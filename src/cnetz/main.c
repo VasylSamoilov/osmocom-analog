@@ -74,7 +74,7 @@ int meldeinterval = 120; /* when to ask the phone about beeing alive */
 int meldeaufrufe = 3; /* how many times to ask phone about beeing alive */
 enum demod_type demod = FSK_DEMOD_AUTO;
 int metering = 20;
-double speech_deviation = 2400.0; /* best results with older equipment (not C5) */
+double speech_deviation = 4000.0; /* best results with older equipment (not C5) */
 
 void print_help(const char *arg0)
 {
