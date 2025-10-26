@@ -93,8 +93,8 @@ static console_t console;
 extern osmo_cc_endpoint_t *ep;
 
 static struct osmo_cc_helper_audio_codecs codecs[] = {
-	{ "L16", 8000, 1, encode_l16, decode_l16 },
-	{ NULL, 0, 0, NULL, NULL},
+	{ "L16", NULL , 8000, 1, encode_l16, decode_l16, NULL, NULL   },
+	{ NULL, NULL , 0, 0, NULL, NULL, NULL, NULL  },
 };
 
 /* stream test music */

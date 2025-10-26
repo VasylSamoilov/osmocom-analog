@@ -94,10 +94,10 @@ void decode_l16(uint8_t *src_data, int src_len, uint8_t **dst_data, int *dst_len
 }
 
 static struct osmo_cc_helper_audio_codecs codecs[] = {
-	{ "L16", 8000, 1, encode_l16, decode_l16 },
-	{ "PCMA", 8000, 1, g711_encode_alaw, g711_decode_alaw },
-	{ "PCMU", 8000, 1, g711_encode_ulaw, g711_decode_ulaw },
-	{ NULL, 0, 0, NULL, NULL},
+	{ "L16", NULL, 8000, 1, encode_l16, decode_l16, NULL, NULL },
+	{ "PCMA", NULL, 8000, 1, g711_encode_alaw, g711_decode_alaw, NULL, NULL },
+	{ "PCMU", NULL, 8000, 1, g711_encode_ulaw, g711_decode_ulaw, NULL, NULL },
+	{ NULL, NULL, 0, 0, NULL, NULL, NULL, NULL},
 };
 
 static int no_l16 = 0;
