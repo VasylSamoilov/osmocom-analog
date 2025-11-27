@@ -580,19 +580,19 @@ int uhd_receive(float *buff, int max)
 {
     	void *buffs_ptr[1];
 	size_t count;
+	size_t num_to_read;
 	uhd_error error;
 	bool has_time_spec;
 	int rc;
 
-	if (max < (int)rx_samps_per_buff) {
-		/* no more space this time */
-		sdr_rx_overflow = 1;
-		return -ENOSPC;
-	}
+	if (max <= 0)
+		return 0;
+	/* read up to MTU, but no more than available buffer space */
+	num_to_read = ((size_t)max < rx_samps_per_buff) ? (size_t)max : rx_samps_per_buff;
 	/* read RX stream */
 	buffs_ptr[0] = buff;
 	count = 0;
-	error = uhd_rx_streamer_recv(rx_streamer, buffs_ptr, rx_samps_per_buff, &rx_metadata, 0.0, false, &count);
+	error = uhd_rx_streamer_recv(rx_streamer, buffs_ptr, num_to_read, &rx_metadata, 0.0, false, &count);
 	if (error) {
 		LOGP(DUHD, LOGL_ERROR, "Failed to read from UHD device.\n");
 		return -EIO;
@@ -646,10 +646,16 @@ int uhd_get_tosend(int buffer_size)
 
 	/* we check how advance our transmitted time stamp is */
 	advance = ((double)tx_time_secs + tx_time_fract_sec) - ((double)rx_time_secs + rx_time_fract_sec);
-	/* in case of underrun: */
+	/* in case of underrun, resync TX timestamp */
 	if (advance < 0) {
 		LOGP(DSOAPY, LOGL_ERROR, "SDR TX underrun, seems we are too slow. Use lower SDR sample rate.\n");
-		advance = 0;
+		tx_time_secs = rx_time_secs;
+		tx_time_fract_sec = rx_time_fract_sec + (double)buffer_size / samplerate;
+		if (tx_time_fract_sec >= 1.0) {
+			tx_time_fract_sec -= 1.0;
+			tx_time_secs++;
+		}
+		advance = (double)buffer_size / samplerate;
 	}
 	tosend = buffer_size - (int)(advance * samplerate);
 	if (tosend < 0)
