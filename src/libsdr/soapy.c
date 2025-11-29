@@ -570,7 +570,14 @@ int soapy_get_tosend(int buffer_size)
 	/* in case of underrun, resync TX timestamp */
 	if (tosend > buffer_size) {
 		LOGP(DSOAPY, LOGL_ERROR, "SDR TX underrun, seems we are too slow. Use lower SDR sample rate.\n");
-		tx_timeNs = rx_timeNs + buffer_size * Ns_per_sample;
+		if (!use_time_stamps) {
+			/* When TX timestamps are disabled, we must resync to recover.
+			 * This causes a slip in the transmit stream. */
+			tx_timeNs = rx_timeNs;
+		}
+		/* When TX timestamps are enabled, the driver drops late packets.
+		 * The TX timestamp naturally catches up without causing a slip.
+		 * We just cap tosend to buffer_size and let recovery happen. */
 		tosend = buffer_size;
 	}
 	pthread_mutex_unlock(&timestamp_mutex);
