@@ -668,14 +668,15 @@ int uhd_get_tosend(int buffer_size)
 	if (tosend > buffer_size) {
 		LOGP(DUHD, LOGL_ERROR, "SDR TX underrun (%.1f ms behind), seems we are too slow. Use lower SDR sample rate.\n",
 			-advance * 1000.0);
-		/* Resync TX timestamp. The slip already happened when the hardware
-		 * buffer underran - resyncing just acknowledges this reality.
-		 * Without resync, TX timestamp stays permanently behind and we'd
-		 * be stuck in underrun forever. */
-		tx_time_secs = rx_time_secs;
-		tx_time_fract_sec = rx_time_fract_sec;
-		/* Return buffer_size so we immediately refill the buffer.
-		 * Original code set advance=buffer_size/samplerate which made tosend=0! */
+		if (!tx_timestamps) {
+			/* When TX timestamps are disabled, we must resync to recover.
+			 * This causes a slip in the transmit stream. */
+			tx_time_secs = rx_time_secs;
+			tx_time_fract_sec = rx_time_fract_sec;
+		}
+		/* When TX timestamps are enabled, the UHD driver drops late packets.
+		 * The TX timestamp naturally catches up without causing a slip.
+		 * We just cap tosend to buffer_size and let recovery happen. */
 		tosend = buffer_size;
 	}
 	if (tosend < 0)
