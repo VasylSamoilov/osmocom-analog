@@ -22,11 +22,15 @@
 #include <string.h>
 #include <errno.h>
 #include <math.h>
+#include <unistd.h>
 #include <uhd.h>
 #include <uhd/usrp/usrp.h>
 #include "uhd.h"
 #include "../liblogging/logging.h"
 #include "../liboptions/options.h"
+
+/* HACK: Set to 1 to trigger a one-time TX underrun after 5 seconds for testing recovery */
+#define TEST_UNDERRUN_RECOVERY 0
 
 extern int sdr_rx_overflow;
 
@@ -626,10 +630,22 @@ int uhd_get_tosend(int buffer_size)
 {
 	double advance;
 	int tosend;
+#if TEST_UNDERRUN_RECOVERY
+	static int underrun_triggered = 0;
+#endif
 
 	/* we need the rx time stamp to determine how much data is already sent in advance */
 	if (rx_time_secs == 0 && rx_time_fract_sec == 0.0)
 		return 0;
+
+#if TEST_UNDERRUN_RECOVERY
+	/* HACK: Trigger underrun after 5 seconds of operation, only once */
+	if (!underrun_triggered && rx_time_secs >= 5) {
+		underrun_triggered = 1;
+		LOGP(DUHD, LOGL_NOTICE, "HACK: Triggering artificial TX underrun by sleeping 200ms...\n");
+		usleep(200000); /* 200ms delay to cause underrun */
+	}
+#endif
 
 	/* if we have not yet sent any data, we set initial tx time stamp */
 	if (tx_time_secs == 0 && tx_time_fract_sec == 0.0) {
@@ -646,18 +662,22 @@ int uhd_get_tosend(int buffer_size)
 
 	/* we check how advance our transmitted time stamp is */
 	advance = ((double)tx_time_secs + tx_time_fract_sec) - ((double)rx_time_secs + rx_time_fract_sec);
-	/* in case of underrun, resync TX timestamp */
-	if (advance < 0) {
-		LOGP(DSOAPY, LOGL_ERROR, "SDR TX underrun, seems we are too slow. Use lower SDR sample rate.\n");
-		tx_time_secs = rx_time_secs;
-		tx_time_fract_sec = rx_time_fract_sec + (double)buffer_size / samplerate;
-		if (tx_time_fract_sec >= 1.0) {
-			tx_time_fract_sec -= 1.0;
-			tx_time_secs++;
-		}
-		advance = (double)buffer_size / samplerate;
-	}
 	tosend = buffer_size - (int)(advance * samplerate);
+
+	/* in case of underrun: tosend will exceed buffer_size */
+	if (tosend > buffer_size) {
+		LOGP(DUHD, LOGL_ERROR, "SDR TX underrun (%.1f ms behind), seems we are too slow. Use lower SDR sample rate.\n",
+			-advance * 1000.0);
+		/* Resync TX timestamp. The slip already happened when the hardware
+		 * buffer underran - resyncing just acknowledges this reality.
+		 * Without resync, TX timestamp stays permanently behind and we'd
+		 * be stuck in underrun forever. */
+		tx_time_secs = rx_time_secs;
+		tx_time_fract_sec = rx_time_fract_sec;
+		/* Return buffer_size so we immediately refill the buffer.
+		 * Original code set advance=buffer_size/samplerate which made tosend=0! */
+		tosend = buffer_size;
+	}
 	if (tosend < 0)
 		tosend = 0;
 
