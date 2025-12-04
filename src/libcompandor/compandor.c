@@ -25,13 +25,50 @@
 #include "../libsample/sample.h"
 #include "compandor.h"
 
-//#define db2level(db)			pow(10, (double)db / 20.0)
+//#define db2level(db)                 pow(10, (double)db / 20.0)
 
-/* factor is the gain (raise and fall) after given attack/recovery time */
-#define COMPRESS_ATTACK_FACTOR		1.83		/* about 1.5 after 12 dB step up */
-#define COMPRESS_RECOVERY_FACTOR	0.44		/* about 0.75 after 12 dB step down */
-#define EXPAND_ATTACK_FACTOR		1.145		/* about 0.57 after 6 dB step up */
-#define EXPAND_RECOVERY_FACTOR		0.753		/* about 1.51 after 6 dB step down */
+/*
+ * Compandor Attack/Recovery Time Constants
+ * =========================================
+ * Per TIA/EIA-553 Section 2.1.3.1.1 and 2.2.2.1.2, referencing ITU-T G.162:
+ *   - Attack time:   3 ms (nominal)
+ *   - Recovery time: 13.5 ms (nominal)
+ *
+ * ITU-T G.162 defines these times as the time for the output to reach
+ * within 2 dB of its final value after a step change in input level.
+ *
+ * For a 2:1 compressor with 12 dB input step:
+ *   - Final output change = 6 dB
+ *   - "Within 2 dB" means output has changed by at least 4 dB
+ *   - This is 4/6 = 66.7% of the final value
+ *
+ * For exponential response: 1 - e^(-t/tau) = 0.667
+ *   - e^(-t/tau) = 0.333
+ *   - tau = t / ln(3) = t / 1.099
+ *
+ * Effective time constants:
+ *   - tau_attack = 3.0 ms / 1.099 = 2.73 ms
+ *   - tau_recovery = 13.5 ms / 1.099 = 12.3 ms
+ *
+ * Per-sample step values at sample rate fs:
+ *   - step_up = e^(1 / (tau_attack * fs))
+ *   - step_down = e^(-1 / (tau_recovery * fs))
+ *
+ * At 8000 Hz:
+ *   - step_up = e^(1 / (0.00273 * 8000)) = e^0.0458 = 1.0469
+ *   - step_down = e^(-1 / (0.0123 * 8000)) = e^-0.0102 = 0.9899
+ *
+ * FACTOR values are chosen so that:
+ *   step = pow(FACTOR, 1000.0 / time_ms / samplerate)
+ *
+ * After attack_ms at 8000 Hz (24 samples):
+ *   ATTACK_FACTOR = step_up^24 = 1.0469^24 = 3.0
+ *
+ * After recovery_ms at 8000 Hz (108 samples):
+ *   RECOVERY_FACTOR = step_down^108 = 0.9899^108 = 0.33
+ */
+#define COMPANDOR_ATTACK_FACTOR		3.0	/* Envelope multiplier after attack time (3ms) */
+#define COMPANDOR_RECOVERY_FACTOR	0.33	/* Envelope multiplier after recovery time (13.5ms) */
 
 /* Minimum level value to keep state (-60 dB) */
 #define ENVELOPE_MIN	0.001
@@ -72,10 +109,11 @@ void setup_compandor(compandor_t *state, double samplerate, double attack_ms, do
 	state->c.envelope = 1.0;
 	state->e.peak = 1.0;
 	state->e.envelope = 1.0;
-	state->c.step_up = pow(COMPRESS_ATTACK_FACTOR, 1000.0 / attack_ms / samplerate);
-	state->c.step_down = pow(COMPRESS_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
-	state->e.step_up = pow(EXPAND_ATTACK_FACTOR, 1000.0 / attack_ms / samplerate);
-	state->e.step_down = pow(EXPAND_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
+	/* Both compressor and expander use same attack/recovery per TIA/EIA-553 */
+	state->c.step_up = pow(COMPANDOR_ATTACK_FACTOR, 1000.0 / attack_ms / samplerate);
+	state->c.step_down = pow(COMPANDOR_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
+	state->e.step_up = pow(COMPANDOR_ATTACK_FACTOR, 1000.0 / attack_ms / samplerate);
+	state->e.step_down = pow(COMPANDOR_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
 }
 
 void compress_audio(compandor_t *state, sample_t *samples, int num)
@@ -92,18 +130,24 @@ void compress_audio(compandor_t *state, sample_t *samples, int num)
 	for (i = 0; i < num; i++) {
 		value = *samples;
 
-		/* 'peak' is the level that raises directly with the signal
+		/* 'peak' is the level that rises instantly with the signal
 		 * level, but falls with specified recovery rate. */
 		if (fabs(value) > peak)
 			peak = fabs(value);
 		else
 			peak *= step_down;
-		/* 'evelope' is the level that raises with the specified attack
-		 * rate to 'peak', but falls with specified recovery rate. */
+
+		/* 'envelope' follows peak with attack/recovery timing:
+		 * - Attack (3ms): envelope rises slowly toward peak
+		 * - Recovery (13.5ms): envelope falls slowly toward peak
+		 * Per TIA/EIA-553 and ITU-T G.162 specifications.
+		 */
 		if (peak > envelope)
-			envelope *= step_up;
+			envelope *= step_up;    /* Attack: slow rise */
 		else
-			envelope = peak;
+			envelope *= step_down;  /* Recovery: slow fall (not instant!) */
+
+		/* Clamp envelope to valid range */
 		if (envelope < ENVELOPE_MIN)
 			envelope = ENVELOPE_MIN;
 		if (envelope > ENVELOPE_MAX)
@@ -133,18 +177,30 @@ void expand_audio(compandor_t *state, sample_t *samples, int num)
 		value = *samples;
 
 		/* for comments: see compress_audio() */
+		/* 'peak' is the level that rises instantly with the signal
+		 * level, but falls with specified recovery rate. */
 		if (fabs(value) > peak)
 			peak = fabs(value);
 		else
 			peak *= step_down;
+
+		/* 'envelope' follows peak with attack/recovery timing:
+		 * - Attack (3ms): envelope rises slowly toward peak
+		 * - Recovery (13.5ms): envelope falls slowly toward peak
+		 * Per TIA/EIA-553 and ITU-T G.162 specifications.
+		 */
 		if (peak > envelope)
-			envelope *= step_up;
+			envelope *= step_up;    /* Attack: slow rise */
 		else
-			envelope = peak;
+			envelope *= step_down;  /* Recovery: slow fall (not instant!) */
+
+		/* Clamp envelope to valid range */
 		if (envelope < ENVELOPE_MIN)
 			envelope = ENVELOPE_MIN;
 
-		*samples++ = value * envelope;
+		/* Expansion uses sqrt(envelope) to undo 2:1 compression */
+		/* Compression divides by sqrt(envelope), so expansion multiplies by sqrt(envelope) */
+		*samples++ = value * sqrt(envelope);
 	}
 
 	state->e.envelope = envelope;
