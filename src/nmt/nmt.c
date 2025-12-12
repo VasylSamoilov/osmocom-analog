@@ -471,6 +471,20 @@ static void nmt_release(nmt_t *nmt)
 		LOGP_CHAN(DNMT, LOGL_ERROR, "Callref already set, please fix!\n");
 		abort();
 	}
+
+	/* If MWI was set during call, use clearing sequence per NMT spec 4.4.1.16:
+	 * 5c x2 (MWI data) then L(15) x4 (triggers phone to apply flags + release)
+	 */
+	if (trans->mwi_pending && nmt->state == STATE_ACTIVE) {
+		LOGP_CHAN(DNMT, LOGL_INFO, "MWI pending (0x%02x), sending clearing sequence.\n", trans->mwi_pending);
+		trans->mwi_flags = trans->mwi_pending;  /* Copy for clearing sequence */
+		trans->mwi_pending = 0;  /* Clear to prevent restart */
+		nmt->active_state = ACTIVE_STATE_MWI_CLEAR;
+		nmt->tx_frame_count = 0;
+		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
+		return;
+	}
+
 	nmt_new_state(nmt, STATE_MT_RELEASE);
 	nmt->tx_frame_count = 0;
 	nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
@@ -1185,7 +1199,8 @@ static void rx_mt_ident(nmt_t *nmt, frame_t *frame)
 			break;
 		nmt_value2digits(frame->ms_password, trans->subscriber.password, 3);
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received identity (password %s).\n", trans->subscriber.password);
-		if (trans->dms_call) {
+		if (trans->dms_call || trans->mwi_call) {
+			/* DMS (SMS) or MWI call - use autoanswer path */
 			nmt_new_state(nmt, STATE_MT_AUTOANSWER);
 			nmt->wait_autoanswer = 1;
 			nmt->tx_frame_count = 0;
@@ -1321,29 +1336,95 @@ static void rx_mt_ringing(nmt_t *nmt, frame_t *frame)
 	}
 }
 
+/* Send MWI frame 5c with message waiting indicators
+ *
+ * Frame 5c format: NNNPYYZXXXXXXFFF
+ *   NNN = channel number
+ *   P = 2 (prefix for frame 5c)
+ *   YY = traffic area
+ *   Z = subscriber country
+ *   XXXXXX = subscriber number
+ *   FFF = waiting indicators (12 bits, duplicated for error checking)
+ *
+ * FFF field (12 bits): i1 i2 i3 i4 | i5 i6 i'1 i'2 | i'3 i'4 i'5 i'6
+ *
+ * Bit positions (MSB first as per NMT spec):
+ *   bit 11 = i1  (SMS)      bit 5 = i'1
+ *   bit 10 = i2  (voice)    bit 4 = i'2
+ *   bit  9 = i3  (fax)      bit 3 = i'3
+ *   bit  8 = i4  (email)    bit 2 = i'4
+ *   bit  7 = i5  (data)     bit 1 = i'5
+ *   bit  6 = i6  (spare)    bit 0 = i'6
+ */
+static void set_mwi_frame(nmt_t *nmt, frame_t *frame, uint8_t flags)
+{
+	transaction_t *trans = nmt->trans;
+	uint16_t info = 0;
+
+	frame->mt = NMT_MESSAGE_5c;
+	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
+	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
+
+	/* Encode flags into FFF field with correct bit positions
+	 * Each indicator sets both i_n (bits 11-6) and i'_n (bits 5-0)
+	 */
+	if (flags & 0x01) info |= 0x820;  /* SMS:   i1 at bit 11, i'1 at bit 5 */
+	if (flags & 0x02) info |= 0x410;  /* voice: i2 at bit 10, i'2 at bit 4 */
+	if (flags & 0x04) info |= 0x208;  /* fax:   i3 at bit 9,  i'3 at bit 3 */
+	if (flags & 0x08) info |= 0x104;  /* email: i4 at bit 8,  i'4 at bit 2 */
+	if (flags & 0x10) info |= 0x082;  /* data:  i5 at bit 7,  i'5 at bit 1 */
+
+	frame->waiting_info = info;
+
+	LOGP_CHAN(DNMT, LOGL_INFO, "Send MWI frame 5c: flags=0x%02x info=0x%03x (%s%s%s%s%s)\n",
+		flags, info,
+		(flags & 0x01) ? "sms " : "",
+		(flags & 0x02) ? "voice " : "",
+		(flags & 0x04) ? "fax " : "",
+		(flags & 0x08) ? "email " : "",
+		(flags & 0x10) ? "data " : "");
+}
+
 static void tx_mt_complete(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans = nmt->trans;
 
 	++nmt->tx_frame_count;
-	if (nmt->compandor && !trans->dms_call) {
+	if (nmt->compandor && !trans->dms_call && !trans->mwi_call) {
 		if (nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'compandor in'.\n");
 		set_line_signal(nmt, frame, 5);
 	} else
 		frame->mt = NMT_MESSAGE_6;
 	if (nmt->tx_frame_count == 5) {
-		LOGP_CHAN(DNMT, LOGL_INFO, "Connect audio.\n");
 		nmt_new_state(nmt, STATE_ACTIVE);
-		nmt->active_state = ACTIVE_STATE_VOICE;
-		nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
-		if (nmt->supervisory && !trans->dms_call) {
-			super_reset(nmt);
-			osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1,0);
-		}
-		if (trans->dms_call) {
+		if (trans->mwi_call) {
+			/* Out-of-call MWI delivery per NMT spec 4.4.1.16:
+			 * 5c x2 (MWI data), then L(15) x4 via nmt_release()
+			 */
+			LOGP_CHAN(DNMT, LOGL_INFO, "Starting MWI delivery (frame 5c).\n");
+			trans->mwi_pending = 0;  /* Clear so release doesn't restart */
+			nmt->tx_frame_count = 0;
+			nmt->active_state = ACTIVE_STATE_MWI;
+			/* Don't switch to audio mode - keep transmitting frames */
+		} else if (trans->dms_call) {
+			/* SMS delivery: handled by DMS layer */
+			LOGP_CHAN(DNMT, LOGL_INFO, "Connect audio.\n");
+			nmt->active_state = ACTIVE_STATE_VOICE;
+			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
 			time_t ti = time(NULL);
 			sms_deliver(nmt, sms_ref, trans->caller_id, trans->caller_type, SMS_PLAN_ISDN_TEL, ti, 1, trans->sms_string);
+		} else {
+			/* Normal call: switch to audio mode */
+			LOGP_CHAN(DNMT, LOGL_INFO, "Connect audio.\n");
+			nmt->active_state = ACTIVE_STATE_VOICE;
+			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+			if (nmt->supervisory) {
+				super_reset(nmt);
+				osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1,0);
+			}
 		}
 	}
 }
@@ -1404,7 +1485,15 @@ static void rx_mt_release(nmt_t *nmt, frame_t *frame)
 		}
 		if ((frame->line_signal & 0xf) != 1)
 			break;
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received release guard.\n");
+		LOGP_CHAN(DNMT, LOGL_INFO, "Received release guard L(1).\n");
+		if (trans->mwi_call) {
+			/* MWI delivery confirmed - phone acknowledged clearing
+			 * Note: This confirms phone received clearing signal,
+			 * but doesn't confirm MWI was processed (phone may not support MWI)
+			 */
+			LOGP_CHAN(DNMT, LOGL_INFO, "MWI out-of-call delivery confirmed (release guard received).\n");
+			printf("MWI delivery confirmed!\n");
+		}
 		osmo_timer_del(&nmt->timer);
 		destroy_transaction(trans);
 		break;
@@ -1417,7 +1506,12 @@ static void timeout_mt_release(nmt_t *nmt)
 {
 	transaction_t *trans = nmt->trans;
 
-	LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout while releasing.\n");
+	if (trans->mwi_call) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "MWI: Timeout waiting for release guard - delivery status unknown.\n");
+		printf("MWI delivery timeout (no ack)!\n");
+	} else {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout while releasing.\n");
+	}
 	destroy_transaction(trans);
 }
 
@@ -1557,6 +1651,8 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 
 static void tx_active(nmt_t *nmt, frame_t *frame)
 {
+	transaction_t *trans = nmt->trans;
+
 	switch (nmt->active_state) {
 	case ACTIVE_STATE_MFT_IN:
 		set_line_signal(nmt, frame, 4);
@@ -1576,6 +1672,65 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
 			if (nmt->supervisory)
 				super_reset(nmt);
+		}
+		break;
+	case ACTIVE_STATE_MWI:
+		/* Send frame 5c with message waiting indicators
+		 * Per NMT spec 4.4.1.16: 5c|5c (2 frames)
+		 * For out-of-call: followed by normal release L(15) x4
+		 * For in-call: return to voice, flags accumulated for call end
+		 */
+		set_mwi_frame(nmt, frame, trans->mwi_flags);
+		++nmt->tx_frame_count;
+		if (nmt->tx_frame_count == 1)
+			LOGP_CHAN(DNMT, LOGL_INFO, "Sending MWI frame 5c.\n");
+		if (nmt->tx_frame_count >= 2) {
+			LOGP_CHAN(DNMT, LOGL_DEBUG, "MWI frame 5c sent 2 times.\n");
+			if (trans->mwi_call) {
+				/* Out-of-call MWI: release with normal L(15) clearing
+				 * Per spec: 5c|5c|5a(L=15)|5a(L=15)|5a(L=15)|5a(L=15)
+				 */
+				LOGP_CHAN(DNMT, LOGL_INFO, "MWI delivery complete, releasing.\n");
+				printf("MWI delivered!\n");
+				nmt_release(nmt);
+			} else {
+				/* In-call MWI: return to voice, flags accumulated for call end */
+				LOGP_CHAN(DNMT, LOGL_INFO, "MWI in-call complete, returning to voice.\n");
+				printf("MWI sent (in-call)!\n");
+				nmt->active_state = ACTIVE_STATE_VOICE;
+				nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+				if (nmt->supervisory) {
+					super_reset(nmt);
+					osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
+				}
+			}
+		}
+		break;
+	case ACTIVE_STATE_MWI_CLEAR:
+		/* MWI during call release per NMT spec 4.4.1.16:
+		 * 5c|5c|5a(L=15)|5a(L=15)|5a(L=15)|5a(L=15)
+		 * Frame 5c delivers MWI data, L(15) triggers apply + release
+		 * Used when call ends with pending MWI flags
+		 */
+		++nmt->tx_frame_count;
+		if (nmt->tx_frame_count <= 2) {
+			/* Frames 1-2: 5c with MWI flags */
+			set_mwi_frame(nmt, frame, trans->mwi_flags);
+			if (nmt->tx_frame_count == 1)
+				LOGP_CHAN(DNMT, LOGL_INFO, "Sending MWI clearing: 5c x2 then L(15) x4 (flags=0x%02x).\n", trans->mwi_flags);
+		} else {
+			/* Frames 3-6: L(15) clearing */
+			set_line_signal(nmt, frame, 15);
+		}
+		if (nmt->tx_frame_count >= 6) {
+			LOGP_CHAN(DNMT, LOGL_DEBUG, "MWI clearing sequence sent.\n");
+			/* Transition to normal release to wait for L(1) ack
+			 * If phone doesn't respond, timeout will clean up
+			 */
+			LOGP_CHAN(DNMT, LOGL_INFO, "MWI clearing done, waiting for release ack.\n");
+			nmt_new_state(nmt, STATE_MT_RELEASE);
+			nmt->tx_frame_count = 0;
+			osmo_timer_schedule(&nmt->timer, RELEASE_TO);
 		}
 		break;
 	default:
@@ -1626,14 +1781,31 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 			return;
 		}
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received clearing by mobile phone in state %s.\n", nmt_state_name(nmt->state));
-		nmt_new_state(nmt, STATE_MO_RELEASE);
-		nmt->tx_frame_count = 0;
-		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
 		if (nmt->trans->callref) {
 			LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
 			call_up_release(nmt->trans->callref, CAUSE_NORMAL);
 			nmt->trans->callref = 0;
 		}
+		/* If already sending MWI clearing sequence, let it complete */
+		if (nmt->state == STATE_ACTIVE && nmt->active_state == ACTIVE_STATE_MWI_CLEAR) {
+			LOGP_CHAN(DNMT, LOGL_DEBUG, "Already in MWI clearing sequence, continuing.\n");
+			return;
+		}
+		/* If MWI was set during call, send clearing sequence per NMT spec 4.4.1.16:
+		 * 5c x2 (MWI data) then L(15) x4 (triggers phone to apply flags + release)
+		 */
+		if (nmt->trans->mwi_pending && nmt->state == STATE_ACTIVE) {
+			LOGP_CHAN(DNMT, LOGL_INFO, "MWI pending (0x%02x), sending clearing sequence.\n", nmt->trans->mwi_pending);
+			nmt->trans->mwi_flags = nmt->trans->mwi_pending;  /* Copy for clearing sequence */
+			nmt->trans->mwi_pending = 0;  /* Clear to prevent restart */
+			nmt->active_state = ACTIVE_STATE_MWI_CLEAR;
+			nmt->tx_frame_count = 0;
+			nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
+			return;
+		}
+		nmt_new_state(nmt, STATE_MO_RELEASE);
+		nmt->tx_frame_count = 0;
+		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
 		return;
 	}
 
@@ -1968,16 +2140,29 @@ void sms_release(nmt_t *nmt)
  	nmt_release(nmt);
 }
 
+/* SMS submit from mobile station
+ * Writes to /tmp/nmt_sms_submit in format:
+ *   <subscriber>,<rp_orig>,<dest>,<message>
+ * Where:
+ *   subscriber = Mobile station's NMT number (from call setup)
+ *   rp_orig    = RP-Originator-Address from SMS (may be empty)
+ *   dest       = Destination address
+ *   message    = SMS text
+ */
 int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message)
 {
 	char sms[512];
+	char subscriber[8];
 
-	if (!orig_address[0])
-		orig_address = &nmt->trans->subscriber.country;
+	/* Get mobile station's subscriber number (country + number) */
+	snprintf(subscriber, sizeof(subscriber), "%c%s",
+		nmt->trans->subscriber.country, nmt->trans->subscriber.number);
 
-	LOGP_CHAN(DNMT, LOGL_NOTICE, "Received SMS from '%s' to '%s' (ref=%d)\n", orig_address, dest_address, ref);
-	printf("SMS received '%s' -> '%s': %s\n", orig_address, dest_address, message);
-	snprintf(sms, sizeof(sms) - 1, "%s,%s,%s", orig_address, dest_address, message);
+	LOGP_CHAN(DNMT, LOGL_NOTICE, "Received SMS from subscriber '%s' (rp_orig='%s') to '%s' (ref=%d): %s\n",
+		subscriber, orig_address, dest_address, ref, message);
+
+	/* Format: subscriber,rp_orig,dest,message */
+	snprintf(sms, sizeof(sms) - 1, "%s,%s,%s,%s", subscriber, orig_address, dest_address, message);
 	sms[sizeof(sms) - 1] = '\0';
 
 	return submit_sms(sms);
@@ -2045,6 +2230,252 @@ inval:
 	rc = sms_out_setup(number, caller_id, caller_type, message);
 	if (rc < 0) {
 		LOGP(DNMT, LOGL_INFO, "SMS delivery failed with cause '%d'\n", -rc);
+		return;
+	}
+}
+
+/*
+ * MWI (Message Waiting Indicator) handling
+ * See docs/NMT_MWI.md for details.
+ */
+
+/* MWI is delivered via frame 5c during calls
+ *
+ * SET command: Sends frame 5c to turn ON indicators
+ *   - Out-of-call: Pages subscriber, sends 5c x2, then L(15) x4 to release
+ *   - In-call: Sends 5c x2 immediately, accumulates flags for call end
+ *
+ * When any call ends with pending MWI, clearing sequence is sent:
+ *   5c x2 (MWI data) then L(15) x4 (triggers phone to apply all flags)
+ * Per NMT spec 4.4.1.16.
+ */
+
+/* Format MWI flags as human-readable string */
+static const char *mwi_flags_string(uint8_t flags)
+{
+	static char buf[64];
+	buf[0] = '\0';
+	if (flags & 0x01) strcat(buf, "sms ");
+	if (flags & 0x02) strcat(buf, "voice ");
+	if (flags & 0x04) strcat(buf, "fax ");
+	if (flags & 0x08) strcat(buf, "email ");
+	if (flags & 0x10) strcat(buf, "data ");
+	if (buf[0] == '\0') strcpy(buf, "(none)");
+	return buf;
+}
+
+/* Send MWI in-call to subscriber with active connection
+ *
+ * Sends frame 5c x2 immediately and accumulates flags for clearing sequence.
+ * The call continues after frame 5c is sent.
+ * When call ends, clearing sequence (5c x2 then L(15) x4) will be sent.
+ */
+static int mwi_send_in_call(nmt_t *nmt, uint8_t flags)
+{
+	transaction_t *trans = nmt->trans;
+
+	LOGP_CHAN(DNMT, LOGL_INFO, "MWI in-call SET to '%c%s': %s(0x%02x)\n",
+		trans->subscriber.country, trans->subscriber.number,
+		mwi_flags_string(flags), flags);
+
+	/* Store flags for immediate frame 5c */
+	trans->mwi_flags = flags;
+	/* Accumulate flags for clearing sequence when call ends */
+	trans->mwi_pending |= flags;
+
+	/* Switch to frame mode to send MWI, then return to voice */
+	nmt->tx_frame_count = 0;
+	nmt->active_state = ACTIVE_STATE_MWI;
+	nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
+
+	printf("MWI in-call: %s(0x%02x)\n", mwi_flags_string(flags), flags);
+	return 0;
+}
+
+/* Set MWI indicators for subscriber
+ *
+ * If subscriber has active call: sends frame 5c x2, accumulates flags
+ * If subscriber idle: initiates MWI delivery call (5c x2 then L(15) x4)
+ *
+ * When any call ends with pending MWI flags, clearing sequence is sent:
+ * 5c x2 then L(15) x4 per NMT spec 4.4.1.16.
+ */
+static int mwi_set(const char *dialing, uint8_t flags)
+{
+	sender_t *sender;
+	nmt_t *nmt;
+	nmt_subscriber_t subscr;
+	transaction_t *trans;
+
+	memset(&subscr, 0, sizeof(subscr));
+
+	/* 1. split number into country and subscriber parts */
+	if (dialstring2number(dialing, &subscr.country, subscr.number)) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: invalid number '%s'\n", dialing);
+		return -CAUSE_INVALNUMBER;
+	}
+
+	/* 2. check if subscriber has an active call - send in-call MWI */
+	trans = get_transaction_by_number(&subscr);
+	if (trans && trans->nmt && trans->nmt->state == STATE_ACTIVE) {
+		LOGP(DNMT, LOGL_INFO, "MWI: subscriber '%s' has active call, sending in-call\n", dialing);
+		return mwi_send_in_call(trans->nmt, flags);
+	}
+
+	/* 3. if subscriber is busy but not in active state, reject */
+	if (trans) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: subscriber '%s' is busy (state: not active), rejecting\n", dialing);
+		return -CAUSE_BUSY;
+	}
+
+	/* 4. check if all paging (calling) channels are busy */
+	for (sender = sender_head; sender; sender = sender->next) {
+		nmt = (nmt_t *) sender;
+		if (!is_chan_class_cc(nmt->sysinfo.chan_type))
+			continue;
+		if (nmt->state == STATE_IDLE)
+			break;
+	}
+	if (!sender) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: no free calling channel\n");
+		return -CAUSE_NOCHANNEL;
+	}
+	if (!search_free_tc(NULL)) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: no free traffic channel\n");
+		return -CAUSE_NOCHANNEL;
+	}
+
+	LOGP(DNMT, LOGL_INFO, "MWI out-of-call to '%c%s': %s(0x%02x)\n",
+		subscr.country, subscr.number,
+		mwi_flags_string(flags), flags);
+
+	/* 5. create transaction and page mobile station */
+	trans = create_transaction(&subscr);
+	if (!trans) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: failed to create transaction\n");
+		return -CAUSE_TEMPFAIL;
+	}
+	trans->callref = 0;
+	trans->mwi_call = 1;
+	trans->mwi_flags = flags;
+	trans->mwi_pending = flags;  /* Accumulated flags for clearing */
+	nmt_page(trans, 1);
+
+	return 0;
+}
+
+/* Parse indicator flags from text or numeric value
+ *
+ * Indicators (space-separated text or numeric 0-31):
+ *   sms   = bit 0 (0x01)
+ *   voice = bit 1 (0x02)
+ *   fax   = bit 2 (0x04)
+ *   email = bit 3 (0x08)
+ *   data  = bit 4 (0x10)
+ */
+static uint8_t parse_mwi_flags(const char *indicators)
+{
+	uint8_t flags = 0;
+
+	if (!indicators || !indicators[0])
+		return 0;
+
+	/* Check if numeric */
+	if (indicators[0] >= '0' && indicators[0] <= '9') {
+		flags = atoi(indicators) & 0x1F;
+		LOGP(DNMT, LOGL_DEBUG, "MWI flags (numeric): 0x%02x\n", flags);
+		return flags;
+	}
+
+	/* Parse space-separated text values (lowercase only) */
+	if (strstr(indicators, "sms"))
+		flags |= 0x01;
+	if (strstr(indicators, "voice"))
+		flags |= 0x02;
+	if (strstr(indicators, "fax"))
+		flags |= 0x04;
+	if (strstr(indicators, "email"))
+		flags |= 0x08;
+	if (strstr(indicators, "data"))
+		flags |= 0x10;
+
+	LOGP(DNMT, LOGL_DEBUG, "MWI flags (text '%s'): 0x%02x\n", indicators, flags);
+	return flags;
+}
+
+/* Deliver MWI update to subscriber
+ *
+ * Command format: <subscriber>,set,<indicators>
+ *   subscriber: 7-digit NMT number
+ *   indicators: space-separated text (sms voice fax email data) or numeric 0-31
+ *
+ * Behavior:
+ *   Out-of-call: Sends frame 5c immediately to turn ON indicators
+ *   In-call: Sends frame 5c immediately + accumulates flags for clearing
+ *   When call ends: If MWI was set during call, sends L(15)+5c clearing sequence
+ *
+ * Examples:
+ *   3735859,set,sms         - Set SMS indicator
+ *   3735859,set,sms voice   - Set SMS and voice indicators
+ *   3735859,set,3           - Set SMS + voice (numeric: bits 0+1 = 3)
+ */
+void deliver_mwi(const char *command)
+{
+	int rc;
+	char buffer[256], *p, *number, *action, *indicators;
+	uint8_t flags;
+
+	if (!command || !command[0]) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: empty command\n");
+		return;
+	}
+
+	strncpy(buffer, command, sizeof(buffer) - 1);
+	buffer[sizeof(buffer) - 1] = '\0';
+	p = buffer;
+
+	/* Parse: number,action,indicators */
+	number = strsep(&p, ",");
+	action = strsep(&p, ",");
+	indicators = p;  /* rest of string, may contain spaces */
+
+	if (!number || !action) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: invalid format. Use: <number>,set,<indicators>\n");
+		LOGP(DNMT, LOGL_NOTICE, "  number: 7-digit subscriber number\n");
+		LOGP(DNMT, LOGL_NOTICE, "  indicators: sms voice fax email data (space-separated) or 0-31\n");
+		return;
+	}
+
+	if (strlen(number) != 7) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: number must be 7 digits, got '%s'\n", number);
+		return;
+	}
+
+	/* Only "set" action is supported */
+	if (strcmp(action, "set") != 0) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: unknown action '%s'. Use: set\n", action);
+		return;
+	}
+
+	flags = parse_mwi_flags(indicators);
+	if (flags == 0) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: no indicators specified\n");
+		return;
+	}
+
+	LOGP(DNMT, LOGL_INFO, "MWI set '%s': %s(0x%02x)\n",
+		number, mwi_flags_string(flags), flags);
+	printf("MWI set '%s': %s(0x%02x)\n",
+		number, mwi_flags_string(flags), flags);
+
+	rc = mwi_set(number, flags);
+	if (rc < 0) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI delivery failed: %s\n",
+			(rc == -CAUSE_INVALNUMBER) ? "invalid number" :
+			(rc == -CAUSE_BUSY) ? "subscriber busy" :
+			(rc == -CAUSE_NOCHANNEL) ? "no channel available" :
+			(rc == -CAUSE_TEMPFAIL) ? "temporary failure" : "unknown error");
+		printf("MWI failed!\n");
 		return;
 	}
 }
