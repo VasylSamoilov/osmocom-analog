@@ -394,7 +394,7 @@ void call_up_answer(int callref, const char *connect_id)
 		return;
 	}
 
-	LOGP(DCALL, LOGL_INFO, "Call has been answered by '%s'\n", connect_id);
+	LOGP(DCALL, LOGL_INFO, "*** Call has been answered by '%s' (callref=%d) ***\n", connect_id, callref);
 
 	if (!connect_on_setup)
 		indicate_answer(callref, NULL, connect_id);
@@ -412,10 +412,11 @@ void call_up_release(int callref, int cause)
 		return;
 	}
 
-	LOGP(DCALL, LOGL_INFO, "Call has been released with cause=%d\n", cause);
+	LOGP(DCALL, LOGL_INFO, "*** Call has been released with cause=%d (callref=%d) ***\n", cause, callref);
 
 	process = get_process(callref);
 	if (process) {
+		LOGP(DCALL, LOGL_DEBUG, "Process state: %d, audio_disconnected: %d\n", process->state, process->audio_disconnected);
 		/* just keep OSMO-CC connection if tones shall be sent.
 		 * no tones while setting up / alerting the call. */
 		if (connect_on_setup
@@ -428,14 +429,17 @@ void call_up_release(int callref, int cause)
 		if (process->state == PROCESS_DISCONNECT
 		 || process->state == PROCESS_SETUP_RO
 		 || process->state == PROCESS_ALERTING_RO) {
+			LOGP(DCALL, LOGL_DEBUG, "Destroying process and sending REL_IND to network\n");
 			destroy_process(callref);
 			indicate_disconnect_release(callref, cause, OSMO_CC_MSG_REL_IND);
 		/* if no tones shall be sent, disconnect on all other states */
 		} else {
+			LOGP(DCALL, LOGL_DEBUG, "Disconnecting process and sending DISC_IND to network\n");
 			disconnect_process(callref, cause);
 			indicate_disconnect_release(callref, cause, OSMO_CC_MSG_DISC_IND);
 		}
 	} else {
+		LOGP(DCALL, LOGL_DEBUG, "No process found for callref, sending REL_IND anyway\n");
 		/* we don't know about the process, just send release to upper layer anyway */
 		indicate_disconnect_release(callref, cause, OSMO_CC_MSG_REL_IND);
 	}
