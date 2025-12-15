@@ -1270,6 +1270,60 @@ void call_down_release(int callref, int cause)
 	}
 }
 
+/* Send Flash With Info to mobile station during active call
+ *
+ * This order delivers character information (e.g., second caller ID for call waiting)
+ * to the mobile station. The mobile responds with an order confirmation.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int amps_flash_with_info(const char *number, const char *message, int pi, int si)
+{
+	sender_t *sender;
+	amps_t *amps;
+	transaction_t *trans = NULL;
+	uint32_t min1;
+	uint16_t min2;
+
+	/* Convert number to MIN */
+	amps_number2min(number, &min1, &min2);
+
+	/* Find transaction for this subscriber */
+	for (sender = sender_head; sender; sender = sender->next) {
+		amps = (amps_t *) sender;
+		trans = search_transaction_number(amps, min1, min2);
+		if (trans)
+			break;
+	}
+
+	if (!trans) {
+		LOGP(DAMPS, LOGL_NOTICE, "Flash With Info: subscriber '%s' not found or not in call\n", number);
+		return -CAUSE_OUTOFORDER;
+	}
+
+	/* Verify subscriber is in active call state */
+	if (trans->state != TRANS_CALL) {
+		LOGP(DAMPS, LOGL_NOTICE, "Flash With Info: subscriber '%s' not in active call (state=%d)\n", 
+			number, trans->state);
+		return -CAUSE_BUSY;
+	}
+
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Flash With Info to '%s': '%s' (PI=%d, SI=%d)\n",
+		number, message, pi, si);
+
+	/* Store Flash With Info parameters */
+	strncpy(amps->tx_fvc_flashinfo, message, sizeof(amps->tx_fvc_flashinfo) - 1);
+	amps->tx_fvc_flashinfo[sizeof(amps->tx_fvc_flashinfo) - 1] = '\0';
+	amps->tx_fvc_flashinfo_pi = pi;
+	amps->tx_fvc_flashinfo_si = si;
+
+	/* Set transaction state to trigger FVC transmission */
+	trans_new_state(trans, TRANS_CALL_FLASH_INFO);
+	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+
+	return 0;
+}
+
 /* Timeout handling */
 void transaction_timeout(void *data)
 {
@@ -1465,6 +1519,19 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
 		/* Set grace period to ignore SAT drop caused by interruption (1/2 of SAT loss timer) */
 		trans->vmac_grace_count = 75; /* ~2.5 seconds worth of samples */
+		return NULL;
+	case TRANS_CALL_FLASH_INFO:
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Flash With Info order\n");
+		trans->chan = 0;
+		trans->msg_type = 0;
+		trans->ordq = 0;
+		trans->order = 18;  /* Flash With Info */
+		trans_new_state(trans, TRANS_CALL_FLASH_INFO_SEND);
+		return trans;
+	case TRANS_CALL_FLASH_INFO_SEND:
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Flash With Info sent\n");
+		trans_new_state(trans, TRANS_CALL);
+		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
 		return NULL;
 	case TRANS_CALL_RELEASE:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Releasing call towards mobile station\n");

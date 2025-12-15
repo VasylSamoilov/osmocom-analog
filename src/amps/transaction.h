@@ -18,6 +18,8 @@ enum amps_trans_state {
 	TRANS_CALL,			/* active call */
 	TRANS_CALL_CHANGE_POWER,	/* changing power level, waiting to send */
 	TRANS_CALL_CHANGE_POWER_SEND,	/* changing power level, sending */
+	TRANS_CALL_FLASH_INFO,		/* flash with info, waiting to send */
+	TRANS_CALL_FLASH_INFO_SEND,	/* flash with info, sending */
 	TRANS_CALL_RELEASE,		/* release call towards phone, waiting to send */
 	TRANS_CALL_RELEASE_SEND,	/* release call towards phone, sending release */
 	TRANS_PAGE,			/* paging phone, waiting to send */

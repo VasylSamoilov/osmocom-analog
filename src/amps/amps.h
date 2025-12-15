@@ -164,6 +164,10 @@ struct amps {
 	int			tx_fvc_callerid_signal;	/* signal to send in conjunction with caller ID */
 	int			tx_fvc_word_count;	/* counts transmitted words in a muli word message */
 	int			tx_fvc_word_repeat;	/* counts repeats of mulit word message */
+	/* Flash With Info fields */
+	char			tx_fvc_flashinfo[34];	/* Flash With Info message */
+	int			tx_fvc_flashinfo_pi;	/* presentation indicator */
+	int			tx_fvc_flashinfo_si;	/* screening indicator */
 	/* SAT tone */
 	int			sat;			/* use SAT tone 0..2 */
 	int			sat_samples;		/* number of samples in buffer for supervisory detection */
@@ -220,4 +224,5 @@ void amps_rx_recc(amps_t *amps, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_
 transaction_t *amps_tx_frame_focc(amps_t *amps);
 transaction_t *amps_tx_frame_fvc(amps_t *amps);
 void amps_display_status();
+int amps_flash_with_info(const char *number, const char *message, int pi, int si);
 

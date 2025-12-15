@@ -22,6 +22,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include "../libsample/sample.h"
 #include "../libmobile/main_mobile.h"
 #include "../liblogging/logging.h"
@@ -33,6 +37,19 @@
 #include "frame.h"
 #include "stations.h"
 #include "main.h"
+
+/* Flash With Info FIFO
+ *
+ * Format: flash,<number>,<message>[,<pi>,<si>]
+ *   number: AMPS phone number (10 digits)
+ *   message: Text to send (max 32 chars)
+ *   pi: Presentation Indicator 0-2 (optional, default=0)
+ *   si: Screening Indicator 0-3 (optional, default=3)
+ *
+ * Example: echo "flash,1234567890,Hello,0,3" > /tmp/amps_flash
+ */
+#define AMPS_FLASH_FIFO "/tmp/amps_flash"
+static int flash_fd = -1;
 
 /* settings */
 int num_chan_type = 0;
@@ -138,8 +155,75 @@ void print_help(const char *arg0)
 	printf("                 04-06=OtherPatterns, 07-11=PBXPatterns\n");
 	printf("    --amps-prefix <prefix>\n");
 	printf("        Give prefix for alerting parameters. (default = '%s')\n", mobile_amps_param_prefix);
+	printf("\nFlash With Info (In-Call Caller ID):\n");
+	printf("    To send caller ID during an active call (e.g., call waiting):\n");
+	printf("        echo \"flash,<number>,<message>[,<pi>,<si>]\" > /tmp/amps_flash\n");
+	printf("    Example: echo \"flash,1234567890,John Doe\" > /tmp/amps_flash\n");
+	printf("    PI: 0=Allowed(Default), 1=Restricted, 2=NotAvail\n");
+	printf("    SI: 0=Unscreened, 1=Passed, 2=Failed, 3=Network(Default)\n");
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
+}
+
+/* Handler for Flash With Info FIFO commands */
+static void amps_myhandler(void)
+{
+	static char buffer[256];
+	static int pos = 0;
+	int rc, i, space;
+	char *p, *cmd, *number, *message, *pi_str, *si_str;
+	int pi = 0, si = 3;  /* defaults: Allowed, Network-provided */
+
+	if (flash_fd < 0)
+		return;
+
+	space = sizeof(buffer) - pos;
+	rc = read(flash_fd, buffer + pos, space);
+	if (rc > 0) {
+		pos += rc;
+		if (pos == space) {
+			fprintf(stderr, "Flash buffer overflow!\n");
+			pos = 0;
+		}
+		/* check for end of line */
+		for (i = 0; i < pos; i++) {
+			if (buffer[i] == '\r' || buffer[i] == '\n')
+				break;
+		}
+		/* process command */
+		if (i < pos) {
+			buffer[i] = '\0';
+			pos = 0;
+
+			/* Parse: flash,number,message[,pi,si] */
+			p = buffer;
+			cmd = strsep(&p, ",");
+			if (!cmd || strcasecmp(cmd, "flash") != 0) {
+				fprintf(stderr, "Invalid command '%s', expected 'flash'\n", cmd ? cmd : "(null)");
+				return;
+			}
+			number = strsep(&p, ",");
+			message = strsep(&p, ",");
+			if (!number || !message) {
+				fprintf(stderr, "Usage: flash,<number>,<message>[,<pi>,<si>]\n");
+				return;
+			}
+			/* optional PI and SI */
+			pi_str = strsep(&p, ",");
+			si_str = strsep(&p, ",");
+			if (pi_str && pi_str[0])
+				pi = atoi(pi_str);
+			if (si_str && si_str[0])
+				si = atoi(si_str);
+			/* clamp values */
+			if (pi < 0 || pi > 2) pi = 0;
+			if (si < 0 || si > 3) si = 3;
+
+			rc = amps_flash_with_info(number, message, pi, si);
+			if (rc < 0)
+				fprintf(stderr, "Flash With Info failed: %d\n", rc);
+		}
+	}
 }
 
 #define OPT_PREFIX 256
@@ -460,9 +544,28 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 			printf("Base station on channel %s ready (%s), please tune transmitter to %.4f MHz and receiver to %.4f MHz. (%.3f MHz offset)\n", kanal[i], chan_type_long_name(chan_type[i]), amps_channel2freq(atoi(kanal[i]), 0) / 1e6, amps_channel2freq(atoi(kanal[i]), 1) / 1e6, amps_channel2freq(atoi(kanal[i]), 2) / 1e6);
 	}
 
-	main_mobile_loop(name, &quit, NULL, station_id);
+	/* Create Flash With Info FIFO */
+	unlink(AMPS_FLASH_FIFO);
+	rc = mkfifo(AMPS_FLASH_FIFO, 0666);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to create Flash FIFO '%s'!\n", AMPS_FLASH_FIFO);
+		goto fail;
+	} else {
+		flash_fd = open(AMPS_FLASH_FIFO, O_RDONLY | O_NONBLOCK);
+		if (flash_fd < 0) {
+			fprintf(stderr, "Failed to open Flash FIFO '%s'!\n", AMPS_FLASH_FIFO);
+			goto fail;
+		}
+	}
+
+	main_mobile_loop(name, &quit, amps_myhandler, station_id);
 
 fail:
+	/* FIFO cleanup */
+	if (flash_fd > 0)
+		close(flash_fd);
+	unlink(AMPS_FLASH_FIFO);
+
 	/* destroy transceiver instance */
 	while (sender_head)
 		amps_destroy(sender_head);
