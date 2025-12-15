@@ -16,6 +16,8 @@ enum amps_trans_state {
 	TRANS_CALL_REJECT,		/* rejecting channel, waiting to send */
 	TRANS_CALL_REJECT_SEND,		/* rejecting channel, sending reject */
 	TRANS_CALL,			/* active call */
+	TRANS_CALL_CHANGE_POWER,	/* changing power level, waiting to send */
+	TRANS_CALL_CHANGE_POWER_SEND,	/* changing power level, sending */
 	TRANS_CALL_RELEASE,		/* release call towards phone, waiting to send */
 	TRANS_CALL_RELEASE_SEND,	/* release call towards phone, sending release */
 	TRANS_PAGE,			/* paging phone, waiting to send */
@@ -43,6 +45,11 @@ typedef struct transaction {
 	int			sat_detected;		/* state if we detected SAT */
 	int			dtx;			/* if set, DTX is used with this call */
 	double			st_start_time;		/* time when ST was first detected */
+	uint8_t			current_vmac;		/* current VMAC value (0-7) */
+	uint8_t			max_vmac;		/* maximum VMAC allowed (from ms_power/limit) */
+	double			sat_level_avg;		/* running average of SAT level */
+	int			vmac_adjust_count;	/* samples since last VMAC adjustment */
+	int			vmac_grace_count;	/* grace period samples after power change */
 } transaction_t;
 
 transaction_t *create_transaction(amps_t *amps, enum amps_trans_state trans_state, uint32_t min1, uint16_t min2, uint32_t esn, uint8_t msg_type, uint8_t ordq, uint8_t order, uint16_t chan);

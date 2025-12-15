@@ -62,6 +62,10 @@ static const char *trans_state_name(int state)
 		return "CALL REJECT SEND";
 	case TRANS_CALL:
 		return "CALL";
+	case TRANS_CALL_CHANGE_POWER:
+		return "CHANGE POWER";
+	case TRANS_CALL_CHANGE_POWER_SEND:
+		return "CHANGE POWER SEND";
 	case TRANS_CALL_RELEASE:
 		return "CALL RELEASE";
 	case TRANS_CALL_RELEASE_SEND:
@@ -157,6 +161,13 @@ transaction_t *create_transaction(amps_t *amps, enum amps_trans_state state, uin
 	trans->ordq = ordq;
 	trans->order = order;
 	trans->chan = chan;
+	trans->vmac_adjust_count = 0;
+	trans->vmac_grace_count = 0;
+	trans->sat_level_avg = 0.0;
+	trans->current_vmac = 0; /* Start with max power */
+	/* Initialize VMAC from system info settings */
+	trans->current_vmac = amps->si.vmac;
+	trans->max_vmac = amps->si.vmac; /* Corresponds to configured Max Power (Min Attenuation) */
 
 	const char *number = amps_min2number(trans->min1, trans->min2);
 	LOGP(DTRANS, LOGL_INFO, "Created transaction for subscriber '%s'\n", number);

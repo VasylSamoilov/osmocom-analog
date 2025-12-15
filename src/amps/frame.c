@@ -3553,9 +3553,13 @@ int amps_encode_frame_fvc(amps_t *amps, char *bits)
 	/* send scheduled mobile control message */
 	if (amps->tx_fvc_send) {
 		if (amps->tx_fvc_word_count == 0) {
-			if (amps->tx_fvc_chan)
-				word = amps_encode_mobile_station_control_message_word1_b(amps->sat, amps->sat, (amps->si.word2.dtx) ? 1 : 0, 0, 0, amps->si.vmac, amps->tx_fvc_chan);
-			else
+			if (amps->tx_fvc_chan) {
+				uint8_t vmac = amps->si.vmac;
+				/* Use transaction-specific VMAC if available */
+				if (amps->trans_list && (amps->trans_list->state == TRANS_CALL || amps->trans_list->state == TRANS_CALL_CHANGE_POWER || amps->trans_list->state == TRANS_CALL_CHANGE_POWER_SEND))
+					vmac = amps->trans_list->current_vmac;
+				word = amps_encode_mobile_station_control_message_word1_b(amps->sat, amps->sat, (amps->si.word2.dtx) ? 1 : 0, 0, 0, vmac, amps->tx_fvc_chan);
+			} else
 				word = amps_encode_mobile_station_control_message_word1_a(amps->sat, amps->tx_fvc_msg_type, amps->tx_fvc_ordq, amps->tx_fvc_order);
 			/* done, if we don't have ALERTING with info */
 			if (amps->tx_fvc_order != 17)

@@ -43,6 +43,9 @@ int dtx = 0;
 int send_callerid = 0;
 int dcc = 0, scc = 0, sid = 0, regh = 1, regr = 1, pureg = 0, pdreg = 0, locaid = -1, regincr = 300, bis = 0;
 int tolerant = 0;
+int vmac_enable = 0;
+double vmac_level_low = 0.95;
+double vmac_level_high = 1.01;
 
 static void print_location_area_note(void)
 {
@@ -66,15 +69,19 @@ void print_help(const char *arg0)
 	printf("        a positive signal causes a positive deviation on your transmitter.\n");
 	printf("        If the phone shows 'NoSrv', try the other way.\n");
 	printf(" -P --ms-power <power level>\n");
-	printf("        Give power level of the mobile station 0..7. (default = '%d')\n", ms_power);
+	printf("        Give maximum power level of the mobile station 0..7. (default = '%d')\n", ms_power);
    if (!tacs) {
 	printf("        0 = 4 W;     1 = 1.6 W;   2 = 630 mW;  3 = 250 mW;\n");
 	printf("	4 = 100 mW;  5 = 40 mW;   6 = 16 mW;   7 = 6.3 mW\n");
+	printf("        (Setting this limits the maximum power, but allows further attenuation with VMAC option)\n");
    } else {
 	/* tacs, not jtacs: https://www.academia.edu/8265916/Total_Access_Communication_System?email_work_card=view-paper */
 	printf("        0 = 2.28 W;  1 = 1.12 W;  2 = 447 mW;  3 = 178 mW;\n");
 	printf("	4 = 70.8 mW; 5 = 28.2 mW; 6 = 11.2 mW; 7 = 4.5 mW\n");
    }
+	printf(" -V --vmac-levels <low,high> | default\n");
+	printf("        Enable Dynamic Power Control (disabled by default).\n");
+	printf("        Specify low,high quality levels (e.g. 95,101) or use 'default'.\n");
 	printf(" -D --dtx <parameter>\n");
 	printf("        Give DTX parameter for Discontinuous Transmission. (default = '%d')\n", dtx);
 	printf("        0 = disable DTX;                     1 = reserved;\n");
@@ -244,6 +251,21 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 'O':
 		tolerant = 1;
+		break;
+	case 'V':
+		vmac_enable = 1;
+		if (!strcasecmp(argv[argi], "default")) {
+			vmac_level_low = 0.95;
+			vmac_level_high = 1.01;
+		} else {
+			if (sscanf(argv[argi], "%lf,%lf", &vmac_level_low, &vmac_level_high) != 2) {
+				fprintf(stderr, "Error parsing VMAC levels '%s'. Format: low,high (e.g. 95,101)\n", argv[argi]);
+				return -EINVAL;
+			}
+			/* Convert integer percentages to ratio if needed */
+			if (vmac_level_low > 2.0) vmac_level_low /= 100.0;
+			if (vmac_level_high > 2.0) vmac_level_high /= 100.0;
+		}
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);

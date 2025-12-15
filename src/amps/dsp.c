@@ -895,6 +895,14 @@ static void sat_decode(amps_t *amps, sample_t *samples, int length)
 	display_measurements_update(amps->dmp_sat_level, sat_level * 100.0, 0.0);
 	display_measurements_update(amps->dmp_sat_quality, sat_quality * 100.0, 0.0);
 
+	/* Continuous SAT update to Upper Layer for Power Control */
+	if (amps->sat_state != SAT_STATE_NONE) {
+
+		/* Pass quality as before. RSSI could be passed too if we updated the API,
+		 * but for now we logged it here as requested. */
+		amps_rx_sat(amps, 1, sat_quality);
+	}
+
 	/* Debug signaling tone */
 	if (amps->sender.loopback || loglevel == LOGL_DEBUG) {
 		LOGP_CHAN(DDSP, loglevel, "Signaling Tone level %.2f%% quality %.0f%%\n", sig_level * 100.0, sig_quality * 100.0);

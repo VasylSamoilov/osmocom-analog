@@ -37,6 +37,8 @@
 
 #define CHAN amps->sender.kanal
 
+#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -69,6 +71,9 @@
 #define ST_FLASH_MIN	0.2		/* min duration for flash (200ms) */
 #define ST_FLASH_MAX	0.8		/* max duration for flash (800ms) */
 #define ST_RELEASE_TIME	1,800000	/* duration for release (1.8s) */
+
+/* Power Control Thresholds */
+#define VMAC_ADJUST_INTERVAL        50     /* Measurements between adjustments */
 
 /* Convert channel number to frequency number of base station.
    Set 'uplink' to 1 to get frequency of mobile station. */
@@ -824,6 +829,32 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 	}
 }
 
+static void adjust_vmac(transaction_t *trans)
+{
+	amps_t *amps = trans->amps;
+	if (trans->sat_level_avg > vmac_level_high) {
+		if (trans->current_vmac < 7) { /* 7 is max attenuation */
+			trans->current_vmac++;
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, "SAT too strong (%.1f%%), reducing power (VMAC %d->%d)\n", 
+				trans->sat_level_avg * 100.0, trans->current_vmac-1, trans->current_vmac);
+			if (trans->state == TRANS_CALL) {
+				trans_new_state(trans, TRANS_CALL_CHANGE_POWER);
+				amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+			}
+		}
+	} else if (trans->sat_level_avg < vmac_level_low) {
+		if (trans->current_vmac > trans->max_vmac) { /* Don't go below configured limit (allow more power) */
+			trans->current_vmac--;
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, "SAT too weak (%.1f%%), increasing power (VMAC %d->%d)\n", 
+				trans->sat_level_avg * 100.0, trans->current_vmac+1, trans->current_vmac);
+			if (trans->state == TRANS_CALL) {
+				trans_new_state(trans, TRANS_CALL_CHANGE_POWER);
+				amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+			}
+		}
+	}
+}
+
 void amps_rx_sat(amps_t *amps, int tone, double quality)
 {
 	transaction_t *trans = amps->trans_list;
@@ -844,14 +875,42 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 	 && trans->state != TRANS_CALL_MT_ALERT_SEND
 	 && trans->state != TRANS_CALL_MT_ALERT_CONFIRM
 	 && trans->state != TRANS_CALL_MT_ANSWER_WAIT
+	 && trans->state != TRANS_CALL_CHANGE_POWER
+	 && trans->state != TRANS_CALL_CHANGE_POWER_SEND
 	 && trans->state != TRANS_CALL) {
 		LOGP_CHAN(DAMPS, LOGL_ERROR, "SAT signal without active call, please fix!\n");
 		return;
 	}
 
+	/* Check grace period - Ignore SAT status updates during power change / blank-and-burst */
+	if (trans->vmac_grace_count > 0) {
+		trans->vmac_grace_count--;
+		/* Update average but with very low weight to avoid dragging it down */
+		// if (tone) trans->sat_level_avg = (trans->sat_level_avg * 0.99) + (quality * 0.01);
+		return;
+	}
+
 	if (tone) {
-		LOGP(DAMPS, LOGL_INFO, "Detected SAT signal with quality=%.0f.\n", quality * 100.0);
+		if (!trans->sat_detected)
+			LOGP(DAMPS, LOGL_INFO, "Detected SAT signal with quality=%.0f.\n", quality * 100.0);
 		trans->sat_detected = 1;
+		
+		/* Power Control Logic */
+		if (trans->state == TRANS_CALL && vmac_enable) {
+			/* Initialize average on first sample */
+			if (trans->sat_level_avg == 0.0)
+				trans->sat_level_avg = quality;
+			
+			/* Update running average */
+			trans->sat_level_avg = (trans->sat_level_avg * 0.9) + (quality * 0.1);
+			trans->vmac_adjust_count++;
+
+			/* Check if time to adjust */
+			if (trans->vmac_adjust_count >= VMAC_ADJUST_INTERVAL) {
+				adjust_vmac(trans);
+				trans->vmac_adjust_count = 0;
+			}
+		}
 	} else {
 		LOGP(DAMPS, LOGL_INFO, "Lost SAT signal\n");
 		trans->sat_detected = 0;
@@ -1279,6 +1338,8 @@ static amps_t *assign_voice_channel(transaction_t *trans)
 	else
 		LOGP(DAMPS, LOGL_INFO, "Moving to voice channel %s\n", vc->sender.kanal);
 
+	LOGP(DAMPS, LOGL_INFO, "Assigning Channel with Initial VMAC: %d (Max Allowed: %d)\n", trans->current_vmac, trans->max_vmac);
+
 	/* switch channel... */
 	osmo_timer_schedule(&trans->timer, SAT_TO1);
 	/* make channel busy */
@@ -1376,6 +1437,20 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		return NULL;
 
 	switch (trans->state) {
+	case TRANS_CALL_CHANGE_POWER:
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Change Power to Level %d\n", trans->current_vmac);
+		trans->msg_type = 0x0b; /* LOCAL_MSG_TYPE = 01011 (11) */
+		trans->ordq = trans->current_vmac; /* Power Level */
+		trans->order = 0; /* ORDER = 00000 */
+		trans_new_state(trans, TRANS_CALL_CHANGE_POWER_SEND);
+		return trans;
+	case TRANS_CALL_CHANGE_POWER_SEND:
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Change Power sent\n");
+		trans_new_state(trans, TRANS_CALL);
+		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+		/* Set grace period to ignore SAT drop caused by interruption (1/2 of SAT loss timer) */
+		trans->vmac_grace_count = 75; /* ~2.5 seconds worth of samples */
+		return NULL;
 	case TRANS_CALL_RELEASE:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Releasing call towards mobile station\n");
 		trans_new_state(trans, TRANS_CALL_RELEASE_SEND);
