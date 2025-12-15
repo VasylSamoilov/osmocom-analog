@@ -120,13 +120,20 @@
 #define SAT_PRINT		10	/* print sat measurement every 0.5 seconds */
 #define DTX_LEVEL		0.50	/* SAT level needed to mute/unmute */
 #define SIG_QUALITY		0.80	/* quality needed to detect Signaling Tone */
-#define SAT_DETECT_COUNT	5	/* number of measures to detect SAT signal (specs say 250ms) */
-#define SAT_LOST_COUNT		5	/* number of measures to loose SAT signal (specs say 250ms) */
+#define SIG_LEVEL		0.20	/* minimum level needed to detect Signaling Tone (relative to 8kHz deviation) */
+#define SAT_DETECT_COUNT	5	/* number of measures to detect SAT signal (~250ms per spec) */
+#define SAT_LOST_COUNT		5	/* number of measures to loose SAT signal (~250ms per spec) */
+#define SAT_FREQ_CHANGE_COUNT	5	/* number of measures for SAT frequency change (~250ms per spec) */
 #define SIG_DETECT_COUNT	6	/* number of measures to detect Signaling Tone */
 #define SIG_LOST_COUNT		4	/* number of measures to loose Signaling Tone */
 #define CUT_OFF_HIGHPASS	300.0   /* cut off frequency for high pass filter to remove dc level from sound card / sample */
 #define BEST_QUALITY		0.68	/* Best possible RX quality */
 #define COMFORT_NOISE		0.02	/* audio level of comfort noise (relative to speech level) */
+/* SAT level thresholds with hysteresis (relative to nominal=1.0) */
+#define SAT_LEVEL_HIGH		0.50	/* threshold to detect SAT (from no SAT state) */
+#define SAT_LEVEL_LOW		0.35	/* threshold to lose SAT (hysteresis ~3 dB) */
+/* Minimum ratio of dominant SAT frequency over others for valid classification */
+#define SAT_FREQ_RATIO		2.0	/* dominant frequency must be 2x (6 dB) above others */
 
 static sample_t ramp_up[256], ramp_down[256];
 
@@ -187,6 +194,77 @@ static void dsp_init_ramp(amps_t *amps)
 }
 
 static void sat_reset(amps_t *amps, const char *reason);
+
+/* Get human-readable name for SAT state */
+const char *sat_state_name(enum sat_state state)
+{
+	switch (state) {
+	case SAT_STATE_NONE: return "NONE";
+	case SAT_STATE_5970: return "5970 Hz";
+	case SAT_STATE_6000: return "6000 Hz";
+	case SAT_STATE_6030: return "6030 Hz";
+	default: return "UNKNOWN";
+	}
+}
+
+/* Classify SAT frequency based on Goertzel filter outputs.
+ * Returns the detected SAT frequency class, or SAT_FREQ_INVALID if
+ * no clear dominant frequency is detected.
+ */
+static enum sat_freq_class sat_classify_frequency(double levels[3])
+{
+	int max_idx = 0;
+	double max_level = levels[0];
+	double second_max = 0;
+	int i;
+
+	/* Find strongest SAT frequency */
+	for (i = 1; i < 3; i++) {
+		if (levels[i] > max_level) {
+			max_level = levels[i];
+			max_idx = i;
+		}
+	}
+
+	/* Find second strongest */
+	for (i = 0; i < 3; i++) {
+		if (i != max_idx && levels[i] > second_max)
+			second_max = levels[i];
+	}
+
+	/* Require dominant frequency to be significantly above second (6 dB) */
+	if (max_level < second_max * SAT_FREQ_RATIO)
+		return SAT_FREQ_INVALID;
+
+	switch (max_idx) {
+	case 0: return SAT_FREQ_5970;
+	case 1: return SAT_FREQ_6000;
+	case 2: return SAT_FREQ_6030;
+	default: return SAT_FREQ_INVALID;
+	}
+}
+
+/* Convert SAT frequency class to SAT state */
+static enum sat_state sat_freq_to_state(enum sat_freq_class freq_class)
+{
+	switch (freq_class) {
+	case SAT_FREQ_5970: return SAT_STATE_5970;
+	case SAT_FREQ_6000: return SAT_STATE_6000;
+	case SAT_FREQ_6030: return SAT_STATE_6030;
+	default: return SAT_STATE_NONE;
+	}
+}
+
+/* Convert SCC (SAT Color Code) to expected SAT state */
+static enum sat_state scc_to_sat_state(int scc)
+{
+	switch (scc) {
+	case 0: return SAT_STATE_5970;
+	case 1: return SAT_STATE_6000;
+	case 2: return SAT_STATE_6030;
+	default: return SAT_STATE_NONE;
+	}
+}
 
 /* Init FSK of transceiver */
 int dsp_init_sender(amps_t *amps, int tolerant)
@@ -753,75 +831,163 @@ static void sender_receive_frame(amps_t *amps, sample_t *samples, int length)
 
 
 /* decode SAT and signaling tone */
-/* compare supervisory signal against noise floor at 5790 Hz */
+/* Enhanced SAT detection with frequency classification per TIA/EIA-553-A */
 static void sat_decode(amps_t *amps, sample_t *samples, int length)
 {
-	double result[3], sat_quality, sig_quality, sat_level, sig_level;
+	double results[5], levels[3], sat_deviation;
+	double sat_quality, sig_quality, sat_level, sig_level, noise_level;
+	enum sat_freq_class freq_class;
+	enum sat_state new_state, expected_state;
+	double level_threshold;
+	int required_count;
+	int i;
 
-	audio_goertzel(&amps->sat_goertzel[amps->sat], samples, length, 0, &result[0], 1);
-	audio_goertzel(&amps->sat_goertzel[3], samples, length, 0, &result[1], 1);
-	audio_goertzel(&amps->sat_goertzel[4], samples, length, 0, &result[2], 1);
+	/* Run Goertzel filters for all 3 SAT frequencies + noise reference + signaling tone */
+	for (i = 0; i < 5; i++) {
+		audio_goertzel(&amps->sat_goertzel[i], samples, length, 0, &results[i], 1);
+	}
 
-	/* normalize sat level and signaling tone level */
-	sat_level = result[0] / ((!tacs) ? AMPS_SAT_DEVIATION : TACS_SAT_DEVIATION);
-	sig_level = result[2] / ((!tacs) ? AMPS_FSK_DEVIATION : TACS_FSK_DEVIATION);
+	/* Normalize levels for all 3 SAT frequencies */
+	sat_deviation = (!tacs) ? AMPS_SAT_DEVIATION : TACS_SAT_DEVIATION;
+	for (i = 0; i < 3; i++) {
+		levels[i] = results[i] / sat_deviation;
+		amps->sat_goertzel_levels[i] = levels[i];
+	}
+	noise_level = results[3] / sat_deviation;
+	sig_level = results[4] / ((!tacs) ? AMPS_FSK_DEVIATION : TACS_FSK_DEVIATION);
 
-	/* get normalized quality of SAT and signaling tone */
-	sat_quality = (result[0] - result[1]) / result[0];
+	/* Find maximum SAT level across all 3 frequencies */
+	sat_level = levels[0];
+	for (i = 1; i < 3; i++) {
+		if (levels[i] > sat_level)
+			sat_level = levels[i];
+	}
+
+	/* Calculate SAT level in dB (relative to nominal=1.0) */
+	amps->sat_level_db = 20.0 * log10(sat_level + 0.001);
+
+	/* Classify which SAT frequency is dominant */
+	freq_class = sat_classify_frequency(levels);
+	amps->sat_freq_detected = freq_class;
+
+	/* Calculate quality (ratio of SAT to noise) */
+	sat_quality = (sat_level > noise_level && sat_level > 0.001) ?
+	              (sat_level - noise_level) / sat_level : 0.0;
 	if (sat_quality < 0)
 		sat_quality = 0;
-	sig_quality = (result[2] - result[1]) / result[2];
+
+	sig_quality = (results[4] > results[3] && results[4] > 0.001) ?
+	              (results[4] - results[3]) / results[4] : 0.0;
 	if (sig_quality < 0)
 		sig_quality = 0;
 
-	/* debug SAT */
+	/* Debug SAT - enhanced with frequency info */
 	if (++amps->sat_print == SAT_PRINT) {
-		LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT level %.2f%% quality %.0f%%\n", sat_level * 100.0, sat_quality * 100.0);
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT: state=%s level=%.1f dB (%.0f%%) quality=%.0f%% [5970:%.0f%% 6000:%.0f%% 6030:%.0f%%]\n",
+		          sat_state_name(amps->sat_state),
+		          amps->sat_level_db,
+		          sat_level * 100.0, sat_quality * 100.0,
+		          levels[0] * 100.0, levels[1] * 100.0, levels[2] * 100.0);
 		amps->sat_print = 0;
 	}
 
-	/* update measurements (if dmp_* params are NULL, we omit this) */
+	/* Update measurements */
 	display_measurements_update(amps->dmp_sat_level, sat_level * 100.0, 0.0);
 	display_measurements_update(amps->dmp_sat_quality, sat_quality * 100.0, 0.0);
 
-	/* debug signaling tone */
+	/* Debug signaling tone */
 	if (amps->sender.loopback || loglevel == LOGL_DEBUG) {
 		LOGP_CHAN(DDSP, loglevel, "Signaling Tone level %.2f%% quality %.0f%%\n", sig_level * 100.0, sig_quality * 100.0);
 	}
 
-	/* mute if SAT quality or level is below threshold */
+	/* Update DTX state */
 	if (sat_quality > SAT_QUALITY && sat_level > DTX_LEVEL)
 		amps->dtx_state = 1;
 	else
 		amps->dtx_state = 0;
 
-	/* detect SAT */
-	if (sat_quality > SAT_QUALITY) {
-		if (amps->sat_detected == 0) {
-			amps->sat_detect_count++;
-			if (amps->sat_detect_count == SAT_DETECT_COUNT) {
-				amps->sat_detected = 1;
-				amps->sat_detect_count = 0;
-				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT signal detected with level=%.0f%%, quality=%.0f%%.\n", sat_level * 100.0, sat_quality * 100.0);
-				amps_rx_sat(amps, 1, sat_quality);
-			}
-		} else
-			amps->sat_detect_count = 0;
+	/* === Enhanced SAT State Machine === */
+
+	/* Determine target state based on level, quality, and frequency */
+	if (freq_class != SAT_FREQ_INVALID && sat_quality > SAT_QUALITY) {
+		/* Apply hysteresis based on current state */
+		level_threshold = (amps->sat_state == SAT_STATE_NONE) ?
+		                  SAT_LEVEL_HIGH : SAT_LEVEL_LOW;
+
+		if (sat_level >= level_threshold) {
+			new_state = sat_freq_to_state(freq_class);
+		} else {
+			new_state = SAT_STATE_NONE;
+		}
 	} else {
-		if (amps->sat_detected == 1) {
-			amps->sat_detect_count++;
-			if (amps->sat_detect_count == SAT_LOST_COUNT) {
-				amps->sat_detected = 0;
-				amps->sat_detect_count = 0;
-				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT signal lost.\n");
-				amps_rx_sat(amps, 0, 0.0);
-			}
-		} else
-			amps->sat_detect_count = 0;
+		new_state = SAT_STATE_NONE;
 	}
 
-	/* detect signaling tone */
-	if (sig_quality > SIG_QUALITY) {
+	/* State machine persistence logic */
+	if (new_state == amps->sat_pending_state) {
+		amps->sat_state_count++;
+	} else {
+		amps->sat_pending_state = new_state;
+		amps->sat_state_count = 1;
+	}
+
+	/* Determine required persistence count based on transition type */
+	if (new_state == SAT_STATE_NONE && amps->sat_state != SAT_STATE_NONE) {
+		/* SAT loss */
+		required_count = SAT_LOST_COUNT;
+	} else if (new_state != SAT_STATE_NONE && amps->sat_state == SAT_STATE_NONE) {
+		/* SAT detection */
+		required_count = SAT_DETECT_COUNT;
+	} else if (new_state != amps->sat_state) {
+		/* SAT frequency change */
+		required_count = SAT_FREQ_CHANGE_COUNT;
+	} else {
+		/* No state change needed */
+		required_count = 1;
+	}
+
+	/* Apply state transition if persistence requirement met */
+	if (amps->sat_state_count >= required_count) {
+		enum sat_state old_state = amps->sat_state;
+
+		if (new_state != old_state) {
+			amps->sat_state = new_state;
+
+			/* Notify upper layer of state changes */
+			if (old_state == SAT_STATE_NONE && new_state != SAT_STATE_NONE) {
+				/* SAT detected */
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT detected: freq=%s level=%.1f dB quality=%.0f%%\n",
+				          sat_state_name(new_state), amps->sat_level_db, sat_quality * 100.0);
+				amps->sat_detected = 1;
+				amps->sat_detect_count = 0;
+				amps_rx_sat(amps, 1, sat_quality);
+
+				/* Check for SAT mismatch (mobile transponds different SCC) */
+				expected_state = scc_to_sat_state(amps->sat);
+				if (new_state != expected_state) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT mismatch: expected %s, detected %s - triggering handoff callback\n",
+					          sat_state_name(expected_state), sat_state_name(new_state));
+					amps_rx_sat_mismatch(amps, expected_state, new_state);
+				}
+			} else if (old_state != SAT_STATE_NONE && new_state == SAT_STATE_NONE) {
+				/* SAT lost */
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT lost\n");
+				amps->sat_detected = 0;
+				amps->sat_detect_count = 0;
+				amps_rx_sat(amps, 0, 0.0);
+			} else if (old_state != new_state) {
+				/* SAT frequency changed (handoff candidate) */
+				LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT frequency changed: %s -> %s\n",
+				          sat_state_name(old_state), sat_state_name(new_state));
+				expected_state = scc_to_sat_state(amps->sat);
+				amps_rx_sat_mismatch(amps, expected_state, new_state);
+			}
+		}
+	}
+
+	/* === Signaling Tone Detection (unchanged) === */
+	/* Added SIG_LEVEL check to prevent spurious detection from low-level noise/spurs */
+	if (sig_quality > SIG_QUALITY && sig_level > SIG_LEVEL) {
 		if (amps->sig_detected == 0) {
 			amps->sig_detect_count++;
 			if (amps->sig_detect_count == SIG_DETECT_COUNT) {
@@ -929,6 +1095,12 @@ static void sat_reset(amps_t *amps, const char *reason)
 	amps->sat_detect_count = 0;
 	amps->sig_detected = 0;
 	amps->sig_detect_count = 0;
+	/* Reset enhanced SAT state machine */
+	amps->sat_state = SAT_STATE_NONE;
+	amps->sat_pending_state = SAT_STATE_NONE;
+	amps->sat_state_count = 0;
+	amps->sat_freq_detected = SAT_FREQ_INVALID;
+	amps->sat_level_db = -100.0;
 }
 
 void amps_set_dsp_mode(amps_t *amps, enum dsp_mode mode, int frame_length)

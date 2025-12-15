@@ -29,6 +29,7 @@ int call_up_setup(const char *callerid, const char *dialing, uint8_t network, co
 void call_up_alerting(int callref);
 void call_up_early(int callref);
 void call_up_answer(int callref, const char *connect_id);
+void call_up_flash(int callref);
 void call_up_release(int callref, int cause);
 void call_tone_recall(int callref, int on);
 

@@ -402,6 +402,18 @@ void call_up_answer(int callref, const char *connect_id)
 	new_state_process(callref, PROCESS_CONNECT);
 }
 
+/* Transceiver indicates flash (hook flash). */
+void call_up_flash(int callref)
+{
+	if (!callref) {
+		LOGP(DCALL, LOGL_DEBUG, "Ignoring flash, because callref not set. (not for us)\n");
+		return;
+	}
+
+	LOGP(DCALL, LOGL_INFO, "*** Flash (Hook-Flash) received from mobile (callref=%d) ***\n", callref);
+	/* TODO: Send suitable message to upper layer if supported (e.g. HOLD/RETRIEVE or FACILITY) */
+}
+
 /* Transceiver indicates release. */
 void call_up_release(int callref, int cause)
 {

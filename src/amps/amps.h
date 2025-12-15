@@ -35,6 +35,22 @@ enum fsk_rx_sync {
 	FSK_SYNC_NEGATIVE,	/* as above, but negative sync (high frequency deviation detected as low signal)  */
 };
 
+/* SAT (Supervisory Audio Tone) state machine states per TIA/EIA-553-A */
+enum sat_state {
+	SAT_STATE_NONE,		/* No valid SAT detected */
+	SAT_STATE_5970,		/* SAT at 5970 Hz detected (SCC 0) */
+	SAT_STATE_6000,		/* SAT at 6000 Hz detected (SCC 1) */
+	SAT_STATE_6030,		/* SAT at 6030 Hz detected (SCC 2) */
+};
+
+/* SAT frequency classification result */
+enum sat_freq_class {
+	SAT_FREQ_INVALID,	/* Frequency outside valid windows or below threshold */
+	SAT_FREQ_5970,		/* 5955-5985 Hz window (SCC 0) */
+	SAT_FREQ_6000,		/* 5985-6015 Hz window (SCC 1) */
+	SAT_FREQ_6030,		/* 6015-6045 Hz window (SCC 2) */
+};
+
 #define FSK_MAX_BITS		1032	/* maximum number of bits to process (FVC with dotting+sync) */
 
 struct amps {
@@ -160,6 +176,13 @@ struct amps {
 	int			dtx_state;		/* 1 = high (fast sat detection) */
 	int			sat_detected;		/* current detection state flag (delayed detection) */
 	int			sat_detect_count;	/* current number of consecutive detections/losses */
+	/* Enhanced SAT state machine per TIA/EIA-553-A */
+	enum sat_state		sat_state;		/* current SAT state machine state */
+	enum sat_state		sat_pending_state;	/* pending state during persistence window */
+	int			sat_state_count;	/* persistence counter for state transitions */
+	double			sat_level_db;		/* current SAT level in dB (relative to nominal) */
+	enum sat_freq_class	sat_freq_detected;	/* currently detected SAT frequency class */
+	double			sat_goertzel_levels[3];	/* levels of all 3 SAT frequencies */
 	int			sig_detected;		/* current detection state flag (delayed detection) */
 	int			sig_detect_count;	/* current number of consecutive detections/losses */
 
@@ -191,6 +214,8 @@ void amps_destroy(sender_t *sender);
 void amps_go_idle(amps_t *amps);
 void amps_rx_signaling_tone(amps_t *amps, int tone, double quality);
 void amps_rx_sat(amps_t *amps, int tone, double quality);
+void amps_rx_sat_mismatch(amps_t *amps, enum sat_state expected, enum sat_state detected);
+const char *sat_state_name(enum sat_state state);
 void amps_rx_recc(amps_t *amps, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing);
 transaction_t *amps_tx_frame_focc(amps_t *amps);
 transaction_t *amps_tx_frame_fvc(amps_t *amps);

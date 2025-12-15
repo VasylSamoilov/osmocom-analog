@@ -42,7 +42,7 @@ typedef struct transaction {
 	struct osmo_timer_list		timer;			/* for varous timeouts */
 	int			sat_detected;		/* state if we detected SAT */
 	int			dtx;			/* if set, DTX is used with this call */
-	int			st_grace_active;	/* if set, ignore ST for grace period (button bounce) */
+	double			st_start_time;		/* time when ST was first detected */
 } transaction_t;
 
 transaction_t *create_transaction(amps_t *amps, enum amps_trans_state trans_state, uint32_t min1, uint16_t min2, uint32_t esn, uint8_t msg_type, uint8_t ordq, uint8_t order, uint16_t chan);

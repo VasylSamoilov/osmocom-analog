@@ -37,12 +37,11 @@
 
 #define CHAN amps->sender.kanal
 
-#include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include "../libsample/sample.h"
+#include "../libmobile/get_time.h"
 #include "../liblogging/logging.h"
 #include "../libmobile/call.h"
 #include "../libmobile/cause.h"
@@ -67,7 +66,9 @@
 #define ALERT_TO	0,600000	/* max time to wait for alert confirm */
 #define ANSWER_TO	60,0		/* max time to wait for answer */
 #define RELEASE_TIMER	5,0		/* max time to send release messages */
-#define ST_ANSWER_GRACE	0,250000	/* grace period after answer to ignore ST (button bounce/double-press) */
+#define ST_FLASH_MIN	0.2		/* min duration for flash (200ms) */
+#define ST_FLASH_MAX	0.8		/* max duration for flash (800ms) */
+#define ST_RELEASE_TIME	1,800000	/* duration for release (1.8s) */
 
 /* Convert channel number to frequency number of base station.
    Set 'uplink' to 1 to get frequency of mobile station. */
@@ -736,16 +737,42 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 	switch (trans->state) {
 	case TRANS_CALL_MO_ASSIGN_CONFIRM: // should not happen
 	case TRANS_CALL:
-		if (!tone)
-			break;
-		/* Check if we're in grace period after answer (button bounce/double-press) */
-		if (trans->st_grace_active) {
-			LOGP_CHAN(DAMPS, LOGL_NOTICE, "ST detected during grace period after answer - ignoring (likely button bounce/double-press) (callref=%d)\n", trans->callref);
-			break;
+		if (tone) {
+			/* ST detected during active call */
+			if (trans->st_start_time == 0.0) {
+				/* Start timing the ST duration */
+				LOGP_CHAN(DAMPS, LOGL_DEBUG, "Signaling Tone detected in active call - starting timer\n");
+				trans->st_start_time = get_time();
+				/* Schedule timer for Release condition (1.8s) */
+				if (trans->sat_detected)
+					osmo_timer_schedule(&trans->timer, ST_RELEASE_TIME);
+			}
+		} else {
+			/* ST Lost during active call */
+			if (trans->st_start_time != 0.0) {
+				double duration = get_time() - trans->st_start_time;
+				
+				LOGP_CHAN(DAMPS, LOGL_DEBUG, "Signaling Tone duration: %.4f s\n", duration);
+				
+				trans->st_start_time = 0.0;
+				osmo_timer_del(&trans->timer);
+				
+				if (duration >= ST_FLASH_MIN && duration <= ST_FLASH_MAX) {
+					LOGP_CHAN(DAMPS, LOGL_NOTICE, "*** Hook-Flash Detected (duration %.4f s) ***\n", duration);
+					if (trans->callref)
+						call_up_flash(trans->callref);
+				} else if (duration > ST_FLASH_MAX) {
+					LOGP_CHAN(DAMPS, LOGL_NOTICE, "*** ST Duration (%.4f s) > Flash Max - Interpreting as Release ***\n", duration);
+					if (trans->callref)
+						call_up_release(trans->callref, CAUSE_NORMAL);
+					destroy_transaction(trans);
+					amps_go_idle(amps);
+				} else {
+					LOGP_CHAN(DAMPS, LOGL_NOTICE, "ST Pulse too short (%.4f s) - ignored\n", duration);
+				}
+			}
 		}
-		/* ST detected during active call - this indicates hook-flash/release */
-		LOGP_CHAN(DAMPS, LOGL_NOTICE, "*** ST DETECTED during active CALL - interpreting as hook-flash/release (callref=%d) ***\n", trans->callref);
-		/* FALLTHRU */
+		break;
 	case TRANS_CALL_RELEASE:
 	case TRANS_CALL_RELEASE_SEND:
 		/* also loosing singaling tone indicates release confirm (after alerting) */
@@ -780,12 +807,8 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 				osmo_timer_del(&trans->timer);
 				if (!trans->sat_detected)
 					osmo_timer_schedule(&trans->timer, SAT_TO1);
-				/* Enable grace period to ignore ST from button bounce/double-press */
-				trans->st_grace_active = 1;
 				call_up_answer(trans->callref, amps_min2number(trans->min1, trans->min2));
 				trans_new_state(trans, TRANS_CALL);
-				/* Schedule timer to disable grace period after 250ms */
-				osmo_timer_schedule(&trans->timer, ST_ANSWER_GRACE);
 			} else {
 				/* ST lost but SAT not detected - likely signal issue or non-compliant phone.
 				 * Keep waiting for answer. The ANSWER_TO timer will handle timeout. */
@@ -862,7 +885,72 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 		return;
 }
 
-/* receive message from phone on RECC */
+/*
+ * SAT frequency mismatch callback - called when mobile transponds a different
+ * SAT frequency than expected (potential handoff candidate).
+ *
+ * Per TIA/EIA-553-A, if SAT does not match SCCr (requested SCC), the base
+ * station should enable fade timing. This callback provides the information
+ * needed to initiate a handoff to the correct cell.
+ */
+void amps_rx_sat_mismatch(amps_t *amps, enum sat_state expected, enum sat_state detected)
+{
+	transaction_t *trans = amps->trans_list;
+
+	if (trans == NULL) {
+		LOGP_CHAN(DAMPS, LOGL_DEBUG, "SAT mismatch without transaction, ignoring\n");
+		return;
+	}
+
+	/* Only process mismatch during active call states */
+	if (trans->state != TRANS_CALL_MO_ASSIGN_CONFIRM
+	 && trans->state != TRANS_CALL_MT_ASSIGN_CONFIRM
+	 && trans->state != TRANS_CALL_MT_ALERT
+	 && trans->state != TRANS_CALL_MT_ALERT_SEND
+	 && trans->state != TRANS_CALL_MT_ALERT_CONFIRM
+	 && trans->state != TRANS_CALL_MT_ANSWER_WAIT
+	 && trans->state != TRANS_CALL) {
+		LOGP_CHAN(DAMPS, LOGL_DEBUG, "SAT mismatch in non-call state, ignoring\n");
+		return;
+	}
+
+	/* Ignore during release */
+	if (trans->state == TRANS_CALL_RELEASE
+	 || trans->state == TRANS_CALL_RELEASE_SEND)
+		return;
+
+	LOGP_CHAN(DAMPS, LOGL_NOTICE, "SAT mismatch detected: expected %s (SCC %d), got %s\n",
+	          sat_state_name(expected),
+	          amps->sat,
+	          sat_state_name(detected));
+
+	/*
+	 * TODO: Implement handoff logic here
+	 *
+	 * Per TIA/EIA-553-A section 2.6.2.3:
+	 * - If SAT does not match SCCr, enable fade timing
+	 * - The mobile may have locked onto a different cell's SAT
+	 * - This indicates potential handoff candidate
+	 *
+	 * Possible actions:
+	 * 1. Start fade timer (if not already running from SAT loss)
+	 * 2. Notify higher layer (e.g., MSC) for handoff decision
+	 * 3. Log for inter-cell coordination
+	 *
+	 * For now, we just log the event. Full handoff implementation
+	 * would require inter-cell coordination protocol.
+	 */
+
+	/* Start fade timer if not already set (treat as potential SAT loss) */
+	if (!trans->dtx && trans->state == TRANS_CALL) {
+		if (!osmo_timer_pending(&trans->timer)) {
+			LOGP_CHAN(DAMPS, LOGL_INFO, "Starting fade timer due to SAT mismatch\n");
+			osmo_timer_schedule(&trans->timer, SAT_TO2);
+		}
+	}
+}
+
+
 void amps_rx_recc(amps_t *amps, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing)
 {
 	amps_t *vc;
@@ -1122,13 +1210,15 @@ void transaction_timeout(void *data)
 		amps_release(amps->trans_list, CAUSE_TEMPFAIL);
 		break;
 	case TRANS_CALL:
-		/* Check if this is grace period timeout */
-		if (trans->st_grace_active) {
-			LOGP_CHAN(DAMPS, LOGL_DEBUG, "ST grace period expired - now accepting ST as hook-flash\n");
-			trans->st_grace_active = 0;
-			/* Reschedule SAT timeout if SAT not detected */
-			if (!trans->sat_detected)
-				osmo_timer_schedule(&trans->timer, SAT_TO1);
+		/* Check if this is ST Release timeout */
+		if (trans->st_start_time != 0.0) {
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, "*** Signaling Tone held > 1.8s - Releasing call ***\n");
+			trans->st_start_time = 0.0;
+			/* Release call */
+			if (trans->callref)
+				call_up_release(trans->callref, CAUSE_NORMAL);
+			destroy_transaction(trans);
+			amps_go_idle(amps);
 			break;
 		}
 		/* Otherwise this is SAT timeout */
