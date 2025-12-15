@@ -128,9 +128,21 @@ void print_help(const char *arg0)
 	printf("        If 1, be sure to have a round-trip delay (latency) not more than 5 ms\n");
 	printf(" -O --tolerant\n");
 	printf("        Be more tolerant when hunting for sync sequence\n");
+	printf("\nDialing Prefixes:\n");
+	printf("        You can configure alerting parameters per call by prefixing the number:\n");
+	printf("        +%s[PI][SI][Pitch][Cadence]xxxxxxxxxx  (or %s...)\n", mobile_amps_param_prefix, mobile_amps_param_prefix);
+	printf("        PI: 0=Allowed(Default), 1=Restricted, 2=NotAvail, 3=Reserved\n");
+	printf("        SI: 0=Unscreened, 1=Passed, 2=Failed, 3=Network(Default)\n");
+	printf("        Pitch: 0=Medium(Default), 1=High, 2=Low, 3=Reserved\n");
+	printf("        Cadence: 00=NoTone, 01=Long(Default), 02=ShortShort, 03=ShortShortLong,\n");
+	printf("                 04-06=OtherPatterns, 07-11=PBXPatterns\n");
+	printf("    --amps-prefix <prefix>\n");
+	printf("        Give prefix for alerting parameters. (default = '%s')\n", mobile_amps_param_prefix);
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
 }
+
+#define OPT_PREFIX 256
 
 static void add_options(void)
 {
@@ -142,6 +154,7 @@ static void add_options(void)
 	option_add('I', "caller-id", 1);
 	option_add('S', "sysinfo", 1);
 	option_add('O', "tolerant", 0);
+	option_add(OPT_PREFIX, "amps-prefix", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -266,6 +279,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			if (vmac_level_low > 2.0) vmac_level_low /= 100.0;
 			if (vmac_level_high > 2.0) vmac_level_high /= 100.0;
 		}
+		break;
+	case OPT_PREFIX:
+		mobile_amps_param_prefix = argv[argi];
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);

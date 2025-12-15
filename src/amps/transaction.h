@@ -50,6 +50,10 @@ typedef struct transaction {
 	double			sat_level_avg;		/* running average of SAT level */
 	int			vmac_adjust_count;	/* samples since last VMAC adjustment */
 	int			vmac_grace_count;	/* grace period samples after power change */
+	int			signal_pitch;		/* pitch of alerting signal (0-3) */
+	int			signal_cadence;		/* cadence of alerting signal (0-63) */
+	int			presentation_indicator;	/* presentation indicator (0-3 or -1 for default) */
+	int			screening_indicator;	/* screening indicator (0-3 or -1 for default) */
 } transaction_t;
 
 transaction_t *create_transaction(amps_t *amps, enum amps_trans_state trans_state, uint32_t min1, uint16_t min2, uint32_t esn, uint8_t msg_type, uint8_t ordq, uint8_t order, uint16_t chan);

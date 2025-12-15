@@ -1112,6 +1112,11 @@ int call_down_setup(int callref, const char __attribute__((unused)) *caller_id, 
 	uint16_t min2;
 
 	/* 1. split number into area code and number */
+	int signal_pitch = mobile_amps_param_pitch;
+	int signal_cadence = mobile_amps_param_cadence;
+	int pi = mobile_amps_param_present;
+	int si = mobile_amps_param_screen;
+
 	amps_number2min(dialing, &min1, &min2);
 
 	/* 2. check if the subscriber is attached */
@@ -1154,6 +1159,16 @@ int call_down_setup(int callref, const char __attribute__((unused)) *caller_id, 
 		LOGP(DAMPS, LOGL_ERROR, "Failed to create transaction\n");
 		return -CAUSE_TEMPFAIL;
 	}
+	/* store custom parameters if set */
+	if (signal_pitch != -1)
+		trans->signal_pitch = signal_pitch;
+	if (signal_cadence != -1)
+		trans->signal_cadence = signal_cadence;
+	if (pi != -1)
+		trans->presentation_indicator = pi;
+	if (si != -1)
+		trans->screening_indicator = si;
+
 	trans->callref = callref;
 	trans->page_retry = 1;
 	if (caller_type == TYPE_INTERNATIONAL) {

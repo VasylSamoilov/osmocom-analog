@@ -88,10 +88,133 @@ static const char *number_digits;
 static const struct number_lengths *number_lengths;
 static const char **number_prefixes;
 
+int mobile_amps_param_present = -1;
+int mobile_amps_param_screen = -1;
+int mobile_amps_param_pitch = -1;
+int mobile_amps_param_cadence = -1;
+
+char *mobile_amps_param_prefix = "0000";
+
+static const char *amps_pi[] = {
+	"Presentation Allowed",
+	"Presentation Restricted",
+	"Number Not Available",
+	"Reserved",
+};
+
+static const char *mobile_amps_pi(int value)
+{
+	if (value < 0 || value > 3) return "Unknown";
+	return amps_pi[value];
+}
+
+static const char *amps_si[] = {
+	"User-provided, not screened",
+	"User-provided, verified and passed",
+	"User-provided, verified and failed",
+	"Network-provided",
+};
+
+static const char *mobile_amps_si(int value)
+{
+	if (value < 0 || value > 3) return "Unknown";
+	return amps_si[value];
+}
+
+static const char *amps_pitch[] = {
+	"Medium pitch",
+	"High pitch",
+	"Low pitch",
+	"Reserved",
+};
+
+static const char *mobile_amps_pitch(int value)
+{
+	if (value < 0 || value > 3) return "Unknown";
+	return amps_pitch[value];
+}
+
+static const char *amps_cadence[] = {
+	"No Tone",
+	"Long",
+	"Short-Short",
+	"Short-Short-Long",
+	"Short-Short-2",
+	"Short-Long-Short",
+	"Short-Short-Short-Short",
+	"PBX Long",
+	"PBX Short-Short",
+	"PBX Short-Short-Long",
+	"PBX Short-Long-Short",
+	"PBX Short-Short-Short-Short",
+};
+
+static const char *mobile_amps_cadence(int value)
+{
+	if (value < 0) return "Unknown";
+	if (value < 12) return amps_cadence[value];
+	return "Other/Reserved";
+}
+
+
 const char *mobile_number_remove_prefix(const char *number)
 {
 	size_t len;
 	int i, j;
+	const char *dialing_parsed = number;
+	char *prefix = mobile_amps_param_prefix;
+	size_t prefix_len = strlen(prefix);
+	size_t number_len = strlen(number);
+
+	/* Reset Parameters */
+	mobile_amps_param_present = -1;
+	mobile_amps_param_screen = -1;
+	mobile_amps_param_pitch = -1;
+	mobile_amps_param_cadence = -1;
+
+	/* check for parameter prefix */
+	int prefix_match = 0;
+	size_t expected_total_len = 0;
+
+	/* Case 1: Prefix matches exactly */
+	if (!strncmp(number, prefix, prefix_len)) {
+		expected_total_len = prefix_len + 5 + 10;
+		if (number_len == expected_total_len) {
+			dialing_parsed = number + prefix_len;
+			prefix_match = 1;
+		}
+	}
+	/* Case 2: Number has + and then Prefix */
+	if (!prefix_match && number[0] == '+' && !strncmp(number + 1, prefix, prefix_len)) {
+		expected_total_len = 1 + prefix_len + 5 + 10;
+		if (number_len == expected_total_len) {
+			dialing_parsed = number + 1 + prefix_len;
+			prefix_match = 1;
+		}
+	}
+
+	if (prefix_match && dialing_parsed) {
+		if (dialing_parsed[0] >= '0' && dialing_parsed[0] <= '3' &&
+		    dialing_parsed[1] >= '0' && dialing_parsed[1] <= '3' &&
+		    dialing_parsed[2] >= '0' && dialing_parsed[2] <= '3' &&
+		    dialing_parsed[3] >= '0' && dialing_parsed[3] <= '9' &&
+		    dialing_parsed[4] >= '0' && dialing_parsed[4] <= '9') {
+			
+			mobile_amps_param_present = dialing_parsed[0] - '0';
+			mobile_amps_param_screen = dialing_parsed[1] - '0';
+			mobile_amps_param_pitch = dialing_parsed[2] - '0';
+			mobile_amps_param_cadence = (dialing_parsed[3] - '0') * 10 + (dialing_parsed[4] - '0');
+
+			/* Found valid prefix, return striped number */
+			printf("Found prefix: PI=%d (%s) SI=%d (%s) Pitch=%d (%s) Cadence=%d (%s) Number=%s\n",
+				mobile_amps_param_present, mobile_amps_pi(mobile_amps_param_present),
+				mobile_amps_param_screen, mobile_amps_si(mobile_amps_param_screen),
+				mobile_amps_param_pitch, mobile_amps_pitch(mobile_amps_param_pitch),
+				mobile_amps_param_cadence, mobile_amps_cadence(mobile_amps_param_cadence),
+				dialing_parsed + 5);
+			return dialing_parsed + 5;
+		}
+	}
 
 	if (!number_prefixes)
 		return number;

@@ -3535,12 +3535,29 @@ int amps_encode_frame_fvc(amps_t *amps, char *bits)
 			amps->tx_fvc_order = trans->order;
 			amps->tx_fvc_chan = trans->chan;
 			strncpy(amps->tx_fvc_callerid, trans->caller_id, sizeof(amps->tx_fvc_callerid) - 1);
-			amps->tx_fvc_callerid_signal = 1;
-			amps->tx_fvc_callerid_screen = 3;
+			/* Set defaults */
+			amps->tx_fvc_callerid_signal = 1; /* Medium Pitch, Long Cadence */
+			/* ie_signal(1):
+			 * Pitch = (1 >> 6) & 3 = 0 (Medium)
+			 * Cadence = 1 & 0x3f = 1 (Long)
+			 */
+			amps->tx_fvc_callerid_screen = 3; /* Network Provided */
 			if (trans->caller_id[0])
-				amps->tx_fvc_callerid_present = 0;
+				amps->tx_fvc_callerid_present = 0; /* Presentation Allowed */
 			else
-				amps->tx_fvc_callerid_signal = 1;
+				amps->tx_fvc_callerid_present = 2; /* Number Not Available */
+
+			/* Override with custom parameters from transaction if set */
+			if (trans->signal_pitch != -1 || trans->signal_cadence != -1) {
+				int pitch = (trans->signal_pitch != -1) ? trans->signal_pitch : 0;
+				int cadence = (trans->signal_cadence != -1) ? trans->signal_cadence : 1;
+				amps->tx_fvc_callerid_signal = (pitch << 6) | (cadence & 0x3f);
+			}
+			if (trans->presentation_indicator != -1)
+				amps->tx_fvc_callerid_present = trans->presentation_indicator;
+			if (trans->screening_indicator != -1)
+				amps->tx_fvc_callerid_screen = trans->screening_indicator;
+
 			amps->tx_fvc_send = 1;
 			amps->tx_fvc_word_count = 0;
 			amps->tx_fvc_word_repeat = 0;

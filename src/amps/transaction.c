@@ -169,6 +169,12 @@ transaction_t *create_transaction(amps_t *amps, enum amps_trans_state state, uin
 	trans->current_vmac = amps->si.vmac;
 	trans->max_vmac = amps->si.vmac; /* Corresponds to configured Max Power (Min Attenuation) */
 
+	/* Initialize pitch/cadence/pi/si with defaults (or invalid values to indicate fallback) */
+	trans->signal_pitch = -1; /* default usage in frame.c */
+	trans->signal_cadence = -1; /* default usage in frame.c */
+	trans->presentation_indicator = -1;
+	trans->screening_indicator = -1;
+
 	const char *number = amps_min2number(trans->min1, trans->min2);
 	LOGP(DTRANS, LOGL_INFO, "Created transaction for subscriber '%s'\n", number);
 
