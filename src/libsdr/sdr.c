@@ -882,7 +882,7 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 			delay = (double)sdr->thread_write.max_fill / 2.0 / (double)sdr->samplerate;
 			sdr->thread_write.max_fill = 0;
 			sdr->thread_write.max_fill_timer += 1.0;
-			LOGP(DSDR, LOGL_DEBUG, "write delay = %.3f ms\n", delay * 1000.0);
+			// LOGP(DSDR, LOGL_DEBUG, "write delay = %.3f ms\n", delay * 1000.0);
 		}
 
 		if (space < num * 2) {
@@ -950,7 +950,7 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 			delay = (double)sdr->thread_read.max_fill / 2.0 / (double)sdr_config->samplerate;
 			sdr->thread_read.max_fill = 0;
 			sdr->thread_read.max_fill_timer += 1.0;
-			LOGP(DSDR, LOGL_DEBUG, "read delay = %.3f ms\n", delay * 1000.0);
+			// LOGP(DSDR, LOGL_DEBUG, "read delay = %.3f ms\n", delay * 1000.0);
 		}
 
 		if (fill / 2 / sdr->oversample < num)

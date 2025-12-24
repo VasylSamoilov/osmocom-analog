@@ -19,6 +19,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "../libsample/sample.h"
@@ -56,9 +57,25 @@ double timeconstant2cutoff(double time_constant_us)
 int init_emphasis(emphasis_t *state, int samplerate, double cut_off, double cut_off_h, double cut_off_l)
 {
 	double factor;
-	sample_t test_samples[samplerate / 10];
+	int test_num;
+	sample_t *test_samples;
 
 	memset(state, 0, sizeof(*state));
+
+	/* Limit test buffer to 1 second or 100000 samples max to avoid
+	 * excessive memory use at high sample rates. 100ms is sufficient
+	 * for calibration of a 1 kHz sine wave. */
+	test_num = samplerate / 10;
+	if (test_num > 100000)
+		test_num = 100000;
+	if (test_num < 1000)
+		test_num = 1000;
+
+	test_samples = malloc(test_num * sizeof(sample_t));
+	if (!test_samples) {
+		fprintf(stderr, "Failed to allocate emphasis calibration buffer\n");
+		return -1;
+	}
 
 	/* exp (-2 * PI * CUT_OFF * delta_t) */
 	factor = exp(-2.0 * PI * cut_off / (double)samplerate); /* 1/samplerate == delta_t */
@@ -78,12 +95,14 @@ int init_emphasis(emphasis_t *state, int samplerate, double cut_off, double cut_
 	iir_lowpass_init(&state->p.lp, cut_off_l, samplerate, 2);
 
 	/* calibrate amplification to be neutral at 1000 Hz */
-	gen_sine(test_samples, sizeof(test_samples) / sizeof(test_samples[0]), samplerate, 1000.0);
-	pre_emphasis(state, test_samples, sizeof(test_samples) / sizeof(test_samples[0]));
-	state->p.amp = 1.0 / get_level(test_samples, sizeof(test_samples) / sizeof(test_samples[0]));
-	gen_sine(test_samples, sizeof(test_samples) / sizeof(test_samples[0]), samplerate, 1000.0);
-	de_emphasis(state, test_samples, sizeof(test_samples) / sizeof(test_samples[0]));
-	state->d.amp = 1.0 / get_level(test_samples, sizeof(test_samples) / sizeof(test_samples[0]));
+	gen_sine(test_samples, test_num, samplerate, 1000.0);
+	pre_emphasis(state, test_samples, test_num);
+	state->p.amp = 1.0 / get_level(test_samples, test_num);
+	gen_sine(test_samples, test_num, samplerate, 1000.0);
+	de_emphasis(state, test_samples, test_num);
+	state->d.amp = 1.0 / get_level(test_samples, test_num);
+
+	free(test_samples);
 
 	return 0;
 }

@@ -34,14 +34,52 @@
 #define STEREO_BW	15000.0
 #define PILOT_FREQ	19000.0
 #define PILOT_BW	5.0
+#define PHASE_ERROR_TOLERANCE	3.0	/* ITU-R BS.450-4 S2.2.2.5: +/-3deg */
+#define PHASE_ERROR_AVG_SAMPLES	10000	/* samples to average for phase error */
 
 static char freq_name[2][64];
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2)
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose)
 {
 	int rc = -EINVAL;
+	double safe_scaler = 1.0;
 
-	clipper_init(CLIP_POINT);
+
+	/* 
+	 * GAIN SCALING & CLIPPER SETUP
+	 * ----------------------------
+	 * FM broadcast uses pre-emphasis to boost high frequencies before transmission,
+	 * which are then de-emphasized on receive. This creates a headroom problem:
+	 *
+	 * Pre-emphasis boost at 50us (European) / 75us (US):
+	 *   500 Hz: +3 dB,  1 kHz: +6 dB,  5 kHz: +14 dB,  15 kHz: +17 dB
+	 *
+	 * IMPORTANT: Input levels should be reduced to avoid clipping!
+	 * - Use -V 0.5 or lower for full-scale input (e.g., test tones)
+	 * - Music/speech with typical dynamics usually works at -V 0.8
+	 * - The soft clipper will activate on peaks, creating odd harmonics
+	 *
+	 * 1. Headroom for Pilot/RDS subcarriers
+	 */
+	if (stereo)
+		safe_scaler -= 0.10; /* Reserve 10% for 19 kHz Pilot Tone */
+	if (rds || rds2)
+		safe_scaler -= 0.05; /* Reserve 5% for 57 kHz RDS Subcarrier */
+
+	/* 
+	 * 2. Pre-emphasis Gain Strategy (Standard Broadcast Practice):
+	 *    - Normalize for unity gain at 1 kHz reference tone
+	 *    - High-frequency peaks (>5 kHz) will hit the soft clipper
+	 *    - This maximizes loudness while clipper prevents over-deviation
+	 */
+
+	if (safe_scaler < 1.0) {
+		LOGP(DRADIO, LOGL_NOTICE, "Auto-scaling input volume by %.3f to reserve headroom for Pilot/RDS.\n", safe_scaler);
+		volume *= safe_scaler;
+	}
+
+	/* Soft clipper at 1.0 (maximum deviation). Peaks exceeding this are limited. */
+	clipper_init(1.0);
 
 	memset(radio, 0, sizeof(*radio));
 	radio->buffer_size = buffer_size;
@@ -49,6 +87,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	radio->stereo = stereo;
 	radio->rds = rds;
 	radio->rds2 = rds2;
+	radio->sca_67k = sca_67k;
+	radio->sca_92k = sca_92k;
 	radio->tx_wave_file = tx_wave_file;
 	radio->modulation = modulation;
 	radio->signal_samplerate = samplerate;
@@ -66,6 +106,11 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			radio->signal_bandwidth = deviation + 60000.0;
 		if (radio->rds2)
 			radio->signal_bandwidth = deviation + 80000.0;
+		/* SCA extends bandwidth further */
+		if (radio->sca_67k)
+			radio->signal_bandwidth = deviation + 75000.0;
+		if (radio->sca_92k)
+			radio->signal_bandwidth = deviation + 100000.0;
 		break;
 	case MODULATION_AM_DSB:
 	case MODULATION_AM_USB:
@@ -207,6 +252,12 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	iir_highpass_init(&radio->tx_dc_removal[0], DC_CUTOFF, radio->tx_audio_samplerate, 1);
 	iir_highpass_init(&radio->tx_dc_removal[1], DC_CUTOFF, radio->tx_audio_samplerate, 1);
 
+	/* init DC blocker state */
+	radio->tx_dc_prev_x[0] = 0.0;
+	radio->tx_dc_prev_x[1] = 0.0;
+	radio->tx_dc_prev_y[0] = 0.0;
+	radio->tx_dc_prev_y[1] = 0.0;
+
 	/* stereo pilot tone phase */
 	radio->pilot_phasestep = 2.0 * M_PI * PILOT_FREQ / radio->signal_samplerate;
 
@@ -217,16 +268,31 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
         iir_lowpass_init(&radio->rx_lp_diff, STEREO_BW, radio->signal_samplerate, 2);
 
 	/* init sample rate conversion, use complete bandwidth for resample filter */
-	rc = init_samplerate(&radio->tx_resampler[0], radio->tx_audio_samplerate, radio->signal_samplerate, radio->tx_audio_samplerate / 2.0);
+	/* 
+	 * RECONSTRUCTION/ANTI-ALIASING FILTER
+	 * -----------------------------------
+	 * We use a strict 15kHz cutoff (Standard FM Bandwidth) for the upsampler.
+	 * 
+	 * JUSTIFICATION:
+	 * 1. The previous default (audio_samplerate / 2) allowed ultrasonic images to pass 
+	 *    through the 2nd order filter.
+	 * 2. These ultrasonic images (e.g. at 24kHz+) folded back into the audible band 
+	 *    during SDR modulation, creating "8-bit like" hiss and intermodulation noise.
+	 * 3. 15kHz creates a clean, hard stop before the 19kHz stereo pilot, protecting
+	 *    the pilot from interference and the audio from aliasing.
+	 * 
+	 * Note: Filter order was also increased to 4 in libsamplerate/samplerate.c
+	 */
+	rc = init_samplerate(&radio->tx_resampler[0], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0);
 	if (rc < 0)
 		goto error;
-	rc = init_samplerate(&radio->tx_resampler[1], radio->tx_audio_samplerate, radio->signal_samplerate, radio->tx_audio_samplerate / 2.0);
+	rc = init_samplerate(&radio->tx_resampler[1], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0);
 	if (rc < 0)
 		goto error;
-	rc = init_samplerate(&radio->rx_resampler[0], radio->rx_audio_samplerate, radio->signal_samplerate, radio->rx_audio_samplerate / 2.0);
+	rc = init_samplerate(&radio->rx_resampler[0], radio->rx_audio_samplerate, radio->signal_samplerate, 15000.0);
 	if (rc < 0)
 		goto error;
-	rc = init_samplerate(&radio->rx_resampler[1], radio->rx_audio_samplerate, radio->signal_samplerate, radio->rx_audio_samplerate / 2.0);
+	rc = init_samplerate(&radio->rx_resampler[1], radio->rx_audio_samplerate, radio->signal_samplerate, 15000.0);
 	if (rc < 0)
 		goto error;
 
@@ -258,6 +324,39 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			sprintf(freq_name[0], "%.4f MHz left", frequency / 1e6);
 			sprintf(freq_name[1], "%.4f MHz right", frequency / 1e6);
 			display_wave_init(&radio->dispwav[1], samplerate, freq_name[1]);
+		}
+		/* Initialize RDS encoder if enabled */
+		if (rds || rds2) {
+			const char *ptyn = "OsmoPtyn"; /* PTYN override */
+			rds_encoder_init(&radio->rds_enc, radio->signal_samplerate,
+				0x1234, "OSMO RDS", "osmocom-analog FM Radio", 0, ptyn);
+			rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose);
+			
+			/*
+			 * TODO: RDS2 Encoder Initialization (IEC 62106-2:2021)
+			 * ----------------------------------------------------
+			 * If rds2 flag is set, initialize additional encoder for streams 2-4:
+			 *
+			 *   if (rds2) {
+			 *       rds2_encoder_init(&radio->rds2_enc, radio->signal_samplerate);
+			 *   }
+			 *
+			 * The rds2_encoder_t would handle:
+			 * - Stream 2:  66.5 kHz subcarrier (independent NCO)
+			 * - Stream 3:  71.25 kHz subcarrier (independent NCO)
+			 * - Stream 4:  76 kHz subcarrier (4 x pilot, can be locked)
+			 * - Group Type C encoding for extended data
+			 * - UTF-8 Extended RadioText (128 bytes)
+			 * - RDS2 File Transfer (RFT) protocol
+			 *
+			 * Note: The radio_t struct would need: rds2_encoder_t rds2_enc;
+			 * See rds.c for stub implementation.
+			 */
+		}
+		/* Initialize SCA encoder/decoder if enabled */
+		if (sca_67k || sca_92k) {
+			sca_encoder_init(&radio->sca_enc, radio->signal_samplerate, sca_67k, sca_92k);
+			sca_decoder_init(&radio->sca_dec, radio->signal_samplerate, sca_67k, sca_92k);
 		}
 		break;
 	case MODULATION_AM_DSB:
@@ -532,11 +631,16 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		return -EINVAL;
 	}
 
+
+
+
+
 	/* convert mono/stereo, generate differential signal */
+	/* (Skip this if we want pure clean signal, but let's keep it to test stereo proc) */
 	if (radio->stereo && radio->tx_audio_channels == 1) {
-		/* mono to stereo: sum is 90%, differential signal is 0 */
+		/* mono to stereo: scale sum to 90%, differential signal is 0 */
 		for (i = 0; i < audio_num; i++) {
-			audio_samples[0][i] = 0.9;
+			audio_samples[0][i] *= 0.9;
 			audio_samples[1][i] = 0.0;
 		}
 	}
@@ -556,10 +660,53 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			audio_samples[0][i] = (audio_samples[0][i] + audio_samples[1][i]) / 2.0;
 	}
 
+
+
 	/* remove DC */
-	iir_process(&radio->tx_dc_removal[0], audio_samples[0], audio_num);
-	if (radio->stereo)
-		iir_process(&radio->tx_dc_removal[1], audio_samples[1], audio_num);
+	// iir_process(&radio->tx_dc_removal[0], audio_samples[0], audio_num);
+	// if (radio->stereo)
+	// 	iir_process(&radio->tx_dc_removal[1], audio_samples[1], audio_num);
+	
+	/* 
+	 * DC OFFSET REMOVAL
+	 * -----------------
+	 * We use a recursive DC blocker filter: y[n] = x[n] - x[n-1] + R * y[n-1]
+	 * R = 0.9995 corresponds to a cutoff of approx 10Hz at 48kHz.
+	 * 
+	 * JUSTIFICATION:
+	 * 1. The previous IIR highpass filter from libfilter was ineffective, leaving a DC 
+	 *    offset (up to 0.02) in the signal.
+	 * 2. This DC offset caused asymmetric clipping and generated a strong 2nd harmonic 
+	 *    distortion (2 kHz tone from a 1 kHz fundamental).
+	 * 3. This manual implementation ensures the signal is centered at 0.0 before modulation.
+	 */
+	{
+		double R = 0.9995;
+		double x, y;
+		int i;
+		
+		/* Channel 0 (Left/Mono) */
+		for (i = 0; i < audio_num; i++) {
+			x = audio_samples[0][i];
+			y = x - radio->tx_dc_prev_x[0] + R * radio->tx_dc_prev_y[0];
+			radio->tx_dc_prev_x[0] = x;
+			radio->tx_dc_prev_y[0] = y;
+			audio_samples[0][i] = y;
+		}
+
+		/* Channel 1 (Right) */
+		if (radio->stereo) {
+			for (i = 0; i < audio_num; i++) {
+				x = audio_samples[1][i];
+				y = x - radio->tx_dc_prev_x[1] + R * radio->tx_dc_prev_y[1];
+				radio->tx_dc_prev_x[1] = x;
+				radio->tx_dc_prev_y[1] = y;
+				audio_samples[1][i] = y;
+			}
+		}
+	}
+
+
 
 	/* gain volume */
 	if (radio->volume != 1.0) {
@@ -587,22 +734,70 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	case MODULATION_FM:
 		if (radio->emphasis)
 			pre_emphasis(&radio->fm_emphasis[0], signal_samples[0], signal_num);
+
+
+		
 		clipper_process(signal_samples[0], signal_num);
 		if (radio->stereo) {
 			if (radio->emphasis)
 				pre_emphasis(&radio->fm_emphasis[1], signal_samples[1], signal_num);
 			clipper_process(signal_samples[1], signal_num);
-			/* add pilot tone */
+		}
+		
+		/* Advance pilot phase if Stereo OR RDS is enabled */
+		if (radio->stereo || radio->rds || radio->rds2) {
 			double phasestep = radio->pilot_phasestep;
 			double phase = radio->tx_pilot_phase;
+			double start_phase = phase; /* Capture start phase for RDS */
+			
 			for (i = 0; i < signal_num; i++) {
-				signal_samples[0][i] += sin(phase) * 0.1;
-				signal_samples[0][i] += signal_samples[1][i] * sin(phase * 2);
+				/* Add pilot tone only if Stereo */
+				if (radio->stereo) {
+					/* Add pilot (19 kHz) */
+					signal_samples[0][i] += sin(phase) * 0.1;
+					/* Add stereo diff (mixed with 38 kHz) */
+					signal_samples[0][i] += signal_samples[1][i] * sin(phase * 2);
+				}
+				
 				phase += phasestep;
 				if (phase >= 2.0 * M_PI)
 					phase -= 2.0 * M_PI;
 			}
 			radio->tx_pilot_phase = phase;
+
+			/* Add RDS subcarrier if enabled (phase-locked to pilot at 3x frequency) */
+			if (radio->rds || radio->rds2) {
+				rds_encoder_process(&radio->rds_enc, signal_samples[0], signal_num,
+						    start_phase, radio->pilot_phasestep);
+				
+				/*
+				 * TODO: RDS2 Additional Subcarriers (IEC 62106-2:2021)
+				 * ---------------------------------------------------
+				 * If rds2 flag is set, we should add 3 more BPSK streams:
+				 *
+				 *   Stream 2:  66.5 kHz   (free-running, NOT pilot harmonic)
+				 *   Stream 3:  71.25 kHz  (free-running, NOT pilot harmonic)
+				 *   Stream 4:  76.0 kHz   (4 x pilot, CAN be phase-locked)
+				 *
+				 * Implementation would look like:
+				 *   if (radio->rds2) {
+				 *       rds2_encoder_process(&radio->rds2_enc, signal_samples[0],
+				 *                            signal_num, start_phase, 
+				 *                            radio->pilot_phasestep);
+				 *   }
+				 *
+				 * Note: Streams 2 & 3 require independent NCOs because:
+				 *   - 66.5 kHz = 19 kHz x 3.5   (not integer harmonic)
+				 *   - 71.25 kHz = 19 kHz x 3.75 (not integer harmonic)
+				 *
+				 * Stream 4 can use: sin(pilot_phase * 4) for 76 kHz
+				 *
+				 * Injection level: ~2-5% per stream (same as original RDS)
+				 * Total RDS2 injection: up to 4 x 5% = 20% (aggressive)
+				 *
+				 * See rds.c for rds2_encoder_t stub structure.
+				 */
+			}
 		}
 		for (i = 0; i < signal_num; i++)
 			signal_samples[0][i] *= radio->fm_deviation;
@@ -656,28 +851,107 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		fm_demodulate_complex(&radio->fm_demod, samples[0], signal_num, baseband, radio->I_buffer, radio->Q_buffer);
 		for (i = 0; i < signal_num; i++)
 			samples[0][i] /= radio->fm_deviation;
+		/* Decode RDS from FM baseband if enabled */
+		if (radio->rds || radio->rds2) {
+			/* Pass pilot phase WITH phase offset compensation (same as stereo decoder)
+			 * The rx_pll_freq_offset compensates for IIR filter group delay and
+			 * TX/RX frequency offset. RDS at 57 kHz = 3 x pilot needs 3x the offset.
+			 */
+			double rds_pilot_phase = radio->rx_pilot_phase - radio->rx_pll_freq_offset;
+			rds_decoder_process(&radio->rds_dec, samples[0], signal_num,
+			                    rds_pilot_phase, radio->pilot_phasestep);
+		}
 		if (radio->stereo) {
-			/* filter pilot tone */
-			p = radio->rx_pilot_phase; /* don't increment in radio structure, will be done later */
+			/*
+			 * FM STEREO DEMODULATION (Pilot-Tone System)
+			 * ==========================================
+			 * FM stereo uses DSB-SC modulation at 38 kHz (2x the 19 kHz pilot).
+			 * The stereo difference signal (L-R) is modulated onto this subcarrier.
+			 *
+			 * Challenge: The narrow-band IIR pilot filter (5 Hz BW) needed to extract
+			 * the 19 kHz pilot from the FM baseband introduces significant group delay.
+			 * This makes per-sample phase tracking unreliable (the measured phase drifts
+			 * continuously as our local oscillator advances).
+			 *
+			 * Solution: Block-level phase offset tracking
+			 * 1. Demodulate using local 38 kHz oscillator with a fixed phase offset
+			 * 2. Measure the actual phase offset once per block (from filtered I/Q)
+			 * 3. Slowly track the average offset (~1 second time constant)
+			 *
+			 * The tracked offset compensates for:
+			 * - IIR filter group delay (~13deg at 5 Hz BW)
+			 * - Any transmitter/receiver frequency offset
+			 * - SDR sample rate inaccuracies
+			 */
+			
+			/* Step 1: Stereo demodulation using local 38 kHz oscillator */
+			/* Apply tracked phase offset compensation */
+			double phase_offset = radio->rx_pll_freq_offset;
+			p = radio->rx_pilot_phase;
 			for (i = 0; i < signal_num; i++) {
-				samples[1][i] = samples[0][i] * cos(p); /* I */
-				samples[2][i] = samples[0][i] * sin(p); /* Q */
+				/* 38 kHz carrier = 2x pilot phase, minus compensation offset */
+				double carrier_38k = (p - phase_offset) * 2.0;
+				samples[1][i] = samples[0][i] * sin(carrier_38k) * 2.0;
+				
 				p += radio->pilot_phasestep;
 				if (p >= 2.0 * M_PI)
-				p -= 2.0 * M_PI;
+					p -= 2.0 * M_PI;
 			}
-			iir_process(&radio->rx_lp_pilot_I, samples[1], signal_num);
-			iir_process(&radio->rx_lp_pilot_Q, samples[2], signal_num);
-			/* mix pilot tone (double phase) with differential signal */
+			
+			/* Step 2: Measure phase offset using I/Q mixing at end of block */
+			/* We only need to compute I and Q for phase detection - reuse samples[2] */
+			/* First compute cos (I) component across block */
+			p = radio->rx_pilot_phase;
 			for (i = 0; i < signal_num; i++) {
-				p = atan2(samples[2][i], samples[1][i]);
-				/* subtract measured phase difference (use double amplitude, because we filter later) */
-			        samples[1][i] = samples[0][i] * sin((radio->rx_pilot_phase - p) * 2.0) * 2.0;
-				radio->rx_pilot_phase += radio->pilot_phasestep;
-				if (radio->rx_pilot_phase >= 2.0 * M_PI)
-				radio->rx_pilot_phase -= 2.0 * M_PI;
+				samples[2][i] = samples[0][i] * cos(p);
+				p += radio->pilot_phasestep;
+				if (p >= 2.0 * M_PI)
+					p -= 2.0 * M_PI;
 			}
-			/* filter to match bandwidth */
+			iir_process(&radio->rx_lp_pilot_I, samples[2], signal_num);
+			double I_end = samples[2][signal_num - 1];
+			
+			/* Then compute sin (Q) component across block */
+			p = radio->rx_pilot_phase;
+			for (i = 0; i < signal_num; i++) {
+				samples[2][i] = samples[0][i] * sin(p);
+				p += radio->pilot_phasestep;
+				if (p >= 2.0 * M_PI)
+					p -= 2.0 * M_PI;
+			}
+			iir_process(&radio->rx_lp_pilot_Q, samples[2], signal_num);
+			double Q_end = samples[2][signal_num - 1];
+			
+			double pilot_mag = sqrt(I_end * I_end + Q_end * Q_end);
+			
+			if (pilot_mag > 1e-9) {
+				/* Measured phase = offset between our oscillator and received pilot */
+				double measured_offset = atan2(Q_end, I_end);
+				
+				/* Normalize to -45..+45 degrees for 90deg periodicity of sin(2x) */
+				while (measured_offset > M_PI/4) measured_offset -= M_PI/2;
+				while (measured_offset < -M_PI/4) measured_offset += M_PI/2;
+				
+				/* Track average offset with slow IIR (time constant ~1 second) */
+				double alpha = 1.0 / (radio->signal_samplerate * 1.0);  /* 1 second TC */
+				radio->rx_pll_freq_offset += alpha * signal_num * (measured_offset - radio->rx_pll_freq_offset);
+			}
+			
+			/* Update pilot phase for next block */
+			radio->rx_pilot_phase = p;
+			
+			/* Diagnostics (every ~1 second) */
+			{
+				static int diag_count = 0;
+				diag_count += signal_num;
+				if (diag_count >= 1000000) {
+					diag_count = 0;
+					double offset_deg = radio->rx_pll_freq_offset * (180.0 / M_PI);
+					// LOGP(DRADIO, LOGL_DEBUG, "Stereo: offset=%.1fdeg pilot=%.6f\n", offset_deg, pilot_mag);
+				}
+			}
+			
+			/* Filter stereo channels to match bandwidth */
 			iir_process(&radio->rx_lp_sum, samples[0], signal_num);
 			iir_process(&radio->rx_lp_diff, samples[1], signal_num);
 		}

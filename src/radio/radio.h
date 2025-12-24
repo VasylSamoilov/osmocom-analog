@@ -2,6 +2,8 @@
 #include "../libmobile/sender.h"
 #include "../libfm/fm.h"
 #include "../libam/am.h"
+#include "rds.h"
+#include "sca.h"
 
 enum modulation {
 	MODULATION_NONE = 0,
@@ -63,11 +65,21 @@ typedef struct radio {
 	double		tx_pilot_phase;		/* current phase of tx sine */
 	double		rx_pilot_phase;		/* current phase of rx mixer */
 	iir_filter_t	tx_dc_removal[2];	/* AM/FM DC level removal */
+	sample_t	tx_dc_prev_x[2], tx_dc_prev_y[2]; /* Manual DC filter state */
 	iir_filter_t	tx_am_bw_limit;		/* AM bandwidth limiter */
 	iir_filter_t	rx_lp_pilot_I;		/* low pass filter for pilot tone extraction */
 	iir_filter_t	rx_lp_pilot_Q;		/* low pass filter for pilot tone extraction */
 	iir_filter_t	rx_lp_sum;		/* filter sum signal of stereo */
 	iir_filter_t	rx_lp_diff;		/* filter differential signal of stereo */
+	double		rx_pll_freq_offset;	/* tracked phase offset (rad) for stereo demod */
+	/* RDS encoder */
+	rds_encoder_t	rds_enc;		/* RDS encoder state */
+	rds_decoder_t	rds_dec;		/* RDS decoder state */
+	/* SCA encoder/decoder */
+	sca_encoder_t	sca_enc;		/* SCA encoder state */
+	sca_decoder_t	sca_dec;		/* SCA decoder state */
+	int		sca_67k;		/* 67 kHz SCA enabled */
+	int		sca_92k;		/* 92 kHz SCA enabled */
 	am_mod_t	am_mod;			/* AM modulation */
 	am_demod_t	am_demod;		/* AM modulation */
 	/* buffers */
@@ -81,7 +93,7 @@ typedef struct radio {
 	sample_t	*carrier_buffer;
 } radio_t;
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2);
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose);
 void radio_exit(radio_t *radio);
 int radio_start(radio_t *radio);
 int radio_tx(radio_t *radio, float *baseband, int num);

@@ -67,6 +67,10 @@ static double volume = 1.0;
 static int stereo = 0;
 static int rds = 0;
 static int rds2 = 0;
+static int rds_debug = 0;
+static int rds_verbose = 0;
+static int sca_67k = 0;
+static int sca_92k = 0;
 
 /* global variable to quit main loop */
 int quit = 0;
@@ -149,6 +153,19 @@ static void print_help(const char *arg0)
 	printf(" -S --stereo\n");
 	printf("        Enables stereo carrier for frequency modulated UHF broadcast.\n");
 	printf("        It uses the 'Pilot-tone' system.\n");
+	printf("    --rds\n");
+	printf("        Enables RDS (Radio Data System) 57 kHz subcarrier.\n");
+	printf("        Reserves bandwidth for RDS but does not encode data (placeholder).\n");
+	printf("    --rds2\n");
+	printf("        Enables RDS2 with additional subcarriers up to 80 kHz.\n");
+	printf("    --rds-debug\n");
+	printf("        Enable RDS decoder debug logging (raw hex codes).\n");
+	printf("    --rds-verbose\n");
+	printf("        Enable RDS decoder verbose logging (human-readable interpretation).\n");
+	printf("    --sca-67k\n");
+	printf("        Enable 67 kHz SCA (Subsidiary Communications) subcarrier.\n");
+	printf("    --sca-92k\n");
+	printf("        Enable 92 kHz SCA (Subsidiary Communications) subcarrier.\n");
 	printf("    --fast-math\n");
 	printf("        Use fast math approximation for slow CPU / ARM based systems.\n");
 	printf("    --limesdr\n");
@@ -159,6 +176,12 @@ static void print_help(const char *arg0)
 }
 
 #define	OPT_FAST_MATH		1007
+#define	OPT_RDS			1008
+#define	OPT_RDS2		1009
+#define	OPT_SCA_67K		1010
+#define	OPT_SCA_92K		1011
+#define	OPT_RDS_DEBUG		1012
+#define	OPT_RDS_VERBOSE		1013
 #define OPT_LIMESDR		1100
 #define OPT_LIMESDR_MINI	1101
 
@@ -179,6 +202,12 @@ static void add_options(void)
 	option_add('E', "emphasis", 1);
 	option_add('V', "volume", 1);
 	option_add('S', "stereo", 0);
+	option_add(OPT_RDS, "rds", 0);
+	option_add(OPT_RDS2, "rds2", 0);
+	option_add(OPT_RDS_DEBUG, "rds-debug", 0);
+	option_add(OPT_RDS_VERBOSE, "rds-verbose", 0);
+	option_add(OPT_SCA_67K, "sca-67k", 0);
+	option_add(OPT_SCA_92K, "sca-92k", 0);
 	option_add(OPT_FAST_MATH, "fast-math", 0);
 	option_add(OPT_LIMESDR, "limesdr", 0);
 	option_add(OPT_LIMESDR_MINI, "limesdr-mini", 0);
@@ -252,6 +281,24 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 'S':
 		stereo = 1;
+		break;
+	case OPT_RDS:
+		rds = 1;
+		break;
+	case OPT_RDS2:
+		rds2 = 1;
+		break;
+	case OPT_RDS_DEBUG:
+		rds_debug = 1;
+		break;
+	case OPT_RDS_VERBOSE:
+		rds_verbose = 1;
+		break;
+	case OPT_SCA_67K:
+		sca_67k = 1;
+		break;
+	case OPT_SCA_92K:
+		sca_92k = 1;
 		break;
 	case OPT_FAST_MATH:
 		fast_math = 1;
@@ -363,7 +410,7 @@ int main(int argc, char *argv[])
 	/* now we have buffer size and sample rate */
 	buffer_size = dsp_samplerate * dsp_buffer / 1000;
 
-	rc = radio_init(&radio, buffer_size, dsp_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2);
+	rc = radio_init(&radio, buffer_size, dsp_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
 		exit(0);
@@ -495,6 +542,11 @@ next_char:
 			goto next_char;
 		case 'b':
 			calibrate_bias();
+			goto next_char;
+		case 'd':
+			/* dump RDS status */
+			if (rx && rds)
+				rds_decoder_status(&radio.rds_dec);
 			goto next_char;
 		}
 	}

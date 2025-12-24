@@ -36,8 +36,8 @@ int init_samplerate(samplerate_t *state, double low_samplerate, double high_samp
 
 	state->filter_cutoff = filter_cutoff;
 	if (state->filter_cutoff) {
-		iir_lowpass_init(&state->up.lp, filter_cutoff, high_samplerate, 2);
-		iir_lowpass_init(&state->down.lp, filter_cutoff, high_samplerate, 2);
+		iir_lowpass_init(&state->up.lp, filter_cutoff, high_samplerate, 4);
+		iir_lowpass_init(&state->down.lp, filter_cutoff, high_samplerate, 4);
 	}
 
 	return 0;

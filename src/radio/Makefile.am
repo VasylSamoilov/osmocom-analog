@@ -7,6 +7,10 @@ bin_PROGRAMS = \
 
 osmoradio_SOURCES = \
 	radio.c \
+	rds.c \
+	rdsframe.c \
+	rds_tables.c \
+	sca.c \
 	main.c
 osmoradio_LDADD = \
 	$(COMMON_LA) \
