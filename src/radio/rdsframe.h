@@ -166,6 +166,24 @@ typedef struct rds_frame {
 	uint8_t			ptyn_segment;	/* PTYN segment - from B */
 	char			ptyn_chars[4];	/* PTYN: chars 0-1 from C, 2-3 from D */
 
+	/* Group 3A specific (IEC 62106 S6.1.5.5) - ODA Identification */
+	uint8_t			app_group;	/* Application Group Type code - from B */
+	uint16_t		aid;		/* Application Identification - from D */
+
+	/* Group 14A/14B specific (IEC 62106 S6.1.5.14) - Enhanced Other Networks */
+	uint8_t			eon_tp_on;	/* TP flag for Other Network - from B */
+	uint8_t			eon_variant;	/* EON variant code (0-15) - from B */
+	uint8_t			eon_ta_on;	/* TA flag for Other Network - from C (v13) */
+	uint8_t			eon_pty_on;	/* PTY for Other Network - from C (v13) */
+	uint16_t		eon_on_pi;	/* PI of Other Network - from D */
+	char			eon_ps_chars[2]; /* PS chars for ON - from C (v0-3) */
+	uint8_t			eon_af1;	/* AF1 for ON - from C (v4) */
+	uint8_t			eon_af2;	/* AF2 for ON - from C (v4) */
+	uint8_t			eon_la;		/* Linkage Actuator - from C (v12) */
+	uint16_t		eon_lsn;	/* Linkage Set Number - from C (v12) */
+	uint16_t		eon_pin;	/* PIN for ON - from C (v14) */
+	uint16_t		eon_bcast;	/* Broadcaster data - from C (v15) */
+
 } rds_frame_t;
 
 /* Status helper: convert status to display character */

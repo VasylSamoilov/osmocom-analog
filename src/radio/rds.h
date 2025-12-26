@@ -20,6 +20,79 @@
 #include "../libsample/sample.h"
 #include "rdsframe.h"  /* For rds_group_type, rds_decode_status enums */
 
+/* Macros for human-readable preset definitions */
+
+/* --- Variadic Macro Helpers (Count and Map) --- */
+#define PP_NARG(...) PP_NARG_(__VA_ARGS__,PP_RSEQ_N())
+#define PP_NARG_(...) PP_ARG_N(__VA_ARGS__)
+#define PP_ARG_N( \
+ _1, _2, _3, _4, _5, _6, _7, _8, _9,_10, \
+ _11,_12,_13,_14,_15,_16,_17,_18,_19,_20, \
+ _21,_22,_23,_24,_25,N,...) N
+#define PP_RSEQ_N() \
+ 25,24,23,22,21,20,19,18,17,16,15,14,13,12,11, \
+ 10,9,8,7,6,5,4,3,2,1,0
+
+#define MAP(c, f, ...) MAP_(PP_NARG(__VA_ARGS__), c, f, __VA_ARGS__)
+#define MAP_(N, c, f, ...) MAP__(N, c, f, __VA_ARGS__)
+#define MAP__(N, c, f, ...) MAP_##N(c, f, __VA_ARGS__)
+
+#define MAP_1(c, f, x)      f(x)
+#define MAP_2(c, f, x, ...) f(x) c() MAP_1(c, f, __VA_ARGS__)
+#define MAP_3(c, f, x, ...) f(x) c() MAP_2(c, f, __VA_ARGS__)
+#define MAP_4(c, f, x, ...) f(x) c() MAP_3(c, f, __VA_ARGS__)
+#define MAP_5(c, f, x, ...) f(x) c() MAP_4(c, f, __VA_ARGS__)
+#define MAP_6(c, f, x, ...) f(x) c() MAP_5(c, f, __VA_ARGS__)
+#define MAP_7(c, f, x, ...) f(x) c() MAP_6(c, f, __VA_ARGS__)
+#define MAP_8(c, f, x, ...) f(x) c() MAP_7(c, f, __VA_ARGS__)
+#define MAP_9(c, f, x, ...) f(x) c() MAP_8(c, f, __VA_ARGS__)
+#define MAP_10(c, f, x, ...) f(x) c() MAP_9(c, f, __VA_ARGS__)
+#define MAP_11(c, f, x, ...) f(x) c() MAP_10(c, f, __VA_ARGS__)
+#define MAP_12(c, f, x, ...) f(x) c() MAP_11(c, f, __VA_ARGS__)
+#define MAP_13(c, f, x, ...) f(x) c() MAP_12(c, f, __VA_ARGS__)
+#define MAP_14(c, f, x, ...) f(x) c() MAP_13(c, f, __VA_ARGS__)
+#define MAP_15(c, f, x, ...) f(x) c() MAP_14(c, f, __VA_ARGS__)
+#define MAP_16(c, f, x, ...) f(x) c() MAP_15(c, f, __VA_ARGS__)
+#define MAP_17(c, f, x, ...) f(x) c() MAP_16(c, f, __VA_ARGS__)
+#define MAP_18(c, f, x, ...) f(x) c() MAP_17(c, f, __VA_ARGS__)
+#define MAP_19(c, f, x, ...) f(x) c() MAP_18(c, f, __VA_ARGS__)
+#define MAP_20(c, f, x, ...) f(x) c() MAP_19(c, f, __VA_ARGS__)
+#define MAP_21(c, f, x, ...) f(x) c() MAP_20(c, f, __VA_ARGS__)
+#define MAP_22(c, f, x, ...) f(x) c() MAP_21(c, f, __VA_ARGS__)
+#define MAP_23(c, f, x, ...) f(x) c() MAP_22(c, f, __VA_ARGS__)
+#define MAP_24(c, f, x, ...) f(x) c() MAP_23(c, f, __VA_ARGS__)
+#define MAP_25(c, f, x, ...) f(x) c() MAP_24(c, f, __VA_ARGS__)
+
+#define COMMA() ,
+
+#define RDS_AF_MHZ(mhz)  ( (uint8_t)( ((mhz) - 87.5) * 10.0 + 0.5 ) )
+#define RDS_STRUCT_KHZ(khz) { .freq_khz = (khz) }
+
+/* --- Advanced Preset Macros --- */
+
+/* Method A: RDS_A(90.1, 102.3, ...) */
+#define RDS_A(...) \
+    .af = { MAP(COMMA, RDS_AF_MHZ, __VA_ARGS__) }, \
+    .af_count = PP_NARG(__VA_ARGS__)
+
+/* LF: RDS_LF(153, 279, ...) */
+#define RDS_LF(...) \
+    .af_lf = { MAP(COMMA, RDS_STRUCT_KHZ, __VA_ARGS__) }, \
+    .af_lf_count = PP_NARG(__VA_ARGS__)
+
+/* MF: RDS_MF(531, 1602, ...) */
+#define RDS_MF(...) \
+    .af_mf = { MAP(COMMA, RDS_STRUCT_KHZ, __VA_ARGS__) }, \
+    .af_mf_count = PP_NARG(__VA_ARGS__)
+
+/* Method B: RDS_B(tx_mhz, af1_mhz, af2_mhz, ...) */
+#define RDS_B(tx_mhz, ...) \
+    { \
+        .tx = RDS_AF_MHZ(tx_mhz), \
+        .count = PP_NARG(__VA_ARGS__), \
+        .list = { MAP(COMMA, RDS_AF_MHZ, __VA_ARGS__) } \
+    }
+
 /* ============================================================
  * RDS CONSTANTS - IEC 62106 / NRSC-4-B Specification
  * ============================================================
@@ -139,13 +212,162 @@
 #define RDS_SYNDROME_D          0x258
 
 /* ============================================================
- * Alternative Frequencies (IEC 62106 S6.2.1.6.1, Table 11)
+ * Alternative Frequencies (AF) - Group 0A Block C
+ * EN 50067 S3.2.1.6, IEC 62106 Table 11
+ *
+ * AF enables seamless frequency switching for mobile receivers.
+ * Receivers store AFs, monitor RSSI, and retune to stronger AF
+ * with matching PI when signal weakens - preventing dropouts.
+ *
+ * Each Group 0A Block C carries two 8-bit AF codes.
+ *
+ * AF CODE RANGES (8-bit):
+ *   0x00 (0):       Not to be used
+ *   0x01-0xCC (1-204): FM frequencies 87.6-107.9 MHz
+ *                   Formula: freq_MHz = 87.5 + (code * 0.1)
+ *   0xCD (205):     Filler code (ignore)
+ *   0xCE-0xDF (206-223): Reserved
+ *   0xE0-0xF9 (224-249): AF count codes (N = code - 224, 1-25 AFs)
+ *   0xFA (250):     LF/MF frequency follows (next byte is LF/MF)
+ *   0xFB-0xFF (251-255): Reserved
+ *
+
+ *
+ * ============================================================
+ * METHOD A (S3.2.1.6.3) - Simple list, up to 25 AFs
+ * ============================================================
+ * Used for small/medium networks where all AFs are equivalent.
+ *
+ * Structure:
+ *   Group 0A #1 Block C: [count_code (224+N), AF1]
+ *   Group 0A #2 Block C: [AF2, AF3]
+ *   Group 0A #3 Block C: [AF4, AF5] ... etc
+ *   Use filler 0xCD if odd number of AFs
+ *
+ * Example (5 AFs: 98.5, 99.3, 101.1, 102.7, 105.0 MHz):
+ *   Group 0A #1: [229, 111]  // 229=5 AFs, 111=98.6MHz
+ *   Group 0A #2: [118, 136]  // 118=99.3MHz, 136=101.1MHz
+ *   Group 0A #3: [152, 175]  // 152=102.7MHz, 175=105.0MHz
+ *
+ * ============================================================
+ * METHOD B (S3.2.1.6.4) - Paired, for >25 AFs or regional
+ * ============================================================
+ * Used for large networks (>25 AFs) or regional variants.
+ * Each transmitter broadcasts its own frequency paired with alternatives.
+ *
+ * Raw list structure:
+ *   [tx_freq, tx_freq, af1, tx_freq, af2, tx_freq, af3, ...]
+ *
+ * Block C encoding:
+ *   Group 0A #1 Block C: [count_code (224+N), tx_freq]  - header
+ *   Group 0A #2 Block C: [tx_freq, af1]                 - tx_freq always first
+ *   Group 0A #3 Block C: [tx_freq, af2]                 - tx_freq always first
+ *   ... (up to 12 pairs, 13 frequencies total)
+ *
+ * Regional detection: compare afN values ACROSS pairs
+ *   - af1 < af2 < af3 (ascending): Same content
+ *   - af1 > af2 > af3 (descending): Regional variants
+ *
+ * Example (tx at 89.3 MHz, 3 alternatives - same content):
+ *   Group 0A #1: [227, 18]   // 227=3 freqs, 18=89.3MHz (tx_freq)
+ *   Group 0A #2: [18, 95]    // [tx_freq, af1] af1=95=97.0 MHz
+ *   Group 0A #3: [18, 120]   // [tx_freq, af2] af2=120=99.5 MHz (95<120: same)
+ *   Group 0A #4: [18, 142]   // [tx_freq, af3] af3=142=101.7 MHz (120<142: same)
+ *
+ * NOTE: Method B detected heuristically when tx_freq repeats in pairs.
+ *
  * ============================================================ */
 
 #define RDS_AF_NOT_USED         0x00    /* Code 0: Not to be used */
 #define RDS_AF_FILLER           0xCD    /* Code 205: Filler code */
 #define RDS_AF_NO_AF            0xE0    /* Code 224: No AF exists */
+#define RDS_AF_LF_MF_FOLLOWS    0xFA    /* Code 250: LF/MF frequency follows */
 #define RDS_AF_NO_AF_PAIR       0xE0E0  /* 16-bit filler for Block C when no AF */
+
+/* AF frequency base (IEC 62106 Table 11) */
+#define RDS_AF_FM_BASE          875     /* FM: 87.5 MHz in 0.1 MHz units */
+
+/* AF entry flags bitmask (used in rds_af_item_t.flags) */
+#define RDS_AF_FLAG_REGIONAL    0x01    /* Regional variant (Method B) */
+#define RDS_AF_FLAG_LF          0x02    /* LF band frequency */
+#define RDS_AF_FLAG_MF          0x04    /* MF band frequency */
+
+/* Detect RBDS (US/Canada) from Extended Country Code
+ * ECC 0xA0-0xA5 = Americas (RBDS, 10kHz AM spacing, US PTY names)
+ * All others = RDS (EU/world, 9kHz AM spacing, EU PTY names)
+ * See NRSC-4-B for RBDS, IEC 62106 Annex D for ECC tables */
+#define RDS_ECC_RBDS_MIN        0xA0
+#define RDS_ECC_RBDS_MAX        0xA5
+#define RDS_IS_RBDS(ecc)        ((ecc) >= RDS_ECC_RBDS_MIN && (ecc) <= RDS_ECC_RBDS_MAX)
+
+
+/* Segment masks for cycling */
+#define RDS_PS_SEG_MASK         0x03    /* 4 segments for PS (0-3) */
+#define RDS_RT_SEG_MASK         0x0F    /* 16 segments for RT (0-15) */
+
+/* AF storage limits (EN 50067 S3.2.1.6)
+
+ * Method A: max 25 AFs in simple list (new data overwrites old)
+ * Method B: multiple sub-lists, each with tuning_freq + up to 12 pairs
+ *           max 10 sub-lists; new replaces matching tuning_freq or oldest
+ */
+#define RDS_AF_MAX_METHOD_A     25      /* Method A: max 25 AFs */
+#define RDS_AF_MAX_PAIRS        12      /* Method B: max 12 pairs per sub-list */
+#define RDS_AF_MAX_SUBLISTS     10      /* Method B: max 10 sub-lists */
+#define RDS_AF_LF_MF_MAX        25      /* LF/MF: Method A style (overwrites) */
+
+/* ============================================================
+ * UNIFIED AF STORAGE (Method A, B, and LF/MF)
+ * ============================================================ */
+
+typedef enum {
+    RDS_AF_TYPE_METHOD_A = 0,
+    RDS_AF_TYPE_METHOD_B,
+    RDS_AF_TYPE_LF_MF
+} rds_af_type_t;
+
+typedef struct {
+    uint16_t freq;          /* Frequency in 100 Hz (e.g. 875..1080) for FM, or kHz for AM */
+    uint8_t  flags;         /* Bitmask: 0x01=Regional, 0x02=LF, 0x04=MF */
+    uint8_t  priority;      /* rds_af_priority_t (for Method B safeguards) */
+    uint32_t entry_time;    /* Timestamp for LRU replacement of items */
+} rds_af_item_t;
+
+#define RDS_AF_MAX_ITEMS 25
+
+typedef struct {
+    uint16_t pi;            /* Programme Identification */
+    rds_af_type_t type;     /* Method A, B, or LF/MF */
+    uint16_t tx_freq;       /* Transmitter Frequency (Method B only), 0 otherwise */
+    uint8_t  count;         /* Number of items in list */
+    uint32_t last_update;   /* Timestamp for LRU replacement of entries */
+    rds_af_item_t list[RDS_AF_MAX_ITEMS]; /* The list of frequencies */
+} rds_af_entry_t;
+
+#define RDS_AF_TABLE_SIZE 16
+
+typedef struct {
+    uint8_t count;
+    rds_af_entry_t entries[RDS_AF_TABLE_SIZE];
+} rds_af_table_t;
+
+/* Method B AF priority for replacement decisions */
+typedef enum {
+	RDS_AF_PRIORITY_SAME = 0,	/* Same content (ascending order) - highest priority */
+	RDS_AF_PRIORITY_REGIONAL,	/* Regional variant (descending order) */
+	RDS_AF_PRIORITY_INVALID		/* Invalid freq order - lowest priority, replace first */
+} rds_af_priority_t;
+
+/* Method B sub-list structure - tracks per-tuning-frequency alternatives */
+typedef struct {
+	uint16_t	tx_freq;		/* Transmitter (tuning) frequency (0.1 MHz, 0=unused) */
+	uint16_t	alt_freq[RDS_AF_MAX_PAIRS]; /* Alternative frequencies */
+	uint8_t		is_regional[RDS_AF_MAX_PAIRS]; /* 1=regional variant */
+	uint8_t		priority[RDS_AF_MAX_PAIRS];    /* rds_af_priority_t per entry */
+	uint32_t	entry_time[RDS_AF_MAX_PAIRS];  /* Per-entry timestamp for LRU */
+	uint8_t		count;			/* Number of valid alt frequencies */
+	uint32_t	last_update;		/* Timestamp for LRU replacement */
+} rds_af_sublist_t;
 
 /* ============================================================
  * Pulse Shaping Filter (IEC 62106 S2.3, Figure 3)
@@ -272,12 +494,51 @@
 #define RDS_1A_VARIANT_BCAST    6       /* Broadcaster use */
 #define RDS_1A_VARIANT_EWS      7       /* EWS channel number */
 
-/* Block D: Programme Item Number (PIN) */
+/* Block D: Programme Item Number (PIN) - IEC 62106:2015 S6.1.5.2
+ *
+ * HISTORICAL CONTEXT (1984-1990s):
+ *   PIN enabled "VCR-like" radio recording. Users selected a programme from
+ *   published schedules (newspapers, guides) and entered its PIN into their
+ *   receiver. The receiver would:
+ *     1. Tune to the station and monitor for the matching PIN
+ *     2. Activate when transmitted PIN matched (programme actually started)
+ *     3. Trigger recording, turn on radio, or switch audio output
+ *   This compensated for schedule delays/overruns - more reliable than timers.
+ *
+ * PIN bit fields are used in:
+ *   - Group 1A Block D:    PIN for THIS service (current PI)
+ *   - Group 14A variant 14: PIN for LINKED service (ON-PI via EON)
+ *
+ * PIN FIELD STRUCTURE:
+ *   Day (5 bits):    Day of month 1-31, or 0 = PIN not used
+ *   Hour (5 bits):   Hour 0-23, or 24 = programme end time
+ *   Minute (6 bits): Minute 0-59
+ *
+ * DATE RESOLUTION:
+ *   PIN only contains day-of-month (no month/year). Receiver uses CT
+ *   (Group 4A) for month/year context to disambiguate today vs tomorrow.
+ *
+ * IMPORTANT DISTINCTIONS:
+ *   - PIN ≠ PTY: PIN identifies WHEN a programme starts, PTY identifies
+ *     WHAT content type is currently playing
+ *   - PIN was for specific programme items from published schedules,
+ *     NOT for searching by category (that's PTY's job)
+ *
+ * MODERN STATUS (post-2018):
+ *   PIN is considered OBSOLETE in updated IEC 62106 revisions.
+ *   Modern alternatives: app-based streaming, DAB, podcast scheduling.
+ *   Most stations transmit PIN = 0x0000 (no PIN).
+ *
+ * EDGE CASES:
+ *   - Day = 0:     PIN not used (no scheduled programme)
+ *   - PIN = 0x0000: "No valid PIN" - most commonly transmitted value
+ *   - Hour = 24:   Programme end time (rare usage)
+ */
 #define RDS_PIN_DAY_SHIFT       11
-#define RDS_PIN_DAY_MASK        0xF800  /* Bits 15-11 (5 bits) */
+#define RDS_PIN_DAY_MASK        0xF800  /* Bits 15-11 (5 bits): Day 1-31, 0=unused */
 #define RDS_PIN_HOUR_SHIFT      6
-#define RDS_PIN_HOUR_MASK       0x07C0  /* Bits 10-6 (5 bits) */
-#define RDS_PIN_MINUTE_MASK     0x003F  /* Bits 5-0 (6 bits) */
+#define RDS_PIN_HOUR_MASK       0x07C0  /* Bits 10-6 (5 bits): Hour 0-23, 24=end */
+#define RDS_PIN_MINUTE_MASK     0x003F  /* Bits 5-0 (6 bits): Minute 0-59 */
 
 /* ============================================================
  * Group 4A Bit Fields (IEC 62106 S6.1.5.4)
@@ -315,31 +576,30 @@
  * Group 10A Bit Fields (IEC 62106 S6.1.5.8)
  * Programme Type Name (PTYN)
  *
- * Block B: [4]AB_FLAG
- * Block C: [0]Segment (bit 0 of address)
- * Block D: 4 characters of PTYN (requires 2 groups for 8 chars)
- * Wait! Group 10A is different from 2A (RadioText).
+ * Block B payload (bits 4-0):
+ *   Bit 4:   A/B flag (toggles when PTYN changes)
+ *   Bits 3-1: Reserved (set to 0)
+ *   Bit 0:   Segment address (0=chars 1-4, 1=chars 5-8)
  *
- * Structure:
- * Block B: [4]AB_FLAG (Toggles)
- * Block B: [3:0] Address (only bit 0 used for segment?)
- * NO! Group 10A uses Block B bits 0-4 for A/B flag and segment?
- * Let's check the spec/reference.
- *
- * Reference check (Standard Implementation):
- * Block B: PTY (5 bits), TP (1 bit), PTY (5 bits) - Standard Block B
- * Bits 4-0 of Block B in Group 10A are:
- *  - Bit 4: A/B flag (if 1, PTYN is being updated/changed?)
- *  - Bits 3-1: Reserved/Spare (set to 0)
- *  - Bit 0: A/B segment address (0 = chars 1-4, 1 = chars 5-8)
- *
- * PTYN is 8 characters long.
- * Block C: Chars 1-2 (or 5-6)
- * Block D: Chars 3-4 (or 7-8)
- * NOTE: PTYN is rarely used.
+ * Block C: PTYN chars 1-2 or 5-6
+ * Block D: PTYN chars 3-4 or 7-8
  * ============================================================ */
 #define RDS_10A_AB_FLAG_BIT     4
+#define RDS_10A_AB_MASK         0x0010
 #define RDS_10A_SEGMENT_BIT     0       /* 0=First 4 chars, 1=Last 4 chars */
+#define RDS_10A_SEGMENT_MASK    0x0001
+
+/* ============================================================
+ * Group 3A Bit Fields (IEC 62106 S6.1.5.5)
+ * Open Data Application (ODA) Identification
+ *
+ * Block B payload (bits 4-0):
+ *   Bits 4-0: Application Group Type Code (indicates which group carries ODA)
+ *
+ * Block C: Application-specific message (ODA-dependent)
+ * Block D: Application Identification (AID) - 16-bit registered code
+ * ============================================================ */
+#define RDS_3A_APP_GROUP_MASK   0x001F  /* Block B bits 4-0: App group type code */
 
 /* ============================================================
  * Group 14A/14B Bit Fields (IEC 62106 S6.1.5.14)
@@ -367,26 +627,75 @@
  *   Block D: ON-PI.
  * ============================================================ */
 #define RDS_14A_USAGE_MASK      0x000F  /* Block B bits 3-0 */
-#define RDS_14A_TP_ON_BIT       4       /* Group 14B only: TA for ON */
-#define RDS_14B_TA_ON_BIT       3       /* Group 14B: bit 3 of Block B? No, Block C... check spec */
-/* 
- * Correction: 
- * Group 14A: Block B bits 3-0 used for variant.
- * Group 14B: Block B bit 4 is usually 0. Block C contains TA flags? 
- * Actually, 14B is rarely used compared to 14A variants.
- * 
- * 14A Variant 13 (0xD):
- *   Block C bits 15-11: ON-PTY
- *   Block C bit 0:      ON-TA (Traffic Announcement)
- *   Block C bit 4:      ON-TP (Traffic Programme)
- */
+#define RDS_14A_TP_ON_BIT       4       /* Block B bit 4: TP for ON */
+#define RDS_14A_TP_ON_MASK      0x0010
+
+/* 14A Usage Variant Codes (IEC 62106 Table 17) */
 #define RDS_14A_VARIANT_PS_0    0       /* chars 1-2 */
 #define RDS_14A_VARIANT_PS_1    1       /* chars 3-4 */
 #define RDS_14A_VARIANT_PS_2    2       /* chars 5-6 */
 #define RDS_14A_VARIANT_PS_3    3       /* chars 7-8 */
 #define RDS_14A_VARIANT_AF      4       /* Alternative Freqs */
+#define RDS_14A_VARIANT_MAP_5   5       /* Mapped freq (tuned->variant) */
+#define RDS_14A_VARIANT_MAP_6   6       /* Mapped freq */
+#define RDS_14A_VARIANT_MAP_7   7       /* Mapped freq */
+#define RDS_14A_VARIANT_MAP_8   8       /* Mapped freq */
+#define RDS_14A_VARIANT_MAP_9   9       /* Mapped freq */
+#define RDS_14A_VARIANT_LINK    12      /* Linkage/E-Linkage info */
 #define RDS_14A_VARIANT_INFO    13      /* PTY, TA, TP for ON */
 #define RDS_14A_VARIANT_PIN     14      /* PIN for ON */
+#define RDS_14A_VARIANT_BCAST   15      /* Broadcaster data (reserved) */
+
+/* 14A Variant 12 (Linkage) Block C fields */
+#define RDS_14A_LINK_LA_BIT     15      /* Linkage Actuator */
+#define RDS_14A_LINK_LA_MASK    0x8000
+#define RDS_14A_LINK_LSN_MASK   0x0FFF  /* Linkage Set Number (12 bits) */
+
+/* 14A Variant 13 (Info) Block C fields */
+#define RDS_14A_INFO_PTY_SHIFT  11
+#define RDS_14A_INFO_PTY_MASK   0xF800  /* ON-PTY (5 bits) */
+#define RDS_14A_INFO_TA_BIT     0       /* ON-TA flag */
+#define RDS_14A_INFO_TA_MASK    0x0001
+
+/* Group 14B Block B payload */
+#define RDS_14B_TA_BIT          4       /* TA for ON (Block B bit 4) */
+#define RDS_14B_TA_MASK         0x0010
+
+/* ============================================================
+ * Group 15B Bit Fields (IEC 62106 S6.1.5.16)
+ * Fast Basic Tuning and Switching Information
+ *
+ * Purpose: Allows fast TA/TP detection for mobile receivers.
+ * Structure mirrors Group 0B but in Block D format.
+ *
+ * Block B payload (bits 4-0):
+ *   Bit 4:   TA (Traffic Announcement)
+ *   Bit 3:   M/S (Music/Speech)
+ *   Bit 2:   DI (Decoder Information, depends on segment)
+ *   Bits 1-0: PS segment address (0-3)
+ *
+ * Block C: PI repeat (same as Block A)
+ * Block D: Repeat of Block B payload structure
+ * ============================================================ */
+#define RDS_15B_TA_BIT          4
+#define RDS_15B_TA_MASK         0x0010
+#define RDS_15B_MS_BIT          3
+#define RDS_15B_MS_MASK         0x0008
+#define RDS_15B_DI_BIT          2
+#define RDS_15B_DI_MASK         0x0004
+#define RDS_15B_SEG_MASK        0x0003  /* Bits 1-0 */
+
+/* ============================================================
+ * Field Validation Macros
+ * Runtime validation for RDS field ranges per IEC 62106
+ * ============================================================ */
+#define RDS_VALID_PTY(pty)        ((pty) <= 31)
+#define RDS_VALID_HOUR(h)         ((h) <= 23)
+#define RDS_VALID_MINUTE(m)       ((m) <= 59)
+#define RDS_VALID_TZ_OFFSET(o)    ((o) >= -24 && (o) <= 24)
+#define RDS_VALID_PIN_DAY(d)      ((d) >= 0 && (d) <= 31)
+#define RDS_VALID_AF_CODE(c)      ((c) >= 1 && (c) <= 204)
+#define RDS_VALID_MJD(mjd)        ((mjd) >= 15079)  /* Jan 1, 1900 */
 
 
 /* ============================================================
@@ -499,6 +808,83 @@
  */
 
 /* ============================================================
+ * ENHANCED OTHER NETWORKS (EON) DATA STRUCTURES
+ * IEC 62106 S6.1.5.14 - Group 14A/14B
+ * ============================================================ */
+
+#define RDS_EON_MAX_ENTRIES     64      /* Maximum tracked Other Networks */
+#define RDS_EON_MAX_AF          25      /* Max AFs per Other Network */
+#define RDS_EON_MAX_MAPPED_AF   8       /* Max mapped AFs (variants 5-9) */
+
+/* Mapped AF pair: maps tuned frequency to Other Network frequency */
+typedef struct {
+	uint8_t		tuned_af;	/* AF code of current tuned freq (1-204) */
+	uint8_t		on_af;		/* AF code of Other Network freq (1-204) */
+} rds_mapped_af_t;
+
+/* EON entry for one Other Network */
+typedef struct {
+	uint16_t	pi;		/* PI code of Other Network (0 = unused) */
+	char		ps[9];		/* PS name (8 chars + NUL) */
+	uint8_t		ps_segments;	/* Received PS segments bitmask (0-3) */
+	uint8_t		pty;		/* Programme Type */
+	uint8_t		tp;		/* Traffic Programme flag */
+	uint8_t		ta;		/* Traffic Announcement flag */
+	
+	/* AF list (variant 4) */
+	uint16_t	af[RDS_EON_MAX_AF];	/* Frequencies in 0.1 MHz (e.g. 1001=100.1) */
+	uint8_t		af_count;		/* Number of valid AF entries */
+	
+	/* Mapped AFs (variants 5-9) */
+	rds_mapped_af_t	mapped_af[RDS_EON_MAX_MAPPED_AF];
+	uint8_t		mapped_af_count;
+	
+	/* Linkage (variant 12) */
+	uint8_t		linkage_la;	/* Linkage Actuator */
+	uint16_t	linkage_lsn;	/* Linkage Set Number (12 bits) */
+	
+	/* PIN (variant 14) - for LINKED service (this ON), not current station
+	 * IEC 62106:2015 S6.1.5.2 - receiver uses CT for month context */
+	uint16_t	pin;		/* Programme Item Number (raw 16-bit) */
+	uint8_t		pin_day;	/* Day of month 1-31 (0 = PIN not used) */
+	uint8_t		pin_hour;	/* Hour 0-23, or 24 = end time */
+	uint8_t		pin_minute;	/* Minute 0-59 */
+	
+	/* Broadcaster data (variant 15) */
+	uint16_t	broadcaster_data;
+	
+	/* Housekeeping */
+	uint32_t	last_update;	/* Timestamp of last update (group count) */
+} rds_eon_entry_t;
+
+/* ============================================================
+ * GROUP VERSION SELECTION (IEC 62106)
+ * ============================================================
+ * Each RDS group type (0-15) has two versions: A and B.
+ *
+ * Version A: Block C carries group-specific data (AF, SLC, RT chars)
+ * Version B: Block C carries PI repeat for faster station identification
+ *
+ * Trade-off:
+ *   - A versions: More data capacity (37 bits payload)
+ *   - B versions: Faster PI identification, better mobile reception (21 bits)
+ *
+ * Selection per group type:
+ *   - Group 0: 0A if AF list needed, 0B otherwise
+ *   - Group 1: 1A if ECC/Language needed, 1B for PIN only
+ *   - Group 2: 2A for 64-char RT, 2B for 32-char with faster cycling
+ *
+ * Important: Never mix A and B for the SAME group type in one stream.
+ *            Different group types CAN use different versions (e.g., 0A + 2B).
+ * ============================================================ */
+
+typedef enum {
+	RDS_GROUP_VERSION_AUTO = 0,	/* Auto-detect based on data */
+	RDS_GROUP_VERSION_A,		/* Force version A */
+	RDS_GROUP_VERSION_B		/* Force version B */
+} rds_group_version_t;
+
+/* ============================================================
  * RDS ENCODER
  * ============================================================ */
 
@@ -511,7 +897,28 @@ typedef struct rds_encoder {
 	uint8_t		pty;		/* Program Type (0-31) */
 	uint8_t		tp;		/* Traffic Program flag */
 	uint8_t		ta;		/* Traffic Announcement flag */
-	uint8_t		ms;		/* Music/Speech flag */
+	uint8_t		ms;		/* Music/Speech flag (1=Music, 0=Speech) */
+	
+	/* Decoder Identification (DI) flags - transmitted via Group 0A/0B */
+	uint8_t		di_stereo;		/* d3: Stereo (1) or Mono (0) */
+	uint8_t		di_artificial_head;	/* d2: Artificial head recording */
+	uint8_t		di_compressed;		/* d1: Compressed audio */
+	uint8_t		di_dynamic_pty;		/* d0: Dynamic PTY indicator */
+	
+	/* Group 0A: Alternative Frequencies (Unified Storage) */
+	rds_af_table_t	af_table;	/* Storage for Method A, B, and LF/MF */
+	int		af_segment;	/* Current segment index (0..N) */
+	int		af_list_index;	/* Current Method B list index */
+	
+	/* Encoder Configuration */
+	rds_af_type_t	af_type_cfg;	/* Configured AF type to transmit */
+	
+	/* Group version selection */
+	uint8_t		use_0b;		/* Use Group 0B (PI repeat) instead of 0A (AF) */
+	uint8_t		use_2b;		/* Use Group 2B (32-char RT) instead of 2A (64-char) */
+	uint8_t		use_1b;		/* Use Group 1B (PIN only) instead of 1A (ECC/Lang) */
+
+	
 	char		ps[9];		/* Program Service name (8 chars + NUL) */
 	char		rt[65];		/* RadioText (64 chars + NUL) */
 	uint8_t		rt_ab;		/* RadioText A/B flag */
@@ -524,9 +931,11 @@ typedef struct rds_encoder {
 	int		ct_enabled;	/* Clock-Time transmission enabled */
 	time_t		ct_time_offset;	/* Offset from system time for CT (seconds) */
 	int8_t		local_offset;	/* Local Time Offset from UTC (half-hours) */
-	uint8_t		pin_day;	/* PIN: Day (0=none) */
-	uint8_t		pin_hour;	/* PIN: Hour */
-	uint8_t		pin_minute;	/* PIN: Minute */
+	/* PIN (Programme Item Number) - for THIS service (current PI)
+	 * IEC 62106:2015 S6.1.5.2 - receiver uses CT for month context */
+	uint8_t		pin_day;	/* Day of month 1-31 (0 = PIN not used) */
+	uint8_t		pin_hour;	/* Hour 0-23, or 24 = end time */
+	uint8_t		pin_minute;	/* Minute 0-59 */
 
 	/* Encoder state */
 	double		samplerate;
@@ -547,6 +956,14 @@ typedef struct rds_encoder {
 	int		group_count;	/* (legacy) for group rotation */
 	uint64_t	group_sequence;	/* Total groups generated */
 	time_t		last_ct_minute;	/* Timestamp of last CT injection */
+	int		slc_variant;	/* Group 1A: current SLC variant index */
+	
+	/* Group 14A/14B: Enhanced Other Networks (EON) TX Configuration */
+	rds_eon_entry_t	eon_tx[RDS_EON_MAX_ENTRIES];	/* Other Networks to transmit */
+	int		eon_tx_count;		/* Number of configured ONs */
+	int		eon_tx_index;		/* Current ON being transmitted */
+	int		eon_tx_variant;		/* Current variant within ON */
+	int		eon_enabled;		/* Enable EON transmission */
 	
 } rds_encoder_t;
 
@@ -655,6 +1072,25 @@ typedef struct rds_decoder {
 	uint8_t		tp_status;		/* Status of TP decode */
 	uint8_t		ta;
 	uint8_t		ta_status;		/* Status of TA decode */
+	
+	/* Group 0A/0B: Music/Speech and Decoder Identification (IEC 62106 S6.1.5.1) */
+	uint8_t		ms;			/* Music (1) / Speech (0) flag */
+	uint8_t		ms_status;		/* Status of M/S decode */
+	uint8_t		di_stereo;		/* d3: Stereo (1) or Mono (0) */
+	uint8_t		di_artificial_head;	/* d2: Artificial head recording */
+	uint8_t		di_compressed;		/* d1: Compressed audio */
+	uint8_t		di_dynamic_pty;		/* d0: Dynamic PTY indicator */
+	uint8_t		di_status;		/* Status of DI decode (any flag) */
+	
+	/* Group 0A: Alternative Frequencies (Unified Storage)
+	 * Stores parsed AF lists for Method A, Method B, and LF/MF.
+	 * Lookups are by PI + Type + TX_FREQ.
+	 */
+	rds_af_table_t	af_table;
+	uint32_t	af_update_counter;	/* Monotonic counter for LRU replacement */
+	int		af_method_b;		/* Flag: Method B detected */
+
+	
 	char		ps[9];
 	uint8_t		ps_status[8];	/* Per-char status: enum rds_decode_status */
 	char		rt[65];
@@ -663,6 +1099,7 @@ typedef struct rds_decoder {
 	int		ps_segments;
 	int		rt_segments;
 	int		groups_received;
+
 	
 	/* Group 1A/1B: Slow Labeling Codes (IEC 62106 S6.1.5.2) */
 	uint8_t		linkage_actuator;	/* LA flag */
@@ -670,11 +1107,11 @@ typedef struct rds_decoder {
 	uint8_t		ecc_status;		/* Status of ECC decode */
 	uint8_t		language_code;		/* Language code (variant 3) */
 	uint8_t		language_status;	/* Status of language decode */
-	uint16_t	pin;			/* Programme Item Number (raw) */
+	uint16_t	pin;			/* Programme Item Number (raw 16-bit) */
 	uint8_t		pin_status;		/* Status of PIN decode */
-	uint8_t		pin_day;		/* PIN: Day (1-31) */
-	uint8_t		pin_hour;		/* PIN: Hour (0-23) */
-	uint8_t		pin_minute;		/* PIN: Minute (0-59) */
+	uint8_t		pin_day;		/* Day of month 1-31 (0 = not used) */
+	uint8_t		pin_hour;		/* Hour 0-23, or 24 = end time */
+	uint8_t		pin_minute;		/* Minute 0-59 */
 	
 	/* Group 4A: Clock-Time and Date (IEC 62106 S6.1.5.4) */
 	uint32_t	ct_mjd;			/* Modified Julian Date */
@@ -691,8 +1128,12 @@ typedef struct rds_decoder {
 	int		ptyn_segments;		/* Received segments mask (bit 0=first half, 1=second half) */
 
 	/* Group 14A/14B: Enhanced Other Networks (IEC 62106 S6.1.5.14) */
-	uint16_t	on_pi;			/* PI of Other Network (current slot) */
-	char		on_ps[9];		/* PS of Other Network */
+	rds_eon_entry_t	eon[RDS_EON_MAX_ENTRIES];	/* Other Network database */
+	int		eon_count;			/* Number of valid EON entries */
+	
+	/* Legacy single-slot fields (for API compatibility, point to eon[0]) */
+	uint16_t	on_pi;			/* PI of most recent Other Network */
+	char		on_ps[9];		/* PS of most recent Other Network */
 	int		on_ps_segments;		/* Received PS segments mask for ON */
 	uint8_t		on_pty;			/* PTY of ON */
 	uint8_t		on_tp;			/* TP flag of ON */
@@ -708,7 +1149,7 @@ typedef struct rds_decoder {
  * debug: Enable debug logging (raw hex codes, --rds-debug)
  * verbose: Enable verbose/info logging (human-readable, --rds-verbose)
  */
-int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose);
+int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us);
 
 /* Process FM baseband samples, extract RDS data
  * pilot_phase: current 19 kHz pilot phase from stereo decoder (or free-run if 0)

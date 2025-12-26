@@ -25,8 +25,11 @@
 #include "rds_tables.h"
 #include "../liblogging/logging.h"
 
+
 /* Forward declaration for encoder loopback verification */
+
 static void rds_decode_group(rds_decoder_t *rds);
+
 
 /* ============================================================
  * RRC Biphase Waveform Generation (IEC 62106 S2.3)
@@ -188,28 +191,318 @@ static uint32_t rds_build_block(uint16_t data, uint16_t offset_word)
 	return rds_block_encode(data, offset_word, 0);
 }
 
-/* Build Group 0A: Basic tuning and switching information */
+/* Unified AF Table Management
+ * Find existing entry by PI+Type+TX, or allocate new one.
+ * Implements 5-step priority replacement for Method B.
+ * Returns pointer to entry, or NULL on error.
+ */
+static rds_af_entry_t *rds_af_get_entry(rds_decoder_t *rds, rds_af_table_t *table, 
+                                        uint16_t pi, rds_af_type_t type, uint16_t tx_freq)
+{
+	int i;
+	
+	/* Candidate indexes */
+	int idx_free = -1;
+	int idx_invalid = -1;
+	int idx_lru = -1;
+	
+	/* Timestamps for finding oldest (lowest value) */
+	uint32_t t_invalid = UINT32_MAX;
+	uint32_t t_lru = UINT32_MAX;
+	
+	/* Track oldest valid match for appending */
+	int target_idx = -1;
+	uint32_t oldest_match_time = UINT32_MAX;
+	
+	/* 1. Check for Free slot */
+	if (table->count < RDS_AF_TABLE_SIZE) {
+		idx_free = table->count;
+	}
+	
+	/* Iterate to find candidates */
+	for (i = 0; i < table->count; i++) {
+		rds_af_entry_t *e = &table->entries[i];
+		
+		/* Match check: PI + Type + TX */
+		int is_match = (e->pi == pi && e->type == type && e->tx_freq == tx_freq);
+		
+		/* Invalid check (Method B only) */
+		int has_invalid = 0;
+		if (e->type == RDS_AF_TYPE_METHOD_B) {
+			for (int j = 0; j < e->count; j++) {
+				if (e->list[j].priority == RDS_AF_PRIORITY_INVALID) {
+					has_invalid = 1;
+					break;
+				}
+			}
+		}
+		
+		/* Found a match - ONLY use for appending if it is VALID (or not Method B)
+		 * For Method B, if it has invalid entries, ignore here so it falls to priority selection. */
+		if (is_match && !has_invalid) {
+			if (e->last_update < oldest_match_time) {
+				oldest_match_time = e->last_update;
+				target_idx = i;
+			}
+		}
+		
+		/* 3. Invalid (Any Method B) (Oldest) */
+		if (has_invalid) {
+			if (e->last_update < t_invalid) {
+				t_invalid = e->last_update;
+				idx_invalid = i;
+			}
+		}
+		
+		/* 5. LRU (Any) (Oldest) */
+		if (e->last_update < t_lru) {
+			t_lru = e->last_update;
+			idx_lru = i;
+		}
+	}
+	
+	/* If found existing VALID match, return it (Append mode - preserve data) */
+	if (target_idx >= 0) {
+		table->entries[target_idx].last_update = rds->af_update_counter++;
+		return &table->entries[target_idx];
+	}
+	
+	/* Select candidate based on priority order */
+	int selected_idx = -1;
+	
+	if (idx_free != -1) {
+		/* 1. Free */
+		selected_idx = table->count++; /* Increment count */
+	} else {
+		/* No free slots - replacement logic */
+		if (type == RDS_AF_TYPE_METHOD_B) {
+			/* Method B Priority: Inv -> LRU */
+			if (idx_invalid != -1) selected_idx = idx_invalid;
+			else if (idx_lru != -1) selected_idx = idx_lru;
+		} else {
+			/* Method A / LF/MF Simple: LRU */
+			if (idx_lru != -1) selected_idx = idx_lru;
+		}
+	}
+	
+	if (selected_idx >= 0) {
+		rds_af_entry_t *e = &table->entries[selected_idx];
+		
+		/* Replacement/Repair Mode: ALWAYS wipe/init */
+		int old_tx = e->tx_freq;
+		if (rds->debug && (e->pi != pi || e->type != type || e->tx_freq != tx_freq))
+			LOGP(DRADIO, LOGL_DEBUG, "RDS: Replacing AF entry %d (old_TX=%.1f, new_TX=%.1f)\n", 
+			     selected_idx, old_tx/10.0, tx_freq/10.0);
+		
+		memset(e, 0, sizeof(rds_af_entry_t));
+		e->pi = pi;
+		e->type = type;
+		e->tx_freq = tx_freq;
+		
+		/* Update timestamp */
+		e->last_update = rds->af_update_counter++;
+		return e;
+	}
+	
+	return NULL;
+}
+
+/* ============================================================
+ * Build Group 0A: Basic Tuning and Switching Information
+ * IEC 62106 S6.1.5.1 - MANDATORY group for RDS transmission
+ *
+ * Group 0A provides essential tuning information including the
+ * Programme Service name (PS) and Alternative Frequencies (AF).
+ *
+ * Block Structure:
+ *   Block A [16 bits]: PI code
+ *   Block B [16 bits]:
+ *     - Bits 15-12: Group type (0000)
+ *     - Bit 11:     Version (0 = A)
+ *     - Bit 10:     TP (Traffic Programme)
+ *     - Bits 9-5:   PTY (Programme Type)
+ *     - Bit 4:      TA (Traffic Announcement)
+ *     - Bit 3:      M/S (Music=1 / Speech=0)
+ *     - Bit 2:      DI (Decoder Info, segment-dependent)
+ *     - Bits 1-0:   PS segment address (0-3)
+ *   Block C [16 bits]: AF1 (8 bits) + AF2 (8 bits)
+ *   Block D [16 bits]: PS chars (2 per group)
+ *
+ * Complete PS name (8 chars) requires 4 groups (segments 0-3).
+ * ============================================================ */
+
 static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 {
 	uint32_t blocks[4];
-	uint16_t b2;
+	uint16_t b2, b3;
 	int seg = rds->ps_segment;
+	
+	/* DI flag depends on segment address */
+	uint8_t di_flags[4] = {
+		rds->di_dynamic_pty,
+		rds->di_compressed,
+		rds->di_artificial_head,
+		rds->di_stereo
+	};
+	uint8_t di = di_flags[seg] ? 1 : 0;
 	
 	/* Block A: PI code */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 	
-	/* Block B: Group type + PTY + TP + TA + M/S + DI + segment */
+	/* Block B: Group type 0A + PTY + TP + TA + M/S + DI + segment */
 	b2 = (RDS_GROUP_0A << RDS_B2_GROUP_SHIFT) |
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT) |
 	     (rds->ta << RDS_0A_TA_BIT) |
 	     (rds->ms << RDS_0A_MS_BIT) |
-	     (0 << RDS_0A_DI_BIT) |
+	     (di << RDS_0A_DI_BIT) |
 	     seg;
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 	
-	/* Block C: AF codes (using filler) */
-	blocks[2] = rds_build_block(RDS_AF_NO_AF_PAIR, RDS_OFFSET_C);
+	/* Block C: Alternative Frequencies (AF) */
+	rds_af_entry_t *e = NULL;
+	
+	/* Find AF entry based on configuration */
+	if (rds->af_type_cfg == RDS_AF_TYPE_METHOD_A) {
+		for(int i=0; i<rds->af_table.count; i++) {
+			if (rds->af_table.entries[i].type == RDS_AF_TYPE_METHOD_A && 
+			    rds->af_table.entries[i].pi == rds->pi) {
+				e = &rds->af_table.entries[i];
+				break;
+			}
+		}
+	} else if (rds->af_type_cfg == RDS_AF_TYPE_LF_MF) {
+		for(int i=0; i<rds->af_table.count; i++) {
+			if (rds->af_table.entries[i].type == RDS_AF_TYPE_LF_MF && 
+			    rds->af_table.entries[i].pi == rds->pi) {
+				e = &rds->af_table.entries[i];
+				break;
+			}
+		}
+	} else if (rds->af_type_cfg == RDS_AF_TYPE_METHOD_B) {
+		/* Determine which Method B list to transmit */
+		/* Try cached index first */
+		if (rds->af_list_index >= 0 && rds->af_list_index < rds->af_table.count &&
+		    rds->af_table.entries[rds->af_list_index].type == RDS_AF_TYPE_METHOD_B &&
+		    rds->af_table.entries[rds->af_list_index].pi == rds->pi) {
+			e = &rds->af_table.entries[rds->af_list_index];
+		} else {
+			/* Fallback: Search from start */
+			for(int i=0; i<rds->af_table.count; i++) {
+				if (rds->af_table.entries[i].type == RDS_AF_TYPE_METHOD_B && 
+				    rds->af_table.entries[i].pi == rds->pi) {
+					e = &rds->af_table.entries[i];
+					rds->af_list_index = i; /* Cache it */
+					break;
+				}
+			}
+		}
+	}
+	
+	if (e && e->count > 0) {
+		if (e->type == RDS_AF_TYPE_METHOD_A) {
+			/* Method A: Header (Count) + List logic */
+			if (rds->af_segment == 0) {
+				/* Header: Count + First AF */
+				uint8_t af_count_code = RDS_AF_NO_AF + e->count;
+				uint8_t af1_code = (e->list[0].freq >= RDS_AF_FM_BASE) ? (e->list[0].freq - RDS_AF_FM_BASE) : 0;
+				b3 = (af_count_code << 8) | af1_code;
+			} else {
+				/* Pairs */
+				int idx = rds->af_segment * 2 - 1;
+				uint16_t freq1 = (idx < e->count) ? e->list[idx].freq : 0;
+				uint16_t freq2 = (idx + 1 < e->count) ? e->list[idx+1].freq : 0;
+				
+				uint8_t af1 = (freq1 >= RDS_AF_FM_BASE) ? (freq1 - RDS_AF_FM_BASE) : RDS_AF_FILLER;
+				uint8_t af2 = (freq2 >= RDS_AF_FM_BASE) ? (freq2 - RDS_AF_FM_BASE) : RDS_AF_FILLER;
+				b3 = (af1 << 8) | af2;
+			}
+			
+			/* Advance segment */
+			rds->af_segment++;
+			/* Reset segment after all pairs sent */
+			if (rds->af_segment > (e->count / 2) + 1) rds->af_segment = 0;
+			
+		} else if (e->type == RDS_AF_TYPE_LF_MF) {
+			/* LF/MF: Stream of [250, code] */
+			int idx = rds->af_segment % e->count;
+			uint8_t code = 0;
+			
+			if (e->list[idx].flags & RDS_AF_FLAG_LF) {
+				code = (e->list[idx].freq - 144) / 9;
+			} else { /* MF */
+				int is_us = RDS_IS_RBDS(rds->ecc);
+				code = 16 + (e->list[idx].freq - (is_us?540:531)) / (is_us?10:9);
+			}
+			b3 = (RDS_AF_LF_MF_FOLLOWS << 8) | code;
+			
+			rds->af_segment = (rds->af_segment + 1) % e->count;
+			
+		} else {
+			/* Method B: Pairs [Tx, AF] */
+			/* Segment 0: Header [Count, Tx] */
+			if (rds->af_segment == 0) {
+				uint8_t count_code = RDS_AF_NO_AF + e->count;
+				uint8_t tx_code = (e->tx_freq >= RDS_AF_FM_BASE) ? (e->tx_freq - RDS_AF_FM_BASE) : 0;
+				b3 = (count_code << 8) | tx_code;
+			} else {
+				/* Segments 1..N: Pairs [Tx, AFn] */
+				int idx = rds->af_segment - 1;
+				if (idx < e->count) {
+					uint8_t tx_code = (e->tx_freq >= RDS_AF_FM_BASE) ? (e->tx_freq - RDS_AF_FM_BASE) : 0;
+					uint8_t af_code = (e->list[idx].freq >= RDS_AF_FM_BASE) ? (e->list[idx].freq - RDS_AF_FM_BASE) : 0;
+					b3 = (tx_code << 8) | af_code;
+				} else {
+					b3 = RDS_AF_NO_AF_PAIR;
+				}
+			}
+			
+			rds->af_segment++;
+			
+			/* Check if we finished this Method B list */
+			if (rds->af_segment > e->count) {
+				rds->af_segment = 0;
+				
+				/* Advance to NEXT Method B entry in the table */
+				/* We need to find the next entry with the same PI */
+				int current_idx = -1;
+				
+				/* 1. Find current index */
+				for(int i=0; i<rds->af_table.count; i++) {
+					if (&rds->af_table.entries[i] == e) {
+						current_idx = i;
+						break;
+					}
+				}
+				
+				/* 2. Find next valid Method B entry (wrapping around) */
+				if (current_idx >= 0) {
+
+					
+					/* Search forward from next index */
+					for(int i=1; i<=rds->af_table.count; i++) {
+						int next_idx = (current_idx + i) % rds->af_table.count;
+						if (rds->af_table.entries[next_idx].type == RDS_AF_TYPE_METHOD_B && 
+							rds->af_table.entries[next_idx].pi == rds->pi) {
+							/* Found next list!
+							   We need to persist this selection for the next call.
+							   However, rds_build_group_0a determines 'e' by searching from 0.
+							   To fix this, we need state. 
+							   Let's use rds->af_list_index to track which Method B list we are serving.
+							*/
+							rds->af_list_index = next_idx;
+							break;
+						}
+					}
+				}
+			}
+		}
+	} else {
+		/* No AF */
+		b3 = RDS_AF_NO_AF_PAIR;
+	}
+
+	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
 	
 	/* Block D: PS name (2 characters per group) */
 	uint16_t ps_chars = ((uint8_t)rds->ps[seg*2] << 8) | (uint8_t)rds->ps[seg*2+1];
@@ -218,7 +511,66 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	rds->ps_segment = (seg + 1) & 0x03;
+	rds->ps_segment = (seg + 1) & RDS_PS_SEG_MASK;
+}
+
+/* ============================================================
+ * Build Group 0B: Basic Tuning (PI repeat, no AF)
+ * IEC 62106 S6.1.5.1 - Version B for faster station identification
+ *
+ * Group 0B is used when:
+ *   - No Alternative Frequencies exist (single-transmitter station)
+ *   - Better mobile reception needed (PI repeat in Block C)
+ *
+ * Trade-off vs 0A:
+ *   - 0A: Has AF data for seamless frequency switching
+ *   - 0B: PI repeat improves station identification in weak signals
+ *
+ * Block Structure:
+ *   Block A [16 bits]: PI code
+ *   Block B [16 bits]: Same as 0A (TP, PTY, TA, M/S, DI, segment)
+ *   Block C [16 bits]: PI code repeat (offset C')
+ *   Block D [16 bits]: PS chars (2 per group)
+ * ============================================================ */
+static void rds_build_group_0b(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4];
+	uint16_t b2;
+	int seg = rds->ps_segment;
+	
+	/* DI flag depends on segment address (same as 0A) */
+	uint8_t di_flags[4] = {
+		rds->di_dynamic_pty,
+		rds->di_compressed,
+		rds->di_artificial_head,
+		rds->di_stereo
+	};
+	uint8_t di = di_flags[seg] ? 1 : 0;
+	
+	/* Block A: PI code */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	
+	/* Block B: Group type 0B + PTY + TP + TA + M/S + DI + segment */
+	b2 = (RDS_GROUP_0B << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     (rds->ta << RDS_0A_TA_BIT) |
+	     (rds->ms << RDS_0A_MS_BIT) |
+	     (di << RDS_0A_DI_BIT) |
+	     seg;
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	
+	/* Block C: PI code repeat (Type B groups use C' offset) */
+	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+	
+	/* Block D: PS name (2 characters per group) */
+	uint16_t ps_chars = ((uint8_t)rds->ps[seg*2] << 8) | (uint8_t)rds->ps[seg*2+1];
+	blocks[3] = rds_build_block(ps_chars, RDS_OFFSET_D);
+	
+	/* Pack into bytes using shared function */
+	rds_group_pack(blocks, group, 0);
+	
+	rds->ps_segment = (seg + 1) & RDS_PS_SEG_MASK;
 }
 
 
@@ -252,39 +604,178 @@ static void rds_build_group_2a(rds_encoder_t *rds, uint8_t *group)
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	rds->rt_segment = (seg + 1) & 0x0F;
+	rds->rt_segment = (seg + 1) & RDS_RT_SEG_MASK;
 }
 
+/* Build Group 2B: RadioText (32 chars, PI repeat in Block C)
+ * IEC 62106 S6.1.5.3 - Version B for improved mobile reception
+ * Block C contains PI repeat; Block D contains 2 RT chars per segment */
+static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4];
+	uint16_t b2;
+	int seg = rds->rt_segment;
+	int pos = seg * 2;  /* 2 chars per segment for 2B */
+	
+	/* Block A: PI code */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	
+	/* Block B: Group type 2B + PTY + TP + A/B flag + segment */
+	b2 = (RDS_GROUP_2B << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     (rds->rt_ab << RDS_2A_AB_BIT) |
+	     seg;
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	
+	/* Block C: PI repeat (offset C' for B-version groups) */
+	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+	
+	/* Block D: RT chars (2 per segment, max 32 chars) */
+	uint16_t rt_chars = ((uint8_t)rds->rt[pos] << 8) | (uint8_t)rds->rt[pos+1];
+	blocks[3] = rds_build_block(rt_chars, RDS_OFFSET_D);
+	
+	/* Pack into bytes using shared function */
+	rds_group_pack(blocks, group, 0);
+	
+	rds->rt_segment = (seg + 1) & RDS_RT_SEG_MASK;
+}
 
-/* Build Group 1A: ECC, Language, PIN */
+/* Build Group 1A: Extended Country Code, Language, and Programme Item Number (PIN)
+ *
+ * NOTE ON PIN (Programme Item Number) - IEC 62106 S6.1.5.2:
+ *   Group 1A PIN identifies a specific programme occurrence in time for THIS SERVICE.
+ *   It is the authoritative source for timer-controlled actions like:
+ *     - Wake-up timers
+ *     - Automatic recording
+ *     - Programme reminders
+ *
+ *   This is DISTINCT from Group 14A PIN (variant 14), which transmits PIN for a
+ *   LINKED service via EON (Enhanced Other Networks). The two PINs:
+ *     - May have different values (usually do)
+ *     - Apply to different PI codes (Group 1A = this PI, Group 14A = linked PI)
+ *     - Are complementary, not redundant
+ *
+ *   Most receivers only implement Group 1A PIN and ignore Group 14A PIN entirely.
+ */
 static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 {
 	uint32_t blocks[4];
 	uint16_t b2, b3, b4;
 	
+	/* SLC Variant Sequence: cycle through active variants
+	 * IEC 62106 Table 9:
+	 *   0 = ECC (Extended Country Code)
+	 *   3 = Language Identification Code (LIC)
+	 * Other variants (TMC, EWS) can be added as needed */
+	static const int slc_variants[] = {
+		RDS_1A_VARIANT_ECC,
+		RDS_1A_VARIANT_LANGUAGE
+	};
+	static const int slc_variant_count = sizeof(slc_variants) / sizeof(slc_variants[0]);
+	
+	int variant = slc_variants[rds->slc_variant % slc_variant_count];
+	
 	/* Block A: PI */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 	
-	/* Block B: Group 1A */
+	/* Block B: Group 1A + TP + PTY 
+	 * Bits 4-0: Radio Paging codes (set to 0) */
 	b2 = (RDS_GROUP_1A << RDS_B2_GROUP_SHIFT) |
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT);
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 	
-	/* Block C: Variant 0 (ECC) - LA=0, Variant=0, ECC=8bits */
-	b3 = (0 << 12) | (rds->ecc & 0xFF);
+	/* Block C: LA + Variant + Payload (IEC 62106 Table 9) */
+	switch (variant) {
+	case RDS_1A_VARIANT_ECC:
+		/* Variant 0: Extended Country Code
+		 * Bits 15: LA (Linkage Actuator)
+		 * Bits 14-12: Variant (0)
+		 * Bits 11-8: Paging (0)
+		 * Bits 7-0: ECC */
+		b3 = (RDS_1A_VARIANT_ECC << RDS_1A_VARIANT_SHIFT) |
+		     (rds->ecc & 0xFF);
+		break;
+		
+	case RDS_1A_VARIANT_LANGUAGE:
+		/* Variant 3: Language Identification Code (LIC)
+		 * TEF6686 displays this as "LIC" on screen
+		 * Bits 14-12: Variant (3)
+		 * Bits 7-0: Language code (0-127) */
+		b3 = (RDS_1A_VARIANT_LANGUAGE << RDS_1A_VARIANT_SHIFT) |
+		     (rds->language & 0xFF);
+		break;
+		
+	default:
+		/* Fallback to ECC */
+		b3 = (RDS_1A_VARIANT_ECC << RDS_1A_VARIANT_SHIFT) |
+		     (rds->ecc & 0xFF);
+		break;
+	}
 	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
 	
-	/* Block D: PIN */
-	b4 = ((rds->pin_day & 0x1F) << 11) |
-	     ((rds->pin_hour & 0x1F) << 6) |
-	     (rds->pin_minute & 0x3F);
+	/* Block D: PIN (Programme Item Number) - for THIS service (current PI)
+	 * IEC 62106:2015 S6.1.5.2
+	 * Format: Day (5 bits) | Hour (5 bits) | Minute (6 bits)
+	 * Day = day of month 1-31 (0 = PIN not used), receiver uses CT for month */
+	b4 = ((rds->pin_day & 0x1F) << RDS_PIN_DAY_SHIFT) |
+	     ((rds->pin_hour & 0x1F) << RDS_PIN_HOUR_SHIFT) |
+	     (rds->pin_minute & RDS_PIN_MINUTE_MASK);
+	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+	
+	/* Pack into bytes using shared function */
+	rds_group_pack(blocks, group, 0);
+	
+	/* Advance to next variant for next call */
+	rds->slc_variant = (rds->slc_variant + 1) % slc_variant_count;
+}
+
+/* Build Group 1B: PIN only (PI repeat in Block C, no SLC data)
+ * IEC 62106 S6.1.5.2 - Version B for faster PIN transmission
+ *
+ * Use when:
+ *   - Only PIN needed (no ECC/Language codes required)
+ *   - Better mobile reception needed (PI repeat in Block C)
+ *
+ * Trade-off vs 1A:
+ *   - 1A: ECC + Language + PIN (full slow labelling data)
+ *   - 1B: PIN only, but with PI repeat for mobile reception
+ *
+ * Block structure:
+ *   Block A: PI code
+ *   Block B: Group 1B + TP + PTY + Radio Paging (0)
+ *   Block C: PI repeat (offset C')
+ *   Block D: PIN (Day/Hour/Minute)
+ */
+static void rds_build_group_1b(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4];
+	uint16_t b2, b4;
+	
+	/* Block A: PI code */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	
+	/* Block B: Group 1B + TP + PTY
+	 * Bits 4-0: Radio Paging codes (set to 0) */
+	b2 = (RDS_GROUP_1B << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	
+	/* Block C: PI repeat (offset C' for B-version groups) */
+	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+	
+	/* Block D: PIN (Programme Item Number) - for THIS service
+	 * Same format as Group 1A Block D */
+	b4 = ((rds->pin_day & 0x1F) << RDS_PIN_DAY_SHIFT) |
+	     ((rds->pin_hour & 0x1F) << RDS_PIN_HOUR_SHIFT) |
+	     (rds->pin_minute & RDS_PIN_MINUTE_MASK);
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 	
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 }
-
 
 /* ============================================================
  * Modified Julian Date (MJD) Conversion Utilities
@@ -426,50 +917,306 @@ static void rds_build_group_10a(rds_encoder_t *rds, uint8_t *group)
 }
 
 
-/* Generate next group */
+/* Build Group 14A: Enhanced Other Networks (EON)
+ * Transmits information about Other Networks one variant at a time.
+ * Cycles through configured ONs and their data variants.
+ */
+static void rds_build_group_14a(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4];
+	uint16_t b2, b3, b4;
+	
+	if (rds->eon_tx_count == 0)
+		return;
+	
+	/* Get current ON entry */
+	rds_eon_entry_t *eon = &rds->eon_tx[rds->eon_tx_index];
+	int variant = rds->eon_tx_variant;
+	
+	/* Block A: PI */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	
+	/* Block B: Group 14A + TP(ON) + variant code */
+	b2 = (RDS_GROUP_14A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     ((eon->tp ? 1 : 0) << RDS_14A_TP_ON_BIT) |
+	     (variant & RDS_14A_USAGE_MASK);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	
+	/* Block C: Variant-dependent data */
+	switch (variant) {
+	case RDS_14A_VARIANT_PS_0:
+	case RDS_14A_VARIANT_PS_1:
+	case RDS_14A_VARIANT_PS_2:
+	case RDS_14A_VARIANT_PS_3:
+		/* PS chars */
+		b3 = ((uint8_t)eon->ps[variant*2] << 8) | (uint8_t)eon->ps[variant*2 + 1];
+		break;
+	case RDS_14A_VARIANT_AF:
+		/* AF Method A (if we have AFs) */
+		if (eon->af_count >= 2) {
+			uint8_t af1 = (eon->af[0] > 875) ? (eon->af[0] - 875) : 0;
+			uint8_t af2 = (eon->af[1] > 875) ? (eon->af[1] - 875) : 0;
+			b3 = (af1 << 8) | af2;
+		} else {
+			b3 = RDS_AF_NO_AF_PAIR;  /* No AF */
+		}
+		break;
+	case RDS_14A_VARIANT_MAP_5:
+	case RDS_14A_VARIANT_MAP_6:
+	case RDS_14A_VARIANT_MAP_7:
+	case RDS_14A_VARIANT_MAP_8:
+	case RDS_14A_VARIANT_MAP_9:
+		/* Mapped AF (if available) */
+		{
+			int map_idx = variant - RDS_14A_VARIANT_MAP_5;
+			if (map_idx < eon->mapped_af_count) {
+				b3 = (eon->mapped_af[map_idx].tuned_af << 8) | 
+				     eon->mapped_af[map_idx].on_af;
+			} else {
+				b3 = RDS_AF_NO_AF_PAIR;
+			}
+		}
+		break;
+	case RDS_14A_VARIANT_LINK:
+		/* Linkage Information */
+		b3 = ((eon->linkage_la ? 1 : 0) << RDS_14A_LINK_LA_BIT) |
+		     (eon->linkage_lsn & RDS_14A_LINK_LSN_MASK);
+		break;
+	case RDS_14A_VARIANT_INFO:
+		/* PTY and TA for ON */
+		b3 = ((eon->pty & 0x1F) << RDS_14A_INFO_PTY_SHIFT) |
+		     ((eon->ta ? 1 : 0) << RDS_14A_INFO_TA_BIT);
+		break;
+	case RDS_14A_VARIANT_PIN:
+		/* PIN for Other Network (ON) - IEC 62106 S6.1.5.14
+		 *
+		 * IMPORTANT: This PIN applies to the LINKED service (Block D: ON-PI),
+		 * NOT to the current service. It is used for:
+		 *   - Scheduling programmes on a different PI
+		 *   - Network-wide timer events
+		 *   - Cross-station programme reminders
+		 *
+		 * Receiver support: Only advanced receivers decode Group 14A PIN.
+		 * Most consumer receivers ignore this entirely and only trust Group 1A PIN.
+		 *
+		 * Even if the time value matches the current station's PIN, they
+		 * refer to DIFFERENT services and should not be treated as duplicates.
+		 */
+		b3 = ((eon->pin_day & 0x1F) << RDS_PIN_DAY_SHIFT) |
+		     ((eon->pin_hour & 0x1F) << RDS_PIN_HOUR_SHIFT) |
+		     (eon->pin_minute & RDS_PIN_MINUTE_MASK);
+		break;
+	case RDS_14A_VARIANT_BCAST:
+		/* Broadcaster data (reserved) */
+		b3 = eon->broadcaster_data;
+		break;
+	default:
+		b3 = 0;
+		break;
+	}
+	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+	
+	/* Block D: ON-PI */
+	b4 = eon->pi;
+	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+	
+	/* Pack into bytes */
+	rds_group_pack(blocks, group, 0);
+	
+	/* Advance to next variant/station - cycle through ALL variants for testing:
+	 * 0-3: PS name (4 groups)
+	 * 4:   AF list
+	 * 5:   Mapped AF (first pair)
+	 * 12:  Linkage information
+	 * 13:  PTY/TA info
+	 * 14:  PIN
+	 * 15:  Broadcaster data
+	 * Then move to next station */
+	static const int variant_sequence[] = {
+		RDS_14A_VARIANT_PS_0, RDS_14A_VARIANT_PS_1,
+		RDS_14A_VARIANT_PS_2, RDS_14A_VARIANT_PS_3,
+		RDS_14A_VARIANT_AF, RDS_14A_VARIANT_MAP_5,
+		RDS_14A_VARIANT_LINK, RDS_14A_VARIANT_INFO,
+		RDS_14A_VARIANT_PIN, RDS_14A_VARIANT_BCAST
+	};
+	static const int sequence_len = sizeof(variant_sequence) / sizeof(variant_sequence[0]);
+	
+	/* Find current position in sequence */
+	int seq_pos;
+	for (seq_pos = 0; seq_pos < sequence_len; seq_pos++) {
+		if (variant_sequence[seq_pos] == variant)
+			break;
+	}
+	
+	/* Advance to next in sequence */
+	seq_pos++;
+	if (seq_pos >= sequence_len) {
+		/* Completed full cycle, move to next station */
+		rds->eon_tx_variant = variant_sequence[0];
+		rds->eon_tx_index = (rds->eon_tx_index + 1) % rds->eon_tx_count;
+	} else {
+		rds->eon_tx_variant = variant_sequence[seq_pos];
+	}
+}
+
+
+/* Build Group 14B: EON TA Flag Update
+ * Simplified version for fast TA switching notification.
+ */
+static void rds_build_group_14b(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4];
+	uint16_t b2, b4;
+	
+	if (rds->eon_tx_count == 0)
+		return;
+	
+	/* Get current ON entry */
+	rds_eon_entry_t *eon = &rds->eon_tx[rds->eon_tx_index];
+	
+	/* Block A: PI */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	
+	/* Block B: Group 14B + TP(ON) + TA(ON) */
+	b2 = (RDS_GROUP_14B << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     ((eon->tp ? 1 : 0) << RDS_14A_TP_ON_BIT) |
+	     ((eon->ta ? 1 : 0) << 3);  /* TA in bit 3 for 14B */
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	
+	/* Block C: PI repeat (tuning aid) */
+	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+	
+	/* Block D: ON-PI */
+	b4 = eon->pi;
+	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+	
+	/* Pack into bytes */
+	rds_group_pack(blocks, group, 0);
+	
+	/* Move to next station */
+	rds->eon_tx_index = (rds->eon_tx_index + 1) % rds->eon_tx_count;
+}
+
+
+/* ============================================================
+ * RDS GROUP SCHEDULER (IEC 62106)
+ * ============================================================
+ * 
+ * MANDATORY VS OPTIONAL GROUPS:
+ *   Only Group 0 (0A or 0B) is MANDATORY for RDS transmission.
+ *   All other groups are OPTIONAL and should only transmit if
+ *   their data is configured. Unused slots go to Group 0.
+ *
+ * A VS B VERSION SELECTION (per group type):
+ *   - Version A: Block C carries group-specific data (more capacity)
+ *   - Version B: Block C carries PI repeat (faster station ID)
+ *   
+ *   Group 0: 0A if AF list, 0B if no AF (use_0b flag)
+ *   Group 1: 1A if ECC/Language, 1B if PIN only (use_1b flag)
+ *   Group 2: 2A for 64-char RT, 2B for 32-char faster (use_2b flag)
+ *
+ *   IMPORTANT: Never mix A and B for the SAME group type.
+ *              Different group types CAN use different versions.
+ *
+ * SCHEDULING PRIORITY:
+ *   1. CT (Group 4A) - Time-triggered at minute boundary
+ *   2. Group 0 (PS) - Mandatory, fills most slots
+ *   3. Group 2 (RT) - If RadioText configured
+ *   4. Group 1 (ECC/PIN) - If ECC/Language/PIN configured  
+ *   5. Group 10 (PTYN) - If PTYN configured
+ *   6. Group 14 (EON) - If EON enabled with entries
+ *
+ * TIMING (at 1187.5 bps, ~11.4 groups/sec):
+ *   - 5-group cycle: ~0.44 sec
+ *   - 20 groups: ~1.75 sec (Group 1 interval)
+ *   - 40 groups: ~3.5 sec (Group 10 interval)
+ *   - 50 groups: ~4.4 sec (Group 14 interval)
+ * ============================================================ */
 static void rds_generate_group(rds_encoder_t *rds)
 {
-	/* 1. Time-Triggered Groups (CT) - Highest Priority */
+	/* --------------------------------------------------------
+	 * 1. TIME-TRIGGERED: Group 4A (Clock-Time)
+	 * --------------------------------------------------------
+	 * CT is transmitted at minute boundaries, highest priority.
+	 * IEC 62106 recommends CT accuracy within +/-100ms of UTC. */
 	if (rds->ct_enabled) {
 		time_t now = time(NULL) + rds->ct_time_offset;
 		struct tm *t_now = gmtime(&now);
 		int current_minute = t_now->tm_min;
 		
-		/* Check if we moved to a new minute relative to last transmission */
-		/* Note: We use a simple latch. If system time jumps back, it might re-send. */
 		struct tm *t_last = gmtime(&rds->last_ct_minute);
 		if (current_minute != t_last->tm_min) {
 			rds_build_group_4a(rds, rds->group_buffer);
 			rds->last_ct_minute = now;
 			rds->group_sequence++;
 			rds->group_bit_pos = 0;
-			/* No debug log needed here, 4A builder monitors it */
 			return;
 		}
 	}
 	
-	/* 2. Cyclic Scheduling */
-	uint64_t seq = rds->group_sequence++;
-	int cycle_pos = seq % 5; /* 5-group cycle (approx 0.42 sec) */
+	/* --------------------------------------------------------
+	 * 2. DATA-DRIVEN SCHEDULING
+	 * --------------------------------------------------------
+	 * Only transmit optional groups if their data is configured.
+	 * Group 0 fills all remaining slots (mandatory). */
 	
-	/* Slot 4 (last in cycle): Group 2A (RadioText) */
-	if (cycle_pos == 4) {
-		rds_build_group_2a(rds, rds->group_buffer);
+	/* Check what optional data is configured */
+	int has_rt = (rds->rt[0] != ' ' && rds->rt[0] != '\r' && rds->rt[0] != '\0');
+	int has_slc = (rds->ecc != 0 || rds->language != 0 || rds->pin_day != 0);
+	int has_ptyn = (rds->ptyn[0] != ' ' && rds->ptyn[0] != '\0');
+	int has_eon = (rds->eon_enabled && rds->eon_tx_count > 0);
+	
+	uint64_t seq = rds->group_sequence++;
+	int cycle_pos = seq % 5;  /* 5-group cycle */
+	
+	/* --------------------------------------------------------
+	 * Slot 4: Group 2 (RadioText) - IF configured
+	 * --------------------------------------------------------
+	 * 2A: 64 chars, 4 chars/group, 16 groups to complete
+	 * 2B: 32 chars, 2 chars/group, 16 groups to complete (faster PI)
+	 * -------------------------------------------------------- */
+	if (cycle_pos == 4 && has_rt) {
+		if (rds->use_2b)
+			rds_build_group_2b(rds, rds->group_buffer);
+		else
+			rds_build_group_2a(rds, rds->group_buffer);
 	}
+	/* --------------------------------------------------------
+	 * Slots 0-3: Mix of Group 0 and other optional groups
+	 * -------------------------------------------------------- */
 	else {
-		/* Slots 0-3: Usually Group 0A (PS), but mix in others */
-		
-		/* Every 20 groups (~1.7 sec): Group 1A (ECC/PIN) */
-		if ((seq % 20) == 0) {
-			rds_build_group_1a(rds, rds->group_buffer);
+		/* Every 20 groups: Group 1 (ECC/Language/PIN) - IF configured
+		 * 1A: Full SLC data (ECC, Language) + PIN
+		 * 1B: PIN only with PI repeat (faster station ID) */
+		if ((seq % 20) == 0 && has_slc) {
+			if (rds->use_1b)
+				rds_build_group_1b(rds, rds->group_buffer);
+			else
+				rds_build_group_1a(rds, rds->group_buffer);
 		}
-		/* Every 40 groups (~3.4 sec): Group 10A (PTYN) if set */
-		else if ((seq % 40) == 10 && rds->ptyn[0] != ' ') {
+		/* Every 40 groups: Group 10A (PTYN) - IF configured */
+		else if ((seq % 40) == 10 && has_ptyn) {
 			rds_build_group_10a(rds, rds->group_buffer);
 		}
-		/* Default: Group 0A (PS) */
+		/* Every 50 groups: Group 14A (EON) - IF configured */
+		else if ((seq % 50) == 25 && has_eon) {
+			rds_build_group_14a(rds, rds->group_buffer);
+		}
+		/* --------------------------------------------------------
+		 * Default: Group 0 (MANDATORY - fills all unused slots)
+		 * --------------------------------------------------------
+		 * 0A: PS name + AF list (use when AF available)
+		 * 0B: PS name + PI repeat (use when no AF, better mobile)
+		 * -------------------------------------------------------- */
 		else {
-			rds_build_group_0a(rds, rds->group_buffer);
+			if (rds->use_0b)
+				rds_build_group_0b(rds, rds->group_buffer);
+			else
+				rds_build_group_0a(rds, rds->group_buffer);
 		}
 	}
 	
@@ -551,8 +1298,8 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 	if (ptyn) {
 		final_ptyn = ptyn;
 	} else {
-		/* Default to standard PTY name (e.g. "PopMusic") */
-		final_ptyn = rds_get_pty_name(rds->pty, 0); /* 0=EU RDS */
+		/* Default to standard PTY name - detect RBDS from encoder's ECC */
+		final_ptyn = rds_get_pty_name(rds->pty, RDS_IS_RBDS(rds->ecc));
 	}
 
 	if (final_ptyn) {
@@ -577,9 +1324,9 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 	
 	LOGP(DRADIO, LOGL_INFO, "RDS encoder initialized: PI=%04X PS=\"%s\" RT=\"%s\" PTY=%d\n",
 	     pi, ps ? ps : "", rt ? rt : "", pty);
-	LOGP(DRADIO, LOGL_INFO, "RDS Config: CT=%d, Offset=%+.1fh (%s), ECC=%02X, PIN=%04X, PTYN=\"%.8s\"\n",
+	LOGP(DRADIO, LOGL_INFO, "RDS Config: CT=%d, Offset=%+.1fh (%s), ECC=%02X, PIN=%02d/%02d:%02d, PTYN=\"%.8s\"\n",
 	     rds->ct_enabled, rds->local_offset/2.0, (rds->local_offset == 0) ? "UTC" : "Local",
-	     rds->ecc, 0 /* PIN todo */, rds->ptyn);
+	     rds->ecc, rds->pin_day, rds->pin_hour, rds->pin_minute, rds->ptyn);
 	LOGP(DRADIO, LOGL_INFO, "RDS Groups: 0A (PS), 2A (RT), 1A (ECC), 10A (PTYN), 4A (CT)\n");
 	
 	return 0;
@@ -924,8 +1671,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 	int tp = frame.tp;
 	int pty = frame.pty;
 	
-	/* PI comes from Block A */
-	if (rds->group_mask & (1<<0)) {
+	/* PI comes from Block A - only update if reliably decoded
+	 * Keep last known good PI for AF processing */
+	if ((rds->group_mask & (1<<0)) && rds->block_status[0] <= 1) {
 		rds->pi = frame.pi;
 		rds->pi_status = rds->block_status[0];
 	}
@@ -944,14 +1692,214 @@ static void rds_decode_group(rds_decoder_t *rds)
 	if (group_type == 0) {
 		/* Group 0A/0B - see RDS_0A_* macros in rds.h */
 		int ta = (b2 & RDS_0A_TA_MASK) >> RDS_0A_TA_BIT;
+		int ms = (b2 & RDS_0A_MS_MASK) >> RDS_0A_MS_BIT;
+		int di = (b2 & RDS_0A_DI_MASK) >> RDS_0A_DI_BIT;
 		int seg = b2 & RDS_0A_SEG_MASK;
 		rds->ta = ta;
 		rds->ta_status = rds->block_status[1];
+		rds->ms = ms;
+		rds->ms_status = rds->block_status[1];
+		
+		/* DI flags are transmitted per segment.
+		 * IEC 62106 Table 9: seg 0→d3, seg 1→d2, seg 2→d1, seg 3→d0
+		 * IEC 62106 Table 10: d0=stereo, d1=artificial head, d2=compressed, d3=dynamic PTY
+		 * Combined: seg 0→dynamic PTY, seg 1→compressed, seg 2→artificial head, seg 3→stereo */
+		switch (seg) {
+		case 0: rds->di_dynamic_pty = di; break;
+		case 1: rds->di_compressed = di; break;
+		case 2: rds->di_artificial_head = di; break;
+		case 3: rds->di_stereo = di; break;
+		}
+		rds->di_status = rds->block_status[1];
+		
+		
+		/* Group 0A only: Decode Alternative Frequencies from Block C
+		 *
+		 * AF encoding (EN 50067 S3.2.1.6, IEC 62106 Table 11):
+		 *   224-249: AF count code (N = code - 224, 1-25 AFs follow)
+		 *   1-204:   FM frequency (87.6-107.9 MHz, code = (freq-87.5)*10)
+		 *   205:     Filler code (ignore)
+		 *   250:     LF/MF frequency follows (next byte is LF/MF table)
+		 *   0,251-255: Reserved (ignore)
+		 *
+		 * Method A (simple list): All AFs are equivalent alternatives
+		 *   [count, AF1] [AF2, AF3] [AF4, AF5] ...
+		 *
+		 * Method B (paired, for >25 AFs/regional): Tuning freq in each pair
+		 *   [count, tuned] [freq1, freq2] [freq1, freq2] ...
+		 *   - Ascending (freq1 < freq2): Same content
+		 *   - Descending (freq1 > freq2): Regional variant
+		 *
+		 * NOTE: Method B is detected heuristically by receivers (no control code).
+		 * This decoder stores all AFs as a simple list without method distinction.
+		 */
+		if (version == 0 && (rds->group_mask & (1<<2))) {
+			/* AF processing requires valid PI - without it, we can't
+			 * associate the AF list with any station */
+			if (rds->pi == 0) {
+				/* No valid PI received yet - ignore AF data */
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: Ignoring AF - no valid PI\n");
+			} else {
+			uint8_t af1 = (b3 >> 8) & 0xFF;
+			uint8_t af2 = b3 & 0xFF;
+			int block_c_reliable = (rds->block_status[2] <= 1);
+			
+			if (af1 >= 224 && af1 <= 249) {
+				/* AF count code: start of new list */
+				if (block_c_reliable) {
+					/* Get/Create Method A and LF/MF entries to reset them */
+					rds_af_entry_t *ea = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_A, 0);
+					rds_af_entry_t *el = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_LF_MF, 0);
+					
+					if (ea) ea->count = 0;
+					if (el) el->count = 0;
+					
+					/* Store first frequency - candidate for Method B tuning freq */
+					if (RDS_VALID_AF_CODE(af2) && ea) {
+						ea->list[ea->count].freq = RDS_AF_FM_BASE + af2;
+						ea->list[ea->count].flags = 0;
+						ea->count++;
+					}
+				}
+			} else if (af1 == RDS_AF_LF_MF_FOLLOWS) {
+				/* LF/MF frequency indicator (code 250) */
+				int is_us = RDS_IS_RBDS(rds->ecc);
+				int spacing = is_us ? 10 : 9;
+				int mf_base = is_us ? 380 : 387;
+				rds_af_entry_t *el = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_LF_MF, 0);
+				
+				if (el && block_c_reliable && rds->pi != 0) {
+					uint16_t freq = 0;
+					uint8_t flags = 0;
+					
+					if (af2 >= 1 && af2 <= 15) {
+						freq = 144 + af2 * 9;
+						flags = RDS_AF_FLAG_LF;
+					} else if (af2 >= 16 && af2 <= 135) {
+						freq = mf_base + af2 * spacing;
+						flags = RDS_AF_FLAG_MF;
+					}
+					
+					if (freq && el->count < RDS_AF_MAX_ITEMS) {
+						el->list[el->count].freq = freq;
+						el->list[el->count].flags = flags;
+						el->count++;
+						
+						if (rds->verbose)
+							LOGP(DRADIO, LOGL_INFO, "RDS 0A: LF/MF AF received: %d kHz (%s band)\n",
+							     freq, (flags & RDS_AF_FLAG_LF) ? "LF" : "MF");
+					}
+				}
+			} else if (block_c_reliable && af1 != 0 && af1 != RDS_AF_FILLER && af1 != RDS_AF_NO_AF) {
+				/* Regular FM AF pair - detect Method B or add to Method A */
+				uint16_t freq1 = RDS_VALID_AF_CODE(af1) ? RDS_AF_FM_BASE + af1 : 0;
+				uint16_t freq2 = RDS_VALID_AF_CODE(af2) ? RDS_AF_FM_BASE + af2 : 0;
+				
+				/* Check Method B: compare against first freq of Method A list (tuning freq) */
+				rds_af_entry_t *ea = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_A, 0);
+				uint16_t tx_freq = (ea && ea->count > 0) ? ea->list[0].freq : 0;
+				
+				int is_method_b = (tx_freq && (freq1 == tx_freq || freq2 == tx_freq));
+				
+				if (is_method_b) {
+					/* Method B: route to sub-entry for this transmitter */
+					rds->af_method_b = 1; /* Keep flag for debug/status */
+					rds_af_entry_t *eb = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_B, tx_freq);
+					
+					if (eb) {
+						uint16_t alt = (freq1 == tx_freq) ? freq2 : freq1;
+						if (alt) {
+							int idx;
+							
+							/* Find slot: new or replace based on priority (Internal List Logic) */
+							if (eb->count < RDS_AF_MAX_ITEMS) {
+								/* Free slot available */
+								idx = eb->count++;
+							} else {
+								/* Smart replacement: Invalid then Oldest */
+								int replace_idx = 0;
+								uint32_t oldest_invalid_time = UINT32_MAX;
+								uint32_t oldest_time = UINT32_MAX;
+								int oldest_idx = 0;
+								
+								for (int j = 0; j < eb->count; j++) {
+									if (eb->list[j].entry_time < oldest_time) {
+										oldest_time = eb->list[j].entry_time;
+										oldest_idx = j;
+									}
+									if (eb->list[j].priority == RDS_AF_PRIORITY_INVALID &&
+									    eb->list[j].entry_time < oldest_invalid_time) {
+										oldest_invalid_time = eb->list[j].entry_time;
+										replace_idx = j;
+									}
+								}
+								
+								if (oldest_invalid_time == UINT32_MAX)
+									replace_idx = oldest_idx;
+								
+								idx = replace_idx;
+								if (rds->debug)
+									LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: Method B replacing item %d (%.1f MHz)\n",
+									     idx, eb->list[idx].freq / 10.0);
+							}
+							
+							/* Update Item */
+							eb->list[idx].freq = alt;
+							eb->list[idx].entry_time = rds->af_update_counter++;
+							
+							/* Determine Priority (Regional/Order) */
+							if (idx == 0) {
+								eb->list[idx].flags = 0; /* Clear Regional bit */
+								eb->list[idx].priority = RDS_AF_PRIORITY_SAME;
+							} else {
+								uint16_t prev_alt = eb->list[idx-1].freq;
+								int is_ascending = (alt > prev_alt);
+								/* Note: We use existing buffer order. ideally idx order might be scrambled.
+								 * Assuming append/linear behavior for detection. */
+								int prev_was_reg = (eb->list[idx-1].flags & RDS_AF_FLAG_REGIONAL);
+								
+								if (is_ascending) {
+									eb->list[idx].flags &= ~RDS_AF_FLAG_REGIONAL;
+									if (prev_was_reg && idx > 1) eb->list[idx].priority = RDS_AF_PRIORITY_INVALID;
+									else eb->list[idx].priority = RDS_AF_PRIORITY_SAME;
+								} else {
+									/* Descending or Equal -> Regional */
+									eb->list[idx].flags |= RDS_AF_FLAG_REGIONAL;
+									if (!prev_was_reg && idx > 1) eb->list[idx].priority = RDS_AF_PRIORITY_INVALID;
+									else eb->list[idx].priority = RDS_AF_PRIORITY_REGIONAL;
+								}
+							}
+							
+							if (rds->verbose) {
+								int is_reg = (eb->list[idx].flags & RDS_AF_FLAG_REGIONAL);
+								int is_inv = (eb->list[idx].priority == RDS_AF_PRIORITY_INVALID);
+								LOGP(DRADIO, LOGL_INFO, "RDS 0A: Method B update: TX=%.1f AF=%.1f %s%s\n",
+								     tx_freq/10.0, alt/10.0, 
+								     is_reg ? "(R)" : "",
+								     is_inv ? " [INVALID ORDER]" : "");
+							}
+						}
+					}
+				} else {
+					/* Method A: Append to list */
+					if (ea && ea->count < RDS_AF_MAX_ITEMS) {
+						if (freq1) ea->list[ea->count++].freq = freq1;
+						if (freq2 && ea->count < RDS_AF_MAX_ITEMS) ea->list[ea->count++].freq = freq2;
+					}
+				}
+			}
+			
+			if (rds->debug && af1 >= 1 && af1 <= 204)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: AF codes: %d, %d (Method %c)\n",
+				     af1, af2, (rds->af_method_b && rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_B, 0)) ? 'B' : 'A');
+			}  /* end else (pi valid) */
+		}
 		
 		/* DEBUG: Compact codes */
 		if (rds->debug)
-			LOGP(DRADIO, LOGL_DEBUG, "RDS 0%c: PI=%04X PTY=%d TP=%d TA=%d seg=%d\n",
-			     version ? 'B' : 'A', pi, pty, tp, ta, seg);
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 0%c: PI=%04X PTY=%d TP=%d TA=%d M/S=%c DI[%d]=%d seg=%d\n",
+			     version ? 'B' : 'A', pi, pty, tp, ta, ms ? 'M' : 'S', seg, di, seg);
 		
 		/* Only update PS if block D is valid (in group_mask) */
 		if (rds->group_mask & (1<<3)) {
@@ -961,20 +1909,33 @@ static void rds_decode_group(rds_decoder_t *rds)
 			rds->ps_status[seg*2+1] = rds->block_status[3];
 			rds->ps_segments |= (1 << seg);
 			
-			/* Verbose: Log Group 0 basic tuning info and PS segment */
+			/* Verbose: Log Group 0 basic tuning info and PS segment
+			 * DI segment mapping: seg 0->d3, seg 1->d2, seg 2->d1, seg 3->d0 */
 			if (rds->verbose)
-				LOGP(DRADIO, LOGL_INFO, "RDS 0%c: Programme Type=%d (%s), "
-				     "Traffic Programme=%s, Traffic Announcement=%s, "
-				     "PS segment %d/4=\"%c%c\"\n",
-				     version ? 'B' : 'A', pty, rds_get_pty_name(pty, 0),
-				     tp ? "Yes" : "No", ta ? "Yes" : "No",
-				     seg + 1,
+				LOGP(DRADIO, LOGL_INFO, "RDS 0%c: PTY=%d (%s), TP=%d, TA=%d (%s), "
+				     "M/S=%s, %s=%s, PS[%d]=\"%c%c\"\n",
+				     version ? 'B' : 'A', pty, rds_get_pty_name(pty, RDS_IS_RBDS(rds->ecc)),
+				     tp, ta, rds_get_tp_ta_description(tp, ta),
+				     rds_get_ms_name(ms),
+				     rds_get_di_name(3 - seg), rds_get_di_value_name(3 - seg, di),
+				     seg,
 				     (rds->ps[seg*2] >= 0x20 && rds->ps[seg*2] <= 0x7E) ? rds->ps[seg*2] : '.',
 				     (rds->ps[seg*2+1] >= 0x20 && rds->ps[seg*2+1] <= 0x7E) ? rds->ps[seg*2+1] : '.');
 		}
 		
 		if (rds->ps_segments == 0x0F) {
 			rds->ps[8] = '\0';
+			
+			/* Log complete DI summary once we have all segments
+			 * DI flag names from rds_tables.h: d0=dynamic_pty, d1=compressed, 
+			 * d2=artificial_head, d3=stereo (mapped to segments 3,2,1,0) */
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 0%c: Decoder Info: %s=%s, %s=%s, %s=%s, %s=%s\n",
+				     version ? 'B' : 'A',
+				     rds_get_di_name(3), rds_get_di_value_name(3, rds->di_stereo),
+				     rds_get_di_name(2), rds_get_di_value_name(2, rds->di_artificial_head),
+				     rds_get_di_name(1), rds_get_di_value_name(1, rds->di_compressed),
+				     rds_get_di_name(0), rds_get_di_value_name(0, rds->di_dynamic_pty));
 		}
 	}
 	else if (group_type == 1) {
@@ -990,11 +1951,17 @@ static void rds_decode_group(rds_decoder_t *rds)
 			rds->pin_hour = (b4 & RDS_PIN_HOUR_MASK) >> RDS_PIN_HOUR_SHIFT;
 			rds->pin_minute = b4 & RDS_PIN_MINUTE_MASK;
 			
-			if (rds->debug)
-				LOGP(DRADIO, LOGL_DEBUG, "RDS 1%c: PIN=0x%04X day=%d hour=%d min=%d\n",
-				     version ? 'B' : 'A', rds->pin, rds->pin_day, rds->pin_hour, rds->pin_minute);
+			/* Validate PIN fields (RDS_VALID_* macros) */
+			int pin_valid = RDS_VALID_PIN_DAY(rds->pin_day) &&
+			                RDS_VALID_HOUR(rds->pin_hour) &&
+			                RDS_VALID_MINUTE(rds->pin_minute);
 			
-			if (rds->verbose) {
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 1%c: PIN=0x%04X day=%d hour=%d min=%d%s\n",
+				     version ? 'B' : 'A', rds->pin, rds->pin_day, rds->pin_hour, rds->pin_minute,
+				     pin_valid ? "" : " [INVALID]");
+			
+			if (rds->verbose && pin_valid) {
 				if (rds->pin_day != 0) {
 					LOGP(DRADIO, LOGL_INFO, "RDS 1%c: Programme Item Number - "
 					     "Scheduled broadcast: Day %d of month, %02d:%02d\n",
@@ -1127,8 +2094,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 			int tz_sign = (b4 & RDS_4A_TZ_SIGN_MASK) ? -1 : 1;
 			int tz_offset = (b4 & RDS_4A_TZ_OFFSET_MASK) * tz_sign;
 			
-			/* Validate before storing */
-			if (mjd >= 15079 && hour <= 23 && minute <= 59) {
+			/* Validate before storing (use RDS_VALID_* macros) */
+			if (RDS_VALID_MJD(mjd) && RDS_VALID_HOUR(hour) && RDS_VALID_MINUTE(minute)) {
 				rds->ct_mjd = mjd;
 				rds->ct_hour = hour;
 				rds->ct_minute = minute;
@@ -1170,7 +2137,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				/* Calculate delta from system time */
 				struct tm tm_rx = {0};
 				tm_rx.tm_year = year - 1900;
-				tm_rx.tm_mon = month;
+				tm_rx.tm_mon = month - 1;  /* mjd_to_date returns 1-12, tm_mon expects 0-11 */
 				tm_rx.tm_mday = day;
 				tm_rx.tm_hour = hour;
 				tm_rx.tm_min = minute;
@@ -1188,7 +2155,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				/* User Requested Format: UTC, Offset, Local, Delta */
 				LOGP(DRADIO, LOGL_INFO, "RDS 4A Report: UTC=%04d-%02d-%02dT%02d:%02dZ  "
 				     "Offset=%+.1fh  Local=%02d:%02d  Delta=%+.0fs\n",
-				     year, month+1, day, hour, minute, /* month is 0-11 */
+				     year, month, day, hour, minute, /* month is already 1-12 from mjd_to_date */
 				     tz_offset / 2.0,
 				     local_hour, local_minute, delta);
 #endif
@@ -1254,43 +2221,78 @@ static void rds_decode_group(rds_decoder_t *rds)
 		}
 	}
 	else if (group_type == 14) {
-		/* Group 14A/14B: Enhanced Other Networks (EON) */
+		/* Group 14A/14B: Enhanced Other Networks (EON) - IEC 62106 S6.1.5.14 */
 		/* Block D contains ON-PI (PI of the Other Network) */
 		uint16_t on_pi = b4;
+		int tp_on = (b2 >> RDS_14A_TP_ON_BIT) & 1;  /* TP flag for ON */
 		
-		/* Update state only if we have Block D */
-		if (rds->group_mask & (1<<3)) {
-			/* If PI changed, reset single-slot state */
-			if (on_pi != rds->on_pi) {
-				rds->on_pi = on_pi;
-				rds->on_ps_segments = 0;
-				memset(rds->on_ps, ' ', 8);
-				/* Keep other fields? Maybe not. */
+		/* Ignore if Block D is missing */
+		if (!(rds->group_mask & (1<<3)))
+			goto group14_done;
+		
+		/* Find or create EON entry for this PI */
+		rds_eon_entry_t *eon = NULL;
+		int eon_idx = -1;
+		
+		/* Search existing entries */
+		for (int i = 0; i < rds->eon_count; i++) {
+			if (rds->eon[i].pi == on_pi) {
+				eon = &rds->eon[i];
+				eon_idx = i;
+				break;
 			}
 		}
+		
+		/* Create new entry if not found and space available */
+		if (!eon && rds->eon_count < RDS_EON_MAX_ENTRIES) {
+			eon_idx = rds->eon_count++;
+			eon = &rds->eon[eon_idx];
+			memset(eon, 0, sizeof(*eon));
+			eon->pi = on_pi;
+			memset(eon->ps, ' ', 8);
+			eon->ps[8] = '\0';
+		}
+		
+		if (!eon) {
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 14A: EON database full, ignoring PI=%04X\n", on_pi);
+			goto group14_done;
+		}
+		
+		/* Update TP for this network */
+		eon->tp = tp_on;
+		eon->last_update = rds->groups_received;
+		
+		/* Update legacy single-slot fields */
+		rds->on_pi = on_pi;
+		rds->on_tp = tp_on;
 
 		if (version == 0) { /* 14A */
-			int usage = b2 & 0x0F;
+			int usage = b2 & RDS_14A_USAGE_MASK;
 			
-			/* Log EON 14A reception */
 			if (rds->debug)
-				LOGP(DRADIO, LOGL_DEBUG, "RDS 14A: ON-PI=%04X Usage=%d\n", on_pi, usage);
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 14A: ON-PI=%04X Usage=%d TP=%d\n", 
+				     on_pi, usage, tp_on);
 
 			if (usage <= 3) {
-				/* ON-PS Characters */
+				/* Variants 0-3: ON-PS Characters (IEC 62106 Table 17) */
 				int pos = usage * 2;
 				if (rds->group_mask & (1<<2)) { /* Block C valid */
-					rds->on_ps[pos]   = (b3 >> 8) & 0xFF;
-					rds->on_ps[pos+1] = b3 & 0xFF;
-					rds->on_ps_segments |= (1 << usage);
+					eon->ps[pos]   = (b3 >> 8) & 0xFF;
+					eon->ps[pos+1] = b3 & 0xFF;
+					eon->ps_segments |= (1 << usage);
 					
-					/* Log if we have segments */
+					/* Update legacy fields */
+					rds->on_ps[pos]   = eon->ps[pos];
+					rds->on_ps[pos+1] = eon->ps[pos+1];
+					rds->on_ps_segments = eon->ps_segments;
+					
 					if (rds->verbose) {
 						char on_ps_disp[9];
-						int i;
-						memcpy(on_ps_disp, rds->on_ps, 8);
-						for(i=0; i<8; i++) 
-							if(on_ps_disp[i] < 0x20 || on_ps_disp[i] > 0x7E) on_ps_disp[i] = ' ';
+						memcpy(on_ps_disp, eon->ps, 8);
+						for (int i = 0; i < 8; i++)
+							if (on_ps_disp[i] < 0x20 || on_ps_disp[i] > 0x7E) 
+								on_ps_disp[i] = ' ';
 						on_ps_disp[8] = '\0';
 						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON-PS segment %d/4. "
 						     "Other Network (PI=%04X) Name=\"%s\"\n", 
@@ -1298,47 +2300,196 @@ static void rds_decode_group(rds_decoder_t *rds)
 					}
 				}
 			}
-			else if (usage == 13) {
-				/* ON-PTY and ON-TA/TP */
+			else if (usage == 4) {
+				/* Variant 4: AF Method A for ON (IEC 62106 S6.2.1.6) */
 				if (rds->group_mask & (1<<2)) {
-					int on_pty = (b3 >> 11) & 0x1F;
-					int on_ta  = (b3 >> 0) & 1;
-					int on_tp  = (b3 >> 10) & 1; /* IEC 62106 S6.1.5.14: Variant 13
-					                              * b15-11: ON-PTY
-					                              * b10:    ON-TP
-					                              * b0:     ON-TA
-					                              */
+					uint8_t af1 = (b3 >> 8) & 0xFF;
+					uint8_t af2 = b3 & 0xFF;
 					
-					rds->on_pty = on_pty;
-					rds->on_tp  = on_tp;
-					rds->on_ta  = on_ta;
+					/* Add valid AF codes to ON's AF list */
+					if (RDS_VALID_AF_CODE(af1) && eon->af_count < RDS_EON_MAX_AF) {
+						eon->af[eon->af_count++] = 875 + af1;
+					}
+					if (RDS_VALID_AF_CODE(af2) && eon->af_count < RDS_EON_MAX_AF) {
+						eon->af[eon->af_count++] = 875 + af2;
+					}
 					
 					if (rds->verbose)
-						LOGP(DRADIO, LOGL_INFO, "RDS 14A: Other Network (PI=%04X) Info: "
-						     "PTY=%d (%s), TP=%s, TA=%s\n",
-						     on_pi, on_pty, rds_get_pty_name(on_pty, 0),
-						     on_tp ? "Yes" : "No", on_ta ? "Yes" : "No");
+						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) AFs: %d, %d "
+						     "(count=%d)\n", on_pi, af1, af2, eon->af_count);
+				}
+			}
+			else if (usage >= 5 && usage <= 9) {
+				/* Variants 5-9: Mapped AF (IEC 62106 S6.2.1.6.2) */
+				if (rds->group_mask & (1<<2)) {
+					uint8_t tuned_af = (b3 >> 8) & 0xFF;
+					uint8_t on_af = b3 & 0xFF;
+					
+					if (RDS_VALID_AF_CODE(tuned_af) && RDS_VALID_AF_CODE(on_af)) {
+						/* Store mapped AF if space available */
+						if (eon->mapped_af_count < RDS_EON_MAX_MAPPED_AF) {
+							/* Check if this mapping already exists */
+							int found = 0;
+							for (int i = 0; i < eon->mapped_af_count; i++) {
+								if (eon->mapped_af[i].tuned_af == tuned_af) {
+									eon->mapped_af[i].on_af = on_af;
+									found = 1;
+									break;
+								}
+							}
+							if (!found) {
+								eon->mapped_af[eon->mapped_af_count].tuned_af = tuned_af;
+								eon->mapped_af[eon->mapped_af_count].on_af = on_af;
+								eon->mapped_af_count++;
+							}
+						}
+						
+						if (rds->verbose)
+							LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Mapped AF: "
+							     "%.1f MHz -> %.1f MHz\n", on_pi, 
+							     (875 + tuned_af) / 10.0, (875 + on_af) / 10.0);
+					}
+				}
+			}
+			else if (usage == RDS_14A_VARIANT_LINK) {
+				/* Variant 12: Linkage Information (IEC 62106 S6.1.5.14)
+				 * Block C structure: LA(1) + EG/ILS(2) + SG(1) + LSN(12)
+				 * LA = Linkage Actuator, LSN = Linkage Set Number
+				 * The upper 4 bits of LSN [11:8] contain the LIC */
+				if (rds->group_mask & (1<<2)) {
+					int la = (b3 >> RDS_14A_LINK_LA_BIT) & 1;
+					uint16_t lsn = b3 & RDS_14A_LINK_LSN_MASK;
+					uint8_t lic = (lsn >> 8) & 0x0F;  /* LIC in bits 11-8 */
+					
+					eon->linkage_la = la;
+					eon->linkage_lsn = lsn;
+					
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Linkage: "
+						     "LA=%d LSN=0x%03X LIC=%d (%s)\n", 
+						     on_pi, la, lsn, lic, rds_get_linkage_name(lic));
+				}
+			}
+			else if (usage == 13) {
+				/* Variant 13: ON-PTY and ON-TA (IEC 62106 S6.1.5.14) */
+				if (rds->group_mask & (1<<2)) {
+					int on_pty = (b3 >> RDS_14A_INFO_PTY_SHIFT) & 0x1F;
+					int on_ta  = b3 & RDS_14A_INFO_TA_MASK;
+					
+					eon->pty = on_pty;
+					eon->ta = on_ta;
+					
+					/* Update legacy fields */
+					rds->on_pty = on_pty;
+					rds->on_ta = on_ta;
+					
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Info: "
+						     "PTY=%d (%s), TA=%s\n",
+						     on_pi, on_pty, rds_get_pty_name(on_pty, RDS_IS_RBDS(rds->ecc)),
+						     on_ta ? "Yes" : "No");
 				}
 			}
 			else if (usage == 14) {
-				/* ON-PIN */
+				/* Variant 14: ON-PIN (IEC 62106 S6.1.5.14) */
 				if (rds->group_mask & (1<<2)) {
+					eon->pin = b3;
+					eon->pin_day = (b3 >> 11) & 0x1F;
+					eon->pin_hour = (b3 >> 6) & 0x1F;
+					eon->pin_minute = b3 & 0x3F;
+					
+					/* Update legacy field */
 					rds->on_pin = b3;
-					int day = (b3 >> 11) & 0x1F;
-					int hour = (b3 >> 6) & 0x1F;
-					int min = b3 & 0x3F;
+					
 					if (rds->verbose)
-						LOGP(DRADIO, LOGL_INFO, "RDS 14A: Other Network (PI=%04X) PIN: "
-						     "Day %d, %02d:%02d\n", on_pi, day, hour, min);
+						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) PIN: "
+						     "Day %d, %02d:%02d\n", 
+						     on_pi, eon->pin_day, eon->pin_hour, eon->pin_minute);
+				}
+			}
+			else if (usage == 15) {
+				/* Variant 15: Broadcaster Data (reserved) */
+				if (rds->group_mask & (1<<2)) {
+					eon->broadcaster_data = b3;
+					
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Broadcaster: "
+						     "0x%04X\n", on_pi, b3);
 				}
 			}
 		} else { /* 14B */
-			/* Block B bit 4 is usually reserved, but 14B transmits TA flags */
-			/* Actually 14B is rarely used and structure is different. 
-			 * Skip for now or just debug log. */
-			if (rds->debug)
-				LOGP(DRADIO, LOGL_DEBUG, "RDS 14B: EON TA update received\n");
+			/* Group 14B: TA Switch (IEC 62106 S6.1.5.14) */
+			int ta_on = (b2 >> 3) & 1;  /* Block B bit 3 is TA for ON */
+			
+			eon->ta = ta_on;
+			rds->on_ta = ta_on;
+			
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 14B: ON (PI=%04X) TA Switch: TA=%s\n",
+				     on_pi, ta_on ? "Yes" : "No");
 		}
+		
+group14_done:
+		; /* Empty statement for label */
+	}
+	else if (group_type == 3 && version == 0) {
+		/* Group 3A: Open Data Application Identification (IEC 62106 S6.1.5.5)
+		 * Block B bits 4-0: Application Group Type code
+		 * Block C: Application-specific message (ODA-dependent)
+		 * Block D: Application Identification (AID) - 16-bit registered code
+		 */
+		int app_group = b2 & RDS_3A_APP_GROUP_MASK;
+		uint16_t aid = b4;
+		
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 3A: AppGroup=%d%c AID=%04X\n",
+			     app_group >> 1, (app_group & 1) ? 'B' : 'A', aid);
+		
+		if (rds->verbose && (rds->group_mask & (1<<3))) {
+			const char *oda_name = "Unknown";
+			/* Common ODA AIDs (EBU ODA Registry) */
+			switch (aid) {
+			case 0x0093: oda_name = "DAB Cross-Reference"; break;
+			case 0x4BD7: oda_name = "RadioText Plus (RT+)"; break;
+			case 0x6552: oda_name = "Enhanced RadioText (eRT)"; break;
+			case 0xCD46: oda_name = "TMC Alert-C"; break;
+			case 0xFF7F: oda_name = "Station Logo"; break;
+			case 0xFF70: oda_name = "Internet Connection"; break;
+			}
+			LOGP(DRADIO, LOGL_INFO, "RDS 3A: ODA Identification - "
+			     "AID=0x%04X (%s), carried in Group %d%c\n",
+			     aid, oda_name,
+			     app_group >> 1, (app_group & 1) ? 'B' : 'A');
+		}
+	}
+	else if (group_type == 15 && version == 1) {
+		/* Group 15B: Fast Basic Tuning and Switching (IEC 62106 S6.1.5.16)
+		 * Mirrors Group 0B Block B payload for fast TA/TP detection.
+		 * Block B bits 4-0: TA, M/S, DI, segment (same as 0A/0B)
+		 * Block C: PI repeat
+		 * Block D: Repeat of Block B payload structure
+		 */
+		int ta = (b2 & RDS_15B_TA_MASK) >> RDS_15B_TA_BIT;
+		int ms = (b2 & RDS_15B_MS_MASK) >> RDS_15B_MS_BIT;
+		int di = (b2 & RDS_15B_DI_MASK) >> RDS_15B_DI_BIT;
+		int seg = b2 & RDS_15B_SEG_MASK;
+		
+		/* Update TA (fast switching use case) */
+		rds->ta = ta;
+		rds->ta_status = rds->block_status[1];
+		rds->ms = ms;
+		rds->ms_status = rds->block_status[1];
+		
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 15B: TA=%d M/S=%d DI=%d seg=%d\n",
+			     ta, ms, di, seg);
+		
+		if (rds->verbose)
+			LOGP(DRADIO, LOGL_INFO, "RDS 15B: Fast Switching - "
+			     "TA=%s, M/S=%s, DI[%d]=%d\n",
+			     ta ? "Yes" : "No",
+			     ms ? "Music" : "Speech",
+			     3 - seg, di);
 	}
 	
 	/* Debug: detailed group dump */
@@ -1453,12 +2604,20 @@ static int rds_biphase_decode(rds_decoder_t *rds, double acc)
 	return bit_decoded;
 }
 
-int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose)
+int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us)
 {
 	memset(rds, 0, sizeof(*rds));
 	rds->samplerate = samplerate;
 	rds->debug = debug;
 	rds->verbose = verbose;
+
+	/* Heuristic: If 50µs emphasis is used, assume RBDS (North America)
+	 * by setting a default ECC in the RBDS range (0xA0).
+	 * This allows correct PTY name display (e.g. "Top 40") before
+	 * the actual ECC is received from Group 1A. */
+	if (time_constant_us > 0.0 && time_constant_us < 60.0) {
+		rds->ecc = 0xA0; /* Start with RBDS assumption */
+	}
 	
 	/* Initialize Subcarrier PLL (57 kHz) */
 	rds->freq_subcarrier = 57000.0;
@@ -1829,12 +2988,20 @@ void rds_decoder_status(rds_decoder_t *rds)
 	/* PI and PS with status beneath */
 	{
 		char ps_status_str[9];
+		char pi_str[32];
+		const char *call = RDS_IS_RBDS(rds->ecc) ? rds_get_callsign(rds->pi) : NULL;
+
+		if (call)
+			snprintf(pi_str, sizeof(pi_str), "%04X (%s)", rds->pi, call);
+		else
+			snprintf(pi_str, sizeof(pi_str), "%04X", rds->pi);
+
 		for (i=0; i<8; i++) {
 			ps_status_str[i] = STATUS_CHAR(rds->ps_status[i]);
 		}
 		ps_status_str[8] = '\0';
-		LOGP(DRADIO, LOGL_NOTICE, "PI=%04X %c  PS=\"%s\"  Sync=%s  BER=%.1f%%\n",
-		     rds->pi, STATUS_CHAR(rds->pi_status), ps_sanitized,
+		LOGP(DRADIO, LOGL_NOTICE, "PI=%-11s %c  PS=\"%s\"  Sync=%s  BER=%.1f%%\n",
+		     pi_str, STATUS_CHAR(rds->pi_status), ps_sanitized,
 		     rds->synced ? "Y" : "N",
 		     rds->ber_percent);
 		/*               PI=XXXX X  PS=" = 15 chars padding */
@@ -1844,16 +3011,69 @@ void rds_decoder_status(rds_decoder_t *rds)
 	/* Flags with status */
 	{
 		char pty_name_buf[32];
-		snprintf(pty_name_buf, sizeof(pty_name_buf), "%s", rds_get_pty_name(rds->pty, 0));
+		snprintf(pty_name_buf, sizeof(pty_name_buf), "%s", rds_get_pty_name(rds->pty, RDS_IS_RBDS(rds->ecc)));
 		LOGP(DRADIO, LOGL_NOTICE, "PTY=%d %c (%s)  TP=%s %c  TA=%s %c\n",
 		     rds->pty, STATUS_CHAR(rds->pty_status), pty_name_buf,
 		     rds->tp ? "Y" : "N", STATUS_CHAR(rds->tp_status),
 		     rds->ta ? "Y" : "N", STATUS_CHAR(rds->ta_status));
 	}
 	
+	/* Music/Speech and Decoder Identification flags */
+	{
+		LOGP(DRADIO, LOGL_NOTICE, "M/S=%s %c  DI: Stereo=%s ArtHead=%s Compress=%s DynPTY=%s %c\n",
+		     rds->ms ? "Music" : "Speech", STATUS_CHAR(rds->ms_status),
+		     rds->di_stereo ? "Y" : "N",
+		     rds->di_artificial_head ? "Y" : "N",
+		     rds->di_compressed ? "Y" : "N",
+		     rds->di_dynamic_pty ? "Y" : "N",
+		     STATUS_CHAR(rds->di_status));
+	}
+	
+	/* Alternative Frequencies (Unified) */
+	if (rds->af_table.count > 0) {
+		LOGP(DRADIO, LOGL_NOTICE, "Alternative Frequencies:\n");
+		for (i = 0; i < rds->af_table.count; i++) {
+			rds_af_entry_t *e = &rds->af_table.entries[i];
+			if (e->count == 0) continue;
+			
+			/* Basic check: only show AFs matching current PI to avoid confusion, 
+			 * or valid PIs if debugging multiple services */
+			if (e->pi != rds->pi && rds->pi != 0) continue;
+			
+			char af_buf[256] = "";
+			int pos = 0;
+			
+			/* Header */
+			char header[64];
+			if (e->type == RDS_AF_TYPE_METHOD_A)
+				snprintf(header, sizeof(header), "  Method A");
+			else if (e->type == RDS_AF_TYPE_METHOD_B)
+				snprintf(header, sizeof(header), "  Method B (TX=%.1f)", e->tx_freq / 10.0);
+			else if (e->type == RDS_AF_TYPE_LF_MF)
+				snprintf(header, sizeof(header), "  LF/MF");
+			else
+				snprintf(header, sizeof(header), "  Unknown");
+
+			/* List */
+			for (int j = 0; j < e->count && pos < 240; j++) {
+				if (e->type == RDS_AF_TYPE_LF_MF) {
+					pos += snprintf(af_buf + pos, sizeof(af_buf) - pos, "%d(%s) ",
+					                e->list[j].freq,
+					                (e->list[j].flags & 0x02) ? "LF" : "MF");
+				} else {
+					pos += snprintf(af_buf + pos, sizeof(af_buf) - pos, "%.1f%s ",
+					                e->list[j].freq / 10.0,
+					                (e->list[j].flags & 0x01) ? "(R)" : "");
+				}
+			}
+			LOGP(DRADIO, LOGL_NOTICE, "%-20s: %s\n", header, af_buf);
+		}
+	}
+	
 	/* Block statistics */
 	LOGP(DRADIO, LOGL_NOTICE, "Groups=%d  Blocks: OK=%ld  Bad=%ld  Total=%ld\n",
 	     rds->groups_received, rds->blocks_ok, rds->blocks_bad, rds->blocks_received);
+
 	
 	/* PTYN (if any bits received) */
 	if (rds->ptyn_segments) {

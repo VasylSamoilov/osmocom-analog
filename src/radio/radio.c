@@ -28,6 +28,7 @@
 #include "../liblogging/logging.h"
 #include "../libclipper/clipper.h"
 #include "radio.h"
+#include "rds_tables.h"
 
 #define CLIP_POINT	0.85
 #define DC_CUTOFF	30.0 // Wikipedia: UKW-Rundfunk
@@ -37,7 +38,572 @@
 #define PHASE_ERROR_TOLERANCE	3.0	/* ITU-R BS.450-4 S2.2.2.5: +/-3deg */
 #define PHASE_ERROR_AVG_SAMPLES	10000	/* samples to average for phase error */
 
+/* ============================================================
+ * RDS Preset Configuration System
+ * Press 'f' during operation to cycle between presets.
+ * 
+ * Country is determined by PI prefix (first hex digit) + ECC combination.
+ * See IEC 62106 Annex D for official tables.
+ * TEF6686 lookup: docs/rds/TEF6686_ESP32/src/TEF6686.cpp lines 848-1155
+ * Country name table: docs/rds/TEF6686_ESP32/src/TEF6686.h lines 111-340
+ * ============================================================ */
+
+typedef struct rds_preset {
+	const char	*name;		/* Preset name for display */
+	uint16_t	pi;		/* Programme Identification */
+	const char	*ps;		/* Programme Service (8 chars max) */
+	const char	*rt;		/* RadioText: 64 chars max (2A) or 32 chars max (2B), per IEC 62106 */
+	uint8_t		pty;		/* Programme Type (0-31) */
+	const char	*ptyn;		/* PTY Name (8 chars max or NULL) */
+	uint8_t		tp;		/* Traffic Programme flag */
+	uint8_t		ms;		/* Music/Speech (1=Music) */
+	uint8_t		ecc;		/* Extended Country Code */
+	uint8_t		lang;		/* Language Code */
+	uint8_t		af[3];		/* Alternative Frequencies (codes) - Method A */
+	uint8_t		af_count;	/* Number of AFs */
+	/* LF Alternative Frequencies (153-279 kHz) */
+	struct {
+		uint16_t freq_khz;
+	} af_lf[4];
+	uint8_t		af_lf_count;
+
+	/* MF Alternative Frequencies (531-1602 kHz) */
+	struct {
+		uint16_t freq_khz;
+	} af_mf[4];
+	uint8_t		af_mf_count;
+	
+	/* Method B AFs: Lists of (Transmitter, AFs...) */
+	struct {
+		uint8_t tx;		/* Transmitter Frequency (code) */
+		uint8_t count;		/* Number of AFs */
+		uint8_t list[20];	/* AF Codes */
+	} af_method_b[5];		/* Up to 5 lists */
+	uint8_t		af_method_b_count;
+	const char	*callsign;	/* RBDS Call Sign (overrides/sets PI if PI=0) */
+	/* Group 1A PIN - Programme Item Number for THIS station (current PI)
+	 * HISTORICAL: Enabled "VCR-like" radio recording (1984-1990s).
+	 * Users entered PIN from published schedule; receiver triggered
+	 * recording when transmitted PIN matched programme start.
+	 * NOW OBSOLETE: Most stations transmit 0x0000 (no PIN). */
+	uint8_t		pin_day;	/* Day of month 1-31 (0 = not used) */
+	uint8_t		pin_hour;	/* Hour 0-23, or 24 = end time */
+	uint8_t		pin_minute;	/* Minute 0-59 (prefer 00/15/30/45) */
+	/* EON (Enhanced Other Networks) - Group 14A */
+	struct {
+		uint16_t	pi;		/* Other Network PI code */
+		const char	*ps;		/* Other Network PS name */
+		uint8_t		pty;		/* Other Network PTY */
+		uint8_t		tp;		/* Other Network TP flag */
+		uint8_t		ta;		/* Other Network TA flag (variant 13) */
+		/* AF (variant 4) - AF codes 1-204 */
+		uint8_t		af[2];		/* Two AF codes for Other Network */
+		uint8_t		af_count;	/* 0-2 */
+		/* Mapped AF (variants 5-9) */
+		struct {
+			uint8_t	tuned;		/* Tuned freq AF code */
+			uint8_t	on;		/* ON freq AF code */
+		} mapped_af[2];
+		uint8_t		mapped_af_count; /* 0-2 */
+		/* Linkage (variant 12) */
+		uint8_t		linkage_la;	/* Linkage Actuator */
+		uint16_t	linkage_lsn;	/* Linkage Set Number (12 bits) */
+		/* PIN (variant 14) - Programme Item Number for Other Network
+		 * This PIN applies to the LINKED station (eon.pi), NOT the current station.
+		 * Day=0 means "no PIN" (IEC 62106 S6.1.5.2).
+		 * Example: News bulletin starts at 14:30 on day 15 of month */
+		uint8_t		pin_day;	/* Day 1-31 (0 = not used) */
+		uint8_t		pin_hour;	/* Hour 0-23 (24 = end time) */
+		uint8_t		pin_minute;	/* Minute 0-59 */
+		/* Broadcaster data (variant 15) */
+		uint16_t	broadcaster_data;
+	} eon[2];				/* Up to 2 Other Networks per preset */
+	uint8_t		eon_count;		/* Number of EON entries (0-2) */
+	
+	/* Group version selection (0=auto, 1=force A, 2=force B)
+	 * Use RDS_GROUP_VERSION_AUTO/A/B from rds.h
+	 * When 0 (AUTO): version auto-detected from data:
+	 *   - Group 0: 0B if af_count==0, else 0A
+	 *   - Group 1: 1B if ecc==0 && lang==0, else 1A
+	 *   - Group 2: 2B if strlen(rt)<=32, else 2A */
+	uint8_t		group0_version;		/* 0A vs 0B */
+	uint8_t		group1_version;		/* 1A vs 1B */
+	uint8_t		group2_version;		/* 2A vs 2B */
+} rds_preset_t;
+
+/* RDS Presets - add more as needed
+ * RT max length: 64 chars (Group 2A) or 32 chars (Group 2B) - terminated with CR (0x0D)
+ * PS max length: 8 chars (padded with spaces)
+ * PTYN max length: 8 chars */
+static const rds_preset_t rds_presets[] = {
+	{
+		.name     = "Ukraine (RDS)",
+		/* PI Structure for Europe (IEC 62106):
+		 * [Country(4)][Coverage(4)][Reference(8)]
+		 * Coverage Codes:
+		 *  0=Local, 1=International, 2=National, 3=Supra-regional
+		 *  4-F = Regional Area 1-12
+		 * Here: 6 (Ukraine) + A (Regional 7) + CE (Ref) */
+		.pi       = 0x6ACE,
+		.ps       = "Osmo RDS",
+		/* 64-char RT (max for Group 2A) - use full capacity for demo */
+		.rt       = "osmocom-analog FM Radio - Open Source Broadcast FM RDS Encoder!",
+		.pty      = 10,		/* Pop music (RDS) */
+		.ptyn     = "OsmoPTYN",
+		.tp       = 1,
+		.ms       = 1,
+		.ecc      = 0xE4,	/* Ukraine with PI prefix 6 */
+		.lang     = 73,		/* Ukrainian (LIC code from IEC 62106 Annex J) */
+		RDS_A(90.0, 95.0, 100.0),
+		/* LF/MF AFs (code 250 prefix) - AM simulcast frequencies */
+		RDS_LF(225),
+		RDS_MF(1008),
+		/* Group 1A PIN - Legacy "VCR-like" recording feature (1984-1990s)
+		 * Example: "Evening News" listed in newspaper as starting 18:00 on 15th.
+		 * User enters PIN (day=15, 18:00) into receiver; when station transmits
+		 * matching PIN, receiver triggers recording - compensating for overruns. */
+		.pin_day  = 15, .pin_hour = 18, .pin_minute = 0,
+		/* EON: Other Networks (Group 14A) - Full test configuration */
+		.eon = {
+			{
+				.pi = 0x6B01, .ps = "UA News ", .pty = 1, .tp = 1, .ta = 1,
+				/* AF variant 4: ON frequencies at 90.7 and 93.2 MHz */
+				/* AF code = freq*10 - 875:  90.7*10-875=32, 93.2*10-875=57 */
+				.af = { RDS_AF_MHZ(90.7), RDS_AF_MHZ(93.2) }, .af_count = 2,
+				/* Mapped AF variant 5: 100.0 MHz (tuned) -> 90.7 MHz (ON) */
+				/* Codes: 100.0*10-875=125 -> 90.7*10-875=32 */
+				.mapped_af = { { .tuned = RDS_AF_MHZ(100.0), .on = RDS_AF_MHZ(90.7) } }, .mapped_af_count = 1,
+				/* Linkage variant 12 */
+				.linkage_la = 1, .linkage_lsn = 0x123,
+				/* PIN variant 14 - Legacy cross-network recording (1980s-90s)
+				 * Example: "World News" on linked station UA News (0x6B01)
+				 * listed at 19:00 on 15th. Receiver could switch to linked
+				 * station and record when that station's PIN matched. */
+				.pin_day = 15, .pin_hour = 19, .pin_minute = 0,
+				/* Broadcaster data variant 15 */
+				.broadcaster_data = 0xABCD,
+			},
+			{
+				.pi = 0x6C02, .ps = "Traffic1", .pty = 22, .tp = 1, .ta = 0,
+				/* AF variant 4: ON frequencies at 94.7 and 97.2 MHz */
+				/* AF code = freq*10 - 875:  94.7*10-875=72, 97.2*10-875=97 */
+				.af = { RDS_AF_MHZ(94.7), RDS_AF_MHZ(97.2) }, .af_count = 2,
+				/* No mapped AF for this one */
+				.mapped_af_count = 0,
+				/* Linkage variant 12 */
+				.linkage_la = 0, .linkage_lsn = 0x456,
+				/* PIN variant 14 - Legacy cross-network recording
+				 * Example: "Traffic Report" on Traffic1 (0x6C02) at 07:30
+				 * on 16th. Advanced receivers could auto-tune and record. */
+				.pin_day = 16, .pin_hour = 7, .pin_minute = 30,
+				/* Broadcaster data variant 15 */
+				.broadcaster_data = 0x1234,
+			},
+		},
+		.eon_count = 2,
+	},
+	{
+		.name     = "USA (RBDS)",
+		/*.pi       = 0xABCD,*/	/* PI=Axxx = USA/RBDS region */
+		/* RBDS PI Codes (NRSC-4-B):
+		 *  1000 - 994F: Computed from Call Sign (e.g. WNYC -> 796E)
+		 *  9950 - 9EFF: 3-Letter Call Signs
+		 *  AFxx / A0xx: Linked Stations / Regional
+		 *  Bxxx, Dxxx, Exxx: Linked National Networks */
+		.callsign = "WNYC",	/* Popular call sign (derived PI=796E) */
+		.ps       = "OsmoRBDS",
+		/* 64-char RT (max for Group 2A) - use full capacity for demo */
+		.rt       = "osmocom-analog FM Radio - Open Source Broadcast FM RDBS Encoder",
+		.pty      = 9,		/* Top 40 (RBDS) */
+		.ptyn     = "Top 40  ",
+		.tp       = 0,
+		.ms       = 1,
+		.ecc      = 0xA0,	/* USA (RBDS region) with PI prefix A */
+		.lang     = 9,		/* English */
+		RDS_A(92.5, 97.5, 102.5),
+		/* Group 1A PIN - not used (0x0000 = most common value)
+		 * Many US stations don't use PIN, so we demonstrate day=0 */
+		.pin_day  = 0, .pin_hour = 0, .pin_minute = 0,
+		/* group*_version omitted = AUTO: 0A (has AF), 2A (RT>32), 1A (has ECC) */
+	},
+	/* ============================================================
+	 * MINIMAL PRESET - Mandatory Group 0 Only
+	 * ============================================================
+	 * Demonstrates: Minimum compliant RDS stream.
+	 * Only Group 0B transmitted (PS name with PI repeat).
+	 * No RT, No ECC, No PTYN, No EON → those groups won't transmit.
+	 * Use case: Small station, minimal bandwidth.
+	 * ============================================================ */
+	{
+		.name     = "Minimal",
+		.pi       = 0x1234,
+		.ps       = "MINIMAL ",
+		.ms       = 1,
+		.group0_version = RDS_GROUP_VERSION_B,  /* Force 0B (no AF) */
+		/* All other fields omitted = 0 = no data → only Group 0 transmits */
+	},
+	/* ============================================================
+	 * MOBILE PRESET - B Versions for Fast PI Identification
+	 * ============================================================
+	 * Demonstrates: All B versions for improved mobile reception.
+	 * PI repeat in Block C of every group helps receivers lock faster.
+	 * Trade-off: Less data capacity (32-char RT, no ECC).
+	 * Use case: Mobile/in-car listening, weak signal areas.
+	 * ============================================================ */
+	{
+		.name     = "Mobile",
+		.pi       = 0x5678,
+		.ps       = "MOBILE  ",
+		.rt       = "Fast cycling RadioText",  /* ≤32 chars for 2B */
+		.pty      = 10,
+		.ms       = 1,
+		.group0_version = RDS_GROUP_VERSION_B,  /* 0B: PI repeat */
+		.group2_version = RDS_GROUP_VERSION_B,  /* 2B: 32-char, faster */
+		/* No ECC/Lang → Group 1 won't transmit */
+	},
+	/* ============================================================
+	 * MIXED PRESET - AF List + Fast RadioText (0A + 2B)
+	 * ============================================================
+	 * Demonstrates: Mixed A/B for different group types.
+	 * 0A for AF list (need Block C for frequencies).
+	 * 2B for fast RadioText cycling (trade 64→32 chars for speed).
+	 * Use case: Regional station with AF, wants quick RT updates.
+	 * ============================================================ */
+	{
+		.name     = "AF + Fast RT",
+		.pi       = 0x9ABC,
+		.ps       = "MIXED   ",
+		.rt       = "Quick updates via 2B",
+		.pty      = 3,
+		.ms       = 1,
+		RDS_A(90.5, 93.5, 96.5),
+		.group0_version = RDS_GROUP_VERSION_A,  /* 0A: need AF list */
+		.group2_version = RDS_GROUP_VERSION_B,  /* 2B: faster RT cycling */
+	},
+	/* ============================================================
+	 * AUTO DEMO PRESET - Let Data Decide A/B Versions
+	 * ============================================================
+	 * Demonstrates: Auto-detection from data (all version fields = 0).
+	 * - No AF → auto-selects 0B
+	 * - RT ≤32 chars → auto-selects 2B
+	 * - No ECC/Lang → auto-selects 1B (if PIN set)
+	 * Use case: Understanding auto-detection behavior.
+	 * ============================================================ */
+	{
+		.name     = "Auto Demo",
+		.pi       = 0xDEF0,
+		.ps       = "AUTODEMO",
+		.rt       = "Short text for 2B",  /* ≤32 chars → auto: 2B */
+		.pty      = 5,
+		.ms       = 1,
+		.pin_day  = 20, .pin_hour = 12, .pin_minute = 0,  /* PIN set → Group 1 transmits */
+		/* No AF → auto: 0B
+		 * No ECC/Lang → auto: 1B (PIN only)
+		 * RT ≤32 → auto: 2B
+		 * group*_version all 0 = AUTO */
+	},
+	{
+		.name     = "Method B Test",
+		.pi       = 0x1234,
+		.ps       = "TEST_B",
+		.rt       = "Testing RDS AF Method B via Presets",
+		.pty      = 15,
+		.ecc      = 0xE0,
+		.lang     = 9,
+		.ms       = 1,
+		/* Method B Pairs: Lists of (Tx, AFs...) */
+		/* Complex Example: 5 Lists
+		 * 1. Tx=89.3: AFs 88.1, 97.0, 99.5, 99.0
+		 * 2. Tx=89.3: AFs 101.0, 104.0 (Same Tx, extending list)
+		 * 3. Tx=92.5: AFs 92.5, 98.0 (Diff Tx)
+		 * 4. Tx=95.0: AFs 95.0, 103.0 (Diff Tx)
+		 * 5. Tx=105.5: AFs 103.6, 107.9 (Diff Tx) */
+		.af_method_b_count = 5,
+		.af_method_b = {
+			RDS_B(89.3, 88.1, 97.0, 99.5, 99.0),
+			RDS_B(89.3, 101.0, 104.0),
+			RDS_B(92.5, 92.5, 98.0),
+			RDS_B(95.0, 95.0, 103.0),
+			RDS_B(105.5, 103.6, 107.9) /* 108.0 = Code 205 (Filler) */
+		},
+		.group0_version = RDS_GROUP_VERSION_A,
+	},
+	/* End of presets */
+};
+
+#define RDS_PRESET_COUNT (sizeof(rds_presets) / sizeof(rds_presets[0]))
+
+static int rds_current_preset = 0;
+
+/* Additional settings not in presets (common to all) */
+static uint8_t rds_ta        = 0;		/* Traffic Announcement */
+
+static uint8_t rds_di_artificial_head = 0;
+static uint8_t rds_di_compressed = 0;
+static uint8_t rds_di_dynamic_pty = 0;
+
+/* Programme Item Number (PIN) is now defined per-preset in rds_preset_t.
+ * See preset .pin_day, .pin_hour, .pin_minute fields. */
+static int rds_ct_enabled    = 1;		/* Clock-Time enabled */
+
+/* Group version selection is now per-preset via group0/1/2_version fields.
+ * See rds_preset_t and RDS_GROUP_VERSION_AUTO/A/B enum. */
+
+
 static char freq_name[2][64];
+
+/* User overrides */
+static uint16_t rds_user_pi = 0;
+static char *rds_user_callsign = NULL;
+
+/* Helper to load AFs (Method A, B, LF/MF) from preset to unified encoder table */
+static void load_preset_afs(rds_encoder_t *enc, const rds_preset_t *p)
+{
+	/* Update Alternative Frequencies (Unified Storage) */
+	memset(&enc->af_table, 0, sizeof(enc->af_table));
+	enc->af_list_index = -1; /* Reset Method B cycling index */
+	enc->af_type_cfg = RDS_AF_TYPE_METHOD_A; /* Default */
+
+	/* Method A (Standard FM) */
+	if (p->af_count > 0 && p->af_count <= 25) {
+		rds_af_entry_t *entry = &enc->af_table.entries[enc->af_table.count++];
+		entry->pi = enc->pi;
+		entry->type = RDS_AF_TYPE_METHOD_A;
+		entry->count = p->af_count;
+		for (int i = 0; i < p->af_count; i++) {
+			/* Convert Code to 100kHz Frequency (87.5 + code*0.1) -> 875 + code */
+			entry->list[i].freq = 875 + p->af[i];
+		}
+		enc->af_type_cfg = RDS_AF_TYPE_METHOD_A;
+	}
+
+	/* Method B (Regional/Complex) */
+	if (p->af_method_b_count > 0 && p->af_method_b_count <= 5) {
+		for (int i = 0; i < p->af_method_b_count; i++) {
+			uint8_t tx_code = p->af_method_b[i].tx;
+			uint16_t tx_freq = 875 + tx_code;
+			
+			/* Create entry for this TX */
+			if (enc->af_table.count < RDS_AF_TABLE_SIZE) {
+				rds_af_entry_t *entry = &enc->af_table.entries[enc->af_table.count++];
+				entry->pi = enc->pi;
+				entry->type = RDS_AF_TYPE_METHOD_B;
+				entry->tx_freq = tx_freq;
+				entry->count = p->af_method_b[i].count;
+				
+				for (int j = 0; j < entry->count && j < RDS_AF_MAX_ITEMS; j++) {
+					uint8_t code = p->af_method_b[i].list[j];
+					entry->list[j].freq = 875 + code;
+				}
+			}
+		}
+		if (enc->af_table.count > 0) enc->af_type_cfg = RDS_AF_TYPE_METHOD_B;
+	}
+
+	/* LF/MF (AM Simulcast) */
+	int lf_count = p->af_lf_count;
+	int mf_count = p->af_mf_count;
+	int total_lf_mf = lf_count + mf_count;
+
+	if (total_lf_mf > 0) {
+		rds_af_entry_t *entry = &enc->af_table.entries[enc->af_table.count++];
+		entry->pi = enc->pi;
+		entry->type = RDS_AF_TYPE_LF_MF;
+		entry->count = 0;
+		
+		/* Add LF Frequencies */
+		for (int i = 0; i < lf_count && entry->count < RDS_AF_MAX_ITEMS; i++) {
+			entry->list[entry->count].freq = p->af_lf[i].freq_khz;
+			entry->list[entry->count].flags = 0x02; /* LF */
+			entry->count++;
+		}
+		/* Add MF Frequencies */
+		for (int i = 0; i < mf_count && entry->count < RDS_AF_MAX_ITEMS; i++) {
+			entry->list[entry->count].freq = p->af_mf[i].freq_khz;
+			entry->list[entry->count].flags = 0x04; /* MF */
+			entry->count++;
+		}
+		
+		/* If no Method A/B, fallback to LF/MF transmission */
+		if (enc->af_table.count == 1) {
+			enc->af_type_cfg = RDS_AF_TYPE_LF_MF;
+		}
+	}
+}
+
+/* Apply current RDS preset to encoder (for runtime switching) */
+static void rds_apply_preset(radio_t *radio)
+{
+	const rds_preset_t *p = &rds_presets[rds_current_preset];
+	rds_encoder_t *enc = &radio->rds_enc;
+	
+	/* Update PI (will require receiver to re-sync) */
+	uint16_t pi = p->pi;
+
+	/* If PI is 0 in preset, try to derive from callsign */
+	if (pi == 0 && p->callsign) {
+		pi = rds_get_pi_from_callsign(p->callsign);
+	}
+
+	if (rds_user_pi)
+		pi = rds_user_pi;
+	else if (rds_user_callsign) {
+		uint16_t cpi = rds_get_pi_from_callsign(rds_user_callsign);
+		if (cpi) pi = cpi;
+	}
+	enc->pi = pi;
+	
+	/* Update PS */
+	memset(enc->ps, ' ', 8);
+	enc->ps[8] = '\0';
+	if (p->ps) {
+		int len = strlen(p->ps);
+		if (len > 8) len = 8;
+		memcpy(enc->ps, p->ps, len);
+	}
+	
+	/* Update RadioText */
+	memset(enc->rt, ' ', 64);
+	enc->rt[64] = '\0';
+	if (p->rt) {
+		int len = strlen(p->rt);
+		if (len > 64) len = 64;
+		memcpy(enc->rt, p->rt, len);
+		if (len < 64) enc->rt[len] = '\r';
+	}
+	enc->rt_ab = !enc->rt_ab;  /* Toggle A/B to signal text change */
+	enc->rt_segment = 0;
+	
+	/* Update PTY and PTYN */
+	enc->pty = p->pty & 0x1F;
+	memset(enc->ptyn, ' ', 8);
+	enc->ptyn[8] = '\0';
+	if (p->ptyn) {
+		int len = strlen(p->ptyn);
+		if (len > 8) len = 8;
+		memcpy(enc->ptyn, p->ptyn, len);
+	}
+	enc->ptyn_ab = !enc->ptyn_ab;
+	
+	/* Update traffic and mode flags */
+	enc->tp = p->tp;
+	enc->ms = p->ms;
+	
+	/* Update DI stereo flag based on broadcast mode (-S flag) */
+	enc->di_stereo = radio->stereo ? 1 : 0;
+	
+	/* Update country codes */
+	enc->ecc = p->ecc;
+	enc->language = p->lang;
+	
+	/* Update Group 1A PIN (Programme Item Number) for THIS station */
+	enc->pin_day = p->pin_day;
+	enc->pin_hour = p->pin_hour;
+	enc->pin_minute = p->pin_minute;
+	
+	/* Update Alternative Frequencies (Unified Storage) */
+	load_preset_afs(enc, p);
+	
+	/* Update EON (Enhanced Other Networks) - Group 14A - ALL variants */
+	if (p->eon_count > 0) {
+		for (int i = 0; i < p->eon_count && i < RDS_EON_MAX_ENTRIES; i++) {
+			rds_eon_entry_t *eon = &enc->eon_tx[i];
+			memset(eon, 0, sizeof(*eon));
+			
+			/* Basic info (variants 0-3, 13) */
+			eon->pi = p->eon[i].pi;
+			memset(eon->ps, ' ', 8);
+			eon->ps[8] = '\0';
+			if (p->eon[i].ps) {
+				int len = strlen(p->eon[i].ps);
+				if (len > 8) len = 8;
+				memcpy(eon->ps, p->eon[i].ps, len);
+			}
+			eon->pty = p->eon[i].pty;
+			eon->tp = p->eon[i].tp;
+			eon->ta = p->eon[i].ta;
+			
+			/* AF (variant 4) - convert to 0.1 MHz format */
+			if (p->eon[i].af_count > 0) {
+				for (int j = 0; j < p->eon[i].af_count && j < RDS_EON_MAX_AF; j++) {
+					eon->af[j] = 875 + p->eon[i].af[j];  /* Convert code to 0.1MHz */
+				}
+				eon->af_count = p->eon[i].af_count;
+			}
+			
+			/* Mapped AF (variants 5-9) */
+			if (p->eon[i].mapped_af_count > 0) {
+				for (int j = 0; j < p->eon[i].mapped_af_count && j < RDS_EON_MAX_MAPPED_AF; j++) {
+					eon->mapped_af[j].tuned_af = p->eon[i].mapped_af[j].tuned;
+					eon->mapped_af[j].on_af = p->eon[i].mapped_af[j].on;
+				}
+				eon->mapped_af_count = p->eon[i].mapped_af_count;
+			}
+			
+			/* Linkage (variant 12) */
+			eon->linkage_la = p->eon[i].linkage_la;
+			eon->linkage_lsn = p->eon[i].linkage_lsn;
+			
+			/* PIN (variant 14) */
+			eon->pin_day = p->eon[i].pin_day;
+			eon->pin_hour = p->eon[i].pin_hour;
+			eon->pin_minute = p->eon[i].pin_minute;
+			
+			/* Broadcaster data (variant 15) */
+			eon->broadcaster_data = p->eon[i].broadcaster_data;
+		}
+		enc->eon_tx_count = p->eon_count;
+		enc->eon_enabled = 1;
+		enc->eon_tx_index = 0;
+		enc->eon_tx_variant = 0;
+	} else {
+		enc->eon_tx_count = 0;
+		enc->eon_enabled = 0;
+	}
+	
+	/* Reset PS segment to restart transmission */
+	enc->ps_segment = 0;
+	
+	/* --------------------------------------------------------
+	 * Group Version Selection (A vs B)
+	 * --------------------------------------------------------
+	 * Priority: Manual override > Auto-detection
+	 * AUTO (0) = detect from data, A (1) = force A, B (2) = force B
+	 * -------------------------------------------------------- */
+	
+	/* Group 0: 0A (with AF) vs 0B (PI repeat, no AF) */
+	if (p->group0_version == RDS_GROUP_VERSION_AUTO)
+		enc->use_0b = (p->af_count == 0);  /* No AF → 0B */
+	else
+		enc->use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
+	
+	/* Group 1: 1A (ECC/Lang/PIN) vs 1B (PIN only) */
+	if (p->group1_version == RDS_GROUP_VERSION_AUTO)
+		enc->use_1b = (p->ecc == 0 && p->lang == 0);  /* No ECC/Lang → 1B */
+	else
+		enc->use_1b = (p->group1_version == RDS_GROUP_VERSION_B);
+	
+	/* Group 2: 2A (64-char RT) vs 2B (32-char, faster) */
+	if (p->group2_version == RDS_GROUP_VERSION_AUTO) {
+		size_t rt_len = p->rt ? strlen(p->rt) : 0;
+		enc->use_2b = (rt_len > 0 && rt_len <= 32);  /* Short RT → 2B */
+	} else {
+		enc->use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
+	}
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS Preset: %s (PI=%04X) Groups: %s/%s/%s\n",
+	     p->name, enc->pi,
+	     enc->use_0b ? "0B" : "0A",
+	     enc->use_1b ? "1B" : "1A",
+	     enc->use_2b ? "2B" : "2A");
+}
+
+/* Cycle to next RDS preset */
+void rds_next_preset(radio_t *radio)
+{
+	rds_current_preset = (rds_current_preset + 1) % RDS_PRESET_COUNT;
+	rds_apply_preset(radio);
+}
 
 int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose)
 {
@@ -144,7 +710,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* open audio device */
 		radio->tx_audio_samplerate = 48000;
 		radio->tx_audio_channels = (stereo) ? 2 : 1;
-		radio->tx_sound = sound_open(SOUND_DIR_PLAY, tx_audiodev, NULL, NULL, NULL, radio->tx_audio_channels, 0.0, radio->tx_audio_samplerate, radio->buffer_size, 1.0, 1.0, 0.0, 2.0);
+		radio->tx_sound = sound_open(SOUND_DIR_REC, tx_audiodev, NULL, NULL, NULL, radio->tx_audio_channels, 0.0, radio->tx_audio_samplerate, radio->buffer_size, 1.0, 1.0, 0.0, 2.0);
 		if (!radio->tx_sound) {
 			rc = -EIO;
 			LOGP(DRADIO, LOGL_ERROR, "Failed to open sound device!\n");
@@ -208,7 +774,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		radio->rx_audio_samplerate = 48000;
 		radio->rx_audio_channels = (stereo) ? 2 : 1;
 		/* check if we use same device */
-		radio->rx_sound = sound_open(SOUND_DIR_REC, rx_audiodev, NULL, NULL, NULL, radio->rx_audio_channels, 0.0, radio->rx_audio_samplerate, radio->buffer_size, 1.0, 1.0, 0.0, 2.0);
+		radio->rx_sound = sound_open(SOUND_DIR_PLAY, rx_audiodev, NULL, NULL, NULL, radio->rx_audio_channels, 0.0, radio->rx_audio_samplerate, radio->buffer_size, 1.0, 1.0, 0.0, 2.0);
 		if (!radio->rx_sound) {
 			rc = -EIO;
 			LOGP(DRADIO, LOGL_ERROR, "Failed to open sound device!\n");
@@ -327,10 +893,145 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		}
 		/* Initialize RDS encoder if enabled */
 		if (rds || rds2) {
-			const char *ptyn = "OsmoPtyn"; /* PTYN override */
+			/* Select preset based on emphasis (heuristic for region):
+			 * 75µs → Europe (RDS)  - preset 0
+			 * 50µs → USA (RBDS)    - preset 1 */
+			if (time_constant_us > 0.0 && time_constant_us < 60.0) {
+				rds_current_preset = 1;  /* USA/RBDS (50µs) */
+				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RBDS (USA) preset\n", time_constant_us);
+			} else if (time_constant_us >= 60.0) {
+				rds_current_preset = 0;  /* Europe/RDS (75µs) */
+				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RDS (Europe) preset\n", time_constant_us);
+			}
+			const rds_preset_t *p = &rds_presets[rds_current_preset];
+			
+			uint16_t pi = p->pi;
+
+			/* If PI is 0 in preset, try to derive from callsign */
+			if (pi == 0 && p->callsign) {
+				pi = rds_get_pi_from_callsign(p->callsign);
+			}
+
+			if (rds_user_pi)
+				pi = rds_user_pi;
+			else if (rds_user_callsign) {
+				uint16_t cpi = rds_get_pi_from_callsign(rds_user_callsign);
+				if (cpi) pi = cpi;
+			}
+
 			rds_encoder_init(&radio->rds_enc, radio->signal_samplerate,
-				0x1234, "OSMO RDS", "osmocom-analog FM Radio", 0, ptyn);
-			rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose);
+				pi, p->ps, p->rt, p->pty, p->ptyn);
+			
+			/* Apply preset configuration to encoder */
+			radio->rds_enc.tp = p->tp;
+			radio->rds_enc.ta = rds_ta;
+			radio->rds_enc.ms = p->ms;
+			
+			/* Decoder Identification (DI) flags */
+			radio->rds_enc.di_stereo = stereo ? 1 : 0;
+			radio->rds_enc.di_artificial_head = rds_di_artificial_head;
+			radio->rds_enc.di_compressed = rds_di_compressed;
+			radio->rds_enc.di_dynamic_pty = rds_di_dynamic_pty;
+			
+			/* Extended codes (Group 1A) */
+			radio->rds_enc.ecc = p->ecc;
+			radio->rds_enc.language = p->lang;
+			
+			/* Programme Item Number (Group 1A Block D) - from preset */
+			radio->rds_enc.pin_day = p->pin_day;
+			radio->rds_enc.pin_hour = p->pin_hour;
+			radio->rds_enc.pin_minute = p->pin_minute;
+			
+			/* Clock-Time (Group 4A) */
+			radio->rds_enc.ct_enabled = rds_ct_enabled;
+			
+			/* Alternative Frequencies (Group 0A Block C) */
+			load_preset_afs(&radio->rds_enc, p);
+			
+			/* EON: Enhanced Other Networks (Group 14A) - ALL variants */
+			if (p->eon_count > 0) {
+				for (int i = 0; i < p->eon_count && i < RDS_EON_MAX_ENTRIES; i++) {
+					rds_eon_entry_t *eon = &radio->rds_enc.eon_tx[i];
+					memset(eon, 0, sizeof(*eon));
+					
+					/* Basic info (variants 0-3, 13) */
+					eon->pi = p->eon[i].pi;
+					memset(eon->ps, ' ', 8);
+					eon->ps[8] = '\0';
+					if (p->eon[i].ps) {
+						int len = strlen(p->eon[i].ps);
+						if (len > 8) len = 8;
+						memcpy(eon->ps, p->eon[i].ps, len);
+					}
+					eon->pty = p->eon[i].pty;
+					eon->tp = p->eon[i].tp;
+					eon->ta = p->eon[i].ta;
+					
+					/* AF (variant 4) - convert to 0.1 MHz format */
+					if (p->eon[i].af_count > 0) {
+						for (int j = 0; j < p->eon[i].af_count && j < RDS_EON_MAX_AF; j++) {
+							eon->af[j] = 875 + p->eon[i].af[j];
+						}
+						eon->af_count = p->eon[i].af_count;
+					}
+					
+					/* Mapped AF (variants 5-9) */
+					if (p->eon[i].mapped_af_count > 0) {
+						for (int j = 0; j < p->eon[i].mapped_af_count && j < RDS_EON_MAX_MAPPED_AF; j++) {
+							eon->mapped_af[j].tuned_af = p->eon[i].mapped_af[j].tuned;
+							eon->mapped_af[j].on_af = p->eon[i].mapped_af[j].on;
+						}
+						eon->mapped_af_count = p->eon[i].mapped_af_count;
+					}
+					
+					/* Linkage (variant 12) */
+					eon->linkage_la = p->eon[i].linkage_la;
+					eon->linkage_lsn = p->eon[i].linkage_lsn;
+					
+					/* PIN (variant 14) */
+					eon->pin_day = p->eon[i].pin_day;
+					eon->pin_hour = p->eon[i].pin_hour;
+					eon->pin_minute = p->eon[i].pin_minute;
+					
+					/* Broadcaster data (variant 15) */
+					eon->broadcaster_data = p->eon[i].broadcaster_data;
+				}
+				radio->rds_enc.eon_tx_count = p->eon_count;
+				radio->rds_enc.eon_enabled = 1;
+				LOGP(DRADIO, LOGL_INFO, "RDS EON: %d Other Networks configured (all variants)\n", p->eon_count);
+			}
+			
+			/* Group version selection (A vs B) with auto-detection
+			 * Priority: Manual override > Auto-detection */
+			
+			/* Group 0: 0A (with AF) vs 0B (PI repeat, no AF) */
+			if (p->group0_version == RDS_GROUP_VERSION_AUTO)
+				radio->rds_enc.use_0b = (p->af_count == 0);
+			else
+				radio->rds_enc.use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
+			
+			/* Group 1: 1A (ECC/Lang/PIN) vs 1B (PIN only) */
+			if (p->group1_version == RDS_GROUP_VERSION_AUTO)
+				radio->rds_enc.use_1b = (p->ecc == 0 && p->lang == 0);
+			else
+				radio->rds_enc.use_1b = (p->group1_version == RDS_GROUP_VERSION_B);
+			
+			/* Group 2: 2A (64-char RT) vs 2B (32-char, faster) */
+			if (p->group2_version == RDS_GROUP_VERSION_AUTO) {
+				size_t rt_len = p->rt ? strlen(p->rt) : 0;
+				radio->rds_enc.use_2b = (rt_len > 0 && rt_len <= 32);
+			} else {
+				radio->rds_enc.use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
+			}
+			
+			LOGP(DRADIO, LOGL_INFO, "RDS Preset: %s (PI=%04X) Groups: %s/%s/%s\n",
+			     p->name, radio->rds_enc.pi,
+			     radio->rds_enc.use_0b ? "0B" : "0A",
+			     radio->rds_enc.use_1b ? "1B" : "1A",
+			     radio->rds_enc.use_2b ? "2B" : "2A");
+			
+			rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us);
+
 			
 			/*
 			 * TODO: RDS2 Encoder Initialization (IEC 62106-2:2021)
@@ -946,8 +1647,8 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 				diag_count += signal_num;
 				if (diag_count >= 1000000) {
 					diag_count = 0;
-					double offset_deg = radio->rx_pll_freq_offset * (180.0 / M_PI);
-					// LOGP(DRADIO, LOGL_DEBUG, "Stereo: offset=%.1fdeg pilot=%.6f\n", offset_deg, pilot_mag);
+					/* double offset_deg = radio->rx_pll_freq_offset * (180.0 / M_PI); */
+					/* LOGP(DRADIO, LOGL_DEBUG, "Stereo: offset=%.1fdeg pilot=%.6f\n", offset_deg, pilot_mag); */
 				}
 			}
 			
@@ -1022,7 +1723,7 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 	if ((radio->rx_audio_mode & AUDIO_MODE_WAVEFILE))
 		wave_write(&radio->wave_rx_rec, samples, audio_num);
 #ifdef HAVE_ALSA
-	if ((radio->rx_audio_mode & AUDIO_MODE_AUDIODEV)) {
+	if ((radio->rx_audio_mode & AUDIO_MODE_AUDIODEV) && audio_num > 0) {
 		jf = jitter_frame_alloc(NULL, NULL, (uint8_t *)samples[0], audio_num * sizeof(*(samples[0])), 0, radio->rx_sequence[0], radio->rx_timestamp[0], 123);
 		if (jf)
 			jitter_save(&radio->rx_dejitter[0], jf);
@@ -1035,6 +1736,8 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			radio->rx_sequence[1] += 1;
 			radio->rx_timestamp[1] += audio_num;
 		}
+	}
+	if ((radio->rx_audio_mode & AUDIO_MODE_AUDIODEV)) {
 		audio_num = sound_get_tosend(radio->rx_sound, radio->signal_buffer_size);
 		if (audio_num < 0) {
 			LOGP(DDSP, LOGL_ERROR, "Failed to get number of samples in buffer (rc = %d)!\n", audio_num);
@@ -1046,7 +1749,7 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		jitter_load_samples(&radio->rx_dejitter[0], (uint8_t *)samples[0], audio_num, sizeof(*samples), NULL, NULL);
 		if (radio->rx_audio_channels == 2)
 			jitter_load_samples(&radio->rx_dejitter[1], (uint8_t *)samples[1], audio_num, sizeof(*samples), NULL, NULL);
-		printf("channels=%d num=%d\n", radio->rx_audio_channels, audio_num);
+		// printf("channels=%d num=%d\n", radio->rx_audio_channels, audio_num);
 		audio_num = sound_write(radio->rx_sound, samples, NULL, audio_num, NULL, NULL, radio->rx_audio_channels);
 		if (audio_num < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "Failed to write to sound device (rc = %d)!\n", audio_num);
@@ -1061,3 +1764,15 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 	return signal_num;
 }
 
+
+void radio_set_callsign(const char *callsign)
+{
+	if (rds_user_callsign)
+		free(rds_user_callsign);
+	rds_user_callsign = callsign ? strdup(callsign) : NULL;
+}
+
+void radio_set_pi(uint16_t pi)
+{
+	rds_user_pi = pi;
+}

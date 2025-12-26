@@ -281,6 +281,86 @@ static const rds_field_def_t rds_group_10a_fields[] = {
 };
 
 /* ============================================================
+ * Group 3A Block B/D Fields (IEC 62106 S6.1.5.19)
+ * Open Data Application (ODA) Identification
+ *
+ * Block B bits 4-0: Application Group Type Code
+ * Block C: Application-specific message
+ * Block D: Application Identification (AID)
+ * ============================================================ */
+
+static const rds_field_def_t rds_group_3a_b_fields[] = {
+	/* Name      Bits  Shift  Mask    IEC Ref               Description              Decoder */
+	{ "APP_GT",  5,    0,     0x001F, "S6.1.5.19 Type 3A",  "App group type code",   NULL },
+	{ NULL, 0, 0, 0, NULL, NULL, NULL }
+};
+
+static const rds_field_def_t rds_group_3a_d_fields[] = {
+	/* Name   Bits  Shift  Mask    IEC Ref                Description               Decoder */
+	{ "AID",  16,   0,     0xFFFF, "S6.1.5.19 Type 3A",   "Application ID",         NULL },
+	{ NULL, 0, 0, 0, NULL, NULL, NULL }
+};
+
+/* ============================================================
+ * Group 14A Block B/C Fields (IEC 62106 S6.1.5.14)
+ * Enhanced Other Networks (EON)
+ *
+ * Block B bits 3-0: Variant code
+ * Block C: Variant-specific data
+ * Block D: ON-PI (Other Network PI)
+ * ============================================================ */
+
+/* Field decoder: EON Variant */
+static const char *rds_field_eon_variant(uint64_t value)
+{
+	static const char *variants[] = {
+		"PS[0-1]", "PS[2-3]", "PS[4-5]", "PS[6-7]",	/* 0-3 */
+		"AF",      "Map5",    "Map6",    "Map7",	/* 4-7 */
+		"Map8",    "Map9",    "Rsvd10",  "Rsvd11",	/* 8-11 */
+		"Link",    "PTY+TA",  "PIN",     "Bcast"	/* 12-15 */
+	};
+	return variants[value & 0x0F];
+}
+
+static const rds_field_def_t rds_group_14a_b_fields[] = {
+	/* Name      Bits  Shift  Mask    IEC Ref               Description          Decoder */
+	{ "TP_ON",   1,    4,     0x0010, "S6.1.5.14 Type 14",  "TP for ON",         rds_field_yes_no },
+	{ "VARIANT", 4,    0,     0x000F, "S6.1.5.14 Type 14",  "EON variant (0-15)", rds_field_eon_variant },
+	{ NULL, 0, 0, 0, NULL, NULL, NULL }
+};
+
+/* Variant 13: PTY + TA for ON */
+static const rds_field_def_t rds_group_14a_v13_c_fields[] = {
+	/* Name      Bits  Shift  Mask    IEC Ref               Description          Decoder */
+	{ "PTY_ON",  5,    11,    0xF800, "S6.1.5.14 Type 14",  "PTY of ON",         rds_field_pty },
+	{ "TA_ON",   1,    0,     0x0001, "S6.1.5.14 Type 14",  "TA of ON",          rds_field_yes_no },
+	{ NULL, 0, 0, 0, NULL, NULL, NULL }
+};
+
+static const rds_field_def_t rds_group_14a_d_fields[] = {
+	/* Name    Bits  Shift  Mask    IEC Ref               Description          Decoder */
+	{ "ON_PI", 16,   0,     0xFFFF, "S6.1.5.14 Type 14",  "PI of Other Net",   NULL },
+	{ NULL, 0, 0, 0, NULL, NULL, NULL }
+};
+
+/* ============================================================
+ * Group 15B Block B/D Fields (IEC 62106 S6.1.5.16)
+ * Fast Basic Tuning and Switching Information
+ *
+ * Mirrors Group 0B Block B payload in both Block B and D
+ * Block C: PI repeat
+ * ============================================================ */
+
+static const rds_field_def_t rds_group_15b_fields[] = {
+	/* Name   Bits  Shift  Mask    IEC Ref                Description            Decoder */
+	{ "TA",   1,    4,     0x0010, "S6.1.5.16 Type 15B",  "Traffic Announcement", rds_field_yes_no },
+	{ "M/S",  1,    3,     0x0008, "S6.1.5.16 Type 15B",  "Music/Speech",         rds_field_music_speech },
+	{ "DI",   1,    2,     0x0004, "S6.1.5.16 Type 15B",  "Decoder Identification", NULL },
+	{ "C1C0", 2,    0,     0x0003, "S6.1.5.16 Type 15B",  "PS segment (0-3)",     NULL },
+	{ NULL, 0, 0, 0, NULL, NULL, NULL }
+};
+
+/* ============================================================
  * Parity Check Matrix (IEC 62106 Annex B - Syndrome calc)
  *
  * Used for syndrome calculation in decoder.
@@ -619,6 +699,97 @@ void rds_group_decode(const uint16_t blocks[4], const uint8_t block_status[4],
 		if (block_status[3] != RDS_STATUS_ERROR) {
 			frame->ptyn_chars[2] = (blocks[3] >> 8) & 0xFF;
 			frame->ptyn_chars[3] = blocks[3] & 0xFF;
+		}
+		break;
+
+	case RDS_GROUP_3A:
+		/* Group 3A: ODA Identification */
+		frame->app_group = b2 & 0x1F;
+		if (block_status[3] != RDS_STATUS_ERROR) {
+			frame->aid = blocks[3];
+		}
+		if (debug) {
+			rds_log_fields(rds_group_3a_b_fields, b2, debug, 0);
+			rds_log_fields(rds_group_3a_d_fields, blocks[3], debug, 0);
+		}
+		break;
+
+	case RDS_GROUP_15B:
+		/* Group 15B: Fast switching (mirrors 0B Block B) */
+		frame->ta = (b2 >> 4) & 1;
+		frame->ms = (b2 >> 3) & 1;
+		frame->di = (b2 >> 2) & 1;
+		frame->ps_segment = b2 & 0x03;
+
+		if (debug)
+			rds_log_fields(rds_group_15b_fields, b2, debug, 0);
+		break;
+
+	case RDS_GROUP_14A:
+		/* Group 14A: Enhanced Other Networks (EON) */
+		frame->eon_tp_on = (b2 >> RDS_14A_TP_ON_BIT) & 1;
+		frame->eon_variant = b2 & RDS_14A_USAGE_MASK;
+
+		if (debug)
+			rds_log_fields(rds_group_14a_b_fields, b2, debug, 0);
+
+		/* Block C: Variant-dependent data */
+		if (block_status[2] != RDS_STATUS_ERROR) {
+			switch (frame->eon_variant) {
+			case 0: case 1: case 2: case 3:
+				/* PS characters */
+				frame->eon_ps_chars[0] = (blocks[2] >> 8) & 0xFF;
+				frame->eon_ps_chars[1] = blocks[2] & 0xFF;
+				break;
+			case 4:
+				/* AF pair for ON */
+				frame->eon_af1 = (blocks[2] >> 8) & 0xFF;
+				frame->eon_af2 = blocks[2] & 0xFF;
+				break;
+			case 5: case 6: case 7: case 8: case 9:
+				/* Mapped AF */
+				frame->eon_af1 = (blocks[2] >> 8) & 0xFF;
+				frame->eon_af2 = blocks[2] & 0xFF;
+				break;
+			case RDS_14A_VARIANT_LINK:
+				/* Linkage information */
+				frame->eon_la = (blocks[2] >> RDS_14A_LINK_LA_BIT) & 1;
+				frame->eon_lsn = blocks[2] & RDS_14A_LINK_LSN_MASK;
+				break;
+			case RDS_14A_VARIANT_INFO:
+				/* PTY and TA for ON */
+				frame->eon_pty_on = (blocks[2] >> RDS_14A_INFO_PTY_SHIFT) & 0x1F;
+				frame->eon_ta_on = (blocks[2] >> RDS_14A_INFO_TA_BIT) & 1;
+				if (debug)
+					rds_log_fields(rds_group_14a_v13_c_fields, blocks[2], debug, 0);
+				break;
+			case RDS_14A_VARIANT_PIN:
+				/* PIN for ON */
+				frame->eon_pin = blocks[2];
+				break;
+			case RDS_14A_VARIANT_BCAST:
+				/* Broadcaster data */
+				frame->eon_bcast = blocks[2];
+				break;
+			}
+		}
+
+		/* Block D: ON-PI */
+		if (block_status[3] != RDS_STATUS_ERROR) {
+			frame->eon_on_pi = blocks[3];
+			if (debug)
+				rds_log_fields(rds_group_14a_d_fields, blocks[3], debug, 0);
+		}
+		break;
+
+	case RDS_GROUP_14B:
+		/* Group 14B: EON TA switching (simplified) */
+		frame->eon_tp_on = (b2 >> 4) & 1;
+		frame->eon_ta_on = (b2 >> 3) & 1;  /* TA in bit 3 for 14B */
+
+		/* Block D: ON-PI */
+		if (block_status[3] != RDS_STATUS_ERROR) {
+			frame->eon_on_pi = blocks[3];
 		}
 		break;
 

@@ -99,3 +99,9 @@ int radio_start(radio_t *radio);
 int radio_tx(radio_t *radio, float *baseband, int num);
 int radio_rx(radio_t *radio, float *baseband, int num);
 
+/* RDS preset switching (press 'f' to cycle) */
+void rds_next_preset(radio_t *radio);
+
+
+void radio_set_callsign(const char *callsign);
+void radio_set_pi(uint16_t pi);

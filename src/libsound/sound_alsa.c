@@ -259,6 +259,9 @@ int sound_start(void *inst)
 	sound_t *sound = (sound_t *)inst;
 	int16_t buff[2];
 
+	if (sound->direction == SOUND_DIR_PLAY)
+		return 0;
+
 	if (sound->direction != SOUND_DIR_REC && sound->direction != SOUND_DIR_DUPLEX)
 		return -EINVAL;
 

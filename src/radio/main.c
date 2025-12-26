@@ -162,6 +162,10 @@ static void print_help(const char *arg0)
 	printf("        Enable RDS decoder debug logging (raw hex codes).\n");
 	printf("    --rds-verbose\n");
 	printf("        Enable RDS decoder verbose logging (human-readable interpretation).\n");
+	printf("    --call-sign <WXXX>\n");
+	printf("        Set RBDS Call Sign (e.g. WNYC) to automatically configure PI code.\n");
+	printf("    --pi <HEX>\n");
+	printf("        Set RDS PI code (hexadecimal), overriding preset or call sign.\n");
 	printf("    --sca-67k\n");
 	printf("        Enable 67 kHz SCA (Subsidiary Communications) subcarrier.\n");
 	printf("    --sca-92k\n");
@@ -184,6 +188,8 @@ static void print_help(const char *arg0)
 #define	OPT_RDS_VERBOSE		1013
 #define OPT_LIMESDR		1100
 #define OPT_LIMESDR_MINI	1101
+#define OPT_CALL_SIGN		1102
+#define OPT_PI			1103
 
 static void add_options(void)
 {
@@ -211,6 +217,8 @@ static void add_options(void)
 	option_add(OPT_FAST_MATH, "fast-math", 0);
 	option_add(OPT_LIMESDR, "limesdr", 0);
 	option_add(OPT_LIMESDR_MINI, "limesdr-mini", 0);
+	option_add(OPT_CALL_SIGN, "call-sign", 1);
+	option_add(OPT_PI, "pi", 1);
         sdr_config_add_options();
 }
 
@@ -302,6 +310,12 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_FAST_MATH:
 		fast_math = 1;
+		break;
+	case OPT_CALL_SIGN:
+		radio_set_callsign(argv[argi]);
+		break;
+	case OPT_PI:
+		radio_set_pi((uint16_t)strtoul(argv[argi], NULL, 16));
 		break;
 	case OPT_LIMESDR:
 		{
@@ -547,6 +561,11 @@ next_char:
 			/* dump RDS status */
 			if (rx && rds)
 				rds_decoder_status(&radio.rds_dec);
+			goto next_char;
+		case 'f':
+			/* cycle RDS presets */
+			if (tx && rds)
+				rds_next_preset(&radio);
 			goto next_char;
 		}
 	}
