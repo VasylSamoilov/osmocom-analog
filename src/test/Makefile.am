@@ -11,7 +11,8 @@ noinst_PROGRAMS = \
 	test_sms \
 	test_performance \
 	test_hagelbarger \
-	test_v27scrambler
+	test_v27scrambler \
+	test_channelizer
 
 test_filter_SOURCES = test_filter.c dummy.c
 
@@ -89,6 +90,7 @@ endif
 if HAVE_SDR
 test_dms_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libam/libam.a \
@@ -126,6 +128,7 @@ endif
 if HAVE_SDR
 test_sms_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libam/libam.a \
@@ -164,5 +167,13 @@ test_goertzel_LDADD = \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(LIBOSMOCC_LIBS) \
 	$(LIBOSMOCORE_LIBS) \
+	-lm
+
+test_channelizer_SOURCES = test_channelizer.c
+
+test_channelizer_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libsample/libsample.a \
 	-lm
 

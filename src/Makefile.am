@@ -21,6 +21,7 @@ SUBDIRS = \
 	libam \
 	libfm \
 	libfilter \
+	libchannelizer \
 	libwave \
 	libfft \
 	libclipper \

@@ -83,6 +83,7 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/libam/Makefile
     src/libfm/Makefile
     src/libfilter/Makefile
+    src/libchannelizer/Makefile
     src/libwave/Makefile
     src/libfft/Makefile
     src/libsound/Makefile

@@ -50,6 +50,7 @@ endif
 if HAVE_SDR
 amps_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
@@ -92,6 +93,7 @@ endif
 if HAVE_SDR
 tacs_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
@@ -134,6 +136,7 @@ endif
 if HAVE_SDR
 jtacs_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \

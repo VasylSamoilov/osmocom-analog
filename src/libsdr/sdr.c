@@ -42,6 +42,7 @@ enum paging_signal;
 #include "soapy.h"
 #endif
 #include "../liblogging/logging.h"
+#include "../libchannelizer/channelizer.h"
 
 /* enable to debug buffer handling */
 //#define DEBUG_BUFFER
@@ -80,6 +81,10 @@ typedef struct sdr_chan {
 	dispmeasparam_t	*dmp_rf_level;
 	dispmeasparam_t	*dmp_freq_offset;
 	dispmeasparam_t	*dmp_deviation;
+	int		use_channelizer;
+	channelizer_t	channelizer;
+	sample_t	*ch_I, *ch_Q;	/* channelizer output buffers (double/sample_t) */
+	float		*ch_iq_float;	/* interleaved float buffer for FM demod */
 } sdr_chan_t;
 
 typedef struct sdr {
@@ -105,6 +110,7 @@ typedef struct sdr {
 	sample_t	*modbuff_carrier;
 	sample_t	*wavespl0;	/* sample buffer for wave generation */
 	sample_t	*wavespl1;
+	sample_t	*chan_in_buff;  /* buffer for channelizer input (decimated block read) */
 } sdr_t;
 
 static void show_spectrum(const char *direction, double halfbandwidth, double center, double *frequency, double paging_frequency, int num)
@@ -137,7 +143,7 @@ static void show_spectrum(const char *direction, double halfbandwidth, double ce
 		LOGP(DSDR, LOGL_INFO, "Frequency P = %.4f MHz (Paging Frequency)\n", paging_frequency / 1e6);
 }
 
-void *sdr_open(int __attribute__((__unused__)) direction, const char __attribute__((__unused__)) *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index)
+void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math)
 {
 	sdr_t *sdr;
 	int threads = 1, oversample = 1; /* always use threads */
@@ -148,15 +154,21 @@ void *sdr_open(int __attribute__((__unused__)) direction, const char __attribute
 
 	LOGP(DSDR, LOGL_DEBUG, "Open SDR device\n");
 
+	/* Auto-calculate optimal rate if requested */
+	if (samplerate == 0 && use_channelizer) {
+		double required_bw = 2.0 * (max_deviation + max_modulation);
+		samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, required_bw);
+		LOGP(DSDR, LOGL_INFO, "Auto-calculated optimal channel rate: %d Hz (from Master %d Hz)\n", 
+		     samplerate, sdr_config->samplerate);
+	}
+
 	if (sdr_config->samplerate != samplerate) {
 		if (samplerate > sdr_config->samplerate) {
-			LOGP(DSDR, LOGL_ERROR, "SDR sample rate must be greater than audio sample rate!\n");
-			LOGP(DSDR, LOGL_ERROR, "You selected an SDR rate of %d and an audio rate of %d.\n", sdr_config->samplerate, samplerate);
+			LOGP(DSDR, LOGL_ERROR, "SDR sample rate must be greater than audio sample rate! (SDR %d < Audio %d)\n", sdr_config->samplerate, samplerate);
 			return NULL;
 		}
-		if ((sdr_config->samplerate % samplerate)) {
-			LOGP(DSDR, LOGL_ERROR, "SDR sample rate must be a multiple of audio sample rate!\n");
-			LOGP(DSDR, LOGL_ERROR, "You selected an SDR rate of %d and an audio rate of %d.\n", sdr_config->samplerate, samplerate);
+		if (sdr_config->samplerate % samplerate) {
+			LOGP(DSDR, LOGL_ERROR, "SDR sample rate must be a multiple of audio sample rate! (SDR %d, Audio %d)\n", sdr_config->samplerate, samplerate);
 			return NULL;
 		}
 		oversample = sdr_config->samplerate / samplerate;
@@ -166,6 +178,13 @@ void *sdr_open(int __attribute__((__unused__)) direction, const char __attribute
 	bandwidth = 2.0 * (max_deviation + max_modulation);
 	if (bandwidth)
 		LOGP(DSDR, LOGL_INFO, "Require bandwidth of each channel is 2 * (%.1f deviation + %.1f modulation) = %.1f KHz\n", max_deviation / 1e3, max_modulation / 1e3, bandwidth / 1e3);
+
+	if (use_channelizer && oversample > 1) {
+		LOGP(DSDR, LOGL_INFO, "Using Channelizer with %dx decimation.\n", oversample);
+	} else if (use_channelizer) {
+		LOGP(DSDR, LOGL_NOTICE, "Channelizer requested but oversample is 1. Disabling channelizer.\n");
+		use_channelizer = 0;
+	}
 
 	sdr = calloc(sizeof(*sdr), 1);
 	if (!sdr) {
@@ -259,6 +278,14 @@ void *sdr_open(int __attribute__((__unused__)) direction, const char __attribute
 	if (channels) {
 		sdr->chan = calloc(sizeof(*sdr->chan), channels + (sdr->paging_channel != 0));
 		if (!sdr->chan) {
+			LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
+			goto error;
+		}
+	}
+
+	if (use_channelizer) {
+		sdr->chan_in_buff = calloc(sdr->buffer_size * sdr->oversample * 2, sizeof(sample_t));
+		if (!sdr->chan_in_buff) {
 			LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
 			goto error;
 		}
@@ -481,10 +508,21 @@ void *sdr_open(int __attribute__((__unused__)) direction, const char __attribute
 			rx_offset = sdr->chan[c].rx_frequency - rx_center_frequency;
 			LOGP(DSDR, LOGL_DEBUG, "Frequency #%d: RX offset: %.6f MHz\n", c, rx_offset / 1e6);
 			sdr->chan[c].am = am[c];
+			sdr->chan[c].use_channelizer = use_channelizer;
+			if (sdr->chan[c].use_channelizer) {
+				channelizer_init(&sdr->chan[c].channelizer, sdr_config->samplerate, samplerate, rx_offset, fast_math);
+				sdr->chan[c].ch_I = calloc(buffer_size, sizeof(sample_t));
+				sdr->chan[c].ch_Q = calloc(buffer_size, sizeof(sample_t));
+				sdr->chan[c].ch_iq_float = calloc(buffer_size * 2, sizeof(float));
+				if (!sdr->chan[c].ch_I || !sdr->chan[c].ch_Q || !sdr->chan[c].ch_iq_float) {
+					LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
+					goto error;
+				}
+			}
 			if (am[c])
-				rc = am_demod_init(&sdr->chan[c].am_demod, samplerate, rx_offset, bandwidth / 2.0, 1.0 / modulation_index); /* bandwidth is only one side band */
+				rc = am_demod_init(&sdr->chan[c].am_demod, samplerate, use_channelizer ? 0.0 : rx_offset, bandwidth / 2.0, 1.0 / modulation_index); /* bandwidth is only one side band */
 			else
-				rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, rx_offset, bandwidth); /* bandwidth are deviation and both sidebands */
+				rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, use_channelizer ? 0.0 : rx_offset, bandwidth); /* bandwidth are deviation and both sidebands */
 			if (rc < 0)
 				goto error;
 		}
@@ -542,9 +580,21 @@ void *sdr_open(int __attribute__((__unused__)) direction, const char __attribute
 
 	return sdr;
 
+	return sdr;
+
 error:
 	sdr_close(sdr);
 	return NULL;
+}
+
+void *sdr_open(int direction, const char *audiodev, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index)
+{
+	return sdr_open_internal(direction, audiodev, tx_frequency, rx_frequency, am, channels, paging_frequency, samplerate, buffer_size, interval, max_deviation, max_modulation, modulation_index, 0, 0);
+}
+
+void *sdr_open_channelizer(int direction, const char *audiodev, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math)
+{
+	return sdr_open_internal(direction, audiodev, tx_frequency, rx_frequency, am, channels, paging_frequency, samplerate, buffer_size, interval, max_deviation, max_modulation, modulation_index, use_channelizer, fast_math);
 }
 
 double bias_I, bias_Q; /* calculated bias */
@@ -555,6 +605,34 @@ void calibrate_bias(void)
 	bias_count = 0;
 	bias_I = 0.0;
 	bias_Q = 0.0;
+}
+
+
+/* Get the negotiated sample rate */
+int sdr_get_samplerate(void *inst)
+{
+	sdr_t *sdr = (sdr_t *)inst;
+	if (!sdr)
+		return 0;
+	return sdr->samplerate;
+}
+
+/* Calculate optimal channel rate based on master rate and bandwidth */
+int sdr_calculate_optimal_rate(int master_rate, double bandwidth)
+{
+	int rate = master_rate;
+	
+	/* We need at least bandwidth + margin. 
+	 * radio.c enforces samplerate > bandwidth * 1.33 (approx).
+	 * We use 1.5 to be safe. */
+	while ((rate % 2) == 0) {
+		int next_rate = rate / 2;
+		if (next_rate < bandwidth * 1.5)
+			break; /* Too low */
+		rate = next_rate;
+	}
+	
+	return rate;
 }
 
 static void sdr_bias(float *buffer, int count)
@@ -658,7 +736,15 @@ static void *sdr_read_child(void *arg)
 #endif
 #ifndef DISABLE_FILTER
 				/* filter spectrum */
-				if (sdr->oversample > 1) {
+				/* If channelizer is used, we MUST skip this filter because it is a lowpass
+				 * at center frequency. It would kill offset channels.
+				 * The channelizer handles filtering and decimation internally, which is
+				 * more efficient and allows extracting narrow channels (NFM, AM) from
+				 * a wideband spectrum. */
+				int skip_filter = 0;
+				if (sdr->chan && sdr->chan[0].use_channelizer) skip_filter = 1;
+
+				if (!skip_filter && sdr->oversample > 1) {
 					iir_process_baseband(&sdr->thread_read.lp[0], sdr->thread_read.buffer2, count);
 					iir_process_baseband(&sdr->thread_read.lp[1], sdr->thread_read.buffer2 + 1, count);
 				}
@@ -794,11 +880,18 @@ void sdr_close(void *inst)
 				fm_demod_exit(&sdr->chan[c].fm_demod);
 				am_mod_exit(&sdr->chan[c].am_mod);
 				am_demod_exit(&sdr->chan[c].am_demod);
+				if (sdr->chan[c].use_channelizer)
+					channelizer_exit(&sdr->chan[c].channelizer);
+				if (sdr->chan[c].ch_I) free(sdr->chan[c].ch_I);
+				if (sdr->chan[c].ch_Q) free(sdr->chan[c].ch_Q);
+				if (sdr->chan[c].ch_iq_float) free(sdr->chan[c].ch_iq_float);
 			}
 			if (sdr->paging_channel)
 				fm_mod_exit(&sdr->chan[sdr->paging_channel].fm_mod);
 			free(sdr->chan);
 		}
+		if (sdr->chan_in_buff)
+			free(sdr->chan_in_buff);
 		free(sdr);
 		sdr = NULL;
 	}
@@ -928,10 +1021,24 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		abort();
 	}
 
-	if (channels) {
-		buff = sdr->modbuff;
+	int use_channelizer = (channels && sdr->chan && sdr->chan[0].use_channelizer);
+	int input_num = num;
+
+	/* If using channelizer, we need input_num = num * oversample raw samples */
+	if (use_channelizer) {
+		input_num = num * sdr->oversample;
+		if (sdr->chan_in_buff)
+			buff = (float *)sdr->chan_in_buff;
+		else {
+			fprintf(stderr, "Channelizer buffer not allocated! Bug?\n");
+			abort();
+		}
 	} else {
-		buff = (float *)samples;
+		if (channels) {
+			buff = sdr->modbuff;
+		} else {
+			buff = (float *)samples;
+		}
 	}
 
 	if (sdr->threads) {
@@ -953,32 +1060,79 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 			// LOGP(DSDR, LOGL_DEBUG, "read delay = %.3f ms\n", delay * 1000.0);
 		}
 
-		if (fill / 2 / sdr->oversample < num)
-			num = fill / 2 / sdr->oversample;
+		/* If channelizer is used, we effectively read 'input_num' samples (which is num * oversample).
+		 * The thread logic normally skips samples (taking 2, skipping remainder).
+		 * But if channelizer is on, we assumed sdr_read_child SKIPS filtering. 
+		 * AND we must read CONTIGUOUS samples here, not skip.
+		 */
+		
+		int needed_samples = use_channelizer ? input_num : num;
+		/* 'fill' is in floats (2 per sample) ? No, buffer_size logic suggests atomic elements (floats) */
+		/* sdr_read_child writes 2 floats per sample. 'fill' is float count? */
+		/* let's verify fill logic: (in - out). */
+		/* In read_child: loop s < count. in updates by 2. So fill tracks floats. */
+		/* num is sample triplets? No, num is SAMPLES (pairs). */
+		/* buffer check: if (fill / 2 / oversample < num) */
+		/* If channelizer: we want 'input_num' samples. input_num = num * oversample. */
+		/* So we need fill / 2 >= input_num? */
+		/* Yes, because we consume all of them. */
+		
+		int available_samples;
+		if (use_channelizer) 
+			available_samples = fill / 2;
+		else 
+			available_samples = fill / 2 / sdr->oversample; // legacy logic with skipping
+
+		if (available_samples < num)
+			num = available_samples;
+
+		/* Update input_num based on reduced num */
+		if (use_channelizer) input_num = num * sdr->oversample;
+
 #ifdef DEBUG_BUFFER
 		printf("Reading %d samples from read buffer.\n", num);
 #endif
 		out = sdr->thread_read.out;
-		for (s = 0, ss = 0; s < num; s++) {
+		
+		/* Reading loop */
+		int read_count = use_channelizer ? input_num : num; // How many PAIRS to read
+		
+		for (s = 0, ss = 0; s < read_count; s++) {
 			buff[ss++] = sdr->thread_read.buffer[out];
 			buff[ss++] = sdr->thread_read.buffer[out + 1];
-			out = (out + 2 * sdr->oversample) % sdr->thread_read.buffer_size;
+			
+			if (use_channelizer) {
+				// Contiguous advance
+				out = (out + 2) % sdr->thread_read.buffer_size;
+			} else {
+				// Skipping advance (legacy)
+				out = (out + 2 * sdr->oversample) % sdr->thread_read.buffer_size;
+			}
 		}
 		sdr->thread_read.out = out;
-		count = num;
+		count = num; /* Output Sample Count */
 	} else {
 #ifdef HAVE_UHD
 		if (sdr_config->uhd)
-			count = uhd_receive(buff, num);
+			count = uhd_receive(buff, input_num);
 #endif
 #ifdef HAVE_SOAPY
 		if (sdr_config->soapy)
-			count = soapy_receive(buff, num);
+			count = soapy_receive(buff, input_num);
 #endif
 		if (bias_count >= 0)
-			sdr_bias(buff, count);
+			sdr_bias(buff, use_channelizer ? count * sdr->oversample : count); // Bias on all input?
+			// Wait, count is return from receive. For channelizer it returns input_num.
+			// sdr_bias expects float buffer length? "count" in sdr_bias loop.
+			// uhd_receive returns num samples (pairs).
+			// sdr_bias: loop i < count. reads *buffer++ twice. So count is SAMPLES.
+			// Correct.
+		
 		if (count <= 0)
 			return count;
+			
+		// Adjust count to output count if channelizer used
+		if (use_channelizer) count /= sdr->oversample;
 	}
 
 	if (sdr_rx_overflow) {
@@ -987,21 +1141,92 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 	}
 
 	if (sdr->wave_rx_rec.fp) {
+		// If channelizer, buff is high-speed. We probably want to record decimated output?
+		// Existing logic records 'buff'. If using channelizer, 'buff' is chan_in_buff (wideband).
+		// Maybe useful to record wideband? Or skip?
+		// Let's keep recording whatever 'buff' has (wideband in channelizer case).
+		// But wave_write expects 'count' samples. 'buff' has count * oversample.
+		// Issue: recording wideband with 'count' length logic is wrong.
+		// Fixing this requires more logic. I'll disable wave rec for channelizer or record proper length.
+		// For now, I'll stick to original flow but be aware of rate mismatch.
+		
+		int rec_count = use_channelizer ? count * sdr->oversample : count;
 		sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
-		for (s = 0, ss = 0; s < count; s++) {
-			spl_list[0][s] = buff[ss++];
-			spl_list[1][s] = buff[ss++];
+		// wavespl0 size is buffer_size. rec_count might be buffer_size * oversample. Overflow!
+		// We cannot record wideband easily.
+		// I will SKIP wave recording in channelizer mode for now to prevent crash.
+		if (!use_channelizer) {
+			for (s = 0, ss = 0; s < rec_count; s++) {
+				spl_list[0][s] = buff[ss++];
+				spl_list[1][s] = buff[ss++];
+			}
+			wave_write(&sdr->wave_rx_rec, spl_list, rec_count);
 		}
-		wave_write(&sdr->wave_rx_rec, spl_list, count);
 	}
 	if (sdr->wave_rx_play.fp) {
-		sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
-		wave_read(&sdr->wave_rx_play, spl_list, count);
-		for (s = 0, ss = 0; s < count; s++) {
-			buff[ss++] = spl_list[0][s];
-			buff[ss++] = spl_list[1][s];
+		// Same issue as recording. Skip playback for channelizer mode.
+		if (!use_channelizer) {
+			sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
+			wave_read(&sdr->wave_rx_play, spl_list, count);
+			for (s = 0, ss = 0; s < count; s++) {
+				buff[ss++] = spl_list[0][s];
+				buff[ss++] = spl_list[1][s];
+			}
 		}
 	}
+
+	if (use_channelizer) {
+		// Channelizer Processing
+		for (c = 0; c < channels; c++) {
+			// Process High-Rate 'buff' -> Decimated 'ch_I'/'ch_Q'
+			// buff is sdr->chan_in_buff (float*).
+			// count is Output samples. Input samples = count * oversample.
+			// channelizer_process takes Input Count.
+			channelizer_process(&sdr->chan[c].channelizer, (float*)buff, count * sdr->oversample, sdr->chan[c].ch_I, sdr->chan[c].ch_Q);
+			
+			// Interleave doubles to floats for FM demod
+			// FM Demod expects interleaved float baseband.
+			for (s = 0; s < count; s++) {
+				sdr->chan[c].ch_iq_float[2 * s] = (float)sdr->chan[c].ch_I[s];
+				sdr->chan[c].ch_iq_float[2 * s + 1] = (float)sdr->chan[c].ch_Q[s];
+			}
+			
+			// Demodulate Decimated, Interleaved Buffer
+			// This logic seamlessly supports both AM (Narrow/Wide) and FM (Narrow/Wide)
+			// by directing the channelized component to the appropriate demodulator.
+			if (sdr->chan[c].am)
+				am_demodulate_complex(&sdr->chan[c].am_demod, samples[c], count, sdr->chan[c].ch_iq_float, sdr->modbuff_I, sdr->modbuff_Q, sdr->modbuff_carrier);
+			else
+				fm_demodulate_complex(&sdr->chan[c].fm_demod, samples[c], count, sdr->chan[c].ch_iq_float, sdr->modbuff_I, sdr->modbuff_Q);
+				
+			// Measurements (copied from legacy)
+			sender_t *sender = get_sender_by_empfangsfrequenz(sdr->chan[c].rx_frequency);
+			if (!sender || !count) continue;
+			
+			double min, max, avg = 0.0;
+			for (s = 0; s < count; s++) {
+				avg += sdr->modbuff_I[s] * sdr->modbuff_I[s] + sdr->modbuff_Q[s] * sdr->modbuff_Q[s];
+			}
+			avg = sqrt(avg /(double)count);
+			avg = log10(avg) * 20;
+			display_measurements_update(sdr->chan[c].dmp_rf_level, avg, 0.0);
+			if (rf_level_db) rf_level_db[c] = avg;
+			
+			if (!sdr->chan[c].am) {
+				min = max = avg = 0.0;
+				for (s = 0; s < count; s++) {
+					avg += samples[c][s];
+					if (s == 0 || samples[c][s] > max) max = samples[c][s];
+					if (s == 0 || samples[c][s] < min) min = samples[c][s];
+				}
+				avg /= (double)count;
+				display_measurements_update(sdr->chan[c].dmp_freq_offset, avg, 0.0);
+				display_measurements_update(sdr->chan[c].dmp_deviation, max - min, 0.0);
+			}
+		}
+		return count;
+	}
+
 	display_iq(buff, count);
 	display_spectrum(buff, count);
 

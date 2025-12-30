@@ -20,6 +20,7 @@ if HAVE_SOAPY
 AM_CPPFLAGS += -DHAVE_SOAPY
 
 libsdr_a_SOURCES += \
-	soapy.c
+	soapy.c \
+	split_sdr.c
 endif
 

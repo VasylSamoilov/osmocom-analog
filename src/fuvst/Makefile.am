@@ -63,6 +63,7 @@ fuvst_sniffer_LDADD = \
 if HAVE_SDR
 fuvst_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
@@ -70,6 +71,7 @@ fuvst_LDADD += \
 
 fuvst_sniffer_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \

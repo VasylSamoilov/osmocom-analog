@@ -18,6 +18,7 @@ osmoradio_LDADD = \
 	$(top_builddir)/src/libwave/libwave.a \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libclipper/libclipper.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libam/libam.a \
