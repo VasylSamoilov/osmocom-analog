@@ -300,6 +300,12 @@
 #define RDS_ECC_RBDS_MAX        0xA5
 #define RDS_IS_RBDS(ecc)        ((ecc) >= RDS_ECC_RBDS_MIN && (ecc) <= RDS_ECC_RBDS_MAX)
 
+/* Detect RBDS from de-emphasis time constant (heuristic)
+ * Only 50µs (±1µs tolerance) triggers RBDS assumption.
+ * All other values (including 75µs) default to RDS, which is more common globally.
+ * This is used for initial PTY name display before ECC is received. */
+#define RDS_IS_RBDS_EMPHASIS(us)  ((us) >= 49.0 && (us) <= 51.0)
+
 
 /* Segment masks for cycling */
 #define RDS_PS_SEG_MASK         0x03    /* 4 segments for PS (0-3) */

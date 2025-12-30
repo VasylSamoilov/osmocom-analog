@@ -17,6 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #include "../libclipper/clipper.h"
 #include "radio.h"
 #include "rds_tables.h"
+#include "../libfm/fm.h"
 
 #define CLIP_POINT	0.85
 #define DC_CUTOFF	30.0 // Wikipedia: UKW-Rundfunk
@@ -894,14 +896,14 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* Initialize RDS encoder if enabled */
 		if (rds || rds2) {
 			/* Select preset based on emphasis (heuristic for region):
-			 * 75µs → Europe (RDS)  - preset 0
-			 * 50µs → USA (RBDS)    - preset 1 */
-			if (time_constant_us > 0.0 && time_constant_us < 60.0) {
+			 * Only 50µs → USA (RBDS) - preset 1
+			 * All other → RDS (default, more common globally) - preset 0 */
+			if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
 				rds_current_preset = 1;  /* USA/RBDS (50µs) */
 				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RBDS (USA) preset\n", time_constant_us);
-			} else if (time_constant_us >= 60.0) {
-				rds_current_preset = 0;  /* Europe/RDS (75µs) */
-				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RDS (Europe) preset\n", time_constant_us);
+			} else {
+				rds_current_preset = 0;  /* RDS (default, more common globally) */
+				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RDS preset (default)\n", time_constant_us);
 			}
 			const rds_preset_t *p = &rds_presets[rds_current_preset];
 			
@@ -1600,26 +1602,30 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			}
 			
 			/* Step 2: Measure phase offset using I/Q mixing at end of block */
-			/* We only need to compute I and Q for phase detection - reuse samples[2] */
-			/* First compute cos (I) component across block */
+			/* Compute I and Q simultaneously using sincos for efficiency */
 			p = radio->rx_pilot_phase;
 			for (i = 0; i < signal_num; i++) {
-				samples[2][i] = samples[0][i] * cos(p);
+				double sc_sin, sc_cos;
+				if (fm_fast_math_enabled()) {
+					fm_fast_sincos(p * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+				} else {
+					sincos(p, &sc_sin, &sc_cos);
+				}
+				radio->I_buffer[i] = samples[0][i] * sc_cos;  /* I component */
+				radio->Q_buffer[i] = samples[0][i] * sc_sin;  /* Q component */
 				p += radio->pilot_phasestep;
 				if (p >= 2.0 * M_PI)
 					p -= 2.0 * M_PI;
 			}
+			/* Filter I channel (copy to samples[2] for in-place filtering) */
+			for (i = 0; i < signal_num; i++)
+				samples[2][i] = radio->I_buffer[i];
 			iir_process(&radio->rx_lp_pilot_I, samples[2], signal_num);
 			double I_end = samples[2][signal_num - 1];
 			
-			/* Then compute sin (Q) component across block */
-			p = radio->rx_pilot_phase;
-			for (i = 0; i < signal_num; i++) {
-				samples[2][i] = samples[0][i] * sin(p);
-				p += radio->pilot_phasestep;
-				if (p >= 2.0 * M_PI)
-					p -= 2.0 * M_PI;
-			}
+			/* Filter Q channel */
+			for (i = 0; i < signal_num; i++)
+				samples[2][i] = radio->Q_buffer[i];
 			iir_process(&radio->rx_lp_pilot_Q, samples[2], signal_num);
 			double Q_end = samples[2][signal_num - 1];
 			

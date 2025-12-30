@@ -15,12 +15,14 @@
  * (at your option) any later version.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "sca.h"
 #include "../liblogging/logging.h"
+#include "../libfm/fm.h"
 
 /* Initialize a single SCA channel */
 static int sca_channel_init(sca_channel_t *ch, double samplerate, 
@@ -139,8 +141,14 @@ static void sca_demodulate_channel(sca_channel_t *ch, sample_t *baseband,
 		double sample = baseband[i];
 		
 		/* Mix with subcarrier to get I and Q */
-		double i_mix = sample * cos(ch->phase);
-		double q_mix = sample * sin(ch->phase);
+		double sc_sin, sc_cos;
+		if (fm_fast_math_enabled()) {
+			fm_fast_sincos(ch->phase * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+		} else {
+			sincos(ch->phase, &sc_sin, &sc_cos);
+		}
+		double i_mix = sample * sc_cos;
+		double q_mix = sample * sc_sin;
 		
 		/* Low-pass filter I and Q */
 		ch->lpf_i += ch->lpf_alpha * (i_mix - ch->lpf_i);

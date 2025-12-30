@@ -16,6 +16,7 @@
  * (at your option) any later version.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,7 @@
 #include "rds.h"
 #include "rds_tables.h"
 #include "../liblogging/logging.h"
+#include "../libfm/fm.h"
 
 
 /* Forward declaration for encoder loopback verification */
@@ -2611,11 +2613,11 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->debug = debug;
 	rds->verbose = verbose;
 
-	/* Heuristic: If 50µs emphasis is used, assume RBDS (North America)
-	 * by setting a default ECC in the RBDS range (0xA0).
-	 * This allows correct PTY name display (e.g. "Top 40") before
-	 * the actual ECC is received from Group 1A. */
-	if (time_constant_us > 0.0 && time_constant_us < 60.0) {
+	/* Heuristic: Only 50µs emphasis triggers RBDS (North America) assumption.
+	 * All other values (including 75µs) default to RDS, which is more common globally.
+	 * This sets a default ECC in the RBDS range (0xA0) for correct PTY name display
+	 * (e.g. "Top 40") before the actual ECC is received from Group 1A. */
+	if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
 		rds->ecc = 0xA0; /* Start with RBDS assumption */
 	}
 	
@@ -2704,8 +2706,17 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		   (phase / 48) remains continuous.
 		*/
 		
-		double bb_i = samples[i] * cos(rds->phase_subcarrier);
-		double bb_q = samples[i] * sin(rds->phase_subcarrier);
+		double sc_sin, sc_cos;
+		if (fm_fast_math_enabled()) {
+			/* Convert phase to 0-65535 range for table lookup */
+			double wrapped = fmod(rds->phase_subcarrier, 2.0 * M_PI);
+			if (wrapped < 0) wrapped += 2.0 * M_PI;
+			fm_fast_sincos(wrapped * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+		} else {
+			sincos(rds->phase_subcarrier, &sc_sin, &sc_cos);
+		}
+		double bb_i = samples[i] * sc_cos;
+		double bb_q = samples[i] * sc_sin;
 		
 		/* 2. Filter I/Q (2400 Hz) */
 		bb_i = iir_lpf_step(&rds->filter_2400_i, bb_i);

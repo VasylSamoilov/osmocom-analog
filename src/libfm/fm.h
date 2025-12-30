@@ -6,6 +6,10 @@
 int fm_init(int fast_math);
 void fm_exit(void);
 
+/* Fast math lookup access (valid after fm_init with fast_math=1) */
+int fm_fast_math_enabled(void);
+void fm_fast_sincos(double phase, double *sin_out, double *cos_out);
+
 enum fm_mod_state {
 	MOD_STATE_OFF,		/* transmitter off, no IQ vector */
 	MOD_STATE_ON,		/* transmitter on, FM modulated IQ vector */
