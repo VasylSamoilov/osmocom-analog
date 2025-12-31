@@ -873,16 +873,27 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	case MODULATION_FM:
 		if (time_constant_us > 0.0) {
 			radio->emphasis = 1;
-			/* time constant - convert from µs to seconds */
-			double tau = time_constant_us / 1e6;
 			LOGP(DRADIO, LOGL_INFO, "Using emphasis cut-off at %.0f Hz.\n", timeconstant2cutoff(time_constant_us));
+		}
+	/* init emphasis */
+	if (radio->emphasis) {
+		double tau = time_constant_us / 1e6;
+		if (fm_fast_math_enabled()) {
 			/* Initialize optimized 1st-order emphasis filters (TX/RX) */
-			init_emphasis_fast(&radio->fm_emphasis[0], radio->signal_samplerate, tau, radio->audio_bandwidth);
-			init_emphasis_fast(&radio->fm_emphasis[1], radio->signal_samplerate, tau, radio->audio_bandwidth);
+			init_emphasis_fast(&radio->fm_emphasis_fast[0], radio->signal_samplerate, tau, 12000.0);
 			/* Initialize RX DC blocking filter (30 Hz cutoff - low enough to preserve bass) */
 			init_dc_filter_fast(&radio->rx_dc_filter[0], radio->signal_samplerate, DC_CUTOFF);
-			init_dc_filter_fast(&radio->rx_dc_filter[1], radio->signal_samplerate, DC_CUTOFF);
+			if (radio->stereo) {
+				init_emphasis_fast(&radio->fm_emphasis_fast[1], radio->signal_samplerate, tau, 12000.0);
+				init_dc_filter_fast(&radio->rx_dc_filter[1], radio->signal_samplerate, DC_CUTOFF);
+			}
+		} else {
+			/* time constant - convert from µs to seconds */
+			init_emphasis(&radio->fm_emphasis[0], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
+			if (radio->stereo)
+				init_emphasis(&radio->fm_emphasis[1], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
 		}
+	}
 		rc = fm_mod_init(&radio->fm_mod, radio->signal_samplerate, 0.0, 1.0);
 		if (rc < 0)
 			goto error;
@@ -1090,6 +1101,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		if (rc < 0)
 			goto error;
 		break;
+
 	default:
 		break;
 	}
@@ -1436,13 +1448,21 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	 * and modulate */
 	switch (radio->modulation) {
 	case MODULATION_FM:
-		if (radio->emphasis)
-			pre_emphasis_fast(&radio->fm_emphasis[0], signal_samples[0], signal_num);
+		if (radio->emphasis) {
+			if (fm_fast_math_enabled())
+				pre_emphasis_fast(&radio->fm_emphasis_fast[0], signal_samples[0], signal_num);
+			else
+				pre_emphasis(&radio->fm_emphasis[0], signal_samples[0], signal_num);
+		}
 
 		clipper_process(signal_samples[0], signal_num);
 		if (radio->stereo) {
-			if (radio->emphasis)
-				pre_emphasis_fast(&radio->fm_emphasis[1], signal_samples[1], signal_num);
+			if (radio->emphasis) {
+				if (fm_fast_math_enabled())
+					pre_emphasis_fast(&radio->fm_emphasis_fast[1], signal_samples[1], signal_num);
+				else
+					pre_emphasis(&radio->fm_emphasis[1], signal_samples[1], signal_num);
+			}
 			clipper_process(signal_samples[1], signal_num);
 		}
 		
@@ -1680,11 +1700,20 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			/* RX path: DC filter → de-emphasis
 			 * DC blocking removes any DC offset from FM demodulator output.
 			 * De-emphasis restores flat frequency response. */
-			dc_filter_fast(&radio->rx_dc_filter[0], samples[0], signal_num);
-			de_emphasis_fast(&radio->fm_emphasis[0], samples[0], signal_num);
-			if (radio->stereo) {
-				dc_filter_fast(&radio->rx_dc_filter[1], samples[1], signal_num);
-				de_emphasis_fast(&radio->fm_emphasis[1], samples[1], signal_num);
+			if (fm_fast_math_enabled()) {
+				dc_filter_fast(&radio->rx_dc_filter[0], samples[0], signal_num);
+				de_emphasis_fast(&radio->fm_emphasis_fast[0], samples[0], signal_num);
+				if (radio->stereo) {
+					dc_filter_fast(&radio->rx_dc_filter[1], samples[1], signal_num);
+					de_emphasis_fast(&radio->fm_emphasis_fast[1], samples[1], signal_num);
+				}
+			} else {
+				dc_filter(&radio->fm_emphasis[0], samples[0], signal_num);
+				de_emphasis(&radio->fm_emphasis[0], samples[0], signal_num);
+				if (radio->stereo) {
+					dc_filter(&radio->fm_emphasis[1], samples[1], signal_num);
+					de_emphasis(&radio->fm_emphasis[1], samples[1], signal_num);
+				}
 			}
 		}
 		break;

@@ -57,7 +57,8 @@ typedef struct radio {
 	double		signal_bandwidth;
 	samplerate_t	tx_resampler[2];	/* resampling from audio rate to signal rate (two channels) */
 	samplerate_t	rx_resampler[2];	/* resampling from signal rate to audi rate (two channels) */
-	emphasis_fast_t	fm_emphasis[2];		/* FM pre emphasis (optimized 1st-order) */
+	emphasis_fast_t	fm_emphasis_fast[2];	/* FM pre emphasis (optimized 1st-order) */
+	emphasis_t	fm_emphasis[2];		/* FM pre emphasis */
 	dc_filter_fast_t rx_dc_filter[2];	/* RX DC blocking filter */
 	double		fm_deviation;		/* deviation of fm signal */
 	fm_mod_t	fm_mod;			/* FM modulation */

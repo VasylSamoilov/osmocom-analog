@@ -224,20 +224,30 @@ void pre_emphasis_fast(emphasis_fast_t *e, sample_t *samples, int num)
 
 void de_emphasis_fast(emphasis_fast_t *e, sample_t *samples, int num)
 {
-	/* De-emphasis is just the inverse filter: swap numerator/denominator
-	 * For now, use same coefficients but with inverted signs conceptually.
-	 * Actually, de-emphasis H(z) = (1 - p1*z^-1) / (b0 * (1 - z1*z^-1))
-	 * Simplified: just apply IIR with swapped a/b */
-	float a1 = e->a1;
+	/* De-emphasis is the inverse of the pre-emphasis filter.
+	 * Pre-emphasis (Direct Form II Transposed):
+	 *   y[n] = b0 * x[n] + z[n-1]
+	 *   z[n] = b1 * x[n] - a1 * y[n]
+	 *
+	 * Solving for x[n] (input to pre-emp, output of de-emp):
+	 *   x[n] = (y[n] - z[n-1]) / b0
+	 *   z[n] = b1 * x[n] - a1 * y[n]
+	 */
 	float b0 = e->b0;
 	float b1 = e->b1;
+	float a1 = e->a1;
 	float z = e->z;
+	float inv_b0 = 1.0f / b0;
 
 	for (int i = 0; i < num; i++) {
-		float in = (float)samples[i];
-		/* Inverse filter: b becomes a, a becomes b */
-		float out = (in - z * (-a1)) / b0;
-		z = in - out * b1;
+		float in = (float)samples[i]; /* This is y[n] from pre-emp view */
+		
+		/* Recover original signal x[n] */
+		float out = (in - z) * inv_b0;
+		
+		/* Update state exactly as pre-emphasis would have */
+		z = out * b1 + in * (-a1);
+		
 		samples[i] = out;
 	}
 
