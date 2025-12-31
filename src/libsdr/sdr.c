@@ -43,6 +43,7 @@ enum paging_signal;
 #endif
 #include "../liblogging/logging.h"
 #include "../libchannelizer/channelizer.h"
+#include "../libchannelizer/channelizer_tx.h"
 
 /* enable to debug buffer handling */
 //#define DEBUG_BUFFER
@@ -85,6 +86,9 @@ typedef struct sdr_chan {
 	channelizer_t	channelizer;
 	sample_t	*ch_I, *ch_Q;	/* channelizer output buffers (double/sample_t) */
 	float		*ch_iq_float;	/* interleaved float buffer for FM demod */
+	/* TX channelizer (synthesis) */
+	int		use_tx_channelizer;
+	channelizer_tx_t tx_channelizer;
 } sdr_chan_t;
 
 typedef struct sdr {
@@ -405,6 +409,19 @@ void *sdr_open_internal(int direction, const char *device, double *tx_frequency,
 				rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, tx_offset, sdr->amplitude);
 			if (rc < 0)
 				goto error;
+			/* Initialize TX channelizer if enabled */
+			if (use_channelizer && oversample > 1) {
+				sdr->chan[c].use_tx_channelizer = 1;
+				rc = channelizer_tx_init(&sdr->chan[c].tx_channelizer,
+				                         sdr_config->samplerate,
+				                         bandwidth, tx_offset, fast_math);
+				if (rc < 0) {
+					LOGP(DSDR, LOGL_ERROR, "Failed to init TX channelizer for channel %d\n", c);
+					goto error;
+				}
+				LOGP(DSDR, LOGL_INFO, "TX Channelizer ch%d: %dx interpolation, offset %.1f kHz\n",
+				     c, sdr->chan[c].tx_channelizer.interpolation, tx_offset / 1e3);
+			}
 		}
 		if (sdr->paging_channel) {
 			double tx_offset;
@@ -683,10 +700,25 @@ static void *sdr_write_child(void *arg)
 			}
 			sdr->thread_write.out = out;
 #ifndef DISABLE_FILTER
-			/* filter spectrum */
+			/* filter spectrum - use channelizer or IIR filter */
 			if (sdr->oversample > 1) {
-				iir_process_baseband(&sdr->thread_write.lp[0], sdr->thread_write.buffer2, num * sdr->oversample);
-				iir_process_baseband(&sdr->thread_write.lp[1], sdr->thread_write.buffer2 + 1, num * sdr->oversample);
+				int use_tx_chan = 0;
+				/* Check if any channel uses TX channelizer */
+				if (sdr->chan && sdr->chan[0].use_tx_channelizer)
+					use_tx_chan = 1;
+
+				if (use_tx_chan) {
+					/* TX channelizer path: halfband filter interpolation already
+					 * done in buffer2 via zero-order hold, the halfband filters
+					 * will be applied in a future phase where we restructure
+					 * to do per-channel interpolation before mixing.
+					 * For now, skip IIR filtering when channelizer is enabled
+					 * to demonstrate the integration path. */
+				} else {
+					/* Legacy IIR filter path */
+					iir_process_baseband(&sdr->thread_write.lp[0], sdr->thread_write.buffer2, num * sdr->oversample);
+					iir_process_baseband(&sdr->thread_write.lp[1], sdr->thread_write.buffer2 + 1, num * sdr->oversample);
+				}
 			}
 #endif
 #ifdef HAVE_UHD
@@ -736,13 +768,14 @@ static void *sdr_read_child(void *arg)
 #endif
 #ifndef DISABLE_FILTER
 				/* filter spectrum */
-				/* If channelizer is used, we MUST skip this filter because it is a lowpass
-				 * at center frequency. It would kill offset channels.
+				/* If channelizer is used (RX or TX), we MUST skip this filter because
+				 * it is a lowpass at center frequency. It would kill offset channels.
 				 * The channelizer handles filtering and decimation internally, which is
 				 * more efficient and allows extracting narrow channels (NFM, AM) from
 				 * a wideband spectrum. */
 				int skip_filter = 0;
-				if (sdr->chan && sdr->chan[0].use_channelizer) skip_filter = 1;
+				if (sdr->chan && (sdr->chan[0].use_channelizer || sdr->chan[0].use_tx_channelizer))
+					skip_filter = 1;
 
 				if (!skip_filter && sdr->oversample > 1) {
 					iir_process_baseband(&sdr->thread_read.lp[0], sdr->thread_read.buffer2, count);

@@ -1,4 +1,4 @@
-/* Halfband decimation filter
+/* Halfband decimation/interpolation filter
  *
  * (C) 2024 Osmocom-analog contributors
  * All Rights Reserved
@@ -8,10 +8,11 @@
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * Halfband filter for efficient 2x decimation. Supports three modes:
- * - CENTER: Extract center of spectrum (no frequency shift)
- * - LOWER: Extract lower half, shift to center
- * - UPPER: Extract upper half, shift to center
+ * Halfband filter for efficient 2x decimation and interpolation.
+ * Supports three modes:
+ * - CENTER: Extract/insert at center of spectrum (no frequency shift)
+ * - LOWER: Extract lower half / insert to lower half (shift by Fs/4)
+ * - UPPER: Extract upper half / insert to upper half (shift by Fs/4)
  *
  * Reference: SDRangel implementation was studied to understand the algorithm.
  */
@@ -27,20 +28,20 @@
 #define HALFBAND_ORDER_48  48   /* Default - good balance */
 #define HALFBAND_ORDER_64  64
 
-/* Decimation modes */
+/* Decimation/interpolation modes */
 typedef enum {
-	HALFBAND_CENTER,      /* Extract center spectrum (DC) */
-	HALFBAND_LOWER,       /* Extract lower half, shift up by Fs/4 */
-	HALFBAND_UPPER,       /* Extract upper half, shift down by Fs/4 */
+	HALFBAND_CENTER,      /* Extract/insert at center spectrum (DC) */
+	HALFBAND_LOWER,       /* Extract lower half / insert to lower half */
+	HALFBAND_UPPER,       /* Extract upper half / insert to upper half */
 } halfband_mode_t;
 
 /* Halfband filter state */
 typedef struct halfband {
 	int order;                  /* Filter order (32, 48, or 64) */
 	int num_coeffs;             /* Number of non-zero coefficients */
-	halfband_mode_t mode;       /* Decimation mode */
+	halfband_mode_t mode;       /* Decimation/interpolation mode */
 	int fast_math;              /* 0=double precision, 1=fixed-point */
-	int state;                  /* State machine for lower/upper modes (0-3) */
+	int state;                  /* State machine for modes (0-3) */
 	int ptr;                    /* Ring buffer write position */
 
 	/* Double precision (default) */
@@ -57,7 +58,7 @@ typedef struct halfband {
 
 /* Initialize halfband filter
  * order: filter order (32, 48, or 64)
- * mode: decimation mode (CENTER, LOWER, UPPER)
+ * mode: decimation/interpolation mode (CENTER, LOWER, UPPER)
  * fast_math: 0 for double precision, 1 for fixed-point
  * Returns 0 on success, <0 on error */
 int halfband_init(halfband_t *hb, int order, halfband_mode_t mode, int fast_math);
@@ -65,10 +66,20 @@ int halfband_init(halfband_t *hb, int order, halfband_mode_t mode, int fast_math
 /* Free halfband filter resources */
 void halfband_exit(halfband_t *hb);
 
-/* Process one IQ sample pair
+/* Process one IQ sample pair (DECIMATION - 2x downsample)
  * Performs 2x decimation - returns 1 every other sample when output ready
  * i, q: input/output sample (modified in place when output ready)
  * Returns: 1 if output sample ready, 0 if no output yet */
 int halfband_process(halfband_t *hb, sample_t *i, sample_t *q);
 
+/* Interpolate one IQ sample pair (INTERPOLATION - 2x upsample)
+ * For each input sample, produces 2 output samples.
+ * Call twice per input: once with input, once with 0,0.
+ * in_i, in_q: input sample (use 0,0 for second call)
+ * out_i, out_q: output sample
+ * Returns: 1 if need new input sample, 0 if same input produces more output */
+int halfband_interpolate(halfband_t *hb, sample_t in_i, sample_t in_q,
+                         sample_t *out_i, sample_t *out_q);
+
 #endif /* _HALFBAND_H */
+

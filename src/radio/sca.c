@@ -81,7 +81,14 @@ static void sca_modulate_channel(sca_channel_t *ch, sample_t *audio,
 		double instantaneous_phase = ch->phase + 2.0 * M_PI * freq_offset;
 		
 		/* Generate subcarrier */
-		double subcarrier = sin(instantaneous_phase);
+		double subcarrier;
+		if (fm_fast_math_enabled()) {
+			double sc_sin, sc_cos;
+			fm_fast_sincos(instantaneous_phase * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+			subcarrier = sc_sin;
+		} else {
+			subcarrier = sin(instantaneous_phase);
+		}
 		
 		/* Add to baseband with injection level */
 		baseband[i] += subcarrier * ch->injection;

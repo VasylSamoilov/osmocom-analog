@@ -161,3 +161,131 @@ void dc_filter(emphasis_t *state, sample_t *samples, int num)
 	iir_process(&state->d.hp, samples, num);
 }
 
+/*
+ * ==========================================================================
+ * Optimized 1st-order IIR emphasis filter for FM broadcast
+ * Based on SDRangel's FMPreemphasis implementation (GPLv3)
+ * Uses bilinear transform for accurate frequency mapping
+ * ==========================================================================
+ */
+
+void init_emphasis_fast(emphasis_fast_t *e, int samplerate, double tau, double high_freq)
+{
+	/* Based on SDRangel/gnuradio implementation */
+	
+	/* Limit high freq to 92.5% of Nyquist to avoid instability */
+	double fh = high_freq;
+	if (fh > 0.925 * samplerate / 2.0)
+		fh = 0.925 * samplerate / 2.0;
+
+	/* Digital corner frequencies */
+	double w_cl = 1.0 / tau;                   /* Low corner (emphasis start) */
+	double w_ch = 2.0 * M_PI * fh;             /* High corner (emphasis stop) */
+
+	/* Prewarped analog corner frequencies (bilinear transform) */
+	double w_cla = 2.0 * samplerate * tan(w_cl / (2.0 * samplerate));
+	double w_cha = 2.0 * samplerate * tan(w_ch / (2.0 * samplerate));
+
+	/* Digital pole, zero, and gain from bilinear transform of
+	 * H(s) = (s + w_cla) / (s + w_cha) */
+	double kl = -w_cla / (2.0 * samplerate);
+	double kh = -w_cha / (2.0 * samplerate);
+	double z1 = (1.0 + kl) / (1.0 - kl);       /* Zero location */
+	double p1 = (1.0 + kh) / (1.0 - kh);       /* Pole location */
+	double b0 = (1.0 - kl) / (1.0 - kh);       /* Gain */
+
+	/* Normalize for 0 dB at DC */
+	double g = fabs(1.0 - p1) / (b0 * fabs(1.0 - z1));
+
+	/* Store coefficients */
+	e->b0 = (float)(g * b0);
+	e->b1 = (float)(g * b0 * -z1);
+	e->a1 = (float)(-p1);
+	e->z = 0.0f;
+}
+
+void pre_emphasis_fast(emphasis_fast_t *e, sample_t *samples, int num)
+{
+	float b0 = e->b0;
+	float b1 = e->b1;
+	float a1 = e->a1;
+	float z = e->z;
+
+	for (int i = 0; i < num; i++) {
+		float in = (float)samples[i];
+		/* Direct Form II Transposed */
+		float out = in * b0 + z;
+		z = in * b1 + out * (-a1);
+		samples[i] = out;
+	}
+
+	e->z = z;
+}
+
+void de_emphasis_fast(emphasis_fast_t *e, sample_t *samples, int num)
+{
+	/* De-emphasis is just the inverse filter: swap numerator/denominator
+	 * For now, use same coefficients but with inverted signs conceptually.
+	 * Actually, de-emphasis H(z) = (1 - p1*z^-1) / (b0 * (1 - z1*z^-1))
+	 * Simplified: just apply IIR with swapped a/b */
+	float a1 = e->a1;
+	float b0 = e->b0;
+	float b1 = e->b1;
+	float z = e->z;
+
+	for (int i = 0; i < num; i++) {
+		float in = (float)samples[i];
+		/* Inverse filter: b becomes a, a becomes b */
+		float out = (in - z * (-a1)) / b0;
+		z = in - out * b1;
+		samples[i] = out;
+	}
+
+	e->z = z;
+}
+
+/*
+ * ==========================================================================
+ * Simple 1st-order highpass DC blocking filter
+ * Uses classic DC blocker formula: y[n] = x[n] - x[n-1] + alpha * y[n-1]
+ * ==========================================================================
+ */
+
+void init_dc_filter_fast(dc_filter_fast_t *f, int samplerate, double cutoff_hz)
+{
+	/* Calculate alpha for 1st-order highpass:
+	 * alpha = (1 - sin(2*pi*fc/fs)) / cos(2*pi*fc/fs)
+	 * Approximation for low frequencies: alpha ≈ 1 - 2*pi*fc/fs
+	 * We use a simpler formula: alpha = 1 - (cutoff / samplerate * 2 * pi) */
+	double w = 2.0 * M_PI * cutoff_hz / samplerate;
+	f->alpha = (float)(1.0 - w);
+	
+	/* Clamp alpha to valid range */
+	if (f->alpha < 0.9f) f->alpha = 0.9f;
+	if (f->alpha > 0.9999f) f->alpha = 0.9999f;
+	
+	f->prev_in = 0.0f;
+	f->prev_out = 0.0f;
+}
+
+void dc_filter_fast(dc_filter_fast_t *f, sample_t *samples, int num)
+{
+	float alpha = f->alpha;
+	float prev_in = f->prev_in;
+	float prev_out = f->prev_out;
+
+	/* Classic DC blocker: y[n] = x[n] - x[n-1] + alpha * y[n-1]
+	 * This is a 1st-order highpass with very low cutoff frequency.
+	 * At DC (0 Hz): output = 0
+	 * At high frequencies: output ≈ input */
+	for (int i = 0; i < num; i++) {
+		float in = (float)samples[i];
+		float out = in - prev_in + alpha * prev_out;
+		prev_in = in;
+		prev_out = out;
+		samples[i] = out;
+	}
+
+	f->prev_in = prev_in;
+	f->prev_out = prev_out;
+}

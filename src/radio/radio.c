@@ -156,10 +156,10 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xE4,	/* Ukraine with PI prefix 6 */
 		.lang     = 73,		/* Ukrainian (LIC code from IEC 62106 Annex J) */
-		RDS_A(90.0, 95.0, 100.0),
+		// RDS_A(90.0, 95.0, 100.0),
 		/* LF/MF AFs (code 250 prefix) - AM simulcast frequencies */
 		RDS_LF(225),
-		RDS_MF(1008),
+		//RDS_MF(1008),
 		/* Group 1A PIN - Legacy "VCR-like" recording feature (1984-1990s)
 		 * Example: "Evening News" listed in newspaper as starting 18:00 on 15th.
 		 * User enters PIN (day=15, 18:00) into receiver; when station transmits
@@ -873,14 +873,15 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	case MODULATION_FM:
 		if (time_constant_us > 0.0) {
 			radio->emphasis = 1;
-			/* time constant */
+			/* time constant - convert from µs to seconds */
+			double tau = time_constant_us / 1e6;
 			LOGP(DRADIO, LOGL_INFO, "Using emphasis cut-off at %.0f Hz.\n", timeconstant2cutoff(time_constant_us));
-			rc = init_emphasis(&radio->fm_emphasis[0], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
-			if (rc < 0)
-				goto error;
-			rc = init_emphasis(&radio->fm_emphasis[1], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
-			if (rc < 0)
-				goto error;
+			/* Initialize optimized 1st-order emphasis filters (TX/RX) */
+			init_emphasis_fast(&radio->fm_emphasis[0], radio->signal_samplerate, tau, radio->audio_bandwidth);
+			init_emphasis_fast(&radio->fm_emphasis[1], radio->signal_samplerate, tau, radio->audio_bandwidth);
+			/* Initialize RX DC blocking filter (30 Hz cutoff - low enough to preserve bass) */
+			init_dc_filter_fast(&radio->rx_dc_filter[0], radio->signal_samplerate, DC_CUTOFF);
+			init_dc_filter_fast(&radio->rx_dc_filter[1], radio->signal_samplerate, DC_CUTOFF);
 		}
 		rc = fm_mod_init(&radio->fm_mod, radio->signal_samplerate, 0.0, 1.0);
 		if (rc < 0)
@@ -1436,14 +1437,12 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	switch (radio->modulation) {
 	case MODULATION_FM:
 		if (radio->emphasis)
-			pre_emphasis(&radio->fm_emphasis[0], signal_samples[0], signal_num);
+			pre_emphasis_fast(&radio->fm_emphasis[0], signal_samples[0], signal_num);
 
-
-		
 		clipper_process(signal_samples[0], signal_num);
 		if (radio->stereo) {
 			if (radio->emphasis)
-				pre_emphasis(&radio->fm_emphasis[1], signal_samples[1], signal_num);
+				pre_emphasis_fast(&radio->fm_emphasis[1], signal_samples[1], signal_num);
 			clipper_process(signal_samples[1], signal_num);
 		}
 		
@@ -1456,10 +1455,19 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			for (i = 0; i < signal_num; i++) {
 				/* Add pilot tone only if Stereo */
 				if (radio->stereo) {
-					/* Add pilot (19 kHz) */
-					signal_samples[0][i] += sin(phase) * 0.1;
-					/* Add stereo diff (mixed with 38 kHz) */
-					signal_samples[0][i] += signal_samples[1][i] * sin(phase * 2);
+					/* Add pilot (19 kHz) and stereo diff (38 kHz) */
+					if (fm_fast_math_enabled()) {
+						double sc_sin, sc_cos;
+						/* 19 kHz pilot */
+						fm_fast_sincos(phase * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+						signal_samples[0][i] += sc_sin * 0.1;
+						/* 38 kHz stereo subcarrier (2x pilot) */
+						fm_fast_sincos(phase * 2.0 * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+						signal_samples[0][i] += signal_samples[1][i] * sc_sin;
+					} else {
+						signal_samples[0][i] += sin(phase) * 0.1;
+						signal_samples[0][i] += signal_samples[1][i] * sin(phase * 2);
+					}
 				}
 				
 				phase += phasestep;
@@ -1594,7 +1602,13 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			for (i = 0; i < signal_num; i++) {
 				/* 38 kHz carrier = 2x pilot phase, minus compensation offset */
 				double carrier_38k = (p - phase_offset) * 2.0;
-				samples[1][i] = samples[0][i] * sin(carrier_38k) * 2.0;
+				if (fm_fast_math_enabled()) {
+					double sc_sin, sc_cos;
+					fm_fast_sincos(carrier_38k * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+					samples[1][i] = samples[0][i] * sc_sin * 2.0;
+				} else {
+					samples[1][i] = samples[0][i] * sin(carrier_38k) * 2.0;
+				}
 				
 				p += radio->pilot_phasestep;
 				if (p >= 2.0 * M_PI)
@@ -1663,11 +1677,14 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			iir_process(&radio->rx_lp_diff, samples[1], signal_num);
 		}
 		if (radio->emphasis) {
-			dc_filter(&radio->fm_emphasis[0], samples[0], signal_num);
-			de_emphasis(&radio->fm_emphasis[0], samples[0], signal_num);
+			/* RX path: DC filter → de-emphasis
+			 * DC blocking removes any DC offset from FM demodulator output.
+			 * De-emphasis restores flat frequency response. */
+			dc_filter_fast(&radio->rx_dc_filter[0], samples[0], signal_num);
+			de_emphasis_fast(&radio->fm_emphasis[0], samples[0], signal_num);
 			if (radio->stereo) {
-				dc_filter(&radio->fm_emphasis[1], samples[1], signal_num);
-				de_emphasis(&radio->fm_emphasis[1], samples[1], signal_num);
+				dc_filter_fast(&radio->rx_dc_filter[1], samples[1], signal_num);
+				de_emphasis_fast(&radio->fm_emphasis[1], samples[1], signal_num);
 			}
 		}
 		break;

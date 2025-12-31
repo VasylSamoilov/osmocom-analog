@@ -4,4 +4,6 @@ noinst_LIBRARIES = libchannelizer.a
 
 libchannelizer_a_SOURCES = \
 	halfband.c \
-	channelizer.c
+	channelizer.c \
+	channelizer_tx.c
+

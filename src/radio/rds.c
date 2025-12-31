@@ -335,7 +335,7 @@ static rds_af_entry_t *rds_af_get_entry(rds_decoder_t *rds, rds_af_table_t *tabl
 
 static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2, b3;
 	int seg = rds->ps_segment;
 	
@@ -346,7 +346,7 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 		rds->di_artificial_head,
 		rds->di_stereo
 	};
-	uint8_t di = di_flags[seg] ? 1 : 0;
+	uint8_t di = di_flags[seg & 3] ? 1 : 0;
 	
 	/* Block A: PI code */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
@@ -423,7 +423,7 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 			/* Advance segment */
 			rds->af_segment++;
 			/* Reset segment after all pairs sent */
-			if (rds->af_segment > (e->count / 2) + 1) rds->af_segment = 0;
+			if (rds->af_segment >= (e->count / 2) + 1) rds->af_segment = 0;
 			
 		} else if (e->type == RDS_AF_TYPE_LF_MF) {
 			/* LF/MF: Stream of [250, code] */
@@ -1290,7 +1290,13 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 	
 	/* Initialize differential encoder */
 	rds->last_diff_bit = 0;
-	memset(rds->bit_history, 0, sizeof(rds->bit_history));
+	/* Initialize bit history to valid bipolar values (not zeros!) to ensure
+	 * proper pulse shaping from the first bit. Zeros cause malformed symbols
+	 * at startup because the RRC filter convolves with these invalid values.
+	 * Values must be +1 or -1 to match the bipolar NRZ encoding used later. */
+	rds->bit_history[0] = 1;  /* Matches last_diff_bit=0 -> +1 */
+	rds->bit_history[1] = 1;
+	rds->bit_history[2] = 1;
 	
 	/* Initialize PTYN with default or override */
 	memset(rds->ptyn, ' ', 8);
@@ -1403,7 +1409,14 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 		double rds_phase = phase * 3.0;
 		
 		/* Modulate */
-		double subcarrier = sample_val * sin(rds_phase);
+		double subcarrier;
+		if (fm_fast_math_enabled()) {
+			double sc_sin, sc_cos;
+			fm_fast_sincos(rds_phase * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+			subcarrier = sample_val * sc_sin;
+		} else {
+			subcarrier = sample_val * sin(rds_phase);
+		}
 		double injection = subcarrier * RDS_INJECTION * -2.0; /* Scale factor; polarity is arbitrary per IEC 62106 DBPSK */
 		/* Note: waveform values are small (~0.5 max), so we need gain to reach 5% injection */
 		

@@ -418,34 +418,46 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
+	/* Set default bandwidth based on modulation type (must be before channelizer rate calc) */
+	if (bandwidth == 0) {
+		if (modulation == MODULATION_FM)
+			bandwidth = bandwidth_fm;
+		else
+			bandwidth = bandwidth_am;
+	}
+
 	/* Auto-calculate optimal input rate if channelizer is used */
 	if (use_channelizer && channelizer_rate == 0) {
 		double req_bw = 0;
-		if (bandwidth > 0) req_bw = bandwidth;
-		else {
-			double audio_bw = 15000.0;
+		
+		/* Calculate required bandwidth based on modulation type:
+		 * FM: Carson's rule = 2 * (deviation + max_audio_freq)
+		 * AM: 2 * audio_bandwidth (DSB) or 1 * audio_bandwidth (SSB)
+		 */
+		if (modulation == MODULATION_FM) {
+			double audio_bw = bandwidth;
+			/* FM broadcast with stereo/RDS needs more bandwidth */
 			if (rds || rds2) audio_bw = 60000.0;
 			else if (stereo) audio_bw = 53000.0;
 			req_bw = 2.0 * (deviation + audio_bw);
+		} else if (modulation == MODULATION_AM_DSB) {
+			/* AM DSB: both sidebands */
+			req_bw = 2.0 * bandwidth;
+		} else {
+			/* AM SSB (USB/LSB): single sideband */
+			req_bw = bandwidth;
 		}
 
 		if (sdr_config) {
 			input_samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, req_bw);
-			printf("Channelizer: Auto-selected input rate %d Hz (from SDR %d Hz)\n", 
-			       input_samplerate, sdr_config->samplerate);
+			printf("Channelizer: Auto-selected input rate %d Hz for %.1f kHz bandwidth (from SDR %d Hz)\n", 
+			       input_samplerate, req_bw / 1000.0, sdr_config->samplerate);
 		}
 	}
 
 	if (modulation == MODULATION_NONE) {
 		fprintf(stderr, "Please select modulation, use '-h' for help!\n");
 		exit(0);
-	}
-
-	if (bandwidth == 0) {
-		if (modulation == MODULATION_FM)
-			bandwidth = bandwidth_fm;
-		else
-			bandwidth = bandwidth_am;
 	}
 
 	if (stereo && modulation != MODULATION_FM) {

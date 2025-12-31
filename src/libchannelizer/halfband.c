@@ -328,3 +328,134 @@ int halfband_process(halfband_t *hb, sample_t *i, sample_t *q)
 		return 0;
 	}
 }
+
+/*
+ * ==================== INTERPOLATION (2x upsample) ====================
+ *
+ * Interpolation is the reverse of decimation:
+ * - For each input sample, produce 2 output samples
+ * - Insert zeros between samples, then filter
+ * - Optimized: only compute FIR for non-zero taps
+ */
+
+/*
+ * Interpolate CENTER mode (no frequency shift)
+ * Returns 1 when need new input, 0 when same input produces more output
+ */
+static int interpolate_center(halfband_t *hb, sample_t in_i, sample_t in_q,
+                              sample_t *out_i, sample_t *out_q)
+{
+	if (hb->state == 0) {
+		/* First output: FIR result */
+		if (hb->fast_math) {
+			hb->buf_i_f[hb->ptr] = (int32_t)(in_i * 4096.0);
+			hb->buf_q_f[hb->ptr] = (int32_t)(in_q * 4096.0);
+			int32_t o_i, o_q;
+			do_fir_fixed(hb, &o_i, &o_q);
+			*out_i = (sample_t)o_i / 4096.0 * 2.0;  /* 2x gain for interpolation */
+			*out_q = (sample_t)o_q / 4096.0 * 2.0;
+		} else {
+			hb->buf_i_d[hb->ptr] = in_i;
+			hb->buf_q_d[hb->ptr] = in_q;
+			double o_i, o_q;
+			do_fir_double(hb, &o_i, &o_q);
+			*out_i = o_i * 2.0;  /* 2x gain for interpolation */
+			*out_q = o_q * 2.0;
+		}
+		hb->state = 1;
+		return 0;  /* Need same input for second output */
+	} else {
+		/* Second output: center tap only (input sample passthrough) */
+		*out_i = in_i;
+		*out_q = in_q;
+		hb->ptr = (hb->ptr + 1) % hb->order;
+		hb->state = 0;
+		return 1;  /* Need new input */
+	}
+}
+
+/*
+ * Interpolate LOWER mode (shift to lower half of spectrum)
+ * Applies Fs/4 frequency shift after interpolation
+ */
+static int interpolate_lower(halfband_t *hb, sample_t in_i, sample_t in_q,
+                             sample_t *out_i, sample_t *out_q)
+{
+	sample_t ti, tq;
+	int need_new = interpolate_center(hb, in_i, in_q, &ti, &tq);
+	
+	/* Rotate by +Fs/4 (multiply by e^(j*pi/2*n)) - opposite of decimate */
+	int phase = (hb->ptr * 2 + (hb->state ? 0 : 1)) & 3;
+	switch (phase) {
+	case 0:  /* ×1 */
+		*out_i = ti;
+		*out_q = tq;
+		break;
+	case 1:  /* ×(j) = swap and negate Q */
+		*out_i = -tq;
+		*out_q = ti;
+		break;
+	case 2:  /* ×(-1) */
+		*out_i = -ti;
+		*out_q = -tq;
+		break;
+	case 3:  /* ×(-j) = swap and negate I */
+		*out_i = tq;
+		*out_q = -ti;
+		break;
+	}
+	
+	return need_new;
+}
+
+/*
+ * Interpolate UPPER mode (shift to upper half of spectrum)
+ * Applies -Fs/4 frequency shift after interpolation
+ */
+static int interpolate_upper(halfband_t *hb, sample_t in_i, sample_t in_q,
+                             sample_t *out_i, sample_t *out_q)
+{
+	sample_t ti, tq;
+	int need_new = interpolate_center(hb, in_i, in_q, &ti, &tq);
+	
+	/* Rotate by -Fs/4 (multiply by e^(-j*pi/2*n)) - opposite of decimate */
+	int phase = (hb->ptr * 2 + (hb->state ? 0 : 1)) & 3;
+	switch (phase) {
+	case 0:  /* ×1 */
+		*out_i = ti;
+		*out_q = tq;
+		break;
+	case 1:  /* ×(-j) = swap and negate I */
+		*out_i = tq;
+		*out_q = -ti;
+		break;
+	case 2:  /* ×(-1) */
+		*out_i = -ti;
+		*out_q = -tq;
+		break;
+	case 3:  /* ×(j) = swap and negate Q */
+		*out_i = -tq;
+		*out_q = ti;
+		break;
+	}
+	
+	return need_new;
+}
+
+/* Interpolate one IQ sample pair (2x upsample) */
+int halfband_interpolate(halfband_t *hb, sample_t in_i, sample_t in_q,
+                         sample_t *out_i, sample_t *out_q)
+{
+	switch (hb->mode) {
+	case HALFBAND_CENTER:
+		return interpolate_center(hb, in_i, in_q, out_i, out_q);
+	case HALFBAND_LOWER:
+		return interpolate_lower(hb, in_i, in_q, out_i, out_q);
+	case HALFBAND_UPPER:
+		return interpolate_upper(hb, in_i, in_q, out_i, out_q);
+	default:
+		*out_i = in_i;
+		*out_q = in_q;
+		return 1;
+	}
+}
