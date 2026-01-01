@@ -407,7 +407,7 @@ int rds_frame_init(void)
 
 	/* Verify group table is properly terminated and ordered */
 	for (i = 0; rds_group_table[i].name != NULL; i++) {
-		if (rds_group_table[i].type != i) {
+		if ((int)rds_group_table[i].type != i) {
 			LOGP(DFRAME, LOGL_ERROR, 
 			     "RDS group table mismatch at index %d: expected type %d, got %d\n",
 			     i, i, rds_group_table[i].type);

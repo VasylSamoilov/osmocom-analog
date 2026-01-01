@@ -151,12 +151,53 @@ const char *rds_get_oda_name(uint16_t aid);
 const char *rds_get_rtplus_content_type(uint8_t type);
 
 /* ============================================================
- * RDS Character Map
- * IEC 62106 Annex E - RDS character set
+ * RDS Character Map (IEC 62106 Annex E)
+ * ============================================================
+ * RDS uses an 8-bit character encoding based on ISO 8859-1/15
+ * with RDS-specific modifications for accented characters.
+ *
+ * ASCII (0x20-0x7F) is a subset - these map directly.
+ * Extended characters (0x80-0xFF) are RDS-specific.
  * ============================================================ */
 
-/* Get UTF-8 string for RDS character code (0-255) */
+/* Get UTF-8 string for RDS character code (0-255)
+ * For display purposes - control chars return their UTF-8 equivalents */
 const char *rds_get_char(uint8_t code);
+
+/* Get display-safe UTF-8 string for RDS character code
+ * Control characters (0x00-0x1F except 0x0A, 0x0D) are shown as "<XX>"
+ * CR (0x0D) is shown as "<0D>" (RT terminator)
+ * LF (0x0A) is shown as "<LF>" (preferred line break)
+ * Returns pointer to static buffer (not thread-safe) */
+const char *rds_char_to_display(uint8_t code);
+
+/* Convert RDS text buffer to display-safe UTF-8 string
+ * Handles control characters as <XX> format
+ * @param rds_text: RDS 8-bit character buffer
+ * @param len: Length of buffer (max 64 for RT, 8 for PS)
+ * @param out: Output buffer for UTF-8 string
+ * @param out_size: Size of output buffer (should be 4*len for safety)
+ * @return: Number of characters written */
+int rds_text_to_display(const uint8_t *rds_text, int len, char *out, int out_size);
+
+/* Convert UTF-8 string to RDS 8-bit encoding
+ * - ASCII characters map directly
+ * - LF (0x0A) is preserved as preferred line break
+ * - CR (0x0D) terminates the message
+ * - Other control characters are ignored
+ * - Non-encodable Unicode chars are replaced with space and warned once
+ *
+ * @param utf8: Input UTF-8 string
+ * @param rds_out: Output RDS 8-bit buffer
+ * @param max_len: Maximum output length (64 for RT, 8 for PS)
+ * @param warn_unencodable: If non-NULL, set to 1 if any chars couldn't be encoded
+ * @return: Actual output length (excluding any padding) */
+int rds_encode_text(const char *utf8, uint8_t *rds_out, int max_len, int *warn_unencodable);
+
+/* Validate UTF-8 string for RDS encoding
+ * Logs warning for any characters that cannot be encoded
+ * @return: Number of non-encodable characters found */
+int rds_validate_text(const char *utf8, const char *field_name);
 
 /* ============================================================
  * Linkage Information Codes (LIC)

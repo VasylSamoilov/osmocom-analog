@@ -15,9 +15,11 @@
 
 #include "rds_tables.h"
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 #include <strings.h>
+#include "../liblogging/logging.h"
 
 /* ============================================================
  * Programme Type (PTY) Names - RDS (European)
@@ -1177,6 +1179,348 @@ const char *rds_get_char(uint8_t code)
 {
 	return rds_charmap[code];
 }
+
+/* ============================================================
+ * RDS Character Display Functions
+ * ============================================================ */
+
+const char *rds_char_to_display(uint8_t code)
+{
+	static char hex_buf[8];
+	
+	/* Control characters shown as Unicode control pictures or <XX> */
+	if (code < 0x20) {
+		if (code == 0x0A) {
+			return "\xE2\x90\x8A";  /* U+240A ␊ Line Feed symbol */
+		} else if (code == 0x0D) {
+			return "\xE2\x90\x8D";  /* U+240D ␍ Carriage Return symbol */
+		} else {
+			snprintf(hex_buf, sizeof(hex_buf), "<%02X>", code);
+			return hex_buf;
+		}
+	}
+	
+	/* DEL character (0x7F) */
+	if (code == 0x7F) {
+		return "<7F>";
+	}
+	
+	/* Normal printable character - return UTF-8 equivalent */
+	return rds_charmap[code];
+}
+
+int rds_text_to_display(const uint8_t *rds_text, int len, char *out, int out_size)
+{
+	int written = 0;
+	int i;
+	
+	if (!rds_text || !out || out_size < 1) return 0;
+	
+	for (i = 0; i < len && written < out_size - 1; i++) {
+		uint8_t code = rds_text[i];
+		const char *disp = rds_char_to_display(code);
+		int disp_len = strlen(disp);
+		
+		if (written + disp_len >= out_size) break;
+		
+		strcpy(out + written, disp);
+		written += disp_len;
+		
+		/* Stop at CR terminator (but still display it) */
+		if (code == 0x0D) break;
+	}
+	
+	out[written] = '\0';
+	return written;
+}
+
+/* ============================================================
+ * Reverse Character Map: UTF-8 Code Point -> RDS Code
+ * ============================================================ */
+
+/* Structure for reverse lookup */
+typedef struct {
+	uint32_t codepoint;  /* Unicode code point */
+	uint8_t rds_code;    /* RDS 8-bit code */
+} unicode_to_rds_t;
+
+/* Sorted by codepoint for binary search */
+static const unicode_to_rds_t unicode_to_rds_map[] = {
+	/* ASCII printable (0x20-0x7E) map 1:1 - not in table */
+	/* Extended characters from Annex E */
+	{0x00A1, 0x8E},  /* ¡ */
+	{0x00A3, 0xAA},  /* £ */
+	{0x00A4, 0x24},  /* ¤ (currency sign at 0x24, replaces $) */
+	{0x00A7, 0xBF},  /* § */
+	{0x00A9, 0xA2},  /* © */
+	{0x00AA, 0xA0},  /* ª */
+	{0x00AF, 0x7E},  /* ¯ (macron) */
+	{0x00B0, 0xBB},  /* ° */
+	{0x00B1, 0xB4},  /* ± */
+	{0x00B2, 0xB2},  /* ² */
+	{0x00B3, 0xB3},  /* ³ */
+	{0x00B5, 0xB8},  /* µ */
+	{0x00B9, 0xB1},  /* ¹ */
+	{0x00BA, 0xB0},  /* º */
+	{0x00BC, 0xBC},  /* ¼ */
+	{0x00BD, 0xBD},  /* ½ */
+	{0x00BE, 0xBE},  /* ¾ */
+	{0x00BF, 0xB9},  /* ¿ */
+	{0x00C0, 0xC1},  /* À */
+	{0x00C1, 0xC0},  /* Á */
+	{0x00C2, 0xD0},  /* Â */
+	{0x00C3, 0xE0},  /* Ã */
+	{0x00C4, 0xD1},  /* Ä */
+	{0x00C5, 0xE1},  /* Å */
+	{0x00C6, 0xE2},  /* Æ */
+	{0x00C7, 0x8B},  /* Ç */
+	{0x00C8, 0xC3},  /* È */
+	{0x00C9, 0xC2},  /* É */
+	{0x00CA, 0xD2},  /* Ê */
+	{0x00CB, 0xD3},  /* Ë */
+	{0x00CC, 0xC5},  /* Ì */
+	{0x00CD, 0xC4},  /* Í */
+	{0x00CE, 0xD4},  /* Î */
+	{0x00CF, 0xD5},  /* Ï */
+	{0x00D0, 0xCE},  /* Ð */
+	{0x00D1, 0x8A},  /* Ñ */
+	{0x00D2, 0xC7},  /* Ò */
+	{0x00D3, 0xC6},  /* Ó */
+	{0x00D4, 0xD6},  /* Ô */
+	{0x00D5, 0xE6},  /* Õ */
+	{0x00D6, 0xD7},  /* Ö */
+	{0x00D7, 0xBA},  /* × (division symbol) */
+	{0x00D8, 0xE7},  /* Ø */
+	{0x00D9, 0xC9},  /* Ù */
+	{0x00DA, 0xC8},  /* Ú */
+	{0x00DB, 0xD8},  /* Û */
+	{0x00DC, 0xD9},  /* Ü */
+	{0x00DD, 0xE5},  /* Ý */
+	{0x00DE, 0xE8},  /* Þ */
+	{0x00DF, 0x8D},  /* ß */
+	{0x00E0, 0x81},  /* à */
+	{0x00E1, 0x80},  /* á */
+	{0x00E2, 0x90},  /* â */
+	{0x00E3, 0xF0},  /* ã */
+	{0x00E4, 0x91},  /* ä */
+	{0x00E5, 0xF1},  /* å */
+	{0x00E6, 0xF2},  /* æ */
+	{0x00E7, 0x9B},  /* ç */
+	{0x00E8, 0x83},  /* è */
+	{0x00E9, 0x82},  /* é */
+	{0x00EA, 0x92},  /* ê */
+	{0x00EB, 0x93},  /* ë */
+	{0x00EC, 0x85},  /* ì */
+	{0x00ED, 0x84},  /* í */
+	{0x00EE, 0x94},  /* î */
+	{0x00EF, 0x95},  /* ï */
+	{0x00F0, 0xEF},  /* ð */
+	{0x00F1, 0x9A},  /* ñ */
+	{0x00F2, 0x87},  /* ò */
+	{0x00F3, 0x86},  /* ó */
+	{0x00F4, 0x96},  /* ô */
+	{0x00F5, 0xF6},  /* õ */
+	{0x00F6, 0x97},  /* ö */
+	{0x00F7, 0xBA},  /* ÷ */
+	{0x00F8, 0xF7},  /* ø */
+	{0x00F9, 0x89},  /* ù */
+	{0x00FA, 0x88},  /* ú */
+	{0x00FB, 0x98},  /* û */
+	{0x00FC, 0x99},  /* ü */
+	{0x00FD, 0xF5},  /* ý */
+	{0x00FE, 0xF8},  /* þ */
+	{0x0132, 0x8F},  /* Ĳ (Dutch ligature) */
+	{0x0133, 0x9F},  /* ĳ */
+	{0x0141, 0xCF},  /* Ł */
+	{0x0142, 0xDF},  /* ł */
+	{0x0152, 0xE3},  /* Œ */
+	{0x0153, 0xF3},  /* œ */
+	{0x0158, 0xCA},  /* Ř */
+	{0x0159, 0xDA},  /* ř */
+	{0x015A, 0xEC},  /* Ś */
+	{0x015B, 0xFC},  /* ś */
+	{0x015E, 0x8C},  /* Ş */
+	{0x015F, 0x9C},  /* ş */
+	{0x0160, 0xCC},  /* Š */
+	{0x0161, 0xDC},  /* š */
+	{0x0166, 0xEE},  /* Ŧ */
+	{0x0167, 0xFE},  /* ŧ */
+	{0x017D, 0xCD},  /* Ž */
+	{0x017E, 0xDD},  /* ž */
+	{0x010C, 0xCB},  /* Č */
+	{0x010D, 0xDB},  /* č */
+	{0x0110, 0xCE},  /* Đ */
+	{0x0111, 0xDE},  /* đ */
+	{0x011A, 0xA5},  /* Ě */
+	{0x011B, 0xA5},  /* ě */
+	{0x0130, 0xB5},  /* İ (Turkish I with dot) */
+	{0x0131, 0x9E},  /* ı (Turkish dotless i) */
+	{0x013F, 0x3F},  /* Ŀ */
+	{0x0140, 0x60},  /* ŀ */
+	{0x0147, 0xA6},  /* Ň */
+	{0x0148, 0xA6},  /* ň */
+	{0x0150, 0xA7},  /* Ő */
+	{0x0151, 0xA7},  /* ő */
+	{0x0154, 0xEA},  /* Ŕ */
+	{0x0155, 0xFA},  /* ŕ */
+	{0x0164, 0xB6},  /* Ť */
+	{0x0165, 0xB6},  /* ť */
+	{0x0170, 0xB7},  /* Ű */
+	{0x0171, 0xB7},  /* ű */
+	{0x0176, 0xE4},  /* Ŷ */
+	{0x0177, 0xF4},  /* ŷ */
+	{0x0179, 0xED},  /* Ź */
+	{0x017A, 0xFD},  /* ź */
+	{0x0186, 0xEB},  /* Ɔ */
+	{0x0187, 0xFB},  /* Ƈ */
+	{0x018A, 0xE9},  /* Ɗ */
+	{0x019A, 0x9E},  /* ƚ */
+	{0x01A4, 0x9D},  /* Ƥ */
+	{0x01B5, 0xA4},  /* Ƶ */
+	{0x03B1, 0xA1},  /* α (Greek alpha) */
+	{0x03C0, 0xA8},  /* π (Greek pi) */
+	{0x2015, 0x5E},  /* ― (horizontal bar) */
+	{0x2030, 0xA3},  /* ‰ (per mille) */
+	{0x20AC, 0xA9},  /* € (Euro) */
+	{0x2190, 0xAC},  /* ← */
+	{0x2191, 0xAD},  /* ↑ */
+	{0x2192, 0xAE},  /* → */
+	{0x2193, 0xAF},  /* ↓ */
+	{0x2551, 0x60},  /* ║ (box drawing) */
+};
+
+#define UNICODE_TO_RDS_COUNT (sizeof(unicode_to_rds_map) / sizeof(unicode_to_rds_map[0]))
+
+/* Decode UTF-8 sequence, return codepoint and advance pointer */
+static uint32_t utf8_decode(const char **p)
+{
+	const uint8_t *s = (const uint8_t *)*p;
+	uint32_t cp;
+	
+	if ((s[0] & 0x80) == 0) {
+		cp = s[0];
+		*p += 1;
+	} else if ((s[0] & 0xE0) == 0xC0) {
+		cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+		*p += 2;
+	} else if ((s[0] & 0xF0) == 0xE0) {
+		cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+		*p += 3;
+	} else if ((s[0] & 0xF8) == 0xF0) {
+		cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | 
+		     ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+		*p += 4;
+	} else {
+		cp = '?';
+		*p += 1;
+	}
+	return cp;
+}
+
+/* Binary search for codepoint in reverse map */
+static int find_rds_code(uint32_t codepoint, uint8_t *rds_code)
+{
+	/* ASCII printable maps directly */
+	if (codepoint >= 0x20 && codepoint <= 0x7E) {
+		*rds_code = (uint8_t)codepoint;
+		return 1;
+	}
+	
+	/* LF and CR are special */
+	if (codepoint == 0x0A || codepoint == 0x0D) {
+		*rds_code = (uint8_t)codepoint;
+		return 1;
+	}
+	
+	/* Binary search in extended map */
+	int lo = 0, hi = UNICODE_TO_RDS_COUNT - 1;
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+		if (unicode_to_rds_map[mid].codepoint == codepoint) {
+			*rds_code = unicode_to_rds_map[mid].rds_code;
+			return 1;
+		} else if (unicode_to_rds_map[mid].codepoint < codepoint) {
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	
+	return 0; /* Not found */
+}
+
+int rds_encode_text(const char *utf8, uint8_t *rds_out, int max_len, int *warn_unencodable)
+{
+	int out_len = 0;
+	const char *p = utf8;
+	int warned = 0;
+	
+	if (!utf8 || !rds_out || max_len < 1) return 0;
+	
+	while (*p && out_len < max_len) {
+		uint32_t cp = utf8_decode(&p);
+		uint8_t rds_code;
+		
+		/* Skip control characters except LF and CR */
+		if (cp < 0x20 && cp != 0x0A && cp != 0x0D) {
+			continue;
+		}
+		
+		/* CR terminates the message */
+		if (cp == 0x0D) {
+			if (out_len < max_len) {
+				rds_out[out_len++] = 0x0D;
+			}
+			break;
+		}
+		
+		if (find_rds_code(cp, &rds_code)) {
+			rds_out[out_len++] = rds_code;
+		} else {
+			/* Non-encodable - replace with '?' (standard convention) */
+			rds_out[out_len++] = '?';
+			warned = 1;
+		}
+	}
+	
+	if (warn_unencodable) {
+		*warn_unencodable = warned;
+	}
+	
+	return out_len;
+}
+
+int rds_validate_text(const char *utf8, const char *field_name)
+{
+	const char *p = utf8;
+	int bad_count = 0;
+	
+	if (!utf8) return 0;
+	
+	while (*p) {
+		uint32_t cp = utf8_decode(&p);
+		uint8_t rds_code;
+		
+		/* Skip control characters - they're filtered */
+		if (cp < 0x20 && cp != 0x0A && cp != 0x0D) {
+			continue;
+		}
+		
+		if (!find_rds_code(cp, &rds_code)) {
+			bad_count++;
+		}
+	}
+	
+	if (bad_count > 0) {
+		LOGP(DRADIO, LOGL_NOTICE, 
+		     "RDS %s: %d character(s) cannot be encoded in RDS charset, replaced with '?'\n",
+		     field_name ? field_name : "text", bad_count);
+	}
+	
+	return bad_count;
+}
+
+
 /* ============================================================
  * RBDS Call Sign Decoding (North America)
  * NRSC-4-B (2011), Annex D.7

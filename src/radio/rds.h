@@ -65,33 +65,9 @@
 
 #define COMMA() ,
 
+/* AF frequency code conversion for preset usage */
 #define RDS_AF_MHZ(mhz)  ( (uint8_t)( ((mhz) - 87.5) * 10.0 + 0.5 ) )
-#define RDS_STRUCT_KHZ(khz) { .freq_khz = (khz) }
 
-/* --- Advanced Preset Macros --- */
-
-/* Method A: RDS_A(90.1, 102.3, ...) */
-#define RDS_A(...) \
-    .af = { MAP(COMMA, RDS_AF_MHZ, __VA_ARGS__) }, \
-    .af_count = PP_NARG(__VA_ARGS__)
-
-/* LF: RDS_LF(153, 279, ...) */
-#define RDS_LF(...) \
-    .af_lf = { MAP(COMMA, RDS_STRUCT_KHZ, __VA_ARGS__) }, \
-    .af_lf_count = PP_NARG(__VA_ARGS__)
-
-/* MF: RDS_MF(531, 1602, ...) */
-#define RDS_MF(...) \
-    .af_mf = { MAP(COMMA, RDS_STRUCT_KHZ, __VA_ARGS__) }, \
-    .af_mf_count = PP_NARG(__VA_ARGS__)
-
-/* Method B: RDS_B(tx_mhz, af1_mhz, af2_mhz, ...) */
-#define RDS_B(tx_mhz, ...) \
-    { \
-        .tx = RDS_AF_MHZ(tx_mhz), \
-        .count = PP_NARG(__VA_ARGS__), \
-        .list = { MAP(COMMA, RDS_AF_MHZ, __VA_ARGS__) } \
-    }
 
 /* ============================================================
  * RDS CONSTANTS - IEC 62106 / NRSC-4-B Specification
@@ -138,8 +114,8 @@
 #define RDS_INJECTION_OPTIMAL   (2.0 / 75.0)    /* +/-2.0 kHz = 2.7% (IEC recommended) */
 #define RDS_INJECTION_NRSC      (5.0 / 75.0)    /* +/-5.0 kHz = 6.7% (NRSC-G300 practice) */
 
-/* Default injection level (5% = +/-3.75 kHz) */
-#define RDS_INJECTION           0.05
+/* Default injection level - use NRSC commercial level for better decode reliability */
+#define RDS_INJECTION           RDS_INJECTION_NRSC  /* 6.7% = +/-5.0 kHz */
 
 /* Pilot injection (ITU-R BS.450-4 S2.2.2.4) */
 #define RDS_PILOT_INJECTION_MIN 0.08            /* 8% */
@@ -318,62 +294,142 @@
  *           max 10 sub-lists; new replaces matching tuning_freq or oldest
  */
 #define RDS_AF_MAX_METHOD_A     25      /* Method A: max 25 AFs */
-#define RDS_AF_MAX_PAIRS        12      /* Method B: max 12 pairs per sub-list */
-#define RDS_AF_MAX_SUBLISTS     10      /* Method B: max 10 sub-lists */
-#define RDS_AF_LF_MF_MAX        25      /* LF/MF: Method A style (overwrites) */
 
 /* ============================================================
- * UNIFIED AF STORAGE (Method A, B, and LF/MF)
+ * AF METHOD A - Dedicated Structures (IEC 62106 S3.2.1.6.3)
+ * ============================================================
+ * Method A transmits a simple list of up to 25 AFs.
+ * LF/MF frequencies count as 2 slots each (250 + code pair).
  * ============================================================ */
 
+/* AF frequency type identifier */
 typedef enum {
-    RDS_AF_TYPE_METHOD_A = 0,
-    RDS_AF_TYPE_METHOD_B,
-    RDS_AF_TYPE_LF_MF
-} rds_af_type_t;
+	RDS_AF_FREQ_VHF = 0,	/* VHF FM 87.6-107.9 MHz */
+	RDS_AF_FREQ_LF,		/* LF 153-279 kHz */
+	RDS_AF_FREQ_MF		/* MF 531-1602 kHz (RDS) or 540-1700 kHz (RBDS) */
+} rds_af_freq_type_t;
+
+/* AF Method A Encoder List - Human-readable input format */
+typedef struct {
+	uint8_t  slot_count;		/* Total slots used (LF/MF = 2 each) */
+	uint8_t  vhf_count;		/* Number of VHF frequencies */
+	uint8_t  lf_mf_count;		/* Number of LF/MF frequencies */
+	uint16_t vhf_freq[25];		/* VHF frequencies in 0.1 MHz (e.g., 910 = 91.0 MHz) */
+	uint16_t lf_mf_freq[12];	/* LF/MF frequencies in kHz (e.g., 225, 1008) */
+	uint8_t  lf_mf_type[12];	/* rds_af_freq_type_t: RDS_AF_FREQ_LF or RDS_AF_FREQ_MF */
+} rds_af_method_a_t;
+
+/* AF Method A Decoder List - Rebuilt from RDS stream */
+typedef struct {
+	uint16_t pi;			/* PI this list was received for (for change detection) */
+	uint8_t  expected_count;	/* Count from code 224-249 (1-25 slots) */
+	uint8_t  received_count;	/* Actually received so far */
+	uint16_t freq[25];		/* Decoded frequencies (0.1 MHz VHF or kHz LF/MF) */
+	uint8_t  type[25];		/* rds_af_freq_type_t per frequency */
+	uint8_t  status[25];		/* Block decode status: RDS_STATUS_* per slot */
+	uint8_t  complete;		/* 1 when all expected freqs received */
+	uint8_t  lf_mf_follows;		/* State: 1 if previous code was 250 (marker) */
+	
+	/* Last successfully decoded complete list (all good/corrected status) */
+	uint16_t last_good_pi;		/* PI when last good was received */
+	uint16_t last_good_tuning;	/* Tuning frequency when received (0 for now) */
+	uint8_t  last_good_count;	/* Number of freqs in last_good */
+	uint16_t last_good_freq[25];	/* Frequencies from last good decode */
+	uint8_t  last_good_type[25];	/* Types from last good decode */
+	time_t   last_good_time;	/* Timestamp of last good decode */
+} rds_af_method_a_dec_t;
+
+/* AF Method A Helper Functions */
+int rds_af_method_a_parse(const char *input, rds_af_method_a_t *out);
+int rds_af_method_a_build_codes(const rds_af_method_a_t *af, uint8_t *codes, int max_codes);
+
+/* ============================================================
+ * AF METHOD B - Paired Frequency Lists (IEC 62106 S3.2.1.6.4)
+ * ============================================================
+ * Method B is used when:
+ *   - Number of AFs exceeds 25
+ *   - Frequencies belong to different regions/programmes
+ *
+ * Each list: [count+tuning_freq header] + up to 12 [tuning, AF] pairs
+ *
+ * PAIR ORDERING (F1 | F2):
+ *   F1 < F2 (ascending)  = Same programme on both frequencies
+ *   F1 > F2 (descending) = Regional variant / different programme
+ *
+ * Tuning frequency can appear in EITHER position of the pair.
+ * The AF is the frequency that is NOT the tuning frequency.
+ *
+ * Example (tuning = 89.3 MHz):
+ *   89.3 | 99.5  → F1<F2, same programme, AF=99.5
+ *   88.8 | 89.3  → F1<F2, same programme, AF=88.8
+ *   102.6| 89.3  → F1>F2, regional, AF=102.6
+ *   89.3 | 89.0  → F1>F2, regional, AF=89.0
+ * ============================================================ */
+
+#define RDS_AF_METHOD_B_MAX_LISTS   8   /* Max separate Method B lists per preset */
+#define RDS_AF_METHOD_B_MAX_AFS    12   /* Max AFs per list (excl tuning freq) */
+#define RDS_AF_METHOD_B_HISTORY_MAX 10  /* Max history entries for decoder */
+
+/* AF Method B Encoder List - Human-readable input format
+ * Format: "T89.3, 99.5, 88.8, R102.6, R89.0"
+ *   T prefix = tuning frequency (required first element)
+ *   R prefix = regional variant (will use descending order)
+ *   No prefix = same programme (will use ascending order) */
+typedef struct {
+	uint16_t tuning_freq;                       /* Tuning frequency in 0.1 MHz */
+	uint8_t  af_count;                          /* Number of AFs (max 12) */
+	uint16_t af_freq[RDS_AF_METHOD_B_MAX_AFS];  /* AF frequencies in 0.1 MHz */
+	uint8_t  af_is_regional[RDS_AF_METHOD_B_MAX_AFS]; /* 1=regional, 0=same programme */
+} rds_af_method_b_list_t;
 
 typedef struct {
-    uint16_t freq;          /* Frequency in 100 Hz (e.g. 875..1080) for FM, or kHz for AM */
-    uint8_t  flags;         /* Bitmask: 0x01=Regional, 0x02=LF, 0x04=MF */
-    uint8_t  priority;      /* rds_af_priority_t (for Method B safeguards) */
-    uint32_t entry_time;    /* Timestamp for LRU replacement of items */
-} rds_af_item_t;
+	uint8_t list_count;                          /* Number of lists */
+	rds_af_method_b_list_t lists[RDS_AF_METHOD_B_MAX_LISTS];
+} rds_af_method_b_t;
 
-#define RDS_AF_MAX_ITEMS 25
-
+/* AF Method B Decoder - Single history entry */
 typedef struct {
-    uint16_t pi;            /* Programme Identification */
-    rds_af_type_t type;     /* Method A, B, or LF/MF */
-    uint16_t tx_freq;       /* Transmitter Frequency (Method B only), 0 otherwise */
-    uint8_t  count;         /* Number of items in list */
-    uint32_t last_update;   /* Timestamp for LRU replacement of entries */
-    rds_af_item_t list[RDS_AF_MAX_ITEMS]; /* The list of frequencies */
-} rds_af_entry_t;
+	uint16_t pi;                                /* PI this list was received for */
+	uint16_t tuning_freq;                       /* Tuning frequency in 0.1 MHz */
+	uint8_t  expected_count;                    /* Expected freq count from code */
+	uint8_t  received_count;                    /* Actually received */
+	uint16_t af_freq[RDS_AF_METHOD_B_MAX_AFS];  /* AF frequencies */
+	uint8_t  af_is_regional[RDS_AF_METHOD_B_MAX_AFS]; /* Regional flags */
+	uint8_t  af_status[RDS_AF_METHOD_B_MAX_AFS];/* Decode status per AF */
+	time_t   timestamp;                         /* Unix timestamp when received */
+	uint8_t  complete;                          /* 1 when all expected freqs received */
+} rds_af_method_b_history_t;
 
-#define RDS_AF_TABLE_SIZE 16
-
+/* AF Method B Decoder State */
 typedef struct {
-    uint8_t count;
-    rds_af_entry_t entries[RDS_AF_TABLE_SIZE];
-} rds_af_table_t;
+	/* Current list being assembled */
+	uint16_t pi;                                /* PI tracking */
+	uint16_t tuning_freq;                       /* Current tuning frequency */
+	uint8_t  expected_count;                    /* From count code */
+	uint8_t  received_count;                    /* Pairs received so far */
+	uint16_t af_freq[RDS_AF_METHOD_B_MAX_AFS];
+	uint8_t  af_is_regional[RDS_AF_METHOD_B_MAX_AFS];
+	uint8_t  af_status[RDS_AF_METHOD_B_MAX_AFS];
+	
+	/* History of complete lists (newest first) */
+	rds_af_method_b_history_t history[RDS_AF_METHOD_B_HISTORY_MAX];
+	uint8_t  history_count;                     /* Valid entries in history */
+} rds_af_method_b_dec_t;
 
-/* Method B AF priority for replacement decisions */
-typedef enum {
-	RDS_AF_PRIORITY_SAME = 0,	/* Same content (ascending order) - highest priority */
-	RDS_AF_PRIORITY_REGIONAL,	/* Regional variant (descending order) */
-	RDS_AF_PRIORITY_INVALID		/* Invalid freq order - lowest priority, replace first */
-} rds_af_priority_t;
-
-/* Method B sub-list structure - tracks per-tuning-frequency alternatives */
+/* AF Collector - buffers codes before method determination */
 typedef struct {
-	uint16_t	tx_freq;		/* Transmitter (tuning) frequency (0.1 MHz, 0=unused) */
-	uint16_t	alt_freq[RDS_AF_MAX_PAIRS]; /* Alternative frequencies */
-	uint8_t		is_regional[RDS_AF_MAX_PAIRS]; /* 1=regional variant */
-	uint8_t		priority[RDS_AF_MAX_PAIRS];    /* rds_af_priority_t per entry */
-	uint32_t	entry_time[RDS_AF_MAX_PAIRS];  /* Per-entry timestamp for LRU */
-	uint8_t		count;			/* Number of valid alt frequencies */
-	uint32_t	last_update;		/* Timestamp for LRU replacement */
-} rds_af_sublist_t;
+	uint16_t pi;                     /* PI tracking for invalidation */
+	uint8_t  expected_count;         /* From count code (1-25) */
+	uint8_t  received_pairs;         /* AF code pairs received */
+	uint8_t  codes[52];              /* Raw AF codes as received */
+	uint8_t  status[52];             /* Per-code decode status */
+	uint16_t tuning_freq;            /* Second byte of header (potential Method B tuning) */
+	uint8_t  header_received;        /* 1 if count+second byte received */
+} rds_af_collector_t;
+
+/* AF Method B Helper Functions */
+int rds_af_method_b_parse(const char *input, rds_af_method_b_list_t *out);
+int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *codes, int max_codes);
 
 /* ============================================================
  * Pulse Shaping Filter (IEC 62106 S2.3, Figure 3)
@@ -904,6 +960,8 @@ typedef struct rds_encoder {
 	uint8_t		tp;		/* Traffic Program flag */
 	uint8_t		ta;		/* Traffic Announcement flag */
 	uint8_t		ms;		/* Music/Speech flag (1=Music, 0=Speech) */
+	int		debug;		/* Debug logging (--rds-debug) */
+	int		verbose;	/* Verbose logging (--rds-verbose) */
 	
 	/* Decoder Identification (DI) flags - transmitted via Group 0A/0B */
 	uint8_t		di_stereo;		/* d3: Stereo (1) or Mono (0) */
@@ -911,13 +969,22 @@ typedef struct rds_encoder {
 	uint8_t		di_compressed;		/* d1: Compressed audio */
 	uint8_t		di_dynamic_pty;		/* d0: Dynamic PTY indicator */
 	
-	/* Group 0A: Alternative Frequencies (Unified Storage) */
-	rds_af_table_t	af_table;	/* Storage for Method A, B, and LF/MF */
-	int		af_segment;	/* Current segment index (0..N) */
-	int		af_list_index;	/* Current Method B list index */
+	/* Group 0A: Alternative Frequencies - Method A only
+	 * Uses human-readable frequency string format (IEC 62106 S3.2.1.6.3) */
+	rds_af_method_a_t af_method_a;		/* Method A frequency list */
+	int		af_method_a_segment;	/* Current segment (pair index) for cycling */
 	
-	/* Encoder Configuration */
-	rds_af_type_t	af_type_cfg;	/* Configured AF type to transmit */
+	/* Group 0A: Alternative Frequencies - Method B
+	 * Uses paired frequency format (IEC 62106 S3.2.1.6.4) */
+	rds_af_method_b_t af_method_b;		/* Method B frequency lists */
+	int		af_method_b_list_idx;	/* Current list being transmitted */
+	int		af_method_b_pair_idx;	/* Current pair within list (0=header) */
+	uint8_t		use_method_b;		/* 1 if using Method B instead of A */
+	
+	/* Group 0A/0B: Pre-computed AF code buffer for transmission
+	 * Built from af_method_a or af_method_b at preset load time */
+	uint8_t		af_codes[52];		/* AF code sequence (max 25 slots + filler) */
+	int		af_code_count;		/* Number of codes in af_codes[] */
 	
 	/* Group version selection */
 	uint8_t		use_0b;		/* Use Group 0B (PI repeat) instead of 0A (AF) */
@@ -928,6 +995,7 @@ typedef struct rds_encoder {
 	char		ps[9];		/* Program Service name (8 chars + NUL) */
 	char		rt[65];		/* RadioText (64 chars + NUL) */
 	uint8_t		rt_ab;		/* RadioText A/B flag */
+	uint8_t		rt_last_version;	/* Last RT version: 0=2A, 1=2B, 0xFF=none */
 	
 	/* Extended Configuration (Phase 2) */
 	uint8_t		ecc;		/* Extended Country Code */
@@ -962,6 +1030,7 @@ typedef struct rds_encoder {
 	int		group_count;	/* (legacy) for group rotation */
 	uint64_t	group_sequence;	/* Total groups generated */
 	time_t		last_ct_minute;	/* Timestamp of last CT injection */
+	int		warmup_countdown;	/* Groups remaining in warmup mode (0 = done) */
 	int		slc_variant;	/* Group 1A: current SLC variant index */
 	
 	/* Group 14A/14B: Enhanced Other Networks (EON) TX Configuration */
@@ -970,6 +1039,14 @@ typedef struct rds_encoder {
 	int		eon_tx_index;		/* Current ON being transmitted */
 	int		eon_tx_variant;		/* Current variant within ON */
 	int		eon_enabled;		/* Enable EON transmission */
+	
+	/* Fixed Group Sequence Scheduler */
+	#define RDS_SCHEDULER_MAX_LEN 64
+	enum rds_group_type group_sched_buffer[RDS_SCHEDULER_MAX_LEN];
+	int			group_sched_len;
+	int			group_sched_index;
+	
+
 	
 } rds_encoder_t;
 
@@ -986,6 +1063,9 @@ void rds_set_radiotext(rds_encoder_t *rds, const char *rt);
 
 /* Set Traffic Announcement flag */
 void rds_set_ta(rds_encoder_t *rds, int ta);
+
+/* Update group scheduler sequence (call after changing PTY, PTYN, or EON) */
+void rds_scheduler_update(rds_encoder_t *rds);
 
 /* Cleanup */
 void rds_encoder_exit(rds_encoder_t *rds);
@@ -1088,22 +1168,48 @@ typedef struct rds_decoder {
 	uint8_t		di_dynamic_pty;		/* d0: Dynamic PTY indicator */
 	uint8_t		di_status;		/* Status of DI decode (any flag) */
 	
-	/* Group 0A: Alternative Frequencies (Unified Storage)
-	 * Stores parsed AF lists for Method A, Method B, and LF/MF.
-	 * Lookups are by PI + Type + TX_FREQ.
-	 */
-	rds_af_table_t	af_table;
-	uint32_t	af_update_counter;	/* Monotonic counter for LRU replacement */
-	int		af_method_b;		/* Flag: Method B detected */
-
+	/* Group 0A: Alternative Frequencies - Method A only
+	 * Decoded AF list with PI tracking and per-slot decode status.
+	 * PI-change invalidates the list (IEC 62106 S3.2.1.6.3). */
+	rds_af_method_a_dec_t af_method_a_dec;
+	
+	/* Group 0A: Alternative Frequencies - Method B with history
+	 * Decoded AF pairs with regional flags and timestamp history.
+	 * PI-change invalidates the current list (IEC 62106 S3.2.1.6.4). */
+	rds_af_method_b_dec_t af_method_b_dec;
+	
+	/* AF Collector - buffers codes before method determination */
+	rds_af_collector_t af_collector;
 	
 	char		ps[9];
 	uint8_t		ps_status[8];	/* Per-char status: enum rds_decode_status */
-	char		rt[65];
-	uint8_t		rt_status[64];	/* Per-char status for RadioText */
-	uint8_t		rt_ab;
+	
+	/* Group 2A/2B: RadioText (IEC 62106 S6.1.5.3)
+	 * EN 50067: "A mixture of type 2A and type 2B groups must not be used
+	 * when transmitting any one given message." Therefore we maintain
+	 * separate buffers and A/B flags for each version.
+	 * 
+	 * rt[] is the display buffer - points to whichever version (2A/2B) 
+	 * was last received. When A/B flag changes, the corresponding buffer
+	 * is cleared and segments are reset. */
+	char		rt_2a[65];		/* 2A buffer: 64 chars + NUL */
+	uint8_t		rt_2a_status[64];	/* Per-char status for 2A */
+	uint8_t		rt_2a_ab;		/* 2A A/B flag */
+	uint16_t	rt_2a_segments;		/* 2A segment bitmask (0-15) */
+	
+	char		rt_2b[33];		/* 2B buffer: 32 chars + NUL */
+	uint8_t		rt_2b_status[32];	/* Per-char status for 2B */
+	uint8_t		rt_2b_ab;		/* 2B A/B flag */
+	uint16_t	rt_2b_segments;		/* 2B segment bitmask (0-15) */
+	
+	char		rt[65];			/* Display buffer (copy of last received) */
+	uint8_t		rt_status[64];		/* Per-char status for display */
+	uint8_t		rt_ab;			/* Display A/B flag */
+	uint8_t		rt_version;		/* 0=2A was last, 1=2B was last */
+	uint8_t		rt_display_version;	/* Version in display buffer: 0=2A, 1=2B, 0xFF=none */
+	
 	int		ps_segments;
-	int		rt_segments;
+	int		rt_segments;		/* Legacy: combined segment count */
 	int		groups_received;
 
 	

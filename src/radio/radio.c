@@ -61,27 +61,24 @@ typedef struct rds_preset {
 	uint8_t		ms;		/* Music/Speech (1=Music) */
 	uint8_t		ecc;		/* Extended Country Code */
 	uint8_t		lang;		/* Language Code */
-	uint8_t		af[3];		/* Alternative Frequencies (codes) - Method A */
-	uint8_t		af_count;	/* Number of AFs */
-	/* LF Alternative Frequencies (153-279 kHz) */
-	struct {
-		uint16_t freq_khz;
-	} af_lf[4];
-	uint8_t		af_lf_count;
-
-	/* MF Alternative Frequencies (531-1602 kHz) */
-	struct {
-		uint16_t freq_khz;
-	} af_mf[4];
-	uint8_t		af_mf_count;
 	
-	/* Method B AFs: Lists of (Transmitter, AFs...) */
-	struct {
-		uint8_t tx;		/* Transmitter Frequency (code) */
-		uint8_t count;		/* Number of AFs */
-		uint8_t list[20];	/* AF Codes */
-	} af_method_b[5];		/* Up to 5 lists */
-	uint8_t		af_method_b_count;
+	/* AF Method A - Human-readable format (IEC 62106 S3.2.1.6.3)
+	 * Format: "91.0, 102.5, LF225, MF1008"
+	 * - VHF frequencies in MHz (87.6-107.9)
+	 * - LFxxx for LF band in kHz (153-279)
+	 * - MFxxx for MF band in kHz (531-1602)
+	 * LF/MF count as 2 slots each. Max 25 total slots. */
+	const char	*af_method_a_str;
+	
+	/* AF Method B - Paired frequency lists (IEC 62106 S3.2.1.6.4)
+	 * Format: "T89.3, 99.5, 88.8, R102.6, R89.0"
+	 *   T prefix = tuning frequency (required first element)
+	 *   R prefix = regional variant (F1 > F2 descending order)
+	 *   No prefix = same programme (F1 < F2 ascending order)
+	 * Max 12 AFs per list. Multiple lists transmitted sequentially. */
+	const char	*af_method_b_str[RDS_AF_METHOD_B_MAX_LISTS];
+	uint8_t		af_method_b_count;	/* Number of Method B lists */
+	
 	const char	*callsign;	/* RBDS Call Sign (overrides/sets PI if PI=0) */
 	/* Group 1A PIN - Programme Item Number for THIS station (current PI)
 	 * HISTORICAL: Enabled "VCR-like" radio recording (1984-1990s).
@@ -131,6 +128,7 @@ typedef struct rds_preset {
 	uint8_t		group0_version;		/* 0A vs 0B */
 	uint8_t		group1_version;		/* 1A vs 1B */
 	uint8_t		group2_version;		/* 2A vs 2B */
+
 } rds_preset_t;
 
 /* RDS Presets - add more as needed
@@ -138,6 +136,10 @@ typedef struct rds_preset {
  * PS max length: 8 chars (padded with spaces)
  * PTYN max length: 8 chars */
 static const rds_preset_t rds_presets[] = {
+	/* ============================================================
+	 * Press 'f' to cycle to normal presets.
+	 * ============================================================ */
+
 	{
 		.name     = "Ukraine (RDS)",
 		/* PI Structure for Europe (IEC 62106):
@@ -156,10 +158,8 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xE4,	/* Ukraine with PI prefix 6 */
 		.lang     = 73,		/* Ukrainian (LIC code from IEC 62106 Annex J) */
-		// RDS_A(90.0, 95.0, 100.0),
-		/* LF/MF AFs (code 250 prefix) - AM simulcast frequencies */
-		RDS_LF(225),
-		//RDS_MF(1008),
+		/* AF Method A with LF frequency (AM simulcast at 225 kHz) */
+		.af_method_a_str = "LF225",
 		/* Group 1A PIN - Legacy "VCR-like" recording feature (1984-1990s)
 		 * Example: "Evening News" listed in newspaper as starting 18:00 on 15th.
 		 * User enters PIN (day=15, 18:00) into receiver; when station transmits
@@ -222,7 +222,7 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xA0,	/* USA (RBDS region) with PI prefix A */
 		.lang     = 9,		/* English */
-		RDS_A(92.5, 97.5, 102.5),
+		.af_method_a_str = "92.5, 97.5, 102.5",
 		/* Group 1A PIN - not used (0x0000 = most common value)
 		 * Many US stations don't use PIN, so we demonstrate day=0 */
 		.pin_day  = 0, .pin_hour = 0, .pin_minute = 0,
@@ -278,7 +278,7 @@ static const rds_preset_t rds_presets[] = {
 		.rt       = "Quick updates via 2B",
 		.pty      = 3,
 		.ms       = 1,
-		RDS_A(90.5, 93.5, 96.5),
+		.af_method_a_str = "90.5, 93.5, 96.5",
 		.group0_version = RDS_GROUP_VERSION_A,  /* 0A: need AF list */
 		.group2_version = RDS_GROUP_VERSION_B,  /* 2B: faster RT cycling */
 	},
@@ -306,29 +306,133 @@ static const rds_preset_t rds_presets[] = {
 	},
 	{
 		.name     = "Method B Test",
-		.pi       = 0x1234,
-		.ps       = "TEST_B",
-		.rt       = "Testing RDS AF Method B via Presets",
+		.pi       = 0xAFB1,
+		.ps       = "AFMETHB ",
+		.rt       = "Testing RDS AF Method B with regional variants",
 		.pty      = 15,
 		.ecc      = 0xE0,
 		.lang     = 9,
 		.ms       = 1,
-		/* Method B Pairs: Lists of (Tx, AFs...) */
-		/* Complex Example: 5 Lists
-		 * 1. Tx=89.3: AFs 88.1, 97.0, 99.5, 99.0
-		 * 2. Tx=89.3: AFs 101.0, 104.0 (Same Tx, extending list)
-		 * 3. Tx=92.5: AFs 92.5, 98.0 (Diff Tx)
-		 * 4. Tx=95.0: AFs 95.0, 103.0 (Diff Tx)
-		 * 5. Tx=105.5: AFs 103.6, 107.9 (Diff Tx) */
-		.af_method_b_count = 5,
-		.af_method_b = {
-			RDS_B(89.3, 88.1, 97.0, 99.5, 99.0),
-			RDS_B(89.3, 101.0, 104.0),
-			RDS_B(92.5, 92.5, 98.0),
-			RDS_B(95.0, 95.0, 103.0),
-			RDS_B(105.5, 103.6, 107.9) /* 108.0 = Code 205 (Filler) */
+		/* AF Method B: Example from IEC 62106 S3.2.1.6.4
+		 * List 1: Tuning 89.3 MHz, AFs: 99.5, 101.7, 88.8 (same), R102.6, R89.0 (regional)
+		 * List 2: Tuning 99.5 MHz, AFs: 89.3, 100.9 (same), R104.8, R89.1 (regional) */
+		.af_method_b_str = {
+			"T89.3, 99.5, 101.7, 88.8, R102.6, R89.0",
+			"T99.5, 89.3, 100.9, R104.8, R89.1",
 		},
+		.af_method_b_count = 2,
 		.group0_version = RDS_GROUP_VERSION_A,
+	},
+	/* ============================================================
+	 * EXTENDED CHARACTER DEMO - German (IEC 62106 Annex E)
+	 * ============================================================
+	 * Demonstrates: German umlauts and ß from RDS charset.
+	 * Characters: ä (0x91), ö (0x97), ü (0x99), ß (0x8D)
+	 *             Ä (0xD1), Ö (0xD7), Ü (0xD9)
+	 * ============================================================ */
+	{
+		.name     = "German Demo",
+		.pi       = 0xD314,
+		.ps       = "WÜRZBÜRG",
+		.rt       = "Größe, Müller, Schöne Grüße! Fünf Äpfel für Österreich.",
+		.pty      = 10,
+		.ptyn     = "Größe   ",	/* PTYN with ö, ß */
+		.ms       = 1,
+		.ecc      = 0xE0,	/* Germany */
+		.lang     = 8,		/* German */
+	},
+	/* ============================================================
+	 * EXTENDED CHARACTER DEMO - French (IEC 62106 Annex E)
+	 * ============================================================
+	 * Demonstrates: French accented chars from RDS charset.
+	 * Characters: à (0x81), é (0x82), è (0x83), ê (0x92), ë (0x93)
+	 *             î (0x94), ï (0x95), ô (0x96), û (0x98), ù (0x89)
+	 *             ç (0x9B), œ (0xF3)
+	 * ============================================================ */
+	{
+		.name     = "French Demo",
+		.pi       = 0xF201,
+		.ps       = "CAFÉ  FM",
+		.rt       = "Bienvenue à Noël! Très bel été, où êtes-vous? Ça va!",
+		.pty      = 14,		/* Classical */
+		.ptyn     = "Évén't  ",	/* PTYN with é */
+		.ms       = 1,
+		.ecc      = 0xE1,	/* France */
+		.lang     = 15,		/* French */
+	},
+	/* ============================================================
+	 * EXTENDED CHARACTER DEMO - Spanish + Euro (IEC 62106 Annex E)
+	 * ============================================================
+	 * Demonstrates: Spanish ñ and symbols from RDS charset.
+	 * Characters: ñ (0x9A), Ñ (0x8A), € (0xA9), ¿ (0xB9), ¡ (0x8E)
+	 * ============================================================ */
+	{
+		.name     = "Spanish Demo",
+		.pi       = 0xE502,
+		.ps       = "ESPAÑA  ",
+		.rt       = "¡Buenas Señor! ¿Cuánto? Mañana €100. ¡Niño pequeño!",
+		.pty      = 6,		/* Drama */
+		.ptyn     = "Señales ",	/* PTYN with ñ */
+		.ms       = 1,
+		.ecc      = 0xE2,	/* Spain */
+		.lang     = 14,		/* Spanish */
+	},
+	/* ============================================================
+	 * EXTENDED CHARACTER DEMO - Nordic (IEC 62106 Annex E)
+	 * ============================================================
+	 * Demonstrates: Norwegian/Danish/Swedish special characters.
+	 * Characters: Å (0xE1), Æ (0xE2), Ø (0xE7)
+	 *             å (0xF1), æ (0xF2), ø (0xF7)
+	 * ============================================================ */
+	{
+		.name     = "Nordic Demo",
+		.pi       = 0xF503,
+		.ps       = "ÅRHUS FM",
+		.rt       = "Velkommen! Ål, Æble, Øl fra København. Blåbær og Rødgrød!",
+		.pty      = 12,		/* Light classical */
+		.ptyn     = "Søndags ",	/* Sunday in Danish with ø */
+		.ms       = 1,
+		.ecc      = 0xE2,	/* Denmark/Norway */
+		.lang     = 7,		/* Danish */
+	},
+	/* ============================================================
+	 * EXTENDED CHARACTER DEMO - Greek (IEC 62106 Annex E)
+	 * ============================================================
+	 * Demonstrates: Greek letters available in RDS charset.
+	 * Note: RDS Annex E has very limited Greek: α (0xA1), π (0xA8)
+	 * Real Greek stations use Latin transliteration for RDS.
+	 * ============================================================ */
+	{
+		.name     = "Greek Demo",
+		.pi       = 0x1F01,
+		.ps       = "ATHINA  ",
+		.rt       = "Kalimera! To α kai to π einai ellinika. FM Ellada!",
+		.pty      = 11,		/* Rock music */
+		.ptyn     = "Mousiki ",	/* Music in transliterated Greek */
+		.ms       = 1,
+		.ecc      = 0xE1,	/* Greece */
+		.lang     = 18,		/* Greek */
+	},
+	/* ============================================================
+	 * AF METHOD A STRING DEMO (IEC 62106 S3.2.1.6.3)
+	 * ============================================================
+	 * Demonstrates: New human-readable AF Method A string format.
+	 * Format: "freq_mhz, freq_mhz, LFxxx, MFxxx"
+	 * LF/MF count as 2 slots each (encoded as [250, code] pairs).
+	 * ============================================================ */
+	{
+		.name     = "AF Method A Demo",
+		.pi       = 0xAF01,
+		.ps       = "AF DEMO ",
+		.rt       = "Testing AF Method A with VHF, LF, and MF frequencies!",
+		.pty      = 15,
+		.ms       = 1,
+		.ecc      = 0xE0,	/* Germany */
+		.lang     = 8,		/* German */
+		/* NEW: Human-readable AF string format
+		 * 3 VHF (91.0, 95.5, 102.3) + 1 LF (225 kHz) + 1 MF (1008 kHz)
+		 * Total slots: 3 + 2 + 2 = 7 slots */
+		.af_method_a_str = "91.0, 95.5, 102.3, LF225, MF1008",
 	},
 	/* End of presets */
 };
@@ -358,77 +462,53 @@ static char freq_name[2][64];
 static uint16_t rds_user_pi = 0;
 static char *rds_user_callsign = NULL;
 
-/* Helper to load AFs (Method A, B, LF/MF) from preset to unified encoder table */
+/* Helper to load AFs from preset - supports both Method A and Method B */
 static void load_preset_afs(rds_encoder_t *enc, const rds_preset_t *p)
 {
-	/* Update Alternative Frequencies (Unified Storage) */
-	memset(&enc->af_table, 0, sizeof(enc->af_table));
-	enc->af_list_index = -1; /* Reset Method B cycling index */
-	enc->af_type_cfg = RDS_AF_TYPE_METHOD_A; /* Default */
-
-	/* Method A (Standard FM) */
-	if (p->af_count > 0 && p->af_count <= 25) {
-		rds_af_entry_t *entry = &enc->af_table.entries[enc->af_table.count++];
-		entry->pi = enc->pi;
-		entry->type = RDS_AF_TYPE_METHOD_A;
-		entry->count = p->af_count;
-		for (int i = 0; i < p->af_count; i++) {
-			/* Convert Code to 100kHz Frequency (87.5 + code*0.1) -> 875 + code */
-			entry->list[i].freq = 875 + p->af[i];
-		}
-		enc->af_type_cfg = RDS_AF_TYPE_METHOD_A;
-	}
-
-	/* Method B (Regional/Complex) */
-	if (p->af_method_b_count > 0 && p->af_method_b_count <= 5) {
-		for (int i = 0; i < p->af_method_b_count; i++) {
-			uint8_t tx_code = p->af_method_b[i].tx;
-			uint16_t tx_freq = 875 + tx_code;
-			
-			/* Create entry for this TX */
-			if (enc->af_table.count < RDS_AF_TABLE_SIZE) {
-				rds_af_entry_t *entry = &enc->af_table.entries[enc->af_table.count++];
-				entry->pi = enc->pi;
-				entry->type = RDS_AF_TYPE_METHOD_B;
-				entry->tx_freq = tx_freq;
-				entry->count = p->af_method_b[i].count;
-				
-				for (int j = 0; j < entry->count && j < RDS_AF_MAX_ITEMS; j++) {
-					uint8_t code = p->af_method_b[i].list[j];
-					entry->list[j].freq = 875 + code;
+	/* Clear AF structures */
+	memset(&enc->af_method_a, 0, sizeof(enc->af_method_a));
+	memset(&enc->af_method_b, 0, sizeof(enc->af_method_b));
+	memset(enc->af_codes, 0, sizeof(enc->af_codes));
+	enc->af_code_count = 0;
+	enc->af_method_a_segment = 0;
+	enc->af_method_b_list_idx = 0;
+	enc->af_method_b_pair_idx = 0;
+	enc->use_method_b = 0;
+	
+	/* Check for Method B lists first (takes priority over Method A) */
+	if (p->af_method_b_count > 0 && p->af_method_b_str[0]) {
+		for (int i = 0; i < p->af_method_b_count && i < RDS_AF_METHOD_B_MAX_LISTS; i++) {
+			if (p->af_method_b_str[i] && p->af_method_b_str[i][0]) {
+				if (rds_af_method_b_parse(p->af_method_b_str[i], 
+				                          &enc->af_method_b.lists[i]) == 0) {
+					enc->af_method_b.list_count++;
+					LOGP(DRADIO, LOGL_INFO, "AF Method B[%d]: Loaded tuning=%.1f, %d AFs\n",
+					     i, enc->af_method_b.lists[i].tuning_freq / 10.0,
+					     enc->af_method_b.lists[i].af_count);
 				}
 			}
 		}
-		if (enc->af_table.count > 0) enc->af_type_cfg = RDS_AF_TYPE_METHOD_B;
+		if (enc->af_method_b.list_count > 0) {
+			enc->use_method_b = 1;
+			LOGP(DRADIO, LOGL_INFO, "AF Method B: Enabled with %d list(s)\n", 
+			     enc->af_method_b.list_count);
+			return;
+		}
 	}
-
-	/* LF/MF (AM Simulcast) */
-	int lf_count = p->af_lf_count;
-	int mf_count = p->af_mf_count;
-	int total_lf_mf = lf_count + mf_count;
-
-	if (total_lf_mf > 0) {
-		rds_af_entry_t *entry = &enc->af_table.entries[enc->af_table.count++];
-		entry->pi = enc->pi;
-		entry->type = RDS_AF_TYPE_LF_MF;
-		entry->count = 0;
-		
-		/* Add LF Frequencies */
-		for (int i = 0; i < lf_count && entry->count < RDS_AF_MAX_ITEMS; i++) {
-			entry->list[entry->count].freq = p->af_lf[i].freq_khz;
-			entry->list[entry->count].flags = 0x02; /* LF */
-			entry->count++;
-		}
-		/* Add MF Frequencies */
-		for (int i = 0; i < mf_count && entry->count < RDS_AF_MAX_ITEMS; i++) {
-			entry->list[entry->count].freq = p->af_mf[i].freq_khz;
-			entry->list[entry->count].flags = 0x04; /* MF */
-			entry->count++;
-		}
-		
-		/* If no Method A/B, fallback to LF/MF transmission */
-		if (enc->af_table.count == 1) {
-			enc->af_type_cfg = RDS_AF_TYPE_LF_MF;
+	
+	/* Parse AF Method A string (human-readable format) */
+	if (p->af_method_a_str && p->af_method_a_str[0]) {
+		if (rds_af_method_a_parse(p->af_method_a_str, &enc->af_method_a) == 0) {
+			/* Build pre-computed code sequence for transmission */
+			enc->af_code_count = rds_af_method_a_build_codes(
+				&enc->af_method_a, enc->af_codes, sizeof(enc->af_codes));
+			
+			if (enc->af_code_count > 0) {
+				LOGP(DRADIO, LOGL_INFO, "AF Method A: Loaded '%s' -> %d codes (%d VHF + %d LF/MF = %d frequencies)\n",
+				     p->af_method_a_str, enc->af_code_count,
+				     enc->af_method_a.vhf_count, enc->af_method_a.lf_mf_count, 
+				     enc->af_method_a.slot_count);
+			}
 		}
 	}
 }
@@ -455,35 +535,37 @@ static void rds_apply_preset(radio_t *radio)
 	}
 	enc->pi = pi;
 	
-	/* Update PS */
+	/* Update PS (IEC 62106 uses limited charset - convert UTF-8 to RDS) */
 	memset(enc->ps, ' ', 8);
 	enc->ps[8] = '\0';
-	if (p->ps) {
-		int len = strlen(p->ps);
-		if (len > 8) len = 8;
-		memcpy(enc->ps, p->ps, len);
+	if (p->ps && p->ps[0] != '\0') {
+		rds_validate_text(p->ps, "PS");
+		int warn = 0;
+		rds_encode_text(p->ps, (uint8_t *)enc->ps, 8, &warn);
 	}
 	
-	/* Update RadioText */
+	/* Update RadioText (IEC 62106 uses limited charset - convert UTF-8 to RDS) */
 	memset(enc->rt, ' ', 64);
 	enc->rt[64] = '\0';
-	if (p->rt) {
-		int len = strlen(p->rt);
-		if (len > 64) len = 64;
-		memcpy(enc->rt, p->rt, len);
+	if (p->rt && p->rt[0] != '\0') {
+		rds_validate_text(p->rt, "RT");
+		int warn = 0;
+		int len = rds_encode_text(p->rt, (uint8_t *)enc->rt, 64, &warn);
 		if (len < 64) enc->rt[len] = '\r';
 	}
 	enc->rt_ab = !enc->rt_ab;  /* Toggle A/B to signal text change */
 	enc->rt_segment = 0;
 	
-	/* Update PTY and PTYN */
+	/* Update PTY and PTYN (IEC 62106 S6.1.5.8)
+	 * PTYN uses same Annex E charset as RadioText - 8 chars max */
 	enc->pty = p->pty & 0x1F;
 	memset(enc->ptyn, ' ', 8);
 	enc->ptyn[8] = '\0';
-	if (p->ptyn) {
-		int len = strlen(p->ptyn);
-		if (len > 8) len = 8;
-		memcpy(enc->ptyn, p->ptyn, len);
+	if (p->ptyn && p->ptyn[0] != '\0') {
+		/* Validate and encode UTF-8 to RDS charset */
+		rds_validate_text(p->ptyn, "PTYN");
+		int warn = 0;
+		rds_encode_text(p->ptyn, (uint8_t *)enc->ptyn, 8, &warn);
 	}
 	enc->ptyn_ab = !enc->ptyn_ab;
 	
@@ -566,6 +648,9 @@ static void rds_apply_preset(radio_t *radio)
 	/* Reset PS segment to restart transmission */
 	enc->ps_segment = 0;
 	
+	/* Reset warmup mode: Group 0 only for ~5 seconds (57 groups @ 11.4/sec) */
+	enc->warmup_countdown = 57;
+	
 	/* --------------------------------------------------------
 	 * Group Version Selection (A vs B)
 	 * --------------------------------------------------------
@@ -575,7 +660,7 @@ static void rds_apply_preset(radio_t *radio)
 	
 	/* Group 0: 0A (with AF) vs 0B (PI repeat, no AF) */
 	if (p->group0_version == RDS_GROUP_VERSION_AUTO)
-		enc->use_0b = (p->af_count == 0);  /* No AF → 0B */
+		enc->use_0b = (p->af_method_a_str == NULL || p->af_method_a_str[0] == '\0');  /* No AF → 0B */
 	else
 		enc->use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
 	
@@ -593,11 +678,15 @@ static void rds_apply_preset(radio_t *radio)
 		enc->use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
 	}
 	
+	/* Debug test mode */
 	LOGP(DRADIO, LOGL_INFO, "RDS Preset: %s (PI=%04X) Groups: %s/%s/%s\n",
 	     p->name, enc->pi,
 	     enc->use_0b ? "0B" : "0A",
 	     enc->use_1b ? "1B" : "1A",
 	     enc->use_2b ? "2B" : "2A");
+	     
+	/* Rebuild group scheduler to reflect new configuration (e.g. enable/disable 10A PTYN) */
+	rds_scheduler_update(enc);
 }
 
 /* Cycle to next RDS preset */
@@ -743,13 +832,14 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* generate tone */
 		phase = 2.0 * M_PI * 1000.0 / radio->tx_audio_samplerate;
 		if (radio->stereo) {
-			for (i = 0; i < radio->testtone_length / 2; i++) {
-				radio->testtone[0][i] = sin(i * phase);
-				radio->testtone[1][i] = 0.0;
-			}
-			for (; i < radio->testtone_length; i++) {
-				radio->testtone[0][i] = 0.0;
-				radio->testtone[1][i] = sin(i * phase);
+			/* Stereo test: L=1kHz, R=400Hz for clear separation verification
+			 * This creates constant L-R content for strong 38kHz subcarrier
+			 * Unlike alternating L/R, this gives continuous stereo modulation */
+			double phase_l = 2.0 * M_PI * 1000.0 / radio->tx_audio_samplerate;
+			double phase_r = 2.0 * M_PI * 400.0 / radio->tx_audio_samplerate;
+			for (i = 0; i < radio->testtone_length; i++) {
+				radio->testtone[0][i] = sin(i * phase_l);  /* Left: 1 kHz */
+				radio->testtone[1][i] = sin(i * phase_r);  /* Right: 400 Hz */
 			}
 		} else {
 			for (i = 0; i < radio->testtone_length; i++) {
@@ -937,6 +1027,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 				pi, p->ps, p->rt, p->pty, p->ptyn);
 			
 			/* Apply preset configuration to encoder */
+			radio->rds_enc.debug = rds_debug;
+			radio->rds_enc.verbose = rds_verbose;
 			radio->rds_enc.tp = p->tp;
 			radio->rds_enc.ta = rds_ta;
 			radio->rds_enc.ms = p->ms;
@@ -1020,7 +1112,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			
 			/* Group 0: 0A (with AF) vs 0B (PI repeat, no AF) */
 			if (p->group0_version == RDS_GROUP_VERSION_AUTO)
-				radio->rds_enc.use_0b = (p->af_count == 0);
+				radio->rds_enc.use_0b = (p->af_method_a_str == NULL || p->af_method_a_str[0] == '\0');
 			else
 				radio->rds_enc.use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
 			
@@ -1038,6 +1130,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 				radio->rds_enc.use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
 			}
 			
+			/* Debug test mode */
 			LOGP(DRADIO, LOGL_INFO, "RDS Preset: %s (PI=%04X) Groups: %s/%s/%s\n",
 			     p->name, radio->rds_enc.pi,
 			     radio->rds_enc.use_0b ? "0B" : "0A",

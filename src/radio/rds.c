@@ -193,121 +193,583 @@ static uint32_t rds_build_block(uint16_t data, uint16_t offset_word)
 	return rds_block_encode(data, offset_word, 0);
 }
 
-/* Unified AF Table Management
- * Find existing entry by PI+Type+TX, or allocate new one.
- * Implements 5-step priority replacement for Method B.
- * Returns pointer to entry, or NULL on error.
+
+/* ============================================================
+ * AF Method A Helper Functions (IEC 62106 S3.2.1.6.3)
+ * ============================================================ */
+
+/**
+ * Parse a human-readable AF frequency string into an rds_af_method_a_t struct.
+ *
+ * Format: "91.0, 102.5, 104.8, LF225, MF1008"
+ *   - VHF frequencies in MHz (87.6-107.9)
+ *   - LFxxx for LF band in kHz (153-279)
+ *   - MFxxx for MF band in kHz (531-1602 RDS, 540-1700 RBDS)
+ *
+ * LF/MF frequencies count as 2 slots each (transmitted as 250+code pair).
+ * Maximum 25 total slots allowed.
+ *
+ * @param input  Comma-separated frequency string
+ * @param out    Output structure (cleared on entry)
+ * @return       0 on success, -1 on error (slot count exceeded, invalid freq)
  */
-static rds_af_entry_t *rds_af_get_entry(rds_decoder_t *rds, rds_af_table_t *table, 
-                                        uint16_t pi, rds_af_type_t type, uint16_t tx_freq)
+int rds_af_method_a_parse(const char *input, rds_af_method_a_t *out)
 {
-	int i;
+	if (!input || !out)
+		return -1;
 	
-	/* Candidate indexes */
-	int idx_free = -1;
-	int idx_invalid = -1;
-	int idx_lru = -1;
+	memset(out, 0, sizeof(*out));
 	
-	/* Timestamps for finding oldest (lowest value) */
-	uint32_t t_invalid = UINT32_MAX;
-	uint32_t t_lru = UINT32_MAX;
+	char buf[256];
+	strncpy(buf, input, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
 	
-	/* Track oldest valid match for appending */
-	int target_idx = -1;
-	uint32_t oldest_match_time = UINT32_MAX;
+	char *saveptr = NULL;
+	char *token = strtok_r(buf, ", \t", &saveptr);
 	
-	/* 1. Check for Free slot */
-	if (table->count < RDS_AF_TABLE_SIZE) {
-		idx_free = table->count;
-	}
-	
-	/* Iterate to find candidates */
-	for (i = 0; i < table->count; i++) {
-		rds_af_entry_t *e = &table->entries[i];
+	while (token) {
+		/* Skip empty tokens */
+		while (*token == ' ' || *token == '\t')
+			token++;
 		
-		/* Match check: PI + Type + TX */
-		int is_match = (e->pi == pi && e->type == type && e->tx_freq == tx_freq);
+		if (*token == '\0') {
+			token = strtok_r(NULL, ", \t", &saveptr);
+			continue;
+		}
 		
-		/* Invalid check (Method B only) */
-		int has_invalid = 0;
-		if (e->type == RDS_AF_TYPE_METHOD_B) {
-			for (int j = 0; j < e->count; j++) {
-				if (e->list[j].priority == RDS_AF_PRIORITY_INVALID) {
-					has_invalid = 1;
-					break;
-				}
+		/* Check for LF/MF prefix */
+		if (strncasecmp(token, "LF", 2) == 0) {
+			/* LF frequency (153-279 kHz) */
+			int freq_khz = atoi(token + 2);
+			if (freq_khz < 153 || freq_khz > 279) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Invalid LF frequency %d kHz (valid: 153-279)\n", freq_khz);
+				return -1;
 			}
-		}
-		
-		/* Found a match - ONLY use for appending if it is VALID (or not Method B)
-		 * For Method B, if it has invalid entries, ignore here so it falls to priority selection. */
-		if (is_match && !has_invalid) {
-			if (e->last_update < oldest_match_time) {
-				oldest_match_time = e->last_update;
-				target_idx = i;
+			
+			/* LF/MF uses 2 codes, but counts as 1 frequency */
+			if (out->slot_count + 1 > 25) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Frequency limit exceeded (max 25)\n");
+				return -1;
 			}
-		}
-		
-		/* 3. Invalid (Any Method B) (Oldest) */
-		if (has_invalid) {
-			if (e->last_update < t_invalid) {
-				t_invalid = e->last_update;
-				idx_invalid = i;
+			
+			if (out->lf_mf_count >= 12) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Max 12 LF/MF frequencies\n");
+				return -1;
 			}
-		}
-		
-		/* 5. LRU (Any) (Oldest) */
-		if (e->last_update < t_lru) {
-			t_lru = e->last_update;
-			idx_lru = i;
-		}
-	}
-	
-	/* If found existing VALID match, return it (Append mode - preserve data) */
-	if (target_idx >= 0) {
-		table->entries[target_idx].last_update = rds->af_update_counter++;
-		return &table->entries[target_idx];
-	}
-	
-	/* Select candidate based on priority order */
-	int selected_idx = -1;
-	
-	if (idx_free != -1) {
-		/* 1. Free */
-		selected_idx = table->count++; /* Increment count */
-	} else {
-		/* No free slots - replacement logic */
-		if (type == RDS_AF_TYPE_METHOD_B) {
-			/* Method B Priority: Inv -> LRU */
-			if (idx_invalid != -1) selected_idx = idx_invalid;
-			else if (idx_lru != -1) selected_idx = idx_lru;
+			
+			out->lf_mf_freq[out->lf_mf_count] = freq_khz;
+			out->lf_mf_type[out->lf_mf_count] = RDS_AF_FREQ_LF;
+			out->lf_mf_count++;
+			out->slot_count++;  /* 1 frequency (uses 2 codes) */
+			
+		} else if (strncasecmp(token, "MF", 2) == 0) {
+			/* MF frequency (531-1602 kHz RDS, 540-1700 kHz RBDS) */
+			int freq_khz = atoi(token + 2);
+			if (freq_khz < 531 || freq_khz > 1700) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Invalid MF frequency %d kHz (valid: 531-1700)\n", freq_khz);
+				return -1;
+			}
+			
+			/* LF/MF uses 2 codes, but counts as 1 frequency */
+			if (out->slot_count + 1 > 25) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Frequency limit exceeded (max 25)\n");
+				return -1;
+			}
+			
+			if (out->lf_mf_count >= 12) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Max 12 LF/MF frequencies\n");
+				return -1;
+			}
+			
+			out->lf_mf_freq[out->lf_mf_count] = freq_khz;
+			out->lf_mf_type[out->lf_mf_count] = RDS_AF_FREQ_MF;
+			out->lf_mf_count++;
+			out->slot_count++;  /* 1 frequency (uses 2 codes) */
+			
 		} else {
-			/* Method A / LF/MF Simple: LRU */
-			if (idx_lru != -1) selected_idx = idx_lru;
+			/* VHF frequency (87.6-107.9 MHz) */
+			double freq_mhz = atof(token);
+			if (freq_mhz < 87.5 || freq_mhz > 108.0) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Invalid VHF frequency %.1f MHz (valid: 87.6-107.9)\n", freq_mhz);
+				return -1;
+			}
+			
+			/* VHF uses 1 slot */
+			if (out->slot_count + 1 > 25) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Slot limit exceeded (max 25)\n");
+				return -1;
+			}
+			
+			if (out->vhf_count >= 25) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Max 25 VHF frequencies\n");
+				return -1;
+			}
+			
+			out->vhf_freq[out->vhf_count] = (uint16_t)(freq_mhz * 10 + 0.5);  /* Store as 0.1 MHz */
+			out->vhf_count++;
+			out->slot_count++;
+		}
+		
+		token = strtok_r(NULL, ", \t", &saveptr);
+	}
+	
+	LOGP(DRADIO, LOGL_DEBUG, "AF Method A: Parsed %d VHF + %d LF/MF = %d slots\n",
+	     out->vhf_count, out->lf_mf_count, out->slot_count);
+	
+	return 0;
+}
+
+/**
+ * Build AF code sequence for Method A transmission.
+ * 
+ * Generates the raw 8-bit AF codes in transmission order:
+ *   [count_code, AF1, AF2, AF3, ..., AFn, (filler)]
+ * 
+ * For LF/MF: inserts [250, LF/MF_code] pair.
+ * Adds filler (205) if total codes is odd (pairs must be complete).
+ * 
+ * Example (6 VHF AFs):
+ *   Output: [230, AF1, AF2, AF3, AF4, AF5, AF6, 205]
+ *   Transmitted as: [230,AF1] [AF2,AF3] [AF4,AF5] [AF6,205]
+ * 
+ * @param af         Input AF structure
+ * @param codes      Output buffer for AF codes
+ * @param max_codes  Maximum codes buffer can hold
+ * @return           Number of codes generated, or -1 on error
+ */
+int rds_af_method_a_build_codes(const rds_af_method_a_t *af, uint8_t *codes, int max_codes)
+{
+	if (!af || !codes || max_codes < 2)
+		return -1;
+	
+	int idx = 0;
+	
+	/* First code: count (224-249) */
+	if (af->slot_count == 0)
+		return 0;  /* No AFs to transmit */
+	
+	codes[idx++] = RDS_AF_NO_AF + af->slot_count;  /* 224 + slot_count */
+	
+	/* Add VHF frequencies */
+	for (int i = 0; i < af->vhf_count && idx < max_codes; i++) {
+		/* Code = freq_0.1MHz - 875 (87.5 MHz = code 0, but 0 is reserved, so 87.6 = code 1) */
+		uint16_t freq_01mhz = af->vhf_freq[i];
+		if (freq_01mhz >= 876 && freq_01mhz <= 1079) {
+			codes[idx++] = (uint8_t)(freq_01mhz - 875);
 		}
 	}
 	
-	if (selected_idx >= 0) {
-		rds_af_entry_t *e = &table->entries[selected_idx];
+	/* Add LF/MF frequencies (each uses 2 codes: 250 + freq_code) */
+	for (int i = 0; i < af->lf_mf_count && idx + 1 < max_codes; i++) {
+		codes[idx++] = RDS_AF_LF_MF_FOLLOWS;  /* 250 */
 		
-		/* Replacement/Repair Mode: ALWAYS wipe/init */
-		int old_tx = e->tx_freq;
-		if (rds->debug && (e->pi != pi || e->type != type || e->tx_freq != tx_freq))
-			LOGP(DRADIO, LOGL_DEBUG, "RDS: Replacing AF entry %d (old_TX=%.1f, new_TX=%.1f)\n", 
-			     selected_idx, old_tx/10.0, tx_freq/10.0);
-		
-		memset(e, 0, sizeof(rds_af_entry_t));
-		e->pi = pi;
-		e->type = type;
-		e->tx_freq = tx_freq;
-		
-		/* Update timestamp */
-		e->last_update = rds->af_update_counter++;
-		return e;
+		if (af->lf_mf_type[i] == RDS_AF_FREQ_LF) {
+			/* LF: code 1-15 for 153-279 kHz (9 kHz spacing) */
+			codes[idx++] = (uint8_t)((af->lf_mf_freq[i] - 144) / 9);
+		} else {
+			/* MF: code 16-135 for 531-1602 kHz (9 kHz RDS) */
+			/* TODO: RBDS uses 10 kHz spacing from 540 kHz */
+			codes[idx++] = (uint8_t)(16 + (af->lf_mf_freq[i] - 531) / 9);
+		}
 	}
 	
-	return NULL;
+	/* Add filler if odd count (pairs must be complete for Block C) */
+	if ((idx % 2) == 1 && idx < max_codes) {
+		codes[idx++] = RDS_AF_FILLER;  /* 205 */
+	}
+	
+	return idx;
 }
+
+/* ============================================================
+ * AF METHOD B Helper Functions (IEC 62106 S3.2.1.6.4)
+ * ============================================================ */
+
+/**
+ * Parse AF Method B string into structure.
+ * 
+ * Format: "T89.3, 99.5, 88.8, R102.6, R89.0"
+ *   T prefix = tuning frequency (required, must be first)
+ *   R prefix = regional variant (transmitted with F1 > F2)
+ *   No prefix = same programme (transmitted with F1 < F2)
+ * 
+ * @return 0 on success, -1 on error
+ */
+int rds_af_method_b_parse(const char *input, rds_af_method_b_list_t *out)
+{
+	if (!input || !out)
+		return -1;
+	
+	memset(out, 0, sizeof(*out));
+	
+	char buf[256];
+	strncpy(buf, input, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+	
+	char *saveptr = NULL;
+	char *token = strtok_r(buf, ", \t", &saveptr);
+	int first = 1;
+	
+	while (token) {
+		/* Skip whitespace */
+		while (*token == ' ' || *token == '\t')
+			token++;
+		
+		if (*token == '\0') {
+			token = strtok_r(NULL, ", \t", &saveptr);
+			continue;
+		}
+		
+		int is_tuning = 0;
+		int is_regional = 0;
+		
+		/* Check for T (tuning) or R (regional) prefix */
+		if (*token == 'T' || *token == 't') {
+			is_tuning = 1;
+			token++;
+		} else if (*token == 'R' || *token == 'r') {
+			is_regional = 1;
+			token++;
+		}
+		
+		/* Parse frequency */
+		double freq_mhz = atof(token);
+		if (freq_mhz < 87.5 || freq_mhz > 108.0) {
+			LOGP(DRADIO, LOGL_ERROR, "AF Method B: Invalid frequency %.1f MHz (valid: 87.6-107.9)\n", freq_mhz);
+			return -1;
+		}
+		
+		uint16_t freq_01mhz = (uint16_t)(freq_mhz * 10 + 0.5);
+		
+		if (first) {
+			/* First element must be tuning frequency */
+			if (!is_tuning) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method B: First element must be tuning frequency (T prefix)\n");
+				return -1;
+			}
+			out->tuning_freq = freq_01mhz;
+			first = 0;
+		} else {
+			/* Subsequent elements are AFs */
+			if (out->af_count >= RDS_AF_METHOD_B_MAX_AFS) {
+				LOGP(DRADIO, LOGL_ERROR, "AF Method B: Max 12 AFs per list\n");
+				return -1;
+			}
+			out->af_freq[out->af_count] = freq_01mhz;
+			out->af_is_regional[out->af_count] = is_regional;
+			out->af_count++;
+		}
+		
+		token = strtok_r(NULL, ", \t", &saveptr);
+	}
+	
+	if (out->tuning_freq == 0) {
+		LOGP(DRADIO, LOGL_ERROR, "AF Method B: No tuning frequency specified\n");
+		return -1;
+	}
+	
+	LOGP(DRADIO, LOGL_DEBUG, "AF Method B: Parsed tuning=%.1f, %d AFs\n",
+	     out->tuning_freq / 10.0, out->af_count);
+	
+	return 0;
+}
+
+/**
+ * Build AF code sequence for Method B transmission.
+ * 
+ * Generates: [count_code, tuning_freq], then pairs [F1, F2]
+ * 
+ * Pair ordering follows specification:
+ *   Same programme: F1 < F2 (ascending)
+ *   Regional:       F1 > F2 (descending)
+ * 
+ * Tuning frequency can appear in either F1 or F2 position.
+ * 
+ * @return Number of codes generated, or -1 on error
+ */
+int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *codes, int max_codes)
+{
+	if (!list || !codes || max_codes < 4)
+		return -1;
+	
+	if (list->af_count == 0 || list->tuning_freq == 0)
+		return 0;
+	
+	int idx = 0;
+	uint8_t tuning_code = (uint8_t)(list->tuning_freq - 875);
+	
+	/* Header: [count_code, tuning_freq]
+	 * Count = 1 (tuning) + 2 × af_count (each pair has 2 frequencies)
+	 * Method B count is ALWAYS ODD (1 + even number) */
+	uint8_t count = 1 + 2 * list->af_count;
+	if (count > 25) count = 25;  /* Max per spec */
+	codes[idx++] = RDS_AF_NO_AF + count;  /* 224 + count */
+	codes[idx++] = tuning_code;
+	
+	/* AF pairs: [F1, F2] with ordering based on regional flag
+	 * Same programme: F1 < F2 (ascending order)
+	 * Regional:       F1 > F2 (descending order) */
+	for (int i = 0; i < list->af_count && idx + 1 < max_codes; i++) {
+		uint8_t af_code = (uint8_t)(list->af_freq[i] - 875);
+		
+		if (list->af_is_regional[i]) {
+			/* Regional: F1 > F2 (descending) */
+			if (tuning_code > af_code) {
+				codes[idx++] = tuning_code;
+				codes[idx++] = af_code;
+			} else {
+				codes[idx++] = af_code;
+				codes[idx++] = tuning_code;
+			}
+		} else {
+			/* Same programme: F1 < F2 (ascending) */
+			if (tuning_code < af_code) {
+				codes[idx++] = tuning_code;
+				codes[idx++] = af_code;
+			} else {
+				codes[idx++] = af_code;
+				codes[idx++] = tuning_code;
+			}
+		}
+	}
+	
+	return idx;
+}
+
+/* ============================================================
+ * AF METHOD B Decoder Helper Functions (IEC 62106 S3.2.1.6.4)
+ * ============================================================ */
+
+/**
+ * Check if a collected AF list matches Method B pattern.
+ * Method B: tuning freq appears in one position of every pair.
+ * @return 1 if Method B pattern, 0 if Method A
+ */
+static int rds_af_check_method_b_pattern(rds_af_method_a_dec_t *afd)
+{
+	if (afd->expected_count < 3)
+		return 0;  /* Too few frequencies for Method B */
+	
+	/* In Method B, the first frequency after count is the tuning freq.
+	 * All subsequent pairs must contain this tuning frequency. */
+	uint16_t tuning_freq = afd->freq[0];
+	
+	/* Check that tuning freq appears in all pairs */
+	for (int i = 1; i < afd->received_count; i++) {
+		/* For Method B, we would expect the freq to match tuning or 
+		 * be paired with tuning. But since Method A stores decoded frequencies,
+		 * we need to check the raw pattern during collection. */
+	}
+	
+	/* Since current decoder immediately interprets codes as Method A,
+	 * we can't reliably detect Method B from the decoded result.
+	 * For now, return 0 - full Method B decoder requires collector approach. */
+	return 0;
+}
+
+/**
+ * Compare two Method B history entries for equality.
+ * @return 1 if equal, 0 if different
+ */
+static int rds_af_method_b_lists_equal(rds_af_method_b_history_t *a, 
+                                        rds_af_method_b_dec_t *b)
+{
+	if (a->pi != b->pi || a->tuning_freq != b->tuning_freq)
+		return 0;
+	if (a->received_count != b->received_count)
+		return 0;
+	
+	for (int i = 0; i < a->received_count; i++) {
+		if (a->af_freq[i] != b->af_freq[i] ||
+		    a->af_is_regional[i] != b->af_is_regional[i])
+			return 0;
+	}
+	return 1;
+}
+
+/**
+ * Add current Method B list to history.
+ * If identical entry exists, move to top. Otherwise insert new.
+ */
+static void rds_af_method_b_add_to_history(rds_decoder_t *rds)
+{
+	rds_af_method_b_dec_t *dec = &rds->af_method_b_dec;
+	
+	/* Check if identical entry exists */
+	for (int i = 0; i < dec->history_count; i++) {
+		if (rds_af_method_b_lists_equal(&dec->history[i], dec)) {
+			/* Move to top */
+			rds_af_method_b_history_t tmp = dec->history[i];
+			memmove(&dec->history[1], &dec->history[0], 
+			        i * sizeof(rds_af_method_b_history_t));
+			dec->history[0] = tmp;
+			dec->history[0].timestamp = time(NULL);
+			return;
+		}
+	}
+	
+	/* Insert new entry at top, shift others down */
+	if (dec->history_count < RDS_AF_METHOD_B_HISTORY_MAX)
+		dec->history_count++;
+	memmove(&dec->history[1], &dec->history[0],
+	        (dec->history_count - 1) * sizeof(rds_af_method_b_history_t));
+	
+	/* Copy current state to history[0] */
+	dec->history[0].pi = dec->pi;
+	dec->history[0].tuning_freq = dec->tuning_freq;
+	dec->history[0].expected_count = dec->expected_count;
+	dec->history[0].received_count = dec->received_count;
+	memcpy(dec->history[0].af_freq, dec->af_freq, sizeof(dec->af_freq));
+	memcpy(dec->history[0].af_is_regional, dec->af_is_regional, 
+	       sizeof(dec->af_is_regional));
+	memcpy(dec->history[0].af_status, dec->af_status, sizeof(dec->af_status));
+	dec->history[0].timestamp = time(NULL);
+	dec->history[0].complete = 1;
+}
+
+/**
+ * Analyze completed AF collector and decode as Method A or B.
+ * Called when expected AF count has been received.
+ */
+static void rds_af_decode_complete(rds_decoder_t *rds)
+{
+	rds_af_collector_t *col = &rds->af_collector;
+	
+	/* Check if count < 3 OR count is even: immediate Method A
+	 * Method B count is always odd (1 + 2*N pairs) and >= 3 */
+	if (col->expected_count < 3 || (col->expected_count % 2) == 0) {
+		/* Decode as Method A */
+		rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
+		afd->complete = 1;
+		
+		/* Check if all received with good/corrected status - save as last_good */
+		int all_good = 1;
+		for (int i = 0; i < afd->received_count; i++) {
+			if (afd->status[i] > RDS_STATUS_CORRECTED) {
+				all_good = 0;
+				break;
+			}
+		}
+		if (all_good && afd->received_count > 0) {
+			afd->last_good_pi = rds->pi;
+			afd->last_good_tuning = 0;  /* Tuned frequency not tracked for Method A */
+			afd->last_good_count = afd->received_count;
+			memcpy(afd->last_good_freq, afd->freq, sizeof(afd->freq));
+			memcpy(afd->last_good_type, afd->type, sizeof(afd->type));
+			afd->last_good_time = time(NULL);
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF Method A complete, %d freqs saved as last good\n",
+				     afd->received_count);
+		} else if (rds->verbose) {
+			LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF list complete (Method A), %d frequencies\n",
+			     afd->received_count);
+		}
+		col->header_received = 0;
+		return;
+	}
+	
+	/* Check for all good/corrected status */
+	for (int i = 0; i < col->received_pairs * 2; i++) {
+		if (col->status[i] > RDS_STATUS_CORRECTED) {
+			/* Bad status - cannot reliably determine method */
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF list has errors, using Method A\n");
+			rds->af_method_a_dec.complete = 1;
+			col->header_received = 0;
+			return;
+		}
+	}
+	
+	/* Check Method B pattern: tuning_freq in all pairs after header */
+	uint8_t tuning_code = col->codes[1];
+	int is_method_b = 1;
+	
+	for (int i = 2; i < col->received_pairs * 2; i += 2) {
+		uint8_t f1 = col->codes[i];
+		uint8_t f2 = col->codes[i + 1];
+		
+		/* Skip filler codes */
+		if (f1 == RDS_AF_FILLER || f2 == RDS_AF_FILLER)
+			continue;
+		
+		/* Tuning freq must be in position 1 OR position 2 */
+		if (f1 != tuning_code && f2 != tuning_code) {
+			is_method_b = 0;
+			break;
+		}
+	}
+	
+	if (is_method_b) {
+		/* Decode as Method B */
+		rds_af_method_b_dec_t *dec = &rds->af_method_b_dec;
+		
+		dec->pi = col->pi;
+		dec->tuning_freq = RDS_AF_FM_BASE + tuning_code;
+		dec->expected_count = col->expected_count;
+		dec->received_count = 0;
+		
+		/* Extract AF pairs with regional detection */
+		for (int i = 2; i < col->received_pairs * 2 && dec->received_count < RDS_AF_METHOD_B_MAX_AFS; i += 2) {
+			uint8_t f1 = col->codes[i];
+			uint8_t f2 = col->codes[i + 1];
+			
+			if (f1 == RDS_AF_FILLER || f2 == RDS_AF_FILLER)
+				continue;
+			
+			int idx = dec->received_count;
+			
+			/* Identify AF (the one that's NOT tuning_freq) */
+			uint8_t af_code = (f1 == tuning_code) ? f2 : f1;
+			dec->af_freq[idx] = RDS_AF_FM_BASE + af_code;
+			
+			/* Regional detection: F1 > F2 = regional, F1 < F2 = same */
+			dec->af_is_regional[idx] = (f1 > f2);
+			
+			dec->af_status[idx] = (col->status[i] == RDS_STATUS_VALID && 
+			                       col->status[i+1] == RDS_STATUS_VALID) ?
+			                      RDS_STATUS_VALID : RDS_STATUS_CORRECTED;
+			dec->received_count++;
+		}
+		
+		/* Add to history */
+		rds_af_method_b_add_to_history(rds);
+		
+		if (rds->verbose)
+			LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF Method B decoded, tuning=%.1f, %d AFs\n",
+			     dec->tuning_freq / 10.0, dec->received_count);
+	} else {
+		/* Method A - already decoded during collection */
+		rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
+		afd->complete = 1;
+		
+		/* Check if all received with good/corrected status - save as last_good */
+		int all_good = 1;
+		for (int i = 0; i < afd->received_count; i++) {
+			if (afd->status[i] > RDS_STATUS_CORRECTED) {
+				all_good = 0;
+				break;
+			}
+		}
+		if (all_good && afd->received_count > 0) {
+			afd->last_good_pi = rds->pi;
+			afd->last_good_tuning = 0;
+			afd->last_good_count = afd->received_count;
+			memcpy(afd->last_good_freq, afd->freq, sizeof(afd->freq));
+			memcpy(afd->last_good_type, afd->type, sizeof(afd->type));
+			afd->last_good_time = time(NULL);
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF Method A complete, %d freqs saved as last good\n",
+				     afd->received_count);
+		} else if (rds->verbose) {
+			LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF list complete (Method A), %d frequencies\n",
+			     afd->received_count);
+		}
+	}
+	
+	/* Reset collector */
+	col->header_received = 0;
+}
+
 
 /* ============================================================
  * Build Group 0A: Basic Tuning and Switching Information
@@ -361,146 +823,90 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 	     seg;
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 	
-	/* Block C: Alternative Frequencies (AF) */
-	rds_af_entry_t *e = NULL;
-	
-	/* Find AF entry based on configuration */
-	if (rds->af_type_cfg == RDS_AF_TYPE_METHOD_A) {
-		for(int i=0; i<rds->af_table.count; i++) {
-			if (rds->af_table.entries[i].type == RDS_AF_TYPE_METHOD_A && 
-			    rds->af_table.entries[i].pi == rds->pi) {
-				e = &rds->af_table.entries[i];
-				break;
-			}
-		}
-	} else if (rds->af_type_cfg == RDS_AF_TYPE_LF_MF) {
-		for(int i=0; i<rds->af_table.count; i++) {
-			if (rds->af_table.entries[i].type == RDS_AF_TYPE_LF_MF && 
-			    rds->af_table.entries[i].pi == rds->pi) {
-				e = &rds->af_table.entries[i];
-				break;
-			}
-		}
-	} else if (rds->af_type_cfg == RDS_AF_TYPE_METHOD_B) {
-		/* Determine which Method B list to transmit */
-		/* Try cached index first */
-		if (rds->af_list_index >= 0 && rds->af_list_index < rds->af_table.count &&
-		    rds->af_table.entries[rds->af_list_index].type == RDS_AF_TYPE_METHOD_B &&
-		    rds->af_table.entries[rds->af_list_index].pi == rds->pi) {
-			e = &rds->af_table.entries[rds->af_list_index];
+	/* Block C: Alternative Frequencies (Method A or Method B)
+	 * Method A: Transmit pairs from pre-computed af_codes[] buffer.
+	 * Method B: Generate pairs dynamically from af_method_b lists. */
+	if (rds->use_method_b && rds->af_method_b.list_count > 0) {
+		/* Method B: paired frequencies from lists */
+		rds_af_method_b_list_t *list = &rds->af_method_b.lists[rds->af_method_b_list_idx];
+		int pair_idx = rds->af_method_b_pair_idx;
+		
+		uint8_t tuning_code = (uint8_t)(list->tuning_freq - 875);
+		
+		if (pair_idx == 0) {
+			/* Header: [count_code, tuning_freq]
+			 * Count = 1 (tuning) + 2 × af_count (each pair has 2 frequencies)
+			 * Example: 5 AFs = 1 + 10 = 11 (always odd for Method B) */
+			uint8_t count = 1 + 2 * list->af_count;
+			b3 = ((RDS_AF_NO_AF + count) << 8) | tuning_code;
+			
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: Method B header: count=%d tuning=%.1f\n",
+				     count, list->tuning_freq / 10.0);
 		} else {
-			/* Fallback: Search from start */
-			for(int i=0; i<rds->af_table.count; i++) {
-				if (rds->af_table.entries[i].type == RDS_AF_TYPE_METHOD_B && 
-				    rds->af_table.entries[i].pi == rds->pi) {
-					e = &rds->af_table.entries[i];
-					rds->af_list_index = i; /* Cache it */
-					break;
-				}
-			}
-		}
-	}
-	
-	if (e && e->count > 0) {
-		if (e->type == RDS_AF_TYPE_METHOD_A) {
-			/* Method A: Header (Count) + List logic */
-			if (rds->af_segment == 0) {
-				/* Header: Count + First AF */
-				uint8_t af_count_code = RDS_AF_NO_AF + e->count;
-				uint8_t af1_code = (e->list[0].freq >= RDS_AF_FM_BASE) ? (e->list[0].freq - RDS_AF_FM_BASE) : 0;
-				b3 = (af_count_code << 8) | af1_code;
-			} else {
-				/* Pairs */
-				int idx = rds->af_segment * 2 - 1;
-				uint16_t freq1 = (idx < e->count) ? e->list[idx].freq : 0;
-				uint16_t freq2 = (idx + 1 < e->count) ? e->list[idx+1].freq : 0;
+			/* AF pair: order by same/regional flag */
+			int af_idx = pair_idx - 1;
+			if (af_idx < list->af_count) {
+				uint8_t af_code = (uint8_t)(list->af_freq[af_idx] - 875);
 				
-				uint8_t af1 = (freq1 >= RDS_AF_FM_BASE) ? (freq1 - RDS_AF_FM_BASE) : RDS_AF_FILLER;
-				uint8_t af2 = (freq2 >= RDS_AF_FM_BASE) ? (freq2 - RDS_AF_FM_BASE) : RDS_AF_FILLER;
-				b3 = (af1 << 8) | af2;
-			}
-			
-			/* Advance segment */
-			rds->af_segment++;
-			/* Reset segment after all pairs sent */
-			if (rds->af_segment >= (e->count / 2) + 1) rds->af_segment = 0;
-			
-		} else if (e->type == RDS_AF_TYPE_LF_MF) {
-			/* LF/MF: Stream of [250, code] */
-			int idx = rds->af_segment % e->count;
-			uint8_t code = 0;
-			
-			if (e->list[idx].flags & RDS_AF_FLAG_LF) {
-				code = (e->list[idx].freq - 144) / 9;
-			} else { /* MF */
-				int is_us = RDS_IS_RBDS(rds->ecc);
-				code = 16 + (e->list[idx].freq - (is_us?540:531)) / (is_us?10:9);
-			}
-			b3 = (RDS_AF_LF_MF_FOLLOWS << 8) | code;
-			
-			rds->af_segment = (rds->af_segment + 1) % e->count;
-			
-		} else {
-			/* Method B: Pairs [Tx, AF] */
-			/* Segment 0: Header [Count, Tx] */
-			if (rds->af_segment == 0) {
-				uint8_t count_code = RDS_AF_NO_AF + e->count;
-				uint8_t tx_code = (e->tx_freq >= RDS_AF_FM_BASE) ? (e->tx_freq - RDS_AF_FM_BASE) : 0;
-				b3 = (count_code << 8) | tx_code;
-			} else {
-				/* Segments 1..N: Pairs [Tx, AFn] */
-				int idx = rds->af_segment - 1;
-				if (idx < e->count) {
-					uint8_t tx_code = (e->tx_freq >= RDS_AF_FM_BASE) ? (e->tx_freq - RDS_AF_FM_BASE) : 0;
-					uint8_t af_code = (e->list[idx].freq >= RDS_AF_FM_BASE) ? (e->list[idx].freq - RDS_AF_FM_BASE) : 0;
-					b3 = (tx_code << 8) | af_code;
+				if (list->af_is_regional[af_idx]) {
+					/* Regional: F1 > F2 (descending) */
+					if (tuning_code > af_code) {
+						b3 = (tuning_code << 8) | af_code;
+					} else {
+						b3 = (af_code << 8) | tuning_code;
+					}
 				} else {
-					b3 = RDS_AF_NO_AF_PAIR;
-				}
-			}
-			
-			rds->af_segment++;
-			
-			/* Check if we finished this Method B list */
-			if (rds->af_segment > e->count) {
-				rds->af_segment = 0;
-				
-				/* Advance to NEXT Method B entry in the table */
-				/* We need to find the next entry with the same PI */
-				int current_idx = -1;
-				
-				/* 1. Find current index */
-				for(int i=0; i<rds->af_table.count; i++) {
-					if (&rds->af_table.entries[i] == e) {
-						current_idx = i;
-						break;
+					/* Same programme: F1 < F2 (ascending) */
+					if (tuning_code < af_code) {
+						b3 = (tuning_code << 8) | af_code;
+					} else {
+						b3 = (af_code << 8) | tuning_code;
 					}
 				}
 				
-				/* 2. Find next valid Method B entry (wrapping around) */
-				if (current_idx >= 0) {
-
-					
-					/* Search forward from next index */
-					for(int i=1; i<=rds->af_table.count; i++) {
-						int next_idx = (current_idx + i) % rds->af_table.count;
-						if (rds->af_table.entries[next_idx].type == RDS_AF_TYPE_METHOD_B && 
-							rds->af_table.entries[next_idx].pi == rds->pi) {
-							/* Found next list!
-							   We need to persist this selection for the next call.
-							   However, rds_build_group_0a determines 'e' by searching from 0.
-							   To fix this, we need state. 
-							   Let's use rds->af_list_index to track which Method B list we are serving.
-							*/
-							rds->af_list_index = next_idx;
-							break;
-						}
-					}
-				}
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: Method B pair[%d]: [%02X, %02X] %s\n",
+					     af_idx, (b3 >> 8) & 0xFF, b3 & 0xFF,
+					     list->af_is_regional[af_idx] ? "regional" : "same");
+			} else {
+				b3 = RDS_AF_NO_AF_PAIR;
 			}
 		}
+		
+		/* Advance: header, then pairs, then next list */
+		rds->af_method_b_pair_idx++;
+		if (rds->af_method_b_pair_idx > list->af_count) {
+			rds->af_method_b_pair_idx = 0;
+			rds->af_method_b_list_idx = (rds->af_method_b_list_idx + 1) % rds->af_method_b.list_count;
+		}
+	} else if (rds->af_code_count >= 2) {
+		/* Method A: from pre-computed af_codes[] buffer */
+		/* Each segment = 2 codes (one pair) */
+		int pair_idx = rds->af_method_a_segment * 2;
+		
+		if (pair_idx < rds->af_code_count) {
+			uint8_t af1 = rds->af_codes[pair_idx];
+			uint8_t af2 = (pair_idx + 1 < rds->af_code_count) 
+			              ? rds->af_codes[pair_idx + 1] 
+			              : RDS_AF_FILLER;
+			b3 = (af1 << 8) | af2;
+			
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: AF pair %d: [%02X, %02X]\n",
+				     rds->af_method_a_segment, af1, af2);
+		} else {
+			/* All pairs sent - use NO_AF_PAIR for remaining groups */
+			b3 = RDS_AF_NO_AF_PAIR;
+		}
+		
+		/* Advance to next pair, wrap to start after all pairs sent */
+		rds->af_method_a_segment++;
+		int num_pairs = (rds->af_code_count + 1) / 2;
+		if (rds->af_method_a_segment >= num_pairs)
+			rds->af_method_a_segment = 0;
 	} else {
-		/* No AF */
+		/* No AF data */
 		b3 = RDS_AF_NO_AF_PAIR;
 	}
 
@@ -536,7 +942,7 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
  * ============================================================ */
 static void rds_build_group_0b(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2;
 	int seg = rds->ps_segment;
 	
@@ -579,10 +985,23 @@ static void rds_build_group_0b(rds_encoder_t *rds, uint8_t *group)
 /* Build Group 2A: RadioText */
 static void rds_build_group_2a(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2;
 	int seg = rds->rt_segment;
 	int pos = seg * 4;
+	
+	/* IEC 62106: Switching from 2B to 2A without toggling A/B flag causes
+	 * problematic receiver behavior. Auto-toggle when version changes. */
+	if (rds->rt_last_version == 1) {
+		rds->rt_ab = !rds->rt_ab;
+		rds->rt_segment = 0;  /* Restart from segment 0 */
+		seg = 0;
+		pos = 0;
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Switched 2B→2A, toggled A/B to %c\n",
+			     rds->rt_ab ? 'B' : 'A');
+	}
+	rds->rt_last_version = 0;
 	
 	/* Block A: PI code */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
@@ -603,21 +1022,66 @@ static void rds_build_group_2a(rds_encoder_t *rds, uint8_t *group)
 	uint16_t rt_chars2 = ((uint8_t)rds->rt[pos+2] << 8) | (uint8_t)rds->rt[pos+3];
 	blocks[3] = rds_build_block(rt_chars2, RDS_OFFSET_D);
 	
+	/* Debug: Log transmitted segment using proper RDS char display */
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 2A: seg=%d pos=%d-%d AB=%c chars='%s%s%s%s'\n",
+		     seg, pos, pos+3, rds->rt_ab ? 'B' : 'A',
+		     rds_char_to_display((uint8_t)rds->rt[pos]),
+		     rds_char_to_display((uint8_t)rds->rt[pos+1]),
+		     rds_char_to_display((uint8_t)rds->rt[pos+2]),
+		     rds_char_to_display((uint8_t)rds->rt[pos+3]));
+	
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	rds->rt_segment = (seg + 1) & RDS_RT_SEG_MASK;
+	/* Advance segment, wrapping at end of message (CR terminator or max 16 segments)
+	 * EN 50067: "A new text must start with segment address 0000 and there must
+	 * be no gaps up to the highest used segment address of the current message." */
+	int next_seg = seg + 1;
+	
+	/* Check if current segment contained CR or we've reached max segments */
+	if (next_seg >= 16 ||
+	    rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r' ||
+	    rds->rt[pos+2] == '\r' || rds->rt[pos+3] == '\r') {
+		rds->rt_segment = 0;  /* Wrap to beginning */
+	} else {
+		rds->rt_segment = next_seg;
+	}
 }
 
 /* Build Group 2B: RadioText (32 chars, PI repeat in Block C)
  * IEC 62106 S6.1.5.3 - Version B for improved mobile reception
- * Block C contains PI repeat; Block D contains 2 RT chars per segment */
+ * Block C contains PI repeat; Block D contains 2 RT chars per segment
+ * 
+ * EN 50067: Group 2B uses 2 chars per segment, max 32 chars total.
+ * Segment 0-15 = chars 0-31 (positions 0-31 in rt[] buffer).
+ * Characters beyond position 31 are NOT transmitted in 2B. */
 static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2;
 	int seg = rds->rt_segment;
 	int pos = seg * 2;  /* 2 chars per segment for 2B */
+	
+	/* IEC 62106: Switching from 2A to 2B without toggling A/B flag causes
+	 * problematic receiver behavior. Auto-toggle when version changes. */
+	if (rds->rt_last_version == 0) {
+		rds->rt_ab = !rds->rt_ab;
+		rds->rt_segment = 0;  /* Restart from segment 0 */
+		seg = 0;
+		pos = 0;
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Switched 2A→2B, toggled A/B to %c\n",
+			     rds->rt_ab ? 'B' : 'A');
+	}
+	rds->rt_last_version = 1;
+	
+	/* Safety: 2B only accesses positions 0-31 */
+	if (pos > 30) {
+		pos = 0;
+		seg = 0;
+		rds->rt_segment = 0;
+	}
 	
 	/* Block A: PI code */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
@@ -633,14 +1097,32 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
 	/* Block C: PI repeat (offset C' for B-version groups) */
 	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
 	
-	/* Block D: RT chars (2 per segment, max 32 chars) */
+	/* Block D: RT chars (2 per segment, positions 0-31 only for 2B) */
 	uint16_t rt_chars = ((uint8_t)rds->rt[pos] << 8) | (uint8_t)rds->rt[pos+1];
 	blocks[3] = rds_build_block(rt_chars, RDS_OFFSET_D);
+	
+	/* Debug: Log transmitted segment using proper RDS char display */
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 2B: seg=%d pos=%d-%d AB=%c chars='%s%s'\n",
+		     seg, pos, pos+1, rds->rt_ab ? 'B' : 'A',
+		     rds_char_to_display((uint8_t)rds->rt[pos]),
+		     rds_char_to_display((uint8_t)rds->rt[pos+1]));
 	
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	rds->rt_segment = (seg + 1) & RDS_RT_SEG_MASK;
+	/* Advance segment, wrapping at end of message (CR terminator or max 16 segments)
+	 * EN 50067: Group 2B uses 2 chars/segment, max 32 chars total.
+	 * "Each message should be ended by the code 0D (Hex) - carriage return" */
+	int next_seg = seg + 1;
+	
+	/* Check if current segment contained CR or we've reached max 16 segments (32 chars) */
+	if (next_seg >= 16 ||
+	    rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r') {
+		rds->rt_segment = 0;  /* Wrap to beginning */
+	} else {
+		rds->rt_segment = next_seg;
+	}
 }
 
 /* Build Group 1A: Extended Country Code, Language, and Programme Item Number (PIN)
@@ -662,7 +1144,7 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
  */
 static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
 	
 	/* SLC Variant Sequence: cycle through active variants
@@ -752,7 +1234,7 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
  */
 static void rds_build_group_1b(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2, b4;
 	
 	/* Block A: PI code */
@@ -836,7 +1318,7 @@ static void mjd_to_date(int mjd, int *year, int *month, int *day)
 /* Build Group 4A: Clock-Time */
 static void rds_build_group_4a(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
 	time_t now = time(NULL) + rds->ct_time_offset;
 	struct tm *t = gmtime(&now);
@@ -888,7 +1370,7 @@ static void rds_build_group_4a(rds_encoder_t *rds, uint8_t *group)
 /* Build Group 10A: PTYN */
 static void rds_build_group_10a(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
 	int seg = rds->ptyn_segment;
 	int pos = seg * 4;
@@ -925,7 +1407,7 @@ static void rds_build_group_10a(rds_encoder_t *rds, uint8_t *group)
  */
 static void rds_build_group_14a(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
 	
 	if (rds->eon_tx_count == 0)
@@ -1069,7 +1551,7 @@ static void rds_build_group_14a(rds_encoder_t *rds, uint8_t *group)
  */
 static void rds_build_group_14b(rds_encoder_t *rds, uint8_t *group)
 {
-	uint32_t blocks[4];
+	uint32_t blocks[4] = {0};
 	uint16_t b2, b4;
 	
 	if (rds->eon_tx_count == 0)
@@ -1105,135 +1587,312 @@ static void rds_build_group_14b(rds_encoder_t *rds, uint8_t *group)
 
 
 /* ============================================================
- * RDS GROUP SCHEDULER (IEC 62106)
+ * RDS GROUP SCHEDULER (Fixed Cyclic Sequence)
  * ============================================================
  * 
- * MANDATORY VS OPTIONAL GROUPS:
- *   Only Group 0 (0A or 0B) is MANDATORY for RDS transmission.
- *   All other groups are OPTIONAL and should only transmit if
- *   their data is configured. Unused slots go to Group 0.
+ * Implements a configurable fixed group sequence as recommended by
+ * professional encoder manufacturers (2wcom, Pira.cz, etc.).
  *
- * A VS B VERSION SELECTION (per group type):
- *   - Version A: Block C carries group-specific data (more capacity)
- *   - Version B: Block C carries PI repeat (faster station ID)
- *   
- *   Group 0: 0A if AF list, 0B if no AF (use_0b flag)
- *   Group 1: 1A if ECC/Language, 1B if PIN only (use_1b flag)
- *   Group 2: 2A for 64-char RT, 2B for 32-char faster (use_2b flag)
+ * The sequence is rebuilt whenever configuration changes (e.g. new RT).
+ * It ensures:
+ *   - High repetition of Group 0 (PS/AF/TA)
+ *   - Adequate repetition of optional groups (RT, 1A, etc.)
+ *   - Consistent timing structure
  *
- *   IMPORTANT: Never mix A and B for the SAME group type.
- *              Different group types CAN use different versions.
- *
- * SCHEDULING PRIORITY:
- *   1. CT (Group 4A) - Time-triggered at minute boundary
- *   2. Group 0 (PS) - Mandatory, fills most slots
- *   3. Group 2 (RT) - If RadioText configured
- *   4. Group 1 (ECC/PIN) - If ECC/Language/PIN configured  
- *   5. Group 10 (PTYN) - If PTYN configured
- *   6. Group 14 (EON) - If EON enabled with entries
- *
- * TIMING (at 1187.5 bps, ~11.4 groups/sec):
- *   - 5-group cycle: ~0.44 sec
- *   - 20 groups: ~1.75 sec (Group 1 interval)
- *   - 40 groups: ~3.5 sec (Group 10 interval)
- *   - 50 groups: ~4.4 sec (Group 14 interval)
+ * Group 4A (CT) remains a high-priority interrupt at minute boundaries.
  * ============================================================ */
+
+void rds_scheduler_update(rds_encoder_t *rds)
+{
+	rds->group_sched_len = 0;
+	rds->group_sched_index = 0;
+	
+	int use_0b = rds->use_0b;
+	/* RT is active if string is not empty/space (check first char) */
+	int has_rt = (rds->rt[0] != ' ' && rds->rt[0] != '\0' && rds->rt[0] != '\r');
+	int has_slc = (rds->ecc != 0 || rds->language != 0 || rds->pin_day > 0);
+	int has_ptyn = (rds->ptyn[0] != ' ' && rds->ptyn[0] != '\0');
+	int has_eon = (rds->eon_enabled && rds->eon_tx_count > 0);
+	
+	/* Use Group 2B if configured, else 2A */
+	enum rds_group_type g2 = rds->use_2b ? RDS_GROUP_2B : RDS_GROUP_2A;
+	enum rds_group_type g0 = use_0b ? RDS_GROUP_0B : RDS_GROUP_0A;
+	enum rds_group_type g1 = rds->use_1b ? RDS_GROUP_1B : RDS_GROUP_1A;
+	
+	/* Helper to add group to sequence */
+	#define ADD_GRP(g) do { \
+		if(rds->group_sched_len < RDS_SCHEDULER_MAX_LEN) \
+			rds->group_sched_buffer[rds->group_sched_len++] = (g); \
+	} while(0)
+	
+	/* 
+	 * BUILD SEQUENCE
+	 * Pattern based on Pira.cz and 2wcom recommendations for "Full Features"
+	 * Aim: ~50% Group 0, ~25% RT, ~25% Others
+	 */
+
+	/* Block 1: 0, 0 (High priority PS/AF) */
+	ADD_GRP(g0);
+	ADD_GRP(g0);
+	
+	/* Block 2: RT or 0 */
+	if (has_rt) {
+		ADD_GRP(g2);
+		ADD_GRP(g2);
+	} else {
+		ADD_GRP(g0);
+	}
+	
+	/* Block 3: 0, 0 */
+	ADD_GRP(g0);
+	ADD_GRP(g0);
+
+	/* Block 4: SLC (1A) or RT or 0 */
+	if (has_slc) {
+		ADD_GRP(g1);
+	} else if (has_rt) {
+		ADD_GRP(g2);
+	} else {
+		ADD_GRP(g0);
+	}
+	
+	/* Block 5: 0 */
+	ADD_GRP(g0);
+	
+	/* Block 6: PTYN (10A) or RT or 0 */
+	if (has_ptyn) {
+		ADD_GRP(RDS_GROUP_10A);
+	} else if (has_rt) {
+		ADD_GRP(g2);
+	} else {
+		ADD_GRP(g0);
+	}
+	
+	/* Block 7: EON (14A) - optional append */
+	if (has_eon) {
+		ADD_GRP(RDS_GROUP_14A);
+	}
+
+	/* Log the new sequence */
+	/* 
+	char seq_str[256] = {0};
+	for(int i=0; i<rds->group_sequence_len; i++) {
+		const char *n = rds_group_name(rds->group_sequence[i]); // Requires lookup
+		snprintf(seq_str+strlen(seq_str), sizeof(seq_str)-strlen(seq_str), "%s ", n ? n : "??");
+	}
+	LOGP(DRADIO, LOGL_INFO, "RDS Scheduler: Sequence updated (%d items): %s\n", rds->group_sequence_len, seq_str);
+	*/
+}
+
 static void rds_generate_group(rds_encoder_t *rds)
 {
-	/* --------------------------------------------------------
-	 * 1. TIME-TRIGGERED: Group 4A (Clock-Time)
-	 * --------------------------------------------------------
-	 * CT is transmitted at minute boundaries, highest priority.
-	 * IEC 62106 recommends CT accuracy within +/-100ms of UTC. */
+	/* ============================================================
+	 * DEBUG TEST MODE: Minimal Group 0A Cycle
+	 * ============================================================
+	 * When enabled, transmits ONLY Group 0A in a simple 4-group cycle
+	 * (segments 0,1,2,3) with fixed known values. No CT, no RT, no PTYN.
+	 * 
+	 * Expected output (PI=1234, PS="TEST1234", no AF):
+	 *   1234 0008 E0E0 5445   | PS[0]='TE'
+	 *   1234 0009 E0E0 5354   | PS[1]='ST'
+	 *   1234 000A E0E0 3132   | PS[2]='12'
+	 *   1234 000F E0E0 3334   | PS[3]='34'
+	 *   (repeat)
+	 * ============================================================ */
+	
+	/* ============================================================
+	 * PRIORITY 1: Time-Triggered Group 4A (Clock-Time)
+	 * ============================================================
+	 * IEC 62106 S6.1.5.4: CT transmitted at minute boundaries.
+	 * Accuracy: within +/-100ms of UTC minute edge.
+	 * Rate: 1 group per minute (not per second). */
 	if (rds->ct_enabled) {
 		time_t now = time(NULL) + rds->ct_time_offset;
-		struct tm *t_now = gmtime(&now);
-		int current_minute = t_now->tm_min;
+		struct tm t_now_buf, t_last_buf;
 		
-		struct tm *t_last = gmtime(&rds->last_ct_minute);
-		if (current_minute != t_last->tm_min) {
+		/* Use reentrant gmtime_r if available, or just copy immediately.
+		 * Since we can't assume gmtime_r exists on all platforms (though likely on Linux),
+		 * we'll use a safe pattern with standard gmtime */
+		
+		struct tm *ptr = gmtime(&now);
+		if (ptr) memcpy(&t_now_buf, ptr, sizeof(struct tm));
+		else memset(&t_now_buf, 0, sizeof(struct tm));
+		
+		ptr = gmtime(&rds->last_ct_minute);
+		if (ptr) memcpy(&t_last_buf, ptr, sizeof(struct tm));
+		else memset(&t_last_buf, 0, sizeof(struct tm));
+
+		if (t_now_buf.tm_min != t_last_buf.tm_min) {
 			rds_build_group_4a(rds, rds->group_buffer);
 			rds->last_ct_minute = now;
-			rds->group_sequence++;
+			rds->group_sequence++; /* Increment total counter */
+			rds->group_bit_pos = 0;
+			// Debug log for CT
+			// LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Group 4A (CT Interrupt)\n");
+			return;
+		}
+	}
+	
+	/* ============================================================
+	 * PRIORITY 2: Warmup Mode (First ~4 seconds after start/preset)
+	 * ============================================================
+	 * Transmit ONLY Group 0 (PS + PI) to help receivers acquire quickly. */
+	if (rds->warmup_countdown > 0) {
+		rds->warmup_countdown--;
+		if (rds->use_0b)
+			rds_build_group_0b(rds, rds->group_buffer);
+		else
+			rds_build_group_0a(rds, rds->group_buffer);
+		rds->group_sequence++;
+		rds->group_bit_pos = 0;
+		return;
+	}
+	
+	/* ============================================================
+	 * PRIORITY 3: Fixed Cyclic Sequence
+	 * ============================================================ */
+	
+	/* Safety check: if sequence empty, fallback to 0A */
+	if (rds->group_sched_len == 0) {
+		rds_scheduler_update(rds);
+		if (rds->group_sched_len == 0) { // Should not happen
+			rds_build_group_0a(rds, rds->group_buffer); // Emergency fallback
 			rds->group_bit_pos = 0;
 			return;
 		}
 	}
 	
-	/* --------------------------------------------------------
-	 * 2. DATA-DRIVEN SCHEDULING
-	 * --------------------------------------------------------
-	 * Only transmit optional groups if their data is configured.
-	 * Group 0 fills all remaining slots (mandatory). */
-	
-	/* Check what optional data is configured */
-	int has_rt = (rds->rt[0] != ' ' && rds->rt[0] != '\r' && rds->rt[0] != '\0');
-	int has_slc = (rds->ecc != 0 || rds->language != 0 || rds->pin_day != 0);
-	int has_ptyn = (rds->ptyn[0] != ' ' && rds->ptyn[0] != '\0');
-	int has_eon = (rds->eon_enabled && rds->eon_tx_count > 0);
-	
-	uint64_t seq = rds->group_sequence++;
-	int cycle_pos = seq % 5;  /* 5-group cycle */
-	
-	/* --------------------------------------------------------
-	 * Slot 4: Group 2 (RadioText) - IF configured
-	 * --------------------------------------------------------
-	 * 2A: 64 chars, 4 chars/group, 16 groups to complete
-	 * 2B: 32 chars, 2 chars/group, 16 groups to complete (faster PI)
-	 * -------------------------------------------------------- */
-	if (cycle_pos == 4 && has_rt) {
-		if (rds->use_2b)
-			rds_build_group_2b(rds, rds->group_buffer);
-		else
-			rds_build_group_2a(rds, rds->group_buffer);
+	/* Get next group from sequence */
+	enum rds_group_type type = rds->group_sched_buffer[rds->group_sched_index];
+
+	switch (type) {
+	case RDS_GROUP_0A:
+		rds_build_group_0a(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_0B:
+		rds_build_group_0b(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_1A:
+		rds_build_group_1a(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_1B:
+		rds_build_group_1b(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_2A:
+		rds_build_group_2a(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_2B:
+		rds_build_group_2b(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_10A:
+		rds_build_group_10a(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_14A:
+		rds_build_group_14a(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_14B:
+		rds_build_group_14b(rds, rds->group_buffer);
+		break;
+	/* Add other cases as needed */
+	default:
+		/* Fallback for unhandled types in sequence */
+		rds_build_group_0a(rds, rds->group_buffer);
+		break;
 	}
-	/* --------------------------------------------------------
-	 * Slots 0-3: Mix of Group 0 and other optional groups
-	 * -------------------------------------------------------- */
-	else {
-		/* Every 20 groups: Group 1 (ECC/Language/PIN) - IF configured
-		 * 1A: Full SLC data (ECC, Language) + PIN
-		 * 1B: PIN only with PI repeat (faster station ID) */
-		if ((seq % 20) == 0 && has_slc) {
-			if (rds->use_1b)
-				rds_build_group_1b(rds, rds->group_buffer);
-			else
-				rds_build_group_1a(rds, rds->group_buffer);
-		}
-		/* Every 40 groups: Group 10A (PTYN) - IF configured */
-		else if ((seq % 40) == 10 && has_ptyn) {
-			rds_build_group_10a(rds, rds->group_buffer);
-		}
-		/* Every 50 groups: Group 14A (EON) - IF configured */
-		else if ((seq % 50) == 25 && has_eon) {
-			rds_build_group_14a(rds, rds->group_buffer);
-		}
-		/* --------------------------------------------------------
-		 * Default: Group 0 (MANDATORY - fills all unused slots)
-		 * --------------------------------------------------------
-		 * 0A: PS name + AF list (use when AF available)
-		 * 0B: PS name + PI repeat (use when no AF, better mobile)
-		 * -------------------------------------------------------- */
-		else {
-			if (rds->use_0b)
-				rds_build_group_0b(rds, rds->group_buffer);
-			else
-				rds_build_group_0a(rds, rds->group_buffer);
-		}
+
+	
+	/* Advance index */
+	rds->group_sched_index++;
+	if (rds->group_sched_index >= rds->group_sched_len) {
+		rds->group_sched_index = 0;
 	}
 	
+	// /* Debug: Log every group generated in RDS Spy format */
+	// {
+	// 	/* 
+	// 	 * The group_buffer is 13 bytes of packed 104 bits (4 x 26-bit blocks).
+	// 	 * To extract the 16-bit DATA portion of each block, we need to unpack
+	// 	 * from the 26-bit block positions, NOT just read byte pairs.
+	// 	 * 
+	// 	 * Block structure (26 bits each):
+	// 	 *   Block A: bits 103-78 -> data in bits 103-88 (16 bits)
+	// 	 *   Block B: bits  77-52 -> data in bits  77-62 (16 bits)
+	// 	 *   Block C: bits  51-26 -> data in bits  51-36 (16 bits)
+	// 	 *   Block D: bits  25-0  -> data in bits  25-10 (16 bits)
+	// 	 *
+	// 	 * Repacking from byte buffer:
+	// 	 */
+	// 	uint32_t all_bits[4];  /* Full 26-bit blocks */
+		
+	// 	/* Unpack 104 bits from 13 bytes back to 4 x 26-bit blocks */
+	// 	all_bits[0] = ((uint32_t)rds->group_buffer[0] << 18) |
+	// 	              ((uint32_t)rds->group_buffer[1] << 10) |
+	// 	              ((uint32_t)rds->group_buffer[2] << 2) |
+	// 	              ((uint32_t)rds->group_buffer[3] >> 6);
+		
+	// 	all_bits[1] = (((uint32_t)rds->group_buffer[3] & 0x3F) << 20) |
+	// 	              ((uint32_t)rds->group_buffer[4] << 12) |
+	// 	              ((uint32_t)rds->group_buffer[5] << 4) |
+	// 	              ((uint32_t)rds->group_buffer[6] >> 4);
+		
+	// 	all_bits[2] = (((uint32_t)rds->group_buffer[6] & 0x0F) << 22) |
+	// 	              ((uint32_t)rds->group_buffer[7] << 14) |
+	// 	              ((uint32_t)rds->group_buffer[8] << 6) |
+	// 	              ((uint32_t)rds->group_buffer[9] >> 2);
+		
+	// 	all_bits[3] = (((uint32_t)rds->group_buffer[9] & 0x03) << 24) |
+	// 	              ((uint32_t)rds->group_buffer[10] << 16) |
+	// 	              ((uint32_t)rds->group_buffer[11] << 8) |
+	// 	              ((uint32_t)rds->group_buffer[12]);
+		
+	// 	/* Extract 16-bit data from 26-bit blocks (upper 16 bits) */
+	// 	uint16_t blk_a = (all_bits[0] >> 10) & 0xFFFF;
+	// 	uint16_t blk_b = (all_bits[1] >> 10) & 0xFFFF;
+	// 	uint16_t blk_c = (all_bits[2] >> 10) & 0xFFFF;
+	// 	uint16_t blk_d = (all_bits[3] >> 10) & 0xFFFF;
+		
+	// 	/* Log in RDS Spy format: PI BLKB BLKC BLKD */
+	// 	LOGP(DRADIO, LOGL_DEBUG, "RDS TX [%s] seq=%lu: %04X %04X %04X %04X",
+	// 	     group_name, (unsigned long)rds->group_sequence, 
+	// 	     blk_a, blk_b, blk_c, blk_d);
+		
+	// 	/* Add extra info for specific group types */
+	// 	if (type == RDS_GROUP_0A || type == RDS_GROUP_0B) {
+	// 		int seg = blk_b & 0x03;
+	// 		char c1 = (blk_d >> 8) & 0xFF;
+	// 		char c2 = blk_d & 0xFF;
+	// 		LOGP(DRADIO, LOGL_DEBUG, " | PS[%d]='%c%c'", seg, 
+	// 		     (c1 >= 32 && c1 < 127) ? c1 : '?',
+	// 		     (c2 >= 32 && c2 < 127) ? c2 : '?');
+	// 	} else if (type == RDS_GROUP_2A || type == RDS_GROUP_2B) {
+	// 		int seg = blk_b & 0x0F;
+	// 		LOGP(DRADIO, LOGL_DEBUG, " | RT[%d]", seg);
+	// 	} else if (type == RDS_GROUP_10A) {
+	// 		int seg = blk_b & 0x01;
+	// 		LOGP(DRADIO, LOGL_DEBUG, " | PTYN[%d]", seg);
+	// 	}
+	// 	LOGP(DRADIO, LOGL_DEBUG, "\n");
+	// }
+	
+	rds->group_sequence++;
 	rds->group_bit_pos = 0;
 }
 
 /* Get next bit from current group */
 static int rds_get_next_bit(rds_encoder_t *rds)
 {
+	/* Check if we need to generate a new group BEFORE calculating indices */
+	if (rds->group_bit_pos >= 104) {
+		rds_generate_group(rds);
+	}
+	
 	int byte_pos = rds->group_bit_pos / 8;
 	int bit_pos = 7 - (rds->group_bit_pos % 8);
 	int bit;
 	
-	if (rds->group_bit_pos >= 104) {
-		rds_generate_group(rds);
+	if (byte_pos >= 13) {
+		// Should not happen if generate_group resets pos to 0
+		return 0;
 	}
 	
 	bit = (rds->group_buffer[byte_pos] >> bit_pos) & 1;
@@ -1272,17 +1931,17 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 		memcpy(rds->ps, ps, len);
 	}
 	
-	/* Set RadioText (pad with spaces) */
-	memset(rds->rt, ' ', 64);
+	/* Set RadioText (pad with CR after message end)
+	 * EN 50067: Unused positions filled with 0x0D to mark end of text */
+	memset(rds->rt, '\r', 64);  /* Fill with CR terminators */
 	rds->rt[64] = '\0';
 	if (rt) {
 		int len = strlen(rt);
 		if (len > 64) len = 64;
 		memcpy(rds->rt, rt, len);
-		/* Add CR terminator if space */
-		if (len < 64)
-			rds->rt[len] = '\r';
+		/* Positions after message remain as CR from memset above */
 	}
+	rds->rt_last_version = 0xFF;  /* No version used yet */
 	
 	/* Calculate phase steps */
 	rds->phasestep = 2.0 * M_PI * RDS_SUBCARRIER / samplerate;
@@ -1318,6 +1977,9 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 	
 	/* Default CT enabled */
 	rds->ct_enabled = 1;
+	
+	/* Start warmup mode: Group 0 only for ~5 seconds (57 groups @ 11.4/sec) */
+	rds->warmup_countdown = 57;
 
 	/* Generate RRC biphase waveform at runtime */
 	if (rds_generate_biphase_waveform(&rds->waveform_biphase) < 0) {
@@ -1327,6 +1989,9 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 	
 
 	
+	/* Initialize Group Scheduler */
+	rds_scheduler_update(rds);
+
 	/* Generate first group */
 	rds_generate_group(rds);
 	
@@ -1348,11 +2013,19 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 	static int debug_count = 0;
 	double max_injection = 0.0;
 	
+	/* Bit consumption tracking for diagnostics */
+	static unsigned long total_bits_consumed = 0;
+	static unsigned long total_samples_processed = 0;
+	int bits_this_call = 0;
+	(void)total_bits_consumed;  /* Suppress unused warning */
+	(void)total_samples_processed;
+	
 	for (i = 0; i < num; i++) {
 		/* Advance bit timing */
 		rds->bit_phase += rds->bit_phasestep;
 		while (rds->bit_phase >= 1.0) {
 			rds->bit_phase -= 1.0;
+			bits_this_call++;
 			
 			/* Shift bit history */
 			rds->bit_history[2] = rds->bit_history[1];
@@ -1370,6 +2043,7 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 			 */
 			rds->bit_history[0] = rds->last_diff_bit ? -1 : 1;
 		}
+
 		
 		/* 
 		 * Convolve bit history with RRC/Biphase waveform.
@@ -1433,6 +2107,13 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 			phase -= 2.0 * M_PI;
 	}
 	
+	/* Update totals */
+	total_bits_consumed += bits_this_call;
+	total_samples_processed += num;
+	
+	/* Debug: log bit consumption for diagnostics */
+
+	
 	/* Debug: log occasionally to confirm RDS is being added */
 	if (++debug_count >= 100) {
 		/* LOGP(DRADIO, LOGL_DEBUG, "RDS: injecting (max=%.4f, phasestep=%.6f, samples=%d)\n",
@@ -1447,16 +2128,41 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 void rds_set_radiotext(rds_encoder_t *rds, const char *rt)
 {
 	if (!rt) return;
-	memset(rds->rt, ' ', 64);
-	int len = strlen(rt);
-	if (len > 64) len = 64;
-	memcpy(rds->rt, rt, len);
-	if (len < 64) rds->rt[len] = '\r';
+	
+	/* Validate input text and warn about unencodable characters */
+	rds_validate_text(rt, "RadioText");
+	
+	/* Clear buffer with spaces */
+	/* Clear buffer with CR terminators (unused positions = 0x0D)
+	 * EN 50067: Positions after message end should be 0x0D */
+	memset(rds->rt, '\r', 64);
+	
+	/* Convert UTF-8 to RDS encoding
+	 * - ASCII maps directly
+	 * - LF (0x0A) preserved for line breaks
+	 * - CR (0x0D) terminates the message
+	 * - Other control chars are skipped
+	 * - Non-encodable Unicode chars become space */
+	int warn = 0;
+	int len = rds_encode_text(rt, (uint8_t *)rds->rt, 64, &warn);
+	
+	/* Positions from len onwards remain as CR from memset above */
 	rds->rt[64] = '\0';
 	
-	/* Toggle A/B flag to trigger receivers to clear display */
+	/* Toggle A/B flag to trigger receivers to clear display
+	 * EN 50067: "If the receiver detects a change in the flag...
+	 * then the whole RadioText display should be cleared" */
+	uint8_t old_ab = rds->rt_ab;
 	rds->rt_ab = !rds->rt_ab;
 	rds->rt_segment = 0;
+	
+	/* Log RT change with new A/B flag */
+	LOGP(DRADIO, LOGL_INFO, "RDS: RadioText set (%d chars), A/B flag toggled %c->%c\n",
+	     len, old_ab ? 'B' : 'A', rds->rt_ab ? 'B' : 'A');
+	LOGP(DRADIO, LOGL_DEBUG, "RDS: RT content: \"%.64s\"\n", rds->rt);
+	
+	/* Update scheduler sequence (RT presence may have changed) */
+	rds_scheduler_update(rds);
 }
 
 void rds_set_ta(rds_encoder_t *rds, int ta)
@@ -1727,189 +2433,136 @@ static void rds_decode_group(rds_decoder_t *rds)
 		}
 		rds->di_status = rds->block_status[1];
 		
-		
-		/* Group 0A only: Decode Alternative Frequencies from Block C
-		 *
-		 * AF encoding (EN 50067 S3.2.1.6, IEC 62106 Table 11):
-		 *   224-249: AF count code (N = code - 224, 1-25 AFs follow)
-		 *   1-204:   FM frequency (87.6-107.9 MHz, code = (freq-87.5)*10)
-		 *   205:     Filler code (ignore)
-		 *   250:     LF/MF frequency follows (next byte is LF/MF table)
-		 *   0,251-255: Reserved (ignore)
-		 *
-		 * Method A (simple list): All AFs are equivalent alternatives
-		 *   [count, AF1] [AF2, AF3] [AF4, AF5] ...
-		 *
-		 * Method B (paired, for >25 AFs/regional): Tuning freq in each pair
-		 *   [count, tuned] [freq1, freq2] [freq1, freq2] ...
-		 *   - Ascending (freq1 < freq2): Same content
-		 *   - Descending (freq1 > freq2): Regional variant
-		 *
-		 * NOTE: Method B is detected heuristically by receivers (no control code).
-		 * This decoder stores all AFs as a simple list without method distinction.
-		 */
+		/* ============================================================
+		 * AF Method A Decode (NEW - dedicated structure with PI tracking)
+		 * ============================================================
+		 * PI-change detection: clear AF list when station changes.
+		 * Only update slots when Block C is valid/corrected.
+		 * ============================================================ */
 		if (version == 0 && (rds->group_mask & (1<<2))) {
-			/* AF processing requires valid PI - without it, we can't
-			 * associate the AF list with any station */
-			if (rds->pi == 0) {
-				/* No valid PI received yet - ignore AF data */
-				if (rds->debug)
-					LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: Ignoring AF - no valid PI\n");
-			} else {
-			uint8_t af1 = (b3 >> 8) & 0xFF;
-			uint8_t af2 = b3 & 0xFF;
-			int block_c_reliable = (rds->block_status[2] <= 1);
+			rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
 			
-			if (af1 >= 224 && af1 <= 249) {
-				/* AF count code: start of new list */
-				if (block_c_reliable) {
-					/* Get/Create Method A and LF/MF entries to reset them */
-					rds_af_entry_t *ea = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_A, 0);
-					rds_af_entry_t *el = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_LF_MF, 0);
-					
-					if (ea) ea->count = 0;
-					if (el) el->count = 0;
-					
-					/* Store first frequency - candidate for Method B tuning freq */
-					if (RDS_VALID_AF_CODE(af2) && ea) {
-						ea->list[ea->count].freq = RDS_AF_FM_BASE + af2;
-						ea->list[ea->count].flags = 0;
-						ea->count++;
-					}
-				}
-			} else if (af1 == RDS_AF_LF_MF_FOLLOWS) {
-				/* LF/MF frequency indicator (code 250) */
-				int is_us = RDS_IS_RBDS(rds->ecc);
-				int spacing = is_us ? 10 : 9;
-				int mf_base = is_us ? 380 : 387;
-				rds_af_entry_t *el = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_LF_MF, 0);
-				
-				if (el && block_c_reliable && rds->pi != 0) {
-					uint16_t freq = 0;
-					uint8_t flags = 0;
-					
-					if (af2 >= 1 && af2 <= 15) {
-						freq = 144 + af2 * 9;
-						flags = RDS_AF_FLAG_LF;
-					} else if (af2 >= 16 && af2 <= 135) {
-						freq = mf_base + af2 * spacing;
-						flags = RDS_AF_FLAG_MF;
-					}
-					
-					if (freq && el->count < RDS_AF_MAX_ITEMS) {
-						el->list[el->count].freq = freq;
-						el->list[el->count].flags = flags;
-						el->count++;
-						
-						if (rds->verbose)
-							LOGP(DRADIO, LOGL_INFO, "RDS 0A: LF/MF AF received: %d kHz (%s band)\n",
-							     freq, (flags & RDS_AF_FLAG_LF) ? "LF" : "MF");
-					}
-				}
-			} else if (block_c_reliable && af1 != 0 && af1 != RDS_AF_FILLER && af1 != RDS_AF_NO_AF) {
-				/* Regular FM AF pair - detect Method B or add to Method A */
-				uint16_t freq1 = RDS_VALID_AF_CODE(af1) ? RDS_AF_FM_BASE + af1 : 0;
-				uint16_t freq2 = RDS_VALID_AF_CODE(af2) ? RDS_AF_FM_BASE + af2 : 0;
-				
-				/* Check Method B: compare against first freq of Method A list (tuning freq) */
-				rds_af_entry_t *ea = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_A, 0);
-				uint16_t tx_freq = (ea && ea->count > 0) ? ea->list[0].freq : 0;
-				
-				int is_method_b = (tx_freq && (freq1 == tx_freq || freq2 == tx_freq));
-				
-				if (is_method_b) {
-					/* Method B: route to sub-entry for this transmitter */
-					rds->af_method_b = 1; /* Keep flag for debug/status */
-					rds_af_entry_t *eb = rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_B, tx_freq);
-					
-					if (eb) {
-						uint16_t alt = (freq1 == tx_freq) ? freq2 : freq1;
-						if (alt) {
-							int idx;
-							
-							/* Find slot: new or replace based on priority (Internal List Logic) */
-							if (eb->count < RDS_AF_MAX_ITEMS) {
-								/* Free slot available */
-								idx = eb->count++;
-							} else {
-								/* Smart replacement: Invalid then Oldest */
-								int replace_idx = 0;
-								uint32_t oldest_invalid_time = UINT32_MAX;
-								uint32_t oldest_time = UINT32_MAX;
-								int oldest_idx = 0;
-								
-								for (int j = 0; j < eb->count; j++) {
-									if (eb->list[j].entry_time < oldest_time) {
-										oldest_time = eb->list[j].entry_time;
-										oldest_idx = j;
-									}
-									if (eb->list[j].priority == RDS_AF_PRIORITY_INVALID &&
-									    eb->list[j].entry_time < oldest_invalid_time) {
-										oldest_invalid_time = eb->list[j].entry_time;
-										replace_idx = j;
-									}
-								}
-								
-								if (oldest_invalid_time == UINT32_MAX)
-									replace_idx = oldest_idx;
-								
-								idx = replace_idx;
-								if (rds->debug)
-									LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: Method B replacing item %d (%.1f MHz)\n",
-									     idx, eb->list[idx].freq / 10.0);
-							}
-							
-							/* Update Item */
-							eb->list[idx].freq = alt;
-							eb->list[idx].entry_time = rds->af_update_counter++;
-							
-							/* Determine Priority (Regional/Order) */
-							if (idx == 0) {
-								eb->list[idx].flags = 0; /* Clear Regional bit */
-								eb->list[idx].priority = RDS_AF_PRIORITY_SAME;
-							} else {
-								uint16_t prev_alt = eb->list[idx-1].freq;
-								int is_ascending = (alt > prev_alt);
-								/* Note: We use existing buffer order. ideally idx order might be scrambled.
-								 * Assuming append/linear behavior for detection. */
-								int prev_was_reg = (eb->list[idx-1].flags & RDS_AF_FLAG_REGIONAL);
-								
-								if (is_ascending) {
-									eb->list[idx].flags &= ~RDS_AF_FLAG_REGIONAL;
-									if (prev_was_reg && idx > 1) eb->list[idx].priority = RDS_AF_PRIORITY_INVALID;
-									else eb->list[idx].priority = RDS_AF_PRIORITY_SAME;
-								} else {
-									/* Descending or Equal -> Regional */
-									eb->list[idx].flags |= RDS_AF_FLAG_REGIONAL;
-									if (!prev_was_reg && idx > 1) eb->list[idx].priority = RDS_AF_PRIORITY_INVALID;
-									else eb->list[idx].priority = RDS_AF_PRIORITY_REGIONAL;
-								}
-							}
-							
-							if (rds->verbose) {
-								int is_reg = (eb->list[idx].flags & RDS_AF_FLAG_REGIONAL);
-								int is_inv = (eb->list[idx].priority == RDS_AF_PRIORITY_INVALID);
-								LOGP(DRADIO, LOGL_INFO, "RDS 0A: Method B update: TX=%.1f AF=%.1f %s%s\n",
-								     tx_freq/10.0, alt/10.0, 
-								     is_reg ? "(R)" : "",
-								     is_inv ? " [INVALID ORDER]" : "");
-							}
-						}
-					}
-				} else {
-					/* Method A: Append to list */
-					if (ea && ea->count < RDS_AF_MAX_ITEMS) {
-						if (freq1) ea->list[ea->count++].freq = freq1;
-						if (freq2 && ea->count < RDS_AF_MAX_ITEMS) ea->list[ea->count++].freq = freq2;
-					}
-				}
+			/* PI-change detection: clear list if PI changed */
+			if (rds->pi != afd->pi) {
+				if (afd->pi != 0 && rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 0A: PI changed %04X -> %04X, clearing AF list\n",
+					     afd->pi, rds->pi);
+				memset(afd, 0, sizeof(*afd));
+				afd->pi = rds->pi;
 			}
 			
-			if (rds->debug && af1 >= 1 && af1 <= 204)
-				LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: AF codes: %d, %d (Method %c)\n",
-				     af1, af2, (rds->af_method_b && rds_af_get_entry(rds, &rds->af_table, rds->pi, RDS_AF_TYPE_METHOD_B, 0)) ? 'B' : 'A');
-			}  /* end else (pi valid) */
+			/* Only process if Block C was decoded OK or corrected */
+			uint8_t block_status = rds->block_status[2];
+			if (block_status <= RDS_STATUS_CORRECTED && rds->pi != 0) {
+				uint8_t codes[2];
+				codes[0] = (b3 >> 8) & 0xFF;
+				codes[1] = b3 & 0xFF;
+				
+				int start_idx = 0;
+				
+				/* Check for Count Code (Start of new list) */
+				if (codes[0] >= 224 && codes[0] <= 249) {
+					afd->expected_count = codes[0] - 224;
+					afd->received_count = 0;
+					afd->complete = 0;
+					afd->lf_mf_follows = 0;
+					memset(afd->freq, 0, sizeof(afd->freq));
+					memset(afd->type, 0, sizeof(afd->type));
+					memset(afd->status, RDS_STATUS_NONE, sizeof(afd->status));
+					
+					/* Also init collector for Method B detection */
+					rds_af_collector_t *col = &rds->af_collector;
+					col->pi = rds->pi;
+					col->expected_count = codes[0] - 224;
+					col->received_pairs = 1;
+					col->tuning_freq = RDS_AF_FM_BASE + codes[1];
+					col->header_received = 1;
+					col->codes[0] = codes[0];
+					col->codes[1] = codes[1];
+					col->status[0] = block_status;
+					col->status[1] = block_status;
+					
+					if (rds->debug)
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: AF list start, expecting %d frequencies\n",
+						     afd->expected_count);
+					
+					/* Count code consumes first byte */
+					start_idx = 1;
+				} else if (rds->af_collector.header_received) {
+					/* Store pair in collector for Method B analysis */
+					rds_af_collector_t *col = &rds->af_collector;
+					if (col->received_pairs < 26) {
+						int idx = col->received_pairs * 2;
+						col->codes[idx] = codes[0];
+						col->codes[idx + 1] = codes[1];
+						col->status[idx] = block_status;
+						col->status[idx + 1] = block_status;
+						col->received_pairs++;
+					}
+				}
+				
+				/* Process 1 or 2 items based on start_idx */
+				int is_us = RDS_IS_RBDS(rds->ecc);
+				
+				for (int i = start_idx; i < 2; i++) {
+					uint8_t code = codes[i];
+					
+					if (afd->lf_mf_follows) {
+						/* Previous byte was 250 -> this is LF/MF code */
+						uint16_t freq_khz = 0;
+						rds_af_freq_type_t ftype = RDS_AF_FREQ_MF;
+						
+						if (code >= 1 && code <= 15) {
+							/* LF: 153-279 kHz */
+							freq_khz = 144 + code * 9;
+							ftype = RDS_AF_FREQ_LF;
+						} else if (code >= 16 && code <= 135) {
+							/* MF: 531-1602 kHz (RDS) or 540-1700 kHz (RBDS) */
+							if (is_us)
+								freq_khz = 540 + (code - 16) * 10;
+							else
+								freq_khz = 531 + (code - 16) * 9;
+							ftype = RDS_AF_FREQ_MF;
+						}
+						
+						if (freq_khz && afd->received_count < 25 && 
+						    afd->received_count < afd->expected_count) {
+							afd->freq[afd->received_count] = freq_khz;
+							afd->type[afd->received_count] = ftype;
+							afd->status[afd->received_count] = block_status;
+							afd->received_count++;
+							
+							if (rds->verbose)
+								LOGP(DRADIO, LOGL_INFO, "RDS 0A: %s AF %d kHz\n",
+								     ftype == RDS_AF_FREQ_LF ? "LF" : "MF", freq_khz);
+						}
+						afd->lf_mf_follows = 0;
+						
+					} else if (code == RDS_AF_LF_MF_FOLLOWS) {
+						/* Marker (250) -> next code is LF/MF */
+						afd->lf_mf_follows = 1;
+						
+					} else if (RDS_VALID_AF_CODE(code)) {
+						/* VHF Frequency (1-204) */
+						if (afd->received_count < 25 && 
+						    afd->received_count < afd->expected_count) {
+							afd->freq[afd->received_count] = RDS_AF_FM_BASE + code;
+							afd->type[afd->received_count] = RDS_AF_FREQ_VHF;
+							afd->status[afd->received_count] = block_status;
+							afd->received_count++;
+						}
+					}
+				}
+				
+				/* Check completion */
+				if (afd->received_count >= afd->expected_count && afd->expected_count > 0) {
+					/* Analyze collected data for Method B pattern */
+					rds_af_decode_complete(rds);
+				}
+			}
 		}
+		
+
 		
 		/* DEBUG: Compact codes */
 		if (rds->debug)
@@ -2032,7 +2685,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 		}
 	}
 	else if (group_type == 2) {
-		/* Group 2A/2B: RadioText - see RDS_2A_* macros in rds.h */
+		/* Group 2A/2B: RadioText (IEC 62106 S6.1.5.3)
+		 * 
+		 * EN 50067: "A mixture of type 2A and type 2B groups must not be used
+		 * when transmitting any one given message."
+		 * 
+		 * We maintain separate buffers for 2A (64 chars) and 2B (32 chars).
+		 * The A/B flag is tracked independently for each version.
+		 * The display buffer (rt[]) is updated with whichever was last received.
+		 */
 		int ab_flag = (b2 & RDS_2A_AB_MASK) >> RDS_2A_AB_BIT;
 		int seg = b2 & RDS_2A_SEG_MASK;
 		
@@ -2041,46 +2702,103 @@ static void rds_decode_group(rds_decoder_t *rds)
 			LOGP(DRADIO, LOGL_DEBUG, "RDS 2%c: AB=%d seg=%d\n",
 			     version ? 'B' : 'A', ab_flag, seg);
 		
-		if (ab_flag != rds->rt_ab) {
-			rds->rt_ab = ab_flag;
-			rds->rt_segments = 0;
-			memset(rds->rt, ' ', 64);
-			if (rds->verbose)
-				LOGP(DRADIO, LOGL_INFO, "RDS 2%c: Text Change Flag toggled to %c "
-				     "(new RadioText message starting)\n",
-				     version ? 'B' : 'A', ab_flag ? 'B' : 'A');
-		}
-		
 		if (version == 0) {
+			/* Group 2A: 64 chars (4 chars per segment, 16 segments) */
+			
+			/* Check A/B flag change for 2A buffer */
+			if (ab_flag != rds->rt_2a_ab) {
+				rds->rt_2a_ab = ab_flag;
+				rds->rt_2a_segments = 0;
+				memset(rds->rt_2a, ' ', 64);
+				rds->rt_2a[64] = '\0';
+				memset(rds->rt_2a_status, RDS_STATUS_NONE, 64);
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 2A: A/B flag toggled to %c "
+					     "(clearing 2A buffer)\n", ab_flag ? 'B' : 'A');
+			}
+			
 			int pos = seg * 4;
 			if (pos <= 60) {
-				rds->rt[pos] = (b3 >> 8) & 0xFF;
-				rds->rt[pos+1] = b3 & 0xFF;
-				rds->rt[pos+2] = (b4 >> 8) & 0xFF;
-				rds->rt[pos+3] = b4 & 0xFF;
-				rds->rt_status[pos] = rds->block_status[2];
-				rds->rt_status[pos+1] = rds->block_status[2];
-				rds->rt_status[pos+2] = rds->block_status[3];
-				rds->rt_status[pos+3] = rds->block_status[3];
-				/* Verbose: Log RadioText 2A segment reception progress */
-				if (rds->verbose)
-					LOGP(DRADIO, LOGL_INFO, "RDS 2A: RadioText segment %d/16, "
-					     "chars %d-%d received\n", seg + 1, pos, pos + 3);
+				rds->rt_2a[pos] = (b3 >> 8) & 0xFF;
+				rds->rt_2a[pos+1] = b3 & 0xFF;
+				rds->rt_2a[pos+2] = (b4 >> 8) & 0xFF;
+				rds->rt_2a[pos+3] = b4 & 0xFF;
+				rds->rt_2a_status[pos] = rds->block_status[2];
+				rds->rt_2a_status[pos+1] = rds->block_status[2];
+				rds->rt_2a_status[pos+2] = rds->block_status[3];
+				rds->rt_2a_status[pos+3] = rds->block_status[3];
+				rds->rt_2a_segments |= (1 << seg);
+				
+				if (rds->verbose) {
+					LOGP(DRADIO, LOGL_INFO, "RDS RX 2A: seg=%d pos=%d-%d AB=%c "
+					     "chars='%s%s%s%s'\n", seg, pos, pos+3, ab_flag ? 'B' : 'A',
+					     rds_char_to_display((uint8_t)rds->rt_2a[pos]),
+					     rds_char_to_display((uint8_t)rds->rt_2a[pos+1]),
+					     rds_char_to_display((uint8_t)rds->rt_2a[pos+2]),
+					     rds_char_to_display((uint8_t)rds->rt_2a[pos+3]));
+				}
 			}
+			
+			/* Update display buffer with 2A content
+			 * IEC 62106: "If no change in flag, segments should be written into
+			 * the existing displayed message." We follow spec literally.
+			 * Version and A/B flag tracked for status display. */
+			if (rds->rt_display_version == 1 && rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS: Now receiving 2A (was 2B)\n");
+			memcpy(rds->rt, rds->rt_2a, 65);
+			memcpy(rds->rt_status, rds->rt_2a_status, 64);
+			rds->rt_ab = rds->rt_2a_ab;
+			rds->rt_version = 0;
+			rds->rt_display_version = 0;
+			rds->rt_segments = rds->rt_2a_segments;
+			
 		} else {
-			int pos = seg * 2;
-			if (pos <= 62) {
-				rds->rt[pos] = (b4 >> 8) & 0xFF;
-				rds->rt[pos+1] = b4 & 0xFF;
-				rds->rt_status[pos] = rds->block_status[3];
-				rds->rt_status[pos+1] = rds->block_status[3];
-				/* Verbose: Log RadioText 2B segment reception progress */
+			/* Group 2B: 32 chars (2 chars per segment, 16 segments) */
+			
+			/* Check A/B flag change for 2B buffer */
+			if (ab_flag != rds->rt_2b_ab) {
+				rds->rt_2b_ab = ab_flag;
+				rds->rt_2b_segments = 0;
+				memset(rds->rt_2b, ' ', 32);
+				rds->rt_2b[32] = '\0';
+				memset(rds->rt_2b_status, RDS_STATUS_NONE, 32);
 				if (rds->verbose)
-					LOGP(DRADIO, LOGL_INFO, "RDS 2B: RadioText segment %d/16, "
-					     "chars %d-%d received\n", seg + 1, pos, pos + 1);
+					LOGP(DRADIO, LOGL_INFO, "RDS 2B: A/B flag toggled to %c "
+					     "(clearing 2B buffer)\n", ab_flag ? 'B' : 'A');
 			}
+			
+			int pos = seg * 2;
+			if (pos <= 30) {
+				rds->rt_2b[pos] = (b4 >> 8) & 0xFF;
+				rds->rt_2b[pos+1] = b4 & 0xFF;
+				rds->rt_2b_status[pos] = rds->block_status[3];
+				rds->rt_2b_status[pos+1] = rds->block_status[3];
+				rds->rt_2b_segments |= (1 << seg);
+				
+				if (rds->verbose) {
+					LOGP(DRADIO, LOGL_INFO, "RDS RX 2B: seg=%d pos=%d-%d AB=%c "
+					     "chars='%s%s'\n", seg, pos, pos+1, ab_flag ? 'B' : 'A',
+					     rds_char_to_display((uint8_t)rds->rt_2b[pos]),
+					     rds_char_to_display((uint8_t)rds->rt_2b[pos+1]));
+				}
+			}
+			
+			/* Update display buffer with 2B content (padded to 64 for display)
+			 * IEC 62106: "If no change in flag, segments should be written into
+			 * the existing displayed message." We follow spec literally.
+			 * Version and A/B flag tracked for status display. */
+			if (rds->rt_display_version == 0 && rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS: Now receiving 2B (was 2A)\n");
+			memset(rds->rt, ' ', 64);
+			memcpy(rds->rt, rds->rt_2b, 32);
+			rds->rt[64] = '\0';
+			memset(rds->rt_status, RDS_STATUS_NONE, 64);
+			memcpy(rds->rt_status, rds->rt_2b_status, 32);
+			rds->rt_ab = rds->rt_2b_ab;
+			rds->rt_version = 1;
+			rds->rt_display_version = 1;
+			rds->rt_segments = rds->rt_2b_segments;
 		}
-		rds->rt_segments |= (1 << seg);
 	}
 	else if (group_type == 4 && version == 0) {
 		/* Group 4A: Clock-Time and Date (IEC 62106 S6.1.5.4)
@@ -2669,6 +3387,7 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->pin_status = RDS_STATUS_NONE;
 	rds->ct_status = RDS_STATUS_NONE;
 	memset(rds->ptyn_status, RDS_STATUS_NONE, sizeof(rds->ptyn_status));
+	rds->rt_display_version = 0xFF;  /* No version in display yet */
 	memset(rds->ptyn, ' ', 8);
 	rds->ptyn[8] = '\0';
 	
@@ -2979,8 +3698,8 @@ int rds_get_rt(rds_decoder_t *rds, char *rt)
 
 void rds_decoder_status(rds_decoder_t *rds)
 {
-	char ps_sanitized[9];
-	char rt_sanitized[65];
+	char ps_display[64];   /* Larger buffer for UTF-8 + control char display */
+	char rt_display[512];  /* Larger buffer for UTF-8 + control char display */
 	int i;
 	
 	if (rds->blocks_received < 10) return;
@@ -2990,21 +3709,11 @@ void rds_decoder_status(rds_decoder_t *rds)
 	                        (s) == RDS_STATUS_CORRECTED ? '?' : \
 	                        (s) == RDS_STATUS_ERROR ? 'X' : '_')
 	
-	/* Sanitize PS */
-	memcpy(ps_sanitized, rds->ps, 9);
-	for (i=0; i<8; i++) {
-		if (ps_sanitized[i] < 0x20 || ps_sanitized[i] > 0x7E) ps_sanitized[i] = ' ';
-	}
-	ps_sanitized[8] = '\0';
+	/* Convert PS to display-safe UTF-8 (control chars shown as <XX>) */
+	rds_text_to_display((uint8_t *)rds->ps, 8, ps_display, sizeof(ps_display));
 	
-	/* Sanitize RT */
-	memcpy(rt_sanitized, rds->rt, 65);
-	for (i=0; i<64; i++) {
-		if (rt_sanitized[i] < 0x20 || rt_sanitized[i] > 0x7E) rt_sanitized[i] = ' ';
-	}
-	rt_sanitized[64] = '\0';
-	/* Trim trailing spaces */
-	for (i=63; i>=0 && rt_sanitized[i]==' '; i--) rt_sanitized[i] = '\0';
+	/* Convert RT to display-safe UTF-8 (control chars shown as <XX>) */
+	rds_text_to_display((uint8_t *)rds->rt, 64, rt_display, sizeof(rt_display));
 	
 	/* Header */
 	LOGP(DRADIO, LOGL_NOTICE, "=== RDS Status Dump ===\n");
@@ -3025,7 +3734,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 		}
 		ps_status_str[8] = '\0';
 		LOGP(DRADIO, LOGL_NOTICE, "PI=%-11s %c  PS=\"%s\"  Sync=%s  BER=%.1f%%\n",
-		     pi_str, STATUS_CHAR(rds->pi_status), ps_sanitized,
+		     pi_str, STATUS_CHAR(rds->pi_status), ps_display,
 		     rds->synced ? "Y" : "N",
 		     rds->ber_percent);
 		/*               PI=XXXX X  PS=" = 15 chars padding */
@@ -3053,47 +3762,69 @@ void rds_decoder_status(rds_decoder_t *rds)
 		     STATUS_CHAR(rds->di_status));
 	}
 	
-	/* Alternative Frequencies (Unified) */
-	if (rds->af_table.count > 0) {
-		LOGP(DRADIO, LOGL_NOTICE, "Alternative Frequencies:\n");
-		for (i = 0; i < rds->af_table.count; i++) {
-			rds_af_entry_t *e = &rds->af_table.entries[i];
-			if (e->count == 0) continue;
-			
-			/* Basic check: only show AFs matching current PI to avoid confusion, 
-			 * or valid PIs if debugging multiple services */
-			if (e->pi != rds->pi && rds->pi != 0) continue;
-			
-			char af_buf[256] = "";
-			int pos = 0;
-			
-			/* Header */
-			char header[64];
-			if (e->type == RDS_AF_TYPE_METHOD_A)
-				snprintf(header, sizeof(header), "  Method A");
-			else if (e->type == RDS_AF_TYPE_METHOD_B)
-				snprintf(header, sizeof(header), "  Method B (TX=%.1f)", e->tx_freq / 10.0);
-			else if (e->type == RDS_AF_TYPE_LF_MF)
-				snprintf(header, sizeof(header), "  LF/MF");
-			else
-				snprintf(header, sizeof(header), "  Unknown");
-
-			/* List */
-			for (int j = 0; j < e->count && pos < 240; j++) {
-				if (e->type == RDS_AF_TYPE_LF_MF) {
-					pos += snprintf(af_buf + pos, sizeof(af_buf) - pos, "%d(%s) ",
-					                e->list[j].freq,
-					                (e->list[j].flags & 0x02) ? "LF" : "MF");
-				} else {
-					pos += snprintf(af_buf + pos, sizeof(af_buf) - pos, "%.1f%s ",
-					                e->list[j].freq / 10.0,
-					                (e->list[j].flags & 0x01) ? "(R)" : "");
-				}
+	/* Alternative Frequencies (Method A) */
+	if (rds->af_method_a_dec.received_count > 0) {
+		rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
+		char af_buf[256] = "";
+		int pos = 0;
+		
+		for (int j = 0; j < afd->received_count && pos < 240; j++) {
+			if (afd->type[j] == RDS_AF_FREQ_VHF) {
+				pos += snprintf(af_buf + pos, sizeof(af_buf) - pos, "%.1f ",
+				                afd->freq[j] / 10.0);
+			} else {
+				pos += snprintf(af_buf + pos, sizeof(af_buf) - pos, "%d(%s) ",
+				                afd->freq[j],
+				                afd->type[j] == RDS_AF_FREQ_LF ? "LF" : "MF");
 			}
-			LOGP(DRADIO, LOGL_NOTICE, "%-20s: %s\n", header, af_buf);
 		}
+		LOGP(DRADIO, LOGL_NOTICE, "Alt. Frequencies    : %s%s\n", af_buf,
+		     afd->complete ? "[complete]" : "[partial]");
 	}
 	
+	/* AF Method A Last Good (if different from current or current has errors) */
+	if (rds->af_method_a_dec.last_good_count > 0) {
+		rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
+		char buf[256] = "";
+		int pos = 0;
+		
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "  [1] PI=%04X: ",
+		                afd->last_good_pi);
+		
+		for (int j = 0; j < afd->last_good_count && pos < 240; j++) {
+			if (afd->last_good_type[j] == RDS_AF_FREQ_VHF) {
+				pos += snprintf(buf + pos, sizeof(buf) - pos, "%.1f ",
+				                afd->last_good_freq[j] / 10.0);
+			} else {
+				pos += snprintf(buf + pos, sizeof(buf) - pos, "%d(%s) ",
+				                afd->last_good_freq[j],
+				                afd->last_good_type[j] == RDS_AF_FREQ_LF ? "LF" : "MF");
+			}
+		}
+		LOGP(DRADIO, LOGL_NOTICE, "AF Method A Last OK :\n");
+		LOGP(DRADIO, LOGL_NOTICE, "%s\n", buf);
+	}
+
+	/* Alternative Frequencies (Method B History) */
+	if (rds->af_method_b_dec.history_count > 0) {
+		LOGP(DRADIO, LOGL_NOTICE, "AF Method B History :\n");
+		for (int i = 0; i < rds->af_method_b_dec.history_count; i++) {
+			rds_af_method_b_history_t *h = &rds->af_method_b_dec.history[i];
+			char buf[256] = "";
+			int pos = 0;
+			
+			pos += snprintf(buf + pos, sizeof(buf) - pos, "  [%d] PI=%04X Tune=%.1f: ",
+			                i + 1, h->pi, h->tuning_freq / 10.0);
+			
+			for (int j = 0; j < h->received_count && pos < 240; j++) {
+				pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%.1f ",
+				                h->af_is_regional[j] ? "R" : "",
+				                h->af_freq[j] / 10.0);
+			}
+			LOGP(DRADIO, LOGL_NOTICE, "%s\n", buf);
+		}
+	}
+
 	/* Block statistics */
 	LOGP(DRADIO, LOGL_NOTICE, "Groups=%d  Blocks: OK=%ld  Bad=%ld  Total=%ld\n",
 	     rds->groups_received, rds->blocks_ok, rds->blocks_bad, rds->blocks_received);
@@ -3101,32 +3832,30 @@ void rds_decoder_status(rds_decoder_t *rds)
 	
 	/* PTYN (if any bits received) */
 	if (rds->ptyn_segments) {
-		char ptyn_sanitized[9];
+		char ptyn_display[64];
 		char ptyn_status_str[9];
 		
-		memcpy(ptyn_sanitized, rds->ptyn, 9);
+		rds_text_to_display((uint8_t *)rds->ptyn, 8, ptyn_display, sizeof(ptyn_display));
 		for (i=0; i<8; i++) {
-			if (ptyn_sanitized[i] < 0x20 || ptyn_sanitized[i] > 0x7E) ptyn_sanitized[i] = ' ';
 			ptyn_status_str[i] = STATUS_CHAR(rds->ptyn_status[i]);
 		}
-		ptyn_sanitized[8] = '\0';
 		ptyn_status_str[8] = '\0';
 		
-		LOGP(DRADIO, LOGL_NOTICE, "PTYN=\"%s\"\n", ptyn_sanitized);
+		LOGP(DRADIO, LOGL_NOTICE, "PTYN=\"%s\"\n", ptyn_display);
+		/* Note: Status shows per-byte quality, may not align if control chars expanded */
 		LOGP(DRADIO, LOGL_NOTICE, "      %s\n", ptyn_status_str);
 	}
 	
-	/* RadioText (if any) with status beneath */
-	if (rt_sanitized[0] != '\0') {
-		char rt_status_str[65];
-		int rt_len = strlen(rt_sanitized);
-		for (i=0; i<rt_len; i++) {
-			rt_status_str[i] = STATUS_CHAR(rds->rt_status[i]);
-		}
-		rt_status_str[rt_len] = '\0';
-		LOGP(DRADIO, LOGL_NOTICE, "RT=\"%s\"\n", rt_sanitized);
-		/*              RT=" = 4 chars padding */
-		LOGP(DRADIO, LOGL_NOTICE, "    %s\n", rt_status_str);
+	/* RadioText (if any) with group version and A/B flag */
+	if (rt_display[0] != '\0') {
+		/* Note: rt_display contains UTF-8 with <XX> for control chars.
+		 * Status string is per source byte, not per display character.
+		 * For terminals, this won't align perfectly if control chars present. */
+		LOGP(DRADIO, LOGL_NOTICE, "RT[%s AB=%c]=\"%s\"\n",
+		     rds->rt_display_version == 0 ? "2A" : 
+		     rds->rt_display_version == 1 ? "2B" : "??",
+		     rds->rt_ab ? 'B' : 'A',
+		     rt_display);
 	}
 	
 	/* Extended info (if available) with status */

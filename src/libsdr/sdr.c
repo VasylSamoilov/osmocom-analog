@@ -306,6 +306,26 @@ void *sdr_open_internal(int direction, const char *device, double *tx_frequency,
 
 	if (tx_frequency && !channels)
 		tx_center_frequency = tx_frequency[0];
+	
+	/* TX IQ wave recording - works for all TX modes, including channels=0 (osmoradio) */
+	if (tx_frequency && sdr_config->write_iq_tx_wave) {
+		rc = wave_create_record(&sdr->wave_tx_rec, sdr_config->write_iq_tx_wave, samplerate, 2, 1.0);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "Failed to create TX WAVE recording instance!\n");
+			goto error;
+		}
+		LOGP(DSDR, LOGL_INFO, "Recording TX IQ to: %s\n", sdr_config->write_iq_tx_wave);
+	}
+	if (tx_frequency && sdr_config->read_iq_tx_wave) {
+		int two = 2;
+		rc = wave_create_playback(&sdr->wave_tx_play, sdr_config->read_iq_tx_wave, &samplerate, &two, 1.0);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "Failed to create TX WAVE playback instance!\n");
+			goto error;
+		}
+		LOGP(DSDR, LOGL_INFO, "Replacing TX IQ from: %s\n", sdr_config->read_iq_tx_wave);
+	}
+	
 	if (tx_frequency && channels) {
 		/* calculate required bandwidth (IQ rate) */
 
@@ -433,22 +453,6 @@ void *sdr_open_internal(int direction, const char *device, double *tx_frequency,
 		}
 		/* show gain */
 		LOGP(DSDR, LOGL_INFO, "Using gain: TX %.1f dB\n", sdr_config->tx_gain);
-		/* open wave */
-		if (sdr_config->write_iq_tx_wave) {
-			rc = wave_create_record(&sdr->wave_tx_rec, sdr_config->write_iq_tx_wave, samplerate, 2, 1.0);
-			if (rc < 0) {
-				LOGP(DSDR, LOGL_ERROR, "Failed to create WAVE recoding instance!\n");
-				goto error;
-			}
-		}
-		if (sdr_config->read_iq_tx_wave) {
-			int two = 2;
-			rc = wave_create_playback(&sdr->wave_tx_play, sdr_config->read_iq_tx_wave, &samplerate, &two, 1.0);
-			if (rc < 0) {
-				LOGP(DSDR, LOGL_ERROR, "Failed to create WAVE playback instance!\n");
-				goto error;
-			}
-		}
 	}
 
 	if (rx_frequency && !channels)
