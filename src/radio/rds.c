@@ -540,32 +540,6 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
  * AF METHOD B Decoder Helper Functions (IEC 62106 S3.2.1.6.4)
  * ============================================================ */
 
-/**
- * Check if a collected AF list matches Method B pattern.
- * Method B: tuning freq appears in one position of every pair.
- * @return 1 if Method B pattern, 0 if Method A
- */
-static int rds_af_check_method_b_pattern(rds_af_method_a_dec_t *afd)
-{
-	if (afd->expected_count < 3)
-		return 0;  /* Too few frequencies for Method B */
-	
-	/* In Method B, the first frequency after count is the tuning freq.
-	 * All subsequent pairs must contain this tuning frequency. */
-	uint16_t tuning_freq = afd->freq[0];
-	
-	/* Check that tuning freq appears in all pairs */
-	for (int i = 1; i < afd->received_count; i++) {
-		/* For Method B, we would expect the freq to match tuning or 
-		 * be paired with tuning. But since Method A stores decoded frequencies,
-		 * we need to check the raw pattern during collection. */
-	}
-	
-	/* Since current decoder immediately interprets codes as Method A,
-	 * we can't reliably detect Method B from the decoded result.
-	 * For now, return 0 - full Method B decoder requires collector approach. */
-	return 0;
-}
 
 /**
  * Compare two Method B history entries for equality.
@@ -1147,16 +1121,30 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
 	
-	/* SLC Variant Sequence: cycle through active variants
-	 * IEC 62106 Table 9:
-	 *   0 = ECC (Extended Country Code)
-	 *   3 = Language Identification Code (LIC)
-	 * Other variants (TMC, EWS) can be added as needed */
-	static const int slc_variants[] = {
-		RDS_1A_VARIANT_ECC,
-		RDS_1A_VARIANT_LANGUAGE
-	};
-	static const int slc_variant_count = sizeof(slc_variants) / sizeof(slc_variants[0]);
+	/* Build dynamic SLC variant sequence from enabled fields
+	 * IEC 62106 Table 9 - cycle only through configured (non-zero) variants:
+	 *   0 = ECC (Extended Country Code) - always included
+	 *   1 = TMC ID - if tmc_id != 0
+	 *   3 = Language Identification Code - if language != 0
+	 *   6 = Broadcaster data - if slc_broadcaster != 0
+	 *   7 = EWS channel ID - if ews_channel != 0
+	 */
+	int slc_variants[8];  /* Max 8 variants in IEC 62106 Table 9 */
+	int slc_variant_count = 0;
+	
+	/* Always include ECC (variant 0) - even if ecc=0x00 ("not defined"),
+	 * this variant carries the LA (Linkage Actuator) flag which is always useful */
+	slc_variants[slc_variant_count++] = RDS_1A_VARIANT_ECC;
+	
+	/* Include optional variants only if configured */
+	if (rds->tmc_id != 0)
+		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_TMC_ID;
+	if (rds->language != 0)
+		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_LANGUAGE;
+	if (rds->slc_broadcaster != 0)
+		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_BCAST;
+	if (rds->ews_channel != 0)
+		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_EWS;
 	
 	int variant = slc_variants[rds->slc_variant % slc_variant_count];
 	
@@ -1164,36 +1152,62 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 	
 	/* Block B: Group 1A + TP + PTY 
-	 * Bits 4-0: Radio Paging codes (set to 0) */
+	 * Bits 4-0: Radio Paging codes (set to 0, deprecated) */
 	b2 = (RDS_GROUP_1A << RDS_B2_GROUP_SHIFT) |
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT);
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 	
-	/* Block C: LA + Variant + Payload (IEC 62106 Table 9) */
+	/* Block C: LA + Variant + Payload (IEC 62106 Table 9)
+	 * Bits 15:    LA (Linkage Actuator)
+	 * Bits 14-12: Variant code (0-7)
+	 * Bits 11-0:  Variant-specific payload */
 	switch (variant) {
 	case RDS_1A_VARIANT_ECC:
 		/* Variant 0: Extended Country Code
-		 * Bits 15: LA (Linkage Actuator)
-		 * Bits 14-12: Variant (0)
-		 * Bits 11-8: Paging (0)
-		 * Bits 7-0: ECC */
-		b3 = (RDS_1A_VARIANT_ECC << RDS_1A_VARIANT_SHIFT) |
+		 * Bits 11-8: Paging (always 0, deprecated)
+		 * Bits 7-0:  ECC value */
+		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
+		     (RDS_1A_VARIANT_ECC << RDS_1A_VARIANT_SHIFT) |
 		     (rds->ecc & 0xFF);
+		break;
+		
+	case RDS_1A_VARIANT_TMC_ID:
+		/* Variant 1: TMC identification
+		 * Bits 11-0: TMC ID for traffic message channel */
+		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
+		     (RDS_1A_VARIANT_TMC_ID << RDS_1A_VARIANT_SHIFT) |
+		     (rds->tmc_id & RDS_1A_PAYLOAD_MASK);
 		break;
 		
 	case RDS_1A_VARIANT_LANGUAGE:
 		/* Variant 3: Language Identification Code (LIC)
-		 * TEF6686 displays this as "LIC" on screen
-		 * Bits 14-12: Variant (3)
-		 * Bits 7-0: Language code (0-127) */
-		b3 = (RDS_1A_VARIANT_LANGUAGE << RDS_1A_VARIANT_SHIFT) |
+		 * Bits 7-0: Language code (0-127, IEC 62106 Annex J) */
+		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
+		     (RDS_1A_VARIANT_LANGUAGE << RDS_1A_VARIANT_SHIFT) |
 		     (rds->language & 0xFF);
 		break;
 		
+	case RDS_1A_VARIANT_BCAST:
+		/* Variant 6: Broadcaster use
+		 * Bits 11-0: Broadcaster-defined data */
+		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
+		     (RDS_1A_VARIANT_BCAST << RDS_1A_VARIANT_SHIFT) |
+		     (rds->slc_broadcaster & RDS_1A_PAYLOAD_MASK);
+		break;
+		
+	case RDS_1A_VARIANT_EWS:
+		/* Variant 7: Emergency Warning System channel ID
+		 * Bits 11-0: EWS channel number */
+		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
+		     (RDS_1A_VARIANT_EWS << RDS_1A_VARIANT_SHIFT) |
+		     (rds->ews_channel & RDS_1A_PAYLOAD_MASK);
+		break;
+		
 	default:
-		/* Fallback to ECC */
-		b3 = (RDS_1A_VARIANT_ECC << RDS_1A_VARIANT_SHIFT) |
+		/* Fallback to ECC if unknown variant somehow selected */
+		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
+		     (RDS_1A_VARIANT_ECC << RDS_1A_VARIANT_SHIFT) |
 		     (rds->ecc & 0xFF);
 		break;
 	}
@@ -1214,6 +1228,7 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	/* Advance to next variant for next call */
 	rds->slc_variant = (rds->slc_variant + 1) % slc_variant_count;
 }
+
 
 /* Build Group 1B: PIN only (PI repeat in Block C, no SLC data)
  * IEC 62106 S6.1.5.2 - Version B for faster PIN transmission
@@ -2482,9 +2497,16 @@ static void rds_decode_group(rds_decoder_t *rds)
 					col->status[0] = block_status;
 					col->status[1] = block_status;
 					
+					/* Log count code - special case for 224 (no AF) */
+				if (afd->expected_count == 0) {
 					if (rds->debug)
-						LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: AF list start, expecting %d frequencies\n",
-						     afd->expected_count);
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: AF code 224 (No AF exists)\n");
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 0A: No AF (count 0)\n");
+				} else if (rds->debug) {
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 0A: AF list start, expecting %d frequencies\n",
+					     afd->expected_count);
+				}
 					
 					/* Count code consumes first byte */
 					start_idx = 1;
@@ -2525,7 +2547,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 							ftype = RDS_AF_FREQ_MF;
 						}
 						
-						if (freq_khz && afd->received_count < 25 && 
+						if (freq_khz && afd->received_count < RDS_AF_MAX_METHOD_A && 
 						    afd->received_count < afd->expected_count) {
 							afd->freq[afd->received_count] = freq_khz;
 							afd->type[afd->received_count] = ftype;
@@ -2544,12 +2566,24 @@ static void rds_decode_group(rds_decoder_t *rds)
 						
 					} else if (RDS_VALID_AF_CODE(code)) {
 						/* VHF Frequency (1-204) */
-						if (afd->received_count < 25 && 
+						if (afd->received_count < RDS_AF_MAX_METHOD_A && 
 						    afd->received_count < afd->expected_count) {
 							afd->freq[afd->received_count] = RDS_AF_FM_BASE + code;
 							afd->type[afd->received_count] = RDS_AF_FREQ_VHF;
 							afd->status[afd->received_count] = block_status;
 							afd->received_count++;
+						}
+					} else {
+						/* Log reserved/invalid AF codes per IEC 62106 Table 11 */
+						if (code == 0) {
+							if (rds->verbose)
+								LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF code 0 (not to be used)\n");
+						} else if (code >= RDS_AF_RESERVED1_MIN && code <= RDS_AF_RESERVED1_MAX) {
+							if (rds->verbose)
+								LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF code %d (reserved 206-223)\n", code);
+						} else if (code >= RDS_AF_RESERVED2_MIN) {
+							if (rds->verbose)
+								LOGP(DRADIO, LOGL_INFO, "RDS 0A: AF code %d (reserved 251-255)\n", code);
 						}
 					}
 				}
@@ -2609,8 +2643,19 @@ static void rds_decode_group(rds_decoder_t *rds)
 	else if (group_type == 1) {
 		/* Group 1A/1B: Programme Item Number and slow labeling codes
 		 * See RDS_1A_* and RDS_PIN_* macros in rds.h for bit field definitions
+		 * Block B bits 4-0: Radio Paging codes (deprecated, usually 0)
 		 */
+		int radio_paging = b2 & 0x1F;  /* Block B bits 4-0 */
 		
+		/* Log Radio Paging codes if non-zero (deprecated) */
+		if (radio_paging != 0) {
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 1%c: Radio Paging (B2[4:0])=%d (deprecated)\n",
+				     version ? 'B' : 'A', radio_paging);
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 1%c: Radio Paging codes=%d (deprecated, bits 4-0)\n",
+				     version ? 'B' : 'A', radio_paging);
+		}
 	/* Decode PIN from Block D (both 1A and 1B) */
 		if (rds->group_mask & (1<<3)) {
 			rds->pin = b4;
@@ -2651,19 +2696,41 @@ static void rds_decode_group(rds_decoder_t *rds)
 			
 		switch (variant) {
 			case RDS_1A_VARIANT_ECC:
-				/* Extended Country Code */
+				/* Variant 0: Extended Country Code + Paging (IEC 62106 Table 9)
+				 * Bits 11-8: Paging codes (deprecated, usually 0)
+				 * Bits 7-0:  Extended Country Code */
 				rds->ecc = payload & 0xFF;
 				rds->ecc_status = rds->block_status[2];
-				if (rds->debug)
-					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: ECC=0x%02X CC=%d LA=%d\n",
-					     rds->ecc, cc, rds->linkage_actuator);
-				if (rds->verbose)
-					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Extended Country Code=%s, "
-					     "Country Code=%d, Linkage Actuator=%d. "
-					     "Summary: Country=\"%s\", Programme Linkage=%s\n",
-					     rds_get_ecc_name(rds->ecc), cc, rds->linkage_actuator,
-					     rds_get_country_code(cc, rds->ecc),
-					     rds->linkage_actuator ? "Yes" : "No");
+				{
+					int paging = (payload >> 8) & 0x0F;
+					/* Normal operation: paging=0 (deprecated), only log ECC */
+					if (paging != 0) {
+						/* Non-zero paging - log in both debug and verbose */
+						if (rds->debug)
+							LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: ECC=0x%02X Paging=%d (deprecated) CC=%d LA=%d\n",
+							     rds->ecc, paging, cc, rds->linkage_actuator);
+						if (rds->verbose)
+							LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X (%s), "
+							     "Paging=%d (deprecated), LA=%d. "
+							     "Country=\"%s\", Linkage=%s\n",
+							     rds->ecc, rds_get_ecc_name(rds->ecc),
+							     paging, rds->linkage_actuator,
+							     rds_get_country_code(cc, rds->ecc),
+							     rds->linkage_actuator ? "Yes" : "No");
+					} else {
+						/* Normal case: paging=0, just log ECC */
+						if (rds->debug)
+							LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: ECC=0x%02X CC=%d LA=%d\n",
+							     rds->ecc, cc, rds->linkage_actuator);
+						if (rds->verbose)
+							LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X (%s), LA=%d. "
+							     "Country=\"%s\", Linkage=%s\n",
+							     rds->ecc, rds_get_ecc_name(rds->ecc),
+							     rds->linkage_actuator,
+							     rds_get_country_code(cc, rds->ecc),
+							     rds->linkage_actuator ? "Yes" : "No");
+					}
+				}
 				break;
 			case RDS_1A_VARIANT_LANGUAGE:
 				/* Language code */
@@ -2680,8 +2747,62 @@ static void rds_decode_group(rds_decoder_t *rds)
 					     rds_get_language_name(rds->language_code),
 					     rds->linkage_actuator ? "Yes" : "No");
 				break;
-			/* Variants TMC_ID, PAGER, BCAST, EWS not decoded yet */
+				case RDS_1A_VARIANT_TMC_ID:
+				/* TMC identification (IEC 62106 Table 9)
+				 * Bits 11-0: TMC ID for traffic message channel
+				 * Used with Group 8A for TMC data */
+				rds->tmc_id = payload & RDS_1A_PAYLOAD_MASK;
+				rds->tmc_id_status = rds->block_status[2];
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: TMC ID=0x%03X LA=%d\n",
+					     rds->tmc_id, rds->linkage_actuator);
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: TMC ID=0x%03X (%d), "
+					     "Linkage Actuator=%d\n",
+					     rds->tmc_id, rds->tmc_id, rds->linkage_actuator);
+				break;
+			case RDS_1A_VARIANT_PAGER:
+				/* Paging ID (deprecated, IEC 62106 Table 9) */
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging ID (deprecated), LA=%d, "
+					     "data=0x%03X\n", rds->linkage_actuator,
+					     payload & RDS_1A_PAYLOAD_MASK);
+				break;
+			case RDS_1A_VARIANT_BCAST:
+				/* Broadcaster use (IEC 62106 Table 9)
+				 * Bits 11-0: Broadcaster-defined data */
+				rds->slc_broadcaster = payload & RDS_1A_PAYLOAD_MASK;
+				rds->slc_broadcaster_status = rds->block_status[2];
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Broadcaster=0x%03X LA=%d\n",
+					     rds->slc_broadcaster, rds->linkage_actuator);
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Broadcaster data=0x%03X, "
+					     "Linkage Actuator=%d\n",
+					     rds->slc_broadcaster, rds->linkage_actuator);
+				break;
+			case RDS_1A_VARIANT_EWS:
+				/* EWS channel ID (IEC 62106 Table 9)
+				 * Bits 11-0: Emergency Warning System channel number */
+				rds->ews_channel = payload & RDS_1A_PAYLOAD_MASK;
+				rds->ews_channel_status = rds->block_status[2];
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: EWS channel=%d LA=%d\n",
+					     rds->ews_channel, rds->linkage_actuator);
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: EWS Channel ID=%d, "
+					     "Linkage Actuator=%d\n",
+					     rds->ews_channel, rds->linkage_actuator);
+				break;
+			default:
+				/* Variants 4-5: Not assigned (IEC 62106 Table 9) */
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Unassigned variant %d, LA=%d, "
+					     "data=0x%03X\n", variant, rds->linkage_actuator,
+					     payload & RDS_1A_PAYLOAD_MASK);
+				break;
 			}
+
 		}
 	}
 	else if (group_type == 2) {

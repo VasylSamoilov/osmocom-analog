@@ -260,6 +260,16 @@
 #define RDS_AF_LF_MF_FOLLOWS    0xFA    /* Code 250: LF/MF frequency follows */
 #define RDS_AF_NO_AF_PAIR       0xE0E0  /* 16-bit filler for Block C when no AF */
 
+/* IEC 62106 Table 11 - AF Code Ranges */
+#define RDS_AF_VHF_MIN          1       /* First valid VHF AF code */
+#define RDS_AF_VHF_MAX          204     /* Last valid VHF AF code (107.9 MHz) */
+#define RDS_AF_RESERVED1_MIN    206     /* Reserved range 206-223 start */
+#define RDS_AF_RESERVED1_MAX    223     /* Reserved range 206-223 end */
+#define RDS_AF_COUNT_MIN        224     /* Count code 0 (No AF) */
+#define RDS_AF_COUNT_MAX        249     /* Count code 25 (max AFs) */
+#define RDS_AF_RESERVED2_MIN    251     /* Reserved range 251-255 start */
+/* Note: RDS_AF_RESERVED2_MAX is 255, omitted since uint8_t max */
+
 /* AF frequency base (IEC 62106 Table 11) */
 #define RDS_AF_FM_BASE          875     /* FM: 87.5 MHz in 0.1 MHz units */
 
@@ -1010,6 +1020,12 @@ typedef struct rds_encoder {
 	uint8_t		pin_day;	/* Day of month 1-31 (0 = PIN not used) */
 	uint8_t		pin_hour;	/* Hour 0-23, or 24 = end time */
 	uint8_t		pin_minute;	/* Minute 0-59 */
+	uint8_t		linkage_actuator;/* LA flag for Group 1A (IEC 62106 S6.1.5.2) */
+	
+	/* Group 1A SLC variants (IEC 62106 Table 9) - set non-zero to enable */
+	uint16_t	tmc_id;		/* TMC identification (variant 1, 12 bits) */
+	uint16_t	ews_channel;	/* EWS channel ID (variant 7, 12 bits) */
+	uint16_t	slc_broadcaster;/* Broadcaster data (variant 6, 12 bits) */
 
 	/* Encoder state */
 	double		samplerate;
@@ -1224,6 +1240,14 @@ typedef struct rds_decoder {
 	uint8_t		pin_day;		/* Day of month 1-31 (0 = not used) */
 	uint8_t		pin_hour;		/* Hour 0-23, or 24 = end time */
 	uint8_t		pin_minute;		/* Minute 0-59 */
+	
+	/* Group 1A SLC variants (IEC 62106 Table 9) */
+	uint16_t	tmc_id;			/* TMC identification (variant 1, 12 bits) */
+	uint8_t		tmc_id_status;		/* Status of TMC ID decode */
+	uint16_t	ews_channel;		/* EWS channel ID (variant 7, 12 bits) */
+	uint8_t		ews_channel_status;	/* Status of EWS decode */
+	uint16_t	slc_broadcaster;	/* Broadcaster data (variant 6, 12 bits) */
+	uint8_t		slc_broadcaster_status;	/* Status of broadcaster decode */
 	
 	/* Group 4A: Clock-Time and Date (IEC 62106 S6.1.5.4) */
 	uint32_t	ct_mjd;			/* Modified Julian Date */
