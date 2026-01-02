@@ -1217,8 +1217,8 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	 * IEC 62106:2015 S6.1.5.2
 	 * Format: Day (5 bits) | Hour (5 bits) | Minute (6 bits)
 	 * Day = day of month 1-31 (0 = PIN not used), receiver uses CT for month */
-	b4 = ((rds->pin_day & 0x1F) << RDS_PIN_DAY_SHIFT) |
-	     ((rds->pin_hour & 0x1F) << RDS_PIN_HOUR_SHIFT) |
+	b4 = ((rds->pin_day & (RDS_PIN_DAY_MASK >> RDS_PIN_DAY_SHIFT)) << RDS_PIN_DAY_SHIFT) |
+	     ((rds->pin_hour & (RDS_PIN_HOUR_MASK >> RDS_PIN_HOUR_SHIFT)) << RDS_PIN_HOUR_SHIFT) |
 	     (rds->pin_minute & RDS_PIN_MINUTE_MASK);
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 	
@@ -1243,7 +1243,7 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
  *
  * Block structure:
  *   Block A: PI code
- *   Block B: Group 1B + TP + PTY + Radio Paging (0)
+ *   Block B: Group 1B + TP + PTY + Spare bits (0)
  *   Block C: PI repeat (offset C')
  *   Block D: PIN (Day/Hour/Minute)
  */
@@ -1256,7 +1256,7 @@ static void rds_build_group_1b(rds_encoder_t *rds, uint8_t *group)
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 	
 	/* Block B: Group 1B + TP + PTY
-	 * Bits 4-0: Radio Paging codes (set to 0) */
+	 * Bits 4-0: Spare (always 0 for 1B, Radio Paging only applies to 1A) */
 	b2 = (RDS_GROUP_1B << RDS_B2_GROUP_SHIFT) |
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT);
@@ -1267,8 +1267,8 @@ static void rds_build_group_1b(rds_encoder_t *rds, uint8_t *group)
 	
 	/* Block D: PIN (Programme Item Number) - for THIS service
 	 * Same format as Group 1A Block D */
-	b4 = ((rds->pin_day & 0x1F) << RDS_PIN_DAY_SHIFT) |
-	     ((rds->pin_hour & 0x1F) << RDS_PIN_HOUR_SHIFT) |
+	b4 = ((rds->pin_day & (RDS_PIN_DAY_MASK >> RDS_PIN_DAY_SHIFT)) << RDS_PIN_DAY_SHIFT) |
+	     ((rds->pin_hour & (RDS_PIN_HOUR_MASK >> RDS_PIN_HOUR_SHIFT)) << RDS_PIN_HOUR_SHIFT) |
 	     (rds->pin_minute & RDS_PIN_MINUTE_MASK);
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 	
@@ -1503,8 +1503,8 @@ static void rds_build_group_14a(rds_encoder_t *rds, uint8_t *group)
 		 * Even if the time value matches the current station's PIN, they
 		 * refer to DIFFERENT services and should not be treated as duplicates.
 		 */
-		b3 = ((eon->pin_day & 0x1F) << RDS_PIN_DAY_SHIFT) |
-		     ((eon->pin_hour & 0x1F) << RDS_PIN_HOUR_SHIFT) |
+		b3 = ((eon->pin_day & (RDS_PIN_DAY_MASK >> RDS_PIN_DAY_SHIFT)) << RDS_PIN_DAY_SHIFT) |
+		     ((eon->pin_hour & (RDS_PIN_HOUR_MASK >> RDS_PIN_HOUR_SHIFT)) << RDS_PIN_HOUR_SHIFT) |
 		     (eon->pin_minute & RDS_PIN_MINUTE_MASK);
 		break;
 	case RDS_14A_VARIANT_BCAST:
@@ -2643,18 +2643,53 @@ static void rds_decode_group(rds_decoder_t *rds)
 	else if (group_type == 1) {
 		/* Group 1A/1B: Programme Item Number and slow labeling codes
 		 * See RDS_1A_* and RDS_PIN_* macros in rds.h for bit field definitions
-		 * Block B bits 4-0: Radio Paging codes (deprecated, usually 0)
+		 * Block B bits 4-0: Radio Paging (1A, deprecated) or Spare (1B)
 		 */
-		int radio_paging = b2 & 0x1F;  /* Block B bits 4-0 */
+		int b2_payload = b2 & RDS_B2_PAYLOAD_MASK;  /* Block B bits 4-0 */
 		
-		/* Log Radio Paging codes if non-zero (deprecated) */
-		if (radio_paging != 0) {
-			if (rds->debug)
-				LOGP(DRADIO, LOGL_DEBUG, "RDS 1%c: Radio Paging (B2[4:0])=%d (deprecated)\n",
-				     version ? 'B' : 'A', radio_paging);
-			if (rds->verbose)
-				LOGP(DRADIO, LOGL_INFO, "RDS 1%c: Radio Paging codes=%d (deprecated, bits 4-0)\n",
-				     version ? 'B' : 'A', radio_paging);
+		/* Group 1A: Radio Paging codes (deprecated, usually 0)
+		 * Group 1B: Spare bits (should be 0) */
+		if (version == 0) {
+			/* 1A: Radio Paging (deprecated) */
+			if (b2_payload != 0) {
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Radio Paging (B2[4:0])=%d (deprecated)\n",
+					     b2_payload);
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Radio Paging codes=%d (deprecated, bits 4-0)\n",
+					     b2_payload);
+			}
+		} else {
+			/* 1B: Spare bits (should be 0) */
+			if (b2_payload != 0) {
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1B: Spare bits (B2[4:0])=%d (expected 0)\n",
+					     b2_payload);
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1B: Spare bits=%d (expected 0, bits 4-0)\n",
+					     b2_payload);
+			}
+		}
+		
+		/* Group 1B: Block C contains PI repeat (for fast station ID) */
+		if (version == 1 && (rds->group_mask & (1<<2))) {
+			uint16_t pi_repeat = b3;
+			/* Validate PI repeat against Block A PI */
+			if (rds->group_mask & (1<<0)) {
+				if (pi_repeat != pi && rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1B: PI mismatch A=%04X C=%04X\n",
+					     pi, pi_repeat);
+			}
+			/* Use PI repeat if Block A was missing/bad */
+			if (!(rds->group_mask & (1<<0)) || rds->block_status[0] > RDS_STATUS_CORRECTED) {
+				if (rds->block_status[2] <= RDS_STATUS_CORRECTED) {
+					rds->pi = pi_repeat;
+					rds->pi_status = rds->block_status[2];
+					if (rds->debug)
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 1B: Using PI from Block C: %04X\n",
+						     pi_repeat);
+				}
+			}
 		}
 	/* Decode PIN from Block D (both 1A and 1B) */
 		if (rds->group_mask & (1<<3)) {
