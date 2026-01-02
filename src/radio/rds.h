@@ -673,9 +673,303 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
  * ============================================================ */
 #define RDS_3A_APP_GROUP_MASK   0x001F  /* Block B bits 4-0: App group type code */
 
+/* Group 3B - ODA-only (IEC 62106 S6.1.5.5)
+ * Group 3B has no standard meaning; entirely ODA-application dependent.
+ * Block C contains PI repeat (version B standard behavior).
+ * Block D contains ODA-specific payload. */
+#define RDS_3B_PAYLOAD_MASK     0x001F  /* Block B bits 4-0 (ODA-specific) */
+
+/* ============================================================
+ * Open Data Application (ODA) Identification Codes
+ * EBU/RDS Forum ODA Registry - Common Applications
+ * ============================================================ */
+#define RDS_ODA_AID_DAB_XREF    0x0093  /* DAB Cross-Reference */
+#define RDS_ODA_AID_RT_PLUS     0x4BD7  /* RadioText+ (RT+) */
+#define RDS_ODA_AID_ERT_PLUS    0x4BD8  /* RT+ for Enhanced RadioText */
+#define RDS_ODA_AID_ERT         0x6552  /* Enhanced RadioText (eRT) */
+#define RDS_ODA_AID_TMC_ALERT   0xCD46  /* RDS-TMC Alert-C */
+#define RDS_ODA_AID_TMC_ALERT2  0xCD47  /* RDS-TMC Alert-C (alt) */
+#define RDS_ODA_AID_STATION_LOGO 0xFF7F /* RFT: Station logo */
+
+/* Maximum simultaneous ODA configurations */
+#define RDS_ODA_MAX_CONFIGS     8
+
+/* ODA Configuration Entry (Group 3A transmission)
+ * Supports multiple simultaneous ODAs (e.g., RT+ + TMC + eRT)
+ * Each ODA maps to a carrier group type and gets cycled 3A announcements */
+typedef struct {
+	uint8_t  carrier_group;   /* Which group carries ODA (0-31: 0A-15B) */
+	uint16_t aid;             /* Application ID (16-bit, e.g. 0x4BD7 = RT+) */
+	uint16_t message;         /* ODA-specific message (Block C) */
+	uint8_t  enabled;         /* 1 = transmit 3A for this ODA */
+} rds_oda_config_t;
+
+/* ODA Application Entry - Decoder tracking (from Group 3A)
+ * Maps group types to registered ODA applications */
+typedef struct {
+	uint8_t  carrier_group;   /* Group type carrying this ODA (0-31) */
+	uint16_t aid;             /* Registered Application ID */
+	uint16_t message;         /* Last received ODA message (Block C) */
+	uint8_t  registered;      /* 1 if registered via 3A, 0 if empty */
+	time_t   timestamp;       /* When registered */
+} rds_oda_app_t;
+
+
+/* ============================================================
+ * RT+ (RadioText Plus) - IEC 62106-6
+ * Content-type tagging for RadioText and Enhanced RadioText
+ * ============================================================
+ *
+ * RT+ allows marking semantic segments within RadioText (e.g., artist,
+ * title, URL). Announced via Group 3A, carried on a configurable ODA
+ * group (typically 11A).
+ *
+ * Each RT+ group can contain up to 2 tags. Each tag specifies:
+ *   - content_type: What the segment represents (0-64)
+ *   - start: Start position in RadioText (0-63)
+ *   - length: Length of segment (1-64)
+ *
+ * RT+ also operates on eRT (Enhanced RadioText) via AID 0x4BD8.
+ *
+ * RT+ Bit Fields (IEC 62106-6):
+ * Block B bits 4-0:
+ *   bit 4: item_toggle
+ *   bit 3: item_running
+ *   bits 2-0: tag1 content_type[5:3] (high 3 bits)
+ * Block C:
+ *   bits 15-13: tag1 content_type[2:0] (low 3 bits)
+ *   bits 12-7: tag1 start (6 bits, 0-63)
+ *   bits 6-1: tag1 length-1 (6 bits, 0-63 → length 1-64)
+ *   bit 0: tag2 content_type[5:4] (high 2 bits, if tag2 exists)
+ * Block D:
+ *   bits 15-12: tag2 content_type[3:0] (low 4 bits, if tag2 exists)
+ *   bits 11-6: tag2 start (6 bits, 0-63)
+ *   bits 5-1: tag2 length-1 (5 bits, 0-31 → length 1-32)
+ *   bit 0: spare
+ * ============================================================ */
+#define RDS_RTPLUS_TOGGLE_BIT         4       /* Block B bit 4: item toggle */
+#define RDS_RTPLUS_TOGGLE_MASK        0x0010
+#define RDS_RTPLUS_ITEM_RUNNING_BIT   3       /* Block B bit 3: item running */
+#define RDS_RTPLUS_ITEM_RUNNING_MASK  0x0008
+#define RDS_RTPLUS_TAG1_CT_HIGH_BITS  0       /* Block B bits 2-0: tag1 content_type[5:3] */
+#define RDS_RTPLUS_TAG1_CT_HIGH_MASK  0x0007
+#define RDS_RTPLUS_TAG1_CT_HIGH_SHIFT 3       /* Shift for high 3 bits */
+#define RDS_RTPLUS_TAG1_CT_LOW_BITS   13      /* Block C bits 15-13: tag1 content_type[2:0] */
+#define RDS_RTPLUS_TAG1_CT_LOW_MASK   0xE000
+#define RDS_RTPLUS_TAG1_CT_LOW_SHIFT  13
+#define RDS_RTPLUS_TAG1_START_BITS    7       /* Block C bits 12-7: tag1 start */
+#define RDS_RTPLUS_TAG1_START_MASK    0x1FC0
+#define RDS_RTPLUS_TAG1_START_SHIFT   7
+#define RDS_RTPLUS_TAG1_LEN_BITS      1       /* Block C bits 6-1: tag1 length-1 */
+#define RDS_RTPLUS_TAG1_LEN_MASK      0x003E
+#define RDS_RTPLUS_TAG1_LEN_SHIFT     1
+#define RDS_RTPLUS_TAG2_CT_HIGH_BIT   0       /* Block C bit 0: tag2 content_type[5] */
+#define RDS_RTPLUS_TAG2_CT_HIGH_MASK  0x0001  /* 1 bit */
+#define RDS_RTPLUS_TAG2_CT_HIGH_SHIFT 5       /* Shift for high bit */
+#define RDS_RTPLUS_TAG2_CT_LOW_BITS   11      /* Block D bits 15-11: tag2 content_type[4:0] */
+#define RDS_RTPLUS_TAG2_CT_LOW_MASK   0xF800  /* 5 bits */
+#define RDS_RTPLUS_TAG2_CT_LOW_SHIFT  11
+#define RDS_RTPLUS_TAG2_START_BITS    6       /* Block D bits 10-5: tag2 start */
+#define RDS_RTPLUS_TAG2_START_MASK    0x07E0
+#define RDS_RTPLUS_TAG2_START_SHIFT   5
+#define RDS_RTPLUS_TAG2_LEN_BITS      5       /* Block D bits 4-0: tag2 length-1 */
+#define RDS_RTPLUS_TAG2_LEN_MASK      0x001F
+#define RDS_RTPLUS_TAG2_LEN_SHIFT     0
+#define RDS_RTPLUS_CONTENT_TYPE_BITS  6       /* Total bits for content_type */
+#define RDS_RTPLUS_MAX_START          63      /* Maximum start position */
+#define RDS_RTPLUS_MAX_LEN_TAG1       64      /* Maximum length for tag1 */
+#define RDS_RTPLUS_MAX_LEN_TAG2       32      /* Maximum length for tag2 */
+#define RDS_RTPLUS_MAX_TAGS           2       /* Maximum tags per group */
+
+/* RT+ Content Type Constants (RDS Forum R06/040_1)
+ * These match the indices in rds_tables.c rtplus_content_types[] array */
+#define RDS_RTPLUS_CT_DUMMY           0       /* dummy_class */
+#define RDS_RTPLUS_CT_ITEM_TITLE      1       /* item.title */
+#define RDS_RTPLUS_CT_ITEM_ALBUM      2       /* item.album */
+#define RDS_RTPLUS_CT_ITEM_TRACKNUM   3       /* item.tracknumber */
+#define RDS_RTPLUS_CT_ITEM_ARTIST     4       /* item.artist */
+#define RDS_RTPLUS_CT_ITEM_COMPOSITION 5      /* item.composition */
+#define RDS_RTPLUS_CT_ITEM_MOVEMENT   6       /* item.movement */
+#define RDS_RTPLUS_CT_ITEM_CONDUCTOR  7       /* item.conductor */
+#define RDS_RTPLUS_CT_ITEM_COMPOSER   8       /* item.composer */
+#define RDS_RTPLUS_CT_ITEM_BAND       9       /* item.band */
+#define RDS_RTPLUS_CT_ITEM_COMMENT    10      /* item.comment */
+#define RDS_RTPLUS_CT_ITEM_GENRE      11      /* item.genre */
+#define RDS_RTPLUS_CT_INFO_NEWS       12      /* info.news */
+#define RDS_RTPLUS_CT_INFO_NEWS_LOCAL 13      /* info.news.local */
+#define RDS_RTPLUS_CT_INFO_STOCKMARKET 14     /* info.stockmarket */
+#define RDS_RTPLUS_CT_INFO_SPORT      15      /* info.sport */
+#define RDS_RTPLUS_CT_INFO_LOTTERY    16      /* info.lottery */
+#define RDS_RTPLUS_CT_INFO_HOROSCOPE  17      /* info.horoscope */
+#define RDS_RTPLUS_CT_INFO_DAILY_DIV   18     /* info.daily_diversion */
+#define RDS_RTPLUS_CT_INFO_HEALTH      19     /* info.health */
+#define RDS_RTPLUS_CT_INFO_EVENT       20     /* info.event */
+#define RDS_RTPLUS_CT_INFO_SCENE       21     /* info.scene */
+#define RDS_RTPLUS_CT_INFO_CINEMA      22     /* info.cinema */
+#define RDS_RTPLUS_CT_INFO_TV          23     /* info.tv */
+#define RDS_RTPLUS_CT_INFO_DATE_TIME   24     /* info.date_time */
+#define RDS_RTPLUS_CT_INFO_WEATHER     25     /* info.weather */
+#define RDS_RTPLUS_CT_INFO_TRAFFIC     26     /* info.traffic */
+#define RDS_RTPLUS_CT_INFO_ALARM       27     /* info.alarm */
+#define RDS_RTPLUS_CT_INFO_AD          28     /* info.advertisement */
+#define RDS_RTPLUS_CT_INFO_URL         29     /* info.url */
+#define RDS_RTPLUS_CT_INFO_OTHER       30     /* info.other */
+#define RDS_RTPLUS_CT_STATIONNAME_SHORT 31    /* stationname.short */
+#define RDS_RTPLUS_CT_STATIONNAME_LONG  32    /* stationname.long */
+#define RDS_RTPLUS_CT_PROGRAMME_NOW     33    /* programme.now */
+#define RDS_RTPLUS_CT_PROGRAMME_NEXT    34    /* programme.next */
+#define RDS_RTPLUS_CT_PROGRAMME_PART    35    /* programme.part */
+#define RDS_RTPLUS_CT_PROGRAMME_HOST    36    /* programme.host */
+#define RDS_RTPLUS_CT_PROGRAMME_EDITORIAL 37  /* programme.editorial_staff */
+#define RDS_RTPLUS_CT_PROGRAMME_FREQ     38   /* programme.frequency */
+#define RDS_RTPLUS_CT_PROGRAMME_HOMEPAGE  39  /* programme.homepage */
+#define RDS_RTPLUS_CT_PROGRAMME_SUBCHAN   40  /* programme.subchannel */
+#define RDS_RTPLUS_CT_PHONE_HOTLINE       41  /* phone.hotline */
+#define RDS_RTPLUS_CT_PHONE_STUDIO        42  /* phone.studio */
+#define RDS_RTPLUS_CT_PHONE_OTHER         43  /* phone.other */
+#define RDS_RTPLUS_CT_SMS_STUDIO          44  /* sms.studio */
+#define RDS_RTPLUS_CT_SMS_OTHER           45  /* sms.other */
+#define RDS_RTPLUS_CT_EMAIL_HOTLINE       46  /* email.hotline */
+#define RDS_RTPLUS_CT_EMAIL_STUDIO        47  /* email.studio */
+#define RDS_RTPLUS_CT_EMAIL_OTHER         48  /* email.other */
+#define RDS_RTPLUS_CT_MMS_OTHER            49  /* mms.other */
+#define RDS_RTPLUS_CT_CHAT                 50  /* chat */
+#define RDS_RTPLUS_CT_CHAT_CENTRE          51  /* chat.centre */
+#define RDS_RTPLUS_CT_VOTE_QUESTION        52  /* vote.question */
+#define RDS_RTPLUS_CT_VOTE_CENTRE          53  /* vote.centre */
+#define RDS_RTPLUS_CT_PLACE                60  /* place */
+#define RDS_RTPLUS_CT_APPOINTMENT          61  /* appointment */
+#define RDS_RTPLUS_CT_IDENTIFIER           62  /* identifier */
+#define RDS_RTPLUS_CT_PURCHASE             63  /* purchase */
+#define RDS_RTPLUS_CT_GET_DATA             64  /* get_data */
+
+/* RT+ Tag structure - identifies a substring in RadioText or eRT */
+typedef struct {
+	uint8_t  content_type;  /* Content type (0-64, see rds_tables.h) */
+	uint8_t  start;         /* Start position in RT/eRT (0-63 for RT, 0-127 for eRT) */
+	uint8_t  length;        /* Length of tag (1-64 for RT, 1-128 for eRT) */
+} rds_rtplus_tag_t;
+
+/* RT+ Encoder Configuration */
+typedef struct {
+	uint8_t  carrier_group;     /* ODA carrier group (e.g., 22 for 11A) */
+	uint8_t  cb;                /* Class/Type flag (from 3A message bit 12) */
+	uint8_t  scb;               /* Server Control Bits (4 bits, from 3A message bits 11-8) */
+	uint8_t  template_num;      /* Template number (8 bits, from 3A message bits 7-0) */
+	uint8_t  toggle;            /* Item toggle (changes when tags change) */
+	uint8_t  item_running;      /* Item running flag */
+	rds_rtplus_tag_t tags[2];   /* Up to 2 tags per group */
+	uint8_t  tag_count;         /* Number of valid tags (0-2) */
+} rds_rtplus_encoder_t;
+
+/* RT+ Decoder State */
+typedef struct {
+	uint8_t  carrier_group;     /* ODA carrier group */
+	uint8_t  cb;                /* Class/Type flag from 3A */
+	uint8_t  scb;               /* Server Control Bits from 3A */
+	uint8_t  template_num;      /* Template number from 3A */
+	uint8_t  toggle;            /* Current item toggle */
+	uint8_t  item_running;      /* Item running flag */
+	rds_rtplus_tag_t tags[2];   /* Last received tags */
+	uint8_t  tag_count;         /* Number of valid tags */
+	uint8_t  registered;        /* 1 if RT+ ODA registered via 3A */
+	time_t   timestamp;         /* When last updated */
+} rds_rtplus_decoder_t;
+
+
+/* ============================================================
+ * eRT (Enhanced RadioText) - RDS2 / IEC 62106-2
+ * 128-byte RadioText with UTF-8/UCS-2 encoding
+ * ============================================================
+ *
+ * eRT extends standard RadioText from 64 to 128 bytes and adds
+ * support for UTF-8 and UCS-2 encoding plus RTL text direction.
+ * Announced via Group 3A, carried on a configurable ODA group.
+ *
+ * Configuration via Group 3A message bits:
+ *   Bit 0: encoding (0=UCS-2, 1=UTF-8)
+ *   Bit 1: direction (0=LTR, 1=RTL)
+ *   Bits 5-2: chartable (0=E3, others reserved)
+ *
+ * eRT transmission: 32 segments × 4 bytes = 128 bytes total
+ *
+ * eRT Bit Fields:
+ * Block B bits 4-0: segment address (0-31)
+ * Block C: eRT bytes [segment*4] and [segment*4+1]
+ * Block D: eRT bytes [segment*4+2] and [segment*4+3]
+ * ============================================================ */
+#define RDS_ERT_SEGMENT_MASK          0x001F  /* Block B bits 4-0: segment (0-31) */
+#define RDS_ERT_SEGMENTS              32      /* Total segments (32 × 4 = 128 bytes) */
+#define RDS_ERT_BYTES_PER_SEGMENT     4       /* Bytes per segment */
+#define RDS_ERT_3A_ENCODING_BIT       0       /* Group 3A message bit 0: encoding */
+#define RDS_ERT_3A_ENCODING_MASK      0x0001
+#define RDS_ERT_3A_DIRECTION_BIT      1       /* Group 3A message bit 1: direction */
+#define RDS_ERT_3A_DIRECTION_MASK     0x0002
+#define RDS_ERT_3A_CHARTABLE_BITS     2       /* Group 3A message bits 5-2: chartable */
+#define RDS_ERT_3A_CHARTABLE_MASK     0x003C
+#define RDS_ERT_3A_CHARTABLE_SHIFT    2
+#define RDS_ERT_3A_CB_BIT             12      /* Group 3A message bit 12: CB flag (RT+ only) */
+#define RDS_ERT_3A_CB_MASK            0x1000
+#define RDS_ERT_3A_SCB_BITS           8       /* Group 3A message bits 11-8: SCB (RT+ only) */
+#define RDS_ERT_3A_SCB_MASK           0x0F00
+#define RDS_ERT_3A_SCB_SHIFT          8
+#define RDS_ERT_3A_TEMPLATE_BITS      0       /* Group 3A message bits 7-0: template (RT+ only) */
+#define RDS_ERT_3A_TEMPLATE_MASK      0x00FF
+
+/* eRT Group 3A Message Construction Helpers */
+#define RDS_ERT_3A_MSG(encoding, direction, chartable) \
+	(((encoding) << RDS_ERT_3A_ENCODING_BIT) | \
+	 ((direction) << RDS_ERT_3A_DIRECTION_BIT) | \
+	 ((chartable) << RDS_ERT_3A_CHARTABLE_SHIFT))
+
+/* Common eRT message values */
+#define RDS_ERT_3A_MSG_UTF8_LTR_E3    RDS_ERT_3A_MSG(RDS_ERT_ENCODING_UTF8, 0, 0)  /* UTF-8, LTR, E3 chartable */
+#define RDS_ERT_3A_MSG_UCS2_LTR_E3    RDS_ERT_3A_MSG(RDS_ERT_ENCODING_UCS2, 0, 0)  /* UCS-2, LTR, E3 chartable */
+#define RDS_ERT_3A_MSG_UTF8_RTL_E3    RDS_ERT_3A_MSG(RDS_ERT_ENCODING_UTF8, 1, 0)  /* UTF-8, RTL, E3 chartable */
+#define RDS_ERT_3A_MSG_UCS2_RTL_E3    RDS_ERT_3A_MSG(RDS_ERT_ENCODING_UCS2, 1, 0)  /* UCS-2, RTL, E3 chartable */
+
+#define RDS_ERT_LENGTH          128     /* eRT: 128 bytes */
+
+/* eRT Text Encoding (from Group 3A message bit 0) */
+typedef enum {
+	RDS_ERT_ENCODING_UCS2 = 0,  /* UCS-2 (16-bit Unicode) */
+	RDS_ERT_ENCODING_UTF8 = 1   /* UTF-8 (variable-length) */
+} rds_ert_encoding_t;
+
+/* eRT Text Direction (from Group 3A message bit 1) */
+typedef enum {
+	RDS_ERT_DIR_LTR = 0,        /* Left-to-right */
+	RDS_ERT_DIR_RTL = 1         /* Right-to-left (Arabic, Hebrew) */
+} rds_ert_direction_t;
+
+/* eRT Encoder Configuration */
+typedef struct {
+	uint8_t  carrier_group;     /* ODA carrier group for eRT data */
+	uint8_t  encoding;          /* rds_ert_encoding_t */
+	uint8_t  direction;         /* rds_ert_direction_t */
+	uint8_t  use_chartable_e3;  /* 1 = use chartable E3 */
+	uint8_t  ert[RDS_ERT_LENGTH + 1];  /* 128 bytes + NUL */
+	uint8_t  length;            /* Current length */
+	uint8_t  segment;           /* Current segment (0-31) */
+} rds_ert_encoder_t;
+
+/* eRT Decoder State */
+typedef struct {
+	uint8_t  carrier_group;     /* ODA carrier group */
+	uint8_t  encoding;          /* rds_ert_encoding_t */
+	uint8_t  direction;         /* rds_ert_direction_t */
+	uint8_t  use_chartable_e3;  /* 1 = use chartable E3 */
+	uint8_t  ert[RDS_ERT_LENGTH + 1];  /* 128 bytes + NUL */
+	uint8_t  ert_status[RDS_ERT_LENGTH];  /* Per-byte decode status */
+	uint32_t segments_received; /* Bitmask of 32 segments */
+	uint8_t  registered;        /* 1 if eRT ODA registered via 3A */
+	time_t   timestamp;         /* When last updated */
+} rds_ert_decoder_t;
+
+
 /* ============================================================
  * Group 14A/14B Bit Fields (IEC 62106 S6.1.5.14)
- * Enhanced Other Networks (EON)
+
  *
  * Block B:
  *   Contains PTY and TP for the *current* network (bits 15-5).
@@ -1056,12 +1350,27 @@ typedef struct rds_encoder {
 	int		eon_tx_variant;		/* Current variant within ON */
 	int		eon_enabled;		/* Enable EON transmission */
 	
+	/* Group 3A: Open Data Application (ODA) TX Configuration
+	 * Supports multiple simultaneous ODAs with cycling 3A announcements */
+	rds_oda_config_t oda[RDS_ODA_MAX_CONFIGS];
+	int		oda_count;		/* Number of configured ODAs */
+	int		oda_cycle_idx;		/* Current index for 3A cycling */
+	
+	/* RT+ (RadioText Plus) - Group 11A (or configurable)
+	 * Content-type tagging for RT and eRT */
+	rds_rtplus_encoder_t rtplus;		/* RT+ for standard RadioText */
+	rds_rtplus_encoder_t ert_plus;		/* RT+ for Enhanced RadioText */
+	
+	/* eRT (Enhanced RadioText) - 128-byte UTF-8/UCS-2 text */
+	rds_ert_encoder_t ert;			/* eRT encoder configuration */
+	
 	/* Fixed Group Sequence Scheduler */
 	#define RDS_SCHEDULER_MAX_LEN 64
 	enum rds_group_type group_sched_buffer[RDS_SCHEDULER_MAX_LEN];
 	int			group_sched_len;
 	int			group_sched_index;
 	
+
 
 	
 } rds_encoder_t;
@@ -1074,14 +1383,190 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 			 double pilot_phase, double pilot_phasestep);
 
-/* Set RadioText (can be changed dynamically) */
-void rds_set_radiotext(rds_encoder_t *rds, const char *rt);
+/* Set RadioText (can be changed dynamically) - converts UTF-8 to RDS charset */
+void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt);
 
-/* Set Traffic Announcement flag */
-void rds_set_ta(rds_encoder_t *rds, int ta);
+/* Set Traffic Announcement flag (1=enabled, 0=disabled) */
+void rds_enc_set_ta(rds_encoder_t *rds, int ta);
 
-/* Update group scheduler sequence (call after changing PTY, PTYN, or EON) */
+/* ODA (Open Data Application) Configuration API
+ * Group 3A announces ODAs; each ODA needs a carrier group for its data.
+ *
+ * carrier_group: Which group carries ODA data (0-31: 0A=0, 0B=1, ..., 15B=31)
+ *                Common: 8A=16 (TMC), 11A=22 (RT+), 12A=24
+ * aid:           Application ID from EBU ODA Registry (e.g., 0x4BD7 = RT+)
+ * message:       ODA-specific 16-bit message for Group 3A Block C
+ */
+/* Add ODA configuration (returns 0 on success, -1 on error) */
+int rds_enc_oda_add(rds_encoder_t *rds, uint8_t carrier_group, uint16_t aid, uint16_t message);
+/* Remove ODA by AID (returns 0 on success, -1 if not found) */
+int rds_enc_oda_remove(rds_encoder_t *rds, uint16_t aid);
+/* Clear all ODA configurations */
+void rds_enc_oda_clear(rds_encoder_t *rds);
+
+/* ============================================================
+ * RT+ (RadioText Plus) Encoder API
+ * ============================================================ */
+/* Add RT+ tag to RadioText
+ * content_type: Content type code (0-64, see rds_tables.h)
+ * start: Start position in RT (0-63 for RT, 0-127 for eRT)
+ * length: Length of tag (1-64 for RT, 1-128 for eRT)
+ * 
+ * Call rds_oda_add() first to register RT+ on a carrier group:
+ *   rds_oda_add(rds, 22, RDS_ODA_AID_RT_PLUS, message);
+ * 
+ * Returns 0 on success, -1 if tag array is full (max 2 tags)
+ */
+int rds_enc_rtplus_add_tag(rds_encoder_t *rds, uint8_t content_type, 
+                           uint8_t start, uint8_t length);
+void rds_enc_rtplus_clear_tags(rds_encoder_t *rds);
+void rds_enc_rtplus_set_toggle(rds_encoder_t *rds, int toggle);
+void rds_enc_rtplus_set_item_running(rds_encoder_t *rds, int running);
+/* RT+ Getters (encoder state) */
+int rds_enc_rtplus_get_tag_count(const rds_encoder_t *rds);
+int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,
+                            uint8_t *content_type, uint8_t *start, uint8_t *length);
+/* eRT+ API (same as RT+ but for eRT) */
+int rds_enc_ert_plus_add_tag(rds_encoder_t *rds, uint8_t content_type,
+                             uint8_t start, uint8_t length);
+void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds);
+int rds_enc_ert_plus_get_tag_count(const rds_encoder_t *rds);
+int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
+                              uint8_t *content_type, uint8_t *start, uint8_t *length);
+
+/* ============================================================
+ * eRT (Enhanced RadioText) Encoder API
+ * ============================================================ */
+/* Set eRT text (UTF-8 or UCS-2, up to 128 bytes)
+ * Call rds_oda_add() first with appropriate message bits:
+ *   Bit 0: encoding (0=UCS2, 1=UTF8)
+ *   Bit 1: direction (0=LTR, 1=RTL)
+ *   Bits 5-2: chartable (0=E3, others reserved)
+ * 
+ * Example:
+ *   uint16_t ert_msg = (1 << 0);  // UTF-8 encoding
+ *   rds_oda_add(rds, 24, RDS_ODA_AID_ERT, ert_msg);
+ *   rds_enc_set_ert(rds, (uint8_t *)"128 bytes of text...", 128);
+ */
+void rds_enc_set_ert(rds_encoder_t *rds, const uint8_t *text, size_t len);
+void rds_enc_clear_ert(rds_encoder_t *rds);
+void rds_enc_get_ert(const rds_encoder_t *rds, uint8_t *text, size_t *len, size_t max_len);
+
+/* Update group scheduler sequence (call after changing PTY, PTYN, EON, or ODA) */
 void rds_scheduler_update(rds_encoder_t *rds);
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 1: Core Fields
+ * ============================================================ */
+
+/* PI (Programme Identification) - 16-bit station identifier */
+void rds_enc_set_pi(rds_encoder_t *rds, uint16_t pi);
+uint16_t rds_enc_get_pi(const rds_encoder_t *rds);
+
+/* PS (Programme Service Name) - 8-character station name */
+void rds_enc_set_ps(rds_encoder_t *rds, const char *ps);
+void rds_enc_clear_ps(rds_encoder_t *rds);
+void rds_enc_get_ps(const rds_encoder_t *rds, char *ps, size_t len);
+
+/* PTY (Programme Type) - 5-bit program type code (0-31) */
+void rds_enc_set_pty(rds_encoder_t *rds, uint8_t pty);
+uint8_t rds_enc_get_pty(const rds_encoder_t *rds);
+
+/* PTYN (Programme Type Name) - 8-character program type name */
+void rds_enc_set_ptyn(rds_encoder_t *rds, const char *ptyn);
+void rds_enc_clear_ptyn(rds_encoder_t *rds);
+void rds_enc_get_ptyn(const rds_encoder_t *rds, char *ptyn, size_t len);
+
+/* TP (Traffic Programme) - 1 if station broadcasts traffic info */
+void rds_enc_set_tp(rds_encoder_t *rds, int tp);
+int rds_enc_get_tp(const rds_encoder_t *rds);
+
+/* MS (Music/Speech) - 1=Music, 0=Speech */
+void rds_enc_set_ms(rds_encoder_t *rds, int ms);
+int rds_enc_get_ms(const rds_encoder_t *rds);
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 2: Extended Info
+ * ============================================================ */
+
+/* ECC (Extended Country Code) - 8-bit extended country code */
+void rds_enc_set_ecc(rds_encoder_t *rds, uint8_t ecc);
+void rds_enc_clear_ecc(rds_encoder_t *rds);
+uint8_t rds_enc_get_ecc(const rds_encoder_t *rds);
+
+/* Language Code - 8-bit language identifier (ISO 639) */
+void rds_enc_set_language(rds_encoder_t *rds, uint8_t lang);
+void rds_enc_clear_language(rds_encoder_t *rds);
+uint8_t rds_enc_get_language(const rds_encoder_t *rds);
+
+/* PIN (Programme Item Number) - day (1-31), hour (0-23), minute (0-59) */
+void rds_enc_set_pin(rds_encoder_t *rds, uint8_t day, uint8_t hour, uint8_t minute);
+void rds_enc_clear_pin(rds_encoder_t *rds);
+void rds_enc_get_pin(const rds_encoder_t *rds, uint8_t *day, uint8_t *hour, uint8_t *minute);
+
+/* DI (Decoder Information) - stereo, artificial_head, compressed, dynamic_pty flags */
+void rds_enc_set_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty);
+void rds_enc_get_di(const rds_encoder_t *rds, int *stereo, int *artificial, int *compressed, int *dynamic_pty);
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 3: Alternative Frequencies
+ * ============================================================ */
+
+/* AF Method A - Set alternative frequencies from string (e.g., "87500,88100,89300") */
+int rds_enc_af_set_method_a(rds_encoder_t *rds, const char *af_string);
+int rds_enc_af_get_method_a_count(const rds_encoder_t *rds);
+
+/* AF Method B - List Management */
+/* Add AF list from string format */
+int rds_enc_af_method_b_add(rds_encoder_t *rds, const char *af_string);
+/* Add complete AF list with tuning frequency and regional flags */
+int rds_enc_af_method_b_add_list(rds_encoder_t *rds, uint16_t tuning_freq, const uint16_t *af_freqs, const uint8_t *af_is_regional, uint8_t af_count);
+/* Remove AF list by tuning frequency */
+int rds_enc_af_method_b_remove_list(rds_encoder_t *rds, uint16_t tuning_freq);
+/* Remove AF list by index */
+int rds_enc_af_method_b_remove_list_by_index(rds_encoder_t *rds, int index);
+
+/* AF Method B - Entry Management */
+/* Add single AF entry to a list */
+int rds_enc_af_method_b_add_entry(rds_encoder_t *rds, uint16_t tuning_freq, uint16_t af_freq, int is_regional);
+/* Remove single AF entry from a list */
+int rds_enc_af_method_b_remove_entry(rds_encoder_t *rds, uint16_t tuning_freq, uint16_t af_freq);
+/* Remove AF entry by index */
+int rds_enc_af_method_b_remove_entry_by_index(rds_encoder_t *rds, uint16_t tuning_freq, int af_index);
+
+/* AF Clear and Getters */
+/* Clear all alternative frequencies */
+void rds_enc_af_clear(rds_encoder_t *rds);
+/* Get current AF method (0=Method A, 1=Method B, -1=none) */
+int rds_enc_af_get_method(const rds_encoder_t *rds);
+/* Get number of AF Method B lists */
+int rds_enc_af_method_b_get_list_count(const rds_encoder_t *rds);
+/* Get AF Method B list by index */
+int rds_enc_af_method_b_get_list(const rds_encoder_t *rds, int index, uint16_t *tuning_freq, uint16_t *af_freqs, uint8_t *af_is_regional, uint8_t *af_count, size_t max_afs);
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 4: RadioText
+ * ============================================================ */
+
+/* RadioText - Clear RadioText buffer */
+void rds_enc_clear_radiotext(rds_encoder_t *rds);
+/* Get RadioText (converts RDS charset to UTF-8 for display) */
+void rds_enc_get_radiotext(const rds_encoder_t *rds, char *rt, size_t len);
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 5: EON
+ * ============================================================ */
+
+/* Add Enhanced Other Network entry */
+int rds_enc_eon_add(rds_encoder_t *rds, uint16_t pi, const char *ps, uint8_t pty, uint8_t tp);
+/* Set Traffic Announcement flag for EON entry */
+int rds_enc_eon_set_ta(rds_encoder_t *rds, uint16_t pi, int ta);
+/* Remove EON entry by PI */
+int rds_enc_eon_remove(rds_encoder_t *rds, uint16_t pi);
+/* Clear all EON entries */
+void rds_enc_eon_clear(rds_encoder_t *rds);
+int rds_enc_eon_get_count(const rds_encoder_t *rds);
+int rds_enc_eon_get_entry(const rds_encoder_t *rds, int index, uint16_t *pi, char *ps, size_t ps_len, uint8_t *pty, uint8_t *tp, uint8_t *ta);
 
 /* Cleanup */
 void rds_encoder_exit(rds_encoder_t *rds);
@@ -1263,6 +1748,19 @@ typedef struct rds_decoder {
 	uint8_t		ptyn_ab;		/* A/B flag for PTYN */
 	int		ptyn_segments;		/* Received segments mask (bit 0=first half, 1=second half) */
 
+	/* Group 3A: ODA Application Registry (decoded from 3A groups)
+	 * Maps group types to ODA applications - up to 32 slots (0A-15B) */
+	rds_oda_app_t	oda_apps[32];		/* ODA registry indexed by group type code */
+	int		oda_app_count;		/* Number of registered ODAs */
+
+	/* RT+ (RadioText Plus) - Decoder state
+	 * Content-type tagging for RT and eRT */
+	rds_rtplus_decoder_t rtplus;		/* RT+ tags for standard RadioText */
+	rds_rtplus_decoder_t ert_plus;		/* RT+ tags for Enhanced RadioText */
+	
+	/* eRT (Enhanced RadioText) - Decoder state */
+	rds_ert_decoder_t ert_dec;		/* eRT 128-byte text */
+
 	/* Group 14A/14B: Enhanced Other Networks (IEC 62106 S6.1.5.14) */
 	rds_eon_entry_t	eon[RDS_EON_MAX_ENTRIES];	/* Other Network database */
 	int		eon_count;			/* Number of valid EON entries */
@@ -1295,12 +1793,33 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
                          double pilot_phase, double pilot_phasestep);
 
 /* Get decoded data (returns 1 if new data available) */
-int rds_get_pi(rds_decoder_t *rds, uint16_t *pi);
-int rds_get_ps(rds_decoder_t *rds, char *ps);  /* ps must be at least 9 bytes */
-int rds_get_rt(rds_decoder_t *rds, char *rt);  /* rt must be at least 65 bytes */
+/* Get decoded PI (Programme Identification) - returns 1 if new data available */
+int rds_dec_get_pi(rds_decoder_t *rds, uint16_t *pi);
+/* Get decoded PS (Programme Service name) - ps must be at least 9 bytes, returns 1 if new */
+int rds_dec_get_ps(rds_decoder_t *rds, char *ps);
+/* Get decoded RT (RadioText) - rt must be at least 65 bytes, returns 1 if new */
+int rds_dec_get_rt(rds_decoder_t *rds, char *rt);
 
 /* Print decoder status (PI, PS, RT, BER) */
 void rds_decoder_status(rds_decoder_t *rds);
+
+/* ============================================================
+ * RT+ and eRT Decoder API
+ * ============================================================ */
+/* RT+ Decoder Getters */
+int rds_dec_rtplus_get_tag_count(const rds_decoder_t *rds);
+int rds_dec_rtplus_get_tag(const rds_decoder_t *rds, int index,
+                            uint8_t *content_type, uint8_t *start, uint8_t *length);
+int rds_dec_rtplus_get_toggle(const rds_decoder_t *rds);
+int rds_dec_rtplus_get_item_running(const rds_decoder_t *rds);
+/* eRT+ Decoder Getters */
+int rds_dec_ert_plus_get_tag_count(const rds_decoder_t *rds);
+int rds_dec_ert_plus_get_tag(const rds_decoder_t *rds, int index,
+                              uint8_t *content_type, uint8_t *start, uint8_t *length);
+/* eRT Decoder Getters */
+void rds_dec_get_ert(const rds_decoder_t *rds, uint8_t *text, size_t *len, size_t max_len);
+int rds_dec_get_ert_encoding(const rds_decoder_t *rds);
+int rds_dec_get_ert_direction(const rds_decoder_t *rds);
 
 /* Cleanup */
 void rds_decoder_exit(rds_decoder_t *rds);

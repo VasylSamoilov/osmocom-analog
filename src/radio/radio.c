@@ -128,6 +128,44 @@ typedef struct rds_preset {
 	uint8_t		group0_version;		/* 0A vs 0B */
 	uint8_t		group1_version;		/* 1A vs 1B */
 	uint8_t		group2_version;		/* 2A vs 2B */
+	
+	/* RT+ (RadioText Plus) Configuration */
+	struct {
+		uint8_t		enabled;		/* 1 = enable RT+ ODA */
+		uint8_t		carrier_group;		/* ODA carrier group (e.g., 22 for 11A) */
+		uint16_t	message;			/* Group 3A message (cb, scb, template) */
+		uint8_t		toggle;			/* Item toggle flag */
+		uint8_t		item_running;		/* Item running flag */
+		struct {
+			uint8_t	content_type;		/* Content type (0-64) */
+			uint8_t	start;			/* Start position in RT (0-63) */
+			uint8_t	length;			/* Length of tag (1-64) */
+		} tags[2];				/* Up to 2 tags */
+		uint8_t		tag_count;		/* Number of tags (0-2) */
+	} rtplus;
+	
+	/* eRT+ (Enhanced RadioText Plus) Configuration */
+	struct {
+		uint8_t		enabled;		/* 1 = enable eRT+ ODA */
+		uint8_t		carrier_group;		/* ODA carrier group (e.g., 22 for 11A) */
+		uint16_t	message;			/* Group 3A message (cb, scb, template) */
+		uint8_t		toggle;			/* Item toggle flag */
+		uint8_t		item_running;		/* Item running flag */
+		struct {
+			uint8_t	content_type;		/* Content type (0-64) */
+			uint8_t	start;			/* Start position in eRT (0-127) */
+			uint8_t	length;			/* Length of tag (1-128) */
+		} tags[2];				/* Up to 2 tags */
+		uint8_t		tag_count;		/* Number of tags (0-2) */
+	} ert_plus;
+	
+	/* eRT (Enhanced RadioText) Configuration */
+	struct {
+		uint8_t		enabled;		/* 1 = enable eRT ODA */
+		uint8_t		carrier_group;		/* ODA carrier group (e.g., 24 for 12A) */
+		uint16_t	message;			/* Group 3A message (encoding, direction, chartable) */
+		const char	*text;			/* eRT text (128 bytes max, UTF-8) */
+	} ert;
 
 } rds_preset_t;
 
@@ -203,6 +241,219 @@ static const rds_preset_t rds_presets[] = {
 			},
 		},
 		.eon_count = 2,
+		/* RT+ (RadioText Plus) Configuration
+		 * Field: .rt[0:13] = "osmocom-analog" (artist, 14 chars)
+		 * Field: .rt[15:22] = "FM Radio" (station name, 8 chars)
+		 * Value source: content_type from RT+ spec constants, start/length from .rt field positions */
+		.rtplus = {
+			.enabled = 1,
+			.carrier_group = RDS_GROUP_11A,	/* Group 11A for RT+ ODA */
+			.message = 0x0000,		/* cb=0, scb=0, template=0 (RT+ default) */
+			.toggle = 0,
+			.item_running = 1,
+			.tags = {
+				{ .content_type = RDS_RTPLUS_CT_ITEM_ARTIST, .start = 0, .length = 14 },	/* item.artist: "osmocom-analog" (positions 0-13) */
+				{ .content_type = RDS_RTPLUS_CT_STATIONNAME_SHORT, .start = 15, .length = 8 },	/* stationname.short: "FM Radio" (positions 15-22) */
+			},
+			.tag_count = 2,
+		},
+		/* eRT+ (Enhanced RadioText Plus) Configuration
+		 * Field: .ert[8:18] = "The Beatles" (artist, 11 chars)
+		 * Field: .ert[29:36] = "Hey Jude" (title, 8 chars)
+		 * Value source: content_type from RT+ spec constants, start/length from .ert field positions */
+		.ert_plus = {
+			.enabled = 1,
+			.carrier_group = RDS_GROUP_13A,	/* Group 13A for eRT+ ODA (different from RT+ on 11A) */
+			.message = 0x0000,		/* cb=0, scb=0, template=0 (eRT+ default) */
+			.toggle = 0,
+			.item_running = 1,
+			.tags = {
+				{ .content_type = RDS_RTPLUS_CT_ITEM_ARTIST, .start = 8, .length = 11 },	/* item.artist: "The Beatles" (positions 8-18) */
+				{ .content_type = RDS_RTPLUS_CT_ITEM_TITLE, .start = 29, .length = 8 },	/* item.title: "Hey Jude" (positions 29-36) */
+			},
+			.tag_count = 2,
+		},
+		/* eRT (Enhanced RadioText) Configuration with UTF-8
+		 * Field: Extended RadioText with international characters
+		 * Value source: text with UTF-8 sequences (Café, Björk, Chinese, Ukrainian)
+		 *               encoding=UTF-8, direction=LTR, chartable=E3
+		 * Note: eRT+ tags reference positions in this text (e.g., "The Beatles" at pos 8) */
+		.ert = {
+			.enabled = 1,
+			.carrier_group = RDS_GROUP_12A,	/* Group 12A for eRT ODA */
+			.message = RDS_ERT_3A_MSG_UTF8_LTR_E3,	/* UTF-8 encoding, LTR direction, E3 chartable */
+			.text = "ARTIST: The Beatles | TITLE: Hey Jude | ALBUM: The Beatles 1967-1970 | GENRE: Rock | YEAR: 1968 | Weather: 22°C | Traffic: Київ",
+		},
+		/* ============================================================
+		 * RT+ (RadioText Plus) and eRT (Enhanced RadioText) Examples
+		 * ============================================================
+		 * RT+ and eRT are configured via runtime API after encoder init.
+		 * These examples show comprehensive configurations with field
+		 * descriptions indicating where each value comes from.
+		 * ============================================================
+		 * 
+		 * EXAMPLE 1: RT+ (RadioText Plus) - Comprehensive Example
+		 * ============================================================
+		 * RT+ tags semantic segments within standard RadioText (64 chars).
+		 * 
+		 * RadioText (from preset .rt field):
+		 *   "osmocom-analog FM Radio - Open Source Broadcast FM RDS Encoder!"
+		 *   Position: 0         1         2         3         4         5
+		 *             012345678901234567890123456789012345678901234567890123
+		 * 
+		 * RT+ Configuration (after encoder init):
+		 *   // Register RT+ ODA on Group 11A (carrier_group=22)
+		 *   rds_enc_oda_add(&radio->rds_enc, 22, RDS_ODA_AID_RT_PLUS, 0x0000);
+		 *   
+		 *   // Tag 1: Artist name (content_type=4 from RT+ spec)
+		 *   // Field: .rt[0:15] = "osmocom-analog"
+		 *   // Value source: content_type=4 (item.artist), start=0 (from .rt[0]),
+		 *   //               length=16 (from strlen("osmocom-analog"))
+		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 4, 0, 16);
+		 *   
+		 *   // Tag 2: Station name (content_type=31 from RT+ spec)
+		 *   // Field: .rt[19:26] = "FM Radio"
+		 *   // Value source: content_type=31 (stationname.short), start=19 (from .rt[19]),
+		 *   //               length=8 (from strlen("FM Radio"))
+		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 31, 19, 8);
+		 *   
+		 *   // Set RT+ flags
+		 *   // Field: item_running=1 (from current song/programme state)
+		 *   // Field: toggle=0 (from item change detection, toggles when tags change)
+		 *   rds_enc_rtplus_set_item_running(&radio->rds_enc, 1);
+		 *   rds_enc_rtplus_set_toggle(&radio->rds_enc, 0);
+		 * 
+		 * ============================================================
+		 * EXAMPLE 2: eRT (Enhanced RadioText) - Comprehensive Example
+		 * ============================================================
+		 * eRT extends RadioText to 128 bytes with UTF-8/UCS-2 support.
+		 * 
+		 * eRT Configuration (after encoder init):
+		 *   // Register eRT ODA on Group 12A (carrier_group=24)
+		 *   // Group 3A message bits:
+		 *   //   Bit 0: encoding=1 (UTF-8, from eRT encoding setting)
+		 *   //   Bit 1: direction=0 (LTR, from text direction setting)
+		 *   //   Bits 5-2: chartable=0 (E3, from character table setting)
+		 *   uint16_t ert_msg = (1 << 0) | (0 << 1) | (0 << 2);  // UTF-8, LTR, E3
+		 *   rds_enc_oda_add(&radio->rds_enc, 24, RDS_ODA_AID_ERT, ert_msg);
+		 *   
+		 *   // Set eRT text (128 bytes max, UTF-8 encoded)
+		 *   // Field: Extended RadioText content (from programme metadata)
+		 *   // Value source: text="Now Playing: Artist Name - Song Title | Next: Upcoming Show | Weather: Sunny 22°C | Traffic: Clear on Highway A1"
+		 *   //               length=128 (from strlen, truncated to 128 bytes max)
+		 *   const char *ert_text = "Now Playing: Artist Name - Song Title | Next: Upcoming Show | Weather: Sunny 22°C | Traffic: Clear on Highway A1";
+		 *   rds_enc_set_ert(&radio->rds_enc, (const uint8_t *)ert_text, strlen(ert_text));
+		 * 
+		 * ============================================================
+		 * EXAMPLE 3: RT+ with eRT+ Tags - Comprehensive Example
+		 * ============================================================
+		 * eRT+ applies RT+ tagging to Enhanced RadioText (128 bytes).
+		 * 
+		 * eRT+ Configuration (after encoder init):
+		 *   // Register eRT+ ODA on Group 11A (carrier_group=22)
+		 *   // Group 3A message bits (same format as RT+):
+		 *   //   Bit 12: cb=0 (from class/type flag)
+		 *   //   Bits 11-8: scb=0 (from server control bits)
+		 *   //   Bits 7-0: template=0 (from template number)
+		 *   rds_enc_oda_add(&radio->rds_enc, 22, RDS_ODA_AID_ERT_PLUS, 0x0000);
+		 *   
+		 *   // Set eRT text first (128 bytes)
+		 *   // Field: Extended RadioText with multiple segments
+		 *   // Value source: text="ARTIST: The Beatles | TITLE: Hey Jude | ALBUM: The Beatles 1967-1970 | GENRE: Rock | YEAR: 1968"
+		 *   const char *ert_text2 = "ARTIST: The Beatles | TITLE: Hey Jude | ALBUM: The Beatles 1967-1970 | GENRE: Rock | YEAR: 1968";
+		 *   rds_enc_set_ert(&radio->rds_enc, (const uint8_t *)ert_text2, strlen(ert_text2));
+		 *   
+		 *   // eRT+ Tag 1: Artist (content_type=4)
+		 *   // Field: .ert[8:20] = "The Beatles"
+		 *   // Value source: content_type=4 (item.artist), start=8 (from .ert[8]),
+		 *   //               length=12 (from strlen("The Beatles"))
+		 *   rds_enc_ert_plus_add_tag(&radio->rds_enc, 4, 8, 12);
+		 *   
+		 *   // eRT+ Tag 2: Title (content_type=1)
+		 *   // Field: .ert[30:39] = "Hey Jude"
+		 *   // Value source: content_type=1 (item.title), start=30 (from .ert[30]),
+		 *   //               length=9 (from strlen("Hey Jude"))
+		 *   rds_enc_ert_plus_add_tag(&radio->rds_enc, 1, 30, 9);
+		 *   
+		 *   // Set eRT+ flags
+		 *   // Field: item_running=1 (from current playback state)
+		 *   // Field: toggle=0 (from item change detection)
+		 *   // Note: eRT+ uses same API as RT+ but operates on 128-byte eRT text
+		 * 
+		 * ============================================================
+		 * EXAMPLE 4: eRT with UTF-8 Demonstration - Comprehensive Example
+		 * ============================================================
+		 * eRT supports UTF-8 encoding for international characters.
+		 * 
+		 * eRT UTF-8 Configuration (after encoder init):
+		 *   // Register eRT ODA on Group 12A (carrier_group=24)
+		 *   // Group 3A message: UTF-8 encoding enabled
+		 *   // Value source: encoding=1 (UTF-8, from eRT encoding setting),
+		 *   //               direction=0 (LTR, from text direction),
+		 *   //               chartable=0 (E3, from character table)
+		 *   uint16_t ert_utf8_msg = (1 << 0);  // UTF-8 encoding bit set
+		 *   rds_enc_oda_add(&radio->rds_enc, 24, RDS_ODA_AID_ERT, ert_utf8_msg);
+		 *   
+		 *   // Set eRT text with UTF-8 characters (128 bytes max)
+		 *   // Field: Extended RadioText with international characters
+		 *   // Value source: text with UTF-8 sequences:
+		 *   //   - "Now Playing: Café" (é = UTF-8 0xC3 0xA9, 2 bytes)
+		 *   //   - "Artist: Björk" (ö = UTF-8 0xC3 0xB6, 2 bytes)
+		 *   //   - "Title: 你好世界" (Chinese = UTF-8 multi-byte sequences)
+		 *   //   - "Weather: 22°C" (° = UTF-8 0xC2 0xB0, 2 bytes)
+		 *   //   - "Traffic: Київ" (Ukrainian = UTF-8 multi-byte sequences)
+		 *   //   length=calculated from UTF-8 byte count (max 128 bytes)
+		 *   const char *ert_utf8_text = "Now Playing: Café | Artist: Björk | Title: 你好世界 | Weather: 22°C | Traffic: Київ";
+		 *   rds_enc_set_ert(&radio->rds_enc, (const uint8_t *)ert_utf8_text, strlen(ert_utf8_text));
+		 *   
+		 *   // Note: UTF-8 multi-byte characters count as multiple bytes in length.
+		 *   // Example: "Café" = 5 bytes (C=1, a=1, f=1, é=2 bytes)
+		 *   //          "你好" = 6 bytes (each Chinese char = 3 UTF-8 bytes)
+		 * 
+		 * ============================================================
+		 * EXAMPLE 5: RT+ with Multiple Content Types - Comprehensive Example
+		 * ============================================================
+		 * RT+ supports up to 2 tags per group, cycling through tag sets.
+		 * 
+		 * RadioText (from preset .rt field):
+		 *   "News: Breaking Story | Weather: Sunny 25°C | Traffic: Highway Clear"
+		 *   Position: 0         1         2         3         4         5
+		 *             012345678901234567890123456789012345678901234567890123
+		 * 
+		 * RT+ Configuration (after encoder init):
+		 *   rds_enc_oda_add(&radio->rds_enc, 22, RDS_ODA_AID_RT_PLUS, 0x0000);
+		 *   
+		 *   // Tag 1: News headline (content_type=12 from RT+ spec)
+		 *   // Field: .rt[0:20] = "News: Breaking Story"
+		 *   // Value source: content_type=12 (info.news), start=0 (from .rt[0]),
+		 *   //               length=20 (from strlen("News: Breaking Story"))
+		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 12, 0, 20);
+		 *   
+		 *   // Tag 2: Weather info (content_type=25 from RT+ spec)
+		 *   // Field: .rt[22:38] = "Weather: Sunny 25°C"
+		 *   // Value source: content_type=25 (info.weather), start=22 (from .rt[22]),
+		 *   //               length=17 (from strlen("Weather: Sunny 25°C"))
+		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 25, 22, 17);
+		 *   
+		 *   // For additional tags, cycle to next tag set:
+		 *   // Clear and add new tags when content changes
+		 *   rds_enc_rtplus_clear_tags(&radio->rds_enc);
+		 *   // Tag 1: Traffic info (content_type=26)
+		 *   // Field: .rt[40:58] = "Traffic: Highway Clear"
+		 *   // Value source: content_type=26 (info.traffic), start=40 (from .rt[40]),
+		 *   //               length=19 (from strlen("Traffic: Highway Clear"))
+		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 26, 40, 19);
+		 *   // Toggle flag changes when tags change
+		 *   rds_enc_rtplus_set_toggle(&radio->rds_enc, 1);
+		 * 
+		 * ============================================================
+		 * Carrier Group Codes Reference:
+		 *   8A = 16,  8B = 17,  9A = 18,  9B = 19,
+		 *  10A = 20, 10B = 21, 11A = 22, 11B = 23,
+		 *  12A = 24, 12B = 25, 13A = 26, 13B = 27,
+		 *  14A = 28, 14B = 29, 15A = 30, 15B = 31
+		 * ============================================================
+		 */
 	},
 	{
 		.name     = "USA (RBDS)",
@@ -533,15 +784,13 @@ static void rds_apply_preset(radio_t *radio)
 		uint16_t cpi = rds_get_pi_from_callsign(rds_user_callsign);
 		if (cpi) pi = cpi;
 	}
-	enc->pi = pi;
+	rds_enc_set_pi(enc, pi);
 	
-	/* Update PS (IEC 62106 uses limited charset - convert UTF-8 to RDS) */
-	memset(enc->ps, ' ', 8);
-	enc->ps[8] = '\0';
+	/* Update PS using API */
 	if (p->ps && p->ps[0] != '\0') {
-		rds_validate_text(p->ps, "PS");
-		int warn = 0;
-		rds_encode_text(p->ps, (uint8_t *)enc->ps, 8, &warn);
+		rds_enc_set_ps(enc, p->ps);
+	} else {
+		rds_enc_clear_ps(enc);
 	}
 	
 	/* Update RadioText (IEC 62106 uses limited charset - convert UTF-8 to RDS) */
@@ -556,93 +805,109 @@ static void rds_apply_preset(radio_t *radio)
 	enc->rt_ab = !enc->rt_ab;  /* Toggle A/B to signal text change */
 	enc->rt_segment = 0;
 	
-	/* Update PTY and PTYN (IEC 62106 S6.1.5.8)
-	 * PTYN uses same Annex E charset as RadioText - 8 chars max */
-	enc->pty = p->pty & 0x1F;
-	memset(enc->ptyn, ' ', 8);
-	enc->ptyn[8] = '\0';
+	/* Update PTY and PTYN using API */
+	rds_enc_set_pty(enc, p->pty);
 	if (p->ptyn && p->ptyn[0] != '\0') {
-		/* Validate and encode UTF-8 to RDS charset */
-		rds_validate_text(p->ptyn, "PTYN");
-		int warn = 0;
-		rds_encode_text(p->ptyn, (uint8_t *)enc->ptyn, 8, &warn);
+		rds_enc_set_ptyn(enc, p->ptyn);
+	} else {
+		rds_enc_clear_ptyn(enc);
 	}
-	enc->ptyn_ab = !enc->ptyn_ab;
 	
-	/* Update traffic and mode flags */
-	enc->tp = p->tp;
-	enc->ms = p->ms;
+	/* Update traffic and mode flags using API */
+	rds_enc_set_tp(enc, p->tp);
+	rds_enc_set_ms(enc, p->ms);
 	
 	/* Update DI stereo flag based on broadcast mode (-S flag) */
 	enc->di_stereo = radio->stereo ? 1 : 0;
 	
-	/* Update country codes */
-	enc->ecc = p->ecc;
-	enc->language = p->lang;
+	/* Update country codes using API */
+	if (p->ecc != 0) {
+		rds_enc_set_ecc(enc, p->ecc);
+	} else {
+		rds_enc_clear_ecc(enc);
+	}
+	if (p->lang != 0) {
+		rds_enc_set_language(enc, p->lang);
+	} else {
+		rds_enc_clear_language(enc);
+	}
 	
-	/* Update Group 1A PIN (Programme Item Number) for THIS station */
-	enc->pin_day = p->pin_day;
-	enc->pin_hour = p->pin_hour;
-	enc->pin_minute = p->pin_minute;
+	/* Update Group 1A PIN (Programme Item Number) for THIS station using API */
+	if (p->pin_day != 0) {
+		rds_enc_set_pin(enc, p->pin_day, p->pin_hour, p->pin_minute);
+	} else {
+		rds_enc_clear_pin(enc);
+	}
 	
-	/* Update Alternative Frequencies (Unified Storage) */
-	load_preset_afs(enc, p);
+	/* Update Alternative Frequencies using API */
+	/* Clear existing AFs first */
+	rds_enc_af_clear(enc);
 	
-	/* Update EON (Enhanced Other Networks) - Group 14A - ALL variants */
+	/* Load Method B if present (takes priority) */
+	if (p->af_method_b_count > 0 && p->af_method_b_str[0]) {
+		for (int i = 0; i < p->af_method_b_count && i < RDS_AF_METHOD_B_MAX_LISTS; i++) {
+			if (p->af_method_b_str[i] && p->af_method_b_str[i][0]) {
+				rds_enc_af_method_b_add(enc, p->af_method_b_str[i]);
+			}
+		}
+	}
+	
+	/* Load Method A if no Method B */
+	if (enc->af_method_b.list_count == 0 && p->af_method_a_str && p->af_method_a_str[0]) {
+		rds_enc_af_set_method_a(enc, p->af_method_a_str);
+	}
+	
+	/* Update EON (Enhanced Other Networks) - Group 14A using API */
+	rds_enc_eon_clear(enc);
 	if (p->eon_count > 0) {
 		for (int i = 0; i < p->eon_count && i < RDS_EON_MAX_ENTRIES; i++) {
-			rds_eon_entry_t *eon = &enc->eon_tx[i];
-			memset(eon, 0, sizeof(*eon));
-			
-			/* Basic info (variants 0-3, 13) */
-			eon->pi = p->eon[i].pi;
-			memset(eon->ps, ' ', 8);
-			eon->ps[8] = '\0';
-			if (p->eon[i].ps) {
-				int len = strlen(p->eon[i].ps);
-				if (len > 8) len = 8;
-				memcpy(eon->ps, p->eon[i].ps, len);
-			}
-			eon->pty = p->eon[i].pty;
-			eon->tp = p->eon[i].tp;
-			eon->ta = p->eon[i].ta;
-			
-			/* AF (variant 4) - convert to 0.1 MHz format */
-			if (p->eon[i].af_count > 0) {
-				for (int j = 0; j < p->eon[i].af_count && j < RDS_EON_MAX_AF; j++) {
-					eon->af[j] = 875 + p->eon[i].af[j];  /* Convert code to 0.1MHz */
+			/* Add basic EON entry using API */
+			if (rds_enc_eon_add(enc, p->eon[i].pi, p->eon[i].ps, p->eon[i].pty, p->eon[i].tp) == 0) {
+				/* Set TA if needed */
+				if (p->eon[i].ta) {
+					rds_enc_eon_set_ta(enc, p->eon[i].pi, p->eon[i].ta);
 				}
-				eon->af_count = p->eon[i].af_count;
-			}
-			
-			/* Mapped AF (variants 5-9) */
-			if (p->eon[i].mapped_af_count > 0) {
-				for (int j = 0; j < p->eon[i].mapped_af_count && j < RDS_EON_MAX_MAPPED_AF; j++) {
-					eon->mapped_af[j].tuned_af = p->eon[i].mapped_af[j].tuned;
-					eon->mapped_af[j].on_af = p->eon[i].mapped_af[j].on;
+				
+				/* Find the entry we just added to set extended fields */
+				for (int j = 0; j < enc->eon_tx_count; j++) {
+					if (enc->eon_tx[j].pi == p->eon[i].pi) {
+						rds_eon_entry_t *eon = &enc->eon_tx[j];
+						
+						/* AF (variant 4) - convert to 0.1 MHz format */
+						if (p->eon[i].af_count > 0) {
+							for (int k = 0; k < p->eon[i].af_count && k < RDS_EON_MAX_AF; k++) {
+								eon->af[k] = 875 + p->eon[i].af[k];  /* Convert code to 0.1MHz */
+							}
+							eon->af_count = p->eon[i].af_count;
+						}
+						
+						/* Mapped AF (variants 5-9) */
+						if (p->eon[i].mapped_af_count > 0) {
+							for (int k = 0; k < p->eon[i].mapped_af_count && k < RDS_EON_MAX_MAPPED_AF; k++) {
+								eon->mapped_af[k].tuned_af = p->eon[i].mapped_af[k].tuned;
+								eon->mapped_af[k].on_af = p->eon[i].mapped_af[k].on;
+							}
+							eon->mapped_af_count = p->eon[i].mapped_af_count;
+						}
+						
+						/* Linkage (variant 12) */
+						eon->linkage_la = p->eon[i].linkage_la;
+						eon->linkage_lsn = p->eon[i].linkage_lsn;
+						
+						/* PIN (variant 14) */
+						eon->pin_day = p->eon[i].pin_day;
+						eon->pin_hour = p->eon[i].pin_hour;
+						eon->pin_minute = p->eon[i].pin_minute;
+						
+						/* Broadcaster data (variant 15) */
+						eon->broadcaster_data = p->eon[i].broadcaster_data;
+						break;
+					}
 				}
-				eon->mapped_af_count = p->eon[i].mapped_af_count;
 			}
-			
-			/* Linkage (variant 12) */
-			eon->linkage_la = p->eon[i].linkage_la;
-			eon->linkage_lsn = p->eon[i].linkage_lsn;
-			
-			/* PIN (variant 14) */
-			eon->pin_day = p->eon[i].pin_day;
-			eon->pin_hour = p->eon[i].pin_hour;
-			eon->pin_minute = p->eon[i].pin_minute;
-			
-			/* Broadcaster data (variant 15) */
-			eon->broadcaster_data = p->eon[i].broadcaster_data;
 		}
-		enc->eon_tx_count = p->eon_count;
-		enc->eon_enabled = 1;
 		enc->eon_tx_index = 0;
 		enc->eon_tx_variant = 0;
-	} else {
-		enc->eon_tx_count = 0;
-		enc->eon_enabled = 0;
 	}
 	
 	/* Reset PS segment to restart transmission */
@@ -676,6 +941,72 @@ static void rds_apply_preset(radio_t *radio)
 		enc->use_2b = (rt_len > 0 && rt_len <= 32);  /* Short RT → 2B */
 	} else {
 		enc->use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
+	}
+	
+	/* Update RT+ (RadioText Plus) Configuration */
+	if (p->rtplus.enabled) {
+		/* Register RT+ ODA */
+		rds_enc_oda_add(enc, p->rtplus.carrier_group, RDS_ODA_AID_RT_PLUS, p->rtplus.message);
+		
+		/* Clear existing tags and add new ones */
+		rds_enc_rtplus_clear_tags(enc);
+		for (int i = 0; i < p->rtplus.tag_count && i < RDS_RTPLUS_MAX_TAGS; i++) {
+			rds_enc_rtplus_add_tag(enc, p->rtplus.tags[i].content_type,
+			                      p->rtplus.tags[i].start, p->rtplus.tags[i].length);
+		}
+		
+		/* Set RT+ flags */
+		rds_enc_rtplus_set_toggle(enc, p->rtplus.toggle);
+		rds_enc_rtplus_set_item_running(enc, p->rtplus.item_running);
+		
+		LOGP(DRADIO, LOGL_INFO, "RDS RT+: Enabled on group %d with %d tag(s)\n",
+		     p->rtplus.carrier_group, p->rtplus.tag_count);
+	} else {
+		/* Remove RT+ ODA if it was previously enabled */
+		rds_enc_oda_remove(enc, RDS_ODA_AID_RT_PLUS);
+		rds_enc_rtplus_clear_tags(enc);
+	}
+	
+	/* Update eRT+ (Enhanced RadioText Plus) Configuration */
+	if (p->ert_plus.enabled) {
+		/* Register eRT+ ODA */
+		rds_enc_oda_add(enc, p->ert_plus.carrier_group, RDS_ODA_AID_ERT_PLUS, p->ert_plus.message);
+		
+		/* Clear existing tags and add new ones */
+		rds_enc_ert_plus_clear_tags(enc);
+		for (int i = 0; i < p->ert_plus.tag_count && i < RDS_RTPLUS_MAX_TAGS; i++) {
+			rds_enc_ert_plus_add_tag(enc, p->ert_plus.tags[i].content_type,
+			                         p->ert_plus.tags[i].start, p->ert_plus.tags[i].length);
+		}
+		
+		/* Note: eRT+ uses same toggle/item_running API as RT+, but operates on eRT text
+		 * These flags are managed separately in the encoder state */
+		
+		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Enabled on group %d with %d tag(s)\n",
+		     p->ert_plus.carrier_group, p->ert_plus.tag_count);
+	} else {
+		/* Remove eRT+ ODA if it was previously enabled */
+		rds_enc_oda_remove(enc, RDS_ODA_AID_ERT_PLUS);
+		rds_enc_ert_plus_clear_tags(enc);
+	}
+	
+	/* Update eRT (Enhanced RadioText) Configuration */
+	if (p->ert.enabled && p->ert.text) {
+		/* Register eRT ODA */
+		rds_enc_oda_add(enc, p->ert.carrier_group, RDS_ODA_AID_ERT, p->ert.message);
+		
+		/* Set eRT text (UTF-8 encoded, up to 128 bytes) */
+		size_t ert_len = strlen(p->ert.text);
+		if (ert_len > RDS_ERT_LENGTH) ert_len = RDS_ERT_LENGTH;
+		rds_enc_set_ert(enc, (const uint8_t *)p->ert.text, ert_len);
+		
+		LOGP(DRADIO, LOGL_INFO, "RDS eRT: Enabled on group %d with %zu bytes (encoding=%s)\n",
+		     p->ert.carrier_group, ert_len,
+		     (p->ert.message & RDS_ERT_3A_ENCODING_MASK) == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2");
+	} else {
+		/* Remove eRT ODA if it was previously enabled */
+		rds_enc_oda_remove(enc, RDS_ODA_AID_ERT);
+		rds_enc_clear_ert(enc);
 	}
 	
 	/* Debug test mode */
@@ -969,19 +1300,28 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	if (radio->emphasis) {
 		double tau = time_constant_us / 1e6;
 		if (fm_fast_math_enabled()) {
-			/* Initialize optimized 1st-order emphasis filters (TX/RX) */
-			init_emphasis_fast(&radio->fm_emphasis_fast[0], radio->signal_samplerate, tau, 12000.0);
+			/* Initialize separate TX and RX emphasis filters to prevent state corruption */
+			/* TX filters: pre-emphasis (boosts high frequencies before transmission) */
+			init_emphasis_fast(&radio->fm_emphasis_fast_tx[0], radio->signal_samplerate, tau, 12000.0);
+			/* RX filters: de-emphasis (restores flat frequency response after reception) */
+			init_emphasis_fast(&radio->fm_emphasis_fast_rx[0], radio->signal_samplerate, tau, 12000.0);
 			/* Initialize RX DC blocking filter (30 Hz cutoff - low enough to preserve bass) */
 			init_dc_filter_fast(&radio->rx_dc_filter[0], radio->signal_samplerate, DC_CUTOFF);
 			if (radio->stereo) {
-				init_emphasis_fast(&radio->fm_emphasis_fast[1], radio->signal_samplerate, tau, 12000.0);
+				init_emphasis_fast(&radio->fm_emphasis_fast_tx[1], radio->signal_samplerate, tau, 12000.0);
+				init_emphasis_fast(&radio->fm_emphasis_fast_rx[1], radio->signal_samplerate, tau, 12000.0);
 				init_dc_filter_fast(&radio->rx_dc_filter[1], radio->signal_samplerate, DC_CUTOFF);
 			}
 		} else {
 			/* time constant - convert from µs to seconds */
-			init_emphasis(&radio->fm_emphasis[0], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
-			if (radio->stereo)
-				init_emphasis(&radio->fm_emphasis[1], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
+			/* TX filters: pre-emphasis */
+			init_emphasis(&radio->fm_emphasis_tx[0], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
+			/* RX filters: de-emphasis */
+			init_emphasis(&radio->fm_emphasis_rx[0], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
+			if (radio->stereo) {
+				init_emphasis(&radio->fm_emphasis_tx[1], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
+				init_emphasis(&radio->fm_emphasis_rx[1], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
+			}
 		}
 	}
 		rc = fm_mod_init(&radio->fm_mod, radio->signal_samplerate, 0.0, 1.0);
@@ -1105,6 +1445,57 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 				radio->rds_enc.eon_tx_count = p->eon_count;
 				radio->rds_enc.eon_enabled = 1;
 				LOGP(DRADIO, LOGL_INFO, "RDS EON: %d Other Networks configured (all variants)\n", p->eon_count);
+			}
+			
+			/* RT+ (RadioText Plus) Configuration */
+			if (p->rtplus.enabled) {
+				/* Register RT+ ODA */
+				rds_enc_oda_add(&radio->rds_enc, p->rtplus.carrier_group, RDS_ODA_AID_RT_PLUS, p->rtplus.message);
+				
+				/* Clear existing tags and add new ones */
+				rds_enc_rtplus_clear_tags(&radio->rds_enc);
+				for (int i = 0; i < p->rtplus.tag_count && i < RDS_RTPLUS_MAX_TAGS; i++) {
+					rds_enc_rtplus_add_tag(&radio->rds_enc, p->rtplus.tags[i].content_type,
+					                      p->rtplus.tags[i].start, p->rtplus.tags[i].length);
+				}
+				
+				/* Set RT+ flags */
+				rds_enc_rtplus_set_toggle(&radio->rds_enc, p->rtplus.toggle);
+				rds_enc_rtplus_set_item_running(&radio->rds_enc, p->rtplus.item_running);
+				
+				LOGP(DRADIO, LOGL_INFO, "RDS RT+: Enabled on group %d with %d tag(s)\n",
+				     p->rtplus.carrier_group, p->rtplus.tag_count);
+			}
+			
+			/* eRT+ (Enhanced RadioText Plus) Configuration */
+			if (p->ert_plus.enabled) {
+				/* Register eRT+ ODA */
+				rds_enc_oda_add(&radio->rds_enc, p->ert_plus.carrier_group, RDS_ODA_AID_ERT_PLUS, p->ert_plus.message);
+				
+				/* Clear existing tags and add new ones */
+				rds_enc_ert_plus_clear_tags(&radio->rds_enc);
+				for (int i = 0; i < p->ert_plus.tag_count && i < RDS_RTPLUS_MAX_TAGS; i++) {
+					rds_enc_ert_plus_add_tag(&radio->rds_enc, p->ert_plus.tags[i].content_type,
+					                         p->ert_plus.tags[i].start, p->ert_plus.tags[i].length);
+				}
+				
+				LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Enabled on group %d with %d tag(s)\n",
+				     p->ert_plus.carrier_group, p->ert_plus.tag_count);
+			}
+			
+			/* eRT (Enhanced RadioText) Configuration */
+			if (p->ert.enabled && p->ert.text) {
+				/* Register eRT ODA */
+				rds_enc_oda_add(&radio->rds_enc, p->ert.carrier_group, RDS_ODA_AID_ERT, p->ert.message);
+				
+				/* Set eRT text (UTF-8 encoded, up to 128 bytes) */
+				size_t ert_len = strlen(p->ert.text);
+				if (ert_len > RDS_ERT_LENGTH) ert_len = RDS_ERT_LENGTH;
+				rds_enc_set_ert(&radio->rds_enc, (const uint8_t *)p->ert.text, ert_len);
+				
+				LOGP(DRADIO, LOGL_INFO, "RDS eRT: Enabled on group %d with %zu bytes (encoding=%s)\n",
+				     p->ert.carrier_group, ert_len,
+				     (p->ert.message & RDS_ERT_3A_ENCODING_MASK) == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2");
 			}
 			
 			/* Group version selection (A vs B) with auto-detection
@@ -1232,17 +1623,21 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		goto error;
 	}
 
-	/* signal buffers */
+	/* signal buffers - separate TX and RX to prevent any potential race conditions */
 	radio->signal_buffer_size = buffer_size;
-	radio->signal_buffer = calloc(radio->signal_buffer_size * 3, sizeof(*radio->signal_buffer));
+	/* TX signal buffer: 3 channels (mono/stereo + temp) */
+	radio->tx_signal_buffer = calloc(radio->signal_buffer_size * 3, sizeof(*radio->tx_signal_buffer));
+	/* RX signal buffer: 3 channels (mono/stereo + temp) */
+	radio->rx_signal_buffer = calloc(radio->signal_buffer_size * 3, sizeof(*radio->rx_signal_buffer));
+	/* TX power buffer */
 	radio->signal_power_buffer = calloc(radio->signal_buffer_size, sizeof(*radio->signal_power_buffer));
-	if (!radio->signal_buffer || !radio->signal_power_buffer) {
+	if (!radio->tx_signal_buffer || !radio->rx_signal_buffer || !radio->signal_power_buffer) {
 		LOGP(DRADIO, LOGL_ERROR, "No memory!!\n");
 		rc = -ENOMEM;
 		goto error;
 	}
 
-	/* temporary I/Q/carrier buffers, used while demodulating */
+	/* temporary I/Q/carrier buffers, used while demodulating (RX-only) */
 	radio->I_buffer = calloc(buffer_size, sizeof(*radio->I_buffer));
 	radio->Q_buffer = calloc(buffer_size, sizeof(*radio->Q_buffer));
 	radio->carrier_buffer = calloc(buffer_size, sizeof(*radio->carrier_buffer));
@@ -1265,9 +1660,13 @@ void radio_exit(radio_t *radio)
 		free(radio->audio_buffer);
 		radio->audio_buffer = NULL;
 	}
-	if (radio->signal_buffer) {
-		free(radio->signal_buffer);
-		radio->signal_buffer = NULL;
+	if (radio->tx_signal_buffer) {
+		free(radio->tx_signal_buffer);
+		radio->tx_signal_buffer = NULL;
+	}
+	if (radio->rx_signal_buffer) {
+		free(radio->rx_signal_buffer);
+		radio->rx_signal_buffer = NULL;
 	}
 	if (radio->signal_power_buffer) {
 		free(radio->signal_power_buffer);
@@ -1381,9 +1780,10 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		LOGP(DRADIO, LOGL_ERROR, "signal_num > signal_buffer_size, please fix!.\n");
 		abort();
 	}
-	signal_samples[0] = radio->signal_buffer;
-	signal_samples[1] = radio->signal_buffer + radio->signal_buffer_size;
-	signal_samples[2] = radio->signal_buffer + radio->signal_buffer_size * 2;
+	/* Use TX-only signal buffer */
+	signal_samples[0] = radio->tx_signal_buffer;
+	signal_samples[1] = radio->tx_signal_buffer + radio->signal_buffer_size;
+	signal_samples[2] = radio->tx_signal_buffer + radio->signal_buffer_size * 2;
 	signal_power = radio->signal_power_buffer;
 
 	/* get audio to be sent */
@@ -1542,19 +1942,21 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	switch (radio->modulation) {
 	case MODULATION_FM:
 		if (radio->emphasis) {
+			/* Use TX-only filters for pre-emphasis */
 			if (fm_fast_math_enabled())
-				pre_emphasis_fast(&radio->fm_emphasis_fast[0], signal_samples[0], signal_num);
+				pre_emphasis_fast(&radio->fm_emphasis_fast_tx[0], signal_samples[0], signal_num);
 			else
-				pre_emphasis(&radio->fm_emphasis[0], signal_samples[0], signal_num);
+				pre_emphasis(&radio->fm_emphasis_tx[0], signal_samples[0], signal_num);
 		}
 
 		clipper_process(signal_samples[0], signal_num);
 		if (radio->stereo) {
 			if (radio->emphasis) {
+				/* Use TX-only filters for pre-emphasis */
 				if (fm_fast_math_enabled())
-					pre_emphasis_fast(&radio->fm_emphasis_fast[1], signal_samples[1], signal_num);
+					pre_emphasis_fast(&radio->fm_emphasis_fast_tx[1], signal_samples[1], signal_num);
 				else
-					pre_emphasis(&radio->fm_emphasis[1], signal_samples[1], signal_num);
+					pre_emphasis(&radio->fm_emphasis_tx[1], signal_samples[1], signal_num);
 			}
 			clipper_process(signal_samples[1], signal_num);
 		}
@@ -1666,9 +2068,10 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		LOGP(DRADIO, LOGL_ERROR, "signal_num > signal_buffer_size, please fix!.\n");
 		abort();
 	}
-	samples[0] = radio->signal_buffer;
-	samples[1] = radio->signal_buffer + radio->signal_buffer_size;
-	samples[2] = radio->signal_buffer + radio->signal_buffer_size * 2;
+	/* Use RX-only signal buffer */
+	samples[0] = radio->rx_signal_buffer;
+	samples[1] = radio->rx_signal_buffer + radio->signal_buffer_size;
+	samples[2] = radio->rx_signal_buffer + radio->signal_buffer_size * 2;
 
 	switch (radio->modulation) {
 	case MODULATION_FM:
@@ -1795,17 +2198,19 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			 * De-emphasis restores flat frequency response. */
 			if (fm_fast_math_enabled()) {
 				dc_filter_fast(&radio->rx_dc_filter[0], samples[0], signal_num);
-				de_emphasis_fast(&radio->fm_emphasis_fast[0], samples[0], signal_num);
+				/* Use RX-only filters for de-emphasis */
+				de_emphasis_fast(&radio->fm_emphasis_fast_rx[0], samples[0], signal_num);
 				if (radio->stereo) {
 					dc_filter_fast(&radio->rx_dc_filter[1], samples[1], signal_num);
-					de_emphasis_fast(&radio->fm_emphasis_fast[1], samples[1], signal_num);
+					de_emphasis_fast(&radio->fm_emphasis_fast_rx[1], samples[1], signal_num);
 				}
 			} else {
-				dc_filter(&radio->fm_emphasis[0], samples[0], signal_num);
-				de_emphasis(&radio->fm_emphasis[0], samples[0], signal_num);
+				/* Use RX-only filters for de-emphasis */
+				dc_filter(&radio->fm_emphasis_rx[0], samples[0], signal_num);
+				de_emphasis(&radio->fm_emphasis_rx[0], samples[0], signal_num);
 				if (radio->stereo) {
-					dc_filter(&radio->fm_emphasis[1], samples[1], signal_num);
-					de_emphasis(&radio->fm_emphasis[1], samples[1], signal_num);
+					dc_filter(&radio->fm_emphasis_rx[1], samples[1], signal_num);
+					de_emphasis(&radio->fm_emphasis_rx[1], samples[1], signal_num);
 				}
 			}
 		}

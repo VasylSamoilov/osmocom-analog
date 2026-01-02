@@ -1277,6 +1277,198 @@ static void rds_build_group_1b(rds_encoder_t *rds, uint8_t *group)
 }
 
 /* ============================================================
+ * RT+ (RadioText Plus) Encoder
+ * IEC 62106-6: Content-type tagging for RadioText
+ * ============================================================ */
+
+/* Build RT+ ODA group (typically Group 11A)
+ * Encodes RT+ tags into ODA carrier group
+ */
+static void rds_build_rtplus_group(rds_encoder_t *rds, rds_rtplus_encoder_t *rtplus,
+                                   uint16_t *b2, uint16_t *b3, uint16_t *b4)
+{
+	uint16_t b2_base = (rds->tp << RDS_B2_TP_BIT) | (rds->pty << RDS_B2_PTY_SHIFT);
+	
+	/* Block B: toggle, item_running, tag1 content_type[5:3] */
+	*b2 = b2_base;
+	if (rtplus->tag_count > 0) {
+		*b2 |= (rtplus->toggle << RDS_RTPLUS_TOGGLE_BIT);
+		*b2 |= (rtplus->item_running << RDS_RTPLUS_ITEM_RUNNING_BIT);
+		*b2 |= ((rtplus->tags[0].content_type >> RDS_RTPLUS_TAG1_CT_HIGH_SHIFT) & RDS_RTPLUS_TAG1_CT_HIGH_MASK);
+	}
+	
+	/* Block C: tag1 content_type[2:0], start, length-1, tag2 content_type[5:4] */
+	*b3 = 0;
+	if (rtplus->tag_count > 0) {
+		rds_rtplus_tag_t *tag1 = &rtplus->tags[0];
+		*b3 |= ((tag1->content_type & 0x07) << RDS_RTPLUS_TAG1_CT_LOW_SHIFT);  /* bits 15-13 */
+		*b3 |= ((tag1->start & 0x3F) << RDS_RTPLUS_TAG1_START_SHIFT);          /* bits 12-7 */
+		*b3 |= (((tag1->length - 1) & 0x3F) << RDS_RTPLUS_TAG1_LEN_SHIFT);   /* bits 6-1 (length-1) */
+		
+		if (rtplus->tag_count > 1) {
+			/* Tag2 content_type[5:4] goes in B3[1:0] (2 bits) */
+			*b3 |= ((rtplus->tags[1].content_type >> RDS_RTPLUS_TAG2_CT_HIGH_SHIFT) & RDS_RTPLUS_TAG2_CT_HIGH_MASK);
+		}
+	}
+	
+	/* Block D: tag2 content_type[4:0], start, length-1, spare */
+	*b4 = 0;
+	if (rtplus->tag_count > 1) {
+		rds_rtplus_tag_t *tag2 = &rtplus->tags[1];
+		/* Tag2 content_type: extract bits 4:0 from the 6-bit value */
+		*b4 |= ((tag2->content_type & 0x1F) << RDS_RTPLUS_TAG2_CT_LOW_SHIFT);  /* bits 15-11 */
+		*b4 |= ((tag2->start & 0x3F) << RDS_RTPLUS_TAG2_START_SHIFT);         /* bits 10-5 */
+		*b4 |= (((tag2->length - 1) & 0x1F) << RDS_RTPLUS_TAG2_LEN_SHIFT);  /* bits 4-0 (length-1, max 31) */
+	}
+	
+	if (rds->debug) {
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX RT+: toggle=%d running=%d tags=%d\n",
+		     rtplus->toggle, rtplus->item_running, rtplus->tag_count);
+		if (rtplus->tag_count > 0) {
+			LOGP(DRADIO, LOGL_DEBUG, "  Tag1: type=%d start=%d len=%d\n",
+			     rtplus->tags[0].content_type, rtplus->tags[0].start, rtplus->tags[0].length);
+		}
+		if (rtplus->tag_count > 1) {
+			LOGP(DRADIO, LOGL_DEBUG, "  Tag2: type=%d start=%d len=%d\n",
+			     rtplus->tags[1].content_type, rtplus->tags[1].start, rtplus->tags[1].length);
+		}
+	}
+}
+
+/* ============================================================
+ * eRT (Enhanced RadioText) Encoder
+ * RDS2 / IEC 62106-2: 128-byte RadioText with UTF-8/UCS-2
+ * ============================================================ */
+
+/* Build eRT ODA group (configurable ODA group)
+ * Similar to Group 2A but for 128-byte eRT text
+ */
+static void rds_build_ert_group(rds_encoder_t *rds, uint16_t *b2, uint16_t *b3, uint16_t *b4)
+{
+	rds_ert_encoder_t *ert = &rds->ert;
+	int seg = ert->segment;
+	int pos = seg * RDS_ERT_BYTES_PER_SEGMENT;
+	
+	if (pos >= RDS_ERT_LENGTH) {
+		seg = 0;
+		pos = 0;
+		ert->segment = 0;
+	}
+	
+	/* Block B: segment address (0-31) */
+	*b2 = (rds->tp << RDS_B2_TP_BIT) | (rds->pty << RDS_B2_PTY_SHIFT);
+	*b2 |= (seg & RDS_ERT_SEGMENT_MASK);
+	
+	/* Block C: eRT bytes [pos] and [pos+1] */
+	*b3 = ((uint16_t)ert->ert[pos] << 8) | (uint16_t)ert->ert[pos + 1];
+	
+	/* Block D: eRT bytes [pos+2] and [pos+3] */
+	*b4 = ((uint16_t)ert->ert[pos + 2] << 8) | (uint16_t)ert->ert[pos + 3];
+	
+	if (rds->debug) {
+		char char_display[5] = {0};
+		for (int i = 0; i < 4 && pos + i < RDS_ERT_LENGTH; i++) {
+			const char *disp = rds_char_to_display(ert->ert[pos + i]);
+			if (disp && strlen(disp) == 1) {
+				char_display[i] = disp[0];
+			} else {
+				char_display[i] = '.';
+			}
+		}
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX eRT: seg=%d pos=%d-%d encoding=%s "
+		     "chars='%s'\n",
+		     seg, pos, pos + 3,
+		     ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
+		     char_display);
+	}
+	
+	/* Advance segment, wrapping at 32 */
+	ert->segment = (seg + 1) % RDS_ERT_SEGMENTS;
+}
+
+/* Build Group 3A: ODA Identification (IEC 62106 S6.1.5.5)
+ *
+ * Group 3A announces which group type carries a specific ODA application.
+ * Receivers use this to build a map of active ODAs.
+ *
+ * Block B bits 4-0: Application Group Type Code
+ *   - Indicates which group (0A-15B) carries this ODA's data
+ *   - Format: [group_number(4 bits)][version(1 bit)] → 0=0A, 1=0B, ..., 31=15B
+ *
+ * Block C: ODA-specific message (application-dependent, 16 bits)
+ *   - RT+: CB flag, SCB, template number
+ *   - eRT: encoding, direction, character table
+ *   - TMC: system info
+ *
+ * Block D: Application Identification (AID) - 16-bit registered code
+ *   - 0x4BD7 = RT+, 0x6552 = eRT, 0xCD46/CD47 = TMC, etc.
+ *
+ * Cycling: When multiple ODAs are configured, this function cycles through
+ * them, transmitting one 3A group per call with the next ODA in sequence.
+ */
+static void rds_build_group_3a(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2, b3, b4;
+	
+	/* Get current ODA configuration to transmit */
+	if (rds->oda_count == 0) {
+		/* No ODAs configured - should not be called, but handle gracefully */
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS TX 3A: No ODA configured, skipping\n");
+		return;
+	}
+	
+	/* Cycle through configured ODAs */
+	int idx = rds->oda_cycle_idx % rds->oda_count;
+	rds_oda_config_t *oda = &rds->oda[idx];
+	
+	/* Block A: PI code */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	
+	/* Block B: Group type (3A) + PTY + TP + App Group Type Code (bits 4-0) */
+	b2 = (RDS_GROUP_3A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     (oda->carrier_group & RDS_3A_APP_GROUP_MASK);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	
+	/* Block C: ODA-specific message */
+	b3 = oda->message;
+	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+	
+	/* Block D: Application ID (AID) */
+	b4 = oda->aid;
+	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+	
+	/* Debug logging */
+	if (rds->debug) {
+		const char *oda_name = "Unknown";
+		switch (oda->aid) {
+		case RDS_ODA_AID_RT_PLUS:     oda_name = "RT+"; break;
+		case RDS_ODA_AID_ERT:         oda_name = "eRT"; break;
+		case RDS_ODA_AID_ERT_PLUS:    oda_name = "eRT+"; break;
+		case RDS_ODA_AID_DAB_XREF:    oda_name = "DAB"; break;
+		case RDS_ODA_AID_TMC_ALERT:
+		case RDS_ODA_AID_TMC_ALERT2:  oda_name = "TMC"; break;
+		case RDS_ODA_AID_STATION_LOGO: oda_name = "Logo"; break;
+		}
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 3A: ODA[%d/%d] AID=0x%04X (%s) "
+		     "carrier=%d%c msg=0x%04X\n",
+		     idx + 1, rds->oda_count, oda->aid, oda_name,
+		     oda->carrier_group >> 1,
+		     (oda->carrier_group & 1) ? 'B' : 'A',
+		     oda->message);
+	}
+	
+	/* Pack into bytes */
+	rds_group_pack(blocks, group, 0);
+	
+	/* Advance to next ODA for cycling */
+	rds->oda_cycle_idx = (idx + 1) % rds->oda_count;
+}
+
+/* ============================================================
  * Modified Julian Date (MJD) Conversion Utilities
  * IEC 62106 Annex G
  * ============================================================
@@ -1628,6 +1820,7 @@ void rds_scheduler_update(rds_encoder_t *rds)
 	int has_slc = (rds->ecc != 0 || rds->language != 0 || rds->pin_day > 0);
 	int has_ptyn = (rds->ptyn[0] != ' ' && rds->ptyn[0] != '\0');
 	int has_eon = (rds->eon_enabled && rds->eon_tx_count > 0);
+	int has_oda = (rds->oda_count > 0);
 	
 	/* Use Group 2B if configured, else 2A */
 	enum rds_group_type g2 = rds->use_2b ? RDS_GROUP_2B : RDS_GROUP_2A;
@@ -1686,6 +1879,44 @@ void rds_scheduler_update(rds_encoder_t *rds)
 	/* Block 7: EON (14A) - optional append */
 	if (has_eon) {
 		ADD_GRP(RDS_GROUP_14A);
+	}
+	
+	/* Block 8: ODA identification (3A) - cycles through configured ODAs */
+	if (has_oda) {
+		ADD_GRP(RDS_GROUP_3A);
+	}
+	
+	/* Block 9: RT+ ODA group (if configured and has tags) */
+	for (int i = 0; i < rds->oda_count; i++) {
+		if (rds->oda[i].aid == RDS_ODA_AID_RT_PLUS && rds->oda[i].enabled) {
+			if (rds->rtplus.tag_count > 0) {
+				enum rds_group_type rtplus_group = (enum rds_group_type)rds->oda[i].carrier_group;
+				ADD_GRP(rtplus_group);
+			}
+			break;
+		}
+	}
+	
+	/* Block 10: eRT+ ODA group (if configured and has tags) */
+	for (int i = 0; i < rds->oda_count; i++) {
+		if (rds->oda[i].aid == RDS_ODA_AID_ERT_PLUS && rds->oda[i].enabled) {
+			if (rds->ert_plus.tag_count > 0) {
+				enum rds_group_type ert_plus_group = (enum rds_group_type)rds->oda[i].carrier_group;
+				ADD_GRP(ert_plus_group);
+			}
+			break;
+		}
+	}
+	
+	/* Block 11: eRT ODA group (if configured and has text) */
+	for (int i = 0; i < rds->oda_count; i++) {
+		if (rds->oda[i].aid == RDS_ODA_AID_ERT && rds->oda[i].enabled) {
+			if (rds->ert.length > 0) {
+				enum rds_group_type ert_group = (enum rds_group_type)rds->oda[i].carrier_group;
+				ADD_GRP(ert_group);
+			}
+			break;
+		}
 	}
 
 	/* Log the new sequence */
@@ -1799,6 +2030,9 @@ static void rds_generate_group(rds_encoder_t *rds)
 	case RDS_GROUP_2B:
 		rds_build_group_2b(rds, rds->group_buffer);
 		break;
+	case RDS_GROUP_3A:
+		rds_build_group_3a(rds, rds->group_buffer);
+		break;
 	case RDS_GROUP_10A:
 		rds_build_group_10a(rds, rds->group_buffer);
 		break;
@@ -1807,6 +2041,70 @@ static void rds_generate_group(rds_encoder_t *rds)
 		break;
 	case RDS_GROUP_14B:
 		rds_build_group_14b(rds, rds->group_buffer);
+		break;
+	/* ODA groups (11A-13B, etc.) - route to specific ODA builders */
+	case RDS_GROUP_11A:
+	case RDS_GROUP_11B:
+	case RDS_GROUP_12A:
+	case RDS_GROUP_12B:
+	case RDS_GROUP_13A:
+	case RDS_GROUP_13B:
+		/* Route to ODA-specific builders based on configured ODAs */
+		{
+			int carrier_code = (int)type;
+			uint32_t blocks[4] = {0};
+			uint16_t b2, b3, b4;
+			int found = 0;
+			
+			/* Check if this carrier has an active ODA */
+			for (int i = 0; i < rds->oda_count; i++) {
+				if (rds->oda[i].carrier_group == carrier_code && rds->oda[i].enabled) {
+					uint16_t aid = rds->oda[i].aid;
+					
+					/* Block A: PI code */
+					blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+					
+					if (aid == RDS_ODA_AID_RT_PLUS) {
+						/* RT+ group */
+						rds_build_rtplus_group(rds, &rds->rtplus, &b2, &b3, &b4);
+						b2 |= (type << RDS_B2_GROUP_SHIFT);
+						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+						blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+						found = 1;
+						break;
+					} else if (aid == RDS_ODA_AID_ERT_PLUS) {
+						/* eRT+ group (same format as RT+ but operates on eRT text) */
+						rds_build_rtplus_group(rds, &rds->ert_plus, &b2, &b3, &b4);
+						b2 |= (type << RDS_B2_GROUP_SHIFT);
+						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+						blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+						found = 1;
+						break;
+					} else if (aid == RDS_ODA_AID_ERT) {
+						/* eRT group */
+						rds_build_ert_group(rds, &b2, &b3, &b4);
+						b2 |= (type << RDS_B2_GROUP_SHIFT);
+						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+						blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+						found = 1;
+						break;
+					}
+				}
+			}
+			
+			if (found) {
+				rds_group_pack(blocks, rds->group_buffer, 0);
+			} else {
+				/* No ODA configured for this group - fallback to 0A */
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS TX: ODA group %d%c not configured, using 0A\n",
+					     carrier_code >> 1, (carrier_code & 1) ? 'B' : 'A');
+				rds_build_group_0a(rds, rds->group_buffer);
+			}
+		}
 		break;
 	/* Add other cases as needed */
 	default:
@@ -2140,7 +2438,7 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 	rds->phase = phase;
 }
 
-void rds_set_radiotext(rds_encoder_t *rds, const char *rt)
+void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
 {
 	if (!rt) return;
 	
@@ -2174,15 +2472,1262 @@ void rds_set_radiotext(rds_encoder_t *rds, const char *rt)
 	/* Log RT change with new A/B flag */
 	LOGP(DRADIO, LOGL_INFO, "RDS: RadioText set (%d chars), A/B flag toggled %c->%c\n",
 	     len, old_ab ? 'B' : 'A', rds->rt_ab ? 'B' : 'A');
-	LOGP(DRADIO, LOGL_DEBUG, "RDS: RT content: \"%.64s\"\n", rds->rt);
+	/* Convert RDS-encoded RT to Unicode for logging */
+	char rt_display[257];  /* 64 chars * 4 bytes UTF-8 max + 1 */
+	rds_text_to_display((uint8_t *)rds->rt, 64, rt_display, sizeof(rt_display));
+	LOGP(DRADIO, LOGL_DEBUG, "RDS: RT content: \"%s\"\n", rt_display);
 	
 	/* Update scheduler sequence (RT presence may have changed) */
 	rds_scheduler_update(rds);
 }
 
-void rds_set_ta(rds_encoder_t *rds, int ta)
+void rds_enc_clear_radiotext(rds_encoder_t *rds)
+{
+	/* Set RT to 64 CR terminators (empty RT) */
+	memset(rds->rt, '\r', 64);
+	rds->rt[64] = '\0';
+	rds->rt_segment = 0;
+	
+	/* Update scheduler (RT presence may have changed) */
+	rds_scheduler_update(rds);
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS: RadioText cleared\n");
+}
+
+void rds_enc_get_radiotext(const rds_encoder_t *rds, char *rt, size_t len)
+{
+	if (!rt || len == 0) return;
+	
+	size_t copy_len = (len - 1 < 64) ? len - 1 : 64;
+	memcpy(rt, rds->rt, copy_len);
+	rt[copy_len] = '\0';
+}
+
+void rds_enc_set_ta(rds_encoder_t *rds, int ta)
 {
 	rds->ta = ta ? 1 : 0;
+}
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 1: Core Fields
+ * ============================================================ */
+
+void rds_enc_set_pi(rds_encoder_t *rds, uint16_t pi)
+{
+	uint16_t old_pi = rds->pi;
+	rds->pi = pi;
+	
+	if (old_pi != pi) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: PI set to 0x%04X\n", pi);
+	}
+}
+
+uint16_t rds_enc_get_pi(const rds_encoder_t *rds)
+{
+	return rds->pi;
+}
+
+void rds_enc_set_ps(rds_encoder_t *rds, const char *ps)
+{
+	if (!ps) return;
+	
+	/* Validate input text and warn about unencodable characters */
+	rds_validate_text(ps, "PS");
+	
+	/* Clear buffer with spaces */
+	memset(rds->ps, ' ', 8);
+	rds->ps[8] = '\0';
+	
+	/* Convert UTF-8 to RDS encoding */
+	int warn = 0;
+	rds_encode_text(ps, (uint8_t *)rds->ps, 8, &warn);
+	
+	/* Reset PS segment for fresh transmission */
+	rds->ps_segment = 0;
+	
+	/* Convert RDS-encoded PS to Unicode for logging */
+	char ps_display[33];  /* 8 chars * 4 bytes UTF-8 max + 1 */
+	rds_text_to_display((uint8_t *)rds->ps, 8, ps_display, sizeof(ps_display));
+	LOGP(DRADIO, LOGL_INFO, "RDS: PS set to \"%s\"\n", ps_display);
+}
+
+void rds_enc_clear_ps(rds_encoder_t *rds)
+{
+	memset(rds->ps, ' ', 8);
+	rds->ps[8] = '\0';
+	rds->ps_segment = 0;
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS: PS cleared\n");
+}
+
+void rds_enc_get_ps(const rds_encoder_t *rds, char *ps, size_t len)
+{
+	if (!ps || len == 0) return;
+	
+	size_t copy_len = (len - 1 < 8) ? len - 1 : 8;
+	memcpy(ps, rds->ps, copy_len);
+	ps[copy_len] = '\0';
+}
+
+/* ============================================================
+ * RT+ (RadioText Plus) Encoder API Implementation
+ * ============================================================ */
+
+int rds_enc_rtplus_add_tag(rds_encoder_t *rds, uint8_t content_type, 
+                           uint8_t start, uint8_t length)
+{
+	rds_rtplus_encoder_t *rtplus = &rds->rtplus;
+	
+	if (rtplus->tag_count >= RDS_RTPLUS_MAX_TAGS) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Tag array full (max %d tags)\n",
+		     RDS_RTPLUS_MAX_TAGS);
+		return -1;
+	}
+	
+	if (content_type > 64) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid content_type %d (max 64)\n",
+		     content_type);
+		return -1;
+	}
+	
+	if (start > RDS_RTPLUS_MAX_START) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid start %d (max %d)\n",
+		     start, RDS_RTPLUS_MAX_START);
+		return -1;
+	}
+	
+	uint8_t max_len = (rtplus->tag_count == 0) ? RDS_RTPLUS_MAX_LEN_TAG1 : RDS_RTPLUS_MAX_LEN_TAG2;
+	if (length == 0 || length > max_len) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid length %d (max %d for tag %d)\n",
+		     length, max_len, rtplus->tag_count + 1);
+		return -1;
+	}
+	
+	rds_rtplus_tag_t *tag = &rtplus->tags[rtplus->tag_count];
+	tag->content_type = content_type;
+	tag->start = start;
+	tag->length = length;
+	rtplus->tag_count++;
+	
+	const char *ct_name = rds_get_rtplus_content_type(content_type);
+	LOGP(DRADIO, LOGL_INFO, "RDS RT+: Added tag%d type=%d (%s) start=%d len=%d\n",
+	     rtplus->tag_count, content_type, ct_name ? ct_name : "Unknown", start, length);
+	
+	return 0;
+}
+
+void rds_enc_rtplus_clear_tags(rds_encoder_t *rds)
+{
+	rds->rtplus.tag_count = 0;
+	LOGP(DRADIO, LOGL_INFO, "RDS RT+: Tags cleared\n");
+}
+
+void rds_enc_rtplus_set_toggle(rds_encoder_t *rds, int toggle)
+{
+	rds->rtplus.toggle = (toggle != 0) ? 1 : 0;
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS RT+: Toggle set to %d\n", rds->rtplus.toggle);
+}
+
+void rds_enc_rtplus_set_item_running(rds_encoder_t *rds, int running)
+{
+	rds->rtplus.item_running = (running != 0) ? 1 : 0;
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS RT+: Item running set to %d\n", rds->rtplus.item_running);
+}
+
+int rds_enc_rtplus_get_tag_count(const rds_encoder_t *rds)
+{
+	return rds->rtplus.tag_count;
+}
+
+int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,
+                            uint8_t *content_type, uint8_t *start, uint8_t *length)
+{
+	if (index < 0 || index >= rds->rtplus.tag_count) {
+		return -1;
+	}
+	
+	if (content_type) *content_type = rds->rtplus.tags[index].content_type;
+	if (start) *start = rds->rtplus.tags[index].start;
+	if (length) *length = rds->rtplus.tags[index].length;
+	
+	return 0;
+}
+
+/* eRT+ API (same as RT+ but for eRT) */
+int rds_enc_ert_plus_add_tag(rds_encoder_t *rds, uint8_t content_type,
+                             uint8_t start, uint8_t length)
+{
+	rds_rtplus_encoder_t *ert_plus = &rds->ert_plus;
+	
+	if (ert_plus->tag_count >= RDS_RTPLUS_MAX_TAGS) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Tag array full (max %d tags)\n",
+		     RDS_RTPLUS_MAX_TAGS);
+		return -1;
+	}
+	
+	if (content_type > 64) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid content_type %d (max 64)\n",
+		     content_type);
+		return -1;
+	}
+	
+	/* eRT supports up to 128 bytes, so start can be up to 127 */
+	if (start > 127) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid start %d (max 127)\n", start);
+		return -1;
+	}
+	
+	uint8_t max_len = (ert_plus->tag_count == 0) ? RDS_RTPLUS_MAX_LEN_TAG1 : RDS_RTPLUS_MAX_LEN_TAG2;
+	if (length == 0 || length > max_len) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid length %d (max %d for tag %d)\n",
+		     length, max_len, ert_plus->tag_count + 1);
+		return -1;
+	}
+	
+	rds_rtplus_tag_t *tag = &ert_plus->tags[ert_plus->tag_count];
+	tag->content_type = content_type;
+	tag->start = start;
+	tag->length = length;
+	ert_plus->tag_count++;
+	
+	const char *ct_name = rds_get_rtplus_content_type(content_type);
+	LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Added tag%d type=%d (%s) start=%d len=%d\n",
+	     ert_plus->tag_count, content_type, ct_name ? ct_name : "Unknown", start, length);
+	
+	return 0;
+}
+
+void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds)
+{
+	rds->ert_plus.tag_count = 0;
+	LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Tags cleared\n");
+}
+
+int rds_enc_ert_plus_get_tag_count(const rds_encoder_t *rds)
+{
+	return rds->ert_plus.tag_count;
+}
+
+int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
+                              uint8_t *content_type, uint8_t *start, uint8_t *length)
+{
+	if (index < 0 || index >= rds->ert_plus.tag_count) {
+		return -1;
+	}
+	
+	if (content_type) *content_type = rds->ert_plus.tags[index].content_type;
+	if (start) *start = rds->ert_plus.tags[index].start;
+	if (length) *length = rds->ert_plus.tags[index].length;
+	
+	return 0;
+}
+
+/* ============================================================
+ * eRT (Enhanced RadioText) Encoder API Implementation
+ * ============================================================ */
+
+void rds_enc_set_ert(rds_encoder_t *rds, const uint8_t *text, size_t len)
+{
+	rds_ert_encoder_t *ert = &rds->ert;
+	
+	if (!text) {
+		rds_enc_clear_ert(rds);
+		return;
+	}
+	
+	/* Limit to 128 bytes */
+	if (len > RDS_ERT_LENGTH) {
+		len = RDS_ERT_LENGTH;
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT: Text truncated to %d bytes\n",
+		     RDS_ERT_LENGTH);
+	}
+	
+	memset(ert->ert, 0, RDS_ERT_LENGTH + 1);
+	memcpy(ert->ert, text, len);
+	ert->length = len;
+	ert->segment = 0;  /* Reset segment for fresh transmission */
+	
+	/* Convert to display-safe UTF-8 for logging */
+	char ert_display[513];  /* 128 bytes * 4 bytes UTF-8 max + 1 */
+	int display_len = rds_text_to_display(ert->ert, len, ert_display, sizeof(ert_display));
+	LOGP(DRADIO, LOGL_INFO, "RDS eRT: Set %zu bytes (encoding=%s): \"%.*s\"\n",
+	     len, ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
+	     display_len, ert_display);
+}
+
+void rds_enc_clear_ert(rds_encoder_t *rds)
+{
+	rds_ert_encoder_t *ert = &rds->ert;
+	memset(ert->ert, 0, RDS_ERT_LENGTH + 1);
+	ert->length = 0;
+	ert->segment = 0;
+	LOGP(DRADIO, LOGL_INFO, "RDS eRT: Cleared\n");
+}
+
+void rds_enc_get_ert(const rds_encoder_t *rds, uint8_t *text, size_t *len, size_t max_len)
+{
+	if (!text || !len) return;
+	
+	const rds_ert_encoder_t *ert = &rds->ert;
+	size_t copy_len = (max_len < ert->length) ? max_len : ert->length;
+	memcpy(text, ert->ert, copy_len);
+	*len = copy_len;
+}
+
+/* ============================================================
+ * RT+ and eRT Decoder API Implementation
+ * ============================================================ */
+
+int rds_dec_rtplus_get_tag_count(const rds_decoder_t *rds)
+{
+	return rds->rtplus.tag_count;
+}
+
+int rds_dec_rtplus_get_tag(const rds_decoder_t *rds, int index,
+                            uint8_t *content_type, uint8_t *start, uint8_t *length)
+{
+	if (index < 0 || index >= rds->rtplus.tag_count) {
+		return -1;
+	}
+	
+	if (content_type) *content_type = rds->rtplus.tags[index].content_type;
+	if (start) *start = rds->rtplus.tags[index].start;
+	if (length) *length = rds->rtplus.tags[index].length;
+	
+	return 0;
+}
+
+int rds_dec_rtplus_get_toggle(const rds_decoder_t *rds)
+{
+	return rds->rtplus.toggle;
+}
+
+int rds_dec_rtplus_get_item_running(const rds_decoder_t *rds)
+{
+	return rds->rtplus.item_running;
+}
+
+int rds_dec_ert_plus_get_tag_count(const rds_decoder_t *rds)
+{
+	return rds->ert_plus.tag_count;
+}
+
+int rds_dec_ert_plus_get_tag(const rds_decoder_t *rds, int index,
+                              uint8_t *content_type, uint8_t *start, uint8_t *length)
+{
+	if (index < 0 || index >= rds->ert_plus.tag_count) {
+		return -1;
+	}
+	
+	if (content_type) *content_type = rds->ert_plus.tags[index].content_type;
+	if (start) *start = rds->ert_plus.tags[index].start;
+	if (length) *length = rds->ert_plus.tags[index].length;
+	
+	return 0;
+}
+
+void rds_dec_get_ert(const rds_decoder_t *rds, uint8_t *text, size_t *len, size_t max_len)
+{
+	if (!text || !len) return;
+	
+	const rds_ert_decoder_t *ert = &rds->ert_dec;
+	size_t copy_len = (max_len < RDS_ERT_LENGTH) ? max_len : RDS_ERT_LENGTH;
+	memcpy(text, ert->ert, copy_len);
+	*len = copy_len;
+}
+
+int rds_dec_get_ert_encoding(const rds_decoder_t *rds)
+{
+	return rds->ert_dec.encoding;
+}
+
+int rds_dec_get_ert_direction(const rds_decoder_t *rds)
+{
+	return rds->ert_dec.direction;
+}
+
+void rds_enc_set_pty(rds_encoder_t *rds, uint8_t pty)
+{
+	if (!RDS_VALID_PTY(pty)) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid PTY %d (must be 0-31)\n", pty);
+		return;
+	}
+	
+	uint8_t old_pty = rds->pty;
+	rds->pty = pty & 0x1F;
+	
+	if (old_pty != rds->pty) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: PTY set to %d\n", rds->pty);
+	}
+}
+
+uint8_t rds_enc_get_pty(const rds_encoder_t *rds)
+{
+	return rds->pty;
+}
+
+void rds_enc_set_ptyn(rds_encoder_t *rds, const char *ptyn)
+{
+	if (!ptyn) return;
+	
+	/* Validate input text and warn about unencodable characters */
+	rds_validate_text(ptyn, "PTYN");
+	
+	/* Clear buffer with spaces */
+	memset(rds->ptyn, ' ', 8);
+	rds->ptyn[8] = '\0';
+	
+	/* Convert UTF-8 to RDS encoding */
+	int warn = 0;
+	rds_encode_text(ptyn, (uint8_t *)rds->ptyn, 8, &warn);
+	
+	/* Reset PTYN segment for fresh transmission */
+	rds->ptyn_segment = 0;
+	
+	/* Update scheduler (PTYN presence may have changed) */
+	rds_scheduler_update(rds);
+	
+	/* Convert RDS-encoded PTYN to Unicode for logging */
+	char ptyn_display[33];  /* 8 chars * 4 bytes UTF-8 max + 1 */
+	rds_text_to_display((uint8_t *)rds->ptyn, 8, ptyn_display, sizeof(ptyn_display));
+	LOGP(DRADIO, LOGL_INFO, "RDS: PTYN set to \"%s\"\n", ptyn_display);
+}
+
+void rds_enc_clear_ptyn(rds_encoder_t *rds)
+{
+	memset(rds->ptyn, ' ', 8);
+	rds->ptyn[8] = '\0';
+	rds->ptyn_segment = 0;
+	
+	/* Update scheduler (PTYN presence may have changed) */
+	rds_scheduler_update(rds);
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS: PTYN cleared\n");
+}
+
+void rds_enc_get_ptyn(const rds_encoder_t *rds, char *ptyn, size_t len)
+{
+	if (!ptyn || len == 0) return;
+	
+	size_t copy_len = (len - 1 < 8) ? len - 1 : 8;
+	memcpy(ptyn, rds->ptyn, copy_len);
+	ptyn[copy_len] = '\0';
+}
+
+void rds_enc_set_tp(rds_encoder_t *rds, int tp)
+{
+	int old_tp = rds->tp;
+	rds->tp = tp ? 1 : 0;
+	
+	if (old_tp != rds->tp) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: TP set to %d\n", rds->tp);
+	}
+}
+
+int rds_enc_get_tp(const rds_encoder_t *rds)
+{
+	return rds->tp;
+}
+
+void rds_enc_set_ms(rds_encoder_t *rds, int ms)
+{
+	int old_ms = rds->ms;
+	rds->ms = ms ? 1 : 0;
+	
+	if (old_ms != rds->ms) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: MS set to %d (%s)\n", 
+		     rds->ms, rds->ms ? "Music" : "Speech");
+	}
+}
+
+int rds_enc_get_ms(const rds_encoder_t *rds)
+{
+	return rds->ms;
+}
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 2: Extended Info
+ * ============================================================ */
+
+void rds_enc_set_ecc(rds_encoder_t *rds, uint8_t ecc)
+{
+	uint8_t old_ecc = rds->ecc;
+	rds->ecc = ecc;
+	
+	if (old_ecc != ecc) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: ECC set to 0x%02X\n", ecc);
+		/* Update scheduler (ECC presence affects Group 1A scheduling) */
+		rds_scheduler_update(rds);
+	}
+}
+
+void rds_enc_clear_ecc(rds_encoder_t *rds)
+{
+	if (rds->ecc != 0) {
+		rds->ecc = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS: ECC cleared\n");
+		/* Update scheduler (ECC presence affects Group 1A scheduling) */
+		rds_scheduler_update(rds);
+	}
+}
+
+uint8_t rds_enc_get_ecc(const rds_encoder_t *rds)
+{
+	return rds->ecc;
+}
+
+void rds_enc_set_language(rds_encoder_t *rds, uint8_t lang)
+{
+	if (lang > 127) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid language code %d (must be 0-127)\n", lang);
+		return;
+	}
+	
+	uint8_t old_lang = rds->language;
+	rds->language = lang;
+	
+	if (old_lang != lang) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: Language set to %d\n", lang);
+		/* Update scheduler (language presence affects Group 1A scheduling) */
+		rds_scheduler_update(rds);
+	}
+}
+
+void rds_enc_clear_language(rds_encoder_t *rds)
+{
+	if (rds->language != 0) {
+		rds->language = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS: Language cleared\n");
+		/* Update scheduler (language presence affects Group 1A scheduling) */
+		rds_scheduler_update(rds);
+	}
+}
+
+uint8_t rds_enc_get_language(const rds_encoder_t *rds)
+{
+	return rds->language;
+}
+
+void rds_enc_set_pin(rds_encoder_t *rds, uint8_t day, uint8_t hour, uint8_t minute)
+{
+	/* Validation */
+	if (day > 31) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid PIN day %d (must be 0-31)\n", day);
+		return;
+	}
+	if (hour > 24) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid PIN hour %d (must be 0-24)\n", hour);
+		return;
+	}
+	if (minute > 59) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid PIN minute %d (must be 0-59)\n", minute);
+		return;
+	}
+	
+	uint8_t old_day = rds->pin_day;
+	rds->pin_day = day;
+	rds->pin_hour = hour;
+	rds->pin_minute = minute;
+	
+	if (old_day != day || rds->pin_hour != hour || rds->pin_minute != minute) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: PIN set to day=%d, %02d:%02d\n", 
+		     day, hour, minute);
+		/* Update scheduler (PIN presence affects Group 1A scheduling) */
+		rds_scheduler_update(rds);
+	}
+}
+
+void rds_enc_clear_pin(rds_encoder_t *rds)
+{
+	if (rds->pin_day != 0 || rds->pin_hour != 0 || rds->pin_minute != 0) {
+		rds->pin_day = 0;
+		rds->pin_hour = 0;
+		rds->pin_minute = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS: PIN cleared\n");
+		/* Update scheduler (PIN presence affects Group 1A scheduling) */
+		rds_scheduler_update(rds);
+	}
+}
+
+void rds_enc_get_pin(const rds_encoder_t *rds, uint8_t *day, uint8_t *hour, uint8_t *minute)
+{
+	if (day) *day = rds->pin_day;
+	if (hour) *hour = rds->pin_hour;
+	if (minute) *minute = rds->pin_minute;
+}
+
+void rds_enc_set_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty)
+{
+	/* Validation: each flag must be 0 or 1 */
+	if (stereo != 0 && stereo != 1) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid DI stereo flag %d (must be 0 or 1)\n", stereo);
+		return;
+	}
+	if (artificial != 0 && artificial != 1) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid DI artificial flag %d (must be 0 or 1)\n", artificial);
+		return;
+	}
+	if (compressed != 0 && compressed != 1) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid DI compressed flag %d (must be 0 or 1)\n", compressed);
+		return;
+	}
+	if (dynamic_pty != 0 && dynamic_pty != 1) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid DI dynamic_pty flag %d (must be 0 or 1)\n", dynamic_pty);
+		return;
+	}
+	
+	int old_stereo = rds->di_stereo;
+	int old_artificial = rds->di_artificial_head;
+	int old_compressed = rds->di_compressed;
+	int old_dynamic_pty = rds->di_dynamic_pty;
+	
+	rds->di_stereo = stereo ? 1 : 0;
+	rds->di_artificial_head = artificial ? 1 : 0;
+	rds->di_compressed = compressed ? 1 : 0;
+	rds->di_dynamic_pty = dynamic_pty ? 1 : 0;
+	
+	if (old_stereo != rds->di_stereo || old_artificial != rds->di_artificial_head ||
+	    old_compressed != rds->di_compressed || old_dynamic_pty != rds->di_dynamic_pty) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: DI set to stereo=%d, artificial=%d, compressed=%d, dynamic_pty=%d\n",
+		     rds->di_stereo, rds->di_artificial_head, rds->di_compressed, rds->di_dynamic_pty);
+	}
+}
+
+void rds_enc_get_di(const rds_encoder_t *rds, int *stereo, int *artificial, int *compressed, int *dynamic_pty)
+{
+	if (stereo) *stereo = rds->di_stereo;
+	if (artificial) *artificial = rds->di_artificial_head;
+	if (compressed) *compressed = rds->di_compressed;
+	if (dynamic_pty) *dynamic_pty = rds->di_dynamic_pty;
+}
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 3: Alternative Frequencies
+ * ============================================================ */
+
+int rds_enc_af_set_method_a(rds_encoder_t *rds, const char *af_string)
+{
+	if (!af_string || af_string[0] == '\0') {
+		rds_enc_af_clear(rds);
+		return 0;
+	}
+	
+	/* Clear Method B if active */
+	rds->use_method_b = 0;
+	memset(&rds->af_method_b, 0, sizeof(rds->af_method_b));
+	
+	/* Parse Method A string */
+	if (rds_af_method_a_parse(af_string, &rds->af_method_a) != 0) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Failed to parse AF Method A string: %s\n", af_string);
+		return -1;
+	}
+	
+	/* Build pre-computed code sequence for transmission */
+	rds->af_code_count = rds_af_method_a_build_codes(
+		&rds->af_method_a, rds->af_codes, sizeof(rds->af_codes));
+	
+	if (rds->af_code_count > 0) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: AF Method A set: %d codes (%d VHF + %d LF/MF = %d frequencies)\n",
+		     rds->af_code_count, rds->af_method_a.vhf_count, rds->af_method_a.lf_mf_count,
+		     rds->af_method_a.slot_count);
+		rds->af_method_a_segment = 0;
+		/* Update scheduler (AF presence affects Group 0 version) */
+		rds->use_0b = 0;  /* Method A requires Group 0A */
+		rds_scheduler_update(rds);
+		return 0;
+	}
+	
+	return -1;
+}
+
+int rds_enc_af_get_method_a_count(const rds_encoder_t *rds)
+{
+	if (rds->use_method_b || rds->af_code_count == 0)
+		return 0;
+	return rds->af_method_a.vhf_count;
+}
+
+int rds_enc_af_method_b_add(rds_encoder_t *rds, const char *af_string)
+{
+	if (!af_string || af_string[0] == '\0') {
+		return -1;
+	}
+	
+	/* Check if array is full */
+	if (rds->af_method_b.list_count >= RDS_AF_METHOD_B_MAX_LISTS) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot add AF Method B list - max %d lists reached\n",
+		     RDS_AF_METHOD_B_MAX_LISTS);
+		return -1;
+	}
+	
+	/* Parse Method B string */
+	rds_af_method_b_list_t new_list;
+	if (rds_af_method_b_parse(af_string, &new_list) != 0) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Failed to parse AF Method B string: %s\n", af_string);
+		return -1;
+	}
+	
+	/* Add to array */
+	int idx = rds->af_method_b.list_count;
+	rds->af_method_b.lists[idx] = new_list;
+	rds->af_method_b.list_count++;
+	
+	/* Enable Method B */
+	rds->use_method_b = 1;
+	rds->af_method_b_list_idx = 0;
+	rds->af_method_b_pair_idx = 0;
+	
+	/* Clear Method A */
+	memset(&rds->af_method_a, 0, sizeof(rds->af_method_a));
+	rds->af_code_count = 0;
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list[%d] added: tuning=%.1f, %d AFs\n",
+	     idx, new_list.tuning_freq / 10.0, new_list.af_count);
+	
+	/* Update scheduler (AF presence affects Group 0 version) */
+	rds->use_0b = 0;  /* Method B requires Group 0A */
+	rds_scheduler_update(rds);
+	
+	return 0;
+}
+
+int rds_enc_af_method_b_add_list(rds_encoder_t *rds, uint16_t tuning_freq, const uint16_t *af_freqs, const uint8_t *af_is_regional, uint8_t af_count)
+{
+	/* Validation */
+	if (tuning_freq < 876 || tuning_freq > 1079) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid tuning frequency %d (must be 876-1079 for 87.6-107.9 MHz)\n", tuning_freq);
+		return -1;
+	}
+	if (af_count == 0 || af_count > RDS_AF_METHOD_B_MAX_AFS) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid AF count %d (must be 1-%d)\n", af_count, RDS_AF_METHOD_B_MAX_AFS);
+		return -1;
+	}
+	if (!af_freqs || !af_is_regional) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: NULL pointer for AF frequencies or regional flags\n");
+		return -1;
+	}
+	
+	/* Validate AF frequencies */
+	for (int i = 0; i < af_count; i++) {
+		if (af_freqs[i] < 876 || af_freqs[i] > 1079) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid AF frequency %d at index %d (must be 876-1079)\n", af_freqs[i], i);
+			return -1;
+		}
+		if (af_is_regional[i] != 0 && af_is_regional[i] != 1) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid regional flag %d at index %d (must be 0 or 1)\n", af_is_regional[i], i);
+			return -1;
+		}
+	}
+	
+	/* Check if array is full */
+	if (rds->af_method_b.list_count >= RDS_AF_METHOD_B_MAX_LISTS) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot add AF Method B list - max %d lists reached\n",
+		     RDS_AF_METHOD_B_MAX_LISTS);
+		return -1;
+	}
+	
+	/* Add to array */
+	int idx = rds->af_method_b.list_count;
+	rds_af_method_b_list_t *list = &rds->af_method_b.lists[idx];
+	list->tuning_freq = tuning_freq;
+	list->af_count = af_count;
+	memcpy(list->af_freq, af_freqs, af_count * sizeof(uint16_t));
+	memcpy(list->af_is_regional, af_is_regional, af_count * sizeof(uint8_t));
+	rds->af_method_b.list_count++;
+	
+	/* Enable Method B */
+	rds->use_method_b = 1;
+	rds->af_method_b_list_idx = 0;
+	rds->af_method_b_pair_idx = 0;
+	
+	/* Clear Method A */
+	memset(&rds->af_method_a, 0, sizeof(rds->af_method_a));
+	rds->af_code_count = 0;
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list[%d] added: tuning=%.1f, %d AFs\n",
+	     idx, tuning_freq / 10.0, af_count);
+	
+	/* Update scheduler (AF presence affects Group 0 version) */
+	rds->use_0b = 0;  /* Method B requires Group 0A */
+	rds_scheduler_update(rds);
+	
+	return 0;
+}
+
+int rds_enc_af_method_b_remove_list(rds_encoder_t *rds, uint16_t tuning_freq)
+{
+	for (int i = 0; i < rds->af_method_b.list_count; i++) {
+		if (rds->af_method_b.lists[i].tuning_freq == tuning_freq) {
+			/* Shift remaining lists */
+			for (int j = i; j < rds->af_method_b.list_count - 1; j++) {
+				rds->af_method_b.lists[j] = rds->af_method_b.lists[j + 1];
+			}
+			rds->af_method_b.list_count--;
+			
+			/* Reset indices if needed */
+			if (rds->af_method_b_list_idx >= rds->af_method_b.list_count) {
+				rds->af_method_b_list_idx = 0;
+				rds->af_method_b_pair_idx = 0;
+			}
+			
+			/* Disable Method B if no lists remain */
+			if (rds->af_method_b.list_count == 0) {
+				rds->use_method_b = 0;
+				rds->use_0b = 1;  /* No AF → use Group 0B */
+			}
+			
+			LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list removed: tuning=%.1f\n", tuning_freq / 10.0);
+			rds_scheduler_update(rds);
+			return 0;
+		}
+	}
+	
+	return -1;  /* Not found */
+}
+
+int rds_enc_af_method_b_remove_list_by_index(rds_encoder_t *rds, int index)
+{
+	if (index < 0 || index >= rds->af_method_b.list_count) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid AF Method B list index %d (must be 0-%d)\n",
+		     index, rds->af_method_b.list_count - 1);
+		return -1;
+	}
+	
+	uint16_t tuning_freq = rds->af_method_b.lists[index].tuning_freq;
+	
+	/* Shift remaining lists */
+	for (int j = index; j < rds->af_method_b.list_count - 1; j++) {
+		rds->af_method_b.lists[j] = rds->af_method_b.lists[j + 1];
+	}
+	rds->af_method_b.list_count--;
+	
+	/* Reset indices if needed */
+	if (rds->af_method_b_list_idx >= rds->af_method_b.list_count) {
+		rds->af_method_b_list_idx = 0;
+		rds->af_method_b_pair_idx = 0;
+	} else if (rds->af_method_b_list_idx > index) {
+		rds->af_method_b_list_idx--;
+	}
+	
+	/* Disable Method B if no lists remain */
+	if (rds->af_method_b.list_count == 0) {
+		rds->use_method_b = 0;
+		rds->use_0b = 1;  /* No AF → use Group 0B */
+	}
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list[%d] removed: tuning=%.1f\n", index, tuning_freq / 10.0);
+	rds_scheduler_update(rds);
+	return 0;
+}
+
+int rds_enc_af_method_b_add_entry(rds_encoder_t *rds, uint16_t tuning_freq, uint16_t af_freq, int is_regional)
+{
+	/* Validation */
+	if (af_freq < 876 || af_freq > 1079) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid AF frequency %d (must be 876-1079 for 87.6-107.9 MHz)\n", af_freq);
+		return -1;
+	}
+	if (is_regional != 0 && is_regional != 1) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid regional flag %d (must be 0 or 1)\n", is_regional);
+		return -1;
+	}
+	
+	/* Find list with matching tuning frequency */
+	for (int i = 0; i < rds->af_method_b.list_count; i++) {
+		if (rds->af_method_b.lists[i].tuning_freq == tuning_freq) {
+			rds_af_method_b_list_t *list = &rds->af_method_b.lists[i];
+			
+			/* Check if list is full */
+			if (list->af_count >= RDS_AF_METHOD_B_MAX_AFS) {
+				LOGP(DRADIO, LOGL_ERROR, "RDS: AF Method B list is full (max %d AFs)\n",
+				     RDS_AF_METHOD_B_MAX_AFS);
+				return -1;
+			}
+			
+			/* Check for duplicate */
+			for (int j = 0; j < list->af_count; j++) {
+				if (list->af_freq[j] == af_freq) {
+					LOGP(DRADIO, LOGL_NOTICE, "RDS: AF frequency %.1f already exists in list\n", af_freq / 10.0);
+					return -1;
+				}
+			}
+			
+			/* Add entry */
+			list->af_freq[list->af_count] = af_freq;
+			list->af_is_regional[list->af_count] = is_regional ? 1 : 0;
+			list->af_count++;
+			
+			LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B entry added: tuning=%.1f, AF=%.1f, regional=%d\n",
+			     tuning_freq / 10.0, af_freq / 10.0, is_regional);
+			return 0;
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_ERROR, "RDS: AF Method B list not found for tuning frequency %.1f\n", tuning_freq / 10.0);
+	return -1;
+}
+
+int rds_enc_af_method_b_remove_entry(rds_encoder_t *rds, uint16_t tuning_freq, uint16_t af_freq)
+{
+	/* Find list with matching tuning frequency */
+	for (int i = 0; i < rds->af_method_b.list_count; i++) {
+		if (rds->af_method_b.lists[i].tuning_freq == tuning_freq) {
+			rds_af_method_b_list_t *list = &rds->af_method_b.lists[i];
+			
+			/* Find entry with matching AF frequency */
+			for (int j = 0; j < list->af_count; j++) {
+				if (list->af_freq[j] == af_freq) {
+					/* Shift remaining entries */
+					for (int k = j; k < list->af_count - 1; k++) {
+						list->af_freq[k] = list->af_freq[k + 1];
+						list->af_is_regional[k] = list->af_is_regional[k + 1];
+					}
+					list->af_count--;
+					
+					LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B entry removed: tuning=%.1f, AF=%.1f\n",
+					     tuning_freq / 10.0, af_freq / 10.0);
+					return 0;
+				}
+			}
+			
+			LOGP(DRADIO, LOGL_ERROR, "RDS: AF frequency %.1f not found in list\n", af_freq / 10.0);
+			return -1;
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_ERROR, "RDS: AF Method B list not found for tuning frequency %.1f\n", tuning_freq / 10.0);
+	return -1;
+}
+
+int rds_enc_af_method_b_remove_entry_by_index(rds_encoder_t *rds, uint16_t tuning_freq, int af_index)
+{
+	/* Find list with matching tuning frequency */
+	for (int i = 0; i < rds->af_method_b.list_count; i++) {
+		if (rds->af_method_b.lists[i].tuning_freq == tuning_freq) {
+			rds_af_method_b_list_t *list = &rds->af_method_b.lists[i];
+			
+			if (af_index < 0 || af_index >= list->af_count) {
+				LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid AF index %d (must be 0-%d)\n",
+				     af_index, list->af_count - 1);
+				return -1;
+			}
+			
+			uint16_t af_freq = list->af_freq[af_index];
+			
+			/* Shift remaining entries */
+			for (int j = af_index; j < list->af_count - 1; j++) {
+				list->af_freq[j] = list->af_freq[j + 1];
+				list->af_is_regional[j] = list->af_is_regional[j + 1];
+			}
+			list->af_count--;
+			
+			LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B entry[%d] removed: tuning=%.1f, AF=%.1f\n",
+			     af_index, tuning_freq / 10.0, af_freq / 10.0);
+			return 0;
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_ERROR, "RDS: AF Method B list not found for tuning frequency %.1f\n", tuning_freq / 10.0);
+	return -1;
+}
+
+void rds_enc_af_clear(rds_encoder_t *rds)
+{
+	/* Clear Method A */
+	memset(&rds->af_method_a, 0, sizeof(rds->af_method_a));
+	rds->af_code_count = 0;
+	rds->af_method_a_segment = 0;
+	
+	/* Clear Method B */
+	memset(&rds->af_method_b, 0, sizeof(rds->af_method_b));
+	rds->af_method_b_list_idx = 0;
+	rds->af_method_b_pair_idx = 0;
+	rds->use_method_b = 0;
+	
+	/* Clear pre-computed codes */
+	memset(rds->af_codes, 0, sizeof(rds->af_codes));
+	
+	/* Switch to Group 0B (no AF) */
+	rds->use_0b = 1;
+	
+	LOGP(DRADIO, LOGL_INFO, "RDS: AF cleared (both Method A and B)\n");
+	rds_scheduler_update(rds);
+}
+
+int rds_enc_af_get_method(const rds_encoder_t *rds)
+{
+	if (rds->use_method_b && rds->af_method_b.list_count > 0)
+		return 2;  /* Method B */
+	if (rds->af_code_count > 0)
+		return 1;  /* Method A */
+	return 0;  /* No AF */
+}
+
+int rds_enc_af_method_b_get_list_count(const rds_encoder_t *rds)
+{
+	return rds->af_method_b.list_count;
+}
+
+int rds_enc_af_method_b_get_list(const rds_encoder_t *rds, int index, uint16_t *tuning_freq, uint16_t *af_freqs, uint8_t *af_is_regional, uint8_t *af_count, size_t max_afs)
+{
+	if (index < 0 || index >= rds->af_method_b.list_count) {
+		return -1;
+	}
+	
+	const rds_af_method_b_list_t *list = &rds->af_method_b.lists[index];
+	
+	if (tuning_freq) *tuning_freq = list->tuning_freq;
+	if (af_count) *af_count = list->af_count;
+	
+	if (af_freqs && af_is_regional && max_afs > 0) {
+		size_t copy_count = (list->af_count < max_afs) ? list->af_count : max_afs;
+		memcpy(af_freqs, list->af_freq, copy_count * sizeof(uint16_t));
+		memcpy(af_is_regional, list->af_is_regional, copy_count * sizeof(uint8_t));
+	}
+	
+	return 0;
+}
+
+/* ============================================================
+ * Dynamic RDS Configuration API - Phase 5: EON
+ * ============================================================ */
+
+int rds_enc_eon_add(rds_encoder_t *rds, uint16_t pi, const char *ps, uint8_t pty, uint8_t tp)
+{
+	/* Validation */
+	if (pi == 0) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid EON PI 0x0000\n");
+		return -1;
+	}
+	if (!RDS_VALID_PTY(pty)) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid EON PTY %d (must be 0-31)\n", pty);
+		return -1;
+	}
+	if (tp != 0 && tp != 1) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid EON TP %d (must be 0 or 1)\n", tp);
+		return -1;
+	}
+	
+	/* Check if array is full */
+	if (rds->eon_tx_count >= RDS_EON_MAX_ENTRIES) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot add EON entry - max %d entries reached\n",
+		     RDS_EON_MAX_ENTRIES);
+		return -1;
+	}
+	
+	/* Check for duplicate PI */
+	for (int i = 0; i < rds->eon_tx_count; i++) {
+		if (rds->eon_tx[i].pi == pi) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS: EON entry with PI 0x%04X already exists, updating\n", pi);
+			/* Update existing entry */
+			rds_eon_entry_t *eon = &rds->eon_tx[i];
+			memset(eon->ps, ' ', 8);
+			eon->ps[8] = '\0';
+			if (ps && ps[0] != '\0') {
+				int len = strlen(ps);
+				if (len > 8) len = 8;
+				memcpy(eon->ps, ps, len);
+			}
+			eon->pty = pty;
+			eon->tp = tp;
+			rds_scheduler_update(rds);
+			return 0;
+		}
+	}
+	
+	/* Add new entry */
+	rds_eon_entry_t *eon = &rds->eon_tx[rds->eon_tx_count];
+	memset(eon, 0, sizeof(*eon));
+	eon->pi = pi;
+	memset(eon->ps, ' ', 8);
+	eon->ps[8] = '\0';
+	if (ps && ps[0] != '\0') {
+		int len = strlen(ps);
+		if (len > 8) len = 8;
+		memcpy(eon->ps, ps, len);
+	}
+	eon->pty = pty;
+	eon->tp = tp;
+	rds->eon_tx_count++;
+	rds->eon_enabled = 1;
+	
+	/* Convert RDS-encoded EON PS to Unicode for logging */
+	char eon_ps_display[33];  /* 8 chars * 4 bytes UTF-8 max + 1 */
+	rds_text_to_display((uint8_t *)eon->ps, 8, eon_ps_display, sizeof(eon_ps_display));
+	LOGP(DRADIO, LOGL_INFO, "RDS: EON entry added: PI=0x%04X, PS=\"%s\", PTY=%d, TP=%d\n",
+	     pi, eon_ps_display, pty, tp);
+	
+	rds_scheduler_update(rds);
+	return 0;
+}
+
+int rds_enc_eon_set_ta(rds_encoder_t *rds, uint16_t pi, int ta)
+{
+	if (ta != 0 && ta != 1) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid EON TA %d (must be 0 or 1)\n", ta);
+		return -1;
+	}
+	
+	/* Find EON entry with matching PI */
+	for (int i = 0; i < rds->eon_tx_count; i++) {
+		if (rds->eon_tx[i].pi == pi) {
+			rds->eon_tx[i].ta = ta ? 1 : 0;
+			LOGP(DRADIO, LOGL_INFO, "RDS: EON TA set: PI=0x%04X, TA=%d\n", pi, rds->eon_tx[i].ta);
+			return 0;
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_ERROR, "RDS: EON entry not found for PI 0x%04X\n", pi);
+	return -1;
+}
+
+int rds_enc_eon_remove(rds_encoder_t *rds, uint16_t pi)
+{
+	/* Find EON entry with matching PI */
+	for (int i = 0; i < rds->eon_tx_count; i++) {
+		if (rds->eon_tx[i].pi == pi) {
+			/* Shift remaining entries */
+			for (int j = i; j < rds->eon_tx_count - 1; j++) {
+				rds->eon_tx[j] = rds->eon_tx[j + 1];
+			}
+			rds->eon_tx_count--;
+			
+			/* Disable EON if no entries remain */
+			if (rds->eon_tx_count == 0) {
+				rds->eon_enabled = 0;
+			}
+			
+			/* Reset indices if needed */
+			if (rds->eon_tx_index >= rds->eon_tx_count) {
+				rds->eon_tx_index = 0;
+				rds->eon_tx_variant = 0;
+			}
+			
+			LOGP(DRADIO, LOGL_INFO, "RDS: EON entry removed: PI=0x%04X\n", pi);
+			rds_scheduler_update(rds);
+			return 0;
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_ERROR, "RDS: EON entry not found for PI 0x%04X\n", pi);
+	return -1;
+}
+
+void rds_enc_eon_clear(rds_encoder_t *rds)
+{
+	if (rds->eon_tx_count > 0) {
+		memset(rds->eon_tx, 0, sizeof(rds->eon_tx));
+		rds->eon_tx_count = 0;
+		rds->eon_enabled = 0;
+		rds->eon_tx_index = 0;
+		rds->eon_tx_variant = 0;
+		
+		LOGP(DRADIO, LOGL_INFO, "RDS: EON cleared\n");
+		rds_scheduler_update(rds);
+	}
+}
+
+int rds_enc_eon_get_count(const rds_encoder_t *rds)
+{
+	return rds->eon_tx_count;
+}
+
+int rds_enc_eon_get_entry(const rds_encoder_t *rds, int index, uint16_t *pi, char *ps, size_t ps_len, uint8_t *pty, uint8_t *tp, uint8_t *ta)
+{
+	if (index < 0 || index >= rds->eon_tx_count) {
+		return -1;
+	}
+	
+	const rds_eon_entry_t *eon = &rds->eon_tx[index];
+	
+	if (pi) *pi = eon->pi;
+	if (ps && ps_len > 0) {
+		size_t copy_len = (ps_len - 1 < 8) ? ps_len - 1 : 8;
+		memcpy(ps, eon->ps, copy_len);
+		ps[copy_len] = '\0';
+	}
+	if (pty) *pty = eon->pty;
+	if (tp) *tp = eon->tp;
+	if (ta) *ta = eon->ta;
+	
+	return 0;
+}
+
+/* ============================================================
+ * ODA (Open Data Application) Configuration API
+ * ============================================================ */
+
+int rds_enc_oda_add(rds_encoder_t *rds, uint8_t carrier_group, uint16_t aid, uint16_t message)
+{
+	/* Check for duplicates (same AID already configured) */
+	for (int i = 0; i < rds->oda_count; i++) {
+		if (rds->oda[i].aid == aid) {
+			/* Update existing entry */
+			rds->oda[i].carrier_group = carrier_group;
+			rds->oda[i].message = message;
+			rds->oda[i].enabled = 1;
+			rds_scheduler_update(rds);
+			return 0;
+		}
+	}
+	
+	/* Add new entry */
+	if (rds->oda_count >= RDS_ODA_MAX_CONFIGS) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS ODA: Cannot add - max %d ODAs reached\n",
+		     RDS_ODA_MAX_CONFIGS);
+		return -1;
+	}
+	
+	rds->oda[rds->oda_count].carrier_group = carrier_group;
+	rds->oda[rds->oda_count].aid = aid;
+	rds->oda[rds->oda_count].message = message;
+	rds->oda[rds->oda_count].enabled = 1;
+	rds->oda_count++;
+	
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS ODA: Added AID=0x%04X on Group %d%c\n",
+		     aid, carrier_group >> 1, (carrier_group & 1) ? 'B' : 'A');
+	
+	rds_scheduler_update(rds);
+	return 0;
+}
+
+int rds_enc_oda_remove(rds_encoder_t *rds, uint16_t aid)
+{
+	for (int i = 0; i < rds->oda_count; i++) {
+		if (rds->oda[i].aid == aid) {
+			/* Shift remaining entries down */
+			for (int j = i; j < rds->oda_count - 1; j++) {
+				rds->oda[j] = rds->oda[j + 1];
+			}
+			rds->oda_count--;
+			
+			/* Reset cycling index if needed */
+			if (rds->oda_cycle_idx >= rds->oda_count)
+				rds->oda_cycle_idx = 0;
+			
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS ODA: Removed AID=0x%04X\n", aid);
+			
+			rds_scheduler_update(rds);
+			return 0;
+		}
+	}
+	return -1;  /* Not found */
+}
+
+void rds_enc_oda_clear(rds_encoder_t *rds)
+{
+	rds->oda_count = 0;
+	rds->oda_cycle_idx = 0;
+	memset(rds->oda, 0, sizeof(rds->oda));
+	
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS ODA: Cleared all ODAs\n");
+	
+	rds_scheduler_update(rds);
 }
 
 void rds_encoder_exit(rds_encoder_t *rds)
@@ -2386,6 +3931,210 @@ static int rds_check_syndrome(uint32_t block, uint16_t *offset_out)
 	if (syndrome == RDS_SYNDROME_D) { *offset_out = 3; return 1; }
 	
 	return 0; /* No valid offset */
+}
+
+/* ============================================================
+ * RT+ (RadioText Plus) Decoder
+ * IEC 62106-6: Content-type tagging for RadioText
+ * ============================================================ */
+
+/* Decode RT+ ODA group
+ * Extracts content-type tags for RadioText or eRT
+ */
+static void rds_decode_rtplus(rds_decoder_t *rds, const uint16_t *blocks,
+                               const uint8_t *status, rds_rtplus_decoder_t *rtplus,
+                               const rds_oda_app_t *oda)
+{
+	uint16_t b2 = blocks[1];
+	uint16_t b3 = blocks[2];
+	uint16_t b4 = blocks[3];
+	
+	/* Extract toggle and item_running from Block B */
+	uint8_t toggle = (b2 & RDS_RTPLUS_TOGGLE_MASK) >> RDS_RTPLUS_TOGGLE_BIT;
+	uint8_t item_running = (b2 & RDS_RTPLUS_ITEM_RUNNING_MASK) >> RDS_RTPLUS_ITEM_RUNNING_BIT;
+	
+	/* Update registration info from 3A message if available */
+	if (oda) {
+		rtplus->cb = (oda->message & RDS_ERT_3A_CB_MASK) >> RDS_ERT_3A_CB_BIT;
+		rtplus->scb = (oda->message & RDS_ERT_3A_SCB_MASK) >> RDS_ERT_3A_SCB_SHIFT;
+		rtplus->template_num = oda->message & RDS_ERT_3A_TEMPLATE_MASK;
+		rtplus->carrier_group = oda->carrier_group;
+		rtplus->registered = 1;
+	}
+	
+	/* Check if toggle/running changed - clear tags if so */
+	if (toggle != rtplus->toggle || item_running != rtplus->item_running) {
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS RT+: Toggle/running changed "
+			     "(toggle=%d->%d running=%d->%d), clearing tags\n",
+			     rtplus->toggle, toggle, rtplus->item_running, item_running);
+		rtplus->tag_count = 0;
+		rtplus->toggle = toggle;
+		rtplus->item_running = item_running;
+	}
+	
+	rtplus->tag_count = 0;
+	
+	/* Extract tag1 if Block C is valid */
+	if (status[2] <= RDS_STATUS_CORRECTED) {
+		rds_rtplus_tag_t *tag1 = &rtplus->tags[0];
+		
+		/* Tag1 content_type: 6 bits split across B2[2:0] and B3[15:13] */
+		uint8_t ct_high = (b2 & RDS_RTPLUS_TAG1_CT_HIGH_MASK) >> RDS_RTPLUS_TAG1_CT_HIGH_BITS;
+		uint8_t ct_low = (b3 & RDS_RTPLUS_TAG1_CT_LOW_MASK) >> RDS_RTPLUS_TAG1_CT_LOW_SHIFT;
+		tag1->content_type = (ct_high << RDS_RTPLUS_TAG1_CT_HIGH_SHIFT) | ct_low;
+		
+		/* Tag1 start: 6 bits from B3[12:7] */
+		tag1->start = (b3 & RDS_RTPLUS_TAG1_START_MASK) >> RDS_RTPLUS_TAG1_START_SHIFT;
+		
+		/* Tag1 length: 6 bits from B3[6:1], stored as length-1 */
+		tag1->length = ((b3 & RDS_RTPLUS_TAG1_LEN_MASK) >> RDS_RTPLUS_TAG1_LEN_SHIFT) + 1;
+		
+		rtplus->tag_count = 1;
+		
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS RT+: Tag1 type=%d start=%d len=%d\n",
+			     tag1->content_type, tag1->start, tag1->length);
+		
+		/* Extract tag2 if Block D is valid */
+		if (status[3] <= RDS_STATUS_CORRECTED) {
+			rds_rtplus_tag_t *tag2 = &rtplus->tags[1];
+			
+			/* Tag2 content_type: 6 bits extracted from combined B3+B4 starting at bit 11
+			 * redsea: getBits<6>(B3, B4, 11) extracts 6 bits from combined (B3 << 16) | B4
+			 * Combined value: bits 31-16 = B3, bits 15-0 = B4
+			 * Bit 11 of combined = bit 11 of B3 (since B3 is upper 16 bits)
+			 * So we extract: B3[11:15] (5 bits) + B4[0] (1 bit) = 6 bits total
+			 * 
+			 * However, the bit layout shows:
+			 * - B3[0] = tag2 content_type[5] (1 bit from constants)
+			 * - B4[15:12] = tag2 content_type[4:1] (4 bits from constants)
+			 * - We need 6 bits total, so B4[11] might be bit 0, but that's in start field
+			 * 
+			 * Using redsea's exact method: extract 6 bits starting at offset 11
+			 * of the combined 32-bit value (B3 << 16) | B4 */
+			uint32_t combined = ((uint32_t)b3 << 16) | b4;
+			tag2->content_type = (combined >> 11) & 0x3F;  /* 6 bits starting at bit 11 */
+			
+			/* Tag2 start: 6 bits from B4[11:6] */
+			tag2->start = (b4 & RDS_RTPLUS_TAG2_START_MASK) >> RDS_RTPLUS_TAG2_START_SHIFT;
+			
+			/* Tag2 length: 5 bits from B4[5:1], stored as length-1 */
+			tag2->length = ((b4 & RDS_RTPLUS_TAG2_LEN_MASK) >> RDS_RTPLUS_TAG2_LEN_SHIFT) + 1;
+			
+			rtplus->tag_count = 2;
+			
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS RT+: Tag2 type=%d start=%d len=%d\n",
+				     tag2->content_type, tag2->start, tag2->length);
+		}
+	}
+	
+	rtplus->timestamp = time(NULL);
+	
+	if (rds->verbose && rtplus->tag_count > 0) {
+		const char *oda_name = (oda && oda->aid == RDS_ODA_AID_ERT_PLUS) ? "eRT+" : "RT+";
+		LOGP(DRADIO, LOGL_INFO, "RDS %s: toggle=%d running=%d tags=%d\n",
+		     oda_name, rtplus->toggle, rtplus->item_running, rtplus->tag_count);
+		for (int i = 0; i < rtplus->tag_count; i++) {
+			const char *ct_name = rds_get_rtplus_content_type(rtplus->tags[i].content_type);
+			LOGP(DRADIO, LOGL_INFO, "  Tag%d: type=%d (%s) start=%d len=%d\n",
+			     i + 1, rtplus->tags[i].content_type, ct_name ? ct_name : "Unknown",
+			     rtplus->tags[i].start, rtplus->tags[i].length);
+		}
+	}
+}
+
+/* ============================================================
+ * eRT (Enhanced RadioText) Decoder
+ * RDS2 / IEC 62106-2: 128-byte RadioText with UTF-8/UCS-2
+ * ============================================================ */
+
+/* Decode eRT ODA group
+ * Decodes 128-byte eRT text segments (32 segments × 4 bytes)
+ */
+static void rds_decode_ert(rds_decoder_t *rds, const uint16_t *blocks,
+                            const uint8_t *status, const rds_oda_app_t *oda)
+{
+	rds_ert_decoder_t *ert = &rds->ert_dec;
+	uint16_t b2 = blocks[1];
+	uint16_t b3 = blocks[2];
+	uint16_t b4 = blocks[3];
+	
+	/* Update registration info from 3A message if available */
+	if (oda) {
+		ert->encoding = (oda->message & RDS_ERT_3A_ENCODING_MASK) >> RDS_ERT_3A_ENCODING_BIT;
+		ert->direction = (oda->message & RDS_ERT_3A_DIRECTION_MASK) >> RDS_ERT_3A_DIRECTION_BIT;
+		ert->use_chartable_e3 = ((oda->message & RDS_ERT_3A_CHARTABLE_MASK) >> RDS_ERT_3A_CHARTABLE_SHIFT) == 0;
+		ert->carrier_group = oda->carrier_group;
+		ert->registered = 1;
+	}
+	
+	/* Extract segment address (0-31) from Block B */
+	int seg = b2 & RDS_ERT_SEGMENT_MASK;
+	int pos = seg * RDS_ERT_BYTES_PER_SEGMENT;
+	
+	if (pos >= RDS_ERT_LENGTH) {
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT: Invalid segment %d (max %d)\n",
+			     seg, RDS_ERT_SEGMENTS - 1);
+		return;
+	}
+	
+	/* Update eRT bytes if blocks are valid */
+	if (status[2] <= RDS_STATUS_CORRECTED) {
+		ert->ert[pos] = (b3 >> 8) & 0xFF;
+		ert->ert[pos + 1] = b3 & 0xFF;
+		ert->ert_status[pos] = status[2];
+		ert->ert_status[pos + 1] = status[2];
+		ert->segments_received |= (1U << seg);
+	}
+	
+	if (status[3] <= RDS_STATUS_CORRECTED && pos + 2 < RDS_ERT_LENGTH) {
+		ert->ert[pos + 2] = (b4 >> 8) & 0xFF;
+		ert->ert[pos + 3] = b4 & 0xFF;
+		ert->ert_status[pos + 2] = status[3];
+		ert->ert_status[pos + 3] = status[3];
+	}
+	
+	/* Add NUL terminator */
+	ert->ert[RDS_ERT_LENGTH] = '\0';
+	ert->timestamp = time(NULL);
+	
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS eRT: seg=%d pos=%d-%d encoding=%s direction=%s\n",
+		     seg, pos, pos + 3,
+		     ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
+		     ert->direction == RDS_ERT_DIR_RTL ? "RTL" : "LTR");
+	
+	/* Check if all segments received */
+	int segments_count = 0;
+	for (int i = 0; i < RDS_ERT_SEGMENTS; i++) {
+		if (ert->segments_received & (1U << i))
+			segments_count++;
+	}
+	
+	if (rds->verbose) {
+		char ert_display[513];  /* 128 bytes * 4 bytes UTF-8 max + 1 */
+		int display_len = 0;
+		
+		/* Convert eRT to display-safe UTF-8 */
+		if (ert->encoding == RDS_ERT_ENCODING_UTF8) {
+			/* UTF-8: use as-is, but convert control chars */
+			display_len = rds_text_to_display(ert->ert, RDS_ERT_LENGTH, ert_display, sizeof(ert_display));
+		} else {
+			/* UCS-2: convert 16-bit Unicode to UTF-8 (simplified - just show bytes for now) */
+			/* TODO: Implement proper UCS-2 to UTF-8 conversion */
+			display_len = rds_text_to_display(ert->ert, RDS_ERT_LENGTH, ert_display, sizeof(ert_display));
+		}
+		
+		LOGP(DRADIO, LOGL_INFO, "RDS eRT: seg=%d/%d encoding=%s direction=%s "
+		     "text=\"%.*s\"\n",
+		     segments_count, RDS_ERT_SEGMENTS,
+		     ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
+		     ert->direction == RDS_ERT_DIR_RTL ? "RTL" : "LTR",
+		     display_len, ert_display);
+	}
 }
 
 /* Decode a complete group */
@@ -2923,6 +4672,14 @@ static void rds_decode_group(rds_decoder_t *rds)
 					     "(clearing 2B buffer)\n", ab_flag ? 'B' : 'A');
 			}
 			
+			/* Validate PI repeat in Block C (b3) */
+			if (b3 != rds->pi) {
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 2B: PI mismatch in Block C (got %04X, expected %04X)\n",
+					     b3, rds->pi);
+				/* We could reject the group here, but for now we just log it */
+			}
+			
 			int pos = seg * 2;
 			if (pos <= 30) {
 				rds->rt_2b[pos] = (b4 >> 8) & 0xFF;
@@ -3328,27 +5085,74 @@ group14_done:
 		 * Block D: Application Identification (AID) - 16-bit registered code
 		 */
 		int app_group = b2 & RDS_3A_APP_GROUP_MASK;
+		uint16_t oda_message = b3;
 		uint16_t aid = b4;
 		
 		if (rds->debug)
-			LOGP(DRADIO, LOGL_DEBUG, "RDS 3A: AppGroup=%d%c AID=%04X\n",
-			     app_group >> 1, (app_group & 1) ? 'B' : 'A', aid);
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 3A: AppGroup=%d%c AID=%04X msg=%04X\n",
+			     app_group >> 1, (app_group & 1) ? 'B' : 'A', aid, oda_message);
 		
-		if (rds->verbose && (rds->group_mask & (1<<3))) {
-			const char *oda_name = "Unknown";
-			/* Common ODA AIDs (EBU ODA Registry) */
-			switch (aid) {
-			case 0x0093: oda_name = "DAB Cross-Reference"; break;
-			case 0x4BD7: oda_name = "RadioText Plus (RT+)"; break;
-			case 0x6552: oda_name = "Enhanced RadioText (eRT)"; break;
-			case 0xCD46: oda_name = "TMC Alert-C"; break;
-			case 0xFF7F: oda_name = "Station Logo"; break;
-			case 0xFF70: oda_name = "Internet Connection"; break;
+		/* Store ODA registration in oda_apps[] indexed by carrier group type
+		 * This allows the decoder to later identify ODA data on other groups */
+		if ((rds->group_mask & (1<<3))) {  /* Block D (AID) valid */
+			rds_oda_app_t *oda = &rds->oda_apps[app_group];
+			
+			/* Check if this is a new or updated registration */
+			int is_new = !oda->registered || oda->aid != aid;
+			
+			oda->carrier_group = app_group;
+			oda->aid = aid;
+			oda->message = oda_message;
+			oda->registered = 1;
+			oda->timestamp = time(NULL);
+			
+			if (is_new && rds->oda_app_count < 32)
+				rds->oda_app_count++;
+			
+			if (rds->verbose) {
+				const char *oda_name = "Unknown";
+				/* Common ODA AIDs (EBU ODA Registry) */
+				switch (aid) {
+				case RDS_ODA_AID_DAB_XREF:    oda_name = "DAB Cross-Reference"; break;
+				case RDS_ODA_AID_RT_PLUS:    oda_name = "RadioText Plus (RT+)"; break;
+				case RDS_ODA_AID_ERT_PLUS:   oda_name = "RT+ for eRT"; break;
+				case RDS_ODA_AID_ERT:        oda_name = "Enhanced RadioText (eRT)"; break;
+				case RDS_ODA_AID_TMC_ALERT:
+				case RDS_ODA_AID_TMC_ALERT2: oda_name = "TMC Alert-C"; break;
+				case RDS_ODA_AID_STATION_LOGO: oda_name = "Station Logo"; break;
+				}
+				LOGP(DRADIO, LOGL_INFO, "RDS 3A: ODA %s - "
+				     "AID=0x%04X (%s), carrier=Group %d%c, msg=0x%04X\n",
+				     is_new ? "Registered" : "Updated",
+				     aid, oda_name,
+				     app_group >> 1, (app_group & 1) ? 'B' : 'A',
+				     oda_message);
 			}
-			LOGP(DRADIO, LOGL_INFO, "RDS 3A: ODA Identification - "
-			     "AID=0x%04X (%s), carried in Group %d%c\n",
-			     aid, oda_name,
-			     app_group >> 1, (app_group & 1) ? 'B' : 'A');
+		}
+	}
+	else if (group_type == 3 && version == 1) {
+		/* Group 3B: ODA-only (IEC 62106 S6.1.5.5)
+		 * No standard meaning - entirely ODA application dependent.
+		 * Block C: PI repeat (standard for all version B groups)
+		 * Block D: ODA-specific payload
+		 */
+		int oda_payload_b = b2 & RDS_3B_PAYLOAD_MASK;
+		uint16_t pi_repeat = b3;  /* Block C */
+		uint16_t oda_data = b4;   /* Block D */
+		
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 3B: ODA-only payload=%02X PI=%04X data=%04X\n",
+			     oda_payload_b, pi_repeat, oda_data);
+		
+		/* Check if an ODA is registered for group 3B (code 7 = 3<<1 | 1) */
+		if (rds->oda_apps[7].registered) {
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 3B: ODA data for AID=0x%04X, "
+				     "payload=%02X data=%04X\n",
+				     rds->oda_apps[7].aid, oda_payload_b, oda_data);
+		} else {
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS 3B: ODA data (no 3A registration yet)\n");
 		}
 	}
 	else if (group_type == 15 && version == 1) {
@@ -3421,6 +5225,25 @@ group14_done:
 	// 		c_str, d_str);
 	// }
 
+	/* Check for ODA groups that need routing to specific decoders */
+	int group_code = (group_type << 1) | version;
+	if (rds->oda_apps[group_code].registered) {
+		rds_oda_app_t *oda = &rds->oda_apps[group_code];
+		uint16_t aid = oda->aid;
+		
+		switch (aid) {
+		case RDS_ODA_AID_RT_PLUS:
+			rds_decode_rtplus(rds, rds->blocks, rds->block_status, &rds->rtplus, oda);
+			break;
+		case RDS_ODA_AID_ERT_PLUS:
+			rds_decode_rtplus(rds, rds->blocks, rds->block_status, &rds->ert_plus, oda);
+			break;
+		case RDS_ODA_AID_ERT:
+			rds_decode_ert(rds, rds->blocks, rds->block_status, oda);
+			break;
+		}
+	}
+	
 	rds->groups_received++;
 }
 
@@ -3825,7 +5648,7 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		rds_decoder_status(rds);
 	}
 }
-int rds_get_pi(rds_decoder_t *rds, uint16_t *pi)
+int rds_dec_get_pi(rds_decoder_t *rds, uint16_t *pi)
 {
 	if (rds->groups_received > 0) {
 		*pi = rds->pi;
@@ -3834,7 +5657,7 @@ int rds_get_pi(rds_decoder_t *rds, uint16_t *pi)
 	return 0;
 }
 
-int rds_get_ps(rds_decoder_t *rds, char *ps)
+int rds_dec_get_ps(rds_decoder_t *rds, char *ps)
 {
 	if (rds->ps_segments == 0x0F) {
 		memcpy(ps, rds->ps, 9);
@@ -3843,7 +5666,7 @@ int rds_get_ps(rds_decoder_t *rds, char *ps)
 	return 0;
 }
 
-int rds_get_rt(rds_decoder_t *rds, char *rt)
+int rds_dec_get_rt(rds_decoder_t *rds, char *rt)
 {
 	if (rds->rt_segments) {
 		memcpy(rt, rds->rt, 65);

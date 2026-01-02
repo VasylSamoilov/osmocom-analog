@@ -57,8 +57,10 @@ typedef struct radio {
 	double		signal_bandwidth;
 	samplerate_t	tx_resampler[2];	/* resampling from audio rate to signal rate (two channels) */
 	samplerate_t	rx_resampler[2];	/* resampling from signal rate to audi rate (two channels) */
-	emphasis_fast_t	fm_emphasis_fast[2];	/* FM pre emphasis (optimized 1st-order) */
-	emphasis_t	fm_emphasis[2];		/* FM pre emphasis */
+	emphasis_fast_t	fm_emphasis_fast_tx[2];	/* FM pre emphasis TX (optimized 1st-order) */
+	emphasis_fast_t	fm_emphasis_fast_rx[2];	/* FM de emphasis RX (optimized 1st-order) */
+	emphasis_t	fm_emphasis_tx[2];		/* FM pre emphasis TX */
+	emphasis_t	fm_emphasis_rx[2];		/* FM de emphasis RX */
 	dc_filter_fast_t rx_dc_filter[2];	/* RX DC blocking filter */
 	double		fm_deviation;		/* deviation of fm signal */
 	fm_mod_t	fm_mod;			/* FM modulation */
@@ -87,12 +89,13 @@ typedef struct radio {
 	/* buffers */
 	sample_t	*audio_buffer;
 	int		audio_buffer_size;
-	sample_t	*signal_buffer;
-	uint8_t		*signal_power_buffer;
+	sample_t	*tx_signal_buffer;		/* TX-only signal buffer */
+	sample_t	*rx_signal_buffer;		/* RX-only signal buffer */
+	uint8_t		*signal_power_buffer;		/* TX-only power buffer */
 	int		signal_buffer_size;
-	sample_t	*I_buffer;
+	sample_t	*I_buffer;			/* RX-only I/Q buffers for demodulation */
 	sample_t	*Q_buffer;
-	sample_t	*carrier_buffer;
+	sample_t	*carrier_buffer;		/* RX-only carrier buffer for AM */
 } radio_t;
 
 int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose);
