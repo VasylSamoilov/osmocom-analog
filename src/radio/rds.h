@@ -878,18 +878,32 @@ typedef struct {
 
 
 /* ============================================================
- * eRT (Enhanced RadioText) - RDS2 / IEC 62106-2
+ * eRT (Enhanced RadioText) - RDS2 / IEC 62106-6
  * 128-byte RadioText with UTF-8/UCS-2 encoding
  * ============================================================
  *
  * eRT extends standard RadioText from 64 to 128 bytes and adds
- * support for UTF-8 and UCS-2 encoding plus RTL text direction.
+ * support for UTF-8 and UCS-2 encoding.
  * Announced via Group 3A, carried on a configurable ODA group.
  *
- * Configuration via Group 3A message bits:
- *   Bit 0: encoding (0=UCS-2, 1=UTF-8)
- *   Bit 1: direction (0=LTR, 1=RTL)
- *   Bits 5-2: chartable (0=E3, others reserved)
+ * Buffer Size: 128 bytes maximum (32 segments × 4 bytes)
+ *
+ * Message Termination:
+ *   - eRT messages are terminated by a carriage return (CR, 0x0D) byte
+ *   - This indicates the end of the text string
+ *   - Receivers use this CR to determine where the displayable message ends
+ *
+ * Padding for Shorter Messages:
+ *   - If the text (including the terminating CR) is shorter than 128 bytes,
+ *     the remaining bytes are padded with space characters (0x20)
+ *   - This is analogous to classic RadioText (RT), where short messages
+ *     are space-padded
+ *
+ * Configuration via Group 3A message bits (IEC 62106-6):
+ *   Bit 0 (b0): encoding (0=UCS-2, 1=UTF-8) on stream 0; always 1 on streams 1-3
+ *   Bit 1 (b1): direction (0=LTR, always 0 per spec)
+ *   Bits 5-2 (b2-b5): chartable (0=E3, others reserved) - must be 0 for backwards compatibility
+ *   Bits 15-6 (b6-b15): RFU (Reserved for Future Use) - must be 0
  *
  * eRT transmission: 32 segments × 4 bytes = 128 bytes total
  *
@@ -897,6 +911,21 @@ typedef struct {
  * Block B bits 4-0: segment address (0-31)
  * Block C: eRT bytes [segment*4] and [segment*4+1]
  * Block D: eRT bytes [segment*4+2] and [segment*4+3]
+ *
+ * UTF-8 Encoding Considerations:
+ *   - UTF-8 is variable-length encoding (1-4 bytes per character)
+ *   - Multi-byte UTF-8 characters MUST NOT be split across the 128-byte boundary
+ *   - Encoder validates UTF-8 and truncates at character boundaries
+ *   - Decoder uses sanitize_utf8() to replace invalid/incomplete sequences with '?'
+ *     for display (does not affect stored string)
+ *
+ * eRT+ Tags:
+ *   - eRT+ tags address CHARACTER position in string, not byte position!
+ *   - This is critical for UTF-8 where multi-byte characters exist
+ *   - Example: "Café" = 4 characters, 5 bytes (é = 2 bytes UTF-8)
+ *     Tag with start=3, length=1 should extract "é" (2 bytes), not byte 3
+ *   - eRT+ tags can address the full 128 characters of eRT text
+ *   - Note: RT+ is limited to 64 characters for standard RT and combination of RT+ with eRT (without eRT+)
  * ============================================================ */
 #define RDS_ERT_SEGMENT_MASK          0x001F  /* Block B bits 4-0: segment (0-31) */
 #define RDS_ERT_SEGMENTS              32      /* Total segments (32 × 4 = 128 bytes) */
@@ -908,6 +937,8 @@ typedef struct {
 #define RDS_ERT_3A_CHARTABLE_BITS     2       /* Group 3A message bits 5-2: chartable */
 #define RDS_ERT_3A_CHARTABLE_MASK     0x003C
 #define RDS_ERT_3A_CHARTABLE_SHIFT    2
+/* Bits 6-15 are RFU (Reserved for Future Use) and must be set to 0 */
+#define RDS_ERT_3A_RFU_MASK           0xFFC0  /* Bits 15-6: RFU (must be 0) */
 #define RDS_ERT_3A_CB_BIT             12      /* Group 3A message bit 12: CB flag (RT+ only) */
 #define RDS_ERT_3A_CB_MASK            0x1000
 #define RDS_ERT_3A_SCB_BITS           8       /* Group 3A message bits 11-8: SCB (RT+ only) */
@@ -916,11 +947,17 @@ typedef struct {
 #define RDS_ERT_3A_TEMPLATE_BITS      0       /* Group 3A message bits 7-0: template (RT+ only) */
 #define RDS_ERT_3A_TEMPLATE_MASK      0x00FF
 
-/* eRT Group 3A Message Construction Helpers */
+/* eRT Group 3A Message Construction Helpers
+ * According to IEC 62106-6:
+ *   Bit 0 (b0): encoding (0=UCS-2, 1=UTF-8) on stream 0; always 1 on streams 1-3
+ *   Bit 1 (b1): direction (0=LTR, always 0 per spec)
+ *   Bits 5-2 (b2-b5): chartable (0=E3, others reserved) - must be 0 for backwards compatibility
+ *   Bits 15-6 (b6-b15): RFU - must be 0
+ */
 #define RDS_ERT_3A_MSG(encoding, direction, chartable) \
-	(((encoding) << RDS_ERT_3A_ENCODING_BIT) | \
-	 ((direction) << RDS_ERT_3A_DIRECTION_BIT) | \
-	 ((chartable) << RDS_ERT_3A_CHARTABLE_SHIFT))
+	((((encoding) << RDS_ERT_3A_ENCODING_BIT) | \
+	  ((direction) << RDS_ERT_3A_DIRECTION_BIT) | \
+	  ((chartable) << RDS_ERT_3A_CHARTABLE_SHIFT)) & ~RDS_ERT_3A_RFU_MASK)
 
 /* Common eRT message values */
 #define RDS_ERT_3A_MSG_UTF8_LTR_E3    RDS_ERT_3A_MSG(RDS_ERT_ENCODING_UTF8, 0, 0)  /* UTF-8, LTR, E3 chartable */
@@ -928,7 +965,14 @@ typedef struct {
 #define RDS_ERT_3A_MSG_UTF8_RTL_E3    RDS_ERT_3A_MSG(RDS_ERT_ENCODING_UTF8, 1, 0)  /* UTF-8, RTL, E3 chartable */
 #define RDS_ERT_3A_MSG_UCS2_RTL_E3    RDS_ERT_3A_MSG(RDS_ERT_ENCODING_UCS2, 1, 0)  /* UCS-2, RTL, E3 chartable */
 
-#define RDS_ERT_LENGTH          128     /* eRT: 128 bytes */
+#define RDS_ERT_LENGTH          128     /* eRT: 128 bytes maximum */
+#define RDS_ERT_CR_TERMINATOR   0x0D    /* Carriage return: message terminator */
+#define RDS_ERT_PADDING_BYTE    0x20    /* Space character: padding for shorter messages */
+
+/* eRT Chartable values (bits 5-2 in Group 3A message) */
+#define RDS_ERT_CHARTABLE_E3    0       /* Chartable E3 (default, for backwards compatibility) */
+#define RDS_ERT_CHARTABLE_MAX   15      /* Maximum chartable value (4 bits: 0-15) */
+#define RDS_ERT_CHARTABLE_DEFAULT RDS_ERT_CHARTABLE_E3  /* Default chartable value */
 
 /* eRT Text Encoding (from Group 3A message bit 0) */
 typedef enum {
@@ -947,9 +991,10 @@ typedef struct {
 	uint8_t  carrier_group;     /* ODA carrier group for eRT data */
 	uint8_t  encoding;          /* rds_ert_encoding_t */
 	uint8_t  direction;         /* rds_ert_direction_t */
-	uint8_t  use_chartable_e3;  /* 1 = use chartable E3 */
+	uint8_t  chartable;  /* Raw chartable value (RDS_ERT_CHARTABLE_E3 to RDS_ERT_CHARTABLE_MAX) as received. Default: RDS_ERT_CHARTABLE_DEFAULT. Not used for character mapping for now. */
+	uint8_t  ab;                /* A/B flag - toggled on content change */
 	uint8_t  ert[RDS_ERT_LENGTH + 1];  /* 128 bytes + NUL */
-	uint8_t  length;            /* Current length */
+	uint8_t  length;            /* Current length (includes CR terminator if present) */
 	uint8_t  segment;           /* Current segment (0-31) */
 } rds_ert_encoder_t;
 
@@ -958,7 +1003,7 @@ typedef struct {
 	uint8_t  carrier_group;     /* ODA carrier group */
 	uint8_t  encoding;          /* rds_ert_encoding_t */
 	uint8_t  direction;         /* rds_ert_direction_t */
-	uint8_t  use_chartable_e3;  /* 1 = use chartable E3 */
+	uint8_t  chartable;  /* Raw chartable value (RDS_ERT_CHARTABLE_E3 to RDS_ERT_CHARTABLE_MAX) as received. Default: RDS_ERT_CHARTABLE_DEFAULT. Not used for character mapping for now. */
 	uint8_t  ert[RDS_ERT_LENGTH + 1];  /* 128 bytes + NUL */
 	uint8_t  ert_status[RDS_ERT_LENGTH];  /* Per-byte decode status */
 	uint32_t segments_received; /* Bitmask of 32 segments */
@@ -1430,6 +1475,8 @@ int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,
 int rds_enc_ert_plus_add_tag(rds_encoder_t *rds, uint8_t content_type,
                              uint8_t start, uint8_t length);
 void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds);
+void rds_enc_ert_plus_set_toggle(rds_encoder_t *rds, int toggle);
+void rds_enc_ert_plus_set_item_running(rds_encoder_t *rds, int running);
 int rds_enc_ert_plus_get_tag_count(const rds_encoder_t *rds);
 int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
                               uint8_t *content_type, uint8_t *start, uint8_t *length);
@@ -1449,8 +1496,23 @@ int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
  *   rds_enc_set_ert(rds, (uint8_t *)"128 bytes of text...", 128);
  */
 void rds_enc_set_ert(rds_encoder_t *rds, const uint8_t *text, size_t len);
+void rds_enc_set_ert_with_ab(rds_encoder_t *rds, const uint8_t *text, size_t len, int ab_flag);
 void rds_enc_clear_ert(rds_encoder_t *rds);
 void rds_enc_get_ert(const rds_encoder_t *rds, uint8_t *text, size_t *len, size_t max_len);
+void rds_enc_set_ert_ab(rds_encoder_t *rds, int ab);
+int rds_enc_get_ert_ab(const rds_encoder_t *rds);
+/* Get/set eRT chartable value (RDS_ERT_CHARTABLE_E3 to RDS_ERT_CHARTABLE_MAX)
+ * Default: RDS_ERT_CHARTABLE_DEFAULT (RDS_ERT_CHARTABLE_E3)
+ * Note: Chartable is not used for character mapping for now.
+ * Setting non-zero values will log a warning. */
+int rds_enc_get_ert_chartable(const rds_encoder_t *rds);
+void rds_enc_set_ert_chartable(rds_encoder_t *rds, uint8_t chartable);
+
+/* UTF-8/UCS-2 utility functions for eRT processing */
+size_t rds_sanitize_utf8(const char *src, size_t src_len, char *dst, size_t dst_size);
+size_t rds_ucs2_to_utf8(const uint8_t *ucs2, size_t ucs2_len, char *utf8, size_t utf8_size);
+size_t rds_utf8_to_ucs2(const char *utf8, size_t utf8_len, uint8_t *ucs2, size_t ucs2_size);
+
 
 /* Update group scheduler sequence (call after changing PTY, PTYN, EON, or ODA) */
 void rds_scheduler_update(rds_encoder_t *rds);
@@ -1759,7 +1821,12 @@ typedef struct rds_decoder {
 	rds_rtplus_decoder_t ert_plus;		/* RT+ tags for Enhanced RadioText */
 	
 	/* eRT (Enhanced RadioText) - Decoder state */
-	rds_ert_decoder_t ert_dec;		/* eRT 128-byte text */
+	rds_ert_decoder_t ert_dec;		/* eRT current (partial) reception */
+	rds_ert_decoder_t ert_dec_complete;	/* eRT last complete reception */
+	rds_rtplus_decoder_t ert_plus_complete;	/* eRT+ last complete tags */
+	uint8_t ert_has_complete;		/* 1 if we have complete eRT */
+	uint8_t ert_plus_has_complete;		/* 1 if we have complete eRT+ tags */
+	uint8_t ert_ab;				/* Current A/B flag for change detection */
 
 	/* Group 14A/14B: Enhanced Other Networks (IEC 62106 S6.1.5.14) */
 	rds_eon_entry_t	eon[RDS_EON_MAX_ENTRIES];	/* Other Network database */
@@ -1820,6 +1887,15 @@ int rds_dec_ert_plus_get_tag(const rds_decoder_t *rds, int index,
 void rds_dec_get_ert(const rds_decoder_t *rds, uint8_t *text, size_t *len, size_t max_len);
 int rds_dec_get_ert_encoding(const rds_decoder_t *rds);
 int rds_dec_get_ert_direction(const rds_decoder_t *rds);
+/* Get eRT chartable value (RDS_ERT_CHARTABLE_E3 to RDS_ERT_CHARTABLE_MAX)
+ * Default: RDS_ERT_CHARTABLE_DEFAULT (RDS_ERT_CHARTABLE_E3)
+ * Note: Chartable is not used for character mapping for now. */
+int rds_dec_get_ert_chartable(const rds_decoder_t *rds);
+
+/* eRT+ tag text extraction with character position addressing */
+size_t rds_ert_extract_tag_text(const rds_ert_decoder_t *ert, 
+                                 size_t char_start, size_t char_len,
+                                 char *out, size_t out_size);
 
 /* Cleanup */
 void rds_decoder_exit(rds_decoder_t *rds);

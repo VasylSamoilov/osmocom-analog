@@ -1349,7 +1349,13 @@ static void rds_build_ert_group(rds_encoder_t *rds, uint16_t *b2, uint16_t *b3, 
 	int seg = ert->segment;
 	int pos = seg * RDS_ERT_BYTES_PER_SEGMENT;
 	
-	if (pos >= RDS_ERT_LENGTH) {
+	/* Calculate how many segments are needed for the text (including terminator) */
+	int segments_needed = (ert->length + RDS_ERT_BYTES_PER_SEGMENT - 1) / RDS_ERT_BYTES_PER_SEGMENT;
+	if (segments_needed < 1) segments_needed = 1;
+	if (segments_needed > RDS_ERT_SEGMENTS) segments_needed = RDS_ERT_SEGMENTS;
+	
+	/* Wrap segment if past the needed segments */
+	if (seg >= segments_needed) {
 		seg = 0;
 		pos = 0;
 		ert->segment = 0;
@@ -1359,11 +1365,20 @@ static void rds_build_ert_group(rds_encoder_t *rds, uint16_t *b2, uint16_t *b3, 
 	*b2 = (rds->tp << RDS_B2_TP_BIT) | (rds->pty << RDS_B2_PTY_SHIFT);
 	*b2 |= (seg & RDS_ERT_SEGMENT_MASK);
 	
-	/* Block C: eRT bytes [pos] and [pos+1] */
-	*b3 = ((uint16_t)ert->ert[pos] << 8) | (uint16_t)ert->ert[pos + 1];
+	/* Block C: eRT bytes [pos] and [pos+1]
+	 * Pad with 0x20 (space) beyond actual text length to avoid incomplete UTF-8 sequences.
+	 * Using space is safer than 0x00 (null) as it's a valid single-byte UTF-8 character.
+	 * Note: ert->length includes the CR terminator, so we only transmit up to that point. */
+	uint8_t byte0 = (pos < ert->length) ? ert->ert[pos] : 0x20;
+	uint8_t byte1 = (pos + 1 < ert->length) ? ert->ert[pos + 1] : 0x20;
+	*b3 = ((uint16_t)byte0 << 8) | (uint16_t)byte1;
 	
-	/* Block D: eRT bytes [pos+2] and [pos+3] */
-	*b4 = ((uint16_t)ert->ert[pos + 2] << 8) | (uint16_t)ert->ert[pos + 3];
+	/* Block D: eRT bytes [pos+2] and [pos+3]
+	 * Pad with 0x20 (space) beyond actual text length to avoid incomplete UTF-8 sequences.
+	 * Note: ert->length includes the CR terminator, so we only transmit up to that point. */
+	uint8_t byte2 = (pos + 2 < ert->length) ? ert->ert[pos + 2] : 0x20;
+	uint8_t byte3 = (pos + 3 < ert->length) ? ert->ert[pos + 3] : 0x20;
+	*b4 = ((uint16_t)byte2 << 8) | (uint16_t)byte3;
 	
 	if (rds->debug) {
 		char char_display[5] = {0};
@@ -1375,15 +1390,91 @@ static void rds_build_ert_group(rds_encoder_t *rds, uint16_t *b2, uint16_t *b3, 
 				char_display[i] = '.';
 			}
 		}
-		LOGP(DRADIO, LOGL_DEBUG, "RDS TX eRT: seg=%d pos=%d-%d encoding=%s "
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX eRT: seg=%d/%d pos=%d-%d encoding=%s "
 		     "chars='%s'\n",
-		     seg, pos, pos + 3,
+		     seg, segments_needed, pos, pos + 3,
 		     ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
 		     char_display);
 	}
 	
-	/* Advance segment, wrapping at 32 */
-	ert->segment = (seg + 1) % RDS_ERT_SEGMENTS;
+	/* DEBUG: Log segment transmission details for UTF-8 if debug enabled */
+	if (rds->debug && ert->encoding == RDS_ERT_ENCODING_UTF8) {
+		LOGP(DRADIO, LOGL_DEBUG, "RDS eRT TX DEBUG: seg=%d/%d pos=%d length=%u bytes: "
+		     "[%02X %02X %02X %02X] -> B3=0x%04X B4=0x%04X\n",
+		     seg, segments_needed, pos, ert->length,
+		     (unsigned int)byte0, (unsigned int)byte1, (unsigned int)byte2, (unsigned int)byte3, 
+		     *b3, *b4);
+		
+		/* Show what's actually in the buffer at this position */
+		LOGP(DRADIO, LOGL_DEBUG, "RDS eRT TX DEBUG: Buffer at pos %d-%d: [%02X %02X %02X %02X] "
+		     "(length=%u, padding=%s)\n",
+		     pos, pos + 3,
+		     (unsigned int)(pos < ert->length ? ert->ert[pos] : 0xFF),
+		     (unsigned int)(pos + 1 < ert->length ? ert->ert[pos + 1] : 0xFF),
+		     (unsigned int)(pos + 2 < ert->length ? ert->ert[pos + 2] : 0xFF),
+		     (unsigned int)(pos + 3 < ert->length ? ert->ert[pos + 3] : 0xFF),
+		     ert->length,
+		     (pos >= ert->length) ? "YES" : "NO");
+		
+		/* Check if we're transmitting beyond the CR terminator */
+		if (pos < ert->length && ert->ert[pos] == 0x0D) {
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT TX DEBUG: Segment %d contains CR terminator at pos %d\n",
+			     seg, pos);
+		}
+		if (pos + 1 < ert->length && ert->ert[pos + 1] == 0x0D) {
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT TX DEBUG: Segment %d contains CR terminator at pos %d\n",
+			     seg, pos + 1);
+		}
+		if (pos + 2 < ert->length && ert->ert[pos + 2] == 0x0D) {
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT TX DEBUG: Segment %d contains CR terminator at pos %d\n",
+			     seg, pos + 2);
+		}
+		if (pos + 3 < ert->length && ert->ert[pos + 3] == 0x0D) {
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT TX DEBUG: Segment %d contains CR terminator at pos %d\n",
+			     seg, pos + 3);
+		}
+	}
+		
+		/* Check for incomplete UTF-8 sequences in this segment */
+		if (ert->encoding == RDS_ERT_ENCODING_UTF8) {
+			for (int i = 0; i < 4; i++) {
+				int byte_pos = pos + i;
+				if (byte_pos >= ert->length) break;
+				uint8_t b = ert->ert[byte_pos];
+				if ((b & 0x80) == 0) {
+					/* ASCII, OK */
+				} else if ((b & 0xE0) == 0xC0) {
+					/* 2-byte sequence start */
+					if (byte_pos + 1 >= ert->length) {
+						LOGP(DRADIO, LOGL_ERROR, "RDS eRT TX DEBUG: INCOMPLETE UTF-8 at seg=%d pos=%d: "
+						     "2-byte start 0x%02X but no continuation byte!\n",
+						     seg, byte_pos, (unsigned int)b);
+					} else if ((ert->ert[byte_pos + 1] & 0xC0) != 0x80) {
+						LOGP(DRADIO, LOGL_ERROR, "RDS eRT TX DEBUG: INVALID UTF-8 at seg=%d pos=%d: "
+						     "2-byte start 0x%02X but invalid continuation 0x%02X!\n",
+						     seg, byte_pos, (unsigned int)b, (unsigned int)ert->ert[byte_pos + 1]);
+					}
+				} else if ((b & 0xF0) == 0xE0) {
+					/* 3-byte sequence start */
+					if (byte_pos + 2 >= ert->length) {
+						LOGP(DRADIO, LOGL_ERROR, "RDS eRT TX DEBUG: INCOMPLETE UTF-8 at seg=%d pos=%d: "
+						     "3-byte start 0x%02X but missing continuation bytes!\n",
+						     seg, byte_pos, (unsigned int)b);
+					}
+				} else if ((b & 0xF8) == 0xF0) {
+					/* 4-byte sequence start */
+					if (byte_pos + 3 >= ert->length) {
+						LOGP(DRADIO, LOGL_ERROR, "RDS eRT TX DEBUG: INCOMPLETE UTF-8 at seg=%d pos=%d: "
+						     "4-byte start 0x%02X but missing continuation bytes!\n",
+						     seg, byte_pos, (unsigned int)b);
+					}
+				}
+			}
+		}
+
+	
+	/* Advance segment, wrapping at segments_needed (not fixed 32) */
+	ert->segment = (seg + 1) % segments_needed;
 }
 
 /* Build Group 3A: ODA Identification (IEC 62106 S6.1.5.5)
@@ -1908,11 +1999,18 @@ void rds_scheduler_update(rds_encoder_t *rds)
 		}
 	}
 	
-	/* Block 11: eRT ODA group (if configured and has text) */
+	/* Block 11: eRT ODA group (if configured and has text)
+	 * Note: eRT has 32 segments, so we add multiple groups per cycle to speed up
+	 * full text transmission. With 4 groups per cycle, complete eRT takes ~8 cycles
+	 * instead of 32 cycles with just 1 group. */
 	for (int i = 0; i < rds->oda_count; i++) {
 		if (rds->oda[i].aid == RDS_ODA_AID_ERT && rds->oda[i].enabled) {
 			if (rds->ert.length > 0) {
 				enum rds_group_type ert_group = (enum rds_group_type)rds->oda[i].carrier_group;
+				/* Add 4 eRT groups per cycle for faster transmission */
+				ADD_GRP(ert_group);
+				ADD_GRP(ert_group);
+				ADD_GRP(ert_group);
 				ADD_GRP(ert_group);
 			}
 			break;
@@ -2218,6 +2316,9 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 		     const char *ps, const char *rt, uint8_t pty, const char *ptyn)
 {
 	memset(rds, 0, sizeof(*rds));
+	
+	/* Initialize eRT chartable to default value */
+	rds->ert.chartable = RDS_ERT_CHARTABLE_DEFAULT;
 	
 	rds->samplerate = samplerate;
 	rds->pi = pi;
@@ -2673,9 +2774,13 @@ int rds_enc_ert_plus_add_tag(rds_encoder_t *rds, uint8_t content_type,
 		return -1;
 	}
 	
-	/* eRT supports up to 128 bytes, so start can be up to 127 */
+	/* eRT+ tags address CHARACTER position, not byte position!
+	 * eRT can have up to 128 bytes (128 characters if all ASCII, fewer if multi-byte UTF-8).
+	 * eRT+ tags can address the full 128 characters of eRT text.
+	 * Note: RT+ is limited to 64 characters for standard RT and combination of RT+ with eRT (without eRT+).
+	 * Note: For UTF-8, character count may be less than byte count if multi-byte chars exist. */
 	if (start > 127) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid start %d (max 127)\n", start);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid start %d (max 127 characters)\n", start);
 		return -1;
 	}
 	
@@ -2705,6 +2810,16 @@ void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds)
 	LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Tags cleared\n");
 }
 
+void rds_enc_ert_plus_set_toggle(rds_encoder_t *rds, int toggle)
+{
+	rds->ert_plus.toggle = toggle ? 1 : 0;
+}
+
+void rds_enc_ert_plus_set_item_running(rds_encoder_t *rds, int running)
+{
+	rds->ert_plus.item_running = running ? 1 : 0;
+}
+
 int rds_enc_ert_plus_get_tag_count(const rds_encoder_t *rds)
 {
 	return rds->ert_plus.tag_count;
@@ -2728,6 +2843,244 @@ int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
  * eRT (Enhanced RadioText) Encoder API Implementation
  * ============================================================ */
 
+/* ========== UTF-8 Helper Functions ========== */
+
+/* Get length of UTF-8 character starting at byte_start.
+ * Returns 0 on error (invalid/incomplete sequence).
+ */
+static size_t rds_utf8_charlen(const char *str, size_t len, size_t byte_start)
+{
+	if (byte_start >= len)
+		return 0;
+
+	uint8_t b = (uint8_t)str[byte_start];
+
+	/* ASCII (0xxxxxxx) */
+	if ((b & 0x80) == 0x00)
+		return 1;
+
+	/* Continuation byte at start (invalid) */
+	if ((b & 0xC0) == 0x80)
+		return 0;
+
+	/* 2-byte (110xxxxx) */
+	if ((b & 0xE0) == 0xC0)
+		return (byte_start + 2 <= len) ? 2 : 0;
+
+	/* 3-byte (1110xxxx) */
+	if ((b & 0xF0) == 0xE0)
+		return (byte_start + 3 <= len) ? 3 : 0;
+
+	/* 4-byte (11110xxx) */
+	if ((b & 0xF8) == 0xF0)
+		return (byte_start + 4 <= len) ? 4 : 0;
+
+	return 0;  /* Invalid */
+}
+
+/* Convert character position to byte position in UTF-8 string.
+ * Returns byte offset, or len if char_pos exceeds string length.
+ */
+static size_t rds_utf8_char_to_byte(const char *str, size_t len, size_t char_pos)
+{
+	size_t byte_pos = 0;
+	for (size_t i = 0; i < char_pos; i++) {
+		size_t clen = rds_utf8_charlen(str, len, byte_pos);
+		if (clen == 0)
+			return len;  /* Error - return end */
+		byte_pos += clen;
+		if (byte_pos >= len)
+			return len;
+	}
+	return byte_pos;
+}
+
+/* Sanitize UTF-8 string - replaces invalid/incomplete sequences with '?'.
+ * Returns number of bytes written to dst (excluding NUL).
+ * This is for display only - does not modify the source buffer.
+ */
+size_t rds_sanitize_utf8(const char *src, size_t src_len, char *dst, size_t dst_size)
+{
+	size_t i = 0, j = 0;
+
+	while (i < src_len && j < dst_size - 1) {
+		uint8_t b = (uint8_t)src[i];
+		size_t seq_len = 0;
+
+		if ((b & 0x80) == 0x00) {
+			seq_len = 1;       /* ASCII */
+		} else if ((b & 0xE0) == 0xC0) {
+			seq_len = 2;       /* 2-byte */
+		} else if ((b & 0xF0) == 0xE0) {
+			seq_len = 3;       /* 3-byte */
+		} else if ((b & 0xF8) == 0xF0) {
+			seq_len = 4;       /* 4-byte */
+		} else {
+			/* Invalid start byte (continuation or >= 0xF8) */
+			dst[j++] = '?';
+			i++;
+			continue;
+		}
+
+		/* Check if we have enough bytes remaining */
+		if (i + seq_len > src_len) {
+			/* Incomplete sequence at end */
+			dst[j++] = '?';
+			i++;
+			continue;
+		}
+
+		/* Validate continuation bytes (must be 10xxxxxx) */
+		int valid = 1;
+		for (size_t k = 1; k < seq_len; k++) {
+			if (((uint8_t)src[i + k] & 0xC0) != 0x80) {
+				valid = 0;
+				break;
+			}
+		}
+
+		if (valid && j + seq_len < dst_size) {
+			memcpy(dst + j, src + i, seq_len);
+			j += seq_len;
+			i += seq_len;
+		} else {
+			dst[j++] = '?';
+			i++;
+		}
+	}
+
+	dst[j] = '\0';
+	return j;
+}
+
+/* ========== UCS-2 Conversion Functions ========== */
+
+/* Convert UCS-2 big-endian to UTF-8 (for decoder display).
+ * Returns number of bytes written to dst (excluding NUL).
+ * Note: Characters outside BMP (emoji etc.) cannot be represented in UCS-2
+ * and should already be handled as replacement chars by the encoder.
+ */
+size_t rds_ucs2_to_utf8(const uint8_t *ucs2, size_t ucs2_len, char *utf8, size_t utf8_size)
+{
+	size_t j = 0;
+	for (size_t i = 0; i + 1 < ucs2_len && j < utf8_size - 4; i += 2) {
+		uint16_t code = ((uint16_t)ucs2[i] << 8) | ucs2[i + 1];  /* Big-endian */
+		
+		if (code == 0x000D) {
+			/* CR terminator - stop conversion */
+			break;
+		} else if (code < 0x80) {
+			utf8[j++] = (char)code;
+		} else if (code < 0x800) {
+			utf8[j++] = (char)(0xC0 | (code >> 6));
+			utf8[j++] = (char)(0x80 | (code & 0x3F));
+		} else {
+			utf8[j++] = (char)(0xE0 | (code >> 12));
+			utf8[j++] = (char)(0x80 | ((code >> 6) & 0x3F));
+			utf8[j++] = (char)(0x80 | (code & 0x3F));
+		}
+	}
+	utf8[j] = '\0';
+	return j;
+}
+
+/* Convert UTF-8 to UCS-2 big-endian (for encoder).
+ * Returns number of bytes written to ucs2 buffer.
+ * Note: 4-byte UTF-8 (emoji etc.) are replaced with U+FFFD as UCS-2 is limited to BMP.
+ */
+size_t rds_utf8_to_ucs2(const char *utf8, size_t utf8_len, uint8_t *ucs2, size_t ucs2_size)
+{
+	size_t i = 0, j = 0;
+	
+	while (i < utf8_len && j < ucs2_size - 2) {
+		uint8_t b = (uint8_t)utf8[i];
+		uint16_t code;
+		
+		if ((b & 0x80) == 0) {
+			/* ASCII */
+			code = b;
+			i++;
+		} else if ((b & 0xE0) == 0xC0 && i + 1 < utf8_len) {
+			/* 2-byte sequence */
+			code = ((b & 0x1F) << 6) | (utf8[i + 1] & 0x3F);
+			i += 2;
+		} else if ((b & 0xF0) == 0xE0 && i + 2 < utf8_len) {
+			/* 3-byte sequence */
+			code = ((b & 0x0F) << 12) | ((utf8[i + 1] & 0x3F) << 6) | (utf8[i + 2] & 0x3F);
+			i += 3;
+		} else if ((b & 0xF8) == 0xF0) {
+			/* 4-byte sequence - outside BMP, use replacement char */
+			code = 0xFFFD;
+			i += (i + 3 < utf8_len) ? 4 : 1;  /* Skip 4 bytes or just 1 if incomplete */
+		} else {
+			/* Invalid - replacement char */
+			code = 0xFFFD;
+			i++;
+		}
+		
+		ucs2[j++] = (code >> 8) & 0xFF;  /* Big-endian high byte */
+		ucs2[j++] = code & 0xFF;         /* Big-endian low byte */
+	}
+	
+	return j;
+}
+
+/* ========== UTF-8 Truncation ========== */
+
+/* Find the last valid UTF-8 character boundary before max_len bytes.
+ * Returns the byte position of the last complete UTF-8 character,
+ * or max_len if the entire string fits within max_len.
+ * This prevents truncating in the middle of a multi-byte UTF-8 sequence. */
+static size_t utf8_truncate_safe(const uint8_t *text, size_t len, size_t max_len)
+{
+	if (len <= max_len)
+		return len;
+	
+	size_t pos = 0;
+	const uint8_t *p = text;
+	
+	/* Decode UTF-8 characters until we would exceed max_len */
+	while (pos < max_len && p < text + len) {
+		size_t char_len;
+		
+		/* Decode one UTF-8 character */
+		if ((*p & 0x80) == 0) {
+			/* ASCII: 1 byte */
+			char_len = 1;
+			p += 1;
+		} else if ((*p & 0xE0) == 0xC0) {
+			/* 2-byte sequence */
+			if (p + 1 >= text + len) break; /* Incomplete */
+			char_len = 2;
+			p += 2;
+		} else if ((*p & 0xF0) == 0xE0) {
+			/* 3-byte sequence */
+			if (p + 2 >= text + len) break; /* Incomplete */
+			char_len = 3;
+			p += 3;
+		} else if ((*p & 0xF8) == 0xF0) {
+			/* 4-byte sequence */
+			if (p + 3 >= text + len) break; /* Incomplete */
+			char_len = 4;
+			p += 4;
+		} else {
+			/* Invalid UTF-8 start byte - treat as single byte */
+			char_len = 1;
+			p += 1;
+		}
+		
+		/* Check if this character would exceed max_len */
+		if (pos + char_len > max_len) {
+			/* This character doesn't fit - return position before it */
+			return pos;
+		}
+		
+		pos += char_len;
+	}
+	
+	return pos;
+}
+
 void rds_enc_set_ert(rds_encoder_t *rds, const uint8_t *text, size_t len)
 {
 	rds_ert_encoder_t *ert = &rds->ert;
@@ -2737,24 +3090,130 @@ void rds_enc_set_ert(rds_encoder_t *rds, const uint8_t *text, size_t len)
 		return;
 	}
 	
-	/* Limit to 128 bytes */
-	if (len > RDS_ERT_LENGTH) {
-		len = RDS_ERT_LENGTH;
-		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT: Text truncated to %d bytes\n",
-		     RDS_ERT_LENGTH);
+	/* Auto-flip A/B flag to signal content change to receivers */
+	ert->ab = !ert->ab;
+	
+	/* Validate and limit to 128 bytes, ensuring we don't split multi-byte sequences */
+	size_t original_len = len;
+	
+	/* Determine encoding - use UTF-8 if not set (default) */
+	int is_utf8 = (ert->encoding == RDS_ERT_ENCODING_UTF8 || ert->encoding == 0);
+	
+	if (is_utf8) {
+		/* UTF-8: Validate string and truncate at valid character boundary
+		 * Critical: Don't encode character if it will cross 128-byte boundary */
+		
+		/* First, validate UTF-8 encoding */
+		for (size_t i = 0; i < len; ) {
+			size_t char_len = rds_utf8_charlen((const char *)text, len, i);
+			if (char_len == 0) {
+				/* Invalid UTF-8 sequence - truncate at this point */
+				if (rds->verbose || rds->debug) {
+					LOGP(DRADIO, LOGL_NOTICE, "RDS eRT: Invalid UTF-8 sequence at byte %zu, truncating\n", i);
+				}
+				len = i;
+				break;
+			}
+			i += char_len;
+		}
+		
+		/* Truncate at 128-byte boundary, ensuring no incomplete characters */
+		if (len > RDS_ERT_LENGTH) {
+			len = utf8_truncate_safe(text, len, RDS_ERT_LENGTH);
+			if (len < original_len) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS eRT: Text truncated to %zu bytes at UTF-8 character boundary (was %zu bytes)\n",
+				     len, original_len);
+			}
+		}
+		
+		/* Final check: ensure last character doesn't cross 128-byte boundary */
+		if (len > 0) {
+
+			/* Find start of last character */
+			for (size_t i = len; i > 0 && i > len - 4; i--) {
+				uint8_t b = text[i - 1];
+				if ((b & 0x80) == 0) {
+					/* ASCII - complete */
+					break;
+				} else if ((b & 0xC0) == 0x80) {
+					/* Continuation byte - keep going back */
+					continue;
+				} else {
+					/* Start byte found */
+					size_t char_len = rds_utf8_charlen((const char *)text, len, i - 1);
+					if (char_len > 0 && (i - 1 + char_len) > RDS_ERT_LENGTH) {
+						/* Last character would cross boundary - truncate before it */
+						len = i - 1;
+						if (rds->debug) {
+							LOGP(DRADIO, LOGL_DEBUG, "RDS eRT: Truncated to %zu bytes to prevent incomplete character at boundary\n", len);
+						}
+					}
+					break;
+				}
+			}
+		}
+	} else {
+		/* UCS-2: truncate at 2-byte boundary (even byte count) */
+		if (len > RDS_ERT_LENGTH) {
+			len = RDS_ERT_LENGTH;
+			if (len & 1) len--; /* Ensure even byte count for UCS-2 */
+			if (len < original_len) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS eRT: Text truncated to %zu bytes (UCS-2, was %zu bytes)\n",
+				     len, original_len);
+			}
+		}
 	}
 	
 	memset(ert->ert, 0, RDS_ERT_LENGTH + 1);
 	memcpy(ert->ert, text, len);
-	ert->length = len;
+	
+	/* Add CR terminator (0x0D) if text is shorter than 128 bytes.
+	 * This signals to receivers that the text is complete.
+	 * Full 128-byte text doesn't need terminator - receivers know it's
+	 * complete when all bytes are received.
+	 * 
+	 * Note: At this point, len is already validated to not have incomplete
+	 * UTF-8 characters at the boundary, so we can safely add CR. */
+	if (len < RDS_ERT_LENGTH) {
+		ert->ert[len] = 0x0D;  /* CR = string terminator in RDS */
+		ert->length = len + 1; /* Include terminator in transmitted length */
+	} else {
+		ert->length = len;     /* Full 128 bytes, no terminator needed */
+	}
 	ert->segment = 0;  /* Reset segment for fresh transmission */
 	
-	/* Convert to display-safe UTF-8 for logging */
-	char ert_display[513];  /* 128 bytes * 4 bytes UTF-8 max + 1 */
-	int display_len = rds_text_to_display(ert->ert, len, ert_display, sizeof(ert_display));
-	LOGP(DRADIO, LOGL_INFO, "RDS eRT: Set %zu bytes (encoding=%s): \"%.*s\"\n",
-	     len, ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
-	     display_len, ert_display);
+	/* Log the text - use sanitize_utf8 for display to handle any edge cases */
+	if (rds->verbose || rds->debug) {
+		char ert_display[513];  /* 128 bytes * 4 bytes UTF-8 max + 1 */
+		size_t display_len = 0;
+		
+		if (is_utf8) {
+			/* UTF-8: sanitize for display (replaces invalid/incomplete sequences with ?) */
+			display_len = rds_sanitize_utf8((const char *)ert->ert, ert->length, ert_display, sizeof(ert_display));
+			LOGP(DRADIO, LOGL_INFO, "RDS eRT: Set %u bytes (encoding=UTF-8, length=%u): \"%.*s\"\n",
+			     (unsigned int)len, (unsigned int)ert->length, (int)display_len, ert_display);
+		} else {
+			/* UCS-2: convert to UTF-8 for display */
+			display_len = rds_ucs2_to_utf8(ert->ert, ert->length, ert_display, sizeof(ert_display));
+			LOGP(DRADIO, LOGL_INFO, "RDS eRT: Set %u bytes (encoding=UCS-2, length=%u): \"%.*s\"\n",
+			     (unsigned int)len, (unsigned int)ert->length, (int)display_len, ert_display);
+		}
+		
+		/* DEBUG: Hex dump of the entire ERT buffer including terminator */
+		if (rds->debug) {
+			char hex_dump[512];
+			size_t hex_pos = 0;
+			for (size_t i = 0; i < ert->length && i < 128 && hex_pos < sizeof(hex_dump) - 3; i++) {
+				hex_pos += snprintf(hex_dump + hex_pos, sizeof(hex_dump) - hex_pos, "%02X ", (unsigned int)ert->ert[i]);
+				if ((i + 1) % 16 == 0 && hex_pos < sizeof(hex_dump) - 1) {
+					hex_dump[hex_pos++] = '\n';
+					hex_dump[hex_pos] = '\0';
+				}
+			}
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT DEBUG: length=%u, hex dump (first 128 bytes):\n%s\n",
+			     (unsigned int)ert->length, hex_dump);
+		}
+	}
 }
 
 void rds_enc_clear_ert(rds_encoder_t *rds)
@@ -2776,9 +3235,115 @@ void rds_enc_get_ert(const rds_encoder_t *rds, uint8_t *text, size_t *len, size_
 	*len = copy_len;
 }
 
+/* Set eRT text with explicit A/B flag control
+ * ab_flag: -1 = auto-flip, 0 = force A, 1 = force B
+ */
+void rds_enc_set_ert_with_ab(rds_encoder_t *rds, const uint8_t *text, size_t len, int ab_flag)
+{
+	if (ab_flag < 0) {
+		/* Auto-flip handled by rds_enc_set_ert */
+		rds_enc_set_ert(rds, text, len);
+	} else {
+		/* Explicit A/B flag - set first, then set text without auto-flip */
+		rds->ert.ab = ab_flag ? 1 : 0;
+		
+		/* Need to call set_ert but prevent double flip - temporarily mark as set */
+		uint8_t old_ab = rds->ert.ab;
+		rds_enc_set_ert(rds, text, len);
+		rds->ert.ab = old_ab;  /* Restore explicit value */
+	}
+}
+
+void rds_enc_set_ert_ab(rds_encoder_t *rds, int ab)
+{
+	rds->ert.ab = ab ? 1 : 0;
+}
+
+int rds_enc_get_ert_ab(const rds_encoder_t *rds)
+{
+	return rds->ert.ab;
+}
+
+int rds_enc_get_ert_chartable(const rds_encoder_t *rds)
+{
+	return rds->ert.chartable;
+}
+
+void rds_enc_set_ert_chartable(rds_encoder_t *rds, uint8_t chartable)
+{
+	if (chartable > RDS_ERT_CHARTABLE_MAX) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS eRT: Invalid chartable value %d (max %d)\n", 
+		     chartable, RDS_ERT_CHARTABLE_MAX);
+		return;
+	}
+	
+	rds->ert.chartable = chartable;
+	
+	/* Log warning if non-zero chartable value is set
+	 * Note: Chartable is not used for character mapping for now */
+	if (chartable != RDS_ERT_CHARTABLE_E3) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT: Chartable value set to %d (expected %d=E3, others reserved). "
+		     "Character mapping not implemented for non-zero chartable values.\n", 
+		     chartable, RDS_ERT_CHARTABLE_E3);
+	}
+}
+
+/* ============================================================
+ * eRT Tag Extraction with Character Position Addressing
+ * ============================================================ */
+
+/* Extract substring from eRT text using CHARACTER positions (not byte positions)
+ * 
+ * This is required for eRT+ tags which specify start/length in characters.
+ * eRT+ tags address character position in string, not byte position!
+ * This is critical for UTF-8 where multi-byte characters exist.
+ * 
+ * Example: "Café" = 4 characters, 5 bytes (é = 2 bytes UTF-8)
+ *   Tag with start=3, length=1 should extract "é" (2 bytes), not byte 3.
+ * 
+ * Returns bytes written to out (excluding NUL), or 0 on error.
+ */
+size_t rds_ert_extract_tag_text(const rds_ert_decoder_t *ert, 
+                                 size_t char_start, size_t char_len,
+                                 char *out, size_t out_size)
+{
+	if (!ert || !out || out_size == 0)
+		return 0;
+	
+	const char *text = (const char *)ert->ert;
+	
+	/* Find actual text length (up to CR terminator or 128 bytes) */
+	size_t text_len = RDS_ERT_LENGTH;
+	for (size_t i = 0; i < RDS_ERT_LENGTH; i++) {
+		if (ert->ert[i] == 0x0D) {
+			text_len = i;
+			break;
+		}
+	}
+	
+	/* Find byte offset of start position (character to byte conversion) */
+	size_t byte_start = rds_utf8_char_to_byte(text, text_len, char_start);
+	if (byte_start >= text_len) {
+		out[0] = '\0';
+		return 0;
+	}
+	
+	/* Find byte offset of end position (character to byte conversion) */
+	size_t byte_end = rds_utf8_char_to_byte(text, text_len, char_start + char_len);
+	
+	size_t byte_len = byte_end - byte_start;
+	if (byte_len >= out_size)
+		byte_len = out_size - 1;
+	
+	memcpy(out, text + byte_start, byte_len);
+	out[byte_len] = '\0';
+	return byte_len;
+}
+
 /* ============================================================
  * RT+ and eRT Decoder API Implementation
  * ============================================================ */
+
 
 int rds_dec_rtplus_get_tag_count(const rds_decoder_t *rds)
 {
@@ -2832,8 +3397,19 @@ void rds_dec_get_ert(const rds_decoder_t *rds, uint8_t *text, size_t *len, size_
 {
 	if (!text || !len) return;
 	
-	const rds_ert_decoder_t *ert = &rds->ert_dec;
-	size_t copy_len = (max_len < RDS_ERT_LENGTH) ? max_len : RDS_ERT_LENGTH;
+	/* Use complete buffer if available, otherwise use current (partial) buffer */
+	const rds_ert_decoder_t *ert = rds->ert_has_complete ? &rds->ert_dec_complete : &rds->ert_dec;
+	
+	/* Find actual text length (up to CR terminator or 128 bytes) */
+	size_t text_len = RDS_ERT_LENGTH;
+	for (size_t i = 0; i < RDS_ERT_LENGTH; i++) {
+		if (ert->ert[i] == 0x0D) {
+			text_len = i;
+			break;
+		}
+	}
+	
+	size_t copy_len = (max_len < text_len) ? max_len : text_len;
 	memcpy(text, ert->ert, copy_len);
 	*len = copy_len;
 }
@@ -2846,6 +3422,11 @@ int rds_dec_get_ert_encoding(const rds_decoder_t *rds)
 int rds_dec_get_ert_direction(const rds_decoder_t *rds)
 {
 	return rds->ert_dec.direction;
+}
+
+int rds_dec_get_ert_chartable(const rds_decoder_t *rds)
+{
+	return rds->ert_dec.chartable;
 }
 
 void rds_enc_set_pty(rds_encoder_t *rds, uint8_t pty)
@@ -3668,6 +4249,28 @@ int rds_enc_oda_add(rds_encoder_t *rds, uint8_t carrier_group, uint16_t aid, uin
 			rds->oda[i].carrier_group = carrier_group;
 			rds->oda[i].message = message;
 			rds->oda[i].enabled = 1;
+			
+			/* Parse eRT-specific message bits if applicable */
+			if (aid == RDS_ODA_AID_ERT) {
+				/* Validate message bits and log if unexpected (but store as received) */
+				uint16_t rfu_bits = message & RDS_ERT_3A_RFU_MASK;
+				uint8_t direction = (message & RDS_ERT_3A_DIRECTION_MASK) >> RDS_ERT_3A_DIRECTION_BIT;
+				uint8_t chartable = (message & RDS_ERT_3A_CHARTABLE_MASK) >> RDS_ERT_3A_CHARTABLE_SHIFT;
+				
+				if (rfu_bits != 0 || direction != 0 || chartable != RDS_ERT_CHARTABLE_E3) {
+					if (rds->verbose || rds->debug) {
+						LOGP(DRADIO, LOGL_NOTICE, "RDS eRT ODA: Unexpected marker bits in message 0x%04X: "
+						     "direction=%d (expected 0), chartable=%d (expected %d=E3), RFU=0x%04X (expected 0x0000)\n",
+						     message, direction, chartable, RDS_ERT_CHARTABLE_E3, rfu_bits);
+					}
+				}
+				
+				rds->ert.encoding = (message & RDS_ERT_3A_ENCODING_MASK) >> RDS_ERT_3A_ENCODING_BIT;
+				rds->ert.direction = direction;  /* Store as received */
+				rds->ert.chartable = chartable;  /* Store raw value as received */
+				rds->ert.carrier_group = carrier_group;
+			}
+			
 			rds_scheduler_update(rds);
 			return 0;
 		}
@@ -3689,6 +4292,46 @@ int rds_enc_oda_add(rds_encoder_t *rds, uint8_t carrier_group, uint16_t aid, uin
 	if (rds->debug)
 		LOGP(DRADIO, LOGL_DEBUG, "RDS ODA: Added AID=0x%04X on Group %d%c\n",
 		     aid, carrier_group >> 1, (carrier_group & 1) ? 'B' : 'A');
+	
+	/* Parse ODA-specific message bits into encoder config (mirrors decoder logic) */
+	if (aid == RDS_ODA_AID_ERT) {
+		/* Parse eRT-specific message bits (IEC 62106-6)
+		 * Validate marker bits and log if unexpected (but store as received):
+		 * b0: encoding (0=UCS-2, 1=UTF-8)
+		 * b1: direction (expected 0=LTR per spec)
+		 * b2-b5: chartable (expected RDS_ERT_CHARTABLE_E3 for backwards compatibility)
+		 * b6-b15: RFU (expected 0)
+		 */
+		uint16_t rfu_bits = message & RDS_ERT_3A_RFU_MASK;
+		uint8_t direction = (message & RDS_ERT_3A_DIRECTION_MASK) >> RDS_ERT_3A_DIRECTION_BIT;
+		uint8_t chartable = (message & RDS_ERT_3A_CHARTABLE_MASK) >> RDS_ERT_3A_CHARTABLE_SHIFT;
+		
+		if (rfu_bits != 0 || direction != 0 || chartable != RDS_ERT_CHARTABLE_E3) {
+			if (rds->verbose || rds->debug) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS eRT ODA: Unexpected marker bits in message 0x%04X: "
+				     "direction=%d (expected 0), chartable=%d (expected %d=E3), RFU=0x%04X (expected 0x0000)\n",
+				     message, direction, chartable, RDS_ERT_CHARTABLE_E3, rfu_bits);
+			}
+			if (rds->debug) {
+				LOGP(DRADIO, LOGL_DEBUG, "RDS eRT ODA: Marker bit validation - "
+				     "b0=%d, b1=%d, b2-b5=%d, b6-b15=0x%04X\n",
+				     (message & RDS_ERT_3A_ENCODING_MASK) >> RDS_ERT_3A_ENCODING_BIT,
+				     direction, chartable, rfu_bits);
+			}
+		}
+		
+		rds->ert.encoding = (message & RDS_ERT_3A_ENCODING_MASK) >> RDS_ERT_3A_ENCODING_BIT;
+		rds->ert.direction = direction;  /* Store as received */
+		rds->ert.chartable = chartable;  /* Store raw value as received */
+		rds->ert.carrier_group = carrier_group;
+		
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT ODA: encoding=%s direction=%s chartable=%d carrier=%d%c msg=0x%04X\n",
+			     rds->ert.encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
+			     direction == RDS_ERT_DIR_RTL ? "RTL" : "LTR",
+			     chartable,
+			     carrier_group >> 1, (carrier_group & 1) ? 'B' : 'A', message);
+	}
 	
 	rds_scheduler_update(rds);
 	return 0;
@@ -4063,9 +4706,40 @@ static void rds_decode_ert(rds_decoder_t *rds, const uint16_t *blocks,
 	
 	/* Update registration info from 3A message if available */
 	if (oda) {
-		ert->encoding = (oda->message & RDS_ERT_3A_ENCODING_MASK) >> RDS_ERT_3A_ENCODING_BIT;
-		ert->direction = (oda->message & RDS_ERT_3A_DIRECTION_MASK) >> RDS_ERT_3A_DIRECTION_BIT;
-		ert->use_chartable_e3 = ((oda->message & RDS_ERT_3A_CHARTABLE_MASK) >> RDS_ERT_3A_CHARTABLE_SHIFT) == 0;
+		uint16_t msg = oda->message;
+		
+		/* Validate marker bits according to IEC 62106-6 spec:
+		 * b0: encoding (0=UCS-2, 1=UTF-8) - valid values: 0 or 1
+		 * b1: direction (0=LTR) - must be 0 per spec
+		 * b2-b5: chartable - must be RDS_ERT_CHARTABLE_E3 for backwards compatibility
+		 * b6-b15: RFU - must be 0
+		 */
+		uint16_t rfu_bits = msg & RDS_ERT_3A_RFU_MASK;
+		uint8_t direction = (msg & RDS_ERT_3A_DIRECTION_MASK) >> RDS_ERT_3A_DIRECTION_BIT;
+		uint8_t chartable = (msg & RDS_ERT_3A_CHARTABLE_MASK) >> RDS_ERT_3A_CHARTABLE_SHIFT;
+		
+		if (rfu_bits != 0 || direction != 0 || chartable != RDS_ERT_CHARTABLE_E3) {
+			if (rds->verbose || rds->debug) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS eRT: Unexpected marker bits in 3A message 0x%04X: "
+				     "direction=%d (expected 0), chartable=%d (expected %d=E3), RFU=0x%04X (expected 0x0000)\n",
+				     msg, direction, chartable, RDS_ERT_CHARTABLE_E3, rfu_bits);
+			}
+			if (rds->debug) {
+				LOGP(DRADIO, LOGL_DEBUG, "RDS eRT: Marker bit validation - "
+				     "b0=%d, b1=%d, b2-b5=%d, b6-b15=0x%04X\n",
+				     (msg & RDS_ERT_3A_ENCODING_MASK) >> RDS_ERT_3A_ENCODING_BIT,
+				     direction, chartable, rfu_bits);
+				if (chartable != RDS_ERT_CHARTABLE_E3) {
+					LOGP(DRADIO, LOGL_DEBUG, "RDS eRT: Non-zero chartable value %d received "
+					     "(expected %d=E3). Character mapping not implemented for non-zero chartable values.\n",
+					     chartable, RDS_ERT_CHARTABLE_E3);
+				}
+			}
+		}
+		
+		ert->encoding = (msg & RDS_ERT_3A_ENCODING_MASK) >> RDS_ERT_3A_ENCODING_BIT;
+		ert->direction = direction;  /* Should be 0, but decode what we receive */
+		ert->chartable = chartable;  /* Store raw value as received */
 		ert->carrier_group = oda->carrier_group;
 		ert->registered = 1;
 	}
@@ -4114,26 +4788,86 @@ static void rds_decode_ert(rds_decoder_t *rds, const uint16_t *blocks,
 			segments_count++;
 	}
 	
-	if (rds->verbose) {
-		char ert_display[513];  /* 128 bytes * 4 bytes UTF-8 max + 1 */
-		int display_len = 0;
+	/* Detect eRT completion - either received CR terminator or all 32 segments */
+	int ert_complete = 0;
+	size_t text_len = 0;
+	
+	/* Find CR terminator position */
+	for (size_t i = 0; i < RDS_ERT_LENGTH; i++) {
+		if (ert->ert[i] == 0x0D) {
+			text_len = i;
+			/* Check if we have all segments up to and including the CR */
+			int needed_segments = (text_len + RDS_ERT_BYTES_PER_SEGMENT) / RDS_ERT_BYTES_PER_SEGMENT;
+			int have_all = 1;
+			for (int s = 0; s < needed_segments && s < RDS_ERT_SEGMENTS; s++) {
+				if (!(ert->segments_received & (1U << s))) {
+					have_all = 0;
+					break;
+				}
+			}
+			if (have_all) {
+				ert_complete = 1;
+			}
+			break;
+		}
+	}
+	
+	/* Also complete if all 32 segments received without CR */
+	if (!ert_complete && segments_count == RDS_ERT_SEGMENTS) {
+		ert_complete = 1;
+		text_len = RDS_ERT_LENGTH;
+	}
+	
+	/* Save last-known-good state when complete */
+	if (ert_complete && !rds->ert_has_complete) {
+		memcpy(&rds->ert_dec_complete, ert, sizeof(rds_ert_decoder_t));
+		rds->ert_has_complete = 1;
 		
-		/* Convert eRT to display-safe UTF-8 */
-		if (ert->encoding == RDS_ERT_ENCODING_UTF8) {
-			/* UTF-8: use as-is, but convert control chars */
-			display_len = rds_text_to_display(ert->ert, RDS_ERT_LENGTH, ert_display, sizeof(ert_display));
-		} else {
-			/* UCS-2: convert 16-bit Unicode to UTF-8 (simplified - just show bytes for now) */
-			/* TODO: Implement proper UCS-2 to UTF-8 conversion */
-			display_len = rds_text_to_display(ert->ert, RDS_ERT_LENGTH, ert_display, sizeof(ert_display));
+		/* Also save eRT+ tags if available */
+		if (rds->ert_plus.tag_count > 0) {
+			memcpy(&rds->ert_plus_complete, &rds->ert_plus, sizeof(rds_rtplus_decoder_t));
+			rds->ert_plus_has_complete = 1;
 		}
 		
-		LOGP(DRADIO, LOGL_INFO, "RDS eRT: seg=%d/%d encoding=%s direction=%s "
-		     "text=\"%.*s\"\n",
+		if (rds->verbose)
+			LOGP(DRADIO, LOGL_INFO, "RDS eRT: Complete reception saved (len=%zu, %d segments)\n",
+			     text_len, segments_count);
+	}
+	
+	/* Display eRT status and text (verbose/debug logging) */
+	if (rds->verbose || rds->debug) {
+		char ert_display[513];  /* 128 bytes * 4 bytes UTF-8 max + 1 */
+		size_t display_len = 0;
+		const char *status_str = ert_complete ? "COMPLETE" : "INCOMPLETE";
+		
+		/* Convert eRT to display-safe UTF-8 with sanitization
+		 * Use sanitize_utf8 to replace invalid/incomplete sequences with ? */
+		if (ert->encoding == RDS_ERT_ENCODING_UTF8) {
+			/* UTF-8: sanitize to replace invalid/incomplete sequences */
+			display_len = rds_sanitize_utf8((const char *)ert->ert, 
+			                                 ert_complete ? text_len : RDS_ERT_LENGTH,
+			                                 ert_display, sizeof(ert_display));
+		} else {
+			/* UCS-2: convert to UTF-8 for display */
+			display_len = rds_ucs2_to_utf8(ert->ert, 
+			                                ert_complete ? text_len : RDS_ERT_LENGTH,
+			                                ert_display, sizeof(ert_display));
+		}
+		
+		LOGP(DRADIO, LOGL_INFO, "RDS eRT: seg=%d/%d encoding=%s direction=%s status=%s "
+		     "text_len=%zu text=\"%.*s\"\n",
 		     segments_count, RDS_ERT_SEGMENTS,
 		     ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
 		     ert->direction == RDS_ERT_DIR_RTL ? "RTL" : "LTR",
-		     display_len, ert_display);
+		     status_str, text_len, (int)display_len, ert_display);
+		
+		/* Debug: Show incomplete reception details */
+		if (rds->debug && !ert_complete) {
+			LOGP(DRADIO, LOGL_DEBUG, "RDS eRT: Incomplete reception - %d/%d segments received, "
+			     "CR terminator: %s\n",
+			     segments_count, RDS_ERT_SEGMENTS,
+			     text_len > 0 ? "found" : "not found");
+		}
 	}
 }
 
@@ -4757,13 +5491,18 @@ static void rds_decode_group(rds_decoder_t *rds)
 				int year, month, day;
 				mjd_to_date(mjd, &year, &month, &day);
 				
-				/* Apply timezone offset to get local time */
+				/* Store original UTC date/time for delta calculation before modifying for local display */
+				int utc_year = year, utc_month = month, utc_day = day;
+				int utc_hour = hour, utc_minute = minute;
+				
+				/* Apply timezone offset to get local time (for display only) */
+				int local_day = day;
 				int local_hour = hour + (tz_offset / 2);
 				int local_minute = minute + (tz_offset % 2) * 30;
 				if (local_minute >= 60) { local_minute -= 60; local_hour++; }
 				if (local_minute < 0) { local_minute += 60; local_hour--; }
-				if (local_hour >= 24) { local_hour -= 24; day++; }
-				if (local_hour < 0) { local_hour += 24; day--; }
+				if (local_hour >= 24) { local_hour -= 24; local_day++; }
+				if (local_hour < 0) { local_hour += 24; local_day--; }
 				
 				/* DEBUG: Compact codes */
 				if (rds->debug)
@@ -4776,17 +5515,17 @@ static void rds_decode_group(rds_decoder_t *rds)
 					     "UTC=%04d-%02d-%02d %02d:%02d, "
 					     "Timezone offset=%+.1f hours. "
 					     "Local time=%02d:%02d\n",
-					     year, month, day, hour, minute,
+					     utc_year, utc_month, utc_day, utc_hour, utc_minute,
 					     tz_offset / 2.0,
 					     local_hour, local_minute);
 				
-				/* Calculate delta from system time */
+				/* Calculate delta from system time using original UTC values */
 				struct tm tm_rx = {0};
-				tm_rx.tm_year = year - 1900;
-				tm_rx.tm_mon = month - 1;  /* mjd_to_date returns 1-12, tm_mon expects 0-11 */
-				tm_rx.tm_mday = day;
-				tm_rx.tm_hour = hour;
-				tm_rx.tm_min = minute;
+				tm_rx.tm_year = utc_year - 1900;
+				tm_rx.tm_mon = utc_month - 1;  /* mjd_to_date returns 1-12, tm_mon expects 0-11 */
+				tm_rx.tm_mday = utc_day;
+				tm_rx.tm_hour = utc_hour;
+				tm_rx.tm_min = utc_minute;
 				tm_rx.tm_sec = 0;
 				tm_rx.tm_isdst = -1;
 				/* We need UTC timestamp. timegm is non-standard but common on Linux */
@@ -4801,7 +5540,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				/* User Requested Format: UTC, Offset, Local, Delta */
 				LOGP(DRADIO, LOGL_INFO, "RDS 4A Report: UTC=%04d-%02d-%02dT%02d:%02dZ  "
 				     "Offset=%+.1fh  Local=%02d:%02d  Delta=%+.0fs\n",
-				     year, month, day, hour, minute, /* month is already 1-12 from mjd_to_date */
+				     utc_year, utc_month, utc_day, utc_hour, utc_minute,
 				     tz_offset / 2.0,
 				     local_hour, local_minute, delta);
 #endif
@@ -5319,6 +6058,10 @@ static int rds_biphase_decode(rds_decoder_t *rds, double acc)
 int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us)
 {
 	memset(rds, 0, sizeof(*rds));
+	
+	/* Initialize eRT chartable to default value */
+	rds->ert_dec.chartable = RDS_ERT_CHARTABLE_DEFAULT;
+	
 	rds->samplerate = samplerate;
 	rds->debug = debug;
 	rds->verbose = verbose;
