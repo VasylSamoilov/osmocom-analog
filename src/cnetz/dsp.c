@@ -122,7 +122,7 @@ int dsp_init_sender(cnetz_t *cnetz, int measure_speed, double clock_speed[2], en
 
 	size = cnetz->fsk_bitduration * (double)BLOCK_BITS * 16.0; /* 16 blocks for distributed frames */
 	cnetz->fsk_tx_buffer_size = size * 1.1; /* more to compensate clock speed */
-	cnetz->fsk_tx_buffer = calloc(sizeof(sample_t), cnetz->fsk_tx_buffer_size);
+	cnetz->fsk_tx_buffer = calloc(cnetz->fsk_tx_buffer_size, sizeof(sample_t));
 	if (!cnetz->fsk_tx_buffer) {
 		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;
@@ -137,7 +137,7 @@ int dsp_init_sender(cnetz_t *cnetz, int measure_speed, double clock_speed[2], en
 	iir_lowpass_init(&cnetz->lp, MAX_MODULATION, cnetz->sender.samplerate, 2);
 
 	/* create speech buffer */
-	cnetz->dsp_speech_buffer = calloc(sizeof(sample_t), (int)(cnetz->fsk_bitduration * 70.0)); /* more to compensate clock speed. we just need it to fill 62 bits (60 bits, including pause bits). */
+	cnetz->dsp_speech_buffer = calloc((int)(cnetz->fsk_bitduration * 70.0), sizeof(sample_t)); /* more to compensate clock speed. we just need it to fill 62 bits (60 bits, including pause bits). */
 	if (!cnetz->dsp_speech_buffer) {
 		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;
