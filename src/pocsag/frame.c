@@ -43,6 +43,7 @@
 #include "../liblogging/logging.h"
 #include "pocsag.h"
 #include "frame.h"
+#include <ctype.h>
 
 #define CHAN pocsag->sender.kanal
 
@@ -286,13 +287,13 @@ static void decode_numeric(pocsag_t *pocsag, uint32_t word)
 	int i;
 
 	for (i = 0; i < 5; i++) {
-		if (pocsag->rx_msg_data_length == sizeof(pocsag->rx_msg_data))
+		if (pocsag->rx_msg_data_length_numeric == sizeof(pocsag->rx_msg_data_numeric))
 			return;
 		digit = (word >> (27 - i * 4)) & 0x1;
 		digit = (digit << 1) | ((word >> (28 - i * 4)) & 0x1);
 		digit = (digit << 1) | ((word >> (29 - i * 4)) & 0x1);
 		digit = (digit << 1) | ((word >> (30 - i * 4)) & 0x1);
-		pocsag->rx_msg_data[pocsag->rx_msg_data_length++] = numeric[digit];
+		pocsag->rx_msg_data_numeric[pocsag->rx_msg_data_length_numeric++] = numeric[digit];
 	}
 }
 
@@ -395,15 +396,25 @@ static void decode_hex(pocsag_t *pocsag, uint32_t word)
 	int i;
 
 	for (i = 0; i < 5; i++) {
-		if (pocsag->rx_msg_data_length == sizeof(pocsag->rx_msg_data))
+		if (pocsag->rx_msg_data_length_hex == sizeof(pocsag->rx_msg_data_hex))
 			return;
 		digit = (word >> (27 - i * 4)) & 0x1;
 		digit = (digit << 1) | ((word >> (28 - i * 4)) & 0x1);
 		digit = (digit << 1) | ((word >> (29 - i * 4)) & 0x1);
 		digit = (digit << 1) | ((word >> (30 - i * 4)) & 0x1);
-		pocsag->rx_msg_data[pocsag->rx_msg_data_length++] = hex[digit];
+		pocsag->rx_msg_data_hex[pocsag->rx_msg_data_length_hex++] = hex[digit];
 	}
 }
+
+static enum pocsag_msg_type detect_msg_type(pocsag_t *pocsag)
+{
+	if (pocsag->rx_msg_data_length == 0)
+		return POCSAG_MSG_TYPE_TONE; /* No data codewords received -> Tone-only message */
+
+	/* Always default to Alpha as per user request */
+	return POCSAG_MSG_TYPE_ALPHA;
+}
+
 
 /* get codeword from scheduler */
 int64_t get_codeword(pocsag_t *pocsag)
@@ -551,17 +562,39 @@ static void done_rx_msg(pocsag_t *pocsag)
 
 	pocsag->rx_msg_valid = 0;
 
+	/* Detect message type based on content */
+	pocsag->rx_msg_type = detect_msg_type(pocsag);
+
 	/*
-	 * Log received message with both function (sub-address) and detected msg_type.
-	 * Per POCSAG standard, these are independent - function bits are sub-addresses,
-	 * message type is determined by content.
+	 * Log received message with detected msg_type.
 	 */
 	LOGP_CHAN(DPOCSAG, LOGL_INFO, "Received message from RIC '%d' / function '%s' / type '%s'\n",
 		  pocsag->rx_msg_ric, pocsag_function_name[pocsag->rx_msg_function],
 		  pocsag_msg_type_name(pocsag->rx_msg_type));
+
+	if (pocsag->rx_msg_type == POCSAG_MSG_TYPE_TONE) {
+		pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
+				   pocsag->rx_msg_function, pocsag->rx_msg_type, NULL);
+		return;
+	}
+
+	/* Log Content (Alpha is default) */
 	text = print_message(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
-	if (pocsag->rx_msg_type == POCSAG_MSG_TYPE_NUMERIC || pocsag->rx_msg_type == POCSAG_MSG_TYPE_ALPHA)
-		LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Message text is \"%s\".\n", text);
+	LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Alpha: \"%s\"\n", text);
+	
+	/* Log Numeric Content if short enough */
+	if (pocsag->rx_msg_data_length_numeric <= 20) {
+		text = print_message(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
+		LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Numeric: \"%s\"\n", text);
+	}
+
+	/* Log Hex Output always */
+	text = print_message(pocsag->rx_msg_data_hex, pocsag->rx_msg_data_length_hex);
+	LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Hex: %s\n", text);
+
+	/* Send Alpha to upper layer */
+	/* Re-generate alpha text as print_message uses static buffer */
+	text = print_message(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
 	pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
 			   pocsag->rx_msg_function, pocsag->rx_msg_type, text);
 }
@@ -599,12 +632,12 @@ void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
 		pocsag->rx_msg_valid = 1;
 		decode_address(word, slot, &pocsag->rx_msg_ric, &pocsag->rx_msg_function);
 		pocsag->rx_msg_data_length = 0;
+		pocsag->rx_msg_data_length_numeric = 0;
+		pocsag->rx_msg_data_length_hex = 0;
 		pocsag->rx_msg_bit_index = 0;
 		/*
 		 * Initialize msg_type to TONE (no message content expected yet).
-		 * Per POCSAG standard, function bits do NOT determine message type.
 		 * Message type will be detected when we receive message codewords.
-		 * If no message codewords follow, it's a tone-only page.
 		 */
 		pocsag->rx_msg_type = POCSAG_MSG_TYPE_TONE;
 	} else {
@@ -612,18 +645,12 @@ void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
 		if (!pocsag->rx_msg_valid)
 			return;
 		/*
-		 * Decoding strategy: Try alpha first as it's more general.
-		 * If the content looks purely numeric, receivers can interpret
-		 * it as such. Per POCSAG standard, the encoding is determined
-		 * by content, NOT by function bits.
-		 *
-		 * Note: We use alpha decoding by default since it can represent
-		 * any content. The rx_msg_type is set to ALPHA when we receive
-		 * message codewords. A more sophisticated implementation could
-		 * try to detect the encoding heuristically.
+		 * Decoding strategy: Decode as Alpha, Numeric, and Hex simultaneously.
+		 * Later, we decide which one is valid.
 		 */
-		pocsag->rx_msg_type = POCSAG_MSG_TYPE_ALPHA;
 		decode_alpha(pocsag, word);
+		decode_numeric(pocsag, word);
+		decode_hex(pocsag, word);
 	}
 }
 
