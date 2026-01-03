@@ -37,6 +37,7 @@ amps_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -80,6 +81,7 @@ tacs_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -123,6 +125,7 @@ jtacs_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm

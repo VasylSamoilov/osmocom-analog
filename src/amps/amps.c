@@ -604,6 +604,8 @@ int amps_create(const char *kanal, enum amps_chan_type chan_type, const char *de
 	LOGP(DAMPS, LOGL_DEBUG, "Creating 'AMPS' instance for channel = %s of band %s (sample rate %d).\n", kanal, band, samplerate);
 
 	/* init general part of transceiver */
+	/* We disable pre/de-emphasis in sender.c (passing 0, 0) because we handle it 
+	 * carefully in dsp.c with correct ordering and limiting. */
 	rc = sender_create(&amps->sender, kanal, amps_channel2freq(atoi(kanal), 0), amps_channel2freq(atoi(kanal), 1), device, use_sdr, samplerate, rx_gain, tx_gain, 0, 0, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, PAGING_SIGNAL_NONE);
 	if (rc < 0) {
 		LOGP(DAMPS, LOGL_ERROR, "Failed to init transceiver process!\n");
@@ -623,6 +625,25 @@ int amps_create(const char *kanal, enum amps_chan_type chan_type, const char *de
 	rc = init_emphasis(&amps->estate, samplerate, CUT_OFF_EMPHASIS_DEFAULT, CUT_OFF_HIGHPASS_DEFAULT, CUT_OFF_LOWPASS_DEFAULT);
 	if (rc < 0)
 		goto error;
+
+	/* init separate RX de-emphasis state for 8000 Hz domain */
+	rc = init_emphasis(&amps->estate_rx, 8000, CUT_OFF_EMPHASIS_DEFAULT, CUT_OFF_HIGHPASS_DEFAULT, CUT_OFF_LOWPASS_DEFAULT);
+	if (rc < 0)
+		goto error;
+
+	/* init TX post-limiter low pass filter (cutoff 3000 Hz, 4th order approx) */
+	iir_lowpass_init(&amps->tx_post_filter, 3000.0, samplerate, 4);
+
+	/* init RX pre-filter (SAT rejection / Anti-Aliasing) (cutoff 3000 Hz) */
+	/* 8 iterations = steep slope, but compliant with 300-3000Hz bandwidth */
+	iir_lowpass_init(&amps->rx_pre_filter, 3000.0, samplerate, 8);
+
+	/* init RX notch filter for SAT (6000 Hz) */
+	/* Q=20 gives ~300Hz bandwidth (5850-6150), 2 iterations for deeper depth */
+	iir_notch_init(&amps->rx_notch_filter, 6000.0, samplerate, 2, 20.0);
+
+	/* init RX HPF for DC and low freq noise (300 Hz) */
+	iir_highpass_init(&amps->rx_hpf, 300.0, samplerate, 1);
 
 	/* init audio processing */
 	rc = dsp_init_sender(amps, tolerant);

@@ -113,6 +113,12 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 	/* attack (3ms) and recovery time (13.5ms) according to NMT specs */
 	setup_compandor(&nmt->cstate, 8000, 3.0, 13.5);
 
+	/* init filters */
+	iir_highpass_init(&nmt->rx_hp_filter, 300.0, nmt->sender.samplerate, 4);
+	if (nmt->supervisory)
+		iir_notch_init(&nmt->rx_notch_filter, super_freq[nmt->supervisory - 1], nmt->sender.samplerate, 2, 20.0);
+	iir_lowpass_init(&nmt->rx_lp_filter, 3400.0, nmt->sender.samplerate, 8);
+
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Init DSP for Transceiver.\n");
 
 	/* set modulation parameters */
@@ -355,6 +361,12 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 			nmt->rx_mute--;
 		}
 	}
+
+	/* filter audio */
+	iir_process(&nmt->rx_hp_filter, samples, length);
+	if (nmt->supervisory)
+		iir_process(&nmt->rx_notch_filter, samples, length);
+	iir_process(&nmt->rx_lp_filter, samples, length);
 
 	if ((nmt->dsp_mode == DSP_MODE_AUDIO || nmt->dsp_mode == DSP_MODE_DTMF)
 	 && nmt->trans && nmt->trans->callref) {

@@ -88,6 +88,7 @@
 #include "amps.h"
 #include "frame.h"
 #include "dsp.h"
+#include "../libclipper/clipper.h"
 #include "main.h"
 
 #define CHAN amps->sender.kanal
@@ -172,6 +173,7 @@ void dsp_init(void)
 	dsp_sync_check[0x0ed] = 0x80; /* no bit error */
 
 	compandor_init();
+	clipper_init(0.95);
 }
 
 static void dsp_init_ramp(amps_t *amps)
@@ -576,6 +578,27 @@ again:
 		/* pre-emphasis */
 		if (amps->pre_emphasis)
 			pre_emphasis(&amps->estate, samples, length);
+
+		/* limiter */
+		/* The clipper limits to 1.0. We want to limit to max_deviation. 
+		 * The sender scales 1.0 to speech_deviation.
+		 * So we must scale the signal so that max_deviation maps to 1.0.
+		 * scale = speech_deviation / max_deviation.
+		 */
+		double scale = amps->sender.speech_deviation / amps->sender.max_deviation;
+		if (scale > 1.0) scale = 1.0; /* safety */
+		int i;
+		for (i = 0; i < length; i++)
+			samples[i] *= scale;
+
+		clipper_process(samples, length);
+
+		for (i = 0; i < length; i++)
+			samples[i] /= scale;
+
+		/* post-limiter filter (splatter filter) */
+		iir_process(&amps->tx_post_filter, samples, length);
+
 		/* encode SAT during call */
 		sat_encode(amps, samples, length);
 		break;
@@ -1051,6 +1074,18 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		int i;
 
 		/* de-emphasis */
+		/* downsample first (channel filter) */
+		/* But first! Apply RX Pre-Filter to remove SAT tone (6kHz) and noise before downsampling */
+		/* Apply HPF (300Hz) first to kill DC and LF noise */
+		iir_process(&amps->rx_hpf, samples, length);
+		/* Apply Notch Filter (6000Hz) to kill the pilot tone */
+		iir_process(&amps->rx_notch_filter, samples, length);
+		/* Then apply LPF (3000Hz) to clean up everything else */
+		iir_process(&amps->rx_pre_filter, samples, length);
+
+		count = samplerate_downsample(&amps->sender.srstate, samples, length);
+
+		/* de-emphasis (now at 8000 Hz) */
 		if (amps->de_emphasis)
 			de_emphasis(&amps->estate, samples, length);
 		/* downsample */

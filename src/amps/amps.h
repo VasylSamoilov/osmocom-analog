@@ -59,6 +59,11 @@ struct amps {
 	int			pre_emphasis;		/* use pre_emphasis by this instance */
 	int			de_emphasis;		/* use de_emphasis by this instance */
 	emphasis_t		estate;
+	emphasis_t		estate_rx;
+	iir_filter_t		tx_post_filter;
+	iir_filter_t		rx_pre_filter;
+	iir_filter_t		rx_notch_filter;
+	iir_filter_t		rx_hpf;
 
 	/* sender's states */
 	enum amps_chan_type	chan_type;

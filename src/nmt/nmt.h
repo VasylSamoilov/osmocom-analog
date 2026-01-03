@@ -5,10 +5,11 @@
 #include "../libmobile/call.h"
 #include "../libfsk/fsk.h"
 #include "../libgoertzel/goertzel.h"
+#include "../libfilter/iir_filter.h"
+
 typedef struct nmt nmt_t;
 #include "dms.h"
 #include "sms.h"
-
 
 enum dsp_mode {
 	DSP_MODE_SILENCE,	/* stream nothing */
@@ -82,6 +83,11 @@ struct nmt {
 	compandor_t		cstate;
 	dtmf_enc_t		dtmf;
 	struct transaction	*trans;			/* pointer to transaction, if bound to channel */
+
+	/* filters */
+	iir_filter_t		rx_notch_filter;	/* filter to remove supervisory signal from audio */
+	iir_filter_t		rx_lp_filter;		/* filter to limit bandwidth to 3400 Hz */
+	iir_filter_t		rx_hp_filter;		/* filter to remove DC / < 300 Hz */
 
 	/* sender's states */
 	enum nmt_state		state;
