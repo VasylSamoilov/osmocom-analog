@@ -57,7 +57,7 @@ static nmt_t *alloc_nmt(void)
 {
 	nmt_t *nmt;
 
-	nmt = calloc(sizeof(*nmt), 1);
+	nmt = calloc(1, sizeof(*nmt));
 	nmt->sender.samplerate = 40 * 1200;
 	dms_init_sender(nmt);
 	dms_reset(nmt);

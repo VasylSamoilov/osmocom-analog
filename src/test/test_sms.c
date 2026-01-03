@@ -112,7 +112,7 @@ int main(void)
 	loglevel = LOGL_DEBUG;
 	logging_init();
 
-	nmt = calloc(sizeof(*nmt), 1);
+	nmt = calloc(1, sizeof(*nmt));
 	sms_init_sender(nmt);
 	sms_reset(nmt);
 
@@ -126,7 +126,7 @@ int main(void)
 
 	ok();
 
-	nmt = calloc(sizeof(*nmt), 1);
+	nmt = calloc(1, sizeof(*nmt));
 	sms_init_sender(nmt);
 	sms_reset(nmt);
 
@@ -143,7 +143,7 @@ int main(void)
 
 	ok();
 
-	nmt = calloc(sizeof(*nmt), 1);
+	nmt = calloc(1, sizeof(*nmt));
 	sms_init_sender(nmt);
 	sms_reset(nmt);
 

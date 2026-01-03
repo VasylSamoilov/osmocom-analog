@@ -298,7 +298,7 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	LOGP(DDSP, LOGL_DEBUG, "Use %.4f samples for full bit duration @ %d.\n", amps->fsk_bitduration, amps->sender.samplerate);
 
 	amps->fsk_tx_buffer_size = amps->fsk_bitduration + 10; /* 10 extra to avoid overflow due to rounding */
-	spl = calloc(sizeof(*spl), amps->fsk_tx_buffer_size);
+	spl = calloc(amps->fsk_tx_buffer_size, sizeof(*spl));
 	if (!spl) {
 		LOGP(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;
@@ -314,7 +314,7 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	LOGP(DDSP, LOGL_DEBUG, "Bit window length: %d\n", amps->fsk_rx_window_length);
 	LOGP(DDSP, LOGL_DEBUG, " -> Samples in window to analyse level left of edge: %d..%d\n", amps->fsk_rx_window_begin, amps->fsk_rx_window_half - 1);
 	LOGP(DDSP, LOGL_DEBUG, " -> Samples in window to analyse level right of edge: %d..%d\n", amps->fsk_rx_window_half, amps->fsk_rx_window_end - 1);
-	spl = calloc(sizeof(*amps->fsk_rx_window), amps->fsk_rx_window_length);
+	spl = calloc(amps->fsk_rx_window_length, sizeof(*amps->fsk_rx_window));
 	if (!spl) {
 		LOGP(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;
@@ -331,7 +331,7 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	 * we half our bandwidth, so that other supervisory signals will be canceled out completely by goertzel filter
 	 */
 	amps->sat_samples = (int)((double)amps->sender.samplerate * (1.0 / (SAT_BANDWIDTH / 2.0)) + 0.5);
-	spl = calloc(sizeof(*spl), amps->sat_samples);
+	spl = calloc(amps->sat_samples, sizeof(*spl));
 	if (!spl) {
 		LOGP(DDSP, LOGL_ERROR, "No memory!\n");
 		return -ENOMEM;

@@ -145,8 +145,12 @@ typedef struct pocsag {
 	uint32_t		rx_msg_ric;		/* ric of message */
 	enum pocsag_function	rx_msg_function;	/* sub-address of message */
 	enum pocsag_msg_type	rx_msg_type;		/* detected message type */
-	char			rx_msg_data[256];	/* data buffer */
+	char			rx_msg_data[256];	/* data buffer (alpha) */
 	int			rx_msg_data_length;	/* complete characters received */
+	char			rx_msg_data_numeric[256]; /* numeric decode buffer */
+	int			rx_msg_data_length_numeric; /* numeric decode length */
+	char			rx_msg_data_hex[256];	/* hex decode buffer */
+	int			rx_msg_data_length_hex;	/* hex decode length */
 	int			rx_msg_bit_index;	/* current bit received for alphanumeric */
 
 	/* calls */

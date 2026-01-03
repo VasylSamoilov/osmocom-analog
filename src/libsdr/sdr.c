@@ -147,7 +147,7 @@ static void show_spectrum(const char *direction, double halfbandwidth, double ce
 		LOGP(DSDR, LOGL_INFO, "Frequency P = %.4f MHz (Paging Frequency)\n", paging_frequency / 1e6);
 }
 
-void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math)
+static void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math)
 {
 	sdr_t *sdr;
 	int threads = 1, oversample = 1; /* always use threads */
@@ -155,6 +155,9 @@ void *sdr_open_internal(int direction, const char *device, double *tx_frequency,
 	double tx_center_frequency = 0.0, rx_center_frequency = 0.0;
 	int rc;
 	int c;
+
+	(void)direction;
+	(void)device;
 
 	LOGP(DSDR, LOGL_DEBUG, "Open SDR device\n");
 
@@ -190,7 +193,7 @@ void *sdr_open_internal(int direction, const char *device, double *tx_frequency,
 		use_channelizer = 0;
 	}
 
-	sdr = calloc(sizeof(*sdr), 1);
+	sdr = calloc(1, sizeof(*sdr));
 	if (!sdr) {
 		LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
 		goto error;
@@ -280,7 +283,7 @@ void *sdr_open_internal(int direction, const char *device, double *tx_frequency,
 
 	/* create list of channel states */
 	if (channels) {
-		sdr->chan = calloc(sizeof(*sdr->chan), channels + (sdr->paging_channel != 0));
+		sdr->chan = calloc(channels + (sdr->paging_channel != 0), sizeof(*sdr->chan));
 		if (!sdr->chan) {
 			LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
 			goto error;
@@ -1010,6 +1013,7 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 		if (get_time() - sdr->thread_write.max_fill_timer > 1.0) {
 			double delay;
 			delay = (double)sdr->thread_write.max_fill / 2.0 / (double)sdr->samplerate;
+			(void)delay;
 			sdr->thread_write.max_fill = 0;
 			sdr->thread_write.max_fill_timer += 1.0;
 			// LOGP(DSDR, LOGL_DEBUG, "write delay = %.3f ms\n", delay * 1000.0);
@@ -1092,6 +1096,7 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		if (get_time() - sdr->thread_read.max_fill_timer > 1.0) {
 			double delay;
 			delay = (double)sdr->thread_read.max_fill / 2.0 / (double)sdr_config->samplerate;
+			(void)delay;
 			sdr->thread_read.max_fill = 0;
 			sdr->thread_read.max_fill_timer += 1.0;
 			// LOGP(DSDR, LOGL_DEBUG, "read delay = %.3f ms\n", delay * 1000.0);
@@ -1104,6 +1109,7 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		 */
 		
 		int needed_samples = use_channelizer ? input_num : num;
+		(void)needed_samples;
 		/* 'fill' is in floats (2 per sample) ? No, buffer_size logic suggests atomic elements (floats) */
 		/* sdr_read_child writes 2 floats per sample. 'fill' is float count? */
 		/* let's verify fill logic: (in - out). */

@@ -134,7 +134,7 @@ static process_t *create_process(int callref, enum process_state state)
 {
 	process_t *process;
 
-	process = calloc(sizeof(*process), 1);
+	process = calloc(1, sizeof(*process));
 	if (!process) {
 		LOGP(DCALL, LOGL_ERROR, "No memory!\n");
 		abort();
