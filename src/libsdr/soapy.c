@@ -45,6 +45,7 @@
 #include <pthread.h>
 #include <SoapySDR/Device.h>
 #include <SoapySDR/Formats.h>
+#include <SoapySDR/Errors.h>
 #include "soapy.h"
 #include "../liblogging/logging.h"
 #include "../liboptions/options.h"
@@ -556,6 +557,10 @@ int soapy_receive(float *buff, int max)
 	/* read RX stream */
 	buffs_ptr[0] = buff;
 	count = SoapySDRDevice_readStream(sdr, rxStream, buffs_ptr, num_to_read, &flags, &timeNs, 0);
+	if (count == SOAPY_SDR_OVERFLOW) {
+		sdr_rx_overflow = 1;
+		return 0;
+	}
 	if (count > 0) {
 		if (!use_time_stamps || !(flags & SOAPY_SDR_HAS_TIME)) {
 			if (use_time_stamps && !software_clock) {
@@ -574,9 +579,11 @@ int soapy_receive(float *buff, int max)
 			rx_timeNs = timeNs;
 			rx_valid = 1;
 		}
-		pthread_mutex_lock(&timestamp_mutex);
-		if (rx_timeNs != timeNs)
+			pthread_mutex_lock(&timestamp_mutex);
+		if (rx_timeNs != timeNs) {
 			LOGP(DSOAPY, LOGL_ERROR, "SDR RX overflow, seems we are too slow. Use lower SDR sample rate, if this happens too often.\n");
+			sdr_rx_overflow = 1;
+		}
 		rx_timeNs = timeNs + count * Ns_per_sample;
 		pthread_mutex_unlock(&timestamp_mutex);
 	}

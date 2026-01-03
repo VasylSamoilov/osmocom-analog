@@ -15,6 +15,23 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * IMPORTANT NOTE ON FUNCTION BITS VS MESSAGE TYPE:
+ *
+ * Per the original CCIR/ETSI POCSAG specification (CCIR Rec. 584), the
+ * 2-bit function field in the address codeword is ONLY used to provide
+ * four possible sub-addresses for a given pager. It has NO mandatory
+ * semantic meaning related to message type.
+ *
+ * Message type (tone-only, numeric, alphanumeric) is determined by the
+ * CONTENT of the message codewords, not by the function bits.
+ *
+ * Any correlation between function bits and message type is manufacturer/
+ * pager specific (e.g., Motorola, Swissphone), not defined by the protocol.
+ *
+ * This implementation treats function bits and message type as INDEPENDENT:
+ *   - Function bits (0-3 or A-D): Sub-address selection
+ *   - Message type (tone/numeric/alpha): Content encoding
  */
 
 #include <stdio.h>
@@ -309,13 +326,42 @@ static uint32_t encode_alpha(pocsag_msg_t *msg)
 			break;
 	}
 
-	/* fill remaining digit space with 0x04 (EOT) */
-	while (bits <= 13) {
-		word = (word << 7) | msg->padding;
-		bits += 7;
+	/*
+	 * Pad remaining space with complete padding characters.
+	 *
+	 * Per POCSAG spec (AN142, CCIR Rec. 584): "The last codeword is filled
+	 * with unprintable characters such as end of message, end of text, or
+	 * null. Null is the only character which can be incomplete."
+	 *
+	 * The spec also states: "Alphanumeric messages should be padded with null."
+	 *
+	 * IMPORTANT: Padding characters must be encoded LSB-first, just like
+	 * message characters. The LSb of each ASCII character is transmitted
+	 * first, so we must bit-reverse the 7-bit padding value before inserting.
+	 * For NULL (0x00), bit-reversal has no effect. For other characters like
+	 * EOT (0x04), the bit order matters for correct decoding.
+	 */
+	if (bits <= 13) {
+		/* Bit-reverse the 7-bit padding character (LSB-first encoding) */
+		uint8_t pad = msg->padding & 0x7F;
+		uint8_t reversed = 0;
+		reversed |= ((pad >> 0) & 1) << 6;
+		reversed |= ((pad >> 1) & 1) << 5;
+		reversed |= ((pad >> 2) & 1) << 4;
+		reversed |= ((pad >> 3) & 1) << 3;
+		reversed |= ((pad >> 4) & 1) << 2;
+		reversed |= ((pad >> 5) & 1) << 1;
+		reversed |= ((pad >> 6) & 1) << 0;
+		do {
+			word = (word << 7) | reversed;
+			bits += 7;
+		} while (bits <= 13);
 	}
 
-	/* fill remaining bits with '0's */
+	/*
+	 * Fill remaining bits with zeros (incomplete NULL character).
+	 * Per spec: "Null is the only character which can be incomplete."
+	 */
 	if (bits < 20)
 		word <<= 20 - bits;
 
@@ -402,16 +448,22 @@ int64_t get_codeword(pocsag_t *pocsag)
 		if ((msg = pocsag->current_msg)) {
 			/* reset idle counter */
 			pocsag->idle_count = 0;
-			/* encode data */
-			switch (msg->function) {
-			case POCSAG_FUNCTION_NUMERIC:
+			/*
+			 * Encode data based on msg_type, NOT function bits.
+			 * Per POCSAG standard, message encoding is independent
+			 * of the function (sub-address) field.
+			 */
+			switch (msg->msg_type) {
+			case POCSAG_MSG_TYPE_NUMERIC:
 				word = encode_numeric(msg);
 				break;
-			case POCSAG_FUNCTION_ALPHA:
+			case POCSAG_MSG_TYPE_ALPHA:
 				word = encode_alpha(msg);
 				break;
+			case POCSAG_MSG_TYPE_TONE:
+			case POCSAG_MSG_TYPE_AUTO:
 			default:
-				word = CODEWORD_IDLE; /* should never happen */
+				word = CODEWORD_IDLE; /* tone-only: no message codewords */
 			}
 			/* if message is complete, reset index and remove message */
 			if (msg->data_index == msg->data_length) {
@@ -435,19 +487,28 @@ int64_t get_codeword(pocsag_t *pocsag)
 				break;
 		}
 		if (msg) {
-			LOGP_CHAN(DPOCSAG, LOGL_INFO, "Sending message to RIC '%d' / function '%d' (%s)\n", msg->ric, msg->function, pocsag_function_name[msg->function]);
+			/*
+			 * Log message with both function (sub-address) and msg_type (encoding).
+			 * Per POCSAG standard, these are independent.
+			 */
+			LOGP_CHAN(DPOCSAG, LOGL_INFO, "Sending message to RIC '%d' / function '%s' / type '%s'\n",
+				  msg->ric, pocsag_function_name[msg->function], pocsag_msg_type_name(msg->msg_type));
 			/* reset idle counter */
 			pocsag->idle_count = 0;
 			/* encode address */
 			word = encode_address(msg);
-			/* link message, if there is data to be sent */
-			if (msg->function == POCSAG_FUNCTION_NUMERIC || msg->function == POCSAG_FUNCTION_ALPHA) {
+			/*
+			 * Link message if there is data to be sent.
+			 * Decision is based on msg_type, NOT function bits.
+			 * Per POCSAG standard, message type is independent of sub-address.
+			 */
+			if (msg->msg_type == POCSAG_MSG_TYPE_NUMERIC || msg->msg_type == POCSAG_MSG_TYPE_ALPHA) {
 				LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Message text is \"%s\".\n", print_message(msg->data, msg->data_length));
 				pocsag->current_msg = msg;
 				msg->data_index = 0;
 				msg->bit_index = 0;
 			} else {
-				/* remove message */
+				/* tone-only: remove message, no data codewords */
 				pocsag_msg_destroy(msg);
 				pocsag_msg_done(pocsag);
 				/* prevent 'use-after-free' from this point on */
@@ -490,11 +551,19 @@ static void done_rx_msg(pocsag_t *pocsag)
 
 	pocsag->rx_msg_valid = 0;
 
-	LOGP_CHAN(DPOCSAG, LOGL_INFO, "Received message from RIC '%d' / function '%d' (%s)\n", pocsag->rx_msg_ric, pocsag->rx_msg_function, pocsag_function_name[pocsag->rx_msg_function]);
+	/*
+	 * Log received message with both function (sub-address) and detected msg_type.
+	 * Per POCSAG standard, these are independent - function bits are sub-addresses,
+	 * message type is determined by content.
+	 */
+	LOGP_CHAN(DPOCSAG, LOGL_INFO, "Received message from RIC '%d' / function '%s' / type '%s'\n",
+		  pocsag->rx_msg_ric, pocsag_function_name[pocsag->rx_msg_function],
+		  pocsag_msg_type_name(pocsag->rx_msg_type));
 	text = print_message(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
-	if (pocsag->rx_msg_function == POCSAG_FUNCTION_NUMERIC || pocsag->rx_msg_function == POCSAG_FUNCTION_ALPHA)
+	if (pocsag->rx_msg_type == POCSAG_MSG_TYPE_NUMERIC || pocsag->rx_msg_type == POCSAG_MSG_TYPE_ALPHA)
 		LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Message text is \"%s\".\n", text);
-	pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric, pocsag->rx_msg_function, text);
+	pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
+			   pocsag->rx_msg_function, pocsag->rx_msg_type, text);
 }
 
 void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
@@ -525,25 +594,36 @@ void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
 	}
 
 	if (!(word & 0x80000000)) {
+		/* Address codeword - start of new message */
 		done_rx_msg(pocsag);
 		pocsag->rx_msg_valid = 1;
 		decode_address(word, slot, &pocsag->rx_msg_ric, &pocsag->rx_msg_function);
 		pocsag->rx_msg_data_length = 0;
 		pocsag->rx_msg_bit_index = 0;
+		/*
+		 * Initialize msg_type to TONE (no message content expected yet).
+		 * Per POCSAG standard, function bits do NOT determine message type.
+		 * Message type will be detected when we receive message codewords.
+		 * If no message codewords follow, it's a tone-only page.
+		 */
+		pocsag->rx_msg_type = POCSAG_MSG_TYPE_TONE;
 	} else {
+		/* Message codeword - decode content */
 		if (!pocsag->rx_msg_valid)
 			return;
-		switch (pocsag->rx_msg_function) {
-		case POCSAG_FUNCTION_NUMERIC:
-			decode_numeric(pocsag, word);
-			break;
-		case POCSAG_FUNCTION_ALPHA:
-			decode_alpha(pocsag, word);
-			break;
-		default:
-			decode_hex(pocsag, word);
-			;
-		}
+		/*
+		 * Decoding strategy: Try alpha first as it's more general.
+		 * If the content looks purely numeric, receivers can interpret
+		 * it as such. Per POCSAG standard, the encoding is determined
+		 * by content, NOT by function bits.
+		 *
+		 * Note: We use alpha decoding by default since it can represent
+		 * any content. The rx_msg_type is set to ALPHA when we receive
+		 * message codewords. A more sophisticated implementation could
+		 * try to detect the encoding heuristically.
+		 */
+		pocsag->rx_msg_type = POCSAG_MSG_TYPE_ALPHA;
+		decode_alpha(pocsag, word);
 	}
 }
 
