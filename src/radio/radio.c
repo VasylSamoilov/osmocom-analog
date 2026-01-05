@@ -992,7 +992,15 @@ void rds_next_preset(radio_t *radio)
 	rds_apply_preset(radio);
 }
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose)
+/* Polyphase resampler flag (set via CLI before radio_init) */
+static int use_polyphase_resampler = 0;
+
+void radio_set_polyphase(int enable)
+{
+	use_polyphase_resampler = enable;
+}
+
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor)
 {
 	int rc = -EINVAL;
 	double safe_scaler = 1.0;
@@ -1092,6 +1100,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		}
 		radio->tx_audio_samplerate = _samplerate;
 		radio->tx_audio_mode = AUDIO_MODE_WAVEFILE;
+		LOGP(DRADIO, LOGL_INFO, "TX audio mode: WAVEFILE (%s, %d Hz, %d ch)\n", tx_wave_file, _samplerate, radio->tx_audio_channels);
 	} else if (tx_audiodev) {
 #ifdef HAVE_ALSA
 		/* open audio device */
@@ -1143,6 +1152,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			}
 		}
 		radio->tx_audio_mode = AUDIO_MODE_TESTTONE;
+		LOGP(DRADIO, LOGL_INFO, "TX audio mode: TESTTONE (1 kHz)\n");
 	}
 
 	if (rx_wave_file) {
@@ -1183,18 +1193,22 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		radio->rx_audio_channels = (stereo) ? 2 : 1;
 	}
 
-	/* check if sample rate is too low */
-	if (radio->tx_audio_samplerate > radio->signal_samplerate) {
-		rc = -EINVAL;
-		LOGP(DRADIO, LOGL_ERROR, "You have selected a signal processing sample rate of %.0f. Your audio sample rate is %.0f.\n", radio->signal_samplerate, radio->tx_audio_samplerate);
-		LOGP(DRADIO, LOGL_ERROR, "Please select a sample rate that is higher or equal the audio sample rate!\n");
-		goto error;
-	}
-	if (radio->rx_audio_samplerate > radio->signal_samplerate) {
-		rc = -EINVAL;
-		LOGP(DRADIO, LOGL_ERROR, "You have selected a signal processing sample rate of %.0f. Your audio sample rate is %.0f.\n", radio->signal_samplerate, radio->rx_audio_samplerate);
-		LOGP(DRADIO, LOGL_ERROR, "Please select a sample rate that is higher or equal the audio sample rate!\n");
-		goto error;
+	/* check if sample rate is too low (only for linear resampler - polyphase handles any ratio) */
+	if (!use_polyphase_resampler) {
+		if (radio->tx_audio_samplerate > radio->signal_samplerate) {
+			rc = -EINVAL;
+			LOGP(DRADIO, LOGL_ERROR, "You have selected a signal processing sample rate of %.0f. Your audio sample rate is %.0f.\n", radio->signal_samplerate, radio->tx_audio_samplerate);
+			LOGP(DRADIO, LOGL_ERROR, "Please select a sample rate that is higher or equal the audio sample rate!\n");
+			LOGP(DRADIO, LOGL_ERROR, "Or use --polyphase-resampler for bidirectional sample rate conversion.\n");
+			goto error;
+		}
+		if (radio->rx_audio_samplerate > radio->signal_samplerate) {
+			rc = -EINVAL;
+			LOGP(DRADIO, LOGL_ERROR, "You have selected a signal processing sample rate of %.0f. Your audio sample rate is %.0f.\n", radio->signal_samplerate, radio->rx_audio_samplerate);
+			LOGP(DRADIO, LOGL_ERROR, "Please select a sample rate that is higher or equal the audio sample rate!\n");
+			LOGP(DRADIO, LOGL_ERROR, "Or use --polyphase-resampler for bidirectional sample rate conversion.\n");
+			goto error;
+		}
 	}
 	if (radio->signal_samplerate < radio->signal_bandwidth * 2 / 0.75) {
 		rc = -EINVAL;
@@ -1237,18 +1251,39 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	 * 
 	 * Note: Filter order was also increased to 4 in libsamplerate/samplerate.c
 	 */
-	rc = init_samplerate(&radio->tx_resampler[0], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0);
-	if (rc < 0)
-		goto error;
-	rc = init_samplerate(&radio->tx_resampler[1], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0);
-	if (rc < 0)
-		goto error;
-	rc = init_samplerate(&radio->rx_resampler[0], radio->rx_audio_samplerate, radio->signal_samplerate, 15000.0);
-	if (rc < 0)
-		goto error;
-	rc = init_samplerate(&radio->rx_resampler[1], radio->rx_audio_samplerate, radio->signal_samplerate, 15000.0);
-	if (rc < 0)
-		goto error;
+	radio->use_polyphase = use_polyphase_resampler;
+	
+	if (use_polyphase_resampler) {
+		/* Polyphase FIR resampler - handles any input/output ratio */
+		LOGP(DRADIO, LOGL_INFO, "Using polyphase resampler for audio/signal rate conversion.\n");
+		
+		rc = polyphase_init(&radio->tx_polyphase[0], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0, 16);
+		if (rc < 0)
+			goto error;
+		rc = polyphase_init(&radio->tx_polyphase[1], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0, 16);
+		if (rc < 0)
+			goto error;
+		rc = polyphase_init(&radio->rx_polyphase[0], radio->signal_samplerate, radio->rx_audio_samplerate, 15000.0, 16);
+		if (rc < 0)
+			goto error;
+		rc = polyphase_init(&radio->rx_polyphase[1], radio->signal_samplerate, radio->rx_audio_samplerate, 15000.0, 16);
+		if (rc < 0)
+			goto error;
+	} else {
+		/* Original linear interpolation resampler - upsampling only */
+		rc = init_samplerate(&radio->tx_resampler[0], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0);
+		if (rc < 0)
+			goto error;
+		rc = init_samplerate(&radio->tx_resampler[1], radio->tx_audio_samplerate, radio->signal_samplerate, 15000.0);
+		if (rc < 0)
+			goto error;
+		rc = init_samplerate(&radio->rx_resampler[0], radio->rx_audio_samplerate, radio->signal_samplerate, 15000.0);
+		if (rc < 0)
+			goto error;
+		rc = init_samplerate(&radio->rx_resampler[1], radio->rx_audio_samplerate, radio->signal_samplerate, 15000.0);
+		if (rc < 0)
+			goto error;
+	}
 
 	/* init display of wave form */
 	sprintf(freq_name[0], "%.4f MHz", frequency / 1e6);
@@ -1303,11 +1338,11 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* Initialize RDS encoder if enabled */
 		if (rds || rds2) {
 			/* Select preset based on emphasis (heuristic for region):
-			 * Only 50µs → USA (RBDS) - preset 1
-			 * All other → RDS (default, more common globally) - preset 0 */
+			 * 75µs → Americas (RBDS) - preset 1
+			 * 50µs and others → Europe/World (RDS) - preset 0 */
 			if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
-				rds_current_preset = 1;  /* USA/RBDS (50µs) */
-				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RBDS (USA) preset\n", time_constant_us);
+				rds_current_preset = 1;  /* USA/RBDS (75µs) */
+				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RBDS (Americas) preset\n", time_constant_us);
 			} else {
 				rds_current_preset = 0;  /* RDS (default, more common globally) */
 				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RDS preset (default)\n", time_constant_us);
@@ -1377,24 +1412,42 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		 * modulation index 1.0 = envelope +-0.5, bias 0.5
 		 * modulation index 0.5 = envelope +-0.25, bias 0.75
 		 */
-		double gain = modulation_index / 2.0;
-		double bias = 1.0 - gain;
-		rc = am_mod_init(&radio->am_mod, radio->signal_samplerate, 0.0, gain, bias);
-		if (rc < 0)
-			goto error;
-		rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->signal_bandwidth, 1.0 / modulation_index);
-		if (rc < 0)
-			goto error;
+		{
+			double gain = modulation_index / 2.0;
+			double bias = 1.0 - gain;
+			rc = am_mod_init(&radio->am_mod, radio->signal_samplerate, 0.0, gain, bias);
+			if (rc < 0)
+				goto error;
+			rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->signal_bandwidth, 1.0 / modulation_index);
+			if (rc < 0)
+				goto error;
+		}
+		/* Initialize AM compandor if enabled
+		 * AM broadcast uses: attack 5ms, recovery 200ms
+		 * This gives consistent modulation depth for varying audio levels
+		 */
+		radio->am_compandor = am_compandor;
+		if (am_compandor) {
+			compandor_init();
+			setup_compandor(&radio->am_compandor_state, radio->signal_samplerate, 5.0, 200.0);
+			LOGP(DRADIO, LOGL_INFO, "AM compandor enabled (attack=5ms, recovery=200ms)\n");
+		}
 		break;
 	case MODULATION_AM_USB:
 		iir_lowpass_init(&radio->tx_am_bw_limit, radio->audio_bandwidth, radio->signal_samplerate, 1);
 		rc = am_mod_init(&radio->am_mod, radio->signal_samplerate, 0.0, 1.0, 0.0);
 		if (rc < 0)
 			goto error;
+		rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->signal_bandwidth, 16.0);
+		if (rc < 0)
+			goto error;
 		break;
 	case MODULATION_AM_LSB:
 		iir_lowpass_init(&radio->tx_am_bw_limit, radio->audio_bandwidth, radio->signal_samplerate, 1);
 		rc = am_mod_init(&radio->am_mod, radio->signal_samplerate, 0.0, 1.0, 0.0);
+		if (rc < 0)
+			goto error;
+		rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->signal_bandwidth, 16.0);
 		if (rc < 0)
 			goto error;
 		break;
@@ -1423,12 +1476,21 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	}
 
 	/* audio buffers: how many sample for audio (rounded down) */
-	int tx_size = (int)((double)buffer_size / radio->tx_resampler[0].factor);
-	int rx_size = (int)((double)buffer_size / radio->rx_resampler[0].factor);
+	/* audio buffers: how many sample for audio (rounded down) */
+	int tx_size, rx_size;
+	if (radio->use_polyphase) {
+		tx_size = polyphase_input_num(&radio->tx_polyphase[0], buffer_size);
+		rx_size = polyphase_output_num(&radio->rx_polyphase[0], buffer_size);
+	} else {
+		tx_size = (int)((double)buffer_size / radio->tx_resampler[0].factor);
+		rx_size = (int)((double)buffer_size / radio->rx_resampler[0].factor);
+	}
+
 	if (tx_size > rx_size)
-		radio->audio_buffer_size = tx_size;
+		radio->audio_buffer_size = tx_size + 16; /* Add padding for safety */
 	else
-		radio->audio_buffer_size = rx_size;
+		radio->audio_buffer_size = rx_size + 16;
+
 	radio->audio_buffer = calloc(radio->audio_buffer_size * 2, sizeof(*radio->audio_buffer));
 	if (!radio->audio_buffer) {
 		LOGP(DRADIO, LOGL_ERROR, "No memory!!\n");
@@ -1537,6 +1599,13 @@ void radio_exit(radio_t *radio)
 		free(radio->testtone[0]);
 		radio->tx_audio_mode = AUDIO_MODE_NONE;
 	}
+	/* Free polyphase resamplers if used */
+	if (radio->use_polyphase) {
+		polyphase_free(&radio->tx_polyphase[0]);
+		polyphase_free(&radio->tx_polyphase[1]);
+		polyphase_free(&radio->rx_polyphase[0]);
+		polyphase_free(&radio->rx_polyphase[1]);
+	}
 	if (radio->modulation == MODULATION_FM)
 		fm_mod_exit(&radio->fm_mod);
 	else
@@ -1588,19 +1657,33 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	}
 
 	/* audio buffers: how many sample for audio (rounded down) */
-	audio_num = (int)((double)signal_num / radio->tx_resampler[0].factor);
+	/* audio buffers: how many sample for audio (rounded down) */
+	if (radio->use_polyphase) {
+		audio_num = polyphase_input_num(&radio->tx_polyphase[0], signal_num);
+	} else {
+		/* Original linear resampler */
+		audio_num = (int)((double)signal_num / radio->tx_resampler[0].factor);
+	}
+
 	if (audio_num > radio->audio_buffer_size) {
-		LOGP(DRADIO, LOGL_ERROR, "audio_num > audio_buffer_size, please fix!.\n");
-		abort();
+		/* Cap if too large, though this shouldn't happen with correct buffer sizing */
+		LOGP(DRADIO, LOGL_ERROR, "audio_num > audio_buffer_size (%d > %d), capping.\n", audio_num, radio->audio_buffer_size);
+		audio_num = radio->audio_buffer_size;
 	}
 	audio_samples[0] = radio->audio_buffer;
 	audio_samples[1] = radio->audio_buffer + radio->audio_buffer_size;
 
 	/* signal buffers: a bit more samples to be safe */
-	signal_num = (int)((double)audio_num * radio->tx_resampler[0].factor + 0.5) + 10;
+	if (radio->use_polyphase) {
+		signal_num = polyphase_output_num(&radio->tx_polyphase[0], audio_num) + 16; /* +padding */
+	} else {
+		signal_num = (int)((double)audio_num * radio->tx_resampler[0].factor + 0.5) + 10;
+	}
+	
 	if (signal_num > radio->signal_buffer_size) {
-		LOGP(DRADIO, LOGL_ERROR, "signal_num > signal_buffer_size, please fix!.\n");
-		abort();
+		/* This means we might overflow output buffer, but audio_num was capped? */
+		LOGP(DRADIO, LOGL_ERROR, "signal_num > signal_buffer_size (%d > %d), capping.\n", signal_num, radio->signal_buffer_size);
+		signal_num = radio->signal_buffer_size;
 	}
 	/* Use TX-only signal buffer */
 	signal_samples[0] = radio->tx_signal_buffer;
@@ -1749,11 +1832,19 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		}
 	}
 
-	/* upsample */
-	signal_num = samplerate_upsample_output_num(&radio->tx_resampler[0], audio_num);
-	samplerate_upsample(&radio->tx_resampler[0], audio_samples[0], audio_num, signal_samples[0], signal_num);
-	if (radio->stereo)
-		samplerate_upsample(&radio->tx_resampler[1], audio_samples[1], audio_num, signal_samples[1], signal_num);
+	/* upsample (or resample with polyphase) */
+	if (radio->use_polyphase) {
+		signal_num = polyphase_resample(&radio->tx_polyphase[0], audio_samples[0], audio_num, signal_samples[0], radio->signal_buffer_size);
+		if (radio->stereo)
+			polyphase_resample(&radio->tx_polyphase[1], audio_samples[1], audio_num, signal_samples[1], radio->signal_buffer_size);
+			
+
+	} else {
+		signal_num = samplerate_upsample_output_num(&radio->tx_resampler[0], audio_num);
+		samplerate_upsample(&radio->tx_resampler[0], audio_samples[0], audio_num, signal_samples[0], signal_num);
+		if (radio->stereo)
+			samplerate_upsample(&radio->tx_resampler[1], audio_samples[1], audio_num, signal_samples[1], signal_num);
+	}
 
 	/* prepare baseband */
 	memset(baseband, 0, sizeof(float) * 2 * signal_num);
@@ -1852,17 +1943,37 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		fm_modulate_complex(&radio->fm_mod, signal_samples[0], signal_power, signal_num, baseband);
 		break;
 	case MODULATION_AM_DSB:
+		/* Apply compandor (audio compressor) if enabled - before clipping */
+		if (radio->am_compandor)
+			compress_audio(&radio->am_compandor_state, signal_samples[0], signal_num);
 		/* also clip to prevent overshooting after audio filtering */
 		clipper_process(signal_samples[0], signal_num);
 		iir_process(&radio->tx_am_bw_limit, signal_samples[0], signal_num);
+		/* Debug: show peak audio level going into AM modulator */
+		{
+			static int am_dbg_cnt = 0;
+			if (++am_dbg_cnt >= 100) {
+				double peak = 0.0;
+				for (int j = 0; j < signal_num; j++)
+					if (fabs(signal_samples[0][j]) > peak)
+						peak = fabs(signal_samples[0][j]);
+				LOGP(DRADIO, LOGL_DEBUG, "AM audio peak: %.3f (mod depth %.0f%%)\n", peak, peak * 100.0);
+				am_dbg_cnt = 0;
+			}
+		}
 		am_modulate_complex(&radio->am_mod, signal_samples[0], signal_power, signal_num, baseband);
 		break;
 	case MODULATION_AM_USB:
+		/* also clip to prevent overshooting after audio filtering */
+		clipper_process(signal_samples[0], signal_num);
+		iir_process(&radio->tx_am_bw_limit, signal_samples[0], signal_num);
+		am_modulate_ssb(&radio->am_mod, signal_samples[0], signal_power, signal_num, baseband, 1);
+		break;
 	case MODULATION_AM_LSB:
 		/* also clip to prevent overshooting after audio filtering */
 		clipper_process(signal_samples[0], signal_num);
 		iir_process(&radio->tx_am_bw_limit, signal_samples[0], signal_num);
-		am_modulate_complex(&radio->am_mod, signal_samples[0], signal_power, signal_num, baseband);
+		am_modulate_ssb(&radio->am_mod, signal_samples[0], signal_power, signal_num, baseband, 0);
 		break;
 	default:
 		break;
@@ -2042,16 +2153,34 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		break;
 	case MODULATION_AM_USB:
 	case MODULATION_AM_LSB:
-		am_demodulate_complex(&radio->am_demod, samples[0], signal_num, baseband, radio->I_buffer, radio->Q_buffer, radio->carrier_buffer);
+		/* Use Product Detection (SSB) */
+		am_demodulate_ssb(&radio->am_demod, samples[0], signal_num, baseband, radio->I_buffer, radio->Q_buffer);
 		break;
 	default:
 		break;
 	}
 
-	/* downsample */
-	audio_num = samplerate_downsample(&radio->rx_resampler[0], samples[0], signal_num);
-	if (radio->stereo)
-		samplerate_downsample(&radio->rx_resampler[1], samples[1], signal_num);
+	/* downsample (or resample with polyphase) */
+	/* downsample (or resample with polyphase) */
+	if (radio->use_polyphase) {
+		/* Use audio_buffer for output to support upsampling (output > input) 
+		 * and avoid in-place overwrite issues. */
+		sample_t *out_left = radio->audio_buffer;
+		sample_t *out_right = radio->audio_buffer + radio->audio_buffer_size;
+		
+		audio_num = polyphase_resample(&radio->rx_polyphase[0], samples[0], signal_num, out_left, radio->audio_buffer_size);
+		samples[0] = out_left;
+		
+		if (radio->stereo) {
+			polyphase_resample(&radio->rx_polyphase[1], samples[1], signal_num, out_right, radio->audio_buffer_size);
+			samples[1] = out_right;
+		}
+	} else {
+		audio_num = samplerate_downsample(&radio->rx_resampler[0], samples[0], signal_num);
+		if (radio->stereo)
+			samplerate_downsample(&radio->rx_resampler[1], samples[1], signal_num);
+	}
+
 
 	/* dampen volume */
 	if (radio->volume != 1.0) {
@@ -2148,3 +2277,4 @@ void radio_set_pi(uint16_t pi)
 {
 	rds_user_pi = pi;
 }
+

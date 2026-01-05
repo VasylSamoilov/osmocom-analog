@@ -6066,8 +6066,8 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->debug = debug;
 	rds->verbose = verbose;
 
-	/* Heuristic: Only 50µs emphasis triggers RBDS (North America) assumption.
-	 * All other values (including 75µs) default to RDS, which is more common globally.
+	/* Heuristic: 75µs emphasis triggers RBDS (Americas) assumption.
+	 * 50µs (Europe/World) defaults to RDS, which is more common globally.
 	 * This sets a default ECC in the RBDS range (0xA0) for correct PTY name display
 	 * (e.g. "Top 40") before the actual ECC is received from Group 1A. */
 	if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {

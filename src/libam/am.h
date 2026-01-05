@@ -1,4 +1,6 @@
 #include "../libfilter/iir_filter.h"
+#include "../libfilter/fir_filter.h"
+#include "ssbfilt.h"
 
 int am_init(int fast_math);
 void am_exit(void);
@@ -8,11 +10,13 @@ typedef struct am_mod {
 	double	phase;		/* current phase */
 	double	gain;		/* gain to be multiplied to amplitude */
 	double	bias;		/* DC offset to add (carrier amplitude) */
+	ssbfilt_t ssbfilt;	/* FFT-based SSB filter (SDRangel approach) */
 } am_mod_t;
 
 int am_mod_init(am_mod_t *mod, double samplerate, double offset, double gain, double bias);
 void am_mod_exit(am_mod_t *mod);
 void am_modulate_complex(am_mod_t *mod, sample_t *amplitude, uint8_t *power, int num, float *baseband);
+void am_modulate_ssb(am_mod_t *mod, sample_t *amplitude, uint8_t *power, int num, float *baseband, int usb);
 
 typedef struct am_demod {
 	double	rot;		/* angle to rotate vector per sample */
@@ -25,4 +29,5 @@ typedef struct am_demod {
 int am_demod_init(am_demod_t *demod, double samplerate, double offset, double gain, double bias);
 void am_demod_exit(am_demod_t *demod);
 void am_demodulate_complex(am_demod_t *demod, sample_t *amplitude, int length, float *baseband, sample_t *I, sample_t *Q, sample_t *carrier);
+void am_demodulate_ssb(am_demod_t *demod, sample_t *amplitude, int length, float *baseband, sample_t *I, sample_t *Q);
 

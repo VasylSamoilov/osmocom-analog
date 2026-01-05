@@ -102,6 +102,9 @@ typedef struct sdr {
 	int		channels;	/* number of frequencies */
 	double		amplitude;	/* amplitude of each carrier */
 	int		samplerate;	/* sample rate of audio data */
+	/* TX channelizer buffers */
+	sample_t	*tx_chan_I;	/* de-interleaved I buffer for TX channelizer */
+	sample_t	*tx_chan_Q;	/* de-interleaved Q buffer for TX channelizer */
 	int		buffer_size;	/* buffer in audio samples */
 	double		interval;	/* how often to process the loop */
 	wave_rec_t	wave_rx_rec;
@@ -294,6 +297,13 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		sdr->chan_in_buff = calloc(sdr->buffer_size * sdr->oversample * 2, sizeof(sample_t));
 		if (!sdr->chan_in_buff) {
 			LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
+			goto error;
+		}
+		/* Allocate TX channelizer buffers */
+		sdr->tx_chan_I = calloc(sdr->buffer_size, sizeof(sample_t));
+		sdr->tx_chan_Q = calloc(sdr->buffer_size, sizeof(sample_t));
+		if (!sdr->tx_chan_I || !sdr->tx_chan_Q) {
+			LOGP(DSDR, LOGL_ERROR, "NO MEM for TX channelizer buffers!\n");
 			goto error;
 		}
 	}
@@ -586,9 +596,22 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 
 	LOGP(DSDR, LOGL_INFO, "Using local oscillator offset: %.0f Hz\n", sdr_config->lo_offset);
 
+	/* Apply upconverter offset */
+	double actual_tx_center = tx_center_frequency + sdr_config->tx_upconverter;
+	double actual_rx_center = rx_center_frequency + sdr_config->rx_upconverter;
+
+	if (sdr_config->tx_upconverter != 0.0 && tx_center_frequency != 0.0) {
+		LOGP(DSDR, LOGL_INFO, "Upconverter TX: %.6f MHz + %.6f MHz = %.6f MHz (SDR tuning)\n",
+		     tx_center_frequency / 1e6, sdr_config->tx_upconverter / 1e6, actual_tx_center / 1e6);
+	}
+	if (sdr_config->rx_upconverter != 0.0 && rx_center_frequency != 0.0) {
+		LOGP(DSDR, LOGL_INFO, "Upconverter RX: %.6f MHz + %.6f MHz = %.6f MHz (SDR tuning)\n",
+		     rx_center_frequency / 1e6, sdr_config->rx_upconverter / 1e6, actual_rx_center / 1e6);
+	}
+
 #ifdef HAVE_UHD
 	if (sdr_config->uhd) {
-		rc = uhd_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, tx_center_frequency, rx_center_frequency, sdr_config->lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, sdr_config->bandwidth, sdr_config->timestamps);
+		rc = uhd_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, actual_tx_center, actual_rx_center, sdr_config->lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, sdr_config->bandwidth, sdr_config->timestamps);
 		if (rc)
 			goto error;
 	}
@@ -596,7 +619,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 
 #ifdef HAVE_SOAPY
 	if (sdr_config->soapy) {
-		rc = soapy_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, tx_center_frequency, rx_center_frequency, sdr_config->lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, sdr_config->bandwidth, sdr_config->timestamps);
+		rc = soapy_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, actual_tx_center, actual_rx_center, sdr_config->lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, sdr_config->bandwidth, sdr_config->timestamps);
 		if (rc)
 			goto error;
 	}
@@ -645,15 +668,27 @@ int sdr_get_samplerate(void *inst)
 int sdr_calculate_optimal_rate(int master_rate, double bandwidth)
 {
 	int rate = master_rate;
+	/* Minimum rate requirement: signal processing sample rate must be at least
+	 * one third greater than the signal's double bandwidth.
+	 * This means: rate >= bandwidth * 2 / 0.75 = bandwidth * 2.666... */
+	double min_rate = bandwidth * 2.0 / 0.75;
 	
-	/* We need at least bandwidth + margin. 
-	 * radio.c enforces samplerate > bandwidth * 1.33 (approx).
-	 * We use 1.5 to be safe. */
+	/* We need at least the minimum required rate.
+	 * Decimate by powers of 2 until we hit the limit. */
 	while ((rate % 2) == 0) {
 		int next_rate = rate / 2;
-		if (next_rate < bandwidth * 1.5)
-			break; /* Too low */
+		if (next_rate < min_rate)
+			break; /* Too low, keep current rate */
 		rate = next_rate;
+	}
+	
+	/* Ensure we meet the minimum requirement */
+	if (rate < min_rate) {
+		/* Round up to next power of 2 that meets the requirement */
+		int pow2 = 1;
+		while (pow2 < min_rate && pow2 < master_rate)
+			pow2 *= 2;
+		rate = pow2;
 	}
 	
 	return rate;
@@ -689,6 +724,11 @@ static void *sdr_write_child(void *arg)
 	int fill, out;
 	int s, ss, o;
 
+	/* Check if TX channelizer is enabled (only check channel 0 for now) */
+	int use_tx_chan = 0;
+	if (sdr->chan && sdr->chan[0].use_tx_channelizer)
+		use_tx_chan = 1;
+
 	while (sdr->thread_write.running) {
 		/* write to SDR */
 		fill = (sdr->thread_write.in - sdr->thread_write.out + sdr->thread_write.buffer_size) % sdr->thread_write.buffer_size;
@@ -698,36 +738,44 @@ static void *sdr_write_child(void *arg)
 			printf("Thread found %d samples in write buffer and forwards them to SDR.\n", num);
 #endif
 			out = sdr->thread_write.out;
-			for (s = 0, ss = 0; s < num; s++) {
-				for (o = 0; o < sdr->oversample; o++) {
-					sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
-					sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
-				}
-				out = (out + 2) % sdr->thread_write.buffer_size;
-			}
-			sdr->thread_write.out = out;
-#ifndef DISABLE_FILTER
-			/* filter spectrum - use channelizer or IIR filter */
-			if (sdr->oversample > 1) {
-				int use_tx_chan = 0;
-				/* Check if any channel uses TX channelizer */
-				if (sdr->chan && sdr->chan[0].use_tx_channelizer)
-					use_tx_chan = 1;
 
-				if (use_tx_chan) {
-					/* TX channelizer path: halfband filter interpolation already
-					 * done in buffer2 via zero-order hold, the halfband filters
-					 * will be applied in a future phase where we restructure
-					 * to do per-channel interpolation before mixing.
-					 * For now, skip IIR filtering when channelizer is enabled
-					 * to demonstrate the integration path. */
-				} else {
-					/* Legacy IIR filter path */
+			if (use_tx_chan && sdr->tx_chan_I && sdr->tx_chan_Q) {
+				/* TX Channelizer path: proper polyphase interpolation */
+				
+				/* De-interleave I/Q from buffer and apply scaling */
+				for (s = 0; s < num; s++) {
+					sdr->tx_chan_I[s] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
+					sdr->tx_chan_Q[s] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
+					out = (out + 2) % sdr->thread_write.buffer_size;
+				}
+				sdr->thread_write.out = out;
+				
+				/* Clear output buffer before channelizer (it ADDS to output) */
+				memset(sdr->thread_write.buffer2, 0, sizeof(float) * num * sdr->oversample * 2);
+				
+				/* Process through TX channelizer (interpolate + filter) */
+				channelizer_tx_process(&sdr->chan[0].tx_channelizer,
+				                       sdr->tx_chan_I, sdr->tx_chan_Q, num,
+				                       sdr->thread_write.buffer2);
+			} else {
+				/* Legacy path: zero-order hold interpolation + IIR filter */
+				for (s = 0, ss = 0; s < num; s++) {
+					for (o = 0; o < sdr->oversample; o++) {
+						sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
+						sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
+					}
+					out = (out + 2) % sdr->thread_write.buffer_size;
+				}
+				sdr->thread_write.out = out;
+#ifndef DISABLE_FILTER
+				/* filter spectrum */
+				if (sdr->oversample > 1) {
 					iir_process_baseband(&sdr->thread_write.lp[0], sdr->thread_write.buffer2, num * sdr->oversample);
 					iir_process_baseband(&sdr->thread_write.lp[1], sdr->thread_write.buffer2 + 1, num * sdr->oversample);
 				}
-			}
 #endif
+			}
+
 #ifdef HAVE_UHD
 			if (sdr_config->uhd)
 				uhd_send(sdr->thread_write.buffer2, num * sdr->oversample);
@@ -932,6 +980,10 @@ void sdr_close(void *inst)
 		}
 		if (sdr->chan_in_buff)
 			free(sdr->chan_in_buff);
+		if (sdr->tx_chan_I)
+			free(sdr->tx_chan_I);
+		if (sdr->tx_chan_Q)
+			free(sdr->tx_chan_Q);
 		free(sdr);
 		sdr = NULL;
 	}

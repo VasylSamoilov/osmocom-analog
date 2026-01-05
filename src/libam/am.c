@@ -29,6 +29,7 @@
 static int has_init = 0;
 static int fast_math = 0;
 static float *sin_tab = NULL, *cos_tab = NULL;
+static double stored_samplerate = 48000.0;  /* Store for SSB filter init */
 
 /* global init */
 int am_init(int _fast_math)
@@ -67,6 +68,7 @@ void am_exit(void)
 }
 
 #define CARRIER_FILTER 30.0
+#define SSB_FFT_LEN 1024  /* Must be power of 2, matches SDRangel */
 
 /* Amplitude modulation in SDR:
  * Just use the base band (audio signal) as real value, and 0.0 as imaginary
@@ -76,19 +78,28 @@ void am_exit(void)
 
 int am_mod_init(am_mod_t *mod, double samplerate, double offset, double gain, double bias)
 {
+	int rc;
+	
 	memset(mod, 0, sizeof(*mod));
 	mod->gain = gain;
 	mod->bias = bias;
+	stored_samplerate = samplerate;
 	if (fast_math)
 		mod->rot = 65536.0 * offset / samplerate;
 	else
 		mod->rot = 2.0 * M_PI * offset / samplerate;
+
+	/* Init FFT-based SSB filter (SDRangel approach) */
+	rc = ssbfilt_init(&mod->ssbfilt, SSB_FFT_LEN, 3000.0, samplerate);
+	if (rc < 0)
+		return rc;
 
 	return 0;
 }
 
 void am_mod_exit(am_mod_t __attribute__((unused)) *mod)
 {
+	ssbfilt_exit(&mod->ssbfilt);
 }
 
 void am_modulate_complex(am_mod_t *mod, sample_t *amplitude, uint8_t *power, int num, float *baseband)
@@ -202,3 +213,85 @@ void am_demodulate_complex(am_demod_t *demod, sample_t *amplitude, int length, f
 		amplitude[s] = (amplitude[s] - carrier[s]) / carrier[s] * gain;
 }
 
+
+/* do ssb demodulation of baseband and write them to samples
+ * This uses Product Detection (mixing), returning combined I+Q (SDRangel approach).
+ */
+void am_demodulate_ssb(am_demod_t *demod, sample_t *amplitude, int length, float *baseband, sample_t *I, sample_t *Q)
+{
+	int s, ss;
+	double rot = demod->rot;
+	double phase = demod->phase;
+	double gain = demod->gain;
+	double i, q;
+	double _sin, _cos;
+
+	/* rotate spectrum */
+	for (s = 0, ss = 0; s < length; s++) {
+		i = baseband[ss++];
+		q = baseband[ss++];
+		phase += rot;
+		if (fast_math) {
+			if (phase < 0.0)
+				phase += 65536.0;
+			else if (phase >= 65536.0)
+				phase -= 65536.0;
+			_sin = sin_tab[(uint16_t)phase];
+			_cos = cos_tab[(uint16_t)phase];
+		} else {
+			if (phase < 0.0)
+				phase += 2.0 * M_PI;
+			else if (phase >= 2.0 * M_PI)
+				phase -= 2.0 * M_PI;
+			_sin = sin(phase);
+			_cos = cos(phase);
+		}
+		I[s] = i * _cos - q * _sin;
+		Q[s] = i * _sin + q * _cos;
+	}
+	demod->phase = phase;
+
+	/* filter bandwidth */
+	iir_process(&demod->lp[0], I, length);
+	iir_process(&demod->lp[1], Q, length);
+
+	/* demod: SDRangel approach - combine I and Q with 0.7 factor for mono output
+	 * This matches SDRangel's: Real demod = (z.real() + z.imag()) * 0.7;
+	 */
+	for (s = 0; s < length; s++) {
+		amplitude[s] = (I[s] + Q[s]) * 0.7 * gain;
+	}
+}
+/* SSB modulation using FFT-based filtering (SDRangel approach)
+ * 
+ * Uses overlap-add FFT convolution to select USB or LSB.
+ * This is exactly how SDRangel's fftfilt::runSSB works.
+ */
+void am_modulate_ssb(am_mod_t *mod, sample_t *amplitude, uint8_t *power, int num, float *baseband, int usb)
+{
+	int s;
+	double gain = mod->gain;
+	ssbfilt_t *filt = &mod->ssbfilt;
+	
+	/* -1 dB headroom to prevent clipping (matches SDRangel) */
+	const double headroom = 0.891235351562;
+	
+	for (s = 0; s < num; s++) {
+		double sample = 0.0;
+		double out_r, out_i;
+		
+		if (power[s]) {
+			sample = amplitude[s] * gain * headroom;
+		}
+		
+		/* Process through FFT SSB filter (sample-by-sample) */
+		ssbfilt_process(filt, sample, 0.0, usb, &out_r, &out_i);
+		
+		/* Output to baseband */
+		*baseband++ += out_r;
+		*baseband++ += out_i;
+	}
+	
+	(void)mod->rot;
+	(void)mod->phase;
+}

@@ -77,6 +77,7 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/libhagelbarger/Makefile
     src/libdtmf/Makefile
     src/libsamplerate/Makefile
+    src/libpolyphase/Makefile
     src/libscrambler/Makefile
     src/libemphasis/Makefile
     src/libfsk/Makefile

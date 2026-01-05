@@ -287,10 +287,10 @@
 #define RDS_IS_RBDS(ecc)        ((ecc) >= RDS_ECC_RBDS_MIN && (ecc) <= RDS_ECC_RBDS_MAX)
 
 /* Detect RBDS from de-emphasis time constant (heuristic)
- * Only 50µs (±1µs tolerance) triggers RBDS assumption.
- * All other values (including 75µs) default to RDS, which is more common globally.
+ * 75µs (±1µs tolerance) triggers RBDS assumption (Americas: USA, Canada, S. Korea).
+ * 50µs is used in Europe/Australia/most of world (RDS).
  * This is used for initial PTY name display before ECC is received. */
-#define RDS_IS_RBDS_EMPHASIS(us)  ((us) >= 49.0 && (us) <= 51.0)
+#define RDS_IS_RBDS_EMPHASIS(us)  ((us) >= 74.0 && (us) <= 76.0)
 
 
 /* Segment masks for cycling */

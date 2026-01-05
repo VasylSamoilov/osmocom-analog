@@ -2,6 +2,8 @@
 #include "../libmobile/sender.h"
 #include "../libfm/fm.h"
 #include "../libam/am.h"
+#include "../libpolyphase/polyphase.h"
+#include "../libcompandor/compandor.h"
 #include "rds.h"
 #include "sca.h"
 
@@ -57,6 +59,9 @@ typedef struct radio {
 	double		signal_bandwidth;
 	samplerate_t	tx_resampler[2];	/* resampling from audio rate to signal rate (two channels) */
 	samplerate_t	rx_resampler[2];	/* resampling from signal rate to audi rate (two channels) */
+	polyphase_t	tx_polyphase[2];	/* polyphase resampler TX (optional) */
+	polyphase_t	rx_polyphase[2];	/* polyphase resampler RX (optional) */
+	int		use_polyphase;		/* use polyphase instead of linear resampler */
 	emphasis_fast_t	fm_emphasis_fast_tx[2];	/* FM pre emphasis TX (optimized 1st-order) */
 	emphasis_fast_t	fm_emphasis_fast_rx[2];	/* FM de emphasis RX (optimized 1st-order) */
 	emphasis_t	fm_emphasis_tx[2];		/* FM pre emphasis TX */
@@ -86,6 +91,9 @@ typedef struct radio {
 	int		sca_92k;		/* 92 kHz SCA enabled */
 	am_mod_t	am_mod;			/* AM modulation */
 	am_demod_t	am_demod;		/* AM modulation */
+	/* AM compandor (audio compressor for better modulation depth) */
+	int		am_compandor;		/* enable AM compandor */
+	compandor_t	am_compandor_state;	/* compandor state for AM */
 	/* buffers */
 	sample_t	*audio_buffer;
 	int		audio_buffer_size;
@@ -98,7 +106,7 @@ typedef struct radio {
 	sample_t	*carrier_buffer;		/* RX-only carrier buffer for AM */
 } radio_t;
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose);
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor);
 void radio_exit(radio_t *radio);
 int radio_start(radio_t *radio);
 int radio_tx(radio_t *radio, float *baseband, int num);
@@ -110,3 +118,4 @@ void rds_next_preset(radio_t *radio);
 
 void radio_set_callsign(const char *callsign);
 void radio_set_pi(uint16_t pi);
+void radio_set_polyphase(int enable);

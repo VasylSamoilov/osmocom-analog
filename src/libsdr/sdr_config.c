@@ -112,6 +112,14 @@ void sdr_config_print_help(void)
 	printf("        RX IF bandwidth\n");
 	printf("    --sdr-rx-lo-offset <Hz>\n");
 	printf("        RX LO frequency offset\n");
+	printf("\nUpconverter options:\n");
+	printf("    --sdr-upconverter <Hz>\n");
+	printf("        Upconverter offset (Hz) for both TX and RX. Can be positive or negative.\n");
+	printf("        SDR tunes to (target + offset). E.g., 125000000 for Ham-It-Up.\n");
+	printf("    --sdr-tx-upconverter <Hz>\n");
+	printf("        TX-specific upconverter offset (Hz).\n");
+	printf("    --sdr-rx-upconverter <Hz>\n");
+	printf("        RX-specific upconverter offset (Hz).\n");
 }
 
 void sdr_config_print_hotkeys(void)
@@ -150,6 +158,10 @@ void sdr_config_print_hotkeys(void)
 #define	OPT_SDR_RX_SAMPLERATE	1525
 #define	OPT_SDR_RX_BANDWIDTH	1526
 #define	OPT_SDR_RX_LO_OFFSET	1527
+/* Upconverter options */
+#define	OPT_SDR_UPCONVERTER	1528
+#define	OPT_SDR_TX_UPCONVERTER	1529
+#define	OPT_SDR_RX_UPCONVERTER	1530
 
 void sdr_config_add_options(void)
 {
@@ -182,6 +194,10 @@ void sdr_config_add_options(void)
 	option_add(OPT_SDR_RX_SAMPLERATE, "sdr-rx-samplerate", 1);
 	option_add(OPT_SDR_RX_BANDWIDTH, "sdr-rx-bandwidth", 1);
 	option_add(OPT_SDR_RX_LO_OFFSET, "sdr-rx-lo-offset", 1);
+	/* Upconverter options */
+	option_add(OPT_SDR_UPCONVERTER, "sdr-upconverter", 1);
+	option_add(OPT_SDR_TX_UPCONVERTER, "sdr-tx-upconverter", 1);
+	option_add(OPT_SDR_RX_UPCONVERTER, "sdr-rx-upconverter", 1);
 }
 
 int sdr_config_handle_options(int short_option, int argi, char **argv)
@@ -285,6 +301,17 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_RX_LO_OFFSET:
 		sdr_config->rx_lo_offset = atof(argv[argi]);
+		break;
+	/* Upconverter options */
+	case OPT_SDR_UPCONVERTER:
+		sdr_config->tx_upconverter = atof(argv[argi]);
+		sdr_config->rx_upconverter = sdr_config->tx_upconverter;
+		break;
+	case OPT_SDR_TX_UPCONVERTER:
+		sdr_config->tx_upconverter = atof(argv[argi]);
+		break;
+	case OPT_SDR_RX_UPCONVERTER:
+		sdr_config->rx_upconverter = atof(argv[argi]);
 		break;
 	default:
 		return -EINVAL;

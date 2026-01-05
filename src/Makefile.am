@@ -15,6 +15,7 @@ SUBDIRS = \
 	libhagelbarger \
 	libdtmf \
 	libsamplerate \
+	libpolyphase \
 	libscrambler \
 	libemphasis \
 	libfsk \

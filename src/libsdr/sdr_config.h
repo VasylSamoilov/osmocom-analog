@@ -30,6 +30,9 @@ typedef struct sdr_config {
 	int		rx_samplerate;		/* RX sample rate */
 	double		rx_bandwidth;		/* RX IF bandwidth */
 	double		rx_lo_offset;		/* RX LO offset */
+	/* Upconverter support (e.g., Ham-It-Up for kHz band reception) */
+	double		tx_upconverter;		/* TX upconverter offset (Hz) */
+	double		rx_upconverter;		/* RX upconverter offset (Hz) */
 } sdr_config_t;
 
 extern sdr_config_t *sdr_config;
