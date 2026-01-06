@@ -151,17 +151,40 @@ const char *weathers_day[16] = {
 	"Partly clouded",
 	"Mostly clouded",
 	"Overcast",
-	"Heat storms",
-	"Heavy Rain",
-	"Snow",
+	"High fog",
 	"Fog",
-	"Sleet",
-	"Rain shower",
+	"Showers",
 	"Light rain",
-	"Snow showers",
+	"Heavy rain",
 	"Frontal storms",
-	"Stratus cloud",
-	"Sleet storms",
+	"Heat storms",
+	"Sleet showers",
+	"Snow showers",
+	"Sleet",
+	"Snow",
+};
+
+/* Enhanced weather descriptions when combined with "schweres Wetter" (extreme weather day/night)
+ * Only codes 1, 6, 7, 9, 10, 12, 13, 14, 15 have special meanings.
+ * NULL means no enhanced meaning for that code.
+ */
+const char *weathers_extreme[16] = {
+	NULL,                          /* 0: Reserved */
+	"Extreme heat",                /* 1: Sonnig + schweres Wetter = grosse Hitze */
+	NULL,                          /* 2: leicht bewölkt */
+	NULL,                          /* 3: vorwiegend bewölkt */
+	NULL,                          /* 4: bedeckt */
+	NULL,                          /* 5: Hochnebel */
+	"Dense fog (<50m visibility)", /* 6: Nebel + schweres Wetter = Nebel Sicht unter 50m */
+	"Heavy showers",               /* 7: Regenschauer + schweres Wetter = Kurze starke Niederschläge */
+	NULL,                          /* 8: leichter Regen */
+	"Extreme precipitation",       /* 9: starker Regen + schweres Wetter = extreme Niederschläge */
+	"Severe storms",               /* 10: Frontengewitter + schweres Wetter = starke Gewitter */
+	NULL,                          /* 11: Wärmegewitter */
+	"Heavy sleet showers",         /* 12: Schneeregenschauer + schweres Wetter */
+	"Heavy snow showers",          /* 13: Schneeschauer + schweres Wetter */
+	"Heavy sleet",                 /* 14: Schneeregen + schweres Wetter */
+	"Heavy snowfall",              /* 15: Schneefall + schweres Wetter */
 };
 
 const char *weathers_night[16] = {
@@ -170,17 +193,17 @@ const char *weathers_night[16] = {
 	"Partly clouded",
 	"Mostly clouded",
 	"Overcast",
-	"Heat storms",
-	"Heavy Rain",
-	"Snow",
+	"High fog",
 	"Fog",
-	"Sleet",
-	"Rain shower",
+	"Showers",
 	"Light rain",
-	"Snow showers",
+	"Heavy rain",
 	"Frontal storms",
-	"Stratus cloud",
-	"Sleet storms",
+	"Heat storms",
+	"Sleet showers",
+	"Snow showers",
+	"Sleet",
+	"Snow",
 };
 
 const char *extremeweathers[16] = {
@@ -194,7 +217,7 @@ const char *extremeweathers[16] = {
 	"Wind gusts Day",
 	"Wind gusts Night",
 	"Icy rain morning",
-	"Icy rain evening",
+	"Icy rain afternoon",
 	"Icy rain night",
 	"Fine dust",
 	"Ozon",
@@ -459,6 +482,13 @@ static uint64_t generate_weather(time_t timestamp, int local_minute, int local_h
 	if ((dataset / 60) < 7) {
 		printf("Weather (day):       %s = %s\n", show_bits(weather_day, 4), weathers_day[weather_day]);
 		printf("Weather (night):     %s = %s\n", show_bits(weather_night, 4), weathers_night[weather_night]);
+		/* Show enhanced meaning if extreme weather (1-3) is set */
+		if (extreme >= 1 && extreme <= 3) {
+			if (weathers_extreme[weather_day])
+				printf("  -> Day extreme weather:   %s\n", weathers_extreme[weather_day]);
+			if (weathers_extreme[weather_night])
+				printf("  -> Night extreme weather: %s\n", weathers_extreme[weather_night]);
+		}
 	}
 	/* show extreme/wind/rain of region 0..59 */
 	if (((dataset / 60) & 1) == 0) {
@@ -592,14 +622,22 @@ static void display_weather(uint32_t weather, int minute, int utc_hour)
 	}
 	if (((dataset / 60) & 1) == 0) {
 		/* even datasets, this is 'Day' data */
+		int extreme_val = 0;
 		if (((weather >> 15) & 1) == 0) {
-			value = (weather >> 8) & 0xf;
-			printf("Extreme weather:     %s = %s\n", show_bits(value, 4), extremeweathers[value]);
+			extreme_val = (weather >> 8) & 0xf;
+			printf("Extreme weather:     %s = %s\n", show_bits(extreme_val, 4), extremeweathers[extreme_val]);
+			/* Show enhanced meaning if extreme weather (1-3) is set */
+			if (extreme_val >= 1 && extreme_val <= 3) {
+				if (weathers_extreme[weather_day])
+					printf("  -> Day extreme weather:   %s\n", weathers_extreme[weather_day]);
+				if (weathers_extreme[weather_night])
+					printf("  -> Night extreme weather: %s\n", weathers_extreme[weather_night]);
+			}
 		} else {
 			value = (weather >> 8) & 0x3;
 			printf("Relative weather:    %s = %s\n", show_bits(value, 2), anomaly1[value]);
 			value = (weather >> 10) & 0x3;
-			printf("Sunshine:            %s = %s\n", show_bits(value, 2), anomaly1[value]);
+			printf("Sunshine:            %s = %s\n", show_bits(value, 2), anomaly2[value]);
 		}
 		value = (weather >> 12) & 0x7;
 		printf("Rain Probability:    %s = %s\n", show_bits(value, 3), probabilities[value]);
@@ -615,7 +653,7 @@ static void display_weather(uint32_t weather, int minute, int utc_hour)
 			value = (weather >> 8) & 0x3;
 			printf("Relative weather:    %s = %s\n", show_bits(value, 2), anomaly1[value]);
 			value = (weather >> 10) & 0x3;
-			printf("Sunshine:            %s = %s\n", show_bits(value, 2), anomaly1[value]);
+			printf("Sunshine:            %s = %s\n", show_bits(value, 2), anomaly2[value]);
 		}
 		value = (weather >> 12) & 0x7;
 		printf("Wind strength:       %s = %s\n", show_bits(value, 3), windstrengths[value]);
