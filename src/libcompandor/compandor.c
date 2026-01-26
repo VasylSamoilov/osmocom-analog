@@ -76,6 +76,9 @@
 /* Maximum level, to prevent sqrt_tab to overflow */
 #define ENVELOPE_MAX	9.990
 
+/* Maximum envelope for expander - limits expansion gain to +10 dB */
+#define EXPANDER_ENVELOPE_MAX	3.16
+
 static double sqrt_tab[10000];
 static int compandor_initalized = 0;
 
@@ -197,9 +200,10 @@ void expand_audio(compandor_t *state, sample_t *samples, int num)
 		/* Clamp envelope to valid range */
 		if (envelope < ENVELOPE_MIN)
 			envelope = ENVELOPE_MIN;
+		if (envelope > EXPANDER_ENVELOPE_MAX)
+			envelope = EXPANDER_ENVELOPE_MAX;
 
-		/* Expansion uses envelope to undo 2:1 compression */
-		/* Compression divides by sqrt(envelope), so expansion multiplies by envelope */
+		/* Expansion: multiply by envelope to undo 2:1 compression. */
 		*samples++ = value * envelope;
 	}
 
