@@ -117,7 +117,7 @@ static void get_test_patterns(int16_t *samples, int length)
 		if (pos >= size)
 			*samples++ = 0;
 		else
-			*samples++ = spl[pos] >> 2;
+			*samples++ = spl[pos];  /* full scale */
 		if (++pos == max)
 			pos = 0;
 	}

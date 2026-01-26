@@ -60,6 +60,7 @@ struct amps {
 	int			de_emphasis;		/* use de_emphasis by this instance */
 	emphasis_t		estate;
 	emphasis_t		estate_rx;
+	emphasis_fast_t		estate_tx_fast;		/* TX pre-emphasis using correct shelf filter */
 	iir_filter_t		tx_post_filter;
 	iir_filter_t		rx_pre_filter;
 	iir_filter_t		rx_notch_filter;

@@ -23,6 +23,7 @@ SUBDIRS = \
 	libfm \
 	libfilter \
 	libchannelizer \
+	libcalibrate \
 	libwave \
 	libfft \
 	libclipper \
@@ -63,7 +64,8 @@ SUBDIRS += \
 	magnetic \
 	fuvst \
 	dcf77 \
-	mate
+	mate \
+	osmocalibrate
 
 if HAVE_ALSA
 if HAVE_FUSE

@@ -108,9 +108,11 @@
 #define AMPS_SAT_DEVIATION	(2000.0 / AMPS_SPEECH_DEVIATION)	/* no emphasis */
 #define AMPS_MAX_DISPLAY	(10000.0 / AMPS_SPEECH_DEVIATION)	/* no emphasis */
 #define AMPS_BITRATE		10000
-/* Standard value per TACS specification - now works correctly after RX path bug fixes */
-#define TACS_SPEECH_DEVIATION	2300.0  /* deviation at 1 kHz normal level (TACS standard) */
-#define TACS_MAX_DEVIATION	6400.0	/* (according to texas instruments and other sources) */
+/* TACS speech deviation: panasonic manual says 2300 Hz at 1 kHz.
+ * Original code used 4000 Hz ("works better"), but echo loopback tests
+ * showed 2300 Hz produces correct audio levels with the limiter. */
+#define TACS_SPEECH_DEVIATION	2300.0
+#define TACS_MAX_DEVIATION	9500.0	/* (according to wikipedia) */
 #define TACS_MAX_MODULATION	9500.0	/* (according to panasonic manual) */
 #define TACS_FSK_DEVIATION	(6400.0 / TACS_SPEECH_DEVIATION)	/* no emphasis */
 #define TACS_SAT_DEVIATION	(1700.0 / TACS_SPEECH_DEVIATION)	/* no emphasis (panasonic / TI) */
@@ -568,36 +570,38 @@ again:
 	case DSP_MODE_AUDIO_RX_AUDIO_TX:
 		memset(power, 1, length);
 		input_num = samplerate_upsample_input_num(&sender->srstate, length);
+
 		{
 			int16_t spl[input_num];
 			jitter_load_samples(&sender->dejitter, (uint8_t *)spl, input_num, sizeof(*spl), jitter_conceal_s16, NULL);
 			int16_to_samples_speech(samples, spl, input_num);
 		}
+
 		compress_audio(&amps->cstate, samples, input_num);
-		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
-		/* pre-emphasis */
+
+		/* pre-emphasis at 8 kHz (BEFORE upsample) - use correct shelf filter with unity gain at DC */
 		if (amps->pre_emphasis)
-			pre_emphasis(&amps->estate, samples, length);
+			pre_emphasis_fast(&amps->estate_tx_fast, samples, input_num);
 
-		/* limiter */
-		/* The clipper limits to 1.0. We want to limit to max_deviation. 
-		 * The sender scales 1.0 to speech_deviation.
-		 * So we must scale the signal so that max_deviation maps to 1.0.
-		 * scale = speech_deviation / max_deviation.
-		 */
-		double scale = amps->sender.speech_deviation / amps->sender.max_deviation;
-		if (scale > 1.0) scale = 1.0; /* safety */
-		int i;
-		for (i = 0; i < length; i++)
-			samples[i] *= scale;
+		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
 
-		clipper_process(samples, length);
-
-		for (i = 0; i < length; i++)
-			samples[i] /= scale;
-
-		/* post-limiter filter (splatter filter) */
-		iir_process(&amps->tx_post_filter, samples, length);
+		/* Deviation limiter (per TIA/EIA-553 §2.1.3.1.3): scale down if peak exceeds limit.
+		 * Applied AFTER upsample to limit actual FM deviation. Leave headroom for SAT. */
+		{
+			double sat_headroom = (!tacs) ? 0.69 : 0.59;  /* SAT amplitude in normalized units (1700/2900 for TACS) */
+			double max_speech = sender->max_deviation / sender->speech_deviation - sat_headroom;
+			double peak = 0;
+			int i;
+			for (i = 0; i < length; i++) {
+				double v = fabs(samples[i]);
+				if (v > peak) peak = v;
+			}
+			if (peak > max_speech) {
+				double scale = max_speech / peak;
+				for (i = 0; i < length; i++)
+					samples[i] *= scale;
+			}
+		}
 
 		/* encode SAT during call */
 		sat_encode(amps, samples, length);
@@ -1073,13 +1077,6 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		int pos, count;
 		int i;
 
-		/* Debug: track signal levels at each stage */
-		double dbg_in_peak = 0, dbg_filt_peak = 0, dbg_deemph_peak = 0, dbg_out_peak = 0;
-		for (i = 0; i < length; i++) {
-			double v = fabs(samples[i]);
-			if (v > dbg_in_peak) dbg_in_peak = v;
-		}
-
 		/* de-emphasis */
 		/* downsample first (channel filter) */
 		/* But first! Apply RX Pre-Filter to remove SAT tone (6kHz) and noise before downsampling */
@@ -1090,38 +1087,14 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		/* Then apply LPF (3000Hz) to clean up everything else */
 		iir_process(&amps->rx_pre_filter, samples, length);
 
-		for (i = 0; i < length; i++) {
-			double v = fabs(samples[i]);
-			if (v > dbg_filt_peak) dbg_filt_peak = v;
-		}
-
 		count = samplerate_downsample(&amps->sender.srstate, samples, length);
 
 		/* de-emphasis (now at 8000 Hz) - use estate_rx which is initialized for 8000 Hz! */
 		if (amps->de_emphasis)
 			de_emphasis(&amps->estate_rx, samples, count);
 
-		for (i = 0; i < count; i++) {
-			double v = fabs(samples[i]);
-			if (v > dbg_deemph_peak) dbg_deemph_peak = v;
-		}
-
 		/* removed redundant second downsample - other DSP files (cnetz, nmt, r2000) only have one */
 		expand_audio(&amps->cstate, samples, count);
-
-		{
-			static double last_log = 0;
-			double now = get_time();
-			for (i = 0; i < count; i++) {
-				double v = fabs(samples[i]);
-				if (v > dbg_out_peak) dbg_out_peak = v;
-			}
-			if (now - last_log >= 1.0) {
-				LOGP_CHAN(DDSP, LOGL_NOTICE, "RX peaks: in=%.2f filt=%.2f deemph=%.2f out=%.2f (env=%.3f, tacs=%d)\n",
-					dbg_in_peak, dbg_filt_peak, dbg_deemph_peak, dbg_out_peak, amps->cstate.e.envelope, tacs);
-				last_log = now;
-			}
-		}
 
 		spl = amps->sender.rxbuf;
 		pos = amps->sender.rxbuf_pos;

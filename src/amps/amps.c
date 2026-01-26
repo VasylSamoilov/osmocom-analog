@@ -631,6 +631,11 @@ int amps_create(const char *kanal, enum amps_chan_type chan_type, const char *de
 	if (rc < 0)
 		goto error;
 
+	/* init TX pre-emphasis using correct shelf filter (unity gain at DC, boost highs)
+	 * Time constant τ = 1/(2π×300) ≈ 530.5µs for 300 Hz corner frequency
+	 * High corner at 3000 Hz (AMPS audio bandwidth) */
+	init_emphasis_fast(&amps->estate_tx_fast, 8000, 530.5e-6, 3000.0);
+
 	/* init TX post-limiter low pass filter (cutoff 3000 Hz, 4th order approx) */
 	iir_lowpass_init(&amps->tx_post_filter, 3000.0, samplerate, 4);
 

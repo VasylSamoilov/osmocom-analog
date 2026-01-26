@@ -242,6 +242,7 @@ static void down_audio(struct osmo_cc_session_codec *codec, uint8_t marker, uint
 	/* if we are disconnected or if a tone is played, ignore audio */
 	if (!process || process->tones.tone != TONES_TONE_OFF)
 		return;
+
 #if 0
 	int16_to_samples_speech(samples, (int16_t *)data, len / 2);
 #ifdef DEBUG_LEVEL
@@ -249,7 +250,7 @@ static void down_audio(struct osmo_cc_session_codec *codec, uint8_t marker, uint
 	printf("festnetz-level: %s                  %.4f\n", debug_db(lev), (20 * log10(lev)));
 #endif
 #endif
-	call_down_audio(codec->decoder, process, process->callref, marker, sequence_number, timestamp, ssrc, payload, payload_len);
+	call_down_audio(codec->decoder, process, process->callref, sequence_number, marker, timestamp, ssrc, payload, payload_len);
 }
 
 static void indicate_setup(process_t *process, const char *callerid, const char *dialing, uint8_t network_type, const char *network_id)
