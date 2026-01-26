@@ -118,6 +118,8 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/fuvst/Makefile
     src/dcf77/Makefile
     src/mate/Makefile
+    src/libcalibrate/Makefile
+    src/osmocalibrate/Makefile
     src/test/Makefile
     src/Makefile
     extra/Makefile

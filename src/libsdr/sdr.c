@@ -596,9 +596,9 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 
 	LOGP(DSDR, LOGL_INFO, "Using local oscillator offset: %.0f Hz\n", sdr_config->lo_offset);
 
-	/* Apply upconverter offset */
-	double actual_tx_center = tx_center_frequency + sdr_config->tx_upconverter;
-	double actual_rx_center = rx_center_frequency + sdr_config->rx_upconverter;
+	/* Apply upconverter offset only when center frequency is set (i.e., that direction is used) */
+	double actual_tx_center = (tx_center_frequency != 0.0) ? tx_center_frequency + sdr_config->tx_upconverter : 0.0;
+	double actual_rx_center = (rx_center_frequency != 0.0) ? rx_center_frequency + sdr_config->rx_upconverter : 0.0;
 
 	if (sdr_config->tx_upconverter != 0.0 && tx_center_frequency != 0.0) {
 		LOGP(DSDR, LOGL_INFO, "Upconverter TX: %.6f MHz + %.6f MHz = %.6f MHz (SDR tuning)\n",

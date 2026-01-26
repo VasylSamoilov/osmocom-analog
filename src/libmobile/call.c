@@ -430,17 +430,21 @@ void call_up_release(int callref, int cause)
 	if (process) {
 		LOGP(DCALL, LOGL_DEBUG, "Process state: %d, audio_disconnected: %d\n", process->state, process->audio_disconnected);
 		/* just keep OSMO-CC connection if tones shall be sent.
-		 * no tones while setting up / alerting the call. */
+		 * no tones while setting up / alerting the call.
+		 * For active calls (PROCESS_CONNECT), mobile already hung up,
+		 * so we can't play tones to it - release immediately. */
 		if (connect_on_setup
 		 && process->state != PROCESS_SETUP_RO
-		 && process->state != PROCESS_ALERTING_RO)
+		 && process->state != PROCESS_ALERTING_RO
+		 && process->state != PROCESS_CONNECT)
 			disconnect_process(callref, cause);
 		else
 		/* if no tones shall be sent, release on disconnect
-		 * or RO setup states */
+		 * or RO setup states, or active call (mobile side released) */
 		if (process->state == PROCESS_DISCONNECT
 		 || process->state == PROCESS_SETUP_RO
-		 || process->state == PROCESS_ALERTING_RO) {
+		 || process->state == PROCESS_ALERTING_RO
+		 || process->state == PROCESS_CONNECT) {
 			LOGP(DCALL, LOGL_DEBUG, "Destroying process and sending REL_IND to network\n");
 			destroy_process(callref);
 			indicate_disconnect_release(callref, cause, OSMO_CC_MSG_REL_IND);
@@ -480,7 +484,7 @@ void call_up_audio(int callref, sample_t *samples, int len)
 
 	/* if we are disconnected or if a tone is played, ignore audio */
 	process = get_process(callref);
-	if (!process || process->tones.tone != TONES_TONE_OFF)
+	if (!process || process->tones.tone != TONES_TONE_OFF || process->audio_disconnected)
 		return;
 
 	/* no codec negotiated (yet) */
