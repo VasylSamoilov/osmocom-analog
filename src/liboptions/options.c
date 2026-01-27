@@ -27,6 +27,15 @@
 
 const char *selected_config_file = NULL;
 
+/* Echo cancellation configuration with defaults */
+echo_config_t echo_config = {
+	.enabled = 0,              /* Disabled by default */
+	.frame_size = 128,         /* 16ms @ 8kHz (debugging only) */
+	.filter_length_ms = 0,     /* 0 means auto-detect with 500ms default */
+	.adapt_rate = 1.0,         /* Default adaptation rate (debugging only) */
+	.stats_enabled = 0         /* Statistics disabled by default (debugging only) */
+};
+
 typedef struct option {
 	struct option *next;
 	int short_option;

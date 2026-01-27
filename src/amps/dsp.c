@@ -577,6 +577,10 @@ again:
 			int16_to_samples_speech(samples, spl, input_num);
 		}
 
+		/* Echo cancellation TX reference (far-end audio before DSP processing) */
+		if (amps->trans_list && amps->trans_list->callref)
+			call_echo_tx_reference(amps->trans_list->callref, samples, input_num);
+
 		compress_audio(&amps->cstate, samples, input_num);
 
 		/* pre-emphasis at 8 kHz (BEFORE upsample) - use correct shelf filter with unity gain at DC */
@@ -1095,6 +1099,9 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 
 		/* removed redundant second downsample - other DSP files (cnetz, nmt, r2000) only have one */
 		expand_audio(&amps->cstate, samples, count);
+
+		/* Echo cancellation RX processing (near-end audio after DSP processing) */
+		call_echo_rx_process(trans->callref, samples, count);
 
 		spl = amps->sender.rxbuf;
 		pos = amps->sender.rxbuf_pos;

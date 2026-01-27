@@ -759,8 +759,8 @@ int uhd_get_tosend(int buffer_size)
 	advance = ((double)tx_time_secs + tx_time_fract_sec) - ((double)rx_time_secs + rx_time_fract_sec);
 	tosend = buffer_size - (int)(advance * samplerate);
 
-	/* Debug: log timing periodically */
-	if (call_count <= 10 || (call_count % 500) == 0) {
+	/* Debug: log timing for initial calls only */
+	if (call_count <= 10) {
 		fprintf(stderr, "DEBUG[%d]: advance=%.3fms tosend=%d buffer=%d\n",
 		        call_count, advance * 1000.0, tosend, buffer_size);
 	}

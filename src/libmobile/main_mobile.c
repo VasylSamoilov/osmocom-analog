@@ -437,6 +437,17 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        Replace received audio by given wave file.\n");
 	printf("    --read-tx-wave <file>\n");
 	printf("        Replace transmitted audio by given wave file.\n");
+	printf("    --echo-cancel\n");
+	printf("        Enable echo cancellation (automatic configuration).\n");
+	printf("        This is all you need - system will auto-detect delay and configure optimally.\n");
+	printf("    --echo-stats\n");
+	printf("        Enable statistics logging for echo cancellation (debugging).\n");
+	printf("    --echo-frame-size <samples>\n");
+	printf("        Set frame size for echo cancellation (debugging only, default: 128).\n");
+	printf("    --echo-filter-length <ms>\n");
+	printf("        Set filter length for echo cancellation (debugging only, default: auto-detect).\n");
+	printf("    --echo-adapt-rate <rate>\n");
+	printf("        Set adaptation rate for echo cancellation (debugging only, default: 1.0).\n");
 #ifdef HAVE_SDR
     if (allow_sdr) {
 	printf("    --limesdr\n");
@@ -505,6 +516,11 @@ void main_mobile_print_hotkeys(void)
 #define	OPT_NO_L16		1011
 #define	OPT_LIMESDR		1100
 #define	OPT_LIMESDR_MINI	1101
+#define	OPT_ECHO_CANCEL		2000
+#define	OPT_ECHO_FRAME_SIZE	2001
+#define	OPT_ECHO_FILTER_LENGTH	2002
+#define	OPT_ECHO_ADAPT_RATE	2003
+#define	OPT_ECHO_STATS		2004
 
 void main_mobile_add_options(void)
 {
@@ -536,6 +552,11 @@ void main_mobile_add_options(void)
 	option_add(OPT_WRITE_TX_WAVE, "write-tx-wave", 1);
 	option_add(OPT_READ_RX_WAVE, "read-rx-wave", 1);
 	option_add(OPT_READ_TX_WAVE, "read-tx-wave", 1);
+	option_add(OPT_ECHO_CANCEL, "echo-cancel", 0);
+	option_add(OPT_ECHO_FRAME_SIZE, "echo-frame-size", 1);
+	option_add(OPT_ECHO_FILTER_LENGTH, "echo-filter-length", 1);
+	option_add(OPT_ECHO_ADAPT_RATE, "echo-adapt-rate", 1);
+	option_add(OPT_ECHO_STATS, "echo-stats", 0);
 #ifdef HAVE_SDR
 	option_add(OPT_LIMESDR, "limesdr", 0);
 	option_add(OPT_LIMESDR_MINI, "limesdr-mini", 0);
@@ -693,6 +714,24 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 #endif
+	case OPT_ECHO_CANCEL:
+		echo_config.enabled = 1;
+		break;
+	case OPT_ECHO_FRAME_SIZE:
+		echo_config.frame_size = atoi(argv[argi]);
+		fprintf(stderr, "Echo frame size manually set to %d (debugging mode)\n", echo_config.frame_size);
+		break;
+	case OPT_ECHO_FILTER_LENGTH:
+		echo_config.filter_length_ms = atoi(argv[argi]);
+		fprintf(stderr, "Echo filter length manually set to %d ms (debugging mode)\n", echo_config.filter_length_ms);
+		break;
+	case OPT_ECHO_ADAPT_RATE:
+		echo_config.adapt_rate = atof(argv[argi]);
+		fprintf(stderr, "Echo adapt rate manually set to %.2f (debugging mode)\n", echo_config.adapt_rate);
+		break;
+	case OPT_ECHO_STATS:
+		echo_config.stats_enabled = 1;
+		break;
 	default:
 #ifdef HAVE_SDR
 		if (allow_sdr)

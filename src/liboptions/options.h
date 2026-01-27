@@ -1,3 +1,13 @@
+/* Echo cancellation configuration */
+typedef struct {
+	int enabled;              /* Default: 0 (disabled) */
+	int frame_size;           /* Default: 128 samples (debugging only) */
+	int filter_length_ms;     /* Default: 0 (auto-detect with 500ms default) */
+	double adapt_rate;        /* Default: 1.0 (debugging only) */
+	int stats_enabled;        /* Default: 0 (debugging only) */
+} echo_config_t;
+
+extern echo_config_t echo_config;
 
 extern const char *selected_config_file;
 char *options_strdup(const char *s);
