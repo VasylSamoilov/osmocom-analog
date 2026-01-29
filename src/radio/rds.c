@@ -1,7 +1,7 @@
 /*
  * RDS (Radio Data System) encoder and decoder
  *
- * (C) 2025-2026 by osmocom-analog authors
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
  *
  * Implements IEC 62106 / NRSC-4-B RDS encoding and decoding

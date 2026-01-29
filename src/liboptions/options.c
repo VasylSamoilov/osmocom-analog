@@ -24,16 +24,20 @@
 #include <errno.h>
 #include "options.h"
 #include "../liblogging/logging.h"
+#include "../libecho/suppressor.h"
 
 const char *selected_config_file = NULL;
 
-/* Echo cancellation configuration with defaults */
-echo_config_t echo_config = {
-	.enabled = 0,              /* Disabled by default */
-	.frame_size = 128,         /* 16ms @ 8kHz (debugging only) */
-	.filter_length_ms = 0,     /* 0 means auto-detect with 500ms default */
-	.adapt_rate = 1.0,         /* Default adaptation rate (debugging only) */
-	.stats_enabled = 0         /* Statistics disabled by default (debugging only) */
+/* Echo suppressor configuration with defaults */
+echo_suppressor_config_t echo_suppressor_config = {
+	.enabled = 0,                    /* Disabled by default */
+	.threshold_db = 10.0,            /* 10 dB threshold (Echo is ~25dB down, gives 15dB margin) */
+	.attenuation_db = 40.0,          /* 40 dB attenuation (safer than 50dB) */
+	.hangover_ms = 150,              /* 150ms hangover to cover jitter */
+	.ramp_ms = 5,                    /* 5ms gain ramp time */
+	.doubletalk_threshold_db = 3.0,  /* 3 dB threshold for double-talk */
+	.stats_enabled = 0,              /* Statistics disabled by default */
+	.echo_delay_ms = 160             /* SDR echo delay (default to observed ~150-160ms) */
 };
 
 typedef struct option {

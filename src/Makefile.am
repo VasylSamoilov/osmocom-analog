@@ -31,7 +31,8 @@ SUBDIRS = \
 	libv27 \
 	libmtp \
 	libaaimage \
-	libtones
+	libtones \
+	libecho
 
 if HAVE_ALSA
 SUBDIRS += \

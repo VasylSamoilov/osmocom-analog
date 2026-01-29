@@ -221,6 +221,11 @@ struct log_info_cat log_categories[] = {
 		.description = "jitter buffer handling",
 		.color = "\033[0;36m",
 	},
+	[DECHO] = {
+		.name = "DECHO",
+		.description = "Echo Analysis",
+		.color = "\033[0;36m",
+	},
 };
 
 size_t log_categories_size = ARRAY_SIZE(log_categories);

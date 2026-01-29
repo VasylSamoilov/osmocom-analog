@@ -1,7 +1,7 @@
 /*
  * RDS (Radio Data System) Lookup Tables
  *
- * (C) 2025-2026 by osmocom-analog authors
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
  *
  * Human-readable lookup tables for RDS codes.

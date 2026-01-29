@@ -43,27 +43,14 @@ void call_down_release(int callref, int cause);
 void call_up_audio(int callref, sample_t *samples, int count);
 void call_down_audio(void *decoder, void *decoder_priv, int callref, uint16_t sequence, uint8_t marker, uint32_t timestamp, uint32_t ssrc, uint8_t *payload, int payload_len);
 
-/* echo cancellation */
+/* echo suppressor (for analog telephony) - wrapper to hold opaque pointer */
 typedef struct {
-	void *echo_state;  /* SpeexEchoState* - opaque to avoid exposing speex_echo.h */
-	void *preprocess;  /* SpeexPreprocessState* - for residual echo suppression */
-	int16_t *tx_buf;   /* Buffer for accumulating TX samples to frame_size */
-	int16_t *rx_buf;   /* Buffer for accumulating RX samples to frame_size */
-	int16_t *out_buf;  /* Output buffer for processed samples */
-	int tx_pos;        /* Current position in TX buffer */
-	int rx_pos;        /* Current position in RX buffer */
-	int echo_frame_size;
-	double last_tx_level_db;  /* Level of last TX frame (for diagnostics) */
-	/* Debug counters for timing analysis */
-	unsigned long tx_frames;  /* Total TX frames processed */
-	unsigned long rx_frames;  /* Total RX frames processed */
-	unsigned long tx_samples; /* Total TX samples received */
-	unsigned long rx_samples; /* Total RX samples received */
-} echo_cancel_state_t;
+	void *suppressor_state;  /* Pointer to echo_suppressor_state_t (opaque) */
+} echo_suppressor_wrapper_t;
 
-echo_cancel_state_t *call_get_echo_state(int callref);
-void call_echo_tx_reference(int callref, sample_t *samples, int count);
-void call_echo_rx_process(int callref, sample_t *samples, int count);
+echo_suppressor_wrapper_t *call_get_echo_suppressor_wrapper(int callref);
+void call_echo_suppressor_tx(int callref, sample_t *samples, int count);
+void call_echo_suppressor_rx(int callref, sample_t *samples, int count);
 
 /* clock to transmit to */
 void call_clock(void); /* from main loop */

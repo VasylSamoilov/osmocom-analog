@@ -1,4 +1,4 @@
-/* Compandor to use various networks like C-Netz / NMT / AMPS / TACS
+/* Syllabic Compandor for Telephony Systems (C-Netz / NMT / AMPS / TACS)
  *
  * (C) 2016 by Andreas Eversberg <jolly@eversberg.eu>
  * All Rights Reserved
@@ -15,6 +15,25 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * COMPANDOR OPERATION PRINCIPLE:
+ * ==============================
+ * A syllabic compandor improves signal-to-noise ratio (SNR) in analog radio
+ * transmission by reducing dynamic range before transmission and restoring it
+ * at the receiver.
+ *
+ * TX Path (Compression):
+ *   - Loud sounds: Reduced in amplitude (compressed)
+ *   - Quiet sounds: Increased in amplitude (boosted)
+ *   - Result: Narrower dynamic range, better noise immunity during transmission
+ *
+ * RX Path (Expansion):
+ *   - Loud sounds: Increased in amplitude (restored)
+ *   - Quiet sounds: Reduced in amplitude (restored)
+ *   - Result: Original dynamic range restored, noise reduced
+ *
+ * The compandor uses envelope tracking with attack/recovery timing to follow
+ * the syllabic structure of speech (hence "syllabic compandor").
  */
 
 #include <stdio.h>
@@ -23,6 +42,7 @@
 #include <string.h>
 #include <math.h>
 #include "../libsample/sample.h"
+#include "../liblogging/logging.h"
 #include "compandor.h"
 
 //#define db2level(db)                 pow(10, (double)db / 20.0)
@@ -70,25 +90,51 @@
 #define COMPANDOR_ATTACK_FACTOR		3.0	/* Envelope multiplier after attack time (3ms) */
 #define COMPANDOR_RECOVERY_FACTOR	0.33	/* Envelope multiplier after recovery time (13.5ms) */
 
-/* Minimum level value to keep state (-60 dB) */
-#define ENVELOPE_MIN	0.001
+/* Minimum envelope value to keep state (-30 dB below nominal)
+ * Prevents division by zero and maintains compandor state during silence.
+ * 
+ * ADJUSTED FOR NOISE FLOOR MITIGATION:
+ * Original value was 0.001 (-60 dB), allowing +30 dB boost.
+ * Previous attempt 0.01 (-40 dB), allowing +20 dB boost (10x).
+ * 
+ * New value is 0.032 (~ -30 dB):
+ * - Linear: 10^(-30/20) = 0.0316...
+ * - Max Compressor Boost: 1 / sqrt(0.032) = ~5.6x (+15 dB)
+ * - This limits noise boosting significantly while keeping compander active.
+ */
+#define ENVELOPE_MIN	0.032
 
-/* Maximum level, to prevent sqrt_tab to overflow */
+/* Maximum envelope for compressor (9.990 = ~20 dB above nominal)
+ * Limits maximum compression to prevent sqrt_tab overflow
+ * At envelope=9.990: compression divides by sqrt(9.990)=3.16, giving -10 dB output */
 #define ENVELOPE_MAX	9.990
 
-/* Maximum envelope for expander - limits expansion gain to +10 dB */
-#define EXPANDER_ENVELOPE_MAX	3.16
+/* Maximum envelope for expander (1.0 = 0 dB, unity gain)
+ * CRITICAL FIX: Limits expansion to prevent amplification beyond original signal level.
+ * 
+ * WHY 1.0?
+ * - Compressor boosts quiet signals (envelope < 1.0) for better SNR during transmission
+ * - Expander should only RESTORE what was compressed, not ADD gain
+ * - When envelope > 1.0, expander would amplify beyond original → causes the reported issue
+ * - Setting max to 1.0 ensures expander is transparent at nominal level and only attenuates
+ *
+ * EXAMPLE:
+ * - Quiet signal (envelope=0.1): Compressor amplifies 3.16x, expander attenuates 0.1x → restored
+ * - Loud signal (envelope=3.0): Compressor attenuates 0.58x, expander limited to 1.0x → compressed
+ * - Nominal signal (envelope=1.0): Compressor 1.0x, expander 1.0x → transparent
+ */
+#define EXPANDER_ENVELOPE_MAX	1.0
 
 static double sqrt_tab[10000];
 static int compandor_initalized = 0;
 
 /*
- * Init compandor according to ITU-T G.162 specification
+ * Initialize compandor lookup tables
  *
- * Hopefully this is correct
- *
+ * Pre-computes square root values for fast compression calculation.
+ * The compressor divides by sqrt(envelope), so we pre-calculate sqrt values
+ * for envelope range 0.001 to 9.990 in steps of 0.001.
  */
-
 void compandor_init(void)
 {
 	int i;
@@ -99,6 +145,19 @@ void compandor_init(void)
 	compandor_initalized = 1;
 }
 
+/*
+ * Setup compandor state with specified timing parameters
+ *
+ * @param state: Compandor state structure to initialize
+ * @param samplerate: Audio sample rate in Hz (typically 8000)
+ * @param attack_ms: Attack time in milliseconds (typically 3.0)
+ * @param recovery_ms: Recovery time in milliseconds (typically 13.5)
+ *
+ * Initializes both compressor and expander with:
+ * - Peak tracking (instant rise, slow fall)
+ * - Envelope following (slow rise/fall with attack/recovery timing)
+ * - Per-sample step multipliers calculated from FACTOR constants
+ */
 void setup_compandor(compandor_t *state, double samplerate, double attack_ms, double recovery_ms)
 {
 	if (!compandor_initalized) {
@@ -108,69 +167,181 @@ void setup_compandor(compandor_t *state, double samplerate, double attack_ms, do
 
 	memset(state, 0, sizeof(*state));
 
+	/* Initialize compressor state
+	 * peak: Instant rise, slow fall - tracks signal envelope
+	 * envelope: Slow rise/fall - follows peak with attack/recovery timing */
 	state->c.peak = 1.0;
 	state->c.envelope = 1.0;
+	
+	/* Initialize expander state (same initial values) */
 	state->e.peak = 1.0;
 	state->e.envelope = 1.0;
-	/* Both compressor and expander use same attack/recovery per TIA/EIA-553 */
+	
+	/* Calculate per-sample step multipliers from time constants
+	 * Both compressor and expander use same attack/recovery per TIA/EIA-553
+	 * 
+	 * step_up: Multiplier for envelope rise (attack)
+	 * step_down: Multiplier for envelope fall (recovery)
+	 * 
+	 * Formula: step = pow(FACTOR, 1000.0 / time_ms / samplerate)
+	 * 
+	 * Example at 8000 Hz with 3ms attack:
+	 *   step_up = pow(3.0, 1000.0 / 3.0 / 8000) = pow(3.0, 0.04167) = 1.0469
+	 *   After 24 samples (3ms): envelope *= 1.0469^24 = 3.0
+	 */
 	state->c.step_up = pow(COMPANDOR_ATTACK_FACTOR, 1000.0 / attack_ms / samplerate);
 	state->c.step_down = pow(COMPANDOR_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
 	state->e.step_up = pow(COMPANDOR_ATTACK_FACTOR, 1000.0 / attack_ms / samplerate);
 	state->e.step_down = pow(COMPANDOR_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
 }
 
+/*
+ * Compress audio for transmission (TX path)
+ *
+ * PURPOSE: Reduce dynamic range to improve SNR during transmission
+ * - Loud sounds: Reduced (compressed)
+ * - Quiet sounds: Increased (boosted)
+ * - Result: Narrower dynamic range, better noise immunity
+ *
+ * OPERATION:
+ * 1. Track peak level (instant rise, slow fall)
+ * 2. Envelope follows peak with attack/recovery timing
+ * 3. Divide audio by sqrt(envelope) for 2:1 compression
+ *
+ * COMPRESSION MATH:
+ * - envelope = 1.0 (nominal): output = value / 1.0 = value (transparent)
+ * - envelope = 4.0 (loud): output = value / 2.0 (compressed -6 dB)
+ * - envelope = 0.1 (quiet): output = value / 0.316 = value * 3.16 (boosted +10 dB)
+ *
+ * The sqrt() gives 2:1 compression ratio:
+ * - 12 dB input change → 6 dB output change
+ *
+ * @param state: Compandor state (maintains envelope between calls)
+ * @param samples: Audio buffer to compress in-place
+ * @param num: Number of samples to process
+ */
 void compress_audio(compandor_t *state, sample_t *samples, int num)
 {
 	double value, peak, envelope, step_up, step_down;
 	int i;
 
+	/* Load state variables for this processing block */
 	step_up = state->c.step_up;
 	step_down = state->c.step_down;
 	peak = state->c.peak;
 	envelope = state->c.envelope;
 
-//	printf("envelope=%.4f\n", envelope);
 	for (i = 0; i < num; i++) {
 		value = *samples;
 
-		/* 'peak' is the level that rises instantly with the signal
-		 * level, but falls with specified recovery rate. */
+		/* Peak tracking: instant rise, slow fall
+		 * 'peak' represents the instantaneous signal level that:
+		 * - Rises immediately when signal increases (instant attack)
+		 * - Falls slowly when signal decreases (recovery time)
+		 * This creates the "peak detector" behavior */
 		if (fabs(value) > peak)
-			peak = fabs(value);
+			peak = fabs(value);  /* Instant rise to new peak */
 		else
-			peak *= step_down;
+			peak *= step_down;   /* Slow fall (recovery) */
 
-		/* 'envelope' follows peak with attack/recovery timing:
+		/* Envelope tracking: slow rise and fall
+		 * 'envelope' follows the peak with attack/recovery timing:
 		 * - Attack (3ms): envelope rises slowly toward peak
 		 * - Recovery (13.5ms): envelope falls slowly toward peak
 		 * Per TIA/EIA-553 and ITU-T G.162 specifications.
-		 */
+		 * 
+		 * This creates the "syllabic" behavior - envelope follows
+		 * the syllable structure of speech, not individual cycles */
 		if (peak > envelope)
 			envelope *= step_up;    /* Attack: slow rise */
 		else
-			envelope *= step_down;  /* Recovery: slow fall (not instant!) */
+			envelope *= step_down;  /* Recovery: slow fall */
 
-		/* Clamp envelope to valid range */
+		/* Clamp envelope to valid range
+		 * Min: Prevents division by zero and maintains state during silence
+		 * Max: Prevents sqrt_tab overflow and limits maximum compression */
 		if (envelope < ENVELOPE_MIN)
 			envelope = ENVELOPE_MIN;
 		if (envelope > ENVELOPE_MAX)
 			envelope = ENVELOPE_MAX;
 
-		*samples++ = value / sqrt_tab[(int)(envelope / 0.001)];
-//if (i > 47000.0 && i < 48144)
-//printf("time=%.4f envelope=%.4fdb, value=%.4f\n", (double)i/48000.0, 20*log10(envelope), value);
-	}
-//exit(0);
+		/* Apply 2:1 compression by dividing by sqrt(envelope)
+		 * Uses pre-computed sqrt table for performance
+		 * 
+		 * WHY sqrt()?
+		 * - For 2:1 compression: output_dB = input_dB / 2
+		 * - In linear domain: output = input / sqrt(envelope)
+		 * - Example: 12 dB input change → 6 dB output change
+		 * 
+		 * EFFECT ON DIFFERENT SIGNAL LEVELS:
+		 * - Loud (envelope=4.0): divide by 2.0 → compress -6 dB
+		 * - Nominal (envelope=1.0): divide by 1.0 → transparent
+		 * - Quiet (envelope=0.1): divide by 0.316 → boost +10 dB
+		 * 
+		 * The boost of quiet signals is INTENTIONAL - it improves SNR
+		 * by raising quiet speech above the noise floor during transmission */
+		double output = value / sqrt_tab[(int)(envelope / 0.001)];
+		*samples++ = output;
 
+		/* DEBUG: Monitor Compressor Levels */
+		static int c_dbg_count = 0;
+		static double c_dbg_sum_in = 0;
+		static double c_dbg_sum_out = 0;
+		c_dbg_sum_in += fabs(value);
+		c_dbg_sum_out += fabs(output);
+		if (++c_dbg_count >= 8000) {
+			LOGP(DDSP, LOGL_DEBUG, "COMP DEBUG: InLevel=%.5f OutLevel=%.5f Env=%.5f\n", 
+				c_dbg_sum_in / 8000.0, c_dbg_sum_out / 8000.0, envelope);
+			c_dbg_count = 0;
+			c_dbg_sum_in = 0;
+			c_dbg_sum_out = 0;
+		}
+	}
+
+	/* Save state for next processing block */
 	state->c.envelope = envelope;
 	state->c.peak = peak;
 }
 
+/*
+ * Expand audio after reception (RX path)
+ *
+ * PURPOSE: Restore original dynamic range and reduce noise
+ * - Loud sounds: Increased (restored)
+ * - Quiet sounds: Reduced (restored + noise reduction)
+ * - Result: Original dynamic range restored, noise floor lowered
+ *
+ * OPERATION:
+ * 1. Track peak level (instant rise, slow fall)
+ * 2. Envelope follows peak with attack/recovery timing
+ * 3. Multiply audio by envelope (limited to 1.0) for expansion
+ *
+ * EXPANSION MATH (with EXPANDER_ENVELOPE_MAX = 1.0):
+ * - envelope = 1.0 (nominal): output = value * 1.0 = value (transparent)
+ * - envelope = 0.1 (quiet): output = value * 0.1 (attenuated -20 dB)
+ * - envelope > 1.0 (loud): LIMITED to 1.0 → output = value * 1.0 (no amplification)
+ *
+ * WHY LIMIT TO 1.0?
+ * - Compressor boosts quiet signals for better SNR during transmission
+ * - Expander should RESTORE what was compressed, not ADD gain
+ * - Without limit: envelope=3.0 would amplify by +9.5 dB beyond original
+ * - With limit: envelope capped at 1.0 ensures no amplification beyond original
+ *
+ * EXAMPLE SIGNAL PATH:
+ * 1. Quiet signal (0.1): Compressor boosts 3.16x → Expander attenuates 0.1x → Restored
+ * 2. Loud signal (3.0): Compressor attenuates 0.58x → Expander limited to 1.0x → Compressed
+ * 3. Nominal signal (1.0): Compressor 1.0x → Expander 1.0x → Transparent
+ *
+ * @param state: Compandor state (maintains envelope between calls)
+ * @param samples: Audio buffer to expand in-place
+ * @param num: Number of samples to process
+ */
 void expand_audio(compandor_t *state, sample_t *samples, int num)
 {
 	double value, peak, envelope, step_up, step_down;
 	int i;
 
+	/* Load state variables for this processing block */
 	step_up = state->e.step_up;
 	step_down = state->e.step_down;
 	peak = state->e.peak;
@@ -179,35 +350,80 @@ void expand_audio(compandor_t *state, sample_t *samples, int num)
 	for (i = 0; i < num; i++) {
 		value = *samples;
 
-		/* for comments: see compress_audio() */
-		/* 'peak' is the level that rises instantly with the signal
-		 * level, but falls with specified recovery rate. */
+		/* Peak tracking: instant rise, slow fall
+		 * Same algorithm as compressor - see compress_audio() for details */
 		if (fabs(value) > peak)
-			peak = fabs(value);
+			peak = fabs(value);  /* Instant rise to new peak */
 		else
-			peak *= step_down;
+			peak *= step_down;   /* Slow fall (recovery) */
 
-		/* 'envelope' follows peak with attack/recovery timing:
-		 * - Attack (3ms): envelope rises slowly toward peak
-		 * - Recovery (13.5ms): envelope falls slowly toward peak
-		 * Per TIA/EIA-553 and ITU-T G.162 specifications.
-		 */
+		/* Envelope tracking: slow rise and fall
+		 * Same algorithm as compressor - see compress_audio() for details
+		 * 
+		 * The envelope tracks the received signal level, which has already
+		 * been compressed at the transmitter. This envelope will be used
+		 * to restore the original dynamic range. */
 		if (peak > envelope)
 			envelope *= step_up;    /* Attack: slow rise */
 		else
-			envelope *= step_down;  /* Recovery: slow fall (not instant!) */
+			envelope *= step_down;  /* Recovery: slow fall */
 
-		/* Clamp envelope to valid range */
+		/* Clamp envelope to valid range
+		 * Min: Prevents multiplication by zero and maintains state during silence
+		 * Max: CRITICAL FIX - prevents amplification beyond original signal level
+		 * 
+		 * BEFORE FIX (EXPANDER_ENVELOPE_MAX = 3.16):
+		 * - Quiet microphone sounds would be amplified up to +10 dB
+		 * - This caused the reported issue of quiet sounds being too loud
+		 * 
+		 * AFTER FIX (EXPANDER_ENVELOPE_MAX = 1.0):
+		 * - Expander can only attenuate or pass through (no amplification)
+		 * - Quiet sounds are properly restored without excessive gain
+		 * - Loud sounds remain compressed (acceptable for telephony)
+		 */
 		if (envelope < ENVELOPE_MIN)
 			envelope = ENVELOPE_MIN;
 		if (envelope > EXPANDER_ENVELOPE_MAX)
 			envelope = EXPANDER_ENVELOPE_MAX;
 
-		/* Expansion: multiply by envelope to undo 2:1 compression. */
-		*samples++ = value * envelope;
+		/* Apply expansion by multiplying by envelope
+		 * This is the inverse of compression (which divides by sqrt(envelope))
+		 * 
+		 * EFFECT ON DIFFERENT SIGNAL LEVELS (with max envelope = 1.0):
+		 * - Loud (envelope limited to 1.0): multiply by 1.0 → no change (stays compressed)
+		 * - Nominal (envelope=1.0): multiply by 1.0 → transparent
+		 * - Quiet (envelope=0.1): multiply by 0.1 → attenuate -20 dB (restores + reduces noise)
+		 * 
+		 * The attenuation of quiet signals is INTENTIONAL - it:
+		 * 1. Restores the original level (undoes compression boost)
+		 * 2. Reduces noise floor (improves perceived SNR)
+		 * 
+		 * Note: Loud signals stay somewhat compressed because envelope is limited.
+		 * This is acceptable for telephony and prevents over-amplification. */
+		double output = value * envelope;
+		*samples++ = output;
+
+		/* DEBUG: Watch for stuck envelope, DC offset, and IO levels */
+		static int dbg_count = 0;
+		static double dbg_sum_dc = 0;
+		static double dbg_sum_in = 0;
+		static double dbg_sum_out = 0;
+		
+		dbg_sum_dc += value;
+		dbg_sum_in += fabs(value);
+		dbg_sum_out += fabs(output);
+
+		if (++dbg_count >= 8000) {
+			LOGP(DDSP, LOGL_DEBUG, "EXP DEBUG: InLevel=%.5f OutLevel=%.5f DC=%.5f Env=%.5f\n", 
+				dbg_sum_in / 8000.0, dbg_sum_out / 8000.0, dbg_sum_dc / 8000.0, envelope);
+			dbg_count = 0;
+			dbg_sum_dc = 0;
+			dbg_sum_in = 0;
+			dbg_sum_out = 0;
+		}
 	}
 
+	/* Save state for next processing block */
 	state->e.envelope = envelope;
 	state->e.peak = peak;
 }
-

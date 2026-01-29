@@ -67,6 +67,7 @@ AC_SUBST([ARFLAGS], [rc])
 AC_CONFIG_FILES([src/liblogging/Makefile
     src/liboptions/Makefile
     src/libmobile/Makefile
+    src/libecho/Makefile
     src/libdisplay/Makefile
     src/libimage/Makefile
     src/libsendevolumenregler/Makefile

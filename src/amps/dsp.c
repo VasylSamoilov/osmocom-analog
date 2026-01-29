@@ -108,9 +108,9 @@
 #define AMPS_SAT_DEVIATION	(2000.0 / AMPS_SPEECH_DEVIATION)	/* no emphasis */
 #define AMPS_MAX_DISPLAY	(10000.0 / AMPS_SPEECH_DEVIATION)	/* no emphasis */
 #define AMPS_BITRATE		10000
-/* TACS speech deviation: panasonic manual says 2300 Hz at 1 kHz.
- * Original code used 4000 Hz ("works better"), but echo loopback tests
- * showed 2300 Hz produces correct audio levels with the limiter. */
+/* TACS speech deviation: Per Panasonic manual, 2300 Hz at 1 kHz reference.
+ * This is lower than AMPS (2900 Hz) because TACS uses narrower deviation.
+ * Using 2900 Hz causes feedback loops due to excessive TX level. */
 #define TACS_SPEECH_DEVIATION	2300.0
 #define TACS_MAX_DEVIATION	9500.0	/* (according to wikipedia) */
 #define TACS_MAX_MODULATION	9500.0	/* (according to panasonic manual) */
@@ -577,9 +577,9 @@ again:
 			int16_to_samples_speech(samples, spl, input_num);
 		}
 
-		/* Echo cancellation TX reference (far-end audio before DSP processing) */
+		/* Echo suppressor TX reference (far-end audio before DSP processing) */
 		if (amps->trans_list && amps->trans_list->callref)
-			call_echo_tx_reference(amps->trans_list->callref, samples, input_num);
+			call_echo_suppressor_tx(amps->trans_list->callref, samples, input_num);
 
 		compress_audio(&amps->cstate, samples, input_num);
 
@@ -1100,8 +1100,8 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		/* removed redundant second downsample - other DSP files (cnetz, nmt, r2000) only have one */
 		expand_audio(&amps->cstate, samples, count);
 
-		/* Echo cancellation RX processing (near-end audio after DSP processing) */
-		call_echo_rx_process(trans->callref, samples, count);
+		/* Echo suppressor RX processing (near-end audio after DSP processing) */
+		call_echo_suppressor_rx(trans->callref, samples, count);
 
 		spl = amps->sender.rxbuf;
 		pos = amps->sender.rxbuf_pos;

@@ -1,7 +1,7 @@
 /*
  * RDS (Radio Data System) encoder and decoder
  *
- * (C) 2025-2026 by osmocom-analog authors
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
  *
  * Implements IEC 62106 / NRSC-4-B RDS encoding and decoding
@@ -370,10 +370,10 @@ int rds_af_method_a_build_codes(const rds_af_method_a_t *af, uint8_t *codes, int
  * The AF is the frequency that is NOT the tuning frequency.
  *
  * Example (tuning = 89.3 MHz):
- *   89.3 | 99.5  → F1<F2, same programme, AF=99.5
- *   88.8 | 89.3  → F1<F2, same programme, AF=88.8
- *   102.6| 89.3  → F1>F2, regional, AF=102.6
- *   89.3 | 89.0  → F1>F2, regional, AF=89.0
+ *   89.3 | 99.5  -> F1<F2, same programme, AF=99.5
+ *   88.8 | 89.3  -> F1<F2, same programme, AF=88.8
+ *   102.6| 89.3  -> F1>F2, regional, AF=102.6
+ *   89.3 | 89.0  -> F1>F2, regional, AF=89.0
  * ============================================================ */
 
 #define RDS_AF_METHOD_B_MAX_LISTS   8   /* Max separate Method B lists per preset */

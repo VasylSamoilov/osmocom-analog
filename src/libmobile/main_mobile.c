@@ -41,8 +41,12 @@
 #include "../libsdr/sdr_config.h"
 #endif
 #include "../liboptions/options.h"
+#include "../libecho/suppressor.h"
 #include "../libfm/fm.h"
 #include "../libaaimage/aaimage.h"
+
+/* External configuration */
+extern echo_suppressor_config_t echo_suppressor_config;
 
 #define DEFAULT_LO_OFFSET -1000000.0
 
@@ -67,6 +71,8 @@ int do_de_emphasis = 0;
 double rx_gain = 1.0;
 double tx_gain = 1.0;
 static int echo_test = 0;
+static int echo_analysis = 0;
+static int echo_analysis_duration = 10;
 static int use_osmocc_cross = 0;
 static int use_osmocc_sock = 0;
 #define MAX_CC_ARGS 1024
@@ -403,6 +409,12 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf(" -e --echo-test\n");
 	printf("        Use echo test, to send back audio from mobile phone's microphone to\n");
 	printf("        the speaker. (German: 'Blasprobe').\n");
+	printf("    --echo-analysis\n");
+	printf("        Enable echo delay analysis mode. Generates multi-frequency test tones,\n");
+	printf("        measures echo delay, level, and frequency response. Runs for 10 seconds\n");
+	printf("        by default. Cannot be used with --echo-test.\n");
+	printf("    --echo-analysis-duration <seconds>\n");
+	printf("        Set duration for echo analysis test (default = 10 seconds).\n");
 	printf(" -c --call-device hw:<card>,<device>[/hw:<card>.<rec-device>]\n");
 	printf("        Sound card and device number for headset (default = '%s')\n", call_device);
 	printf("        You may specify a different recording device by using '/'.\n");
@@ -437,17 +449,20 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        Replace received audio by given wave file.\n");
 	printf("    --read-tx-wave <file>\n");
 	printf("        Replace transmitted audio by given wave file.\n");
-	printf("    --echo-cancel\n");
-	printf("        Enable echo cancellation (automatic configuration).\n");
-	printf("        This is all you need - system will auto-detect delay and configure optimally.\n");
+	printf("    --echo-suppressor\n");
+	printf("        Enable echo suppressor (energy-based direction detection).\n");
+	printf("    --echo-threshold <dB>\n");
+	printf("        Set threshold for direction detection (default: 10.0 dB).\n");
+	printf("    --echo-attenuation <dB>\n");
+	printf("        Set attenuation depth when suppressing (default: 40.0 dB).\n");
+	printf("    --echo-hangover <ms>\n");
+	printf("        Set hangover time to prevent rapid switching (default: 150 ms).\n");
+	printf("    --echo-delay <ms>\n");
+	printf("        Set SDR roundtrip delay for echo detection (default: 160, max: 500).\n");
+	printf("        Use this in SDR environments where echo arrives delayed.\n");
+	printf("        Typical values: 100-200ms for PlutoSDR, 50-100ms for LimeSDR.\n");
 	printf("    --echo-stats\n");
-	printf("        Enable statistics logging for echo cancellation (debugging).\n");
-	printf("    --echo-frame-size <samples>\n");
-	printf("        Set frame size for echo cancellation (debugging only, default: 128).\n");
-	printf("    --echo-filter-length <ms>\n");
-	printf("        Set filter length for echo cancellation (debugging only, default: auto-detect).\n");
-	printf("    --echo-adapt-rate <rate>\n");
-	printf("        Set adaptation rate for echo cancellation (debugging only, default: 1.0).\n");
+	printf("        Enable statistics logging for echo suppressor (debugging).\n");
 #ifdef HAVE_SDR
     if (allow_sdr) {
 	printf("    --limesdr\n");
@@ -516,11 +531,14 @@ void main_mobile_print_hotkeys(void)
 #define	OPT_NO_L16		1011
 #define	OPT_LIMESDR		1100
 #define	OPT_LIMESDR_MINI	1101
-#define	OPT_ECHO_CANCEL		2000
-#define	OPT_ECHO_FRAME_SIZE	2001
-#define	OPT_ECHO_FILTER_LENGTH	2002
-#define	OPT_ECHO_ADAPT_RATE	2003
+#define	OPT_ECHO_SUPPRESSOR	2000
+#define	OPT_ECHO_THRESHOLD	2001
+#define	OPT_ECHO_ATTENUATION	2002
+#define	OPT_ECHO_HANGOVER	2003
 #define	OPT_ECHO_STATS		2004
+#define	OPT_ECHO_DELAY		2005
+#define	OPT_ECHO_ANALYSIS	2006
+#define	OPT_ECHO_ANALYSIS_DURATION	2007
 
 void main_mobile_add_options(void)
 {
@@ -552,11 +570,14 @@ void main_mobile_add_options(void)
 	option_add(OPT_WRITE_TX_WAVE, "write-tx-wave", 1);
 	option_add(OPT_READ_RX_WAVE, "read-rx-wave", 1);
 	option_add(OPT_READ_TX_WAVE, "read-tx-wave", 1);
-	option_add(OPT_ECHO_CANCEL, "echo-cancel", 0);
-	option_add(OPT_ECHO_FRAME_SIZE, "echo-frame-size", 1);
-	option_add(OPT_ECHO_FILTER_LENGTH, "echo-filter-length", 1);
-	option_add(OPT_ECHO_ADAPT_RATE, "echo-adapt-rate", 1);
+	option_add(OPT_ECHO_SUPPRESSOR, "echo-suppressor", 0);
+	option_add(OPT_ECHO_THRESHOLD, "echo-threshold", 1);
+	option_add(OPT_ECHO_ATTENUATION, "echo-attenuation", 1);
+	option_add(OPT_ECHO_HANGOVER, "echo-hangover", 1);
+	option_add(OPT_ECHO_DELAY, "echo-delay", 1);
 	option_add(OPT_ECHO_STATS, "echo-stats", 0);
+	option_add(OPT_ECHO_ANALYSIS, "echo-analysis", 0);
+	option_add(OPT_ECHO_ANALYSIS_DURATION, "echo-analysis-duration", 1);
 #ifdef HAVE_SDR
 	option_add(OPT_LIMESDR, "limesdr", 0);
 	option_add(OPT_LIMESDR_MINI, "limesdr-mini", 0);
@@ -714,23 +735,39 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 #endif
-	case OPT_ECHO_CANCEL:
-		echo_config.enabled = 1;
+	case OPT_ECHO_SUPPRESSOR:
+		echo_suppressor_config.enabled = 1;
 		break;
-	case OPT_ECHO_FRAME_SIZE:
-		echo_config.frame_size = atoi(argv[argi]);
-		fprintf(stderr, "Echo frame size manually set to %d (debugging mode)\n", echo_config.frame_size);
+	case OPT_ECHO_THRESHOLD:
+		echo_suppressor_config.threshold_db = atof(argv[argi]);
+		fprintf(stderr, "Echo suppressor threshold set to %.1f dB\n", echo_suppressor_config.threshold_db);
 		break;
-	case OPT_ECHO_FILTER_LENGTH:
-		echo_config.filter_length_ms = atoi(argv[argi]);
-		fprintf(stderr, "Echo filter length manually set to %d ms (debugging mode)\n", echo_config.filter_length_ms);
+	case OPT_ECHO_ATTENUATION:
+		echo_suppressor_config.attenuation_db = atof(argv[argi]);
+		fprintf(stderr, "Echo suppressor attenuation set to %.1f dB\n", echo_suppressor_config.attenuation_db);
 		break;
-	case OPT_ECHO_ADAPT_RATE:
-		echo_config.adapt_rate = atof(argv[argi]);
-		fprintf(stderr, "Echo adapt rate manually set to %.2f (debugging mode)\n", echo_config.adapt_rate);
+	case OPT_ECHO_HANGOVER:
+		echo_suppressor_config.hangover_ms = atoi(argv[argi]);
+		fprintf(stderr, "Echo suppressor hangover set to %d ms\n", echo_suppressor_config.hangover_ms);
+		break;
+	case OPT_ECHO_DELAY:
+		echo_suppressor_config.echo_delay_ms = atoi(argv[argi]);
+		if (echo_suppressor_config.echo_delay_ms < 0)
+			echo_suppressor_config.echo_delay_ms = 0;
+		if (echo_suppressor_config.echo_delay_ms > 500)
+			echo_suppressor_config.echo_delay_ms = 500;
+		fprintf(stderr, "Echo suppressor SDR delay set to %d ms\n", echo_suppressor_config.echo_delay_ms);
 		break;
 	case OPT_ECHO_STATS:
-		echo_config.stats_enabled = 1;
+		echo_suppressor_config.stats_enabled = 1;
+		break;
+	case OPT_ECHO_ANALYSIS:
+		echo_analysis = 1;
+		break;
+	case OPT_ECHO_ANALYSIS_DURATION:
+		echo_analysis_duration = atoi(argv[argi]);
+		if (echo_analysis_duration < 1)
+			echo_analysis_duration = 1;
 		break;
 	default:
 #ifdef HAVE_SDR
@@ -811,6 +848,14 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		fprintf(stderr, "You selected call device (headset) and echo test, but only one can be selected.\n");
 		return;
 	}
+	if (echo_test && echo_analysis) {
+		fprintf(stderr, "You selected echo test and echo analysis, but only one can be selected.\n");
+		return;
+	}
+	if (echo_analysis && call_device[0]) {
+		fprintf(stderr, "You selected call device (headset) and echo analysis, but only one can be selected.\n");
+		return;
+	}
 	if (use_osmocc_sock && call_device[0]) {
 		fprintf(stderr, "You selected OSMO-CC socket interface, but it cannot be used with call device (headset).\n");
 		return;
@@ -823,8 +868,16 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		fprintf(stderr, "You selected OSMO-CC socket interface, but it cannot be used with echo test.\n");
 		return;
 	}
+	if (use_osmocc_sock && echo_analysis) {
+		fprintf(stderr, "You selected OSMO-CC socket interface, but it cannot be used with echo analysis.\n");
+		return;
+	}
 	if (use_osmocc_cross && echo_test) {
 		fprintf(stderr, "You selected built-in call forwarding, but it cannot be used with echo test.\n");
+		return;
+	}
+	if (use_osmocc_cross && echo_analysis) {
+		fprintf(stderr, "You selected built-in call forwarding, but it cannot be used with echo analysis.\n");
 		return;
 	}
 
@@ -838,7 +891,7 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 
 	/* init OSMO-CC */
 	if (!use_osmocc_sock)
-		console_init(call_device, call_samplerate, call_buffer, loopback, echo_test, number_digits, number_lengths, station_id);
+		console_init(call_device, call_samplerate, call_buffer, loopback, echo_test, echo_analysis, echo_analysis_duration, number_digits, number_lengths, station_id);
 
 	/* init call control instance */
 	rc = call_init(name, (use_osmocc_sock) ? send_patterns : 0, release_on_disconnect, use_osmocc_sock, cc_argc, cc_argv, no_l16, call_toneset);

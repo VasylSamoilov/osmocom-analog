@@ -1,8 +1,13 @@
 /* FFT-based SSB filter - based on SDRangel's fftfilt
  *
- * (C) 2024 
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * Based on SDRangel by Edouard Griffiths, F4EXB
- * License: GPL v3
+ * All Rights Reserved
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
  * Uses overlap-add FFT convolution for sideband selection.
  */

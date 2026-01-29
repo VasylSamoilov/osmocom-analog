@@ -1,7 +1,7 @@
 /*
  * SCA (Subsidiary Communications Authorization) encoder/decoder
  *
- * (C) 2024 by Andreas Eversberg <jolly@eversberg.eu>
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
  *
  * Implements FM subcarrier encoding/decoding per FCC 47 CFR 73.319

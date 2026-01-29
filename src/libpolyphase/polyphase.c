@@ -3,8 +3,13 @@
  * Based on SDRangel's polyphase interpolator design by Christian Daniel
  * and Edouard Griffiths (F4EXB). Adapted for osmocom-analog.
  *
- * (C) 2026
- * GPLv3
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
+ * All Rights Reserved
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  */
 
 #include <stdio.h>

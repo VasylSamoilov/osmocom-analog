@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string.h>
 #include "../libsample/sample.h"
+#include "../liblogging/logging.h"
 #include "../libcompandor/compandor.h"
 
 #define level2db(level)		(20 * log10(level))
@@ -72,6 +73,7 @@ int main(void)
 	sample_t samples[SAMPLERATE * 2];
 	int f;
 
+	logging_init();
 	compandor_init();
 	setup_compandor(&cstate, SAMPLERATE, ATTACK_MS, RECOVERY_MS);
 

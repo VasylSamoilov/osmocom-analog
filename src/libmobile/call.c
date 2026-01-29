@@ -39,9 +39,11 @@
 #include "sender.h"
 #include "call.h"
 #include "console.h"
-#include "../libecho/speex_echo.h"
-#include "../libecho/speex_preprocess.h"
+#include "../libecho/suppressor.h"
 #include "../liboptions/options.h"
+
+/* External configuration */
+extern echo_suppressor_config_t echo_suppressor_config;
 
 #define DISC_TIMEOUT	30, 0
 
@@ -128,16 +130,16 @@ typedef struct process {
 	osmo_cc_session_t *session;
 	osmo_cc_session_codec_t *codec; /* codec to send */
 	
-	/* Echo cancellation */
-	int echo_cancel_enabled;
-	echo_cancel_state_t echo_cancel;
+	/* Echo suppressor */
+	int echo_suppressor_enabled;
+	echo_suppressor_wrapper_t echo_suppressor;
 } process_t;
 
 static process_t *process_head = NULL;
 
 static void process_timeout(void *data);
 static void indicate_disconnect_release(int callref, int cause, uint8_t msg_type);
-static void call_echo_cleanup(process_t *process);
+static void call_echo_suppressor_cleanup(process_t *process);
 
 static process_t *create_process(int callref, enum process_state state)
 {
@@ -156,9 +158,9 @@ static process_t *create_process(int callref, enum process_state state)
 	process->state = state;
 	tones_set_tone(&call_tones, &process->tones, TONES_TONE_OFF);
 	
-	/* Initialize echo cancellation fields */
-	process->echo_cancel_enabled = 0;
-	memset(&process->echo_cancel, 0, sizeof(process->echo_cancel));
+	/* Initialize echo suppressor fields */
+	process->echo_suppressor_enabled = 0;
+	memset(&process->echo_suppressor, 0, sizeof(process->echo_suppressor));
 
 	return process;
 }
@@ -174,8 +176,8 @@ static void destroy_process(int callref)
 			osmo_timer_del(&process->timer);
 			if (process->session)
 				osmo_cc_free_session(process->session);
-			/* Cleanup echo cancellation */
-			call_echo_cleanup(process);
+			/* Cleanup echo suppressor */
+			call_echo_suppressor_cleanup(process);
 			free(process);
 			return;
 		}
@@ -197,315 +199,122 @@ static process_t *get_process(int callref)
 	return NULL;
 }
 
-/* Get echo cancellation state for a callref
- * Returns NULL if echo cancellation is disabled or not initialized */
-echo_cancel_state_t *call_get_echo_state(int callref)
+/* ===== Echo Suppressor Functions ===== */
+
+/* Get echo suppressor wrapper for a callref */
+echo_suppressor_wrapper_t *call_get_echo_suppressor_wrapper(int callref)
 {
 	process_t *process = get_process(callref);
 	
-	if (!process || !process->echo_cancel_enabled || !process->echo_cancel.echo_state)
+	if (!process || !process->echo_suppressor_enabled || !process->echo_suppressor.suppressor_state)
 		return NULL;
 	
-	return &process->echo_cancel;
+	return &process->echo_suppressor;
 }
 
-/* Initialize echo cancellation for a process */
-static int call_echo_init(process_t *process, int sample_rate, int frame_size, int filter_length_ms)
+/* Initialize echo suppressor for a process */
+static int call_echo_suppressor_init(process_t *process, int sample_rate, int frame_size)
 {
-	int filter_length_samples;
-	echo_cancel_state_t *echo;
+	echo_suppressor_wrapper_t *supp;
 	
-	if (!process->echo_cancel_enabled)
+	if (!process->echo_suppressor_enabled)
 		return 0;
 	
-	echo = &process->echo_cancel;
+	supp = &process->echo_suppressor;
 	
-	if (filter_length_ms == 0)
-		filter_length_ms = 500;
-	
-	filter_length_samples = (filter_length_ms * sample_rate) / 1000;
-	
-	echo->echo_state = speex_echo_state_init(frame_size, filter_length_samples);
-	if (!echo->echo_state) {
-		LOGP(DCALL, LOGL_ERROR, "Failed to initialize echo canceller\n");
-		process->echo_cancel_enabled = 0;
+	supp->suppressor_state = echo_suppressor_init(sample_rate, frame_size, &echo_suppressor_config);
+	if (!supp->suppressor_state) {
+		LOGP(DECHO, LOGL_ERROR, "Failed to initialize echo suppressor\n");
+		process->echo_suppressor_enabled = 0;
 		return -1;
 	}
 	
-	speex_echo_ctl(echo->echo_state, SPEEX_ECHO_SET_SAMPLING_RATE, &sample_rate);
-	
-	echo->tx_buf = calloc(frame_size, sizeof(int16_t));
-	echo->rx_buf = calloc(frame_size, sizeof(int16_t));
-	echo->out_buf = calloc(frame_size, sizeof(int16_t));
-	
-	if (!echo->tx_buf || !echo->rx_buf || !echo->out_buf) {
-		LOGP(DCALL, LOGL_ERROR, "Failed to allocate echo canceller buffers\n");
-		if (echo->tx_buf) free(echo->tx_buf);
-		if (echo->rx_buf) free(echo->rx_buf);
-		if (echo->out_buf) free(echo->out_buf);
-		speex_echo_state_destroy(echo->echo_state);
-		process->echo_cancel_enabled = 0;
-		return -1;
-	}
-	
-	echo->tx_pos = 0;
-	echo->rx_pos = 0;
-	echo->echo_frame_size = frame_size;
-	echo->last_tx_level_db = -100.0;
-	echo->tx_frames = 0;
-	echo->rx_frames = 0;
-	echo->tx_samples = 0;
-	echo->rx_samples = 0;
-	
-	/* Initialize preprocessor for residual echo suppression */
-	echo->preprocess = speex_preprocess_state_init(frame_size, sample_rate);
-	if (echo->preprocess) {
-		int tmp;
-		float agc_level;
-		speex_preprocess_ctl(echo->preprocess, SPEEX_PREPROCESS_SET_ECHO_STATE, echo->echo_state);
-		/* Moderate suppression - balance between echo removal and artifacts */
-		tmp = -30;  /* Suppress residual echo by 30dB when no near-end speech */
-		speex_preprocess_ctl(echo->preprocess, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &tmp);
-		tmp = -12;  /* Suppress by 12dB during double-talk */
-		speex_preprocess_ctl(echo->preprocess, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &tmp);
-		tmp = 0;
-		speex_preprocess_ctl(echo->preprocess, SPEEX_PREPROCESS_SET_DENOISE, &tmp);
-		/* Enable AGC to prevent saturation */
-		tmp = 1;
-		speex_preprocess_ctl(echo->preprocess, SPEEX_PREPROCESS_SET_AGC, &tmp);
-		agc_level = 8000.0f;  /* Target RMS level */
-		speex_preprocess_ctl(echo->preprocess, SPEEX_PREPROCESS_SET_AGC_LEVEL, &agc_level);
-		LOGP(DCALL, LOGL_INFO, "Preprocessor initialized with AGC and residual echo suppression\n");
-	}
-	
-	LOGP(DCALL, LOGL_INFO, "Echo canceller initialized (async API): frame=%d, filter=%d (%dms), M=%d blocks @ %dHz\n",
-	     frame_size, filter_length_samples, filter_length_ms,
-	     (filter_length_samples + frame_size - 1) / frame_size, sample_rate);
+	LOGP(DECHO, LOGL_INFO, "Echo suppressor initialized: threshold=%.1fdB atten=%.1fdB hangover=%dms delay=%dms\n",
+	     echo_suppressor_config.threshold_db, echo_suppressor_config.attenuation_db,
+	     echo_suppressor_config.hangover_ms, echo_suppressor_config.echo_delay_ms);
 	
 	return 0;
 }
 
-/* Calculate RMS level in dB for int16 samples */
-static double calc_level_db(const int16_t *samples, int count)
+/* Process TX samples (far-end reference) through echo suppressor */
+void call_echo_suppressor_tx(int callref, sample_t *samples, int count)
 {
-	double sum = 0;
-	int i;
-	for (i = 0; i < count; i++) {
-		double s = samples[i] / 32768.0;
-		sum += s * s;
-	}
-	if (sum < 1e-10)
-		return -100.0;
-	return 10.0 * log10(sum / count);
-}
-
-/* Buffer TX samples (far-end reference) for echo cancellation
- * 
- * Using ASYNC API: speex_echo_playback() feeds TX frames into Speex's
- * internal buffer. speex_echo_capture() will use these with adaptive
- * delay estimation for asynchronous TX/RX streams.
- */
-void call_echo_tx_reference(int callref, sample_t *samples, int count)
-{
-	echo_cancel_state_t *echo;
+	echo_suppressor_wrapper_t *supp;
 	int16_t tx_spl[count];
-	int i;
 	
-	echo = call_get_echo_state(callref);
-	if (!echo)
+	supp = call_get_echo_suppressor_wrapper(callref);
+	if (!supp)
 		return;
 	
-	echo->tx_samples += count;
+	/* Convert to int16 */
 	samples_to_int16_speech(tx_spl, samples, count);
 	
-	for (i = 0; i < count; i++) {
-		echo->tx_buf[echo->tx_pos++] = tx_spl[i];
-		
-		if (echo->tx_pos == echo->echo_frame_size) {
-			/* Find peak sample */
-			int16_t peak_tx = 0;
-			int j;
-			
-			/* Apply soft limiting to prevent saturation in echo canceller
-			 * Limit to ±16000 (leaving headroom below ±32767) */
-			for (j = 0; j < echo->echo_frame_size; j++) {
-				if (echo->tx_buf[j] > 16000)
-					echo->tx_buf[j] = 16000;
-				else if (echo->tx_buf[j] < -16000)
-					echo->tx_buf[j] = -16000;
-					
-				if (abs(echo->tx_buf[j]) > abs(peak_tx))
-					peak_tx = echo->tx_buf[j];
-			}
-			
-			echo->last_tx_level_db = calc_level_db(echo->tx_buf, echo->echo_frame_size);
-			speex_echo_playback(echo->echo_state, echo->tx_buf);
-			echo->tx_pos = 0;
-			echo->tx_frames++;
-			
-			/* Log first 20 TX frames for timing analysis */
-			if (echo->tx_frames <= 20) {
-				LOGP(DCALL, LOGL_NOTICE, "AEC TX[%lu]: level=%.1fdB peak=%d\n",
-				     echo->tx_frames, echo->last_tx_level_db, peak_tx);
-			}
-		}
-	}
+	/* Process through suppressor */
+	echo_suppressor_process_tx(supp->suppressor_state, tx_spl, count);
+	
+	/* Convert back to sample_t */
+	int16_to_samples_speech(samples, tx_spl, count);
 }
 
-/* Process RX samples (near-end with echo) through echo cancellation */
-void call_echo_rx_process(int callref, sample_t *samples, int count)
+/* Process RX samples (near-end with echo) through echo suppressor */
+void call_echo_suppressor_rx(int callref, sample_t *samples, int count)
 {
-	echo_cancel_state_t *echo;
+	echo_suppressor_wrapper_t *supp;
 	int16_t rx_spl[count];
-	int i, out_pos = 0;
 	
-	echo = call_get_echo_state(callref);
-	if (!echo)
+	supp = call_get_echo_suppressor_wrapper(callref);
+	if (!supp)
 		return;
 	
-	echo->rx_samples += count;
+	/* Convert to int16 */
 	samples_to_int16_speech(rx_spl, samples, count);
 	
-	for (i = 0; i < count; i++) {
-		echo->rx_buf[echo->rx_pos++] = rx_spl[i];
-		
-		if (echo->rx_pos == echo->echo_frame_size) {
-			double rx_level_before, rx_level_after, reduction;
-			speex_echo_stats_t stats;
-			int use_original = 0;
-			int j;
-			
-			/* Apply soft limiting to prevent saturation in echo canceller
-			 * Limit to ±16000 (leaving headroom below ±32767) */
-			for (j = 0; j < echo->echo_frame_size; j++) {
-				if (echo->rx_buf[j] > 16000)
-					echo->rx_buf[j] = 16000;
-				else if (echo->rx_buf[j] < -16000)
-					echo->rx_buf[j] = -16000;
-			}
-			
-			rx_level_before = calc_level_db(echo->rx_buf, echo->echo_frame_size);
-			speex_echo_capture(echo->echo_state, echo->rx_buf, echo->out_buf);
-			
-			/* Re-enable preprocessor for residual echo suppression */
-			if (echo->preprocess)
-				speex_preprocess_run(echo->preprocess, echo->out_buf);
-			
-			speex_echo_get_stats(echo->echo_state, &stats);
-			rx_level_after = calc_level_db(echo->out_buf, echo->echo_frame_size);
-			reduction = rx_level_before - rx_level_after;
-			
-			/* Protection: if output is significantly louder than input (negative reduction),
-			 * the filter is adding noise. Use original input instead.
-			 * Threshold: -3dB means output is ~1.4x louder than input */
-			if (reduction < -3.0) {
-				use_original = 1;
-				memcpy(echo->out_buf, echo->rx_buf, echo->echo_frame_size * sizeof(int16_t));
-				rx_level_after = rx_level_before;
-				reduction = 0.0;
-			}
-			
-			int16_to_samples_speech(samples + out_pos, echo->out_buf, echo->echo_frame_size);
-			out_pos += echo->echo_frame_size;
-			
-			echo->rx_pos = 0;
-			echo->rx_frames++;
-			
-			/* Detailed logging for first 20 frames to diagnose primary echo issue */
-			if (echo->rx_frames <= 20) {
-				/* Find peak sample in RX buffer */
-				int16_t peak_rx = 0;
-				int j;
-				for (j = 0; j < echo->echo_frame_size; j++) {
-					if (abs(echo->rx_buf[j]) > abs(peak_rx))
-						peak_rx = echo->rx_buf[j];
-				}
-				LOGP(DCALL, LOGL_NOTICE, "AEC[%lu]: TX=%.1f RX=%.1f (peak=%d) -> %.1f red=%.1fdB | Sxx=%.0f See=%.0f leak=%.3f %s\n",
-				     echo->rx_frames, echo->last_tx_level_db, rx_level_before, peak_rx, rx_level_after, reduction,
-				     stats.Sxx, stats.See, stats.leak_estimate,
-				     stats.adapted ? "ADAPTED" : "learning");
-			} else if (echo->rx_frames % 50 == 0) {
-				LOGP(DCALL, LOGL_NOTICE, "AEC[%lu]: TX=%.0f RX=%.0f->%.0f red=%.1fdB | ERLE=%.1fdB %s%s\n",
-				     echo->rx_frames, echo->last_tx_level_db, rx_level_before, rx_level_after, reduction,
-				     stats.erle_db, stats.adapted ? "adapted" : "learning",
-				     use_original ? " (bypass)" : "");
-			}
-		}
-	}
+	/* Process through suppressor */
+	echo_suppressor_process_rx(supp->suppressor_state, rx_spl, count);
+	
+	/* Convert back to sample_t */
+	int16_to_samples_speech(samples, rx_spl, count);
 }
 
-/* Cleanup echo cancellation state */
-static void call_echo_cleanup(process_t *process)
+/* Cleanup echo suppressor state */
+static void call_echo_suppressor_cleanup(process_t *process)
 {
-	echo_cancel_state_t *echo;
+	echo_suppressor_wrapper_t *supp;
 	
 	if (!process)
 		return;
 	
-	echo = &process->echo_cancel;
+	supp = &process->echo_suppressor;
 	
-	if (echo->preprocess) {
-		speex_preprocess_state_destroy(echo->preprocess);
-		echo->preprocess = NULL;
-	}
-	
-	if (echo->echo_state) {
-		speex_echo_state_destroy(echo->echo_state);
-		echo->echo_state = NULL;
-	}
-	
-	if (echo->tx_buf) {
-		free(echo->tx_buf);
-		echo->tx_buf = NULL;
-	}
-	
-	if (echo->rx_buf) {
-		free(echo->rx_buf);
-		echo->rx_buf = NULL;
-	}
-	
-	if (echo->out_buf) {
-		free(echo->out_buf);
-		echo->out_buf = NULL;
+	if (supp->suppressor_state) {
+		echo_suppressor_cleanup(supp->suppressor_state);
+		supp->suppressor_state = NULL;
 	}
 }
 
-/* Print echo cancellation statistics */
-static void call_echo_print_stats(process_t *process)
+/* Print echo suppressor statistics */
+static void call_echo_suppressor_print_stats(process_t *process)
 {
-	speex_echo_stats_t stats;
-	echo_cancel_state_t *echo;
-	double tx_rx_ratio;
+	const echo_suppressor_state_t *stats;
+	echo_suppressor_wrapper_t *supp;
 	
-	if (!process || !process->echo_cancel_enabled)
+	if (!process || !process->echo_suppressor_enabled)
 		return;
 	
-	echo = &process->echo_cancel;
-	if (!echo->echo_state)
+	supp = &process->echo_suppressor;
+	if (!supp->suppressor_state)
 		return;
 	
-	speex_echo_get_stats(echo->echo_state, &stats);
+	stats = echo_suppressor_get_stats(supp->suppressor_state);
+	if (!stats)
+		return;
 	
-	/* Calculate TX/RX frame ratio (should be close to 1.0) */
-	tx_rx_ratio = (echo->rx_frames > 0) ? (double)echo->tx_frames / echo->rx_frames : 0;
-	
-	/* Compact periodic stats - one main line with peak block info */
-	LOGP(DCALL, LOGL_NOTICE, "AEC STATS: %s ERLE=%.1fdB leak=%.3f peak=blk%d(%.0fms) | TX=%lu RX=%lu | Sxx=%.0f Sdd=%.0f See=%.0f\n",
-	     stats.adapted ? "ADAPTED" : "LEARNING", stats.erle_db, stats.leak_estimate,
-	     stats.peak_block, stats.peak_block_ms,
-	     echo->tx_frames, echo->rx_frames,
-	     stats.Sxx, stats.Sdd, stats.See);
-	
-	/* Only print warnings when there are actual issues */
-	if (stats.saturated > 0)
-		LOGP(DCALL, LOGL_NOTICE, "AEC WARN: saturation=%d (reduce gain)\n", stats.saturated);
-	if (stats.screwed_up > 0)
-		LOGP(DCALL, LOGL_NOTICE, "AEC WARN: diverged=%d (echo path change?)\n", stats.screwed_up);
-	/* Only warn about not adapted once every 100 frames to reduce spam */
-	if (!stats.adapted && echo->rx_frames > 300 && echo->rx_frames % 100 < 13)
-		LOGP(DCALL, LOGL_NOTICE, "AEC WARN: not adapted after %lu frames (TX may be too quiet)\n", echo->rx_frames);
-	if (fabs(tx_rx_ratio - 1.0) > 0.1 && echo->rx_frames > 100)
-		LOGP(DCALL, LOGL_NOTICE, "AEC WARN: TX/RX ratio %.2f (expect ~1.0)\n", tx_rx_ratio);
+	LOGP(DECHO, LOGL_NOTICE, "SUPP STATS: dir=%s TX=%.1fdB(%.2f) RX=%.1fdB(%.2f) | frames=%lu/%lu changes=%lu doubletalk=%lu\n",
+	     echo_suppressor_direction_name(stats->direction),
+	     stats->tx_energy_smooth, stats->tx_gain,
+	     stats->rx_energy_smooth, stats->rx_gain,
+	     stats->tx_frames, stats->rx_frames,
+	     stats->direction_changes, stats->doubletalk_frames);
 }
 
 static void new_state_process(int callref, enum process_state state)
@@ -730,11 +539,11 @@ void call_up_answer(int callref, const char *connect_id)
 	set_tone_process(callref, TONES_TONE_OFF);
 	new_state_process(callref, PROCESS_CONNECT);
 	
-	/* Initialize echo cancellation if enabled */
+	/* Initialize echo suppressor */
 	process = get_process(callref);
-	if (process && echo_config.enabled) {
-		process->echo_cancel_enabled = 1;
-		call_echo_init(process, 8000, echo_config.frame_size, echo_config.filter_length_ms);
+	if (process && echo_suppressor_config.enabled) {
+		process->echo_suppressor_enabled = 1;
+		call_echo_suppressor_init(process, 8000, 128);
 	}
 }
 
@@ -849,12 +658,12 @@ void call_clock(void)
 
 	call_down_clock();
 
-	/* Print echo stats every 1 second (assuming call_clock is called every 100ms) */
-	if (echo_config.stats_enabled && ++stats_counter >= 10) {  /* 10 * 100ms = 1s */
+	/* Print echo suppressor stats every 1 second (assuming call_clock is called every 100ms) */
+	if (echo_suppressor_config.stats_enabled && ++stats_counter >= 10) {  /* 10 * 100ms = 1s */
 		process_t *p = process_head;
 		while (p) {
-			if (p->echo_cancel_enabled && p->state == PROCESS_CONNECT)
-				call_echo_print_stats(p);
+			if (p->echo_suppressor_enabled && p->state == PROCESS_CONNECT)
+				call_echo_suppressor_print_stats(p);
 			p = p->next;
 		}
 		stats_counter = 0;
@@ -1091,10 +900,10 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		call_down_answer(callref, &tv_meter);
 		indicate_answer_ack(callref);
 		
-		/* Initialize echo cancellation if enabled */
-		if (echo_config.enabled) {
-			process->echo_cancel_enabled = 1;
-			call_echo_init(process, 8000, echo_config.frame_size, echo_config.filter_length_ms);
+		/* Initialize echo suppressor */
+		if (echo_suppressor_config.enabled) {
+			process->echo_suppressor_enabled = 1;
+			call_echo_suppressor_init(process, 8000, 128);
 		}
 		break;
 	case OSMO_CC_MSG_DISC_REQ:

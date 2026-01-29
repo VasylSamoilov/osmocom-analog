@@ -1,7 +1,7 @@
 /*
  * RDS Frame Encoding and Decoding
  *
- * (C) 2025-2026 by osmocom-analog authors
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
  *
  * Frame-level encoding and decoding for RDS groups and blocks.

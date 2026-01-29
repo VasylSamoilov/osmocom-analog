@@ -1,8 +1,13 @@
 /* FFT-based SSB filter - based on SDRangel's fftfilt
  *
- * (C) 2024 
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * Based on SDRangel by Edouard Griffiths, F4EXB
- * License: GPL v3
+ * All Rights Reserved
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  */
 
 #include <stdio.h>
@@ -12,20 +17,7 @@
 #include "ssbfilt.h"
 #include "../libfft/fft.h"
 
-/* Windowed sinc function for filter design */
-static double fsinc(double fc, int i, int len)
-{
-	int len2 = len / 2;
-	if (i == len2)
-		return 2.0 * fc;
-	return sin(2.0 * M_PI * fc * (i - len2)) / (M_PI * (i - len2));
-}
 
-/* Blackman window */
-static double blackman(int i, int len)
-{
-	return 0.42 - 0.50 * cos(2.0 * M_PI * i / len) + 0.08 * cos(4.0 * M_PI * i / len);
-}
 
 /* Calculate log2 of a power-of-2 number */
 static int log2_int(int n)

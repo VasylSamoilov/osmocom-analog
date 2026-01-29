@@ -24,6 +24,7 @@ golay_LDADD = \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm

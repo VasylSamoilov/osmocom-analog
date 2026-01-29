@@ -1,6 +1,6 @@
 /* TX Polyphase channelizer (synthesis/interpolation)
  *
- * (C) 2024 Osmocom-analog contributors
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
  *
  * This program is free software: you can redistribute it and/or modify
