@@ -67,6 +67,11 @@ static double volume = 1.0;
 static int stereo = 0;
 static int rds = 0;
 static int rds2 = 0;
+static int rds_debug = 0;
+static int rds_verbose = 0;
+static int sca_67k = 0;
+static int sca_92k = 0;
+static int am_compandor = 0;
 
 /* global variable to quit main loop */
 int quit = 0;
@@ -139,6 +144,9 @@ static void print_help(const char *arg0)
 	printf("        Give deviation of frequency modulated signal. (default %.0f)\n", deviation);
 	printf(" -I --modulation-index 0..1\n");
 	printf("        Give modulation index of amplitude modulated signal. (default %.0f)\n", modulation_index);
+	printf(" -C --compandor\n");
+	printf("        Enable audio compressor for AM to improve modulation depth.\n");
+	printf("        Uses 2:1 compression with 5ms attack, 200ms recovery.\n");
 	printf(" -E --emphasis <uS> | 0\n");
 	printf("        Use given time constant of pre- and de-emphasis for frequency\n");
 	printf("        modulation. Give 0 to disable emphasis. (default = %.0f uS)\n", time_constant_us);
@@ -149,8 +157,32 @@ static void print_help(const char *arg0)
 	printf(" -S --stereo\n");
 	printf("        Enables stereo carrier for frequency modulated UHF broadcast.\n");
 	printf("        It uses the 'Pilot-tone' system.\n");
+	printf("    --rds\n");
+	printf("        Enables RDS (Radio Data System) 57 kHz subcarrier.\n");
+	printf("        Reserves bandwidth for RDS but does not encode data (placeholder).\n");
+	printf("    --rds2\n");
+	printf("        Enables RDS2 with additional subcarriers up to 80 kHz.\n");
+	printf("    --rds-debug\n");
+	printf("        Enable RDS decoder debug logging (raw hex codes).\n");
+	printf("    --rds-verbose\n");
+	printf("        Enable RDS decoder verbose logging (human-readable interpretation).\n");
+	printf("    --call-sign <WXXX>\n");
+	printf("        Set RBDS Call Sign (e.g. WNYC) to automatically configure PI code.\n");
+	printf("    --pi <HEX>\n");
+	printf("        Set RDS PI code (hexadecimal), overriding preset or call sign.\n");
+	printf("    --sca-67k\n");
+	printf("        Enable 67 kHz SCA (Subsidiary Communications) subcarrier.\n");
+	printf("    --sca-92k\n");
+	printf("        Enable 92 kHz SCA (Subsidiary Communications) subcarrier.\n");
 	printf("    --fast-math\n");
 	printf("        Use fast math approximation for slow CPU / ARM based systems.\n");
+	printf("    --channelizer\n");
+	printf("        Enable Polyphase Channelizer (auto-tunes sampling rate).\n");
+	printf("    --channelizer-rate <rate>\n");
+	printf("        Explicitly set channelizer input processing rate (Hz).\n");
+	printf("    --polyphase-resampler\n");
+	printf("        Use polyphase FIR resampler for audio/signal rate conversion.\n");
+	printf("        Enables bidirectional sample rate conversion with better quality.\n");
 	printf("    --limesdr\n");
 	printf("        Auto-select several required options for LimeSDR\n");
 	printf("    --limesdr-mini\n");
@@ -158,9 +190,24 @@ static void print_help(const char *arg0)
 	sdr_config_print_help();
 }
 
+static int channelizer_rate = 0; /* 0 = disabled */
+static int use_channelizer = 0;
+static int use_polyphase = 0;
+
 #define	OPT_FAST_MATH		1007
+#define	OPT_RDS			1008
+#define	OPT_RDS2		1009
+#define	OPT_SCA_67K		1010
+#define	OPT_SCA_92K		1011
+#define	OPT_RDS_DEBUG		1012
+#define	OPT_RDS_VERBOSE		1013
+#define	OPT_CHANNELIZER		1014
+#define	OPT_CHANNELIZER_RATE	1015
 #define OPT_LIMESDR		1100
 #define OPT_LIMESDR_MINI	1101
+#define OPT_CALL_SIGN		1102
+#define OPT_PI			1103
+#define OPT_POLYPHASE		1104
 
 static void add_options(void)
 {
@@ -176,12 +223,24 @@ static void add_options(void)
 	option_add('B', "bandwidth", 1);
 	option_add('D', "deviation", 1);
 	option_add('I', "modulation-index", 1);
+	option_add('C', "compandor", 0);
 	option_add('E', "emphasis", 1);
 	option_add('V', "volume", 1);
 	option_add('S', "stereo", 0);
+	option_add(OPT_RDS, "rds", 0);
+	option_add(OPT_RDS2, "rds2", 0);
+	option_add(OPT_RDS_DEBUG, "rds-debug", 0);
+	option_add(OPT_RDS_VERBOSE, "rds-verbose", 0);
+	option_add(OPT_SCA_67K, "sca-67k", 0);
+	option_add(OPT_SCA_92K, "sca-92k", 0);
 	option_add(OPT_FAST_MATH, "fast-math", 0);
+	option_add(OPT_CHANNELIZER, "channelizer", 0);
+	option_add(OPT_CHANNELIZER_RATE, "channelizer-rate", 1);
 	option_add(OPT_LIMESDR, "limesdr", 0);
 	option_add(OPT_LIMESDR_MINI, "limesdr-mini", 0);
+	option_add(OPT_CALL_SIGN, "call-sign", 1);
+	option_add(OPT_PI, "pi", 1);
+	option_add(OPT_POLYPHASE, "polyphase-resampler", 0);
         sdr_config_add_options();
 }
 
@@ -244,6 +303,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		}
 		break;
+	case 'C':
+		am_compandor = 1;
+		break;
 	case 'E':
 		time_constant_us = atof(argv[argi]);
 		break;
@@ -253,8 +315,42 @@ static int handle_options(int short_option, int argi, char **argv)
 	case 'S':
 		stereo = 1;
 		break;
+	case OPT_RDS:
+		rds = 1;
+		break;
+	case OPT_RDS2:
+		rds2 = 1;
+		break;
+	case OPT_RDS_DEBUG:
+		rds_debug = 1;
+		break;
+	case OPT_RDS_VERBOSE:
+		rds_verbose = 1;
+		break;
+	case OPT_SCA_67K:
+		sca_67k = 1;
+		break;
+	case OPT_SCA_92K:
+		sca_92k = 1;
+		break;
 	case OPT_FAST_MATH:
 		fast_math = 1;
+		break;
+	case OPT_CHANNELIZER:
+		use_channelizer = 1;
+		break;
+	case OPT_CHANNELIZER_RATE:
+		channelizer_rate = atoi(argv[argi]);
+		use_channelizer = 1;
+		break;
+	case OPT_CALL_SIGN:
+		radio_set_callsign(argv[argi]);
+		break;
+	case OPT_PI:
+		radio_set_pi((uint16_t)strtoul(argv[argi], NULL, 16));
+		break;
+	case OPT_POLYPHASE:
+		use_polyphase = 1;
 		break;
 	case OPT_LIMESDR:
 		{
@@ -299,6 +395,7 @@ int main(int argc, char *argv[])
 	struct termios term, term_orig;
 	int c;
 	int buffer_size;
+	int input_samplerate;
 
 	loglevel = LOGL_DEBUG;
 	logging_init();
@@ -324,7 +421,13 @@ int main(int argc, char *argv[])
 	fm_init(fast_math);
 	am_init(fast_math);
 
-	rc = sdr_configure(dsp_samplerate);
+	/* Determine input samplerate */
+	if (use_channelizer && channelizer_rate > 0)
+		input_samplerate = channelizer_rate;
+	else
+		input_samplerate = dsp_samplerate;
+
+	rc = sdr_configure(input_samplerate);
 	if (rc < 0)
 		return rc;
 	if (rc == 0) {
@@ -332,16 +435,45 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
-	if (modulation == MODULATION_NONE) {
-		fprintf(stderr, "Please select modulation, use '-h' for help!\n");
-		exit(0);
-	}
-
+	/* Set default bandwidth based on modulation type (must be before channelizer rate calc) */
 	if (bandwidth == 0) {
 		if (modulation == MODULATION_FM)
 			bandwidth = bandwidth_fm;
 		else
 			bandwidth = bandwidth_am;
+	}
+
+	/* Auto-calculate optimal input rate if channelizer is used */
+	if (use_channelizer && channelizer_rate == 0) {
+		double signal_bw = 0;
+		
+		/* Calculate signal_bandwidth (what radio.c will use for validation):
+		 * This must match what radio->signal_bandwidth will be set to in radio.c
+		 */
+		if (modulation == MODULATION_FM) {
+			double audio_bw = bandwidth;
+			/* FM broadcast with stereo/RDS needs more bandwidth */
+			if (rds || rds2) audio_bw = 60000.0;
+			else if (stereo) audio_bw = 53000.0;
+			signal_bw = deviation + audio_bw;
+		} else if (modulation == MODULATION_AM_DSB) {
+			/* AM DSB: both sidebands, but signal_bandwidth is just bandwidth */
+			signal_bw = bandwidth;
+		} else {
+			/* AM SSB (USB/LSB): single sideband */
+			signal_bw = bandwidth;
+		}
+
+		if (sdr_config) {
+			input_samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, signal_bw);
+			printf("Channelizer: Auto-selected input rate %d Hz for %.1f kHz signal bandwidth (from SDR %d Hz)\n", 
+			       input_samplerate, signal_bw / 1000.0, sdr_config->samplerate);
+		}
+	}
+
+	if (modulation == MODULATION_NONE) {
+		fprintf(stderr, "Please select modulation, use '-h' for help!\n");
+		exit(0);
 	}
 
 	if (stereo && modulation != MODULATION_FM) {
@@ -360,10 +492,16 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
-	/* now we have buffer size and sample rate */
-	buffer_size = dsp_samplerate * dsp_buffer / 1000;
+	/* now we have buffer size and sample rate 
+	 * buffer size is proportional to INPUT sample rate (SDR rate)
+	 */
+	buffer_size = input_samplerate * dsp_buffer / 1000;
 
-	rc = radio_init(&radio, buffer_size, dsp_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2);
+	/* Set polyphase resampler mode before init */
+	if (use_polyphase)
+		radio_set_polyphase(1);
+
+	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
 		exit(0);
@@ -397,7 +535,7 @@ int main(int argc, char *argv[])
 	tx_frequencies[0] = frequency;
 	rx_frequencies[0] = frequency;
 	am[0] = 0;
-	sdr = sdr_open(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0, dsp_samplerate, buffer_size, 1.0, 0.0, 0.0, 0.0);
+	sdr = sdr_open_channelizer(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0, input_samplerate, buffer_size, 1.0, 0.0, 0.0, 0.0, use_channelizer, fast_math);
 	if (!sdr)
 		goto error;
 	sdr_start(sdr);
@@ -495,6 +633,16 @@ next_char:
 			goto next_char;
 		case 'b':
 			calibrate_bias();
+			goto next_char;
+		case 'd':
+			/* dump RDS status */
+			if (rx && rds)
+				rds_decoder_status(&radio.rds_dec);
+			goto next_char;
+		case 'f':
+			/* cycle RDS presets */
+			if (tx && rds)
+				rds_next_preset(&radio);
 			goto next_char;
 		}
 	}

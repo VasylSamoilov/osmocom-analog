@@ -30,6 +30,7 @@
 #include <osmocom/core/timer.h>
 #ifdef HAVE_SDR
 #include "../libsdr/sdr_config.h"
+#include "../libsdr/split_sdr.h"
 #endif
 
 /* debug time consumption of audio processing */
@@ -119,12 +120,22 @@ int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, dou
 		/* link audio device */
 #ifdef HAVE_SDR
 		if (use_sdr) {
-			sender->audio_open = sdr_open;
-			sender->audio_start = sdr_start;
-			sender->audio_close = sdr_close;
-			sender->audio_read = sdr_read;
-			sender->audio_write = sdr_write;
-			sender->audio_get_tosend = sdr_get_tosend;
+			/* Check for split mode first */
+			if (sdr_config && sdr_config->split_mode) {
+				sender->audio_open = split_sdr_open;
+				sender->audio_start = split_sdr_start;
+				sender->audio_close = split_sdr_close;
+				sender->audio_read = split_sdr_read;
+				sender->audio_write = split_sdr_write;
+				sender->audio_get_tosend = split_sdr_get_tosend;
+			} else {
+				sender->audio_open = sdr_open;
+				sender->audio_start = sdr_start;
+				sender->audio_close = sdr_close;
+				sender->audio_read = sdr_read;
+				sender->audio_write = sdr_write;
+				sender->audio_get_tosend = sdr_get_tosend;
+			}
 		} else
 #endif
 		{

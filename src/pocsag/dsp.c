@@ -70,7 +70,7 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Use %.4f samples for one bit duration @ %d.\n", pocsag->fsk_bitduration, pocsag->sender.samplerate);
 
 	pocsag->fsk_tx_buffer_size = pocsag->fsk_bitduration * 32.0 + 10; /* 32 bit, add some extra to prevent short buffer due to rounding */
-	pocsag->fsk_tx_buffer = calloc(sizeof(sample_t), pocsag->fsk_tx_buffer_size);
+	pocsag->fsk_tx_buffer = calloc(pocsag->fsk_tx_buffer_size, sizeof(sample_t));
 	if (!pocsag->fsk_tx_buffer) {
 		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;

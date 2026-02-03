@@ -164,7 +164,7 @@ int fsk_fm_init(fsk_fm_demod_t *fsk, cnetz_t *cnetz, int samplerate, double bitr
 
 	len = (int)((double)samplerate / bitrate + 0.5);
 	half = (int)((double)samplerate / bitrate / 2.0 + 0.5);
-	fsk->bit_buffer_spl = calloc(sizeof(fsk->bit_buffer_spl[0]), len);
+	fsk->bit_buffer_spl = calloc(len, sizeof(fsk->bit_buffer_spl[0]));
 	if (!fsk->bit_buffer_spl) {
 		LOGP(DDSP, LOGL_ERROR, "No mem!\n");
 		goto error;
@@ -175,7 +175,7 @@ int fsk_fm_init(fsk_fm_demod_t *fsk, cnetz_t *cnetz, int samplerate, double bitr
 	fsk->bits_per_sample = bitrate / (double)samplerate;
 
 	fsk->speech_size = samplerate * 60 / bitrate + 10; /* 60 bits duration, add 10 to be safe */
-	fsk->speech_buffer = calloc(sizeof(fsk->speech_buffer[0]), fsk->speech_size);
+	fsk->speech_buffer = calloc(fsk->speech_size, sizeof(fsk->speech_buffer[0]));
 	if (!fsk->speech_buffer) {
 		LOGP(DDSP, LOGL_ERROR, "No mem!\n");
 		goto error;

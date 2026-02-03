@@ -43,6 +43,7 @@ enum {
 	DMUP,
 	DDCF77,
 	DJITTER,
+	DECHO,
 };
 
 #define DLCC_DEFINED

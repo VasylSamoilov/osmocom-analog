@@ -69,7 +69,7 @@ int dsp_init_sender(gsc_t *gsc, int samplerate, double deviation, double polarit
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Use %.4f samples for one bit duration @ %d.\n", gsc->fsk_bitduration, gsc->sender.samplerate);
 
 	gsc->fsk_tx_buffer_size = gsc->fsk_bitduration + 10; /* 1 bit, add some extra to prevent short buffer due to rounding */
-	gsc->fsk_tx_buffer = calloc(sizeof(sample_t), gsc->fsk_tx_buffer_size);
+	gsc->fsk_tx_buffer = calloc(gsc->fsk_tx_buffer_size, sizeof(sample_t));
 	if (!gsc->fsk_tx_buffer) {
 		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;

@@ -1,4 +1,3 @@
-
 extern const char *selected_config_file;
 char *options_strdup(const char *s);
 void option_add(int short_option, const char *long_option, int parameter_count);

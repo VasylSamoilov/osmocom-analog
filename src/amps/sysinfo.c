@@ -108,10 +108,10 @@ void init_sysinfo(amps_si *si, int cmac, int vmac, int dtx, int dcc, int sid1, i
 	 * The access type message (including this 'bis') must also be included.
 	 */
 	si->acc_type.bis = bis; /* must be clear to ignore B/I bit */
-	si->acc_type.pci_home = 0; /* if set, bscap must also be set */
-	si->acc_type.pci_roam = 0; /* if set, bscap must also be set */
+	si->acc_type.pci_home = 1; /* request protocol capability from home mobiles */
+	si->acc_type.pci_roam = 1; /* request protocol capability from roaming mobiles */
 	si->acc_type.bspc = 0;
-	si->acc_type.bscap = 0;
+	si->acc_type.bscap = 1; /* required when pci_home or pci_roam is set */
 
 	/* access attempt parameters */
 	si->acc_attempt.maxbusy_pgr = 10;

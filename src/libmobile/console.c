@@ -39,6 +39,7 @@
 #include "console.h"
 #include "cause.h"
 #include "../libmobile/call.h"
+#include "../libecho/echo_analysis.h"
 #ifdef HAVE_ALSA
 #include "../libsound/sound.h"
 #endif
@@ -85,6 +86,7 @@ typedef struct console {
 	int number_max_length;	/* number of digits of the longest number to be dialed */
 	int loopback;		/* loopback test for echo */
 	int echo_test;		/* send echo back to mobile phone */
+	echo_analysis_state_t *echo_analysis;	/* echo analysis state */
 	const char *digits;	/* list of dialable digits */
 } console_t;
 
@@ -117,7 +119,7 @@ static void get_test_patterns(int16_t *samples, int length)
 		if (pos >= size)
 			*samples++ = 0;
 		else
-			*samples++ = spl[pos] >> 2;
+			*samples++ = spl[pos];  /* full scale */
 		if (++pos == max)
 			pos = 0;
 	}
@@ -150,6 +152,47 @@ static void up_audio(struct osmo_cc_session_codec *codec, uint8_t marker, uint16
 		if (!jf)
 			return;
 		jitter_save(&console.dejitter, jf);
+		return;
+	}
+	/* if echo analysis is active, process received audio and generate TX tones */
+	if (console.echo_analysis) {
+		sample_t samples[160];
+		int16_t spl[160];
+		uint8_t *decoded_data;
+		int decoded_len;
+		uint8_t *payload_out;
+		int payload_len_out;
+		
+		/* decode received audio */
+		codec->decoder(payload, payload_len, &decoded_data, &decoded_len, &console);
+		if (decoded_len >= 160 * 2) {
+			int16_to_samples_fullscale(samples, (int16_t *)decoded_data, 160);
+		} else {
+			/* Not enough data, use silence */
+			memset(samples, 0, sizeof(samples));
+		}
+		
+		/* process through echo analysis */
+		echo_analysis_process_rx(console.echo_analysis, samples, 160);
+		
+		/* check if analysis is complete */
+		if (echo_analysis_is_complete(console.echo_analysis)) {
+			echo_analysis_print_report(console.echo_analysis);
+			echo_analysis_cleanup(console.echo_analysis);
+			console.echo_analysis = NULL;
+			/* After analysis completes, disconnect the call */
+			if (console.callref) {
+				LOGP(DCALL, LOGL_INFO, "Echo analysis complete, disconnecting call\n");
+			}
+			return;
+		}
+		
+		/* generate TX tones for echo analysis */
+		echo_analysis_process_tx(console.echo_analysis, samples, 160);
+		samples_to_int16_fullscale(spl, samples, 160);
+		codec->encoder((uint8_t *)spl, 160 * 2, &payload_out, &payload_len_out, &console);
+		osmo_cc_rtp_send(codec, payload_out, payload_len_out, 0, 1, 160);
+		free(payload_out);
 		return;
 	}
 	/* if echo test is used, send echo back to mobile */
@@ -344,7 +387,7 @@ void console_msg(osmo_cc_call_t *call, osmo_cc_msg_t *msg)
 static char console_text[256];
 static int console_len = 0;
 
-int console_init(const char *audiodev, int samplerate, int buffer, int loopback, int echo_test, const char *digits, const struct number_lengths *lengths, const char *station_id)
+int console_init(const char *audiodev, int samplerate, int buffer, int loopback, int echo_test, int echo_analysis, int echo_analysis_duration, const char *digits, const struct number_lengths *lengths, const char *station_id)
 {
 	int rc = 0;
 	int i;
@@ -370,6 +413,16 @@ int console_init(const char *audiodev, int samplerate, int buffer, int loopback,
 	}
 	if (station_id)
 		strncpy(console.station_id, station_id, sizeof(console.station_id) - 1);
+
+	/* Initialize echo analysis if requested */
+	if (echo_analysis) {
+		console.echo_analysis = echo_analysis_init(echo_analysis_duration, 3);
+		if (!console.echo_analysis) {
+			LOGP(DSENDER, LOGL_ERROR, "Failed to initialize echo analysis!\n");
+			return -ENOMEM;
+		}
+		LOGP(DSENDER, LOGL_NOTICE, "Echo analysis mode enabled (duration: %d seconds)\n", echo_analysis_duration);
+	}
 
 	if (!audiodev[0])
 		return 0;
@@ -441,6 +494,17 @@ void console_cleanup(void)
 	if (console.session) {
 		osmo_cc_free_session(console.session);
 		console.session = NULL;
+	}
+
+	/* cleanup echo analysis if active */
+	if (console.echo_analysis) {
+		/* If echo analysis is still running, print partial report */
+		if (!echo_analysis_is_complete(console.echo_analysis)) {
+			LOGP(DSENDER, LOGL_NOTICE, "\nEcho analysis interrupted - printing partial results:\n");
+			echo_analysis_print_report(console.echo_analysis);
+		}
+		echo_analysis_cleanup(console.echo_analysis);
+		console.echo_analysis = NULL;
 	}
 }
 
@@ -565,6 +629,44 @@ void process_console(int c)
 {
 	if (!console.loopback && console.number_max_length)
 		process_ui(c);
+
+	/* Handle echo analysis mode (no sound device) */
+	/* NOTE: This block is disabled because echo_analysis_process_tx is already called 
+	 * from up_audio() (RX path). Calling it here in the main loop causes TX sample 
+	 * counters to increment uncontrollably fast, breaking synchronization with RX.
+	 */
+	/*
+	if (!console.sound && console.echo_analysis) {
+		// Generate and send TX tones for echo analysis 
+		if (console.callref && console.codec && console.state == CONSOLE_CONNECT) {
+			sample_t samples[160];
+			int16_t spl[160];
+			uint8_t *payload;
+			int payload_len;
+			
+			// Check if analysis is complete 
+			if (echo_analysis_is_complete(console.echo_analysis)) {
+				LOGP(DCALL, LOGL_NOTICE, "\nEcho analysis complete\n");
+				echo_analysis_print_report(console.echo_analysis);
+				echo_analysis_cleanup(console.echo_analysis);
+				console.echo_analysis = NULL;
+				return;
+			}
+			
+			// Generate TX tones 
+			echo_analysis_process_tx(console.echo_analysis, samples, 160);
+			
+			// Convert to int16 and encode 
+			samples_to_int16_fullscale(spl, samples, 160);
+			console.codec->encoder((uint8_t *)spl, 160 * 2, &payload, &payload_len, &console);
+			
+			// Send via RTP 
+			osmo_cc_rtp_send(console.codec, payload, payload_len, 0, 1, 160);
+			free(payload);
+		}
+		return;
+	}
+	*/
 
 	if (!console.sound)
 		return;

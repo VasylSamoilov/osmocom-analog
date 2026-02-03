@@ -23,6 +23,13 @@ extern const char *write_tx_wave;
 extern const char *read_rx_wave;
 extern const char *read_tx_wave;
 
+extern int mobile_amps_param_present;
+extern int mobile_amps_param_screen;
+extern int mobile_amps_param_pitch;
+extern int mobile_amps_param_cadence;
+
+extern char *mobile_amps_param_prefix;
+
 struct number_lengths {
 	int digits;
 	const char *usage;

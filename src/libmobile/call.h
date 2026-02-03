@@ -29,6 +29,7 @@ int call_up_setup(const char *callerid, const char *dialing, uint8_t network, co
 void call_up_alerting(int callref);
 void call_up_early(int callref);
 void call_up_answer(int callref, const char *connect_id);
+void call_up_flash(int callref);
 void call_up_release(int callref, int cause);
 void call_tone_recall(int callref, int on);
 
@@ -41,6 +42,15 @@ void call_down_release(int callref, int cause);
 /* send and receive audio */
 void call_up_audio(int callref, sample_t *samples, int count);
 void call_down_audio(void *decoder, void *decoder_priv, int callref, uint16_t sequence, uint8_t marker, uint32_t timestamp, uint32_t ssrc, uint8_t *payload, int payload_len);
+
+/* echo suppressor (for analog telephony) - wrapper to hold opaque pointer */
+typedef struct {
+	void *suppressor_state;  /* Pointer to echo_suppressor_state_t (opaque) */
+} echo_suppressor_wrapper_t;
+
+echo_suppressor_wrapper_t *call_get_echo_suppressor_wrapper(int callref);
+void call_echo_suppressor_tx(int callref, sample_t *samples, int count);
+void call_echo_suppressor_rx(int callref, sample_t *samples, int count);
 
 /* clock to transmit to */
 void call_clock(void); /* from main loop */

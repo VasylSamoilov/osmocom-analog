@@ -95,6 +95,31 @@ void sdr_config_print_help(void)
 	printf("        Swap RX and TX frequencies for loopback tests over the air.\n");
 	printf("    --sdr-timestamps 1 | 0\n");
 	printf("        Use TX timestamps on UHD device. (default = %d)\n", sdr_config->timestamps);
+	printf("\nSplit device options (mutually exclusive with unified options above):\n");
+	printf("    --sdr-tx-device <args>\n");
+	printf("        TX SDR device arguments (enables split mode)\n");
+	printf("    --sdr-tx-samplerate <rate>\n");
+	printf("        TX sample rate\n");
+	printf("    --sdr-tx-bandwidth <Hz>\n");
+	printf("        TX IF bandwidth\n");
+	printf("    --sdr-tx-lo-offset <Hz>\n");
+	printf("        TX LO frequency offset\n");
+	printf("    --sdr-rx-device <args>\n");
+	printf("        RX SDR device arguments (enables split mode)\n");
+	printf("    --sdr-rx-samplerate <rate>\n");
+	printf("        RX sample rate\n");
+	printf("    --sdr-rx-bandwidth <Hz>\n");
+	printf("        RX IF bandwidth\n");
+	printf("    --sdr-rx-lo-offset <Hz>\n");
+	printf("        RX LO frequency offset\n");
+	printf("\nUpconverter options:\n");
+	printf("    --sdr-upconverter <Hz>\n");
+	printf("        Upconverter offset (Hz) for both TX and RX. Can be positive or negative.\n");
+	printf("        SDR tunes to (target + offset). E.g., 125000000 for Ham-It-Up.\n");
+	printf("    --sdr-tx-upconverter <Hz>\n");
+	printf("        TX-specific upconverter offset (Hz).\n");
+	printf("    --sdr-rx-upconverter <Hz>\n");
+	printf("        RX-specific upconverter offset (Hz).\n");
 }
 
 void sdr_config_print_hotkeys(void)
@@ -124,6 +149,19 @@ void sdr_config_print_hotkeys(void)
 #define	OPT_READ_IQ_TX_WAVE	1517
 #define	OPT_SDR_SWAP_LINKS	1518
 #define	OPT_SDR_TIMESTAMPS	1519
+/* Split device options */
+#define	OPT_SDR_TX_DEVICE	1520
+#define	OPT_SDR_TX_SAMPLERATE	1521
+#define	OPT_SDR_TX_BANDWIDTH	1522
+#define	OPT_SDR_TX_LO_OFFSET	1523
+#define	OPT_SDR_RX_DEVICE	1524
+#define	OPT_SDR_RX_SAMPLERATE	1525
+#define	OPT_SDR_RX_BANDWIDTH	1526
+#define	OPT_SDR_RX_LO_OFFSET	1527
+/* Upconverter options */
+#define	OPT_SDR_UPCONVERTER	1528
+#define	OPT_SDR_TX_UPCONVERTER	1529
+#define	OPT_SDR_RX_UPCONVERTER	1530
 
 void sdr_config_add_options(void)
 {
@@ -147,6 +185,19 @@ void sdr_config_add_options(void)
 	option_add(OPT_READ_IQ_TX_WAVE, "read-iq-tx-wave", 1);
 	option_add(OPT_SDR_SWAP_LINKS, "sdr-swap-links", 0);
 	option_add(OPT_SDR_TIMESTAMPS, "sdr-timestamps", 1);
+	/* Split device options */
+	option_add(OPT_SDR_TX_DEVICE, "sdr-tx-device", 1);
+	option_add(OPT_SDR_TX_SAMPLERATE, "sdr-tx-samplerate", 1);
+	option_add(OPT_SDR_TX_BANDWIDTH, "sdr-tx-bandwidth", 1);
+	option_add(OPT_SDR_TX_LO_OFFSET, "sdr-tx-lo-offset", 1);
+	option_add(OPT_SDR_RX_DEVICE, "sdr-rx-device", 1);
+	option_add(OPT_SDR_RX_SAMPLERATE, "sdr-rx-samplerate", 1);
+	option_add(OPT_SDR_RX_BANDWIDTH, "sdr-rx-bandwidth", 1);
+	option_add(OPT_SDR_RX_LO_OFFSET, "sdr-rx-lo-offset", 1);
+	/* Upconverter options */
+	option_add(OPT_SDR_UPCONVERTER, "sdr-upconverter", 1);
+	option_add(OPT_SDR_TX_UPCONVERTER, "sdr-tx-upconverter", 1);
+	option_add(OPT_SDR_RX_UPCONVERTER, "sdr-rx-upconverter", 1);
 }
 
 int sdr_config_handle_options(int short_option, int argi, char **argv)
@@ -224,6 +275,44 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 	case OPT_SDR_TIMESTAMPS:
 		sdr_config->timestamps = atoi(argv[argi]);
 		break;
+	/* Split device options */
+	case OPT_SDR_TX_DEVICE:
+		sdr_config->tx_device_args = options_strdup(argv[argi]);
+		sdr_config->split_mode = 1;
+		break;
+	case OPT_SDR_TX_SAMPLERATE:
+		sdr_config->tx_samplerate = atoi(argv[argi]);
+		break;
+	case OPT_SDR_TX_BANDWIDTH:
+		sdr_config->tx_bandwidth = atof(argv[argi]);
+		break;
+	case OPT_SDR_TX_LO_OFFSET:
+		sdr_config->tx_lo_offset = atof(argv[argi]);
+		break;
+	case OPT_SDR_RX_DEVICE:
+		sdr_config->rx_device_args = options_strdup(argv[argi]);
+		sdr_config->split_mode = 1;
+		break;
+	case OPT_SDR_RX_SAMPLERATE:
+		sdr_config->rx_samplerate = atoi(argv[argi]);
+		break;
+	case OPT_SDR_RX_BANDWIDTH:
+		sdr_config->rx_bandwidth = atof(argv[argi]);
+		break;
+	case OPT_SDR_RX_LO_OFFSET:
+		sdr_config->rx_lo_offset = atof(argv[argi]);
+		break;
+	/* Upconverter options */
+	case OPT_SDR_UPCONVERTER:
+		sdr_config->tx_upconverter = atof(argv[argi]);
+		sdr_config->rx_upconverter = sdr_config->tx_upconverter;
+		break;
+	case OPT_SDR_TX_UPCONVERTER:
+		sdr_config->tx_upconverter = atof(argv[argi]);
+		break;
+	case OPT_SDR_RX_UPCONVERTER:
+		sdr_config->rx_upconverter = atof(argv[argi]);
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -245,6 +334,25 @@ int sdr_configure(int samplerate)
 	if ((sdr_config->uhd == 1 && sdr_config->soapy == 1)) {
 		fprintf(stderr, "You must choose which one you want: --sdr-uhd or --sdr-soapy\n");
 		exit(0);
+	}
+
+	/* Check mutual exclusivity: unified vs split mode */
+	if (sdr_config->split_mode && sdr_config->device_args[0] != '\0') {
+		fprintf(stderr, "Cannot use --sdr-device-args with --sdr-tx-device or --sdr-rx-device (mutually exclusive)\n");
+		exit(0);
+	}
+
+	/* Validate split mode has at least one device */
+	if (sdr_config->split_mode) {
+		if (!sdr_config->tx_device_args && !sdr_config->rx_device_args) {
+			fprintf(stderr, "Split mode requires at least --sdr-tx-device or --sdr-rx-device\n");
+			exit(0);
+		}
+		/* Default split sample rates to unified rate if not specified */
+		if (sdr_config->tx_samplerate == 0)
+			sdr_config->tx_samplerate = sdr_config->samplerate ? sdr_config->samplerate : samplerate;
+		if (sdr_config->rx_samplerate == 0)
+			sdr_config->rx_samplerate = sdr_config->samplerate ? sdr_config->samplerate : samplerate;
 	}
 
 	if (sdr_config->samplerate == 0)

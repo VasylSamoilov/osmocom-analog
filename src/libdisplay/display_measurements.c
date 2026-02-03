@@ -285,7 +285,7 @@ dispmeasparam_t *display_measurements_add(dispmeas_t *disp, char *name, char *fo
 
 	while (*param_p)
 		param_p = &((*param_p)->next);
-	*param_p = calloc(sizeof(dispmeasparam_t), 1);
+	*param_p = calloc(1, sizeof(dispmeasparam_t));
 	if (!*param_p)
 		return NULL;
 	param = *param_p;

@@ -33,6 +33,7 @@ osmotv_LDADD = \
 if HAVE_SDR
 osmotv_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a
 endif
 

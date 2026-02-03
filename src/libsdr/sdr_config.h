@@ -20,6 +20,19 @@ typedef struct sdr_config {
 	const char	*read_iq_rx_wave;
 	int		swap_links;		/* swap DL and UL frequency */
 	int		timestamps;		/* use time stamps when transmitting */
+	/* Split device mode (mutually exclusive with unified mode above) */
+	int		split_mode;		/* flag: using separate TX/RX devices */
+	const char	*tx_device_args;	/* TX device arguments */
+	int		tx_samplerate;		/* TX sample rate */
+	double		tx_bandwidth;		/* TX IF bandwidth */
+	double		tx_lo_offset;		/* TX LO offset */
+	const char	*rx_device_args;	/* RX device arguments */
+	int		rx_samplerate;		/* RX sample rate */
+	double		rx_bandwidth;		/* RX IF bandwidth */
+	double		rx_lo_offset;		/* RX LO offset */
+	/* Upconverter support (e.g., Ham-It-Up for kHz band reception) */
+	double		tx_upconverter;		/* TX upconverter offset (Hz) */
+	double		rx_upconverter;		/* RX upconverter offset (Hz) */
 } sdr_config_t;
 
 extern sdr_config_t *sdr_config;

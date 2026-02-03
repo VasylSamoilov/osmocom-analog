@@ -747,6 +747,23 @@ static struct def_word pci_report_registration_word = {
 	}
 };
 
+static struct def_word order_confirmation_rvc_word = {
+	"Word 1 - Order Confirmation (RVC)",
+	{
+		{ "F",                1,    0 },
+		{ "NAWC",             2,    0 },
+		{ "T",                1,    0 },
+		{ "LOCAL/MSG TYPE",   5,    AMPS_IE_LOCAL_MSG_TYPE }, /* Fix name to match TIA */
+		{ "ORDQ",             3,    AMPS_IE_ORDQ },
+		{ "ORDER",            5,    AMPS_IE_ORDER },
+		{ "MSPC",             4,    AMPS_IE_MSPC },
+		{ "MSCAP",            3,    AMPS_IE_MSCAP },
+		{ "RSVD",             12,   0 },
+		{ "P",                12,   0 },
+		{ NULL, 0, 0 }
+	}
+};
+
 static struct def_word first_word_of_the_called_address = {
 	"Word D - First Word of the Called-Address (Origination - Voice Service)",
 	{
@@ -1849,7 +1866,7 @@ static const char *ie_digit(uint64_t value)
 	return string;
 }
 
-static const char *ie_mscap(uint64_t value)
+const char *ie_mscap(uint64_t value)
 {
 	switch (value) {
 	case 0:
@@ -1860,7 +1877,7 @@ static const char *ie_mscap(uint64_t value)
 	return "Reserved";
 }
 
-static const char *ie_mspc(uint64_t value)
+const char *ie_mspc(uint64_t value)
 {
 	switch (value) {
 	case 0:
@@ -1956,7 +1973,7 @@ static const char *amps_mpci[4] = {
 	"indicates EIATIA/EIA-136 dual-mode mobile station",
 };
 
-static const char *ie_mpci(uint64_t value)
+const char *ie_mpci(uint64_t value)
 {
 	return amps_mpci[value & 0x3];
 }
@@ -2363,9 +2380,9 @@ struct amps_table4_def {
 	{ "00011", "010", "00000", "Release with Digital Control Channel Information" },
 	{ "00011", "011", "00000", "Release Complete" },
 	{ "00100", "000", "00000", "Reorder" },
-	{ "00101", "000", "XXXXX", "Voice Message Waiting (Message Type field indicates number of messages, 11111 = unknown number of messages waiting)" },
-	{ "00101", "001", "XXXXX", "SMS Message Waiting (Message Type field indicates number of messages, 11111 = unknown number of messages waiting)" },
-	{ "00101", "010", "XXXXX", "G3-Fax Message Waiting (Message Type field indicates number of messages, 11111 = unknown number of messages waiting)" },
+	{ "00101", "000", "XXXXX", "Voice Message Waiting" },
+	{ "00101", "001", "XXXXX", "SMS Message Waiting" },
+	{ "00101", "010", "XXXXX", "G3-Fax Message Waiting" },
 	{ "00110", "000", "00000", "Stop Alert" },
 	{ "00111", "000", "00000", "Audit" },
 	{ "01000", "000", "00000", "Send Called-address" },
@@ -2605,9 +2622,28 @@ static void gen_table4(void)
 	}
 }
 
-static const char *amps_table4_name(uint8_t msg_type, uint8_t ordq, uint8_t order)
+const char *amps_table4_name(uint8_t msg_type, uint8_t ordq, uint8_t order)
 {
+	static char mwi_buffer[80];
 	int i;
+
+	/* Special handling for Message Waiting order (Order 5) to show actual count */
+	if (order == 5 && ordq <= 2) {
+		const char *type_name;
+		switch (ordq) {
+		case 0: type_name = "Voice"; break;
+		case 1: type_name = "SMS"; break;
+		case 2: type_name = "G3-Fax"; break;
+		default: type_name = "Unknown"; break;
+		}
+		if (msg_type == 0)
+			snprintf(mwi_buffer, sizeof(mwi_buffer), "%s Message Waiting: No messages (cleared)", type_name);
+		else if (msg_type == 31)
+			snprintf(mwi_buffer, sizeof(mwi_buffer), "%s Message Waiting: Unknown number of messages", type_name);
+		else
+			snprintf(mwi_buffer, sizeof(mwi_buffer), "%s Message Waiting: %d message%s", type_name, msg_type, msg_type == 1 ? "" : "s");
+		return mwi_buffer;
+	}
 
 	for (i = 0; amps_table4[i].function; i++) {
 //printf("c %d %d %d with %d %d %d\n", msg_type, ordq, order, amps_table4[i].msg_type, amps_table4[i].ordq, amps_table4[i].order);
@@ -2989,6 +3025,75 @@ static uint64_t amps_encode_word2_extended_address_word_b(uint8_t scc, uint16_t 
 	return amps_encode_word(&frame, &word2_extended_address_word_b, 1);
 }
 
+/*
+ * Encode Word 3 - First Directed-Retry Word
+ * Per TIA/EIA-553-A Section 3.7.1.1:
+ * T1T2=10 (2 bits), SCC=11 (2 bits), CHANPOS(7), CHANPOS(7), CHANPOS(7), RSVD=000 (3 bits), P(12)
+ *
+ * Manual encoding because the word definition has multiple CHANPOS fields
+ * that can't be handled by the generic encoder.
+ *
+ * Parameters:
+ *   scc: SAT Color Code (0-3)
+ *   chanpos1, chanpos2, chanpos3: Channel positions (0-127, 0 = unused)
+ */
+static uint64_t amps_encode_word3_directed_retry(uint8_t scc, uint8_t chanpos1, uint8_t chanpos2, uint8_t chanpos3)
+{
+	uint64_t word;
+	
+	/* Build word manually: T1T2(2) + SCC(2) + CHANPOS(7) + CHANPOS(7) + CHANPOS(7) + RSVD(3) = 28 bits */
+	word = 0;
+	word = (word << 2) | (2 & 0x3);           /* T1T2 = 10 */
+	word = (word << 2) | (scc & 0x3);         /* SCC */
+	word = (word << 7) | (chanpos1 & 0x7f);   /* First CHANPOS */
+	word = (word << 7) | (chanpos2 & 0x7f);   /* Second CHANPOS */
+	word = (word << 7) | (chanpos3 & 0x7f);   /* Third CHANPOS */
+	word = (word << 3) | 0;                   /* RSVD = 000 */
+	
+	/* Add BCH parity (12 bits) */
+	word = (word << 12) | encode_bch_binary(word, 28);
+	
+	LOGP(DFRAME, LOGL_INFO, "Transmit: Word 3 - First Directed-Retry Word\n");
+	LOGP(DFRAME, LOGL_DEBUG, "          T1T2: 2 (multiple word)\n");
+	LOGP(DFRAME, LOGL_DEBUG, "           SCC: %d\n", scc);
+	LOGP(DFRAME, LOGL_DEBUG, "       CHANPOS: %d, %d, %d\n", chanpos1, chanpos2, chanpos3);
+	
+	return word;
+}
+
+/*
+ * Encode Word 4 - Second Directed-Retry Word
+ * Per TIA/EIA-553-A Section 3.7.1.1:
+ * T1T2=10 (2 bits), SCC=11 (2 bits), CHANPOS(7), CHANPOS(7), CHANPOS(7), RSVD=000 (3 bits), P(12)
+ *
+ * Parameters:
+ *   scc: SAT Color Code (0-3)
+ *   chanpos4, chanpos5, chanpos6: Channel positions (0-127, 0 = unused)
+ */
+static uint64_t amps_encode_word4_directed_retry(uint8_t scc, uint8_t chanpos4, uint8_t chanpos5, uint8_t chanpos6)
+{
+	uint64_t word;
+	
+	/* Build word manually: T1T2(2) + SCC(2) + CHANPOS(7) + CHANPOS(7) + CHANPOS(7) + RSVD(3) = 28 bits */
+	word = 0;
+	word = (word << 2) | (2 & 0x3);           /* T1T2 = 10 */
+	word = (word << 2) | (scc & 0x3);         /* SCC */
+	word = (word << 7) | (chanpos4 & 0x7f);   /* Fourth CHANPOS */
+	word = (word << 7) | (chanpos5 & 0x7f);   /* Fifth CHANPOS */
+	word = (word << 7) | (chanpos6 & 0x7f);   /* Sixth CHANPOS */
+	word = (word << 3) | 0;                   /* RSVD = 000 */
+	
+	/* Add BCH parity (12 bits) */
+	word = (word << 12) | encode_bch_binary(word, 28);
+	
+	LOGP(DFRAME, LOGL_INFO, "Transmit: Word 4 - Second Directed-Retry Word\n");
+	LOGP(DFRAME, LOGL_DEBUG, "          T1T2: 2 (multiple word)\n");
+	LOGP(DFRAME, LOGL_DEBUG, "           SCC: %d\n", scc);
+	LOGP(DFRAME, LOGL_DEBUG, "       CHANPOS: %d, %d, %d\n", chanpos4, chanpos5, chanpos6);
+	
+	return word;
+}
+
 static uint64_t amps_encode_mobile_station_control_message_word1_a(uint8_t pscc, uint8_t msg_type, uint8_t ordq, uint8_t order)
 {
 	frame_t frame;
@@ -3052,6 +3157,239 @@ static uint64_t amps_encode_wordn_n_minus_1th_alert_with_info_word(const char *c
 	return amps_encode_word(&frame, &wordn_n_minus_1th_alert_with_info_word, 1);
 }
 
+static uint64_t amps_encode_word2_first_flash_with_info_word(uint8_t rl_w, uint8_t cpn_rl, uint8_t pi, uint8_t si)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_RL_W] = rl_w;
+	frame.ie[AMPS_IE_CPN_RL] = cpn_rl;
+	frame.ie[AMPS_IE_PI] = pi;
+	frame.ie[AMPS_IE_SI] = si;
+	return amps_encode_word(&frame, &word2_first_flash_with_info_word, 1);
+}
+
+static uint64_t amps_encode_wordn_n_minus_1th_flash_with_info_word(const char *character)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	if (character[0]) {
+		frame.ie[AMPS_IE_CHARACTER_1] = character[0];
+		if (character[1]) {
+			frame.ie[AMPS_IE_CHARACTER_2] = character[1];
+			if (character[2])
+				frame.ie[AMPS_IE_CHARACTER_3] = character[2];
+		}
+	}
+	return amps_encode_word(&frame, &wordn_n_minus_1th_flash_with_info_word, 1);
+}
+
+/* CRI (Charging Rate Indication) encoding functions for ORDQ=1 */
+
+/* Word 2 for CRI - same structure as character message but with RL_W indicating CRI word count */
+static uint64_t amps_encode_word2_alert_with_info_cri(uint8_t rl_w, uint8_t signal)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_RL_W] = rl_w;      /* Number of CRI words to follow */
+	frame.ie[AMPS_IE_SIGNAL] = signal;  /* Alert signal pitch/cadence */
+	frame.ie[AMPS_IE_CPN_RL] = 0;       /* Not used for CRI */
+	frame.ie[AMPS_IE_PI] = 0;           /* Not used for CRI */
+	frame.ie[AMPS_IE_SI] = 0;           /* Not used for CRI */
+	return amps_encode_word(&frame, &word2_first_alert_with_info_word, 1);
+}
+
+static uint64_t amps_encode_word2_flash_with_info_cri(uint8_t rl_w)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_RL_W] = rl_w;      /* Number of CRI words to follow */
+	frame.ie[AMPS_IE_CPN_RL] = 0;       /* Not used for CRI */
+	frame.ie[AMPS_IE_PI] = 0;           /* Not used for CRI */
+	frame.ie[AMPS_IE_SI] = 0;           /* Not used for CRI */
+	return amps_encode_word(&frame, &word2_first_flash_with_info_word, 1);
+}
+
+/* CRI Word 3 (Second CRI Word) - Elements E1 and E2 (partial) */
+static uint64_t amps_encode_word3_cri(uint8_t e14, uint8_t e13, uint8_t e12, uint8_t e11,
+                                       uint8_t e24, uint8_t e23)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_CRI_E14] = e14;
+	frame.ie[AMPS_IE_CRI_E13] = e13;
+	frame.ie[AMPS_IE_CRI_E12] = e12;
+	frame.ie[AMPS_IE_CRI_E11] = e11;
+	frame.ie[AMPS_IE_CRI_E24] = e24;
+	frame.ie[AMPS_IE_CRI_E23] = e23;
+	return amps_encode_word(&frame, &word3_second_alert_with_info_cri_message_word, 1);
+}
+
+/* CRI Word 4 (Third CRI Word) - Elements E2 (partial) and E3 */
+static uint64_t amps_encode_word4_cri(uint8_t e22, uint8_t e21, uint8_t e34, uint8_t e33,
+                                       uint8_t e32, uint8_t e31)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_CRI_E22] = e22;
+	frame.ie[AMPS_IE_CRI_E21] = e21;
+	frame.ie[AMPS_IE_CRI_E34] = e34;
+	frame.ie[AMPS_IE_CRI_E33] = e33;
+	frame.ie[AMPS_IE_CRI_E32] = e32;
+	frame.ie[AMPS_IE_CRI_E31] = e31;
+	return amps_encode_word(&frame, &word4_third_alert_with_info_cri_message_word, 1);
+}
+
+/* CRI Word 5 (Fourth CRI Word) - Elements E4 and E5 (partial) */
+static uint64_t amps_encode_word5_cri(uint8_t e44, uint8_t e43, uint8_t e42, uint8_t e41,
+                                       uint8_t e54, uint8_t e53)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_CRI_E44] = e44;
+	frame.ie[AMPS_IE_CRI_E43] = e43;
+	frame.ie[AMPS_IE_CRI_E42] = e42;
+	frame.ie[AMPS_IE_CRI_E41] = e41;
+	frame.ie[AMPS_IE_CRI_E54] = e54;
+	frame.ie[AMPS_IE_CRI_E53] = e53;
+	return amps_encode_word(&frame, &word5_alert_with_info_cri_message_word, 1);
+}
+
+/* CRI Word 6 (Fifth CRI Word) - Elements E5 (partial) and E6 */
+static uint64_t amps_encode_word6_cri(uint8_t e52, uint8_t e51, uint8_t e64, uint8_t e63,
+                                       uint8_t e62, uint8_t e61)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_CRI_E52] = e52;
+	frame.ie[AMPS_IE_CRI_E51] = e51;
+	frame.ie[AMPS_IE_CRI_E64] = e64;
+	frame.ie[AMPS_IE_CRI_E63] = e63;
+	frame.ie[AMPS_IE_CRI_E62] = e62;
+	frame.ie[AMPS_IE_CRI_E61] = e61;
+	return amps_encode_word(&frame, &word6_fifth_alert_with_info_cri_mesage_word, 1);
+}
+
+/* CRI Word 7 (Sixth CRI Word) - Elements E7 and E8 (partial) */
+static uint64_t amps_encode_word7_cri(uint8_t e74, uint8_t e73, uint8_t e72, uint8_t e71,
+                                       uint8_t e84, uint8_t e83)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_CRI_E74] = e74;
+	frame.ie[AMPS_IE_CRI_E73] = e73;
+	frame.ie[AMPS_IE_CRI_E72] = e72;
+	frame.ie[AMPS_IE_CRI_E71] = e71;
+	frame.ie[AMPS_IE_CRI_E84] = e84;
+	frame.ie[AMPS_IE_CRI_E83] = e83;
+	return amps_encode_word(&frame, &word7_sixth_alert_with_info_cri_mesage_word, 1);
+}
+
+/* CRI Word 8 (Seventh CRI Word) - Element E8 (partial) */
+static uint64_t amps_encode_word8_cri(uint8_t e82, uint8_t e81)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_CRI_E82] = e82;
+	frame.ie[AMPS_IE_CRI_E81] = e81;
+	return amps_encode_word(&frame, &word8_seventh_alert_with_info_cri_mesage_word, 1);
+}
+
+/* TCI (Total Charging Information) encoding functions for ORDQ=2 */
+
+/* Word 2 for TCI - same structure as character message */
+static uint64_t amps_encode_word2_alert_with_info_tci(uint8_t rl_w, uint8_t signal)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_RL_W] = rl_w;      /* Number of TCI words to follow */
+	frame.ie[AMPS_IE_SIGNAL] = signal;  /* Alert signal pitch/cadence */
+	frame.ie[AMPS_IE_CPN_RL] = 0;       /* Not used for TCI */
+	frame.ie[AMPS_IE_PI] = 0;           /* Not used for TCI */
+	frame.ie[AMPS_IE_SI] = 0;           /* Not used for TCI */
+	return amps_encode_word(&frame, &word2_first_alert_with_info_word, 1);
+}
+
+static uint64_t amps_encode_word2_flash_with_info_tci(uint8_t rl_w)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_RL_W] = rl_w;      /* Number of TCI words to follow */
+	frame.ie[AMPS_IE_CPN_RL] = 0;       /* Not used for TCI */
+	frame.ie[AMPS_IE_PI] = 0;           /* Not used for TCI */
+	frame.ie[AMPS_IE_SI] = 0;           /* Not used for TCI */
+	return amps_encode_word(&frame, &word2_first_flash_with_info_word, 1);
+}
+
+/* TCI Word 3 (Second TCI Word) - Row 1 and Row 2 (partial) */
+static uint64_t amps_encode_word3_tci(uint8_t tci1, uint8_t tci5, uint8_t tci24, uint8_t tci23,
+                                       uint8_t tci22, uint8_t tci21)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_TCI1] = tci1;      /* 7 bits: Row 1 digits 1-4 (partial) */
+	frame.ie[AMPS_IE_TCI5] = tci5;      /* 1 bit: Row 1 digit 4 (partial) */
+	frame.ie[AMPS_IE_TCI24] = tci24;    /* Row 2 digit 4 */
+	frame.ie[AMPS_IE_TCI23] = tci23;    /* Row 2 digit 3 */
+	frame.ie[AMPS_IE_TCI22] = tci22;    /* Row 2 digit 2 */
+	frame.ie[AMPS_IE_TCI21] = tci21;    /* Row 2 digit 1 */
+	return amps_encode_word(&frame, &word3_second_alert_with_info_tci_message_word, 1);
+}
+
+/* TCI Word 4 (Third TCI Word) - Row 3 and Row 4 (partial) */
+static uint64_t amps_encode_word4_tci(uint8_t tci34, uint8_t tci33, uint8_t tci32, uint8_t tci31,
+                                       uint8_t tci44, uint8_t tci43)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_TCI34] = tci34;    /* Row 3 digit 4 */
+	frame.ie[AMPS_IE_TCI33] = tci33;    /* Row 3 digit 3 */
+	frame.ie[AMPS_IE_TCI32] = tci32;    /* Row 3 digit 2 */
+	frame.ie[AMPS_IE_TCI31] = tci31;    /* Row 3 digit 1 */
+	frame.ie[AMPS_IE_TCI44] = tci44;    /* Row 4 digit 4 */
+	frame.ie[AMPS_IE_TCI43] = tci43;    /* Row 4 digit 3 */
+	return amps_encode_word(&frame, &word4_third_alert_with_info_tci_message_word, 1);
+}
+
+/* TCI Word 5 (Fourth TCI Word) - Row 4 (partial) */
+static uint64_t amps_encode_word5_tci(uint8_t tci42, uint8_t tci41)
+{
+	frame_t frame;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.ie[AMPS_IE_T1T2] = 1;
+	frame.ie[AMPS_IE_TCI42] = tci42;    /* Row 4 digit 2 */
+	frame.ie[AMPS_IE_TCI41] = tci41;    /* Row 4 digit 1 */
+	return amps_encode_word(&frame, &word5_alert_with_info_tci_message_word, 1);
+}
+
 /* decoder function of a word */
 static frame_t *amps_decode_word(uint64_t word, struct def_word *w)
 {
@@ -3086,7 +3424,11 @@ static frame_t *amps_decode_word(uint64_t word, struct def_word *w)
 			t4++;
 		if (t4 == 3) {
 			t4 = 0;
-			LOGP(DFRAME, LOGL_DEBUG, " %s--> %s\n", spaces, amps_table4_name(frame.ie[AMPS_IE_LOCAL_MSG_TYPE], frame.ie[AMPS_IE_ORDQ], frame.ie[AMPS_IE_ORDER]));
+			LOGP(DFRAME, LOGL_INFO, " %s--> %s\n", spaces, amps_table4_name(frame.ie[AMPS_IE_LOCAL_MSG_TYPE], frame.ie[AMPS_IE_ORDQ], frame.ie[AMPS_IE_ORDER]));
+			/* Explicitly confirm Audit Order for user visibility */
+			if (frame.ie[AMPS_IE_ORDER] == 7) {
+				LOGP(DFRAME, LOGL_NOTICE, "Received Audit Confirmation (Order 7)\n");
+			}
 		}
 	}
 
@@ -3208,7 +3550,18 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 	static frame_t *frame;
 
 	f = (word >> 47) & 0x1;
-	nawc = (word >> 44) & 0x7;
+	
+	/* NAWC extraction depends on channel type:
+	 * - RECC: 3 bits at position 44-46
+	 * - RVC: 2 bits at position 45-46
+	 */
+	if (amps->chan_type == CHAN_TYPE_VC || amps->chan_type == CHAN_TYPE_CC_PC_VC) {
+		nawc = (word >> 45) & 0x3;  /* RVC: 2 bits */
+	} else {
+		nawc = (word >> 44) & 0x7;  /* RECC: 3 bits */
+	}
+
+	LOGP_CHAN(DFRAME, LOGL_DEBUG, "RECC/RVC Raw Decode: Word=0x%012lx F=%d NAWC=%d ChanType=%d\n", word, f, nawc, amps->chan_type);
 
 	if (first) {
 		memset(amps->rx_recc_dialing, 0, sizeof(amps->rx_recc_dialing));
@@ -3219,13 +3572,21 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 			return 0;
 		}
 	} else {
+		/* Reverse Voice Channel (RVC) messages are often repeated for redundancy.
+		 * Any word with F=1 is the start of a new message (or repetition).
+		 * If we were expecting a continuation (F=0) but get F=1, the previous message is incomplete/lost.
+		 * We must reset and process this new word.
+		 */
 		if (f == 1) {
-			LOGP_CHAN(DFRAME, LOGL_NOTICE, "Received additional word, but F bit is set.\n");
-			return 0;
-		}
-		amps->rx_recc_nawc--;
-		if (amps->rx_recc_nawc != nawc) {
-			LOGP_CHAN(DFRAME, LOGL_NOTICE, "Received additional word with NAWC mismatch!\n");
+			// LOGP_CHAN(DFRAME, LOGL_DEBUG, "Received F=1 word while in continuation mode. Resetting/Starting new message.\n");
+			amps->rx_recc_word_count = 0;
+			amps->rx_recc_nawc = nawc;
+			/* Proceed as first word */
+		} else {
+			amps->rx_recc_nawc--;
+			if (amps->rx_recc_nawc != nawc) {
+				LOGP_CHAN(DFRAME, LOGL_NOTICE, "Received additional word with NAWC mismatch!\n");
+			}
 		}
 	}
 
@@ -3236,48 +3597,331 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		return 0;
 	}
 
-	if (msg_count == 0)
-		w = &abbreviated_address_word;
+	if (amps->chan_type == CHAN_TYPE_VC || amps->chan_type == CHAN_TYPE_CC_PC_VC) {
+		/* RVC (Voice Channel) Logic
+		 * RVC Format (TIA-553 §2.7.2):
+		 * F(1) NAWC(2) T(1) ...
+		 * Note: NAWC is only 2 bits on RVC (vs 3 on RECC)
+		 * T is at bit 44 (vs 43 on RECC)
+		 */
+		int t = (word >> 44) & 1;
+		int order = (word >> 31) & 0x1F; /* Order is 5 bits at 31-35 */
 
-	if (msg_count == 1)
-		w = &extended_address_word;
+		LOGP_CHAN(DFRAME, LOGL_DEBUG, "  RVC Fields: T=%d Order=%d (0x%x) NAWC=%d\n", t, order, order, nawc);
 
-	if (amps->si.word2.s) {
-		if (msg_count == 2)
-			w = &serial_number_word;
-	} else 
-		msg_count++;
+		/* Check if we're waiting for ESN word (Word 2 of Serial Number Response)
+		 * Word 2 format per TIA/EIA-553-A §2.7.2.1:
+		 * F(1)=0 NAWC(2)=00 T(1) ESN(32) P(12)
+		 * ESN is at bits 43-12 (32 bits)
+		 * F must be 0 (not first word)
+		 * Note: T can be 0 or 1 depending on phone implementation
+		 * Some phones repeat Word 1 before sending Word 2
+		 */
+		if (amps->rx_rvc_esn_pending) {
+			int f = (word >> 47) & 1;
+			/* Raw debug for ESN word */
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "ESN pending - Raw word: 0x%012llx\n", (unsigned long long)word);
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  F=%d NAWC=%d T=%d\n", f, nawc, t);
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  Bits 47-44: %d%d%d%d (F,NAWC,NAWC,T)\n",
+				(int)((word >> 47) & 1), (int)((word >> 46) & 1), 
+				(int)((word >> 45) & 1), (int)((word >> 44) & 1));
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  Bits 43-12 (ESN): 0x%08x\n", (uint32_t)((word >> 12) & 0xFFFFFFFF));
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  Bits 11-0 (P): 0x%03x\n", (uint32_t)(word & 0xFFF));
+			
+			/* Check if this is Word 1 repeated (F=1) - skip it and wait for Word 2 */
+			if (f == 1) {
+				LOGP_CHAN(DFRAME, LOGL_DEBUG, "ESN Word 2: F=1 indicates Word 1 repeat, skipping\n");
+				/* Don't clear pending flag - keep waiting for actual Word 2 */
+				goto done;
+			}
+			
+			/* F=0 means this is Word 2 (continuation word) with ESN */
+			uint32_t esn = (word >> 12) & 0xFFFFFFFF;
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received Serial Number Response Word 2 (ESN=0x%08x)\n", esn);
+			amps->rx_rvc_esn_pending = 0;
+			amps_rx_esn_response(amps, esn);
+			goto done;
+		}
 
-	if (amps->si.word1.auth) {
-		if (msg_count == 3)
-			w = &authentication_word;
-	} else 
-		msg_count++;
+		if (t == 1) {
+			w = &order_confirmation_rvc_word;
+		} else {
+			/* T=0 on RVC means Called-Address message (TIA-553 §2.7.2)
+			 * Format: F(1) NAWC(2) T(1)=0 DIGITS(32) P(12)
+			 * Up to 4 words, each containing 8 digits
+			 */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Called-Address Word %d (T=0, NAWC=%d)\n", 
+				msg_count + 1, nawc);
+			
+			/* Raw debug: show the 48-bit word and extracted digit bits */
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  Raw word: 0x%012llx\n", (unsigned long long)word);
+			/* Extract digit bits manually for debug: bits 43-12 (32 bits of digits) */
+			uint32_t digit_bits = (word >> 12) & 0xFFFFFFFF;
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  Digit bits (32): 0x%08x = %c%c%c%c%c%c%c%c\n",
+				digit_bits,
+				digit2number[(digit_bits >> 28) & 0xF],
+				digit2number[(digit_bits >> 24) & 0xF],
+				digit2number[(digit_bits >> 20) & 0xF],
+				digit2number[(digit_bits >> 16) & 0xF],
+				digit2number[(digit_bits >> 12) & 0xF],
+				digit2number[(digit_bits >> 8) & 0xF],
+				digit2number[(digit_bits >> 4) & 0xF],
+				digit2number[(digit_bits >> 0) & 0xF]);
+			
+			switch (msg_count) {
+			case 0:
+				w = &word1_called_address;
+				break;
+			case 1:
+				w = &word2_called_address;
+				break;
+			case 2:
+				w = &word3_called_address;
+				break;
+			case 3:
+				w = &word4_called_address;
+				break;
+			default:
+				LOGP_CHAN(DFRAME, LOGL_ERROR, "RVC Called-Address: too many words (%d)\n", msg_count);
+				goto done;
+			}
+			
+			/* Decode the word */
+			frame = amps_decode_word(word, w);
+			if (!frame) {
+				LOGP_CHAN(DFRAME, LOGL_ERROR, "Failed to decode RVC Called-Address word\n");
+				goto done;
+			}
+			
+			/* Debug: show raw IE values */
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  Decoded IEs: D1=%d D2=%d D3=%d D4=%d D5=%d D6=%d D7=%d D8=%d\n",
+				(int)frame->ie[AMPS_IE_DIGIT_1], (int)frame->ie[AMPS_IE_DIGIT_2],
+				(int)frame->ie[AMPS_IE_DIGIT_3], (int)frame->ie[AMPS_IE_DIGIT_4],
+				(int)frame->ie[AMPS_IE_DIGIT_5], (int)frame->ie[AMPS_IE_DIGIT_6],
+				(int)frame->ie[AMPS_IE_DIGIT_7], (int)frame->ie[AMPS_IE_DIGIT_8]);
+			
+			/* Extract digits from this word
+			 * Each word contains 8 digits, but they use different IE indices:
+			 * Word 1: DIGIT_1 - DIGIT_8
+			 * Word 2: DIGIT_9 - DIGIT_16
+			 * Word 3: DIGIT_17 - DIGIT_24
+			 * Word 4: DIGIT_25 - DIGIT_32
+			 */
+			int base = msg_count * 8;
+			switch (msg_count) {
+			case 0:
+				amps->rx_recc_dialing[base + 0] = digit2number[frame->ie[AMPS_IE_DIGIT_1]];
+				amps->rx_recc_dialing[base + 1] = digit2number[frame->ie[AMPS_IE_DIGIT_2]];
+				amps->rx_recc_dialing[base + 2] = digit2number[frame->ie[AMPS_IE_DIGIT_3]];
+				amps->rx_recc_dialing[base + 3] = digit2number[frame->ie[AMPS_IE_DIGIT_4]];
+				amps->rx_recc_dialing[base + 4] = digit2number[frame->ie[AMPS_IE_DIGIT_5]];
+				amps->rx_recc_dialing[base + 5] = digit2number[frame->ie[AMPS_IE_DIGIT_6]];
+				amps->rx_recc_dialing[base + 6] = digit2number[frame->ie[AMPS_IE_DIGIT_7]];
+				amps->rx_recc_dialing[base + 7] = digit2number[frame->ie[AMPS_IE_DIGIT_8]];
+				break;
+			case 1:
+				amps->rx_recc_dialing[base + 0] = digit2number[frame->ie[AMPS_IE_DIGIT_9]];
+				amps->rx_recc_dialing[base + 1] = digit2number[frame->ie[AMPS_IE_DIGIT_10]];
+				amps->rx_recc_dialing[base + 2] = digit2number[frame->ie[AMPS_IE_DIGIT_11]];
+				amps->rx_recc_dialing[base + 3] = digit2number[frame->ie[AMPS_IE_DIGIT_12]];
+				amps->rx_recc_dialing[base + 4] = digit2number[frame->ie[AMPS_IE_DIGIT_13]];
+				amps->rx_recc_dialing[base + 5] = digit2number[frame->ie[AMPS_IE_DIGIT_14]];
+				amps->rx_recc_dialing[base + 6] = digit2number[frame->ie[AMPS_IE_DIGIT_15]];
+				amps->rx_recc_dialing[base + 7] = digit2number[frame->ie[AMPS_IE_DIGIT_16]];
+				break;
+			case 2:
+				amps->rx_recc_dialing[base + 0] = digit2number[frame->ie[AMPS_IE_DIGIT_17]];
+				amps->rx_recc_dialing[base + 1] = digit2number[frame->ie[AMPS_IE_DIGIT_18]];
+				amps->rx_recc_dialing[base + 2] = digit2number[frame->ie[AMPS_IE_DIGIT_19]];
+				amps->rx_recc_dialing[base + 3] = digit2number[frame->ie[AMPS_IE_DIGIT_20]];
+				amps->rx_recc_dialing[base + 4] = digit2number[frame->ie[AMPS_IE_DIGIT_21]];
+				amps->rx_recc_dialing[base + 5] = digit2number[frame->ie[AMPS_IE_DIGIT_22]];
+				amps->rx_recc_dialing[base + 6] = digit2number[frame->ie[AMPS_IE_DIGIT_23]];
+				amps->rx_recc_dialing[base + 7] = digit2number[frame->ie[AMPS_IE_DIGIT_24]];
+				break;
+			case 3:
+				amps->rx_recc_dialing[base + 0] = digit2number[frame->ie[AMPS_IE_DIGIT_25]];
+				amps->rx_recc_dialing[base + 1] = digit2number[frame->ie[AMPS_IE_DIGIT_26]];
+				amps->rx_recc_dialing[base + 2] = digit2number[frame->ie[AMPS_IE_DIGIT_27]];
+				amps->rx_recc_dialing[base + 3] = digit2number[frame->ie[AMPS_IE_DIGIT_28]];
+				amps->rx_recc_dialing[base + 4] = digit2number[frame->ie[AMPS_IE_DIGIT_29]];
+				amps->rx_recc_dialing[base + 5] = digit2number[frame->ie[AMPS_IE_DIGIT_30]];
+				amps->rx_recc_dialing[base + 6] = digit2number[frame->ie[AMPS_IE_DIGIT_31]];
+				amps->rx_recc_dialing[base + 7] = digit2number[frame->ie[AMPS_IE_DIGIT_32]];
+				break;
+			}
+			
+			LOGP_CHAN(DFRAME, LOGL_INFO, "RVC Called-Address digits so far: '%s'\n", amps->rx_recc_dialing);
+			
+			amps->rx_recc_word_count++;
+			
+			/* Check if this is the last word */
+			if (nawc == 0) {
+				/* All words received - pass to handler */
+				LOGP_CHAN(DFRAME, LOGL_INFO, "RVC Called-Address complete: '%s'\n", amps->rx_recc_dialing);
+				amps_rx_recc(amps, 0, 0, 0, 0, 0, 0, 0, 0, 0, amps->rx_recc_dialing, 0, 0);
+				amps->rx_recc_word_count = 0;
+			}
+			
+			goto done;
+		}
+	} else {
+		/* RECC (Control Channel) Logic */
+		/* NAWC is 3 bits, T is at 43. Existing logic is fine for RECC. */
+		if (msg_count == 0)
+			w = &abbreviated_address_word;
 
-	// FIXME: other messages Word D
-	if (msg_count == 4)
-		w = &first_word_of_the_called_address;
+		if (msg_count == 1)
+			w = &extended_address_word;
 
-	if (msg_count == 5)
-		w = &second_word_of_the_called_address;
+		if (amps->si.word2.s) {
+			if (msg_count == 2)
+				w = &serial_number_word;
+		} else 
+			msg_count++;
 
-	if (msg_count == 6)
-		w = &third_word_of_the_called_address;
+		/* Word C - Authentication Word (if AUTH is set) */
+		/* Word C - Authentication Word (if AUTH is set) */
+		if (amps->si.word1.auth) {
+			/* If this is an Origination (T=1, Order=0) and it's the last word (nawc=0),
+			 * then it MUST be Word D (Digits). Skip Auth logic.
+			 */
+			if (msg_count == 3 && !(amps->rx_recc_t == 1 && amps->rx_recc_order == 0 && nawc == 0)) {
+				// LOGP_CHAN(DFRAME, LOGL_DEBUG, "Decoding Word C (Authentication)\n");
+				w = &authentication_word;
+			} else {
+				if (msg_count == 3)
+					LOGP_CHAN(DFRAME, LOGL_DEBUG, "Skipping Optional Word C (Authentication) in favor of Mandatory Word D (Digits)\n");
+				msg_count++;
+			}
+		} else 
+			msg_count++;
 
-	if (msg_count == 7)
-		w = &fourth_word_of_the_called_address;
+		/* Word C - Protocol Capability Indicator (if PCI_HOME or PCI_ROAM is set) */
+		if (amps->si.acc_type.pci_home || amps->si.acc_type.pci_roam) {
+			/* If this is an Origination (T=1, Order=0) and it's the last word (nawc=0),
+			 * then it MUST be Word D (Digits). Skip PCI logic.
+			 */
+			if (msg_count == 4 && !(amps->rx_recc_t == 1 && amps->rx_recc_order == 0 && nawc == 0)) {
+				// LOGP_CHAN(DFRAME, LOGL_DEBUG, "Decoding Word C (PCI)\n");
+				w = &pci_report_registration_word;
+			} else {
+				if (msg_count == 4)
+					LOGP_CHAN(DFRAME, LOGL_DEBUG, "Skipping Optional Word C (PCI) in favor of Mandatory Word D (Digits)\n");
+				msg_count++;
+			}
+		} else
+			msg_count++;
 
+		/* Word D - First word of called address (Origination) */
+		if (msg_count == 5)
+			w = &first_word_of_the_called_address;
+
+		if (msg_count == 6)
+			w = &second_word_of_the_called_address;
+
+		if (msg_count == 7)
+			w = &third_word_of_the_called_address;
+
+		if (msg_count == 8)
+			w = &fourth_word_of_the_called_address;
+	}
 
 	if (!w) {
-		LOGP_CHAN(DFRAME, LOGL_INFO, "Received Illegal RECC Message\n");
+		/* Log the raw word data at ERROR level for debugging */
+		LOGP_CHAN(DFRAME, LOGL_ERROR, "Received unparseable RECC/RVC message: raw=0x%012llx msg_count=%d\n",
+			(unsigned long long)word, msg_count);
+		if (amps->chan_type == CHAN_TYPE_VC || amps->chan_type == CHAN_TYPE_CC_PC_VC) {
+			int nawc_rvc = (word >> 45) & 0x3;
+			int t = (word >> 44) & 1;
+			int msg_type = (word >> 36) & 0x1F;
+			int ordq = (word >> 33) & 0x7;
+			int order = (word >> 28) & 0x1F;
+			LOGP_CHAN(DFRAME, LOGL_ERROR, "  RVC decode attempt: T=%d NAWC=%d MSG_TYPE=%d ORDQ=%d ORDER=%d\n",
+				t, nawc_rvc, msg_type, ordq, order);
+		}
 		goto done;
 	}
 
 	frame = amps_decode_word(word, w);
 
+	/* RVC Extraction: Any Order Confirmation */
+	if (w == &order_confirmation_rvc_word) {
+		/* Order 26 = PCI Report */
+		if (frame->ie[AMPS_IE_ORDER] == 26) {
+			amps_rx_pci_report(amps, frame->ie[AMPS_IE_MSPC], frame->ie[AMPS_IE_MSCAP]);
+		} else if (frame->ie[AMPS_IE_ORDER] == 3) {
+			/* Order 3 = Release from mobile station */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received Release order from mobile (Order=3 ORDQ=%d) - mobile initiated hangup\n",
+				(int)frame->ie[AMPS_IE_ORDQ]);
+			amps_rx_release_order(amps, frame->ie[AMPS_IE_ORDQ]);
+		} else if (frame->ie[AMPS_IE_ORDER] == 7) {
+			/* Order 7 = Audit confirmation */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: Audit (Order=7 ORDQ=%d)\n",
+				(int)frame->ie[AMPS_IE_ORDQ]);
+		} else if (frame->ie[AMPS_IE_ORDER] == 11) {
+			/* Order 11 = Change Power confirmation */
+			int power_level = (int)frame->ie[AMPS_IE_ORDQ];
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: Change Power to level %d (Order=11 ORDQ=%d)\n",
+				power_level, power_level);
+			LOGP_CHAN(DFRAME, LOGL_NOTICE, "<<< Change Power Confirmed: Level %d -> %s\n",
+				power_level, amps_power_level_name(power_level));
+		} else if (frame->ie[AMPS_IE_ORDER] == 18) {
+			/* Order 18 = Flash With Info confirmation */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: Flash With Info (Order=18 ORDQ=%d)\n",
+				(int)frame->ie[AMPS_IE_ORDQ]);
+		} else if (frame->ie[AMPS_IE_ORDER] == 5) {
+			/* Order 5 = Message Waiting confirmation
+			 * Per TIA/EIA-553-A, mobile sends order confirmation after receiving MWI.
+			 * MSG_TYPE echoes back the message count we sent.
+			 */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: %s (Order=5 ORDQ=%d MSG_TYPE=%d)\n",
+				amps_table4_name((int)frame->ie[AMPS_IE_LOCAL_MSG_TYPE], (int)frame->ie[AMPS_IE_ORDQ], 5),
+				(int)frame->ie[AMPS_IE_ORDQ], (int)frame->ie[AMPS_IE_LOCAL_MSG_TYPE]);
+		} else if (frame->ie[AMPS_IE_ORDER] == 15 && frame->ie[AMPS_IE_ORDQ] == 1) {
+			/* Order 15 with ORDQ=1 = Serial Number Response (Word 1)
+			 * Per TIA/EIA-553-A Table 3.7.1-1:
+			 * - Order 15 (01111) with ORDQ=001 = "Serial Number Request/Response"
+			 * - This is Word 1, Word 2 contains the ESN
+			 * - NAWC indicates how many more words are coming
+			 */
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "ESN Response Word 1 - Raw word: 0x%012llx\n", (unsigned long long)word);
+			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  F=%d NAWC=%d T=%d ORDER=%d ORDQ=%d\n",
+				(int)((word >> 47) & 1), nawc, (int)((word >> 44) & 1),
+				(int)frame->ie[AMPS_IE_ORDER], (int)frame->ie[AMPS_IE_ORDQ]);
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received Serial Number Response Word 1 (Order=15 ORDQ=1 NAWC=%d)\n", nawc);
+			if (nawc > 0) {
+				/* More words coming - set flag to wait for ESN word */
+				amps->rx_rvc_esn_pending = 1;
+				LOGP_CHAN(DFRAME, LOGL_DEBUG, "Waiting for ESN in next word\n");
+			} else {
+				LOGP_CHAN(DFRAME, LOGL_ERROR, "Serial Number Response Word 1 with NAWC=0 - no ESN word!\n");
+			}
+		} else if (frame->ie[AMPS_IE_ORDER] == 15 && frame->ie[AMPS_IE_ORDQ] == 0) {
+			/* Order 15 with ORDQ=0 = Parameter Update Order Confirmation
+			 * Per TIA/EIA-553-A Table 3.7.1-1:
+			 * - Order 15 (01111) with ORDQ=000 = "Parameter Update Order/Confirmation"
+			 * - This is a simple confirmation for parameter updates
+			 * - NOT related to ESN request (that uses ORDQ=1)
+			 */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received Parameter Update Order Confirmation (Order=15 ORDQ=0)\n");
+		} else {
+			/* Unknown/unhandled order - log at ERROR level with full details */
+			LOGP_CHAN(DFRAME, LOGL_ERROR, "Received UNHANDLED RVC Order Confirmation: %s (Order=%d ORDQ=%d MSG_TYPE=%d MSPC=%d MSCAP=%d)\n", 
+				amps_table4_name(0, (int)frame->ie[AMPS_IE_ORDQ], (int)frame->ie[AMPS_IE_ORDER]),
+				(int)frame->ie[AMPS_IE_ORDER], (int)frame->ie[AMPS_IE_ORDQ],
+				(int)frame->ie[AMPS_IE_LOCAL_MSG_TYPE],
+				(int)frame->ie[AMPS_IE_MSPC], (int)frame->ie[AMPS_IE_MSCAP]);
+		}
+		/* RVC messages are individual, reset RECC counter */
+		amps->rx_recc_word_count = 0;
+		goto done;
+	}
+
 	if (amps->rx_recc_word_count == 0 && frame) {
 		amps->rx_recc_min1 = frame->ie[AMPS_IE_MIN1];
 		amps->rx_recc_scm = frame->ie[AMPS_IE_SCM];
+		amps->rx_recc_t = frame->ie[AMPS_IE_T];  /* T field: 1=Origination, 0=Paging Response */
 	}
 	if (amps->rx_recc_word_count == 1 && frame) {
 		amps->rx_recc_min2 = frame->ie[AMPS_IE_MIN2];
@@ -3293,7 +3937,13 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		else
 			amps->rx_recc_esn = 0;
 	}
-	if (msg_count == 4 && frame) {
+	/* Extract MSPC and MSCAP from Word C (PCI) if present */
+	if (msg_count == 4 && frame && (amps->si.acc_type.pci_home || amps->si.acc_type.pci_roam)) {
+		amps->rx_recc_mspc = frame->ie[AMPS_IE_MSPC];
+		amps->rx_recc_mscap = frame->ie[AMPS_IE_MSCAP];
+	}
+	/* Word D - First word of called address (Origination) */
+	if (msg_count == 5 && frame) {
 		amps->rx_recc_dialing[0] = digit2number[frame->ie[AMPS_IE_DIGIT_1]];
 		amps->rx_recc_dialing[1] = digit2number[frame->ie[AMPS_IE_DIGIT_2]];
 		amps->rx_recc_dialing[2] = digit2number[frame->ie[AMPS_IE_DIGIT_3]];
@@ -3303,7 +3953,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		amps->rx_recc_dialing[6] = digit2number[frame->ie[AMPS_IE_DIGIT_7]];
 		amps->rx_recc_dialing[7] = digit2number[frame->ie[AMPS_IE_DIGIT_8]];
 	}
-	if (msg_count == 5 && frame) {
+	if (msg_count == 6 && frame) {
 		amps->rx_recc_dialing[8] = digit2number[frame->ie[AMPS_IE_DIGIT_9]];
 		amps->rx_recc_dialing[9] = digit2number[frame->ie[AMPS_IE_DIGIT_10]];
 		amps->rx_recc_dialing[10] = digit2number[frame->ie[AMPS_IE_DIGIT_11]];
@@ -3313,7 +3963,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		amps->rx_recc_dialing[14] = digit2number[frame->ie[AMPS_IE_DIGIT_15]];
 		amps->rx_recc_dialing[15] = digit2number[frame->ie[AMPS_IE_DIGIT_16]];
 	}
-	if (msg_count == 6 && frame) {
+	if (msg_count == 7 && frame) {
 		amps->rx_recc_dialing[16] = digit2number[frame->ie[AMPS_IE_DIGIT_17]];
 		amps->rx_recc_dialing[17] = digit2number[frame->ie[AMPS_IE_DIGIT_18]];
 		amps->rx_recc_dialing[18] = digit2number[frame->ie[AMPS_IE_DIGIT_19]];
@@ -3323,7 +3973,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		amps->rx_recc_dialing[22] = digit2number[frame->ie[AMPS_IE_DIGIT_23]];
 		amps->rx_recc_dialing[23] = digit2number[frame->ie[AMPS_IE_DIGIT_24]];
 	}
-	if (msg_count == 7 && frame) {
+	if (msg_count == 8 && frame) {
 		amps->rx_recc_dialing[24] = digit2number[frame->ie[AMPS_IE_DIGIT_25]];
 		amps->rx_recc_dialing[25] = digit2number[frame->ie[AMPS_IE_DIGIT_26]];
 		amps->rx_recc_dialing[26] = digit2number[frame->ie[AMPS_IE_DIGIT_27]];
@@ -3338,8 +3988,9 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 
 	if (msg_count >= 3 && amps->rx_recc_nawc == 0) {
 		/* if no digit messages are present, send NULL as dial string (paging reply) */
-		amps_rx_recc(amps, amps->rx_recc_scm, amps->rx_recc_mpci, amps->rx_recc_esn, amps->rx_recc_min1, amps->rx_recc_min2, amps->rx_recc_msg_type, amps->rx_recc_ordq, amps->rx_recc_order, (msg_count > 3) ? amps->rx_recc_dialing : NULL);
+		amps_rx_recc(amps, amps->rx_recc_t, amps->rx_recc_scm, amps->rx_recc_mpci, amps->rx_recc_esn, amps->rx_recc_min1, amps->rx_recc_min2, amps->rx_recc_msg_type, amps->rx_recc_ordq, amps->rx_recc_order, (msg_count > 4) ? amps->rx_recc_dialing : NULL, amps->rx_recc_mspc, amps->rx_recc_mscap);
 	}
+
 
 	amps->rx_recc_word_count++;
 
@@ -3449,7 +4100,7 @@ static void amps_encode_fvc_bits(uint64_t word_a, char *bits)
 
 int amps_encode_frame_focc(amps_t *amps, char *bits)
 {
-	uint64_t word;
+	uint64_t word = 0;
 	int debug = !amps->tx_focc_debugged;
 
 	/* init overhead train */
@@ -3468,6 +4119,7 @@ int amps_encode_frame_focc(amps_t *amps, char *bits)
 		transaction_t *trans;
 		trans = amps_tx_frame_focc(amps);
 		if (trans) {
+			int i;
 			amps->tx_focc_min1 = trans->min1;
 			amps->tx_focc_min2 = trans->min2;
 			amps->tx_focc_msg_type = trans->msg_type;
@@ -3477,6 +4129,19 @@ int amps_encode_frame_focc(amps_t *amps, char *bits)
 			amps->tx_focc_send = 1;
 			amps->tx_focc_word_count = 0;
 			amps->tx_focc_word_repeat = 0;
+			
+			/* Check if this is a Directed Retry (Order 12) - needs 4 words */
+			if (trans->order == 12 && trans->retry_num_channels > 0) {
+				amps->tx_focc_num_words = 4;  /* Word 1, 2, 3, 4 */
+				for (i = 0; i < 6; i++) {
+					amps->tx_focc_retry_channels[i] = (i < trans->retry_num_channels) ? 
+						trans->retry_channels[i] : 0;
+				}
+				amps->tx_focc_retry_num_channels = trans->retry_num_channels;
+			} else {
+				amps->tx_focc_num_words = 2;  /* Normal 2-word message */
+				amps->tx_focc_retry_num_channels = 0;
+			}
 		}
 		/* on change of dsp mode */
 		if (amps->dsp_mode != DSP_MODE_FRAME_RX_FRAME_TX)
@@ -3486,15 +4151,27 @@ int amps_encode_frame_focc(amps_t *amps, char *bits)
 	if (amps->tx_focc_send) {
 		if (amps->tx_focc_word_count == 0)
 			word = amps_encode_word1_abbreviated_address_word(amps->si.dcc, amps->tx_focc_min1, 1);
-		else {
+		else if (amps->tx_focc_word_count == 1) {
 			if (amps->tx_focc_chan)
 				word = amps_encode_word2_extended_address_word_b(amps->sat, amps->tx_focc_min2, amps->si.vmac, amps->tx_focc_chan);
 			else
 				word = amps_encode_word2_extended_address_word_a(amps->tx_focc_min2, amps->tx_focc_msg_type, amps->tx_focc_ordq, amps->tx_focc_order);
+		} else if (amps->tx_focc_word_count == 2) {
+			/* Word 3 - First Directed-Retry Word (channels 1-3) */
+			word = amps_encode_word3_directed_retry(amps->sat,
+				amps->tx_focc_retry_channels[0],
+				amps->tx_focc_retry_channels[1],
+				amps->tx_focc_retry_channels[2]);
+		} else if (amps->tx_focc_word_count == 3) {
+			/* Word 4 - Second Directed-Retry Word (channels 4-6) */
+			word = amps_encode_word4_directed_retry(amps->sat,
+				amps->tx_focc_retry_channels[3],
+				amps->tx_focc_retry_channels[4],
+				amps->tx_focc_retry_channels[5]);
 		}
 		/* dont wrap frame count until we are done */
 		++amps->tx_focc_frame_count;
-		if (++amps->tx_focc_word_count == 2) {
+		if (++amps->tx_focc_word_count == amps->tx_focc_num_words) {
 			amps->tx_focc_word_count = 0;
 			if (++amps->tx_focc_word_repeat == 3) {
 				amps->tx_focc_word_repeat = 0;
@@ -3523,7 +4200,7 @@ send:
 
 int amps_encode_frame_fvc(amps_t *amps, char *bits)
 {
-	uint64_t word;
+	uint64_t word = 0;
 
 	/* see if we can schedule a mobile control message */
 	if (!amps->tx_fvc_send) {
@@ -3535,12 +4212,32 @@ int amps_encode_frame_fvc(amps_t *amps, char *bits)
 			amps->tx_fvc_order = trans->order;
 			amps->tx_fvc_chan = trans->chan;
 			strncpy(amps->tx_fvc_callerid, trans->caller_id, sizeof(amps->tx_fvc_callerid) - 1);
-			amps->tx_fvc_callerid_signal = 1;
-			amps->tx_fvc_callerid_screen = 3;
+			/* Set defaults */
+			amps->tx_fvc_callerid_signal = 1; /* Medium Pitch, Long Cadence */
+			/* ie_signal(1):
+			 * Pitch = (1 >> 6) & 3 = 0 (Medium)
+			 * Cadence = 1 & 0x3f = 1 (Long)
+			 */
+			amps->tx_fvc_callerid_screen = 3; /* Network Provided */
 			if (trans->caller_id[0])
-				amps->tx_fvc_callerid_present = 0;
+				amps->tx_fvc_callerid_present = 0; /* Presentation Allowed */
 			else
-				amps->tx_fvc_callerid_signal = 1;
+				amps->tx_fvc_callerid_present = 2; /* Number Not Available */
+
+			/* Override with custom parameters from transaction if set */
+			if (trans->signal_pitch != -1 || trans->signal_cadence != -1) {
+				int pitch = (trans->signal_pitch != -1) ? trans->signal_pitch : 0;
+				int cadence = (trans->signal_cadence != -1) ? trans->signal_cadence : 1;
+				amps->tx_fvc_callerid_signal = (pitch << 6) | (cadence & 0x3f);
+			}
+			if (trans->presentation_indicator != -1)
+				amps->tx_fvc_callerid_present = trans->presentation_indicator;
+			if (trans->screening_indicator != -1)
+				amps->tx_fvc_callerid_screen = trans->screening_indicator;
+
+			/* Set target SAT for handoff (-1 = use current channel's SAT) */
+			amps->tx_fvc_scc = trans->handoff_scc;
+
 			amps->tx_fvc_send = 1;
 			amps->tx_fvc_word_count = 0;
 			amps->tx_fvc_word_repeat = 0;
@@ -3553,29 +4250,172 @@ int amps_encode_frame_fvc(amps_t *amps, char *bits)
 	/* send scheduled mobile control message */
 	if (amps->tx_fvc_send) {
 		if (amps->tx_fvc_word_count == 0) {
-			if (amps->tx_fvc_chan)
-				word = amps_encode_mobile_station_control_message_word1_b(amps->sat, amps->sat, (amps->si.word2.dtx) ? 1 : 0, 0, 0, amps->si.vmac, amps->tx_fvc_chan);
-			else
+			if (amps->tx_fvc_chan) {
+				uint8_t vmac = amps->si.vmac;
+				uint8_t scc = amps->sat;  /* Default: current channel's SAT */
+				/* Use transaction-specific VMAC if available */
+				if (amps->trans_list && (amps->trans_list->state == TRANS_CALL || amps->trans_list->state == TRANS_CALL_CHANGE_POWER || amps->trans_list->state == TRANS_CALL_CHANGE_POWER_SEND))
+					vmac = amps->trans_list->current_vmac;
+				/* For handoff: use target SAT (tx_fvc_scc) for SCC, current SAT for PSCC
+				 * Per TIA/EIA-553-A:
+				 * - SCC = SAT Color Code of target channel (what mobile tunes to)
+				 * - PSCC = Present SAT Color Code (mobile verifies this matches current)
+				 */
+				if (amps->tx_fvc_scc >= 0) {
+					scc = amps->tx_fvc_scc;
+					LOGP_CHAN(DFRAME, LOGL_INFO, "Transmit: Mobile Station Control Message Word 1 Type B (Handoff)\n");
+					LOGP_CHAN(DFRAME, LOGL_INFO, "    CHAN=%d, SCC=%d (target), PSCC=%d (current), VMAC=%d\n",
+						amps->tx_fvc_chan, scc, amps->sat, vmac);
+				} else {
+					LOGP_CHAN(DFRAME, LOGL_INFO, "Transmit: Mobile Station Control Message Word 1 Type B\n");
+					LOGP_CHAN(DFRAME, LOGL_INFO, "    CHAN=%d, SCC=%d, PSCC=%d, VMAC=%d\n",
+						amps->tx_fvc_chan, scc, amps->sat, vmac);
+				}
+				word = amps_encode_mobile_station_control_message_word1_b(scc, amps->sat, (amps->si.word2.dtx) ? 1 : 0, 0, 0, vmac, amps->tx_fvc_chan);
+			} else
 				word = amps_encode_mobile_station_control_message_word1_a(amps->sat, amps->tx_fvc_msg_type, amps->tx_fvc_ordq, amps->tx_fvc_order);
-			/* done, if we don't have ALERTING with info */
-			if (amps->tx_fvc_order != 17)
+			/* done, if we don't have ALERTING with info or FLASH with info */
+			if (amps->tx_fvc_order != 17 && amps->tx_fvc_order != 18)
 				amps->tx_fvc_send = 0;
 		} else if (amps->tx_fvc_word_count == 1) {
 			int cpn_rl, rl_w;
-			/* number of characters */
-			cpn_rl = strlen(amps->tx_fvc_callerid);
-			/* number of frames that are required to hold number of characters */
-			rl_w = (cpn_rl + 2) / 3;
-			word = amps_encode_word2_first_alert_with_info_word(rl_w, amps->tx_fvc_callerid_signal, cpn_rl, amps->tx_fvc_callerid_present, amps->tx_fvc_callerid_screen);
-			if (cpn_rl == 0)
-				amps->tx_fvc_send = 0;
+			if (amps->tx_fvc_order == 17) {
+				/* Alert With Info - Word 2 */
+				if (amps->tx_fvc_ordq == 0) {
+					/* ORDQ=0: Character message (Caller ID) */
+					cpn_rl = strlen(amps->tx_fvc_callerid);
+					rl_w = (cpn_rl + 2) / 3;
+					word = amps_encode_word2_first_alert_with_info_word(rl_w, amps->tx_fvc_callerid_signal, cpn_rl, amps->tx_fvc_callerid_present, amps->tx_fvc_callerid_screen);
+					if (cpn_rl == 0)
+						amps->tx_fvc_send = 0;
+				} else if (amps->tx_fvc_ordq == 1) {
+					/* ORDQ=1: CRI (Charging Rate Indication) */
+					rl_w = (amps->tx_fvc_cri_elements + 1) / 2 + 1; /* CRI words needed */
+					word = amps_encode_word2_alert_with_info_cri(rl_w, amps->tx_fvc_callerid_signal);
+					if (amps->tx_fvc_cri_elements == 0)
+						amps->tx_fvc_send = 0;
+				} else if (amps->tx_fvc_ordq == 2) {
+					/* ORDQ=2: TCI (Total Charging Information) */
+					rl_w = (amps->tx_fvc_tci_rows + 1) / 2 + 1; /* TCI words needed */
+					word = amps_encode_word2_alert_with_info_tci(rl_w, amps->tx_fvc_callerid_signal);
+					if (amps->tx_fvc_tci_rows == 0)
+						amps->tx_fvc_send = 0;
+				}
+			} else {
+				/* Flash With Info - Word 2 */
+				if (amps->tx_fvc_ordq == 0) {
+					/* ORDQ=0: Character message */
+					cpn_rl = strlen(amps->tx_fvc_flashinfo);
+					rl_w = (cpn_rl + 2) / 3;
+					word = amps_encode_word2_first_flash_with_info_word(rl_w, cpn_rl, amps->tx_fvc_flashinfo_pi, amps->tx_fvc_flashinfo_si);
+					if (cpn_rl == 0)
+						amps->tx_fvc_send = 0;
+				} else if (amps->tx_fvc_ordq == 1) {
+					/* ORDQ=1: CRI (Charging Rate Indication) */
+					rl_w = (amps->tx_fvc_cri_elements + 1) / 2 + 1;
+					word = amps_encode_word2_flash_with_info_cri(rl_w);
+					if (amps->tx_fvc_cri_elements == 0)
+						amps->tx_fvc_send = 0;
+				} else if (amps->tx_fvc_ordq == 2) {
+					/* ORDQ=2: TCI (Total Charging Information) */
+					rl_w = (amps->tx_fvc_tci_rows + 1) / 2 + 1;
+					word = amps_encode_word2_flash_with_info_tci(rl_w);
+					if (amps->tx_fvc_tci_rows == 0)
+						amps->tx_fvc_send = 0;
+				}
+			}
 		} else {
-			const char *callerid;
-			/* chunk of caller ID */
-			callerid = amps->tx_fvc_callerid + (amps->tx_fvc_word_count - 2) * 3;
-			word = amps_encode_wordn_n_minus_1th_alert_with_info_word(callerid);
-			if (strlen(callerid) <= 3)
-				amps->tx_fvc_send = 0;
+			/* Word 3+ encoding depends on ORDQ */
+			if (amps->tx_fvc_ordq == 0) {
+				/* ORDQ=0: Character message words */
+				const char *characters;
+				if (amps->tx_fvc_order == 17) {
+					/* Alert With Info - Word 3+ */
+					characters = amps->tx_fvc_callerid + (amps->tx_fvc_word_count - 2) * 3;
+					word = amps_encode_wordn_n_minus_1th_alert_with_info_word(characters);
+				} else {
+					/* Flash With Info - Word 3+ */
+					characters = amps->tx_fvc_flashinfo + (amps->tx_fvc_word_count - 2) * 3;
+					word = amps_encode_wordn_n_minus_1th_flash_with_info_word(characters);
+				}
+				if (strlen(characters) <= 3)
+					amps->tx_fvc_send = 0;
+			} else if (amps->tx_fvc_ordq == 1) {
+				/* ORDQ=1: CRI words */
+				int cri_word = amps->tx_fvc_word_count - 2; /* 0-based CRI word index */
+				uint8_t *cri = amps->tx_fvc_cri;
+				switch (cri_word) {
+				case 0: /* Word 3: E1 and E2 partial */
+					word = amps_encode_word3_cri(cri[3], cri[2], cri[1], cri[0],
+					                              cri[7], cri[6]);
+					if (amps->tx_fvc_cri_elements <= 2)
+						amps->tx_fvc_send = 0;
+					break;
+				case 1: /* Word 4: E2 partial and E3 */
+					word = amps_encode_word4_cri(cri[5], cri[4], cri[11], cri[10],
+					                              cri[9], cri[8]);
+					if (amps->tx_fvc_cri_elements <= 4)
+						amps->tx_fvc_send = 0;
+					break;
+				case 2: /* Word 5: E4 and E5 partial */
+					word = amps_encode_word5_cri(cri[15], cri[14], cri[13], cri[12],
+					                              cri[19], cri[18]);
+					if (amps->tx_fvc_cri_elements <= 6)
+						amps->tx_fvc_send = 0;
+					break;
+				case 3: /* Word 6: E5 partial and E6 */
+					word = amps_encode_word6_cri(cri[17], cri[16], cri[23], cri[22],
+					                              cri[21], cri[20]);
+					if (amps->tx_fvc_cri_elements <= 6)
+						amps->tx_fvc_send = 0;
+					break;
+				case 4: /* Word 7: E7 and E8 partial */
+					word = amps_encode_word7_cri(cri[27], cri[26], cri[25], cri[24],
+					                              cri[31], cri[30]);
+					if (amps->tx_fvc_cri_elements <= 8)
+						amps->tx_fvc_send = 0;
+					break;
+				case 5: /* Word 8: E8 partial */
+					word = amps_encode_word8_cri(cri[29], cri[28]);
+					amps->tx_fvc_send = 0;
+					break;
+				default:
+					amps->tx_fvc_send = 0;
+					word = 0;
+					break;
+				}
+			} else if (amps->tx_fvc_ordq == 2) {
+				/* ORDQ=2: TCI words */
+				int tci_word = amps->tx_fvc_word_count - 2; /* 0-based TCI word index */
+				uint8_t *tci = amps->tx_fvc_tci;
+				switch (tci_word) {
+				case 0: /* Word 3: Row 1 and Row 2 partial */
+					/* TCI1 is 7 bits containing row 1 digits 1-4 packed */
+					/* TCI5 is 1 bit (MSB of row 1 digit 4) */
+					{
+						uint8_t tci1 = ((tci[0] & 0x0F) << 3) | ((tci[1] & 0x0E) >> 1);
+						uint8_t tci5 = (tci[1] & 0x01);
+						word = amps_encode_word3_tci(tci1, tci5, tci[7], tci[6], tci[5], tci[4]);
+					}
+					if (amps->tx_fvc_tci_rows <= 2)
+						amps->tx_fvc_send = 0;
+					break;
+				case 1: /* Word 4: Row 3 and Row 4 partial */
+					word = amps_encode_word4_tci(tci[11], tci[10], tci[9], tci[8],
+					                              tci[15], tci[14]);
+					if (amps->tx_fvc_tci_rows <= 4)
+						amps->tx_fvc_send = 0;
+					break;
+				case 2: /* Word 5: Row 4 partial */
+					word = amps_encode_word5_tci(tci[13], tci[12]);
+					amps->tx_fvc_send = 0;
+					break;
+				default:
+					amps->tx_fvc_send = 0;
+					word = 0;
+					break;
+				}
+			}
 		}
 		amps->tx_fvc_word_count++;
 	} else
@@ -3725,17 +4565,19 @@ static int amps_decode_bits_recc(amps_t *amps, const char *bits, int first)
 	}
 
 	if (first) {
+	/* result */
+	if (crc_ok_count >= 3) {
 		if (loglevel == LOGL_DEBUG || crc_ok_count > 0) {
 			LOGP_CHAN(DFRAME, LOGL_INFO, "RX RECC: DCC=%d (%d of 5 CRCs are ok)\n", dcc, crc_ok_count);
 			if (dcc != amps->si.dcc) {
-				LOGP(DFRAME, LOGL_INFO, "received DCC=%d mismatches the base station's DCC=%d\n", dcc, amps->si.dcc);
+				LOGP(DFRAME, LOGL_ERROR, "received DCC=%d mismatches the base station's DCC=%d\n", dcc, amps->si.dcc);
 				return 0;
 			}
 		}
-	} else {
-		if (loglevel == LOGL_DEBUG || crc_ok_count > 0)
-			LOGP_CHAN(DFRAME, LOGL_INFO, "RX RECC: (%d of 5 CRCs are ok)\n", crc_ok_count);
+	} else if (crc_ok_count > 0) {
+		LOGP_CHAN(DFRAME, LOGL_NOTICE, "RX RECC: Only %d of 5 CRCs are ok (Minimum 3 required)\n", crc_ok_count);
 	}
+	/* Note: crc_ok_count == 0 is silently ignored - usually SAT tone misinterpreted as FSK */
 	if (loglevel == LOGL_DEBUG) {
 		char text[64];
 
@@ -3744,6 +4586,7 @@ static int amps_decode_bits_recc(amps_t *amps, const char *bits, int first)
 			text[48] = '\0';
 			LOGP_CHAN(DFRAME, LOGL_DEBUG, "  word - %s%s\n", text, (crc_a_ok[i]) ? " ok" : " BAD CRC!");
 		}
+	}
 	}
 
 	if (crc_ok_count > 0)

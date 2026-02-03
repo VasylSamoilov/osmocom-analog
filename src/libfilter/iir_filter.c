@@ -125,8 +125,7 @@ void iir_process(iir_filter_t *filter, sample_t *samples, int length)
 
 	/* process filter */
 	for (i = 0; i < length; i++) {
-		/* add a small value, otherwise this loop will perform really bad on my 'nuedel' machine!!! */
-		in = *samples + 0.000000001;
+		in = *samples;
 		for (j = 0; j < iterations; j++) {
 			out = in * a0 + z1[j];
 			z1[j] = in * a1 + z2[j] - b1 * out;

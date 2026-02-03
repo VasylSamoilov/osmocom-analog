@@ -15,12 +15,15 @@ SUBDIRS = \
 	libhagelbarger \
 	libdtmf \
 	libsamplerate \
+	libpolyphase \
 	libscrambler \
 	libemphasis \
 	libfsk \
 	libam \
 	libfm \
 	libfilter \
+	libchannelizer \
+	libcalibrate \
 	libwave \
 	libfft \
 	libclipper \
@@ -28,7 +31,8 @@ SUBDIRS = \
 	libv27 \
 	libmtp \
 	libaaimage \
-	libtones
+	libtones \
+	libecho
 
 if HAVE_ALSA
 SUBDIRS += \
@@ -61,7 +65,8 @@ SUBDIRS += \
 	magnetic \
 	fuvst \
 	dcf77 \
-	mate
+	mate \
+	osmocalibrate
 
 if HAVE_ALSA
 if HAVE_FUSE

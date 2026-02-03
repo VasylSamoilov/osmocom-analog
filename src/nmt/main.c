@@ -35,9 +35,40 @@
 #include "dsp.h"
 #include "countries.h"
 
+/* SMS FIFOs
+ *
+ * SMS_DELIVER: FIFO to send SMS to mobile stations
+ *   Format: <dest>,<orig>,<message>
+ *   Example: echo "3704021,3735859,Hello" > /tmp/nmt_sms_deliver
+ *
+ * SMS_SUBMIT: File where received SMS from mobile stations are written
+ *   Format: <subscriber>,<rp_orig>,<dest>,<message>
+ *   Where:
+ *     subscriber = Mobile station's NMT number (from call setup)
+ *     rp_orig    = RP-Originator-Address from SMS (may be empty)
+ *     dest       = Destination address
+ *     message    = SMS text
+ */
 #define SMS_DELIVER "/tmp/nmt_sms_deliver"
 #define SMS_SUBMIT "/tmp/nmt_sms_submit"
 static int sms_deliver_fd = -1;
+
+/* MWI (Message Waiting Indicator) control FIFO
+ * See docs/NMT_MWI.md for full documentation.
+ *
+ * Command format: <subscriber>,set,<indicators>
+ *   subscriber: 7-digit NMT number
+ *   indicators: space-separated text (sms voice fax email data) or numeric 0-31
+ *
+ * Examples:
+ *   echo "3735859,set,sms" > /tmp/nmt_mwi
+ *   echo "3735859,set,sms voice" > /tmp/nmt_mwi
+ *   echo "3735859,set,3" > /tmp/nmt_mwi
+ *
+ * Clearing sequence (5c x2 then L(15) x4) is sent per NMT spec 4.4.1.16.
+ */
+#define MWI_DELIVER "/tmp/nmt_mwi"
+static int mwi_deliver_fd = -1;
 
 /* settings */
 int nmt_system = 450;
@@ -221,42 +252,80 @@ error_ta:
 
 static void myhandler(void)
 {
-	static char buffer[256];
-	static int pos = 0, rc, i;
-	int space = sizeof(buffer) - pos;
+	static char sms_buffer[256];
+	static int sms_pos = 0;
+	static char mwi_buffer[256];
+	static int mwi_pos = 0;
+	int rc, i, space;
 
-	rc = read(sms_deliver_fd, buffer + pos, space);
+	/* Handle SMS deliver FIFO */
+	space = sizeof(sms_buffer) - sms_pos;
+	rc = read(sms_deliver_fd, sms_buffer + sms_pos, space);
 	if (rc > 0) {
-		pos += rc;
-		if (pos == space) {
+		sms_pos += rc;
+		if (sms_pos == space) {
 			fprintf(stderr, "SMS buffer overflow!\n");
-			pos = 0;
+			sms_pos = 0;
 		}
 		/* check for end of line */
-		for (i = 0; i < pos; i++) {
-			if (buffer[i] == '\r' || buffer[i] == '\n')
+		for (i = 0; i < sms_pos; i++) {
+			if (sms_buffer[i] == '\r' || sms_buffer[i] == '\n')
 				break;
 		}
 		/* send sms */
-		if (i < pos) {
-			buffer[i] = '\0';
-			pos = 0;
-			deliver_sms(buffer);
+		if (i < sms_pos) {
+			sms_buffer[i] = '\0';
+			sms_pos = 0;
+			deliver_sms(sms_buffer);
+		}
+	}
+
+	/* Handle MWI deliver FIFO */
+	if (mwi_deliver_fd < 0)
+		return;
+	space = sizeof(mwi_buffer) - mwi_pos;
+	rc = read(mwi_deliver_fd, mwi_buffer + mwi_pos, space);
+	if (rc > 0) {
+		mwi_pos += rc;
+		if (mwi_pos == space) {
+			fprintf(stderr, "MWI buffer overflow!\n");
+			mwi_pos = 0;
+		}
+		/* check for end of line */
+		for (i = 0; i < mwi_pos; i++) {
+			if (mwi_buffer[i] == '\r' || mwi_buffer[i] == '\n')
+				break;
+		}
+		/* deliver mwi */
+		if (i < mwi_pos) {
+			mwi_buffer[i] = '\0';
+			mwi_pos = 0;
+			deliver_mwi(mwi_buffer);
 		}
 	}
 }
 
+/* Write received SMS to file
+ * Format: <subscriber>,<rp_orig>,<dest>,<message>
+ * See SMS_SUBMIT comment at top of file for field descriptions.
+ */
 int submit_sms(const char *sms)
 {
 	FILE *fp;
+	int rc;
 
 	fp = fopen(SMS_SUBMIT, "a");
 	if (!fp) {
-		fprintf(stderr, "Failed to open SMS submit file '%s'!\n", SMS_SUBMIT);
+		fprintf(stderr, "Failed to open SMS submit file '%s': %s\n", SMS_SUBMIT, strerror(errno));
 		return -1;
 	}
 
-	fprintf(fp, "%s\n", sms);
+	rc = fprintf(fp, "%s\n", sms);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to write to SMS submit file '%s': %s\n", SMS_SUBMIT, strerror(errno));
+		fclose(fp);
+		return -1;
+	}
 
 	fclose(fp);
 
@@ -386,6 +455,22 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* create pipe for MWI (Message Waiting Indicator) delivery
+	 * See docs/NMT_MWI.md for command format and usage.
+	 */
+	unlink(MWI_DELIVER);
+	rc = mkfifo(MWI_DELIVER, 0666);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to create MWI deliver FIFO '%s'!\n", MWI_DELIVER);
+		goto fail;
+	} else {
+		mwi_deliver_fd = open(MWI_DELIVER, O_RDONLY | O_NONBLOCK);
+		if (mwi_deliver_fd < 0) {
+			fprintf(stderr, "Failed to open MWI deliver FIFO! '%s'\n", MWI_DELIVER);
+			goto fail;
+		}
+	}
+
 	/* inits */
 	fm_init(fast_math);
 	rc = init_frame();
@@ -416,10 +501,13 @@ int main(int argc, char *argv[])
 	main_mobile_loop("nmt", &quit, myhandler, station_id);
 
 fail:
-	/* fifo */
+	/* fifo cleanup */
 	if (sms_deliver_fd > 0)
 		close(sms_deliver_fd);
 	unlink(SMS_DELIVER);
+	if (mwi_deliver_fd > 0)
+		close(mwi_deliver_fd);
+	unlink(MWI_DELIVER);
 
 	/* destroy transceiver instance */
 	while (sender_head)

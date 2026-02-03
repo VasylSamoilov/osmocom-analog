@@ -41,9 +41,11 @@
 #include <string.h>
 #include <errno.h>
 #include <math.h>
+#include <time.h>
 #include <pthread.h>
 #include <SoapySDR/Device.h>
 #include <SoapySDR/Formats.h>
+#include <SoapySDR/Errors.h>
 #include "soapy.h"
 #include "../liblogging/logging.h"
 #include "../liboptions/options.h"
@@ -62,6 +64,27 @@ static long long		rx_timeNs = 0;
 static int			tx_valid = 0;
 static long long		tx_timeNs = 0;
 static long long		Ns_per_sample;
+
+/* Software clock for TX-only or timestamp-free operation */
+static int			software_clock = 0;
+static struct timespec		software_base_ts;
+
+static long long get_software_time_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+	return (ts.tv_sec * 1000000000LL + ts.tv_nsec) -
+	       (software_base_ts.tv_sec * 1000000000LL + software_base_ts.tv_nsec);
+}
+
+static void init_software_clock(void)
+{
+	clock_gettime(CLOCK_MONOTONIC_RAW, &software_base_ts);
+	rx_timeNs = 0;
+	rx_valid = 1;
+	software_clock = 1;
+	LOGP(DSOAPY, LOGL_NOTICE, "Using software clock (may drift relative to SDR sample clock)\n");
+}
 
 static int parse_args(SoapySDRKwargs *args, const char *_args_string)
 {
@@ -437,17 +460,27 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 /* start streaming */
 int soapy_start(void)
 {
-	/* enable rx stream */
-	if (SoapySDRDevice_activateStream(sdr, rxStream, 0, 0, 0) != 0) {
-		LOGP(DSOAPY, LOGL_ERROR, "Failed to issue RX stream command\n");
-		return -EIO;
+	/* enable rx stream if configured */
+	if (rxStream) {
+		if (SoapySDRDevice_activateStream(sdr, rxStream, 0, 0, 0) != 0) {
+			LOGP(DSOAPY, LOGL_ERROR, "Failed to issue RX stream command\n");
+			return -EIO;
+		}
 	}
 
-	/* enable tx stream */
-	if (SoapySDRDevice_activateStream(sdr, txStream, 0, 0, 0) != 0) {
-		LOGP(DSOAPY, LOGL_ERROR, "Failed to issue TX stream command\n");
-		return -EIO;
+	/* enable tx stream if configured */
+	if (txStream) {
+		if (SoapySDRDevice_activateStream(sdr, txStream, 0, 0, 0) != 0) {
+			LOGP(DSOAPY, LOGL_ERROR, "Failed to issue TX stream command\n");
+			return -EIO;
+		}
 	}
+
+	/* TX-only mode: no RX stream to provide clock, use software clock */
+	if (txStream && !rxStream) {
+		init_software_clock();
+	}
+
 	return 0;
 }
 
@@ -524,22 +557,33 @@ int soapy_receive(float *buff, int max)
 	/* read RX stream */
 	buffs_ptr[0] = buff;
 	count = SoapySDRDevice_readStream(sdr, rxStream, buffs_ptr, num_to_read, &flags, &timeNs, 0);
+	if (count == SOAPY_SDR_OVERFLOW) {
+		sdr_rx_overflow = 1;
+		return 0;
+	}
 	if (count > 0) {
 		if (!use_time_stamps || !(flags & SOAPY_SDR_HAS_TIME)) {
-			if (use_time_stamps) {
-				LOGP(DSOAPY, LOGL_ERROR, "SDR RX: No time stamps available. This may cause little gaps and problems with time slot based networks, like C-Netz.\n");
+			if (use_time_stamps && !software_clock) {
+				LOGP(DSOAPY, LOGL_NOTICE, "SDR RX: No hardware timestamps available, falling back to software clock.\n");
+				init_software_clock();
 				use_time_stamps = 0;
 			}
-			timeNs = rx_timeNs;
+			/* Software clock updates rx_timeNs in soapy_get_tosend() */
+			if (!software_clock)
+				timeNs = rx_timeNs;
+			else
+				timeNs = get_software_time_ns();
 		}
 		/* process RX time stamp */
 		if (!rx_valid) {
 			rx_timeNs = timeNs;
 			rx_valid = 1;
 		}
-		pthread_mutex_lock(&timestamp_mutex);
-		if (rx_timeNs != timeNs)
+			pthread_mutex_lock(&timestamp_mutex);
+		if (rx_timeNs != timeNs) {
 			LOGP(DSOAPY, LOGL_ERROR, "SDR RX overflow, seems we are too slow. Use lower SDR sample rate, if this happens too often.\n");
+			sdr_rx_overflow = 1;
+		}
 		rx_timeNs = timeNs + count * Ns_per_sample;
 		pthread_mutex_unlock(&timestamp_mutex);
 	}
@@ -551,6 +595,11 @@ int soapy_receive(float *buff, int max)
 int soapy_get_tosend(int buffer_size)
 {
 	int tosend;
+
+	/* Update software clock if in use (TX-only or no HW timestamps) */
+	if (software_clock) {
+		rx_timeNs = get_software_time_ns();
+	}
 
 	/* if no RX time stamp is set, we must wait until we receive a valid time stamp */
 	if (!rx_valid)

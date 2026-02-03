@@ -2,6 +2,10 @@
 #include "../libmobile/sender.h"
 #include "../libfm/fm.h"
 #include "../libam/am.h"
+#include "../libpolyphase/polyphase.h"
+#include "../libcompandor/compandor.h"
+#include "rds.h"
+#include "sca.h"
 
 enum modulation {
 	MODULATION_NONE = 0,
@@ -55,7 +59,14 @@ typedef struct radio {
 	double		signal_bandwidth;
 	samplerate_t	tx_resampler[2];	/* resampling from audio rate to signal rate (two channels) */
 	samplerate_t	rx_resampler[2];	/* resampling from signal rate to audi rate (two channels) */
-	emphasis_t	fm_emphasis[2];		/* FM pre emphasis */
+	polyphase_t	tx_polyphase[2];	/* polyphase resampler TX (optional) */
+	polyphase_t	rx_polyphase[2];	/* polyphase resampler RX (optional) */
+	int		use_polyphase;		/* use polyphase instead of linear resampler */
+	emphasis_fast_t	fm_emphasis_fast_tx[2];	/* FM pre emphasis TX (optimized 1st-order) */
+	emphasis_fast_t	fm_emphasis_fast_rx[2];	/* FM de emphasis RX (optimized 1st-order) */
+	emphasis_t	fm_emphasis_tx[2];		/* FM pre emphasis TX */
+	emphasis_t	fm_emphasis_rx[2];		/* FM de emphasis RX */
+	dc_filter_fast_t rx_dc_filter[2];	/* RX DC blocking filter */
 	double		fm_deviation;		/* deviation of fm signal */
 	fm_mod_t	fm_mod;			/* FM modulation */
 	fm_demod_t	fm_demod;		/* FM modulation */
@@ -63,27 +74,48 @@ typedef struct radio {
 	double		tx_pilot_phase;		/* current phase of tx sine */
 	double		rx_pilot_phase;		/* current phase of rx mixer */
 	iir_filter_t	tx_dc_removal[2];	/* AM/FM DC level removal */
+	sample_t	tx_dc_prev_x[2], tx_dc_prev_y[2]; /* Manual DC filter state */
 	iir_filter_t	tx_am_bw_limit;		/* AM bandwidth limiter */
 	iir_filter_t	rx_lp_pilot_I;		/* low pass filter for pilot tone extraction */
 	iir_filter_t	rx_lp_pilot_Q;		/* low pass filter for pilot tone extraction */
 	iir_filter_t	rx_lp_sum;		/* filter sum signal of stereo */
 	iir_filter_t	rx_lp_diff;		/* filter differential signal of stereo */
+	double		rx_pll_freq_offset;	/* tracked phase offset (rad) for stereo demod */
+	/* RDS encoder */
+	rds_encoder_t	rds_enc;		/* RDS encoder state */
+	rds_decoder_t	rds_dec;		/* RDS decoder state */
+	/* SCA encoder/decoder */
+	sca_encoder_t	sca_enc;		/* SCA encoder state */
+	sca_decoder_t	sca_dec;		/* SCA decoder state */
+	int		sca_67k;		/* 67 kHz SCA enabled */
+	int		sca_92k;		/* 92 kHz SCA enabled */
 	am_mod_t	am_mod;			/* AM modulation */
 	am_demod_t	am_demod;		/* AM modulation */
+	/* AM compandor (audio compressor for better modulation depth) */
+	int		am_compandor;		/* enable AM compandor */
+	compandor_t	am_compandor_state;	/* compandor state for AM */
 	/* buffers */
 	sample_t	*audio_buffer;
 	int		audio_buffer_size;
-	sample_t	*signal_buffer;
-	uint8_t		*signal_power_buffer;
+	sample_t	*tx_signal_buffer;		/* TX-only signal buffer */
+	sample_t	*rx_signal_buffer;		/* RX-only signal buffer */
+	uint8_t		*signal_power_buffer;		/* TX-only power buffer */
 	int		signal_buffer_size;
-	sample_t	*I_buffer;
+	sample_t	*I_buffer;			/* RX-only I/Q buffers for demodulation */
 	sample_t	*Q_buffer;
-	sample_t	*carrier_buffer;
+	sample_t	*carrier_buffer;		/* RX-only carrier buffer for AM */
 } radio_t;
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2);
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor);
 void radio_exit(radio_t *radio);
 int radio_start(radio_t *radio);
 int radio_tx(radio_t *radio, float *baseband, int num);
 int radio_rx(radio_t *radio, float *baseband, int num);
 
+/* RDS preset switching (press 'f' to cycle) */
+void rds_next_preset(radio_t *radio);
+
+
+void radio_set_callsign(const char *callsign);
+void radio_set_pi(uint16_t pi);
+void radio_set_polyphase(int enable);

@@ -47,9 +47,22 @@ static double deviation = 4500;
 static int deviation_given = 0;
 static double polarity = -1;
 static int polarity_given = 0;
-static enum pocsag_function function = POCSAG_FUNCTION_NUMERIC;
+/* Default function (sub-address) and message type */
+static enum pocsag_function function = POCSAG_FUNCTION_A;
+static enum pocsag_msg_type msg_type = POCSAG_MSG_TYPE_AUTO;
 static const char *message = "1234";
-static char padding = 4;
+/*
+ * Default padding for alphanumeric messages.
+ *
+ * Per POCSAG spec (AN142, CCIR Rec. 584): "Alphanumeric messages should be
+ * padded with null." The spec also notes: "The last codeword is filled with
+ * unprintable characters such as end of message, end of text, or null.
+ * Null is the only character which can be incomplete."
+ *
+ * NULL (0x00) is the correct default per specification. Some legacy pagers
+ * may expect EOT (0x04), which can be selected with --padding 4.
+ */
+static char padding = 0;
 static enum pocsag_language language = LANGUAGE_DEFAULT;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
@@ -70,9 +83,16 @@ void print_help(const char *arg0)
 	printf(" -P --polarity -1 | nagative | 1 | positive\n");
 	printf("        Choose polarity of FFSK signal. 'negative' means that a binary 0 uses\n");
 	printf("        positive and a binary 1 negative deviation. (default %s KHz).\n", (polarity < 0) ? "negative" : "positive");
-	printf(" -F --function 0..3 | A..D | numeric | beep1 | beep2 | alphanumeric\n");
-	printf("        Choose default function when 7 digit only number is dialed.\n");
-	printf("        (default %d = %s)\n", function, pocsag_function_name[function]);
+	printf(" -F --function 0..3 | A..D\n");
+	printf("        Set default sub-address for 7-digit RICs. (default %s)\n", pocsag_function_name[function]);
+	printf(" -y --type auto | tone | numeric | alpha\n");
+	printf("        Set message encoding type. (default %s)\n", pocsag_msg_type_name(msg_type));
+	printf("          auto    - Auto-detect based on message content\n");
+	printf("          tone    - Tone-only (no message content)\n");
+	printf("          numeric - BCD-encoded numeric message\n");
+	printf("                    Valid chars: 0-9 R U <space> - [ ]\n");
+	printf("                    (R=return/received, U=urgent, 5 chars per codeword)\n");
+	printf("          alpha   - 7-bit ASCII alphanumeric message\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Send this message, if no caller ID was given or of built-in console\n");
 	printf("        is used. (default \"%s\").\n", message);
@@ -82,19 +102,35 @@ void print_help(const char *arg0)
 	printf("        Scan through given IDs once (no repetition). This can be useful to find\n");
 	printf("        the RIC of a vintage pager. Note that scanning all RICs from 0 through\n");
 	printf("        2097151 would take about 16.5 Hours at 1200 Baud and known sub RIC.\n");
-	printf("        Use -F to select function of the pager. Short messages with 5 numeric\n");
-	printf("        or 2 alphanumeric characters are sent without increase in scanning\n");
-	printf("        time. The upper 5 digits of the RIC are sent as message, if numeric\n");
-	printf("        function was selected. The upper 3 digits of the RIC are sent as\n");
-	printf("        message (2 digits hexadecimal), if alphanumeric function was selected.\n");
-	printf("    --padding 4 | 0 | ...\n");
-	printf("        Text message padding uses 4 (EOT) by default. Old pagers want 0 (NUL).\n");
+	printf("        Use -F to select sub-address and -y to select message type.\n");
+	printf("        Short messages with 5 numeric or 2 alpha chars are sent without\n");
+	printf("        increase in scanning time.\n");
+	printf("    --padding 0 | 3 | 4 | ...\n");
+	printf("        Padding character for alphanumeric messages (7-bit ASCII, 0-127).\n");
+	printf("        Per POCSAG spec: 'The last codeword is filled with unprintable\n");
+	printf("        characters such as end of message, end of text, or null.'\n");
+	printf("        Recommended: 0 (NUL, default per spec), 3 (ETX), 4 (EOT).\n");
+	printf("        Only NULL can be incomplete (partial bits filled with zeros).\n");
+	printf("\n");
+	printf("RIC (Radio Identity Code) Structure:\n");
+	printf("      The RIC is a 21-bit pager address (0 to 2097151), formed as follows:\n");
+	printf("        - 18 address bits are transmitted in the address codeword (bits 2-19)\n");
+	printf("        - 3 frame bits are derived from the frame position within the batch\n");
+	printf("        - Frame bits are the 3 LSBs (RIC & 7), address bits are upper 18 bits\n");
+	printf("      This allows pagers to power-save by only listening to their frame.\n");
+	printf("      Reserved/Invalid RICs:\n");
+	printf("        - 2097152+     : Out of range (exceeds 21 bits)\n");
+	printf("        - 2007664-2007671: Reserved (address bits match idle codeword pattern)\n");
+	printf("\n");
+	printf("NOTE: Function bits (0-3/A-D) are sub-addresses, NOT message types.\n");
+	printf("      Message encoding (tone/numeric/alpha) is set separately with -y.\n");
 	printf("\n");
 	printf("File: %s\n", MSG_SEND);
-	printf("        Write \"<ric>,0,message\" to it to send a numerical message.\n");
-	printf("        Write \"<ric>,3,message\" to it to send an alphanumerical message.\n");
-	printf("        alphanumeric messages may contain any character except LF and CR.\n");
-	printf("        Any control character can be sent by using pointed brackets:\n");
+	printf("        Write \"<ric>,<function>,<type>,message\" to send a message.\n");
+	printf("        Example: \"1234567,A,numeric,12345\" or \"1234567,0,alpha,Hello\"\n");
+	printf("        Numeric messages: only 0-9 R U <space> - [ ] are valid.\n");
+	printf("        Alphanumeric messages may contain any 7-bit ASCII character.\n");
+	printf("        Use escape sequences for control characters (LF/CR terminate input):\n");
 	printf("          '<NUL>' '<SOH>' '<STX>' '<ETX>' '<EOT>' '<ENQ>' '<ACK>' '<BEL>'\n");
 	printf("          '<BS>'  '<HT>'  '<LF>'  '<VT>'  '<FF>'  '<CR>'  '<SO>'  '<SI>'\n");
 	printf("          '<DLE>  '<DC1>' '<DC2'  '<DC3>' '<DC4>' '<NAK>' '<SYN>' '<ETB>'\n");
@@ -117,6 +153,7 @@ static void add_options(void)
 	option_add('B', "baud-rate", 1);
 	option_add('D', "deviation", 1);
 	option_add('F', "function", 1);
+	option_add('y', "type", 1);
 	option_add('P', "polarity", 1);
 	option_add('M', "message", 1);
 	option_add('L', "language", 0);
@@ -178,10 +215,18 @@ static int handle_options(int short_option, int argi, char **argv)
 	case 'F':
 		rc = pocsag_function_name2value(argv[argi]);
 		if (rc < 0) {
-			fprintf(stderr, "Given function is invalid, use '-h' for help.\n");
+			fprintf(stderr, "Given function is invalid. Use A/B/C/D or 0/1/2/3.\n");
 			return rc;
 		}
 		function = rc;
+		break;
+	case 'y':
+		rc = pocsag_msg_type_name2value(argv[argi]);
+		if (rc < 0) {
+			fprintf(stderr, "Given type is invalid. Use auto/tone/numeric/alpha.\n");
+			return rc;
+		}
+		msg_type = rc;
 		break;
 	case 'M':
 		message = options_strdup(argv[argi++]);
@@ -202,7 +247,27 @@ static int handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 	case OPT_PADDING:
-		padding = atoi(argv[argi++]);
+		/*
+		 * Validate padding character per POCSAG spec (AN142, CCIR Rec. 584):
+		 * "The last codeword is filled with unprintable characters such as
+		 * end of message, end of text, or null."
+		 *
+		 * Must be a 7-bit ASCII value. Recommended values are control
+		 * characters: NUL (0), ETX (3), EOT (4). Printable characters
+		 * (32-126) are discouraged as they may confuse pager displays.
+		 */
+		{
+			int pad_value = atoi(argv[argi++]);
+			if (pad_value < 0 || pad_value > 127) {
+				fprintf(stderr, "Padding must be a 7-bit ASCII value (0-127).\n");
+				return -EINVAL;
+			}
+			if (pad_value >= 32 && pad_value < 127) {
+				fprintf(stderr, "Warning: Padding with printable character '%c' (0x%02X).\n", pad_value, pad_value);
+				fprintf(stderr, "         Per POCSAG spec, padding should be unprintable (NUL, ETX, EOT, etc.).\n");
+			}
+			padding = (char)pad_value;
+		}
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -355,7 +420,7 @@ int main(int argc, char *argv[])
 			printf("Invalid channel '%s', Use '-k list' to get a list of all channels.\n\n", kanal[i]);
 			goto fail;
 		}
-		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
+		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;

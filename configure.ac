@@ -50,6 +50,9 @@ AM_CONDITIONAL(HAVE_SDR, test "x$with_sdr" == "xyes" )
 AM_CONDITIONAL(HAVE_MAGICK6, test "x$with_imagemagick6" == "xyes" )
 AM_CONDITIONAL(HAVE_MAGICK7, test "x$with_imagemagick7" == "xyes" )
 AM_CONDITIONAL(HAVE_FUSE, test "x$with_fuse" == "xyes" )
+dnl FUSE requires 64-bit off_t, add flag for 32-bit systems
+AC_CHECK_SIZEOF([void *])
+AS_IF([test "x$with_fuse" == "xyes" -a "$ac_cv_sizeof_void_p" = "4"],[FUSE_CFLAGS="$FUSE_CFLAGS -D_FILE_OFFSET_BITS=64"])
 AS_IF([test "x$with_alsa" == "xyes"],[AC_MSG_NOTICE( Compiling with Alsa support )], [AC_MSG_NOTICE( Alsa sound card not supported. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
 AS_IF([test "x$with_uhd" == "xyes"],[AC_MSG_NOTICE( Compiling with UHD SDR support )], [AC_MSG_NOTICE( UHD SDR not supported. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
 AS_IF([test "x$with_soapy" == "xyes"],[AC_MSG_NOTICE( Compiling with SoapySDR support )], [AC_MSG_NOTICE( SoapySDR not supported. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
@@ -67,6 +70,7 @@ AC_SUBST([ARFLAGS], [rc])
 AC_CONFIG_FILES([src/liblogging/Makefile
     src/liboptions/Makefile
     src/libmobile/Makefile
+    src/libecho/Makefile
     src/libdisplay/Makefile
     src/libimage/Makefile
     src/libsendevolumenregler/Makefile
@@ -77,12 +81,14 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/libhagelbarger/Makefile
     src/libdtmf/Makefile
     src/libsamplerate/Makefile
+    src/libpolyphase/Makefile
     src/libscrambler/Makefile
     src/libemphasis/Makefile
     src/libfsk/Makefile
     src/libam/Makefile
     src/libfm/Makefile
     src/libfilter/Makefile
+    src/libchannelizer/Makefile
     src/libwave/Makefile
     src/libfft/Makefile
     src/libsound/Makefile
@@ -116,6 +122,8 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/fuvst/Makefile
     src/dcf77/Makefile
     src/mate/Makefile
+    src/libcalibrate/Makefile
+    src/osmocalibrate/Makefile
     src/test/Makefile
     src/Makefile
     extra/Makefile

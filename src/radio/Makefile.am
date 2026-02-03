@@ -7,6 +7,10 @@ bin_PROGRAMS = \
 
 osmoradio_SOURCES = \
 	radio.c \
+	rds.c \
+	rdsframe.c \
+	rds_tables.c \
+	sca.c \
 	main.c
 osmoradio_LDADD = \
 	$(COMMON_LA) \
@@ -14,11 +18,14 @@ osmoradio_LDADD = \
 	$(top_builddir)/src/libwave/libwave.a \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libclipper/libclipper.a \
+	$(top_builddir)/src/libcompandor/libcompandor.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libemphasis/libemphasis.a \
 	$(top_builddir)/src/libsamplerate/libsamplerate.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
 	$(top_builddir)/src/libjitter/libjitter.a \
 	$(top_builddir)/src/libfilter/libfilter.a \
 	$(top_builddir)/src/libdisplay/libdisplay.a \

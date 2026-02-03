@@ -37,6 +37,8 @@ amps_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
+	$(top_builddir)/src/libecho/libecho.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -50,6 +52,7 @@ endif
 if HAVE_SDR
 amps_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
@@ -79,6 +82,8 @@ tacs_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
+	$(top_builddir)/src/libecho/libecho.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -92,6 +97,7 @@ endif
 if HAVE_SDR
 tacs_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
@@ -121,6 +127,8 @@ jtacs_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
+	$(top_builddir)/src/libecho/libecho.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -134,6 +142,7 @@ endif
 if HAVE_SDR
 jtacs_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \

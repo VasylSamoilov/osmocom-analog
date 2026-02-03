@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <math.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include "../libsample/sample.h"
@@ -38,6 +39,11 @@
 #include "sender.h"
 #include "call.h"
 #include "console.h"
+#include "../libecho/suppressor.h"
+#include "../liboptions/options.h"
+
+/* External configuration */
+extern echo_suppressor_config_t echo_suppressor_config;
 
 #define DISC_TIMEOUT	30, 0
 
@@ -123,18 +129,23 @@ typedef struct process {
 	struct osmo_timer_list timer;
 	osmo_cc_session_t *session;
 	osmo_cc_session_codec_t *codec; /* codec to send */
+	
+	/* Echo suppressor */
+	int echo_suppressor_enabled;
+	echo_suppressor_wrapper_t echo_suppressor;
 } process_t;
 
 static process_t *process_head = NULL;
 
 static void process_timeout(void *data);
 static void indicate_disconnect_release(int callref, int cause, uint8_t msg_type);
+static void call_echo_suppressor_cleanup(process_t *process);
 
 static process_t *create_process(int callref, enum process_state state)
 {
 	process_t *process;
 
-	process = calloc(sizeof(*process), 1);
+	process = calloc(1, sizeof(*process));
 	if (!process) {
 		LOGP(DCALL, LOGL_ERROR, "No memory!\n");
 		abort();
@@ -146,6 +157,10 @@ static process_t *create_process(int callref, enum process_state state)
 	process->callref = callref;
 	process->state = state;
 	tones_set_tone(&call_tones, &process->tones, TONES_TONE_OFF);
+	
+	/* Initialize echo suppressor fields */
+	process->echo_suppressor_enabled = 0;
+	memset(&process->echo_suppressor, 0, sizeof(process->echo_suppressor));
 
 	return process;
 }
@@ -161,6 +176,8 @@ static void destroy_process(int callref)
 			osmo_timer_del(&process->timer);
 			if (process->session)
 				osmo_cc_free_session(process->session);
+			/* Cleanup echo suppressor */
+			call_echo_suppressor_cleanup(process);
 			free(process);
 			return;
 		}
@@ -180,6 +197,124 @@ static process_t *get_process(int callref)
 		process = process->next;
 	}
 	return NULL;
+}
+
+/* ===== Echo Suppressor Functions ===== */
+
+/* Get echo suppressor wrapper for a callref */
+echo_suppressor_wrapper_t *call_get_echo_suppressor_wrapper(int callref)
+{
+	process_t *process = get_process(callref);
+	
+	if (!process || !process->echo_suppressor_enabled || !process->echo_suppressor.suppressor_state)
+		return NULL;
+	
+	return &process->echo_suppressor;
+}
+
+/* Initialize echo suppressor for a process */
+static int call_echo_suppressor_init(process_t *process, int sample_rate, int frame_size)
+{
+	echo_suppressor_wrapper_t *supp;
+	
+	if (!process->echo_suppressor_enabled)
+		return 0;
+	
+	supp = &process->echo_suppressor;
+	
+	supp->suppressor_state = echo_suppressor_init(sample_rate, frame_size, &echo_suppressor_config);
+	if (!supp->suppressor_state) {
+		LOGP(DECHO, LOGL_ERROR, "Failed to initialize echo suppressor\n");
+		process->echo_suppressor_enabled = 0;
+		return -1;
+	}
+	
+	LOGP(DECHO, LOGL_INFO, "Echo suppressor initialized: threshold=%.1fdB atten=%.1fdB hangover=%dms delay=%dms\n",
+	     echo_suppressor_config.threshold_db, echo_suppressor_config.attenuation_db,
+	     echo_suppressor_config.hangover_ms, echo_suppressor_config.echo_delay_ms);
+	
+	return 0;
+}
+
+/* Process TX samples (far-end reference) through echo suppressor */
+void call_echo_suppressor_tx(int callref, sample_t *samples, int count)
+{
+	echo_suppressor_wrapper_t *supp;
+	int16_t tx_spl[count];
+	
+	supp = call_get_echo_suppressor_wrapper(callref);
+	if (!supp)
+		return;
+	
+	/* Convert to int16 */
+	samples_to_int16_speech(tx_spl, samples, count);
+	
+	/* Process through suppressor */
+	echo_suppressor_process_tx(supp->suppressor_state, tx_spl, count);
+	
+	/* Convert back to sample_t */
+	int16_to_samples_speech(samples, tx_spl, count);
+}
+
+/* Process RX samples (near-end with echo) through echo suppressor */
+void call_echo_suppressor_rx(int callref, sample_t *samples, int count)
+{
+	echo_suppressor_wrapper_t *supp;
+	int16_t rx_spl[count];
+	
+	supp = call_get_echo_suppressor_wrapper(callref);
+	if (!supp)
+		return;
+	
+	/* Convert to int16 */
+	samples_to_int16_speech(rx_spl, samples, count);
+	
+	/* Process through suppressor */
+	echo_suppressor_process_rx(supp->suppressor_state, rx_spl, count);
+	
+	/* Convert back to sample_t */
+	int16_to_samples_speech(samples, rx_spl, count);
+}
+
+/* Cleanup echo suppressor state */
+static void call_echo_suppressor_cleanup(process_t *process)
+{
+	echo_suppressor_wrapper_t *supp;
+	
+	if (!process)
+		return;
+	
+	supp = &process->echo_suppressor;
+	
+	if (supp->suppressor_state) {
+		echo_suppressor_cleanup(supp->suppressor_state);
+		supp->suppressor_state = NULL;
+	}
+}
+
+/* Print echo suppressor statistics */
+static void call_echo_suppressor_print_stats(process_t *process)
+{
+	const echo_suppressor_state_t *stats;
+	echo_suppressor_wrapper_t *supp;
+	
+	if (!process || !process->echo_suppressor_enabled)
+		return;
+	
+	supp = &process->echo_suppressor;
+	if (!supp->suppressor_state)
+		return;
+	
+	stats = echo_suppressor_get_stats(supp->suppressor_state);
+	if (!stats)
+		return;
+	
+	LOGP(DECHO, LOGL_NOTICE, "SUPP STATS: dir=%s TX=%.1fdB(%.2f) RX=%.1fdB(%.2f) | frames=%lu/%lu changes=%lu doubletalk=%lu\n",
+	     echo_suppressor_direction_name(stats->direction),
+	     stats->tx_energy_smooth, stats->tx_gain,
+	     stats->rx_energy_smooth, stats->rx_gain,
+	     stats->tx_frames, stats->rx_frames,
+	     stats->direction_changes, stats->doubletalk_frames);
 }
 
 static void new_state_process(int callref, enum process_state state)
@@ -242,6 +377,7 @@ static void down_audio(struct osmo_cc_session_codec *codec, uint8_t marker, uint
 	/* if we are disconnected or if a tone is played, ignore audio */
 	if (!process || process->tones.tone != TONES_TONE_OFF)
 		return;
+
 #if 0
 	int16_to_samples_speech(samples, (int16_t *)data, len / 2);
 #ifdef DEBUG_LEVEL
@@ -249,7 +385,7 @@ static void down_audio(struct osmo_cc_session_codec *codec, uint8_t marker, uint
 	printf("festnetz-level: %s                  %.4f\n", debug_db(lev), (20 * log10(lev)));
 #endif
 #endif
-	call_down_audio(codec->decoder, process, process->callref, marker, sequence_number, timestamp, ssrc, payload, payload_len);
+	call_down_audio(codec->decoder, process, process->callref, sequence_number, marker, timestamp, ssrc, payload, payload_len);
 }
 
 static void indicate_setup(process_t *process, const char *callerid, const char *dialing, uint8_t network_type, const char *network_id)
@@ -389,17 +525,38 @@ void call_up_early(int callref)
 /* Transceiver indicates answer. */
 void call_up_answer(int callref, const char *connect_id)
 {
+	process_t *process;
+	
 	if (!callref) {
 		LOGP(DCALL, LOGL_DEBUG, "Ignoring answer, because callref not set. (not for us)\n");
 		return;
 	}
 
-	LOGP(DCALL, LOGL_INFO, "Call has been answered by '%s'\n", connect_id);
+	LOGP(DCALL, LOGL_INFO, "*** Call has been answered by '%s' (callref=%d) ***\n", connect_id, callref);
 
 	if (!connect_on_setup)
 		indicate_answer(callref, NULL, connect_id);
 	set_tone_process(callref, TONES_TONE_OFF);
 	new_state_process(callref, PROCESS_CONNECT);
+	
+	/* Initialize echo suppressor */
+	process = get_process(callref);
+	if (process && echo_suppressor_config.enabled) {
+		process->echo_suppressor_enabled = 1;
+		call_echo_suppressor_init(process, 8000, 128);
+	}
+}
+
+/* Transceiver indicates flash (hook flash). */
+void call_up_flash(int callref)
+{
+	if (!callref) {
+		LOGP(DCALL, LOGL_DEBUG, "Ignoring flash, because callref not set. (not for us)\n");
+		return;
+	}
+
+	LOGP(DCALL, LOGL_INFO, "*** Flash (Hook-Flash) received from mobile (callref=%d) ***\n", callref);
+	/* TODO: Send suitable message to upper layer if supported (e.g. HOLD/RETRIEVE or FACILITY) */
 }
 
 /* Transceiver indicates release. */
@@ -412,30 +569,38 @@ void call_up_release(int callref, int cause)
 		return;
 	}
 
-	LOGP(DCALL, LOGL_INFO, "Call has been released with cause=%d\n", cause);
+	LOGP(DCALL, LOGL_INFO, "*** Call has been released with cause=%d (callref=%d) ***\n", cause, callref);
 
 	process = get_process(callref);
 	if (process) {
+		LOGP(DCALL, LOGL_DEBUG, "Process state: %d, audio_disconnected: %d\n", process->state, process->audio_disconnected);
 		/* just keep OSMO-CC connection if tones shall be sent.
-		 * no tones while setting up / alerting the call. */
+		 * no tones while setting up / alerting the call.
+		 * For active calls (PROCESS_CONNECT), mobile already hung up,
+		 * so we can't play tones to it - release immediately. */
 		if (connect_on_setup
 		 && process->state != PROCESS_SETUP_RO
-		 && process->state != PROCESS_ALERTING_RO)
+		 && process->state != PROCESS_ALERTING_RO
+		 && process->state != PROCESS_CONNECT)
 			disconnect_process(callref, cause);
 		else
 		/* if no tones shall be sent, release on disconnect
-		 * or RO setup states */
+		 * or RO setup states, or active call (mobile side released) */
 		if (process->state == PROCESS_DISCONNECT
 		 || process->state == PROCESS_SETUP_RO
-		 || process->state == PROCESS_ALERTING_RO) {
+		 || process->state == PROCESS_ALERTING_RO
+		 || process->state == PROCESS_CONNECT) {
+			LOGP(DCALL, LOGL_DEBUG, "Destroying process and sending REL_IND to network\n");
 			destroy_process(callref);
 			indicate_disconnect_release(callref, cause, OSMO_CC_MSG_REL_IND);
 		/* if no tones shall be sent, disconnect on all other states */
 		} else {
+			LOGP(DCALL, LOGL_DEBUG, "Disconnecting process and sending DISC_IND to network\n");
 			disconnect_process(callref, cause);
 			indicate_disconnect_release(callref, cause, OSMO_CC_MSG_DISC_IND);
 		}
 	} else {
+		LOGP(DCALL, LOGL_DEBUG, "No process found for callref, sending REL_IND anyway\n");
 		/* we don't know about the process, just send release to upper layer anyway */
 		indicate_disconnect_release(callref, cause, OSMO_CC_MSG_REL_IND);
 	}
@@ -464,7 +629,7 @@ void call_up_audio(int callref, sample_t *samples, int len)
 
 	/* if we are disconnected or if a tone is played, ignore audio */
 	process = get_process(callref);
-	if (!process || process->tones.tone != TONES_TONE_OFF)
+	if (!process || process->tones.tone != TONES_TONE_OFF || process->audio_disconnected)
 		return;
 
 	/* no codec negotiated (yet) */
@@ -489,8 +654,20 @@ void call_up_audio(int callref, sample_t *samples, int len)
 void call_clock(void)
 {
 	process_t *process = process_head;
+	static int stats_counter = 0;
 
 	call_down_clock();
+
+	/* Print echo suppressor stats every 1 second (assuming call_clock is called every 100ms) */
+	if (echo_suppressor_config.stats_enabled && ++stats_counter >= 10) {  /* 10 * 100ms = 1s */
+		process_t *p = process_head;
+		while (p) {
+			if (p->echo_suppressor_enabled && p->state == PROCESS_CONNECT)
+				call_echo_suppressor_print_stats(p);
+			p = p->next;
+		}
+		stats_counter = 0;
+	}
 
 	while(process) {
 		if (process->tones.tone != TONES_TONE_OFF) {
@@ -722,6 +899,12 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		LOGP(DCALL, LOGL_INFO, "Call answered\n");
 		call_down_answer(callref, &tv_meter);
 		indicate_answer_ack(callref);
+		
+		/* Initialize echo suppressor */
+		if (echo_suppressor_config.enabled) {
+			process->echo_suppressor_enabled = 1;
+			call_echo_suppressor_init(process, 8000, 128);
+		}
 		break;
 	case OSMO_CC_MSG_DISC_REQ:
 		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);

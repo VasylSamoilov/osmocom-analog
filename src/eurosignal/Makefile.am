@@ -28,6 +28,8 @@ eurosignal_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -42,6 +44,7 @@ endif
 if HAVE_SDR
 eurosignal_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \

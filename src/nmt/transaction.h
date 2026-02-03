@@ -24,6 +24,20 @@ typedef struct transaction {
 	/* DMS/SMS */
 	int			dms_call;		/* indicates to use DMS (used for SMS) */
 	char			sms_string[256];	/* current string to deliver */
+
+	/* MWI (Message Waiting Indicator)
+	 * See docs/NMT_MWI.md for details on MWI implementation.
+	 *
+	 * mwi_flags bits:
+	 *   bit 0 (0x01) = SMS message waiting
+	 *   bit 1 (0x02) = Voice mail waiting
+	 *   bit 2 (0x04) = Fax waiting
+	 *   bit 3 (0x08) = E-mail waiting
+	 *   bit 4 (0x10) = Data waiting
+	 */
+	int			mwi_call;		/* 1 = this is an MWI-only delivery call */
+	uint8_t			mwi_flags;		/* indicator flags for current frame 5c */
+	uint8_t			mwi_pending;		/* accumulated flags set during call */
 } transaction_t;
 
 transaction_t *create_transaction(struct nmt_subscriber *subscriber);

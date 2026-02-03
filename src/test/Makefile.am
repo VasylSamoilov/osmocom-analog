@@ -11,7 +11,11 @@ noinst_PROGRAMS = \
 	test_sms \
 	test_performance \
 	test_hagelbarger \
-	test_v27scrambler
+	test_v27scrambler \
+	test_channelizer \
+	test_echo_analysis \
+	test_echo_analysis_edge_cases \
+	test_echo_analysis_final_checkpoint
 
 test_filter_SOURCES = test_filter.c dummy.c
 
@@ -36,6 +40,10 @@ test_compandor_SOURCES = dummy.x test_compandor.c
 test_compandor_LDADD = \
 	$(COMMON_LA) \
 	$(top_builddir)/src/libcompandor/libcompandor.a \
+	$(top_builddir)/src/liboptions/liboptions.a \
+	$(top_builddir)/src/liblogging/liblogging.a \
+	$(LIBOSMOCC_LIBS) \
+	$(LIBOSMOCORE_LIBS) \
 	-lm
 
 test_emphasis_SOURCES = test_emphasis.c dummy.c
@@ -76,6 +84,8 @@ test_dms_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -89,6 +99,7 @@ endif
 if HAVE_SDR
 test_dms_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libam/libam.a \
@@ -113,6 +124,8 @@ test_sms_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -126,6 +139,7 @@ endif
 if HAVE_SDR
 test_sms_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libam/libam.a \
@@ -166,3 +180,50 @@ test_goertzel_LDADD = \
 	$(LIBOSMOCORE_LIBS) \
 	-lm
 
+test_channelizer_SOURCES = test_channelizer.c
+
+test_channelizer_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	-lm
+
+
+test_echo_analysis_SOURCES = test_echo_analysis.c dummy.c
+
+test_echo_analysis_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	$(top_builddir)/src/liboptions/liboptions.a \
+	$(top_builddir)/src/liblogging/liblogging.a \
+	$(LIBOSMOCC_LIBS) \
+	$(LIBOSMOCORE_LIBS) \
+	-lm
+
+test_echo_analysis_edge_cases_SOURCES = test_echo_analysis_edge_cases.c dummy.c
+
+test_echo_analysis_edge_cases_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	$(top_builddir)/src/liboptions/liboptions.a \
+	$(top_builddir)/src/liblogging/liblogging.a \
+	$(LIBOSMOCC_LIBS) \
+	$(LIBOSMOCORE_LIBS) \
+	-lm
+
+test_echo_analysis_final_checkpoint_SOURCES = test_echo_analysis_final_checkpoint.c dummy.c
+
+test_echo_analysis_final_checkpoint_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	$(top_builddir)/src/liboptions/liboptions.a \
+	$(top_builddir)/src/liblogging/liblogging.a \
+	$(LIBOSMOCC_LIBS) \
+	$(LIBOSMOCORE_LIBS) \
+	-lm

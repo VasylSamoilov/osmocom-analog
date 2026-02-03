@@ -410,6 +410,8 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 	int coding = 0;
 	int rc;
 
+	LOGP(DSMS, LOGL_DEBUG, "decode_sms_submit: got %d bytes\n", length);
+
 	/* decode ref */
 	ref = data[1];
 	data += 2;
@@ -643,13 +645,11 @@ release:
 	/* check if complete */
 	if (length < 2)
 		return;
+
+	LOGP(DSMS, LOGL_DEBUG, "Processing RP message: first bytes 0x%02x 0x%02x, MTI=%d, length=%d\n",
+		data[0], data[1], data[0] & RP_MTI_MASK, length);
+
 	switch (data[0] & RP_MTI_MASK) {
-	case RP_MT_ACK:
-		rc = decode_deliver_report(nmt, data, length);
-		break;
-	case RP_MT_ERROR:
-		rc = decode_deliver_report(nmt, data, length);
-		break;
 	case RP_MO_DATA:
 		rc = decode_sms_submit(nmt, data, length);
 		if (rc < 0)
@@ -660,13 +660,41 @@ release:
 		/* no release, we release afeter the report */
 		rc = 0;
 		break;
+	case RP_MT_DATA:
+		/* RP_MT_DATA (1) is SC->MS, should not be received from mobile.
+		 * Some phones may echo back or send unexpected data.
+		 * Log and ignore to avoid call release.
+		 */
+		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MT_DATA (0x%02x) from mobile, ignoring.\n", data[0]);
+		rc = 0;
+		break;
+	case RP_MT_ACK:
+		rc = decode_deliver_report(nmt, data, length);
+		break;
+	case RP_MO_ACK:
+		/* RP_MO_ACK (3) is SC->MS, should not be received from mobile. */
+		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MO_ACK (0x%02x) from mobile, ignoring.\n", data[0]);
+		rc = 0;
+		break;
+	case RP_MT_ERROR:
+		rc = decode_deliver_report(nmt, data, length);
+		break;
+	case RP_MO_ERROR:
+		/* RP_MO_ERROR (5) is SC->MS, should not be received from mobile. */
+		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MO_ERROR (0x%02x) from mobile, ignoring.\n", data[0]);
+		rc = 0;
+		break;
+	case RP_SM_MEMORY_AVAILABLE:
+		LOGP(DSMS, LOGL_NOTICE, "Received MEMORY-AVAILABLE message.\n");
+		rc = 0;
+		break;
 	case RP_SM_READY_TO_RECEIVE:
-		LOGP(DSMS, LOGL_NOTICE, "Received READY-TO-RECEVIE message.\n");
-		data += length;
-		length -= length;
+		LOGP(DSMS, LOGL_NOTICE, "Received READY-TO-RECEIVE message.\n");
+		rc = 0;
 		break;
 	default:
-		LOGP(DSMS, LOGL_NOTICE, "Received unknown RP message type %d.\n", data[0]);
+		LOGP(DSMS, LOGL_NOTICE, "Received unknown RP message type %d (0x%02x, MTI=%d).\n",
+			data[0], data[0], data[0] & RP_MTI_MASK);
 		rc = -1;
 	}
 	if (rc)

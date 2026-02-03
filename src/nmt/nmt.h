@@ -5,10 +5,11 @@
 #include "../libmobile/call.h"
 #include "../libfsk/fsk.h"
 #include "../libgoertzel/goertzel.h"
+#include "../libfilter/iir_filter.h"
+
 typedef struct nmt nmt_t;
 #include "dms.h"
 #include "sms.h"
-
 
 enum dsp_mode {
 	DSP_MODE_SILENCE,	/* stream nothing */
@@ -53,6 +54,8 @@ enum nmt_active_state {
 	ACTIVE_STATE_MFT_IN,	/* ack MFT converter in */
 	ACTIVE_STATE_MFT,	/* receive digits in MFT mode */
 	ACTIVE_STATE_MFT_OUT,	/* ack MFT converter out */
+	ACTIVE_STATE_MWI,	/* sending MWI (message waiting indicator) */
+	ACTIVE_STATE_MWI_CLEAR,	/* sending clearing signal after MWI */
 };
 
 enum nmt_direction {
@@ -80,6 +83,11 @@ struct nmt {
 	compandor_t		cstate;
 	dtmf_enc_t		dtmf;
 	struct transaction	*trans;			/* pointer to transaction, if bound to channel */
+
+	/* filters */
+	iir_filter_t		rx_notch_filter;	/* filter to remove supervisory signal from audio */
+	iir_filter_t		rx_lp_filter;		/* filter to limit bandwidth to 3400 Hz */
+	iir_filter_t		rx_hp_filter;		/* filter to remove DC / < 300 Hz */
 
 	/* sender's states */
 	enum nmt_state		state;
@@ -155,4 +163,15 @@ void nmt_rx_super(nmt_t *nmt, int tone, double quality);
 void timeout_mt_paging(struct transaction *trans);
 void deliver_sms(const char *sms);
 int submit_sms(const char *sms);
+
+/* MWI (Message Waiting Indicator)
+ * See docs/NMT_MWI.md for command format and usage.
+ *
+ * Command format: <subscriber>,set,<indicators>
+ *   subscriber: 7-digit NMT number
+ *   indicators: space-separated text (sms voice fax email data) or numeric 0-31
+ *
+ * Clearing sequence (5c x2 then L(15) x4) is sent at call end per NMT 4.4.1.16.
+ */
+void deliver_mwi(const char *command);
 

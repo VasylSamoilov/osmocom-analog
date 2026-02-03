@@ -743,7 +743,7 @@ int mtp_l3l2(mtp_t *mtp, enum mtp_prim prim, uint8_t sio, uint8_t *data, int len
 		tailp = &((*tailp)->next);
 
 	/* add new message to queue */
-	msg = calloc(sizeof(*msg) + len, 1);
+	msg = calloc(1, sizeof(*msg) + len);
 	if (!msg) {
 		LOGP_CHAN(DMTP2, LOGL_ERROR, "No mem!\n");
 		abort();

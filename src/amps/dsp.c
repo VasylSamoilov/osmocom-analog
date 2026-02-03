@@ -88,6 +88,7 @@
 #include "amps.h"
 #include "frame.h"
 #include "dsp.h"
+#include "../libclipper/clipper.h"
 #include "main.h"
 
 #define CHAN amps->sender.kanal
@@ -107,9 +108,11 @@
 #define AMPS_SAT_DEVIATION	(2000.0 / AMPS_SPEECH_DEVIATION)	/* no emphasis */
 #define AMPS_MAX_DISPLAY	(10000.0 / AMPS_SPEECH_DEVIATION)	/* no emphasis */
 #define AMPS_BITRATE		10000
-/* for some reason, 4000 Hz deviation works better */
-#define TACS_SPEECH_DEVIATION	4000.0  /* 2300 Hz deviation at 1 kHz (according to panasonic manual) */
-#define TACS_MAX_DEVIATION	6400.0	/* (according to texas instruments and other sources) */
+/* TACS speech deviation: Per Panasonic manual, 2300 Hz at 1 kHz reference.
+ * This is lower than AMPS (2900 Hz) because TACS uses narrower deviation.
+ * Using 2900 Hz causes feedback loops due to excessive TX level. */
+#define TACS_SPEECH_DEVIATION	2300.0
+#define TACS_MAX_DEVIATION	9500.0	/* (according to wikipedia) */
 #define TACS_MAX_MODULATION	9500.0	/* (according to panasonic manual) */
 #define TACS_FSK_DEVIATION	(6400.0 / TACS_SPEECH_DEVIATION)	/* no emphasis */
 #define TACS_SAT_DEVIATION	(1700.0 / TACS_SPEECH_DEVIATION)	/* no emphasis (panasonic / TI) */
@@ -120,13 +123,20 @@
 #define SAT_PRINT		10	/* print sat measurement every 0.5 seconds */
 #define DTX_LEVEL		0.50	/* SAT level needed to mute/unmute */
 #define SIG_QUALITY		0.80	/* quality needed to detect Signaling Tone */
-#define SAT_DETECT_COUNT	5	/* number of measures to detect SAT signal (specs say 250ms) */
-#define SAT_LOST_COUNT		5	/* number of measures to loose SAT signal (specs say 250ms) */
+#define SIG_LEVEL		0.20	/* minimum level needed to detect Signaling Tone (relative to 8kHz deviation) */
+#define SAT_DETECT_COUNT	5	/* number of measures to detect SAT signal (~250ms per spec) */
+#define SAT_LOST_COUNT		5	/* number of measures to loose SAT signal (~250ms per spec) */
+#define SAT_FREQ_CHANGE_COUNT	5	/* number of measures for SAT frequency change (~250ms per spec) */
 #define SIG_DETECT_COUNT	6	/* number of measures to detect Signaling Tone */
 #define SIG_LOST_COUNT		4	/* number of measures to loose Signaling Tone */
 #define CUT_OFF_HIGHPASS	300.0   /* cut off frequency for high pass filter to remove dc level from sound card / sample */
 #define BEST_QUALITY		0.68	/* Best possible RX quality */
 #define COMFORT_NOISE		0.02	/* audio level of comfort noise (relative to speech level) */
+/* SAT level thresholds with hysteresis (relative to nominal=1.0) */
+#define SAT_LEVEL_HIGH		0.50	/* threshold to detect SAT (from no SAT state) */
+#define SAT_LEVEL_LOW		0.35	/* threshold to lose SAT (hysteresis ~3 dB) */
+/* Minimum ratio of dominant SAT frequency over others for valid classification */
+#define SAT_FREQ_RATIO		2.0	/* dominant frequency must be 2x (6 dB) above others */
 
 static sample_t ramp_up[256], ramp_down[256];
 
@@ -165,6 +175,7 @@ void dsp_init(void)
 	dsp_sync_check[0x0ed] = 0x80; /* no bit error */
 
 	compandor_init();
+	clipper_init(0.95);
 }
 
 static void dsp_init_ramp(amps_t *amps)
@@ -187,6 +198,77 @@ static void dsp_init_ramp(amps_t *amps)
 }
 
 static void sat_reset(amps_t *amps, const char *reason);
+
+/* Get human-readable name for SAT state */
+const char *sat_state_name(enum sat_state state)
+{
+	switch (state) {
+	case SAT_STATE_NONE: return "NONE";
+	case SAT_STATE_5970: return "5970 Hz";
+	case SAT_STATE_6000: return "6000 Hz";
+	case SAT_STATE_6030: return "6030 Hz";
+	default: return "UNKNOWN";
+	}
+}
+
+/* Classify SAT frequency based on Goertzel filter outputs.
+ * Returns the detected SAT frequency class, or SAT_FREQ_INVALID if
+ * no clear dominant frequency is detected.
+ */
+static enum sat_freq_class sat_classify_frequency(double levels[3])
+{
+	int max_idx = 0;
+	double max_level = levels[0];
+	double second_max = 0;
+	int i;
+
+	/* Find strongest SAT frequency */
+	for (i = 1; i < 3; i++) {
+		if (levels[i] > max_level) {
+			max_level = levels[i];
+			max_idx = i;
+		}
+	}
+
+	/* Find second strongest */
+	for (i = 0; i < 3; i++) {
+		if (i != max_idx && levels[i] > second_max)
+			second_max = levels[i];
+	}
+
+	/* Require dominant frequency to be significantly above second (6 dB) */
+	if (max_level < second_max * SAT_FREQ_RATIO)
+		return SAT_FREQ_INVALID;
+
+	switch (max_idx) {
+	case 0: return SAT_FREQ_5970;
+	case 1: return SAT_FREQ_6000;
+	case 2: return SAT_FREQ_6030;
+	default: return SAT_FREQ_INVALID;
+	}
+}
+
+/* Convert SAT frequency class to SAT state */
+static enum sat_state sat_freq_to_state(enum sat_freq_class freq_class)
+{
+	switch (freq_class) {
+	case SAT_FREQ_5970: return SAT_STATE_5970;
+	case SAT_FREQ_6000: return SAT_STATE_6000;
+	case SAT_FREQ_6030: return SAT_STATE_6030;
+	default: return SAT_STATE_NONE;
+	}
+}
+
+/* Convert SCC (SAT Color Code) to expected SAT state */
+static enum sat_state scc_to_sat_state(int scc)
+{
+	switch (scc) {
+	case 0: return SAT_STATE_5970;
+	case 1: return SAT_STATE_6000;
+	case 2: return SAT_STATE_6030;
+	default: return SAT_STATE_NONE;
+	}
+}
 
 /* Init FSK of transceiver */
 int dsp_init_sender(amps_t *amps, int tolerant)
@@ -218,7 +300,7 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	LOGP(DDSP, LOGL_DEBUG, "Use %.4f samples for full bit duration @ %d.\n", amps->fsk_bitduration, amps->sender.samplerate);
 
 	amps->fsk_tx_buffer_size = amps->fsk_bitduration + 10; /* 10 extra to avoid overflow due to rounding */
-	spl = calloc(sizeof(*spl), amps->fsk_tx_buffer_size);
+	spl = calloc(amps->fsk_tx_buffer_size, sizeof(*spl));
 	if (!spl) {
 		LOGP(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;
@@ -234,7 +316,7 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	LOGP(DDSP, LOGL_DEBUG, "Bit window length: %d\n", amps->fsk_rx_window_length);
 	LOGP(DDSP, LOGL_DEBUG, " -> Samples in window to analyse level left of edge: %d..%d\n", amps->fsk_rx_window_begin, amps->fsk_rx_window_half - 1);
 	LOGP(DDSP, LOGL_DEBUG, " -> Samples in window to analyse level right of edge: %d..%d\n", amps->fsk_rx_window_half, amps->fsk_rx_window_end - 1);
-	spl = calloc(sizeof(*amps->fsk_rx_window), amps->fsk_rx_window_length);
+	spl = calloc(amps->fsk_rx_window_length, sizeof(*amps->fsk_rx_window));
 	if (!spl) {
 		LOGP(DDSP, LOGL_ERROR, "No memory!\n");
 		rc = -ENOMEM;
@@ -251,7 +333,7 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	 * we half our bandwidth, so that other supervisory signals will be canceled out completely by goertzel filter
 	 */
 	amps->sat_samples = (int)((double)amps->sender.samplerate * (1.0 / (SAT_BANDWIDTH / 2.0)) + 0.5);
-	spl = calloc(sizeof(*spl), amps->sat_samples);
+	spl = calloc(amps->sat_samples, sizeof(*spl));
 	if (!spl) {
 		LOGP(DDSP, LOGL_ERROR, "No memory!\n");
 		return -ENOMEM;
@@ -268,6 +350,25 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	/* signaling tone */
 	audio_goertzel_init(&amps->sat_goertzel[4], (!tacs) ? 10000.0 : 8000.0, amps->sender.samplerate);
 	sat_reset(amps, "Initial state");
+
+	/* Fast ST detection for handoff - 20ms window for catching 50ms ST
+	 * Bandwidth = 1/0.020 = 50 Hz (wider than SAT, but sufficient for ST detection)
+	 * This allows us to detect ST more quickly during handoff
+	 */
+	amps->fast_st_samples = (int)((double)amps->sender.samplerate * 0.020 + 0.5);  /* 20ms window */
+	spl = calloc(amps->fast_st_samples, sizeof(*spl));
+	if (!spl) {
+		LOGP(DDSP, LOGL_ERROR, "No memory for fast ST buffer!\n");
+		return -ENOMEM;
+	}
+	amps->fast_st_buffer = spl;
+	amps->fast_st_pos = 0;
+	amps->fast_st_detected = 0;
+	amps->fast_st_count = 0;
+	/* Initialize fast ST Goertzel filters */
+	audio_goertzel_init(&amps->fast_st_goertzel[0], (!tacs) ? 10000.0 : 8000.0, amps->sender.samplerate);  /* ST */
+	audio_goertzel_init(&amps->fast_st_goertzel[1], 5790.0, amps->sender.samplerate);  /* noise reference */
+	LOGP(DDSP, LOGL_DEBUG, "Fast ST detection interval is %d ms.\n", amps->fast_st_samples * 1000 / amps->sender.samplerate);
 
 	/* be more tolerant when syncing */
 	amps->fsk_rx_sync_tolerant = tolerant;
@@ -299,6 +400,10 @@ void dsp_cleanup_sender(amps_t *amps)
 	if (amps->sat_filter_spl) {
 		free(amps->sat_filter_spl);
 		amps->sat_filter_spl = NULL;
+	}
+	if (amps->fast_st_buffer) {
+		free(amps->fast_st_buffer);
+		amps->fast_st_buffer = NULL;
 	}
 #if 0
 	if (amps->frame_spl) {
@@ -488,16 +593,43 @@ again:
 	case DSP_MODE_AUDIO_RX_AUDIO_TX:
 		memset(power, 1, length);
 		input_num = samplerate_upsample_input_num(&sender->srstate, length);
+
 		{
 			int16_t spl[input_num];
 			jitter_load_samples(&sender->dejitter, (uint8_t *)spl, input_num, sizeof(*spl), jitter_conceal_s16, NULL);
 			int16_to_samples_speech(samples, spl, input_num);
 		}
+
+		/* Echo suppressor TX reference (far-end audio before DSP processing) */
+		if (amps->trans_list && amps->trans_list->callref)
+			call_echo_suppressor_tx(amps->trans_list->callref, samples, input_num);
+
 		compress_audio(&amps->cstate, samples, input_num);
-		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
-		/* pre-emphasis */
+
+		/* pre-emphasis at 8 kHz (BEFORE upsample) - use correct shelf filter with unity gain at DC */
 		if (amps->pre_emphasis)
-			pre_emphasis(&amps->estate, samples, length);
+			pre_emphasis_fast(&amps->estate_tx_fast, samples, input_num);
+
+		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
+
+		/* Deviation limiter (per TIA/EIA-553 §2.1.3.1.3): scale down if peak exceeds limit.
+		 * Applied AFTER upsample to limit actual FM deviation. Leave headroom for SAT. */
+		{
+			double sat_headroom = (!tacs) ? 0.69 : 0.59;  /* SAT amplitude in normalized units (1700/2900 for TACS) */
+			double max_speech = sender->max_deviation / sender->speech_deviation - sat_headroom;
+			double peak = 0;
+			int i;
+			for (i = 0; i < length; i++) {
+				double v = fabs(samples[i]);
+				if (v > peak) peak = v;
+			}
+			if (peak > max_speech) {
+				double scale = max_speech / peak;
+				for (i = 0; i < length; i++)
+					samples[i] *= scale;
+			}
+		}
+
 		/* encode SAT during call */
 		sat_encode(amps, samples, length);
 		break;
@@ -706,125 +838,237 @@ static void fsk_rx_dotting(amps_t *amps, double _elapsed)
 }
 
 /* decode frame */
-static void sender_receive_frame(amps_t *amps, sample_t *samples, int length)
+/* Process one FSK sample (dotting, sync, bit decoding) */
+static void fsk_rx_sample(amps_t *amps, sample_t sample)
 {
-	int i;
-
-	for (i = 0; i < length; i++) {
 #ifdef DEBUG_DECODER
-		puts(debug_amplitude(samples[i] / (double)FSK_DEVIATION));
+	puts(debug_amplitude(sample / (double)FSK_DEVIATION));
 #endif
-		/* push sample to detection window and shift */
-		amps->fsk_rx_window[amps->fsk_rx_window_pos++] = samples[i];
-		if (amps->fsk_rx_window_pos == amps->fsk_rx_window_length)
-			amps->fsk_rx_window_pos = 0;
-		if (amps->fsk_rx_sync != FSK_SYNC_POSITIVE && amps->fsk_rx_sync != FSK_SYNC_NEGATIVE) {
-			/* check for change in polarity */
-			if (amps->fsk_rx_last_sample <= 0) {
-				if (samples[i] > 0) {
-					fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
-					amps->fsk_rx_elapsed = 0.0;
-				}
-			} else {
-				if (samples[i] <= 0) {
-					fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
-					amps->fsk_rx_elapsed = 0.0;
-				}
+	/* push sample to detection window and shift */
+	amps->fsk_rx_window[amps->fsk_rx_window_pos++] = sample;
+	if (amps->fsk_rx_window_pos == amps->fsk_rx_window_length)
+		amps->fsk_rx_window_pos = 0;
+	if (amps->fsk_rx_sync != FSK_SYNC_POSITIVE && amps->fsk_rx_sync != FSK_SYNC_NEGATIVE) {
+		/* check for change in polarity */
+		if (amps->fsk_rx_last_sample <= 0) {
+			if (sample > 0) {
+				fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
+				amps->fsk_rx_elapsed = 0.0;
+			}
+		} else {
+			if (sample <= 0) {
+				fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
+				amps->fsk_rx_elapsed = 0.0;
 			}
 		}
-		amps->fsk_rx_last_sample = samples[i];
-		amps->fsk_rx_elapsed += amps->fsk_bitstep;
-//		printf("%.4f\n", bitcount);
-		if (amps->fsk_rx_sync != FSK_SYNC_NONE) {
-			amps->fsk_rx_bitcount += amps->fsk_bitstep;
-			if (amps->fsk_rx_bitcount >= 1.0) {
-				amps->fsk_rx_bitcount -= 1.0;
-				fsk_rx_bit(amps,
-					amps->fsk_rx_window,
-					amps->fsk_rx_window_length,
-					amps->fsk_rx_window_pos,
-					amps->fsk_rx_window_begin,
-					amps->fsk_rx_window_half,
-					amps->fsk_rx_window_end);
-			}
+	}
+	amps->fsk_rx_last_sample = sample;
+	amps->fsk_rx_elapsed += amps->fsk_bitstep;
+//	printf("%.4f\n", bitcount);
+	if (amps->fsk_rx_sync != FSK_SYNC_NONE) {
+		amps->fsk_rx_bitcount += amps->fsk_bitstep;
+		if (amps->fsk_rx_bitcount >= 1.0) {
+			amps->fsk_rx_bitcount -= 1.0;
+			fsk_rx_bit(amps,
+				amps->fsk_rx_window,
+				amps->fsk_rx_window_length,
+				amps->fsk_rx_window_pos,
+				amps->fsk_rx_window_begin,
+				amps->fsk_rx_window_half,
+				amps->fsk_rx_window_end);
 		}
 	}
 }
 
+/* decode frame */
+static void sender_receive_frame(amps_t *amps, sample_t *samples, int length)
+{
+	int i;
+
+	for (i = 0; i < length; i++)
+		fsk_rx_sample(amps, samples[i]);
+}
+
 
 /* decode SAT and signaling tone */
-/* compare supervisory signal against noise floor at 5790 Hz */
+/* Enhanced SAT detection with frequency classification per TIA/EIA-553-A */
 static void sat_decode(amps_t *amps, sample_t *samples, int length)
 {
-	double result[3], sat_quality, sig_quality, sat_level, sig_level;
+	double results[5], levels[3], sat_deviation;
+	double sat_quality, sig_quality, sat_level, sig_level, noise_level;
+	enum sat_freq_class freq_class;
+	enum sat_state new_state, expected_state;
+	double level_threshold;
+	int required_count;
+	int i;
 
-	audio_goertzel(&amps->sat_goertzel[amps->sat], samples, length, 0, &result[0], 1);
-	audio_goertzel(&amps->sat_goertzel[3], samples, length, 0, &result[1], 1);
-	audio_goertzel(&amps->sat_goertzel[4], samples, length, 0, &result[2], 1);
+	/* Run Goertzel filters for all 3 SAT frequencies + noise reference + signaling tone */
+	for (i = 0; i < 5; i++) {
+		audio_goertzel(&amps->sat_goertzel[i], samples, length, 0, &results[i], 1);
+	}
 
-	/* normalize sat level and signaling tone level */
-	sat_level = result[0] / ((!tacs) ? AMPS_SAT_DEVIATION : TACS_SAT_DEVIATION);
-	sig_level = result[2] / ((!tacs) ? AMPS_FSK_DEVIATION : TACS_FSK_DEVIATION);
+	/* Normalize levels for all 3 SAT frequencies */
+	sat_deviation = (!tacs) ? AMPS_SAT_DEVIATION : TACS_SAT_DEVIATION;
+	for (i = 0; i < 3; i++) {
+		levels[i] = results[i] / sat_deviation;
+		amps->sat_goertzel_levels[i] = levels[i];
+	}
+	noise_level = results[3] / sat_deviation;
+	sig_level = results[4] / ((!tacs) ? AMPS_FSK_DEVIATION : TACS_FSK_DEVIATION);
 
-	/* get normalized quality of SAT and signaling tone */
-	sat_quality = (result[0] - result[1]) / result[0];
+	/* Find maximum SAT level across all 3 frequencies */
+	sat_level = levels[0];
+	for (i = 1; i < 3; i++) {
+		if (levels[i] > sat_level)
+			sat_level = levels[i];
+	}
+
+	/* Calculate SAT level in dB (relative to nominal=1.0) */
+	amps->sat_level_db = 20.0 * log10(sat_level + 0.001);
+
+	/* Classify which SAT frequency is dominant */
+	freq_class = sat_classify_frequency(levels);
+	amps->sat_freq_detected = freq_class;
+
+	/* Calculate quality (ratio of SAT to noise) */
+	sat_quality = (sat_level > noise_level && sat_level > 0.001) ?
+	              (sat_level - noise_level) / sat_level : 0.0;
 	if (sat_quality < 0)
 		sat_quality = 0;
-	sig_quality = (result[2] - result[1]) / result[2];
+
+	sig_quality = (results[4] > results[3] && results[4] > 0.001) ?
+	              (results[4] - results[3]) / results[4] : 0.0;
 	if (sig_quality < 0)
 		sig_quality = 0;
 
-	/* debug SAT */
+	/* Debug SAT - enhanced with frequency info */
 	if (++amps->sat_print == SAT_PRINT) {
-		LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT level %.2f%% quality %.0f%%\n", sat_level * 100.0, sat_quality * 100.0);
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT: state=%s level=%.1f dB (%.0f%%) quality=%.0f%% [5970:%.0f%% 6000:%.0f%% 6030:%.0f%%]\n",
+		          sat_state_name(amps->sat_state),
+		          amps->sat_level_db,
+		          sat_level * 100.0, sat_quality * 100.0,
+		          levels[0] * 100.0, levels[1] * 100.0, levels[2] * 100.0);
 		amps->sat_print = 0;
 	}
 
-	/* update measurements (if dmp_* params are NULL, we omit this) */
+	/* Update measurements */
 	display_measurements_update(amps->dmp_sat_level, sat_level * 100.0, 0.0);
 	display_measurements_update(amps->dmp_sat_quality, sat_quality * 100.0, 0.0);
 
-	/* debug signaling tone */
+	/* Continuous SAT update to Upper Layer for Power Control */
+	if (amps->sat_state != SAT_STATE_NONE) {
+
+		/* Pass quality as before. RSSI could be passed too if we updated the API,
+		 * but for now we logged it here as requested. */
+		amps_rx_sat(amps, 1, sat_quality);
+	}
+
+	/* Debug signaling tone */
 	if (amps->sender.loopback || loglevel == LOGL_DEBUG) {
 		LOGP_CHAN(DDSP, loglevel, "Signaling Tone level %.2f%% quality %.0f%%\n", sig_level * 100.0, sig_quality * 100.0);
 	}
 
-	/* mute if SAT quality or level is below threshold */
+	/* Update DTX state */
 	if (sat_quality > SAT_QUALITY && sat_level > DTX_LEVEL)
 		amps->dtx_state = 1;
 	else
 		amps->dtx_state = 0;
 
-	/* detect SAT */
-	if (sat_quality > SAT_QUALITY) {
-		if (amps->sat_detected == 0) {
-			amps->sat_detect_count++;
-			if (amps->sat_detect_count == SAT_DETECT_COUNT) {
-				amps->sat_detected = 1;
-				amps->sat_detect_count = 0;
-				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT signal detected with level=%.0f%%, quality=%.0f%%.\n", sat_level * 100.0, sat_quality * 100.0);
-				amps_rx_sat(amps, 1, sat_quality);
-			}
-		} else
-			amps->sat_detect_count = 0;
+	/* === Enhanced SAT State Machine === */
+
+	/* Determine target state based on level, quality, and frequency */
+	if (freq_class != SAT_FREQ_INVALID && sat_quality > SAT_QUALITY) {
+		/* Apply hysteresis based on current state */
+		level_threshold = (amps->sat_state == SAT_STATE_NONE) ?
+		                  SAT_LEVEL_HIGH : SAT_LEVEL_LOW;
+
+		if (sat_level >= level_threshold) {
+			new_state = sat_freq_to_state(freq_class);
+		} else {
+			new_state = SAT_STATE_NONE;
+		}
 	} else {
-		if (amps->sat_detected == 1) {
-			amps->sat_detect_count++;
-			if (amps->sat_detect_count == SAT_LOST_COUNT) {
-				amps->sat_detected = 0;
-				amps->sat_detect_count = 0;
-				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT signal lost.\n");
-				amps_rx_sat(amps, 0, 0.0);
-			}
-		} else
-			amps->sat_detect_count = 0;
+		new_state = SAT_STATE_NONE;
 	}
 
-	/* detect signaling tone */
-	if (sig_quality > SIG_QUALITY) {
+	/* State machine persistence logic */
+	if (new_state == amps->sat_pending_state) {
+		amps->sat_state_count++;
+	} else {
+		amps->sat_pending_state = new_state;
+		amps->sat_state_count = 1;
+	}
+
+	/* Determine required persistence count based on transition type */
+	if (new_state == SAT_STATE_NONE && amps->sat_state != SAT_STATE_NONE) {
+		/* SAT loss */
+		required_count = SAT_LOST_COUNT;
+	} else if (new_state != SAT_STATE_NONE && amps->sat_state == SAT_STATE_NONE) {
+		/* SAT detection */
+		required_count = SAT_DETECT_COUNT;
+	} else if (new_state != amps->sat_state) {
+		/* SAT frequency change */
+		required_count = SAT_FREQ_CHANGE_COUNT;
+	} else {
+		/* No state change needed */
+		required_count = 1;
+	}
+
+	/* Apply state transition if persistence requirement met */
+	if (amps->sat_state_count >= required_count) {
+		enum sat_state old_state = amps->sat_state;
+
+		if (new_state != old_state) {
+			amps->sat_state = new_state;
+
+			/* Notify upper layer of state changes */
+			if (old_state == SAT_STATE_NONE && new_state != SAT_STATE_NONE) {
+				/* SAT detected */
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT detected: freq=%s level=%.1f dB quality=%.0f%%\n",
+				          sat_state_name(new_state), amps->sat_level_db, sat_quality * 100.0);
+				amps->sat_detected = 1;
+				amps->sat_detect_count = 0;
+				amps_rx_sat(amps, 1, sat_quality);
+
+				/* Check for SAT mismatch (mobile transponds different SCC) */
+				expected_state = scc_to_sat_state(amps->sat);
+				if (new_state != expected_state) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT mismatch: expected %s, detected %s - triggering handoff callback\n",
+					          sat_state_name(expected_state), sat_state_name(new_state));
+					amps_rx_sat_mismatch(amps, expected_state, new_state);
+				}
+			} else if (old_state != SAT_STATE_NONE && new_state == SAT_STATE_NONE) {
+				/* SAT lost */
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT lost\n");
+				amps->sat_detected = 0;
+				amps->sat_detect_count = 0;
+				amps_rx_sat(amps, 0, 0.0);
+			} else if (old_state != new_state) {
+				/* SAT frequency changed (handoff candidate) */
+				LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT frequency changed: %s -> %s\n",
+				          sat_state_name(old_state), sat_state_name(new_state));
+				expected_state = scc_to_sat_state(amps->sat);
+				amps_rx_sat_mismatch(amps, expected_state, new_state);
+			}
+		}
+	}
+
+	/* === Signaling Tone Detection === */
+	/* For handoff, use fast detection (1 sample) since ST is only 50ms
+	 * For other states, use normal detection (6 samples) to avoid false positives
+	 */
+	int sig_detect_threshold = SIG_DETECT_COUNT;
+	transaction_t *trans = amps->trans_list;
+	if (trans && trans->state == TRANS_CALL_HANDOFF_SEND) {
+		/* Fast ST detection for handoff - 50ms ST needs immediate detection */
+		sig_detect_threshold = 1;
+	}
+	
+	/* Added SIG_LEVEL check to prevent spurious detection from low-level noise/spurs */
+	if (sig_quality > SIG_QUALITY && sig_level > SIG_LEVEL) {
 		if (amps->sig_detected == 0) {
 			amps->sig_detect_count++;
-			if (amps->sig_detect_count == SIG_DETECT_COUNT) {
+			if (amps->sig_detect_count >= sig_detect_threshold) {
 				amps->sig_detected = 1;
 				amps->sig_detect_count = 0;
 				LOGP_CHAN(DDSP, LOGL_DEBUG, "Signaling Tone detected with level=%.0f%%, quality=%.0f%%.\n", sig_level * 100.0, sig_quality * 100.0);
@@ -846,12 +1090,91 @@ static void sat_decode(amps_t *amps, sample_t *samples, int length)
 	}
 }
 
+/* Fast ST detection for handoff - runs every 20ms instead of 66ms
+ * This is specifically designed to catch the 50ms ST during handoff
+ */
+static void fast_st_decode(amps_t *amps, sample_t *samples, int length)
+{
+	double results[2], sig_level, sig_quality;
+	
+	/* Run Goertzel filters for ST and noise reference */
+	audio_goertzel(&amps->fast_st_goertzel[0], samples, length, 0, &results[0], 1);
+	audio_goertzel(&amps->fast_st_goertzel[1], samples, length, 0, &results[1], 1);
+	
+	/* Normalize levels */
+	sig_level = results[0] / ((!tacs) ? AMPS_FSK_DEVIATION : TACS_FSK_DEVIATION);
+	
+	/* Calculate quality (ratio of ST to noise) */
+	sig_quality = (results[0] > results[1] && results[0] > 0.001) ?
+	              (results[0] - results[1]) / results[0] : 0.0;
+	if (sig_quality < 0)
+		sig_quality = 0;
+	
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "Fast ST: level=%.0f%% quality=%.0f%%\n", 
+	          sig_level * 100.0, sig_quality * 100.0);
+	
+	/* Fast ST detection - lower thresholds for quick detection */
+	if (sig_quality > 0.70 && sig_level > 0.15) {
+		if (amps->fast_st_detected == 0) {
+			amps->fast_st_count++;
+			/* Require 2 consecutive detections (40ms) to confirm */
+			if (amps->fast_st_count >= 2) {
+				amps->fast_st_detected = 1;
+				amps->fast_st_count = 0;
+				LOGP_CHAN(DDSP, LOGL_NOTICE, "Fast ST detected! level=%.0f%% quality=%.0f%%\n", 
+				          sig_level * 100.0, sig_quality * 100.0);
+				amps_rx_signaling_tone(amps, 1, sig_quality);
+			}
+		} else {
+			amps->fast_st_count = 0;
+		}
+	} else {
+		if (amps->fast_st_detected == 1) {
+			amps->fast_st_count++;
+			/* Require 2 consecutive losses (40ms) to confirm loss */
+			if (amps->fast_st_count >= 2) {
+				amps->fast_st_detected = 0;
+				amps->fast_st_count = 0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "Fast ST lost.\n");
+				amps_rx_signaling_tone(amps, 0, 0.0);
+			}
+		} else {
+			amps->fast_st_count = 0;
+		}
+	}
+}
+
 static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 {
 	transaction_t *trans = amps->trans_list;
 	sample_t *spl, s;
 	int max, pos;
 	int i;
+	int use_fast_st = 0;
+	
+	/* Check if we should use fast ST detection (during handoff) */
+	if (trans && trans->state == TRANS_CALL_HANDOFF_SEND) {
+		use_fast_st = 1;
+	}
+	
+	/* Fast ST detection during handoff - process raw samples BEFORE the delay buffer
+	 * This gives us the most recent samples for quick ST detection
+	 */
+	if (use_fast_st && amps->fast_st_buffer) {
+		sample_t *fast_spl = amps->fast_st_buffer;
+		int fast_max = amps->fast_st_samples;
+		int fast_pos = amps->fast_st_pos;
+		
+		/* Use the raw incoming samples for fast ST detection */
+		for (i = 0; i < length; i++) {
+			fast_spl[fast_pos++] = samples[i];
+			if (fast_pos >= fast_max) {
+				fast_pos = 0;
+				fast_st_decode(amps, fast_spl, fast_max);
+			}
+		}
+		amps->fast_st_pos = fast_pos;
+	}
 
 	/* SAT / signalling tone detection */
 	max = amps->sat_samples;
@@ -876,12 +1199,39 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		int pos, count;
 		int i;
 
+		/* Parallel FSK detection (Blank-and-Burst support) */
+		/* We process raw samples before filtering to catch dotting/sync */
+		for (i = 0; i < length; i++) {
+			/* Optimization: Only process full FSK if we are "hunting" (dotting detected) or "syncing" */
+			/* Lightweight dotting check is cheap. Full decoding happens only if dotting triggers. */
+			fsk_rx_sample(amps, samples[i]);
+		}
+
+		/* If we catch a digital frame during audio mode, we might want to mute audio (blanking) */
+		/* For now, we let both run. If FSK decoder wins, it triggers a callback. */
+
 		/* de-emphasis */
-		if (amps->de_emphasis)
-			de_emphasis(&amps->estate, samples, length);
-		/* downsample */
+		/* downsample first (channel filter) */
+		/* But first! Apply RX Pre-Filter to remove SAT tone (6kHz) and noise before downsampling */
+		/* Apply HPF (300Hz) first to kill DC and LF noise */
+		iir_process(&amps->rx_hpf, samples, length);
+		/* Apply Notch Filter (6000Hz) to kill the pilot tone */
+		iir_process(&amps->rx_notch_filter, samples, length);
+		/* Then apply LPF (3000Hz) to clean up everything else */
+		iir_process(&amps->rx_pre_filter, samples, length);
+
 		count = samplerate_downsample(&amps->sender.srstate, samples, length);
+
+		/* de-emphasis (now at 8000 Hz) - use estate_rx which is initialized for 8000 Hz! */
+		if (amps->de_emphasis)
+			de_emphasis(&amps->estate_rx, samples, count);
+
+		/* removed redundant second downsample - other DSP files (cnetz, nmt, r2000) only have one */
 		expand_audio(&amps->cstate, samples, count);
+
+		/* Echo suppressor RX processing (near-end audio after DSP processing) */
+		call_echo_suppressor_rx(trans->callref, samples, count);
+
 		spl = amps->sender.rxbuf;
 		pos = amps->sender.rxbuf_pos;
 		for (i = 0; i < count; i++) {
@@ -929,6 +1279,16 @@ static void sat_reset(amps_t *amps, const char *reason)
 	amps->sat_detect_count = 0;
 	amps->sig_detected = 0;
 	amps->sig_detect_count = 0;
+	/* Reset enhanced SAT state machine */
+	amps->sat_state = SAT_STATE_NONE;
+	amps->sat_pending_state = SAT_STATE_NONE;
+	amps->sat_state_count = 0;
+	amps->sat_freq_detected = SAT_FREQ_INVALID;
+	amps->sat_level_db = -100.0;
+	/* Reset fast ST detection */
+	amps->fast_st_detected = 0;
+	amps->fast_st_count = 0;
+	amps->fast_st_pos = 0;
 }
 
 void amps_set_dsp_mode(amps_t *amps, enum dsp_mode mode, int frame_length)
@@ -969,6 +1329,8 @@ void amps_set_dsp_mode(amps_t *amps, enum dsp_mode mode, int frame_length)
 	amps->dsp_mode = mode;
 	if (frame_length)
 		amps->fsk_rx_frame_length = frame_length;
+	else if (mode == DSP_MODE_AUDIO_RX_AUDIO_TX || mode == DSP_MODE_AUDIO_RX_FRAME_TX)
+		amps->fsk_rx_frame_length = 240;
 
 	/* reset detection process */
 	amps->fsk_rx_sync = FSK_SYNC_NONE;
