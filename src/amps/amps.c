@@ -3825,32 +3825,35 @@ int amps_directed_retry(const char *number, int *channels, int num_channels, int
 	if (trans) {
 		/* Subscriber has a transaction - check if in valid access state
 		 * Per TIA/EIA-553-A, Directed Retry is only valid during access:
-		 * - After page response (TRANS_PAGE_REPLY)
-		 * - During MO call setup before channel assignment (TRANS_CALL_MO_ASSIGN)
-		 * - During MT call setup before channel assignment (TRANS_CALL_MT_ASSIGN)
+		 * Mobile must be on FOCC (not yet tuned to voice channel)
 		 */
-		if (trans->state == TRANS_PAGE_REPLY) {
-			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Directed Retry: mobile '%s' in PAGE_REPLY state (valid)\n", number);
-		} else if (trans->state == TRANS_CALL_MO_ASSIGN) {
-			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Directed Retry: mobile '%s' in MO_ASSIGN state (valid)\n", number);
-		} else if (trans->state == TRANS_CALL_MT_ASSIGN) {
-			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Directed Retry: mobile '%s' in MT_ASSIGN state (valid)\n", number);
-		} else {
+		int valid = 0;
+		switch (trans->state) {
+		case TRANS_PAGE_REPLY:           /* MT: responded to page */
+		case TRANS_CALL_MO_WAIT_PROCEED: /* MO: waiting for network PROCEEDING */
+		case TRANS_CALL_MO_ASSIGN:       /* MO: about to send VC assignment */
+		case TRANS_CALL_MO_ASSIGN_SEND:  /* MO: sending VC assignment */
+		case TRANS_CALL_MT_ASSIGN:       /* MT: about to send VC assignment */
+		case TRANS_CALL_MT_ASSIGN_SEND:  /* MT: sending VC assignment */
+			valid = 1;
+			break;
+		default:
+			break;
+		}
+		if (!valid) {
 			LOGP_CHAN(DAMPS, LOGL_ERROR, "Directed Retry: mobile '%s' not in access state!\n", number);
-			LOGP_CHAN(DAMPS, LOGL_ERROR, "  Current state: %s\n", trans_short_state_name(trans->state));
-			LOGP_CHAN(DAMPS, LOGL_ERROR, "  Directed Retry only works during access (page response, call setup)\n");
-			LOGP_CHAN(DAMPS, LOGL_ERROR, "  The mobile must be actively accessing the system.\n");
+			LOGP_CHAN(DAMPS, LOGL_ERROR, "  Current state: %s - mobile may already be on voice channel\n", 
+				trans_short_state_name(trans->state));
 			return -CAUSE_BUSY;
 		}
-		/* Reuse existing transaction - update state for Directed Retry */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Directed Retry: mobile '%s' in %s state\n", 
+			number, trans_short_state_name(trans->state));
+		
+		/* Cancel any pending timer (e.g., network timeout) */
+		osmo_timer_del(&trans->timer);
 	} else {
 		/* No transaction - mobile is idle, Directed Retry won't work */
-		LOGP(DAMPS, LOGL_ERROR, "Directed Retry: no active transaction for '%s'\n", number);
-		LOGP(DAMPS, LOGL_ERROR, "  The mobile is idle (not accessing the system).\n");
-		LOGP(DAMPS, LOGL_ERROR, "  Directed Retry only works during access attempts:\n");
-		LOGP(DAMPS, LOGL_ERROR, "  - After mobile responds to a page\n");
-		LOGP(DAMPS, LOGL_ERROR, "  - During mobile-originated call setup\n");
-		LOGP(DAMPS, LOGL_ERROR, "  To test: page the mobile first, then send retry during PAGE_REPLY state.\n");
+		LOGP(DAMPS, LOGL_ERROR, "Directed Retry: no active transaction for '%s' - mobile is idle\n", number);
 		return -CAUSE_OUTOFORDER;
 	}
 
