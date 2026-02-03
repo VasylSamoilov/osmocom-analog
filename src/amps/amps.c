@@ -1258,13 +1258,23 @@ void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t e
 		 * ORDQ=3 (011): Autonomous - Make whereabouts known
 		 * MSG_TYPE=0: Normal registration
 		 * MSG_TYPE=1: Power-Down registration (only with ORDQ=3)
+		 *
+		 * Human-readable meanings:
+		 * - Autonomous: Phone decided to register on its own (power-up, timer, location change)
+		 * - Non-autonomous: Network requested the phone to register
+		 * - Whereabouts known: Phone wants to receive incoming calls (normal)
+		 * - Whereabouts hidden: Phone registers but doesn't want to be reachable (privacy)
+		 * - ORDQ=3 is the normal power-up registration (phone-initiated, wants calls)
 		 */
 		const char *reg_type;
 		const char *whereabouts = (ordq & 1) ? "whereabouts known" : "whereabouts hidden";
 		const char *auto_type = (ordq & 2) ? "Autonomous" : "Non-autonomous";
-		reg_type = auto_type;  /* Use autonomous/non-autonomous as primary type */
+		const char *human_readable = (ordq & 2) ? "Phone registering on its own (power-up, timer, location change)" : "Network requested the phone to register";
+		const char *human_reachable = (ordq & 1) ? " Phone wants to receive incoming calls (normal)" : "Phone registers but doesn't want to be reachable (privacy)";
+		reg_type = auto_type;
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Registration (%s, %s, ORDQ=%d) %s (ESN = %s, %s, %s)%s\n", 
 			reg_type, whereabouts, ordq, callerid, esn_to_string(esn), amps_scm(scm), amps_mpci(mpci), (mspc || mscap) ? " +PCI" : "");
+		LOGP_CHAN(DAMPS, LOGL_INFO, " -> %s, %s\n", human_readable, human_reachable);
 _register:
 		numbering(callerid, &carrier, &country, &national_number);
 		if (carrier)
@@ -1284,8 +1294,10 @@ _register:
 		/* Per TIA/EIA-553-A Table 3.7.1-1:
 		 * Order 13, ORDQ=3, MSG_TYPE=1 = Autonomous Registration - Power Down
 		 * This is sent by the mobile just before it powers off.
+		 * Phone is saying goodbye - it will no longer be reachable.
 		 */
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Registration (Power-Down, Autonomous, ORDQ=3, MSG_TYPE=1) %s (ESN = %s, %s, %s)\n", callerid, esn_to_string(esn), amps_scm(scm), amps_mpci(mpci));
+		LOGP_CHAN(DAMPS, LOGL_INFO, " -> phone shutting down, no longer reachable\n");
 		goto _register;
 	} else
 	if (order == 0 && ordq == 0 && msg_type == 0) {
@@ -1331,33 +1343,65 @@ _register:
 		}
 		if (trans && dialing)
 			LOGP(DAMPS, LOGL_NOTICE, "There is already a transaction for this phone. Cloning?\n");
-		vc = search_free_vc();
-		if (!vc) {
-			LOGP(DAMPS, LOGL_NOTICE, "No free channel, rejecting call\n");
-reject:
+		
+		/* For MO calls (new transaction), use delayed channel assignment */
+		if (!trans && dialing) {
+			/* Delayed channel assignment - wait for network PROCEEDING before assigning voice channel.
+			 * This allows us to send Reorder/Intercept on FOCC if call fails early.
+			 */
+			LOGP_CHAN(DAMPS, LOGL_INFO, "MO call to '%s' - waiting for network PROCEEDING\n", dialing);
+			trans = create_transaction(amps, TRANS_CALL_MO_WAIT_PROCEED, min1, min2, esn, 0, 0, 0, 0);
 			if (!trans) {
-				trans = create_transaction(amps, TRANS_CALL_REJECT, min1, min2, esn, 0, 0, 3, 0);
+				LOGP(DAMPS, LOGL_ERROR, "Failed to create transaction\n");
+				return;
+			}
+			strncpy(trans->dialing, dialing, sizeof(trans->dialing) - 1);
+			
+			/* Setup call to network immediately */
+			char esn_text[16];
+			sprintf(esn_text, "%u", esn);
+			LOGP(DAMPS, LOGL_INFO, "Setup call to network (waiting for PROCEEDING).\n");
+			trans->callref = call_up_setup(callerid, dialing, OSMO_CC_NETWORK_AMPS_ESN, esn_text);
+			
+			/* Start timeout timer (per TIA/EIA-553-A, max 5 seconds) */
+			osmo_timer_schedule(&trans->timer, network_timeout, 0);
+		} else if (!trans) {
+			/* Paging reply or other - need voice channel */
+			vc = search_free_vc();
+			if (!vc) {
+				LOGP(DAMPS, LOGL_NOTICE, "No free channel, rejecting call\n");
+reject:
 				if (!trans) {
-					LOGP(DAMPS, LOGL_ERROR, "Failed to create transaction\n");
-					return;
+					trans = create_transaction(amps, TRANS_CALL_REJECT, min1, min2, esn, 0, 0, 3, 0);
+					if (!trans) {
+						LOGP(DAMPS, LOGL_ERROR, "Failed to create transaction\n");
+						return;
+					}
+				} else {
+					trans_new_state(trans, TRANS_CALL_REJECT);
+					trans->chan = 0;
+					trans->msg_type = 0;
+					trans->ordq = 0;
+					trans->order = 3;
 				}
-			} else {
+				return;
+			}
+			/* This shouldn't happen - paging reply without transaction */
+			LOGP(DAMPS, LOGL_ERROR, "Unexpected: no transaction for non-MO call\n");
+			return;
+		} else {
+			/* Existing transaction - paging reply or silent page reply */
+			/* Need to find a voice channel for these */
+			vc = search_free_vc();
+			if (!vc) {
+				LOGP(DAMPS, LOGL_NOTICE, "No free channel for paging reply, rejecting\n");
 				trans_new_state(trans, TRANS_CALL_REJECT);
 				trans->chan = 0;
 				trans->msg_type = 0;
 				trans->ordq = 0;
 				trans->order = 3;
-			}
-			return;
-		}
-		if (!trans) {
-			trans = create_transaction(amps, TRANS_CALL_MO_ASSIGN, min1, min2, esn, 0, 0, 0, atoi(vc->sender.kanal));
-			strncpy(trans->dialing, dialing, sizeof(trans->dialing) - 1);
-			if (!trans) {
-				LOGP(DAMPS, LOGL_ERROR, "Failed to create transaction\n");
 				return;
 			}
-		} else {
 			/* Check if this is a silent page reply */
 			if (trans->state == TRANS_SILENT_PAGE_REPLY) {
 				LOGP_CHAN(DAMPS, LOGL_INFO, "Silent Page: page reply received, assigning voice channel\n");
@@ -1474,6 +1518,60 @@ void call_down_answer(int __attribute__((unused)) callref, struct timeval __attr
 {
 }
 
+/* Call control sends PROCEEDING - network accepted the call setup.
+ * For delayed channel assignment: Now we can assign the voice channel.
+ */
+void call_down_proceeding(int callref)
+{
+	sender_t *sender;
+	amps_t *amps;
+	amps_t *vc;
+	transaction_t *trans;
+
+	LOGP(DAMPS, LOGL_INFO, "Network sent PROCEEDING for call.\n");
+
+	for (sender = sender_head; sender; sender = sender->next) {
+		amps = (amps_t *) sender;
+		/* search transaction for this callref */
+		trans = search_transaction_callref(amps, callref);
+		if (trans)
+			break;
+	}
+	if (!sender) {
+		LOGP(DAMPS, LOGL_DEBUG, "PROCEEDING received but no transaction (may be internal call)\n");
+		return;
+	}
+
+	/* Only handle if we're in WAIT_PROCEED state (delayed assignment) */
+	if (trans->state != TRANS_CALL_MO_WAIT_PROCEED) {
+		LOGP(DAMPS, LOGL_DEBUG, "PROCEEDING received but not in WAIT_PROCEED state (state=%s)\n",
+			trans_short_state_name(trans->state));
+		return;
+	}
+
+	/* Cancel the timeout timer */
+	osmo_timer_del(&trans->timer);
+
+	/* Now assign voice channel */
+	vc = search_free_vc();
+	if (!vc) {
+		LOGP(DAMPS, LOGL_NOTICE, "No free voice channel after PROCEEDING, sending Reorder\n");
+		const char *number = amps_min2number(trans->min1, trans->min2);
+		if (trans->callref) {
+			call_up_release(trans->callref, CAUSE_NOCHANNEL);
+			trans->callref = 0;
+		}
+		amps_reorder(number);
+		return;
+	}
+
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Network PROCEEDING received, assigning voice channel %s\n", vc->sender.kanal);
+
+	/* Set channel and transition to assignment state */
+	trans->chan = atoi(vc->sender.kanal);
+	trans_new_state(trans, TRANS_CALL_MO_ASSIGN);
+}
+
 /* Call control sends disconnect (with tones).
  * An active call stays active, so tones and annoucements can be received
  * by mobile station.
@@ -1550,75 +1648,54 @@ void call_down_release(int callref, int cause)
 	case DSP_MODE_AUDIO_RX_SILENCE_TX:
 	case DSP_MODE_AUDIO_RX_AUDIO_TX:
 	case DSP_MODE_AUDIO_RX_FRAME_TX:
-		/*
-		 * Automatic Reorder/Intercept Order Integration
-		 * ==============================================
-		 *
-		 * When the network releases a call during the CALL SETUP phase
-		 * (before the call is connected), we send Reorder or Intercept
-		 * orders to inform the mobile user WHY the call failed.
-		 *
-		 * Per TIA/EIA-553-A Section 2.6.3.8 (Await message):
-		 * "If the access is an origination:
-		 *   - Intercept: The mobile station shall enter the Serving-System
-		 *     Determination Task
-		 *   - Reorder: The mobile station shall enter the Serving-System
-		 *     Determination Task"
-		 *
-		 * This means NO RELEASE ORDER IS NEEDED after Reorder/Intercept!
-		 * The mobile plays the tone and automatically returns to idle.
-		 * The base station sends Reorder or Intercept, then cleans up
-		 * the transaction locally.
-		 *
-		 * TIMING:
-		 * The window for sending Reorder/Intercept is during call setup:
-		 *   - TRANS_CALL_MO_ASSIGN_CONFIRM: Mobile originated, SAT received
-		 *   - TRANS_CALL_MT_ASSIGN_CONFIRM: Mobile terminated, SAT received
-		 *     (Note: Intercept is only valid for MO calls per standard)
-		 *
-		 * Once in TRANS_CALL (active call), Reorder/Intercept have no effect.
-		 *
-		 * CAUSE CODE MAPPING:
-		 *   Reorder (Order 4) - "All circuits busy, try again later"
-		 *     - CAUSE_NOCHANNEL (34): No circuit/channel available
-		 *     - CAUSE_TEMPFAIL (41): Temporary failure
-		 *     - SIP 486 Busy Here, 503 Service Unavailable
-		 *
-		 *   Intercept (Order 9) - "Number cannot be completed as dialed"
-		 *     - CAUSE_INVALNUMBER (28): Invalid number format
-		 *     - CAUSE_OUTOFORDER (27): Destination out of service
-		 *     - SIP 404 Not Found, 410 Gone, 604 Does Not Exist
-		 *
-		 * TESTING:
-		 * - Configure osmo-cc-sip to reject calls with specific SIP codes
-		 * - Verify mobile plays correct tone and returns to idle
-		 * - Verify base station cleans up transaction properly
-		 */
-		if (trans->state == TRANS_CALL_MO_ASSIGN_CONFIRM) {
-			const char *number = amps_min2number(trans->min1, trans->min2);
-			
-			/* Map cause codes to appropriate order */
-			switch (cause) {
-			case CAUSE_NOCHANNEL:  /* 34 - No circuit available */
-			case CAUSE_TEMPFAIL:   /* 41 - Temporary failure */
-				LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Reorder (cause=%d) to MO caller - no Release needed\n", cause);
-				amps_reorder(number);
-				return; /* Transaction cleanup happens after order is sent */
-			case CAUSE_INVALNUMBER: /* 28 - Invalid number format */
-			case CAUSE_OUTOFORDER:  /* 27 - Destination out of service */
-				LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Intercept (cause=%d) to MO caller - no Release needed\n", cause);
-				amps_intercept(number);
-				return; /* Transaction cleanup happens after order is sent */
-			default:
-				/* Other causes: proceed with normal release */
-				break;
-			}
-		}
-		/* For MT calls in setup or active calls, use normal Release */
+		/* Phone is on voice channel - use Release order */
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Call control releases on voice channel, releasing towards mobile station.\n");
 		amps_release(trans, cause);
 		break;
 	default:
+		/* Phone is on control channel - check if we can send Reorder/Intercept */
+		if (trans->state == TRANS_CALL_MO_WAIT_PROCEED ||
+		    trans->state == TRANS_CALL_MO_ASSIGN ||
+		    trans->state == TRANS_CALL_MO_ASSIGN_SEND) {
+			/*
+			 * Delayed Channel Assignment: Network rejected before phone tuned to VC
+			 * =====================================================================
+			 *
+			 * Phone is still on FOCC - either waiting for PROCEEDING, or we've
+			 * started sending channel assignment but phone hasn't tuned yet.
+			 * Per TIA/EIA-553-A Section 2.6.3.8, we can send Reorder or Intercept
+			 * on FOCC and the mobile will return to idle automatically.
+			 *
+			 * CAUSE CODE MAPPING:
+			 *   Reorder (Order 4) - "All circuits busy, try again later"
+			 *     - CAUSE_NOCHANNEL (34): No circuit/channel available
+			 *     - CAUSE_TEMPFAIL (41): Temporary failure
+			 *
+			 *   Intercept (Order 9) - "Number cannot be completed as dialed"
+			 *     - CAUSE_UNASSIGNED (1): Unassigned/unallocated number
+			 *     - CAUSE_INVALNUMBER (28): Invalid number format
+			 *     - CAUSE_OUTOFORDER (27): Destination out of service
+			 */
+			const char *number = amps_min2number(trans->min1, trans->min2);
+			
+			/* Cancel any pending timer */
+			osmo_timer_del(&trans->timer);
+			
+			switch (cause) {
+			case CAUSE_UNASSIGNED:  /* 1 - Unassigned number (SIP 404) */
+			case CAUSE_INVALNUMBER: /* 28 - Invalid number format */
+			case CAUSE_OUTOFORDER:  /* 27 - Destination out of service */
+				LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Intercept (cause=%d) to MO caller on FOCC\n", cause);
+				amps_intercept(number);
+				return; /* Transaction cleanup happens after order is sent */
+			default:
+				/* All other causes: send Reorder */
+				LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Reorder (cause=%d) to MO caller on FOCC\n", cause);
+				amps_reorder(number);
+				return; /* Transaction cleanup happens after order is sent */
+			}
+		}
+		/* Other control channel states: just destroy transaction */
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Call control releases on control channel, removing transaction.\n");
 		destroy_transaction(trans);
 		amps_go_idle(amps);
@@ -2468,6 +2545,7 @@ int amps_reorder(const char *number)
 {
 	sender_t *sender;
 	amps_t *amps;
+	amps_t *cc_amps;  /* Control channel AMPS instance */
 	transaction_t *trans = NULL;
 	uint32_t min1;
 	uint16_t min2;
@@ -2489,19 +2567,45 @@ int amps_reorder(const char *number)
 		return -CAUSE_OUTOFORDER;
 	}
 
-	/* Reorder is a CALL SETUP order - only valid during channel assignment phase.
-	 * It has no effect during an active call (TRANS_CALL).
-	 * Typical use case: Mobile originates call, gets channel, but PSTN trunk is busy.
+	/* Reorder is ONLY valid on FOCC during call setup, per TIA/EIA-553-A.
+	 * Section 3.6.4.1 lists valid responses to origination: Initial Voice Channel,
+	 * Directed Retry, Intercept, Reorder.
+	 * Section 3.6.4.4 (Conversation on FVC) does NOT include Reorder.
+	 *
+	 * Valid states (phone still on FOCC):
+	 *   - TRANS_CALL_MO_WAIT_PROCEED: Waiting for network PROCEEDING
+	 *   - TRANS_CALL_MO_ASSIGN: PROCEEDING received, about to send assignment
+	 *   - TRANS_CALL_MO_ASSIGN_SEND: Assignment being sent, phone hasn't tuned yet
+	 *
+	 * Invalid states:
+	 *   - TRANS_CALL: Active call on FVC - use Release instead
+	 *   - TRANS_CALL_MO_ASSIGN_CONFIRM: Phone already on FVC waiting for SAT
 	 */
-	if (trans->state != TRANS_CALL_MO_ASSIGN_CONFIRM &&
-	    trans->state != TRANS_CALL_MT_ASSIGN_CONFIRM) {
-		LOGP(DAMPS, LOGL_NOTICE, "Reorder: subscriber '%s' not in call setup state (state=%d). "
-			"Reorder is a call setup order, not an in-call order.\n", 
-			number, trans->state);
-		return -CAUSE_BUSY;
+	if (trans->state == TRANS_CALL) {
+		LOGP(DAMPS, LOGL_ERROR, "Reorder: Cannot send during active call (state=%s). "
+			"Per TIA/EIA-553-A, Reorder is only valid on FOCC during call setup. "
+			"Use Release (Order 3) instead.\n", trans_short_state_name(trans->state));
+		return -EINVAL;
 	}
 
-	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Reorder Order (Order 4, ORDQ=0) to '%s'\n", number);
+	if (trans->state == TRANS_CALL_MO_ASSIGN_CONFIRM ||
+	    trans->state == TRANS_CALL_MT_ASSIGN_CONFIRM) {
+		LOGP(DAMPS, LOGL_ERROR, "Reorder: Phone already on voice channel (state=%s). "
+			"Per TIA/EIA-553-A, Reorder is only valid on FOCC. "
+			"Use Release (Order 3) instead.\n", trans_short_state_name(trans->state));
+		return -EINVAL;
+	}
+
+	if (trans->state != TRANS_CALL_MO_WAIT_PROCEED &&
+	    trans->state != TRANS_CALL_MO_ASSIGN &&
+	    trans->state != TRANS_CALL_MO_ASSIGN_SEND) {
+		LOGP(DAMPS, LOGL_NOTICE, "Reorder: Invalid state %s for subscriber '%s'. "
+			"Reorder is only valid during MO call setup before phone tunes to VC.\n",
+			trans_short_state_name(trans->state), number);
+		return -EINVAL;
+	}
+
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Reorder Order (Order 4, ORDQ=0) to '%s' on FOCC\n", number);
 	LOGP_CHAN(DAMPS, LOGL_NOTICE, ">>> %s - Mobile will play fast busy tone (all circuits busy)\n",
 		amps_table4_name(0, 0, 4));
 
@@ -2511,9 +2615,26 @@ int amps_reorder(const char *number)
 	trans->ordq = 0;       /* ORDQ=0 for Reorder */
 	trans->order = 4;      /* Order 4 = Reorder */
 
-	/* Set transaction state to trigger FVC transmission */
-	trans_new_state(trans, TRANS_CALL_REORDER);
-	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+	/* Cancel any pending timer */
+	osmo_timer_del(&trans->timer);
+
+	/* Find control channel to send the order on FOCC.
+	 * The phone is still listening on FOCC during call setup.
+	 */
+	cc_amps = search_pc();
+	if (!cc_amps) {
+		LOGP(DAMPS, LOGL_ERROR, "No control channel found for Reorder order\n");
+		return -CAUSE_TEMPFAIL;
+	}
+
+	/* Move transaction to control channel if not already there */
+	if (trans->amps != cc_amps) {
+		unlink_transaction(trans);
+		link_transaction(trans, cc_amps);
+	}
+
+	/* Set transaction state to trigger FOCC transmission */
+	trans_new_state(trans, TRANS_REORDER);
 
 	return 0;
 }
@@ -2747,6 +2868,7 @@ int amps_intercept(const char *number)
 {
 	sender_t *sender;
 	amps_t *amps;
+	amps_t *cc_amps;  /* Control channel AMPS instance */
 	transaction_t *trans = NULL;
 	uint32_t min1;
 	uint16_t min2;
@@ -2768,18 +2890,46 @@ int amps_intercept(const char *number)
 		return -CAUSE_OUTOFORDER;
 	}
 
-	/* Intercept is a CALL SETUP order - only valid during channel assignment phase.
-	 * It has no effect during an active call (TRANS_CALL).
-	 * Typical use case: Mobile originates call, gets channel, but dialed number is invalid.
+	/* Intercept is ONLY valid on FOCC during MO call setup, per TIA/EIA-553-A.
+	 * Section 3.6.4.1 lists valid responses to origination: Initial Voice Channel,
+	 * Directed Retry, Intercept, Reorder.
+	 * Section 3.6.4.4 (Conversation on FVC) does NOT include Intercept.
+	 *
+	 * Valid states (phone still on FOCC):
+	 *   - TRANS_CALL_MO_WAIT_PROCEED: Waiting for network PROCEEDING
+	 *   - TRANS_CALL_MO_ASSIGN: PROCEEDING received, about to send assignment
+	 *   - TRANS_CALL_MO_ASSIGN_SEND: Assignment being sent, phone hasn't tuned yet
+	 *
+	 * Invalid states:
+	 *   - TRANS_CALL: Active call on FVC - use Release instead
+	 *   - TRANS_CALL_MO_ASSIGN_CONFIRM: Phone already on FVC waiting for SAT
+	 *   - MT calls: Intercept is only for MO calls (procedural error in placing call)
 	 */
-	if (trans->state != TRANS_CALL_MO_ASSIGN_CONFIRM) {
-		LOGP(DAMPS, LOGL_NOTICE, "Intercept: subscriber '%s' not in call setup state (state=%d). "
-			"Intercept is a call setup order, not an in-call order.\n", 
-			number, trans->state);
-		return -CAUSE_BUSY;
+	if (trans->state == TRANS_CALL) {
+		LOGP(DAMPS, LOGL_ERROR, "Intercept: Cannot send during active call (state=%s). "
+			"Per TIA/EIA-553-A, Intercept is only valid on FOCC during call setup. "
+			"Use Release (Order 3) instead.\n", trans_short_state_name(trans->state));
+		return -EINVAL;
 	}
 
-	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Intercept Order (Order 9, ORDQ=0) to '%s'\n", number);
+	if (trans->state == TRANS_CALL_MO_ASSIGN_CONFIRM ||
+	    trans->state == TRANS_CALL_MT_ASSIGN_CONFIRM) {
+		LOGP(DAMPS, LOGL_ERROR, "Intercept: Phone already on voice channel (state=%s). "
+			"Per TIA/EIA-553-A, Intercept is only valid on FOCC. "
+			"Use Release (Order 3) instead.\n", trans_short_state_name(trans->state));
+		return -EINVAL;
+	}
+
+	if (trans->state != TRANS_CALL_MO_WAIT_PROCEED &&
+	    trans->state != TRANS_CALL_MO_ASSIGN &&
+	    trans->state != TRANS_CALL_MO_ASSIGN_SEND) {
+		LOGP(DAMPS, LOGL_NOTICE, "Intercept: Invalid state %s for subscriber '%s'. "
+			"Intercept is only valid during MO call setup before phone tunes to VC.\n",
+			trans_short_state_name(trans->state), number);
+		return -EINVAL;
+	}
+
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Intercept Order (Order 9, ORDQ=0) to '%s' on FOCC\n", number);
 	LOGP_CHAN(DAMPS, LOGL_NOTICE, ">>> %s - Mobile will play intercept tone (number cannot be completed)\n",
 		amps_table4_name(0, 0, 9));
 
@@ -2789,9 +2939,26 @@ int amps_intercept(const char *number)
 	trans->ordq = 0;       /* ORDQ=0 for Intercept */
 	trans->order = 9;      /* Order 9 = Intercept */
 
-	/* Set transaction state to trigger FVC transmission */
-	trans_new_state(trans, TRANS_CALL_INTERCEPT);
-	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+	/* Cancel any pending timer */
+	osmo_timer_del(&trans->timer);
+
+	/* Find control channel to send the order on FOCC.
+	 * The phone is still listening on FOCC during call setup.
+	 */
+	cc_amps = search_pc();
+	if (!cc_amps) {
+		LOGP(DAMPS, LOGL_ERROR, "No control channel found for Intercept order\n");
+		return -CAUSE_TEMPFAIL;
+	}
+
+	/* Move transaction to control channel if not already there */
+	if (trans->amps != cc_amps) {
+		unlink_transaction(trans);
+		link_transaction(trans, cc_amps);
+	}
+
+	/* Set transaction state to trigger FOCC transmission */
+	trans_new_state(trans, TRANS_INTERCEPT);
 
 	return 0;
 }
@@ -4107,6 +4274,23 @@ void transaction_timeout(void *data)
 	amps_t *amps = trans->amps;
 
 	switch (trans->state) {
+	case TRANS_CALL_MO_WAIT_PROCEED:
+		/* Network didn't respond with PROCEEDING within timeout
+		 * Per TIA/EIA-553-A §2.6.3.8: Mobile waits up to 5 seconds
+		 * We use 4 seconds with safety margin
+		 */
+		LOGP_CHAN(DAMPS, LOGL_NOTICE, "Network timeout waiting for PROCEEDING (4s), sending Reorder\n");
+		{
+			const char *number = amps_min2number(trans->min1, trans->min2);
+			/* Release call towards network if callref exists */
+			if (trans->callref) {
+				call_up_release(trans->callref, CAUSE_TEMPFAIL);
+				trans->callref = 0;
+			}
+			/* Send Reorder on FOCC - phone will play fast busy and return to idle */
+			amps_reorder(number);
+		}
+		break;
 	case TRANS_CALL_MO_ASSIGN_CONFIRM:
 	case TRANS_CALL_MT_ASSIGN_CONFIRM:
 		LOGP_CHAN(DAMPS, LOGL_NOTICE, "Timeout after %ld seconds not receiving initial SAT signal.\n", trans->timer.timeout.tv_sec);
@@ -4383,6 +4567,30 @@ again:
 	case TRANS_DIRECTED_RETRY_SEND:
 		/* Directed Retry sent - fire and forget, destroy transaction */
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Directed Retry order sent on FOCC\n");
+		destroy_transaction(trans);
+		goto again;
+	case TRANS_REORDER:
+		/* Reorder (Order 4) on FOCC during call setup
+		 * Phone is still listening on FOCC, not yet tuned to voice channel.
+		 */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Reorder order (Order 4, ORDQ=0) on FOCC\n");
+		trans_new_state(trans, TRANS_REORDER_SEND);
+		return trans;
+	case TRANS_REORDER_SEND:
+		/* Reorder sent on FOCC - mobile returns to idle automatically */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Reorder order sent on FOCC - mobile will return to idle\n");
+		destroy_transaction(trans);
+		goto again;
+	case TRANS_INTERCEPT:
+		/* Intercept (Order 9) on FOCC during call setup
+		 * Phone is still listening on FOCC, not yet tuned to voice channel.
+		 */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Intercept order (Order 9, ORDQ=0) on FOCC\n");
+		trans_new_state(trans, TRANS_INTERCEPT_SEND);
+		return trans;
+	case TRANS_INTERCEPT_SEND:
+		/* Intercept sent on FOCC - mobile returns to idle automatically */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Intercept order sent on FOCC - mobile will return to idle\n");
 		destroy_transaction(trans);
 		goto again;
 	case TRANS_PAGE_SEND:

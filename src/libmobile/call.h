@@ -38,6 +38,7 @@ int call_down_setup(int callref, const char *caller_id, enum number_type caller_
 void call_down_answer(int callref, struct timeval *tv_meter);
 void call_down_disconnect(int callref, int cause);
 void call_down_release(int callref, int cause);
+void call_down_proceeding(int callref);  /* Network sent PROCEEDING - can assign channel now */
 
 /* send and receive audio */
 void call_up_audio(int callref, sample_t *samples, int count);

@@ -1602,6 +1602,10 @@ void call_down_answer(int __attribute__((unused)) callref, struct timeval __attr
 {
 }
 
+void call_down_proceeding(int __attribute__((unused)) callref)
+{
+}
+
 /* Call control sends disconnect (with tones).
  * An active call stays active, so tones and annoucements can be received
  * by mobile station.

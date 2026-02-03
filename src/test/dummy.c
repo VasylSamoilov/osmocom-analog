@@ -13,6 +13,7 @@ int call_down_setup(int __attribute__((unused)) callref, const char __attribute_
 void call_down_release(int __attribute__((unused)) callref, int __attribute__((unused)) cause) { }
 void call_down_disconnect(int __attribute__((unused)) callref, int __attribute__((unused)) cause) { }
 void call_down_answer(int __attribute__((unused)) callref, struct timeval __attribute__((unused)) *tv_meter) { }
+void call_down_proceeding(int __attribute__((unused)) callref) { }
 void print_help(const char __attribute__((unused)) *argv0) { }
 void sender_send(sender_t __attribute__((unused)) *sender, sample_t __attribute__((unused)) *samples, uint8_t __attribute__((unused)) *power, int __attribute__((unused)) count) { }
 void sender_receive(sender_t __attribute__((unused)) *sender, sample_t __attribute__((unused)) *samples, int __attribute__((unused)) count, double __attribute__((unused)) rf_level_db) { }
