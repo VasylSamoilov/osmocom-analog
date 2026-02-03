@@ -72,6 +72,7 @@ test_dms_SOURCES = test_dms.c dummy.c
 test_dms_LDADD = \
 	$(COMMON_LA) \
 	$(top_builddir)/src/libmobile/libmobile.a \
+	$(top_builddir)/src/libdtmf/libdtmf.a \
 	$(top_builddir)/src/libtones/libtones.a \
 	$(top_builddir)/src/liboptions/liboptions.a \
 	$(top_builddir)/src/libdisplay/libdisplay.a \
@@ -86,6 +87,7 @@ test_dms_LDADD = \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(top_builddir)/src/libecho/libecho.a \
 	$(top_builddir)/src/libgoertzel/libgoertzel.a \
+	$(top_builddir)/src/libfm/libfm.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm
@@ -112,6 +114,7 @@ test_sms_SOURCES = dummy.c test_sms.c
 test_sms_LDADD = \
 	$(COMMON_LA) \
 	$(top_builddir)/src/libmobile/libmobile.a \
+	$(top_builddir)/src/libdtmf/libdtmf.a \
 	$(top_builddir)/src/libtones/libtones.a \
 	$(top_builddir)/src/liboptions/liboptions.a \
 	$(top_builddir)/src/libdisplay/libdisplay.a \
@@ -126,6 +129,7 @@ test_sms_LDADD = \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(top_builddir)/src/libecho/libecho.a \
 	$(top_builddir)/src/libgoertzel/libgoertzel.a \
+	$(top_builddir)/src/libfm/libfm.a \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOCC_LIBS) \
 	-lm

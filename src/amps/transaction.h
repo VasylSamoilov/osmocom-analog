@@ -47,6 +47,8 @@ enum amps_trans_state {
 	TRANS_CALL_DIGITS_REPLY,	/* Called-Address response received (Order 8) */
 	TRANS_CALL_LOCAL_CONTROL,	/* sending Local Control order (Order 30), waiting to send */
 	TRANS_CALL_LOCAL_CONTROL_SEND,	/* sending Local Control order (Order 30), sending */
+	TRANS_CALL_DISABLE_DTMF,	/* sending Disable DTMF order (Order 22), waiting to send */
+	TRANS_CALL_DISABLE_DTMF_SEND,	/* sending Disable DTMF order (Order 22), waiting for confirmation */
 	TRANS_CALL_HANDOFF,		/* sending Handoff message on FVC, waiting to send */
 	TRANS_CALL_HANDOFF_SEND,	/* sending Handoff message on FVC, waiting for ST */
 	TRANS_CALL_HANDOFF_CONFIRM,	/* Handoff ST received, moving to new channel */

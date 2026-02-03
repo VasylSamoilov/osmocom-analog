@@ -40,6 +40,8 @@
 #include "call.h"
 #include "console.h"
 #include "../libecho/suppressor.h"
+#include "../libdtmf/dtmf_decode.h"
+#include "../libdtmf/dtmf_encode.h"
 #include "../liboptions/options.h"
 
 /* External configuration */
@@ -133,6 +135,17 @@ typedef struct process {
 	/* Echo suppressor */
 	int echo_suppressor_enabled;
 	echo_suppressor_wrapper_t echo_suppressor;
+	
+	/* DTMF decoder (RX from mobile) */
+	dtmf_dec_t dtmf_dec;
+	int dtmf_dec_enabled;
+	
+	/* DTMF encoder (TX to mobile) */
+	dtmf_enc_t dtmf_enc;
+	char dtmf_tx_queue[33];
+	double dtmf_tone_duration;
+	double dtmf_gap_duration;
+	int dtmf_tx_active;
 } process_t;
 
 static process_t *process_head = NULL;
@@ -140,6 +153,7 @@ static process_t *process_head = NULL;
 static void process_timeout(void *data);
 static void indicate_disconnect_release(int callref, int cause, uint8_t msg_type);
 static void call_echo_suppressor_cleanup(process_t *process);
+static void call_dtmf_cleanup(process_t *process);
 
 static process_t *create_process(int callref, enum process_state state)
 {
@@ -176,6 +190,8 @@ static void destroy_process(int callref)
 			osmo_timer_del(&process->timer);
 			if (process->session)
 				osmo_cc_free_session(process->session);
+			/* Cleanup DTMF */
+			call_dtmf_cleanup(process);
 			/* Cleanup echo suppressor */
 			call_echo_suppressor_cleanup(process);
 			free(process);
@@ -289,6 +305,136 @@ static void call_echo_suppressor_cleanup(process_t *process)
 	if (supp->suppressor_state) {
 		echo_suppressor_cleanup(supp->suppressor_state);
 		supp->suppressor_state = NULL;
+	}
+}
+
+/* ===== DTMF Functions ===== */
+
+/* DTMF decoder callback - called when a digit is detected */
+static void call_dtmf_rx_digit(void *priv, char digit, dtmf_meas_t __attribute__((unused)) *meas)
+{
+	process_t *process = priv;
+
+	LOGP(DCALL, LOGL_INFO, "DTMF digit '%c' detected from mobile\n", digit);
+
+	if (process && process->callref)
+		call_up_dtmf(process->callref, digit);
+}
+
+/* Initialize DTMF processing for a process (called when call becomes active) */
+static int call_dtmf_init(process_t *process)
+{
+	int rc;	if (process->dtmf_dec_enabled)
+		return 0;  /* Already initialized */
+
+	rc = dtmf_decode_init(&process->dtmf_dec, process, call_dtmf_rx_digit,
+			      8000,  /* sample rate */
+			      10.0,  /* max amplitude - allow for expanded audio that may exceed 1.0 */
+			      0.1,   /* min amplitude (-20 dB) - higher threshold to avoid false triggers */
+			      DTMF_FREQ_MARGIN_PERCENT_DEFAULT);
+	if (rc < 0) {
+		LOGP(DCALL, LOGL_ERROR, "Failed to init DTMF decoder!\n");
+		return -1;
+	}
+	process->dtmf_dec_enabled = 1;
+
+	dtmf_encode_init(&process->dtmf_enc, 8000, 1.0);  /* Amplitude */
+	process->dtmf_tone_duration = 0.250;  /* 250ms tone */
+	process->dtmf_gap_duration = 0.160;   /* 160ms gap */
+	process->dtmf_tx_queue[0] = '\0';
+	process->dtmf_tx_active = 0;
+
+	LOGP(DCALL, LOGL_DEBUG, "DTMF initialized for call\n");
+
+	return 0;
+}
+
+/* Cleanup DTMF processing for a process */
+static void call_dtmf_cleanup(process_t *process)
+{
+	if (!process || !process->dtmf_dec_enabled)
+		return;
+
+	dtmf_decode_exit(&process->dtmf_dec);
+	process->dtmf_dec_enabled = 0;
+	process->dtmf_tx_queue[0] = '\0';
+	process->dtmf_tx_active = 0;
+	LOGP(DCALL, LOGL_DEBUG, "DTMF cleanup complete\n");
+}
+
+/* Process RX samples for DTMF detection (call AFTER echo suppressor) */
+void call_dtmf_rx(int callref, sample_t *samples, int count)
+{
+	process_t *process = get_process(callref);
+
+	if (!process || !process->dtmf_dec_enabled)
+		return;
+
+	dtmf_decode(&process->dtmf_dec, samples, count);
+}
+
+/* Process TX samples for DTMF generation (call BEFORE echo suppressor) */
+void call_dtmf_tx(int callref, sample_t *samples, int count)
+{
+	process_t *process = get_process(callref);
+	sample_t dtmf_samples[count];
+	int generated;
+	int i;
+
+	if (!process || !process->dtmf_dec_enabled)
+		return;
+
+	/* Nothing to do if no digits queued and not currently active */
+	if (!process->dtmf_tx_queue[0] && !process->dtmf_tx_active)
+		return;
+
+	/* Start new tone if queue has digits and not currently active */
+	if (!process->dtmf_tx_active && process->dtmf_tx_queue[0]) {
+		char digit = process->dtmf_tx_queue[0];
+		memmove(process->dtmf_tx_queue, process->dtmf_tx_queue + 1,
+			strlen(process->dtmf_tx_queue));
+		dtmf_encode_set_tone(&process->dtmf_enc, digit,
+				    process->dtmf_tone_duration,
+				    process->dtmf_gap_duration);
+		process->dtmf_tx_active = 1;
+		LOGP(DCALL, LOGL_INFO, "DTMF TX: Sending '%c' to mobile\n", digit);
+	}
+
+	/* Generate DTMF samples */
+	generated = dtmf_encode(&process->dtmf_enc, dtmf_samples, count);
+	if (generated == 0 && process->dtmf_tx_active)
+		process->dtmf_tx_active = 0;
+
+	/* Mix DTMF with audio (additive) */
+	for (i = 0; i < generated; i++)
+		samples[i] += dtmf_samples[i];
+}
+
+/* Queue DTMF digits for TX to mobile */
+void call_dtmf_queue(int callref, const char *digits)
+{
+	process_t *process = get_process(callref);
+	size_t queue_len, digits_len, space;	if (!process || !digits || !digits[0])
+		return;
+
+	if (!process->dtmf_dec_enabled) {
+		LOGP(DCALL, LOGL_NOTICE, "DTMF not enabled for callref %d\n", callref);
+		return;
+	}
+
+	queue_len = strlen(process->dtmf_tx_queue);
+	digits_len = strlen(digits);
+	space = sizeof(process->dtmf_tx_queue) - 1 - queue_len;
+
+	if (digits_len > space) {
+		LOGP(DCALL, LOGL_NOTICE, "DTMF TX queue overflow, truncating '%s'\n", digits);
+		digits_len = space;
+	}
+
+	if (digits_len > 0) {
+		strncat(process->dtmf_tx_queue, digits, digits_len);
+		LOGP(DCALL, LOGL_INFO, "Queued DTMF for TX: '%.*s' (queue now: '%s')\n",
+			(int)digits_len, digits, process->dtmf_tx_queue);
 	}
 }
 
@@ -545,6 +691,9 @@ void call_up_answer(int callref, const char *connect_id)
 		process->echo_suppressor_enabled = 1;
 		call_echo_suppressor_init(process, 8000, 128);
 	}
+	/* Initialize DTMF */
+	if (process)
+		call_dtmf_init(process);
 }
 
 /* Transceiver indicates flash (hook flash). */
@@ -557,6 +706,25 @@ void call_up_flash(int callref)
 
 	LOGP(DCALL, LOGL_INFO, "*** Flash (Hook-Flash) received from mobile (callref=%d) ***\n", callref);
 	/* TODO: Send suitable message to upper layer if supported (e.g. HOLD/RETRIEVE or FACILITY) */
+}
+
+/* Transceiver indicates DTMF digit detected from mobile. */
+void call_up_dtmf(int callref, char digit)
+{
+	osmo_cc_msg_t *msg;
+	char dtmf_str[2] = { digit, '\0' };
+
+	if (!callref) {
+		LOGP(DCALL, LOGL_DEBUG, "Ignoring DTMF, no callref\n");
+		return;
+	}
+
+	LOGP(DCALL, LOGL_INFO, "Forwarding DTMF '%c' to osmo-cc (callref=%d)\n", digit, callref);
+
+	msg = osmo_cc_new_msg(OSMO_CC_MSG_INFO_IND);
+	/* Use IE_DTMF (not IE_KEYPAD) - osmo-cc-sip-endpoint expects IE_DTMF for SIP INFO */
+	osmo_cc_add_ie_dtmf(msg, 160, 160, OSMO_CC_DTMF_MODE_DIGITS, dtmf_str);
+	osmo_cc_ll_msg(ep, callref, msg);
 }
 
 /* Transceiver indicates release. */
@@ -909,6 +1077,8 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 			process->echo_suppressor_enabled = 1;
 			call_echo_suppressor_init(process, 8000, 128);
 		}
+		/* Initialize DTMF */
+		call_dtmf_init(process);
 		break;
 	case OSMO_CC_MSG_DISC_REQ:
 		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
@@ -951,6 +1121,27 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		LOGP(DCALL, LOGL_INFO, "Call released toward mobile network\n");
 		call_down_release(callref, isdn_cause);
 		break;
+	case OSMO_CC_MSG_INFO_REQ:
+	    {
+		char digits[33];
+		uint8_t duration_ms, pause_ms, dtmf_mode;
+		
+		/* Try IE_DTMF first (from SIP INFO) */
+		rc = osmo_cc_get_ie_dtmf(msg, 0, &duration_ms, &pause_ms, &dtmf_mode, digits, sizeof(digits));
+		if (rc >= 0 && digits[0]) {
+			LOGP(DCALL, LOGL_INFO, "Received DTMF (IE_DTMF) from osmo-cc: '%s' (callref=%d)\n", digits, callref);
+			call_dtmf_queue(callref, digits);
+			break;
+		}
+		
+		/* Fall back to IE_KEYPAD */
+		rc = osmo_cc_get_ie_keypad(msg, 0, digits, sizeof(digits));
+		if (rc >= 0 && digits[0]) {
+			LOGP(DCALL, LOGL_INFO, "Received DTMF (IE_KEYPAD) from osmo-cc: '%s' (callref=%d)\n", digits, callref);
+			call_dtmf_queue(callref, digits);
+		}
+		break;
+	    }
 	}
 	osmo_cc_free_msg(msg);
 }

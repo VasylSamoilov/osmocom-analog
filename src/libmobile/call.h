@@ -31,6 +31,7 @@ void call_up_early(int callref);
 void call_up_answer(int callref, const char *connect_id);
 void call_up_flash(int callref);
 void call_up_release(int callref, int cause);
+void call_up_dtmf(int callref, char digit);
 void call_tone_recall(int callref, int on);
 
 /* send messages */
@@ -52,6 +53,11 @@ typedef struct {
 echo_suppressor_wrapper_t *call_get_echo_suppressor_wrapper(int callref);
 void call_echo_suppressor_tx(int callref, sample_t *samples, int count);
 void call_echo_suppressor_rx(int callref, sample_t *samples, int count);
+
+/* DTMF processing (per-call) */
+void call_dtmf_rx(int callref, sample_t *samples, int count);
+void call_dtmf_tx(int callref, sample_t *samples, int count);
+void call_dtmf_queue(int callref, const char *digits);
 
 /* clock to transmit to */
 void call_clock(void); /* from main loop */

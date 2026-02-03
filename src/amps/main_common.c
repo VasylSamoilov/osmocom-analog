@@ -254,6 +254,12 @@ void print_help(const char *arg0)
 	printf("        echo \"esn,<number>\" > /tmp/amps_control\n");
 	printf("        Example: echo \"esn,1234567890\" > /tmp/amps_control\n");
 	printf("        Sends Order 15 - requests mobile to send ESN for verification\n");
+	printf("    Disable DTMF Order:\n");
+	printf("        echo \"disabledtmf,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"disabledtmf,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 22 - mutes mobile's DTMF tones until Called-Address sent\n");
+	printf("        Use before Order 8 (digits) to prevent far-end hearing DTMF\n");
+	printf("        DTMF auto-enables after mobile sends Called-Address response\n");
 	printf("    Local Control Order (Vendor-Specific):\n");
 	printf("        echo \"local,<number>,<code>\" > /tmp/amps_control\n");
 	printf("        Example: echo \"local,1234567890,5\" > /tmp/amps_control\n");
@@ -638,6 +644,30 @@ static void amps_myhandler(void)
 				rc = amps_serial_number_request(number);
 				if (rc < 0)
 					fprintf(stderr, "Serial Number Request failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "disabledtmf") == 0) {
+				/* Parse: disabledtmf,number
+				 * Send Disable DTMF Order (Order 22, ORDQ=0)
+				 * Mutes mobile's DTMF tone generator until Called-Address sent
+				 *
+				 * Per TIA/EIA-553-A Section 2.6.4.4:
+				 * - Mobile confirms with digital Order Confirmation
+				 * - DTMF stays disabled until Called-Address Message transmitted
+				 * - No explicit "Enable DTMF" order - re-enable is automatic
+				 *
+				 * Typical workflow:
+				 * 1. Send disabledtmf -> Mobile mutes DTMF
+				 * 2. User dials digits (no tones heard by far-end)
+				 * 3. Send digits (Order 8) -> Mobile sends Called-Address
+				 * 4. DTMF auto-enables after Called-Address transmission
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: disabledtmf,<number>\n");
+					return;
+				}
+				rc = amps_disable_dtmf(number);
+				if (rc < 0)
+					fprintf(stderr, "Disable DTMF order failed: %d\n", rc);
 			} else if (strcasecmp(cmd, "local") == 0) {
 				/* Parse: local,number,code
 				 * Send Local Control Order (Order 30, ORDQ=0)

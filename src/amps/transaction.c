@@ -150,6 +150,10 @@ static const char *trans_state_name(int state)
 		return "LOCAL CONTROL";
 	case TRANS_CALL_LOCAL_CONTROL_SEND:
 		return "LOCAL CONTROL SEND";
+	case TRANS_CALL_DISABLE_DTMF:
+		return "DISABLE DTMF";
+	case TRANS_CALL_DISABLE_DTMF_SEND:
+		return "DISABLE DTMF SEND";
 	case TRANS_CALL_HANDOFF:
 		return "HANDOFF";
 	case TRANS_CALL_HANDOFF_SEND:
@@ -257,6 +261,9 @@ const char *trans_short_state_name(int state)
 	case TRANS_CALL_LOCAL_CONTROL:
 	case TRANS_CALL_LOCAL_CONTROL_SEND:
 		return "LOCAL";
+	case TRANS_CALL_DISABLE_DTMF:
+	case TRANS_CALL_DISABLE_DTMF_SEND:
+		return "DTMF";
 	case TRANS_CALL_HANDOFF:
 	case TRANS_CALL_HANDOFF_SEND:
 	case TRANS_CALL_HANDOFF_CONFIRM:

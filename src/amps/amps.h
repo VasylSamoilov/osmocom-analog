@@ -272,6 +272,7 @@ int amps_silent_page(const char *number);
 int amps_change_power_order(const char *number, int level);
 int amps_serial_number_request(const char *number);
 int amps_local_control(const char *number, int code);
+int amps_disable_dtmf(const char *number);
 int amps_handoff(const char *number, int new_channel);
 int amps_directed_retry(const char *number, int *channels, int num_channels, int last_try);
 int amps_rescan(const char *number);
