@@ -13,6 +13,7 @@ pocsag_LDADD = \
 	$(COMMON_LA) \
 	$(top_builddir)/src/liboptions/liboptions.a \
 	$(top_builddir)/src/libmobile/libmobile.a \
+	$(top_builddir)/src/libdtmf/libdtmf.a \
 	$(top_builddir)/src/libtones/libtones.a \
 	$(top_builddir)/src/libdisplay/libdisplay.a \
 	$(top_builddir)/src/libjitter/libjitter.a \

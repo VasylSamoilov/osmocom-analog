@@ -52,8 +52,8 @@ int dtmf_decode_init(dtmf_dec_t *dtmf, void *priv, void (*recv_digit)(void *priv
 	dtmf->freq_margin = freq_margin;
 	dtmf->max_amplitude = max_amplitude;
 	dtmf->min_amplitude = min_amplitude;
-	dtmf->forward_twist = db2level(4.0);
-	dtmf->reverse_twist = db2level(8.0);
+	dtmf->forward_twist = db2level(8.0);   /* Allow high to be 8 dB louder than low */
+	dtmf->reverse_twist = db2level(8.0);   /* Allow low to be 8 dB louder than high */
 	dtmf->time_detect = (int)(0.025 * (double)samplerate);
 	dtmf->time_meas = (int)(0.015 * (double)samplerate);
 	dtmf->time_pause = (int)(0.010 * (double)samplerate);

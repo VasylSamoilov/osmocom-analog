@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #include "../libsample/sample.h"
 #include "../libmobile/get_time.h"
 #include "../liblogging/logging.h"
@@ -1061,6 +1062,8 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 	 && trans->state != TRANS_CALL_ESN_REQUEST_SEND
 	 && trans->state != TRANS_CALL_LOCAL_CONTROL
 	 && trans->state != TRANS_CALL_LOCAL_CONTROL_SEND
+	 && trans->state != TRANS_CALL_DISABLE_DTMF
+	 && trans->state != TRANS_CALL_DISABLE_DTMF_SEND
 	 && trans->state != TRANS_CALL_HANDOFF
 	 && trans->state != TRANS_CALL_HANDOFF_SEND
 	 && trans->state != TRANS_SILENT_PAGE_ASSIGN_CONFIRM
@@ -1701,6 +1704,10 @@ void call_down_release(int callref, int cause)
 		amps_go_idle(amps);
 	}
 }
+
+/* Call control sends DTMF digits toward mobile station.
+ * Note: DTMF TX is now handled in call.c (per-call, not per-channel).
+ */
 
 /*
  * ============================================================================
@@ -3573,6 +3580,76 @@ int amps_local_control(const char *number, int code)
 }
 
 /*
+ * Send Disable DTMF Order on FVC
+ *
+ * Per TIA/EIA-553-A Section 2.6.4.4:
+ * The Disable DTMF order tells the mobile station to disable its DTMF tone
+ * generator. The mobile confirms with a digital Order Confirmation message.
+ *
+ * The DTMF generator remains disabled until the Called Address Message
+ * (in response to the next Send Called-Address order) has been completely
+ * transmitted. There is NO explicit "Enable DTMF" order - re-enable is automatic.
+ *
+ * Typical workflow:
+ * 1. BS sends Disable DTMF (Order 22) -> Mobile disables DTMF tones
+ * 2. User dials digits on keypad (no tones heard by far-end)
+ * 3. BS sends Send Called-Address (Order 8) -> Mobile sends digits
+ * 4. Mobile completes Called-Address transmission -> DTMF auto-enables
+ *
+ * Parameters:
+ *   number: AMPS phone number (10 digits)
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int amps_disable_dtmf(const char *number)
+{
+	sender_t *sender;
+	amps_t *amps;
+	transaction_t *trans = NULL;
+	uint32_t min1;
+	uint16_t min2;
+
+	/* Convert number to MIN */
+	if (amps_number2min(number, &min1, &min2) < 0)
+		return -1;
+
+	/* Find transaction for this subscriber */
+	for (sender = sender_head; sender; sender = sender->next) {
+		amps = (amps_t *) sender;
+		trans = search_transaction_number(amps, min1, min2);
+		if (trans)
+			break;
+	}
+
+	if (!trans) {
+		LOGP(DAMPS, LOGL_NOTICE, "Disable DTMF: subscriber '%s' not found\n", number);
+		return -CAUSE_OUTOFORDER;
+	}
+
+	/* Disable DTMF is only valid during active call */
+	if (trans->state != TRANS_CALL) {
+		LOGP(DAMPS, LOGL_NOTICE, "Disable DTMF: subscriber '%s' not in active call (state=%d)\n", 
+			number, trans->state);
+		return -CAUSE_BUSY;
+	}
+
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Disable DTMF Order (Order 22) to '%s'\n", number);
+	LOGP_CHAN(DAMPS, LOGL_NOTICE, ">>> Disable DTMF Order: Mobile will mute DTMF tones until Called-Address sent\n");
+
+	/* Set order parameters */
+	trans->chan = 0;
+	trans->msg_type = 0;     /* MSG_TYPE=0 for Disable DTMF */
+	trans->ordq = 0;         /* ORDQ=0 for Disable DTMF */
+	trans->order = 22;       /* Order 22 = Disable DTMF */
+
+	/* Set transaction state to trigger FVC transmission */
+	trans_new_state(trans, TRANS_CALL_DISABLE_DTMF);
+	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+
+	return 0;
+}
+
+/*
  * Send Handoff message on FVC
  *
  * Per TIA/EIA-553-A Section 2.6.4.4:
@@ -4918,6 +4995,29 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		 * Per TIA/EIA-553-A: Local Control is vendor-specific, no standard response
 		 */
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Local Control order sent\n");
+		trans_new_state(trans, TRANS_CALL);
+		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+		return NULL;
+	case TRANS_CALL_DISABLE_DTMF:
+		/* Disable DTMF (Order 22, ORDQ=0) - mute mobile's DTMF generator
+		 * Per TIA/EIA-553-A Section 2.6.4.4:
+		 * Mobile confirms with digital Order Confirmation message.
+		 * DTMF stays disabled until Called-Address Message is transmitted.
+		 */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Disable DTMF order (Order 22, ORDQ=0)\n");
+		trans->chan = 0;
+		trans->msg_type = 0;
+		trans->ordq = 0;    /* ORDQ=0 for Disable DTMF */
+		trans->order = 22;  /* Order 22 = Disable DTMF */
+		trans_new_state(trans, TRANS_CALL_DISABLE_DTMF_SEND);
+		return trans;
+	case TRANS_CALL_DISABLE_DTMF_SEND:
+		/* Disable DTMF sent - wait for Order Confirmation
+		 * Per TIA/EIA-553-A: Mobile sends digital Order Confirmation on RVC.
+		 * Confirmation is logged in frame.c when received.
+		 * Return to call state - confirmation handled asynchronously.
+		 */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Disable DTMF order sent, waiting for confirmation\n");
 		trans_new_state(trans, TRANS_CALL);
 		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
 		return NULL;

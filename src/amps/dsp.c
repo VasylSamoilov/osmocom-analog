@@ -600,6 +600,10 @@ again:
 			int16_to_samples_speech(samples, spl, input_num);
 		}
 
+		/* DTMF TX: Mix DTMF tones into audio (at 8000 Hz, before echo suppressor) */
+		if (amps->trans_list && amps->trans_list->callref)
+			call_dtmf_tx(amps->trans_list->callref, samples, input_num);
+
 		/* Echo suppressor TX reference (far-end audio before DSP processing) */
 		if (amps->trans_list && amps->trans_list->callref)
 			call_echo_suppressor_tx(amps->trans_list->callref, samples, input_num);
@@ -1231,6 +1235,9 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 
 		/* Echo suppressor RX processing (near-end audio after DSP processing) */
 		call_echo_suppressor_rx(trans->callref, samples, count);
+
+		/* DTMF RX: Detect DTMF tones (after echo suppressor) */
+		call_dtmf_rx(trans->callref, samples, count);
 
 		spl = amps->sender.rxbuf;
 		pos = amps->sender.rxbuf_pos;

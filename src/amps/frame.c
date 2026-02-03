@@ -3905,6 +3905,15 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 			 * - NOT related to ESN request (that uses ORDQ=1)
 			 */
 			LOGP_CHAN(DFRAME, LOGL_INFO, "Received Parameter Update Order Confirmation (Order=15 ORDQ=0)\n");
+		} else if (frame->ie[AMPS_IE_ORDER] == 22) {
+			/* Order 22 = Disable DTMF confirmation
+			 * Per TIA/EIA-553-A Section 2.6.4.4:
+			 * Mobile confirms with digital Order Confirmation message.
+			 * DTMF generator is now disabled until Called-Address Message is sent.
+			 */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: Disable DTMF (Order=22 ORDQ=%d)\n",
+				(int)frame->ie[AMPS_IE_ORDQ]);
+			LOGP_CHAN(DFRAME, LOGL_NOTICE, "<<< Disable DTMF Confirmed: Mobile DTMF tones muted until Called-Address sent\n");
 		} else {
 			/* Unknown/unhandled order - log at ERROR level with full details */
 			LOGP_CHAN(DFRAME, LOGL_ERROR, "Received UNHANDLED RVC Order Confirmation: %s (Order=%d ORDQ=%d MSG_TYPE=%d MSPC=%d MSCAP=%d)\n", 
