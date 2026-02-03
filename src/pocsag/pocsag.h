@@ -22,7 +22,7 @@
  *
  * Batch Structure:
  *   - 1 sync codeword (0x7CD215D8)
- *   - 8 frames × 2 codewords = 16 codewords
+ *   - 8 frames x 2 codewords = 16 codewords
  *   - Total: 17 codewords per batch (544 bits at 32 bits each)
  *
  * Valid RIC Range:

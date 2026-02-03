@@ -204,17 +204,17 @@ static int process_lower(halfband_t *hb, sample_t *i, sample_t *q)
 
 	/* Rotate by -Fs/4 (multiply by e^(-j*pi/2*n)) */
 	switch (hb->state) {
-	case 0:  /* ×1 */
+	case 0:  /* x1 */
 		break;
-	case 1:  /* ×(-j) = swap and negate I */
+	case 1:  /* x(-j) = swap and negate I */
 		*i = *q;
 		*q = -ti;
 		break;
-	case 2:  /* ×(-1) */
+	case 2:  /* x(-1) */
 		*i = -ti;
 		*q = -tq;
 		break;
-	case 3:  /* ×(j) = swap and negate Q */
+	case 3:  /* x(j) = swap and negate Q */
 		*i = -tq;
 		*q = ti;
 		break;
@@ -264,17 +264,17 @@ static int process_upper(halfband_t *hb, sample_t *i, sample_t *q)
 
 	/* Rotate by +Fs/4 (multiply by e^(j*pi/2*n)) */
 	switch (hb->state) {
-	case 0:  /* ×1 */
+	case 0:  /* x1 */
 		break;
-	case 1:  /* ×(j) = swap and negate Q */
+	case 1:  /* x(j) = swap and negate Q */
 		*i = -tq;
 		*q = ti;
 		break;
-	case 2:  /* ×(-1) */
+	case 2:  /* x(-1) */
 		*i = -ti;
 		*q = -tq;
 		break;
-	case 3:  /* ×(-j) = swap and negate I */
+	case 3:  /* x(-j) = swap and negate I */
 		*i = tq;
 		*q = -ti;
 		break;
@@ -387,19 +387,19 @@ static int interpolate_lower(halfband_t *hb, sample_t in_i, sample_t in_q,
 	/* Rotate by +Fs/4 (multiply by e^(j*pi/2*n)) - opposite of decimate */
 	int phase = (hb->ptr * 2 + (hb->state ? 0 : 1)) & 3;
 	switch (phase) {
-	case 0:  /* ×1 */
+	case 0:  /* x1 */
 		*out_i = ti;
 		*out_q = tq;
 		break;
-	case 1:  /* ×(j) = swap and negate Q */
+	case 1:  /* x(j) = swap and negate Q */
 		*out_i = -tq;
 		*out_q = ti;
 		break;
-	case 2:  /* ×(-1) */
+	case 2:  /* x(-1) */
 		*out_i = -ti;
 		*out_q = -tq;
 		break;
-	case 3:  /* ×(-j) = swap and negate I */
+	case 3:  /* x(-j) = swap and negate I */
 		*out_i = tq;
 		*out_q = -ti;
 		break;
@@ -421,19 +421,19 @@ static int interpolate_upper(halfband_t *hb, sample_t in_i, sample_t in_q,
 	/* Rotate by -Fs/4 (multiply by e^(-j*pi/2*n)) - opposite of decimate */
 	int phase = (hb->ptr * 2 + (hb->state ? 0 : 1)) & 3;
 	switch (phase) {
-	case 0:  /* ×1 */
+	case 0:  /* x1 */
 		*out_i = ti;
 		*out_q = tq;
 		break;
-	case 1:  /* ×(-j) = swap and negate I */
+	case 1:  /* x(-j) = swap and negate I */
 		*out_i = tq;
 		*out_q = -ti;
 		break;
-	case 2:  /* ×(-1) */
+	case 2:  /* x(-1) */
 		*out_i = -ti;
 		*out_q = -tq;
 		break;
-	case 3:  /* ×(j) = swap and negate Q */
+	case 3:  /* x(j) = swap and negate Q */
 		*out_i = -tq;
 		*out_q = ti;
 		break;

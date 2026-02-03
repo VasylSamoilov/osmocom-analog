@@ -38,25 +38,47 @@
 #include "stations.h"
 #include "main.h"
 
-/* AMPS Control FIFO
+/* ============================================================
+ * AMPS Control FIFO - Runtime Command Interface
+ * ============================================================
+ * Named pipe at /tmp/amps_control for sending orders to active calls.
+ * Commands are case-insensitive, comma-separated.
  *
- * Commands:
- *   flash,<number>,<message>[,<pi>,<si>]
- *     Send Flash With Info (in-call caller ID)
- *     number: AMPS phone number (10 digits)
- *     message: Text to send (max 32 chars)
- *     pi: Presentation Indicator 0-2 (optional, default=0)
- *     si: Screening Indicator 0-3 (optional, default=3)
+ * STANDARD ORDERS (TIA/EIA-553-A):
+ *   alert,<number>              Ring mobile (Order 1, ORDQ=0)
+ *   abbalert,<number>           Feature reminder tone (Order 1, ORDQ=1)
+ *   release,<number>            Terminate call (Order 3)
+ *   reorder,<number>            Fast busy tone (Order 4)
+ *   mwi,<number>,<count>[,type] Voicemail indicator (Order 5)
+ *                               count: 0-31, type: 0=voice,1=SMS,2=fax
+ *   stopalert,<number>          Stop ringing (Order 6)
+ *   digits,<number>             Request dialed digits (Order 8)
+ *   intercept,<number>          Number cannot be completed (Order 9)
+ *   maintenance,<number>        Silent test (Order 10)
+ *   power,<number>,<level>      Adjust TX power (Order 11), level: 0-7
+ *   retry,<number>,<ch1>[,...]  Redirect to other CC (Order 12)
+ *   esn,<number>                Request ESN (Order 15)
+ *   local,<number>,<code>       Vendor-specific (Order 30), code: 0-31
  *
- *   pci,<number>
- *     Query Protocol Capability Indicator
- *     number: AMPS phone number (10 digits)
- *     Response is logged (MSPC, MSCAP)
+ * EXTENDED FEATURES:
+ *   flash,<number>,<msg>[,pi,si]  In-call Caller ID (Order 18)
+ *   pci,<number>                  Query Protocol Capability
+ *   audit,<number>                Audit mobile (Order 2)
+ *   handoff,<number>[,channel]    Transfer to different VC
+ *   rescan,<number>               Auto-calculated Directed Retry
+ *   silentpage,<number>           Page + Maintenance (no ring)
+ *
+ * EXPERIMENTAL (non-standard):
+ *   flashcri,<number>,<data>    Flash with Charging Rate (Order 18, ORDQ=1)
+ *   flashtci,<number>,<data>    Flash with Total Charges (Order 18, ORDQ=2)
+ *   alertcri,<number>,<data>    Alert with Charging Rate (Order 17, ORDQ=1)
+ *   alerttci,<number>,<data>    Alert with Total Charges (Order 17, ORDQ=2)
  *
  * Examples:
- *   echo "flash,1234567890,Hello,0,3" > /tmp/amps_control
- *   echo "pci,1234567890" > /tmp/amps_control
- */
+ *   echo "alert,5551234567" > /tmp/amps_control
+ *   echo "power,5551234567,3" > /tmp/amps_control
+ *   echo "flash,5551234567,Hello World,0,3" > /tmp/amps_control
+ * ============================================================ */
 #define AMPS_CONTROL_FIFO "/tmp/amps_control"
 static int control_fd = -1;
 
@@ -354,7 +376,7 @@ static void amps_myhandler(void)
 					fprintf(stderr, "Usage: alert,<number>\n");
 					return;
 				}
-				rc = amps_alert_order(number, 0);  /* ORDQ=0 for standard alert */
+				rc = amps_alert_order(number);
 				if (rc < 0)
 					fprintf(stderr, "Alert order failed: %d\n", rc);
 			} else if (strcasecmp(cmd, "release") == 0) {

@@ -3865,15 +3865,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: Change Power to level %d (Order=11 ORDQ=%d)\n",
 				power_level, power_level);
 			LOGP_CHAN(DFRAME, LOGL_NOTICE, "<<< Change Power Confirmed: Level %d -> %s\n",
-				power_level,
-				power_level == 0 ? "4.0W (max)" :
-				power_level == 1 ? "1.6W" :
-				power_level == 2 ? "630mW" :
-				power_level == 3 ? "250mW" :
-				power_level == 4 ? "100mW" :
-				power_level == 5 ? "40mW" :
-				power_level == 6 ? "16mW" :
-				"6.3mW (min)");
+				power_level, amps_power_level_name(power_level));
 		} else if (frame->ie[AMPS_IE_ORDER] == 18) {
 			/* Order 18 = Flash With Info confirmation */
 			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: Flash With Info (Order=18 ORDQ=%d)\n",

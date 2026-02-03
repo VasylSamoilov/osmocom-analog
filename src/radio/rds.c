@@ -499,7 +499,7 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 	uint8_t tuning_code = (uint8_t)(list->tuning_freq - 875);
 	
 	/* Header: [count_code, tuning_freq]
-	 * Count = 1 (tuning) + 2 × af_count (each pair has 2 frequencies)
+	 * Count = 1 (tuning) + 2 x af_count (each pair has 2 frequencies)
 	 * Method B count is ALWAYS ODD (1 + even number) */
 	uint8_t count = 1 + 2 * list->af_count;
 	if (count > 25) count = 25;  /* Max per spec */
@@ -809,7 +809,7 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 		
 		if (pair_idx == 0) {
 			/* Header: [count_code, tuning_freq]
-			 * Count = 1 (tuning) + 2 × af_count (each pair has 2 frequencies)
+			 * Count = 1 (tuning) + 2 x af_count (each pair has 2 frequencies)
 			 * Example: 5 AFs = 1 + 10 = 11 (always odd for Method B) */
 			uint8_t count = 1 + 2 * list->af_count;
 			b3 = ((RDS_AF_NO_AF + count) << 8) | tuning_code;
@@ -4694,7 +4694,7 @@ static void rds_decode_rtplus(rds_decoder_t *rds, const uint16_t *blocks,
  * ============================================================ */
 
 /* Decode eRT ODA group
- * Decodes 128-byte eRT text segments (32 segments × 4 bytes)
+ * Decodes 128-byte eRT text segments (32 segments x 4 bytes)
  */
 static void rds_decode_ert(rds_decoder_t *rds, const uint16_t *blocks,
                             const uint8_t *status, const rds_oda_app_t *oda)

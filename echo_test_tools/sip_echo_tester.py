@@ -1,1 +1,0 @@
-sip_echo_tester_pjsip.py

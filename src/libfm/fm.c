@@ -46,7 +46,7 @@ int fm_init(int _fast_math)
 		 * Table size: 65,536 entries (2^16)
 		 *   - Angular resolution: 360° / 65536 = 0.0055° (0.000096 rad)
 		 *   - Max amplitude error: ~0.005% (0.00005)
-		 *   - Memory usage: (65536 + 16384) × 4 bytes = ~320 KB
+		 *   - Memory usage: (65536 + 16384) x 4 bytes = ~320 KB
 		 *
 		 * Cosine is obtained by offsetting into the same array by 16384
 		 * entries (90° = 65536/4), avoiding a separate table.

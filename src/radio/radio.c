@@ -267,7 +267,7 @@ static const rds_preset_t rds_presets[] = {
 		 * 
 		 * Character positions (NOT byte positions):
 		 *   - "22°C" at char 53-56 (4 chars, 5 bytes: 2+2+°+C where ° is 2 bytes)
-		 *   - "Київ" at char 60-63 (4 chars, 8 bytes: 4 Cyrillic × 2 bytes each) */
+		 *   - "Київ" at char 60-63 (4 chars, 8 bytes: 4 Cyrillic x 2 bytes each) */
 		.ert_plus = {
 			.enabled = 1,
 			.carrier_group = RDS_GROUP_13A,	/* Group 13A for eRT+ ODA (different from RT+ on 11A) */
@@ -281,7 +281,7 @@ static const rds_preset_t rds_presets[] = {
 			.tag_count = 2,
 		},
 		/* eRT (Enhanced RadioText) Configuration with UTF-8
-		 * IEC 62106-6:2018 Annex C: eRT supports 128 bytes (32 segments × 4 bytes)
+		 * IEC 62106-6:2018 Annex C: eRT supports 128 bytes (32 segments x 4 bytes)
 		 * but RT+ can only tag first 64 CHARACTERS
 		 * 
 		 * This text: 64 characters, 69 bytes (° = 2 bytes, Київ = 8 bytes)

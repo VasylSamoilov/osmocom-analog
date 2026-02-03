@@ -351,6 +351,25 @@ const char *amps_scm(uint8_t scm)
 	return text;
 }
 
+/* Power level names per TIA/EIA-553-A Table 2.1.2-1 (Class I mobile) */
+static const char *power_level_names[] = {
+	"4.0W (max)",	/* 0 */
+	"1.6W",		/* 1 */
+	"630mW",	/* 2 */
+	"250mW",	/* 3 */
+	"100mW",	/* 4 */
+	"40mW",		/* 5 */
+	"16mW",		/* 6 */
+	"6.3mW (min)"	/* 7 */
+};
+
+const char *amps_power_level_name(int level)
+{
+	if (level < 0 || level > 7)
+		return "invalid";
+	return power_level_names[level];
+}
+
 static const char *amps_mpci(uint8_t mpci)
 {
 	switch (mpci) {
@@ -644,7 +663,7 @@ int amps_create(const char *kanal, enum amps_chan_type chan_type, const char *de
 		goto error;
 
 	/* init TX pre-emphasis using correct shelf filter (unity gain at DC, boost highs)
-	 * Time constant τ = 1/(2π×300) ≈ 530.5µs for 300 Hz corner frequency
+	 * Time constant tau = 1/(2*pi*300) = 530.5us for 300 Hz corner frequency
 	 * High corner at 3000 Hz (AMPS audio bandwidth) */
 	init_emphasis_fast(&amps->estate_tx_fast, 8000, 530.5e-6, 3000.0);
 
@@ -1608,12 +1627,22 @@ void call_down_release(int callref, int cause)
 
 /*
  * ============================================================================
- * COMMON ORDER DISPATCH PATTERN
+ * COMMON ORDER DISPATCH PATTERN (Asynchronous)
  * ============================================================================
  *
- * All AMPS order implementations follow a common pattern for consistency and
- * maintainability. This section documents the pattern that should be used when
- * implementing new orders or modifying existing ones.
+ * The AMPS order system uses an ASYNCHRONOUS callback-driven architecture.
+ * Order API functions set up state and return immediately - actual transmission
+ * and confirmation happen via DSP/frame callbacks.
+ *
+ * ASYNC FLOW:
+ * -----------
+ * 1. Order API (e.g., amps_alert_order()) sets trans->state and DSP mode
+ * 2. DSP layer (dsp.c) requests frames when ready via fsk_frame()
+ * 3. Frame layer (frame.c) calls amps_tx_frame_fvc() to get order parameters
+ * 4. Frame encoding happens in frame.c, transmission via sound/SDR
+ * 5. Confirmation arrives asynchronously:
+ *    - ST tone: detected by DSP, calls amps_rx_signaling_tone()
+ *    - RVC message: decoded by frame.c, calls appropriate handler
  *
  * PATTERN OVERVIEW (Requirements 1.1, 1.2, 1.3):
  * ---------------------------------------------
@@ -1659,11 +1688,12 @@ void call_down_release(int callref, int cause)
  *        trans->ordq = <ordq>;          // Order Qualifier (0-7)
  *        trans->order = <order>;        // Order code (see TIA/EIA-553-A Table 3.7.1-1)
  *
- *        // Step 6: Transition state and switch DSP mode
+ *        // Step 6: Transition state and switch DSP mode - RETURNS IMMEDIATELY
+ *        //         Actual transmission happens asynchronously via DSP callbacks
  *        trans_new_state(trans, TRANS_CALL_<ORDER>);
  *        amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
  *
- *        return 0;
+ *        return 0;  // Success - order queued for async transmission
  *    }
  *
  * 2. ST-CONFIRMED ORDER HANDLING (Requirement 1.2):
@@ -1679,7 +1709,7 @@ void call_down_release(int callref, int cause)
  *    - ESN Request (Order 15), Send Called-Address (Order 8)
  *    - Message parsing in amps_decode_frame_rvc() or dedicated handlers
  *    - Logging of response data
- *    - State transition: TRANS_CALL_<ORDER>_SEND -> TRANS_CALL_<ORDER>_REPLY -> TRANS_CALL
+ *    - State transition: TRANS_CALL_<ORDER>_SEND -> response handled async -> TRANS_CALL
  *
  * 4. NO-CONFIRMATION ORDERS:
  *    Some orders don't require confirmation:
@@ -2193,20 +2223,23 @@ int amps_alert_with_tci(const char *number, const char *tci_data)
 }
 
 /*
- * Send Alert order to mobile station during active call
+ * Send Alert order (Order 1, ORDQ=0) to mobile station during active call
  *
- * This order (Order 1) causes the mobile station to ring/alert the user.
+ * This order causes the mobile station to ring/alert the user.
  * The mobile responds with ST (Signaling Tone) confirmation.
+ *
+ * Per TIA/EIA-553-A Section 2.6.4.4 (Conversation Task):
+ * "Alert or Alert With Info: Turn on signaling tone, wait 500 ms,
+ *  and then enter the Waiting for Answer Task"
  *
  * Parameters:
  *   number: AMPS phone number (10 digits)
- *   ordq: Order Qualifier (0=standard alert, 1=abbreviated alert)
  *
  * Requirements: 3.1, 3.2, 3.4, 3.6
  *
  * Returns 0 on success, negative error code on failure.
  */
-int amps_alert_order(const char *number, int ordq)
+int amps_alert_order(const char *number)
 {
 	sender_t *sender;
 	amps_t *amps;
@@ -2238,19 +2271,14 @@ int amps_alert_order(const char *number, int ordq)
 		return -CAUSE_BUSY;
 	}
 
-	/* Clamp ORDQ to valid range (0 or 1 for Alert) */
-	if (ordq < 0) ordq = 0;
-	if (ordq > 1) ordq = 1;
-
-	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Alert Order (Order 1, ORDQ=%d) to '%s'\n", ordq, number);
-	LOGP_CHAN(DAMPS, LOGL_NOTICE, ">>> %s - Mobile will %s\n",
-		amps_table4_name(0, ordq, 1),
-		(ordq == 0) ? "ring/alert the user" : "play feature reminder tone");
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Alert Order (Order 1, ORDQ=0) to '%s'\n", number);
+	LOGP_CHAN(DAMPS, LOGL_NOTICE, ">>> %s - Mobile will ring/alert the user\n",
+		amps_table4_name(0, 0, 1));
 
 	/* Set order parameters in transaction */
 	trans->chan = 0;
 	trans->msg_type = 0;
-	trans->ordq = ordq;    /* 0=standard alert, 1=abbreviated alert */
+	trans->ordq = 0;       /* ORDQ=0 for standard alert */
 	trans->order = 1;      /* Order 1 = Alert */
 
 	/* Transition state and switch DSP mode */
@@ -4312,31 +4340,7 @@ again:
 		trans_new_state(trans, TRANS_AUDIT_SEND);
 		return trans;
 	case TRANS_AUDIT_SEND:
-		/* Sent once, destroy transaction (Fire and Forget for now) */
-		/* Wait, if we destroy it immediately, frame.c assumes it's done? 
-		 * frame.c sends repeat loop. If we destroy, loop stops?
-		 * See amps_tx_frame_focc loop logic in frame.c:
-		 * It calls amps_tx_frame_focc() on every frame.
-		 * If we return trans, it sends.
-		 * REGISTER_ACK_SEND destroys itself and does 'goto again'.
-		 * Let's assume we want to send it enough times.
-		 * frame.c handles repeat count internally (amps->tx_focc_frame_count).
-		 * BUT it checks amps->tx_focc_send flag.
-		 * If we destroy transaction, frame.c doesn't know. 
-		 * However, frame.c copies min/order to amps->tx_focc_... struct! [Lines 3617-3622]
-		 * So once returned ONCE, frame.c sends the whole train.
-		 * So we CAN destroy it immediately after returning it once?
-		 * No, REGISTER_ACK does: TRANS_REGISTER_ACK (returns trans) -> TRANS_REGISTER_ACK_SEND (destroys trans).
-		 * This implies 2 calls.
-		 * 1. frame.c calls, gets trans (TRANS_AUDIT -> TRANS_AUDIT_SEND), copies data, starts sending.
-		 * 2. Next time frame.c calls (or maybe same loop if not busy?), it sees TRANS_AUDIT_SEND?
-		 * Actually, frame.c only calls if !amps->tx_focc_send.
-		 * Once it starts sending (tx_focc_send=1), it DOES NOT call amps_tx_frame_focc until done.
-		 * So we can safely leave it in TRANS_AUDIT_SEND, or destroy it.
-		 * If we destroy it, we lose the record that we did it. 
-		 * Ideally we should wait for reply.
-		 * For now, destroy logic matches REGISTER_ACK.
-		 */
+		/* Frame data copied to amps->tx_focc_*, frame.c handles repeat. */
 		destroy_transaction(trans);
 		goto again;
 	case TRANS_PCI:
@@ -4432,15 +4436,7 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 	case TRANS_CALL_CHANGE_POWER:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Change Power to Level %d\n", trans->current_vmac);
 		LOGP_CHAN(DAMPS, LOGL_NOTICE, ">>> Change Power Order: Level %d -> %s\n", 
-			trans->current_vmac,
-			trans->current_vmac == 0 ? "4.0W (max)" :
-			trans->current_vmac == 1 ? "1.6W" :
-			trans->current_vmac == 2 ? "630mW" :
-			trans->current_vmac == 3 ? "250mW" :
-			trans->current_vmac == 4 ? "100mW" :
-			trans->current_vmac == 5 ? "40mW" :
-			trans->current_vmac == 6 ? "16mW" :
-			"6.3mW (min)");
+			trans->current_vmac, amps_power_level_name(trans->current_vmac));
 		trans->chan = 0;  /* Use Word1_A format, not channel assignment */
 		trans->msg_type = 0;  /* LOCAL_MSG_TYPE = 00000 */
 		trans->ordq = trans->current_vmac; /* Power Level (0-7) */

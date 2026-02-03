@@ -886,7 +886,7 @@ typedef struct {
  * support for UTF-8 and UCS-2 encoding.
  * Announced via Group 3A, carried on a configurable ODA group.
  *
- * Buffer Size: 128 bytes maximum (32 segments × 4 bytes)
+ * Buffer Size: 128 bytes maximum (32 segments x 4 bytes)
  *
  * Message Termination:
  *   - eRT messages are terminated by a carriage return (CR, 0x0D) byte
@@ -905,7 +905,7 @@ typedef struct {
  *   Bits 5-2 (b2-b5): chartable (0=E3, others reserved) - must be 0 for backwards compatibility
  *   Bits 15-6 (b6-b15): RFU (Reserved for Future Use) - must be 0
  *
- * eRT transmission: 32 segments × 4 bytes = 128 bytes total
+ * eRT transmission: 32 segments x 4 bytes = 128 bytes total
  *
  * eRT Bit Fields:
  * Block B bits 4-0: segment address (0-31)
@@ -928,7 +928,7 @@ typedef struct {
  *   - Note: RT+ is limited to 64 characters for standard RT and combination of RT+ with eRT (without eRT+)
  * ============================================================ */
 #define RDS_ERT_SEGMENT_MASK          0x001F  /* Block B bits 4-0: segment (0-31) */
-#define RDS_ERT_SEGMENTS              32      /* Total segments (32 × 4 = 128 bytes) */
+#define RDS_ERT_SEGMENTS              32      /* Total segments (32 x 4 = 128 bytes) */
 #define RDS_ERT_BYTES_PER_SEGMENT     4       /* Bytes per segment */
 #define RDS_ERT_3A_ENCODING_BIT       0       /* Group 3A message bit 0: encoding */
 #define RDS_ERT_3A_ENCODING_MASK      0x0001
