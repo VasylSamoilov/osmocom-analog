@@ -94,6 +94,7 @@ int tolerant = 0;
 int vmac_enable = 0;
 double vmac_level_low = 0.95;
 double vmac_level_high = 1.01;
+int network_timeout = 4;  /* seconds to wait for network PROCEEDING (1-5 per standard) */
 
 static void print_location_area_note(void)
 {
@@ -176,6 +177,9 @@ void print_help(const char *arg0)
 	printf("        If 1, be sure to have a round-trip delay (latency) not more than 5 ms\n");
 	printf(" -O --tolerant\n");
 	printf("        Be more tolerant when hunting for sync sequence\n");
+	printf("    --network-timeout <seconds>\n");
+	printf("        Timeout waiting for network PROCEEDING before sending Reorder.\n");
+	printf("        Valid range: 1-5 seconds (default = %d). Per TIA/EIA-553-A max is 5s.\n", network_timeout);
 	printf("\nDialing Prefixes:\n");
 	printf("        You can configure alerting parameters per call by prefixing the number:\n");
 	printf("        +%s[PI][SI][Pitch][Cadence]xxxxxxxxxx  (or %s...)\n", mobile_amps_param_prefix, mobile_amps_param_prefix);
@@ -768,6 +772,7 @@ static void amps_myhandler(void)
 }
 
 #define OPT_PREFIX 256
+#define OPT_NETWORK_TIMEOUT 257
 
 static void add_options(void)
 {
@@ -780,6 +785,7 @@ static void add_options(void)
 	option_add('S', "sysinfo", 1);
 	option_add('O', "tolerant", 0);
 	option_add(OPT_PREFIX, "amps-prefix", 1);
+	option_add(OPT_NETWORK_TIMEOUT, "network-timeout", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -907,6 +913,11 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_PREFIX:
 		mobile_amps_param_prefix = argv[argi];
+		break;
+	case OPT_NETWORK_TIMEOUT:
+		network_timeout = atoi(argv[argi]);
+		if (network_timeout < 1) network_timeout = 1;
+		if (network_timeout > 5) network_timeout = 5;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);

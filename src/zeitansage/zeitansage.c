@@ -362,6 +362,10 @@ void call_down_answer(int __attribute__((unused)) callref, struct timeval __attr
 {
 }
 
+void call_down_proceeding(int __attribute__((unused)) callref)
+{
+}
+
 static void _release(int callref, int __attribute__((unused)) cause)
 {
 	zeit_call_t *call;

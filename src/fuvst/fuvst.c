@@ -1387,6 +1387,10 @@ void call_down_answer(int callref, struct timeval __attribute__((unused)) *tv_me
 	new_call_state(trans, STATE_MO_CONNECT);
 }
 
+void call_down_proceeding(int __attribute__((unused)) callref)
+{
+}
+
 static void _disconnect_release(transaction_t *trans, int callref, int cause)
 {
 	uint8_t opcode, *data;

@@ -1461,6 +1461,10 @@ void call_down_answer(int callref, struct timeval __attribute__((unused)) *tv_me
 	}
 }
 
+void call_down_proceeding(int __attribute__((unused)) callref)
+{
+}
+
 /* Call control sends disconnect (with tones).
  * An active call stays active, so tones and annoucements can be received
  * by station mobile.

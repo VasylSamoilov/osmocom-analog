@@ -265,6 +265,8 @@ int call_down_setup(int __attribute__((unused)) callref, const char __attribute_
 
 void call_down_answer(int __attribute__((unused)) callref, struct timeval __attribute__((unused)) *tv_meter) { }
 
+void call_down_proceeding(int __attribute__((unused)) callref) { }
+
 void call_down_disconnect(int __attribute__((unused)) callref, int __attribute__((unused)) cause) { }
 
 void call_down_release(int __attribute__((unused)) callref, int __attribute__((unused)) cause) { }

@@ -703,6 +703,10 @@ void call_down_answer(int __attribute__((unused)) callref, struct timeval __attr
 	osmo_timer_schedule(&call->timer, BEEP_TIME);
 }
 
+void call_down_proceeding(int __attribute__((unused)) callref)
+{
+}
+
 static void _release(int callref, int __attribute__((unused)) cause)
 {
 	sender_t *sender;

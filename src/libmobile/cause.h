@@ -1,3 +1,4 @@
+#define CAUSE_UNASSIGNED	1
 #define CAUSE_NORMAL		16
 #define CAUSE_BUSY		17
 #define CAUSE_NOANSWER		19

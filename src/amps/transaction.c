@@ -36,6 +36,8 @@ static const char *trans_state_name(int state)
 		return "REGISTER ACK";
 	case TRANS_REGISTER_ACK_SEND:
 		return "REGISTER ACK SEND";
+	case TRANS_CALL_MO_WAIT_PROCEED:
+		return "MO CALL WAIT PROCEED";
 	case TRANS_CALL_MO_ASSIGN:
 		return "MO CALL ASSIGNMENT";
 	case TRANS_CALL_MO_ASSIGN_SEND:
@@ -94,6 +96,14 @@ static const char *trans_state_name(int state)
 		return "FOCC MWI";
 	case TRANS_MWI_SEND:
 		return "FOCC MWI SEND";
+	case TRANS_REORDER:
+		return "FOCC REORDER";
+	case TRANS_REORDER_SEND:
+		return "FOCC REORDER SEND";
+	case TRANS_INTERCEPT:
+		return "FOCC INTERCEPT";
+	case TRANS_INTERCEPT_SEND:
+		return "FOCC INTERCEPT SEND";
 	case TRANS_PAGE:
 		return "PAGE";
 	case TRANS_PAGE_SEND:
@@ -214,6 +224,8 @@ const char *trans_short_state_name(int state)
 		return "SILPAGE";
 	case TRANS_CALL_REORDER:
 	case TRANS_CALL_REORDER_SEND:
+	case TRANS_REORDER:
+	case TRANS_REORDER_SEND:
 		return "REORDER";
 	case TRANS_CALL_MWI:
 	case TRANS_CALL_MWI_SEND:
@@ -225,6 +237,8 @@ const char *trans_short_state_name(int state)
 		return "STOPALRT";
 	case TRANS_CALL_INTERCEPT:
 	case TRANS_CALL_INTERCEPT_SEND:
+	case TRANS_INTERCEPT:
+	case TRANS_INTERCEPT_SEND:
 		return "INTERCPT";
 	case TRANS_CALL_MAINTENANCE:
 	case TRANS_CALL_MAINTENANCE_SEND:

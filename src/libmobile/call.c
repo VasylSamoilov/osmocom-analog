@@ -876,6 +876,8 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
 		if (rc < 0)
 			goto nego_failed;
+		/* Notify AMPS layer - can now assign voice channel */
+		call_down_proceeding(callref);
 		break;
 	case OSMO_CC_MSG_PROGRESS_REQ:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC progress from fixed network\n");
@@ -888,6 +890,8 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
 		if (rc < 0)
 			goto nego_failed;
+		/* Also trigger channel assignment on ALERTING (in case PROCEEDING was skipped) */
+		call_down_proceeding(callref);
 		new_state_process(callref, PROCESS_ALERTING_RO);
 		break;
 	case OSMO_CC_MSG_SETUP_RSP:

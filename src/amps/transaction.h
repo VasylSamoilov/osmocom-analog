@@ -3,6 +3,7 @@ enum amps_trans_state {
 	TRANS_NULL = 0,
 	TRANS_REGISTER_ACK,		/* attach request received, waiting to ack */
 	TRANS_REGISTER_ACK_SEND,	/* attach request received, sending ack */
+	TRANS_CALL_MO_WAIT_PROCEED,	/* MO call: waiting for network PROCEEDING before channel assignment */
 	TRANS_CALL_MO_ASSIGN,		/* assigning channel, waiting to send */
 	TRANS_CALL_MO_ASSIGN_SEND,	/* assigning channel, sending assignment */
 	TRANS_CALL_MO_ASSIGN_CONFIRM,	/* assignment sent, waiting for confirm (SAT) */
@@ -57,6 +58,10 @@ enum amps_trans_state {
 	TRANS_PCI_SEND,			/* PCI query on FOCC, sending */
 	TRANS_MWI,			/* MWI order on FOCC, waiting to send */
 	TRANS_MWI_SEND,			/* MWI order on FOCC, sending */
+	TRANS_REORDER,			/* Reorder order on FOCC (during call setup), waiting to send */
+	TRANS_REORDER_SEND,		/* Reorder order on FOCC (during call setup), sending */
+	TRANS_INTERCEPT,		/* Intercept order on FOCC (during call setup), waiting to send */
+	TRANS_INTERCEPT_SEND,		/* Intercept order on FOCC (during call setup), sending */
 	TRANS_PAGE,			/* paging phone, waiting to send */
 	TRANS_PAGE_SEND,		/* paging phone, sending page order */
 	TRANS_PAGE_REPLY,		/* waitring for paging reply */
