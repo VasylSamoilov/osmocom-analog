@@ -38,18 +38,27 @@
 #include "stations.h"
 #include "main.h"
 
-/* Flash With Info FIFO
+/* AMPS Control FIFO
  *
- * Format: flash,<number>,<message>[,<pi>,<si>]
- *   number: AMPS phone number (10 digits)
- *   message: Text to send (max 32 chars)
- *   pi: Presentation Indicator 0-2 (optional, default=0)
- *   si: Screening Indicator 0-3 (optional, default=3)
+ * Commands:
+ *   flash,<number>,<message>[,<pi>,<si>]
+ *     Send Flash With Info (in-call caller ID)
+ *     number: AMPS phone number (10 digits)
+ *     message: Text to send (max 32 chars)
+ *     pi: Presentation Indicator 0-2 (optional, default=0)
+ *     si: Screening Indicator 0-3 (optional, default=3)
  *
- * Example: echo "flash,1234567890,Hello,0,3" > /tmp/amps_flash
+ *   pci,<number>
+ *     Query Protocol Capability Indicator
+ *     number: AMPS phone number (10 digits)
+ *     Response is logged (MSPC, MSCAP)
+ *
+ * Examples:
+ *   echo "flash,1234567890,Hello,0,3" > /tmp/amps_control
+ *   echo "pci,1234567890" > /tmp/amps_control
  */
-#define AMPS_FLASH_FIFO "/tmp/amps_flash"
-static int flash_fd = -1;
+#define AMPS_CONTROL_FIFO "/tmp/amps_control"
+static int control_fd = -1;
 
 /* settings */
 int num_chan_type = 0;
@@ -155,17 +164,108 @@ void print_help(const char *arg0)
 	printf("                 04-06=OtherPatterns, 07-11=PBXPatterns\n");
 	printf("    --amps-prefix <prefix>\n");
 	printf("        Give prefix for alerting parameters. (default = '%s')\n", mobile_amps_param_prefix);
-	printf("\nFlash With Info (In-Call Caller ID):\n");
-	printf("    To send caller ID during an active call (e.g., call waiting):\n");
-	printf("        echo \"flash,<number>,<message>[,<pi>,<si>]\" > /tmp/amps_flash\n");
-	printf("    Example: echo \"flash,1234567890,John Doe\" > /tmp/amps_flash\n");
-	printf("    PI: 0=Allowed(Default), 1=Restricted, 2=NotAvail\n");
-	printf("    SI: 0=Unscreened, 1=Passed, 2=Failed, 3=Network(Default)\n");
+	printf("\nAMPS Control FIFO (/tmp/amps_control):\n");
+	printf("    Flash With Info (In-Call Caller ID):\n");
+	printf("        echo \"flash,<number>,<message>[,<pi>,<si>]\" > /tmp/amps_control\n");
+	printf("        Example: echo \"flash,1234567890,John Doe\" > /tmp/amps_control\n");
+	printf("        PI: 0=Allowed(Default), 1=Restricted, 2=NotAvail\n");
+	printf("        SI: 0=Unscreened, 1=Passed, 2=Failed, 3=Network(Default)\n");
+	printf("    Protocol Capability Indicator (PCI) Query:\n");
+	printf("        echo \"pci,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"pci,1234567890\" > /tmp/amps_control\n");
+	printf("        Response shows MSPC (protocol version) and MSCAP (analog capability)\n");
+	printf("        NOTE: Most phones tested do not reply to PCI query\n");
+	printf("    Audit Order:\n");
+	printf("        echo \"audit,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"audit,1234567890\" > /tmp/amps_control\n");
+	printf("    Alert Order (Ring Mobile Station):\n");
+	printf("        echo \"alert,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"alert,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 1 (ORDQ=0) to ring the mobile station during active call\n");
+	printf("    Abbreviated Alert Order (Feature Reminder Tone):\n");
+	printf("        echo \"abbalert,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"abbalert,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 1 (ORDQ=1) for feature reminder tones\n");
+	printf("    Release Order (Terminate Call):\n");
+	printf("        echo \"release,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"release,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 3 to force call termination\n");
+	printf("    Reorder Order (Fast Busy Tone):\n");
+	printf("        echo \"reorder,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"reorder,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 4 - mobile plays fast busy (all circuits busy)\n");
+	printf("    Message Waiting Indicator:\n");
+	printf("        echo \"mwi,<number>,<count>[,<type>]\" > /tmp/amps_control\n");
+	printf("        Example: echo \"mwi,1234567890,3,0\" > /tmp/amps_control\n");
+	printf("        Sends Order 5 - count: 0-31, type: 0=voice, 1=SMS, 2=fax\n");
+	printf("    Stop Alert Order (Stop Ringing):\n");
+	printf("        echo \"stopalert,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"stopalert,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 6 - stops ringing but keeps channel\n");
+	printf("    Intercept Order (Number Cannot Be Completed):\n");
+	printf("        echo \"intercept,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"intercept,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 9 - mobile plays intercept tone (invalid number)\n");
+	printf("    Send Called-Address Order (Request Dialed Digits):\n");
+	printf("        echo \"digits,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"digits,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 8 - requests mobile to send dialed digits\n");
+	printf("    Maintenance Order (Silent Test):\n");
+	printf("        echo \"maintenance,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"maintenance,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 10 - mobile confirms with ST but doesn't ring\n");
+	printf("        NOTE: Requires active call - use 'silentpage' for idle mobiles\n");
+	printf("    Silent Page (Page + Maintenance):\n");
+	printf("        echo \"silentpage,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"silentpage,1234567890\" > /tmp/amps_control\n");
+	printf("        Pages idle mobile, assigns channel, sends Maintenance, releases\n");
+	printf("        Tests mobile RF path without ringing - logs SUCCESS or FAILED\n");
+	printf("    Change Power Order:\n");
+	printf("        echo \"power,<number>,<level>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"power,1234567890,3\" > /tmp/amps_control\n");
+	printf("        Sends Order 11 - level: 0-7 (0=max power, 7=min power)\n");
+	printf("    Serial Number Request (ESN Verification):\n");
+	printf("        echo \"esn,<number>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"esn,1234567890\" > /tmp/amps_control\n");
+	printf("        Sends Order 15 - requests mobile to send ESN for verification\n");
+	printf("    Local Control Order (Vendor-Specific):\n");
+	printf("        echo \"local,<number>,<code>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"local,1234567890,5\" > /tmp/amps_control\n");
+	printf("        Sends Order 30 - code: 0-31 (manufacturer-defined)\n");
+	printf("        WARNING: Highly vendor-specific, meaning depends on mobile manufacturer\n");
+	printf("    Handoff (Voice Channel Transfer):\n");
+	printf("        echo \"handoff,<number>,<channel>\" > /tmp/amps_control\n");
+	printf("        Example: echo \"handoff,1234567890,335\" > /tmp/amps_control\n");
+	printf("        Transfers active call to different voice channel\n");
+	printf("        Mobile sends 50ms ST, tunes to new channel, continues call\n");
+	/* CRI/TCI commands are experimental - value mapping is unknown.
+	 * Data structures were provided by Andreas Eversberg but no documentation
+	 * reference is available to verify how mobile stations interpret the BCD values.
+	 *
+	 * TESTING NOTE: Phones tested confirm the order (send Order Confirmation)
+	 * but do not display anything. Some show a generic "Call Waiting" message
+	 * as if it were a normal Flash With Info with no actual data displayed.
+	 *
+	 * Uncomment below if you want to experiment with these commands.
+	 *
+	printf("    Flash With CRI (Charging Rate Indication) - EXPERIMENTAL:\n");
+	printf("        echo \"flashcri,<number>,<cri_data>\" > /tmp/amps_control\n");
+	printf("        cri_data: E1,E2,E3,... (up to 8 elements, 4 digits each)\n");
+	printf("        WARNING: Value mapping unknown, may not work with real mobiles\n");
+	printf("    Flash With TCI (Total Charging Information) - EXPERIMENTAL:\n");
+	printf("        echo \"flashtci,<number>,<tci_data>\" > /tmp/amps_control\n");
+	printf("        tci_data: R1,R2,R3,R4 (up to 4 rows, 4 digits each)\n");
+	printf("        WARNING: Value mapping unknown, may not work with real mobiles\n");
+	printf("    Alert With CRI/TCI - EXPERIMENTAL:\n");
+	printf("        echo \"alertcri,<number>,<cri_data>\" > /tmp/amps_control\n");
+	printf("        echo \"alerttci,<number>,<tci_data>\" > /tmp/amps_control\n");
+	printf("        WARNING: Value mapping unknown, may not work with real mobiles\n");
+	*/
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
 }
 
-/* Handler for Flash With Info FIFO commands */
+/* Handler for AMPS Control FIFO commands */
 static void amps_myhandler(void)
 {
 	static char buffer[256];
@@ -174,15 +274,15 @@ static void amps_myhandler(void)
 	char *p, *cmd, *number, *message, *pi_str, *si_str;
 	int pi = 0, si = 3;  /* defaults: Allowed, Network-provided */
 
-	if (flash_fd < 0)
+	if (control_fd < 0)
 		return;
 
 	space = sizeof(buffer) - pos;
-	rc = read(flash_fd, buffer + pos, space);
+	rc = read(control_fd, buffer + pos, space);
 	if (rc > 0) {
 		pos += rc;
 		if (pos == space) {
-			fprintf(stderr, "Flash buffer overflow!\n");
+			fprintf(stderr, "Control buffer overflow!\n");
 			pos = 0;
 		}
 		/* check for end of line */
@@ -195,33 +295,452 @@ static void amps_myhandler(void)
 			buffer[i] = '\0';
 			pos = 0;
 
-			/* Parse: flash,number,message[,pi,si] */
 			p = buffer;
 			cmd = strsep(&p, ",");
-			if (!cmd || strcasecmp(cmd, "flash") != 0) {
-				fprintf(stderr, "Invalid command '%s', expected 'flash'\n", cmd ? cmd : "(null)");
+			if (!cmd) {
+				fprintf(stderr, "Empty command\n");
 				return;
 			}
-			number = strsep(&p, ",");
-			message = strsep(&p, ",");
-			if (!number || !message) {
-				fprintf(stderr, "Usage: flash,<number>,<message>[,<pi>,<si>]\n");
-				return;
-			}
-			/* optional PI and SI */
-			pi_str = strsep(&p, ",");
-			si_str = strsep(&p, ",");
-			if (pi_str && pi_str[0])
-				pi = atoi(pi_str);
-			if (si_str && si_str[0])
-				si = atoi(si_str);
-			/* clamp values */
-			if (pi < 0 || pi > 2) pi = 0;
-			if (si < 0 || si > 3) si = 3;
 
-			rc = amps_flash_with_info(number, message, pi, si);
-			if (rc < 0)
-				fprintf(stderr, "Flash With Info failed: %d\n", rc);
+			if (strcasecmp(cmd, "flash") == 0) {
+				/* Parse: flash,number,message[,pi,si] */
+				number = strsep(&p, ",");
+				message = strsep(&p, ",");
+				if (!number || !message) {
+					fprintf(stderr, "Usage: flash,<number>,<message>[,<pi>,<si>]\n");
+					return;
+				}
+				/* optional PI and SI */
+				pi_str = strsep(&p, ",");
+				si_str = strsep(&p, ",");
+				if (pi_str && pi_str[0])
+					pi = atoi(pi_str);
+				if (si_str && si_str[0])
+					si = atoi(si_str);
+				/* clamp values */
+				if (pi < 0 || pi > 2) pi = 0;
+				if (si < 0 || si > 3) si = 3;
+
+				rc = amps_flash_with_info(number, message, pi, si);
+				if (rc < 0)
+					fprintf(stderr, "Flash With Info failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "pci") == 0) {
+				/* Parse: pci,number */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: pci,<number>\n");
+					return;
+				}
+				rc = amps_pci_query(number);
+				if (rc < 0)
+					fprintf(stderr, "PCI query failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "audit") == 0) {
+				/* Parse: audit,number */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: audit,<number>\n");
+					return;
+				}
+				rc = amps_audit_order(number);
+				if (rc < 0)
+					fprintf(stderr, "Audit order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "alert") == 0) {
+				/* Parse: alert,number
+				 * Send Alert Order (Order 1, ORDQ=0) to ring the mobile station
+				 * Requirements: 3.1, 3.2, 3.4, 3.6
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: alert,<number>\n");
+					return;
+				}
+				rc = amps_alert_order(number, 0);  /* ORDQ=0 for standard alert */
+				if (rc < 0)
+					fprintf(stderr, "Alert order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "release") == 0) {
+				/* Parse: release,number
+				 * Send Release Order (Order 3) to terminate the call
+				 * Requirements: 4.3, 4.5
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: release,<number>\n");
+					return;
+				}
+				rc = amps_release_order(number);
+				if (rc < 0)
+					fprintf(stderr, "Release order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "power") == 0) {
+				/* Parse: power,number,level
+				 * Send Change Power Order (Order 11) to adjust mobile TX power
+				 * level: 0-7 (0=max power, 7=min power)
+				 * Requirements: 12.3, 12.4, 12.5
+				 */
+				char *level_str;
+				int level;
+				number = strsep(&p, ",");
+				level_str = strsep(&p, ",");
+				if (!number || !level_str) {
+					fprintf(stderr, "Usage: power,<number>,<level>\n");
+					fprintf(stderr, "  level: 0-7 (0=max power, 7=min power)\n");
+					return;
+				}
+				level = atoi(level_str);
+				/* Clamp to valid range (Requirement 12.4) */
+				if (level < 0) level = 0;
+				if (level > 7) level = 7;
+				rc = amps_change_power_order(number, level);
+				if (rc < 0)
+					fprintf(stderr, "Change Power order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "abbalert") == 0) {
+				/* Parse: abbalert,number
+				 * Send Abbreviated Alert Order (Order 1, ORDQ=1) for feature reminder tones
+				 * Requirements: 3.5
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: abbalert,<number>\n");
+					return;
+				}
+				rc = amps_abbreviated_alert(number);
+				if (rc < 0)
+					fprintf(stderr, "Abbreviated Alert order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "reorder") == 0) {
+				/* Parse: reorder,number
+				 * Send Reorder Order (Order 4, ORDQ=0) - fast busy tone
+				 * Requirements: 5.1, 5.2, 5.3
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: reorder,<number>\n");
+					return;
+				}
+				rc = amps_reorder(number);
+				if (rc < 0)
+					fprintf(stderr, "Reorder order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "mwi") == 0) {
+				/* Parse: mwi,number,count[,type]
+				 * Send Message Waiting Order (Order 5) - voicemail indicator
+				 * count: 0-31 (31 = unknown count)
+				 * type: 0=voice (default), 1=SMS, 2=fax
+				 * Requirements: 6.1, 6.2, 6.3, 6.4, 6.5
+				 */
+				char *count_str, *type_str;
+				int count, type = 0;
+				number = strsep(&p, ",");
+				count_str = strsep(&p, ",");
+				type_str = strsep(&p, ",");
+				if (!number || !count_str) {
+					fprintf(stderr, "Usage: mwi,<number>,<count>[,<type>]\n");
+					fprintf(stderr, "  count: 0-31 (31 = unknown count)\n");
+					fprintf(stderr, "  type: 0=voice (default), 1=SMS, 2=fax\n");
+					return;
+				}
+				count = atoi(count_str);
+				if (type_str && type_str[0])
+					type = atoi(type_str);
+				rc = amps_mwi(number, count, type);
+				if (rc < 0)
+					fprintf(stderr, "Message Waiting order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "stopalert") == 0) {
+				/* Parse: stopalert,number
+				 * Send Stop Alert Order (Order 6, ORDQ=0) - stop ringing
+				 * Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: stopalert,<number>\n");
+					return;
+				}
+				rc = amps_stopalert(number);
+				if (rc < 0)
+					fprintf(stderr, "Stop Alert order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "intercept") == 0) {
+				/* Parse: intercept,number
+				 * Send Intercept Order (Order 9, ORDQ=0) - number cannot be completed
+				 * Mobile plays intercept tone (alternating high-low)
+				 * This is a MANDATORY order - all AMPS phones must support it
+				 * Requirements: 10.1, 10.2, 10.3
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: intercept,<number>\n");
+					return;
+				}
+				rc = amps_intercept(number);
+				if (rc < 0)
+					fprintf(stderr, "Intercept order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "digits") == 0) {
+				/* Parse: digits,number
+				 * Send Called-Address Request (Order 8, ORDQ=0)
+				 * Requests mobile to send dialed digits
+				 * Requirements: 9.1, 9.2, 9.3
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: digits,<number>\n");
+					return;
+				}
+				rc = amps_send_called_address(number);
+				if (rc < 0)
+					fprintf(stderr, "Send Called-Address order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "maintenance") == 0) {
+				/* Parse: maintenance,number
+				 * Send Maintenance Order (Order 10, ORDQ=0)
+				 * Silent test - mobile confirms with ST but doesn't ring
+				 * Requirements: 11.1, 11.2, 11.3, 11.4
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: maintenance,<number>\n");
+					return;
+				}
+				rc = amps_maintenance(number);
+				if (rc < 0)
+					fprintf(stderr, "Maintenance order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "silentpage") == 0) {
+				/* Parse: silentpage,number
+				 * Silent Page - page mobile and send Maintenance instead of Alert
+				 * This tests the mobile's RF path without ringing the phone.
+				 * Flow: Page -> Assign Channel -> Maintenance -> Release
+				 * Per TIA/EIA-553-A: Maintenance can only be sent on FVC,
+				 * so we must establish a call first.
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: silentpage,<number>\n");
+					return;
+				}
+				rc = amps_silent_page(number);
+				if (rc < 0)
+					fprintf(stderr, "Silent Page failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "flashcri") == 0) {
+				/* Parse: flashcri,number,cri_data
+				 * Send Flash With CRI (Order 18, ORDQ=1) - Charging Rate Indication
+				 * cri_data: "E1,E2,E3,..." (up to 8 elements, 4 digits each)
+				 * Example: flashcri,0570000000,0025,0100
+				 *
+				 * WARNING: EXPERIMENTAL - CRI is NOT defined in TIA/EIA-553-A.
+				 * Data structures from Andreas Eversberg, value mapping unknown.
+				 */
+				char *cri_data;
+				number = strsep(&p, ",");
+				cri_data = p;  /* Rest of string is CRI data */
+				if (!number || !cri_data || !cri_data[0]) {
+					fprintf(stderr, "Usage: flashcri,<number>,<cri_data>\n");
+					fprintf(stderr, "  cri_data: E1,E2,E3,... (up to 8 elements, 4 digits each)\n");
+					fprintf(stderr, "  Example: flashcri,0570000000,0025,0100\n");
+					return;
+				}
+				rc = amps_flash_with_cri(number, cri_data);
+				if (rc < 0)
+					fprintf(stderr, "Flash With CRI failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "flashtci") == 0) {
+				/* Parse: flashtci,number,tci_data
+				 * Send Flash With TCI (Order 18, ORDQ=2) - Total Charging Information
+				 * tci_data: "R1,R2,R3,R4" (up to 4 rows, 4 digits each)
+				 * Example: flashtci,0570000000,0123,4567
+				 *
+				 * WARNING: EXPERIMENTAL - TCI is NOT defined in TIA/EIA-553-A.
+				 * Data structures from Andreas Eversberg, value mapping unknown.
+				 */
+				char *tci_data;
+				number = strsep(&p, ",");
+				tci_data = p;  /* Rest of string is TCI data */
+				if (!number || !tci_data || !tci_data[0]) {
+					fprintf(stderr, "Usage: flashtci,<number>,<tci_data>\n");
+					fprintf(stderr, "  tci_data: R1,R2,R3,R4 (up to 4 rows, 4 digits each)\n");
+					fprintf(stderr, "  Example: flashtci,0570000000,0123,4567\n");
+					return;
+				}
+				rc = amps_flash_with_tci(number, tci_data);
+				if (rc < 0)
+					fprintf(stderr, "Flash With TCI failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "alertcri") == 0) {
+				/* Parse: alertcri,number,cri_data
+				 * Send Alert With CRI (Order 17, ORDQ=1) - Alert with Charging Rate
+				 * cri_data: "E1,E2,E3,..." (up to 8 elements, 4 digits each)
+				 * Example: alertcri,0570000000,0025,0100
+				 *
+				 * WARNING: EXPERIMENTAL - CRI is NOT defined in TIA/EIA-553-A.
+				 * Data structures from Andreas Eversberg, value mapping unknown.
+				 */
+				char *cri_data;
+				number = strsep(&p, ",");
+				cri_data = p;  /* Rest of string is CRI data */
+				if (!number || !cri_data || !cri_data[0]) {
+					fprintf(stderr, "Usage: alertcri,<number>,<cri_data>\n");
+					fprintf(stderr, "  cri_data: E1,E2,E3,... (up to 8 elements, 4 digits each)\n");
+					fprintf(stderr, "  Example: alertcri,0570000000,0025,0100\n");
+					return;
+				}
+				rc = amps_alert_with_cri(number, cri_data);
+				if (rc < 0)
+					fprintf(stderr, "Alert With CRI failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "alerttci") == 0) {
+				/* Parse: alerttci,number,tci_data
+				 * Send Alert With TCI (Order 17, ORDQ=2) - Alert with Total Charges
+				 * tci_data: "R1,R2,R3,R4" (up to 4 rows, 4 digits each)
+				 * Example: alerttci,0570000000,0123,4567
+				 *
+				 * WARNING: EXPERIMENTAL - TCI is NOT defined in TIA/EIA-553-A.
+				 * Data structures from Andreas Eversberg, value mapping unknown.
+				 */
+				char *tci_data;
+				number = strsep(&p, ",");
+				tci_data = p;  /* Rest of string is TCI data */
+				if (!number || !tci_data || !tci_data[0]) {
+					fprintf(stderr, "Usage: alerttci,<number>,<tci_data>\n");
+					fprintf(stderr, "  tci_data: R1,R2,R3,R4 (up to 4 rows, 4 digits each)\n");
+					fprintf(stderr, "  Example: alerttci,0570000000,0123,4567\n");
+					return;
+				}
+				rc = amps_alert_with_tci(number, tci_data);
+				if (rc < 0)
+					fprintf(stderr, "Alert With TCI failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "esn") == 0) {
+				/* Parse: esn,number
+				 * Send Serial Number Request (Order 15, ORDQ=0)
+				 * Requests mobile to send its ESN for verification
+				 * Requirements: 15.1, 15.2, 15.3, 15.4
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: esn,<number>\n");
+					return;
+				}
+				rc = amps_serial_number_request(number);
+				if (rc < 0)
+					fprintf(stderr, "Serial Number Request failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "local") == 0) {
+				/* Parse: local,number,code
+				 * Send Local Control Order (Order 30, ORDQ=0)
+				 * Vendor-specific local control action
+				 * code: 0-31 (manufacturer-defined)
+				 * Requirements: 19.1, 19.2, 19.3, 19.4
+				 *
+				 * WARNING: This is highly vendor-specific. The meaning of each
+				 * code depends on the mobile station manufacturer.
+				 */
+				char *code_str;
+				int code;
+				number = strsep(&p, ",");
+				code_str = strsep(&p, ",");
+				if (!number || !code_str) {
+					fprintf(stderr, "Usage: local,<number>,<code>\n");
+					fprintf(stderr, "  code: 0-31 (vendor-specific)\n");
+					return;
+				}
+				code = atoi(code_str);
+				rc = amps_local_control(number, code);
+				if (rc < 0)
+					fprintf(stderr, "Local Control order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "handoff") == 0) {
+				/* Parse: handoff,number[,channel]
+				 * Send Handoff message on FVC
+				 * Transfers active call to different voice channel
+				 *
+				 * Per TIA/EIA-553-A Section 2.6.4.4:
+				 * - Mobile sends 50ms ST to confirm
+				 * - Mobile tunes to new channel
+				 * - Call continues on new channel
+				 *
+				 * If channel is omitted, auto-selects a free VC in same system
+				 *
+				 * Example: handoff,5203495579        (auto-select)
+				 * Example: handoff,5203495579,335   (specific channel)
+				 */
+				char *chan_str;
+				int channel = 0;  /* 0 = auto-select */
+				
+				number = strsep(&p, ",");
+				chan_str = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: handoff,<number>[,<channel>]\n");
+					fprintf(stderr, "  channel: Target voice channel (optional, auto-selects if omitted)\n");
+					return;
+				}
+				if (chan_str && chan_str[0])
+					channel = atoi(chan_str);
+				rc = amps_handoff(number, channel);
+				if (rc < 0)
+					fprintf(stderr, "Handoff failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "retry") == 0) {
+				/* Parse: retry,number,chan1[,chan2,chan3,chan4,chan5,chan6][,last]
+				 * Send Directed Retry Order (Order 12) on FOCC
+				 * Redirects mobile to try access on different control channels
+				 * chan1-chan6: Channel positions (1-127, up to 6 channels)
+				 * last: Optional "last" keyword to indicate last try (ORDQ=1)
+				 *
+				 * Per TIA/EIA-553-A Section 3.7.1.1:
+				 * - ORDQ=0: Not last try (mobile should try again if this fails)
+				 * - ORDQ=1: Last try (mobile should give up if this fails)
+				 *
+				 * Example: retry,5203495579,10,20,30
+				 * Example: retry,5203495579,10,20,30,last
+				 */
+				char *chan_str;
+				int channels[6];
+				int num_channels = 0;
+				int last_try = 0;
+				
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: retry,<number>,<chan1>[,<chan2>,...][,last]\n");
+					fprintf(stderr, "  chan1-chan6: Channel positions (1-127)\n");
+					fprintf(stderr, "  last: Optional - indicates last try (ORDQ=1)\n");
+					return;
+				}
+				
+				/* Parse channel positions */
+				while ((chan_str = strsep(&p, ",")) != NULL && num_channels < 6) {
+					if (strcasecmp(chan_str, "last") == 0) {
+						last_try = 1;
+						break;
+					}
+					int chan = atoi(chan_str);
+					if (chan < 1 || chan > 127) {
+						fprintf(stderr, "Invalid channel position %d (must be 1-127)\n", chan);
+						return;
+					}
+					channels[num_channels++] = chan;
+				}
+				
+				/* Check for "last" keyword after channels */
+				if (chan_str && strcasecmp(chan_str, "last") == 0) {
+					last_try = 1;
+				}
+				
+				if (num_channels < 1) {
+					fprintf(stderr, "Usage: retry,<number>,<chan1>[,<chan2>,...][,last]\n");
+					fprintf(stderr, "  At least one channel position required\n");
+					return;
+				}
+				
+				rc = amps_directed_retry(number, channels, num_channels, last_try);
+				if (rc < 0)
+					fprintf(stderr, "Directed Retry order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "rescan") == 0) {
+				/* Parse: rescan,number
+				 * Send Directed Retry with automatic CHANPOS calculation
+				 * Determines current system (A/B), calculates valid control
+				 * channel positions, and sends Directed Retry.
+				 *
+				 * This is a convenience command that handles the CHANPOS
+				 * calculation automatically based on the current control
+				 * channel and serving-system status.
+				 */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: rescan,<number>\n");
+					return;
+				}
+				rc = amps_rescan(number);
+				if (rc < 0)
+					fprintf(stderr, "Rescan order failed: %d\n", rc);
+			} else {
+				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry' or 'rescan'\n", cmd);
+			}
 		}
 	}
 }
@@ -544,16 +1063,16 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 			printf("Base station on channel %s ready (%s), please tune transmitter to %.4f MHz and receiver to %.4f MHz. (%.3f MHz offset)\n", kanal[i], chan_type_long_name(chan_type[i]), amps_channel2freq(atoi(kanal[i]), 0) / 1e6, amps_channel2freq(atoi(kanal[i]), 1) / 1e6, amps_channel2freq(atoi(kanal[i]), 2) / 1e6);
 	}
 
-	/* Create Flash With Info FIFO */
-	unlink(AMPS_FLASH_FIFO);
-	rc = mkfifo(AMPS_FLASH_FIFO, 0666);
+	/* Create AMPS Control FIFO */
+	unlink(AMPS_CONTROL_FIFO);
+	rc = mkfifo(AMPS_CONTROL_FIFO, 0666);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to create Flash FIFO '%s'!\n", AMPS_FLASH_FIFO);
+		fprintf(stderr, "Failed to create Control FIFO '%s'!\n", AMPS_CONTROL_FIFO);
 		goto fail;
 	} else {
-		flash_fd = open(AMPS_FLASH_FIFO, O_RDONLY | O_NONBLOCK);
-		if (flash_fd < 0) {
-			fprintf(stderr, "Failed to open Flash FIFO '%s'!\n", AMPS_FLASH_FIFO);
+		control_fd = open(AMPS_CONTROL_FIFO, O_RDONLY | O_NONBLOCK);
+		if (control_fd < 0) {
+			fprintf(stderr, "Failed to open Control FIFO '%s'!\n", AMPS_CONTROL_FIFO);
 			goto fail;
 		}
 	}
@@ -562,9 +1081,9 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 
 fail:
 	/* FIFO cleanup */
-	if (flash_fd > 0)
-		close(flash_fd);
-	unlink(AMPS_FLASH_FIFO);
+	if (control_fd > 0)
+		close(control_fd);
+	unlink(AMPS_CONTROL_FIFO);
 
 	/* destroy transceiver instance */
 	while (sender_head)

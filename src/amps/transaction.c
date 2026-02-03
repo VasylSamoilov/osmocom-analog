@@ -70,12 +70,102 @@ static const char *trans_state_name(int state)
 		return "CALL RELEASE";
 	case TRANS_CALL_RELEASE_SEND:
 		return "CALL RELEASE SEND";
+	case TRANS_CALL_FLASH_INFO:
+		return "FLASH WITH INFO";
+	case TRANS_CALL_FLASH_INFO_SEND:
+		return "FLASH WITH INFO SEND";
+	case TRANS_CALL_PCI_QUERY:
+		return "PCI QUERY";
+	case TRANS_CALL_PCI_QUERY_SEND:
+		return "PCI QUERY SEND";
+	case TRANS_CALL_AUDIT:
+		return "AUDIT";
+	case TRANS_CALL_AUDIT_SEND:
+		return "AUDIT SEND";
+	case TRANS_AUDIT:
+		return "FOCC AUDIT";
+	case TRANS_AUDIT_SEND:
+		return "FOCC AUDIT SEND";
+	case TRANS_PCI:
+		return "FOCC PCI";
+	case TRANS_PCI_SEND:
+		return "FOCC PCI SEND";
+	case TRANS_MWI:
+		return "FOCC MWI";
+	case TRANS_MWI_SEND:
+		return "FOCC MWI SEND";
 	case TRANS_PAGE:
 		return "PAGE";
 	case TRANS_PAGE_SEND:
 		return "PAGE SEND";
 	case TRANS_PAGE_REPLY:
 		return "PAGE REPLY";
+	case TRANS_CALL_REORDER:
+		return "REORDER";
+	case TRANS_CALL_REORDER_SEND:
+		return "REORDER SEND";
+	case TRANS_CALL_MWI:
+		return "MESSAGE WAITING";
+	case TRANS_CALL_MWI_SEND:
+		return "MESSAGE WAITING SEND";
+	case TRANS_CALL_STOP_ALERT:
+		return "STOP ALERT";
+	case TRANS_CALL_STOP_ALERT_SEND:
+		return "STOP ALERT SEND";
+	case TRANS_CALL_INTERCEPT:
+		return "INTERCEPT";
+	case TRANS_CALL_INTERCEPT_SEND:
+		return "INTERCEPT SEND";
+	case TRANS_CALL_MAINTENANCE:
+		return "MAINTENANCE";
+	case TRANS_CALL_MAINTENANCE_SEND:
+		return "MAINTENANCE SEND";
+	case TRANS_CALL_ABB_ALERT:
+		return "ABBREVIATED ALERT";
+	case TRANS_CALL_ABB_ALERT_SEND:
+		return "ABBREVIATED ALERT SEND";
+	case TRANS_CALL_ESN_REQUEST:
+		return "ESN REQUEST";
+	case TRANS_CALL_ESN_REQUEST_SEND:
+		return "ESN REQUEST SEND";
+	case TRANS_CALL_ESN_REPLY:
+		return "ESN REPLY";
+	case TRANS_CALL_DIGITS_REQUEST:
+		return "DIGITS REQUEST";
+	case TRANS_CALL_DIGITS_REQUEST_SEND:
+		return "DIGITS REQUEST SEND";
+	case TRANS_CALL_DIGITS_REPLY:
+		return "DIGITS REPLY";
+	case TRANS_CALL_LOCAL_CONTROL:
+		return "LOCAL CONTROL";
+	case TRANS_CALL_LOCAL_CONTROL_SEND:
+		return "LOCAL CONTROL SEND";
+	case TRANS_CALL_HANDOFF:
+		return "HANDOFF";
+	case TRANS_CALL_HANDOFF_SEND:
+		return "HANDOFF SEND";
+	case TRANS_CALL_HANDOFF_CONFIRM:
+		return "HANDOFF CONFIRM";
+	case TRANS_DIRECTED_RETRY:
+		return "DIRECTED RETRY";
+	case TRANS_DIRECTED_RETRY_SEND:
+		return "DIRECTED RETRY SEND";
+	case TRANS_SILENT_PAGE:
+		return "SILENT PAGE";
+	case TRANS_SILENT_PAGE_SEND:
+		return "SILENT PAGE SEND";
+	case TRANS_SILENT_PAGE_REPLY:
+		return "SILENT PAGE REPLY";
+	case TRANS_SILENT_PAGE_ASSIGN:
+		return "SILENT PAGE ASSIGN";
+	case TRANS_SILENT_PAGE_ASSIGN_SEND:
+		return "SILENT PAGE ASSIGN SEND";
+	case TRANS_SILENT_PAGE_ASSIGN_CONFIRM:
+		return "SILENT PAGE ASSIGN CONFIRM";
+	case TRANS_SILENT_PAGE_MAINTENANCE:
+		return "SILENT PAGE MAINTENANCE";
+	case TRANS_SILENT_PAGE_MAINTENANCE_SEND:
+		return "SILENT PAGE MAINTENANCE SEND";
 	default:
 		return "<invalid transaction state>";
 	}
@@ -113,6 +203,53 @@ const char *trans_short_state_name(int state)
 	case TRANS_PAGE_SEND:
 	case TRANS_PAGE_REPLY:
 		return "PAGE";
+	case TRANS_SILENT_PAGE:
+	case TRANS_SILENT_PAGE_SEND:
+	case TRANS_SILENT_PAGE_REPLY:
+	case TRANS_SILENT_PAGE_ASSIGN:
+	case TRANS_SILENT_PAGE_ASSIGN_SEND:
+	case TRANS_SILENT_PAGE_ASSIGN_CONFIRM:
+	case TRANS_SILENT_PAGE_MAINTENANCE:
+	case TRANS_SILENT_PAGE_MAINTENANCE_SEND:
+		return "SILPAGE";
+	case TRANS_CALL_REORDER:
+	case TRANS_CALL_REORDER_SEND:
+		return "REORDER";
+	case TRANS_CALL_MWI:
+	case TRANS_CALL_MWI_SEND:
+	case TRANS_MWI:
+	case TRANS_MWI_SEND:
+		return "MWI";
+	case TRANS_CALL_STOP_ALERT:
+	case TRANS_CALL_STOP_ALERT_SEND:
+		return "STOPALRT";
+	case TRANS_CALL_INTERCEPT:
+	case TRANS_CALL_INTERCEPT_SEND:
+		return "INTERCPT";
+	case TRANS_CALL_MAINTENANCE:
+	case TRANS_CALL_MAINTENANCE_SEND:
+		return "MAINT";
+	case TRANS_CALL_ABB_ALERT:
+	case TRANS_CALL_ABB_ALERT_SEND:
+		return "ABBALRT";
+	case TRANS_CALL_ESN_REQUEST:
+	case TRANS_CALL_ESN_REQUEST_SEND:
+	case TRANS_CALL_ESN_REPLY:
+		return "ESN";
+	case TRANS_CALL_DIGITS_REQUEST:
+	case TRANS_CALL_DIGITS_REQUEST_SEND:
+	case TRANS_CALL_DIGITS_REPLY:
+		return "DIGITS";
+	case TRANS_CALL_LOCAL_CONTROL:
+	case TRANS_CALL_LOCAL_CONTROL_SEND:
+		return "LOCAL";
+	case TRANS_CALL_HANDOFF:
+	case TRANS_CALL_HANDOFF_SEND:
+	case TRANS_CALL_HANDOFF_CONFIRM:
+		return "HANDOFF";
+	case TRANS_DIRECTED_RETRY:
+	case TRANS_DIRECTED_RETRY_SEND:
+		return "RETRY";
 	default:
 		return "<invalid transaction state>";
 	}
@@ -174,6 +311,10 @@ transaction_t *create_transaction(amps_t *amps, enum amps_trans_state state, uin
 	trans->signal_cadence = -1; /* default usage in frame.c */
 	trans->presentation_indicator = -1;
 	trans->screening_indicator = -1;
+	
+	/* Initialize handoff fields */
+	trans->handoff_channel = 0;
+	trans->handoff_scc = -1;  /* -1 = use current channel's SAT */
 
 	const char *number = amps_min2number(trans->min1, trans->min2);
 	LOGP(DTRANS, LOGL_INFO, "Created transaction for subscriber '%s'\n", number);
@@ -190,8 +331,11 @@ void destroy_transaction(transaction_t *trans)
 	
 	const char *number = amps_min2number(trans->min1, trans->min2);
 	LOGP(DTRANS, LOGL_INFO, "Destroying transaction for subscriber '%s'\n", number);
+	LOGP(DTRANS, LOGL_DEBUG, "DEBUG: Destroying transaction state=%d MIN1=%u MIN2=%u on channel %s\n", 
+		trans->state, trans->min1, trans->min2, trans->amps ? trans->amps->sender.kanal : "(no channel)");
 
 	osmo_timer_del(&trans->timer);
+	osmo_timer_del(&trans->flash_timer);
 
 	trans_new_state(trans, 0);
 

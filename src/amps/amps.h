@@ -136,6 +136,7 @@ struct amps {
 	/* RECC frame states */
 	int			rx_recc_nawc;		/* counts down received words */
 	int			rx_recc_word_count;	/* counts up received words */
+	uint8_t			rx_recc_t;		/* T field: 1=Origination, 0=Paging Response */
 	uint32_t		rx_recc_min1;		/* mobile id */
 	uint16_t		rx_recc_min2;
 	uint8_t			rx_recc_msg_type;	/* message (3 values) */
@@ -144,7 +145,10 @@ struct amps {
 	uint32_t		rx_recc_esn;
 	uint32_t		rx_recc_scm;
 	uint8_t			rx_recc_mpci;
+	uint8_t			rx_recc_mspc;		/* from Word C - Protocol Capability */
+	uint8_t			rx_recc_mscap;		/* from Word C - Protocol Capability */
 	char			rx_recc_dialing[33];	/* received dial string */
+	int			rx_rvc_esn_pending;	/* waiting for ESN word (Order 15 response) */
 	/* FOCC frame states */
 	int			rx_focc_word_count;	/* counts received words */
 	int			tx_focc_frame_count;	/* used to schedule system information */
@@ -158,9 +162,14 @@ struct amps {
 	int			tx_focc_word_count;	/* counts transmitted words in a multi word message */
 	int			tx_focc_word_repeat;	/* counts repeats of multi word message */
 	int			tx_focc_debugged;	/* indicator to prevent debugging all SI/filler frames */
+	/* Directed Retry fields for FOCC */
+	int			tx_focc_retry_channels[6];	/* channel positions for Directed Retry */
+	int			tx_focc_retry_num_channels;	/* number of channels */
+	int			tx_focc_num_words;	/* total words in message (2 for normal, 4 for Directed Retry) */
 	/* FVC frame states */
 	int			tx_fvc_send;		/* if set, send message words */
 	int			tx_fvc_chan;		/* channel to assign for voice call */
+	int			tx_fvc_scc;		/* target SAT color code for handoff (-1 = use current) */
 	uint8_t			tx_fvc_msg_type;	/* message (3 values) */
 	uint8_t			tx_fvc_ordq;
 	uint8_t			tx_fvc_order;
@@ -174,6 +183,11 @@ struct amps {
 	char			tx_fvc_flashinfo[34];	/* Flash With Info message */
 	int			tx_fvc_flashinfo_pi;	/* presentation indicator */
 	int			tx_fvc_flashinfo_si;	/* screening indicator */
+	/* CRI/TCI fields for Alert/Flash With Info ORDQ=1,2 */
+	uint8_t			tx_fvc_cri[32];		/* CRI data: 8 elements × 4 BCD digits */
+	int			tx_fvc_cri_elements;	/* number of CRI elements (1-8) */
+	uint8_t			tx_fvc_tci[16];		/* TCI data: 4 rows × 4 BCD digits */
+	int			tx_fvc_tci_rows;	/* number of TCI rows (1-4) */
 	/* SAT tone */
 	int			sat;			/* use SAT tone 0..2 */
 	int			sat_samples;		/* number of samples in buffer for supervisory detection */
@@ -195,6 +209,13 @@ struct amps {
 	double			sat_goertzel_levels[3];	/* levels of all 3 SAT frequencies */
 	int			sig_detected;		/* current detection state flag (delayed detection) */
 	int			sig_detect_count;	/* current number of consecutive detections/losses */
+	/* Fast ST detection for handoff (smaller window, more frequent checks) */
+	goertzel_t		fast_st_goertzel[2];	/* ST and noise reference for fast detection */
+	sample_t		*fast_st_buffer;	/* buffer for fast ST detection */
+	int			fast_st_samples;	/* number of samples in fast ST buffer (~20ms) */
+	int			fast_st_pos;		/* current position in fast ST buffer */
+	int			fast_st_detected;	/* fast ST detection flag */
+	int			fast_st_count;		/* consecutive fast ST detections */
 
 	transaction_t		*trans_list;		/* list of transactions */
 
@@ -214,7 +235,7 @@ enum amps_chan_type amps_channel2type(int channel);
 const char *amps_channel2band(int channel);
 const char *amps_min22number(uint16_t min2);
 const char *amps_min12number(uint32_t min1);
-void amps_number2min(const char *number, uint32_t *min1, uint16_t *min2);
+int amps_number2min(const char *number, uint32_t *min1, uint16_t *min2);
 const char *amps_min2number(uint32_t min1, uint16_t min2);
 void amps_encode_esn(uint32_t *esn, uint8_t mfr, uint32_t serial);
 void amps_decode_esn(uint32_t esn, uint8_t *mfr, uint32_t *serial);
@@ -226,9 +247,33 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality);
 void amps_rx_sat(amps_t *amps, int tone, double quality);
 void amps_rx_sat_mismatch(amps_t *amps, enum sat_state expected, enum sat_state detected);
 const char *sat_state_name(enum sat_state state);
-void amps_rx_recc(amps_t *amps, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing);
+void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing, uint8_t mspc, uint8_t mscap);
 transaction_t *amps_tx_frame_focc(amps_t *amps);
 transaction_t *amps_tx_frame_fvc(amps_t *amps);
 void amps_display_status();
 int amps_flash_with_info(const char *number, const char *message, int pi, int si);
-
+int amps_flash_with_cri(const char *number, const char *cri_data);
+int amps_flash_with_tci(const char *number, const char *tci_data);
+int amps_alert_with_cri(const char *number, const char *cri_data);
+int amps_alert_with_tci(const char *number, const char *tci_data);
+int amps_pci_query(const char *number);
+int amps_audit_order(const char *number);
+int amps_alert_order(const char *number, int ordq);
+int amps_abbreviated_alert(const char *number);
+int amps_release_order(const char *number);
+int amps_reorder(const char *number);
+int amps_mwi(const char *number, int count, int type);
+int amps_stopalert(const char *number);
+int amps_intercept(const char *number);
+int amps_send_called_address(const char *number);
+int amps_maintenance(const char *number);
+int amps_silent_page(const char *number);
+int amps_change_power_order(const char *number, int level);
+int amps_serial_number_request(const char *number);
+int amps_local_control(const char *number, int code);
+int amps_handoff(const char *number, int new_channel);
+int amps_directed_retry(const char *number, int *channels, int num_channels, int last_try);
+int amps_rescan(const char *number);
+void amps_rx_pci_report(amps_t *amps, uint8_t mspc, uint8_t mscap);
+void amps_rx_release_order(amps_t *amps, uint8_t ordq);
+void amps_rx_esn_response(amps_t *amps, uint32_t esn);

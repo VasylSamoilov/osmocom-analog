@@ -225,3 +225,8 @@ int amps_encode_frame_focc(amps_t *amps, char *bits);
 int amps_encode_frame_fvc(amps_t *amps, char *bits);
 int amps_decode_frame(amps_t *amps, const char *bits, int count, double level, double quality, int negative);
 
+const char *ie_mpci(uint64_t value);
+const char *ie_mspc(uint64_t value);
+const char *ie_mscap(uint64_t value);
+const char *amps_table4_name(uint8_t msg_type, uint8_t ordq, uint8_t order);
+

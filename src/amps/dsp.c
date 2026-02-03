@@ -351,6 +351,25 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 	audio_goertzel_init(&amps->sat_goertzel[4], (!tacs) ? 10000.0 : 8000.0, amps->sender.samplerate);
 	sat_reset(amps, "Initial state");
 
+	/* Fast ST detection for handoff - 20ms window for catching 50ms ST
+	 * Bandwidth = 1/0.020 = 50 Hz (wider than SAT, but sufficient for ST detection)
+	 * This allows us to detect ST more quickly during handoff
+	 */
+	amps->fast_st_samples = (int)((double)amps->sender.samplerate * 0.020 + 0.5);  /* 20ms window */
+	spl = calloc(amps->fast_st_samples, sizeof(*spl));
+	if (!spl) {
+		LOGP(DDSP, LOGL_ERROR, "No memory for fast ST buffer!\n");
+		return -ENOMEM;
+	}
+	amps->fast_st_buffer = spl;
+	amps->fast_st_pos = 0;
+	amps->fast_st_detected = 0;
+	amps->fast_st_count = 0;
+	/* Initialize fast ST Goertzel filters */
+	audio_goertzel_init(&amps->fast_st_goertzel[0], (!tacs) ? 10000.0 : 8000.0, amps->sender.samplerate);  /* ST */
+	audio_goertzel_init(&amps->fast_st_goertzel[1], 5790.0, amps->sender.samplerate);  /* noise reference */
+	LOGP(DDSP, LOGL_DEBUG, "Fast ST detection interval is %d ms.\n", amps->fast_st_samples * 1000 / amps->sender.samplerate);
+
 	/* be more tolerant when syncing */
 	amps->fsk_rx_sync_tolerant = tolerant;
 
@@ -381,6 +400,10 @@ void dsp_cleanup_sender(amps_t *amps)
 	if (amps->sat_filter_spl) {
 		free(amps->sat_filter_spl);
 		amps->sat_filter_spl = NULL;
+	}
+	if (amps->fast_st_buffer) {
+		free(amps->fast_st_buffer);
+		amps->fast_st_buffer = NULL;
 	}
 #if 0
 	if (amps->frame_spl) {
@@ -815,49 +838,55 @@ static void fsk_rx_dotting(amps_t *amps, double _elapsed)
 }
 
 /* decode frame */
+/* Process one FSK sample (dotting, sync, bit decoding) */
+static void fsk_rx_sample(amps_t *amps, sample_t sample)
+{
+#ifdef DEBUG_DECODER
+	puts(debug_amplitude(sample / (double)FSK_DEVIATION));
+#endif
+	/* push sample to detection window and shift */
+	amps->fsk_rx_window[amps->fsk_rx_window_pos++] = sample;
+	if (amps->fsk_rx_window_pos == amps->fsk_rx_window_length)
+		amps->fsk_rx_window_pos = 0;
+	if (amps->fsk_rx_sync != FSK_SYNC_POSITIVE && amps->fsk_rx_sync != FSK_SYNC_NEGATIVE) {
+		/* check for change in polarity */
+		if (amps->fsk_rx_last_sample <= 0) {
+			if (sample > 0) {
+				fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
+				amps->fsk_rx_elapsed = 0.0;
+			}
+		} else {
+			if (sample <= 0) {
+				fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
+				amps->fsk_rx_elapsed = 0.0;
+			}
+		}
+	}
+	amps->fsk_rx_last_sample = sample;
+	amps->fsk_rx_elapsed += amps->fsk_bitstep;
+//	printf("%.4f\n", bitcount);
+	if (amps->fsk_rx_sync != FSK_SYNC_NONE) {
+		amps->fsk_rx_bitcount += amps->fsk_bitstep;
+		if (amps->fsk_rx_bitcount >= 1.0) {
+			amps->fsk_rx_bitcount -= 1.0;
+			fsk_rx_bit(amps,
+				amps->fsk_rx_window,
+				amps->fsk_rx_window_length,
+				amps->fsk_rx_window_pos,
+				amps->fsk_rx_window_begin,
+				amps->fsk_rx_window_half,
+				amps->fsk_rx_window_end);
+		}
+	}
+}
+
+/* decode frame */
 static void sender_receive_frame(amps_t *amps, sample_t *samples, int length)
 {
 	int i;
 
-	for (i = 0; i < length; i++) {
-#ifdef DEBUG_DECODER
-		puts(debug_amplitude(samples[i] / (double)FSK_DEVIATION));
-#endif
-		/* push sample to detection window and shift */
-		amps->fsk_rx_window[amps->fsk_rx_window_pos++] = samples[i];
-		if (amps->fsk_rx_window_pos == amps->fsk_rx_window_length)
-			amps->fsk_rx_window_pos = 0;
-		if (amps->fsk_rx_sync != FSK_SYNC_POSITIVE && amps->fsk_rx_sync != FSK_SYNC_NEGATIVE) {
-			/* check for change in polarity */
-			if (amps->fsk_rx_last_sample <= 0) {
-				if (samples[i] > 0) {
-					fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
-					amps->fsk_rx_elapsed = 0.0;
-				}
-			} else {
-				if (samples[i] <= 0) {
-					fsk_rx_dotting(amps, amps->fsk_rx_elapsed);
-					amps->fsk_rx_elapsed = 0.0;
-				}
-			}
-		}
-		amps->fsk_rx_last_sample = samples[i];
-		amps->fsk_rx_elapsed += amps->fsk_bitstep;
-//		printf("%.4f\n", bitcount);
-		if (amps->fsk_rx_sync != FSK_SYNC_NONE) {
-			amps->fsk_rx_bitcount += amps->fsk_bitstep;
-			if (amps->fsk_rx_bitcount >= 1.0) {
-				amps->fsk_rx_bitcount -= 1.0;
-				fsk_rx_bit(amps,
-					amps->fsk_rx_window,
-					amps->fsk_rx_window_length,
-					amps->fsk_rx_window_pos,
-					amps->fsk_rx_window_begin,
-					amps->fsk_rx_window_half,
-					amps->fsk_rx_window_end);
-			}
-		}
-	}
+	for (i = 0; i < length; i++)
+		fsk_rx_sample(amps, samples[i]);
 }
 
 
@@ -1024,12 +1053,22 @@ static void sat_decode(amps_t *amps, sample_t *samples, int length)
 		}
 	}
 
-	/* === Signaling Tone Detection (unchanged) === */
+	/* === Signaling Tone Detection === */
+	/* For handoff, use fast detection (1 sample) since ST is only 50ms
+	 * For other states, use normal detection (6 samples) to avoid false positives
+	 */
+	int sig_detect_threshold = SIG_DETECT_COUNT;
+	transaction_t *trans = amps->trans_list;
+	if (trans && trans->state == TRANS_CALL_HANDOFF_SEND) {
+		/* Fast ST detection for handoff - 50ms ST needs immediate detection */
+		sig_detect_threshold = 1;
+	}
+	
 	/* Added SIG_LEVEL check to prevent spurious detection from low-level noise/spurs */
 	if (sig_quality > SIG_QUALITY && sig_level > SIG_LEVEL) {
 		if (amps->sig_detected == 0) {
 			amps->sig_detect_count++;
-			if (amps->sig_detect_count == SIG_DETECT_COUNT) {
+			if (amps->sig_detect_count >= sig_detect_threshold) {
 				amps->sig_detected = 1;
 				amps->sig_detect_count = 0;
 				LOGP_CHAN(DDSP, LOGL_DEBUG, "Signaling Tone detected with level=%.0f%%, quality=%.0f%%.\n", sig_level * 100.0, sig_quality * 100.0);
@@ -1051,12 +1090,91 @@ static void sat_decode(amps_t *amps, sample_t *samples, int length)
 	}
 }
 
+/* Fast ST detection for handoff - runs every 20ms instead of 66ms
+ * This is specifically designed to catch the 50ms ST during handoff
+ */
+static void fast_st_decode(amps_t *amps, sample_t *samples, int length)
+{
+	double results[2], sig_level, sig_quality;
+	
+	/* Run Goertzel filters for ST and noise reference */
+	audio_goertzel(&amps->fast_st_goertzel[0], samples, length, 0, &results[0], 1);
+	audio_goertzel(&amps->fast_st_goertzel[1], samples, length, 0, &results[1], 1);
+	
+	/* Normalize levels */
+	sig_level = results[0] / ((!tacs) ? AMPS_FSK_DEVIATION : TACS_FSK_DEVIATION);
+	
+	/* Calculate quality (ratio of ST to noise) */
+	sig_quality = (results[0] > results[1] && results[0] > 0.001) ?
+	              (results[0] - results[1]) / results[0] : 0.0;
+	if (sig_quality < 0)
+		sig_quality = 0;
+	
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "Fast ST: level=%.0f%% quality=%.0f%%\n", 
+	          sig_level * 100.0, sig_quality * 100.0);
+	
+	/* Fast ST detection - lower thresholds for quick detection */
+	if (sig_quality > 0.70 && sig_level > 0.15) {
+		if (amps->fast_st_detected == 0) {
+			amps->fast_st_count++;
+			/* Require 2 consecutive detections (40ms) to confirm */
+			if (amps->fast_st_count >= 2) {
+				amps->fast_st_detected = 1;
+				amps->fast_st_count = 0;
+				LOGP_CHAN(DDSP, LOGL_NOTICE, "Fast ST detected! level=%.0f%% quality=%.0f%%\n", 
+				          sig_level * 100.0, sig_quality * 100.0);
+				amps_rx_signaling_tone(amps, 1, sig_quality);
+			}
+		} else {
+			amps->fast_st_count = 0;
+		}
+	} else {
+		if (amps->fast_st_detected == 1) {
+			amps->fast_st_count++;
+			/* Require 2 consecutive losses (40ms) to confirm loss */
+			if (amps->fast_st_count >= 2) {
+				amps->fast_st_detected = 0;
+				amps->fast_st_count = 0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "Fast ST lost.\n");
+				amps_rx_signaling_tone(amps, 0, 0.0);
+			}
+		} else {
+			amps->fast_st_count = 0;
+		}
+	}
+}
+
 static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 {
 	transaction_t *trans = amps->trans_list;
 	sample_t *spl, s;
 	int max, pos;
 	int i;
+	int use_fast_st = 0;
+	
+	/* Check if we should use fast ST detection (during handoff) */
+	if (trans && trans->state == TRANS_CALL_HANDOFF_SEND) {
+		use_fast_st = 1;
+	}
+	
+	/* Fast ST detection during handoff - process raw samples BEFORE the delay buffer
+	 * This gives us the most recent samples for quick ST detection
+	 */
+	if (use_fast_st && amps->fast_st_buffer) {
+		sample_t *fast_spl = amps->fast_st_buffer;
+		int fast_max = amps->fast_st_samples;
+		int fast_pos = amps->fast_st_pos;
+		
+		/* Use the raw incoming samples for fast ST detection */
+		for (i = 0; i < length; i++) {
+			fast_spl[fast_pos++] = samples[i];
+			if (fast_pos >= fast_max) {
+				fast_pos = 0;
+				fast_st_decode(amps, fast_spl, fast_max);
+			}
+		}
+		amps->fast_st_pos = fast_pos;
+	}
 
 	/* SAT / signalling tone detection */
 	max = amps->sat_samples;
@@ -1080,6 +1198,17 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 	 && trans && trans->callref) {
 		int pos, count;
 		int i;
+
+		/* Parallel FSK detection (Blank-and-Burst support) */
+		/* We process raw samples before filtering to catch dotting/sync */
+		for (i = 0; i < length; i++) {
+			/* Optimization: Only process full FSK if we are "hunting" (dotting detected) or "syncing" */
+			/* Lightweight dotting check is cheap. Full decoding happens only if dotting triggers. */
+			fsk_rx_sample(amps, samples[i]);
+		}
+
+		/* If we catch a digital frame during audio mode, we might want to mute audio (blanking) */
+		/* For now, we let both run. If FSK decoder wins, it triggers a callback. */
 
 		/* de-emphasis */
 		/* downsample first (channel filter) */
@@ -1156,6 +1285,10 @@ static void sat_reset(amps_t *amps, const char *reason)
 	amps->sat_state_count = 0;
 	amps->sat_freq_detected = SAT_FREQ_INVALID;
 	amps->sat_level_db = -100.0;
+	/* Reset fast ST detection */
+	amps->fast_st_detected = 0;
+	amps->fast_st_count = 0;
+	amps->fast_st_pos = 0;
 }
 
 void amps_set_dsp_mode(amps_t *amps, enum dsp_mode mode, int frame_length)
@@ -1196,6 +1329,8 @@ void amps_set_dsp_mode(amps_t *amps, enum dsp_mode mode, int frame_length)
 	amps->dsp_mode = mode;
 	if (frame_length)
 		amps->fsk_rx_frame_length = frame_length;
+	else if (mode == DSP_MODE_AUDIO_RX_AUDIO_TX || mode == DSP_MODE_AUDIO_RX_FRAME_TX)
+		amps->fsk_rx_frame_length = 240;
 
 	/* reset detection process */
 	amps->fsk_rx_sync = FSK_SYNC_NONE;
