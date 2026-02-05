@@ -2403,9 +2403,17 @@ struct amps_table4_def {
 	{ "01100", "001", "00001", "Directed Retry to Primary Dedicated Control Channels - analog channels only, Authentication disabled, last try" },
 	{ "01111", "001", "00000", "Serial Number Request / Response" },
 	{ "01100", "001", "00010", "Directed Retry to Primary Dedicated Control Channels - analog channels only, Authentication enabled, last try" },
+	/* Non-autonomous Registration (ORDER=13, ORDQ=0/1) - mobile responds to registration order from base */
+	{ "01101", "000", "00000", "Non-autonomous Registration - Do not make whereabouts known, Authentication Word C not included" },
+	{ "01101", "001", "00000", "Non-autonomous Registration - Make whereabouts known, Authentication Word C not included" },
+	/* Autonomous Registration (ORDER=13, ORDQ=2/3) - mobile initiates registration */
 	{ "01101", "010", "00000", "Autonomous Registration - Do not make whereabouts known, Authentication Word C not included" },
 	{ "01101", "011", "00000", "Autonomous Registration - Make whereabouts known, Authentication Word C not included" },
 	{ "01101", "011", "00001", "Autonomous Registration - Power Down, Authentication Word C not included" },
+	/* Non-autonomous Registration with Auth (ORDER=24, ORDQ=0/1) */
+	{ "11000", "000", "00000", "Non-autonomous Registration - Do not make whereabouts known, Authentication Word C included" },
+	{ "11000", "001", "00000", "Non-autonomous Registration - Make whereabouts known, Authentication Word C included" },
+	/* Autonomous Registration with Auth (ORDER=24, ORDQ=2/3) */
 	{ "11000", "010", "00000", "Autonomous Registration - Do not make whereabouts known, Authentication Word C included" },
 	{ "11000", "011", "00000", "Autonomous Registration - Make whereabouts known, Authentication Word C included" },
 	{ "11000", "011", "00001", "Autonomous Registration - Power Down, Authentication Word C included" },
@@ -2544,6 +2552,13 @@ struct amps_table4_def {
 	{ "10101", "001", "00000", "SSD Update Order Confirmation with success indication" },
 	{ "10111", "000", "00000", "Message Encryption Mode Order Confirmation with disable indication" },
 	{ "10111", "001", "00000", "Message Encryption Mode Order Confirmation with enable indication" },
+	/* Handoff Order (ORDER=14) - analog voice channel handoff */
+	{ "01110", "000", "00000", "Handoff" },
+	/* Reserved entries for completeness */
+	{ "01111", "100", "00000", "Reserved (Parameter Update)" },
+	/* Power-up Registration (ORDER=13, ORDQ=3, MSG_TYPE=2) - some phones use this */
+	{ "01101", "011", "00010", "Autonomous Registration - Power Up, Authentication Word C not included" },
+	{ "11000", "011", "00010", "Autonomous Registration - Power Up, Authentication Word C included" },
 	{ NULL, NULL, NULL, NULL }
 };
 
@@ -2652,7 +2667,13 @@ const char *amps_table4_name(uint8_t msg_type, uint8_t ordq, uint8_t order)
 		 && amps_table4[i].msg_type == (msg_type & amps_table4[i].msg_type_mask))
 		 	return amps_table4[i].function;
 	}
-	return ("Unknown message type");
+	/* Return descriptive string with actual values for unknown message types */
+	{
+		static char unknown_buffer[128];
+		snprintf(unknown_buffer, sizeof(unknown_buffer),
+			"Unknown message type (ORDER=%d ORDQ=%d MSG_TYPE=%d)", order, ordq, msg_type);
+		return unknown_buffer;
+	}
 }
 
 void init_frame(void)

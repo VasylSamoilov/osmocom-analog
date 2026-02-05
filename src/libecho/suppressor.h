@@ -15,6 +15,11 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * UNIDIRECTIONAL ECHO SUPPRESSOR
+ * ==============================
+ * TX = far-end signal (reference) - passes through unmodified
+ * RX = near-end signal - suppressed when TX is active (echo removal)
  */
 
 #ifndef _ECHO_SUPPRESSOR_H
@@ -22,109 +27,75 @@
 
 #include <stdint.h>
 
-/* Direction state */
+/* Suppressor state (simplified) */
 typedef enum {
-	SUPP_DIR_NONE = 0,      /* No dominant direction */
-	SUPP_DIR_TX,            /* TX (far-end) dominant */
-	SUPP_DIR_RX,            /* RX (near-end) dominant */
-	SUPP_DIR_DOUBLETALK     /* Both directions active */
+	SUPP_DIR_NONE = 0,      /* TX silent, RX passes */
+	SUPP_DIR_TX,            /* TX active, RX suppressed */
 } suppressor_direction_t;
 
 /* Echo suppressor state */
 typedef struct {
 	/* Energy detection */
-	double tx_energy;           /* Current TX energy (RMS) */
-	double rx_energy;           /* Current RX energy (RMS) */
+	double tx_energy;           /* Current TX energy (dB) */
+	double rx_energy;           /* Current RX energy (dB) */
 	double tx_energy_smooth;    /* Smoothed TX energy */
 	double rx_energy_smooth;    /* Smoothed RX energy */
 	
-	/* TX energy delay buffer for SDR roundtrip compensation
-	 * In SDR environments, echo arrives delayed (50-200ms+ roundtrip).
-	 * We store TX energy history and compare RX against delayed TX energy
-	 * to properly detect echo that arrives after the original TX. */
+	/* TX energy delay buffer for SDR roundtrip compensation */
 	double *tx_energy_history;  /* Circular buffer of TX energy values */
 	int history_size;           /* Buffer size in frames */
 	int history_write_pos;      /* Current write position */
-	int delay_frames;           /* Echo delay in frames (from config) */
+	int delay_frames;           /* Echo delay in frames */
 	double delayed_tx_energy;   /* TX energy from delay_frames ago */
 	
-	/* Direction state */
-	suppressor_direction_t direction;
-	suppressor_direction_t prev_direction;
-	
-	/* Hangover timers (in samples) */
-	int tx_hangover;            /* TX direction hangover counter */
-	int rx_hangover;            /* RX direction hangover counter */
-	
-	/* Gain control */
-	double tx_gain;             /* Current TX path gain (0.0-1.0) */
-	double rx_gain;             /* Current RX path gain (0.0-1.0) */
-	double tx_gain_target;      /* Target TX gain */
+	/* Suppression state */
+	int tx_hangover;            /* Hangover counter (samples) */
+	double rx_gain;             /* Current RX gain (0.0-1.0) */
 	double rx_gain_target;      /* Target RX gain */
 	
 	/* Configuration */
-	double threshold_db;        /* Energy threshold for direction decision (dB) */
-	double attenuation_db;      /* Attenuation depth (40-60 dB) */
+	double threshold_db;        /* TX energy threshold for suppression */
+	double attenuation_db;      /* RX attenuation depth */
 	double attenuation_linear;  /* Attenuation as linear gain */
 	int hangover_samples;       /* Hangover duration in samples */
 	double ramp_alpha;          /* Gain ramp smoothing factor */
 	double energy_alpha;        /* Energy smoothing factor */
-	double doubletalk_threshold_db; /* Threshold for double-talk detection */
 	
 	/* Statistics */
 	unsigned long tx_frames;
 	unsigned long rx_frames;
-	unsigned long direction_changes;
-	unsigned long doubletalk_frames;
+	unsigned long suppressed_frames;
 } echo_suppressor_state_t;
 
 /* Configuration structure */
 typedef struct {
-	int enabled;                    /* Enable echo suppressor */
-	double threshold_db;            /* Direction threshold (default: 6.0) */
-	double attenuation_db;          /* Attenuation depth (default: 50.0) */
-	int hangover_ms;                /* Hangover time (default: 100) */
-	int ramp_ms;                    /* Gain ramp time (default: 5) */
-	double doubletalk_threshold_db; /* Double-talk threshold (default: 3.0) */
-	int stats_enabled;              /* Enable statistics logging */
-	int echo_delay_ms;              /* SDR echo roundtrip delay (default: 0, max: 500) */
+	int enabled;                /* Enable echo suppressor */
+	double threshold_db;        /* TX threshold for suppression (default: -40) */
+	double attenuation_db;      /* RX attenuation depth (default: 50) */
+	int hangover_ms;            /* Hangover time (default: 100) */
+	int ramp_ms;                /* Gain ramp time (default: 5) */
+	double doubletalk_threshold_db; /* Unused - kept for compatibility */
+	int stats_enabled;          /* Enable statistics logging */
+	int echo_delay_ms;          /* SDR echo delay (default: 0, max: 500) */
 } echo_suppressor_config_t;
 
-/* Initialize echo suppressor
- * sample_rate: Audio sample rate (typically 8000 Hz)
- * frame_size: Frame size in samples (typically 128 for 16ms @ 8kHz)
- * config: Configuration parameters
- * Returns: Pointer to initialized state, or NULL on error
- */
+/* Initialize echo suppressor */
 echo_suppressor_state_t *echo_suppressor_init(int sample_rate, int frame_size, 
                                                const echo_suppressor_config_t *config);
 
-/* Process TX (far-end) audio samples
- * state: Echo suppressor state
- * samples: Audio samples (int16_t format)
- * count: Number of samples
- */
+/* Process TX (far-end) audio - reference signal, passes through unmodified */
 void echo_suppressor_process_tx(echo_suppressor_state_t *state, int16_t *samples, int count);
 
-/* Process RX (near-end) audio samples
- * state: Echo suppressor state
- * samples: Audio samples (int16_t format)
- * count: Number of samples
- */
+/* Process RX (near-end) audio - suppressed when TX is active */
 void echo_suppressor_process_rx(echo_suppressor_state_t *state, int16_t *samples, int count);
 
-/* Get statistics from echo suppressor
- * state: Echo suppressor state
- * Returns: Pointer to state structure (read-only)
- */
+/* Get statistics */
 const echo_suppressor_state_t *echo_suppressor_get_stats(echo_suppressor_state_t *state);
 
-/* Cleanup echo suppressor
- * state: Echo suppressor state to free
- */
+/* Cleanup */
 void echo_suppressor_cleanup(echo_suppressor_state_t *state);
 
-/* Get human-readable direction name */
+/* Get state name */
 const char *echo_suppressor_direction_name(suppressor_direction_t direction);
 
 #endif /* _ECHO_SUPPRESSOR_H */

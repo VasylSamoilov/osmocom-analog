@@ -89,7 +89,21 @@ const char *flip_polarity = "";
 int ms_power = 4;
 int dtx = 0;
 int send_callerid = 0;
-int dcc = 0, scc = 0, sid = 0, regh = 1, regr = 1, pureg = 0, pdreg = 0, locaid = -1, regincr = 300, bis = 0;
+
+/* System parameters broadcast in overhead messages (per TIA/EIA-553-A):
+ * dcc      - Digital Color Code (0-3): Identifies control channel, prevents interference from adjacent cells
+ * scc      - SAT Color Code (0-2): Supervisory Audio Tone frequency on voice channels (5970/6000/6030 Hz)
+ * sid      - System ID (15-bit): Unique identifier for cellular system, phone uses to detect home vs roaming
+ * regh     - Registration Home: If 1, home phones must register
+ * regr     - Registration Roaming: If 1, roaming phones must register
+ * pureg    - Power-Up Registration: If 1, phones send registration immediately after power-on
+ * pdreg    - Power-Down Registration: If 1, phones send registration just before power-off
+ * locaid   - Location Area ID (0-4095, -1=disabled): Phone re-registers when entering new location area
+ * regincr  - Registration Increment (seconds): Timer-based registration interval
+ * bis      - Busy/Idle Status: If 1, phone checks B/I bit before TX. Set to 0 (osmocom can't respond fast enough)
+ */
+int dcc = 0, scc = 0, sid = 0, regh = 1, regr = 1, pureg = 1, pdreg = 1, locaid = -1, regincr = 300, bis = 0;
+
 int tolerant = 0;
 int vmac_enable = 0;
 double vmac_level_low = 0.95;
@@ -162,7 +176,7 @@ void print_help(const char *arg0)
 	printf("        If 1, phone registers on every power on (default = '%d')\n", pureg);
 	print_location_area_note();
 	printf(" -S --sysinfo pdreg=0 | pdreg=1\n");
-	printf("        If 1, phone de-registers on every power down (default = '%d')\n", pureg);
+	printf("        If 1, phone de-registers on every power down (default = '%d')\n", pdreg);
 	print_location_area_note();
 	printf(" -S --sysinfo locaid=<location area ID > | locaid=-1 to disable\n");
 	printf("        (default = '%d')\n", locaid);

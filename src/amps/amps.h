@@ -65,6 +65,8 @@ struct amps {
 	iir_filter_t		rx_pre_filter;
 	iir_filter_t		rx_notch_filter;
 	iir_filter_t		rx_hpf;
+	iir_filter_t		rx_voice_hpf;		/* voice band HPF (300 Hz) at 8kHz for expander */
+	iir_filter_t		rx_voice_lpf;		/* voice band LPF (3400 Hz) at 8kHz for expander */
 
 	/* sender's states */
 	enum amps_chan_type	chan_type;

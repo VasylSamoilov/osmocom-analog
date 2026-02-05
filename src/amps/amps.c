@@ -671,16 +671,23 @@ int amps_create(const char *kanal, enum amps_chan_type chan_type, const char *de
 	/* init TX post-limiter low pass filter (cutoff 3000 Hz, 4th order approx) */
 	iir_lowpass_init(&amps->tx_post_filter, 3000.0, samplerate, 4);
 
-	/* init RX pre-filter (SAT rejection / Anti-Aliasing) (cutoff 3000 Hz) */
-	/* 8 iterations = steep slope, but compliant with 300-3000Hz bandwidth */
-	iir_lowpass_init(&amps->rx_pre_filter, 3000.0, samplerate, 8);
+	/* RX LPF removed - downsampler already has 3400Hz anti-aliasing filter.
+	 * The notch filter below removes SAT tones. Extra LPF was causing
+	 * passband gain (+3dB) and distortion from cascaded biquads. */
 
-	/* init RX notch filter for SAT (6000 Hz) */
-	/* Q=20 gives ~300Hz bandwidth (5850-6150), 2 iterations for deeper depth */
-	iir_notch_init(&amps->rx_notch_filter, 6000.0, samplerate, 2, 20.0);
+	/* init RX notch filter for SAT rejection (5970/6000/6030 Hz)
+	 * Q=10 gives ~600Hz bandwidth (5700-6300), covering all SAT frequencies.
+	 * 2 iterations for deeper notch depth (~40dB rejection). */
+	iir_notch_init(&amps->rx_notch_filter, 6000.0, samplerate, 2, 10.0);
 
 	/* init RX HPF for DC and low freq noise (300 Hz) */
 	iir_highpass_init(&amps->rx_hpf, 300.0, samplerate, 1);
+
+	/* init voice band filters for expander (at 8000 Hz after downsample)
+	 * These limit the bandwidth to 300-3400 Hz before the expander sees it,
+	 * so the expander envelope tracks only voice band energy, not wideband noise */
+	iir_highpass_init(&amps->rx_voice_hpf, 300.0, 8000, 2);
+	iir_lowpass_init(&amps->rx_voice_lpf, 3400.0, 8000, 2);
 
 	/* init audio processing */
 	rc = dsp_init_sender(amps, tolerant);
@@ -4418,7 +4425,16 @@ void transaction_timeout(void *data)
 	case TRANS_PAGE_REPLY:
 		if (trans->page_retry++ == PAGE_TRIES) {
 			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Paging timeout, destroying transaction\n");
-			amps_release(trans, CAUSE_OUTOFORDER);
+			/* Phone never answered page - no voice channel established.
+			 * Just release call control and destroy transaction.
+			 * Don't call amps_release() which would try to send Release
+			 * order on voice channel that was never set up. */
+			if (trans->callref) {
+				call_up_release(trans->callref, CAUSE_OUTOFORDER);
+				trans->callref = 0;
+			}
+			destroy_transaction(trans);
+			amps_go_idle(amps);
 		} else {
 			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Paging timeout, retrying\n");
 			trans_new_state(trans, TRANS_PAGE);

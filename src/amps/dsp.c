@@ -947,7 +947,7 @@ static void sat_decode(amps_t *amps, sample_t *samples, int length)
 
 	/* Debug SAT - enhanced with frequency info */
 	if (++amps->sat_print == SAT_PRINT) {
-		LOGP_CHAN(DDSP, LOGL_NOTICE, "SAT: state=%s level=%.1f dB (%.0f%%) quality=%.0f%% [5970:%.0f%% 6000:%.0f%% 6030:%.0f%%]\n",
+		LOGP_CHAN(DDSP, LOGL_DEBUG, "SAT: state=%s level=%.1f dB (%.0f%%) quality=%.0f%% [5970:%.0f%% 6000:%.0f%% 6030:%.0f%%]\n",
 		          sat_state_name(amps->sat_state),
 		          amps->sat_level_db,
 		          sat_level * 100.0, sat_quality * 100.0,
@@ -1203,6 +1203,31 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		int pos, count;
 		int i;
 
+		/* DEBUG: Log RAW input levels before any filtering (disabled - uncomment to enable)
+		 * Logs: RAW-INPUT: avg/peak dB levels of FM demodulated signal */
+#if 0
+		{
+			static int raw_count = 0;
+			static double raw_sum = 0;
+			static double raw_max = 0;
+			int j;
+			for (j = 0; j < length; j++) {
+				double abs_val = fabs(samples[j]);
+				raw_sum += abs_val;
+				if (abs_val > raw_max) raw_max = abs_val;
+			}
+			raw_count += length;
+			if (raw_count >= 8000 * (amps->sender.samplerate / 8000)) {
+				double avg_db = (raw_sum > 0) ? 20.0 * log10(raw_sum / raw_count) : -100.0;
+				double max_db = (raw_max > 0) ? 20.0 * log10(raw_max) : -100.0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "RAW-INPUT: avg=%.1fdB peak=%.1fdB\n", avg_db, max_db);
+				raw_count = 0;
+				raw_sum = 0;
+				raw_max = 0;
+			}
+		}
+#endif
+
 		/* Parallel FSK detection (Blank-and-Burst support) */
 		/* We process raw samples before filtering to catch dotting/sync */
 		for (i = 0; i < length; i++) {
@@ -1219,16 +1244,501 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		/* But first! Apply RX Pre-Filter to remove SAT tone (6kHz) and noise before downsampling */
 		/* Apply HPF (300Hz) first to kill DC and LF noise */
 		iir_process(&amps->rx_hpf, samples, length);
+
+		/* DEBUG: Log levels AFTER HPF (disabled - uncomment to enable)
+		 * Logs: AFTER-HPF: avg/peak dB levels after 300Hz highpass filter */
+#if 0
+		{
+			static int hpf_count = 0;
+			static double hpf_sum = 0;
+			static double hpf_max = 0;
+			int j;
+			for (j = 0; j < length; j++) {
+				double abs_val = fabs(samples[j]);
+				hpf_sum += abs_val;
+				if (abs_val > hpf_max) hpf_max = abs_val;
+			}
+			hpf_count += length;
+			if (hpf_count >= amps->sender.samplerate) {
+				double avg_db = (hpf_sum > 0) ? 20.0 * log10(hpf_sum / hpf_count) : -100.0;
+				double max_db = (hpf_max > 0) ? 20.0 * log10(hpf_max) : -100.0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "AFTER-HPF: avg=%.1fdB peak=%.1fdB\n", avg_db, max_db);
+				hpf_count = 0;
+				hpf_sum = 0;
+				hpf_max = 0;
+			}
+		}
+#endif
+
+		/* DEBUG: Spectrum analysis BEFORE notch filter (disabled - uncomment to enable)
+		 * Logs: PRE-NOTCH-BANDS (voice/SAT band energy), PRE-NOTCH-SAT (5970/6000/6030 Hz levels)
+		 * Uses Goertzel filters to measure frequency content before SAT notch removal */
+#if 0
+		{
+			#define PRE_NOTCH_NUM_FREQS 15
+			static const double pre_notch_freqs[PRE_NOTCH_NUM_FREQS] = {
+				100.0, 200.0, 300.0,
+				500.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0, 3400.0,
+				4000.0, 5000.0,
+				5970.0, 6000.0, 6030.0
+			};
+			static goertzel_t pre_notch_goertzel[PRE_NOTCH_NUM_FREQS];
+			static int pre_notch_initialized = 0;
+			static sample_t *pre_notch_buffer = NULL;
+			static int pre_notch_pos = 0;
+			static int pre_notch_size = 0;
+			static int pre_notch_report_count = 0;
+			
+			if (!pre_notch_initialized) {
+				int f;
+				for (f = 0; f < PRE_NOTCH_NUM_FREQS; f++) {
+					audio_goertzel_init(&pre_notch_goertzel[f], pre_notch_freqs[f], amps->sender.samplerate);
+				}
+				pre_notch_size = amps->sender.samplerate / 10;
+				pre_notch_buffer = calloc(pre_notch_size, sizeof(sample_t));
+				pre_notch_initialized = 1;
+			}
+			
+			if (pre_notch_buffer) {
+				int j;
+				for (j = 0; j < length; j++) {
+					pre_notch_buffer[pre_notch_pos++] = samples[j];
+					if (pre_notch_pos >= pre_notch_size) {
+						double results[PRE_NOTCH_NUM_FREQS];
+						
+						audio_goertzel(pre_notch_goertzel, pre_notch_buffer, pre_notch_size, 0, results, PRE_NOTCH_NUM_FREQS);
+						
+						double sat_band_energy = sqrt((results[12]*results[12] + results[13]*results[13] + results[14]*results[14]) / 3.0);
+						double voice_band_energy = sqrt((results[3]*results[3] + results[4]*results[4] + results[5]*results[5] + 
+						                                 results[6]*results[6] + results[7]*results[7] + results[8]*results[8] + 
+						                                 results[9]*results[9]) / 7.0);
+						
+						double sat_band_db = (sat_band_energy > 0) ? 20.0 * log10(sat_band_energy) : -100.0;
+						double voice_band_db = (voice_band_energy > 0) ? 20.0 * log10(voice_band_energy) : -100.0;
+						
+						pre_notch_report_count++;
+						if (pre_notch_report_count >= 10) {
+							double db_5970 = (results[12] > 0) ? 20.0 * log10(results[12]) : -100.0;
+							double db_6000 = (results[13] > 0) ? 20.0 * log10(results[13]) : -100.0;
+							double db_6030 = (results[14] > 0) ? 20.0 * log10(results[14]) : -100.0;
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "PRE-NOTCH-BANDS: Voice=%.1fdB SAT=%.1fdB\n",
+								voice_band_db, sat_band_db);
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "PRE-NOTCH-SAT: 5970Hz=%.1fdB 6000Hz=%.1fdB 6030Hz=%.1fdB\n",
+								db_5970, db_6000, db_6030);
+							pre_notch_report_count = 0;
+						}
+						
+						pre_notch_pos = 0;
+					}
+				}
+			}
+		}
+#endif
+
 		/* Apply Notch Filter (6000Hz) to kill the pilot tone */
 		iir_process(&amps->rx_notch_filter, samples, length);
-		/* Then apply LPF (3000Hz) to clean up everything else */
-		iir_process(&amps->rx_pre_filter, samples, length);
+
+		/* DEBUG: Log levels AFTER NOTCH (disabled - uncomment to enable)
+		 * Logs: AFTER-NOTCH: avg/peak dB levels after SAT notch filter */
+#if 0
+		{
+			static int notch_count = 0;
+			static double notch_sum = 0;
+			static double notch_max = 0;
+			int j;
+			for (j = 0; j < length; j++) {
+				double abs_val = fabs(samples[j]);
+				notch_sum += abs_val;
+				if (abs_val > notch_max) notch_max = abs_val;
+			}
+			notch_count += length;
+			if (notch_count >= amps->sender.samplerate) {
+				double avg_db = (notch_sum > 0) ? 20.0 * log10(notch_sum / notch_count) : -100.0;
+				double max_db = (notch_max > 0) ? 20.0 * log10(notch_max) : -100.0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "AFTER-NOTCH: avg=%.1fdB peak=%.1fdB\n", avg_db, max_db);
+				notch_count = 0;
+				notch_sum = 0;
+				notch_max = 0;
+			}
+		}
+#endif
+
+		/* FM Noise Gate with Makeup Gain
+		 * 
+		 * FM demodulation produces a noise floor (~0.09 normalized) even during silence.
+		 * This gate removes signals below threshold and expands the remaining signal
+		 * to restore full amplitude range.
+		 *
+		 * threshold = 0.10 (normalized) = ~290 Hz deviation
+		 * makeup_gain = 1.0 / (1.0 - threshold) = 1.111
+		 */
+		{
+			#define FM_NOISE_GATE_THRESHOLD 0.10
+			#define FM_NOISE_GATE_MAKEUP (1.0 / (1.0 - FM_NOISE_GATE_THRESHOLD))
+			int j;
+			
+			for (j = 0; j < length; j++) {
+				double val = samples[j];
+				double abs_val = fabs(val);
+				
+				if (abs_val < FM_NOISE_GATE_THRESHOLD) {
+					/* Below threshold: gate to zero */
+					samples[j] = 0.0;
+				} else {
+					/* Above threshold: subtract threshold and apply makeup gain */
+					double sign = (val >= 0.0) ? 1.0 : -1.0;
+					samples[j] = sign * (abs_val - FM_NOISE_GATE_THRESHOLD) * FM_NOISE_GATE_MAKEUP;
+				}
+			}
+		}
+
+		/* DEBUG: FM-GATE statistics (disabled - uncomment to enable)
+		 * Logs: FM-GATE: input/output dB levels, percentage of samples gated */
+#if 0
+		{
+			static int gate_dbg_count = 0;
+			static int gate_dbg_gated = 0;
+			static double gate_dbg_sum_in = 0;
+			static double gate_dbg_sum_out = 0;
+			static double gate_dbg_max_in = 0;
+			static double gate_dbg_max_out = 0;
+			int j;
+			
+			for (j = 0; j < length; j++) {
+				/* Note: would need to track before/after gate separately */
+			}
+			
+			gate_dbg_count += length;
+			if (gate_dbg_count >= amps->sender.samplerate) {
+				double gated_pct = 100.0 * gate_dbg_gated / gate_dbg_count;
+				double in_avg = gate_dbg_sum_in / gate_dbg_count;
+				double out_avg = gate_dbg_sum_out / gate_dbg_count;
+				double in_db = (in_avg > 0) ? 20.0 * log10(in_avg) : -100.0;
+				double out_db = (out_avg > 0) ? 20.0 * log10(out_avg) : -100.0;
+				double in_pk_db = (gate_dbg_max_in > 0) ? 20.0 * log10(gate_dbg_max_in) : -100.0;
+				double out_pk_db = (gate_dbg_max_out > 0) ? 20.0 * log10(gate_dbg_max_out) : -100.0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "FM-GATE: in=%.1fdB(pk%.1f) out=%.1fdB(pk%.1f) gated=%.1f%% thr=%.2f\n", 
+					in_db, in_pk_db, out_db, out_pk_db, gated_pct, FM_NOISE_GATE_THRESHOLD);
+				gate_dbg_count = 0;
+				gate_dbg_gated = 0;
+				gate_dbg_sum_in = 0;
+				gate_dbg_sum_out = 0;
+				gate_dbg_max_in = 0;
+				gate_dbg_max_out = 0;
+			}
+		}
+#endif
+
+		/* DEBUG: Measure voice band (300-3400 Hz) broadband energy after notch (disabled - uncomment to enable)
+		 * Logs: VOICEBAND-FILTERED: avg/peak dB in 300-3400Hz band using IIR bandpass */
+#if 0
+		{
+			static iir_filter_t vb_hpf;  /* 300 Hz highpass */
+			static iir_filter_t vb_lpf;  /* 3400 Hz lowpass */
+			static int vb_initialized = 0;
+			static int vb_count = 0;
+			static double vb_sum = 0;
+			static double vb_max = 0;
+			static sample_t *vb_buffer = NULL;
+			static int vb_buffer_size = 0;
+			
+			if (!vb_initialized) {
+				iir_highpass_init(&vb_hpf, 300.0, amps->sender.samplerate, 2);
+				iir_lowpass_init(&vb_lpf, 3400.0, amps->sender.samplerate, 2);
+				vb_initialized = 1;
+			}
+			
+			/* Allocate/reallocate buffer if needed */
+			if (length > vb_buffer_size) {
+				free(vb_buffer);
+				vb_buffer = malloc(length * sizeof(sample_t));
+				vb_buffer_size = length;
+			}
+			
+			if (vb_buffer) {
+				int j;
+				/* Copy samples and apply bandpass filter */
+				memcpy(vb_buffer, samples, length * sizeof(sample_t));
+				iir_process(&vb_hpf, vb_buffer, length);
+				iir_process(&vb_lpf, vb_buffer, length);
+				
+				/* Measure filtered signal */
+				for (j = 0; j < length; j++) {
+					double abs_val = fabs(vb_buffer[j]);
+					vb_sum += abs_val;
+					if (abs_val > vb_max) vb_max = abs_val;
+				}
+				vb_count += length;
+				
+				if (vb_count >= amps->sender.samplerate) {
+					double avg_db = (vb_sum > 0) ? 20.0 * log10(vb_sum / vb_count) : -100.0;
+					double max_db = (vb_max > 0) ? 20.0 * log10(vb_max) : -100.0;
+					LOGP_CHAN(DDSP, LOGL_DEBUG, "VOICEBAND-FILTERED: avg=%.1fdB peak=%.1fdB (300-3400Hz)\n", avg_db, max_db);
+					vb_count = 0;
+					vb_sum = 0;
+					vb_max = 0;
+				}
+			}
+		}
+#endif
+
+		/* DEBUG: Comprehensive spectrum analysis after notch using Goertzel (disabled - uncomment to enable)
+		 * Logs: SPECTRUM-BANDS (low/voice/above-voice/SAT/high freq band energies)
+		 *       SPECTRUM-LOW (100/200/300 Hz), SPECTRUM-VOICE (500-3400 Hz)
+		 *       SPECTRUM-HIGH (4k/5k Hz), SPECTRUM-SAT (5970/6000/6030 Hz)
+		 *       SPECTRUM-ULTRAHIGH (7k-40k Hz)
+		 * Uses 22 Goertzel filters with 100ms window for ~10Hz resolution */
+#if 0
+		{
+			/* Frequency bins for analysis:
+			 * - Low freq (HPF check): 100, 200, 300 Hz
+			 * - Voice band: 500, 1000, 1500, 2000, 2500, 3000, 3400 Hz
+			 * - Above voice: 4000, 5000 Hz
+			 * - SAT band: 5970, 6000, 6030 Hz
+			 * - High freq (above SAT): 7000, 8000, 10000, 15000, 20000, 30000, 40000 Hz
+			 */
+			#define DIAG_NUM_FREQS 22
+			static const double diag_freqs[DIAG_NUM_FREQS] = {
+				100.0, 200.0, 300.0,           /* Low freq - should be attenuated by HPF */
+				500.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0, 3400.0,  /* Voice band */
+				4000.0, 5000.0,                /* Above voice, below SAT */
+				5970.0, 6000.0, 6030.0,        /* SAT band - should be attenuated by notch */
+				7000.0, 8000.0, 10000.0, 15000.0, 20000.0, 30000.0, 40000.0  /* High freq above SAT */
+			};
+			static goertzel_t diag_goertzel[DIAG_NUM_FREQS];
+			static int diag_initialized = 0;
+			static sample_t *diag_buffer = NULL;
+			static int diag_pos = 0;
+			static int diag_size = 0;
+			static int diag_report_count = 0;
+			
+			if (!diag_initialized) {
+				int f;
+				for (f = 0; f < DIAG_NUM_FREQS; f++) {
+					audio_goertzel_init(&diag_goertzel[f], diag_freqs[f], amps->sender.samplerate);
+				}
+				/* Use 100ms window for ~10Hz frequency resolution */
+				diag_size = amps->sender.samplerate / 10;
+				diag_buffer = calloc(diag_size, sizeof(sample_t));
+				if (diag_buffer) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG, "SPECTRUM-DIAG: initialized %d freq bins, %dms window @ %dHz\n",
+						DIAG_NUM_FREQS, diag_size * 1000 / amps->sender.samplerate, amps->sender.samplerate);
+				}
+				diag_initialized = 1;
+			}
+			
+			if (diag_buffer) {
+				int j;
+				for (j = 0; j < length; j++) {
+					diag_buffer[diag_pos++] = samples[j];
+					if (diag_pos >= diag_size) {
+						double results[DIAG_NUM_FREQS];
+						double results_db[DIAG_NUM_FREQS];
+						int f;
+						
+						audio_goertzel(diag_goertzel, diag_buffer, diag_size, 0, results, DIAG_NUM_FREQS);
+						
+						for (f = 0; f < DIAG_NUM_FREQS; f++) {
+							results_db[f] = (results[f] > 0) ? 20.0 * log10(results[f]) : -100.0;
+						}
+						
+						/* Calculate band energies (RMS of linear values, then to dB) */
+						double low_freq_energy = sqrt((results[0]*results[0] + results[1]*results[1] + results[2]*results[2]) / 3.0);
+						double voice_band_energy = sqrt((results[3]*results[3] + results[4]*results[4] + results[5]*results[5] + 
+						                                 results[6]*results[6] + results[7]*results[7] + results[8]*results[8] + 
+						                                 results[9]*results[9]) / 7.0);
+						double above_voice_energy = sqrt((results[10]*results[10] + results[11]*results[11]) / 2.0);
+						double sat_band_energy = sqrt((results[12]*results[12] + results[13]*results[13] + results[14]*results[14]) / 3.0);
+						double high_freq_energy = sqrt((results[15]*results[15] + results[16]*results[16] + results[17]*results[17] +
+						                                results[18]*results[18] + results[19]*results[19] + results[20]*results[20] +
+						                                results[21]*results[21]) / 7.0);
+						
+						double low_freq_db = (low_freq_energy > 0) ? 20.0 * log10(low_freq_energy) : -100.0;
+						double voice_band_db = (voice_band_energy > 0) ? 20.0 * log10(voice_band_energy) : -100.0;
+						double above_voice_db = (above_voice_energy > 0) ? 20.0 * log10(above_voice_energy) : -100.0;
+						double sat_band_db = (sat_band_energy > 0) ? 20.0 * log10(sat_band_energy) : -100.0;
+						double high_freq_db = (high_freq_energy > 0) ? 20.0 * log10(high_freq_energy) : -100.0;
+						
+						/* Report every 1 second (10 windows) */
+						diag_report_count++;
+						if (diag_report_count >= 10) {
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "SPECTRUM-BANDS: LowFreq=%.1fdB Voice=%.1fdB AboveVoice=%.1fdB SAT=%.1fdB HighFreq=%.1fdB\n",
+								low_freq_db, voice_band_db, above_voice_db, sat_band_db, high_freq_db);
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "SPECTRUM-LOW: 100Hz=%.1fdB 200Hz=%.1fdB 300Hz=%.1fdB\n",
+								results_db[0], results_db[1], results_db[2]);
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "SPECTRUM-VOICE: 500=%.1f 1k=%.1f 1.5k=%.1f 2k=%.1f 2.5k=%.1f 3k=%.1f 3.4k=%.1fdB\n",
+								results_db[3], results_db[4], results_db[5], results_db[6], results_db[7], results_db[8], results_db[9]);
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "SPECTRUM-HIGH: 4kHz=%.1fdB 5kHz=%.1fdB\n",
+								results_db[10], results_db[11]);
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "SPECTRUM-SAT: 5970Hz=%.1fdB 6000Hz=%.1fdB 6030Hz=%.1fdB\n",
+								results_db[12], results_db[13], results_db[14]);
+							LOGP_CHAN(DDSP, LOGL_DEBUG, "SPECTRUM-ULTRAHIGH: 7k=%.1f 8k=%.1f 10k=%.1f 15k=%.1f 20k=%.1f 30k=%.1f 40k=%.1fdB\n",
+								results_db[15], results_db[16], results_db[17], results_db[18], results_db[19], results_db[20], results_db[21]);
+							diag_report_count = 0;
+						}
+						
+						diag_pos = 0;
+					}
+				}
+			}
+		}
+#endif
+
+		/* DEBUG: Sub-band energy measurement using time-domain (disabled - uncomment to enable)
+		 * Logs: SUBBAND-AVG (total + 6 sub-band average dB), SUBBAND-PK (peak dB per band)
+		 * Sub-bands: 0-500, 500-1k, 1k-2k, 2k-3k, 3k-4k, 4k-6k Hz
+		 * Shows what the expander would see if we split the signal into bands */
+#if 0
+		{
+			#define NUM_SUBBANDS 6
+			/* Sub-bands: 0-500, 500-1000, 1000-2000, 2000-3000, 3000-4000, 4000-6000 Hz */
+			static iir_filter_t subband_lpf[NUM_SUBBANDS];
+			static iir_filter_t subband_hpf[NUM_SUBBANDS];
+			static int subband_initialized = 0;
+			static double subband_sum[NUM_SUBBANDS];
+			static double subband_max[NUM_SUBBANDS];
+			static int subband_count = 0;
+			static int subband_report = 0;
+			
+			/* Band edges: [low, high] for each sub-band */
+			static const double band_low[NUM_SUBBANDS] = {100, 500, 1000, 2000, 3000, 4000};
+			static const double band_high[NUM_SUBBANDS] = {500, 1000, 2000, 3000, 4000, 6000};
+			
+			if (!subband_initialized) {
+				int b;
+				for (b = 0; b < NUM_SUBBANDS; b++) {
+					iir_highpass_init(&subband_hpf[b], band_low[b], amps->sender.samplerate, 2);
+					iir_lowpass_init(&subband_lpf[b], band_high[b], amps->sender.samplerate, 2);
+					subband_sum[b] = 0;
+					subband_max[b] = 0;
+				}
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "SUBBAND: initialized %d bands for time-domain measurement\n", NUM_SUBBANDS);
+				subband_initialized = 1;
+			}
+			
+			/* Process each sub-band */
+			int b;
+			for (b = 0; b < NUM_SUBBANDS; b++) {
+				/* Copy samples and apply bandpass */
+				sample_t filtered[length];
+				memcpy(filtered, samples, length * sizeof(sample_t));
+				iir_process(&subband_hpf[b], filtered, length);
+				iir_process(&subband_lpf[b], filtered, length);
+				
+				/* Measure like expander: sum of absolute values */
+				int j;
+				for (j = 0; j < length; j++) {
+					double abs_val = fabs(filtered[j]);
+					subband_sum[b] += abs_val;
+					if (abs_val > subband_max[b])
+						subband_max[b] = abs_val;
+				}
+			}
+			subband_count += length;
+			
+			/* Report every second */
+			if (subband_count >= amps->sender.samplerate) {
+				subband_report++;
+				if (subband_report >= 1) {
+					double db[NUM_SUBBANDS], pk[NUM_SUBBANDS];
+					double total_sum = 0;
+					for (b = 0; b < NUM_SUBBANDS; b++) {
+						double avg = subband_sum[b] / subband_count;
+						db[b] = (avg > 0) ? 20.0 * log10(avg) : -100.0;
+						pk[b] = (subband_max[b] > 0) ? 20.0 * log10(subband_max[b]) : -100.0;
+						total_sum += subband_sum[b];
+					}
+					double total_avg = total_sum / subband_count;
+					double total_db = (total_avg > 0) ? 20.0 * log10(total_avg) : -100.0;
+					
+					LOGP_CHAN(DDSP, LOGL_DEBUG, "SUBBAND-AVG: Total=%.1fdB | 0-500=%.1f | 500-1k=%.1f | 1k-2k=%.1f | 2k-3k=%.1f | 3k-4k=%.1f | 4k-6k=%.1fdB\n",
+						total_db, db[0], db[1], db[2], db[3], db[4], db[5]);
+					LOGP_CHAN(DDSP, LOGL_DEBUG, "SUBBAND-PK:  | 0-500=%.1f | 500-1k=%.1f | 1k-2k=%.1f | 2k-3k=%.1f | 3k-4k=%.1f | 4k-6k=%.1fdB\n",
+						pk[0], pk[1], pk[2], pk[3], pk[4], pk[5]);
+					subband_report = 0;
+				}
+				
+				/* Reset accumulators */
+				for (b = 0; b < NUM_SUBBANDS; b++) {
+					subband_sum[b] = 0;
+					subband_max[b] = 0;
+				}
+				subband_count = 0;
+			}
+		}
+#endif
+
+		/* No extra LPF - downsampler has built-in 3400Hz anti-aliasing filter.
+		 * Notch filter above removes SAT tones (5970/6000/6030 Hz). */
 
 		count = samplerate_downsample(&amps->sender.srstate, samples, length);
 
+		/* DEBUG: Log levels AFTER DOWNSAMPLE (disabled - uncomment to enable)
+		 * Logs: AFTER-DOWNSAMPLE: avg/peak dB levels after resampling to 8kHz */
+#if 0
+		{
+			static int post_ds_count = 0;
+			static double post_ds_sum = 0;
+			static double post_ds_max = 0;
+			int j;
+			for (j = 0; j < count; j++) {
+				double abs_val = fabs(samples[j]);
+				post_ds_sum += abs_val;
+				if (abs_val > post_ds_max) post_ds_max = abs_val;
+			}
+			post_ds_count += count;
+			if (post_ds_count >= 8000) {
+				double avg_db = (post_ds_sum > 0) ? 20.0 * log10(post_ds_sum / post_ds_count) : -100.0;
+				double max_db = (post_ds_max > 0) ? 20.0 * log10(post_ds_max) : -100.0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "AFTER-DOWNSAMPLE: avg=%.1fdB peak=%.1fdB\n", avg_db, max_db);
+				post_ds_count = 0;
+				post_ds_sum = 0;
+				post_ds_max = 0;
+			}
+		}
+#endif
+
 		/* de-emphasis (now at 8000 Hz) - use estate_rx which is initialized for 8000 Hz! */
-		if (amps->de_emphasis)
+		if (amps->de_emphasis) {
+			/* DC filter MUST be applied before de-emphasis to prevent accumulation.
+			 * The de-emphasis filter is y = x + factor*y_last, which accumulates DC.
+			 * Without DC removal, the output grows over time (rising noise floor). */
+			dc_filter(&amps->estate_rx, samples, count);
 			de_emphasis(&amps->estate_rx, samples, count);
+		}
+
+		/* Voice band filter (300-3400 Hz) before expander
+		 * Uses separate HPF + LPF since iir_bandpass_init() is a resonant filter
+		 * for single-frequency detection, not a wide passband filter.
+		 * This limits bandwidth so expander envelope tracks only voice band energy,
+		 * not wideband receiver noise that would keep envelope elevated during silence */
+		iir_process(&amps->rx_voice_hpf, samples, count);
+		iir_process(&amps->rx_voice_lpf, samples, count);
+
+		/* DEBUG: Log levels BEFORE expander (disabled - uncomment to enable)
+		 * Logs: PRE-EXPANDER: avg/peak dB levels before 2:1 expander */
+#if 0
+		{
+			static int pre_exp_count = 0;
+			static double pre_exp_sum = 0;
+			static double pre_exp_max = 0;
+			int j;
+			for (j = 0; j < count; j++) {
+				double abs_val = fabs(samples[j]);
+				pre_exp_sum += abs_val;
+				if (abs_val > pre_exp_max) pre_exp_max = abs_val;
+			}
+			pre_exp_count += count;
+			if (pre_exp_count >= 8000) {
+				double avg_db = (pre_exp_sum > 0) ? 20.0 * log10(pre_exp_sum / pre_exp_count) : -100.0;
+				double max_db = (pre_exp_max > 0) ? 20.0 * log10(pre_exp_max) : -100.0;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "PRE-EXPANDER: avg=%.1fdB peak=%.1fdB\n", avg_db, max_db);
+				pre_exp_count = 0;
+				pre_exp_sum = 0;
+				pre_exp_max = 0;
+			}
+		}
+#endif
 
 		/* removed redundant second downsample - other DSP files (cnetz, nmt, r2000) only have one */
 		expand_audio(&amps->cstate, samples, count);

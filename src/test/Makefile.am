@@ -40,6 +40,7 @@ test_compandor_SOURCES = dummy.x test_compandor.c
 test_compandor_LDADD = \
 	$(COMMON_LA) \
 	$(top_builddir)/src/libcompandor/libcompandor.a \
+	$(top_builddir)/src/libfilter/libfilter.a \
 	$(top_builddir)/src/liboptions/liboptions.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(LIBOSMOCC_LIBS) \

@@ -96,6 +96,7 @@ extern osmo_cc_endpoint_t *ep;
 
 static struct osmo_cc_helper_audio_codecs codecs[] = {
 	{ "L16", NULL , 8000, 1, encode_l16, decode_l16, NULL, NULL   },
+	{ "telephone-event", NULL, 8000, 1, NULL, NULL, NULL, NULL },  /* RFC 4733 DTMF/Flash */
 	{ NULL, NULL , 0, 0, NULL, NULL, NULL, NULL  },
 };
 

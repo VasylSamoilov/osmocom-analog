@@ -24,6 +24,7 @@ struct tones_sets_t {
 	{ true, "denmark", "Danish tones", set_denmark },
 	{ true, "japan", "Japanese tones", set_japan },
 	{ true, "france", "French tones", set_france },
+	{ true, "uk", "UK tones", set_uk },
 	{ false, NULL, NULL, NULL },
 };
 
