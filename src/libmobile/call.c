@@ -33,6 +33,7 @@
 #include <osmocom/core/select.h>
 #include <osmocom/cc/endpoint.h>
 #include <osmocom/cc/helper.h>
+#include <osmocom/cc/session.h>
 #include <osmocom/cc/g711.h>
 #include <osmocom/cc/rtp.h>
 #include "cause.h"
@@ -105,6 +106,7 @@ static struct osmo_cc_helper_audio_codecs codecs[] = {
 	{ "L16", NULL, 8000, 1, encode_l16, decode_l16, NULL, NULL },
 	{ "PCMA", NULL, 8000, 1, g711_encode_alaw, g711_decode_alaw, NULL, NULL },
 	{ "PCMU", NULL, 8000, 1, g711_encode_ulaw, g711_decode_ulaw, NULL, NULL },
+	{ "telephone-event", NULL, 8000, 1, NULL, NULL, NULL, NULL },  /* RFC 4733 DTMF/Flash */
 	{ NULL, NULL, 0, 0, NULL, NULL, NULL, NULL},
 };
 
@@ -131,6 +133,7 @@ typedef struct process {
 	struct osmo_timer_list timer;
 	osmo_cc_session_t *session;
 	osmo_cc_session_codec_t *codec; /* codec to send */
+	osmo_cc_session_media_t *media; /* audio media (for RFC 4733 support) */
 	
 	/* Echo suppressor */
 	int echo_suppressor_enabled;
@@ -146,6 +149,12 @@ typedef struct process {
 	double dtmf_tone_duration;
 	double dtmf_gap_duration;
 	int dtmf_tx_active;
+	
+	/* Flash/Hold state tracking
+	 * Tracks whether the local mobile user has put the remote party on hold.
+	 * Used to toggle between SUSPENDED and RESUMED on subsequent flash presses.
+	 */
+	int remote_on_hold;	/* 1 = remote party is on hold (we sent SUSPENDED) */
 } process_t;
 
 static process_t *process_head = NULL;
@@ -154,6 +163,78 @@ static void process_timeout(void *data);
 static void indicate_disconnect_release(int callref, int cause, uint8_t msg_type);
 static void call_echo_suppressor_cleanup(process_t *process);
 static void call_dtmf_cleanup(process_t *process);
+
+/* RFC 4733 event codes */
+#define RFC4733_EVENT_FLASH 16
+
+/* Local RFC 4733 RX callback - handles DTMF/Flash received via RTP directly.
+ * This is called when RFC 4733 telephone-event packets are received from the network.
+ * Instead of sending osmo-cc messages (which would go back to SIP endpoint),
+ * we process the events locally: queue DTMF for TX to mobile, or handle flash.
+ */
+static void call_rfc4733_rx_cb(osmo_cc_session_media_t *media, uint8_t event, uint16_t __attribute__((unused)) duration)
+{
+	process_t *process;
+	static const char dtmf_chars[] = "0123456789*#ABCD";
+
+	if (!media || !media->session || !media->session->priv) {
+		LOGP(DCALL, LOGL_ERROR, "RFC 4733 RX: no media/session/priv\n");
+		return;
+	}
+
+	process = (process_t *)media->session->priv;
+
+	if (event == RFC4733_EVENT_FLASH) {
+		/* Flash from network - play recall tone to mobile */
+		LOGP(DCALL, LOGL_INFO, "RFC 4733 Flash received from network (callref=%d)\n", process->callref);
+		call_tone_recall(process->callref, 1);
+	} else if (event <= 15) {
+		/* DTMF from network - queue for TX to mobile */
+		char digit = dtmf_chars[event];
+		char digits[2] = { digit, '\0' };
+		LOGP(DCALL, LOGL_INFO, "RFC 4733 DTMF '%c' received from network -> TX to mobile (callref=%d)\n",
+		     digit, process->callref);
+		call_dtmf_queue(process->callref, digits);
+	} else {
+		LOGP(DCALL, LOGL_DEBUG, "RFC 4733 unsupported event %d ignored (callref=%d)\n",
+		     event, process->callref);
+	}
+}
+
+/* Set up RFC 4733 telephone-event support for a process after codec negotiation.
+ * This enables receiving DTMF/Flash via RTP telephone-event packets.
+ * Must be called after process->codec is set and session is established.
+ */
+static void call_setup_rfc4733(process_t *process)
+{
+	osmo_cc_session_media_t *media;
+
+	if (!process || !process->session || !process->codec)
+		return;
+
+	/* Get the media from the codec */
+	media = process->codec->media;
+	if (!media)
+		return;
+
+	/* Store media pointer for sending RFC 4733 events */
+	process->media = media;
+
+	/* Check if telephone-event was negotiated */
+	if (!media->telephone_event_negotiated) {
+		LOGP(DCALL, LOGL_NOTICE, "RFC 4733 not available - telephone-event not negotiated (callref=%d)\n",
+		     process->callref);
+		return;
+	}
+
+	/* Set up local RFC 4733 receive callback - handles DTMF/Flash directly
+	 * instead of sending osmo-cc messages back to SIP endpoint */
+	media->event_cb = call_rfc4733_rx_cb;
+	media->event_cb_data = NULL;  /* We use media->session->priv instead */
+
+	LOGP(DCALL, LOGL_INFO, "RFC 4733 enabled for DTMF/Flash signaling (callref=%d, pt=%d)\n",
+	     process->callref, media->telephone_event_pt);
+}
 
 static process_t *create_process(int callref, enum process_state state)
 {
@@ -455,12 +536,14 @@ static void call_echo_suppressor_print_stats(process_t *process)
 	if (!stats)
 		return;
 	
-	LOGP(DECHO, LOGL_NOTICE, "SUPP STATS: dir=%s TX=%.1fdB(%.2f) RX=%.1fdB(%.2f) | frames=%lu/%lu changes=%lu doubletalk=%lu\n",
-	     echo_suppressor_direction_name(stats->direction),
-	     stats->tx_energy_smooth, stats->tx_gain,
+	LOGP(DECHO, LOGL_NOTICE, "SUPP: TX=%.1fdB RX=%.1fdB(gain=%.2f) delayTX=%.1fdB hang=%d delayF=%d wpos=%d | frames=%lu/%lu suppressed=%lu\n",
+	     stats->tx_energy_smooth,
 	     stats->rx_energy_smooth, stats->rx_gain,
+	     stats->delayed_tx_energy,
+	     stats->tx_hangover,
+	     stats->delay_frames, stats->history_write_pos,
 	     stats->tx_frames, stats->rx_frames,
-	     stats->direction_changes, stats->doubletalk_frames);
+	     stats->suppressed_frames);
 }
 
 static void new_state_process(int callref, enum process_state state)
@@ -696,30 +779,156 @@ void call_up_answer(int callref, const char *connect_id)
 		call_dtmf_init(process);
 }
 
-/* Transceiver indicates flash (hook flash). */
+/*
+ * Flash (Hook-Flash) Signal Handling - TX Direction (Mobile -> Network)
+ *
+ * This function is called when the LOCAL MOBILE USER presses the flash button.
+ * We forward this event to the REMOTE PARTY (SIP side) via osmo-cc.
+ *
+ * In 1G AMPS cellular (TIA/EIA-553-A), flash is signaled by the mobile station
+ * sending a 10 kHz Signaling Tone (ST) burst for 400ms on the voice channel.
+ * The base station detects this as SAT/ST status change: (1,0) -> (1,1) for
+ * 400ms -> (1,0).
+ *
+ * Historical use cases for flash in mobile telephony:
+ *
+ * 1. Three-Way Calling:
+ *    - Mobile user talking to Party A (SIP)
+ *    - Mobile user presses FLASH -> Party A on hold, mobile user hears dial tone
+ *    - Mobile user dials Party B's number
+ *    - Mobile user presses FLASH again -> All three parties conferenced
+ *
+ * 2. Call Waiting:
+ *    - Mobile user talking to Party A, call waiting tone indicates Party B calling
+ *    - Mobile user presses FLASH -> Party A on hold, connected to Party B
+ *    - Mobile user presses FLASH -> Toggle back to Party A
+ *
+ * 3. Call Transfer:
+ *    - Mobile user talking to Party A
+ *    - Mobile user presses FLASH -> Dials transfer destination
+ *    - Mobile user hangs up -> Party A transferred to destination
+ *
+ * 4. Feature Access:
+ *    - After flash, mobile user dials feature codes for call forwarding, etc.
+ *
+ * Per TIA/EIA-553-A Section 3.6.4.4, after receiving flash the base station
+ * may send Order 8 (Send Called-Address) to request digits dialed by user.
+ * The mobile must respond within 10 seconds of the flash.
+ *
+ * osmo-cc Mapping:
+ * We toggle between OSMO_CC_NOTIFY_USER_SUSPENDED and OSMO_CC_NOTIFY_USER_RESUMED
+ * on each flash press. First flash puts remote on hold (SUSPENDED), second flash
+ * brings them back (RESUMED), and so on.
+ *
+ * Note: The SIP endpoint may translate this to SIP re-INVITE with sendonly/recvonly,
+ * SIP INFO with hookflash, or other hold signaling depending on configuration.
+ */
 void call_up_flash(int callref)
 {
+	process_t *process;
+	osmo_cc_msg_t *msg;
+	uint8_t notify_type;
+
 	if (!callref) {
 		LOGP(DCALL, LOGL_DEBUG, "Ignoring flash, because callref not set. (not for us)\n");
 		return;
 	}
 
+	process = get_process(callref);
+	if (!process) {
+		LOGP(DCALL, LOGL_ERROR, "Flash received but no process for callref %d\n", callref);
+		return;
+	}
+
 	LOGP(DCALL, LOGL_INFO, "*** Flash (Hook-Flash) received from mobile (callref=%d) ***\n", callref);
-	/* TODO: Send suitable message to upper layer if supported (e.g. HOLD/RETRIEVE or FACILITY) */
+
+	/* Try RFC 4733 first if available (event 16 = Flash) */
+	if (process->media && process->media->telephone_event_negotiated) {
+		LOGP(DCALL, LOGL_INFO, "Flash from mobile -> RFC 4733 event 16 (callref=%d)\n", callref);
+		osmo_cc_rtp_send_event(process->media, 16, 400);  /* 400ms duration per TIA/EIA-553-A */
+		/* Still toggle hold state for local tracking */
+		process->remote_on_hold = !process->remote_on_hold;
+		return;
+	}
+
+	/* Fall back to osmo-cc NOTIFY message */
+	LOGP(DCALL, LOGL_INFO, "Flash from mobile -> SIP INFO fallback (callref=%d)\n", callref);
+	/* Toggle hold state: first flash puts remote on hold, second flash retrieves */
+	if (!process->remote_on_hold) {
+		/* Remote party is active -> put them on hold */
+		notify_type = OSMO_CC_NOTIFY_USER_SUSPENDED;
+		process->remote_on_hold = 1;
+		LOGP(DCALL, LOGL_DEBUG, "Putting remote party on hold (SUSPENDED)\n");
+	} else {
+		/* Remote party is on hold -> retrieve them */
+		notify_type = OSMO_CC_NOTIFY_USER_RESUMED;
+		process->remote_on_hold = 0;
+		LOGP(DCALL, LOGL_DEBUG, "Retrieving remote party from hold (RESUMED)\n");
+	}
+
+	/* Use NOTIFY_REQ to send towards SIP endpoint (REQ = request to lower layer) */
+	msg = osmo_cc_new_msg(OSMO_CC_MSG_NOTIFY_REQ);
+	osmo_cc_add_ie_notify(msg, notify_type);
+	osmo_cc_ll_msg(ep, callref, msg);
+}
+
+/* Convert DTMF character to RFC 4733 event code.
+ * Returns event code 0-15 for DTMF, -1 for invalid character.
+ * Per RFC 4733 Section 3.2:
+ *   0-9: DTMF digits 0-9
+ *   10:  DTMF *
+ *   11:  DTMF #
+ *   12-15: DTMF A-D
+ */
+static int dtmf_char_to_rfc4733_event(char digit)
+{
+	if (digit >= '0' && digit <= '9')
+		return digit - '0';
+	if (digit == '*')
+		return 10;
+	if (digit == '#')
+		return 11;
+	if (digit >= 'A' && digit <= 'D')
+		return 12 + (digit - 'A');
+	if (digit >= 'a' && digit <= 'd')
+		return 12 + (digit - 'a');
+	return -1;
 }
 
 /* Transceiver indicates DTMF digit detected from mobile. */
 void call_up_dtmf(int callref, char digit)
 {
+	process_t *process;
 	osmo_cc_msg_t *msg;
 	char dtmf_str[2] = { digit, '\0' };
+	int event;
 
 	if (!callref) {
 		LOGP(DCALL, LOGL_DEBUG, "Ignoring DTMF, no callref\n");
 		return;
 	}
 
-	LOGP(DCALL, LOGL_INFO, "Forwarding DTMF '%c' to osmo-cc (callref=%d)\n", digit, callref);
+	process = get_process(callref);
+
+	LOGP(DCALL, LOGL_NOTICE, "call_up_dtmf: digit='%c' callref=%d process=%p media=%p\n",
+	     digit, callref, process, process ? process->media : NULL);
+	if (process && process->media) {
+		LOGP(DCALL, LOGL_NOTICE, "call_up_dtmf: media->telephone_event_negotiated=%d pt=%d\n",
+		     process->media->telephone_event_negotiated, process->media->telephone_event_pt);
+	}
+
+	/* Try RFC 4733 first if available */
+	if (process && process->media && process->media->telephone_event_negotiated) {
+		event = dtmf_char_to_rfc4733_event(digit);
+		if (event >= 0) {
+			LOGP(DCALL, LOGL_INFO, "DTMF '%c' from mobile -> RFC 4733 (callref=%d)\n", digit, callref);
+			osmo_cc_rtp_send_event(process->media, event, 160);  /* 160ms duration */
+			return;
+		}
+	}
+
+	/* Fall back to osmo-cc INFO message */
+	LOGP(DCALL, LOGL_INFO, "DTMF '%c' from mobile -> SIP INFO fallback (callref=%d)\n", digit, callref);
 
 	msg = osmo_cc_new_msg(OSMO_CC_MSG_INFO_IND);
 	/* Use IE_DTMF (not IE_KEYPAD) - osmo-cc-sip-endpoint expects IE_DTMF for SIP INFO */
@@ -811,6 +1020,35 @@ void call_up_audio(int callref, sample_t *samples, int len)
 #endif
 	/* real to integer */
 	samples_to_int16_speech(spl, samples, len);
+	
+	/* DEBUG: RTP TX level diagnostics (disabled - uncomment to enable)
+	 * Logs: RTP TX: avg/max int16 sample values and dB levels being sent to RTP
+	 * Measures actual audio levels going out to SIP/RTP every second */
+#if 0
+	{
+		static int rtp_dbg_count = 0;
+		static int64_t rtp_dbg_sum = 0;
+		static int16_t rtp_dbg_max = 0;
+		int i;
+		for (i = 0; i < len; i++) {
+			int16_t abs_val = (spl[i] < 0) ? -spl[i] : spl[i];
+			rtp_dbg_sum += abs_val;
+			if (abs_val > rtp_dbg_max) rtp_dbg_max = abs_val;
+		}
+		rtp_dbg_count += len;
+		if (rtp_dbg_count >= 8000) {
+			double avg = (double)rtp_dbg_sum / rtp_dbg_count;
+			double avg_db = (avg > 0) ? 20.0 * log10(avg / 32767.0) : -100.0;
+			double max_db = (rtp_dbg_max > 0) ? 20.0 * log10((double)rtp_dbg_max / 32767.0) : -100.0;
+			LOGP(DCALL, LOGL_DEBUG, "RTP TX: avg=%d (%.1fdB) max=%d (%.1fdB)\n",
+			     (int)avg, avg_db, rtp_dbg_max, max_db);
+			rtp_dbg_count = 0;
+			rtp_dbg_sum = 0;
+			rtp_dbg_max = 0;
+		}
+	}
+#endif
+	
 	/* encode and send via RTP */
 	process->codec->encoder((uint8_t *)spl, len * 2, &payload, &payload_len, process);
 	osmo_cc_rtp_send(process->codec, payload, payload_len, 0, 1, len);
@@ -842,6 +1080,8 @@ void call_clock(void)
 			int16_t spl[160];
 			uint8_t *payload;
 			int payload_len;
+			/* Initialize buffer to silence in case tones_read_tone doesn't fill it */
+			memset(spl, 0, sizeof(spl));
 			/* try to get patterns, else copy the samples we got */
 			tones_read_tone(&process->tones, spl, 160);
 #ifdef DEBUG_LEVEL
@@ -926,6 +1166,9 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 			indicate_disconnect_release(callref, 47, OSMO_CC_MSG_REJ_IND);
 			break;
 		}
+
+		/* Set up RFC 4733 telephone-event support */
+		call_setup_rfc4733(process);
 
 		/* caller id */
 		rc = osmo_cc_get_ie_calling(msg, 0, &type, &plan, &present, &screen, caller_id, sizeof(caller_id));
@@ -1067,6 +1310,10 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
 		if (rc < 0)
 			goto nego_failed;
+		/* Set up RFC 4733 telephone-event support */
+		call_setup_rfc4733(process);
+		/* Trigger channel assignment if PROCEEDING was skipped (e.g., console auto-answer) */
+		call_down_proceeding(callref);
 		new_state_process(callref, PROCESS_CONNECT);
 		LOGP(DCALL, LOGL_INFO, "Call answered\n");
 		call_down_answer(callref, &tv_meter);
@@ -1126,10 +1373,13 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		char digits[33];
 		uint8_t duration_ms, pause_ms, dtmf_mode;
 		
-		/* Try IE_DTMF first (from SIP INFO) */
+		LOGP(DCALL, LOGL_NOTICE, "CALL-INFO-REQ: received from SIP side (callref=%d)\n", callref);
+		
+		/* Try IE_DTMF first (from SIP INFO or RFC 4733) */
 		rc = osmo_cc_get_ie_dtmf(msg, 0, &duration_ms, &pause_ms, &dtmf_mode, digits, sizeof(digits));
 		if (rc >= 0 && digits[0]) {
-			LOGP(DCALL, LOGL_INFO, "Received DTMF (IE_DTMF) from osmo-cc: '%s' (callref=%d)\n", digits, callref);
+			LOGP(DCALL, LOGL_NOTICE, "CALL-INFO-REQ: DTMF '%s' from SIP -> queue for TX to mobile (callref=%d)\n", digits, callref);
+			LOGP(DCALL, LOGL_INFO, "INFO_REQ: DTMF '%s' received via IE_DTMF (callref=%d)\n", digits, callref);
 			call_dtmf_queue(callref, digits);
 			break;
 		}
@@ -1137,8 +1387,57 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		/* Fall back to IE_KEYPAD */
 		rc = osmo_cc_get_ie_keypad(msg, 0, digits, sizeof(digits));
 		if (rc >= 0 && digits[0]) {
-			LOGP(DCALL, LOGL_INFO, "Received DTMF (IE_KEYPAD) from osmo-cc: '%s' (callref=%d)\n", digits, callref);
+			LOGP(DCALL, LOGL_NOTICE, "CALL-INFO-REQ: KEYPAD '%s' from SIP -> queue for TX to mobile (callref=%d)\n", digits, callref);
+			LOGP(DCALL, LOGL_INFO, "INFO_REQ: DTMF '%s' received via IE_KEYPAD (callref=%d)\n", digits, callref);
 			call_dtmf_queue(callref, digits);
+		} else {
+			LOGP(DCALL, LOGL_NOTICE, "CALL-INFO-REQ: no DTMF/KEYPAD IE found (callref=%d)\n", callref);
+		}
+		break;
+	    }
+	/*
+	 * Handle NOTIFY messages from the network (e.g., remote party flash/hold).
+	 *
+	 * When the remote SIP endpoint sends a NOTIFY (e.g., via SIP NOTIFY or
+	 * interpreted from SIP INFO with hookflash), we receive it here.
+	 *
+	 * Common scenarios:
+	 * - Remote party pressed flash for three-way calling or call waiting
+	 * - Remote party put us on hold (USER_SUSPENDED / REMOTE_HOLD)
+	 * - Remote party retrieved us from hold (USER_RESUMED / REMOTE_RETRIEVAL)
+	 *
+	 * For 1G analog networks, we play a recall tone to indicate hold status
+	 * to the mobile user, similar to how landline phones indicate hold.
+	 *
+	 * Note: We handle both NOTIFY_IND (from SIP endpoint) and NOTIFY_REQ
+	 * for compatibility with different osmo-cc routing configurations.
+	 */
+	case OSMO_CC_MSG_NOTIFY_IND:  /* Flash/hold from SIP INFO (SIP endpoint -> call.c) */
+	case OSMO_CC_MSG_NOTIFY_REQ:  /* Alternative routing path */
+	    {
+		uint8_t notify;
+		
+		rc = osmo_cc_get_ie_notify(msg, 0, &notify);
+		if (rc >= 0) {
+			LOGP(DCALL, LOGL_INFO, "Received NOTIFY from osmo-cc: notify=0x%02x (callref=%d)\n", notify, callref);
+			/* Handle remote hold/retrieve notifications */
+			switch (notify) {
+			case OSMO_CC_NOTIFY_USER_SUSPENDED:
+			case OSMO_CC_NOTIFY_REMOTE_HOLD:
+				LOGP(DCALL, LOGL_INFO, "Remote party put call on hold\n");
+				/* Play recall tone to indicate remote hold to mobile user */
+				call_tone_recall(callref, 1);
+				break;
+			case OSMO_CC_NOTIFY_USER_RESUMED:
+			case OSMO_CC_NOTIFY_REMOTE_RETRIEVAL:
+				LOGP(DCALL, LOGL_INFO, "Remote party retrieved call from hold\n");
+				/* Stop recall tone - call is active again */
+				call_tone_recall(callref, 0);
+				break;
+			default:
+				LOGP(DCALL, LOGL_DEBUG, "Unhandled notify type: 0x%02x\n", notify);
+				break;
+			}
 		}
 		break;
 	    }
@@ -1155,8 +1454,8 @@ int call_init(const char *name, int _send_patterns, int _release_on_disconnect, 
 
 	g711_init();
 	rc = tones_init(&call_tones, toneset, TONES_TDATA_SLIN16HOST);
-	if (rc > 0) {
-		LOGP(DCALL, LOGL_INFO, "Failed to initialize tone set '%s'. Please fix!\n", toneset);
+	if (rc < 0) {
+		LOGP(DCALL, LOGL_ERROR, "Failed to initialize tone set '%s'. Please fix!\n", toneset);
 		return -EINVAL;
 	}
 

@@ -1362,6 +1362,36 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 				display_measurements_update(sdr->chan[c].dmp_freq_offset, avg / 1000.0, 0.0);
 				/* use half min and max, because we want the deviation above/below (+-) center frequency. */
 				display_measurements_update(sdr->chan[c].dmp_deviation, min / 2.0 / 1000.0, max / 2.0 / 1000.0);
+				
+				/* DEBUG: FM-DEMOD level diagnostics (disabled - uncomment to enable)
+				 * Logs: FM-DEMOD ch%d: avg/peak Hz deviation and normalized dB levels
+				 * Measures FM demodulator output per channel every second */
+#if 0
+				static int fm_diag_count[16] = {0};
+				static double fm_diag_sum[16] = {0};
+				static double fm_diag_max[16] = {0};
+				
+				if (c < 16) {
+					for (s = 0; s < count; s++) {
+						double abs_dev = fabs(samples[c][s]);
+						fm_diag_sum[c] += abs_dev;
+						if (abs_dev > fm_diag_max[c]) fm_diag_max[c] = abs_dev;
+					}
+					fm_diag_count[c] += count;
+					
+					if (fm_diag_count[c] >= sdr->samplerate) {
+						double fm_avg_hz = fm_diag_sum[c] / fm_diag_count[c];
+						double fm_max_hz = fm_diag_max[c];
+						LOGP(DSDR, LOGL_DEBUG, "FM-DEMOD ch%d: avg=%.0fHz pk=%.0fHz (norm: avg=%.1fdB pk=%.1fdB)\n",
+							c, fm_avg_hz, fm_max_hz,
+							20.0 * log10(fm_avg_hz / 2900.0 + 0.001),
+							20.0 * log10(fm_max_hz / 2900.0 + 0.001));
+						fm_diag_count[c] = 0;
+						fm_diag_sum[c] = 0;
+						fm_diag_max[c] = 0;
+					}
+				}
+#endif
 			}
 		}
 	}

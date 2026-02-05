@@ -8,4 +8,5 @@ extern tones_set_t set_oldamerican[];
 extern tones_set_t set_denmark[];
 extern tones_set_t set_japan[];
 extern tones_set_t set_france[];
+extern tones_set_t set_uk[];
 

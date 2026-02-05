@@ -34,6 +34,7 @@ src/libdtmf/libdtmf.a
 src/libsamplerate/libsamplerate.a
 src/libscrambler/libscrambler.a
 src/libemphasis/libemphasis.a
+src/libemphasis/libpolyphase.a
 src/libfsk/libfsk.a
 src/libfm/libfm.a
 src/libfilter/libfilter.a
@@ -49,6 +50,7 @@ src/libv27/libv27.a
 src/libmtp/libmtp.a
 src/libaaimage/libaaimage.a
 src/libtones/libtones.a
+src/libchannelizer/libchannelizer.a
 src/anetz/anetz
 src/bnetz/bnetz
 src/bnetz/bnetz-dialer
@@ -90,6 +92,7 @@ src/test/test_sms
 src/test/test_performance
 src/test/test_hagelbarger
 src/test/test_v27scrambler
+src/test/test_channelizer
 
 installiere_es.sh
 jolly.sh
