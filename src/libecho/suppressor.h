@@ -58,7 +58,8 @@ typedef struct {
 	double attenuation_db;      /* RX attenuation depth */
 	double attenuation_linear;  /* Attenuation as linear gain */
 	int hangover_samples;       /* Hangover duration in samples */
-	double ramp_alpha;          /* Gain ramp smoothing factor */
+	double attack_alpha;        /* Attack ramp smoothing factor (fast) */
+	double release_alpha;       /* Release ramp smoothing factor (slow) */
 	double energy_alpha;        /* Energy smoothing factor */
 	
 	/* Statistics */
@@ -67,13 +68,21 @@ typedef struct {
 	unsigned long suppressed_frames;
 } echo_suppressor_state_t;
 
-/* Configuration structure */
+/* Configuration structure
+ * Based on Bell/CCITT standard parameters:
+ * - Attenuation: 35-45 dB (typical ~40 dB)
+ * - Attack time: 1-5 ms
+ * - Hold time: 150-300 ms
+ * - Release time: 200-500 ms
+ * - Detection threshold: -30 to -36 dBm0
+ */
 typedef struct {
 	int enabled;                /* Enable echo suppressor */
-	double threshold_db;        /* TX threshold for suppression (default: -40) */
-	double attenuation_db;      /* RX attenuation depth (default: 50) */
-	int hangover_ms;            /* Hangover time (default: 100) */
-	int ramp_ms;                /* Gain ramp time (default: 5) */
+	double threshold_db;        /* TX threshold for suppression (Bell/CCITT: -30 to -36 dBm0) */
+	double attenuation_db;      /* RX attenuation depth (Bell/CCITT: 35-45 dB) */
+	int hangover_ms;            /* Hold time after TX stops (Bell/CCITT: 150-300 ms) */
+	int ramp_ms;                /* Attack time (Bell/CCITT: 1-5 ms) */
+	int release_ms;             /* Release time (Bell/CCITT: 200-500 ms) */
 	double doubletalk_threshold_db; /* Unused - kept for compatibility */
 	int stats_enabled;          /* Enable statistics logging */
 	int echo_delay_ms;          /* SDR echo delay (default: 0, max: 500) */

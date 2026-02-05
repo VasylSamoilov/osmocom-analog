@@ -31,10 +31,11 @@ const char *selected_config_file = NULL;
 /* Echo suppressor configuration with defaults */
 echo_suppressor_config_t echo_suppressor_config = {
 	.enabled = 0,                    /* Disabled by default */
-	.threshold_db = -50.0,           /* TX energy threshold: above this = speech present */
-	.attenuation_db = 45.0,          /* 45 dB attenuation (stronger suppression) */
-	.hangover_ms = 150,              /* 150ms hangover after echo stops */
-	.ramp_ms = 2,                    /* 2ms gain ramp time (faster transitions) */
+	.threshold_db = -40.0,           /* TX energy threshold */
+	.attenuation_db = 38.0,          /* 38 dB attenuation */
+	.hangover_ms = 150,              /* 150ms hold time */
+	.ramp_ms = 2,                    /* 2ms attack time */
+	.release_ms = 200,               /* 200ms release time */
 	.doubletalk_threshold_db = 3.0,  /* Unused in unidirectional mode */
 	.stats_enabled = 0,              /* Statistics disabled by default */
 	.echo_delay_ms = 160             /* SDR echo delay (~150-160ms typical) */

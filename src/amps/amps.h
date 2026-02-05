@@ -78,6 +78,12 @@ struct amps {
 	dispmeasparam_t		*dmp_frame_quality;
 	dispmeasparam_t		*dmp_sat_level;
 	dispmeasparam_t		*dmp_sat_quality;
+	dispmeasparam_t		*dmp_rf_level;		/* RF signal level from SDR */
+
+	/* RF level monitoring (for diagnostics, not squelch - AMPS uses SAT for that) */
+	double			rf_level_db;		/* current RF level in dB */
+	double			rf_level_sum;		/* sum for averaging */
+	int			rf_level_count;		/* sample count for averaging */
 
 	/* system info */
 	amps_si			si;

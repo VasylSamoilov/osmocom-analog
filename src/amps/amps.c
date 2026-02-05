@@ -664,9 +664,11 @@ int amps_create(const char *kanal, enum amps_chan_type chan_type, const char *de
 		goto error;
 
 	/* init TX pre-emphasis using correct shelf filter (unity gain at DC, boost highs)
-	 * Time constant tau = 1/(2*pi*300) = 530.5us for 300 Hz corner frequency
-	 * High corner at 3000 Hz (AMPS audio bandwidth) */
-	init_emphasis_fast(&amps->estate_tx_fast, 8000, 530.5e-6, 3000.0);
+	 * Standard says +6 dB/octave from 300-3000 Hz, but that gives ~20 dB boost
+	 * which causes excessive clipping on high-pitched voices.
+	 * Using 500 Hz low corner and 2000 Hz high corner reduces total boost
+	 * while maintaining the +6 dB/octave slope characteristic. */
+	init_emphasis_fast(&amps->estate_tx_fast, 8000, 318.3e-6, 2000.0);
 
 	/* init TX post-limiter low pass filter (cutoff 3000 Hz, 4th order approx) */
 	iir_lowpass_init(&amps->tx_post_filter, 3000.0, samplerate, 4);

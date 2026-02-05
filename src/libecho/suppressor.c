@@ -73,10 +73,17 @@ static double smooth_energy(double current, double previous, double alpha)
 	return alpha * current + (1.0 - alpha) * previous;
 }
 
-/* Apply smooth gain ramping */
-static double ramp_gain(double current_gain, double target_gain, double ramp_alpha)
+/* Apply smooth gain ramping with separate attack/release rates */
+static double ramp_gain(double current_gain, double target_gain, double attack_alpha, double release_alpha)
 {
-	return ramp_alpha * target_gain + (1.0 - ramp_alpha) * current_gain;
+	double alpha;
+	/* Use fast attack when suppressing, slow release when opening */
+	if (target_gain < current_gain)
+		alpha = attack_alpha;   /* Suppressing - fast */
+	else
+		alpha = release_alpha;  /* Releasing - slow */
+	
+	return alpha * target_gain + (1.0 - alpha) * current_gain;
 }
 
 /* Apply gain to audio samples */
@@ -158,21 +165,32 @@ echo_suppressor_state_t *echo_suppressor_init(int sample_rate, int frame_size,
 	state->attenuation_linear = pow(10.0, -config->attenuation_db / 20.0);
 	state->hangover_samples = (config->hangover_ms * sample_rate) / 1000;
 	
-	/* Smoothing factors */
+	/* Energy smoothing factor */
 	state->energy_alpha = 0.3;
 	
-	int ramp_samples = (config->ramp_ms * sample_rate) / 1000;
-	if (ramp_samples > 0)
-		state->ramp_alpha = 1.0 / (double)ramp_samples;
+	/* Attack time (Bell/CCITT: 1-5ms) - fast to catch plosives */
+	int attack_samples = (config->ramp_ms * sample_rate) / 1000;
+	if (attack_samples > 0)
+		state->attack_alpha = 1.0 / (double)attack_samples;
 	else
-		state->ramp_alpha = 1.0;
+		state->attack_alpha = 1.0;
 	
-	/* Calculate delay_frames with ramp compensation:
+	/* Release time (Bell/CCITT: 200-500ms) - slow to prevent pumping */
+	int release_ms = config->release_ms;
+	if (release_ms <= 0)
+		release_ms = 300;  /* Default 300ms if not specified */
+	int release_samples = (release_ms * sample_rate) / 1000;
+	if (release_samples > 0)
+		state->release_alpha = 1.0 / (double)release_samples;
+	else
+		state->release_alpha = 0.01;  /* Very slow default */
+	
+	/* Calculate delay_frames with attack compensation:
 	 * Start suppression early so gain ramp reaches full attenuation when echo arrives.
-	 * effective_delay = echo_delay - ramp_time */
+	 * effective_delay = echo_delay - attack_time */
 	int delay_frames = echo_delay_ms / frame_duration_ms;
-	int ramp_frames = config->ramp_ms / frame_duration_ms;
-	int effective_delay = delay_frames - ramp_frames;
+	int attack_frames = config->ramp_ms / frame_duration_ms;
+	int effective_delay = delay_frames - attack_frames;
 	if (effective_delay < 0)
 		effective_delay = 0;
 	state->delay_frames = effective_delay;
@@ -182,8 +200,8 @@ echo_suppressor_state_t *echo_suppressor_init(int sample_rate, int frame_size,
 	state->rx_frames = 0;
 	state->suppressed_frames = 0;
 	
-	LOGP(DECHO, LOGL_INFO, "Echo suppressor initialized: delay=%dms (effective=%d frames) thresh=%.1fdB att=%.1fdB hangover=%dms ramp=%dms\n",
-	     echo_delay_ms, effective_delay, state->threshold_db, state->attenuation_db, config->hangover_ms, config->ramp_ms);
+	LOGP(DECHO, LOGL_INFO, "Echo suppressor initialized (Bell/CCITT params): delay=%dms thresh=%.1fdB att=%.1fdB hold=%dms attack=%dms release=%dms\n",
+	     echo_delay_ms, state->threshold_db, state->attenuation_db, config->hangover_ms, config->ramp_ms, release_ms);
 
 	return state;
 }
@@ -249,8 +267,9 @@ void echo_suppressor_process_rx(echo_suppressor_state_t *state, int16_t *samples
 		state->rx_gain_target = 1.0;
 	}
 	
-	/* Smooth gain transition */
-	state->rx_gain = ramp_gain(state->rx_gain, state->rx_gain_target, state->ramp_alpha);
+	/* Smooth gain transition (fast attack, slow release per Bell/CCITT) */
+	state->rx_gain = ramp_gain(state->rx_gain, state->rx_gain_target, 
+	                           state->attack_alpha, state->release_alpha);
 	
 	/* Apply gain to RX samples */
 	apply_gain(samples, count, state->rx_gain);

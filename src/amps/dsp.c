@@ -379,6 +379,13 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 		amps->dmp_sat_level = display_measurements_add(&amps->sender.dispmeas, "SAT Level", "%.1f %%", DISPLAY_MEAS_AVG, DISPLAY_MEAS_LEFT, 0.0, 150.0, 100.0);
 		amps->dmp_sat_quality = display_measurements_add(&amps->sender.dispmeas, "SAT Quality", "%.1f %%", DISPLAY_MEAS_AVG, DISPLAY_MEAS_LEFT, 0.0, 100.0, 100.0);
 	}
+	/* RF level display - shows signal strength from SDR (useful for diagnostics) */
+	amps->dmp_rf_level = display_measurements_add(&amps->sender.dispmeas, "RF Level", "%.1f dB", DISPLAY_MEAS_AVG, DISPLAY_MEAS_LEFT, -100.0, 0.0, -INFINITY);
+
+	/* Initialize RF level tracking */
+	amps->rf_level_db = -INFINITY;
+	amps->rf_level_sum = 0.0;
+	amps->rf_level_count = 0;
 
 	return 0;
 
@@ -600,6 +607,19 @@ again:
 			int16_to_samples_speech(samples, spl, input_num);
 		}
 
+#if 0 /* TX DEBUG: Uncomment to enable TX path level logging */
+		/* TX DEBUG: Track levels at each stage */
+		static int tx_dbg_count = 0;
+		static double tx_dbg_input_peak = 0, tx_dbg_comp_peak = 0, tx_dbg_emph_peak = 0, tx_dbg_final_peak = 0;
+		{
+			int i;
+			for (i = 0; i < input_num; i++) {
+				double v = fabs(samples[i]);
+				if (v > tx_dbg_input_peak) tx_dbg_input_peak = v;
+			}
+		}
+#endif
+
 		/* DTMF TX: Mix DTMF tones into audio (at 8000 Hz, before echo suppressor) */
 		if (amps->trans_list && amps->trans_list->callref)
 			call_dtmf_tx(amps->trans_list->callref, samples, input_num);
@@ -610,9 +630,43 @@ again:
 
 		compress_audio(&amps->cstate, samples, input_num);
 
+#if 0 /* TX DEBUG: After compressor */
+		{
+			int i;
+			for (i = 0; i < input_num; i++) {
+				double v = fabs(samples[i]);
+				if (v > tx_dbg_comp_peak) tx_dbg_comp_peak = v;
+			}
+		}
+#endif
+
+		/* Pre-emphasis input scaling to prevent excessive peaks.
+		 * 
+		 * Pre-emphasis filter: 500 Hz low corner, 2000 Hz high corner, +6 dB/octave
+		 * Gain at 1 kHz = 6 * log2(1000/500) = 6 * 1 = +6 dB = 2.0x
+		 * Gain at 2 kHz = 6 * log2(2000/500) = 6 * 2 = +12 dB = 4.0x (max)
+		 * 
+		 * Scale = 1/gain_1kHz = 1/2.0 = 0.50 to maintain unity at 1 kHz reference */
+		if (amps->pre_emphasis) {
+			double preemph_scale = 0.50;
+			int i;
+			for (i = 0; i < input_num; i++)
+				samples[i] *= preemph_scale;
+		}
+
 		/* pre-emphasis at 8 kHz (BEFORE upsample) - use correct shelf filter with unity gain at DC */
 		if (amps->pre_emphasis)
 			pre_emphasis_fast(&amps->estate_tx_fast, samples, input_num);
+
+#if 0 /* TX DEBUG: After pre-emphasis */
+		{
+			int i;
+			for (i = 0; i < input_num; i++) {
+				double v = fabs(samples[i]);
+				if (v > tx_dbg_emph_peak) tx_dbg_emph_peak = v;
+			}
+		}
+#endif
 
 		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
 
@@ -631,8 +685,23 @@ again:
 				double scale = max_speech / peak;
 				for (i = 0; i < length; i++)
 					samples[i] *= scale;
+#if 0 /* TX DEBUG: Log when limiter activates */
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "TX LIMITER: peak=%.3f max=%.3f scale=%.3f\n", peak, max_speech, scale);
+#endif
 			}
+#if 0 /* TX DEBUG */
+			if (peak > tx_dbg_final_peak) tx_dbg_final_peak = peak;
+#endif
 		}
+
+#if 0 /* TX DEBUG: Log levels once per second */
+		if (++tx_dbg_count >= 50) {  /* ~1 sec at 20ms frames */
+			LOGP_CHAN(DDSP, LOGL_INFO, "TX PATH: input=%.3f comp=%.3f emph=%.3f final=%.3f\n",
+				tx_dbg_input_peak, tx_dbg_comp_peak, tx_dbg_emph_peak, tx_dbg_final_peak);
+			tx_dbg_count = 0;
+			tx_dbg_input_peak = tx_dbg_comp_peak = tx_dbg_emph_peak = tx_dbg_final_peak = 0;
+		}
+#endif
 
 		/* encode SAT during call */
 		sat_encode(amps, samples, length);
@@ -1766,9 +1835,32 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 }
 
 /* Process received audio stream from radio unit. */
-void sender_receive(sender_t *sender, sample_t *samples, int length, double __attribute__((unused)) rf_level_db)
+void sender_receive(sender_t *sender, sample_t *samples, int length, double rf_level_db)
 {
 	amps_t *amps = (amps_t *) sender;
+
+	/* Track RF level from SDR for diagnostics display
+	 * Note: AMPS uses SAT for signal detection, not squelch.
+	 * RF level is purely informational. */
+	if (!isnan(rf_level_db)) {
+		amps->rf_level_db = rf_level_db;
+		amps->rf_level_sum += rf_level_db;
+		amps->rf_level_count++;
+		/* Update display every ~100 samples (about 10 times per second at 8kHz) */
+		if (amps->rf_level_count >= 100) {
+			double avg = amps->rf_level_sum / (double)amps->rf_level_count;
+			if (amps->dmp_rf_level)
+				display_measurements_update(amps->dmp_rf_level, avg, 0.0);
+			/* Log RF level once per second (every 10th update = 1000 samples = ~1 sec at 8kHz) */
+			static int log_counter = 0;
+			if (++log_counter >= 10) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "RF Level: %.1f dB\n", avg);
+				log_counter = 0;
+			}
+			amps->rf_level_sum = 0.0;
+			amps->rf_level_count = 0;
+		}
+	}
 
 	/* dc filter required for FSK decoding and tone detection */
 	if (amps->de_emphasis)
