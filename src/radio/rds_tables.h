@@ -50,8 +50,13 @@ const char *rds_get_ecc_country_name(int index);
 
 /* Get human-readable ECC region name
  * Returns descriptive string like "Europe 1", "Americas - US", etc.
- * Used for educational logging to explain what ECC value means */
+ * For undefined ECCs returns "Not defined in EN 50067" */
 const char *rds_get_ecc_name(uint8_t ecc);
+
+/* Check if ECC value is defined in EN 50067 Table D.1 / Annex N.
+ * Valid: E0-E4 (Europe), A0-A5 (Americas), D0-D3 (Africa), F0-F2 (Asia/Pacific).
+ * Returns 1 if valid, 0 if not defined. */
+int rds_is_valid_ecc(uint8_t ecc);
 
 /* Get North American (RBDS) Call Sign from PI code
  * Returns pointer to static buffer (not thread-safe) or NULL if not a valid call sign */
@@ -216,8 +221,49 @@ const char *rds_get_linkage_name(uint8_t lic);
 const char *rds_get_dab_channel_name(uint32_t frequency);
 
 /* ============================================================
- * Linked Station Codes (RBDS)
+ * Programme Identification (PI) Code Decode
+ * EN 50067 Annex D / NRSC-4-B Annex D
+ *
+ * PI structure (16 bits):
+ *   b15-b12: Country Code (CC) -- 1-F valid, 0 invalid (EN 50067 D.1)
+ *   b11-b8:  Coverage Area Code -- L/I/N/S/R1-R12 (EN 50067 D.4)
+ *   b7-b0:   Programme Reference Number -- 0 not assigned (EN 50067 D.5)
+ *
+ * For RBDS (North America), PI encodes call sign instead.
  * ============================================================ */
+
+/* Decoded PI code fields */
+typedef struct {
+	uint16_t	pi;		/* Raw PI code */
+	uint8_t		cc;		/* Country Code (b15-b12), 0 = invalid */
+	uint8_t		coverage;	/* Coverage Area Code (b11-b8) */
+	uint8_t		ref;		/* Programme Reference Number (b7-b0) */
+	const char	*cc_name;	/* ISO country code, or list when ECC unknown */
+	const char	*coverage_name;	/* "Local", "National", "R3", etc. */
+	const char	*callsign;	/* RBDS call sign or NULL */
+	const char	*pi_note;	/* Warning for special PI values, or NULL */
+	int		cc_valid;	/* 1 if CC is in range 1-F */
+	int		ref_valid;	/* 1 if ref != 0 (0 = not assigned) */
+	int		is_rbds;	/* 1 if decoded as RBDS (ECC or forced) */
+} rds_pi_info_t;
+
+/* Decode PI code into its constituent fields (EN 50067 D.1-D.5).
+ * Works for both RDS and RBDS. For RBDS, also populates callsign.
+ * ecc: Extended Country Code (from Group 1A), 0 if unknown.
+ * force_rbds: 1 to force RBDS decoding (callsign + US PTY names).
+ * Shared by encoder and decoder. */
+void rds_decode_pi(uint16_t pi, uint8_t ecc, int force_rbds, rds_pi_info_t *info);
+
+/* Get all possible countries for a CC value across all ECCs.
+ * Returns comma-separated ISO codes in a static buffer.
+ * Used when ECC is unknown to show what CC could mean.
+ * EN 50067 Table D.1: CC is ambiguous without ECC. */
+const char *rds_get_cc_countries(uint8_t cc);
+
+/* Get coverage area name from code (0-F).
+ * EN 50067 D.4: 0=Local, 1=International, 2=National, 3=Supra-regional,
+ * 4-F = R1-R12 */
+const char *rds_get_coverage_name(uint8_t code);
 
 /* Get Linked Station Name (e.g. "NPR-1") from PI code.
  * Returns NULL if not found. */

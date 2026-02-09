@@ -494,7 +494,7 @@ int rds_af_is_method_b(const uint16_t *af, int count)
 	/* Check that tuning freq appears in every pair */
 	for (i = 1; i < count - 1; i += 2) {
 		if (af[i] != tuned && af[i + 1] != tuned)
-			return 0;  /* Neither freq is tuned → not Method B */
+			return 0;  /* Neither freq is tuned -> not Method B */
 	}
 	
 	return 1;
@@ -548,6 +548,45 @@ const char *rds_get_country_code(uint8_t cc, uint8_t ecc)
 		}
 	}
 	return "--";
+}
+
+/* Get all possible countries for a CC value across all ECCs.
+ * When ECC is unknown, CC alone is ambiguous (EN 50067 Table D.1).
+ * Returns comma-separated unique ISO codes in a static buffer. */
+const char *rds_get_cc_countries(uint8_t cc)
+{
+	static char buf[128];
+	int pos = 0;
+
+	if (cc < 1 || cc > 15)
+		return "--";
+
+	/* Collect unique country codes across all ECCs */
+	const char *seen[32];
+	int seen_count = 0;
+
+	for (const ecc_country_t *e = country_table; e->ecc != 0; e++) {
+		const char *code = e->countries[cc - 1];
+		if (!code || (code[0] == '-' && code[1] == '-'))
+			continue;
+		/* Check for duplicate */
+		int dup = 0;
+		for (int i = 0; i < seen_count; i++) {
+			if (strcmp(seen[i], code) == 0) { dup = 1; break; }
+		}
+		if (!dup && seen_count < 32) {
+			seen[seen_count++] = code;
+			if (pos > 0 && pos < (int)sizeof(buf) - 1)
+				buf[pos++] = '/';
+			int n = snprintf(buf + pos, sizeof(buf) - pos, "%s", code);
+			if (n > 0) pos += n;
+		}
+	}
+
+	if (pos == 0)
+		return "--";
+	buf[pos] = '\0';
+	return buf;
 }
 
 /* ============================================================
@@ -803,26 +842,28 @@ typedef struct {
 	const char *name;
 } ecc_name_t;
 
+/* EN 50067 Table D.1 / Annex N: Valid ECCs are E0-E4, A0-A5, D0-D3, F0-F2.
+ * Any other value (including 0x00) is not defined in the standard. */
 static const ecc_name_t ecc_names[] = {
-	/* European ECCs (0xE0-0xE4) */
+	/* European ECCs (EN 50067 Table D.1) */
 	{ 0xE0, "Europe 1 (DE, IT, AT, etc.)" },
 	{ 0xE1, "Europe 2 (GR, CH, FI, GB, FR)" },
 	{ 0xE2, "Europe 3 (CZ, PL, ES, NO)" },
 	{ 0xE3, "Europe 4 (IE, TR, NL, SE)" },
 	{ 0xE4, "Europe 5 (UA, PT, SI)" },
-	/* American ECCs (0xA0-0xA6) */
+	/* American ECCs (EN 50067 Annex N / NRSC-4-B) */
 	{ 0xA0, "Americas - United States" },
 	{ 0xA1, "Americas - Canada" },
 	{ 0xA2, "Americas - Caribbean/South" },
 	{ 0xA3, "Americas - Caribbean/Central" },
 	{ 0xA4, "Americas - Central/South" },
 	{ 0xA5, "Americas - Mexico" },
-	/* African ECCs (0xD0-0xD3) */
+	/* African ECCs (EN 50067 Annex N) */
 	{ 0xD0, "Africa 1" },
 	{ 0xD1, "Africa 2" },
 	{ 0xD2, "Africa 3" },
 	{ 0xD3, "Africa 4" },
-	/* Asia/Pacific ECCs (0xF0-0xF3) */
+	/* Asia/Pacific ECCs (EN 50067 Annex N) */
 	{ 0xF0, "Asia/Pacific 1 (AU, CN)" },
 	{ 0xF1, "Asia/Pacific 2 (NZ, KR, HK)" },
 	{ 0xF2, "Asia/Pacific 3 (IN, JP, SG)" },
@@ -836,7 +877,16 @@ const char *rds_get_ecc_name(uint8_t ecc)
 		if (e->ecc == ecc)
 			return e->name;
 	}
-	return "(Unknown ECC region)";
+	return "Not defined in EN 50067";
+}
+
+int rds_is_valid_ecc(uint8_t ecc)
+{
+	for (const ecc_name_t *e = ecc_names; e->name != NULL; e++) {
+		if (e->ecc == ecc)
+			return 1;
+	}
+	return 0;
 }
 
 /* ============================================================
@@ -1676,4 +1726,84 @@ uint16_t rds_get_pi_from_callsign(const char *call)
 	}
 
 	return 0;
+}
+
+/* ============================================================
+ * Coverage Area Codes (EN 50067 D.4)
+ * PI bits b11-b8
+ * ============================================================ */
+static const char *coverage_area_names[16] = {
+	"Local",		/* 0 */
+	"International",	/* 1 */
+	"National",		/* 2 */
+	"Supra-regional",	/* 3 */
+	"R1",			/* 4 */
+	"R2",			/* 5 */
+	"R3",			/* 6 */
+	"R4",			/* 7 */
+	"R5",			/* 8 */
+	"R6",			/* 9 */
+	"R7",			/* A */
+	"R8",			/* B */
+	"R9",			/* C */
+	"R10",			/* D */
+	"R11",			/* E */
+	"R12",			/* F */
+};
+
+const char *rds_get_coverage_name(uint8_t code)
+{
+	if (code > 0x0F)
+		return "??";
+	return coverage_area_names[code];
+}
+
+/* ============================================================
+ * Programme Identification (PI) Code Decode
+ * EN 50067 Annex D / NRSC-4-B Annex D
+ * ============================================================ */
+void rds_decode_pi(uint16_t pi, uint8_t ecc, int force_rbds, rds_pi_info_t *info)
+{
+	memset(info, 0, sizeof(*info));
+	info->pi = pi;
+	info->cc = (pi >> 12) & 0x0F;
+	info->coverage = (pi >> 8) & 0x0F;
+	info->ref = pi & 0xFF;
+
+	/* Special PI values */
+	if (pi == 0x0000) {
+		info->pi_note = "empty/uninitialized (misconfigured transmitter)";
+	} else if (pi == 0xFFFF) {
+		info->pi_note = "factory default (encoder not configured)";
+	}
+
+	/* EN 50067 D.1: "Code 0 (Hex) shall not be used for country identification" */
+	info->cc_valid = (info->cc >= 1 && info->cc <= 0x0F);
+
+	/* EN 50067 D.5: Programme reference 0x00 = "Not assigned" */
+	info->ref_valid = (info->ref != 0);
+
+	/* Determine if this is RBDS */
+	info->is_rbds = force_rbds || (ecc >= 0xA0 && ecc <= 0xA5);
+
+	/* Country name from CC + ECC.
+	 * When ECC is known, we get a specific country.
+	 * When ECC is unknown (0), show all possible countries for this CC
+	 * from EN 50067 Table D.1 -- CC alone is ambiguous. */
+	if (!info->cc_valid)
+		info->cc_name = "--";
+	else if (ecc != 0)
+		info->cc_name = rds_get_country_code(info->cc, ecc);
+	else
+		info->cc_name = rds_get_cc_countries(info->cc);
+
+	/* Coverage area name */
+	info->coverage_name = rds_get_coverage_name(info->coverage);
+
+	/* RBDS call sign -- only when confirmed RBDS (ECC or forced).
+	 * NRSC-4-B Annex N: ECC 0xA0-0xA5 = North America.
+	 * When ECC is unknown, default to RDS (more common globally). */
+	info->callsign = NULL;
+	if (info->is_rbds)
+		info->callsign = rds_get_callsign(pi);
 }

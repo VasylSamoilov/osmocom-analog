@@ -32,6 +32,9 @@
 
 static void rds_decode_group(rds_decoder_t *rds);
 
+/* Forward declaration for dynamic PS cycle tracking */
+void rds_dps_on_ps_cycle_complete(rds_encoder_t *rds);
+
 
 /* ============================================================
  * RRC Biphase Waveform Generation (IEC 62106 S2.3)
@@ -323,14 +326,14 @@ int rds_af_method_a_parse(const char *input, rds_af_method_a_t *out)
  * Build AF code sequence for Method A transmission.
  * 
  * Generates the raw 8-bit AF codes in transmission order:
- *   [count_code, AF1, AF2, AF3, ..., AFn, (filler)]
+ *   [count_code, AF1, AF2, ..., AFn, (filler)]
  * 
- * For LF/MF: inserts [250, LF/MF_code] pair.
+ * For LF/MF: inserts [250, LF/MF_code] pair per EN 50067 S3.2.1.6.3.
  * Adds filler (205) if total codes is odd (pairs must be complete).
  * 
- * Example (6 VHF AFs):
- *   Output: [230, AF1, AF2, AF3, AF4, AF5, AF6, 205]
- *   Transmitted as: [230,AF1] [AF2,AF3] [AF4,AF5] [AF6,205]
+ * EN 50067 Example C (3 VHF + 1 LF/MF):
+ *   [#4, AF1] [AF2, AF3] [250, AF4]
+ *   The [250, AF4] pair naturally aligns when VHF count is odd.
  * 
  * @param af         Input AF structure
  * @param codes      Output buffer for AF codes
@@ -894,6 +897,10 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 	rds_group_pack(blocks, group, 0);
 	
 	rds->ps_segment = (seg + 1) & RDS_PS_SEG_MASK;
+	
+	/* Dynamic PS: detect completed PS cycle (segment wrapped from 3 to 0) */
+	if (rds->ps_segment == 0)
+		rds_dps_on_ps_cycle_complete(rds);
 }
 
 /* ============================================================
@@ -953,6 +960,10 @@ static void rds_build_group_0b(rds_encoder_t *rds, uint8_t *group)
 	rds_group_pack(blocks, group, 0);
 	
 	rds->ps_segment = (seg + 1) & RDS_PS_SEG_MASK;
+	
+	/* Dynamic PS: detect completed PS cycle (segment wrapped from 3 to 0) */
+	if (rds->ps_segment == 0)
+		rds_dps_on_ps_cycle_complete(rds);
 }
 
 
@@ -972,7 +983,7 @@ static void rds_build_group_2a(rds_encoder_t *rds, uint8_t *group)
 		seg = 0;
 		pos = 0;
 		if (rds->debug)
-			LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Switched 2B→2A, toggled A/B to %c\n",
+			LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Switched 2B->2A, toggled A/B to %c\n",
 			     rds->rt_ab ? 'B' : 'A');
 	}
 	rds->rt_last_version = 0;
@@ -1045,7 +1056,7 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
 		seg = 0;
 		pos = 0;
 		if (rds->debug)
-			LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Switched 2A→2B, toggled A/B to %c\n",
+			LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Switched 2A->2B, toggled A/B to %c\n",
 			     rds->rt_ab ? 'B' : 'A');
 	}
 	rds->rt_last_version = 1;
@@ -1297,7 +1308,7 @@ static void rds_build_rtplus_group(rds_encoder_t *rds, rds_rtplus_encoder_t *rtp
 		*b2 |= ((rtplus->tags[0].content_type >> RDS_RTPLUS_TAG1_CT_HIGH_SHIFT) & RDS_RTPLUS_TAG1_CT_HIGH_MASK);
 	}
 	
-	/* Block C: tag1 content_type[2:0], start, length-1, tag2 content_type[5:4] */
+	/* Block C: tag1 content_type[2:0], start, length-1, tag2 content_type[5] */
 	*b3 = 0;
 	if (rtplus->tag_count > 0) {
 		rds_rtplus_tag_t *tag1 = &rtplus->tags[0];
@@ -1306,7 +1317,7 @@ static void rds_build_rtplus_group(rds_encoder_t *rds, rds_rtplus_encoder_t *rtp
 		*b3 |= (((tag1->length - 1) & 0x3F) << RDS_RTPLUS_TAG1_LEN_SHIFT);   /* bits 6-1 (length-1) */
 		
 		if (rtplus->tag_count > 1) {
-			/* Tag2 content_type[5:4] goes in B3[1:0] (2 bits) */
+			/* Tag2 content_type[5] goes in B3 bit 0 (1 bit) */
 			*b3 |= ((rtplus->tags[1].content_type >> RDS_RTPLUS_TAG2_CT_HIGH_SHIFT) & RDS_RTPLUS_TAG2_CT_HIGH_MASK);
 		}
 	}
@@ -1322,8 +1333,8 @@ static void rds_build_rtplus_group(rds_encoder_t *rds, rds_rtplus_encoder_t *rtp
 	}
 	
 	if (rds->debug) {
-		LOGP(DRADIO, LOGL_DEBUG, "RDS TX RT+: toggle=%d running=%d tags=%d\n",
-		     rtplus->toggle, rtplus->item_running, rtplus->tag_count);
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX RT+: toggle=%d running=%d tags=%d B2=0x%04X B3=0x%04X B4=0x%04X\n",
+		     rtplus->toggle, rtplus->item_running, rtplus->tag_count, *b2, *b3, *b4);
 		if (rtplus->tag_count > 0) {
 			LOGP(DRADIO, LOGL_DEBUG, "  Tag1: type=%d start=%d len=%d\n",
 			     rtplus->tags[0].content_type, rtplus->tags[0].start, rtplus->tags[0].length);
@@ -1484,7 +1495,7 @@ static void rds_build_ert_group(rds_encoder_t *rds, uint16_t *b2, uint16_t *b3, 
  *
  * Block B bits 4-0: Application Group Type Code
  *   - Indicates which group (0A-15B) carries this ODA's data
- *   - Format: [group_number(4 bits)][version(1 bit)] → 0=0A, 1=0B, ..., 31=15B
+ *   - Format: [group_number(4 bits)][version(1 bit)] -> 0=0A, 1=0B, ..., 31=15B
  *
  * Block C: ODA-specific message (application-dependent, 16 bits)
  *   - RT+: CB flag, SCB, template number
@@ -1545,11 +1556,11 @@ static void rds_build_group_3a(rds_encoder_t *rds, uint8_t *group)
 		case RDS_ODA_AID_STATION_LOGO: oda_name = "Logo"; break;
 		}
 		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 3A: ODA[%d/%d] AID=0x%04X (%s) "
-		     "carrier=%d%c msg=0x%04X\n",
+		     "carrier=%d%c B2=0x%04X msg=0x%04X\n",
 		     idx + 1, rds->oda_count, oda->aid, oda_name,
 		     oda->carrier_group >> 1,
 		     (oda->carrier_group & 1) ? 'B' : 'A',
-		     oda->message);
+		     b2, oda->message);
 	}
 	
 	/* Pack into bytes */
@@ -1955,10 +1966,22 @@ void rds_scheduler_update(rds_encoder_t *rds)
 		ADD_GRP(g0);
 	}
 	
-	/* Block 5: 0 */
+	/* Block 5: RT or 0
+	 * Extra RT slot to match KCRC-like ~30% RT bandwidth.
+	 * Without this, RT only gets ~17% (2/12) vs KCRC's 30%.
+	 * Full 64-char RT takes ~6.8s at 17% but ~3.8s at 30%. */
+	if (has_rt) {
+		ADD_GRP(g2);
+		ADD_GRP(g2);
+	} else {
+		ADD_GRP(g0);
+		ADD_GRP(g0);
+	}
+	
+	/* Block 6: 0 */
 	ADD_GRP(g0);
 	
-	/* Block 6: PTYN (10A) or RT or 0 */
+	/* Block 7: PTYN (10A) or RT or 0 */
 	if (has_ptyn) {
 		ADD_GRP(RDS_GROUP_10A);
 	} else if (has_rt) {
@@ -2000,17 +2023,12 @@ void rds_scheduler_update(rds_encoder_t *rds)
 	}
 	
 	/* Block 11: eRT ODA group (if configured and has text)
-	 * Note: eRT has 32 segments, so we add multiple groups per cycle to speed up
-	 * full text transmission. With 4 groups per cycle, complete eRT takes ~8 cycles
-	 * instead of 32 cycles with just 1 group. */
+	 * eRT is low priority -- most receivers don't support it.
+	 * 1 group per cycle keeps it present without starving RT (2A). */
 	for (int i = 0; i < rds->oda_count; i++) {
 		if (rds->oda[i].aid == RDS_ODA_AID_ERT && rds->oda[i].enabled) {
 			if (rds->ert.length > 0) {
 				enum rds_group_type ert_group = (enum rds_group_type)rds->oda[i].carrier_group;
-				/* Add 4 eRT groups per cycle for faster transmission */
-				ADD_GRP(ert_group);
-				ADD_GRP(ert_group);
-				ADD_GRP(ert_group);
 				ADD_GRP(ert_group);
 			}
 			break;
@@ -2096,11 +2114,14 @@ static void rds_generate_group(rds_encoder_t *rds)
 	 * PRIORITY 3: Fixed Cyclic Sequence
 	 * ============================================================ */
 	
-	/* Safety check: if sequence empty, fallback to 0A */
+	/* Safety check: if sequence empty, fallback to 0A/0B */
 	if (rds->group_sched_len == 0) {
 		rds_scheduler_update(rds);
 		if (rds->group_sched_len == 0) { // Should not happen
-			rds_build_group_0a(rds, rds->group_buffer); // Emergency fallback
+			if (rds->use_0b)
+				rds_build_group_0b(rds, rds->group_buffer);
+			else
+				rds_build_group_0a(rds, rds->group_buffer);
 			rds->group_bit_pos = 0;
 			return;
 		}
@@ -2196,18 +2217,24 @@ static void rds_generate_group(rds_encoder_t *rds)
 			if (found) {
 				rds_group_pack(blocks, rds->group_buffer, 0);
 			} else {
-				/* No ODA configured for this group - fallback to 0A */
+				/* No ODA configured for this group - fallback to 0A/0B */
 				if (rds->debug)
-					LOGP(DRADIO, LOGL_DEBUG, "RDS TX: ODA group %d%c not configured, using 0A\n",
-					     carrier_code >> 1, (carrier_code & 1) ? 'B' : 'A');
-				rds_build_group_0a(rds, rds->group_buffer);
+					LOGP(DRADIO, LOGL_DEBUG, "RDS TX: ODA group %d%c not configured, using %s\n",
+					     carrier_code >> 1, (carrier_code & 1) ? 'B' : 'A',
+					     rds->use_0b ? "0B" : "0A");
+				if (rds->use_0b)
+					rds_build_group_0b(rds, rds->group_buffer);
+				else
+					rds_build_group_0a(rds, rds->group_buffer);
 			}
 		}
 		break;
-	/* Add other cases as needed */
 	default:
 		/* Fallback for unhandled types in sequence */
-		rds_build_group_0a(rds, rds->group_buffer);
+		if (rds->use_0b)
+			rds_build_group_0b(rds, rds->group_buffer);
+		else
+			rds_build_group_0a(rds, rds->group_buffer);
 		break;
 	}
 
@@ -2668,6 +2695,584 @@ void rds_enc_get_ps(const rds_encoder_t *rds, char *ps, size_t len)
 	size_t copy_len = (len - 1 < 8) ? len - 1 : 8;
 	memcpy(ps, rds->ps, copy_len);
 	ps[copy_len] = '\0';
+}
+
+/* ============================================================
+ * Dynamic PS (Scrolling Programme Service Name) Implementation
+ * ============================================================
+ *
+ * ARCHITECTURE:
+ *   Dynamic PS works by hooking into the Group 0A/0B builder.
+ *   Each time a complete PS cycle finishes (all 4 segments 0-3
+ *   transmitted), we increment ps_dyn_ps_cycles. When the cycle
+ *   count reaches ps_dyn_repeat, we advance the scroll position
+ *   and load the next 8-character window into rds->ps[].
+ *
+ *   The advance is triggered from rds_build_group_0a/0b when
+ *   ps_segment wraps from 3 back to 0 (a full cycle completed).
+ *
+ * TIMING ANALYSIS:
+ *   RDS data rate: 1187.5 bps
+ *   Group size: 104 bits -> ~11.4 groups/second
+ *   Group 0 allocation: ~50% of groups -> ~5.7 Group 0/sec
+ *   Full PS cycle: 4 Group 0 -> ~0.7 seconds
+ *
+ *   With repeat=1: advance every ~0.7s (FAST - flicker risk)
+ *   With repeat=3: advance every ~2.1s (NORMAL - recommended)
+ *   With repeat=5: advance every ~3.5s (SAFE - all receivers)
+ *
+ *   Full message cycle time = steps * repeat * 0.7s
+ *   Example: 20-char message in SCROLL mode:
+ *     Steps = 20 + 8 - 1 = 27 (with padding)
+ *     At repeat=3: 27 * 2.1s = ~57s full cycle
+ *
+ * RECEIVER COMPATIBILITY NOTES:
+ *   - Early Philips/Blaupunkt tuners have PS stability timers
+ *     of 1-2 seconds. They require at least 2 identical PS
+ *     decodes before updating the display.
+ *   - Automotive receivers often have PS debounce filters that
+ *     ignore rapid PS changes.
+ *   - Some car radios cache the first stable PS and only update
+ *     after signal loss/reacquisition.
+ *   - Using repeat >= 3 ensures compatibility with these receivers.
+ *   - Trailing spaces (instead of wraparound jumps) reduce the
+ *     visual jarring effect on displays.
+ * ============================================================ */
+
+/**
+ * Internal: Load the current scroll window into rds->ps[].
+ * Called when the scroll position changes.
+ */
+static void rds_dps_load_current_window(rds_encoder_t *rds)
+{
+	/* Clear PS buffer with spaces */
+	memset(rds->ps, ' ', 8);
+	rds->ps[8] = '\0';
+	
+	switch (rds->ps_dyn_mode) {
+	case RDS_DPS_SCROLL: {
+		/*
+		 * Window shift mode: extract 8 characters starting at scroll_pos
+		 * from the padded text buffer.
+		 *
+		 * The text is pre-padded with leading and trailing spaces so that
+		 * the message smoothly enters and exits the 8-char display:
+		 *
+		 *   Padded: "        NOW PLAYING        "
+		 *   pos=0:  "        "  (all spaces)
+		 *   pos=1:  "       N"
+		 *   pos=8:  "NOW PLAY"
+		 *   pos=9:  "OW PLAYI"
+		 *   ...
+		 *   pos=N:  "        "  (all spaces, end)
+		 */
+		int pos = rds->ps_dyn_scroll_pos;
+		for (int i = 0; i < 8; i++) {
+			int src_idx = pos + i;
+			if (src_idx >= 0 && src_idx < rds->ps_dyn_text_len)
+				rds->ps[i] = rds->ps_dyn_text[src_idx];
+			else
+				rds->ps[i] = ' ';
+		}
+		break;
+	}
+	case RDS_DPS_WORD:
+		/*
+		 * Word-step mode: load the pre-computed word page at current index.
+		 * Each page is an 8-char window aligned to word boundaries.
+		 */
+		if (rds->ps_dyn_word_index < rds->ps_dyn_word_count) {
+			int offset = rds->ps_dyn_word_offsets[rds->ps_dyn_word_index];
+			for (int i = 0; i < 8; i++) {
+				int src_idx = offset + i;
+				if (src_idx >= 0 && src_idx < rds->ps_dyn_text_len)
+					rds->ps[i] = rds->ps_dyn_text[src_idx];
+				else
+					rds->ps[i] = ' ';
+			}
+		}
+		break;
+		
+	case RDS_DPS_PAGE:
+		/*
+		 * Page mode: load the pre-split page at current index.
+		 * Pages were split on '|' delimiter during setup.
+		 */
+		if (rds->ps_dyn_page_index < rds->ps_dyn_page_count) {
+			memcpy(rds->ps, rds->ps_dyn_pages[rds->ps_dyn_page_index], 8);
+		}
+		break;
+	}
+	
+	rds->ps[8] = '\0';
+	
+	if (rds->debug) {
+		char ps_display[33];
+		rds_text_to_display((uint8_t *)rds->ps, 8, ps_display, sizeof(ps_display));
+		LOGP(DRADIO, LOGL_DEBUG, "RDS DPS: Window [%d] = \"%s\"\n",
+		     rds->ps_dyn_scroll_pos, ps_display);
+	}
+}
+
+/**
+ * Internal: Advance the dynamic PS to the next scroll position.
+ * Called when enough PS cycles have been transmitted.
+ */
+static void rds_dps_advance(rds_encoder_t *rds)
+{
+	switch (rds->ps_dyn_mode) {
+	case RDS_DPS_SCROLL:
+		rds->ps_dyn_scroll_pos++;
+		/* Wrap around when we've scrolled past the padded text */
+		if (rds->ps_dyn_scroll_pos >= rds->ps_dyn_text_len - 7) {
+			rds->ps_dyn_scroll_pos = 0;
+		}
+		break;
+		
+	case RDS_DPS_WORD:
+		rds->ps_dyn_word_index++;
+		if (rds->ps_dyn_word_index >= rds->ps_dyn_word_count) {
+			rds->ps_dyn_word_index = 0;
+		}
+		break;
+		
+	case RDS_DPS_PAGE:
+		rds->ps_dyn_page_index++;
+		if (rds->ps_dyn_page_index >= rds->ps_dyn_page_count) {
+			rds->ps_dyn_page_index = 0;
+		}
+		break;
+	}
+	
+	rds_dps_load_current_window(rds);
+}
+
+/**
+ * Internal: Called from rds_build_group_0a/0b when a complete PS cycle
+ * finishes (ps_segment wraps from 3 to 0). Manages the repeat counter
+ * and triggers scroll advancement when ready.
+ *
+ * This is the core timing mechanism for dynamic PS. It ensures that
+ * each PS value is transmitted the configured number of times before
+ * the display advances, giving receivers time to latch the value.
+ */
+void rds_dps_on_ps_cycle_complete(rds_encoder_t *rds)
+{
+	if (!rds->ps_dyn_enabled)
+		return;
+	
+	rds->ps_dyn_ps_cycles++;
+	
+	if (rds->ps_dyn_ps_cycles >= rds->ps_dyn_repeat) {
+		rds->ps_dyn_ps_cycles = 0;
+		rds_dps_advance(rds);
+	}
+}
+
+/**
+ * Internal: Compute word boundaries for RDS_DPS_WORD mode.
+ *
+ * Splits the text into 8-character pages aligned to word boundaries.
+ * Words that don't fit in the remaining space of a page start a new page.
+ * Short pages are right-padded with spaces.
+ *
+ * Example: "NOW PLAYING SONG" ->
+ *   Page 0: "NOW     " (offset 0, "NOW" + padding)
+ *   Page 1: "PLAYING " (offset 4, "PLAYING" + padding)
+ *   Page 2: "SONG    " (offset 12, "SONG" + padding)
+ */
+static void rds_dps_compute_word_pages(rds_encoder_t *rds)
+{
+	const char *text = rds->ps_dyn_text;
+	int len = rds->ps_dyn_text_len;
+	int pos = 0;
+	
+	rds->ps_dyn_word_count = 0;
+	
+	/* Skip leading spaces */
+	while (pos < len && text[pos] == ' ')
+		pos++;
+	
+	while (pos < len && rds->ps_dyn_word_count < 32) {
+		/* Record this word page starting position */
+		rds->ps_dyn_word_offsets[rds->ps_dyn_word_count] = pos;
+		rds->ps_dyn_word_count++;
+		
+		/* Find how much text fits in 8 characters from this position.
+		 * Try to break at a word boundary. */
+		int end = pos + 8;
+		if (end >= len) {
+			/* Remaining text fits in one page */
+			break;
+		}
+		
+		/* Find the last space within the 8-char window to break at */
+		int break_pos = -1;
+		for (int i = end - 1; i > pos; i--) {
+			if (text[i] == ' ') {
+				break_pos = i;
+				break;
+			}
+		}
+		
+		if (break_pos > pos) {
+			/* Break at word boundary, skip spaces */
+			pos = break_pos;
+			while (pos < len && text[pos] == ' ')
+				pos++;
+		} else {
+			/* No space found - hard break at 8 chars */
+			pos = end;
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_DEBUG, "RDS DPS WORD: Computed %d word pages\n",
+	     rds->ps_dyn_word_count);
+}
+
+/**
+ * Internal: Split text on configurable delimiter for RDS_DPS_PAGE mode.
+ * Each segment is trimmed/padded to exactly 8 characters.
+ * Uses rds->ps_dyn_delimiter (set by rds_enc_set_dynamic_ps before calling).
+ */
+static void rds_dps_split_pages(rds_encoder_t *rds, const char *text)
+{
+	char buf[256];
+	strncpy(buf, text, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+	
+	rds->ps_dyn_page_count = 0;
+	
+	char delim_str[2] = { rds->ps_dyn_delimiter ? rds->ps_dyn_delimiter : '|', '\0' };
+	char *saveptr = NULL;
+	char *token = strtok_r(buf, delim_str, &saveptr);
+	
+	while (token && rds->ps_dyn_page_count < 32) {
+		/* Trim leading spaces */
+		while (*token == ' ')
+			token++;
+		
+		/* Pad/truncate to 8 chars */
+		memset(rds->ps_dyn_pages[rds->ps_dyn_page_count], ' ', 8);
+		rds->ps_dyn_pages[rds->ps_dyn_page_count][8] = '\0';
+		
+		int len = strlen(token);
+		/* Trim trailing spaces from token */
+		while (len > 0 && token[len - 1] == ' ')
+			len--;
+		if (len > 8) len = 8;
+		
+		/* Convert to RDS charset */
+		int warn = 0;
+		rds_encode_text(token, (uint8_t *)rds->ps_dyn_pages[rds->ps_dyn_page_count], 8, &warn);
+		
+		rds->ps_dyn_page_count++;
+		token = strtok_r(NULL, delim_str, &saveptr);
+	}
+	
+	LOGP(DRADIO, LOGL_DEBUG, "RDS DPS PAGE: Split into %d pages\n",
+	     rds->ps_dyn_page_count);
+}
+
+/**
+ * Internal: Compute the approximate wall-clock time for one full PS cycle
+ * (4 Group 0 transmissions) based on the current scheduler configuration.
+ *
+ * This examines the actual group_sched_buffer[] to count how many Group 0
+ * slots exist per scheduler cycle, then calculates:
+ *
+ *   groups_per_second = 1187.5 bps / 104 bits = ~11.4 groups/sec
+ *   scheduler_cycle_time = group_sched_len / groups_per_second
+ *   group0_per_cycle = count of 0A/0B in scheduler
+ *   ps_cycles_per_sched_cycle = group0_per_cycle / 4  (4 segments per PS)
+ *   ps_cycle_time = scheduler_cycle_time / ps_cycles_per_sched_cycle
+ *
+ * Returns approximate seconds per one full PS transmission.
+ * Falls back to 0.7s if scheduler is empty or has no Group 0.
+ */
+static double rds_dps_estimate_ps_cycle_time(const rds_encoder_t *rds)
+{
+	const double groups_per_second = RDS_BITRATE / (double)RDS_GROUP_BITS;  /* ~11.4 */
+	
+	if (rds->group_sched_len == 0)
+		return 4.0 / (groups_per_second * 0.5);  /* Fallback: assume 50% Group 0 */
+	
+	/* Count Group 0A/0B slots in the scheduler */
+	int group0_count = 0;
+	for (int i = 0; i < rds->group_sched_len; i++) {
+		if (rds->group_sched_buffer[i] == RDS_GROUP_0A ||
+		    rds->group_sched_buffer[i] == RDS_GROUP_0B)
+			group0_count++;
+	}
+	
+	if (group0_count == 0)
+		return 4.0 / (groups_per_second * 0.5);  /* Fallback */
+	
+	/*
+	 * Time for one full scheduler cycle:
+	 *   sched_cycle_time = group_sched_len / groups_per_second
+	 *
+	 * Number of complete PS transmissions per scheduler cycle:
+	 *   ps_per_sched = group0_count / 4
+	 *
+	 * Time per PS transmission:
+	 *   ps_time = sched_cycle_time / ps_per_sched
+	 *           = (group_sched_len / groups_per_second) / (group0_count / 4)
+	 *           = (group_sched_len * 4) / (group0_count * groups_per_second)
+	 */
+	return (rds->group_sched_len * 4.0) / (group0_count * groups_per_second);
+}
+
+void rds_enc_set_dynamic_ps(rds_encoder_t *rds, const char *text,
+                            rds_dynamic_ps_mode_t mode, int repeat,
+                            char delimiter)
+{
+	if (!rds || !text || !text[0])
+		return;
+	
+	/* Store the delimiter (default to '|' if unset) */
+	rds->ps_dyn_delimiter = delimiter ? delimiter : '|';
+	
+	/* ============================================================
+	 * TIMING ESTIMATION FROM CURRENT SCHEDULER
+	 * ============================================================
+	 * We compute the approximate wall-clock time per PS cycle from
+	 * the actual scheduler configuration, rather than assuming a
+	 * fixed 50% Group 0 allocation. This gives accurate timing
+	 * estimates in the log output regardless of how many RT, PTYN,
+	 * EON, ODA, etc. groups are configured.
+	 * ============================================================ */
+	double ps_cycle_secs = rds_dps_estimate_ps_cycle_time(rds);
+	
+	/* Count Group 0 slots for the log */
+	int group0_count = 0;
+	for (int i = 0; i < rds->group_sched_len; i++) {
+		if (rds->group_sched_buffer[i] == RDS_GROUP_0A ||
+		    rds->group_sched_buffer[i] == RDS_GROUP_0B)
+			group0_count++;
+	}
+	
+	/* ============================================================
+	 * INPUT VALIDATION AND WARNINGS
+	 * ============================================================ */
+	
+	/* Clamp repeat to minimum of 1 */
+	if (repeat < 1) {
+		LOGP(DRADIO, LOGL_NOTICE,
+		     "RDS DPS: repeat=%d is invalid, clamping to 1. "
+		     "Recommended: 3 (normal) or 5 (safe for all receivers).\n", repeat);
+		repeat = 1;
+	}
+	
+	/* Warn about fast repeat settings that may cause receiver issues.
+	 * Use the actual scheduler-derived timing for accurate warnings. */
+	double step_time = repeat * ps_cycle_secs;
+	
+	if (repeat == 1) {
+		LOGP(DRADIO, LOGL_NOTICE,
+		     "RDS DPS: WARNING - repeat=1 is the fastest possible setting!\n"
+		     "  Each PS value will be transmitted only ONCE (~%.2fs based on current\n"
+		     "  scheduler: %d Group 0 slots out of %d total) before advancing.\n"
+		     "  This WILL cause display flicker on many receivers, especially:\n"
+		     "    - Early Philips/Blaupunkt tuners (PS stability timer 1-2s)\n"
+		     "    - Automotive head units with PS debounce filters\n"
+		     "    - Receivers that require 2 identical PS decodes before display update\n"
+		     "  Recommended settings:\n"
+		     "    repeat=3 (~%.1fs/step) - compatible with most receivers\n"
+		     "    repeat=5 (~%.1fs/step) - safe for all known receivers\n",
+		     ps_cycle_secs, group0_count, rds->group_sched_len,
+		     3 * ps_cycle_secs, 5 * ps_cycle_secs);
+	} else if (repeat == 2) {
+		LOGP(DRADIO, LOGL_NOTICE,
+		     "RDS DPS: repeat=2 (~%.1fs/step) is aggressive. Some receivers with\n"
+		     "  PS stability timers may miss updates. Recommended: 3 or higher.\n",
+		     step_time);
+	}
+	
+	/* For PAGE mode, handle delimited input */
+	if (mode == RDS_DPS_PAGE) {
+		rds_dps_split_pages(rds, text);
+		
+		if (rds->ps_dyn_page_count < 2) {
+			LOGP(DRADIO, LOGL_NOTICE,
+			     "RDS DPS PAGE: Only %d page(s) found. Use '%c' to separate pages.\n"
+			     "  Example: \"RADIO 1 %cHOT HITS%c98.5 FM \"\n"
+			     "  Falling back to static PS.\n", rds->ps_dyn_page_count,
+			     rds->ps_dyn_delimiter, rds->ps_dyn_delimiter, rds->ps_dyn_delimiter);
+			if (rds->ps_dyn_page_count == 1) {
+				/* Single page - just set as static PS */
+				memcpy(rds->ps, rds->ps_dyn_pages[0], 8);
+				rds->ps[8] = '\0';
+			}
+			return;
+		}
+		
+		rds->ps_dyn_enabled = 1;
+		rds->ps_dyn_mode = RDS_DPS_PAGE;
+		rds->ps_dyn_repeat = repeat;
+		rds->ps_dyn_repeat_count = 0;
+		rds->ps_dyn_ps_cycles = 0;
+		rds->ps_dyn_page_index = 0;
+		
+		/* Store original text for get_dynamic_ps_text */
+		strncpy(rds->ps_dyn_text, text, sizeof(rds->ps_dyn_text) - 1);
+		rds->ps_dyn_text[sizeof(rds->ps_dyn_text) - 1] = '\0';
+		rds->ps_dyn_text_len = strlen(rds->ps_dyn_text);
+		
+		/* Load first page */
+		rds_dps_load_current_window(rds);
+		rds->ps_segment = 0;
+		
+		double full_cycle = rds->ps_dyn_page_count * step_time;
+		LOGP(DRADIO, LOGL_INFO,
+		     "RDS DPS: Page mode enabled, %d pages, repeat=%d\n"
+		     "  Timing (from scheduler: %d Group 0 / %d total groups):\n"
+		     "    1 PS transmission ~ %.2fs, step interval ~ %.1fs, full cycle ~ %.0fs\n",
+		     rds->ps_dyn_page_count, repeat,
+		     group0_count, rds->group_sched_len,
+		     ps_cycle_secs, step_time, full_cycle);
+		
+		/* Log the EBU warning about dynamic PS */
+		LOGP(DRADIO, LOGL_NOTICE,
+		     "RDS DPS: NOTE - Dynamic PS is NOT part of the RDS standard (IEC 62106).\n"
+		     "  The EBU discourages its use. RadioText (Group 2A) is the proper\n"
+		     "  mechanism for dynamic text display. Use --rt for standard-compliant\n"
+		     "  dynamic text.\n");
+		return;
+	}
+	
+	/* For SCROLL and WORD modes, convert text to RDS charset first */
+	
+	/* Validate input */
+	rds_validate_text(text, "Dynamic PS");
+	
+	int input_len = strlen(text);
+	
+	/* If text fits in 8 chars, just use static PS */
+	if (input_len <= 8 && mode != RDS_DPS_PAGE) {
+		LOGP(DRADIO, LOGL_INFO,
+		     "RDS DPS: Text \"%s\" fits in 8 chars, using static PS.\n", text);
+		rds_enc_set_ps(rds, text);
+		return;
+	}
+	
+	/* Build the padded/encoded text buffer */
+	if (mode == RDS_DPS_SCROLL) {
+		/*
+		 * SCROLL mode: Pad with 8 leading and 8 trailing spaces so the
+		 * message smoothly enters and exits the display window.
+		 *
+		 * Layout: "        <message>        "
+		 *          ^^^^^^^^                 ^^^^^^^^
+		 *          8 spaces                 8 spaces (7 needed + 1 for clean wrap)
+		 *
+		 * Total scroll positions = 8 + message_len + 8 - 7 = message_len + 9
+		 * (We need text_len - 7 positions to show all 8-char windows)
+		 */
+		memset(rds->ps_dyn_text, ' ', 8);  /* 8 leading spaces */
+		int warn = 0;
+		int encoded_len = rds_encode_text(text, (uint8_t *)(rds->ps_dyn_text + 8),
+		                                  sizeof(rds->ps_dyn_text) - 16, &warn);
+		/* 8 trailing spaces */
+		memset(rds->ps_dyn_text + 8 + encoded_len, ' ', 8);
+		rds->ps_dyn_text_len = 8 + encoded_len + 8;
+		rds->ps_dyn_text[rds->ps_dyn_text_len] = '\0';
+		
+		rds->ps_dyn_scroll_pos = 0;
+		
+		int total_steps = rds->ps_dyn_text_len - 7;
+		double full_cycle = total_steps * step_time;
+		
+		LOGP(DRADIO, LOGL_INFO,
+		     "RDS DPS: Scroll mode enabled, %d chars, %d scroll steps, repeat=%d\n"
+		     "  Timing (from scheduler: %d Group 0 / %d total groups):\n"
+		     "    1 PS transmission ~ %.2fs, step interval ~ %.1fs, full cycle ~ %.0fs\n",
+		     encoded_len, total_steps, repeat,
+		     group0_count, rds->group_sched_len,
+		     ps_cycle_secs, step_time, full_cycle);
+		
+	} else if (mode == RDS_DPS_WORD) {
+		/*
+		 * WORD mode: Encode text without padding, then compute word-aligned
+		 * page boundaries.
+		 */
+		int warn = 0;
+		int encoded_len = rds_encode_text(text, (uint8_t *)rds->ps_dyn_text,
+		                                  sizeof(rds->ps_dyn_text) - 1, &warn);
+		rds->ps_dyn_text_len = encoded_len;
+		rds->ps_dyn_text[encoded_len] = '\0';
+		
+		rds_dps_compute_word_pages(rds);
+		rds->ps_dyn_word_index = 0;
+		
+		if (rds->ps_dyn_word_count < 2) {
+			LOGP(DRADIO, LOGL_INFO,
+			     "RDS DPS: Text fits in one word page, using static PS.\n");
+			rds_enc_set_ps(rds, text);
+			return;
+		}
+		
+		double full_cycle = rds->ps_dyn_word_count * step_time;
+		
+		LOGP(DRADIO, LOGL_INFO,
+		     "RDS DPS: Word mode enabled, %d word pages, repeat=%d\n"
+		     "  Timing (from scheduler: %d Group 0 / %d total groups):\n"
+		     "    1 PS transmission ~ %.2fs, step interval ~ %.1fs, full cycle ~ %.0fs\n",
+		     rds->ps_dyn_word_count, repeat,
+		     group0_count, rds->group_sched_len,
+		     ps_cycle_secs, step_time, full_cycle);
+	}
+	
+	/* Activate dynamic PS */
+	rds->ps_dyn_enabled = 1;
+	rds->ps_dyn_mode = mode;
+	rds->ps_dyn_repeat = repeat;
+	rds->ps_dyn_repeat_count = 0;
+	rds->ps_dyn_ps_cycles = 0;
+	
+	/* Load the first window */
+	rds_dps_load_current_window(rds);
+	rds->ps_segment = 0;
+	
+	/* Log the EBU warning about dynamic PS */
+	LOGP(DRADIO, LOGL_NOTICE,
+	     "RDS DPS: NOTE - Dynamic PS is NOT part of the RDS standard (IEC 62106).\n"
+	     "  The EBU discourages its use. RadioText (Group 2A) is the proper\n"
+	     "  mechanism for dynamic text display. Use --rt for standard-compliant\n"
+	     "  dynamic text.\n");
+}
+
+void rds_enc_stop_dynamic_ps(rds_encoder_t *rds)
+{
+	if (!rds)
+		return;
+	
+	if (rds->ps_dyn_enabled) {
+		rds->ps_dyn_enabled = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS DPS: Dynamic PS stopped. Current PS frozen.\n");
+	}
+}
+
+int rds_enc_is_dynamic_ps(const rds_encoder_t *rds)
+{
+	return rds ? rds->ps_dyn_enabled : 0;
+}
+
+void rds_enc_get_dynamic_ps_text(const rds_encoder_t *rds, char *text, size_t len)
+{
+	if (!rds || !text || len == 0)
+		return;
+	
+	if (!rds->ps_dyn_enabled) {
+		text[0] = '\0';
+		return;
+	}
+	
+	size_t copy_len = strlen(rds->ps_dyn_text);
+	if (copy_len >= len)
+		copy_len = len - 1;
+	memcpy(text, rds->ps_dyn_text, copy_len);
+	text[copy_len] = '\0';
 }
 
 /* ============================================================
@@ -3298,8 +3903,8 @@ void rds_enc_set_ert_chartable(rds_encoder_t *rds, uint8_t chartable)
  * eRT+ tags address character position in string, not byte position!
  * This is critical for UTF-8 where multi-byte characters exist.
  * 
- * Example: "Café" = 4 characters, 5 bytes (é = 2 bytes UTF-8)
- *   Tag with start=3, length=1 should extract "é" (2 bytes), not byte 3.
+ * Example: "Cafe" = 4 characters, 5 bytes (e = 2 bytes UTF-8)
+ *   Tag with start=3, length=1 should extract "e" (2 bytes), not byte 3.
  * 
  * Returns bytes written to out (excluding NUL), or 0 on error.
  */
@@ -3856,7 +4461,7 @@ int rds_enc_af_method_b_remove_list(rds_encoder_t *rds, uint16_t tuning_freq)
 			/* Disable Method B if no lists remain */
 			if (rds->af_method_b.list_count == 0) {
 				rds->use_method_b = 0;
-				rds->use_0b = 1;  /* No AF → use Group 0B */
+				rds->use_0b = 1;  /* No AF -> use Group 0B */
 			}
 			
 			LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list removed: tuning=%.1f\n", tuning_freq / 10.0);
@@ -3895,7 +4500,7 @@ int rds_enc_af_method_b_remove_list_by_index(rds_encoder_t *rds, int index)
 	/* Disable Method B if no lists remain */
 	if (rds->af_method_b.list_count == 0) {
 		rds->use_method_b = 0;
-		rds->use_0b = 1;  /* No AF → use Group 0B */
+		rds->use_0b = 1;  /* No AF -> use Group 0B */
 	}
 	
 	LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list[%d] removed: tuning=%.1f\n", index, tuning_freq / 10.0);
@@ -4598,9 +5203,9 @@ static void rds_decode_rtplus(rds_decoder_t *rds, const uint16_t *blocks,
 	
 	/* Update registration info from 3A message if available */
 	if (oda) {
-		rtplus->cb = (oda->message & RDS_ERT_3A_CB_MASK) >> RDS_ERT_3A_CB_BIT;
-		rtplus->scb = (oda->message & RDS_ERT_3A_SCB_MASK) >> RDS_ERT_3A_SCB_SHIFT;
-		rtplus->template_num = oda->message & RDS_ERT_3A_TEMPLATE_MASK;
+		rtplus->cb = (oda->message & RDS_RTPLUS_3A_CB_MASK) >> RDS_RTPLUS_3A_CB_BIT;
+		rtplus->scb = (oda->message & RDS_RTPLUS_3A_SCB_MASK) >> RDS_RTPLUS_3A_SCB_SHIFT;
+		rtplus->template_num = oda->message & RDS_RTPLUS_3A_TEMPLATE_MASK;
 		rtplus->carrier_group = oda->carrier_group;
 		rtplus->registered = 1;
 	}
@@ -4905,8 +5510,33 @@ static void rds_decode_group(rds_decoder_t *rds)
 		rds->pty_status = rds->block_status[1];
 	}
 	
-	/* REQUIRE Valid Block B for Group/Segment info */
-	if (!(rds->group_mask & (1<<1))) return;
+	/* Log every group type for consistent grep-ability.
+	 * All groups get "RDS RX %d%c:" so you can grep for group cadence. */
+	if ((rds->group_mask & (1<<1)) && rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS RX %d%c: PI=%04X B2=%04X B3=%04X B4=%04X\n",
+		     group_type, version ? 'B' : 'A', pi, b2, b3, b4);
+	
+	/* REQUIRE Valid Block B for Group/Segment info.
+	 * Block B carries group type, TP, PTY -- without it we cannot
+	 * determine what kind of group this is (EN 50067 sec.3.1.2). */
+	if (!(rds->group_mask & (1<<1))) {
+		rds->groups_skipped_no_block_b++;
+		if (rds->verbose)
+			LOGP(DRADIO, LOGL_INFO, "RDS: Group skipped -- Block B missing "
+			     "(cannot determine group type). PI=%04X Blocks=[%c%c%c%c]\n",
+			     pi,
+			     (rds->group_mask & (1<<0)) ? '+' : '-',
+			     (rds->group_mask & (1<<1)) ? '+' : '-',
+			     (rds->group_mask & (1<<2)) ? '+' : '-',
+			     (rds->group_mask & (1<<3)) ? '+' : '-');
+		rds->groups_received++;
+		return;
+	}
+	
+	/* Count this group type for distribution stats */
+	int group_code_stat = (group_type << 1) | version;
+	if (group_code_stat >= 0 && group_code_stat < 32)
+		rds->group_type_counts[group_code_stat]++;
 	
 	if (group_type == 0) {
 		/* Group 0A/0B - see RDS_0A_* macros in rds.h */
@@ -4920,9 +5550,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 		rds->ms_status = rds->block_status[1];
 		
 		/* DI flags are transmitted per segment.
-		 * IEC 62106 Table 9: seg 0→d3, seg 1→d2, seg 2→d1, seg 3→d0
+		 * IEC 62106 Table 9: seg 0->d3, seg 1->d2, seg 2->d1, seg 3->d0
 		 * IEC 62106 Table 10: d0=stereo, d1=artificial head, d2=compressed, d3=dynamic PTY
-		 * Combined: seg 0→dynamic PTY, seg 1→compressed, seg 2→artificial head, seg 3→stereo */
+		 * Combined: seg 0->dynamic PTY, seg 1->compressed, seg 2->artificial head, seg 3->stereo */
 		switch (seg) {
 		case 0: rds->di_dynamic_pty = di; break;
 		case 1: rds->di_compressed = di; break;
@@ -5007,7 +5637,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				}
 				
 				/* Process 1 or 2 items based on start_idx */
-				int is_us = RDS_IS_RBDS(rds->ecc);
+				int is_us = rds->force_rbds || RDS_IS_RBDS(rds->ecc);
 				
 				for (int i = start_idx; i < 2; i++) {
 					uint8_t code = codes[i];
@@ -5088,39 +5718,78 @@ static void rds_decode_group(rds_decoder_t *rds)
 		
 		/* Only update PS if block D is valid (in group_mask) */
 		if (rds->group_mask & (1<<3)) {
-			rds->ps[seg*2] = (b4 >> 8) & 0xFF;
-			rds->ps[seg*2+1] = b4 & 0xFF;
+			uint8_t c0 = (b4 >> 8) & 0xFF;
+			uint8_t c1 = b4 & 0xFF;
+
+			/* Detect partial PS update: segment chars differ from previous */
+			if (rds->ps_prev[seg*2] != (char)c0 || rds->ps_prev[seg*2+1] != (char)c1) {
+				if (rds->verbose) {
+					/* Show full PS string with this segment updated */
+					char ps_tmp[9];
+					char ps_display[64];
+					memcpy(ps_tmp, rds->ps_prev, 9);
+					ps_tmp[seg*2] = c0;
+					ps_tmp[seg*2+1] = c1;
+					ps_tmp[8] = '\0';
+					rds_text_to_display((uint8_t *)ps_tmp, 8, ps_display, sizeof(ps_display));
+					LOGP(DRADIO, LOGL_NOTICE, "RDS PS[%d] update: \"%s\"\n",
+					     seg, ps_display);
+				}
+				rds->ps_prev[seg*2] = c0;
+				rds->ps_prev[seg*2+1] = c1;
+			}
+
+			rds->ps[seg*2] = c0;
+			rds->ps[seg*2+1] = c1;
 			rds->ps_status[seg*2] = rds->block_status[3];
 			rds->ps_status[seg*2+1] = rds->block_status[3];
 			rds->ps_segments |= (1 << seg);
+
+			/* On full decode (all 4 segments received), compare against previous successful full decode */
+			if (rds->ps_segments == 0x0F) {
+				rds->ps[8] = '\0';
+				if (memcmp(rds->ps, rds->ps_prev_successful, 8) != 0) {
+					rds->ps_changes++;
+					{
+						char ps_display[64];
+						rds_text_to_display((uint8_t *)rds->ps, 8, ps_display, sizeof(ps_display));
+						/* INFO: always visible */
+						LOGP(DRADIO, LOGL_INFO, "RDS PS: \"%s\" (#%d)\n",
+						     ps_display, rds->ps_changes);
+						/* NOTICE: gated by --rds-verbose */
+						if (rds->verbose)
+							LOGP(DRADIO, LOGL_NOTICE, "RDS PS changed:   \"%s\" (#%d)\n",
+							     ps_display, rds->ps_changes);
+					}
+					memcpy(rds->ps_prev_successful, rds->ps, 9);
+					memcpy(rds->ps_prev, rds->ps, 9);
+				}
+				/* Log complete DI summary once we have all segments
+				 * DI flag names from rds_tables.h: d0=dynamic_pty, d1=compressed, 
+				 * d2=artificial_head, d3=stereo (mapped to segments 3,2,1,0) */
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 0%c: Decoder Info: %s=%s, %s=%s, %s=%s, %s=%s\n",
+					     version ? 'B' : 'A',
+					     rds_get_di_name(3), rds_get_di_value_name(3, rds->di_stereo),
+					     rds_get_di_name(2), rds_get_di_value_name(2, rds->di_artificial_head),
+					     rds_get_di_name(1), rds_get_di_value_name(1, rds->di_compressed),
+					     rds_get_di_name(0), rds_get_di_value_name(0, rds->di_dynamic_pty));
+				/* Reset segments so next full decode requires all 4 fresh */
+				rds->ps_segments = 0;
+			}
 			
 			/* Verbose: Log Group 0 basic tuning info and PS segment
 			 * DI segment mapping: seg 0->d3, seg 1->d2, seg 2->d1, seg 3->d0 */
 			if (rds->verbose)
 				LOGP(DRADIO, LOGL_INFO, "RDS 0%c: PTY=%d (%s), TP=%d, TA=%d (%s), "
 				     "M/S=%s, %s=%s, PS[%d]=\"%c%c\"\n",
-				     version ? 'B' : 'A', pty, rds_get_pty_name(pty, RDS_IS_RBDS(rds->ecc)),
+				     version ? 'B' : 'A', pty, rds_get_pty_name(pty, rds->force_rbds || RDS_IS_RBDS(rds->ecc)),
 				     tp, ta, rds_get_tp_ta_description(tp, ta),
 				     rds_get_ms_name(ms),
 				     rds_get_di_name(3 - seg), rds_get_di_value_name(3 - seg, di),
 				     seg,
 				     (rds->ps[seg*2] >= 0x20 && rds->ps[seg*2] <= 0x7E) ? rds->ps[seg*2] : '.',
 				     (rds->ps[seg*2+1] >= 0x20 && rds->ps[seg*2+1] <= 0x7E) ? rds->ps[seg*2+1] : '.');
-		}
-		
-		if (rds->ps_segments == 0x0F) {
-			rds->ps[8] = '\0';
-			
-			/* Log complete DI summary once we have all segments
-			 * DI flag names from rds_tables.h: d0=dynamic_pty, d1=compressed, 
-			 * d2=artificial_head, d3=stereo (mapped to segments 3,2,1,0) */
-			if (rds->verbose)
-				LOGP(DRADIO, LOGL_INFO, "RDS 0%c: Decoder Info: %s=%s, %s=%s, %s=%s, %s=%s\n",
-				     version ? 'B' : 'A',
-				     rds_get_di_name(3), rds_get_di_value_name(3, rds->di_stereo),
-				     rds_get_di_name(2), rds_get_di_value_name(2, rds->di_artificial_head),
-				     rds_get_di_name(1), rds_get_di_value_name(1, rds->di_compressed),
-				     rds_get_di_name(0), rds_get_di_value_name(0, rds->di_dynamic_pty));
 		}
 	}
 	else if (group_type == 1) {
@@ -5221,6 +5890,11 @@ static void rds_decode_group(rds_decoder_t *rds)
 				rds->ecc_status = rds->block_status[2];
 				{
 					int paging = (payload >> 8) & 0x0F;
+					/* EN 50067 Table D.1: Valid ECCs are E0-E4, A0-A5, D0-D3, F0-F2.
+					 * Any other value is not defined in the standard. */
+					if (!rds_is_valid_ecc(rds->ecc) && rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X -- "
+						     "not defined in EN 50067\n", rds->ecc);
 					/* Normal operation: paging=0 (deprecated), only log ECC */
 					if (paging != 0) {
 						/* Non-zero paging - log in both debug and verbose */
@@ -5247,6 +5921,21 @@ static void rds_decode_group(rds_decoder_t *rds)
 							     rds->linkage_actuator,
 							     rds_get_country_code(cc, rds->ecc),
 							     rds->linkage_actuator ? "Yes" : "No");
+					}
+				}
+				/* Check ECC vs mode mismatch (log once, only for valid ECCs) */
+				if (!rds->ecc_mismatch_logged && rds_is_valid_ecc(rds->ecc)) {
+					int ecc_is_rbds = (rds->ecc >= 0xA0 && rds->ecc <= 0xA5);
+					if (rds->force_rbds && !ecc_is_rbds) {
+						LOGP(DRADIO, LOGL_NOTICE, "RDS: --rbds forced but ECC=0x%02X (%s) "
+						     "is not Americas. Received stream is likely RDS.\n",
+						     rds->ecc, rds_get_ecc_name(rds->ecc));
+						rds->ecc_mismatch_logged = 1;
+					} else if (!rds->force_rbds && ecc_is_rbds) {
+						LOGP(DRADIO, LOGL_NOTICE, "RDS: ECC=0x%02X (%s) indicates RBDS. "
+						     "Use --rbds for US PTY names and callsign decoding.\n",
+						     rds->ecc, rds_get_ecc_name(rds->ecc));
+						rds->ecc_mismatch_logged = 1;
 					}
 				}
 				break;
@@ -5736,6 +6425,16 @@ static void rds_decode_group(rds_decoder_t *rds)
 					}
 				}
 			}
+			else if (usage == 10 || usage == 11) {
+				/* Variants 10-11: Not assigned (IEC 62106 Table 17)
+				 * Reserved for future use -- log if encountered */
+				if (rds->group_mask & (1<<2)) {
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Unassigned "
+						     "usage variant %d, data=0x%04X\n",
+						     on_pi, usage, b3);
+				}
+			}
 			else if (usage == RDS_14A_VARIANT_LINK) {
 				/* Variant 12: Linkage Information (IEC 62106 S6.1.5.14)
 				 * Block C structure: LA(1) + EG/ILS(2) + SG(1) + LSN(12)
@@ -5771,7 +6470,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 					if (rds->verbose)
 						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Info: "
 						     "PTY=%d (%s), TA=%s\n",
-						     on_pi, on_pty, rds_get_pty_name(on_pty, RDS_IS_RBDS(rds->ecc)),
+						     on_pi, on_pty, rds_get_pty_name(on_pty, rds->force_rbds || RDS_IS_RBDS(rds->ecc)),
 						     on_ta ? "Yes" : "No");
 				}
 			}
@@ -5923,6 +6622,26 @@ group14_done:
 			     ms ? "Music" : "Speech",
 			     3 - seg, di);
 	}
+	else {
+		/* Unhandled group type -- not decoded by this implementation.
+		 * Known unhandled types per IEC 62106:
+		 *   4B:  Clock-Time (version B, no standard use)
+		 *   5A/5B: Transparent Data Channels (TDC)
+		 *   6A/6B: In-House Applications (IH)
+		 *   7A:  Radio Paging (RP)
+		 *   8A:  TMC (Traffic Message Channel) -- typically via ODA
+		 *   9A:  Emergency Warning System (EWS)
+		 *   11A/11B: Open Data Application (ODA-only)
+		 *   12A/12B: Open Data Application (ODA-only)
+		 *   13A: Enhanced Radio Paging
+		 *   13B: Open Data Application (ODA-only)
+		 *   15A: Fast Basic Tuning (RBDS only, long form)
+		 * These may be routed as ODA below if registered via 3A.
+		 */
+		if (rds->verbose)
+			LOGP(DRADIO, LOGL_INFO, "RDS %d%c: Not decoded (no built-in handler)\n",
+			     group_type, version ? 'B' : 'A');
+	}
 	
 	/* Debug: detailed group dump */
 
@@ -5979,6 +6698,13 @@ group14_done:
 			break;
 		case RDS_ODA_AID_ERT:
 			rds_decode_ert(rds, rds->blocks, rds->block_status, oda);
+			break;
+		default:
+			/* ODA registered but no specific decoder -- log the raw data */
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS %d%c: ODA data for AID=0x%04X (no decoder), "
+				     "B3=%04X B4=%04X\n",
+				     group_type, version ? 'B' : 'A', aid, b3, b4);
 			break;
 		}
 	}
@@ -6055,7 +6781,7 @@ static int rds_biphase_decode(rds_decoder_t *rds, double acc)
 	return bit_decoded;
 }
 
-int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us)
+int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us, int force_rbds)
 {
 	memset(rds, 0, sizeof(*rds));
 	
@@ -6065,13 +6791,20 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->samplerate = samplerate;
 	rds->debug = debug;
 	rds->verbose = verbose;
+	rds->force_rbds = force_rbds;
+	rds->time_constant_us = time_constant_us;
 
-	/* Heuristic: 75µs emphasis triggers RBDS (Americas) assumption.
-	 * 50µs (Europe/World) defaults to RDS, which is more common globally.
-	 * This sets a default ECC in the RBDS range (0xA0) for correct PTY name display
-	 * (e.g. "Top 40") before the actual ECC is received from Group 1A. */
-	if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
-		rds->ecc = 0xA0; /* Start with RBDS assumption */
+	/* Log emphasis/mode mismatch hints once at startup.
+	 * Do NOT auto-set ECC -- let the actual ECC from Group 1A determine the mode.
+	 * The force_rbds flag only affects decoder interpretation (PTY names, callsign). */
+	if (force_rbds && !RDS_IS_RBDS_EMPHASIS(time_constant_us) && time_constant_us > 0) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS: --rbds forced but emphasis=%.0fus (RDS). "
+		     "RBDS typically uses 75us.\n", time_constant_us);
+		rds->rbds_hint_logged = 1;
+	} else if (!force_rbds && RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS: emphasis=75us detected (RBDS/Americas). "
+		     "Use --rbds to force RBDS decoding (US PTY names, callsign).\n");
+		rds->rbds_hint_logged = 1;
 	}
 	
 	/* Initialize Subcarrier PLL (57 kHz) */
@@ -6130,6 +6863,125 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	if (verbose)
 		LOGP(DRADIO, LOGL_INFO, "RDS decoder initialized (IEC 62106 DBPSK, fs=%.0f, debug=%d, verbose=%d)\n", samplerate, debug, verbose);
 	return 0;
+}
+
+/* Feed a single decoded bit into the RDS decoder sync state machine.
+ * This bypasses the DSP/PLL/biphase stages and feeds directly into
+ * the block synchronizer + group decoder.
+ * Used for binary .rds bitstream files (raw RDS bits, MSB first). */
+void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
+{
+	rds->shift_reg = ((rds->shift_reg << 1) | (bit & 1)) & 0x3FFFFFF;
+	rds->bit_count++;
+	rds->bit_count_in_block++;
+	rds->bit_time++;
+
+	if (!rds->synced) {
+		/* Search Mode: Check every bit for valid syndrome */
+		uint16_t block_index;
+		if (rds_check_syndrome(rds->shift_reg, &block_index)) {
+			int offset = rds->bit_time % 26;
+			int pseudo_block = ((rds->bit_time / 26) + 4 - block_index) % 4;
+
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Hit at offset=%d pseudo=%d block=%c\n",
+					offset, pseudo_block, 'A'+block_index);
+
+			if (rds->sync_hit_time[offset][pseudo_block] < rds->bit_time - SYNC_CONFIRM_BITS)
+				rds->sync_hits[offset][pseudo_block] = 0;
+
+			rds->sync_hits[offset][pseudo_block]++;
+			rds->sync_hit_time[offset][pseudo_block] = rds->bit_time;
+
+			if (rds->sync_hits[offset][pseudo_block] > SYNC_THRESHOLD) {
+				rds->synced = 1;
+				rds->block_idx = (block_index + 1) & 0x03;
+				rds->errors = 0;
+				rds->blocks_in_group = 0;
+				rds->group_error_count = 0;
+				rds->blocks_received++;
+				rds->group_mask = (1 << block_index);
+				rds->nb_ok = 1;
+				rds->nb_unsync = 0;
+				rds->bit_count_in_block = 0;
+
+				uint16_t data = (rds->shift_reg >> 10) & 0xFFFF;
+				rds->blocks[block_index] = data;
+				rds->blocks_ok++;
+
+				LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Acquired at offset %c (hits=%d)\n",
+					'A'+block_index, rds->sync_hits[offset][pseudo_block]);
+
+				memset(rds->sync_hits, 0, sizeof(rds->sync_hits));
+				memset(rds->sync_hit_time, 0, sizeof(rds->sync_hit_time));
+			}
+		}
+	} else {
+		/* Synced Mode: Flywheel */
+		if (rds->bit_count_in_block >= 26) {
+			rds->bit_count_in_block = 0;
+			rds->blocks_received++;
+
+			uint16_t offset;
+			int valid_syndrome = rds_check_syndrome(rds->shift_reg, &offset);
+
+			if (valid_syndrome && (int)offset == rds->block_idx) {
+				uint16_t data = (rds->shift_reg >> 10) & 0xFFFF;
+				rds->blocks[rds->block_idx] = data;
+				rds->group_mask |= (1 << rds->block_idx);
+				rds->block_status[rds->block_idx] = RDS_STATUS_VALID;
+				rds->blocks_ok++;
+				rds->nb_ok++;
+				rds->errors = 0;
+			} else {
+				uint32_t corrected_block;
+				if (rds_correct_errors(rds->shift_reg, rds->block_idx, &corrected_block)) {
+					uint16_t data = (corrected_block >> 10) & 0xFFFF;
+					rds->blocks[rds->block_idx] = data;
+					rds->group_mask |= (1 << rds->block_idx);
+					rds->block_status[rds->block_idx] = RDS_STATUS_CORRECTED;
+					rds->blocks_ok++;
+					rds->nb_ok++;
+					rds->errors = 0;
+				} else {
+					rds->errors++;
+					rds->blocks_bad++;
+					rds->blocks_missing[rds->block_idx]++;
+					rds->group_error_count++;
+				}
+			}
+
+			rds->block_idx = (rds->block_idx + 1) & 0x03;
+
+			if (rds->block_idx == 0) {
+				rds_decode_group(rds);
+				rds->group_mask = 0;
+
+				if (rds->nb_ok > 0)
+					rds->nb_unsync = 0;
+				else
+					rds->nb_unsync++;
+
+				if (rds->nb_unsync >= SYNC_LOSS_GROUPS) {
+					LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Lost Sync (%d groups with no valid blocks)\n", rds->nb_unsync);
+					rds->synced = 0;
+				}
+				rds->nb_ok = 0;
+			}
+
+			rds->blocks_in_group++;
+			if (rds->blocks_in_group >= 4) {
+				float g_ber = (float)rds->group_error_count / 4.0;
+				rds->ber_accumulator -= rds->ber_history[rds->ber_history_idx];
+				rds->ber_history[rds->ber_history_idx] = g_ber;
+				rds->ber_accumulator += g_ber;
+				rds->ber_history_idx = (rds->ber_history_idx + 1) % BER_WINDOW_SIZE;
+				rds->ber_percent = (rds->ber_accumulator / BER_WINDOW_SIZE) * 100.0;
+				rds->blocks_in_group = 0;
+				rds->group_error_count = 0;
+			}
+		}
+	}
 }
 
 void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
@@ -6337,6 +7189,7 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 									}
 									rds->errors++;
 									rds->blocks_bad++;
+									rds->blocks_missing[rds->block_idx]++;
 									rds->group_error_count++;
 								}
 							}
@@ -6422,9 +7275,13 @@ void rds_decoder_status(rds_decoder_t *rds)
 {
 	char ps_display[64];   /* Larger buffer for UTF-8 + control char display */
 	char rt_display[512];  /* Larger buffer for UTF-8 + control char display */
+	rds_pi_info_t pi_info;
 	int i;
 	
 	if (rds->blocks_received < 10) return;
+	
+	/* Decode PI once for use throughout status dump */
+	rds_decode_pi(rds->pi, rds->ecc, rds->force_rbds, &pi_info);
 	
 	/* Helper: status character */
 	#define STATUS_CHAR(s) ((s) == RDS_STATUS_VALID ? '+' : \
@@ -6443,12 +7300,22 @@ void rds_decoder_status(rds_decoder_t *rds)
 	/* PI and PS with status beneath */
 	{
 		char ps_status_str[9];
-		char pi_str[32];
-		const char *call = RDS_IS_RBDS(rds->ecc) ? rds_get_callsign(rds->pi) : NULL;
+		char pi_str[80];
 
-		if (call)
-			snprintf(pi_str, sizeof(pi_str), "%04X (%s)", rds->pi, call);
-		else
+		if (pi_info.pi_note)
+			snprintf(pi_str, sizeof(pi_str), "%04X (%s)", rds->pi, pi_info.pi_note);
+		else if (pi_info.callsign)
+			snprintf(pi_str, sizeof(pi_str), "%04X (%s)", rds->pi, pi_info.callsign);
+		else if (!pi_info.cc_valid)
+			snprintf(pi_str, sizeof(pi_str), "%04X (CC=0)", rds->pi);
+		else if (rds->ecc != 0) {
+			/* ECC known -- show resolved country */
+			const char *country = rds_get_country_code(pi_info.cc, rds->ecc);
+			if (country[0] != '-')
+				snprintf(pi_str, sizeof(pi_str), "%04X (%s)", rds->pi, country);
+			else
+				snprintf(pi_str, sizeof(pi_str), "%04X", rds->pi);
+		} else
 			snprintf(pi_str, sizeof(pi_str), "%04X", rds->pi);
 
 		for (i=0; i<8; i++) {
@@ -6459,14 +7326,33 @@ void rds_decoder_status(rds_decoder_t *rds)
 		     pi_str, STATUS_CHAR(rds->pi_status), ps_display,
 		     rds->synced ? "Y" : "N",
 		     rds->ber_percent);
-		/*               PI=XXXX X  PS=" = 15 chars padding */
+		{
+			const char *ecc_note = "";
+			const char *mode_hint = "";
+			if (rds->ecc == 0 && pi_info.cc_valid) {
+				ecc_note = " (ECC unknown)";
+				/* Hint: PI looks like a valid RBDS callsign */
+				if (!pi_info.is_rbds && rds_get_callsign(rds->pi) != NULL)
+					mode_hint = " -- may be RBDS, use --rbds to force";
+			} else if (rds->force_rbds && rds->ecc != 0 && !RDS_IS_RBDS(rds->ecc)) {
+				/* RBDS forced but ECC says otherwise */
+				mode_hint = " -- RBDS forced but ECC suggests RDS";
+			}
+			LOGP(DRADIO, LOGL_NOTICE, "  CC=%X (%s%s)  Coverage=%s  Ref=%d%s  Mode=%s%s\n",
+			     pi_info.cc, pi_info.cc_name, ecc_note,
+			     pi_info.coverage_name,
+			     pi_info.ref,
+			     pi_info.ref_valid ? "" : " (not assigned)",
+			     pi_info.is_rbds ? "RBDS" : "RDS",
+			     mode_hint);
+		}
 		LOGP(DRADIO, LOGL_NOTICE, "               %s\n", ps_status_str);
 	}
 	
 	/* Flags with status */
 	{
 		char pty_name_buf[32];
-		snprintf(pty_name_buf, sizeof(pty_name_buf), "%s", rds_get_pty_name(rds->pty, RDS_IS_RBDS(rds->ecc)));
+		snprintf(pty_name_buf, sizeof(pty_name_buf), "%s", rds_get_pty_name(rds->pty, pi_info.is_rbds));
 		LOGP(DRADIO, LOGL_NOTICE, "PTY=%d %c (%s)  TP=%s %c  TA=%s %c\n",
 		     rds->pty, STATUS_CHAR(rds->pty_status), pty_name_buf,
 		     rds->tp ? "Y" : "N", STATUS_CHAR(rds->tp_status),
@@ -6550,6 +7436,32 @@ void rds_decoder_status(rds_decoder_t *rds)
 	/* Block statistics */
 	LOGP(DRADIO, LOGL_NOTICE, "Groups=%d  Blocks: OK=%ld  Bad=%ld  Total=%ld\n",
 	     rds->groups_received, rds->blocks_ok, rds->blocks_bad, rds->blocks_received);
+	if (rds->blocks_bad > 0)
+		LOGP(DRADIO, LOGL_NOTICE, "  Bad/missing per block: A=%d  B=%d  C=%d  D=%d\n",
+		     rds->blocks_missing[0], rds->blocks_missing[1],
+		     rds->blocks_missing[2], rds->blocks_missing[3]);
+	if (rds->groups_skipped_no_block_b > 0)
+		LOGP(DRADIO, LOGL_NOTICE, "  Skipped: %d group(s) with missing Block B (cannot determine group type)\n",
+		     rds->groups_skipped_no_block_b);
+
+	/* Group type distribution */
+	{
+		char dist_buf[512];
+		int pos = 0;
+		int any = 0;
+		for (int g = 0; g < 32; g++) {
+			if (rds->group_type_counts[g] > 0) {
+				pos += snprintf(dist_buf + pos, sizeof(dist_buf) - pos,
+				                "%s%d%c=%d",
+				                any ? " " : "",
+				                g >> 1, (g & 1) ? 'B' : 'A',
+				                rds->group_type_counts[g]);
+				any = 1;
+			}
+		}
+		if (any)
+			LOGP(DRADIO, LOGL_NOTICE, "Group Distribution: %s\n", dist_buf);
+	}
 
 	
 	/* PTYN (if any bits received) */
@@ -6568,24 +7480,28 @@ void rds_decoder_status(rds_decoder_t *rds)
 		LOGP(DRADIO, LOGL_NOTICE, "      %s\n", ptyn_status_str);
 	}
 	
-	/* RadioText (if any) with group version and A/B flag */
-	if (rt_display[0] != '\0') {
+	/* RadioText (if any) with group version and A/B flag.
+	 * Suppress display when no 2A/2B groups were ever received
+	 * (rt_display_version == 0xFF means RT buffer is uninitialized NULs). */
+	if (rds->rt_display_version != 0xFF && rt_display[0] != '\0') {
 		/* Note: rt_display contains UTF-8 with <XX> for control chars.
 		 * Status string is per source byte, not per display character.
 		 * For terminals, this won't align perfectly if control chars present. */
 		LOGP(DRADIO, LOGL_NOTICE, "RT[%s AB=%c]=\"%s\"\n",
-		     rds->rt_display_version == 0 ? "2A" : 
-		     rds->rt_display_version == 1 ? "2B" : "??",
+		     rds->rt_display_version == 0 ? "2A" : "2B",
 		     rds->rt_ab ? 'B' : 'A',
 		     rt_display);
 	}
 	
 	/* Extended info (if available) with status */
-	if (rds->ecc != 0 || rds->language_code != 0) {
+	if (rds->ecc_status != RDS_STATUS_NONE || rds->language_code != 0) {
 		uint8_t cc = (rds->pi >> 12) & 0x0F;
-		LOGP(DRADIO, LOGL_NOTICE, "Country=%s %c (ECC=0x%02X CC=%d)  Language=%s %c (%d)\n",
+		const char *ecc_note = "";
+		if (rds->ecc_status != RDS_STATUS_NONE && !rds_is_valid_ecc(rds->ecc))
+			ecc_note = " (not defined in EN 50067)";
+		LOGP(DRADIO, LOGL_NOTICE, "Country=%s %c (ECC=0x%02X%s CC=%d)  Language=%s %c (%d)\n",
 		     rds_get_country_code(cc, rds->ecc), STATUS_CHAR(rds->ecc_status),
-		     rds->ecc, cc,
+		     rds->ecc, ecc_note, cc,
 		     rds_get_language_name(rds->language_code), STATUS_CHAR(rds->language_status),
 		     rds->language_code);
 	}
@@ -6611,7 +7527,107 @@ void rds_decoder_status(rds_decoder_t *rds)
 	}
 	
 	LOGP(DRADIO, LOGL_NOTICE, "=======================\n");
+	
+	/* ODA Application Registry */
+	if (rds->oda_app_count > 0) {
+		LOGP(DRADIO, LOGL_NOTICE, "ODA Applications (%d registered):\n", rds->oda_app_count);
+		for (int g = 0; g < 32; g++) {
+			if (rds->oda_apps[g].registered) {
+				LOGP(DRADIO, LOGL_NOTICE, "  Group %d%c -> AID=0x%04X msg=0x%04X\n",
+				     g >> 1, (g & 1) ? 'B' : 'A',
+				     rds->oda_apps[g].aid, rds->oda_apps[g].message);
+			}
+		}
+	}
+	
+	/* RT+ tags (if received) */
+	if (rds->rtplus.tag_count > 0) {
+		LOGP(DRADIO, LOGL_NOTICE, "RT+: toggle=%d running=%d tags=%d\n",
+		     rds->rtplus.toggle, rds->rtplus.item_running, rds->rtplus.tag_count);
+		for (int t = 0; t < rds->rtplus.tag_count; t++) {
+			const char *ct_name = rds_get_rtplus_content_type(rds->rtplus.tags[t].content_type);
+			LOGP(DRADIO, LOGL_NOTICE, "  Tag%d: type=%d (%s) start=%d len=%d\n",
+			     t + 1, rds->rtplus.tags[t].content_type,
+			     ct_name ? ct_name : "Unknown",
+			     rds->rtplus.tags[t].start, rds->rtplus.tags[t].length);
+		}
+	}
+	
+	/* eRT (if received) */
+	if (rds->ert_has_complete) {
+		rds_ert_decoder_t *ert = &rds->ert_dec_complete;
+		char ert_display[513];
+		size_t display_len;
+		
+		/* Find text length (up to CR or full 128) */
+		size_t text_len = RDS_ERT_LENGTH;
+		for (size_t j = 0; j < RDS_ERT_LENGTH; j++) {
+			if (ert->ert[j] == 0x0D) { text_len = j; break; }
+		}
+		
+		if (ert->encoding == RDS_ERT_ENCODING_UTF8)
+			display_len = rds_sanitize_utf8((const char *)ert->ert, text_len,
+			                                 ert_display, sizeof(ert_display));
+		else
+			display_len = rds_ucs2_to_utf8(ert->ert, text_len,
+			                                ert_display, sizeof(ert_display));
+		
+		LOGP(DRADIO, LOGL_NOTICE, "eRT[%s]=\"%.*s\"\n",
+		     ert->encoding == RDS_ERT_ENCODING_UTF8 ? "UTF-8" : "UCS-2",
+		     (int)display_len, ert_display);
+	}
+	
+	/* EON entries (if any) */
+	if (rds->eon_count > 0) {
+		LOGP(DRADIO, LOGL_NOTICE, "EON: %d other network(s)\n", rds->eon_count);
+		for (int e = 0; e < rds->eon_count; e++) {
+			rds_eon_entry_t *eon = &rds->eon[e];
+			char on_ps_disp[9];
+			memcpy(on_ps_disp, eon->ps, 8);
+			for (int j = 0; j < 8; j++)
+				if (on_ps_disp[j] < 0x20 || on_ps_disp[j] > 0x7E)
+					on_ps_disp[j] = ' ';
+			on_ps_disp[8] = '\0';
+			LOGP(DRADIO, LOGL_NOTICE, "  ON PI=%04X PS=\"%s\" TP=%d TA=%d PTY=%d AFs=%d\n",
+			     eon->pi, on_ps_disp, eon->tp, eon->ta, eon->pty, eon->af_count);
+		}
+	}
+	
 	#undef STATUS_CHAR
+}
+
+/* Feed a pre-decoded group (4 x 16-bit blocks) directly into the decoder.
+ * This bypasses the baseband DSP/PLL/sync pipeline and goes straight to
+ * rds_decode_group(). Useful for validating the decoder against captured
+ * hex/binary RDS data (e.g. .hexrds or .rds files).
+ *
+ * blocks[4]:  The 4 data words (without checkwords)
+ * status[4]:  Decode status per block (RDS_STATUS_VALID, RDS_STATUS_NONE for missing)
+ */
+void rds_decoder_feed_group(rds_decoder_t *rds, const uint16_t blocks[4], const uint8_t status[4])
+{
+	memcpy(rds->blocks, blocks, 4 * sizeof(uint16_t));
+	memcpy(rds->block_status, status, 4 * sizeof(uint8_t));
+
+	/* Build group_mask from status: bit set = block present */
+	rds->group_mask = 0;
+	for (int i = 0; i < 4; i++) {
+		if (status[i] != RDS_STATUS_NONE)
+			rds->group_mask |= (1 << i);
+	}
+
+	/* Note: groups_received is incremented inside rds_decode_group() */
+	rds->blocks_received += 4;
+	for (int i = 0; i < 4; i++) {
+		if (status[i] != RDS_STATUS_NONE)
+			rds->blocks_ok++;
+		else {
+			rds->blocks_bad++;
+			rds->blocks_missing[i]++;
+		}
+	}
+
+	rds_decode_group(rds);
 }
 
 void rds_decoder_exit(rds_decoder_t *rds)

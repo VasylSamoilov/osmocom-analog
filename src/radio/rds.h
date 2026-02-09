@@ -287,8 +287,8 @@
 #define RDS_IS_RBDS(ecc)        ((ecc) >= RDS_ECC_RBDS_MIN && (ecc) <= RDS_ECC_RBDS_MAX)
 
 /* Detect RBDS from de-emphasis time constant (heuristic)
- * 75µs (±1µs tolerance) triggers RBDS assumption (Americas: USA, Canada, S. Korea).
- * 50µs is used in Europe/Australia/most of world (RDS).
+ * 75us (+/-1us tolerance) triggers RBDS assumption (Americas: USA, Canada, S. Korea).
+ * 50us is used in Europe/Australia/most of world (RDS).
  * This is used for initial PTY name display before ECC is received. */
 #define RDS_IS_RBDS_EMPHASIS(us)  ((us) >= 74.0 && (us) <= 76.0)
 
@@ -591,7 +591,7 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
  *   (Group 4A) for month/year context to disambiguate today vs tomorrow.
  *
  * IMPORTANT DISTINCTIONS:
- *   - PIN ≠ PTY: PIN identifies WHEN a programme starts, PTY identifies
+ *   - PIN != PTY: PIN identifies WHEN a programme starts, PTY identifies
  *     WHAT content type is currently playing
  *   - PIN was for specific programme items from published schedules,
  *     NOT for searching by category (that's PTY's job)
@@ -739,13 +739,12 @@ typedef struct {
  * Block C:
  *   bits 15-13: tag1 content_type[2:0] (low 3 bits)
  *   bits 12-7: tag1 start (6 bits, 0-63)
- *   bits 6-1: tag1 length-1 (6 bits, 0-63 → length 1-64)
- *   bit 0: tag2 content_type[5:4] (high 2 bits, if tag2 exists)
+ *   bits 6-1: tag1 length-1 (6 bits, 0-63 -> length 1-64)
+ *   bit 0: tag2 content_type[5] (high 1 bit, if tag2 exists)
  * Block D:
- *   bits 15-12: tag2 content_type[3:0] (low 4 bits, if tag2 exists)
- *   bits 11-6: tag2 start (6 bits, 0-63)
- *   bits 5-1: tag2 length-1 (5 bits, 0-31 → length 1-32)
- *   bit 0: spare
+ *   bits 15-11: tag2 content_type[4:0] (low 5 bits, if tag2 exists)
+ *   bits 10-5: tag2 start (6 bits, 0-63)
+ *   bits 4-0: tag2 length-1 (5 bits, 0-31 -> length 1-32)
  * ============================================================ */
 #define RDS_RTPLUS_TOGGLE_BIT         4       /* Block B bit 4: item toggle */
 #define RDS_RTPLUS_TOGGLE_MASK        0x0010
@@ -922,8 +921,8 @@ typedef struct {
  * eRT+ Tags:
  *   - eRT+ tags address CHARACTER position in string, not byte position!
  *   - This is critical for UTF-8 where multi-byte characters exist
- *   - Example: "Café" = 4 characters, 5 bytes (é = 2 bytes UTF-8)
- *     Tag with start=3, length=1 should extract "é" (2 bytes), not byte 3
+ *   - Example: "Cafe" = 4 characters, 5 bytes (e = 2 bytes UTF-8)
+ *     Tag with start=3, length=1 should extract "e" (2 bytes), not byte 3
  *   - eRT+ tags can address the full 128 characters of eRT text
  *   - Note: RT+ is limited to 64 characters for standard RT and combination of RT+ with eRT (without eRT+)
  * ============================================================ */
@@ -939,13 +938,34 @@ typedef struct {
 #define RDS_ERT_3A_CHARTABLE_SHIFT    2
 /* Bits 6-15 are RFU (Reserved for Future Use) and must be set to 0 */
 #define RDS_ERT_3A_RFU_MASK           0xFFC0  /* Bits 15-6: RFU (must be 0) */
-#define RDS_ERT_3A_CB_BIT             12      /* Group 3A message bit 12: CB flag (RT+ only) */
-#define RDS_ERT_3A_CB_MASK            0x1000
-#define RDS_ERT_3A_SCB_BITS           8       /* Group 3A message bits 11-8: SCB (RT+ only) */
-#define RDS_ERT_3A_SCB_MASK           0x0F00
-#define RDS_ERT_3A_SCB_SHIFT          8
-#define RDS_ERT_3A_TEMPLATE_BITS      0       /* Group 3A message bits 7-0: template (RT+ only) */
-#define RDS_ERT_3A_TEMPLATE_MASK      0x00FF
+
+/* ============================================================
+ * RT+ Group 3A Message Bits (EBU Technical Review, July 2006)
+ *
+ * Block C of Group 3A carries ODA-specific control data.
+ * For RT+ (AID=0x4BD7), the 16-bit message layout is:
+ *
+ *   b15 b14 b13  b12   b11 b10 b9 b8   b7 b6 b5 b4 b3 b2 b1 b0
+ *   rfu rfu rfu  CB    --- SCB ------   ------ Template number --
+ *
+ *   CB flag (b12):     0 = no template available
+ *                      1 = template available for ongoing programme
+ *   SCB (b11-b8):      Server Control Bits - distinguishes programmes
+ *                      sharing the same PI code (e.g. regional stations)
+ *   Template (b7-b0):  Template number for receiver display layout
+ *                      (only meaningful when CB=1)
+ *   rfu (b15-b13):     Reserved, must be 0
+ *
+ * Standard value: 0x0000 (no template, no SCB, all rfu=0)
+ * This matches all known real-world RT+ implementations (KCRC, etc.)
+ * ============================================================ */
+#define RDS_RTPLUS_3A_CB_BIT          12      /* Group 3A message bit 12: CB flag */
+#define RDS_RTPLUS_3A_CB_MASK         0x1000
+#define RDS_RTPLUS_3A_SCB_BITS        8       /* Group 3A message bits 11-8: SCB */
+#define RDS_RTPLUS_3A_SCB_MASK        0x0F00
+#define RDS_RTPLUS_3A_SCB_SHIFT       8
+#define RDS_RTPLUS_3A_TEMPLATE_BITS   0       /* Group 3A message bits 7-0: template number */
+#define RDS_RTPLUS_3A_TEMPLATE_MASK   0x00FF
 
 /* eRT Group 3A Message Construction Helpers
  * According to IEC 62106-6:
@@ -1415,8 +1435,114 @@ typedef struct rds_encoder {
 	int			group_sched_len;
 	int			group_sched_index;
 	
-
-
+	/* ============================================================
+	 * Dynamic PS (Scrolling Programme Service Name)
+	 * ============================================================
+	 *
+	 * HISTORICAL CONTEXT:
+	 *   Scrolling PS was never part of the RDS standard (IEC 62106).
+	 *   It was a de facto practice used by European commercial broadcasters
+	 *   from the late 1990s onward. Broadcasters exploited the fact that
+	 *   receivers simply display whatever 8-character PS string they last
+	 *   decoded, so by rapidly overwriting PS with shifted windows of a
+	 *   longer message, the display appeared to scroll.
+	 *
+	 *   The EBU and ITU have repeatedly discouraged this practice because:
+	 *   - It violates the PS field's intended purpose (static station ID)
+	 *   - It causes display flicker on receivers with PS stability timers
+	 *   - It can confuse station preset memory on car radios
+	 *   - RadioText (RT) is the proper field for dynamic messages
+	 *
+	 *   Nevertheless, dynamic PS remains widely used in practice.
+	 *
+	 * SCROLLING PATTERNS SUPPORTED:
+	 *
+	 *   RDS_DPS_SCROLL (Window shift / character scroll):
+	 *     The de facto standard. Text is padded with spaces and shifted
+	 *     one character at a time through an 8-character window.
+	 *     Example for "NOW PLAYING SONG":
+	 *       "  NOW PL" -> " NOW PLA" -> "NOW PLAY" -> "OW PLAYI" -> ...
+	 *     Used heavily by European commercial stations.
+	 *     Step size: 1 character. Recommended update: 500-1000ms.
+	 *
+	 *   RDS_DPS_WORD (Word-step scrolling):
+	 *     Instead of character-by-character scrolling, full words are
+	 *     swapped. Less flicker on slow receivers.
+	 *     Example: "NOW PLAY" -> "PLAYING " -> "SONG    "
+	 *     Popular on German and Nordic broadcasts.
+	 *     Recommended update: 1000-2000ms.
+	 *
+	 *   RDS_DPS_PAGE (Paging / alternating messages):
+	 *     Two or more fixed 8-char PS strings alternate.
+	 *     Example: "RADIO 1 " -> "HOT HITS" -> "RADIO 1 " -> ...
+	 *     Technically not scrolling. Considered less abusive by regulators.
+	 *     Recommended update: 2000-4000ms.
+	 *
+	 * TIMING AND RECEIVER COMPATIBILITY:
+	 *
+	 *   The update_interval_ms parameter controls how often the PS window
+	 *   advances. This is measured in COMPLETED PS TRANSMISSIONS, not
+	 *   wall-clock time, because:
+	 *
+	 *   1. Each PS transmission requires 4 Group 0 transmissions (segments
+	 *      0-3), each carrying 2 characters. A full PS = 4 groups.
+	 *
+	 *   2. At 1187.5 bps with 104 bits/group = ~11.4 groups/second.
+	 *      With ~50% Group 0 allocation, that's ~5.7 Group 0/sec.
+	 *      So one full PS cycle takes ~0.7 seconds minimum.
+	 *
+	 *   3. Many real-world encoders repeated each PS value 2-4 times
+	 *      before advancing, to ensure receivers with PS stability
+	 *      timers (1-2 seconds) could latch the value.
+	 *
+	 *   The ps_dyn_repeat parameter controls how many complete PS
+	 *   transmissions (4 segments each) occur before advancing to the
+	 *   next scroll position. Recommended: 2-4 repeats.
+	 *
+	 *   MINIMUM TIMING (ps_dyn_repeat=1):
+	 *     ~0.7s per step. This is the absolute fastest and will cause
+	 *     flicker/missed updates on many receivers. Use only for testing.
+	 *
+	 *   RECOMMENDED TIMING (ps_dyn_repeat=3):
+	 *     ~2.1s per step. Compatible with most receivers including
+	 *     early Philips/Blaupunkt tuners and automotive head units
+	 *     with PS debounce filters.
+	 *
+	 *   CONSERVATIVE TIMING (ps_dyn_repeat=5):
+	 *     ~3.5s per step. Safe for all known receivers.
+	 *
+	 * RECEIVER-SIDE BEHAVIOR THAT SHAPED THESE PATTERNS:
+	 *   - PS stability timer (1-2s): Some radios only update PS after
+	 *     two identical full decodes
+	 *   - Some radios blank PS if it changes too often
+	 *   - Car radios often cache the first stable PS and ignore later
+	 *     updates until signal loss
+	 *   - This is why broadcasters repeated each PS value many times,
+	 *     avoided fast scrolling, and used trailing spaces instead of
+	 *     wraparound jumps
+	 * ============================================================ */
+	
+	/* Dynamic PS state */
+	int		ps_dyn_enabled;		/* 1 if dynamic PS is active */
+	int		ps_dyn_mode;		/* RDS_DPS_SCROLL, _WORD, or _PAGE */
+	char		ps_dyn_text[256];	/* Full message text (RDS-encoded) */
+	int		ps_dyn_text_len;	/* Length of full message */
+	int		ps_dyn_scroll_pos;	/* Current scroll position (char offset) */
+	int		ps_dyn_repeat;		/* Repeats per PS value before advancing */
+	int		ps_dyn_repeat_count;	/* Current repeat counter */
+	int		ps_dyn_ps_cycles;	/* Completed PS cycles (4 segments = 1 cycle) */
+	char		ps_dyn_static_ps[9];	/* Saved static PS for restore on stop */
+	char		ps_dyn_delimiter;	/* Page delimiter char (default '|', 0 = '|') */
+	
+	/* Word-step mode: pre-computed word boundaries */
+	int		ps_dyn_word_offsets[32];/* Start offset of each 8-char word page */
+	int		ps_dyn_word_count;	/* Number of word pages */
+	int		ps_dyn_word_index;	/* Current word page index */
+	
+	/* Page mode: pre-computed page list */
+	char		ps_dyn_pages[32][9];	/* Up to 32 alternating 8-char pages */
+	int		ps_dyn_page_count;	/* Number of pages */
+	int		ps_dyn_page_index;	/* Current page index */
 	
 } rds_encoder_t;
 
@@ -1529,6 +1655,111 @@ uint16_t rds_enc_get_pi(const rds_encoder_t *rds);
 void rds_enc_set_ps(rds_encoder_t *rds, const char *ps);
 void rds_enc_clear_ps(rds_encoder_t *rds);
 void rds_enc_get_ps(const rds_encoder_t *rds, char *ps, size_t len);
+
+/* ============================================================
+ * Dynamic PS (Scrolling Programme Service Name)
+ * ============================================================
+ * Extends the static 8-character PS with time-sequenced overwriting
+ * to create the appearance of scrolling text on receiver displays.
+ *
+ * WARNING: Dynamic PS is NOT part of the RDS standard (IEC 62106).
+ * The EBU discourages its use. RadioText (Group 2A) is the proper
+ * mechanism for dynamic text. Use dynamic PS only when you
+ * specifically need receiver-display scrolling for legacy reasons.
+ *
+ * Usage:
+ *   rds_enc_set_dynamic_ps(rds, "NOW PLAYING: BOHEMIAN RHAPSODY BY QUEEN",
+ *                          RDS_DPS_SCROLL, 3, 0);
+ *
+ * Page mode with default '|' delimiter:
+ *   rds_enc_set_dynamic_ps(rds, "RADIO 1 |HOT HITS|98.5 FM ",
+ *                          RDS_DPS_PAGE, 5, 0);
+ *
+ * Page mode with '\n' delimiter (allows '|' in display):
+ *   rds_enc_set_dynamic_ps(rds, "||||||||\\nOSMO FM \\n||||||||",
+ *                          RDS_DPS_PAGE, 1, '\n');
+ *
+ * To stop scrolling and return to static PS:
+ *   rds_enc_stop_dynamic_ps(rds);
+ *   rds_enc_set_ps(rds, "RADIO 1 ");
+ * ============================================================ */
+
+/* Dynamic PS scrolling modes */
+typedef enum {
+	/* Character-by-character window shift (most common historical pattern).
+	 * Text is padded with leading/trailing spaces and shifted 1 char at a time.
+	 * De facto standard used by most European commercial stations. */
+	RDS_DPS_SCROLL = 0,
+	
+	/* Word-step scrolling. Full words are swapped rather than character-scrolled.
+	 * Fewer PS changes, less flicker on slow receivers.
+	 * Popular on German and Nordic broadcasts. */
+	RDS_DPS_WORD = 1,
+	
+	/* Paging / alternating fixed messages. Two or more 8-char strings alternate.
+	 * Input text is split on a configurable delimiter (default '|'):
+	 *   "RADIO 1 |HOT HITS|98.5 FM "
+	 * Technically not scrolling. Considered least abusive by regulators. */
+	RDS_DPS_PAGE = 2
+} rds_dynamic_ps_mode_t;
+
+/* Recommended repeat counts for different receiver compatibility levels.
+ * These are in units of COMPLETE PS TRANSMISSIONS (4 Group 0 groups each).
+ * Actual wall-clock time depends on the scheduler's Group 0 allocation.
+ * The API logs the computed approximate interval at setup time. */
+#define RDS_DPS_REPEAT_FAST     1   /* 1 PS tx/step - fastest, causes flicker */
+#define RDS_DPS_REPEAT_NORMAL   3   /* 3 PS tx/step - compatible with most receivers */
+#define RDS_DPS_REPEAT_SAFE     5   /* 5 PS tx/step - safe for all known receivers */
+
+/**
+ * Enable dynamic PS (scrolling/paging programme service name).
+ *
+ * Takes a string longer than 8 characters and scrolls it through the
+ * 8-character PS display using the specified mode and repeat count.
+ *
+ * For strings <= 8 characters, this falls back to static PS (no scrolling).
+ *
+ * @param rds     Encoder state
+ * @param text    Full message text (UTF-8, will be converted to RDS charset).
+ *                For RDS_DPS_PAGE mode, use a delimiter to separate pages
+ *                (default '|'): "RADIO 1 |HOT HITS|98.5 FM "
+ * @param mode    Scrolling mode (RDS_DPS_SCROLL, RDS_DPS_WORD, RDS_DPS_PAGE)
+ * @param repeat  Number of complete PS transmissions per scroll step.
+ *                Each PS transmission = 4 Group 0 groups. The actual
+ *                wall-clock time per step depends on the scheduler's
+ *                Group 0 allocation (logged at setup time).
+ *                Minimum: 1 (fastest - WARNING: causes flicker on many receivers)
+ *                Recommended: 3 (normal - compatible with most receivers)
+ *                Conservative: 5 (safe for all known receivers)
+ *                Values < 1 are clamped to 1 with a warning.
+ * @param delimiter  Page delimiter character for RDS_DPS_PAGE mode.
+ *                   Pass 0 or '|' for the default pipe delimiter.
+ *                   Use '\n' to allow '|' in page content.
+ *                   Ignored for SCROLL and WORD modes.
+ */
+void rds_enc_set_dynamic_ps(rds_encoder_t *rds, const char *text,
+                            rds_dynamic_ps_mode_t mode, int repeat,
+                            char delimiter);
+
+/**
+ * Stop dynamic PS and return to static PS mode.
+ * The current PS display value is frozen (not cleared).
+ * Call rds_enc_set_ps() afterwards to set a new static PS.
+ */
+void rds_enc_stop_dynamic_ps(rds_encoder_t *rds);
+
+/**
+ * Check if dynamic PS is currently active.
+ * @return 1 if scrolling/paging is active, 0 if static PS
+ */
+int rds_enc_is_dynamic_ps(const rds_encoder_t *rds);
+
+/**
+ * Get the full dynamic PS source text.
+ * @param text  Output buffer (should be at least 256 bytes)
+ * @param len   Buffer size
+ */
+void rds_enc_get_dynamic_ps_text(const rds_encoder_t *rds, char *text, size_t len);
 
 /* PTY (Programme Type) - 5-bit program type code (0-31) */
 void rds_enc_set_pty(rds_encoder_t *rds, uint8_t pty);
@@ -1651,6 +1882,10 @@ typedef struct rds_decoder {
 	double		samplerate;	/* sample rate of signal */
 	int		debug;		/* debug logging */
 	int		verbose;	/* verbose logging (human-readable) */
+	int		force_rbds;	/* force RBDS decoding (--rbds flag) */
+	double		time_constant_us; /* de-emphasis time constant (50=RDS, 75=RBDS) */
+	int		rbds_hint_logged; /* 1 after emphasis/mode mismatch hint logged */
+	int		ecc_mismatch_logged; /* 1 after ECC vs mode mismatch logged */
 	
 	/* Tunable State */
 	double		freq_subcarrier;	/* Current locked frequency (~57000 Hz) */
@@ -1711,6 +1946,11 @@ typedef struct rds_decoder {
 	long		blocks_ok;
 	long		blocks_bad;
 	double		ber_percent;
+	int		groups_skipped_no_block_b;	/* Groups skipped: Block B missing */
+	int		blocks_missing[4];		/* Per-block missing counts [A,B,C,D] */
+	
+	/* Group type distribution counters (0A=0, 0B=1, 1A=2, ... 15B=31) */
+	int		group_type_counts[32];
 	
 	/* Decoded data */
 	uint16_t	pi;
@@ -1745,7 +1985,10 @@ typedef struct rds_decoder {
 	rds_af_collector_t af_collector;
 	
 	char		ps[9];
+	char		ps_prev[9];		/* Previous PS (segment-level, for scrolling) */
+	char		ps_prev_successful[9];	/* Previous successful full PS decode */
 	uint8_t		ps_status[8];	/* Per-char status: enum rds_decode_status */
+	int		ps_changes;	/* Number of PS string changes (scrolling) */
 	
 	/* Group 2A/2B: RadioText (IEC 62106 S6.1.5.3)
 	 * EN 50067: "A mixture of type 2A and type 2B groups must not be used
@@ -1849,8 +2092,9 @@ typedef struct rds_decoder {
 /* Initialize RDS decoder
  * debug: Enable debug logging (raw hex codes, --rds-debug)
  * verbose: Enable verbose/info logging (human-readable, --rds-verbose)
+ * force_rbds: Force RBDS decoding (callsign + US PTY names, --rbds)
  */
-int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us);
+int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us, int force_rbds);
 
 /* Process FM baseband samples, extract RDS data
  * pilot_phase: current 19 kHz pilot phase from stereo decoder (or free-run if 0)
@@ -1858,6 +2102,15 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
  */
 void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
                          double pilot_phase, double pilot_phasestep);
+
+/* Feed a pre-decoded group directly into the decoder (bypasses DSP/PLL/sync).
+ * blocks[4]: 4 data words, status[4]: decode status per block */
+void rds_decoder_feed_group(rds_decoder_t *rds, const uint16_t blocks[4], const uint8_t status[4]);
+
+/* Feed a single decoded bit into the decoder's sync state machine.
+ * Bypasses DSP/PLL/biphase -- used for binary .rds bitstream files.
+ * bit: 0 or 1 (MSB first, matching RDS over-the-air bit order). */
+void rds_decoder_feed_bit(rds_decoder_t *rds, int bit);
 
 /* Get decoded data (returns 1 if new data available) */
 /* Get decoded PI (Programme Identification) - returns 1 if new data available */

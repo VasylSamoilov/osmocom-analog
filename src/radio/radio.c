@@ -166,6 +166,16 @@ typedef struct rds_preset {
 		uint16_t	message;			/* Group 3A message (encoding, direction, chartable) */
 		const char	*text;			/* eRT text (128 bytes max, UTF-8) */
 	} ert;
+	
+	/* Dynamic PS (Scrolling Programme Service Name)
+	 * If dps_text is non-NULL, dynamic PS is enabled for this preset.
+	 * The PS field is still used as the initial/fallback static PS. */
+	struct {
+		const char	*text;		/* Full scrolling text (NULL = disabled) */
+		uint8_t		mode;		/* RDS_DPS_SCROLL=0, RDS_DPS_WORD=1, RDS_DPS_PAGE=2 */
+		uint8_t		repeat;		/* PS transmissions per step (1=fast, 3=normal, 5=safe) */
+		char		delimiter;	/* Page delimiter for PAGE mode (0 = default '|') */
+	} dps;
 
 } rds_preset_t;
 
@@ -188,16 +198,22 @@ static const rds_preset_t rds_presets[] = {
 		 * Here: 6 (Ukraine) + A (Regional 7) + CE (Ref) */
 		.pi       = 0x6ACE,
 		.ps       = "Osmo RDS",
-		/* 64-char RT (max for Group 2A) - use full capacity for demo */
-		.rt       = "osmocom-analog FM Radio - Open Source Broadcast FM RDS Encoder!",
+		/* 64-char RT (max for Group 2A) */
+		.rt       = "osmocom-analog FM RDS Radio - Open Source Broadcast FM Encoder!",
 		.pty      = 10,		/* Pop music (RDS) */
 		.ptyn     = "OsmoPTYN",
 		.tp       = 1,
 		.ms       = 1,
 		.ecc      = 0xE4,	/* Ukraine with PI prefix 6 */
 		.lang     = 73,		/* Ukrainian (LIC code from IEC 62106 Annex J) */
-		/* AF Method A with LF frequency (AM simulcast at 225 kHz) */
-		.af_method_a_str = "LF225",
+		/* AF Method A: VHF only -- LF/MF AF decodes fine with open-source
+		 * RDS decoders but no hardware receiver to confirm tuning.
+		 * EN 50067 Table 12 LF/MF codes (9 kHz, ITU Regions 1&3):
+		 *   LF: code 1-15 -> freq = 144 + 9*code kHz (153-279 kHz)
+		 *   MF: code 16-135 -> freq = 522 + 9*(code-15) kHz (531-1602 kHz)
+		 * Encoded as [250, code] pair. */
+		.af_method_a_str = "100.0, 104.5, 98.2",
+		/* .af_method_a_str = "100.0, 104.5, 98.2, LF225", */
 		/* Group 1A PIN - Legacy "VCR-like" recording feature (1984-1990s)
 		 * Example: "Evening News" listed in newspaper as starting 18:00 on 15th.
 		 * User enters PIN (day=15, 18:00) into receiver; when station transmits
@@ -242,41 +258,43 @@ static const rds_preset_t rds_presets[] = {
 		},
 		.eon_count = 2,
 		/* RT+ (RadioText Plus) Configuration
-		 * Field: .rt[0:13] = "osmocom-analog" (artist, 14 chars)
-		 * Field: .rt[15:22] = "FM Radio" (station name, 8 chars)
-		 * Value source: content_type from RT+ spec constants, start/length from .rt field positions */
+		 * 
+		 * RadioText: "osmocom-analog FM RDS Radio\r"
+		 *             ^0              ^15
+		 * 
+		 * Tag1: item.artist (type=4) "osmocom-analog" at positions 0-13 (14 chars)
+		 * Tag2: item.title  (type=1) "FM RDS Radio" at positions 15-26 (12 chars) */
 		.rtplus = {
 			.enabled = 1,
-			.carrier_group = RDS_GROUP_11A,	/* Group 11A for RT+ ODA */
-			.message = 0x0000,		/* cb=0, scb=0, template=0 (RT+ default) */
+			.carrier_group = RDS_GROUP_12A,	/* Group 12A for RT+ ODA */
+			.message = 0x0000,		/* 3A msg: cb=0 (no template), scb=0, template=0 */
 			.toggle = 0,
-			.item_running = 1,
+			.item_running = 1,		/* 1 = song is currently playing */
 			.tags = {
-				{ .content_type = RDS_RTPLUS_CT_ITEM_ARTIST, .start = 0, .length = 14 },	/* item.artist: "osmocom-analog" (positions 0-13) */
-				{ .content_type = RDS_RTPLUS_CT_STATIONNAME_SHORT, .start = 15, .length = 8 },	/* stationname.short: "FM Radio" (positions 15-22) */
+				{ .content_type = RDS_RTPLUS_CT_ITEM_ARTIST, .start = 0, .length = 14 },	/* "osmocom-analog" */
+				{ .content_type = RDS_RTPLUS_CT_ITEM_TITLE, .start = 15, .length = 12 },	/* "FM RDS Radio" */
 			},
 			.tag_count = 2,
 		},
-		/* eRT+ (Enhanced RadioText Plus) Configuration
+		/* eRT+ (Enhanced RadioText Plus) Configuration - Artist/Title tags
 		 * IEC 62106-6:2018 Annex C: RT+ tags use CHARACTER positions (0-63 max)
 		 * The 6-bit start marker limits tagging to first 64 CHARACTERS of eRT
 		 * 
-		 * eRT text (64 chars, 69 bytes UTF-8):
-		 *   "The Beatles | Hey Jude | Album: 1967-1970 | Weather: 22°C | Київ"
-		 *    ^0         ^11       ^22      ^41                 ^53     ^60
+		 * eRT text: "osmocom-analog — Analoge Funktechnik · Open Source FM RDS Encoder"
+		 *            ^0               ^17                   ^40
 		 * 
 		 * Character positions (NOT byte positions):
-		 *   - "22°C" at char 53-56 (4 chars, 5 bytes: 2+2+°+C where ° is 2 bytes)
-		 *   - "Київ" at char 60-63 (4 chars, 8 bytes: 4 Cyrillic x 2 bytes each) */
+		 *   - "osmocom-analog" at char 0-13 (14 chars)
+		 *   - "Analoge Funktechnik" at char 17-35 (19 chars) */
 		.ert_plus = {
-			.enabled = 1,
+			.enabled = 0,	/* Disabled for RT+ debugging */
 			.carrier_group = RDS_GROUP_13A,	/* Group 13A for eRT+ ODA (different from RT+ on 11A) */
 			.message = 0x0000,		/* cb=0, scb=0, template=0 (eRT+ default) */
 			.toggle = 0,
 			.item_running = 1,
 			.tags = {
-				{ .content_type = RDS_RTPLUS_CT_INFO_WEATHER, .start = 53, .length = 4 },	/* "22°C" chars 53-56 */
-				{ .content_type = RDS_RTPLUS_CT_INFO_OTHER, .start = 60, .length = 4 },		/* "Київ" chars 60-63 */
+				{ .content_type = RDS_RTPLUS_CT_ITEM_ARTIST, .start = 0, .length = 14 },	/* "osmocom-analog" chars 0-13 */
+				{ .content_type = RDS_RTPLUS_CT_ITEM_TITLE, .start = 17, .length = 19 },	/* "Analoge Funktechnik" chars 17-35 */
 			},
 			.tag_count = 2,
 		},
@@ -284,13 +302,15 @@ static const rds_preset_t rds_presets[] = {
 		 * IEC 62106-6:2018 Annex C: eRT supports 128 bytes (32 segments x 4 bytes)
 		 * but RT+ can only tag first 64 CHARACTERS
 		 * 
-		 * This text: 64 characters, 69 bytes (° = 2 bytes, Київ = 8 bytes)
+		 * This text uses UTF-8 em-dash (—) and middle dot (·) to demonstrate
+		 * eRT's extended character support beyond basic ASCII RadioText.
+		 * 65 characters, 69 bytes (— = 3 bytes, · = 2 bytes)
 		 * Terminated with CR if < 128 bytes */
 		.ert = {
-			.enabled = 1,
-			.carrier_group = RDS_GROUP_12A,	/* Group 12A for eRT ODA */
+			.enabled = 0,	/* Disabled -- eRT eats 30% bandwidth, most receivers don't support it */
+			.carrier_group = RDS_GROUP_11A,	/* Group 11A for eRT ODA (swapped with RT+ now on 12A) */
 			.message = RDS_ERT_3A_MSG_UTF8_LTR_E3,	/* UTF-8 encoding, LTR direction, E3 chartable */
-			.text = "The Beatles | Hey Jude | Album: 1967-1970 | Weather: 22°C | Київ",
+			.text = "osmocom-analog — Analoge Funktechnik · Open Source FM RDS Encoder",
 		},
 		/* ============================================================
 		 * RT+ (RadioText Plus) and eRT (Enhanced RadioText) Examples
@@ -463,6 +483,189 @@ static const rds_preset_t rds_presets[] = {
 		 * ============================================================
 		 */
 	},
+	/* ============================================================
+	 * DYNAMIC PS DEMO PRESETS
+	 * ============================================================
+	 * Three presets demonstrating the three historical scrolling
+	 * patterns used by European broadcasters. Press 'f' to cycle.
+	 * ============================================================ */
+	{
+		/* Pattern 1: Window shift (character scroll) - de facto standard.
+		 * Text slides through the 8-char display one character at a time.
+		 * Most common pattern used by European commercial stations. */
+		.name     = "DynPS Scroll",
+		.pi       = 0x6AD1,
+		.ps       = "SCROLL  ",	/* Initial static PS (shown briefly during warmup) */
+		.rt       = "Dynamic PS Scroll Demo - Character-by-character window shift",
+		.pty      = 10,
+		.ms       = 1,
+		.dps      = {
+			.text   = "NOW PLAYING BOHEMIAN RHAPSODY BY QUEEN",
+			.mode   = RDS_DPS_SCROLL,
+			.repeat = RDS_DPS_REPEAT_NORMAL,	/* 3 PS tx/step */
+		},
+	},
+	{
+		/* Pattern 2: Word-step scrolling - receiver-friendly.
+		 * Full words swapped instead of character scrolling.
+		 * Popular on German and Nordic broadcasts. */
+		.name     = "DynPS Word",
+		.pi       = 0x6AD2,
+		.ps       = "WORDSTEP",
+		.rt       = "Dynamic PS Word Demo - Word-aligned page stepping",
+		.pty      = 10,
+		.ms       = 1,
+		.dps      = {
+			.text   = "OSMOCOM ANALOG OPEN SOURCE FM RADIO",
+			.mode   = RDS_DPS_WORD,
+			.repeat = RDS_DPS_REPEAT_NORMAL,
+		},
+	},
+	{
+		/* Pattern 3: Paging / alternating messages.
+		 * Fixed 8-char strings alternate. Pages separated by '|'.
+		 * Considered least abusive by regulators. */
+		.name     = "DynPS Page",
+		.pi       = 0x6AD3,
+		.ps       = "PAGING  ",
+		.rt       = "Dynamic PS Page Demo - Alternating fixed messages",
+		.pty      = 10,
+		.ms       = 1,
+		.dps      = {
+			.text   = "RADIO 1 |HOT HITS|98.5 FM ",
+			.mode   = RDS_DPS_PAGE,
+			.repeat = RDS_DPS_REPEAT_SAFE,	/* 5 PS tx/step - slow alternation */
+		},
+	},
+	{
+		/* Fast page demo: repeat=1 pushes speed to the absolute limit.
+		 * Each page shown for only one PS cycle (~0.7s). Designed to
+		 * look good on alphanumeric segmented displays (8-char LCD/VFD).
+		 *
+		 * Uses '\n' as page delimiter so '|' can appear on display
+		 * (vertical bars make great curtain/border effects on VFD).
+		 *
+		 * ASCII animation effects:
+		 *   - Curtain open (||| bars part from center)
+		 *   - Typewriter text reveal with blinking cursor
+		 *   - Wipe transition (========)
+		 *   - Center pop with sparkle burst
+		 *   - Bouncing dot (ping-pong)
+		 *   - Expanding brackets with text fill
+		 *   - Curtain close (||| bars close)
+		 *   - Slot machine spin
+		 *   - Strobe flash finale
+		 *
+		 * ~80 pages at ~0.7s each = ~56s full cycle. */
+		.name     = "DynPS Fast",
+		.pi       = 0x6AD4,
+		.ps       = "FASTPAGE",
+		.rt       = "Dynamic PS Fast Page Demo - ASCII animation on 8-char display",
+		.pty      = 10,
+		.ms       = 1,
+		.dps      = {
+			.delimiter = '\n',
+			.text   =
+			/* --- Act 1: Curtain open (| bars part from center) --- */
+			"||||||||\n"
+			"|||  |||\n"
+			"||    ||\n"
+			"|      |\n"
+			"        \n"
+			/* --- Act 2: Typewriter reveal "OSMO FM" --- */
+			"O_      \n"
+			"OS_     \n"
+			"OSM_    \n"
+			"OSMO_   \n"
+			"OSMO _  \n"
+			"OSMO F_ \n"
+			"OSMO FM \n"
+			"OSMO FM \n"  /* hold */
+			/* --- Act 3: Wipe right erases --- */
+			"=SMO FM \n"
+			"==MO FM \n"
+			"===O FM \n"
+			"==== FM \n"
+			"=====FM \n"
+			"======M \n"
+			"======= \n"
+			"========\n"
+			/* --- Act 4: Wipe continues right, clears --- */
+			" =======\n"
+			"  ======\n"
+			"   =====\n"
+			"    ====\n"
+			"     ===\n"
+			"      ==\n"
+			"       =\n"
+			"        \n"
+			/* --- Act 5: Center pop "RDS" --- */
+			"   *    \n"
+			"  *R*   \n"
+			" * R *  \n"
+			"  RDS   \n"
+			"  RDS   \n"  /* hold */
+			/* --- Act 6: Sparkle around RDS --- */
+			"* RDS  *\n"
+			" *RDS*  \n"
+			"* RDS *.\n"
+			".*RDS*. \n"
+			". RDS . \n"
+			"  RDS   \n"
+			/* --- Act 7: Bouncing dot --- */
+			".       \n"
+			" .      \n"
+			"  .     \n"
+			"   .    \n"
+			"    .   \n"
+			"     .  \n"
+			"      . \n"
+			"       .\n"
+			"      . \n"
+			"     .  \n"
+			"    .   \n"
+			"   .    \n"
+			"  .     \n"
+			" .      \n"
+			".       \n"
+			/* --- Act 8: Expanding brackets reveal RADIO --- */
+			"   ..   \n"
+			"  .  .  \n"
+			" .    . \n"
+			"[      ]\n"
+			"[ R    ]\n"
+			"[ RA   ]\n"
+			"[ RAD  ]\n"
+			"[ RADI ]\n"
+			"[RADIO ]\n"
+			"[RADIO ]\n"  /* hold */
+			/* --- Act 9: Curtain close (| bars close from edges) --- */
+			"|RADIO |\n"
+			"|RADIO |\n"
+			"||ADIO||\n"
+			"||DIO ||\n"
+			"|||IO|||\n"
+			"||||O|||\n"
+			"||||||||\n"
+			"        \n"
+			/* --- Act 10: Slot machine spin --- */
+			"--OPEN--\n"
+			"=SOURCE=\n"
+			"--OPEN--\n"
+			"=SOURCE=\n"
+			"  -FM-  \n"
+			" =RDS=  \n"
+			"  -FM-  \n"
+			/* --- Act 11: Strobe flash finale --- */
+			"*OSMO*FM\n"
+			"        \n"
+			"*OSMO*FM\n"
+			"        \n"
+			"*OSMO*FM",
+			.mode   = RDS_DPS_PAGE,
+			.repeat = 2,	/* 2 PS tx/step (~1.4s) - fast but readable */
+		},
+	},
 	{
 		.name     = "USA (RBDS)",
 		/*.pi       = 0xABCD,*/	/* PI=Axxx = USA/RBDS region */
@@ -482,6 +685,15 @@ static const rds_preset_t rds_presets[] = {
 		.ecc      = 0xA0,	/* USA (RBDS region) with PI prefix A */
 		.lang     = 9,		/* English */
 		.af_method_a_str = "92.5, 97.5, 102.5",
+		/* RBDS MF AF (ITU Region 2, NRSC-4-B, no LF broadcasting):
+		 *   MF code = 16 + (freq_kHz - 530) / 10 (10 kHz spacing)
+		 *   e.g. 1010 kHz -> code 64
+		 * vs RDS (ITU Regions 1&3, EN 50067 Table 12):
+		 *   LF: code 1-15 -> 144 + 9*code kHz (153-279 kHz)
+		 *   MF: code 16-135 -> 522 + 9*(code-15) kHz (531-1602 kHz)
+		 * Both encoded as [250, code] pair. Decodes fine with
+		 * open-source RDS decoders, no hardware receiver to test. */
+		/* .af_method_a_str = "92.5, 97.5, 102.5, MF1010", */
 		/* Group 1A PIN - not used (0x0000 = most common value)
 		 * Many US stations don't use PIN, so we demonstrate day=0 */
 		.pin_day  = 0, .pin_hour = 0, .pin_minute = 0,
@@ -492,7 +704,7 @@ static const rds_preset_t rds_presets[] = {
 	 * ============================================================
 	 * Demonstrates: Minimum compliant RDS stream.
 	 * Only Group 0B transmitted (PS name with PI repeat).
-	 * No RT, No ECC, No PTYN, No EON → those groups won't transmit.
+	 * No RT, No ECC, No PTYN, No EON -> those groups won't transmit.
 	 * Use case: Small station, minimal bandwidth.
 	 * ============================================================ */
 	{
@@ -501,7 +713,7 @@ static const rds_preset_t rds_presets[] = {
 		.ps       = "MINIMAL ",
 		.ms       = 1,
 		.group0_version = RDS_GROUP_VERSION_B,  /* Force 0B (no AF) */
-		/* All other fields omitted = 0 = no data → only Group 0 transmits */
+		/* All other fields omitted = 0 = no data -> only Group 0 transmits */
 	},
 	/* ============================================================
 	 * MOBILE PRESET - B Versions for Fast PI Identification
@@ -515,19 +727,19 @@ static const rds_preset_t rds_presets[] = {
 		.name     = "Mobile",
 		.pi       = 0x5678,
 		.ps       = "MOBILE  ",
-		.rt       = "Fast cycling RadioText",  /* ≤32 chars for 2B */
+		.rt       = "Fast cycling RadioText",  /* <=32 chars for 2B */
 		.pty      = 10,
 		.ms       = 1,
 		.group0_version = RDS_GROUP_VERSION_B,  /* 0B: PI repeat */
 		.group2_version = RDS_GROUP_VERSION_B,  /* 2B: 32-char, faster */
-		/* No ECC/Lang → Group 1 won't transmit */
+		/* No ECC/Lang -> Group 1 won't transmit */
 	},
 	/* ============================================================
 	 * MIXED PRESET - AF List + Fast RadioText (0A + 2B)
 	 * ============================================================
 	 * Demonstrates: Mixed A/B for different group types.
 	 * 0A for AF list (need Block C for frequencies).
-	 * 2B for fast RadioText cycling (trade 64→32 chars for speed).
+	 * 2B for fast RadioText cycling (trade 64->32 chars for speed).
 	 * Use case: Regional station with AF, wants quick RT updates.
 	 * ============================================================ */
 	{
@@ -545,22 +757,22 @@ static const rds_preset_t rds_presets[] = {
 	 * AUTO DEMO PRESET - Let Data Decide A/B Versions
 	 * ============================================================
 	 * Demonstrates: Auto-detection from data (all version fields = 0).
-	 * - No AF → auto-selects 0B
-	 * - RT ≤32 chars → auto-selects 2B
-	 * - No ECC/Lang → auto-selects 1B (if PIN set)
+	 * - No AF -> auto-selects 0B
+	 * - RT <=32 chars -> auto-selects 2B
+	 * - No ECC/Lang -> auto-selects 1B (if PIN set)
 	 * Use case: Understanding auto-detection behavior.
 	 * ============================================================ */
 	{
 		.name     = "Auto Demo",
 		.pi       = 0xDEF0,
 		.ps       = "AUTODEMO",
-		.rt       = "Short text for 2B",  /* ≤32 chars → auto: 2B */
+		.rt       = "Short text for 2B",  /* <=32 chars -> auto: 2B */
 		.pty      = 5,
 		.ms       = 1,
-		.pin_day  = 20, .pin_hour = 12, .pin_minute = 0,  /* PIN set → Group 1 transmits */
-		/* No AF → auto: 0B
-		 * No ECC/Lang → auto: 1B (PIN only)
-		 * RT ≤32 → auto: 2B
+		.pin_day  = 20, .pin_hour = 12, .pin_minute = 0,  /* PIN set -> Group 1 transmits */
+		/* No AF -> auto: 0B
+		 * No ECC/Lang -> auto: 1B (PIN only)
+		 * RT <=32 -> auto: 2B
 		 * group*_version all 0 = AUTO */
 	},
 	{
@@ -675,9 +887,10 @@ static const rds_preset_t rds_presets[] = {
 	/* ============================================================
 	 * AF METHOD A STRING DEMO (IEC 62106 S3.2.1.6.3)
 	 * ============================================================
-	 * Demonstrates: New human-readable AF Method A string format.
+	 * Demonstrates: Human-readable AF Method A string format.
 	 * Format: "freq_mhz, freq_mhz, LFxxx, MFxxx"
 	 * LF/MF count as 2 slots each (encoded as [250, code] pairs).
+	 * LF/MF decodes fine with open-source decoders, no HW receiver to test.
 	 * ============================================================ */
 	{
 		.name     = "AF Method A Demo",
@@ -688,10 +901,14 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xE0,	/* Germany */
 		.lang     = 8,		/* German */
-		/* NEW: Human-readable AF string format
-		 * 3 VHF (91.0, 95.5, 102.3) + 1 LF (225 kHz) + 1 MF (1008 kHz)
-		 * Total slots: 3 + 2 + 2 = 7 slots */
-		.af_method_a_str = "91.0, 95.5, 102.3, LF225, MF1008",
+		/* AF Method A: VHF only -- LF/MF AF decodes fine with open-source
+		 * RDS decoders but no hardware receiver to confirm tuning.
+		 * EN 50067 Table 12 LF/MF codes (9 kHz, ITU Regions 1&3):
+		 *   LF: code 1-15 -> freq = 144 + 9*code kHz (153-279 kHz)
+		 *   MF: code 16-135 -> freq = 522 + 9*(code-15) kHz (531-1602 kHz)
+		 * Encoded as [250, code] pair. */
+		.af_method_a_str = "91.0, 95.5, 102.3, 88.1, 106.7",
+		/* .af_method_a_str = "91.0, 95.5, 102.3, LF225, MF1008", */
 	},
 	/* End of presets */
 };
@@ -752,17 +969,16 @@ static void rds_apply_preset(radio_t *radio)
 		rds_enc_clear_ps(enc);
 	}
 	
-	/* Update RadioText (IEC 62106 uses limited charset - convert UTF-8 to RDS) */
-	memset(enc->rt, ' ', 64);
-	enc->rt[64] = '\0';
+	/* Update RadioText using the proper API which handles:
+	 * - CR (0x0D) termination per EN 50067
+	 * - A/B flag toggle to force receiver display update
+	 * - Scheduler update for RT presence changes
+	 * - RDS charset conversion from UTF-8 */
 	if (p->rt && p->rt[0] != '\0') {
-		rds_validate_text(p->rt, "RT");
-		int warn = 0;
-		int len = rds_encode_text(p->rt, (uint8_t *)enc->rt, 64, &warn);
-		if (len < 64) enc->rt[len] = '\r';
+		rds_enc_set_radiotext(enc, p->rt);
+	} else {
+		rds_enc_clear_radiotext(enc);
 	}
-	enc->rt_ab = !enc->rt_ab;  /* Toggle A/B to signal text change */
-	enc->rt_segment = 0;
 	
 	/* Update PTY and PTYN using API */
 	rds_enc_set_pty(enc, p->pty);
@@ -884,20 +1100,20 @@ static void rds_apply_preset(radio_t *radio)
 	
 	/* Group 0: 0A (with AF) vs 0B (PI repeat, no AF) */
 	if (p->group0_version == RDS_GROUP_VERSION_AUTO)
-		enc->use_0b = (p->af_method_a_str == NULL || p->af_method_a_str[0] == '\0');  /* No AF → 0B */
+		enc->use_0b = (p->af_method_a_str == NULL || p->af_method_a_str[0] == '\0');  /* No AF -> 0B */
 	else
 		enc->use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
 	
 	/* Group 1: 1A (ECC/Lang/PIN) vs 1B (PIN only) */
 	if (p->group1_version == RDS_GROUP_VERSION_AUTO)
-		enc->use_1b = (p->ecc == 0 && p->lang == 0);  /* No ECC/Lang → 1B */
+		enc->use_1b = (p->ecc == 0 && p->lang == 0);  /* No ECC/Lang -> 1B */
 	else
 		enc->use_1b = (p->group1_version == RDS_GROUP_VERSION_B);
 	
 	/* Group 2: 2A (64-char RT) vs 2B (32-char, faster) */
 	if (p->group2_version == RDS_GROUP_VERSION_AUTO) {
 		size_t rt_len = p->rt ? strlen(p->rt) : 0;
-		enc->use_2b = (rt_len > 0 && rt_len <= 32);  /* Short RT → 2B */
+		enc->use_2b = (rt_len > 0 && rt_len <= 32);  /* Short RT -> 2B */
 	} else {
 		enc->use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
 	}
@@ -983,6 +1199,17 @@ static void rds_apply_preset(radio_t *radio)
 	     
 	/* Rebuild group scheduler to reflect new configuration (e.g. enable/disable 10A PTYN) */
 	rds_scheduler_update(enc);
+	
+	/* Dynamic PS: must be applied AFTER scheduler update so timing
+	 * estimates can inspect the actual group_sched_buffer[] */
+	if (p->dps.text && p->dps.text[0]) {
+		rds_enc_set_dynamic_ps(enc, p->dps.text,
+		                       (rds_dynamic_ps_mode_t)p->dps.mode,
+		                       p->dps.repeat ? p->dps.repeat : RDS_DPS_REPEAT_NORMAL,
+		                       p->dps.delimiter);
+	} else {
+		rds_enc_stop_dynamic_ps(enc);
+	}
 }
 
 /* Cycle to next RDS preset */
@@ -1000,7 +1227,7 @@ void radio_set_polyphase(int enable)
 	use_polyphase_resampler = enable;
 }
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor)
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int rds_force_rbds)
 {
 	int rc = -EINVAL;
 	double safe_scaler = 1.0;
@@ -1313,7 +1540,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 				init_dc_filter_fast(&radio->rx_dc_filter[1], radio->signal_samplerate, DC_CUTOFF);
 			}
 		} else {
-			/* time constant - convert from µs to seconds */
+			/* time constant - convert from us to seconds */
 			/* TX filters: pre-emphasis */
 			init_emphasis(&radio->fm_emphasis_tx[0], radio->signal_samplerate, timeconstant2cutoff(time_constant_us), DC_CUTOFF, radio->audio_bandwidth);
 			/* RX filters: de-emphasis */
@@ -1338,14 +1565,14 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* Initialize RDS encoder if enabled */
 		if (rds || rds2) {
 			/* Select preset based on emphasis (heuristic for region):
-			 * 75µs → Americas (RBDS) - preset 1
-			 * 50µs and others → Europe/World (RDS) - preset 0 */
+			 * 75us -> Americas (RBDS) - preset 1
+			 * 50us and others -> Europe/World (RDS) - preset 0 */
 			if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
-				rds_current_preset = 1;  /* USA/RBDS (75µs) */
-				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RBDS (Americas) preset\n", time_constant_us);
+				rds_current_preset = 1;  /* USA/RBDS (75us) */
+				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fus detected: using RBDS (Americas) preset\n", time_constant_us);
 			} else {
 				rds_current_preset = 0;  /* RDS (default, more common globally) */
-				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fµs detected: using RDS preset (default)\n", time_constant_us);
+				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fus detected: using RDS preset (default)\n", time_constant_us);
 			}
 			const rds_preset_t *p = &rds_presets[rds_current_preset];
 			
@@ -1376,7 +1603,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			radio->rds_enc.ta = rds_ta;
 			radio->rds_enc.ct_enabled = rds_ct_enabled;
 			
-			rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us);
+			rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us, rds_force_rbds);
 
 			
 			/*
@@ -1529,6 +1756,12 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		 * This ensures all preset fields are applied correctly, including
 		 * EON, RT+, eRT+, eRT, group versions, etc. */
 		rds_apply_preset(radio);
+
+		/* Force A/B flags to 0 (group A) for initial transmission.
+		 * rds_apply_preset() toggles A/B to signal "new text" to receivers,
+		 * but on first load there's no previous text to distinguish from. */
+		radio->rds_enc.rt_ab = 0;
+		radio->rds_enc.ert.ab = 0;
 	}
 
 	return 0;
@@ -2126,7 +2359,7 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			iir_process(&radio->rx_lp_diff, samples[1], signal_num);
 		}
 		if (radio->emphasis) {
-			/* RX path: DC filter → de-emphasis
+			/* RX path: DC filter -> de-emphasis
 			 * DC blocking removes any DC offset from FM demodulator output.
 			 * De-emphasis restores flat frequency response. */
 			if (fm_fast_math_enabled()) {

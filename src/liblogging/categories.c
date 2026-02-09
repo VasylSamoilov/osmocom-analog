@@ -130,16 +130,19 @@ struct log_info_cat log_categories[] = {
 		.name = "DSDR",
 		.description = "Software Defined Radio",
 		.color = "\033[1;31m",
+		.loglevel = LOGL_NOTICE,
 	},
 	[DUHD] = {
 		.name = "DUHD",
 		.description = "UHD interface",
 		.color = "\033[1;35m",
+		.loglevel = LOGL_NOTICE,
 	},
 	[DSOAPY] = {
 		.name = "DSOAPY",
 		.description = "Soapy interface",
 		.color = "\033[1;35m",
+		.loglevel = LOGL_NOTICE,
 	},
 	[DWAVE] = {
 		.name = "DWAVE",
@@ -150,6 +153,7 @@ struct log_info_cat log_categories[] = {
 		.name = "DRADIO",
 		.description = "Radio application",
 		.color = "\033[1;34m",
+		.loglevel = LOGL_NOTICE,
 	},
 	[DAM791X] = {
 		.name = "DAM791X",

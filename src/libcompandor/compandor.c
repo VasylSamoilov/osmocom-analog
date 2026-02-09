@@ -115,13 +115,13 @@
  * WHY 1.0?
  * - Compressor boosts quiet signals (envelope < 1.0) for better SNR during transmission
  * - Expander should only RESTORE what was compressed, not ADD gain
- * - When envelope > 1.0, expander would amplify beyond original → causes the reported issue
+ * - When envelope > 1.0, expander would amplify beyond original -> causes the reported issue
  * - Setting max to 1.0 ensures expander is transparent at nominal level and only attenuates
  *
  * EXAMPLE:
- * - Quiet signal (envelope=0.1): Compressor amplifies 3.16x, expander attenuates 0.1x → restored
- * - Loud signal (envelope=3.0): Compressor attenuates 0.58x, expander limited to 1.0x → compressed
- * - Nominal signal (envelope=1.0): Compressor 1.0x, expander 1.0x → transparent
+ * - Quiet signal (envelope=0.1): Compressor amplifies 3.16x, expander attenuates 0.1x -> restored
+ * - Loud signal (envelope=3.0): Compressor attenuates 0.58x, expander limited to 1.0x -> compressed
+ * - Nominal signal (envelope=1.0): Compressor 1.0x, expander 1.0x -> transparent
  */
 #define EXPANDER_ENVELOPE_MAX	1.0
 
@@ -214,7 +214,7 @@ void setup_compandor(compandor_t *state, double samplerate, double attack_ms, do
  * - envelope = 0.1 (quiet): output = value / 0.316 = value * 3.16 (boosted +10 dB)
  *
  * The sqrt() gives 2:1 compression ratio:
- * - 12 dB input change → 6 dB output change
+ * - 12 dB input change -> 6 dB output change
  *
  * @param state: Compandor state (maintains envelope between calls)
  * @param samples: Audio buffer to compress in-place
@@ -271,12 +271,12 @@ void compress_audio(compandor_t *state, sample_t *samples, int num)
 		 * WHY sqrt()?
 		 * - For 2:1 compression: output_dB = input_dB / 2
 		 * - In linear domain: output = input / sqrt(envelope)
-		 * - Example: 12 dB input change → 6 dB output change
+		 * - Example: 12 dB input change -> 6 dB output change
 		 * 
 		 * EFFECT ON DIFFERENT SIGNAL LEVELS:
-		 * - Loud (envelope=4.0): divide by 2.0 → compress -6 dB
-		 * - Nominal (envelope=1.0): divide by 1.0 → transparent
-		 * - Quiet (envelope=0.1): divide by 0.316 → boost +10 dB
+		 * - Loud (envelope=4.0): divide by 2.0 -> compress -6 dB
+		 * - Nominal (envelope=1.0): divide by 1.0 -> transparent
+		 * - Quiet (envelope=0.1): divide by 0.316 -> boost +10 dB
 		 * 
 		 * The boost of quiet signals is INTENTIONAL - it improves SNR
 		 * by raising quiet speech above the noise floor during transmission */
@@ -319,7 +319,7 @@ void compress_audio(compandor_t *state, sample_t *samples, int num)
  * EXPANSION MATH (with EXPANDER_ENVELOPE_MAX = 1.0):
  * - envelope = 1.0 (nominal): output = value * 1.0 = value (transparent)
  * - envelope = 0.1 (quiet): output = value * 0.1 (attenuated -20 dB)
- * - envelope > 1.0 (loud): LIMITED to 1.0 → output = value * 1.0 (no amplification)
+ * - envelope > 1.0 (loud): LIMITED to 1.0 -> output = value * 1.0 (no amplification)
  *
  * WHY LIMIT TO 1.0?
  * - Compressor boosts quiet signals for better SNR during transmission
@@ -328,9 +328,9 @@ void compress_audio(compandor_t *state, sample_t *samples, int num)
  * - With limit: envelope capped at 1.0 ensures no amplification beyond original
  *
  * EXAMPLE SIGNAL PATH:
- * 1. Quiet signal (0.1): Compressor boosts 3.16x → Expander attenuates 0.1x → Restored
- * 2. Loud signal (3.0): Compressor attenuates 0.58x → Expander limited to 1.0x → Compressed
- * 3. Nominal signal (1.0): Compressor 1.0x → Expander 1.0x → Transparent
+ * 1. Quiet signal (0.1): Compressor boosts 3.16x -> Expander attenuates 0.1x -> Restored
+ * 2. Loud signal (3.0): Compressor attenuates 0.58x -> Expander limited to 1.0x -> Compressed
+ * 3. Nominal signal (1.0): Compressor 1.0x -> Expander 1.0x -> Transparent
  *
  * @param state: Compandor state (maintains envelope between calls)
  * @param samples: Audio buffer to expand in-place
@@ -390,9 +390,9 @@ void expand_audio(compandor_t *state, sample_t *samples, int num)
 		 * This is the inverse of compression (which divides by sqrt(envelope))
 		 * 
 		 * EFFECT ON DIFFERENT SIGNAL LEVELS (with max envelope = 1.0):
-		 * - Loud (envelope limited to 1.0): multiply by 1.0 → no change (stays compressed)
-		 * - Nominal (envelope=1.0): multiply by 1.0 → transparent
-		 * - Quiet (envelope=0.1): multiply by 0.1 → attenuate -20 dB (restores + reduces noise)
+		 * - Loud (envelope limited to 1.0): multiply by 1.0 -> no change (stays compressed)
+		 * - Nominal (envelope=1.0): multiply by 1.0 -> transparent
+		 * - Quiet (envelope=0.1): multiply by 0.1 -> attenuate -20 dB (restores + reduces noise)
 		 * 
 		 * The attenuation of quiet signals is INTENTIONAL - it:
 		 * 1. Restores the original level (undoes compression boost)

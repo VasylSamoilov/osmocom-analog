@@ -157,6 +157,8 @@ void logging_print_help(void)
 	printf("        -> If no category is specified, all categories are selected\n");
 	printf(" -v --verbose date\n");
 	printf("        Show date with debug output\n");
+	printf(" -v --verbose date-ms\n");
+	printf("        Show date with millisecond precision (for timing analysis)\n");
 }
 
 static unsigned char log_levels[] = { LOGL_DEBUG, LOGL_INFO, LOGL_NOTICE, LOGL_ERROR };
@@ -196,6 +198,11 @@ int parse_logging_opt(const char *optarg)
 
 	if (!strcasecmp(optarg, "date")) {
 		log_set_print_timestamp(osmo_stderr_target, 1);
+		return 0;
+	}
+
+	if (!strcasecmp(optarg, "date-ms")) {
+		log_set_print_extended_timestamp(osmo_stderr_target, 1);
 		return 0;
 	}
 

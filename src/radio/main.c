@@ -69,6 +69,7 @@ static int rds = 0;
 static int rds2 = 0;
 static int rds_debug = 0;
 static int rds_verbose = 0;
+static int rds_force_rbds = 0;
 static int sca_67k = 0;
 static int sca_92k = 0;
 static int am_compandor = 0;
@@ -166,6 +167,8 @@ static void print_help(const char *arg0)
 	printf("        Enable RDS decoder debug logging (raw hex codes).\n");
 	printf("    --rds-verbose\n");
 	printf("        Enable RDS decoder verbose logging (human-readable interpretation).\n");
+	printf("    --rbds\n");
+	printf("        Force RBDS decoding (callsign lookup, US PTY names).\n");
 	printf("    --call-sign <WXXX>\n");
 	printf("        Set RBDS Call Sign (e.g. WNYC) to automatically configure PI code.\n");
 	printf("    --pi <HEX>\n");
@@ -187,6 +190,7 @@ static void print_help(const char *arg0)
 	printf("        Auto-select several required options for LimeSDR\n");
 	printf("    --limesdr-mini\n");
 	printf("        Auto-select several required options for LimeSDR Mini\n");
+	logging_print_help();
 	sdr_config_print_help();
 }
 
@@ -208,10 +212,12 @@ static int use_polyphase = 0;
 #define OPT_CALL_SIGN		1102
 #define OPT_PI			1103
 #define OPT_POLYPHASE		1104
+#define OPT_RBDS		1105
 
 static void add_options(void)
 {
 	option_add('h', "help", 0);
+	option_add('v', "verbose", 1);
 	option_add('f', "frequency", 1);
 	option_add('s', "samplerate", 1);
 	option_add('r', "tx-wave-file", 1);
@@ -241,15 +247,25 @@ static void add_options(void)
 	option_add(OPT_CALL_SIGN, "call-sign", 1);
 	option_add(OPT_PI, "pi", 1);
 	option_add(OPT_POLYPHASE, "polyphase-resampler", 0);
+	option_add(OPT_RBDS, "rbds", 0);
         sdr_config_add_options();
 }
 
 static int handle_options(int short_option, int argi, char **argv)
 {
+	int rc;
+
 	switch (short_option) {
 	case 'h':
 		print_help(argv[0]);
 		return 0;
+	case 'v':
+		rc = parse_logging_opt(argv[argi]);
+		if (rc > 0)
+			return 0;
+		if (rc < 0)
+			return rc;
+		break;
 	case 'f':
 		frequency = atof(argv[argi]);
 		break;
@@ -326,6 +342,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_RDS_VERBOSE:
 		rds_verbose = 1;
+		break;
+	case OPT_RBDS:
+		rds_force_rbds = 1;
 		break;
 	case OPT_SCA_67K:
 		sca_67k = 1;
@@ -501,7 +520,7 @@ int main(int argc, char *argv[])
 	if (use_polyphase)
 		radio_set_polyphase(1);
 
-	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor);
+	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor, rds_force_rbds);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
 		exit(0);
