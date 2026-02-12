@@ -581,7 +581,9 @@ int main(int argc, char *argv[])
 	}
 
 	int tosend, got;
+#if 0 /* TX debug logging - uncomment to enable */
 	static int main_loop_dbg_cnt = 0;
+#endif
 	while (!quit) {
 		usleep(1000);
 		got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
@@ -591,18 +593,22 @@ int main(int argc, char *argv[])
 				break;
 		}
 		tosend = sdr_get_tosend(sdr, buffer_size);
+#if 0 /* TX debug logging - uncomment to enable */
 		int tosend_raw = tosend;
+#endif
 		if (tosend > buffer_size / 10)
 			tosend = buffer_size / 10;
 		if (tosend == 0) {
 			continue;
 		}
+#if 0 /* TX debug logging - uncomment to enable */
 		/* Log main loop buffer sizes periodically (~1/sec) */
 		if (++main_loop_dbg_cnt >= 333) {
 			LOGP(DRADIO, LOGL_DEBUG, "Main loop: buffer_size=%d tosend_raw=%d tosend_capped=%d (cap=%d) got=%d\n",
 			     buffer_size, tosend_raw, tosend, buffer_size / 10, got);
 			main_loop_dbg_cnt = 0;
 		}
+#endif
 		/* perform radio modulation */
 		if (tx)
 			tosend = radio_tx(&radio, sendbuff, tosend);

@@ -1942,6 +1942,7 @@ int radio_start(radio_t __attribute__((unused)) *radio)
 	return 0;
 }
 
+#if 0 /* TX pipeline debug instrumentation - uncomment to enable */
 /* TX pipeline debug: compute peak, min, DC, and detect discontinuities */
 static void tx_debug_stats(const char *stage, const sample_t *buf, int len, int ch,
                            double *prev_last, int *disc_count)
@@ -2000,6 +2001,7 @@ static struct {
 	unsigned long total_audio_samples;
 	unsigned long total_signal_samples;
 } tx_dbg = { .dump_interval = 333 }; /* ~1s at 3ms blocks */
+#endif /* TX pipeline debug instrumentation */
 
 int radio_tx(radio_t *radio, float *baseband, int signal_num)
 {
@@ -2009,12 +2011,16 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	sample_t *audio_samples[2];
 	sample_t *signal_samples[3];
 	uint8_t *signal_power;
+#if 0 /* TX debug */
 	int tx_debug_this_call;
+#endif
 #ifdef HAVE_ALSA
 	jitter_frame_t *jf;
 #endif
+#if 0 /* TX debug */
 	tx_dbg.call_count++;
 	tx_debug_this_call = (tx_dbg.call_count % tx_dbg.dump_interval == 0);
+#endif
 
 	if (signal_num > radio->buffer_size) {
 		LOGP(DRADIO, LOGL_ERROR, "signal_num > buffer_size, please fix!.\n");
@@ -2070,6 +2076,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	case AUDIO_MODE_WAVEFILE:
 	{
 		int wave_got = wave_read(&radio->wave_tx_play, audio_samples, audio_num);
+#if 0 /* TX debug */
 		/* Track short reads from wave file - these cause sample gaps and pops */
 		if (wave_got < audio_num && wave_got > 0) {
 			static int short_read_count = 0;
@@ -2077,6 +2084,8 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			LOGP(DRADIO, LOGL_NOTICE, "TX WAVE SHORT READ #%d at call %d: requested=%d got=%d (gap=%d samples)\n",
 			     short_read_count, tx_dbg.call_count, audio_num, wave_got, audio_num - wave_got);
 		}
+#endif
+		(void)wave_got;
 		
 		if (!radio->wave_tx_play.left) {
 			int rc;
@@ -2128,6 +2137,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		return -EINVAL;
 	}
 
+#if 0 /* TX debug: boundary pop detection */
 	/* === TX DEBUG: Check EVERY call for inter-block boundary pops === */
 	if (audio_num > 1 && tx_boundary.initialized) {
 		double boundary_jump = fabs(audio_samples[0][0] - tx_boundary.last_sample_ch0);
@@ -2162,6 +2172,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		if (radio->tx_audio_channels == 2)
 			tx_debug_stats("1_src", audio_samples[1], audio_num, 1, &tx_dbg.prev_last[1], &tx_dbg.disc_count[1]);
 	}
+#endif
 
 	/* convert mono/stereo, generate differential signal */
 	/* (Skip this if we want pure clean signal, but let's keep it to test stereo proc) */
@@ -2188,12 +2199,14 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			audio_samples[0][i] = (audio_samples[0][i] + audio_samples[1][i]) / 2.0;
 	}
 
+#if 0 /* TX debug: Stage 2 */
 	/* === TX DEBUG: Stage 2 - After stereo matrix === */
 	if (tx_debug_this_call) {
 		tx_debug_stats("2_matrix", audio_samples[0], audio_num, 0, &tx_dbg.prev_last[2], &tx_dbg.disc_count[2]);
 		if (radio->stereo)
 			tx_debug_stats("2_matrix", audio_samples[1], audio_num, 1, &tx_dbg.prev_last[3], &tx_dbg.disc_count[3]);
 	}
+#endif
 
 	/* remove DC */
 	// iir_process(&radio->tx_dc_removal[0], audio_samples[0], audio_num);
@@ -2251,10 +2264,12 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		}
 	}
 
+#if 0 /* TX debug: Stage 3 */
 	/* === TX DEBUG: Stage 3 - After DC removal + volume === */
 	if (tx_debug_this_call) {
 		tx_debug_stats("3_dc_vol", audio_samples[0], audio_num, 0, &tx_dbg.prev_last[4], &tx_dbg.disc_count[4]);
 	}
+#endif
 
 	/* upsample (or resample with polyphase) */
 	if (radio->use_polyphase) {
@@ -2274,10 +2289,12 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	memset(baseband, 0, sizeof(float) * 2 * signal_num);
 	memset(signal_power, 1, signal_num);
 
+#if 0 /* TX debug: Stage 4 */
 	/* === TX DEBUG: Stage 4 - After upsample === */
 	if (tx_debug_this_call) {
 		tx_debug_stats("4_upsamp", signal_samples[0], signal_num, 0, &tx_dbg.prev_last[5], &tx_dbg.disc_count[5]);
 	}
+#endif
 
 	/* filter audio (remove DC, remove high frequencies, pre-emphasis)
 	 * and modulate */
@@ -2303,6 +2320,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			clipper_process(signal_samples[1], signal_num);
 		}
 
+#if 0 /* TX debug: Stage 5 - clipper */
 		/* === TX DEBUG: Stage 5 - After pre-emphasis + clipper === */
 		if (tx_debug_this_call) {
 			double peak5 = 0.0;
@@ -2316,6 +2334,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			     (peak5 >= radio->clip_level - 0.01) ? "(clipper active)" : "(no clipping)");
 			tx_debug_stats("5_emph_clip", signal_samples[0], signal_num, 0, &tx_dbg.prev_last[6], &tx_dbg.disc_count[6]);
 		}
+#endif
 		
 		/* Advance pilot phase if Stereo OR RDS is enabled */
 		if (radio->stereo || radio->rds || radio->rds2) {
@@ -2384,6 +2403,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		for (i = 0; i < signal_num; i++)
 			signal_samples[0][i] *= radio->fm_deviation;
 
+#if 0 /* TX debug: Stage 6 - deviation */
 		/* === TX DEBUG: Stage 6 - Final composite (after pilot+RDS, before FM mod) === */
 		if (tx_debug_this_call) {
 			/* Measure peak composite BEFORE deviation scaling (normalized 0..1) */
@@ -2409,6 +2429,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			LOGP(DRADIO, LOGL_DEBUG, "TX totals: calls=%d audio_samples=%lu signal_samples=%lu\n",
 			     tx_dbg.call_count, tx_dbg.total_audio_samples, tx_dbg.total_signal_samples);
 		}
+#endif
 
 		fm_modulate_complex(&radio->fm_mod, signal_samples[0], signal_power, signal_num, baseband);
 		break;
