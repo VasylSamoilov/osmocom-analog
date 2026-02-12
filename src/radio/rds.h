@@ -725,7 +725,7 @@ typedef struct {
  * group (typically 11A).
  *
  * Each RT+ group can contain up to 2 tags. Each tag specifies:
- *   - content_type: What the segment represents (0-64)
+ *   - content_type: What the segment represents (0-63)
  *   - start: Start position in RadioText (0-63)
  *   - length: Length of segment (1-64)
  *
@@ -836,15 +836,15 @@ typedef struct {
 #define RDS_RTPLUS_CT_CHAT_CENTRE          51  /* chat.centre */
 #define RDS_RTPLUS_CT_VOTE_QUESTION        52  /* vote.question */
 #define RDS_RTPLUS_CT_VOTE_CENTRE          53  /* vote.centre */
-#define RDS_RTPLUS_CT_PLACE                60  /* place */
-#define RDS_RTPLUS_CT_APPOINTMENT          61  /* appointment */
-#define RDS_RTPLUS_CT_IDENTIFIER           62  /* identifier */
-#define RDS_RTPLUS_CT_PURCHASE             63  /* purchase */
-#define RDS_RTPLUS_CT_GET_DATA             64  /* get_data */
+#define RDS_RTPLUS_CT_PLACE                59  /* place (Descriptor) */
+#define RDS_RTPLUS_CT_APPOINTMENT          60  /* appointment (Descriptor) */
+#define RDS_RTPLUS_CT_IDENTIFIER           61  /* identifier (Descriptor) */
+#define RDS_RTPLUS_CT_PURCHASE             62  /* purchase (Descriptor) */
+#define RDS_RTPLUS_CT_GET_DATA             63  /* get_data (Descriptor) */
 
 /* RT+ Tag structure - identifies a substring in RadioText or eRT */
 typedef struct {
-	uint8_t  content_type;  /* Content type (0-64, see rds_tables.h) */
+	uint8_t  content_type;  /* Content type (0-63, see rds_tables.h) */
 	uint8_t  start;         /* Start position in RT/eRT (0-63 for RT, 0-127 for eRT) */
 	uint8_t  length;        /* Length of tag (1-64 for RT, 1-128 for eRT) */
 } rds_rtplus_tag_t;
@@ -1579,7 +1579,7 @@ void rds_enc_oda_clear(rds_encoder_t *rds);
  * RT+ (RadioText Plus) Encoder API
  * ============================================================ */
 /* Add RT+ tag to RadioText
- * content_type: Content type code (0-64, see rds_tables.h)
+ * content_type: Content type code (0-63, see rds_tables.h)
  * start: Start position in RT (0-63 for RT, 0-127 for eRT)
  * length: Length of tag (1-64 for RT, 1-128 for eRT)
  * 

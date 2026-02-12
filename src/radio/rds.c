@@ -3290,8 +3290,8 @@ int rds_enc_rtplus_add_tag(rds_encoder_t *rds, uint8_t content_type,
 		return -1;
 	}
 	
-	if (content_type > 64) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid content_type %d (max 64)\n",
+	if (content_type > 63) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid content_type %d (max 63)\n",
 		     content_type);
 		return -1;
 	}
@@ -3373,8 +3373,8 @@ int rds_enc_ert_plus_add_tag(rds_encoder_t *rds, uint8_t content_type,
 		return -1;
 	}
 	
-	if (content_type > 64) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid content_type %d (max 64)\n",
+	if (content_type > 63) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid content_type %d (max 63)\n",
 		     content_type);
 		return -1;
 	}
@@ -4847,6 +4847,15 @@ int rds_enc_eon_get_entry(const rds_encoder_t *rds, int index, uint16_t *pi, cha
 
 int rds_enc_oda_add(rds_encoder_t *rds, uint8_t carrier_group, uint16_t aid, uint16_t message)
 {
+	/* IEC 62106-6 A.5.1: "Only type A groups can be used for the application group"
+	 * for RT+ and eRT+. Odd carrier_group values indicate B-type groups. */
+	if ((aid == RDS_ODA_AID_RT_PLUS || aid == RDS_ODA_AID_ERT_PLUS) && (carrier_group & 1)) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS ODA: RT+/eRT+ requires type A group, "
+		     "but carrier_group %d is type B (%d%c)\n",
+		     carrier_group, carrier_group >> 1, 'B');
+		return -1;
+	}
+	
 	/* Check for duplicates (same AID already configured) */
 	for (int i = 0; i < rds->oda_count; i++) {
 		if (rds->oda[i].aid == aid) {

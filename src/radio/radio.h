@@ -29,6 +29,7 @@ typedef struct radio {
 	enum audio_mode	tx_audio_mode;		/* mode for audio source */
 	enum audio_mode	rx_audio_mode;		/* mode for audio sink */
 	double		volume;			/* volume change (gain/dampen) */
+	double		clip_level;		/* soft clipper threshold (audio budget after pilot/RDS) */
 	int		stereo;			/* use stere FM */
 	int		rds, rds2;		/* use RDS */
 	int		emphasis;		/* use pre-/de-emphasis with FM */

@@ -76,7 +76,6 @@ static void init_software_clock(void)
 		tx_timestamps = 0;
 	}
 	LOGP(DUHD, LOGL_NOTICE, "Using software clock for TX-only mode (may drift relative to SDR sample clock)\n");
-	fprintf(stderr, "DEBUG: init_software_clock called, tx_timestamps=%d, samplerate=%.0f\n", tx_timestamps, samplerate);
 }
 
 int uhd_open(size_t channel, const char *_device_args, const char *_stream_args, const char *_tune_args, const char *tx_antenna, const char *rx_antenna, const char *clock_source, double tx_frequency, double rx_frequency, double lo_offset, double rate, double tx_gain, double rx_gain, double bandwidth, int timestamps)
@@ -567,7 +566,6 @@ int uhd_start(void)
 			if (!error) {
 				error = uhd_tx_streamer_send(tx_streamer, buffs_ptr, prefill_samples, &tx_metadata, 1.0, &sent);
 				if (!error && sent > 0) {
-					fprintf(stderr, "DEBUG: Pre-filled TX FIFO with %zu silent samples\n", sent);
 					LOGP(DUHD, LOGL_NOTICE, "Pre-filled TX FIFO with %zu samples of silence\n", sent);
 				}
 			}
@@ -632,14 +630,6 @@ int uhd_send(float *buff, int num)
 		sent += count;
 		buff += count * 2;
 		num -= count;
-	}
-
-	/* Debug: log send progress periodically */
-	static int send_debug_counter = 0;
-	if (++send_debug_counter >= 100) {
-		LOGP(DUHD, LOGL_DEBUG, "uhd_send: sent %zu samples, tx_timestamps=%d, I[0]=%.3f\n", 
-		     sent, tx_timestamps, buff ? buff[0] : 0.0f);
-		send_debug_counter = 0;
 	}
 
 	return sent;
@@ -712,16 +702,10 @@ int uhd_get_tosend(int buffer_size)
 		double sw_time = get_software_time();
 		rx_time_secs = (time_t)sw_time;
 		rx_time_fract_sec = sw_time - (double)rx_time_secs;
-		if (call_count <= 5 || (call_count % 500) == 0) {
-			fprintf(stderr, "DEBUG[%d]: sw_time=%.6f rx=%ld.%.6f tx=%ld.%.6f\n",
-			        call_count, sw_time, (long)rx_time_secs, rx_time_fract_sec,
-			        (long)tx_time_secs, tx_time_fract_sec);
-		}
 	}
 
 	/* we need the rx time stamp to determine how much data is already sent in advance */
 	if (rx_time_secs == 0 && rx_time_fract_sec == 0.0) {
-		fprintf(stderr, "DEBUG[%d]: rx time not valid, returning 0\n", call_count);
 		return 0;
 	}
 
@@ -749,26 +733,14 @@ int uhd_get_tosend(int buffer_size)
 			tx_time_fract_sec -= 1.0;
 			tx_time_secs++;
 		}
-		fprintf(stderr, "DEBUG: TX init: rx=%.6f -> tx=%.6f (ahead by %.3fms = %d samples @ %.0f)\n",
-		        (double)rx_time_secs + rx_time_fract_sec - (double)buffer_size / samplerate,
-		        (double)tx_time_secs + tx_time_fract_sec,
-		        (double)buffer_size / samplerate * 1000.0, buffer_size, samplerate);
 	}
 
 	/* we check how advance our transmitted time stamp is */
 	advance = ((double)tx_time_secs + tx_time_fract_sec) - ((double)rx_time_secs + rx_time_fract_sec);
 	tosend = buffer_size - (int)(advance * samplerate);
 
-	/* Debug: log timing for initial calls only */
-	if (call_count <= 10) {
-		fprintf(stderr, "DEBUG[%d]: advance=%.3fms tosend=%d buffer=%d\n",
-		        call_count, advance * 1000.0, tosend, buffer_size);
-	}
-
 	/* in case of underrun: tosend will exceed buffer_size */
 	if (tosend > buffer_size) {
-		fprintf(stderr, "DEBUG: UNDERRUN! advance=%.3fms tosend=%d > buffer=%d\n",
-		        advance * 1000.0, tosend, buffer_size);
 		LOGP(DUHD, LOGL_ERROR, "SDR TX underrun (%.1f ms behind), seems we are too slow. Use lower SDR sample rate.\n",
 			-advance * 1000.0);
 		if (!tx_timestamps) {
@@ -781,8 +753,6 @@ int uhd_get_tosend(int buffer_size)
 				tx_time_fract_sec -= 1.0;
 				tx_time_secs++;
 			}
-			fprintf(stderr, "DEBUG: Resynced TX -> now ahead by %.3fms\n",
-			        ((double)tx_time_secs + tx_time_fract_sec - (double)rx_time_secs - rx_time_fract_sec) * 1000.0);
 		}
 		/* When TX timestamps are enabled, the UHD driver drops late packets.
 		 * The TX timestamp naturally catches up without causing a slip.

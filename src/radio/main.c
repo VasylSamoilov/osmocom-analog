@@ -581,6 +581,7 @@ int main(int argc, char *argv[])
 	}
 
 	int tosend, got;
+	static int main_loop_dbg_cnt = 0;
 	while (!quit) {
 		usleep(1000);
 		got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
@@ -590,18 +591,28 @@ int main(int argc, char *argv[])
 				break;
 		}
 		tosend = sdr_get_tosend(sdr, buffer_size);
+		int tosend_raw = tosend;
 		if (tosend > buffer_size / 10)
 			tosend = buffer_size / 10;
 		if (tosend == 0) {
 			continue;
+		}
+		/* Log main loop buffer sizes periodically (~1/sec) */
+		if (++main_loop_dbg_cnt >= 333) {
+			LOGP(DRADIO, LOGL_DEBUG, "Main loop: buffer_size=%d tosend_raw=%d tosend_capped=%d (cap=%d) got=%d\n",
+			     buffer_size, tosend_raw, tosend, buffer_size / 10, got);
+			main_loop_dbg_cnt = 0;
 		}
 		/* perform radio modulation */
 		if (tx)
 			tosend = radio_tx(&radio, sendbuff, tosend);
 		else
 			memset(sendbuff, 0, tosend * sizeof(*sendbuff) * 2);
-		if (tosend < 0)
-			break;
+		if (tosend <= 0) {
+			if (tosend < 0)
+				break;
+			continue; /* radio_tx returned 0: no audio to process, skip SDR write */
+		}
 		/* write to SDR */
 		sdr_write(sdr, (void *)sendbuff, NULL, tosend, NULL, NULL, 0);
 

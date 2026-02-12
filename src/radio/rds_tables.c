@@ -1134,13 +1134,13 @@ static const char *rtplus_content_types[] = {
 	"chat.centre",          /* 51 */
 	"vote.question",        /* 52 */
 	"vote.centre",          /* 53 */
-	NULL, NULL, NULL, NULL, /* 54-57 reserved */
-	NULL, NULL,             /* 58-59 reserved */
-	"place",                /* 60 */
-	"appointment",          /* 61 */
-	"identifier",           /* 62 */
-	"purchase",             /* 63 */
-	"get_data"              /* 64 */
+	NULL, NULL,             /* 54-55 reserved for future use */
+	NULL, NULL, NULL,       /* 56-58 private classes */
+	"place",                /* 59 - Descriptor */
+	"appointment",          /* 60 - Descriptor */
+	"identifier",           /* 61 - Descriptor */
+	"purchase",             /* 62 - Descriptor */
+	"get_data"              /* 63 - Descriptor */
 };
 
 #define RTPLUS_TYPE_COUNT (sizeof(rtplus_content_types) / sizeof(rtplus_content_types[0]))
