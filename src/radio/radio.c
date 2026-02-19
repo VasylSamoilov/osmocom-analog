@@ -40,6 +40,22 @@
 #define PHASE_ERROR_TOLERANCE	3.0	/* ITU-R BS.450-4 S2.2.2.5: +/-3deg */
 #define PHASE_ERROR_AVG_SAMPLES	10000	/* samples to average for phase error */
 
+/* Stereo pilot lock/unlock thresholds (fraction of full-scale FM baseband).
+ * A real 19 kHz pilot at 8% deviation reads ~0.08 after FM demod normalisation.
+ * Lock above LOCK_THR, unlock below UNLOCK_THR (~12 dB hysteresis).
+ *
+ * Acquisition/loss require the signal to be continuously in-range for
+ * PILOT_ACQUIRE_S / PILOT_LOSS_S seconds before the state changes.
+ * This rejects noise spikes and brief dropouts.
+ * IEC 62106 / ITU-R BS.450 consumer practice: 50–200 ms each direction.
+ *
+ * COOLDOWN_S: minimum hold time after any transition (prevents re-entry). */
+#define PILOT_LOCK_THR		0.01	/* acquire: pilot must stay above this  */
+#define PILOT_UNLOCK_THR	0.003	/* loss:    pilot must stay below this  */
+#define PILOT_ACQUIRE_S		0.2	/* 200 ms continuous above thr to lock  */
+#define PILOT_LOSS_S		0.2	/* 200 ms continuous below thr to unlock */
+#define PILOT_COOLDOWN_S	0.1	/* seconds before next transition allowed */
+
 /* ============================================================
  * RDS Preset Configuration System
  * Press 'f' during operation to cycle between presets.
@@ -263,10 +279,13 @@ static const rds_preset_t rds_presets[] = {
 		 *             ^0              ^15
 		 * 
 		 * Tag1: item.title (type=1) "osmocom-analog" at positions 0-13 (14 chars)
-		 * Tag2: item.album (type=2) "FM RDS Radio" at positions 15-26 (12 chars) */
+		 * Tag2: item.album (type=2) "FM RDS Radio" at positions 15-26 (12 chars)
+		 * 
+		 * NOTE: Group 11A is what we default for RT+.
+		 * The spec allows any ODA group. */
 		.rtplus = {
 			.enabled = 1,
-			.carrier_group = RDS_GROUP_12A,	/* Group 12A for RT+ ODA */
+			.carrier_group = RDS_GROUP_11A,	/* Group 11A for RT+ ODA */
 			.message = 0x0000,		/* 3A msg: cb=0 (no template), scb=0, template=0 */
 			.toggle = 0,
 			.item_running = 1,		/* 1 = song is currently playing */
@@ -308,7 +327,7 @@ static const rds_preset_t rds_presets[] = {
 		 * Terminated with CR if < 128 bytes */
 		.ert = {
 			.enabled = 0,	/* Disabled -- eRT eats 30% bandwidth, most receivers don't support it */
-			.carrier_group = RDS_GROUP_11A,	/* Group 11A for eRT ODA (swapped with RT+ now on 12A) */
+			.carrier_group = RDS_GROUP_12A,	/* Group 12A for eRT ODA (RT+ uses 11A) */
 			.message = RDS_ERT_3A_MSG_UTF8_LTR_E3,	/* UTF-8 encoding, LTR direction, E3 chartable */
 			.text = "osmocom-analog — Analoge Funktechnik · Open Source FM RDS Encoder",
 		},
@@ -331,25 +350,15 @@ static const rds_preset_t rds_presets[] = {
 		 * 
 		 * RT+ Configuration (after encoder init):
 		 *   // Register RT+ ODA on Group 11A (carrier_group=22)
-		 *   rds_enc_oda_add(&radio->rds_enc, 22, RDS_ODA_AID_RT_PLUS, 0x0000);
+		 *   rds_enc_oda_add(&radio->rds_enc, RDS_GROUP_11A, RDS_ODA_AID_RT_PLUS, 0x0000);
 		 *   
-		 *   // Tag 1: Artist name (content_type=4 from RT+ spec)
-		 *   // Field: .rt[0:15] = "osmocom-analog"
-		 *   // Value source: content_type=4 (item.artist), start=0 (from .rt[0]),
-		 *   //               length=16 (from strlen("osmocom-analog"))
-		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 4, 0, 16);
-		 *   
-		 *   // Tag 2: Station name (content_type=31 from RT+ spec)
-		 *   // Field: .rt[19:26] = "FM Radio"
-		 *   // Value source: content_type=31 (stationname.short), start=19 (from .rt[19]),
-		 *   //               length=8 (from strlen("FM Radio"))
-		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 31, 19, 8);
-		 *   
-		 *   // Set RT+ flags
-		 *   // Field: item_running=1 (from current song/programme state)
-		 *   // Field: toggle=0 (from item change detection, toggles when tags change)
-		 *   rds_enc_rtplus_set_item_running(&radio->rds_enc, 1);
-		 *   rds_enc_rtplus_set_toggle(&radio->rds_enc, 0);
+		 *   // Set both tags at once (tag1: Title, tag2: Album)
+		 *   // Tag 1: RDS_RTPLUS_CT_ITEM_TITLE (1), start=0, length=14 ("osmocom-analog")
+		 *   // Tag 2: RDS_RTPLUS_CT_ITEM_ALBUM (2), start=15, length=12 ("FM RDS Radio")
+		 *   // For single tag, pass 0 for ct2/start2/len2
+		 *   rds_enc_rtplus_set_tags(&radio->rds_enc,
+		 *       RDS_RTPLUS_CT_ITEM_TITLE, 0, 14,
+		 *       RDS_RTPLUS_CT_ITEM_ALBUM, 15, 12);
 		 * 
 		 * ============================================================
 		 * EXAMPLE 2: eRT (Enhanced RadioText) - Comprehensive Example
@@ -383,7 +392,7 @@ static const rds_preset_t rds_presets[] = {
 		 *   //   Bit 12: cb=0 (from class/type flag)
 		 *   //   Bits 11-8: scb=0 (from server control bits)
 		 *   //   Bits 7-0: template=0 (from template number)
-		 *   rds_enc_oda_add(&radio->rds_enc, 22, RDS_ODA_AID_ERT_PLUS, 0x0000);
+		 *   rds_enc_oda_add(&radio->rds_enc, RDS_GROUP_11A, RDS_ODA_AID_ERT_PLUS, 0x0000);
 		 *   
 		 *   // Set eRT text first (128 bytes)
 		 *   // Field: Extended RadioText with multiple segments
@@ -391,22 +400,12 @@ static const rds_preset_t rds_presets[] = {
 		 *   const char *ert_text2 = "ARTIST: The Beatles | TITLE: Hey Jude | ALBUM: The Beatles 1967-1970 | GENRE: Rock | YEAR: 1968";
 		 *   rds_enc_set_ert(&radio->rds_enc, (const uint8_t *)ert_text2, strlen(ert_text2));
 		 *   
-		 *   // eRT+ Tag 1: Artist (content_type=4)
-		 *   // Field: .ert[8:20] = "The Beatles"
-		 *   // Value source: content_type=4 (item.artist), start=8 (from .ert[8]),
-		 *   //               length=12 (from strlen("The Beatles"))
-		 *   rds_enc_ert_plus_add_tag(&radio->rds_enc, 4, 8, 12);
-		 *   
-		 *   // eRT+ Tag 2: Title (content_type=1)
-		 *   // Field: .ert[30:39] = "Hey Jude"
-		 *   // Value source: content_type=1 (item.title), start=30 (from .ert[30]),
-		 *   //               length=9 (from strlen("Hey Jude"))
-		 *   rds_enc_ert_plus_add_tag(&radio->rds_enc, 1, 30, 9);
-		 *   
-		 *   // Set eRT+ flags
-		 *   // Field: item_running=1 (from current playback state)
-		 *   // Field: toggle=0 (from item change detection)
-		 *   // Note: eRT+ uses same API as RT+ but operates on 128-byte eRT text
+		 *   // Set both eRT+ tags at once
+		 *   // Tag 1: RDS_RTPLUS_CT_ITEM_ARTIST (4), start=8, length=12 ("The Beatles")
+		 *   // Tag 2: RDS_RTPLUS_CT_ITEM_TITLE (1), start=30, length=9 ("Hey Jude")
+		 *   rds_enc_ert_plus_set_tags(&radio->rds_enc,
+		 *       RDS_RTPLUS_CT_ITEM_ARTIST, 8, 12,
+		 *       RDS_RTPLUS_CT_ITEM_TITLE, 30, 9);
 		 * 
 		 * ============================================================
 		 * EXAMPLE 4: eRT with UTF-8 Demonstration - Comprehensive Example
@@ -441,7 +440,7 @@ static const rds_preset_t rds_presets[] = {
 		 * ============================================================
 		 * EXAMPLE 5: RT+ with Multiple Content Types - Comprehensive Example
 		 * ============================================================
-		 * RT+ supports up to 2 tags per group, cycling through tag sets.
+		 * RT+ supports up to 2 tags per group. Use set_tags() to set both.
 		 * 
 		 * RadioText (from preset .rt field):
 		 *   "News: Breaking Story | Weather: Sunny 25°C | Traffic: Highway Clear"
@@ -449,30 +448,20 @@ static const rds_preset_t rds_presets[] = {
 		 *             012345678901234567890123456789012345678901234567890123
 		 * 
 		 * RT+ Configuration (after encoder init):
-		 *   rds_enc_oda_add(&radio->rds_enc, 22, RDS_ODA_AID_RT_PLUS, 0x0000);
+		 *   rds_enc_oda_add(&radio->rds_enc, RDS_GROUP_11A, RDS_ODA_AID_RT_PLUS, 0x0000);
 		 *   
-		 *   // Tag 1: News headline (content_type=12 from RT+ spec)
-		 *   // Field: .rt[0:20] = "News: Breaking Story"
-		 *   // Value source: content_type=12 (info.news), start=0 (from .rt[0]),
-		 *   //               length=20 (from strlen("News: Breaking Story"))
-		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 12, 0, 20);
+		 *   // Set tags: News and Weather
+		 *   rds_enc_rtplus_set_tags(&radio->rds_enc,
+		 *       RDS_RTPLUS_CT_INFO_NEWS, 0, 20,
+		 *       RDS_RTPLUS_CT_INFO_WEATHER, 22, 17);
 		 *   
-		 *   // Tag 2: Weather info (content_type=25 from RT+ spec)
-		 *   // Field: .rt[22:38] = "Weather: Sunny 25°C"
-		 *   // Value source: content_type=25 (info.weather), start=22 (from .rt[22]),
-		 *   //               length=17 (from strlen("Weather: Sunny 25°C"))
-		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 25, 22, 17);
-		 *   
-		 *   // For additional tags, cycle to next tag set:
-		 *   // Clear and add new tags when content changes
+		 *   // To change tags (e.g., show Traffic instead):
+		 *   // clear_tags() sets running=0 (no toggle flip)
 		 *   rds_enc_rtplus_clear_tags(&radio->rds_enc);
-		 *   // Tag 1: Traffic info (content_type=26)
-		 *   // Field: .rt[40:58] = "Traffic: Highway Clear"
-		 *   // Value source: content_type=26 (info.traffic), start=40 (from .rt[40]),
-		 *   //               length=19 (from strlen("Traffic: Highway Clear"))
-		 *   rds_enc_rtplus_add_tag(&radio->rds_enc, 26, 40, 19);
-		 *   // Toggle flag changes when tags change
-		 *   rds_enc_rtplus_set_toggle(&radio->rds_enc, 1);
+		 *   // set_tags() sets running=1 and flips the toggle bit
+		 *   rds_enc_rtplus_set_tags(&radio->rds_enc,
+		 *       RDS_RTPLUS_CT_INFO_TRAFFIC, 40, 19,
+		 *       0, 0, 0);  // Single tag
 		 * 
 		 * ============================================================
 		 * Carrier Group Codes Reference:
@@ -1123,16 +1112,19 @@ static void rds_apply_preset(radio_t *radio)
 		/* Register RT+ ODA */
 		rds_enc_oda_add(enc, p->rtplus.carrier_group, RDS_ODA_AID_RT_PLUS, p->rtplus.message);
 		
-		/* Clear existing tags and add new ones */
-		rds_enc_rtplus_clear_tags(enc);
-		for (int i = 0; i < p->rtplus.tag_count && i < RDS_RTPLUS_MAX_TAGS; i++) {
-			rds_enc_rtplus_add_tag(enc, p->rtplus.tags[i].content_type,
-			                      p->rtplus.tags[i].start, p->rtplus.tags[i].length);
+		/* Set RT+ tags (1 or 2 tags) */
+		if (p->rtplus.tag_count >= 1) {
+			uint8_t ct1 = p->rtplus.tags[0].content_type;
+			uint8_t start1 = p->rtplus.tags[0].start;
+			uint8_t len1 = p->rtplus.tags[0].length;
+			uint8_t ct2 = 0, start2 = 0, len2 = 0;
+			if (p->rtplus.tag_count >= 2) {
+				ct2 = p->rtplus.tags[1].content_type;
+				start2 = p->rtplus.tags[1].start;
+				len2 = p->rtplus.tags[1].length;
+			}
+			rds_enc_rtplus_set_tags(enc, ct1, start1, len1, ct2, start2, len2);
 		}
-		
-		/* Set RT+ flags */
-		rds_enc_rtplus_set_toggle(enc, p->rtplus.toggle);
-		rds_enc_rtplus_set_item_running(enc, p->rtplus.item_running);
 		
 		LOGP(DRADIO, LOGL_INFO, "RDS RT+: Enabled on group %d%c with %d tag(s)\n",
 		     p->rtplus.carrier_group >> 1,
@@ -1149,16 +1141,19 @@ static void rds_apply_preset(radio_t *radio)
 		/* Register eRT+ ODA */
 		rds_enc_oda_add(enc, p->ert_plus.carrier_group, RDS_ODA_AID_ERT_PLUS, p->ert_plus.message);
 		
-		/* Clear existing tags and add new ones */
-		rds_enc_ert_plus_clear_tags(enc);
-		for (int i = 0; i < p->ert_plus.tag_count && i < RDS_RTPLUS_MAX_TAGS; i++) {
-			rds_enc_ert_plus_add_tag(enc, p->ert_plus.tags[i].content_type,
-			                         p->ert_plus.tags[i].start, p->ert_plus.tags[i].length);
+		/* Set eRT+ tags (1 or 2 tags) */
+		if (p->ert_plus.tag_count >= 1) {
+			uint8_t ct1 = p->ert_plus.tags[0].content_type;
+			uint8_t start1 = p->ert_plus.tags[0].start;
+			uint8_t len1 = p->ert_plus.tags[0].length;
+			uint8_t ct2 = 0, start2 = 0, len2 = 0;
+			if (p->ert_plus.tag_count >= 2) {
+				ct2 = p->ert_plus.tags[1].content_type;
+				start2 = p->ert_plus.tags[1].start;
+				len2 = p->ert_plus.tags[1].length;
+			}
+			rds_enc_ert_plus_set_tags(enc, ct1, start1, len1, ct2, start2, len2);
 		}
-		
-		/* Set eRT+ flags */
-		rds_enc_ert_plus_set_toggle(enc, p->ert_plus.toggle);
-		rds_enc_ert_plus_set_item_running(enc, p->ert_plus.item_running);
 		
 		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Enabled on group %d%c with %d tag(s)\n",
 		     p->ert_plus.carrier_group >> 1,
@@ -2584,37 +2579,113 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			double Q_end = samples[2][signal_num - 1];
 			
 			double pilot_mag = sqrt(I_end * I_end + Q_end * Q_end);
-			
+
+			/* IIR-smooth pilot magnitude (~100ms time constant).
+			 * alpha = block_size / (TC_s * samplerate) clamped to [0,1].
+			 * Smoothed value is used for lock/unlock decisions so that
+			 * brief noise dips don't reset the acquisition counter. */
+#define PILOT_MAG_SMOOTH_TC_S	0.1		/* 100 ms IIR time constant */
+			{
+				double alpha = (double)signal_num / (PILOT_MAG_SMOOTH_TC_S * radio->signal_samplerate);
+				if (alpha > 1.0) alpha = 1.0;
+				radio->rx_pilot_mag_avg += alpha * (pilot_mag - radio->rx_pilot_mag_avg);
+			}
+
+			/* Expose raw pilot magnitude for external use */
+			radio->rx_pilot_mag = pilot_mag;
+
 			if (pilot_mag > 1e-9) {
 				/* Measured phase = offset between our oscillator and received pilot */
 				double measured_offset = atan2(Q_end, I_end);
-				
+
 				/* Normalize to -45..+45 degrees for 90deg periodicity of sin(2x) */
 				while (measured_offset > M_PI/4) measured_offset -= M_PI/2;
 				while (measured_offset < -M_PI/4) measured_offset += M_PI/2;
-				
+
 				/* Track average offset with slow IIR (time constant ~1 second) */
-				double alpha = 1.0 / (radio->signal_samplerate * 1.0);  /* 1 second TC */
-				radio->rx_pll_freq_offset += alpha * signal_num * (measured_offset - radio->rx_pll_freq_offset);
+				double alpha_pll = 1.0 / (radio->signal_samplerate * 1.0);  /* 1 second TC */
+				radio->rx_pll_freq_offset += alpha_pll * signal_num * (measured_offset - radio->rx_pll_freq_offset);
 			}
-			
 			/* Update pilot phase for next block */
 			radio->rx_pilot_phase = p;
-			
-			/* Diagnostics (every ~1 second) */
+
+			/* Periodic debug: pilot magnitude, phase offset, lock state, counters */
 			{
-				static int diag_count = 0;
-				diag_count += signal_num;
-				if (diag_count >= 1000000) {
-					diag_count = 0;
-					/* double offset_deg = radio->rx_pll_freq_offset * (180.0 / M_PI); */
-					/* LOGP(DRADIO, LOGL_DEBUG, "Stereo: offset=%.1fdeg pilot=%.6f\n", offset_deg, pilot_mag); */
+				static double dbg_accum = 0.0;
+				dbg_accum += signal_num;
+				if (dbg_accum >= radio->signal_samplerate) {
+					dbg_accum = 0.0;
+					LOGP(DRADIO, LOGL_DEBUG,
+					     "Stereo pilot: mag=%.4f avg=%.4f phase_off=%.1fdeg locked=%d "
+					     "above=%.0fms below=%.0fms cooldown=%.0fms\n",
+					     pilot_mag,
+					     radio->rx_pilot_mag_avg,
+					     radio->rx_pll_freq_offset * (180.0 / M_PI),
+					     radio->rx_pilot_locked,
+					     radio->rx_pilot_above_samples / radio->signal_samplerate * 1000.0,
+					     radio->rx_pilot_below_samples / radio->signal_samplerate * 1000.0,
+					     (radio->rx_pilot_cooldown > 0.0 ? radio->rx_pilot_cooldown : 0.0) / radio->signal_samplerate * 1000.0);
 				}
 			}
-			
+
+			/* --- Pilot lock/unlock with integrating hysteresis + cooldown ---
+			 *
+			 * Two independent counters accumulate time while the pilot is
+			 * continuously above LOCK_THR (for acquisition) or continuously
+			 * below UNLOCK_THR (for loss).  A single block going the wrong
+			 * way resets that counter, so noise spikes can't trigger a switch.
+			 * State only changes after ACQUIRE/LOSS duration is met AND the
+			 * cooldown from the last transition has expired.
+			 *
+			 * IEC 62106 / ITU-R BS.450 consumer practice: 50–200 ms each way.
+			 */
+			if (radio->rx_pilot_cooldown > 0.0)
+				radio->rx_pilot_cooldown -= signal_num;
+
+			if (!radio->rx_pilot_locked) {
+				/* Trying to acquire stereo — use smoothed magnitude to ignore noise dips */
+				if (radio->rx_pilot_mag_avg >= PILOT_LOCK_THR) {
+					radio->rx_pilot_above_samples += signal_num;
+					radio->rx_pilot_below_samples  = 0.0;
+					if (radio->rx_pilot_cooldown <= 0.0 &&
+					    radio->rx_pilot_above_samples >= PILOT_ACQUIRE_S * radio->signal_samplerate) {
+						radio->rx_pilot_locked        = 1;
+						radio->rx_pilot_above_samples = 0.0;
+						radio->rx_pilot_cooldown      = PILOT_COOLDOWN_S * radio->signal_samplerate;
+						LOGP(DRADIO, LOGL_NOTICE, "Stereo pilot locked (mag=%.4f avg=%.4f)\n",
+						     pilot_mag, radio->rx_pilot_mag_avg);
+					}
+				} else {
+					radio->rx_pilot_above_samples = 0.0;
+				}
+			} else {
+				/* Monitoring for pilot loss */
+				if (radio->rx_pilot_mag_avg < PILOT_UNLOCK_THR) {
+					radio->rx_pilot_below_samples += signal_num;
+					radio->rx_pilot_above_samples  = 0.0;
+					if (radio->rx_pilot_cooldown <= 0.0 &&
+					    radio->rx_pilot_below_samples >= PILOT_LOSS_S * radio->signal_samplerate) {
+						radio->rx_pilot_locked        = 0;
+						radio->rx_pilot_below_samples = 0.0;
+						radio->rx_pilot_cooldown      = PILOT_COOLDOWN_S * radio->signal_samplerate;
+						LOGP(DRADIO, LOGL_NOTICE, "Stereo pilot lost (mag=%.4f avg=%.4f), switching to mono\n",
+						     pilot_mag, radio->rx_pilot_mag_avg);
+					}
+				} else {
+					radio->rx_pilot_below_samples = 0.0;
+				}
+			}
+
 			/* Filter stereo channels to match bandwidth */
 			iir_process(&radio->rx_lp_sum, samples[0], signal_num);
 			iir_process(&radio->rx_lp_diff, samples[1], signal_num);
+
+			/* If pilot not locked, zero the diff channel → mono fallback.
+			 * The L/R matrix below produces L=R=sum, clean mono output. */
+			if (!radio->rx_pilot_locked) {
+				for (i = 0; i < signal_num; i++)
+					samples[1][i] = 0.0;
+			}
 		}
 		if (radio->emphasis) {
 			/* RX path: DC filter -> de-emphasis

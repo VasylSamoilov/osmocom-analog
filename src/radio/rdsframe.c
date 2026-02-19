@@ -794,6 +794,30 @@ void rds_group_decode(const uint16_t blocks[4], const uint8_t block_status[4],
 		break;
 
 	default:
+		/* Group 7A: Radio Paging (EN 50067 Annex M) */
+		if (frame->group_type == RDS_GROUP_7A) {
+			frame->paging_ab = (b2 >> 4) & 1;
+			frame->paging_psac = b2 & 0x0F;
+			if (block_status[2] != RDS_STATUS_ERROR)
+				frame->paging_block_c = blocks[2];
+			if (block_status[3] != RDS_STATUS_ERROR)
+				frame->paging_block_d = blocks[3];
+			break;
+		}
+		/* Group 13A: Enhanced Radio Paging */
+		if (frame->group_type == RDS_GROUP_13A) {
+			frame->erp_sty = (b2 >> 2) & 0x07;
+			if (block_status[2] != RDS_STATUS_ERROR) {
+				frame->erp_cs = (blocks[2] >> 14) & 0x03;
+				frame->erp_it = (blocks[2] >> 10) & 0x0F;
+				frame->erp_notify = (blocks[2] & 0x03FF) << 15;
+			}
+			if (block_status[3] != RDS_STATUS_ERROR) {
+				frame->erp_notify |= (blocks[3] >> 1) & 0x7FFF;
+				frame->erp_s1 = blocks[3] & 1;
+			}
+			break;
+		}
 		/* Other groups: log as unknown for now */
 		if (debug)
 			LOGP(DFRAME, LOGL_DEBUG, "  (group type not fully decoded)\n");

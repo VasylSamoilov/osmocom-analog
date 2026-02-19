@@ -1,15 +1,22 @@
-/* FCCH Burst Detector Implementation
+/* FCCH Burst Detector - adaptive error detector with tone estimation
  *
- * Adaptive filter-based FCCH detection, ported from kalibrate.
- * Reference: "Robust Frequency Burst Detection Algorithm for GSM/GPRS"
- *            by Varma, Sahu, and Charan.
+ * This implementation is inspired by the kalibrate BSD-licensed FCCH
+ * detector (Joshua Lackey), itself based on:
+ *   Varma, Sahu, Charan - "Robust Frequency Burst Detection Algorithm
+ *   for GSM / GPRS".
  *
- * (C) 2010 Joshua Lackey (original kalibrate)
- * (C) 2026 Osmocom-analog contributors (C port)
- * GPLv3
+ * We use adaptive-filter normalized error to find pure-tone neighborhoods,
+ * then estimate tone frequency from that neighborhood.
+ *
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
+ * All Rights Reserved
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -22,326 +29,373 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* Buffer operations */
-static int buffer_init(fcch_buffer_t *buf, int size)
+#define DETECT_FFT_SIZE 1024
+#define DETECT_FFT_LOG2 10
+
+/* Tuned to match kalibrate-like behavior while keeping false locks down. */
+#define ADAPT_DEFAULT_D 8
+#define ADAPT_DEFAULT_P (1.0 / 32.0)
+#define ADAPT_DEFAULT_G (1.0 / 12.5)
+#define ADAPT_FILTER_DELAY 8
+#define PRECOND_TARGET_RMS 0.20
+#define PRECOND_MIN_RMS 1e-6
+
+static inline double c_norm2(double re, double im)
 {
-    buf->data = calloc(size * 2, sizeof(float));  /* I/Q interleaved */
-    if (!buf->data)
-        return -ENOMEM;
-    buf->size = size;
-    buf->head = 0;
-    buf->count = 0;
-    return 0;
+	return re * re + im * im;
 }
 
-static void buffer_exit(fcch_buffer_t *buf)
+static inline void iq_at(const float *iq, int idx, double *re, double *im)
 {
-    free(buf->data);
-    memset(buf, 0, sizeof(*buf));
+	*re = iq[idx * 2];
+	*im = iq[idx * 2 + 1];
 }
 
-static void buffer_flush(fcch_buffer_t *buf)
+/* Instantaneous-frequency variance (Hz^2): pure tones are low variance,
+ * modulated bursts (like SCH) are much higher. */
+static double inst_freq_var_hz2(const float *iq, int n, double sample_rate)
 {
-    buf->head = 0;
-    buf->count = 0;
+	if (n < 8)
+		return 0.0;
+	double sum = 0.0, sum2 = 0.0;
+	int m = 0;
+	for (int i = 1; i < n; i++) {
+		double r0 = iq[(i - 1) * 2], i0 = iq[(i - 1) * 2 + 1];
+		double r1 = iq[i * 2],       i1 = iq[i * 2 + 1];
+		double pr = r1 * r0 + i1 * i0;
+		double pi = i1 * r0 - r1 * i0;
+		double dphi = atan2(pi, pr);
+		double hz = dphi * sample_rate / (2.0 * M_PI);
+		sum += hz;
+		sum2 += hz * hz;
+		m++;
+	}
+	if (m < 4)
+		return 0.0;
+	double mean = sum / m;
+	double var = (sum2 / m) - mean * mean;
+	return (var > 0.0) ? var : 0.0;
 }
 
-static int buffer_write(fcch_buffer_t *buf, float i, float q)
+static int detect_tone_from_segment(fcch_detect_t *det, const float *iq, int n,
+				    double *offset_hz, double *snr_db,
+				    int *peak_bin, double *peak_hz)
 {
-    if (buf->count >= buf->size)
-        return 0;
-    int idx = (buf->head + buf->count) % buf->size;
-    buf->data[idx * 2] = i;
-    buf->data[idx * 2 + 1] = q;
-    buf->count++;
-    return 1;
+	if (n < 64)
+		return 0;
+
+	double fft_r[DETECT_FFT_SIZE];
+	double fft_i[DETECT_FFT_SIZE];
+	memset(fft_r, 0, sizeof(fft_r));
+	memset(fft_i, 0, sizeof(fft_i));
+
+	int copy_n = (n < DETECT_FFT_SIZE) ? n : DETECT_FFT_SIZE;
+	for (int i = 0; i < copy_n; i++) {
+		fft_r[i] = iq[i * 2];
+		fft_i[i] = iq[i * 2 + 1];
+	}
+
+	fft_process(1, DETECT_FFT_LOG2, fft_r, fft_i);
+
+	double bin_hz = det->sample_rate / (double)DETECT_FFT_SIZE;
+	int tone_bin = (int)lround(FCCH_FREQ / bin_hz);
+	int search_bins = (int)ceil(FCCH_SEARCH_HZ / bin_hz);
+	int lo = tone_bin - search_bins;
+	int hi = tone_bin + search_bins;
+	if (lo < 2) lo = 2;
+	if (hi > DETECT_FFT_SIZE / 2 - 2) hi = DETECT_FFT_SIZE / 2 - 2;
+	if (hi <= lo)
+		return 0;
+
+	int best = lo;
+	double best_mag = c_norm2(fft_r[lo], fft_i[lo]);
+	double sum = 0.0;
+	int cnt = 0;
+	for (int b = lo; b <= hi; b++) {
+		double mag = c_norm2(fft_r[b], fft_i[b]);
+		if (mag > best_mag) {
+			best_mag = mag;
+			best = b;
+		}
+		sum += mag;
+		cnt++;
+	}
+	if (cnt < 4 || best_mag <= 0.0)
+		return 0;
+
+	double avg = (sum - best_mag) / (double)(cnt - 1);
+	if (avg <= 0.0)
+		return 0;
+	double snr = 10.0 * log10(best_mag / avg);
+	if (snr < FCCH_MIN_SNR_DB)
+		return 0;
+
+	double alpha = c_norm2(fft_r[best - 1], fft_i[best - 1]);
+	double beta  = best_mag;
+	double gamma = c_norm2(fft_r[best + 1], fft_i[best + 1]);
+	double denom = alpha - 2.0 * beta + gamma;
+	double delta = 0.0;
+	if (fabs(denom) > 1e-30)
+		delta = 0.5 * (alpha - gamma) / denom;
+
+	double freq = ((double)best + delta) * bin_hz;
+	double off = freq - FCCH_FREQ;
+	if (fabs(off) > FCCH_OFFSET_MAX)
+		return 0;
+
+	if (offset_hz) *offset_hz = off;
+	if (snr_db) *snr_db = snr;
+	if (peak_bin) *peak_bin = best;
+	if (peak_hz) *peak_hz = freq;
+	return 1;
 }
 
-static void buffer_get(fcch_buffer_t *buf, int offset, float *i, float *q)
+static int scan_for_fcch(fcch_detect_t *det, double *offset, double *snr_db,
+			 int *consumed_samples)
 {
-    int idx = (buf->head + offset) % buf->size;
-    *i = buf->data[idx * 2];
-    *q = buf->data[idx * 2 + 1];
-}
+	const float *s = det->scan_iq;
+	int s_len = det->scan_count;
+	if (s_len < 256)
+		return 0;
 
-static void buffer_purge(fcch_buffer_t *buf, int count)
-{
-    if (count > buf->count)
-        count = buf->count;
-    buf->head = (buf->head + count) % buf->size;
-    buf->count -= count;
-}
+	double sps = det->sample_rate / GSM_RATE;
+	int min_fb_len = (int)lround(100.0 * sps);
+	int fcch_len = (int)lround(148.0 * sps);
+	int frame_len = (int)lround(156.25 * sps);
+	if (min_fb_len < 64) min_fb_len = 64;
+	if (fcch_len < min_fb_len) fcch_len = min_fb_len;
 
-/* Vector norm squared */
-static double vectornorm2(fcch_buffer_t *buf, int start, int len)
-{
-    double sum = 0;
-    for (int i = 0; i < len; i++) {
-        float re, im;
-        buffer_get(buf, start + i, &re, &im);
-        sum += re * re + im * im;
-    }
-    return sum;
-}
+	int max_err = s_len;
+	double *errs = malloc(max_err * sizeof(double));
+	int *err_pos = malloc(max_err * sizeof(int));
+	if (!errs || !err_pos) {
+		free(errs);
+		free(err_pos);
+		return 0;
+	}
 
-/* Compute next normalized error sample */
-static int next_norm_error(fcch_detect_t *det, float *error)
-{
-    int n = FCCH_FILTER_LEN - 1;
-    int required = n + FCCH_DELAY + 1;
-    
-    if (det->x_buf.count < required)
-        return -1;  /* Not enough samples */
-    
-    /* Calculate energy for gain adaptation */
-    double E = vectornorm2(&det->x_buf, 0, FCCH_FILTER_LEN);
-    if (det->G >= 2.0 / E)
-        det->G = 1.0 / E;
-    
-    /* Calculate filtered value: y = sum(conj(w[i]) * x[n-i]) */
-    double y_re = 0, y_im = 0;
-    for (int i = 0; i < FCCH_FILTER_LEN; i++) {
-        float x_re, x_im;
-        buffer_get(&det->x_buf, n - i, &x_re, &x_im);
-        /* conj(w) * x = (w_re - j*w_im) * (x_re + j*x_im) */
-        y_re += det->w_real[i] * x_re + det->w_imag[i] * x_im;
-        y_im += det->w_real[i] * x_im - det->w_imag[i] * x_re;
-    }
-    
-    /* Get desired signal (delayed input) */
-    float d_re, d_im;
-    buffer_get(&det->x_buf, n + FCCH_DELAY, &d_re, &d_im);
-    
-    /* Calculate error */
-    double e_re = d_re - y_re;
-    double e_im = d_im - y_im;
-    
-    /* Update filter weights with opposite gradient */
-    for (int i = 0; i < FCCH_FILTER_LEN; i++) {
-        float x_re, x_im;
-        buffer_get(&det->x_buf, n - i, &x_re, &x_im);
-        /* w += G * conj(e) * x */
-        det->w_real[i] += det->G * (e_re * x_re + e_im * x_im);
-        det->w_imag[i] += det->G * (e_re * x_im - e_im * x_re);
-    }
-    
-    /* Update average error power */
-    double e_power = e_re * e_re + e_im * e_im;
-    E /= FCCH_FILTER_LEN;
-    det->e_avg = (1.0 - det->p) * det->e_avg + det->p * e_power;
-    
-    /* Return normalized error */
-    if (error)
-        *error = (E > 0) ? (float)(det->e_avg / E) : 0;
-    
-    /* Remove processed sample */
-    buffer_purge(&det->x_buf, 1);
-    
-    return 0;
-}
+	int err_count = 0;
+	double err_sum = 0.0;
+	int n0 = det->adapt_w_len - 1;
+	for (int n = n0; n + det->adapt_delay < s_len; n++) {
+		double e_in = 0.0;
+		double y_re = 0.0, y_im = 0.0;
+		for (int i = 0; i < det->adapt_w_len; i++) {
+			double xr, xi;
+			iq_at(s, n - i, &xr, &xi);
+			e_in += c_norm2(xr, xi);
+			y_re += det->w_real[i] * xr + det->w_imag[i] * xi;
+			y_im += det->w_real[i] * xi - det->w_imag[i] * xr;
+		}
+		e_in /= det->adapt_w_len;
+		if (e_in <= 1e-12)
+			continue;
 
-/* Detect frequency using FFT */
-static double freq_detect(fcch_detect_t *det, const float *iq, int len, double *pm)
-{
-    int fft_len = (len < FCCH_FFT_SIZE) ? len : FCCH_FFT_SIZE;
-    int m = 0, n = FCCH_FFT_SIZE;
-    
-    /* Calculate log2 for FFT */
-    while (n > 1) { n >>= 1; m++; }
-    
-    /* Copy samples to FFT buffers */
-    for (int i = 0; i < fft_len; i++) {
-        det->fft_real[i] = iq[i * 2];
-        det->fft_imag[i] = iq[i * 2 + 1];
-    }
-    for (int i = fft_len; i < FCCH_FFT_SIZE; i++) {
-        det->fft_real[i] = 0;
-        det->fft_imag[i] = 0;
-    }
-    
-    /* Execute FFT */
-    fft_process(1, m, det->fft_real, det->fft_imag);
-    
-    /* Find peak and calculate mean */
-    double peak_power = 0;
-    double sum_power = 0;
-    int peak_bin = 0;
-    
-    for (int i = 0; i < FCCH_FFT_SIZE; i++) {
-        double power = det->fft_real[i] * det->fft_real[i] + 
-                       det->fft_imag[i] * det->fft_imag[i];
-        sum_power += power;
-        if (power > peak_power) {
-            peak_power = power;
-            peak_bin = i;
-        }
-    }
-    
-    double mean_power = (sum_power - peak_power) / (FCCH_FFT_SIZE - 1);
-    if (pm)
-        *pm = (mean_power > 0) ? (peak_power / mean_power) : 0;
-    
-    /* Parabolic interpolation for sub-bin accuracy */
-    int i0 = (peak_bin - 1 + FCCH_FFT_SIZE) % FCCH_FFT_SIZE;
-    int i2 = (peak_bin + 1) % FCCH_FFT_SIZE;
-    double y0 = det->fft_real[i0] * det->fft_real[i0] + det->fft_imag[i0] * det->fft_imag[i0];
-    double y1 = peak_power;
-    double y2 = det->fft_real[i2] * det->fft_real[i2] + det->fft_imag[i2] * det->fft_imag[i2];
-    
-    double delta = 0;
-    double denom = y0 - 2.0 * y1 + y2;
-    if (denom != 0)
-        delta = 0.5 * (y0 - y2) / denom;
-    
-    double peak_index = peak_bin + delta;
-    
-    /* Convert to frequency */
-    double freq = peak_index * (det->sample_rate / FCCH_FFT_SIZE);
-    if (peak_index > FCCH_FFT_SIZE / 2)
-        freq -= det->sample_rate;
-    
-    return freq;
+		double dr, di;
+		iq_at(s, n + det->adapt_delay, &dr, &di);
+		double er = dr - y_re;
+		double ei = di - y_im;
+		double en = c_norm2(er, ei);
+
+		for (int i = 0; i < det->adapt_w_len; i++) {
+			double xr, xi;
+			iq_at(s, n - i, &xr, &xi);
+			det->w_real[i] += det->adapt_g * (er * xr + ei * xi);
+			det->w_imag[i] += det->adapt_g * (er * xi - ei * xr);
+		}
+
+		det->adapt_err_ema = (1.0 - det->adapt_p) * det->adapt_err_ema + det->adapt_p * en;
+		double ratio = det->adapt_err_ema / e_in;
+		errs[err_count] = ratio;
+		err_pos[err_count] = n;
+		err_sum += ratio;
+		err_count++;
+	}
+
+	if (err_count < 64) {
+		free(errs);
+		free(err_pos);
+		return 0;
+	}
+
+	double avg = err_sum / err_count;
+	double limit = 0.7 * avg;
+	int low = 0, run_start = 0;
+
+	for (int i = 0; i < err_count; i++) {
+		int is_low = (errs[i] <= limit);
+		if (!low && is_low) {
+			low = 1;
+			run_start = i;
+		} else if (low && !is_low) {
+			int sidx = err_pos[run_start];
+			int eidx = err_pos[i - 1];
+			int run_len = eidx - sidx + 1;
+			low = 0;
+
+			if (run_len >= min_fb_len) {
+				int y_len = (run_len < fcch_len) ? run_len : fcch_len;
+				double off = 0.0, snr = 0.0, phz = 0.0;
+				int pbin = 0;
+				if (detect_tone_from_segment(det, s + sidx * 2, y_len,
+							     &off, &snr, &pbin, &phz)) {
+					/* SCH confirmation guard:
+					 * In GSM TS0, SCH follows FCCH by one frame. FCCH is CW-like
+					 * (low phase-variance), while SCH is data-modulated (higher
+					 * phase-variance). Reject tone families that do not show this. */
+					int sch_ok = 1;
+					int sch_start = sidx + frame_len;
+					/* Guard is for far-offset spur families. Do not penalize
+					 * near-center candidates; those are handled by clustering. */
+					if (fabs(off) >= 3000.0 && sch_start + fcch_len < s_len) {
+						double var_fcch = inst_freq_var_hz2(s + sidx * 2, y_len, det->sample_rate);
+						double var_sch  = inst_freq_var_hz2(s + sch_start * 2, fcch_len, det->sample_rate);
+						/* Reject only when SCH frame looks too similar to FCCH
+						 * (continuous-tone behavior) with a stricter ratio. */
+						if (var_fcch > 0.0 && var_sch <= var_fcch * 1.30) {
+							sch_ok = 0;
+							det->bursts_rejected++;
+						}
+					}
+					if (!sch_ok)
+						continue;
+
+					if (offset) *offset = off;
+					if (snr_db) *snr_db = snr;
+					det->last_snr_db = snr;
+					det->last_peak_bin = pbin;
+					det->last_peak_hz = phz;
+					det->last_burst_len = y_len;
+					det->bursts_found++;
+					if (consumed_samples)
+						*consumed_samples = sidx + y_len;
+					free(errs);
+					free(err_pos);
+					return 1;
+				}
+			}
+		}
+	}
+
+	/* If buffer gets crowded, consume old samples to keep runtime bounded. */
+	if (consumed_samples && s_len > (FCCH_SCAN_BUF_SAMPLES * 3) / 4)
+		*consumed_samples = s_len / 2;
+
+	free(errs);
+	free(err_pos);
+	return 0;
 }
 
 int fcch_detect_init(fcch_detect_t *det, double sample_rate)
 {
-    int rc;
-    
-    memset(det, 0, sizeof(*det));
-    det->sample_rate = sample_rate;
-    det->sps = sample_rate / GSM_RATE;
-    det->min_burst_len = (int)(100 * det->sps);  /* 100 symbols minimum */
-    det->fcch_burst_len = (int)(148 * det->sps); /* Full FCCH burst */
-    
-    /* Initialize adaptive filter */
-    det->G = 0.01;
-    det->p = 0.01;
-    det->e_avg = 0;
-    memset(det->w_real, 0, sizeof(det->w_real));
-    memset(det->w_imag, 0, sizeof(det->w_imag));
-    
-    /* Allocate buffers - enough for 12 frames + 1 burst */
-    int buf_size = (int)ceil((12 * 8 * 156.25 + 156.25) * det->sps);
-    
-    rc = buffer_init(&det->x_buf, buf_size);
-    if (rc < 0) return rc;
-    
-    rc = buffer_init(&det->e_buf, buf_size);
-    if (rc < 0) {
-        buffer_exit(&det->x_buf);
-        return rc;
-    }
-    
-    /* Allocate FFT buffers */
-    det->fft_real = calloc(FCCH_FFT_SIZE, sizeof(double));
-    det->fft_imag = calloc(FCCH_FFT_SIZE, sizeof(double));
-    if (!det->fft_real || !det->fft_imag) {
-        fcch_detect_exit(det);
-        return -ENOMEM;
-    }
-    
-    return 0;
+	memset(det, 0, sizeof(*det));
+	det->sample_rate = sample_rate;
+	det->bin_hz = sample_rate / (double)DETECT_FFT_SIZE;
+
+	det->adapt_delay = ADAPT_DEFAULT_D;
+	det->adapt_w_len = 2 * ADAPT_FILTER_DELAY + 1;
+	det->adapt_p = ADAPT_DEFAULT_P;
+	det->adapt_g = ADAPT_DEFAULT_G;
+	det->adapt_err_ema = 0.0;
+
+	det->w_real = calloc(det->adapt_w_len, sizeof(double));
+	det->w_imag = calloc(det->adapt_w_len, sizeof(double));
+	det->scan_iq = calloc(FCCH_SCAN_BUF_SAMPLES * 2, sizeof(float));
+	if (!det->w_real || !det->w_imag || !det->scan_iq) {
+		fcch_detect_exit(det);
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 int fcch_detect_process(fcch_detect_t *det, const float *iq_in, int num_samples,
-                        double *offset)
+			double *offset, double *snr_db)
 {
-    float errors[8192];  /* Error values for this batch */
-    int e_count = 0;
-    double e_sum = 0;
-    
-    /* Add samples to buffer and compute errors */
-    for (int i = 0; i < num_samples && e_count < 8192; i++) {
-        buffer_write(&det->x_buf, iq_in[i * 2], iq_in[i * 2 + 1]);
-        
-        float e;
-        if (next_norm_error(det, &e) == 0) {
-            errors[e_count++] = e;
-            e_sum += e;
-        }
-    }
-    
-    if (e_count < det->min_burst_len)
-        return 0;  /* Not enough samples */
-    
-    /* Calculate average error and threshold */
-    double avg_error = e_sum / e_count;
-    double limit = 0.7 * avg_error;
-    
-    /* Find low-error neighborhoods */
-    int low_count = 0;
-    int best_start = -1;
-    int best_len = 0;
-    
-    for (int i = 0; i < e_count; i++) {
-        if (errors[i] < limit) {
-            low_count++;
-        } else {
-            if (low_count > best_len) {
-                best_len = low_count;
-                best_start = i - low_count;
-            }
-            low_count = 0;
-        }
-    }
-    if (low_count > best_len) {
-        best_len = low_count;
-        best_start = e_count - low_count;
-    }
-    
-    /* Check if we found a long enough low-error region */
-    if (best_len < det->min_burst_len || best_start < 0)
-        return 0;
-    
-    /* Get the samples for this region from input */
-    int fft_len = (best_len < det->fcch_burst_len) ? best_len : det->fcch_burst_len;
-    if (best_start + fft_len > num_samples)
-        fft_len = num_samples - best_start;
-    
-    if (fft_len < det->min_burst_len)
-        return 0;
-    
-    /* Detect frequency */
-    double pm;
-    double freq = freq_detect(det, iq_in + best_start * 2, fft_len, &pm);
-    
-    /* Check peak/mean threshold */
-    if (pm < FCCH_MIN_PM) {
-        det->bursts_rejected++;
-        return 0;
-    }
-    
-    /* Valid FCCH detected! */
-    det->bursts_found++;
-    
-    /* Calculate offset from expected FCCH frequency */
-    double fcch_offset = freq - FCCH_FREQ;
-    
-    /* Sanity check */
-    if (fabs(fcch_offset) > FCCH_OFFSET_MAX)
-        return 0;
-    
-    if (offset)
-        *offset = fcch_offset;
-    
-    return 1;
+	if (num_samples <= 0)
+		return 0;
+
+	det->total_frames += (num_samples >= 1024) ? (num_samples / 1024) : 1;
+
+	/* Append input; if not enough room, drop oldest half. */
+	if (det->scan_count + num_samples > FCCH_SCAN_BUF_SAMPLES) {
+		int keep = det->scan_count / 2;
+		memmove(det->scan_iq, det->scan_iq + (det->scan_count - keep) * 2,
+			keep * 2 * sizeof(float));
+		det->scan_count = keep;
+	}
+	int copy = num_samples;
+	if (copy > FCCH_SCAN_BUF_SAMPLES - det->scan_count)
+		copy = FCCH_SCAN_BUF_SAMPLES - det->scan_count;
+	float *dst = det->scan_iq + det->scan_count * 2;
+	memcpy(dst, iq_in, copy * 2 * sizeof(float));
+
+	/* Quick front-end conditioning:
+	 * - remove per-block DC (I/Q mean)
+	 * - normalize RMS to a gentle target
+	 * This improves detector stability when RF gain/device levels vary. */
+	double mean_i = 0.0, mean_q = 0.0;
+	for (int i = 0; i < copy; i++) {
+		mean_i += dst[i * 2];
+		mean_q += dst[i * 2 + 1];
+	}
+	mean_i /= copy;
+	mean_q /= copy;
+	double pwr = 0.0;
+	for (int i = 0; i < copy; i++) {
+		double re = dst[i * 2] - mean_i;
+		double im = dst[i * 2 + 1] - mean_q;
+		dst[i * 2] = (float)re;
+		dst[i * 2 + 1] = (float)im;
+		pwr += re * re + im * im;
+	}
+	double rms = sqrt(pwr / (double)copy);
+	if (rms > PRECOND_MIN_RMS) {
+		double g = PRECOND_TARGET_RMS / rms;
+		if (g > 4.0) g = 4.0;
+		if (g < 0.25) g = 0.25;
+		for (int i = 0; i < copy; i++) {
+			dst[i * 2] *= (float)g;
+			dst[i * 2 + 1] *= (float)g;
+		}
+	}
+
+	det->scan_count += copy;
+
+	int consumed = 0;
+	int rc = scan_for_fcch(det, offset, snr_db, &consumed);
+	if (consumed > 0 && consumed <= det->scan_count) {
+		memmove(det->scan_iq, det->scan_iq + consumed * 2,
+			(det->scan_count - consumed) * 2 * sizeof(float));
+		det->scan_count -= consumed;
+	}
+	if (rc > 0)
+		return 1;
+
+	/* Count non-detections as rejected attempts for diagnostics parity. */
+	det->bursts_rejected++;
+	return 0;
 }
 
 void fcch_detect_reset(fcch_detect_t *det)
 {
-    buffer_flush(&det->x_buf);
-    buffer_flush(&det->e_buf);
-    det->G = 0.01;
-    det->e_avg = 0;
-    memset(det->w_real, 0, sizeof(det->w_real));
-    memset(det->w_imag, 0, sizeof(det->w_imag));
+	det->scan_count = 0;
+	det->last_burst_len = 0;
+	det->total_frames = 0;
+	det->adapt_err_ema = 0.0;
+	if (det->w_real)
+		memset(det->w_real, 0, det->adapt_w_len * sizeof(double));
+	if (det->w_imag)
+		memset(det->w_imag, 0, det->adapt_w_len * sizeof(double));
 }
 
 void fcch_detect_exit(fcch_detect_t *det)
 {
-    buffer_exit(&det->x_buf);
-    buffer_exit(&det->e_buf);
-    free(det->fft_real);
-    free(det->fft_imag);
-    memset(det, 0, sizeof(*det));
+	free(det->w_real);
+	free(det->w_imag);
+	free(det->scan_iq);
+	det->w_real = NULL;
+	det->w_imag = NULL;
+	det->scan_iq = NULL;
 }
+

@@ -26,6 +26,7 @@
 static int rds_debug = 0;
 static int rds_verbose = 0;
 static int force_rbds = 0;
+static int paging_enabled = 0;
 
 /* Parse a single hex group line from .hexrds format.
  * Handles:
@@ -163,6 +164,7 @@ static void print_usage(const char *prog)
 	printf("  --rds-debug   Enable RDS decoder debug (raw hex codes, field extraction)\n");
 	printf("  --rds-verbose Enable RDS decoder verbose (human-readable decoded fields)\n");
 	printf("  --rbds        Force RBDS decoding (callsign lookup, US PTY names)\n");
+	printf("  --paging      Enable Radio Paging decoding (Group 7A, 1A RPC, 13A)\n");
 	printf("  --help        Show this help\n\n");
 	printf("Supported formats:\n");
 	printf("  .hexrds     Hex text (RDS Spy, redsea, RdsSurveyor2)\n");
@@ -196,6 +198,8 @@ int main(int argc, char *argv[])
 			rds_verbose = 1;
 		} else if (strcmp(argv[i], "--rbds") == 0) {
 			force_rbds = 1;
+		} else if (strcmp(argv[i], "--paging") == 0) {
+			paging_enabled = 1;
 		} else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
 			print_usage(argv[0]);
 			return 0;
@@ -236,6 +240,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to init decoder for %s\n", files[i]);
 			continue;
 		}
+		rds.paging_enabled = paging_enabled;
 
 		int groups;
 		if (is_binary_rds(files[i]))

@@ -184,6 +184,19 @@ typedef struct rds_frame {
 	uint16_t		eon_pin;	/* PIN for ON - from C (v14) */
 	uint16_t		eon_bcast;	/* Broadcaster data - from C (v15) */
 
+	/* Group 7A specific (EN 50067 Annex M) - Radio Paging */
+	uint8_t			paging_ab;	/* A/B flag - from B bit 4 */
+	uint8_t			paging_psac;	/* PSAC value - from B bits 3-0 */
+	uint16_t		paging_block_c;	/* Raw Block C data */
+	uint16_t		paging_block_d;	/* Raw Block D data */
+
+	/* Group 13A specific (EN 50067 Annex M) - Enhanced Radio Paging */
+	uint8_t			erp_sty;	/* Sub-type - from B bits 4-2 */
+	uint8_t			erp_cs;		/* Cycle Selection - from C bits 15-14 */
+	uint8_t			erp_it;		/* Interval Number - from C bits 13-10 */
+	uint32_t		erp_notify;	/* 25 notification bits - from C+D */
+	uint8_t			erp_s1;		/* Sort indicator - from D bit 0 */
+
 } rds_frame_t;
 
 /* Status helper: convert status to display character */

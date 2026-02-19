@@ -30,6 +30,7 @@ bin_PROGRAMS += \
 osmoradio_SOURCES = \
 	radio.c \
 	sca.c \
+	rds_protocol.c \
 	main.c
 osmoradio_LDADD = \
 	$(COMMON_LA) \
@@ -54,6 +55,7 @@ osmoradio_LDADD = \
 	$(LIBOSMOCORE_LIBS) \
 	$(UHD_LIBS) \
 	$(SOAPY_LIBS) \
+	$(RPITX_LIBS) \
 	-lm
 
 if HAVE_ALSA

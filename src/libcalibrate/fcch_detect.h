@@ -1,15 +1,18 @@
-/* FCCH Burst Detector
+/* FCCH Burst Detector - adaptive filter + burst scan
  *
- * Adaptive filter-based FCCH (Frequency Correction Channel) burst detector.
- * Ported from kalibrate by Joshua Lackey.
+ * Detects GSM FCCH bursts using a kalibrate-style adaptive filter
+ * error metric (Varma et al.) to find pure-tone neighborhoods, then
+ * estimates tone frequency from that neighborhood.
  *
- * The FCCH is a pure sine wave at GSM_RATE/4 (67.7 kHz). This detector
- * uses an adaptive filter to track the signal and identify low-error
- * "neighborhoods" where a pure tone exists.
+ * This is closer to GSM MS behavior than pure "strongest FFT peak".
  *
- * (C) 2010 Joshua Lackey (original kalibrate)
- * (C) 2026 Osmocom-analog contributors (C port)
- * GPLv3
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
+ * All Rights Reserved
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  */
 
 #ifndef FCCH_DETECT_H
@@ -21,69 +24,49 @@
 #define GSM_RATE            (1625000.0 / 6.0)   /* 270833.33 Hz */
 #define FCCH_FREQ           (GSM_RATE / 4.0)    /* 67708.33 Hz */
 
-/* Detection parameters (from kalibrate) */
-#define FCCH_FFT_SIZE       1024
-#define FCCH_MIN_PM         50.0    /* Minimum peak/mean for valid detection */
-#define FCCH_OFFSET_MAX     40000.0 /* Maximum allowable offset in Hz */
+/* Detection thresholds */
+#define FCCH_MIN_SNR_DB     6.0     /* Min peak-to-mean SNR on detected burst */
+#define FCCH_OFFSET_MAX     40000.0 /* Max allowable offset Hz */
+#define FCCH_SEARCH_HZ      20000.0 /* ±20 kHz search window (covers ~10 ppm at 1900 MHz) */
+#define FCCH_SCAN_BUF_SAMPLES 16384 /* Complex samples in detector scan buffer */
 
-/* Adaptive filter parameters */
-#define FCCH_FILTER_LEN     21      /* Adaptive filter length (odd) */
-#define FCCH_DELAY          4       /* Prediction delay */
-
-/* Circular buffer for samples */
-typedef struct fcch_buffer {
-    float *data;        /* Interleaved I/Q */
-    int size;           /* Buffer size in samples */
-    int head;           /* Write position */
-    int count;          /* Samples in buffer */
-} fcch_buffer_t;
-
-/* FCCH detector state */
 typedef struct fcch_detect {
-    double sample_rate;         /* Input sample rate */
-    double sps;                 /* Samples per GSM symbol */
-    int min_burst_len;          /* Minimum burst length in samples */
-    int fcch_burst_len;         /* FCCH burst length in samples */
-    
-    /* Adaptive filter state */
-    float w_real[FCCH_FILTER_LEN];  /* Filter weights (real) */
-    float w_imag[FCCH_FILTER_LEN];  /* Filter weights (imag) */
-    double G;                   /* Adaptive gain */
-    double p;                   /* Smoothing factor */
-    double e_avg;               /* Average error power */
-    
-    /* Sample buffers */
-    fcch_buffer_t x_buf;        /* Input sample buffer */
-    fcch_buffer_t e_buf;        /* Error buffer */
-    
-    /* FFT for frequency detection */
-    double *fft_real;
-    double *fft_imag;
-    
+    double sample_rate;
+    double bin_hz;
+
+    /* Adaptive detector state (kalibrate-style) */
+    int adapt_delay;
+    int adapt_w_len;
+    double adapt_p;
+    double adapt_g;
+    double adapt_err_ema;
+    double *w_real;
+    double *w_imag;
+
+    /* Rolling scan buffer (interleaved IQ float) */
+    float *scan_iq;
+    int scan_count;
+    int last_burst_len;         /* accepted burst neighborhood length (samples) */
+    int total_frames;           /* processed analysis windows */
+
     /* Statistics */
     int bursts_found;
     int bursts_rejected;
+    double last_snr_db;
+    double last_peak_hz;
+    int last_peak_bin;
+    int detect_fail_count;      /* reserved */
 } fcch_detect_t;
 
-/* Initialize FCCH detector
- * sample_rate: Input sample rate in Hz (should be ~270833 for GSM)
- * Returns 0 on success, <0 on error
- */
 int fcch_detect_init(fcch_detect_t *det, double sample_rate);
 
-/* Process samples and detect FCCH burst
- * iq_in: Interleaved I/Q samples
- * num_samples: Number of sample pairs
- * offset: Output frequency offset from expected FCCH (if detected)
- * Returns: 1 if FCCH burst detected, 0 if not, <0 on error
- */
+/* Returns 1 if FCCH detected, 0 if not yet.
+ * offset: frequency error from expected FCCH (Hz)
+ * snr_db: measured SNR (may be NULL) */
 int fcch_detect_process(fcch_detect_t *det, const float *iq_in, int num_samples,
-                        double *offset);
+                        double *offset, double *snr_db);
 
-/* Reset detector state (keep parameters) */
 void fcch_detect_reset(fcch_detect_t *det);
-
-/* Free detector resources */
 void fcch_detect_exit(fcch_detect_t *det);
 
-#endif /* FCCH_DETECT_H */
+#endif

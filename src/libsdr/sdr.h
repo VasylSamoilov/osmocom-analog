@@ -10,4 +10,6 @@ int sdr_get_tosend(void *inst, int buffer_size);
 void calibrate_bias(void);
 void *sdr_open_channelizer(int direction, const char *audiodev, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math);
 int sdr_get_samplerate(void *inst);
+int sdr_set_rx_frequency(double frequency);
+int sdr_set_tx_frequency(double frequency);
 int sdr_calculate_optimal_rate(int master_rate, double bandwidth);

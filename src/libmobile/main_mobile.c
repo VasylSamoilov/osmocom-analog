@@ -612,6 +612,9 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		break;
 	case 's':
 		dsp_samplerate = atoi(argv[argi]);
+#ifdef HAVE_SDR
+		sdr_config->samplerate_given = 1;
+#endif
 		break;
 	case 'i':
 		dsp_interval = atof(argv[argi]);

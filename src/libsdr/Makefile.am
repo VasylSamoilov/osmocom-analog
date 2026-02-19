@@ -5,7 +5,8 @@ noinst_LIBRARIES = libsdr.a
 
 libsdr_a_SOURCES = \
 	sdr_config.c \
-	sdr.c
+	sdr.c \
+	sdr_status.c
 
 AM_CPPFLAGS += -DHAVE_SDR
 
@@ -22,5 +23,12 @@ AM_CPPFLAGS += -DHAVE_SOAPY
 libsdr_a_SOURCES += \
 	soapy.c \
 	split_sdr.c
+endif
+
+if HAVE_RPITX
+AM_CPPFLAGS += -DHAVE_RPITX
+
+libsdr_a_SOURCES += \
+	rpitx.cpp
 endif
 

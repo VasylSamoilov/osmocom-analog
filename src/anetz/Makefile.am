@@ -42,9 +42,11 @@ if HAVE_SDR
 anetz_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
 	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
-	$(SOAPY_LIBS)
+	$(SOAPY_LIBS) \
+	$(RPITX_LIBS)
 endif
 

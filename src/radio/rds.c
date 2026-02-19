@@ -22,6 +22,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/time.h>
 #include "rds.h"
 #include "rds_tables.h"
 #include "../liblogging/logging.h"
@@ -316,6 +318,7 @@ int rds_af_method_a_parse(const char *input, rds_af_method_a_t *out)
 		token = strtok_r(NULL, ", \t", &saveptr);
 	}
 	
+	/* Debug: AF Method A parse result (shown when log level includes DEBUG) */
 	LOGP(DRADIO, LOGL_DEBUG, "AF Method A: Parsed %d VHF + %d LF/MF = %d slots\n",
 	     out->vhf_count, out->lf_mf_count, out->slot_count);
 	
@@ -471,6 +474,7 @@ int rds_af_method_b_parse(const char *input, rds_af_method_b_list_t *out)
 		return -1;
 	}
 	
+	/* Debug: AF Method B parse result (shown when log level includes DEBUG) */
 	LOGP(DRADIO, LOGL_DEBUG, "AF Method B: Parsed tuning=%.1f, %d AFs\n",
 	     out->tuning_freq / 10.0, out->af_count);
 	
@@ -770,6 +774,316 @@ static void rds_af_decode_complete(rds_decoder_t *rds)
  *   Block D [16 bits]: PS chars (2 per group)
  *
  * Complete PS name (8 chars) requires 4 groups (segments 0-3).
+ * ============================================================ */
+
+/* ============================================================
+ * PAGING BCD AND ADDRESS UTILITIES (EN 50067 Annex M)
+ * ============================================================ */
+
+/* Encode digit string to BCD nibbles.
+ * '0'-'9' -> 0x0-0x9, ' ' -> 0xA.
+ * Returns number of nibbles written. */
+int rds_paging_bcd_encode(const char *digits, int len, uint8_t *nibbles, int max_nibbles)
+{
+	int i, count = 0;
+
+	for (i = 0; i < len && count < max_nibbles; i++) {
+		if (digits[i] >= '0' && digits[i] <= '9')
+			nibbles[count++] = digits[i] - '0';
+		else if (digits[i] == ' ')
+			nibbles[count++] = RDS_PAGING_BCD_SPACE;
+	}
+	return count;
+}
+
+/* Decode BCD nibbles to digit string.
+ * 0x0-0x9 -> '0'-'9', 0xA -> ' '.
+ * Nibbles 0xB-0xF treated as space with warning.
+ * Returns string length (not including NUL). */
+int rds_paging_bcd_decode(const uint8_t *nibbles, int count, char *digits, int max_len)
+{
+	int i, len = 0;
+
+	for (i = 0; i < count && len < max_len - 1; i++) {
+		if (nibbles[i] <= RDS_PAGING_BCD_MAX)
+			digits[len++] = '0' + nibbles[i];
+		else if (nibbles[i] == RDS_PAGING_BCD_SPACE)
+			digits[len++] = ' ';
+		else {
+			LOGP(DRADIO, LOGL_DEBUG, "RDS Paging: invalid BCD nibble 0x%X, treating as space\n", nibbles[i]);
+			digits[len++] = ' ';
+		}
+	}
+	digits[len] = '\0';
+	return len;
+}
+
+/* Pack 6-digit address into Block C (16 bits) and Block D upper byte (8 bits).
+ * address = Y1Y2Z1Z2Z3Z4 as integer (e.g. 100466).
+ * Block C: Y1(4) Y2(4) Z1(4) Z2(4)
+ * Block D upper: Z3(4) Z4(4) */
+void rds_paging_addr_pack(uint32_t address, uint16_t *block_c, uint8_t *block_d_hi)
+{
+	uint8_t d[6];
+
+	/* Extract 6 digits from integer */
+	d[0] = (address / 100000) % 10;	/* Y1 */
+	d[1] = (address / 10000) % 10;	/* Y2 */
+	d[2] = (address / 1000) % 10;	/* Z1 */
+	d[3] = (address / 100) % 10;	/* Z2 */
+	d[4] = (address / 10) % 10;	/* Z3 */
+	d[5] = address % 10;		/* Z4 */
+
+	*block_c = (d[0] << 12) | (d[1] << 8) | (d[2] << 4) | d[3];
+	*block_d_hi = (d[4] << 4) | d[5];
+}
+
+/* Unpack address from Block C and Block D upper byte.
+ * Returns 6-digit integer. */
+uint32_t rds_paging_addr_unpack(uint16_t block_c, uint8_t block_d_hi)
+{
+	uint32_t addr;
+
+	addr  = ((block_c >> 12) & 0xF) * 100000;
+	addr += ((block_c >> 8) & 0xF) * 10000;
+	addr += ((block_c >> 4) & 0xF) * 1000;
+	addr += (block_c & 0xF) * 100;
+	addr += ((block_d_hi >> 4) & 0xF) * 10;
+	addr += block_d_hi & 0xF;
+
+	return addr;
+}
+
+/* ============================================================
+ * PAGING MESSAGE QUEUE AND API
+ * ============================================================ */
+
+/* Forward declarations */
+static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg);
+
+static rds_paging_msg_t *rds_paging_msg_alloc(enum rds_paging_msg_type type,
+					       uint32_t address, const char *data,
+					       int data_len, int repeats, int interval)
+{
+	rds_paging_msg_t *msg = calloc(1, sizeof(*msg));
+	if (!msg)
+		return NULL;
+	msg->type = type;
+	msg->address = address;
+	if (data && data_len > 0) {
+		if (data_len > (int)sizeof(msg->data) - 1)
+			data_len = sizeof(msg->data) - 1;
+		memcpy(msg->data, data, data_len);
+	}
+	msg->data_len = data_len;
+	msg->repeats_left = repeats;
+	msg->repeat_interval = interval;
+	msg->next_send_time = 0;
+	msg->next = NULL;
+	return msg;
+}
+
+static void rds_paging_enqueue(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
+{
+	if (pag->queue_count >= RDS_PAGING_QUEUE_MAX) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: queue full (%d), dropping message\n", pag->queue_count);
+		free(msg);
+		return;
+	}
+	msg->next = NULL;
+	if (pag->queue_tail)
+		pag->queue_tail->next = msg;
+	else
+		pag->queue_head = msg;
+	pag->queue_tail = msg;
+	pag->queue_count++;
+}
+
+static rds_paging_msg_t *rds_paging_dequeue(rds_paging_enc_t *pag)
+{
+	rds_paging_msg_t *msg = pag->queue_head;
+	if (!msg)
+		return NULL;
+	pag->queue_head = msg->next;
+	if (!pag->queue_head)
+		pag->queue_tail = NULL;
+	msg->next = NULL;
+	pag->queue_count--;
+	return msg;
+}
+
+static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
+{
+	rds_paging_msg_t *msg;
+	while ((msg = rds_paging_dequeue(pag)) != NULL)
+		free(msg);
+	if (pag->tx_msg) {
+		free(pag->tx_msg);
+		pag->tx_msg = NULL;
+	}
+	pag->tx_active = 0;
+}
+
+/* Try to start transmitting the next queued message */
+static void rds_paging_start_next(rds_encoder_t *rds)
+{
+	rds_paging_enc_t *pag = &rds->paging;
+	rds_paging_msg_t *msg;
+	time_t now = time(NULL);
+
+	if (pag->tx_active)
+		return;
+
+	/* Free previous message if done */
+	if (pag->tx_msg) {
+		free(pag->tx_msg);
+		pag->tx_msg = NULL;
+	}
+
+	/* Find next ready message */
+	while ((msg = pag->queue_head) != NULL) {
+		if (msg->next_send_time <= now) {
+			rds_paging_dequeue(pag);
+			pag->tx_msg = msg;
+			pag->ab_flag ^= 1;  /* Toggle A/B flag */
+			rds_paging_precompute(pag, msg);
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging: TX start addr=%06u type=%d AB=%d repeats_left=%d\n",
+			     msg->address, msg->type, pag->ab_flag, msg->repeats_left);
+			rds_scheduler_update(rds);
+			return;
+		}
+		break;  /* Head not ready yet, wait */
+	}
+
+	/* No message to send - update scheduler to remove 7A */
+	rds_scheduler_update(rds);
+}
+
+/* Called when a message transmission completes (tx_active becomes 0) */
+static void rds_paging_tx_complete(rds_encoder_t *rds)
+{
+	rds_paging_enc_t *pag = &rds->paging;
+	rds_paging_msg_t *msg = pag->tx_msg;
+
+	if (!msg)
+		return;
+
+	if (msg->repeats_left > 0) {
+		/* Re-enqueue for retransmission */
+		msg->repeats_left--;
+		msg->next_send_time = time(NULL) + msg->repeat_interval;
+		pag->tx_msg = NULL;
+		rds_paging_enqueue(pag, msg);
+	} else {
+		free(msg);
+		pag->tx_msg = NULL;
+	}
+
+	/* Try to start next message */
+	rds_paging_start_next(rds);
+}
+
+/* Public API: queue a tone-only page */
+int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
+			     int repeats, int interval_sec)
+{
+	rds_paging_msg_t *msg;
+
+	if (address > RDS_PAGING_ADDR_MAX)
+		return -1;
+	if (repeats < 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+
+	msg = rds_paging_msg_alloc(RDS_PAGING_TONE, address, NULL, 0, repeats, interval_sec);
+	if (!msg)
+		return -1;
+
+	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
+/* Public API: queue a numeric page (auto-selects 10 or 18 digit) */
+int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
+				const char *digits, int repeats, int interval_sec)
+{
+	rds_paging_msg_t *msg;
+	enum rds_paging_msg_type type;
+	int len;
+
+	if (address > RDS_PAGING_ADDR_MAX || !digits)
+		return -1;
+
+	len = strlen(digits);
+	if (len > RDS_PAGING_NUM18_DIGITS)
+		return -1;
+
+	type = (len <= RDS_PAGING_NUM10_DIGITS) ? RDS_PAGING_NUM10 : RDS_PAGING_NUM18;
+	if (repeats < 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+
+	msg = rds_paging_msg_alloc(type, address, digits, len, repeats, interval_sec);
+	if (!msg)
+		return -1;
+
+	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
+/* Public API: queue an alphanumeric page */
+int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
+			      const char *text, int repeats, int interval_sec)
+{
+	rds_paging_msg_t *msg;
+	int len;
+
+	if (address > RDS_PAGING_ADDR_MAX || !text)
+		return -1;
+
+	len = strlen(text);
+	if (len > RDS_PAGING_ALPHA_MAX)
+		len = RDS_PAGING_ALPHA_MAX;
+
+	if (repeats < 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+
+	msg = rds_paging_msg_alloc(RDS_PAGING_ALPHA, address, text, len, repeats, interval_sec);
+	if (!msg)
+		return -1;
+
+	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
+/* Public API: enable/disable paging */
+void rds_enc_paging_enable(rds_encoder_t *rds, int enable)
+{
+	rds->paging.enabled = enable;
+	if (!enable)
+		rds_paging_queue_destroy(&rds->paging);
+	rds_scheduler_update(rds);
+}
+
+/* Public API: set RPC value for Group 1A */
+void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc)
+{
+	rds->paging.rpc = rpc & 0x1F;
+}
+
+/* Public API: enable/disable enhanced paging (13A) */
+void rds_enc_paging_set_enhanced(rds_encoder_t *rds, int enable)
+{
+	rds->paging.enhanced = enable;
+	rds_scheduler_update(rds);
+}
+
+/* ============================================================
+ * GROUP BUILDERS
+ * ============================================================
+ *
+ * Group 0A: Basic Tuning and Switching (PS + AF)
  * ============================================================ */
 
 static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
@@ -1162,11 +1476,15 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	/* Block A: PI */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 	
-	/* Block B: Group 1A + TP + PTY 
-	 * Bits 4-0: Radio Paging codes (set to 0, deprecated) */
+	/* Block B: Group 1A + TP + PTY
+	 * Bits 4-0: Radio Paging Codes (RPC) - EN 50067 Annex M
+	 * When paging enabled: bits 4-2 = group designation, bits 1-0 = battery saving sync
+	 * When paging not enabled: bits 4-0 = 0 (modern standard behavior) */
 	b2 = (RDS_GROUP_1A << RDS_B2_GROUP_SHIFT) |
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT);
+	if (rds->paging.enabled)
+		b2 |= (rds->paging.rpc & 0x1F);
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 	
 	/* Block C: LA + Variant + Payload (IEC 62106 Table 9)
@@ -1641,7 +1959,7 @@ static void rds_build_group_4a(rds_encoder_t *rds, uint8_t *group)
 	
 #if defined(__GLIBC__) || defined(__linux__)
 	/* Debug Log */
-	{
+	if (rds->debug) {
 		float off_h = offset_half_hours / 2.0;
 		int l_h = t->tm_hour + (int)off_h;
 		int l_m = t->tm_min + (int)((off_h - (int)off_h) * 60);
@@ -1896,6 +2214,209 @@ static void rds_build_group_14b(rds_encoder_t *rds, uint8_t *group)
 
 
 /* ============================================================
+ * GROUP 7A: RADIO PAGING (EN 50067 Annex M)
+ * ============================================================ */
+
+/* Pre-compute block C/D values and PSAC sequence for a paging message.
+ * Called when a new message starts transmission. */
+static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
+{
+	uint16_t addr_c;
+	uint8_t addr_d_hi;
+	int idx = 0;
+
+	rds_paging_addr_pack(msg->address, &addr_c, &addr_d_hi);
+
+	switch (msg->type) {
+	case RDS_PAGING_TONE:
+		/* 1 group: PSAC=0, address only */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_TONE;
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8);
+		pag->tx_total_groups = 1;
+		break;
+
+	case RDS_PAGING_NUM10: {
+		/* 2 groups: address+2 digits, then 8 digits */
+		uint8_t nibbles[RDS_PAGING_NUM10_DIGITS];
+		int ncount;
+		char padded[RDS_PAGING_NUM10_DIGITS + 1];
+		int i, plen = msg->data_len;
+
+		if (plen > RDS_PAGING_NUM10_DIGITS)
+			plen = RDS_PAGING_NUM10_DIGITS;
+		memcpy(padded, msg->data, plen);
+		for (i = plen; i < RDS_PAGING_NUM10_DIGITS; i++)
+			padded[i] = ' ';
+		ncount = rds_paging_bcd_encode(padded, RDS_PAGING_NUM10_DIGITS, nibbles, RDS_PAGING_NUM10_DIGITS);
+		(void)ncount;
+
+		/* Group 0: address + first 2 digits */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_NUM10_ADDR;
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (nibbles[0] << 4) | nibbles[1];
+
+		/* Group 1: remaining 8 digits */
+		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM10_DATA;
+		pag->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) | (nibbles[4] << 4) | nibbles[5];
+		pag->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) | (nibbles[8] << 4) | nibbles[9];
+
+		pag->tx_total_groups = 2;
+		break;
+	}
+
+	case RDS_PAGING_NUM18: {
+		/* 3 groups: address+2 digits, 8 digits, 8 digits */
+		uint8_t nibbles[RDS_PAGING_NUM18_DIGITS];
+		char padded[RDS_PAGING_NUM18_DIGITS + 1];
+		int i, plen = msg->data_len;
+
+		if (plen > RDS_PAGING_NUM18_DIGITS)
+			plen = RDS_PAGING_NUM18_DIGITS;
+		memcpy(padded, msg->data, plen);
+		for (i = plen; i < RDS_PAGING_NUM18_DIGITS; i++)
+			padded[i] = ' ';
+		rds_paging_bcd_encode(padded, RDS_PAGING_NUM18_DIGITS, nibbles, RDS_PAGING_NUM18_DIGITS);
+
+		/* Group 0: address + first 2 digits */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_NUM18_ADDR;
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (nibbles[0] << 4) | nibbles[1];
+
+		/* Group 1: digits 3-10 */
+		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;
+		pag->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) | (nibbles[4] << 4) | nibbles[5];
+		pag->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) | (nibbles[8] << 4) | nibbles[9];
+
+		/* Group 2: digits 11-18 */
+		pag->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;
+		pag->tx_blocks_c[2] = (nibbles[10] << 12) | (nibbles[11] << 8) | (nibbles[12] << 4) | nibbles[13];
+		pag->tx_blocks_d[2] = (nibbles[14] << 12) | (nibbles[15] << 8) | (nibbles[16] << 4) | nibbles[17];
+
+		pag->tx_total_groups = 3;
+		break;
+	}
+
+	case RDS_PAGING_ALPHA: {
+		/* Variable groups: address, data groups (4 chars each), end marker */
+		int len = msg->data_len;
+		int padded_len, ngroups, i;
+
+		if (len > RDS_PAGING_ALPHA_MAX)
+			len = RDS_PAGING_ALPHA_MAX;
+
+		/* Pad to multiple of 4 */
+		padded_len = ((len + 3) / 4) * 4;
+		ngroups = padded_len / 4;
+
+		/* Group 0: address */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8);
+		idx = 1;
+
+		/* Data groups: 4 chars each, PSAC cycles 9-14 */
+		for (i = 0; i < ngroups; i++) {
+			int ci = i * 4;
+			uint8_t c0 = (ci < len) ? (uint8_t)msg->data[ci] : 0x20;
+			uint8_t c1 = (ci + 1 < len) ? (uint8_t)msg->data[ci + 1] : 0x20;
+			uint8_t c2 = (ci + 2 < len) ? (uint8_t)msg->data[ci + 2] : 0x20;
+			uint8_t c3 = (ci + 3 < len) ? (uint8_t)msg->data[ci + 3] : 0x20;
+
+			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (i % 6);
+			pag->tx_blocks_c[idx] = (c0 << 8) | c1;
+			pag->tx_blocks_d[idx] = (c2 << 8) | c3;
+			idx++;
+		}
+
+		/* End marker */
+		pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
+		pag->tx_blocks_c[idx] = 0;
+		pag->tx_blocks_d[idx] = 0;
+		idx++;
+
+		pag->tx_total_groups = idx;
+		break;
+	}
+	}
+
+	pag->tx_group_idx = 0;
+	pag->tx_active = 1;
+}
+
+/* Build one Group 7A frame from current paging transmission state.
+ * Called by rds_generate_group() when scheduler selects RDS_GROUP_7A. */
+static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2;
+	rds_paging_enc_t *pag = &rds->paging;
+	int gi = pag->tx_group_idx;
+
+	/* Block A: PI */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+
+	/* Block B: Group 7A + TP + PTY + A/B flag + PSAC */
+	b2 = (RDS_GROUP_7A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     ((pag->ab_flag & 1) << RDS_7A_AB_FLAG_BIT) |
+	     (pag->tx_psac_seq[gi] & RDS_7A_PSAC_MASK);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+
+	/* Block C and D: pre-computed data */
+	blocks[2] = rds_build_block(pag->tx_blocks_c[gi], RDS_OFFSET_C);
+	blocks[3] = rds_build_block(pag->tx_blocks_d[gi], RDS_OFFSET_D);
+
+	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Group 7A [%d/%d] PSAC=%d AB=%d C=%04X D=%04X\n",
+		     gi + 1, pag->tx_total_groups, pag->tx_psac_seq[gi],
+		     pag->ab_flag, pag->tx_blocks_c[gi], pag->tx_blocks_d[gi]);
+
+	/* Advance to next group */
+	pag->tx_group_idx++;
+	if (pag->tx_group_idx >= pag->tx_total_groups) {
+		/* Message transmission complete */
+		pag->tx_active = 0;
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging: message transmission complete (addr=%06u type=%d)\n",
+		     pag->tx_msg->address, pag->tx_msg->type);
+	}
+}
+
+/* Build Group 13A sub-type 000 for enhanced paging address notification. */
+static void rds_build_group_13a_paging(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2, b3, b4;
+	rds_paging_enc_t *pag = &rds->paging;
+
+	/* Block A: PI */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+
+	/* Block B: Group 13A + TP + PTY + STY=000 */
+	b2 = (RDS_GROUP_13A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT);
+	/* STY=000, reserved bits=00 -> bits 4-0 = 0 */
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+
+	/* Block C: CS(2) + IT(4) + notify bits 24-15 (10 bits) */
+	b3 = ((pag->cycle_selection & 0x3) << RDS_13A_CS_SHIFT) |
+	     (0 << RDS_13A_IT_SHIFT) |  /* IT=0 for now */
+	     ((pag->notify_bits >> 15) & RDS_13A_NOTIFY_HI_MASK);
+	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+
+	/* Block D: notify bits 14-0 (15 bits) + S1(1) */
+	b4 = ((pag->notify_bits & 0x7FFF) << RDS_13A_NOTIFY_LO_SHIFT);
+	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+
+	rds_group_pack(blocks, group, 0);
+}
+
+
+/* ============================================================
  * RDS GROUP SCHEDULER (Fixed Cyclic Sequence)
  * ============================================================
  * 
@@ -1993,6 +2514,17 @@ void rds_scheduler_update(rds_encoder_t *rds)
 	/* Block 7: EON (14A) - optional append */
 	if (has_eon) {
 		ADD_GRP(RDS_GROUP_14A);
+	}
+	
+	/* Block 7b: Paging (7A) - 2 slots when message active for adequate bandwidth */
+	if (rds->paging.enabled && (rds->paging.tx_active || rds->paging.queue_head)) {
+		ADD_GRP(RDS_GROUP_7A);
+		ADD_GRP(RDS_GROUP_7A);
+	}
+	
+	/* Block 7c: Enhanced paging (13A) - 1 slot when enabled */
+	if (rds->paging.enhanced) {
+		ADD_GRP(RDS_GROUP_13A);
 	}
 	
 	/* Block 8: ODA identification (3A) - cycles through configured ODAs */
@@ -2161,13 +2693,29 @@ static void rds_generate_group(rds_encoder_t *rds)
 	case RDS_GROUP_14B:
 		rds_build_group_14b(rds, rds->group_buffer);
 		break;
+	/* Group 7A: Radio Paging or ODA */
+	case RDS_GROUP_7A:
+		if (rds->paging.enabled && rds->paging.tx_active) {
+			rds_build_group_7a(rds, rds->group_buffer);
+			break;
+		}
+		/* Fall through to ODA routing when paging not active */
+		goto oda_route;
+	/* Group 13A: Enhanced Radio Paging or ODA */
+	case RDS_GROUP_13A:
+		if (rds->paging.enhanced) {
+			rds_build_group_13a_paging(rds, rds->group_buffer);
+			break;
+		}
+		/* Fall through to ODA routing when enhanced paging not active */
+		goto oda_route;
 	/* ODA groups (11A-13B, etc.) - route to specific ODA builders */
 	case RDS_GROUP_11A:
 	case RDS_GROUP_11B:
 	case RDS_GROUP_12A:
 	case RDS_GROUP_12B:
-	case RDS_GROUP_13A:
 	case RDS_GROUP_13B:
+	oda_route:
 		/* Route to ODA-specific builders based on configured ODAs */
 		{
 			int carrier_code = (int)type;
@@ -2244,6 +2792,10 @@ static void rds_generate_group(rds_encoder_t *rds)
 	if (rds->group_sched_index >= rds->group_sched_len) {
 		rds->group_sched_index = 0;
 	}
+	
+	/* Check if paging message transmission just completed */
+	if (rds->paging.enabled && !rds->paging.tx_active && rds->paging.tx_msg)
+		rds_paging_tx_complete(rds);
 	
 	// /* Debug: Log every group generated in RDS Spy format */
 	// {
@@ -2601,9 +3153,11 @@ void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
 	LOGP(DRADIO, LOGL_INFO, "RDS: RadioText set (%d chars), A/B flag toggled %c->%c\n",
 	     len, old_ab ? 'B' : 'A', rds->rt_ab ? 'B' : 'A');
 	/* Convert RDS-encoded RT to Unicode for logging */
-	char rt_display[257];  /* 64 chars * 4 bytes UTF-8 max + 1 */
-	rds_text_to_display((uint8_t *)rds->rt, 64, rt_display, sizeof(rt_display));
-	LOGP(DRADIO, LOGL_DEBUG, "RDS: RT content: \"%s\"\n", rt_display);
+	if (rds->debug) {
+		char rt_display[257];  /* 64 chars * 4 bytes UTF-8 max + 1 */
+		rds_text_to_display((uint8_t *)rds->rt, 64, rt_display, sizeof(rt_display));
+		LOGP(DRADIO, LOGL_DEBUG, "RDS: RT content: \"%s\"\n", rt_display);
+	}
 	
 	/* Update scheduler sequence (RT presence may have changed) */
 	rds_scheduler_update(rds);
@@ -2926,8 +3480,9 @@ static void rds_dps_compute_word_pages(rds_encoder_t *rds)
 		}
 	}
 	
-	LOGP(DRADIO, LOGL_DEBUG, "RDS DPS WORD: Computed %d word pages\n",
-	     rds->ps_dyn_word_count);
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS DPS WORD: Computed %d word pages\n",
+		     rds->ps_dyn_word_count);
 }
 
 /**
@@ -2970,8 +3525,9 @@ static void rds_dps_split_pages(rds_encoder_t *rds, const char *text)
 		token = strtok_r(NULL, delim_str, &saveptr);
 	}
 	
-	LOGP(DRADIO, LOGL_DEBUG, "RDS DPS PAGE: Split into %d pages\n",
-	     rds->ps_dyn_page_count);
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS DPS PAGE: Split into %d pages\n",
+		     rds->ps_dyn_page_count);
 }
 
 /**
@@ -3279,53 +3835,106 @@ void rds_enc_get_dynamic_ps_text(const rds_encoder_t *rds, char *text, size_t le
  * RT+ (RadioText Plus) Encoder API Implementation
  * ============================================================ */
 
-int rds_enc_rtplus_add_tag(rds_encoder_t *rds, uint8_t content_type, 
-                           uint8_t start, uint8_t length)
+int rds_enc_rtplus_set_tags(rds_encoder_t *rds,
+                            uint8_t ct1, uint8_t start1, uint8_t len1,
+                            uint8_t ct2, uint8_t start2, uint8_t len2)
 {
 	rds_rtplus_encoder_t *rtplus = &rds->rtplus;
 	
-	if (rtplus->tag_count >= RDS_RTPLUS_MAX_TAGS) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Tag array full (max %d tags)\n",
-		     RDS_RTPLUS_MAX_TAGS);
-		return -1;
+	/* Check if this is a "no tags" call (both tags are dummy_class with len=0)
+	 * Per RT+ spec, content_type=0 is dummy_class meaning "no tag" */
+	int has_tag1 = (ct1 != 0 || len1 != 0);
+	int has_tag2 = (len2 > 0);
+	
+	if (!has_tag1 && !has_tag2) {
+		/* No valid tags - set running=0, toggle, clear tags */
+		rtplus->toggle = !rtplus->toggle;
+		rtplus->item_running = 0;
+		rtplus->tag_count = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS RT+: No tags (dummy), toggle=%d running=%d\n",
+		     rtplus->toggle, rtplus->item_running);
+		return 0;
 	}
 	
-	if (content_type > 63) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid content_type %d (max 63)\n",
-		     content_type);
-		return -1;
+	/* Validate tag1 (required if not dummy) */
+	if (has_tag1) {
+		if (ct1 > 63) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid tag1 content_type %d (max 63)\n", ct1);
+			return -1;
+		}
+		if (start1 > RDS_RTPLUS_MAX_START) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid tag1 start %d (max %d)\n",
+			     start1, RDS_RTPLUS_MAX_START);
+			return -1;
+		}
+		if (len1 == 0 || len1 > RDS_RTPLUS_MAX_LEN_TAG1) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid tag1 length %d (1-%d)\n",
+			     len1, RDS_RTPLUS_MAX_LEN_TAG1);
+			return -1;
+		}
 	}
 	
-	if (start > RDS_RTPLUS_MAX_START) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid start %d (max %d)\n",
-		     start, RDS_RTPLUS_MAX_START);
-		return -1;
+	if (has_tag2) {
+		if (ct2 > 63) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid tag2 content_type %d (max 63)\n", ct2);
+			return -1;
+		}
+		if (start2 > RDS_RTPLUS_MAX_START) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid tag2 start %d (max %d)\n",
+			     start2, RDS_RTPLUS_MAX_START);
+			return -1;
+		}
+		if (len2 > RDS_RTPLUS_MAX_LEN_TAG2) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid tag2 length %d (1-%d)\n",
+			     len2, RDS_RTPLUS_MAX_LEN_TAG2);
+			return -1;
+		}
 	}
 	
-	uint8_t max_len = (rtplus->tag_count == 0) ? RDS_RTPLUS_MAX_LEN_TAG1 : RDS_RTPLUS_MAX_LEN_TAG2;
-	if (length == 0 || length > max_len) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: Invalid length %d (max %d for tag %d)\n",
-		     length, max_len, rtplus->tag_count + 1);
-		return -1;
+	/* Toggle the toggle bit (per RT+ spec, toggle changes when tags change) */
+	rtplus->toggle = !rtplus->toggle;
+	
+	/* Set tag1 */
+	rtplus->tags[0].content_type = ct1;
+	rtplus->tags[0].start = start1;
+	rtplus->tags[0].length = len1;
+	
+	/* Set tag2 if provided */
+	if (has_tag2) {
+		rtplus->tags[1].content_type = ct2;
+		rtplus->tags[1].start = start2;
+		rtplus->tags[1].length = len2;
+		rtplus->tag_count = 2;
+	} else {
+		rtplus->tag_count = 1;
 	}
 	
-	rds_rtplus_tag_t *tag = &rtplus->tags[rtplus->tag_count];
-	tag->content_type = content_type;
-	tag->start = start;
-	tag->length = length;
-	rtplus->tag_count++;
+	/* Set item_running = 1 when valid tags are set */
+	rtplus->item_running = 1;
 	
-	const char *ct_name = rds_get_rtplus_content_type(content_type);
-	LOGP(DRADIO, LOGL_INFO, "RDS RT+: Added tag%d type=%d (%s) start=%d len=%d\n",
-	     rtplus->tag_count, content_type, ct_name ? ct_name : "Unknown", start, length);
+	const char *ct1_name = rds_get_rtplus_content_type(ct1);
+	if (has_tag2) {
+		const char *ct2_name = rds_get_rtplus_content_type(ct2);
+		LOGP(DRADIO, LOGL_INFO, "RDS RT+: Set tag1=%d(%s) @%d+%d, tag2=%d(%s) @%d+%d, toggle=%d running=%d\n",
+		     ct1, ct1_name ? ct1_name : "?", start1, len1,
+		     ct2, ct2_name ? ct2_name : "?", start2, len2,
+		     rtplus->toggle, rtplus->item_running);
+	} else {
+		LOGP(DRADIO, LOGL_INFO, "RDS RT+: Set tag1=%d(%s) @%d+%d, toggle=%d running=%d\n",
+		     ct1, ct1_name ? ct1_name : "?", start1, len1,
+		     rtplus->toggle, rtplus->item_running);
+	}
 	
 	return 0;
 }
 
 void rds_enc_rtplus_clear_tags(rds_encoder_t *rds)
 {
+	/* Clear tags and set running=0 (no toggle flip on clear) */
+	rds->rtplus.item_running = 0;
 	rds->rtplus.tag_count = 0;
-	LOGP(DRADIO, LOGL_INFO, "RDS RT+: Tags cleared\n");
+	LOGP(DRADIO, LOGL_INFO, "RDS RT+: Tags cleared, toggle=%d running=%d\n",
+	     rds->rtplus.toggle, rds->rtplus.item_running);
 }
 
 void rds_enc_rtplus_set_toggle(rds_encoder_t *rds, int toggle)
@@ -3362,57 +3971,107 @@ int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,
 }
 
 /* eRT+ API (same as RT+ but for eRT) */
-int rds_enc_ert_plus_add_tag(rds_encoder_t *rds, uint8_t content_type,
-                             uint8_t start, uint8_t length)
+int rds_enc_ert_plus_set_tags(rds_encoder_t *rds,
+                              uint8_t ct1, uint8_t start1, uint8_t len1,
+                              uint8_t ct2, uint8_t start2, uint8_t len2)
 {
 	rds_rtplus_encoder_t *ert_plus = &rds->ert_plus;
 	
-	if (ert_plus->tag_count >= RDS_RTPLUS_MAX_TAGS) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Tag array full (max %d tags)\n",
-		     RDS_RTPLUS_MAX_TAGS);
-		return -1;
+	/* Check if this is a "no tags" call (both tags are dummy_class with len=0)
+	 * Per RT+ spec, content_type=0 is dummy_class meaning "no tag" */
+	int has_tag1 = (ct1 != 0 || len1 != 0);
+	int has_tag2 = (len2 > 0);
+	
+	if (!has_tag1 && !has_tag2) {
+		/* No valid tags - set running=0, toggle, clear tags */
+		ert_plus->toggle = !ert_plus->toggle;
+		ert_plus->item_running = 0;
+		ert_plus->tag_count = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: No tags (dummy), toggle=%d running=%d\n",
+		     ert_plus->toggle, ert_plus->item_running);
+		return 0;
 	}
 	
-	if (content_type > 63) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid content_type %d (max 63)\n",
-		     content_type);
-		return -1;
+	/* Validate tag1 (required if not dummy) */
+	if (has_tag1) {
+		if (ct1 > 63) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid tag1 content_type %d (max 63)\n", ct1);
+			return -1;
+		}
+		/* eRT+ tags address CHARACTER position, not byte position!
+		 * eRT can have up to 128 bytes (128 characters if all ASCII, fewer if multi-byte UTF-8).
+		 * eRT+ tags can address the full 128 characters of eRT text. */
+		if (start1 > 127) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid tag1 start %d (max 127)\n", start1);
+			return -1;
+		}
+		if (len1 == 0 || len1 > RDS_RTPLUS_MAX_LEN_TAG1) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid tag1 length %d (1-%d)\n",
+			     len1, RDS_RTPLUS_MAX_LEN_TAG1);
+			return -1;
+		}
 	}
 	
-	/* eRT+ tags address CHARACTER position, not byte position!
-	 * eRT can have up to 128 bytes (128 characters if all ASCII, fewer if multi-byte UTF-8).
-	 * eRT+ tags can address the full 128 characters of eRT text.
-	 * Note: RT+ is limited to 64 characters for standard RT and combination of RT+ with eRT (without eRT+).
-	 * Note: For UTF-8, character count may be less than byte count if multi-byte chars exist. */
-	if (start > 127) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid start %d (max 127 characters)\n", start);
-		return -1;
+	if (has_tag2) {
+		if (ct2 > 63) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid tag2 content_type %d (max 63)\n", ct2);
+			return -1;
+		}
+		if (start2 > 127) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid tag2 start %d (max 127)\n", start2);
+			return -1;
+		}
+		if (len2 > RDS_RTPLUS_MAX_LEN_TAG2) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid tag2 length %d (1-%d)\n",
+			     len2, RDS_RTPLUS_MAX_LEN_TAG2);
+			return -1;
+		}
 	}
 	
-	uint8_t max_len = (ert_plus->tag_count == 0) ? RDS_RTPLUS_MAX_LEN_TAG1 : RDS_RTPLUS_MAX_LEN_TAG2;
-	if (length == 0 || length > max_len) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS eRT+: Invalid length %d (max %d for tag %d)\n",
-		     length, max_len, ert_plus->tag_count + 1);
-		return -1;
+	/* Toggle the toggle bit (per RT+ spec, toggle changes when tags change) */
+	ert_plus->toggle = !ert_plus->toggle;
+	
+	/* Set tag1 */
+	ert_plus->tags[0].content_type = ct1;
+	ert_plus->tags[0].start = start1;
+	ert_plus->tags[0].length = len1;
+	
+	/* Set tag2 if provided */
+	if (has_tag2) {
+		ert_plus->tags[1].content_type = ct2;
+		ert_plus->tags[1].start = start2;
+		ert_plus->tags[1].length = len2;
+		ert_plus->tag_count = 2;
+	} else {
+		ert_plus->tag_count = 1;
 	}
 	
-	rds_rtplus_tag_t *tag = &ert_plus->tags[ert_plus->tag_count];
-	tag->content_type = content_type;
-	tag->start = start;
-	tag->length = length;
-	ert_plus->tag_count++;
+	/* Set item_running = 1 when valid tags are set */
+	ert_plus->item_running = 1;
 	
-	const char *ct_name = rds_get_rtplus_content_type(content_type);
-	LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Added tag%d type=%d (%s) start=%d len=%d\n",
-	     ert_plus->tag_count, content_type, ct_name ? ct_name : "Unknown", start, length);
+	const char *ct1_name = rds_get_rtplus_content_type(ct1);
+	if (has_tag2) {
+		const char *ct2_name = rds_get_rtplus_content_type(ct2);
+		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Set tag1=%d(%s) @%d+%d, tag2=%d(%s) @%d+%d, toggle=%d running=%d\n",
+		     ct1, ct1_name ? ct1_name : "?", start1, len1,
+		     ct2, ct2_name ? ct2_name : "?", start2, len2,
+		     ert_plus->toggle, ert_plus->item_running);
+	} else {
+		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Set tag1=%d(%s) @%d+%d, toggle=%d running=%d\n",
+		     ct1, ct1_name ? ct1_name : "?", start1, len1,
+		     ert_plus->toggle, ert_plus->item_running);
+	}
 	
 	return 0;
 }
 
 void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds)
 {
+	/* Clear tags and set running=0 (no toggle flip on clear) */
+	rds->ert_plus.item_running = 0;
 	rds->ert_plus.tag_count = 0;
-	LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Tags cleared\n");
+	LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Tags cleared, toggle=%d running=%d\n",
+	     rds->ert_plus.toggle, rds->ert_plus.item_running);
 }
 
 void rds_enc_ert_plus_set_toggle(rds_encoder_t *rds, int toggle)
@@ -4989,6 +5648,7 @@ void rds_enc_oda_clear(rds_encoder_t *rds)
 
 void rds_encoder_exit(rds_encoder_t *rds)
 {
+	rds_paging_queue_destroy(&rds->paging);
 	if (rds->waveform_biphase) {
 		free(rds->waveform_biphase);
 		rds->waveform_biphase = NULL;
@@ -5486,12 +6146,50 @@ static void rds_decode_ert(rds_decoder_t *rds, const uint16_t *blocks,
 }
 
 /* Decode a complete group */
+/* Helper to write a 16-bit value as 4 hex chars */
+static void write_hex16(FILE *f, uint16_t val)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	fputc(hex[(val >> 12) & 0xF], f);
+	fputc(hex[(val >> 8) & 0xF], f);
+	fputc(hex[(val >> 4) & 0xF], f);
+	fputc(hex[val & 0xF], f);
+}
+
 static void rds_decode_group(rds_decoder_t *rds)
 {
 	uint16_t pi = rds->blocks[0];
 	uint16_t b2 = rds->blocks[1];
 	uint16_t b3 = rds->blocks[2];
 	uint16_t b4 = rds->blocks[3];
+	
+	/* Write to hexrds output file if enabled.
+	 * Format: "XXXX XXXX XXXX XXXX @YYYY/MM/DD HH:MM:SS.mmm" (RDS Spy format)
+	 * Uses ---- for missing blocks */
+	if (rds->hexrds_file) {
+		struct timeval tv;
+		struct tm *tm;
+		gettimeofday(&tv, NULL);
+		tm = localtime(&tv.tv_sec);
+		
+		if (rds->group_mask & (1<<0)) write_hex16(rds->hexrds_file, pi);
+		else fprintf(rds->hexrds_file, "----");
+		fputc(' ', rds->hexrds_file);
+		if (rds->group_mask & (1<<1)) write_hex16(rds->hexrds_file, b2);
+		else fprintf(rds->hexrds_file, "----");
+		fputc(' ', rds->hexrds_file);
+		if (rds->group_mask & (1<<2)) write_hex16(rds->hexrds_file, b3);
+		else fprintf(rds->hexrds_file, "----");
+		fputc(' ', rds->hexrds_file);
+		if (rds->group_mask & (1<<3)) write_hex16(rds->hexrds_file, b4);
+		else fprintf(rds->hexrds_file, "----");
+		
+		fprintf(rds->hexrds_file, " @%04d/%02d/%02d %02d:%02d:%02d.%03d\n",
+			tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+			tm->tm_hour, tm->tm_min, tm->tm_sec,
+			(int)(tv.tv_usec / 1000));
+		fflush(rds->hexrds_file);
+	}
 	
 	/* Use table-driven decoder for field extraction and logging (NMT-style)
 	 * This populates a frame structure using field definition tables */
@@ -5524,6 +6222,24 @@ static void rds_decode_group(rds_decoder_t *rds)
 	if ((rds->group_mask & (1<<1)) && rds->debug)
 		LOGP(DRADIO, LOGL_DEBUG, "RDS RX %d%c: PI=%04X B2=%04X B3=%04X B4=%04X\n",
 		     group_type, version ? 'B' : 'A', pi, b2, b3, b4);
+	
+	/* Per-group block quality (always log at DEBUG when debug enabled) */
+	if (rds->debug) {
+		LOGP(DRADIO, LOGL_DEBUG, "RDS QUALITY: blocks=[%c%c%c%c] status=[%s%s%s%s] mask=0x%X\n",
+		     (rds->group_mask & (1<<0)) ? 'A' : '-',
+		     (rds->group_mask & (1<<1)) ? 'B' : '-',
+		     (rds->group_mask & (1<<2)) ? 'C' : '-',
+		     (rds->group_mask & (1<<3)) ? 'D' : '-',
+		     rds->block_status[0] == RDS_STATUS_VALID ? "ok" :
+		       rds->block_status[0] == RDS_STATUS_CORRECTED ? "fec" : "BAD",
+		     rds->block_status[1] == RDS_STATUS_VALID ? " ok" :
+		       rds->block_status[1] == RDS_STATUS_CORRECTED ? " fec" : " BAD",
+		     rds->block_status[2] == RDS_STATUS_VALID ? " ok" :
+		       rds->block_status[2] == RDS_STATUS_CORRECTED ? " fec" : " BAD",
+		     rds->block_status[3] == RDS_STATUS_VALID ? " ok" :
+		       rds->block_status[3] == RDS_STATUS_CORRECTED ? " fec" : " BAD",
+		     rds->group_mask);
+	}
 	
 	/* REQUIRE Valid Block B for Group/Segment info.
 	 * Block B carries group type, TP, PTY -- without it we cannot
@@ -5808,16 +6524,36 @@ static void rds_decode_group(rds_decoder_t *rds)
 		 */
 		int b2_payload = b2 & RDS_B2_PAYLOAD_MASK;  /* Block B bits 4-0 */
 		
-		/* Group 1A: Radio Paging codes (deprecated, usually 0)
+		/* Group 1A: Radio Paging codes (EN 50067 Annex M)
+		 * Bits 4-2: transmitter network group designation
+		 * Bits 1-0: battery saving interval synchronization
+		 * IEC 62106:2018 removed paging; bits 4-0 are spare (should be 0).
 		 * Group 1B: Spare bits (should be 0) */
 		if (version == 0) {
-			/* 1A: Radio Paging (deprecated) */
-			if (b2_payload != 0) {
-				if (rds->debug)
-					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Radio Paging (B2[4:0])=%d (deprecated)\n",
-					     b2_payload);
+			if (b2_payload != 0 && rds->paging_enabled) {
+				/* 1A: Decode as Radio Paging Codes (EN 50067 Annex M) */
+				rds_paging_dec_t *pd = &rds->paging_dec;
+				pd->rpc = b2_payload & 0x1F;
+				pd->rpc_group_desig = (b2_payload >> 2) & 0x07;
+				pd->rpc_batt_sync = b2_payload & 0x03;
+				pd->rpc_valid = 1;
+				/* Table M.1 group designation ranges */
+				static const char *group_ranges[] = {
+					"00-99", "00-99", "00-39", "40-69",
+					"70-99", "00-19", "20-39", "40-59"
+				};
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Radio Paging RPC=%d "
+				     "(group desig=%d [groups %s], batt sync=%d)\n",
+				     pd->rpc, pd->rpc_group_desig,
+				     group_ranges[pd->rpc_group_desig],
+				     pd->rpc_batt_sync);
+			} else if (b2_payload != 0) {
+				/* 1A without paging: bits 4-0 are spare per IEC 62106:2018 */
 				if (rds->verbose)
-					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Radio Paging codes=%d (deprecated, bits 4-0)\n",
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Spare bits=%d (likely RPC -- enable --rds-paging to decode)\n",
+					     b2_payload);
+				else if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Spare bits (B2[4:0])=%d (expected 0)\n",
 					     b2_payload);
 			}
 		} else {
@@ -6303,6 +7039,253 @@ static void rds_decode_group(rds_decoder_t *rds)
 			     "Current PTYN=\"%s\"\n", seg + 1, ptyn_disp);
 		}
 	}
+	else if (group_type == 7 && version == 0 && rds->paging_enabled) {
+		/* Group 7A: Radio Paging (EN 50067 Annex M)
+		 * Block B bit 4: A/B flag, bits 3-0: PSAC */
+		uint8_t ab_flag = (b2 >> RDS_7A_AB_FLAG_BIT) & 1;
+		uint8_t psac = b2 & RDS_7A_PSAC_MASK;
+		rds_paging_dec_t *pd = &rds->paging_dec;
+
+		/* Check for A/B flag change -> new message */
+		if (pd->assembling && ab_flag != pd->ab_flag) {
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: A/B flag changed (%d->%d), resetting reassembly\n",
+				     pd->ab_flag, ab_flag);
+			pd->assembling = 0;
+			pd->msg_len = 0;
+		}
+		pd->ab_flag = ab_flag;
+
+		/* Check timeout on partial messages */
+		if (pd->assembling && pd->timeout_sec > 0) {
+			time_t now = time(NULL);
+			if (now - pd->assembly_start > pd->timeout_sec) {
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: reassembly timeout, discarding partial message\n");
+				pd->assembling = 0;
+				pd->msg_len = 0;
+			}
+		}
+
+		switch (psac) {
+		case RDS_7A_PSAC_TONE: {
+			/* Tone-only: single group, address in C+D */
+			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			pd->address = addr;
+			pd->msg_type = RDS_PAGING_TONE;
+			pd->msg_valid = 1;
+			pd->last_type = RDS_PAGING_TONE;
+			pd->last_address = addr;
+			pd->last_msg[0] = '\0';
+			pd->last_msg_len = 0;
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: TONE page addr=%02u-%04u AB=%d\n",
+			     addr / 10000, addr % 10000, ab_flag);
+			break;
+		}
+		case RDS_7A_PSAC_NUM10_ADDR: {
+			/* 10-digit numeric: address group */
+			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			uint8_t nib[2] = { (b4 >> 4) & 0xF, b4 & 0xF };
+			pd->address = addr;
+			pd->msg_type = RDS_PAGING_NUM10;
+			pd->assembling = 1;
+			pd->assembly_start = time(NULL);
+			pd->msg_len = 0;
+			rds_paging_bcd_decode(nib, 2, pd->msg_buf, sizeof(pd->msg_buf));
+			pd->msg_len = 2;
+			pd->expected_psac = RDS_7A_PSAC_NUM10_DATA;
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM10 addr=%02u-%04u AB=%d (assembling: \"%.*s????????\")\n",
+				     addr / 10000, addr % 10000, ab_flag,
+				     pd->msg_len, pd->msg_buf);
+			break;
+		}
+		case RDS_7A_PSAC_NUM10_DATA: {
+			/* 10-digit numeric: data group (8 digits) */
+			if (!pd->assembling || pd->msg_type != RDS_PAGING_NUM10) {
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: NUM10 data without address, ignoring\n");
+				break;
+			}
+			uint8_t nib[8] = {
+				(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
+				(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
+			};
+			char tmp[9];
+			rds_paging_bcd_decode(nib, 8, tmp, sizeof(tmp));
+			memcpy(pd->msg_buf + pd->msg_len, tmp, 8);
+			pd->msg_len += 8;
+			pd->msg_buf[pd->msg_len] = '\0';
+			pd->assembling = 0;
+			pd->msg_valid = 1;
+			pd->last_type = RDS_PAGING_NUM10;
+			pd->last_address = pd->address;
+			memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
+			pd->last_msg_len = pd->msg_len;
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM10 complete addr=%02u-%04u msg=\"%s\"\n",
+			     pd->address / 10000, pd->address % 10000, pd->last_msg);
+			break;
+		}
+		case RDS_7A_PSAC_NUM18_ADDR: {
+			/* 18-digit numeric: address group */
+			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			uint8_t nib[2] = { (b4 >> 4) & 0xF, b4 & 0xF };
+			pd->address = addr;
+			pd->msg_type = RDS_PAGING_NUM18;
+			pd->assembling = 1;
+			pd->assembly_start = time(NULL);
+			pd->msg_len = 0;
+			rds_paging_bcd_decode(nib, 2, pd->msg_buf, sizeof(pd->msg_buf));
+			pd->msg_len = 2;
+			pd->expected_psac = RDS_7A_PSAC_NUM18_DATA1;
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM18 addr=%02u-%04u AB=%d (assembling: \"%.*s????????????????\")\n",
+				     addr / 10000, addr % 10000, ab_flag,
+				     pd->msg_len, pd->msg_buf);
+			break;
+		}
+		case RDS_7A_PSAC_NUM18_DATA1:
+		case RDS_7A_PSAC_NUM18_DATA2: {
+			/* 18-digit numeric: data groups */
+			if (!pd->assembling || pd->msg_type != RDS_PAGING_NUM18) {
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: NUM18 data without address, ignoring\n");
+				break;
+			}
+			if (psac != pd->expected_psac) {
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM18 PSAC out of sequence (got %d, expected %d)\n",
+					     psac, pd->expected_psac);
+				break;
+			}
+			uint8_t nib[8] = {
+				(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
+				(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
+			};
+			char tmp[9];
+			rds_paging_bcd_decode(nib, 8, tmp, sizeof(tmp));
+			memcpy(pd->msg_buf + pd->msg_len, tmp, 8);
+			pd->msg_len += 8;
+			pd->msg_buf[pd->msg_len] = '\0';
+
+			if (psac == RDS_7A_PSAC_NUM18_DATA2) {
+				/* Complete */
+				pd->assembling = 0;
+				pd->msg_valid = 1;
+				pd->last_type = RDS_PAGING_NUM18;
+				pd->last_address = pd->address;
+				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
+				pd->last_msg_len = pd->msg_len;
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM18 complete addr=%02u-%04u msg=\"%s\"\n",
+				     pd->address / 10000, pd->address % 10000, pd->last_msg);
+			} else {
+				pd->expected_psac = RDS_7A_PSAC_NUM18_DATA2;
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM18 data1 addr=%02u-%04u (assembling: \"%.*s????????\")\n",
+					     pd->address / 10000, pd->address % 10000,
+					     pd->msg_len, pd->msg_buf);
+			}
+			break;
+		}
+		case RDS_7A_PSAC_ALPHA_ADDR: {
+			/* Alphanumeric: address group */
+			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			pd->address = addr;
+			pd->msg_type = RDS_PAGING_ALPHA;
+			pd->assembling = 1;
+			pd->assembly_start = time(NULL);
+			pd->msg_len = 0;
+			pd->expected_psac = RDS_7A_PSAC_ALPHA_DATA_FIRST;
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA addr=%02u-%04u AB=%d (assembling: \"\")\n",
+				     addr / 10000, addr % 10000, ab_flag);
+			break;
+		}
+		case RDS_7A_PSAC_ALPHA_END: {
+			/* Alphanumeric: end-of-message */
+			if (!pd->assembling || pd->msg_type != RDS_PAGING_ALPHA) {
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: ALPHA end without address, ignoring\n");
+				break;
+			}
+			pd->assembling = 0;
+			pd->msg_buf[pd->msg_len] = '\0';
+			pd->msg_valid = 1;
+			pd->last_type = RDS_PAGING_ALPHA;
+			pd->last_address = pd->address;
+			memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
+			pd->last_msg_len = pd->msg_len;
+			{
+				char alpha_disp[257];
+				rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, alpha_disp, sizeof(alpha_disp));
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA complete addr=%02u-%04u msg=\"%s\"\n",
+				     pd->address / 10000, pd->address % 10000, alpha_disp);
+			}
+			break;
+		}
+		default:
+			/* PSAC 9-14: alphanumeric data groups */
+			if (psac >= RDS_7A_PSAC_ALPHA_DATA_FIRST && psac <= RDS_7A_PSAC_ALPHA_DATA_LAST) {
+				if (!pd->assembling || pd->msg_type != RDS_PAGING_ALPHA) {
+					if (rds->debug)
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: ALPHA data without address, ignoring\n");
+					break;
+				}
+				/* Extract 4 characters from blocks C and D */
+				if (pd->msg_len + 4 <= (int)sizeof(pd->msg_buf) - 1) {
+					pd->msg_buf[pd->msg_len++] = (b3 >> 8) & 0xFF;
+					pd->msg_buf[pd->msg_len++] = b3 & 0xFF;
+					pd->msg_buf[pd->msg_len++] = (b4 >> 8) & 0xFF;
+					pd->msg_buf[pd->msg_len++] = b4 & 0xFF;
+				}
+				/* Update expected PSAC (cycles 9-14) */
+				pd->expected_psac = (psac < RDS_7A_PSAC_ALPHA_DATA_LAST) ? psac + 1 : RDS_7A_PSAC_ALPHA_DATA_FIRST;
+				if (rds->verbose) {
+					char alpha_partial[257];
+					pd->msg_buf[pd->msg_len] = '\0';
+					rds_text_to_display((uint8_t *)pd->msg_buf, pd->msg_len, alpha_partial, sizeof(alpha_partial));
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA data PSAC=%d addr=%02u-%04u (assembling: \"%s...\")\n",
+					     psac, pd->address / 10000, pd->address % 10000, alpha_partial);
+				}
+			} else if (psac == RDS_7A_PSAC_INTL15) {
+				/* International 15-digit - log but don't decode */
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: International 15-digit (PSAC=7), not decoded\n");
+			} else {
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: unknown PSAC=%d\n", psac);
+			}
+			break;
+		}
+	}
+	else if (group_type == 13 && version == 0 && rds->paging_enabled) {
+		/* Group 13A: Enhanced Radio Paging (EN 50067 Annex M)
+		 * Block B bits 4-2: STY (sub-type), bits 1-0: reserved */
+		uint8_t sty = (b2 >> RDS_13A_STY_SHIFT) & 0x07;
+		rds_paging_dec_t *pd = &rds->paging_dec;
+
+		if (sty == 0) {
+			/* Sub-type 000: Address notification
+			 * Block C: CS(2) + IT(4) + notify_hi(10)
+			 * Block D: notify_lo(15) + S1(1) */
+			pd->cycle_selection = (b3 >> RDS_13A_CS_SHIFT) & 0x03;
+			pd->interval_num = (b3 >> RDS_13A_IT_SHIFT) & 0x0F;
+			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;
+			uint32_t notify_lo = (b4 & RDS_13A_NOTIFY_LO_MASK) >> RDS_13A_NOTIFY_LO_SHIFT;
+			pd->notify_bits = (notify_hi << 15) | notify_lo;
+			pd->notify_sty = sty;
+			pd->enhanced_valid = 1;
+
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: Enhanced paging STY=000 "
+			     "CS=%d IT=%d notify=0x%07X S1=%d\n",
+			     pd->cycle_selection, pd->interval_num,
+			     pd->notify_bits, b4 & RDS_13A_S1_MASK);
+		} else {
+			/* Other sub-types: log but don't decode */
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 13A: STY=%d (not decoded)\n", sty);
+		}
+	}
 	else if (group_type == 14) {
 		/* Group 14A/14B: Enhanced Other Networks (EON) - IEC 62106 S6.1.5.14 */
 		/* Block D contains ON-PI (PI of the Other Network) */
@@ -6632,24 +7615,37 @@ group14_done:
 			     3 - seg, di);
 	}
 	else {
-		/* Unhandled group type -- not decoded by this implementation.
-		 * Known unhandled types per IEC 62106:
+		/* Unhandled group type -- check if ODA-eligible.
+		 * Per IEC 62106, groups that can carry ODA data when
+		 * announced via Group 3A:
+		 *   5A/5B, 6A/6B, 7A, 8A, 9A, 11A/11B, 12A/12B, 13A, 13B
+		 * Non-ODA unhandled:
 		 *   4B:  Clock-Time (version B, no standard use)
-		 *   5A/5B: Transparent Data Channels (TDC)
-		 *   6A/6B: In-House Applications (IH)
-		 *   7A:  Radio Paging (RP)
-		 *   8A:  TMC (Traffic Message Channel) -- typically via ODA
-		 *   9A:  Emergency Warning System (EWS)
-		 *   11A/11B: Open Data Application (ODA-only)
-		 *   12A/12B: Open Data Application (ODA-only)
-		 *   13A: Enhanced Radio Paging
-		 *   13B: Open Data Application (ODA-only)
 		 *   15A: Fast Basic Tuning (RBDS only, long form)
-		 * These may be routed as ODA below if registered via 3A.
 		 */
-		if (rds->verbose)
-			LOGP(DRADIO, LOGL_INFO, "RDS %d%c: Not decoded (no built-in handler)\n",
-			     group_type, version ? 'B' : 'A');
+		int gc = (group_type << 1) | version;
+		int is_oda_eligible = (group_type == 5 || group_type == 6 ||
+				       (group_type == 7 && version == 0) ||
+				       (group_type == 8 && version == 0) ||
+				       (group_type == 9 && version == 0) ||
+				       group_type == 11 || group_type == 12 ||
+				       group_type == 13);
+		if (is_oda_eligible && rds->oda_apps[gc].registered) {
+			/* ODA registered -- handled by ODA routing below */
+		} else if (is_oda_eligible) {
+			if (rds->verbose) {
+				const char *hint = "";
+				if (!rds->paging_enabled &&
+				    ((group_type == 7 && version == 0) || (group_type == 13 && version == 0)))
+					hint = " (enable --rds-paging to decode as Radio Paging)";
+				LOGP(DRADIO, LOGL_INFO, "RDS %d%c: ODA-eligible group (no 3A registration yet)%s\n",
+				     group_type, version ? 'B' : 'A', hint);
+			}
+		} else {
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_INFO, "RDS %d%c: Not decoded (no built-in handler)\n",
+				     group_type, version ? 'B' : 'A');
+		}
 	}
 	
 	/* Debug: detailed group dump */
@@ -6718,14 +7714,45 @@ group14_done:
 		}
 	}
 	
+	/* Invoke protocol server callback if registered */
+	if (rds->group_callback) {
+		rds->group_callback(rds->blocks, rds->block_status, rds->group_callback_arg);
+	}
+	
 	rds->groups_received++;
 }
 
 /* Simple 1-pole IIR Low Pass Filter step (RC equivalent) */
+/* General-purpose IIR filter step (Direct Form II Transposed)
+ * Supports 1st through 5th order.
+ * For order=0 (legacy 1-pole): y += a[0] * (x - y) */
 static inline double iir_lpf_step(rds_iir_filter_t *f, double input)
 {
-	f->y[0] += f->a[0] * (input - f->y[0]);
-	return f->y[0];
+	if (f->order == 0) {
+		/* Legacy 1-pole: y += alpha * (x - y) */
+		f->y[0] += f->a[0] * (input - f->y[0]);
+		return f->y[0];
+	}
+	
+	/* Standard IIR: y[n] = sum(b[k]*x[n-k]) - sum(a[k]*y[n-k]) for k=1..order
+	 * a[0] is assumed to be 1.0 (normalized) */
+	int n = f->order;
+	
+	/* Shift history */
+	for (int k = n; k > 0; k--) {
+		f->x[k] = f->x[k-1];
+		f->y[k] = f->y[k-1];
+	}
+	f->x[0] = input;
+	
+	/* Compute output */
+	double out = f->b[0] * f->x[0];
+	for (int k = 1; k <= n; k++) {
+		out += f->b[k] * f->x[k];
+		out -= f->a[k] * f->y[k];
+	}
+	f->y[0] = out;
+	return out;
 }
 
 /* Differential Biphase Decoding (IEC 62106 S2.2)
@@ -6763,7 +7790,18 @@ static int rds_biphase_decode(rds_decoder_t *rds, double acc)
 
 	if ((rds->biphase_counter % 2) == rds->reading_frame) {
 		/* Symbol decision: use dominant polarity of the pair */
-		int sum_sign = (acc + rds->prev_integral >= 0) ? 1 : -1;
+		double symbol_sum = acc + rds->prev_integral;
+		int sum_sign = (symbol_sum >= 0) ? 1 : -1;
+		
+		/* Track eye diagram quality (symbol confidence) */
+		double confidence = fabs(symbol_sum);
+		rds->sig_eye_sum += confidence;
+		rds->sig_eye_count++;
+		if (confidence < rds->sig_eye_min || rds->sig_eye_min == 0)
+			rds->sig_eye_min = confidence;
+		/* Count low-confidence decisions (near zero crossing) */
+		if (confidence < rds->sig_eye_sum / (rds->sig_eye_count > 1 ? rds->sig_eye_count : 1) * 0.3)
+			rds->sig_eye_weak++;
 		
 		/* Differential decode: XOR with previous symbol recovers data bit */
 		int raw_bit = (sum_sign != rds->last_diff_bit) ? 1 : 0;
@@ -6778,8 +7816,11 @@ static int rds_biphase_decode(rds_decoder_t *rds, double acc)
 		/* Prefer frame with FEWER errors */
 		if (rds->total_errors[1 - rds->reading_frame] < rds->total_errors[rds->reading_frame]) {
 			rds->reading_frame = 1 - rds->reading_frame;
-			// LOGP(DRADIO, LOGL_DEBUG, "RDS: Realigning biphase frame\n");
+			rds->sig_frame_flips++;
 		}
+		/* Snapshot error counts before reset */
+		rds->sig_biphase_err[0] = rds->total_errors[0];
+		rds->sig_biphase_err[1] = rds->total_errors[1];
 		rds->total_errors[0] = 0;
 		rds->total_errors[1] = 0;
 	}
@@ -6796,6 +7837,9 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	
 	/* Initialize eRT chartable to default value */
 	rds->ert_dec.chartable = RDS_ERT_CHARTABLE_DEFAULT;
+	
+	/* Initialize paging decoder timeout */
+	rds->paging_dec.timeout_sec = RDS_PAGING_DEFAULT_TIMEOUT;
 	
 	rds->samplerate = samplerate;
 	rds->debug = debug;
@@ -6819,6 +7863,22 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	/* Initialize Subcarrier PLL (57 kHz) */
 	rds->freq_subcarrier = 57000.0;
 	
+	/* AGC for Costas PLL error normalization
+	 * Redsea uses liquid-dsp AGC with bandwidth=500Hz/171kHz ≈ 0.003.
+	 * We use a simpler approach: track signal magnitude with a slow IIR
+	 * and normalize bb_i/bb_q before computing the Costas error.
+	 * This ensures the error signal bb_i*bb_q has consistent magnitude
+	 * regardless of input signal level.
+	 * 
+	 * agc_alpha controls adaptation speed: smaller = slower, more stable.
+	 * ~50 Hz bandwidth at 250 kHz → alpha ≈ 2*pi*50/250000 ≈ 0.00126
+	 * This is slow enough to track the envelope without following
+	 * instantaneous oscillations of the baseband signal.
+	 */
+	rds->agc_gain = 1e-4;  /* Initial power estimate (will converge quickly) */
+	rds->agc_alpha = 2.0 * M_PI * 50.0 / samplerate;
+	if (rds->agc_alpha > 0.01) rds->agc_alpha = 0.01;  /* Clamp for very low sample rates */
+	
 	/* Filter Coefficients */
 	/* 2400 Hz LPF */
 	double alpha_2400 = (2.0 * M_PI * 2400.0) / samplerate;
@@ -6826,13 +7886,16 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->filter_2400_q.a[0] = alpha_2400;
 	
 	/* PLL Loop Filter (~54 Hz BW scaled) */
-	double alpha_pll = 0.054 * (250000.0 / samplerate);
-	/* Clamp alpha to sane range */
-	if (alpha_pll > 1.0) alpha_pll = 1.0;
-	if (alpha_pll < 0.001) alpha_pll = 0.001;
-	rds->filter_pll.a[0] = alpha_pll;
+	{
+		double alpha_pll = 0.054 * (250000.0 / samplerate);
+		/* Clamp alpha to sane range */
+		if (alpha_pll > 1.0) alpha_pll = 1.0;
+		if (alpha_pll < 0.001) alpha_pll = 0.001;
+		rds->filter_pll.a[0] = alpha_pll;
+	}
 	
 	rds->status_interval = samplerate * 30.0;  /* Status dump every 30 seconds */
+	rds->signal_debug_interval = samplerate * 1.0;  /* Signal debug every 1 second */
 	
 	/* BER Init */
 	for (int i=0; i<BER_WINDOW_SIZE; i++) rds->ber_history[i] = 1.0f;
@@ -6999,7 +8062,7 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 	(void)pilot_phase;
 	(void)pilot_phasestep;
 	int i;
-	const double PLL_BETA = 50.0 * (250000.0 / rds->samplerate) * 0.01; /* Tuned gain */
+	const double PLL_BETA = 0.02 * (250000.0 / rds->samplerate); /* Normalized Costas gain */
 	const double FC_TOLERANCE = 12.0;
 	const double SUBCARRIER_BITRATE_RATIO = 48.0;
 	
@@ -7012,6 +8075,13 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 	
 	for (i = 0; i < num; i++) {
 		rds->status_timer++;
+		rds->signal_debug_timer++;
+		
+		/* Track input signal level */
+		double abs_input = fabs(samples[i]);
+		if (abs_input > rds->sig_input_peak) rds->sig_input_peak = abs_input;
+		rds->sig_input_sum += abs_input;
+		rds->sig_sample_count++;
 		
 		/* 1. Subcarrier Oscillator & Downmix */
 		rds->phase_subcarrier += pll_step_base * rds->freq_subcarrier;
@@ -7037,9 +8107,36 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		bb_i = iir_lpf_step(&rds->filter_2400_i, bb_i);
 		bb_q = iir_lpf_step(&rds->filter_2400_q, bb_q);
 		
-		/* 3. PLL Costas Error */
-		double err = bb_i * bb_q; /* Phase error */
+		/* 2b. Signal level tracking for debug/diagnostics */
+		{
+			double power = bb_i * bb_i + bb_q * bb_q;
+			rds->agc_gain += rds->agc_alpha * (power - rds->agc_gain);
+			if (rds->agc_gain < 1e-20) rds->agc_gain = 1e-20;
+		}
+		
+		/* 3. Costas Error (normalized by signal power for consistent loop dynamics) */
+		double err;
+		{
+			double power = rds->agc_gain;  /* Smoothed power estimate from step 2b */
+			if (power > 1e-12)
+				err = (bb_i * bb_q) / power;
+			else
+				err = 0.0;
+		}
 		double d_phi_sc = iir_lpf_step(&rds->filter_pll, err);
+		
+		/* Track baseband and PLL signal levels */
+		{
+			double abs_i = fabs(bb_i);
+			double abs_q = fabs(bb_q);
+			double abs_err = fabs(err);
+			if (abs_i > rds->sig_bb_i_peak) rds->sig_bb_i_peak = abs_i;
+			if (abs_q > rds->sig_bb_q_peak) rds->sig_bb_q_peak = abs_q;
+			if (abs_err > rds->sig_pll_err_peak) rds->sig_pll_err_peak = abs_err;
+			rds->sig_bb_i_sum += abs_i;
+			rds->sig_bb_q_sum += abs_q;
+			rds->sig_pll_err_sum += abs_err;
+		}
 		
 		/* Update PLL */
 		rds->phase_subcarrier -= PLL_BETA * d_phi_sc;
@@ -7053,9 +8150,8 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		
 
 		/* 4. Decimation & Symbol Processing */
-		static int sample_count = 0;
-		if (++sample_count >= decimate) {
-			sample_count = 0;
+		if (++rds->decimate_counter >= decimate) {
+			rds->decimate_counter = 0;
 			
 			/* Clamp Freq */
 			if (rds->freq_subcarrier > 57000.0 + FC_TOLERANCE) rds->freq_subcarrier = 57000.0 + FC_TOLERANCE;
@@ -7080,9 +8176,7 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 				
 				/* Nudge offset to align edge to zero crossing */
 				rds->clock_offset -= 0.005 * d_cphi;
-				
-				/* Debug Clock Alignment */
-				////// LOGP(DRADIO, LOGL_DEBUG, "RDS CLK: ZC adjust d_cphi=%.4f new_offset=%.4f\n", d_cphi, rds->clock_offset);
+				rds->sig_zc_count++;
 			}
 			rds->prev_bb_sample = bb_i;
 			
@@ -7091,14 +8185,53 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 			
 			/* 8. Dump on clock edge */
 			if (lo_clock != rds->prev_clock_bit) {
-				/* Debug Integration result before decoding */
-				// LOGP(DRADIO, LOGL_DEBUG, "RDS INT: integrator=%.4f lo_clock=%d\n", rds->integrator, lo_clock);
+				/* Track integrator dump values */
+				{
+					double abs_int = fabs(rds->integrator);
+					if (abs_int > rds->sig_integrator_peak) rds->sig_integrator_peak = abs_int;
+					rds->sig_integrator_sum += abs_int;
+					rds->sig_dump_count++;
+				}
+				
+				/* Lock detection (RdsSurveyor2-style):
+				 * Track |I| vs |Q| at symbol dumps.
+				 * When locked, I >> Q (signal is on I axis).
+				 * locked = (sumI - sumQ) / sumI >= 0.5 */
+				{
+					rds->lock_sum_i += fabs(bb_i);
+					rds->lock_sum_q += fabs(bb_q);
+					rds->lock_count++;
+					if (rds->lock_count >= 100) {
+						double lock_ratio = (rds->lock_sum_i > 0) ?
+						    (rds->lock_sum_i - rds->lock_sum_q) / rds->lock_sum_i : 0.0;
+						rds->pll_locked = (rds->lock_sum_i > 0 && lock_ratio >= 0.5);
+						if (rds->debug)
+							LOGP(DRADIO, LOGL_DEBUG, "RDS LOCK: sumI=%.6f sumQ=%.6f ratio=%.4f (need>=0.5) locked=%d\n",
+								     rds->lock_sum_i, rds->lock_sum_q, lock_ratio, rds->pll_locked);
+						/* Sliding window: decay by half */
+						rds->lock_sum_i *= 0.5;
+						rds->lock_sum_q *= 0.5;
+						rds->lock_count = 50;
+					}
+				}
 
 				if (rds_biphase_decode(rds, rds->integrator)) {
 					/* Got Bit */
 					rds->shift_reg = ((rds->shift_reg << 1) | rds->curr_bit) & 0x3FFFFFF;
 					rds->bit_count++;
 					rds->bit_count_in_block++;
+					rds->sig_bits_period++;
+					
+					/* Write to bitstream output file if enabled (MSB first) */
+					if (rds->bitstream_file) {
+						rds->bitstream_byte = (rds->bitstream_byte << 1) | (rds->curr_bit & 1);
+						rds->bitstream_bit_count++;
+						if (rds->bitstream_bit_count >= 8) {
+							fputc(rds->bitstream_byte, rds->bitstream_file);
+							rds->bitstream_byte = 0;
+							rds->bitstream_bit_count = 0;
+						}
+					}
 					
 					/* Debug Bit Stream */
 					// LOGP(DRADIO, LOGL_DEBUG, "RDS BIT: %d (reg=%07X)\n", rds->curr_bit, rds->shift_reg);
@@ -7159,8 +8292,6 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 							rds->blocks_received++;
 							
 							uint16_t offset;
-							rds_check_syndrome(rds->shift_reg, &offset); /* Ignore return value for now */
-							
 							int valid_syndrome = rds_check_syndrome(rds->shift_reg, &offset);
 							
 							if (valid_syndrome && (int)offset == rds->block_idx) {
@@ -7174,6 +8305,7 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 								rds->blocks_ok++;
 								rds->nb_ok++;
 								rds->errors = 0;
+								rds->sig_blocks_ok_period++;
 							} else {
 								/* Mismatch or Invalid - Try FEC */
 								uint32_t corrected_block;
@@ -7188,18 +8320,26 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 									rds->blocks_ok++;
 									rds->nb_ok++;
 									rds->errors = 0;
+									rds->sig_blocks_fec_period++;
 								} else {
 									/* FEC failed */
 									if (valid_syndrome) {
 										if (rds->debug)
-											LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Unexpected Offset! Expected %d Got %d. Ignoring.\n", rds->block_idx, offset);
+											LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c wrong offset (expected %c got %c) reg=%07X\n",
+											     'A'+rds->block_idx, 'A'+rds->block_idx, 'A'+offset, rds->shift_reg);
 									} else {
-										// LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Invalid Syndrome (reg=%07X)\n", rds->shift_reg);
+										if (rds->debug)
+											LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c no valid syndrome, FEC failed, reg=%07X\n",
+											     'A'+rds->block_idx, rds->shift_reg);
 									}
 									rds->errors++;
 									rds->blocks_bad++;
 									rds->blocks_missing[rds->block_idx]++;
 									rds->group_error_count++;
+									rds->sig_blocks_bad_period++;
+									rds->sig_block_miss[rds->block_idx]++;
+									if (valid_syndrome)
+										rds->sig_block_wrongoff++;
 								}
 							}
 							
@@ -7210,6 +8350,7 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 							if (rds->block_idx == 0) {
 								rds_decode_group(rds);
 								rds->group_mask = 0;
+								rds->sig_groups_period++;
 								
 								/* Sync loss detection */
 								if (rds->nb_ok > 0) {
@@ -7245,6 +8386,82 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 			}
 			rds->prev_clock_bit = lo_clock;
 		}
+	}
+	
+	/* Signal-level debug report (every 1 second) */
+	if (rds->signal_debug_timer >= rds->signal_debug_interval) {
+		/*
+		double avg_input = rds->sig_sample_count > 0 ? rds->sig_input_sum / rds->sig_sample_count : 0;
+		double avg_bb_i = rds->sig_sample_count > 0 ? rds->sig_bb_i_sum / rds->sig_sample_count : 0;
+		double avg_bb_q = rds->sig_sample_count > 0 ? rds->sig_bb_q_sum / rds->sig_sample_count : 0;
+		double avg_pll_err = rds->sig_sample_count > 0 ? rds->sig_pll_err_sum / rds->sig_sample_count : 0;
+		double avg_integrator = rds->sig_dump_count > 0 ? rds->sig_integrator_sum / rds->sig_dump_count : 0;
+		double zc_rate = rds->sig_sample_count > 0 ? (double)rds->sig_zc_count / (rds->signal_debug_timer / rds->samplerate) : 0;
+		int total_blocks = rds->sig_blocks_ok_period + rds->sig_blocks_fec_period + rds->sig_blocks_bad_period;
+		double block_ok_pct = total_blocks > 0 ? 100.0 * rds->sig_blocks_ok_period / total_blocks : 0;
+		double block_fec_pct = total_blocks > 0 ? 100.0 * rds->sig_blocks_fec_period / total_blocks : 0;
+		double block_bad_pct = total_blocks > 0 ? 100.0 * rds->sig_blocks_bad_period / total_blocks : 0;
+		double bit_rate = rds->sig_bits_period / (rds->signal_debug_timer / rds->samplerate);
+		double avg_eye = rds->sig_eye_count > 0 ? rds->sig_eye_sum / rds->sig_eye_count : 0;
+		LOGP(DRADIO, LOGL_DEBUG, "RDS SIGNAL: input peak=%.4f avg=%.6f | "
+		     "bb_i peak=%.4f avg=%.6f | bb_q peak=%.4f avg=%.6f | I/Q=%.2f\n",
+		     rds->sig_input_peak, avg_input,
+		     rds->sig_bb_i_peak, avg_bb_i,
+		     rds->sig_bb_q_peak, avg_bb_q,
+		     (avg_bb_q > 0) ? avg_bb_i / avg_bb_q : 0.0);
+		LOGP(DRADIO, LOGL_DEBUG, "RDS PLL: freq=%.2f Hz | err peak=%.6f avg=%.8f | "
+		     "clock_offset=%.4f | frame=%d flips=%d | locked=%d pwr=%.2e\n",
+		     rds->freq_subcarrier, rds->sig_pll_err_peak, avg_pll_err,
+		     rds->clock_offset, rds->reading_frame, rds->sig_frame_flips,
+		     rds->pll_locked, rds->agc_gain);
+		LOGP(DRADIO, LOGL_DEBUG, "RDS DEMOD: integrator peak=%.4f avg=%.4f | "
+		     "dumps=%ld | bits=%d (%.1f bps) | zc_rate=%.1f Hz | synced=%d BER=%.1f%%\n",
+		     rds->sig_integrator_peak, avg_integrator,
+		     rds->sig_dump_count, rds->sig_bits_period, bit_rate,
+		     zc_rate, rds->synced, rds->ber_percent);
+		LOGP(DRADIO, LOGL_DEBUG, "RDS EYE: avg=%.5f min=%.5f weak=%d/%ld | "
+		     "biphase_err=[%d,%d] frame=%d flips=%d\n",
+		     avg_eye, rds->sig_eye_min, rds->sig_eye_weak, rds->sig_eye_count,
+		     rds->sig_biphase_err[0], rds->sig_biphase_err[1],
+		     rds->reading_frame, rds->sig_frame_flips);
+		LOGP(DRADIO, LOGL_DEBUG, "RDS BLOCKS: groups=%d | ok=%d(%.0f%%) fec=%d(%.0f%%) bad=%d(%.0f%%) | "
+		     "period_miss=[A:%d B:%d C:%d D:%d] wrongoff=%d\n",
+		     rds->sig_groups_period,
+		     rds->sig_blocks_ok_period, block_ok_pct,
+		     rds->sig_blocks_fec_period, block_fec_pct,
+		     rds->sig_blocks_bad_period, block_bad_pct,
+		     rds->sig_block_miss[0], rds->sig_block_miss[1],
+		     rds->sig_block_miss[2], rds->sig_block_miss[3],
+		     rds->sig_block_wrongoff);
+		*/
+		
+		/* Reset period counters */
+		rds->signal_debug_timer = 0;
+		rds->sig_bb_i_peak = 0;
+		rds->sig_bb_q_peak = 0;
+		rds->sig_bb_i_sum = 0;
+		rds->sig_bb_q_sum = 0;
+		rds->sig_pll_err_peak = 0;
+		rds->sig_pll_err_sum = 0;
+		rds->sig_input_peak = 0;
+		rds->sig_input_sum = 0;
+		rds->sig_integrator_peak = 0;
+		rds->sig_integrator_sum = 0;
+		rds->sig_sample_count = 0;
+		rds->sig_dump_count = 0;
+		rds->sig_zc_count = 0;
+		rds->sig_frame_flips = 0;
+		rds->sig_blocks_ok_period = 0;
+		rds->sig_blocks_fec_period = 0;
+		rds->sig_blocks_bad_period = 0;
+		rds->sig_groups_period = 0;
+		memset(rds->sig_block_miss, 0, sizeof(rds->sig_block_miss));
+		rds->sig_block_wrongoff = 0;
+		rds->sig_bits_period = 0;
+		rds->sig_eye_sum = 0;
+		rds->sig_eye_min = 0;
+		rds->sig_eye_count = 0;
+		rds->sig_eye_weak = 0;
 	}
 	
 	/* Output status */
@@ -7601,6 +8818,45 @@ void rds_decoder_status(rds_decoder_t *rds)
 			     eon->pi, on_ps_disp, eon->tp, eon->ta, eon->pty, eon->af_count);
 		}
 	}
+
+	/* Radio Paging (Group 7A / 1A RPC / 13A Enhanced) */
+	{
+		rds_paging_dec_t *pd = &rds->paging_dec;
+		int has_paging = (rds->group_type_counts[7 * 2] > 0) ||
+				 pd->rpc_valid || pd->enhanced_valid;
+		if (has_paging) {
+			LOGP(DRADIO, LOGL_NOTICE, "Paging:\n");
+			if (pd->rpc_valid)
+				LOGP(DRADIO, LOGL_NOTICE, "  RPC=%d (1A: group_desig=%d batt_sync=%d)\n",
+				     pd->rpc, pd->rpc_group_desig, pd->rpc_batt_sync);
+			if (pd->msg_valid) {
+				const char *type_str = "?";
+				switch (pd->last_type) {
+				case RDS_PAGING_TONE:  type_str = "TONE";  break;
+				case RDS_PAGING_NUM10: type_str = "NUM10"; break;
+				case RDS_PAGING_NUM18: type_str = "NUM18"; break;
+				case RDS_PAGING_ALPHA: type_str = "ALPHA"; break;
+				}
+				if (pd->last_msg_len > 0) {
+					char paging_disp[257];
+					if (pd->last_type == RDS_PAGING_ALPHA)
+						rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, paging_disp, sizeof(paging_disp));
+					else
+						snprintf(paging_disp, sizeof(paging_disp), "%s", pd->last_msg);
+					LOGP(DRADIO, LOGL_NOTICE, "  Last msg: type=%s addr=%02u-%04u data=\"%s\"\n",
+					     type_str, pd->last_address / 10000,
+					     pd->last_address % 10000, paging_disp);
+				}
+				else
+					LOGP(DRADIO, LOGL_NOTICE, "  Last msg: type=%s addr=%02u-%04u\n",
+					     type_str, pd->last_address / 10000,
+					     pd->last_address % 10000);
+			}
+			if (pd->enhanced_valid)
+				LOGP(DRADIO, LOGL_NOTICE, "  13A Enhanced: CS=%d IT=%d notify=0x%07X\n",
+				     pd->cycle_selection, pd->interval_num, pd->notify_bits);
+		}
+	}
 	
 	#undef STATUS_CHAR
 }
@@ -7641,5 +8897,69 @@ void rds_decoder_feed_group(rds_decoder_t *rds, const uint16_t blocks[4], const 
 
 void rds_decoder_exit(rds_decoder_t *rds)
 {
-	(void)rds;
+	/* Close output files if open */
+	if (rds->hexrds_file) {
+		fclose(rds->hexrds_file);
+		rds->hexrds_file = NULL;
+	}
+	if (rds->bitstream_file) {
+		/* Flush any remaining bits (pad with zeros) */
+		if (rds->bitstream_bit_count > 0) {
+			rds->bitstream_byte <<= (8 - rds->bitstream_bit_count);
+			fputc(rds->bitstream_byte, rds->bitstream_file);
+		}
+		fclose(rds->bitstream_file);
+		rds->bitstream_file = NULL;
+	}
+}
+
+/* Set output file for .hexrds format (text hex groups) */
+int rds_decoder_set_hexrds_file(rds_decoder_t *rds, const char *filename)
+{
+	if (rds->hexrds_file) {
+		fclose(rds->hexrds_file);
+		rds->hexrds_file = NULL;
+	}
+	if (!filename)
+		return 0;
+	
+	rds->hexrds_file = fopen(filename, "w");
+	if (!rds->hexrds_file) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot open hexrds output file '%s': %s\n",
+		     filename, strerror(errno));
+		return -1;
+	}
+	LOGP(DRADIO, LOGL_NOTICE, "RDS: Writing hexrds output to '%s'\n", filename);
+	return 0;
+}
+
+/* Set output file for .rds bitstream format (raw binary bits) */
+int rds_decoder_set_bitstream_file(rds_decoder_t *rds, const char *filename)
+{
+	if (rds->bitstream_file) {
+		fclose(rds->bitstream_file);
+		rds->bitstream_file = NULL;
+	}
+	if (!filename)
+		return 0;
+	
+	rds->bitstream_file = fopen(filename, "wb");
+	if (!rds->bitstream_file) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot open bitstream output file '%s': %s\n",
+		     filename, strerror(errno));
+		return -1;
+	}
+	rds->bitstream_byte = 0;
+	rds->bitstream_bit_count = 0;
+	LOGP(DRADIO, LOGL_NOTICE, "RDS: Writing bitstream output to '%s'\n", filename);
+	return 0;
+}
+
+/* Set callback for decoded RDS groups (for protocol servers) */
+void rds_decoder_set_group_callback(rds_decoder_t *rds,
+                                    void (*callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg),
+                                    void *arg)
+{
+	rds->group_callback = callback;
+	rds->group_callback_arg = arg;
 }

@@ -23,6 +23,8 @@ SUBDIRS = \
 	libfm \
 	libfilter \
 	libchannelizer \
+	libfastmath \
+	libiqringbuf \
 	libcalibrate \
 	libwave \
 	libfft \

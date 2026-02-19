@@ -82,6 +82,12 @@ typedef struct radio {
 	iir_filter_t	rx_lp_sum;		/* filter sum signal of stereo */
 	iir_filter_t	rx_lp_diff;		/* filter differential signal of stereo */
 	double		rx_pll_freq_offset;	/* tracked phase offset (rad) for stereo demod */
+	double		rx_pilot_mag;		/* pilot tone magnitude (0=no signal, ~0.1 on lock) */
+	double		rx_pilot_mag_avg;	/* IIR-smoothed pilot magnitude for threshold decisions */
+	int		rx_pilot_locked;	/* 1 = pilot locked, 0 = mono fallback */
+	double		rx_pilot_cooldown;	/* samples until next lock state change allowed */
+	double		rx_pilot_above_samples;	/* samples continuously above LOCK_THR   */
+	double		rx_pilot_below_samples;	/* samples continuously below UNLOCK_THR */
 	/* RDS encoder */
 	rds_encoder_t	rds_enc;		/* RDS encoder state */
 	rds_decoder_t	rds_dec;		/* RDS decoder state */

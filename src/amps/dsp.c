@@ -151,6 +151,22 @@ static sample_t dsp_sine_sat[65536];
 
 static uint8_t dsp_sync_check[0x800];
 
+/* Get bandwidth parameters for SDR rate selection (works for AMPS/TACS/JTACS) */
+void amps_get_bandwidth(int is_tacs, double *max_deviation, double *max_modulation)
+{
+	if (is_tacs) {
+		if (max_deviation)
+			*max_deviation = TACS_MAX_DEVIATION;
+		if (max_modulation)
+			*max_modulation = TACS_MAX_MODULATION;
+	} else {
+		if (max_deviation)
+			*max_deviation = AMPS_MAX_DEVIATION;
+		if (max_modulation)
+			*max_modulation = AMPS_MAX_MODULATION;
+	}
+}
+
 /* global init for FSK */
 void dsp_init(void)
 {

@@ -30,6 +30,8 @@ enum paging_signal;
 #include <math.h>
 #include <termios.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "../libsdr/sdr_config.h"
@@ -37,8 +39,13 @@ enum paging_signal;
 #include "../liboptions/options.h"
 #include <osmocom/cc/misc.h>
 #include "radio.h"
+#include "rds.h"
+#include "rds_protocol.h"
 
 #define DEFAULT_LO_OFFSET -1000000.0
+#define RDS_PAGING_PIPE "/tmp/rds_paging_send"
+
+static int paging_pipe_fd = -1;
 
 sender_t *sender_head = NULL;
 int use_sdr = 0;
@@ -73,9 +80,98 @@ static int rds_force_rbds = 0;
 static int sca_67k = 0;
 static int sca_92k = 0;
 static int am_compandor = 0;
+static int rds_paging = 0;
+static int rds_paging_rpc = 4;  /* Default RPC=4: group desig 001, batt sync 00 */
+static const char *rds_hexrds_file = NULL;
+static const char *rds_bitstream_file = NULL;
+
+/* Protocol server endpoints */
+static const char *xdr_gtk_server = NULL;
+static const char *rdsspy_server = NULL;
+static const char *uecp_server = NULL;
+static const char *asciig_server = NULL;
+static const char *xdr_gtk_password = NULL;
 
 /* global variable to quit main loop */
 int quit = 0;
+
+/* Protocol server callback context */
+typedef struct {
+	rds_server_t *xdr_srv;
+	rds_server_t *rdsspy_srv;
+	rds_server_t *asciig_srv;
+} rds_callback_ctx_t;
+
+/* Tune callback for XDR-GTK (RX side): retunes the SDR receiver */
+static void radio_tune_cb(int freq_khz, void *arg)
+{
+	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
+	double freq_hz = freq_khz * 1000.0;
+
+	LOGP(DRADIO, LOGL_NOTICE, "Re-tuning SDR RX to %d kHz\n", freq_khz);
+
+	if (sdr_set_rx_frequency(freq_hz) < 0) {
+		LOGP(DRADIO, LOGL_ERROR, "Failed to re-tune SDR to %d kHz\n", freq_khz);
+		return;
+	}
+
+	/* Update global frequency and XDR-GTK server state */
+	frequency = freq_hz;
+	if (ctx->xdr_srv)
+		ctx->xdr_srv->freq_khz = freq_khz;
+
+	/* Tell RDS-Spy to reset its decoder state (new station) */
+	if (ctx->rdsspy_srv)
+		rds_server_send_reset(ctx->rdsspy_srv);
+}
+
+/* Scan retune callback for XDR-GTK spectral scan:
+ * called only when the scan engine needs to shift the SDR window. */
+static void radio_scan_cb(int freq_khz, void *arg)
+{
+	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
+	double freq_hz = freq_khz * 1000.0;
+
+	if (sdr_set_rx_frequency(freq_hz) < 0)
+		return;
+
+	frequency = freq_hz;
+	if (ctx->xdr_srv)
+		ctx->xdr_srv->freq_khz = freq_khz;
+}
+
+static void radio_tx_tune_cb(int freq_khz, void *arg)
+{
+	(void)arg;
+	double freq_hz = freq_khz * 1000.0;
+
+	LOGP(DRADIO, LOGL_NOTICE, "Re-tuning SDR TX to %d kHz\n", freq_khz);
+
+	if (sdr_set_tx_frequency(freq_hz) < 0) {
+		LOGP(DRADIO, LOGL_ERROR, "Failed to re-tune SDR TX to %d kHz\n", freq_khz);
+		return;
+	}
+
+	frequency = freq_hz;
+}
+
+/* Callback for decoded RDS groups - forwards to protocol servers */
+static void rds_group_callback(const uint16_t blocks[4], const uint8_t status[4], void *arg)
+{
+	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
+
+	if (ctx->xdr_srv) {
+		rds_server_send_group(ctx->xdr_srv, blocks, status);
+		/* XDR-GTK needs explicit PI messages to drive its rds_timeout counter.
+		 * Send P<XXXX> for every group where block A is usable (error < uncorrectable). */
+		if (status[0] < RDS_ERR_UNCORR)
+			rds_server_send_pi(ctx->xdr_srv, blocks[0], status[0]);
+	}
+	if (ctx->rdsspy_srv)
+		rds_server_send_group(ctx->rdsspy_srv, blocks, status);
+	if (ctx->asciig_srv)
+		rds_server_send_group(ctx->asciig_srv, blocks, status);
+}
 
 static void sighandler(int sigset)
 {
@@ -169,6 +265,35 @@ static void print_help(const char *arg0)
 	printf("        Enable RDS decoder verbose logging (human-readable interpretation).\n");
 	printf("    --rbds\n");
 	printf("        Force RBDS decoding (callsign lookup, US PTY names).\n");
+	printf("    --rds-paging [rpc]\n");
+	printf("        Enable RDS Radio Paging (Group 7A/1A/13A). Implies --rds.\n");
+	printf("        Optional RPC value 0-31 (default 4: group 001, sync 00).\n");
+	printf("        Use named pipe /tmp/rds_paging_send to send messages.\n");
+	printf("    --rds-hexrds-file <filename>\n");
+	printf("        Write received RDS groups to file in hexrds format.\n");
+	printf("        Format: \"XXXX XXXX XXXX XXXX\" per line (---- for missing blocks).\n");
+	printf("    --rds-bitstream-file <filename>\n");
+	printf("        Write received RDS bitstream to file in binary format.\n");
+	printf("        Raw bits packed MSB first, compatible with .rds files.\n");
+	printf("    --xdr-gtk-server <endpoint>\n");
+	printf("        Enable XDR-GTK protocol server for RDS decoder output.\n");
+	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:7373)\n");
+	printf("        Serial: <device>,<speed>,<8N1>[,<flow>]\n");
+	printf("    --xdr-gtk-password <password>\n");
+	printf("        Set password for XDR-GTK TCP authentication (SHA1 challenge-response).\n");
+	printf("        If not set, clients connect without a password.\n");
+	printf("    --rdsspy-server <endpoint>\n");
+	printf("        Enable RDS Spy protocol server for RDS decoder output.\n");
+	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:7374)\n");
+	printf("        Serial: <device>,<speed>,<8N1>[,<flow>]\n");
+	printf("    --uecp-server <endpoint>\n");
+	printf("        Enable UECP protocol server for RDS encoder control.\n");
+	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:5001)\n");
+	printf("        Serial: <device>,<speed>,<8N1>[,<flow>]\n");
+	printf("    --asciig-server <endpoint>\n");
+	printf("        Enable ASCII-G protocol server for RDS encoder control.\n");
+	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:5002)\n");
+	printf("        Serial: <device>,<speed>,<8N1>[,<flow>]\n");
 	printf("    --call-sign <WXXX>\n");
 	printf("        Set RBDS Call Sign (e.g. WNYC) to automatically configure PI code.\n");
 	printf("    --pi <HEX>\n");
@@ -213,6 +338,14 @@ static int use_polyphase = 0;
 #define OPT_PI			1103
 #define OPT_POLYPHASE		1104
 #define OPT_RBDS		1105
+#define OPT_RDS_PAGING		1106
+#define OPT_RDS_HEXRDS_FILE	1107
+#define OPT_RDS_BITSTREAM_FILE	1108
+#define OPT_XDR_GTK_SERVER	1109
+#define OPT_RDSSPY_SERVER	1110
+#define OPT_UECP_SERVER		1111
+#define OPT_ASCIIG_SERVER	1112
+#define OPT_XDR_GTK_PASSWORD	1113
 
 static void add_options(void)
 {
@@ -248,6 +381,14 @@ static void add_options(void)
 	option_add(OPT_PI, "pi", 1);
 	option_add(OPT_POLYPHASE, "polyphase-resampler", 0);
 	option_add(OPT_RBDS, "rbds", 0);
+	option_add(OPT_RDS_PAGING, "rds-paging", 1);
+	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
+	option_add(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1);
+	option_add(OPT_XDR_GTK_SERVER, "xdr-gtk-server", 1);
+	option_add(OPT_RDSSPY_SERVER, "rdsspy-server", 1);
+	option_add(OPT_UECP_SERVER, "uecp-server", 1);
+	option_add(OPT_ASCIIG_SERVER, "asciig-server", 1);
+	option_add(OPT_XDR_GTK_PASSWORD, "xdr-gtk-password", 1);
         sdr_config_add_options();
 }
 
@@ -371,6 +512,45 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_POLYPHASE:
 		use_polyphase = 1;
 		break;
+	case OPT_RDS_PAGING:
+		rds_paging = 1;
+		rds = 1;  /* auto-enable RDS */
+		{
+			int rpc_val = atoi(argv[argi]);
+			if (rpc_val < 0 || rpc_val > 31) {
+				fprintf(stderr, "Invalid RPC value %d (must be 0-31), use '-h' for help!\n", rpc_val);
+				return -EINVAL;
+			}
+			rds_paging_rpc = rpc_val;
+		}
+		break;
+	case OPT_RDS_HEXRDS_FILE:
+		rds_hexrds_file = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
+	case OPT_RDS_BITSTREAM_FILE:
+		rds_bitstream_file = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
+	case OPT_XDR_GTK_SERVER:
+		xdr_gtk_server = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
+	case OPT_XDR_GTK_PASSWORD:
+		xdr_gtk_password = options_strdup(argv[argi]);
+		break;
+	case OPT_RDSSPY_SERVER:
+		rdsspy_server = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
+	case OPT_UECP_SERVER:
+		uecp_server = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
+	case OPT_ASCIIG_SERVER:
+		asciig_server = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
 	case OPT_LIMESDR:
 		{
 			char *argv_lime[] = { argv[0],
@@ -407,6 +587,128 @@ static int handle_options(int short_option, int argi, char **argv)
 	return 1;
 }
 
+/* Process paging commands from named pipe.
+ * Format: <address>,<type>,<message>
+ *     or: <address>,<type>,<repeats>,<interval_sec>,<message>
+ * Types: tone, numeric, alpha */
+static void paging_pipe_handler(rds_encoder_t *enc)
+{
+	static char buf[512];
+	static int pos = 0;
+	int space = sizeof(buf) - pos - 1;
+	int rc, i;
+
+	if (paging_pipe_fd < 0)
+		return;
+
+	rc = read(paging_pipe_fd, buf + pos, space);
+	if (rc <= 0)
+		return;
+	pos += rc;
+
+	/* look for newline */
+	for (i = 0; i < pos; i++) {
+		if (buf[i] == '\r' || buf[i] == '\n')
+			break;
+	}
+	if (i >= pos)
+		return;
+
+	buf[i] = '\0';
+	pos = 0;
+
+	/* Parse: address,type[,repeats,interval],message */
+	char *p = buf;
+	char *addr_str = strsep(&p, ",");
+	char *type_str = strsep(&p, ",");
+	if (!addr_str || !type_str) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: invalid format\n");
+		return;
+	}
+
+	uint32_t address = (uint32_t)atoi(addr_str);
+	if (address > 999999) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: address %u out of range\n", address);
+		return;
+	}
+
+	/* Check for extended format: repeats,interval,message */
+	int repeats = 2;
+	int interval = 0;
+	char *msg = NULL;
+
+	if (!strcasecmp(type_str, "tone")) {
+		/* Tone: no message needed, but check for repeats */
+		if (p) {
+			/* Could be repeats,interval or nothing */
+			char *r = strsep(&p, ",");
+			if (r && p) {
+				repeats = atoi(r);
+				char *iv = strsep(&p, ",");
+				if (iv) interval = atoi(iv);
+			}
+		}
+		rds_enc_paging_send_tone(enc, address, repeats, interval);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS paging: queued TONE addr=%02u-%04u repeats=%d\n",
+		     address / 10000, address % 10000, repeats);
+	} else if (!strcasecmp(type_str, "numeric") || !strcasecmp(type_str, "numeric10") || !strcasecmp(type_str, "numeric18")) {
+		if (!p) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: numeric requires message\n");
+			return;
+		}
+		/* Check for extended format */
+		char *next = strsep(&p, ",");
+		if (p) {
+			/* Could be repeats,interval,msg or just msg */
+			char *maybe_interval = strsep(&p, ",");
+			if (maybe_interval && p) {
+				repeats = atoi(next);
+				interval = atoi(maybe_interval);
+				msg = p;
+			} else {
+				/* Two fields: next is the message, maybe_interval is extra */
+				msg = next;
+			}
+		} else {
+			msg = next;
+		}
+		if (!msg || !*msg) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: empty numeric message\n");
+			return;
+		}
+		rds_enc_paging_send_numeric(enc, address, msg, repeats, interval);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS paging: queued NUMERIC addr=%02u-%04u msg=\"%s\" repeats=%d\n",
+		     address / 10000, address % 10000, msg, repeats);
+	} else if (!strcasecmp(type_str, "alpha")) {
+		if (!p) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: alpha requires message\n");
+			return;
+		}
+		char *next = strsep(&p, ",");
+		if (p) {
+			char *maybe_interval = strsep(&p, ",");
+			if (maybe_interval && p) {
+				repeats = atoi(next);
+				interval = atoi(maybe_interval);
+				msg = p;
+			} else {
+				msg = next;
+			}
+		} else {
+			msg = next;
+		}
+		if (!msg || !*msg) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: empty alpha message\n");
+			return;
+		}
+		rds_enc_paging_send_alpha(enc, address, msg, repeats, interval);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS paging: queued ALPHA addr=%02u-%04u msg=\"%s\" repeats=%d\n",
+		     address / 10000, address % 10000, msg, repeats);
+	} else {
+		LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: unknown type '%s'\n", type_str);
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	int rc, argi;
@@ -415,8 +717,15 @@ int main(int argc, char *argv[])
 	int c;
 	int buffer_size;
 	int input_samplerate;
+	void *sdr = NULL;
+	float *sendbuff = NULL;
+	
+	/* Protocol servers */
+	rds_server_t xdr_srv, rdsspy_srv, uecp_srv, asciig_srv;
+	int xdr_enabled = 0, rdsspy_enabled = 0, uecp_enabled = 0, asciig_enabled = 0;
+	rds_callback_ctx_t rds_cb_ctx = { NULL, NULL, NULL };
 
-	loglevel = LOGL_DEBUG;
+	loglevel = LOGL_NOTICE;
 	logging_init();
 
 	sdr_config_init(DEFAULT_LO_OFFSET);
@@ -526,8 +835,132 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
-	void *sdr = NULL;
-	float *sendbuff = NULL;
+	/* Set up RDS file output if requested */
+	if (rds_hexrds_file) {
+		rc = rds_decoder_set_hexrds_file(&radio.rds_dec, rds_hexrds_file);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to open hexrds output file, exitting!\n");
+			exit(0);
+		}
+	}
+	if (rds_bitstream_file) {
+		rc = rds_decoder_set_bitstream_file(&radio.rds_dec, rds_bitstream_file);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to open bitstream output file, exitting!\n");
+			exit(0);
+		}
+	}
+
+	/* Enable RDS paging if requested */
+	if (rds_paging) {
+		rds_enc_paging_enable(&radio.rds_enc, 1);
+		rds_enc_paging_set_rpc(&radio.rds_enc, rds_paging_rpc);
+		/* Enable paging decoder so 7A/13A are decoded as paging, not ODA */
+		radio.rds_dec.paging_enabled = 1;
+		/* Create named pipe for paging commands */
+		unlink(RDS_PAGING_PIPE);
+		rc = mkfifo(RDS_PAGING_PIPE, 0666);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to create paging FIFO '%s': %s\n",
+				RDS_PAGING_PIPE, strerror(errno));
+		} else {
+			paging_pipe_fd = open(RDS_PAGING_PIPE, O_RDONLY | O_NONBLOCK);
+			if (paging_pipe_fd < 0)
+				fprintf(stderr, "Failed to open paging FIFO '%s': %s\n",
+					RDS_PAGING_PIPE, strerror(errno));
+			else
+				printf("RDS Paging enabled (RPC=%d), pipe: %s\n",
+				       rds_paging_rpc, RDS_PAGING_PIPE);
+		}
+	}
+
+	/* Initialize protocol servers */
+	memset(&xdr_srv, 0, sizeof(xdr_srv));
+	memset(&rdsspy_srv, 0, sizeof(rdsspy_srv));
+	memset(&uecp_srv, 0, sizeof(uecp_srv));
+	memset(&asciig_srv, 0, sizeof(asciig_srv));
+
+	/* RX-only servers: XDR-GTK and RDS-Spy */
+	if (xdr_gtk_server) {
+		if (!rx)
+			fprintf(stderr, "Warning: --xdr-gtk-server is for RX mode (use with --rx)\n");
+		rc = rds_server_init(&xdr_srv, xdr_gtk_server, RDS_PROTO_XDR_GTK, NULL);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to initialize XDR-GTK server\n");
+			goto error;
+		}
+		if (xdr_gtk_password)
+			rds_server_set_password(&xdr_srv, xdr_gtk_password);
+		xdr_srv.freq_khz = (int)(frequency / 1000.0);
+		/* Tell XDR-GTK our de-emphasis setting: 0=50µs (EU), 1=75µs (US) */
+		if (time_constant_us == 50.0)
+			rds_server_set_deemphasis(&xdr_srv, 0);
+		else if (time_constant_us == 75.0)
+			rds_server_set_deemphasis(&xdr_srv, 1);
+		xdr_enabled = 1;
+		printf("XDR-GTK protocol server enabled: %s%s\n",
+		       xdr_gtk_server, xdr_gtk_password ? " (password protected)" : "");
+	}
+
+	if (rdsspy_server) {
+		if (!rx)
+			fprintf(stderr, "Warning: --rdsspy-server is for RX mode (use with --rx)\n");
+		rc = rds_server_init(&rdsspy_srv, rdsspy_server, RDS_PROTO_RDSSPY, NULL);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to initialize RDS Spy server\n");
+			goto error;
+		}
+		rdsspy_enabled = 1;
+		printf("RDS Spy protocol server enabled: %s\n", rdsspy_server);
+	}
+
+	/* TX-only servers: UECP and ASCII-G */
+	if (uecp_server) {
+		if (!tx)
+			fprintf(stderr, "Warning: --uecp-server is for TX mode (use with --tx)\n");
+		rc = rds_server_init(&uecp_srv, uecp_server, RDS_PROTO_UECP, &radio.rds_enc);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to initialize UECP server\n");
+			goto error;
+		}
+		uecp_enabled = 1;
+		printf("UECP protocol server enabled: %s\n", uecp_server);
+	}
+
+	if (asciig_server) {
+		if (!tx)
+			fprintf(stderr, "Warning: --asciig-server is for TX mode (use with --tx)\n");
+		rc = rds_server_init(&asciig_srv, asciig_server, RDS_PROTO_ASCII_G, &radio.rds_enc);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to initialize ASCII-G server\n");
+			goto error;
+		}
+		asciig_srv.freq_khz = (int)(frequency / 1000.0);
+		asciig_enabled = 1;
+		printf("ASCII-G protocol server enabled: %s\n", asciig_server);
+	}
+
+	/* Set up RDS decoder callback for RX protocol servers (XDR-GTK, RDS-Spy) */
+	if (xdr_enabled || rdsspy_enabled) {
+		rds_cb_ctx.xdr_srv = xdr_enabled ? &xdr_srv : NULL;
+		rds_cb_ctx.rdsspy_srv = rdsspy_enabled ? &rdsspy_srv : NULL;
+		rds_cb_ctx.asciig_srv = NULL;
+		rds_decoder_set_group_callback(&radio.rds_dec, rds_group_callback, &rds_cb_ctx);
+	}
+
+	/* Wire tune callback into XDR-GTK and RDS-Spy servers (RX tuner control) */
+	if (xdr_enabled)
+		rds_server_set_callbacks(&xdr_srv, radio_tune_cb, NULL, &rds_cb_ctx);
+	if (rdsspy_enabled)
+		rds_server_set_callbacks(&rdsspy_srv, radio_tune_cb, NULL, &rds_cb_ctx);
+	/* Wire tune callback into ASCII-G server (TX tuner control) */
+	if (asciig_enabled)
+		rds_server_set_callbacks(&asciig_srv, radio_tx_tune_cb, NULL, NULL);
+
+	/* Wire spectral scan callback into XDR-GTK server */
+	if (xdr_enabled && rx)
+		rds_server_set_scan_callback(&xdr_srv, radio_scan_cb, &rds_cb_ctx);
+
 
 	sendbuff = calloc(buffer_size * 2, sizeof(*sendbuff));
 	if (!sendbuff) {
@@ -586,11 +1019,45 @@ int main(int argc, char *argv[])
 #endif
 	while (!quit) {
 		usleep(1000);
+		/* Check paging pipe for new messages */
+		if (paging_pipe_fd >= 0)
+			paging_pipe_handler(&radio.rds_enc);
+		
+		/* Poll protocol servers (non-blocking) */
+		if (xdr_enabled)
+			rds_server_poll(&xdr_srv);
+		if (rdsspy_enabled)
+			rds_server_poll(&rdsspy_srv);
+		if (uecp_enabled)
+			rds_server_poll(&uecp_srv);
+		if (asciig_enabled)
+			rds_server_poll(&asciig_srv);
+		
 		got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
 		if (rx) {
+			/* Feed raw IQ into scan engine if active (FFT-based, no retuning needed
+			 * unless scan range exceeds SDR bandwidth) */
+			if (xdr_enabled && xdr_srv.scan_active)
+				rds_server_scan_feed_iq(&xdr_srv, sendbuff, got,
+							frequency, sdr_get_samplerate(sdr));
+			/* Feed raw IQ into narrow-band power estimator when not scanning.
+			 * This gives a per-channel SNR on the same scale as scan results. */
+			else if (xdr_enabled)
+				rds_server_feed_iq(&xdr_srv, sendbuff, got,
+						   sdr_get_samplerate(sdr));
 			got = radio_rx(&radio, sendbuff, got);
 			if (got < 0)
 				break;
+			/* Feed signal level to XDR-GTK for periodic S reports.
+			 * Use nb_signal_db (narrow-band SNR+10) so the value is on
+			 * the same scale as scan results. */
+			if (xdr_enabled) {
+				double sig_db = (xdr_srv.nb_hist_fill > 0)
+					? xdr_srv.nb_signal_db
+					: -100.0;
+				int is_stereo = radio.stereo && radio.rx_pilot_locked;
+				rds_server_update_signal(&xdr_srv, sig_db, is_stereo);
+			}
 		}
 		tosend = sdr_get_tosend(sdr, buffer_size);
 #if 0 /* TX debug logging - uncomment to enable */
@@ -711,6 +1178,21 @@ error:
 	free(sendbuff);
 	if (sdr)
 		sdr_close(sdr);
+	/* Clean up paging pipe */
+	if (paging_pipe_fd >= 0)
+		close(paging_pipe_fd);
+	unlink(RDS_PAGING_PIPE);
+	
+	/* Clean up protocol servers */
+	if (xdr_enabled)
+		rds_server_cleanup(&xdr_srv);
+	if (rdsspy_enabled)
+		rds_server_cleanup(&rdsspy_srv);
+	if (uecp_enabled)
+		rds_server_cleanup(&uecp_srv);
+	if (asciig_enabled)
+		rds_server_cleanup(&asciig_srv);
+	
 	radio_exit(&radio);
 
 	/* global exits */

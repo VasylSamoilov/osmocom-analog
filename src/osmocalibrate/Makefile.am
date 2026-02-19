@@ -19,6 +19,8 @@ osmocalibrate_LDADD = \
 	$(top_builddir)/src/libemphasis/libemphasis.a \
 	$(top_builddir)/src/libsamplerate/libsamplerate.a \
 	$(top_builddir)/src/libpolyphase/libpolyphase.a \
+	$(top_builddir)/src/libfastmath/libfastmath.a \
+	$(top_builddir)/src/libiqringbuf/libiqringbuf.a \
 	$(top_builddir)/src/libjitter/libjitter.a \
 	$(top_builddir)/src/libfilter/libfilter.a \
 	$(top_builddir)/src/libdisplay/libdisplay.a \
@@ -27,6 +29,7 @@ osmocalibrate_LDADD = \
 	$(LIBOSMOCORE_LIBS) \
 	$(UHD_LIBS) \
 	$(SOAPY_LIBS) \
+	$(RPITX_LIBS) \
 	-lm
 
 if HAVE_ALSA
@@ -36,5 +39,13 @@ osmocalibrate_LDADD += \
 endif
 
 AM_CPPFLAGS += -DHAVE_SDR
+
+if HAVE_UHD
+AM_CPPFLAGS += -DHAVE_UHD
+endif
+
+if HAVE_SOAPY
+AM_CPPFLAGS += -DHAVE_SOAPY
+endif
 
 endif

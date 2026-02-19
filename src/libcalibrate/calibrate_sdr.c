@@ -150,22 +150,27 @@ int calibrate_sdr_receive(calibrate_sdr_t *sdr, float *iq_buffer, int max_sample
 
 int calibrate_sdr_set_freq(calibrate_sdr_t *sdr, double center_freq)
 {
+	int rc = -ENOSYS;
+
 	if (!sdr->is_open)
 		return -ENODEV;
-	
-	sdr->center_freq = center_freq;
-	
-	/* Note: For frequency changes during scanning, we would need to 
-	 * close and reopen. This is a limitation of the current soapy/uhd
-	 * wrappers. For now, we'll return success but not actually change.
-	 * 
-	 * TODO: Add soapy_set_frequency() / uhd_set_frequency() functions
-	 * to the low-level wrappers.
-	 */
-	
-	fprintf(stderr, "calibrate_sdr: frequency change not yet implemented\n");
-	return -ENOSYS;
+
+#ifdef HAVE_SOAPY
+	if (sdr->use_soapy)
+		rc = soapy_set_rx_frequency(center_freq);
+#endif
+
+#ifdef HAVE_UHD
+	if (sdr->use_uhd)
+		rc = uhd_set_rx_frequency(center_freq);
+#endif
+
+	if (rc == 0)
+		sdr->center_freq = center_freq;
+
+	return rc;
 }
+
 
 void calibrate_sdr_close(calibrate_sdr_t *sdr)
 {

@@ -662,6 +662,79 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_10A_SEGMENT_MASK    0x0001
 
 /* ============================================================
+ * Group 7A Bit Fields (EN 50067 Annex M / IEC 62106)
+ * Radio Paging (or ODA when paging not enabled)
+ *
+ * Block B payload (bits 4-0):
+ *   Bit  4:     A/B Flag (paging call indicator, toggles per new call)
+ *   Bits 3-0:   PSAC (Paging Segment Address Code)
+ *
+ * Block C: Paging address or data (depends on PSAC)
+ * Block D: Paging address or data (depends on PSAC)
+ * ============================================================ */
+#define RDS_7A_AB_FLAG_BIT      4
+#define RDS_7A_AB_FLAG_MASK     0x0010
+#define RDS_7A_PSAC_MASK        0x000F  /* Bits 3-0: PSAC value */
+
+/* PSAC values (EN 50067 Annex M Table M.2) */
+#define RDS_7A_PSAC_TONE        0x0     /* Tone-only (1 group) */
+#define RDS_7A_PSAC_NUM10_ADDR  0x2     /* 10-digit numeric: address group */
+#define RDS_7A_PSAC_NUM10_DATA  0x3     /* 10-digit numeric: data group */
+#define RDS_7A_PSAC_NUM18_ADDR  0x4     /* 18-digit numeric: address group */
+#define RDS_7A_PSAC_NUM18_DATA1 0x5     /* 18-digit numeric: data group 1 */
+#define RDS_7A_PSAC_NUM18_DATA2 0x6     /* 18-digit numeric: data group 2 */
+#define RDS_7A_PSAC_INTL15      0x7     /* International 15-digit */
+#define RDS_7A_PSAC_ALPHA_ADDR  0x8     /* Alphanumeric: address group */
+#define RDS_7A_PSAC_ALPHA_DATA_FIRST 0x9 /* Alphanumeric: first data group */
+#define RDS_7A_PSAC_ALPHA_DATA_LAST  0xE /* Alphanumeric: last data group (cycles 9-E) */
+#define RDS_7A_PSAC_ALPHA_END   0xF     /* Alphanumeric: end-of-message */
+
+/* BCD encoding for paging digits (EN 50067 Annex M) */
+#define RDS_PAGING_BCD_SPACE    0xA     /* Space character in BCD */
+#define RDS_PAGING_BCD_MAX      0x9     /* Maximum valid digit nibble */
+
+/* Paging message limits */
+#define RDS_PAGING_ADDR_MAX     999999  /* Maximum 6-digit address */
+#define RDS_PAGING_NUM10_DIGITS 10      /* 10-digit numeric message */
+#define RDS_PAGING_NUM18_DIGITS 18      /* 18-digit numeric message */
+#define RDS_PAGING_ALPHA_MAX    80      /* Maximum alphanumeric chars */
+#define RDS_PAGING_ALPHA_PER_GROUP 4    /* Characters per alpha data group */
+#define RDS_PAGING_MAX_GROUPS   22      /* Max groups for 80-char alpha */
+#define RDS_PAGING_QUEUE_MAX    16      /* Maximum queued messages */
+#define RDS_PAGING_DEFAULT_REPEATS   2  /* Default retransmission count */
+#define RDS_PAGING_DEFAULT_INTERVAL  5  /* Default repeat interval (seconds) */
+#define RDS_PAGING_DEFAULT_TIMEOUT  30  /* Default reassembly timeout (seconds) */
+#define RDS_PAGING_DEFAULT_RPC       4  /* Default RPC (groups 00-99, sync 00) */
+
+/* ============================================================
+ * Group 13A Bit Fields (EN 50067 Annex M / IEC 62106)
+ * Enhanced Radio Paging (or ODA when paging not enabled)
+ *
+ * Block B payload (bits 4-0):
+ *   Bits 4-2: STY (Sub-Type, 000 for address notification)
+ *   Bits 1-0: Reserved
+ *
+ * Block C (sub-type 000):
+ *   Bits 15-14: CS (Cycle Selection)
+ *   Bits 13-10: IT (Interval Number, 0-9)
+ *   Bits 9-0:   Notification bits 24-15
+ *
+ * Block D (sub-type 000):
+ *   Bits 15-1:  Notification bits 14-0
+ *   Bit  0:     S1 (Sort indicator)
+ * ============================================================ */
+#define RDS_13A_STY_SHIFT       2
+#define RDS_13A_STY_MASK        0x001C  /* Bits 4-2: Sub-type */
+#define RDS_13A_CS_SHIFT        14
+#define RDS_13A_CS_MASK         0xC000  /* Block C bits 15-14 */
+#define RDS_13A_IT_SHIFT        10
+#define RDS_13A_IT_MASK         0x3C00  /* Block C bits 13-10 */
+#define RDS_13A_NOTIFY_HI_MASK  0x03FF  /* Block C bits 9-0: notify 24-15 */
+#define RDS_13A_NOTIFY_LO_SHIFT 1
+#define RDS_13A_NOTIFY_LO_MASK  0xFFFE  /* Block D bits 15-1: notify 14-0 */
+#define RDS_13A_S1_MASK         0x0001  /* Block D bit 0: sort indicator */
+
+/* ============================================================
  * Group 3A Bit Fields (IEC 62106 S6.1.5.5)
  * Open Data Application (ODA) Identification
  *
@@ -1289,6 +1362,92 @@ typedef struct {
 } rds_eon_entry_t;
 
 /* ============================================================
+ * RDS PAGING TYPES (EN 50067 Annex M)
+ * ============================================================ */
+
+/* Paging message types */
+enum rds_paging_msg_type {
+	RDS_PAGING_TONE  = 0,	/* Tone-only (1 group) */
+	RDS_PAGING_NUM10 = 1,	/* 10-digit numeric (2 groups) */
+	RDS_PAGING_NUM18 = 2,	/* 18-digit numeric (3 groups) */
+	RDS_PAGING_ALPHA = 3,	/* Alphanumeric up to 80 chars */
+};
+
+/* Queued paging message */
+typedef struct rds_paging_msg {
+	struct rds_paging_msg	*next;
+	enum rds_paging_msg_type type;
+	uint32_t	address;	/* 6-digit BCD address (0-999999) */
+	char		data[81];	/* Message content (max 80 + NUL) */
+	int		data_len;	/* Length of message data */
+	int		repeats_left;	/* Remaining retransmissions */
+	int		repeat_interval;/* Seconds between retransmissions */
+	time_t		next_send_time;	/* Earliest time for next transmission */
+} rds_paging_msg_t;
+
+/* Paging encoder state - embedded in rds_encoder_t */
+typedef struct rds_paging_enc {
+	int		enabled;	/* Paging enabled flag */
+	int		enhanced;	/* Enhanced paging (13A) enabled */
+	uint8_t		rpc;		/* Radio Paging Code (0-31) for Group 1A */
+	uint8_t		ab_flag;	/* Current A/B flag (toggles per new call) */
+
+	/* Current transmission state */
+	int		tx_active;	/* Currently transmitting a message */
+	rds_paging_msg_t *tx_msg;	/* Message being transmitted (owned copy) */
+	int		tx_group_idx;	/* Current group index within message */
+	int		tx_total_groups;/* Total groups needed for current message */
+
+	/* Pre-computed group data for current message */
+	uint16_t	tx_blocks_c[RDS_PAGING_MAX_GROUPS];
+	uint16_t	tx_blocks_d[RDS_PAGING_MAX_GROUPS];
+	uint8_t		tx_psac_seq[RDS_PAGING_MAX_GROUPS];
+
+	/* Message queue */
+	rds_paging_msg_t *queue_head;
+	rds_paging_msg_t *queue_tail;
+	int		queue_count;
+
+	/* 13A enhanced paging state */
+	uint32_t	notify_bits;	/* Address notification bits (25 bits) */
+	uint8_t		cycle_selection;/* CS field (0-3) */
+} rds_paging_enc_t;
+
+/* Paging decoder state - embedded in rds_decoder_t */
+typedef struct rds_paging_dec {
+	/* Reassembly state */
+	int		assembling;	/* Currently assembling a multi-group message */
+	enum rds_paging_msg_type msg_type;
+	uint32_t	address;	/* Decoded address */
+	uint8_t		ab_flag;	/* Last seen A/B flag */
+	int		expected_psac;	/* Next expected PSAC value */
+	char		msg_buf[81];	/* Reassembly buffer */
+	int		msg_len;	/* Current length in buffer */
+	time_t		assembly_start;	/* Timestamp when assembly began */
+	int		timeout_sec;	/* Configurable reassembly timeout */
+
+	/* Last complete message (for display/API) */
+	int		msg_valid;	/* 1 if a complete message is available */
+	enum rds_paging_msg_type last_type;
+	uint32_t	last_address;
+	char		last_msg[81];
+	int		last_msg_len;
+
+	/* Group 1A RPC state */
+	uint8_t		rpc;		/* Last received Radio Paging Code */
+	uint8_t		rpc_group_desig;/* Decoded group designation (bits 4-2) */
+	uint8_t		rpc_batt_sync;	/* Battery saving sync (bits 1-0) */
+	uint8_t		rpc_valid;	/* RPC received at least once */
+
+	/* Group 13A enhanced paging state */
+	uint32_t	notify_bits;	/* Address notification bits (25 bits) */
+	uint8_t		notify_sty;	/* Last STY sub-type */
+	uint8_t		cycle_selection;/* CS field */
+	uint8_t		interval_num;	/* Current interval number (0-9) */
+	uint8_t		enhanced_valid;	/* 13A data received at least once */
+} rds_paging_dec_t;
+
+/* ============================================================
  * GROUP VERSION SELECTION (IEC 62106)
  * ============================================================
  * Each RDS group type (0-15) has two versions: A and B.
@@ -1428,6 +1587,9 @@ typedef struct rds_encoder {
 	
 	/* eRT (Enhanced RadioText) - 128-byte UTF-8/UCS-2 text */
 	rds_ert_encoder_t ert;			/* eRT encoder configuration */
+	
+	/* Radio Paging (EN 50067 Annex M) - Group 7A, 1A RPC, 13A */
+	rds_paging_enc_t paging;		/* Paging encoder state */
 	
 	/* Fixed Group Sequence Scheduler */
 	#define RDS_SCHEDULER_MAX_LEN 64
@@ -1586,10 +1748,11 @@ void rds_enc_oda_clear(rds_encoder_t *rds);
  * Call rds_oda_add() first to register RT+ on a carrier group:
  *   rds_oda_add(rds, 22, RDS_ODA_AID_RT_PLUS, message);
  * 
- * Returns 0 on success, -1 if tag array is full (max 2 tags)
+ * Returns 0 on success, -1 on validation error
  */
-int rds_enc_rtplus_add_tag(rds_encoder_t *rds, uint8_t content_type, 
-                           uint8_t start, uint8_t length);
+int rds_enc_rtplus_set_tags(rds_encoder_t *rds,
+                            uint8_t ct1, uint8_t start1, uint8_t len1,
+                            uint8_t ct2, uint8_t start2, uint8_t len2);
 void rds_enc_rtplus_clear_tags(rds_encoder_t *rds);
 void rds_enc_rtplus_set_toggle(rds_encoder_t *rds, int toggle);
 void rds_enc_rtplus_set_item_running(rds_encoder_t *rds, int running);
@@ -1598,8 +1761,9 @@ int rds_enc_rtplus_get_tag_count(const rds_encoder_t *rds);
 int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,
                             uint8_t *content_type, uint8_t *start, uint8_t *length);
 /* eRT+ API (same as RT+ but for eRT) */
-int rds_enc_ert_plus_add_tag(rds_encoder_t *rds, uint8_t content_type,
-                             uint8_t start, uint8_t length);
+int rds_enc_ert_plus_set_tags(rds_encoder_t *rds,
+                              uint8_t ct1, uint8_t start1, uint8_t len1,
+                              uint8_t ct2, uint8_t start2, uint8_t len2);
 void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds);
 void rds_enc_ert_plus_set_toggle(rds_encoder_t *rds, int toggle);
 void rds_enc_ert_plus_set_item_running(rds_encoder_t *rds, int running);
@@ -1861,6 +2025,30 @@ void rds_enc_eon_clear(rds_encoder_t *rds);
 int rds_enc_eon_get_count(const rds_encoder_t *rds);
 int rds_enc_eon_get_entry(const rds_encoder_t *rds, int index, uint16_t *pi, char *ps, size_t ps_len, uint8_t *pty, uint8_t *tp, uint8_t *ta);
 
+/* ============================================================
+ * Paging Encoder API (EN 50067 Annex M)
+ * ============================================================ */
+/* BCD encoding/decoding utilities */
+int rds_paging_bcd_encode(const char *digits, int len, uint8_t *nibbles, int max_nibbles);
+int rds_paging_bcd_decode(const uint8_t *nibbles, int count, char *digits, int max_len);
+
+/* Address packing/unpacking */
+void rds_paging_addr_pack(uint32_t address, uint16_t *block_c, uint8_t *block_d_hi);
+uint32_t rds_paging_addr_unpack(uint16_t block_c, uint8_t block_d_hi);
+
+/* Queue paging messages */
+int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
+			     int repeats, int interval_sec);
+int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
+				const char *digits, int repeats, int interval_sec);
+int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
+			      const char *text, int repeats, int interval_sec);
+
+/* Configuration */
+void rds_enc_paging_enable(rds_encoder_t *rds, int enable);
+void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
+void rds_enc_paging_set_enhanced(rds_encoder_t *rds, int enable);
+
 /* Cleanup */
 void rds_encoder_exit(rds_encoder_t *rds);
 
@@ -1896,11 +2084,22 @@ typedef struct rds_decoder {
 	rds_iir_filter_t	filter_2400_i;	/* 2.4kHz LPF for I */
 	rds_iir_filter_t	filter_2400_q;	/* 2.4kHz LPF for Q */
 	
+	/* AGC for Costas PLL (normalizes baseband level so error signal is meaningful) */
+	double		agc_gain;		/* Current AGC gain */
+	double		agc_alpha;		/* AGC smoothing constant */
+	
 	/* Clock Recovery (Subcarrier-locked) */
 	double		clock_offset;		/* Phase offset for 1187.5 Hz clock */
 	int		prev_clock_bit;		/* Previous clock level (+1/-1) */
 	double		prev_bb_sample;		/* Previous baseband sample (for zero cross) */
 	double		integrator;		/* Integrate-and-dump accumulator */
+	int		decimate_counter;	/* Decimation counter (per-instance) */
+	
+	/* PLL Lock Detection (RdsSurveyor2-style) */
+	double		lock_sum_i;		/* Running sum of |bb_i| at symbol dumps */
+	double		lock_sum_q;		/* Running sum of |bb_q| at symbol dumps */
+	int		lock_count;		/* Number of symbol dumps in window */
+	int		pll_locked;		/* 1 if PLL is locked (I >> Q) */
 	
 	/* Biphase Decoding */
 	int		curr_bit;		/* Current raw bit */
@@ -2084,9 +2283,53 @@ typedef struct rds_decoder {
 	uint8_t		on_ta;			/* TA flag of ON */
 	uint16_t	on_pin;			/* PIN of ON */
 	
+	/* Radio Paging (EN 50067 Annex M) - Group 7A, 1A RPC, 13A */
+	int		paging_enabled;		/* Decode paging groups (--paging) */
+	rds_paging_dec_t paging_dec;		/* Paging decoder state */
+	
 	/* Status timing */
 	double		status_timer;
 	double		status_interval;
+	
+	/* Signal-level debug instrumentation */
+	double		signal_debug_timer;
+	double		signal_debug_interval;
+	double		sig_bb_i_peak;		/* Peak baseband I since last report */
+	double		sig_bb_q_peak;		/* Peak baseband Q since last report */
+	double		sig_bb_i_sum;		/* Sum of |bb_i| for average */
+	double		sig_bb_q_sum;		/* Sum of |bb_q| for average */
+	double		sig_pll_err_peak;	/* Peak PLL error since last report */
+	double		sig_pll_err_sum;	/* Sum of |pll_err| for average */
+	double		sig_input_peak;		/* Peak input sample level */
+	double		sig_input_sum;		/* Sum of |input| for average */
+	double		sig_integrator_peak;	/* Peak integrator dump value */
+	double		sig_integrator_sum;	/* Sum of |integrator| for average */
+	long		sig_sample_count;	/* Samples since last report */
+	long		sig_dump_count;		/* Integrator dumps since last report */
+	long		sig_zc_count;		/* Zero crossings since last report */
+	int		sig_frame_flips;	/* Biphase frame realignments */
+	int		sig_blocks_ok_period;	/* Blocks OK in this period */
+	int		sig_blocks_fec_period;	/* Blocks FEC-corrected in this period */
+	int		sig_blocks_bad_period;	/* Blocks bad in this period */
+	int		sig_groups_period;	/* Groups decoded in this period */
+	int		sig_block_miss[4];	/* Per-block misses in this period [A,B,C,D] */
+	int		sig_block_wrongoff;	/* Wrong-offset syndrome matches in period */
+	int		sig_bits_period;	/* Bits decoded in this period */
+	double		sig_eye_sum;		/* Sum of symbol confidence values */
+	double		sig_eye_min;		/* Minimum symbol confidence in period */
+	long		sig_eye_count;		/* Symbol decisions in period */
+	int		sig_eye_weak;		/* Low-confidence symbol decisions */
+	int		sig_biphase_err[2];	/* Biphase error counts [frame0, frame1] */
+	
+	/* File output for captured RDS data */
+	FILE		*hexrds_file;		/* Output file for .hexrds format */
+	FILE		*bitstream_file;	/* Output file for .rds bitstream format */
+	uint8_t		bitstream_byte;		/* Accumulator for bitstream output */
+	int		bitstream_bit_count;	/* Bits accumulated (0-7) */
+	
+	/* Protocol server callback (for XDR-GTK, RDS Spy output) */
+	void		(*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg);
+	void		*group_callback_arg;
 } rds_decoder_t;
 
 /* Initialize RDS decoder
@@ -2152,5 +2395,14 @@ size_t rds_ert_extract_tag_text(const rds_ert_decoder_t *ert,
 
 /* Cleanup */
 void rds_decoder_exit(rds_decoder_t *rds);
+
+/* File output for captured RDS data */
+int rds_decoder_set_hexrds_file(rds_decoder_t *rds, const char *filename);
+int rds_decoder_set_bitstream_file(rds_decoder_t *rds, const char *filename);
+
+/* Set callback for decoded RDS groups (for protocol servers) */
+void rds_decoder_set_group_callback(rds_decoder_t *rds,
+                                    void (*callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg),
+                                    void *arg);
 
 #endif /* _RDS_H */

@@ -1,5 +1,9 @@
 AM_CPPFLAGS = -Wall -Wextra -Wmissing-prototypes -g $(all_includes)
 
+if HAVE_SDR
+AM_CPPFLAGS += -DHAVE_SDR
+endif
+
 bin_PROGRAMS = \
 	amps tacs jtacs
 
@@ -54,10 +58,12 @@ if HAVE_SDR
 amps_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
 	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
-	$(SOAPY_LIBS)
+	$(SOAPY_LIBS) \
+	$(RPITX_LIBS)
 endif
 
 tacs_SOURCES = \
@@ -100,10 +106,12 @@ if HAVE_SDR
 tacs_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
 	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
-	$(SOAPY_LIBS)
+	$(SOAPY_LIBS) \
+	$(RPITX_LIBS)
 endif
 
 jtacs_SOURCES = \
@@ -146,9 +154,11 @@ if HAVE_SDR
 jtacs_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
 	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libfft/libfft.a \
 	$(UHD_LIBS) \
-	$(SOAPY_LIBS)
+	$(SOAPY_LIBS) \
+	$(RPITX_LIBS)
 endif
 

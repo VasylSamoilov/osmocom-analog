@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <math.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "../libsample/sample.h"
@@ -32,6 +33,9 @@
 #include "../libmobile/call.h"
 #include "../liboptions/options.h"
 #include "../libfm/fm.h"
+#ifdef HAVE_SDR
+#include "../libsdr/sdr_config.h"
+#endif
 #include "amps.h"
 #include "dsp.h"
 #include "frame.h"
@@ -972,6 +976,91 @@ static int handle_options(int short_option, int argi, char **argv)
 
 extern const struct number_lengths number_lengths[];
 
+#ifdef HAVE_SDR
+/**
+ * Calculate required SDR bandwidth for given channels.
+ * 
+ * This replicates the range calculation from sdr.c to ensure rate selection
+ * picks a sample rate that will actually work. The calculation accounts for:
+ * 1. DC avoidance - center frequency is moved between channels
+ * 2. Asymmetric spectrum - max(low_side, high_side) * 2
+ * 
+ * @param kanal       Array of channel number strings
+ * @param num_kanal   Number of channels
+ * @param channel_bw  Per-channel bandwidth (2 * (deviation + modulation))
+ * @return Required bandwidth in Hz, or 0 on error
+ */
+static double amps_calculate_sdr_bandwidth(const char **kanal, int num_kanal, double channel_bw)
+{
+	double *frequencies;
+	double low_freq = 0, high_freq = 0, center_freq;
+	double low_side, high_side, range;
+	int i;
+
+	if (num_kanal <= 0)
+		return channel_bw;
+
+	/* Get frequencies for all channels */
+	frequencies = calloc(num_kanal, sizeof(double));
+	if (!frequencies)
+		return 0;
+
+	for (i = 0; i < num_kanal; i++) {
+		frequencies[i] = amps_channel2freq(atoi(kanal[i]), 1); /* RX freq */
+		if (frequencies[i] <= 0) {
+			free(frequencies);
+			return 0;
+		}
+		if (i == 0 || frequencies[i] < low_freq)
+			low_freq = frequencies[i];
+		if (i == 0 || frequencies[i] > high_freq)
+			high_freq = frequencies[i];
+	}
+
+	/* Initial center = midpoint */
+	center_freq = (high_freq + low_freq) / 2.0;
+
+	/* DC avoidance: move center between two closest channels */
+	if (num_kanal == 1) {
+		/* Single channel: shift center down by bandwidth to avoid DC */
+		center_freq -= channel_bw;
+		/* low_freq stays at original, so low_side becomes 0 */
+	} else {
+		/* Find two channels closest to center, one on each side */
+		double low_dist = 0, high_dist = 0, dist;
+		int low_c = -1, high_c = -1;
+		
+		for (i = 0; i < num_kanal; i++) {
+			dist = fabs(center_freq - frequencies[i]);
+			if (round(frequencies[i]) >= round(center_freq)) {
+				if (high_c < 0 || dist < high_dist) {
+					high_dist = dist;
+					high_c = i;
+				}
+			} else {
+				if (low_c < 0 || dist < low_dist) {
+					low_dist = dist;
+					low_c = i;
+				}
+			}
+		}
+		
+		/* New center = midpoint of the two channels aside old center */
+		if (low_c >= 0 && high_c >= 0) {
+			center_freq = (frequencies[low_c] + frequencies[high_c]) / 2.0;
+		}
+	}
+
+	/* Calculate range: max(low_side, high_side) * 2 */
+	low_side = (center_freq - low_freq) + channel_bw / 2.0;
+	high_side = (high_freq - center_freq) + channel_bw / 2.0;
+	range = ((low_side > high_side) ? low_side : high_side) * 2.0;
+
+	free(frequencies);
+	return range;
+}
+#endif
+
 int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset)
 {
 	int rc, argi;
@@ -1124,6 +1213,29 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 		exit(0);
 	}
 
+#ifdef HAVE_SDR
+	/* Early SDR rate selection - BEFORE creating senders */
+	if (use_sdr) {
+		double max_dev, max_mod, channel_bw, required_bw;
+
+		/* Get protocol-specific bandwidth parameters */
+		amps_get_bandwidth(tacs, &max_dev, &max_mod);
+		channel_bw = 2.0 * (max_dev + max_mod);
+
+		/* Calculate actual required bandwidth using same algorithm as sdr.c */
+		required_bw = amps_calculate_sdr_bandwidth((const char **)kanal, num_kanal, channel_bw);
+		if (required_bw <= 0) {
+			fprintf(stderr, "Failed to calculate SDR bandwidth!\n");
+			goto fail;
+		}
+
+		/* Select optimal SDR rate (may update dsp_samplerate) */
+		rc = sdr_select_rate(required_bw, &dsp_samplerate);
+		if (rc < 0)
+			goto fail;
+	}
+#endif
+
 	/* create transceiver instance */
 	for (i = 0; i < num_kanal; i++) {
 		amps_si si;
@@ -1175,3 +1287,12 @@ fail:
 	return 0;
 }
 
+
+/* Full-duplex application: reject TX-only or RX-only modes, but allow split devices */
+int sdr_check_separate_device_support(int tx_only, int rx_only, int split_mode)
+{
+	(void)split_mode; /* split mode is fine - we just need both TX and RX */
+	if (tx_only || rx_only)
+		return -1;
+	return 0;
+}

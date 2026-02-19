@@ -224,6 +224,7 @@ struct log_info_cat log_categories[] = {
 		.name = "DJITTER",
 		.description = "jitter buffer handling",
 		.color = "\033[0;36m",
+		.loglevel = LOGL_NOTICE,
 	},
 	[DECHO] = {
 		.name = "DECHO",

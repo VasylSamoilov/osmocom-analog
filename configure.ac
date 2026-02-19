@@ -30,12 +30,14 @@ soapy_0_8_0_or_higher=
 AC_ARG_WITH([alsa], [AS_HELP_STRING([--with-alsa], [compile with Alsa driver @<:@default=check@:>@]) ], [], [with_alsa="check"])
 AC_ARG_WITH([uhd], [AS_HELP_STRING([--with-uhd], [compile with UHD driver @<:@default=check@:>@]) ], [], [with_uhd="check"])
 AC_ARG_WITH([soapy], [AS_HELP_STRING([--with-soapy], [compile with SoapySDR driver @<:@default=check@:>@]) ], [], [with_soapy="check"])
+AC_ARG_WITH([rpitx], [AS_HELP_STRING([--with-rpitx], [compile with rpitx driver for Raspberry Pi GPIO TX @<:@default=check@:>@]) ], [], [with_rpitx="check"])
 AC_ARG_WITH([imagemagick], [AS_HELP_STRING([--with-imagemagick], [compile with ImageMagick support @<:@default=check@:>@]) ], [], [with_imagemagick="check"])
 AC_ARG_WITH([fuse], [AS_HELP_STRING([--with-fuse], [compile with FUSE support @<:@default=check@:>@]) ], [], [with_fuse="check"])
 AS_IF([test "x$with_alsa" != xno], [PKG_CHECK_MODULES(ALSA, alsa >= 1.0, with_alsa=yes, with_alsa=no)])
 AS_IF([test "x$with_uhd" != xno], [PKG_CHECK_MODULES(UHD, uhd >= 3.0.0, with_sdr=yes with_uhd=yes, with_uhd=no)])
 AS_IF([test "x$with_soapy" != xno], [PKG_CHECK_MODULES(SOAPY, SoapySDR >= 0.8.0, soapy_0_8_0_or_higher="-DSOAPY_0_8_0_OR_HIGHER", soapy_0_8_0_or_higher=)])
 AS_IF([test "x$with_soapy" != xno], [PKG_CHECK_MODULES(SOAPY, SoapySDR >= 0.5.0, with_sdr=yes with_soapy=yes, with_soapy=no)])
+AS_IF([test "x$with_rpitx" != xno], [AC_CHECK_LIB([rpitx], [main], [with_sdr=yes with_rpitx=yes RPITX_LIBS="-lrpitx -lstdc++"], [with_rpitx=no])])
 AS_IF([test "x$with_imagemagick" != xno], [PKG_CHECK_MODULES(IMAGEMAGICK6, ImageMagick >= 6.0.0, with_imagemagick6=yes, with_imagemagick6=no)])
 AS_IF([test "x$with_imagemagick" != xno], [PKG_CHECK_MODULES(IMAGEMAGICK7, ImageMagick >= 7.0.0, with_imagemagick7=yes with_imagemagick6=no, with_imagemagick7=no)])
 AS_IF([test "x$with_fuse" != xno], with_fuse=check)
@@ -46,6 +48,7 @@ AS_IF([test "x$with_fuse" == xcheck], with_fuse=no)
 AM_CONDITIONAL(HAVE_ALSA, test "x$with_alsa" == "xyes" )
 AM_CONDITIONAL(HAVE_UHD, test "x$with_uhd" == "xyes" )
 AM_CONDITIONAL(HAVE_SOAPY, test "x$with_soapy" == "xyes" )
+AM_CONDITIONAL(HAVE_RPITX, test "x$with_rpitx" == "xyes" )
 AM_CONDITIONAL(HAVE_SDR, test "x$with_sdr" == "xyes" )
 AM_CONDITIONAL(HAVE_MAGICK6, test "x$with_imagemagick6" == "xyes" )
 AM_CONDITIONAL(HAVE_MAGICK7, test "x$with_imagemagick7" == "xyes" )
@@ -56,6 +59,7 @@ AS_IF([test "x$with_fuse" == "xyes" -a "$ac_cv_sizeof_void_p" = "4"],[FUSE_CFLAG
 AS_IF([test "x$with_alsa" == "xyes"],[AC_MSG_NOTICE( Compiling with Alsa support )], [AC_MSG_NOTICE( Alsa sound card not supported. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
 AS_IF([test "x$with_uhd" == "xyes"],[AC_MSG_NOTICE( Compiling with UHD SDR support )], [AC_MSG_NOTICE( UHD SDR not supported. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
 AS_IF([test "x$with_soapy" == "xyes"],[AC_MSG_NOTICE( Compiling with SoapySDR support )], [AC_MSG_NOTICE( SoapySDR not supported. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
+AS_IF([test "x$with_rpitx" == "xyes"],[AC_MSG_NOTICE( Compiling with rpitx support for Raspberry Pi GPIO TX )], [AC_MSG_NOTICE( rpitx not found. Install librpitx for Raspberry Pi GPIO transmitter support. )])
 AS_IF([test "x$with_imagemagick6" == "xyes" || "x$with_imagemagick7" == "xyes"],[AC_MSG_NOTICE( Compiling with ImageMagick )],[AC_MSG_NOTICE( ImageMagick not supported. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
 AS_IF([test "x$with_fuse" == "xyes"],[AC_MSG_NOTICE( Compiling with FUSE )],[AC_MSG_NOTICE( FUSE not supported. There will be no analog modem support. Consider adjusting the PKG_CONFIG_PATH environment variable if you installed software in a non-standard prefix. )])
 
@@ -66,6 +70,7 @@ SOAPY_CFLAGS="$soapy_0_8_0_or_higher"
 AM_CONDITIONAL(HAVE_MOBILE, true)
 
 AC_SUBST([ARFLAGS], [rc])
+AC_SUBST([RPITX_LIBS])
 
 AC_CONFIG_FILES([src/liblogging/Makefile
     src/liboptions/Makefile
@@ -89,6 +94,8 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/libfm/Makefile
     src/libfilter/Makefile
     src/libchannelizer/Makefile
+    src/libfastmath/Makefile
+    src/libiqringbuf/Makefile
     src/libwave/Makefile
     src/libfft/Makefile
     src/libsound/Makefile

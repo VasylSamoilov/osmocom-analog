@@ -30,6 +30,7 @@
 #include "../libmobile/main_mobile.h"
 #include "../liblogging/logging.h"
 #include "../liboptions/options.h"
+#include "../libsdr/sdr_config.h"
 #include "r2000.h"
 #include "dsp.h"
 #include "frame.h"
@@ -380,3 +381,12 @@ fail:
 	return 0;
 }
 
+
+/* Full-duplex application: reject TX-only or RX-only modes, but allow split devices */
+int sdr_check_separate_device_support(int tx_only, int rx_only, int split_mode)
+{
+	(void)split_mode; /* split mode is fine - we just need both TX and RX */
+	if (tx_only || rx_only)
+		return -1;
+	return 0;
+}

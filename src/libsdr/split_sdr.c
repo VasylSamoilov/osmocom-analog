@@ -128,9 +128,14 @@ void *split_sdr_open(int direction, const char *audiodev, double *tx_frequency, 
 		SoapySDRDevice_setGain(s->tx_device, SOAPY_SDR_TX, 0, sdr_config->tx_gain);
 		
 		/* Setup TX stream */
-		s->tx_stream = SoapySDRDevice_setupStream(s->tx_device, SOAPY_SDR_TX, 
+#ifdef SOAPY_0_8_0_OR_HIGHER
+		s->tx_stream = SoapySDRDevice_setupStream(s->tx_device, SOAPY_SDR_TX,
 		                                          SOAPY_SDR_CF32, NULL, 0, NULL);
 		if (!s->tx_stream) {
+#else
+		if (SoapySDRDevice_setupStream(s->tx_device, (SoapySDRStream **)&s->tx_stream, SOAPY_SDR_TX,
+		                               SOAPY_SDR_CF32, NULL, 0, NULL) != 0) {
+#endif
 			LOGP(DSPLITSDR, LOGL_ERROR, "Failed to setup TX stream\n");
 			goto error;
 		}
@@ -155,9 +160,14 @@ void *split_sdr_open(int direction, const char *audiodev, double *tx_frequency, 
 		SoapySDRDevice_setGain(s->rx_device, SOAPY_SDR_RX, 0, sdr_config->rx_gain);
 		
 		/* Setup RX stream */
+#ifdef SOAPY_0_8_0_OR_HIGHER
 		s->rx_stream = SoapySDRDevice_setupStream(s->rx_device, SOAPY_SDR_RX,
 		                                          SOAPY_SDR_CF32, NULL, 0, NULL);
 		if (!s->rx_stream) {
+#else
+		if (SoapySDRDevice_setupStream(s->rx_device, (SoapySDRStream **)&s->rx_stream, SOAPY_SDR_RX,
+		                               SOAPY_SDR_CF32, NULL, 0, NULL) != 0) {
+#endif
 			LOGP(DSPLITSDR, LOGL_ERROR, "Failed to setup RX stream\n");
 			goto error;
 		}
@@ -299,6 +309,9 @@ int split_sdr_read(void *inst, sample_t **samples, int num, int channels, double
 	count = SoapySDRDevice_readStream(s->rx_device, s->rx_stream,
 	                                  buffs, num, &flags, &timeNs, 0);
 	if (count < 0) {
+		/* TIMEOUT (-1) is normal for non-blocking reads, silently return 0 */
+		if (count == SOAPY_SDR_TIMEOUT)
+			return 0;
 		LOGP(DSPLITSDR, LOGL_ERROR, "RX read error: %d\n", count);
 		return 0;
 	}
