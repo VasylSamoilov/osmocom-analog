@@ -1134,3 +1134,171 @@ int soapy_select_bandwidth(double min_required, const sdr_rate_info_t *info, dou
         *out_bw = best;
         return 0;
 }
+
+/**
+ * Query frequency range from SoapySDR device
+ *
+ * @param device_args   Device arguments string
+ * @param direction     SOAPY_SDR_TX or SOAPY_SDR_RX
+ * @param channel       Channel number
+ * @param min_freq      Output: minimum frequency (Hz)
+ * @param max_freq      Output: maximum frequency (Hz)
+ * @return 0 on success, -1 on failure
+ */
+int soapy_query_freq_range(const char *device_args, int direction, size_t channel,
+			   double *min_freq, double *max_freq)
+{
+	SoapySDRDevice *dev = NULL;
+	SoapySDRKwargs args;
+	SoapySDRRange *ranges = NULL;
+	size_t length = 0;
+	int rc = -1;
+
+	if (!min_freq || !max_freq)
+		return -1;
+
+	*min_freq = 0;
+	*max_freq = 0;
+
+	/* Parse device args */
+	memset(&args, 0, sizeof(args));
+	if (device_args && device_args[0]) {
+		char *args_copy = strdup(device_args);
+		char *key, *val, *p = args_copy;
+		while (p && *p) {
+			key = p;
+			val = strchr(key, '=');
+			if (!val) break;
+			*val++ = '\0';
+			p = strchr(val, ',');
+			if (p) *p++ = '\0';
+			SoapySDRKwargs_set(&args, key, val);
+		}
+		free(args_copy);
+	}
+
+	/* Open device */
+	dev = SoapySDRDevice_make(&args);
+	if (!dev) {
+		LOGP(DSOAPY, LOGL_ERROR, "Failed to open SoapySDR device for freq range query\n");
+		SoapySDRKwargs_clear(&args);
+		return -1;
+	}
+
+	/* Get frequency range */
+	ranges = SoapySDRDevice_getFrequencyRange(dev, direction, channel, &length);
+	if (ranges && length > 0) {
+		/* Use first range (usually the main tunable range) */
+		*min_freq = ranges[0].minimum;
+		*max_freq = ranges[0].maximum;
+
+		LOGP(DSOAPY, LOGL_INFO, "Device %s frequency range: %.0f - %.0f Hz (%.3f - %.3f MHz)\n",
+		     direction == SOAPY_SDR_TX ? "TX" : "RX",
+		     *min_freq, *max_freq, *min_freq / 1e6, *max_freq / 1e6);
+
+		/* If multiple ranges, find overall min/max */
+		for (size_t i = 1; i < length; i++) {
+			if (ranges[i].minimum < *min_freq)
+				*min_freq = ranges[i].minimum;
+			if (ranges[i].maximum > *max_freq)
+				*max_freq = ranges[i].maximum;
+		}
+
+		rc = 0;
+	} else {
+		LOGP(DSOAPY, LOGL_ERROR, "Failed to get frequency range from device\n");
+	}
+
+	SoapySDRDevice_unmake(dev);
+	SoapySDRKwargs_clear(&args);
+
+	return rc;
+}
+
+/**
+ * Query gain range and available gain elements from SoapySDR device
+ *
+ * @param device_args   Device arguments string
+ * @param direction     SOAPY_SDR_TX or SOAPY_SDR_RX
+ * @param channel       Channel number
+ * @param min_gain      Output: minimum overall gain (dB)
+ * @param max_gain      Output: maximum overall gain (dB)
+ * @param gain_names    Output: space-separated list of gain element names
+ * @param gain_names_len Size of gain_names buffer
+ * @return 0 on success, -1 on failure
+ */
+int soapy_query_gain_info(const char *device_args, int direction, size_t channel,
+			  double *min_gain, double *max_gain,
+			  char *gain_names, int gain_names_len)
+{
+	SoapySDRDevice *dev = NULL;
+	SoapySDRKwargs args;
+	SoapySDRRange range;
+	char **names = NULL;
+	size_t num_names = 0;
+	int rc = -1;
+	int pos = 0;
+
+	if (!min_gain || !max_gain)
+		return -1;
+
+	*min_gain = 0;
+	*max_gain = 0;
+	if (gain_names && gain_names_len > 0)
+		gain_names[0] = '\0';
+
+	/* Parse device args */
+	memset(&args, 0, sizeof(args));
+	if (device_args && device_args[0]) {
+		char *args_copy = strdup(device_args);
+		char *key, *val, *p = args_copy;
+		while (p && *p) {
+			key = p;
+			val = strchr(key, '=');
+			if (!val) break;
+			*val++ = '\0';
+			p = strchr(val, ',');
+			if (p) *p++ = '\0';
+			SoapySDRKwargs_set(&args, key, val);
+		}
+		free(args_copy);
+	}
+
+	/* Open device */
+	dev = SoapySDRDevice_make(&args);
+	if (!dev) {
+		LOGP(DSOAPY, LOGL_ERROR, "Failed to open SoapySDR device for gain query\n");
+		SoapySDRKwargs_clear(&args);
+		return -1;
+	}
+
+	/* Get overall gain range */
+	range = SoapySDRDevice_getGainRange(dev, direction, channel);
+	*min_gain = range.minimum;
+	*max_gain = range.maximum;
+
+	LOGP(DSOAPY, LOGL_INFO, "Device %s overall gain range: %.1f - %.1f dB\n",
+	     direction == SOAPY_SDR_TX ? "TX" : "RX", *min_gain, *max_gain);
+
+	/* Get list of gain elements */
+	names = SoapySDRDevice_listGains(dev, direction, channel, &num_names);
+	if (names && num_names > 0 && gain_names && gain_names_len > 0) {
+		for (size_t i = 0; i < num_names; i++) {
+			SoapySDRRange elem_range = SoapySDRDevice_getGainElementRange(dev, direction, channel, names[i]);
+			int len = snprintf(gain_names + pos, gain_names_len - pos,
+					   "%s%s", (i > 0) ? " " : "", names[i]);
+			if (len > 0 && pos + len < gain_names_len)
+				pos += len;
+
+			LOGP(DSOAPY, LOGL_INFO, "  Gain element '%s': %.1f - %.1f dB\n",
+			     names[i], elem_range.minimum, elem_range.maximum);
+		}
+	}
+
+	rc = 0;
+
+	SoapySDRDevice_unmake(dev);
+	SoapySDRKwargs_clear(&args);
+
+	return rc;
+}

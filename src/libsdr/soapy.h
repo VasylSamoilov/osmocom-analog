@@ -19,4 +19,13 @@ int soapy_query_device_info(const char *device_args, int direction, size_t chann
 /* Select optimal IF bandwidth from supported values */
 int soapy_select_bandwidth(double min_required, const sdr_rate_info_t *info, double *out_bw);
 
+/* Query frequency range from device */
+int soapy_query_freq_range(const char *device_args, int direction, size_t channel,
+			   double *min_freq, double *max_freq);
+
+/* Query gain range and available gain elements from device */
+int soapy_query_gain_info(const char *device_args, int direction, size_t channel,
+			  double *min_gain, double *max_gain,
+			  char *gain_names, int gain_names_len);
+
 #endif /* SOAPY_H */

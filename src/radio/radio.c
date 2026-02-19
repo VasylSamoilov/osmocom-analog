@@ -50,8 +50,8 @@
  * IEC 62106 / ITU-R BS.450 consumer practice: 50–200 ms each direction.
  *
  * COOLDOWN_S: minimum hold time after any transition (prevents re-entry). */
-#define PILOT_LOCK_THR		0.01	/* acquire: pilot must stay above this  */
-#define PILOT_UNLOCK_THR	0.003	/* loss:    pilot must stay below this  */
+#define PILOT_LOCK_THR		0.02	/* acquire: pilot must stay above this  */
+#define PILOT_UNLOCK_THR	0.01	/* loss:    pilot must stay below this  */
 #define PILOT_ACQUIRE_S		0.2	/* 200 ms continuous above thr to lock  */
 #define PILOT_LOSS_S		0.2	/* 200 ms continuous below thr to unlock */
 #define PILOT_COOLDOWN_S	0.1	/* seconds before next transition allowed */

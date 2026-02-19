@@ -530,22 +530,6 @@ typedef struct rds_server {
 	 * our current frequency instead of retuning to its last saved one. */
 	int64_t		login_tune_grace_us;       /* Deadline: ignore first T until this time */
 
-	/* Narrow-band power tracking for current station (no FFT).
-	 * Decimates IQ by averaging NBPWR_DECIM samples (boxcar LPF) to
-	 * ~200 kHz bandwidth, then tracks RMS and a slow noise floor minimum
-	 * to produce an SNR value on the same scale as scan results. */
-#define NBPWR_DECIM		10	/* Decimation factor: 2 MHz / 10 = 200 kHz */
-#define NBPWR_HIST_LEN		64	/* History length for noise floor tracking */
-	double		nb_sum_i;	/* Accumulator for boxcar decimation (I) */
-	double		nb_sum_q;	/* Accumulator for boxcar decimation (Q) */
-	int		nb_decim_cnt;	/* Samples accumulated so far */
-	double		nb_power_acc;	/* Sum of decimated |IQ|^2 for RMS */
-	int		nb_power_cnt;	/* Number of decimated samples accumulated */
-	double		nb_power_hist[NBPWR_HIST_LEN]; /* Circular history of power_db values */
-	int		nb_hist_pos;	/* Write position in history */
-	int		nb_hist_fill;	/* How many history slots are valid */
-	double		nb_signal_db;	/* Last computed SNR+10 value (scan-scale) */
-
 	/* XDR-GTK spectral scan state */
 	int		scan_start_khz;    /* Sa: scan start frequency (kHz) */
 	int		scan_stop_khz;     /* Sb: scan stop frequency (kHz) */
@@ -646,14 +630,6 @@ void rds_server_set_deemphasis(rds_server_t *srv, int val);
 
 /* Get protocol name. */
 const char *rds_proto_name(rds_proto_t proto);
-
-/* Narrow-band power measurement for the current (tuned) station.
- * Call from the main loop on every sdr_read() when NOT scanning.
- * Decimates IQ to ~200 kHz bandwidth (boxcar LPF) and tracks a noise floor
- * minimum to produce an SNR value on the same scale as scan results.
- * Updates srv->nb_signal_db which rds_server_update_signal() should use. */
-void rds_server_feed_iq(rds_server_t *srv,
-			const float *iq_buf, int count, int sdr_rate);
 
 /* Spectral scan support (XDR-GTK).
  * Call rds_server_scan_feed_iq() from the main loop after each sdr_read().

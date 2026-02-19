@@ -17,6 +17,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
+
 enum paging_signal;
 
 #include <stdio.h>
@@ -36,16 +38,23 @@ enum paging_signal;
 #include "../liblogging/logging.h"
 #include "../libsdr/sdr_config.h"
 #include "../libsdr/sdr.h"
+#include "../libsdr/sdr_status.h"
 #include "../liboptions/options.h"
 #include <osmocom/cc/misc.h>
 #include "radio.h"
 #include "rds.h"
 #include "rds_protocol.h"
+#include "rigctl_server.h"
+#include "signal_meter.h"
 
 #define DEFAULT_LO_OFFSET -1000000.0
 #define RDS_PAGING_PIPE "/tmp/rds_paging_send"
 
 static int paging_pipe_fd = -1;
+
+/* Signal meter (file-scope so tune callback can access it) */
+static signal_meter_t *meter = NULL;
+static int spectral_freq_idx = -1;	/* index of our registered frequency in spectral measurement */
 
 sender_t *sender_head = NULL;
 int use_sdr = 0;
@@ -84,12 +93,16 @@ static int rds_paging = 0;
 static int rds_paging_rpc = 4;  /* Default RPC=4: group desig 001, batt sync 00 */
 static const char *rds_hexrds_file = NULL;
 static const char *rds_bitstream_file = NULL;
+static const char *rds_tx_hexrds_file = NULL;
+static const char *rds_tx_bitstream_file = NULL;
 
 /* Protocol server endpoints */
 static const char *xdr_gtk_server = NULL;
 static const char *rdsspy_server = NULL;
 static const char *uecp_server = NULL;
 static const char *asciig_server = NULL;
+static const char *rigctl_server_endpoint = NULL;
+static const char *rigctl_allowed_hosts = NULL;
 static const char *xdr_gtk_password = NULL;
 
 /* global variable to quit main loop */
@@ -120,6 +133,15 @@ static void radio_tune_cb(int freq_khz, void *arg)
 	if (ctx->xdr_srv)
 		ctx->xdr_srv->freq_khz = freq_khz;
 
+	/* Clear stale measurements from previous frequency */
+	if (meter)
+		signal_meter_reset(meter);
+
+	/* Update spectral measurement for new frequency */
+	sdr_spectral_set_center(freq_hz);
+	sdr_spectral_clear_freq();
+	spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
+
 	/* Tell RDS-Spy to reset its decoder state (new station) */
 	if (ctx->rdsspy_srv)
 		rds_server_send_reset(ctx->rdsspy_srv);
@@ -138,6 +160,9 @@ static void radio_scan_cb(int freq_khz, void *arg)
 	frequency = freq_hz;
 	if (ctx->xdr_srv)
 		ctx->xdr_srv->freq_khz = freq_khz;
+
+	/* Update spectral center for scan retune */
+	sdr_spectral_set_center(freq_hz);
 }
 
 static void radio_tx_tune_cb(int freq_khz, void *arg)
@@ -153,6 +178,59 @@ static void radio_tx_tune_cb(int freq_khz, void *arg)
 	}
 
 	frequency = freq_hz;
+}
+
+/* Rigctl callbacks */
+static int rigctl_set_rx_freq(double freq_hz, void *arg)
+{
+	(void)arg;
+
+	LOGP(DRADIO, LOGL_NOTICE, "Rigctl: Re-tuning SDR RX to %.0f Hz\n", freq_hz);
+
+	if (sdr_set_rx_frequency(freq_hz) < 0) {
+		LOGP(DRADIO, LOGL_ERROR, "Rigctl: Failed to re-tune SDR RX\n");
+		return -1;
+	}
+
+	frequency = freq_hz;
+
+	/* Clear stale measurements */
+	if (meter)
+		signal_meter_reset(meter);
+
+	/* Update spectral measurement */
+	sdr_spectral_set_center(freq_hz);
+	sdr_spectral_clear_freq();
+	spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
+
+	return 0;
+}
+
+static int rigctl_set_tx_freq(double freq_hz, void *arg)
+{
+	(void)arg;
+
+	LOGP(DRADIO, LOGL_NOTICE, "Rigctl: Re-tuning SDR TX to %.0f Hz\n", freq_hz);
+
+	if (sdr_set_tx_frequency(freq_hz) < 0) {
+		LOGP(DRADIO, LOGL_ERROR, "Rigctl: Failed to re-tune SDR TX\n");
+		return -1;
+	}
+
+	frequency = freq_hz;
+	return 0;
+}
+
+static double rigctl_get_rx_freq(void *arg)
+{
+	(void)arg;
+	return frequency;
+}
+
+static double rigctl_get_tx_freq(void *arg)
+{
+	(void)arg;
+	return frequency;
 }
 
 /* Callback for decoded RDS groups - forwards to protocol servers */
@@ -275,6 +353,14 @@ static void print_help(const char *arg0)
 	printf("    --rds-bitstream-file <filename>\n");
 	printf("        Write received RDS bitstream to file in binary format.\n");
 	printf("        Raw bits packed MSB first, compatible with .rds files.\n");
+	printf("    --rds-tx-hexrds-file <filename>\n");
+	printf("        Transmit RDS groups from hexrds file (bypasses encoder).\n");
+	printf("        Format: \"XXXX XXXX XXXX XXXX\" per line. Loops continuously.\n");
+	printf("        Transmitted groups are logged using the decoder.\n");
+	printf("    --rds-tx-bitstream-file <filename>\n");
+	printf("        Transmit RDS bitstream from binary file (bypasses encoder).\n");
+	printf("        Raw bits packed MSB first. Loops continuously.\n");
+	printf("        Transmitted groups are logged using the decoder.\n");
 	printf("    --xdr-gtk-server <endpoint>\n");
 	printf("        Enable XDR-GTK protocol server for RDS decoder output.\n");
 	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:7373)\n");
@@ -294,6 +380,15 @@ static void print_help(const char *arg0)
 	printf("        Enable ASCII-G protocol server for RDS encoder control.\n");
 	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:5002)\n");
 	printf("        Serial: <device>,<speed>,<8N1>[,<flow>]\n");
+	printf("    --rigctl-server <endpoint>\n");
+	printf("        Enable hamlib-compatible rigctl server for remote control.\n");
+	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:7356) or just <port>\n");
+	printf("        Serial: <device>,<speed>,<8N1>[,<flow>]\n");
+	printf("        Supports: f/F (freq), m/M (mode), l/L (levels), u/U (funcs)\n");
+	printf("        Test with: rigctl -m 2 -r localhost:<port>\n");
+	printf("    --rigctl-allowed-hosts <hosts>\n");
+	printf("        Comma-separated list of allowed client IPs for rigctl.\n");
+	printf("        If not set, all hosts are allowed.\n");
 	printf("    --call-sign <WXXX>\n");
 	printf("        Set RBDS Call Sign (e.g. WNYC) to automatically configure PI code.\n");
 	printf("    --pi <HEX>\n");
@@ -346,6 +441,10 @@ static int use_polyphase = 0;
 #define OPT_UECP_SERVER		1111
 #define OPT_ASCIIG_SERVER	1112
 #define OPT_XDR_GTK_PASSWORD	1113
+#define OPT_RIGCTL_SERVER	1114
+#define OPT_RIGCTL_ALLOWED	1115
+#define OPT_RDS_TX_HEXRDS_FILE	1116
+#define OPT_RDS_TX_BITSTREAM_FILE 1117
 
 static void add_options(void)
 {
@@ -384,11 +483,15 @@ static void add_options(void)
 	option_add(OPT_RDS_PAGING, "rds-paging", 1);
 	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
 	option_add(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1);
+	option_add(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1);
+	option_add(OPT_RDS_TX_BITSTREAM_FILE, "rds-tx-bitstream-file", 1);
 	option_add(OPT_XDR_GTK_SERVER, "xdr-gtk-server", 1);
 	option_add(OPT_RDSSPY_SERVER, "rdsspy-server", 1);
 	option_add(OPT_UECP_SERVER, "uecp-server", 1);
 	option_add(OPT_ASCIIG_SERVER, "asciig-server", 1);
 	option_add(OPT_XDR_GTK_PASSWORD, "xdr-gtk-password", 1);
+	option_add(OPT_RIGCTL_SERVER, "rigctl-server", 1);
+	option_add(OPT_RIGCTL_ALLOWED, "rigctl-allowed-hosts", 1);
         sdr_config_add_options();
 }
 
@@ -532,12 +635,26 @@ static int handle_options(int short_option, int argi, char **argv)
 		rds_bitstream_file = options_strdup(argv[argi]);
 		rds = 1;  /* auto-enable RDS */
 		break;
+	case OPT_RDS_TX_HEXRDS_FILE:
+		rds_tx_hexrds_file = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
+	case OPT_RDS_TX_BITSTREAM_FILE:
+		rds_tx_bitstream_file = options_strdup(argv[argi]);
+		rds = 1;  /* auto-enable RDS */
+		break;
 	case OPT_XDR_GTK_SERVER:
 		xdr_gtk_server = options_strdup(argv[argi]);
 		rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_XDR_GTK_PASSWORD:
 		xdr_gtk_password = options_strdup(argv[argi]);
+		break;
+	case OPT_RIGCTL_SERVER:
+		rigctl_server_endpoint = options_strdup(argv[argi]);
+		break;
+	case OPT_RIGCTL_ALLOWED:
+		rigctl_allowed_hosts = options_strdup(argv[argi]);
 		break;
 	case OPT_RDSSPY_SERVER:
 		rdsspy_server = options_strdup(argv[argi]);
@@ -722,7 +839,9 @@ int main(int argc, char *argv[])
 	
 	/* Protocol servers */
 	rds_server_t xdr_srv, rdsspy_srv, uecp_srv, asciig_srv;
+	rigctl_server_t rigctl_srv;
 	int xdr_enabled = 0, rdsspy_enabled = 0, uecp_enabled = 0, asciig_enabled = 0;
+	int rigctl_enabled = 0;
 	rds_callback_ctx_t rds_cb_ctx = { NULL, NULL, NULL };
 
 	loglevel = LOGL_NOTICE;
@@ -771,27 +890,25 @@ int main(int argc, char *argv[])
 			bandwidth = bandwidth_am;
 	}
 
+	/* Calculate signal_bandwidth (RF passband)
+	 * Used for channelizer rate calculation and rigctl passband reporting */
+	double signal_bw = 0;
+	if (modulation == MODULATION_FM) {
+		double audio_bw = bandwidth;
+		/* FM broadcast with stereo/RDS needs more bandwidth */
+		if (rds || rds2) audio_bw = 60000.0;
+		else if (stereo) audio_bw = 53000.0;
+		signal_bw = deviation + audio_bw;
+	} else if (modulation == MODULATION_AM_DSB) {
+		/* AM DSB: both sidebands, but signal_bandwidth is just bandwidth */
+		signal_bw = bandwidth;
+	} else {
+		/* AM SSB (USB/LSB): single sideband */
+		signal_bw = bandwidth;
+	}
+
 	/* Auto-calculate optimal input rate if channelizer is used */
 	if (use_channelizer && channelizer_rate == 0) {
-		double signal_bw = 0;
-		
-		/* Calculate signal_bandwidth (what radio.c will use for validation):
-		 * This must match what radio->signal_bandwidth will be set to in radio.c
-		 */
-		if (modulation == MODULATION_FM) {
-			double audio_bw = bandwidth;
-			/* FM broadcast with stereo/RDS needs more bandwidth */
-			if (rds || rds2) audio_bw = 60000.0;
-			else if (stereo) audio_bw = 53000.0;
-			signal_bw = deviation + audio_bw;
-		} else if (modulation == MODULATION_AM_DSB) {
-			/* AM DSB: both sidebands, but signal_bandwidth is just bandwidth */
-			signal_bw = bandwidth;
-		} else {
-			/* AM SSB (USB/LSB): single sideband */
-			signal_bw = bandwidth;
-		}
-
 		if (sdr_config) {
 			input_samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, signal_bw);
 			printf("Channelizer: Auto-selected input rate %d Hz for %.1f kHz signal bandwidth (from SDR %d Hz)\n", 
@@ -835,6 +952,18 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
+	/* Initialize signal meter (FFT-based, same approach as scan engine).
+	 * Uses 4096-point FFT with ±20 kHz integration and processing gain.
+	 * Output: SNR in dB (signal - noise).
+	 * The dbf_offset is a fallback before noise floor is established. */
+	meter = signal_meter_init(input_samplerate, 50.0);
+	if (meter)
+		signal_meter_register_thread(meter, "main", gettid());
+
+	/* NOTE: spectral frequency registration moved after sdr_open_channelizer()
+	 * because sdr_status_init() inside sdr_open zeroes the entire sdr_status
+	 * struct, wiping any previously registered frequencies. */
+
 	/* Set up RDS file output if requested */
 	if (rds_hexrds_file) {
 		rc = rds_decoder_set_hexrds_file(&radio.rds_dec, rds_hexrds_file);
@@ -847,6 +976,32 @@ int main(int argc, char *argv[])
 		rc = rds_decoder_set_bitstream_file(&radio.rds_dec, rds_bitstream_file);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to open bitstream output file, exitting!\n");
+			exit(0);
+		}
+	}
+
+	/* Set up RDS TX file input if requested (bypasses encoder) */
+	if (rds_tx_hexrds_file && rds_tx_bitstream_file) {
+		fprintf(stderr, "Cannot use both --rds-tx-hexrds-file and --rds-tx-bitstream-file\n");
+		exit(0);
+	}
+	if (rds_tx_hexrds_file) {
+		if (!tx) {
+			fprintf(stderr, "Warning: --rds-tx-hexrds-file requires --tx mode\n");
+		}
+		rc = rds_encoder_set_tx_hexrds_file(&radio.rds_enc, rds_tx_hexrds_file);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to open TX hexrds input file, exitting!\n");
+			exit(0);
+		}
+	}
+	if (rds_tx_bitstream_file) {
+		if (!tx) {
+			fprintf(stderr, "Warning: --rds-tx-bitstream-file requires --tx mode\n");
+		}
+		rc = rds_encoder_set_tx_bitstream_file(&radio.rds_enc, rds_tx_bitstream_file);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to open TX bitstream input file, exitting!\n");
 			exit(0);
 		}
 	}
@@ -879,6 +1034,7 @@ int main(int argc, char *argv[])
 	memset(&rdsspy_srv, 0, sizeof(rdsspy_srv));
 	memset(&uecp_srv, 0, sizeof(uecp_srv));
 	memset(&asciig_srv, 0, sizeof(asciig_srv));
+	memset(&rigctl_srv, 0, sizeof(rigctl_srv));
 
 	/* RX-only servers: XDR-GTK and RDS-Spy */
 	if (xdr_gtk_server) {
@@ -940,6 +1096,71 @@ int main(int argc, char *argv[])
 		printf("ASCII-G protocol server enabled: %s\n", asciig_server);
 	}
 
+	/* Rigctl server (hamlib-compatible remote control) */
+	if (rigctl_server_endpoint) {
+		rc = rigctl_server_init(&rigctl_srv, rigctl_server_endpoint, rigctl_allowed_hosts);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to initialize rigctl server\n");
+			goto error;
+		}
+		rigctl_server_set_mode_flags(&rigctl_srv, tx, rx);
+		rigctl_server_set_frequency(&rigctl_srv, frequency, frequency);
+		rigctl_server_set_modulation(&rigctl_srv, modulation, (int)(2.0 * signal_bw), deviation, modulation_index);
+		rigctl_server_set_flags(&rigctl_srv, stereo, rds);
+		rigctl_server_set_radio(&rigctl_srv, &radio);
+		rigctl_server_set_meter(&rigctl_srv, meter);
+
+		/* Query and set SDR capabilities
+		 *
+		 * TODO: Currently sdr_query_caps() returns cached/configured values.
+		 *       Should query actual hardware frequency ranges at startup via:
+		 *       - soapy_query_freq_range() for SoapySDR devices
+		 *       - uhd_query_freq_range() for UHD devices
+		 *       Also need to update stored ranges on retune if SDR has tunable
+		 *       front-end filters. Account for upconverter offsets which
+		 *       may differ for RX and TX directions (e.g., transverter).
+		 *       Hamlib supports separate rx_range_list and tx_range_list.
+		 *       IMPORTANT: Never query hardware from subroutines! Query once
+		 *       during SDR setup/startup/retune and store results for later use. */
+		if (sdr) {
+			sdr_caps_t sdr_caps;
+			if (sdr_query_caps(&sdr_caps) == 0) {
+				rigctl_sdr_caps_t rigctl_caps = {
+					.rx_freq_min = sdr_caps.rx_freq_min,
+					.rx_freq_max = sdr_caps.rx_freq_max,
+					.tx_freq_min = sdr_caps.tx_freq_min,
+					.tx_freq_max = sdr_caps.tx_freq_max,
+					.rx_upconverter = sdr_caps.rx_upconverter,
+					.tx_upconverter = sdr_caps.tx_upconverter,
+					.rx_gain_min = sdr_caps.rx_gain_min,
+					.rx_gain_max = sdr_caps.rx_gain_max,
+					.tx_gain_min = sdr_caps.tx_gain_min,
+					.tx_gain_max = sdr_caps.tx_gain_max,
+					.has_rx = sdr_caps.has_rx,
+					.has_tx = sdr_caps.has_tx,
+					.is_split = sdr_caps.is_split,
+				};
+				strncpy(rigctl_caps.rx_gain_names, sdr_caps.rx_gain_names,
+					sizeof(rigctl_caps.rx_gain_names) - 1);
+				strncpy(rigctl_caps.tx_gain_names, sdr_caps.tx_gain_names,
+					sizeof(rigctl_caps.tx_gain_names) - 1);
+				rigctl_server_set_sdr_caps(&rigctl_srv, &rigctl_caps);
+			}
+		}
+
+		/* Set up callbacks */
+		rigctl_callbacks_t rigctl_cb = {
+			.set_rx_freq = rigctl_set_rx_freq,
+			.set_tx_freq = rigctl_set_tx_freq,
+			.get_rx_freq = rigctl_get_rx_freq,
+			.get_tx_freq = rigctl_get_tx_freq,
+			.arg = NULL
+		};
+		rigctl_server_set_callbacks(&rigctl_srv, &rigctl_cb);
+		rigctl_enabled = 1;
+		printf("Rigctl server enabled: %s\n", rigctl_server_endpoint);
+	}
+
 	/* Set up RDS decoder callback for RX protocol servers (XDR-GTK, RDS-Spy) */
 	if (xdr_enabled || rdsspy_enabled) {
 		rds_cb_ctx.xdr_srv = xdr_enabled ? &xdr_srv : NULL;
@@ -992,6 +1213,11 @@ int main(int argc, char *argv[])
 		goto error;
 	sdr_start(sdr);
 
+	/* Configure spectral measurement - center matches SDR tuned frequency */
+	sdr_spectral_configure(sdr_get_samplerate(sdr), frequency);
+	if (frequency > 0.0)
+		spectral_freq_idx = sdr_spectral_register_freq(frequency);
+
 	/* prepare terminal */
 	tcgetattr(0, &term_orig);
 	term = term_orig;
@@ -1032,6 +1258,8 @@ int main(int argc, char *argv[])
 			rds_server_poll(&uecp_srv);
 		if (asciig_enabled)
 			rds_server_poll(&asciig_srv);
+		if (rigctl_enabled)
+			rigctl_server_poll(&rigctl_srv);
 		
 		got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
 		if (rx) {
@@ -1040,24 +1268,53 @@ int main(int argc, char *argv[])
 			if (xdr_enabled && xdr_srv.scan_active)
 				rds_server_scan_feed_iq(&xdr_srv, sendbuff, got,
 							frequency, sdr_get_samplerate(sdr));
-			/* Feed raw IQ into narrow-band power estimator when not scanning.
-			 * This gives a per-channel SNR on the same scale as scan results. */
-			else if (xdr_enabled)
-				rds_server_feed_iq(&xdr_srv, sendbuff, got,
-						   sdr_get_samplerate(sdr));
+
+			/* Feed IQ into spectral measurement (same data/rate as scan) */
+			sdr_spectral_feed_iq(sendbuff, got);
+
+			/* Feed IQ into signal meter for time-domain RMS */
+			signal_meter_feed_iq(meter, sendbuff, got);
+
 			got = radio_rx(&radio, sendbuff, got);
 			if (got < 0)
 				break;
-			/* Feed signal level to XDR-GTK for periodic S reports.
-			 * Use nb_signal_db (narrow-band SNR+10) so the value is on
-			 * the same scale as scan results. */
-			if (xdr_enabled) {
-				double sig_db = (xdr_srv.nb_hist_fill > 0)
-					? xdr_srv.nb_signal_db
-					: -100.0;
-				int is_stereo = radio.stereo && radio.rx_pilot_locked;
-				rds_server_update_signal(&xdr_srv, sig_db, is_stereo);
+
+			/* Update 19 kHz stereo pilot info from radio_rx() results */
+			signal_meter_set_stereo_pilot(meter, radio.rx_pilot_mag_avg,
+						      radio.rx_pilot_locked);
+
+			/* Feed FFT-based measurements to signal meter.
+			 * Both signal power (at tuned frequency) and noise floor (minimum of offsets)
+			 * come from FFT - same method as scan for consistent dBf output. */
+			if (sdr_spectral_is_valid()) {
+				double nf = sdr_spectral_get_noise_floor();
+				signal_meter_set_noise_floor(meter, nf);
+				if (spectral_freq_idx >= 0)
+					signal_meter_set_signal_power(meter, sdr_spectral_get_power(spectral_freq_idx));
+			} else {
+				const sdr_status_t *ss = sdr_status_get();
+				if (ss && ss->rx.valid)
+					signal_meter_set_noise_floor(meter, ss->rx.noise_floor_db);
 			}
+
+			/* Feed signal level to XDR-GTK for periodic S reports */
+			if (xdr_enabled) {
+				double sig = signal_meter_get_level_dbf(meter);
+				int is_stereo = radio.stereo && radio.rx_pilot_locked;
+				rds_server_update_signal(&xdr_srv,
+					(sig > SIGNAL_METER_NO_VALUE) ? sig : -100.0,
+					is_stereo);
+			}
+
+			/* Feed signal level to rigctl server */
+			if (rigctl_enabled) {
+				double sig = signal_meter_get_level_dbfs(meter);
+				rigctl_server_set_signal(&rigctl_srv,
+					(sig > SIGNAL_METER_NO_VALUE) ? sig : -100.0);
+			}
+
+			/* CPU update (self-throttles to ~1/sec via internal wall-clock check) */
+			signal_meter_update_cpu(meter);
 		}
 		tosend = sdr_get_tosend(sdr, buffer_size);
 #if 0 /* TX debug logging - uncomment to enable */
@@ -1176,6 +1433,8 @@ error:
 	}
 
 	free(sendbuff);
+	signal_meter_free(meter);
+	meter = NULL;
 	if (sdr)
 		sdr_close(sdr);
 	/* Clean up paging pipe */
@@ -1192,6 +1451,8 @@ error:
 		rds_server_cleanup(&uecp_srv);
 	if (asciig_enabled)
 		rds_server_cleanup(&asciig_srv);
+	if (rigctl_enabled)
+		rigctl_server_cleanup(&rigctl_srv);
 	
 	radio_exit(&radio);
 

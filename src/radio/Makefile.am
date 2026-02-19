@@ -31,6 +31,8 @@ osmoradio_SOURCES = \
 	radio.c \
 	sca.c \
 	rds_protocol.c \
+	rigctl_server.c \
+	signal_meter.c \
 	main.c
 osmoradio_LDADD = \
 	$(COMMON_LA) \

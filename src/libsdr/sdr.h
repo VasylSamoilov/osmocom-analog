@@ -1,3 +1,5 @@
+#ifndef SDR_H
+#define SDR_H
 
 enum paging_signal;
 
@@ -13,3 +15,42 @@ int sdr_get_samplerate(void *inst);
 int sdr_set_rx_frequency(double frequency);
 int sdr_set_tx_frequency(double frequency);
 int sdr_calculate_optimal_rate(int master_rate, double bandwidth);
+
+/* SDR capability information */
+typedef struct sdr_caps {
+	/* Frequency ranges (Hz) - 0 means unknown/unlimited */
+	double		rx_freq_min;
+	double		rx_freq_max;
+	double		tx_freq_min;
+	double		tx_freq_max;
+
+	/* Gain ranges (dB) */
+	double		rx_gain_min;
+	double		rx_gain_max;
+	double		tx_gain_min;
+	double		tx_gain_max;
+
+	/* Gain element names (space-separated) */
+	char		rx_gain_names[256];
+	char		tx_gain_names[256];
+
+	/* Upconverter offsets from config (Hz) */
+	double		rx_upconverter;
+	double		tx_upconverter;
+
+	/* Sample rate ranges */
+	double		sample_rate_min;
+	double		sample_rate_max;
+
+	/* Flags */
+	int		has_rx;
+	int		has_tx;
+	int		is_split;	/* Separate TX/RX devices */
+} sdr_caps_t;
+
+/* Query SDR capabilities from configured device(s)
+ * Call after sdr_configure() but before sdr_open()
+ * Returns 0 on success, -1 on error */
+int sdr_query_caps(sdr_caps_t *caps);
+
+#endif /* SDR_H */

@@ -1115,3 +1115,206 @@ out:
 	return rc;
 }
 
+
+/**
+ * Query frequency range from UHD device
+ *
+ * @param device_args   Device arguments string
+ * @param direction     1=TX, 0=RX
+ * @param channel       Channel number
+ * @param min_freq      Output: minimum frequency (Hz)
+ * @param max_freq      Output: maximum frequency (Hz)
+ * @return 0 on success, -1 on failure
+ */
+int uhd_query_freq_range(const char *device_args, int direction, size_t channel,
+			 double *min_freq, double *max_freq)
+{
+	uhd_usrp_handle usrp = NULL;
+	uhd_meta_range_handle range = NULL;
+	uhd_error error;
+	double start, stop;
+	int rc = -1;
+
+	if (!min_freq || !max_freq)
+		return -EINVAL;
+
+	*min_freq = 0;
+	*max_freq = 0;
+
+	LOGP(DUHD, LOGL_INFO, "Querying frequency range from device '%s' (direction=%s, channel=%zu)\n",
+	     device_args ? device_args : "(default)",
+	     direction == 1 ? "TX" : "RX", channel);
+
+	/* Create USRP device */
+	error = uhd_usrp_make(&usrp, device_args ? device_args : "");
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to create USRP for freq range query\n");
+		goto out;
+	}
+
+	/* Create meta range handle */
+	error = uhd_meta_range_make(&range);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to create meta range\n");
+		goto out;
+	}
+
+	/* Get frequency range */
+	if (direction == 1) {
+		error = uhd_usrp_get_tx_freq_range(usrp, channel, range);
+	} else {
+		error = uhd_usrp_get_rx_freq_range(usrp, channel, range);
+	}
+
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to get %s frequency range\n", direction == 1 ? "TX" : "RX");
+		goto out;
+	}
+
+	/* Get range start and stop */
+	error = uhd_meta_range_start(range, &start);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to get freq range start\n");
+		goto out;
+	}
+
+	error = uhd_meta_range_stop(range, &stop);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to get freq range stop\n");
+		goto out;
+	}
+
+	*min_freq = start;
+	*max_freq = stop;
+
+	LOGP(DUHD, LOGL_INFO, "Device %s frequency range: %.0f - %.0f Hz (%.3f - %.3f MHz)\n",
+	     direction == 1 ? "TX" : "RX", start, stop, start / 1e6, stop / 1e6);
+
+	rc = 0;
+
+out:
+	if (range)
+		uhd_meta_range_free(&range);
+	if (usrp)
+		uhd_usrp_free(&usrp);
+
+	return rc;
+}
+
+/**
+ * Query gain range from UHD device
+ *
+ * @param device_args   Device arguments string
+ * @param direction     1=TX, 0=RX
+ * @param channel       Channel number
+ * @param min_gain      Output: minimum gain (dB)
+ * @param max_gain      Output: maximum gain (dB)
+ * @param gain_names    Output: space-separated list of gain element names
+ * @param gain_names_len Size of gain_names buffer
+ * @return 0 on success, -1 on failure
+ */
+int uhd_query_gain_info(const char *device_args, int direction, size_t channel,
+			double *min_gain, double *max_gain,
+			char *gain_names, int gain_names_len)
+{
+	uhd_usrp_handle usrp = NULL;
+	uhd_meta_range_handle range = NULL;
+	uhd_string_vector_handle names = NULL;
+	uhd_error error;
+	double start, stop;
+	size_t num_names = 0;
+	int rc = -1;
+	int pos = 0;
+
+	if (!min_gain || !max_gain)
+		return -EINVAL;
+
+	*min_gain = 0;
+	*max_gain = 0;
+	if (gain_names && gain_names_len > 0)
+		gain_names[0] = '\0';
+
+	LOGP(DUHD, LOGL_INFO, "Querying gain info from device '%s' (direction=%s, channel=%zu)\n",
+	     device_args ? device_args : "(default)",
+	     direction == 1 ? "TX" : "RX", channel);
+
+	/* Create USRP device */
+	error = uhd_usrp_make(&usrp, device_args ? device_args : "");
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to create USRP for gain query\n");
+		goto out;
+	}
+
+	/* Create meta range handle */
+	error = uhd_meta_range_make(&range);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to create meta range\n");
+		goto out;
+	}
+
+	/* Get overall gain range */
+	if (direction == 1) {
+		error = uhd_usrp_get_tx_gain_range(usrp, "", channel, range);
+	} else {
+		error = uhd_usrp_get_rx_gain_range(usrp, "", channel, range);
+	}
+
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to get %s gain range\n", direction == 1 ? "TX" : "RX");
+		goto out;
+	}
+
+	error = uhd_meta_range_start(range, &start);
+	if (!error)
+		error = uhd_meta_range_stop(range, &stop);
+
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to get gain range values\n");
+		goto out;
+	}
+
+	*min_gain = start;
+	*max_gain = stop;
+
+	LOGP(DUHD, LOGL_INFO, "Device %s overall gain range: %.1f - %.1f dB\n",
+	     direction == 1 ? "TX" : "RX", start, stop);
+
+	/* Get list of gain elements */
+	error = uhd_string_vector_make(&names);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to create string vector\n");
+		goto out;
+	}
+
+	if (direction == 1) {
+		error = uhd_usrp_get_tx_gain_names(usrp, channel, &names);
+	} else {
+		error = uhd_usrp_get_rx_gain_names(usrp, channel, &names);
+	}
+
+	if (!error) {
+		uhd_string_vector_size(names, &num_names);
+		for (size_t i = 0; i < num_names && gain_names && gain_names_len > 0; i++) {
+			char name[64];
+			uhd_string_vector_at(names, i, name, sizeof(name));
+			int len = snprintf(gain_names + pos, gain_names_len - pos,
+					   "%s%s", (i > 0) ? " " : "", name);
+			if (len > 0 && pos + len < gain_names_len)
+				pos += len;
+
+			LOGP(DUHD, LOGL_INFO, "  Gain element: '%s'\n", name);
+		}
+	}
+
+	rc = 0;
+
+out:
+	if (names)
+		uhd_string_vector_free(&names);
+	if (range)
+		uhd_meta_range_free(&range);
+	if (usrp)
+		uhd_usrp_free(&usrp);
+
+	return rc;
+}

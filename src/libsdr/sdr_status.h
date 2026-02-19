@@ -2,9 +2,8 @@
  * SDR Status Monitoring
  *
  * Structured status objects for TX/RX IQ signal monitoring.
- * Replaces scattered static variables with proper per-channel
- * and global status that can be queried by other subsystems
- * (VMAC power control, display, diagnostics).
+ * Includes FFT-based spectral measurement for accurate per-frequency
+ * power levels and noise floor estimation.
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -22,6 +21,12 @@
 
 #define SDR_STATUS_MAX_CHANNELS	16
 #define SDR_STATUS_HIST_BINS	10
+
+/* FFT-based spectral measurement */
+#define SDR_SPECTRAL_FFT_SIZE	4096
+#define SDR_SPECTRAL_FFT_M	12	/* log2(4096) */
+#define SDR_SPECTRAL_MAX_FREQ	16	/* max registered frequencies */
+#define SDR_SPECTRAL_HALF_BW_HZ 20000	/* ±20 kHz integration window */
 
 /* Signal quality assessment */
 enum sdr_signal_quality {
@@ -63,6 +68,44 @@ typedef struct sdr_tx_status {
 	int		valid;		/* set after first report */
 } sdr_tx_status_t;
 
+/* Per-frequency spectral measurement result */
+typedef struct sdr_spectral_freq {
+	double		frequency;	/* registered frequency in Hz */
+	double		power_dbfs;	/* signal power in dBFS (±20 kHz window) */
+	int		valid;		/* set after first measurement */
+} sdr_spectral_freq_t;
+
+/* FFT-based spectral measurement state */
+typedef struct sdr_spectral {
+	/* Configuration */
+	int		sdr_rate;	/* SDR sample rate in Hz */
+	double		center_hz;	/* current SDR center frequency */
+	int		enabled;	/* 1 if configured and running */
+
+	/* Registered frequencies to measure */
+	sdr_spectral_freq_t freq[SDR_SPECTRAL_MAX_FREQ];
+	int		num_freq;
+
+	/* Global noise floor (from off-signal bins) */
+	double		noise_floor_dbfs;
+	int		noise_floor_valid;
+
+	/* FFT accumulation (internal) */
+	double		_fft_i[SDR_SPECTRAL_FFT_SIZE];
+	double		_fft_q[SDR_SPECTRAL_FFT_SIZE];
+	int		_fft_fill;	/* samples accumulated so far */
+	int		_fft_count;	/* FFTs completed this period */
+	int		_fft_target;	/* FFTs to average before reporting */
+
+	/* Power accumulation per registered frequency (linear, for averaging) */
+	double		_power_acc[SDR_SPECTRAL_MAX_FREQ];
+	int		_power_cnt[SDR_SPECTRAL_MAX_FREQ];
+
+	/* Global noise accumulation */
+	double		_noise_acc;
+	int		_noise_cnt;
+} sdr_spectral_t;
+
 /* Per-channel RX status (after FM/AM demod) */
 typedef struct sdr_rx_chan_status {
 	double		frequency;	/* RX frequency in Hz */
@@ -102,10 +145,7 @@ typedef struct sdr_rx_status {
 	long		hist[SDR_STATUS_HIST_BINS];
 	double		hist_pct[SDR_STATUS_HIST_BINS]; /* normalized percentages */
 
-	/* Noise floor estimation
-	 * Estimated from the lowest-energy histogram bins when signal is present.
-	 * When no signal: noise_floor ≈ avg amplitude.
-	 * When signal present: noise_floor from bins below signal peak. */
+	/* Noise floor estimation (histogram-based, kept for backward compat) */
 	double		noise_floor;	/* estimated noise floor (linear, 0.0-1.0) */
 	double		noise_floor_db;	/* noise floor in dB relative to full scale */
 
@@ -171,7 +211,10 @@ typedef struct sdr_status {
 	sdr_tx_status_t	tx;
 	sdr_rx_status_t	rx;
 	sdr_hw_status_t	hw;
+	sdr_spectral_t	spectral;
 	double		report_interval;	/* seconds between snapshots (default 1.0) */
+	double		spectral_interval;	/* seconds between spectral updates (default 0.1 = 10Hz) */
+	double		_spectral_timer;	/* internal timer for spectral updates */
 } sdr_status_t;
 
 /* Global status instance */
@@ -202,7 +245,56 @@ void sdr_status_hw_rx_accumulate(float *buff, int num);
  * Returns 1 if a new snapshot was taken, 0 if not yet time. */
 int sdr_status_snapshot(double now);
 
+/* Spectral-only snapshot: update FFT measurements at higher rate (10Hz default).
+ * Call this from the main loop for faster signal meter updates.
+ * Returns 1 if spectral data was updated, 0 if not yet time. */
+int sdr_spectral_snapshot(double now);
+
+/* Set spectral update interval (default 0.1 = 10Hz).
+ * Range: 0.1 to 1.0 seconds (1-10 Hz). */
+void sdr_spectral_set_interval(double interval_sec);
+
 /* Query current status (returns pointer to last snapshot) */
 const sdr_status_t *sdr_status_get(void);
+
+/*
+ * FFT-based spectral measurement API
+ *
+ * Configure once at startup, then feed IQ samples continuously.
+ * Results are updated on each snapshot interval.
+ */
+
+/* Configure spectral measurement.
+ *   sdr_rate:   SDR sample rate in Hz (e.g. 500000 or 20000000)
+ *   center_hz:  SDR center frequency in Hz
+ * FFTs per update are auto-calculated based on sample rate and update interval.
+ */
+void sdr_spectral_configure(int sdr_rate, double center_hz);
+
+/* Update center frequency (e.g. after retune) */
+void sdr_spectral_set_center(double center_hz);
+
+/* Register a frequency to measure power at.
+ *   freq_hz: absolute frequency in Hz (must be within SDR bandwidth)
+ * Returns index (0..MAX-1) on success, -1 if full or out of range.
+ */
+int sdr_spectral_register_freq(double freq_hz);
+
+/* Unregister a frequency by index. */
+void sdr_spectral_unregister_freq(int idx);
+
+/* Unregister all frequencies. */
+void sdr_spectral_clear_freq(void);
+
+/* Feed IQ samples (called from sdr_read, wideband data).
+ * Internally fills FFT buffer and runs FFT when full.
+ * Very cheap: just copies samples until buffer full, then one FFT. */
+void sdr_spectral_feed_iq(const float *iq_buf, int count);
+
+/* Query results (valid after snapshot) */
+double sdr_spectral_get_noise_floor(void);	/* global noise floor in dBFS */
+double sdr_spectral_get_power(int idx);		/* power at registered freq in dBFS */
+double sdr_spectral_get_snr(int idx);		/* SNR at registered freq in dB */
+int    sdr_spectral_is_valid(void);		/* 1 if measurements available */
 
 #endif /* SDR_STATUS_H */

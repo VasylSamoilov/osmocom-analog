@@ -2559,70 +2559,6 @@ int rds_server_poll(rds_server_t *srv)
 }
 
 /* ============================================================
- * Narrow-Band Power Measurement for Current Station (no FFT)
- * ============================================================
- *
- * The tuned station sits at DC (center of the SDR capture window).
- * We apply a boxcar (moving-average) low-pass filter by summing
- * NBPWR_DECIM consecutive IQ samples — this reduces the effective
- * bandwidth from sdr_rate to sdr_rate/NBPWR_DECIM (~200 kHz at 2 MHz).
- * The decimated signal's RMS power is then tracked along with a slow
- * noise floor minimum to produce an SNR value matching the scan scale:
- *   SNR_above_local_noise_floor + 10
- * (noise floor → ~10, strong stations → 30-46)
- */
-void rds_server_feed_iq(rds_server_t *srv,
-			const float *iq_buf, int count, int sdr_rate)
-{
-	(void)sdr_rate;
-
-	if (!iq_buf || count <= 0)
-		return;
-
-	for (int i = 0; i < count; i++) {
-		srv->nb_sum_i += (double)iq_buf[i * 2];
-		srv->nb_sum_q += (double)iq_buf[i * 2 + 1];
-		srv->nb_decim_cnt++;
-
-		if (srv->nb_decim_cnt >= NBPWR_DECIM) {
-			/* Compute mean (decimated) sample */
-			double di = srv->nb_sum_i / NBPWR_DECIM;
-			double dq = srv->nb_sum_q / NBPWR_DECIM;
-			srv->nb_power_acc += di * di + dq * dq;
-			srv->nb_power_cnt++;
-			srv->nb_sum_i = 0.0;
-			srv->nb_sum_q = 0.0;
-			srv->nb_decim_cnt = 0;
-		}
-	}
-
-	/* Update signal estimate once we have enough decimated samples (~1024) */
-	if (srv->nb_power_cnt < 1024)
-		return;
-
-	double avg_power = srv->nb_power_acc / srv->nb_power_cnt;
-	srv->nb_power_acc = 0.0;
-	srv->nb_power_cnt = 0;
-
-	double power_db = (avg_power > 1e-30) ? (10.0 * log10(avg_power)) : -120.0;
-
-	/* Store in circular history for noise floor tracking */
-	srv->nb_power_hist[srv->nb_hist_pos] = power_db;
-	srv->nb_hist_pos = (srv->nb_hist_pos + 1) % NBPWR_HIST_LEN;
-	if (srv->nb_hist_fill < NBPWR_HIST_LEN)
-		srv->nb_hist_fill++;
-
-	/* Noise floor = minimum over history window */
-	double noise_floor = srv->nb_power_hist[0];
-	for (int j = 1; j < srv->nb_hist_fill; j++)
-		if (srv->nb_power_hist[j] < noise_floor)
-			noise_floor = srv->nb_power_hist[j];
-
-	/* SNR above noise floor + 10 offset (matches scan scale) */
-	srv->nb_signal_db = (power_db - noise_floor) + 10.0;
-}
-
-/* ============================================================
  * Spectral Scan Support (XDR-GTK)
  * ============================================================ */
 
@@ -2807,7 +2743,7 @@ int rds_server_scan_feed_iq(rds_server_t *srv,
 		for (int f = srv->scan_start_khz; f <= srv->scan_stop_khz; f += srv->scan_step_khz) {
 			int idx = (f - srv->scan_start_khz) / srv->scan_step_khz;
 			if (!srv->scan_measured[idx]) continue;
-			double snr_val = (dbfs_vals[idx] - local_noise[idx]) + 10.0;
+			double snr_val = dbfs_vals[idx] - local_noise[idx];
 			int rem = (int)sizeof(srv->scan_result) - srv->scan_result_len - 1;
 			if (rem > 32) {
 				int n = snprintf(srv->scan_result + srv->scan_result_len, rem,

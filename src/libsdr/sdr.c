@@ -42,6 +42,7 @@ enum paging_signal;
 #endif
 #ifdef HAVE_SOAPY
 #include "soapy.h"
+#include <SoapySDR/Constants.h>
 #endif
 #ifdef HAVE_RPITX
 #include "rpitx.h"
@@ -866,6 +867,9 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 	/* Initialize SDR status monitoring */
 	sdr_status_init(channels, 1.0);
 
+	/* FFT-based spectral measurement is configured from main.c after sdr_open,
+	 * using the same data path as the scan engine (decimated DSP-rate IQ). */
+
 	return sdr;
 
 error:
@@ -1680,6 +1684,35 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		
 		/* Apply polyphase resampling if needed */
 		if (use_rx_polyphase && poly_in_i && poly_in_q) {
+			/* DEBUG: measure IQ levels BEFORE polyphase resampling */
+			{
+				static int pre_dbg_count = 0;
+				static double pre_pwr_sum = 0.0;
+				static double pre_peak = 0.0;
+				static int pre_samples = 0;
+				for (s = 0; s < read_count; s++) {
+					double pwr = (double)poly_in_i[s] * poly_in_i[s]
+					           + (double)poly_in_q[s] * poly_in_q[s];
+					pre_pwr_sum += pwr;
+					double mag = sqrt(pwr);
+					if (mag > pre_peak) pre_peak = mag;
+					pre_samples++;
+				}
+				pre_dbg_count++;
+				if (pre_dbg_count >= 333) {
+					double rms = sqrt(pre_pwr_sum / pre_samples);
+					LOGP(DSDR, LOGL_NOTICE,
+					     "IQ_BEFORE_POLY: samples=%d rms=%.6f(%.1fdBFS) peak=%.6f(%.1fdBFS) pwr=%.1fdBFS\n",
+					     pre_samples, rms, 20.0*log10(rms+1e-20),
+					     pre_peak, 20.0*log10(pre_peak+1e-20),
+					     10.0*log10(pre_pwr_sum/pre_samples+1e-20));
+					pre_pwr_sum = 0.0;
+					pre_peak = 0.0;
+					pre_samples = 0;
+					pre_dbg_count = 0;
+				}
+			}
+
 			if (!rx_polyphase_logged) {
 				LOGP(DSDR, LOGL_NOTICE, "RX POLYPHASE DOWNSAMPLE: SDR %d Hz -> DSP %d Hz (ratio=%.6f)\n",
 				     sdr_config->rx_samplerate, sdr->samplerate,
@@ -1731,6 +1764,35 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 				buff[s * 2 + 1] = out_q[s];
 			}
 			count = out_count;
+
+			/* DEBUG: measure IQ levels AFTER polyphase resampling */
+			{
+				static int post_dbg_count = 0;
+				static double post_pwr_sum = 0.0;
+				static double post_peak = 0.0;
+				static int post_samples = 0;
+				for (s = 0; s < out_count; s++) {
+					double pwr = (double)buff[s*2] * buff[s*2]
+					           + (double)buff[s*2+1] * buff[s*2+1];
+					post_pwr_sum += pwr;
+					double mag = sqrt(pwr);
+					if (mag > post_peak) post_peak = mag;
+					post_samples++;
+				}
+				post_dbg_count++;
+				if (post_dbg_count >= 333) {
+					double rms = sqrt(post_pwr_sum / post_samples);
+					LOGP(DSDR, LOGL_NOTICE,
+					     "IQ_AFTER_POLY: samples=%d rms=%.6f(%.1fdBFS) peak=%.6f(%.1fdBFS) pwr=%.1fdBFS\n",
+					     post_samples, rms, 20.0*log10(rms+1e-20),
+					     post_peak, 20.0*log10(post_peak+1e-20),
+					     10.0*log10(post_pwr_sum/post_samples+1e-20));
+					post_pwr_sum = 0.0;
+					post_peak = 0.0;
+					post_samples = 0;
+					post_dbg_count = 0;
+				}
+			}
 		} else {
 			count = num; /* Output Sample Count */
 		}
@@ -1804,11 +1866,13 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		sdr_rx_overflow = 0;
 	}
 
-	/* IQ level monitoring via status objects */
+	/* IQ level monitoring via status objects (uses decimated data for RMS) */
 	{
 		int iq_total = use_channelizer ? count * rx_os : count;
 		sdr_status_rx_accumulate(buff, iq_total);
 		sdr_status_snapshot(get_time());
+		/* Update spectral measurements at higher rate (10Hz) for signal meter */
+		sdr_spectral_snapshot(get_time());
 	}
 
 	if (sdr->wave_rx_rec.fp) {
@@ -2021,3 +2085,116 @@ int sdr_get_tosend(void *inst, int buffer_size)
 }
 
 
+
+/* Query SDR capabilities from configured device(s) */
+int sdr_query_caps(sdr_caps_t *caps)
+{
+	int rc = 0;
+
+	if (!caps)
+		return -1;
+
+	memset(caps, 0, sizeof(*caps));
+
+	if (!sdr_config) {
+		LOGP(DSDR, LOGL_ERROR, "SDR not configured, cannot query caps\n");
+		return -1;
+	}
+
+	/* Copy upconverter offsets from config */
+	caps->rx_upconverter = sdr_config->rx_upconverter;
+	caps->tx_upconverter = sdr_config->tx_upconverter;
+
+	/* Determine mode flags */
+	caps->is_split = sdr_config->split_mode;
+	caps->has_rx = !sdr_config->tx_only;
+	caps->has_tx = !sdr_config->rx_only;
+
+	/* Query RX device capabilities */
+	if (caps->has_rx) {
+		const char *rx_args = sdr_config->split_mode ?
+			sdr_config->rx_device_args : sdr_config->device_args;
+		int rx_channel = sdr_config->split_mode && sdr_config->rx_channel_given ?
+			sdr_config->rx_channel : sdr_config->channel;
+		int rx_is_uhd = sdr_config->split_mode ? sdr_config->rx_uhd : sdr_config->uhd;
+		int rx_is_soapy = sdr_config->split_mode ? sdr_config->rx_soapy : sdr_config->soapy;
+
+#ifdef HAVE_UHD
+		if (rx_is_uhd) {
+			if (uhd_query_freq_range(rx_args, 0, rx_channel,
+						 &caps->rx_freq_min, &caps->rx_freq_max) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query RX freq range from UHD\n");
+			}
+			if (uhd_query_gain_info(rx_args, 0, rx_channel,
+						&caps->rx_gain_min, &caps->rx_gain_max,
+						caps->rx_gain_names, sizeof(caps->rx_gain_names)) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query RX gain info from UHD\n");
+			}
+		}
+#endif
+#ifdef HAVE_SOAPY
+		if (rx_is_soapy) {
+			if (soapy_query_freq_range(rx_args, SOAPY_SDR_RX, rx_channel,
+						   &caps->rx_freq_min, &caps->rx_freq_max) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query RX freq range from SoapySDR\n");
+			}
+			if (soapy_query_gain_info(rx_args, SOAPY_SDR_RX, rx_channel,
+						  &caps->rx_gain_min, &caps->rx_gain_max,
+						  caps->rx_gain_names, sizeof(caps->rx_gain_names)) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query RX gain info from SoapySDR\n");
+			}
+		}
+#endif
+	}
+
+	/* Query TX device capabilities */
+	if (caps->has_tx) {
+		const char *tx_args = sdr_config->split_mode ?
+			sdr_config->tx_device_args : sdr_config->device_args;
+		int tx_channel = sdr_config->split_mode && sdr_config->tx_channel_given ?
+			sdr_config->tx_channel : sdr_config->channel;
+		int tx_is_uhd = sdr_config->split_mode ? sdr_config->tx_uhd : sdr_config->uhd;
+		int tx_is_soapy = sdr_config->split_mode ? sdr_config->tx_soapy : sdr_config->soapy;
+
+#ifdef HAVE_UHD
+		if (tx_is_uhd) {
+			if (uhd_query_freq_range(tx_args, 1, tx_channel,
+						 &caps->tx_freq_min, &caps->tx_freq_max) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query TX freq range from UHD\n");
+			}
+			if (uhd_query_gain_info(tx_args, 1, tx_channel,
+						&caps->tx_gain_min, &caps->tx_gain_max,
+						caps->tx_gain_names, sizeof(caps->tx_gain_names)) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query TX gain info from UHD\n");
+			}
+		}
+#endif
+#ifdef HAVE_SOAPY
+		if (tx_is_soapy) {
+			if (soapy_query_freq_range(tx_args, SOAPY_SDR_TX, tx_channel,
+						   &caps->tx_freq_min, &caps->tx_freq_max) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query TX freq range from SoapySDR\n");
+			}
+			if (soapy_query_gain_info(tx_args, SOAPY_SDR_TX, tx_channel,
+						  &caps->tx_gain_min, &caps->tx_gain_max,
+						  caps->tx_gain_names, sizeof(caps->tx_gain_names)) < 0) {
+				LOGP(DSDR, LOGL_NOTICE, "Could not query TX gain info from SoapySDR\n");
+			}
+		}
+#endif
+	}
+
+	LOGP(DSDR, LOGL_INFO, "SDR Capabilities:\n");
+	LOGP(DSDR, LOGL_INFO, "  RX: %.0f - %.0f MHz, gain %.1f - %.1f dB, upconv %.0f Hz\n",
+	     caps->rx_freq_min / 1e6, caps->rx_freq_max / 1e6,
+	     caps->rx_gain_min, caps->rx_gain_max, caps->rx_upconverter);
+	LOGP(DSDR, LOGL_INFO, "  TX: %.0f - %.0f MHz, gain %.1f - %.1f dB, upconv %.0f Hz\n",
+	     caps->tx_freq_min / 1e6, caps->tx_freq_max / 1e6,
+	     caps->tx_gain_min, caps->tx_gain_max, caps->tx_upconverter);
+	if (caps->rx_gain_names[0])
+		LOGP(DSDR, LOGL_INFO, "  RX gains: %s\n", caps->rx_gain_names);
+	if (caps->tx_gain_names[0])
+		LOGP(DSDR, LOGL_INFO, "  TX gains: %s\n", caps->tx_gain_names);
+
+	return rc;
+}

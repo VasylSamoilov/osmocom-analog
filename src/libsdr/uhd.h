@@ -16,4 +16,13 @@ int uhd_set_tx_frequency(double frequency);
 /* Query supported sample rates from device */
 int uhd_query_sample_rates(const char *device_args, int direction, size_t channel, sdr_rate_info_t *info);
 
+/* Query frequency range from device */
+int uhd_query_freq_range(const char *device_args, int direction, size_t channel,
+			 double *min_freq, double *max_freq);
+
+/* Query gain range from device */
+int uhd_query_gain_info(const char *device_args, int direction, size_t channel,
+			double *min_gain, double *max_gain,
+			char *gain_names, int gain_names_len);
+
 #endif /* UHD_H */

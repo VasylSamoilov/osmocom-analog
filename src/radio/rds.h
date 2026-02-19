@@ -1706,6 +1706,25 @@ typedef struct rds_encoder {
 	int		ps_dyn_page_count;	/* Number of pages */
 	int		ps_dyn_page_index;	/* Current page index */
 	
+	/* ============================================================
+	 * TX File Input (bypasses encoder, transmits from file)
+	 * ============================================================
+	 * When enabled, groups are read from file instead of generated.
+	 * Only one file type can be active at a time.
+	 * File is looped continuously until transmission stops.
+	 * ============================================================ */
+	FILE		*tx_hexrds_file;	/* Input file for hexrds format */
+	FILE		*tx_bitstream_file;	/* Input file for bitstream format */
+	long		tx_file_size;		/* File size for loop detection */
+	int		tx_file_mode;		/* 0=none, 1=hexrds, 2=bitstream */
+	uint8_t		tx_bitstream_byte;	/* Current byte being read */
+	int		tx_bitstream_bit_pos;	/* Bit position in current byte (0-7) */
+	int		tx_file_eof_logged;	/* 1 if EOF/loop logged this cycle */
+	uint64_t	tx_file_groups_sent;	/* Groups transmitted from file */
+	
+	/* TX file logging decoder (decodes transmitted groups for logging) */
+	struct rds_decoder *tx_log_decoder;	/* Decoder for logging TX groups */
+	
 } rds_encoder_t;
 
 /* Initialize RDS encoder */
@@ -2048,6 +2067,11 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 void rds_enc_paging_enable(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
 void rds_enc_paging_set_enhanced(rds_encoder_t *rds, int enable);
+
+/* TX File Input (bypasses encoder, transmits from file) */
+int rds_encoder_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename);
+int rds_encoder_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename);
+void rds_encoder_close_tx_file(rds_encoder_t *rds);
 
 /* Cleanup */
 void rds_encoder_exit(rds_encoder_t *rds);

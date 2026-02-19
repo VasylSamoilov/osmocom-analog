@@ -5,6 +5,13 @@
  * Computes derived metrics (noise floor, SNR, crest factor, signal quality)
  * on each snapshot interval.
  *
+ * FFT-based spectral measurement (same algorithm as scan):
+ *   - Signal power: FFT at registered frequencies (±20 kHz integration)
+ *   - Noise floor: minimum power across offset frequencies (skip ±100 kHz DC)
+ *   - Output: dBFS values, caller computes SNR = signal - noise
+ *
+ * CPU cost: ~0.05ms per FFT, negligible even at 20 Msps.
+ *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
  *
@@ -18,6 +25,7 @@
 #include <string.h>
 #include <math.h>
 #include "../liblogging/logging.h"
+#include "../libfft/fft.h"
 #include "sdr_status.h"
 
 /* Global status instance */
@@ -27,6 +35,7 @@ void sdr_status_init(int num_channels, double report_interval)
 {
 	memset(&sdr_status, 0, sizeof(sdr_status));
 	sdr_status.report_interval = report_interval > 0.0 ? report_interval : 1.0;
+	sdr_status.spectral_interval = 0.1;  /* 10Hz default for fast signal meter updates */
 	sdr_status.rx.num_channels = num_channels;
 	if (num_channels > SDR_STATUS_MAX_CHANNELS)
 		sdr_status.rx.num_channels = SDR_STATUS_MAX_CHANNELS;
@@ -35,10 +44,21 @@ void sdr_status_init(int num_channels, double report_interval)
 void sdr_status_reset(void)
 {
 	double interval = sdr_status.report_interval;
+	double spectral_interval = sdr_status.spectral_interval;
 	int num_ch = sdr_status.rx.num_channels;
+	sdr_spectral_t spectral_save = sdr_status.spectral;
 	memset(&sdr_status, 0, sizeof(sdr_status));
 	sdr_status.report_interval = interval;
+	sdr_status.spectral_interval = spectral_interval;
 	sdr_status.rx.num_channels = num_ch;
+	/* Preserve spectral config (frequencies, rates) but reset accumulators */
+	sdr_status.spectral = spectral_save;
+	sdr_status.spectral._fft_fill = 0;
+	sdr_status.spectral._fft_count = 0;
+	memset(sdr_status.spectral._power_acc, 0, sizeof(sdr_status.spectral._power_acc));
+	memset(sdr_status.spectral._power_cnt, 0, sizeof(sdr_status.spectral._power_cnt));
+	sdr_status.spectral._noise_acc = 0.0;
+	sdr_status.spectral._noise_cnt = 0;
 }
 
 /*
@@ -183,15 +203,7 @@ void sdr_status_hw_rx_accumulate(float *buff, int num)
 }
 
 /*
- * Estimate noise floor from histogram.
- *
- * Strategy: The noise floor is the average amplitude of the lowest-energy bins.
- * For a signal-free spectrum, all energy is noise and the histogram is concentrated
- * in the low bins. When a signal is present, the histogram becomes bimodal —
- * noise in low bins, signal in higher bins.
- *
- * We find the noise floor by looking at the lowest bins that contain samples
- * but are clearly below the signal peak.
+ * Estimate noise floor from histogram (kept for backward compat / diagnostics).
  */
 static double estimate_noise_floor(sdr_rx_status_t *rx)
 {
@@ -199,7 +211,6 @@ static double estimate_noise_floor(sdr_rx_status_t *rx)
 	if (total == 0)
 		return 0.0;
 
-	/* Find the bin with the most samples (dominant energy) */
 	int peak_bin = 0;
 	long peak_count = 0;
 	int i;
@@ -210,20 +221,13 @@ static double estimate_noise_floor(sdr_rx_status_t *rx)
 		}
 	}
 
-	/* If peak is in bin 0 (most energy near zero), the noise floor IS the signal.
-	 * This means either no signal or very weak signal. */
-	if (peak_bin == 0) {
-		/* Noise floor = average amplitude */
+	if (peak_bin == 0)
 		return total ? (rx->_sum_i + rx->_sum_q) / (2.0 * total) : 0.0;
-	}
 
-	/* Signal is in higher bins. Noise floor = weighted average of bins below the peak.
-	 * Use bins 0 through (peak_bin - 1) as noise estimate. */
 	double noise_sum = 0.0;
 	long noise_count = 0;
 	for (i = 0; i < peak_bin && i < SDR_STATUS_HIST_BINS; i++) {
 		if (rx->_hist[i] > 0) {
-			/* Center of bin i is (i + 0.5) / BINS */
 			double bin_center = ((double)i + 0.5) / SDR_STATUS_HIST_BINS;
 			noise_sum += bin_center * rx->_hist[i];
 			noise_count += rx->_hist[i];
@@ -233,8 +237,6 @@ static double estimate_noise_floor(sdr_rx_status_t *rx)
 	if (noise_count > 0)
 		return noise_sum / noise_count;
 
-	/* No samples in lower bins — signal fills entire range.
-	 * Use the lowest non-empty bin as noise estimate. */
 	for (i = 0; i < SDR_STATUS_HIST_BINS; i++) {
 		if (rx->_hist[i] > 0)
 			return ((double)i + 0.5) / SDR_STATUS_HIST_BINS;
@@ -243,36 +245,26 @@ static double estimate_noise_floor(sdr_rx_status_t *rx)
 	return 0.0;
 }
 
-/*
- * Determine signal quality assessment
- */
 static enum sdr_signal_quality assess_quality(sdr_rx_status_t *rx)
 {
 	if (rx->sample_count == 0)
 		return SDR_SIGNAL_NONE;
-
-	/* Saturated: >80% of samples clipping */
 	if (rx->clip_ratio > 0.80)
 		return SDR_SIGNAL_SATURATED;
-
-	/* Clipping: >5% of samples clipping */
 	if (rx->clip_ratio > 0.05)
 		return SDR_SIGNAL_CLIPPING;
 
-	/* Check if there's meaningful signal above noise */
 	double peak = rx->peak_i > rx->peak_q ? rx->peak_i : rx->peak_q;
 	if (peak < 0.01)
 		return SDR_SIGNAL_NONE;
-
 	if (peak < 0.05)
 		return SDR_SIGNAL_WEAK;
-
 	if (peak > 0.8)
 		return SDR_SIGNAL_STRONG;
-
 	return SDR_SIGNAL_GOOD;
 }
 
+#if 0  /* Unused - was for verbose RX IQ debug */
 static const char *quality_str(enum sdr_signal_quality q)
 {
 	switch (q) {
@@ -284,6 +276,302 @@ static const char *quality_str(enum sdr_signal_quality q)
 	case SDR_SIGNAL_SATURATED:	return "SATURATED";
 	}
 	return "?";
+}
+#endif
+
+/* ================================================================
+ * FFT-based spectral measurement (same algorithm as scan)
+ *
+ * Signal power: FFT at registered frequencies with ±20 kHz integration
+ * Noise floor: minimum power across offset frequencies (skip ±100 kHz DC)
+ *
+ * This matches the scan algorithm exactly, so signal meter output
+ * will be consistent with scan results (SNR = signal - noise).
+ * ================================================================ */
+
+void sdr_spectral_configure(int sdr_rate, double center_hz)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+
+	sp->sdr_rate = sdr_rate;
+	sp->center_hz = center_hz;
+	sp->_fft_fill = 0;
+	sp->_fft_count = 0;
+
+	/* Calculate optimal FFTs per update based on sample rate and update interval.
+	 * FFT size = 4096, so max FFTs/sec = sdr_rate / 4096.
+	 * With 10Hz updates (0.1 sec), we want enough FFTs to average but not too many.
+	 * Target: 4 FFTs per update for good averaging without blocking. */
+	int max_fft_per_sec = sdr_rate / SDR_SPECTRAL_FFT_SIZE;
+	int fft_per_update = (int)(max_fft_per_sec * sdr_status.spectral_interval);
+	if (fft_per_update < 1) fft_per_update = 1;
+	if (fft_per_update > 4) fft_per_update = 4;  /* cap at 4 for fast updates */
+
+	sp->_fft_target = fft_per_update;
+	sp->noise_floor_dbfs = -120.0;
+	sp->noise_floor_valid = 0;
+	sp->enabled = 1;
+
+	/* Reset accumulators */
+	memset(sp->_power_acc, 0, sizeof(sp->_power_acc));
+	memset(sp->_power_cnt, 0, sizeof(sp->_power_cnt));
+	sp->_noise_acc = 0.0;
+	sp->_noise_cnt = 0;
+
+	LOGP(DSDR, LOGL_INFO, "Spectral measurement: rate=%d center=%.0f Hz fft_per_update=%d (max_fft/sec=%d, interval=%.2fs)\n",
+	     sdr_rate, center_hz, sp->_fft_target, max_fft_per_sec, sdr_status.spectral_interval);
+}
+
+void sdr_spectral_set_center(double center_hz)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+	if (sp->center_hz == center_hz)
+		return;
+	sp->center_hz = center_hz;
+	/* Reset FFT buffer on retune — partial data is from old frequency */
+	sp->_fft_fill = 0;
+}
+
+int sdr_spectral_register_freq(double freq_hz)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+
+	if (sp->num_freq >= SDR_SPECTRAL_MAX_FREQ)
+		return -1;
+
+	/* Check if within SDR bandwidth */
+	if (sp->sdr_rate > 0) {
+		double offset = freq_hz - sp->center_hz;
+		double half_bw = sp->sdr_rate / 2.0;
+		if (offset < -half_bw || offset >= half_bw) {
+			LOGP(DSDR, LOGL_NOTICE,
+			     "Spectral: freq %.0f Hz outside SDR bandwidth (center=%.0f ±%.0f)\n",
+			     freq_hz, sp->center_hz, half_bw);
+			/* Register anyway — will be measured when/if center changes */
+		}
+	}
+
+	int idx = sp->num_freq++;
+	sp->freq[idx].frequency = freq_hz;
+	sp->freq[idx].power_dbfs = -120.0;
+	sp->freq[idx].valid = 0;
+	sp->_power_acc[idx] = 0.0;
+	sp->_power_cnt[idx] = 0;
+
+	LOGP(DSDR, LOGL_INFO, "Spectral: registered freq[%d] = %.0f Hz\n", idx, freq_hz);
+	return idx;
+}
+
+void sdr_spectral_unregister_freq(int idx)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+	if (idx < 0 || idx >= sp->num_freq)
+		return;
+
+	/* Shift remaining entries down */
+	for (int i = idx; i < sp->num_freq - 1; i++) {
+		sp->freq[i] = sp->freq[i + 1];
+		sp->_power_acc[i] = sp->_power_acc[i + 1];
+		sp->_power_cnt[i] = sp->_power_cnt[i + 1];
+	}
+	sp->num_freq--;
+}
+
+void sdr_spectral_clear_freq(void)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+	sp->num_freq = 0;
+	memset(sp->_power_acc, 0, sizeof(sp->_power_acc));
+	memset(sp->_power_cnt, 0, sizeof(sp->_power_cnt));
+}
+
+/*
+ * Process one completed FFT frame.
+ * 1. Measures power at registered frequencies (including DC/tuned frequency)
+ * 2. Measures power at offset frequencies, takes minimum as noise floor
+ * Same approach as scan: ±20 kHz integration window, minimum of offsets = noise floor.
+ */
+static void spectral_process_fft(sdr_spectral_t *sp)
+{
+	const int N = SDR_SPECTRAL_FFT_SIZE;
+	double bin_hz = (double)sp->sdr_rate / N;
+	int half_bins = (int)(20000.0 / bin_hz);  /* ±20 kHz integration window */
+	if (half_bins < 1) half_bins = 1;
+
+	/* Run FFT (in-place, divides by N) */
+	fft_process(1, SDR_SPECTRAL_FFT_M, sp->_fft_i, sp->_fft_q);
+
+	/* 1. Measure power at each registered frequency (same method as scan) */
+	for (int i = 0; i < sp->num_freq; i++) {
+		double offset_hz = sp->freq[i].frequency - sp->center_hz;
+		double half_bw = sp->sdr_rate / 2.0;
+
+		/* Skip if outside current SDR bandwidth */
+		if (offset_hz < -half_bw || offset_hz >= half_bw)
+			continue;
+
+		/* Map offset to FFT bin (with wrap for negative offsets) */
+		int center_bin = (int)round(offset_hz / bin_hz);
+
+		/* Integrate power over ±20 kHz window around channel center */
+		double power_sum = 0.0;
+		for (int b = center_bin - half_bins; b <= center_bin + half_bins; b++) {
+			int wb = (b < 0 ? b + N : b) & (N - 1);
+			double re = sp->_fft_i[wb];
+			double im = sp->_fft_q[wb];
+			power_sum += re * re + im * im;
+		}
+		double avg_power = power_sum / (2 * half_bins + 1);
+		sp->_power_acc[i] += avg_power;
+		sp->_power_cnt[i]++;
+	}
+
+	/* 2. Measure noise floor: power at offset frequencies (skip ±100 kHz around DC).
+	 * Take minimum as noise floor estimate. */
+	double min_power = 1e30;
+	int step_bins = (int)(100000.0 / bin_hz);  /* 100 kHz steps */
+	int dc_skip_bins = (int)(100000.0 / bin_hz);  /* skip ±100 kHz around DC */
+
+	/* Measure positive frequencies */
+	for (int center = dc_skip_bins; center < N/2 - half_bins; center += step_bins) {
+		double power_sum = 0.0;
+		for (int b = center - half_bins; b <= center + half_bins; b++) {
+			double re = sp->_fft_i[b];
+			double im = sp->_fft_q[b];
+			power_sum += re * re + im * im;
+		}
+		double avg_power = power_sum / (2 * half_bins + 1);
+		if (avg_power < min_power)
+			min_power = avg_power;
+	}
+
+	/* Measure negative frequencies (bins N/2+1 to N-1) */
+	for (int center = N/2 + dc_skip_bins; center < N - half_bins; center += step_bins) {
+		double power_sum = 0.0;
+		for (int b = center - half_bins; b <= center + half_bins; b++) {
+			double re = sp->_fft_i[b];
+			double im = sp->_fft_q[b];
+			power_sum += re * re + im * im;
+		}
+		double avg_power = power_sum / (2 * half_bins + 1);
+		if (avg_power < min_power)
+			min_power = avg_power;
+	}
+
+	if (min_power < 1e29) {
+		sp->_noise_acc += min_power;
+		sp->_noise_cnt++;
+	}
+
+	sp->_fft_count++;
+}
+
+void sdr_spectral_feed_iq(const float *iq_buf, int count)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+
+	if (!sp->enabled || !iq_buf || count <= 0)
+		return;
+
+	/* Already have enough FFTs for this snapshot period — skip until reset */
+	if (sp->_fft_count >= sp->_fft_target)
+		return;
+
+	/* Fill FFT buffer from IQ stream */
+	const int N = SDR_SPECTRAL_FFT_SIZE;
+	int i = 0;
+
+	while (i < count && sp->_fft_count < sp->_fft_target) {
+		/* Copy samples into FFT buffer */
+		int remaining = N - sp->_fft_fill;
+		int available = count - i;
+		int to_copy = remaining < available ? remaining : available;
+
+		for (int j = 0; j < to_copy; j++) {
+			sp->_fft_i[sp->_fft_fill] = (double)iq_buf[(i + j) * 2];
+			sp->_fft_q[sp->_fft_fill] = (double)iq_buf[(i + j) * 2 + 1];
+			sp->_fft_fill++;
+		}
+		i += to_copy;
+
+		/* FFT buffer full — process it */
+		if (sp->_fft_fill >= N) {
+			spectral_process_fft(sp);
+			sp->_fft_fill = 0;
+		}
+	}
+}
+
+/*
+ * Finalize spectral measurements for this snapshot period.
+ * Converts accumulated linear power to dBFS and resets accumulators.
+ */
+static void spectral_snapshot(sdr_spectral_t *sp)
+{
+	const int N = SDR_SPECTRAL_FFT_SIZE;
+	/* FFT normalization: the C fft_process divides by N, so to get
+	 * proper dBFS we add 20*log10(N) back. */
+	double fft_norm = 20.0 * log10((double)N);
+	int i;
+
+	if (!sp->enabled || sp->_fft_count == 0)
+		return;
+
+	/* Noise floor */
+	if (sp->_noise_cnt > 0) {
+		double avg_noise = sp->_noise_acc / sp->_noise_cnt;
+		sp->noise_floor_dbfs = (avg_noise > 1e-30)
+			? 10.0 * log10(avg_noise) + fft_norm : -120.0;
+		sp->noise_floor_valid = 1;
+	}
+
+	/* Per-frequency power */
+	for (i = 0; i < sp->num_freq; i++) {
+		if (sp->_power_cnt[i] > 0) {
+			double avg_power = sp->_power_acc[i] / sp->_power_cnt[i];
+			sp->freq[i].power_dbfs = (avg_power > 1e-30)
+				? 10.0 * log10(avg_power) + fft_norm : -120.0;
+			sp->freq[i].valid = 1;
+		}
+	}
+
+	/* Reset accumulators for next period */
+	sp->_fft_fill = 0;
+	sp->_fft_count = 0;
+	memset(sp->_power_acc, 0, sizeof(sp->_power_acc));
+	memset(sp->_power_cnt, 0, sizeof(sp->_power_cnt));
+	sp->_noise_acc = 0.0;
+	sp->_noise_cnt = 0;
+}
+
+/* Query functions */
+
+double sdr_spectral_get_noise_floor(void)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+	return sp->noise_floor_valid ? sp->noise_floor_dbfs : -120.0;
+}
+
+double sdr_spectral_get_power(int idx)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+	if (idx < 0 || idx >= sp->num_freq || !sp->freq[idx].valid)
+		return -120.0;
+	return sp->freq[idx].power_dbfs;
+}
+
+double sdr_spectral_get_snr(int idx)
+{
+	sdr_spectral_t *sp = &sdr_status.spectral;
+	if (idx < 0 || idx >= sp->num_freq || !sp->freq[idx].valid || !sp->noise_floor_valid)
+		return 0.0;
+	double snr = sp->freq[idx].power_dbfs - sp->noise_floor_dbfs;
+	return snr > 0.0 ? snr : 0.0;
+}
+
+int sdr_spectral_is_valid(void)
+{
+	return sdr_status.spectral.noise_floor_valid;
 }
 
 /*
@@ -355,7 +643,7 @@ int sdr_status_snapshot(double now)
 			rx->hist_pct[i] = 100.0 * rx->_hist[i] / n;
 		}
 
-		/* Noise floor estimation */
+		/* Noise floor estimation (histogram-based, kept for diagnostics) */
 		rx->noise_floor = estimate_noise_floor(rx);
 		rx->noise_floor_db = rx->noise_floor > 0.0
 			? 20.0 * log10(rx->noise_floor) : -120.0;
@@ -377,6 +665,7 @@ int sdr_status_snapshot(double now)
 		rx->quality = assess_quality(rx);
 		rx->valid = 1;
 
+#if 0  /* Verbose RX IQ debug - disabled */
 		/* Log RX status */
 		LOGP(DSDR, LOGL_DEBUG, "RX IQ: peak=%.4f/%.4f avg=%.4f/%.4f rms=%.4f DC=%.4f/%.4f | %s\n",
 		     rx->peak_i, rx->peak_q, rx->avg_i, rx->avg_q, rx->rms,
@@ -395,6 +684,7 @@ int sdr_status_snapshot(double now)
 		LOGP(DSDR, LOGL_DEBUG, "RX ANALYSIS: noise_floor=%.1f dBFS signal=%.1f dBFS dynamic_range=%.1f dB crest=%.1f dB\n",
 		     rx->noise_floor_db, rx->signal_power_db,
 		     rx->dynamic_range_db, rx->crest_factor_db);
+#endif
 
 		/* Per-channel RX status (after FM demod) */
 		for (i = 0; i < rx->num_channels && i < SDR_STATUS_MAX_CHANNELS; i++) {
@@ -402,56 +692,30 @@ int sdr_status_snapshot(double now)
 			if (!c->valid)
 				continue;
 
-			/* Compute average rf_level this period */
 			double avg_rf_db = c->_rf_count > 0
 				? c->_rf_sum_db / c->_rf_count : c->rf_level_db;
 
-			/*
-			 * In-channel noise floor tracking:
-			 *
-			 * The minimum rf_level seen during this 1-second window
-			 * approximates the in-channel noise floor (the quietest
-			 * moment on this channel). We smooth it with exponential
-			 * moving average to avoid jumps.
-			 *
-			 * Key insight: only update the noise floor when the
-			 * channel appears idle. When a signal is present
-			 * (has_signal from previous period), the minimum
-			 * rf_level is still the signal — not noise. Updating
-			 * upward during active signal would contaminate the
-			 * noise floor estimate.
-			 *
-			 * When signal disappears, the noise floor quickly
-			 * re-acquires the true idle level (alpha=0.5 downward).
-			 */
 			if (c->_rf_count > 0) {
 				double min_this_period = c->_rf_min_db;
 				if (!c->noise_floor_valid) {
-					/* First measurement — seed the noise floor */
 					c->noise_floor_db = min_this_period;
 					c->noise_floor_valid = 1;
 				} else if (!c->has_signal) {
-					/* Channel is idle — safe to update noise floor.
-					 * Drop fast, rise slow. */
 					double alpha;
 					if (min_this_period < c->noise_floor_db)
-						alpha = 0.5;  /* drop fast */
+						alpha = 0.5;
 					else
-						alpha = 0.1;  /* rise slow */
+						alpha = 0.1;
 					c->noise_floor_db = c->noise_floor_db
 						+ alpha * (min_this_period - c->noise_floor_db);
 				}
-				/* else: signal present — freeze noise floor */
 			}
 
-			/* SNR: current rf_level above in-channel noise floor */
 			if (c->noise_floor_valid)
 				c->snr_db = avg_rf_db - c->noise_floor_db;
 			else
 				c->snr_db = 0.0;
 
-			/* Signal detection: SNR > 6 dB is a reasonable threshold
-			 * for FM signal presence above in-channel noise */
 			c->has_signal = (c->snr_db > 6.0) ? 1 : 0;
 
 			LOGP(DSDR, LOGL_NOTICE, "RX CH%d: rf=%.1f dB nf=%.1f dB snr=%.1f dB %s | dev=%.0f Hz offset=%.0f Hz freq=%.6f MHz\n",
@@ -524,6 +788,44 @@ int sdr_status_snapshot(double now)
 	hw->_rx_timer = now;
 
 	return 1;
+}
+
+/*
+ * Spectral-only snapshot: update FFT measurements at higher rate (10Hz default).
+ * This allows the signal meter to update faster than the main status logging.
+ * Returns 1 if spectral data was updated, 0 if not yet time.
+ */
+int sdr_spectral_snapshot(double now)
+{
+	double interval = sdr_status.spectral_interval;
+
+	/* Initialize timer on first call */
+	if (sdr_status._spectral_timer == 0.0)
+		sdr_status._spectral_timer = now;
+
+	if (now - sdr_status._spectral_timer < interval)
+		return 0;
+
+	/* Update spectral measurements */
+	spectral_snapshot(&sdr_status.spectral);
+	sdr_status._spectral_timer = now;
+
+	return 1;
+}
+
+/*
+ * Set spectral update interval.
+ * Default is 0.1 seconds (10Hz). Range: 0.1 to 1.0 seconds (1-10 Hz).
+ */
+void sdr_spectral_set_interval(double interval_sec)
+{
+	if (interval_sec < 0.1)
+		interval_sec = 0.1;  /* max 10 Hz */
+	if (interval_sec > 1.0)
+		interval_sec = 1.0;  /* min 1 Hz */
+	sdr_status.spectral_interval = interval_sec;
+	LOGP(DSDR, LOGL_INFO, "Spectral update interval set to %.3f sec (%.1f Hz)\n",
+	     interval_sec, 1.0 / interval_sec);
 }
 
 const sdr_status_t *sdr_status_get(void)

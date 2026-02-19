@@ -37,6 +37,9 @@ static void rds_decode_group(rds_decoder_t *rds);
 /* Forward declaration for dynamic PS cycle tracking */
 void rds_dps_on_ps_cycle_complete(rds_encoder_t *rds);
 
+/* Forward declaration for TX file input */
+static int rds_generate_group_from_file(rds_encoder_t *rds);
+
 
 /* ============================================================
  * RRC Biphase Waveform Generation (IEC 62106 S2.3)
@@ -2581,6 +2584,28 @@ void rds_scheduler_update(rds_encoder_t *rds)
 static void rds_generate_group(rds_encoder_t *rds)
 {
 	/* ============================================================
+	 * PRIORITY 0: TX File Input (bypasses ALL other generation)
+	 * ============================================================
+	 * When a TX file is configured, read groups from file instead of
+	 * generating them. This completely bypasses the encoder logic,
+	 * including CT, warmup, and the normal carousel. The file is
+	 * the sole source of RDS data. */
+	if (rds->tx_file_mode != 0) {
+		/* For hexrds mode, read and transmit from file.
+		 * For bitstream mode, bits are read directly in rds_get_next_bit.
+		 * Only fall through on read error (empty file, etc.) */
+		if (rds->tx_file_mode == 1) {
+			if (rds_generate_group_from_file(rds))
+				return;
+			/* File read failed - log once and continue with file */
+			LOGP(DRADIO, LOGL_ERROR, "RDS TX: hexrds file read error, retrying\n");
+			return;  /* Don't fall through to encoder */
+		}
+		/* Bitstream mode (tx_file_mode == 2) - bits handled elsewhere */
+		return;
+	}
+	
+	/* ============================================================
 	 * DEBUG TEST MODE: Minimal Group 0A Cycle
 	 * ============================================================
 	 * When enabled, transmits ONLY Group 0A in a simple 4-group cycle
@@ -2868,9 +2893,22 @@ static void rds_generate_group(rds_encoder_t *rds)
 	rds->group_bit_pos = 0;
 }
 
-/* Get next bit from current group */
+/* Forward declaration for bitstream bit reader */
+static int rds_tx_read_bitstream_bit(rds_encoder_t *rds);
+
+/* Get next bit from current group (or directly from bitstream file) */
 static int rds_get_next_bit(rds_encoder_t *rds)
 {
+	/* For bitstream file mode, read bits directly - no group parsing needed.
+	 * This completely bypasses group generation - file is sole source. */
+	if (rds->tx_file_mode == 2 && rds->tx_bitstream_file) {
+		int bit = rds_tx_read_bitstream_bit(rds);
+		if (bit >= 0)
+			return bit;
+		/* File read error - return 0 but don't fall through to encoder */
+		return 0;
+	}
+	
 	/* Check if we need to generate a new group BEFORE calculating indices */
 	if (rds->group_bit_pos >= 104) {
 		rds_generate_group(rds);
@@ -5653,6 +5691,256 @@ void rds_encoder_exit(rds_encoder_t *rds)
 		free(rds->waveform_biphase);
 		rds->waveform_biphase = NULL;
 	}
+	/* Close TX file input if open */
+	rds_encoder_close_tx_file(rds);
+	/* Free TX log decoder if allocated */
+	if (rds->tx_log_decoder) {
+		rds_decoder_exit(rds->tx_log_decoder);
+		free(rds->tx_log_decoder);
+		rds->tx_log_decoder = NULL;
+	}
+}
+
+/* ============================================================
+ * TX FILE INPUT IMPLEMENTATION
+ * ============================================================
+ * Allows transmitting RDS data from pre-recorded files instead of
+ * generating groups dynamically. Supports two formats:
+ *
+ * 1. hexrds format: Text file with "XXXX XXXX XXXX XXXX" per line
+ *    (same format as RDS Spy, compatible with --rds-hexrds-file output)
+ *
+ * 2. bitstream format: Raw binary bits packed MSB first
+ *    (same format as .rds files, compatible with --rds-bitstream-file output)
+ *
+ * File is looped continuously. Transmitted groups are decoded and
+ * logged using the decoder for verification.
+ * ============================================================ */
+
+/* Close any open TX file */
+void rds_encoder_close_tx_file(rds_encoder_t *rds)
+{
+	if (rds->tx_hexrds_file) {
+		fclose(rds->tx_hexrds_file);
+		rds->tx_hexrds_file = NULL;
+	}
+	if (rds->tx_bitstream_file) {
+		fclose(rds->tx_bitstream_file);
+		rds->tx_bitstream_file = NULL;
+	}
+	rds->tx_file_mode = 0;
+	rds->tx_bitstream_byte = 0;
+	rds->tx_bitstream_bit_pos = 0;
+}
+
+/* Set TX input file for hexrds format */
+int rds_encoder_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename)
+{
+	/* Close any existing TX file */
+	rds_encoder_close_tx_file(rds);
+	
+	if (!filename)
+		return 0;
+	
+	rds->tx_hexrds_file = fopen(filename, "r");
+	if (!rds->tx_hexrds_file) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS TX: Cannot open hexrds input file '%s': %s\n",
+		     filename, strerror(errno));
+		return -1;
+	}
+	
+	/* Get file size for loop detection */
+	fseek(rds->tx_hexrds_file, 0, SEEK_END);
+	rds->tx_file_size = ftell(rds->tx_hexrds_file);
+	fseek(rds->tx_hexrds_file, 0, SEEK_SET);
+	
+	rds->tx_file_mode = 1;  /* hexrds mode */
+	rds->tx_file_eof_logged = 0;
+	rds->tx_file_groups_sent = 0;
+	
+	/* Allocate TX log decoder if not already done */
+	if (!rds->tx_log_decoder) {
+		rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
+		if (rds->tx_log_decoder) {
+			rds_decoder_init(rds->tx_log_decoder, rds->samplerate, 
+			                 rds->debug, rds->verbose, 50.0, 0);
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_NOTICE, "RDS TX: Reading hexrds input from '%s' (%ld bytes), looping\n",
+	     filename, rds->tx_file_size);
+	return 0;
+}
+
+/* Set TX input file for bitstream format */
+int rds_encoder_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename)
+{
+	/* Close any existing TX file */
+	rds_encoder_close_tx_file(rds);
+	
+	if (!filename)
+		return 0;
+	
+	rds->tx_bitstream_file = fopen(filename, "rb");
+	if (!rds->tx_bitstream_file) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS TX: Cannot open bitstream input file '%s': %s\n",
+		     filename, strerror(errno));
+		return -1;
+	}
+	
+	/* Get file size for loop detection */
+	fseek(rds->tx_bitstream_file, 0, SEEK_END);
+	rds->tx_file_size = ftell(rds->tx_bitstream_file);
+	fseek(rds->tx_bitstream_file, 0, SEEK_SET);
+	
+	rds->tx_file_mode = 2;  /* bitstream mode */
+	rds->tx_bitstream_byte = 0;
+	rds->tx_bitstream_bit_pos = 0;
+	rds->tx_file_eof_logged = 0;
+	rds->tx_file_groups_sent = 0;
+	
+	/* Allocate TX log decoder if not already done */
+	if (!rds->tx_log_decoder) {
+		rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
+		if (rds->tx_log_decoder) {
+			rds_decoder_init(rds->tx_log_decoder, rds->samplerate,
+			                 rds->debug, rds->verbose, 50.0, 0);
+		}
+	}
+	
+	LOGP(DRADIO, LOGL_NOTICE, "RDS TX: Reading bitstream input from '%s' (%ld bytes), looping\n",
+	     filename, rds->tx_file_size);
+	return 0;
+}
+
+/* Read next group from hexrds file.
+ * Returns 1 if group read successfully, 0 on EOF (will loop), -1 on error.
+ * Populates blocks[4] with the 16-bit data words. */
+static int rds_tx_read_hexrds_group(rds_encoder_t *rds, uint16_t blocks[4])
+{
+	char line[256];
+	
+	if (!rds->tx_hexrds_file)
+		return -1;
+	
+	/* Read next line */
+	if (!fgets(line, sizeof(line), rds->tx_hexrds_file)) {
+		/* EOF - loop back to start */
+		fseek(rds->tx_hexrds_file, 0, SEEK_SET);
+		if (!rds->tx_file_eof_logged) {
+			LOGP(DRADIO, LOGL_INFO, "RDS TX: hexrds file EOF, looping (%lu groups sent)\n",
+			     (unsigned long)rds->tx_file_groups_sent);
+			rds->tx_file_eof_logged = 1;
+		}
+		if (!fgets(line, sizeof(line), rds->tx_hexrds_file))
+			return -1;  /* Empty file */
+	}
+	
+	/* Parse "XXXX XXXX XXXX XXXX" format (ignore timestamp if present) */
+	char b0[8], b1[8], b2[8], b3[8];
+	if (sscanf(line, "%4s %4s %4s %4s", b0, b1, b2, b3) != 4) {
+		/* Skip malformed lines */
+		return 0;
+	}
+	
+	/* Parse hex values (---- means missing block, use 0) */
+	blocks[0] = (strcmp(b0, "----") == 0) ? 0 : (uint16_t)strtoul(b0, NULL, 16);
+	blocks[1] = (strcmp(b1, "----") == 0) ? 0 : (uint16_t)strtoul(b1, NULL, 16);
+	blocks[2] = (strcmp(b2, "----") == 0) ? 0 : (uint16_t)strtoul(b2, NULL, 16);
+	blocks[3] = (strcmp(b3, "----") == 0) ? 0 : (uint16_t)strtoul(b3, NULL, 16);
+	
+	rds->tx_file_groups_sent++;
+	rds->tx_file_eof_logged = 0;
+	
+	return 1;
+}
+
+/* Read next bit from bitstream file.
+ * Returns 0 or 1 for the bit, -1 on error. */
+static int rds_tx_read_bitstream_bit(rds_encoder_t *rds)
+{
+	if (!rds->tx_bitstream_file)
+		return -1;
+	
+	/* Need to read a new byte? */
+	if (rds->tx_bitstream_bit_pos == 0) {
+		int c = fgetc(rds->tx_bitstream_file);
+		if (c == EOF) {
+			/* EOF - loop back to start */
+			fseek(rds->tx_bitstream_file, 0, SEEK_SET);
+			if (!rds->tx_file_eof_logged) {
+				LOGP(DRADIO, LOGL_INFO, "RDS TX: bitstream file EOF, looping (%lu groups sent)\n",
+				     (unsigned long)rds->tx_file_groups_sent);
+				rds->tx_file_eof_logged = 1;
+			}
+			c = fgetc(rds->tx_bitstream_file);
+			if (c == EOF)
+				return -1;  /* Empty file */
+		}
+		rds->tx_bitstream_byte = (uint8_t)c;
+		rds->tx_bitstream_bit_pos = 8;
+	}
+	
+	/* Extract MSB first */
+	rds->tx_bitstream_bit_pos--;
+	int bit = (rds->tx_bitstream_byte >> rds->tx_bitstream_bit_pos) & 1;
+	
+	return bit;
+}
+
+/* Generate group from TX file input.
+ * Called by rds_generate_group when tx_file_mode is active.
+ * Returns 1 if group generated from file, 0 if should fall back to normal generation.
+ * NOTE: Bitstream mode (tx_file_mode==2) reads bits directly in rds_get_next_bit,
+ *       so this function only handles hexrds mode (tx_file_mode==1). */
+static int rds_generate_group_from_file(rds_encoder_t *rds)
+{
+	uint16_t blocks[4];
+	uint32_t encoded_blocks[4];
+	int rc;
+	
+	/* Bitstream mode reads bits directly - don't use this path */
+	if (rds->tx_file_mode != 1)
+		return 0;
+	
+	/* hexrds format - read and re-encode */
+	rc = rds_tx_read_hexrds_group(rds, blocks);
+	
+	if (rc <= 0)
+		return 0;  /* Error or skip, fall back to normal generation */
+	
+	/* Log transmitted group using decoder */
+	if (rds->tx_log_decoder) {
+		uint8_t status[4] = {RDS_STATUS_VALID, RDS_STATUS_VALID, 
+		                     RDS_STATUS_VALID, RDS_STATUS_VALID};
+		rds_decoder_feed_group(rds->tx_log_decoder, blocks, status);
+		
+		/* Log in RDS Spy format */
+		if (rds->debug || rds->verbose) {
+			int group_type = (blocks[1] >> 11) & 0x1F;
+			int type = group_type >> 1;
+			int version = group_type & 1;
+			LOGP(DRADIO, LOGL_INFO, "RDS TX FILE %d%c: %04X %04X %04X %04X\n",
+			     type, version ? 'B' : 'A',
+			     blocks[0], blocks[1], blocks[2], blocks[3]);
+		}
+	}
+	
+	/* Encode blocks with CRC and offset words */
+	encoded_blocks[0] = rds_block_encode(blocks[0], RDS_OFFSET_A, 0);
+	encoded_blocks[1] = rds_block_encode(blocks[1], RDS_OFFSET_B, 0);
+	/* Block C offset depends on version (A or B) */
+	int version = (blocks[1] >> 11) & 1;
+	encoded_blocks[2] = rds_block_encode(blocks[2], version ? RDS_OFFSET_Cp : RDS_OFFSET_C, 0);
+	encoded_blocks[3] = rds_block_encode(blocks[3], RDS_OFFSET_D, 0);
+	
+	/* Pack into group buffer */
+	rds_group_pack(encoded_blocks, rds->group_buffer, 0);
+	
+	rds->group_sequence++;
+	rds->group_bit_pos = 0;
+	
+	return 1;
 }
 
 
