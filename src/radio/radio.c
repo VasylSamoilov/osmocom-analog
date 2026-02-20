@@ -1345,25 +1345,33 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	radio->tx_wave_file = tx_wave_file;
 	radio->modulation = modulation;
 	radio->signal_samplerate = samplerate;
-	radio->audio_bandwidth = bandwidth;
+	radio->audio_bandwidth = bandwidth;	/* Audio passband (Hz), e.g. 15kHz for FM */
 
+	/* Calculate RF signal_bandwidth based on modulation type.
+	 * FM: signal_bandwidth = deviation + baseband_extent
+	 *   - Mono:   deviation + audio_bw (75k + 15k = 90 kHz)
+	 *   - Stereo: deviation + 53k (pilot 19k + L-R up to 53k)
+	 *   - RDS:    deviation + 60k (RDS subcarrier at 57k ± 2.4k)
+	 *   - RDS2:   deviation + 80k (additional subcarriers)
+	 *   - SCA:    deviation + 67k/92k/100k (subsidiary carriers)
+	 * AM: signal_bandwidth = audio_bandwidth (single/double sideband) */
 	switch (radio->modulation) {
 	case MODULATION_FM:
 		radio->fm_deviation = deviation;
 		radio->signal_bandwidth = deviation + bandwidth;
 		if (radio->stereo) {
-			radio->signal_bandwidth = deviation + 53000.0;
+			radio->signal_bandwidth = deviation + 53000.0;  /* stereo L-R extends to 53 kHz */
 			radio->audio_bandwidth = STEREO_BW;
 		}
 		if (radio->rds)
-			radio->signal_bandwidth = deviation + 60000.0;
+			radio->signal_bandwidth = deviation + 60000.0;  /* RDS at 57 kHz ± 2.4 kHz */
 		if (radio->rds2)
-			radio->signal_bandwidth = deviation + 80000.0;
+			radio->signal_bandwidth = deviation + 80000.0;  /* RDS2 additional subcarriers */
 		/* SCA extends bandwidth further */
 		if (radio->sca_67k)
-			radio->signal_bandwidth = deviation + 75000.0;
+			radio->signal_bandwidth = deviation + 75000.0;  /* SCA at 67 kHz */
 		if (radio->sca_92k)
-			radio->signal_bandwidth = deviation + 100000.0;
+			radio->signal_bandwidth = deviation + 100000.0; /* SCA at 92 kHz */
 		break;
 	case MODULATION_AM_DSB:
 	case MODULATION_AM_USB:

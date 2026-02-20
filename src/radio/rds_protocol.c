@@ -8,7 +8,32 @@
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * DESIGN:
+ * ============================================================
+ * SUPPORTED CLIENTS
+ * ============================================================
+ * 
+ * XDR-GTK Protocol (RDS_PROTO_XDR_GTK):
+ *   - XDR-GTK desktop application (tested)
+ *   - fm-dx-webserver (tested, supported)
+ *     Uses librdsparser for RDS decoding. Supports PI, PS, RT, PTY, AF,
+ *     signal level, stereo indicator, and spectral scan.
+ *   - Any client implementing XDR-GTK protocol
+ *
+ * RDS-Spy Protocol (RDS_PROTO_RDSSPY):
+ *   - RDS Spy desktop application
+ *   - Compatible RDS logging software
+ *
+ * UECP Protocol (RDS_PROTO_UECP):
+ *   - Professional RDS encoder control (TX mode)
+ *   - EN 50067 / IEC 62106 compliant
+ *
+ * ASCII-G Protocol (RDS_PROTO_ASCII_G):
+ *   - Simple text-based RDS encoder control (TX mode)
+ *   - SETSPY command for RDS Spy output
+ *
+ * ============================================================
+ * DESIGN
+ * ============================================================
  * - TX: radio writes to ring buffer, poll drains to socket
  * - RX: socket fills ring buffer, poll processes ONE command per call
  * - Never blocks main thread
@@ -197,6 +222,165 @@ const char *rds_proto_name(rds_proto_t proto)
 	case RDS_PROTO_ASCII_G:	return "ASCII-G";
 	default:		return "Unknown";
 	}
+}
+
+/* ============================================================
+ * XDR-GTK Command Decoders (for logging)
+ * ============================================================ */
+
+/* Command name lookup */
+static const char *xdr_cmd_name(char cmd)
+{
+	switch (cmd) {
+	case 'A': return "AGC";
+	case 'B': return "stereo mode";
+	case 'D': return "de-emphasis";
+	case 'F': return "IF filter";
+	case 'G': return "gain/iMS+cEQ";
+	case 'I': return "signal interval";
+	case 'M': return "FM/AM mode";
+	case 'N': return "pilot test";
+	case 'Q': return "squelch";
+	case 'T': return "tune";
+	case 'V': return "DAA voltage";
+	case 'W': return "bandwidth";
+	case 'Y': return "volume";
+	case 'Z': return "antenna";
+	case 'x': return "init";
+	case 'X': return "shutdown";
+	default:  return NULL;
+	}
+}
+
+/* Decode AGC value */
+static const char *xdr_agc_str(int val)
+{
+	switch (val) {
+	case 0: return "off";
+	case 1: return "low";
+	case 2: return "mid";
+	case 3: return "high";
+	default: return "?";
+	}
+}
+
+/* Decode stereo mode */
+static const char *xdr_stereo_str(int val)
+{
+	switch (val) {
+	case 0: return "stereo";
+	case 1: return "mono";
+	case 2: return "forced stereo";
+	default: return "?";
+	}
+}
+
+/* Decode de-emphasis */
+static const char *xdr_deemph_str(int val)
+{
+	switch (val) {
+	case 0: return "50µs";
+	case 1: return "75µs";
+	default: return "?";
+	}
+}
+
+/* Decode FM/AM mode */
+static const char *xdr_mode_str(int val)
+{
+	switch (val) {
+	case 0: return "FM";
+	case 1: return "AM";
+	default: return "?";
+	}
+}
+
+/* Format command value with human-readable description.
+ * Returns static buffer - not thread safe, use immediately. */
+static const char *xdr_cmd_desc(char cmd, int val, const char *arg)
+{
+	static char buf[64];
+	const char *name = xdr_cmd_name(cmd);
+	
+	if (!name) {
+		snprintf(buf, sizeof(buf), "%c%d", cmd, val);
+		return buf;
+	}
+	
+	switch (cmd) {
+	case 'A':
+		snprintf(buf, sizeof(buf), "%s=%s", name, xdr_agc_str(val));
+		break;
+	case 'B':
+		snprintf(buf, sizeof(buf), "%s=%s", name, xdr_stereo_str(val));
+		break;
+	case 'D':
+		snprintf(buf, sizeof(buf), "%s=%s", name, xdr_deemph_str(val));
+		break;
+	case 'F':
+		if (val < 0)
+			snprintf(buf, sizeof(buf), "%s=auto", name);
+		else
+			snprintf(buf, sizeof(buf), "%s=%d", name, val);
+		break;
+	case 'G':
+		/* Detect TEF6686 format (2-digit: 00, 01, 10, 11) vs XDR-GTK format */
+		if (arg && strlen(arg) == 2 && arg[0] >= '0' && arg[0] <= '1' && arg[1] >= '0' && arg[1] <= '1') {
+			snprintf(buf, sizeof(buf), "iMS=%c cEQ=%c", arg[0], arg[1]);
+		} else {
+			snprintf(buf, sizeof(buf), "RF=%d IF=%d", val / 10, val % 10);
+		}
+		break;
+	case 'I':
+		snprintf(buf, sizeof(buf), "%s=%dms", name, val);
+		break;
+	case 'M':
+		snprintf(buf, sizeof(buf), "%s=%s", name, xdr_mode_str(val));
+		break;
+	case 'Q':
+		snprintf(buf, sizeof(buf), "%s=%d", name, val);
+		break;
+	case 'T':
+		snprintf(buf, sizeof(buf), "%s=%.3fMHz", name, val / 1000.0);
+		break;
+	case 'W':
+		snprintf(buf, sizeof(buf), "%s=%dkHz", name, val);
+		break;
+	case 'Y':
+		snprintf(buf, sizeof(buf), "%s=%d%%", name, val);
+		break;
+	case 'Z':
+		snprintf(buf, sizeof(buf), "%s=%d", name, val);
+		break;
+	default:
+		snprintf(buf, sizeof(buf), "%s=%d", name, val);
+		break;
+	}
+	return buf;
+}
+
+/* Format command as "CMD (decoded)" - uses two static buffers to allow
+ * two calls in the same printf. Alternates between buffers. */
+static const char *xdr_cmd_fmt(char cmd, int val, const char *arg)
+{
+	static char buf[2][80];
+	static int idx = 0;
+	char *b = buf[idx];
+	idx = (idx + 1) % 2;
+	
+	/* Format protocol part */
+	int len;
+	if (cmd == 'G' && arg && strlen(arg) == 2 && arg[0] >= '0' && arg[0] <= '1' && arg[1] >= '0' && arg[1] <= '1') {
+		len = snprintf(b, sizeof(buf[0]), "G%02d", val);
+	} else if (cmd == 'G') {
+		len = snprintf(b, sizeof(buf[0]), "G%d", val);
+	} else {
+		len = snprintf(b, sizeof(buf[0]), "%c%d", cmd, val);
+	}
+	
+	/* Add decoded part */
+	snprintf(b + len, sizeof(buf[0]) - len, " (%s)", xdr_cmd_desc(cmd, val, arg));
+	return b;
 }
 
 /* ============================================================
@@ -582,11 +766,35 @@ void rds_server_send_group(rds_server_t *srv,
 	switch (srv->proto) {
 	case RDS_PROTO_XDR_GTK: {
 		/* Format: R<AAAA><BBBB><CCCC><DDDD><EE>\n
-		 * EE = error byte: A[7:6], B[5:4], C[3:2], D[1:0] */
-		uint8_t err_byte = ((errors[0] & 0x03) << 6) |
-				   ((errors[1] & 0x03) << 4) |
-				   ((errors[2] & 0x03) << 2) |
-				   (errors[3] & 0x03);
+		 * EE = error byte: A[7:6], B[5:4], C[3:2], D[1:0]
+		 * 
+		 * librdsparser (used by XDR-GTK and fm-dx-webserver) expects:
+		 *   0 = RDSPARSER_BLOCK_ERROR_NONE (valid block)
+		 *   1 = RDSPARSER_BLOCK_ERROR_SMALL (corrected)
+		 *   2 = RDSPARSER_BLOCK_ERROR_LARGE
+		 *   3 = RDSPARSER_BLOCK_ERROR_UNCORRECTABLE
+		 * 
+		 * fm-dx-webserver sets correction threshold to LARGE (2), so it
+		 * accepts blocks with error levels 0, 1, or 2. This enables AF
+		 * decoding and other features that require error-free Block C.
+		 * 
+		 * Our RDS_STATUS_* values need mapping:
+		 *   0 = NONE (no data) -> 3 (uncorrectable)
+		 *   1 = VALID -> 0 (no error)
+		 *   2 = CORRECTED -> 1 (small error)
+		 *   3 = ERROR -> 3 (uncorrectable) */
+		uint8_t mapped[4];
+		for (int i = 0; i < 4; i++) {
+			switch (errors[i]) {
+			case 1:  mapped[i] = 0; break;  /* VALID -> no error */
+			case 2:  mapped[i] = 1; break;  /* CORRECTED -> small error */
+			default: mapped[i] = 3; break;  /* NONE/ERROR -> uncorrectable */
+			}
+		}
+		uint8_t err_byte = ((mapped[0] & 0x03) << 6) |
+				   ((mapped[1] & 0x03) << 4) |
+				   ((mapped[2] & 0x03) << 2) |
+				   (mapped[3] & 0x03);
 		tx_printf(srv, "R%04X%04X%04X%04X%02X\n",
 			  blocks[0], blocks[1], blocks[2], blocks[3], err_byte);
 		break;
@@ -691,8 +899,21 @@ void rds_server_send_reset(rds_server_t *srv)
 /* Process single XDR-GTK command line */
 static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 {
-	if (len < 1)
+	/* Empty line (len == 0) is used by XDR-GTK to stop an active scan.
+	 * See xdr-gtk/src/scan.c line 477: tuner_write(tuner.thread, "") */
+	if (len == 0) {
+		if (srv->scan_active) {
+			LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: Scan stop requested (empty line)\n");
+			srv->scan_active = 0;
+			/* Restore original frequency */
+			if (srv->scan_cb && srv->scan_orig_freq_khz > 0) {
+				srv->scan_cb(srv->scan_orig_freq_khz, srv->scan_cb_arg);
+				tx_printf(srv, "T%d\n", srv->scan_orig_freq_khz);
+				srv->freq_khz = srv->scan_orig_freq_khz;
+			}
+		}
 		return;
+	}
 	
 	char c = cmd[0];
 	const char *arg = (len > 1) ? cmd + 1 : "";
@@ -700,13 +921,16 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 	switch (c) {
 	case 'x':
 		/* Status/init request - respond with OK and current frequency */
-		LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'x' (status/init request), reply: OK + T%d%s\n",
+		LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'x' (init), reply: OK + T%d%s\n",
 		     srv->freq_khz, srv->deemphasis >= 0 ? " + D" : "");
 		tx_write_str(srv, "OK\n");
 		tx_printf(srv, "T%d\n", srv->freq_khz);
 		if (srv->deemphasis >= 0)
 			tx_printf(srv, "D%d\n", srv->deemphasis);
-		/* Start grace window: suppress XDR-GTK's first T after login */
+		/* Start post-login sync window: clients send their saved settings
+		 * (T, A, Y, D, etc.) immediately after connection. During this window
+		 * we ignore those and echo back our current values so the client
+		 * syncs to our state instead of overriding it. */
 		srv->login_tune_grace_us = time_us() + XDR_LOGIN_TUNE_GRACE_US;
 		break;
 
@@ -724,21 +948,17 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		/* Tune: T<freq_khz> */
 		if (*arg) {
 			int freq = atoi(arg);
-			/* Suppress the first T after login: XDR-GTK unconditionally sends
-			 * T<conf.initial_freq> from connection_dialog_callback ~100ms after
-			 * tuner_ready fires.  We absorb it so the client adopts our current
-			 * frequency instead of retuning to its last saved one. */
+			/* During post-login sync window: client sends its saved settings,
+			 * but we want it to adopt our current state instead. */
 			if (srv->login_tune_grace_us && time_us() < srv->login_tune_grace_us) {
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: Suppressing login T%d (grace window, current=%d kHz)\n",
-				     freq, srv->freq_khz);
-				srv->login_tune_grace_us = 0;
-				/* Echo back our current frequency so XDR-GTK UI shows the right value */
+				LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Ignoring T%d (tune=%.3fMHz), reply: T%d (tune=%.3fMHz)\n",
+				     freq, freq / 1000.0, srv->freq_khz, srv->freq_khz / 1000.0);
+				/* Echo back our current frequency so client UI syncs to us */
 				tx_printf(srv, "T%d\n", srv->freq_khz);
 				break;
 			}
 			srv->login_tune_grace_us = 0;
-			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'T%d' (tune to %d kHz), reply: T%d\n",
-			     freq, freq, freq);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: T%d (tune=%.3fMHz)\n", freq, freq / 1000.0);
 			if (srv->tune_cb)
 				srv->tune_cb(freq, srv->cb_arg);
 			tx_printf(srv, "T%d\n", freq);
@@ -750,51 +970,54 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 	case 'B':  /* Stereo/Mono mode */
 	case 'D':  /* De-emphasis */
 	case 'F':  /* Bandwidth filter */
-	case 'G':  /* RF/IF gain */
+	case 'G':  /* RF/IF gain (XDR-GTK) or iMS/cEQ (TEF6686/fm-dx-webserver) */
 	case 'Y':  /* Volume */
 	case 'Z':  /* Antenna */
 	case 'Q':  /* Squelch */
 		if (*arg) {
 			int val = atoi(arg);
-			switch (c) {
-			case 'A':
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: AGC=%d (%s) [not wired]\n",
-				     val, val==0?"off":val==1?"low":val==2?"mid":"high");
+			
+			/* During post-login sync window: client sends its saved settings,
+			 * but we want it to adopt our current state instead.
+			 * Echo back acknowledgment without acting on the command. */
+			if (srv->login_tune_grace_us && time_us() < srv->login_tune_grace_us) {
+				if (c == 'D' && srv->deemphasis >= 0) {
+					/* For de-emphasis, send our actual value */
+					LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Ignoring %s, reply: %s\n",
+					     xdr_cmd_fmt(c, val, arg), xdr_cmd_fmt(c, srv->deemphasis, NULL));
+					tx_printf(srv, "D%d\n", srv->deemphasis);
+				} else {
+					/* Echo back same value to acknowledge */
+					LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Ignoring %s, reply: %s\n",
+					     xdr_cmd_fmt(c, val, arg), xdr_cmd_fmt(c, val, arg));
+					if (c == 'G' && strlen(arg) == 2 && arg[0] >= '0' && arg[0] <= '1' && arg[1] >= '0' && arg[1] <= '1')
+						tx_printf(srv, "G%02d\n", val);
+					else if (c == 'G')
+						tx_printf(srv, "G%d\n", val);
+					else
+						tx_printf(srv, "%c%d\n", c, val);
+				}
 				break;
-			case 'B':
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: Stereo/mono mode=%d (%s) [not wired]\n",
-				     val, val==0?"stereo":val==1?"mono":"forced stereo");
-				break;
-			case 'D':
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: De-emphasis=%d (%s) [not wired]\n",
-				     val, val==0?"50us (EU)":"75us (US)");
-				break;
-			case 'F':
-				if (val < 0)
-					LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: IF bandwidth=auto [not wired]\n");
+			}
+			
+			/* Normal command processing */
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: %s [not wired]\n", xdr_cmd_fmt(c, val, arg));
+			
+			/* Echo back in appropriate format */
+			if (c == 'G') {
+				if (strlen(arg) == 2 && arg[0] >= '0' && arg[0] <= '1' && arg[1] >= '0' && arg[1] <= '1')
+					tx_printf(srv, "G%02d\n", val);
 				else
-					LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: IF bandwidth step=%d [not wired]\n", val);
-				break;
-			case 'G': {
-				int rf = val / 10, ifg = val % 10;
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: Gain RF=%d IF=%d [not wired]\n", rf, ifg);
-				break;
+					tx_printf(srv, "G%d\n", val);
+			} else {
+				tx_printf(srv, "%c%d\n", c, val);
 			}
-			case 'Y':
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: Volume=%d [not wired]\n", val);
-				break;
-			case 'Z':
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: Antenna=%d [not wired]\n", val);
-				break;
-			case 'Q':
-				LOGP(DRADIO, LOGL_NOTICE, "XDR-GTK: Squelch=%d [not wired]\n", val);
-				break;
-			}
+			
+			/* Notify callback */
 			if (srv->setting_cb) {
 				char name[2] = { c, '\0' };
 				srv->setting_cb(name, val, srv->cb_arg);
 			}
-			tx_printf(srv, "%c%d\n", c, val);
 		}
 		break;
 		
@@ -806,8 +1029,8 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 			    ms <= XDR_SIGNAL_INTERVAL_MAX_MS) {
 				srv->signal_interval_ms = ms;
 			}
-			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'I%s' (signal interval), reply: I%d\n",
-			     arg, srv->signal_interval_ms);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: %s, reply: %s\n",
+			     xdr_cmd_fmt('I', ms, arg), xdr_cmd_fmt('I', srv->signal_interval_ms, NULL));
 			tx_printf(srv, "I%d\n", srv->signal_interval_ms);
 		}
 		break;
@@ -816,7 +1039,7 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		/* FM/AM mode: M<mode> (0=FM, 1=AM, ...) — echo back */
 		if (*arg) {
 			int mode = atoi(arg);
-			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'M%d' (mode), reply: M%d\n", mode, mode);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: %s\n", xdr_cmd_fmt('M', mode, arg));
 			tx_printf(srv, "M%d\n", mode);
 		}
 		break;
@@ -825,7 +1048,7 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		/* Bandwidth kHz (TEF6686): W<bw> — echo back */
 		if (*arg) {
 			int bw = atoi(arg);
-			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'W%d' (bandwidth kHz), reply: W%d\n", bw, bw);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: %s\n", xdr_cmd_fmt('W', bw, arg));
 			tx_printf(srv, "W%d\n", bw);
 		}
 		break;
@@ -834,7 +1057,7 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		/* DAA tuning voltage alignment: V<val> — echo back */
 		if (*arg) {
 			int val = atoi(arg);
-			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'V%d' (DAA voltage), reply: V%d\n", val, val);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: V%d (DAA voltage)\n", val);
 			tx_printf(srv, "V%d\n", val);
 		}
 		break;
@@ -843,14 +1066,14 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		/* Rotator control: C<state> — echo back */
 		if (*arg) {
 			int state = atoi(arg);
-			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'C%d' (rotator), reply: C%d\n", state, state);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: C%d (rotator)\n", state);
 			tx_printf(srv, "C%d\n", state);
 		}
 		break;
 
 	case 'N':
 		/* Stereo pilot test request — reply N0 (no pilot injection) */
-		LOGP(DRADIO, LOGL_INFO, "XDR-GTK: Received 'N' (pilot test), reply: N0\n");
+		LOGP(DRADIO, LOGL_INFO, "XDR-GTK: N (pilot test), reply: N0\n");
 		tx_write_str(srv, "N0\n");
 		break;
 
@@ -961,7 +1184,7 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		break;
 
 	default:
-		LOGP(DRADIO, LOGL_ERROR, "XDR-GTK: Unsupported command '%c' (0x%02X), full line: \"%.*s\"\n",
+		LOGP(DRADIO, LOGL_ERROR, "XDR-GTK: Unknown command '%c' (0x%02X): \"%.*s\"\n",
 		     isprint((unsigned char)c) ? c : '?', (unsigned char)c, len, cmd);
 		break;
 	}
@@ -1378,11 +1601,15 @@ static void rx_process_xdr(rds_server_t *srv)
 		if (pos < 0)
 			break;  /* No complete command */
 		
-		/* Extract command (up to newline) */
-		if (pos > 0 && pos < (int)sizeof(cmd)) {
-			rds_ring_read(&srv->rx_ring, (uint8_t *)cmd, pos);
+		/* Extract command (up to newline) - pos==0 means empty line */
+		if (pos < (int)sizeof(cmd)) {
+			if (pos > 0)
+				rds_ring_read(&srv->rx_ring, (uint8_t *)cmd, pos);
 			cmd[pos] = '\0';
 			xdr_process_cmd(srv, cmd, pos);
+		} else {
+			/* Command too long, discard it */
+			rds_ring_discard(&srv->rx_ring, pos);
 		}
 		
 		/* Skip newline(s) */
@@ -2341,24 +2568,37 @@ int rds_server_poll(rds_server_t *srv)
 				     srv->client_ip, srv->client_port,
 				     (unsigned long long)srv->total_connections);
 
-				/* XDR-GTK TCP auth: send 16-byte random salt + \n */
+				/* XDR-GTK TCP auth: send 16-byte random salt + \n
+				 * 
+				 * COMPATIBILITY NOTE: We generate ASCII printable characters
+				 * (0x21-0x7E) instead of arbitrary bytes. This maintains
+				 * compatibility with XDR-GTK (which uses raw bytes) while also
+				 * working with fm-dx-webserver which incorrectly interprets
+				 * the salt as UTF-8 (Buffer.from(salt, 'utf-8')). Using ASCII
+				 * ensures both interpretations produce the same result. */
 				if (srv->proto == RDS_PROTO_XDR_GTK) {
 					int i;
 					uint8_t salt_msg[XDR_AUTH_SALT_LEN + 1];
 					/* Use time + fd as entropy source */
-					int64_t seed = time_us() ^ ((int64_t)fd << 32);
+					uint64_t seed = (uint64_t)(time_us() ^ ((int64_t)fd << 32));
+					/* ASCII printable range: 0x21 ('!') to 0x7E ('~') = 94 chars
+					 * Avoid 0x20 (space) and control chars for safety */
 					for (i = 0; i < XDR_AUTH_SALT_LEN; i++) {
-						seed = seed * 6364136223846793005LL + 1442695040888963407LL;
-						srv->auth_salt[i] = (uint8_t)(seed >> 33);
+						seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+						srv->auth_salt[i] = 0x21 + (int)((seed >> 33) % 94);
 					}
 					memcpy(salt_msg, srv->auth_salt, XDR_AUTH_SALT_LEN);
 					salt_msg[XDR_AUTH_SALT_LEN] = '\n';
 					send(fd, salt_msg, sizeof(salt_msg), MSG_NOSIGNAL);
 					srv->auth_state = XDR_AUTH_WAIT;
 					srv->auth_deadline_us = time_us() + (int64_t)XDR_AUTH_TIMEOUT_S * 1000000LL;
+					/* Debug: log salt (now ASCII printable) */
+					char salt_str[XDR_AUTH_SALT_LEN + 1];
+					memcpy(salt_str, srv->auth_salt, XDR_AUTH_SALT_LEN);
+					salt_str[XDR_AUTH_SALT_LEN] = '\0';
 					LOGP(DRADIO, LOGL_INFO,
-					     "XDR-GTK: Sent auth salt to %s:%d\n",
-					     srv->client_ip, srv->client_port);
+					     "XDR-GTK: Sent auth salt to %s:%d: \"%s\"\n",
+					     srv->client_ip, srv->client_port, salt_str);
 				} else {
 					srv->auth_state = XDR_AUTH_NONE;
 				}
@@ -2393,15 +2633,30 @@ int rds_server_poll(rds_server_t *srv)
 			recv(srv->client_fd, rxbuf, XDR_AUTH_HASH_LEN + 1, 0);
 			rxbuf[XDR_AUTH_HASH_LEN] = '\0';  /* Null-terminate, drop \n */
 
+			/* Debug: log salt (now ASCII printable) */
+			char salt_str[XDR_AUTH_SALT_LEN + 1];
+			memcpy(salt_str, srv->auth_salt, XDR_AUTH_SALT_LEN);
+			salt_str[XDR_AUTH_SALT_LEN] = '\0';
+			LOGP(DRADIO, LOGL_DEBUG,
+			     "XDR-GTK: Auth debug - salt: \"%s\"\n", salt_str);
+			LOGP(DRADIO, LOGL_DEBUG,
+			     "XDR-GTK: Auth debug - password: \"%s\"\n", srv->password);
+			LOGP(DRADIO, LOGL_DEBUG,
+			     "XDR-GTK: Auth debug - received hash: %s\n", rxbuf);
+
 			/* Compute expected hash */
 			char expected[XDR_AUTH_HASH_LEN + 1];
 			xdr_auth_hash(srv->auth_salt, srv->password, expected);
+
+			LOGP(DRADIO, LOGL_DEBUG,
+			     "XDR-GTK: Auth debug - expected hash: %s\n", expected);
 
 			if (strncasecmp(rxbuf, expected, XDR_AUTH_HASH_LEN) == 0) {
 				/* Auth OK */
 				srv->auth_state = XDR_AUTH_OK;
 				send(srv->client_fd, "a1\n", 3, MSG_NOSIGNAL);
-				send(srv->client_fd, "o1\n", 3, MSG_NOSIGNAL);
+				/* Send online user count (xdrd format: o<users>,<guests>) */
+				send(srv->client_fd, "o1,0\n", 5, MSG_NOSIGNAL);
 				/* Send current frequency if known */
 				if (srv->freq_khz > 0) {
 					char tbuf[32];
@@ -2440,6 +2695,11 @@ int rds_server_poll(rds_server_t *srv)
 			srv->client_fd = RDS_FD_NONE;
 			srv->rx_bytes = 0;
 			srv->tx_bytes = 0;
+		} else {
+			/* Debug: log partial receive */
+			LOGP(DRADIO, LOGL_DEBUG,
+			     "XDR-GTK: Auth debug - recv returned %ld (expected %d)\n",
+			     (long)n, XDR_AUTH_HASH_LEN + 1);
 		}
 		return 0;
 	}
@@ -2546,8 +2806,10 @@ int rds_server_poll(rds_server_t *srv)
 		}
 	}
 	
-	/* Periodic signal report (XDR-GTK only) */
-	if (srv->proto == RDS_PROTO_XDR_GTK && srv->signal_interval_ms > 0) {
+	/* Periodic signal report (XDR-GTK only) - but NOT during scan
+	 * because S messages trigger scan_update_value() which sets scan.active=FALSE
+	 * and disables the stop button in the client */
+	if (srv->proto == RDS_PROTO_XDR_GTK && srv->signal_interval_ms > 0 && !srv->scan_active) {
 		now = time_us();
 		if (now - srv->last_signal_us >= srv->signal_interval_ms * 1000LL) {
 			rds_server_send_signal(srv, srv->signal_dbm, srv->stereo, 0);

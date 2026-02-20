@@ -3143,7 +3143,21 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 	total_samples_processed += num;
 	
 	/* Debug: log bit consumption for diagnostics */
-
+	{
+		static unsigned long last_report_samples = 0;
+		static unsigned long last_report_bits = 0;
+		if (total_samples_processed - last_report_samples >= rds->samplerate) {
+			double elapsed_sec = (total_samples_processed - last_report_samples) / rds->samplerate;
+			double bit_rate = (total_bits_consumed - last_report_bits) / elapsed_sec;
+			LOGP(DRADIO, LOGL_NOTICE, "RDS ENC TIMING: bit_phase=%.6f bit_phasestep=%.9f | "
+			     "bits=%lu (%.2f bps, expect 1187.5) | samples=%lu\n",
+			     rds->bit_phase, rds->bit_phasestep,
+			     total_bits_consumed - last_report_bits, bit_rate,
+			     total_samples_processed - last_report_samples);
+			last_report_samples = total_samples_processed;
+			last_report_bits = total_bits_consumed;
+		}
+	}
 	
 	/* Debug: log occasionally to confirm RDS is being added */
 	if (++debug_count >= 100) {
@@ -8225,6 +8239,93 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	return 0;
 }
 
+void rds_decoder_reset(rds_decoder_t *rds)
+{
+	/* Preserve DSP configuration */
+	double samplerate = rds->samplerate;
+	int debug = rds->debug;
+	int verbose = rds->verbose;
+	int force_rbds = rds->force_rbds;
+	double time_constant_us = rds->time_constant_us;
+	
+	/* Preserve callbacks */
+	void (*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg) = rds->group_callback;
+	void *group_callback_arg = rds->group_callback_arg;
+	
+	/* Preserve file handles */
+	FILE *hexrds_file = rds->hexrds_file;
+	FILE *bitstream_file = rds->bitstream_file;
+	
+	/* Preserve filter state (DSP continuity) */
+	rds_iir_filter_t filter_2400_i = rds->filter_2400_i;
+	rds_iir_filter_t filter_2400_q = rds->filter_2400_q;
+	rds_iir_filter_t filter_pll = rds->filter_pll;
+	double agc_gain = rds->agc_gain;
+	double agc_alpha = rds->agc_alpha;
+	double freq_subcarrier = rds->freq_subcarrier;
+	double status_interval = rds->status_interval;
+	double signal_debug_interval = rds->signal_debug_interval;
+	
+	/* Clear all decoder state */
+	memset(rds, 0, sizeof(*rds));
+	
+	/* Restore DSP configuration */
+	rds->samplerate = samplerate;
+	rds->debug = debug;
+	rds->verbose = verbose;
+	rds->force_rbds = force_rbds;
+	rds->time_constant_us = time_constant_us;
+	
+	/* Restore callbacks */
+	rds->group_callback = group_callback;
+	rds->group_callback_arg = group_callback_arg;
+	
+	/* Restore file handles */
+	rds->hexrds_file = hexrds_file;
+	rds->bitstream_file = bitstream_file;
+	
+	/* Restore filter state */
+	rds->filter_2400_i = filter_2400_i;
+	rds->filter_2400_q = filter_2400_q;
+	rds->filter_pll = filter_pll;
+	rds->agc_gain = agc_gain;
+	rds->agc_alpha = agc_alpha;
+	rds->freq_subcarrier = freq_subcarrier;
+	rds->status_interval = status_interval;
+	rds->signal_debug_interval = signal_debug_interval;
+	
+	/* Re-initialize decoder-specific defaults */
+	rds->ert_dec.chartable = RDS_ERT_CHARTABLE_DEFAULT;
+	rds->paging_dec.timeout_sec = RDS_PAGING_DEFAULT_TIMEOUT;
+	
+	/* BER Init */
+	for (int i = 0; i < BER_WINDOW_SIZE; i++)
+		rds->ber_history[i] = 1.0f;
+	rds->ber_accumulator = (double)BER_WINDOW_SIZE;
+	rds->ber_percent = 100.0;
+	
+	/* Initialize status to NONE */
+	rds->pi_status = RDS_STATUS_NONE;
+	rds->pty_status = RDS_STATUS_NONE;
+	rds->tp_status = RDS_STATUS_NONE;
+	rds->ta_status = RDS_STATUS_NONE;
+	memset(rds->ps_status, RDS_STATUS_NONE, sizeof(rds->ps_status));
+	memset(rds->rt_status, RDS_STATUS_NONE, sizeof(rds->rt_status));
+	rds->ecc_status = RDS_STATUS_NONE;
+	rds->language_status = RDS_STATUS_NONE;
+	rds->pin_status = RDS_STATUS_NONE;
+	rds->ct_status = RDS_STATUS_NONE;
+	memset(rds->ptyn_status, RDS_STATUS_NONE, sizeof(rds->ptyn_status));
+	rds->rt_display_version = 0xFF;
+	memset(rds->ptyn, ' ', 8);
+	rds->ptyn[8] = '\0';
+	memset(rds->on_ps, ' ', 8);
+	rds->on_ps[8] = '\0';
+	
+	if (verbose)
+		LOGP(DRADIO, LOGL_INFO, "RDS decoder reset (new station)\n");
+}
+
 /* Feed a single decoded bit into the RDS decoder sync state machine.
  * This bypasses the DSP/PLL/biphase stages and feeds directly into
  * the block synchronizer + group decoder.
@@ -8612,13 +8713,13 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 								} else {
 									/* FEC failed */
 									if (valid_syndrome) {
-										if (rds->debug)
-											LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c wrong offset (expected %c got %c) reg=%07X\n",
-											     'A'+rds->block_idx, 'A'+rds->block_idx, 'A'+offset, rds->shift_reg);
+										LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c wrong offset (expected %c got %c) reg=%07X freq=%.2f clk_off=%.4f phase=%.2f\n",
+										     'A'+rds->block_idx, 'A'+rds->block_idx, 'A'+offset, rds->shift_reg,
+										     rds->freq_subcarrier, rds->clock_offset, fmod(rds->phase_subcarrier, 2*M_PI));
 									} else {
-										if (rds->debug)
-											LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c no valid syndrome, FEC failed, reg=%07X\n",
-											     'A'+rds->block_idx, rds->shift_reg);
+										LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c no valid syndrome, FEC failed, reg=%07X freq=%.2f clk_off=%.4f phase=%.2f bit_in_blk=%d\n",
+										     'A'+rds->block_idx, rds->shift_reg,
+										     rds->freq_subcarrier, rds->clock_offset, fmod(rds->phase_subcarrier, 2*M_PI), rds->bit_count_in_block);
 									}
 									rds->errors++;
 									rds->blocks_bad++;
@@ -8722,6 +8823,22 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		     rds->sig_block_miss[2], rds->sig_block_miss[3],
 		     rds->sig_block_wrongoff);
 		*/
+		
+		/* Timing drift debug - always log this */
+		{
+			int total_blocks = rds->sig_blocks_ok_period + rds->sig_blocks_fec_period + rds->sig_blocks_bad_period;
+			double bit_rate = rds->sig_bits_period / (rds->signal_debug_interval / rds->samplerate);
+			double dump_rate = rds->sig_dump_count / (rds->signal_debug_interval / rds->samplerate);
+			(void)total_blocks;
+			LOGP(DRADIO, LOGL_NOTICE, "RDS TIMING: freq=%.3f Hz (drift=%.3f) clk_off=%.6f | "
+			     "dumps=%ld (%.1f/s, expect 2375) bits=%d (%.2f bps, expect 1187.5) | ok=%d fec=%d bad=%d | BER=%.1f%%\n",
+			     rds->freq_subcarrier, rds->freq_subcarrier - 57000.0,
+			     rds->clock_offset,
+			     rds->sig_dump_count, dump_rate,
+			     rds->sig_bits_period, bit_rate,
+			     rds->sig_blocks_ok_period, rds->sig_blocks_fec_period, rds->sig_blocks_bad_period,
+			     rds->ber_percent);
+		}
 		
 		/* Reset period counters */
 		rds->signal_debug_timer = 0;

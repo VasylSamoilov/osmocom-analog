@@ -73,10 +73,34 @@ static const char *tx_audiodev = NULL;
 static const char *rx_audiodev = NULL;
 static enum modulation modulation = MODULATION_NONE;
 static int rx = 0, tx = 0;
-static double bandwidth_am = 4500.0;
-static double bandwidth_fm = 15000.0;
-static double bandwidth = 0.0;
-static double deviation = 75000.0;
+/* Audio bandwidth defaults (Hz) - NOT RF/signal bandwidth.
+ * FM broadcast audio: 30 Hz - 15 kHz (matches 50/75µs pre-emphasis curve).
+ *
+ * Carson's Rule: BW = 2 * (Δf + fm)
+ *   where Δf = peak deviation (75 kHz), fm = max modulating freq
+ *
+ * Our variables map to Carson's Rule as:
+ *   Δf = deviation (75000 Hz)
+ *   fm = bandwidth_fm (15000 Hz) for mono, or baseband extent for stereo/RDS
+ *   signal_bandwidth = Δf + fm (one-sided), used for filter/sample rate calc
+ *
+ * Theoretical vs practical RF bandwidth:
+ *   Mono:   2*(75k+15k) = 180 kHz — fits 200 kHz channel
+ *   Stereo: 2*(75k+53k) = 256 kHz — theoretical, but fits 200 kHz
+ *   RDS:    2*(75k+60k) = 270 kHz — theoretical, but fits 200 kHz
+ *
+ * Real-world FM+RDS fits in 200 kHz because:
+ *   - RDS at 57 kHz is only ~5% injection level (low energy)
+ *   - High-frequency sidebands fall off rapidly
+ *   - Carson's Rule is worst-case; actual spectrum is narrower
+ *
+ * We use the theoretical values for signal_bandwidth to ensure our
+ * filters and sample rates capture the full baseband spectrum.
+ */
+static double bandwidth_am = 4500.0;	/* AM audio bandwidth (Hz) */
+static double bandwidth_fm = 15000.0;	/* FM audio bandwidth (Hz) */
+static double bandwidth = 0.0;		/* User-specified audio bandwidth override */
+static double deviation = 75000.0;	/* FM deviation (Hz), ±75kHz for broadcast */
 static double modulation_index = 1.0;
 static double time_constant_us = 50.0;
 static double volume = 1.0;
@@ -113,6 +137,7 @@ typedef struct {
 	rds_server_t *xdr_srv;
 	rds_server_t *rdsspy_srv;
 	rds_server_t *asciig_srv;
+	radio_t *radio;
 } rds_callback_ctx_t;
 
 /* Tune callback for XDR-GTK (RX side): retunes the SDR receiver */
@@ -120,6 +145,18 @@ static void radio_tune_cb(int freq_khz, void *arg)
 {
 	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
 	double freq_hz = freq_khz * 1000.0;
+
+	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
+	if (rds && ctx->radio) {
+		if (ctx->radio->rds_dec.blocks_ok > 0) {
+			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz, last known RDS data:\n",
+			     frequency / 1e6);
+			rds_decoder_status(&ctx->radio->rds_dec);
+		} else {
+			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz (no valid RDS blocks received)\n",
+			     frequency / 1e6);
+		}
+	}
 
 	LOGP(DRADIO, LOGL_NOTICE, "Re-tuning SDR RX to %d kHz\n", freq_khz);
 
@@ -136,6 +173,10 @@ static void radio_tune_cb(int freq_khz, void *arg)
 	/* Clear stale measurements from previous frequency */
 	if (meter)
 		signal_meter_reset(meter);
+
+	/* Reset RDS decoder for new station */
+	if (rds && ctx->radio)
+		rds_decoder_reset(&ctx->radio->rds_dec);
 
 	/* Update spectral measurement for new frequency */
 	sdr_spectral_set_center(freq_hz);
@@ -183,7 +224,19 @@ static void radio_tx_tune_cb(int freq_khz, void *arg)
 /* Rigctl callbacks */
 static int rigctl_set_rx_freq(double freq_hz, void *arg)
 {
-	(void)arg;
+	radio_t *r = (radio_t *)arg;
+
+	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
+	if (rds && r) {
+		if (r->rds_dec.blocks_ok > 0) {
+			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz, last known RDS data:\n",
+			     frequency / 1e6);
+			rds_decoder_status(&r->rds_dec);
+		} else {
+			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz (no valid RDS blocks received)\n",
+			     frequency / 1e6);
+		}
+	}
 
 	LOGP(DRADIO, LOGL_NOTICE, "Rigctl: Re-tuning SDR RX to %.0f Hz\n", freq_hz);
 
@@ -197,6 +250,10 @@ static int rigctl_set_rx_freq(double freq_hz, void *arg)
 	/* Clear stale measurements */
 	if (meter)
 		signal_meter_reset(meter);
+
+	/* Reset RDS decoder for new station */
+	if (rds && r)
+		rds_decoder_reset(&r->rds_dec);
 
 	/* Update spectral measurement */
 	sdr_spectral_set_center(freq_hz);
@@ -241,9 +298,30 @@ static void rds_group_callback(const uint16_t blocks[4], const uint8_t status[4]
 	if (ctx->xdr_srv) {
 		rds_server_send_group(ctx->xdr_srv, blocks, status);
 		/* XDR-GTK needs explicit PI messages to drive its rds_timeout counter.
-		 * Send P<XXXX> for every group where block A is usable (error < uncorrectable). */
-		if (status[0] < RDS_ERR_UNCORR)
-			rds_server_send_pi(ctx->xdr_srv, blocks[0], status[0]);
+		 * Send P<XXXX> for every group where block A is usable (error < uncorrectable).
+		 * Map RDS_STATUS_* + BER to XDR-GTK error levels:
+		 *   RDS_STATUS_ERROR -> 3 (severe, ⁇)
+		 *   RDS_STATUS_CORRECTED + BER > 10% -> 2 (moderate, visible ?)
+		 *   RDS_STATUS_CORRECTED + BER <= 10% -> 1 (minor, faint ?)
+		 *   RDS_STATUS_VALID + BER >= 50% -> 2 (moderate, visible ?)
+		 *   RDS_STATUS_VALID + BER > 20% -> 1 (minor, faint ?)
+		 *   RDS_STATUS_VALID + BER <= 20% -> 0 (no error indicator) */
+		if (status[0] < RDS_ERR_UNCORR) {
+			int err_level = 0;
+			double ber = (ctx->radio) ? ctx->radio->rds_dec.ber_percent : 0.0;
+			if (status[0] == RDS_STATUS_ERROR) {
+				err_level = 3;
+			} else if (status[0] == RDS_STATUS_CORRECTED) {
+				err_level = (ber > 10.0) ? 2 : 1;
+			} else {
+				/* RDS_STATUS_VALID */
+				if (ber >= 50.0)
+					err_level = 2;
+				else if (ber > 20.0)
+					err_level = 1;
+			}
+			rds_server_send_pi(ctx->xdr_srv, blocks[0], err_level);
+		}
 	}
 	if (ctx->rdsspy_srv)
 		rds_server_send_group(ctx->rdsspy_srv, blocks, status);
@@ -842,7 +920,7 @@ int main(int argc, char *argv[])
 	rigctl_server_t rigctl_srv;
 	int xdr_enabled = 0, rdsspy_enabled = 0, uecp_enabled = 0, asciig_enabled = 0;
 	int rigctl_enabled = 0;
-	rds_callback_ctx_t rds_cb_ctx = { NULL, NULL, NULL };
+	rds_callback_ctx_t rds_cb_ctx = { NULL, NULL, NULL, NULL };
 
 	loglevel = LOGL_NOTICE;
 	logging_init();
@@ -1154,7 +1232,7 @@ int main(int argc, char *argv[])
 			.set_tx_freq = rigctl_set_tx_freq,
 			.get_rx_freq = rigctl_get_rx_freq,
 			.get_tx_freq = rigctl_get_tx_freq,
-			.arg = NULL
+			.arg = &radio
 		};
 		rigctl_server_set_callbacks(&rigctl_srv, &rigctl_cb);
 		rigctl_enabled = 1;
@@ -1166,6 +1244,7 @@ int main(int argc, char *argv[])
 		rds_cb_ctx.xdr_srv = xdr_enabled ? &xdr_srv : NULL;
 		rds_cb_ctx.rdsspy_srv = rdsspy_enabled ? &rdsspy_srv : NULL;
 		rds_cb_ctx.asciig_srv = NULL;
+		rds_cb_ctx.radio = &radio;
 		rds_decoder_set_group_callback(&radio.rds_dec, rds_group_callback, &rds_cb_ctx);
 	}
 

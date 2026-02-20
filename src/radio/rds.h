@@ -2390,6 +2390,9 @@ int rds_dec_get_rt(rds_decoder_t *rds, char *rt);
 /* Print decoder status (PI, PS, RT, BER) */
 void rds_decoder_status(rds_decoder_t *rds);
 
+/* Reset decoder state for new station (clears PI, PS, RT, stats, keeps DSP config) */
+void rds_decoder_reset(rds_decoder_t *rds);
+
 /* ============================================================
  * RT+ and eRT Decoder API
  * ============================================================ */
