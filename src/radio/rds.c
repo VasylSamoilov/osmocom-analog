@@ -3143,13 +3143,13 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 	total_samples_processed += num;
 	
 	/* Debug: log bit consumption for diagnostics */
-	{
+	if (rds->debug) {
 		static unsigned long last_report_samples = 0;
 		static unsigned long last_report_bits = 0;
 		if (total_samples_processed - last_report_samples >= rds->samplerate) {
 			double elapsed_sec = (total_samples_processed - last_report_samples) / rds->samplerate;
 			double bit_rate = (total_bits_consumed - last_report_bits) / elapsed_sec;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS ENC TIMING: bit_phase=%.6f bit_phasestep=%.9f | "
+			LOGP(DRADIO, LOGL_DEBUG, "RDS ENC TIMING: bit_phase=%.6f bit_phasestep=%.9f | "
 			     "bits=%lu (%.2f bps, expect 1187.5) | samples=%lu\n",
 			     rds->bit_phase, rds->bit_phasestep,
 			     total_bits_consumed - last_report_bits, bit_rate,
@@ -8453,13 +8453,8 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 	int i;
 	const double PLL_BETA = 0.02 * (250000.0 / rds->samplerate); /* Normalized Costas gain */
 	const double FC_TOLERANCE = 12.0;
-	const double SUBCARRIER_BITRATE_RATIO = 48.0;
 	
-	int decimate = (int)(rds->samplerate / 7125.0);
-	if (decimate < 1) decimate = 1;
-	
-	/* Phase step per sample for 57k (free running part) */
-	/* Actually we update phase by freq_subcarrier */
+	/* Phase step per sample for 57k subcarrier PLL */
 	double pll_step_base = 2.0 * M_PI / rds->samplerate;
 	
 	for (i = 0; i < num; i++) {
@@ -8527,52 +8522,43 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 			rds->sig_pll_err_sum += abs_err;
 		}
 		
-		/* Update PLL */
+		/* Update PLL (for subcarrier tracking only, not bit clock) */
 		rds->phase_subcarrier -= PLL_BETA * d_phi_sc;
 		rds->freq_subcarrier  -= 0.5 * PLL_BETA * d_phi_sc;
 		
-		/* Debug PLL (every 1000 samples) */
-		
-		// if ((int)rds->status_timer % 1000 == 0) {
-		// 	LOGP(DRADIO, LOGL_DEBUG, "RDS PLL: freq=%.2f err=%.6f bb_i=%.4f bb_q=%.4f\n", rds->freq_subcarrier, err, bb_i, bb_q);
-		// }
-		
+		/* Clamp subcarrier freq */
+		if (rds->freq_subcarrier > 57000.0 + FC_TOLERANCE) rds->freq_subcarrier = 57000.0 + FC_TOLERANCE;
+		if (rds->freq_subcarrier < 57000.0 - FC_TOLERANCE) rds->freq_subcarrier = 57000.0 - FC_TOLERANCE;
 
-		/* 4. Decimation & Symbol Processing */
-		if (++rds->decimate_counter >= decimate) {
-			rds->decimate_counter = 0;
-			
-			/* Clamp Freq */
-			if (rds->freq_subcarrier > 57000.0 + FC_TOLERANCE) rds->freq_subcarrier = 57000.0 + FC_TOLERANCE;
-			if (rds->freq_subcarrier < 57000.0 - FC_TOLERANCE) rds->freq_subcarrier = 57000.0 - FC_TOLERANCE;
-			
-			/* 5. Clock Recovery (Derived) */
-			/* Directly divide the monotonic subcarrier phase */
-			double clock_phi = (rds->phase_subcarrier / SUBCARRIER_BITRATE_RATIO) + rds->clock_offset;
-			clock_phi = fmod(clock_phi, 2.0 * M_PI);
-			if (clock_phi < 0) clock_phi += 2.0 * M_PI;
-			
-			int lo_clock = (clock_phi < M_PI) ? 1 : -1;
-			
-			/* 6. Alignment (Zero-Crossing) */
-			int curr_sign = (bb_i >= 0) ? 1 : -1;
-			int prev_sign = (rds->prev_bb_sample >= 0) ? 1 : -1;
-			
-			if (curr_sign != prev_sign) {
-				/* Crossed zero. Check phase. */
-				double d_cphi = fmod(clock_phi, M_PI); /* dist from 0 or PI */
-				if (d_cphi >= M_PI/2.0) d_cphi -= M_PI; /* -PI/2 .. +PI/2 */
-				
-				/* Nudge offset to align edge to zero crossing */
-				rds->clock_offset -= 0.005 * d_cphi;
-				rds->sig_zc_count++;
-			}
-			rds->prev_bb_sample = bb_i;
-			
-			/* 7. Integrate */
+		/* 4. Bit Clock Recovery (SDRangel approach)
+		 * Use direct 1187.5 Hz oscillator, NOT derived from subcarrier.
+		 * This eliminates PLL drift accumulation that caused bit rate errors. */
+		rds->clock_phi += (2.0 * M_PI * RDS_BITRATE) / rds->samplerate;
+		
+		/* Clock phase recovery: align to baseband zero crossings */
+		int curr_sign = (bb_i >= 0) ? 1 : -1;
+		int prev_sign = (rds->prev_bb_sample >= 0) ? 1 : -1;
+		
+		if (curr_sign != prev_sign) {
+			/* Crossed zero. Nudge clock to align edge to zero crossing */
+			double d_cphi = fmod(rds->clock_phi, M_PI);
+			if (d_cphi >= M_PI / 2.0) d_cphi -= M_PI;
+			rds->clock_phi -= 0.005 * d_cphi;
+			rds->sig_zc_count++;
+		}
+		
+		rds->clock_phi = fmod(rds->clock_phi, 2.0 * M_PI);
+		if (rds->clock_phi < 0) rds->clock_phi += 2.0 * M_PI;
+		
+		int lo_clock = (rds->clock_phi < M_PI) ? 1 : -1;
+		rds->prev_bb_sample = bb_i;
+
+		/* 5. Decimation & Symbol Processing (decimate by 8 like SDRangel) */
+		if (++rds->decimate_counter % 8 == 0) {
+			/* Integrate & dump */
 			rds->integrator += bb_i * lo_clock;
 			
-			/* 8. Dump on clock edge */
+			/* Dump on clock edge */
 			if (lo_clock != rds->prev_clock_bit) {
 				/* Track integrator dump values */
 				{
@@ -8713,14 +8699,18 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 								} else {
 									/* FEC failed */
 									if (valid_syndrome) {
-										LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c wrong offset (expected %c got %c) reg=%07X freq=%.2f clk_off=%.4f phase=%.2f\n",
-										     'A'+rds->block_idx, 'A'+rds->block_idx, 'A'+offset, rds->shift_reg,
-										     rds->freq_subcarrier, rds->clock_offset, fmod(rds->phase_subcarrier, 2*M_PI));
-									} else {
-										LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c no valid syndrome, FEC failed, reg=%07X freq=%.2f clk_off=%.4f phase=%.2f bit_in_blk=%d\n",
+										if (rds->debug) {
+									LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c wrong offset (expected %c got %c) reg=%07X freq=%.2f clk_phi=%.4f\n",
+									     'A'+rds->block_idx, 'A'+rds->block_idx, 'A'+offset, rds->shift_reg,
+									     rds->freq_subcarrier, rds->clock_phi);
+								}
+								} else {
+									if (rds->debug) {
+										LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c no valid syndrome, FEC failed, reg=%07X freq=%.2f clk_phi=%.4f bit_in_blk=%d\n",
 										     'A'+rds->block_idx, rds->shift_reg,
-										     rds->freq_subcarrier, rds->clock_offset, fmod(rds->phase_subcarrier, 2*M_PI), rds->bit_count_in_block);
+										     rds->freq_subcarrier, rds->clock_phi, rds->bit_count_in_block);
 									}
+								}
 									rds->errors++;
 									rds->blocks_bad++;
 									rds->blocks_missing[rds->block_idx]++;
@@ -8799,9 +8789,9 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		     rds->sig_bb_q_peak, avg_bb_q,
 		     (avg_bb_q > 0) ? avg_bb_i / avg_bb_q : 0.0);
 		LOGP(DRADIO, LOGL_DEBUG, "RDS PLL: freq=%.2f Hz | err peak=%.6f avg=%.8f | "
-		     "clock_offset=%.4f | frame=%d flips=%d | locked=%d pwr=%.2e\n",
+		     "clock_phi=%.4f | frame=%d flips=%d | locked=%d pwr=%.2e\n",
 		     rds->freq_subcarrier, rds->sig_pll_err_peak, avg_pll_err,
-		     rds->clock_offset, rds->reading_frame, rds->sig_frame_flips,
+		     rds->clock_phi, rds->reading_frame, rds->sig_frame_flips,
 		     rds->pll_locked, rds->agc_gain);
 		LOGP(DRADIO, LOGL_DEBUG, "RDS DEMOD: integrator peak=%.4f avg=%.4f | "
 		     "dumps=%ld | bits=%d (%.1f bps) | zc_rate=%.1f Hz | synced=%d BER=%.1f%%\n",
@@ -8824,16 +8814,16 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		     rds->sig_block_wrongoff);
 		*/
 		
-		/* Timing drift debug - always log this */
-		{
+		/* Timing drift debug - gated by --rds-debug */
+		if (rds->debug) {
 			int total_blocks = rds->sig_blocks_ok_period + rds->sig_blocks_fec_period + rds->sig_blocks_bad_period;
 			double bit_rate = rds->sig_bits_period / (rds->signal_debug_interval / rds->samplerate);
 			double dump_rate = rds->sig_dump_count / (rds->signal_debug_interval / rds->samplerate);
 			(void)total_blocks;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS TIMING: freq=%.3f Hz (drift=%.3f) clk_off=%.6f | "
+			LOGP(DRADIO, LOGL_DEBUG, "RDS TIMING: freq=%.3f Hz (drift=%.3f) clk_phi=%.6f | "
 			     "dumps=%ld (%.1f/s, expect 2375) bits=%d (%.2f bps, expect 1187.5) | ok=%d fec=%d bad=%d | BER=%.1f%%\n",
 			     rds->freq_subcarrier, rds->freq_subcarrier - 57000.0,
-			     rds->clock_offset,
+			     rds->clock_phi,
 			     rds->sig_dump_count, dump_rate,
 			     rds->sig_bits_period, bit_rate,
 			     rds->sig_blocks_ok_period, rds->sig_blocks_fec_period, rds->sig_blocks_bad_period,

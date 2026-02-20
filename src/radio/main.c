@@ -81,8 +81,8 @@ static int rx = 0, tx = 0;
  *
  * Our variables map to Carson's Rule as:
  *   Δf = deviation (75000 Hz)
- *   fm = bandwidth_fm (15000 Hz) for mono, or baseband extent for stereo/RDS
- *   signal_bandwidth = Δf + fm (one-sided), used for filter/sample rate calc
+ *   fm = bandwidth_fm (15000 Hz) for mono, or highest subcarrier for stereo/RDS
+ *   baseband_extent = Δf + fm (one-sided max freq), RF bandwidth = 2x this
  *
  * Theoretical vs practical RF bandwidth:
  *   Mono:   2*(75k+15k) = 180 kHz — fits 200 kHz channel
@@ -94,7 +94,7 @@ static int rx = 0, tx = 0;
  *   - High-frequency sidebands fall off rapidly
  *   - Carson's Rule is worst-case; actual spectrum is narrower
  *
- * We use the theoretical values for signal_bandwidth to ensure our
+ * We use the theoretical values for baseband_extent to ensure our
  * filters and sample rates capture the full baseband spectrum.
  */
 static double bandwidth_am = 4500.0;	/* AM audio bandwidth (Hz) */
@@ -204,6 +204,20 @@ static void radio_scan_cb(int freq_khz, void *arg)
 
 	/* Update spectral center for scan retune */
 	sdr_spectral_set_center(freq_hz);
+}
+
+/* Setting callback for XDR-GTK: handles B (stereo/mono) and other settings */
+static void radio_setting_cb(const char *name, int val, void *arg)
+{
+	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
+
+	if (!ctx || !ctx->radio)
+		return;
+
+	if (name[0] == 'B') {
+		/* B0 = auto stereo, B1 = forced mono */
+		radio_set_forced_mono(ctx->radio, val != 0);
+	}
 }
 
 static void radio_tx_tune_cb(int freq_khz, void *arg)
@@ -968,29 +982,27 @@ int main(int argc, char *argv[])
 			bandwidth = bandwidth_am;
 	}
 
-	/* Calculate signal_bandwidth (RF passband)
-	 * Used for channelizer rate calculation and rigctl passband reporting */
-	double signal_bw = 0;
+	/* Calculate baseband_extent (max baseband frequency, one-sided)
+	 * Used for channelizer rate calculation before radio_init.
+	 * After radio_init, use radio.baseband_extent instead. */
+	double baseband_extent = 0;
 	if (modulation == MODULATION_FM) {
 		double audio_bw = bandwidth;
 		/* FM broadcast with stereo/RDS needs more bandwidth */
 		if (rds || rds2) audio_bw = 60000.0;
 		else if (stereo) audio_bw = 53000.0;
-		signal_bw = deviation + audio_bw;
-	} else if (modulation == MODULATION_AM_DSB) {
-		/* AM DSB: both sidebands, but signal_bandwidth is just bandwidth */
-		signal_bw = bandwidth;
+		baseband_extent = deviation + audio_bw;
 	} else {
-		/* AM SSB (USB/LSB): single sideband */
-		signal_bw = bandwidth;
+		/* AM: baseband_extent = audio bandwidth */
+		baseband_extent = bandwidth;
 	}
 
 	/* Auto-calculate optimal input rate if channelizer is used */
 	if (use_channelizer && channelizer_rate == 0) {
 		if (sdr_config) {
-			input_samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, signal_bw);
-			printf("Channelizer: Auto-selected input rate %d Hz for %.1f kHz signal bandwidth (from SDR %d Hz)\n", 
-			       input_samplerate, signal_bw / 1000.0, sdr_config->samplerate);
+			input_samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, baseband_extent);
+			printf("Channelizer: Auto-selected input rate %d Hz for %.1f kHz baseband extent (from SDR %d Hz)\n", 
+			       input_samplerate, baseband_extent / 1000.0, sdr_config->samplerate);
 		}
 	}
 
@@ -1183,7 +1195,7 @@ int main(int argc, char *argv[])
 		}
 		rigctl_server_set_mode_flags(&rigctl_srv, tx, rx);
 		rigctl_server_set_frequency(&rigctl_srv, frequency, frequency);
-		rigctl_server_set_modulation(&rigctl_srv, modulation, (int)(2.0 * signal_bw), deviation, modulation_index);
+		rigctl_server_set_modulation(&rigctl_srv, modulation, (int)radio.rf_bandwidth, deviation, modulation_index);
 		rigctl_server_set_flags(&rigctl_srv, stereo, rds);
 		rigctl_server_set_radio(&rigctl_srv, &radio);
 		rigctl_server_set_meter(&rigctl_srv, meter);
@@ -1250,7 +1262,7 @@ int main(int argc, char *argv[])
 
 	/* Wire tune callback into XDR-GTK and RDS-Spy servers (RX tuner control) */
 	if (xdr_enabled)
-		rds_server_set_callbacks(&xdr_srv, radio_tune_cb, NULL, &rds_cb_ctx);
+		rds_server_set_callbacks(&xdr_srv, radio_tune_cb, radio_setting_cb, &rds_cb_ctx);
 	if (rdsspy_enabled)
 		rds_server_set_callbacks(&rdsspy_srv, radio_tune_cb, NULL, &rds_cb_ctx);
 	/* Wire tune callback into ASCII-G server (TX tuner control) */
@@ -1379,10 +1391,11 @@ int main(int argc, char *argv[])
 			/* Feed signal level to XDR-GTK for periodic S reports */
 			if (xdr_enabled) {
 				double sig = signal_meter_get_level_dbf(meter);
-				int is_stereo = radio.stereo && radio.rx_pilot_locked;
+				int is_stereo = radio.stereo && radio.rx_pilot_locked && !radio.rx_forced_mono;
 				rds_server_update_signal(&xdr_srv,
 					(sig > SIGNAL_METER_NO_VALUE) ? sig : -100.0,
-					is_stereo);
+					is_stereo,
+					radio.rx_pilot_mag_avg);
 			}
 
 			/* Feed signal level to rigctl server */

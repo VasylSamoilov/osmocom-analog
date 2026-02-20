@@ -778,7 +778,7 @@ static void cmd_dump_state(rigctl_server_t *srv, rigctl_client_t *c)
 	tx_write_str(c, "0xef 1\n");
 	tx_write_str(c, "0 0\n");
 
-	/* Filter presets */
+	/* Filter presets - report actual bandwidth for current mode */
 	tx_write_str(c, "0x82 500\n");   /* CW normal */
 	tx_write_str(c, "0x82 200\n");   /* CW narrow */
 	tx_write_str(c, "0x82 2000\n");  /* CW wide */
@@ -788,9 +788,14 @@ static void cmd_dump_state(rigctl_server_t *srv, rigctl_client_t *c)
 	tx_write_str(c, "0x0c 2700\n");  /* SSB normal */
 	tx_write_str(c, "0x0c 1400\n");  /* SSB narrow */
 	tx_write_str(c, "0x0c 3900\n");  /* SSB wide */
-	tx_write_str(c, "0x40 160000\n"); /* WFM normal */
-	tx_write_str(c, "0x40 120000\n"); /* WFM narrow */
-	tx_write_str(c, "0x40 200000\n"); /* WFM wide */
+	/* WFM: report actual rf_bandwidth if available, else typical values */
+	if (srv->radio && srv->radio->rf_bandwidth > 0) {
+		tx_printf(c, "0x40 %d\n", (int)srv->radio->rf_bandwidth);
+	} else {
+		tx_write_str(c, "0x40 200000\n"); /* WFM normal */
+		tx_write_str(c, "0x40 150000\n"); /* WFM narrow */
+		tx_write_str(c, "0x40 270000\n"); /* WFM wide (stereo+RDS) */
+	}
 	tx_write_str(c, "0 0\n");
 
 	/* max_rit, max_xit, max_ifshift */
@@ -1021,11 +1026,17 @@ static void cmd_get_vfo_list(rigctl_client_t *c)
 }
 
 /* \get_modes - Get supported modes with bandwidths */
-static void cmd_get_modes(rigctl_client_t *c)
+static void cmd_get_modes(rigctl_server_t *srv, rigctl_client_t *c)
 {
+	/* Report filter bandwidths for each mode.
+	 * For WFM, report actual rf_bandwidth if available. */
 	tx_write_str(c, "AM 10000 6000 3000\n");
 	tx_write_str(c, "FM 15000 10000 7000\n");
-	tx_write_str(c, "WFM 200000 160000 120000\n");
+	if (srv->radio && srv->radio->rf_bandwidth > 0) {
+		tx_printf(c, "WFM %d\n", (int)srv->radio->rf_bandwidth);
+	} else {
+		tx_write_str(c, "WFM 270000 200000 150000\n");
+	}
 	tx_write_str(c, "USB 3000 2400 1800\n");
 	tx_write_str(c, "LSB 3000 2400 1800\n");
 }
@@ -1209,7 +1220,7 @@ static void process_command(rigctl_server_t *srv, rigctl_client_t *c,
 		return;
 	}
 	if (strcmp(args[0], "\\get_modes") == 0) {
-		cmd_get_modes(c);
+		cmd_get_modes(srv, c);
 		return;
 	}
 	if (strcmp(args[0], "\\get_dcd") == 0) {

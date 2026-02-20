@@ -2112,8 +2112,8 @@ typedef struct rds_decoder {
 	double		agc_gain;		/* Current AGC gain */
 	double		agc_alpha;		/* AGC smoothing constant */
 	
-	/* Clock Recovery (Subcarrier-locked) */
-	double		clock_offset;		/* Phase offset for 1187.5 Hz clock */
+	/* Clock Recovery (direct 1187.5 Hz oscillator) */
+	double		clock_phi;		/* Bit clock phase (0..2π) */
 	int		prev_clock_bit;		/* Previous clock level (+1/-1) */
 	double		prev_bb_sample;		/* Previous baseband sample (for zero cross) */
 	double		integrator;		/* Integrate-and-dump accumulator */

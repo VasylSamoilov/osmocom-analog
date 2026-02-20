@@ -29,6 +29,7 @@ bin_PROGRAMS += \
 
 osmoradio_SOURCES = \
 	radio.c \
+	audio_debug.c \
 	sca.c \
 	rds_protocol.c \
 	rigctl_server.c \

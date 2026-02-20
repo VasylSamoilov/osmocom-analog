@@ -700,10 +700,11 @@ void rds_server_set_callbacks(rds_server_t *srv,
 	srv->cb_arg = arg;
 }
 
-void rds_server_update_signal(rds_server_t *srv, double dbm, int stereo)
+void rds_server_update_signal(rds_server_t *srv, double dbm, int stereo, double pilot_mag)
 {
 	srv->signal_dbm = dbm;
 	srv->stereo = stereo;
+	srv->pilot_mag = pilot_mag;
 }
 
 /* ============================================================
@@ -966,8 +967,21 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		}
 		break;
 		
+	case 'B':  /* Stereo/Mono mode: B0=auto, B1=forced mono */
+		if (*arg) {
+			int val = atoi(arg);
+			srv->forced_mono = (val != 0);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: %s\n", xdr_cmd_fmt(c, val, arg));
+			tx_printf(srv, "B%d\n", val);
+			
+			/* Notify callback */
+			if (srv->setting_cb) {
+				srv->setting_cb("B", val, srv->cb_arg);
+			}
+		}
+		break;
+		
 	case 'A':  /* AGC */
-	case 'B':  /* Stereo/Mono mode */
 	case 'D':  /* De-emphasis */
 	case 'F':  /* Bandwidth filter */
 	case 'G':  /* RF/IF gain (XDR-GTK) or iMS/cEQ (TEF6686/fm-dx-webserver) */
@@ -1072,9 +1086,15 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
 		break;
 
 	case 'N':
-		/* Stereo pilot test request — reply N0 (no pilot injection) */
-		LOGP(DRADIO, LOGL_INFO, "XDR-GTK: N (pilot test), reply: N0\n");
-		tx_write_str(srv, "N0\n");
+		/* Stereo pilot test request — reply N<level> in 0.1 kHz units */
+		{
+			/* pilot_mag is true injection level (0.1 = 10% = 7.5 kHz).
+			 * Convert to 0.1 kHz units: mag * 75 kHz * 10 */
+			int pilot_level = (int)(srv->pilot_mag * 75.0 * 10.0 + 0.5);
+			LOGP(DRADIO, LOGL_INFO, "XDR-GTK: N (pilot test), reply: N%d (%.1f kHz)\n",
+			     pilot_level, pilot_level / 10.0);
+			tx_printf(srv, "N%d\n", pilot_level);
+		}
 		break;
 
 	case 'S':
@@ -2812,7 +2832,7 @@ int rds_server_poll(rds_server_t *srv)
 	if (srv->proto == RDS_PROTO_XDR_GTK && srv->signal_interval_ms > 0 && !srv->scan_active) {
 		now = time_us();
 		if (now - srv->last_signal_us >= srv->signal_interval_ms * 1000LL) {
-			rds_server_send_signal(srv, srv->signal_dbm, srv->stereo, 0);
+			rds_server_send_signal(srv, srv->signal_dbm, srv->stereo, srv->forced_mono);
 			srv->last_signal_us = now;
 		}
 	}

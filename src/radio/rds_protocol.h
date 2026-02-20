@@ -485,6 +485,8 @@ typedef struct rds_server {
 	int		deemphasis;		/* 0=50µs (EU), 1=75µs (US), -1=unknown */
 	double		signal_dbm;
 	int		stereo;
+	int		forced_mono;		/* B1=forced mono, B0=auto stereo */
+	double		pilot_mag;		/* pilot magnitude (0.0-1.0, normalized to deviation) */
 	int		signal_interval_ms;
 	int64_t		last_signal_us;
 	
@@ -608,7 +610,7 @@ void rds_server_send_freq(rds_server_t *srv, int freq_khz);
 void rds_server_send_reset(rds_server_t *srv);
 
 /* Update signal state for periodic reporting. */
-void rds_server_update_signal(rds_server_t *srv, double dbm, int stereo);
+void rds_server_update_signal(rds_server_t *srv, double dbm, int stereo, double pilot_mag);
 
 /* Set callbacks (XDR-GTK). */
 void rds_server_set_callbacks(rds_server_t *srv,

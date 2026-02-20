@@ -31,6 +31,7 @@
 #include "radio.h"
 #include "rds_tables.h"
 #include "../libfm/fm.h"
+#include "audio_debug.h"
 
 #define CLIP_POINT	0.85
 #define DC_CUTOFF	30.0 // Wikipedia: UKW-Rundfunk
@@ -40,9 +41,10 @@
 #define PHASE_ERROR_TOLERANCE	3.0	/* ITU-R BS.450-4 S2.2.2.5: +/-3deg */
 #define PHASE_ERROR_AVG_SAMPLES	10000	/* samples to average for phase error */
 
-/* Stereo pilot lock/unlock thresholds (fraction of full-scale FM baseband).
- * A real 19 kHz pilot at 8% deviation reads ~0.08 after FM demod normalisation.
- * Lock above LOCK_THR, unlock below UNLOCK_THR (~12 dB hysteresis).
+/* Stereo pilot lock/unlock thresholds (fraction of full-scale FM deviation).
+ * pilot_mag represents true injection level: 0.1 = 10% = 7.5 kHz deviation.
+ * Standard broadcast pilot is 8-10% (6-7.5 kHz). Lock above LOCK_THR,
+ * unlock below UNLOCK_THR (~6 dB hysteresis).
  *
  * Acquisition/loss require the signal to be continuously in-range for
  * PILOT_ACQUIRE_S / PILOT_LOSS_S seconds before the state changes.
@@ -50,8 +52,8 @@
  * IEC 62106 / ITU-R BS.450 consumer practice: 50–200 ms each direction.
  *
  * COOLDOWN_S: minimum hold time after any transition (prevents re-entry). */
-#define PILOT_LOCK_THR		0.02	/* acquire: pilot must stay above this  */
-#define PILOT_UNLOCK_THR	0.01	/* loss:    pilot must stay below this  */
+#define PILOT_LOCK_THR		0.04	/* acquire: pilot must stay above this (~3 kHz) */
+#define PILOT_UNLOCK_THR	0.02	/* loss:    pilot must stay below this (~1.5 kHz) */
 #define PILOT_ACQUIRE_S		0.2	/* 200 ms continuous above thr to lock  */
 #define PILOT_LOSS_S		0.2	/* 200 ms continuous below thr to unlock */
 #define PILOT_COOLDOWN_S	0.1	/* seconds before next transition allowed */
@@ -1228,6 +1230,12 @@ void radio_set_polyphase(int enable)
 	use_polyphase_resampler = enable;
 }
 
+void radio_set_forced_mono(radio_t *radio, int forced)
+{
+	radio->rx_forced_mono = forced;
+	LOGP(DRADIO, LOGL_INFO, "Forced mono: %s\n", forced ? "ON" : "OFF");
+}
+
 int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int rds_force_rbds)
 {
 	int rc = -EINVAL;
@@ -1347,42 +1355,50 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	radio->signal_samplerate = samplerate;
 	radio->audio_bandwidth = bandwidth;	/* Audio passband (Hz), e.g. 15kHz for FM */
 
-	/* Calculate RF signal_bandwidth based on modulation type.
-	 * FM: signal_bandwidth = deviation + baseband_extent
+	/* Initialize audio quality debug tracking */
+	audio_debug_init(&g_rx_debug, 5.0);
+
+	/* Calculate baseband_extent based on modulation type.
+	 * This is the max frequency in baseband (one-sided). RF bandwidth = 2x this.
+	 * FM: baseband_extent = deviation + highest_subcarrier
 	 *   - Mono:   deviation + audio_bw (75k + 15k = 90 kHz)
 	 *   - Stereo: deviation + 53k (pilot 19k + L-R up to 53k)
 	 *   - RDS:    deviation + 60k (RDS subcarrier at 57k ± 2.4k)
 	 *   - RDS2:   deviation + 80k (additional subcarriers)
 	 *   - SCA:    deviation + 67k/92k/100k (subsidiary carriers)
-	 * AM: signal_bandwidth = audio_bandwidth (single/double sideband) */
+	 * AM: baseband_extent = audio_bandwidth */
 	switch (radio->modulation) {
 	case MODULATION_FM:
 		radio->fm_deviation = deviation;
-		radio->signal_bandwidth = deviation + bandwidth;
+		radio->baseband_extent = deviation + bandwidth;
 		if (radio->stereo) {
-			radio->signal_bandwidth = deviation + 53000.0;  /* stereo L-R extends to 53 kHz */
+			radio->baseband_extent = deviation + 53000.0;  /* stereo L-R extends to 53 kHz */
 			radio->audio_bandwidth = STEREO_BW;
 		}
 		if (radio->rds)
-			radio->signal_bandwidth = deviation + 60000.0;  /* RDS at 57 kHz ± 2.4 kHz */
+			radio->baseband_extent = deviation + 60000.0;  /* RDS at 57 kHz ± 2.4 kHz */
 		if (radio->rds2)
-			radio->signal_bandwidth = deviation + 80000.0;  /* RDS2 additional subcarriers */
+			radio->baseband_extent = deviation + 80000.0;  /* RDS2 additional subcarriers */
 		/* SCA extends bandwidth further */
 		if (radio->sca_67k)
-			radio->signal_bandwidth = deviation + 75000.0;  /* SCA at 67 kHz */
+			radio->baseband_extent = deviation + 75000.0;  /* SCA at 67 kHz */
 		if (radio->sca_92k)
-			radio->signal_bandwidth = deviation + 100000.0; /* SCA at 92 kHz */
+			radio->baseband_extent = deviation + 100000.0; /* SCA at 92 kHz */
 		break;
 	case MODULATION_AM_DSB:
 	case MODULATION_AM_USB:
 	case MODULATION_AM_LSB:
 		/* level is 1.0, which is full amplitude */
-		radio->signal_bandwidth = bandwidth;
+		radio->baseband_extent = bandwidth;
 		break;
 	case MODULATION_NONE:
 		LOGP(DRADIO, LOGL_ERROR, "Wrong modulation, please fix!\n");
 		goto error;
 	}
+
+	/* Derive RF bandwidth and required sample rate from baseband_extent */
+	radio->rf_bandwidth = 2.0 * radio->baseband_extent;
+	radio->required_samplerate = radio->rf_bandwidth / 0.75;  /* 25% filter margin */
 
 	if (tx_wave_file) {
 		/* open wave file */
@@ -1510,10 +1526,12 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			goto error;
 		}
 	}
-	if (radio->signal_samplerate < radio->signal_bandwidth * 2 / 0.75) {
+	if (radio->signal_samplerate < radio->required_samplerate) {
 		rc = -EINVAL;
-		LOGP(DRADIO, LOGL_ERROR, "You have selected a signal processing sample rate of %.0f. Your signal's bandwidth %.0f.\n", radio->signal_samplerate, radio->signal_bandwidth);
-		LOGP(DRADIO, LOGL_ERROR, "Your signal processing sample rate must be at least one third greater than the signal's double bandwidth. Use at least %.0f.\n", radio->signal_bandwidth * 2.0 / 0.75);
+		LOGP(DRADIO, LOGL_ERROR, "Signal sample rate %.0f Hz too low for %.0f kHz RF bandwidth.\n",
+		     radio->signal_samplerate, radio->rf_bandwidth / 1000.0);
+		LOGP(DRADIO, LOGL_ERROR, "Need at least %.0f Hz sample rate (Nyquist + 33%% filter margin).\n",
+		     radio->required_samplerate);
 		goto error;
 	}
 
@@ -1627,7 +1645,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		rc = fm_mod_init(&radio->fm_mod, radio->signal_samplerate, 0.0, 1.0);
 		if (rc < 0)
 			goto error;
-		rc = fm_demod_init(&radio->fm_demod, radio->signal_samplerate, 0.0, 2 * radio->signal_bandwidth);
+		rc = fm_demod_init(&radio->fm_demod, radio->signal_samplerate, 0.0, radio->rf_bandwidth);
 		if (rc < 0)
 			goto error;
 		if (stereo) {
@@ -1718,7 +1736,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			rc = am_mod_init(&radio->am_mod, radio->signal_samplerate, 0.0, gain, bias);
 			if (rc < 0)
 				goto error;
-			rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->signal_bandwidth, 1.0 / modulation_index);
+			rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->baseband_extent, 1.0 / modulation_index);
 			if (rc < 0)
 				goto error;
 		}
@@ -1738,7 +1756,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		rc = am_mod_init(&radio->am_mod, radio->signal_samplerate, 0.0, 1.0, 0.0);
 		if (rc < 0)
 			goto error;
-		rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->signal_bandwidth, 16.0);
+		rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->baseband_extent, 16.0);
 		if (rc < 0)
 			goto error;
 		break;
@@ -1747,7 +1765,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		rc = am_mod_init(&radio->am_mod, radio->signal_samplerate, 0.0, 1.0, 0.0);
 		if (rc < 0)
 			goto error;
-		rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->signal_bandwidth, 16.0);
+		rc = am_demod_init(&radio->am_demod, radio->signal_samplerate, 0.0, radio->baseband_extent, 16.0);
 		if (rc < 0)
 			goto error;
 		break;
@@ -1761,7 +1779,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	if (radio->rx_audio_mode)
 		LOGP(DRADIO, LOGL_INFO, "Bandwidth of audio sink is %.0f Hz.\n", radio->rx_audio_samplerate / 2.0);
 	LOGP(DRADIO, LOGL_INFO, "Bandwidth of audio signal is %.0f Hz.\n", radio->audio_bandwidth);
-	LOGP(DRADIO, LOGL_INFO, "Bandwidth of modulated signal is %.0f Hz.\n", radio->signal_bandwidth);
+	LOGP(DRADIO, LOGL_INFO, "RF bandwidth is %.0f kHz (baseband extent %.0f kHz, min samplerate %.0f Hz).\n",
+	     radio->rf_bandwidth / 1000.0, radio->baseband_extent / 1000.0, radio->required_samplerate);
 	if (radio->tx_audio_mode)
 		LOGP(DRADIO, LOGL_INFO, "Sample rate of audio source is %.0f Hz.\n", radio->tx_audio_samplerate);
 	if (radio->rx_audio_mode)
@@ -2312,6 +2331,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		}
 
 		clipper_process(signal_samples[0], signal_num);
+		
 		if (radio->stereo) {
 			if (radio->emphasis) {
 				/* Use TX-only filters for pre-emphasis */
@@ -2500,11 +2520,28 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 	samples[1] = radio->rx_signal_buffer + radio->signal_buffer_size;
 	samples[2] = radio->rx_signal_buffer + radio->signal_buffer_size * 2;
 
+	/* DEBUG: Track raw SDR IQ levels (baseband is interleaved I/Q floats) */
+	{
+		double peak_iq = 0;
+		for (i = 0; i < signal_num * 2; i++) {
+			double v = fabs(baseband[i]);
+			if (v > peak_iq) peak_iq = v;
+		}
+		/* Store in samples[2] temporarily for stage tracking */
+		for (i = 0; i < signal_num && i < 1000; i++)
+			samples[2][i] = sqrt(baseband[i*2] * baseband[i*2] + baseband[i*2+1] * baseband[i*2+1]);
+		audio_debug_stage(&g_rx_debug, RX_STAGE_SDR_RAW, samples[2], (signal_num < 1000) ? signal_num : 1000);
+	}
+
 	switch (radio->modulation) {
 	case MODULATION_FM:
 		fm_demodulate_complex(&radio->fm_demod, samples[0], signal_num, baseband, radio->I_buffer, radio->Q_buffer);
 		for (i = 0; i < signal_num; i++)
 			samples[0][i] /= radio->fm_deviation;
+		
+		/* DEBUG: Track levels after FM demod */
+		audio_debug_stage(&g_rx_debug, RX_STAGE_FM_DEMOD, samples[0], signal_num);
+		
 		/* Decode RDS from FM baseband if enabled */
 		if (radio->rds || radio->rds2) {
 			/* Pass pilot phase WITH phase offset compensation (same as stereo decoder)
@@ -2586,7 +2623,9 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			iir_process(&radio->rx_lp_pilot_Q, samples[2], signal_num);
 			double Q_end = samples[2][signal_num - 1];
 			
-			double pilot_mag = sqrt(I_end * I_end + Q_end * Q_end);
+			/* Quadrature demodulation gives half amplitude due to sin²(x) = (1-cos(2x))/2.
+			 * Multiply by 2 to get true pilot injection level (0.1 = 10% = 7.5 kHz). */
+			double pilot_mag = 2.0 * sqrt(I_end * I_end + Q_end * Q_end);
 
 			/* IIR-smooth pilot magnitude (~100ms time constant).
 			 * alpha = block_size / (TC_s * samplerate) clamped to [0,1].
@@ -2688,9 +2727,13 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			iir_process(&radio->rx_lp_sum, samples[0], signal_num);
 			iir_process(&radio->rx_lp_diff, samples[1], signal_num);
 
-			/* If pilot not locked, zero the diff channel → mono fallback.
+			/* DEBUG: Track levels after stereo decode */
+			audio_debug_stage(&g_rx_debug, RX_STAGE_STEREO_DECODE, samples[0], signal_num);
+			audio_debug_stage(&g_rx_debug, RX_STAGE_STEREO_DECODE, samples[1], signal_num);
+
+			/* If pilot not locked or forced mono, zero the diff channel → mono fallback.
 			 * The L/R matrix below produces L=R=sum, clean mono output. */
-			if (!radio->rx_pilot_locked) {
+			if (!radio->rx_pilot_locked || radio->rx_forced_mono) {
 				for (i = 0; i < signal_num; i++)
 					samples[1][i] = 0.0;
 			}
@@ -2717,6 +2760,10 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 				}
 			}
 		}
+		/* DEBUG: Track levels after de-emphasis */
+		audio_debug_stage(&g_rx_debug, RX_STAGE_DEEMPHASIS, samples[0], signal_num);
+		if (radio->stereo)
+			audio_debug_stage(&g_rx_debug, RX_STAGE_DEEMPHASIS, samples[1], signal_num);
 		break;
 	case MODULATION_AM_DSB:
 		am_demodulate_complex(&radio->am_demod, samples[0], signal_num, baseband, radio->I_buffer, radio->Q_buffer, radio->carrier_buffer);
@@ -2741,16 +2788,29 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		audio_num = polyphase_resample(&radio->rx_polyphase[0], samples[0], signal_num, out_left, radio->audio_buffer_size);
 		samples[0] = out_left;
 		
+		/* DEBUG: Track resampling ratio */
+		audio_debug_resample(&g_rx_debug, signal_num, audio_num, 
+		                     radio->rx_audio_samplerate / radio->signal_samplerate);
+		
 		if (radio->stereo) {
 			polyphase_resample(&radio->rx_polyphase[1], samples[1], signal_num, out_right, radio->audio_buffer_size);
 			samples[1] = out_right;
 		}
 	} else {
 		audio_num = samplerate_downsample(&radio->rx_resampler[0], samples[0], signal_num);
+		
+		/* DEBUG: Track resampling ratio */
+		audio_debug_resample(&g_rx_debug, signal_num, audio_num,
+		                     radio->rx_audio_samplerate / radio->signal_samplerate);
+		
 		if (radio->stereo)
 			samplerate_downsample(&radio->rx_resampler[1], samples[1], signal_num);
 	}
 
+	/* DEBUG: Track levels after resampling */
+	audio_debug_stage(&g_rx_debug, RX_STAGE_RESAMPLE, samples[0], audio_num);
+	if (radio->stereo)
+		audio_debug_stage(&g_rx_debug, RX_STAGE_RESAMPLE, samples[1], audio_num);
 
 	/* dampen volume */
 	if (radio->volume != 1.0) {
@@ -2770,13 +2830,15 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		}
 	}
 	if (radio->stereo && radio->rx_audio_channels == 2) {
-		/* stereo from differential */
+		/* stereo from differential 
+		 * L = (sum + diff) / 2, R = (sum - diff) / 2
+		 * This ensures output stays within [-1, 1] when inputs are normalized */
 		double sum, diff;
 		for (i = 0; i < audio_num; i++) {
 			sum = samples[0][i];
 			diff = samples[1][i];
-			samples[0][i] = sum + diff / 2.0;
-			samples[1][i] = sum - diff / 2.0;
+			samples[0][i] = (sum + diff) / 2.0;
+			samples[1][i] = (sum - diff) / 2.0;
 		}
 	}
 	if (!radio->stereo && radio->rx_audio_channels == 2) {
@@ -2784,6 +2846,14 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		for (i = 0; i < audio_num; i++)
 			samples[1][i] = samples[0][i];
 	}
+
+	/* DEBUG: Track final audio output levels */
+	audio_debug_stage(&g_rx_debug, RX_STAGE_AUDIO_OUT, samples[0], audio_num);
+	if (radio->stereo && radio->rx_audio_channels == 2)
+		audio_debug_stage(&g_rx_debug, RX_STAGE_AUDIO_OUT, samples[1], audio_num);
+	
+	/* DEBUG: Periodic report */
+	audio_debug_report(&g_rx_debug);
 
 	/* display wave */
 	display_wave(&radio->dispwav[0], samples[0], audio_num, 1.0);

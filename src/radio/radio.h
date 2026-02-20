@@ -6,6 +6,7 @@
 #include "../libcompandor/compandor.h"
 #include "rds.h"
 #include "sca.h"
+#include "audio_debug.h"
 
 enum modulation {
 	MODULATION_NONE = 0,
@@ -57,7 +58,9 @@ typedef struct radio {
 	dispwav_t	dispwav[2];		/* display wave form */
 	/* signal stage */
 	double		signal_samplerate;
-	double		signal_bandwidth;
+	double		baseband_extent;	/* max baseband freq (one-sided), e.g. 135 kHz for FM+RDS */
+	double		rf_bandwidth;		/* full RF bandwidth = 2 * baseband_extent */
+	double		required_samplerate;	/* min sample rate = rf_bandwidth / 0.75 (filter margin) */
 	samplerate_t	tx_resampler[2];	/* resampling from audio rate to signal rate (two channels) */
 	samplerate_t	rx_resampler[2];	/* resampling from signal rate to audi rate (two channels) */
 	polyphase_t	tx_polyphase[2];	/* polyphase resampler TX (optional) */
@@ -85,6 +88,7 @@ typedef struct radio {
 	double		rx_pilot_mag;		/* pilot tone magnitude (0=no signal, ~0.1 on lock) */
 	double		rx_pilot_mag_avg;	/* IIR-smoothed pilot magnitude for threshold decisions */
 	int		rx_pilot_locked;	/* 1 = pilot locked, 0 = mono fallback */
+	int		rx_forced_mono;		/* 1 = force mono (B1 command), 0 = auto */
 	double		rx_pilot_cooldown;	/* samples until next lock state change allowed */
 	double		rx_pilot_above_samples;	/* samples continuously above LOCK_THR   */
 	double		rx_pilot_below_samples;	/* samples continuously below UNLOCK_THR */
@@ -122,6 +126,8 @@ int radio_rx(radio_t *radio, float *baseband, int num);
 /* RDS preset switching (press 'f' to cycle) */
 void rds_next_preset(radio_t *radio);
 
+/* Force mono mode (B1 command from XDR-GTK) */
+void radio_set_forced_mono(radio_t *radio, int forced);
 
 void radio_set_callsign(const char *callsign);
 void radio_set_pi(uint16_t pi);
