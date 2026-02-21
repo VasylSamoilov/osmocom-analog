@@ -1057,6 +1057,25 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
+	/* Keep SDR direction flags in sync with radio app direction flags.
+	 * Without this, --rx / --tx still leaves the opposite SDR path enabled,
+	 * which breaks RX-only SDRs (e.g. RTL-SDR) and needlessly initializes
+	 * TX-side radio components in receive-only mode. */
+	if (rx && !tx) {
+		if (sdr_config->tx_only) {
+			fprintf(stderr, "Conflicting options: --rx cannot be combined with --sdr-tx-only\n");
+			exit(0);
+		}
+		sdr_config->rx_only = 1;
+	}
+	if (tx && !rx) {
+		if (sdr_config->rx_only) {
+			fprintf(stderr, "Conflicting options: --tx cannot be combined with --sdr-rx-only\n");
+			exit(0);
+		}
+		sdr_config->tx_only = 1;
+	}
+
 	/* now we have buffer size and sample rate 
 	 * buffer size is proportional to INPUT sample rate (SDR rate)
 	 */
@@ -1389,8 +1408,9 @@ int main(int argc, char *argv[])
 		if (rigctl_enabled)
 			rigctl_server_poll(&rigctl_srv);
 		
-		got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
+		got = 0;
 		if (rx) {
+			got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
 			/* Feed raw IQ into scan engine if active (FFT-based, no retuning needed
 			 * unless scan range exceeds SDR bandwidth) */
 			if (xdr_enabled && xdr_srv.scan_active)
@@ -1402,6 +1422,8 @@ int main(int argc, char *argv[])
 
 			/* Feed IQ into signal meter for time-domain RMS */
 			signal_meter_feed_iq(meter, sendbuff, got);
+			/* Use last known SNR estimate for stereo quieting heuristics in radio_rx(). */
+			radio_set_rx_snr(&radio, signal_meter_get_snr(meter));
 
 			got = radio_rx(&radio, sendbuff, got);
 			if (got < 0)
@@ -1424,6 +1446,8 @@ int main(int argc, char *argv[])
 				if (ss && ss->rx.valid)
 					signal_meter_set_noise_floor(meter, ss->rx.noise_floor_db);
 			}
+			/* Refresh SNR after FFT/noise updates for next RX iteration. */
+			radio_set_rx_snr(&radio, signal_meter_get_snr(meter));
 
 			/* Feed signal level to XDR-GTK for periodic S reports */
 			if (xdr_enabled) {
@@ -1445,35 +1469,36 @@ int main(int argc, char *argv[])
 			/* CPU update (self-throttles to ~1/sec via internal wall-clock check) */
 			signal_meter_update_cpu(meter);
 		}
-		tosend = sdr_get_tosend(sdr, buffer_size);
+		
+		/* TX processing - only if TX mode is enabled */
+		if (tx) {
+			tosend = sdr_get_tosend(sdr, buffer_size);
 #if 0 /* TX debug logging - uncomment to enable */
-		int tosend_raw = tosend;
+			int tosend_raw = tosend;
 #endif
-		if (tosend > buffer_size / 10)
-			tosend = buffer_size / 10;
-		if (tosend == 0) {
-			continue;
-		}
+			if (tosend > buffer_size / 10)
+				tosend = buffer_size / 10;
+			if (tosend == 0) {
+				continue;
+			}
 #if 0 /* TX debug logging - uncomment to enable */
-		/* Log main loop buffer sizes periodically (~1/sec) */
-		if (++main_loop_dbg_cnt >= 333) {
-			LOGP(DRADIO, LOGL_DEBUG, "Main loop: buffer_size=%d tosend_raw=%d tosend_capped=%d (cap=%d) got=%d\n",
-			     buffer_size, tosend_raw, tosend, buffer_size / 10, got);
-			main_loop_dbg_cnt = 0;
-		}
+			/* Log main loop buffer sizes periodically (~1/sec) */
+			if (++main_loop_dbg_cnt >= 333) {
+				LOGP(DRADIO, LOGL_DEBUG, "Main loop: buffer_size=%d tosend_raw=%d tosend_capped=%d (cap=%d) got=%d\n",
+				     buffer_size, tosend_raw, tosend, buffer_size / 10, got);
+				main_loop_dbg_cnt = 0;
+			}
 #endif
-		/* perform radio modulation */
-		if (tx)
+			/* perform radio modulation */
 			tosend = radio_tx(&radio, sendbuff, tosend);
-		else
-			memset(sendbuff, 0, tosend * sizeof(*sendbuff) * 2);
-		if (tosend <= 0) {
-			if (tosend < 0)
-				break;
-			continue; /* radio_tx returned 0: no audio to process, skip SDR write */
+			if (tosend <= 0) {
+				if (tosend < 0)
+					break;
+				continue; /* radio_tx returned 0: no audio to process, skip SDR write */
+			}
+			/* write to SDR */
+			sdr_write(sdr, (void *)sendbuff, NULL, tosend, NULL, NULL, 0);
 		}
-		/* write to SDR */
-		sdr_write(sdr, (void *)sendbuff, NULL, tosend, NULL, NULL, 0);
 
 		/* process keyboard input */
 next_char:

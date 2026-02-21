@@ -111,7 +111,7 @@ void sdr_config_print_help(void)
 	printf("    --sdr-timestamps 1 | 0\n");
 	printf("        Use TX timestamps on UHD device. (default = %d)\n", sdr_config->timestamps);
 	printf("\nSplit device options (mutually exclusive with unified options above):\n");
-	printf("    --sdr-tx-device <args>\n");
+	printf("    --sdr-tx-device-args <args>\n");
 	printf("        TX SDR device arguments (enables split mode)\n");
 	printf("    --sdr-tx-samplerate <rate>\n");
 	printf("        TX sample rate\n");
@@ -119,7 +119,7 @@ void sdr_config_print_help(void)
 	printf("        TX IF bandwidth\n");
 	printf("    --sdr-tx-lo-offset <Hz>\n");
 	printf("        TX LO frequency offset\n");
-	printf("    --sdr-rx-device <args>\n");
+	printf("    --sdr-rx-device-args <args>\n");
 	printf("        RX SDR device arguments (enables split mode)\n");
 	printf("    --sdr-rx-samplerate <rate>\n");
 	printf("        RX sample rate\n");
@@ -262,11 +262,11 @@ void sdr_config_add_options(void)
 	option_add(OPT_SDR_SWAP_LINKS, "sdr-swap-links", 0);
 	option_add(OPT_SDR_TIMESTAMPS, "sdr-timestamps", 1);
 	/* Split device options */
-	option_add(OPT_SDR_TX_DEVICE, "sdr-tx-device", 1);
+	option_add(OPT_SDR_TX_DEVICE, "sdr-tx-device-args", 1);
 	option_add(OPT_SDR_TX_SAMPLERATE, "sdr-tx-samplerate", 1);
 	option_add(OPT_SDR_TX_BANDWIDTH, "sdr-tx-bandwidth", 1);
 	option_add(OPT_SDR_TX_LO_OFFSET, "sdr-tx-lo-offset", 1);
-	option_add(OPT_SDR_RX_DEVICE, "sdr-rx-device", 1);
+	option_add(OPT_SDR_RX_DEVICE, "sdr-rx-device-args", 1);
 	option_add(OPT_SDR_RX_SAMPLERATE, "sdr-rx-samplerate", 1);
 	option_add(OPT_SDR_RX_BANDWIDTH, "sdr-rx-bandwidth", 1);
 	option_add(OPT_SDR_RX_LO_OFFSET, "sdr-rx-lo-offset", 1);
@@ -536,26 +536,90 @@ int sdr_configure(int samplerate)
 	}
 	/* rpitx is TX-only: force tx_only mode in unified mode */
 	if (sdr_config->rpitx && !sdr_config->split_mode) {
+		LOGP(DSDR, LOGL_NOTICE, "rpitx driver: forcing TX-only mode\n");
 		sdr_config->tx_only = 1;
 	}
 #endif
 
 	/* tx_only and rx_only are mutually exclusive */
 	if (sdr_config->tx_only && sdr_config->rx_only) {
+		LOGP(DSDR, LOGL_ERROR, "Cannot use --sdr-tx-only and --sdr-rx-only together\n");
 		fprintf(stderr, "Cannot use --sdr-tx-only and --sdr-rx-only together\n");
 		exit(0);
 	}
 
-	/* tx_only/rx_only cannot be combined with split_mode */
-	if ((sdr_config->tx_only || sdr_config->rx_only) && sdr_config->split_mode) {
-		fprintf(stderr, "Cannot combine --sdr-tx-only/--sdr-rx-only with --sdr-tx-device/--sdr-rx-device\n");
-		exit(0);
+	/* tx_only/rx_only cannot be combined with split_mode when using separate TX/RX devices.
+	 * However, we allow rx_only with rx-specific driver (e.g., --sdr-rx-soapy) and
+	 * tx_only with tx-specific driver (e.g., --sdr-tx-soapy) since that's a valid use case
+	 * for RX-only or TX-only SDR devices like RTL-SDR. */
+	if (sdr_config->split_mode) {
+		/* Check if we have actual split devices (both TX and RX specified) */
+		int have_tx_device = sdr_config->tx_device_args || sdr_config->tx_uhd || sdr_config->tx_soapy
+#ifdef HAVE_RPITX
+			|| sdr_config->tx_rpitx
+#endif
+			;
+		int have_rx_device = sdr_config->rx_device_args || sdr_config->rx_uhd || sdr_config->rx_soapy;
+		
+		/* Only error if trying to use tx_only/rx_only with actual split TX+RX devices */
+		if (sdr_config->tx_only && have_tx_device && have_rx_device) {
+			LOGP(DSDR, LOGL_ERROR, "Cannot combine --sdr-tx-only with both TX and RX device specifications\n");
+			fprintf(stderr, "Cannot combine --sdr-tx-only with both TX and RX device specifications\n");
+			exit(0);
+		}
+		if (sdr_config->rx_only && have_tx_device && have_rx_device) {
+			LOGP(DSDR, LOGL_ERROR, "Cannot combine --sdr-rx-only with both TX and RX device specifications\n");
+			fprintf(stderr, "Cannot combine --sdr-rx-only with both TX and RX device specifications\n");
+			exit(0);
+		}
+		
+		/* If rx_only with only RX driver specified, convert to unified mode for simplicity */
+		if (sdr_config->rx_only && have_rx_device && !have_tx_device) {
+			/* This is valid: RX-only with RX-specific driver like RTL-SDR */
+			LOGP(DSDR, LOGL_NOTICE, "RX-only mode: converting to unified mode with RX driver\n");
+			sdr_config->split_mode = 0;
+			/* Copy RX settings to unified settings */
+			if (sdr_config->rx_device_args &&
+			    (!sdr_config->device_args || sdr_config->device_args[0] == '\0'))
+				sdr_config->device_args = sdr_config->rx_device_args;
+			if (sdr_config->rx_soapy) {
+				sdr_config->soapy = 1;
+				sdr_config->rx_soapy = 0;
+			}
+			if (sdr_config->rx_uhd) {
+				sdr_config->uhd = 1;
+				sdr_config->rx_uhd = 0;
+			}
+			sdr_config->rx_device_args = NULL;
+		}
+		/* If tx_only with only TX driver specified, convert to unified mode for simplicity */
+		if (sdr_config->tx_only && have_tx_device && !have_rx_device) {
+			/* This is valid: TX-only with TX-specific driver */
+			LOGP(DSDR, LOGL_NOTICE, "TX-only mode: converting to unified mode with TX driver\n");
+			sdr_config->split_mode = 0;
+			/* Copy TX settings to unified settings */
+			if (sdr_config->tx_device_args &&
+			    (!sdr_config->device_args || sdr_config->device_args[0] == '\0'))
+				sdr_config->device_args = sdr_config->tx_device_args;
+			if (sdr_config->tx_soapy) {
+				sdr_config->soapy = 1;
+				sdr_config->tx_soapy = 0;
+			}
+			if (sdr_config->tx_uhd) {
+				sdr_config->uhd = 1;
+				sdr_config->tx_uhd = 0;
+			}
+#ifdef HAVE_RPITX
+			sdr_config->tx_rpitx = 0;
+#endif
+			sdr_config->tx_device_args = NULL;
+		}
 	}
 
 	/* Per-device split options require split_mode */
 	if (!sdr_config->split_mode) {
 		if (sdr_config->tx_channel_given || sdr_config->rx_channel_given) {
-			fprintf(stderr, "Option --sdr-tx-channel/--sdr-rx-channel requires split device mode (--sdr-tx-device/--sdr-rx-device)\n");
+			fprintf(stderr, "Option --sdr-tx-channel/--sdr-rx-channel requires split device mode (--sdr-tx-device-args/--sdr-rx-device-args)\n");
 			exit(0);
 		}
 		if (sdr_config->tx_stream_args || sdr_config->rx_stream_args) {
@@ -610,7 +674,7 @@ int sdr_configure(int samplerate)
 
 	/* Check mutual exclusivity: unified vs split mode */
 	if (sdr_config->split_mode && sdr_config->device_args[0] != '\0') {
-		fprintf(stderr, "Cannot use --sdr-device-args with --sdr-tx-device or --sdr-rx-device (mutually exclusive)\n");
+		fprintf(stderr, "Cannot use --sdr-device-args with --sdr-tx-device-args or --sdr-rx-device-args (mutually exclusive)\n");
 		exit(0);
 	}
 
@@ -623,11 +687,11 @@ int sdr_configure(int samplerate)
 			;
 		int have_rx = sdr_config->rx_device_args || sdr_config->rx_uhd || sdr_config->rx_soapy;
 		if (!have_tx && !have_rx) {
-			fprintf(stderr, "Split mode requires at least --sdr-tx-device/--sdr-tx-uhd/--sdr-tx-soapy"
+			fprintf(stderr, "Split mode requires at least --sdr-tx-device-args/--sdr-tx-uhd/--sdr-tx-soapy"
 #ifdef HAVE_RPITX
 				"/--sdr-tx-rpitx"
 #endif
-				" or --sdr-rx-device/--sdr-rx-uhd/--sdr-rx-soapy\n");
+				" or --sdr-rx-device-args/--sdr-rx-uhd/--sdr-rx-soapy\n");
 			exit(0);
 		}
 		/* Set empty device args if not specified (for auto-detect) */

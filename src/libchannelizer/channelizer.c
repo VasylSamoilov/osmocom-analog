@@ -86,10 +86,25 @@ static double create_filter_chain(channelizer_t *ch,
 		best_space = space_upper;
 	}
 
-	/* Check if we should add another stage */
+	/* Check if we should add another stage.
+	 * Continue if:
+	 * 1. We haven't hit max stages
+	 * 2. Signal band is valid
+	 * 3. Channel band is valid
+	 * 4. EITHER the channel fits well (best_space >= chan_bw/8)
+	 *    OR the signal bandwidth is still larger than channel bandwidth
+	 *    (we need more decimation to reach target rate)
+	 */
+	int need_more_decimation = (sig_bw > chan_bw * 1.5);  /* Still need to decimate */
+	int channel_fits = (best_space >= chan_bw / 8.0);
+	
+	fprintf(stderr, "  Stage %d: sig=[%.0f,%.0f] chan=[%.0f,%.0f] best_mode=%d best_space=%.0f need_more=%d fits=%d\n",
+	        ch->num_stages, sig_start, sig_end, chan_start, chan_end, 
+	        best_mode, best_space, need_more_decimation, channel_fits);
+	
 	if (ch->num_stages < CHANNELIZER_MAX_STAGES &&
 	    sig_start < sig_end && chan_start < chan_end &&
-	    best_space >= chan_bw / 8.0) {
+	    (channel_fits || need_more_decimation)) {
 
 		halfband_mode_t mode;
 		double new_sig_start, new_sig_end;
@@ -172,6 +187,14 @@ int channelizer_init_order(channelizer_t *ch, int input_rate,
 
 	/* Create filter chain */
 	half_rate = (double)input_rate / 2.0;
+	
+	fprintf(stderr, "Channelizer init: input=%d output=%d center=%d\n", 
+	        input_rate, output_rate, center_freq);
+	fprintf(stderr, "  Signal band: %.0f to %.0f Hz\n", -half_rate, half_rate);
+	fprintf(stderr, "  Channel band: %.0f to %.0f Hz (bw=%.0f)\n",
+	        (double)center_freq - chan_bw / 2.0,
+	        (double)center_freq + chan_bw / 2.0, chan_bw);
+	
 	offset = create_filter_chain(ch,
 	                             -half_rate, half_rate,
 	                             (double)center_freq - chan_bw / 2.0,
@@ -182,6 +205,9 @@ int channelizer_init_order(channelizer_t *ch, int input_rate,
 	ch->decimation = 1 << ch->num_stages;
 	ch->output_rate = input_rate / ch->decimation;
 	ch->center_offset = (int)round(offset);
+
+	fprintf(stderr, "  Created %d stages, decimation=%d, center_offset=%d Hz\n",
+	        ch->num_stages, ch->decimation, ch->center_offset);
 
 	return 0;
 }

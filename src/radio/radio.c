@@ -28,6 +28,7 @@
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "../libclipper/clipper.h"
+#include "../libsdr/sdr_config.h"
 #include "radio.h"
 #include "rds_tables.h"
 #include "../libfm/fm.h"
@@ -57,6 +58,48 @@
 #define PILOT_ACQUIRE_S		0.2	/* 200 ms continuous above thr to lock  */
 #define PILOT_LOSS_S		0.2	/* 200 ms continuous below thr to unlock */
 #define PILOT_COOLDOWN_S	0.1	/* seconds before next transition allowed */
+/* Noise-aware stereo blend cap.
+ * Strong L-R energy relative to L+R often correlates with stereo hiss in quiet
+ * passages; cap blend there to improve perceived quieting like FM receivers. */
+#define STEREO_QUALITY_LOW	1.2
+#define STEREO_QUALITY_HIGH	3.0
+#define STEREO_BLEND_CAP_MIN	0.10
+/* Additional cap from RF SNR estimate (dB). */
+#define SNR_FORCE_MONO_DB	14.0
+#define SNR_BLEND_LOW_DB	20.0
+#define SNR_BLEND_HIGH_DB	38.0
+/* Keep floor effectively disabled; mono-like quieting is preferred unless
+ * signal quality is truly exceptional. */
+#define SNR_CAP_FLOOR_DB	80.0
+#define SNR_CAP_FLOOR_VALUE	0.95
+/* Content-cap is only trusted in very poor SNR conditions. */
+#define CONTENT_CAP_ENABLE_MAX_SNR_DB	14.0
+/* Stereo side-channel HF suppression (receiver-style hiss reduction):
+ * only the high-band of L-R is attenuated based on SNR. */
+#define STEREO_DIFF_LOW_BW	3500.0
+#define STEREO_HF_GAIN_MIN	0.40
+#define STEREO_HF_GAIN_LOW_DB	28.0
+#define STEREO_HF_GAIN_HIGH_DB	42.0
+/* Apply HF attenuation mostly on quiet passages (where hiss is audible). */
+#define STEREO_QUIET_RMS_LOW	0.12
+#define STEREO_QUIET_RMS_HIGH	0.45
+#define STEREO_HF_GAIN_TC_FALL_S 0.35
+#define STEREO_HF_GAIN_TC_RISE_S 1.20
+/* Mild post-deemphasis audio HF shaping to reduce gritty/harsh texture
+ * that can remain in both mono and stereo with noisy SDR front-ends. */
+#define RX_OUTPUT_HICUT_BW	13500.0
+/* Smooth stereo control to avoid audible "pulsation":
+ * - cap: fast reduction on bad quality, slow recovery
+ * - blend: fast collapse to mono, slower stereo return */
+#define STEREO_CAP_TC_FALL_S	0.12
+#define STEREO_CAP_TC_RISE_S	0.90
+#define STEREO_BLEND_TC_FALL_S	0.08
+#define STEREO_BLEND_TC_RISE_S	0.35
+/* AFC stabilization:
+ * - deadband prevents chasing tiny/noisy offsets
+ * - slew limit prevents runaway on weak/noisy stations */
+#define AFC_DEADBAND_HZ		15.0
+#define AFC_MAX_SLEW_HZ_PER_S	1200.0
 
 /* ============================================================
  * RDS Preset Configuration System
@@ -1236,6 +1279,13 @@ void radio_set_forced_mono(radio_t *radio, int forced)
 	LOGP(DRADIO, LOGL_INFO, "Forced mono: %s\n", forced ? "ON" : "OFF");
 }
 
+void radio_set_rx_snr(radio_t *radio, double snr_db)
+{
+	if (!radio)
+		return;
+	radio->rx_input_snr_db = snr_db;
+}
+
 /* AFC control functions */
 void radio_afc_enable(radio_t *radio, int enable)
 {
@@ -1389,6 +1439,16 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	radio->volume = volume;
 	radio->clip_level = clip_level;
 	radio->stereo = stereo;
+	radio->rx_noise_blend_cap = 1.0;
+	radio->rx_input_snr_db = -1.0;
+	radio->rx_blend_quality = 0.0;
+	radio->rx_blend_cap_content = 1.0;
+	radio->rx_blend_cap_snr = 1.0;
+	radio->rx_blend_cap_floor = 0.0;
+	radio->rx_stereo_hf_gain = 1.0;
+	radio->rx_diag_sum_rms = 0.0;
+	radio->rx_diag_diff_rms_pre = 0.0;
+	radio->rx_diag_diff_rms_post = 0.0;
 	radio->rds = rds;
 	radio->rds2 = rds2;
 	radio->sca_67k = sca_67k;
@@ -1603,8 +1663,11 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	/* Legacy stereo decoding filters (kept for fallback/comparison) */
 	iir_lowpass_init(&radio->rx_lp_pilot_I, PILOT_BW, radio->signal_samplerate, 2);
         iir_lowpass_init(&radio->rx_lp_pilot_Q, PILOT_BW, radio->signal_samplerate, 2);
-        iir_lowpass_init(&radio->rx_lp_sum, STEREO_BW, radio->signal_samplerate, 2);
-        iir_lowpass_init(&radio->rx_lp_diff, STEREO_BW, radio->signal_samplerate, 2);
+	iir_lowpass_init(&radio->rx_lp_sum, STEREO_BW, radio->signal_samplerate, 2);
+	iir_lowpass_init(&radio->rx_lp_diff, STEREO_BW, radio->signal_samplerate, 2);
+	iir_lowpass_init(&radio->rx_lp_diff_low, STEREO_DIFF_LOW_BW, radio->signal_samplerate, 2);
+	iir_lowpass_init(&radio->rx_out_hicut[0], RX_OUTPUT_HICUT_BW, radio->rx_audio_samplerate, 2);
+	iir_lowpass_init(&radio->rx_out_hicut[1], RX_OUTPUT_HICUT_BW, radio->rx_audio_samplerate, 2);
 
 	/* init sample rate conversion, use complete bandwidth for resample filter */
 	/* 
@@ -1739,21 +1802,33 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			}
 
 			/* Initialize encoder with calculated PI and preset values
-			 * (rds_apply_preset will overwrite these, but init needs valid values) */
-			rds_encoder_init(&radio->rds_enc, radio->signal_samplerate,
-				pi, p->ps, p->rt, p->pty, p->ptyn);
+			 * (rds_apply_preset will overwrite these, but init needs valid values)
+			 * Only initialize encoder for TX path (not in rx_only mode) */
+			if (!sdr_config || !sdr_config->rx_only) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS: Initializing encoder for TX path\n");
+				rds_encoder_init(&radio->rds_enc, radio->signal_samplerate,
+					pi, p->ps, p->rt, p->pty, p->ptyn);
+				
+				/* Set debug/verbose flags and DI flags before applying preset */
+				radio->rds_enc.debug = rds_debug;
+				radio->rds_enc.verbose = rds_verbose;
+				radio->rds_enc.di_stereo = stereo ? 1 : 0;
+				radio->rds_enc.di_artificial_head = rds_di_artificial_head;
+				radio->rds_enc.di_compressed = rds_di_compressed;
+				radio->rds_enc.di_dynamic_pty = rds_di_dynamic_pty;
+				radio->rds_enc.ta = rds_ta;
+				radio->rds_enc.ct_enabled = rds_ct_enabled;
+			} else {
+				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping encoder init (RX-only mode)\n");
+			}
 			
-			/* Set debug/verbose flags and DI flags before applying preset */
-			radio->rds_enc.debug = rds_debug;
-			radio->rds_enc.verbose = rds_verbose;
-			radio->rds_enc.di_stereo = stereo ? 1 : 0;
-			radio->rds_enc.di_artificial_head = rds_di_artificial_head;
-			radio->rds_enc.di_compressed = rds_di_compressed;
-			radio->rds_enc.di_dynamic_pty = rds_di_dynamic_pty;
-			radio->rds_enc.ta = rds_ta;
-			radio->rds_enc.ct_enabled = rds_ct_enabled;
-			
-			rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us, rds_force_rbds);
+			/* Only initialize decoder for RX path (not in tx_only mode) */
+			if (!sdr_config || !sdr_config->tx_only) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS: Initializing decoder for RX path\n");
+				rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us, rds_force_rbds);
+			} else {
+				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping decoder init (TX-only mode)\n");
+			}
 
 			
 			/*
@@ -1901,8 +1976,9 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	}
 
 	/* Apply RDS preset after all initialization is complete
-	 * This ensures the preset is applied when everything is fully ready */
-	if ((radio->rds || radio->rds2) && radio->modulation == MODULATION_FM) {
+	 * This ensures the preset is applied when everything is fully ready
+	 * Only apply preset for TX path (encoder only, not in rx_only mode) */
+	if ((!sdr_config || !sdr_config->rx_only) && (radio->rds || radio->rds2) && radio->modulation == MODULATION_FM) {
 		/* Apply full preset configuration using the comprehensive function
 		 * This ensures all preset fields are applied correctly, including
 		 * EON, RT+, eRT+, eRT, group versions, etc. */
@@ -2555,11 +2631,43 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	return signal_num;
 }
 
+static void calc_audio_metrics(const sample_t *in, int n, double *peak, double *rms, double *hf_rms)
+{
+	int i;
+	double p = 0.0, e = 0.0, hf_e = 0.0;
+
+	if (!in || n <= 0) {
+		*peak = 0.0;
+		*rms = 0.0;
+		*hf_rms = 0.0;
+		return;
+	}
+
+	for (i = 0; i < n; i++) {
+		double v = in[i];
+		double a = fabs(v);
+		if (a > p)
+			p = a;
+		e += v * v;
+		if (i > 0) {
+			double d = v - in[i - 1];
+			hf_e += d * d;
+		}
+	}
+
+	*peak = p;
+	*rms = sqrt((e + 1e-12) / (n + 1e-12));
+	*hf_rms = sqrt((hf_e + 1e-12) / ((n > 1 ? n - 1 : 1) + 1e-12));
+}
+
 int radio_rx(radio_t *radio, float *baseband, int signal_num)
 {
 	int i;
 	int audio_num;
 	sample_t *samples[3];
+	double fm_pre_peak = 0.0, fm_pre_rms = 0.0, fm_pre_hf = 0.0;
+	double fm_post_peak = 0.0, fm_post_rms = 0.0, fm_post_hf = 0.0;
+	int fm_diag_valid = 0;
 #ifdef HAVE_ALSA
 	jitter_frame_t *jf;
 #endif
@@ -2573,6 +2681,10 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		LOGP(DRADIO, LOGL_ERROR, "signal_num > signal_buffer_size, please fix!.\n");
 		abort();
 	}
+	/* No IQ available this cycle: avoid running full RX chain on empty blocks.
+	 * This prevents misleading debug output with repeated AUDIO_OUT zeros. */
+	if (signal_num <= 0)
+		return signal_num;
 	/* Use RX-only signal buffer */
 	samples[0] = radio->rx_signal_buffer;
 	samples[1] = radio->rx_signal_buffer + radio->signal_buffer_size;
@@ -2618,12 +2730,12 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			 * freq = d(phase)/dt = (phase[n] - phase[n-1]) per sample
 			 * IIR filter gives average frequency = carrier offset */
 			
-			/* Compute FLL alpha from time constant if not set */
+			/* Compute FLL alpha from configured AFC time constant */
 			if (radio->afc.fll_alpha == 0.0) {
-				/* For broadcast FM, we need a LONG time constant to average out
-				 * the ±75 kHz audio modulation. 5 seconds works well.
-				 * alpha = 1 / (time_constant * samplerate) */
-				double tc_seconds = 5.0;
+				/* alpha = 1 / (time_constant * samplerate) */
+				double tc_seconds = radio->afc.time_constant_s;
+				if (tc_seconds < 0.1)
+					tc_seconds = 0.1;
 				radio->afc.fll_alpha = 1.0 / (tc_seconds * radio->signal_samplerate);
 			}
 			
@@ -2689,18 +2801,38 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 					pilot_accuracy_hz = 0.0;
 			}
 			
-			/* Apply correction with limit */
-			double correction = radio->afc.freq_error_hz;
-			if (correction > radio->afc.max_correction_hz)
-				correction = radio->afc.max_correction_hz;
-			else if (correction < -radio->afc.max_correction_hz)
-				correction = -radio->afc.max_correction_hz;
-			
-			radio->afc.correction_hz = correction;
+			/* Apply correction with confidence gate + deadband + slew limit.
+			 * When pilot lock is unavailable (stereo/RDS modes), decay back to 0
+			 * instead of following noisy FLL estimates. */
+			double target_correction = radio->afc.freq_error_hz;
+			int afc_confident = 1;
+			if (radio->stereo || radio->rds || radio->rds2) {
+				if (!pll_is_locked(&radio->rx_pilot_pll))
+					afc_confident = 0;
+			}
+			if (!afc_confident)
+				target_correction = 0.0;
+			if (target_correction > radio->afc.max_correction_hz)
+				target_correction = radio->afc.max_correction_hz;
+			else if (target_correction < -radio->afc.max_correction_hz)
+				target_correction = -radio->afc.max_correction_hz;
+			if (fabs(target_correction) < AFC_DEADBAND_HZ)
+				target_correction = 0.0;
+
+			{
+				double block_seconds = (double)signal_num / radio->signal_samplerate;
+				double max_step = AFC_MAX_SLEW_HZ_PER_S * block_seconds;
+				double delta = target_correction - radio->afc.correction_hz;
+				if (delta > max_step)
+					delta = max_step;
+				else if (delta < -max_step)
+					delta = -max_step;
+				radio->afc.correction_hz += delta;
+			}
 			radio->afc.update_count++;
 			
 			/* Update FM demodulator NCO offset to correct carrier offset */
-			fm_demod_set_offset(&radio->fm_demod, correction);
+			fm_demod_set_offset(&radio->fm_demod, radio->afc.correction_hz);
 			
 			/* Track peak error for debug */
 			double abs_err = fabs(radio->afc.freq_error_hz);
@@ -2780,15 +2912,31 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 				dbg_accum += signal_num;
 				if (dbg_accum >= radio->signal_samplerate) {
 					dbg_accum = 0.0;
+					double pre_db = 20.0 * log10((radio->rx_diag_diff_rms_pre + 1e-12) /
+					                            (radio->rx_diag_sum_rms + 1e-12));
+					double post_db = 20.0 * log10((radio->rx_diag_diff_rms_post + 1e-12) /
+					                             (radio->rx_diag_sum_rms + 1e-12));
 					LOGP(DRADIO, LOGL_DEBUG,
 					     "Stereo PLL: mag=%.4f avg=%.4f freq_err=%.1fHz pll_lock=%d "
-					     "stereo=%d blend=%.0f%% above=%.0fms below=%.0fms cooldown=%.0fms\n",
+					     "stereo=%d blend=%.0f%% cap=%.0f%% snr=%.1fdB q=%.2f c_cont=%.0f%% c_snr=%.0f%% c_floor=%.0f%% "
+					     "hf=%.0f%% sum_rms=%.4f diff_pre=%.4f(%.1fdB) diff_post=%.4f(%.1fdB) "
+					     "above=%.0fms below=%.0fms cooldown=%.0fms\n",
 					     pilot_mag,
 					     radio->rx_pilot_mag_avg,
 					     freq_error_hz,
 					     pll_locked,
 					     radio->rx_pilot_locked,
 					     radio->rx_stereo_blend * 100.0,
+					     radio->rx_noise_blend_cap * 100.0,
+					     radio->rx_input_snr_db,
+					     radio->rx_blend_quality,
+					     radio->rx_blend_cap_content * 100.0,
+					     radio->rx_blend_cap_snr * 100.0,
+					     radio->rx_blend_cap_floor * 100.0,
+					     radio->rx_stereo_hf_gain * 100.0,
+					     radio->rx_diag_sum_rms,
+					     radio->rx_diag_diff_rms_pre, pre_db,
+					     radio->rx_diag_diff_rms_post, post_db,
 					     radio->rx_pilot_above_samples / radio->signal_samplerate * 1000.0,
 					     radio->rx_pilot_below_samples / radio->signal_samplerate * 1000.0,
 					     (radio->rx_pilot_cooldown > 0.0 ? radio->rx_pilot_cooldown : 0.0) / radio->signal_samplerate * 1000.0);
@@ -2858,25 +3006,162 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 #define STEREO_BLEND_HIGH	0.07	/* Full stereo above this pilot level */
 #define STEREO_BLEND_LOW	0.02	/* Full mono below this pilot level */
 			{
-				double blend = 1.0;
+				double sum_e = 0.0, diff_e = 0.0;
+				double quality, content_cap, cap_target, snr_cap = 1.0, floor_cap = 0.0;
+				for (i = 0; i < signal_num; i++) {
+					double s0 = samples[0][i];
+					double d0 = samples[1][i];
+					sum_e += s0 * s0;
+					diff_e += d0 * d0;
+				}
+				quality = sqrt((sum_e + 1e-12) / (diff_e + 1e-12));
+				radio->rx_diag_sum_rms = sqrt((sum_e + 1e-12) / (signal_num + 1e-12));
+				radio->rx_diag_diff_rms_pre = sqrt((diff_e + 1e-12) / (signal_num + 1e-12));
+				if (quality <= STEREO_QUALITY_LOW) {
+					content_cap = STEREO_BLEND_CAP_MIN;
+				} else if (quality >= STEREO_QUALITY_HIGH) {
+					content_cap = 1.0;
+				} else {
+					double t = (quality - STEREO_QUALITY_LOW) /
+					           (STEREO_QUALITY_HIGH - STEREO_QUALITY_LOW);
+					content_cap = STEREO_BLEND_CAP_MIN + t * (1.0 - STEREO_BLEND_CAP_MIN);
+				}
+				cap_target = 1.0;
+				if (radio->rx_input_snr_db >= 0.0) {
+					if (radio->rx_input_snr_db <= SNR_FORCE_MONO_DB)
+						snr_cap = 0.0;
+					else if (radio->rx_input_snr_db <= SNR_BLEND_LOW_DB)
+						snr_cap = STEREO_BLEND_CAP_MIN;
+					else if (radio->rx_input_snr_db >= SNR_BLEND_HIGH_DB)
+						snr_cap = 1.0;
+					else {
+						double t = (radio->rx_input_snr_db - SNR_BLEND_LOW_DB) /
+						           (SNR_BLEND_HIGH_DB - SNR_BLEND_LOW_DB);
+						snr_cap = STEREO_BLEND_CAP_MIN + t * (1.0 - STEREO_BLEND_CAP_MIN);
+					}
+					cap_target = snr_cap;
+				}
+				/* Content cap only in very poor SNR (program-dependent otherwise). */
+				if (radio->rx_input_snr_db < 0.0 ||
+				    radio->rx_input_snr_db <= CONTENT_CAP_ENABLE_MAX_SNR_DB) {
+					if (cap_target > content_cap)
+						cap_target = content_cap;
+				} else {
+					/* Hide content-cap metric when disabled to avoid confusion in logs. */
+					content_cap = 1.0;
+				}
+				if (radio->rx_pilot_locked && !radio->rx_forced_mono &&
+				    radio->rx_input_snr_db >= SNR_CAP_FLOOR_DB) {
+					floor_cap = SNR_CAP_FLOOR_VALUE;
+					if (cap_target < floor_cap)
+						cap_target = floor_cap;
+				}
+				radio->rx_blend_quality = quality;
+				radio->rx_blend_cap_content = content_cap;
+				radio->rx_blend_cap_snr = snr_cap;
+				radio->rx_blend_cap_floor = floor_cap;
+
+				/* Smooth cap to avoid rapid toggling around thresholds. */
+				{
+					double cap_alpha;
+					double tc = (cap_target < radio->rx_noise_blend_cap) ?
+					            STEREO_CAP_TC_FALL_S : STEREO_CAP_TC_RISE_S;
+					cap_alpha = (double)signal_num / (tc * radio->signal_samplerate);
+					if (cap_alpha > 1.0)
+						cap_alpha = 1.0;
+					if (cap_alpha < 0.0)
+						cap_alpha = 0.0;
+					radio->rx_noise_blend_cap += cap_alpha * (cap_target - radio->rx_noise_blend_cap);
+				}
+
+				double blend_target = 1.0;
 				if (!radio->rx_pilot_locked || radio->rx_forced_mono) {
-					blend = 0.0;
+					blend_target = 0.0;
 				} else if (radio->rx_pilot_mag_avg < STEREO_BLEND_HIGH) {
 					/* Gradual blend based on pilot magnitude */
-					blend = (radio->rx_pilot_mag_avg - STEREO_BLEND_LOW) 
+					blend_target = (radio->rx_pilot_mag_avg - STEREO_BLEND_LOW) 
 					      / (STEREO_BLEND_HIGH - STEREO_BLEND_LOW);
-					if (blend < 0.0) blend = 0.0;
-					if (blend > 1.0) blend = 1.0;
+					if (blend_target < 0.0) blend_target = 0.0;
+					if (blend_target > 1.0) blend_target = 1.0;
 				}
+				if (blend_target > radio->rx_noise_blend_cap)
+					blend_target = radio->rx_noise_blend_cap;
+
+				/* Smooth final blend (fast down, slower up) to avoid breathing. */
+				{
+					double blend_alpha;
+					double tc = (blend_target < radio->rx_stereo_blend) ?
+					            STEREO_BLEND_TC_FALL_S : STEREO_BLEND_TC_RISE_S;
+					blend_alpha = (double)signal_num / (tc * radio->signal_samplerate);
+					if (blend_alpha > 1.0)
+						blend_alpha = 1.0;
+					if (blend_alpha < 0.0)
+						blend_alpha = 0.0;
+					radio->rx_stereo_blend += blend_alpha * (blend_target - radio->rx_stereo_blend);
+				}
+
 				/* Apply blend to diff channel */
-				if (blend < 1.0) {
+				if (radio->rx_stereo_blend < 1.0) {
 					for (i = 0; i < signal_num; i++)
-						samples[1][i] *= blend;
+						samples[1][i] *= radio->rx_stereo_blend;
 				}
-				/* Store for debug/display */
-				radio->rx_stereo_blend = blend;
+
+				/* HF-only L-R suppression: keep low-band stereo mostly intact,
+				 * attenuate only high-band side-channel hiss by SNR. */
+				{
+					double hf_gain_target, hf_gain_base;
+					double quiet_factor = 0.0;
+					if (radio->rx_input_snr_db < 0.0 || radio->rx_input_snr_db >= STEREO_HF_GAIN_HIGH_DB)
+						hf_gain_base = 1.0;
+					else if (radio->rx_input_snr_db <= STEREO_HF_GAIN_LOW_DB)
+						hf_gain_base = STEREO_HF_GAIN_MIN;
+					else {
+						double t = (radio->rx_input_snr_db - STEREO_HF_GAIN_LOW_DB) /
+						           (STEREO_HF_GAIN_HIGH_DB - STEREO_HF_GAIN_LOW_DB);
+						hf_gain_base = STEREO_HF_GAIN_MIN + t * (1.0 - STEREO_HF_GAIN_MIN);
+					}
+					/* Quiet-gate: apply HF attenuation mostly when program level is low.
+					 * Keep max gate effect below 100% to avoid "crispy"/over-processed highs. */
+					if (radio->rx_diag_sum_rms <= STEREO_QUIET_RMS_LOW)
+						quiet_factor = 1.0;
+					else if (radio->rx_diag_sum_rms >= STEREO_QUIET_RMS_HIGH)
+						quiet_factor = 0.0;
+					else
+						quiet_factor = (STEREO_QUIET_RMS_HIGH - radio->rx_diag_sum_rms) /
+						               (STEREO_QUIET_RMS_HIGH - STEREO_QUIET_RMS_LOW);
+					quiet_factor *= 0.70;
+					hf_gain_target = 1.0 - quiet_factor * (1.0 - hf_gain_base);
+					/* Smooth gain to avoid breathing artifacts. */
+					{
+						double tc = (hf_gain_target < radio->rx_stereo_hf_gain) ?
+						            STEREO_HF_GAIN_TC_FALL_S : STEREO_HF_GAIN_TC_RISE_S;
+						double a = (double)signal_num / (tc * radio->signal_samplerate);
+						if (a > 1.0) a = 1.0;
+						if (a < 0.0) a = 0.0;
+						radio->rx_stereo_hf_gain += a * (hf_gain_target - radio->rx_stereo_hf_gain);
+					}
+
+					/* samples[2] is scratch here: low-band extract of diff */
+					memcpy(samples[2], samples[1], sizeof(*samples[1]) * signal_num);
+					iir_process(&radio->rx_lp_diff_low, samples[2], signal_num);
+					for (i = 0; i < signal_num; i++) {
+						double low = samples[2][i];
+						double high = samples[1][i] - low;
+						samples[1][i] = low + high * radio->rx_stereo_hf_gain;
+					}
+				}
+				{
+					double post_e = 0.0;
+					for (i = 0; i < signal_num; i++) {
+						double d1 = samples[1][i];
+						post_e += d1 * d1;
+					}
+					radio->rx_diag_diff_rms_post = sqrt((post_e + 1e-12) / (signal_num + 1e-12));
+				}
 			}
 		}
+		/* Snapshot mono-equivalent channel before RX deemphasis. */
+		calc_audio_metrics(samples[0], signal_num, &fm_pre_peak, &fm_pre_rms, &fm_pre_hf);
 		if (radio->emphasis) {
 			/* RX path: DC filter -> de-emphasis
 			 * DC blocking removes any DC offset from FM demodulator output.
@@ -2903,6 +3188,8 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		audio_debug_stage(&g_rx_debug, RX_STAGE_DEEMPHASIS, samples[0], signal_num);
 		if (radio->stereo)
 			audio_debug_stage(&g_rx_debug, RX_STAGE_DEEMPHASIS, samples[1], signal_num);
+		calc_audio_metrics(samples[0], signal_num, &fm_post_peak, &fm_post_rms, &fm_post_hf);
+		fm_diag_valid = 1;
 		break;
 	case MODULATION_AM_DSB:
 		/* TODO: Implement Synchronous AM (SAM) detection with carrier PLL tracking.
@@ -2966,6 +3253,35 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		}
 	}
 
+	/* FM artifact diagnostics:
+	 * - crest = peak/rms (clipping/flattening indicator)
+	 * - hfk   = sample-rate-normalized first-difference metric (kHz units),
+	 *          comparable across stages that run at different sample rates. */
+	if (fm_diag_valid && radio->modulation == MODULATION_FM) {
+		static double fm_diag_accum = 0.0;
+		double out_peak = 0.0, out_rms = 0.0, out_hf = 0.0;
+		calc_audio_metrics(samples[0], audio_num, &out_peak, &out_rms, &out_hf);
+		fm_diag_accum += signal_num;
+		if (fm_diag_accum >= radio->signal_samplerate) {
+			double pre_crest = fm_pre_peak / (fm_pre_rms + 1e-12);
+			double post_crest = fm_post_peak / (fm_post_rms + 1e-12);
+			double out_crest = out_peak / (out_rms + 1e-12);
+			double pre_hf_ratio = (fm_pre_hf / (fm_pre_rms + 1e-12)) * (radio->signal_samplerate / 1000.0);
+			double post_hf_ratio = (fm_post_hf / (fm_post_rms + 1e-12)) * (radio->signal_samplerate / 1000.0);
+			double out_hf_ratio = (out_hf / (out_rms + 1e-12)) * (radio->rx_audio_samplerate / 1000.0);
+			const char *mode = (radio->rx_forced_mono || !radio->stereo) ? "mono" : "stereo";
+			fm_diag_accum = 0.0;
+			LOGP(DRADIO, LOGL_DEBUG,
+			     "FM HF diag (%s): pre{crest=%.2f hfk=%.1f} deemph{crest=%.2f hfk=%.1f} out{crest=%.2f hfk=%.1f} blend=%.0f%% hf_gain=%.0f%%\n",
+			     mode,
+			     pre_crest, pre_hf_ratio,
+			     post_crest, post_hf_ratio,
+			     out_crest, out_hf_ratio,
+			     radio->rx_stereo_blend * 100.0,
+			     radio->rx_stereo_hf_gain * 100.0);
+		}
+	}
+
 	/* apply volume (multiply, not divide!) */
 	if (radio->volume != 1.0) {
 		for (i = 0; i < audio_num; i++)
@@ -2983,27 +3299,38 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		/* samples[0] already contains sum, nothing to do */
 	}
 	if (radio->stereo && radio->rx_audio_channels == 2) {
-		/* stereo from differential 
-		 * sum = L+R, diff = (L-R) after DSB-SC demod (half amplitude)
+		/* FM Stereo Matrix Decoding with Level Compensation
 		 * 
-		 * When pilot locked (true stereo):
-		 *   L = sum/2 + diff = (L+R)/2 + (L-R)/2 = L
-		 *   R = sum/2 - diff = (L+R)/2 - (L-R)/2 = R
+		 * sum = L+R (mono-compatible, 0-15 kHz)
+		 * diff = L-R (DSB-SC on 38 kHz subcarrier, half amplitude after demod)
 		 * 
-		 * When pilot not locked or forced mono (diff was zeroed earlier):
-		 *   Output sum directly to both channels (full mono level)
+		 * Stereo decode: L = sum/2 + diff, R = sum/2 - diff
+		 * For center-panned content (L=R, diff=0): L = R = sum/2
+		 * 
+		 * Mono output: L = R = sum = L+R
+		 * For center-panned: L = R = 2*original (coherent sum)
+		 * 
+		 * This creates a 6 dB loudness difference (mono louder than stereo).
+		 * Industry standard is to apply +3 dB gain compensation to stereo
+		 * output to match perceived loudness with mono. This is a compromise:
+		 * - +6 dB would match perfectly for center-panned content
+		 * - +3 dB (sqrt(2) ≈ 1.414) is standard for typical music with panning
+		 * 
+		 * Reference: ITU-R BS.412, typical FM receiver design practice
 		 */
+#define STEREO_LEVEL_COMP	1.414	/* +3 dB = sqrt(2), industry standard */
+		
 		if (radio->rx_pilot_locked && !radio->rx_forced_mono) {
-			/* True stereo decode */
+			/* True stereo decode with level compensation */
 			double sum, diff;
 			for (i = 0; i < audio_num; i++) {
 				sum = samples[0][i];
 				diff = samples[1][i];
-				samples[0][i] = sum / 2.0 + diff;  /* L */
-				samples[1][i] = sum / 2.0 - diff;  /* R */
+				samples[0][i] = (sum / 2.0 + diff) * STEREO_LEVEL_COMP;  /* L */
+				samples[1][i] = (sum / 2.0 - diff) * STEREO_LEVEL_COMP;  /* R */
 			}
 		} else {
-			/* Mono fallback - clone sum to both channels */
+			/* Mono fallback - clone sum to both channels (no compensation needed) */
 			for (i = 0; i < audio_num; i++)
 				samples[1][i] = samples[0][i];
 		}
@@ -3012,6 +3339,13 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		/* mono to stereo: clone channel */
 		for (i = 0; i < audio_num; i++)
 			samples[1][i] = samples[0][i];
+	}
+
+	/* Final RX FM anti-harsh shaping at audio rate (mono + stereo). */
+	if (radio->modulation == MODULATION_FM && audio_num > 0) {
+		iir_process(&radio->rx_out_hicut[0], samples[0], audio_num);
+		if (radio->rx_audio_channels == 2)
+			iir_process(&radio->rx_out_hicut[1], samples[1], audio_num);
 	}
 
 	/* DEBUG: Track final audio output levels */
@@ -3028,9 +3362,9 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			}
 		}
 		static int dbg_cnt = 0;
-		if (++dbg_cnt % 100 == 0) {
-			LOGP(DRADIO, LOGL_DEBUG, "AUDIO_OUT: stereo=%d rx_ch=%d peak0=%.4f peak1=%.4f\n",
-			     radio->stereo, radio->rx_audio_channels, peak0, peak1);
+		if (audio_num > 0 && ++dbg_cnt % 100 == 0) {
+			LOGP(DRADIO, LOGL_DEBUG, "AUDIO_OUT: stereo=%d rx_ch=%d n=%d peak0=%.4f peak1=%.4f\n",
+			     radio->stereo, radio->rx_audio_channels, audio_num, peak0, peak1);
 		}
 	}
 	audio_debug_stage(&g_rx_debug, RX_STAGE_AUDIO_OUT, samples[0], audio_num);

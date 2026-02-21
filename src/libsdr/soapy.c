@@ -86,6 +86,14 @@ static long long get_software_time_ns(soapy_instance_t *inst)
 	       (inst->software_base_ts.tv_sec * 1000000000LL + inst->software_base_ts.tv_nsec);
 }
 
+/* Convert sample count to nanoseconds using actual samplerate.
+ * This avoids truncation drift at rates where 1e9 / samplerate is fractional
+ * (e.g. 1024000 sps). */
+static long long samples_to_ns(const soapy_instance_t *inst, int samples)
+{
+	return (long long)llround(((double)samples * 1e9) / inst->samplerate);
+}
+
 static void init_software_clock(soapy_instance_t *inst)
 {
 	clock_gettime(CLOCK_MONOTONIC_RAW, &inst->software_base_ts);
@@ -155,7 +163,7 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 
 	inst->use_time_stamps = timestamps;
 	if (inst->use_time_stamps && (1000000000LL % (long long)rate)) {
-		LOGP(DSOAPY, LOGL_ERROR, "The given sample duration is not a multiple of a nano second. I.e. we can't divide 10^9 by sample rate of %.0f. Please choose a different sample rate for time stamp support!\n", rate);
+		LOGP(DSOAPY, LOGL_NOTICE, "Sample rate %.0f does not map to integer ns/sample; disabling hardware timestamp arithmetic and using software timing.\n", rate);
 		inst->use_time_stamps = 0;
 	}
 	inst->Ns_per_sample = 1000000000LL / (long long)rate;
@@ -195,6 +203,23 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 		assign_instance_for_cleanup(inst, tx_frequency, rx_frequency);
 		soapy_close();
 		return -EIO;
+	}
+
+	/* Detect RTL-SDR and force software clock.
+	 * RTL-SDR reports SOAPY_SDR_HAS_TIME flag but the "timestamps" are actually
+	 * USB buffer byte positions, not nanosecond timestamps. This causes false
+	 * overflow detection. Force software clock for reliable timing. */
+	{
+		char *driver_key = SoapySDRDevice_getDriverKey(inst->sdr);
+		if (driver_key) {
+			if (strcasecmp(driver_key, "RTLSDR") == 0) {
+				LOGP(DSOAPY, LOGL_NOTICE, "RTL-SDR detected: forcing software clock (hardware timestamps unreliable)\n");
+				inst->use_time_stamps = 0;
+				/* Don't init software clock here - do it on first receive
+				 * to avoid timing offset from device open to stream start */
+			}
+			free(driver_key);
+		}
 	}
 
 	/* clock source */
@@ -712,7 +737,7 @@ int soapy_send(float *buff, int num)
 			LOGP(DSOAPY, LOGL_ERROR, "SDR TX: tosend() was not called before, please fix!\n");
 		else {
 			pthread_mutex_lock(&soapy_tx_inst->timestamp_mutex);
-			soapy_tx_inst->tx_timeNs += count * soapy_tx_inst->Ns_per_sample;
+			soapy_tx_inst->tx_timeNs += samples_to_ns(soapy_tx_inst, count);
 			pthread_mutex_unlock(&soapy_tx_inst->timestamp_mutex);
 		}
 		/* increment transmit counters */
@@ -751,59 +776,54 @@ int soapy_receive(float *buff, int max)
 	if (count > 0) {
 		static int rx_debug_count = 0;
 		
+		/* Sample rate tracking */
+		static long long rx_sample_total = 0;
+		static double rx_rate_timer = 0;
+		rx_sample_total += count;
+		if (rx_rate_timer == 0.0) {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			rx_rate_timer = ts.tv_sec + ts.tv_nsec / 1e9;
+		} else {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			double now = ts.tv_sec + ts.tv_nsec / 1e9;
+			if (now - rx_rate_timer >= 1.0) {
+				double actual_rate = rx_sample_total / (now - rx_rate_timer);
+				LOGP(DSOAPY, LOGL_NOTICE, "RX RATE: actual=%.0f Hz (configured=%.0f Hz, diff=%.1f ppm)\n",
+				     actual_rate, soapy_rx_inst->samplerate,
+				     1e6 * (actual_rate - soapy_rx_inst->samplerate) / soapy_rx_inst->samplerate);
+				rx_sample_total = 0;
+				rx_rate_timer = now;
+			}
+		}
 		/* Check if hardware timestamps are available */
 		int has_hw_time = (flags & SOAPY_SDR_HAS_TIME) != 0;
 		
-		/* In split mode, use software clock for overflow detection.
-		 * Hardware timestamps from different SDR devices are unreliable
-		 * (RTL-SDR reports buffer position, not samples read).
-		 * Instead, compare wall-clock time vs expected processing time. */
-		if (split_mode) {
-			/* First read: initialize software clock for RX */
-			if (!soapy_rx_inst->rx_valid) {
+		if (split_mode || !soapy_rx_inst->use_time_stamps || !has_hw_time) {
+			/* AMPS/UHD-style software timing:
+			 * Keep a monotonic sample-derived RX time in software mode and
+			 * avoid wall-clock overflow inference (too sensitive with USB SDRs). */
+			if (!soapy_rx_inst->software_clock) {
+				if (has_hw_time && !soapy_rx_inst->use_time_stamps)
+					LOGP(DSOAPY, LOGL_DEBUG, "SDR RX: Hardware timestamps disabled, using software clock.\n");
+				else if (split_mode)
+					LOGP(DSOAPY, LOGL_NOTICE, "SDR RX: Split mode using software clock.\n");
+				else
+					LOGP(DSOAPY, LOGL_NOTICE, "SDR RX: No hardware timestamps available, falling back to software clock.\n");
 				init_software_clock(soapy_rx_inst);
-				LOGP(DSOAPY, LOGL_NOTICE, "RX INIT (split mode): count=%d Ns_per_sample=%lld samplerate=%.0f\n",
+			}
+
+			if (!soapy_rx_inst->rx_valid) {
+				soapy_rx_inst->rx_timeNs = 0;
+				soapy_rx_inst->rx_valid = 1;
+				LOGP(DSOAPY, LOGL_NOTICE, "RX INIT (software clock): count=%d Ns_per_sample=%lld samplerate=%.0f\n",
 				     count, soapy_rx_inst->Ns_per_sample, soapy_rx_inst->samplerate);
 			}
-			
-			/* Get wall-clock time and compare with expected processing time.
-			 * rx_timeNs tracks how much time worth of samples we've processed.
-			 * If wall clock is ahead of rx_timeNs, we're falling behind. */
-			long long wall_time_ns = get_software_time_ns(soapy_rx_inst);
-			long long samples_time_ns = soapy_rx_inst->rx_timeNs + count * soapy_rx_inst->Ns_per_sample;
-			
-			/* Allow some tolerance (e.g., 100ms) for jitter and buffering */
-			long long tolerance_ns = 100000000LL; /* 100ms */
-			if (wall_time_ns > samples_time_ns + tolerance_ns) {
-				if (rx_debug_count < 20) {
-					LOGP(DSOAPY, LOGL_ERROR, "SDR RX overflow (split mode): wall=%lldms processed=%lldms behind=%lldms\n",
-					     wall_time_ns / 1000000LL, samples_time_ns / 1000000LL,
-					     (wall_time_ns - samples_time_ns) / 1000000LL);
-					rx_debug_count++;
-				}
-				sdr_rx_overflow = 1;
-			}
-			
-			soapy_rx_inst->rx_timeNs = samples_time_ns;
 
-			/* Raw RX sample diagnostics via status objects */
+			soapy_rx_inst->rx_timeNs += samples_to_ns(soapy_rx_inst, count);
 			sdr_status_hw_rx_accumulate(buff, count);
-
 			return count;
-		}
-		
-		if (!soapy_rx_inst->use_time_stamps || !has_hw_time) {
-			/* No hardware timestamps - use software clock */
-			if (soapy_rx_inst->use_time_stamps && !soapy_rx_inst->software_clock) {
-				LOGP(DSOAPY, LOGL_NOTICE, "SDR RX: No hardware timestamps available, falling back to software clock.\n");
-				init_software_clock(soapy_rx_inst);
-				soapy_rx_inst->use_time_stamps = 0;
-			}
-			/* Get time from software clock */
-			if (soapy_rx_inst->software_clock)
-				timeNs = get_software_time_ns(soapy_rx_inst);
-			else
-				timeNs = soapy_rx_inst->rx_timeNs;
 		}
 		/* else: use hardware timeNs from device */
 		
@@ -815,7 +835,7 @@ int soapy_receive(float *buff, int max)
 			     timeNs, count, soapy_rx_inst->Ns_per_sample, soapy_rx_inst->samplerate);
 		}
 		pthread_mutex_lock(&soapy_rx_inst->timestamp_mutex);
-		long long expected_advance = count * soapy_rx_inst->Ns_per_sample;
+		long long expected_advance = samples_to_ns(soapy_rx_inst, count);
 		if (soapy_rx_inst->rx_timeNs != timeNs) {
 			if (rx_debug_count < 20) {
 				LOGP(DSOAPY, LOGL_ERROR, "SDR RX overflow: expected=%lld actual=%lld diff=%lld count=%d expected_adv=%lld Ns_per_sample=%lld\n",
@@ -825,7 +845,7 @@ int soapy_receive(float *buff, int max)
 			}
 			sdr_rx_overflow = 1;
 		}
-		soapy_rx_inst->rx_timeNs = timeNs + count * soapy_rx_inst->Ns_per_sample;
+		soapy_rx_inst->rx_timeNs = timeNs + expected_advance;
 		pthread_mutex_unlock(&soapy_rx_inst->timestamp_mutex);
 
 		/* Raw RX sample diagnostics via status objects */

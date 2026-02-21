@@ -120,10 +120,22 @@ typedef struct radio {
 	iir_filter_t	rx_lp_pilot_Q;		/* low pass filter for pilot tone extraction (legacy) */
 	iir_filter_t	rx_lp_sum;		/* filter sum signal of stereo */
 	iir_filter_t	rx_lp_diff;		/* filter differential signal of stereo */
+	iir_filter_t	rx_lp_diff_low;		/* low-band extract for L-R HF suppression */
+	iir_filter_t	rx_out_hicut[2];	/* gentle post-deemphasis anti-harsh filter */
 	double		rx_pll_freq_offset;	/* tracked phase offset (rad) for stereo demod (legacy) */
 	double		rx_pilot_mag;		/* pilot tone magnitude (0=no signal, ~0.1 on lock) */
 	double		rx_pilot_mag_avg;	/* IIR-smoothed pilot magnitude for threshold decisions */
 	double		rx_stereo_blend;	/* stereo blend factor: 1.0=full stereo, 0.0=mono */
+	double		rx_noise_blend_cap;	/* noise-aware max stereo blend (quieting aid) */
+	double		rx_input_snr_db;	/* external RF SNR estimate from signal meter */
+	double		rx_blend_quality;	/* debug: sqrt(sum_energy/diff_energy) */
+	double		rx_blend_cap_content;	/* debug: cap from content metric */
+	double		rx_blend_cap_snr;	/* debug: cap from SNR metric */
+	double		rx_blend_cap_floor;	/* debug: enforced floor at high SNR */
+	double		rx_stereo_hf_gain;	/* debug: applied gain to high-band L-R component */
+	double		rx_diag_sum_rms;	/* debug: L+R RMS before matrix */
+	double		rx_diag_diff_rms_pre;	/* debug: L-R RMS before blend */
+	double		rx_diag_diff_rms_post;	/* debug: L-R RMS after blend */
 	int		rx_pilot_locked;	/* 1 = pilot locked, 0 = mono fallback */
 	int		rx_forced_mono;		/* 1 = force mono (B1 command), 0 = auto */
 	double		rx_pilot_cooldown;	/* samples until next lock state change allowed */
@@ -167,6 +179,7 @@ void rds_next_preset(radio_t *radio);
 
 /* Force mono mode (B1 command from XDR-GTK) */
 void radio_set_forced_mono(radio_t *radio, int forced);
+void radio_set_rx_snr(radio_t *radio, double snr_db);
 
 /* AFC control */
 void radio_afc_enable(radio_t *radio, int enable);
