@@ -491,8 +491,9 @@ static void print_help(const char *arg0)
 	printf("        Enable 92 kHz SCA (Subsidiary Communications) subcarrier.\n");
 	printf("    --fast-math\n");
 	printf("        Use fast math approximation for slow CPU / ARM based systems.\n");
-	printf("    --channelizer\n");
-	printf("        Enable Polyphase Channelizer (auto-tunes sampling rate).\n");
+	printf("    --channelizer [auto|on|off]\n");
+	printf("        Decimation channelizer mode. auto (default): enable when SDR rate > DSP rate.\n");
+	printf("        on: always enable. off: never enable (use legacy sample-skip path).\n");
 	printf("    --channelizer-rate <rate>\n");
 	printf("        Explicitly set channelizer input processing rate (Hz).\n");
 	printf("    --polyphase-resampler\n");
@@ -515,7 +516,7 @@ static void print_help(const char *arg0)
 }
 
 static int channelizer_rate = 0; /* 0 = disabled */
-static int use_channelizer = 0;
+static int use_channelizer = 0; /* -1=off, 0=auto, 1=on */
 static int use_polyphase = 0;
 static int use_afc = 0;
 static double afc_tc_ms = 300.0;
@@ -578,7 +579,7 @@ static void add_options(void)
 	option_add(OPT_SCA_67K, "sca-67k", 0);
 	option_add(OPT_SCA_92K, "sca-92k", 0);
 	option_add(OPT_FAST_MATH, "fast-math", 0);
-	option_add(OPT_CHANNELIZER, "channelizer", 0);
+	option_add(OPT_CHANNELIZER, "channelizer", 1);
 	option_add(OPT_CHANNELIZER_RATE, "channelizer-rate", 1);
 	option_add(OPT_LIMESDR, "limesdr", 0);
 	option_add(OPT_LIMESDR_MINI, "limesdr-mini", 0);
@@ -709,7 +710,16 @@ static int handle_options(int short_option, int argi, char **argv)
 		fast_math = 1;
 		break;
 	case OPT_CHANNELIZER:
-		use_channelizer = 1;
+		if (!strcasecmp(argv[argi], "on"))
+			use_channelizer = 1;
+		else if (!strcasecmp(argv[argi], "off"))
+			use_channelizer = -1;
+		else if (!strcasecmp(argv[argi], "auto"))
+			use_channelizer = 0;
+		else {
+			fprintf(stderr, "Invalid --channelizer value '%s', use auto, on, or off.\n", argv[argi]);
+			exit(0);
+		}
 		break;
 	case OPT_CHANNELIZER_RATE:
 		channelizer_rate = atoi(argv[argi]);
@@ -991,7 +1001,7 @@ int main(int argc, char *argv[])
 	am_init(fast_math);
 
 	/* Determine input samplerate */
-	if (use_channelizer && channelizer_rate > 0)
+	if (use_channelizer == 1 && channelizer_rate > 0)
 		input_samplerate = channelizer_rate;
 	else
 		input_samplerate = dsp_samplerate;
@@ -1027,13 +1037,22 @@ int main(int argc, char *argv[])
 		baseband_extent = bandwidth;
 	}
 
+	/* Auto-enable channelizer when SDR rate > DSP rate — decimation is required */
+	if (use_channelizer == 0 && sdr_config && sdr_config->samplerate > dsp_samplerate)
+		use_channelizer = 1;
+
 	/* Auto-calculate optimal input rate if channelizer is used */
-	if (use_channelizer && channelizer_rate == 0) {
+	if (use_channelizer == 1 && channelizer_rate == 0) {
 		if (sdr_config) {
 			input_samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, baseband_extent);
-			printf("Channelizer: Auto-selected input rate %d Hz for %.1f kHz baseband extent (from SDR %d Hz)\n", 
-			       input_samplerate, baseband_extent / 1000.0, sdr_config->samplerate);
 		}
+	}
+
+	if (use_channelizer == 1 && sdr_config) {
+		int ratio = (input_samplerate > 0) ? sdr_config->samplerate / input_samplerate : 0;
+		LOGP(DSDR, LOGL_NOTICE, "Channelizer: SDR=%d Hz -> DSP=%d Hz (decimate x%d, rf_bw=%.1f kHz, signal=%.1f kHz)\n",
+		     sdr_config->samplerate, input_samplerate, ratio,
+		     2.0 * baseband_extent / 1000.0, dsp_samplerate / 1000.0);
 	}
 
 	if (modulation == MODULATION_NONE) {
@@ -1355,7 +1374,7 @@ int main(int argc, char *argv[])
 	tx_frequencies[0] = frequency;
 	rx_frequencies[0] = frequency;
 	am[0] = 0;
-	sdr = sdr_open_channelizer(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0, input_samplerate, buffer_size, 1.0, 0.0, 0.0, 0.0, use_channelizer, fast_math);
+	sdr = sdr_open_channelizer(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0, input_samplerate, buffer_size, 1.0, 0.0, 0.0, 0.0, (use_channelizer == 1), fast_math);
 	if (!sdr)
 		goto error;
 	sdr_start(sdr);

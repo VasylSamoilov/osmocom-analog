@@ -8181,6 +8181,12 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->agc_alpha = 2.0 * M_PI * 50.0 / samplerate;
 	if (rds->agc_alpha > 0.01) rds->agc_alpha = 0.01;  /* Clamp for very low sample rates */
 	
+	/* Pre-decimation: integer stride to ~200 kHz before per-sample DSP.
+	 * N = floor(sr / 200000), clamped to >= 1. No anti-alias LPF needed:
+	 * FM baseband above 100 kHz is noise floor; internal 2.4 kHz LPF rejects aliases. */
+	rds->pre_dec_n = (int)(samplerate / 200000.0);
+	if (rds->pre_dec_n < 1) rds->pre_dec_n = 1;
+
 	/* Filter Coefficients */
 	/* 2400 Hz LPF */
 	double alpha_2400 = (2.0 * M_PI * 2400.0) / samplerate;
@@ -8260,6 +8266,7 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	rds_iir_filter_t filter_2400_i = rds->filter_2400_i;
 	rds_iir_filter_t filter_2400_q = rds->filter_2400_q;
 	rds_iir_filter_t filter_pll = rds->filter_pll;
+	int pre_dec_n = rds->pre_dec_n;
 	double agc_gain = rds->agc_gain;
 	double agc_alpha = rds->agc_alpha;
 	double freq_subcarrier = rds->freq_subcarrier;
@@ -8288,6 +8295,7 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	rds->filter_2400_i = filter_2400_i;
 	rds->filter_2400_q = filter_2400_q;
 	rds->filter_pll = filter_pll;
+	rds->pre_dec_n = pre_dec_n;
 	rds->agc_gain = agc_gain;
 	rds->agc_alpha = agc_alpha;
 	rds->freq_subcarrier = freq_subcarrier;
@@ -8451,16 +8459,17 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 	(void)pilot_phase;
 	(void)pilot_phasestep;
 	int i;
+	const int N = rds->pre_dec_n;  /* Input stride: process 1 of every N samples */
 	const double PLL_BETA = 0.02 * (250000.0 / rds->samplerate); /* Normalized Costas gain */
 	const double FC_TOLERANCE = 12.0;
-	
-	/* Phase step per sample for 57k subcarrier PLL */
-	double pll_step_base = 2.0 * M_PI / rds->samplerate;
-	
-	for (i = 0; i < num; i++) {
-		rds->status_timer++;
-		rds->signal_debug_timer++;
-		
+
+	/* Phase step per processed sample (accounts for stride) */
+	double pll_step_base = 2.0 * M_PI * N / rds->samplerate;
+
+	for (i = 0; i < num; i += N) {
+		rds->status_timer += N;
+		rds->signal_debug_timer += N;
+
 		/* Track input signal level */
 		double abs_input = fabs(samples[i]);
 		if (abs_input > rds->sig_input_peak) rds->sig_input_peak = abs_input;
@@ -8477,10 +8486,12 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		
 		double sc_sin, sc_cos;
 		if (fm_fast_math_enabled()) {
-			/* Convert phase to 0-65535 range for table lookup */
-			double wrapped = fmod(rds->phase_subcarrier, 2.0 * M_PI);
-			if (wrapped < 0) wrapped += 2.0 * M_PI;
-			fm_fast_sincos(wrapped * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
+			/* Subtract wrap instead of fmod - keeps phase in [0, 2pi].
+			 * Valid as long as samplerate > 57kHz (always true).
+			 * ~3.5x faster than fmod. */
+			if (rds->phase_subcarrier >= 2.0 * M_PI)
+				rds->phase_subcarrier -= 2.0 * M_PI;
+			fm_fast_sincos(rds->phase_subcarrier * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
 		} else {
 			sincos(rds->phase_subcarrier, &sc_sin, &sc_cos);
 		}
@@ -8533,7 +8544,7 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 		/* 4. Bit Clock Recovery (SDRangel approach)
 		 * Use direct 1187.5 Hz oscillator, NOT derived from subcarrier.
 		 * This eliminates PLL drift accumulation that caused bit rate errors. */
-		rds->clock_phi += (2.0 * M_PI * RDS_BITRATE) / rds->samplerate;
+		rds->clock_phi += (2.0 * M_PI * RDS_BITRATE * N) / rds->samplerate;
 		
 		/* Clock phase recovery: align to baseband zero crossings */
 		int curr_sign = (bb_i >= 0) ? 1 : -1;

@@ -2118,7 +2118,13 @@ typedef struct rds_decoder {
 	double		prev_bb_sample;		/* Previous baseband sample (for zero cross) */
 	double		integrator;		/* Integrate-and-dump accumulator */
 	int		decimate_counter;	/* Decimation counter (per-instance) */
-	
+
+	/* Pre-decimation: integer stride to reduce per-sample DSP work.
+	 * No anti-alias LPF needed: FM baseband above 100 kHz is noise floor
+	 * (pilot=19k, stereo=38k, RDS=57k, SCA=67/92k). The internal 2.4 kHz
+	 * LPF and Costas PLL reject any aliased noise. */
+	int		pre_dec_n;		/* Stride factor (sr / 200kHz, min 1) */
+
 	/* PLL Lock Detection (RdsSurveyor2-style) */
 	double		lock_sum_i;		/* Running sum of |bb_i| at symbol dumps */
 	double		lock_sum_q;		/* Running sum of |bb_q| at symbol dumps */

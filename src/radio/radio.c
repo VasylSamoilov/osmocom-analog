@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <errno.h>
 #include <pthread.h>
 #include "../libsample/sample.h"
@@ -1292,7 +1293,6 @@ void radio_afc_enable(radio_t *radio, int enable)
 	radio->afc.enabled = enable;
 	if (!enable) {
 		/* Reset AFC state and NCO offset when disabled */
-		radio->afc.dc_avg = 0.0;
 		radio->afc.freq_error_hz = 0.0;
 		radio->afc.correction_hz = 0.0;
 		fm_demod_set_offset(&radio->fm_demod, 0.0);
@@ -2665,9 +2665,11 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 	int i;
 	int audio_num;
 	sample_t *samples[3];
+#ifdef AUDIO_DEBUG
 	double fm_pre_peak = 0.0, fm_pre_rms = 0.0, fm_pre_hf = 0.0;
 	double fm_post_peak = 0.0, fm_post_rms = 0.0, fm_post_hf = 0.0;
 	int fm_diag_valid = 0;
+#endif
 #ifdef HAVE_ALSA
 	jitter_frame_t *jf;
 #endif
@@ -2697,10 +2699,12 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			double v = fabs(baseband[i]);
 			if (v > peak_iq) peak_iq = v;
 		}
+#ifdef AUDIO_DEBUG
 		/* Store in samples[2] temporarily for stage tracking */
 		for (i = 0; i < signal_num && i < 1000; i++)
 			samples[2][i] = sqrt(baseband[i*2] * baseband[i*2] + baseband[i*2+1] * baseband[i*2+1]);
 		audio_debug_stage(&g_rx_debug, RX_STAGE_SDR_RAW, samples[2], (signal_num < 1000) ? signal_num : 1000);
+#endif
 	}
 
 	switch (radio->modulation) {
@@ -2710,8 +2714,9 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			samples[0][i] /= radio->fm_deviation;
 		
 		/* DEBUG: Track levels after FM demod */
+#ifdef AUDIO_DEBUG
 		audio_debug_stage(&g_rx_debug, RX_STAGE_FM_DEMOD, samples[0], signal_num);
-		
+#endif
 		/* AFC (Automatic Frequency Control) for FM
 		 * Uses FLL (Frequency-Locked Loop) on IQ samples.
 		 * Based on SDRangel's FreqLockComplex implementation.
@@ -2774,22 +2779,6 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			
 			radio->afc.freq_error_hz = fll_freq_hz;
 			
-			/* Legacy DC method for debug comparison */
-			{
-				double dc_sum = 0.0;
-				for (i = 0; i < signal_num; i++)
-					dc_sum += samples[0][i];
-				double dc_block = dc_sum / signal_num;
-				if (!isfinite(dc_block)) dc_block = 0.0;
-				
-				double alpha = (double)signal_num / (radio->afc.time_constant_s * radio->signal_samplerate);
-				if (alpha > 1.0) alpha = 1.0;
-				radio->afc.dc_avg += alpha * (dc_block - radio->afc.dc_avg);
-				if (!isfinite(radio->afc.dc_avg)) radio->afc.dc_avg = 0.0;
-				
-				radio->afc.dc_freq_error_hz = radio->afc.dc_avg * radio->fm_deviation;
-			}
-			
 			/* Pilot accuracy measurement (when stereo/RDS active)
 			 * This measures how accurate the station's 19 kHz pilot is - NOT tuning error!
 			 * The pilot is always at 19 kHz in the FM baseband regardless of carrier offset.
@@ -2838,15 +2827,32 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			double abs_err = fabs(radio->afc.freq_error_hz);
 			if (abs_err > radio->afc.peak_error_hz)
 				radio->afc.peak_error_hz = abs_err;
+
+			/* Periodic AFC status log (every 10s) */
+			{
+				static double afc_log_timer = 0.0;
+				struct timespec _ts;
+				clock_gettime(CLOCK_MONOTONIC, &_ts);
+				double now = _ts.tv_sec + _ts.tv_nsec / 1e9;
+				if (afc_log_timer == 0.0) afc_log_timer = now;
+				if (now - afc_log_timer >= 10.0) {
+					LOGP(DRADIO, LOGL_INFO,
+					     "AFC: err=%+.1fHz corr=%+.1fHz peak=%.1fHz pilot=%+.1fHz lock=%d\n",
+					     radio->afc.freq_error_hz, radio->afc.correction_hz,
+					     radio->afc.peak_error_hz, pilot_accuracy_hz,
+					     pll_is_locked(&radio->rx_pilot_pll));
+					radio->afc.peak_error_hz = 0.0;
+					afc_log_timer = now;
+				}
+			}
 			
-			/* Update audio debug stats
-			 * FLL_err = carrier offset (used for AFC)
-			 * DC_err = legacy method (unreliable)
-			 * pilot = 19 kHz accuracy (station TX quality, not tuning) */
-			audio_debug_afc(&g_rx_debug, radio->afc.dc_avg, 
+			/* Update audio debug stats */
+#ifdef AUDIO_DEBUG
+			audio_debug_afc(&g_rx_debug,
 			                radio->afc.freq_error_hz, radio->afc.correction_hz,
-			                radio->afc.dc_freq_error_hz, pilot_accuracy_hz,
+			                pilot_accuracy_hz,
 			                0, pll_is_locked(&radio->rx_pilot_pll));
+#endif
 		}
 		
 		/* Process PLL and stereo demodulation together
@@ -2995,8 +3001,10 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			iir_process(&radio->rx_lp_diff, samples[1], signal_num);
 
 			/* DEBUG: Track levels after stereo decode */
+#ifdef AUDIO_DEBUG
 			audio_debug_stage(&g_rx_debug, RX_STAGE_STEREO_DECODE, samples[0], signal_num);
 			audio_debug_stage(&g_rx_debug, RX_STAGE_STEREO_DECODE, samples[1], signal_num);
+#endif
 
 			/* Stereo blend: gradually reduce separation as signal weakens.
 			 * Uses smoothed pilot magnitude (100ms TC) for gradual transitions.
@@ -3161,7 +3169,9 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			}
 		}
 		/* Snapshot mono-equivalent channel before RX deemphasis. */
+#ifdef AUDIO_DEBUG
 		calc_audio_metrics(samples[0], signal_num, &fm_pre_peak, &fm_pre_rms, &fm_pre_hf);
+#endif
 		if (radio->emphasis) {
 			/* RX path: DC filter -> de-emphasis
 			 * DC blocking removes any DC offset from FM demodulator output.
@@ -3185,11 +3195,13 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			}
 		}
 		/* DEBUG: Track levels after de-emphasis */
+#ifdef AUDIO_DEBUG
 		audio_debug_stage(&g_rx_debug, RX_STAGE_DEEMPHASIS, samples[0], signal_num);
 		if (radio->stereo)
 			audio_debug_stage(&g_rx_debug, RX_STAGE_DEEMPHASIS, samples[1], signal_num);
 		calc_audio_metrics(samples[0], signal_num, &fm_post_peak, &fm_post_rms, &fm_post_hf);
 		fm_diag_valid = 1;
+#endif
 		break;
 	case MODULATION_AM_DSB:
 		/* TODO: Implement Synchronous AM (SAM) detection with carrier PLL tracking.
@@ -3221,8 +3233,10 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		samples[0] = out_left;
 		
 		/* DEBUG: Track resampling ratio */
+#ifdef AUDIO_DEBUG
 		audio_debug_resample(&g_rx_debug, signal_num, audio_num, 
 		                     radio->rx_audio_samplerate / radio->signal_samplerate);
+#endif
 		
 		if (radio->stereo) {
 			polyphase_resample(&radio->rx_polyphase[1], samples[1], signal_num, out_right, radio->audio_buffer_size);
@@ -3232,14 +3246,17 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		audio_num = samplerate_downsample(&radio->rx_resampler[0], samples[0], signal_num);
 		
 		/* DEBUG: Track resampling ratio */
+#ifdef AUDIO_DEBUG
 		audio_debug_resample(&g_rx_debug, signal_num, audio_num,
 		                     radio->rx_audio_samplerate / radio->signal_samplerate);
+#endif
 		
 		if (radio->stereo)
 			samplerate_downsample(&radio->rx_resampler[1], samples[1], signal_num);
 	}
 
 	/* DEBUG: Track levels after resampling - BOTH channels for stereo */
+#ifdef AUDIO_DEBUG
 	audio_debug_stage(&g_rx_debug, RX_STAGE_RESAMPLE, samples[0], audio_num);
 	if (radio->stereo) {
 		/* Track channel 1 separately to see if it has higher peaks */
@@ -3253,34 +3270,19 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		}
 	}
 
-	/* FM artifact diagnostics:
-	 * - crest = peak/rms (clipping/flattening indicator)
-	 * - hfk   = sample-rate-normalized first-difference metric (kHz units),
-	 *          comparable across stages that run at different sample rates. */
+	/* FM artifact diagnostics */
 	if (fm_diag_valid && radio->modulation == MODULATION_FM) {
-		static double fm_diag_accum = 0.0;
 		double out_peak = 0.0, out_rms = 0.0, out_hf = 0.0;
 		calc_audio_metrics(samples[0], audio_num, &out_peak, &out_rms, &out_hf);
-		fm_diag_accum += signal_num;
-		if (fm_diag_accum >= radio->signal_samplerate) {
-			double pre_crest = fm_pre_peak / (fm_pre_rms + 1e-12);
-			double post_crest = fm_post_peak / (fm_post_rms + 1e-12);
-			double out_crest = out_peak / (out_rms + 1e-12);
-			double pre_hf_ratio = (fm_pre_hf / (fm_pre_rms + 1e-12)) * (radio->signal_samplerate / 1000.0);
-			double post_hf_ratio = (fm_post_hf / (fm_post_rms + 1e-12)) * (radio->signal_samplerate / 1000.0);
-			double out_hf_ratio = (out_hf / (out_rms + 1e-12)) * (radio->rx_audio_samplerate / 1000.0);
-			const char *mode = (radio->rx_forced_mono || !radio->stereo) ? "mono" : "stereo";
-			fm_diag_accum = 0.0;
-			LOGP(DRADIO, LOGL_DEBUG,
-			     "FM HF diag (%s): pre{crest=%.2f hfk=%.1f} deemph{crest=%.2f hfk=%.1f} out{crest=%.2f hfk=%.1f} blend=%.0f%% hf_gain=%.0f%%\n",
-			     mode,
-			     pre_crest, pre_hf_ratio,
-			     post_crest, post_hf_ratio,
-			     out_crest, out_hf_ratio,
-			     radio->rx_stereo_blend * 100.0,
-			     radio->rx_stereo_hf_gain * 100.0);
-		}
+		audio_debug_fm_hf(&g_rx_debug,
+		                  fm_pre_peak, fm_pre_rms, fm_pre_hf,
+		                  fm_post_peak, fm_post_rms, fm_post_hf,
+		                  out_peak, out_rms, out_hf,
+		                  radio->signal_samplerate, radio->rx_audio_samplerate,
+		                  radio->rx_stereo_blend, radio->rx_stereo_hf_gain,
+		                  radio->stereo && !radio->rx_forced_mono);
 	}
+#endif
 
 	/* apply volume (multiply, not divide!) */
 	if (radio->volume != 1.0) {
@@ -3348,31 +3350,12 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			iir_process(&radio->rx_out_hicut[1], samples[1], audio_num);
 	}
 
-	/* DEBUG: Track final audio output levels */
-	{
-		double peak0 = 0, peak1 = 0;
-		for (i = 0; i < audio_num; i++) {
-			double v = fabs(samples[0][i]);
-			if (v > peak0) peak0 = v;
-		}
-		if (radio->rx_audio_channels == 2) {
-			for (i = 0; i < audio_num; i++) {
-				double v = fabs(samples[1][i]);
-				if (v > peak1) peak1 = v;
-			}
-		}
-		static int dbg_cnt = 0;
-		if (audio_num > 0 && ++dbg_cnt % 100 == 0) {
-			LOGP(DRADIO, LOGL_DEBUG, "AUDIO_OUT: stereo=%d rx_ch=%d n=%d peak0=%.4f peak1=%.4f\n",
-			     radio->stereo, radio->rx_audio_channels, audio_num, peak0, peak1);
-		}
-	}
+#ifdef AUDIO_DEBUG
 	audio_debug_stage(&g_rx_debug, RX_STAGE_AUDIO_OUT, samples[0], audio_num);
 	if (radio->stereo && radio->rx_audio_channels == 2)
 		audio_debug_stage(&g_rx_debug, RX_STAGE_AUDIO_OUT, samples[1], audio_num);
-	
-	/* DEBUG: Periodic report */
 	audio_debug_report(&g_rx_debug);
+#endif
 
 	/* display wave */
 	display_wave(&radio->dispwav[0], samples[0], audio_num, 1.0);

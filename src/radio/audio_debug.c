@@ -10,6 +10,8 @@
 #include "../liblogging/logging.h"
 #include "audio_debug.h"
 
+#ifdef AUDIO_DEBUG
+
 /* Global instance */
 audio_debug_t g_rx_debug;
 
@@ -144,17 +146,37 @@ void audio_debug_jitter_overrun(audio_debug_t *dbg)
 	     (unsigned long)dbg->jitter_overruns);
 }
 
-void audio_debug_afc(audio_debug_t *dbg, double dc_offset, double freq_error_hz,
-                     double correction_hz, double dc_freq_error_hz,
+void audio_debug_fm_hf(audio_debug_t *dbg,
+                       double pre_peak, double pre_rms, double pre_hf,
+                       double post_peak, double post_rms, double post_hf,
+                       double out_peak, double out_rms, double out_hf,
+                       double signal_samplerate, double audio_samplerate,
+                       double stereo_blend, double stereo_hf_gain, int stereo)
+{
+	if (!dbg->enabled)
+		return;
+	fm_hf_stats_t *f = &dbg->fm_hf;
+	/* Keep last-seen values; report prints them once per interval */
+	f->pre_peak = pre_peak; f->pre_rms = pre_rms; f->pre_hf = pre_hf;
+	f->post_peak = post_peak; f->post_rms = post_rms; f->post_hf = post_hf;
+	f->out_peak = out_peak; f->out_rms = out_rms; f->out_hf = out_hf;
+	f->signal_samplerate = signal_samplerate;
+	f->audio_samplerate = audio_samplerate;
+	f->stereo_blend = stereo_blend;
+	f->stereo_hf_gain = stereo_hf_gain;
+	f->stereo = stereo;
+	f->valid = 1;
+}
+
+void audio_debug_afc(audio_debug_t *dbg, double freq_error_hz,
+                     double correction_hz,
                      double pilot_accuracy_hz, int using_pll_method, int pll_locked)
 {
 	if (!dbg->enabled)
 		return;
 	
-	dbg->afc.dc_offset = dc_offset;
 	dbg->afc.freq_error_hz = freq_error_hz;
 	dbg->afc.correction_hz = correction_hz;
-	dbg->afc.dc_freq_error_hz = dc_freq_error_hz;
 	dbg->afc.pilot_accuracy_hz = pilot_accuracy_hz;
 	dbg->afc.using_pll_method = using_pll_method;
 	dbg->afc.pll_locked = pll_locked;
@@ -220,6 +242,28 @@ void audio_debug_report_now(audio_debug_t *dbg)
 		     s->sample_count / 1e6);
 	}
 	
+	/* FM HF diagnostics */
+	if (dbg->fm_hf.valid) {
+		fm_hf_stats_t *f = &dbg->fm_hf;
+		double sr = f->signal_samplerate / 1000.0;
+		double ar = f->audio_samplerate / 1000.0;
+		double pre_crest  = f->pre_peak  / (f->pre_rms  + 1e-12);
+		double post_crest = f->post_peak / (f->post_rms + 1e-12);
+		double out_crest  = f->out_peak  / (f->out_rms  + 1e-12);
+		double pre_hfk    = (f->pre_hf  / (f->pre_rms  + 1e-12)) * sr;
+		double post_hfk   = (f->post_hf / (f->post_rms + 1e-12)) * sr;
+		double out_hfk    = (f->out_hf  / (f->out_rms  + 1e-12)) * ar;
+		const char *mode  = f->stereo ? "stereo" : "mono";
+		LOGP(DRADIO, LOGL_INFO,
+		     "  FM HF (%s): pre{crest=%.2f hfk=%.1f} deemph{crest=%.2f hfk=%.1f} out{crest=%.2f hfk=%.1f} blend=%.0f%% hf_gain=%.0f%%\n",
+		     mode,
+		     pre_crest, pre_hfk,
+		     post_crest, post_hfk,
+		     out_crest, out_hfk,
+		     f->stereo_blend * 100.0,
+		     f->stereo_hf_gain * 100.0);
+	}
+
 	/* Resampler stats */
 	if (dbg->resample.input_samples > 0) {
 		double actual_ratio = (double)dbg->resample.output_samples / 
@@ -254,9 +298,8 @@ void audio_debug_report_now(audio_debug_t *dbg)
 		 * peak: max FLL error this period
 		 * pilot_lock: stereo pilot PLL lock status (not same as stereo mode!) */
 		LOGP(DRADIO, LOGL_INFO,
-		     "  AFC: FLL_err=%+.1fHz DC_err=%+.1fHz pilot=%+.1fHz corr=%+.1fHz peak=%.1fHz n=%lu pilot_lock=%d\n",
+		     "  AFC: FLL_err=%+.1fHz pilot=%+.1fHz corr=%+.1fHz peak=%.1fHz n=%lu pilot_lock=%d\n",
 		     dbg->afc.freq_error_hz,
-		     dbg->afc.dc_freq_error_hz,
 		     dbg->afc.pilot_accuracy_hz,
 		     dbg->afc.correction_hz,
 		     dbg->afc.peak_error_hz,
@@ -278,3 +321,8 @@ void audio_debug_reset(audio_debug_t *dbg)
 	dbg->enabled = enabled;
 	dbg->last_report_time = get_time_sec();
 }
+
+#else /* !AUDIO_DEBUG */
+/* Global stub instance */
+audio_debug_t g_rx_debug;
+#endif /* AUDIO_DEBUG */

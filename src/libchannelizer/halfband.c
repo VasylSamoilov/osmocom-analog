@@ -103,18 +103,18 @@ static void do_fir_double(halfband_t *hb, double *out_i, double *out_q)
 	/* Symmetric filter - compute both sides together */
 	for (j = 0; j < n; j++) {
 		/* Left side of filter */
-		idx = (hb->ptr + j * 2) % hb->order;
+		idx = (hb->ptr + j * 2) & (hb->order - 1);
 		acc_i += hb->buf_i_d[idx] * hb->coeffs_d[j];
 		acc_q += hb->buf_q_d[idx] * hb->coeffs_d[j];
 
 		/* Right side (symmetric) */
-		idx = (hb->ptr + hb->order - 1 - j * 2) % hb->order;
+		idx = (hb->ptr + hb->order - 1 - j * 2) & (hb->order - 1);
 		acc_i += hb->buf_i_d[idx] * hb->coeffs_d[j];
 		acc_q += hb->buf_q_d[idx] * hb->coeffs_d[j];
 	}
 
 	/* Center tap (always 0.5 for halfband) */
-	idx = (hb->ptr + half) % hb->order;
+	idx = (hb->ptr + half) & (hb->order - 1);
 	acc_i += hb->buf_i_d[idx] * 0.5;
 	acc_q += hb->buf_q_d[idx] * 0.5;
 
@@ -135,18 +135,18 @@ static void do_fir_fixed(halfband_t *hb, int32_t *out_i, int32_t *out_q)
 	/* Symmetric filter - compute both sides together */
 	for (j = 0; j < n; j++) {
 		/* Left side */
-		idx = (hb->ptr + j * 2) % hb->order;
+		idx = (hb->ptr + j * 2) & (hb->order - 1);
 		acc_i += (int64_t)hb->buf_i_f[idx] * hb->coeffs_f[j];
 		acc_q += (int64_t)hb->buf_q_f[idx] * hb->coeffs_f[j];
 
 		/* Right side */
-		idx = (hb->ptr + hb->order - 1 - j * 2) % hb->order;
+		idx = (hb->ptr + hb->order - 1 - j * 2) & (hb->order - 1);
 		acc_i += (int64_t)hb->buf_i_f[idx] * hb->coeffs_f[j];
 		acc_q += (int64_t)hb->buf_q_f[idx] * hb->coeffs_f[j];
 	}
 
 	/* Center tap (0.5 = 2048 in Q12) */
-	idx = (hb->ptr + half) % hb->order;
+	idx = (hb->ptr + half) & (hb->order - 1);
 	acc_i += (int64_t)hb->buf_i_f[idx] << (hb->shift - 1);
 	acc_q += (int64_t)hb->buf_q_f[idx] << (hb->shift - 1);
 
@@ -169,7 +169,7 @@ static int process_center(halfband_t *hb, sample_t *i, sample_t *q)
 		hb->buf_q_d[hb->ptr] = *q;
 	}
 
-	hb->ptr = (hb->ptr + 1) % hb->order;
+	hb->ptr = (hb->ptr + 1) & (hb->order - 1);
 
 	if (hb->state == 0) {
 		hb->state = 1;
@@ -229,7 +229,7 @@ static int process_lower(halfband_t *hb, sample_t *i, sample_t *q)
 		hb->buf_q_d[hb->ptr] = *q;
 	}
 
-	hb->ptr = (hb->ptr + 1) % hb->order;
+	hb->ptr = (hb->ptr + 1) & (hb->order - 1);
 
 	/* Advance state, output every other sample */
 	int output = (hb->state & 1);
@@ -289,7 +289,7 @@ static int process_upper(halfband_t *hb, sample_t *i, sample_t *q)
 		hb->buf_q_d[hb->ptr] = *q;
 	}
 
-	hb->ptr = (hb->ptr + 1) % hb->order;
+	hb->ptr = (hb->ptr + 1) & (hb->order - 1);
 
 	/* Advance state, output every other sample */
 	int output = (hb->state & 1);
@@ -368,7 +368,7 @@ static int interpolate_center(halfband_t *hb, sample_t in_i, sample_t in_q,
 		/* Second output: center tap only (input sample passthrough) */
 		*out_i = in_i;
 		*out_q = in_q;
-		hb->ptr = (hb->ptr + 1) % hb->order;
+		hb->ptr = (hb->ptr + 1) & (hb->order - 1);
 		hb->state = 0;
 		return 1;  /* Need new input */
 	}

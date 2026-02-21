@@ -1318,7 +1318,7 @@ static void *sdr_read_child(void *arg)
 		double now = get_time();
 		if (now - thr_timer >= 1.0) {
 			int fill = (sdr->thread_read.in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size;
-			LOGP(DSDR, LOGL_NOTICE, "RX_THREAD: calls=%d written=%d zero_space=%d zero_count=%d | fill=%d/%d\n",
+			LOGP(DSDR, LOGL_DEBUG, "RX_THREAD: calls=%d written=%d zero_space=%d zero_count=%d | fill=%d/%d\n",
 			     thr_dbg_cnt, thr_total_written, thr_zero_space, thr_zero_count,
 			     fill/2, sdr->thread_read.buffer_size/2);
 			thr_dbg_cnt = 0;
@@ -1714,13 +1714,6 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 			if (available_dsp_samples < num)
 				num = available_dsp_samples;
 			input_num = num * rx_os;
-			/* DEBUG: show buffer state for channelizer */
-			static int buf_dbg = 0;
-			if (++buf_dbg >= 100) {
-				LOGP(DSDR, LOGL_DEBUG, "CHAN BUF: fill=%d avail_sdr=%d avail_dsp=%d num=%d input_num=%d\n",
-				     fill, available_sdr_samples, available_dsp_samples, num, input_num);
-				buf_dbg = 0;
-			}
 		} else if (use_rx_polyphase) {
 			/* Don't clamp num — the resampler tracks exact in_count/out_count
 			 * state and will produce the correct number of outputs.
@@ -2012,55 +2005,16 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		// Channelizer Processing
 		int final_count = 0;
 		
-		/* Sample rate tracking for channelizer */
-		static long long ch_in_total = 0, ch_out_total = 0;
-		static double ch_rate_timer = 0;
-		
 		if (channels == 0) {
 			/* Radio mode: decimate IQ data using the radio's channelizer.
 			 * The radio does its own FM demodulation, it just needs decimated IQ.
 			 * Use the halfband channelizer for proper anti-alias filtering. */
 			int ch_in = count * rx_os;
 			
-			/* DEBUG: IQ levels before channelizer */
-			static double ch_in_peak = 0, ch_in_pwr = 0;
-			static int ch_in_samples = 0;
-			static int ch_dbg_cnt = 0;
-			for (s = 0; s < ch_in; s++) {
-				double pwr = buff[s*2] * buff[s*2] + buff[s*2+1] * buff[s*2+1];
-				ch_in_pwr += pwr;
-				double mag = sqrt(pwr);
-				if (mag > ch_in_peak) ch_in_peak = mag;
-				ch_in_samples++;
-			}
-			
 			/* Use the radio channelizer (initialized in sdr_open when channels=0 && use_channelizer) */
 			if (sdr->radio_channelizer_init) {
 				int ch_out = channelizer_process(&sdr->radio_channelizer, buff, ch_in, 
 				                                  sdr->radio_ch_I, sdr->radio_ch_Q);
-				
-				/* DEBUG: IQ levels after channelizer */
-				static double ch_out_peak = 0, ch_out_pwr = 0;
-				static int ch_out_samples = 0;
-				for (s = 0; s < ch_out; s++) {
-					double pwr = sdr->radio_ch_I[s] * sdr->radio_ch_I[s] + 
-					             sdr->radio_ch_Q[s] * sdr->radio_ch_Q[s];
-					ch_out_pwr += pwr;
-					double mag = sqrt(pwr);
-					if (mag > ch_out_peak) ch_out_peak = mag;
-					ch_out_samples++;
-				}
-				
-				ch_dbg_cnt++;
-				if (ch_dbg_cnt >= 100) {
-					double in_rms = sqrt(ch_in_pwr / ch_in_samples);
-					double out_rms = sqrt(ch_out_pwr / ch_out_samples);
-					LOGP(DSDR, LOGL_NOTICE, "CHAN IQ: in_peak=%.4f in_rms=%.4f | out_peak=%.4f out_rms=%.4f | ch_in=%d ch_out=%d\n",
-					     ch_in_peak, in_rms, ch_out_peak, out_rms, ch_in, ch_out);
-					ch_in_peak = ch_in_pwr = ch_in_samples = 0;
-					ch_out_peak = ch_out_pwr = ch_out_samples = 0;
-					ch_dbg_cnt = 0;
-				}
 				
 				/* Interleave I/Q back to output buffer */
 				float *out = (float *)samples;
@@ -2069,8 +2023,6 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 					out[s * 2 + 1] = (float)sdr->radio_ch_Q[s];
 				}
 				
-				ch_in_total += ch_in;
-				ch_out_total += ch_out;
 				final_count = ch_out;
 			} else {
 				/* Fallback: simple decimation (not ideal but works) */
@@ -2080,25 +2032,7 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 					out[s * 2] = buff[s * rx_os * 2];
 					out[s * 2 + 1] = buff[s * rx_os * 2 + 1];
 				}
-				ch_in_total += ch_in;
-				ch_out_total += ch_out;
 				final_count = ch_out;
-			}
-			
-			/* Log channelizer rate stats every second */
-			if (ch_rate_timer == 0.0) {
-				ch_rate_timer = get_time();
-			} else {
-				double now = get_time();
-				if (now - ch_rate_timer >= 1.0) {
-					double in_rate = ch_in_total / (now - ch_rate_timer);
-					double out_rate = ch_out_total / (now - ch_rate_timer);
-					LOGP(DSDR, LOGL_NOTICE, "CHANNELIZER RATE (radio): in=%.0f Hz out=%.0f Hz ratio=%.4f (expect %d)\n",
-					     in_rate, out_rate, in_rate / out_rate, rx_os);
-					ch_in_total = 0;
-					ch_out_total = 0;
-					ch_rate_timer = now;
-				}
 			}
 			
 			return final_count;
@@ -2111,9 +2045,6 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 			// channelizer_process takes Input Count.
 			int ch_in = count * rx_os;
 			int ch_out = channelizer_process(&sdr->chan[c].channelizer, (float*)buff, ch_in, sdr->chan[c].ch_I, sdr->chan[c].ch_Q);
-			
-			ch_in_total += ch_in;
-			ch_out_total += ch_out;
 			
 			// Use actual channelizer output count
 			if (ch_out != count) {
@@ -2169,22 +2100,6 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 				/* Update per-channel RX status */
 				sdr_status_rx_chan_update(c, rf_level_db ? rf_level_db[c] : avg,
 							 avg, max - min, sdr->chan[c].rx_frequency);
-			}
-		}
-		
-		/* Log channelizer rate stats every second */
-		if (ch_rate_timer == 0.0) {
-			ch_rate_timer = get_time();
-		} else {
-			double now = get_time();
-			if (now - ch_rate_timer >= 1.0) {
-				double in_rate = ch_in_total / (now - ch_rate_timer);
-				double out_rate = ch_out_total / (now - ch_rate_timer);
-				LOGP(DSDR, LOGL_NOTICE, "CHANNELIZER RATE: in=%.0f Hz out=%.0f Hz ratio=%.4f (expect %d)\n",
-				     in_rate, out_rate, in_rate / out_rate, rx_os);
-				ch_in_total = 0;
-				ch_out_total = 0;
-				ch_rate_timer = now;
 			}
 		}
 		

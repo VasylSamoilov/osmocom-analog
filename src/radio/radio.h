@@ -50,9 +50,6 @@ typedef struct afc_state {
 	double correction_hz;     /* Applied NCO correction (Hz) */
 	double time_constant_s;   /* IIR time constant (default 5s for broadcast FM) */
 	double max_correction_hz; /* Limit (default 5000 Hz) */
-	/* Legacy DC method (kept for debug comparison - unreliable) */
-	double dc_avg;            /* IIR-averaged DC offset (normalized) */
-	double dc_freq_error_hz;  /* DC method frequency error (debug only) */
 	/* Debug/statistics */
 	double peak_error_hz;     /* Peak frequency error seen */
 	uint64_t update_count;    /* Number of AFC updates */

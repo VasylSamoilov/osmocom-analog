@@ -21,7 +21,7 @@
 #define CHANNELIZER_MAX_STAGES 8
 
 /* Default filter order */
-#define CHANNELIZER_DEFAULT_ORDER HALFBAND_ORDER_48
+#define CHANNELIZER_DEFAULT_ORDER HALFBAND_ORDER_32
 
 /* Channelizer state */
 typedef struct channelizer {
