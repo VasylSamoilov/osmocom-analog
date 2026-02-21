@@ -16,11 +16,11 @@ audio_debug_t g_rx_debug;
 static const char *stage_names[] = {
 	"SDR_RAW",
 	"CHANNELIZER", 
-	"FM_DEMOD",
+	"FM_DEMOD",      /* >1.0 = over-modulation (>75kHz dev), common in broadcast */
 	"STEREO_DEC",
 	"DEEMPH",
 	"RESAMPLE",
-	"AUDIO_OUT"
+	"AUDIO_OUT"      /* >1.0 = actual audio clipping */
 };
 
 static double get_time_sec(void)
@@ -144,6 +144,28 @@ void audio_debug_jitter_overrun(audio_debug_t *dbg)
 	     (unsigned long)dbg->jitter_overruns);
 }
 
+void audio_debug_afc(audio_debug_t *dbg, double dc_offset, double freq_error_hz,
+                     double correction_hz, double dc_freq_error_hz,
+                     double pilot_accuracy_hz, int using_pll_method, int pll_locked)
+{
+	if (!dbg->enabled)
+		return;
+	
+	dbg->afc.dc_offset = dc_offset;
+	dbg->afc.freq_error_hz = freq_error_hz;
+	dbg->afc.correction_hz = correction_hz;
+	dbg->afc.dc_freq_error_hz = dc_freq_error_hz;
+	dbg->afc.pilot_accuracy_hz = pilot_accuracy_hz;
+	dbg->afc.using_pll_method = using_pll_method;
+	dbg->afc.pll_locked = pll_locked;
+	dbg->afc.update_count++;
+	
+	/* Track peak error */
+	double abs_err = fabs(freq_error_hz);
+	if (abs_err > dbg->afc.peak_error_hz)
+		dbg->afc.peak_error_hz = abs_err;
+}
+
 void audio_debug_report(audio_debug_t *dbg)
 {
 	if (!dbg->enabled)
@@ -175,11 +197,24 @@ void audio_debug_report_now(audio_debug_t *dbg)
 		double peak_db = (peak > 0) ? 20.0 * log10(peak) : -999;
 		double rms_db = (rms > 0) ? 20.0 * log10(rms) : -999;
 		
+		/* For FM_DEMOD, >1.0 means over-modulation (>75kHz), not clipping.
+		 * For intermediate stages (STEREO_DEC, DEEMPH, RESAMPLE), >1.0 is just
+		 * "over" nominal level - no actual clipping since we use float/double.
+		 * Only AUDIO_OUT has real clipping when written to 16-bit PCM. */
+		const char *exceed_label;
+		if (i == RX_STAGE_FM_DEMOD)
+			exceed_label = "ovmod";
+		else if (i == RX_STAGE_AUDIO_OUT)
+			exceed_label = "clip";
+		else
+			exceed_label = "over";
+		
 		LOGP(DRADIO, LOGL_INFO,
-		     "  %-12s: peak=%.4f (%+.1fdB) rms=%.4f (%+.1fdB) clip=%lu disc=%lu n=%.1fM\n",
+		     "  %-12s: peak=%.4f (%+.1fdB) rms=%.4f (%+.1fdB) %s=%lu disc=%lu n=%.1fM\n",
 		     stage_names[i],
 		     peak, peak_db,
 		     rms, rms_db,
+		     exceed_label,
 		     (unsigned long)s->clip_count,
 		     (unsigned long)s->discontinuities,
 		     s->sample_count / 1e6);
@@ -208,6 +243,27 @@ void audio_debug_report_now(audio_debug_t *dbg)
 		     loss_pct,
 		     (unsigned long)dbg->jitter_underruns,
 		     (unsigned long)dbg->jitter_overruns);
+	}
+	
+	/* AFC stats */
+	if (dbg->afc.update_count > 0) {
+		/* FLL_err: carrier offset from FLL (used for AFC correction)
+		 * DC_err: legacy DC method (unreliable, debug only)
+		 * pilot: 19 kHz pilot accuracy (station TX quality, not tuning error)
+		 * corr: NCO correction being applied
+		 * peak: max FLL error this period
+		 * pilot_lock: stereo pilot PLL lock status (not same as stereo mode!) */
+		LOGP(DRADIO, LOGL_INFO,
+		     "  AFC: FLL_err=%+.1fHz DC_err=%+.1fHz pilot=%+.1fHz corr=%+.1fHz peak=%.1fHz n=%lu pilot_lock=%d\n",
+		     dbg->afc.freq_error_hz,
+		     dbg->afc.dc_freq_error_hz,
+		     dbg->afc.pilot_accuracy_hz,
+		     dbg->afc.correction_hz,
+		     dbg->afc.peak_error_hz,
+		     (unsigned long)dbg->afc.update_count,
+		     dbg->afc.pll_locked);
+		/* Reset peak for next period */
+		dbg->afc.peak_error_hz = 0;
 	}
 	
 	LOGP(DRADIO, LOGL_INFO, "=============================\n");

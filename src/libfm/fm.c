@@ -318,6 +318,19 @@ void fm_demod_exit(fm_demod_t __attribute__ ((unused)) *demod)
 {
 }
 
+/* Update FM demodulator frequency offset (for AFC) */
+void fm_demod_set_offset(fm_demod_t *demod, double offset_hz)
+{
+	/* Protect against NaN - don't update if offset is invalid */
+	if (!isfinite(offset_hz))
+		return;
+	
+	if (fast_math)
+		demod->rot = 65536.0 * -offset_hz / demod->samplerate;
+	else
+		demod->rot = 2 * M_PI * -offset_hz / demod->samplerate;
+}
+
 static inline float fast_tan(float z)
 {
 	const float n1 = 0.97239411f;
@@ -363,6 +376,7 @@ void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, f
 	rate = demod->samplerate;
 	phase = demod->phase;
 	rot = demod->rot;
+	
 	for (s = 0, ss = 0; s < length; s++) {
 		phase += rot;
 		i = baseband[ss++];

@@ -22,6 +22,7 @@ SUBDIRS = \
 	libam \
 	libfm \
 	libfilter \
+	libpll \
 	libchannelizer \
 	libfastmath \
 	libiqringbuf \

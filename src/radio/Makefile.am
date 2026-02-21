@@ -45,6 +45,7 @@ osmoradio_LDADD = \
 	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libclipper/libclipper.a \
 	$(top_builddir)/src/libcompandor/libcompandor.a \
+	$(top_builddir)/src/libpll/libpll.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libemphasis/libemphasis.a \

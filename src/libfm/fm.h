@@ -42,6 +42,7 @@ typedef struct fm_demod {
 
 int fm_demod_init(fm_demod_t *demod, double samplerate, double offset, double bandwidth);
 void fm_demod_exit(fm_demod_t *demod);
+void fm_demod_set_offset(fm_demod_t *demod, double offset_hz);
 void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, float *baseband, sample_t *I, sample_t *Q);
 void fm_demodulate_real(fm_demod_t *demod, sample_t *frequency, int length, sample_t *baseband, sample_t *I, sample_t *Q);
 

@@ -502,6 +502,14 @@ static void print_help(const char *arg0)
 	printf("        Auto-select several required options for LimeSDR\n");
 	printf("    --limesdr-mini\n");
 	printf("        Auto-select several required options for LimeSDR Mini\n");
+	printf("    --afc\n");
+	printf("        Enable AFC (Automatic Frequency Control) for mono FM.\n");
+	printf("        Corrects frequency offset using DC measurement after FM demod.\n");
+	printf("    --afc-tc <ms>\n");
+	printf("        AFC time constant in milliseconds (default 300).\n");
+	printf("        Larger values = slower but more stable tracking.\n");
+	printf("    --afc-max <Hz>\n");
+	printf("        Maximum AFC correction in Hz (default 5000).\n");
 	logging_print_help();
 	sdr_config_print_help();
 }
@@ -509,6 +517,9 @@ static void print_help(const char *arg0)
 static int channelizer_rate = 0; /* 0 = disabled */
 static int use_channelizer = 0;
 static int use_polyphase = 0;
+static int use_afc = 0;
+static double afc_tc_ms = 300.0;
+static double afc_max_hz = 5000.0;
 
 #define	OPT_FAST_MATH		1007
 #define	OPT_RDS			1008
@@ -528,6 +539,9 @@ static int use_polyphase = 0;
 #define OPT_RDS_PAGING		1106
 #define OPT_RDS_HEXRDS_FILE	1107
 #define OPT_RDS_BITSTREAM_FILE	1108
+#define OPT_AFC			1118
+#define OPT_AFC_TC		1119
+#define OPT_AFC_MAX		1120
 #define OPT_XDR_GTK_SERVER	1109
 #define OPT_RDSSPY_SERVER	1110
 #define OPT_UECP_SERVER		1111
@@ -584,6 +598,9 @@ static void add_options(void)
 	option_add(OPT_XDR_GTK_PASSWORD, "xdr-gtk-password", 1);
 	option_add(OPT_RIGCTL_SERVER, "rigctl-server", 1);
 	option_add(OPT_RIGCTL_ALLOWED, "rigctl-allowed-hosts", 1);
+	option_add(OPT_AFC, "afc", 0);
+	option_add(OPT_AFC_TC, "afc-tc", 1);
+	option_add(OPT_AFC_MAX, "afc-max", 1);
         sdr_config_add_options();
 }
 
@@ -789,6 +806,19 @@ static int handle_options(int short_option, int argi, char **argv)
 			int argc_lime = sizeof(argv_lime) / sizeof (*argv_lime);
 			return options_command_line(argc_lime, argv_lime, handle_options);
 		}
+	case OPT_AFC:
+		use_afc = 1;
+		break;
+	case OPT_AFC_TC:
+		afc_tc_ms = atof(argv[argi]);
+		if (afc_tc_ms < 10.0) afc_tc_ms = 10.0;
+		if (afc_tc_ms > 10000.0) afc_tc_ms = 10000.0;
+		break;
+	case OPT_AFC_MAX:
+		afc_max_hz = atof(argv[argi]);
+		if (afc_max_hz < 100.0) afc_max_hz = 100.0;
+		if (afc_max_hz > 50000.0) afc_max_hz = 50000.0;
+		break;
 	default:
 		return sdr_config_handle_options(short_option, argi, argv);
 	}
@@ -1040,6 +1070,13 @@ int main(int argc, char *argv[])
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
 		exit(0);
+	}
+
+	/* Configure AFC if enabled */
+	if (use_afc && modulation == MODULATION_FM) {
+		radio_afc_set_time_constant(&radio, afc_tc_ms / 1000.0);
+		radio_afc_set_max_correction(&radio, afc_max_hz);
+		radio_afc_enable(&radio, 1);
 	}
 
 	/* Initialize signal meter (FFT-based, same approach as scan engine).

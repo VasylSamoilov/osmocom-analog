@@ -1236,6 +1236,49 @@ void radio_set_forced_mono(radio_t *radio, int forced)
 	LOGP(DRADIO, LOGL_INFO, "Forced mono: %s\n", forced ? "ON" : "OFF");
 }
 
+/* AFC control functions */
+void radio_afc_enable(radio_t *radio, int enable)
+{
+	radio->afc.enabled = enable;
+	if (!enable) {
+		/* Reset AFC state and NCO offset when disabled */
+		radio->afc.dc_avg = 0.0;
+		radio->afc.freq_error_hz = 0.0;
+		radio->afc.correction_hz = 0.0;
+		fm_demod_set_offset(&radio->fm_demod, 0.0);
+	}
+	LOGP(DRADIO, LOGL_INFO, "AFC: %s (tc=%.0fms, max=%.0fHz)\n", 
+	     enable ? "ON" : "OFF",
+	     radio->afc.time_constant_s * 1000.0,
+	     radio->afc.max_correction_hz);
+}
+
+void radio_afc_set_time_constant(radio_t *radio, double tc_seconds)
+{
+	if (tc_seconds < 0.01) tc_seconds = 0.01;  /* Min 10ms */
+	if (tc_seconds > 10.0) tc_seconds = 10.0;  /* Max 10s */
+	radio->afc.time_constant_s = tc_seconds;
+	LOGP(DRADIO, LOGL_INFO, "AFC time constant: %.0f ms\n", tc_seconds * 1000.0);
+}
+
+void radio_afc_set_max_correction(radio_t *radio, double max_hz)
+{
+	if (max_hz < 100.0) max_hz = 100.0;     /* Min 100 Hz */
+	if (max_hz > 50000.0) max_hz = 50000.0; /* Max 50 kHz */
+	radio->afc.max_correction_hz = max_hz;
+	LOGP(DRADIO, LOGL_INFO, "AFC max correction: %.0f Hz\n", max_hz);
+}
+
+double radio_afc_get_correction(radio_t *radio)
+{
+	return radio->afc.correction_hz;
+}
+
+double radio_afc_get_freq_error(radio_t *radio)
+{
+	return radio->afc.freq_error_hz;
+}
+
 int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int rds_force_rbds)
 {
 	int rc = -EINVAL;
@@ -1547,7 +1590,17 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	/* stereo pilot tone phase */
 	radio->pilot_phasestep = 2.0 * M_PI * PILOT_FREQ / radio->signal_samplerate;
 
-	/* stere decoding filters */
+	/* Initialize PLL for 19 kHz pilot tracking
+	 * freq: 19000 / samplerate (normalized)
+	 * bandwidth: 50 Hz / samplerate (narrow for clean tracking)
+	 * min_signal: 0.01 (1% pilot level for lock)
+	 */
+	pll_init(&radio->rx_pilot_pll, 
+	         PILOT_FREQ / radio->signal_samplerate,
+	         50.0 / radio->signal_samplerate,
+	         0.01);
+
+	/* Legacy stereo decoding filters (kept for fallback/comparison) */
 	iir_lowpass_init(&radio->rx_lp_pilot_I, PILOT_BW, radio->signal_samplerate, 2);
         iir_lowpass_init(&radio->rx_lp_pilot_Q, PILOT_BW, radio->signal_samplerate, 2);
         iir_lowpass_init(&radio->rx_lp_sum, STEREO_BW, radio->signal_samplerate, 2);
@@ -1648,6 +1701,12 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		rc = fm_demod_init(&radio->fm_demod, radio->signal_samplerate, 0.0, radio->rf_bandwidth);
 		if (rc < 0)
 			goto error;
+		
+		/* Initialize AFC for mono FM (disabled by default, enable with --afc) */
+		memset(&radio->afc, 0, sizeof(radio->afc));
+		radio->afc.time_constant_s = 0.3;      /* 300ms IIR time constant */
+		radio->afc.max_correction_hz = 5000.0; /* ±5 kHz max correction */
+		
 		if (stereo) {
 			sprintf(freq_name[0], "%.4f MHz left", frequency / 1e6);
 			sprintf(freq_name[1], "%.4f MHz right", frequency / 1e6);
@@ -2501,7 +2560,6 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 	int i;
 	int audio_num;
 	sample_t *samples[3];
-	double p;
 #ifdef HAVE_ALSA
 	jitter_frame_t *jf;
 #endif
@@ -2542,133 +2600,195 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		/* DEBUG: Track levels after FM demod */
 		audio_debug_stage(&g_rx_debug, RX_STAGE_FM_DEMOD, samples[0], signal_num);
 		
-		/* Decode RDS from FM baseband if enabled */
-		if (radio->rds || radio->rds2) {
-			/* Pass pilot phase WITH phase offset compensation (same as stereo decoder)
-			 * The rx_pll_freq_offset compensates for IIR filter group delay and
-			 * TX/RX frequency offset. RDS at 57 kHz = 3 x pilot needs 3x the offset.
-			 */
-			double rds_pilot_phase = radio->rx_pilot_phase - radio->rx_pll_freq_offset;
-			rds_decoder_process(&radio->rds_dec, samples[0], signal_num,
-			                    rds_pilot_phase, radio->pilot_phasestep);
-		}
-		if (radio->stereo) {
-			/*
-			 * FM STEREO DEMODULATION (Pilot-Tone System)
-			 * ==========================================
-			 * FM stereo uses DSB-SC modulation at 38 kHz (2x the 19 kHz pilot).
-			 * The stereo difference signal (L-R) is modulated onto this subcarrier.
-			 *
-			 * Challenge: The narrow-band IIR pilot filter (5 Hz BW) needed to extract
-			 * the 19 kHz pilot from the FM baseband introduces significant group delay.
-			 * This makes per-sample phase tracking unreliable (the measured phase drifts
-			 * continuously as our local oscillator advances).
-			 *
-			 * Solution: Block-level phase offset tracking
-			 * 1. Demodulate using local 38 kHz oscillator with a fixed phase offset
-			 * 2. Measure the actual phase offset once per block (from filtered I/Q)
-			 * 3. Slowly track the average offset (~1 second time constant)
-			 *
-			 * The tracked offset compensates for:
-			 * - IIR filter group delay (~13deg at 5 Hz BW)
-			 * - Any transmitter/receiver frequency offset
-			 * - SDR sample rate inaccuracies
-			 */
+		/* AFC (Automatic Frequency Control) for FM
+		 * Uses FLL (Frequency-Locked Loop) on IQ samples.
+		 * Based on SDRangel's FreqLockComplex implementation.
+		 * 
+		 * The FLL measures instantaneous frequency by tracking phase
+		 * differences between consecutive IQ samples. The IIR-filtered
+		 * average frequency IS the carrier offset from center.
+		 * 
+		 * This runs on the raw IQ baseband samples, measuring the average
+		 * phase rotation rate which equals the frequency offset.
+		 *
+		 * TODO: NFM (Narrow FM) support - same FLL approach works.
+		 */
+		if (radio->afc.enabled) {
+			/* FLL: Process IQ samples to measure average frequency
+			 * freq = d(phase)/dt = (phase[n] - phase[n-1]) per sample
+			 * IIR filter gives average frequency = carrier offset */
 			
-			/* Step 1: Stereo demodulation using local 38 kHz oscillator */
-			/* Apply tracked phase offset compensation */
-			double phase_offset = radio->rx_pll_freq_offset;
-			p = radio->rx_pilot_phase;
+			/* Compute FLL alpha from time constant if not set */
+			if (radio->afc.fll_alpha == 0.0) {
+				/* For broadcast FM, we need a LONG time constant to average out
+				 * the ±75 kHz audio modulation. 5 seconds works well.
+				 * alpha = 1 / (time_constant * samplerate) */
+				double tc_seconds = 5.0;
+				radio->afc.fll_alpha = 1.0 / (tc_seconds * radio->signal_samplerate);
+			}
+			
+			/* Process each IQ sample through FLL */
 			for (i = 0; i < signal_num; i++) {
-				/* 38 kHz carrier = 2x pilot phase, minus compensation offset */
-				double carrier_38k = (p - phase_offset) * 2.0;
-				if (fm_fast_math_enabled()) {
-					double sc_sin, sc_cos;
-					fm_fast_sincos(carrier_38k * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
-					samples[1][i] = samples[0][i] * sc_sin * 2.0;
+				double re = baseband[i * 2];
+				double im = baseband[i * 2 + 1];
+				
+				/* Get phase of current sample */
+				double phase = atan2(im, re);
+				
+				if (radio->afc.fll_initialized) {
+					/* Compute instantaneous frequency (phase difference) */
+					double delta_phase = phase - radio->afc.fll_last_phase;
+					
+					/* Normalize to [-pi, +pi] */
+					while (delta_phase <= -M_PI) delta_phase += 2.0 * M_PI;
+					while (delta_phase > M_PI) delta_phase -= 2.0 * M_PI;
+					
+					/* IIR filter: freq = alpha * delta_phase + (1-alpha) * freq */
+					radio->afc.fll_freq = radio->afc.fll_alpha * delta_phase + 
+					                      (1.0 - radio->afc.fll_alpha) * radio->afc.fll_freq;
 				} else {
-					samples[1][i] = samples[0][i] * sin(carrier_38k) * 2.0;
+					radio->afc.fll_initialized = 1;
 				}
 				
-				p += radio->pilot_phasestep;
-				if (p >= 2.0 * M_PI)
-					p -= 2.0 * M_PI;
+				radio->afc.fll_last_phase = phase;
 			}
 			
-			/* Step 2: Measure phase offset using I/Q mixing at end of block */
-			/* Compute I and Q simultaneously using sincos for efficiency */
-			p = radio->rx_pilot_phase;
+			/* Convert FLL frequency (rad/sample) to Hz */
+			double fll_freq_hz = (radio->afc.fll_freq * radio->signal_samplerate) / (2.0 * M_PI);
+			
+			/* Protect against NaN */
+			if (!isfinite(fll_freq_hz))
+				fll_freq_hz = 0.0;
+			
+			radio->afc.freq_error_hz = fll_freq_hz;
+			
+			/* Legacy DC method for debug comparison */
+			{
+				double dc_sum = 0.0;
+				for (i = 0; i < signal_num; i++)
+					dc_sum += samples[0][i];
+				double dc_block = dc_sum / signal_num;
+				if (!isfinite(dc_block)) dc_block = 0.0;
+				
+				double alpha = (double)signal_num / (radio->afc.time_constant_s * radio->signal_samplerate);
+				if (alpha > 1.0) alpha = 1.0;
+				radio->afc.dc_avg += alpha * (dc_block - radio->afc.dc_avg);
+				if (!isfinite(radio->afc.dc_avg)) radio->afc.dc_avg = 0.0;
+				
+				radio->afc.dc_freq_error_hz = radio->afc.dc_avg * radio->fm_deviation;
+			}
+			
+			/* Pilot accuracy measurement (when stereo/RDS active)
+			 * This measures how accurate the station's 19 kHz pilot is - NOT tuning error!
+			 * The pilot is always at 19 kHz in the FM baseband regardless of carrier offset.
+			 * Useful for diagnosing station transmitter issues. */
+			double pilot_accuracy_hz = 0.0;
+			if (radio->stereo || radio->rds || radio->rds2) {
+				pilot_accuracy_hz = pll_get_freq_error_hz(&radio->rx_pilot_pll, radio->signal_samplerate);
+				if (!isfinite(pilot_accuracy_hz))
+					pilot_accuracy_hz = 0.0;
+			}
+			
+			/* Apply correction with limit */
+			double correction = radio->afc.freq_error_hz;
+			if (correction > radio->afc.max_correction_hz)
+				correction = radio->afc.max_correction_hz;
+			else if (correction < -radio->afc.max_correction_hz)
+				correction = -radio->afc.max_correction_hz;
+			
+			radio->afc.correction_hz = correction;
+			radio->afc.update_count++;
+			
+			/* Update FM demodulator NCO offset to correct carrier offset */
+			fm_demod_set_offset(&radio->fm_demod, correction);
+			
+			/* Track peak error for debug */
+			double abs_err = fabs(radio->afc.freq_error_hz);
+			if (abs_err > radio->afc.peak_error_hz)
+				radio->afc.peak_error_hz = abs_err;
+			
+			/* Update audio debug stats
+			 * FLL_err = carrier offset (used for AFC)
+			 * DC_err = legacy method (unreliable)
+			 * pilot = 19 kHz accuracy (station TX quality, not tuning) */
+			audio_debug_afc(&g_rx_debug, radio->afc.dc_avg, 
+			                radio->afc.freq_error_hz, radio->afc.correction_hz,
+			                radio->afc.dc_freq_error_hz, pilot_accuracy_hz,
+			                0, pll_is_locked(&radio->rx_pilot_pll));
+		}
+		
+		/* Process PLL and stereo demodulation together
+		 * The PLL tracks the 19 kHz pilot and provides phase-locked outputs for:
+		 * - Stereo demodulation (38 kHz = 2x pilot)
+		 * - RDS decoding (57 kHz = 3x pilot)
+		 */
+		if (radio->stereo || radio->rds || radio->rds2) {
+			double pll_outputs[4];
+			
 			for (i = 0; i < signal_num; i++) {
-				double sc_sin, sc_cos;
-				if (fm_fast_math_enabled()) {
-					fm_fast_sincos(p * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
-				} else {
-					sincos(p, &sc_sin, &sc_cos);
+				/* Feed FM baseband to PLL - it tracks the 19 kHz pilot */
+				pll_process(&radio->rx_pilot_pll, samples[0][i]);
+				
+				/* Stereo demodulation using PLL's 38 kHz carrier */
+				if (radio->stereo) {
+					pll_get_stereo_outputs(&radio->rx_pilot_pll, pll_outputs);
+					/* pll_outputs[1] = sin(2*phase) = 38 kHz carrier
+					 * DSB-SC demod produces (L-R)/2, but L/R matrix also divides by 2,
+					 * so no extra gain needed here - the math works out correctly */
+					samples[1][i] = samples[0][i] * pll_outputs[1];
 				}
-				radio->I_buffer[i] = samples[0][i] * sc_cos;  /* I component */
-				radio->Q_buffer[i] = samples[0][i] * sc_sin;  /* Q component */
-				p += radio->pilot_phasestep;
-				if (p >= 2.0 * M_PI)
-					p -= 2.0 * M_PI;
 			}
-			/* Filter I channel (copy to samples[2] for in-place filtering) */
-			for (i = 0; i < signal_num; i++)
-				samples[2][i] = radio->I_buffer[i];
-			iir_process(&radio->rx_lp_pilot_I, samples[2], signal_num);
-			double I_end = samples[2][signal_num - 1];
+		}
+		
+		/* Decode RDS from FM baseband if enabled */
+		if (radio->rds || radio->rds2) {
+			/* Use PLL phase for RDS decoding. RDS at 57 kHz = 3 x pilot.
+			 * The PLL tracks frequency drift, so no manual offset needed. */
+			double rds_pilot_phase = pll_get_phase(&radio->rx_pilot_pll);
+			double pll_freq = pll_get_freq(&radio->rx_pilot_pll);
+			rds_decoder_process(&radio->rds_dec, samples[0], signal_num,
+			                    rds_pilot_phase, pll_freq);
+		}
+		
+		if (radio->stereo) {
+			/*
+			 * FM STEREO - Post-processing
+			 * ===========================
+			 * PLL processing and stereo demodulation done above.
+			 * Now handle pilot lock detection and filtering.
+			 */
 			
-			/* Filter Q channel */
-			for (i = 0; i < signal_num; i++)
-				samples[2][i] = radio->Q_buffer[i];
-			iir_process(&radio->rx_lp_pilot_Q, samples[2], signal_num);
-			double Q_end = samples[2][signal_num - 1];
+			/* Get pilot level and lock status from PLL */
+			double pilot_mag = pll_get_level(&radio->rx_pilot_pll);
+			int pll_locked = pll_is_locked(&radio->rx_pilot_pll);
+			double freq_error_hz = pll_get_freq_error_hz(&radio->rx_pilot_pll, radio->signal_samplerate);
 			
-			/* Quadrature demodulation gives half amplitude due to sin²(x) = (1-cos(2x))/2.
-			 * Multiply by 2 to get true pilot injection level (0.1 = 10% = 7.5 kHz). */
-			double pilot_mag = 2.0 * sqrt(I_end * I_end + Q_end * Q_end);
-
-			/* IIR-smooth pilot magnitude (~100ms time constant).
-			 * alpha = block_size / (TC_s * samplerate) clamped to [0,1].
-			 * Smoothed value is used for lock/unlock decisions so that
-			 * brief noise dips don't reset the acquisition counter. */
+			/* IIR-smooth pilot magnitude (~100ms time constant) for hysteresis */
 #define PILOT_MAG_SMOOTH_TC_S	0.1		/* 100 ms IIR time constant */
 			{
 				double alpha = (double)signal_num / (PILOT_MAG_SMOOTH_TC_S * radio->signal_samplerate);
 				if (alpha > 1.0) alpha = 1.0;
 				radio->rx_pilot_mag_avg += alpha * (pilot_mag - radio->rx_pilot_mag_avg);
 			}
-
-			/* Expose raw pilot magnitude for external use */
+			
+			/* Expose pilot magnitude for external use */
 			radio->rx_pilot_mag = pilot_mag;
-
-			if (pilot_mag > 1e-9) {
-				/* Measured phase = offset between our oscillator and received pilot */
-				double measured_offset = atan2(Q_end, I_end);
-
-				/* Normalize to -45..+45 degrees for 90deg periodicity of sin(2x) */
-				while (measured_offset > M_PI/4) measured_offset -= M_PI/2;
-				while (measured_offset < -M_PI/4) measured_offset += M_PI/2;
-
-				/* Track average offset with slow IIR (time constant ~1 second) */
-				double alpha_pll = 1.0 / (radio->signal_samplerate * 1.0);  /* 1 second TC */
-				radio->rx_pll_freq_offset += alpha_pll * signal_num * (measured_offset - radio->rx_pll_freq_offset);
-			}
-			/* Update pilot phase for next block */
-			radio->rx_pilot_phase = p;
-
-			/* Periodic debug: pilot magnitude, phase offset, lock state, counters */
+			
+			/* Periodic debug: pilot magnitude, frequency error, lock state */
 			{
 				static double dbg_accum = 0.0;
 				dbg_accum += signal_num;
 				if (dbg_accum >= radio->signal_samplerate) {
 					dbg_accum = 0.0;
 					LOGP(DRADIO, LOGL_DEBUG,
-					     "Stereo pilot: mag=%.4f avg=%.4f phase_off=%.1fdeg locked=%d "
-					     "above=%.0fms below=%.0fms cooldown=%.0fms\n",
+					     "Stereo PLL: mag=%.4f avg=%.4f freq_err=%.1fHz pll_lock=%d "
+					     "stereo=%d blend=%.0f%% above=%.0fms below=%.0fms cooldown=%.0fms\n",
 					     pilot_mag,
 					     radio->rx_pilot_mag_avg,
-					     radio->rx_pll_freq_offset * (180.0 / M_PI),
+					     freq_error_hz,
+					     pll_locked,
 					     radio->rx_pilot_locked,
+					     radio->rx_stereo_blend * 100.0,
 					     radio->rx_pilot_above_samples / radio->signal_samplerate * 1000.0,
 					     radio->rx_pilot_below_samples / radio->signal_samplerate * 1000.0,
 					     (radio->rx_pilot_cooldown > 0.0 ? radio->rx_pilot_cooldown : 0.0) / radio->signal_samplerate * 1000.0);
@@ -2677,12 +2797,9 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 
 			/* --- Pilot lock/unlock with integrating hysteresis + cooldown ---
 			 *
-			 * Two independent counters accumulate time while the pilot is
-			 * continuously above LOCK_THR (for acquisition) or continuously
-			 * below UNLOCK_THR (for loss).  A single block going the wrong
-			 * way resets that counter, so noise spikes can't trigger a switch.
-			 * State only changes after ACQUIRE/LOSS duration is met AND the
-			 * cooldown from the last transition has expired.
+			 * We use both PLL lock status AND pilot magnitude for robust detection.
+			 * The PLL provides fast lock detection, but we add hysteresis to prevent
+			 * rapid switching on weak/noisy signals.
 			 *
 			 * IEC 62106 / ITU-R BS.450 consumer practice: 50–200 ms each way.
 			 */
@@ -2691,7 +2808,7 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 
 			if (!radio->rx_pilot_locked) {
 				/* Trying to acquire stereo — use smoothed magnitude to ignore noise dips */
-				if (radio->rx_pilot_mag_avg >= PILOT_LOCK_THR) {
+				if (radio->rx_pilot_mag_avg >= PILOT_LOCK_THR && pll_locked) {
 					radio->rx_pilot_above_samples += signal_num;
 					radio->rx_pilot_below_samples  = 0.0;
 					if (radio->rx_pilot_cooldown <= 0.0 &&
@@ -2699,15 +2816,15 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 						radio->rx_pilot_locked        = 1;
 						radio->rx_pilot_above_samples = 0.0;
 						radio->rx_pilot_cooldown      = PILOT_COOLDOWN_S * radio->signal_samplerate;
-						LOGP(DRADIO, LOGL_NOTICE, "Stereo pilot locked (mag=%.4f avg=%.4f)\n",
-						     pilot_mag, radio->rx_pilot_mag_avg);
+						LOGP(DRADIO, LOGL_NOTICE, "Stereo pilot locked (mag=%.4f avg=%.4f freq_err=%.1fHz)\n",
+						     pilot_mag, radio->rx_pilot_mag_avg, freq_error_hz);
 					}
 				} else {
 					radio->rx_pilot_above_samples = 0.0;
 				}
 			} else {
 				/* Monitoring for pilot loss */
-				if (radio->rx_pilot_mag_avg < PILOT_UNLOCK_THR) {
+				if (radio->rx_pilot_mag_avg < PILOT_UNLOCK_THR || !pll_locked) {
 					radio->rx_pilot_below_samples += signal_num;
 					radio->rx_pilot_above_samples  = 0.0;
 					if (radio->rx_pilot_cooldown <= 0.0 &&
@@ -2717,6 +2834,8 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 						radio->rx_pilot_cooldown      = PILOT_COOLDOWN_S * radio->signal_samplerate;
 						LOGP(DRADIO, LOGL_NOTICE, "Stereo pilot lost (mag=%.4f avg=%.4f), switching to mono\n",
 						     pilot_mag, radio->rx_pilot_mag_avg);
+						/* Reset PLL when lock is lost */
+						pll_reset(&radio->rx_pilot_pll);
 					}
 				} else {
 					radio->rx_pilot_below_samples = 0.0;
@@ -2731,11 +2850,31 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			audio_debug_stage(&g_rx_debug, RX_STAGE_STEREO_DECODE, samples[0], signal_num);
 			audio_debug_stage(&g_rx_debug, RX_STAGE_STEREO_DECODE, samples[1], signal_num);
 
-			/* If pilot not locked or forced mono, zero the diff channel → mono fallback.
-			 * The L/R matrix below produces L=R=sum, clean mono output. */
-			if (!radio->rx_pilot_locked || radio->rx_forced_mono) {
-				for (i = 0; i < signal_num; i++)
-					samples[1][i] = 0.0;
+			/* Stereo blend: gradually reduce separation as signal weakens.
+			 * Uses smoothed pilot magnitude (100ms TC) for gradual transitions.
+			 * Full stereo above BLEND_HIGH, full mono below BLEND_LOW.
+			 * Thresholds are optimistic - prefer stereo when possible.
+			 * Requires pilot lock to enable any stereo (prevents noise decode). */
+#define STEREO_BLEND_HIGH	0.07	/* Full stereo above this pilot level */
+#define STEREO_BLEND_LOW	0.02	/* Full mono below this pilot level */
+			{
+				double blend = 1.0;
+				if (!radio->rx_pilot_locked || radio->rx_forced_mono) {
+					blend = 0.0;
+				} else if (radio->rx_pilot_mag_avg < STEREO_BLEND_HIGH) {
+					/* Gradual blend based on pilot magnitude */
+					blend = (radio->rx_pilot_mag_avg - STEREO_BLEND_LOW) 
+					      / (STEREO_BLEND_HIGH - STEREO_BLEND_LOW);
+					if (blend < 0.0) blend = 0.0;
+					if (blend > 1.0) blend = 1.0;
+				}
+				/* Apply blend to diff channel */
+				if (blend < 1.0) {
+					for (i = 0; i < signal_num; i++)
+						samples[1][i] *= blend;
+				}
+				/* Store for debug/display */
+				radio->rx_stereo_blend = blend;
 			}
 		}
 		if (radio->emphasis) {
@@ -2766,6 +2905,12 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			audio_debug_stage(&g_rx_debug, RX_STAGE_DEEMPHASIS, samples[1], signal_num);
 		break;
 	case MODULATION_AM_DSB:
+		/* TODO: Implement Synchronous AM (SAM) detection with carrier PLL tracking.
+		 * This would enable AFC for AM by tracking the carrier frequency.
+		 * Current envelope detection doesn't produce DC offset proportional to
+		 * frequency error, so AFC is not practical with envelope detection.
+		 * SAM approach: PLL locks to carrier, provides coherent demodulation
+		 * and frequency error estimate. See SDRangel's AM demod PLL option. */
 		am_demodulate_complex(&radio->am_demod, samples[0], signal_num, baseband, radio->I_buffer, radio->Q_buffer, radio->carrier_buffer);
 		break;
 	case MODULATION_AM_USB:
@@ -2807,38 +2952,60 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			samplerate_downsample(&radio->rx_resampler[1], samples[1], signal_num);
 	}
 
-	/* DEBUG: Track levels after resampling */
+	/* DEBUG: Track levels after resampling - BOTH channels for stereo */
 	audio_debug_stage(&g_rx_debug, RX_STAGE_RESAMPLE, samples[0], audio_num);
-	if (radio->stereo)
-		audio_debug_stage(&g_rx_debug, RX_STAGE_RESAMPLE, samples[1], audio_num);
+	if (radio->stereo) {
+		/* Track channel 1 separately to see if it has higher peaks */
+		double peak_ch1 = 0;
+		for (i = 0; i < audio_num; i++) {
+			double v = fabs(samples[1][i]);
+			if (v > peak_ch1) peak_ch1 = v;
+		}
+		if (peak_ch1 > 1.0) {
+			LOGP(DRADIO, LOGL_DEBUG, "RESAMPLE ch1 peak=%.4f (>1.0!)\n", peak_ch1);
+		}
+	}
 
-	/* dampen volume */
+	/* apply volume (multiply, not divide!) */
 	if (radio->volume != 1.0) {
 		for (i = 0; i < audio_num; i++)
-			samples[0][i] /= radio->volume;
+			samples[0][i] *= radio->volume;
 		if (radio->stereo) {
 			for (i = 0; i < audio_num; i++)
-				samples[1][i] /= radio->volume;
+				samples[1][i] *= radio->volume;
 		}
 	}
 
 	/* convert mono/stereo, (from differential signal) */
 	if (radio->stereo && radio->rx_audio_channels == 1) {
-		/* stereo to mono */
-		for (i = 0; i < audio_num; i++) {
-			samples[0][i] = (samples[0][i] + samples[1][i]) / 2.0;
-		}
+		/* stereo to mono: just use sum channel (L+R), ignore diff
+		 * The sum channel is already mono-compatible */
+		/* samples[0] already contains sum, nothing to do */
 	}
 	if (radio->stereo && radio->rx_audio_channels == 2) {
 		/* stereo from differential 
-		 * L = (sum + diff) / 2, R = (sum - diff) / 2
-		 * This ensures output stays within [-1, 1] when inputs are normalized */
-		double sum, diff;
-		for (i = 0; i < audio_num; i++) {
-			sum = samples[0][i];
-			diff = samples[1][i];
-			samples[0][i] = (sum + diff) / 2.0;
-			samples[1][i] = (sum - diff) / 2.0;
+		 * sum = L+R, diff = (L-R) after DSB-SC demod (half amplitude)
+		 * 
+		 * When pilot locked (true stereo):
+		 *   L = sum/2 + diff = (L+R)/2 + (L-R)/2 = L
+		 *   R = sum/2 - diff = (L+R)/2 - (L-R)/2 = R
+		 * 
+		 * When pilot not locked or forced mono (diff was zeroed earlier):
+		 *   Output sum directly to both channels (full mono level)
+		 */
+		if (radio->rx_pilot_locked && !radio->rx_forced_mono) {
+			/* True stereo decode */
+			double sum, diff;
+			for (i = 0; i < audio_num; i++) {
+				sum = samples[0][i];
+				diff = samples[1][i];
+				samples[0][i] = sum / 2.0 + diff;  /* L */
+				samples[1][i] = sum / 2.0 - diff;  /* R */
+			}
+		} else {
+			/* Mono fallback - clone sum to both channels */
+			for (i = 0; i < audio_num; i++)
+				samples[1][i] = samples[0][i];
 		}
 	}
 	if (!radio->stereo && radio->rx_audio_channels == 2) {
@@ -2848,6 +3015,24 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 	}
 
 	/* DEBUG: Track final audio output levels */
+	{
+		double peak0 = 0, peak1 = 0;
+		for (i = 0; i < audio_num; i++) {
+			double v = fabs(samples[0][i]);
+			if (v > peak0) peak0 = v;
+		}
+		if (radio->rx_audio_channels == 2) {
+			for (i = 0; i < audio_num; i++) {
+				double v = fabs(samples[1][i]);
+				if (v > peak1) peak1 = v;
+			}
+		}
+		static int dbg_cnt = 0;
+		if (++dbg_cnt % 100 == 0) {
+			LOGP(DRADIO, LOGL_DEBUG, "AUDIO_OUT: stereo=%d rx_ch=%d peak0=%.4f peak1=%.4f\n",
+			     radio->stereo, radio->rx_audio_channels, peak0, peak1);
+		}
+	}
 	audio_debug_stage(&g_rx_debug, RX_STAGE_AUDIO_OUT, samples[0], audio_num);
 	if (radio->stereo && radio->rx_audio_channels == 2)
 		audio_debug_stage(&g_rx_debug, RX_STAGE_AUDIO_OUT, samples[1], audio_num);

@@ -4,6 +4,7 @@
 #include "../libam/am.h"
 #include "../libpolyphase/polyphase.h"
 #include "../libcompandor/compandor.h"
+#include "../libpll/pll.h"
 #include "rds.h"
 #include "sca.h"
 #include "audio_debug.h"
@@ -22,6 +23,40 @@ enum audio_mode {
 	AUDIO_MODE_AUDIODEV = 2,
 	AUDIO_MODE_TESTTONE = 4,
 };
+
+/* AFC (Automatic Frequency Control) state for FM
+ * 
+ * Uses FLL (Frequency-Locked Loop) on IQ samples BEFORE FM demodulation.
+ * The FLL measures instantaneous frequency by tracking phase differences
+ * between consecutive IQ samples, then IIR-filters to get average frequency.
+ * This average frequency IS the carrier offset from center.
+ * 
+ * For broadcast FM with ±75 kHz deviation, a long time constant (5 seconds)
+ * is needed to average out the audio modulation and get the true carrier offset.
+ * 
+ * The 19 kHz stereo pilot PLL cannot be used for AFC because the pilot is
+ * always at 19 kHz in the FM baseband regardless of carrier offset - it only
+ * measures the station's pilot accuracy, not tuning error.
+ */
+typedef struct afc_state {
+	int enabled;              /* AFC on/off */
+	/* FLL state (operates on IQ samples before FM demod) */
+	double fll_last_phase;    /* Previous sample phase for frequency calculation */
+	double fll_freq;          /* IIR-filtered instantaneous frequency (rad/sample) */
+	double fll_alpha;         /* IIR filter coefficient (computed from time constant) */
+	int fll_initialized;      /* 1 after first sample processed */
+	/* Computed values */
+	double freq_error_hz;     /* Current carrier offset from FLL (Hz) */
+	double correction_hz;     /* Applied NCO correction (Hz) */
+	double time_constant_s;   /* IIR time constant (default 5s for broadcast FM) */
+	double max_correction_hz; /* Limit (default 5000 Hz) */
+	/* Legacy DC method (kept for debug comparison - unreliable) */
+	double dc_avg;            /* IIR-averaged DC offset (normalized) */
+	double dc_freq_error_hz;  /* DC method frequency error (debug only) */
+	/* Debug/statistics */
+	double peak_error_hz;     /* Peak frequency error seen */
+	uint64_t update_count;    /* Number of AFC updates */
+} afc_state_t;
 
 typedef struct radio {
 	/* modes */
@@ -76,17 +111,19 @@ typedef struct radio {
 	fm_demod_t	fm_demod;		/* FM modulation */
 	double		pilot_phasestep;	/* phase change of pilot tone for each sample */
 	double		tx_pilot_phase;		/* current phase of tx sine */
-	double		rx_pilot_phase;		/* current phase of rx mixer */
+	double		rx_pilot_phase;		/* current phase of rx mixer (legacy, kept for TX) */
+	pll_t		rx_pilot_pll;		/* PLL for 19 kHz pilot tracking */
 	iir_filter_t	tx_dc_removal[2];	/* AM/FM DC level removal */
 	sample_t	tx_dc_prev_x[2], tx_dc_prev_y[2]; /* Manual DC filter state */
 	iir_filter_t	tx_am_bw_limit;		/* AM bandwidth limiter */
-	iir_filter_t	rx_lp_pilot_I;		/* low pass filter for pilot tone extraction */
-	iir_filter_t	rx_lp_pilot_Q;		/* low pass filter for pilot tone extraction */
+	iir_filter_t	rx_lp_pilot_I;		/* low pass filter for pilot tone extraction (legacy) */
+	iir_filter_t	rx_lp_pilot_Q;		/* low pass filter for pilot tone extraction (legacy) */
 	iir_filter_t	rx_lp_sum;		/* filter sum signal of stereo */
 	iir_filter_t	rx_lp_diff;		/* filter differential signal of stereo */
-	double		rx_pll_freq_offset;	/* tracked phase offset (rad) for stereo demod */
+	double		rx_pll_freq_offset;	/* tracked phase offset (rad) for stereo demod (legacy) */
 	double		rx_pilot_mag;		/* pilot tone magnitude (0=no signal, ~0.1 on lock) */
 	double		rx_pilot_mag_avg;	/* IIR-smoothed pilot magnitude for threshold decisions */
+	double		rx_stereo_blend;	/* stereo blend factor: 1.0=full stereo, 0.0=mono */
 	int		rx_pilot_locked;	/* 1 = pilot locked, 0 = mono fallback */
 	int		rx_forced_mono;		/* 1 = force mono (B1 command), 0 = auto */
 	double		rx_pilot_cooldown;	/* samples until next lock state change allowed */
@@ -115,6 +152,8 @@ typedef struct radio {
 	sample_t	*I_buffer;			/* RX-only I/Q buffers for demodulation */
 	sample_t	*Q_buffer;
 	sample_t	*carrier_buffer;		/* RX-only carrier buffer for AM */
+	/* AFC state for mono FM */
+	afc_state_t	afc;
 } radio_t;
 
 int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int rds_force_rbds);
@@ -128,6 +167,13 @@ void rds_next_preset(radio_t *radio);
 
 /* Force mono mode (B1 command from XDR-GTK) */
 void radio_set_forced_mono(radio_t *radio, int forced);
+
+/* AFC control */
+void radio_afc_enable(radio_t *radio, int enable);
+void radio_afc_set_time_constant(radio_t *radio, double tc_seconds);
+void radio_afc_set_max_correction(radio_t *radio, double max_hz);
+double radio_afc_get_correction(radio_t *radio);
+double radio_afc_get_freq_error(radio_t *radio);
 
 void radio_set_callsign(const char *callsign);
 void radio_set_pi(uint16_t pi);
