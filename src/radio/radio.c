@@ -2631,6 +2631,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	return signal_num;
 }
 
+#ifdef AUDIO_DEBUG
 static void calc_audio_metrics(const sample_t *in, int n, double *peak, double *rms, double *hf_rms)
 {
 	int i;
@@ -2659,6 +2660,7 @@ static void calc_audio_metrics(const sample_t *in, int n, double *peak, double *
 	*rms = sqrt((e + 1e-12) / (n + 1e-12));
 	*hf_rms = sqrt((hf_e + 1e-12) / ((n > 1 ? n - 1 : 1) + 1e-12));
 }
+#endif
 
 int radio_rx(radio_t *radio, float *baseband, int signal_num)
 {

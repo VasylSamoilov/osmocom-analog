@@ -1449,30 +1449,9 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
 	
-	/* Build dynamic SLC variant sequence from enabled fields
-	 * IEC 62106 Table 9 - cycle only through configured (non-zero) variants:
-	 *   0 = ECC (Extended Country Code) - always included
-	 *   1 = TMC ID - if tmc_id != 0
-	 *   3 = Language Identification Code - if language != 0
-	 *   6 = Broadcaster data - if slc_broadcaster != 0
-	 *   7 = EWS channel ID - if ews_channel != 0
-	 */
-	int slc_variants[8];  /* Max 8 variants in IEC 62106 Table 9 */
-	int slc_variant_count = 0;
-	
-	/* Always include ECC (variant 0) - even if ecc=0x00 ("not defined"),
-	 * this variant carries the LA (Linkage Actuator) flag which is always useful */
-	slc_variants[slc_variant_count++] = RDS_1A_VARIANT_ECC;
-	
-	/* Include optional variants only if configured */
-	if (rds->tmc_id != 0)
-		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_TMC_ID;
-	if (rds->language != 0)
-		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_LANGUAGE;
-	if (rds->slc_broadcaster != 0)
-		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_BCAST;
-	if (rds->ews_channel != 0)
-		slc_variants[slc_variant_count++] = RDS_1A_VARIANT_EWS;
+	/* Build dynamic SLC variant sequence from shared API */
+	int slc_variants[RDS_1A_VARIANT_MAX];
+	int slc_variant_count = rds_enc_get_slc_variants(rds, slc_variants, RDS_1A_VARIANT_MAX);
 	
 	int variant = slc_variants[rds->slc_variant % slc_variant_count];
 	
@@ -1510,6 +1489,14 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
 		     (RDS_1A_VARIANT_TMC_ID << RDS_1A_VARIANT_SHIFT) |
 		     (rds->tmc_id & RDS_1A_PAYLOAD_MASK);
+		break;
+		
+	case RDS_1A_VARIANT_PAGER:
+		/* Variant 2: Paging identification (IEC 62106 Table 9)
+		 * Bits 11-0: Paging OPC (Operator's Programme Code)
+		 * Transmitted when paging is enabled; payload is 0 (no OPC field) */
+		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
+		     (RDS_1A_VARIANT_PAGER << RDS_1A_VARIANT_SHIFT);
 		break;
 		
 	case RDS_1A_VARIANT_LANGUAGE:
@@ -3242,6 +3229,11 @@ void rds_enc_set_ta(rds_encoder_t *rds, int ta)
 	rds->ta = ta ? 1 : 0;
 }
 
+int rds_enc_get_ta(const rds_encoder_t *rds)
+{
+	return rds->ta;
+}
+
 /* ============================================================
  * Dynamic RDS Configuration API - Phase 1: Core Fields
  * ============================================================ */
@@ -4854,7 +4846,8 @@ void rds_enc_set_ecc(rds_encoder_t *rds, uint8_t ecc)
 	rds->ecc = ecc;
 	
 	if (old_ecc != ecc) {
-		LOGP(DRADIO, LOGL_INFO, "RDS: ECC set to 0x%02X\n", ecc);
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 0 (ECC) set to 0x%02X (%s)\n",
+		     ecc, rds_get_ecc_name(ecc));
 		/* Update scheduler (ECC presence affects Group 1A scheduling) */
 		rds_scheduler_update(rds);
 	}
@@ -4864,7 +4857,7 @@ void rds_enc_clear_ecc(rds_encoder_t *rds)
 {
 	if (rds->ecc != 0) {
 		rds->ecc = 0;
-		LOGP(DRADIO, LOGL_INFO, "RDS: ECC cleared\n");
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 0 (ECC) cleared\n");
 		/* Update scheduler (ECC presence affects Group 1A scheduling) */
 		rds_scheduler_update(rds);
 	}
@@ -4886,7 +4879,8 @@ void rds_enc_set_language(rds_encoder_t *rds, uint8_t lang)
 	rds->language = lang;
 	
 	if (old_lang != lang) {
-		LOGP(DRADIO, LOGL_INFO, "RDS: Language set to %d\n", lang);
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 3 (Language) set to %d (%s)\n",
+		     lang, rds_get_language_name(lang));
 		/* Update scheduler (language presence affects Group 1A scheduling) */
 		rds_scheduler_update(rds);
 	}
@@ -4896,7 +4890,7 @@ void rds_enc_clear_language(rds_encoder_t *rds)
 {
 	if (rds->language != 0) {
 		rds->language = 0;
-		LOGP(DRADIO, LOGL_INFO, "RDS: Language cleared\n");
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 3 (Language) cleared\n");
 		/* Update scheduler (language presence affects Group 1A scheduling) */
 		rds_scheduler_update(rds);
 	}
@@ -4905,6 +4899,123 @@ void rds_enc_clear_language(rds_encoder_t *rds)
 uint8_t rds_enc_get_language(const rds_encoder_t *rds)
 {
 	return rds->language;
+}
+
+/* Build the active SLC variant sequence from encoder state.
+ * This is the single source of truth used by both the Group 1A builder
+ * and the UECP Group Variant request handler.
+ * Returns number of variants written to variants[]. */
+int rds_enc_get_slc_variants(const rds_encoder_t *rds, int *variants, int max)
+{
+	int count = 0;
+
+	if (max < 1)
+		return 0;
+
+	/* Variant 0 (ECC) always included — carries LA flag */
+	variants[count++] = RDS_1A_VARIANT_ECC;
+
+	if (count < max && rds->tmc_id != 0)
+		variants[count++] = RDS_1A_VARIANT_TMC_ID;
+	if (count < max && rds->paging.enabled)
+		variants[count++] = RDS_1A_VARIANT_PAGER;
+	if (count < max && rds->language != 0)
+		variants[count++] = RDS_1A_VARIANT_LANGUAGE;
+	if (count < max && rds->slc_broadcaster != 0)
+		variants[count++] = RDS_1A_VARIANT_BCAST;
+	if (count < max && rds->ews_channel != 0)
+		variants[count++] = RDS_1A_VARIANT_EWS;
+
+	return count;
+}
+
+void rds_enc_set_linkage_actuator(rds_encoder_t *rds, int la)
+{
+	uint8_t old = rds->linkage_actuator;
+	rds->linkage_actuator = la ? 1 : 0;
+	if (old != rds->linkage_actuator)
+		LOGP(DRADIO, LOGL_INFO, "RDS: Linkage Actuator set to %d\n",
+		     rds->linkage_actuator);
+}
+
+int rds_enc_get_linkage_actuator(const rds_encoder_t *rds)
+{
+	return rds->linkage_actuator;
+}
+
+void rds_enc_set_tmc_id(rds_encoder_t *rds, uint16_t tmc_id)
+{
+	uint16_t old = rds->tmc_id;
+	rds->tmc_id = tmc_id & RDS_1A_PAYLOAD_MASK;
+	if (old != rds->tmc_id) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 1 (TMC) set to 0x%03X (%d)\n",
+		     rds->tmc_id, rds->tmc_id);
+		rds_scheduler_update(rds);
+	}
+}
+
+void rds_enc_clear_tmc_id(rds_encoder_t *rds)
+{
+	if (rds->tmc_id != 0) {
+		rds->tmc_id = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 1 (TMC) cleared\n");
+		rds_scheduler_update(rds);
+	}
+}
+
+uint16_t rds_enc_get_tmc_id(const rds_encoder_t *rds)
+{
+	return rds->tmc_id;
+}
+
+void rds_enc_set_ews_channel(rds_encoder_t *rds, uint16_t ews)
+{
+	uint16_t old = rds->ews_channel;
+	rds->ews_channel = ews & RDS_1A_PAYLOAD_MASK;
+	if (old != rds->ews_channel) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 7 (EWS) set to %d (0x%03X)\n",
+		     rds->ews_channel, rds->ews_channel);
+		rds_scheduler_update(rds);
+	}
+}
+
+void rds_enc_clear_ews_channel(rds_encoder_t *rds)
+{
+	if (rds->ews_channel != 0) {
+		rds->ews_channel = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 7 (EWS) cleared\n");
+		rds_scheduler_update(rds);
+	}
+}
+
+uint16_t rds_enc_get_ews_channel(const rds_encoder_t *rds)
+{
+	return rds->ews_channel;
+}
+
+void rds_enc_set_slc_broadcaster(rds_encoder_t *rds, uint16_t data)
+{
+	uint16_t old = rds->slc_broadcaster;
+	rds->slc_broadcaster = data & RDS_1A_PAYLOAD_MASK;
+	if (old != rds->slc_broadcaster) {
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 6 (Broadcaster) set to 0x%03X\n",
+		     rds->slc_broadcaster);
+		rds_scheduler_update(rds);
+	}
+}
+
+void rds_enc_clear_slc_broadcaster(rds_encoder_t *rds)
+{
+	if (rds->slc_broadcaster != 0) {
+		rds->slc_broadcaster = 0;
+		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 6 (Broadcaster) cleared\n");
+		rds_scheduler_update(rds);
+	}
+}
+
+uint16_t rds_enc_get_slc_broadcaster(const rds_encoder_t *rds)
+{
+	return rds->slc_broadcaster;
 }
 
 void rds_enc_set_pin(rds_encoder_t *rds, uint8_t day, uint8_t hour, uint8_t minute)
@@ -5550,6 +5661,216 @@ int rds_enc_eon_get_entry(const rds_encoder_t *rds, int index, uint16_t *pi, cha
 	if (ta) *ta = eon->ta;
 	
 	return 0;
+}
+
+/* ============================================================
+ * EON Field Setters and AF Management
+ * ============================================================ */
+
+/* Find EON entry by PI (internal helper) */
+static rds_eon_entry_t *eon_find_by_pi(rds_encoder_t *rds, uint16_t pi)
+{
+	for (int i = 0; i < rds->eon_tx_count; i++) {
+		if (rds->eon_tx[i].pi == pi)
+			return &rds->eon_tx[i];
+	}
+	return NULL;
+}
+
+rds_eon_entry_t *rds_enc_eon_ensure(rds_encoder_t *rds, uint16_t pi)
+{
+	rds_eon_entry_t *eon = eon_find_by_pi(rds, pi);
+	if (eon)
+		return eon;
+
+	/* Create new entry */
+	if (rds->eon_tx_count >= RDS_EON_MAX_ENTRIES) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot add EON entry - max %d reached\n",
+		     RDS_EON_MAX_ENTRIES);
+		return NULL;
+	}
+
+	eon = &rds->eon_tx[rds->eon_tx_count];
+	memset(eon, 0, sizeof(*eon));
+	eon->pi = pi;
+	memset(eon->ps, ' ', 8);
+	eon->ps[8] = '\0';
+	rds->eon_tx_count++;
+
+	LOGP(DRADIO, LOGL_INFO, "RDS: EON entry created: PI=0x%04X (index %d)\n",
+	     pi, rds->eon_tx_count - 1);
+	rds_scheduler_update(rds);
+	return eon;
+}
+
+const rds_eon_entry_t *rds_enc_eon_get_by_index(const rds_encoder_t *rds, int index)
+{
+	if (index < 0 || index >= rds->eon_tx_count)
+		return NULL;
+	return &rds->eon_tx[index];
+}
+
+void rds_enc_eon_set_enable_flags(rds_encoder_t *rds, uint16_t pi, uint8_t flags)
+{
+	rds_eon_entry_t *eon = eon_find_by_pi(rds, pi);
+	if (!eon)
+		return;
+	eon->enable_flags = flags & 0x7F;
+	LOGP(DRADIO, LOGL_INFO, "RDS: EON PI=0x%04X enable flags set to 0x%02X\n",
+	     pi, eon->enable_flags);
+}
+
+uint8_t rds_enc_eon_get_enable_flags(const rds_encoder_t *rds, uint16_t pi)
+{
+	for (int i = 0; i < rds->eon_tx_count; i++) {
+		if (rds->eon_tx[i].pi == pi)
+			return rds->eon_tx[i].enable_flags;
+	}
+	return 0;
+}
+
+uint8_t rds_enc_eon_build_enable_flags(const rds_eon_entry_t *eon)
+{
+	uint8_t flags = 0;
+	if (!eon || eon->pi == 0)
+		return 0;
+
+	/* PS: non-blank PS name */
+	for (int i = 0; i < 8; i++) {
+		if (eon->ps[i] != ' ' && eon->ps[i] != '\0') {
+			flags |= RDS_EON_FLAG_PS;
+			break;
+		}
+	}
+
+	/* AF: has at least one AF */
+	if (eon->af_count > 0)
+		flags |= RDS_EON_FLAG_AF;
+
+	/* Linkage: has LSN configured */
+	if (eon->linkage_lsn != 0)
+		flags |= RDS_EON_FLAG_LINK;
+
+	/* PTY: non-zero PTY */
+	if (eon->pty != 0)
+		flags |= RDS_EON_FLAG_PTY;
+
+	/* PIN: has PIN day set */
+	if (eon->pin_day != 0)
+		flags |= RDS_EON_FLAG_PIN;
+
+	/* Broadcaster data: non-zero */
+	if (eon->broadcaster_data != 0)
+		flags |= RDS_EON_FLAG_BCAST;
+
+	/* TA: TP flag set (can do TA switching) */
+	if (eon->tp)
+		flags |= RDS_EON_FLAG_TA;
+
+	return flags;
+}
+
+int rds_enc_eon_set_pi(rds_encoder_t *rds, int index, uint16_t new_pi)
+{
+	if (index < 0 || index >= rds->eon_tx_count)
+		return -1;
+	if (new_pi == 0) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid EON PI 0x0000\n");
+		return -1;
+	}
+	rds->eon_tx[index].pi = new_pi;
+	LOGP(DRADIO, LOGL_INFO, "RDS: EON[%d] PI set to 0x%04X\n", index, new_pi);
+	return 0;
+}
+
+int rds_enc_eon_set_ps(rds_encoder_t *rds, uint16_t pi, const char *ps)
+{
+	rds_eon_entry_t *eon = eon_find_by_pi(rds, pi);
+	if (!eon)
+		return -1;
+	memset(eon->ps, ' ', 8);
+	eon->ps[8] = '\0';
+	if (ps && ps[0]) {
+		int len = strlen(ps);
+		if (len > 8) len = 8;
+		memcpy(eon->ps, ps, len);
+	}
+	LOGP(DRADIO, LOGL_INFO, "RDS: EON PI=0x%04X PS set to \"%s\"\n", pi, eon->ps);
+	return 0;
+}
+
+int rds_enc_eon_set_pty(rds_encoder_t *rds, uint16_t pi, uint8_t pty)
+{
+	rds_eon_entry_t *eon = eon_find_by_pi(rds, pi);
+	if (!eon)
+		return -1;
+	if (!RDS_VALID_PTY(pty)) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid EON PTY %d\n", pty);
+		return -1;
+	}
+	eon->pty = pty;
+	LOGP(DRADIO, LOGL_INFO, "RDS: EON PI=0x%04X PTY set to %d\n", pi, pty);
+	return 0;
+}
+
+int rds_enc_eon_set_tp(rds_encoder_t *rds, uint16_t pi, uint8_t tp)
+{
+	rds_eon_entry_t *eon = eon_find_by_pi(rds, pi);
+	if (!eon)
+		return -1;
+	eon->tp = tp ? 1 : 0;
+	LOGP(DRADIO, LOGL_INFO, "RDS: EON PI=0x%04X TP set to %d\n", pi, eon->tp);
+	return 0;
+}
+
+int rds_enc_eon_af_add(rds_encoder_t *rds, uint16_t pi, uint16_t freq_01mhz)
+{
+	rds_eon_entry_t *eon = eon_find_by_pi(rds, pi);
+	if (!eon)
+		return -1;
+	if (freq_01mhz < 876 || freq_01mhz > 1079) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid EON AF frequency %d\n", freq_01mhz);
+		return -1;
+	}
+	/* Check for duplicate */
+	for (int i = 0; i < eon->af_count; i++) {
+		if (eon->af[i] == freq_01mhz)
+			return 0; /* already present */
+	}
+	if (eon->af_count >= RDS_EON_MAX_AF) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: EON AF list full (max %d)\n", RDS_EON_MAX_AF);
+		return -1;
+	}
+	eon->af[eon->af_count++] = freq_01mhz;
+	LOGP(DRADIO, LOGL_DEBUG, "RDS: EON PI=0x%04X AF added: %.1f MHz (%d total)\n",
+	     pi, freq_01mhz / 10.0, eon->af_count);
+	return 0;
+}
+
+void rds_enc_eon_af_clear(rds_encoder_t *rds, uint16_t pi)
+{
+	rds_eon_entry_t *eon = eon_find_by_pi(rds, pi);
+	if (!eon)
+		return;
+	eon->af_count = 0;
+	memset(eon->af, 0, sizeof(eon->af));
+	LOGP(DRADIO, LOGL_DEBUG, "RDS: EON PI=0x%04X AFs cleared\n", pi);
+}
+
+int rds_enc_eon_af_get(const rds_encoder_t *rds, uint16_t pi, uint16_t *freqs, int max, int *count)
+{
+	for (int i = 0; i < rds->eon_tx_count; i++) {
+		if (rds->eon_tx[i].pi == pi) {
+			const rds_eon_entry_t *eon = &rds->eon_tx[i];
+			int n = (eon->af_count < max) ? eon->af_count : max;
+			if (freqs && n > 0)
+				memcpy(freqs, eon->af, n * sizeof(uint16_t));
+			if (count)
+				*count = eon->af_count;
+			return 0;
+		}
+	}
+	return -1;
 }
 
 /* ============================================================
@@ -7016,11 +7337,25 @@ static void rds_decode_group(rds_decoder_t *rds)
 					     rds->tmc_id, rds->tmc_id, rds->linkage_actuator);
 				break;
 			case RDS_1A_VARIANT_PAGER:
-				/* Paging ID (deprecated, IEC 62106 Table 9) */
-				if (rds->verbose)
-					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging ID (deprecated), LA=%d, "
-					     "data=0x%03X\n", rds->linkage_actuator,
+				/* Paging identification (IEC 62106 Table 9)
+				 * Bits 11-0: Paging OPC/identification data
+				 * Only decode when --rds-paging is enabled */
+				if (rds->paging_enabled) {
+					rds->paging_id = payload & RDS_1A_PAYLOAD_MASK;
+					rds->paging_id_status = rds->block_status[2];
+					if (rds->debug)
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Paging=0x%03X LA=%d\n",
+						     rds->paging_id, rds->linkage_actuator);
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging ID=0x%03X (%d), "
+						     "Linkage Actuator=%d\n",
+						     rds->paging_id, rds->paging_id,
+						     rds->linkage_actuator);
+				} else if (rds->verbose) {
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging ID=0x%03X (ignored, "
+					     "enable --rds-paging to decode)\n",
 					     payload & RDS_1A_PAYLOAD_MASK);
+				}
 				break;
 			case RDS_1A_VARIANT_BCAST:
 				/* Broadcaster use (IEC 62106 Table 9)
@@ -8219,6 +8554,10 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	memset(rds->rt_status, RDS_STATUS_NONE, sizeof(rds->rt_status));
 	rds->ecc_status = RDS_STATUS_NONE;
 	rds->language_status = RDS_STATUS_NONE;
+	rds->tmc_id_status = RDS_STATUS_NONE;
+	rds->paging_id_status = RDS_STATUS_NONE;
+	rds->ews_channel_status = RDS_STATUS_NONE;
+	rds->slc_broadcaster_status = RDS_STATUS_NONE;
 	rds->pin_status = RDS_STATUS_NONE;
 	rds->ct_status = RDS_STATUS_NONE;
 	memset(rds->ptyn_status, RDS_STATUS_NONE, sizeof(rds->ptyn_status));
@@ -8321,6 +8660,10 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	memset(rds->rt_status, RDS_STATUS_NONE, sizeof(rds->rt_status));
 	rds->ecc_status = RDS_STATUS_NONE;
 	rds->language_status = RDS_STATUS_NONE;
+	rds->tmc_id_status = RDS_STATUS_NONE;
+	rds->paging_id_status = RDS_STATUS_NONE;
+	rds->ews_channel_status = RDS_STATUS_NONE;
+	rds->slc_broadcaster_status = RDS_STATUS_NONE;
 	rds->pin_status = RDS_STATUS_NONE;
 	rds->ct_status = RDS_STATUS_NONE;
 	memset(rds->ptyn_status, RDS_STATUS_NONE, sizeof(rds->ptyn_status));
@@ -8903,6 +9246,41 @@ int rds_dec_get_rt(rds_decoder_t *rds, char *rt)
 	return 0;
 }
 
+uint8_t rds_dec_get_ecc(const rds_decoder_t *rds)
+{
+	return rds->ecc;
+}
+
+uint8_t rds_dec_get_language(const rds_decoder_t *rds)
+{
+	return rds->language_code;
+}
+
+uint8_t rds_dec_get_linkage_actuator(const rds_decoder_t *rds)
+{
+	return rds->linkage_actuator;
+}
+
+uint16_t rds_dec_get_tmc_id(const rds_decoder_t *rds)
+{
+	return rds->tmc_id;
+}
+
+uint16_t rds_dec_get_paging_id(const rds_decoder_t *rds)
+{
+	return rds->paging_id;
+}
+
+uint16_t rds_dec_get_ews_channel(const rds_decoder_t *rds)
+{
+	return rds->ews_channel;
+}
+
+uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds)
+{
+	return rds->slc_broadcaster;
+}
+
 void rds_decoder_status(rds_decoder_t *rds)
 {
 	char ps_display[64];   /* Larger buffer for UTF-8 + control char display */
@@ -9136,6 +9514,19 @@ void rds_decoder_status(rds_decoder_t *rds)
 		     rds->ecc, ecc_note, cc,
 		     rds_get_language_name(rds->language_code), STATUS_CHAR(rds->language_status),
 		     rds->language_code);
+	}
+	
+	/* SLC variant fields (if any received) */
+	if (rds->tmc_id_status != RDS_STATUS_NONE ||
+	    rds->paging_id_status != RDS_STATUS_NONE ||
+	    rds->ews_channel_status != RDS_STATUS_NONE ||
+	    rds->slc_broadcaster_status != RDS_STATUS_NONE) {
+		LOGP(DRADIO, LOGL_NOTICE, "LA=%d  TMC=0x%03X %c  Paging=0x%03X %c  Bcast=0x%03X %c  EWS=%d %c\n",
+		     rds->linkage_actuator,
+		     rds->tmc_id, STATUS_CHAR(rds->tmc_id_status),
+		     rds->paging_id, STATUS_CHAR(rds->paging_id_status),
+		     rds->slc_broadcaster, STATUS_CHAR(rds->slc_broadcaster_status),
+		     rds->ews_channel, STATUS_CHAR(rds->ews_channel_status));
 	}
 	
 	/* Clock-Time (if received) with status */

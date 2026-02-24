@@ -1320,6 +1320,15 @@ typedef struct {
 #define RDS_EON_MAX_AF          25      /* Max AFs per Other Network */
 #define RDS_EON_MAX_MAPPED_AF   8       /* Max mapped AFs (variants 5-9) */
 
+/* EON element enable flag bits (IEC 62106-10 A.6.5 / Group 14A variants) */
+#define RDS_EON_FLAG_PS		0x01	/* Bit 0: PS name (variants 0-3) */
+#define RDS_EON_FLAG_AF		0x02	/* Bit 1: AF information (variant 4) */
+#define RDS_EON_FLAG_LINK	0x04	/* Bit 2: Linkage information (variant 12) */
+#define RDS_EON_FLAG_PTY	0x08	/* Bit 3: PTY (variant 13) */
+#define RDS_EON_FLAG_PIN	0x10	/* Bit 4: PIN (variant 14) */
+#define RDS_EON_FLAG_BCAST	0x20	/* Bit 5: Broadcaster data (variant 15) */
+#define RDS_EON_FLAG_TA		0x40	/* Bit 6: TA switching (Group 14B) */
+
 /* Mapped AF pair: maps tuned frequency to Other Network frequency */
 typedef struct {
 	uint8_t		tuned_af;	/* AF code of current tuned freq (1-204) */
@@ -1356,6 +1365,9 @@ typedef struct {
 	
 	/* Broadcaster data (variant 15) */
 	uint16_t	broadcaster_data;
+	
+		/* EON element enable flags (bitmask of RDS_EON_FLAG_*) */
+	uint8_t		enable_flags;
 	
 	/* Housekeeping */
 	uint32_t	last_update;	/* Timestamp of last update (group count) */
@@ -1740,6 +1752,7 @@ void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt);
 
 /* Set Traffic Announcement flag (1=enabled, 0=disabled) */
 void rds_enc_set_ta(rds_encoder_t *rds, int ta);
+int rds_enc_get_ta(const rds_encoder_t *rds);
 
 /* ODA (Open Data Application) Configuration API
  * Group 3A announces ODAs; each ODA needs a carrier group for its data.
@@ -1975,10 +1988,36 @@ void rds_enc_set_language(rds_encoder_t *rds, uint8_t lang);
 void rds_enc_clear_language(rds_encoder_t *rds);
 uint8_t rds_enc_get_language(const rds_encoder_t *rds);
 
+/* Linkage Actuator (LA) - Group 1A bit 15 of Block C */
+void rds_enc_set_linkage_actuator(rds_encoder_t *rds, int la);
+int rds_enc_get_linkage_actuator(const rds_encoder_t *rds);
+
+/* TMC Identification - variant 1, 12-bit (0-4095, 0 = disabled) */
+void rds_enc_set_tmc_id(rds_encoder_t *rds, uint16_t tmc_id);
+void rds_enc_clear_tmc_id(rds_encoder_t *rds);
+uint16_t rds_enc_get_tmc_id(const rds_encoder_t *rds);
+
+/* EWS Channel ID - variant 7, 12-bit (0-4095, 0 = disabled) */
+void rds_enc_set_ews_channel(rds_encoder_t *rds, uint16_t ews);
+void rds_enc_clear_ews_channel(rds_encoder_t *rds);
+uint16_t rds_enc_get_ews_channel(const rds_encoder_t *rds);
+
+/* Broadcaster Data - variant 6, 12-bit (0-4095, 0 = disabled) */
+void rds_enc_set_slc_broadcaster(rds_encoder_t *rds, uint16_t data);
+void rds_enc_clear_slc_broadcaster(rds_encoder_t *rds);
+uint16_t rds_enc_get_slc_broadcaster(const rds_encoder_t *rds);
+
 /* PIN (Programme Item Number) - day (1-31), hour (0-23), minute (0-59) */
 void rds_enc_set_pin(rds_encoder_t *rds, uint8_t day, uint8_t hour, uint8_t minute);
 void rds_enc_clear_pin(rds_encoder_t *rds);
 void rds_enc_get_pin(const rds_encoder_t *rds, uint8_t *day, uint8_t *hour, uint8_t *minute);
+
+/* SLC (Slow Labelling Codes) - Group 1A variant sequence query
+ * Returns the active variant codes based on current encoder state.
+ * variants[] must have room for RDS_1A_VARIANT_MAX entries.
+ * Returns the number of active variants written to variants[]. */
+#define RDS_1A_VARIANT_MAX	8	/* Max variants in IEC 62106 Table 9 */
+int rds_enc_get_slc_variants(const rds_encoder_t *rds, int *variants, int max);
 
 /* DI (Decoder Information) - stereo, artificial_head, compressed, dynamic_pty flags */
 void rds_enc_set_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty);
@@ -2043,6 +2082,28 @@ int rds_enc_eon_remove(rds_encoder_t *rds, uint16_t pi);
 void rds_enc_eon_clear(rds_encoder_t *rds);
 int rds_enc_eon_get_count(const rds_encoder_t *rds);
 int rds_enc_eon_get_entry(const rds_encoder_t *rds, int index, uint16_t *pi, char *ps, size_t ps_len, uint8_t *pty, uint8_t *tp, uint8_t *ta);
+
+/* EON field setters (by PI lookup) */
+int rds_enc_eon_set_pi(rds_encoder_t *rds, int index, uint16_t new_pi);
+int rds_enc_eon_set_ps(rds_encoder_t *rds, uint16_t pi, const char *ps);
+int rds_enc_eon_set_pty(rds_encoder_t *rds, uint16_t pi, uint8_t pty);
+int rds_enc_eon_set_tp(rds_encoder_t *rds, uint16_t pi, uint8_t tp);
+
+/* EON AF management (by PI lookup) */
+int rds_enc_eon_af_add(rds_encoder_t *rds, uint16_t pi, uint16_t freq_01mhz);
+void rds_enc_eon_af_clear(rds_encoder_t *rds, uint16_t pi);
+int rds_enc_eon_af_get(const rds_encoder_t *rds, uint16_t pi, uint16_t *freqs, int max, int *count);
+
+/* EON entry ensure — find by PI or create if not exists */
+rds_eon_entry_t *rds_enc_eon_ensure(rds_encoder_t *rds, uint16_t pi);
+
+/* EON lookup by index (for UECP PSN mapping) */
+const rds_eon_entry_t *rds_enc_eon_get_by_index(const rds_encoder_t *rds, int index);
+
+/* EON enable flags (per-entry, UECP MEC 0x3F bits) */
+void rds_enc_eon_set_enable_flags(rds_encoder_t *rds, uint16_t pi, uint8_t flags);
+uint8_t rds_enc_eon_get_enable_flags(const rds_encoder_t *rds, uint16_t pi);
+uint8_t rds_enc_eon_build_enable_flags(const rds_eon_entry_t *eon);
 
 /* ============================================================
  * Paging Encoder API (EN 50067 Annex M)
@@ -2263,6 +2324,8 @@ typedef struct rds_decoder {
 	/* Group 1A SLC variants (IEC 62106 Table 9) */
 	uint16_t	tmc_id;			/* TMC identification (variant 1, 12 bits) */
 	uint8_t		tmc_id_status;		/* Status of TMC ID decode */
+	uint16_t	paging_id;		/* Paging identification (variant 2, 12 bits) */
+	uint8_t		paging_id_status;	/* Status of paging ID decode */
 	uint16_t	ews_channel;		/* EWS channel ID (variant 7, 12 bits) */
 	uint8_t		ews_channel_status;	/* Status of EWS decode */
 	uint16_t	slc_broadcaster;	/* Broadcaster data (variant 6, 12 bits) */
@@ -2392,6 +2455,15 @@ int rds_dec_get_pi(rds_decoder_t *rds, uint16_t *pi);
 int rds_dec_get_ps(rds_decoder_t *rds, char *ps);
 /* Get decoded RT (RadioText) - rt must be at least 65 bytes, returns 1 if new */
 int rds_dec_get_rt(rds_decoder_t *rds, char *rt);
+
+/* Get decoded SLC fields (Group 1A) */
+uint8_t rds_dec_get_ecc(const rds_decoder_t *rds);
+uint8_t rds_dec_get_language(const rds_decoder_t *rds);
+uint8_t rds_dec_get_linkage_actuator(const rds_decoder_t *rds);
+uint16_t rds_dec_get_tmc_id(const rds_decoder_t *rds);
+uint16_t rds_dec_get_paging_id(const rds_decoder_t *rds);
+uint16_t rds_dec_get_ews_channel(const rds_decoder_t *rds);
+uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds);
 
 /* Print decoder status (PI, PS, RT, BER) */
 void rds_decoder_status(rds_decoder_t *rds);

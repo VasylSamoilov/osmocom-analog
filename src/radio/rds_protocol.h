@@ -266,17 +266,25 @@
  *   [x] 0x01 PI                 rds_enc_set_pi()
  *   [x] 0x02 PS                 rds_enc_set_ps()
  *   [x] 0x03 TP/TA              rds_enc_set_tp/ta()
+ *   [x] 0x04 DI/PTYI            rds_enc_set_di()
+ *   [x] 0x05 M/S                rds_enc_set_ms()
  *   [x] 0x07 PTY                rds_enc_set_pty()
+ *   [x] 0x09 RTC Correction     ct_time_offset
  *   [x] 0x0A RT                 rds_enc_set_radiotext()
+ *   [x] 0x0B PSN Enable         Logged (single-service encoder)
+ *   [x] 0x0D RTC                local_offset updated
+ *   [x] 0x13 AF                 Logged (TODO: AF code conversion)
+ *   [x] 0x14 EON-AF             Logged (TODO: EON-AF parsing)
+ *   [x] 0x17 Request            uecp_handle_request()
+ *   [x] 0x19 CT On/Off          ct_enabled
  *   [x] 0x1A ECC                rds_enc_set_ecc()
+ *   [x] 0x28 Make PSN List      Logged (single-service encoder)
  *   [x] 0x3E PTYN               rds_enc_set_ptyn()
- *   [ ] 0x04 DI/PTYI            Not implemented
- *   [ ] 0x0D RTC                System time used
- *   [ ] 0x13 AF                 Not implemented
- *   [ ] 0x17 Request            Not implemented
+ *   [x] 0x3F EON Enable         Logged
  *
  * UECP Output:
  *   [x] 0x18 ACK                uecp_send_ack()
+ *   [x] Response frames         uecp_send_mec_response()
  */
 
 #ifndef _RDS_PROTOCOL_H
@@ -436,26 +444,122 @@ typedef enum {
 #define UECP_STUFF		0xFD
 #define UECP_FRAME_MAX		263
 
-/* UECP Message Element Codes */
-#define UECP_MEC_PI		0x01
-#define UECP_MEC_PS		0x02
-#define UECP_MEC_TP_TA		0x03
-#define UECP_MEC_DI_PTYI	0x04
-#define UECP_MEC_PTY		0x07
-#define UECP_MEC_RT		0x0A
-#define UECP_MEC_AF		0x13
-#define UECP_MEC_ECC		0x1A
-#define UECP_MEC_PTYN		0x3E
-#define UECP_MEC_RTC		0x0D
-#define UECP_MEC_CT_ONOFF	0x19
-#define UECP_MEC_REQUEST	0x17
-#define UECP_MEC_ACK		0x18
+/* UECP Message Element Codes (IEC 62106-10:2021 Table A.1) */
+#define UECP_MEC_PI		0x01	/* Programme Identification */
+#define UECP_MEC_PS		0x02	/* Programme Service name */
+#define UECP_MEC_TP_TA		0x03	/* TP/TA flags */
+#define UECP_MEC_DI_PTYI	0x04	/* DI + Dynamic PTY Indicator */
+#define UECP_MEC_MS		0x05	/* Music/Speech */
+#define UECP_MEC_PTY		0x07	/* Programme Type */
+#define UECP_MEC_RTC_CORR	0x09	/* Real time clock correction */
+#define UECP_MEC_RT		0x0A	/* RadioText */
+#define UECP_MEC_PSN_ENABLE	0x0B	/* PSN enable/disable */
+#define UECP_MEC_RTC		0x0D	/* Real time clock for CT */
+#define UECP_MEC_RDS_LEVEL	0x0E	/* RDS level */
+#define UECP_MEC_AF		0x13	/* Alternative Frequencies */
+#define UECP_MEC_EON_AF		0x14	/* EON Alternative Frequencies */
+#define UECP_MEC_EON_TA_CTRL	0x15	/* EON-TA control */
+#define UECP_MEC_GROUP_SEQ	0x16	/* Group sequence (data-stream 0) */
+#define UECP_MEC_REQUEST	0x17	/* Request message */
+#define UECP_MEC_ACK		0x18	/* Message acknowledgement */
+#define UECP_MEC_CT_ONOFF	0x19	/* CT on/off */
+#define UECP_MEC_ECC		0x1A	/* ECC and slow label settings */
+#define UECP_MEC_DATA_SET_SEL	0x1C	/* Data set select */
+#define UECP_MEC_REF_INPUT	0x1D	/* Reference input selection */
+#define UECP_MEC_RDS_ONOFF	0x1E	/* RDS on/off (subcarrier 0) */
+#define UECP_MEC_LPS		0x21	/* Long PS name */
+#define UECP_MEC_RDS_PHASE	0x22	/* RDS phase (subcarrier 0) */
+#define UECP_MEC_SITE_ADDR	0x23	/* Site address */
+#define UECP_MEC_FREE_FORMAT	0x24	/* Free format data group (data-stream 0) */
+#define UECP_MEC_TDC		0x26	/* Transparent Data Channel */
+#define UECP_MEC_ENC_ADDR	0x27	/* Encoder address */
+#define UECP_MEC_MAKE_PSN_LIST	0x28	/* Make PSN list */
+#define UECP_MEC_GROUP_VARIANT	0x29	/* Group variant code sequence (data-stream 0) */
+#define UECP_MEC_TA_CTRL	0x2A	/* TA control */
+#define UECP_MEC_EWS		0x2B	/* Emergency Warning System */
+#define UECP_MEC_COMM_MODE	0x2C	/* Communication mode */
+#define UECP_MEC_MANUFACTURER	0x2D	/* Manufacturer/operator specific */
+#define UECP_MEC_LINKAGE	0x2E	/* Linkage information */
+#define UECP_MEC_TMC		0x30	/* Traffic Message Channel */
+#define UECP_MEC_EXT_GROUP_SEQ	0x38	/* Extended group sequence (data-stream 0) */
+#define UECP_MEC_ACCESS_RIGHT	0x3A	/* Encoder access right */
+#define UECP_MEC_PORT_MODE	0x3B	/* Port configuration - Mode */
+#define UECP_MEC_PORT_SPEED	0x3C	/* Port configuration - Speed */
+#define UECP_MEC_PORT_TIMEOUT	0x3D	/* Port configuration - Timeout */
+#define UECP_MEC_PTYN		0x3E	/* Programme Type Name */
+#define UECP_MEC_EON_ENABLE	0x3F	/* EON enable/disable */
+#define UECP_MEC_ODA_CONFIG	0x40	/* ODA configuration + Short message (A/B) */
+#define UECP_MEC_ODA_IDENT	0x41	/* ODA identification group usage sequence (A/B) */
+#define UECP_MEC_ODA_FREE	0x42	/* ODA free-format (old, replaced by 0x46) */
+#define UECP_MEC_ODA_PRIORITY	0x43	/* ODA relative priority (A/B) */
+#define UECP_MEC_ODA_BURST	0x44	/* ODA burst mode */
+#define UECP_MEC_ODA_SPIN	0x45	/* ODA spinning wheel timing */
+#define UECP_MEC_ODA_DATA	0x46	/* ODA data */
+#define UECP_MEC_ODA_ACCESS	0x47	/* ODA data command access right */
+#define UECP_MEC_DAB_DL_CMD	0x48	/* DAB Dynamic Label command */
+#define UECP_MEC_ODA_AID_C1	0x50	/* ODA-AID channel assignment type C (Alt 1) */
+#define UECP_MEC_ODA_AID_C2	0x51	/* ODA-AID channel assignment type C (Alt 2) */
+#define UECP_MEC_PRIORITY_C	0x53	/* Relative priority (type C) */
+#define UECP_MEC_BURST_C	0x54	/* Burst mode (type C) */
+#define UECP_MEC_RFT_ALT2	0x55	/* RFT file data (Alt 2) */
+#define UECP_MEC_ODA_DATA_C	0x56	/* ODA data (type C) */
+#define UECP_MEC_RFT_ALT1	0x57	/* RFT file data (Alt 1) */
+#define UECP_MEC_RFT_VARIANTS	0x58	/* RFT file variants 2-7 (Alt 1) */
+#define UECP_MEC_FILE_SEQ	0x59	/* File sequence for AID in RFT */
+#define UECP_MEC_GROUP_SEQ_C	0x61	/* Group sequence (type C) */
+#define UECP_MEC_EXT_GS_C	0x83	/* Extended group sequence (type C) */
+#define UECP_MEC_DAB_DL_MSG	0xAA	/* DAB Dynamic Label message */
+#define UECP_MEC_UPPER_LEVEL	0xE0	/* Upper stream level */
+#define UECP_MEC_UPPER_ONOFF	0xE1	/* Upper streams on/off */
+/* EON Enable flag bits — aliases for UECP (same as RDS_EON_FLAG_* in rds.h) */
+#define UECP_EON_FLAG_PS	RDS_EON_FLAG_PS
+#define UECP_EON_FLAG_AF	RDS_EON_FLAG_AF
+#define UECP_EON_FLAG_LINK	RDS_EON_FLAG_LINK
+#define UECP_EON_FLAG_PTY	RDS_EON_FLAG_PTY
+#define UECP_EON_FLAG_PIN	RDS_EON_FLAG_PIN
+#define UECP_EON_FLAG_BCAST	RDS_EON_FLAG_BCAST
+#define UECP_EON_FLAG_TA	RDS_EON_FLAG_TA
+
+/* UECP manufacturer-specific identifiers */
+#define UECP_MFR_ID_HI		'O'	/* Manufacturer designation: "OA" = osmocom-analog */
+#define UECP_MFR_ID_LO		'A'
+#define UECP_MFR_MODEL		"osmocom-analog"
 
 /* UECP ACK codes */
 #define UECP_ACK_OK		0x00
 #define UECP_ACK_CRC_ERR	0x01
 #define UECP_ACK_UNKNOWN	0x03
 #define UECP_ACK_PARAM_ERR	0x06
+
+/* UECP addressing constants (IEC 62106-10 §6) */
+#define UECP_ADDR_GLOBAL	0x00	/* Global: all sites/encoders */
+#define UECP_SITE_ADDR_MASK	0x03FF	/* 10-bit site address */
+#define UECP_ENC_ADDR_MASK	0x3F	/* 6-bit encoder address */
+
+/* UECP address control bits (MEC 0x23, 0x27) */
+#define UECP_ADDR_CTRL_REMOVE	0x00	/* Remove specified address */
+#define UECP_ADDR_CTRL_ADD	0x01	/* Add specified address */
+#define UECP_ADDR_CTRL_CLEAR	0x02	/* Remove all addresses */
+
+/* UECP access right constants (MEC 0x3A) */
+#define UECP_ACCESS_ALL_MECS	0xFF	/* Apply to all MECs */
+#define UECP_ACCESS_ALL_PORTS	0xFF	/* Apply to all ports */
+#define UECP_ACCESS_ENABLED	0x01	/* Access enabled */
+
+/* UECP on/off flag values */
+#define UECP_FLAG_OFF		0x00	/* Feature disabled */
+#define UECP_FLAG_ON		0x01	/* Feature enabled */
+
+/* UECP DSN/PSN constants */
+#define UECP_DSN_CURRENT	0x00	/* Current data set */
+#define UECP_PSN_MAIN		0x00	/* Main programme service */
+
+/* UECP RDS signal defaults */
+#define UECP_RDS_LEVEL_DEFAULT	2000	/* Default RDS level in mV p-p */
+#define UECP_RDS_PHASE_DEFAULT	0	/* Default phase: 0.0 degrees */
+
+/* MEC name lookup (for logging) */
+const char *uecp_mec_name(uint8_t mec);
 
 /* ============================================================
  * Server State

@@ -63,6 +63,7 @@
 #include "../libfft/fft.h"
 #include "rds_protocol.h"
 #include "rds.h"
+#include "rds_tables.h"
 
 /* ============================================================
  * Constants
@@ -1214,6 +1215,105 @@ static void xdr_process_cmd(rds_server_t *srv, const char *cmd, int len)
  * UECP Frame Processing
  * ============================================================ */
 
+/* UECP MEC name lookup table for human-readable logging */
+static const struct {
+	uint8_t		mec;
+	const char	*name;
+} uecp_mec_names[] = {
+	/* RDS data (IEC 62106-10 Table A.1) */
+	{ UECP_MEC_PI,		"PI" },
+	{ UECP_MEC_PS,		"PS" },
+	{ UECP_MEC_TP_TA,	"TP/TA" },
+	{ UECP_MEC_DI_PTYI,	"DI/PTYI" },
+	{ UECP_MEC_MS,		"M/S" },
+	{ UECP_MEC_PTY,	"PTY" },
+	{ UECP_MEC_RTC_CORR,	"RTC Correction" },
+	{ UECP_MEC_RT,		"RT" },
+	{ UECP_MEC_PSN_ENABLE,	"PSN Enable" },
+	{ UECP_MEC_RTC,	"RTC" },
+	{ UECP_MEC_RDS_LEVEL,	"RDS Level" },
+	{ UECP_MEC_AF,		"AF" },
+	{ UECP_MEC_EON_AF,	"EON-AF" },
+	{ UECP_MEC_EON_TA_CTRL,"EON-TA Ctrl" },
+	{ UECP_MEC_GROUP_SEQ,	"Group Seq" },
+	{ UECP_MEC_REQUEST,	"Request" },
+	{ UECP_MEC_ACK,	"ACK" },
+	{ UECP_MEC_CT_ONOFF,	"CT On/Off" },
+	{ UECP_MEC_ECC,	"ECC/SLC" },
+	{ UECP_MEC_DATA_SET_SEL,"Data Set Sel" },
+	{ UECP_MEC_REF_INPUT,	"Ref Input" },
+	{ UECP_MEC_RDS_ONOFF,	"RDS On/Off" },
+	{ UECP_MEC_LPS,	"LPS" },
+	{ UECP_MEC_RDS_PHASE,	"RDS Phase" },
+	{ UECP_MEC_SITE_ADDR,	"Site Addr" },
+	{ UECP_MEC_FREE_FORMAT,	"Free Format" },
+	{ UECP_MEC_TDC,	"TDC" },
+	{ UECP_MEC_ENC_ADDR,	"Enc Addr" },
+	{ UECP_MEC_MAKE_PSN_LIST,"Make PSN List" },
+	{ UECP_MEC_GROUP_VARIANT,"Group Variant" },
+	{ UECP_MEC_TA_CTRL,	"TA Ctrl" },
+	{ UECP_MEC_EWS,	"EWS" },
+	{ UECP_MEC_COMM_MODE,	"Comm Mode" },
+	{ UECP_MEC_MANUFACTURER,"Manufacturer" },
+	{ UECP_MEC_LINKAGE,	"Linkage" },
+	{ UECP_MEC_TMC,	"TMC" },
+	{ UECP_MEC_EXT_GROUP_SEQ,"Ext Group Seq" },
+	{ UECP_MEC_ACCESS_RIGHT,"Access Right" },
+	{ UECP_MEC_PORT_MODE,	"Port Mode" },
+	{ UECP_MEC_PORT_SPEED,	"Port Speed" },
+	{ UECP_MEC_PORT_TIMEOUT,"Port Timeout" },
+	{ UECP_MEC_PTYN,	"PTYN" },
+	{ UECP_MEC_EON_ENABLE,	"EON Enable" },
+	/* ODA commands */
+	{ UECP_MEC_ODA_CONFIG,	"ODA Config" },
+	{ UECP_MEC_ODA_IDENT,	"ODA Ident" },
+	{ UECP_MEC_ODA_FREE,	"ODA Free" },
+	{ UECP_MEC_ODA_PRIORITY,"ODA Priority" },
+	{ UECP_MEC_ODA_BURST,	"ODA Burst" },
+	{ UECP_MEC_ODA_SPIN,	"ODA Spin" },
+	{ UECP_MEC_ODA_DATA,	"ODA Data" },
+	{ UECP_MEC_ODA_ACCESS,	"ODA Access" },
+	{ UECP_MEC_DAB_DL_CMD,	"DAB DL Cmd" },
+	/* RDS2 / type C commands */
+	{ UECP_MEC_ODA_AID_C1,	"ODA-AID C1" },
+	{ UECP_MEC_ODA_AID_C2,	"ODA-AID C2" },
+	{ UECP_MEC_PRIORITY_C,	"Priority C" },
+	{ UECP_MEC_BURST_C,	"Burst C" },
+	{ UECP_MEC_RFT_ALT2,	"RFT Alt2" },
+	{ UECP_MEC_ODA_DATA_C,	"ODA Data C" },
+	{ UECP_MEC_RFT_ALT1,	"RFT Alt1" },
+	{ UECP_MEC_RFT_VARIANTS,"RFT Variants" },
+	{ UECP_MEC_FILE_SEQ,	"File Seq" },
+	{ UECP_MEC_GROUP_SEQ_C,	"Group Seq C" },
+	{ UECP_MEC_EXT_GS_C,	"Ext GS C" },
+	{ UECP_MEC_DAB_DL_MSG,	"DAB DL Msg" },
+	{ UECP_MEC_UPPER_LEVEL,	"Upper Level" },
+	{ UECP_MEC_UPPER_ONOFF,	"Upper On/Off" },
+	{ 0, NULL }
+};
+
+const char *uecp_mec_name(uint8_t mec)
+{
+	int i;
+	for (i = 0; uecp_mec_names[i].name; i++) {
+		if (uecp_mec_names[i].mec == mec)
+			return uecp_mec_names[i].name;
+	}
+	return "Unknown";
+}
+
+/* SLC variant names (IEC 62106-2 Table 9) — shared by request and group variant handlers */
+static const char *slc_variant_names[RDS_1A_VARIANT_MAX] = {
+	[RDS_1A_VARIANT_ECC]      = "ECC",
+	[RDS_1A_VARIANT_TMC_ID]   = "TMC",
+	[RDS_1A_VARIANT_PAGER]    = "Paging",
+	[RDS_1A_VARIANT_LANGUAGE] = "Language",
+	[4]                       = "Rsvd4",
+	[5]                       = "Rsvd5",
+	[RDS_1A_VARIANT_BCAST]    = "Broadcaster",
+	[RDS_1A_VARIANT_EWS]      = "EWS",
+};
+
 /* CRC-16 (ITU-T polynomial x^16 + x^12 + x^5 + 1) */
 static uint16_t uecp_crc16(const uint8_t *data, int len)
 {
@@ -1251,9 +1351,9 @@ static void uecp_send_ack(rds_server_t *srv, uint8_t code, uint8_t seq)
 	/* Build frame */
 	frame[len++] = UECP_STA;
 	
-	/* Address: site 0, encoder 0 (global) */
-	frame[len++] = 0x00;
-	frame[len++] = 0x00;
+	/* Address: global (all sites/encoders) */
+	frame[len++] = UECP_ADDR_GLOBAL;
+	frame[len++] = UECP_ADDR_GLOBAL;
 	
 	/* Sequence counter */
 	frame[len++] = srv->uecp_seq++;
@@ -1289,135 +1389,1244 @@ static void uecp_send_ack(rds_server_t *srv, uint8_t code, uint8_t seq)
 	tx_write_raw(srv, frame, len);
 }
 
+/* Send a UECP frame with arbitrary message content.
+ * msg/msg_len: complete message field (MEC + data).
+ * Handles STA/STP delimiters, addressing, sequence counter, and CRC. */
+static void uecp_send_frame(rds_server_t *srv, const uint8_t *msg, int msg_len)
+{
+	uint8_t frame[UECP_FRAME_MAX + 4]; /* room for STA + max frame + CRC + STP */
+	uint16_t crc;
+	int len = 0;
+
+	if (msg_len > 255)
+		return;
+
+	frame[len++] = UECP_STA;
+
+	/* Address: global (all sites/encoders) */
+	frame[len++] = UECP_ADDR_GLOBAL;
+	frame[len++] = UECP_ADDR_GLOBAL;
+
+	/* Sequence counter */
+	frame[len++] = srv->uecp_seq++;
+	if (srv->uecp_seq == 0)
+		srv->uecp_seq = 1;
+
+	/* Message length */
+	frame[len++] = (uint8_t)msg_len;
+
+	/* Message */
+	memcpy(frame + len, msg, msg_len);
+	len += msg_len;
+
+	/* CRC (over ADD to MSG) */
+	crc = uecp_crc16(frame + 1, len - 1);
+	frame[len++] = (crc >> 8) & 0xFF;
+	frame[len++] = crc & 0xFF;
+
+	frame[len++] = UECP_STP;
+
+	tx_write_raw(srv, frame, len);
+}
+
+/* Build and send a UECP response for a single MEC query.
+ * requested_mec: the MEC code being queried
+ * resp_data/resp_len: the MEC-specific response payload (DSN+PSN+value) */
+static void uecp_send_mec_response(rds_server_t *srv, uint8_t requested_mec,
+				   const uint8_t *resp_data, int resp_len)
+{
+	uint8_t msg[260];
+	int mlen = 0;
+
+	msg[mlen++] = requested_mec;
+	if (resp_len > 0 && resp_len < 256) {
+		memcpy(msg + mlen, resp_data, resp_len);
+		mlen += resp_len;
+	}
+
+	LOGP(DRADIO, LOGL_DEBUG, "UECP: Sending %s (0x%02X) response, %d bytes\n",
+	     uecp_mec_name(requested_mec), requested_mec, resp_len);
+
+	uecp_send_frame(srv, msg, mlen);
+}
+
+/* Build AF code list from encoder state (Method A or B).
+ * Returns number of AF codes written to buf, 0 if no AFs.
+ * UECP AF memory is a flat array of code pairs (IEC 62106-10 A.2.9):
+ * "No distinction is made between Methods A or B. The AF list(s)
+ *  have to be structured in pairs as specified in IEC 62106-2."
+ * Method A: count_code + AF codes (pre-computed in af_codes[])
+ * Method B: per list: [count_code, tuning] + [F1,F2] pairs
+ *   count_code = 0xE0 + (1 + 2*af_count)
+ *   F1<F2 = same programme, F1>F2 = regional variant
+ * Terminated with 0x00. */
+static int uecp_build_af_codes(const rds_encoder_t *enc, uint8_t *buf, int max,
+			       const char **method_out, int *n_freqs)
+{
+	int n = 0;
+
+	*n_freqs = 0;
+
+	if (enc->use_method_b && enc->af_method_b.list_count > 0) {
+		int i, j;
+		*method_out = "B";
+		for (i = 0; i < enc->af_method_b.list_count && n + 2 < max; i++) {
+			const rds_af_method_b_list_t *list = &enc->af_method_b.lists[i];
+			uint8_t tuning_code = (uint8_t)(list->tuning_freq - RDS_AF_FM_BASE);
+			uint8_t count = 1 + 2 * list->af_count;
+			/* Header pair: [count_code, tuning_freq] */
+			buf[n++] = (uint8_t)(RDS_AF_NO_AF + count);
+			buf[n++] = tuning_code;
+			/* AF pairs: [F1, F2] with ascending/descending order */
+			for (j = 0; j < list->af_count && n + 1 < max; j++) {
+				uint8_t af_code = (uint8_t)(list->af_freq[j] - RDS_AF_FM_BASE);
+				if (list->af_is_regional[j]) {
+					/* Regional: F1 > F2 (descending) */
+					if (tuning_code > af_code) {
+						buf[n++] = tuning_code;
+						buf[n++] = af_code;
+					} else {
+						buf[n++] = af_code;
+						buf[n++] = tuning_code;
+					}
+				} else {
+					/* Same programme: F1 < F2 (ascending) */
+					if (tuning_code < af_code) {
+						buf[n++] = tuning_code;
+						buf[n++] = af_code;
+					} else {
+						buf[n++] = af_code;
+						buf[n++] = tuning_code;
+					}
+				}
+				(*n_freqs)++;
+			}
+		}
+		/* Terminator */
+		if (n < max)
+			buf[n++] = 0x00;
+	} else if (enc->af_code_count > 0) {
+		*method_out = "A";
+		n = (enc->af_code_count <= max - 1) ? enc->af_code_count : max - 1;
+		memcpy(buf, enc->af_codes, n);
+		*n_freqs = enc->af_method_a.vhf_count + enc->af_method_a.lf_mf_count;
+		/* Terminator */
+		buf[n++] = 0x00;
+	} else {
+		*method_out = "none";
+	}
+
+	return n;
+}
+
+/* Handle UECP Request MEC (0x17): query encoder state and send response.
+ * data points to the bytes after the MEC byte, len is their count.
+ * Format: MEL(1) + requested_MEC(1) + [DSN(1) + PSN(1) + ...] */
+static void uecp_handle_request(rds_server_t *srv, const uint8_t *data, int len)
+{
+	rds_encoder_t *enc = srv->encoder;
+	uint8_t resp[72];
+	int rlen;
+	uint8_t mel, req_mec, req_psn;
+	const char *req_name;
+	const rds_eon_entry_t *eon;
+
+	if (!enc) {
+		LOGP(DRADIO, LOGL_DEBUG, "UECP: Request ignored, no encoder\n");
+		return;
+	}
+
+	if (len < 1) return;
+
+	mel = data[0];
+	if (mel < 1 || len < 1 + mel) {
+		LOGP(DRADIO, LOGL_DEBUG, "UECP: Request truncated (mel=%d len=%d)\n", mel, len);
+		return;
+	}
+
+	req_mec = data[1];
+	req_name = uecp_mec_name(req_mec);
+
+	/* Extract PSN from request: data[2]=DSN, data[3]=PSN (when mel >= 3)
+	 * Exceptions — MECs with non-standard request format:
+	 * MEC 0x1A: no PSN, data[3] = variant code (IEC 62106-10 A.2.11)
+	 * MEC 0x3A: no DSN/PSN, data[2] = target MEC, data[3] = port (A.6.14) */
+	if (req_mec == UECP_MEC_ECC || req_mec == UECP_MEC_ACCESS_RIGHT)
+		req_psn = UECP_PSN_MAIN;
+	else
+		req_psn = (mel >= 3) ? data[3] : UECP_PSN_MAIN;
+
+	/* PSN >= 2 = EON entry (index = PSN - 2) */
+	eon = NULL;
+	if (req_psn >= 2)
+		eon = rds_enc_eon_get_by_index(enc, req_psn - 2);
+
+	if (req_mec == UECP_MEC_ECC) {
+		uint8_t rv = (mel >= 3) ? (data[3] & 0x07) : 0;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Request for %s (0x%02X) variant=%d (%s)\n",
+		     req_name, req_mec, rv,
+		     slc_variant_names[rv] ? slc_variant_names[rv] : "?");
+	} else if (req_mec == UECP_MEC_ACCESS_RIGHT) {
+		uint8_t target_mec = (mel >= 2) ? data[2] : 0;
+		uint8_t port = (mel >= 3) ? data[3] : 0;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Request for %s (0x%02X) target=%s (0x%02X) port=%d\n",
+		     req_name, req_mec, uecp_mec_name(target_mec), target_mec, port);
+	} else {
+		LOGP(DRADIO, LOGL_INFO, "UECP: Request for %s (0x%02X) PSN=%d%s\n",
+		     req_name, req_mec, req_psn,
+		     (req_psn >= 2) ? (eon ? " (EON)" : " (EON, not found)") : "");
+	}
+
+	rlen = 0;
+
+	switch (req_mec) {
+	case UECP_MEC_PI: {
+		uint16_t pi;
+		if (eon) {
+			pi = eon->pi;
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = req_psn;
+		} else {
+			pi = rds_enc_get_pi(enc);
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = UECP_PSN_MAIN;
+		}
+		resp[rlen++] = (pi >> 8) & 0xFF;
+		resp[rlen++] = pi & 0xFF;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): PI=0x%04X%s\n",
+		     req_name, req_mec, pi, eon ? " (EON)" : "");
+		break;
+	}
+	case UECP_MEC_PS: {
+		char ps[9];
+		if (eon) {
+			memcpy(ps, eon->ps, 8);
+			ps[8] = '\0';
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = req_psn;
+		} else {
+			rds_enc_get_ps(enc, ps, sizeof(ps));
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = UECP_PSN_MAIN;
+		}
+		memcpy(resp + rlen, ps, 8);
+		rlen += 8;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): \"%s\"%s\n",
+		     req_name, req_mec, ps, eon ? " (EON)" : "");
+		break;
+	}
+	case UECP_MEC_TP_TA: {
+		int tp, ta;
+		uint8_t flags;
+		if (eon) {
+			tp = eon->tp;
+			ta = eon->ta;
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = req_psn;
+		} else {
+			tp = rds_enc_get_tp(enc);
+			ta = rds_enc_get_ta(enc);
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = UECP_PSN_MAIN;
+		}
+		flags = (uint8_t)((tp << 1) | ta);
+		resp[rlen++] = flags;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): flags=0x%02X TP=%d TA=%d (%s)%s\n",
+		     req_name, req_mec, flags, tp, ta,
+		     rds_get_tp_ta_description(tp, ta), eon ? " (EON)" : "");
+		break;
+	}
+	case UECP_MEC_DI_PTYI: {
+		int stereo, artificial, compressed, dynamic_pty;
+		uint8_t flags;
+		rds_enc_get_di(enc, &stereo, &artificial, &compressed, &dynamic_pty);
+		flags = (uint8_t)((dynamic_pty << 3) | (compressed << 2) |
+				  (artificial << 1) | stereo);
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = UECP_PSN_MAIN;
+		resp[rlen++] = flags;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): flags=0x%02X "
+		     "stereo=%d art=%d comp=%d dpty=%d\n",
+		     req_name, req_mec, flags, stereo, artificial, compressed, dynamic_pty);
+		break;
+	}
+	case UECP_MEC_PTY: {
+		uint8_t pty;
+		if (eon) {
+			pty = eon->pty;
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = req_psn;
+		} else {
+			pty = rds_enc_get_pty(enc);
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = UECP_PSN_MAIN;
+		}
+		resp[rlen++] = pty;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): PTY=%d (%s)%s\n",
+		     req_name, req_mec, pty,
+		     rds_get_pty_name(pty, RDS_IS_RBDS(enc->ecc)),
+		     eon ? " (EON)" : "");
+		break;
+	}
+	case UECP_MEC_RT: {
+		char rt[65];
+		int i, text_len;
+		rds_enc_get_radiotext(enc, rt, sizeof(rt));
+		/* Find actual text length (before CR terminators) */
+		text_len = 64;
+		for (i = 0; i < 64; i++) {
+			if (rt[i] == '\r') { text_len = i; break; }
+		}
+		/* UECP RT response: config(1) + text only (no CR padding).
+		 * MEL delimits the field — controller knows length from MEL. */
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = UECP_PSN_MAIN;
+		resp[rlen++] = (uint8_t)(text_len + 1); /* MEL: config + text */
+		resp[rlen++] = (uint8_t)(enc->rt_ab & 0x01);
+		if (text_len > 0) {
+			memcpy(resp + rlen, rt, text_len);
+			rlen += text_len;
+		}
+		rt[text_len] = '\0';
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): A/B=%c \"%s\" (%d chars)\n",
+		     req_name, req_mec, enc->rt_ab ? 'B' : 'A', rt, text_len);
+		break;
+	}
+	case UECP_MEC_PTYN: {
+		char ptyn[9];
+		rds_enc_get_ptyn(enc, ptyn, sizeof(ptyn));
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = UECP_PSN_MAIN;
+		memcpy(resp + rlen, ptyn, 8);
+		rlen += 8;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): \"%s\"\n",
+		     req_name, req_mec, ptyn);
+		break;
+	}
+	case UECP_MEC_ECC: {
+		/* IEC 62106-10 A.2.11: request includes variant code (data[3] when mel>=3)
+		 * Reply format matches set: DSN + variant_byte(variant<<4 | data_msb) + data_lsb
+		 * For 8-bit variants (ECC, Language): data_msb=0, data_lsb=value
+		 * For 12-bit variants (TMC, Bcast, EWS): data_msb=high nibble, data_lsb=low byte */
+		uint8_t req_variant = (mel >= 3) ? (data[3] & 0x07) : RDS_1A_VARIANT_ECC;
+		const char *vname = slc_variant_names[req_variant];
+		resp[rlen++] = UECP_DSN_CURRENT;
+		switch (req_variant) {
+		case RDS_1A_VARIANT_ECC: {
+			uint8_t ecc = rds_enc_get_ecc(enc);
+			resp[rlen++] = (RDS_1A_VARIANT_ECC << 4);
+			resp[rlen++] = ecc;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): variant=%d (%s) ECC=0x%02X\n",
+			     req_name, req_mec, req_variant, vname, ecc);
+			break;
+		}
+		case RDS_1A_VARIANT_TMC_ID: {
+			uint16_t tmc = rds_enc_get_tmc_id(enc);
+			resp[rlen++] = (RDS_1A_VARIANT_TMC_ID << 4) | ((tmc >> 8) & 0x0F);
+			resp[rlen++] = tmc & 0xFF;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): variant=%d (%s) TMC=0x%03X\n",
+			     req_name, req_mec, req_variant, vname, tmc);
+			break;
+		}
+		case RDS_1A_VARIANT_LANGUAGE: {
+			uint8_t lang = rds_enc_get_language(enc);
+			resp[rlen++] = (RDS_1A_VARIANT_LANGUAGE << 4);
+			resp[rlen++] = lang;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): variant=%d (%s) LIC=%d\n",
+			     req_name, req_mec, req_variant, vname, lang);
+			break;
+		}
+		case RDS_1A_VARIANT_BCAST: {
+			uint16_t bc = rds_enc_get_slc_broadcaster(enc);
+			resp[rlen++] = (RDS_1A_VARIANT_BCAST << 4) | ((bc >> 8) & 0x0F);
+			resp[rlen++] = bc & 0xFF;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): variant=%d (%s) Bcast=0x%03X\n",
+			     req_name, req_mec, req_variant, vname, bc);
+			break;
+		}
+		case RDS_1A_VARIANT_EWS: {
+			uint16_t ews = rds_enc_get_ews_channel(enc);
+			resp[rlen++] = (RDS_1A_VARIANT_EWS << 4) | ((ews >> 8) & 0x0F);
+			resp[rlen++] = ews & 0xFF;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): variant=%d (%s) EWS=%d\n",
+			     req_name, req_mec, req_variant, vname, ews);
+			break;
+		}
+		default:
+			resp[rlen++] = (req_variant << 4);
+			resp[rlen++] = 0x00;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): variant=%d (%s) data=0\n",
+			     req_name, req_mec, req_variant, vname);
+			break;
+		}
+		break;
+	}
+	case UECP_MEC_RDS_ONOFF:
+		resp[rlen++] = UECP_FLAG_ON; /* always on */
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): on=%d (always on)\n",
+		     req_name, req_mec, UECP_FLAG_ON);
+		break;
+	case UECP_MEC_RDS_PHASE: {
+		uint8_t ref = (mel >= 2) ? (data[2] & 0x07) : 0;
+		resp[rlen++] = (ref << 5); /* ref in bits 7-5, phase MSB = 0 */
+		resp[rlen++] = UECP_RDS_PHASE_DEFAULT & 0xFF;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): ref=%d phase=%d.%d°\n",
+		     req_name, req_mec, ref,
+		     UECP_RDS_PHASE_DEFAULT / 10, UECP_RDS_PHASE_DEFAULT % 10);
+		break;
+	}
+	case UECP_MEC_RDS_LEVEL: {
+		uint8_t ref = (mel >= 2) ? (data[2] & 0x07) : 0;
+		resp[rlen++] = (ref << 5) | ((UECP_RDS_LEVEL_DEFAULT >> 8) & 0x1F);
+		resp[rlen++] = UECP_RDS_LEVEL_DEFAULT & 0xFF;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): ref=%d level=%d mVpp\n",
+		     req_name, req_mec, ref, UECP_RDS_LEVEL_DEFAULT);
+		break;
+	}
+	case UECP_MEC_SITE_ADDR:
+		resp[rlen++] = UECP_ADDR_CTRL_ADD;
+		resp[rlen++] = (srv->site_addr >> 8) & 0x03;
+		resp[rlen++] = srv->site_addr & 0xFF;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): addr=0x%03X\n",
+		     req_name, req_mec, srv->site_addr);
+		break;
+	case UECP_MEC_ENC_ADDR:
+		resp[rlen++] = UECP_ADDR_CTRL_ADD;
+		resp[rlen++] = srv->enc_addr & UECP_ENC_ADDR_MASK;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): addr=0x%02X\n",
+		     req_name, req_mec, srv->enc_addr);
+		break;
+	case UECP_MEC_ACCESS_RIGHT: {
+		/* IEC 62106-10 A.6.14: reply format = target_MEC + port + enable_bit
+		 * Request: data[2]=target_MEC, data[3]=port */
+		uint8_t target_mec = (mel >= 2) ? data[2] : 0;
+		uint8_t port = (mel >= 3) ? data[3] : 0;
+		resp[rlen++] = target_mec;
+		resp[rlen++] = port;
+		resp[rlen++] = UECP_ACCESS_ENABLED;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): target=%s (0x%02X) port=%d enabled\n",
+		     req_name, req_mec, uecp_mec_name(target_mec), target_mec, port);
+		break;
+	}
+	case UECP_MEC_MS: {
+		int ms = rds_enc_get_ms(enc);
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = UECP_PSN_MAIN;
+		resp[rlen++] = (uint8_t)ms;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): M/S=%d (%s)\n",
+		     req_name, req_mec, ms, rds_get_ms_name(ms));
+		break;
+	}
+	case UECP_MEC_CT_ONOFF:
+		resp[rlen++] = (uint8_t)(enc->ct_enabled ? UECP_FLAG_ON : UECP_FLAG_OFF);
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): ct=%s\n",
+		     req_name, req_mec, enc->ct_enabled ? "on" : "off");
+		break;
+	case UECP_MEC_AF: {
+		/* Return actual AF list from encoder (Method A or B) */
+		uint8_t af_buf[64];
+		const char *af_method;
+		int af_freqs;
+		int af_n = uecp_build_af_codes(enc, af_buf, (int)sizeof(af_buf),
+						&af_method, &af_freqs);
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = UECP_PSN_MAIN;
+		if (af_n > 0) {
+			resp[rlen++] = (uint8_t)(af_n + 2); /* MEL: start_loc(2) + codes */
+			resp[rlen++] = 0x00; /* start location high */
+			resp[rlen++] = 0x00; /* start location low */
+			memcpy(resp + rlen, af_buf, af_n);
+			rlen += af_n;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): Method %s, "
+			     "%d codes, %d freqs\n",
+			     req_name, req_mec, af_method, af_n, af_freqs);
+		} else {
+			resp[rlen++] = 0x02; /* MEL: start_loc(2) only */
+			resp[rlen++] = 0x00;
+			resp[rlen++] = 0x00;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): empty list (no AFs)\n",
+			     req_name, req_mec);
+		}
+		break;
+	}
+	case UECP_MEC_EON_AF:
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = req_psn;
+		if (eon && eon->af_count > 0) {
+			/* Build AF code list from EON entry frequencies */
+			int af_n = 0;
+			uint8_t af_buf[52]; /* max 25 AFs + count + terminator */
+			for (int i = 0; i < eon->af_count && af_n < (int)sizeof(af_buf); i++) {
+				uint8_t code = (uint8_t)(eon->af[i] - RDS_AF_FM_BASE);
+				if (code >= 1 && code <= 204)
+					af_buf[af_n++] = code;
+			}
+			resp[rlen++] = (uint8_t)(af_n + 2); /* MEL: start_loc(2) + codes */
+			resp[rlen++] = 0x00; /* start location high */
+			resp[rlen++] = 0x00; /* start location low */
+			memcpy(resp + rlen, af_buf, af_n);
+			rlen += af_n;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): %d EON-AFs for PI=0x%04X\n",
+			     req_name, req_mec, af_n, eon->pi);
+		} else {
+			resp[rlen++] = 0x02; /* MEL: start_loc(2) only */
+			resp[rlen++] = 0x00;
+			resp[rlen++] = 0x00;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): empty list (0 EON-AFs)%s\n",
+			     req_name, req_mec,
+			     (req_psn >= 2 && !eon) ? " (no EON entry)" : "");
+		}
+		break;
+	case UECP_MEC_MAKE_PSN_LIST:
+		/* Return current PSN list - single main service */
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = 0x01; /* MEL: 1 PSN */
+		resp[rlen++] = UECP_PSN_MAIN;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): 1 service (PSN=%d)\n",
+		     req_name, req_mec, UECP_PSN_MAIN);
+		break;
+	case UECP_MEC_PSN_ENABLE:
+		/* Return PSN enable status - main service always enabled */
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = 0x02; /* MEL: 1 pair */
+		resp[rlen++] = UECP_FLAG_ON; /* enabled */
+		resp[rlen++] = UECP_PSN_MAIN;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): PSN=%d enabled\n",
+		     req_name, req_mec, UECP_PSN_MAIN);
+		break;
+	case UECP_MEC_GROUP_SEQ: {
+		/* Return current group sequence from scheduler */
+		int i;
+		resp[rlen++] = UECP_DSN_CURRENT;
+		if (enc->group_sched_len > 0) {
+			resp[rlen++] = (uint8_t)enc->group_sched_len;
+			for (i = 0; i < enc->group_sched_len && rlen < (int)sizeof(resp) - 1; i++)
+				resp[rlen++] = (uint8_t)enc->group_sched_buffer[i];
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): %d groups in sequence\n",
+			     req_name, req_mec, enc->group_sched_len);
+		} else {
+			resp[rlen++] = 0x01; /* MEL: 1 entry */
+			resp[rlen++] = 0x00; /* Group 0A */
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): default (0A only)\n",
+			     req_name, req_mec);
+		}
+		break;
+	}
+	case UECP_MEC_GROUP_VARIANT: {
+		/* Return actual SLC variant sequence for requested group type.
+		 * Group type byte follows DSN+PSN when present:
+		 *   mel=2: data[2]=group_type (no DSN/PSN)
+		 *   mel=3: DSN+PSN only, no group_type → default 1A
+		 *   mel>=4: data[4]=group_type (after DSN+PSN) */
+		uint8_t gt;
+		if (mel >= 4)
+			gt = data[4];		/* after MEC+DSN+PSN */
+		else if (mel >= 3)
+			gt = 0x02;		/* DSN+PSN but no group type → default 1A */
+		else if (mel >= 2)
+			gt = data[2];		/* no DSN/PSN, group type directly */
+		else
+			gt = 0x02;		/* nothing → default 1A */
+		int group_num = (gt >> 1) & 0x0F;
+		int group_ver = gt & 0x01;
+
+		/* SLC variants only apply to Group 1A */
+		if (group_num == 1 && group_ver == 0) {
+			int variants[RDS_1A_VARIANT_MAX];
+			int nv = rds_enc_get_slc_variants(enc, variants, RDS_1A_VARIANT_MAX);
+
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = req_psn;
+			resp[rlen++] = gt;
+			for (int i = 0; i < nv; i++)
+				resp[rlen++] = (uint8_t)variants[i];
+
+			/* Build human-readable log */
+			char vbuf[64];
+			int vpos = 0;
+			for (int i = 0; i < nv && vpos < (int)sizeof(vbuf) - 12; i++) {
+				int v = variants[i];
+				const char *vname = (v >= 0 && v <= 7) ? slc_variant_names[v] : "?";
+				vpos += snprintf(vbuf + vpos, sizeof(vbuf) - vpos,
+						 "%s%d=%s", i ? "," : "", v, vname);
+			}
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): group=1A, %d variants [%s]\n",
+			     req_name, req_mec, nv, vbuf);
+		} else {
+			/* Non-1A groups: no variant sequence */
+			resp[rlen++] = UECP_DSN_CURRENT;
+			resp[rlen++] = req_psn;
+			resp[rlen++] = gt;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): group=%d%c (no variants)\n",
+			     req_name, req_mec, group_num, group_ver ? 'B' : 'A');
+		}
+		break;
+	}
+	case UECP_MEC_EON_ENABLE: {
+		/* Build enable flags from actual EON entry content */
+		uint8_t eon_flags = 0;
+		if (eon) {
+			/* Per-entry: use stored flags if set, otherwise build from content */
+			eon_flags = eon->enable_flags ? eon->enable_flags
+						      : rds_enc_eon_build_enable_flags(eon);
+		} else if (req_psn <= 1 && enc->eon_tx_count > 0 && enc->eon_enabled) {
+			/* Main PSN: OR all entry flags together */
+			for (int i = 0; i < enc->eon_tx_count; i++) {
+				uint8_t f = enc->eon_tx[i].enable_flags
+					  ? enc->eon_tx[i].enable_flags
+					  : rds_enc_eon_build_enable_flags(&enc->eon_tx[i]);
+				eon_flags |= f;
+			}
+		}
+		resp[rlen++] = UECP_DSN_CURRENT;
+		resp[rlen++] = req_psn;
+		resp[rlen++] = eon_flags;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): flags=0x%02X "
+		     "(PS=%d AF=%d Link=%d PTY=%d PIN=%d Bcast=%d TA=%d)\n",
+		     req_name, req_mec, eon_flags,
+		     !!(eon_flags & RDS_EON_FLAG_PS), !!(eon_flags & RDS_EON_FLAG_AF),
+		     !!(eon_flags & RDS_EON_FLAG_LINK), !!(eon_flags & RDS_EON_FLAG_PTY),
+		     !!(eon_flags & RDS_EON_FLAG_PIN), !!(eon_flags & RDS_EON_FLAG_BCAST),
+		     !!(eon_flags & RDS_EON_FLAG_TA));
+		break;
+	}
+	case UECP_MEC_MANUFACTURER: {
+		/* Return manufacturer ID + model string */
+		int slen = (int)strlen(UECP_MFR_MODEL);
+		resp[rlen++] = UECP_MFR_ID_HI;
+		resp[rlen++] = UECP_MFR_ID_LO;
+		memcpy(resp + rlen, UECP_MFR_MODEL, slen);
+		rlen += slen;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): \"%c%c\" \"%s\"\n",
+		     req_name, req_mec, UECP_MFR_ID_HI, UECP_MFR_ID_LO, UECP_MFR_MODEL);
+		break;
+	}
+	default:
+		LOGP(DRADIO, LOGL_NOTICE, "UECP: Request for unsupported %s (0x%02X)\n", req_name, req_mec);
+		return;
+	}
+
+	uecp_send_mec_response(srv, req_mec, resp, rlen);
+}
+
 /* Process single UECP message element */
 static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 			     const uint8_t *data, int len)
 {
 	rds_encoder_t *enc = srv->encoder;
-	
+	const char *name = uecp_mec_name(mec);
+
 	if (!enc) {
 		LOGP(DRADIO, LOGL_DEBUG, "UECP: No encoder attached\n");
 		return;
 	}
-	
-	/* Skip DSN/PSN if present (we only support single data set) */
-	int pos = 0;
-	
+
+	/* Most MECs have DSN(1) + PSN(1) prefix.
+	 * PSN 0-1 = main programme, PSN >= 2 = EON entry (index PSN-2) */
+	uint8_t psn = UECP_PSN_MAIN;
+	int is_eon = 0;
+
+	switch (mec) {
+	/* MECs with DSN + PSN prefix */
+	case UECP_MEC_PI:
+	case UECP_MEC_PS:
+	case UECP_MEC_TP_TA:
+	case UECP_MEC_DI_PTYI:
+	case UECP_MEC_PTY:
+	case UECP_MEC_MS:
+	case UECP_MEC_PTYN:
+	case UECP_MEC_AF:
+	case UECP_MEC_EON_AF:
+	case UECP_MEC_EON_ENABLE:
+		if (len >= 2)
+			psn = data[1];
+		is_eon = (psn >= 2);
+		break;
+	default:
+		break;
+	}
+
 	switch (mec) {
 	case UECP_MEC_PI:
-		/* PI: DSN, PSN, PI_MSB, PI_LSB */
 		if (len >= 4) {
 			uint16_t pi = ((uint16_t)data[2] << 8) | data[3];
-			rds_enc_set_pi(enc, pi);
-			LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x01 (PI), set PI=%04X\n", pi);
+			if (is_eon) {
+				rds_eon_entry_t *eon = rds_enc_eon_ensure(enc, pi);
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) PSN=%d: EON PI=0x%04X%s\n",
+				     name, mec, psn, pi, eon ? "" : " (FAILED)");
+			} else {
+				rds_enc_set_pi(enc, pi);
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): PI=0x%04X\n", name, mec, pi);
+			}
 		}
 		break;
-		
+
 	case UECP_MEC_PS:
-		/* PS: DSN, PSN, 8 chars */
 		if (len >= 10) {
 			char ps[9];
 			memcpy(ps, data + 2, 8);
 			ps[8] = '\0';
-			rds_enc_set_ps(enc, ps);
-			LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x02 (PS), set PS=\"%s\"\n", ps);
+			if (is_eon) {
+				/* Need PI to find EON entry — get from eon_tx by PSN index */
+				const rds_eon_entry_t *eon = rds_enc_eon_get_by_index(enc, psn - 2);
+				if (eon) {
+					rds_enc_eon_set_ps(enc, eon->pi, ps);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) PSN=%d: EON PS=\"%s\" (PI=0x%04X)\n",
+					     name, mec, psn, ps, eon->pi);
+				} else {
+					LOGP(DRADIO, LOGL_NOTICE, "UECP: Set %s (0x%02X) PSN=%d: no EON entry at index %d\n",
+					     name, mec, psn, psn - 2);
+				}
+			} else {
+				rds_enc_set_ps(enc, ps);
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\"\n", name, mec, ps);
+			}
 		}
 		break;
-		
+
 	case UECP_MEC_TP_TA:
-		/* TP-TA: DSN, PSN, flags */
 		if (len >= 3) {
 			int ta = data[2] & 0x01;
 			int tp = (data[2] >> 1) & 0x01;
-			rds_enc_set_tp(enc, tp);
-			rds_enc_set_ta(enc, ta);
-			LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x03 (TP/TA), set TP=%d TA=%d\n", tp, ta);
+			if (is_eon) {
+				const rds_eon_entry_t *eon = rds_enc_eon_get_by_index(enc, psn - 2);
+				if (eon) {
+					rds_enc_eon_set_tp(enc, eon->pi, tp);
+					rds_enc_eon_set_ta(enc, eon->pi, ta);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) PSN=%d: EON TP=%d TA=%d (PI=0x%04X)\n",
+					     name, mec, psn, tp, ta, eon->pi);
+				} else {
+					LOGP(DRADIO, LOGL_NOTICE, "UECP: Set %s (0x%02X) PSN=%d: no EON entry at index %d\n",
+					     name, mec, psn, psn - 2);
+				}
+			} else {
+				rds_enc_set_tp(enc, tp);
+				rds_enc_set_ta(enc, ta);
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): TP=%d TA=%d (%s)\n",
+				     name, mec, tp, ta, rds_get_tp_ta_description(tp, ta));
+			}
 		}
 		break;
-		
+
+	case UECP_MEC_DI_PTYI:
+		if (len >= 3) {
+			int stereo = data[2] & 0x01;
+			int artificial = (data[2] >> 1) & 0x01;
+			int compressed = (data[2] >> 2) & 0x01;
+			int dynamic_pty = (data[2] >> 3) & 0x01;
+			rds_enc_set_di(enc, stereo, artificial, compressed, dynamic_pty);
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): stereo=%d art=%d comp=%d dpty=%d\n",
+			     name, mec, stereo, artificial, compressed, dynamic_pty);
+		}
+		break;
+
 	case UECP_MEC_PTY:
-		/* PTY: DSN, PSN, pty */
 		if (len >= 3) {
 			uint8_t pty = data[2] & 0x1F;
-			rds_enc_set_pty(enc, pty);
-			LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x07 (PTY), set PTY=%d\n", pty);
+			if (is_eon) {
+				const rds_eon_entry_t *eon = rds_enc_eon_get_by_index(enc, psn - 2);
+				if (eon) {
+					rds_enc_eon_set_pty(enc, eon->pi, pty);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) PSN=%d: EON PTY=%d (PI=0x%04X)\n",
+					     name, mec, psn, pty, eon->pi);
+				} else {
+					LOGP(DRADIO, LOGL_NOTICE, "UECP: Set %s (0x%02X) PSN=%d: no EON entry at index %d\n",
+					     name, mec, psn, psn - 2);
+				}
+			} else {
+				rds_enc_set_pty(enc, pty);
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): PTY=%d (%s)\n",
+				     name, mec, pty,
+				     rds_get_pty_name(pty, RDS_IS_RBDS(enc->ecc)));
+			}
 		}
 		break;
-		
+
 	case UECP_MEC_RT:
-		/* RT: DSN, PSN, MEL, config, text... */
 		if (len >= 4) {
 			int mel = data[2];
-			int text_len = mel - 1;  /* Subtract config byte */
+			int text_len = mel - 1;
 			if (text_len > 0 && text_len <= 64 && len >= 4 + text_len) {
 				char rt[65];
 				memcpy(rt, data + 4, text_len);
 				rt[text_len] = '\0';
 				rds_enc_set_radiotext(enc, rt);
-				LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x0A (RT), set RT=\"%s\"\n", rt);
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\"\n", name, mec, rt);
 			}
 		}
 		break;
-		
+
 	case UECP_MEC_PTYN:
-		/* PTYN: DSN, PSN, 8 chars */
 		if (len >= 10) {
 			char ptyn[9];
 			memcpy(ptyn, data + 2, 8);
 			ptyn[8] = '\0';
 			rds_enc_set_ptyn(enc, ptyn);
-			LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x3E (PTYN), set PTYN=\"%s\"\n", ptyn);
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\"\n", name, mec, ptyn);
 		}
 		break;
-		
+
 	case UECP_MEC_ECC:
-		/* ECC: DSN, variant+data */
 		if (len >= 2) {
 			uint8_t variant = (data[1] >> 4) & 0x07;
-			if (variant == 0 && len >= 3) {
-				uint8_t ecc = data[2];
-				rds_enc_set_ecc(enc, ecc);
-				LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x1A (ECC), set ECC=%02X\n", ecc);
+			const char *vname = slc_variant_names[variant];
+			switch (variant) {
+			case RDS_1A_VARIANT_ECC:
+				if (len >= 3) {
+					rds_enc_set_ecc(enc, data[2]);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) variant=%d (%s): ECC=0x%02X\n",
+					     name, mec, variant, vname, data[2]);
+				}
+				break;
+			case RDS_1A_VARIANT_TMC_ID:
+				if (len >= 4) {
+					uint16_t tmc = ((uint16_t)(data[2] & 0x0F) << 8) | data[3];
+					rds_enc_set_tmc_id(enc, tmc);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) variant=%d (%s): TMC=0x%03X\n",
+					     name, mec, variant, vname, tmc);
+				}
+				break;
+			case RDS_1A_VARIANT_LANGUAGE:
+				if (len >= 3) {
+					rds_enc_set_language(enc, data[2]);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) variant=%d (%s): LIC=%d\n",
+					     name, mec, variant, vname, data[2]);
+				}
+				break;
+			case RDS_1A_VARIANT_BCAST:
+				if (len >= 4) {
+					uint16_t bc = ((uint16_t)(data[2] & 0x0F) << 8) | data[3];
+					rds_enc_set_slc_broadcaster(enc, bc);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) variant=%d (%s): Bcast=0x%03X\n",
+					     name, mec, variant, vname, bc);
+				}
+				break;
+			case RDS_1A_VARIANT_EWS:
+				if (len >= 4) {
+					uint16_t ews = ((uint16_t)(data[2] & 0x0F) << 8) | data[3];
+					rds_enc_set_ews_channel(enc, ews);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) variant=%d (%s): EWS=%d\n",
+					     name, mec, variant, vname, ews);
+				}
+				break;
+			default:
+				LOGP(DRADIO, LOGL_NOTICE, "UECP: Set %s (0x%02X) variant=%d (%s): unsupported\n",
+				     name, mec, variant, vname);
+				break;
 			}
 		}
 		break;
-		
-	case UECP_MEC_DI_PTYI:
-		/* DI/PTYI: DSN, PSN, flags - not implemented */
-		LOGP(DRADIO, LOGL_NOTICE, "UECP: Unsupported MEC 0x04 (DI/PTYI)\n");
-		break;
-		
-	case UECP_MEC_RTC:
-		/* Real Time Clock - not implemented (system time used) */
-		LOGP(DRADIO, LOGL_NOTICE, "UECP: Unsupported MEC 0x0D (RTC) - system time used\n");
-		break;
-		
-	case UECP_MEC_AF:
-		/* Alternative Frequencies - not implemented */
-		LOGP(DRADIO, LOGL_NOTICE, "UECP: Unsupported MEC 0x13 (AF)\n");
-		break;
-		
+
 	case UECP_MEC_REQUEST:
-		/* Request/Query - not implemented */
-		LOGP(DRADIO, LOGL_NOTICE, "UECP: Unsupported MEC 0x17 (Request)\n");
+		uecp_handle_request(srv, data, len);
 		break;
-		
+
 	case UECP_MEC_CT_ONOFF:
-		/* Clock-Time On/Off - not implemented */
-		LOGP(DRADIO, LOGL_NOTICE, "UECP: Unsupported MEC 0x19 (CT On/Off)\n");
+		if (len >= 1) {
+			int ct_on = data[0] & UECP_FLAG_ON;
+			if (enc)
+				enc->ct_enabled = ct_on;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): ct=%s\n",
+			     name, mec, ct_on ? "on" : "off");
+		}
 		break;
-		
+
+	case UECP_MEC_MS:
+		if (len >= 3) {
+			int ms = data[2] & 0x01;
+			rds_enc_set_ms(enc, ms);
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): M/S=%d (%s)\n",
+			     name, mec, ms, ms ? "Music" : "Speech");
+		}
+		break;
+
+	case UECP_MEC_RTC_CORR:
+		if (len >= 2) {
+			int16_t corr_ms = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+			enc->ct_time_offset = corr_ms / 1000;  /* Store as whole seconds */
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): correction=%d ms\n",
+			     name, mec, corr_ms);
+		}
+		break;
+
+	case UECP_MEC_PSN_ENABLE:
+		/* PSN enable/disable - we only have a single programme service,
+		 * so just acknowledge and log */
+		if (len >= 2) {
+			int mel_val = data[1];
+			int n_pairs = mel_val / 2;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): %d PSN entries (single-service encoder, ignored)\n",
+			     name, mec, n_pairs);
+		}
+		break;
+
+	case UECP_MEC_MAKE_PSN_LIST:
+		/* Make PSN list - we only have a single programme service,
+		 * so just acknowledge and log */
+		if (len >= 2) {
+			int mel_val = data[1];
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): %d services (single-service encoder, ignored)\n",
+			     name, mec, mel_val);
+		}
+		break;
+
+	case UECP_MEC_GROUP_SEQ:
+		/* Group sequence - log the requested sequence */
+		if (len >= 2) {
+			int mel_val = data[1];
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): %d groups in sequence (scheduler handles)\n",
+			     name, mec, mel_val);
+		}
+		break;
+
+	case UECP_MEC_GROUP_VARIANT:
+		/* Group variant code sequence - log */
+		if (len >= 3) {
+			int mel_val = data[1];
+			uint8_t group_type = data[2];
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): group=%d%c, %d variants (scheduler handles)\n",
+			     name, mec, (group_type >> 1) & 0x0F, (group_type & 0x01) ? 'B' : 'A',
+			     mel_val - 1);
+		}
+		break;
+
+	case UECP_MEC_EON_ENABLE:
+		/* EON elements enable/disable */
+		if (len >= 3) {
+			uint8_t flags = data[2];
+			if (is_eon) {
+				const rds_eon_entry_t *eon = rds_enc_eon_get_by_index(enc, psn - 2);
+				if (eon) {
+					rds_enc_eon_set_enable_flags(enc, eon->pi, flags);
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) PSN=%d: EON flags=0x%02X "
+					     "(PS=%d AF=%d Link=%d PTY=%d PIN=%d Bcast=%d TA=%d) PI=0x%04X\n",
+					     name, mec, psn, flags,
+					     !!(flags & RDS_EON_FLAG_PS), !!(flags & RDS_EON_FLAG_AF),
+					     !!(flags & RDS_EON_FLAG_LINK), !!(flags & RDS_EON_FLAG_PTY),
+					     !!(flags & RDS_EON_FLAG_PIN), !!(flags & RDS_EON_FLAG_BCAST),
+					     !!(flags & RDS_EON_FLAG_TA), eon->pi);
+				} else {
+					LOGP(DRADIO, LOGL_NOTICE, "UECP: Set %s (0x%02X) PSN=%d: no EON entry at index %d\n",
+					     name, mec, psn, psn - 2);
+				}
+			} else {
+				/* Main PSN: enable/disable EON globally */
+				enc->eon_enabled = (flags != 0) ? 1 : 0;
+				rds_scheduler_update(enc);
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): flags=0x%02X %s "
+				     "(PS=%d AF=%d Link=%d PTY=%d PIN=%d Bcast=%d TA=%d)\n",
+				     name, mec, flags, enc->eon_enabled ? "enabled" : "disabled",
+				     !!(flags & RDS_EON_FLAG_PS), !!(flags & RDS_EON_FLAG_AF),
+				     !!(flags & RDS_EON_FLAG_LINK), !!(flags & RDS_EON_FLAG_PTY),
+				     !!(flags & RDS_EON_FLAG_PIN), !!(flags & RDS_EON_FLAG_BCAST),
+				     !!(flags & RDS_EON_FLAG_TA));
+			}
+		}
+		break;
+
+	case UECP_MEC_RDS_ONOFF:
+		if (len >= 1) {
+			int rds_on = data[0] & UECP_FLAG_ON;
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): %s (always on)\n",
+			     name, mec, rds_on ? "on" : "off");
+		}
+		break;
+
+	case UECP_MEC_RDS_PHASE:
+		if (len >= 2) {
+			uint8_t ref = (data[0] >> 5) & 0x07;
+			uint16_t phase = ((uint16_t)(data[0] & 0x0F) << 8) | data[1];
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): ref=%d phase=%d.%d° (DSP handles)\n",
+			     name, mec, ref, phase / 10, phase % 10);
+		}
+		break;
+
+	case UECP_MEC_RDS_LEVEL:
+		if (len >= 2) {
+			uint8_t ref = (data[0] >> 5) & 0x07;
+			uint16_t level = ((uint16_t)(data[0] & 0x1F) << 8) | data[1];
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): ref=%d level=%d mVpp (DSP handles)\n",
+			     name, mec, ref, level);
+		}
+		break;
+
+	case UECP_MEC_SITE_ADDR:
+		if (len >= 3) {
+			uint8_t ctrl = data[0] & 0x03;
+			uint16_t addr = ((uint16_t)(data[1] & 0x03) << 8) | data[2];
+			if (ctrl == UECP_ADDR_CTRL_ADD) {
+				srv->site_addr = addr;
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): add 0x%03X\n", name, mec, addr);
+			} else if (ctrl == UECP_ADDR_CTRL_REMOVE) {
+				if (srv->site_addr == addr)
+					srv->site_addr = UECP_ADDR_GLOBAL;
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): remove 0x%03X\n", name, mec, addr);
+			} else if (ctrl == UECP_ADDR_CTRL_CLEAR) {
+				srv->site_addr = UECP_ADDR_GLOBAL;
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): clear all\n", name, mec);
+			}
+		}
+		break;
+
+	case UECP_MEC_ENC_ADDR:
+		if (len >= 2) {
+			uint8_t ctrl = data[0] & 0x03;
+			uint8_t addr = data[1] & UECP_ENC_ADDR_MASK;
+			if (ctrl == UECP_ADDR_CTRL_ADD) {
+				srv->enc_addr = addr;
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): add 0x%02X\n", name, mec, addr);
+			} else if (ctrl == UECP_ADDR_CTRL_REMOVE) {
+				if (srv->enc_addr == addr)
+					srv->enc_addr = UECP_ADDR_GLOBAL;
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): remove 0x%02X\n", name, mec, addr);
+			} else if (ctrl == UECP_ADDR_CTRL_CLEAR) {
+				srv->enc_addr = UECP_ADDR_GLOBAL;
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): clear all\n", name, mec);
+			}
+		}
+		break;
+
+	case UECP_MEC_ACCESS_RIGHT:
+		if (len >= 3) {
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): target=%s (0x%02X) port=%d enable=%d\n",
+			     name, mec, uecp_mec_name(data[0]), data[0], data[1], data[2] & 0x01);
+		}
+		break;
+
+	case UECP_MEC_MANUFACTURER:
+		/* Manufacturer-specific command — log and ignore */
+		if (len >= 2) {
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): mfr=\"%c%c\" %d data bytes\n",
+			     name, mec, data[0], data[1], len - 2);
+		}
+		break;
+
 	case UECP_MEC_ACK:
-		/* ACK from client - just log it */
-		LOGP(DRADIO, LOGL_INFO, "UECP: Received MEC 0x18 (ACK)\n");
+		LOGP(DRADIO, LOGL_INFO, "UECP: Received %s (0x%02X) from client\n", name, mec);
 		break;
-		
+
+	case UECP_MEC_RTC:
+		if (len >= 8) {
+			uint8_t year = data[0];
+			uint8_t month = data[1];
+			uint8_t day = data[2];
+			uint8_t hour = data[3];
+			uint8_t minute = data[4];
+			uint8_t second = data[5];
+			uint8_t centisec = data[6];
+			uint8_t lto = data[7];
+			/* We use system time for CT, but log the received time
+			 * and update local_offset if provided */
+			if (lto != 0xFF) {
+				/* Bits 5-0: magnitude in half-hours, bit 5: sign (1=negative) */
+				int8_t offset = (int8_t)(lto & 0x3F);
+				if (lto & 0x20)
+					offset = -offset;
+				enc->local_offset = offset;
+			}
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): 20%02d-%02d-%02d %02d:%02d:%02d.%02d UTC, LTO=%s%d.%dh\n",
+			     name, mec, year, month, day, hour, minute, second, centisec,
+			     (enc->local_offset < 0) ? "-" : "+",
+			     abs(enc->local_offset) / 2, (abs(enc->local_offset) % 2) * 5);
+		}
+		break;
+
+	case UECP_MEC_AF:
+		if (len >= 5) {
+			/* DSN(1) + PSN(1) + MEL(1) + start_loc(2) + AF data
+			 * AF data is the on-air code sequence: either Method A
+			 * (individual codes) or Method B (count+tuning+pairs per list).
+			 * Method B: count = 1 + 2*N (always odd, ≥3), pairs contain
+			 * tuning freq with ascending=same, descending=regional. */
+			int af_mel = data[2];
+			int af_data_len = af_mel - 2; /* subtract start_loc(2) */
+			uint16_t af_offset = ((uint16_t)data[3] << 8) | data[4];
+			if (af_data_len > 0 && len >= 5 + af_data_len) {
+				const uint8_t *af = data + 5;
+				int i = 0;
+
+				/* Detect Method B: first byte is count code with odd
+				 * count ≥ 3, second byte is valid VHF tuning code,
+				 * and pairs reference the tuning frequency */
+				int is_method_b = 0;
+				if (af_data_len >= 4 && af[0] >= RDS_AF_COUNT_MIN &&
+				    af[0] <= RDS_AF_COUNT_MAX) {
+					int cnt = af[0] - RDS_AF_NO_AF;
+					uint8_t tuning = af[1];
+					/* Method B: odd count ≥ 3, valid tuning code,
+					 * and first pair references tuning */
+					if (cnt >= 3 && (cnt & 1) && tuning >= 1 &&
+					    tuning <= 204 && af_data_len >= 4 &&
+					    (af[2] == tuning || af[3] == tuning))
+						is_method_b = 1;
+				}
+
+				if (is_method_b) {
+					/* Method B: parse [count, tuning, pairs...] lists */
+					rds_enc_af_clear(enc);
+					int list_num = 0;
+
+					while (i < af_data_len) {
+						uint8_t code = af[i];
+
+						/* Terminator */
+						if (code == RDS_AF_NOT_USED)
+							break;
+
+						/* Expect count code */
+						if (code < RDS_AF_COUNT_MIN || code > RDS_AF_COUNT_MAX) {
+							i++;
+							continue;
+						}
+
+						int cnt = code - RDS_AF_NO_AF;
+						int n_pairs = (cnt - 1) / 2;
+						i++; /* skip count */
+
+						if (i >= af_data_len)
+							break;
+
+						uint8_t tuning_code = af[i++];
+						uint16_t tuning_freq = tuning_code + RDS_AF_FM_BASE;
+
+						uint16_t af_freqs[RDS_AF_METHOD_B_MAX_AFS];
+						uint8_t af_regional[RDS_AF_METHOD_B_MAX_AFS];
+						int af_count = 0;
+
+						for (int p = 0; p < n_pairs && i + 1 < af_data_len; p++) {
+							uint8_t f1 = af[i++];
+							uint8_t f2 = af[i++];
+
+							/* Skip filler pairs */
+							if (f1 == RDS_AF_FILLER || f2 == RDS_AF_FILLER)
+								continue;
+
+							/* Identify which is the AF (not tuning) */
+							uint8_t af_code;
+							if (f1 == tuning_code)
+								af_code = f2;
+							else if (f2 == tuning_code)
+								af_code = f1;
+							else {
+								/* Neither is tuning — take the non-tuning one */
+								af_code = (f1 != tuning_code) ? f1 : f2;
+							}
+
+							if (af_code < 1 || af_code > 204)
+								continue;
+
+							if (af_count < RDS_AF_METHOD_B_MAX_AFS) {
+								af_freqs[af_count] = af_code + RDS_AF_FM_BASE;
+								/* Descending (F1 > F2) = regional */
+								af_regional[af_count] = (f1 > f2) ? 1 : 0;
+								af_count++;
+							}
+						}
+
+						if (af_count > 0) {
+							rds_enc_af_method_b_add_list(enc, tuning_freq,
+								af_freqs, af_regional, af_count);
+							LOGP(DRADIO, LOGL_INFO,
+							     "UECP: Set %s (0x%02X): Method B list[%d] tuning=%.1f, %d AFs\n",
+							     name, mec, list_num,
+							     tuning_freq / 10.0, af_count);
+							list_num++;
+						}
+					}
+
+					if (list_num == 0) {
+						LOGP(DRADIO, LOGL_INFO,
+						     "UECP: Set %s (0x%02X): cleared (no valid Method B lists)\n",
+						     name, mec);
+					}
+				} else {
+					/* Method A: individual AF codes */
+					char af_str[256];
+					int pos = 0;
+					int freq_count = 0;
+					int skip_next = 0;
+
+					for (i = 0; i < af_data_len; i++) {
+						uint8_t code = af[i];
+
+						if (skip_next) {
+							skip_next = 0;
+							continue;
+						}
+						if (code == RDS_AF_LF_MF_FOLLOWS) {
+							skip_next = 1;
+							continue;
+						}
+						if (code >= RDS_AF_COUNT_MIN || code == RDS_AF_FILLER ||
+						    code == RDS_AF_NOT_USED)
+							continue;
+
+						int freq_tenths = code + RDS_AF_FM_BASE;
+						int n = snprintf(af_str + pos, sizeof(af_str) - pos,
+								 "%s%d.%d", freq_count ? "," : "",
+								 freq_tenths / 10, freq_tenths % 10);
+						if (n < 0 || pos + n >= (int)sizeof(af_str))
+							break;
+						pos += n;
+						freq_count++;
+					}
+					af_str[pos] = '\0';
+
+					if (freq_count > 0) {
+						rds_enc_af_set_method_a(enc, af_str);
+						LOGP(DRADIO, LOGL_INFO,
+						     "UECP: Set %s (0x%02X): Method A, %d freqs at offset %d: %s\n",
+						     name, mec, freq_count, af_offset, af_str);
+					} else {
+						rds_enc_af_set_method_a(enc, NULL);
+						LOGP(DRADIO, LOGL_INFO,
+						     "UECP: Set %s (0x%02X): cleared (no valid AF codes)\n",
+						     name, mec);
+					}
+				}
+			}
+		}
+		break;
+
+	case UECP_MEC_EON_AF:
+		if (is_eon && len >= 5) {
+			int eon_mel = data[2];
+			int eon_data_len = eon_mel - 2;
+			uint16_t eon_offset = ((uint16_t)data[3] << 8) | data[4];
+			const rds_eon_entry_t *eon = rds_enc_eon_get_by_index(enc, psn - 2);
+			if (eon && eon_data_len > 0 && len >= 5 + eon_data_len) {
+				const uint8_t *af = data + 5;
+				/* Clear existing AFs and parse new ones */
+				rds_enc_eon_af_clear(enc, eon->pi);
+				int af_count = 0;
+				for (int i = 0; i < eon_data_len; i++) {
+					uint8_t code = af[i];
+					if (code == RDS_AF_NOT_USED || code == RDS_AF_FILLER)
+						continue;
+					if (code >= RDS_AF_COUNT_MIN)
+						continue;
+					if (code >= 1 && code <= 204) {
+						uint16_t freq = code + RDS_AF_FM_BASE;
+						rds_enc_eon_af_add(enc, eon->pi, freq);
+						af_count++;
+					}
+				}
+				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X) PSN=%d: %d EON-AFs at offset %d (PI=0x%04X)\n",
+				     name, mec, psn, af_count, eon_offset, eon->pi);
+			} else if (!eon) {
+				LOGP(DRADIO, LOGL_NOTICE, "UECP: Set %s (0x%02X) PSN=%d: no EON entry at index %d\n",
+				     name, mec, psn, psn - 2);
+			}
+		} else if (!is_eon && len >= 5) {
+			LOGP(DRADIO, LOGL_DEBUG, "UECP: Set %s (0x%02X): EON-AF for main programme (ignored)\n",
+			     name, mec);
+		}
+		break;
+
 	default:
-		LOGP(DRADIO, LOGL_ERROR, "UECP: Unsupported MEC 0x%02X (len=%d)\n", mec, len);
+		LOGP(DRADIO, LOGL_ERROR, "UECP: Unknown %s (0x%02X) (len=%d)\n", uecp_mec_name(mec), mec, len);
 		break;
 	}
-	
-	(void)pos;  /* Suppress unused warning */
 }
 
 /* Process complete UECP frame (after unstuffing, CRC validated) */
@@ -1450,12 +2659,12 @@ static void uecp_process_frame(rds_server_t *srv, const uint8_t *frame, int len)
 		return;
 	}
 	
-	/* Check addressing (0 = global, matches all) */
-	if (site_addr != 0 && site_addr != srv->site_addr) {
+	/* Check addressing (UECP_ADDR_GLOBAL = matches all) */
+	if (site_addr != UECP_ADDR_GLOBAL && site_addr != srv->site_addr) {
 		LOGP(DRADIO, LOGL_DEBUG, "UECP: Site address mismatch\n");
 		return;  /* Not for us, ignore silently */
 	}
-	if (enc_addr != 0 && enc_addr != srv->enc_addr) {
+	if (enc_addr != UECP_ADDR_GLOBAL && enc_addr != srv->enc_addr) {
 		LOGP(DRADIO, LOGL_DEBUG, "UECP: Encoder address mismatch\n");
 		return;  /* Not for us, ignore silently */
 	}
@@ -1480,14 +2689,90 @@ static void uecp_process_frame(rds_server_t *srv, const uint8_t *frame, int len)
 			break;
 		case UECP_MEC_RT:
 			/* Variable length: DSN + PSN + MEL + config + text */
-			if (pos + 3 > msg_len) goto frame_err;
-			mel = 3 + msg[pos + 2];  /* DSN + PSN + MEL + data */
+			if (pos + 4 > msg_len) goto frame_err;
+			mel = 3 + msg[pos + 3];  /* DSN + PSN + MEL + data[MEL] */
 			break;
 		case UECP_MEC_PTYN:
 			mel = 10; /* DSN + PSN + PTYN(8) */
 			break;
 		case UECP_MEC_ECC:
 			mel = 3;  /* DSN + variant + data */
+			break;
+		case UECP_MEC_DI_PTYI:
+			mel = 3;  /* DSN + PSN + flags */
+			break;
+		case UECP_MEC_MS:
+			mel = 3;  /* DSN + PSN + M/S flag */
+			break;
+		case UECP_MEC_RTC:
+			mel = 8;  /* year + month + date + hours + minutes + seconds + centisec + local_offset */
+			break;
+		case UECP_MEC_RTC_CORR:
+			mel = 2;  /* RTCC high + RTCC low (16-bit signed ms) */
+			break;
+		case UECP_MEC_AF:
+			/* Variable length: DSN + PSN + MEL + data */
+			if (pos + 3 > msg_len) goto frame_err;
+			mel = 3 + msg[pos + 3]; /* DSN + PSN + MEL + data */
+			break;
+		case UECP_MEC_EON_AF:
+			/* Variable length: DSN + PSN + MEL + data */
+			if (pos + 3 > msg_len) goto frame_err;
+			mel = 3 + msg[pos + 3]; /* DSN + PSN + MEL + data */
+			break;
+		case UECP_MEC_PSN_ENABLE:
+			/* Variable length: DSN + MEL + pairs */
+			if (pos + 2 > msg_len) goto frame_err;
+			mel = 2 + msg[pos + 2]; /* DSN + MEL + data */
+			break;
+		case UECP_MEC_MAKE_PSN_LIST:
+			/* Variable length: DSN + MEL + PSN list */
+			if (pos + 2 > msg_len) goto frame_err;
+			mel = 2 + msg[pos + 2]; /* DSN + MEL + data */
+			break;
+		case UECP_MEC_GROUP_SEQ:
+			/* Variable length: DSN + MEL + group types */
+			if (pos + 2 > msg_len) goto frame_err;
+			mel = 2 + msg[pos + 2]; /* DSN + MEL + data */
+			break;
+		case UECP_MEC_GROUP_VARIANT:
+			/* Variable length: DSN + MEL + group type + variants */
+			if (pos + 2 > msg_len) goto frame_err;
+			mel = 2 + msg[pos + 2]; /* DSN + MEL + data */
+			break;
+		case UECP_MEC_EON_ENABLE:
+			mel = 3;  /* DSN + PSN + flags */
+			break;
+		case UECP_MEC_REQUEST:
+			/* Variable length: MEL + requested_MEC + [DSN + PSN + ...] */
+			if (pos + 1 > msg_len) goto frame_err;
+			mel = 1 + msg[pos + 1]; /* MEL byte + MEL bytes of data */
+			break;
+		case UECP_MEC_CT_ONOFF:
+			mel = 1;  /* on/off (no DSN per IEC 62106-10 A.4.3) */
+			break;
+		case UECP_MEC_RDS_ONOFF:
+			mel = 1;  /* on/off */
+			break;
+		case UECP_MEC_RDS_PHASE:
+			mel = 2;  /* ref_table_entry + phase(2 bytes packed) */
+			break;
+		case UECP_MEC_RDS_LEVEL:
+			mel = 2;  /* ref_table_entry + level(2 bytes packed) */
+			break;
+		case UECP_MEC_SITE_ADDR:
+			mel = 3;  /* control + addr_hi + addr_lo */
+			break;
+		case UECP_MEC_ENC_ADDR:
+			mel = 2;  /* control + addr */
+			break;
+		case UECP_MEC_ACCESS_RIGHT:
+			mel = 3;  /* target_mec + port + enable */
+			break;
+		case UECP_MEC_MANUFACTURER:
+			/* Variable length: MEL + mfr_id(2) + data */
+			if (pos + 1 > msg_len) goto frame_err;
+			mel = 1 + msg[pos + 1]; /* MEL byte + MEL bytes of data */
 			break;
 		case UECP_MEC_ACK:
 			mel = 2;  /* code + [seq] */
@@ -1496,12 +2781,13 @@ static void uecp_process_frame(rds_server_t *srv, const uint8_t *frame, int len)
 			break;
 		default:
 			/* Unknown MEC mid-frame - log and skip rest of frame */
-			LOGP(DRADIO, LOGL_ERROR, "UECP: Unsupported MEC 0x%02X in frame, skipping remainder\n", mec);
+			LOGP(DRADIO, LOGL_ERROR, "UECP: Unsupported %s (0x%02X) in frame, skipping remainder\n",
+			     uecp_mec_name(mec), mec);
 			goto frame_done;
 		}
 		
 		if (pos + 1 + mel > msg_len) {
-			LOGP(DRADIO, LOGL_DEBUG, "UECP: MEC 0x%02X truncated\n", mec);
+			LOGP(DRADIO, LOGL_DEBUG, "UECP: %s (0x%02X) truncated\n", uecp_mec_name(mec), mec);
 			goto frame_err;
 		}
 		
