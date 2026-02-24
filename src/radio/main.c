@@ -1577,6 +1577,21 @@ next_char:
 			if (tx && rds)
 				rds_next_preset(&radio);
 			goto next_char;
+		case '1':
+			/* flip RT A/B flag */
+			if (tx && rds)
+				rds_flip_rt_ab(&radio);
+			goto next_char;
+		case '2':
+			/* flip RT+ item_running */
+			if (tx && rds)
+				rds_flip_rtplus_item_running(&radio);
+			goto next_char;
+		case '3':
+			/* flip RT+ item_toggle */
+			if (tx && rds)
+				rds_flip_rtplus_toggle(&radio);
+			goto next_char;
 		}
 	}
 

@@ -671,6 +671,11 @@ void rds_server_cleanup(rds_server_t *srv)
 		close(srv->listen_fd);
 		srv->listen_fd = RDS_FD_NONE;
 	}
+	if (srv->uecp_decoder) {
+		rds_decoder_exit(srv->uecp_decoder);
+		free(srv->uecp_decoder);
+		srv->uecp_decoder = NULL;
+	}
 }
 
 int rds_server_connected(const rds_server_t *srv)
@@ -2148,10 +2153,27 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 			int text_len = mel - 1;
 			if (text_len > 0 && text_len <= 64 && len >= 4 + text_len) {
 				char rt[65];
+				uint8_t config = data[3];
+				/* IEC 62106-10 A.2.8: config byte bit 0 = A/B flag control
+				 *   0 = do not toggle A/B flag
+				 *   1 = toggle A/B flag
+				 * rds_enc_set_radiotext() always toggles A/B.
+				 * If bit 0 = 0, we need to preserve the current A/B flag. */
+				uint8_t ab_toggle = config & 0x01;
+				uint8_t saved_ab = enc->rt_ab;
 				memcpy(rt, data + 4, text_len);
 				rt[text_len] = '\0';
 				rds_enc_set_radiotext(enc, rt);
-				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\"\n", name, mec, rt);
+				if (!ab_toggle) {
+					/* Restore A/B flag — UECP source doesn't want toggle */
+					enc->rt_ab = saved_ab;
+					enc->rt_segment = 0;
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\" (A/B not toggled, flag=%c)\n",
+					     name, mec, rt, saved_ab ? 'B' : 'A');
+				} else {
+					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\" (A/B toggled %c->%c)\n",
+					     name, mec, rt, saved_ab ? 'B' : 'A', enc->rt_ab ? 'B' : 'A');
+				}
 			}
 		}
 		break;
@@ -2382,6 +2404,47 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 			} else if (ctrl == UECP_ADDR_CTRL_CLEAR) {
 				srv->enc_addr = UECP_ADDR_GLOBAL;
 				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): clear all\n", name, mec);
+			}
+		}
+		break;
+
+	case UECP_MEC_FREE_FORMAT:
+		if (len >= 6) {
+			/* IEC 62106-10 A.2.13: group_type(1) + config/b2_low(1) + block3(2) + block4(2)
+			 * group_type: bits 4-1 = group number, bit 0 = version (A/B)
+			 * config: bits 6-5 = buffer mode (00=once, 10=cyclic, 11=clear), bits 4-0 = block2 low 5 bits */
+			uint8_t gt = data[0];
+			uint8_t cfg = data[1];
+			int group_num = (gt >> 1) & 0x0F;
+			int group_ver = gt & 0x01;
+			int buf_mode = (cfg >> 5) & 0x03;
+			uint8_t b2_low = cfg & 0x1F;
+			uint16_t b3 = ((uint16_t)data[2] << 8) | data[3];
+			uint16_t b4 = ((uint16_t)data[4] << 8) | data[5];
+
+			/* Reconstruct full group and feed to decoder for human-readable logging.
+			 * Block A = PI, Block B = group_type(4) | B0(1) | TP(1) | PTY(5) | b2_low(5) */
+			uint16_t pi = rds_enc_get_pi(enc);
+			uint8_t tp = rds_enc_get_tp(enc);
+			uint8_t pty = rds_enc_get_pty(enc);
+			uint16_t b2 = ((uint16_t)group_num << 12) | ((uint16_t)group_ver << 11) |
+				      ((uint16_t)tp << 10) | ((uint16_t)pty << 5) | b2_low;
+
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): group=%d%c %s\n",
+			     name, mec, group_num, group_ver ? 'B' : 'A',
+			     buf_mode == 0 ? "once" : buf_mode == 2 ? "cyclic" : buf_mode == 3 ? "clear" : "rsvd");
+
+			/* Lazy-allocate UECP group decoder */
+			if (!srv->uecp_decoder) {
+				srv->uecp_decoder = calloc(1, sizeof(rds_decoder_t));
+				if (srv->uecp_decoder)
+					rds_decoder_init(srv->uecp_decoder, 250000.0, 0, 1, 50.0, 0);
+			}
+			if (srv->uecp_decoder) {
+				uint16_t blocks[4] = { pi, b2, b3, b4 };
+				uint8_t status[4] = { RDS_STATUS_VALID, RDS_STATUS_VALID,
+						      RDS_STATUS_VALID, RDS_STATUS_VALID };
+				rds_decoder_feed_group(srv->uecp_decoder, blocks, status);
 			}
 		}
 		break;
@@ -2739,6 +2802,9 @@ static void uecp_process_frame(rds_server_t *srv, const uint8_t *frame, int len)
 			/* Variable length: DSN + MEL + group type + variants */
 			if (pos + 2 > msg_len) goto frame_err;
 			mel = 2 + msg[pos + 2]; /* DSN + MEL + data */
+			break;
+		case UECP_MEC_FREE_FORMAT:
+			mel = 6;  /* group_type + config/b2_low + block3(2) + block4(2) */
 			break;
 		case UECP_MEC_EON_ENABLE:
 			mel = 3;  /* DSN + PSN + flags */

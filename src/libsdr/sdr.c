@@ -1212,8 +1212,13 @@ static void *sdr_write_child(void *arg)
 #endif
 		}
 
-		/* delay some time */
-		usleep(sdr->interval * 1000.0);
+		/* Only sleep when buffer is empty.
+		 * When data is available, loop immediately to minimize
+		 * latency between ring buffer fill and UHD transmission.
+		 * This prevents underruns caused by sleeping while data
+		 * is waiting in the ring buffer. */
+		if (num == 0)
+			usleep(sdr->interval * 1000.0);
 	}
 
 	LOGP(DSDR, LOGL_DEBUG, "Thread received exit!\n");

@@ -1750,6 +1750,12 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 /* Set RadioText (can be changed dynamically) - converts UTF-8 to RDS charset */
 void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt);
 
+/* Set RadioText without clearing RT+ tags or rebuilding scheduler.
+ * For use by atomic RT+ functions and preset init where tags are set
+ * immediately after RT. Caller must call rds_scheduler_update() when done.
+ * Returns encoded length, or -1 on error. */
+int rds_enc_set_radiotext_raw(rds_encoder_t *rds, const char *rt);
+
 /* Set Traffic Announcement flag (1=enabled, 0=disabled) */
 void rds_enc_set_ta(rds_encoder_t *rds, int ta);
 int rds_enc_get_ta(const rds_encoder_t *rds);
@@ -1788,6 +1794,36 @@ int rds_enc_rtplus_set_tags(rds_encoder_t *rds,
 void rds_enc_rtplus_clear_tags(rds_encoder_t *rds);
 void rds_enc_rtplus_set_toggle(rds_encoder_t *rds, int toggle);
 void rds_enc_rtplus_set_item_running(rds_encoder_t *rds, int running);
+
+/* Debug flip functions (keyboard shortcuts for testing) */
+void rds_enc_flip_rt_ab(rds_encoder_t *rds);
+void rds_enc_flip_rtplus_item_running(rds_encoder_t *rds);
+void rds_enc_flip_rtplus_toggle(rds_encoder_t *rds);
+
+/* Atomic RT + RT+ item update (IEC 62106-6 §A.6 compliant).
+ *
+ * Sets new RadioText, toggles A/B flag, sets RT+ tags, flips item_toggle,
+ * sets item_running=1, and rebuilds the scheduler — all in one call.
+ * This avoids the race where set_radiotext() clears tags and the scheduler
+ * drops the RT+ ODA group before set_tags() can restore them.
+ *
+ * For non-item content (news, jingle), use rds_enc_rtplus_set_no_item()
+ * which sets item_running=0 without flipping item_toggle.
+ *
+ * Returns 0 on success, -1 on validation error.
+ */
+int rds_enc_rtplus_new_item(rds_encoder_t *rds, const char *rt,
+                            uint8_t ct1, uint8_t start1, uint8_t len1,
+                            uint8_t ct2, uint8_t start2, uint8_t len2);
+
+/* Set RadioText for non-item content (news, jingle, ad).
+ * Sets new RT, toggles A/B, sets item_running=0 (item_toggle unchanged),
+ * and optionally sets non-item tags (e.g. INFO.NEWS).
+ * Pass ct1=0,start1=0,len1=0 for no tags. */
+int rds_enc_rtplus_set_no_item(rds_encoder_t *rds, const char *rt,
+                               uint8_t ct1, uint8_t start1, uint8_t len1,
+                               uint8_t ct2, uint8_t start2, uint8_t len2);
+
 /* RT+ Getters (encoder state) */
 int rds_enc_rtplus_get_tag_count(const rds_encoder_t *rds);
 int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,

@@ -602,6 +602,9 @@ typedef struct rds_server {
 	/* Encoder reference (UECP) */
 	struct rds_encoder *encoder;
 	
+	/* UECP group decoder (for human-readable logging of Free Format groups) */
+	struct rds_decoder *uecp_decoder;
+	
 	/* Callbacks (XDR-GTK) */
 	void		(*tune_cb)(int freq_khz, void *arg);
 	void		(*setting_cb)(const char *name, int val, void *arg);

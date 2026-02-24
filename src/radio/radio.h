@@ -174,6 +174,11 @@ int radio_rx(radio_t *radio, float *baseband, int num);
 /* RDS preset switching (press 'f' to cycle) */
 void rds_next_preset(radio_t *radio);
 
+/* RDS debug flag flips (keyboard shortcuts for testing) */
+void rds_flip_rt_ab(radio_t *radio);            /* key '1': flip RT A/B */
+void rds_flip_rtplus_item_running(radio_t *radio); /* key '2': flip item_running */
+void rds_flip_rtplus_toggle(radio_t *radio);     /* key '3': flip item_toggle */
+
 /* Force mono mode (B1 command from XDR-GTK) */
 void radio_set_forced_mono(radio_t *radio, int forced);
 void radio_set_rx_snr(radio_t *radio, double snr_db);
