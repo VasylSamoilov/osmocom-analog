@@ -1038,12 +1038,12 @@ static void *sdr_write_child(void *arg)
 	int s, ss, o;
 
 	/* Diagnostics for split mode */
-	static int diag_count = 0;
-	static int empty_count = 0;
-	static int total_samples = 0;
-	static double last_diag_time = 0.0;
-	static int max_fill = 0;
-	static int min_fill = INT_MAX;
+	int diag_count = 0;
+	int empty_count = 0;
+	int total_samples = 0;
+	double last_diag_time = 0.0;
+	int max_fill_diag = 0;
+	int min_fill_diag = INT_MAX;
 	int split_mode = sdr_config && sdr_config->split_mode;
 
 	/* Use tx_oversample for TX operations in split mode (only for integer resampling) */
@@ -1051,15 +1051,39 @@ static void *sdr_write_child(void *arg)
 	
 	/* Check if using polyphase resampler for TX */
 	int use_tx_polyphase = sdr->tx_use_polyphase;
-	static int tx_polyphase_logged = 0;
+	int tx_polyphase_logged = 0;
 
 	/* Check if TX channelizer is enabled (only check channel 0 for now) */
 	int use_tx_chan = 0;
 	if (sdr->chan && sdr->chan[0].use_tx_channelizer)
 		use_tx_chan = 1;
 
+	/* Determine TX chunk size.
+	 * For UHD: use the hardware MTU so send() blocks naturally as pacemaker.
+	 * For other drivers: use a reasonable chunk (~1ms worth of samples).
+	 * The chunk size is in INPUT samples (before oversampling). */
+	int tx_chunk = 0;
+#ifdef HAVE_UHD
+	if (tx_driver == 1) {
+		int mtu = uhd_get_tx_mtu();
+		if (mtu > 0) {
+			/* MTU is in output samples; convert to input samples */
+			tx_chunk = mtu / tx_os;
+			if (tx_chunk < 1) tx_chunk = 1;
+			LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: UHD MTU=%d output samples, tx_chunk=%d input samples (tx_os=%d)\n",
+			     mtu, tx_chunk, tx_os);
+		}
+	}
+#endif
+	if (tx_chunk == 0) {
+		/* Fallback: ~1ms worth of input samples */
+		tx_chunk = sdr->samplerate / 1000;
+		if (tx_chunk < 100) tx_chunk = 100;
+		LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: using fallback tx_chunk=%d input samples\n", tx_chunk);
+	}
+
 	while (sdr->thread_write.running) {
-		/* write to SDR */
+		/* Check how much data is available in ring buffer */
 		fill = (sdr->thread_write.in - sdr->thread_write.out + sdr->thread_write.buffer_size) % sdr->thread_write.buffer_size;
 		num = fill / 2;
 		
@@ -1069,156 +1093,164 @@ static void *sdr_write_child(void *arg)
 			if (num == 0) {
 				empty_count++;
 			} else {
-				total_samples += num;
-				if (fill > max_fill) max_fill = fill;
-				if (fill < min_fill) min_fill = fill;
+				if (fill > max_fill_diag) max_fill_diag = fill;
+				if (fill < min_fill_diag) min_fill_diag = fill;
 			}
 			
 			/* Log diagnostics every second */
 			double now = get_time();
 			if (last_diag_time == 0.0) last_diag_time = now;
 			if (now - last_diag_time >= 1.0) {
-				LOGP(DSDR, LOGL_DEBUG, "WRITE_THREAD: iterations=%d empty=%d (%.1f%%) samples=%d avg_fill=%d min=%d max=%d buf_size=%d\n",
+				LOGP(DSDR, LOGL_DEBUG, "WRITE_THREAD: iterations=%d empty=%d (%.1f%%) samples=%d avg_fill=%d min=%d max=%d buf_size=%d chunk=%d\n",
 				     diag_count, empty_count, 
 				     diag_count > 0 ? (100.0 * empty_count / diag_count) : 0.0,
 				     total_samples,
 				     diag_count - empty_count > 0 ? total_samples / (diag_count - empty_count) : 0,
-				     min_fill == INT_MAX ? 0 : min_fill,
-				     max_fill,
-				     sdr->thread_write.buffer_size);
+				     min_fill_diag == INT_MAX ? 0 : min_fill_diag,
+				     max_fill_diag,
+				     sdr->thread_write.buffer_size,
+				     tx_chunk);
 				diag_count = 0;
 				empty_count = 0;
 				total_samples = 0;
-				max_fill = 0;
-				min_fill = INT_MAX;
+				max_fill_diag = 0;
+				min_fill_diag = INT_MAX;
 				last_diag_time = now;
 			}
 		}
-		
-		if (num) {
+
+		/* Send fixed-size chunks to keep the SDR FIFO continuously fed.
+		 * Cap to tx_chunk so send() blocks as the pacemaker, spreading
+		 * data evenly over time instead of sending bursts. */
+		if (num >= tx_chunk)
+			num = tx_chunk;
+		else if (num == 0) {
+			/* Ring buffer empty — short spin-wait to react quickly
+			 * when the main loop produces more data. */
+			usleep(50);
+			continue;
+		}
+		/* else: num < tx_chunk but > 0 — send what we have to avoid starvation */
+
+		if (split_mode)
+			total_samples += num;
+
 #ifdef DEBUG_BUFFER
-			printf("Thread found %d samples in write buffer and forwards them to SDR.\n", num);
+		printf("Thread found %d samples in write buffer and forwards them to SDR.\n", num);
 #endif
-			out = sdr->thread_write.out;
-			int out_samples;  /* Number of samples to send to SDR */
+		out = sdr->thread_write.out;
+		int out_samples;  /* Number of samples to send to SDR */
 
-			if (use_tx_chan && sdr->tx_chan_I && sdr->tx_chan_Q) {
-				/* TX Channelizer path: proper polyphase interpolation */
-				
-				/* De-interleave I/Q from buffer and apply scaling */
-				for (s = 0; s < num; s++) {
-					sdr->tx_chan_I[s] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
-					sdr->tx_chan_Q[s] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
-					out = (out + 2) % sdr->thread_write.buffer_size;
-				}
-				sdr->thread_write.out = out;
-				
-				/* Clear output buffer before channelizer (it ADDS to output) */
-				memset(sdr->thread_write.buffer2, 0, sizeof(float) * num * tx_os * 2);
-				
-				/* Process through TX channelizer (interpolate + filter) */
-				channelizer_tx_process(&sdr->chan[0].tx_channelizer,
-				                       sdr->tx_chan_I, sdr->tx_chan_Q, num,
-				                       sdr->thread_write.buffer2);
-				out_samples = num * tx_os;
-			} else if (use_tx_polyphase && sdr->tx_poly_i && sdr->tx_poly_q) {
-				/* Polyphase resampler path: arbitrary ratio upsampling */
-				static int tx_poly_debug_count = 0;
-				if (!tx_polyphase_logged) {
-					LOGP(DSDR, LOGL_NOTICE, "TX POLYPHASE UPSAMPLE: DSP %d Hz -> SDR %d Hz (ratio=%.6f)\n",
-					     sdr->samplerate, sdr_config->tx_samplerate,
-					     (double)sdr_config->tx_samplerate / (double)sdr->samplerate);
-					tx_polyphase_logged = 1;
-				}
-				
-				/* De-interleave I/Q from buffer into pre-allocated polyphase input buffers */
-				sample_t *in_i = sdr->tx_poly_i;
-				sample_t *in_q = sdr->tx_poly_q;
-				double in_max = 0;
-				for (s = 0; s < num; s++) {
-					in_i[s] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
-					in_q[s] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
-					if (fabs(in_i[s]) > in_max) in_max = fabs(in_i[s]);
-					if (fabs(in_q[s]) > in_max) in_max = fabs(in_q[s]);
-					out = (out + 2) % sdr->thread_write.buffer_size;
-				}
-				sdr->thread_write.out = out;
-				
-				/* Resample I and Q through polyphase filter
-				 * Output goes directly into buffer2 (de-interleaved first, then interleaved) */
-				int max_out = polyphase_output_num(&sdr->tx_polyphase, num) + 4;
-				
-				/* Use second half of tx_poly buffers for output (they're sized for max_out) */
-				sample_t *out_i = in_i + sdr->buffer_size;  /* Offset past input area */
-				sample_t *out_q = in_q + sdr->buffer_size;
-				
-				out_samples = polyphase_resample_iq(&sdr->tx_polyphase,
-				                                    in_i, in_q, num,
-				                                    out_i, out_q, max_out);
-				
-				/* Debug: check output */
-				double out_max = 0;
-				for (s = 0; s < out_samples; s++) {
-					if (fabs(out_i[s]) > out_max) out_max = fabs(out_i[s]);
-					if (fabs(out_q[s]) > out_max) out_max = fabs(out_q[s]);
-				}
-				tx_poly_debug_count++;
-				if (tx_poly_debug_count % 50 == 1) {
-					LOGP(DSDR, LOGL_NOTICE, "TX POLY: in=%d out=%d max_out=%d | in_max=%.4f out_max=%.4f\n",
-					     num, out_samples, max_out, in_max, out_max);
-				}
-				
-				/* Interleave I/Q into output buffer */
-				for (s = 0; s < out_samples; s++) {
-					sdr->thread_write.buffer2[s * 2] = out_i[s];
-					sdr->thread_write.buffer2[s * 2 + 1] = out_q[s];
-				}
-			} else {
-				/* Legacy path: zero-order hold interpolation + IIR filter */
-				static int tx_upsample_logged = 0;
-				if (!tx_upsample_logged) {
-					LOGP(DSDR, LOGL_NOTICE, "TX INTEGER UPSAMPLE: in=%d tx_os=%d out=%d\n", num, tx_os, num * tx_os);
-					tx_upsample_logged = 1;
-				}
-				for (s = 0, ss = 0; s < num; s++) {
-					for (o = 0; o < tx_os; o++) {
-						sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
-						sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
-					}
-					out = (out + 2) % sdr->thread_write.buffer_size;
-				}
-				sdr->thread_write.out = out;
-#ifndef DISABLE_FILTER
-				/* filter spectrum */
-				if (tx_os > 1) {
-					iir_process_baseband(&sdr->thread_write.lp[0], sdr->thread_write.buffer2, num * tx_os);
-					iir_process_baseband(&sdr->thread_write.lp[1], sdr->thread_write.buffer2 + 1, num * tx_os);
-				}
-#endif
-				out_samples = num * tx_os;
+		if (use_tx_chan && sdr->tx_chan_I && sdr->tx_chan_Q) {
+			/* TX Channelizer path: proper polyphase interpolation */
+			
+			/* De-interleave I/Q from buffer and apply scaling */
+			for (s = 0; s < num; s++) {
+				sdr->tx_chan_I[s] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
+				sdr->tx_chan_Q[s] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
+				out = (out + 2) % sdr->thread_write.buffer_size;
 			}
-
-#ifdef HAVE_UHD
-			if (tx_driver == 1)
-				uhd_send(sdr->thread_write.buffer2, out_samples);
+			sdr->thread_write.out = out;
+			
+			/* Clear output buffer before channelizer (it ADDS to output) */
+			memset(sdr->thread_write.buffer2, 0, sizeof(float) * num * tx_os * 2);
+			
+			/* Process through TX channelizer (interpolate + filter) */
+			channelizer_tx_process(&sdr->chan[0].tx_channelizer,
+			                       sdr->tx_chan_I, sdr->tx_chan_Q, num,
+			                       sdr->thread_write.buffer2);
+			out_samples = num * tx_os;
+		} else if (use_tx_polyphase && sdr->tx_poly_i && sdr->tx_poly_q) {
+			/* Polyphase resampler path: arbitrary ratio upsampling */
+			static int tx_poly_debug_count = 0;
+			if (!tx_polyphase_logged) {
+				LOGP(DSDR, LOGL_NOTICE, "TX POLYPHASE UPSAMPLE: DSP %d Hz -> SDR %d Hz (ratio=%.6f)\n",
+				     sdr->samplerate, sdr_config->tx_samplerate,
+				     (double)sdr_config->tx_samplerate / (double)sdr->samplerate);
+				tx_polyphase_logged = 1;
+			}
+			
+			/* De-interleave I/Q from buffer into pre-allocated polyphase input buffers */
+			sample_t *in_i = sdr->tx_poly_i;
+			sample_t *in_q = sdr->tx_poly_q;
+			double in_max = 0;
+			for (s = 0; s < num; s++) {
+				in_i[s] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
+				in_q[s] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
+				if (fabs(in_i[s]) > in_max) in_max = fabs(in_i[s]);
+				if (fabs(in_q[s]) > in_max) in_max = fabs(in_q[s]);
+				out = (out + 2) % sdr->thread_write.buffer_size;
+			}
+			sdr->thread_write.out = out;
+			
+			/* Resample I and Q through polyphase filter
+			 * Output goes directly into buffer2 (de-interleaved first, then interleaved) */
+			int max_out = polyphase_output_num(&sdr->tx_polyphase, num) + 4;
+			
+			/* Use second half of tx_poly buffers for output (they're sized for max_out) */
+			sample_t *out_i = in_i + sdr->buffer_size;  /* Offset past input area */
+			sample_t *out_q = in_q + sdr->buffer_size;
+			
+			out_samples = polyphase_resample_iq(&sdr->tx_polyphase,
+			                                    in_i, in_q, num,
+			                                    out_i, out_q, max_out);
+			
+			/* Debug: check output */
+			double out_max = 0;
+			for (s = 0; s < out_samples; s++) {
+				if (fabs(out_i[s]) > out_max) out_max = fabs(out_i[s]);
+				if (fabs(out_q[s]) > out_max) out_max = fabs(out_q[s]);
+			}
+			tx_poly_debug_count++;
+			if (tx_poly_debug_count % 50 == 1) {
+				LOGP(DSDR, LOGL_NOTICE, "TX POLY: in=%d out=%d max_out=%d | in_max=%.4f out_max=%.4f\n",
+				     num, out_samples, max_out, in_max, out_max);
+			}
+			
+			/* Interleave I/Q into output buffer */
+			for (s = 0; s < out_samples; s++) {
+				sdr->thread_write.buffer2[s * 2] = out_i[s];
+				sdr->thread_write.buffer2[s * 2 + 1] = out_q[s];
+			}
+		} else {
+			/* Legacy path: zero-order hold interpolation + IIR filter */
+			static int tx_upsample_logged = 0;
+			if (!tx_upsample_logged) {
+				LOGP(DSDR, LOGL_NOTICE, "TX INTEGER UPSAMPLE: in=%d tx_os=%d out=%d\n", num, tx_os, num * tx_os);
+				tx_upsample_logged = 1;
+			}
+			for (s = 0, ss = 0; s < num; s++) {
+				for (o = 0; o < tx_os; o++) {
+					sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
+					sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
+				}
+				out = (out + 2) % sdr->thread_write.buffer_size;
+			}
+			sdr->thread_write.out = out;
+#ifndef DISABLE_FILTER
+			/* filter spectrum */
+			if (tx_os > 1) {
+				iir_process_baseband(&sdr->thread_write.lp[0], sdr->thread_write.buffer2, num * tx_os);
+				iir_process_baseband(&sdr->thread_write.lp[1], sdr->thread_write.buffer2 + 1, num * tx_os);
+			}
 #endif
-#ifdef HAVE_SOAPY
-			if (tx_driver == 2)
-				soapy_send(sdr->thread_write.buffer2, out_samples);
-#endif
-#ifdef HAVE_RPITX
-			if (tx_driver == 3)
-				rpitx_send(sdr->thread_write.buffer2, out_samples);
-#endif
+			out_samples = num * tx_os;
 		}
 
-		/* Only sleep when buffer is empty.
-		 * When data is available, loop immediately to minimize
-		 * latency between ring buffer fill and UHD transmission.
-		 * This prevents underruns caused by sleeping while data
-		 * is waiting in the ring buffer. */
-		if (num == 0)
-			usleep(sdr->interval * 1000.0);
+		/* send() blocks until the hardware is ready, acting as the
+		 * pacemaker that keeps data flowing at the exact SDR rate. */
+#ifdef HAVE_UHD
+		if (tx_driver == 1)
+			uhd_send(sdr->thread_write.buffer2, out_samples);
+#endif
+#ifdef HAVE_SOAPY
+		if (tx_driver == 2)
+			soapy_send(sdr->thread_write.buffer2, out_samples);
+#endif
+#ifdef HAVE_RPITX
+		if (tx_driver == 3)
+			rpitx_send(sdr->thread_write.buffer2, out_samples);
+#endif
 	}
 
 	LOGP(DSDR, LOGL_DEBUG, "Thread received exit!\n");

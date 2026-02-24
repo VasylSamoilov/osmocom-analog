@@ -9,6 +9,7 @@ void uhd_close(void);
 int uhd_send(float *buff, int num);
 int uhd_receive(float *buff, int max);
 int uhd_get_tosend(int buffer_size);
+int uhd_get_tx_mtu(void);
 
 int uhd_set_rx_frequency(double frequency);
 int uhd_set_tx_frequency(double frequency);

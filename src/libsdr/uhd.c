@@ -821,6 +821,22 @@ int uhd_send(float *buff, int num)
 	return sent;
 }
 
+/* Return the TX streamer MTU (max samples per send call) */
+int uhd_get_tx_mtu(void)
+{
+	size_t mtu;
+	uhd_error error;
+
+	if (!uhd_tx_inst || !uhd_tx_inst->tx_streamer)
+		return 0;
+
+	error = uhd_tx_streamer_max_num_samps(uhd_tx_inst->tx_streamer, &mtu);
+	if (error)
+		return 0;
+
+	return (int)mtu;
+}
+
 /* read what we got, return 0, if buffer is empty, otherwise return the number of samples */
 int uhd_receive(float *buff, int max)
 {
