@@ -1336,16 +1336,18 @@ static void rds_build_group_2a(rds_encoder_t *rds, uint8_t *group)
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	/* Advance segment, wrapping at end of message (CR terminator or max 16 segments)
-	 * EN 50067: "A new text must start with segment address 0000 and there must
-	 * be no gaps up to the highest used segment address of the current message." */
+	/* Advance segment, wrapping after all 16 segments.
+	 * EN 50067: "A new text shall start with segment address 0000 and the
+	 * segment numbers shall be transmitted sequentially."
+	 * We always transmit all 16 segments (64 chars) even for short messages.
+	 * The buffer is pre-filled with 0x0D (CR) terminators, so segments
+	 * beyond the text content are valid per the standard. This ensures
+	 * maximum receiver compatibility — some receivers (especially those
+	 * implementing RT+) wait for all segments before processing. */
 	int next_seg = seg + 1;
-	
-	/* Check if current segment contained CR or we've reached max segments */
-	if (next_seg >= 16 ||
-	    rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r' ||
-	    rds->rt[pos+2] == '\r' || rds->rt[pos+3] == '\r') {
-		rds->rt_segment = 0;  /* Wrap to beginning */
+	if (next_seg >= 16) {
+		rds->rt_segment = 0;
+		rds->rt_complete_count++;
 	} else {
 		rds->rt_segment = next_seg;
 	}
@@ -1413,15 +1415,13 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	/* Advance segment, wrapping at end of message (CR terminator or max 16 segments)
-	 * EN 50067: Group 2B uses 2 chars/segment, max 32 chars total.
-	 * "Each message should be ended by the code 0D (Hex) - carriage return" */
+	/* Advance segment, wrapping after all 16 segments (32 chars).
+	 * Always transmit all segments for receiver compatibility.
+	 * Buffer is pre-filled with 0x0D terminators. */
 	int next_seg = seg + 1;
-	
-	/* Check if current segment contained CR or we've reached max 16 segments (32 chars) */
-	if (next_seg >= 16 ||
-	    rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r') {
-		rds->rt_segment = 0;  /* Wrap to beginning */
+	if (next_seg >= 16) {
+		rds->rt_segment = 0;
+		rds->rt_complete_count++;
 	} else {
 		rds->rt_segment = next_seg;
 	}
@@ -2555,12 +2555,11 @@ void rds_scheduler_update(rds_encoder_t *rds)
 		ADD_GRP(RDS_GROUP_3A);
 	}
 	
-	/* RT+ pair: 3A (announcing RT+ specifically) then RT+ carrier group.
-	 * This ensures the receiver sees the ODA registration immediately
-	 * before the tagged data, every cycle. The 3A builder cycles through
-	 * all ODAs, so RT+ gets announced roughly every oda_count cycles.
-	 * With the dedicated pair here, the worst case is still well within
-	 * the 10s requirement at ~11.4 groups/sec. */
+	/* RT+ pair: 3A then RT+ carrier group.
+	 * IEC 62106-6 §A.6: 3A at least every 10s, RT+ app group at
+	 * least 0.5 groups/sec. One pair per cycle at ~11.4 groups/sec
+	 * satisfies both requirements. 3A immediately before carrier
+	 * ensures receiver sees registration before tag data. */
 	if (has_rtplus_oda) {
 		ADD_GRP(RDS_GROUP_3A);
 		ADD_GRP(rtplus_carrier);
@@ -2592,14 +2591,16 @@ void rds_scheduler_update(rds_encoder_t *rds)
 	}
 
 	/* Log the new sequence */
-	/* 
-	char seq_str[256] = {0};
-	for(int i=0; i<rds->group_sequence_len; i++) {
-		const char *n = rds_group_name(rds->group_sequence[i]); // Requires lookup
-		snprintf(seq_str+strlen(seq_str), sizeof(seq_str)-strlen(seq_str), "%s ", n ? n : "??");
+	{
+		char seq_str[512] = {0};
+		int pos = 0;
+		for (int i = 0; i < rds->group_sched_len; i++) {
+			const char *n = rds_group_name(rds->group_sched_buffer[i]);
+			pos += snprintf(seq_str + pos, sizeof(seq_str) - pos, "%s ", n ? n : "??");
+			if (pos >= (int)sizeof(seq_str) - 8) break;
+		}
+		LOGP(DRADIO, LOGL_INFO, "RDS Scheduler: %d groups: %s\n", rds->group_sched_len, seq_str);
 	}
-	LOGP(DRADIO, LOGL_INFO, "RDS Scheduler: Sequence updated (%d items): %s\n", rds->group_sequence_len, seq_str);
-	*/
 }
 
 static void rds_generate_group(rds_encoder_t *rds)
@@ -2778,7 +2779,12 @@ static void rds_generate_group(rds_encoder_t *rds)
 					blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 					
 					if (aid == RDS_ODA_AID_RT_PLUS) {
-						/* RT+ group */
+						/* RT+ group — always transmit tags alongside 3A.
+						 * Real-world encoders (2wcom etc.) send RT+ from
+						 * the start, even with dummy tags. Suppressing 11A
+						 * while 3A announces it causes receivers to ignore
+						 * the ODA registration entirely. The receiver stores
+						 * tags and applies them when RT text arrives. */
 						rds_build_rtplus_group(rds, &rds->rtplus, &b2, &b3, &b4);
 						b2 |= (type << RDS_B2_GROUP_SHIFT);
 						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
@@ -2983,9 +2989,8 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 		memcpy(rds->ps, ps, len);
 	}
 	
-	/* Set RadioText (pad with CR after message end)
-	 * EN 50067: Unused positions filled with 0x0D to mark end of text */
-	memset(rds->rt, '\r', 64);  /* Fill with CR terminators */
+	/* Set RadioText (pad with spaces to fill full 64 chars) */
+	memset(rds->rt, ' ', 64);
 	rds->rt[64] = '\0';
 	if (rt) {
 		int len = strlen(rt);
@@ -3202,16 +3207,18 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
  * starts transmitting with the new A/B flag.
  *
  * Returns encoded length, or -1 on error. */
-int rds_enc_set_radiotext_raw(rds_encoder_t *rds, const char *rt)
+void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
 {
-	if (!rt) return -1;
+	if (!rt) return;
 	
 	/* Validate input text and warn about unencodable characters */
 	rds_validate_text(rt, "RadioText");
 	
-	/* Clear buffer with CR terminators (unused positions = 0x0D)
-	 * EN 50067: Positions after message end should be 0x0D */
-	memset(rds->rt, '\r', 64);
+	/* Clear buffer with spaces (0x20) to fill full 64 chars.
+	 * This ensures all 16 segments contain displayable content,
+	 * maximizing receiver compatibility — especially for RT+
+	 * where some receivers wait for all segments before processing. */
+	memset(rds->rt, ' ', 64);
 	
 	/* Convert UTF-8 to RDS encoding */
 	int warn = 0;
@@ -3226,6 +3233,7 @@ int rds_enc_set_radiotext_raw(rds_encoder_t *rds, const char *rt)
 	uint8_t old_ab = rds->rt_ab;
 	rds->rt_ab = !rds->rt_ab;
 	rds->rt_segment = 0;
+	rds->rt_complete_count = 0;
 	
 	/* Log RT change with new A/B flag */
 	LOGP(DRADIO, LOGL_INFO, "RDS: RadioText set (%d chars), A/B flag toggled %c->%c\n",
@@ -3236,35 +3244,14 @@ int rds_enc_set_radiotext_raw(rds_encoder_t *rds, const char *rt)
 		LOGP(DRADIO, LOGL_DEBUG, "RDS: RT content: \"%s\"\n", rt_display);
 	}
 	
-	return len;
-}
-
-void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
-{
-	if (!rt) return;
-	
-	int len = rds_enc_set_radiotext_raw(rds, rt);
-	if (len < 0) return;
-	
-	/* IEC 62106-6 A.6: RT+ tags reference positions within the current
-	 * RadioText. When RT changes (A/B toggles), old tags are stale.
-	 * Clear them so we don't transmit tags pointing into the old text.
-	 * Per A.6: "The RT+ tag information for the application group shall
-	 * be sent to the RDS encoder immediately after the new RadioText."
-	 * Caller must set new tags after this call. */
-	if (rds->rtplus.tag_count > 0) {
-		LOGP(DRADIO, LOGL_INFO, "RDS RT+: Tags invalidated by RT change\n");
-		rds->rtplus.tag_count = 0;
-	}
-	
 	/* Update scheduler sequence (RT presence may have changed) */
 	rds_scheduler_update(rds);
 }
 
 void rds_enc_clear_radiotext(rds_encoder_t *rds)
 {
-	/* Set RT to 64 CR terminators (empty RT) */
-	memset(rds->rt, '\r', 64);
+	/* Set RT to 64 spaces (empty RT) */
+	memset(rds->rt, ' ', 64);
 	rds->rt[64] = '\0';
 	rds->rt_segment = 0;
 	
@@ -3945,11 +3932,8 @@ void rds_enc_get_dynamic_ps_text(const rds_encoder_t *rds, char *text, size_t le
  *   - item_toggle and item_running are independent signals (A.5.3 note 2)
  *     and are NOT modified here. Use rds_enc_rtplus_set_item_running() and
  *     rds_enc_rtplus_set_toggle() to control them separately.
- *   - Per A.6: "tag information sent out shall not change during the period
- *     of the associated RadioText". Caller is responsible for setting new
- *     tags immediately after setting new RadioText.
- *   - When RT changes (A/B flag toggles), old tags become stale.
- *     rds_enc_set_radiotext() clears tags automatically for this reason.
+ *   - RT and RT+ are independent: setting RT does NOT clear or modify tags.
+ *     The UECP source (or caller) manages RT and RT+ separately.
  */
 int rds_enc_rtplus_set_tags(rds_encoder_t *rds,
                             uint8_t ct1, uint8_t start1, uint8_t len1,
@@ -4021,6 +4005,11 @@ int rds_enc_rtplus_set_tags(rds_encoder_t *rds,
 		rtplus->tag_count = 1;
 	}
 	
+	/* item_toggle and item_running are NOT modified here.
+	 * They are independent signals (IEC 62106-6 A.5.3 note 2).
+	 * Use rds_enc_rtplus_set_toggle() and rds_enc_rtplus_set_item_running()
+	 * to control them separately. */
+	
 	const char *ct1_name = rds_get_rtplus_content_type(ct1);
 	if (has_tag2) {
 		const char *ct2_name = rds_get_rtplus_content_type(ct2);
@@ -4039,10 +4028,9 @@ int rds_enc_rtplus_set_tags(rds_encoder_t *rds,
 
 void rds_enc_rtplus_clear_tags(rds_encoder_t *rds)
 {
-	/* Clear tags only. Do NOT touch toggle/running;
-	 * those are independent signals per IEC 62106-6 A.5.3 note 2.
-	 * Caller controls toggle/running via dedicated setters. */
 	rds->rtplus.tag_count = 0;
+	rds->rtplus.item_running = 0;
+	rds->rtplus.toggle = !rds->rtplus.toggle;
 	LOGP(DRADIO, LOGL_INFO, "RDS RT+: Tags cleared, toggle=%d running=%d\n",
 	     rds->rtplus.toggle, rds->rtplus.item_running);
 }
@@ -4067,6 +4055,7 @@ void rds_enc_flip_rt_ab(rds_encoder_t *rds)
 {
 	rds->rt_ab = !rds->rt_ab;
 	rds->rt_segment = 0;
+	rds->rt_complete_count = 0;
 	LOGP(DRADIO, LOGL_INFO, "RDS: RT A/B flag flipped -> %c\n",
 	     rds->rt_ab ? 'B' : 'A');
 }
@@ -4083,102 +4072,6 @@ void rds_enc_flip_rtplus_toggle(rds_encoder_t *rds)
 	rds->rtplus.toggle = !rds->rtplus.toggle;
 	LOGP(DRADIO, LOGL_INFO, "RDS RT+: item_toggle flipped -> %d\n",
 	     rds->rtplus.toggle);
-}
-
-/* Atomic RT + RT+ new item update (IEC 62106-6 §A.6 compliant).
- *
- * Per the transmitter state machine (TX_ITEM_CHANGE):
- *   1. Set new RT text
- *   2. Toggle RT A/B flag
- *   3. Set Item Running = 1
- *   4. Toggle Item Toggle (new item)
- *   5. Set Tag1, Tag2
- *   6. Rebuild scheduler
- *
- * Critical: tags must be set BEFORE the scheduler starts transmitting
- * with the new A/B flag. We use rds_enc_set_radiotext_raw() which
- * sets text and toggles A/B but does NOT clear tags or rebuild the
- * scheduler. Tags and flags are set, THEN the scheduler is rebuilt
- * with everything consistent.
- */
-int rds_enc_rtplus_new_item(rds_encoder_t *rds, const char *rt,
-                            uint8_t ct1, uint8_t start1, uint8_t len1,
-                            uint8_t ct2, uint8_t start2, uint8_t len2)
-{
-	if (!rt) return -1;
-
-	/* Step 1-2: Set RT text and toggle A/B (no tag clear, no scheduler) */
-	rds_enc_set_radiotext_raw(rds, rt);
-
-	/* Step 3: Set new tags (validates, stores) */
-	int rc = rds_enc_rtplus_set_tags(rds, ct1, start1, len1, ct2, start2, len2);
-	if (rc < 0) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: new_item tag validation failed\n");
-		return rc;
-	}
-
-	/* Step 4: Flip item_toggle (signals new item to receivers) */
-	rds->rtplus.toggle = !rds->rtplus.toggle;
-
-	/* Step 5: item_running = 1 (an item is playing) */
-	rds->rtplus.item_running = 1;
-
-	LOGP(DRADIO, LOGL_INFO, "RDS RT+: New item, toggle=%d running=1\n",
-	     rds->rtplus.toggle);
-
-	/* Step 6: Rebuild scheduler — tags are ready, A/B is toggled,
-	 * everything is consistent before first transmission */
-	rds_scheduler_update(rds);
-
-	return 0;
-}
-
-/* Set RadioText for non-item content (news, jingle, ad).
- *
- * Per transmitter state machine (TX_NO_ITEM):
- *   1. New RT text
- *   2. Toggle RT A/B
- *   3. Item Running = 0
- *   4. Item Toggle unchanged
- *   5. Tags = DUMMY or non-Item classes
- *
- * Uses rds_enc_set_radiotext_raw() so tags are set before scheduler
- * starts transmitting with the new A/B flag.
- *
- * Pass ct1=0, start1=0, len1=0 for no tags (both become DUMMY).
- */
-int rds_enc_rtplus_set_no_item(rds_encoder_t *rds, const char *rt,
-                               uint8_t ct1, uint8_t start1, uint8_t len1,
-                               uint8_t ct2, uint8_t start2, uint8_t len2)
-{
-	if (!rt) return -1;
-
-	/* Set RT text and toggle A/B (no tag clear, no scheduler) */
-	rds_enc_set_radiotext_raw(rds, rt);
-
-	/* Set non-item tags if provided */
-	int has_tags = (ct1 != 0 || len1 != 0 || len2 > 0);
-	if (has_tags) {
-		int rc = rds_enc_rtplus_set_tags(rds, ct1, start1, len1, ct2, start2, len2);
-		if (rc < 0) {
-			LOGP(DRADIO, LOGL_NOTICE, "RDS RT+: set_no_item tag validation failed\n");
-			return rc;
-		}
-	} else {
-		/* No tags — clear to DUMMY */
-		rds->rtplus.tag_count = 0;
-	}
-
-	/* item_running = 0 (no item playing), toggle unchanged */
-	rds->rtplus.item_running = 0;
-
-	LOGP(DRADIO, LOGL_INFO, "RDS RT+: No item, toggle=%d running=0\n",
-	     rds->rtplus.toggle);
-
-	/* Rebuild scheduler */
-	rds_scheduler_update(rds);
-
-	return 0;
 }
 
 int rds_enc_rtplus_get_tag_count(const rds_encoder_t *rds)
@@ -4297,9 +4190,9 @@ int rds_enc_ert_plus_set_tags(rds_encoder_t *rds,
 
 void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds)
 {
-	/* Clear tags and set running=0 (no toggle flip on clear) */
-	rds->ert_plus.item_running = 0;
 	rds->ert_plus.tag_count = 0;
+	rds->ert_plus.item_running = 0;
+	rds->ert_plus.toggle = !rds->ert_plus.toggle;
 	LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Tags cleared, toggle=%d running=%d\n",
 	     rds->ert_plus.toggle, rds->ert_plus.item_running);
 }

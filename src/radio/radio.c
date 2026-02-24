@@ -333,8 +333,8 @@ static const rds_preset_t rds_presets[] = {
 			.enabled = 1,
 			.carrier_group = RDS_GROUP_11A,	/* Group 11A for RT+ ODA */
 			.message = 0x0000,		/* 3A msg: cb=0 (no template), scb=0, template=0 */
-			.toggle = 1,
-			.item_running = 1,		/* 1 = song is currently playing */
+			.toggle = 0,			/* Default per IEC 62106-6 A.5.3 NOTE 2 */
+			.item_running = 1,		/* 1 = item is currently playing */
 			.tags = {
 				{ .content_type = RDS_RTPLUS_CT_ITEM_TITLE, .start = 0, .length = 14 },	/* "osmocom-analog" */
 				{ .content_type = RDS_RTPLUS_CT_ITEM_ALBUM, .start = 15, .length = 12 },	/* "FM RDS Radio" */
@@ -398,25 +398,13 @@ static const rds_preset_t rds_presets[] = {
 		 *   // Register RT+ ODA on Group 11A (carrier_group=22)
 		 *   rds_enc_oda_add(&radio->rds_enc, RDS_GROUP_11A, RDS_ODA_AID_RT_PLUS, 0x0000);
 		 *   
-		 *   // PREFERRED: Atomic new-item call (sets RT + tags + toggle + running)
-		 *   // Per IEC 62106-6 §A.6: tags must be sent immediately after new RT.
-		 *   rds_enc_rtplus_new_item(&radio->rds_enc,
-		 *       "Bohemian Rhapsody - Queen",
+		 *   // RT and RT+ are independent — set each separately:
+		 *   rds_enc_set_radiotext(enc, "Bohemian Rhapsody - Queen");
+		 *   rds_enc_rtplus_set_tags(enc,
 		 *       RDS_RTPLUS_CT_ITEM_TITLE, 0, 18,
 		 *       RDS_RTPLUS_CT_ITEM_ARTIST, 21, 5);
-		 *   
-		 *   // For non-item content (news, jingle):
-		 *   rds_enc_rtplus_set_no_item(&radio->rds_enc,
-		 *       "Breaking: Weather alert for region",
-		 *       RDS_RTPLUS_CT_INFO_NEWS, 0, 34,
-		 *       0, 0, 0);  // Single tag, no second tag
-		 *   
-		 *   // LEGACY: Separate calls still work but have a race window
-		 *   // where the scheduler may drop RT+ groups between calls:
-		 *   //   rds_enc_set_radiotext(enc, "text");  // clears tags!
-		 *   //   rds_enc_rtplus_set_tags(enc, ...);   // restores tags
-		 *   //   rds_enc_rtplus_set_toggle(enc, !old); // flip toggle
-		 *   //   rds_enc_rtplus_set_item_running(enc, 1);
+		 *   rds_enc_rtplus_set_toggle(enc, !old);
+		 *   rds_enc_rtplus_set_item_running(enc, 1);
 		 * 
 		 * ============================================================
 		 * EXAMPLE 2: eRT (Enhanced RadioText) - Comprehensive Example
@@ -660,6 +648,22 @@ static const rds_preset_t rds_presets[] = {
 		 * Many US stations don't use PIN, so we demonstrate day=0 */
 		.pin_day  = 0, .pin_hour = 0, .pin_minute = 0,
 		/* group*_version omitted = AUTO: 0A (has AF), 2A (RT>32), 1A (has ECC) */
+		/* RT+: "osmocom-analog FM Radio - Open Source Broadcast FM RDBS Encoder"
+		 *       ^0                        ^27
+		 * Tag1: stationname.long @0+24 "osmocom-analog FM Radio"
+		 * Tag2: info.other @27+37 "Open Source Broadcast FM RDBS Encoder" */
+		.rtplus = {
+			.enabled = 1,
+			.carrier_group = RDS_GROUP_11A,
+			.message = 0x0000,
+			.toggle = 0,
+			.item_running = 1,
+			.tags = {
+				{ .content_type = RDS_RTPLUS_CT_STATIONNAME_LONG, .start = 0, .length = 24 },
+				{ .content_type = RDS_RTPLUS_CT_INFO_OTHER, .start = 27, .length = 37 },
+			},
+			.tag_count = 2,
+		},
 	},
 	/* ============================================================
 	 * MINIMAL PRESET - Mandatory Group 0 Only
@@ -773,6 +777,23 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xE0,	/* Germany */
 		.lang     = 8,		/* German */
+		/* RT+: info.weather example — common on German radio
+		 * "Größe, Müller, Schöne Grüße! Fünf Äpfel für Österreich."
+		 *  ^0                           ^29
+		 * Tag1: info.news @0+28 "Größe, Müller, Schöne Grüße!"
+		 * Tag2: info.weather @29+27 "Fünf Äpfel für Österreich." */
+		.rtplus = {
+			.enabled = 1,
+			.carrier_group = RDS_GROUP_11A,
+			.message = 0x0000,
+			.toggle = 0,
+			.item_running = 1,
+			.tags = {
+				{ .content_type = RDS_RTPLUS_CT_INFO_NEWS, .start = 0, .length = 28 },
+				{ .content_type = RDS_RTPLUS_CT_INFO_WEATHER, .start = 29, .length = 27 },
+			},
+			.tag_count = 2,
+		},
 	},
 	/* ============================================================
 	 * EXTENDED CHARACTER DEMO - French (IEC 62106 Annex E)
@@ -792,6 +813,23 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xE1,	/* France */
 		.lang     = 15,		/* French */
+		/* RT+: info.event + info.weather — common on French radio
+		 * "Bienvenue à Noël! Très bel été, où êtes-vous? Ça va!"
+		 *  ^0                ^18
+		 * Tag1: info.event @0+17 "Bienvenue à Noël!"
+		 * Tag2: info.weather @18+15 "Très bel été, où" */
+		.rtplus = {
+			.enabled = 1,
+			.carrier_group = RDS_GROUP_11A,
+			.message = 0x0000,
+			.toggle = 0,
+			.item_running = 1,
+			.tags = {
+				{ .content_type = RDS_RTPLUS_CT_INFO_EVENT, .start = 0, .length = 17 },
+				{ .content_type = RDS_RTPLUS_CT_INFO_WEATHER, .start = 18, .length = 15 },
+			},
+			.tag_count = 2,
+		},
 	},
 	/* ============================================================
 	 * EXTENDED CHARACTER DEMO - Spanish + Euro (IEC 62106 Annex E)
@@ -935,15 +973,8 @@ static void rds_apply_preset(radio_t *radio)
 	 * - CR (0x0D) termination per EN 50067
 	 * - A/B flag toggle to force receiver display update
 	 * - Scheduler update for RT presence changes
-	 * - RDS charset conversion from UTF-8
-	 *
-	 * When RT+ is enabled, RT is set later in the RT+ section using
-	 * rds_enc_rtplus_new_item()-style ordering: RT text first, then
-	 * tags, then scheduler rebuild. This ensures the receiver never
-	 * sees the new A/B flag with stale/empty tags. */
-	if (p->rtplus.enabled && p->rt && p->rt[0] != '\0') {
-		/* RT will be set in the RT+ section below */
-	} else if (p->rt && p->rt[0] != '\0') {
+	 * - RDS charset conversion from UTF-8 */
+	if (p->rt && p->rt[0] != '\0') {
 		rds_enc_set_radiotext(enc, p->rt);
 	} else {
 		rds_enc_clear_radiotext(enc);
@@ -1089,55 +1120,32 @@ static void rds_apply_preset(radio_t *radio)
 	
 	/* Update RT+ (RadioText Plus) Configuration
 	 *
-	 * Per IEC 62106-6 §A.6 and the transmitter state machine: tags must
-	 * be ready BEFORE the scheduler starts transmitting with the new A/B
-	 * flag. We use rds_enc_set_radiotext_raw() which sets RT text and
-	 * toggles A/B but does NOT clear tags or rebuild the scheduler.
-	 * Sequence:
-	 *   1. Register ODA (so scheduler knows about RT+)
-	 *   2. Set RT text + toggle A/B (raw — no tag clear, no scheduler)
-	 *   3. Set tags (referencing positions in the new RT)
-	 *   4. Set toggle and item_running from preset
-	 *   5. Final rds_scheduler_update() at end of function builds correct sequence
-	 *
-	 * We don't use rds_enc_rtplus_new_item() here because that always
-	 * flips item_toggle and forces item_running=1 — it's designed for
-	 * runtime "new song" transitions. Preset init needs exact values. */
+	 * RT and RT+ are independent. RT is already set above.
+	 * Per IEC 62106-6 §A.5: 3A announces AID=0x4BD7 on carrier group,
+	 * carrier group carries toggle + running + 2 tags. */
 	if (p->rtplus.enabled) {
-		/* Register RT+ ODA first */
+		/* Register RT+ ODA (adds 3A + carrier to scheduler) */
 		rds_enc_oda_add(enc, p->rtplus.carrier_group, RDS_ODA_AID_RT_PLUS, p->rtplus.message);
 		
-		/* Set RT using raw setter (A/B toggles, but tags not cleared,
-		 * scheduler not rebuilt — tags are set immediately below) */
-		if (p->rt && p->rt[0] != '\0')
-			rds_enc_set_radiotext_raw(enc, p->rt);
-		
-		/* Set RT+ tags (1 or 2 tags) */
+		/* Set tags */
 		if (p->rtplus.tag_count >= 1) {
-			uint8_t ct1 = p->rtplus.tags[0].content_type;
-			uint8_t start1 = p->rtplus.tags[0].start;
-			uint8_t len1 = p->rtplus.tags[0].length;
-			uint8_t ct2 = 0, start2 = 0, len2 = 0;
+			uint8_t ct2 = 0, s2 = 0, l2 = 0;
 			if (p->rtplus.tag_count >= 2) {
 				ct2 = p->rtplus.tags[1].content_type;
-				start2 = p->rtplus.tags[1].start;
-				len2 = p->rtplus.tags[1].length;
+				s2 = p->rtplus.tags[1].start;
+				l2 = p->rtplus.tags[1].length;
 			}
-			rds_enc_rtplus_set_tags(enc, ct1, start1, len1, ct2, start2, len2);
+			rds_enc_rtplus_set_tags(enc,
+				p->rtplus.tags[0].content_type,
+				p->rtplus.tags[0].start,
+				p->rtplus.tags[0].length,
+				ct2, s2, l2);
 		}
 		
-		/* Apply toggle and item_running from preset.
-		 * These are independent signals (IEC 62106-6 A.5.3 note 2)
-		 * and set_tags() intentionally does not touch them. */
-		rds_enc_rtplus_set_item_running(enc, p->rtplus.item_running);
+		/* Set flags — toggle=0 default per IEC 62106-6 A.5.3 NOTE 2 */
 		rds_enc_rtplus_set_toggle(enc, p->rtplus.toggle);
-		
-		LOGP(DRADIO, LOGL_INFO, "RDS RT+: Enabled on group %d%c with %d tag(s)\n",
-		     p->rtplus.carrier_group >> 1,
-		     (p->rtplus.carrier_group & 1) ? 'B' : 'A',
-		     p->rtplus.tag_count);
+		rds_enc_rtplus_set_item_running(enc, p->rtplus.item_running);
 	} else {
-		/* Remove RT+ ODA if it was previously enabled */
 		rds_enc_oda_remove(enc, RDS_ODA_AID_RT_PLUS);
 		rds_enc_rtplus_clear_tags(enc);
 	}
