@@ -260,8 +260,10 @@ static const rds_preset_t rds_presets[] = {
 		 * Here: 6 (Ukraine) + A (Regional 7) + CE (Ref) */
 		.pi       = 0x6ACE,
 		.ps       = "Osmo RDS",
-		/* 64-char RT (max for Group 2A) */
-		.rt       = "osmocom-analog FM RDS Radio - Open Source Broadcast FM Encoder!",
+		/* 64-char RT (max for Group 2A).
+		 * Space-padded to full 64 chars to avoid 0x0D CR terminator —
+		 * some receivers handle CR poorly (EN 50067 S6.1.5.3). */
+		.rt       = "osmocom-analog FM RDS Radio - Open Source Broadcast FM Encoder! ",
 		.pty      = 10,		/* Pop music (RDS) */
 		.ptyn     = "OsmoPTYN",
 		.tp       = 1,

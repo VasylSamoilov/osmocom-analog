@@ -1336,16 +1336,17 @@ static void rds_build_group_2a(rds_encoder_t *rds, uint8_t *group)
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	/* Advance segment, wrapping after all 16 segments.
-	 * EN 50067: "A new text shall start with segment address 0000 and the
-	 * segment numbers shall be transmitted sequentially."
-	 * We always transmit all 16 segments (64 chars) even for short messages.
-	 * The buffer is pre-filled with 0x0D (CR) terminators, so segments
-	 * beyond the text content are valid per the standard. This ensures
-	 * maximum receiver compatibility — some receivers (especially those
-	 * implementing RT+) wait for all segments before processing. */
+	/* Advance segment.
+	 * EN 50067: "each message should be ended by the code 0D (Hex) -
+	 * carriage return - if the current message requires less than 16
+	 * segment addresses."
+	 * Once we transmit a segment containing the first 0x0D terminator,
+	 * wrap back to segment 0 — no need to keep transmitting padding.
+	 * This reduces unnecessary air time and matches standard behavior. */
 	int next_seg = seg + 1;
-	if (next_seg >= 16) {
+	int has_cr = (rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r' ||
+		      rds->rt[pos+2] == '\r' || rds->rt[pos+3] == '\r');
+	if (has_cr || next_seg >= 16) {
 		rds->rt_segment = 0;
 		rds->rt_complete_count++;
 	} else {
@@ -1415,11 +1416,12 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
 	
-	/* Advance segment, wrapping after all 16 segments (32 chars).
-	 * Always transmit all segments for receiver compatibility.
-	 * Buffer is pre-filled with 0x0D terminators. */
+	/* Advance segment. Reset to 0 once we hit the first 0x0D terminator
+	 * in the current segment — no need to transmit padding beyond that.
+	 * EN 50067: message ended by 0x0D if fewer than 16 segments needed. */
 	int next_seg = seg + 1;
-	if (next_seg >= 16) {
+	int has_cr = (rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r');
+	if (has_cr || next_seg >= 16) {
 		rds->rt_segment = 0;
 		rds->rt_complete_count++;
 	} else {
@@ -3214,17 +3216,17 @@ void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
 	/* Validate input text and warn about unencodable characters */
 	rds_validate_text(rt, "RadioText");
 	
-	/* Clear buffer with spaces (0x20) to fill full 64 chars.
-	 * This ensures all 16 segments contain displayable content,
-	 * maximizing receiver compatibility — especially for RT+
-	 * where some receivers wait for all segments before processing. */
-	memset(rds->rt, ' ', 64);
+	/* Clear buffer with 0x0D (carriage return) per EN 50067:
+	 * "each message should be ended by the code 0D (Hex) - carriage
+	 * return - if the current message requires less than 16 segment
+	 * addresses." */
+	memset(rds->rt, '\r', 64);
 	
 	/* Convert UTF-8 to RDS encoding */
 	int warn = 0;
 	int len = rds_encode_text(rt, (uint8_t *)rds->rt, 64, &warn);
 	
-	/* Positions from len onwards remain as CR from memset above */
+	/* Positions from len onwards remain as 0x0D from memset above */
 	rds->rt[64] = '\0';
 	
 	/* Toggle A/B flag to trigger receivers to clear display
@@ -3235,6 +3237,22 @@ void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
 	rds->rt_segment = 0;
 	rds->rt_complete_count = 0;
 	
+	/* Warn if RT is shorter than the full group capacity or contains an
+	 * embedded 0x0D — both cause early termination per EN 50067. */
+	int full_len = rds->use_2b ? 32 : 64;
+	int cr_pos = -1;
+	for (int i = 0; i < len; i++) {
+		if (rds->rt[i] == '\r') { cr_pos = i; break; }
+	}
+	if (len < full_len || cr_pos >= 0) {
+		char cr_info[48] = "";
+		if (cr_pos >= 0)
+			snprintf(cr_info, sizeof(cr_info), ", has 0x0D at position %d", cr_pos);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS: RadioText is %d/%d chars (%s)%s, "
+		     "space-pad to full length for better receiver compatibility\n",
+		     len, full_len, rds->use_2b ? "2B" : "2A", cr_info);
+	}
+
 	/* Log RT change with new A/B flag */
 	LOGP(DRADIO, LOGL_INFO, "RDS: RadioText set (%d chars), A/B flag toggled %c->%c\n",
 	     len, old_ab ? 'B' : 'A', rds->rt_ab ? 'B' : 'A');
@@ -3250,8 +3268,8 @@ void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
 
 void rds_enc_clear_radiotext(rds_encoder_t *rds)
 {
-	/* Set RT to 64 spaces (empty RT) */
-	memset(rds->rt, ' ', 64);
+	/* Set RT to 64 x 0x0D (carriage return) per EN 50067 */
+	memset(rds->rt, '\r', 64);
 	rds->rt[64] = '\0';
 	rds->rt_segment = 0;
 	
