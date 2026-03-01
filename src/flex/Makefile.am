@@ -1,0 +1,55 @@
+AM_CPPFLAGS = -Wall -Wextra -Wmissing-prototypes -g $(all_includes)
+
+bin_PROGRAMS = \
+	flex
+
+flex_SOURCES = \
+	flex.c \
+	frame.c \
+	dsp.c \
+	image.c \
+	main.c
+flex_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/liboptions/liboptions.a \
+	$(top_builddir)/src/libmobile/libmobile.a \
+	$(top_builddir)/src/libdtmf/libdtmf.a \
+	$(top_builddir)/src/libtones/libtones.a \
+	$(top_builddir)/src/libdisplay/libdisplay.a \
+	$(top_builddir)/src/libjitter/libjitter.a \
+	$(top_builddir)/src/libsamplerate/libsamplerate.a \
+	$(top_builddir)/src/libemphasis/libemphasis.a \
+	$(top_builddir)/src/libfm/libfm.a \
+	$(top_builddir)/src/libfilter/libfilter.a \
+	$(top_builddir)/src/libwave/libwave.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	$(top_builddir)/src/libaaimage/libaaimage.a \
+	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
+	$(LIBOSMOCORE_LIBS) \
+	$(LIBOSMOCC_LIBS) \
+	-lm
+
+if HAVE_ALSA
+flex_LDADD += \
+	$(top_builddir)/src/libsound/libsound.a \
+	$(ALSA_LIBS)
+
+endif
+
+if HAVE_SDR
+flex_LDADD += \
+	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
+	$(top_builddir)/src/libam/libam.a \
+	$(top_builddir)/src/libfft/libfft.a \
+	$(UHD_LIBS) \
+	$(SOAPY_LIBS) \
+	$(RPITX_LIBS)
+endif
+
+if HAVE_ALSA
+AM_CPPFLAGS += -DHAVE_ALSA
+endif

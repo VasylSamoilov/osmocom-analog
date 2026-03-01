@@ -16,6 +16,7 @@ enum {
 	DJOLLY,
 	DEURO,
 	DPOCSAG,
+	DFLEX,
 	DGOLAY,
 	DFUENF,
 	DFRAME,

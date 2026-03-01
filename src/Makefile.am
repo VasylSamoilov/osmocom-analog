@@ -59,6 +59,7 @@ SUBDIRS += \
 	jolly \
 	eurosignal \
 	pocsag \
+	flex \
 	golay \
 	fuenf \
 	tv \
