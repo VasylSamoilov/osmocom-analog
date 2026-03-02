@@ -36,6 +36,7 @@
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
+#include "scheduler.h"
 
 #define MSG_SEND "/tmp/flex_msg_send"
 static int msg_send_fd = -1;
@@ -48,6 +49,37 @@ static const char *message = "1234";
 static uint64_t scan_from = 0;
 static uint64_t scan_to = 0;
 
+/* STD-43A compliance options */
+static int network_mode = 0;
+static int collapse = 0;
+static int fixed_speed = -1;		/* -1 = not fixed */
+static int fixed_mod_type = FLEX_MOD_2FSK;	/* default 2FSK */
+static double fixed_polarity = 0.0;	/* 0.0 = not fixed */
+static int lpf_enabled = 1;
+static int biw_time_enabled = -1;	/* -1 = auto (on in network mode) */
+static int ers_cycles_override = -1;
+static int default_charset = 0;
+static uint32_t ssid = 0;
+static uint32_t nid = 0;
+static const char *pocsag_mix = NULL;
+static const char *temp_addr = NULL;
+
+/* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
+#define OPT_NETWORK		3000
+#define OPT_COLLAPSE		3001
+#define OPT_SPEED		3002
+#define OPT_FIXED_POLARITY	3003
+#define OPT_LPF		3004
+#define OPT_NO_LPF		3005
+#define OPT_BIW_TIME		3006
+#define OPT_NO_BIW_TIME	3007
+#define OPT_ERS_CYCLES		3008
+#define OPT_CHARSET		3009
+#define OPT_SSID		3010
+#define OPT_NID			3011
+#define OPT_POCSAG_MIX		3012
+#define OPT_TEMP_ADDR		3013
+
 void print_help(const char *arg0)
 {
 	main_mobile_print_help(arg0, "-k <frequency>");
@@ -57,12 +89,40 @@ void print_help(const char *arg0)
 	printf("        Choose deviation of FSK signal (default %.0f Hz).\n", deviation);
 	printf(" -P --polarity -1 | negative | 1 | positive\n");
 	printf("        Choose polarity of FSK signal. (default %s).\n", (polarity < 0) ? "negative" : "positive");
-	printf(" -y --type auto | tone | numeric | alpha\n");
+	printf(" -y --type auto | tone | numeric | alpha | hex | instruction | short\n");
 	printf("        Set message type. (default auto)\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Default message text. (default \"%s\").\n", message);
 	printf(" -S --scan <from> <to>\n");
 	printf("        Scan through given capcode range.\n");
+	printf("    --network\n");
+	printf("        Enable network mode (continuous operation).\n");
+	printf("    --collapse <0-7>\n");
+	printf("        Set collapse cycle value (default %d, network mode only).\n", collapse);
+	printf("    --speed <1600|3200|3200-4fsk|6400>\n");
+	printf("        Lock transmitter to fixed baud rate (fixed-mode).\n");
+	printf("    --fixed-polarity <neg|pos>\n");
+	printf("        Lock transmitter to fixed FSK polarity (fixed-mode).\n");
+	printf("    --lpf\n");
+	printf("        Enable baseband low-pass filter (default).\n");
+	printf("    --no-lpf\n");
+	printf("        Disable baseband low-pass filter.\n");
+	printf("    --biw-time\n");
+	printf("        Enable BIW3/BIW4 time broadcast.\n");
+	printf("    --no-biw-time\n");
+	printf("        Disable BIW3/BIW4 time broadcast.\n");
+	printf("    --ers-cycles <N>\n");
+	printf("        Override ERS cycle count (default auto).\n");
+	printf("    --charset <ascii|kanji>\n");
+	printf("        Set default character set (default ascii).\n");
+	printf("    --ssid <N>\n");
+	printf("        Set System Sub-ID for roaming (default 0).\n");
+	printf("    --nid <N>\n");
+	printf("        Set Network ID for roaming (default 0).\n");
+	printf("    --pocsag-mix <frames>\n");
+	printf("        Enable POCSAG frame slot allocation.\n");
+	printf("    --temp-addr <cap:temp>\n");
+	printf("        Assign temporary address (format capcode:temp_addr).\n");
 	main_mobile_print_hotkeys();
 }
 
@@ -75,6 +135,20 @@ static void add_options(void)
 	option_add('y', "type", 1);
 	option_add('M', "message", 1);
 	option_add('S', "scan", 2);
+	option_add(OPT_NETWORK, "network", 0);
+	option_add(OPT_COLLAPSE, "collapse", 1);
+	option_add(OPT_SPEED, "speed", 1);
+	option_add(OPT_FIXED_POLARITY, "fixed-polarity", 1);
+	option_add(OPT_LPF, "lpf", 0);
+	option_add(OPT_NO_LPF, "no-lpf", 0);
+	option_add(OPT_BIW_TIME, "biw-time", 0);
+	option_add(OPT_NO_BIW_TIME, "no-biw-time", 0);
+	option_add(OPT_ERS_CYCLES, "ers-cycles", 1);
+	option_add(OPT_CHARSET, "charset", 1);
+	option_add(OPT_SSID, "ssid", 1);
+	option_add(OPT_NID, "nid", 1);
+	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
+	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -109,8 +183,14 @@ static int handle_options(int short_option, int argi, char **argv)
 			msg_type = FLEX_MSG_TYPE_NUMERIC;
 		else if (!strcasecmp(argv[argi], "alpha") || !strcasecmp(argv[argi], "alphanumeric") || !strcmp(argv[argi], "3"))
 			msg_type = FLEX_MSG_TYPE_ALPHA;
+		else if (!strcasecmp(argv[argi], "hex") || !strcmp(argv[argi], "4"))
+			msg_type = FLEX_MSG_TYPE_HEX;
+		else if (!strcasecmp(argv[argi], "instruction") || !strcmp(argv[argi], "5"))
+			msg_type = FLEX_MSG_TYPE_INSTRUCTION;
+		else if (!strcasecmp(argv[argi], "short") || !strcmp(argv[argi], "6"))
+			msg_type = FLEX_MSG_TYPE_SHORT;
 		else {
-			fprintf(stderr, "Given type is invalid. Use auto/tone/numeric/alpha.\n");
+			fprintf(stderr, "Given type is invalid. Use auto/tone/numeric/alpha/hex/instruction/short.\n");
 			return -EINVAL;
 		}
 		break;
@@ -121,6 +201,85 @@ static int handle_options(int short_option, int argi, char **argv)
 		scan_from = atoll(argv[argi++]);
 		scan_to = atoll(argv[argi++]) + 1;
 		break;
+	case OPT_NETWORK:
+		network_mode = 1;
+		break;
+	case OPT_COLLAPSE:
+		collapse = atoi(argv[argi]);
+		if (collapse < 0 || collapse > 7) {
+			fprintf(stderr, "Collapse value must be 0-7, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_SPEED:
+		if (!strcmp(argv[argi], "1600")) {
+			fixed_speed = 1600;
+			fixed_mod_type = FLEX_MOD_2FSK;
+		} else if (!strcmp(argv[argi], "3200")) {
+			fixed_speed = 3200;
+			fixed_mod_type = FLEX_MOD_2FSK;
+		} else if (!strcmp(argv[argi], "3200-4fsk")) {
+			fixed_speed = 3200;
+			fixed_mod_type = FLEX_MOD_4FSK;
+		} else if (!strcmp(argv[argi], "6400")) {
+			fixed_speed = 6400;
+			fixed_mod_type = FLEX_MOD_4FSK;
+		} else {
+			fprintf(stderr, "Speed must be 1600, 3200, 3200-4fsk, or 6400, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_FIXED_POLARITY:
+		if (argv[argi][0] == 'n' || argv[argi][0] == 'N')
+			fixed_polarity = -1.0;
+		else if (argv[argi][0] == 'p' || argv[argi][0] == 'P')
+			fixed_polarity = 1.0;
+		else {
+			fprintf(stderr, "Polarity must be neg or pos, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_LPF:
+		lpf_enabled = 1;
+		break;
+	case OPT_NO_LPF:
+		lpf_enabled = 0;
+		break;
+	case OPT_BIW_TIME:
+		biw_time_enabled = 1;
+		break;
+	case OPT_NO_BIW_TIME:
+		biw_time_enabled = 0;
+		break;
+	case OPT_ERS_CYCLES:
+		ers_cycles_override = atoi(argv[argi]);
+		if (ers_cycles_override < 1) {
+			fprintf(stderr, "ERS cycles must be >= 1, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_CHARSET:
+		if (!strcasecmp(argv[argi], "ascii"))
+			default_charset = 0;
+		else if (!strcasecmp(argv[argi], "kanji"))
+			default_charset = 1;
+		else {
+			fprintf(stderr, "Charset must be ascii or kanji, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_SSID:
+		ssid = (uint32_t)strtoul(argv[argi], NULL, 10);
+		break;
+	case OPT_NID:
+		nid = (uint32_t)strtoul(argv[argi], NULL, 10);
+		break;
+	case OPT_POCSAG_MIX:
+		pocsag_mix = options_strdup(argv[argi]);
+		break;
+	case OPT_TEMP_ADDR:
+		temp_addr = options_strdup(argv[argi]);
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -128,113 +287,322 @@ static int handle_options(int short_option, int argi, char **argv)
 	return 1;
 }
 
-static void myhandler(void)
+
+/* Parse FIFO options field: space-separated key=value pairs.
+ * Sets per-message parameters from parsed values; unset keys keep defaults. */
+static void parse_fifo_options(const char *opts, int opts_len,
+			       int *speed, int *modulation_type,
+			       double *polarity_out, int *priority,
+			       int *charset, int *is_group, char *source_id)
 {
-	static char buffer[256];
-	static int pos = 0;
-	int rc, i;
-	int space = sizeof(buffer) - pos;
+	char buf[256];
+	char *p, *key, *val;
+	int len;
 
-	rc = read(msg_send_fd, buffer + pos, space);
-	if (rc > 0) {
-		pos += rc;
-		if (pos == space) {
-			fprintf(stderr, "Message buffer overflow!\n");
-			pos = 0;
+	/* defaults */
+	*speed = 1600;
+	*modulation_type = FLEX_MOD_2FSK;
+	*polarity_out = -1.0;
+	*priority = 0;
+	*charset = 0;
+	/* is_group already set from group: prefix */
+	source_id[0] = '\0';
+
+	if (opts_len <= 0)
+		return;
+
+	len = opts_len;
+	if (len >= (int)sizeof(buf))
+		len = sizeof(buf) - 1;
+	memcpy(buf, opts, len);
+	buf[len] = '\0';
+
+	p = buf;
+	while (*p) {
+		/* skip spaces */
+		while (*p == ' ')
+			p++;
+		if (!*p)
+			break;
+
+		key = p;
+		val = NULL;
+		while (*p && *p != '=' && *p != ' ')
+			p++;
+		if (*p == '=') {
+			*p++ = '\0';
+			val = p;
+			while (*p && *p != ' ')
+				p++;
+			if (*p)
+				*p++ = '\0';
+		} else {
+			if (*p)
+				*p++ = '\0';
 		}
-		/* check for end of line */
-		for (i = 0; i < pos; i++) {
-			if (buffer[i] == '\r' || buffer[i] == '\n')
-				break;
+
+		if (!val)
+			continue;
+
+		if (!strcmp(key, "speed")) {
+			if (!strcmp(val, "3200-4fsk")) {
+				*speed = 3200;
+				*modulation_type = FLEX_MOD_4FSK;
+			} else if (!strcmp(val, "6400")) {
+				*speed = 6400;
+				*modulation_type = FLEX_MOD_4FSK;
+			} else if (!strcmp(val, "3200")) {
+				*speed = 3200;
+				*modulation_type = FLEX_MOD_2FSK;
+			} else {
+				*speed = atoi(val);
+				*modulation_type = FLEX_MOD_2FSK;
+			}
 		}
-		/* parse and send msg */
-		if (i < pos) {
-			int text_length = i;
-			const char *text = buffer;
-			char capcode_string[text_length + 1];
-			char type_string[text_length + 1];
-			char message[text_length + 1];
-			uint64_t capcode;
-			enum flex_msg_type mtype;
-			int message_length = 0;
-			int j;
+		else if (!strcmp(key, "polarity")) {
+			if (val[0] == 'n' || val[0] == 'N')
+				*polarity_out = -1.0;
+			else if (val[0] == 'p' || val[0] == 'P')
+				*polarity_out = 1.0;
+		}
+		else if (!strcmp(key, "priority"))
+			*priority = atoi(val);
+		else if (!strcmp(key, "charset")) {
+			if (!strcasecmp(val, "kanji"))
+				*charset = 1;
+			else
+				*charset = 0;
+		}
+		else if (!strcmp(key, "group"))
+			*is_group = atoi(val);
+		else if (!strcmp(key, "source")) {
+			strncpy(source_id, val, 63);
+			source_id[63] = '\0';
+		}
+	}
+}
 
-			pos = 0;
+/* Process a single FIFO line: capcode,type,options,message */
+static void fifo_process_line(const char *text, int text_length)
+{
+	char capcode_string[text_length + 1];
+	char type_string[text_length + 1];
+	char msg_buf[text_length + 1];
+	uint64_t capcode;
+	enum flex_msg_type mtype;
+	int message_length = 0;
+	int j;
+	int is_group = 0;
+	int comma_count = 0;
+	int comma1 = -1, comma2 = -1, comma3 = -1;
+	int msg_speed;
+	int msg_mod_type;
+	double msg_polarity;
+	int msg_priority;
+	int msg_charset;
+	char msg_source[64];
+	const char *opts_start;
+	int opts_len;
 
-			if (!tx) {
-				LOGP(DFLEX, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
+	if (!tx) {
+		LOGP(DFLEX, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
+		return;
+	}
+
+	/* Count commas and record positions */
+	for (j = 0; j < text_length; j++) {
+		if (text[j] == ',') {
+			comma_count++;
+			if (comma_count == 1)
+				comma1 = j;
+			else if (comma_count == 2)
+				comma2 = j;
+			else if (comma_count == 3) {
+				comma3 = j;
+				break; /* stop at third comma */
+			}
+		}
+	}
+
+	if (comma_count < 3) {
+		LOGP(DFLEX, LOGL_NOTICE, "Given message MUST be in the format: capcode,type,options,message\n");
+		return;
+	}
+
+	/* Extract capcode field (before first comma) */
+	memcpy(capcode_string, text, comma1);
+	capcode_string[comma1] = '\0';
+
+	/* Handle group:capcode prefix */
+	if (strncmp(capcode_string, "group:", 6) == 0) {
+		is_group = 1;
+		memmove(capcode_string, capcode_string + 6, strlen(capcode_string + 6) + 1);
+	}
+
+	/* Extract type field (between first and second comma) */
+	{
+		int tlen = comma2 - comma1 - 1;
+		memcpy(type_string, text + comma1 + 1, tlen);
+		type_string[tlen] = '\0';
+	}
+
+	/* Extract options field (between second and third comma) */
+	opts_start = text + comma2 + 1;
+	opts_len = comma3 - comma2 - 1;
+
+	/* Extract message payload (everything after third comma) */
+	if (comma3 + 1 < text_length) {
+		message_length = flex_scan_message(text + comma3 + 1, text_length - comma3 - 1, msg_buf, sizeof(msg_buf));
+	}
+
+	/* Parse options field */
+	parse_fifo_options(opts_start, opts_len,
+			   &msg_speed, &msg_mod_type,
+			   &msg_polarity, &msg_priority,
+			   &msg_charset, &is_group, msg_source);
+
+	/* Validate capcode */
+	capcode = strtoull(capcode_string, NULL, 10);
+	if (!flex_capcode_valid(capcode)) {
+		LOGP(DFLEX, LOGL_NOTICE, "Invalid capcode '%" PRIu64 "'.\n", capcode);
+		return;
+	}
+
+	/* Validate message type */
+	if (!strcasecmp(type_string, "auto") || !strcmp(type_string, "0"))
+		mtype = FLEX_MSG_TYPE_AUTO;
+	else if (!strcasecmp(type_string, "tone") || !strcmp(type_string, "1"))
+		mtype = FLEX_MSG_TYPE_TONE;
+	else if (!strcasecmp(type_string, "numeric") || !strcasecmp(type_string, "num") || !strcmp(type_string, "2"))
+		mtype = FLEX_MSG_TYPE_NUMERIC;
+	else if (!strcasecmp(type_string, "alpha") || !strcasecmp(type_string, "alphanumeric") || !strcmp(type_string, "3"))
+		mtype = FLEX_MSG_TYPE_ALPHA;
+	else if (!strcasecmp(type_string, "hex"))
+		mtype = FLEX_MSG_TYPE_HEX;
+	else if (!strcasecmp(type_string, "instruction"))
+		mtype = FLEX_MSG_TYPE_INSTRUCTION;
+	else if (!strcasecmp(type_string, "short"))
+		mtype = FLEX_MSG_TYPE_SHORT;
+	else {
+		LOGP(DFLEX, LOGL_NOTICE, "Invalid type '%s'. Use auto/tone/numeric/alpha/hex/instruction/short.\n", type_string);
+		return;
+	}
+
+	/* Auto-detect message type if AUTO */
+	if (mtype == FLEX_MSG_TYPE_AUTO) {
+		if (message_length == 0) {
+			mtype = FLEX_MSG_TYPE_TONE;
+		} else {
+			mtype = flex_detect_msg_type(msg_buf, message_length);
+		}
+	}
+
+	/* Fixed-mode rejection: check speed, modulation type, and polarity locks */
+	{
+		flex_t *flex = (flex_t *)sender_head;
+		if (flex) {
+			if (flex->fixed_speed != -1 &&
+			    (msg_speed != flex->fixed_speed || msg_mod_type != flex->fixed_mod_type)) {
+				LOGP(DFLEX, LOGL_NOTICE, "fixed-mode: speed locked to %d/%s, discarding message with speed=%d/%s\n",
+				     flex->fixed_speed,
+				     (flex->fixed_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+				     msg_speed,
+				     (msg_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
 				return;
 			}
-
-			/* Parse capcode */
-			for (j = 0; j < text_length; j++) {
-				if (text[j] == ',')
-					break;
-				capcode_string[j] = text[j];
-			}
-			capcode_string[j] = '\0';
-			if (j >= text_length) {
-				LOGP(DFLEX, LOGL_NOTICE, "Given message MUST be in the format: capcode,type,message\n");
+			if (flex->fixed_polarity != 0.0 && msg_polarity != flex->fixed_polarity) {
+				LOGP(DFLEX, LOGL_NOTICE, "fixed-mode: polarity locked to %s, discarding message with polarity=%s\n",
+				     (flex->fixed_polarity < 0) ? "negative" : "positive",
+				     (msg_polarity < 0) ? "negative" : "positive");
 				return;
 			}
-			j++; /* skip comma */
+		}
+	}
 
-			/* Parse type */
-			{
-				int k = 0;
-				for (; j < text_length; j++, k++) {
-					if (text[j] == ',')
-						break;
-					type_string[k] = text[j];
+	/* Enqueue message on first transmitter instance */
+	{
+		flex_t *flex = (flex_t *)sender_head;
+		if (flex) {
+			flex_msg_t *msg;
+			msg = flex_msg_create(flex, capcode, mtype, msg_buf, message_length);
+			if (msg) {
+				msg->speed = msg_speed;
+				msg->modulation_type = msg_mod_type;
+				msg->polarity = msg_polarity;
+				msg->priority = msg_priority;
+				msg->charset = msg_charset;
+				msg->is_group = is_group;
+				if (msg_source[0] != '\0') {
+					strncpy(msg->source_id, msg_source, sizeof(msg->source_id) - 1);
+					msg->source_id[sizeof(msg->source_id) - 1] = '\0';
 				}
-				type_string[k] = '\0';
-			}
-
-			/* Parse optional message */
-			if (j < text_length) {
-				j++; /* skip comma */
-				message_length = flex_scan_message(text + j, text_length - j, message, sizeof(message));
-			}
-
-			/* Validate capcode */
-			capcode = strtoull(capcode_string, NULL, 10);
-			if (!flex_capcode_valid(capcode)) {
-				LOGP(DFLEX, LOGL_NOTICE, "Invalid capcode '%" PRIu64 "'.\n", capcode);
-				return;
-			}
-
-			/* Validate message type */
-			if (!strcasecmp(type_string, "auto") || !strcmp(type_string, "0"))
-				mtype = FLEX_MSG_TYPE_AUTO;
-			else if (!strcasecmp(type_string, "tone") || !strcmp(type_string, "1"))
-				mtype = FLEX_MSG_TYPE_TONE;
-			else if (!strcasecmp(type_string, "numeric") || !strcasecmp(type_string, "num") || !strcmp(type_string, "2"))
-				mtype = FLEX_MSG_TYPE_NUMERIC;
-			else if (!strcasecmp(type_string, "alpha") || !strcasecmp(type_string, "alphanumeric") || !strcmp(type_string, "3"))
-				mtype = FLEX_MSG_TYPE_ALPHA;
-			else {
-				LOGP(DFLEX, LOGL_NOTICE, "Invalid type '%s'. Use auto/tone/numeric/alpha.\n", type_string);
-				return;
-			}
-
-			/* Auto-detect message type if AUTO */
-			if (mtype == FLEX_MSG_TYPE_AUTO) {
-				if (message_length == 0) {
-					mtype = FLEX_MSG_TYPE_TONE;
-				} else {
-					mtype = flex_detect_msg_type(message, message_length);
-				}
-			}
-
-			/* Enqueue message on first transmitter instance */
-			{
-				flex_t *flex = (flex_t *)sender_head;
-				if (flex)
-					flex_msg_create(flex, capcode, mtype, message, message_length);
+				LOGP(DFLEX, LOGL_INFO,
+				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d len=%d\n",
+				     capcode,
+				     flex_msg_type_name(mtype),
+				     msg_speed,
+				     (msg_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+				     (msg_polarity < 0) ? "neg" : "pos",
+				     msg_priority,
+				     msg_charset ? "kanji" : "ascii",
+				     is_group,
+				     message_length);
 			}
 		}
 	}
 }
+
+static void myhandler(void)
+{
+	static char buffer[4096 + 256];
+	static int pos = 0;
+	int rc, i, line_start;
+	int space;
+
+	/* Read whatever is available from the FIFO */
+	space = (int)sizeof(buffer) - pos;
+	if (space <= 0) {
+		fprintf(stderr, "Message buffer overflow, discarding.\n");
+		pos = 0;
+		space = (int)sizeof(buffer);
+	}
+
+	rc = read(msg_send_fd, buffer + pos, space);
+	if (rc > 0)
+		pos += rc;
+
+	/* Process all complete lines in the buffer */
+	line_start = 0;
+	while (line_start < pos) {
+		/* Find next line terminator */
+		for (i = line_start; i < pos; i++) {
+			if (buffer[i] == '\r' || buffer[i] == '\n')
+				break;
+		}
+
+		if (i >= pos)
+			break;  /* no complete line yet — keep remainder */
+
+		/* Process this line if non-empty */
+		if (i > line_start)
+			fifo_process_line(buffer + line_start, i - line_start);
+
+		/* Skip past the line terminator(s) */
+		i++;
+		while (i < pos && (buffer[i] == '\r' || buffer[i] == '\n'))
+			i++;
+		line_start = i;
+	}
+
+	/* Shift any remaining partial line to the front of the buffer */
+	if (line_start > 0) {
+		int remaining = pos - line_start;
+		if (remaining > 0)
+			memmove(buffer, buffer + line_start, remaining);
+		pos = remaining;
+	}
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -293,6 +661,14 @@ int main(int argc, char *argv[])
 		goto fail;
 	}
 
+	/* STD-43A option validation */
+	if (collapse > 0 && !network_mode) {
+		fprintf(stderr, "Warning: --collapse is only meaningful in network mode, setting collapse=0.\n");
+		collapse = 0;
+	}
+	if (biw_time_enabled == -1)
+		biw_time_enabled = network_mode;
+
 	/* create pipe for message send */
 	unlink(MSG_SEND);
 	rc = mkfifo(MSG_SEND, 0666);
@@ -317,6 +693,36 @@ int main(int argc, char *argv[])
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;
+		}
+		/* Set STD-43A compliance config on the just-created instance.
+		 * sender_create() appends to the list, so walk to the tail. */
+		{
+			sender_t *s;
+			flex_t *f;
+			for (s = sender_head; s->next; s = s->next)
+				;
+			f = (flex_t *)s;
+			f->network_mode = network_mode;
+			f->collapse = collapse;
+			f->fixed_speed = fixed_speed;
+			f->fixed_mod_type = fixed_mod_type;
+			f->fixed_polarity = fixed_polarity;
+			f->lpf_enabled = lpf_enabled;
+			f->biw_time_enabled = biw_time_enabled;
+			f->ers_cycles_override = ers_cycles_override;
+			f->default_charset = default_charset;
+			f->ssid = ssid;
+			f->nid = nid;
+			f->roaming_active = (ssid != 0 || nid != 0) ? 1 : 0;
+
+			/* Parse POCSAG mixing frame slots if specified */
+			if (pocsag_mix) {
+				rc = flex_scheduler_parse_pocsag_slots(f, pocsag_mix);
+				if (rc < 0) {
+					fprintf(stderr, "Failed to parse --pocsag-mix '%s'.\n", pocsag_mix);
+					goto fail;
+				}
+			}
 		}
 		printf("Base station ready, please tune transmitter to %.4f MHz\n", frequency / 1e6);
 	}

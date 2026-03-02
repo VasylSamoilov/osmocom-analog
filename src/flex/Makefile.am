@@ -6,6 +6,7 @@ bin_PROGRAMS = \
 flex_SOURCES = \
 	flex.c \
 	frame.c \
+	scheduler.c \
 	dsp.c \
 	image.c \
 	main.c

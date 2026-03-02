@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "frame.h"
 
 /* Optional per-message configuration (for mail drop flag support). */
@@ -39,7 +40,7 @@ struct flex_msg_config {
  * A1  = Frame Sync code for 1600 baud, 2-level FSK (32 bits)
  * Ar  = ERS (Emergency Re-Synchronization) frame sync (32 bits)
  *       Shares lower 16 bits with A1; upper 16 bits differ.
- *       Used in the ERS preamble to force pager re-acquisition.
+ *       Used in the ERS burst to force pager re-acquisition.
  * B   = Baud/level indicator (16 bits)
  * C   = Second sync block, follows FIW (40 bits)
  *
@@ -58,6 +59,19 @@ static const uint8_t sync_bs_inv[]    = {0x55, 0x55};
 static const uint8_t sync_bs1[]       = {0xAA, 0xAA, 0xAA, 0xAA};
 static const uint8_t sync_a1[]        = {0x78, 0xF3, 0x59, 0x39};
 static const uint8_t sync_a1_inv[]    = {0x87, 0x0C, 0xA6, 0xC6};
+
+/* A2: 3200 bps 2-FSK sync (Table 3.2-1) */
+static const uint8_t sync_a2[]       = {0xB4, 0x68, 0x2C, 0xAB};
+static const uint8_t sync_a2_inv[]   = {0x4B, 0x97, 0xD3, 0x54};
+
+/* A3: 3200 bps 4-FSK sync (Table 3.2-1) */
+static const uint8_t sync_a3[]       = {0xD4, 0xA8, 0x6C, 0xEB};
+static const uint8_t sync_a3_inv[]   = {0x2B, 0x57, 0x93, 0x14};
+
+/* A4: 6400 bps 4-FSK sync (Table 3.2-1) */
+static const uint8_t sync_a4[]       = {0x94, 0xE8, 0xAC, 0x2B};
+static const uint8_t sync_a4_inv[]   = {0x6B, 0x17, 0x53, 0xD4};
+
 static const uint8_t sync_ar[]        = {0xCB, 0x20, 0x59, 0x39};
 static const uint8_t sync_ar_inv[]    = {0x34, 0xDF, 0xA6, 0xC6};
 static const uint8_t sync_b[]         = {0x55, 0x55};
@@ -575,10 +589,11 @@ int flex_detect_msg_type(const char *message, int length)
 /* ===== Complete Frame Encoding ===== */
 
 /*
- * Encode a complete FLEX frame.
+ * Encode a complete FLEX frame (backward-compatible single-message API).
  *
- * Assembles: ERS preamble + S1 sync + FIW + S2 sync + data block
- * (BIW + address + vector + message + idle fill + interleave).
+ * Assembles: ERS burst + S1 sync + FIW + S2 sync + data block.
+ * Delegates frame encoding to flex_encode_frame_multi() with one-shot
+ * default parameters (cycle=0, frame=0, collapse=0, 1600 baud).
  *
  * Returns bytes written to buffer, or 0 on error.
  */
@@ -586,259 +601,58 @@ size_t flex_encode_frame(uint64_t capcode, int msg_type,
 			 const char *message, uint8_t *buffer,
 			 size_t buffer_size, int *error)
 {
-	uint32_t frame_words[FLEX_WORDS_PER_FRAME] = {0};
+	flex_frame_msg_t fmsg;
+	flex_frame_params_t params;
 	uint8_t *out;
-	uint32_t addr_words[2] = {0};
-	int is_long;
-	uint32_t fwc, i;
+	size_t ers_len, frame_len;
+	int msgs_packed = 0;
 
 	if (!error)
 		return 0;
 	*error = 0;
 
-	/* Resolve AUTO type */
-	if (msg_type == FLEX_FRAME_MSG_TYPE_AUTO)
-		msg_type = flex_detect_msg_type(message,
-			message ? (int)strlen(message) : 0);
-
-	/* Validate message */
-	switch (msg_type) {
-	case FLEX_FRAME_MSG_TYPE_ALPHA:
-		if (!message || !*message || strlen(message) > FLEX_MAX_CHARS_ALPHA) {
-			*error = -FLEX_ERR_INVALID_MESSAGE;
-			return 0;
-		}
-		break;
-	case FLEX_FRAME_MSG_TYPE_NUMERIC:
-		if (!message || !*message || strlen(message) > FLEX_MAX_CHARS_NUMERIC) {
-			*error = -FLEX_ERR_INVALID_MESSAGE;
-			return 0;
-		}
-		if (!is_valid_numeric_message(message)) {
-			*error = -FLEX_ERR_INVALID_MESSAGE;
-			return 0;
-		}
-		break;
-	case FLEX_FRAME_MSG_TYPE_TONE:
-		break;
-	default:
-		*error = -FLEX_ERR_INVALID_MESSAGE;
-		return 0;
-	}
-
-	/* Validate capcode */
-	if (!is_capcode_valid(capcode, &is_long)) {
-		*error = -FLEX_ERR_INVALID_CAPCODE;
-		return 0;
-	}
-
-	/* Validate output buffer */
 	if (!buffer || buffer_size < FLEX_BUFFER_SIZE) {
 		*error = -FLEX_ERR_INVALID_BUFFER;
 		return 0;
 	}
 
 	out = buffer;
-	fwc = 0;
 
-	/* === Preamble: Emergency Re-Synchronization (Spec Section 3.2.1) ===
-	 *
-	 * The ERS preamble forces pagers to re-acquire synchronization.
-	 * Pattern per cycle: BS + Ar + BS_inv + Ar_inv (12 bytes, 96 bits).
-	 *
-	 * Duration requirement depends on the maximum collapse cycle value:
-	 *   m=0: 1.875 sec (pager decodes all frames)
-	 *   m=7: 4 minutes (pager decodes every 128th frame)
-	 *
-	 * Default mode uses collapse=0, so 35 cycles (~2.1 sec at 1600 baud)
-	 * exceeds the minimum 1.875 sec requirement.
-	 */
-	for (i = 0; i < FLEX_ERS_CYCLES; i++) {
-		EMIT_SYNC(out, sync_bs);
-		EMIT_SYNC(out, sync_ar);
-		EMIT_SYNC(out, sync_bs_inv);
-		EMIT_SYNC(out, sync_ar_inv);
+	/* Prepend ERS burst (35 cycles at 1600 baud) */
+	ers_len = flex_generate_ers(out, buffer_size, FLEX_ERS_CYCLES);
+	if (ers_len == 0) {
+		*error = -FLEX_ERR_INVALID_BUFFER;
+		return 0;
 	}
+	out += ers_len;
 
-	/* === S1: Frame synchronization (Spec Section 3.2.1) === */
-	EMIT_SYNC(out, sync_bs1);
-	EMIT_SYNC(out, sync_a1);
-	EMIT_SYNC(out, sync_b);
-	EMIT_SYNC(out, sync_a1_inv);
+	/* Resolve AUTO type */
+	if (msg_type == FLEX_FRAME_MSG_TYPE_AUTO)
+		msg_type = flex_detect_msg_type(message,
+			message ? (int)strlen(message) : 0);
 
-	/* === Frame Information Word (Spec Section 3.6) ===
-	 *
-	 * Default mode: hardcoded cycle=0, frame=0, collapse=0.
-	 *
-	 * Frame/cycle in the FIW = "what time is it" (pager's clock reference).
-	 * Collapse in BIW1 = "how often should I wake up" (battery-saving schedule).
-	 * These two mechanisms are independent.
-	 *
-	 * With collapse=0 (m=0, 2^0=1), the pager decodes ALL frames because
-	 * the wake condition `frame_number mod 2^m == n mod 2^m` simplifies to
-	 * `frame_number mod 1 == n mod 1` → `0 == 0` → always true.
-	 * Frame assignment becomes irrelevant — the pager never skips a frame.
-	 *
-	 * This means frame/cycle values could be advanced to real wall-clock
-	 * time without breaking anything: the pager would still decode every
-	 * frame, just with accurate time references. Collapse=0 is the correct
-	 * default for any scenario that doesn't require battery saving.
-	 *
-	 * For future real-time sync:
-	 *   cycle = (minute % 60) / 4       (0-14)
-	 *   frame = f(second, subsecond)     (0-127)
-	 * See FLEX_STD43A_IMPROVEMENT_PLAN.md Section 1.1.
-	 */
-	EMIT_WORD(out, flex_create_fiw(0, 0, 0, 0, 0));
+	/* Build single-message descriptor */
+	memset(&fmsg, 0, sizeof(fmsg));
+	fmsg.capcode = capcode;
+	fmsg.msg_type = msg_type;
+	fmsg.message = message;
+	fmsg.message_length = message ? (int)strlen(message) : 0;
+	fmsg.speed = 1600;
+	fmsg.polarity = -1.0;
+	fmsg.sequence_num = -1;
+	fmsg.short_msg_idx = -1;
 
-	/* === S2: C block (Spec Section 3.2.2) === */
-	EMIT_SYNC(out, sync_c);
+	/* One-shot default parameters */
+	flex_frame_params_default(&params);
 
-	/* === Data block === */
+	/* Delegate to multi-message encoder (produces S1 + FIW + S2 + data) */
+	frame_len = flex_encode_frame_multi(&fmsg, 1, &params,
+					    out, buffer_size - ers_len,
+					    &msgs_packed, error);
+	if (frame_len == 0)
+		return 0;
 
-	/* BIW1: vector field starts after BIW + address words.
-	 *
-	 * collapse=0 (last parameter) is the default mode.
-	 *
-	 * === Address-to-Frame Assignment (Spec Appendix A, Section 3) ===
-	 *
-	 * Each capcode maps to a frame and phase:
-	 *   Frame = (INT[capcode / 16]) mod 128       (0-127)
-	 *   Phase = (INT[capcode / 4])  mod 4          (0-3)
-	 *
-	 * Small capcode example — capcode 1337:
-	 *   Frame = INT(1337/16) mod 128 = 83 mod 128 = 83
-	 *   Phase = INT(1337/4)  mod 4   = 334 mod 4  = 2 (phase C)
-	 *
-	 * Large capcode example — capcode 1000000:
-	 *   Frame = INT(1000000/16) mod 128 = 62500 mod 128 = 36
-	 *   Phase = INT(1000000/4)  mod 4   = 250000 mod 4  = 0 (phase A)
-	 *
-	 * === Collapse Cycle (Spec Section 3.1.2) ===
-	 *
-	 * The collapse value m (0-7) in BIW1 controls battery saving.
-	 * Pager wakes every 2^m frames. Wake condition:
-	 *   frame_number mod 2^m == assigned_frame mod 2^m
-	 *
-	 * The pager compares the lower (7-m) bits of the frame number.
-	 * Smaller m = more frames decoded = shorter paging delay = more
-	 * battery drain. Larger m = fewer frames = longer delay = less drain.
-	 *
-	 * Each frame = 1.875 sec. Worst-case delay = 2^m * 1.875 sec.
-	 *
-	 * === TX Scheduling ===
-	 *
-	 * The transmitter must place each message in a frame where:
-	 *   tx_frame mod 2^m == assigned_frame mod 2^m
-	 *
-	 * To find the next valid TX frame from the current frame `f`:
-	 *   target = assigned_frame mod 2^m
-	 *   remainder = f mod 2^m
-	 *   if (remainder <= target)
-	 *       next_frame = f + (target - remainder)
-	 *   else
-	 *       next_frame = f + (2^m - remainder + target)
-	 *
-	 * With m=0, 2^m=1, so target=0, remainder=0, next_frame=f.
-	 * Any frame is valid — transmit immediately.
-	 *
-	 * === Worked Examples ===
-	 *
-	 * Capcode 1337 (short addr, assigned frame n=83):
-	 *
-	 * 1) No power saving (m=0, default mode):
-	 *    2^0=1. frame mod 1 == 83 mod 1 → 0==0 (always true).
-	 *    Pager decodes ALL 128 frames. TX: any frame.
-	 *    Worst-case delay: 1.875 sec (1 frame period).
-	 *    ERS needs: 1.875 sec.
-	 *
-	 * 2) Small operator (m=3, collapse cycle=8):
-	 *    2^3=8. frame mod 8 == 83 mod 8 = 3.
-	 *    Pager wakes on: 3,11,19,27,35,43,51,59,67,75,83,91,99,
-	 *    107,115,123 (16 frames/cycle).
-	 *    TX: must place message in frame where frame mod 8 == 3.
-	 *    Worst-case delay: 8 * 1.875 = 15 sec.
-	 *    ERS needs: 15 sec.
-	 *
-	 * 3) Large operator (m=4, standard FLEX collapse):
-	 *    2^4=16. frame mod 16 == 83 mod 16 = 3.
-	 *    Pager wakes on: 3,19,35,51,67,83,99,115 (8 frames/cycle).
-	 *    TX: must place message in frame where frame mod 16 == 3.
-	 *    Worst-case delay: 16 * 1.875 = 30 sec.
-	 *    ERS needs: 30 sec.
-	 *
-	 * 4) Maximum battery saving (m=7, collapse cycle=128):
-	 *    2^7=128. frame mod 128 == 83 mod 128 = 83.
-	 *    Pager wakes on frame 83 ONLY (1 frame/cycle).
-	 *    TX: must place message in frame 83 exactly.
-	 *    Worst-case delay: 128 * 1.875 = 240 sec (4 min).
-	 *    ERS needs: 240 sec (full cycle).
-	 *
-	 * Capcode 1000000 (short addr, assigned frame n=36):
-	 *
-	 * 1) No power saving (m=0): same as above — any frame, 1.875 sec.
-	 *
-	 * 2) Small operator (m=3):
-	 *    frame mod 8 == 36 mod 8 = 4.
-	 *    Pager wakes on: 4,12,20,28,36,44,52,60,68,76,84,92,100,
-	 *    108,116,124 (16 frames/cycle).
-	 *    TX: frame where frame mod 8 == 4.
-	 *    Worst-case delay: 15 sec.
-	 *
-	 * 3) Large operator (m=4):
-	 *    frame mod 16 == 36 mod 16 = 4.
-	 *    Pager wakes on: 4,20,36,52,68,84,100,116 (8 frames/cycle).
-	 *    TX: frame where frame mod 16 == 4.
-	 *    Worst-case delay: 30 sec.
-	 *
-	 * 4) Maximum battery saving (m=7):
-	 *    frame mod 128 == 36. Pager wakes on frame 36 only.
-	 *    TX: frame 36 exactly. Worst-case delay: 240 sec.
-	 *
-	 * With m=0 (default), the wake condition is trivially true for all
-	 * frames, so the pager decodes everything regardless of its capcode.
-	 * TX scheduling is unnecessary — transmit in the current frame.
-	 */
-	frame_words[fwc++] = flex_create_biw1(0, 0, 2 + is_long, 0, 0);
-
-	/* Address word(s) */
-	if (is_long) {
-		encode_long_address(capcode, addr_words);
-		frame_words[fwc++] = addr_words[0];
-		frame_words[fwc++] = addr_words[1];
-	} else {
-		frame_words[fwc++] = encode_short_address((uint32_t)capcode);
-	}
-
-	/* Message encoding (vector + data words) */
-	switch (msg_type) {
-	case FLEX_FRAME_MSG_TYPE_ALPHA:
-		encode_alpha_message(frame_words, message,
-				     3 + is_long, &fwc, is_long, NULL);
-		break;
-	case FLEX_FRAME_MSG_TYPE_NUMERIC:
-		encode_numeric_message(frame_words, message,
-				       3 + is_long, &fwc, is_long, NULL);
-		break;
-	case FLEX_FRAME_MSG_TYPE_TONE:
-		encode_tone_message(frame_words, NULL,
-				    3 + is_long, &fwc, is_long, NULL);
-		break;
-	}
-
-	/* Fill remaining words with alternating idle pattern (Spec Section 3.4.1) */
-	for (; fwc < FLEX_WORDS_PER_FRAME; fwc++) {
-		frame_words[fwc] = (fwc % 2 == 0) ? FLEX_IDLE_WORD_1 : FLEX_IDLE_WORD_2;
-	}
-
-	/* Block interleaving (Spec Section 3.3) */
-	for (i = 0; i < FLEX_BLOCKS_PER_FRAME; i++)
-		flex_interleave_block(i, frame_words);
-
-	/* Write interleaved data to output buffer */
-	EMIT_SYNC(out, frame_words);
-
-	return (size_t)(out - buffer);
+	return ers_len + frame_len;
 }
 
 /* ===== Text Utilities ===== */
@@ -923,4 +737,1400 @@ int flex_scan_message(const char *message_input, int message_input_length,
 	}
 
 	return out;
+}
+
+void flex_frame_params_default(flex_frame_params_t *params)
+{
+	memset(params, 0, sizeof(*params));
+	params->baud_rate = 1600;
+	params->modulation_type = FLEX_MOD_2FSK;
+}
+
+/*
+ * Block Information Word 2 (Spec Section 3.7.2).
+ *
+ * local_id:        Local ID (4 bits, 0-15)
+ * coverage_id:     Coverage zone ID (2 bits, 0-3)
+ * repeat:          Repeat indicator (1 bit, 0-1)
+ * timezone_offset: Timezone offset in half-hours from UTC (-12..+12),
+ *                  stored as (offset + 12) in 6 bits (0-24 range)
+ */
+uint32_t flex_create_biw2(uint32_t local_id, uint32_t coverage_id,
+			  uint32_t repeat, int timezone_offset)
+{
+	uint32_t tz = (uint32_t)((timezone_offset + 12) & 0x3F);
+	uint32_t dw = 0;
+	dw |= (coverage_id & 0x03) <<  8;
+	dw |= (local_id    & 0x0F) << 10;
+	dw |= (repeat      & 0x01) << 14;
+	dw |= (tz          & 0x3F) << 15;
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Block Information Word 3 (Spec Section 3.7.3).
+ *
+ * month: Month of year (4 bits, 1-12)
+ * day:   Day of month (5 bits, 1-31)
+ */
+uint32_t flex_create_biw3(uint32_t month, uint32_t day)
+{
+	uint32_t dw = 0;
+	dw |= (month & 0x0F) <<  8;
+	dw |= (day   & 0x1F) << 12;
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Block Information Word 4 (Spec Section 3.7.4).
+ *
+ * hour:   Hour of day (5 bits, 0-23)
+ * minute: Minute of hour (6 bits, 0-59)
+ */
+uint32_t flex_create_biw4(uint32_t hour, uint32_t minute)
+{
+	uint32_t dw = 0;
+	dw |= (hour   & 0x1F) <<  8;
+	dw |= (minute & 0x3F) << 13;
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Generate a standalone ERS (Emergency Re-Synchronization) burst.
+ *
+ * Used by network mode to stream the ERS burst during FLEX_STATE_NET_ERS
+ * without buffering the entire burst into the frame buffer.
+ *
+ * Each ERS cycle = BS(2) + AR(4) + BS_inv(2) + AR_inv(4) = 12 bytes (96 bits).
+ * Returns bytes written (cycles * 12), or 0 on error.
+ *
+ * Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7
+ */
+size_t flex_generate_ers(uint8_t *buffer, size_t buffer_size, int cycles)
+{
+	uint8_t *out;
+	int i;
+	size_t needed;
+
+	if (!buffer || cycles <= 0)
+		return 0;
+
+	needed = (size_t)cycles * 12;
+	if (buffer_size < needed)
+		return 0;
+
+	out = buffer;
+	for (i = 0; i < cycles; i++) {
+		EMIT_SYNC(out, sync_bs);
+		EMIT_SYNC(out, sync_ar);
+		EMIT_SYNC(out, sync_bs_inv);
+		EMIT_SYNC(out, sync_ar_inv);
+	}
+
+	return needed;
+}
+
+/* Split a long message into fragments that each fit within max_chars_per_fragment.
+ * Returns the number of fragments created. Each fragment is a newly allocated
+ * string (caller must free). If the message fits in one fragment, return 1
+ * with fragments[0] = strdup(message).
+ *
+ * The caller (flex_fragment_queue) handles assigning retrieval numbers,
+ * fragment_index, total_fragments, and f0f1 flags on each flex_msg_t. */
+int flex_fragment_message(const char *message, int msg_type,
+			  int max_chars_per_fragment,
+			  char **fragments, int max_fragments)
+{
+	int len, count, i, chunk;
+
+	if (!message || !fragments || max_fragments <= 0 || max_chars_per_fragment <= 0)
+		return 0;
+
+	len = (int)strlen(message);
+
+	/* Message fits in a single fragment */
+	if (len <= max_chars_per_fragment) {
+		fragments[0] = strdup(message);
+		if (!fragments[0])
+			return 0;
+		return 1;
+	}
+
+	/* Compute number of fragments needed */
+	count = (len + max_chars_per_fragment - 1) / max_chars_per_fragment;
+	if (count > max_fragments)
+		count = max_fragments;
+
+	for (i = 0; i < count; i++) {
+		int offset = i * max_chars_per_fragment;
+		int remaining = len - offset;
+
+		chunk = (remaining < max_chars_per_fragment) ? remaining : max_chars_per_fragment;
+
+		fragments[i] = malloc(chunk + 1);
+		if (!fragments[i]) {
+			/* Cleanup on allocation failure */
+			int j;
+			for (j = 0; j < i; j++)
+				free(fragments[j]);
+			return 0;
+		}
+		memcpy(fragments[i], message + offset, chunk);
+		fragments[i][chunk] = '\0';
+	}
+
+	return count;
+}
+
+/* ===== Group Address Encoding (Spec Section 3.8.2.2) ===== */
+
+/*
+ * Encode a group address word for common or temporary group addresses.
+ *
+ * Group addresses use the same short/long address encoding as individual
+ * addresses, but with the group flag indicated by setting bit 20 (the MSB
+ * of the 21-bit data word) to 1. For temporary group addresses, bit 19
+ * is also set.
+ *
+ * Returns the encoded 32-bit BCH codeword, or 0 on invalid capcode.
+ */
+uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary)
+{
+	uint32_t dw;
+
+	/* Validate capcode range using the same rules as individual addresses */
+	if (!flex_capcode_valid(group_capcode))
+		return 0;
+
+	/*
+	 * Build the 21-bit data word from the capcode.
+	 * Short addresses: single word with offset.
+	 * Long addresses: use only the first word (w1) for the group address word.
+	 */
+	if (is_short_address(group_capcode)) {
+		dw = ((uint32_t)group_capcode + FLEX_SHORT_ADDR_OFFSET)
+			& ((1U << FLEX_BCH_DATA_BITS) - 1);
+	} else if (is_long_address(group_capcode)) {
+		uint64_t result;
+		uint32_t w1;
+
+		if (group_capcode >= FLEX_LONG_SET12_MIN &&
+		    group_capcode <= FLEX_LONG_SET12_MAX) {
+			result = group_capcode - FLEX_LONG_OFFSET_A;
+			w1 = (result % FLEX_SHORT_ADDR_OFFSET) + 1;
+		} else if (group_capcode >= FLEX_LONG_SET34_MIN &&
+			   group_capcode <= FLEX_LONG_SET34_MAX) {
+			result = group_capcode - FLEX_LONG_OFFSET_A;
+			w1 = (result % FLEX_SHORT_ADDR_OFFSET) + 1;
+		} else if (group_capcode >= FLEX_LONG_SET23_MIN &&
+			   group_capcode <= FLEX_LONG_SET23_MAX) {
+			result = group_capcode - FLEX_LONG_OFFSET_B;
+			w1 = (result % FLEX_SHORT_ADDR_OFFSET) + FLEX_LONG_W1_SET23;
+		} else {
+			return 0;
+		}
+		dw = w1 & ((1U << FLEX_BCH_DATA_BITS) - 1);
+	} else {
+		return 0;
+	}
+
+	/* Set bit 20 (group flag) — MSB of the 21-bit data word */
+	dw |= (1U << 20);
+
+	/* Set bit 19 (temporary group flag) if requested */
+	if (is_temporary)
+		dw |= (1U << 19);
+
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/* ===== Temporary Address Assignment (Spec Section 3.8.2.3) ===== */
+
+/*
+ * Encode a temporary address assignment word.
+ *
+ * Maps a permanent capcode to a temporary address. The temporary address
+ * value is encoded as a 21-bit BCH word. Both the permanent capcode and
+ * the temporary address must be valid.
+ *
+ * Returns the encoded 32-bit BCH codeword for the temporary address,
+ * or 0 on invalid input.
+ */
+uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr)
+{
+	uint32_t dw;
+
+	/* Validate permanent capcode */
+	if (!flex_capcode_valid(capcode))
+		return 0;
+
+	/* Validate temporary address — must fit in 21-bit data word */
+	if (temp_addr == 0 || temp_addr > ((1ULL << FLEX_BCH_DATA_BITS) - 1))
+		return 0;
+
+	/* Encode the temporary address value as a 21-bit BCH word */
+	dw = (uint32_t)temp_addr & ((1U << FLEX_BCH_DATA_BITS) - 1);
+
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/* ===== Hex/Binary Vector and Message Encoding (Spec Section 3.9.3) ===== */
+
+/*
+ * Create a hex/binary vector word.
+ *
+ * The hex vector uses the same type code (011) as numeric but with
+ * k-bits = 0110 to indicate hex/binary mode per Section 3.9.3.
+ * This distinguishes it from standard numeric vectors which use
+ * different k-bit values.
+ *
+ * Bit layout (21-bit data word before BCH encoding):
+ *   bits  4-6:  vector type (011 = 0x3)
+ *   bits  7-13: message start word offset
+ *   bits 14-16: message word count (3 bits)
+ *   bits 17-20: k-bits = 0110 (hex/binary indicator)
+ */
+static uint32_t create_hex_vector(uint32_t msg_start, uint32_t msg_words)
+{
+	uint32_t dw = 0;
+	dw |= (FLEX_VECTOR_TYPE_HEX_BINARY & 0x07) <<  4;
+	dw |= (msg_start                   & 0x7F) <<  7;
+	dw |= (msg_words                   & 0x07) << 14;
+	dw |= (0x06)                                << 17; /* k-bits = 0110: hex/binary mode */
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Validate that a character is a valid hexadecimal digit.
+ * Returns 1 for 0-9, A-F, a-f; 0 otherwise.
+ */
+static int is_valid_hex_char(char c)
+{
+	return (c >= '0' && c <= '9') ||
+	       (c >= 'A' && c <= 'F') ||
+	       (c >= 'a' && c <= 'f');
+}
+
+/*
+ * Convert a hex character to its 4-bit nibble value.
+ * Caller must ensure c is a valid hex character.
+ */
+static uint8_t hex_char_to_nibble(char c)
+{
+	if (c >= '0' && c <= '9')
+		return (uint8_t)(c - '0');
+	if (c >= 'A' && c <= 'F')
+		return (uint8_t)(c - 'A' + 10);
+	/* a-f */
+	return (uint8_t)(c - 'a' + 10);
+}
+
+/*
+ * Encode hex/binary message (Spec Section 3.9.3).
+ *
+ * Hex characters are converted to 4-bit nibbles and packed 5 per
+ * 21-bit message word (5 × 4 = 20 bits used, 1 bit unused).
+ *
+ * Packing order within each word:
+ *   bits  0-3:  nibble 0 (first hex char)
+ *   bits  4-7:  nibble 1
+ *   bits  8-11: nibble 2
+ *   bits 12-15: nibble 3
+ *   bits 16-19: nibble 4
+ *   bit  20:    unused (0)
+ *
+ * The function writes the hex vector word followed by encoded message
+ * words to frame_words, updating *fwc_p.
+ *
+ * On invalid input (non-hex characters), sets *error = -FLEX_ERR_INVALID_MESSAGE
+ * and returns without writing any words.
+ */
+static void encode_hex_message(uint32_t *frame_words, const char *msg,
+			       uint32_t msg_start, uint32_t *fwc_p,
+			       int is_long, int *error)
+{
+	uint32_t msg_words[FLEX_MAX_MSG_WORDS_HEX];
+	uint32_t fwc;
+	size_t len, i;
+	int word_idx, nibble_idx;
+
+	/* Validate all characters are hex */
+	len = strlen(msg);
+	for (i = 0; i < len; i++) {
+		if (!is_valid_hex_char(msg[i])) {
+			*error = -FLEX_ERR_INVALID_MESSAGE;
+			return;
+		}
+	}
+
+	/* Limit to maximum hex characters */
+	if (len > FLEX_MAX_CHARS_HEX)
+		len = FLEX_MAX_CHARS_HEX;
+
+	/* Pack nibbles into 21-bit words, 5 nibbles per word */
+	memset(msg_words, 0, sizeof(msg_words));
+	word_idx = 0;
+	nibble_idx = 0;
+
+	for (i = 0; i < len; i++) {
+		uint8_t nibble = hex_char_to_nibble(msg[i]);
+		msg_words[word_idx] |= ((uint32_t)nibble << (nibble_idx * 4));
+		nibble_idx++;
+		if (nibble_idx >= 5) {
+			nibble_idx = 0;
+			word_idx++;
+			if (word_idx >= FLEX_MAX_MSG_WORDS_HEX)
+				break;
+		}
+	}
+
+	/* Account for partial last word */
+	if (nibble_idx > 0)
+		word_idx++;
+
+	/* Write vector word and encoded message words to frame */
+	fwc = *fwc_p;
+	frame_words[fwc++] = create_hex_vector(msg_start + is_long, word_idx);
+	for (i = 0; i < (size_t)word_idx; i++)
+		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
+	*fwc_p = fwc;
+}
+
+/*
+ * Create a short instruction vector word (Spec Section 3.9.6).
+ *
+ * The short instruction vector encodes instruction data directly in the
+ * vector word — no message body words are needed (similar to tone-only).
+ *
+ * Bit layout of the 21-bit data word:
+ *   bits  0-3:  checksum (filled by flex_word_checksum)
+ *   bits  4-6:  vector type = 111 (0x7 = FLEX_VECTOR_TYPE_SHORT_INSTR)
+ *   bits  7-20: instruction data (14 bits, range 0-16383)
+ */
+static uint32_t create_short_instruction_vector(uint32_t instruction_data)
+{
+	uint32_t dw = 0;
+	dw |= (FLEX_VECTOR_TYPE_SHORT_INSTR & 0x07) << 4;
+	dw |= (instruction_data & 0x3FFF) << 7;
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Encode a short instruction message (Spec Section 3.9.6).
+ *
+ * Parses the message string as a decimal integer instruction value,
+ * creates the short instruction vector word, and writes it to frame_words.
+ * No message body words are produced — all data is in the vector word.
+ *
+ * On invalid input (non-numeric string, value out of 14-bit range, or
+ * NULL/empty message), sets *error = -FLEX_ERR_INVALID_MESSAGE and
+ * returns without writing any words.
+ */
+static void encode_instruction_message(uint32_t *frame_words, const char *msg,
+				       uint32_t msg_start, uint32_t *fwc_p,
+				       int is_long, int *error)
+{
+	unsigned long val;
+	char *endptr;
+
+	(void)msg_start;
+	(void)is_long;
+
+	if (!msg || !*msg) {
+		*error = -FLEX_ERR_INVALID_MESSAGE;
+		return;
+	}
+
+	/* Parse as decimal integer */
+	val = strtoul(msg, &endptr, 10);
+
+	/* Reject if not a clean integer or has trailing garbage */
+	if (*endptr != '\0') {
+		*error = -FLEX_ERR_INVALID_MESSAGE;
+		return;
+	}
+
+	/* 14-bit range: 0-16383 */
+	if (val > 0x3FFF) {
+		*error = -FLEX_ERR_INVALID_MESSAGE;
+		return;
+	}
+
+	frame_words[(*fwc_p)++] = create_short_instruction_vector((uint32_t)val);
+}
+
+/* ===== Multi-Message Frame Encoding ===== */
+
+/* Forward declaration — defined after flex_encode_frame_multi(). */
+static void encode_kanji_message(uint32_t *frame_words, const char *msg,
+				 uint32_t msg_start, uint32_t *fwc_p,
+				 int is_long, int *error);
+
+/*
+ * Estimate the number of message body words for a given message type and content.
+ * Used in the first pass to determine if a message fits in the remaining frame capacity.
+ *
+ * Returns the number of 21-bit message body words (excluding the vector word).
+ * Returns -1 on error (invalid message content for the given type).
+ */
+static int estimate_msg_words(const flex_frame_msg_t *msg)
+{
+	size_t len;
+
+	switch (msg->msg_type) {
+	case FLEX_FRAME_MSG_TYPE_TONE:
+		return 0; /* vector word only */
+
+	case FLEX_FRAME_MSG_TYPE_INSTRUCTION:
+		return 0; /* vector word only */
+
+	case FLEX_FRAME_MSG_TYPE_SHORT:
+		return 0; /* vector word only */
+
+	case FLEX_FRAME_MSG_TYPE_ALPHA:
+		if (!msg->message || !msg->message[0])
+			return -1;
+		len = (msg->message_length > 0)
+			? (size_t)msg->message_length
+			: strlen(msg->message);
+
+		if (msg->charset == 1) {
+			/* KANJI: 16-bit chars (2 bytes each), 1 char per word.
+			 * Total = 1 (header) + num_chars. */
+			size_t num_chars = len / 2;
+			size_t max_chars = FLEX_MAX_MSG_WORDS_ALPHA - 1;
+			if (num_chars == 0)
+				return -1;
+			if (num_chars > max_chars)
+				num_chars = max_chars;
+			return 1 + (int)num_chars;
+		}
+
+		if (len > FLEX_MAX_CHARS_ALPHA)
+			return -1;
+		/*
+		 * Alpha packing: word 0 = header (frag flags + checksum).
+		 * Word 1 holds 2 chars (shift starts at 7, so bits 7 and 14).
+		 * Subsequent words hold 3 chars each (shifts 0, 7, 14).
+		 * Total message words = 1 (header) + ceil((len + 2) / 3).
+		 * The +2 accounts for the 2 ETX pad chars that always fill
+		 * the remainder of the last word.
+		 */
+		return 1 + (int)((len + 2 + 2) / 3);
+
+	case FLEX_FRAME_MSG_TYPE_NUMERIC:
+		if (!msg->message || !msg->message[0])
+			return -1;
+		len = (msg->message_length > 0)
+			? (size_t)msg->message_length
+			: strlen(msg->message);
+		if (len > FLEX_MAX_CHARS_NUMERIC)
+			return -1;
+		/*
+		 * Numeric packing: 4-bit nibbles, 5 per 21-bit word.
+		 * First 2 bits reserved for checksum, so first word holds
+		 * floor((21-2)/4) = 4 nibbles effectively, but the encoder
+		 * packs continuously. Total = ceil((len * 4 + 2) / 21).
+		 * Simplified: ceil((len + 1) / 5) works for small counts,
+		 * but the encoder caps at FLEX_MAX_MSG_WORDS_NUMERIC (8).
+		 */
+		{
+			int bits_needed = (int)len * 4 + 2;
+			int words = (bits_needed + 20) / 21;
+			if (words > FLEX_MAX_MSG_WORDS_NUMERIC)
+				words = FLEX_MAX_MSG_WORDS_NUMERIC;
+			if (words < 1)
+				words = 1;
+			return words;
+		}
+
+	case FLEX_FRAME_MSG_TYPE_HEX:
+		if (!msg->message || !msg->message[0])
+			return -1;
+		len = (msg->message_length > 0)
+			? (size_t)msg->message_length
+			: strlen(msg->message);
+		if (len > FLEX_MAX_CHARS_HEX)
+			return -1;
+		/* Hex packing: 5 nibbles per 21-bit word */
+		return (int)((len + 4) / 5);
+
+	default:
+		return -1;
+	}
+}
+
+/*
+ * Encode a FLEX frame with multiple messages (ARIB STD-43A compliant).
+ *
+ * Frame layout (88-word data area):
+ *   Word 0:                          BIW1
+ *   Word 1:                          BIW2 (if biw_time or local_id/coverage_id set)
+ *   Word 2:                          BIW3 (if biw_time set)
+ *   Word 3:                          BIW4 (if biw_time set)
+ *   Words e_biw+1..s_vfield-1:       Address words (priority first, then normal)
+ *   Words s_vfield..msg_start-1:     Vector words
+ *   Words msg_start..87:             Message data words + idle fill
+ *
+ * Algorithm:
+ *   1. Write sync section (S1 + FIW + S2) to buffer
+ *   2. Compute BIW count based on params
+ *   3. First pass: compute per-message word counts, greedily pack messages
+ *   4. Write BIW words, address words, vector + message words
+ *   5. Fill remaining with idle pattern, interleave, write to buffer
+ *
+ * Returns bytes written to buffer, or 0 on error.
+ * Sets *msgs_packed to the number of messages that fit.
+ * Sets *error to a negative FLEX_ERR_* code on failure.
+ *
+ * Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.4, 6.5, 10.3, 16.2, 16.3
+ */
+size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
+			       const flex_frame_params_t *params,
+			       uint8_t *buffer, size_t buffer_size,
+			       int *msgs_packed, int *error)
+{
+	uint32_t frame_words[FLEX_WORDS_PER_FRAME] = {0};
+	uint8_t *out;
+	uint32_t fwc, i;
+	int err_local = 0;
+
+	/* Per-message bookkeeping for the packing pass */
+	struct msg_info {
+		int	addr_words;	/* 1 (short) or 2 (long) */
+		int	vector_words;	/* always 1 */
+		int	msg_words;	/* body words (0 for tone/instruction/short) */
+		int	is_long;	/* 1 if long capcode */
+		int	packed;		/* 1 if included in this frame */
+	} info[256]; /* max 256 messages per call — generous upper bound */
+
+	/* Ordered indices: priority messages first, then normal */
+	int order[256];
+	int n_prio = 0, n_norm = 0;
+	int prio_addr_words = 0;
+	int total_addr = 0, total_vector = 0, total_msg = 0;
+	int biw_count, e_biw;
+	int capacity;
+	int packed_count = 0;
+
+	/* ---- Validate inputs ---- */
+
+	if (!error)
+		error = &err_local;
+	*error = 0;
+
+	if (msgs_packed)
+		*msgs_packed = 0;
+
+	if (!buffer || buffer_size < FLEX_BUFFER_SIZE) {
+		*error = -FLEX_ERR_INVALID_BUFFER;
+		return 0;
+	}
+
+	if (!params) {
+		*error = -FLEX_ERR_INVALID_BUFFER;
+		return 0;
+	}
+
+	/* Clamp msg_count to our static array limit */
+	if (msg_count > 256)
+		msg_count = 256;
+
+	out = buffer;
+
+	/* ---- S1: Frame synchronization (Spec Section 3.2.1) ---- */
+
+	EMIT_SYNC(out, sync_bs1);
+
+	/* Select sync pattern based on baud rate */
+	switch (params->baud_rate) {
+	case 3200:
+		if (params->modulation_type == FLEX_MOD_4FSK) {
+			EMIT_SYNC(out, sync_a3);
+			EMIT_SYNC(out, sync_b);
+			EMIT_SYNC(out, sync_a3_inv);
+		} else {
+			EMIT_SYNC(out, sync_a2);
+			EMIT_SYNC(out, sync_b);
+			EMIT_SYNC(out, sync_a2_inv);
+		}
+		break;
+	case 6400:
+		EMIT_SYNC(out, sync_a4);
+		EMIT_SYNC(out, sync_b);
+		EMIT_SYNC(out, sync_a4_inv);
+		break;
+	default: /* 1600 */
+		EMIT_SYNC(out, sync_a1);
+		EMIT_SYNC(out, sync_b);
+		EMIT_SYNC(out, sync_a1_inv);
+		break;
+	}
+
+	/* ---- FIW: Frame Information Word ---- */
+
+	EMIT_WORD(out, flex_create_fiw(params->cycle, params->frame,
+				       params->roaming, 0, 0));
+
+	/* ---- S2: C block (Spec Section 3.2.2) ----
+	 *
+	 * S2 fills a 25ms time slot. At higher baud rates, repeat the C pattern:
+	 *   1600 bps:  5 bytes (40 bits)
+	 *   3200 bps: 10 bytes (80 bits)  — 2× the C pattern
+	 *   6400 bps: 20 bytes (160 bits) — 4× the C pattern
+	 */
+	EMIT_SYNC(out, sync_c);
+	if (params->baud_rate >= 3200)
+		EMIT_SYNC(out, sync_c);
+	if (params->baud_rate >= 6400) {
+		EMIT_SYNC(out, sync_c);
+		EMIT_SYNC(out, sync_c);
+	}
+
+	/* ---- Compute BIW count ---- */
+
+	biw_count = 1; /* BIW1 always present */
+	e_biw = 0;
+
+	if (params->local_id || params->coverage_id || params->timezone_offset) {
+		biw_count = 2; /* BIW1 + BIW2 */
+		e_biw = 1;
+	}
+
+	if (params->biw_time) {
+		biw_count = 4; /* BIW1 + BIW2 + BIW3 + BIW4 */
+		e_biw = 3;
+	}
+
+	/* ---- First pass: compute per-message word counts ---- */
+
+	if (msg_count > 0 && msgs) {
+		for (i = 0; i < (uint32_t)msg_count; i++) {
+			int is_long_addr = 0;
+			int mw;
+
+			/* Validate capcode */
+			if (msgs[i].is_group) {
+				if (!flex_capcode_valid(msgs[i].capcode)) {
+					info[i].packed = 0;
+					info[i].addr_words = 0;
+					info[i].vector_words = 0;
+					info[i].msg_words = 0;
+					info[i].is_long = 0;
+					continue;
+				}
+				info[i].addr_words = 1; /* group = 1 address word */
+				info[i].is_long = 0;
+			} else {
+				if (!is_capcode_valid(msgs[i].capcode, &is_long_addr)) {
+					info[i].packed = 0;
+					info[i].addr_words = 0;
+					info[i].vector_words = 0;
+					info[i].msg_words = 0;
+					info[i].is_long = 0;
+					continue;
+				}
+				info[i].addr_words = is_long_addr ? 2 : 1;
+				info[i].is_long = is_long_addr;
+			}
+
+			info[i].vector_words = 1;
+
+			/* Estimate message body words */
+			mw = estimate_msg_words(&msgs[i]);
+			if (mw < 0) {
+				/* Invalid message — skip */
+				info[i].packed = 0;
+				info[i].msg_words = 0;
+				continue;
+			}
+			info[i].msg_words = mw;
+			info[i].packed = 0;
+		}
+	}
+
+	/* ---- Build ordering: priority messages first, then normal ---- */
+
+	for (i = 0; i < (uint32_t)msg_count; i++) {
+		if (info[i].addr_words == 0 && info[i].vector_words == 0)
+			continue; /* skip invalid */
+		if (msgs[i].priority)
+			order[n_prio++] = (int)i;
+	}
+	for (i = 0; i < (uint32_t)msg_count; i++) {
+		if (info[i].addr_words == 0 && info[i].vector_words == 0)
+			continue; /* skip invalid */
+		if (!msgs[i].priority)
+			order[n_prio + n_norm++] = (int)i;
+	}
+
+	/* ---- Greedy packing ---- */
+
+	capacity = FLEX_WORDS_PER_FRAME - biw_count; /* words available after BIWs */
+
+	for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
+		int idx = order[i];
+		int needed = info[idx].addr_words + info[idx].vector_words
+			   + info[idx].msg_words;
+
+		if (needed > capacity)
+			break; /* no more room */
+
+		info[idx].packed = 1;
+		total_addr += info[idx].addr_words;
+		total_vector += info[idx].vector_words;
+		total_msg += info[idx].msg_words;
+		capacity -= needed;
+		packed_count++;
+
+		if ((int)i < n_prio)
+			prio_addr_words += info[idx].addr_words;
+	}
+
+	/* ---- Write BIW1 ---- */
+
+	fwc = 0;
+	{
+		uint32_t s_vfield = (uint32_t)(biw_count + total_addr);
+		frame_words[fwc++] = flex_create_biw1(
+			(uint32_t)prio_addr_words,
+			(uint32_t)e_biw,
+			s_vfield,
+			0, /* carry */
+			(uint32_t)params->collapse);
+	}
+
+	/* ---- Write BIW2/3/4 if enabled ---- */
+
+	if (biw_count >= 2) {
+		frame_words[fwc++] = flex_create_biw2(
+			params->local_id,
+			params->coverage_id,
+			0, /* repeat */
+			params->timezone_offset);
+	}
+
+	if (biw_count >= 4) {
+		/* Get current system time for BIW3/BIW4 */
+		time_t now = time(NULL);
+		struct tm tm_now;
+		gmtime_r(&now, &tm_now);
+
+		frame_words[fwc++] = flex_create_biw3(
+			(uint32_t)(tm_now.tm_mon + 1),
+			(uint32_t)tm_now.tm_mday);
+		frame_words[fwc++] = flex_create_biw4(
+			(uint32_t)tm_now.tm_hour,
+			(uint32_t)tm_now.tm_min);
+	}
+
+	/* ---- Write address words (priority first, then normal) ---- */
+
+	for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
+		int idx = order[i];
+		if (!info[idx].packed)
+			continue;
+
+		if (msgs[idx].is_group) {
+			frame_words[fwc++] = flex_encode_group_address(
+				msgs[idx].capcode, 0);
+		} else if (info[idx].is_long) {
+			uint32_t aw[2];
+			encode_long_address(msgs[idx].capcode, aw);
+			frame_words[fwc++] = aw[0];
+			frame_words[fwc++] = aw[1];
+		} else {
+			frame_words[fwc++] = encode_short_address(
+				(uint32_t)msgs[idx].capcode);
+		}
+	}
+
+	/* ---- Write vector + message words for each packed message ---- */
+
+	/* msg_start tracks where the next message's body words begin.
+	 * It starts after BIW + address + vector words. */
+	{
+		uint32_t msg_start_word = (uint32_t)(biw_count + total_addr
+						     + total_vector);
+
+		for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
+			int idx = order[i];
+			int enc_err = 0;
+			if (!info[idx].packed)
+				continue;
+
+			switch (msgs[idx].msg_type) {
+			case FLEX_FRAME_MSG_TYPE_ALPHA:
+				if (msgs[idx].charset == 1) {
+					encode_kanji_message(frame_words,
+						msgs[idx].message,
+						msg_start_word,
+						&fwc,
+						info[idx].is_long,
+						&enc_err);
+				} else {
+					encode_alpha_message(frame_words,
+						msgs[idx].message,
+						msg_start_word,
+						&fwc,
+						info[idx].is_long,
+						NULL);
+				}
+				break;
+
+			case FLEX_FRAME_MSG_TYPE_NUMERIC:
+				encode_numeric_message(frame_words,
+					msgs[idx].message,
+					msg_start_word,
+					&fwc,
+					info[idx].is_long,
+					NULL);
+				break;
+
+			case FLEX_FRAME_MSG_TYPE_TONE:
+				encode_tone_message(frame_words,
+					NULL,
+					msg_start_word,
+					&fwc,
+					info[idx].is_long,
+					NULL);
+				break;
+
+			case FLEX_FRAME_MSG_TYPE_HEX:
+				encode_hex_message(frame_words,
+					msgs[idx].message,
+					msg_start_word,
+					&fwc,
+					info[idx].is_long,
+					&enc_err);
+				break;
+
+			case FLEX_FRAME_MSG_TYPE_INSTRUCTION:
+				encode_instruction_message(frame_words,
+					msgs[idx].message,
+					msg_start_word,
+					&fwc,
+					info[idx].is_long,
+					&enc_err);
+				break;
+
+			case FLEX_FRAME_MSG_TYPE_SHORT:
+				/*
+				 * Short message: tone/short-message vector (type 010)
+				 * with message index encoded. Produces 1 vector word,
+				 * 0 body words.
+				 *
+				 * Validate index range 0-127.
+				 */
+				{
+					int sidx = msgs[idx].short_msg_idx;
+					if (sidx < 0 || sidx > 127) {
+						enc_err = -FLEX_ERR_INVALID_MESSAGE;
+					} else {
+						uint32_t dw = 0;
+						dw |= (FLEX_VECTOR_TYPE_TONE & 0x07) << 4;
+						/* t1t0 = 00 for short message sub-type */
+						dw |= ((uint32_t)sidx & 0x7F) << 9;
+						dw = flex_word_checksum(dw);
+						frame_words[fwc++] = flex_encode_word(
+							reverse_bits32(dw));
+					}
+				}
+				break;
+
+			default:
+				enc_err = -FLEX_ERR_INVALID_MESSAGE;
+				break;
+			}
+
+			/* Advance msg_start_word past this message's body words */
+			msg_start_word += (uint32_t)info[idx].msg_words;
+
+			if (enc_err && !*error)
+				*error = enc_err;
+		}
+	}
+
+	/* ---- Fill remaining words with alternating idle pattern ---- */
+
+	for (; fwc < FLEX_WORDS_PER_FRAME; fwc++)
+		frame_words[fwc] = (fwc % 2 == 0) ? FLEX_IDLE_WORD_1
+						   : FLEX_IDLE_WORD_2;
+
+	/* ---- Block interleaving (Spec Section 3.3) ---- */
+
+	for (i = 0; i < FLEX_BLOCKS_PER_FRAME; i++)
+		flex_interleave_block(i, frame_words);
+
+	/* ---- Write interleaved data to output buffer ---- */
+
+	memcpy(out, frame_words, FLEX_WORDS_PER_FRAME * 4);
+	out += FLEX_WORDS_PER_FRAME * 4;
+
+	if (msgs_packed)
+		*msgs_packed = packed_count;
+
+	return (size_t)(out - buffer);
+}
+
+
+/* ===== Multi-Phase Frame Encoding (Spec Section 3.3) ===== */
+
+/*
+ * Encode a multi-phase FLEX frame for 3200/6400 bps operation.
+ *
+ * At higher baud rates, the frame carries multiple independent phases:
+ *   3200 bps (2-FSK or 4-FSK): 2 phases (A, B)
+ *   6400 bps (4-FSK only):     4 phases (A, B, C, D)
+ *
+ * Each phase is an independent set of 88 data words (BIW + addresses +
+ * vectors + message data + idle fill), already block-interleaved by the
+ * caller (typically via flex_encode_frame_multi per phase).
+ *
+ * The output format is:
+ *   S1:  BS1(4) + Ax(4) + B(2) + Ax_inv(4) = 14 bytes
+ *   FIW: 1 codeword = 4 bytes
+ *   S2:  C block repeated per baud rate (5/10/20 bytes)
+ *   Data: phase words interleaved — for N phases, output order is:
+ *         word[0] of phase A, word[0] of phase B, ...,
+ *         word[1] of phase A, word[1] of phase B, ...
+ *         (88 * N words total)
+ *
+ * The sync pattern (A1/A2/A3/A4) is selected based on baud_rate and
+ * modulation_type in params.
+ *
+ * Returns bytes written to buffer, or 0 on error (with *error set).
+ */
+size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
+				const flex_frame_params_t *params,
+				uint8_t *buffer, size_t buffer_size,
+				int *error)
+{
+	uint8_t *out;
+	int err_local = 0;
+	int i, p;
+
+	if (!error)
+		error = &err_local;
+	*error = 0;
+
+	if (!phases || !params || !buffer) {
+		*error = -FLEX_ERR_INVALID_BUFFER;
+		return 0;
+	}
+
+	/* Validate phase count vs baud rate */
+	if (num_phases < 1 || num_phases > FLEX_MAX_PHASES) {
+		*error = -FLEX_ERR_INVALID_BUFFER;
+		return 0;
+	}
+
+	/* Validate baud/modulation combination */
+	if (params->baud_rate == 1600 && params->modulation_type == FLEX_MOD_4FSK) {
+		*error = -FLEX_ERR_INVALID_MESSAGE;
+		return 0;
+	}
+	if (params->baud_rate == 6400 && params->modulation_type == FLEX_MOD_2FSK) {
+		*error = -FLEX_ERR_INVALID_MESSAGE;
+		return 0;
+	}
+
+	/* Compute output size:
+	 *   S1: 14 bytes (BS1 + Ax + B + Ax_inv)
+	 *   FIW: 4 bytes
+	 *   S2: 5 * (baud_rate / 1600) bytes
+	 *   Data: 88 * num_phases * 4 bytes
+	 */
+	{
+		int s2_bytes = 5 * (params->baud_rate / 1600);
+		size_t needed = 14 + 4 + (size_t)s2_bytes
+			      + (size_t)(FLEX_WORDS_PER_FRAME * num_phases * 4);
+		if (buffer_size < needed) {
+			*error = -FLEX_ERR_INVALID_BUFFER;
+			return 0;
+		}
+	}
+
+	out = buffer;
+
+	/* ---- S1: Frame synchronization ---- */
+
+	EMIT_SYNC(out, sync_bs1);
+
+	switch (params->baud_rate) {
+	case 3200:
+		if (params->modulation_type == FLEX_MOD_4FSK) {
+			EMIT_SYNC(out, sync_a3);
+			EMIT_SYNC(out, sync_b);
+			EMIT_SYNC(out, sync_a3_inv);
+		} else {
+			EMIT_SYNC(out, sync_a2);
+			EMIT_SYNC(out, sync_b);
+			EMIT_SYNC(out, sync_a2_inv);
+		}
+		break;
+	case 6400:
+		EMIT_SYNC(out, sync_a4);
+		EMIT_SYNC(out, sync_b);
+		EMIT_SYNC(out, sync_a4_inv);
+		break;
+	default: /* 1600 */
+		EMIT_SYNC(out, sync_a1);
+		EMIT_SYNC(out, sync_b);
+		EMIT_SYNC(out, sync_a1_inv);
+		break;
+	}
+
+	/* ---- FIW: Frame Information Word ---- */
+
+	EMIT_WORD(out, flex_create_fiw(params->cycle, params->frame,
+				       params->roaming, 0, 0));
+
+	/* ---- S2: C block (25 ms at data rate) ---- */
+
+	EMIT_SYNC(out, sync_c);
+	if (params->baud_rate >= 3200)
+		EMIT_SYNC(out, sync_c);
+	if (params->baud_rate >= 6400) {
+		EMIT_SYNC(out, sync_c);
+		EMIT_SYNC(out, sync_c);
+	}
+
+	/* ---- Data: interleaved phase words ---- */
+
+	/*
+	 * Per Section 3.3, at multi-phase speeds the data words from
+	 * each phase are interleaved word-by-word:
+	 *   A[0], B[0], A[1], B[1], ... (2 phases)
+	 *   A[0], B[0], C[0], D[0], A[1], B[1], C[1], D[1], ... (4 phases)
+	 *
+	 * Each phase has already been independently block-interleaved
+	 * by the caller.
+	 */
+	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+		for (p = 0; p < num_phases; p++) {
+			uint32_t w = phases[p].words[i];
+			out[0] = (w >> 24) & 0xFF;
+			out[1] = (w >> 16) & 0xFF;
+			out[2] = (w >>  8) & 0xFF;
+			out[3] =  w        & 0xFF;
+			out += 4;
+		}
+	}
+
+	return (size_t)(out - buffer);
+}
+
+
+/* ===== KANJI Character Encoding (ARIB STD-43A Section 3.10.2.3) ===== */
+
+/*
+ * Encode a KANJI (16-bit character) message.
+ *
+ * KANJI mode packs one 16-bit character per 21-bit word (5 padding bits),
+ * compared to 7-bit ASCII mode which packs 3 characters per word.
+ *
+ * Word layout:
+ *   Word 0: fragment flags (f0f1) + K-bit checksum (same as alpha)
+ *   Word 1+: bits [0..15] = 16-bit character, bits [16..20] = 0 (padding)
+ *
+ * The vector word uses the same alpha vector type (FLEX_VECTOR_TYPE_ALPHA).
+ * The receiver distinguishes KANJI from ASCII via the BIW charset field.
+ *
+ * Parameters follow the same convention as encode_alpha_message():
+ *   frame_words  — 88-word frame data array
+ *   msg          — UTF-16 character data as raw bytes (2 bytes per char)
+ *   msg_start    — word index where message body starts
+ *   fwc_p        — pointer to frame word counter (updated on return)
+ *   is_long      — 1 if long capcode (affects vector word encoding)
+ *   error        — set to negative error code on failure
+ */
+static void encode_kanji_message(uint32_t *frame_words, const char *msg,
+				 uint32_t msg_start, uint32_t *fwc_p,
+				 int is_long, int *error)
+{
+	uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
+	uint32_t word_idx, fwc;
+	size_t byte_len, num_chars, max_chars;
+	uint32_t k_bit;
+	uint32_t i;
+
+	if (!msg || !fwc_p) {
+		if (error)
+			*error = -FLEX_ERR_INVALID_MESSAGE;
+		return;
+	}
+
+	/*
+	 * Message is raw bytes representing 16-bit characters.
+	 * Each character = 2 bytes (big-endian).
+	 */
+	byte_len = strlen(msg);
+	num_chars = byte_len / 2;
+
+	if (num_chars == 0) {
+		if (error)
+			*error = -FLEX_ERR_INVALID_MESSAGE;
+		return;
+	}
+
+	/* Max chars: frame capacity minus header word, 1 char per word */
+	max_chars = FLEX_MAX_MSG_WORDS_ALPHA - 1;
+	if (num_chars > max_chars)
+		num_chars = max_chars;
+
+	/* Word 0: fragment flags f0f1=11 (initial fragment) */
+	msg_word[0] = FLEX_ALPHA_FRAG_INITIAL;
+
+	/* Pack 16-bit characters, 1 per 21-bit word */
+	word_idx = 1;
+	for (i = 0; i < (uint32_t)num_chars; i++) {
+		uint16_t ch = ((uint8_t)msg[i * 2] << 8)
+			    | (uint8_t)msg[i * 2 + 1];
+		msg_word[word_idx++] = (uint32_t)ch; /* bits 0-15, bits 16-20 = 0 */
+	}
+
+	/* K-bit: 10-bit checksum over all message words (same as alpha) */
+	k_bit = 0;
+	for (i = 0; i < word_idx; i++) {
+		k_bit += (msg_word[i])       & 0xFF;
+		k_bit += (msg_word[i] >> 8)  & 0xFF;
+		k_bit += (msg_word[i] >> 16) & 0x1F;
+	}
+	msg_word[0] |= (~k_bit) & 0x3FF;
+
+	/* Write vector word and encoded message words to frame */
+	fwc = *fwc_p;
+	frame_words[fwc++] = create_alpha_vector(msg_start + is_long, word_idx);
+	for (i = 0; i < word_idx; i++)
+		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_word[i]));
+	*fwc_p = fwc;
+}
+
+
+/* ===== POCSAG Idle Batch Generation ===== */
+
+/*
+ * POCSAG protocol constants for idle batch generation.
+ * Per ITU-R M.584 / POCSAG specification.
+ */
+#define POCSAG_PREAMBLE_WORD	0xAAAAAAAAU
+#define POCSAG_PREAMBLE_WORDS	18	/* 576 bits of alternating 1/0 */
+#define POCSAG_SYNC_WORD	0x7CD215D8U
+#define POCSAG_IDLE_WORD	0x7A89C197U
+#define POCSAG_BATCH_CODEWORDS	16	/* 8 address/data pairs = 16 codewords */
+
+/*
+ * Generate a POCSAG idle batch for POCSAG/FLEX mixed-mode operation.
+ *
+ * Output format:
+ *   Preamble: 18 words of 0xAAAAAAAA (576 bits alternating 1/0)
+ *   Batch:    1 sync codeword (0x7CD215D8)
+ *           + 16 idle codewords (0x7A89C197)
+ *
+ * Total: (18 + 1 + 16) = 35 words = 140 bytes.
+ *
+ * This is used in network mode when a frame slot is designated for
+ * POCSAG mixing. The DSP streams this at 1200 baud 2-FSK.
+ *
+ * Returns bytes written to buffer, or 0 on error.
+ */
+size_t flex_generate_pocsag_idle(uint8_t *buffer, size_t buffer_size)
+{
+	uint8_t *out;
+	size_t needed;
+	int i;
+
+	/* Total: 18 preamble + 1 sync + 16 idle = 35 words × 4 bytes */
+	needed = (POCSAG_PREAMBLE_WORDS + 1 + POCSAG_BATCH_CODEWORDS) * 4;
+
+	if (!buffer || buffer_size < needed)
+		return 0;
+
+	out = buffer;
+
+	/* Preamble: 18 words of alternating bits */
+	for (i = 0; i < POCSAG_PREAMBLE_WORDS; i++) {
+		EMIT_WORD(out, POCSAG_PREAMBLE_WORD);
+	}
+
+	/* Sync codeword */
+	EMIT_WORD(out, POCSAG_SYNC_WORD);
+
+	/* 16 idle codewords (8 address/data pairs, all idle) */
+	for (i = 0; i < POCSAG_BATCH_CODEWORDS; i++) {
+		EMIT_WORD(out, POCSAG_IDLE_WORD);
+	}
+
+	return (size_t)(out - buffer);
+}
+
+
+/* ===== Message Numbering (ARIB STD-43A Section 8.4) ===== */
+
+/*
+ * Encode message sequence number into a vector word extension.
+ *
+ * Per Section 8.4, the Message Numbering service assigns a 6-bit
+ * message number (N, range 0-63) to each message for duplicate
+ * detection and ordering at the pager. The retrieval flag R is
+ * normally 1 (first transmission) and 0 on retransmission.
+ *
+ * The message number is encoded in the vector word's upper data bits:
+ *   Bits 14-19: N (6-bit message number, 0-63)
+ *   Bit 20:     R (retrieval flag, 1 = first, 0 = retransmit)
+ *
+ * This function creates a "numbered" variant of the alpha vector
+ * (type 101 with numbering extension). The msg_start and msg_words
+ * fields occupy the same positions as the standard alpha vector.
+ *
+ * Parameters:
+ *   msg_start    — word index where message body starts (7 bits)
+ *   msg_words    — number of message body words (7 bits)
+ *   sequence_num — message number 0-63 (wraps via caller)
+ *
+ * Returns: BCH-encoded 32-bit vector codeword.
+ */
+static uint32_t create_numbered_alpha_vector(uint32_t msg_start,
+					     uint32_t msg_words,
+					     int sequence_num)
+{
+	uint32_t dw = 0;
+
+	/* Vector type: alpha (101) */
+	dw |= (FLEX_VECTOR_TYPE_ALPHA & 0x07) << 4;
+	/* Message start word offset */
+	dw |= (msg_start & 0x7F) << 7;
+	/* Message word count */
+	dw |= (msg_words & 0x7F) << 14;
+
+	/*
+	 * When sequence_num >= 0, the message number is encoded in the
+	 * first message word's header (fragment flags area), not in the
+	 * vector word itself. The vector type remains alpha (101).
+	 *
+	 * The actual N value is carried in the message header word:
+	 *   Bits 0-5:  N (message number, 0-63)
+	 *   Bit 6:     R (retrieval flag, 1 = first transmission)
+	 *
+	 * This function returns the standard alpha vector; the caller
+	 * is responsible for encoding N into the message header word.
+	 */
+	(void)sequence_num; /* N is encoded in message header, not vector */
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Encode message number into the first message word (header).
+ *
+ * Per Section 8.4, when message numbering is active:
+ *   Bits 0-5 of the header word carry N (message number, 0-63)
+ *   Bit 6 carries R (retrieval flag: 1 = first, 0 = retransmit)
+ *
+ * The fragment flags (f0f1) and checksum (K) occupy their normal
+ * positions in the remaining bits.
+ *
+ * Parameters:
+ *   header_word  — pointer to the first message word (modified in place)
+ *   sequence_num — message number 0-63
+ *
+ * The sequence counter wraps at 63 (maximum value per spec).
+ */
+static void encode_message_number(uint32_t *header_word, int sequence_num)
+{
+	if (!header_word || sequence_num < 0)
+		return;
+
+	/* Clamp to 6-bit range (0-63) */
+	uint32_t n = (uint32_t)(sequence_num % 64);
+
+	/* R = 1 (first transmission) */
+	uint32_t r = 1;
+
+	/* Encode N in bits 0-5, R in bit 6 of the header word.
+	 * Clear existing bits in that range first. */
+	*header_word &= ~0x7FU;       /* clear bits 0-6 */
+	*header_word |= (n & 0x3F);   /* N: bits 0-5 */
+	*header_word |= (r << 6);     /* R: bit 6 */
+}
+
+
+/* ===== Source Indication (ARIB STD-43A Section 8.5) ===== */
+
+/*
+ * Encode source indication (callback number / originator ID) into
+ * the message header area.
+ *
+ * Per Section 8.5, the Source Indication service transmits a short
+ * identifier for the calling party. When source_id is provided
+ * (non-NULL, non-empty), it is prepended to the message content
+ * as a SOH-delimited field in the alpha message body:
+ *
+ *   <SOH> source_id <STX> message_content
+ *
+ * SOH (0x01) marks the start of the source indication field.
+ * STX (0x02) marks the transition to the actual message content.
+ *
+ * When source_id is NULL or empty, no source indication is added
+ * and the message is encoded normally.
+ *
+ * Parameters:
+ *   dest        — output buffer for the combined message
+ *   dest_size   — size of output buffer
+ *   source_id   — source identifier string (NULL = omit)
+ *   message     — original message content
+ *
+ * Returns: length of the combined message written to dest,
+ *          or 0 if source_id is NULL/empty (message unchanged).
+ */
+static int encode_source_indication(char *dest, int dest_size,
+				    const char *source_id,
+				    const char *message)
+{
+	int pos = 0;
+	int src_len, msg_len;
+
+	if (!dest || dest_size < 4)
+		return 0;
+
+	if (!source_id || source_id[0] == '\0')
+		return 0;
+
+	src_len = (int)strlen(source_id);
+	msg_len = message ? (int)strlen(message) : 0;
+
+	/* Need: SOH + source_id + STX + message + NUL */
+	if (1 + src_len + 1 + msg_len + 1 > dest_size)
+		return 0;
+
+	/* SOH: start of source indication */
+	dest[pos++] = 0x01;
+
+	/* Source identifier */
+	memcpy(dest + pos, source_id, src_len);
+	pos += src_len;
+
+	/* STX: start of message text */
+	dest[pos++] = 0x02;
+
+	/* Original message content */
+	if (msg_len > 0) {
+		memcpy(dest + pos, message, msg_len);
+		pos += msg_len;
+	}
+
+	dest[pos] = '\0';
+	return pos;
 }

@@ -609,11 +609,11 @@ int sdr_status_snapshot(double now)
 		tx->valid = 1;
 
 		/* Log TX status */
-		LOGP(DSDR, LOGL_NOTICE, "TX IQ LEVEL: peak I=%.4f Q=%.4f | avg I=%.4f Q=%.4f | rms=%.4f | active_ch=%d/%d | amplitude=%.4f\n",
+		LOGP(DSDR, LOGL_DEBUG, "TX IQ LEVEL: peak I=%.4f Q=%.4f | avg I=%.4f Q=%.4f | rms=%.4f | active_ch=%d/%d | amplitude=%.4f\n",
 		     tx->peak_i, tx->peak_q, tx->avg_i, tx->avg_q, tx->rms,
 		     tx->active_channels, tx->total_channels, tx->amplitude);
 		for (i = 0; i < tx->total_channels && i < SDR_STATUS_MAX_CHANNELS; i++) {
-			LOGP(DSDR, LOGL_NOTICE, "TX CH%d: power_on=%s duty=%.1f%% freq=%.6f MHz\n",
+			LOGP(DSDR, LOGL_DEBUG, "TX CH%d: power_on=%s duty=%.1f%% freq=%.6f MHz\n",
 			     i, tx->chan[i].power_on ? "YES" : "NO",
 			     tx->chan[i].duty_cycle * 100.0,
 			     tx->chan[i].frequency / 1e6);

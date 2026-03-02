@@ -24,9 +24,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
+#include "../libfilter/iir_filter.h"
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
@@ -52,10 +54,74 @@ static void dsp_init_ramp(flex_t *flex)
 	}
 }
 
+/* 4-FSK deviation levels (normalized to fsk_deviation = 1.0).
+ * ARIB STD-43A Section 2: +4800, +1600, -1600, -4800 Hz.
+ * With FM deviation = 4800 Hz, these map to +1.0, +1/3, -1/3, -1.0.
+ * Symbol mapping: 00→level 0 (-1.0), 01→level 1 (-1/3),
+ *                 10→level 2 (+1/3), 11→level 3 (+1.0) */
+static const double fsk4_levels[4] = { -1.0, -1.0/3.0, 1.0/3.0, 1.0 };
+
+/* Pre-compute 4-FSK ramp tables for all 16 level transitions.
+ * Each ramp[from][to][phase] is a cosine-shaped transition. */
+static void dsp_init_fsk4_ramps(flex_t *flex)
+{
+	int from, to, i;
+	double lf, lt, mid, amp;
+
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "Generating 4-FSK ramp tables.\n");
+	for (from = 0; from < 4; from++) {
+		lf = fsk4_levels[from] * flex->fsk_deviation * flex->fsk_polarity;
+		for (to = 0; to < 4; to++) {
+			lt = fsk4_levels[to] * flex->fsk_deviation * flex->fsk_polarity;
+			mid = (lf + lt) / 2.0;
+			amp = (lf - lt) / 2.0;
+			for (i = 0; i < 256; i++) {
+				double c;
+				if (i < 64)
+					c = 1.0;
+				else if (i >= 192)
+					c = -1.0;
+				else
+					c = cos((double)(i - 64) / 128.0 * M_PI);
+				flex->fsk4_ramps[from][to][i] = mid + amp * c;
+			}
+		}
+	}
+	flex->fsk4_tx_last_level = 0;
+}
+
+/* Switch baud rate for the next frame.
+ * Updates fsk_bitduration and fsk_bitstep for the selected speed.
+ * Valid speeds: 1600, 3200 (2-FSK), 6400 (4-FSK, handled separately). */
+void dsp_set_speed(flex_t *flex, int baud_rate, int modulation_type)
+{
+	int symbol_rate = baud_rate;
+	if (modulation_type == FLEX_MOD_4FSK)
+		symbol_rate = baud_rate / 2;
+	flex->fsk_bitduration = (double)flex->sender.samplerate / (double)symbol_rate;
+	flex->fsk_bitstep = 1.0 / flex->fsk_bitduration;
+	flex->current_frame_speed = baud_rate;
+	flex->current_frame_mod_type = modulation_type;
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "DSP speed set to %d baud (symbol rate %d, %.4f samples/symbol).\n",
+		  baud_rate, symbol_rate, flex->fsk_bitduration);
+}
+
 /* Init transceiver instance. */
-int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polarity)
+void dsp_set_polarity(flex_t *flex, double polarity)
+{
+	if (flex->fsk_polarity == polarity)
+		return;
+	flex->fsk_polarity = polarity;
+	dsp_init_ramp(flex);
+	dsp_init_fsk4_ramps(flex);
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "DSP polarity set to %s.\n",
+		  polarity < 0 ? "neg" : "pos");
+}
+
+int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polarity, int enable_lpf)
 {
 	int rc;
+	double max_bitduration;
 
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Init DSP for transceiver.\n");
 
@@ -63,11 +129,9 @@ int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polar
 	 * NOTE: baudrate equals modulation, because we have a raised cosine ramp of beta = 0.5 */
 	sender_set_fm(&flex->sender, deviation, 1600, deviation, MAX_DISPLAY);
 
-	flex->fsk_bitduration = (double)samplerate / 1600.0;
-	flex->fsk_bitstep = 1.0 / flex->fsk_bitduration;
-	LOGP_CHAN(DDSP, LOGL_DEBUG, "Use %.4f samples for one bit duration @ %d.\n", flex->fsk_bitduration, flex->sender.samplerate);
-
-	flex->fsk_tx_buffer_size = flex->fsk_bitduration * 32.0 + 10; /* 32 bit, add some extra to prevent short buffer due to rounding */
+	/* Size buffer for slowest speed (1600 baud = most samples per word) */
+	max_bitduration = (double)samplerate / 1600.0;
+	flex->fsk_tx_buffer_size = (int)(max_bitduration * 32.0) + 10;
 	flex->fsk_tx_buffer = calloc(flex->fsk_tx_buffer_size, sizeof(sample_t));
 	if (!flex->fsk_tx_buffer) {
 		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory!\n");
@@ -78,7 +142,20 @@ int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polar
 	/* create deviation and ramp */
 	flex->fsk_deviation = 1.0; /* equals what we set at sender_set_fm() */
 	flex->fsk_polarity = polarity;
+	flex->lpf_enabled = enable_lpf;
 	dsp_init_ramp(flex);
+	dsp_init_fsk4_ramps(flex);
+
+	/* Initialize baseband LPF: 3.2 kHz cutoff, 2 iterations (4th-order).
+	 * ARIB STD-43A Chapter 2: occupied bandwidth must not exceed 16 kHz.
+	 * The IIR biquad is efficient and already used throughout the codebase. */
+	if (flex->lpf_enabled) {
+		iir_lowpass_init(&flex->lpf, 3200.0, samplerate, 2);
+		LOGP_CHAN(DDSP, LOGL_DEBUG, "Baseband LPF enabled: 3.2 kHz cutoff, 2 iterations.\n");
+	}
+
+	/* Default to 1600 baud */
+	dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
 	return 0;
 
@@ -103,7 +180,7 @@ void dsp_cleanup_sender(flex_t *flex)
  * input: 32 data bits
  * output: samples
  * return number of samples */
-static int fsk_block_encode(flex_t *flex, uint32_t word)
+static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 {
 	/* alloc samples, add 1 in case there is a rest */
 	sample_t *spl;
@@ -117,8 +194,7 @@ static int fsk_block_encode(flex_t *flex, uint32_t word)
 	lastbit = flex->fsk_tx_lastbit;
 	bitstep = flex->fsk_bitstep * 256.0;
 
-	/* add 32 bits */
-	for (i = 0; i < 32; i++) {
+	for (i = 0; i < nbits; i++) {
 		if (lastbit) {
 			if ((word & 0x80000000)) {
 				/* stay up */
@@ -166,6 +242,53 @@ static int fsk_block_encode(flex_t *flex, uint32_t word)
 	return count;
 }
 
+/* 4-FSK encoder for 6400 bps mode.
+ * Encodes 2 bits per symbol at 3200 baud (16 symbols per 32-bit word).
+ * Uses pre-computed cosine ramp tables for smooth transitions. */
+static int fsk4_block_encode(flex_t *flex, uint32_t word, int nsymbols)
+{
+	sample_t *spl;
+	double phase, bitstep;
+	int i, count;
+	uint8_t last_level, sym;
+
+	spl = flex->fsk_tx_buffer;
+	phase = flex->fsk_tx_phase;
+	last_level = flex->fsk4_tx_last_level;
+	/* 4-FSK: dsp_set_speed() now sets fsk_bitstep for the actual symbol
+	 * rate (1600 baud for A3, 3200 baud for A4), so use it directly. */
+	bitstep = flex->fsk_bitstep * 256.0;
+
+	for (i = 0; i < nsymbols; i++) {
+		sym = (word >> 30) & 0x03;
+		word <<= 2;
+
+		if (sym == last_level) {
+			/* Stay at current level */
+			double lev = fsk4_levels[sym] * flex->fsk_deviation * flex->fsk_polarity;
+			do {
+				*spl++ = lev;
+				phase += bitstep;
+			} while (phase < 256.0);
+			phase -= 256.0;
+		} else {
+			/* Ramp from last_level to sym */
+			do {
+				*spl++ = flex->fsk4_ramps[last_level][sym][(uint8_t)phase];
+				phase += bitstep;
+			} while (phase < 256.0);
+			phase -= 256.0;
+			last_level = sym;
+		}
+	}
+
+	count = ((uintptr_t)spl - (uintptr_t)flex->fsk_tx_buffer) / sizeof(*spl);
+	flex->fsk_tx_phase = phase;
+	flex->fsk4_tx_last_level = last_level;
+
+	return count;
+}
+
 /* Provide stream of audio toward radio unit */
 void sender_send(sender_t *sender, sample_t *samples, uint8_t *power, int length)
 {
@@ -175,6 +298,7 @@ again:
 	/* get word */
 	if (!flex->fsk_tx_buffer_length) {
 		uint32_t word;
+		int read_bytes;
 
 		/* If no frame data buffered, ask state machine for next frame */
 		if (flex->frame_buffer_pos >= flex->frame_buffer_length) {
@@ -184,35 +308,111 @@ again:
 				memset(power, 0, length);
 				return;
 			}
-		}
 
-		/* Read next 32-bit word from frame buffer (big-endian).
-		 * Handle partial last word: FLEX_BUFFER_SIZE (795) is not
-		 * divisible by 4, so the last chunk may be 1-3 bytes. */
-		{
-			int remaining = flex->frame_buffer_length - flex->frame_buffer_pos;
-			if (remaining >= 4) {
-				word = ((uint32_t)flex->frame_buffer[flex->frame_buffer_pos] << 24)
-				     | ((uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 1] << 16)
-				     | ((uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 2] << 8)
-				     |  (uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 3];
-				flex->frame_buffer_pos += 4;
-			} else {
-				/* Partial word: pad with zeros */
-				word = 0;
-				if (remaining >= 1)
-					word |= (uint32_t)flex->frame_buffer[flex->frame_buffer_pos] << 24;
-				if (remaining >= 2)
-					word |= (uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 1] << 16;
-				if (remaining >= 3)
-					word |= (uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 2] << 8;
-				flex->frame_buffer_pos = flex->frame_buffer_length;
+			/* Reset per-frame debug counters */
+			flex->dbg_frame_symbols = 0;
+			flex->dbg_frame_samples = 0;
+
+			/* Hex dump of entire frame buffer for debugging */
+			{
+				int di;
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "TX frame buffer: %d bytes, speed_switch_offset=%d target=%d/%s\n",
+					  flex->frame_buffer_length,
+					  flex->frame_speed_switch_offset,
+					  flex->frame_target_speed,
+					  (flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
+				for (di = 0; di < flex->frame_buffer_length; di += 16) {
+					char hex[80];
+					int hi = 0, dj;
+					for (dj = di; dj < di + 16 && dj < flex->frame_buffer_length; dj++)
+						hi += sprintf(hex + hi, "%02x ", flex->frame_buffer[dj]);
+					LOGP_CHAN(DDSP, LOGL_INFO, "  [%04d] %s\n", di, hex);
+				}
 			}
 		}
 
-		/* encode */
-		flex->fsk_tx_buffer_length = fsk_block_encode(flex, word);
+		/* Speed transition: per ARIB STD-43A Section 3.2, S1+FIW
+		 * are always at 1600/2FSK.  Switch to the frame's block speed
+		 * BEFORE reading the first word of the C block / data portion.
+		 * frame_speed_switch_offset points to the first byte of S2 (C block). */
+		if (flex->frame_speed_switch_offset > 0 &&
+		    flex->frame_buffer_pos >= flex->frame_speed_switch_offset) {
+			LOGP_CHAN(DDSP, LOGL_INFO,
+				  "TX speed switch at pos %d (offset %d): %d/%s phase=%.2f lastbit=%d symbols_so_far=%d\n",
+				  flex->frame_buffer_pos,
+				  flex->frame_speed_switch_offset,
+				  flex->frame_target_speed,
+				  (flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+				  flex->fsk_tx_phase, flex->fsk_tx_lastbit,
+				  flex->dbg_frame_symbols);
+			dsp_set_speed(flex, flex->frame_target_speed,
+				      flex->frame_target_mod_type);
+			/* Clear offset so we only switch once per frame */
+			flex->frame_speed_switch_offset = 0;
+		}
+
+		/* Determine how many bytes to read.  Normally 4 (one 32-bit
+		 * word), but may be fewer at end-of-buffer or at the speed
+		 * switch boundary.  When the switch offset falls inside the
+		 * next 4-byte chunk, read only up to the offset so the
+		 * remaining bytes get encoded at the new speed. */
+		{
+			int remaining = flex->frame_buffer_length - flex->frame_buffer_pos;
+			read_bytes = (remaining >= 4) ? 4 : remaining;
+
+			if (flex->frame_speed_switch_offset > 0 &&
+			    flex->frame_buffer_pos < flex->frame_speed_switch_offset) {
+				int bytes_before_switch = flex->frame_speed_switch_offset
+							- flex->frame_buffer_pos;
+				if (bytes_before_switch < read_bytes)
+					read_bytes = bytes_before_switch;
+			}
+		}
+
+		/* Read next word from frame buffer (big-endian, MSB-justified).
+		 * Partial reads (1-3 bytes) are zero-padded in the low bits. */
+		word = 0;
+		if (read_bytes >= 1)
+			word |= (uint32_t)flex->frame_buffer[flex->frame_buffer_pos] << 24;
+		if (read_bytes >= 2)
+			word |= (uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 1] << 16;
+		if (read_bytes >= 3)
+			word |= (uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 2] << 8;
+		if (read_bytes >= 4)
+			word |= (uint32_t)flex->frame_buffer[flex->frame_buffer_pos + 3];
+		flex->frame_buffer_pos += read_bytes;
+
+		LOGP_CHAN(DDSP, LOGL_INFO,
+			  "TX word pos=%d bytes=%d word=0x%08x speed=%d/%s\n",
+			  flex->frame_buffer_pos - read_bytes, read_bytes, word,
+			  flex->current_frame_speed,
+			  (flex->current_frame_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
+
+		/* Encode — dispatch based on modulation type.
+		 * Pass exact bit/symbol count so partial words (< 4 bytes)
+		 * produce only the correct number of symbols. */
+		if (flex->current_frame_mod_type == FLEX_MOD_4FSK)
+			flex->fsk_tx_buffer_length = fsk4_block_encode(flex, word, read_bytes * 8 / 2);
+		else
+			flex->fsk_tx_buffer_length = fsk_block_encode(flex, word, read_bytes * 8);
+
 		flex->fsk_tx_buffer_pos = 0;
+		flex->dbg_frame_symbols += (flex->current_frame_mod_type == FLEX_MOD_4FSK)
+					   ? (read_bytes * 8 / 2) : (read_bytes * 8);
+		flex->dbg_frame_samples += flex->fsk_tx_buffer_length;
+
+		/* Log at speed switch boundary and frame end */
+		if (flex->frame_buffer_pos == flex->frame_buffer_length) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
+				  "TX frame end: total %d symbols, %d samples, phase=%.2f lastbit=%d\n",
+				  flex->dbg_frame_symbols, flex->dbg_frame_samples,
+				  flex->fsk_tx_phase, flex->fsk_tx_lastbit);
+		}
+
+		/* Apply baseband LPF after modulation (ARIB STD-43A Chapter 2) */
+		if (flex->lpf_enabled && flex->fsk_tx_buffer_length > 0)
+			iir_process(&flex->lpf, flex->fsk_tx_buffer, flex->fsk_tx_buffer_length);
 	}
 
 	/* send encoded word until end of source or destination buffer is reached */
@@ -231,8 +431,510 @@ again:
 		goto again;
 }
 
-/* Process received audio stream from radio unit (no-op, TX only) */
+/* ===== FLEX Receiver ===== */
+
+/* RX state machine states */
+enum flex_rx_state {
+	RX_HUNT_SYNC = 0,	/* hunting for A1 sync pattern */
+	RX_SKIP_S1_TAIL,	/* skipping B(16) + A1_inv(32) after A1 detected */
+	RX_READ_FIW,		/* reading 32-bit FIW codeword */
+	RX_SKIP_S2,		/* skipping C block (40 bits) */
+	RX_READ_FRAME,		/* reading 88 × 32-bit data words */
+};
+
+/* A1 sync pattern as 32-bit value (MSB first): 0x78F35939 */
+#define FLEX_SYNC_A1		0x78F35939U
+#define FLEX_SYNC_A1_INV	0x870CA6C6U
+
+/* A3 sync pattern (4-FSK at 1600 baud): 0x4F975939 */
+#define FLEX_SYNC_A3		0x4F975939U
+#define FLEX_SYNC_A3_INV	0xB068A6C6U
+
+/* RX detected mode */
+enum flex_rx_mode {
+	RX_MODE_A1 = 0,
+	RX_MODE_A3 = 1,
+};
+
+/* S1 tail after A1: B(16 bits) + A1_inv(32 bits) = 48 bits */
+#define RX_S1_TAIL_BITS		48
+/* S2: C block = 40 bits */
+#define RX_S2_BITS		40
+/* FIW: 1 codeword = 32 bits */
+#define RX_FIW_BITS		32
+
+/* BCH(31,21) syndrome-based decoder.
+ * Returns corrected 21-bit data word, or -1 if uncorrectable (>2 errors). */
+static int32_t flex_bch_decode(uint32_t codeword)
+{
+	uint32_t data21, ecc10, syndrome;
+	uint32_t gen = FLEX_BCH_POLY; /* 0x769 */
+	int i, parity;
+
+	/* Check overall parity (bit 0) */
+	parity = 0;
+	{
+		uint32_t tmp = codeword;
+		while (tmp) {
+			parity ^= (tmp & 1);
+			tmp >>= 1;
+		}
+	}
+
+	/* Extract data (bits 31-11) and received ECC (bits 10-1) */
+	data21 = (codeword >> 11) & 0x1FFFFF;
+	ecc10 = (codeword >> 1) & 0x3FF;
+
+	/* Compute syndrome: divide data by generator, XOR remainder with received ECC */
+	{
+		uint32_t dividend = data21;
+		for (i = 20; i >= 10; i--) {
+			if ((dividend >> i) & 1)
+				dividend ^= gen << (i - 10);
+		}
+		syndrome = (dividend & 0x3FF) ^ ecc10;
+	}
+
+	if (syndrome == 0 && parity == 0)
+		return (int32_t)data21; /* no errors */
+
+	if (syndrome == 0 && parity == 1)
+		return (int32_t)data21; /* parity bit error only, data correct */
+
+	/* Try single-bit error correction in data field */
+	for (i = 0; i < 21; i++) {
+		uint32_t test = data21 ^ (1U << (20 - i));
+		uint32_t div = test;
+		int j;
+		for (j = 20; j >= 10; j--) {
+			if ((div >> j) & 1)
+				div ^= gen << (j - 10);
+		}
+		if ((div & 0x3FF) == ecc10)
+			return (int32_t)test;
+	}
+
+	/* Try single-bit error in ECC field */
+	for (i = 0; i < 10; i++) {
+		uint32_t test_ecc = ecc10 ^ (1U << (9 - i));
+		uint32_t div = data21;
+		int j;
+		for (j = 20; j >= 10; j--) {
+			if ((div >> j) & 1)
+				div ^= gen << (j - 10);
+		}
+		if ((div & 0x3FF) == test_ecc)
+			return (int32_t)data21; /* error was in ECC, data is fine */
+	}
+
+	/* Try double-bit error correction (brute force over data bits) */
+	{
+		int a, b;
+		for (a = 0; a < 21; a++) {
+			for (b = a + 1; b < 21; b++) {
+				uint32_t test = data21 ^ (1U << (20 - a)) ^ (1U << (20 - b));
+				uint32_t div = test;
+				int j;
+				for (j = 20; j >= 10; j--) {
+					if ((div >> j) & 1)
+						div ^= gen << (j - 10);
+				}
+				if ((div & 0x3FF) == ecc10)
+					return (int32_t)test;
+			}
+		}
+	}
+
+	/* Uncorrectable */
+	return -1;
+}
+
+/* De-interleave one block of 8 × 32-bit words.
+ * Reverses the column-wise interleaving done by flex_interleave_block().
+ *
+ * The TX interleaver maps:
+ *   dst_byte[i] bit (7-w) = src_word[w] bit (31-i)
+ *   for i=0..31, w=0..7
+ *
+ * So de-interleave is:
+ *   word[w] bit (31-i) = interleaved_byte[i] bit (7-w) */
+static void flex_deinterleave_block(uint32_t *words)
+{
+	uint8_t src[FLEX_CODEWORD_BITS]; /* 32 bytes of interleaved data */
+	uint32_t out[FLEX_WORDS_PER_BLOCK];
+	int i, w;
+
+	/* The interleaved data is stored as raw bytes over the word array */
+	memcpy(src, words, sizeof(src));
+	memset(out, 0, sizeof(out));
+
+	for (i = 0; i < (int)FLEX_CODEWORD_BITS; i++) {
+		for (w = 0; w < (int)FLEX_WORDS_PER_BLOCK; w++) {
+			if (src[i] & (1 << (7 - w)))
+				out[w] |= (1U << (31 - i));
+		}
+	}
+
+	memcpy(words, out, sizeof(out));
+}
+
+/* Decode a received FIW codeword to extract cycle and frame numbers.
+ * Returns 0 on success, -1 on decode failure. */
+static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
+{
+	int32_t data;
+
+	data = flex_bch_decode(fiw_raw);
+	if (data < 0) {
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: FIW BCH decode failed (uncorrectable).\n");
+		return -1;
+	}
+
+	/* FIW bit layout (21 data bits, MSB first):
+	 * bits 20-17: cycle (4 bits, 0-14)
+	 * bits 16-10: frame (7 bits, 0-127)
+	 * bits 9-2:   reserved/flags
+	 * bits 1-0:   n (roaming), r (repeat) */
+	flex->rx.fiw_cycle = (data >> 17) & 0xF;
+	flex->rx.fiw_frame = (data >> 10) & 0x7F;
+
+	LOGP_CHAN(DDSP, LOGL_INFO, "RX: FIW decoded — cycle=%u frame=%u.\n",
+		  flex->rx.fiw_cycle, flex->rx.fiw_frame);
+
+	return 0;
+}
+
+/* Process a complete received frame (88 words).
+ * De-interleave, BCH decode, extract addresses/vectors/messages. */
+static void flex_rx_process_frame(flex_t *flex)
+{
+	uint32_t *words = flex->rx.frame_words;
+	int32_t decoded[FLEX_WORDS_PER_FRAME];
+	int i, biw1_data, e_biw, s_vfield;
+	int addr_start, vec_start;
+
+	LOGP_CHAN(DDSP, LOGL_INFO, "RX: Processing frame C%u/F%u (%d words).\n",
+		  flex->rx.fiw_cycle, flex->rx.fiw_frame, flex->rx.word_count);
+
+	/* De-interleave each block of 8 words */
+	{
+		int b;
+		for (b = 0; b < FLEX_BLOCKS_PER_FRAME; b++)
+			flex_deinterleave_block(words + b * FLEX_WORDS_PER_BLOCK);
+	}
+
+	/* BCH decode all 88 words */
+	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+		decoded[i] = flex_bch_decode(words[i]);
+		if (decoded[i] < 0) {
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: Word %d BCH uncorrectable (0x%08X).\n",
+				  i, words[i]);
+		}
+	}
+
+	/* Decode BIW1 (word 0) */
+	if (decoded[0] < 0) {
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: BIW1 uncorrectable, skipping frame.\n");
+		return;
+	}
+
+	biw1_data = decoded[0];
+	/* BIW1 layout (21 bits):
+	 * bits 20-17: priority address count (prio)
+	 * bits 16-13: end of BIW field (e_biw)
+	 * bits 12-6:  start of vector field (s_vfield)
+	 * bits 5-3:   carry
+	 * bits 2-0:   collapse */
+	e_biw = (biw1_data >> 13) & 0xF;
+	s_vfield = (biw1_data >> 6) & 0x7F;
+
+	addr_start = e_biw + 1;
+	vec_start = s_vfield;
+
+	if (vec_start <= addr_start || vec_start >= FLEX_WORDS_PER_FRAME) {
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
+			  "RX: Invalid BIW1 offsets (e_biw=%d, s_vfield=%d).\n",
+			  e_biw, s_vfield);
+		return;
+	}
+
+	LOGP_CHAN(DDSP, LOGL_DEBUG,
+		  "RX: BIW1: e_biw=%d s_vfield=%d, addresses at %d-%d, vectors at %d+.\n",
+		  e_biw, s_vfield, addr_start, vec_start - 1, vec_start);
+
+	/* Walk address/vector pairs and extract messages */
+	{
+		int addr_idx = addr_start;
+		int vec_idx = vec_start;
+
+		while (addr_idx < vec_start && vec_idx < FLEX_WORDS_PER_FRAME) {
+			uint32_t addr_word, vec_word;
+			uint64_t capcode;
+			int vec_type, msg_word_start, msg_word_count;
+			int is_long = 0;
+
+			if (decoded[addr_idx] < 0) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Address word %d uncorrectable.\n", addr_idx);
+				addr_idx++;
+				vec_idx++;
+				continue;
+			}
+			if (decoded[vec_idx] < 0) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Vector word %d uncorrectable.\n", vec_idx);
+				addr_idx++;
+				vec_idx++;
+				continue;
+			}
+
+			addr_word = (uint32_t)decoded[addr_idx];
+			vec_word = (uint32_t)decoded[vec_idx];
+
+			/* Decode capcode from address word */
+			if (addr_word < FLEX_SHORT_ADDR_OFFSET) {
+				/* Could be a long address — check next word */
+				if (addr_idx + 1 < vec_start && decoded[addr_idx + 1] >= 0) {
+					is_long = 1;
+					/* Long address decode (simplified) */
+					capcode = ((uint64_t)(addr_word) << 21) |
+						  (uint64_t)(uint32_t)decoded[addr_idx + 1];
+					addr_idx += 2;
+				} else {
+					capcode = addr_word;
+					addr_idx++;
+				}
+			} else {
+				/* Short address: subtract offset */
+				capcode = addr_word - FLEX_SHORT_ADDR_OFFSET;
+				addr_idx++;
+			}
+
+			/* Decode vector word */
+			vec_type = (vec_word >> 4) & 0x7; /* bits 6-4: type */
+
+			/* Extract message start and word count from vector */
+			msg_word_start = (vec_word >> 7) & 0x7F; /* bits 13-7 */
+			msg_word_count = vec_word & 0xF;          /* bits 3-0 (approx) */
+
+			LOGP_CHAN(DDSP, LOGL_INFO,
+				  "RX: Message — capcode=%" PRIu64 " type=%d start=%d words=%d%s.\n",
+				  capcode, vec_type, msg_word_start, msg_word_count,
+				  is_long ? " (long)" : "");
+
+			/* Decode message content based on vector type */
+			if (vec_type == 0x5) {
+				/* Alpha message: 3 chars per 21-bit word */
+				char text[256];
+				int ti = 0, w;
+
+				for (w = msg_word_start;
+				     w < msg_word_start + msg_word_count && w < FLEX_WORDS_PER_FRAME;
+				     w++) {
+					if (decoded[w] < 0)
+						continue;
+					uint32_t d = (uint32_t)decoded[w];
+					/* 3 × 7-bit chars packed into 21 bits */
+					if (ti < (int)sizeof(text) - 1)
+						text[ti++] = (d >> 14) & 0x7F;
+					if (ti < (int)sizeof(text) - 1)
+						text[ti++] = (d >> 7) & 0x7F;
+					if (ti < (int)sizeof(text) - 1)
+						text[ti++] = d & 0x7F;
+				}
+				text[ti] = '\0';
+
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Alpha message from %" PRIu64 ": \"%s\"\n",
+					  capcode, text);
+			} else if (vec_type == 0x3) {
+				/* Numeric message */
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Numeric message from %" PRIu64 " (%d words).\n",
+					  capcode, msg_word_count);
+			} else if (vec_type == 0x2) {
+				/* Tone-only */
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Tone-only alert for %" PRIu64 ".\n",
+					  capcode);
+			} else {
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Unknown vector type %d from %" PRIu64 ".\n",
+					  vec_type, capcode);
+			}
+
+			vec_idx++;
+		}
+	}
+}
+
+/* Feed one demodulated bit into the RX state machine. */
+static void flex_rx_bit(flex_t *flex, uint8_t bit)
+{
+	flex->rx.shift_reg = (flex->rx.shift_reg << 1) | (bit & 1);
+
+	switch (flex->rx.rx_state) {
+	case RX_HUNT_SYNC:
+		/* Look for A1 sync pattern (32 bits) */
+		if (flex->rx.shift_reg == FLEX_SYNC_A1) {
+			LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: A1 sync detected.\n");
+			flex->rx.rx_mode = RX_MODE_A1;
+			flex->rx.rx_state = RX_SKIP_S1_TAIL;
+			flex->rx.bit_count = 0;
+		} else if (flex->rx.shift_reg == FLEX_SYNC_A1_INV) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
+				  "RX: Inverted A1 sync detected — wrong polarity?\n");
+		} else if (flex->rx.shift_reg == FLEX_SYNC_A3) {
+			LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: A3 sync detected (4-FSK 1600 baud).\n");
+			flex->rx.rx_mode = RX_MODE_A3;
+			flex->rx.rx_state = RX_SKIP_S1_TAIL;
+			flex->rx.bit_count = 0;
+		} else if (flex->rx.shift_reg == FLEX_SYNC_A3_INV) {
+			LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: Inverted A3 sync detected (4-FSK 1600 baud).\n");
+			flex->rx.rx_mode = RX_MODE_A3;
+			flex->rx.rx_state = RX_SKIP_S1_TAIL;
+			flex->rx.bit_count = 0;
+		}
+		break;
+
+	case RX_SKIP_S1_TAIL:
+		/* Skip B(16) + A1_inv(32) = 48 bits */
+		if (++flex->rx.bit_count >= RX_S1_TAIL_BITS) {
+			flex->rx.rx_state = RX_READ_FIW;
+			flex->rx.bit_count = 0;
+			flex->rx.shift_reg = 0;
+		}
+		break;
+
+	case RX_READ_FIW:
+		/* Accumulate 32 bits for FIW */
+		if (++flex->rx.bit_count >= RX_FIW_BITS) {
+			if (flex_rx_decode_fiw(flex, flex->rx.shift_reg) < 0) {
+				/* FIW decode failed — go back to hunting */
+				flex->rx.rx_state = RX_HUNT_SYNC;
+				break;
+			}
+			flex->rx.rx_state = RX_SKIP_S2;
+			flex->rx.bit_count = 0;
+		}
+		break;
+
+	case RX_SKIP_S2:
+		/* Skip C block (40 bits) */
+		if (++flex->rx.bit_count >= RX_S2_BITS) {
+			flex->rx.rx_state = RX_READ_FRAME;
+			flex->rx.bit_count = 0;
+			flex->rx.word_count = 0;
+			flex->rx.shift_reg = 0;
+		}
+		break;
+
+	case RX_READ_FRAME:
+		/* Accumulate 32 bits per word */
+		flex->rx.bit_count++;
+		if (flex->rx.bit_count >= 32) {
+			flex->rx.frame_words[flex->rx.word_count] = flex->rx.shift_reg;
+			flex->rx.word_count++;
+			flex->rx.bit_count = 0;
+			flex->rx.shift_reg = 0;
+
+			if (flex->rx.rx_mode == RX_MODE_A3) {
+				/* A3: expect 176 interleaved words (2 × 88) */
+				if (flex->rx.word_count >= FLEX_WORDS_PER_FRAME * 2) {
+					/* De-interleave: even words → phase A, odd → phase B */
+					uint32_t phase_a[FLEX_WORDS_PER_FRAME];
+					uint32_t phase_b[FLEX_WORDS_PER_FRAME];
+					int i;
+
+					for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+						phase_a[i] = flex->rx.frame_words[2 * i];
+						phase_b[i] = flex->rx.frame_words[2 * i + 1];
+					}
+
+					/* Process phase A */
+					memcpy(flex->rx.frame_words, phase_a,
+					       FLEX_WORDS_PER_FRAME * sizeof(uint32_t));
+					flex->rx.word_count = FLEX_WORDS_PER_FRAME;
+					flex_rx_process_frame(flex);
+
+					/* Process phase B */
+					memcpy(flex->rx.frame_words, phase_b,
+					       FLEX_WORDS_PER_FRAME * sizeof(uint32_t));
+					flex->rx.word_count = FLEX_WORDS_PER_FRAME;
+					flex_rx_process_frame(flex);
+
+					/* Return to hunting for next frame */
+					flex->rx.rx_state = RX_HUNT_SYNC;
+				}
+			} else {
+				/* A1/A2: 88 words total */
+				if (flex->rx.word_count >= FLEX_WORDS_PER_FRAME) {
+					/* Complete frame received — process it */
+					flex_rx_process_frame(flex);
+					/* Return to hunting for next frame */
+					flex->rx.rx_state = RX_HUNT_SYNC;
+				}
+			}
+		}
+		break;
+	}
+}
+
+/* 2-FSK demodulator: convert audio samples to bits.
+ * Same zero-crossing approach as the POCSAG receiver. */
+static void flex_fsk_demod(flex_t *flex, sample_t *samples, int length)
+{
+	double phase, bitstep, polarity;
+	uint8_t lastbit;
+	int i;
+
+	polarity = flex->fsk_polarity;
+	phase = flex->rx.fsk_rx_phase;
+	lastbit = flex->rx.fsk_rx_lastbit;
+	bitstep = flex->fsk_bitstep;
+
+	for (i = 0; i < length; i++) {
+		if (samples[i] * polarity > 0.0) {
+			if (lastbit) {
+				/* stay high */
+				phase += bitstep;
+				if (phase >= 1.0) {
+					phase -= 1.0;
+					flex_rx_bit(flex, 1);
+				}
+			} else {
+				/* transition low→high */
+				phase = -0.5;
+				flex_rx_bit(flex, 1);
+				lastbit = 1;
+			}
+		} else {
+			if (lastbit) {
+				/* transition high→low */
+				phase = -0.5;
+				flex_rx_bit(flex, 0);
+				lastbit = 0;
+			} else {
+				/* stay low */
+				phase += bitstep;
+				if (phase >= 1.0) {
+					phase -= 1.0;
+					flex_rx_bit(flex, 0);
+				}
+			}
+		}
+	}
+
+	flex->rx.fsk_rx_phase = phase;
+	flex->rx.fsk_rx_lastbit = lastbit;
+}
+
+/* Process received audio stream from radio unit. */
 void sender_receive(sender_t *sender, sample_t *samples, int length, double __attribute__((unused)) rf_level_db)
 {
-	(void)sender; (void)samples; (void)length;
+	flex_t *flex = (flex_t *)sender;
+
+	if (flex->rx.enabled)
+		flex_fsk_demod(flex, samples, length);
 }
