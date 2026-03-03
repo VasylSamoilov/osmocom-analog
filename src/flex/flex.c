@@ -41,6 +41,7 @@
 static const char *flex_state_name[] = {
 	"IDLE",
 	"ERS",
+	"ERS_GAP",
 	"MESSAGE",
 	"NET_ERS",
 	"NET_FRAME",
@@ -157,7 +158,9 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 				       ? FLEX_STATE_NET_FRAME
 				       : FLEX_STATE_NET_ERS);
 		else
-			flex_new_state(flex, FLEX_STATE_ERS);
+			flex_new_state(flex, flex->no_ers
+				       ? FLEX_STATE_MESSAGE
+				       : FLEX_STATE_ERS);
 	} else
 		flex_display_status();
 
@@ -281,59 +284,65 @@ static void flex_fragment_queue(flex_t *flex)
 }
 
 /*
- * Set up the per-frame speed transition metadata.
+ * Set up the split sync/data buffers for a frame.
  *
  * Per ARIB STD-43A Section 3.2, the S1 sync (BS1 + A + B + A_inv) and FIW
  * are ALWAYS transmitted at 1600 baud / 2-FSK, regardless of the frame's
- * data speed.  The speed transition to the frame's block speed occurs at
- * S2 (the C block), which immediately follows the FIW.
+ * data speed.  The DSP consumes sync_buffer first at 1600/2FSK, then
+ * switches to the target speed for frame_buffer (S2 + DATA).
  *
- * For 1600 baud frames, no transition is needed (offset = 0).
- * For 3200/6400 baud frames, the DSP must start at 1600/2FSK and switch
- * to the target speed after consuming S1+FIW bytes.
- *
- * Layout: S1(14) + FIW(4) = 18 bytes at 1600 baud, then S2+DATA at target speed.
- * ERS is a separate event emitted before the frame, not part of it.
+ * For 1600 baud frames, the target speed is still 1600/2FSK (no actual
+ * speed change, but the split is maintained for consistency).
  */
-static void flex_setup_speed_transition(flex_t *flex, int baud_rate,
-					int modulation_type)
+static void flex_setup_frame_buffers(flex_t *flex,
+				     const flex_frame_params_t *params,
+				     const flex_frame_msg_t *msgs, int msg_count,
+				     int *msgs_packed, int *error)
 {
-	if (baud_rate <= 1600) {
-		/* No speed transition needed — entire frame at 1600/2FSK */
-		flex->frame_speed_switch_offset = 0;
-		flex->frame_target_speed = 0;
-		flex->frame_target_mod_type = 0;
-		return;
-	}
+	size_t sync_len, data_len;
 
-	/* S1 = BS1(4) + A(4) + B(2) + A_inv(4) = 14 bytes
-	 * FIW = 4 bytes
-	 * Total sync portion at 1600 baud = 18 bytes */
-	flex->frame_speed_switch_offset = 14 + 4;
-	flex->frame_target_speed = baud_rate;
-	flex->frame_target_mod_type = modulation_type;
+	/* Sync portion: S1 + FIW → sync_buffer (always 18 bytes at 1600/2FSK) */
+	sync_len = flex_encode_sync(params, flex->sync_buffer,
+				    sizeof(flex->sync_buffer));
+	flex->sync_buffer_length = (int)sync_len;
+	flex->sync_buffer_pos = 0;
+
+	/* Data portion: S2 + interleaved phase data → frame_buffer */
+	data_len = flex_encode_data(msgs, msg_count, params,
+				    flex->frame_buffer,
+				    sizeof(flex->frame_buffer),
+				    msgs_packed, error);
+	flex->frame_buffer_length = (int)data_len;
+	flex->frame_buffer_pos = 0;
+
+	/* Target speed for the data portion */
+	flex->frame_target_speed = params->baud_rate;
+	flex->frame_target_mod_type = params->modulation_type;
 
 	/* Start DSP at 1600/2FSK for the sync portion */
 	dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
 	LOGP_CHAN(DDSP, LOGL_DEBUG,
-		  "Speed transition: 1600/2fsk for first 18 bytes, then %d/%s for data.\n",
-		  baud_rate,
-		  (modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
+		  "Frame buffers: sync=%d bytes (1600/2fsk), data=%d bytes (%d/%s).\n",
+		  (int)sync_len, (int)data_len,
+		  params->baud_rate,
+		  (params->modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
 }
 
 /* Map (baud_rate, modulation_type) → phase count per ARIB STD-43A:
  *   A1 (1600, 2FSK) → 1 phase
- *   A2 (3200, 2FSK) → 1 phase
- *   A3 (3200, 4FSK) → 2 phases
- *   A4 (6400, 4FSK) → 4 phases */
+ *   A2 (3200, 2FSK) → 2 phases (A, C)
+ *   A3 (3200, 4FSK) → 4 phases (A, B, C, D)
+ *   A4 (6400, 4FSK) → 4 phases (A, B, C, D) */
 static int flex_get_phase_count(int baud_rate, int modulation_type)
 {
 	if (baud_rate >= 6400 && modulation_type == FLEX_MOD_4FSK)
 		return 4;  /* A4 */
 	if (baud_rate >= 3200 && modulation_type == FLEX_MOD_4FSK)
-		return 2;  /* A3 */
-	return 1;  /* A1, A2 */
+		return 4;  /* A3 */
+	if (baud_rate >= 3200)
+		return 2;  /* A2 */
+	return 1;  /* A1 */
 }
 
 /*
@@ -389,7 +398,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 			flex->frame_buffer_length = (int)len;
 			flex->frame_buffer_pos = 0;
-			flex->frame_speed_switch_offset = 0; /* ERS is all 1600/2FSK */
+			flex->sync_buffer_length = 0; /* ERS has no sync portion */
+			flex->sync_buffer_pos = 0;
 			flex->ers_sent_cycles += chunk;
 
 			LOGP_CHAN(DFLEX, LOGL_DEBUG,
@@ -452,7 +462,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 		flex->frame_buffer_length = (int)len;
 		flex->frame_buffer_pos = 0;
-		flex->frame_speed_switch_offset = 0; /* POCSAG is all 1200/2FSK */
+		flex->sync_buffer_length = 0; /* POCSAG has no FLEX sync portion */
+		flex->sync_buffer_pos = 0;
 		flex->sched_last_cycle = ft.cycle;
 		flex->sched_last_frame = ft.frame;
 
@@ -471,9 +482,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.biw_time = flex->biw_time_enabled;
 	params.baud_rate = flex_scheduler_select_speed(flex, &params.modulation_type);
 
-	/* Don't switch DSP speed here — flex_setup_speed_transition() will
-	 * set DSP to 1600/2FSK for the sync portion and schedule the
-	 * transition to the target speed after S1+FIW. */
+	/* DSP speed is set by flex_setup_frame_buffers() or the phased
+	 * encoding path — always starts at 1600/2FSK for sync_buffer,
+	 * then switches to target speed for frame_buffer. */
 
 	/* Coverage/roaming fields */
 	if (flex->ssid || flex->nid) {
@@ -530,8 +541,10 @@ static int flex_get_next_frame_network(flex_t *flex)
 		memset(phases, 0, sizeof(phases));
 		memset(phase_has_msg, 0, sizeof(phase_has_msg));
 
-		/* Build per-phase params — same as frame params */
+		/* Build per-phase params — same as frame params but force
+		 * single-phase output so we can extract the 88 data words */
 		phase_params = params;
+		phase_params.single_phase = 1;
 
 		/* Collect one message per phase from the queue */
 		for (candidate = flex->msg_list; candidate; candidate = next) {
@@ -656,25 +669,42 @@ static int flex_get_next_frame_network(flex_t *flex)
 				}
 			}
 
-			/* Encode the multi-phase frame */
-			len = flex_encode_frame_phased(phases, num_phases, &params,
-						       flex->frame_buffer,
-						       sizeof(flex->frame_buffer),
-						       &error);
-			if (error || len == 0) {
-				LOGP_CHAN(DFLEX, LOGL_NOTICE,
-					  "Network mode: failed to encode phased frame (error=%d), sending idle.\n", error);
-				goto send_idle;
+			/* Encode sync → sync_buffer, data → frame_buffer.
+			 * flex_encode_frame_phased produces S1+FIW+S2+DATA
+			 * in one buffer, but we need the split for DSP.
+			 * Use a temp buffer, then split. */
+			{
+				uint8_t phased_buf[FLEX_BUFFER_SIZE];
+				size_t phased_len;
+
+				phased_len = flex_encode_frame_phased(phases, num_phases,
+								      &params, phased_buf,
+								      sizeof(phased_buf),
+								      &error);
+				if (error || phased_len == 0) {
+					LOGP_CHAN(DFLEX, LOGL_NOTICE,
+						  "Network mode: failed to encode phased frame (error=%d), sending idle.\n", error);
+					goto send_idle;
+				}
+
+				/* Split: first 18 bytes = sync, rest = data */
+				memcpy(flex->sync_buffer, phased_buf, 18);
+				flex->sync_buffer_length = 18;
+				flex->sync_buffer_pos = 0;
+
+				flex->frame_buffer_length = (int)(phased_len - 18);
+				memcpy(flex->frame_buffer, phased_buf + 18,
+				       flex->frame_buffer_length);
+				flex->frame_buffer_pos = 0;
 			}
 
-			flex->frame_buffer_length = (int)len;
-			flex->frame_buffer_pos = 0;
 			flex->sched_last_cycle = ft.cycle;
 			flex->sched_last_frame = ft.frame;
 
-			/* Set up speed transition for S1+FIW at 1600 → block speed */
-			flex_setup_speed_transition(flex, params.baud_rate,
-						    params.modulation_type);
+			/* Set target speed for data portion, start DSP at 1600/2FSK */
+			flex->frame_target_speed = params.baud_rate;
+			flex->frame_target_mod_type = params.modulation_type;
+			dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
 			LOGP_CHAN(DFLEX, LOGL_INFO,
 				  "Network mode: encoded %d-phase frame C%u/F%u speed=%d/%s polarity=%s collapse=%d roaming=%d.\n",
@@ -688,7 +718,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		goto send_idle;
 	}
 
-	/* Single-phase encoding (1600 bps) */
+	/* Single-phase encoding (1600 bps or any speed) */
 	if (msg) {
 		/* Encode the eligible message */
 		memset(&frame_msg, 0, sizeof(frame_msg));
@@ -705,27 +735,20 @@ static int flex_get_next_frame_network(flex_t *flex)
 		frame_msg.source_id = msg->source_id[0] ? msg->source_id : NULL;
 		frame_msg.short_msg_idx = msg->short_msg_index;
 
-		len = flex_encode_frame_multi(&frame_msg, 1, &params,
-					      flex->frame_buffer,
-					      sizeof(flex->frame_buffer),
-					      &msgs_packed, &error);
+		/* Use split encoding: sync → sync_buffer, data → frame_buffer */
+		flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
+					&msgs_packed, &error);
 
 		/* Destroy the transmitted message */
 		flex_msg_destroy(msg);
 
-		if (error || len == 0) {
+		if (error || flex->frame_buffer_length == 0) {
 			LOGP_CHAN(DFLEX, LOGL_NOTICE, "Network mode: failed to encode frame (error=%d), sending idle.\n", error);
 			goto send_idle;
 		}
 
-		flex->frame_buffer_length = (int)len;
-		flex->frame_buffer_pos = 0;
 		flex->sched_last_cycle = ft.cycle;
 		flex->sched_last_frame = ft.frame;
-
-		/* Set up speed transition for S1+FIW at 1600 → block speed */
-		flex_setup_speed_transition(flex, params.baud_rate,
-					    params.modulation_type);
 
 		LOGP_CHAN(DFLEX, LOGL_INFO,
 			  "Network mode: encoded frame C%u/F%u capcode=%" PRIu64 " type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
@@ -743,10 +766,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 
 send_idle:
-	/* No messages — send idle frame.
-	 * Encode a tone-only to capcode 1 (valid short addr) as a no-op.
-	 * The pager won't respond since it's not addressed to it.
-	 * This produces a valid frame with BIW + 1 addr + 1 vec + idle fill. */
+	/* No messages — send idle frame */
 	memset(&frame_msg, 0, sizeof(frame_msg));
 	frame_msg.capcode = 1;
 	frame_msg.msg_type = FLEX_FRAME_MSG_TYPE_TONE;
@@ -755,26 +775,16 @@ send_idle:
 	frame_msg.speed = 1600;
 	frame_msg.polarity = -1.0;
 
-	len = flex_encode_frame_multi(&frame_msg, 1, &params,
-				      flex->frame_buffer,
-				      sizeof(flex->frame_buffer),
-				      &msgs_packed, &error);
+	flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
+				&msgs_packed, &error);
 
-	if (error || len == 0) {
+	if (error || flex->frame_buffer_length == 0) {
 		LOGP_CHAN(DFLEX, LOGL_ERROR, "Network mode: failed to encode idle frame (error=%d).\n", error);
 		return 0;
 	}
 
-	flex->frame_buffer_length = (int)len;
-	flex->frame_buffer_pos = 0;
 	flex->sched_last_cycle = ft.cycle;
 	flex->sched_last_frame = ft.frame;
-
-	/* Idle frames use the current params (which may be at higher speed
-	 * if the scheduler selected 3200/6400 for this slot). Set up
-	 * speed transition so S1+FIW are still at 1600/2FSK. */
-	flex_setup_speed_transition(flex, params.baud_rate,
-				    params.modulation_type);
 
 	LOGP_CHAN(DFLEX, LOGL_DEBUG, "Network mode: idle frame C%u/F%u.\n",
 		  ft.cycle, ft.frame);
@@ -833,7 +843,8 @@ int flex_get_next_frame(flex_t *flex)
 
 			flex->frame_buffer_length = (int)len;
 			flex->frame_buffer_pos = 0;
-			flex->frame_speed_switch_offset = 0; /* ERS is all 1600/2FSK */
+			flex->sync_buffer_length = 0; /* ERS has no sync portion */
+			flex->sync_buffer_pos = 0;
 			dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
 			LOGP_CHAN(DFLEX, LOGL_INFO,
@@ -841,8 +852,39 @@ int flex_get_next_frame(flex_t *flex)
 				  ers_cycles, (int)len,
 				  (double)ers_cycles * 96.0 / 1600.0);
 
-			flex_new_state(flex, FLEX_STATE_MESSAGE);
+			flex_new_state(flex, FLEX_STATE_ERS_GAP);
 			flex->idle_count = 0;
+			return 1;
+		}
+
+	case FLEX_STATE_ERS_GAP:
+		/* Post-ERS gap: ~2905 bits of idle carrier at 1600 baud.
+		 *
+		 * PDW (and similar decoders) detect the ERS Ar sync pattern
+		 * as an unknown sync header, which triggers their FIW capture
+		 * (89 bits) + data collection (11×256 = 2816 bits) pipeline.
+		 * Total: 2905 bits of decoder blindness after the last ERS
+		 * sync detection.  We pad to 3072 bits (384 bytes) for margin.
+		 *
+		 * The gap is filled with alternating 0xAA bytes (BS pattern)
+		 * so the decoder's PLL stays locked for clean sync acquisition
+		 * of the data frame that follows. */
+		{
+			int gap_bytes = 384; /* 3072 bits at 1600 baud = 1.92 sec */
+
+			memset(flex->frame_buffer, 0xAA, gap_bytes);
+			flex->frame_buffer_length = gap_bytes;
+			flex->frame_buffer_pos = 0;
+			flex->sync_buffer_length = 0;
+			flex->sync_buffer_pos = 0;
+			dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
+
+			LOGP_CHAN(DFLEX, LOGL_INFO,
+				  "ERS gap: %d bytes (%d bits, %.2f sec at 1600 baud).\n",
+				  gap_bytes, gap_bytes * 8,
+				  (double)(gap_bytes * 8) / 1600.0);
+
+			flex_new_state(flex, FLEX_STATE_MESSAGE);
 			return 1;
 		}
 
@@ -855,10 +897,6 @@ int flex_get_next_frame(flex_t *flex)
 
 			/* reset idle counter when we have a message */
 			flex->idle_count = 0;
-
-			/* Don't switch DSP speed here — flex_setup_speed_transition()
-			 * will handle starting at 1600/2FSK for sync and switching
-			 * to the target speed after S1+FIW. */
 
 			/* Switch DSP polarity if message requires it */
 			dsp_set_polarity(flex, msg->polarity);
@@ -894,29 +932,22 @@ int flex_get_next_frame(flex_t *flex)
 				flex_msg_destroy(msg);
 				msg = NULL;
 
-				/* encode using the same path as network mode */
-				len = flex_encode_frame_multi(&frame_msg, 1, &params,
-							     flex->frame_buffer,
-							     FLEX_BUFFER_SIZE,
-							     &msgs_packed, &error);
+				/* Use split encoding: sync → sync_buffer, data → frame_buffer */
+				flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
+							&msgs_packed, &error);
 
-				if (error || len == 0) {
+				if (error || flex->frame_buffer_length == 0) {
 					LOGP_CHAN(DFLEX, LOGL_NOTICE, "Failed to encode FLEX frame (error=%d), skipping.\n", error);
 					if (flex->msg_list)
 						return flex_get_next_frame(flex);
 					goto check_idle;
 				}
 
-				flex->frame_buffer_length = (int)len;
-				flex->frame_buffer_pos = 0;
-
-				/* Set up speed transition for S1+FIW at 1600 → block speed */
-				flex_setup_speed_transition(flex, params.baud_rate,
-							    params.modulation_type);
-
 				LOGP_CHAN(DFLEX, LOGL_INFO,
-					  "Encoded FLEX frame (%d bytes): capcode=%" PRIu64 " type=%d speed=%d/%s polarity=%s deviation=%.0f len=%d.\n",
-					  (int)len, log_capcode, log_msg_type,
+					  "Encoded FLEX frame (sync=%d data=%d bytes): capcode=%" PRIu64 " type=%d speed=%d/%s polarity=%s deviation=%.0f len=%d.\n",
+					  flex->sync_buffer_length,
+					  flex->frame_buffer_length,
+					  log_capcode, log_msg_type,
 					  log_speed,
 					  (log_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 					  (log_polarity < 0) ? "neg" : "pos",

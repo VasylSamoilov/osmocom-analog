@@ -187,6 +187,8 @@ typedef struct flex_frame_params {
 	int		baud_rate;		/* 1600, 3200, or 6400 */
 	int		modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
+	int		single_phase;		/* 1 = force single-phase output (for
+						 * network mode per-phase encoding) */
 } flex_frame_params_t;
 
 /* ===== Phase Multiplexing (Spec Section 3.3) ===== */
@@ -270,6 +272,34 @@ size_t flex_generate_ers(uint8_t *buffer, size_t buffer_size, int cycles);
  * Produces: preamble (18 words of 0xAAAAAAAA) + 1 batch (sync + 16 idle codewords).
  * Returns bytes written, or 0 on error. */
 size_t flex_generate_pocsag_idle(uint8_t *buffer, size_t buffer_size);
+
+/* ===== Split Sync/Data Encoding (ARIB STD-43A Section 3.2) =====
+ *
+ * The sync portion (S1 + FIW) is ALWAYS at 1600/2FSK.
+ * The data portion (S2 + DATA) is at the frame's target speed.
+ * These functions produce the two parts separately so the DSP
+ * can transmit them at the correct speeds without mid-buffer switching.
+ */
+
+/* Encode the sync portion: S1 (BS1 + Ax + B + Ax_inv) + FIW.
+ * Always 18 bytes, always at 1600/2FSK.
+ * Returns bytes written (18), or 0 on error. */
+size_t flex_encode_sync(const flex_frame_params_t *params,
+			uint8_t *buffer, size_t buffer_size);
+
+/* Encode the data portion: S2 + interleaved phase data.
+ * Transmitted at the frame's target speed/modulation after
+ * the speed switch from 1600/2FSK (S1+FIW).
+ * S2 structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
+ *   N varies per speed — see flex_encode_s2() in frame.c.
+ * For single-phase (1600): S2(5) + DATA(352) = 357 bytes.
+ * For 2-phase (3200/2FSK): S2(10) + DATA(704) = 714 bytes.
+ * For 4-phase (6400/4FSK): S2(20) + DATA(1408) = 1428 bytes.
+ * Returns bytes written, or 0 on error. */
+size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
+			const flex_frame_params_t *params,
+			uint8_t *buffer, size_t buffer_size,
+			int *msgs_packed, int *error);
 
 /* Text utilities */
 const char *flex_print_message(const char *message, int message_length);

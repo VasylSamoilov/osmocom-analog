@@ -24,6 +24,7 @@ enum flex_msg_type {
 enum flex_state {
 	FLEX_STATE_IDLE = 0,
 	FLEX_STATE_ERS,			/* ERS re-sync burst at network start */
+	FLEX_STATE_ERS_GAP,		/* post-ERS gap for decoder recovery */
 	FLEX_STATE_MESSAGE,
 	/* Network mode states */
 	FLEX_STATE_NET_ERS,		/* Initial ERS at network startup */
@@ -78,19 +79,26 @@ typedef struct flex {
 	/* message queue (singly-linked list) */
 	flex_msg_t		*msg_list;
 
-	/* frame buffer — filled by frame.c, consumed by dsp.c
-	 * FLEX pre-encodes the entire frame because of block interleaving,
-	 * unlike POCSAG which generates codewords on-the-fly. */
+	/* Sync buffer — S1 + FIW, always transmitted at 1600/2FSK.
+	 * Per ARIB STD-43A Section 3.2, the sync portion is always
+	 * at 1600 baud regardless of the frame's data speed.
+	 * S1 = BS1(4) + Ax(4) + B(2) + Ax_inv(4) = 14 bytes
+	 * FIW = 4 bytes (32-bit BCH codeword)
+	 * Total: 18 bytes max */
+	uint8_t			sync_buffer[20];
+	int			sync_buffer_length;
+	int			sync_buffer_pos;
+
+	/* Data buffer — S2 + DATA, transmitted at the frame's target speed
+	 * after the speed switch from 1600/2FSK (S1+FIW).
+	 * S2 = BS2(N) + C(16) + BS2_inv(N) + C_inv(16), N per speed table
+	 * DATA = interleaved phase words (352/704/1408 bytes) */
 	uint8_t			frame_buffer[FLEX_BUFFER_SIZE];
 	int			frame_buffer_length;
 	int			frame_buffer_pos;
 
-	/* Byte offset in frame_buffer where DSP should switch from
-	 * 1600/2FSK (sync+FIW) to the target speed/modulation.
-	 * Per ARIB STD-43A Section 3.2, S1+FIW are always at 1600 baud;
-	 * S2 (C block) and data are at the frame's block speed.
-	 * Set to 0 when no speed transition is needed (1600 baud frames). */
-	int			frame_speed_switch_offset;
+	/* Target speed/modulation for the data portion (S2+DATA).
+	 * S1+FIW always at 1600/2FSK; speed switches after FIW. */
 	int			frame_target_speed;
 	int			frame_target_mod_type;
 
@@ -113,6 +121,7 @@ typedef struct flex {
 	int			network_mode;		/* 0 = one-shot (default), 1 = network */
 	int			collapse;		/* 0-7, default 0 */
 	int			ers_cycles_override;	/* -1 = auto, >0 = manual override */
+	int			no_ers;			/* skip ERS in single-shot mode */
 	int			biw_time_enabled;	/* BIW3/BIW4 time broadcast */
 	int			lpf_enabled;		/* baseband LPF */
 

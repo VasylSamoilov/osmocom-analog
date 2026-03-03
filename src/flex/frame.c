@@ -34,48 +34,137 @@ struct flex_msg_config {
 };
 
 /*
- * Synchronization patterns (Spec Section 3.2, Tables 3.2-1 and 3.2-5).
+ * Synchronization patterns (Spec Section 3.2).
  *
- * BS  = Bit Sync: alternating 1/0 pattern (16 bits)
- * A1  = Frame Sync code for 1600 baud, 2-level FSK (32 bits)
- * Ar  = ERS (Emergency Re-Synchronization) frame sync (32 bits)
- *       Shares lower 16 bits with A1; upper 16 bits differ.
- *       Used in the ERS burst to force pager re-acquisition.
- * B   = Baud/level indicator (16 bits)
- * C   = Second sync block, follows FIW (40 bits)
+ * All bit patterns below are from the spec tables, presented as in the
+ * original tables with "LSB on the left transmitted first".
+ *
+ * S1 structure (144 bits, always at 1600 baud / 2-level FSK):
+ *   BS1(32) + A(32) + B(16) + A_inv(32) + FIW(32)
+ *
+ * After S1+FIW, the transmitter switches to the frame's target
+ * speed/modulation (if different from 1600/2FSK).
+ *
+ * S2 structure (at target data rate, always 25 ms):
+ *   BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
+ *
+ * === Table 3.2-1: 1600bps/2-level frame speed ===
+ *   BS1       1010101010101010 1010101010101010
+ *   A (A1)    0111100011110011 0101100100111001
+ *   B         0101010101010101
+ *   inv.A(A1) 1000011100001100 1010011011000110
+ *   Frame Info iiiiiiiiiiiiiiii iiiiiipppppppppppp
+ *   BS2       1010
+ *   C         1110110110000100
+ *   inv.BS2   0101
+ *   inv.C     0001001001111011
+ *
+ * === Table 3.2-2: 3200bps/2-level frame speed ===
+ *   BS1       1010101010101010 1010101010101010
+ *   A (A2)    1000010011100111 0101100100111001
+ *   B         0101010101010101
+ *   inv.A(A2) 0111101100011000 1010011011000110
+ *   Frame Info iiiiiiiiiiiiiiii iiiiiipppppppppppp
+ *   BS2       1010101010101010 10101010
+ *   C         1110110110000100
+ *   inv.BS2   0101010101010101 01010101
+ *   inv.C     0001001001111011
+ *
+ * === Table 3.2-3: 3200bps/4-level frame speed ===
+ *   BS1       1010101010101010 1010101010101010
+ *   A (A3)    0100111110010111 0101100100111001
+ *   B         0101010101010101
+ *   inv.A(A3) 1011000001101000 1010011011000110
+ *   Frame Info iiiiiiiiiiiiiiii iiiiiipppppppppppp
+ *   BS2       101010101010 (symbol)
+ *   C         1110110110000100 (decoded value)
+ *   inv.BS2   010101010101 (symbol)
+ *   inv.C     0001001001111011 (decoded value)
+ *
+ * === Table 3.2-4: 6400bps/4-level frame speed ===
+ *   BS1       1010101010101010 1010101010101010
+ *   A (A4)    0010000010101111 0101100100111001
+ *   B         0101010101010101
+ *   inv.A(A4) 1101111101010000 1010011011000110
+ *   Frame Info iiiiiiiiiiiiiiii iiiiiipppppppppppp
+ *   BS2       1010101010101010 1010101010101010 (symbol)
+ *   C         1110110110000100 (decoded value)
+ *   inv.BS2   0101010101010101 0101010101010101 (symbol)
+ *   inv.C     0001001001111011 (decoded value)
+ *
+ * === Table 3.2-5: "A" binary pattern ===
+ *   A1  1600bps/2-level     0111100011110011 0101100100111001
+ *   A2  3200bps/2-level     1000010011100111 0101100100111001
+ *   A3  3200bps/4-level     0100111110010111 0101100100111001
+ *   A4  6400bps/4-level     0010000010101111 0101100100111001
+ *   A5  Reserved            1101110101001011 0101100100111001
+ *   A6  Reserved            0001011000111011 0101100100111001
+ *   A7  Reserved            1011001110000001 0101100100111001
+ *   A8  Reserved            0110001101000001 0101100100111001
+ *   A9  Reserved            0001101111000010 0101100100111001
+ *   A10 Reserved            0010110010000110 0101100100111001
+ *   A11 Reserved            1010010111101000 0101100100111001
+ *   A12 Reserved            1001001010001100 0101100100111001
+ *   A13 Reserved            0110111010011000 0101100100111001
+ *   A14 Reserved            1011111001011010 0101100100111001
+ *   A15 Reserved            1111000100111101 0101100100111001
+ *   Ar  Re-synchronization  1100101100100000 0101100100111001
+ *   * "A" = BCH(31,21) code + even parity, transmitted in reverse order
  *
  * _inv variants are bitwise inversions for polarity detection.
- * All values verified against ARIB STD-43A Tables 3.2-1 and 3.2-5.
- *
- * Bit patterns (binary, LSB transmitted first per spec):
- *   BS:      1010101010101010
- *   A1:      0111100011110011 0101100100111001
- *   Ar:      1100101100100000 0101100100111001
- *   inv.A1:  1000011100001100 1010011011000110
- *   inv.Ar:  0011010011011111 1010011011000110
  */
+
+/* S1 bit sync patterns */
 static const uint8_t sync_bs[]        = {0xAA, 0xAA};
 static const uint8_t sync_bs_inv[]    = {0x55, 0x55};
 static const uint8_t sync_bs1[]       = {0xAA, 0xAA, 0xAA, 0xAA};
-static const uint8_t sync_a1[]        = {0x78, 0xF3, 0x59, 0x39};
+
+/* A codes — active speeds (Table 3.2-5, MSB-first byte order) */
+static const uint8_t sync_a1[]        = {0x78, 0xF3, 0x59, 0x39}; /* 1600/2FSK */
 static const uint8_t sync_a1_inv[]    = {0x87, 0x0C, 0xA6, 0xC6};
+static const uint8_t sync_a2[]        = {0x84, 0xE7, 0x59, 0x39}; /* 3200/2FSK */
+static const uint8_t sync_a2_inv[]    = {0x7B, 0x18, 0xA6, 0xC6};
+static const uint8_t sync_a3[]        = {0x4F, 0x97, 0x59, 0x39}; /* 3200/4FSK */
+static const uint8_t sync_a3_inv[]    = {0xB0, 0x68, 0xA6, 0xC6};
+static const uint8_t sync_a4[]        = {0x20, 0xAF, 0x59, 0x39}; /* 6400/4FSK */
+static const uint8_t sync_a4_inv[]    = {0xDF, 0x50, 0xA6, 0xC6};
 
-/* A2: 3200 bps 2-FSK sync (Table 3.2-1) */
-static const uint8_t sync_a2[]       = {0xB4, 0x68, 0x2C, 0xAB};
-static const uint8_t sync_a2_inv[]   = {0x4B, 0x97, 0xD3, 0x54};
+/* A codes — reserved (Table 3.2-5)
+ * Not used by the encoder (no defined frame speed), but kept here
+ * for completeness. The RX decoder in dsp.c detects these via
+ * FLEX_SYNC_A5..A15 defines and logs them as unsupported. */
+static const uint8_t sync_a5[]  __attribute__((unused)) = {0xDC, 0xD3, 0x59, 0x39};
+static const uint8_t sync_a6[]  __attribute__((unused)) = {0x16, 0x3B, 0x59, 0x39};
+static const uint8_t sync_a7[]  __attribute__((unused)) = {0xB3, 0x81, 0x59, 0x39};
+static const uint8_t sync_a8[]  __attribute__((unused)) = {0x63, 0x41, 0x59, 0x39};
+static const uint8_t sync_a9[]  __attribute__((unused)) = {0x1B, 0xC2, 0x59, 0x39};
+static const uint8_t sync_a10[] __attribute__((unused)) = {0x2C, 0x86, 0x59, 0x39};
+static const uint8_t sync_a11[] __attribute__((unused)) = {0xA5, 0xE8, 0x59, 0x39};
+static const uint8_t sync_a12[] __attribute__((unused)) = {0x92, 0x8C, 0x59, 0x39};
+static const uint8_t sync_a13[] __attribute__((unused)) = {0x6E, 0x98, 0x59, 0x39};
+static const uint8_t sync_a14[] __attribute__((unused)) = {0xBE, 0x5A, 0x59, 0x39};
+static const uint8_t sync_a15[] __attribute__((unused)) = {0xF1, 0x3D, 0x59, 0x39};
 
-/* A3: 3200 bps 4-FSK sync (Table 3.2-1) */
-static const uint8_t sync_a3[]       = {0xD4, 0xA8, 0x6C, 0xEB};
-static const uint8_t sync_a3_inv[]   = {0x2B, 0x57, 0x93, 0x14};
-
-/* A4: 6400 bps 4-FSK sync (Table 3.2-1) */
-static const uint8_t sync_a4[]       = {0x94, 0xE8, 0xAC, 0x2B};
-static const uint8_t sync_a4_inv[]   = {0x6B, 0x17, 0x53, 0xD4};
-
+/* Ar: ERS re-synchronization (Table 3.2-5) */
 static const uint8_t sync_ar[]        = {0xCB, 0x20, 0x59, 0x39};
 static const uint8_t sync_ar_inv[]    = {0x34, 0xDF, 0xA6, 0xC6};
+
+/* B: baud/level indicator */
 static const uint8_t sync_b[]         = {0x55, 0x55};
-static const uint8_t sync_c[]         = {0xAE, 0xD8, 0x45, 0x12, 0x7B};
+
+/*
+ * S2 (Second Sync) component constants (Spec Section 3.2).
+ *
+ * S2 structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
+ * See tables above for per-speed BS2 lengths and bit patterns.
+ *
+ * For 4FSK modes, BS2/BS2_inv are symbol patterns where each symbol
+ * maps to a dibit: symbol 1→10, symbol 0→00 (per Fig 3.2-3, 3.2-4).
+ *
+ * C and C_inv are always 16-bit decoded values, same across all modes.
+ */
+#define S2_C		0xED84	/* 16 bits: 1110110110000100 */
+#define S2_C_INV	0x127B	/* 16 bits: 0001001001111011 */
 
 /* Copy a sync pattern into the output buffer and advance the pointer. */
 #define EMIT_SYNC(ptr, pattern) \
@@ -1295,6 +1384,215 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
  *
  * Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.4, 6.5, 10.3, 16.2, 16.3
  */
+
+/* ===== Sync Component Helpers ===== */
+
+/*
+ * Encode S1: BS1(4) + Ax(4) + B(2) + Ax_inv(4) = 14 bytes.
+ *
+ * S1 is always transmitted at 1600/2FSK. The A code identifies the
+ * frame's target speed/modulation (Table 3.2-5):
+ *   A1 = 1600/2FSK, A2 = 3200/2FSK, A3 = 3200/4FSK, A4 = 6400/4FSK
+ *
+ * Returns bytes written (14), or 0 on error.
+ */
+static size_t flex_encode_s1(int baud_rate, int modulation_type,
+			     uint8_t *buffer, size_t buffer_size)
+{
+	uint8_t *out;
+
+	if (!buffer || buffer_size < 14)
+		return 0;
+
+	out = buffer;
+
+	/* BS1: 32-bit alternating 1010... pattern */
+	EMIT_SYNC(out, sync_bs1);
+
+	/* A + B + A_inv: selected by target speed/modulation */
+	switch (baud_rate) {
+	case 3200:
+		if (modulation_type == FLEX_MOD_4FSK) {
+			EMIT_SYNC(out, sync_a3);
+			EMIT_SYNC(out, sync_b);
+			EMIT_SYNC(out, sync_a3_inv);
+		} else {
+			EMIT_SYNC(out, sync_a2);
+			EMIT_SYNC(out, sync_b);
+			EMIT_SYNC(out, sync_a2_inv);
+		}
+		break;
+	case 6400:
+		EMIT_SYNC(out, sync_a4);
+		EMIT_SYNC(out, sync_b);
+		EMIT_SYNC(out, sync_a4_inv);
+		break;
+	default: /* 1600 */
+		EMIT_SYNC(out, sync_a1);
+		EMIT_SYNC(out, sync_b);
+		EMIT_SYNC(out, sync_a1_inv);
+		break;
+	}
+
+	return (size_t)(out - buffer);
+}
+
+/*
+ * Encode FIW (Frame Information Word): 4 bytes (32-bit BCH codeword).
+ *
+ * Returns bytes written (4), or 0 on error.
+ */
+static size_t flex_encode_fiw(const flex_frame_params_t *params,
+			      uint8_t *buffer, size_t buffer_size)
+{
+	uint8_t *out;
+
+	if (!params || !buffer || buffer_size < 4)
+		return 0;
+
+	out = buffer;
+	EMIT_WORD(out, flex_create_fiw(params->cycle, params->frame,
+				       params->roaming, 0, 0));
+
+	return 4;
+}
+
+/*
+ * Compute S2 byte size for a given speed/modulation without encoding.
+ *
+ * S2 structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
+ * Total bits = 2*N + 32, where N (bs2_bits) varies per speed:
+ *   1600/2FSK:  N=4   → 40 bits  =  5 bytes
+ *   3200/2FSK:  N=24  → 80 bits  = 10 bytes
+ *   3200/4FSK:  N=24  → 80 bits  = 10 bytes
+ *   6400/4FSK:  N=64  → 160 bits = 20 bytes
+ *
+ * Returns byte count, or 0 for invalid baud_rate.
+ */
+static size_t flex_s2_size(int baud_rate)
+{
+	int bs2_bits;
+
+	switch (baud_rate) {
+	case 1600: bs2_bits = 4;  break;
+	case 3200: bs2_bits = 24; break;
+	case 6400: bs2_bits = 64; break;
+	default:   return 0;
+	}
+
+	return (size_t)(2 * bs2_bits + 32 + 7) / 8;
+}
+
+/*
+ * Encode S2 (second sync block) into buffer.
+ *
+ * S2 is the first thing transmitted at the frame's target data rate,
+ * after the speed switch from 1600/2FSK (S1+FIW).
+ * Structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
+ * All sizes in bits (after symbol-to-dibit mapping for 4FSK).
+ *
+ * Per speed/modulation (from spec bit stream tables):
+ *   1600/2FSK (Table 3.2-1):  BS2=4 bits   → total  40 bits ( 5 bytes)
+ *   3200/2FSK (Table 3.2-2):  BS2=24 bits  → total  80 bits (10 bytes)
+ *   3200/4FSK (Table 3.2-3):  BS2=24 bits  → total  80 bits (10 bytes)
+ *     (12 symbols × 2 bits/symbol = 24 bits)
+ *   6400/4FSK (Table 3.2-4):  BS2=64 bits  → total 160 bits (20 bytes)
+ *     (32 symbols × 2 bits/symbol = 64 bits)
+ *
+ * For 2FSK, BS2 is alternating bits: 1,0,1,0... → 0xAA pattern
+ * For 4FSK, BS2 is alternating symbols: 1,0,1,0... where each symbol
+ *   maps to a dibit: symbol 1→10, symbol 0→00 → 0x88 pattern
+ *   (per Fig 3.2-3, 3.2-4 decoded data)
+ *
+ * C and C_inv are always 16-bit values (decoded/bit-level),
+ * regardless of modulation.
+ *
+ * Returns bytes written, or 0 on error.
+ */
+static size_t flex_encode_s2(int baud_rate, int mod_type,
+			     uint8_t *buffer, size_t buffer_size)
+{
+	int bs2_bits, bit_pos, i;
+	size_t total_bits, total_bytes;
+	int is_4fsk = (mod_type == FLEX_MOD_4FSK);
+
+	/* BS2 bit length from spec tables */
+	switch (baud_rate) {
+	case 1600: bs2_bits = 4;  break;
+	case 3200: bs2_bits = 24; break;
+	case 6400: bs2_bits = 64; break;
+	default:   return 0;
+	}
+
+	total_bits = (size_t)bs2_bits + 16 + (size_t)bs2_bits + 16;
+	total_bytes = (total_bits + 7) / 8;
+
+	if (!buffer || buffer_size < total_bytes)
+		return 0;
+
+	memset(buffer, 0, total_bytes);
+	bit_pos = 0;
+
+	/* BS2: alternating symbol pattern, bit encoding depends on modulation.
+	 * 2FSK: symbol 1→bit 1, symbol 0→bit 0 → alternating 10101010...
+	 * 4FSK: symbol 1→dibit 10, symbol 0→dibit 00 → 10001000...
+	 * Pattern is N/2 symbols (4FSK) or N bits (2FSK): 1,0,1,0,... */
+	if (is_4fsk) {
+		int sym;
+		for (sym = 0; sym < bs2_bits / 2; sym++) {
+			if ((sym & 1) == 0) {
+				/* symbol 1 → dibit 10 */
+				buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
+			}
+			/* symbol 0 → dibit 00 (nothing to set) */
+			bit_pos += 2;
+		}
+	} else {
+		for (i = 0; i < bs2_bits; i++) {
+			if ((i & 1) == 0)
+				buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
+			bit_pos++;
+		}
+	}
+
+	/* C: 16 bits, MSB first */
+	for (i = 15; i >= 0; i--) {
+		if (S2_C & (1 << i))
+			buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
+		bit_pos++;
+	}
+
+	/* BS2_inv: inverted alternating symbol pattern.
+	 * 2FSK: 01010101...
+	 * 4FSK: symbols 0,1,0,1... → 00,10,00,10... → 00100010... */
+	if (is_4fsk) {
+		int sym;
+		for (sym = 0; sym < bs2_bits / 2; sym++) {
+			if ((sym & 1) == 1) {
+				/* symbol 1 → dibit 10 */
+				buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
+			}
+			/* symbol 0 → dibit 00 (nothing to set) */
+			bit_pos += 2;
+		}
+	} else {
+		for (i = 0; i < bs2_bits; i++) {
+			if ((i & 1) == 1)
+				buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
+			bit_pos++;
+		}
+	}
+
+	/* C_inv: 16 bits, MSB first */
+	for (i = 15; i >= 0; i--) {
+		if (S2_C_INV & (1 << i))
+			buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
+		bit_pos++;
+	}
+
+	return total_bytes;
+}
+
 size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			       const flex_frame_params_t *params,
 			       uint8_t *buffer, size_t buffer_size,
@@ -1348,54 +1646,13 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 	out = buffer;
 
-	/* ---- S1: Frame synchronization (Spec Section 3.2.1) ---- */
-
-	EMIT_SYNC(out, sync_bs1);
-
-	/* Select sync pattern based on baud rate */
-	switch (params->baud_rate) {
-	case 3200:
-		if (params->modulation_type == FLEX_MOD_4FSK) {
-			EMIT_SYNC(out, sync_a3);
-			EMIT_SYNC(out, sync_b);
-			EMIT_SYNC(out, sync_a3_inv);
-		} else {
-			EMIT_SYNC(out, sync_a2);
-			EMIT_SYNC(out, sync_b);
-			EMIT_SYNC(out, sync_a2_inv);
-		}
-		break;
-	case 6400:
-		EMIT_SYNC(out, sync_a4);
-		EMIT_SYNC(out, sync_b);
-		EMIT_SYNC(out, sync_a4_inv);
-		break;
-	default: /* 1600 */
-		EMIT_SYNC(out, sync_a1);
-		EMIT_SYNC(out, sync_b);
-		EMIT_SYNC(out, sync_a1_inv);
-		break;
-	}
-
-	/* ---- FIW: Frame Information Word ---- */
-
-	EMIT_WORD(out, flex_create_fiw(params->cycle, params->frame,
-				       params->roaming, 0, 0));
-
-	/* ---- S2: C block (Spec Section 3.2.2) ----
-	 *
-	 * S2 fills a 25ms time slot. At higher baud rates, repeat the C pattern:
-	 *   1600 bps:  5 bytes (40 bits)
-	 *   3200 bps: 10 bytes (80 bits)  — 2× the C pattern
-	 *   6400 bps: 20 bytes (160 bits) — 4× the C pattern
-	 */
-	EMIT_SYNC(out, sync_c);
-	if (params->baud_rate >= 3200)
-		EMIT_SYNC(out, sync_c);
-	if (params->baud_rate >= 6400) {
-		EMIT_SYNC(out, sync_c);
-		EMIT_SYNC(out, sync_c);
-	}
+	/* ---- S1 + FIW + S2 ---- */
+	out += flex_encode_s1(params->baud_rate, params->modulation_type,
+			      out, buffer_size - (size_t)(out - buffer));
+	out += flex_encode_fiw(params, out,
+			       buffer_size - (size_t)(out - buffer));
+	out += flex_encode_s2(params->baud_rate, params->modulation_type,
+			      out, buffer_size - (size_t)(out - buffer));
 
 	/* ---- Compute BIW count ---- */
 
@@ -1684,14 +1941,153 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 }
 
 
+/* ===== Bit-Level Phase Interleaving (Spec Section 3.3) ===== */
+
+/*
+ * Bit-interleave phase data into an output byte buffer.
+ *
+ * At 3200/6400 baud, the transmitted bit stream alternates between
+ * phases at the BIT level, not the word level.  PDW's de-interleaver
+ * (Flex.cpp lines 1159-1180) confirms this:
+ *
+ *   3200/2FSK (2 phases A,C):
+ *     hbit=0 → bit goes to phase A, hbit=1 → bit goes to phase C
+ *     Pattern: A_bit, C_bit, A_bit, C_bit, ...
+ *
+ *   3200/4FSK (4 phases A,B,C,D):
+ *     hbit=0 → dibit MSB→A, LSB→B; hbit=1 → dibit MSB→C, LSB→D
+ *     At the 2FSK bit level this is still alternating A,C per bit,
+ *     with B,D carried by the 4FSK second level.
+ *
+ *   6400/4FSK: same as 3200/4FSK (symbol rate is 3200 baud).
+ *
+ * For 2FSK encoding (which is what the DSP layer sends for 3200/2FSK),
+ * we must bit-interleave: output bit 0 = A_bit0, bit 1 = C_bit0,
+ * bit 2 = A_bit1, bit 3 = C_bit1, etc.
+ *
+ * For 4FSK encoding, the DSP layer sends dibits.  Each dibit's MSB
+ * comes from one phase pair (A or C) and LSB from the other (B or D).
+ * The interleaving at the symbol level alternates phase pairs:
+ * symbol 0 → (A,B), symbol 1 → (C,D), symbol 2 → (A,B), ...
+ * This is equivalent to word-level interleaving since each 32-bit
+ * word = 16 symbols, and the alternation is per-symbol.
+ *
+ * This function handles the 2FSK case (num_phases == 2).
+ * For 4FSK (num_phases == 4), word-level interleaving is correct
+ * because the DSP sends dibits and the phase pairing is handled
+ * by the 4-level modulation itself.
+ *
+ * Parameters:
+ *   phases     — array of phase data (each has 88 words)
+ *   num_phases — number of phases (2 for 3200/2FSK)
+ *   mod_type   — FLEX_MOD_2FSK or FLEX_MOD_4FSK
+ *   out        — output buffer (must hold 88 * num_phases * 4 bytes)
+ *
+ * Returns bytes written.
+ */
+static size_t flex_interleave_phases(const flex_phase_data_t *phases,
+				     int num_phases, int mod_type,
+				     uint8_t *out)
+{
+	int w, p, bit;
+	uint8_t *dst = out;
+
+	if (num_phases == 1) {
+		/* Single phase: no interleaving, just serialize words */
+		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+			uint32_t word = phases[0].words[w];
+			*dst++ = (word >> 24) & 0xFF;
+			*dst++ = (word >> 16) & 0xFF;
+			*dst++ = (word >>  8) & 0xFF;
+			*dst++ =  word        & 0xFF;
+		}
+		return (size_t)(dst - out);
+	}
+
+	if (num_phases == 2 && mod_type == FLEX_MOD_2FSK) {
+		/*
+		 * 3200/2FSK bit-level interleaving.
+		 *
+		 * For each bit position across the 88-word frame,
+		 * output A's bit then C's bit.  Total output:
+		 * 88 words × 32 bits × 2 phases = 5632 bits = 704 bytes.
+		 *
+		 * We process word-by-word: for word index w, iterate
+		 * bits 31..0 (MSB first, matching fsk_block_encode
+		 * transmission order).  For each bit position, emit
+		 * phase_A's bit then phase_C's bit into the output
+		 * stream.
+		 */
+		uint8_t cur_byte = 0;
+		int out_bit = 0; /* bit position within current output byte (0..7) */
+
+		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+			uint32_t wa = phases[0].words[w];
+			uint32_t wc = phases[1].words[w];
+
+			for (bit = 31; bit >= 0; bit--) {
+				/* Phase A bit */
+				cur_byte = (cur_byte << 1) | ((wa >> bit) & 1);
+				out_bit++;
+				if (out_bit == 8) {
+					*dst++ = cur_byte;
+					cur_byte = 0;
+					out_bit = 0;
+				}
+
+				/* Phase C bit */
+				cur_byte = (cur_byte << 1) | ((wc >> bit) & 1);
+				out_bit++;
+				if (out_bit == 8) {
+					*dst++ = cur_byte;
+					cur_byte = 0;
+					out_bit = 0;
+				}
+			}
+		}
+
+		/* Flush any remaining bits (shouldn't happen: 88*32*2 = 5632 = 704*8) */
+		if (out_bit > 0) {
+			cur_byte <<= (8 - out_bit);
+			*dst++ = cur_byte;
+		}
+
+		return (size_t)(dst - out);
+	}
+
+	/*
+	 * 4FSK modes (3200/4FSK, 6400/4FSK): word-level interleaving.
+	 *
+	 * The DSP layer sends dibits via fsk4_block_encode.  Each dibit
+	 * carries one bit from each of two phases (MSB from A or C,
+	 * LSB from B or D).  The symbol-level alternation between
+	 * phase pairs (A,B) and (C,D) means word-level interleaving
+	 * produces the correct bit stream:
+	 *   A[0], B[0], C[0], D[0], A[1], B[1], C[1], D[1], ...
+	 */
+	for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+		for (p = 0; p < num_phases; p++) {
+			uint32_t word = phases[p].words[w];
+			*dst++ = (word >> 24) & 0xFF;
+			*dst++ = (word >> 16) & 0xFF;
+			*dst++ = (word >>  8) & 0xFF;
+			*dst++ =  word        & 0xFF;
+		}
+	}
+
+	return (size_t)(dst - out);
+}
+
+
 /* ===== Multi-Phase Frame Encoding (Spec Section 3.3) ===== */
 
 /*
  * Encode a multi-phase FLEX frame for 3200/6400 bps operation.
  *
  * At higher baud rates, the frame carries multiple independent phases:
- *   3200 bps (2-FSK or 4-FSK): 2 phases (A, B)
- *   6400 bps (4-FSK only):     4 phases (A, B, C, D)
+ *   3200 bps (2-FSK): 2 phases (A, C)
+ *   3200 bps (4-FSK): 4 phases (A, B, C, D)
+ *   6400 bps (4-FSK): 4 phases (A, B, C, D)
  *
  * Each phase is an independent set of 88 data words (BIW + addresses +
  * vectors + message data + idle fill), already block-interleaved by the
@@ -1701,10 +2097,10 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
  *   S1:  BS1(4) + Ax(4) + B(2) + Ax_inv(4) = 14 bytes
  *   FIW: 1 codeword = 4 bytes
  *   S2:  C block repeated per baud rate (5/10/20 bytes)
- *   Data: phase words interleaved — for N phases, output order is:
- *         word[0] of phase A, word[0] of phase B, ...,
- *         word[1] of phase A, word[1] of phase B, ...
- *         (88 * N words total)
+ *   Data: bit-interleaved phase data (see flex_interleave_phases)
+ *
+ * For 3200/2FSK, data is BIT-interleaved: A_bit, C_bit, A_bit, C_bit...
+ * For 4FSK modes, data is word-interleaved (DSP handles dibit pairing).
  *
  * The sync pattern (A1/A2/A3/A4) is selected based on baud_rate and
  * modulation_type in params.
@@ -1718,7 +2114,6 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 {
 	uint8_t *out;
 	int err_local = 0;
-	int i, p;
 
 	if (!error)
 		error = &err_local;
@@ -1748,12 +2143,12 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	/* Compute output size:
 	 *   S1: 14 bytes (BS1 + Ax + B + Ax_inv)
 	 *   FIW: 4 bytes
-	 *   S2: 5 * (baud_rate / 1600) bytes
+	 *   S2: flex_s2_size() bytes (per speed/modulation)
 	 *   Data: 88 * num_phases * 4 bytes
 	 */
 	{
-		int s2_bytes = 5 * (params->baud_rate / 1600);
-		size_t needed = 14 + 4 + (size_t)s2_bytes
+		size_t s2_bytes = flex_s2_size(params->baud_rate);
+		size_t needed = 14 + 4 + s2_bytes
 			      + (size_t)(FLEX_WORDS_PER_FRAME * num_phases * 4);
 		if (buffer_size < needed) {
 			*error = -FLEX_ERR_INVALID_BUFFER;
@@ -1763,69 +2158,225 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 
 	out = buffer;
 
-	/* ---- S1: Frame synchronization ---- */
+	/* ---- S1 + FIW + S2 ---- */
+	out += flex_encode_s1(params->baud_rate, params->modulation_type,
+			      out, buffer_size - (size_t)(out - buffer));
+	out += flex_encode_fiw(params, out,
+			       buffer_size - (size_t)(out - buffer));
+	out += flex_encode_s2(params->baud_rate, params->modulation_type,
+			      out, buffer_size - (size_t)(out - buffer));
 
-	EMIT_SYNC(out, sync_bs1);
-
-	switch (params->baud_rate) {
-	case 3200:
-		if (params->modulation_type == FLEX_MOD_4FSK) {
-			EMIT_SYNC(out, sync_a3);
-			EMIT_SYNC(out, sync_b);
-			EMIT_SYNC(out, sync_a3_inv);
-		} else {
-			EMIT_SYNC(out, sync_a2);
-			EMIT_SYNC(out, sync_b);
-			EMIT_SYNC(out, sync_a2_inv);
-		}
-		break;
-	case 6400:
-		EMIT_SYNC(out, sync_a4);
-		EMIT_SYNC(out, sync_b);
-		EMIT_SYNC(out, sync_a4_inv);
-		break;
-	default: /* 1600 */
-		EMIT_SYNC(out, sync_a1);
-		EMIT_SYNC(out, sync_b);
-		EMIT_SYNC(out, sync_a1_inv);
-		break;
-	}
-
-	/* ---- FIW: Frame Information Word ---- */
-
-	EMIT_WORD(out, flex_create_fiw(params->cycle, params->frame,
-				       params->roaming, 0, 0));
-
-	/* ---- S2: C block (25 ms at data rate) ---- */
-
-	EMIT_SYNC(out, sync_c);
-	if (params->baud_rate >= 3200)
-		EMIT_SYNC(out, sync_c);
-	if (params->baud_rate >= 6400) {
-		EMIT_SYNC(out, sync_c);
-		EMIT_SYNC(out, sync_c);
-	}
-
-	/* ---- Data: interleaved phase words ---- */
+	/* ---- Data: bit-interleaved phase data ---- */
 
 	/*
-	 * Per Section 3.3, at multi-phase speeds the data words from
-	 * each phase are interleaved word-by-word:
-	 *   A[0], B[0], A[1], B[1], ... (2 phases)
-	 *   A[0], B[0], C[0], D[0], A[1], B[1], C[1], D[1], ... (4 phases)
-	 *
-	 * Each phase has already been independently block-interleaved
-	 * by the caller.
+	 * Phase interleaving depends on modulation type:
+	 *   3200/2FSK: bit-level (A_bit, C_bit, A_bit, C_bit, ...)
+	 *   4FSK modes: word-level (DSP handles dibit phase pairing)
+	 * See flex_interleave_phases() for details and PDW evidence.
 	 */
-	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
-		for (p = 0; p < num_phases; p++) {
-			uint32_t w = phases[p].words[i];
-			out[0] = (w >> 24) & 0xFF;
-			out[1] = (w >> 16) & 0xFF;
-			out[2] = (w >>  8) & 0xFF;
-			out[3] =  w        & 0xFF;
-			out += 4;
+	out += flex_interleave_phases(phases, num_phases,
+				      params->modulation_type, out);
+
+	return (size_t)(out - buffer);
+}
+
+
+/* ===== Split Sync/Data Encoding (ARIB STD-43A Section 3.2) ===== */
+
+/*
+ * Encode the sync portion of a FLEX frame: S1 + FIW.
+ *
+ * Per ARIB STD-43A Section 3.2, the sync portion is ALWAYS transmitted
+ * at 1600 bps / 2-level FSK, regardless of the frame's data speed.
+ * The receiver uses the A code to determine the target speed, then
+ * switches after FIW to receive S2 + DATA at that rate.
+ *
+ * Layout:
+ *   BS1:     4 bytes (32 bits) — alternating 1010... bit sync
+ *   Ax:      4 bytes (32 bits) — sync code identifying speed/modulation
+ *   B:       2 bytes (16 bits) — baud/level indicator
+ *   Ax_inv:  4 bytes (32 bits) — inverted sync code
+ *   FIW:     4 bytes (32 bits) — BCH-encoded frame information word
+ *   Total:  18 bytes
+ *
+ * The sync code (A1/A2/A3/A4) is selected based on baud_rate and
+ * modulation_type in params, telling the receiver what speed to
+ * expect after the speed switch that follows S1+FIW.
+ *
+ * Returns bytes written (18), or 0 on error.
+ */
+size_t flex_encode_sync(const flex_frame_params_t *params,
+			uint8_t *buffer, size_t buffer_size)
+{
+	uint8_t *out;
+
+	if (!params || !buffer || buffer_size < 18)
+		return 0;
+
+	out = buffer;
+
+	/* S1: BS1(4) + Ax(4) + B(2) + Ax_inv(4) = 14 bytes */
+	out += flex_encode_s1(params->baud_rate, params->modulation_type,
+			      out, buffer_size - (size_t)(out - buffer));
+
+	/* FIW: 4 bytes */
+	out += flex_encode_fiw(params, out,
+			       buffer_size - (size_t)(out - buffer));
+
+	return (size_t)(out - buffer);
+}
+
+
+/*
+ * Encode the data portion of a FLEX frame: S2 + interleaved phase data.
+ *
+ * After S1+FIW (always 1600/2FSK), the transmitter switches to the
+ * frame's target speed/modulation. S2 and DATA are both transmitted
+ * at this target rate.
+ *
+ * S2 structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
+ *   N varies per speed — see flex_encode_s2() for details.
+ *
+ * For multi-phase speeds (3200/6400), the message is encoded into
+ * phase 0 and remaining phases are filled with idle frames. Phase
+ * data is then interleaved into the output:
+ *   3200/2FSK (2 phases): BIT-level — A_bit, C_bit, A_bit, C_bit, ...
+ *   4FSK modes (4 phases): word-level — A[0],B[0],C[0],D[0], ...
+ * See flex_interleave_phases() for details and PDW evidence.
+ *
+ * Output sizes:
+ *   1600/2FSK (1 phase):  S2(5)  + 352  = 357 bytes
+ *   3200/2FSK (2 phases): S2(10) + 704  = 714 bytes
+ *   3200/4FSK (4 phases): S2(10) + 1408 = 1418 bytes
+ *   6400/4FSK (4 phases): S2(20) + 1408 = 1428 bytes
+ *
+ * Returns bytes written, or 0 on error.
+ */
+size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
+			const flex_frame_params_t *params,
+			uint8_t *buffer, size_t buffer_size,
+			int *msgs_packed, int *error)
+{
+	uint8_t tmp[FLEX_BUFFER_SIZE + 32];
+	uint8_t *out;
+	size_t full_len, s2_len, sync_overhead;
+	int err_local = 0;
+	int num_phases, p, w;
+
+	if (!error)
+		error = &err_local;
+	*error = 0;
+
+	if (!params || !buffer) {
+		*error = -FLEX_ERR_INVALID_BUFFER;
+		return 0;
+	}
+
+	/* S2 size for this speed/modulation */
+	s2_len = flex_s2_size(params->baud_rate);
+	if (s2_len == 0) {
+		*error = -FLEX_ERR_INVALID_BUFFER;
+		return 0;
+	}
+
+	/* Phase count from speed/modulation:
+	 *   A1 (1600/2FSK) → 1, A2 (3200/2FSK) → 2,
+	 *   A3 (3200/4FSK) → 4, A4 (6400/4FSK) → 4 */
+	if (params->baud_rate >= 3200 && params->modulation_type == FLEX_MOD_4FSK)
+		num_phases = 4;
+	else if (params->baud_rate >= 3200)
+		num_phases = 2;
+	else
+		num_phases = 1;
+
+	/* Check output buffer can hold S2 + interleaved DATA */
+	{
+		size_t needed = s2_len
+			+ (size_t)(FLEX_WORDS_PER_FRAME * num_phases * 4);
+		if (buffer_size < needed) {
+			*error = -FLEX_ERR_INVALID_BUFFER;
+			return 0;
 		}
+	}
+
+	/* Sync overhead in flex_encode_frame_multi output: S1(14)+FIW(4)+S2 */
+	sync_overhead = 14 + 4 + s2_len;
+
+	/* Use single_phase=1 so flex_encode_frame_multi always produces
+	 * 88 words regardless of speed — we handle phase interleaving here. */
+	{
+		flex_frame_params_t phase_params = *params;
+		phase_params.single_phase = 1;
+
+		/* Phase data: 88 words per phase */
+		flex_phase_data_t phases[FLEX_MAX_PHASES];
+		memset(phases, 0, sizeof(phases));
+
+		/* Phase 0: encode the actual message(s) */
+		full_len = flex_encode_frame_multi(msgs, msg_count, &phase_params,
+						   tmp, sizeof(tmp),
+						   msgs_packed, error);
+		if (full_len == 0)
+			return 0;
+
+		if (sync_overhead + (size_t)(FLEX_WORDS_PER_FRAME * 4) > full_len) {
+			*error = -FLEX_ERR_INVALID_BUFFER;
+			return 0;
+		}
+
+		/* Extract 88 data words from phase 0 (skip S1+FIW+S2) */
+		{
+			uint8_t *dp = tmp + sync_overhead;
+			for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+				phases[0].words[w] =
+					((uint32_t)dp[0] << 24) |
+					((uint32_t)dp[1] << 16) |
+					((uint32_t)dp[2] << 8) |
+					 (uint32_t)dp[3];
+				dp += 4;
+			}
+			phases[0].word_count = FLEX_WORDS_PER_FRAME;
+		}
+
+		/* Fill remaining phases with idle frames */
+		for (p = 1; p < num_phases; p++) {
+			flex_frame_msg_t idle_msg;
+			int idle_packed = 0;
+
+			memset(&idle_msg, 0, sizeof(idle_msg));
+			idle_msg.capcode = 1;
+			idle_msg.msg_type = FLEX_FRAME_MSG_TYPE_TONE;
+			idle_msg.message = "";
+			idle_msg.message_length = 0;
+			idle_msg.speed = params->baud_rate;
+			idle_msg.polarity = -1.0;
+
+			full_len = flex_encode_frame_multi(&idle_msg, 1, &phase_params,
+							   tmp, sizeof(tmp),
+							   &idle_packed, &err_local);
+			if (full_len > 0) {
+				uint8_t *dp = tmp + sync_overhead;
+				for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+					phases[p].words[w] =
+						((uint32_t)dp[0] << 24) |
+						((uint32_t)dp[1] << 16) |
+						((uint32_t)dp[2] << 8) |
+						 (uint32_t)dp[3];
+					dp += 4;
+				}
+				phases[p].word_count = FLEX_WORDS_PER_FRAME;
+			}
+		}
+
+		/* Write S2 + interleaved phase data */
+		out = buffer;
+
+		out += flex_encode_s2(params->baud_rate, params->modulation_type,
+				      out, buffer_size - (size_t)(out - buffer));
+
+		/* Bit-interleave phase data (see flex_interleave_phases) */
+		out += flex_interleave_phases(phases, num_phases,
+					      params->modulation_type, out);
 	}
 
 	return (size_t)(out - buffer);

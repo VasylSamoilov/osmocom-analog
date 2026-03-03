@@ -63,6 +63,7 @@ static uint32_t ssid = 0;
 static uint32_t nid = 0;
 static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
+static int no_ers = 0;
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -79,6 +80,7 @@ static const char *temp_addr = NULL;
 #define OPT_NID			3011
 #define OPT_POCSAG_MIX		3012
 #define OPT_TEMP_ADDR		3013
+#define OPT_NO_ERS		3014
 
 void print_help(const char *arg0)
 {
@@ -111,6 +113,9 @@ void print_help(const char *arg0)
 	printf("        Enable BIW3/BIW4 time broadcast.\n");
 	printf("    --no-biw-time\n");
 	printf("        Disable BIW3/BIW4 time broadcast.\n");
+	printf("    --no-ers\n");
+	printf("        Skip ERS burst in single-shot mode (workaround for decoders\n");
+	printf("        that choke on ERS sync patterns, e.g. PDW).\n");
 	printf("    --ers-cycles <N>\n");
 	printf("        Override ERS cycle count (default auto).\n");
 	printf("    --charset <ascii|kanji>\n");
@@ -149,6 +154,7 @@ static void add_options(void)
 	option_add(OPT_NID, "nid", 1);
 	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
+	option_add(OPT_NO_ERS, "no-ers", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -279,6 +285,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_TEMP_ADDR:
 		temp_addr = options_strdup(argv[argi]);
+		break;
+	case OPT_NO_ERS:
+		no_ers = 1;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -710,6 +719,7 @@ int main(int argc, char *argv[])
 			f->lpf_enabled = lpf_enabled;
 			f->biw_time_enabled = biw_time_enabled;
 			f->ers_cycles_override = ers_cycles_override;
+			f->no_ers = no_ers;
 			f->default_charset = default_charset;
 			f->ssid = ssid;
 			f->nid = nid;
