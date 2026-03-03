@@ -461,6 +461,57 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words)
 	memcpy(frame_words + block_num * FLEX_WORDS_PER_BLOCK, dst, sizeof(dst));
 }
 
+/*
+ * Fill a phase's word array with the proper idle pattern per ARIB STD-43A
+ * Section 3.4.1, Table 3.4.1-1.
+ *
+ * The standard requires idle blocks to produce a 1,0 bit pattern at 1600 bps
+ * on the channel.  For 2FSK this means alternating all-1s and all-0s words.
+ * For 4FSK, the MSB phases (A, and C for 6400) get the alternating pattern,
+ * while the LSB phases (C for 3200, B and D for 6400) get all-zeros so that
+ * the resulting 4-level symbols are only the two extreme levels (±4800 Hz),
+ * reproducing the same 1600 bps binary waveform.
+ *
+ * Standard idle patterns by mode:
+ *   1600/2FSK, 3200/2FSK: all phases alternate 0xFFFFFFFF / 0x00000000
+ *   3200/4FSK: Phase A alternates, Phase C = all zeros
+ *   6400/4FSK: Phases A,C alternate, Phases B,D = all zeros
+ *
+ * phase_index: 0=A, 1=B(6400) or C(3200), 2=C(6400), 3=D(6400)
+ * mod_type: FLEX_MOD_2FSK or FLEX_MOD_4FSK
+ * baud_rate: 1600, 3200, or 6400
+ */
+void flex_fill_idle_phase(uint32_t *words, int phase_index,
+			  int mod_type, int baud_rate)
+{
+	int w;
+	int is_lsb_phase = 0;
+
+	if (mod_type == FLEX_MOD_4FSK) {
+		if (baud_rate <= 3200) {
+			/* 3200/4FSK: phase 0=A (MSB, alternating),
+			 *            phase 1=C (LSB, all zeros) */
+			is_lsb_phase = (phase_index == 1);
+		} else {
+			/* 6400/4FSK: phases 0=A, 2=C (MSB, alternating),
+			 *            phases 1=B, 3=D (LSB, all zeros) */
+			is_lsb_phase = (phase_index == 1 || phase_index == 3);
+		}
+	}
+
+	if (is_lsb_phase) {
+		/* LSB phase: all zeros */
+		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++)
+			words[w] = FLEX_IDLE_WORD_2;
+	} else {
+		/* MSB phase (or 2FSK): alternating 1s and 0s */
+		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++)
+			words[w] = (w % 2 == 0) ? FLEX_IDLE_WORD_1
+						 : FLEX_IDLE_WORD_2;
+	}
+}
+
+
 /* ===== Numeric Character Table (Spec Section 3.10.2, Table 3.10.2.1) ===== */
 
 static uint8_t numeric_char_to_flex(uint8_t ch)
@@ -1954,34 +2005,29 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
  *     hbit=0 → bit goes to phase A, hbit=1 → bit goes to phase C
  *     Pattern: A_bit, C_bit, A_bit, C_bit, ...
  *
- *   3200/4FSK (4 phases A,B,C,D):
- *     hbit=0 → dibit MSB→A, LSB→B; hbit=1 → dibit MSB→C, LSB→D
- *     At the 2FSK bit level this is still alternating A,C per bit,
- *     with B,D carried by the 4FSK second level.
+ *   3200/4FSK (2 phases A,B):
+ *     Each 4-level symbol carries A_bit (MSB) and B_bit (LSB).
+ *     No phase-toggle interleaving — every symbol goes to A+B.
+ *     PDW (g_sps=1600, level=4): phase_A from MSB, phase_B from LSB.
+ *     multimon-ng (Sync.baud=1600, levels=4): same, no toggle.
  *
- *   6400/4FSK: same as 3200/4FSK (symbol rate is 3200 baud).
+ *   6400/4FSK (4 phases A,B,C,D):
+ *     hbit=0 → dibit MSB→A, LSB→B; hbit=1 → dibit MSB→C, LSB→D
+ *     Symbol stream alternates: (A,B), (C,D), (A,B), (C,D), ...
  *
  * For 2FSK encoding (which is what the DSP layer sends for 3200/2FSK),
  * we must bit-interleave: output bit 0 = A_bit0, bit 1 = C_bit0,
  * bit 2 = A_bit1, bit 3 = C_bit1, etc.
  *
- * For 4FSK encoding, the DSP layer sends dibits.  Each dibit's MSB
- * comes from one phase pair (A or C) and LSB from the other (B or D).
- * The interleaving at the symbol level alternates phase pairs:
- * symbol 0 → (A,B), symbol 1 → (C,D), symbol 2 → (A,B), ...
- * This is equivalent to word-level interleaving since each 32-bit
- * word = 16 symbols, and the alternation is per-symbol.
+ * For 3200/4FSK, each dibit = (A_bit, B_bit), no interleaving needed.
  *
- * This function handles the 2FSK case (num_phases == 2).
- * For 4FSK (num_phases == 4), word-level interleaving is correct
- * because the DSP sends dibits and the phase pairing is handled
- * by the 4-level modulation itself.
+ * For 6400/4FSK, dibits alternate between phase pairs (A,B) and (C,D).
  *
  * Parameters:
  *   phases     — array of phase data (each has 88 words)
- *   num_phases — number of phases (2 for 3200/2FSK)
+ *   num_phases — 1 (1600/2FSK), 2 (3200/2FSK or 3200/4FSK), 4 (6400/4FSK)
  *   mod_type   — FLEX_MOD_2FSK or FLEX_MOD_4FSK
- *   out        — output buffer (must hold 88 * num_phases * 4 bytes)
+ *   out        — output buffer (must hold interleaved data)
  *
  * Returns bytes written.
  */
@@ -2053,67 +2099,92 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
 		return (size_t)(dst - out);
 	}
 
-	/*
-	 * 4FSK modes: bit-level interleaving into dibits (Section 3.3.2).
-	 *
-	 * The DSP layer (fsk4_block_encode) reads dibits from the buffer:
-	 *   sym = (word >> 30) & 0x03; word <<= 2;
-	 * Each dibit = one 4-level symbol.
-	 *
-	 * PDW (Flex.cpp) at g_sps==3200, level==4:
-	 *   hbit=0 → symbol MSB→A[bct], LSB→B[bct]
-	 *   hbit=1 → symbol MSB→C[bct], LSB→D[bct], bct++
-	 *
-	 * So the transmitted symbol stream must alternate:
-	 *   (A_bit0,C_bit0), (B_bit0,D_bit0), (A_bit1,C_bit1), ...
-	 *
-	 * Spec Section 3.3.2 confirms:
-	 *   3200/4FSK: "bit 0a → MSB, bit 0c → LSB" for first symbol
-	 *     → symbol = (A_bit, C_bit), then (B_bit, D_bit)
-	 *     Phase pairing: (A,C) and (B,D) alternate per symbol.
-	 *
-	 *   6400/4FSK: "bit 0a → MSB, bit 0b → LSB" for first symbol
-	 *     → symbol = (A_bit, B_bit), then (C_bit, D_bit)
-	 *     Phase pairing: (A,B) and (C,D) alternate per symbol.
-	 *
-	 * We output dibits packed MSB-first into bytes, matching
-	 * fsk4_block_encode's consumption order.
-	 *
-	 * Total: 88 words × 32 bits × 4 phases = 11264 bits
-	 *       = 5632 dibits = 11264 bits = 1408 bytes.
-	 */
-	{
-		/* Phase indices for dibit construction.
-		 * Even symbols: MSB from p_msb0, LSB from p_lsb0
-		 * Odd symbols:  MSB from p_msb1, LSB from p_lsb1
+	if (num_phases == 2 && mod_type == FLEX_MOD_4FSK) {
+		/*
+		 * 3200/4FSK: 2 phases (A, C) packed into 4-level symbols.
 		 *
-		 * 3200/4FSK (spec): (A,C) then (B,D) → indices (0,2),(1,3)
-		 * 6400/4FSK (spec): (A,B) then (C,D) → indices (0,1),(2,3)
+		 * Per spec Section 3.3.2: "Of the first 2 bits for
+		 * 3200bps/4-level FSK, bit 0a is converted into the MSB
+		 * for the symbol and bit 0c into the LSB."
+		 *
+		 * Each symbol carries one bit from phase A (MSB) and one
+		 * bit from phase C (LSB).  No phase-toggle interleaving —
+		 * the symbol rate is 1600 sym/s (same as 1600/2FSK).
+		 *
+		 * multimon-ng (Sync.baud=1600, levels=4):
+		 *   bit_a = (sym > 1)          → phase A (MSB)
+		 *   bit_b = (sym==1)||(sym==2) → phase C (LSB)
+		 *   phase_toggle forced to 0 (baud==1600)
+		 *
+		 * PDW (g_sps=1600, level=4):
+		 *   phase_A from (gin < 2)         → MSB
+		 *   phase_B from (gin==0)||(gin==3) → LSB
+		 *
+		 * Total: 88 words × 32 bits × 2 phases = 5632 bits
+		 *       = 2816 dibits = 704 bytes.
 		 */
-		int p_msb0, p_lsb0, p_msb1, p_lsb1;
+		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+			uint32_t wa = phases[0].words[w];  /* phase A */
+			uint32_t wc = phases[1].words[w];  /* phase C */
 
-		if (baud_rate >= 6400) {
-			/* 6400/4FSK: (A,B) then (C,D) */
-			p_msb0 = 0; p_lsb0 = 1;
-			p_msb1 = 2; p_lsb1 = 3;
-		} else {
-			/* 3200/4FSK: (A,C) then (B,D) */
-			p_msb0 = 0; p_lsb0 = 2;
-			p_msb1 = 1; p_lsb1 = 3;
+			for (bit = 31; bit >= 0; bit--) {
+				uint8_t msb = (wa >> bit) & 1;  /* A → MSB */
+				uint8_t lsb = (wc >> bit) & 1;  /* C → LSB */
+				cur_byte = (cur_byte << 2) | (msb << 1) | lsb;
+				out_bit += 2;
+				if (out_bit == 8) {
+					*dst++ = cur_byte;
+					cur_byte = 0;
+					out_bit = 0;
+				}
+			}
 		}
 
+		if (out_bit > 0) {
+			cur_byte <<= (8 - out_bit);
+			*dst++ = cur_byte;
+		}
+		return (size_t)(dst - out);
+	}
+
+	/*
+	 * 6400/4FSK: 4 phases (A, B, C, D) with dibit interleaving.
+	 *
+	 * Per spec Section 3.3.2: "Of the first 2 bits for the
+	 * 6400bps/4-level FSK, bit 0a is converted into the MSB for
+	 * the symbol and bit 0b into the LSB."
+	 *
+	 * Transmission order: 0a, 0b, 0c, 0d, 1a, 1b, 1c, 1d, ...
+	 * At 4-level: symbols alternate (A,B) and (C,D) pairs.
+	 *   Even symbols: MSB=A, LSB=B
+	 *   Odd symbols:  MSB=C, LSB=D
+	 *
+	 * PDW (g_sps=3200, level=4):
+	 *   hbit=0 → MSB→A, LSB→B
+	 *   hbit=1 → MSB→C, LSB→D, bct++
+	 *
+	 * multimon-ng (Sync.baud=3200, levels=4):
+	 *   phase_toggle alternates 0/1 per symbol
+	 *   toggle=0 → bit_a→A, bit_b→B
+	 *   toggle=1 → bit_a→C, bit_b→D
+	 *
+	 * Total: 88 words × 32 bits × 4 phases = 11264 bits
+	 *       = 5632 dibits = 1408 bytes.
+	 */
+	{
+		/* Phase pairing: (A,B) then (C,D) */
 		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
-			uint32_t w0m = phases[p_msb0].words[w];
-			uint32_t w0l = phases[p_lsb0].words[w];
-			uint32_t w1m = phases[p_msb1].words[w];
-			uint32_t w1l = phases[p_lsb1].words[w];
+			uint32_t wa = phases[0].words[w];
+			uint32_t wb = phases[1].words[w];
+			uint32_t wc = phases[2].words[w];
+			uint32_t wd = phases[3].words[w];
 
 			for (bit = 31; bit >= 0; bit--) {
 				uint8_t msb, lsb;
 
-				/* Even symbol: (p_msb0, p_lsb0) */
-				msb = (w0m >> bit) & 1;
-				lsb = (w0l >> bit) & 1;
+				/* Even symbol: (A, B) */
+				msb = (wa >> bit) & 1;
+				lsb = (wb >> bit) & 1;
 				cur_byte = (cur_byte << 2) | (msb << 1) | lsb;
 				out_bit += 2;
 				if (out_bit == 8) {
@@ -2122,9 +2193,9 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
 					out_bit = 0;
 				}
 
-				/* Odd symbol: (p_msb1, p_lsb1) */
-				msb = (w1m >> bit) & 1;
-				lsb = (w1l >> bit) & 1;
+				/* Odd symbol: (C, D) */
+				msb = (wc >> bit) & 1;
+				lsb = (wd >> bit) & 1;
 				cur_byte = (cur_byte << 2) | (msb << 1) | lsb;
 				out_bit += 2;
 				if (out_bit == 8) {
@@ -2154,7 +2225,7 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
  *
  * At higher baud rates, the frame carries multiple independent phases:
  *   3200 bps (2-FSK): 2 phases (A, C)
- *   3200 bps (4-FSK): 4 phases (A, B, C, D)
+ *   3200 bps (4-FSK): 2 phases (A, B)
  *   6400 bps (4-FSK): 4 phases (A, B, C, D)
  *
  * Each phase is an independent set of 88 data words (BIW + addresses +
@@ -2168,7 +2239,7 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
  *   Data: bit-interleaved phase data (see flex_interleave_phases)
  *
  * For 3200/2FSK, data is BIT-interleaved: A_bit, C_bit, A_bit, C_bit...
- * For 3200/4FSK, data is dibit-interleaved: (A,C), (B,D) alternating.
+ * For 3200/4FSK, data is dibit-packed: each symbol = (A_bit, B_bit).
  * For 6400/4FSK, data is dibit-interleaved: (A,B), (C,D) alternating.
  *
  * The sync pattern (A1/A2/A3/A4) is selected based on baud_rate and
@@ -2240,7 +2311,7 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	/*
 	 * Phase interleaving depends on modulation type:
 	 *   3200/2FSK: bit-level (A_bit, C_bit, A_bit, C_bit, ...)
-	 *   3200/4FSK: dibit-level, phase pairs (A,C) and (B,D) alternate
+	 *   3200/4FSK: dibit-packed, each symbol = (A_bit, B_bit)
 	 *   6400/4FSK: dibit-level, phase pairs (A,B) and (C,D) alternate
 	 * See flex_interleave_phases() for details and PDW evidence.
 	 */
@@ -2312,14 +2383,14 @@ size_t flex_encode_sync(const flex_frame_params_t *params,
  * phase 0 and remaining phases are filled with idle frames. Phase
  * data is then interleaved into the output:
  *   3200/2FSK (2 phases): BIT-level — A_bit, C_bit, A_bit, C_bit, ...
- *   3200/4FSK (4 phases): dibit-level — (A,C), (B,D) alternating
+ *   3200/4FSK (2 phases): dibit-packed — each symbol = (A_bit, B_bit)
  *   6400/4FSK (4 phases): dibit-level — (A,B), (C,D) alternating
  * See flex_interleave_phases() for details and PDW evidence.
  *
  * Output sizes:
  *   1600/2FSK (1 phase):  S2(5)  + 352  = 357 bytes
  *   3200/2FSK (2 phases): S2(10) + 704  = 714 bytes
- *   3200/4FSK (4 phases): S2(10) + 1408 = 1418 bytes
+ *   3200/4FSK (2 phases): S2(10) + 704  = 714 bytes
  *   6400/4FSK (4 phases): S2(20) + 1408 = 1428 bytes
  *
  * Returns bytes written, or 0 on error.
@@ -2353,8 +2424,8 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 
 	/* Phase count from speed/modulation:
 	 *   A1 (1600/2FSK) → 1, A2 (3200/2FSK) → 2,
-	 *   A3 (3200/4FSK) → 4, A4 (6400/4FSK) → 4 */
-	if (params->baud_rate >= 3200 && params->modulation_type == FLEX_MOD_4FSK)
+	 *   A3 (3200/4FSK) → 2, A4 (6400/4FSK) → 4 */
+	if (params->baud_rate >= 6400 && params->modulation_type == FLEX_MOD_4FSK)
 		num_phases = 4;
 	else if (params->baud_rate >= 3200)
 		num_phases = 2;
@@ -2410,34 +2481,13 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 			phases[0].word_count = FLEX_WORDS_PER_FRAME;
 		}
 
-		/* Fill remaining phases with idle frames */
+		/* Fill remaining phases with proper idle pattern (Section 3.4.1).
+		 * For 4FSK, LSB phases get all-zeros; MSB phases alternate. */
 		for (p = 1; p < num_phases; p++) {
-			flex_frame_msg_t idle_msg;
-			int idle_packed = 0;
-
-			memset(&idle_msg, 0, sizeof(idle_msg));
-			idle_msg.capcode = 1;
-			idle_msg.msg_type = FLEX_FRAME_MSG_TYPE_TONE;
-			idle_msg.message = "";
-			idle_msg.message_length = 0;
-			idle_msg.speed = params->baud_rate;
-			idle_msg.polarity = -1.0;
-
-			full_len = flex_encode_frame_multi(&idle_msg, 1, &phase_params,
-							   tmp, sizeof(tmp),
-							   &idle_packed, &err_local);
-			if (full_len > 0) {
-				uint8_t *dp = tmp + sync_overhead;
-				for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
-					phases[p].words[w] =
-						((uint32_t)dp[0] << 24) |
-						((uint32_t)dp[1] << 16) |
-						((uint32_t)dp[2] << 8) |
-						 (uint32_t)dp[3];
-					dp += 4;
-				}
-				phases[p].word_count = FLEX_WORDS_PER_FRAME;
-			}
+			flex_fill_idle_phase(phases[p].words, p,
+					     params->modulation_type,
+					     params->baud_rate);
+			phases[p].word_count = FLEX_WORDS_PER_FRAME;
 		}
 
 		/* Write S2 + interleaved phase data */

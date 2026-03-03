@@ -332,14 +332,14 @@ static void flex_setup_frame_buffers(flex_t *flex,
 /* Map (baud_rate, modulation_type) → phase count per ARIB STD-43A:
  *   A1 (1600, 2FSK) → 1 phase
  *   A2 (3200, 2FSK) → 2 phases (A, C)
- *   A3 (3200, 4FSK) → 4 phases (A, B, C, D)
- *   A4 (6400, 4FSK) → 4 phases (A, B, C, D) */
+ *   A3 (3200, 4FSK) → 2 phases (A, C) — 1600 sym/s × 4 levels
+ *   A4 (6400, 4FSK) → 4 phases (A, B, C, D) — 3200 sym/s × 4 levels */
 static int flex_get_phase_count(int baud_rate, int modulation_type)
 {
 	if (baud_rate >= 6400 && modulation_type == FLEX_MOD_4FSK)
 		return 4;  /* A4 */
 	if (baud_rate >= 3200 && modulation_type == FLEX_MOD_4FSK)
-		return 4;  /* A3 */
+		return 2;  /* A3: phases A+B packed into 4-level symbols */
 	if (baud_rate >= 3200)
 		return 2;  /* A2 */
 	return 1;  /* A1 */
@@ -527,8 +527,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 	}
 
-	/* Multi-phase encoding for A3 (2 phases) and A4 (4 phases).
-	 * A1 and A2 are single-phase and skip this block. */
+	/* Multi-phase encoding for A2/A3 (2 phases) and A4 (4 phases).
+	 * A1 is single-phase and skips this block. */
 	int num_phases = flex_get_phase_count(params.baud_rate, params.modulation_type);
 	if (msg && num_phases > 1) {
 		flex_phase_data_t phases[FLEX_MAX_PHASES];
@@ -636,36 +636,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 
 		if (any_msg) {
-			/* Fill empty phases with idle data */
+			/* Fill empty phases with proper idle pattern (Section 3.4.1) */
 			for (p = 0; p < num_phases; p++) {
 				if (!phase_has_msg[p]) {
-					/* Encode an idle frame for this phase */
-					flex_frame_msg_t idle_msg;
-					memset(&idle_msg, 0, sizeof(idle_msg));
-					idle_msg.capcode = 1;
-					idle_msg.msg_type = FLEX_FRAME_MSG_TYPE_TONE;
-					idle_msg.message = "";
-					idle_msg.message_length = 0;
-					idle_msg.speed = params.baud_rate;
-					idle_msg.polarity = -1.0;
-
-					len = flex_encode_frame_multi(&idle_msg, 1, &phase_params,
-								      phase_buf, sizeof(phase_buf),
-								      &msgs_packed, &error);
-					if (len > 0) {
-						int w;
-						int s2_bytes = 5 * (params.baud_rate / 1600);
-						uint8_t *dp = phase_buf + 14 + 4 + s2_bytes;
-						for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
-							phases[p].words[w] =
-								((uint32_t)dp[0] << 24) |
-								((uint32_t)dp[1] << 16) |
-								((uint32_t)dp[2] << 8) |
-								 (uint32_t)dp[3];
-							dp += 4;
-						}
-						phases[p].word_count = FLEX_WORDS_PER_FRAME;
-					}
+					flex_fill_idle_phase(phases[p].words, p,
+							     params.modulation_type,
+							     params.baud_rate);
+					phases[p].word_count = FLEX_WORDS_PER_FRAME;
 				}
 			}
 

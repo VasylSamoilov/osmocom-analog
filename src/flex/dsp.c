@@ -54,11 +54,15 @@ static void dsp_init_ramp(flex_t *flex)
 	}
 }
 
-/* 4-FSK deviation levels (normalized to fsk_deviation = 1.0).
+/* 4-FSK deviation levels indexed by symbol number (0-3).
  * ARIB STD-43A Section 2: +4800, +1600, -1600, -4800 Hz.
  * With FM deviation = 4800 Hz, these map to +1.0, +1/3, -1/3, -1.0.
- * Symbol mapping: 00→level 0 (-1.0), 01→level 1 (-1/3),
- *                 10→level 2 (+1/3), 11→level 3 (+1.0) */
+ *
+ * The standard uses Gray coding for dibit-to-symbol mapping:
+ *   dibit "00" -> sym 0 (-4800 Hz), dibit "01" -> sym 1 (-1600 Hz),
+ *   dibit "11" -> sym 2 (+1600 Hz), dibit "10" -> sym 3 (+4800 Hz).
+ * Gray encoding is applied in fsk4_block_encode(), not here;
+ * this array is indexed by the gray-encoded symbol number. */
 static const double fsk4_levels[4] = { -1.0, -1.0/3.0, 1.0/3.0, 1.0 };
 
 /* Pre-compute 4-FSK ramp tables for all 16 level transitions.
@@ -256,6 +260,17 @@ static int fsk4_block_encode(flex_t *flex, uint32_t word, int nsymbols)
 	int i, count;
 	uint8_t last_level, sym;
 
+	/* Gray code lookup: dibit → symbol index.
+	 * Per ARIB STD-43A Section 2.1.3, 4-level FM uses Gray coding:
+	 *   dibit "00" → -4800 Hz (sym 0)
+	 *   dibit "01" → -1600 Hz (sym 1)
+	 *   dibit "11" → +1600 Hz (sym 2)
+	 *   dibit "10" → +4800 Hz (sym 3)
+	 * Standard binary-to-gray: gray = val ^ (val >> 1)
+	 *   0b00 → 0b00 (0), 0b01 → 0b01 (1),
+	 *   0b10 → 0b11 (3), 0b11 → 0b10 (2) */
+	static const uint8_t gray_encode[4] = { 0, 1, 3, 2 };
+
 	spl = flex->fsk_tx_buffer;
 	phase = flex->fsk_tx_phase;
 	last_level = flex->fsk4_tx_last_level;
@@ -264,7 +279,7 @@ static int fsk4_block_encode(flex_t *flex, uint32_t word, int nsymbols)
 	bitstep = flex->fsk_bitstep * 256.0;
 
 	for (i = 0; i < nsymbols; i++) {
-		sym = (word >> 30) & 0x03;
+		sym = gray_encode[(word >> 30) & 0x03];
 		word <<= 2;
 
 		if (sym == last_level) {
@@ -952,7 +967,13 @@ static void flex_rx_bit(flex_t *flex, uint8_t bit)
 			flex->rx.shift_reg = 0;
 
 			if (flex->rx.rx_mode == RX_MODE_A3) {
-				/* A3: expect 176 interleaved words (2 × 88) */
+				/* A3 (3200/4FSK): 2 phases (A, B) packed
+				 * into 4-level symbols.  The demodulator
+				 * delivers dibits as 2-bit values; at the
+				 * bit level we receive 88 words of phase A
+				 * interleaved with 88 words of phase B.
+				 * Total: 176 words (5632 bits = 2816 dibits).
+				 */
 				if (flex->rx.word_count >= FLEX_WORDS_PER_FRAME * 2) {
 					/* De-interleave: even words → phase A, odd → phase B */
 					uint32_t phase_a[FLEX_WORDS_PER_FRAME];

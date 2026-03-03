@@ -193,7 +193,7 @@ typedef struct flex_frame_params {
 
 /* ===== Phase Multiplexing (Spec Section 3.3) ===== */
 
-/* Maximum phases: 2 at 3200 bps, 4 at 6400 bps */
+/* Maximum phases: 2 at 3200 bps (2FSK or 4FSK), 4 at 6400 bps */
 #define FLEX_MAX_PHASES		4
 
 /* Phase data for multi-phase frames.
@@ -229,6 +229,7 @@ int flex_fragment_message(const char *message, int msg_type,
 			  char **fragments, int max_fragments);
 
 /* Encode a multi-phase frame (3200 bps: 2 phases, 6400 bps: 4 phases).
+ * 3200/4FSK also uses 2 phases (A, B) packed into 4-level symbols.
  * Phase data words are interleaved in the output per Section 3.3.
  * Returns bytes written to buffer, or 0 on error. */
 size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
@@ -252,6 +253,11 @@ uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr);
 uint32_t flex_encode_word(uint32_t dw);
 uint32_t flex_word_checksum(uint32_t dw);
 void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
+
+/* Fill a phase's word array with the proper idle pattern per Section 3.4.1.
+ * For 4FSK modes, LSB phases get all-zeros instead of alternating. */
+void flex_fill_idle_phase(uint32_t *words, int phase_index,
+			  int mod_type, int baud_rate);
 uint32_t flex_create_fiw(uint32_t cycle, uint32_t frame, uint32_t n,
 			 uint32_t r, uint32_t t);
 uint32_t flex_create_biw1(uint32_t prio, uint32_t e_biw,
