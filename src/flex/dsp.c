@@ -133,9 +133,33 @@ int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polar
 
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Init DSP for transceiver.\n");
 
-	/* set modulation parameters
-	 * NOTE: baudrate equals modulation, because we have a raised cosine ramp of beta = 0.5 */
-	sender_set_fm(&flex->sender, deviation, 1600, deviation, MAX_DISPLAY);
+	/* Set FM modulation parameters for the SDR signal chain.
+	 *
+	 * sender_set_fm(sender, max_deviation, max_modulation, speech_deviation, max_display)
+	 *
+	 * max_deviation (4800 Hz):
+	 *   Peak FM deviation.  ARIB STD-43A §2.1.3 specifies ±4.8 kHz for
+	 *   both 2-level and 4-level FSK (outer symbols).
+	 *
+	 * max_modulation (3200 Hz):
+	 *   Highest baseband frequency component of the modulated signal.
+	 *   The SDR layer uses this together with max_deviation to calculate
+	 *   the channel bandwidth via Carson's rule:
+	 *     bandwidth = 2 × (max_deviation + max_modulation)
+	 *   This bandwidth determines:
+	 *     - SDR channel filter / channelizer decimation
+	 *     - RX FM demodulator IIR lowpass cutoff (bandwidth / 2)
+	 *   The highest symbol rate across all FLEX modes is 3200 symbols/sec
+	 *   (3200bps/2FSK and 6400bps/4FSK), so the baseband extends to
+	 *   ~3200 Hz.  Carson's rule: 2 × (4800 + 3200) = 16 kHz, which
+	 *   matches the standard's occupied bandwidth limit (§2.1.7: ≤16 kHz).
+	 *
+	 * speech_deviation (4800 Hz):
+	 *   Scaling factor applied by process_sender_audio() to convert
+	 *   normalized baseband samples (±1.0) to frequency in Hz.
+	 *   Since our FSK samples are already normalized to ±1.0 = ±4800 Hz,
+	 *   speech_deviation equals max_deviation. */
+	sender_set_fm(&flex->sender, deviation, 3200, deviation, MAX_DISPLAY);
 
 	/* Size buffer for slowest speed (1600 baud = most samples per word) */
 	max_bitduration = (double)samplerate / 1600.0;
