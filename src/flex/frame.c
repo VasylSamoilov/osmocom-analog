@@ -83,9 +83,9 @@ struct flex_msg_config {
  *
  * === Table 3.2-4: 6400bps/4-level frame speed ===
  *   BS1       1010101010101010 1010101010101010
- *   A (A4)    0010000010101111 0101100100111001
+ *   A (A4)    0010000101011111 0101100100111001
  *   B         0101010101010101
- *   inv.A(A4) 1101111101010000 1010011011000110
+ *   inv.A(A4) 1101111010100000 1010011011000110
  *   Frame Info iiiiiiiiiiiiiiii iiiiiipppppppppppp
  *   BS2       1010101010101010 1010101010101010 (symbol)
  *   C         1110110110000100 (decoded value)
@@ -96,18 +96,18 @@ struct flex_msg_config {
  *   A1  1600bps/2-level     0111100011110011 0101100100111001
  *   A2  3200bps/2-level     1000010011100111 0101100100111001
  *   A3  3200bps/4-level     0100111110010111 0101100100111001
- *   A4  6400bps/4-level     0010000010101111 0101100100111001
+ *   A4  6400bps/4-level     0010000101011111 0101100100111001
  *   A5  Reserved            1101110101001011 0101100100111001
  *   A6  Reserved            0001011000111011 0101100100111001
- *   A7  Reserved            1011001110000001 0101100100111001
+ *   A7  Reserved            1011001110000011 0101100100111001
  *   A8  Reserved            0110001101000001 0101100100111001
- *   A9  Reserved            0001101111000010 0101100100111001
+ *   A9  Reserved            0001101111100010 0101100100111001
  *   A10 Reserved            0010110010000110 0101100100111001
  *   A11 Reserved            1010010111101000 0101100100111001
  *   A12 Reserved            1001001010001100 0101100100111001
  *   A13 Reserved            0110111010011000 0101100100111001
  *   A14 Reserved            1011111001011010 0101100100111001
- *   A15 Reserved            1111000100111101 0101100100111001
+ *   A15 Reserved            1111000110011101 0101100100111001
  *   Ar  Re-synchronization  1100101100100000 0101100100111001
  *   * "A" = BCH(31,21) code + even parity, transmitted in reverse order
  *
@@ -126,24 +126,24 @@ static const uint8_t sync_a2[]        = {0x84, 0xE7, 0x59, 0x39}; /* 3200/2FSK *
 static const uint8_t sync_a2_inv[]    = {0x7B, 0x18, 0xA6, 0xC6};
 static const uint8_t sync_a3[]        = {0x4F, 0x97, 0x59, 0x39}; /* 3200/4FSK */
 static const uint8_t sync_a3_inv[]    = {0xB0, 0x68, 0xA6, 0xC6};
-static const uint8_t sync_a4[]        = {0x20, 0xAF, 0x59, 0x39}; /* 6400/4FSK */
-static const uint8_t sync_a4_inv[]    = {0xDF, 0x50, 0xA6, 0xC6};
+static const uint8_t sync_a4[]        = {0x21, 0x5F, 0x59, 0x39}; /* 6400/4FSK */
+static const uint8_t sync_a4_inv[]    = {0xDE, 0xA0, 0xA6, 0xC6};
 
 /* A codes — reserved (Table 3.2-5)
  * Not used by the encoder (no defined frame speed), but kept here
  * for completeness. The RX decoder in dsp.c detects these via
  * FLEX_SYNC_A5..A15 defines and logs them as unsupported. */
-static const uint8_t sync_a5[]  __attribute__((unused)) = {0xDC, 0xD3, 0x59, 0x39};
+static const uint8_t sync_a5[]  __attribute__((unused)) = {0xDD, 0x4B, 0x59, 0x39};
 static const uint8_t sync_a6[]  __attribute__((unused)) = {0x16, 0x3B, 0x59, 0x39};
-static const uint8_t sync_a7[]  __attribute__((unused)) = {0xB3, 0x81, 0x59, 0x39};
+static const uint8_t sync_a7[]  __attribute__((unused)) = {0xB3, 0x83, 0x59, 0x39};
 static const uint8_t sync_a8[]  __attribute__((unused)) = {0x63, 0x41, 0x59, 0x39};
-static const uint8_t sync_a9[]  __attribute__((unused)) = {0x1B, 0xC2, 0x59, 0x39};
+static const uint8_t sync_a9[]  __attribute__((unused)) = {0x1B, 0xE2, 0x59, 0x39};
 static const uint8_t sync_a10[] __attribute__((unused)) = {0x2C, 0x86, 0x59, 0x39};
 static const uint8_t sync_a11[] __attribute__((unused)) = {0xA5, 0xE8, 0x59, 0x39};
 static const uint8_t sync_a12[] __attribute__((unused)) = {0x92, 0x8C, 0x59, 0x39};
 static const uint8_t sync_a13[] __attribute__((unused)) = {0x6E, 0x98, 0x59, 0x39};
 static const uint8_t sync_a14[] __attribute__((unused)) = {0xBE, 0x5A, 0x59, 0x39};
-static const uint8_t sync_a15[] __attribute__((unused)) = {0xF1, 0x3D, 0x59, 0x39};
+static const uint8_t sync_a15[] __attribute__((unused)) = {0xF1, 0x9D, 0x59, 0x39};
 
 /* Ar: ERS re-synchronization (Table 3.2-5) */
 static const uint8_t sync_ar[]        = {0xCB, 0x20, 0x59, 0x39};
@@ -1985,15 +1985,18 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
  *
  * Returns bytes written.
  */
+
 static size_t flex_interleave_phases(const flex_phase_data_t *phases,
 				     int num_phases, int mod_type,
-				     uint8_t *out)
+				     int baud_rate, uint8_t *out)
 {
-	int w, p, bit;
+	int w, bit;
 	uint8_t *dst = out;
+	uint8_t cur_byte = 0;
+	int out_bit = 0;
 
 	if (num_phases == 1) {
-		/* Single phase: no interleaving, just serialize words */
+		/* Single phase (1600/2FSK): no interleaving, just serialize */
 		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
 			uint32_t word = phases[0].words[w];
 			*dst++ = (word >> 24) & 0xFF;
@@ -2006,21 +2009,17 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
 
 	if (num_phases == 2 && mod_type == FLEX_MOD_2FSK) {
 		/*
-		 * 3200/2FSK bit-level interleaving.
+		 * 3200/2FSK bit-level interleaving (Section 3.3.2).
 		 *
-		 * For each bit position across the 88-word frame,
-		 * output A's bit then C's bit.  Total output:
-		 * 88 words × 32 bits × 2 phases = 5632 bits = 704 bytes.
+		 * PDW (Flex.cpp lines 1159-1180) at g_sps==3200, level==2:
+		 *   hbit=0 → bit goes to phase A
+		 *   hbit=1 → bit goes to phase C, bct++
 		 *
-		 * We process word-by-word: for word index w, iterate
-		 * bits 31..0 (MSB first, matching fsk_block_encode
-		 * transmission order).  For each bit position, emit
-		 * phase_A's bit then phase_C's bit into the output
-		 * stream.
+		 * So the transmitted bit stream must alternate:
+		 *   A_bit0, C_bit0, A_bit1, C_bit1, ...
+		 *
+		 * Total: 88 words × 32 bits × 2 = 5632 bits = 704 bytes.
 		 */
-		uint8_t cur_byte = 0;
-		int out_bit = 0; /* bit position within current output byte (0..7) */
-
 		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
 			uint32_t wa = phases[0].words[w];
 			uint32_t wc = phases[1].words[w];
@@ -2046,37 +2045,106 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
 			}
 		}
 
-		/* Flush any remaining bits (shouldn't happen: 88*32*2 = 5632 = 704*8) */
+		/* Flush (shouldn't happen: 88×32×2 = 5632 = 704×8) */
 		if (out_bit > 0) {
 			cur_byte <<= (8 - out_bit);
 			*dst++ = cur_byte;
 		}
-
 		return (size_t)(dst - out);
 	}
 
 	/*
-	 * 4FSK modes (3200/4FSK, 6400/4FSK): word-level interleaving.
+	 * 4FSK modes: bit-level interleaving into dibits (Section 3.3.2).
 	 *
-	 * The DSP layer sends dibits via fsk4_block_encode.  Each dibit
-	 * carries one bit from each of two phases (MSB from A or C,
-	 * LSB from B or D).  The symbol-level alternation between
-	 * phase pairs (A,B) and (C,D) means word-level interleaving
-	 * produces the correct bit stream:
-	 *   A[0], B[0], C[0], D[0], A[1], B[1], C[1], D[1], ...
+	 * The DSP layer (fsk4_block_encode) reads dibits from the buffer:
+	 *   sym = (word >> 30) & 0x03; word <<= 2;
+	 * Each dibit = one 4-level symbol.
+	 *
+	 * PDW (Flex.cpp) at g_sps==3200, level==4:
+	 *   hbit=0 → symbol MSB→A[bct], LSB→B[bct]
+	 *   hbit=1 → symbol MSB→C[bct], LSB→D[bct], bct++
+	 *
+	 * So the transmitted symbol stream must alternate:
+	 *   (A_bit0,C_bit0), (B_bit0,D_bit0), (A_bit1,C_bit1), ...
+	 *
+	 * Spec Section 3.3.2 confirms:
+	 *   3200/4FSK: "bit 0a → MSB, bit 0c → LSB" for first symbol
+	 *     → symbol = (A_bit, C_bit), then (B_bit, D_bit)
+	 *     Phase pairing: (A,C) and (B,D) alternate per symbol.
+	 *
+	 *   6400/4FSK: "bit 0a → MSB, bit 0b → LSB" for first symbol
+	 *     → symbol = (A_bit, B_bit), then (C_bit, D_bit)
+	 *     Phase pairing: (A,B) and (C,D) alternate per symbol.
+	 *
+	 * We output dibits packed MSB-first into bytes, matching
+	 * fsk4_block_encode's consumption order.
+	 *
+	 * Total: 88 words × 32 bits × 4 phases = 11264 bits
+	 *       = 5632 dibits = 11264 bits = 1408 bytes.
 	 */
-	for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
-		for (p = 0; p < num_phases; p++) {
-			uint32_t word = phases[p].words[w];
-			*dst++ = (word >> 24) & 0xFF;
-			*dst++ = (word >> 16) & 0xFF;
-			*dst++ = (word >>  8) & 0xFF;
-			*dst++ =  word        & 0xFF;
+	{
+		/* Phase indices for dibit construction.
+		 * Even symbols: MSB from p_msb0, LSB from p_lsb0
+		 * Odd symbols:  MSB from p_msb1, LSB from p_lsb1
+		 *
+		 * 3200/4FSK (spec): (A,C) then (B,D) → indices (0,2),(1,3)
+		 * 6400/4FSK (spec): (A,B) then (C,D) → indices (0,1),(2,3)
+		 */
+		int p_msb0, p_lsb0, p_msb1, p_lsb1;
+
+		if (baud_rate >= 6400) {
+			/* 6400/4FSK: (A,B) then (C,D) */
+			p_msb0 = 0; p_lsb0 = 1;
+			p_msb1 = 2; p_lsb1 = 3;
+		} else {
+			/* 3200/4FSK: (A,C) then (B,D) */
+			p_msb0 = 0; p_lsb0 = 2;
+			p_msb1 = 1; p_lsb1 = 3;
+		}
+
+		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+			uint32_t w0m = phases[p_msb0].words[w];
+			uint32_t w0l = phases[p_lsb0].words[w];
+			uint32_t w1m = phases[p_msb1].words[w];
+			uint32_t w1l = phases[p_lsb1].words[w];
+
+			for (bit = 31; bit >= 0; bit--) {
+				uint8_t msb, lsb;
+
+				/* Even symbol: (p_msb0, p_lsb0) */
+				msb = (w0m >> bit) & 1;
+				lsb = (w0l >> bit) & 1;
+				cur_byte = (cur_byte << 2) | (msb << 1) | lsb;
+				out_bit += 2;
+				if (out_bit == 8) {
+					*dst++ = cur_byte;
+					cur_byte = 0;
+					out_bit = 0;
+				}
+
+				/* Odd symbol: (p_msb1, p_lsb1) */
+				msb = (w1m >> bit) & 1;
+				lsb = (w1l >> bit) & 1;
+				cur_byte = (cur_byte << 2) | (msb << 1) | lsb;
+				out_bit += 2;
+				if (out_bit == 8) {
+					*dst++ = cur_byte;
+					cur_byte = 0;
+					out_bit = 0;
+				}
+			}
+		}
+
+		/* Flush (shouldn't happen: 88×32×4 = 11264 bits = 1408×8) */
+		if (out_bit > 0) {
+			cur_byte <<= (8 - out_bit);
+			*dst++ = cur_byte;
 		}
 	}
 
 	return (size_t)(dst - out);
 }
+
 
 
 /* ===== Multi-Phase Frame Encoding (Spec Section 3.3) ===== */
@@ -2100,7 +2168,8 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
  *   Data: bit-interleaved phase data (see flex_interleave_phases)
  *
  * For 3200/2FSK, data is BIT-interleaved: A_bit, C_bit, A_bit, C_bit...
- * For 4FSK modes, data is word-interleaved (DSP handles dibit pairing).
+ * For 3200/4FSK, data is dibit-interleaved: (A,C), (B,D) alternating.
+ * For 6400/4FSK, data is dibit-interleaved: (A,B), (C,D) alternating.
  *
  * The sync pattern (A1/A2/A3/A4) is selected based on baud_rate and
  * modulation_type in params.
@@ -2171,11 +2240,13 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	/*
 	 * Phase interleaving depends on modulation type:
 	 *   3200/2FSK: bit-level (A_bit, C_bit, A_bit, C_bit, ...)
-	 *   4FSK modes: word-level (DSP handles dibit phase pairing)
+	 *   3200/4FSK: dibit-level, phase pairs (A,C) and (B,D) alternate
+	 *   6400/4FSK: dibit-level, phase pairs (A,B) and (C,D) alternate
 	 * See flex_interleave_phases() for details and PDW evidence.
 	 */
 	out += flex_interleave_phases(phases, num_phases,
-				      params->modulation_type, out);
+				      params->modulation_type,
+				      params->baud_rate, out);
 
 	return (size_t)(out - buffer);
 }
@@ -2241,7 +2312,8 @@ size_t flex_encode_sync(const flex_frame_params_t *params,
  * phase 0 and remaining phases are filled with idle frames. Phase
  * data is then interleaved into the output:
  *   3200/2FSK (2 phases): BIT-level — A_bit, C_bit, A_bit, C_bit, ...
- *   4FSK modes (4 phases): word-level — A[0],B[0],C[0],D[0], ...
+ *   3200/4FSK (4 phases): dibit-level — (A,C), (B,D) alternating
+ *   6400/4FSK (4 phases): dibit-level — (A,B), (C,D) alternating
  * See flex_interleave_phases() for details and PDW evidence.
  *
  * Output sizes:
@@ -2376,7 +2448,8 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 
 		/* Bit-interleave phase data (see flex_interleave_phases) */
 		out += flex_interleave_phases(phases, num_phases,
-					      params->modulation_type, out);
+					      params->modulation_type,
+					      params->baud_rate, out);
 	}
 
 	return (size_t)(out - buffer);

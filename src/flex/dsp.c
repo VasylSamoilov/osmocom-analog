@@ -514,19 +514,19 @@ enum flex_rx_state {
 #define FLEX_SYNC_A2_INV	0x7B18A6C6U
 #define FLEX_SYNC_A3		0x4F975939U	/* 3200/4FSK */
 #define FLEX_SYNC_A3_INV	0xB068A6C6U
-#define FLEX_SYNC_A4		0x20AF5939U	/* 6400/4FSK */
-#define FLEX_SYNC_A4_INV	0xDF50A6C6U
-#define FLEX_SYNC_A5		0xDCD35939U	/* Reserved */
+#define FLEX_SYNC_A4		0x215F5939U	/* 6400/4FSK */
+#define FLEX_SYNC_A4_INV	0xDEA0A6C6U
+#define FLEX_SYNC_A5		0xDD4B5939U	/* Reserved */
 #define FLEX_SYNC_A6		0x163B5939U	/* Reserved */
-#define FLEX_SYNC_A7		0xB3815939U	/* Reserved */
+#define FLEX_SYNC_A7		0xB3835939U	/* Reserved */
 #define FLEX_SYNC_A8		0x63415939U	/* Reserved */
-#define FLEX_SYNC_A9		0x1BC25939U	/* Reserved */
+#define FLEX_SYNC_A9		0x1BE25939U	/* Reserved */
 #define FLEX_SYNC_A10		0x2C865939U	/* Reserved */
 #define FLEX_SYNC_A11		0xA5E85939U	/* Reserved */
 #define FLEX_SYNC_A12		0x928C5939U	/* Reserved */
 #define FLEX_SYNC_A13		0x6E985939U	/* Reserved */
 #define FLEX_SYNC_A14		0xBE5A5939U	/* Reserved */
-#define FLEX_SYNC_A15		0xF13D5939U	/* Reserved */
+#define FLEX_SYNC_A15		0xF19D5939U	/* Reserved */
 #define FLEX_SYNC_AR		0xCB205939U	/* Re-synchronization */
 #define FLEX_SYNC_AR_INV	0x34DFA6C6U
 
