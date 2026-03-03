@@ -172,6 +172,7 @@ typedef struct flex_frame_msg {
 	int		sequence_num;		/* message numbering (-1 = disabled) */
 	const char	*source_id;		/* source indication (NULL = none) */
 	int		short_msg_idx;		/* short message index, -1 = N/A */
+	int		phase;			/* phase override: -1=auto (default), 0=A, 1=B, 2=C, 3=D */
 } flex_frame_msg_t;
 
 /* Frame encoding parameters */

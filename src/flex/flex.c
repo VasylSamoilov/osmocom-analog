@@ -138,6 +138,7 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->is_temp_group = 0;
 	msg->source_id[0] = '\0';
 	msg->short_msg_index = -1;
+	msg->phase = -1;
 
 	/* fragmentation state defaults */
 	msg->fragment_index = 0;
@@ -271,6 +272,7 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->is_temp_group = msg->is_temp_group;
 			memcpy(frag->source_id, msg->source_id, sizeof(frag->source_id));
 			frag->short_msg_index = msg->short_msg_index;
+			frag->phase = msg->phase;
 
 			/* Set fragmentation state */
 			frag->fragment_index = i;
@@ -343,6 +345,32 @@ static int flex_get_phase_count(int baud_rate, int modulation_type)
 	if (baud_rate >= 3200)
 		return 2;  /* A2 */
 	return 1;  /* A1 */
+}
+
+/* Map user-facing phase letter to internal phase index.
+ *
+ * User phase values: A=0, B=1, C=2, D=3 (matching the standard names).
+ * Internal phase indices are 0..num_phases-1.
+ *
+ * At 6400/4FSK (4 phases): A=0, B=1, C=2, D=3 — direct mapping.
+ * At 3200 (2 phases): phases are A and C (not A and B).
+ *   So user A=0 → index 0, user C=2 → index 1.
+ *   User B=1 or D=3 are invalid for 2-phase modes → clamp to 0.
+ *
+ * Returns internal phase index (0..num_phases-1). */
+static int flex_map_phase(int user_phase, int num_phases)
+{
+	if (user_phase < 0)
+		return 0;
+	if (num_phases >= 4)
+		return user_phase % 4;
+	if (num_phases == 2) {
+		/* 3200 bps: phases A(0) and C(2) */
+		if (user_phase == 2 || user_phase == 3)
+			return 1;  /* C or D → internal index 1 (=phase C) */
+		return 0;          /* A or B → internal index 0 (=phase A) */
+	}
+	return 0;  /* single phase */
 }
 
 /*
@@ -571,6 +599,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 			}
 
 			phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
+
+			/* Phase override: if message specifies a phase, use it
+			 * (mapped to internal index for this mode's phase count) */
+			if (candidate->phase >= 0)
+				phase_idx = flex_map_phase(candidate->phase, num_phases);
 
 			/* Skip if this phase already has a message */
 			if (phase_has_msg[phase_idx])
@@ -890,6 +923,7 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.charset = msg->charset;
 			frame_msg.is_group = msg->is_group;
 			frame_msg.sequence_num = (int)(flex->msg_sequence++ & 0x7F);
+			frame_msg.phase = msg->phase;
 
 			/* Build frame params matching the message */
 			flex_frame_params_default(&params);

@@ -64,6 +64,7 @@ static uint32_t nid = 0;
 static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
 static int no_ers = 0;
+static int default_phase = -1;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -81,6 +82,7 @@ static int no_ers = 0;
 #define OPT_POCSAG_MIX		3012
 #define OPT_TEMP_ADDR		3013
 #define OPT_NO_ERS		3014
+#define OPT_PHASE		3015
 
 void print_help(const char *arg0)
 {
@@ -128,6 +130,16 @@ void print_help(const char *arg0)
 	printf("        Enable POCSAG frame slot allocation.\n");
 	printf("    --temp-addr <cap:temp>\n");
 	printf("        Assign temporary address (format capcode:temp_addr).\n");
+	printf("    --phase <A|B|C|D|auto>\n");
+	printf("        Force message onto a specific phase (channel). (default auto)\n");
+	printf("        In FLEX, a 'phase' is an independent data channel within a frame.\n");
+	printf("        Multi-phase modes transmit several channels simultaneously:\n");
+	printf("          1600/2FSK: 1 phase  (A only, --phase ignored)\n");
+	printf("          3200/2FSK: 2 phases (A, C)\n");
+	printf("          3200/4FSK: 2 phases (A, C)\n");
+	printf("          6400/4FSK: 4 phases (A, B, C, D)\n");
+	printf("        With 'auto', the scheduler assigns phase from capcode.\n");
+	printf("        FIFO option: phase=A|B|C|D|auto\n");
 	main_mobile_print_hotkeys();
 }
 
@@ -155,6 +167,7 @@ static void add_options(void)
 	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
 	option_add(OPT_NO_ERS, "no-ers", 0);
+	option_add(OPT_PHASE, "phase", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -289,6 +302,22 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_NO_ERS:
 		no_ers = 1;
 		break;
+	case OPT_PHASE:
+		if (!strcasecmp(argv[argi], "auto") || !strcmp(argv[argi], "-1"))
+			default_phase = -1;
+		else if (!strcasecmp(argv[argi], "a") || !strcmp(argv[argi], "0"))
+			default_phase = 0;
+		else if (!strcasecmp(argv[argi], "b") || !strcmp(argv[argi], "1"))
+			default_phase = 1;
+		else if (!strcasecmp(argv[argi], "c") || !strcmp(argv[argi], "2"))
+			default_phase = 2;
+		else if (!strcasecmp(argv[argi], "d") || !strcmp(argv[argi], "3"))
+			default_phase = 3;
+		else {
+			fprintf(stderr, "Phase must be A, B, C, D, or auto, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -302,7 +331,8 @@ static int handle_options(int short_option, int argi, char **argv)
 static void parse_fifo_options(const char *opts, int opts_len,
 			       int *speed, int *modulation_type,
 			       double *polarity_out, int *priority,
-			       int *charset, int *is_group, char *source_id)
+			       int *charset, int *is_group, char *source_id,
+			       int *phase)
 {
 	char buf[256];
 	char *p, *key, *val;
@@ -316,6 +346,7 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*charset = 0;
 	/* is_group already set from group: prefix */
 	source_id[0] = '\0';
+	*phase = -1;
 
 	if (opts_len <= 0)
 		return;
@@ -388,6 +419,18 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			strncpy(source_id, val, 63);
 			source_id[63] = '\0';
 		}
+		else if (!strcmp(key, "phase")) {
+			if (!strcasecmp(val, "auto") || !strcmp(val, "-1"))
+				*phase = -1;
+			else if (!strcasecmp(val, "a") || !strcmp(val, "0"))
+				*phase = 0;
+			else if (!strcasecmp(val, "b") || !strcmp(val, "1"))
+				*phase = 1;
+			else if (!strcasecmp(val, "c") || !strcmp(val, "2"))
+				*phase = 2;
+			else if (!strcasecmp(val, "d") || !strcmp(val, "3"))
+				*phase = 3;
+		}
 	}
 }
 
@@ -409,6 +452,7 @@ static void fifo_process_line(const char *text, int text_length)
 	double msg_polarity;
 	int msg_priority;
 	int msg_charset;
+	int msg_phase;
 	char msg_source[64];
 	const char *opts_start;
 	int opts_len;
@@ -468,7 +512,8 @@ static void fifo_process_line(const char *text, int text_length)
 	parse_fifo_options(opts_start, opts_len,
 			   &msg_speed, &msg_mod_type,
 			   &msg_polarity, &msg_priority,
-			   &msg_charset, &is_group, msg_source);
+			   &msg_charset, &is_group, msg_source,
+			   &msg_phase);
 
 	/* Validate capcode */
 	capcode = strtoull(capcode_string, NULL, 10);
@@ -541,12 +586,13 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->priority = msg_priority;
 				msg->charset = msg_charset;
 				msg->is_group = is_group;
+				msg->phase = msg_phase;
 				if (msg_source[0] != '\0') {
 					strncpy(msg->source_id, msg_source, sizeof(msg->source_id) - 1);
 					msg->source_id[sizeof(msg->source_id) - 1] = '\0';
 				}
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d len=%d\n",
+				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d phase=%s len=%d\n",
 				     capcode,
 				     flex_msg_type_name(mtype),
 				     msg_speed,
@@ -555,6 +601,10 @@ static void fifo_process_line(const char *text, int text_length)
 				     msg_priority,
 				     msg_charset ? "kanji" : "ascii",
 				     is_group,
+				     (msg_phase < 0) ? "auto" :
+				     (msg_phase == 0) ? "A" :
+				     (msg_phase == 1) ? "B" :
+				     (msg_phase == 2) ? "C" : "D",
 				     message_length);
 			}
 		}
@@ -721,6 +771,7 @@ int main(int argc, char *argv[])
 			f->ers_cycles_override = ers_cycles_override;
 			f->no_ers = no_ers;
 			f->default_charset = default_charset;
+			f->default_phase = default_phase;
 			f->ssid = ssid;
 			f->nid = nid;
 			f->roaming_active = (ssid != 0 || nid != 0) ? 1 : 0;

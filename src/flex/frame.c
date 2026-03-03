@@ -2455,7 +2455,21 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 		flex_phase_data_t phases[FLEX_MAX_PHASES];
 		memset(phases, 0, sizeof(phases));
 
-		/* Phase 0: encode the actual message(s) */
+		/* Determine target phase for the message.
+		 * phase >= 0: explicit override, mapped to internal index.
+		 * phase < 0 (auto): use phase 0 (A).
+		 *
+		 * At 3200 (2 phases): A=0→idx 0, C=2→idx 1.
+		 * At 6400 (4 phases): A=0, B=1, C=2, D=3 direct. */
+		int target_phase = 0;
+		if (msg_count == 1 && msgs[0].phase >= 0) {
+			if (num_phases >= 4)
+				target_phase = msgs[0].phase % 4;
+			else if (num_phases == 2)
+				target_phase = (msgs[0].phase >= 2) ? 1 : 0;
+		}
+
+		/* Encode the actual message(s) into a temp buffer */
 		full_len = flex_encode_frame_multi(msgs, msg_count, &phase_params,
 						   tmp, sizeof(tmp),
 						   msgs_packed, error);
@@ -2467,23 +2481,25 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 			return 0;
 		}
 
-		/* Extract 88 data words from phase 0 (skip S1+FIW+S2) */
+		/* Extract 88 data words into the target phase (skip S1+FIW+S2) */
 		{
 			uint8_t *dp = tmp + sync_overhead;
 			for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
-				phases[0].words[w] =
+				phases[target_phase].words[w] =
 					((uint32_t)dp[0] << 24) |
 					((uint32_t)dp[1] << 16) |
 					((uint32_t)dp[2] << 8) |
 					 (uint32_t)dp[3];
 				dp += 4;
 			}
-			phases[0].word_count = FLEX_WORDS_PER_FRAME;
+			phases[target_phase].word_count = FLEX_WORDS_PER_FRAME;
 		}
 
 		/* Fill remaining phases with proper idle pattern (Section 3.4.1).
 		 * For 4FSK, LSB phases get all-zeros; MSB phases alternate. */
-		for (p = 1; p < num_phases; p++) {
+		for (p = 0; p < num_phases; p++) {
+			if (p == target_phase)
+				continue;
 			flex_fill_idle_phase(phases[p].words, p,
 					     params->modulation_type,
 					     params->baud_rate);

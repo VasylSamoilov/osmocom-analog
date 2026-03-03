@@ -103,7 +103,21 @@ int flex_scheduler_get_time(struct flex *flex, flex_frame_time_t *ft)
 /* Compute assigned frame and phase for a capcode.
  * Per ARIB STD-43A Appendix A Section 3:
  *   assigned_frame = (capcode / 16) mod 128
- *   assigned_phase = (capcode / 4) mod 4 */
+ *   assigned_phase = (capcode / 4) mod 4
+ *
+ * The phase assignment determines which data channel (A/B/C/D) a pager
+ * listens on.  Pagers only decode their assigned phase to save battery.
+ * Phase mapping for each mode:
+ *   1600/2FSK (A1): 1 phase  — all capcodes on phase A
+ *   3200/2FSK (A2): 2 phases — phase 0→A, phase 1→C  (mod 2)
+ *   3200/4FSK (A3): 2 phases — phase 0→A, phase 1→C  (mod 2)
+ *   6400/4FSK (A4): 4 phases — phase 0→A, 1→B, 2→C, 3→D
+ *
+ * Examples:
+ *   capcode 1000: (1000/4) mod 4 = 250 mod 4 = 2 → phase C
+ *   capcode 1001: (1001/4) mod 4 = 250 mod 4 = 2 → phase C
+ *   capcode 1004: (1004/4) mod 4 = 251 mod 4 = 3 → phase D
+ *   capcode 1008: (1008/4) mod 4 = 252 mod 4 = 0 → phase A */
 void flex_scheduler_capcode_info(uint64_t capcode, flex_capcode_sched_t *info)
 {
 	info->assigned_frame = (uint32_t)((capcode / 16) % 128);

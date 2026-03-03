@@ -50,6 +50,14 @@ typedef struct flex_msg {
 	int			is_temp_group;		/* 0 = common group, 1 = temporary */
 	char			source_id[64];		/* source/callback identifier ('\0' = none) */
 	int			short_msg_index;	/* short message index (-1 = N/A) */
+	int			phase;			/* phase (channel) override:
+						 * -1=auto (default, scheduler assigns
+						 * from capcode per ARIB STD-43A),
+						 * 0=A, 1=B, 2=C, 3=D.
+						 * Only meaningful for multi-phase modes:
+						 *   3200/2FSK: 0=A, 1=C
+						 *   3200/4FSK: 0=A, 1=C
+						 *   6400/4FSK: 0=A, 1=B, 2=C, 3=D */
 
 	/* fragmentation state (set by scheduler for long messages) */
 	int			fragment_index;
@@ -129,6 +137,7 @@ typedef struct flex {
 	int			default_speed;		/* 1600, 3200, 6400 — default 1600 */
 	double			default_polarity;	/* -1.0 or +1.0 — default -1.0 */
 	int			default_charset;	/* 0 = ASCII, 1 = KANJI — default 0 */
+	int			default_phase;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 
 	/* fixed-mode flags (CLI --speed / --polarity lock) */
 	int			fixed_speed;		/* -1 = not fixed, else 1600/3200/6400 */
