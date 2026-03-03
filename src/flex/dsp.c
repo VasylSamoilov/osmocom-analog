@@ -95,6 +95,10 @@ static void dsp_init_fsk4_ramps(flex_t *flex)
  * Valid speeds: 1600, 3200 (2-FSK), 6400 (4-FSK, handled separately). */
 void dsp_set_speed(flex_t *flex, int baud_rate, int modulation_type)
 {
+	/* FLEX baud rate = bit rate.
+	 * 2FSK: 1 bit/symbol → symbol rate = baud rate.
+	 * 4FSK: 2 bits/symbol → symbol rate = baud rate / 2.
+	 * e.g. 3200/4FSK = 1600 symbols/sec at 4 levels. */
 	int symbol_rate = baud_rate;
 	if (modulation_type == FLEX_MOD_4FSK)
 		symbol_rate = baud_rate / 2;
