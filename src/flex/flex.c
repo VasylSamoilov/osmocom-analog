@@ -1010,8 +1010,10 @@ int flex_create(const char *kanal, double frequency, const char *device, int use
 
 	/* Enable RX path — always on so we can monitor our own transmission
 	 * (loopback) or receive off-air FLEX signals for debugging.
-	 * rx_state starts at 0 (== RX_HUNT_SYNC) from calloc, no need to set it. */
+	 * State starts at 0 (== RX_STATE_SYNC1) from calloc. */
 	flex->rx.enabled = 1;
+	flex->rx.sample_freq = samplerate;
+	flex->rx.baud = 1600;
 
 	flex_display_status();
 

@@ -207,7 +207,7 @@ static uint8_t word_parity(uint32_t x)
  * Reverse all 32 bits of a word.
  * Standard bit-reversal algorithm from "Bit Twiddling Hacks" (public domain).
  */
-static uint32_t reverse_bits32(uint32_t v)
+uint32_t reverse_bits32(uint32_t v)
 {
 	v = ((v >> 1) & 0x55555555) | ((v & 0x55555555) << 1);
 	v = ((v >> 2) & 0x33333333) | ((v & 0x33333333) << 2);
@@ -555,36 +555,47 @@ static int is_valid_numeric_message(const char *msg)
  */
 static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 				 uint32_t msg_start, uint32_t *fwc_p,
-				 int is_long, const void *config)
+				 int is_long, int sequence_num,
+				 const void *config)
 {
 	uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
 	uint32_t word_idx, fwc;
 	size_t len, max_len;
-	uint32_t s_bit, k_bit;
+	uint32_t sig_sum, k_sum;
 	int shift;
 	uint32_t i;
 
 	len = strlen(msg);
 	max_len = (len > FLEX_MAX_CHARS_ALPHA) ? FLEX_MAX_CHARS_ALPHA : len;
 
-	/* First word: fragment flags f0f1=11 (initial fragment) in bits 11-12 */
-	msg_word[0] = FLEX_ALPHA_FRAG_INITIAL;
+	/* First message word (header) — see frame.h for bit layout.
+	 * K checksum is computed last after all other fields are set. */
+	msg_word[0] = FLEX_ALPHA_FRAG_INITIAL;  /* F=11 in bits 11-12 */
 
-	/* Mail drop flag if configured */
+	/* Message number N and retrieval flag R */
+	if (sequence_num >= 0) {
+		uint32_t n = (uint32_t)(sequence_num % 64);
+		msg_word[0] |= (n << FLEX_ALPHA_HDR_N_SHIFT);
+		msg_word[0] |= FLEX_ALPHA_HDR_R_MASK;
+	}
+
+	/* Mail drop flag M */
 	if (config) {
 		const struct flex_msg_config *cfg = config;
 		if (cfg->mail_drop)
-			msg_word[0] |= (1U << 20);
+			msg_word[0] |= FLEX_ALPHA_HDR_M_MASK;
 	}
 
-	/* Pack 7-bit ASCII characters, 3 per word */
+	/* Pack 7-bit ASCII characters, 3 per word.
+	 * First data word: bits 0-6 reserved for signature S,
+	 * characters start at bit 7. */
 	i = 0;
-	shift = 7;  /* First word starts at bit 7 (bits 0-6 reserved for signature) */
+	shift = FLEX_ALPHA_CHAR2_SHIFT;  /* skip signature slot */
 	word_idx = 1;
 
 	while (i < max_len) {
-		msg_word[word_idx] |= ((uint32_t)msg[i++] & 0x7F) << shift;
-		shift += 7;
+		msg_word[word_idx] |= ((uint32_t)msg[i++] & FLEX_ALPHA_CHAR_MASK) << shift;
+		shift += FLEX_ALPHA_CHAR_BITS;
 		if (shift == FLEX_BCH_DATA_BITS) {
 			if (++word_idx >= FLEX_MAX_MSG_WORDS_ALPHA)
 				break;
@@ -592,41 +603,39 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 		}
 	}
 
-	/* Pad unused character slots with ETX (0x03) per spec */
-	if (shift == 7) {
-		msg_word[word_idx] |= (0x03U << 7) | (0x03U << 14);
+	/* Pad unused character slots with ETX per spec */
+	if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
+		msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+				      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
 		word_idx++;
-	} else if (shift == 14) {
-		msg_word[word_idx] |= (0x03U << 14);
+	} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
+		msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
 		word_idx++;
 	}
 
-	/* S-bit: 7-bit signature = ones' complement of sum of all character values */
-	s_bit = 0;
+	/* S: 7-bit message signature (ARIB STD-43A Section 3.8.8.3).
+	 * 1's complement of binary sum of all message characters taken
+	 * 7 bits at a time, starting from the first character directly
+	 * following the signature field. */
+	sig_sum = 0;
 	for (i = 1; i < word_idx; i++) {
-		s_bit += (msg_word[i])       & 0x7F;
-		s_bit += (msg_word[i] >> 7)  & 0x7F;
-		s_bit += (msg_word[i] >> 14) & 0x7F;
+		sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+		sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+		sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
 	}
-	msg_word[1] |= (~s_bit) & 0x7F;
+	msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 
-	/* K-bit: 10-bit checksum over all message words */
-	k_bit = 0;
+	/* K: 10-bit fragment checksum (ARIB STD-43A Section 3.8.8.3).
+	 * 1's complement of binary sum of all information bits in the
+	 * fragment, taken as three groups per word: bits 0-7, 8-15, 16-20.
+	 * Computed last since it covers all other fields including S. */
+	k_sum = 0;
 	for (i = 0; i < word_idx; i++) {
-		k_bit += (msg_word[i])       & 0xFF;
-		k_bit += (msg_word[i] >> 8)  & 0xFF;
-		k_bit += (msg_word[i] >> 16) & 0x1F;
+		k_sum += msg_word[i] & FLEX_ALPHA_K_GRP1_MASK;
+		k_sum += (msg_word[i] >> FLEX_ALPHA_K_GRP2_SHIFT) & FLEX_ALPHA_K_GRP2_MASK;
+		k_sum += (msg_word[i] >> FLEX_ALPHA_K_GRP3_SHIFT) & FLEX_ALPHA_K_GRP3_MASK;
 	}
-	msg_word[0] |= (~k_bit) & 0x3FF;
-
-	/* TX DEBUG: dump alpha encoding */
-	{
-		uint32_t vec_raw = 0;
-		vec_raw |= (FLEX_VECTOR_TYPE_ALPHA & 0x07) << 4;
-		vec_raw |= ((msg_start + is_long) & 0x7F) << 7;
-		vec_raw |= (word_idx & 0x7F) << 14;
-		vec_raw = flex_word_checksum(vec_raw);
-	}
+	msg_word[0] |= (~k_sum) & FLEX_ALPHA_HDR_K_MASK;
 
 	/* Write vector word and encoded message words to frame */
 	fwc = *fwc_p;
@@ -1511,8 +1520,11 @@ static size_t flex_encode_fiw(const flex_frame_params_t *params,
 		return 0;
 
 	out = buffer;
-	EMIT_WORD(out, flex_create_fiw(params->cycle, params->frame,
-				       params->roaming, 0, 0));
+	{
+		uint32_t fiw_cw = flex_create_fiw(params->cycle, params->frame,
+						  params->roaming, 0, 0);
+		EMIT_WORD(out, fiw_cw);
+	}
 
 	return 4;
 }
@@ -1901,6 +1913,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 						msg_start_word,
 						&fwc,
 						info[idx].is_long,
+						msgs[idx].sequence_num,
 						NULL);
 				}
 				break;
@@ -2731,8 +2744,8 @@ static uint32_t create_numbered_alpha_vector(uint32_t msg_start,
 	 * vector word itself. The vector type remains alpha (101).
 	 *
 	 * The actual N value is carried in the message header word:
-	 *   Bits 0-5:  N (message number, 0-63)
-	 *   Bit 6:     R (retrieval flag, 1 = first transmission)
+	 *   Bits 13-18: N (message number, 0-63)
+	 *   Bit 19:     R (retrieval flag, 1 = numbered)
 	 *
 	 * This function returns the standard alpha vector; the caller
 	 * is responsible for encoding N into the message header word.
@@ -2744,38 +2757,12 @@ static uint32_t create_numbered_alpha_vector(uint32_t msg_start,
 }
 
 /*
- * Encode message number into the first message word (header).
- *
- * Per Section 8.4, when message numbering is active:
- *   Bits 0-5 of the header word carry N (message number, 0-63)
- *   Bit 6 carries R (retrieval flag: 1 = first, 0 = retransmit)
- *
- * The fragment flags (f0f1) and checksum (K) occupy their normal
- * positions in the remaining bits.
- *
- * Parameters:
- *   header_word  — pointer to the first message word (modified in place)
- *   sequence_num — message number 0-63
- *
- * The sequence counter wraps at 63 (maximum value per spec).
+ * NOTE: Message number (N) and retrieval flag (R) encoding is now
+ * handled directly in encode_alpha_message() with correct bit positions
+ * per ARIB STD-43A Section 3.8.8.3:
+ *   bits 13-18: N (6-bit message number, 0-63)
+ *   bit  19:    R (message retrieval flag)
  */
-static void encode_message_number(uint32_t *header_word, int sequence_num)
-{
-	if (!header_word || sequence_num < 0)
-		return;
-
-	/* Clamp to 6-bit range (0-63) */
-	uint32_t n = (uint32_t)(sequence_num % 64);
-
-	/* R = 1 (first transmission) */
-	uint32_t r = 1;
-
-	/* Encode N in bits 0-5, R in bit 6 of the header word.
-	 * Clear existing bits in that range first. */
-	*header_word &= ~0x7FU;       /* clear bits 0-6 */
-	*header_word |= (n & 0x3F);   /* N: bits 0-5 */
-	*header_word |= (r << 6);     /* R: bit 6 */
-}
 
 
 /* ===== Source Indication (ARIB STD-43A Section 8.5) ===== */

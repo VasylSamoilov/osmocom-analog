@@ -186,30 +186,63 @@ typedef struct flex {
 	int			pocsag_mix_enabled;
 	uint8_t			pocsag_frame_slots[128]; /* 1 = POCSAG, 0 = FLEX */
 
-	/* RX state */
+	/* RX state — standard-compliant FLEX decoder (ARIB STD-43A) */
 	struct {
 		int		enabled;
-		int		rx_state;		/* RX_HUNT_ERS / RX_SYNC / RX_FRAME */
-		int		rx_mode;		/* detected mode: RX_MODE_A1, RX_MODE_A3 */
-		uint32_t	shift_reg;		/* bit shift register for sync detection */
-		uint32_t	frame_words[FLEX_WORDS_PER_FRAME * 4]; /* decoded 32-bit words (up to 4 phases) */
-		int		word_count;		/* words received so far */
-		int		bit_count;		/* bits received in current word */
-		int		block_count;		/* blocks received */
-		double		fsk_rx_phase;		/* sample phase tracking */
-		uint8_t		fsk_rx_lastbit;		/* last demodulated bit */
 
-		/* FIW decode */
+		/* PLL-based symbol timing recovery (per multimon-ng buildSymbol) */
+		int		sample_freq;		/* audio sample rate (e.g. 48000) */
+		int64_t		pll_phase;		/* phase accumulator */
+		int		pll_locked;		/* 1 = locked to signal */
+		double		pll_zero;		/* DC offset estimate */
+		double		pll_envelope;		/* signal envelope estimate */
+		double		pll_envelope_sum;	/* running sum for envelope */
+		int		pll_envelope_count;	/* sample count for envelope */
+		double		pll_last_sample;	/* previous sample for zero-crossing */
+		int		pll_symcount[4];	/* symbol vote counters per period */
+		int		pll_nonconsec;		/* non-consecutive zero crossings */
+		int		pll_timeout;		/* timeout counter */
+		uint64_t	pll_sample_count;	/* total samples processed */
+		uint64_t	pll_symbol_count;	/* total symbols produced */
+		uint64_t	pll_lock_buf;		/* lock pattern shift register */
+
+		/* Demodulator state */
+		int		baud;			/* current symbol rate (1600 or 3200) */
+		int		polarity;		/* 0 = normal, 1 = inverted */
+
+		/* State machine */
+		int		rx_state;		/* RX_STATE_SYNC1..DATA */
+
+		/* Sync detection */
+		uint64_t	sync_buf;		/* 64-bit shift register for sync */
+		int		sync_baud;		/* baud rate from sync word */
+		int		sync_levels;		/* 2 or 4 from sync word */
+
+		/* FIW state */
+		int		fiw_count;		/* symbol counter in FIW state */
+		uint32_t	fiw_rawdata;		/* accumulated FIW bits */
+
+		/* FIW decode result */
 		uint32_t	fiw_cycle;
 		uint32_t	fiw_frame;
 
-		/* message decode state */
-		uint32_t	rx_capcode;		/* current address being decoded */
-		int		rx_msg_type;		/* vector type */
-		int		rx_msg_start;		/* message word start index */
-		int		rx_msg_words;		/* message word count */
-		char		rx_msg_data[1024];	/* decoded message text */
-		int		rx_msg_data_length;
+		/* S2 state */
+		int		sync2_count;		/* S2 symbol counter */
+
+		/* Data state */
+		int		data_count;		/* data symbol counter */
+
+		/* Per-phase data buffers (88 words each) */
+		uint32_t	phase_a[FLEX_WORDS_PER_FRAME];
+		uint32_t	phase_b[FLEX_WORDS_PER_FRAME];
+		uint32_t	phase_c[FLEX_WORDS_PER_FRAME];
+		uint32_t	phase_d[FLEX_WORDS_PER_FRAME];
+		int		phase_a_idle;
+		int		phase_b_idle;
+		int		phase_c_idle;
+		int		phase_d_idle;
+		int		phase_toggle;		/* alternates 0/1 at 3200 baud */
+		int		data_bit_counter;	/* de-interleave index counter */
 	} rx;
 } flex_t;
 

@@ -104,6 +104,7 @@
 
 /* ===== Vector Word Types (Spec Section 3.9) ===== */
 
+#define FLEX_VECTOR_TYPE_SECURE		0x0	/* Secure message (3.9.5) */
 #define FLEX_VECTOR_TYPE_TONE		0x2	/* Tone-only / short message (3.9.2) */
 #define FLEX_VECTOR_TYPE_NUMERIC	0x3	/* Standard numeric (3.9.1) */
 #define FLEX_VECTOR_TYPE_HEX_BINARY	0x3	/* type 011 with hex k-bits (3.9.3) */
@@ -114,6 +115,48 @@
 
 /* f0f1 = 11 indicates initial (and possibly only) fragment */
 #define FLEX_ALPHA_FRAG_INITIAL		0x1800U
+
+/* Alpha message header word (1st word) bit layout:
+ *   bits 0-9:   K  (10-bit fragment checksum)
+ *   bit  10:    C  (message continued flag)
+ *   bits 11-12: F  (2-bit fragment number, mod 3)
+ *   bits 13-18: N  (6-bit message number, 0-63)
+ *   bit  19:    R  (message retrieval flag)
+ *   bit  20:    M  (mail drop flag)
+ */
+#define FLEX_ALPHA_HDR_K_MASK		0x000003FFU	/* bits 0-9 */
+#define FLEX_ALPHA_HDR_K_BITS		10
+#define FLEX_ALPHA_HDR_C_SHIFT		10
+#define FLEX_ALPHA_HDR_C_MASK		(1U << 10)
+#define FLEX_ALPHA_HDR_F_SHIFT		11
+#define FLEX_ALPHA_HDR_F_MASK		(0x03U << 11)
+#define FLEX_ALPHA_HDR_N_SHIFT		13
+#define FLEX_ALPHA_HDR_N_MASK		(0x3FU << 13)
+#define FLEX_ALPHA_HDR_R_SHIFT		19
+#define FLEX_ALPHA_HDR_R_MASK		(1U << 19)
+#define FLEX_ALPHA_HDR_M_SHIFT		20
+#define FLEX_ALPHA_HDR_M_MASK		(1U << 20)
+
+/* K checksum groups: 3 groups per word (bits 0-7, 8-15, 16-20) */
+#define FLEX_ALPHA_K_GRP1_MASK		0xFFU		/* bits 0-7 */
+#define FLEX_ALPHA_K_GRP2_SHIFT		8
+#define FLEX_ALPHA_K_GRP2_MASK		0xFFU		/* bits 8-15 */
+#define FLEX_ALPHA_K_GRP3_SHIFT		16
+#define FLEX_ALPHA_K_GRP3_MASK		0x1FU		/* bits 16-20 */
+
+/* Signature field: bits 0-6 of the first data word (after header) */
+#define FLEX_ALPHA_SIG_MASK		0x7FU		/* 7-bit signature */
+#define FLEX_ALPHA_SIG_BITS		7
+
+/* Character field: 7 bits per character, 3 per 21-bit word */
+#define FLEX_ALPHA_CHAR_BITS		7
+#define FLEX_ALPHA_CHAR_MASK		0x7FU
+#define FLEX_ALPHA_CHAR1_SHIFT		0		/* bits 0-6 */
+#define FLEX_ALPHA_CHAR2_SHIFT		7		/* bits 7-13 */
+#define FLEX_ALPHA_CHAR3_SHIFT		14		/* bits 14-20 */
+
+/* ETX termination character */
+#define FLEX_ALPHA_ETX			0x03U
 
 /* ===== Frame Buffer Size ===== */
 
@@ -253,6 +296,7 @@ uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr);
 /* Individual encoding functions (exposed for testing) */
 uint32_t flex_encode_word(uint32_t dw);
 uint32_t flex_word_checksum(uint32_t dw);
+uint32_t reverse_bits32(uint32_t v);
 void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
 
 /* Fill a phase's word array with the proper idle pattern per Section 3.4.1.
