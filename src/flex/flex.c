@@ -41,7 +41,6 @@
 static const char *flex_state_name[] = {
 	"IDLE",
 	"ERS",
-	"ERS_GAP",
 	"MESSAGE",
 	"NET_ERS",
 	"NET_FRAME",
@@ -862,41 +861,11 @@ int flex_get_next_frame(flex_t *flex)
 				  ers_cycles, (int)len,
 				  (double)ers_cycles * 96.0 / 1600.0);
 
-			flex_new_state(flex, FLEX_STATE_ERS_GAP);
+			flex_new_state(flex, FLEX_STATE_MESSAGE);
 			flex->idle_count = 0;
 			return 1;
 		}
 
-	case FLEX_STATE_ERS_GAP:
-		/* Post-ERS gap: ~2905 bits of idle carrier at 1600 baud.
-		 *
-		 * PDW (and similar decoders) detect the ERS Ar sync pattern
-		 * as an unknown sync header, which triggers their FIW capture
-		 * (89 bits) + data collection (11×256 = 2816 bits) pipeline.
-		 * Total: 2905 bits of decoder blindness after the last ERS
-		 * sync detection.  We pad to 3072 bits (384 bytes) for margin.
-		 *
-		 * The gap is filled with alternating 0xAA bytes (BS pattern)
-		 * so the decoder's PLL stays locked for clean sync acquisition
-		 * of the data frame that follows. */
-		{
-			int gap_bytes = 384; /* 3072 bits at 1600 baud = 1.92 sec */
-
-			memset(flex->frame_buffer, 0xAA, gap_bytes);
-			flex->frame_buffer_length = gap_bytes;
-			flex->frame_buffer_pos = 0;
-			flex->sync_buffer_length = 0;
-			flex->sync_buffer_pos = 0;
-			dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
-
-			LOGP_CHAN(DFLEX, LOGL_INFO,
-				  "ERS gap: %d bytes (%d bits, %.2f sec at 1600 baud).\n",
-				  gap_bytes, gap_bytes * 8,
-				  (double)(gap_bytes * 8) / 1600.0);
-
-			flex_new_state(flex, FLEX_STATE_MESSAGE);
-			return 1;
-		}
 
 	case FLEX_STATE_MESSAGE:
 		msg = flex->msg_list;

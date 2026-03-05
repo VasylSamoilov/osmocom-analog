@@ -24,7 +24,6 @@ enum flex_msg_type {
 enum flex_state {
 	FLEX_STATE_IDLE = 0,
 	FLEX_STATE_ERS,			/* ERS re-sync burst at network start */
-	FLEX_STATE_ERS_GAP,		/* post-ERS gap for decoder recovery */
 	FLEX_STATE_MESSAGE,
 	/* Network mode states */
 	FLEX_STATE_NET_ERS,		/* Initial ERS at network startup */
