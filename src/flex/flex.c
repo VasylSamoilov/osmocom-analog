@@ -172,10 +172,10 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 		memcpy(msg->data, data, data_length);
 	msg->data_length = data_length;
 
-	/* per-message parameter defaults */
+	/* per-message parameter defaults (use flex->default_polarity from CLI -P) */
 	msg->speed = 1600;
 	msg->modulation_type = FLEX_MOD_2FSK;
-	msg->polarity = -1.0;
+	msg->polarity = flex->default_polarity ? flex->default_polarity : -1.0;
 	msg->priority = 0;
 	msg->charset = 0;
 	msg->is_group = 0;
@@ -1149,6 +1149,9 @@ int flex_scan_or_loopback(flex_t *flex)
 					msg->speed = flex->fixed_speed;
 					msg->modulation_type = flex->fixed_mod_type;
 				}
+				/* Apply fixed-mode polarity if set */
+				if (flex->fixed_polarity != 0.0)
+					msg->polarity = flex->fixed_polarity;
 				/* Apply default phase if set */
 				if (flex->default_phase >= 0)
 					msg->phase = flex->default_phase;

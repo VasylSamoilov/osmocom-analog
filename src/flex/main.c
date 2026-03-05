@@ -801,6 +801,7 @@ int main(int argc, char *argv[])
 			f->ers_cycles_override = ers_cycles_override;
 			f->no_ers = no_ers;
 			f->default_charset = default_charset;
+			f->default_polarity = polarity;
 			f->default_phase = default_phase;
 			if (wav_test)
 				f->wav_test_mode = 1;

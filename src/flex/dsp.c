@@ -920,10 +920,11 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 {
 	int32_t decoded[FLEX_WORDS_PER_FRAME];
 	int i;
+	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
 
-	LOGP_CHAN(DDSP, LOGL_INFO, "RX: Decoding phase %c (C%u/F%u, %d/%d).\n",
+	LOGP_CHAN(DDSP, LOGL_INFO, "RX: Decoding phase %c (C%u/F%u, %dbps/%dFSK, %d baud).\n",
 		  phase_name, flex->rx.fiw_cycle, flex->rx.fiw_frame,
-		  flex->rx.sync_baud, flex->rx.sync_levels);
+		  bitrate, flex->rx.sync_levels, flex->rx.sync_baud);
 
 	/* No separate de-interleave step needed here.
 	 * The idx formula in flex_rx_read_data() already de-interleaves
@@ -1136,27 +1137,38 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 					}
 
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %d/%d/%c/%c %02u.%03u [%09" PRIu64 "] ALN %s\n",
-						  flex->rx.sync_baud, flex->rx.sync_levels,
-						  frag_flag, phase_name,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] ALN \"%s\"\n",
+						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "neg" : "pos",
+						  (frag_flag == 'K') ? "complete" :
+						  (frag_flag == 'F') ? "cont" : "final",
 						  capcode, text);
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_NUMERIC) {
 				/* Numeric */
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %d/%d/%c %02u.%03u [%09" PRIu64 "] NUM\n",
-					  flex->rx.sync_baud, flex->rx.sync_levels,
-					  phase_name,
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] NUM\n",
+					  bitrate,
 					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+					  phase_name,
+					  flex->rx.sync_baud,
+					  flex->rx.sync_levels,
+					  flex->rx.polarity ? "neg" : "pos",
 					  capcode);
 			} else if (vec_type == FLEX_VECTOR_TYPE_TONE) {
 				/* Tone-only */
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %d/%d/%c %02u.%03u [%09" PRIu64 "] TON\n",
-					  flex->rx.sync_baud, flex->rx.sync_levels,
-					  phase_name,
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] TON\n",
+					  bitrate,
 					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+					  phase_name,
+					  flex->rx.sync_baud,
+					  flex->rx.sync_levels,
+					  flex->rx.polarity ? "neg" : "pos",
 					  capcode);
 			} else {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
