@@ -619,6 +619,27 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 	}
 	msg_word[0] |= (~k_bit) & 0x3FF;
 
+	/* TX DEBUG: dump alpha encoding */
+	{
+		uint32_t vec_raw = 0;
+		vec_raw |= (FLEX_VECTOR_TYPE_ALPHA & 0x07) << 4;
+		vec_raw |= ((msg_start + is_long) & 0x7F) << 7;
+		vec_raw |= (word_idx & 0x7F) << 14;
+		vec_raw = flex_word_checksum(vec_raw);
+		uint32_t vec_rev = reverse_bits32(vec_raw);
+		uint32_t vec_bch = flex_encode_word(vec_rev);
+		fprintf(stderr, "TX ALPHA: msg_start=%u is_long=%d n_words=%u len=%zu\n",
+			msg_start, is_long, word_idx, max_len);
+		fprintf(stderr, "TX VEC: raw21=0x%05X rev=0x%08X bch32=0x%08X\n",
+			vec_raw & 0x1FFFFF, vec_rev, vec_bch);
+		for (i = 0; i < word_idx; i++) {
+			uint32_t rev = reverse_bits32(msg_word[i]);
+			uint32_t bch = flex_encode_word(rev);
+			fprintf(stderr, "TX MW[%u]: raw21=0x%05X rev=0x%08X bch32=0x%08X\n",
+				i, msg_word[i] & 0x1FFFFF, rev, bch);
+		}
+	}
+
 	/* Write vector word and encoded message words to frame */
 	fwc = *fwc_p;
 	frame_words[fwc++] = create_alpha_vector(msg_start + is_long, word_idx);
@@ -2496,26 +2517,51 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 		}
 
 		/* Fill remaining phases with proper idle pattern (Section 3.4.1).
-		 * For 4FSK, LSB phases get all-zeros; MSB phases alternate. */
+		 * For 4FSK, LSB phases get all-zeros; MSB phases alternate.
+		 * Idle words must be block-interleaved just like message data,
+		 * because the phase interleaver operates on interleaved words
+		 * and the receiver de-interleaves blocks per-phase. */
 		for (p = 0; p < num_phases; p++) {
 			if (p == target_phase)
 				continue;
 			flex_fill_idle_phase(phases[p].words, p,
 					     params->modulation_type,
 					     params->baud_rate);
+			/* Block-interleave the idle phase */
+			{
+				int blk;
+				for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
+					flex_interleave_block(blk, phases[p].words);
+			}
 			phases[p].word_count = FLEX_WORDS_PER_FRAME;
 		}
 
 		/* Write S2 + interleaved phase data */
 		out = buffer;
 
+		/* TX PHASE DEBUG */
+		for (p = 0; p < num_phases; p++) {
+			fprintf(stderr, "TX PHASE[%d] first 5 words:", p);
+			for (w = 0; w < 5 && w < FLEX_WORDS_PER_FRAME; w++)
+				fprintf(stderr, " %08X", phases[p].words[w]);
+			fprintf(stderr, "%s\n", (p == target_phase) ? " <-- MSG" : " (idle)");
+		}
+
 		out += flex_encode_s2(params->baud_rate, params->modulation_type,
 				      out, buffer_size - (size_t)(out - buffer));
 
-		/* Bit-interleave phase data (see flex_interleave_phases) */
-		out += flex_interleave_phases(phases, num_phases,
-					      params->modulation_type,
-					      params->baud_rate, out);
+		{
+			uint8_t *before_interleave = out;
+			/* Bit-interleave phase data (see flex_interleave_phases) */
+			size_t il_len = flex_interleave_phases(phases, num_phases,
+						      params->modulation_type,
+						      params->baud_rate, out);
+			fprintf(stderr, "TX INTERLEAVED first 20 bytes:");
+			for (w = 0; w < 20 && (size_t)w < il_len; w++)
+				fprintf(stderr, " %02X", before_interleave[w]);
+			fprintf(stderr, " (total %zu bytes)\n", il_len);
+			out += il_len;
+		}
 	}
 
 	return (size_t)(out - buffer);

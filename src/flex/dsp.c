@@ -219,6 +219,7 @@ static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 	double phase, bitstep, devpol;
 	int i, count;
 	uint8_t lastbit;
+	int spl_before;
 
 	devpol = flex->fsk_deviation * flex->fsk_polarity;
 	spl = flex->fsk_tx_buffer;
@@ -227,6 +228,8 @@ static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 	bitstep = flex->fsk_bitstep * 256.0;
 
 	for (i = 0; i < nbits; i++) {
+		int bit = (word >> 31) & 1;
+		spl_before = (int)((uintptr_t)spl - (uintptr_t)flex->fsk_tx_buffer) / sizeof(*spl);
 		if (lastbit) {
 			if ((word & 0x80000000)) {
 				/* stay up */
@@ -261,6 +264,14 @@ static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 				} while (phase < 256.0);
 				phase -= 256.0;
 			}
+		}
+		{
+			int spl_after = (int)((uintptr_t)spl - (uintptr_t)flex->fsk_tx_buffer) / sizeof(*spl);
+			int nspl = spl_after - spl_before;
+			if (flex->dbg_tx_bitcount < 300)
+				fprintf(stderr, "TX BIT[%d]=%d spl=%d ph=%.1f\n",
+					flex->dbg_tx_bitcount, bit, nspl, phase);
+			flex->dbg_tx_bitcount++;
 		}
 		word <<= 1;
 	}
@@ -303,8 +314,14 @@ static int fsk4_block_encode(flex_t *flex, uint32_t word, int nsymbols)
 	bitstep = flex->fsk_bitstep * 256.0;
 
 	for (i = 0; i < nsymbols; i++) {
-		sym = gray_encode[(word >> 30) & 0x03];
+		uint8_t dibit = (word >> 30) & 0x03;
+		sym = gray_encode[dibit];
 		word <<= 2;
+
+		if (flex->dbg_tx_bitcount < 300)
+			fprintf(stderr, "TX 4SYM[%d] dibit=%d gray=%d\n",
+				flex->dbg_tx_bitcount, dibit, sym);
+		flex->dbg_tx_bitcount++;
 
 		if (sym == last_level) {
 			/* Stay at current level */
@@ -358,6 +375,7 @@ again:
 			/* Reset per-frame debug counters */
 			flex->dbg_frame_symbols = 0;
 			flex->dbg_frame_samples = 0;
+			flex->dbg_tx_bitcount = 0;
 
 			/* Hex dump for debugging */
 			{
@@ -429,6 +447,13 @@ again:
 			/* Sync exhausted — switch to target speed if needed */
 			if (flex->frame_target_speed > 0 &&
 			    flex->current_frame_speed != flex->frame_target_speed) {
+				fprintf(stderr, "TX SPEED SWITCH at bit %d: %d/%s -> %d/%s phase=%.2f lastbit=%d\n",
+					flex->dbg_tx_bitcount,
+					flex->current_frame_speed,
+					(flex->current_frame_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+					flex->frame_target_speed,
+					(flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+					flex->fsk_tx_phase, flex->fsk_tx_lastbit);
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "TX speed switch: %d/%s -> %d/%s phase=%.2f lastbit=%d symbols_so_far=%d sync_pos=%d/%d frame_pos=%d/%d\n",
 					  flex->current_frame_speed,
@@ -441,6 +466,13 @@ again:
 					  flex->frame_buffer_pos, flex->frame_buffer_length);
 				dsp_set_speed(flex, flex->frame_target_speed,
 					      flex->frame_target_mod_type);
+				/* Reset phase accumulator at speed switch so the
+				 * first symbol at the new baud rate is full-length.
+				 * Without this, the residual phase from the last
+				 * 1600-baud bit shortens the first higher-baud bit,
+				 * causing the demodulator PLL to lose 1 symbol at
+				 * the S2/DATA boundary. */
+				flex->fsk_tx_phase = 0.0;
 				/* Log first 16 bytes of data buffer at switch point */
 				{
 					char hex[80];
@@ -707,6 +739,8 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 {
 	int32_t data;
 
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: FIW raw codeword = 0x%08X\n", fiw_raw);
+
 	data = flex_bch_decode(fiw_raw);
 	if (data < 0) {
 		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: FIW BCH decode failed (uncorrectable).\n");
@@ -739,6 +773,18 @@ static void flex_rx_process_frame(flex_t *flex)
 	LOGP_CHAN(DDSP, LOGL_INFO, "RX: Processing frame C%u/F%u (%d words).\n",
 		  flex->rx.fiw_cycle, flex->rx.fiw_frame, flex->rx.word_count);
 
+	/* Dump raw frame words (pre-deinterleave) for bitstream debugging.
+	 * This lets you compare TX output against what the RX actually received. */
+	{
+		int d;
+		LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: === Raw frame dump (pre-deinterleave) ===\n");
+		for (d = 0; d < flex->rx.word_count; d++) {
+			LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: word[%02d] = 0x%08X\n",
+				  d, words[d]);
+		}
+		LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: === End raw frame dump ===\n");
+	}
+
 	/* De-interleave each block of 8 words */
 	{
 		int b;
@@ -754,6 +800,20 @@ static void flex_rx_process_frame(flex_t *flex)
 				  "RX: Word %d BCH uncorrectable (0x%08X).\n",
 				  i, words[i]);
 		}
+	}
+
+	/* Post-BCH decode summary for debugging transmission issues */
+	{
+		int ok = 0, fail = 0;
+		for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+			if (decoded[i] >= 0)
+				ok++;
+			else
+				fail++;
+		}
+		LOGP_CHAN(DDSP, LOGL_INFO,
+			  "RX: BCH decode: %d/%d words OK, %d uncorrectable.\n",
+			  ok, FLEX_WORDS_PER_FRAME, fail);
 	}
 
 	/* Decode BIW1 (word 0) */
@@ -896,6 +956,14 @@ static void flex_rx_process_frame(flex_t *flex)
 static void flex_rx_bit(flex_t *flex, uint8_t bit)
 {
 	flex->rx.shift_reg = (flex->rx.shift_reg << 1) | (bit & 1);
+
+	/* Bitstream trace: log every bit during active frame reception.
+	 * Use LOGL_DEBUG so it only appears with -v -v or higher. */
+	if (flex->rx.rx_state == RX_READ_FRAME || flex->rx.rx_state == RX_READ_FIW) {
+		LOGP_CHAN(DDSP, LOGL_DEBUG, "RX BIT: state=%d bit=%u shift=0x%08X bc=%d wc=%d\n",
+			  flex->rx.rx_state, bit, flex->rx.shift_reg,
+			  flex->rx.bit_count, flex->rx.word_count);
+	}
 
 	switch (flex->rx.rx_state) {
 	case RX_HUNT_SYNC:

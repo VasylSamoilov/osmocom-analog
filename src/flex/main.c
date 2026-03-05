@@ -65,6 +65,7 @@ static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
 static int no_ers = 0;
 static int default_phase = -1;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
+static int wav_test = 0;		/* --wav-test: exit after TX completes */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -83,6 +84,7 @@ static int default_phase = -1;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 #define OPT_TEMP_ADDR		3013
 #define OPT_NO_ERS		3014
 #define OPT_PHASE		3015
+#define OPT_WAV_TEST		3016
 
 void print_help(const char *arg0)
 {
@@ -140,6 +142,8 @@ void print_help(const char *arg0)
 	printf("          6400/4FSK: 4 phases (A, B, C, D)\n");
 	printf("        With 'auto', the scheduler assigns phase from capcode.\n");
 	printf("        FIFO option: phase=A|B|C|D|auto\n");
+	printf("    --wav-test\n");
+	printf("        Exit after TX completes (use with --write-tx-wave).\n");
 	main_mobile_print_hotkeys();
 }
 
@@ -168,6 +172,7 @@ static void add_options(void)
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
 	option_add(OPT_NO_ERS, "no-ers", 0);
 	option_add(OPT_PHASE, "phase", 1);
+	option_add(OPT_WAV_TEST, "wav-test", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -317,6 +322,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Phase must be A, B, C, D, or auto, use '-h' for help.\n");
 			return -EINVAL;
 		}
+		break;
+	case OPT_WAV_TEST:
+		wav_test = 1;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -772,6 +780,8 @@ int main(int argc, char *argv[])
 			f->no_ers = no_ers;
 			f->default_charset = default_charset;
 			f->default_phase = default_phase;
+			if (wav_test)
+				f->wav_test_mode = 1;
 			f->ssid = ssid;
 			f->nid = nid;
 			f->roaming_active = (ssid != 0 || nid != 0) ? 1 : 0;
@@ -786,6 +796,13 @@ int main(int argc, char *argv[])
 			}
 		}
 		printf("Base station ready, please tune transmitter to %.4f MHz\n", frequency / 1e6);
+	}
+
+	/* Start scanning/loopback after all config is applied */
+	{
+		sender_t *s;
+		for (s = sender_head; s; s = s->next)
+			flex_scan_or_loopback((flex_t *)s);
 	}
 
 	main_mobile_loop("flex", &quit, myhandler, station_id);

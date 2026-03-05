@@ -32,6 +32,7 @@
 #include "../liblogging/logging.h"
 #include "../libmobile/call.h"
 #include "../libmobile/cause.h"
+#include "../libmobile/main_mobile.h"
 #include <osmocom/cc/message.h>
 #include "flex.h"
 #include "frame.h"
@@ -908,13 +909,13 @@ int flex_get_next_frame(flex_t *flex)
 				double log_polarity = msg->polarity;
 				int log_data_length = msg->data_length;
 
-				/* destroy the transmitted message */
-				flex_msg_destroy(msg);
-				msg = NULL;
-
 				/* Use split encoding: sync → sync_buffer, data → frame_buffer */
 				flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
 							&msgs_packed, &error);
+
+				/* destroy the transmitted message (after encoding!) */
+				flex_msg_destroy(msg);
+				msg = NULL;
 
 				if (error || flex->frame_buffer_length == 0) {
 					LOGP_CHAN(DFLEX, LOGL_NOTICE, "Failed to encode FLEX frame (error=%d), skipping.\n", error);
@@ -949,6 +950,8 @@ check_idle:
 			LOGP_CHAN(DFLEX, LOGL_INFO, "Transmission done.\n");
 			LOGP_CHAN(DFLEX, LOGL_DEBUG, "Reached %d idle batches, turning transmitter off.\n", FLEX_IDLE_BATCHES);
 			flex_new_state(flex, FLEX_STATE_IDLE);
+			if (flex->wav_test_mode)
+				quit = 1;
 			return 0;
 		}
 
@@ -1005,13 +1008,15 @@ int flex_create(const char *kanal, double frequency, const char *device, int use
 	flex->scan_from = scan_from;
 	flex->scan_to = scan_to;
 
+	/* Enable RX path — always on so we can monitor our own transmission
+	 * (loopback) or receive off-air FLEX signals for debugging.
+	 * rx_state starts at 0 (== RX_HUNT_SYNC) from calloc, no need to set it. */
+	flex->rx.enabled = 1;
+
 	flex_display_status();
 
 	LOGP(DFLEX, LOGL_NOTICE, "Created 'Kanal' %s: samplerate=%d deviation=%.0f polarity=%s tx=%d.\n",
 	     kanal, samplerate, deviation, (polarity < 0) ? "neg" : "pos", tx);
-
-	/* start scanning, if enabled, otherwise send loopback sequence, if enabled */
-	flex_scan_or_loopback(flex);
 
 	return 0;
 
@@ -1045,25 +1050,47 @@ void flex_destroy(sender_t *sender)
 int flex_scan_or_loopback(flex_t *flex)
 {
 	if (flex->scan_from < flex->scan_to) {
-		char message[16];
+		const char *msg_text;
+		int msg_len;
 
-		/* Generate scan message based on configured message type */
-		switch (flex->default_msg_type) {
-		case FLEX_MSG_TYPE_NUMERIC:
-			sprintf(message, "%05d", (int)(flex->scan_from / 100));
-			break;
-		case FLEX_MSG_TYPE_ALPHA:
-			sprintf(message, "%02x", (int)(flex->scan_from / 10000));
-			break;
-		case FLEX_MSG_TYPE_TONE:
-		case FLEX_MSG_TYPE_AUTO:
-		default:
-			message[0] = '\0';
+		/* Use CLI -M message if provided, otherwise generate a default */
+		if (flex->default_message && flex->default_message[0]) {
+			msg_text = flex->default_message;
+			msg_len = strlen(msg_text);
+		} else {
+			static char autobuf[16];
+			switch (flex->default_msg_type) {
+			case FLEX_MSG_TYPE_NUMERIC:
+				sprintf(autobuf, "%05d", (int)(flex->scan_from / 100));
+				break;
+			case FLEX_MSG_TYPE_ALPHA:
+				sprintf(autobuf, "%02x", (int)(flex->scan_from / 10000));
+				break;
+			case FLEX_MSG_TYPE_TONE:
+			case FLEX_MSG_TYPE_AUTO:
+			default:
+				autobuf[0] = '\0';
+			}
+			msg_text = autobuf;
+			msg_len = strlen(autobuf);
 		}
 		LOGP_CHAN(DFLEX, LOGL_NOTICE, "Transmitting %s message '%s' with capcode '%" PRIu64 "'.\n",
-			  flex_msg_type_name(flex->default_msg_type), message, flex->scan_from);
-		flex_msg_create(flex, flex->scan_from, flex->default_msg_type,
-				message, strlen(message));
+			  flex_msg_type_name(flex->default_msg_type), msg_text, flex->scan_from);
+		{
+			flex_msg_t *msg;
+			msg = flex_msg_create(flex, flex->scan_from, flex->default_msg_type,
+					      msg_text, msg_len);
+			if (msg) {
+				/* Apply fixed-mode speed/modulation if set */
+				if (flex->fixed_speed != -1) {
+					msg->speed = flex->fixed_speed;
+					msg->modulation_type = flex->fixed_mod_type;
+				}
+				/* Apply default phase if set */
+				if (flex->default_phase >= 0)
+					msg->phase = flex->default_phase;
+			}
+		}
 		flex->scan_from++;
 		return 1;
 	}

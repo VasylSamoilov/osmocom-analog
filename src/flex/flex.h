@@ -123,6 +123,7 @@ typedef struct flex {
 	uint8_t			fsk_tx_lastbit;
 	int			dbg_frame_symbols;	/* debug: total symbols emitted this frame */
 	int			dbg_frame_samples;	/* debug: total samples emitted this frame */
+	int			dbg_tx_bitcount;	/* debug: global TX bit counter for bit dump */
 
 	/* network mode config */
 	int			network_mode;		/* 0 = one-shot (default), 1 = network */
@@ -178,6 +179,9 @@ typedef struct flex {
 	double			lpf_history[64];	/* (unused, reserved) */
 	int			lpf_taps;		/* (unused, reserved) */
 	int			lpf_pos;		/* (unused, reserved) */
+
+	/* wav-test mode: exit after TX completes */
+	int			wav_test_mode;
 
 	/* POCSAG mixing */
 	int			pocsag_mix_enabled;
