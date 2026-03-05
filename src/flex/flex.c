@@ -318,7 +318,7 @@ static void flex_setup_frame_buffers(flex_t *flex,
 	flex->frame_buffer_pos = 0;
 
 	/* Target speed for the data portion */
-	flex->frame_target_speed = params->baud_rate;
+	flex->frame_target_speed = params->bitrate;
 	flex->frame_target_mod_type = params->modulation_type;
 
 	/* Start DSP at 1600/2FSK for the sync portion */
@@ -327,22 +327,22 @@ static void flex_setup_frame_buffers(flex_t *flex,
 	LOGP_CHAN(DDSP, LOGL_DEBUG,
 		  "Frame buffers: sync=%d bytes (1600/2fsk), data=%d bytes (%d/%s).\n",
 		  (int)sync_len, (int)data_len,
-		  params->baud_rate,
+		  params->bitrate,
 		  (params->modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
 }
 
-/* Map (baud_rate, modulation_type) → phase count per ARIB STD-43A:
- *   A1 (1600, 2FSK) → 1 phase
- *   A2 (3200, 2FSK) → 2 phases (A, C)
- *   A3 (3200, 4FSK) → 2 phases (A, C) — 1600 sym/s × 4 levels
- *   A4 (6400, 4FSK) → 4 phases (A, B, C, D) — 3200 sym/s × 4 levels */
-static int flex_get_phase_count(int baud_rate, int modulation_type)
+/* Map (bitrate, modulation_type) → phase count per ARIB STD-43A:
+ *   A1 (1600bps, 2FSK) → 1 phase
+ *   A2 (3200bps, 2FSK) → 2 phases (A, C)
+ *   A3 (3200bps, 4FSK) → 2 phases (A, C) — 1600 baud × 4 levels
+ *   A4 (6400bps, 4FSK) → 4 phases (A, B, C, D) — 3200 baud × 4 levels */
+static int flex_get_phase_count(int bitrate, int modulation_type)
 {
-	if (baud_rate >= 6400 && modulation_type == FLEX_MOD_4FSK)
+	if (bitrate >= 6400 && modulation_type == FLEX_MOD_4FSK)
 		return 4;  /* A4 */
-	if (baud_rate >= 3200 && modulation_type == FLEX_MOD_4FSK)
+	if (bitrate >= 3200 && modulation_type == FLEX_MOD_4FSK)
 		return 2;  /* A3: phases A+B packed into 4-level symbols */
-	if (baud_rate >= 3200)
+	if (bitrate >= 3200)
 		return 2;  /* A2 */
 	return 1;  /* A1 */
 }
@@ -508,7 +508,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.roaming = flex->roaming_active ? 1 : 0;
 	params.collapse = flex->collapse;
 	params.biw_time = flex->biw_time_enabled;
-	params.baud_rate = flex_scheduler_select_speed(flex, &params.modulation_type);
+	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
 
 	/* DSP speed is set by flex_setup_frame_buffers() or the phased
 	 * encoding path — always starts at 1600/2FSK for sync_buffer,
@@ -529,7 +529,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		flex_msg_t *candidate;
 		for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
 			/* Speed filter: skip messages not matching this frame's speed/modulation */
-			if (candidate->speed != params.baud_rate ||
+			if (candidate->speed != params.bitrate ||
 			    candidate->modulation_type != params.modulation_type)
 				continue;
 
@@ -557,7 +557,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 	/* Multi-phase encoding for A2/A3 (2 phases) and A4 (4 phases).
 	 * A1 is single-phase and skips this block. */
-	int num_phases = flex_get_phase_count(params.baud_rate, params.modulation_type);
+	int num_phases = flex_get_phase_count(params.bitrate, params.modulation_type);
 	if (msg && num_phases > 1) {
 		flex_phase_data_t phases[FLEX_MAX_PHASES];
 		flex_frame_params_t phase_params;
@@ -581,7 +581,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 			next = candidate->next;
 
-			if (candidate->speed != params.baud_rate ||
+			if (candidate->speed != params.bitrate ||
 			    candidate->modulation_type != params.modulation_type)
 				continue;
 
@@ -633,10 +633,10 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 			/* Extract the 88 data words from the encoded output.
 			 * Layout: S1(14) + FIW(4) + S2(c_bytes) + data
-			 * S2 is 5 bytes × (baud_rate/1600) to fill 25 ms. */
+			 * S2 is 5 bytes × (bitrate/1600) to fill 25 ms. */
 			{
 				int w;
-				int s2_bytes = 5 * (params.baud_rate / 1600);
+				int s2_bytes = 5 * (params.bitrate / 1600);
 				uint8_t *dp = phase_buf + 14 + 4 + s2_bytes;
 				for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
 					phases[phase_idx].words[w] =
@@ -674,7 +674,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (!phase_has_msg[p]) {
 					flex_fill_idle_phase(phases[p].words, p,
 							     params.modulation_type,
-							     params.baud_rate);
+							     params.bitrate);
 					phases[p].word_count = FLEX_WORDS_PER_FRAME;
 				}
 			}
@@ -712,13 +712,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 			flex->sched_last_frame = ft.frame;
 
 			/* Set target speed for data portion, start DSP at 1600/2FSK */
-			flex->frame_target_speed = params.baud_rate;
+			flex->frame_target_speed = params.bitrate;
 			flex->frame_target_mod_type = params.modulation_type;
 			dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
 			LOGP_CHAN(DFLEX, LOGL_INFO,
 				  "Network mode: encoded %d-phase frame C%u/F%u speed=%d/%s polarity=%s collapse=%d roaming=%d.\n",
-				  num_phases, ft.cycle, ft.frame, params.baud_rate,
+				  num_phases, ft.cycle, ft.frame, params.bitrate,
 				  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 				  (flex->fsk_polarity < 0) ? "neg" : "pos",
 				  params.collapse, params.roaming);
@@ -763,7 +763,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		LOGP_CHAN(DFLEX, LOGL_INFO,
 			  "Network mode: encoded frame C%u/F%u capcode=%" PRIu64 " type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
 			  ft.cycle, ft.frame, frame_msg.capcode,
-			  frame_msg.msg_type, params.baud_rate,
+			  frame_msg.msg_type, params.bitrate,
 			  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 			  (frame_msg.polarity < 0) ? "neg" : "pos",
 			  frame_msg.priority,
@@ -897,7 +897,7 @@ int flex_get_next_frame(flex_t *flex)
 
 			/* Build frame params matching the message */
 			flex_frame_params_default(&params);
-			params.baud_rate = msg->speed;
+			params.bitrate = msg->speed;
 			params.modulation_type = msg->modulation_type;
 
 			/* Capture log values before destroy */

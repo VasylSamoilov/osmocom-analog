@@ -95,24 +95,37 @@ static void dsp_init_fsk4_ramps(flex_t *flex)
 	flex->fsk4_tx_last_level = 0;
 }
 
-/* Switch baud rate for the next frame.
- * Updates fsk_bitduration and fsk_bitstep for the selected speed.
- * Valid speeds: 1600, 3200 (2-FSK), 6400 (4-FSK, handled separately). */
-void dsp_set_speed(flex_t *flex, int baud_rate, int modulation_type)
+/* Switch speed for the next frame portion.
+ * Updates fsk_bitduration and fsk_bitstep for the selected mode.
+ *
+ * ARIB STD-43A terminology:
+ *   bps    = bit rate (1600, 3200, or 6400 bits/second)
+ *   baud   = symbol rate (symbols/second) — always 1600 or 3200
+ *   symbol = one modulation event on the air:
+ *            2FSK: 1 symbol = 1 bit  → baud = bps
+ *            4FSK: 1 symbol = 2 bits (a dibit) → baud = bps / 2
+ *
+ * Mode table:
+ *   1600bps/2FSK (A1): 1600 baud, 1 bit/symbol
+ *   3200bps/2FSK (A2): 3200 baud, 1 bit/symbol
+ *   3200bps/4FSK (A3): 1600 baud, 2 bits/symbol (dibit)
+ *   6400bps/4FSK (A4): 3200 baud, 2 bits/symbol (dibit)
+ *
+ * The 'bitrate' parameter here is the BIT rate (bps), not the symbol
+ * rate.  We derive the symbol rate (baud) from it. */
+void dsp_set_speed(flex_t *flex, int bitrate, int modulation_type)
 {
-	/* FLEX baud rate = bit rate.
-	 * 2FSK: 1 bit/symbol → symbol rate = baud rate.
-	 * 4FSK: 2 bits/symbol → symbol rate = baud rate / 2.
-	 * e.g. 3200/4FSK = 1600 symbols/sec at 4 levels. */
-	int symbol_rate = baud_rate;
+	int symbol_rate = bitrate;
 	if (modulation_type == FLEX_MOD_4FSK)
-		symbol_rate = baud_rate / 2;
+		symbol_rate = bitrate / 2;
 	flex->fsk_bitduration = (double)flex->sender.samplerate / (double)symbol_rate;
 	flex->fsk_bitstep = 1.0 / flex->fsk_bitduration;
-	flex->current_frame_speed = baud_rate;
+	flex->current_frame_speed = bitrate;
 	flex->current_frame_mod_type = modulation_type;
-	LOGP_CHAN(DDSP, LOGL_DEBUG, "DSP speed set to %d baud (symbol rate %d, %.4f samples/symbol).\n",
-		  baud_rate, symbol_rate, flex->fsk_bitduration);
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "DSP speed: %d bps, %d baud (symbols/s), %s, %.4f samples/symbol.\n",
+		  bitrate, symbol_rate,
+		  (modulation_type == FLEX_MOD_4FSK) ? "4FSK" : "2FSK",
+		  flex->fsk_bitduration);
 }
 
 /* Init transceiver instance. */
@@ -273,8 +286,10 @@ static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 	return count;
 }
 
-/* 4-FSK encoder for 6400 bps mode.
- * Encodes 2 bits per symbol at 3200 baud (16 symbols per 32-bit word).
+/* 4-FSK encoder for 4-level modes (3200bps/4FSK and 6400bps/4FSK).
+ * Encodes 2 bits (one dibit) per symbol.
+ *   3200bps/4FSK (A3): 1600 baud (symbols/s)
+ *   6400bps/4FSK (A4): 3200 baud (symbols/s)
  * Uses pre-computed cosine ramp tables for smooth transitions. */
 static int fsk4_block_encode(flex_t *flex, uint32_t word, int nsymbols)
 {
@@ -401,7 +416,7 @@ again:
 				dsp_set_speed(flex, flex->frame_target_speed,
 					      flex->frame_target_mod_type);
 				/* Reset phase accumulator at speed switch so the
-				 * first symbol at the new baud rate is full-length.
+				 * first symbol at the new symbol rate is full-length.
 				 * Without this, the residual phase from the last
 				 * 1600-baud symbol shortens the first higher-baud
 				 * symbol, causing the demodulator PLL to miscount
@@ -493,10 +508,10 @@ again:
 
 /* RX state machine states */
 enum {
-	RX_STATE_SYNC1 = 0,	/* hunting for sync pattern */
-	RX_STATE_FIW,		/* reading FIW (16 dotting + 32 data symbols) */
-	RX_STATE_SYNC2,		/* skipping S2 at data baud rate */
-	RX_STATE_DATA,		/* reading interleaved phase data */
+	RX_STATE_SYNC1 = 0,	/* hunting for S1 sync pattern (always 1600 baud, 2FSK) */
+	RX_STATE_FIW,		/* reading FIW (16 bits dotting + 32 bits data, 1600/2FSK) */
+	RX_STATE_SYNC2,		/* S2: block sync at data symbol rate (25 ms, all modes) */
+	RX_STATE_DATA,		/* reading interleaved phase data at data symbol rate */
 };
 
 /* FLEX sync marker: the middle 32 bits of the 64-bit sync word.
@@ -781,21 +796,30 @@ static unsigned int flex_rx_sync_detect(flex_t __attribute__((unused)) *flex, ui
 	return 0;
 }
 
-/* Decode the sync code to determine baud rate and FSK levels.
+/* Decode the sync code to determine symbol rate and FSK levels.
  * Per ARIB STD-43A Table 3.2-5, the outer code determines the mode.
  * Returns 1 if valid mode found, 0 otherwise. */
 static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 {
+	/* Mode table: sync code → symbol rate (baud) and FSK levels.
+	 *
+	 * ARIB STD-43A Section 3.2, Table 3.2-5:
+	 *   A1: 1600bps/2FSK → 1600 baud, 2 levels (1 bit/symbol)
+	 *   A2: 3200bps/2FSK → 3200 baud, 2 levels (1 bit/symbol)
+	 *   A3: 3200bps/4FSK → 1600 baud, 4 levels (2 bits/symbol = dibit)
+	 *   A4: 6400bps/4FSK → 3200 baud, 4 levels (2 bits/symbol = dibit)
+	 *
+	 * 'baud' is the SYMBOL rate, not the bit rate.
+	 * Bit rate = baud × bits_per_symbol (1 for 2FSK, 2 for 4FSK). */
 	static const struct {
 		uint16_t code;
-		int baud;
-		int levels;
+		int baud;	/* symbol rate (symbols/second) */
+		int levels;	/* 2 = 2FSK (1 bit/sym), 4 = 4FSK (2 bits/sym) */
 	} modes[] = {
-		{ 0x870C, 1600, 2 },	/* A1 */
-		{ 0xB068, 1600, 4 },	/* A3 (3200 bps via 4-level at 1600 sym/s) */
-		{ 0x7B18, 3200, 2 },	/* A2 */
-		{ 0xDEA0, 3200, 4 },	/* A4 (6400 bps via 4-level at 3200 sym/s) */
-		{ 0x4C7C, 3200, 4 },	/* A4 alternate */
+		{ 0x870C, 1600, 2 },	/* A1: 1600bps/2FSK, 1600 baud */
+		{ 0xB068, 1600, 4 },	/* A3: 3200bps/4FSK, 1600 baud */
+		{ 0x7B18, 3200, 2 },	/* A2: 3200bps/2FSK, 3200 baud */
+		{ 0xDEA0, 3200, 4 },	/* A4: 6400bps/4FSK, 3200 baud */
 		{ 0, 0, 0 }
 	};
 	int i;
@@ -807,13 +831,33 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 		return 0;
 	}
 
+	/* ReFLEX sync (0x4C7C): Motorola ReFLEX protocol extension.
+	 * Same physical layer as A4 (6400bps/4FSK, 3200 baud) but
+	 * uses a different framing format.  Decode what we can as
+	 * standard FLEX, hex-dump the rest. */
+	if (count_bits((uint32_t)(0x4C7C ^ sync_code)) < 4) {
+		flex->rx.sync_baud = 3200;
+		flex->rx.sync_levels = 4;
+		flex->rx.reflex = 1;
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
+			  "RX: ReFLEX sync detected — code=0x%04X, 6400bps/4FSK, 3200 baud, polarity=%s (stub).\n",
+			  sync_code,
+			  flex->rx.polarity ? "NEG" : "POS");
+		return 1;
+	}
+
+	flex->rx.reflex = 0;
+
 	for (i = 0; modes[i].code != 0; i++) {
 		if (count_bits((uint32_t)(modes[i].code ^ sync_code)) < 4) {
 			flex->rx.sync_baud = modes[i].baud;
 			flex->rx.sync_levels = modes[i].levels;
 			LOGP_CHAN(DDSP, LOGL_INFO,
-				  "RX: Sync detected — code=0x%04X baud=%d levels=%d polarity=%s.\n",
-				  sync_code, modes[i].baud, modes[i].levels,
+				  "RX: Sync detected — code=0x%04X, %dbps/%dFSK, %d baud, polarity=%s.\n",
+				  sync_code,
+				  modes[i].baud * (modes[i].levels == 4 ? 2 : 1),
+				  modes[i].levels,
+				  modes[i].baud,
 				  flex->rx.polarity ? "NEG" : "POS");
 			return 1;
 		}
@@ -1147,6 +1191,76 @@ static void flex_rx_clear_phase_data(flex_t *flex)
  *   3200/4: A, B, C, D (interleaved + simultaneous) */
 static void flex_rx_decode_data(flex_t *flex)
 {
+	/* ReFLEX stub: attempt standard FLEX decode (may partially work),
+	 * then hex-dump raw phase words for analysis — both per-phase
+	 * and as one contiguous block (in case ReFLEX uses a different
+	 * phase layout than standard FLEX A4). */
+	if (flex->rx.reflex) {
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
+			  "RX: ReFLEX frame C%u/F%u — attempting FLEX decode (may fail), then hex dump.\n",
+			  flex->rx.fiw_cycle, flex->rx.fiw_frame);
+
+		/* Try standard FLEX phase decode — ReFLEX shares the same
+		 * physical layer as A4 (6400/4FSK, 4 phases) so BCH and
+		 * address/vector parsing may partially succeed. */
+		flex_rx_decode_phase(flex, flex->rx.phase_a, 'A');
+		flex_rx_decode_phase(flex, flex->rx.phase_b, 'B');
+		flex_rx_decode_phase(flex, flex->rx.phase_c, 'C');
+		flex_rx_decode_phase(flex, flex->rx.phase_d, 'D');
+
+		/* Hex dump: per-phase, then full frame as contiguous block */
+		{
+			uint32_t *pptrs[4] = {
+				flex->rx.phase_a, flex->rx.phase_b,
+				flex->rx.phase_c, flex->rx.phase_d,
+			};
+			static const char pnames[4] = { 'A', 'B', 'C', 'D' };
+			/* 4 phases × 88 words, 9 chars per word ("XXXXXXXX ") */
+			char frame_hex[4 * FLEX_WORDS_PER_FRAME * 9 + 1];
+			int frame_pos = 0;
+			int frame_nonzero = 0;
+			int p, w;
+
+			for (p = 0; p < 4; p++) {
+				char hex[FLEX_WORDS_PER_FRAME * 9 + 1];
+				int pos = 0;
+				int all_zero = 1;
+
+				for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+					if (pptrs[p][w] != 0) {
+						all_zero = 0;
+						frame_nonzero = 1;
+					}
+					pos += snprintf(hex + pos, sizeof(hex) - pos,
+							"%08X ", pptrs[p][w]);
+					frame_pos += snprintf(frame_hex + frame_pos,
+							      sizeof(frame_hex) - frame_pos,
+							      "%08X ", pptrs[p][w]);
+				}
+				if (!all_zero) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: ReFLEX phase %c raw: %s\n",
+						  pnames[p], hex);
+				}
+			}
+
+			if (frame_nonzero) {
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: ReFLEX frame raw (A|B|C|D): %s\n",
+					  frame_hex);
+			}
+		}
+		return;
+	}
+
+	/* Decode phases based on mode (ARIB STD-43A Section 3.3.4):
+	 *   A1 (1600bps/2FSK): 1600 baud, 2 levels → phase A only
+	 *   A3 (3200bps/4FSK): 1600 baud, 4 levels → phases A, B
+	 *     (4FSK dibit: MSB=phase A, LSB=phase B)
+	 *   A2 (3200bps/2FSK): 3200 baud, 2 levels → phases A, C
+	 *     (alternating symbols: even=A, odd=C)
+	 *   A4 (6400bps/4FSK): 3200 baud, 4 levels → phases A, B, C, D
+	 *     (alternating dibit pairs: even sym MSB=A/LSB=B, odd sym MSB=C/LSB=D) */
 	if (flex->rx.sync_baud == 1600) {
 		if (flex->rx.sync_levels == 2) {
 			flex_rx_decode_phase(flex, flex->rx.phase_a, 'A');
@@ -1192,6 +1306,16 @@ static void flex_rx_read_data(flex_t *flex, unsigned char sym)
 	int bit_a, bit_b = 0;
 	unsigned int idx;
 
+	/* Extract bits from the demodulated symbol.
+	 * 2FSK (2 levels): 1 symbol = 1 bit.
+	 *   bit_a = MSB of symbol (sym > 1 → 1, else 0).
+	 * 4FSK (4 levels): 1 symbol = 2 bits (dibit).
+	 *   bit_a = MSB of dibit, bit_b = LSB of dibit.
+	 *   Per ARIB STD-43A Section 3.3.2: MSB is phase a/c, LSB is phase b/d.
+	 *   Symbol levels 0-3 map to dibits via Gray decode:
+	 *     sym 0 (-4800Hz) → "00", sym 1 (-1600Hz) → "01",
+	 *     sym 2 (+1600Hz) → "11", sym 3 (+4800Hz) → "10".
+	 *   bit_a (MSB) = (sym > 1), bit_b (LSB) = (sym == 1 || sym == 2). */
 	bit_a = (sym > 1);
 	if (flex->rx.sync_levels == 4)
 		bit_b = (sym == 1) || (sym == 2);
@@ -1241,8 +1365,12 @@ static void flex_rx_read_data(flex_t *flex, unsigned char sym)
 		}
 	}
 
-	/* Advance data_bit_counter only when a complete symbol pair is done
-	 * (at 1600 baud: every symbol; at 3200 baud: every other symbol) */
+	/* Advance data_bit_counter once per complete bit-pair cycle.
+	 * At 1600 baud (A1, A3): every symbol advances the counter
+	 *   (A1 has only phase a; A3 has phases a+c in one 4FSK symbol).
+	 * At 3200 baud (A2, A4): two consecutive symbols form one bit-pair
+	 *   (first symbol → phases a,b; second → phases c,d).
+	 *   Counter advances only after the second symbol (phase_toggle==0). */
 	if (flex->rx.sync_baud == 1600 || flex->rx.phase_toggle == 0)
 		flex->rx.data_bit_counter++;
 }
@@ -1263,7 +1391,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 	case RX_STATE_SYNC1:
 	{
 		/* Feed 2-level bit into 64-bit sync shift register.
-		 * During sync hunting, we always use 2-level (1600 baud).
+		 * S1 is always at 1600 baud / 2FSK (1 bit per symbol).
 		 * sym < 2 → bit 1, sym >= 2 → bit 0 (per multimon-ng flex_sync) */
 		flex->rx.sync_buf = (flex->rx.sync_buf << 1) |
 				    ((sym < 2) ? 1 : 0);
@@ -1284,24 +1412,27 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 
 	case RX_STATE_FIW:
 	{
-		/* FIW: 16 symbols of dotting, then 32 symbols of FIW data.
-		 * All at 1600/2FSK (2-level). Total = 48 symbols.
-		 * Per multimon-ng: skip first 16, then accumulate 32 bits. */
+		/* FIW: always at 1600 baud / 2FSK (1 bit per symbol).
+		 * 16 bits of dotting (PLL settling), then 32 bits of FIW data.
+		 * Total = 48 bits = 48 symbols at 1600/2FSK. */
 		flex->rx.fiw_count++;
 		if (flex->rx.fiw_count > 16) {
-			/* Accumulate FIW bits: shift in MSB-first (sym > 1 → bit 1) */
+			/* Accumulate FIW data bits LSB-first (sym > 1 → bit 1).
+			 * FIW is a 32-bit BCH codeword at 1600/2FSK. */
 			flex->rx.fiw_rawdata = (flex->rx.fiw_rawdata >> 1) |
 					       ((sym_rect > 1) ? 0x80000000U : 0);
 		}
 
 		if (flex->rx.fiw_count == 48) {
 			if (flex_rx_decode_fiw(flex, flex->rx.fiw_rawdata) == 0) {
-				/* FIW OK — switch baud rate and enter S2 */
+				/* FIW OK — switch to data symbol rate and enter S2.
+				 * sync_baud is the SYMBOL rate (baud), not bit rate.
+				 * PLL now tracks symbols at the data rate. */
 				flex->rx.baud = flex->rx.sync_baud;
 				flex->rx.sync2_count = 0;
 				flex->rx.rx_state = RX_STATE_SYNC2;
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: FIW→SYNC2, baud switch to %d.\n",
+					  "RX: FIW→SYNC2, symbol rate switch to %d baud.\n",
 					  flex->rx.baud);
 			} else {
 				flex->rx.rx_state = RX_STATE_SYNC1;
@@ -1312,33 +1443,70 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 
 	case RX_STATE_SYNC2:
 	{
-		/* S2: skip baud*25/1000 symbols at data baud rate.
-		 * 1600 baud → 40 symbols, 3200 baud → 80 symbols.
-		 * Per ARIB STD-43A Section 3.2: S2 duration = 25 ms. */
-		if (++flex->rx.sync2_count == flex->rx.sync_baud * 25 / 1000) {
+		/* S2: 25 ms at the data symbol rate (ARIB STD-43A Section 3.2).
+		 * S2 = BS2 + C(0xED84) + inv.BS2 + inv.C(0x127B).
+		 *
+		 * sync_baud is the SYMBOL rate (baud), so:
+		 *   sync_baud * 25 / 1000 = number of SYMBOLS in S2.
+		 *
+		 * Per standard Section 3.2 (S2 description):
+		 *   1600bps/2FSK (A1): 1600 baud → 40 symbols (= 40 bits)
+		 *   3200bps/2FSK (A2): 3200 baud → 80 symbols (= 80 bits)
+		 *   3200bps/4FSK (A3): 1600 baud → 40 symbols (= 80 bits)
+		 *   6400bps/4FSK (A4): 3200 baud → 80 symbols (= 160 bits)
+		 *
+		 * S2 component breakdown (in symbols):
+		 *   Mode        BS2   C    inv.BS2  inv.C  Total
+		 *   A1 (1600/2) :  4 + 16 +   4   + 16   = 40 sym
+		 *   A2 (3200/2) : 24 + 16 +  24   + 16   = 80 sym
+		 *   A3 (3200/4) :  6 +  8 +   6   +  8   = 28 sym (*)
+		 *   A4 (6400/4) : 32 +  8 +  32   +  8   = 80 sym
+		 *
+		 * (*) A3 note: standard Table 3.2-3 shows BS2 as 12 symbols
+		 *     of alternating comma pattern "101010101010" which is
+		 *     12 4-level symbols. C is 16 decoded bits = 8 symbols.
+		 *     Total = 12 + 8 + 12 + 8 = 40 symbols.
+		 *
+		 * TODO: Replace blind skip with C pattern detection for
+		 * precise block boundary timing (see BCH_REWRITE_PLAN.md). */
+		int s2_symbols = flex->rx.sync_baud * 25 / 1000;
+		if (++flex->rx.sync2_count == s2_symbols) {
 			flex->rx.data_count = 0;
 			flex_rx_clear_phase_data(flex);
 			flex->rx.rx_state = RX_STATE_DATA;
 			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: SYNC2→DATA, skipped %d S2 symbols.\n",
-				  flex->rx.sync2_count);
+				  "RX: SYNC2→DATA, skipped %d S2 symbols (%d baud, %dFSK).\n",
+				  flex->rx.sync2_count,
+				  flex->rx.sync_baud,
+				  flex->rx.sync_levels);
 		}
 		break;
 	}
 
 	case RX_STATE_DATA:
 	{
-		/* Data: 1760 ms at data baud rate.
-		 * 1600 baud → 2816 symbols, 3200 baud → 5632 symbols.
-		 * Per ARIB STD-43A Section 3.3. */
+		/* Data: 1760 ms at the data symbol rate (ARIB STD-43A Section 3.3).
+		 * sync_baud is the SYMBOL rate, so:
+		 *   sync_baud * 1760 / 1000 = number of SYMBOLS in data portion.
+		 *
+		 * Per standard:
+		 *   A1 (1600bps/2FSK): 1600 baud → 2816 symbols (= 2816 bits)
+		 *   A2 (3200bps/2FSK): 3200 baud → 5632 symbols (= 5632 bits)
+		 *   A3 (3200bps/4FSK): 1600 baud → 2816 symbols (= 5632 bits)
+		 *   A4 (6400bps/4FSK): 3200 baud → 5632 symbols (= 11264 bits)
+		 *
+		 * Each symbol produces 1 bit (2FSK) or 2 bits (4FSK).
+		 * flex_rx_read_data() handles the bit extraction per symbol. */
 		flex_rx_read_data(flex, sym_rect);
 
 		if (++flex->rx.data_count == flex->rx.sync_baud * 1760 / 1000) {
+			int bps = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
 			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: DATA complete, %d symbols read.\n",
-				  flex->rx.data_count);
+				  "RX: DATA complete, %d symbols (%d baud, %dbps/%dFSK).\n",
+				  flex->rx.data_count, flex->rx.sync_baud,
+				  bps, flex->rx.sync_levels);
 			flex_rx_decode_data(flex);
-			/* Return to sync hunting at 1600 baud */
+			/* Return to sync hunting at 1600 baud / 2FSK */
 			flex->rx.baud = 1600;
 			flex->rx.rx_state = RX_STATE_SYNC1;
 		}

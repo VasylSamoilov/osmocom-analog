@@ -65,13 +65,13 @@ uint32_t flex_scheduler_next_frame(uint32_t current_frame,
 				   uint32_t assigned_frame,
 				   int collapse);
 
-/* Compute ERS cycle count for a given collapse value and baud rate.
+/* Compute ERS cycle count for a given collapse value and bit rate (bps).
  * ERS duration must cover 2^m frame periods (each 1.875 sec).
  * Each ERS cycle = 96 bits. */
-int flex_scheduler_ers_cycles(int collapse, int baud_rate);
+int flex_scheduler_ers_cycles(int collapse, int bitrate);
 
-/* Select baud rate for the next frame based on queued messages.
- * Returns the speed that has the most pending messages,
+/* Select bit rate for the next frame based on queued messages.
+ * Returns the speed (bps) that has the most pending messages,
  * defaulting to 1600 if the queue is empty.
  * Also sets *modulation_type_out to the modulation type of the winning group. */
 int flex_scheduler_select_speed(struct flex *flex, int *modulation_type_out);

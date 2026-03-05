@@ -153,18 +153,22 @@ static const uint8_t sync_ar_inv[]    = {0x34, 0xDF, 0xA6, 0xC6};
 static const uint8_t sync_b[]         = {0x55, 0x55};
 
 /*
- * S2 (Second Sync) component constants (Spec Section 3.2).
+ * S2 (Sync Part 2) component constants (ARIB STD-43A Section 3.2).
  *
- * S2 structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
- * See tables above for per-speed BS2 lengths and bit patterns.
+ * S2 structure: BS2 + C + inv.BS2 + inv.C
+ * S2 is always 25 ms at the data symbol rate.
  *
- * For 4FSK modes, BS2/BS2_inv are symbol patterns where each symbol
- * maps to a dibit: symbol 1→10, symbol 0→00 (per Fig 3.2-3, 3.2-4).
+ * C pattern: 16 decoded bits, identical across all modes.
+ *   2FSK: transmitted as 16 symbols (1 bit/symbol)
+ *   4FSK: transmitted as 8 symbols (2 bits/symbol = 1 dibit each)
  *
- * C and C_inv are always 16-bit decoded values, same across all modes.
+ * BS2: alternating comma pattern for PLL lock at the new symbol rate.
+ *   2FSK: alternating bits 1,0,1,0... (1 bit/symbol)
+ *   4FSK: alternating dibits 10,00,10,00... (2 bits/symbol)
+ *         This produces full-deviation comma on the channel.
  */
-#define S2_C		0xED84	/* 16 bits: 1110110110000100 */
-#define S2_C_INV	0x127B	/* 16 bits: 0001001001111011 */
+#define S2_C		0xED84	/* C pattern: 16 decoded bits (1110110110000100) */
+#define S2_C_INV	0x127B	/* inv.C:     16 decoded bits (0001001001111011) */
 
 /* Copy a sync pattern into the output buffer and advance the pointer. */
 #define EMIT_SYNC(ptr, pattern) \
@@ -479,16 +483,16 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words)
  *
  * phase_index: 0=A, 1=B(6400) or C(3200), 2=C(6400), 3=D(6400)
  * mod_type: FLEX_MOD_2FSK or FLEX_MOD_4FSK
- * baud_rate: 1600, 3200, or 6400
+ * bitrate: 1600, 3200, or 6400 (bps)
  */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
-			  int mod_type, int baud_rate)
+			  int mod_type, int bitrate)
 {
 	int w;
 	int is_lsb_phase = 0;
 
 	if (mod_type == FLEX_MOD_4FSK) {
-		if (baud_rate <= 3200) {
+		if (bitrate <= 3200) {
 			/* 3200/4FSK: phase 0=A (MSB, alternating),
 			 *            phase 1=C (LSB, all zeros) */
 			is_lsb_phase = (phase_index == 1);
@@ -900,7 +904,7 @@ int flex_scan_message(const char *message_input, int message_input_length,
 void flex_frame_params_default(flex_frame_params_t *params)
 {
 	memset(params, 0, sizeof(*params));
-	params->baud_rate = 1600;
+	params->bitrate = 1600;
 	params->modulation_type = FLEX_MOD_2FSK;
 }
 
@@ -1465,7 +1469,7 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
  *
  * Returns bytes written (14), or 0 on error.
  */
-static size_t flex_encode_s1(int baud_rate, int modulation_type,
+static size_t flex_encode_s1(int bitrate, int modulation_type,
 			     uint8_t *buffer, size_t buffer_size)
 {
 	uint8_t *out;
@@ -1479,7 +1483,7 @@ static size_t flex_encode_s1(int baud_rate, int modulation_type,
 	EMIT_SYNC(out, sync_bs1);
 
 	/* A + B + A_inv: selected by target speed/modulation */
-	switch (baud_rate) {
+	switch (bitrate) {
 	case 3200:
 		if (modulation_type == FLEX_MOD_4FSK) {
 			EMIT_SYNC(out, sync_a3);
@@ -1539,13 +1543,13 @@ static size_t flex_encode_fiw(const flex_frame_params_t *params,
  *   3200/4FSK:  N=24  → 80 bits  = 10 bytes
  *   6400/4FSK:  N=64  → 160 bits = 20 bytes
  *
- * Returns byte count, or 0 for invalid baud_rate.
+ * Returns byte count, or 0 for invalid bitrate.
  */
-static size_t flex_s2_size(int baud_rate)
+static size_t flex_s2_size(int bitrate)
 {
 	int bs2_bits;
 
-	switch (baud_rate) {
+	switch (bitrate) {
 	case 1600: bs2_bits = 4;  break;
 	case 3200: bs2_bits = 24; break;
 	case 6400: bs2_bits = 64; break;
@@ -1560,39 +1564,55 @@ static size_t flex_s2_size(int baud_rate)
  *
  * S2 is the first thing transmitted at the frame's target data rate,
  * after the speed switch from 1600/2FSK (S1+FIW).
- * Structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
- * All sizes in bits (after symbol-to-dibit mapping for 4FSK).
+ * Structure: BS2 + C + inv.BS2 + inv.C
  *
- * Per speed/modulation (from spec bit stream tables):
- *   1600/2FSK (Table 3.2-1):  BS2=4 bits   → total  40 bits ( 5 bytes)
- *   3200/2FSK (Table 3.2-2):  BS2=24 bits  → total  80 bits (10 bytes)
- *   3200/4FSK (Table 3.2-3):  BS2=24 bits  → total  80 bits (10 bytes)
- *     (12 symbols × 2 bits/symbol = 24 bits)
- *   6400/4FSK (Table 3.2-4):  BS2=64 bits  → total 160 bits (20 bytes)
- *     (32 symbols × 2 bits/symbol = 64 bits)
+ * ARIB STD-43A Section 3.2 defines S2 as always 25 ms at the data
+ * symbol rate.  The buffer is encoded at the BIT level (after
+ * symbol-to-dibit expansion for 4FSK modes).
  *
- * For 2FSK, BS2 is alternating bits: 1,0,1,0... → 0xAA pattern
- * For 4FSK, BS2 is alternating symbols: 1,0,1,0... where each symbol
- *   maps to a dibit: symbol 1→10, symbol 0→00 → 0x88 pattern
- *   (per Fig 3.2-3, 3.2-4 decoded data)
+ * Per speed/modulation (from standard Tables 3.2-1 through 3.2-4):
  *
- * C and C_inv are always 16-bit values (decoded/bit-level),
- * regardless of modulation.
+ *   Mode          BS2        C       inv.BS2   inv.C   Total
+ *   ----          ---        -       -------   -----   -----
+ *   1600bps/2FSK:  4 bits + 16 bits +  4 bits + 16 bits =  40 bits ( 5 bytes)
+ *                  4 sym    16 sym     4 sym    16 sym   =  40 symbols @ 1600 baud
+ *
+ *   3200bps/2FSK: 24 bits + 16 bits + 24 bits + 16 bits =  80 bits (10 bytes)
+ *                 24 sym    16 sym    24 sym    16 sym   =  80 symbols @ 3200 baud
+ *
+ *   3200bps/4FSK: 24 bits + 16 bits + 24 bits + 16 bits =  80 bits (10 bytes)
+ *                 12 sym     8 sym    12 sym     8 sym   =  40 symbols @ 1600 baud
+ *                 (each 4FSK symbol = 1 dibit = 2 bits)
+ *
+ *   6400bps/4FSK: 64 bits + 16 bits + 64 bits + 16 bits = 160 bits (20 bytes)
+ *                 32 sym     8 sym    32 sym     8 sym   =  80 symbols @ 3200 baud
+ *                 (each 4FSK symbol = 1 dibit = 2 bits)
+ *
+ * BS2 pattern:
+ *   2FSK: alternating bits 1,0,1,0... (1 bit/symbol)
+ *   4FSK: alternating 4-level symbols → dibits 10,00,10,00... (2 bits/symbol)
+ *
+ * C pattern: always 16 decoded bits = 0xED84, regardless of modulation.
+ *   2FSK: 16 symbols (1 bit each)
+ *   4FSK:  8 symbols (2 bits each, dibit pairs from the 16-bit pattern)
  *
  * Returns bytes written, or 0 on error.
  */
-static size_t flex_encode_s2(int baud_rate, int mod_type,
+static size_t flex_encode_s2(int bitrate, int mod_type,
 			     uint8_t *buffer, size_t buffer_size)
 {
 	int bs2_bits, bit_pos, i;
 	size_t total_bits, total_bytes;
 	int is_4fsk = (mod_type == FLEX_MOD_4FSK);
 
-	/* BS2 bit length from spec tables */
-	switch (baud_rate) {
-	case 1600: bs2_bits = 4;  break;
-	case 3200: bs2_bits = 24; break;
-	case 6400: bs2_bits = 64; break;
+	/* BS2 length in BITS (not symbols) from standard tables.
+	 * bitrate here is the BIT rate (bps), not the symbol rate.
+	 * For 4FSK modes, the bit count = symbol_count × 2. */
+	switch (bitrate) {
+	case 1600: bs2_bits = 4;  break;	/* A1: 4 sym × 1 bit/sym = 4 bits */
+	case 3200: bs2_bits = 24; break;	/* A2: 24 sym × 1 bit/sym = 24 bits */
+						/* A3: 12 sym × 2 bits/sym = 24 bits */
+	case 6400: bs2_bits = 64; break;	/* A4: 32 sym × 2 bits/sym = 64 bits */
 	default:   return 0;
 	}
 
@@ -1605,10 +1625,11 @@ static size_t flex_encode_s2(int baud_rate, int mod_type,
 	memset(buffer, 0, total_bytes);
 	bit_pos = 0;
 
-	/* BS2: alternating symbol pattern, bit encoding depends on modulation.
-	 * 2FSK: symbol 1→bit 1, symbol 0→bit 0 → alternating 10101010...
-	 * 4FSK: symbol 1→dibit 10, symbol 0→dibit 00 → 10001000...
-	 * Pattern is N/2 symbols (4FSK) or N bits (2FSK): 1,0,1,0,... */
+	/* BS2: alternating comma pattern for PLL lock at new symbol rate.
+	 * 2FSK: 1 bit/symbol, pattern = 1,0,1,0... (alternating bits)
+	 * 4FSK: 2 bits/symbol (dibit), pattern = 10,00,10,00...
+	 *   symbol "1" → dibit 10, symbol "0" → dibit 00
+	 *   (full deviation comma on the channel, per standard appendix) */
 	if (is_4fsk) {
 		int sym;
 		for (sym = 0; sym < bs2_bits / 2; sym++) {
@@ -1627,16 +1648,17 @@ static size_t flex_encode_s2(int baud_rate, int mod_type,
 		}
 	}
 
-	/* C: 16 bits, MSB first */
+	/* C: 16 decoded bits (0xED84), MSB first in the buffer.
+	 * On air: 16 symbols for 2FSK, 8 symbols for 4FSK. */
 	for (i = 15; i >= 0; i--) {
 		if (S2_C & (1 << i))
 			buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
 		bit_pos++;
 	}
 
-	/* BS2_inv: inverted alternating symbol pattern.
-	 * 2FSK: 01010101...
-	 * 4FSK: symbols 0,1,0,1... → 00,10,00,10... → 00100010... */
+	/* inv.BS2: inverted alternating comma pattern.
+	 * 2FSK: 0,1,0,1... (inverted bits)
+	 * 4FSK: symbols 0,1,0,1... → dibits 00,10,00,10... */
 	if (is_4fsk) {
 		int sym;
 		for (sym = 0; sym < bs2_bits / 2; sym++) {
@@ -1655,7 +1677,8 @@ static size_t flex_encode_s2(int baud_rate, int mod_type,
 		}
 	}
 
-	/* C_inv: 16 bits, MSB first */
+	/* inv.C: 16 decoded bits (0x127B), MSB first in the buffer.
+	 * On air: 16 symbols for 2FSK, 8 symbols for 4FSK. */
 	for (i = 15; i >= 0; i--) {
 		if (S2_C_INV & (1 << i))
 			buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
@@ -1719,11 +1742,11 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	out = buffer;
 
 	/* ---- S1 + FIW + S2 ---- */
-	out += flex_encode_s1(params->baud_rate, params->modulation_type,
+	out += flex_encode_s1(params->bitrate, params->modulation_type,
 			      out, buffer_size - (size_t)(out - buffer));
 	out += flex_encode_fiw(params, out,
 			       buffer_size - (size_t)(out - buffer));
-	out += flex_encode_s2(params->baud_rate, params->modulation_type,
+	out += flex_encode_s2(params->bitrate, params->modulation_type,
 			      out, buffer_size - (size_t)(out - buffer));
 
 	/* ---- Compute BIW count ---- */
@@ -2056,7 +2079,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 static size_t flex_interleave_phases(const flex_phase_data_t *phases,
 				     int num_phases, int mod_type,
-				     int baud_rate, uint8_t *out)
+				     int bitrate, uint8_t *out)
 {
 	int w, bit;
 	uint8_t *dst = out;
@@ -2264,7 +2287,7 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
  * For 3200/4FSK, data is dibit-packed: each symbol = (A_bit, B_bit).
  * For 6400/4FSK, data is dibit-interleaved: (A,B), (C,D) alternating.
  *
- * The sync pattern (A1/A2/A3/A4) is selected based on baud_rate and
+ * The sync pattern (A1/A2/A3/A4) is selected based on bitrate and
  * modulation_type in params.
  *
  * Returns bytes written to buffer, or 0 on error (with *error set).
@@ -2293,11 +2316,11 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	}
 
 	/* Validate baud/modulation combination */
-	if (params->baud_rate == 1600 && params->modulation_type == FLEX_MOD_4FSK) {
+	if (params->bitrate == 1600 && params->modulation_type == FLEX_MOD_4FSK) {
 		*error = -FLEX_ERR_INVALID_MESSAGE;
 		return 0;
 	}
-	if (params->baud_rate == 6400 && params->modulation_type == FLEX_MOD_2FSK) {
+	if (params->bitrate == 6400 && params->modulation_type == FLEX_MOD_2FSK) {
 		*error = -FLEX_ERR_INVALID_MESSAGE;
 		return 0;
 	}
@@ -2309,7 +2332,7 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	 *   Data: 88 * num_phases * 4 bytes
 	 */
 	{
-		size_t s2_bytes = flex_s2_size(params->baud_rate);
+		size_t s2_bytes = flex_s2_size(params->bitrate);
 		size_t needed = 14 + 4 + s2_bytes
 			      + (size_t)(FLEX_WORDS_PER_FRAME * num_phases * 4);
 		if (buffer_size < needed) {
@@ -2321,11 +2344,11 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	out = buffer;
 
 	/* ---- S1 + FIW + S2 ---- */
-	out += flex_encode_s1(params->baud_rate, params->modulation_type,
+	out += flex_encode_s1(params->bitrate, params->modulation_type,
 			      out, buffer_size - (size_t)(out - buffer));
 	out += flex_encode_fiw(params, out,
 			       buffer_size - (size_t)(out - buffer));
-	out += flex_encode_s2(params->baud_rate, params->modulation_type,
+	out += flex_encode_s2(params->bitrate, params->modulation_type,
 			      out, buffer_size - (size_t)(out - buffer));
 
 	/* ---- Data: bit-interleaved phase data ---- */
@@ -2339,7 +2362,7 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	 */
 	out += flex_interleave_phases(phases, num_phases,
 				      params->modulation_type,
-				      params->baud_rate, out);
+				      params->bitrate, out);
 
 	return (size_t)(out - buffer);
 }
@@ -2363,7 +2386,7 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
  *   FIW:     4 bytes (32 bits) — BCH-encoded frame information word
  *   Total:  18 bytes
  *
- * The sync code (A1/A2/A3/A4) is selected based on baud_rate and
+ * The sync code (A1/A2/A3/A4) is selected based on bitrate and
  * modulation_type in params, telling the receiver what speed to
  * expect after the speed switch that follows S1+FIW.
  *
@@ -2380,7 +2403,7 @@ size_t flex_encode_sync(const flex_frame_params_t *params,
 	out = buffer;
 
 	/* S1: BS1(4) + Ax(4) + B(2) + Ax_inv(4) = 14 bytes */
-	out += flex_encode_s1(params->baud_rate, params->modulation_type,
+	out += flex_encode_s1(params->bitrate, params->modulation_type,
 			      out, buffer_size - (size_t)(out - buffer));
 
 	/* FIW: 4 bytes */
@@ -2438,7 +2461,7 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 	}
 
 	/* S2 size for this speed/modulation */
-	s2_len = flex_s2_size(params->baud_rate);
+	s2_len = flex_s2_size(params->bitrate);
 	if (s2_len == 0) {
 		*error = -FLEX_ERR_INVALID_BUFFER;
 		return 0;
@@ -2447,9 +2470,9 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 	/* Phase count from speed/modulation:
 	 *   A1 (1600/2FSK) → 1, A2 (3200/2FSK) → 2,
 	 *   A3 (3200/4FSK) → 2, A4 (6400/4FSK) → 4 */
-	if (params->baud_rate >= 6400 && params->modulation_type == FLEX_MOD_4FSK)
+	if (params->bitrate >= 6400 && params->modulation_type == FLEX_MOD_4FSK)
 		num_phases = 4;
-	else if (params->baud_rate >= 3200)
+	else if (params->bitrate >= 3200)
 		num_phases = 2;
 	else
 		num_phases = 1;
@@ -2527,7 +2550,7 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 				continue;
 			flex_fill_idle_phase(phases[p].words, p,
 					     params->modulation_type,
-					     params->baud_rate);
+					     params->bitrate);
 			/* Block-interleave the idle phase */
 			{
 				int blk;
@@ -2540,14 +2563,14 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 		/* Write S2 + interleaved phase data */
 		out = buffer;
 
-		out += flex_encode_s2(params->baud_rate, params->modulation_type,
+		out += flex_encode_s2(params->bitrate, params->modulation_type,
 				      out, buffer_size - (size_t)(out - buffer));
 
 		{
 			/* Bit-interleave phase data (see flex_interleave_phases) */
 			size_t il_len = flex_interleave_phases(phases, num_phases,
 						      params->modulation_type,
-						      params->baud_rate, out);
+						      params->bitrate, out);
 			out += il_len;
 		}
 	}

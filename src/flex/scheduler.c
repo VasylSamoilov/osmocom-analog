@@ -153,13 +153,13 @@ uint32_t flex_scheduler_next_frame(uint32_t current_frame,
  * Minimum ERS duration = 2^m frame periods, each 1.875 sec.
  * Each ERS cycle = 96 bits (BS + Ar + BS_inv + Ar_inv = 4 × 24 bits).
  * Minimum 35 cycles (the current default, ~2.1 sec at 1600 baud). */
-int flex_scheduler_ers_cycles(int collapse, int baud_rate)
+int flex_scheduler_ers_cycles(int collapse, int bitrate)
 {
 	double min_duration;
 	int cycles;
 
 	min_duration = (1 << collapse) * 1.875;
-	cycles = (int)ceil(min_duration * baud_rate / 96.0);
+	cycles = (int)ceil(min_duration * bitrate / 96.0);
 
 	if (cycles < FLEX_ERS_CYCLES)
 		cycles = FLEX_ERS_CYCLES;

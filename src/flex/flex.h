@@ -98,21 +98,27 @@ typedef struct flex {
 
 	/* Data buffer — S2 + DATA, transmitted at the frame's target speed
 	 * after the speed switch from 1600/2FSK (S1+FIW).
-	 * S2 = BS2(N) + C(16) + BS2_inv(N) + C_inv(16), N per speed table
-	 * DATA = interleaved phase words (352/704/1408 bytes) */
+	 * S2 = BS2 + C(16 bits) + inv.BS2 + inv.C(16 bits)
+	 * DATA = interleaved phase words (352/704/1408 bytes)
+	 * Buffer is at the BIT level; the DSP layer converts bits to
+	 * symbols (1:1 for 2FSK, 2 bits per symbol for 4FSK). */
 	uint8_t			frame_buffer[FLEX_BUFFER_SIZE];
 	int			frame_buffer_length;
 	int			frame_buffer_pos;
 
 	/* Target speed/modulation for the data portion (S2+DATA).
-	 * S1+FIW always at 1600/2FSK; speed switches after FIW. */
+	 * S1+FIW always at 1600/2FSK; speed switches after FIW.
+	 * frame_target_speed is the BIT rate (bps): 1600, 3200, or 6400.
+	 * The DSP layer derives the symbol rate (baud) from this. */
 	int			frame_target_speed;
 	int			frame_target_mod_type;
 
-	/* DSP state — identical field pattern to pocsag_t,
-	 * reused by identical fsk_block_encode() and dsp_init_ramp() code */
-	double			fsk_bitduration;
-	double			fsk_bitstep;
+	/* DSP state — field names match pocsag_t for shared fsk_block_encode().
+	 * NOTE: fsk_bitduration/fsk_bitstep are SAMPLES PER SYMBOL, not per bit.
+	 * Named "bit" for POCSAG compatibility where bit=symbol (2FSK only).
+	 * For 4FSK modes, these are per-symbol (1 symbol = 2 bits = 1 dibit). */
+	double			fsk_bitduration;	/* samples per symbol */
+	double			fsk_bitstep;		/* 1.0 / fsk_bitduration */
 	sample_t		fsk_ramp_up[256];
 	sample_t		fsk_ramp_down[256];
 	sample_t		*fsk_tx_buffer;
@@ -168,7 +174,7 @@ typedef struct flex {
 	uint32_t		msg_sequence;		/* monotonic counter, wraps at max */
 	uint32_t		frag_retrieval_seq;	/* monotonic retrieval number for fragments */
 
-	/* 4-FSK state (6400 bps) */
+	/* 4-FSK state (3200bps/4FSK and 6400bps/4FSK modes) */
 	sample_t		fsk4_ramps[4][4][256];	/* [from][to][phase] */
 	uint8_t			fsk4_tx_last_level;	/* 0-3 */
 
@@ -207,7 +213,7 @@ typedef struct flex {
 		uint64_t	pll_lock_buf;		/* lock pattern shift register */
 
 		/* Demodulator state */
-		int		baud;			/* current symbol rate (1600 or 3200) */
+		int		baud;			/* current symbol rate in baud (not bps) */
 		int		polarity;		/* 0 = normal, 1 = inverted */
 
 		/* State machine */
@@ -215,12 +221,13 @@ typedef struct flex {
 
 		/* Sync detection */
 		uint64_t	sync_buf;		/* 64-bit shift register for sync */
-		int		sync_baud;		/* baud rate from sync word */
-		int		sync_levels;		/* 2 or 4 from sync word */
+		int		sync_baud;		/* symbol rate from sync (baud, not bps) */
+		int		sync_levels;		/* 2=2FSK (1 bit/sym), 4=4FSK (2 bits/sym) */
+		int		reflex;			/* 1 = ReFLEX sync detected (stub) */
 
-		/* FIW state */
-		int		fiw_count;		/* symbol counter in FIW state */
-		uint32_t	fiw_rawdata;		/* accumulated FIW bits */
+		/* FIW state (always 1600/2FSK, 1 bit per symbol) */
+		int		fiw_count;		/* bit counter in FIW state */
+		uint32_t	fiw_rawdata;		/* accumulated FIW bits (32-bit codeword) */
 
 		/* FIW decode result */
 		uint32_t	fiw_cycle;

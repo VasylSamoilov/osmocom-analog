@@ -31,7 +31,7 @@
 
 /* ===== Frame Structure (Spec Section 3.3) ===== */
 
-#define FLEX_BAUD_RATE		1600
+#define FLEX_BASE_BAUD		1600	/* S1/FIW symbol rate: always 1600 baud */
 #define FLEX_BLOCKS_PER_FRAME	11
 #define FLEX_WORDS_PER_BLOCK	8
 #define FLEX_WORDS_PER_FRAME	(FLEX_BLOCKS_PER_FRAME * FLEX_WORDS_PER_BLOCK)
@@ -165,8 +165,11 @@
  *   ERS:   35 cycles * (2+4+2+4) bytes  = 420 bytes
  *   S1:    BS1(4) + A1(4) + B(2) + A1_inv(4) = 14 bytes
  *   FIW:   1 codeword                   =   4 bytes
- *   S2:    C block (25 ms at data rate) =   5-20 bytes
- *          1600: 5, 3200: 10, 6400: 20
+ *   S2:    25 ms at data rate (bit-level buffer):
+ *          1600bps/2FSK:  40 bits  =  5 bytes
+ *          3200bps/2FSK:  80 bits  = 10 bytes
+ *          3200bps/4FSK:  80 bits  = 10 bytes
+ *          6400bps/4FSK: 160 bits  = 20 bytes
  *   Frame: 88 words * 4 bytes            = 352 bytes (1 phase)
  *          or 4 * 88 * 4                 = 1408 bytes (4 phases at 6400 bps)
  *   Total max (4-phase, 6400):           = 420+14+4+20+1408 = 1866 bytes
@@ -193,7 +196,7 @@
 
 /* ===== Modulation Type (ARIB STD-43A Table 3.2-2) ===== */
 
-/* Distinguishes 2-FSK (A1, A2) from 4-FSK (A3, A4) at the same baud rate */
+/* Distinguishes 2-FSK (A1, A2) from 4-FSK (A3, A4) at the same symbol rate */
 enum flex_mod_type {
 	FLEX_MOD_2FSK = 0,	/* 2-level FSK (A1, A2) — default */
 	FLEX_MOD_4FSK = 1,	/* 4-level FSK (A3, A4) */
@@ -228,7 +231,7 @@ typedef struct flex_frame_params {
 	uint32_t	local_id;		/* BIW2 local ID */
 	uint32_t	coverage_id;		/* BIW2 coverage ID */
 	int		timezone_offset;	/* BIW2 timezone (half-hours from UTC) */
-	int		baud_rate;		/* 1600, 3200, or 6400 */
+	int		bitrate;		/* bit rate: 1600, 3200, or 6400 (bps, not baud) */
 	int		modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
 	int		single_phase;		/* 1 = force single-phase output (for
@@ -302,7 +305,7 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
 /* Fill a phase's word array with the proper idle pattern per Section 3.4.1.
  * For 4FSK modes, LSB phases get all-zeros instead of alternating. */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
-			  int mod_type, int baud_rate);
+			  int mod_type, int bitrate);
 uint32_t flex_create_fiw(uint32_t cycle, uint32_t frame, uint32_t n,
 			 uint32_t r, uint32_t t);
 uint32_t flex_create_biw1(uint32_t prio, uint32_t e_biw,
@@ -341,11 +344,12 @@ size_t flex_encode_sync(const flex_frame_params_t *params,
 /* Encode the data portion: S2 + interleaved phase data.
  * Transmitted at the frame's target speed/modulation after
  * the speed switch from 1600/2FSK (S1+FIW).
- * S2 structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
- *   N varies per speed — see flex_encode_s2() in frame.c.
- * For single-phase (1600): S2(5) + DATA(352) = 357 bytes.
- * For 2-phase (3200/2FSK): S2(10) + DATA(704) = 714 bytes.
- * For 4-phase (6400/4FSK): S2(20) + DATA(1408) = 1428 bytes.
+ * S2 structure: BS2 + C(16 bits) + inv.BS2 + inv.C(16 bits)
+ *   S2 is always 25 ms at the data symbol rate.
+ * For single-phase (1600bps/2FSK): S2(5) + DATA(352) = 357 bytes.
+ * For 2-phase (3200bps/2FSK): S2(10) + DATA(704) = 714 bytes.
+ * For 2-phase (3200bps/4FSK): S2(10) + DATA(704) = 714 bytes.
+ * For 4-phase (6400bps/4FSK): S2(20) + DATA(1408) = 1428 bytes.
  * Returns bytes written, or 0 on error. */
 size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 			const flex_frame_params_t *params,
