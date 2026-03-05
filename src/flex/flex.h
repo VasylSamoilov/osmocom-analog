@@ -121,9 +121,8 @@ typedef struct flex {
 	int			fsk_tx_buffer_pos;
 	double			fsk_tx_phase;
 	uint8_t			fsk_tx_lastbit;
-	int			dbg_frame_symbols;	/* debug: total symbols emitted this frame */
-	int			dbg_frame_samples;	/* debug: total samples emitted this frame */
-	int			dbg_tx_bitcount;	/* debug: global TX bit counter for bit dump */
+	int	dbg_frame_symbols;	/* debug: total symbols emitted this frame */
+	int	dbg_frame_samples;	/* debug: total samples emitted this frame */
 
 	/* network mode config */
 	int			network_mode;		/* 0 = one-shot (default), 1 = network */

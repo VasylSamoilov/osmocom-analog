@@ -208,18 +208,15 @@ void dsp_cleanup_sender(flex_t *flex)
 	}
 }
 
-/* Encode one codeword into samples.
- * input: 32 data bits
- * output: samples
- * return number of samples */
+/* Encode one 2-FSK word into audio samples.
+ * Reads bits MSB-first from 'word', generates cosine-ramped transitions.
+ * Returns number of samples written to fsk_tx_buffer. */
 static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 {
-	/* alloc samples, add 1 in case there is a rest */
 	sample_t *spl;
 	double phase, bitstep, devpol;
 	int i, count;
 	uint8_t lastbit;
-	int spl_before;
 
 	devpol = flex->fsk_deviation * flex->fsk_polarity;
 	spl = flex->fsk_tx_buffer;
@@ -228,8 +225,6 @@ static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 	bitstep = flex->fsk_bitstep * 256.0;
 
 	for (i = 0; i < nbits; i++) {
-		int bit = (word >> 31) & 1;
-		spl_before = (int)((uintptr_t)spl - (uintptr_t)flex->fsk_tx_buffer) / sizeof(*spl);
 		if (lastbit) {
 			if ((word & 0x80000000)) {
 				/* stay up */
@@ -264,14 +259,6 @@ static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
 				} while (phase < 256.0);
 				phase -= 256.0;
 			}
-		}
-		{
-			int spl_after = (int)((uintptr_t)spl - (uintptr_t)flex->fsk_tx_buffer) / sizeof(*spl);
-			int nspl = spl_after - spl_before;
-			if (flex->dbg_tx_bitcount < 300)
-				fprintf(stderr, "TX BIT[%d]=%d spl=%d ph=%.1f\n",
-					flex->dbg_tx_bitcount, bit, nspl, phase);
-			flex->dbg_tx_bitcount++;
 		}
 		word <<= 1;
 	}
@@ -309,19 +296,14 @@ static int fsk4_block_encode(flex_t *flex, uint32_t word, int nsymbols)
 	spl = flex->fsk_tx_buffer;
 	phase = flex->fsk_tx_phase;
 	last_level = flex->fsk4_tx_last_level;
-	/* 4-FSK: dsp_set_speed() now sets fsk_bitstep for the actual symbol
-	 * rate (1600 baud for A3, 3200 baud for A4), so use it directly. */
+	/* Symbol rate is set by dsp_set_speed(): 1600 sym/s for 3200/4FSK (A3),
+	 * 3200 sym/s for 6400/4FSK (A4). */
 	bitstep = flex->fsk_bitstep * 256.0;
 
 	for (i = 0; i < nsymbols; i++) {
 		uint8_t dibit = (word >> 30) & 0x03;
 		sym = gray_encode[dibit];
 		word <<= 2;
-
-		if (flex->dbg_tx_bitcount < 300)
-			fprintf(stderr, "TX 4SYM[%d] dibit=%d gray=%d\n",
-				flex->dbg_tx_bitcount, dibit, sym);
-		flex->dbg_tx_bitcount++;
 
 		if (sym == last_level) {
 			/* Stay at current level */
@@ -375,57 +357,21 @@ again:
 			/* Reset per-frame debug counters */
 			flex->dbg_frame_symbols = 0;
 			flex->dbg_frame_samples = 0;
-			flex->dbg_tx_bitcount = 0;
 
-			/* Hex dump for debugging */
-			{
-				int di;
-				LOGP_CHAN(DDSP, LOGL_INFO,
-					  "TX buffers: sync=%d bytes (1600/2fsk), data=%d bytes (target=%d/%s)\n",
-					  flex->sync_buffer_length,
-					  flex->frame_buffer_length,
-					  flex->frame_target_speed,
-					  (flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
-				if (flex->sync_buffer_length > 0) {
-					char hex[80];
-					int hi = 0, dj;
-					for (dj = 0; dj < flex->sync_buffer_length && dj < 20; dj++)
-						hi += sprintf(hex + hi, "%02x ", flex->sync_buffer[dj]);
-					LOGP_CHAN(DDSP, LOGL_INFO, "  SYNC: %s\n", hex);
-				}
-				for (di = 0; di < flex->frame_buffer_length; di += 16) {
-					char hex[80];
-					int hi = 0, dj;
-					for (dj = di; dj < di + 16 && dj < flex->frame_buffer_length; dj++)
-						hi += sprintf(hex + hi, "%02x ", flex->frame_buffer[dj]);
-					LOGP_CHAN(DDSP, LOGL_INFO, "  DATA[%04d] %s\n", di, hex);
-				}
-			}
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "TX frame start: sync=%d bytes (1600/2fsk), data=%d bytes (target=%d/%s)\n",
+				  flex->sync_buffer_length,
+				  flex->frame_buffer_length,
+				  flex->frame_target_speed,
+				  (flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
 
 			/* Start at 1600/2FSK for sync portion (if present) */
 			if (flex->sync_buffer_length > 0)
 				dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
-			/* Seed phase accumulator to compensate for ramp-shaped
-			 * FSK shifting the PLL symbol boundary by ~half a bit.
-			 *
-			 * The cosine ramp puts zero crossings at mid-bit
-			 * (sample 15 of 30), not at bit boundaries.  The
-			 * decoder PLL locks to zero crossings, so its symbol
-			 * boundaries are offset by ~half a symbol.  At
-			 * 48000/1600 the boundary between sync@97 (BAD) and
-			 * sync@96 (GOOD) is at initial phase ~10.  Seeding
-			 * with 2 * bitstep * 256 (~17.07) places us safely
-			 * in the GOOD region and also avoids the fp boundary
-			 * issue where phase=0 gives 31 samples on the first
-			 * bit instead of 30.
-			 *
-			 * However, the baseband LPF (3.2 kHz, 2 iterations)
-			 * adds group delay that shifts the boundary up to
-			 * ~63.  Seeding at 128.0 (the ramp table midpoint /
-			 * zero-crossing) works with and without LPF and is
-			 * independent of sample rate. */
-			flex->fsk_tx_phase = 128.0;
+			/* Start with phase accumulator at zero so the first
+			 * symbol gets a full-length sample period. */
+			flex->fsk_tx_phase = 0.0;
 			flex->fsk_tx_lastbit = 0;
 		}
 
@@ -438,66 +384,38 @@ again:
 			src_buf = flex->sync_buffer;
 			src_pos = &flex->sync_buffer_pos;
 			src_len = flex->sync_buffer_length;
-			LOGP_CHAN(DDSP, LOGL_INFO,
-				  "TX select: SYNC buf, pos=%d/%d, speed=%d/%s\n",
-				  flex->sync_buffer_pos, flex->sync_buffer_length,
-				  flex->current_frame_speed,
-				  (flex->current_frame_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "TX select: SYNC buf, pos=%d/%d\n",
+				  flex->sync_buffer_pos, flex->sync_buffer_length);
 		} else {
 			/* Sync exhausted — switch to target speed if needed */
 			if (flex->frame_target_speed > 0 &&
 			    flex->current_frame_speed != flex->frame_target_speed) {
-				fprintf(stderr, "TX SPEED SWITCH at bit %d: %d/%s -> %d/%s phase=%.2f lastbit=%d\n",
-					flex->dbg_tx_bitcount,
-					flex->current_frame_speed,
-					(flex->current_frame_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-					flex->frame_target_speed,
-					(flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-					flex->fsk_tx_phase, flex->fsk_tx_lastbit);
-				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "TX speed switch: %d/%s -> %d/%s phase=%.2f lastbit=%d symbols_so_far=%d sync_pos=%d/%d frame_pos=%d/%d\n",
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "TX speed switch: %d/%s -> %d/%s\n",
 					  flex->current_frame_speed,
 					  (flex->current_frame_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 					  flex->frame_target_speed,
-					  (flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-					  flex->fsk_tx_phase, flex->fsk_tx_lastbit,
-					  flex->dbg_frame_symbols,
-					  flex->sync_buffer_pos, flex->sync_buffer_length,
-					  flex->frame_buffer_pos, flex->frame_buffer_length);
+					  (flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
 				dsp_set_speed(flex, flex->frame_target_speed,
 					      flex->frame_target_mod_type);
 				/* Reset phase accumulator at speed switch so the
 				 * first symbol at the new baud rate is full-length.
 				 * Without this, the residual phase from the last
-				 * 1600-baud bit shortens the first higher-baud bit,
-				 * causing the demodulator PLL to lose 1 symbol at
-				 * the S2/DATA boundary. */
+				 * 1600-baud symbol shortens the first higher-baud
+				 * symbol, causing the demodulator PLL to miscount
+				 * S2 symbols by one. */
 				flex->fsk_tx_phase = 0.0;
-				/* Log first 16 bytes of data buffer at switch point */
-				{
-					char hex[80];
-					int hi = 0, dj;
-					int dump_len = flex->frame_buffer_length - flex->frame_buffer_pos;
-					if (dump_len > 16) dump_len = 16;
-					for (dj = 0; dj < dump_len; dj++)
-						hi += sprintf(hex + hi, "%02x ",
-							      flex->frame_buffer[flex->frame_buffer_pos + dj]);
-					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "TX data buf at switch: [%04d] %s\n",
-						  flex->frame_buffer_pos, hex);
-				}
 			}
 
 			src_buf = flex->frame_buffer;
 			src_pos = &flex->frame_buffer_pos;
 			src_len = flex->frame_buffer_length;
-			LOGP_CHAN(DDSP, LOGL_INFO,
-				  "TX select: DATA buf, pos=%d/%d, speed=%d/%s target=%d/%s\n",
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "TX select: DATA buf, pos=%d/%d, speed=%d/%s\n",
 				  flex->frame_buffer_pos, flex->frame_buffer_length,
 				  flex->current_frame_speed,
-				  (flex->current_frame_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-				  flex->frame_target_speed,
-				  (flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
+				  (flex->current_frame_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
 		}
 
 		/* Read next word from the active buffer */
@@ -523,7 +441,7 @@ again:
 			word |= (uint32_t)src_buf[*src_pos + 3];
 		*src_pos += read_bytes;
 
-		LOGP_CHAN(DDSP, LOGL_INFO,
+		LOGP_CHAN(DDSP, LOGL_DEBUG,
 			  "TX word pos=%d bytes=%d word=0x%08x speed=%d/%s buf=%s\n",
 			  *src_pos - read_bytes, read_bytes, word,
 			  flex->current_frame_speed,
@@ -544,10 +462,9 @@ again:
 		/* Log at frame end */
 		if (flex->sync_buffer_pos >= flex->sync_buffer_length &&
 		    flex->frame_buffer_pos >= flex->frame_buffer_length) {
-			LOGP_CHAN(DDSP, LOGL_NOTICE,
-				  "TX frame end: total %d symbols, %d samples, phase=%.2f lastbit=%d\n",
-				  flex->dbg_frame_symbols, flex->dbg_frame_samples,
-				  flex->fsk_tx_phase, flex->fsk_tx_lastbit);
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "TX frame end: total %d symbols, %d samples\n",
+				  flex->dbg_frame_symbols, flex->dbg_frame_samples);
 		}
 
 		/* Apply baseband LPF after modulation (ARIB STD-43A Chapter 2) */
