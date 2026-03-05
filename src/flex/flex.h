@@ -166,9 +166,21 @@ typedef struct flex {
 	uint32_t		sched_last_cycle;
 	uint32_t		sched_last_frame;
 
-	/* ERS streaming state (network mode) */
+	/* ERS streaming state (network mode and FIFO-triggered) */
 	int			ers_total_cycles;	/* total ERS cycles to send */
 	int			ers_sent_cycles;	/* ERS cycles sent so far */
+
+	/* Dual-polarity ERS is unnecessary.
+	 *
+	 * The ERS cycle structure is BS + Ar + BS_inv + Ar_inv.
+	 * Inverting all bits (= flipping polarity) produces
+	 * BS_inv + Ar_inv + BS + Ar — the same continuous stream
+	 * shifted by half a cycle (48 bits).  Both Ar and Ar_inv
+	 * appear in every cycle, so a pager of either polarity will
+	 * detect the re-sync pattern regardless of TX polarity.
+	 *
+	 * This is by design: Section 3.2 uses the A + inv.A structure
+	 * precisely so that polarity is irrelevant for sync detection. */
 
 	/* message numbering */
 	uint32_t		msg_sequence;		/* monotonic counter, wraps at max */
@@ -267,6 +279,11 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 			    enum flex_msg_type msg_type,
 			    const char *data, int data_length);
 void flex_msg_destroy(flex_msg_t *msg);
+
+/* ERS (Emergency Re-Synchronization) trigger.
+ * Polarity is irrelevant for ERS — the BS+Ar+BS_inv+Ar_inv cycle
+ * structure ensures pagers of either polarity detect the re-sync. */
+void flex_trigger_ers(flex_t *flex);
 
 /* Frame buffer management */
 int flex_get_next_frame(flex_t *flex);

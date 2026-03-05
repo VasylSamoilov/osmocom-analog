@@ -99,6 +99,50 @@ static void flex_new_state(flex_t *flex, enum flex_state new_state)
 }
 
 /*
+ * Trigger an ERS (Emergency Re-Synchronization) burst.
+ *
+ * Called from FIFO command handler or at startup.  Sets up ERS parameters
+ * and transitions the state machine to the ERS state.
+ *
+ * Polarity is irrelevant for ERS: the cycle structure is
+ * BS + Ar + BS_inv + Ar_inv, so inverting all bits just shifts the
+ * continuous stream by half a cycle.  Both Ar and Ar_inv appear in
+ * every cycle, so pagers of either polarity detect the re-sync.
+ *
+ * Duration is calculated from the collapse value using
+ * flex_scheduler_ers_cycles(), per Section 3.2.1:
+ *   "The Re-synchronization pattern must be transmitted for a continuous
+ *    period which is equivalent to the battery saving cycle for a pager
+ *    having the maximum Collapse cycle value."
+ */
+void flex_trigger_ers(flex_t *flex)
+{
+	int ers_cycles;
+
+	/* Calculate ERS duration from collapse value */
+	if (flex->ers_cycles_override > 0)
+		ers_cycles = flex->ers_cycles_override;
+	else
+		ers_cycles = flex_scheduler_ers_cycles(flex->collapse, 1600);
+
+	/* Reset streaming counters (used by network mode) */
+	flex->ers_total_cycles = ers_cycles;
+	flex->ers_sent_cycles = 0;
+
+	LOGP(DFLEX, LOGL_INFO,
+	     "ERS triggered: %d cycles (%.1f sec at 1600 baud).\n",
+	     ers_cycles, (double)ers_cycles * 96.0 / 1600.0);
+
+	/* Transition to ERS state */
+	if (flex->network_mode) {
+		flex->sched_ers_done = 0;
+		flex_new_state(flex, FLEX_STATE_NET_ERS);
+	} else {
+		flex_new_state(flex, FLEX_STATE_ERS);
+	}
+}
+
+/*
  * Create msg instance.
  */
 flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
@@ -154,14 +198,17 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 
 	/* kick transmitter */
 	if (flex->state == FLEX_STATE_IDLE) {
-		if (flex->network_mode)
-			flex_new_state(flex, flex->sched_ers_done
-				       ? FLEX_STATE_NET_FRAME
-				       : FLEX_STATE_NET_ERS);
-		else
-			flex_new_state(flex, flex->no_ers
-				       ? FLEX_STATE_MESSAGE
-				       : FLEX_STATE_ERS);
+		if (flex->network_mode) {
+			if (flex->sched_ers_done)
+				flex_new_state(flex, FLEX_STATE_NET_FRAME);
+			else
+				flex_trigger_ers(flex);
+		} else {
+			if (flex->no_ers)
+				flex_new_state(flex, FLEX_STATE_MESSAGE);
+			else
+				flex_trigger_ers(flex);
+		}
 	} else
 		flex_display_status();
 
@@ -394,7 +441,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 	/* === ERS streaming phase ===
 	 * ERS is a standalone re-sync burst emitted before data frames.
-	 * It forces pagers to re-acquire synchronization. */
+	 * Polarity is irrelevant: each cycle contains both Ar and Ar_inv,
+	 * so pagers of either polarity detect the re-sync pattern. */
 	if (!flex->sched_ers_done) {
 		/* First call: compute total ERS cycles */
 		if (flex->ers_sent_cycles == 0 && flex->ers_total_cycles == 0) {
@@ -436,11 +484,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 			return 1;
 		}
 
-		/* ERS complete — mark done and fall through to frame generation */
-		flex->sched_ers_done = 1;
+		/* ERS complete */
 		LOGP_CHAN(DFLEX, LOGL_INFO,
 			  "Network mode: ERS burst complete (%d cycles).\n",
 			  flex->ers_total_cycles);
+		flex->sched_ers_done = 1;
 
 		/* Transition to NET_FRAME */
 		if (flex->state == FLEX_STATE_NET_ERS)
@@ -831,15 +879,25 @@ int flex_get_next_frame(flex_t *flex)
 
 	case FLEX_STATE_ERS:
 		/* Emit ERS (Emergency Re-Synchronization) burst.
-		 * ERS is a network-level re-sync command emitted at network
-		 * start/restart to force all pagers to re-acquire timing. */
+		 * ERS forces pagers to re-acquire timing.  Duration is
+		 * pre-computed by flex_trigger_ers() from collapse value.
+		 *
+		 * Polarity is irrelevant: each ERS cycle contains both
+		 * Ar and Ar_inv, so pagers of either polarity will detect
+		 * the re-sync pattern. */
 		{
 			int ers_cycles;
 
-			if (flex->ers_cycles_override > 0)
+			/* flex_trigger_ers() pre-computes ers_total_cycles;
+			 * for legacy startup paths, fall back to override
+			 * or calculate from collapse. */
+			if (flex->ers_total_cycles > 0)
+				ers_cycles = flex->ers_total_cycles;
+			else if (flex->ers_cycles_override > 0)
 				ers_cycles = flex->ers_cycles_override;
 			else
-				ers_cycles = FLEX_ERS_CYCLES;
+				ers_cycles = flex_scheduler_ers_cycles(
+					flex->collapse, 1600);
 
 			len = flex_generate_ers(flex->frame_buffer,
 						FLEX_BUFFER_SIZE,
@@ -862,6 +920,9 @@ int flex_get_next_frame(flex_t *flex)
 				  ers_cycles, (int)len,
 				  (double)ers_cycles * 96.0 / 1600.0);
 
+			/* Reset ERS state and move to message transmission */
+			flex->ers_total_cycles = 0;
+			flex->ers_sent_cycles = 0;
 			flex_new_state(flex, FLEX_STATE_MESSAGE);
 			flex->idle_count = 0;
 			return 1;

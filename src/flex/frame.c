@@ -131,8 +131,8 @@ static const uint8_t sync_a4_inv[]    = {0xDE, 0xA0, 0xA6, 0xC6};
 
 /* A codes — reserved (Table 3.2-5)
  * Not used by the encoder (no defined frame speed), but kept here
- * for completeness. The RX decoder in dsp.c detects these via
- * FLEX_SYNC_A5..A15 defines and logs them as unsupported. */
+ * for completeness. The 16-bit outer codes FLEX_SYNC_A5..A15 are
+ * defined in frame.h for RX detection and logging. */
 static const uint8_t sync_a5[]  __attribute__((unused)) = {0xDD, 0x4B, 0x59, 0x39};
 static const uint8_t sync_a6[]  __attribute__((unused)) = {0x16, 0x3B, 0x59, 0x39};
 static const uint8_t sync_a7[]  __attribute__((unused)) = {0xB3, 0x83, 0x59, 0x39};
@@ -166,9 +166,9 @@ static const uint8_t sync_b[]         = {0x55, 0x55};
  *   2FSK: alternating bits 1,0,1,0... (1 bit/symbol)
  *   4FSK: alternating dibits 10,00,10,00... (2 bits/symbol)
  *         This produces full-deviation comma on the channel.
+ *
+ * C and inv.C values are defined in frame.h as FLEX_S2_C / FLEX_S2_C_INV.
  */
-#define S2_C		0xED84	/* C pattern: 16 decoded bits (1110110110000100) */
-#define S2_C_INV	0x127B	/* inv.C:     16 decoded bits (0001001001111011) */
 
 /* Copy a sync pattern into the output buffer and advance the pointer. */
 #define EMIT_SYNC(ptr, pattern) \
@@ -1651,7 +1651,7 @@ static size_t flex_encode_s2(int bitrate, int mod_type,
 	/* C: 16 decoded bits (0xED84), MSB first in the buffer.
 	 * On air: 16 symbols for 2FSK, 8 symbols for 4FSK. */
 	for (i = 15; i >= 0; i--) {
-		if (S2_C & (1 << i))
+		if (FLEX_S2_C & (1 << i))
 			buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
 		bit_pos++;
 	}
@@ -1680,7 +1680,7 @@ static size_t flex_encode_s2(int bitrate, int mod_type,
 	/* inv.C: 16 decoded bits (0x127B), MSB first in the buffer.
 	 * On air: 16 symbols for 2FSK, 8 symbols for 4FSK. */
 	for (i = 15; i >= 0; i--) {
-		if (S2_C_INV & (1 << i))
+		if (FLEX_S2_C_INV & (1 << i))
 			buffer[bit_pos / 8] |= (0x80 >> (bit_pos % 8));
 		bit_pos++;
 	}

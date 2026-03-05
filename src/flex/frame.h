@@ -194,6 +194,126 @@
 #define FLEX_FRAME_MSG_TYPE_INSTRUCTION	5
 #define FLEX_FRAME_MSG_TYPE_SHORT	6
 
+/* ===== Sync Codes (ARIB STD-43A Table 3.2-5) =====
+ *
+ * 16-bit outer sync codes extracted from the 64-bit S1 sync word.
+ * The full 64-bit sync is: AAAA:BBBBBBBB:CCCC where
+ *   BBBBBBBB = FLEX_SYNC_MARKER (0xA6C6AAAA)
+ *   AAAA = outer code (identifies mode)
+ *   CCCC = ~AAAA (complement for polarity detection)
+ *
+ * The RX decoder sees the INVERTED A-code in the upper 16 bits
+ * (because the sync word is transmitted as inv.A + marker + A,
+ * and the shift register captures inv.A first).
+ *
+ * Each define below shows:
+ *   - The spec bit pattern from Table 3.2-5 (LSB-left as transmitted)
+ *   - The corresponding byte array from frame.c (MSB-first, for TX)
+ *   - The inverted upper-16 value used by the RX sync detector
+ *
+ * Verification: for each Ax, the normal byte array is the spec bit
+ * pattern read MSB-first.  The _inv byte array is the bitwise inverse.
+ * The 16-bit code here equals the first two bytes of the _inv array.
+ */
+
+/* A1: 1600bps/2FSK — spec: 0111100011110011 0101100100111001
+ * Normal bytes: {0x78,0xF3,0x59,0x39}  Inv bytes: {0x87,0x0C,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x870C */
+#define FLEX_SYNC_A1		0x870C
+
+/* A2: 3200bps/2FSK — spec: 1000010011100111 0101100100111001
+ * Normal bytes: {0x84,0xE7,0x59,0x39}  Inv bytes: {0x7B,0x18,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x7B18 */
+#define FLEX_SYNC_A2		0x7B18
+
+/* A3: 3200bps/4FSK — spec: 0100111110010111 0101100100111001
+ * Normal bytes: {0x4F,0x97,0x59,0x39}  Inv bytes: {0xB0,0x68,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0xB068 */
+#define FLEX_SYNC_A3		0xB068
+
+/* A4: 6400bps/4FSK — spec: 0010000101011111 0101100100111001
+ * Normal bytes: {0x21,0x5F,0x59,0x39}  Inv bytes: {0xDE,0xA0,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0xDEA0 */
+#define FLEX_SYNC_A4		0xDEA0
+
+/* A5 (Reserved) — spec: 1101110101001011 0101100100111001
+ * Normal bytes: {0xDD,0x4B,0x59,0x39}  Inv bytes: {0x22,0xB4,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x22B4 */
+#define FLEX_SYNC_A5		0x22B4
+
+/* A6 (Reserved) — spec: 0001011000111011 0101100100111001
+ * Normal bytes: {0x16,0x3B,0x59,0x39}  Inv bytes: {0xE9,0xC4,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0xE9C4 */
+#define FLEX_SYNC_A6		0xE9C4
+
+/* A7 (Reserved): ReFLEX protocol — spec: 1011001110000011 0101100100111001
+ * Normal bytes: {0xB3,0x83,0x59,0x39}  Inv bytes: {0x4C,0x7C,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x4C7C
+ * Motorola ReFLEX uses A7 reserved code; same physical layer as A4. */
+#define FLEX_SYNC_A7		0x4C7C
+#define FLEX_SYNC_REFLEX	FLEX_SYNC_A7
+
+/* A8 (Reserved) — spec: 0110001101000001 0101100100111001
+ * Normal bytes: {0x63,0x41,0x59,0x39}  Inv bytes: {0x9C,0xBE,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x9CBE */
+#define FLEX_SYNC_A8		0x9CBE
+
+/* A9 (Reserved) — spec: 0001101111100010 0101100100111001
+ * Normal bytes: {0x1B,0xE2,0x59,0x39}  Inv bytes: {0xE4,0x1D,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0xE41D */
+#define FLEX_SYNC_A9		0xE41D
+
+/* A10 (Reserved) — spec: 0010110010000110 0101100100111001
+ * Normal bytes: {0x2C,0x86,0x59,0x39}  Inv bytes: {0xD3,0x79,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0xD379 */
+#define FLEX_SYNC_A10		0xD379
+
+/* A11 (Reserved) — spec: 1010010111101000 0101100100111001
+ * Normal bytes: {0xA5,0xE8,0x59,0x39}  Inv bytes: {0x5A,0x17,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x5A17 */
+#define FLEX_SYNC_A11		0x5A17
+
+/* A12 (Reserved) — spec: 1001001010001100 0101100100111001
+ * Normal bytes: {0x92,0x8C,0x59,0x39}  Inv bytes: {0x6D,0x73,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x6D73 */
+#define FLEX_SYNC_A12		0x6D73
+
+/* A13 (Reserved) — spec: 0110111010011000 0101100100111001
+ * Normal bytes: {0x6E,0x98,0x59,0x39}  Inv bytes: {0x91,0x67,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x9167 */
+#define FLEX_SYNC_A13		0x9167
+
+/* A14 (Reserved) — spec: 1011111001011010 0101100100111001
+ * Normal bytes: {0xBE,0x5A,0x59,0x39}  Inv bytes: {0x41,0xA5,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x41A5 */
+#define FLEX_SYNC_A14		0x41A5
+
+/* A15 (Reserved) — spec: 1111000110011101 0101100100111001
+ * Normal bytes: {0xF1,0x9D,0x59,0x39}  Inv bytes: {0x0E,0x62,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x0E62 */
+#define FLEX_SYNC_A15		0x0E62
+
+/* Ar: ERS re-synchronization — spec: 1100101100100000 0101100100111001
+ * Normal bytes: {0xCB,0x20,0x59,0x39}  Inv bytes: {0x34,0xDF,0xA6,0xC6}
+ * RX outer code = inv upper16 = 0x34DF (same convention as A1–A4)
+ *
+ * Per Section 3.2.1: ERS uses the same BS+A+BS_inv+A_inv structure as S1.
+ * The receiver detects Ar through the normal sync detector (which always
+ * returns the inv upper-16).  When detected, the pager must re-synchronize
+ * its frame timing — this is NOT a data frame, no FIW/S2/DATA follows. */
+#define FLEX_SYNC_AR		0x34DF
+
+/* FLEX sync marker: the middle 32 bits of the 64-bit sync word.
+ * Per ARIB STD-43A Section 3.2, the 64-bit sync is AAAA:BBBBBBBB:CCCC
+ * where BBBBBBBB = 0xA6C6AAAA and AAAA ^ CCCC = 0xFFFF. */
+#define FLEX_SYNC_MARKER	0xA6C6AAAAul
+
+/* S2 (Sync Part 2) C pattern: 16 decoded bits, identical across all modes.
+ * Spec Tables 3.2-1 through 3.2-4: C = 1110110110000100 = 0xED84
+ * inv.C = 0001001001111011 = 0x127B */
+#define FLEX_S2_C		0xED84
+#define FLEX_S2_C_INV		0x127B
+
 /* ===== Modulation Type (ARIB STD-43A Table 3.2-2) ===== */
 
 /* Distinguishes 2-FSK (A1, A2) from 4-FSK (A3, A4) at the same symbol rate */

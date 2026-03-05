@@ -494,6 +494,28 @@ static void fifo_process_line(const char *text, int text_length)
 	memcpy(capcode_string, text, comma1);
 	capcode_string[comma1] = '\0';
 
+	/* === ERS command: "ers,0,," ===
+	 * Triggers an Emergency Re-Synchronization burst.
+	 * Format: ers,0,,
+	 * Duration is calculated from collapse value per Section 3.2.1.
+	 *
+	 * Polarity is irrelevant for ERS: each cycle is BS+Ar+BS_inv+Ar_inv,
+	 * so inverting all bits (= flipping polarity) just shifts the
+	 * continuous stream by half a cycle.  Pagers of either polarity
+	 * will detect the re-sync pattern. */
+	if (!strcasecmp(capcode_string, "ers")) {
+		flex_t *flex = (flex_t *)sender_head;
+
+		if (!flex) {
+			LOGP(DFLEX, LOGL_ERROR, "No transmitter instance for ERS command.\n");
+			return;
+		}
+
+		LOGP(DFLEX, LOGL_INFO, "FIFO: ERS command.\n");
+		flex_trigger_ers(flex);
+		return;
+	}
+
 	/* Handle group:capcode prefix */
 	if (strncmp(capcode_string, "group:", 6) == 0) {
 		is_group = 1;

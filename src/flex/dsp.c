@@ -514,11 +514,6 @@ enum {
 	RX_STATE_DATA,		/* reading interleaved phase data at data symbol rate */
 };
 
-/* FLEX sync marker: the middle 32 bits of the 64-bit sync word.
- * Per ARIB STD-43A Section 3.2, the 64-bit sync is AAAA:BBBBBBBB:CCCC
- * where BBBBBBBB = 0xA6C6AAAA and AAAA ^ CCCC = 0xFFFF. */
-#define FLEX_SYNC_MARKER	0xA6C6AAAAul
-
 /* PLL tuning constants (per multimon-ng, empirically validated) */
 #define SLICE_THRESHOLD		0.667	/* 4-level quantization at 2/3 envelope */
 #define DC_OFFSET_FILTER	0.010	/* DC removal IIR time constant (seconds) */
@@ -816,18 +811,22 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 		int baud;	/* symbol rate (symbols/second) */
 		int levels;	/* 2 = 2FSK (1 bit/sym), 4 = 4FSK (2 bits/sym) */
 	} modes[] = {
-		{ 0x870C, 1600, 2 },	/* A1: 1600bps/2FSK, 1600 baud */
-		{ 0xB068, 1600, 4 },	/* A3: 3200bps/4FSK, 1600 baud */
-		{ 0x7B18, 3200, 2 },	/* A2: 3200bps/2FSK, 3200 baud */
-		{ 0xDEA0, 3200, 4 },	/* A4: 6400bps/4FSK, 3200 baud */
+		{ FLEX_SYNC_A1, 1600, 2 },	/* A1: 1600bps/2FSK, 1600 baud */
+		{ FLEX_SYNC_A3, 1600, 4 },	/* A3: 3200bps/4FSK, 1600 baud */
+		{ FLEX_SYNC_A2, 3200, 2 },	/* A2: 3200bps/2FSK, 3200 baud */
+		{ FLEX_SYNC_A4, 3200, 4 },	/* A4: 6400bps/4FSK, 3200 baud */
 		{ 0, 0, 0 }
 	};
 	int i;
 
-	/* Check for Ar (ERS re-sync) — skip these */
-	if (count_bits(sync_code ^ 0xCB20) < 4 ||
-	    count_bits(sync_code ^ 0x34DF) < 4) {
-		LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: Ar (ERS re-sync) detected, ignoring.\n");
+	/* Check for Ar (ERS re-sync).
+	 * Per ARIB STD-43A Section 3.2.1: when the receiver detects the Ar
+	 * sync code, it must re-synchronize its frame timing.  ERS is not
+	 * a data frame — no FIW/S2/DATA follows.  The receiver should reset
+	 * to sync-hunting state so it can lock onto the next data frame's
+	 * S1 sync after the ERS burst ends. */
+	if (count_bits(sync_code ^ FLEX_SYNC_AR) < 4) {
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: Ar (ERS re-sync) detected — resetting sync.\n");
 		return 0;
 	}
 
@@ -835,7 +834,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 	 * Same physical layer as A4 (6400bps/4FSK, 3200 baud) but
 	 * uses a different framing format.  Decode what we can as
 	 * standard FLEX, hex-dump the rest. */
-	if (count_bits((uint32_t)(0x4C7C ^ sync_code)) < 4) {
+	if (count_bits((uint32_t)(FLEX_SYNC_REFLEX ^ sync_code)) < 4) {
 		flex->rx.sync_baud = 3200;
 		flex->rx.sync_levels = 4;
 		flex->rx.reflex = 1;
