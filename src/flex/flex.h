@@ -52,6 +52,10 @@ typedef struct flex_msg {
 	int			blocking_length;	/* HEX/Binary B field: bits per character.
 						 * 1-15 = that many bits, 0 = 16 bits.
 						 * Spec §3.10.1.2, default 1 (raw bits). */
+	int			mail_drop;		/* M flag (Spec §3.10.1.3):
+						 * 0 = ordinary message (default)
+						 * 1 = can be handled separately from
+						 *     ordinary messages (mail drop) */
 	int			phase;			/* phase (channel) override:
 						 * -1=auto (default, scheduler assigns
 						 * from capcode per ARIB STD-43A),
@@ -61,10 +65,15 @@ typedef struct flex_msg {
 						 *   3200/4FSK: 0=A, 1=C
 						 *   6400/4FSK: 0=A, 1=B, 2=C, 3=D */
 
-	/* fragmentation state (set by scheduler for long messages) */
+	/* fragmentation state (set by scheduler for long messages).
+	 * All fragments of one message share the same retrieval_num,
+	 * which becomes the N (message number) field in the alpha/hex
+	 * header word.  Per spec §3.10.1.3: "those message numbers
+	 * which are newly assigned to a message must be unique numbers
+	 * so as to identify fragments for the same message." */
 	int			fragment_index;
 	int			total_fragments;
-	uint32_t		retrieval_num;
+	uint32_t		retrieval_num;	/* → N field (6 bits, 0-63) */
 } flex_msg_t;
 
 /* Instance of FLEX transmitter — embeds sender_t as first member */
@@ -188,8 +197,8 @@ typedef struct flex {
 	 * precisely so that polarity is irrelevant for sync detection. */
 
 	/* message numbering */
-	uint32_t		msg_sequence;		/* monotonic counter, wraps at max */
-	uint32_t		frag_retrieval_seq;	/* monotonic retrieval number for fragments */
+	uint32_t		msg_sequence;		/* monotonic counter, wraps at 64 (N is 6 bits) */
+	uint32_t		frag_retrieval_seq;	/* monotonic retrieval number for fragments (6-bit, 0-63) */
 
 	/* 4-FSK state (3200bps/4FSK and 6400bps/4FSK modes) */
 	sample_t		fsk4_ramps[4][4][256];	/* [from][to][phase] */

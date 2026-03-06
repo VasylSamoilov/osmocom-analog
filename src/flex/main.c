@@ -390,7 +390,8 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			       int *speed, int *modulation_type,
 			       double *polarity_out, int *priority,
 			       int *charset, int *is_group, int *is_temp_group,
-			       char *source_id, int *phase, int *blocking_length)
+			       char *source_id, int *phase, int *blocking_length,
+			       int *mail_drop)
 {
 	char buf[256];
 	char *p, *key, *val;
@@ -407,6 +408,7 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	source_id[0] = '\0';
 	*phase = -1;
 	*blocking_length = default_blocking_length;
+	*mail_drop = 0;
 
 	if (opts_len <= 0)
 		return;
@@ -499,6 +501,8 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			if (bv >= 0 && bv <= 15)
 				*blocking_length = bv;
 		}
+		else if (!strcmp(key, "maildrop"))
+			*mail_drop = atoi(val) ? 1 : 0;
 	}
 }
 
@@ -523,6 +527,7 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_charset;
 	int msg_phase;
 	int msg_blocking_length;
+	int msg_mail_drop;
 	char msg_source[64];
 	const char *opts_start;
 	int opts_len;
@@ -688,7 +693,8 @@ static void fifo_process_line(const char *text, int text_length)
 			   &msg_speed, &msg_mod_type,
 			   &msg_polarity, &msg_priority,
 			   &msg_charset, &is_group, &is_temp_group,
-			   msg_source, &msg_phase, &msg_blocking_length);
+			   msg_source, &msg_phase, &msg_blocking_length,
+			   &msg_mail_drop);
 
 	/* Validate capcode */
 	capcode = strtoull(capcode_string, NULL, 10);
@@ -768,6 +774,7 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->is_temp_group = is_temp_group;
 				msg->phase = msg_phase;
 				msg->blocking_length = msg_blocking_length;
+				msg->mail_drop = msg_mail_drop;
 				if (msg_source[0] != '\0') {
 					strncpy(msg->source_id, msg_source, sizeof(msg->source_id) - 1);
 					msg->source_id[sizeof(msg->source_id) - 1] = '\0';

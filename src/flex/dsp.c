@@ -2028,6 +2028,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				/* Decode header word flags (frame.h has layout) */
 				int hdr_k = 0, hdr_c = 0, hdr_f = 0;
 				int hdr_n = 0, hdr_r = 0, hdr_m = 0;
+				int hdr_u = 0, hdr_v = 0;
 				char frag_flag = '?';
 				if (ph->status[mw1] == FLEX_WORD_CLEAN ||
 				    ph->status[mw1] == FLEX_WORD_CORRECTED) {
@@ -2036,24 +2037,44 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					hdr_c = (hdr & FLEX_ALPHA_HDR_C_MASK) >> FLEX_ALPHA_HDR_C_SHIFT;
 					hdr_f = (hdr & FLEX_ALPHA_HDR_F_MASK) >> FLEX_ALPHA_HDR_F_SHIFT;
 					hdr_n = (hdr & FLEX_ALPHA_HDR_N_MASK) >> FLEX_ALPHA_HDR_N_SHIFT;
-					hdr_r = (hdr & FLEX_ALPHA_HDR_R_MASK) >> FLEX_ALPHA_HDR_R_SHIFT;
-					hdr_m = (hdr & FLEX_ALPHA_HDR_M_MASK) >> FLEX_ALPHA_HDR_M_SHIFT;
 
 					if (hdr_c == 0 && hdr_f == 3) frag_flag = 'K';
 					else if (hdr_c == 0) frag_flag = 'C';
 					else frag_flag = 'F';
 
-					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c alpha hdr[%d]=0x%05X: "
-						  "checksum=0x%03X continued=%d frag=%d "
-						  "msgnum=%d retrieval=%d maildrop=%d "
-						  "(%s)\n",
-						  phase_name, mw1, hdr,
-						  hdr_k, hdr_c, hdr_f,
-						  hdr_n, hdr_r, hdr_m,
-						  (frag_flag == 'K') ? "complete" :
-						  (frag_flag == 'F') ? "continuation" :
-						  "final");
+					/* Bits 19-20 differ by fragment type:
+					 *   First fragment (F=11, Fig. 3.10.1.3-1):
+					 *     bit 19 = R (retrieval), bit 20 = M (mail drop)
+					 *   Continuation/final (Fig. 3.10.1.3-2):
+					 *     bit 19 = U₀ (reserved), bit 20 = V₀ (reserved) */
+					if (hdr_f == 3) {
+						hdr_r = (hdr & FLEX_ALPHA_HDR_R_MASK) >> FLEX_ALPHA_HDR_R_SHIFT;
+						hdr_m = (hdr & FLEX_ALPHA_HDR_M_MASK) >> FLEX_ALPHA_HDR_M_SHIFT;
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c alpha hdr[%d]=0x%05X: "
+							  "K=0x%03X C=%d F=%d "
+							  "N=%d R=%d M=%d "
+							  "(%s)\n",
+							  phase_name, mw1, hdr,
+							  hdr_k, hdr_c, hdr_f,
+							  hdr_n, hdr_r, hdr_m,
+							  (frag_flag == 'K') ? "complete" :
+							  (frag_flag == 'F') ? "continuation" :
+							  "final");
+					} else {
+						hdr_u = (hdr & FLEX_ALPHA_HDR_U_MASK) >> FLEX_ALPHA_HDR_U_SHIFT;
+						hdr_v = (hdr & FLEX_ALPHA_HDR_V_MASK) >> FLEX_ALPHA_HDR_V_SHIFT;
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c alpha hdr[%d]=0x%05X: "
+							  "K=0x%03X C=%d F=%d "
+							  "N=%d U=%d V=%d "
+							  "(%s)\n",
+							  phase_name, mw1, hdr,
+							  hdr_k, hdr_c, hdr_f,
+							  hdr_n, hdr_u, hdr_v,
+							  (frag_flag == 'F') ? "continuation" :
+							  "final");
+					}
 				}
 
 				/* Extract 7-bit alphanumeric characters and
@@ -2074,6 +2095,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					uint32_t rx_sig = 0;
 					uint32_t sig_sum = 0;
 					int is_initial = (hdr_f == 3); /* F=11 = first/only */
+					const char *alpha_sig_status = ""; /* signature validation result */
 
 					for (w = start_word; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
 						uint32_t dw;
@@ -2105,18 +2127,107 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					}
 					text[ti] = '\0';
 
-					/* Verify signature on initial fragment */
+					/* S: Verify 7-bit message signature on initial fragment.
+					 *
+					 * Per Spec §3.8.8.3 / §3.10.1.3: "Signature is defined
+					 * as the 1's complement of binary sum for the entire
+					 * message (including all fragments) for every 7 bits,
+					 * starting from the first 7 bits that directly follow
+					 * the Signature Field.  The 7 LSB's of the result is
+					 * transmitted as the Message Signature."
+					 *
+					 * Note: Function characters ETX and NUL in Enhanced
+					 * Fragmentation are not included for calculation.
+					 *
+					 * For a complete (single-fragment) message, we validate
+					 * immediately.  For multi-fragment messages, the
+					 * signature covers ALL fragments — validation must
+					 * wait until reassembly is complete. */
 					if (is_initial) {
 						uint32_t expected_sig = (~sig_sum) & FLEX_ALPHA_SIG_MASK;
-						if (rx_sig == expected_sig) {
-							LOGP_CHAN(DDSP, LOGL_DEBUG,
-								  "RX: Phase %c signature OK (0x%02X).\n",
-								  phase_name, rx_sig);
+						if (hdr_c == 0) {
+							/* Complete message — validate now */
+							if (rx_sig == expected_sig) {
+								alpha_sig_status = ",sig=OK";
+								LOGP_CHAN(DDSP, LOGL_DEBUG,
+									  "RX: Phase %c alpha signature OK "
+									  "(S=0x%02X, sum=0x%02X)\n",
+									  phase_name, rx_sig,
+									  sig_sum & 0x7F);
+							} else {
+								alpha_sig_status = ",sig=FAIL";
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: Phase %c alpha signature MISMATCH: "
+									  "received=0x%02X computed=0x%02X "
+									  "(sum=0x%02X)\n",
+									  phase_name, rx_sig, expected_sig,
+									  sig_sum & 0x7F);
+							}
 						} else {
-							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: Phase %c signature MISMATCH: "
-								  "received=0x%02X computed=0x%02X.\n",
-								  phase_name, rx_sig, expected_sig);
+							/* First fragment of multi-fragment message.
+							 * Signature covers all fragments — log
+							 * partial sum for debugging, defer final
+							 * validation to reassembly completion. */
+							alpha_sig_status = ",sig=partial";
+							LOGP_CHAN(DDSP, LOGL_DEBUG,
+								  "RX: Phase %c alpha signature deferred "
+								  "(multi-fragment): S=0x%02X, partial_sum=0x%02X\n",
+								  phase_name, rx_sig,
+								  sig_sum & 0x7F);
+						}
+					}
+
+					/* K: Verify 10-bit fragment checksum (Spec §3.10.1.3).
+					 *
+					 * Recompute K over all message words in this fragment
+					 * using the 3-group method: bits 0-7, 8-15, 16-20.
+					 * The header word (mw1) participates with K₀-K₉ = 0.
+					 * Compare 1's complement of lower 10 bits against
+					 * the received K value.
+					 *
+					 * Unlike S (which spans all fragments), K is per-
+					 * fragment and can always be validated immediately. */
+					const char *alpha_k_status = "";
+					if (ph->status[mw1] == FLEX_WORD_CLEAN ||
+					    ph->status[mw1] == FLEX_WORD_CORRECTED) {
+						uint32_t k_sum = 0;
+						int all_words_ok = 1;
+
+						for (w = mw1; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+							uint32_t dw;
+							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED) {
+								all_words_ok = 0;
+								break;
+							}
+							dw = ph->words[w];
+							if (w == mw1) {
+								/* Header word: zero out K field (bits 0-9)
+								 * before summing, per spec calculation. */
+								dw &= ~FLEX_ALPHA_HDR_K_MASK;
+							}
+							k_sum += dw & FLEX_ALPHA_K_GRP1_MASK;
+							k_sum += (dw >> FLEX_ALPHA_K_GRP2_SHIFT) & FLEX_ALPHA_K_GRP2_MASK;
+							k_sum += (dw >> FLEX_ALPHA_K_GRP3_SHIFT) & FLEX_ALPHA_K_GRP3_MASK;
+						}
+
+						if (all_words_ok) {
+							uint32_t expected_k = (~k_sum) & FLEX_ALPHA_HDR_K_MASK;
+							if ((uint32_t)hdr_k == expected_k) {
+								alpha_k_status = ",K=OK";
+								LOGP_CHAN(DDSP, LOGL_DEBUG,
+									  "RX: Phase %c alpha K checksum OK "
+									  "(K=0x%03X)\n",
+									  phase_name, hdr_k);
+							} else {
+								alpha_k_status = ",K=FAIL";
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: Phase %c alpha K checksum MISMATCH: "
+									  "received=0x%03X computed=0x%03X\n",
+									  phase_name, hdr_k, expected_k);
+							}
+						} else {
+							alpha_k_status = ",K=incomplete";
 						}
 					}
 
@@ -2133,7 +2244,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c ALN \"%s\"\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s [%09" PRIu64 "] %c%c ALN \"%s\"\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -2143,6 +2254,8 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  (frag_flag == 'K') ? "complete" :
 						  (frag_flag == 'F') ? (is_initial ? "frag_start" : "frag_cont") :
 						  "frag_end",
+						  alpha_sig_status,
+						  alpha_k_status,
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  grp_flag,
@@ -2309,6 +2422,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					int hex_c = 0, hex_f = 0, hex_n = 0;
 					int hex_is_initial = 0;
 					int hex_blocking = 0; /* B field from hdr2 (0=16 bits/char) */
+					uint32_t rx_hex_sig = 0; /* S field from hdr2 (8-bit signature) */
+					int hex_has_sig = 0; /* 1 if we extracted S from hdr2 */
+					const char *hex_sig_status = ""; /* signature validation result */
 					char hex_frag_flag = '?';
 					int data_start = mw1; /* default: all words */
 
@@ -2330,18 +2446,25 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						 * continuation:   word 0=hdr1, data from word 1 */
 						if (hex_is_initial) {
 							data_start = mw1 + 2;
-							/* Parse header2 for B field (blocking length) */
+							/* Parse header2 for B and S fields */
 							if ((mw1 + 1) <= mw2 &&
 							    (ph->status[mw1 + 1] == FLEX_WORD_CLEAN ||
 							     ph->status[mw1 + 1] == FLEX_WORD_CORRECTED)) {
 								uint32_t hdr2 = ph->words[mw1 + 1];
 								hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
+								/* S: 8-bit message signature (bits 13-20).
+								 * Per Spec §3.10.1.2: 1's complement of
+								 * binary sum of every 8 bits of the entire
+								 * message, excluding termination bits. */
+								rx_hex_sig = (hdr2 >> FLEX_HEX_HDR2_S_SHIFT) & 0xFF;
+								hex_has_sig = 1;
 								LOGP_CHAN(DDSP, LOGL_DEBUG,
 									  "RX: Phase %c hex hdr2[%d]=0x%05X: "
-									  "B=%d (%d bits/char)\n",
+									  "B=%d (%d bits/char) S=0x%02X\n",
 									  phase_name, mw1 + 1, hdr2,
 									  hex_blocking,
-									  hex_blocking ? hex_blocking : 16);
+									  hex_blocking ? hex_blocking : 16,
+									  rx_hex_sig);
 							}
 						} else {
 							data_start = mw1 + 1;
@@ -2447,6 +2570,90 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					}
 					hex[hi] = '\0';
 
+					/* S: Verify 8-bit message signature on initial fragment.
+					 *
+					 * Per Spec §3.10.1.2: "Signature is defined as the
+					 * 1's complement of binary sum for the entire message
+					 * (including all fragments) for every 8 bits, beginning
+					 * with the first 8 bits which follow directly after the
+					 * Signature Field.  The 8 LSB of the result is
+					 * transmitted as the Message Signature."
+					 *
+					 * Note: Termination bits are NOT included.
+					 *
+					 * For a complete (single-fragment) message, we can
+					 * validate immediately.  For multi-fragment messages,
+					 * the signature covers ALL fragments — validation
+					 * must wait until reassembly is complete.
+					 *
+					 * We compute the sum over the raw data bits from the
+					 * data words, stopping at hi*4 bits (the actual data
+					 * length after termination stripping). */
+					if (hex_is_initial && hex_has_sig) {
+						uint32_t sig_sum = 0;
+						int total_data_bits = hi * 4;
+						int bit_pos = 0;
+						uint8_t accum = 0;
+						int accum_bits = 0;
+
+						for (w = data_start; w <= mw2 && w < FLEX_WORDS_PER_FRAME && bit_pos < total_data_bits; w++) {
+							int b;
+							uint32_t dw;
+							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+								continue;
+							dw = ph->words[w];
+							for (b = 0; b < 21 && bit_pos < total_data_bits; b++) {
+								accum |= (uint8_t)(((dw >> b) & 1) << accum_bits);
+								accum_bits++;
+								bit_pos++;
+								if (accum_bits == 8) {
+									sig_sum += accum;
+									accum = 0;
+									accum_bits = 0;
+								}
+							}
+						}
+						/* Include any remaining partial byte */
+						if (accum_bits > 0)
+							sig_sum += accum;
+
+						{
+							uint32_t expected_sig = (~sig_sum) & 0xFF;
+							if (hex_c == 0) {
+								/* Complete message — validate now */
+								if (rx_hex_sig == expected_sig) {
+									hex_sig_status = ",sig=OK";
+									LOGP_CHAN(DDSP, LOGL_DEBUG,
+										  "RX: Phase %c HEX signature OK "
+										  "(S=0x%02X, sum=0x%02X, %d data bits)\n",
+										  phase_name, rx_hex_sig,
+										  sig_sum & 0xFF, total_data_bits);
+								} else {
+									hex_sig_status = ",sig=FAIL";
+									LOGP_CHAN(DDSP, LOGL_NOTICE,
+										  "RX: Phase %c HEX signature MISMATCH: "
+										  "received=0x%02X computed=0x%02X "
+										  "(sum=0x%02X, %d data bits)\n",
+										  phase_name, rx_hex_sig, expected_sig,
+										  sig_sum & 0xFF, total_data_bits);
+								}
+							} else {
+								/* First fragment of multi-fragment message.
+								 * Signature covers all fragments — log
+								 * partial sum for debugging, defer final
+								 * validation to reassembly completion. */
+								hex_sig_status = ",sig=partial";
+								LOGP_CHAN(DDSP, LOGL_DEBUG,
+									  "RX: Phase %c HEX signature deferred "
+									  "(multi-fragment): S=0x%02X, partial_sum=0x%02X "
+									  "(%d data bits in this fragment)\n",
+									  phase_name, rx_hex_sig,
+									  sig_sum & 0xFF, total_data_bits);
+							}
+						}
+					}
+
 					/* For continuation/final fragments, recover B
 					 * from the reassembly slot (only the initial
 					 * fragment carries header2 with the B field). */
@@ -2477,7 +2684,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -2488,6 +2695,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  (hex_frag_flag == 'F') ? (hex_is_initial ? "frag_start" : "frag_cont") :
 						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
 						  hex_blocking,
+						  hex_sig_status,
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  grp_flag,

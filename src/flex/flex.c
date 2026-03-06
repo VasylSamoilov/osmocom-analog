@@ -202,6 +202,7 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->source_id[0] = '\0';
 	msg->short_msg_index = -1;
 	msg->blocking_length = flex->default_blocking_length;
+	msg->mail_drop = 0;
 	msg->phase = -1;
 
 	/* fragmentation state defaults */
@@ -346,7 +347,7 @@ static void flex_fragment_queue(flex_t *flex)
 
 		/* Assign a retrieval number for this set of fragments */
 		uint32_t ret_num = flex->frag_retrieval_seq++;
-		flex->frag_retrieval_seq &= 0x7F; /* 7-bit counter per spec */
+		flex->frag_retrieval_seq &= 0x3F; /* 6-bit counter: N is 0-63 per spec */
 
 		LOGP(DFLEX, LOGL_INFO,
 		     "Fragmenting message for capcode %" PRIu64 " into %d fragments (retrieval=%u).\n",
@@ -376,6 +377,7 @@ static void flex_fragment_queue(flex_t *flex)
 			memcpy(frag->source_id, msg->source_id, sizeof(frag->source_id));
 			frag->short_msg_index = msg->short_msg_index;
 			frag->blocking_length = msg->blocking_length;
+			frag->mail_drop = msg->mail_drop;
 			frag->phase = msg->phase;
 
 			/* Set fragmentation state */
@@ -756,10 +758,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 			frame_msg.is_temp_group = candidate->is_temp_group;
 			frame_msg.sequence_num = (candidate->total_fragments > 1)
 				? (int)candidate->retrieval_num
-				: (int)(flex->msg_sequence++ & 0x7F);
+				: (int)(flex->msg_sequence++ & 0x3F);
 			frame_msg.source_id = candidate->source_id[0] ? candidate->source_id : NULL;
 			frame_msg.short_msg_idx = candidate->short_msg_index;
 			frame_msg.blocking_length = candidate->blocking_length;
+			frame_msg.mail_drop = candidate->mail_drop;
 			frame_msg.fragment_index = candidate->fragment_index;
 			frame_msg.total_fragments = candidate->total_fragments;
 
@@ -884,10 +887,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 		frame_msg.is_temp_group = msg->is_temp_group;
 		frame_msg.sequence_num = (msg->total_fragments > 1)
 			? (int)msg->retrieval_num
-			: (int)(flex->msg_sequence++ & 0x7F);
+			: (int)(flex->msg_sequence++ & 0x3F);
 		frame_msg.source_id = msg->source_id[0] ? msg->source_id : NULL;
 		frame_msg.short_msg_idx = msg->short_msg_index;
 		frame_msg.blocking_length = msg->blocking_length;
+		frame_msg.mail_drop = msg->mail_drop;
 		frame_msg.fragment_index = msg->fragment_index;
 		frame_msg.total_fragments = msg->total_fragments;
 
@@ -1073,9 +1077,10 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.is_temp_group = msg->is_temp_group;
 			frame_msg.sequence_num = (msg->total_fragments > 1)
 				? (int)msg->retrieval_num
-				: (int)(flex->msg_sequence++ & 0x7F);
+				: (int)(flex->msg_sequence++ & 0x3F);
 			frame_msg.phase = msg->phase;
 			frame_msg.blocking_length = msg->blocking_length;
+			frame_msg.mail_drop = msg->mail_drop;
 			frame_msg.fragment_index = msg->fragment_index;
 			frame_msg.total_fragments = msg->total_fragments;
 

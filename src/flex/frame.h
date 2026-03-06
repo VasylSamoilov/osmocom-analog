@@ -1159,6 +1159,14 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_ALPHA_HDR_M_SHIFT		20
 #define FLEX_ALPHA_HDR_M_MASK		(1U << 20)
 
+/* Continuation/final fragment header (Fig. 3.10.1.3-2):
+ * Bits 19-20 are U₀/V₀ (reserved), NOT R/M.
+ * Same bit positions, different semantics. */
+#define FLEX_ALPHA_HDR_U_SHIFT		19
+#define FLEX_ALPHA_HDR_U_MASK		(1U << 19)
+#define FLEX_ALPHA_HDR_V_SHIFT		20
+#define FLEX_ALPHA_HDR_V_MASK		(1U << 20)
+
 /* K checksum groups: 3 groups per word (bits 0-7, 8-15, 16-20) */
 #define FLEX_ALPHA_K_GRP1_MASK		0xFFU		/* bits 0-7 */
 #define FLEX_ALPHA_K_GRP2_SHIFT		8
@@ -1398,12 +1406,21 @@ typedef struct flex_frame_msg {
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
 	int		is_group;		/* 0 = individual, 1 = group */
 	int		is_temp_group;		/* 0 = common group, 1 = temporary group */
-	int		sequence_num;		/* message numbering (-1 = disabled) */
+	int		sequence_num;		/* N field: message number (0-63), or -1 to
+					 * disable numbering (R=0, N not set).
+					 * Per spec §3.10.1.3: when R=1, pager checks
+					 * numbered messages; R=0 messages are excluded
+					 * from message number order checking.
+					 * For fragmented messages, all fragments share
+					 * the same N to identify the fragment stream. */
 	const char	*source_id;		/* source indication (NULL = none) */
 	int		short_msg_idx;		/* short message index, -1 = N/A */
 	int		blocking_length;	/* HEX/Binary B field: bits per character.
 					 * 1-15 = that many bits, 0 = 16 bits.
 					 * Spec §3.10.1.2, default 1 (raw bits). */
+	int		mail_drop;		/* M flag (Spec §3.10.1.3):
+					 * 0 = ordinary message (default)
+					 * 1 = can be handled separately */
 	int		phase;			/* phase override: -1=auto (default), 0=A, 1=B, 2=C, 3=D */
 
 	/* Fragment state (Spec Section 3.10.1.3 / 4.2).

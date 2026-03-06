@@ -571,18 +571,37 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 			msg_word[0] |= FLEX_ALPHA_HDR_C_MASK;
 	}
 
-	/* Message number N and retrieval flag R */
+	/* Message number N — present on ALL fragments (identifies the
+	 * fragment stream).  Per spec §3.10.1.3, N is 6 bits (0-63).
+	 * "those message numbers which are newly assigned to a message
+	 * must be unique numbers so as to identify fragments for the
+	 * same message." */
 	if (sequence_num >= 0) {
 		uint32_t n = (uint32_t)(sequence_num % 64);
 		msg_word[0] |= (n << FLEX_ALPHA_HDR_N_SHIFT);
-		msg_word[0] |= FLEX_ALPHA_HDR_R_MASK;
 	}
 
-	/* Mail drop flag M */
-	if (config) {
-		const struct flex_msg_config *cfg = config;
-		if (cfg->mail_drop)
-			msg_word[0] |= FLEX_ALPHA_HDR_M_MASK;
+	/* R (retrieval) and M (mail drop) — first fragment only.
+	 * Per Fig. 3.10.1.3-2, bits 19-20 on continuation/final
+	 * fragments are U₀/V₀ (reserved), not R/M.
+	 * Per spec: "Fields R through S are only transmitted in
+	 * the first fragment." */
+	{
+		int is_initial = 1;
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			is_initial = (cfg->total_fragments <= 1 ||
+				      cfg->fragment_index == 0);
+		}
+		if (is_initial) {
+			if (sequence_num >= 0)
+				msg_word[0] |= FLEX_ALPHA_HDR_R_MASK;
+			if (config) {
+				const struct flex_msg_config *cfg = config;
+				if (cfg->mail_drop)
+					msg_word[0] |= FLEX_ALPHA_HDR_M_MASK;
+			}
+		}
 	}
 
 	/* Pack 7-bit ASCII characters, 3 per word.
@@ -652,11 +671,23 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 			}
 		}
 
-		/* S: 7-bit message signature (ARIB STD-43A Section 3.8.8.3).
+		/* S: 7-bit message signature (Spec §3.8.8.3 / §3.10.1.3).
 		 * Only present on initial fragment (F=11).
-		 * 1's complement of binary sum of all message characters taken
-		 * 7 bits at a time, starting from the first character directly
-		 * following the signature field. */
+		 *
+		 * Per spec: "Signature is defined as the 1's complement of
+		 * binary sum for the entire message (including all fragments)
+		 * for every 7 bits [a6 a5 a4 a3 a2 a1 a0 + b6 b5 b4 b3 b2
+		 * b1 b0 ...] starting from the first 7 bits that directly
+		 * follow the Signature Field.  The 7 LSB's of the result is
+		 * transmitted as the Message Signature."
+		 *
+		 * Note: Function characters ETX and NUL in Enhanced
+		 * Fragmentation are not included for calculation.
+		 *
+		 * We sum all three 7-bit character slots from each data word
+		 * (words 1..N), skipping the signature slot itself (bits 0-6
+		 * of word 1).  The sum includes ETX padding characters since
+		 * they occupy character slots in the transmitted words. */
 		if (is_initial_frag) {
 			sig_sum = 0;
 			for (i = 1; i < word_idx; i++) {
@@ -665,6 +696,12 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
 			}
 			msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
+
+			LOGP(DFLEX, LOGL_DEBUG,
+			     "TX: Alpha signature: sum=0x%02X S=0x%02X "
+			     "(%d data words, %d character slots)\n",
+			     sig_sum & 0x7F, (~sig_sum) & 0x7F,
+			     word_idx - 1, (word_idx - 1) * 3 - 1);
 		}
 	}
 
@@ -1484,10 +1521,68 @@ static void encode_hex_message(uint32_t *frame_words, const char *msg,
 		}
 	}
 
+	/* S: 8-bit message signature (Spec §3.10.1.2, header2 bits 13-20).
+	 * Only present on initial fragment.
+	 *
+	 * Per spec: "Signature is defined as the 1's complement of binary
+	 * sum for the entire message (including all fragments) for every
+	 * 8 bits, beginning with the first 8 bits which follow directly
+	 * after the Signature Field.  The 8 LSB of the result is
+	 * transmitted as the Message Signature."
+	 *
+	 * For a single-fragment message, the data words start at index 2
+	 * (after hdr1 and hdr2).  We sum every 8 bits of the raw data
+	 * words (excluding termination fill bits in the last word).
+	 * Termination bits are NOT included in the calculation.
+	 *
+	 * The bit stream is taken from the data words only (not headers),
+	 * packed as a flat bit sequence: word[data_idx] bits 0-20, then
+	 * word[data_idx+1] bits 0-20, etc.  We group these into 8-bit
+	 * chunks and sum them, then take the 1's complement (8-bit). */
+	if (is_initial_frag) {
+		uint32_t sig_sum = 0;
+		int total_data_bits;
+		int bit_pos = 0;
+		uint8_t accum = 0;
+		int accum_bits = 0;
+
+		/* Calculate total data bits excluding termination fill.
+		 * len = number of hex nibbles = number of 4-bit units.
+		 * Total data bits = len * 4. */
+		total_data_bits = (int)len * 4;
+
+		/* Walk through data words, extract bits, group into 8-bit sums */
+		for (i = data_idx; i < (size_t)word_idx && bit_pos < total_data_bits; i++) {
+			int b;
+			for (b = 0; b < 21 && bit_pos < total_data_bits; b++) {
+				accum |= (uint8_t)(((msg_words[i] >> b) & 1) << accum_bits);
+				accum_bits++;
+				bit_pos++;
+				if (accum_bits == 8) {
+					sig_sum += accum;
+					accum = 0;
+					accum_bits = 0;
+				}
+			}
+		}
+		/* Include any remaining partial byte (< 8 bits) in the sum */
+		if (accum_bits > 0)
+			sig_sum += accum;
+
+		msg_words[1] |= (uint32_t)((~sig_sum) & 0xFF) << FLEX_HEX_HDR2_S_SHIFT;
+
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "TX: HEX/Binary signature: sum=0x%02X S=0x%02X "
+		     "(%d data bits, %d complete bytes + %d remainder bits)\n",
+		     sig_sum & 0xFF, (~sig_sum) & 0xFF,
+		     total_data_bits, total_data_bits / 8, total_data_bits % 8);
+	}
+
 	/* K: 12-bit fragment checksum (Spec §3.10.1.2).
 	 * 1's complement of binary sum of all information bits in the
 	 * fragment, taken as three groups per word: bits 0-7, 8-15, 16-20.
-	 * Same algorithm as alpha but 12-bit mask. */
+	 * Same algorithm as alpha but 12-bit mask.
+	 * Computed last since it covers all other fields including S. */
 	k_sum = 0;
 	for (i = 0; i < (size_t)word_idx; i++) {
 		k_sum += msg_words[i] & 0xFFU;
@@ -2267,6 +2362,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 					memset(&acfg, 0, sizeof(acfg));
 					acfg.fragment_index = msgs[idx].fragment_index;
 					acfg.total_fragments = msgs[idx].total_fragments;
+					acfg.mail_drop = msgs[idx].mail_drop;
 					encode_alpha_message(frame_words,
 						msgs[idx].message,
 						msg_start_word,
@@ -2297,6 +2393,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				hcfg.fragment_index = msgs[idx].fragment_index;
 				hcfg.total_fragments = msgs[idx].total_fragments;
 				hcfg.blocking_length = msgs[idx].blocking_length;
+				hcfg.mail_drop = msgs[idx].mail_drop;
 				encode_hex_message(frame_words,
 					msgs[idx].message,
 					msg_start_word,
