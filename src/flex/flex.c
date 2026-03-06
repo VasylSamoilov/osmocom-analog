@@ -278,9 +278,15 @@ static void flex_fragment_queue(flex_t *flex)
 	 * which reduces the space available for message data. */
 	int biw_count = 1; /* BIW1 always present */
 	if (flex->ssid || flex->nid)
-		biw_count = 2;
+		biw_count++;
+	if (flex->country_code || flex->tmf)
+		biw_count++;
 	if (flex->biw_time_enabled)
-		biw_count = 4;
+		biw_count += 2; /* Date + Time */
+	if (flex->timezone_code >= 0 && flex->timezone_code < (int)FLEX_TZ_ENTRIES)
+		biw_count++;
+	if (biw_count > 4)
+		biw_count = 4; /* max e_biw=3 → 4 total */
 
 	for (msg = flex->msg_list; msg; msg = next) {
 		next = msg->next;
@@ -617,6 +623,15 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.biw_time = flex->biw_time_enabled;
 	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
 
+	/* Multiple transmission params (Spec Section 3.4.2) */
+	params.num_transmissions = flex->num_transmissions;
+	params.td_collapse = flex->td_collapse;
+	if (flex->num_transmissions > 1) {
+		params.subframe_index = flex_scheduler_subframe_index(
+			ft.frame, flex->num_transmissions,
+			flex->collapse, flex->td_collapse);
+	}
+
 	/* DSP speed is set by flex_setup_frame_buffers() or the phased
 	 * encoding path — always starts at 1600/2FSK for sync_buffer,
 	 * then switches to target speed for frame_buffer. */
@@ -626,6 +641,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 		params.local_id = flex->ssid;
 		params.coverage_id = flex->nid;
 	}
+	if (flex->country_code || flex->tmf) {
+		params.country_code = flex->country_code;
+		params.tmf = flex->tmf;
+	}
+	params.timezone_code = flex->timezone_code;
 
 	/* Find messages eligible for current frame (collapse-aware, speed-grouped).
 	 * Only pick messages matching the selected baud rate for this frame.
@@ -634,8 +654,14 @@ static int flex_get_next_frame_network(flex_t *flex)
 	msg = NULL;
 	{
 		flex_msg_t *candidate;
+
+		/* Two-pass selection: priority messages first, then normal.
+		 * Per ARIB STD-43A Section 3.4.1, priority addresses come
+		 * before normal addresses in the frame.  We honor this at
+		 * the scheduling level too. */
 		for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
-			/* Speed filter: skip messages not matching this frame's speed/modulation */
+			if (!candidate->priority)
+				continue;
 			if (candidate->speed != params.bitrate ||
 			    candidate->modulation_type != params.modulation_type)
 				continue;
@@ -645,7 +671,6 @@ static int flex_get_next_frame_network(flex_t *flex)
 				break;
 			}
 
-			/* Collapse filter: check capcode-to-frame mapping */
 			{
 				flex_capcode_sched_t sched;
 				uint32_t next_frame;
@@ -657,6 +682,34 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (next_frame == ft.frame) {
 					msg = candidate;
 					break;
+				}
+			}
+		}
+
+		/* Second pass: normal priority */
+		if (!msg) {
+			for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
+				if (candidate->speed != params.bitrate ||
+				    candidate->modulation_type != params.modulation_type)
+					continue;
+
+				if (flex->collapse <= 0) {
+					msg = candidate;
+					break;
+				}
+
+				{
+					flex_capcode_sched_t sched;
+					uint32_t next_frame;
+
+					flex_scheduler_capcode_info(candidate->capcode, &sched);
+					next_frame = flex_scheduler_next_frame(ft.frame,
+									       sched.assigned_frame,
+									       flex->collapse);
+					if (next_frame == ft.frame) {
+						msg = candidate;
+						break;
+					}
 				}
 			}
 		}
@@ -688,8 +741,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 		 * eligible for this frame and compute carry-on from the max
 		 * remaining fragment count.  Must be done before per-phase
 		 * encoding since BIW1 is baked into the encoded words.
-		 * Only meaningful with collapse > 0. */
-		if (flex->collapse > 0) {
+		 * Only meaningful with collapse > 0.
+		 * Per spec: "Carry On is not allowed for multiple transmission." */
+		if (flex->collapse > 0 && flex->num_transmissions <= 1) {
 			flex_msg_t *qm;
 			int max_remaining = 0;
 			for (qm = flex->msg_list; qm; qm = qm->next) {
@@ -860,11 +914,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 			dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
 			LOGP_CHAN(DFLEX, LOGL_INFO,
-				  "Network mode: encoded %d-phase frame C%u/F%u speed=%d/%s polarity=%s collapse=%d roaming=%d.\n",
+				  "Network mode: encoded %d-phase frame C%u/F%u speed=%d/%s polarity=%s collapse=%d roaming=%d num_tx=%d sf=%d/%d.\n",
 				  num_phases, ft.cycle, ft.frame, params.bitrate,
 				  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 				  (flex->fsk_polarity < 0) ? "neg" : "pos",
-				  params.collapse, params.roaming);
+				  params.collapse, params.roaming,
+				  params.num_transmissions,
+				  params.subframe_index, params.num_transmissions);
 			return 1;
 		}
 		/* No eligible messages found — fall through to idle */
@@ -904,6 +960,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		 * with collapse=0 pagers decode every frame anyway.
 		 * Per spec: "Carry On is not allowed for multiple transmission." */
 		if (flex->collapse > 0 &&
+		    flex->num_transmissions <= 1 &&
 		    msg->total_fragments > 1 &&
 		    msg->fragment_index < msg->total_fragments - 1) {
 			int remaining = msg->total_fragments - 1 - msg->fragment_index;
@@ -926,7 +983,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		flex->sched_last_frame = ft.frame;
 
 		LOGP_CHAN(DFLEX, LOGL_INFO,
-			  "Network mode: encoded frame C%u/F%u capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
+			  "Network mode: encoded frame C%u/F%u capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d num_tx=%d sf=%d/%d.\n",
 			  ft.cycle, ft.frame, frame_msg.capcode,
 			  flex_capcode_type_name(frame_msg.capcode),
 			  frame_msg.msg_type, params.bitrate,
@@ -936,7 +993,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 			  frame_msg.charset ? "kanji" : "ascii",
 			  frame_msg.is_group,
 			  frame_msg.sequence_num,
-			  frame_msg.message_length);
+			  frame_msg.message_length,
+			  params.num_transmissions,
+			  params.subframe_index, params.num_transmissions);
 
 		return 1;
 	}
@@ -1097,6 +1156,11 @@ int flex_get_next_frame(flex_t *flex)
 				params.local_id = flex->ssid;
 				params.coverage_id = flex->nid;
 			}
+			if (flex->country_code || flex->tmf) {
+				params.country_code = flex->country_code;
+				params.tmf = flex->tmf;
+			}
+			params.timezone_code = flex->timezone_code;
 
 			/* Set cycle/frame from wall clock so FIW matches
 			 * real time (same as network mode). */

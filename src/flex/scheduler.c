@@ -289,3 +289,54 @@ int flex_scheduler_is_pocsag_slot(struct flex *flex, uint32_t frame)
 		return 0;
 	return flex->pocsag_frame_slots[frame];
 }
+
+/* Compute repeat interval for multiple transmission (Spec Section 3.4.2).
+ *
+ * The repeat interval is the number of frames between successive
+ * transmissions of the same subframe content.  It equals 2^m where
+ * m is the effective collapse value:
+ *   - td_collapse (5/6/7) if set (takes priority per spec)
+ *   - system collapse otherwise
+ *
+ * Example: collapse=3, td_collapse=-1 → interval = 2^3 = 8 frames. */
+uint32_t flex_scheduler_repeat_interval(int collapse, int td_collapse)
+{
+	int m = (td_collapse >= 0) ? td_collapse : collapse;
+	if (m < 0) m = 0;
+	if (m > 7) m = 7;
+	return 1U << m;
+}
+
+/* Compute repeat unit for multiple transmission (Spec Section 3.4.2, Fig. 3.4.2-3).
+ *
+ * repeat_unit = num_transmissions × repeat_interval.
+ * This is the total number of frames in one complete cycle of all
+ * subframe transmissions. */
+uint32_t flex_scheduler_repeat_unit(int num_transmissions, int collapse, int td_collapse)
+{
+	if (num_transmissions <= 1)
+		return flex_scheduler_repeat_interval(collapse, td_collapse);
+	return (uint32_t)num_transmissions *
+	       flex_scheduler_repeat_interval(collapse, td_collapse);
+}
+
+/* Determine which subframe index (0..num_transmissions-1) to transmit
+ * for the current frame number.
+ *
+ * Per Spec Section 3.4.2 / Fig. 3.4.2-3:
+ * Within each repeat unit, subframes are transmitted in order at
+ * repeat_interval spacing.  The subframe index is:
+ *   (frame / repeat_interval) % num_transmissions
+ *
+ * Returns 0 if num_transmissions <= 1 (no subframing). */
+int flex_scheduler_subframe_index(uint32_t frame, int num_transmissions,
+				  int collapse, int td_collapse)
+{
+	uint32_t interval;
+
+	if (num_transmissions <= 1)
+		return 0;
+
+	interval = flex_scheduler_repeat_interval(collapse, td_collapse);
+	return (int)((frame / interval) % (uint32_t)num_transmissions);
+}

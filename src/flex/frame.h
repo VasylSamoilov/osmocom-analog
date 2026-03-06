@@ -52,12 +52,69 @@ enum flex_word_status {
 #define FLEX_WORDS_PER_BLOCK	8
 #define FLEX_WORDS_PER_FRAME	(FLEX_BLOCKS_PER_FRAME * FLEX_WORDS_PER_BLOCK)
 
-/* ===== Idle Word Patterns (Spec Section 3.4.1) ===== */
+/* ===== Idle Word Patterns (Section 3.4.1, Fig. 3.4.1-3) =====
+ *
+ * When no addresses, vectors, or messages are present, the frame
+ * can be shortened to block 0 only (S1 + FI + S2 + BI + IB).
+ * Unused blocks are filled with idle words that produce a 1,0 bit
+ * pattern at 1600 bps on the channel.
+ *
+ * Idle fill uses alternating all-1s and all-0s 32-bit words.
+ * For 4FSK modes, LSB phases use all-zeros so the resulting
+ * 4-level symbols stay at the two extreme levels (±4800 Hz),
+ * reproducing the same 1600 bps binary waveform. */
 
 /* Idle word 1: all ones (even-indexed idle words) */
 #define FLEX_IDLE_WORD_1	0xFFFFFFFFU
 /* Idle word 2: all zeros (odd-indexed idle words) */
 #define FLEX_IDLE_WORD_2	0x00000000U
+
+/* ===== Multiple Transmission Subframe Structure (Section 3.4.2) =====
+ *
+ * When multiple transmission is active (FIW r=1), the 88-word frame
+ * is divided into N subframes (N = num_transmissions).
+ *
+ * Per Fig. 3.4.2-1:
+ *   2x: 2 subframes × 44 words = 88 words
+ *   3x: 3 subframes × 29 words = 87 words (+1 extra idle word)
+ *   4x: 4 subframes × 22 words = 88 words
+ *
+ * Per Fig. 3.4.2-2: word numbers within each subframe start at 0.
+ * Word 0 always contains the Block Information Word.
+ *
+ * Each subframe is transmitted at a repeat interval equal to the
+ * System Collapse cycle (2^m frames).  The repeat unit =
+ * num_transmissions × repeat_interval (Fig. 3.4.2-3).
+ *
+ * Per spec: "the same bit stream as transmitted for the 1st
+ * transmission is transmitted for the Block Information Word,
+ * Address Field, Vector Field, Message Field and Idle Blocks
+ * in the 2nd, 3rd and 4th transmissions." */
+
+/* Subframe word counts per transmission count */
+#define FLEX_SUBFRAME_WORDS_2X	44
+#define FLEX_SUBFRAME_WORDS_3X	29
+#define FLEX_SUBFRAME_WORDS_4X	22
+
+/* Get subframe word count for a given number of transmissions.
+ * Returns 88 for 1x (no subframing), or the per-subframe count. */
+static inline int flex_subframe_words(int num_transmissions)
+{
+	switch (num_transmissions) {
+	case 2:  return FLEX_SUBFRAME_WORDS_2X;
+	case 3:  return FLEX_SUBFRAME_WORDS_3X;
+	case 4:  return FLEX_SUBFRAME_WORDS_4X;
+	default: return FLEX_WORDS_PER_FRAME; /* 1x = full 88 words */
+	}
+}
+
+/* Compute the word offset within the full 88-word frame for a given
+ * subframe index.  For 3x, the last subframe has an extra idle word
+ * appended (87 + 1 = 88). */
+static inline int flex_subframe_offset(int num_transmissions, int subframe_index)
+{
+	return subframe_index * flex_subframe_words(num_transmissions);
+}
 
 /* ===== Emergency Re-Synchronization (Spec Section 3.2.1) ===== */
 
@@ -88,7 +145,7 @@ enum flex_word_status {
 #define FLEX_LONG_ADDR_MIN	2101249ULL
 #define FLEX_LONG_ADDR_MAX	4297068542ULL
 
-/* Long address set boundaries (Spec Reference Document A, Section 5.15.5) */
+/* Long address set boundaries (ARIB STD-43A Section 3.8.2.2, Table 3.8.2.2-1) */
 #define FLEX_LONG_SET12_MIN	2101249ULL
 #define FLEX_LONG_SET12_MAX	1075843072ULL
 #define FLEX_LONG_SET34_MIN	1075843073ULL
@@ -96,7 +153,7 @@ enum flex_word_status {
 #define FLEX_LONG_SET23_MIN	3223326721ULL
 #define FLEX_LONG_SET23_MAX	4297068542ULL
 
-/* Long address encoding offsets (derived from spec conversion tables) */
+/* Long address encoding offsets (ARIB STD-43A Appendix A, Section 6) */
 #define FLEX_LONG_OFFSET_A	2068481ULL	/* Sets 1-2, 1-3, 1-4 */
 #define FLEX_LONG_OFFSET_B	2068479ULL	/* Set 2-3 */
 #define FLEX_LONG_W2_SET12	2097151U	/* w2 base for set 1-2 */
@@ -209,7 +266,9 @@ enum flex_word_status {
 #define FLEX_BIW1_COLLAPSE_SHIFT 18
 #define FLEX_BIW1_COLLAPSE_MASK	0x07
 
-/* BIW1 idle detection: all-zeros or all-ones in 21-bit data field */
+/* BIW1 idle detection (Fig. 3.4.1-4): when BIW word 0 is all-zeros
+ * or all-ones in the 21-bit data field, the frame contains no
+ * addresses, vectors, or messages — skip decode. */
 #define FLEX_BIW_IDLE_ZEROS	0x00000000U
 #define FLEX_BIW_IDLE_ONES	0x001FFFFFU
 
@@ -246,6 +305,13 @@ enum flex_word_status {
  *
  *   bits 7-11:  coverage zone (c4-c0, 5 bits, 0-31)
  *   bits 12-20: local ID (i8-i0, 9 bits, 0-511)
+ *
+ * LID with Coverage Zone, Country Code and Traffic Management Flag
+ * defines a specific simulcast coverage area.
+ *
+ * Spec requirements:
+ * - On RF channels supporting SSID Roaming, BIW 000 (SSID1) must be
+ *   transmitted in every Frame.
  */
 #define FLEX_BIW_SSID1_COVERAGE_SHIFT	7
 #define FLEX_BIW_SSID1_COVERAGE_MASK	0x1F	/* 5 bits */
@@ -338,18 +404,15 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 /* ===== BIW Type 001: Date (Spec Section 3.7.2) =====
  *
  * Month, day, year.
- *   bits 7-10:  year (y4-y0, 5 bits, 0-31, base year = 1994)
- *   bits 7-11:  year is 5 bits at shift 7 per PDW evidence
- *
  * Standard layout (from Table 3.7.2-1, type 001):
- *   bits 7-11:  year (y4-y0, 5 bits, 0-31 → 1994-2025)
- *   bits 12-16: day (d4-d0, 5 bits, 1-31)
- *   bits 17-20: month (m3-m0, 4 bits, 1-12)
+ *   bits 7-11:  year (Y4-Y0, 5 bits, 00000-11111, 1994-2025)
+ *   bits 12-16: day (d4-d0, 5 bits, 00001-11111, 1-31)
+ *   bits 17-20: month (m3-m0, 4 bits, 0001-1100, Jan-Dec)
  *
- * Note: Our TX encoder (flex_create_biw3) uses a different layout:
- *   bits 8-11: month, bits 12-16: day, no year.
- *   This is a known TX discrepancy — the TX doesn't set the type
- *   field (bits 4-6) either.  The RX decoder follows the standard.
+ * Date, Time and Time Zone based on the Standard time in each region
+ * are transmitted by BIW 001, 010 and 101 respectively.  To display
+ * or update the data more frequently, the information can be
+ * transmitted in other Frames.
  */
 #define FLEX_BIW_DATE_YEAR_SHIFT	7
 #define FLEX_BIW_DATE_YEAR_MASK		0x1F
@@ -363,9 +426,17 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
  *
  * Hour, minute, second.
  * Standard layout (from Table 3.7.2-1, type 010):
- *   bits 7-11:  hour (h4-h0, 5 bits, 0-23)
- *   bits 12-17: minute (m5-m0, 6 bits, 0-59)
- *   bits 18-20: second (s2-s0, 3 bits, 0-7 in 1/8 minute = 7.5s steps)
+ *   bits 7-11:  hour (h4-h0, 5 bits, 00000-10111, 0-23)
+ *   bits 12-17: minute (m5-m0, 6 bits, 000000-111011, 0-59)
+ *   bits 18-20: second (s2-s0, 3 bits, 000-111, 1/8 minute = 7.5s steps)
+ *
+ * The synchronization to the real time is based on the rising edge
+ * of the 1st bit of the Bit Sync 1 of the Frame 0 for the Cycle
+ * which contains that Frame.  (In the case of multiple transmission,
+ * the Frame first transmission is done.)
+ *
+ * The Second field can be extended to 1/64 minute (0.9375s) resolution
+ * by the S5-S3 field in BIW SysInfo type 101 (A=0100 or A=0101).
  */
 #define FLEX_BIW_TIME_HOUR_SHIFT	7
 #define FLEX_BIW_TIME_HOUR_MASK		0x1F
@@ -377,35 +448,388 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 
 /* ===== BIW Type 101: System Information (Spec Section 3.7.2) =====
  *
- * System messages and timezone extension.
- *   bits 7-10:  A3-A0 (4 bits, system message type)
- *   bits 11-20: I9-I0 (10 bits, system info data)
+ * System messages, timezone, DST, and extended seconds.
+ *   bits 7-10:  A3-A0 (4 bits, system message type per Table 3.7.2-2)
+ *   bits 11-20: I9-I0 (10 bits, system info data — layout depends on A)
  *
  * A3-A0 values per Table 3.7.2-2:
- *   0000 = Message for all subscriber units
- *   0001 = Message for all Home subscriber units
- *   0010 = Message for all Roaming subscriber units
- *   0011 = Message for all SSID subscriber units
- *   0100 = Time-related (extended seconds + DST + timezone)
- *   0101 = Additional time instruction
- *   0110 = Channel setup instruction
+ *   0000 = System Message for all subscriber units
+ *   0001 = System Message for all pagers in Home
+ *   0010 = System Message for all Roaming pagers
+ *   0011 = System Message for all SSID pagers
+ *   0100 = Time related for all pagers and additional Time Instruction
+ *   0101 = Additional Time Instruction
+ *   0110 = Channel Set Up Instruction
  *   0111-1111 = Reserved
+ *
+ * For A=0100 and A=0101 (time-related), the I field is structured as:
+ *   I9-I7 (3 bits): S5-S3 extended Second field (0-7, 1/64 minute
+ *                   = 0.9375s steps).  Extends the 3-bit Second field
+ *                   in BIW Time word (type 010) for finer resolution.
+ *   I6    (1 bit):  reserved
+ *   I5    (1 bit):  L0 Day Light Saving Time flag.
+ *                   L0=0: transmitted time is Day Light Saving Time.
+ *                   L0=1: transmitted time is standard time.
+ *   I4-I0 (5 bits): Z4-Z0 Time Zone code per Table 3.7.2-3.
+ *
+ * For A=0110 (Channel Set Up Instruction), the I field is:
+ *   I9    (1 bit):  B0 System Message Bit (1=channel supports SysMsg)
+ *   I8    (1 bit):  N0 NID System Message Bit (1=supports NID SysMsg)
+ *   I7-I6 (2 bits): O1-O0 Maximum Carry On for roaming pagers
+ *   I5-I0 (6 bits): F5-F0 Frame Offset (1-63)
+ *
+ * Spec requirements:
+ * - BIW 101 for System Messages may appear once per phase per frame.
+ * - When BIW 101 A=0000-0100 is present in Frame 0, corresponding
+ *   vectors (except Secure) go at end of vector field, and System
+ *   Messages are in the Message field (Fig. 3.7.2-2).
+ * - Tone-Only addresses cannot be in frames carrying System Messages.
+ * - At least 1 time-related BIW (001, 010, or 101) must be in each
+ *   phase of Frame 0 Cycle 0 (Section 3.7.2).
  */
 #define FLEX_BIW_SYSINFO_A_SHIFT	7
 #define FLEX_BIW_SYSINFO_A_MASK		0x0F
 #define FLEX_BIW_SYSINFO_I_SHIFT	11
 #define FLEX_BIW_SYSINFO_I_MASK		0x03FF	/* 10 bits */
 
+/* SysInfo A-type values (Table 3.7.2-2) */
+#define FLEX_BIW_SYSINFO_A_MSG_ALL	0x00	/* 0000: System Message for all pagers */
+#define FLEX_BIW_SYSINFO_A_MSG_HOME	0x01	/* 0001: System Message for Home pagers */
+#define FLEX_BIW_SYSINFO_A_MSG_ROAM	0x02	/* 0010: System Message for Roaming pagers */
+#define FLEX_BIW_SYSINFO_A_MSG_SSID	0x03	/* 0011: System Message for SSID pagers */
+#define FLEX_BIW_SYSINFO_A_TIME	0x04	/* 0100: Time related + additional Time Instr */
+#define FLEX_BIW_SYSINFO_A_TIME_ADD	0x05	/* 0101: Additional Time Instruction */
+#define FLEX_BIW_SYSINFO_A_CHAN_SETUP	0x06	/* 0110: Channel Set Up Instruction */
+
+/* SysInfo I-field sub-fields for A=0100/0101 (time-related).
+ *
+ * I-field layout (10 bits, within the 21-bit data word at SYSINFO_I_SHIFT):
+ *   I0-I4: Z0-Z4 timezone zone code (5 bits, Table 3.7.2-3)
+ *   I5:    L0 DST flag (0=DST, 1=standard time)
+ *   I6:    reserved
+ *   I7-I9: S3-S5 extended seconds (3 bits, 1/64 min = 0.9375s steps)
+ *
+ * These offsets are relative to the I field value (after >> SYSINFO_I_SHIFT). */
+#define FLEX_BIW_SYSINFO_TZ_MASK	0x1F	/* I4-I0: timezone zone code (5 bits) */
+#define FLEX_BIW_SYSINFO_DST_SHIFT	5	/* I5: DST flag */
+#define FLEX_BIW_SYSINFO_DST_MASK	0x01
+#define FLEX_BIW_SYSINFO_EXTSEC_SHIFT	7	/* I7-I9: extended seconds (3 bits) */
+#define FLEX_BIW_SYSINFO_EXTSEC_MASK	0x07
+
+/* SysInfo I-field sub-fields for A=0110 (Channel Set Up Instruction).
+ * Offsets relative to the I field value. */
+#define FLEX_BIW_SYSINFO_FRAME_OFS_MASK  0x3F	/* I5-I0: Frame Offset F5-F0 (6 bits) */
+#define FLEX_BIW_SYSINFO_CARRY_ON_SHIFT  6	/* I7-I6: Max Carry On O1-O0 (2 bits) */
+#define FLEX_BIW_SYSINFO_CARRY_ON_MASK   0x03
+#define FLEX_BIW_SYSINFO_NID_BIT	 8	/* I8: N0 NID System Message Bit */
+#define FLEX_BIW_SYSINFO_SYSMSG_BIT	 9	/* I9: B0 System Message Bit */
+
 /* ===== BIW Type 111: SSID2 (Spec Section 3.7.2) =====
  *
  * Country code and traffic management flags.
  *   bits 7-10:  traffic management flags (T3-T0, 4 bits)
- *   bits 11-20: country code (c9-c0, 10 bits, ITU-T E.212)
+ *   bits 11-20: country code (c9-c0, 10 bits, ITU-T E.212 Annex A)
+ *
+ * Country Codes comply with CCITT (ITU-T) E.212 Annex A.
+ * Japan's Country Code is "440".
+ *
+ * The 4 Traffic Management Flags indicate which of the four traffic
+ * groups the channel is assigned to.  After a roaming pager detects
+ * a channel with matching LID, Coverage Zone, and Country Code, the
+ * pager checks which of the 4 flags corresponds to its group.  When
+ * more than 1 flag is set to 0, the pager searches for other channels
+ * with the same LID/Coverage/Country that have its flag set to 1.
+ *
+ * Spec requirements:
+ * - On RF channels supporting SSID Roaming, BIW 000 (SSID1) must be
+ *   transmitted in every Frame; BIW 111 (SSID2) must be transmitted
+ *   in Frame 0 through Frame 3.
+ * - If channels are shared or mixed on one channel ("channel mixing"),
+ *   transmission of Frame 0 through Frame 3 must not be blocked.
  */
 #define FLEX_BIW_SSID2_TMF_SHIFT	7
 #define FLEX_BIW_SSID2_TMF_MASK		0x0F
 #define FLEX_BIW_SSID2_COUNTRY_SHIFT	11
 #define FLEX_BIW_SSID2_COUNTRY_MASK	0x03FF	/* 10 bits */
+
+/* ===== ITU-T E.212 Mobile Country Code (MCC) Lookup =====
+ *
+ * Per ITU Operational Bulletin No. 1117 (1 February 2017),
+ * Complement to Recommendation ITU-T E.212 (09/2016).
+ *
+ * The SSID2 country code field (c9-c0, 10 bits) carries the 3-digit
+ * MCC.  This table maps MCC values to country/area names for RX
+ * display and TX validation.
+ *
+ * Notes:
+ *   a. MCCs beginning with 0, 1, or 8 are reserved for future use.
+ *   b. UAE: Dubai=431, Abu Dhabi=430.
+ *   c. 901 = International Mobile, shared code.
+ *   d. Kosovo designation per UNSCR 1244 / ICJ Opinion.
+ *
+ * Only assigned codes (202-901) are included.  Codes not in this
+ * table are either reserved or unassigned. */
+
+typedef struct flex_mcc_entry {
+	uint16_t	code;
+	const char	*name;
+} flex_mcc_entry_t;
+
+static const flex_mcc_entry_t flex_mcc_table[] = {
+	{ 202, "Greece" },
+	{ 204, "Netherlands" },
+	{ 206, "Belgium" },
+	{ 208, "France" },
+	{ 212, "Monaco" },
+	{ 213, "Andorra" },
+	{ 214, "Spain" },
+	{ 216, "Hungary" },
+	{ 218, "Bosnia-Herzegovina" },
+	{ 219, "Croatia" },
+	{ 220, "Serbia" },
+	{ 221, "Kosovo" },
+	{ 222, "Italy" },
+	{ 225, "Vatican" },
+	{ 226, "Romania" },
+	{ 228, "Switzerland" },
+	{ 230, "Czech Republic" },
+	{ 231, "Slovakia" },
+	{ 232, "Austria" },
+	{ 234, "UK" },
+	{ 235, "UK" },
+	{ 238, "Denmark" },
+	{ 240, "Sweden" },
+	{ 242, "Norway" },
+	{ 244, "Finland" },
+	{ 246, "Lithuania" },
+	{ 247, "Latvia" },
+	{ 248, "Estonia" },
+	{ 250, "Russia" },
+	{ 255, "Ukraine" },
+	{ 257, "Belarus" },
+	{ 259, "Moldova" },
+	{ 260, "Poland" },
+	{ 262, "Germany" },
+	{ 266, "Gibraltar" },
+	{ 268, "Portugal" },
+	{ 270, "Luxembourg" },
+	{ 272, "Ireland" },
+	{ 274, "Iceland" },
+	{ 276, "Albania" },
+	{ 278, "Malta" },
+	{ 280, "Cyprus" },
+	{ 282, "Georgia" },
+	{ 283, "Armenia" },
+	{ 284, "Bulgaria" },
+	{ 286, "Turkey" },
+	{ 288, "Faroe Islands" },
+	{ 290, "Greenland" },
+	{ 292, "San Marino" },
+	{ 293, "Slovenia" },
+	{ 294, "Macedonia" },
+	{ 295, "Liechtenstein" },
+	{ 297, "Montenegro" },
+	{ 302, "Canada" },
+	{ 308, "St. Pierre & Miquelon" },
+	{ 310, "USA" },
+	{ 311, "USA" },
+	{ 312, "USA" },
+	{ 313, "USA" },
+	{ 314, "USA" },
+	{ 315, "USA" },
+	{ 316, "USA" },
+	{ 330, "Puerto Rico" },
+	{ 332, "US Virgin Islands" },
+	{ 334, "Mexico" },
+	{ 338, "Jamaica" },
+	{ 340, "Guadeloupe/Martinique" },
+	{ 342, "Barbados" },
+	{ 344, "Antigua & Barbuda" },
+	{ 346, "Cayman Islands" },
+	{ 348, "British Virgin Islands" },
+	{ 350, "Bermuda" },
+	{ 352, "Grenada" },
+	{ 354, "Montserrat" },
+	{ 356, "St. Kitts & Nevis" },
+	{ 358, "St. Lucia" },
+	{ 360, "St. Vincent & Grenadines" },
+	{ 362, "Curacao/Sint Maarten/BES" },
+	{ 363, "Aruba" },
+	{ 364, "Bahamas" },
+	{ 365, "Anguilla" },
+	{ 366, "Dominica" },
+	{ 368, "Cuba" },
+	{ 370, "Dominican Republic" },
+	{ 372, "Haiti" },
+	{ 374, "Trinidad & Tobago" },
+	{ 376, "Turks & Caicos" },
+	{ 400, "Azerbaijan" },
+	{ 401, "Kazakhstan" },
+	{ 402, "Bhutan" },
+	{ 404, "India" },
+	{ 405, "India" },
+	{ 406, "India" },
+	{ 410, "Pakistan" },
+	{ 412, "Afghanistan" },
+	{ 413, "Sri Lanka" },
+	{ 414, "Myanmar" },
+	{ 415, "Lebanon" },
+	{ 416, "Jordan" },
+	{ 417, "Syria" },
+	{ 418, "Iraq" },
+	{ 419, "Kuwait" },
+	{ 420, "Saudi Arabia" },
+	{ 421, "Yemen" },
+	{ 422, "Oman" },
+	{ 424, "UAE" },
+	{ 425, "Israel" },
+	{ 426, "Bahrain" },
+	{ 427, "Qatar" },
+	{ 428, "Mongolia" },
+	{ 429, "Nepal" },
+	{ 430, "UAE (Abu Dhabi)" },
+	{ 431, "UAE (Dubai)" },
+	{ 432, "Iran" },
+	{ 434, "Uzbekistan" },
+	{ 436, "Tajikistan" },
+	{ 437, "Kyrgyzstan" },
+	{ 438, "Turkmenistan" },
+	{ 440, "Japan" },
+	{ 441, "Japan" },
+	{ 450, "South Korea" },
+	{ 452, "Vietnam" },
+	{ 454, "Hong Kong" },
+	{ 455, "Macao" },
+	{ 456, "Cambodia" },
+	{ 457, "Laos" },
+	{ 460, "China" },
+	{ 461, "China" },
+	{ 466, "Taiwan" },
+	{ 467, "North Korea" },
+	{ 470, "Bangladesh" },
+	{ 472, "Maldives" },
+	{ 502, "Malaysia" },
+	{ 505, "Australia" },
+	{ 510, "Indonesia" },
+	{ 514, "Timor-Leste" },
+	{ 515, "Philippines" },
+	{ 520, "Thailand" },
+	{ 525, "Singapore" },
+	{ 528, "Brunei" },
+	{ 530, "New Zealand" },
+	{ 536, "Nauru" },
+	{ 537, "Papua New Guinea" },
+	{ 539, "Tonga" },
+	{ 540, "Solomon Islands" },
+	{ 541, "Vanuatu" },
+	{ 542, "Fiji" },
+	{ 543, "Wallis & Futuna" },
+	{ 544, "American Samoa" },
+	{ 545, "Kiribati" },
+	{ 546, "New Caledonia" },
+	{ 547, "French Polynesia" },
+	{ 548, "Cook Islands" },
+	{ 549, "Samoa" },
+	{ 550, "Micronesia" },
+	{ 551, "Marshall Islands" },
+	{ 552, "Palau" },
+	{ 553, "Tuvalu" },
+	{ 554, "Tokelau" },
+	{ 555, "Niue" },
+	{ 602, "Egypt" },
+	{ 603, "Algeria" },
+	{ 604, "Morocco" },
+	{ 605, "Tunisia" },
+	{ 606, "Libya" },
+	{ 607, "Gambia" },
+	{ 608, "Senegal" },
+	{ 609, "Mauritania" },
+	{ 610, "Mali" },
+	{ 611, "Guinea" },
+	{ 612, "Cote d'Ivoire" },
+	{ 613, "Burkina Faso" },
+	{ 614, "Niger" },
+	{ 615, "Togo" },
+	{ 616, "Benin" },
+	{ 617, "Mauritius" },
+	{ 618, "Liberia" },
+	{ 619, "Sierra Leone" },
+	{ 620, "Ghana" },
+	{ 621, "Nigeria" },
+	{ 622, "Chad" },
+	{ 623, "Central African Rep." },
+	{ 624, "Cameroon" },
+	{ 625, "Cabo Verde" },
+	{ 626, "Sao Tome & Principe" },
+	{ 627, "Equatorial Guinea" },
+	{ 628, "Gabon" },
+	{ 629, "Congo" },
+	{ 630, "DR Congo" },
+	{ 631, "Angola" },
+	{ 632, "Guinea-Bissau" },
+	{ 633, "Seychelles" },
+	{ 634, "Sudan" },
+	{ 635, "Rwanda" },
+	{ 636, "Ethiopia" },
+	{ 637, "Somalia" },
+	{ 638, "Djibouti" },
+	{ 639, "Kenya" },
+	{ 640, "Tanzania" },
+	{ 641, "Uganda" },
+	{ 642, "Burundi" },
+	{ 643, "Mozambique" },
+	{ 645, "Zambia" },
+	{ 646, "Madagascar" },
+	{ 647, "French Indian Ocean" },
+	{ 648, "Zimbabwe" },
+	{ 649, "Namibia" },
+	{ 650, "Malawi" },
+	{ 651, "Lesotho" },
+	{ 652, "Botswana" },
+	{ 653, "Swaziland" },
+	{ 654, "Comoros" },
+	{ 655, "South Africa" },
+	{ 657, "Eritrea" },
+	{ 658, "St. Helena" },
+	{ 659, "South Sudan" },
+	{ 702, "Belize" },
+	{ 704, "Guatemala" },
+	{ 706, "El Salvador" },
+	{ 708, "Honduras" },
+	{ 710, "Nicaragua" },
+	{ 712, "Costa Rica" },
+	{ 714, "Panama" },
+	{ 716, "Peru" },
+	{ 722, "Argentina" },
+	{ 724, "Brazil" },
+	{ 730, "Chile" },
+	{ 732, "Colombia" },
+	{ 734, "Venezuela" },
+	{ 736, "Bolivia" },
+	{ 738, "Guyana" },
+	{ 740, "Ecuador" },
+	{ 742, "French Guiana" },
+	{ 744, "Paraguay" },
+	{ 746, "Suriname" },
+	{ 748, "Uruguay" },
+	{ 750, "Falkland Islands" },
+	{ 901, "International Mobile" },
+};
+
+#define FLEX_MCC_TABLE_SIZE \
+	(sizeof(flex_mcc_table) / sizeof(flex_mcc_table[0]))
+
+/* Look up country/area name for a 10-bit MCC value.
+ * Returns short name string, or NULL if not found. */
+static inline const char *flex_mcc_name(uint32_t mcc)
+{
+	unsigned int i;
+	for (i = 0; i < FLEX_MCC_TABLE_SIZE; i++) {
+		if (flex_mcc_table[i].code == mcc)
+			return flex_mcc_table[i].name;
+	}
+	return NULL;
+}
 
 /* Extract BIW type field from a decoded 21-bit BIW word */
 static inline uint32_t flex_biw_type(uint32_t biw)
@@ -424,6 +848,32 @@ static inline const char *flex_biw_type_name(uint32_t btype)
 	case FLEX_BIW_TYPE_SSID2:   return "SSID2";
 	default:                    return "Reserved";
 	}
+}
+
+/* Human-readable name for BIW SysInfo A-type (Table 3.7.2-2) */
+static inline const char *flex_biw_sysinfo_a_name(uint32_t a_type)
+{
+	switch (a_type) {
+	case FLEX_BIW_SYSINFO_A_MSG_ALL:    return "SysMsg(All)";
+	case FLEX_BIW_SYSINFO_A_MSG_HOME:   return "SysMsg(Home)";
+	case FLEX_BIW_SYSINFO_A_MSG_ROAM:   return "SysMsg(Roaming)";
+	case FLEX_BIW_SYSINFO_A_MSG_SSID:   return "SysMsg(SSID)";
+	case FLEX_BIW_SYSINFO_A_TIME:       return "Time";
+	case FLEX_BIW_SYSINFO_A_TIME_ADD:   return "TimeAdd";
+	case FLEX_BIW_SYSINFO_A_CHAN_SETUP:  return "ChanSetup";
+	default:                             return "Reserved";
+	}
+}
+
+/* Check if a BIW SysInfo A-type indicates a System Message (A=0000~0100).
+ * Per Spec Section 3.7.2 / Fig. 3.7.2-2(a): when BIW101 has A=0000~0100,
+ * vectors are placed at the end of the vector field and system messages
+ * are in the message field.
+ * "Tone-Only Addresses cannot be transmitted in Frames used for
+ * transmitting System Messages." */
+static inline int flex_biw_sysinfo_is_sysmsg(uint32_t a_type)
+{
+	return (a_type <= FLEX_BIW_SYSINFO_A_TIME) ? 1 : 0;
 }
 
 /* ===== BIW Date Year Equivalence (for years >2025) =====
@@ -563,19 +1013,47 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
 #define FLEX_ADDR_RSVD_SHORT2_MIN	0x1F7820U	/* 2,062,368 — reserved for future use */
 #define FLEX_ADDR_RSVD_SHORT2_MAX	0x1F7FFEU	/* 2,064,382 */
 
-/* Operator Messaging Address sub-types (Section 3.8.2.4).
- * The 4 LSBs of the 21-bit address word determine the function. */
+/* Operator Messaging Address sub-types (Table 3.8.2.4-1).
+ * Base address: 1 1111 0111 1000 0001 0000 (0x1F7810).
+ * The 4 LSBs select the function:
+ *
+ *   0x0 SysMsg(All)     — system message for all pagers (content per BIW)
+ *   0x1 SysMsg(Home)    — system message for home area pagers
+ *   0x2 SysMsg(Roaming) — system message for roaming pagers
+ *   0x3 SysMsg(SSID)    — system message for SSID pagers
+ *   0x4 SysMsg(Time)    — time related message for all pagers
+ *   0x5-0xD Reserved
+ *   0xE SSIDChange      — SSID change instruction.
+ *                          Transmits change info to SSID pagers:
+ *                            (1) traffic split by TMF in SSID
+ *                            (2) new frequencies for SSID coverage zones
+ *                          Mandatory for TMF-split systems on roaming
+ *                          frames (F0-7 NID, F0-3 SSID-only), 2 cycles
+ *                          before + 2 after the change (5 cycles total).
+ *                          Must be in same phase as SSID.
+ *   0xF SysEvent        — system event notification.
+ *                          Pre-alerts pagers that a change will occur
+ *                          within the next 4 cycles.
+ *                          Used with Short Instruction Vector (type 001).
+ *                          Must be in each frame for ≥1 full collapse cycle.
+ *                          Events:
+ *                            (1) traffic split by SSID TMF
+ *                            (2) traffic split by NID TMF
+ *                            (3) channel set up instruction changes
+ *                            (4) new NID frequency
+ *                            (5) new SSID coverage zone frequency
+ */
 #define FLEX_OPER_MSG_LSB_MASK		0x0FU
-#define FLEX_OPER_MSG_SYSMSG_MAX	0x04U	/* LSB 0000–0100: System Messages */
-#define FLEX_OPER_MSG_INSTR_MIN		0x0EU	/* LSB 1110: system change instruction */
-#define FLEX_OPER_MSG_INSTR_MAX		0x0FU	/* LSB 1111: system change instruction */
+#define FLEX_OPER_MSG_SYSMSG_MAX	0x04U	/* LSB 0000–0100: system messages */
+#define FLEX_OPER_MSG_SSID_CHANGE	0x0EU	/* LSB 1110: SSID change instruction */
+#define FLEX_OPER_MSG_SYS_EVENT		0x0FU	/* LSB 1111: system event notification */
 
-/* Operator Messaging System Message sub-type LSB values (Section 3.8.2.4) */
+/* System Message sub-type LSB values */
 #define FLEX_OPER_MSG_ALL_PAGERS	0x00U	/* all pagers */
-#define FLEX_OPER_MSG_HOME		0x01U	/* all pagers in Home */
-#define FLEX_OPER_MSG_ROAMING		0x02U	/* all Roaming pagers */
+#define FLEX_OPER_MSG_HOME		0x01U	/* all pagers in home area */
+#define FLEX_OPER_MSG_ROAMING		0x02U	/* all roaming pagers */
 #define FLEX_OPER_MSG_SSID		0x03U	/* all SSID pagers */
-#define FLEX_OPER_MSG_TIME		0x04U	/* Time-related for all pagers */
+#define FLEX_OPER_MSG_TIME		0x04U	/* time related message for all pagers */
 
 /* ===== Temporary Address Slots (Spec Section 5.2) =====
  *
@@ -626,9 +1104,19 @@ static inline uint32_t flex_temp_addr_slot(uint32_t aw)
 #define FLEX_INSTR_SLOT_SHIFT		10	/* bits 10-13: temp address slot (a0-a3) */
 #define FLEX_INSTR_SLOT_MASK		0x0FU	/* 4-bit slot index */
 
-/* Instruction type values (i2 i1 i0) */
-#define FLEX_INSTR_TYPE_TEMP_ADDR	0x00U	/* 000: Temporary Address assignment (§5.2) */
-#define FLEX_INSTR_TYPE_SYS_EVENT	0x01U	/* 001: System Event Notification (§3.8.2.4) */
+/* Instruction type values (i2 i1 i0) from short instruction vector.
+ *   000 = Temporary Address assignment: assigns pager to a temp group
+ *         slot (a3-a0) for group message delivery in target frame (f6-f0).
+ *   001 = System Event Notification: pre-alerts pagers about upcoming
+ *         system changes within the next 4 cycles.  Used with Operator
+ *         Messaging address 0x1F781F.  Must be transmitted in each frame
+ *         for at least 1 full collapse cycle duration.
+ *         Events: (1) SSID TMF split, (2) NID TMF split,
+ *                 (3) channel setup changes, (4) new NID frequency,
+ *                 (5) new SSID coverage zone frequency.
+ *   010-111 = Reserved for future use. */
+#define FLEX_INSTR_TYPE_TEMP_ADDR	0x00U	/* 000: temp address assignment */
+#define FLEX_INSTR_TYPE_SYS_EVENT	0x01U	/* 001: system event notification */
 
 /* Extract instruction type (i2 i1 i0) from 14-bit instruction data */
 static inline uint32_t flex_instr_type(uint32_t instr_data)
@@ -710,9 +1198,10 @@ static inline int flex_net_is_overloaded(uint32_t mw)
 
 /* Operator messaging sub-type categories */
 enum flex_oper_msg_category {
-	FLEX_OPER_CAT_SYSMSG,		/* System message (LSB 0x00-0x04) */
-	FLEX_OPER_CAT_CHANGE_INSTR,	/* Change instruction (LSB 0x0E-0x0F) */
-	FLEX_OPER_CAT_RESERVED,		/* Reserved (LSB 0x05-0x0D) */
+	FLEX_OPER_CAT_SYSMSG,		/* system message (LSB 0x00-0x04) */
+	FLEX_OPER_CAT_SSID_CHANGE,	/* SSID change instruction (LSB 0x0E) */
+	FLEX_OPER_CAT_SYS_EVENT,	/* system event notification (LSB 0x0F) */
+	FLEX_OPER_CAT_RESERVED,		/* reserved (LSB 0x05-0x0D) */
 };
 
 /* Classify an operator messaging address word into its category */
@@ -721,8 +1210,10 @@ static inline enum flex_oper_msg_category flex_oper_msg_category(uint32_t aw)
 	uint32_t lsb = aw & FLEX_OPER_MSG_LSB_MASK;
 	if (lsb <= FLEX_OPER_MSG_SYSMSG_MAX)
 		return FLEX_OPER_CAT_SYSMSG;
-	if (lsb >= FLEX_OPER_MSG_INSTR_MIN && lsb <= FLEX_OPER_MSG_INSTR_MAX)
-		return FLEX_OPER_CAT_CHANGE_INSTR;
+	if (lsb == FLEX_OPER_MSG_SSID_CHANGE)
+		return FLEX_OPER_CAT_SSID_CHANGE;
+	if (lsb == FLEX_OPER_MSG_SYS_EVENT)
+		return FLEX_OPER_CAT_SYS_EVENT;
 	return FLEX_OPER_CAT_RESERVED;
 }
 
@@ -731,7 +1222,8 @@ static inline const char *flex_oper_msg_category_name(enum flex_oper_msg_categor
 {
 	switch (cat) {
 	case FLEX_OPER_CAT_SYSMSG:       return "SystemMessage";
-	case FLEX_OPER_CAT_CHANGE_INSTR: return "ChangeInstruction";
+	case FLEX_OPER_CAT_SSID_CHANGE:  return "SSIDChangeInstruction";
+	case FLEX_OPER_CAT_SYS_EVENT:    return "SystemEventNotification";
 	case FLEX_OPER_CAT_RESERVED:     return "Reserved";
 	}
 	return "?";
@@ -869,6 +1361,7 @@ static inline int flex_addr_is_long(uint32_t aw)
 #define FLEX_RX_FLAG_UNKNOWN	'?'
 #define FLEX_RX_FLAG_GROUP	'G'
 #define FLEX_RX_FLAG_TEMP_GROUP	'g'
+#define FLEX_RX_FLAG_PRIORITY	'P'	/* address is in priority section of AF */
 
 /* Get the single-character address type flag for RX logging.
  * Returns one of the FLEX_RX_FLAG_* characters. */
@@ -904,7 +1397,7 @@ static inline char flex_group_flag_char(int is_group, int is_temp)
 	return ' ';
 }
 
-/* Long address set name from w1/w2 types. */
+/* Long address set name from w1/w2 types (Table 3.8.2.2-1). */
 static inline const char *flex_long_set_name(uint32_t w1, uint32_t w2)
 {
 	enum flex_addr_type t1 = flex_classify_addr_word(w1);
@@ -914,6 +1407,7 @@ static inline const char *flex_long_set_name(uint32_t w1, uint32_t w2)
 	if (t1 == FLEX_ADDR_LONG1 && t2 == FLEX_ADDR_LONG3) return "Set1-3";
 	if (t1 == FLEX_ADDR_LONG1 && t2 == FLEX_ADDR_LONG4) return "Set1-4";
 	if (t1 == FLEX_ADDR_LONG2 && t2 == FLEX_ADDR_LONG3) return "Set2-3";
+	if (t1 == FLEX_ADDR_LONG2 && t2 == FLEX_ADDR_LONG4) return "Set2-4";
 	return "InvalidSet";
 }
 
@@ -976,10 +1470,11 @@ static inline enum flex_addr_type flex_capcode_special_type(uint64_t capcode)
 }
 
 /* Operator Messaging sub-type name from 4 LSBs of address word.
- * Per Section 3.8.2.4:
+ * Per Section 3.8.2.4, Table 3.8.2.4-1:
  *   LSB 0000 = SysMsg(All), 0001 = SysMsg(Home), 0010 = SysMsg(Roaming),
  *   0011 = SysMsg(SSID), 0100 = SysMsg(Time),
- *   1110-1111 = ChangeInstr, 0101-1101 = Reserved */
+ *   0101-1101 = Reserved,
+ *   1110 = SSID Change Instruction, 1111 = System Event Notification */
 static inline const char *flex_oper_msg_subtype_name(uint32_t aw)
 {
 	uint32_t lsb = aw & FLEX_OPER_MSG_LSB_MASK;
@@ -989,8 +1484,8 @@ static inline const char *flex_oper_msg_subtype_name(uint32_t aw)
 	case FLEX_OPER_MSG_ROAMING:    return "SysMsg(Roaming)";
 	case FLEX_OPER_MSG_SSID:       return "SysMsg(SSID)";
 	case FLEX_OPER_MSG_TIME:       return "SysMsg(Time)";
-	case FLEX_OPER_MSG_INSTR_MIN:
-	case FLEX_OPER_MSG_INSTR_MAX:  return "ChangeInstr";
+	case FLEX_OPER_MSG_SSID_CHANGE: return "SSIDChange";
+	case FLEX_OPER_MSG_SYS_EVENT:  return "SysEvent";
 	default:                       return "Reserved";
 	}
 }
@@ -1002,8 +1497,8 @@ static inline const char *flex_special_addr_detail(uint32_t aw)
 {
 	enum flex_addr_type t = flex_classify_addr_word(aw);
 	switch (t) {
-	case FLEX_ADDR_NETWORK:    return "NID system message (§6.1.2, Secure type)";
-	case FLEX_ADDR_TEMPORARY:  return "group messaging (§5.2)";
+	case FLEX_ADDR_NETWORK:    return "NID system info (Secure vector, area/zones/traffic)";
+	case FLEX_ADDR_TEMPORARY:  return "temp group slot (16 slots, assigned via short instruction)";
 	case FLEX_ADDR_OPER_MSG:   return NULL; /* caller uses flex_oper_msg_subtype_name() */
 	case FLEX_ADDR_INFO_SVC:   return "info service (under study)";
 	case FLEX_ADDR_RSVD_SHORT: return "reserved for future use";
@@ -1048,10 +1543,11 @@ static inline uint64_t flex_decode_long_address(uint32_t w1, uint32_t w2)
 		       + (uint64_t)(w2 - FLEX_LONG_W2_SET34) * FLEX_SHORT_ADDR_OFFSET
 		       + (FLEX_LONG_OFFSET_A - 1);
 
-	/* Set 2-3: w1 in LA2, w2 in LA3
+	/* Set 2-3 / 2-4: w1 in LA2, w2 in LA3 or LA4
+	 * (Table 3.8.2.2-1: Long Address 2 + Long Address 3 or 4)
 	 * capcode = (w1 - 2064383) + (w2 - 1867776) * 32768 + 2068479 */
 	if (w1 >= FLEX_LA2_MIN && w1 <= FLEX_LA2_MAX &&
-	    w2 >= FLEX_LA3_MIN && w2 <= FLEX_LA3_MAX)
+	    w2 >= FLEX_LA3_MIN && w2 <= FLEX_LA4_MAX)
 		return (uint64_t)(w1 - FLEX_LONG_W1_SET23)
 		       + (uint64_t)(w2 - FLEX_LONG_W2_SET23) * FLEX_SHORT_ADDR_OFFSET
 		       + FLEX_LONG_OFFSET_B;
@@ -1160,8 +1656,33 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_ALPHA_HDR_M_MASK		(1U << 20)
 
 /* Continuation/final fragment header (Fig. 3.10.1.3-2):
- * Bits 19-20 are U₀/V₀ (reserved), NOT R/M.
- * Same bit positions, different semantics. */
+ * Bits 19-20 are U₀/V₀ (Fragment Control), NOT R/M.
+ * Same bit positions, different semantics per fragment type.
+ *
+ * U₀V₀ values (Enhanced Fragmentation Rules):
+ *   00 = Enhanced Fragmentation not supported (default)
+ *   01 = Reserved (for a second alternative character mode)
+ *   10 = Default character mode (fragment starts at char boundary)
+ *   11 = Alternative character mode
+ *
+ * TODO: Enhanced Fragmentation (ARIB STD-43A §3.10.1.3, Fig. 3.10.1.3-2,
+ * "Enhanced Fragmentation Rules").  When U₀V₀ ≠ 00 on continuation/final
+ * fragments, the pager uses SI ($0F) / SO ($0E) shift-in/shift-out to
+ * switch between default and alternative 7-bit character modes within a
+ * fragment.  Key differences from Standard Fragmentation (U₀V₀ = 00):
+ *   - U₀V₀ = 10: fragment starts in default character mode.
+ *   - U₀V₀ = 11: fragment starts in alternative character mode.
+ *   - U₀V₀ = 01: reserved for a second alternative mode.
+ *   - NUL ($00) padding replaces ETX ($03) for unused character slots.
+ *   - Signature (S) computation must exclude ETX ($03) and NUL ($00)
+ *     function characters (spec: "function characters NUL and ETX in
+ *     Enhanced Fragmentation are not included for calculation").
+ *   - RX must strip NUL padding and interpret SI/SO mode switches.
+ *   - TX must set U₀V₀ on each continuation/final fragment header
+ *     and pad with NUL instead of ETX.
+ * Currently only Standard Fragmentation (U₀V₀ = 00, pure 7-bit ASCII)
+ * is implemented.  See also: frame.c encode_alpha_message() TX side,
+ * dsp.c flex_rx_decode_phase() RX side. */
 #define FLEX_ALPHA_HDR_U_SHIFT		19
 #define FLEX_ALPHA_HDR_U_MASK		(1U << 19)
 #define FLEX_ALPHA_HDR_V_SHIFT		20
@@ -1440,11 +1961,33 @@ typedef struct flex_frame_params {
 	int		biw_time;		/* include BIW3/BIW4 time broadcast */
 	uint32_t	local_id;		/* BIW2 local ID (9 bits, 0-511) */
 	uint32_t	coverage_id;		/* BIW2 coverage zone (5 bits, 0-31) */
+	uint32_t	country_code;		/* SSID2 country code (10 bits, ITU-T E.212) */
+	uint32_t	tmf;			/* SSID2 traffic management flags (4 bits) */
+	int		timezone_code;		/* SysInfo timezone zone code (0-31, -1=none) */
 	int		bitrate;		/* bit rate: 1600, 3200, or 6400 (bps, not baud) */
 	int		modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
 	int		single_phase;		/* 1 = force single-phase output (for
 						 * network mode per-phase encoding) */
+
+	/* Multiple transmission (Spec Section 3.4.2, Fig. 3.4.2-1).
+	 *
+	 * num_transmissions: 1 (default), 2, 3, or 4.
+	 *   When >1, FIW r=1 and [t1,t0] encode the count.
+	 *   The frame is divided into N subframes of equal size.
+	 *
+	 * td_collapse: -1 = use system collapse (default).
+	 *   5, 6, or 7 = TD Collapse cycle override.
+	 *   When set, FIW [t3,t2] encode the override value.
+	 *   TD Collapse takes priority over System Collapse.
+	 *
+	 * subframe_index: which subframe (0..N-1) this encoding
+	 *   represents.  The scheduler sets this per transmission.
+	 *   Word numbering within the subframe starts at 0.
+	 *   Word 0 always contains the Block Information Word. */
+	int		num_transmissions;	/* 1, 2, 3, or 4 */
+	int		td_collapse;		/* -1=system, 5/6/7=override */
+	int		subframe_index;		/* 0..num_transmissions-1 */
 } flex_frame_params_t;
 
 /* ===== Phase Multiplexing (Spec Section 3.3) ===== */
@@ -1466,7 +2009,9 @@ typedef struct flex_phase_data {
 	uint32_t		words[FLEX_WORDS_PER_FRAME];
 	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];
 	int			word_count;	/* TX: actual words used */
-	int			idle_count;	/* RX: idle word counter */
+	int			idle_count;	/* RX: idle words seen (all-0s or all-1s),
+					 * used to detect shortened frames
+					 * (Fig. 3.4.1-3) */
 
 	/* RX reception context (set once before BCH decode) */
 	int			rx_phase;	/* 0=A, 1=B, 2=C, 3=D; -1=not received */
@@ -1547,7 +2092,7 @@ uint32_t flex_word_checksum(uint32_t dw);
 uint32_t reverse_bits32(uint32_t v);
 void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
 
-/* Fill a phase's word array with the proper idle pattern per Section 3.4.1.
+/* Fill a phase's word array with idle pattern (Section 3.4.1, Fig. 3.4.1-3).
  * For 4FSK modes, LSB phases get all-zeros instead of alternating. */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
 			  int mod_type, int bitrate);
@@ -1557,8 +2102,10 @@ uint32_t flex_create_biw1(uint32_t prio, uint32_t e_biw,
 			  uint32_t s_vfield, uint32_t carry,
 			  uint32_t collapse);
 uint32_t flex_create_biw2(uint32_t local_id, uint32_t coverage_id);
-uint32_t flex_create_biw3(uint32_t month, uint32_t day);
-uint32_t flex_create_biw4(uint32_t hour, uint32_t minute);
+uint32_t flex_create_biw3(uint32_t year, uint32_t month, uint32_t day);
+uint32_t flex_create_biw4(uint32_t hour, uint32_t minute, uint32_t second);
+uint32_t flex_create_biw_ssid2(uint32_t country_code, uint32_t tmf);
+uint32_t flex_create_biw_sysinfo(uint32_t a_type, uint32_t info);
 
 /* Generate ERS (Emergency Re-Synchronization) burst into buffer.
  * ERS is a standalone re-sync burst, separate from data frames.

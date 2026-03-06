@@ -61,13 +61,18 @@ static int ers_cycles_override = -1;
 static int default_charset = 0;
 static uint32_t ssid = 0;
 static uint32_t nid = 0;
+static uint32_t country_code = 0;
+static uint32_t tmf_flags = 0;
+static int timezone_code = -1;		/* -1 = none, 0-31 = zone code per Table 3.7.2-3 */
 static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
 static int no_ers = 0;
 static int default_phase = -1;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 static int default_blocking_length = 1;	/* HEX/Binary B field: 1-15 bits/char, 0=16.
-					 * Spec §3.10.1.2, default 1 (raw bits). */
+					 * Default 1 (raw bits). */
 static int wav_test = 0;		/* --wav-test: exit after TX completes */
+static int num_transmissions = 1;	/* --num-transmissions: 1/2/3/4 */
+static int td_collapse = -1;		/* --td-collapse: -1=system, 5/6/7 */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -88,6 +93,11 @@ static int wav_test = 0;		/* --wav-test: exit after TX completes */
 #define OPT_PHASE		3015
 #define OPT_WAV_TEST		3016
 #define OPT_BLOCKING		3017
+#define OPT_COUNTRY_CODE	3018
+#define OPT_TMF			3019
+#define OPT_TIMEZONE		3020
+#define OPT_NUM_TX		3021
+#define OPT_TD_COLLAPSE		3022
 
 void print_help(const char *arg0)
 {
@@ -139,6 +149,14 @@ void print_help(const char *arg0)
 	printf("        Set System Sub-ID for roaming (default 0).\n");
 	printf("    --nid <N>\n");
 	printf("        Set Network ID for roaming (default 0).\n");
+	printf("    --country-code <N>\n");
+	printf("        Set SSID2 country code (ITU-T E.212, 0-1023, e.g. 440=Japan).\n");
+	printf("    --tmf <N>\n");
+	printf("        Set SSID2 traffic management flags (0-15, 4-bit bitmask).\n");
+	printf("    --timezone <N>\n");
+	printf("        Set timezone zone code (0-31, per Table 3.7.2-3).\n");
+	printf("        Emitted as BIW SysInfo type 101 (A=4). Use 'timezone,0,,' FIFO\n");
+	printf("        command to list all zone codes. Common: 9=JST, 24=PST, 27=EST.\n");
 	printf("    --pocsag-mix <frames>\n");
 	printf("        Enable POCSAG frame slot allocation.\n");
 	printf("    --temp-addr <cap:temp>\n");
@@ -156,33 +174,59 @@ void print_help(const char *arg0)
 	printf("    --wav-test\n");
 	printf("        Exit after TX completes (use with --write-tx-wave).\n");
 	printf("    --blocking <0-16>\n");
-	printf("        HEX/Binary blocking length: bits per character (Spec §3.10.1.2).\n");
+	printf("        HEX/Binary blocking length: bits per character.\n");
 	printf("        1-15 = that many bits/char, 0 or 16 = 16 bits/char.\n");
 	printf("        Default 1 (raw bits). Stored as B field in header word 2.\n");
+	printf("    --num-transmissions <1-4>\n");
+	printf("        Multiple transmission count (Spec Section 3.4.2).\n");
+	printf("        1=single (default), 2/3/4=subframe repeat.\n");
+	printf("        Subframe words: 2x=44, 3x=29, 4x=22. Requires --network.\n");
+	printf("    --td-collapse <5|6|7>\n");
+	printf("        TD Collapse cycle override for multiple transmission.\n");
+	printf("        Overrides system --collapse for repeat interval calculation.\n");
 	printf("\n");
 	printf("    FIFO protocol (write to %s):\n", MSG_SEND);
 	printf("        Format: capcode,type,options,message\n");
 	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short (or 0-6)\n");
 	printf("        Options: space-separated key=value pairs:\n");
 	printf("          speed=1600|3200|3200-4fsk|6400  polarity=neg|pos\n");
-	printf("          priority=0|1  charset=ascii|kanji  group=0|1\n");
-	printf("          tempgroup=0|1  source=<id>  phase=A|B|C|D|auto\n");
-	printf("          blocking=0-16  (HEX/Binary B field, bits/char, default 1)\n");
+	printf("          priority=0|1  charset=ascii|kanji\n");
+	printf("          group=0|1  tempgroup=0|1  source=<id>\n");
+	printf("          phase=A|B|C|D|auto\n");
+	printf("          blocking=0-16  (hex bits/char: 0 or 16=16bit, 1=raw, default 1)\n");
+	printf("          maildrop=0|1  (alpha/hex: separate handling from ordinary msgs)\n");
 	printf("        Special: ers,0,,  — trigger ERS re-sync burst\n");
-	printf("        Special: status,0,,  — dump RX temp group assignments (per phase)\n");
-	printf("        Special: timezone,0,,  — dump Table 3.7.2-3 timezone table\n");
+	printf("        Special: status,0,,  — dump system config + temp group assignments\n");
+	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
 	printf("        Special: timezone,<code>,,  — show offset for zone code 0-31\n");
-	printf("        Group:   group:<capcode>,<type>,group=1,<msg>\n");
-	printf("        TempGrp: group:<capcode>,<type>,group=1 tempgroup=1,<msg>\n");
-	printf("        Example: 1234567,alpha,speed=3200 priority=1,Hello World\n");
+	printf("        Special: sysmsg,<lsb>,,<payload>  — send system message via\n");
+	printf("          Operator Messaging Address (Fig. 3.7.2-2(c)).\n");
+	printf("          LSB: 0=all 1=home 2=roaming 3=ssid 4=time 14=SSIDChange 15=SysEvent\n");
+	printf("        Examples:\n");
+	printf("          1234567,alpha,,Hello World\n");
+	printf("          1234567,alpha,speed=3200 priority=1,Hello World\n");
+	printf("          1234567,numeric,,31415926\n");
+	printf("          1234567,hex,blocking=8,DEADBEEF\n");
+	printf("          1234567,tone,,\n");
+	printf("          group:1234567,alpha,group=1,Group message\n");
+	printf("          group:1234567,alpha,group=1 tempgroup=1,Temp group msg\n");
+	printf("          sysmsg,0,,System maintenance at 03:00 UTC\n");
+	printf("          sysmsg,14,,\n");
 	printf("\n");
-	printf("    Valid capcode ranges (ARIB STD-43A Section 3.8, Table 3.8.1-1):\n");
-	printf("        Short:  1–1933312 (7-digit, 1 address word)\n");
-	printf("        Long:   2101249–4297068542 (9-10 digit, 2 address words)\n");
-	printf("        The gap (1933313–2101248) contains special protocol addresses\n");
-	printf("        (Network, Temporary, Operator Messaging, Info Service, Reserved).\n");
-	printf("        These are allowed but will log a warning — they are normally\n");
-	printf("        not user-assignable per the standard.\n");
+	printf("    Valid capcode ranges:\n");
+	printf("        Short:  1–1933312 (1 address word, 21-bit d0-d20)\n");
+	printf("        Long:   2101249–4297068542 (2 address words, d0-d20 + e0-e20)\n");
+	printf("          Set 1-2: 2101249–1075843072     (LA1+LA2)\n");
+	printf("          Set 1-3/1-4: 1075843073–3223326720 (LA1+LA3 or LA1+LA4)\n");
+	printf("          Set 2-3/2-4: 3223326721–4297068542 (LA2+LA3 or LA2+LA4)\n");
+	printf("        Special addresses (gap 1933313–2101248):\n");
+	printf("          Network:  NID system info (4096 addrs, area_id/zones/traffic)\n");
+	printf("          Temporary: 16 group slots (assigned via short instruction)\n");
+	printf("          Operator:  system messages (all/home/roaming/ssid/time),\n");
+	printf("                     SSID change (TMF split, new coverage frequencies),\n");
+	printf("                     system event pre-alert (change within 4 cycles)\n");
+	printf("          Info Svc:  reserved (under investigation)\n");
+	printf("        Special addresses are allowed but will log a warning.\n");
 	main_mobile_print_hotkeys();
 }
 
@@ -207,12 +251,17 @@ static void add_options(void)
 	option_add(OPT_CHARSET, "charset", 1);
 	option_add(OPT_SSID, "ssid", 1);
 	option_add(OPT_NID, "nid", 1);
+	option_add(OPT_COUNTRY_CODE, "country-code", 1);
+	option_add(OPT_TMF, "tmf", 1);
+	option_add(OPT_TIMEZONE, "timezone", 1);
 	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
 	option_add(OPT_NO_ERS, "no-ers", 0);
 	option_add(OPT_PHASE, "phase", 1);
 	option_add(OPT_WAV_TEST, "wav-test", 0);
 	option_add(OPT_BLOCKING, "blocking", 1);
+	option_add(OPT_NUM_TX, "num-transmissions", 1);
+	option_add(OPT_TD_COLLAPSE, "td-collapse", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -338,6 +387,30 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_NID:
 		nid = (uint32_t)strtoul(argv[argi], NULL, 10);
 		break;
+	case OPT_COUNTRY_CODE:
+		country_code = (uint32_t)strtoul(argv[argi], NULL, 10);
+		if (country_code > 1023) {
+			fprintf(stderr, "Country code must be 0-1023 (ITU-T E.212), use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_TMF:
+		tmf_flags = (uint32_t)strtoul(argv[argi], NULL, 10);
+		if (tmf_flags > 15) {
+			fprintf(stderr, "TMF must be 0-15 (4-bit bitmask), use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_TIMEZONE:
+		timezone_code = atoi(argv[argi]);
+		if (timezone_code < 0 || timezone_code >= (int)FLEX_TZ_ENTRIES) {
+			fprintf(stderr, "Timezone code must be 0-31 (Table 3.7.2-3), use '-h' for help.\n");
+			return -EINVAL;
+		}
+		if (timezone_code == (int)FLEX_TZ_RESERVED) {
+			fprintf(stderr, "Warning: timezone zone code 16 is reserved in the standard.\n");
+		}
+		break;
 	case OPT_POCSAG_MIX:
 		pocsag_mix = options_strdup(argv[argi]);
 		break;
@@ -375,6 +448,20 @@ static int handle_options(int short_option, int argi, char **argv)
 		/* Normalize: 16 maps to B=0000 (stored as 0 internally) */
 		if (default_blocking_length == 16)
 			default_blocking_length = 0;
+		break;
+	case OPT_NUM_TX:
+		num_transmissions = atoi(argv[argi]);
+		if (num_transmissions < 1 || num_transmissions > 4) {
+			fprintf(stderr, "Number of transmissions must be 1-4, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_TD_COLLAPSE:
+		td_collapse = atoi(argv[argi]);
+		if (td_collapse != 5 && td_collapse != 6 && td_collapse != 7) {
+			fprintf(stderr, "TD collapse must be 5, 6, or 7, use '-h' for help.\n");
+			return -EINVAL;
+		}
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -585,8 +672,8 @@ static void fifo_process_line(const char *text, int text_length)
 
 	/* === Status command: "status,0,," ===
 	 * Dumps current temporary group assignments (persistent across frames).
-	 * Per ARIB STD-43A §5.2: assignments persist until group message
-	 * delivery completes or 128-frame timeout.
+	 * Assignments persist until group message delivery completes or
+	 * 128-frame timeout (~2 minutes).
 	 * 16 group slots per phase, each can have multiple members. */
 	if (!strcasecmp(capcode_string, "status")) {
 		flex_t *flex = (flex_t *)sender_head;
@@ -598,8 +685,25 @@ static void fifo_process_line(const char *text, int text_length)
 			return;
 		}
 
-		LOGP(DFLEX, LOGL_NOTICE, "FIFO: Temp group assignments (C%u/F%u, 16 groups/phase, §5.2):\n",
-		     flex->rx.fiw_cycle, flex->rx.fiw_frame);
+		/* System config summary */
+		{
+			flex_msg_t *qm;
+			int q_total = 0;
+			for (qm = flex->msg_list; qm; qm = qm->next)
+				q_total++;
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: System status: collapse=%d num_tx=%d td_collapse=%s queue=%d last=C%u/F%u\n",
+			     flex->collapse,
+			     flex->num_transmissions,
+			     flex->td_collapse >= 0 ?
+			       (flex->td_collapse == 5 ? "5" :
+			        flex->td_collapse == 6 ? "6" : "7") :
+			       "system",
+			     q_total,
+			     flex->sched_last_cycle, flex->sched_last_frame);
+		}
+
+		LOGP(DFLEX, LOGL_NOTICE, "FIFO: Temp group assignments (16 groups/phase):\n");
 		for (p = 0; p < FLEX_MAX_PHASES; p++) {
 			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
 				if (!flex->rx.temp_addr_map[p][s].active)
@@ -661,6 +765,83 @@ static void fifo_process_line(const char *text, int text_length)
 				     code,
 				     flex_tz_format(flex_tz_table[code], fmtbuf, sizeof(fmtbuf)),
 				     flex_tz_table[code]);
+			}
+		}
+		return;
+	}
+
+	/* === System Message command: "sysmsg,<lsb>,,<payload>" ===
+	 * Sends a system message via Operator Messaging Address
+	 * (Fig. 3.7.2-2(c) — Operator Messaging Address only).
+	 *
+	 * The <lsb> field (0-15) selects the operator address sub-type:
+	 *   0 = all pagers    1 = home area    2 = roaming    3 = SSID
+	 *   4 = time related  5-13 = reserved  14 = SSIDChange  15 = SysEvent
+	 *
+	 * The <payload> is sent as an alpha message body on the operator
+	 * messaging address.  The pager infrastructure interprets the
+	 * content based on the sub-type.
+	 *
+	 * Examples:
+	 *   sysmsg,0,,System maintenance at 03:00 UTC
+	 *   sysmsg,14,,                (SSIDChange, empty payload = TMF update)
+	 *   sysmsg,4,,                 (time-related system message)
+	 *
+	 * Per Section 3.7.2: "Tone-Only Addresses cannot be transmitted
+	 * in Frames used for transmitting System Messages." */
+	if (!strcasecmp(capcode_string, "sysmsg")) {
+		flex_t *flex = (flex_t *)sender_head;
+		int lsb;
+		int tlen;
+		char tbuf[16];
+
+		if (!flex) {
+			LOGP(DFLEX, LOGL_ERROR, "No transmitter instance for sysmsg command.\n");
+			return;
+		}
+
+		/* Extract LSB from type field */
+		tlen = comma2 - comma1 - 1;
+		if (tlen <= 0 || tlen >= (int)sizeof(tbuf)) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: sysmsg requires LSB (0-15). Format: sysmsg,<lsb>,,<payload>\n"
+			     "  LSB: 0=all 1=home 2=roaming 3=ssid 4=time 14=SSIDChange 15=SysEvent\n");
+			return;
+		}
+		memcpy(tbuf, text + comma1 + 1, tlen);
+		tbuf[tlen] = '\0';
+		lsb = atoi(tbuf);
+
+		if (lsb < 0 || lsb > 15) {
+			LOGP(DFLEX, LOGL_NOTICE, "FIFO: sysmsg LSB %d out of range (0-15).\n", lsb);
+			return;
+		}
+
+		/* Compute the operator messaging capcode.
+		 * Base address 0x1F7810 + LSB per Table 3.8.1-1. */
+		{
+			uint64_t oper_capcode = (uint64_t)(FLEX_ADDR_OPER_MSG_MIN + (uint32_t)lsb);
+			flex_msg_t *msg;
+
+			/* Extract message payload (after third comma) */
+			if (comma3 + 1 < text_length) {
+				message_length = flex_scan_message(text + comma3 + 1,
+								   text_length - comma3 - 1,
+								   msg_buf, sizeof(msg_buf));
+			}
+
+			msg = flex_msg_create(flex, oper_capcode,
+					      message_length > 0 ? FLEX_MSG_TYPE_ALPHA : FLEX_MSG_TYPE_TONE,
+					      msg_buf, message_length);
+			if (msg) {
+				msg->speed = 1600;
+				msg->modulation_type = FLEX_MOD_2FSK;
+				msg->polarity = -1.0;
+				msg->priority = 1; /* system messages are priority */
+				LOGP(DFLEX, LOGL_INFO,
+				     "FIFO: sysmsg enqueued LSB=%d (%s) capcode=%" PRIu64 " len=%d\n",
+				     lsb, flex_oper_msg_subtype_name((uint32_t)(FLEX_ADDR_OPER_MSG_MIN + lsb)),
+				     oper_capcode, message_length);
 			}
 		}
 		return;
@@ -914,6 +1095,14 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Warning: --collapse is only meaningful in network mode, setting collapse=0.\n");
 		collapse = 0;
 	}
+	if (num_transmissions > 1 && !network_mode) {
+		fprintf(stderr, "Warning: --num-transmissions > 1 requires --network, setting to 1.\n");
+		num_transmissions = 1;
+	}
+	if (num_transmissions > 1 && collapse <= 0) {
+		fprintf(stderr, "Warning: --num-transmissions > 1 requires --collapse > 0, setting to 1.\n");
+		num_transmissions = 1;
+	}
 	if (biw_time_enabled == -1)
 		biw_time_enabled = network_mode;
 
@@ -967,7 +1156,12 @@ int main(int argc, char *argv[])
 				f->wav_test_mode = 1;
 			f->ssid = ssid;
 			f->nid = nid;
+			f->country_code = country_code;
+			f->tmf = tmf_flags;
+			f->timezone_code = timezone_code;
 			f->roaming_active = (ssid != 0 || nid != 0) ? 1 : 0;
+			f->num_transmissions = num_transmissions;
+			f->td_collapse = td_collapse;
 
 			/* Parse POCSAG mixing frame slots if specified */
 			if (pocsag_mix) {

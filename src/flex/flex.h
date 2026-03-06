@@ -51,11 +51,12 @@ typedef struct flex_msg {
 	int			short_msg_index;	/* short message index (-1 = N/A) */
 	int			blocking_length;	/* HEX/Binary B field: bits per character.
 						 * 1-15 = that many bits, 0 = 16 bits.
-						 * Spec §3.10.1.2, default 1 (raw bits). */
-	int			mail_drop;		/* M flag (Spec §3.10.1.3):
+						 * Default 1 (raw bits). */
+	int			mail_drop;		/* M flag in alpha/hex header word 1:
 						 * 0 = ordinary message (default)
-						 * 1 = can be handled separately from
-						 *     ordinary messages (mail drop) */
+						 * 1 = mail drop — pager may store/handle
+						 *     separately from ordinary messages.
+						 * Applies to both alpha and hex types. */
 	int			phase;			/* phase (channel) override:
 						 * -1=auto (default, scheduler assigns
 						 * from capcode per ARIB STD-43A),
@@ -68,9 +69,8 @@ typedef struct flex_msg {
 	/* fragmentation state (set by scheduler for long messages).
 	 * All fragments of one message share the same retrieval_num,
 	 * which becomes the N (message number) field in the alpha/hex
-	 * header word.  Per spec §3.10.1.3: "those message numbers
-	 * which are newly assigned to a message must be unique numbers
-	 * so as to identify fragments for the same message." */
+	 * header word.  Message numbers newly assigned to a message
+	 * must be unique to identify fragments of the same message. */
 	int			fragment_index;
 	int			total_fragments;
 	uint32_t		retrieval_num;	/* → N field (6 bits, 0-63) */
@@ -150,13 +150,34 @@ typedef struct flex {
 	int			biw_time_enabled;	/* BIW3/BIW4 time broadcast */
 	int			lpf_enabled;		/* baseband LPF */
 
+	/* Multiple transmission config (Spec Section 3.4.2).
+	 *
+	 * When num_transmissions > 1, the 88-word frame is divided into
+	 * N subframes, each transmitted at a repeat interval equal to
+	 * the System Collapse cycle (2^m frames).
+	 *
+	 * Subframe sizes (Fig. 3.4.2-1):
+	 *   2x: 44 words per subframe (2 subframes)
+	 *   3x: 29 words per subframe (3 subframes, +1 extra word)
+	 *   4x: 22 words per subframe (4 subframes)
+	 *
+	 * The repeat unit = num_transmissions × repeat_interval frames.
+	 * Word numbering within each subframe starts at 0.
+	 * Word 0 always contains the Block Information Word.
+	 *
+	 * FIW encoding: r=1, [t1,t0]=num_tx, [t3,t2]=td_collapse.
+	 * Per spec: "Carry On is not allowed for multiple transmission." */
+	int			num_transmissions;	/* 1 (default), 2, 3, or 4 */
+	int			td_collapse;		/* -1=use system collapse (default),
+						 * 5, 6, or 7 = TD Collapse override */
+
 	/* per-message defaults (CLI -M message and FIFO fallback) */
 	int			default_speed;		/* 1600, 3200, 6400 — default 1600 */
 	double			default_polarity;	/* -1.0 or +1.0 — default -1.0 */
 	int			default_charset;	/* 0 = ASCII, 1 = KANJI — default 0 */
 	int			default_phase;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 	int			default_blocking_length; /* HEX/Binary B field default: 1-15 bits/char,
-						  * 0=16. Spec §3.10.1.2, default 1 (raw bits). */
+						  * 0=16. Default 1 (raw bits). */
 
 	/* fixed-mode flags (CLI --speed / --polarity lock) */
 	int			fixed_speed;		/* -1 = not fixed, else 1600/3200/6400 */
@@ -171,6 +192,9 @@ typedef struct flex {
 	/* roaming config */
 	uint32_t		ssid;			/* System Sub-ID */
 	uint32_t		nid;			/* Network ID */
+	uint32_t		country_code;		/* SSID2 country code (10 bits, ITU-T E.212) */
+	uint32_t		tmf;			/* SSID2 traffic management flags (4 bits) */
+	int			timezone_code;		/* SysInfo timezone zone code (0-31, -1=auto) */
 	int			roaming_active;		/* FIW n flag */
 
 	/* scheduler state */
@@ -278,9 +302,29 @@ typedef struct flex {
 		int		fiw_count;		/* bit counter in FIW state (0..32) */
 		uint32_t	fiw_rawdata;		/* accumulated FIW bits (32-bit codeword) */
 
-		/* FIW decode result */
+		/* FIW decode result (Spec Section 3.6, Fig. 3.6-1) */
 		uint32_t	fiw_cycle;
 		uint32_t	fiw_frame;
+		uint32_t	fiw_roaming;		/* n: 1=roaming allowed */
+		uint32_t	fiw_repeat;		/* r: 1=multiple transmission active */
+		uint32_t	fiw_traffic;		/* t3-t0: depends on r value */
+
+		/* Multiple transmission state (Spec Section 3.4.2).
+		 *
+		 * When r=1, [t1,t0] encode the number of transmissions:
+		 *   01=2x, 10=3x, 11=4x, 00=reserved.
+		 * And [t3,t2] encode the TD Collapse cycle override:
+		 *   00=use System Collapse, 01=value 6, 10=value 7, 11=value 5.
+		 *
+		 * When r=0, the number of transmissions is 1x and [t3-t0]
+		 * are Low Traffic Flags per phase (Section 3.6).
+		 *
+		 * A Frame is divided into N subframes (N = num_transmissions).
+		 * Subframe word counts: 2x=44, 3x=29(+1 extra), 4x=22.
+		 * Each subframe is transmitted at a repeat interval equal
+		 * to the System Collapse cycle (2^m frames). */
+		int		fiw_num_transmissions;	/* 1, 2, 3, or 4 */
+		int		fiw_td_collapse;	/* -1=use system, else 5/6/7 */
 
 		/* S2 state — evidence-based timing correction.
 		 * We scan the full S2 window + 2 symbols, recording where
@@ -303,14 +347,14 @@ typedef struct flex {
 		/* Data state */
 		int		data_count;		/* data symbol counter */
 
-		/* Per-phase channel data (Spec Section 3.3.3).
+		/* Per-phase channel data.
 		 * Each phase is an independent channel with 88 words
 		 * and per-word BCH status. */
 		flex_phase_data_t phase[FLEX_MAX_PHASES];
 		int		phase_toggle;		/* alternates 0/1 at 3200 baud */
 		int		data_bit_counter;	/* de-interleave index counter */
 
-		/* Per-phase temporary group tracking (Spec Section 5.2).
+		/* Per-phase temporary group tracking.
 		 *
 		 * Temporary addresses (0x1F7800–0x1F780F) are 16 group slots.
 		 * The system assigns pagers to a temp group in three phases:
@@ -348,7 +392,7 @@ typedef struct flex {
 		 * Assignments persist across frames until:
 		 *   a) The group message completes (C=0 in alpha header, or
 		 *      non-fragmented message type like tone/numeric), OR
-		 *   b) 128 frames elapse without delivery (timeout per §5.2).
+		 *   b) 128 frames elapse without delivery (timeout, ~2 minutes).
 		 *
 		 * Each phase has its own independent set of 16 slots.
 		 * Each slot can have up to FLEX_TEMP_GROUP_MAX_MEMBERS
@@ -362,7 +406,7 @@ typedef struct flex {
 			int		active;		/* 1 = assignment active, 0 = empty */
 		} temp_addr_map[FLEX_MAX_PHASES][FLEX_TEMP_ADDR_SLOTS];
 
-		/* BIW state — track SSID/coverage/timezone across frames.
+		/* BIW state — track SSID/coverage/timezone/date/time across frames.
 		 * Log at NOTICE level when values change, DEBUG when repeated. */
 		struct {
 			uint32_t	local_id;
@@ -371,9 +415,26 @@ typedef struct flex {
 			uint32_t	tmf;
 			int		seen;		/* 1 = at least one SSID1 received */
 			int		seen_ssid2;	/* 1 = at least one SSID2 received */
+			/* Date (type 001) */
+			int		date_year;	/* decoded year (with equiv mapping) */
+			uint32_t	date_month;
+			uint32_t	date_day;
+			int		seen_date;
+			/* Time (type 010) */
+			uint32_t	time_hour;
+			uint32_t	time_minute;
+			uint32_t	time_second;	/* raw 3-bit value (0-7, ×7.5s) */
+			int		seen_time;
+			/* SysInfo timezone (type 101, A=0100/0101) */
+			uint32_t	timezone_zone;	/* 5-bit zone code (Z4-Z0) */
+			int		timezone_offset_min; /* UTC offset in minutes */
+			int		timezone_dst;	/* L0: 0=DST, 1=standard time */
+			uint32_t	timezone_extsec; /* S5-S3: extended seconds (0-7,
+						  * 1/64 min = 0.9375s steps) */
+			int		seen_timezone;
 		} biw;
 
-		/* Fragment reassembly state (Spec Section 3.10.1.3 / 4.2).
+		/* Fragment reassembly state.
 		 *
 		 * Tracks in-progress fragmented messages per capcode.
 		 * A fragment stream is identified by capcode + message number (N).

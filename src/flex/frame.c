@@ -302,7 +302,10 @@ static int is_capcode_valid(uint64_t capcode, int *is_long)
 
 /*
  * Encode a short capcode (1-1933312) into a single address word.
- * (Spec Appendix A: CAPCODE to binary conversion)
+ * (ARIB STD-43A Section 3.8.2.1, Fig. 3.8.2.1-1)
+ *
+ * The 21-bit information word d₀-d₂₀ holds the address value
+ * (d₀=LSB, d₂₀=MSB).  The address is transmitted LSB first.
  */
 static uint32_t encode_short_address(uint32_t capcode)
 {
@@ -312,7 +315,12 @@ static uint32_t encode_short_address(uint32_t capcode)
 
 /*
  * Encode a long capcode into two address words.
- * (Spec Reference Document A, Section 5.15.5)
+ * (ARIB STD-43A Section 3.8.2.2, Fig. 3.8.2.2-1, Table 3.8.2.2-1)
+ *
+ * Long addresses consist of 2 words (1st word d₀-d₂₀, 2nd word e₀-e₂₀).
+ * The combination of Long Address types determines the set:
+ *   Set 1-2: LA1 + LA2    Set 1-3: LA1 + LA3    Set 1-4: LA1 + LA4
+ *   Set 2-3: LA2 + LA3    Set 2-4: LA2 + LA4
  *
  * Returns 0 on success, -1 if capcode is out of range.
  */
@@ -332,7 +340,7 @@ static int encode_long_address(uint64_t capcode, uint32_t words[2])
 		w1 = (result % FLEX_SHORT_ADDR_OFFSET) + 1;
 		w2 = (result / FLEX_SHORT_ADDR_OFFSET) + FLEX_LONG_W2_SET34;
 	} else if (capcode >= FLEX_LONG_SET23_MIN && capcode <= FLEX_LONG_SET23_MAX) {
-		/* Set 2-3 */
+		/* Sets 2-3 and 2-4 (Table 3.8.2.2-1) */
 		result = capcode - FLEX_LONG_OFFSET_B;
 		w1 = (result % FLEX_SHORT_ADDR_OFFSET) + FLEX_LONG_W1_SET23;
 		w2 = (result / FLEX_SHORT_ADDR_OFFSET) + FLEX_LONG_W2_SET23;
@@ -459,17 +467,17 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words)
 }
 
 /*
- * Fill a phase's word array with the proper idle pattern per ARIB STD-43A
- * Section 3.4.1, Table 3.4.1-1.
+ * Fill a phase's word array with the idle pattern (Section 3.4.1,
+ * Fig. 3.4.1-3, Table 3.4.1-1).
  *
- * The standard requires idle blocks to produce a 1,0 bit pattern at 1600 bps
- * on the channel.  For 2FSK this means alternating all-1s and all-0s words.
- * For 4FSK, the MSB phases (A, and C for 6400) get the alternating pattern,
- * while the LSB phases (C for 3200, B and D for 6400) get all-zeros so that
- * the resulting 4-level symbols are only the two extreme levels (±4800 Hz),
- * reproducing the same 1600 bps binary waveform.
+ * Idle blocks produce a 1,0 bit pattern at 1600 bps on the channel.
+ * For 2FSK this means alternating all-1s and all-0s words.
+ * For 4FSK, the MSB phases (A, and C for 6400) get the alternating
+ * pattern, while the LSB phases (C for 3200, B and D for 6400) get
+ * all-zeros so that the resulting 4-level symbols are only the two
+ * extreme levels (±4800 Hz), reproducing the same 1600 bps waveform.
  *
- * Standard idle patterns by mode:
+ * Idle patterns by mode:
  *   1600/2FSK, 3200/2FSK: all phases alternate 0xFFFFFFFF / 0x00000000
  *   3200/4FSK: Phase A alternates, Phase C = all zeros
  *   6400/4FSK: Phases A,C alternate, Phases B,D = all zeros
@@ -529,10 +537,14 @@ static int is_valid_numeric_char(char c)
  * Characters are packed 3 per 21-bit word (7 bits each).
  * Unused character slots are filled with ETX (0x03).
  * Includes fragment flags (f0f1), signature (S-bit), and checksum (K-bit).
+ *
+ * Returns the encoded vector word for this message.  Only body words
+ * are written to frame_words starting at *fwc_p.  The caller places
+ * the vector word in the Vector Field per Section 3.4.1.
  */
-static void encode_alpha_message(uint32_t *frame_words, const char *msg,
+static uint32_t encode_alpha_message(uint32_t *frame_words, const char *msg,
 				 uint32_t msg_start, uint32_t *fwc_p,
-				 int is_long, int sequence_num,
+				 int sequence_num,
 				 const void *config)
 {
 	uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
@@ -602,6 +614,13 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 					msg_word[0] |= FLEX_ALPHA_HDR_M_MASK;
 			}
 		}
+		/* TODO: Enhanced Fragmentation — set U₀/V₀ bits on
+		 * continuation/final fragments (ARIB STD-43A §3.10.1.3,
+		 * Fig. 3.10.1.3-2).  When !is_initial and the message
+		 * uses SI/SO character mode switching, set bits 19-20:
+		 *   U₀V₀ = 10 if fragment starts in default char mode,
+		 *   U₀V₀ = 11 if fragment starts in alternative mode.
+		 * Currently always 00 (Standard Fragmentation). */
 	}
 
 	/* Pack 7-bit ASCII characters, 3 per word.
@@ -640,7 +659,14 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 			}
 		}
 
-		/* Pad unused character slots with ETX per spec */
+		/* Pad unused character slots with ETX per spec.
+		 *
+		 * TODO: Enhanced Fragmentation (ARIB STD-43A §3.10.1.3,
+		 * rule (1)) — when U₀V₀ ≠ 00, pad with NUL ($00) instead
+		 * of ETX ($03).  Per spec: "the pager must remove function
+		 * characters NUL($00) used as fill characters in Enhanced
+		 * Fragmentation."  ETX is only used as fill in Standard
+		 * Fragmentation mode. */
 		if (is_initial_frag) {
 			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
 				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
@@ -681,13 +707,25 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 		 * follow the Signature Field.  The 7 LSB's of the result is
 		 * transmitted as the Message Signature."
 		 *
-		 * Note: Function characters ETX and NUL in Enhanced
-		 * Fragmentation are not included for calculation.
+		 * Standard Fragmentation (U₀,V₀ = 0,0 — ASCII/7-bit):
+		 *   ETX padding IS included in the sum.  Both TX and RX
+		 *   agree on the padding, so the signature matches.
+		 *
+		 * Enhanced Fragmentation (U₀,V₀ ≠ 0,0 — not implemented):
+		 *   Per spec, function characters ETX ($03) and NUL ($00)
+		 *   are NOT included in the signature calculation.
 		 *
 		 * We sum all three 7-bit character slots from each data word
 		 * (words 1..N), skipping the signature slot itself (bits 0-6
-		 * of word 1).  The sum includes ETX padding characters since
-		 * they occupy character slots in the transmitted words. */
+		 * of word 1).  Since we only use Standard Fragmentation,
+		 * ETX padding characters are included in the sum.
+		 *
+		 * TODO: Enhanced Fragmentation (ARIB STD-43A §3.10.1.3) —
+		 * when U₀V₀ ≠ 00, exclude ETX ($03) and NUL ($00) from
+		 * the signature sum.  Per spec: "function characters NUL
+		 * and ETX in Enhanced Fragmentation are not included for
+		 * calculation."  This requires tracking which characters
+		 * are function chars vs. data during the sum loop. */
 		if (is_initial_frag) {
 			sig_sum = 0;
 			for (i = 1; i < word_idx; i++) {
@@ -717,12 +755,13 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 	}
 	msg_word[0] |= (~k_sum) & FLEX_ALPHA_HDR_K_MASK;
 
-	/* Write vector word and encoded message words to frame */
+	/* Write encoded body words to frame (vector word returned to caller) */
 	fwc = *fwc_p;
-	frame_words[fwc++] = create_alpha_vector(msg_start + is_long, word_idx);
 	for (i = 0; i < word_idx; i++)
 		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_word[i]));
 	*fwc_p = fwc;
+
+	return create_alpha_vector(msg_start, word_idx);
 }
 
 /*
@@ -730,10 +769,13 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
  *
  * Digits are packed as 4-bit nibbles, 5 per 21-bit word.
  * Includes K-bit checksum.
+ *
+ * Returns the encoded vector word.  Only body words are written to
+ * frame_words starting at *fwc_p.
  */
-static void encode_numeric_message(uint32_t *frame_words, const char *msg,
+static uint32_t encode_numeric_message(uint32_t *frame_words, const char *msg,
 				   uint32_t msg_start, uint32_t *fwc_p,
-				   int is_long, const void *config)
+				   const void *config)
 {
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_NUMERIC] = {0};
 	uint8_t last_ch;
@@ -786,13 +828,13 @@ static void encode_numeric_message(uint32_t *frame_words, const char *msg,
 	k_bit = ~k_bit;
 	msg_words[0] |= (k_bit >> 4) & 0x3;  /* k5k4 bits */
 
-	/* Write vector word and encoded message words to frame */
+	/* Write encoded body words to frame (vector word returned to caller) */
 	fwc = *fwc_p;
-	frame_words[fwc++] = create_numeric_vector(msg_start + is_long,
-						   word_idx, k_bit);
 	for (i = 0; i <= word_idx; i++)
 		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
 	*fwc_p = fwc;
+
+	return create_numeric_vector(msg_start, word_idx + 1, k_bit);
 }
 
 /* ===== Message Type Detection ===== */
@@ -970,6 +1012,10 @@ void flex_frame_params_default(flex_frame_params_t *params)
 	memset(params, 0, sizeof(*params));
 	params->bitrate = 1600;
 	params->modulation_type = FLEX_MOD_2FSK;
+	params->timezone_code = -1; /* no timezone by default */
+	params->num_transmissions = 1; /* single transmission (no repeat) */
+	params->td_collapse = -1; /* use system collapse cycle */
+	params->subframe_index = 0;
 }
 
 /*
@@ -992,28 +1038,17 @@ uint32_t flex_create_biw2(uint32_t local_id, uint32_t coverage_id)
 /*
  * Block Information Word 3 (Spec Section 3.7.2, type 001 = Date).
  *
- * year:  Year (5 bits, 0-31, base 1994 → 1994-2025)
- * month: Month of year (4 bits, 1-12)
- * day:   Day of month (5 bits, 1-31)
+ * year:  Year offset (5 bits, 0-31, base 1994 → 1994-2025).
+ *        Caller should use flex_biw_equiv_year() for years >2025.
+ * month: Month of year (4 bits, 0001-1100, Jan-Dec)
+ * day:   Day of month (5 bits, 00001-11111, 1-31)
  */
-uint32_t flex_create_biw3(uint32_t month, uint32_t day)
+uint32_t flex_create_biw3(uint32_t year, uint32_t month, uint32_t day)
 {
 	uint32_t dw = 0;
 	/* type field bits 4-6 = 001 (Date) */
 	dw |= (uint32_t)FLEX_BIW_TYPE_DATE << FLEX_BIW_TYPE_SHIFT;
-	/* Year field: standard range 0-31 (1994-2025).
-	 * For years >2025, find a calendar-equivalent year in range
-	 * (same leap status + same Jan 1 weekday) so pagers display
-	 * correct day-of-week and Feb 29 behavior. */
-	{
-		time_t now = time(NULL);
-		struct tm tm_now;
-		gmtime_r(&now, &tm_now);
-		int real_year = tm_now.tm_year + 1900;
-		int equiv = flex_biw_equiv_year(real_year);
-		uint32_t year = (uint32_t)(equiv - FLEX_BIW_DATE_YEAR_BASE);
-		dw |= (year  & FLEX_BIW_DATE_YEAR_MASK)  << FLEX_BIW_DATE_YEAR_SHIFT;
-	}
+	dw |= (year  & FLEX_BIW_DATE_YEAR_MASK)  << FLEX_BIW_DATE_YEAR_SHIFT;
 	dw |= (day   & FLEX_BIW_DATE_DAY_MASK)   << FLEX_BIW_DATE_DAY_SHIFT;
 	dw |= (month & FLEX_BIW_DATE_MONTH_MASK)  << FLEX_BIW_DATE_MONTH_SHIFT;
 
@@ -1024,16 +1059,86 @@ uint32_t flex_create_biw3(uint32_t month, uint32_t day)
 /*
  * Block Information Word 4 (Spec Section 3.7.2, type 010 = Time).
  *
- * hour:   Hour of day (5 bits, 0-23)
- * minute: Minute of hour (6 bits, 0-59)
+ * hour:   Hour of day (5 bits, 00000-10111, 0-23)
+ * minute: Minute of hour (6 bits, 000000-111011, 0-59)
+ * second: Second in 7.5s steps (3 bits, 000-111, 1/8 minute)
+ *
+ * The Second field can be extended to 1/64 minute (0.9375s) resolution
+ * by the S5-S3 field in BIW SysInfo type 101 (A=0100 or A=0101).
  */
-uint32_t flex_create_biw4(uint32_t hour, uint32_t minute)
+uint32_t flex_create_biw4(uint32_t hour, uint32_t minute, uint32_t second)
 {
 	uint32_t dw = 0;
 	/* type field bits 4-6 = 010 (Time) */
 	dw |= (uint32_t)FLEX_BIW_TYPE_TIME << FLEX_BIW_TYPE_SHIFT;
 	dw |= (hour   & FLEX_BIW_TIME_HOUR_MASK)   << FLEX_BIW_TIME_HOUR_SHIFT;
 	dw |= (minute & FLEX_BIW_TIME_MINUTE_MASK)  << FLEX_BIW_TIME_MINUTE_SHIFT;
+	dw |= (second & FLEX_BIW_TIME_SECOND_MASK)  << FLEX_BIW_TIME_SECOND_SHIFT;
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Block Information Word — SSID2 (Spec Section 3.7.2, type 111).
+ *
+ * country_code: ITU-T E.212 country code (10 bits, 0-1023)
+ * tmf:          Traffic management flags (4 bits, 0-15)
+ */
+uint32_t flex_create_biw_ssid2(uint32_t country_code, uint32_t tmf)
+{
+	uint32_t dw = 0;
+	/* type field bits 4-6 = 111 (SSID2) */
+	dw |= (uint32_t)FLEX_BIW_TYPE_SSID2 << FLEX_BIW_TYPE_SHIFT;
+	dw |= (tmf          & FLEX_BIW_SSID2_TMF_MASK)     << FLEX_BIW_SSID2_TMF_SHIFT;
+	dw |= (country_code & FLEX_BIW_SSID2_COUNTRY_MASK)  << FLEX_BIW_SSID2_COUNTRY_SHIFT;
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
+ * Block Information Word — System Information (Spec Section 3.7.2, type 101).
+ *
+ * BIW word layout (21 data bits):
+ *   bits 0-3:   checksum (x)
+ *   bits 4-6:   type = 101 (SysInfo)
+ *   bits 7-10:  A3-A0 system message type (Table 3.7.2-2)
+ *   bits 11-20: I9-I0 system info data (layout depends on A-type)
+ *
+ * a_type: A3-A0 (4 bits). Use FLEX_BIW_SYSINFO_A_* constants:
+ *   0000 = SysMsg for all pagers      0001 = SysMsg for home pagers
+ *   0010 = SysMsg for roaming pagers  0011 = SysMsg for SSID pagers
+ *   0100 = Time instruction           0101 = Additional time instruction
+ *   0110 = Channel Set Up instruction 0111-1111 = Reserved
+ *
+ * info: I9-I0 (10 bits). Layout per A-type:
+ *
+ *   A=0100/0101 (Time):
+ *     I4-I0: timezone zone code Z4-Z0 (5 bits, Table 3.7.2-3)
+ *     I5:    L0 DST flag (0=DST active, 1=standard time)
+ *     I6:    reserved (0)
+ *     I7-I9: S5-S3 extended seconds (3 bits, 0.9375s steps)
+ *     Example: zone=14 (UTC+0), DST=1, esec=0 → info=0x034
+ *
+ *   A=0110 (Channel Set Up):
+ *     I5-I0: F5-F0 Frame Offset (6 bits, 1-63)
+ *     I7-I6: O1-O0 Max Carry On for roaming pagers (2 bits, 0-3)
+ *     I8:    N0 NID System Message Bit (1=NID sysmsg present)
+ *     I9:    B0 System Message Bit (1=sysmsg present in frame)
+ *     Example: frame_ofs=10, carry_on=2, nid=0, sysmsg=1 → info=0x28A
+ *
+ *   A=0000~0011 (System Messages):
+ *     I-field is message-type-specific. When used, vectors (except
+ *     Secure) go at end of VF, message body in MF (Fig. 3.7.2-2(a)).
+ */
+uint32_t flex_create_biw_sysinfo(uint32_t a_type, uint32_t info)
+{
+	uint32_t dw = 0;
+	/* type field bits 4-6 = 101 (SysInfo) */
+	dw |= (uint32_t)FLEX_BIW_TYPE_SYSINFO << FLEX_BIW_TYPE_SHIFT;
+	dw |= (a_type & FLEX_BIW_SYSINFO_A_MASK) << FLEX_BIW_SYSINFO_A_SHIFT;
+	dw |= (info   & FLEX_BIW_SYSINFO_I_MASK) << FLEX_BIW_SYSINFO_I_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -1132,6 +1237,7 @@ int flex_fragment_message(const char *message, int msg_type,
 
 /*
  * Encode a group address word for common or temporary group addresses.
+ * (ARIB STD-43A Section 3.8.2.2, Fig. 3.8.2.2-1)
  *
  * Group addresses use the same short/long address encoding as individual
  * addresses, but with the group flag indicated by setting bit 20 (the MSB
@@ -1190,14 +1296,14 @@ uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary)
 	return flex_encode_word(reverse_bits32(dw));
 }
 
-/* ===== Temporary Address Assignment (Spec Section 3.8.2.3) ===== */
+/* ===== Temporary Address Assignment (ARIB STD-43A Section 3.8.2.3) ===== */
 
 /*
  * Encode a temporary address assignment word.
+ * (Section 3.8.2.3: base address = 1 1111 0111 1000 0000 0000₂ = 0x1F7800)
  *
- * Maps a permanent capcode to a temporary address. The temporary address
- * value is encoded as a 21-bit BCH word. Both the permanent capcode and
- * the temporary address must be valid.
+ * The Temporary Address is obtained by adding binary 0000 through 1111
+ * (as indicated by a₃~a₀ of the Short Instruction Vector) to the base.
  *
  * Returns the encoded 32-bit BCH codeword for the temporary address,
  * or 0 on invalid input.
@@ -1220,14 +1326,14 @@ uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr)
 	return flex_encode_word(reverse_bits32(dw));
 }
 
-/* ===== Network Address Encoding (Spec Section 6.1.2) ===== */
+/* ===== Network Address Encoding (ARIB STD-43A Section 6.1.2) ===== */
 
 /*
  * Encode a network (NID) address word.
  *
- * Network addresses occupy the range FLEX_ADDR_NETWORK_MIN to
- * FLEX_ADDR_NETWORK_MAX (4096 addresses).  The addr_offset parameter
- * selects which address within that range (0-based).
+ * Network addresses occupy the range FLEX_ADDR_NETWORK_MIN (0x1F6800)
+ * to FLEX_ADDR_NETWORK_MAX (0x1F77FF) — 4096 addresses.
+ * The addr_offset parameter selects which address within that range (0-based).
  *
  * Returns the encoded 32-bit BCH codeword, or 0 on invalid offset.
  */
@@ -1265,16 +1371,37 @@ uint32_t flex_encode_network_payload(uint32_t area_id, uint32_t coverage_zones,
 	return flex_encode_word(reverse_bits32(dw));
 }
 
-/* ===== Operator Messaging Address Encoding (Spec Section 3.8.2.4) ===== */
+/* ===== Operator Messaging Address Encoding (Table 3.8.2.4-1) ===== */
 
 /*
  * Encode an operator messaging address word.
  *
- * The sub-type LSB (4 bits) selects the specific operator messaging
- * function per Section 3.8.2.4:
- *   0x00-0x04: System Messages (All, Home, Roaming, SSID, Time)
+ * Per Spec Section 3.7.2 / Fig. 3.7.2-2, System Messages can be
+ * transmitted in three ways:
+ *   (a) BIW101 only: vectors at end of VF, messages in MF.
+ *   (b) BIW101 + Operator Messaging Address: both BIW and operator
+ *       address in AF, operator vector in VF, message in MF.
+ *   (c) Operator Messaging Address only: operator address in AF,
+ *       operator vector in VF, message in MF (no BIW101 needed).
+ *
+ * The sub-type LSB (4 bits) selects the specific function:
+ *   0x00: System Message for all pagers (content per BIW)
+ *   0x01: System Message for home area pagers
+ *   0x02: System Message for roaming pagers
+ *   0x03: System Message for SSID pagers
+ *   0x04: Time related Message for all pagers
  *   0x05-0x0D: Reserved
- *   0x0E-0x0F: Change Instructions
+ *   0x0E: SSID Change Instruction — transmits TMF split / new frequency
+ *          info to SSID pagers.  Mandatory for TMF-split systems on
+ *          roaming frames, 5 cycles around the change.
+ *   0x0F: System Event Notification — pre-alerts pagers about changes
+ *          within next 4 cycles.  Used with Short Instruction Vector
+ *          (type 001).  Events: SSID/NID TMF split, channel setup
+ *          changes, new NID/SSID frequency.
+ *
+ * FIFO usage: "sysmsg,<lsb>,,<payload>" sends via mode (c).
+ *   Example: "sysmsg,0,,System maintenance" → capcode 2062352 (0x1F7810)
+ *   Example: "sysmsg,14,,"                  → capcode 2062366 (0x1F781E)
  *
  * Returns the encoded 32-bit BCH codeword, or 0 on invalid sub-type.
  */
@@ -1358,15 +1485,15 @@ static uint8_t hex_char_to_nibble(char c)
  *   bits 16-19: nibble 4
  *   bit  20:    unused (0)
  *
- * The function writes the hex vector word followed by encoded message
- * words to frame_words, updating *fwc_p.
+ * Returns the encoded vector word.  Only body words are written to
+ * frame_words starting at *fwc_p.
  *
  * On invalid input (non-hex characters), sets *error = -FLEX_ERR_INVALID_MESSAGE
- * and returns without writing any words.
+ * and returns 0 without writing any words.
  */
-static void encode_hex_message(uint32_t *frame_words, const char *msg,
+static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 			       uint32_t msg_start, uint32_t *fwc_p,
-			       int is_long, int sequence_num,
+			       int sequence_num,
 			       const void *config, int *error)
 {
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_HEX];
@@ -1393,7 +1520,7 @@ static void encode_hex_message(uint32_t *frame_words, const char *msg,
 	for (i = 0; i < len; i++) {
 		if (!is_valid_hex_char(msg[i])) {
 			*error = -FLEX_ERR_INVALID_MESSAGE;
-			return;
+			return 0;
 		}
 	}
 
@@ -1591,12 +1718,15 @@ static void encode_hex_message(uint32_t *frame_words, const char *msg,
 	}
 	msg_words[0] |= (~k_sum) & FLEX_HEX_HDR_K_MASK;
 
-	/* Write vector word and encoded message words to frame */
+	/* Write encoded body words to frame (vector word returned to caller).
+	 * Per ARIB STD-43A Sections 3.9.1/3.9.3/3.9.4: for long addresses,
+	 * body[0] is placed at Vy in the Vector Field by the caller. */
 	fwc = *fwc_p;
-	frame_words[fwc++] = create_hex_vector(msg_start + is_long, word_idx);
 	for (i = 0; i < (size_t)word_idx; i++)
 		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
 	*fwc_p = fwc;
+
+	return create_hex_vector(msg_start, word_idx);
 }
 
 /*
@@ -1631,19 +1761,25 @@ static uint32_t create_short_instruction_vector(uint32_t instruction_data)
  * NULL/empty message), sets *error = -FLEX_ERR_INVALID_MESSAGE and
  * returns without writing any words.
  */
-static void encode_instruction_message(uint32_t *frame_words, const char *msg,
-				       uint32_t msg_start, uint32_t *fwc_p,
-				       int is_long, int *error)
+/*
+ * Encode a short instruction message (Spec Section 3.9.6).
+ *
+ * Parses the message string as a decimal integer instruction value,
+ * creates the short instruction vector word.  No message body words
+ * are produced — all data is in the vector word.
+ *
+ * Returns the encoded vector word, or 0 on error.
+ * On invalid input (non-numeric string, value out of 14-bit range, or
+ * NULL/empty message), sets *error = -FLEX_ERR_INVALID_MESSAGE.
+ */
+static uint32_t encode_instruction_message(const char *msg, int *error)
 {
 	unsigned long val;
 	char *endptr;
 
-	(void)msg_start;
-	(void)is_long;
-
 	if (!msg || !*msg) {
 		*error = -FLEX_ERR_INVALID_MESSAGE;
-		return;
+		return 0;
 	}
 
 	/* Parse as decimal integer */
@@ -1652,24 +1788,24 @@ static void encode_instruction_message(uint32_t *frame_words, const char *msg,
 	/* Reject if not a clean integer or has trailing garbage */
 	if (*endptr != '\0') {
 		*error = -FLEX_ERR_INVALID_MESSAGE;
-		return;
+		return 0;
 	}
 
 	/* 14-bit range: 0-16383 */
 	if (val > 0x3FFF) {
 		*error = -FLEX_ERR_INVALID_MESSAGE;
-		return;
+		return 0;
 	}
 
-	frame_words[(*fwc_p)++] = create_short_instruction_vector((uint32_t)val);
+	return create_short_instruction_vector((uint32_t)val);
 }
 
 /* ===== Multi-Message Frame Encoding ===== */
 
 /* Forward declaration — defined after flex_encode_frame_multi(). */
-static void encode_kanji_message(uint32_t *frame_words, const char *msg,
+static uint32_t encode_kanji_message(uint32_t *frame_words, const char *msg,
 				 uint32_t msg_start, uint32_t *fwc_p,
-				 int is_long, int *error);
+				 int *error);
 
 /*
  * Estimate the number of message body words for a given message type and content.
@@ -1809,14 +1945,14 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
  *   Word 3:                          BIW4 (if biw_time set)
  *   Words e_biw+1..s_vfield-1:       Address words (priority first, then normal)
  *   Words s_vfield..msg_start-1:     Vector words
- *   Words msg_start..87:             Message data words + idle fill
+ *   Words msg_start..87:             Message data words + idle fill (Fig. 3.4.1-3)
  *
  * Algorithm:
  *   1. Write sync section (S1 + FIW + S2) to buffer
  *   2. Compute BIW count based on params
  *   3. First pass: compute per-message word counts, greedily pack messages
  *   4. Write BIW words, address words, vector + message words
- *   5. Fill remaining with idle pattern, interleave, write to buffer
+ *   5. Fill remaining with idle pattern (Fig. 3.4.1-3), interleave, write to buffer
  *
  * Returns bytes written to buffer, or 0 on error.
  * Sets *msgs_packed to the number of messages that fit.
@@ -1892,8 +2028,40 @@ static size_t flex_encode_fiw(const flex_frame_params_t *params,
 
 	out = buffer;
 	{
+		/* Compute FIW r and t fields from multiple transmission params.
+		 *
+		 * Per Spec Section 3.6 (Fig. 3.6-1):
+		 *   When num_transmissions=1: r=0, t=low_traffic_flags.
+		 *   When num_transmissions>1: r=1, and:
+		 *     [t1,t0] = num_transmissions (01=2x, 10=3x, 11=4x)
+		 *     [t3,t2] = TD Collapse override (00=system, 01=6, 10=7, 11=5) */
+		uint32_t r_flag = 0;
+		uint32_t t_field = 0;
+
+		if (params->num_transmissions > 1) {
+			uint32_t t10, t32;
+
+			r_flag = 1;
+
+			switch (params->num_transmissions) {
+			case 2:  t10 = 0x01; break;
+			case 3:  t10 = 0x02; break;
+			case 4:  t10 = 0x03; break;
+			default: t10 = 0x00; break; /* reserved */
+			}
+
+			switch (params->td_collapse) {
+			case 6:  t32 = 0x01; break;
+			case 7:  t32 = 0x02; break;
+			case 5:  t32 = 0x03; break;
+			default: t32 = 0x00; break; /* use system collapse */
+			}
+
+			t_field = t10 | (t32 << 2);
+		}
+
 		uint32_t fiw_cw = flex_create_fiw(params->cycle, params->frame,
-						  params->roaming, 0, 0);
+						  params->roaming, r_flag, t_field);
 		EMIT_WORD(out, fiw_cw);
 	}
 
@@ -2073,7 +2241,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	/* Per-message bookkeeping for the packing pass */
 	struct msg_info {
 		int	addr_words;	/* 1 (short) or 2 (long) */
-		int	vector_words;	/* always 1 */
+		int	vector_words;	/* 1 (short) or 2 (long) per Fig. 3.4.1-2 */
 		int	msg_words;	/* body words (0 for tone/instruction/short) */
 		int	is_long;	/* 1 if long capcode */
 		int	packed;		/* 1 if included in this frame */
@@ -2122,18 +2290,39 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			      out, buffer_size - (size_t)(out - buffer));
 
 	/* ---- Compute BIW count ---- */
+	/* Build list of extra BIW words to emit (max 3, limited by
+	 * BIW1 e_biw field = 2 bits).  Per Spec Section 3.7.2, the
+	 * transmission order of BIW 2/3/4 is not regulated — receivers
+	 * dispatch on the type field.  We prioritize:
+	 *   1. SSID1 (type 000) — required for roaming
+	 *   2. SSID2 (type 111) — required for roaming per spec
+	 *   3. Date  (type 001) — if biw_time enabled
+	 *   4. Time  (type 010) — if biw_time enabled
+	 *   5. SysInfo/timezone (type 101) — if timezone_code set
+	 * If more than 3 are needed, SysInfo is dropped (it can be
+	 * transmitted in other frames per spec). */
 
 	biw_count = 1; /* BIW1 always present */
 	e_biw = 0;
 
-	if (params->local_id || params->coverage_id) {
-		biw_count = 2; /* BIW1 + BIW2 */
-		e_biw = 1;
-	}
+	{
+		int extra = 0;
 
-	if (params->biw_time) {
-		biw_count = 4; /* BIW1 + BIW2 + BIW3 + BIW4 */
-		e_biw = 3;
+		if (params->local_id || params->coverage_id)
+			extra++;
+		if (params->country_code || params->tmf)
+			extra++;
+		if (params->biw_time)
+			extra += 2; /* Date + Time */
+		if (params->timezone_code >= 0 && params->timezone_code < (int)FLEX_TZ_ENTRIES)
+			extra++;
+
+		/* Clamp to 3 (max e_biw) — drop SysInfo first if needed */
+		if (extra > 3)
+			extra = 3;
+
+		e_biw = extra;
+		biw_count = 1 + extra;
 	}
 
 	/* ---- First pass: compute per-message word counts ---- */
@@ -2168,7 +2357,13 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				info[i].is_long = is_long_addr;
 			}
 
-			info[i].vector_words = 1;
+			/* Per ARIB STD-43A Section 3.4.1 / Fig. 3.4.1-2:
+			 * (A) Short address: 1 addr word (Ax) → 1 vector word (Vx)
+			 * (B) Long address:  2 addr words (Ax,Ay) → 2 vector words (Vx,Vy)
+			 * Per Sections 3.9.1/3.9.3/3.9.4: "the 1st word of the
+			 * message is placed at the 2nd word of the vector" — Vy
+			 * holds body[0], not a copy of Vx. */
+			info[i].vector_words = info[i].is_long ? 2 : 1;
 
 			/* Tone-only addresses have no vector word and no message
 			 * body per ARIB STD-43A Section 3.4.1 / Fig. 3.4.1-2(C).
@@ -2230,11 +2425,32 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 	capacity = FLEX_WORDS_PER_FRAME - biw_count; /* words available after BIWs */
 
-	/* Pack non-tone messages (priority + normal) — these need addr + vector + msg words */
+	/* When using multiple transmission (Spec Section 3.4.2, Fig. 3.4.2-1),
+	 * the frame is divided into N subframes with reduced word counts:
+	 *   2x=44, 3x=29, 4x=22 words per subframe.
+	 * Capacity is limited to the subframe size minus BIW words. */
+	if (params->num_transmissions > 1) {
+		int sf_words = flex_subframe_words(params->num_transmissions);
+		capacity = sf_words - biw_count;
+		if (capacity < 0)
+			capacity = 0;
+	}
+
+	/* Pack non-tone messages (priority + normal) — these need addr + vector + msg words.
+	 * Per Sections 3.9.1/3.9.3/3.9.4: for long addresses with body words,
+	 * body[0] is placed at Vy (already counted in vector_words), so the
+	 * Message Field only needs msg_words-1 slots. */
 	for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
 		int idx = order[i];
-		int needed = info[idx].addr_words + info[idx].vector_words
-			   + info[idx].msg_words;
+		int mf_words = info[idx].msg_words;
+		int needed;
+
+		/* Long address: body[0] absorbed into Vy slot in VF */
+		if (info[idx].is_long && mf_words > 0)
+			mf_words--;
+
+		needed = info[idx].addr_words + info[idx].vector_words
+			   + mf_words;
 
 		if (needed > capacity)
 			break; /* no more room */
@@ -2242,7 +2458,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		info[idx].packed = 1;
 		total_addr += info[idx].addr_words;
 		total_vector += info[idx].vector_words;
-		total_msg += info[idx].msg_words;
+		total_msg += mf_words;
 		capacity -= needed;
 		packed_count++;
 
@@ -2253,7 +2469,26 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	/* Pack tone-only messages — these need only addr words (no vector, no msg body).
 	 * Per spec Section 3.4.1, tone-only addresses sit at the end of the
 	 * address field, after the vector field start offset.  They don't
-	 * consume vector or message word slots. */
+	 * consume vector or message word slots.
+	 *
+	 * Per Spec Section 3.7.2 / Fig. 3.7.2-2:
+	 * "Tone-Only Addresses (without vectors) cannot be transmitted in
+	 * Frames used for transmitting System Messages."
+	 *
+	 * This restriction applies when the frame contains actual system
+	 * message content in the Message Field — i.e., when BIW101 has
+	 * A=0000~0011 (SysMsg for all/home/roaming/SSID pagers) with
+	 * vectors at the end of VF and body words in MF, or when an
+	 * Operator Messaging Address carries system message content
+	 * per Fig. 3.7.2-2(b)(c).
+	 *
+	 * A=0100 (timezone) only carries data in the I-field of the BIW
+	 * word itself — no vectors or MF content — so the restriction
+	 * does not apply to timezone-only frames.
+	 *
+	 * TODO: When system message TX via A=0000~0011 or Operator
+	 * Messaging is implemented, add enforcement here:
+	 *   if (has_sysmsg_content) skip tone-only packing. */
 	{
 		int tone_addr_words = 0;
 		for (i = 0; i < (uint32_t)n_tone; i++) {
@@ -2288,25 +2523,111 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	}
 
 	/* ---- Write BIW2/3/4 if enabled ---- */
+	/* Emit extra BIW words in priority order.  Receivers identify
+	 * each word by its type field, so order doesn't matter. */
+	{
+		int slots_left = biw_count - 1; /* extra slots available */
 
-	if (biw_count >= 2) {
-		frame_words[fwc++] = flex_create_biw2(
-			params->local_id,
-			params->coverage_id);
-	}
+		/* SSID1 (type 000) */
+		if (slots_left > 0 && (params->local_id || params->coverage_id)) {
+			frame_words[fwc++] = flex_create_biw2(
+				params->local_id,
+				params->coverage_id);
+			slots_left--;
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX: BIW SSID1 local_id=%u coverage=%u\n",
+			     params->local_id, params->coverage_id);
+		}
 
-	if (biw_count >= 4) {
-		/* Get current system time for BIW3/BIW4 */
-		time_t now = time(NULL);
-		struct tm tm_now;
-		gmtime_r(&now, &tm_now);
+		/* SSID2 (type 111) */
+		if (slots_left > 0 && (params->country_code || params->tmf)) {
+			const char *cname = flex_mcc_name(params->country_code);
+			frame_words[fwc++] = flex_create_biw_ssid2(
+				params->country_code,
+				params->tmf);
+			slots_left--;
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX: BIW SSID2 country=%u (%s) tmf=0x%X\n",
+			     params->country_code,
+			     cname ? cname : "unknown",
+			     params->tmf);
+		}
 
-		frame_words[fwc++] = flex_create_biw3(
-			(uint32_t)(tm_now.tm_mon + 1),
-			(uint32_t)tm_now.tm_mday);
-		frame_words[fwc++] = flex_create_biw4(
-			(uint32_t)tm_now.tm_hour,
-			(uint32_t)tm_now.tm_min);
+		/* Date + Time (types 001, 010) */
+		if (params->biw_time) {
+			time_t now = time(NULL);
+			struct tm tm_now;
+			gmtime_r(&now, &tm_now);
+
+			if (slots_left > 0) {
+				/* Year field: standard range 0-31 (1994-2025).
+				 * For years >2025, find a calendar-equivalent
+				 * year in range (same leap status + same Jan 1
+				 * weekday) so pagers display correct day-of-week
+				 * and Feb 29 behavior. */
+				int real_year = tm_now.tm_year + 1900;
+				int equiv = flex_biw_equiv_year(real_year);
+				uint32_t year_field = (uint32_t)(equiv - FLEX_BIW_DATE_YEAR_BASE);
+				frame_words[fwc++] = flex_create_biw3(
+					year_field,
+					(uint32_t)(tm_now.tm_mon + 1),
+					(uint32_t)tm_now.tm_mday);
+				slots_left--;
+				LOGP(DFLEX, LOGL_INFO,
+				     "TX: BIW DATE %04d-%02d-%02d (year field=%u%s)\n",
+				     real_year,
+				     tm_now.tm_mon + 1,
+				     tm_now.tm_mday,
+				     year_field,
+				     (equiv != real_year) ? " equiv" : "");
+			}
+			if (slots_left > 0) {
+				/* Convert seconds to 7.5s steps (0-7) */
+				uint32_t sec_step = (uint32_t)(tm_now.tm_sec / 7.5);
+				if (sec_step > 7) sec_step = 7;
+				frame_words[fwc++] = flex_create_biw4(
+					(uint32_t)tm_now.tm_hour,
+					(uint32_t)tm_now.tm_min,
+					sec_step);
+				slots_left--;
+				LOGP(DFLEX, LOGL_INFO,
+				     "TX: BIW TIME %02d:%02d:%04.1f\n",
+				     tm_now.tm_hour,
+				     tm_now.tm_min,
+				     sec_step * FLEX_BIW_TIME_SECOND_STEP);
+			}
+		}
+
+		/* SysInfo/timezone (type 101, A=0100) — only if slot available.
+		 *
+		 * Encodes timezone zone code in I4-I0 (Table 3.7.2-3).
+		 * L0 (DST) and S5-S3 (extended seconds) are left at zero.
+		 *
+		 * Example: --timezone 14 → zone=14 (UTC+0:00), I=0x00E.
+		 * Example: --timezone 24 → zone=24 (UTC+9:00, JST), I=0x018.
+		 *
+		 * This is a time instruction (A=0100), not a system message
+		 * with MF content (A=0000~0011).  The tone-only restriction
+		 * per Fig. 3.7.2-2 does not apply to time-only BIW words.
+		 *
+		 * Per Section 3.7.2: "The transmission of a System Message
+		 * by Block Information Word 101 must be one time per each
+		 * phase."  Satisfied: BIW is in block 0, shared across all
+		 * phases (Section 3.3). */
+		if (slots_left > 0 &&
+		    params->timezone_code >= 0 &&
+		    params->timezone_code < (int)FLEX_TZ_ENTRIES) {
+			int tz_min = flex_tz_to_minutes((uint32_t)params->timezone_code);
+			char tzbuf[20];
+			frame_words[fwc++] = flex_create_biw_sysinfo(
+				FLEX_BIW_SYSINFO_A_TIME,
+				(uint32_t)params->timezone_code & FLEX_BIW_SYSINFO_TZ_MASK);
+			slots_left--;
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX: BIW SYSINFO timezone zone=%d (%s)\n",
+			     params->timezone_code,
+			     flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
+		}
 	}
 
 	/* ---- Write address words ----
@@ -2333,29 +2654,111 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		}
 	}
 
-	/* ---- Write vector + message words for each packed non-tone message ---- */
-
-	/* msg_start tracks where the next message's body words begin.
-	 * It starts after BIW + address + vector words.
-	 * Tone-only messages have no vector or message words. */
+	/* ---- Write Vector Field and Message Field ----
+	 *
+	 * Per ARIB STD-43A Section 3.4.1 / Fig. 3.4.1-1, the frame has
+	 * contiguous regions after the Block Information:
+	 *   [BI][AF][VF][MF][IB]
+	 *
+	 * Per Section 3.4.1 / Fig. 3.4.1-2:
+	 *   (A) Short address: 1 addr word (Ax) → 1 vector word (Vx)
+	 *   (B) Long address:  2 addr words (Ax,Ay) → 2 vector words (Vx,Vy)
+	 *   (C) Tone-only: address only, no vector, no message
+	 *
+	 * Per Sections 3.9.1, 3.9.3, 3.9.4 — long address rule:
+	 *   "When a Long Address is used, a 2nd word is required for the
+	 *    vector, and the 1st word of the message is placed at the 2nd
+	 *    word of the vector."
+	 *
+	 * So for long addresses with body words:
+	 *   VF: [Vx][body[0]]   — Vy slot holds the first body word
+	 *   MF: [body[1]..body[n-1]]  — remaining n-1 body words
+	 *   Vector b field → MF start (body[1]) for multi-word messages
+	 *   Vector n field → total body word count (including body[0])
+	 *
+	 * For short addresses:
+	 *   VF: [Vx]
+	 *   MF: [body[0]..body[n-1]]  — all n body words
+	 *   Vector b field → MF start (body[0])
+	 *   Vector n field → total body word count
+	 *
+	 * Approach:
+	 *   1. Encode each message into a temp body buffer
+	 *   2. Build vector word with correct b field
+	 *   3. Write Vx to VF; if long, write body[0] to Vy slot in VF
+	 *   4. Write remaining body words to MF
+	 */
 	{
-		uint32_t msg_start_word = (uint32_t)(biw_count + total_addr
-						     + total_vector);
+		/* Temp buffer for encoded body words from each message */
+		uint32_t body_buf[FLEX_WORDS_PER_FRAME];
+		uint32_t body_count;  /* number of body words produced */
+
+		uint32_t vec_fwc;     /* write cursor in Vector Field */
+		uint32_t msg_fwc;     /* write cursor in Message Field */
+		uint32_t mf_start;    /* absolute word index where MF begins */
+
+		vec_fwc = (uint32_t)(biw_count + total_addr);
+		mf_start = (uint32_t)(biw_count + total_addr + total_vector);
+		msg_fwc = mf_start;
 
 		for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
 			int idx = order[i];
 			int enc_err = 0;
+			uint32_t vw = 0;
+			uint32_t body_fwc = 0; /* cursor into body_buf */
+			uint32_t msg_start_for_vec;
+			uint32_t j;
+
 			if (!info[idx].packed)
 				continue;
 
+			/* Compute the vector b field (message start word)
+			 * BEFORE calling the encoder, so the vector word is
+			 * created with the correct value.
+			 *
+			 * For short addresses: b = msg_fwc (MF cursor).
+			 * For long addresses with body: b = msg_fwc (MF start
+			 * for body[1..n-1]) per Sections 3.9.3/3.9.4.
+			 *
+			 * Exception — Section 3.9.1 (numeric), single-word
+			 * message with long address: b = Vy position.  We
+			 * handle this as a post-fixup since we don't know the
+			 * body count until after encoding.
+			 *
+			 * For most cases, msg_fwc is correct. */
+			/* Compute the vector b field (message start word)
+			 * BEFORE calling the encoder, so the vector word is
+			 * created with the correct value.
+			 *
+			 * Per Sections 3.9.3, 3.9.4 (hex, alpha):
+			 *   b = MF start for this message (always).
+			 * Per Section 3.9.1 (numeric):
+			 *   b = Vy position if single-word message and long,
+			 *   b = MF start otherwise.
+			 *
+			 * For short addresses or no body: b = msg_fwc.
+			 * For long addresses: b = msg_fwc (body[1] in MF).
+			 * Special: numeric, 1 body word, long → b = Vy pos. */
+			if (info[idx].is_long && info[idx].msg_words == 1 &&
+			    msgs[idx].msg_type == FLEX_FRAME_MSG_TYPE_NUMERIC) {
+				/* Section 3.9.1: "the word number at the top
+				 * of the message, indicated by the vector is
+				 * the word number of the 2nd word of the
+				 * vector if the message consists of one word" */
+				msg_start_for_vec = vec_fwc + 1; /* Vy position */
+			} else {
+				msg_start_for_vec = msg_fwc;
+			}
+
+			/* Encode message body into temp buffer.
+			 * Each encoder writes body words to body_buf starting
+			 * at body_fwc=0 and returns the vector word. */
 			switch (msgs[idx].msg_type) {
 			case FLEX_FRAME_MSG_TYPE_ALPHA:
 				if (msgs[idx].charset == 1) {
-					encode_kanji_message(frame_words,
+					vw = encode_kanji_message(body_buf,
 						msgs[idx].message,
-						msg_start_word,
-						&fwc,
-						info[idx].is_long,
+						msg_start_for_vec, &body_fwc,
 						&enc_err);
 				} else {
 					struct flex_msg_config acfg;
@@ -2363,29 +2766,20 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 					acfg.fragment_index = msgs[idx].fragment_index;
 					acfg.total_fragments = msgs[idx].total_fragments;
 					acfg.mail_drop = msgs[idx].mail_drop;
-					encode_alpha_message(frame_words,
+					vw = encode_alpha_message(body_buf,
 						msgs[idx].message,
-						msg_start_word,
-						&fwc,
-						info[idx].is_long,
+						msg_start_for_vec, &body_fwc,
 						msgs[idx].sequence_num,
 						&acfg);
 				}
 				break;
 
 			case FLEX_FRAME_MSG_TYPE_NUMERIC:
-				encode_numeric_message(frame_words,
+				vw = encode_numeric_message(body_buf,
 					msgs[idx].message,
-					msg_start_word,
-					&fwc,
-					info[idx].is_long,
+					msg_start_for_vec, &body_fwc,
 					NULL);
 				break;
-
-			/* FLEX_FRAME_MSG_TYPE_TONE: handled separately —
-			 * tone-only addresses are written at the end of the
-			 * address field with no vector or message words
-			 * (Section 3.4.1 / Fig. 3.4.1-2(C)). */
 
 			case FLEX_FRAME_MSG_TYPE_HEX: {
 				struct flex_msg_config hcfg;
@@ -2394,11 +2788,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				hcfg.total_fragments = msgs[idx].total_fragments;
 				hcfg.blocking_length = msgs[idx].blocking_length;
 				hcfg.mail_drop = msgs[idx].mail_drop;
-				encode_hex_message(frame_words,
+				vw = encode_hex_message(body_buf,
 					msgs[idx].message,
-					msg_start_word,
-					&fwc,
-					info[idx].is_long,
+					msg_start_for_vec, &body_fwc,
 					msgs[idx].sequence_num,
 					&hcfg,
 					&enc_err);
@@ -2406,22 +2798,14 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			}
 
 			case FLEX_FRAME_MSG_TYPE_INSTRUCTION:
-				encode_instruction_message(frame_words,
+				vw = encode_instruction_message(
 					msgs[idx].message,
-					msg_start_word,
-					&fwc,
-					info[idx].is_long,
 					&enc_err);
 				break;
 
 			case FLEX_FRAME_MSG_TYPE_SHORT:
-				/*
-				 * Short message: tone/short-message vector (type 010)
-				 * with message index encoded. Produces 1 vector word,
-				 * 0 body words.
-				 *
-				 * Validate index range 0-127.
-				 */
+				/* Short message vector (Section 3.9.2):
+				 * all data in the vector word, no body. */
 				{
 					int sidx = msgs[idx].short_msg_idx;
 					if (sidx < 0 || sidx > 127) {
@@ -2429,10 +2813,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 					} else {
 						uint32_t dw = 0;
 						dw |= (FLEX_VECTOR_TYPE_TONE & 0x07) << 4;
-						/* t1t0 = 00 for short message sub-type */
 						dw |= ((uint32_t)sidx & 0x7F) << 9;
 						dw = flex_word_checksum(dw);
-						frame_words[fwc++] = flex_encode_word(
+						vw = flex_encode_word(
 							reverse_bits32(dw));
 					}
 				}
@@ -2443,15 +2826,45 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				break;
 			}
 
-			/* Advance msg_start_word past this message's body words */
-			msg_start_word += (uint32_t)info[idx].msg_words;
-
 			if (enc_err && !*error)
 				*error = enc_err;
+
+			body_count = body_fwc;
+
+			/* Write Vx to Vector Field */
+			if (vec_fwc < FLEX_WORDS_PER_FRAME)
+				frame_words[vec_fwc++] = vw;
+
+			/* For long addresses: write Vy = body[0] to VF
+			 * (Section 3.9.1/3.9.3/3.9.4: "the 1st word of the
+			 * message is placed at the 2nd word of the vector") */
+			if (info[idx].is_long) {
+				if (body_count > 0 && vec_fwc < FLEX_WORDS_PER_FRAME)
+					frame_words[vec_fwc++] = body_buf[0];
+				else if (vec_fwc < FLEX_WORDS_PER_FRAME)
+					frame_words[vec_fwc++] = vw; /* no body: Vy = Vx */
+			}
+
+			/* Write remaining body words to Message Field.
+			 * For long addresses: body[1..n-1] (body[0] is in Vy).
+			 * For short addresses: body[0..n-1] (all in MF). */
+			{
+				uint32_t start = info[idx].is_long ? 1 : 0;
+				for (j = start; j < body_count; j++) {
+					if (msg_fwc < FLEX_WORDS_PER_FRAME)
+						frame_words[msg_fwc++] = body_buf[j];
+				}
+			}
 		}
+
+		/* Advance fwc past all written data */
+		fwc = msg_fwc;
 	}
 
-	/* ---- Fill remaining words with alternating idle pattern ---- */
+	/* ---- Fill remaining words with idle pattern (Fig. 3.4.1-3) ----
+	 * Unused word slots after message data get alternating 1s/0s.
+	 * If no messages were packed, this fills everything after BIW,
+	 * producing a minimal frame (block 0 = BI + IB only). */
 
 	for (; fwc < FLEX_WORDS_PER_FRAME; fwc++)
 		frame_words[fwc] = (fwc % 2 == 0) ? FLEX_IDLE_WORD_1
@@ -2864,8 +3277,8 @@ size_t flex_encode_sync(const flex_frame_params_t *params,
  *   N varies per speed — see flex_encode_s2() for details.
  *
  * For multi-phase speeds (3200/6400), the message is encoded into
- * phase 0 and remaining phases are filled with idle frames. Phase
- * data is then interleaved into the output:
+ * phase 0 and remaining phases are filled with idle (Fig. 3.4.1-3).
+ * Phase data is then interleaved into the output:
  *   3200/2FSK (2 phases): BIT-level — A_bit, C_bit, A_bit, C_bit, ...
  *   3200/4FSK (2 phases): dibit-packed — each symbol = (A_bit, C_bit)
  *   6400/4FSK (4 phases): dibit-level — (A,B), (C,D) alternating
@@ -2979,7 +3392,7 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 			phases[target_phase].word_count = FLEX_WORDS_PER_FRAME;
 		}
 
-		/* Fill remaining phases with proper idle pattern (Section 3.4.1).
+		/* Fill remaining phases with idle pattern (Fig. 3.4.1-3).
 		 * For 4FSK, LSB phases get all-zeros; MSB phases alternate.
 		 * Idle words must be block-interleaved just like message data,
 		 * because the phase interleaver operates on interleaved words
@@ -3038,12 +3451,14 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
  *   msg          — UTF-16 character data as raw bytes (2 bytes per char)
  *   msg_start    — word index where message body starts
  *   fwc_p        — pointer to frame word counter (updated on return)
- *   is_long      — 1 if long capcode (affects vector word encoding)
  *   error        — set to negative error code on failure
+ *
+ * Returns the encoded vector word.  Only body words are written to
+ * frame_words starting at *fwc_p.
  */
-static void encode_kanji_message(uint32_t *frame_words, const char *msg,
+static uint32_t encode_kanji_message(uint32_t *frame_words, const char *msg,
 				 uint32_t msg_start, uint32_t *fwc_p,
-				 int is_long, int *error)
+				 int *error)
 {
 	uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
 	uint32_t word_idx, fwc;
@@ -3054,7 +3469,7 @@ static void encode_kanji_message(uint32_t *frame_words, const char *msg,
 	if (!msg || !fwc_p) {
 		if (error)
 			*error = -FLEX_ERR_INVALID_MESSAGE;
-		return;
+		return 0;
 	}
 
 	/*
@@ -3067,7 +3482,7 @@ static void encode_kanji_message(uint32_t *frame_words, const char *msg,
 	if (num_chars == 0) {
 		if (error)
 			*error = -FLEX_ERR_INVALID_MESSAGE;
-		return;
+		return 0;
 	}
 
 	/* Max chars: frame capacity minus header word, 1 char per word */
@@ -3095,16 +3510,14 @@ static void encode_kanji_message(uint32_t *frame_words, const char *msg,
 	}
 	msg_word[0] |= (~k_bit) & 0x3FF;
 
-	/* Write vector word and encoded message words to frame */
+	/* Write encoded body words to frame (vector word returned to caller) */
 	fwc = *fwc_p;
-	frame_words[fwc++] = create_alpha_vector(msg_start + is_long, word_idx);
 	for (i = 0; i < word_idx; i++)
 		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_word[i]));
 	*fwc_p = fwc;
+
+	return create_alpha_vector(msg_start, word_idx);
 }
-
-
-/* ===== POCSAG Idle Batch Generation ===== */
 
 /*
  * POCSAG protocol constants for idle batch generation.

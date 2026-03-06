@@ -85,4 +85,18 @@ int flex_scheduler_parse_pocsag_slots(struct flex *flex, const char *spec);
  * Returns 1 if POCSAG, 0 if FLEX. */
 int flex_scheduler_is_pocsag_slot(struct flex *flex, uint32_t frame);
 
+/* Compute repeat interval for multiple transmission (Spec Section 3.4.2).
+ * repeat_interval = 2^m frames, where m = td_collapse if set, else system collapse. */
+uint32_t flex_scheduler_repeat_interval(int collapse, int td_collapse);
+
+/* Compute repeat unit for multiple transmission (Spec Section 3.4.2, Fig. 3.4.2-3).
+ * repeat_unit = num_transmissions × repeat_interval frames. */
+uint32_t flex_scheduler_repeat_unit(int num_transmissions, int collapse, int td_collapse);
+
+/* Determine which subframe index (0..num_transmissions-1) to transmit
+ * for the current frame number, given the repeat interval.
+ * Returns the subframe index, or 0 if num_transmissions <= 1. */
+int flex_scheduler_subframe_index(uint32_t frame, int num_transmissions,
+				  int collapse, int td_collapse);
+
 #endif /* FLEX_SCHEDULER_H */
