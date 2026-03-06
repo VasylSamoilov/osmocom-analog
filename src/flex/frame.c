@@ -1335,7 +1335,7 @@ static void encode_hex_message(uint32_t *frame_words, const char *msg,
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_HEX];
 	uint32_t fwc;
 	size_t len, i;
-	int word_idx, hex_idx, data_idx;
+	int word_idx, nibble_idx, data_idx;
 	int frag_idx = 0, frag_total = 0;
 	int is_initial_frag;
 	uint32_t f_val, k_sum;
