@@ -289,15 +289,10 @@ typedef struct flex {
 		/* Data state */
 		int		data_count;		/* data symbol counter */
 
-		/* Per-phase data buffers (88 words each) */
-		uint32_t	phase_a[FLEX_WORDS_PER_FRAME];
-		uint32_t	phase_b[FLEX_WORDS_PER_FRAME];
-		uint32_t	phase_c[FLEX_WORDS_PER_FRAME];
-		uint32_t	phase_d[FLEX_WORDS_PER_FRAME];
-		int		phase_a_idle;
-		int		phase_b_idle;
-		int		phase_c_idle;
-		int		phase_d_idle;
+		/* Per-phase channel data (Spec Section 3.3.3).
+		 * Each phase is an independent channel with 88 words
+		 * and per-word BCH status. */
+		flex_phase_data_t phase[FLEX_MAX_PHASES];
 		int		phase_toggle;		/* alternates 0/1 at 3200 baud */
 		int		data_bit_counter;	/* de-interleave index counter */
 	} rx;

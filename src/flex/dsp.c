@@ -1179,35 +1179,43 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 /* Decode one phase of a received frame.
  * De-interleave blocks, BCH decode, parse BIW/addresses/vectors/messages.
  * phaseptr points to 88 words of raw interleaved data. */
-static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_name)
+static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase_name)
 {
-	int32_t decoded[FLEX_WORDS_PER_FRAME];
 	int i;
 	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
+
+	/* Store reception context in the phase struct */
+	ph->rx_phase = phase_name - 'A';	/* 'A'→0, 'B'→1, 'C'→2, 'D'→3 */
+	ph->rx_cycle = flex->rx.fiw_cycle;
+	ph->rx_frame = flex->rx.fiw_frame;
+	ph->rx_baud = flex->rx.sync_baud;
+	ph->rx_levels = flex->rx.sync_levels;
+	ph->rx_polarity = flex->rx.polarity;
 
 	LOGP_CHAN(DDSP, LOGL_INFO, "RX: Decoding phase %c (C%u/F%u, %dbps/%dFSK, %d baud).\n",
 		  phase_name, flex->rx.fiw_cycle, flex->rx.fiw_frame,
 		  bitrate, flex->rx.sync_levels, flex->rx.sync_baud);
 
-	/* No separate de-interleave step needed here.
-	 * The idx formula in flex_rx_read_data() already de-interleaves
-	 * bits into the correct word positions during accumulation
-	 * (same approach as multimon-ng read_data).
+	/* BCH(31,21) decode each word (Spec Section 3.3.3).
+	 * "BCH (31, 21) codes and even parity can be detected and processed
+	 * by the 2-bit error correction algorithm.  The error condition is
+	 * checked for each word and the information bits are extracted."
 	 *
-	 * Each word has: bits 0-20 = data, bits 21-30 = ECC, bit 31 = parity.
-	 * BCH decode strips parity and returns 21-bit data.
-	 * We preserve raw word and status for per-word reporting. */
-	int bch_status[FLEX_WORDS_PER_FRAME];
+	 * On success: ph->words[i] = 21-bit info, ph->status[i] = CLEAN/CORRECTED.
+	 * On failure: ph->words[i] = raw 32-bit codeword, ph->status[i] = UNCORRECTABLE. */
 	uint32_t raw_words[FLEX_WORDS_PER_FRAME];
 
 	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
-		raw_words[i] = phaseptr[i];
-		int32_t result = flex_bch_decode(flex, phaseptr[i], &bch_status[i], NULL);
+		int bch_status;
+
+		raw_words[i] = ph->words[i];
+		int32_t result = flex_bch_decode(flex, ph->words[i], &bch_status, NULL);
 		if (result < 0) {
-			decoded[i] = -1;
+			ph->status[i] = FLEX_WORD_UNCORRECTABLE;
 		} else {
-			decoded[i] = result;
-			phaseptr[i] = (uint32_t)result;
+			ph->words[i] = (uint32_t)result;
+			ph->status[i] = (bch_status == 0) ? FLEX_WORD_CLEAN
+							   : FLEX_WORD_CORRECTED;
 		}
 	}
 
@@ -1215,9 +1223,9 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 	{
 		int ok = 0, fixed = 0, fail = 0;
 		for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
-			if (bch_status[i] == 0)
+			if (ph->status[i] == FLEX_WORD_CLEAN)
 				ok++;
-			else if (bch_status[i] == 1)
+			else if (ph->status[i] == FLEX_WORD_CORRECTED)
 				fixed++;
 			else
 				fail++;
@@ -1227,13 +1235,13 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 			  phase_name, ok, FLEX_WORDS_PER_FRAME, fixed, fail);
 
 		for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
-			if (bch_status[i] == 1) {
+			if (ph->status[i] == FLEX_WORD_CORRECTED) {
 				LOGP_CHAN(DDSP, LOGL_INFO,
 					  "RX: Phase %c word %2d BCH corrected "
 					  "(raw=0x%08X → data=0x%05X).\n",
 					  phase_name, i, raw_words[i],
-					  (unsigned int)decoded[i]);
-			} else if (bch_status[i] == -1) {
+					  ph->words[i]);
+			} else if (ph->status[i] == FLEX_WORD_UNCORRECTABLE) {
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "RX: Phase %c word %2d BCH uncorrectable "
 					  "(raw=0x%08X).\n",
@@ -1243,14 +1251,15 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 	}
 
 	/* BIW1 (word 0) */
-	if (decoded[0] < 0) {
+	if (ph->status[0] == FLEX_WORD_UNCORRECTABLE ||
+	    ph->status[0] == FLEX_WORD_NOT_RECEIVED) {
 		LOGP_CHAN(DDSP, LOGL_NOTICE,
 			  "RX: Phase %c BIW1 uncorrectable, skipping.\n", phase_name);
 		return;
 	}
 
 	{
-		uint32_t biw = phaseptr[0];
+		uint32_t biw = ph->words[0];
 
 		/* Nothing to decode if BIW is idle */
 		if (biw == 0 || biw == 0x001FFFFF) {
@@ -1286,7 +1295,10 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 
 			if (j >= FLEX_WORDS_PER_FRAME) break;
 
-			if (decoded[i] < 0 || decoded[j] < 0) {
+			if (ph->status[i] == FLEX_WORD_UNCORRECTABLE ||
+			    ph->status[i] == FLEX_WORD_NOT_RECEIVED ||
+			    ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
+			    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
 					  "RX: Phase %c addr[%d] or vec[%d] uncorrectable.\n",
 					  phase_name, i, j);
@@ -1295,7 +1307,7 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 
 			/* Address decode (per multimon-ng parse_capcode) */
 			{
-				uint32_t aw = phaseptr[i];
+				uint32_t aw = ph->words[i];
 				is_long = (aw < 0x008001U) ||
 					  (aw > 0x1E0000U) ||
 					  (aw > 0x1E7FFEU);
@@ -1304,7 +1316,7 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 
 			/* Vector decode */
 			{
-				uint32_t viw = phaseptr[j];
+				uint32_t viw = ph->words[j];
 				vec_type = (viw >> 4) & 0x7;
 				mw1 = (viw >> 7) & 0x7F;
 				len = (viw >> 14) & 0x7F;
@@ -1334,8 +1346,9 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 				int hdr_k = 0, hdr_c = 0, hdr_f = 0;
 				int hdr_n = 0, hdr_r = 0, hdr_m = 0;
 				char frag_flag = '?';
-				if (decoded[mw1] >= 0) {
-					uint32_t hdr = phaseptr[mw1];
+				if (ph->status[mw1] == FLEX_WORD_CLEAN ||
+				    ph->status[mw1] == FLEX_WORD_CORRECTED) {
+					uint32_t hdr = ph->words[mw1];
 					hdr_k = hdr & FLEX_ALPHA_HDR_K_MASK;
 					hdr_c = (hdr & FLEX_ALPHA_HDR_C_MASK) >> FLEX_ALPHA_HDR_C_SHIFT;
 					hdr_f = (hdr & FLEX_ALPHA_HDR_F_MASK) >> FLEX_ALPHA_HDR_F_SHIFT;
@@ -1382,8 +1395,10 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 						uint32_t dw;
 						unsigned char ch;
 
-						if (decoded[w] < 0) continue;
-						dw = phaseptr[w];
+						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+							continue;
+						dw = ph->words[w];
 
 						/* First slot: signature on initial
 						 * fragment, character otherwise */
@@ -1467,14 +1482,13 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 /* Clear all phase data buffers before reading a new frame. */
 static void flex_rx_clear_phase_data(flex_t *flex)
 {
-	memset(flex->rx.phase_a, 0, sizeof(flex->rx.phase_a));
-	memset(flex->rx.phase_b, 0, sizeof(flex->rx.phase_b));
-	memset(flex->rx.phase_c, 0, sizeof(flex->rx.phase_c));
-	memset(flex->rx.phase_d, 0, sizeof(flex->rx.phase_d));
-	flex->rx.phase_a_idle = 0;
-	flex->rx.phase_b_idle = 0;
-	flex->rx.phase_c_idle = 0;
-	flex->rx.phase_d_idle = 0;
+	int i;
+
+	for (i = 0; i < FLEX_MAX_PHASES; i++) {
+		memset(&flex->rx.phase[i], 0, sizeof(flex->rx.phase[i]));
+		/* status[] is zeroed by memset — FLEX_WORD_NOT_RECEIVED == 0 */
+		flex->rx.phase[i].rx_phase = -1;	/* not received */
+	}
 	flex->rx.phase_toggle = 0;
 	flex->rx.data_bit_counter = 0;
 }
@@ -1499,16 +1513,16 @@ static void flex_rx_decode_data(flex_t *flex)
 		/* Try standard FLEX phase decode — ReFLEX shares the same
 		 * physical layer as A4 (6400/4FSK, 4 phases) so BCH and
 		 * address/vector parsing may partially succeed. */
-		flex_rx_decode_phase(flex, flex->rx.phase_a, 'A');
-		flex_rx_decode_phase(flex, flex->rx.phase_b, 'B');
-		flex_rx_decode_phase(flex, flex->rx.phase_c, 'C');
-		flex_rx_decode_phase(flex, flex->rx.phase_d, 'D');
+		flex_rx_decode_phase(flex, &flex->rx.phase[0], 'A');
+		flex_rx_decode_phase(flex, &flex->rx.phase[1], 'B');
+		flex_rx_decode_phase(flex, &flex->rx.phase[2], 'C');
+		flex_rx_decode_phase(flex, &flex->rx.phase[3], 'D');
 
 		/* Hex dump: per-phase, then full frame as contiguous block */
 		{
 			uint32_t *pptrs[4] = {
-				flex->rx.phase_a, flex->rx.phase_b,
-				flex->rx.phase_c, flex->rx.phase_d,
+				flex->rx.phase[0].words, flex->rx.phase[1].words,
+				flex->rx.phase[2].words, flex->rx.phase[3].words,
 			};
 			static const char pnames[4] = { 'A', 'B', 'C', 'D' };
 			/* 4 phases × 88 words, 9 chars per word ("XXXXXXXX ") */
@@ -1559,20 +1573,20 @@ static void flex_rx_decode_data(flex_t *flex)
 	 *     (alternating dibit pairs: even sym MSB=A/LSB=B, odd sym MSB=C/LSB=D) */
 	if (flex->rx.sync_baud == 1600) {
 		if (flex->rx.sync_levels == 2) {
-			flex_rx_decode_phase(flex, flex->rx.phase_a, 'A');
+			flex_rx_decode_phase(flex, &flex->rx.phase[0], 'A');
 		} else {
-			flex_rx_decode_phase(flex, flex->rx.phase_a, 'A');
-			flex_rx_decode_phase(flex, flex->rx.phase_b, 'B');
+			flex_rx_decode_phase(flex, &flex->rx.phase[0], 'A');
+			flex_rx_decode_phase(flex, &flex->rx.phase[1], 'B');
 		}
 	} else {
 		if (flex->rx.sync_levels == 2) {
-			flex_rx_decode_phase(flex, flex->rx.phase_a, 'A');
-			flex_rx_decode_phase(flex, flex->rx.phase_c, 'C');
+			flex_rx_decode_phase(flex, &flex->rx.phase[0], 'A');
+			flex_rx_decode_phase(flex, &flex->rx.phase[2], 'C');
 		} else {
-			flex_rx_decode_phase(flex, flex->rx.phase_a, 'A');
-			flex_rx_decode_phase(flex, flex->rx.phase_b, 'B');
-			flex_rx_decode_phase(flex, flex->rx.phase_c, 'C');
-			flex_rx_decode_phase(flex, flex->rx.phase_d, 'D');
+			flex_rx_decode_phase(flex, &flex->rx.phase[0], 'A');
+			flex_rx_decode_phase(flex, &flex->rx.phase[1], 'B');
+			flex_rx_decode_phase(flex, &flex->rx.phase[2], 'C');
+			flex_rx_decode_phase(flex, &flex->rx.phase[3], 'D');
 		}
 	}
 
@@ -1639,35 +1653,35 @@ static void flex_rx_read_data(flex_t *flex, unsigned char sym)
 	}
 
 	if (flex->rx.phase_toggle == 0) {
-		flex->rx.phase_a[idx] = (flex->rx.phase_a[idx] >> 1) |
-					(bit_a ? 0x80000000U : 0);
-		flex->rx.phase_b[idx] = (flex->rx.phase_b[idx] >> 1) |
-					(bit_b ? 0x80000000U : 0);
+		flex->rx.phase[0].words[idx] = (flex->rx.phase[0].words[idx] >> 1) |
+					       (bit_a ? 0x80000000U : 0);
+		flex->rx.phase[1].words[idx] = (flex->rx.phase[1].words[idx] >> 1) |
+					       (bit_b ? 0x80000000U : 0);
 		flex->rx.phase_toggle = 1;
 
 		/* Track idle words for early termination */
 		if ((flex->rx.data_bit_counter & 0xFF) == 0xFF) {
-			if (flex->rx.phase_a[idx] == 0x00000000 ||
-			    flex->rx.phase_a[idx] == 0xFFFFFFFF)
-				flex->rx.phase_a_idle++;
-			if (flex->rx.phase_b[idx] == 0x00000000 ||
-			    flex->rx.phase_b[idx] == 0xFFFFFFFF)
-				flex->rx.phase_b_idle++;
+			if (flex->rx.phase[0].words[idx] == 0x00000000 ||
+			    flex->rx.phase[0].words[idx] == 0xFFFFFFFF)
+				flex->rx.phase[0].idle_count++;
+			if (flex->rx.phase[1].words[idx] == 0x00000000 ||
+			    flex->rx.phase[1].words[idx] == 0xFFFFFFFF)
+				flex->rx.phase[1].idle_count++;
 		}
 	} else {
-		flex->rx.phase_c[idx] = (flex->rx.phase_c[idx] >> 1) |
-					(bit_a ? 0x80000000U : 0);
-		flex->rx.phase_d[idx] = (flex->rx.phase_d[idx] >> 1) |
-					(bit_b ? 0x80000000U : 0);
+		flex->rx.phase[2].words[idx] = (flex->rx.phase[2].words[idx] >> 1) |
+					       (bit_a ? 0x80000000U : 0);
+		flex->rx.phase[3].words[idx] = (flex->rx.phase[3].words[idx] >> 1) |
+					       (bit_b ? 0x80000000U : 0);
 		flex->rx.phase_toggle = 0;
 
 		if ((flex->rx.data_bit_counter & 0xFF) == 0xFF) {
-			if (flex->rx.phase_c[idx] == 0x00000000 ||
-			    flex->rx.phase_c[idx] == 0xFFFFFFFF)
-				flex->rx.phase_c_idle++;
-			if (flex->rx.phase_d[idx] == 0x00000000 ||
-			    flex->rx.phase_d[idx] == 0xFFFFFFFF)
-				flex->rx.phase_d_idle++;
+			if (flex->rx.phase[2].words[idx] == 0x00000000 ||
+			    flex->rx.phase[2].words[idx] == 0xFFFFFFFF)
+				flex->rx.phase[2].idle_count++;
+			if (flex->rx.phase[3].words[idx] == 0x00000000 ||
+			    flex->rx.phase[3].words[idx] == 0xFFFFFFFF)
+				flex->rx.phase[3].idle_count++;
 		}
 	}
 

@@ -29,6 +29,22 @@
 #define FLEX_BCH_PARITY_BITS	1
 #define FLEX_CODEWORD_BITS	(FLEX_BCH_DATA_BITS + FLEX_BCH_ECC_BITS + FLEX_BCH_PARITY_BITS)
 
+/* ===== Per-Word BCH Status (Spec Section 3.3.3) =====
+ *
+ * Each word in a received block goes through BCH(31,21) error correction
+ * and even parity check.  The result is one of four states:
+ *   NOT_RECEIVED — default; word was never populated (phase not active)
+ *   CLEAN        — syndrome=0, parity OK; no errors detected
+ *   CORRECTED    — 1-2 bit errors corrected by BCH
+ *   UNCORRECTABLE — >2 bit errors; BCH failed, word is unusable
+ */
+enum flex_word_status {
+	FLEX_WORD_NOT_RECEIVED = 0,	/* default state */
+	FLEX_WORD_CLEAN,		/* no errors */
+	FLEX_WORD_CORRECTED,		/* BCH corrected 1-2 bit errors */
+	FLEX_WORD_UNCORRECTABLE,	/* BCH failed, data invalid */
+};
+
 /* ===== Frame Structure (Spec Section 3.3) ===== */
 
 #define FLEX_BASE_BAUD		1600	/* S1/FIW symbol rate: always 1600 baud */
@@ -363,11 +379,29 @@ typedef struct flex_frame_params {
 /* Maximum phases: 2 at 3200 bps (2FSK or 4FSK), 4 at 6400 bps */
 #define FLEX_MAX_PHASES		4
 
-/* Phase data for multi-phase frames.
- * Each phase carries an independent set of up to 88 data words. */
+/* Per-phase channel data (Spec Sections 3.3.3, 3.3.4).
+ *
+ * Each phase is an independent channel carrying 88 words (11 blocks × 8).
+ * After reception, each word goes through BCH(31,21) error correction
+ * and even parity check.  The result is stored per word:
+ *   words[i]  — 21-bit info on success, raw 32-bit codeword on failure
+ *   status[i] — BCH decode outcome for this word
+ *
+ * RX reception context records the conditions under which this phase
+ * was received, per Section 3.3.4 (phase assignment). */
 typedef struct flex_phase_data {
-	uint32_t	words[FLEX_WORDS_PER_FRAME];	/* 88 words per phase */
-	int		word_count;			/* actual words used */
+	uint32_t		words[FLEX_WORDS_PER_FRAME];
+	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];
+	int			word_count;	/* TX: actual words used */
+	int			idle_count;	/* RX: idle word counter */
+
+	/* RX reception context (set once before BCH decode) */
+	int			rx_phase;	/* 0=A, 1=B, 2=C, 3=D; -1=not received */
+	uint32_t		rx_cycle;	/* FIW cycle number (0-14) */
+	uint32_t		rx_frame;	/* FIW frame number (0-127) */
+	int			rx_baud;	/* symbol rate (1600 or 3200) */
+	int			rx_levels;	/* 2=2FSK, 4=4FSK */
+	int			rx_polarity;	/* 0=normal, 1=inverted */
 } flex_phase_data_t;
 
 /* ===== Public API ===== */
