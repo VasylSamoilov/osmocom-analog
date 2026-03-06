@@ -26,11 +26,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "../liblogging/logging.h"
 #include "frame.h"
 
 /* Optional per-message configuration (for mail drop flag support). */
 struct flex_msg_config {
-	uint8_t mail_drop;  /* 0 or 1 */
+	uint8_t mail_drop;	/* 0 or 1 */
+	int	fragment_index;	/* 0-based fragment index */
+	int	total_fragments;/* total count (0 = not fragmented) */
+	int	blocking_length;/* HEX/Binary B field: bits/char (1-15, 0=16) */
 };
 
 /*
@@ -514,15 +518,8 @@ static int is_valid_numeric_char(char c)
 	       c == FLEX_NUM_BCD_SPARE_CHAR;
 }
 
-static int is_valid_numeric_message(const char *msg)
-{
-	while (*msg) {
-		if (!is_valid_numeric_char(*msg))
-			return 0;
-		msg++;
-	}
-	return 1;
-}
+/* is_valid_numeric_message() removed — dead code, never called.
+ * Validation is done inline at the call site. */
 
 /* ===== Message Encoding (Spec Reference Document A, Section 3.8.8) ===== */
 
@@ -549,8 +546,30 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 	max_len = (len > FLEX_MAX_CHARS_ALPHA) ? FLEX_MAX_CHARS_ALPHA : len;
 
 	/* First message word (header) — see frame.h for bit layout.
-	 * K checksum is computed last after all other fields are set. */
-	msg_word[0] = FLEX_ALPHA_FRAG_INITIAL;  /* F=11 in bits 11-12 */
+	 * K checksum is computed last after all other fields are set.
+	 *
+	 * Fragment flags (Spec Section 3.10.1.3):
+	 *   F = fragment number (modulo 3 sequence: 11, 00, 01, 10, ...)
+	 *   C = message continued (1 = more fragments follow, 0 = last/only)
+	 */
+	{
+		int frag_idx = 0, frag_total = 0;
+		uint32_t f_val;
+		int c_val;
+
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			frag_idx = cfg->fragment_index;
+			frag_total = cfg->total_fragments;
+		}
+
+		f_val = flex_fragment_number(frag_idx);
+		c_val = (frag_total > 1 && frag_idx < frag_total - 1) ? 1 : 0;
+
+		msg_word[0] = (f_val << FLEX_ALPHA_HDR_F_SHIFT);
+		if (c_val)
+			msg_word[0] |= FLEX_ALPHA_HDR_C_MASK;
+	}
 
 	/* Message number N and retrieval flag R */
 	if (sequence_num >= 0) {
@@ -567,43 +586,87 @@ static void encode_alpha_message(uint32_t *frame_words, const char *msg,
 	}
 
 	/* Pack 7-bit ASCII characters, 3 per word.
-	 * First data word: bits 0-6 reserved for signature S,
-	 * characters start at bit 7. */
-	i = 0;
-	shift = FLEX_ALPHA_CHAR2_SHIFT;  /* skip signature slot */
-	word_idx = 1;
+	 *
+	 * Initial fragment (F=11): first data word has signature in
+	 * bits 0-6, characters start at bit 7 (2 chars per word 1).
+	 * Continuation fragments (F≠11): no signature field, all
+	 * three 7-bit slots are characters starting at bit 0.
+	 * Per spec §3.10.1.3: "Fields R through S are only
+	 * transmitted in the first fragment." */
+	{
+		int is_initial_frag;
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			is_initial_frag = (cfg->total_fragments <= 1 ||
+					   cfg->fragment_index == 0);
+		} else {
+			is_initial_frag = 1;
+		}
 
-	while (i < max_len) {
-		msg_word[word_idx] |= ((uint32_t)msg[i++] & FLEX_ALPHA_CHAR_MASK) << shift;
-		shift += FLEX_ALPHA_CHAR_BITS;
-		if (shift == FLEX_BCH_DATA_BITS) {
-			if (++word_idx >= FLEX_MAX_MSG_WORDS_ALPHA)
-				break;
-			shift = 0;
+		i = 0;
+		if (is_initial_frag) {
+			shift = FLEX_ALPHA_CHAR2_SHIFT; /* skip signature slot */
+		} else {
+			shift = 0; /* no signature — start at bit 0 */
+		}
+		word_idx = 1;
+
+		while (i < max_len) {
+			msg_word[word_idx] |= ((uint32_t)msg[i++] & FLEX_ALPHA_CHAR_MASK) << shift;
+			shift += FLEX_ALPHA_CHAR_BITS;
+			if (shift == FLEX_BCH_DATA_BITS) {
+				if (++word_idx >= FLEX_MAX_MSG_WORDS_ALPHA)
+					break;
+				shift = 0;
+			}
+		}
+
+		/* Pad unused character slots with ETX per spec */
+		if (is_initial_frag) {
+			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == 0 && word_idx > 1) {
+				/* word boundary — no padding needed */
+			}
+		} else {
+			/* Continuation: 3 chars per word, pad remaining slots */
+			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == FLEX_ALPHA_CHAR1_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR1_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == 0 && word_idx > 1) {
+				/* word boundary — no padding needed */
+			}
+		}
+
+		/* S: 7-bit message signature (ARIB STD-43A Section 3.8.8.3).
+		 * Only present on initial fragment (F=11).
+		 * 1's complement of binary sum of all message characters taken
+		 * 7 bits at a time, starting from the first character directly
+		 * following the signature field. */
+		if (is_initial_frag) {
+			sig_sum = 0;
+			for (i = 1; i < word_idx; i++) {
+				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+			}
+			msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 		}
 	}
-
-	/* Pad unused character slots with ETX per spec */
-	if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
-		msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
-				      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-		word_idx++;
-	} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
-		msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-		word_idx++;
-	}
-
-	/* S: 7-bit message signature (ARIB STD-43A Section 3.8.8.3).
-	 * 1's complement of binary sum of all message characters taken
-	 * 7 bits at a time, starting from the first character directly
-	 * following the signature field. */
-	sig_sum = 0;
-	for (i = 1; i < word_idx; i++) {
-		sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-		sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-		sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-	}
-	msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 
 	/* K: 10-bit fragment checksum (ARIB STD-43A Section 3.8.8.3).
 	 * 1's complement of binary sum of all information bits in the
@@ -873,46 +936,56 @@ void flex_frame_params_default(flex_frame_params_t *params)
 }
 
 /*
- * Block Information Word 2 (Spec Section 3.7.2).
+ * Block Information Word 2 (Spec Section 3.7.2, type 000 = SSID1).
  *
- * local_id:        Local ID (4 bits, 0-15)
- * coverage_id:     Coverage zone ID (2 bits, 0-3)
- * repeat:          Repeat indicator (1 bit, 0-1)
- * timezone_offset: Timezone offset in half-hours from UTC (-12..+12),
- *                  stored as (offset + 12) in 6 bits (0-24 range)
+ * local_id:    Local ID (9 bits, 0-511)
+ * coverage_id: Coverage zone ID (5 bits, 0-31)
  */
-uint32_t flex_create_biw2(uint32_t local_id, uint32_t coverage_id,
-			  uint32_t repeat, int timezone_offset)
+uint32_t flex_create_biw2(uint32_t local_id, uint32_t coverage_id)
 {
-	uint32_t tz = (uint32_t)((timezone_offset + 12) & 0x3F);
 	uint32_t dw = 0;
-	dw |= (coverage_id & 0x03) <<  8;
-	dw |= (local_id    & 0x0F) << 10;
-	dw |= (repeat      & 0x01) << 14;
-	dw |= (tz          & 0x3F) << 15;
+	/* type field bits 4-6 = 000 (SSID1) — already zero */
+	dw |= (coverage_id & FLEX_BIW_SSID1_COVERAGE_MASK) << FLEX_BIW_SSID1_COVERAGE_SHIFT;
+	dw |= (local_id    & FLEX_BIW_SSID1_LOCALID_MASK)  << FLEX_BIW_SSID1_LOCALID_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
 }
 
 /*
- * Block Information Word 3 (Spec Section 3.7.3).
+ * Block Information Word 3 (Spec Section 3.7.2, type 001 = Date).
  *
+ * year:  Year (5 bits, 0-31, base 1994 → 1994-2025)
  * month: Month of year (4 bits, 1-12)
  * day:   Day of month (5 bits, 1-31)
  */
 uint32_t flex_create_biw3(uint32_t month, uint32_t day)
 {
 	uint32_t dw = 0;
-	dw |= (month & 0x0F) <<  8;
-	dw |= (day   & 0x1F) << 12;
+	/* type field bits 4-6 = 001 (Date) */
+	dw |= (uint32_t)FLEX_BIW_TYPE_DATE << FLEX_BIW_TYPE_SHIFT;
+	/* Year field: standard range 0-31 (1994-2025).
+	 * For years >2025, find a calendar-equivalent year in range
+	 * (same leap status + same Jan 1 weekday) so pagers display
+	 * correct day-of-week and Feb 29 behavior. */
+	{
+		time_t now = time(NULL);
+		struct tm tm_now;
+		gmtime_r(&now, &tm_now);
+		int real_year = tm_now.tm_year + 1900;
+		int equiv = flex_biw_equiv_year(real_year);
+		uint32_t year = (uint32_t)(equiv - FLEX_BIW_DATE_YEAR_BASE);
+		dw |= (year  & FLEX_BIW_DATE_YEAR_MASK)  << FLEX_BIW_DATE_YEAR_SHIFT;
+	}
+	dw |= (day   & FLEX_BIW_DATE_DAY_MASK)   << FLEX_BIW_DATE_DAY_SHIFT;
+	dw |= (month & FLEX_BIW_DATE_MONTH_MASK)  << FLEX_BIW_DATE_MONTH_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
 }
 
 /*
- * Block Information Word 4 (Spec Section 3.7.4).
+ * Block Information Word 4 (Spec Section 3.7.2, type 010 = Time).
  *
  * hour:   Hour of day (5 bits, 0-23)
  * minute: Minute of hour (6 bits, 0-59)
@@ -920,8 +993,10 @@ uint32_t flex_create_biw3(uint32_t month, uint32_t day)
 uint32_t flex_create_biw4(uint32_t hour, uint32_t minute)
 {
 	uint32_t dw = 0;
-	dw |= (hour   & 0x1F) <<  8;
-	dw |= (minute & 0x3F) << 13;
+	/* type field bits 4-6 = 010 (Time) */
+	dw |= (uint32_t)FLEX_BIW_TYPE_TIME << FLEX_BIW_TYPE_SHIFT;
+	dw |= (hour   & FLEX_BIW_TIME_HOUR_MASK)   << FLEX_BIW_TIME_HOUR_SHIFT;
+	dw |= (minute & FLEX_BIW_TIME_MINUTE_MASK)  << FLEX_BIW_TIME_MINUTE_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -974,6 +1049,8 @@ int flex_fragment_message(const char *message, int msg_type,
 			  char **fragments, int max_fragments)
 {
 	int len, count, i, chunk;
+
+	(void)msg_type; /* reserved for future per-type fragment sizing */
 
 	if (!message || !fragments || max_fragments <= 0 || max_chars_per_fragment <= 0)
 		return 0;
@@ -1106,6 +1183,75 @@ uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr)
 	return flex_encode_word(reverse_bits32(dw));
 }
 
+/* ===== Network Address Encoding (Spec Section 6.1.2) ===== */
+
+/*
+ * Encode a network (NID) address word.
+ *
+ * Network addresses occupy the range FLEX_ADDR_NETWORK_MIN to
+ * FLEX_ADDR_NETWORK_MAX (4096 addresses).  The addr_offset parameter
+ * selects which address within that range (0-based).
+ *
+ * Returns the encoded 32-bit BCH codeword, or 0 on invalid offset.
+ */
+uint32_t flex_encode_network_address(uint32_t addr_offset)
+{
+	uint32_t aw;
+
+	if (addr_offset > (FLEX_ADDR_NETWORK_MAX - FLEX_ADDR_NETWORK_MIN))
+		return 0;
+
+	aw = (FLEX_ADDR_NETWORK_MIN + addr_offset) & FLEX_DATA_MASK;
+	return flex_encode_word(reverse_bits32(aw));
+}
+
+/*
+ * Encode a network message payload word (Section 6.1.2).
+ *
+ * Packs Service Area ID, Coverage Zone Count, and Traffic Management
+ * Flags into a single 21-bit message word.
+ *
+ * Bit layout:
+ *   bits 0-11:  Service Area ID (12 bits, 0-4095)
+ *   bits 12-15: Coverage Zone Count (4 bits, 0-15)
+ *   bits 16-20: Traffic Management Flags (5 bits)
+ */
+uint32_t flex_encode_network_payload(uint32_t area_id, uint32_t coverage_zones,
+				     uint32_t traffic_flags)
+{
+	uint32_t dw = 0;
+
+	dw |= (area_id & FLEX_NET_AREA_ID_MASK);
+	dw |= ((coverage_zones & FLEX_NET_COVERAGE_MASK) << FLEX_NET_COVERAGE_SHIFT);
+	dw |= ((traffic_flags & FLEX_NET_TRAFFIC_MASK) << FLEX_NET_TRAFFIC_SHIFT);
+
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/* ===== Operator Messaging Address Encoding (Spec Section 3.8.2.4) ===== */
+
+/*
+ * Encode an operator messaging address word.
+ *
+ * The sub-type LSB (4 bits) selects the specific operator messaging
+ * function per Section 3.8.2.4:
+ *   0x00-0x04: System Messages (All, Home, Roaming, SSID, Time)
+ *   0x05-0x0D: Reserved
+ *   0x0E-0x0F: Change Instructions
+ *
+ * Returns the encoded 32-bit BCH codeword, or 0 on invalid sub-type.
+ */
+uint32_t flex_encode_oper_msg_address(uint32_t subtype_lsb)
+{
+	uint32_t aw;
+
+	if (subtype_lsb > FLEX_OPER_MSG_LSB_MASK)
+		return 0;
+
+	aw = (FLEX_ADDR_OPER_MSG_MIN + subtype_lsb) & FLEX_DATA_MASK;
+	return flex_encode_word(reverse_bits32(aw));
+}
+
 /* ===== Hex/Binary Vector and Message Encoding (Spec Section 3.9.3) ===== */
 
 /*
@@ -1162,17 +1308,47 @@ static uint8_t hex_char_to_nibble(char c)
 }
 
 /*
+ * Compute HEX/Binary message signature (Spec §3.10.1.2, S field).
+ *
+ * 1's complement of binary sum of every 8 bits of the entire message
+ * data (all fragments combined), excluding termination fill bits.
+ * The input is the full hex string before fragmentation.
+ *
+ * Every pair of hex chars = 8 bits = one byte added to the sum.
+ * If the message has an odd number of hex chars, the last 4 bits
+ * are zero-padded to form a full byte for the sum.
+ */
+uint8_t flex_hex_signature(const char *hex_msg, size_t len)
+{
+	uint32_t sum = 0;
+	size_t i;
+
+	for (i = 0; i + 1 < len; i += 2) {
+		uint8_t hi = hex_char_to_nibble(hex_msg[i]);
+		uint8_t lo = hex_char_to_nibble(hex_msg[i + 1]);
+		sum += (uint32_t)((hi << 4) | lo);
+	}
+	/* Odd trailing hex char: pad low 4 bits with zero */
+	if (i < len) {
+		uint8_t hi = hex_char_to_nibble(hex_msg[i]);
+		sum += (uint32_t)(hi << 4);
+	}
+
+	return (uint8_t)(~sum & 0xFF);
+}
+
+/*
  * Encode hex/binary message (Spec Section 3.9.3).
  *
- * Hex characters are converted to 4-bit nibbles and packed 5 per
+ * Hex characters are converted to 4-bit values and packed 5 per
  * 21-bit message word (5 × 4 = 20 bits used, 1 bit unused).
  *
  * Packing order within each word:
- *   bits  0-3:  nibble 0 (first hex char)
- *   bits  4-7:  nibble 1
- *   bits  8-11: nibble 2
- *   bits 12-15: nibble 3
- *   bits 16-19: nibble 4
+ *   bits  0-3:  hex digit 0 (first hex char)
+ *   bits  4-7:  hex digit 1
+ *   bits  8-11: hex digit 2
+ *   bits 12-15: hex digit 3
+ *   bits 16-19: hex digit 4
  *   bit  20:    unused (0)
  *
  * The function writes the hex vector word followed by encoded message
@@ -1183,12 +1359,27 @@ static uint8_t hex_char_to_nibble(char c)
  */
 static void encode_hex_message(uint32_t *frame_words, const char *msg,
 			       uint32_t msg_start, uint32_t *fwc_p,
-			       int is_long, int *error)
+			       int is_long, int sequence_num,
+			       const void *config, int *error)
 {
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_HEX];
 	uint32_t fwc;
 	size_t len, i;
-	int word_idx, nibble_idx;
+	int word_idx, hex_idx, data_idx;
+	int frag_idx = 0, frag_total = 0;
+	int is_initial_frag;
+	uint32_t f_val, k_sum;
+	int c_val;
+
+	if (config) {
+		const struct flex_msg_config *cfg = config;
+		frag_idx = cfg->fragment_index;
+		frag_total = cfg->total_fragments;
+	}
+
+	is_initial_frag = (frag_total <= 1 || frag_idx == 0);
+	f_val = flex_fragment_number(frag_idx);
+	c_val = (frag_total > 1 && frag_idx < frag_total - 1) ? 1 : 0;
 
 	/* Validate all characters are hex */
 	len = strlen(msg);
@@ -1199,13 +1390,69 @@ static void encode_hex_message(uint32_t *frame_words, const char *msg,
 		}
 	}
 
-	/* Limit to maximum hex characters */
 	if (len > FLEX_MAX_CHARS_HEX)
 		len = FLEX_MAX_CHARS_HEX;
 
-	/* Pack nibbles into 21-bit words, 5 nibbles per word */
+	/* Build message words array:
+	 *   word 0:     header1 (K/C/F/N — K filled last)
+	 *   word 1:     header2 (R/M/D/H/B/I/s/S — initial fragment only)
+	 *   word 2+:    data (5 hex digits per 21-bit word)
+	 * Continuation fragments skip header2, so data starts at word 1. */
 	memset(msg_words, 0, sizeof(msg_words));
-	word_idx = 0;
+
+	/* Header word 1: C, F, N (K computed last) */
+	msg_words[0] = (f_val << FLEX_HEX_HDR_F_SHIFT);
+	if (c_val)
+		msg_words[0] |= FLEX_HEX_HDR_C_MASK;
+	if (sequence_num >= 0) {
+		uint32_t n = (uint32_t)(sequence_num % 64);
+		msg_words[0] |= (n << FLEX_HEX_HDR_N_SHIFT);
+	}
+
+	/* Header word 2: initial fragment only */
+	if (is_initial_frag) {
+		/* R=retrieval, M=mail_drop, D=0 (LTR), H=0,
+		 * B=blocking_length (bits/char), I=0, s=0, S=0 (signature) */
+		int b_field = 0; /* default B=0000 (16 bits/char) */
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			b_field = cfg->blocking_length & 0xF;
+		}
+		msg_words[1] = 0;
+		msg_words[1] |= ((uint32_t)b_field << FLEX_HEX_HDR2_B_SHIFT);
+		if (sequence_num >= 0)
+			msg_words[1] |= FLEX_HEX_HDR2_R_MASK;
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			if (cfg->mail_drop)
+				msg_words[1] |= FLEX_HEX_HDR2_M_MASK;
+		}
+		data_idx = 2;
+
+		/* Log blocking length and data metrics */
+		{
+			int bl = b_field ? b_field : 16;
+			int data_bits = (int)len * 4;
+			int blocks = (bl > 0) ? (data_bits + bl - 1) / bl : 0;
+			LOGP(DFLEX, LOGL_DEBUG,
+			     "TX: HEX/Binary encoder: B=%d (%d bits/char), "
+			     "data=%d bits, %d blocks\n",
+			     b_field, bl, data_bits, blocks);
+		}
+	} else {
+		data_idx = 1;
+	}
+
+	/* Pack hex nibbles into data words, 5 per word.
+	 *
+	 * Termination (Spec §3.10.1.2): when the last character ends
+	 * mid-word, remaining bits are filled with the inverse of the
+	 * last valid data bit.  If the last character is all-0 or all-1,
+	 * an extra word of inverse fill is appended.
+	 *
+	 * We pack nibbles (4-bit units) into 21-bit words.  After the
+	 * last nibble, we apply the spec's termination fill. */
+	word_idx = data_idx;
 	nibble_idx = 0;
 
 	for (i = 0; i < len; i++) {
@@ -1220,9 +1467,64 @@ static void encode_hex_message(uint32_t *frame_words, const char *msg,
 		}
 	}
 
-	/* Account for partial last word */
-	if (nibble_idx > 0)
+	/* Apply spec termination fill to remaining bits in last word */
+	if (nibble_idx > 0) {
+		/* Last data bit determines fill pattern */
+		int last_data_bit = (msg_words[word_idx] >> (nibble_idx * 4 - 1)) & 1;
+		uint32_t fill_bit = last_data_bit ? 0 : 1; /* inverse */
+		uint32_t fill_mask = 0;
+		int b;
+
+		/* Fill remaining bits in this word (from nibble_idx*4 to bit 20) */
+		for (b = nibble_idx * 4; b < 21; b++)
+			fill_mask |= (fill_bit << b);
+		msg_words[word_idx] |= fill_mask;
 		word_idx++;
+
+		/* Spec rule (3): if last character is all-0 or all-1,
+		 * append an extra word of inverse fill.
+		 * "Last character" = last nibble (4 bits) for our B=4 packing. */
+		{
+			uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
+			if ((last_nib == 0x0 || last_nib == 0xF) &&
+			    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
+				uint32_t extra = 0;
+				for (b = 0; b < 21; b++)
+					extra |= (fill_bit << b);
+				msg_words[word_idx] = extra;
+				word_idx++;
+			}
+		}
+	} else if (len > 0) {
+		/* Data ended exactly on a word boundary.
+		 * Spec rule (3): if last character is all-0 or all-1,
+		 * append an extra word of inverse fill. */
+		int prev_word = word_idx - 1;
+		int last_data_bit = (msg_words[prev_word] >> 20) & 1;
+		uint32_t fill_bit = last_data_bit ? 0 : 1;
+		uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
+		if ((last_nib == 0x0 || last_nib == 0xF) &&
+		    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
+			uint32_t extra = 0;
+			int b;
+			for (b = 0; b < 21; b++)
+				extra |= (fill_bit << b);
+			msg_words[word_idx] = extra;
+			word_idx++;
+		}
+	}
+
+	/* K: 12-bit fragment checksum (Spec §3.10.1.2).
+	 * 1's complement of binary sum of all information bits in the
+	 * fragment, taken as three groups per word: bits 0-7, 8-15, 16-20.
+	 * Same algorithm as alpha but 12-bit mask. */
+	k_sum = 0;
+	for (i = 0; i < (size_t)word_idx; i++) {
+		k_sum += msg_words[i] & 0xFFU;
+		k_sum += (msg_words[i] >> 8) & 0xFFU;
+		k_sum += (msg_words[i] >> 16) & 0x1FU;
+	}
+	msg_words[0] |= (~k_sum) & FLEX_HEX_HDR_K_MASK;
 
 	/* Write vector word and encoded message words to frame */
 	fwc = *fwc_p;
@@ -1348,13 +1650,25 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
 			return -1;
 		/*
 		 * Alpha packing: word 0 = header (frag flags + checksum).
-		 * Word 1 holds 2 chars (shift starts at 7, so bits 7 and 14).
-		 * Subsequent words hold 3 chars each (shifts 0, 7, 14).
-		 * Total message words = 1 (header) + ceil((len + 2) / 3).
-		 * The +2 accounts for the 2 ETX pad chars that always fill
-		 * the remainder of the last word.
+		 *
+		 * Initial fragment (F=11) or unfragmented:
+		 *   Word 1 holds signature (bits 0-6) + 2 chars (bits 7-13, 14-20).
+		 *   Subsequent words hold 3 chars each (shifts 0, 7, 14).
+		 *   Total = 1 (header) + ceil((len + 2) / 3).
+		 *   The +2 accounts for the signature slot eating one char position.
+		 *
+		 * Continuation fragment (F≠11):
+		 *   No signature field — all 3 char slots available from word 1.
+		 *   Total = 1 (header) + ceil(len / 3).
 		 */
-		return 1 + (int)((len + 2 + 2) / 3);
+		{
+			int is_continuation = (msg->total_fragments > 1 &&
+					       msg->fragment_index > 0);
+			if (is_continuation)
+				return 1 + (int)((len + 2) / 3);
+			else
+				return 1 + (int)((len + 2 + 2) / 3);
+		}
 
 	case FLEX_FRAME_MSG_TYPE_NUMERIC:
 		if (!msg->message || !msg->message[0])
@@ -1390,8 +1704,30 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
 			: strlen(msg->message);
 		if (len > FLEX_MAX_CHARS_HEX)
 			return -1;
-		/* Hex packing: 5 nibbles per 21-bit word */
-		return (int)((len + 4) / 5);
+		/* Hex packing: 5 nibbles per 21-bit data word.
+		 * Header words: hdr1 (always) + hdr2 (initial fragment only).
+		 * Initial fragment: 2 headers + ceil(len/5) data words.
+		 * Continuation:     1 header  + ceil(len/5) data words.
+		 *
+		 * Termination (Spec §3.10.1.2): if the last nibble is all-0
+		 * or all-1 (0x0 or 0xF), an extra fill word may be appended.
+		 * We add +1 worst-case to ensure the frame has room. */
+		{
+			int is_continuation = (msg->total_fragments > 1 &&
+					       msg->fragment_index > 0);
+			int hdr_words = is_continuation ? 1 : 2;
+			int data_words = (int)((len + 4) / 5);
+			int is_last_frag = (msg->total_fragments <= 1 ||
+					    msg->fragment_index == msg->total_fragments - 1);
+			/* Extra termination word possible on last fragment */
+			if (is_last_frag && len > 0) {
+				const char *m = msg->message;
+				char last_ch = m[len - 1];
+				if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
+					data_words++;
+			}
+			return hdr_words + data_words;
+		}
 
 	default:
 		return -1;
@@ -1725,7 +2061,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	biw_count = 1; /* BIW1 always present */
 	e_biw = 0;
 
-	if (params->local_id || params->coverage_id || params->timezone_offset) {
+	if (params->local_id || params->coverage_id) {
 		biw_count = 2; /* BIW1 + BIW2 */
 		e_biw = 1;
 	}
@@ -1882,7 +2218,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			(uint32_t)prio_addr_words,
 			(uint32_t)e_biw,
 			s_vfield,
-			0, /* carry */
+			(uint32_t)params->carry_on,
 			(uint32_t)params->collapse);
 	}
 
@@ -1891,9 +2227,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	if (biw_count >= 2) {
 		frame_words[fwc++] = flex_create_biw2(
 			params->local_id,
-			params->coverage_id,
-			0, /* repeat */
-			params->timezone_offset);
+			params->coverage_id);
 	}
 
 	if (biw_count >= 4) {
@@ -1922,9 +2256,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 		if (msgs[idx].is_group) {
 			frame_words[fwc++] = flex_encode_group_address(
-				msgs[idx].capcode, 0);
+				msgs[idx].capcode, msgs[idx].is_temp_group);
 		} else if (info[idx].is_long) {
-			uint32_t aw[2];
+			uint32_t aw[2] = {0, 0};
 			encode_long_address(msgs[idx].capcode, aw);
 			frame_words[fwc++] = aw[0];
 			frame_words[fwc++] = aw[1];
@@ -1959,13 +2293,17 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 						info[idx].is_long,
 						&enc_err);
 				} else {
+					struct flex_msg_config acfg;
+					memset(&acfg, 0, sizeof(acfg));
+					acfg.fragment_index = msgs[idx].fragment_index;
+					acfg.total_fragments = msgs[idx].total_fragments;
 					encode_alpha_message(frame_words,
 						msgs[idx].message,
 						msg_start_word,
 						&fwc,
 						info[idx].is_long,
 						msgs[idx].sequence_num,
-						NULL);
+						&acfg);
 				}
 				break;
 
@@ -1983,14 +2321,22 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			 * address field with no vector or message words
 			 * (Section 3.4.1 / Fig. 3.4.1-2(C)). */
 
-			case FLEX_FRAME_MSG_TYPE_HEX:
+			case FLEX_FRAME_MSG_TYPE_HEX: {
+				struct flex_msg_config hcfg;
+				memset(&hcfg, 0, sizeof(hcfg));
+				hcfg.fragment_index = msgs[idx].fragment_index;
+				hcfg.total_fragments = msgs[idx].total_fragments;
+				hcfg.blocking_length = msgs[idx].blocking_length;
 				encode_hex_message(frame_words,
 					msgs[idx].message,
 					msg_start_word,
 					&fwc,
 					info[idx].is_long,
+					msgs[idx].sequence_num,
+					&hcfg,
 					&enc_err);
 				break;
+			}
 
 			case FLEX_FRAME_MSG_TYPE_INSTRUCTION:
 				encode_instruction_message(frame_words,
@@ -2109,6 +2455,8 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
 	uint8_t *dst = out;
 	uint8_t cur_byte = 0;
 	int out_bit = 0;
+
+	(void)bitrate; /* mode is determined by num_phases + mod_type */
 
 	if (num_phases == 1) {
 		/* Single phase (1600/2FSK): no interleaving, just serialize */
@@ -2750,132 +3098,14 @@ size_t flex_generate_pocsag_idle(uint8_t *buffer, size_t buffer_size)
 /* ===== Message Numbering (ARIB STD-43A Section 8.4) ===== */
 
 /*
- * Encode message sequence number into a vector word extension.
- *
- * Per Section 8.4, the Message Numbering service assigns a 6-bit
- * message number (N, range 0-63) to each message for duplicate
- * detection and ordering at the pager. The retrieval flag R is
- * normally 1 (first transmission) and 0 on retransmission.
- *
- * The message number is encoded in the vector word's upper data bits:
- *   Bits 14-19: N (6-bit message number, 0-63)
- *   Bit 20:     R (retrieval flag, 1 = first, 0 = retransmit)
- *
- * This function creates a "numbered" variant of the alpha vector
- * (type 101 with numbering extension). The msg_start and msg_words
- * fields occupy the same positions as the standard alpha vector.
- *
- * Parameters:
- *   msg_start    — word index where message body starts (7 bits)
- *   msg_words    — number of message body words (7 bits)
- *   sequence_num — message number 0-63 (wraps via caller)
- *
- * Returns: BCH-encoded 32-bit vector codeword.
- */
-static uint32_t create_numbered_alpha_vector(uint32_t msg_start,
-					     uint32_t msg_words,
-					     int sequence_num)
-{
-	uint32_t dw = 0;
-
-	/* Vector type: alpha (101) */
-	dw |= (FLEX_VECTOR_TYPE_ALPHA & FLEX_VEC_TYPE_MASK) << FLEX_VEC_TYPE_SHIFT;
-	/* Message start word offset */
-	dw |= (msg_start & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
-	/* Message word count */
-	dw |= (msg_words & FLEX_VEC_LEN_MASK) << FLEX_VEC_LEN_SHIFT;
-
-	/*
-	 * When sequence_num >= 0, the message number is encoded in the
-	 * first message word's header (fragment flags area), not in the
-	 * vector word itself. The vector type remains alpha (101).
-	 *
-	 * The actual N value is carried in the message header word:
-	 *   Bits 13-18: N (message number, 0-63)
-	 *   Bit 19:     R (retrieval flag, 1 = numbered)
-	 *
-	 * This function returns the standard alpha vector; the caller
-	 * is responsible for encoding N into the message header word.
-	 */
-	(void)sequence_num; /* N is encoded in message header, not vector */
-
-	dw = flex_word_checksum(dw);
-	return flex_encode_word(reverse_bits32(dw));
-}
-
-/*
- * NOTE: Message number (N) and retrieval flag (R) encoding is now
- * handled directly in encode_alpha_message() with correct bit positions
+ * NOTE: create_numbered_alpha_vector() removed — dead code.
+ * Message number (N) and retrieval flag (R) encoding is handled
+ * directly in encode_alpha_message() with correct bit positions
  * per ARIB STD-43A Section 3.8.8.3:
  *   bits 13-18: N (6-bit message number, 0-63)
  *   bit  19:    R (message retrieval flag)
+ *
+ * NOTE: encode_source_indication() removed — dead code.
+ * Source indication (SOH/STX framing per Section 8.5) is handled
+ * inline at the call site in flex.c where the message is composed.
  */
-
-
-/* ===== Source Indication (ARIB STD-43A Section 8.5) ===== */
-
-/*
- * Encode source indication (callback number / originator ID) into
- * the message header area.
- *
- * Per Section 8.5, the Source Indication service transmits a short
- * identifier for the calling party. When source_id is provided
- * (non-NULL, non-empty), it is prepended to the message content
- * as a SOH-delimited field in the alpha message body:
- *
- *   <SOH> source_id <STX> message_content
- *
- * SOH (0x01) marks the start of the source indication field.
- * STX (0x02) marks the transition to the actual message content.
- *
- * When source_id is NULL or empty, no source indication is added
- * and the message is encoded normally.
- *
- * Parameters:
- *   dest        — output buffer for the combined message
- *   dest_size   — size of output buffer
- *   source_id   — source identifier string (NULL = omit)
- *   message     — original message content
- *
- * Returns: length of the combined message written to dest,
- *          or 0 if source_id is NULL/empty (message unchanged).
- */
-static int encode_source_indication(char *dest, int dest_size,
-				    const char *source_id,
-				    const char *message)
-{
-	int pos = 0;
-	int src_len, msg_len;
-
-	if (!dest || dest_size < 4)
-		return 0;
-
-	if (!source_id || source_id[0] == '\0')
-		return 0;
-
-	src_len = (int)strlen(source_id);
-	msg_len = message ? (int)strlen(message) : 0;
-
-	/* Need: SOH + source_id + STX + message + NUL */
-	if (1 + src_len + 1 + msg_len + 1 > dest_size)
-		return 0;
-
-	/* SOH: start of source indication */
-	dest[pos++] = 0x01;
-
-	/* Source identifier */
-	memcpy(dest + pos, source_id, src_len);
-	pos += src_len;
-
-	/* STX: start of message text */
-	dest[pos++] = 0x02;
-
-	/* Original message content */
-	if (msg_len > 0) {
-		memcpy(dest + pos, message, msg_len);
-		pos += msg_len;
-	}
-
-	dest[pos] = '\0';
-	return pos;
-}

@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
+#include <time.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "../libfilter/iir_filter.h"
@@ -1197,6 +1198,105 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 	return 0;
 }
 
+/* ===== Fragment Reassembly Helpers (Spec Section 3.10.1.3 / 4.2) ===== */
+
+/* Find or allocate a reassembly slot for the given capcode + message number.
+ * Returns slot index, or -1 if no slot available. */
+static int reasm_find(flex_t *flex, uint64_t capcode, int msg_num)
+{
+	int i;
+	for (i = 0; i < FLEX_REASM_SLOTS; i++) {
+		if (flex->rx.reasm[i].active &&
+		    flex->rx.reasm[i].capcode == capcode &&
+		    flex->rx.reasm[i].msg_num == msg_num)
+			return i;
+	}
+	return -1;
+}
+
+static int reasm_alloc(flex_t *flex, uint64_t capcode, int msg_num, int msg_type)
+{
+	int i;
+	/* Find a free slot */
+	for (i = 0; i < FLEX_REASM_SLOTS; i++) {
+		if (!flex->rx.reasm[i].active)
+			goto found;
+	}
+	/* Evict oldest slot */
+	{
+		int oldest = 0;
+		uint32_t oldest_frame = flex->rx.reasm[0].last_frame;
+		for (i = 1; i < FLEX_REASM_SLOTS; i++) {
+			if (flex->rx.reasm[i].last_frame < oldest_frame) {
+				oldest = i;
+				oldest_frame = flex->rx.reasm[i].last_frame;
+			}
+		}
+		i = oldest;
+	}
+found:
+	flex->rx.reasm[i].active = 1;
+	flex->rx.reasm[i].capcode = capcode;
+	flex->rx.reasm[i].msg_num = msg_num;
+	flex->rx.reasm[i].len = 0;
+	flex->rx.reasm[i].msg_type = msg_type;
+	flex->rx.reasm[i].expected_f = 0; /* next after initial (F=11) is F=00 */
+	flex->rx.reasm[i].last_frame = flex->rx.fiw_frame;
+	flex->rx.reasm[i].last_cycle = flex->rx.fiw_cycle;
+	return i;
+}
+
+/* Append text to a reassembly slot. Returns 0 on success, -1 if full. */
+static int reasm_append(flex_t *flex, int slot, const char *text, int text_len)
+{
+	int avail = FLEX_REASM_MAX_LEN - 1 - flex->rx.reasm[slot].len;
+	int copy = (text_len < avail) ? text_len : avail;
+	if (copy <= 0)
+		return -1;
+	memcpy(flex->rx.reasm[slot].buf + flex->rx.reasm[slot].len, text, copy);
+	flex->rx.reasm[slot].len += copy;
+	flex->rx.reasm[slot].buf[flex->rx.reasm[slot].len] = '\0';
+	flex->rx.reasm[slot].last_frame = flex->rx.fiw_frame;
+	flex->rx.reasm[slot].last_cycle = flex->rx.fiw_cycle;
+	return 0;
+}
+
+/* Expire stale reassembly slots (per spec: 32 frames max between fragments,
+ * we use 64 as a generous timeout). Outputs partial result on expiry. */
+static void reasm_expire(flex_t *flex)
+{
+	int i;
+	uint32_t cur = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+	for (i = 0; i < FLEX_REASM_SLOTS; i++) {
+		uint32_t last;
+		int delta;
+		if (!flex->rx.reasm[i].active)
+			continue;
+		last = flex->rx.reasm[i].last_cycle * 128 + flex->rx.reasm[i].last_frame;
+		delta = (int)cur - (int)last;
+		if (delta < 0)
+			delta += 15 * 128; /* wrap around cycle boundary */
+		if (delta > FLEX_REASM_TIMEOUT) {
+			if (flex->rx.reasm[i].len > 0) {
+				const char *type_tag =
+					(flex->rx.reasm[i].msg_type == FLEX_VECTOR_TYPE_HEX_BINARY)
+					? "HEX" : "ALN";
+				LOGP(DDSP, LOGL_NOTICE,
+				     "RX: reassembly timeout [%09" PRIu64 "] msgnum=%d (%d frames stale) partial %s \"%s\"\n",
+				     flex->rx.reasm[i].capcode,
+				     flex->rx.reasm[i].msg_num, delta,
+				     type_tag,
+				     flex->rx.reasm[i].buf);
+			} else {
+				LOGP(DDSP, LOGL_DEBUG,
+				     "RX: reassembly timeout for capcode %" PRIu64 " msgnum=%d (%d frames stale, empty).\n",
+				     flex->rx.reasm[i].capcode, flex->rx.reasm[i].msg_num, delta);
+			}
+			flex->rx.reasm[i].active = 0;
+		}
+	}
+}
+
 /* Decode one phase of a received frame.
  * De-interleave blocks, BCH decode, parse BIW/addresses/vectors/messages.
  * phaseptr points to 88 words of raw interleaved data. */
@@ -1204,6 +1304,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 {
 	int i;
 	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
+
+	/* Expire stale reassembly slots at the start of each phase decode */
+	reasm_expire(flex);
 
 	/* Store reception context in the phase struct */
 	ph->rx_phase = phase_name - 'A';	/* 'A'→0, 'B'→1, 'C'→2, 'D'→3 */
@@ -1290,21 +1393,166 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			return;
 		}
 
-		/* BIW1 layout (Spec Section 3.7.1):
-		 * bits 15-10: voffset (start of vector field)
-		 * bits 9-8:   aoffset_raw (+1 = start of address field)
-		 * Other bits: priority, carry, collapse */
+		/* BIW1 layout (Spec Section 3.7.1, 21 data bits):
+		 * bits 0-3:   checksum (x)
+		 * bits 4-7:   priority address word count (P, 0-15)
+		 * bits 8-9:   address field start offset (a, +1 = word index)
+		 * bits 10-15: vector field start offset (V, 0-63)
+		 * bits 16-17: carry-on (C, 0-3 frames)
+		 * bits 18-20: collapse cycle (m, 0-7) */
+		int prio    = (biw >> FLEX_BIW1_PRIO_SHIFT) & FLEX_BIW1_PRIO_MASK;
 		int voffset = (biw >> FLEX_BIW1_VSTART_SHIFT) & FLEX_BIW1_VSTART_MASK;
 		int aoffset = ((biw >> FLEX_BIW1_ASTART_SHIFT) & FLEX_BIW1_ASTART_MASK) + 1;
+		int carry   = (biw >> FLEX_BIW1_CARRY_SHIFT) & FLEX_BIW1_CARRY_MASK;
+		int collapse = (biw >> FLEX_BIW1_COLLAPSE_SHIFT) & FLEX_BIW1_COLLAPSE_MASK;
 
 		LOGP_CHAN(DDSP, LOGL_DEBUG,
-			  "RX: Phase %c BIW=0x%05X aoffset=%d voffset=%d (%d pages).\n",
-			  phase_name, biw, aoffset, voffset, voffset - aoffset);
+			  "RX: Phase %c BIW1=0x%05X aoffset=%d voffset=%d prio=%d carry=%d collapse=%d (%d pages).\n",
+			  phase_name, biw, aoffset, voffset, prio, carry, collapse,
+			  voffset - aoffset);
 
-		if (voffset <= aoffset || voffset >= FLEX_WORDS_PER_FRAME) {
+		if (voffset < aoffset || voffset >= FLEX_WORDS_PER_FRAME) {
 			LOGP_CHAN(DDSP, LOGL_NOTICE,
-				  "RX: Phase %c invalid BIW offsets.\n", phase_name);
+				  "RX: Phase %c invalid BIW offsets (aoffset=%d voffset=%d).\n",
+				  phase_name, aoffset, voffset);
 			return;
+		}
+
+		/* Parse BIW2/3/4 (words 1 through aoffset-1).
+		 *
+		 * Per Spec Section 3.7.2: BIW1 is always word 0.
+		 * Words 1..(aoffset-1) are BIW2/3/4, identified by
+		 * their type field (bits 4-6).  The transmission order
+		 * is not regulated — we dispatch on type, not position.
+		 *
+		 * BIW1 aoffset_raw (bits 8-9) = number of extra BIW words.
+		 * aoffset = aoffset_raw + 1 = first address word index.
+		 * So extra BIW words are at indices 1..(aoffset-1). */
+		{
+			int bw;
+			for (bw = 1; bw < aoffset && bw < FLEX_WORDS_PER_FRAME; bw++) {
+				uint32_t bword;
+				uint32_t btype;
+
+				if (ph->status[bw] == FLEX_WORD_UNCORRECTABLE ||
+				    ph->status[bw] == FLEX_WORD_NOT_RECEIVED) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c BIW[%d] uncorrectable.\n",
+						  phase_name, bw);
+					continue;
+				}
+
+				bword = ph->words[bw];
+				btype = flex_biw_type(bword);
+
+				switch (btype) {
+				case FLEX_BIW_TYPE_SSID1: {
+					uint32_t cov = (bword >> FLEX_BIW_SSID1_COVERAGE_SHIFT) & FLEX_BIW_SSID1_COVERAGE_MASK;
+					uint32_t lid = (bword >> FLEX_BIW_SSID1_LOCALID_SHIFT) & FLEX_BIW_SSID1_LOCALID_MASK;
+					int changed = !flex->rx.biw.seen ||
+						      flex->rx.biw.local_id != lid ||
+						      flex->rx.biw.coverage != cov;
+					LOGP_CHAN(DDSP, changed ? LOGL_NOTICE : LOGL_DEBUG,
+						  "RX: %dbps C%u/F%u phase=%c BIW SSID1 local_id=%u coverage=%u%s\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, lid, cov,
+						  changed ? "" : " (unchanged)");
+					flex->rx.biw.local_id = lid;
+					flex->rx.biw.coverage = cov;
+					flex->rx.biw.seen = 1;
+					break;
+				}
+				case FLEX_BIW_TYPE_DATE: {
+					uint32_t year_raw = (bword >> FLEX_BIW_DATE_YEAR_SHIFT) & FLEX_BIW_DATE_YEAR_MASK;
+					uint32_t day  = (bword >> FLEX_BIW_DATE_DAY_SHIFT) & FLEX_BIW_DATE_DAY_MASK;
+					uint32_t mon  = (bword >> FLEX_BIW_DATE_MONTH_SHIFT) & FLEX_BIW_DATE_MONTH_MASK;
+					int biw_year = (int)year_raw + FLEX_BIW_DATE_YEAR_BASE;
+					/* Reverse the calendar-equivalent mapping:
+					 * if system year >2025, the TX may have mapped
+					 * the real year to an equivalent in 1994-2025. */
+					time_t now_t = time(NULL);
+					struct tm now_tm;
+					gmtime_r(&now_t, &now_tm);
+					int sys_year = now_tm.tm_year + 1900;
+					int real = flex_biw_real_year(biw_year, sys_year);
+					if (real != biw_year) {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps C%u/F%u phase=%c BIW DATE %04d-%02u-%02u (probably %d)\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name,
+							  biw_year, mon, day, real);
+					} else {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps C%u/F%u phase=%c BIW DATE %04d-%02u-%02u\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name,
+							  biw_year, mon, day);
+					}
+					break;
+				}
+				case FLEX_BIW_TYPE_TIME: {
+					uint32_t hour = (bword >> FLEX_BIW_TIME_HOUR_SHIFT) & FLEX_BIW_TIME_HOUR_MASK;
+					uint32_t min  = (bword >> FLEX_BIW_TIME_MINUTE_SHIFT) & FLEX_BIW_TIME_MINUTE_MASK;
+					uint32_t sec  = (bword >> FLEX_BIW_TIME_SECOND_SHIFT) & FLEX_BIW_TIME_SECOND_MASK;
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps C%u/F%u phase=%c BIW TIME %02u:%02u:%04.1f\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  hour, min, sec * FLEX_BIW_TIME_SECOND_STEP);
+					break;
+				}
+				case FLEX_BIW_TYPE_SYSINFO: {
+					uint32_t a_type = (bword >> FLEX_BIW_SYSINFO_A_SHIFT) & FLEX_BIW_SYSINFO_A_MASK;
+					uint32_t info   = (bword >> FLEX_BIW_SYSINFO_I_SHIFT) & FLEX_BIW_SYSINFO_I_MASK;
+					if (a_type == 4) {
+						/* Time-related: I contains timezone zone code
+						 * (Table 3.7.2-3) in lower 5 bits */
+						uint32_t zone = info & 0x1F;
+						int tz_min = flex_tz_to_minutes(zone);
+						char tzbuf[20];
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps C%u/F%u phase=%c BIW SYSINFO timezone zone=%u (%s)\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name, zone,
+							  flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
+					} else {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps C%u/F%u phase=%c BIW SYSINFO type=%u info=0x%03X\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name, a_type, info);
+					}
+					break;
+				}
+				case FLEX_BIW_TYPE_SSID2: {
+					uint32_t tmf     = (bword >> FLEX_BIW_SSID2_TMF_SHIFT) & FLEX_BIW_SSID2_TMF_MASK;
+					uint32_t country = (bword >> FLEX_BIW_SSID2_COUNTRY_SHIFT) & FLEX_BIW_SSID2_COUNTRY_MASK;
+					int changed = !flex->rx.biw.seen_ssid2 ||
+						      flex->rx.biw.country != country ||
+						      flex->rx.biw.tmf != tmf;
+					LOGP_CHAN(DDSP, changed ? LOGL_NOTICE : LOGL_DEBUG,
+						  "RX: %dbps C%u/F%u phase=%c BIW SSID2 country=%u tmf=0x%X%s\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, country, tmf,
+						  changed ? "" : " (unchanged)");
+					flex->rx.biw.country = country;
+					flex->rx.biw.tmf = tmf;
+					flex->rx.biw.seen_ssid2 = 1;
+					break;
+				}
+				default:
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c BIW[%d] reserved type=%u data=0x%05X.\n",
+						  phase_name, bw, btype, bword);
+					break;
+				}
+			}
 		}
 
 		/* Walk address/vector pairs.
@@ -1326,6 +1574,10 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			uint64_t capcode;
 			int is_long = 0;
 			int vec_type, mw1, mw2, len;
+			uint32_t aw_raw, aw_base;
+			int addr_is_group = 0, addr_is_temp = 0;
+			enum flex_addr_type aw_type;
+			char grp_flag;
 
 			if (j >= FLEX_WORDS_PER_FRAME) break;
 
@@ -1338,23 +1590,50 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				continue;
 			}
 
-			/* Address decode (Spec Section 3.8, Appendix A).
+			/* Address decode (Spec Section 3.8, Table 3.8.1-1).
 			 *
-			 * Long address detection: the first address word falls
-			 * outside the short address range.
-			 * Condition from multimon-ng demod_flex_next.c line 796:
-			 *   long = (aw < SHORT_MIN) || (aw > SHORT_MAX && aw < LONG_LO_MAX) || (aw > LONG_HI_MIN)
-			 */
-			{
-				uint32_t aw = ph->words[addr_idx];
-				is_long = (aw < FLEX_ADDR_SHORT_MIN) ||
-					  (aw > FLEX_ADDR_SHORT_MAX && aw < FLEX_ADDR_LONG_LO_MAX) ||
-					  (aw > FLEX_ADDR_LONG_HI_MIN);
+			 * First extract group/temporary flags from bit 20/19
+			 * (Section 3.8.2.2), then classify the base address word.
+			 * Long address types (LA1-LA4) require a second word;
+			 * all other types are single-word addresses. */
+			aw_raw = ph->words[addr_idx];
+			aw_base = flex_decode_addr_flags(aw_raw, &addr_is_group, &addr_is_temp);
+			aw_type = flex_classify_addr_word(aw_base);
+			grp_flag = flex_group_flag_char(addr_is_group, addr_is_temp);
+			is_long = flex_addr_is_long(aw_base);
 
-				if (is_long) {
-					/* Long address: 2 address words, 2 vector words.
-					 * capcode = (aw2 ^ 0x1FFFFF) << 15 + offset + aw1
-					 * per multimon-ng demod_flex_next.c line 804. */
+			if (is_long) {
+				/* Long address: 2 address words, 2 vector words.
+				 * Set detection + inverse formula per Spec
+				 * Appendix A Section 6.
+				 * Group long addresses use only w1 (with group
+				 * bit set), so they are single-word — the group
+				 * bit extraction above already handled this. */
+				if (addr_is_group) {
+					/* Group address with long-range base:
+					 * single word, decode base as short-style */
+					capcode = flex_decode_short_address(aw_base);
+					is_long = 0;
+
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) → cap=%" PRIu64 ".\n",
+						  phase_name, addr_idx,
+						  flex_addr_type_name(aw_type),
+						  flex_addr_type_flag(aw_type, 0),
+						  grp_flag,
+						  aw_base, aw_raw, capcode);
+
+					if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
+					    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c vec[%d] uncorrectable.\n",
+							  phase_name, j);
+						vec_count++;
+						continue;
+					}
+					vec_count++;
+				} else {
+					/* Individual long address: 2 words */
 					if (addr_idx + 1 >= voffset) {
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
 							  "RX: Phase %c long addr[%d] truncated.\n",
@@ -1366,20 +1645,31 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						LOGP_CHAN(DDSP, LOGL_DEBUG,
 							  "RX: Phase %c long addr[%d] word2 uncorrectable.\n",
 							  phase_name, addr_idx);
-						addr_idx++; /* skip second address word */
-						vec_count += 2; /* skip both vector words */
+						addr_idx++;
+						vec_count += 2;
 						continue;
 					}
 					uint32_t aw2 = ph->words[addr_idx + 1];
-					capcode = ((uint64_t)(aw2 ^ FLEX_LONG_ADDR_W2_XOR) << 15)
-						  + FLEX_LONG_ADDR_RECON + (uint64_t)aw;
-					addr_idx++; /* consume second address word */
+					capcode = flex_decode_long_address(aw_base, aw2);
+					addr_idx++;
+
+					if (capcode == 0) {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: Phase %c long addr[%d,%d] aw=0x%05X,0x%05X invalid set.\n",
+							  phase_name, addr_idx - 1, addr_idx, aw_base, aw2);
+						vec_count += 2;
+						continue;
+					}
 
 					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c long addr[%d,%d] aw=0x%05X,0x%05X → cap=%" PRIu64 ".\n",
-						  phase_name, addr_idx - 1, addr_idx, aw, aw2, capcode);
+						  "RX: Phase %c long addr[%d,%d] %s[%c] aw=0x%05X(%s),0x%05X(%s) → cap=%" PRIu64 ".\n",
+						  phase_name, addr_idx - 1, addr_idx,
+						  flex_long_set_name(aw_base, aw2),
+						  flex_addr_type_flag(aw_type, 1),
+						  aw_base, flex_addr_type_name(aw_type),
+						  aw2, flex_addr_type_name(flex_classify_addr_word(aw2)),
+						  capcode);
 
-					/* Long address also consumes 2 vector words */
 					if (j + 1 >= FLEX_WORDS_PER_FRAME) break;
 					if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
 					    ph->status[j] == FLEX_WORD_NOT_RECEIVED ||
@@ -1391,22 +1681,68 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						vec_count += 2;
 						continue;
 					}
-					/* Use first vector word for type/start/len */
 					vec_count += 2;
-				} else {
-					/* Short address: capcode = aw - offset */
-					capcode = aw - FLEX_SHORT_ADDR_OFFSET;
-
-					if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
-					    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
-						LOGP_CHAN(DDSP, LOGL_DEBUG,
-							  "RX: Phase %c vec[%d] uncorrectable.\n",
-							  phase_name, j);
-						vec_count++;
-						continue;
-					}
-					vec_count++;
 				}
+			} else {
+				/* Single-word address (Spec Table 3.8.1-1).
+				 * For group addresses, decode from the base word
+				 * (flags already stripped). */
+				capcode = flex_decode_short_address(aw_base);
+
+				/* Enhanced logging for special address types */
+				if (flex_addr_is_special(aw_base)) {
+					if (aw_type == FLEX_ADDR_OPER_MSG) {
+						LOGP_CHAN(DDSP, LOGL_INFO,
+							  "RX: Phase %c addr[%d] %s/%s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
+							  phase_name, addr_idx,
+							  flex_addr_type_name(aw_type),
+							  flex_oper_msg_subtype_name(aw_base),
+							  flex_addr_type_flag(aw_type, 0),
+							  aw_base, capcode);
+					} else if (aw_type == FLEX_ADDR_TEMPORARY) {
+						LOGP_CHAN(DDSP, LOGL_INFO,
+							  "RX: Phase %c addr[%d] %s[%c] slot=%u aw=0x%05X → cap=%" PRIu64 " — %s.\n",
+							  phase_name, addr_idx,
+							  flex_addr_type_name(aw_type),
+							  flex_addr_type_flag(aw_type, 0),
+							  flex_temp_addr_slot(aw_base),
+							  aw_base, capcode,
+							  flex_special_addr_detail(aw_base));
+					} else {
+						LOGP_CHAN(DDSP, LOGL_INFO,
+							  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 " — %s.\n",
+							  phase_name, addr_idx,
+							  flex_addr_type_name(aw_type),
+							  flex_addr_type_flag(aw_type, 0),
+							  aw_base, capcode,
+							  flex_special_addr_detail(aw_base));
+					}
+				} else if (addr_is_group) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) → cap=%" PRIu64 ".\n",
+						  phase_name, addr_idx,
+						  flex_addr_type_name(aw_type),
+						  flex_addr_type_flag(aw_type, 0),
+						  grp_flag,
+						  aw_base, aw_raw, capcode);
+				} else {
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
+						  phase_name, addr_idx,
+						  flex_addr_type_name(aw_type),
+						  flex_addr_type_flag(aw_type, 0),
+						  aw_base, capcode);
+				}
+
+				if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
+				    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c vec[%d] uncorrectable.\n",
+						  phase_name, j);
+					vec_count++;
+					continue;
+				}
+				vec_count++;
 			}
 
 			/* Vector decode */
@@ -1418,20 +1754,272 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				mw2 = mw1 + (len - 1);
 
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: Phase %c cap=%" PRIu64 " type=%d mw1=%d len=%d%s.\n",
+					  "RX: Phase %c cap=%" PRIu64 " type=%d mw1=%d len=%d%s%s.\n",
 					  phase_name, capcode, vec_type, mw1, len,
-					  is_long ? " (long)" : "");
+					  is_long ? " (long)" : "",
+					  addr_is_group ? (addr_is_temp ? " (tempgroup)" : " (group)") : "");
 			}
 
-			/* Short instruction (group message setup) — skip */
+			/* Short instruction vector (Spec Section 3.9.6).
+			 * 14-bit instruction data encoded directly in the vector word.
+			 * Used for temporary group address assignment/release (§5.2)
+			 * and other system instructions. */
 			if (vec_type == FLEX_VECTOR_TYPE_SHORT_INSTR) {
+				uint32_t viw = ph->words[j];
+				uint32_t instr_data = FLEX_VEC_INSTR_DATA(viw);
+				uint32_t itype = flex_instr_type(instr_data);
+
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: Phase %c short instruction, skipping.\n",
-					  phase_name);
+					  "RX: Phase %c short instruction: cap=%" PRIu64 " data=0x%04X type=%s(%u).\n",
+					  phase_name, capcode, instr_data,
+					  flex_instr_type_name(itype), itype);
+
+				/* Temporary Address assignment (§5.2):
+				 * instruction type 000.
+				 * bits 10-13 = a3-a0 (slot index 0-15)
+				 * bits 3-9   = f6-f0 (target frame for group msg)
+				 *
+				 * Multiple capcodes can be assigned to the same
+				 * slot — that's how temporary groups work.  Each
+				 * pager's individual address + short instruction
+				 * tells it "listen on temp slot X in frame Y." */
+				if (itype == FLEX_INSTR_TYPE_TEMP_ADDR) {
+					uint32_t slot = flex_instr_slot(instr_data);
+					uint32_t tgt_frame = flex_instr_frame(instr_data);
+					int phase_idx = (phase_name == 'A') ? 0 :
+							(phase_name == 'B') ? 1 :
+							(phase_name == 'C') ? 2 : 3;
+					int cnt = flex->rx.temp_addr_map[phase_idx][slot].count;
+
+					/* New SETUP on this slot: if slot was active
+					 * from a previous assignment, overwrite it.
+					 * Per §5.2: "the same Temporary Address must
+					 * not be used until transmission of the Group
+					 * message has ended" — so a new SETUP implies
+					 * the old one completed or was abandoned. */
+					if (slot < FLEX_TEMP_ADDR_SLOTS) {
+						if (!flex->rx.temp_addr_map[phase_idx][slot].active) {
+							/* Fresh slot — initialize */
+							flex->rx.temp_addr_map[phase_idx][slot].count = 0;
+							flex->rx.temp_addr_map[phase_idx][slot].target_frame = tgt_frame;
+							flex->rx.temp_addr_map[phase_idx][slot].setup_frame = flex->rx.fiw_frame;
+							flex->rx.temp_addr_map[phase_idx][slot].setup_cycle = flex->rx.fiw_cycle;
+							flex->rx.temp_addr_map[phase_idx][slot].active = 1;
+							cnt = 0;
+						}
+						if (cnt < FLEX_TEMP_GROUP_MAX_MEMBERS) {
+							flex->rx.temp_addr_map[phase_idx][slot].capcodes[cnt] = capcode;
+							flex->rx.temp_addr_map[phase_idx][slot].count = cnt + 1;
+						}
+					}
+
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  SETUP slot=%u target_frame=%u <- cap=%" PRIu64 " (member %d)\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_TEMPORARY,
+						  slot, tgt_frame, capcode,
+						  flex->rx.temp_addr_map[phase_idx][slot].count);
+				} else if (aw_type == FLEX_ADDR_TEMPORARY) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  INS temp_slot=%u type=%s data=0x%04X\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_TEMPORARY,
+						  flex_temp_addr_slot(aw_base),
+						  flex_instr_type_name(itype),
+						  instr_data);
+				} else {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c%c INS type=%s data=0x%04X\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  grp_flag,
+						  flex_instr_type_name(itype),
+						  instr_data);
+				}
 				continue;
 			}
 
 			if (mw1 == 0 && mw2 == 0) continue;
+
+			/* Network message payload parsing (Spec Section 6.1.2).
+			 * Network addresses use Secure (type 0) vectors.
+			 * First message word contains Service Area ID, Coverage
+			 * Zone Count, and Traffic Management Flags. */
+			if (aw_type == FLEX_ADDR_NETWORK &&
+			    vec_type == FLEX_VECTOR_TYPE_SECURE &&
+			    mw1 <= 87 && mw1 < FLEX_WORDS_PER_FRAME &&
+			    (ph->status[mw1] == FLEX_WORD_CLEAN ||
+			     ph->status[mw1] == FLEX_WORD_CORRECTED)) {
+				uint32_t net_mw = ph->words[mw1];
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  NET area_id=%u zones=%u traffic=0x%02X%s\n",
+					  bitrate,
+					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+					  phase_name, capcode,
+					  FLEX_RX_FLAG_NETWORK,
+					  flex_net_area_id(net_mw),
+					  flex_net_coverage_zones(net_mw),
+					  flex_net_traffic_flags(net_mw),
+					  flex_net_is_overloaded(net_mw) ? " OVERLOAD" : "");
+				continue;
+			}
+
+			/* Operator messaging payload parsing (Spec Section 3.8.2.4).
+			 * Log the sub-type category and raw message payload. */
+			if (aw_type == FLEX_ADDR_OPER_MSG) {
+				enum flex_oper_msg_category cat = flex_oper_msg_category(aw_base);
+				if (mw1 <= 87 && mw1 < FLEX_WORDS_PER_FRAME &&
+				    (ph->status[mw1] == FLEX_WORD_CLEAN ||
+				     ph->status[mw1] == FLEX_WORD_CORRECTED)) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  OPR %s/%s payload=0x%05X\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_OPER_MSG,
+						  flex_oper_msg_subtype_name(aw_base),
+						  flex_oper_msg_category_name(cat),
+						  ph->words[mw1]);
+				} else {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  OPR %s/%s\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_OPER_MSG,
+						  flex_oper_msg_subtype_name(aw_base),
+						  flex_oper_msg_category_name(cat));
+				}
+				continue;
+			}
+
+			/* Info Service address (Spec Table 3.8.1-1, under study).
+			 * Log raw payload for analysis — no defined protocol yet. */
+			if (aw_type == FLEX_ADDR_INFO_SVC) {
+				if (mw1 <= 87 && mw2 <= 87) {
+					char hex[512];
+					int hi = 0, w;
+					for (w = mw1; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+							continue;
+						hi += snprintf(hex + hi, sizeof(hex) - hi,
+							       "%05X ", ph->words[w]);
+						if (hi >= (int)sizeof(hex) - 6)
+							break;
+					}
+					if (hi > 0 && hex[hi - 1] == ' ')
+						hex[--hi] = '\0';
+					else
+						hex[hi] = '\0';
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  ISV [%s]\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_INFO_SVC,
+						  hex);
+				} else {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  ISV\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_INFO_SVC);
+				}
+				continue;
+			}
+
+			/* Reserved Short address — log and skip (no defined behavior). */
+			if (aw_type == FLEX_ADDR_RSVD_SHORT) {
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Phase %c addr[%d] reserved short aw=0x%05X — ignoring.\n",
+					  phase_name, addr_idx, aw_base);
+				continue;
+			}
+
+			/* Temporary Address DELIVERY detection (§5.2).
+			 *
+			 * When a temp address (0x1F7800–0x1F780F) appears as an
+			 * address word with a non-instruction vector, this is the
+			 * group message delivery.  Log the member list from the
+			 * tracking table, then determine if the message is complete.
+			 *
+			 * Per §5.2: "The Temporary Address is valid until the Group
+			 * message ends."  And: "All dynamic group messages using
+			 * temporary addresses are considered to be fragmented
+			 * regardless of message length."
+			 *
+			 * Teardown: clear the slot when the message is complete:
+			 *   - Alpha/Secure: C=0 in header (not continued)
+			 *   - Tone/Numeric/HEX: always complete (single frame)
+			 * If C=1 (continued), the slot stays active for the next
+			 * frame's fragment. */
+			if (aw_type == FLEX_ADDR_TEMPORARY) {
+				uint32_t slot = flex_temp_addr_slot(aw_base);
+				int phase_idx = (phase_name == 'A') ? 0 :
+						(phase_name == 'B') ? 1 :
+						(phase_name == 'C') ? 2 : 3;
+				int is_complete = 1; /* assume complete unless alpha says otherwise */
+
+				/* Check alpha header for continuation flag */
+				if ((vec_type == FLEX_VECTOR_TYPE_ALPHA ||
+				     vec_type == FLEX_VECTOR_TYPE_SECURE) &&
+				    mw1 <= 87 && mw1 < FLEX_WORDS_PER_FRAME &&
+				    (ph->status[mw1] == FLEX_WORD_CLEAN ||
+				     ph->status[mw1] == FLEX_WORD_CORRECTED)) {
+					uint32_t hdr = ph->words[mw1];
+					int hdr_c = (hdr & FLEX_ALPHA_HDR_C_MASK) >> FLEX_ALPHA_HDR_C_SHIFT;
+					if (hdr_c)
+						is_complete = 0; /* continued — keep slot active */
+				}
+
+				/* Log DELIVERY with member list */
+				if (slot < FLEX_TEMP_ADDR_SLOTS &&
+				    flex->rx.temp_addr_map[phase_idx][slot].active) {
+					int cnt = flex->rx.temp_addr_map[phase_idx][slot].count;
+					int m;
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  DELIVERY slot=%u members=%d%s:",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_TEMPORARY,
+						  slot, cnt,
+						  is_complete ? " COMPLETE" : " CONTINUED");
+					for (m = 0; m < cnt; m++)
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  " %" PRIu64,
+							  flex->rx.temp_addr_map[phase_idx][slot].capcodes[m]);
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "\n");
+
+					/* Teardown on completion */
+					if (is_complete) {
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c temp slot=%u TEARDOWN — message complete.\n",
+							  phase_name, slot);
+						memset(&flex->rx.temp_addr_map[phase_idx][slot], 0,
+						       sizeof(flex->rx.temp_addr_map[phase_idx][slot]));
+					}
+				} else {
+					/* No tracked SETUP for this slot — log anyway */
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  DELIVERY slot=%u (no tracked SETUP)%s\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  FLEX_RX_FLAG_TEMPORARY,
+						  slot,
+						  is_complete ? " COMPLETE" : " CONTINUED");
+				}
+				/* Fall through to normal message decode below */
+			}
 
 			/* Alpha message */
 			if (vec_type == FLEX_VECTOR_TYPE_ALPHA || vec_type == FLEX_VECTOR_TYPE_SECURE) {
@@ -1485,6 +2073,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					int start_word = mw1 + 1;
 					uint32_t rx_sig = 0;
 					uint32_t sig_sum = 0;
+					int is_initial = (hdr_f == 3); /* F=11 = first/only */
 
 					for (w = start_word; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
 						uint32_t dw;
@@ -1497,7 +2086,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 						/* First slot: signature on initial
 						 * fragment, character otherwise */
-						if (w == start_word && frag_flag == 'K') {
+						if (w == start_word && is_initial) {
 							rx_sig = dw & FLEX_ALPHA_SIG_MASK;
 						} else {
 							ch = (dw >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
@@ -1517,7 +2106,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					text[ti] = '\0';
 
 					/* Verify signature on initial fragment */
-					if (frag_flag == 'K') {
+					if (is_initial) {
 						uint32_t expected_sig = (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 						if (rx_sig == expected_sig) {
 							LOGP_CHAN(DDSP, LOGL_DEBUG,
@@ -1531,8 +2120,20 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						}
 					}
 
+					/* Fragment reassembly (Spec §3.10.1.3 / §4.2).
+					 *
+					 * frag_flag: 'K' = complete (F=11, C=0)
+					 *            'F' = continuation (C=1)
+					 *            'C' = final fragment (C=0, F≠11)
+					 *
+					 * Every fragment is always output at NOTICE level.
+					 * Additionally, fragments are buffered for reassembly.
+					 * When the final fragment arrives, the full reassembled
+					 * message is output as a separate "reassembled" line. */
+
+					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] ALN \"%s\"\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c ALN \"%s\"\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -1540,8 +2141,64 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "neg" : "pos",
 						  (frag_flag == 'K') ? "complete" :
-						  (frag_flag == 'F') ? "cont" : "final",
-						  capcode, text);
+						  (frag_flag == 'F') ? (is_initial ? "frag_start" : "frag_cont") :
+						  "frag_end",
+						  capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  grp_flag,
+						  text);
+
+					/* Reassembly logic for fragmented messages.
+					 *
+					 * F sequence per spec (§3.10.1.2/3):
+					 *   11(initial), 00, 01, 10, 00, 01, 10, ...
+					 * We validate expected_f on continuation/final
+					 * fragments to detect missing or out-of-order
+					 * fragments.  On mismatch we log a warning but
+					 * still append (best-effort reassembly). */
+					if (frag_flag == 'F' && is_initial) {
+						/* First fragment (F=11, C=1) — start reassembly */
+						int slot = reasm_alloc(flex, capcode, hdr_n, FLEX_VECTOR_TYPE_ALPHA);
+						reasm_append(flex, slot, text, ti);
+					} else if (frag_flag == 'F') {
+						/* Continuation fragment (C=1, F≠11) — append */
+						int slot = reasm_find(flex, capcode, hdr_n);
+						if (slot >= 0) {
+							if (hdr_f != flex->rx.reasm[slot].expected_f)
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: Phase %c reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
+									  phase_name, capcode, hdr_n,
+									  flex->rx.reasm[slot].expected_f, hdr_f);
+							reasm_append(flex, slot, text, ti);
+							flex->rx.reasm[slot].expected_f = (hdr_f + 1) % 3;
+						}
+					} else if (frag_flag == 'C') {
+						/* Final fragment (C=0, F≠11) — append and emit reassembled */
+						int slot = reasm_find(flex, capcode, hdr_n);
+						if (slot >= 0) {
+							if (hdr_f != flex->rx.reasm[slot].expected_f)
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: Phase %c reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
+									  phase_name, capcode, hdr_n,
+									  flex->rx.reasm[slot].expected_f, hdr_f);
+							reasm_append(flex, slot, text, ti);
+							LOGP_CHAN(DDSP, LOGL_NOTICE,
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c ALN \"%s\"\n",
+								  bitrate,
+								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+								  phase_name,
+								  flex->rx.sync_baud,
+								  flex->rx.sync_levels,
+								  flex->rx.polarity ? "neg" : "pos",
+								  "reassembled",
+								  capcode,
+								  flex_addr_type_flag(aw_type, is_long),
+								  grp_flag,
+								  flex->rx.reasm[slot].buf);
+							flex->rx.reasm[slot].active = 0;
+						}
+					}
+					/* frag_flag == 'K': complete message, no reassembly needed */
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_NUMERIC ||
 				   vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM ||
@@ -1598,67 +2255,302 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					digits[di] = '\0';
 
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] NUM \"%s\"\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c NUM \"%s\"\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "neg" : "pos",
-						  capcode, digits);
+						  capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  grp_flag,
+						  digits);
 				} else {
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] NUM\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c NUM\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "neg" : "pos",
-						  capcode);
+						  capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  grp_flag);
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_TONE) {
 				/* Tone-only */
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] TON\n",
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c TON\n",
 					  bitrate,
 					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 					  phase_name,
 					  flex->rx.sync_baud,
 					  flex->rx.sync_levels,
 					  flex->rx.polarity ? "neg" : "pos",
-					  capcode);
+					  capcode,
+					  flex_addr_type_flag(aw_type, is_long),
+					  grp_flag);
 			} else if (vec_type == FLEX_VECTOR_TYPE_HEX_BINARY) {
-				/* HEX/Binary — dump raw hex from message words */
+				/* HEX/Binary message (Spec §3.10.1.2).
+				 *
+				 * First message word = header: K(12), C(1), F(2), N(6).
+				 * First fragment also has a 2nd header word with
+				 * R, M, D, H, B, I, s, S fields.
+				 * Data starts at 3rd word (first frag) or 2nd word
+				 * (continuation frags).
+				 *
+				 * We parse C/F/N for fragment reassembly, then dump
+				 * raw hex from the data words. */
 				if (mw1 <= 87 && mw2 <= 87) {
 					char hex[512];
 					int hi = 0, w;
+					int hex_c = 0, hex_f = 0, hex_n = 0;
+					int hex_is_initial = 0;
+					int hex_blocking = 0; /* B field from hdr2 (0=16 bits/char) */
+					char hex_frag_flag = '?';
+					int data_start = mw1; /* default: all words */
 
-					for (w = mw1; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
-						uint32_t dw;
-						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-							continue;
-						dw = ph->words[w];
-						hi += snprintf(hex + hi, sizeof(hex) - hi,
-							       "%05X ", dw);
-						if (hi >= (int)sizeof(hex) - 6)
-							break;
+					/* Parse header word if available */
+					if (ph->status[mw1] == FLEX_WORD_CLEAN ||
+					    ph->status[mw1] == FLEX_WORD_CORRECTED) {
+						uint32_t hdr = ph->words[mw1];
+						hex_c = (hdr & FLEX_HEX_HDR_C_MASK) >> FLEX_HEX_HDR_C_SHIFT;
+						hex_f = (hdr & FLEX_HEX_HDR_F_MASK) >> FLEX_HEX_HDR_F_SHIFT;
+						hex_n = (hdr & FLEX_HEX_HDR_N_MASK) >> FLEX_HEX_HDR_N_SHIFT;
+						hex_is_initial = (hex_f == 3);
+
+						if (hex_c == 0 && hex_f == 3) hex_frag_flag = 'K';
+						else if (hex_c == 0) hex_frag_flag = 'C';
+						else hex_frag_flag = 'F';
+
+						/* Data starts after header words:
+						 * first fragment: word 0=hdr1, word 1=hdr2, data from word 2
+						 * continuation:   word 0=hdr1, data from word 1 */
+						if (hex_is_initial) {
+							data_start = mw1 + 2;
+							/* Parse header2 for B field (blocking length) */
+							if ((mw1 + 1) <= mw2 &&
+							    (ph->status[mw1 + 1] == FLEX_WORD_CLEAN ||
+							     ph->status[mw1 + 1] == FLEX_WORD_CORRECTED)) {
+								uint32_t hdr2 = ph->words[mw1 + 1];
+								hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
+								LOGP_CHAN(DDSP, LOGL_DEBUG,
+									  "RX: Phase %c hex hdr2[%d]=0x%05X: "
+									  "B=%d (%d bits/char)\n",
+									  phase_name, mw1 + 1, hdr2,
+									  hex_blocking,
+									  hex_blocking ? hex_blocking : 16);
+							}
+						} else {
+							data_start = mw1 + 1;
+						}
+
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c hex hdr[%d]=0x%05X: "
+							  "checksum=0x%03X continued=%d frag=%d "
+							  "msgnum=%d (%s)\n",
+							  phase_name, mw1, hdr,
+							  (int)(hdr & FLEX_HEX_HDR_K_MASK),
+							  hex_c, hex_f, hex_n,
+							  (hex_frag_flag == 'K') ? "complete" :
+							  (hex_frag_flag == 'F') ? "continuation" :
+							  "final");
 					}
-					if (hi > 0 && hex[hi - 1] == ' ')
-						hex[--hi] = '\0';
-					else
-						hex[hi] = '\0';
 
+					/* Unpack nibbles from data words to flat hex string.
+					 * Each 21-bit word holds 5 × 4-bit nibbles (bits 0-19).
+					 * Output format: continuous uppercase hex chars like
+					 * "DEADBEEF01020304" (no spaces).
+					 *
+					 * Termination detection (Spec §3.10.1.2):
+					 * The last data word's unused bits are filled with the
+					 * inverse of the last valid data bit.  We detect this
+					 * fill pattern in the last word to find the exact data
+					 * boundary and strip padding nibbles.
+					 *
+					 * For non-last fragments (C=1), the spec says data must
+					 * end at character boundaries and continue from bit 1
+					 * of the next fragment's 2nd word — so no partial-word
+					 * termination fill is expected (all 21 bits are data). */
+					{
+						int last_data_word = -1;
+						for (w = data_start; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+							uint32_t dw;
+							int n;
+							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+								continue;
+							dw = ph->words[w];
+							last_data_word = w;
+							for (n = 0; n < 5; n++) {
+								uint8_t nibble = (dw >> (n * 4)) & 0xF;
+								if (hi < (int)sizeof(hex) - 1)
+									hex[hi++] = "0123456789ABCDEF"[nibble];
+							}
+						}
+
+						/* Strip termination fill from last word of
+						 * last fragment (C=0) or complete message.
+						 * The fill is inverse-of-last-data-bit from
+						 * the end of real data to bit 20.
+						 *
+						 * Strategy: scan backwards from bit 20 of the
+						 * last word.  All consecutive identical bits
+						 * from the top are fill.  The transition point
+						 * marks the last real data bit.  We then round
+						 * up to the next nibble boundary to find how
+						 * many complete nibbles are real data. */
+						if (last_data_word >= 0 && hex_c == 0) {
+							uint32_t lw = ph->words[last_data_word];
+							uint32_t top_bit = (lw >> 20) & 1;
+							int fill_start = 21; /* assume no fill */
+							int b;
+
+							/* Scan from bit 20 downward while bits
+							 * match the top bit value */
+							for (b = 20; b >= 0; b--) {
+								if (((lw >> b) & 1) != top_bit)
+									break;
+								fill_start = b;
+							}
+
+							/* fill_start = first bit of the fill run.
+							 * Real data occupies bits 0..(fill_start-1).
+							 * Number of complete nibbles in this word: */
+							if (fill_start < 21) {
+								int real_nibbles = (fill_start + 3) / 4;
+								/* Nibbles from this word in hex[] start at
+								 * position (last_data_word - data_start) * 5
+								 * relative to the first data nibble. */
+								int word_offset = 0;
+								int ww;
+								for (ww = data_start; ww < last_data_word; ww++) {
+									if (ph->status[ww] == FLEX_WORD_UNCORRECTABLE ||
+									    ph->status[ww] == FLEX_WORD_NOT_RECEIVED)
+										continue;
+									word_offset += 5;
+								}
+								/* Check if the entire last word is fill
+								 * (extra termination word per spec rule 3) */
+								if (real_nibbles == 0) {
+									/* Entire word is fill — remove it.
+									 * Also check the previous word for
+									 * partial fill. */
+									hi = word_offset;
+								} else if (word_offset + real_nibbles < hi) {
+									hi = word_offset + real_nibbles;
+								}
+							}
+						}
+					}
+					hex[hi] = '\0';
+
+					/* For continuation/final fragments, recover B
+					 * from the reassembly slot (only the initial
+					 * fragment carries header2 with the B field). */
+					if (!hex_is_initial && hex_blocking == 0) {
+						int slot = reasm_find(flex, capcode, hex_n);
+						if (slot >= 0)
+							hex_blocking = flex->rx.reasm[slot].blocking;
+					}
+
+					/* Pad to full byte boundary for hex display
+					 * (even number of hex chars = whole bytes) */
+					if (hi > 0 && (hi & 1)) {
+						hex[hi++] = '0';
+						hex[hi] = '\0';
+					}
+
+					/* Log blocking length and decoded block count */
+					{
+						int bl = hex_blocking ? hex_blocking : 16;
+						int data_bits = hi * 4;
+						int blocks = (bl > 0) ? data_bits / bl : 0;
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c HEX/Binary: B=%d (%d bits/char), "
+							  "%d data bits, %d blocks\n",
+							  phase_name, hex_blocking, bl,
+							  data_bits, blocks);
+					}
+
+					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "neg" : "pos",
-						  capcode, hex);
+						  (hex_frag_flag == 'K') ? "complete" :
+						  (hex_frag_flag == 'F') ? (hex_is_initial ? "frag_start" : "frag_cont") :
+						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
+						  hex_blocking,
+						  capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  grp_flag,
+						  hex);
+
+					/* HEX fragment reassembly (same pattern as alpha).
+					 * We reassemble the hex string representation.
+					 * No separator between fragments — hex is a
+					 * continuous nibble stream, not text. */
+					if (hex_frag_flag == 'F' && hex_is_initial) {
+						int slot = reasm_alloc(flex, capcode, hex_n, FLEX_VECTOR_TYPE_HEX_BINARY);
+						flex->rx.reasm[slot].blocking = hex_blocking;
+						reasm_append(flex, slot, hex, hi);
+					} else if (hex_frag_flag == 'F') {
+						int slot = reasm_find(flex, capcode, hex_n);
+						if (slot >= 0) {
+							hex_blocking = flex->rx.reasm[slot].blocking;
+							if (hex_f != flex->rx.reasm[slot].expected_f)
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: Phase %c HEX reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
+									  phase_name, capcode, hex_n,
+									  flex->rx.reasm[slot].expected_f, hex_f);
+							reasm_append(flex, slot, hex, hi);
+							flex->rx.reasm[slot].expected_f = (hex_f + 1) % 3;
+						}
+					} else if (hex_frag_flag == 'C') {
+						int slot = reasm_find(flex, capcode, hex_n);
+						if (slot >= 0) {
+							hex_blocking = flex->rx.reasm[slot].blocking;
+							if (hex_f != flex->rx.reasm[slot].expected_f)
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: Phase %c HEX reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
+									  phase_name, capcode, hex_n,
+									  flex->rx.reasm[slot].expected_f, hex_f);
+							reasm_append(flex, slot, hex, hi);
+							{
+								int rbl = hex_blocking ? hex_blocking : 16;
+								int r_bits = flex->rx.reasm[slot].len * 4;
+								int r_blocks = (rbl > 0) ? r_bits / rbl : 0;
+								LOGP_CHAN(DDSP, LOGL_DEBUG,
+									  "RX: Phase %c HEX/Binary reassembled: B=%d (%d bits/char), "
+									  "%d data bits, %d blocks\n",
+									  phase_name, hex_blocking, rbl,
+									  r_bits, r_blocks);
+							}
+							LOGP_CHAN(DDSP, LOGL_NOTICE,
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
+								  bitrate,
+								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+								  phase_name,
+								  flex->rx.sync_baud,
+								  flex->rx.sync_levels,
+								  flex->rx.polarity ? "neg" : "pos",
+								  "reassembled",
+								  hex_blocking,
+								  capcode,
+								  flex_addr_type_flag(aw_type, is_long),
+								  grp_flag,
+								  flex->rx.reasm[slot].buf);
+							flex->rx.reasm[slot].active = 0;
+						}
+					}
+					/* hex_frag_flag == 'K': complete message, no reassembly needed */
 				}
 			} else {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
@@ -1692,6 +2584,40 @@ static void flex_rx_clear_phase_data(flex_t *flex)
  *   3200/4: A, B, C, D (interleaved + simultaneous) */
 static void flex_rx_decode_data(flex_t *flex)
 {
+	/* Expire stale temporary group assignments (§5.2 timeout).
+	 * Per standard: "The first transmission of the Group message must
+	 * be started within 128 Frames from the first transmission of the
+	 * Short Instruction Vector."  If 128+ frames have elapsed since
+	 * SETUP without delivery, the assignment is stale — clear it.
+	 *
+	 * Frame numbers wrap at 128 (0-127), cycle at 15 (0-14).
+	 * Total frame count = cycle * 128 + frame. */
+	{
+		int p, s;
+		uint32_t cur_total = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+
+		for (p = 0; p < FLEX_MAX_PHASES; p++) {
+			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
+				if (!flex->rx.temp_addr_map[p][s].active)
+					continue;
+				uint32_t setup_total = flex->rx.temp_addr_map[p][s].setup_cycle * 128
+						     + flex->rx.temp_addr_map[p][s].setup_frame;
+				/* Handle wraparound: 15 cycles * 128 frames = 1920 total */
+				uint32_t elapsed = (cur_total >= setup_total)
+						 ? (cur_total - setup_total)
+						 : (15 * 128 - setup_total + cur_total);
+				if (elapsed >= 128) {
+					static const char pn[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c temp slot=%d TIMEOUT — %u frames since SETUP, clearing.\n",
+						  pn[p], s, elapsed);
+					memset(&flex->rx.temp_addr_map[p][s], 0,
+					       sizeof(flex->rx.temp_addr_map[p][s]));
+				}
+			}
+		}
+	}
+
 	/* ReFLEX stub: attempt standard FLEX decode (may partially work),
 	 * then hex-dump raw phase words for analysis — both per-phase
 	 * and as one contiguous block (in case ReFLEX uses a different
@@ -1778,6 +2704,37 @@ static void flex_rx_decode_data(flex_t *flex)
 			flex_rx_decode_phase(flex, &flex->rx.phase[1], 'B');
 			flex_rx_decode_phase(flex, &flex->rx.phase[2], 'C');
 			flex_rx_decode_phase(flex, &flex->rx.phase[3], 'D');
+		}
+	}
+
+	/* Log active temporary group assignments.
+	 * These persist across frames until delivery completes or timeout.
+	 * Per §5.2: "The Temporary Address is valid until the Group
+	 * message ends." */
+	{
+		static const char pnames[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
+		int p, s, m;
+
+		for (p = 0; p < FLEX_MAX_PHASES; p++) {
+			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
+				if (!flex->rx.temp_addr_map[p][s].active)
+					continue;
+				int cnt = flex->rx.temp_addr_map[p][s].count;
+				if (cnt > 0) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: C%u/F%u phase=%c temp_group=%d ACTIVE members=%d target_frame=%u setup=C%u/F%u:",
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  pnames[p], s, cnt,
+						  flex->rx.temp_addr_map[p][s].target_frame,
+						  flex->rx.temp_addr_map[p][s].setup_cycle,
+						  flex->rx.temp_addr_map[p][s].setup_frame);
+					for (m = 0; m < cnt; m++)
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  " %" PRIu64,
+							  flex->rx.temp_addr_map[p][s].capcodes[m]);
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "\n");
+				}
+			}
 		}
 	}
 

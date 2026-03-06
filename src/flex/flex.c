@@ -155,6 +155,24 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	LOGP(DFLEX, LOGL_INFO, "Creating msg instance to page capcode '%" PRIu64 "' / type '%s'.\n",
 	     capcode, flex_msg_type_name(msg_type));
 
+	/* Warn if capcode falls in a special protocol address range.
+	 * These are not user-assignable per Table 3.8.1-1 but we allow
+	 * them through for testing and protocol experimentation. */
+	if (flex_capcode_is_special(capcode)) {
+		enum flex_addr_type stype = flex_capcode_special_type(capcode);
+		uint32_t aw = (uint32_t)(capcode + FLEX_SHORT_ADDR_OFFSET);
+		if (stype == FLEX_ADDR_OPER_MSG)
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "Warning: capcode %" PRIu64 " is special address %s/%s (aw=0x%05X) — not a user-assignable capcode.\n",
+			     capcode, flex_addr_type_name(stype),
+			     flex_oper_msg_subtype_name(aw), aw);
+		else
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "Warning: capcode %" PRIu64 " is special address %s (aw=0x%05X) — %s.\n",
+			     capcode, flex_addr_type_name(stype), aw,
+			     flex_special_addr_detail(aw) ? flex_special_addr_detail(aw) : "not a user-assignable capcode");
+	}
+
 	/* create */
 	msg = calloc(1, sizeof(*msg));
 	if (!msg) {
@@ -183,6 +201,7 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->is_temp_group = 0;
 	msg->source_id[0] = '\0';
 	msg->short_msg_index = -1;
+	msg->blocking_length = flex->default_blocking_length;
 	msg->phase = -1;
 
 	/* fragmentation state defaults */
@@ -253,20 +272,56 @@ static void flex_fragment_queue(flex_t *flex)
 	int max_chars, frag_count, i;
 	char *fragments[64]; /* max 64 fragments */
 
+	/* Compute actual BIW count for this instance.
+	 * This determines how many frame words are consumed by BIW,
+	 * which reduces the space available for message data. */
+	int biw_count = 1; /* BIW1 always present */
+	if (flex->ssid || flex->nid)
+		biw_count = 2;
+	if (flex->biw_time_enabled)
+		biw_count = 4;
+
 	for (msg = flex->msg_list; msg; msg = next) {
 		next = msg->next;
 
 		/* Only fragment alpha, numeric, and hex messages */
 		switch (msg->msg_type) {
-		case FLEX_MSG_TYPE_ALPHA:
-			max_chars = FLEX_MAX_CHARS_ALPHA;
+		case FLEX_MSG_TYPE_ALPHA: {
+			/* Available message words = 88 - biw - addr - vector.
+			 * Short addr = 1 word, long = 2.  Vector = 1 word.
+			 * Alpha: chars = (msg_words - 1) * 3 - 2
+			 *   (1 header word, signature eats 1 char slot,
+			 *    ETX padding eats 1 more). */
+			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
+			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
+					      - addr_words - 1; /* 1 vector */
+			max_chars = (msg_words_avail - 1) * 3 - 2;
+			if (max_chars > FLEX_MAX_CHARS_ALPHA)
+				max_chars = FLEX_MAX_CHARS_ALPHA;
+			if (max_chars < 1)
+				max_chars = 1;
 			break;
+		}
 		case FLEX_MSG_TYPE_NUMERIC:
 			max_chars = FLEX_MAX_CHARS_NUMERIC;
 			break;
-		case FLEX_MSG_TYPE_HEX:
-			max_chars = FLEX_MAX_CHARS_HEX;
+		case FLEX_MSG_TYPE_HEX: {
+			/* Available message words = 88 - biw - addr - vector.
+			 * HEX: initial fragment has 2 header words (hdr1+hdr2),
+			 * continuation has 1 (hdr1 only).
+			 * Data words hold 5 hex nibbles each.
+			 * Use initial fragment sizing (worst case = 2 headers). */
+			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
+			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
+					      - addr_words - 1; /* 1 vector */
+			int data_words = msg_words_avail - 2; /* 2 header words */
+			max_chars = data_words * 5;
+			if (max_chars > FLEX_MAX_CHARS_HEX)
+				max_chars = FLEX_MAX_CHARS_HEX;
+			if (max_chars < 1)
+				max_chars = 1;
 			break;
+		}
 		default:
 			continue;
 		}
@@ -320,6 +375,7 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->is_temp_group = msg->is_temp_group;
 			memcpy(frag->source_id, msg->source_id, sizeof(frag->source_id));
 			frag->short_msg_index = msg->short_msg_index;
+			frag->blocking_length = msg->blocking_length;
 			frag->phase = msg->phase;
 
 			/* Set fragmentation state */
@@ -623,6 +679,34 @@ static int flex_get_next_frame_network(flex_t *flex)
 		phase_params = params;
 		phase_params.single_phase = 1;
 
+		/* Carry-on computation for multi-phase (Spec §3.7.1 / §4.2.1).
+		 *
+		 * Per spec: "values for Carry On must be identical for all
+		 * phases in one Frame."  Scan the queue for fragment messages
+		 * eligible for this frame and compute carry-on from the max
+		 * remaining fragment count.  Must be done before per-phase
+		 * encoding since BIW1 is baked into the encoded words.
+		 * Only meaningful with collapse > 0. */
+		if (flex->collapse > 0) {
+			flex_msg_t *qm;
+			int max_remaining = 0;
+			for (qm = flex->msg_list; qm; qm = qm->next) {
+				if (qm->speed != params.bitrate ||
+				    qm->modulation_type != params.modulation_type)
+					continue;
+				if (qm->total_fragments > 1 &&
+				    qm->fragment_index < qm->total_fragments - 1) {
+					int rem = qm->total_fragments - 1 - qm->fragment_index;
+					if (rem > max_remaining)
+						max_remaining = rem;
+				}
+			}
+			if (max_remaining > 0) {
+				params.carry_on = (max_remaining > 3) ? 3 : max_remaining;
+				phase_params.carry_on = params.carry_on;
+			}
+		}
+
 		/* Collect one message per phase from the queue */
 		for (candidate = flex->msg_list; candidate; candidate = next) {
 			flex_capcode_sched_t sched;
@@ -669,9 +753,15 @@ static int flex_get_next_frame_network(flex_t *flex)
 			frame_msg.priority = candidate->priority;
 			frame_msg.charset = candidate->charset;
 			frame_msg.is_group = candidate->is_group;
-			frame_msg.sequence_num = (int)(flex->msg_sequence++ & 0x7F);
+			frame_msg.is_temp_group = candidate->is_temp_group;
+			frame_msg.sequence_num = (candidate->total_fragments > 1)
+				? (int)candidate->retrieval_num
+				: (int)(flex->msg_sequence++ & 0x7F);
 			frame_msg.source_id = candidate->source_id[0] ? candidate->source_id : NULL;
 			frame_msg.short_msg_idx = candidate->short_msg_index;
+			frame_msg.blocking_length = candidate->blocking_length;
+			frame_msg.fragment_index = candidate->fragment_index;
+			frame_msg.total_fragments = candidate->total_fragments;
 
 			len = flex_encode_frame_multi(&frame_msg, 1, &phase_params,
 						      phase_buf, sizeof(phase_buf),
@@ -702,8 +792,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 			any_msg = 1;
 
 			LOGP_CHAN(DFLEX, LOGL_INFO,
-				  "Network mode: phase %d msg capcode=%" PRIu64 " type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
+				  "Network mode: phase %d msg capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
 				  phase_idx, frame_msg.capcode,
+				  flex_capcode_type_name(frame_msg.capcode),
 				  frame_msg.msg_type, candidate->speed,
 				  (candidate->modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 				  (candidate->polarity < 0) ? "neg" : "pos",
@@ -790,9 +881,30 @@ static int flex_get_next_frame_network(flex_t *flex)
 		frame_msg.priority = msg->priority;
 		frame_msg.charset = msg->charset;
 		frame_msg.is_group = msg->is_group;
-		frame_msg.sequence_num = (int)(flex->msg_sequence++ & 0x7F);
+		frame_msg.is_temp_group = msg->is_temp_group;
+		frame_msg.sequence_num = (msg->total_fragments > 1)
+			? (int)msg->retrieval_num
+			: (int)(flex->msg_sequence++ & 0x7F);
 		frame_msg.source_id = msg->source_id[0] ? msg->source_id : NULL;
 		frame_msg.short_msg_idx = msg->short_msg_index;
+		frame_msg.blocking_length = msg->blocking_length;
+		frame_msg.fragment_index = msg->fragment_index;
+		frame_msg.total_fragments = msg->total_fragments;
+
+		/* Carry-on computation (Spec Section 3.7.1 / 4.2.1).
+		 *
+		 * When this message is a fragment and more fragments of the
+		 * same message follow in the queue, tell pagers to also
+		 * decode the next N consecutive frames (carry_on = 1..3).
+		 * Only meaningful with collapse > 0 (battery saving active);
+		 * with collapse=0 pagers decode every frame anyway.
+		 * Per spec: "Carry On is not allowed for multiple transmission." */
+		if (flex->collapse > 0 &&
+		    msg->total_fragments > 1 &&
+		    msg->fragment_index < msg->total_fragments - 1) {
+			int remaining = msg->total_fragments - 1 - msg->fragment_index;
+			params.carry_on = (remaining > 3) ? 3 : remaining;
+		}
 
 		/* Use split encoding: sync → sync_buffer, data → frame_buffer */
 		flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
@@ -810,8 +922,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 		flex->sched_last_frame = ft.frame;
 
 		LOGP_CHAN(DFLEX, LOGL_INFO,
-			  "Network mode: encoded frame C%u/F%u capcode=%" PRIu64 " type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
+			  "Network mode: encoded frame C%u/F%u capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
 			  ft.cycle, ft.frame, frame_msg.capcode,
+			  flex_capcode_type_name(frame_msg.capcode),
 			  frame_msg.msg_type, params.bitrate,
 			  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 			  (frame_msg.polarity < 0) ? "neg" : "pos",
@@ -931,6 +1044,9 @@ int flex_get_next_frame(flex_t *flex)
 
 
 	case FLEX_STATE_MESSAGE:
+		/* Fragment any oversized messages before selection */
+		flex_fragment_queue(flex);
+
 		msg = flex->msg_list;
 		if (msg) {
 			flex_frame_msg_t frame_msg;
@@ -954,13 +1070,37 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.priority = msg->priority;
 			frame_msg.charset = msg->charset;
 			frame_msg.is_group = msg->is_group;
-			frame_msg.sequence_num = (int)(flex->msg_sequence++ & 0x7F);
+			frame_msg.is_temp_group = msg->is_temp_group;
+			frame_msg.sequence_num = (msg->total_fragments > 1)
+				? (int)msg->retrieval_num
+				: (int)(flex->msg_sequence++ & 0x7F);
 			frame_msg.phase = msg->phase;
+			frame_msg.blocking_length = msg->blocking_length;
+			frame_msg.fragment_index = msg->fragment_index;
+			frame_msg.total_fragments = msg->total_fragments;
 
-			/* Build frame params matching the message */
+			/* Build frame params matching the message.
+			 * Copy BIW/coverage fields so BIW2/3/4 are emitted
+			 * in scan/one-shot mode when --biw-time or --ssid
+			 * are specified. */
 			flex_frame_params_default(&params);
 			params.bitrate = msg->speed;
 			params.modulation_type = msg->modulation_type;
+			params.biw_time = flex->biw_time_enabled;
+			params.collapse = flex->collapse;
+			if (flex->ssid || flex->nid) {
+				params.local_id = flex->ssid;
+				params.coverage_id = flex->nid;
+			}
+
+			/* Set cycle/frame from wall clock so FIW matches
+			 * real time (same as network mode). */
+			{
+				flex_frame_time_t ft;
+				flex_scheduler_get_time(flex, &ft);
+				params.cycle = ft.cycle;
+				params.frame = ft.frame;
+			}
 
 			/* Capture log values before destroy */
 			{
@@ -987,10 +1127,12 @@ int flex_get_next_frame(flex_t *flex)
 				}
 
 				LOGP_CHAN(DFLEX, LOGL_INFO,
-					  "Encoded FLEX frame (sync=%d data=%d bytes): capcode=%" PRIu64 " type=%d speed=%d/%s polarity=%s deviation=%.0f len=%d.\n",
+					  "Encoded FLEX frame (sync=%d data=%d bytes): capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s deviation=%.0f len=%d.\n",
 					  flex->sync_buffer_length,
 					  flex->frame_buffer_length,
-					  log_capcode, log_msg_type,
+					  log_capcode,
+					  flex_capcode_type_name(log_capcode),
+					  log_msg_type,
 					  log_speed,
 					  (log_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
 					  (log_polarity < 0) ? "neg" : "pos",

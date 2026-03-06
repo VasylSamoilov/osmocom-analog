@@ -65,6 +65,8 @@ static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
 static int no_ers = 0;
 static int default_phase = -1;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
+static int default_blocking_length = 1;	/* HEX/Binary B field: 1-15 bits/char, 0=16.
+					 * Spec §3.10.1.2, default 1 (raw bits). */
 static int wav_test = 0;		/* --wav-test: exit after TX completes */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
@@ -85,6 +87,7 @@ static int wav_test = 0;		/* --wav-test: exit after TX completes */
 #define OPT_NO_ERS		3014
 #define OPT_PHASE		3015
 #define OPT_WAV_TEST		3016
+#define OPT_BLOCKING		3017
 
 void print_help(const char *arg0)
 {
@@ -152,6 +155,10 @@ void print_help(const char *arg0)
 	printf("        FIFO option: phase=A|B|C|D|auto\n");
 	printf("    --wav-test\n");
 	printf("        Exit after TX completes (use with --write-tx-wave).\n");
+	printf("    --blocking <0-16>\n");
+	printf("        HEX/Binary blocking length: bits per character (Spec §3.10.1.2).\n");
+	printf("        1-15 = that many bits/char, 0 or 16 = 16 bits/char.\n");
+	printf("        Default 1 (raw bits). Stored as B field in header word 2.\n");
 	printf("\n");
 	printf("    FIFO protocol (write to %s):\n", MSG_SEND);
 	printf("        Format: capcode,type,options,message\n");
@@ -159,9 +166,23 @@ void print_help(const char *arg0)
 	printf("        Options: space-separated key=value pairs:\n");
 	printf("          speed=1600|3200|3200-4fsk|6400  polarity=neg|pos\n");
 	printf("          priority=0|1  charset=ascii|kanji  group=0|1\n");
-	printf("          source=<id>  phase=A|B|C|D|auto\n");
+	printf("          tempgroup=0|1  source=<id>  phase=A|B|C|D|auto\n");
+	printf("          blocking=0-16  (HEX/Binary B field, bits/char, default 1)\n");
 	printf("        Special: ers,0,,  — trigger ERS re-sync burst\n");
+	printf("        Special: status,0,,  — dump RX temp group assignments (per phase)\n");
+	printf("        Special: timezone,0,,  — dump Table 3.7.2-3 timezone table\n");
+	printf("        Special: timezone,<code>,,  — show offset for zone code 0-31\n");
+	printf("        Group:   group:<capcode>,<type>,group=1,<msg>\n");
+	printf("        TempGrp: group:<capcode>,<type>,group=1 tempgroup=1,<msg>\n");
 	printf("        Example: 1234567,alpha,speed=3200 priority=1,Hello World\n");
+	printf("\n");
+	printf("    Valid capcode ranges (ARIB STD-43A Section 3.8, Table 3.8.1-1):\n");
+	printf("        Short:  1–1933312 (7-digit, 1 address word)\n");
+	printf("        Long:   2101249–4297068542 (9-10 digit, 2 address words)\n");
+	printf("        The gap (1933313–2101248) contains special protocol addresses\n");
+	printf("        (Network, Temporary, Operator Messaging, Info Service, Reserved).\n");
+	printf("        These are allowed but will log a warning — they are normally\n");
+	printf("        not user-assignable per the standard.\n");
 	main_mobile_print_hotkeys();
 }
 
@@ -191,6 +212,7 @@ static void add_options(void)
 	option_add(OPT_NO_ERS, "no-ers", 0);
 	option_add(OPT_PHASE, "phase", 1);
 	option_add(OPT_WAV_TEST, "wav-test", 0);
+	option_add(OPT_BLOCKING, "blocking", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -344,6 +366,16 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_WAV_TEST:
 		wav_test = 1;
 		break;
+	case OPT_BLOCKING:
+		default_blocking_length = atoi(argv[argi]);
+		if (default_blocking_length < 0 || default_blocking_length > 16) {
+			fprintf(stderr, "Blocking length must be 0-16 (0 and 16 both mean 16 bits/char), use '-h' for help.\n");
+			return -EINVAL;
+		}
+		/* Normalize: 16 maps to B=0000 (stored as 0 internally) */
+		if (default_blocking_length == 16)
+			default_blocking_length = 0;
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -357,8 +389,8 @@ static int handle_options(int short_option, int argi, char **argv)
 static void parse_fifo_options(const char *opts, int opts_len,
 			       int *speed, int *modulation_type,
 			       double *polarity_out, int *priority,
-			       int *charset, int *is_group, char *source_id,
-			       int *phase)
+			       int *charset, int *is_group, int *is_temp_group,
+			       char *source_id, int *phase, int *blocking_length)
 {
 	char buf[256];
 	char *p, *key, *val;
@@ -371,8 +403,10 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*priority = 0;
 	*charset = 0;
 	/* is_group already set from group: prefix */
+	*is_temp_group = 0;
 	source_id[0] = '\0';
 	*phase = -1;
+	*blocking_length = default_blocking_length;
 
 	if (opts_len <= 0)
 		return;
@@ -441,6 +475,8 @@ static void parse_fifo_options(const char *opts, int opts_len,
 		}
 		else if (!strcmp(key, "group"))
 			*is_group = atoi(val);
+		else if (!strcmp(key, "tempgroup"))
+			*is_temp_group = atoi(val);
 		else if (!strcmp(key, "source")) {
 			strncpy(source_id, val, 63);
 			source_id[63] = '\0';
@@ -457,6 +493,12 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			else if (!strcasecmp(val, "d") || !strcmp(val, "3"))
 				*phase = 3;
 		}
+		else if (!strcmp(key, "blocking")) {
+			int bv = atoi(val);
+			if (bv == 16) bv = 0; /* normalize: 16 → B=0000 */
+			if (bv >= 0 && bv <= 15)
+				*blocking_length = bv;
+		}
 	}
 }
 
@@ -471,6 +513,7 @@ static void fifo_process_line(const char *text, int text_length)
 	int message_length = 0;
 	int j;
 	int is_group = 0;
+	int is_temp_group = 0;
 	int comma_count = 0;
 	int comma1 = -1, comma2 = -1, comma3 = -1;
 	int msg_speed;
@@ -479,6 +522,7 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_priority;
 	int msg_charset;
 	int msg_phase;
+	int msg_blocking_length;
 	char msg_source[64];
 	const char *opts_start;
 	int opts_len;
@@ -534,6 +578,89 @@ static void fifo_process_line(const char *text, int text_length)
 		return;
 	}
 
+	/* === Status command: "status,0,," ===
+	 * Dumps current temporary group assignments (persistent across frames).
+	 * Per ARIB STD-43A §5.2: assignments persist until group message
+	 * delivery completes or 128-frame timeout.
+	 * 16 group slots per phase, each can have multiple members. */
+	if (!strcasecmp(capcode_string, "status")) {
+		flex_t *flex = (flex_t *)sender_head;
+		static const char pnames[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
+		int p, s, m, any = 0;
+
+		if (!flex) {
+			LOGP(DFLEX, LOGL_ERROR, "No instance for status command.\n");
+			return;
+		}
+
+		LOGP(DFLEX, LOGL_NOTICE, "FIFO: Temp group assignments (C%u/F%u, 16 groups/phase, §5.2):\n",
+		     flex->rx.fiw_cycle, flex->rx.fiw_frame);
+		for (p = 0; p < FLEX_MAX_PHASES; p++) {
+			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
+				if (!flex->rx.temp_addr_map[p][s].active)
+					continue;
+				int cnt = flex->rx.temp_addr_map[p][s].count;
+				if (cnt > 0) {
+					LOGP(DFLEX, LOGL_NOTICE,
+					     "  phase=%c group=%d members=%d target_frame=%u setup=C%u/F%u:",
+					     pnames[p], s, cnt,
+					     flex->rx.temp_addr_map[p][s].target_frame,
+					     flex->rx.temp_addr_map[p][s].setup_cycle,
+					     flex->rx.temp_addr_map[p][s].setup_frame);
+					for (m = 0; m < cnt; m++)
+						LOGP(DFLEX, LOGL_NOTICE,
+						     " %" PRIu64,
+						     flex->rx.temp_addr_map[p][s].capcodes[m]);
+					LOGP(DFLEX, LOGL_NOTICE, "\n");
+					any = 1;
+				}
+			}
+		}
+		if (!any)
+			LOGP(DFLEX, LOGL_NOTICE, "  (no active assignments)\n");
+		return;
+	}
+
+	/* === Timezone command: "timezone,0,," or "timezone,<code>,," ===
+	 * Dumps the Table 3.7.2-3 timezone conversion table, or shows
+	 * the offset for a specific 5-bit zone code (0-31). */
+	if (!strcasecmp(capcode_string, "timezone")) {
+		int tlen = comma2 - comma1 - 1;
+		char tbuf[16];
+		memcpy(tbuf, text + comma1 + 1, tlen < (int)sizeof(tbuf) - 1 ? tlen : (int)sizeof(tbuf) - 1);
+		tbuf[tlen < (int)sizeof(tbuf) - 1 ? tlen : (int)sizeof(tbuf) - 1] = '\0';
+
+		if (tbuf[0] == '\0' || !strcmp(tbuf, "0") || !strcasecmp(tbuf, "list")) {
+			/* Dump full table */
+			char fmtbuf[20];
+			uint32_t i;
+			LOGP(DFLEX, LOGL_NOTICE, "FIFO: Table 3.7.2-3 timezone conversion (32 entries):\n");
+			for (i = 0; i < FLEX_TZ_ENTRIES; i++) {
+				if (i == FLEX_TZ_RESERVED) {
+					LOGP(DFLEX, LOGL_NOTICE, "  zone=%2u (reserved)\n", i);
+				} else {
+					LOGP(DFLEX, LOGL_NOTICE, "  zone=%2u %s\n",
+					     i, flex_tz_format(flex_tz_table[i], fmtbuf, sizeof(fmtbuf)));
+				}
+			}
+		} else {
+			/* Show specific zone code */
+			int code = atoi(tbuf);
+			if (code < 0 || code >= (int)FLEX_TZ_ENTRIES) {
+				LOGP(DFLEX, LOGL_ERROR, "FIFO: timezone code %d out of range (0-31).\n", code);
+			} else if (code == (int)FLEX_TZ_RESERVED) {
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: timezone zone=%d (reserved).\n", code);
+			} else {
+				char fmtbuf[20];
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: timezone zone=%d %s (%+d min)\n",
+				     code,
+				     flex_tz_format(flex_tz_table[code], fmtbuf, sizeof(fmtbuf)),
+				     flex_tz_table[code]);
+			}
+		}
+		return;
+	}
+
 	/* Handle group:capcode prefix */
 	if (strncmp(capcode_string, "group:", 6) == 0) {
 		is_group = 1;
@@ -560,8 +687,8 @@ static void fifo_process_line(const char *text, int text_length)
 	parse_fifo_options(opts_start, opts_len,
 			   &msg_speed, &msg_mod_type,
 			   &msg_polarity, &msg_priority,
-			   &msg_charset, &is_group, msg_source,
-			   &msg_phase);
+			   &msg_charset, &is_group, &is_temp_group,
+			   msg_source, &msg_phase, &msg_blocking_length);
 
 	/* Validate capcode */
 	capcode = strtoull(capcode_string, NULL, 10);
@@ -638,13 +765,15 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->priority = msg_priority;
 				msg->charset = msg_charset;
 				msg->is_group = is_group;
+				msg->is_temp_group = is_temp_group;
 				msg->phase = msg_phase;
+				msg->blocking_length = msg_blocking_length;
 				if (msg_source[0] != '\0') {
 					strncpy(msg->source_id, msg_source, sizeof(msg->source_id) - 1);
 					msg->source_id[sizeof(msg->source_id) - 1] = '\0';
 				}
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d phase=%s len=%d\n",
+				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d tempgroup=%d phase=%s len=%d\n",
 				     capcode,
 				     flex_msg_type_name(mtype),
 				     msg_speed,
@@ -653,6 +782,7 @@ static void fifo_process_line(const char *text, int text_length)
 				     msg_priority,
 				     msg_charset ? "kanji" : "ascii",
 				     is_group,
+				     is_temp_group,
 				     (msg_phase < 0) ? "auto" :
 				     (msg_phase == 0) ? "A" :
 				     (msg_phase == 1) ? "B" :
@@ -825,6 +955,7 @@ int main(int argc, char *argv[])
 			f->default_charset = default_charset;
 			f->default_polarity = polarity;
 			f->default_phase = default_phase;
+			f->default_blocking_length = default_blocking_length;
 			if (wav_test)
 				f->wav_test_mode = 1;
 			f->ssid = ssid;

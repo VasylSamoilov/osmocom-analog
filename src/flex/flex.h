@@ -49,6 +49,9 @@ typedef struct flex_msg {
 	int			is_temp_group;		/* 0 = common group, 1 = temporary */
 	char			source_id[64];		/* source/callback identifier ('\0' = none) */
 	int			short_msg_index;	/* short message index (-1 = N/A) */
+	int			blocking_length;	/* HEX/Binary B field: bits per character.
+						 * 1-15 = that many bits, 0 = 16 bits.
+						 * Spec §3.10.1.2, default 1 (raw bits). */
 	int			phase;			/* phase (channel) override:
 						 * -1=auto (default, scheduler assigns
 						 * from capcode per ARIB STD-43A),
@@ -143,6 +146,8 @@ typedef struct flex {
 	double			default_polarity;	/* -1.0 or +1.0 — default -1.0 */
 	int			default_charset;	/* 0 = ASCII, 1 = KANJI — default 0 */
 	int			default_phase;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
+	int			default_blocking_length; /* HEX/Binary B field default: 1-15 bits/char,
+						  * 0=16. Spec §3.10.1.2, default 1 (raw bits). */
 
 	/* fixed-mode flags (CLI --speed / --polarity lock) */
 	int			fixed_speed;		/* -1 = not fixed, else 1600/3200/6400 */
@@ -295,6 +300,95 @@ typedef struct flex {
 		flex_phase_data_t phase[FLEX_MAX_PHASES];
 		int		phase_toggle;		/* alternates 0/1 at 3200 baud */
 		int		data_bit_counter;	/* de-interleave index counter */
+
+		/* Per-phase temporary group tracking (Spec Section 5.2).
+		 *
+		 * Temporary addresses (0x1F7800–0x1F780F) are 16 group slots.
+		 * The system assigns pagers to a temp group in three phases:
+		 *
+		 * 1) SETUP: Each pager's individual address + short instruction
+		 *    vector is transmitted.  The instruction tells the pager:
+		 *    "listen on temp slot a3-a0 in frame f6-f0."
+		 *    Multiple pagers receiving the same slot+frame = same group.
+		 *    Standard: "the address and Short Instruction Vector for
+		 *    each pager are transmitted first."
+		 *
+		 * 2) DELIVERY: In the designated frame, the temp address slot
+		 *    appears with a vector + message.  All assigned pagers
+		 *    receive it.
+		 *    Standard: "Then all the pagers within the same group
+		 *    receive the Temporary Address with vector and message
+		 *    in the Frame designated by the Short Instruction Vector."
+		 *    Standard: "The Temporary Address is valid until the Group
+		 *    message ends. It is also possible to break down Group
+		 *    messages which stretch over several Frames."
+		 *    Standard: "All dynamic group messages using temporary
+		 *    addresses are considered to be fragmented regardless of
+		 *    message length."
+		 *
+		 * 3) TEARDOWN: Automatic — no explicit remove.
+		 *    Standard: "When the complete message is built, the pager
+		 *    automatically returns to normal operation."
+		 *    Standard: "In cases when the Temporary Address is not
+		 *    detected within the designated Frame, the pager must
+		 *    automatically return to normal operation immediately."
+		 *    Standard: "The first transmission of the Group message
+		 *    must be started within 128 Frames from the first
+		 *    transmission of the Short Instruction Vector."
+		 *
+		 * Assignments persist across frames until:
+		 *   a) The group message completes (C=0 in alpha header, or
+		 *      non-fragmented message type like tone/numeric), OR
+		 *   b) 128 frames elapse without delivery (timeout per §5.2).
+		 *
+		 * Each phase has its own independent set of 16 slots.
+		 * Each slot can have up to FLEX_TEMP_GROUP_MAX_MEMBERS
+		 * capcodes assigned. */
+		struct {
+			uint64_t	capcodes[FLEX_TEMP_GROUP_MAX_MEMBERS];
+			uint32_t	target_frame;	/* f6-f0 from instruction */
+			uint32_t	setup_frame;	/* frame number where SETUP was observed */
+			uint32_t	setup_cycle;	/* cycle number where SETUP was observed */
+			int		count;		/* number of capcodes assigned */
+			int		active;		/* 1 = assignment active, 0 = empty */
+		} temp_addr_map[FLEX_MAX_PHASES][FLEX_TEMP_ADDR_SLOTS];
+
+		/* BIW state — track SSID/coverage/timezone across frames.
+		 * Log at NOTICE level when values change, DEBUG when repeated. */
+		struct {
+			uint32_t	local_id;
+			uint32_t	coverage;
+			uint32_t	country;
+			uint32_t	tmf;
+			int		seen;		/* 1 = at least one SSID1 received */
+			int		seen_ssid2;	/* 1 = at least one SSID2 received */
+		} biw;
+
+		/* Fragment reassembly state (Spec Section 3.10.1.3 / 4.2).
+		 *
+		 * Tracks in-progress fragmented messages per capcode.
+		 * A fragment stream is identified by capcode + message number (N).
+		 * Fragments arrive with C=1 (continued) until the final C=0.
+		 * F cycles through modulo-3 sequence: 11,00,01,10,00,01,10,...
+		 *
+		 * Per spec: "The transmission interval between each fragment
+		 * must be 32 Frames (equivalent to 1 minute) or less."
+		 * We use a 64-frame timeout (generous) to expire stale entries. */
+#define FLEX_REASM_SLOTS	16	/* max concurrent reassembly streams */
+#define FLEX_REASM_MAX_LEN	4096	/* max reassembled message length */
+#define FLEX_REASM_TIMEOUT	64	/* frames before expiry */
+		struct {
+			uint64_t	capcode;
+			int		msg_num;	/* N field (0-63) */
+			int		expected_f;	/* next expected F value */
+			int		msg_type;	/* FLEX_VECTOR_TYPE_ALPHA or _HEX_BINARY */
+			int		blocking;	/* HEX/Binary B field from initial frag */
+			char		buf[FLEX_REASM_MAX_LEN];
+			int		len;		/* bytes accumulated */
+			uint32_t	last_frame;	/* frame number of last fragment */
+			uint32_t	last_cycle;	/* cycle number of last fragment */
+			int		active;		/* 1 = in progress */
+		} reasm[FLEX_REASM_SLOTS];
 	} rx;
 } flex_t;
 
