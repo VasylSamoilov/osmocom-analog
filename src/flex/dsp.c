@@ -884,6 +884,124 @@ static uint32_t flex_extract_inv_a(uint64_t sync_buf_lo, int polarity)
 	return polarity ? raw : ~raw;
 }
 
+/* Combined A / inv.A error correction for S1 sync.
+ *
+ * A and ~inv.A are both BCH(31,21)+parity codewords encoding the same
+ * 21-bit info.  By decoding both independently and cross-validating,
+ * we can recover from more errors than BCH alone (which handles ≤2).
+ *
+ * Algorithm:
+ *   1. BCH decode A → status_a, corrected_a
+ *   2. BCH decode ~inv.A → status_b, corrected_b
+ *   3. Both OK + match → high confidence, use corrected value
+ *   4. Both OK + mismatch → not a sync frame, reject
+ *   5. One OK, one failed → XOR raw_failed with corrected_good to find
+ *      candidate error bits.  If ≤3 diffs, try flipping each one
+ *      individually in the raw failed value (one at a time, always
+ *      starting from the original raw) and re-attempt BCH.  If BCH
+ *      succeeds and matches the good side → recovered.  If no single
+ *      flip recovers it → uncorrectable, reject.
+ *   6. Both failed → no sync
+ *
+ * Returns the corrected 32-bit A codeword, or 0 on failure.
+ * The 16-bit sync code is derived as (~result >> 16) & 0xFFFF. */
+static uint32_t flex_combined_a_correction(flex_t *flex,
+					   uint32_t a_raw,
+					   uint32_t inv_a_raw)
+{
+	uint32_t b_raw = ~inv_a_raw;  /* ~inv.A should equal A */
+	uint32_t corr_a = 0, corr_b = 0;
+	int status_a, status_b;
+	int32_t info_a, info_b;
+
+	info_a = flex_bch_decode(flex, a_raw, &status_a, &corr_a);
+	info_b = flex_bch_decode(flex, b_raw, &status_b, &corr_b);
+
+	/* Case 1: both decoded successfully */
+	if (info_a >= 0 && info_b >= 0) {
+		if (corr_a == corr_b) {
+			/* Match — high confidence */
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: A/inv.A both OK, match "
+				  "(A:%s, ~inv.A:%s) → 0x%08X\n",
+				  status_a == 0 ? "clean" : "corrected",
+				  status_b == 0 ? "clean" : "corrected",
+				  corr_a);
+			return corr_a;
+		}
+		/* Both decoded OK but disagree — not a real sync frame.
+		 * A and inv.A are redundant copies; if both pass BCH
+		 * independently yet produce different results, the sync
+		 * detection was a false positive. */
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
+			  "RX: A/inv.A both %s but disagree "
+			  "(A=0x%08X, ~inv.A=0x%08X) — not a sync frame\n",
+			  (status_a == 0 && status_b == 0) ? "clean" : "decoded",
+			  corr_a, corr_b);
+		return 0;
+	}
+
+	/* Case 2: one OK, one failed — try to rescue the failed side */
+	if (info_a >= 0 || info_b >= 0) {
+		uint32_t good = (info_a >= 0) ? corr_a : corr_b;
+		uint32_t bad_raw = (info_a >= 0) ? b_raw : a_raw;
+		const char *good_name = (info_a >= 0) ? "A" : "~inv.A";
+		const char *bad_name = (info_a >= 0) ? "~inv.A" : "A";
+		uint32_t diff = good ^ bad_raw;
+		int ndiff = (int)count_bits(diff);
+
+		LOGP_CHAN(DDSP, LOGL_DEBUG,
+			  "RX: %s OK (0x%08X), %s failed "
+			  "(raw=0x%08X, %d bit diff)\n",
+			  good_name, good, bad_name, bad_raw, ndiff);
+
+		if (ndiff <= 3) {
+			/* Try flipping each diff bit in bad_raw and
+			 * re-attempt BCH.  If it succeeds and matches
+			 * the good side, we've recovered.
+			 *
+			 * Save/restore bch_stats so rescue attempts
+			 * don't inflate the per-frame counters. */
+			typeof(flex->bch_stats) saved_stats = flex->bch_stats;
+			uint32_t remaining = diff;
+			while (remaining) {
+				int bit = __builtin_ctz(remaining);
+				uint32_t candidate = bad_raw ^ (1U << bit);
+				int try_status;
+				uint32_t try_corr = 0;
+				int32_t try_info = flex_bch_decode(flex,
+					candidate, &try_status, &try_corr);
+				if (try_info >= 0 && try_corr == good) {
+					flex->bch_stats = saved_stats;
+					LOGP_CHAN(DDSP, LOGL_INFO,
+						  "RX: %s recovered by "
+						  "flipping bit %d "
+						  "(raw 0x%08X → 0x%08X)\n",
+						  bad_name, bit,
+						  bad_raw, try_corr);
+					return good;
+				}
+				remaining &= remaining - 1;
+			}
+			flex->bch_stats = saved_stats;
+		}
+
+		/* Rescue failed — too many errors, uncorrectable */
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
+			  "RX: %s rescue failed (%d diffs), "
+			  "uncorrectable\n",
+			  bad_name, ndiff);
+		return 0;
+	}
+
+	/* Case 3: both failed */
+	LOGP_CHAN(DDSP, LOGL_NOTICE,
+		  "RX: A/inv.A both BCH-failed "
+		  "(A=0x%08X, ~inv.A=0x%08X)\n",
+		  a_raw, b_raw);
+	return 0;
+}
+
 /* Decode the sync code to determine symbol rate and FSK levels.
  * Per ARIB STD-43A Table 3.2-5, the outer code determines the mode.
  *
@@ -930,9 +1048,12 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 	 * recomputed parity) via corrected_word.  The 16-bit outer sync code
 	 * is (~corrected_word >> 16) & 0xFFFF, matching FLEX_SYNC_A1..AR.
 	 *
-	 * Also reset per-frame BCH stats — S1 is the start of a new frame. */
-	memset(&flex->bch_stats, 0, sizeof(flex->bch_stats));
+	 * This is a tentative decode — the authoritative BCH validation
+	 * happens later in flex_combined_a_correction() once inv.A is
+	 * available.  Save/restore bch_stats so this preliminary decode
+	 * doesn't inflate the per-frame counters. */
 	{
+		typeof(flex->bch_stats) saved_stats = flex->bch_stats;
 		uint32_t a_code = flex_extract_a_code(flex->rx.sync_buf_lo,
 						      polarity);
 		flex->rx.sync_a_code = a_code;
@@ -940,6 +1061,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 		int bch_status;
 		int32_t info = flex_bch_decode(flex, a_code, &bch_status,
 					       &corrected_word);
+		flex->bch_stats = saved_stats;
 		if (info >= 0)
 			corrected_code = (~corrected_word >> 16) & 0xFFFF;
 		else
@@ -1601,18 +1723,87 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 					flex->rx.s1_tail_count = 1;
 			}
 		} else if (++flex->rx.s1_tail_count > 16) {
-			/* S1 complete — extract inv.A, transition to FIW */
+			/* S1 complete — extract inv.A, run combined
+			 * A/inv.A error correction.  This is the final
+			 * sync validation: if correction fails, the
+			 * sync detection was a false positive. */
 			uint32_t inv_a = flex_extract_inv_a(
 				flex->rx.sync_buf_lo,
 				flex->rx.polarity);
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: S1 complete: "
-				  "A=0x%08X inv.A=0x%08X "
-				  "~inv.A=0x%08X match=%s\n",
-				  flex->rx.sync_a_code, inv_a,
-				  ~inv_a,
-				  (flex->rx.sync_a_code == ~inv_a)
-					? "YES" : "NO");
+
+			/* Reset BCH stats — this is the start of a new
+			 * frame.  The combined correction's BCH decodes
+			 * of A and ~inv.A are the authoritative counts. */
+			memset(&flex->bch_stats, 0, sizeof(flex->bch_stats));
+
+			uint32_t corrected = flex_combined_a_correction(
+				flex, flex->rx.sync_a_code, inv_a);
+
+			if (corrected == 0) {
+				/* Rejected — back to hunting */
+				flex->rx.s1_tail_count = 0;
+				break;
+			}
+
+			/* Validate mode from the combined-corrected A-code.
+			 * We cannot call flex_rx_decode_mode() here because
+			 * it re-extracts A from sync_buf_lo, which has shifted
+			 * 16 bits since sync detection.  Instead, derive the
+			 * sync code and compare against the already-established
+			 * mode directly. */
+			flex->rx.sync_a_code = corrected;
+			{
+				uint32_t final_sync = (~corrected >> 16) & 0xFFFF;
+				int prev_baud = flex->rx.sync_baud;
+				int prev_levels = flex->rx.sync_levels;
+
+				/* Look up mode from corrected sync code */
+				static const struct {
+					uint16_t code;
+					int baud;
+					int levels;
+				} modes[] = {
+					{ FLEX_SYNC_A1, 1600, 2 },
+					{ FLEX_SYNC_A3, 1600, 4 },
+					{ FLEX_SYNC_A2, 3200, 2 },
+					{ FLEX_SYNC_A4, 3200, 4 },
+					{ FLEX_SYNC_REFLEX, 3200, 4 },
+					{ 0, 0, 0 }
+				};
+				int found = 0, mi;
+				for (mi = 0; modes[mi].code != 0; mi++) {
+					if (final_sync == modes[mi].code) {
+						flex->rx.sync_baud = modes[mi].baud;
+						flex->rx.sync_levels = modes[mi].levels;
+						found = 1;
+						break;
+					}
+				}
+				if (!found) {
+					/* Corrected code doesn't map to a
+					 * valid mode — reject */
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: combined correction "
+						  "produced unknown sync "
+						  "0x%04X, rejecting.\n",
+						  final_sync);
+					flex->rx.s1_tail_count = 0;
+					break;
+				}
+				if (final_sync == FLEX_SYNC_AR) {
+					flex->rx.s1_tail_count = 0;
+					break;
+				}
+				if (flex->rx.sync_baud != prev_baud ||
+				    flex->rx.sync_levels != prev_levels) {
+					LOGP_CHAN(DDSP, LOGL_INFO,
+						  "RX: combined correction "
+						  "changed mode: %d/%d → %d/%d.\n",
+						  prev_baud, prev_levels,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels);
+				}
+			}
 
 			flex->rx.rx_state = RX_STATE_FIW;
 			flex->rx.fiw_count = 0;
@@ -1766,33 +1957,34 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 			/* Decision logic: we are already synced from S1 and do not
 			 * expect corrections here.  The blind symbol count is the
 			 * correct baseline.  We only override it when the evidence
-			 * is unambiguous — anything less falls back to nominal.
+			 * is strong — anything less falls back to nominal.
 			 *
 			 * C and inv.C are raw 16-bit correlation patterns, NOT
-			 * BCH-protected.  With a ≤2 error detection threshold,
-			 * there is a ~0.2% per-symbol false positive risk from
-			 * random bit patterns (137/65536).  Over 80 symbols
-			 * that's ~16% chance of a spurious match in BS2.
+			 * BCH-protected.  We use them as redundant copies (like
+			 * A/inv.A): if at least one is clean (0 errors), we
+			 * trust its timing position.
 			 *
 			 * Correction criteria (ALL must hold):
-			 *   1. Both C and inv.C detected with 0 bit errors.
-			 *   2. Gap between them = exactly s2_half.
-			 *   3. Offset from nominal is ±1 or ±2 (not ±0).
-			 *
-			 * This should essentially never trigger in practice —
-			 * the PLL is well-locked by the time S2 starts. */
+			 *   1. Both C and inv.C detected (≤2 errors each).
+			 *   2. At least one has 0 bit errors.
+			 *   3. Gap between them = exactly s2_half.
+			 *   4. Offset from nominal is ±1 (not ±0, not ±2). */
 			if (flex->rx.sync2_c_found && flex->rx.sync2_cinv_found) {
 				int gap = flex->rx.sync2_cinv_pos - flex->rx.sync2_c_pos;
 				int offset = flex->rx.sync2_cinv_pos - s2_symbols;
+				int best_errs = (flex->rx.sync2_c_errs < flex->rx.sync2_cinv_errs)
+					? flex->rx.sync2_c_errs : flex->rx.sync2_cinv_errs;
 
-				if (flex->rx.sync2_c_errs == 0 &&
-				    flex->rx.sync2_cinv_errs == 0 &&
+				if (best_errs == 0 &&
 				    gap == s2_half &&
 				    offset != 0 &&
-				    offset >= -2 && offset <= 2) {
+				    offset >= -1 && offset <= 1) {
 					boundary = flex->rx.sync2_cinv_pos;
 					correction = offset;
-					reason = "C+inv.C perfect";
+					reason = (flex->rx.sync2_c_errs == 0 &&
+						  flex->rx.sync2_cinv_errs == 0)
+						? "C+inv.C perfect"
+						: "C/inv.C one clean";
 				}
 				/* else: detected but not clean enough to correct */
 			}
