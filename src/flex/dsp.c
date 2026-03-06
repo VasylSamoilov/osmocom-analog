@@ -481,6 +481,27 @@ again:
 			LOGP_CHAN(DDSP, LOGL_DEBUG,
 				  "TX frame end: total %d symbols, %d samples\n",
 				  flex->dbg_frame_symbols, flex->dbg_frame_samples);
+
+			/* If no more frames follow, the TX goes silent.
+			 * The RX PLL drifts slightly forward over the frame,
+			 * so the last symbol's vote window extends into silence,
+			 * causing a BCH error.  Append one extra symbol at the
+			 * last level as a guard.  In real operation with
+			 * back-to-back frames, the next S1 provides this
+			 * signal naturally. */
+			if (!flex->msg_list &&
+			    flex->scan_from >= flex->scan_to &&
+			    !flex->sender.loopback) {
+				int guard = (int)(flex->fsk_bitduration + 1.0);
+				sample_t last_val = flex->fsk_tx_buffer[flex->fsk_tx_buffer_length - 1];
+				int gi;
+				for (gi = 0; gi < guard && flex->fsk_tx_buffer_length + gi < flex->fsk_tx_buffer_size; gi++)
+					flex->fsk_tx_buffer[flex->fsk_tx_buffer_length + gi] = last_val;
+				flex->fsk_tx_buffer_length += gi;
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "TX guard: appended %d samples (last_val=%.3f) — no more frames\n",
+					  gi, last_val);
+			}
 		}
 
 		/* Apply baseband LPF after modulation (ARIB STD-43A Chapter 2) */
