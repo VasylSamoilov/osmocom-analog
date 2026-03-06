@@ -1308,47 +1308,17 @@ static uint8_t hex_char_to_nibble(char c)
 }
 
 /*
- * Compute HEX/Binary message signature (Spec §3.10.1.2, S field).
- *
- * 1's complement of binary sum of every 8 bits of the entire message
- * data (all fragments combined), excluding termination fill bits.
- * The input is the full hex string before fragmentation.
- *
- * Every pair of hex chars = 8 bits = one byte added to the sum.
- * If the message has an odd number of hex chars, the last 4 bits
- * are zero-padded to form a full byte for the sum.
- */
-uint8_t flex_hex_signature(const char *hex_msg, size_t len)
-{
-	uint32_t sum = 0;
-	size_t i;
-
-	for (i = 0; i + 1 < len; i += 2) {
-		uint8_t hi = hex_char_to_nibble(hex_msg[i]);
-		uint8_t lo = hex_char_to_nibble(hex_msg[i + 1]);
-		sum += (uint32_t)((hi << 4) | lo);
-	}
-	/* Odd trailing hex char: pad low 4 bits with zero */
-	if (i < len) {
-		uint8_t hi = hex_char_to_nibble(hex_msg[i]);
-		sum += (uint32_t)(hi << 4);
-	}
-
-	return (uint8_t)(~sum & 0xFF);
-}
-
-/*
  * Encode hex/binary message (Spec Section 3.9.3).
  *
- * Hex characters are converted to 4-bit values and packed 5 per
+ * Hex characters are converted to 4-bit nibbles and packed 5 per
  * 21-bit message word (5 × 4 = 20 bits used, 1 bit unused).
  *
  * Packing order within each word:
- *   bits  0-3:  hex digit 0 (first hex char)
- *   bits  4-7:  hex digit 1
- *   bits  8-11: hex digit 2
- *   bits 12-15: hex digit 3
- *   bits 16-19: hex digit 4
+ *   bits  0-3:  nibble 0 (first hex char)
+ *   bits  4-7:  nibble 1
+ *   bits  8-11: nibble 2
+ *   bits 12-15: nibble 3
+ *   bits 16-19: nibble 4
  *   bit  20:    unused (0)
  *
  * The function writes the hex vector word followed by encoded message
