@@ -63,7 +63,7 @@ static uint32_t ssid = 0;
 static uint32_t nid = 0;
 static uint32_t country_code = 0;
 static uint32_t tmf_flags = 0;
-static int timezone_code = -1;		/* -1 = none, 0-31 = zone code per Table 3.7.2-3 */
+static int timezone_code = -1;		/* -1 = none, 0-31 = 5-bit zone code (Z4..Z0) */
 static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
 static int no_ers = 0;
@@ -110,14 +110,17 @@ void print_help(const char *arg0)
 	printf("        Choose polarity of FSK signal. (default %s).\n", (polarity < 0) ? "negative" : "positive");
 	printf(" -y --type auto | tone | numeric | alpha | hex | instruction | short\n");
 	printf("        Set message type. (default auto)\n");
-	printf("        Vector types per ARIB STD-43A Section 3.9:\n");
-	printf("          tone        — type 2: alert only, no message body\n");
-	printf("          numeric     — type 3: BCD-encoded digits\n");
-	printf("          alpha       — type 5: 7-bit alphanumeric characters\n");
-	printf("          hex         — type 6: raw hex/binary data\n");
-	printf("          instruction — type 1: 14-bit short instruction word\n");
-	printf("          short       — type 2: short message index (0-127)\n");
+	printf("        Message types (V2V1V0 vector type field):\n");
+	printf("          tone        — V=010: alert only, no message body\n");
+	printf("          numeric     — V=011: 4-bit BCD digits, 5 chars/word\n");
+	printf("          alpha       — V=101: 7-bit alphanumeric (3 chars/word)\n");
+	printf("          hex         — V=110: raw hex/binary data\n");
+	printf("          instruction — V=001: 14-bit short instruction word\n");
+	printf("          short       — V=010: short message index (0-127)\n");
 	printf("          auto        — detect from message content\n");
+	printf("        RX output tags: ALN=alpha, SEC=secure(V=000),\n");
+	printf("          NUM=standard numeric, SNUM=special format, NNUM=numbered,\n");
+	printf("          HEX=hex/binary, TON=tone, INS=instruction\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Default message text. (default \"%s\").\n", message);
 	printf(" -S --scan <from> <to>\n");
@@ -154,7 +157,7 @@ void print_help(const char *arg0)
 	printf("    --tmf <N>\n");
 	printf("        Set SSID2 traffic management flags (0-15, 4-bit bitmask).\n");
 	printf("    --timezone <N>\n");
-	printf("        Set timezone zone code (0-31, per Table 3.7.2-3).\n");
+	printf("        Set timezone zone code (0-31, 5-bit Z4..Z0).\n");
 	printf("        Emitted as BIW SysInfo type 101 (A=4). Use 'timezone,0,,' FIFO\n");
 	printf("        command to list all zone codes. Common: 9=JST, 24=PST, 27=EST.\n");
 	printf("    --pocsag-mix <frames>\n");
@@ -178,7 +181,7 @@ void print_help(const char *arg0)
 	printf("        1-15 = that many bits/char, 0 or 16 = 16 bits/char.\n");
 	printf("        Default 1 (raw bits). Stored as B field in header word 2.\n");
 	printf("    --num-transmissions <1-4>\n");
-	printf("        Multiple transmission count (Spec Section 3.4.2).\n");
+	printf("        Multiple transmission count (subframe repeat).\n");
 	printf("        1=single (default), 2/3/4=subframe repeat.\n");
 	printf("        Subframe words: 2x=44, 3x=29, 4x=22. Requires --network.\n");
 	printf("    --td-collapse <5|6|7>\n");
@@ -200,7 +203,7 @@ void print_help(const char *arg0)
 	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
 	printf("        Special: timezone,<code>,,  — show offset for zone code 0-31\n");
 	printf("        Special: sysmsg,<lsb>,,<payload>  — send system message via\n");
-	printf("          Operator Messaging Address (Fig. 3.7.2-2(c)).\n");
+	printf("          Operator Messaging Address (capcode 0x1F7800-0x1F780F).\n");
 	printf("          LSB: 0=all 1=home 2=roaming 3=ssid 4=time 14=SSIDChange 15=SysEvent\n");
 	printf("        Examples:\n");
 	printf("          1234567,alpha,,Hello World\n");
@@ -404,7 +407,7 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_TIMEZONE:
 		timezone_code = atoi(argv[argi]);
 		if (timezone_code < 0 || timezone_code >= (int)FLEX_TZ_ENTRIES) {
-			fprintf(stderr, "Timezone code must be 0-31 (Table 3.7.2-3), use '-h' for help.\n");
+			fprintf(stderr, "Timezone code must be 0-31 (5-bit Z4..Z0), use '-h' for help.\n");
 			return -EINVAL;
 		}
 		if (timezone_code == (int)FLEX_TZ_RESERVED) {
@@ -651,7 +654,7 @@ static void fifo_process_line(const char *text, int text_length)
 	/* === ERS command: "ers,0,," ===
 	 * Triggers an Emergency Re-Synchronization burst.
 	 * Format: ers,0,,
-	 * Duration is calculated from collapse value per Section 3.2.1.
+	 * Duration is calculated from collapse value (ERS cycles).
 	 *
 	 * Polarity is irrelevant for ERS: each cycle is BS+Ar+BS_inv+Ar_inv,
 	 * so inverting all bits (= flipping polarity) just shifts the
@@ -731,7 +734,7 @@ static void fifo_process_line(const char *text, int text_length)
 	}
 
 	/* === Timezone command: "timezone,0,," or "timezone,<code>,," ===
-	 * Dumps the Table 3.7.2-3 timezone conversion table, or shows
+	 * Dumps the 32-entry timezone conversion table, or shows
 	 * the offset for a specific 5-bit zone code (0-31). */
 	if (!strcasecmp(capcode_string, "timezone")) {
 		int tlen = comma2 - comma1 - 1;
@@ -743,7 +746,7 @@ static void fifo_process_line(const char *text, int text_length)
 			/* Dump full table */
 			char fmtbuf[20];
 			uint32_t i;
-			LOGP(DFLEX, LOGL_NOTICE, "FIFO: Table 3.7.2-3 timezone conversion (32 entries):\n");
+			LOGP(DFLEX, LOGL_NOTICE, "FIFO: Timezone conversion table (32 entries, 5-bit Z4..Z0):\n");
 			for (i = 0; i < FLEX_TZ_ENTRIES; i++) {
 				if (i == FLEX_TZ_RESERVED) {
 					LOGP(DFLEX, LOGL_NOTICE, "  zone=%2u (reserved)\n", i);
@@ -772,7 +775,7 @@ static void fifo_process_line(const char *text, int text_length)
 
 	/* === System Message command: "sysmsg,<lsb>,,<payload>" ===
 	 * Sends a system message via Operator Messaging Address
-	 * (Fig. 3.7.2-2(c) — Operator Messaging Address only).
+	 * (capcode 0x1F7800 + LSB, range 0x1F7800-0x1F780F).
 	 *
 	 * The <lsb> field (0-15) selects the operator address sub-type:
 	 *   0 = all pagers    1 = home area    2 = roaming    3 = SSID
@@ -787,8 +790,8 @@ static void fifo_process_line(const char *text, int text_length)
 	 *   sysmsg,14,,                (SSIDChange, empty payload = TMF update)
 	 *   sysmsg,4,,                 (time-related system message)
 	 *
-	 * Per Section 3.7.2: "Tone-Only Addresses cannot be transmitted
-	 * in Frames used for transmitting System Messages." */
+	 * Note: Tone-Only Addresses cannot be transmitted in frames
+	 * used for transmitting System Messages. */
 	if (!strcasecmp(capcode_string, "sysmsg")) {
 		flex_t *flex = (flex_t *)sender_head;
 		int lsb;
@@ -818,7 +821,7 @@ static void fifo_process_line(const char *text, int text_length)
 		}
 
 		/* Compute the operator messaging capcode.
-		 * Base address 0x1F7810 + LSB per Table 3.8.1-1. */
+		 * Base address 0x1F7810 + LSB (range 0-15). */
 		{
 			uint64_t oper_capcode = (uint64_t)(FLEX_ADDR_OPER_MSG_MIN + (uint32_t)lsb);
 			flex_msg_t *msg;
@@ -885,7 +888,7 @@ static void fifo_process_line(const char *text, int text_length)
 	}
 
 	/* Validate message type.
-	 * Accept names or numeric codes matching ARIB STD-43A vector types:
+	 * Accept names or numeric codes:
 	 *   0=auto, 1=tone, 2=numeric, 3=alpha, 4=hex, 5=instruction, 6=short
 	 * Also accept vector type numbers directly for advanced use:
 	 *   vtype1=instruction, vtype2=tone, vtype3=numeric, vtype5=alpha, vtype6=hex */

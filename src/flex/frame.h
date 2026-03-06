@@ -19,7 +19,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ===== BCH(31,21) Error Correction (Spec Section 3.5.2) ===== */
+/* ===== BCH(31,21) Error Correction ===== */
 
 /* Generator polynomial: x^10 + x^9 + x^8 + x^6 + x^5 + x^3 + 1
  * Binary: 11101101001 = 0x769 */
@@ -29,7 +29,7 @@
 #define FLEX_BCH_PARITY_BITS	1
 #define FLEX_CODEWORD_BITS	(FLEX_BCH_DATA_BITS + FLEX_BCH_ECC_BITS + FLEX_BCH_PARITY_BITS)
 
-/* ===== Per-Word BCH Status (Spec Section 3.3.3) =====
+/* ===== Per-Word BCH Status =====
  *
  * Each word in a received block goes through BCH(31,21) error correction
  * and even parity check.  The result is one of four states:
@@ -45,14 +45,14 @@ enum flex_word_status {
 	FLEX_WORD_UNCORRECTABLE,	/* BCH failed, data invalid */
 };
 
-/* ===== Frame Structure (Spec Section 3.3) ===== */
+/* ===== Frame Structure ===== */
 
 #define FLEX_BASE_BAUD		1600	/* S1/FIW symbol rate: always 1600 baud */
 #define FLEX_BLOCKS_PER_FRAME	11
 #define FLEX_WORDS_PER_BLOCK	8
 #define FLEX_WORDS_PER_FRAME	(FLEX_BLOCKS_PER_FRAME * FLEX_WORDS_PER_BLOCK)
 
-/* ===== Idle Word Patterns (Section 3.4.1, Fig. 3.4.1-3) =====
+/* ===== Idle Word Patterns =====
  *
  * When no addresses, vectors, or messages are present, the frame
  * can be shortened to block 0 only (S1 + FI + S2 + BI + IB).
@@ -69,22 +69,22 @@ enum flex_word_status {
 /* Idle word 2: all zeros (odd-indexed idle words) */
 #define FLEX_IDLE_WORD_2	0x00000000U
 
-/* ===== Multiple Transmission Subframe Structure (Section 3.4.2) =====
+/* ===== Multiple Transmission Subframe Structure =====
  *
  * When multiple transmission is active (FIW r=1), the 88-word frame
  * is divided into N subframes (N = num_transmissions).
  *
- * Per Fig. 3.4.2-1:
+ * Subframe sizes:
  *   2x: 2 subframes × 44 words = 88 words
  *   3x: 3 subframes × 29 words = 87 words (+1 extra idle word)
  *   4x: 4 subframes × 22 words = 88 words
  *
- * Per Fig. 3.4.2-2: word numbers within each subframe start at 0.
+ * Word numbers within each subframe start at 0.
  * Word 0 always contains the Block Information Word.
  *
  * Each subframe is transmitted at a repeat interval equal to the
  * System Collapse cycle (2^m frames).  The repeat unit =
- * num_transmissions × repeat_interval (Fig. 3.4.2-3).
+ * num_transmissions × repeat_interval.
  *
  * Per spec: "the same bit stream as transmitted for the 1st
  * transmission is transmitted for the Block Information Word,
@@ -116,7 +116,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 	return subframe_index * flex_subframe_words(num_transmissions);
 }
 
-/* ===== Emergency Re-Synchronization (Spec Section 3.2.1) ===== */
+/* ===== Emergency Re-Synchronization ===== */
 
 /* Default ERS cycle count.
  * Each cycle = BS + AR + BS_inv + AR_inv = 12 bytes = 96 bits.
@@ -126,7 +126,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
  * It forces pagers to re-acquire synchronization before data frames
  * are transmitted. ERS is emitted as a separate event in the TX stream.
  *
- * Per Section 3.2.1, the ERS duration depends on the maximum collapse
+ * The ERS duration depends on the maximum collapse
  * cycle value in use:
  *   m=0 (collapse=0): pager decodes ALL frames → ERS needs only 1.875 sec
  *   m=7 (collapse=7): pager decodes every 128th frame → ERS needs 4 minutes
@@ -134,7 +134,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
  * Default mode uses collapse=0, so 35 cycles (~2.1 sec) is sufficient. */
 #define FLEX_ERS_CYCLES		35
 
-/* ===== Capcode Address Ranges (Spec Section 3.8, Appendix A) ===== */
+/* ===== Capcode Address Ranges ===== */
 
 /* Short address: 7-digit capcodes (1 address word) */
 #define FLEX_SHORT_ADDR_MIN	1ULL
@@ -145,7 +145,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_LONG_ADDR_MIN	2101249ULL
 #define FLEX_LONG_ADDR_MAX	4297068542ULL
 
-/* Long address set boundaries (ARIB STD-43A Section 3.8.2.2, Table 3.8.2.2-1) */
+/* Long address set boundaries (3 overlapping sets, w1+w2 encoding) */
 #define FLEX_LONG_SET12_MIN	2101249ULL
 #define FLEX_LONG_SET12_MAX	1075843072ULL
 #define FLEX_LONG_SET34_MIN	1075843073ULL
@@ -153,7 +153,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_LONG_SET23_MIN	3223326721ULL
 #define FLEX_LONG_SET23_MAX	4297068542ULL
 
-/* Long address encoding offsets (ARIB STD-43A Appendix A, Section 6) */
+/* Long address encoding offsets (used in capcode ↔ w1/w2 conversion) */
 #define FLEX_LONG_OFFSET_A	2068481ULL	/* Sets 1-2, 1-3, 1-4 */
 #define FLEX_LONG_OFFSET_B	2068479ULL	/* Set 2-3 */
 #define FLEX_LONG_W2_SET12	2097151U	/* w2 base for set 1-2 */
@@ -175,25 +175,32 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_MAX_MSG_WORDS_HEX		FLEX_MAX_MSG_WORDS_ALPHA
 #define FLEX_MAX_CHARS_HEX		(FLEX_MAX_MSG_WORDS_HEX * 5)
 
-/* ===== Vector Word Types (Spec Section 3.9) =====
+/* ===== Vector Word Types =====
  *
- * 3-bit type field extracted as (viw >> 4) & 0x7.
- * Values per ARIB STD-43A and confirmed by PDW (MODE_*) and
- * multimon-ng (FLEX_PAGETYPE_*):
- *   0 = Secure, 1 = Short Instruction, 2 = Tone-Only/Short Message,
- *   3 = Standard Numeric, 4 = Special Format Numeric,
- *   5 = Alphanumeric, 6 = HEX/Binary, 7 = Numbered Numeric */
+ * V2V1V0 type field extracted as (viw >> 4) & 0x7.
+ *
+ *   V   Message                  RX tag  Overview
+ *   000 Secure Message           SEC     Operator control (t1t0 subtype)
+ *   001 (Short Instruction)      INS     14-bit instruction data
+ *   010 (Tone-Only/Short Msg)    TON     Alert only, no message body
+ *   011 Standard Numeric         NUM     4-bit BCD, 1 char in 4 bits
+ *   100 Special Format Numeric   SNUM    BCD, display per ID-ROM
+ *   101 Alphanumeric             ALN     7-bit chars, 1 char in 7 bits
+ *   110 HEX/Binary               HEX     Raw hex/binary data
+ *   111 Numbered Numeric         NNUM    BCD with message number N
+ *
+ * Confirmed by PDW (MODE_*) and multimon-ng (FLEX_PAGETYPE_*). */
 
-#define FLEX_VECTOR_TYPE_SECURE		0x0	/* Secure message (3.9.5) */
-#define FLEX_VECTOR_TYPE_SHORT_INSTR	0x1	/* Short instruction (3.9.6) */
-#define FLEX_VECTOR_TYPE_TONE		0x2	/* Tone-only / short message (3.9.2) */
-#define FLEX_VECTOR_TYPE_NUMERIC	0x3	/* Standard numeric (3.9.1) */
-#define FLEX_VECTOR_TYPE_SPECIAL_NUM	0x4	/* Special format numeric (3.9.1) */
-#define FLEX_VECTOR_TYPE_ALPHA		0x5	/* Alphanumeric (3.9.4) */
-#define FLEX_VECTOR_TYPE_HEX_BINARY	0x6	/* HEX/Binary (3.9.3) */
-#define FLEX_VECTOR_TYPE_NUMBERED_NUM	0x7	/* Numbered numeric (3.9.1) */
+#define FLEX_VECTOR_TYPE_SECURE		0x0	/* Secure message */
+#define FLEX_VECTOR_TYPE_SHORT_INSTR	0x1	/* Short instruction */
+#define FLEX_VECTOR_TYPE_TONE		0x2	/* Tone-only / short message */
+#define FLEX_VECTOR_TYPE_NUMERIC	0x3	/* Standard numeric */
+#define FLEX_VECTOR_TYPE_SPECIAL_NUM	0x4	/* Special format numeric */
+#define FLEX_VECTOR_TYPE_ALPHA		0x5	/* Alphanumeric */
+#define FLEX_VECTOR_TYPE_HEX_BINARY	0x6	/* HEX/Binary */
+#define FLEX_VECTOR_TYPE_NUMBERED_NUM	0x7	/* Numbered numeric */
 
-/* ===== Vector Word Bit Fields (Spec Section 3.9) =====
+/* ===== Vector Word Bit Fields =====
  *
  * Vector information word layout (21 data bits):
  *   bits 0-3:   checksum (4-bit nibble sum)
@@ -224,7 +231,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_VEC_LEN(viw)	(((viw) >> FLEX_VEC_LEN_SHIFT) & FLEX_VEC_LEN_MASK)
 #define FLEX_VEC_INSTR_DATA(viw) (((viw) >> FLEX_VEC_INSTR_SHIFT) & FLEX_VEC_INSTR_MASK)
 
-/* ===== FIW Bit Fields (Spec Section 3.6) =====
+/* ===== FIW Bit Fields =====
  *
  * Frame Information Word layout (21 data bits):
  *   bits 0-3:   checksum (sum of all nibbles + bit20 = 0xF)
@@ -245,7 +252,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_FIW_TRAFFIC_MASK	0x0F
 #define FLEX_FIW_CHECKSUM_OK	0x0F	/* expected checksum result */
 
-/* ===== BIW1 Bit Fields (Spec Section 3.7.1) =====
+/* ===== BIW1 Bit Fields =====
  *
  * Block Information Word 1 layout (21 data bits):
  *   bits 0-3:   checksum
@@ -266,13 +273,13 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_BIW1_COLLAPSE_SHIFT 18
 #define FLEX_BIW1_COLLAPSE_MASK	0x07
 
-/* BIW1 idle detection (Fig. 3.4.1-4): when BIW word 0 is all-zeros
+/* BIW1 idle detection: when BIW word 0 is all-zeros
  * or all-ones in the 21-bit data field, the frame contains no
  * addresses, vectors, or messages — skip decode. */
 #define FLEX_BIW_IDLE_ZEROS	0x00000000U
 #define FLEX_BIW_IDLE_ONES	0x001FFFFFU
 
-/* ===== BIW2/3/4 Type Field (Spec Section 3.7.2, Table 3.7.2-1) =====
+/* ===== BIW2/3/4 Type Field =====
  *
  * Block Information Words 2, 3, and 4 share a common layout:
  *   bits 0-3:   checksum (x)
@@ -298,7 +305,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_BIW_TYPE_SYSINFO	0x05	/* 101: system information */
 #define FLEX_BIW_TYPE_SSID2	0x07	/* 111: SSID2 (country code, TMF) */
 
-/* ===== BIW Type 000: SSID1 (Spec Section 3.7.2) =====
+/* ===== BIW Type 000: SSID1 =====
  *
  * Local channel ID and coverage zone.
  * Per PDW: "SSID/Local ID's (i8-i0)(512) & Coverage Zones (c4-c0)(32)"
@@ -318,13 +325,13 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_BIW_SSID1_LOCALID_SHIFT	12
 #define FLEX_BIW_SSID1_LOCALID_MASK	0x01FF	/* 9 bits */
 
-/* Table 3.7.2-3: Time Zone conversion table.
+/* Time Zone conversion table.
  * Index = 5-bit zone area code (Z4..Z0), value = offset from UTC in minutes.
- * Entry 16 (10000) is reserved/unspecified in the standard (marked "—"). */
+ * Entry 16 (10000) is reserved/unspecified (marked "—"). */
 #define FLEX_TZ_ENTRIES		32
 #define FLEX_TZ_RESERVED	16	/* zone code 10000 = reserved */
 
-/* Table 3.7.2-3 timezone offset in minutes, indexed by 5-bit zone code.
+/* Timezone offset in minutes, indexed by 5-bit zone code.
  * Codes 0-15 map to whole-hour offsets -12h..+12h (with -0h at 0).
  * Codes 16-31 map to fractional offsets per the standard table.
  * Code 16 is reserved (shown as "—" in standard); we use 0. */
@@ -401,10 +408,10 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 	return FLEX_TZ_RESERVED;
 }
 
-/* ===== BIW Type 001: Date (Spec Section 3.7.2) =====
+/* ===== BIW Type 001: Date =====
  *
  * Month, day, year.
- * Standard layout (from Table 3.7.2-1, type 001):
+ * Layout (BIW type 001, 21 data bits):
  *   bits 7-11:  year (Y4-Y0, 5 bits, 00000-11111, 1994-2025)
  *   bits 12-16: day (d4-d0, 5 bits, 00001-11111, 1-31)
  *   bits 17-20: month (m3-m0, 4 bits, 0001-1100, Jan-Dec)
@@ -422,10 +429,10 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 #define FLEX_BIW_DATE_MONTH_SHIFT	17
 #define FLEX_BIW_DATE_MONTH_MASK	0x0F
 
-/* ===== BIW Type 010: Time (Spec Section 3.7.2) =====
+/* ===== BIW Type 010: Time =====
  *
  * Hour, minute, second.
- * Standard layout (from Table 3.7.2-1, type 010):
+ * Layout (BIW type 010, 21 data bits):
  *   bits 7-11:  hour (h4-h0, 5 bits, 00000-10111, 0-23)
  *   bits 12-17: minute (m5-m0, 6 bits, 000000-111011, 0-59)
  *   bits 18-20: second (s2-s0, 3 bits, 000-111, 1/8 minute = 7.5s steps)
@@ -446,13 +453,13 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 #define FLEX_BIW_TIME_SECOND_MASK	0x07
 #define FLEX_BIW_TIME_SECOND_STEP	7.5	/* each unit = 7.5 seconds */
 
-/* ===== BIW Type 101: System Information (Spec Section 3.7.2) =====
+/* ===== BIW Type 101: System Information =====
  *
  * System messages, timezone, DST, and extended seconds.
- *   bits 7-10:  A3-A0 (4 bits, system message type per Table 3.7.2-2)
+ *   bits 7-10:  A3-A0 (4 bits, system message type — see A values below)
  *   bits 11-20: I9-I0 (10 bits, system info data — layout depends on A)
  *
- * A3-A0 values per Table 3.7.2-2:
+ * A3-A0 values:
  *   0000 = System Message for all subscriber units
  *   0001 = System Message for all pagers in Home
  *   0010 = System Message for all Roaming pagers
@@ -470,7 +477,7 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
  *   I5    (1 bit):  L0 Day Light Saving Time flag.
  *                   L0=0: transmitted time is Day Light Saving Time.
  *                   L0=1: transmitted time is standard time.
- *   I4-I0 (5 bits): Z4-Z0 Time Zone code per Table 3.7.2-3.
+ *   I4-I0 (5 bits): Z4-Z0 Time Zone code (5-bit zone code, 0-31).
  *
  * For A=0110 (Channel Set Up Instruction), the I field is:
  *   I9    (1 bit):  B0 System Message Bit (1=channel supports SysMsg)
@@ -482,17 +489,17 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
  * - BIW 101 for System Messages may appear once per phase per frame.
  * - When BIW 101 A=0000-0100 is present in Frame 0, corresponding
  *   vectors (except Secure) go at end of vector field, and System
- *   Messages are in the Message field (Fig. 3.7.2-2).
+ *   Messages are in the Message field.
  * - Tone-Only addresses cannot be in frames carrying System Messages.
  * - At least 1 time-related BIW (001, 010, or 101) must be in each
- *   phase of Frame 0 Cycle 0 (Section 3.7.2).
+ *   phase of Frame 0 Cycle 0.
  */
 #define FLEX_BIW_SYSINFO_A_SHIFT	7
 #define FLEX_BIW_SYSINFO_A_MASK		0x0F
 #define FLEX_BIW_SYSINFO_I_SHIFT	11
 #define FLEX_BIW_SYSINFO_I_MASK		0x03FF	/* 10 bits */
 
-/* SysInfo A-type values (Table 3.7.2-2) */
+/* SysInfo A-type values */
 #define FLEX_BIW_SYSINFO_A_MSG_ALL	0x00	/* 0000: System Message for all pagers */
 #define FLEX_BIW_SYSINFO_A_MSG_HOME	0x01	/* 0001: System Message for Home pagers */
 #define FLEX_BIW_SYSINFO_A_MSG_ROAM	0x02	/* 0010: System Message for Roaming pagers */
@@ -504,7 +511,7 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 /* SysInfo I-field sub-fields for A=0100/0101 (time-related).
  *
  * I-field layout (10 bits, within the 21-bit data word at SYSINFO_I_SHIFT):
- *   I0-I4: Z0-Z4 timezone zone code (5 bits, Table 3.7.2-3)
+ *   I0-I4: Z0-Z4 timezone zone code (5 bits, 0-31)
  *   I5:    L0 DST flag (0=DST, 1=standard time)
  *   I6:    reserved
  *   I7-I9: S3-S5 extended seconds (3 bits, 1/64 min = 0.9375s steps)
@@ -524,7 +531,7 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 #define FLEX_BIW_SYSINFO_NID_BIT	 8	/* I8: N0 NID System Message Bit */
 #define FLEX_BIW_SYSINFO_SYSMSG_BIT	 9	/* I9: B0 System Message Bit */
 
-/* ===== BIW Type 111: SSID2 (Spec Section 3.7.2) =====
+/* ===== BIW Type 111: SSID2 =====
  *
  * Country code and traffic management flags.
  *   bits 7-10:  traffic management flags (T3-T0, 4 bits)
@@ -850,7 +857,7 @@ static inline const char *flex_biw_type_name(uint32_t btype)
 	}
 }
 
-/* Human-readable name for BIW SysInfo A-type (Table 3.7.2-2) */
+/* Human-readable name for BIW SysInfo A-type */
 static inline const char *flex_biw_sysinfo_a_name(uint32_t a_type)
 {
 	switch (a_type) {
@@ -866,7 +873,7 @@ static inline const char *flex_biw_sysinfo_a_name(uint32_t a_type)
 }
 
 /* Check if a BIW SysInfo A-type indicates a System Message (A=0000~0100).
- * Per Spec Section 3.7.2 / Fig. 3.7.2-2(a): when BIW101 has A=0000~0100,
+ * When BIW101 has A=0000~0100,
  * vectors are placed at the end of the vector field and system messages
  * are in the message field.
  * "Tone-Only Addresses cannot be transmitted in Frames used for
@@ -939,7 +946,7 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
 	return biw_year; /* no match found, return as-is */
 }
 
-/* ===== Address Word Type Ranges (Spec Table 3.8.1-1) =====
+/* ===== Address Word Type Ranges =====
  *
  * After BCH decode, the 21-bit address word value determines its type.
  * All ranges below are the raw 21-bit word values (NOT capcodes).
@@ -976,21 +983,21 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
 #define FLEX_ADDR_SHORT_MIN	0x008001U	/* 32,769 */
 #define FLEX_ADDR_SHORT_MAX	0x1E0000U	/* 1,966,080 */
 
-/* Special address ranges (Table 3.8.1-1 remarks)
+/* Special address ranges (gap between LA4 and LA2)
  *
  * These are single-word address types between LA4 and LA2 that serve
  * special protocol functions.  They are NOT user-assignable capcodes.
  *
  * Reserved Short:     Reserved for future use (no defined behavior).
  * Info Service:       Under study (no defined behavior yet).
- * Network:            NID system messages (Section 6.1.2).
+ * Network:            NID system messages.
  *                     Transmitted using Secure (type 0) vector.
  *                     Message contains Service Area ID, Multiplier,
  *                     and Traffic Management Flags.
- * Temporary:          Group messaging (Section 5.2).
+ * Temporary:          Group messaging (16 temp address slots).
  *                     16 addresses assigned via short instruction vectors.
  *                     Used for temporary group address assignment.
- * Operator Messaging: System messages and change instructions (Section 3.8.2.4).
+ * Operator Messaging: System messages and change instructions.
  *                     LSB 0000–0100 (5 addrs): System Messages
  *                       0000 = all pagers
  *                       0001 = all pagers in Home
@@ -1004,16 +1011,16 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
 #define FLEX_ADDR_RSVD_SHORT1_MAX	0x1F27FFU	/* 2,041,855 */
 #define FLEX_ADDR_INFO_SVC_MIN		0x1F2800U	/* 2,041,856 — under study */
 #define FLEX_ADDR_INFO_SVC_MAX		0x1F67FFU	/* 2,058,239 */
-#define FLEX_ADDR_NETWORK_MIN		0x1F6800U	/* 2,058,240 — NID (Section 6.1.2) */
+#define FLEX_ADDR_NETWORK_MIN		0x1F6800U	/* 2,058,240 — NID */
 #define FLEX_ADDR_NETWORK_MAX		0x1F77FFU	/* 2,062,335 */
-#define FLEX_ADDR_TEMPORARY_MIN		0x1F7800U	/* 2,062,336 — group messaging (Section 5.2) */
+#define FLEX_ADDR_TEMPORARY_MIN		0x1F7800U	/* 2,062,336 — group messaging */
 #define FLEX_ADDR_TEMPORARY_MAX		0x1F780FU	/* 2,062,351 */
-#define FLEX_ADDR_OPER_MSG_MIN		0x1F7810U	/* 2,062,352 — system messages (Section 3.8.2.4) */
+#define FLEX_ADDR_OPER_MSG_MIN		0x1F7810U	/* 2,062,352 — system messages */
 #define FLEX_ADDR_OPER_MSG_MAX		0x1F781FU	/* 2,062,367 */
 #define FLEX_ADDR_RSVD_SHORT2_MIN	0x1F7820U	/* 2,062,368 — reserved for future use */
 #define FLEX_ADDR_RSVD_SHORT2_MAX	0x1F7FFEU	/* 2,064,382 */
 
-/* Operator Messaging Address sub-types (Table 3.8.2.4-1).
+/* Operator Messaging Address sub-types.
  * Base address: 1 1111 0111 1000 0001 0000 (0x1F7810).
  * The 4 LSBs select the function:
  *
@@ -1055,7 +1062,7 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
 #define FLEX_OPER_MSG_SSID		0x03U	/* all SSID pagers */
 #define FLEX_OPER_MSG_TIME		0x04U	/* time related message for all pagers */
 
-/* ===== Temporary Address Slots (Spec Section 5.2) =====
+/* ===== Temporary Address Slots =====
  *
  * 16 temporary address slots (0x1F7800–0x1F780F) are assigned via
  * short instruction vectors.  The slot index is the 4 LSBs of the
@@ -1075,16 +1082,16 @@ static inline uint32_t flex_temp_addr_slot(uint32_t aw)
 	return (aw - FLEX_ADDR_TEMPORARY_MIN) & FLEX_TEMP_ADDR_SLOT_MASK;
 }
 
-/* ===== Short Instruction Type Field (Spec Section 3.9.6, ARIB STD-43A §5.2) =====
+/* ===== Short Instruction Type Field =====
  *
  * The 14-bit instruction data from a short instruction vector (type 1)
  * is extracted by FLEX_VEC_INSTR_DATA() from bits 7-20 of the 21-bit word.
  *
- * Within the 14-bit value (Fig. 3.9.6-1):
+ * Within the 14-bit value:
  *   bits 0-2:   i0 i1 i2  (3-bit instruction type)
  *   bits 3-13:  d0-d10    (11-bit instruction-specific data)
  *
- * For Temporary Address (i2i1i0 = 000, Table 3.9.6-1):
+ * For Temporary Address (i2i1i0 = 000):
  *   bits 3-9:   f0-f6  (7-bit target frame number for group message)
  *   bits 10-13: a0-a3  (4-bit temp address slot index, 0-15)
  *
@@ -1094,7 +1101,7 @@ static inline uint32_t flex_temp_addr_slot(uint32_t aw)
  * Then the group message is sent to that temp address in the
  * designated frame, reaching all assigned pagers.
  *
- * Per §5.2: "The assigned Temporary Address is only valid for the
+ * Per the spec: "The assigned Temporary Address is only valid for the
  * Frame in which the Temporary Address is transmitted."
  */
 #define FLEX_INSTR_TYPE_MASK		0x07U	/* bits 0-2: instruction type (i2 i1 i0) */
@@ -1148,7 +1155,7 @@ static inline const char *flex_instr_type_name(uint32_t itype)
 	}
 }
 
-/* ===== Network Message Payload (Spec Section 6.1.2) =====
+/* ===== Network Message Payload =====
  *
  * Network (NID) messages are transmitted using Secure (type 0) vectors.
  * The message payload contains system information fields.
@@ -1158,7 +1165,7 @@ static inline const char *flex_instr_type_name(uint32_t itype)
  *   bits 12-15: Coverage Zone Count (4 bits, 0-15)
  *   bits 16-20: Traffic Management Flags (5 bits)
  *
- * Traffic Management Flags (Section 6.1.2):
+ * Traffic Management Flags:
  *   bit 16: System overload indicator
  *   bit 17: Reserved
  *   bit 18: Reserved
@@ -1194,7 +1201,7 @@ static inline int flex_net_is_overloaded(uint32_t mw)
 	return (mw & FLEX_NET_OVERLOAD_BIT) ? 1 : 0;
 }
 
-/* ===== Operator Messaging Sub-type Classification (Section 3.8.2.4) ===== */
+/* ===== Operator Messaging Sub-type Classification ===== */
 
 /* Operator messaging sub-type categories */
 enum flex_oper_msg_category {
@@ -1229,16 +1236,16 @@ static inline const char *flex_oper_msg_category_name(enum flex_oper_msg_categor
 	return "?";
 }
 
-/* ===== Address Word Group/Temporary Flags (Spec Section 3.8.2.2) =====
+/* ===== Address Word Group/Temporary Flags =====
  *
  * In the 21-bit address word, bit 20 (MSB) is the group flag and bit 19
  * is the temporary group flag.  These must be extracted BEFORE the
- * remaining bits are classified per Table 3.8.1-1.
+ * remaining bits are classified.
  *
  * Bit layout:
  *   bit 20:    G  — group address flag (1 = group, 0 = individual)
  *   bit 19:    T  — temporary group flag (1 = temporary, 0 = common)
- *   bits 0-18: base address word (classified per Table 3.8.1-1)
+ *   bits 0-18: base address word (classified by range)
  *
  * For individual addresses (G=0), bits 19-20 are part of the normal
  * address word value and the full 21-bit word is classified directly.
@@ -1274,7 +1281,7 @@ static inline uint32_t flex_decode_addr_flags(uint32_t aw, int *is_group, int *i
 	return aw;
 }
 
-/* ===== Address Word Type Classification (Spec Table 3.8.1-1) ===== */
+/* ===== Address Word Type Classification ===== */
 
 enum flex_addr_type {
 	FLEX_ADDR_LONG1,		/* Long Address 1 (pair word) */
@@ -1290,7 +1297,7 @@ enum flex_addr_type {
 	FLEX_ADDR_UNKNOWN,		/* Unknown / invalid */
 };
 
-/* Classify a 21-bit address word per Table 3.8.1-1.
+/* Classify a 21-bit address word by range.
  * Returns the address type enum value. */
 static inline enum flex_addr_type flex_classify_addr_word(uint32_t aw)
 {
@@ -1397,7 +1404,7 @@ static inline char flex_group_flag_char(int is_group, int is_temp)
 	return ' ';
 }
 
-/* Long address set name from w1/w2 types (Table 3.8.2.2-1). */
+/* Long address set name from w1/w2 types. */
 static inline const char *flex_long_set_name(uint32_t w1, uint32_t w2)
 {
 	enum flex_addr_type t1 = flex_classify_addr_word(w1);
@@ -1470,7 +1477,7 @@ static inline enum flex_addr_type flex_capcode_special_type(uint64_t capcode)
 }
 
 /* Operator Messaging sub-type name from 4 LSBs of address word.
- * Per Section 3.8.2.4, Table 3.8.2.4-1:
+ * LSB values:
  *   LSB 0000 = SysMsg(All), 0001 = SysMsg(Home), 0010 = SysMsg(Roaming),
  *   0011 = SysMsg(SSID), 0100 = SysMsg(Time),
  *   0101-1101 = Reserved,
@@ -1506,7 +1513,7 @@ static inline const char *flex_special_addr_detail(uint32_t aw)
 	}
 }
 
-/* ===== Address Decode Helpers (Spec Appendix A, Section 6) =====
+/* ===== Address Decode Helpers =====
  *
  * Shared inline functions for RX address decoding.  These are the exact
  * inverse of the TX encode_short_address() / encode_long_address() in
@@ -1522,7 +1529,7 @@ static inline uint64_t flex_decode_short_address(uint32_t aw)
 
 /* Decode a long address (2 words) to capcode.
  * Detects the address set from w1/w2 ranges and applies the correct
- * inverse formula per Spec Appendix A Section 6.
+ * inverse formula.
  *
  * Returns the capcode, or 0 on invalid w1/w2 combination. */
 static inline uint64_t flex_decode_long_address(uint32_t w1, uint32_t w2)
@@ -1544,7 +1551,6 @@ static inline uint64_t flex_decode_long_address(uint32_t w1, uint32_t w2)
 		       + (FLEX_LONG_OFFSET_A - 1);
 
 	/* Set 2-3 / 2-4: w1 in LA2, w2 in LA3 or LA4
-	 * (Table 3.8.2.2-1: Long Address 2 + Long Address 3 or 4)
 	 * capcode = (w1 - 2064383) + (w2 - 1867776) * 32768 + 2068479 */
 	if (w1 >= FLEX_LA2_MIN && w1 <= FLEX_LA2_MAX &&
 	    w2 >= FLEX_LA3_MIN && w2 <= FLEX_LA4_MAX)
@@ -1558,7 +1564,7 @@ static inline uint64_t flex_decode_long_address(uint32_t w1, uint32_t w2)
 /* 21-bit data mask (useful for masking BCH-decoded words) */
 #define FLEX_DATA_MASK		((1U << FLEX_BCH_DATA_BITS) - 1)
 
-/* ===== Numeric BCD Character Table (ARIB STD-43A Section 3.10.2, Table 3.10.2.1-1) =====
+/* ===== Numeric BCD Character Table =====
  *
  * 4-bit BCD encoding for numeric messages (B3=MSB, B0=LSB).
  * Single shared table used by both TX encoder and RX decoder.
@@ -1607,14 +1613,49 @@ static inline uint8_t flex_num_char_to_bcd(uint8_t ch)
 	}
 }
 
-/* Numeric message overhead bits (Spec Section 3.10.2):
- *   Standard/Special numeric: 2 overhead bits at start of first word
- *   Numbered numeric: 10-bit header (message number + retrieval) + 2 overhead = 12 bits */
+/* Numeric message overhead bits:
+ *
+ * Standard/Special word layout:
+ *   bits 1-2: K5,K4 (checksum overflow) — 2 overhead bits
+ *   bits 3+:  BCD nibbles (4 bits each, LSB-first)
+ *   → 5 digits per word (bits 3-6, 7-10, 11-14, 15-18, 19-20+carry)
+ *   → max 8 words = 41 chars (37-41 chars need 8 words)
+ *
+ * Numbered word layout:
+ *   bits 1-2:  K5,K4 (checksum overflow)
+ *   bits 3-8:  N5-N0 message number (0-63, displayed as N+1)
+ *   bit  9:    R0 retrieval flag (1=check sequence, 0=retransmission)
+ *   bit  10:   S0 special format (1=ID-ROM display format)
+ *   bits 11+:  BCD nibbles
+ *   → 10-bit header + 2 overhead = 12 skip bits
+ *   → max 8 words = 39 chars (35-39 chars need 8 words) */
 #define FLEX_NUM_OVERHEAD_BITS		2
 #define FLEX_NUM_NUMBERED_HDR_BITS	10
 #define FLEX_NUM_NUMBERED_SKIP_BITS	(FLEX_NUM_NUMBERED_HDR_BITS + FLEX_NUM_OVERHEAD_BITS)
 
-/* ===== Alpha Message Fragment Flags (Spec Section 3.8.8.3) ===== */
+/* ===== Secure Message Type Field =====
+ *
+ * Bits 19-20 of the 1st word (header) on ALL secure fragments.
+ * Unlike alpha (where bits 19-20 are R/M on initial, U₀/V₀ on continuation),
+ * secure messages always use these bits for the type field t1t0.
+ *
+ *   t1t0=00: 7-bit Alphanumeric Message data (JIS X 0201)
+ *   t1t0=10: binary message data
+ *   t1t0=01: data defined separately
+ *   t1t0=11: reserved
+ *
+ * Content starts from 2nd word. For t1t0=00, characters are 7-bit
+ * (same as alpha). For t1t0=10, data is raw binary with inverse-fill
+ * termination. Registration Acknowledgment uses t1t0=00 with
+ * operation code "=" ($3D) in 2nd word bits 1-7. */
+#define FLEX_SEC_TYPE_ALPHA		0	/* t1t0=00: alphanumeric */
+#define FLEX_SEC_TYPE_SEPARATE		1	/* t1t0=01: defined separately */
+#define FLEX_SEC_TYPE_BINARY		2	/* t1t0=10: binary data */
+#define FLEX_SEC_TYPE_RESERVED		3	/* t1t0=11: reserved */
+#define FLEX_SEC_TYPE_SHIFT		19	/* bit position in header word */
+#define FLEX_SEC_TYPE_MASK		0x3	/* 2-bit field */
+
+/* ===== Alpha Message Fragment Flags ===== */
 
 /* f0f1 = 11 indicates initial (and possibly only) fragment */
 #define FLEX_ALPHA_FRAG_INITIAL		0x1800U
@@ -1655,7 +1696,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_ALPHA_HDR_M_SHIFT		20
 #define FLEX_ALPHA_HDR_M_MASK		(1U << 20)
 
-/* Continuation/final fragment header (Fig. 3.10.1.3-2):
+/* Continuation/final fragment header:
  * Bits 19-20 are U₀/V₀ (Fragment Control), NOT R/M.
  * Same bit positions, different semantics per fragment type.
  *
@@ -1665,7 +1706,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
  *   10 = Default character mode (fragment starts at char boundary)
  *   11 = Alternative character mode
  *
- * TODO: Enhanced Fragmentation (ARIB STD-43A §3.10.1.3, Fig. 3.10.1.3-2,
+ * TODO: Enhanced Fragmentation — when U₀V₀ ≠ 00 on continuation/final
  * "Enhanced Fragmentation Rules").  When U₀V₀ ≠ 00 on continuation/final
  * fragments, the pager uses SI ($0F) / SO ($0E) shift-in/shift-out to
  * switch between default and alternative 7-bit character modes within a
@@ -1695,7 +1736,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_ALPHA_K_GRP3_SHIFT		16
 #define FLEX_ALPHA_K_GRP3_MASK		0x1FU		/* bits 16-20 */
 
-/* HEX/Binary message header word (1st word) bit layout (Spec §3.10.1.2):
+/* HEX/Binary message header word (1st word) bit layout:
  *   bits 0-11:  K  (12-bit fragment checksum)
  *   bit  12:    C  (message continued flag)
  *   bits 13-14: F  (2-bit fragment number, mod 3)
@@ -1710,7 +1751,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_HEX_HDR_N_SHIFT		15
 #define FLEX_HEX_HDR_N_MASK		(0x3FU << 15)
 
-/* HEX/Binary 2nd word (first fragment only, Spec §3.10.1.2):
+/* HEX/Binary 2nd word (first fragment only):
  *   bit  0:     R  (message retrieval flag)
  *   bit  1:     M  (mail drop flag)
  *   bit  2:     D  (display direction: 0=LTR, 1=RTL)
@@ -1785,7 +1826,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_FRAME_MSG_TYPE_INSTRUCTION	5
 #define FLEX_FRAME_MSG_TYPE_SHORT	6
 
-/* ===== Sync Codes (ARIB STD-43A Table 3.2-5) =====
+/* ===== Sync Codes =====
  *
  * 16-bit outer sync codes extracted from the 64-bit S1 sync word.
  * The full 64-bit sync is: AAAA:BBBBBBBB:CCCC where
@@ -1798,7 +1839,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
  * and the shift register captures inv.A first).
  *
  * Each define below shows:
- *   - The spec bit pattern from Table 3.2-5 (LSB-left as transmitted)
+ *   - The spec bit pattern (LSB-left as transmitted)
  *   - The corresponding byte array from frame.c (MSB-first, for TX)
  *   - The inverted upper-16 value used by the RX sync detector
  *
@@ -1888,14 +1929,14 @@ static inline uint32_t flex_fragment_number(int fragment_index)
  * Normal bytes: {0xCB,0x20,0x59,0x39}  Inv bytes: {0x34,0xDF,0xA6,0xC6}
  * RX outer code = inv upper16 = 0x34DF (same convention as A1–A4)
  *
- * Per Section 3.2.1: ERS uses the same BS+A+BS_inv+A_inv structure as S1.
+ * ERS uses the same BS+A+BS_inv+A_inv structure as S1.
  * The receiver detects Ar through the normal sync detector (which always
  * returns the inv upper-16).  When detected, the pager must re-synchronize
  * its frame timing — this is NOT a data frame, no FIW/S2/DATA follows. */
 #define FLEX_SYNC_AR		0x34DF
 
 /* FLEX sync marker: the middle 32 bits of the 64-bit sync word.
- * Per ARIB STD-43A Section 3.2, the 64-bit sync is AAAA:BBBBBBBB:CCCC
+ * The 64-bit sync is AAAA:BBBBBBBB:CCCC
  * where BBBBBBBB = 0xA6C6AAAA and AAAA ^ CCCC = 0xFFFF. */
 #define FLEX_SYNC_MARKER	0xA6C6AAAAul
 
@@ -1905,7 +1946,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_S2_C		0xED84
 #define FLEX_S2_C_INV		0x127B
 
-/* ===== Modulation Type (ARIB STD-43A Table 3.2-2) ===== */
+/* ===== Modulation Type ===== */
 
 /* Distinguishes 2-FSK (A1, A2) from 4-FSK (A3, A4) at the same symbol rate */
 enum flex_mod_type {
@@ -1929,7 +1970,7 @@ typedef struct flex_frame_msg {
 	int		is_temp_group;		/* 0 = common group, 1 = temporary group */
 	int		sequence_num;		/* N field: message number (0-63), or -1 to
 					 * disable numbering (R=0, N not set).
-					 * Per spec §3.10.1.3: when R=1, pager checks
+					 * When R=1, pager checks
 					 * numbered messages; R=0 messages are excluded
 					 * from message number order checking.
 					 * For fragmented messages, all fragments share
@@ -1938,13 +1979,13 @@ typedef struct flex_frame_msg {
 	int		short_msg_idx;		/* short message index, -1 = N/A */
 	int		blocking_length;	/* HEX/Binary B field: bits per character.
 					 * 1-15 = that many bits, 0 = 16 bits.
-					 * Spec §3.10.1.2, default 1 (raw bits). */
-	int		mail_drop;		/* M flag (Spec §3.10.1.3):
+					 * Default 1 (raw bits). */
+	int		mail_drop;		/* M flag:
 					 * 0 = ordinary message (default)
 					 * 1 = can be handled separately */
 	int		phase;			/* phase override: -1=auto (default), 0=A, 1=B, 2=C, 3=D */
 
-	/* Fragment state (Spec Section 3.10.1.3 / 4.2).
+	/* Fragment state.
 	 * Set by flex_fragment_queue() for multi-fragment messages.
 	 * fragment_index=0, total_fragments=0 means unfragmented. */
 	int		fragment_index;		/* 0-based index within message */
@@ -1957,7 +1998,7 @@ typedef struct flex_frame_params {
 	uint32_t	frame;			/* FIW frame (0-127) */
 	uint32_t	roaming;		/* FIW roaming flag n */
 	int		collapse;		/* BIW1 collapse value (0-7) */
-	int		carry_on;		/* BIW1 carry-on (0-3 frames, Spec §3.7.1) */
+	int		carry_on;		/* BIW1 carry-on (0-3 frames) */
 	int		biw_time;		/* include BIW3/BIW4 time broadcast */
 	uint32_t	local_id;		/* BIW2 local ID (9 bits, 0-511) */
 	uint32_t	coverage_id;		/* BIW2 coverage zone (5 bits, 0-31) */
@@ -1970,7 +2011,7 @@ typedef struct flex_frame_params {
 	int		single_phase;		/* 1 = force single-phase output (for
 						 * network mode per-phase encoding) */
 
-	/* Multiple transmission (Spec Section 3.4.2, Fig. 3.4.2-1).
+	/* Multiple transmission (subframe repeat).
 	 *
 	 * num_transmissions: 1 (default), 2, 3, or 4.
 	 *   When >1, FIW r=1 and [t1,t0] encode the count.
@@ -1990,12 +2031,12 @@ typedef struct flex_frame_params {
 	int		subframe_index;		/* 0..num_transmissions-1 */
 } flex_frame_params_t;
 
-/* ===== Phase Multiplexing (Spec Section 3.3) ===== */
+/* ===== Phase Multiplexing ===== */
 
 /* Maximum phases: 2 at 3200 bps (2FSK or 4FSK), 4 at 6400 bps */
 #define FLEX_MAX_PHASES		4
 
-/* Per-phase channel data (Spec Sections 3.3.3, 3.3.4).
+/* Per-phase channel data.
  *
  * Each phase is an independent channel carrying 88 words (11 blocks × 8).
  * After reception, each word goes through BCH(31,21) error correction
@@ -2004,14 +2045,13 @@ typedef struct flex_frame_params {
  *   status[i] — BCH decode outcome for this word
  *
  * RX reception context records the conditions under which this phase
- * was received, per Section 3.3.4 (phase assignment). */
+ * was received (phase assignment). */
 typedef struct flex_phase_data {
 	uint32_t		words[FLEX_WORDS_PER_FRAME];
 	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];
 	int			word_count;	/* TX: actual words used */
 	int			idle_count;	/* RX: idle words seen (all-0s or all-1s),
-					 * used to detect shortened frames
-					 * (Fig. 3.4.1-3) */
+					 * used to detect shortened frames */
 
 	/* RX reception context (set once before BCH decode) */
 	int			rx_phase;	/* 0=A, 1=B, 2=C, 3=D; -1=not received */
@@ -2049,7 +2089,7 @@ int flex_fragment_message(const char *message, int msg_type,
 
 /* Encode a multi-phase frame (3200 bps: 2 phases, 6400 bps: 4 phases).
  * 3200/4FSK also uses 2 phases (A, B) packed into 4-level symbols.
- * Phase data words are interleaved in the output per Section 3.3.
+ * Phase data words are interleaved in the output.
  * Returns bytes written to buffer, or 0 on error. */
 size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 				const flex_frame_params_t *params,
@@ -2062,26 +2102,26 @@ int flex_detect_msg_type(const char *message, int length);
 /* Validate capcode (returns 1 if valid, 0 if invalid) */
 int flex_capcode_valid(uint64_t capcode);
 
-/* Group address encoding (Section 3.8.2.2) */
+/* Group address encoding */
 uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary);
 
-/* Temporary address assignment (Section 3.8.2.3) */
+/* Temporary address assignment */
 uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr);
 
-/* Network address encoding (Section 6.1.2).
+/* Network address encoding.
  * Encodes a network (NID) address word from the raw address value.
  * addr_offset: offset within the network range (0 to FLEX_ADDR_NETWORK_MAX - FLEX_ADDR_NETWORK_MIN).
  * Returns the encoded 32-bit BCH codeword, or 0 on invalid offset. */
 uint32_t flex_encode_network_address(uint32_t addr_offset);
 
-/* Network message payload encoding (Section 6.1.2).
+/* Network message payload encoding.
  * Encodes the first message word containing Service Area ID, Coverage
  * Zone Count, and Traffic Management Flags.
  * Returns the encoded 32-bit BCH codeword. */
 uint32_t flex_encode_network_payload(uint32_t area_id, uint32_t coverage_zones,
 				     uint32_t traffic_flags);
 
-/* Operator messaging address encoding (Section 3.8.2.4).
+/* Operator messaging address encoding.
  * Encodes an operator messaging address word from the sub-type LSB (0x00-0x0F).
  * Returns the encoded 32-bit BCH codeword, or 0 on invalid sub-type. */
 uint32_t flex_encode_oper_msg_address(uint32_t subtype_lsb);
@@ -2092,7 +2132,7 @@ uint32_t flex_word_checksum(uint32_t dw);
 uint32_t reverse_bits32(uint32_t v);
 void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
 
-/* Fill a phase's word array with idle pattern (Section 3.4.1, Fig. 3.4.1-3).
+/* Fill a phase's word array with idle pattern.
  * For 4FSK modes, LSB phases get all-zeros instead of alternating. */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
 			  int mod_type, int bitrate);
@@ -2118,7 +2158,7 @@ size_t flex_generate_ers(uint8_t *buffer, size_t buffer_size, int cycles);
  * Returns bytes written, or 0 on error. */
 size_t flex_generate_pocsag_idle(uint8_t *buffer, size_t buffer_size);
 
-/* ===== Split Sync/Data Encoding (ARIB STD-43A Section 3.2) =====
+/* ===== Split Sync/Data Encoding =====
  *
  * The sync portion (S1 + FIW) is ALWAYS at 1600/2FSK.
  * The data portion (S2 + DATA) is at the frame's target speed.
