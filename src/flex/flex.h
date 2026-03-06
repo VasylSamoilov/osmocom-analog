@@ -204,6 +204,16 @@ typedef struct flex {
 	int			pocsag_mix_enabled;
 	uint8_t			pocsag_frame_slots[128]; /* 1 = POCSAG, 0 = FLEX */
 
+	/* BCH(31,21) decode statistics — accumulated per frame across
+	 * all BCH-protected fields (S1 A-code, FIW, data words).
+	 * Reset at each new S1 sync detection. */
+	struct {
+		unsigned int	clean;		/* syndrome=0, no correction needed */
+		unsigned int	corrected;	/* 1-2 bit errors, corrected by BCH */
+		unsigned int	uncorrectable;	/* >2 bit errors, BCH failed */
+		unsigned int	total;		/* total codewords processed */
+	} bch_stats;
+
 	/* RX state — standard-compliant FLEX decoder (ARIB STD-43A) */
 	struct {
 		int		enabled;
@@ -231,22 +241,50 @@ typedef struct flex {
 		/* State machine */
 		int		rx_state;		/* RX_STATE_SYNC1..DATA */
 
-		/* Sync detection */
-		uint64_t	sync_buf;		/* 64-bit shift register for sync */
+		/* Sync detection — 128-bit shift register for full S1.
+		 * S1 = BS1(32) + A(32) + B(16) + inv.A(32) = 112 bits.
+		 * sync_buf_hi:sync_buf_lo form a single 128-bit register,
+		 * shifted left 1 bit per symbol during SYNC1 and the first
+		 * 16 symbols of FIW (to capture the full inv.A tail).
+		 * Sync fires at bit 96 (after BS1+A+B+inv.A_upper16) when
+		 * the marker appears in sync_buf_lo.  After 16 more shifts,
+		 * the full inv.A is available for combined error correction. */
+		uint64_t	sync_buf_hi;		/* upper 64 bits of 128-bit shift register */
+		uint64_t	sync_buf_lo;		/* lower 64 bits (marker detection here) */
+		uint32_t	sync_a_code;		/* A code extracted at sync detection */
 		int		sync_baud;		/* symbol rate from sync (baud, not bps) */
 		int		sync_levels;		/* 2=2FSK (1 bit/sym), 4=4FSK (2 bits/sym) */
 		int		reflex;			/* 1 = ReFLEX sync detected (stub) */
 
+		/* S1 tail state — 16 symbols after sync detection to
+		 * complete inv.A reception.  Register keeps shifting. */
+		int		s1_tail_count;		/* symbol counter (0..16) */
+
 		/* FIW state (always 1600/2FSK, 1 bit per symbol) */
-		int		fiw_count;		/* bit counter in FIW state */
+		int		fiw_count;		/* bit counter in FIW state (0..32) */
 		uint32_t	fiw_rawdata;		/* accumulated FIW bits (32-bit codeword) */
 
 		/* FIW decode result */
 		uint32_t	fiw_cycle;
 		uint32_t	fiw_frame;
 
-		/* S2 state */
+		/* S2 state — evidence-based timing correction.
+		 * We scan the full S2 window + 2 symbols, recording where
+		 * C and inv.C are found.  At the end, we combine both
+		 * positions to decide whether to correct the data boundary.
+		 * Correction is applied only when evidence is strong and
+		 * the offset is within ±2 symbols of nominal. */
 		int		sync2_count;		/* S2 symbol counter */
+		uint16_t	sync2_shiftreg;		/* 16-bit shift register for C pattern */
+		int		sync2_c_found;		/* 1 = C (first half) detected */
+		int		sync2_c_pos;		/* symbol position where C was found */
+		int		sync2_c_errs;		/* bit errors in C match */
+		int		sync2_cinv_found;	/* 1 = inv.C (second half) detected */
+		int		sync2_cinv_pos;		/* symbol position where inv.C was found */
+		int		sync2_cinv_errs;	/* bit errors in inv.C match */
+		unsigned char	sync2_sym_buf[4];	/* symbols from [nominal-2 .. nominal+2) */
+		int		sync2_sym_buf_count;	/* symbols buffered */
+		int		sync2_sym_buf_start;	/* symbol index of first buffered sym */
 
 		/* Data state */
 		int		data_count;		/* data symbol counter */

@@ -1534,29 +1534,41 @@ static size_t flex_encode_fiw(const flex_frame_params_t *params,
 }
 
 /*
+ * BS2 bit count for a given bitrate (ARIB STD-43A Tables 3.2-1..3.2-4).
+ *
+ * Returns the number of BITS in one BS2 field, or 0 for invalid bitrate.
+ * For 4FSK modes, this is symbol_count × 2 (dibits).
+ *   1600bps/2FSK (A1):  4 sym × 1 bit/sym =  4 bits
+ *   3200bps/2FSK (A2): 24 sym × 1 bit/sym = 24 bits
+ *   3200bps/4FSK (A3): 12 sym × 2 bit/sym = 24 bits
+ *   6400bps/4FSK (A4): 32 sym × 2 bit/sym = 64 bits
+ */
+static int flex_bs2_bits(int bitrate)
+{
+	switch (bitrate) {
+	case 1600: return 4;
+	case 3200: return 24;
+	case 6400: return 64;
+	default:   return 0;
+	}
+}
+
+/*
  * Compute S2 byte size for a given speed/modulation without encoding.
  *
  * S2 structure: BS2(N) + C(16) + BS2_inv(N) + C_inv(16)
- * Total bits = 2*N + 32, where N (bs2_bits) varies per speed:
- *   1600/2FSK:  N=4   → 40 bits  =  5 bytes
- *   3200/2FSK:  N=24  → 80 bits  = 10 bytes
- *   3200/4FSK:  N=24  → 80 bits  = 10 bytes
- *   6400/4FSK:  N=64  → 160 bits = 20 bytes
+ * Total bits = 2*N + 32, where N varies per speed (see flex_bs2_bits).
  *
  * Returns byte count, or 0 for invalid bitrate.
  */
 static size_t flex_s2_size(int bitrate)
 {
-	int bs2_bits;
+	int n = flex_bs2_bits(bitrate);
 
-	switch (bitrate) {
-	case 1600: bs2_bits = 4;  break;
-	case 3200: bs2_bits = 24; break;
-	case 6400: bs2_bits = 64; break;
-	default:   return 0;
-	}
+	if (n == 0)
+		return 0;
 
-	return (size_t)(2 * bs2_bits + 32 + 7) / 8;
+	return (size_t)(2 * n + 32 + 7) / 8;
 }
 
 /*
@@ -1605,16 +1617,9 @@ static size_t flex_encode_s2(int bitrate, int mod_type,
 	size_t total_bits, total_bytes;
 	int is_4fsk = (mod_type == FLEX_MOD_4FSK);
 
-	/* BS2 length in BITS (not symbols) from standard tables.
-	 * bitrate here is the BIT rate (bps), not the symbol rate.
-	 * For 4FSK modes, the bit count = symbol_count × 2. */
-	switch (bitrate) {
-	case 1600: bs2_bits = 4;  break;	/* A1: 4 sym × 1 bit/sym = 4 bits */
-	case 3200: bs2_bits = 24; break;	/* A2: 24 sym × 1 bit/sym = 24 bits */
-						/* A3: 12 sym × 2 bits/sym = 24 bits */
-	case 6400: bs2_bits = 64; break;	/* A4: 32 sym × 2 bits/sym = 64 bits */
-	default:   return 0;
-	}
+	bs2_bits = flex_bs2_bits(bitrate);
+	if (bs2_bits == 0)
+		return 0;
 
 	total_bits = (size_t)bs2_bits + 16 + (size_t)bs2_bits + 16;
 	total_bytes = (total_bits + 7) / 8;

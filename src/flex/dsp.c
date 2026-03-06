@@ -508,8 +508,8 @@ again:
 
 /* RX state machine states */
 enum {
-	RX_STATE_SYNC1 = 0,	/* hunting for S1 sync pattern (always 1600 baud, 2FSK) */
-	RX_STATE_FIW,		/* reading FIW (16 bits dotting + 32 bits data, 1600/2FSK) */
+	RX_STATE_SYNC1 = 0,	/* S1: sync detection + inv.A completion (1600 baud, 2FSK) */
+	RX_STATE_FIW,		/* FIW: 32-bit BCH codeword (1600/2FSK) */
 	RX_STATE_SYNC2,		/* S2: block sync at data symbol rate (25 ms, all modes) */
 	RX_STATE_DATA,		/* reading interleaved phase data at data symbol rate */
 };
@@ -670,38 +670,114 @@ static unsigned int flex_bch_syndrome(uint32_t codeword)
 	return (s1 << 5) | s3;
 }
 
-/* BCH(31,21,2) decoder.
+/* Count set bits (Hamming weight). */
+static unsigned int count_bits(uint32_t data)
+{
+#ifdef __GNUC__
+	return __builtin_popcount(data);
+#else
+	unsigned int n = (data >> 1) & 0x77777777;
+	data = data - n;
+	n = (n >> 1) & 0x77777777;
+	data = data - n;
+	n = (n >> 1) & 0x77777777;
+	data = data - n;
+	data = (data + (data >> 4)) & 0x0f0f0f0f;
+	data = data * 0x01010101;
+	return data >> 24;
+#endif
+}
+
+/* BCH(31,21)+parity decoder per ARIB STD-43A Section 3.5.2.
  *
- * Input: 32-bit word as accumulated by RX (LSB-first):
- *   bits 0-20 = data, bits 21-30 = ECC, bit 31 = even parity.
+ * Input: 32-bit codeword as accumulated by RX:
+ *   bits 0-20 = data (21 info bits)
+ *   bits 21-30 = ECC (10 check bits)
+ *   bit 31 = even parity
  *
- * Corrects up to 2 bit errors in the 31-bit codeword.
- * Returns corrected 21-bit data (bits 0-20), or -1 if uncorrectable. */
-static int32_t flex_bch_decode(uint32_t codeword)
+ * The even parity bit extends the BCH(31,21) minimum distance from 5 to 6,
+ * enabling simultaneous 2-bit correction + 3-bit detection (same as POCSAG).
+ * This matters because we may be looking at random bits from a sliding
+ * bitstream — parity halves the false-accept rate for syndrome=0 matches.
+ *
+ * Decision matrix:
+ *   syndrome=0, parity OK  → clean (0 errors)
+ *   syndrome=0, parity BAD → 1 error in parity bit only → correctable
+ *   syndrome≠0, correction found, parity OK after correction → corrected
+ *   syndrome≠0, correction found, parity BAD after correction → 3+ errors, reject
+ *   syndrome≠0, no correction found → uncorrectable, reject
+ *
+ * Returns corrected 21-bit info (bits 0-20), or -1 if uncorrectable.
+ *
+ * Output parameters:
+ *   *status:       0 = clean, 1 = corrected, -1 = uncorrectable.
+ *   *corrected_p:  corrected full 32-bit word (code31 + recomputed parity).
+ *                  Only written on success (return >= 0).  May be NULL if
+ *                  the caller only needs the 21-bit info.
+ *
+ * Also updates flex->bch_stats counters. */
+static int32_t flex_bch_decode(flex_t *flex, uint32_t codeword,
+			       int *status, uint32_t *corrected_p)
 {
 	unsigned int key, error;
-	uint32_t code31;
+	uint32_t code31, parity;
+	int parity_bad;
 
 	flex_bch_init();
 
-	/* Strip even parity bit (bit 31), work on 31-bit codeword */
 	code31 = codeword & 0x7FFFFFFFU;
-
-	/* Compute syndrome */
 	key = flex_bch_syndrome(code31);
+	parity_bad = count_bits(codeword) & 1; /* odd popcount = parity error */
+
+	flex->bch_stats.total++;
 
 	if (key == 0) {
-		/* No errors in BCH code (parity bit error is harmless) */
-		return (int32_t)(code31 & 0x1FFFFF);
+		if (!parity_bad) {
+			/* syndrome=0, parity OK → clean */
+			*status = 0;
+			flex->bch_stats.clean++;
+		} else {
+			/* syndrome=0, parity BAD → single error in parity bit.
+			 * code31 is a valid BCH codeword; only the parity bit
+			 * was flipped.  Treat as corrected. */
+			*status = 1;
+			flex->bch_stats.corrected++;
+		}
+		goto success;
 	}
 
-	/* Look up error pattern */
 	error = bch_err_tbl[key];
-	if (error == 0)
-		return -1; /* uncorrectable (>2 errors) */
+	if (error == 0) {
+		/* syndrome≠0, no correction → uncorrectable */
+		*status = -1;
+		flex->bch_stats.uncorrectable++;
+		return -1;
+	}
 
-	/* Apply correction */
+	/* Apply BCH correction to code31, then recheck parity.
+	 * Reassemble the full 32-bit word with the RECEIVED parity bit
+	 * and the CORRECTED code31.  If parity is now OK, the correction
+	 * was valid (1 or 2 bit errors in code31).  If parity is still
+	 * BAD, there were 3+ total errors and BCH miscorrected — reject. */
 	code31 ^= error;
+	if (count_bits((codeword & 0x80000000U) | code31) & 1) {
+		/* parity BAD after correction → 3+ errors, reject */
+		*status = -1;
+		flex->bch_stats.uncorrectable++;
+		return -1;
+	}
+
+	*status = 1;
+	flex->bch_stats.corrected++;
+
+success:
+	/* Recompute correct parity from (possibly corrected) code31.
+	 * Even parity: set bit 31 so that popcount of all 32 bits is even. */
+	parity = (count_bits(code31) & 1) ? 1U : 0U;
+
+	if (corrected_p)
+		*corrected_p = (parity << 31) | code31;
+
 	return (int32_t)(code31 & 0x1FFFFF);
 }
 
@@ -730,24 +806,6 @@ static void __attribute__((unused)) flex_deinterleave_block(uint32_t *words)
 	}
 
 	memcpy(words, out, sizeof(out));
-}
-
-/* Count set bits (Hamming weight). */
-static unsigned int count_bits(uint32_t data)
-{
-#ifdef __GNUC__
-	return __builtin_popcount(data);
-#else
-	unsigned int n = (data >> 1) & 0x77777777;
-	data = data - n;
-	n = (n >> 1) & 0x77777777;
-	data = data - n;
-	n = (n >> 1) & 0x77777777;
-	data = data - n;
-	data = (data + (data >> 4)) & 0x0f0f0f0f;
-	data = data * 0x01010101;
-	return data >> 24;
-#endif
 }
 
 /* Check a 64-bit buffer against the FLEX sync pattern.
@@ -791,10 +849,50 @@ static unsigned int flex_rx_sync_detect(flex_t __attribute__((unused)) *flex, ui
 	return 0;
 }
 
+
+/* Extract the 32-bit A code from the sync shift register at detection time.
+ *
+ * Called when sync fires at bit 96 of S1.  At this point sync_buf_lo
+ * contains the same 64-bit pattern as the old single sync_buf:
+ *   [63:32] = A (32 bits), [31:16] = B (16 bits), [15:0] = inv.A_upper16.
+ *
+ * With negative polarity (polarity=0), the FSK mapping inverts all bits,
+ * so the register contains ~A at [63:32].  Invert to recover A.
+ * With positive polarity (polarity=1), the register contains A directly. */
+static uint32_t flex_extract_a_code(uint64_t sync_buf_lo, int polarity)
+{
+	uint32_t raw = (uint32_t)(sync_buf_lo >> 32);
+	return polarity ? raw : ~raw;
+}
+
+/* Extract inv.A from the 128-bit register after S1 completes.
+ *
+ * Called at s1_tail_count == 16, after the inv.A tail has been shifted in.
+ *
+ * Register layout (bit 0 = last shifted in):
+ *   lo[31:0] = inv.A (32 bits)
+ *
+ * At sync detection, inv.A_first16 was at lo[15:0].  After 16 more
+ * shifts: inv.A_first16 moved to lo[31:16], inv.A_last16 at lo[15:0].
+ *
+ * Raw bits (non-polarity-corrected, same as SYNC1):
+ *   pol=1 (NEG TX): register = transmitted → inv.A directly.
+ *   pol=0 (POS TX): register = ~transmitted → invert to recover. */
+static uint32_t flex_extract_inv_a(uint64_t sync_buf_lo, int polarity)
+{
+	uint32_t raw = (uint32_t)(sync_buf_lo & 0xFFFFFFFF);
+	return polarity ? raw : ~raw;
+}
+
 /* Decode the sync code to determine symbol rate and FSK levels.
  * Per ARIB STD-43A Table 3.2-5, the outer code determines the mode.
+ *
+ * Uses BCH(31,21) error correction on the bit-reversed A code to
+ * correct up to 2 bit errors before mode identification.
+ *
  * Returns 1 if valid mode found, 0 otherwise. */
-static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
+static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
+			       int polarity)
 {
 	/* Mode table: sync code → symbol rate (baud) and FSK levels.
 	 *
@@ -818,6 +916,42 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 		{ 0, 0, 0 }
 	};
 	int i;
+	unsigned int corrected_code;
+
+	/* BCH-correct the A code for reliable mode identification.
+	 *
+	 * The A-code from flex_extract_a_code() is in TX bit order (MSB-first),
+	 * which is reverse_bits32(encoder_output).  This is the same layout as
+	 * normal RX codewords (FIW, data words) accumulated LSB-first — so we
+	 * pass it directly to flex_bch_decode(), no bit reversal needed.
+	 * Verified: all 16 A-codes produce syndrome 0 in this layout.
+	 *
+	 * flex_bch_decode() returns the corrected full 32-bit word (code31 +
+	 * recomputed parity) via corrected_word.  The 16-bit outer sync code
+	 * is (~corrected_word >> 16) & 0xFFFF, matching FLEX_SYNC_A1..AR.
+	 *
+	 * Also reset per-frame BCH stats — S1 is the start of a new frame. */
+	memset(&flex->bch_stats, 0, sizeof(flex->bch_stats));
+	{
+		uint32_t a_code = flex_extract_a_code(flex->rx.sync_buf_lo,
+						      polarity);
+		flex->rx.sync_a_code = a_code;
+		uint32_t corrected_word;
+		int bch_status;
+		int32_t info = flex_bch_decode(flex, a_code, &bch_status,
+					       &corrected_word);
+		if (info >= 0)
+			corrected_code = (~corrected_word >> 16) & 0xFFFF;
+		else
+			corrected_code = 0;
+
+		if (corrected_code != 0 && corrected_code != sync_code) {
+			LOGP_CHAN(DDSP, LOGL_INFO,
+				  "RX: BCH corrected sync code 0x%04X → 0x%04X.\n",
+				  sync_code, corrected_code);
+			sync_code = corrected_code;
+		}
+	}
 
 	/* Check for Ar (ERS re-sync).
 	 * Per ARIB STD-43A Section 3.2.1: when the receiver detects the Ar
@@ -825,7 +959,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 	 * a data frame — no FIW/S2/DATA follows.  The receiver should reset
 	 * to sync-hunting state so it can lock onto the next data frame's
 	 * S1 sync after the ERS burst ends. */
-	if (count_bits(sync_code ^ FLEX_SYNC_AR) < 4) {
+	if (sync_code == FLEX_SYNC_AR) {
 		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: Ar (ERS re-sync) detected — resetting sync.\n");
 		return 0;
 	}
@@ -834,7 +968,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 	 * Same physical layer as A4 (6400bps/4FSK, 3200 baud) but
 	 * uses a different framing format.  Decode what we can as
 	 * standard FLEX, hex-dump the rest. */
-	if (count_bits((uint32_t)(FLEX_SYNC_REFLEX ^ sync_code)) < 4) {
+	if (sync_code == FLEX_SYNC_REFLEX) {
 		flex->rx.sync_baud = 3200;
 		flex->rx.sync_levels = 4;
 		flex->rx.reflex = 1;
@@ -848,7 +982,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code)
 	flex->rx.reflex = 0;
 
 	for (i = 0; modes[i].code != 0; i++) {
-		if (count_bits((uint32_t)(modes[i].code ^ sync_code)) < 4) {
+		if (sync_code == modes[i].code) {
 			flex->rx.sync_baud = modes[i].baud;
 			flex->rx.sync_levels = modes[i].levels;
 			LOGP_CHAN(DDSP, LOGL_INFO,
@@ -876,10 +1010,17 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 
 	/* RX accumulated LSB-first: bits 0-20 = data, 21-30 = ECC, 31 = parity.
 	 * This is the natural layout for the BCH decoder — no bit reversal needed. */
-	data = flex_bch_decode(fiw_raw);
+	int bch_status;
+	data = flex_bch_decode(flex, fiw_raw, &bch_status, NULL);
 	if (data < 0) {
-		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: FIW BCH decode failed (uncorrectable).\n");
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: FIW BCH decode failed (uncorrectable, raw=0x%08X).\n",
+			  fiw_raw);
 		return -1;
+	}
+	if (bch_status == 1) {
+		LOGP_CHAN(DDSP, LOGL_INFO,
+			  "RX: FIW BCH corrected (raw=0x%08X → data=0x%05X).\n",
+			  fiw_raw, (unsigned int)data);
 	}
 
 	/* FIW layout per multimon-ng decode_fiw():
@@ -932,29 +1073,51 @@ static void flex_rx_decode_phase(flex_t *flex, uint32_t *phaseptr, char phase_na
 	 * (same approach as multimon-ng read_data).
 	 *
 	 * Each word has: bits 0-20 = data, bits 21-30 = ECC, bit 31 = parity.
-	 * BCH decode strips parity and returns 21-bit data. */
+	 * BCH decode strips parity and returns 21-bit data.
+	 * We preserve raw word and status for per-word reporting. */
+	int bch_status[FLEX_WORDS_PER_FRAME];
+	uint32_t raw_words[FLEX_WORDS_PER_FRAME];
+
 	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
-		int decode_error = flex_bch_decode(phaseptr[i]);
-		if (decode_error < 0) {
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: Phase %c word %d BCH uncorrectable (0x%08X).\n",
-				  phase_name, i, phaseptr[i]);
+		raw_words[i] = phaseptr[i];
+		int32_t result = flex_bch_decode(flex, phaseptr[i], &bch_status[i], NULL);
+		if (result < 0) {
 			decoded[i] = -1;
 		} else {
-			decoded[i] = decode_error;
-			phaseptr[i] = (uint32_t)decode_error; /* store corrected 21-bit data */
+			decoded[i] = result;
+			phaseptr[i] = (uint32_t)result;
 		}
 	}
 
-	/* Summary */
+	/* Per-word summary: report corrected and uncorrectable words individually */
 	{
-		int ok = 0, fail = 0;
+		int ok = 0, fixed = 0, fail = 0;
 		for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
-			if (decoded[i] >= 0) ok++; else fail++;
+			if (bch_status[i] == 0)
+				ok++;
+			else if (bch_status[i] == 1)
+				fixed++;
+			else
+				fail++;
 		}
 		LOGP_CHAN(DDSP, LOGL_INFO,
-			  "RX: Phase %c BCH: %d/%d OK, %d uncorrectable.\n",
-			  phase_name, ok, FLEX_WORDS_PER_FRAME, fail);
+			  "RX: Phase %c BCH: %d/%d clean, %d corrected, %d uncorrectable.\n",
+			  phase_name, ok, FLEX_WORDS_PER_FRAME, fixed, fail);
+
+		for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+			if (bch_status[i] == 1) {
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Phase %c word %2d BCH corrected "
+					  "(raw=0x%08X → data=0x%05X).\n",
+					  phase_name, i, raw_words[i],
+					  (unsigned int)decoded[i]);
+			} else if (bch_status[i] == -1) {
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: Phase %c word %2d BCH uncorrectable "
+					  "(raw=0x%08X).\n",
+					  phase_name, i, raw_words[i]);
+			}
+		}
 	}
 
 	/* BIW1 (word 0) */
@@ -1290,6 +1453,16 @@ static void flex_rx_decode_data(flex_t *flex)
 			flex_rx_decode_phase(flex, flex->rx.phase_d, 'D');
 		}
 	}
+
+	/* Frame-level BCH summary (S1 + FIW + all data phases) */
+	LOGP_CHAN(DDSP, LOGL_INFO,
+		  "RX: Frame C%u/F%u BCH totals: %u codewords — "
+		  "%u clean, %u corrected, %u uncorrectable.\n",
+		  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+		  flex->bch_stats.total,
+		  flex->bch_stats.clean,
+		  flex->bch_stats.corrected,
+		  flex->bch_stats.uncorrectable);
 }
 
 /* Read one data symbol into the appropriate phase buffers.
@@ -1401,52 +1574,79 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 	switch (flex->rx.rx_state) {
 	case RX_STATE_SYNC1:
 	{
-		/* Feed 2-level bit into 64-bit sync shift register.
-		 * S1 is always at 1600 baud / 2FSK (1 bit per symbol).
-		 * sym < 2 → bit 1, sym >= 2 → bit 0 (per multimon-ng flex_sync) */
-		flex->rx.sync_buf = (flex->rx.sync_buf << 1) |
-				    ((sym < 2) ? 1 : 0);
+		/* S1 = BS1(32) + A(32) + B(16) + inv.A(32) = 112 bits.
+		 * Always 1600 baud / 2FSK.
+		 *
+		 * The 128-bit shift register accumulates raw (non-polarity-
+		 * corrected) bits throughout.  Sync detection fires at bit 96
+		 * when the marker appears in sync_buf_lo.  After that, 16 more
+		 * symbols complete inv.A.  s1_tail_count tracks progress:
+		 *   0 = hunting (sync not yet detected)
+		 *   1..16 = counting inv.A tail after sync */
+		int bit = (sym < 2) ? 1 : 0;
+		flex->rx.sync_buf_hi = (flex->rx.sync_buf_hi << 1) |
+				       (flex->rx.sync_buf_lo >> 63);
+		flex->rx.sync_buf_lo = (flex->rx.sync_buf_lo << 1) | bit;
 
-		unsigned int sync_code;
-		int polarity;
-		sync_code = flex_rx_sync_detect(flex, flex->rx.sync_buf, &polarity);
-		if (sync_code != 0) {
-			flex->rx.polarity = polarity;
-			if (flex_rx_decode_mode(flex, sync_code)) {
-				flex->rx.rx_state = RX_STATE_FIW;
-				flex->rx.fiw_count = 0;
-				flex->rx.fiw_rawdata = 0;
+		if (flex->rx.s1_tail_count == 0) {
+			/* Hunting: check for sync marker */
+			unsigned int sync_code;
+			int polarity;
+			sync_code = flex_rx_sync_detect(flex,
+				flex->rx.sync_buf_lo, &polarity);
+			if (sync_code != 0) {
+				flex->rx.polarity = polarity;
+				if (flex_rx_decode_mode(flex, sync_code,
+							polarity))
+					flex->rx.s1_tail_count = 1;
 			}
+		} else if (++flex->rx.s1_tail_count > 16) {
+			/* S1 complete — extract inv.A, transition to FIW */
+			uint32_t inv_a = flex_extract_inv_a(
+				flex->rx.sync_buf_lo,
+				flex->rx.polarity);
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: S1 complete: "
+				  "A=0x%08X inv.A=0x%08X "
+				  "~inv.A=0x%08X match=%s\n",
+				  flex->rx.sync_a_code, inv_a,
+				  ~inv_a,
+				  (flex->rx.sync_a_code == ~inv_a)
+					? "YES" : "NO");
+
+			flex->rx.rx_state = RX_STATE_FIW;
+			flex->rx.fiw_count = 0;
+			flex->rx.fiw_rawdata = 0;
 		}
 		break;
 	}
 
 	case RX_STATE_FIW:
 	{
-		/* FIW: always at 1600 baud / 2FSK (1 bit per symbol).
-		 * 16 bits of dotting (PLL settling), then 32 bits of FIW data.
-		 * Total = 48 bits = 48 symbols at 1600/2FSK. */
-		flex->rx.fiw_count++;
-		if (flex->rx.fiw_count > 16) {
-			/* Accumulate FIW data bits LSB-first (sym > 1 → bit 1).
-			 * FIW is a 32-bit BCH codeword at 1600/2FSK. */
-			flex->rx.fiw_rawdata = (flex->rx.fiw_rawdata >> 1) |
-					       ((sym_rect > 1) ? 0x80000000U : 0);
-		}
+		/* FIW: 32-bit BCH codeword, always 1600/2FSK. */
+		flex->rx.fiw_rawdata = (flex->rx.fiw_rawdata >> 1) |
+				       ((sym_rect > 1) ? 0x80000000U : 0);
 
-		if (flex->rx.fiw_count == 48) {
+		if (++flex->rx.fiw_count == 32) {
 			if (flex_rx_decode_fiw(flex, flex->rx.fiw_rawdata) == 0) {
-				/* FIW OK — switch to data symbol rate and enter S2.
-				 * sync_baud is the SYMBOL rate (baud), not bit rate.
-				 * PLL now tracks symbols at the data rate. */
 				flex->rx.baud = flex->rx.sync_baud;
 				flex->rx.sync2_count = 0;
+				flex->rx.sync2_shiftreg = 0;
+				flex->rx.sync2_c_found = 0;
+				flex->rx.sync2_c_pos = 0;
+				flex->rx.sync2_c_errs = 0;
+				flex->rx.sync2_cinv_found = 0;
+				flex->rx.sync2_cinv_pos = 0;
+				flex->rx.sync2_cinv_errs = 0;
+				flex->rx.sync2_sym_buf_count = 0;
+				flex->rx.sync2_sym_buf_start = 0;
 				flex->rx.rx_state = RX_STATE_SYNC2;
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
 					  "RX: FIW→SYNC2, symbol rate switch to %d baud.\n",
 					  flex->rx.baud);
 			} else {
 				flex->rx.rx_state = RX_STATE_SYNC1;
+				flex->rx.s1_tail_count = 0;
 			}
 		}
 		break;
@@ -1457,39 +1657,208 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 		/* S2: 25 ms at the data symbol rate (ARIB STD-43A Section 3.2).
 		 * S2 = BS2 + C(0xED84) + inv.BS2 + inv.C(0x127B).
 		 *
-		 * sync_baud is the SYMBOL rate (baud), so:
-		 *   sync_baud * 25 / 1000 = number of SYMBOLS in S2.
+		 * By this point the PLL is already well-synchronized: it locked
+		 * during S1 (112 symbols of BS1+A+B+inv.A at 1600 baud), then
+		 * tracked 48 more symbols of FIW.  The only disruption is the
+		 * baud rate switch (1600 → data rate), and BS2's alternating
+		 * pattern re-trains the PLL at the new rate before C arrives.
+		 * Corrections here should be extremely rare.
 		 *
-		 * Per standard Section 3.2 (S2 description):
-		 *   1600bps/2FSK (A1): 1600 baud → 40 symbols (= 40 bits)
-		 *   3200bps/2FSK (A2): 3200 baud → 80 symbols (= 80 bits)
-		 *   3200bps/4FSK (A3): 1600 baud → 40 symbols (= 80 bits)
-		 *   6400bps/4FSK (A4): 3200 baud → 80 symbols (= 160 bits)
+		 * S2 is symmetric: first half = BS2 + C, second half = inv.BS2 + inv.C.
+		 * Distance from C-end to inv.C-end is always s2_symbols/2.
+		 * In a correctly-synced signal, inv.C ends at exactly s2_symbols —
+		 * the same position as the blind symbol count.  The normal outcome
+		 * is that detection confirms the blind count, or falls back to it.
 		 *
-		 * S2 component breakdown (in symbols):
-		 *   Mode        BS2   C    inv.BS2  inv.C  Total
-		 *   A1 (1600/2) :  4 + 16 +   4   + 16   = 40 sym
-		 *   A2 (3200/2) : 24 + 16 +  24   + 16   = 80 sym
-		 *   A3 (3200/4) :  6 +  8 +   6   +  8   = 28 sym (*)
-		 *   A4 (6400/4) : 32 +  8 +  32   +  8   = 80 sym
+		 * We scan the full window (nominal + 2 symbols), record where
+		 * C and inv.C are found, and only correct if the evidence is
+		 * unambiguous: both patterns perfect (0 errors), at the exact
+		 * expected distance, with a small offset from nominal.
 		 *
-		 * (*) A3 note: standard Table 3.2-3 shows BS2 as 12 symbols
-		 *     of alternating comma pattern "101010101010" which is
-		 *     12 4-level symbols. C is 16 decoded bits = 8 symbols.
-		 *     Total = 12 + 8 + 12 + 8 = 40 symbols.
-		 *
-		 * TODO: Replace blind skip with C pattern detection for
-		 * precise block boundary timing (see BCH_REWRITE_PLAN.md). */
+		 * S2 component breakdown (in decoded bits / symbols):
+		 *   Mode        BS2   C    inv.BS2  inv.C  Total sym
+		 *   A1 (1600/2) :  4 + 16 +   4   + 16   = 40
+		 *   A2 (3200/2) : 24 + 16 +  24   + 16   = 80
+		 *   A3 (3200/4) : 12 +  8 +  12   +  8   = 40
+		 *   A4 (6400/4) : 32 +  8 +  32   +  8   = 80 */
 		int s2_symbols = flex->rx.sync_baud * 25 / 1000;
-		if (++flex->rx.sync2_count == s2_symbols) {
+		int s2_half = s2_symbols / 2;
+
+		/* Scan window: nominal + 2 symbols.  We are already synced
+		 * from S1, so this margin is a safety net, not an expectation. */
+		int s2_window = s2_symbols + 2;
+
+		/* Extract decoded bit(s) from this symbol and shift into
+		 * the 16-bit C pattern shift register.
+		 * 2FSK: 1 bit per symbol (bit_a only).
+		 * 4FSK: 2 bits per symbol (bit_a=MSB, bit_b=LSB via Gray). */
+		int bit_a = (sym_rect > 1);
+
+		if (flex->rx.sync_levels == 4) {
+			int bit_b = (sym_rect == 1) || (sym_rect == 2);
+			flex->rx.sync2_shiftreg = (uint16_t)(
+				(flex->rx.sync2_shiftreg << 2) |
+				(bit_a << 1) | bit_b);
+		} else {
+			flex->rx.sync2_shiftreg = (uint16_t)(
+				(flex->rx.sync2_shiftreg << 1) | bit_a);
+		}
+
+		/* Buffer symbols around the nominal boundary [nominal-2 .. nominal+2).
+		 * These may be data symbols if the boundary is earlier than nominal,
+		 * or S2 tail if the boundary is later.  We decide at the end. */
+		if (flex->rx.sync2_count >= s2_symbols - 2 &&
+		    flex->rx.sync2_sym_buf_count < 4) {
+			if (flex->rx.sync2_sym_buf_count == 0)
+				flex->rx.sync2_sym_buf_start = flex->rx.sync2_count;
+			flex->rx.sync2_sym_buf[flex->rx.sync2_sym_buf_count++] = sym_rect;
+		}
+
+		flex->rx.sync2_count++;
+
+		/* Correlate against both C and inv.C patterns for diagnostics.
+		 * We record positions but do NOT transition yet — we always
+		 * scan the full window before making a decision.
+		 * Detection threshold ≤2 errors is for logging only;
+		 * correction requires 0 errors (see decision logic below). */
+		if (flex->rx.sync2_count >= 16) {
+			/* Check for C (first half) — take first match only */
+			if (!flex->rx.sync2_c_found) {
+				unsigned int c_errs = count_bits(
+					flex->rx.sync2_shiftreg ^ FLEX_S2_C);
+				if (c_errs <= 2) {
+					flex->rx.sync2_c_found = 1;
+					flex->rx.sync2_c_pos = flex->rx.sync2_count;
+					flex->rx.sync2_c_errs = (int)c_errs;
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: S2 C detected at symbol %d/%d "
+						  "(%u bit error%s, reg=0x%04X).\n",
+						  flex->rx.sync2_count, s2_symbols,
+						  c_errs, c_errs == 1 ? "" : "s",
+						  flex->rx.sync2_shiftreg);
+				}
+			}
+
+			/* Check for inv.C (second half) — take first match only */
+			if (!flex->rx.sync2_cinv_found) {
+				unsigned int errs = count_bits(
+					flex->rx.sync2_shiftreg ^ FLEX_S2_C_INV);
+				if (errs <= 2) {
+					flex->rx.sync2_cinv_found = 1;
+					flex->rx.sync2_cinv_pos = flex->rx.sync2_count;
+					flex->rx.sync2_cinv_errs = (int)errs;
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: S2 inv.C detected at symbol %d/%d "
+						  "(%u bit error%s, reg=0x%04X).\n",
+						  flex->rx.sync2_count, s2_symbols,
+						  errs, errs == 1 ? "" : "s",
+						  flex->rx.sync2_shiftreg);
+				}
+			}
+		}
+
+		/* End of scan window — make the boundary decision. */
+		if (flex->rx.sync2_count >= s2_window) {
+			int boundary = s2_symbols;  /* default: nominal (blind count) */
+			int correction = 0;
+			const char *reason = "blind";
+
+			/* Decision logic: we are already synced from S1 and do not
+			 * expect corrections here.  The blind symbol count is the
+			 * correct baseline.  We only override it when the evidence
+			 * is unambiguous — anything less falls back to nominal.
+			 *
+			 * C and inv.C are raw 16-bit correlation patterns, NOT
+			 * BCH-protected.  With a ≤2 error detection threshold,
+			 * there is a ~0.2% per-symbol false positive risk from
+			 * random bit patterns (137/65536).  Over 80 symbols
+			 * that's ~16% chance of a spurious match in BS2.
+			 *
+			 * Correction criteria (ALL must hold):
+			 *   1. Both C and inv.C detected with 0 bit errors.
+			 *   2. Gap between them = exactly s2_half.
+			 *   3. Offset from nominal is ±1 or ±2 (not ±0).
+			 *
+			 * This should essentially never trigger in practice —
+			 * the PLL is well-locked by the time S2 starts. */
+			if (flex->rx.sync2_c_found && flex->rx.sync2_cinv_found) {
+				int gap = flex->rx.sync2_cinv_pos - flex->rx.sync2_c_pos;
+				int offset = flex->rx.sync2_cinv_pos - s2_symbols;
+
+				if (flex->rx.sync2_c_errs == 0 &&
+				    flex->rx.sync2_cinv_errs == 0 &&
+				    gap == s2_half &&
+				    offset != 0 &&
+				    offset >= -2 && offset <= 2) {
+					boundary = flex->rx.sync2_cinv_pos;
+					correction = offset;
+					reason = "C+inv.C perfect";
+				}
+				/* else: detected but not clean enough to correct */
+			}
+			/* else: neither found → nominal */
+
+			/* Transition to DATA */
 			flex->rx.data_count = 0;
 			flex_rx_clear_phase_data(flex);
 			flex->rx.rx_state = RX_STATE_DATA;
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: SYNC2→DATA, skipped %d S2 symbols (%d baud, %dFSK).\n",
-				  flex->rx.sync2_count,
-				  flex->rx.sync_baud,
-				  flex->rx.sync_levels);
+
+			/* Log only when something noteworthy happens.
+			 * Normal case (no correction) is silent — blind
+			 * count is the expected baseline. */
+			if (correction != 0) {
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: SYNC2→DATA (%s), boundary corrected "
+					  "by %+d symbol%s, "
+					  "C@%d(%de), inv.C@%d(%de), "
+					  "gap=%d (expected %d), "
+					  "%d baud/%dFSK.\n",
+					  reason, correction,
+					  (correction == 1 || correction == -1) ? "" : "s",
+					  flex->rx.sync2_c_pos,
+					  flex->rx.sync2_c_errs,
+					  flex->rx.sync2_cinv_pos,
+					  flex->rx.sync2_cinv_errs,
+					  flex->rx.sync2_c_found && flex->rx.sync2_cinv_found ?
+						flex->rx.sync2_cinv_pos - flex->rx.sync2_c_pos : 0,
+					  s2_half,
+					  flex->rx.sync_baud,
+					  flex->rx.sync_levels);
+			} else if (!flex->rx.sync2_c_found && !flex->rx.sync2_cinv_found) {
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: SYNC2→DATA, neither C nor inv.C detected, "
+					  "using blind count (%d symbols, %d baud/%dFSK).\n",
+					  s2_symbols,
+					  flex->rx.sync_baud,
+					  flex->rx.sync_levels);
+			}
+
+			/* Replay buffered symbols that fall AFTER the decided
+			 * boundary.  The buffer starts at sync2_sym_buf_start
+			 * (which is s2_symbols - 2).  Symbols at positions
+			 * >= boundary are data; symbols < boundary are S2 tail. */
+			{
+				int k;
+				int replay_count = 0;
+				for (k = 0; k < flex->rx.sync2_sym_buf_count; k++) {
+					int sym_pos = flex->rx.sync2_sym_buf_start + k;
+					if (sym_pos >= boundary) {
+						flex_rx_read_data(flex,
+							flex->rx.sync2_sym_buf[k]);
+						flex->rx.data_count++;
+						replay_count++;
+					}
+				}
+				if (replay_count > 0) {
+					LOGP_CHAN(DDSP, LOGL_INFO,
+						  "RX: replayed %d buffered symbol%s "
+						  "into data (boundary=%d, buf_start=%d).\n",
+						  replay_count,
+						  replay_count == 1 ? "" : "s",
+						  boundary,
+						  flex->rx.sync2_sym_buf_start);
+				}
+			}
 		}
 		break;
 	}
@@ -1520,6 +1889,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 			/* Return to sync hunting at 1600 baud / 2FSK */
 			flex->rx.baud = 1600;
 			flex->rx.rx_state = RX_STATE_SYNC1;
+			flex->rx.s1_tail_count = 0;
 		}
 		break;
 	}
@@ -1562,7 +1932,7 @@ static int flex_rx_build_symbol(flex_t *flex, double sample)
 				flex->rx.pll_envelope_count;
 		}
 	} else {
-		/* Not locked: reset envelope and hold in SYNC1 */
+		/* Not locked: reset envelope and hold in S1 hunting */
 		flex->rx.pll_envelope = 0;
 		flex->rx.pll_envelope_sum = 0;
 		flex->rx.pll_envelope_count = 0;
@@ -1570,6 +1940,7 @@ static int flex_rx_build_symbol(flex_t *flex, double sample)
 		flex->rx.pll_timeout = 0;
 		flex->rx.pll_nonconsec = 0;
 		flex->rx.rx_state = RX_STATE_SYNC1;
+		flex->rx.s1_tail_count = 0;
 	}
 
 	/* Mid 80% of symbol period: vote on symbol level */
@@ -1658,7 +2029,7 @@ static void flex_rx_demodulate(flex_t *flex, double sample)
 		/* Process symbol through state machine */
 		flex_rx_sym(flex, (unsigned char)modal_symbol);
 	} else {
-		/* Check for lock pattern (alternating 0/3 symbols = dotting).
+		/* Check for lock pattern (alternating 0/3 symbols = BS1 1,0 pattern).
 		 * Shift symbols into buffer; XOR with 0x1 maps sym 0→1, 3→2
 		 * (each containing a single set bit).
 		 * Lock pattern: 0x6666... (alternating 01 10 01 10...) */
