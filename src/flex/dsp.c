@@ -799,7 +799,7 @@ success:
 	if (corrected_p)
 		*corrected_p = (parity << 31) | code31;
 
-	return (int32_t)(code31 & 0x1FFFFF);
+	return (int32_t)(code31 & FLEX_DATA_MASK);
 }
 
 /* De-interleave one block of 8 × 32-bit words.
@@ -1166,30 +1166,30 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 			  fiw_raw, (unsigned int)data);
 	}
 
-	/* FIW layout per multimon-ng decode_fiw():
+	/* FIW layout (Spec Section 3.6):
 	 * bits 3-0:   checksum
 	 * bits 7-4:   cycle number (0-14)
 	 * bits 14-8:  frame number (0-127)
 	 * bits 20-15: fix3 (reserved)
 	 * Checksum: sum of all 4-bit nibbles + bit 20 = 0xF */
 	{
-		unsigned int checksum = (data & 0xF);
+		unsigned int checksum = (data & FLEX_FIW_CHECKSUM_MASK);
 		checksum += ((data >> 4) & 0xF);
 		checksum += ((data >> 8) & 0xF);
 		checksum += ((data >> 12) & 0xF);
 		checksum += ((data >> 16) & 0xF);
 		checksum += ((data >> 20) & 0x01);
-		checksum &= 0xF;
+		checksum &= FLEX_FIW_CHECKSUM_MASK;
 
-		if (checksum != 0xF) {
+		if (checksum != FLEX_FIW_CHECKSUM_OK) {
 			LOGP_CHAN(DDSP, LOGL_NOTICE,
 				  "RX: FIW checksum failed (0x%X != 0xF).\n", checksum);
 			return -1;
 		}
 	}
 
-	flex->rx.fiw_cycle = (data >> 4) & 0xF;
-	flex->rx.fiw_frame = (data >> 8) & 0x7F;
+	flex->rx.fiw_cycle = (data >> FLEX_FIW_CYCLE_SHIFT) & FLEX_FIW_CYCLE_MASK;
+	flex->rx.fiw_frame = (data >> FLEX_FIW_FRAME_SHIFT) & FLEX_FIW_FRAME_MASK;
 
 	LOGP_CHAN(DDSP, LOGL_INFO, "RX: FIW decoded — cycle=%u frame=%u.\n",
 		  flex->rx.fiw_cycle, flex->rx.fiw_frame);
@@ -1283,19 +1283,19 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 		uint32_t biw = ph->words[0];
 
 		/* Nothing to decode if BIW is idle */
-		if (biw == 0 || biw == 0x001FFFFF) {
+		if (biw == FLEX_BIW_IDLE_ZEROS || biw == FLEX_BIW_IDLE_ONES) {
 			LOGP_CHAN(DDSP, LOGL_DEBUG,
 				  "RX: Phase %c idle frame (BIW=0x%05X).\n",
 				  phase_name, biw);
 			return;
 		}
 
-		/* BIW1 layout (21 bits, per multimon-ng decode_phase):
+		/* BIW1 layout (Spec Section 3.7.1):
 		 * bits 15-10: voffset (start of vector field)
 		 * bits 9-8:   aoffset_raw (+1 = start of address field)
 		 * Other bits: priority, carry, collapse */
-		int voffset = (biw >> 10) & 0x3F;
-		int aoffset = ((biw >> 8) & 0x03) + 1;
+		int voffset = (biw >> FLEX_BIW1_VSTART_SHIFT) & FLEX_BIW1_VSTART_MASK;
+		int aoffset = ((biw >> FLEX_BIW1_ASTART_SHIFT) & FLEX_BIW1_ASTART_MASK) + 1;
 
 		LOGP_CHAN(DDSP, LOGL_DEBUG,
 			  "RX: Phase %c BIW=0x%05X aoffset=%d voffset=%d (%d pages).\n",
@@ -1307,40 +1307,114 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			return;
 		}
 
-		/* Walk address/vector pairs */
-		for (i = aoffset; i < voffset; i++) {
-			int j = voffset + i - aoffset; /* vector index */
+		/* Walk address/vector pairs.
+		 *
+		 * Per ARIB STD-43A Section 3.4.1 / Fig. 3.4.1-2:
+		 * - Short address (1 word): Ax pairs with Vx
+		 * - Long address (2 words): Ax,Ay pair with Vx,Vy
+		 *   (Ay is 2nd word of Ax; Vy is 2nd word of Vx)
+		 * - Tone-only addresses at end of AF have no vector
+		 *
+		 * addr_idx tracks position in the address field,
+		 * vec_count tracks how many vector slots consumed. */
+		{
+			int addr_idx = aoffset;
+			int vec_count = 0;
+
+		for (; addr_idx < voffset; addr_idx++) {
+			int j = voffset + vec_count; /* vector index */
 			uint64_t capcode;
 			int is_long = 0;
 			int vec_type, mw1, mw2, len;
 
 			if (j >= FLEX_WORDS_PER_FRAME) break;
 
-			if (ph->status[i] == FLEX_WORD_UNCORRECTABLE ||
-			    ph->status[i] == FLEX_WORD_NOT_RECEIVED ||
-			    ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
-			    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
+			if (ph->status[addr_idx] == FLEX_WORD_UNCORRECTABLE ||
+			    ph->status[addr_idx] == FLEX_WORD_NOT_RECEIVED) {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: Phase %c addr[%d] or vec[%d] uncorrectable.\n",
-					  phase_name, i, j);
+					  "RX: Phase %c addr[%d] uncorrectable.\n",
+					  phase_name, addr_idx);
+				vec_count++;
 				continue;
 			}
 
-			/* Address decode (per multimon-ng parse_capcode) */
+			/* Address decode (Spec Section 3.8, Appendix A).
+			 *
+			 * Long address detection: the first address word falls
+			 * outside the short address range.
+			 * Condition from multimon-ng demod_flex_next.c line 796:
+			 *   long = (aw < SHORT_MIN) || (aw > SHORT_MAX && aw < LONG_LO_MAX) || (aw > LONG_HI_MIN)
+			 */
 			{
-				uint32_t aw = ph->words[i];
-				is_long = (aw < 0x008001U) ||
-					  (aw > 0x1E0000U) ||
-					  (aw > 0x1E7FFEU);
-				capcode = aw - 0x8000;
+				uint32_t aw = ph->words[addr_idx];
+				is_long = (aw < FLEX_ADDR_SHORT_MIN) ||
+					  (aw > FLEX_ADDR_SHORT_MAX && aw < FLEX_ADDR_LONG_LO_MAX) ||
+					  (aw > FLEX_ADDR_LONG_HI_MIN);
+
+				if (is_long) {
+					/* Long address: 2 address words, 2 vector words.
+					 * capcode = (aw2 ^ 0x1FFFFF) << 15 + offset + aw1
+					 * per multimon-ng demod_flex_next.c line 804. */
+					if (addr_idx + 1 >= voffset) {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: Phase %c long addr[%d] truncated.\n",
+							  phase_name, addr_idx);
+						break;
+					}
+					if (ph->status[addr_idx + 1] == FLEX_WORD_UNCORRECTABLE ||
+					    ph->status[addr_idx + 1] == FLEX_WORD_NOT_RECEIVED) {
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c long addr[%d] word2 uncorrectable.\n",
+							  phase_name, addr_idx);
+						addr_idx++; /* skip second address word */
+						vec_count += 2; /* skip both vector words */
+						continue;
+					}
+					uint32_t aw2 = ph->words[addr_idx + 1];
+					capcode = ((uint64_t)(aw2 ^ FLEX_LONG_ADDR_W2_XOR) << 15)
+						  + FLEX_LONG_ADDR_RECON + (uint64_t)aw;
+					addr_idx++; /* consume second address word */
+
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c long addr[%d,%d] aw=0x%05X,0x%05X → cap=%" PRIu64 ".\n",
+						  phase_name, addr_idx - 1, addr_idx, aw, aw2, capcode);
+
+					/* Long address also consumes 2 vector words */
+					if (j + 1 >= FLEX_WORDS_PER_FRAME) break;
+					if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
+					    ph->status[j] == FLEX_WORD_NOT_RECEIVED ||
+					    ph->status[j + 1] == FLEX_WORD_UNCORRECTABLE ||
+					    ph->status[j + 1] == FLEX_WORD_NOT_RECEIVED) {
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c long vec[%d,%d] uncorrectable.\n",
+							  phase_name, j, j + 1);
+						vec_count += 2;
+						continue;
+					}
+					/* Use first vector word for type/start/len */
+					vec_count += 2;
+				} else {
+					/* Short address: capcode = aw - offset */
+					capcode = aw - FLEX_SHORT_ADDR_OFFSET;
+
+					if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
+					    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
+						LOGP_CHAN(DDSP, LOGL_DEBUG,
+							  "RX: Phase %c vec[%d] uncorrectable.\n",
+							  phase_name, j);
+						vec_count++;
+						continue;
+					}
+					vec_count++;
+				}
 			}
 
 			/* Vector decode */
 			{
 				uint32_t viw = ph->words[j];
-				vec_type = (viw >> 4) & 0x7;
-				mw1 = (viw >> 7) & 0x7F;
-				len = (viw >> 14) & 0x7F;
+				vec_type = FLEX_VEC_TYPE(viw);
+				mw1 = FLEX_VEC_START(viw);
+				len = FLEX_VEC_LEN(viw);
 				mw2 = mw1 + (len - 1);
 
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
@@ -1469,17 +1543,80 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  (frag_flag == 'F') ? "cont" : "final",
 						  capcode, text);
 				}
-			} else if (vec_type == FLEX_VECTOR_TYPE_NUMERIC) {
-				/* Numeric */
-				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] NUM\n",
-					  bitrate,
-					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-					  phase_name,
-					  flex->rx.sync_baud,
-					  flex->rx.sync_levels,
-					  flex->rx.polarity ? "neg" : "pos",
-					  capcode);
+			} else if (vec_type == FLEX_VECTOR_TYPE_NUMERIC ||
+				   vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM ||
+				   vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) {
+				/* Numeric message — extract BCD digits from message words.
+				 * Per ARIB STD-43A Section 3.9.1:
+				 *   Standard numeric: skip first 2 bits, then 4-bit BCD
+				 *   Numbered numeric (type 7): skip first 10+2 bits (header)
+				 * BCD table per Spec Table 3.10.2.1-1:
+				 *   0-9=digits, 0xA=spare (was linefeed pre-G1.4),
+				 *   0xB=U, 0xC=space, 0xD=hyphen, 0xE=], 0xF=[ */
+				if (mw1 <= 87 && mw2 <= 87) {
+					/* Numeric BCD decode (Spec Section 3.10.2, Table 3.10.2.1).
+				 * Shared table from frame.h — matches TX encoder. */
+				static const char bcd_table[16] = FLEX_NUM_BCD_TABLE;
+					char digits[256];
+					int di = 0, w, bit_count;
+					int skip_bits;
+
+					if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM)
+						skip_bits = FLEX_NUM_NUMBERED_SKIP_BITS;
+					else
+						skip_bits = FLEX_NUM_OVERHEAD_BITS;
+
+					bit_count = 0;
+					for (w = mw1; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+						int b;
+						uint32_t dw;
+
+						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+							break;
+						dw = ph->words[w];
+
+						/* Extract 4-bit BCD nibbles from 21-bit word */
+						for (b = 0; b < FLEX_BCH_DATA_BITS; b++) {
+							if (bit_count < skip_bits) {
+								bit_count++;
+								continue;
+							}
+							/* Accumulate nibble (4 bits per digit) */
+							{
+								int nibble_pos = (bit_count - skip_bits) % 4;
+								static uint8_t nibble_acc;
+								if (nibble_pos == 0)
+									nibble_acc = 0;
+								nibble_acc |= ((dw >> b) & 1) << nibble_pos;
+								if (nibble_pos == 3 && di < (int)sizeof(digits) - 1)
+									digits[di++] = bcd_table[nibble_acc & 0x0F];
+							}
+							bit_count++;
+						}
+					}
+					digits[di] = '\0';
+
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] NUM \"%s\"\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "neg" : "pos",
+						  capcode, digits);
+				} else {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] NUM\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "neg" : "pos",
+						  capcode);
+				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_TONE) {
 				/* Tone-only */
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
@@ -1491,12 +1628,45 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					  flex->rx.sync_levels,
 					  flex->rx.polarity ? "neg" : "pos",
 					  capcode);
+			} else if (vec_type == FLEX_VECTOR_TYPE_HEX_BINARY) {
+				/* HEX/Binary — dump raw hex from message words */
+				if (mw1 <= 87 && mw2 <= 87) {
+					char hex[512];
+					int hi = 0, w;
+
+					for (w = mw1; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+						uint32_t dw;
+						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+							continue;
+						dw = ph->words[w];
+						hi += snprintf(hex + hi, sizeof(hex) - hi,
+							       "%05X ", dw);
+						if (hi >= (int)sizeof(hex) - 6)
+							break;
+					}
+					if (hi > 0 && hex[hi - 1] == ' ')
+						hex[--hi] = '\0';
+					else
+						hex[hi] = '\0';
+
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] HEX [%s]\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "neg" : "pos",
+						  capcode, hex);
+				}
 			} else {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
 					  "RX: Phase %c unknown type %d from %" PRIu64 ".\n",
 					  phase_name, vec_type, capcode);
 			}
 		}
+		} /* end block scope for addr_idx/vec_count */
 	}
 }
 
@@ -1517,7 +1687,7 @@ static void flex_rx_clear_phase_data(flex_t *flex)
 /* Decode all active phases after data reading is complete.
  * Which phases are active depends on baud/levels:
  *   1600/2: A only
- *   1600/4: A, B (simultaneous via 4-level)
+ *   1600/4: A, C (simultaneous via 4-level dibit, per Section 3.3.2)
  *   3200/2: A, C (interleaved via toggle)
  *   3200/4: A, B, C, D (interleaved + simultaneous) */
 static void flex_rx_decode_data(flex_t *flex)
@@ -1586,8 +1756,8 @@ static void flex_rx_decode_data(flex_t *flex)
 
 	/* Decode phases based on mode (ARIB STD-43A Section 3.3.4):
 	 *   A1 (1600bps/2FSK): 1600 baud, 2 levels → phase A only
-	 *   A3 (3200bps/4FSK): 1600 baud, 4 levels → phases A, B
-	 *     (4FSK dibit: MSB=phase A, LSB=phase B)
+	 *   A3 (3200bps/4FSK): 1600 baud, 4 levels → phases A, C
+	 *     (4FSK dibit: MSB=phase A, LSB=phase C per Section 3.3.2)
 	 *   A2 (3200bps/2FSK): 3200 baud, 2 levels → phases A, C
 	 *     (alternating symbols: even=A, odd=C)
 	 *   A4 (6400bps/4FSK): 3200 baud, 4 levels → phases A, B, C, D
@@ -1597,7 +1767,7 @@ static void flex_rx_decode_data(flex_t *flex)
 			flex_rx_decode_phase(flex, &flex->rx.phase[0], 'A');
 		} else {
 			flex_rx_decode_phase(flex, &flex->rx.phase[0], 'A');
-			flex_rx_decode_phase(flex, &flex->rx.phase[1], 'B');
+			flex_rx_decode_phase(flex, &flex->rx.phase[1], 'C');
 		}
 	} else {
 		if (flex->rx.sync_levels == 2) {
@@ -1632,11 +1802,15 @@ static void flex_rx_decode_data(flex_t *flex)
  *   sym 3 → bit_a=1, bit_b=0  (+4800 Hz)
  *
  * Phase assignment:
- *   toggle=0: bit_a → Phase A, bit_b → Phase B
- *   toggle=1: bit_a → Phase C, bit_b → Phase D
+ *   toggle=0: bit_a → phase[0], bit_b → phase[1]
+ *   toggle=1: bit_a → phase[2], bit_b → phase[3]
  *
- * At 1600 baud: toggle is always 0 (no interleaving).
- * At 3200 baud: toggle alternates 0/1 on each symbol.
+ * At 1600 baud (A3): toggle forced to 0, no interleaving.
+ *   Per Section 3.3.2: MSB=phase A, LSB=phase C.
+ *   So phase[0]=A, phase[1]=C.
+ * At 3200 baud (A4): toggle alternates 0/1 per symbol.
+ *   Per Section 3.3.2: even sym MSB=A/LSB=B, odd sym MSB=C/LSB=D.
+ *   So phase[0]=A, phase[1]=B, phase[2]=C, phase[3]=D.
  *
  * De-interleave index formula (block de-interleave):
  *   idx = ((data_bit_counter >> 5) & 0xFFF8) | (data_bit_counter & 0x0007)

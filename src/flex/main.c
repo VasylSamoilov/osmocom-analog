@@ -97,6 +97,14 @@ void print_help(const char *arg0)
 	printf("        Choose polarity of FSK signal. (default %s).\n", (polarity < 0) ? "negative" : "positive");
 	printf(" -y --type auto | tone | numeric | alpha | hex | instruction | short\n");
 	printf("        Set message type. (default auto)\n");
+	printf("        Vector types per ARIB STD-43A Section 3.9:\n");
+	printf("          tone        — type 2: alert only, no message body\n");
+	printf("          numeric     — type 3: BCD-encoded digits\n");
+	printf("          alpha       — type 5: 7-bit alphanumeric characters\n");
+	printf("          hex         — type 6: raw hex/binary data\n");
+	printf("          instruction — type 1: 14-bit short instruction word\n");
+	printf("          short       — type 2: short message index (0-127)\n");
+	printf("          auto        — detect from message content\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Default message text. (default \"%s\").\n", message);
 	printf(" -S --scan <from> <to>\n");
@@ -144,6 +152,16 @@ void print_help(const char *arg0)
 	printf("        FIFO option: phase=A|B|C|D|auto\n");
 	printf("    --wav-test\n");
 	printf("        Exit after TX completes (use with --write-tx-wave).\n");
+	printf("\n");
+	printf("    FIFO protocol (write to %s):\n", MSG_SEND);
+	printf("        Format: capcode,type,options,message\n");
+	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short (or 0-6)\n");
+	printf("        Options: space-separated key=value pairs:\n");
+	printf("          speed=1600|3200|3200-4fsk|6400  polarity=neg|pos\n");
+	printf("          priority=0|1  charset=ascii|kanji  group=0|1\n");
+	printf("          source=<id>  phase=A|B|C|D|auto\n");
+	printf("        Special: ers,0,,  — trigger ERS re-sync burst\n");
+	printf("        Example: 1234567,alpha,speed=3200 priority=1,Hello World\n");
 	main_mobile_print_hotkeys();
 }
 
@@ -552,7 +570,11 @@ static void fifo_process_line(const char *text, int text_length)
 		return;
 	}
 
-	/* Validate message type */
+	/* Validate message type.
+	 * Accept names or numeric codes matching ARIB STD-43A vector types:
+	 *   0=auto, 1=tone, 2=numeric, 3=alpha, 4=hex, 5=instruction, 6=short
+	 * Also accept vector type numbers directly for advanced use:
+	 *   vtype1=instruction, vtype2=tone, vtype3=numeric, vtype5=alpha, vtype6=hex */
 	if (!strcasecmp(type_string, "auto") || !strcmp(type_string, "0"))
 		mtype = FLEX_MSG_TYPE_AUTO;
 	else if (!strcasecmp(type_string, "tone") || !strcmp(type_string, "1"))
@@ -561,14 +583,14 @@ static void fifo_process_line(const char *text, int text_length)
 		mtype = FLEX_MSG_TYPE_NUMERIC;
 	else if (!strcasecmp(type_string, "alpha") || !strcasecmp(type_string, "alphanumeric") || !strcmp(type_string, "3"))
 		mtype = FLEX_MSG_TYPE_ALPHA;
-	else if (!strcasecmp(type_string, "hex"))
+	else if (!strcasecmp(type_string, "hex") || !strcasecmp(type_string, "binary") || !strcmp(type_string, "4"))
 		mtype = FLEX_MSG_TYPE_HEX;
-	else if (!strcasecmp(type_string, "instruction"))
+	else if (!strcasecmp(type_string, "instruction") || !strcasecmp(type_string, "instr") || !strcmp(type_string, "5"))
 		mtype = FLEX_MSG_TYPE_INSTRUCTION;
-	else if (!strcasecmp(type_string, "short"))
+	else if (!strcasecmp(type_string, "short") || !strcmp(type_string, "6"))
 		mtype = FLEX_MSG_TYPE_SHORT;
 	else {
-		LOGP(DFLEX, LOGL_NOTICE, "Invalid type '%s'. Use auto/tone/numeric/alpha/hex/instruction/short.\n", type_string);
+		LOGP(DFLEX, LOGL_NOTICE, "FIFO: invalid type '%s'. Use auto/tone/numeric/alpha/hex/instruction/short.\n", type_string);
 		return;
 	}
 

@@ -302,7 +302,7 @@ static int is_capcode_valid(uint64_t capcode, int *is_long)
  */
 static uint32_t encode_short_address(uint32_t capcode)
 {
-	uint32_t dw = (capcode + FLEX_SHORT_ADDR_OFFSET) & ((1U << FLEX_BCH_DATA_BITS) - 1);
+	uint32_t dw = (capcode + FLEX_SHORT_ADDR_OFFSET) & FLEX_DATA_MASK;
 	return flex_encode_word(reverse_bits32(dw));
 }
 
@@ -362,11 +362,11 @@ uint32_t flex_create_fiw(uint32_t cycle, uint32_t frame, uint32_t n,
 			 uint32_t r, uint32_t t)
 {
 	uint32_t dw = 0;
-	dw |= (cycle & 0x0F) <<  4;
-	dw |= (frame & 0x7F) <<  8;
-	dw |= (n     & 0x01) << 15;
-	dw |= (r     & 0x01) << 16;
-	dw |= (t     & 0x0F) << 17;
+	dw |= (cycle & FLEX_FIW_CYCLE_MASK)   << FLEX_FIW_CYCLE_SHIFT;
+	dw |= (frame & FLEX_FIW_FRAME_MASK)   << FLEX_FIW_FRAME_SHIFT;
+	dw |= (n     & 0x01)                  << FLEX_FIW_ROAMING_SHIFT;
+	dw |= (r     & 0x01)                  << FLEX_FIW_REPEAT_SHIFT;
+	dw |= (t     & FLEX_FIW_TRAFFIC_MASK) << FLEX_FIW_TRAFFIC_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -386,11 +386,11 @@ uint32_t flex_create_biw1(uint32_t prio, uint32_t e_biw,
 			  uint32_t collapse)
 {
 	uint32_t dw = 0;
-	dw |= (prio     & 0x0F) <<  4;
-	dw |= (e_biw    & 0x03) <<  8;
-	dw |= (s_vfield & 0x3F) << 10;
-	dw |= (carry    & 0x03) << 16;
-	dw |= (collapse & 0x07) << 18;
+	dw |= (prio     & FLEX_BIW1_PRIO_MASK)     << FLEX_BIW1_PRIO_SHIFT;
+	dw |= (e_biw    & FLEX_BIW1_ASTART_MASK)   << FLEX_BIW1_ASTART_SHIFT;
+	dw |= (s_vfield & FLEX_BIW1_VSTART_MASK)   << FLEX_BIW1_VSTART_SHIFT;
+	dw |= (carry    & FLEX_BIW1_CARRY_MASK)     << FLEX_BIW1_CARRY_SHIFT;
+	dw |= (collapse & FLEX_BIW1_COLLAPSE_MASK)  << FLEX_BIW1_COLLAPSE_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -402,9 +402,9 @@ uint32_t flex_create_biw1(uint32_t prio, uint32_t e_biw,
 static uint32_t create_alpha_vector(uint32_t msg_start, uint32_t msg_words)
 {
 	uint32_t dw = 0;
-	dw |= (FLEX_VECTOR_TYPE_ALPHA & 0x07) <<  4;
-	dw |= (msg_start              & 0x7F) <<  7;
-	dw |= (msg_words              & 0x7F) << 14;
+	dw |= (FLEX_VECTOR_TYPE_ALPHA & FLEX_VEC_TYPE_MASK) << FLEX_VEC_TYPE_SHIFT;
+	dw |= (msg_start              & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
+	dw |= (msg_words              & FLEX_VEC_LEN_MASK)   << FLEX_VEC_LEN_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -415,21 +415,10 @@ static uint32_t create_numeric_vector(uint32_t msg_start,
 				      uint32_t msg_words, uint32_t kbit)
 {
 	uint32_t dw = 0;
-	dw |= (FLEX_VECTOR_TYPE_NUMERIC & 0x07) <<  4;
-	dw |= (msg_start                & 0x7F) <<  7;
-	dw |= (msg_words                & 0x07) << 14;
-	dw |= (kbit                     & 0x0F) << 17;
-
-	dw = flex_word_checksum(dw);
-	return flex_encode_word(reverse_bits32(dw));
-}
-
-/* Tone-only vector (Spec Section 3.9.2) */
-static uint32_t create_tone_vector(void)
-{
-	uint32_t dw = 0;
-	dw |= (FLEX_VECTOR_TYPE_TONE & 0x07) << 4;
-	dw |= (0x01) << 7;  /* Message type t1t0 = 01 */
+	dw |= (FLEX_VECTOR_TYPE_NUMERIC & FLEX_VEC_TYPE_MASK)  << FLEX_VEC_TYPE_SHIFT;
+	dw |= (msg_start                & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
+	dw |= (msg_words                & FLEX_VEC_NUM_LEN_MASK) << FLEX_VEC_LEN_SHIFT;
+	dw |= (kbit                     & FLEX_VEC_NUM_KBIT_MASK) << FLEX_VEC_NUM_KBIT_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -516,26 +505,13 @@ void flex_fill_idle_phase(uint32_t *words, int phase_index,
 }
 
 
-/* ===== Numeric Character Table (Spec Section 3.10.2, Table 3.10.2.1) ===== */
-
-static uint8_t numeric_char_to_flex(uint8_t ch)
-{
-	if (ch >= '0' && ch <= '9')
-		return ch - '0';
-	switch (ch) {
-	case 'U': case 'u': return 0xB;  /* Urgency */
-	case ' ':            return 0xC;  /* Space */
-	case '-': case '_':  return 0xD;  /* Hyphen */
-	case ']':            return 0xE;  /* Right bracket */
-	case '[':            return 0xF;  /* Left bracket */
-	default:             return 0;
-	}
-}
+/* numeric_char_to_flex() removed — use shared flex_num_char_to_bcd() from frame.h */
 
 static int is_valid_numeric_char(char c)
 {
 	return (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-	       c == '[' || c == ']' || c == ' ' || c == 'U' || c == 'u';
+	       c == '[' || c == ']' || c == ' ' || c == 'U' || c == 'u' ||
+	       c == FLEX_NUM_BCD_SPARE_CHAR;
 }
 
 static int is_valid_numeric_message(const char *msg)
@@ -668,7 +644,7 @@ static void encode_numeric_message(uint32_t *frame_words, const char *msg,
 	(void)config;
 
 	last_shift = 0;
-	bit_shift = 2;  /* First 2 bits reserved for checksum overflow */
+	bit_shift = FLEX_NUM_OVERHEAD_BITS;  /* First 2 bits reserved for checksum overflow */
 	word_idx = 0;
 	i = 0;
 
@@ -676,14 +652,14 @@ static void encode_numeric_message(uint32_t *frame_words, const char *msg,
 		if (bit_shift < FLEX_BCH_DATA_BITS) {
 			if (last_shift) {
 				/* Carry bits from previous nibble that crossed word boundary */
-				ch = numeric_char_to_flex(last_ch) >> (4 - last_shift);
+				ch = flex_num_char_to_bcd(last_ch) >> (4 - last_shift);
 				msg_words[word_idx] |= ((uint32_t)ch << bit_shift);
 				bit_shift += last_shift;
 				last_shift = 0;
 				continue;
 			}
-			ch = numeric_char_to_flex(msg[i++]);
-			msg_words[word_idx] |= ((uint32_t)ch << bit_shift) & ((1U << FLEX_BCH_DATA_BITS) - 1);
+			ch = flex_num_char_to_bcd(msg[i++]);
+			msg_words[word_idx] |= ((uint32_t)ch << bit_shift) & FLEX_DATA_MASK;
 			bit_shift += 4;
 			continue;
 		}
@@ -694,9 +670,9 @@ static void encode_numeric_message(uint32_t *frame_words, const char *msg,
 		word_idx++;
 	}
 
-	/* Pad remaining space with 0xC (space character) */
+	/* Pad remaining space with BCD space character */
 	for (; bit_shift < 18; bit_shift += 4)
-		msg_words[word_idx] |= ((uint32_t)0xC << bit_shift);
+		msg_words[word_idx] |= ((uint32_t)FLEX_NUM_BCD_SPACE << bit_shift);
 
 	/* K-bit checksum */
 	k_bit = 0;
@@ -717,18 +693,6 @@ static void encode_numeric_message(uint32_t *frame_words, const char *msg,
 	for (i = 0; i <= word_idx; i++)
 		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
 	*fwc_p = fwc;
-}
-
-/* Encode tone-only message (Spec Section 3.8.7.2) — vector word only. */
-static void encode_tone_message(uint32_t *frame_words, const char *msg,
-				uint32_t msg_start, uint32_t *fwc_p,
-				int is_long, const void *config)
-{
-	(void)msg;
-	(void)msg_start;
-	(void)is_long;
-	(void)config;
-	frame_words[(*fwc_p)++] = create_tone_vector();
 }
 
 /* ===== Message Type Detection ===== */
@@ -1077,7 +1041,7 @@ uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary)
 	 */
 	if (is_short_address(group_capcode)) {
 		dw = ((uint32_t)group_capcode + FLEX_SHORT_ADDR_OFFSET)
-			& ((1U << FLEX_BCH_DATA_BITS) - 1);
+			& FLEX_DATA_MASK;
 	} else if (is_long_address(group_capcode)) {
 		uint64_t result;
 		uint32_t w1;
@@ -1097,7 +1061,7 @@ uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary)
 		} else {
 			return 0;
 		}
-		dw = w1 & ((1U << FLEX_BCH_DATA_BITS) - 1);
+		dw = w1 & FLEX_DATA_MASK;
 	} else {
 		return 0;
 	}
@@ -1137,7 +1101,7 @@ uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr)
 		return 0;
 
 	/* Encode the temporary address value as a 21-bit BCH word */
-	dw = (uint32_t)temp_addr & ((1U << FLEX_BCH_DATA_BITS) - 1);
+	dw = (uint32_t)temp_addr & FLEX_DATA_MASK;
 
 	return flex_encode_word(reverse_bits32(dw));
 }
@@ -1153,18 +1117,20 @@ uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr)
  * different k-bit values.
  *
  * Bit layout (21-bit data word before BCH encoding):
- *   bits  4-6:  vector type (011 = 0x3)
+ *   bits  4-6:  vector type (110 = 0x6, HEX/Binary per Section 3.9.3)
  *   bits  7-13: message start word offset
- *   bits 14-16: message word count (3 bits)
- *   bits 17-20: k-bits = 0110 (hex/binary indicator)
+ *   bits 14-20: message word count (7 bits)
+ *
+ * Previously this used type 0x3 (numeric) with k-bits=0110 to signal
+ * hex mode.  Corrected to type 0x6 per ARIB STD-43A and reference
+ * decoders (PDW MODE_BINARY=6, multimon-ng FLEX_PAGETYPE_BINARY=6).
  */
 static uint32_t create_hex_vector(uint32_t msg_start, uint32_t msg_words)
 {
 	uint32_t dw = 0;
-	dw |= (FLEX_VECTOR_TYPE_HEX_BINARY & 0x07) <<  4;
-	dw |= (msg_start                   & 0x7F) <<  7;
-	dw |= (msg_words                   & 0x07) << 14;
-	dw |= (0x06)                                << 17; /* k-bits = 0110: hex/binary mode */
+	dw |= (FLEX_VECTOR_TYPE_HEX_BINARY & FLEX_VEC_TYPE_MASK) << FLEX_VEC_TYPE_SHIFT;
+	dw |= (msg_start                   & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
+	dw |= (msg_words                   & FLEX_VEC_LEN_MASK)   << FLEX_VEC_LEN_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -1274,14 +1240,14 @@ static void encode_hex_message(uint32_t *frame_words, const char *msg,
  *
  * Bit layout of the 21-bit data word:
  *   bits  0-3:  checksum (filled by flex_word_checksum)
- *   bits  4-6:  vector type = 111 (0x7 = FLEX_VECTOR_TYPE_SHORT_INSTR)
+ *   bits  4-6:  vector type = 001 (0x1 = FLEX_VECTOR_TYPE_SHORT_INSTR)
  *   bits  7-20: instruction data (14 bits, range 0-16383)
  */
 static uint32_t create_short_instruction_vector(uint32_t instruction_data)
 {
 	uint32_t dw = 0;
-	dw |= (FLEX_VECTOR_TYPE_SHORT_INSTR & 0x07) << 4;
-	dw |= (instruction_data & 0x3FFF) << 7;
+	dw |= (FLEX_VECTOR_TYPE_SHORT_INSTR & FLEX_VEC_TYPE_MASK) << FLEX_VEC_TYPE_SHIFT;
+	dw |= (instruction_data & FLEX_VEC_INSTR_MASK) << FLEX_VEC_INSTR_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -1712,7 +1678,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		int	packed;		/* 1 if included in this frame */
 	} info[256]; /* max 256 messages per call — generous upper bound */
 
-	/* Ordered indices: priority messages first, then normal */
+	/* Ordered indices: priority first, normal, tone-only last */
 	int order[256];
 	int n_prio = 0, n_norm = 0;
 	int prio_addr_words = 0;
@@ -1803,6 +1769,16 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 			info[i].vector_words = 1;
 
+			/* Tone-only addresses have no vector word and no message
+			 * body per ARIB STD-43A Section 3.4.1 / Fig. 3.4.1-2(C).
+			 * They sit at the end of the address field. */
+			if (msgs[i].msg_type == FLEX_FRAME_MSG_TYPE_TONE) {
+				info[i].vector_words = 0;
+				info[i].msg_words = 0;
+				info[i].packed = 0;
+				continue;
+			}
+
 			/* Estimate message body words */
 			mw = estimate_msg_words(&msgs[i]);
 			if (mw < 0) {
@@ -1816,25 +1792,44 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		}
 	}
 
-	/* ---- Build ordering: priority messages first, then normal ---- */
+	/* ---- Build ordering: priority first, normal, tone-only last ----
+	 *
+	 * Per ARIB STD-43A Section 3.4.1: "The Tone-Only Address is
+	 * positioned at the end of the Address Field, as it does not
+	 * require related vectors."  Tone-only addresses have no
+	 * corresponding vector word, so they must come after all
+	 * addresses that do have vectors.  The address/vector pairing
+	 * (Fig. 3.4.1-2) only covers the non-tone addresses. */
 
+	int n_tone = 0;
+
+	/* Pass 1: priority messages (non-tone) */
 	for (i = 0; i < (uint32_t)msg_count; i++) {
 		if (info[i].addr_words == 0 && info[i].vector_words == 0)
 			continue; /* skip invalid */
-		if (msgs[i].priority)
+		if (msgs[i].priority && msgs[i].msg_type != FLEX_FRAME_MSG_TYPE_TONE)
 			order[n_prio++] = (int)i;
 	}
+	/* Pass 2: normal messages (non-tone) */
 	for (i = 0; i < (uint32_t)msg_count; i++) {
 		if (info[i].addr_words == 0 && info[i].vector_words == 0)
 			continue; /* skip invalid */
-		if (!msgs[i].priority)
+		if (!msgs[i].priority && msgs[i].msg_type != FLEX_FRAME_MSG_TYPE_TONE)
 			order[n_prio + n_norm++] = (int)i;
+	}
+	/* Pass 3: tone-only messages last (no vector needed) */
+	for (i = 0; i < (uint32_t)msg_count; i++) {
+		if (info[i].addr_words == 0 && info[i].vector_words == 0)
+			continue; /* skip invalid */
+		if (msgs[i].msg_type == FLEX_FRAME_MSG_TYPE_TONE)
+			order[n_prio + n_norm + n_tone++] = (int)i;
 	}
 
 	/* ---- Greedy packing ---- */
 
 	capacity = FLEX_WORDS_PER_FRAME - biw_count; /* words available after BIWs */
 
+	/* Pack non-tone messages (priority + normal) — these need addr + vector + msg words */
 	for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
 		int idx = order[i];
 		int needed = info[idx].addr_words + info[idx].vector_words
@@ -1852,6 +1847,30 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 		if ((int)i < n_prio)
 			prio_addr_words += info[idx].addr_words;
+	}
+
+	/* Pack tone-only messages — these need only addr words (no vector, no msg body).
+	 * Per spec Section 3.4.1, tone-only addresses sit at the end of the
+	 * address field, after the vector field start offset.  They don't
+	 * consume vector or message word slots. */
+	{
+		int tone_addr_words = 0;
+		for (i = 0; i < (uint32_t)n_tone; i++) {
+			int idx = order[n_prio + n_norm + (int)i];
+			int needed = info[idx].addr_words; /* no vector, no msg */
+
+			if (needed > capacity)
+				break;
+
+			info[idx].packed = 1;
+			tone_addr_words += info[idx].addr_words;
+			capacity -= needed;
+			packed_count++;
+		}
+		/* Tone-only addresses are part of the address field but
+		 * come after the vector field start point.  Include them
+		 * in total_addr for the address writing loop. */
+		total_addr += tone_addr_words;
 	}
 
 	/* ---- Write BIW1 ---- */
@@ -1891,9 +1910,12 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			(uint32_t)tm_now.tm_min);
 	}
 
-	/* ---- Write address words (priority first, then normal) ---- */
+	/* ---- Write address words ----
+	 * Order: priority (non-tone), normal (non-tone), tone-only.
+	 * Per ARIB STD-43A Section 3.4.1 / Fig. 3.4.1-2(C):
+	 * tone-only addresses are at the end of the address field. */
 
-	for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
+	for (i = 0; i < (uint32_t)(n_prio + n_norm + n_tone); i++) {
 		int idx = order[i];
 		if (!info[idx].packed)
 			continue;
@@ -1912,10 +1934,11 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		}
 	}
 
-	/* ---- Write vector + message words for each packed message ---- */
+	/* ---- Write vector + message words for each packed non-tone message ---- */
 
 	/* msg_start tracks where the next message's body words begin.
-	 * It starts after BIW + address + vector words. */
+	 * It starts after BIW + address + vector words.
+	 * Tone-only messages have no vector or message words. */
 	{
 		uint32_t msg_start_word = (uint32_t)(biw_count + total_addr
 						     + total_vector);
@@ -1955,14 +1978,10 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 					NULL);
 				break;
 
-			case FLEX_FRAME_MSG_TYPE_TONE:
-				encode_tone_message(frame_words,
-					NULL,
-					msg_start_word,
-					&fwc,
-					info[idx].is_long,
-					NULL);
-				break;
+			/* FLEX_FRAME_MSG_TYPE_TONE: handled separately —
+			 * tone-only addresses are written at the end of the
+			 * address field with no vector or message words
+			 * (Section 3.4.1 / Fig. 3.4.1-2(C)). */
 
 			case FLEX_FRAME_MSG_TYPE_HEX:
 				encode_hex_message(frame_words,
@@ -2055,9 +2074,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
  *     hbit=0 → bit goes to phase A, hbit=1 → bit goes to phase C
  *     Pattern: A_bit, C_bit, A_bit, C_bit, ...
  *
- *   3200/4FSK (2 phases A,B):
- *     Each 4-level symbol carries A_bit (MSB) and B_bit (LSB).
- *     No phase-toggle interleaving — every symbol goes to A+B.
+ *   3200/4FSK (2 phases A,C):
+ *     Each 4-level symbol carries A_bit (MSB) and C_bit (LSB).
+ *     No phase-toggle interleaving — every symbol goes to A+C.
  *     PDW (g_sps=1600, level=4): phase_A from MSB, phase_B from LSB.
  *     multimon-ng (Sync.baud=1600, levels=4): same, no toggle.
  *
@@ -2069,7 +2088,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
  * we must bit-interleave: output bit 0 = A_bit0, bit 1 = C_bit0,
  * bit 2 = A_bit1, bit 3 = C_bit1, etc.
  *
- * For 3200/4FSK, each dibit = (A_bit, B_bit), no interleaving needed.
+ * For 3200/4FSK, each dibit = (A_bit, C_bit), no interleaving needed.
  *
  * For 6400/4FSK, dibits alternate between phase pairs (A,B) and (C,D).
  *
@@ -2274,8 +2293,8 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
  * Encode a multi-phase FLEX frame for 3200/6400 bps operation.
  *
  * At higher baud rates, the frame carries multiple independent phases:
- *   3200 bps (2-FSK): 2 phases (A, C)
- *   3200 bps (4-FSK): 2 phases (A, B)
+ *   3200 bps (2-FSK): 2 phases (A, C) — bit-level interleave
+ *   3200 bps (4-FSK): 2 phases (A, C) — dibit packed per Section 3.3.2
  *   6400 bps (4-FSK): 4 phases (A, B, C, D)
  *
  * Each phase is an independent set of 88 data words (BIW + addresses +
@@ -2289,7 +2308,7 @@ static size_t flex_interleave_phases(const flex_phase_data_t *phases,
  *   Data: bit-interleaved phase data (see flex_interleave_phases)
  *
  * For 3200/2FSK, data is BIT-interleaved: A_bit, C_bit, A_bit, C_bit...
- * For 3200/4FSK, data is dibit-packed: each symbol = (A_bit, B_bit).
+ * For 3200/4FSK, data is dibit-packed: each symbol = (A_bit, C_bit).
  * For 6400/4FSK, data is dibit-interleaved: (A,B), (C,D) alternating.
  *
  * The sync pattern (A1/A2/A3/A4) is selected based on bitrate and
@@ -2361,7 +2380,7 @@ size_t flex_encode_frame_phased(const flex_phase_data_t *phases, int num_phases,
 	/*
 	 * Phase interleaving depends on modulation type:
 	 *   3200/2FSK: bit-level (A_bit, C_bit, A_bit, C_bit, ...)
-	 *   3200/4FSK: dibit-packed, each symbol = (A_bit, B_bit)
+	 *   3200/4FSK: dibit-packed, each symbol = (A_bit, C_bit)
 	 *   6400/4FSK: dibit-level, phase pairs (A,B) and (C,D) alternate
 	 * See flex_interleave_phases() for details and PDW evidence.
 	 */
@@ -2433,7 +2452,7 @@ size_t flex_encode_sync(const flex_frame_params_t *params,
  * phase 0 and remaining phases are filled with idle frames. Phase
  * data is then interleaved into the output:
  *   3200/2FSK (2 phases): BIT-level — A_bit, C_bit, A_bit, C_bit, ...
- *   3200/4FSK (2 phases): dibit-packed — each symbol = (A_bit, B_bit)
+ *   3200/4FSK (2 phases): dibit-packed — each symbol = (A_bit, C_bit)
  *   6400/4FSK (4 phases): dibit-level — (A,B), (C,D) alternating
  * See flex_interleave_phases() for details and PDW evidence.
  *
@@ -2760,11 +2779,11 @@ static uint32_t create_numbered_alpha_vector(uint32_t msg_start,
 	uint32_t dw = 0;
 
 	/* Vector type: alpha (101) */
-	dw |= (FLEX_VECTOR_TYPE_ALPHA & 0x07) << 4;
+	dw |= (FLEX_VECTOR_TYPE_ALPHA & FLEX_VEC_TYPE_MASK) << FLEX_VEC_TYPE_SHIFT;
 	/* Message start word offset */
-	dw |= (msg_start & 0x7F) << 7;
+	dw |= (msg_start & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
 	/* Message word count */
-	dw |= (msg_words & 0x7F) << 14;
+	dw |= (msg_words & FLEX_VEC_LEN_MASK) << FLEX_VEC_LEN_SHIFT;
 
 	/*
 	 * When sequence_num >= 0, the message number is encoded in the

@@ -118,14 +118,180 @@ enum flex_word_status {
 #define FLEX_MAX_MSG_WORDS_HEX		FLEX_MAX_MSG_WORDS_ALPHA
 #define FLEX_MAX_CHARS_HEX		(FLEX_MAX_MSG_WORDS_HEX * 5)
 
-/* ===== Vector Word Types (Spec Section 3.9) ===== */
+/* ===== Vector Word Types (Spec Section 3.9) =====
+ *
+ * 3-bit type field extracted as (viw >> 4) & 0x7.
+ * Values per ARIB STD-43A and confirmed by PDW (MODE_*) and
+ * multimon-ng (FLEX_PAGETYPE_*):
+ *   0 = Secure, 1 = Short Instruction, 2 = Tone-Only/Short Message,
+ *   3 = Standard Numeric, 4 = Special Format Numeric,
+ *   5 = Alphanumeric, 6 = HEX/Binary, 7 = Numbered Numeric */
 
 #define FLEX_VECTOR_TYPE_SECURE		0x0	/* Secure message (3.9.5) */
+#define FLEX_VECTOR_TYPE_SHORT_INSTR	0x1	/* Short instruction (3.9.6) */
 #define FLEX_VECTOR_TYPE_TONE		0x2	/* Tone-only / short message (3.9.2) */
 #define FLEX_VECTOR_TYPE_NUMERIC	0x3	/* Standard numeric (3.9.1) */
-#define FLEX_VECTOR_TYPE_HEX_BINARY	0x3	/* type 011 with hex k-bits (3.9.3) */
+#define FLEX_VECTOR_TYPE_SPECIAL_NUM	0x4	/* Special format numeric (3.9.1) */
 #define FLEX_VECTOR_TYPE_ALPHA		0x5	/* Alphanumeric (3.9.4) */
-#define FLEX_VECTOR_TYPE_SHORT_INSTR	0x7	/* type 111 (3.9.6) */
+#define FLEX_VECTOR_TYPE_HEX_BINARY	0x6	/* HEX/Binary (3.9.3) */
+#define FLEX_VECTOR_TYPE_NUMBERED_NUM	0x7	/* Numbered numeric (3.9.1) */
+
+/* ===== Vector Word Bit Fields (Spec Section 3.9) =====
+ *
+ * Vector information word layout (21 data bits):
+ *   bits 0-3:   checksum (4-bit nibble sum)
+ *   bits 4-6:   type (3-bit vector type, see FLEX_VECTOR_TYPE_*)
+ *   bits 7-13:  msg_start (7-bit word offset where message begins)
+ *   bits 14-20: msg_words (7-bit message word count)
+ *
+ * For numeric vectors (types 3, 4, 7), bits 14-16 are msg_words (3 bits)
+ * and bits 17-20 are the K-bit checksum (4 bits).
+ *
+ * For short instruction (type 1), bits 7-20 are 14-bit instruction data. */
+
+#define FLEX_VEC_TYPE_SHIFT	4
+#define FLEX_VEC_TYPE_MASK	0x07
+#define FLEX_VEC_START_SHIFT	7
+#define FLEX_VEC_START_MASK	0x7F
+#define FLEX_VEC_LEN_SHIFT	14
+#define FLEX_VEC_LEN_MASK	0x7F	/* alpha/hex: 7-bit length */
+#define FLEX_VEC_NUM_LEN_MASK	0x07	/* numeric: 3-bit length */
+#define FLEX_VEC_NUM_KBIT_SHIFT	17
+#define FLEX_VEC_NUM_KBIT_MASK	0x0F
+#define FLEX_VEC_INSTR_SHIFT	7
+#define FLEX_VEC_INSTR_MASK	0x3FFF	/* 14-bit instruction data */
+
+/* Extract fields from a decoded (21-bit) vector word */
+#define FLEX_VEC_TYPE(viw)	(((viw) >> FLEX_VEC_TYPE_SHIFT) & FLEX_VEC_TYPE_MASK)
+#define FLEX_VEC_START(viw)	(((viw) >> FLEX_VEC_START_SHIFT) & FLEX_VEC_START_MASK)
+#define FLEX_VEC_LEN(viw)	(((viw) >> FLEX_VEC_LEN_SHIFT) & FLEX_VEC_LEN_MASK)
+
+/* ===== FIW Bit Fields (Spec Section 3.6) =====
+ *
+ * Frame Information Word layout (21 data bits):
+ *   bits 0-3:   checksum (sum of all nibbles + bit20 = 0xF)
+ *   bits 4-7:   cycle (0-14)
+ *   bits 8-14:  frame (0-127)
+ *   bit  15:    roaming flag (n)
+ *   bit  16:    repeat flag (r)
+ *   bits 17-20: low traffic flags (t) */
+
+#define FLEX_FIW_CHECKSUM_MASK	0x0F
+#define FLEX_FIW_CYCLE_SHIFT	4
+#define FLEX_FIW_CYCLE_MASK	0x0F
+#define FLEX_FIW_FRAME_SHIFT	8
+#define FLEX_FIW_FRAME_MASK	0x7F
+#define FLEX_FIW_ROAMING_SHIFT	15
+#define FLEX_FIW_REPEAT_SHIFT	16
+#define FLEX_FIW_TRAFFIC_SHIFT	17
+#define FLEX_FIW_TRAFFIC_MASK	0x0F
+#define FLEX_FIW_CHECKSUM_OK	0x0F	/* expected checksum result */
+
+/* ===== BIW1 Bit Fields (Spec Section 3.7.1) =====
+ *
+ * Block Information Word 1 layout (21 data bits):
+ *   bits 0-3:   checksum
+ *   bits 4-7:   priority address count (0-15)
+ *   bits 8-9:   address field start offset (add 1 for actual word index)
+ *   bits 10-15: vector field start offset (1-63)
+ *   bits 16-17: carry-on (0-3)
+ *   bits 18-20: collapse (0-7) */
+
+#define FLEX_BIW1_PRIO_SHIFT	4
+#define FLEX_BIW1_PRIO_MASK	0x0F
+#define FLEX_BIW1_ASTART_SHIFT	8
+#define FLEX_BIW1_ASTART_MASK	0x03
+#define FLEX_BIW1_VSTART_SHIFT	10
+#define FLEX_BIW1_VSTART_MASK	0x3F
+#define FLEX_BIW1_CARRY_SHIFT	16
+#define FLEX_BIW1_CARRY_MASK	0x03
+#define FLEX_BIW1_COLLAPSE_SHIFT 18
+#define FLEX_BIW1_COLLAPSE_MASK	0x07
+
+/* BIW1 idle detection: all-zeros or all-ones in 21-bit data field */
+#define FLEX_BIW_IDLE_ZEROS	0x00000000U
+#define FLEX_BIW_IDLE_ONES	0x001FFFFFU
+
+/* ===== Address Detection Thresholds (Spec Section 3.8) =====
+ *
+ * After BCH decode, the 21-bit address word is compared against these
+ * thresholds to determine if it's a short or long address.
+ * Short addresses: [0x008001, 0x1E0000] (capcode 1 to 1,933,312)
+ * Long addresses: outside that range (2-word encoding).
+ *
+ * Per multimon-ng demod_flex_next.c line 796 and PDW show_address():
+ *   is_long = (aw < 0x8001) || (aw > 0x1E0000 && aw < 0x1F0001) || (aw > 0x1F7FFE)
+ */
+#define FLEX_ADDR_SHORT_MIN	0x008001U	/* FLEX_SHORT_ADDR_MIN + FLEX_SHORT_ADDR_OFFSET */
+#define FLEX_ADDR_SHORT_MAX	0x1E0000U	/* FLEX_SHORT_ADDR_MAX + FLEX_SHORT_ADDR_OFFSET */
+#define FLEX_ADDR_LONG_LO_MAX	0x1F0001U	/* upper boundary of long address gap */
+#define FLEX_ADDR_LONG_HI_MIN	0x1F7FFEU	/* lower boundary of high long address range */
+
+/* Long address reconstruction (RX decode):
+ * capcode = ((aw2 ^ FLEX_LONG_ADDR_W2_XOR) << 15) + FLEX_LONG_ADDR_RECON + aw1
+ * This is the simplified formula from multimon-ng; the TX encoder uses the
+ * full set-based encoding with FLEX_LONG_OFFSET_A/B and set boundaries. */
+#define FLEX_LONG_ADDR_W2_XOR	0x1FFFFFU	/* XOR mask for second address word */
+#define FLEX_LONG_ADDR_RECON	0x1F9000ULL	/* reconstruction offset */
+
+/* 21-bit data mask (useful for masking BCH-decoded words) */
+#define FLEX_DATA_MASK		((1U << FLEX_BCH_DATA_BITS) - 1)
+
+/* ===== Numeric BCD Character Table (ARIB STD-43A Section 3.10.2, Table 3.10.2.1-1) =====
+ *
+ * 4-bit BCD encoding for numeric messages (B3=MSB, B0=LSB).
+ * Single shared table used by both TX encoder and RX decoder.
+ *
+ *   0x0-0x9 = digits '0'-'9'
+ *   0xA     = Spare (was linefeed pre-G1.4, now reserved — displayed as '.')
+ *   0xB     = U (urgency)
+ *   0xC     = Space
+ *   0xD     = Hyphen/dash
+ *   0xE     = ] (right bracket)
+ *   0xF     = [ (left bracket) */
+#define FLEX_NUM_BCD_SPARE	0x0A
+#define FLEX_NUM_BCD_URGENCY	0x0B
+#define FLEX_NUM_BCD_SPACE	0x0C
+#define FLEX_NUM_BCD_HYPHEN	0x0D
+#define FLEX_NUM_BCD_RBRACKET	0x0E
+#define FLEX_NUM_BCD_LBRACKET	0x0F
+
+/* ASCII representation of the spare nibble (0xA).
+ * '.' chosen because it is visually distinct, does not collide with any
+ * defined BCD character, and clearly signals a reserved/unused position. */
+#define FLEX_NUM_BCD_SPARE_CHAR	'.'
+
+/* Nibble→char decode table (index = 4-bit BCD value, value = ASCII char).
+ * Defined as a macro so it can be used to initialize a static const array
+ * in any translation unit without multiple-definition issues. */
+#define FLEX_NUM_BCD_TABLE \
+	{ '0','1','2','3','4','5','6','7','8','9', \
+	  FLEX_NUM_BCD_SPARE_CHAR,'U',' ','-',']','[' }
+
+/* Char→nibble encode: inline helper for TX.
+ * Returns the 4-bit BCD nibble for a given ASCII character. */
+static inline uint8_t flex_num_char_to_bcd(uint8_t ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	switch (ch) {
+	case FLEX_NUM_BCD_SPARE_CHAR:
+				 return FLEX_NUM_BCD_SPARE;
+	case 'U': case 'u': return FLEX_NUM_BCD_URGENCY;
+	case ' ':            return FLEX_NUM_BCD_SPACE;
+	case '-': case '_':  return FLEX_NUM_BCD_HYPHEN;
+	case ']':            return FLEX_NUM_BCD_RBRACKET;
+	case '[':            return FLEX_NUM_BCD_LBRACKET;
+	default:             return 0;
+	}
+}
+
+/* Numeric message overhead bits (Spec Section 3.10.2):
+ *   Standard/Special numeric: 2 overhead bits at start of first word
+ *   Numbered numeric: 10-bit header (message number + retrieval) + 2 overhead = 12 bits */
+#define FLEX_NUM_OVERHEAD_BITS		2
+#define FLEX_NUM_NUMBERED_HDR_BITS	10
+#define FLEX_NUM_NUMBERED_SKIP_BITS	(FLEX_NUM_NUMBERED_HDR_BITS + FLEX_NUM_OVERHEAD_BITS)
 
 /* ===== Alpha Message Fragment Flags (Spec Section 3.8.8.3) ===== */
 
@@ -242,12 +408,12 @@ enum flex_word_status {
  * RX outer code = inv upper16 = 0x7B18 */
 #define FLEX_SYNC_A2		0x7B18
 
-/* A3: 3200bps/4FSK — spec: 0100111110010111 0101100100111001
+/* A3: 3200bps/4FSK (1600 baud) — spec: 0100111110010111 0101100100111001
  * Normal bytes: {0x4F,0x97,0x59,0x39}  Inv bytes: {0xB0,0x68,0xA6,0xC6}
  * RX outer code = inv upper16 = 0xB068 */
 #define FLEX_SYNC_A3		0xB068
 
-/* A4: 6400bps/4FSK — spec: 0010000101011111 0101100100111001
+/* A4: 6400bps/4FSK (3200 baud) — spec: 0010000101011111 0101100100111001
  * Normal bytes: {0x21,0x5F,0x59,0x39}  Inv bytes: {0xDE,0xA0,0xA6,0xC6}
  * RX outer code = inv upper16 = 0xDEA0 */
 #define FLEX_SYNC_A4		0xDEA0

@@ -389,7 +389,7 @@ static int flex_get_phase_count(int bitrate, int modulation_type)
 	if (bitrate >= 6400 && modulation_type == FLEX_MOD_4FSK)
 		return 4;  /* A4 */
 	if (bitrate >= 3200 && modulation_type == FLEX_MOD_4FSK)
-		return 2;  /* A3: phases A+B packed into 4-level symbols */
+		return 2;  /* A3: phases A+C packed into 4-level symbols */
 	if (bitrate >= 3200)
 		return 2;  /* A2 */
 	return 1;  /* A1 */
