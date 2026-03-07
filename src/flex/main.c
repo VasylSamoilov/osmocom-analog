@@ -73,6 +73,8 @@ static int default_blocking_length = 1;	/* HEX/Binary B field: 1-15 bits/char, 0
 static int wav_test = 0;		/* --wav-test: exit after TX completes */
 static int num_transmissions = 1;	/* --num-transmissions: 1/2/3/4 */
 static int td_collapse = -1;		/* --td-collapse: -1=system, 5/6/7 */
+static int chan_setup_enabled = 0;	/* --chan-setup: enable BIW channel setup */
+int rx_kanji_enabled = 0;		/* --rx-kanji: enable Kanji/Shift-JIS decode */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -98,6 +100,8 @@ static int td_collapse = -1;		/* --td-collapse: -1=system, 5/6/7 */
 #define OPT_TIMEZONE		3020
 #define OPT_NUM_TX		3021
 #define OPT_TD_COLLAPSE		3022
+#define OPT_CHAN_SETUP		3023
+#define OPT_RX_KANJI		3024
 
 void print_help(const char *arg0)
 {
@@ -108,7 +112,7 @@ void print_help(const char *arg0)
 	printf("        Choose deviation of FSK signal (default %.0f Hz).\n", deviation);
 	printf(" -P --polarity -1 | negative | 1 | positive\n");
 	printf("        Choose polarity of FSK signal. (default %s).\n", (polarity < 0) ? "negative" : "positive");
-	printf(" -y --type auto | tone | numeric | alpha | hex | instruction | short\n");
+	printf(" -y --type auto | tone | numeric | alpha | hex | instruction | short | secure | special | snum | nnumeric | nnum | nspecial | nsnum\n");
 	printf("        Set message type. (default auto)\n");
 	printf("        Message types (V2V1V0 vector type field):\n");
 	printf("          tone        — V=010: alert only, no message body\n");
@@ -117,9 +121,14 @@ void print_help(const char *arg0)
 	printf("          hex         — V=110: raw hex/binary data\n");
 	printf("          instruction — V=001: 14-bit short instruction word\n");
 	printf("          short       — V=010: short message index (0-127)\n");
+	printf("          secure      — V=000: operator-controlled secure message (alpha or binary body)\n");
+	printf("          special     — V=100: special format numeric (BCD, ID-ROM display) [alias: snum]\n");
+	printf("          nnumeric    — V=111 S=0: like numeric, with duplicate detection/sequencing [alias: nnum]\n");
+	printf("          nspecial    — V=111 S=1: like special, with duplicate detection/sequencing [alias: nsnum]\n");
 	printf("          auto        — detect from message content\n");
 	printf("        RX output tags: ALN=alpha, SEC=secure(V=000),\n");
-	printf("          NUM=standard numeric, SNUM=special format, NNUM=numbered,\n");
+	printf("          NUM=standard numeric, SNUM=special format,\n");
+	printf("          NNUM=numbered numeric, NSNUM=numbered special,\n");
 	printf("          HEX=hex/binary, TON=tone, INS=instruction\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Default message text. (default \"%s\").\n", message);
@@ -187,10 +196,16 @@ void print_help(const char *arg0)
 	printf("    --td-collapse <5|6|7>\n");
 	printf("        TD Collapse cycle override for multiple transmission.\n");
 	printf("        Overrides system --collapse for repeat interval calculation.\n");
+	printf("    --chan-setup\n");
+	printf("        Enable BIW Channel Setup instruction (A-type 0x06) emission.\n");
+	printf("        Emits frame offset, carry-on, NID, and system message bits.\n");
+	printf("    --rx-kanji\n");
+	printf("        Enable Kanji/Shift-JIS 16-bit character decode for RX alpha messages.\n");
+	printf("        Output tagged ALN:KNJ instead of ALN.\n");
 	printf("\n");
 	printf("    FIFO protocol (write to %s):\n", MSG_SEND);
 	printf("        Format: capcode,type,options,message\n");
-	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short (or 0-6)\n");
+	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short|secure|special|nnumeric|nspecial (or 0-10)\n");
 	printf("        Options: space-separated key=value pairs:\n");
 	printf("          speed=1600|3200|3200-4fsk|6400  polarity=neg|pos\n");
 	printf("          priority=0|1  charset=ascii|kanji\n");
@@ -198,6 +213,10 @@ void print_help(const char *arg0)
 	printf("          phase=A|B|C|D|auto\n");
 	printf("          blocking=0-16  (hex bits/char: 0 or 16=16bit, 1=raw, default 1)\n");
 	printf("          maildrop=0|1  (alpha/hex: separate handling from ordinary msgs)\n");
+	printf("          sectype=alpha|binary  (secure: wire encoding of body, default alpha)\n");
+	printf("          sectag=0|1|2|3  (secure: pager type tag, 0=alpha 1=vendor 2=binary 3=rsvd, default=sectype)\n");
+	printf("          msgnum=0-63  (nnumeric/nspecial: sequence number for dedup, default auto)\n");
+	printf("          chan_setup=0|1  (enable/disable BIW channel setup emission)\n");
 	printf("        Special: ers,0,,  — trigger ERS re-sync burst\n");
 	printf("        Special: status,0,,  — dump system config + temp group assignments\n");
 	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
@@ -211,6 +230,13 @@ void print_help(const char *arg0)
 	printf("          1234567,numeric,,31415926\n");
 	printf("          1234567,hex,blocking=8,DEADBEEF\n");
 	printf("          1234567,tone,,\n");
+	printf("          1234567,instruction,,42\n");
+	printf("          1234567,short,,5\n");
+	printf("          1234567,secure,,Secure alpha message\n");
+	printf("          1234567,secure,sectype=binary sectag=2,DEADBEEF\n");
+	printf("          1234567,special,,31415926\n");
+	printf("          1234567,nnumeric,msgnum=7,31415926\n");
+	printf("          1234567,nspecial,,31415926\n");
 	printf("          group:1234567,alpha,group=1,Group message\n");
 	printf("          group:1234567,alpha,group=1 tempgroup=1,Temp group msg\n");
 	printf("          sysmsg,0,,System maintenance at 03:00 UTC\n");
@@ -265,6 +291,8 @@ static void add_options(void)
 	option_add(OPT_BLOCKING, "blocking", 1);
 	option_add(OPT_NUM_TX, "num-transmissions", 1);
 	option_add(OPT_TD_COLLAPSE, "td-collapse", 1);
+	option_add(OPT_CHAN_SETUP, "chan-setup", 0);
+	option_add(OPT_RX_KANJI, "rx-kanji", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -305,8 +333,16 @@ static int handle_options(int short_option, int argi, char **argv)
 			msg_type = FLEX_MSG_TYPE_INSTRUCTION;
 		else if (!strcasecmp(argv[argi], "short") || !strcmp(argv[argi], "6"))
 			msg_type = FLEX_MSG_TYPE_SHORT;
+		else if (!strcasecmp(argv[argi], "secure") || !strcmp(argv[argi], "7"))
+			msg_type = FLEX_MSG_TYPE_SECURE;
+		else if (!strcasecmp(argv[argi], "special") || !strcasecmp(argv[argi], "snum") || !strcmp(argv[argi], "8"))
+			msg_type = FLEX_MSG_TYPE_SPECIAL_NUM;
+		else if (!strcasecmp(argv[argi], "nnumeric") || !strcasecmp(argv[argi], "nnum") || !strcmp(argv[argi], "9"))
+			msg_type = FLEX_MSG_TYPE_NUMBERED_NUM;
+		else if (!strcasecmp(argv[argi], "nspecial") || !strcasecmp(argv[argi], "nsnum") || !strcmp(argv[argi], "10"))
+			msg_type = FLEX_MSG_TYPE_NUMBERED_SPECIAL;
 		else {
-			fprintf(stderr, "Given type is invalid. Use auto/tone/numeric/alpha/hex/instruction/short.\n");
+			fprintf(stderr, "Given type is invalid. Use auto/tone/numeric/alpha/hex/instruction/short/secure/special/nnumeric/nspecial.\n");
 			return -EINVAL;
 		}
 		break;
@@ -466,6 +502,12 @@ static int handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		}
 		break;
+	case OPT_CHAN_SETUP:
+		chan_setup_enabled = 1;
+		break;
+	case OPT_RX_KANJI:
+		rx_kanji_enabled = 1;
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -481,7 +523,10 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			       double *polarity_out, int *priority,
 			       int *charset, int *is_group, int *is_temp_group,
 			       char *source_id, int *phase, int *blocking_length,
-			       int *mail_drop)
+			       int *mail_drop,
+			       int *secure_encoding, int *secure_subtype,
+			       int *numbered_msgnum,
+			       int *msg_chan_setup)
 {
 	char buf[256];
 	char *p, *key, *val;
@@ -499,6 +544,10 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*phase = -1;
 	*blocking_length = default_blocking_length;
 	*mail_drop = 0;
+	*secure_encoding = 0;	/* wire encoding: 0=7-bit alpha, 1=raw binary */
+	*secure_subtype = -1;	/* pager-side type tag; -1 = derive from encoding */
+	*numbered_msgnum = -1;	/* sequence number for dedup; -1 = auto from counter */
+	*msg_chan_setup = -1;	/* -1 = not set (use global default) */
 
 	if (opts_len <= 0)
 		return;
@@ -593,6 +642,41 @@ static void parse_fifo_options(const char *opts, int opts_len,
 		}
 		else if (!strcmp(key, "maildrop"))
 			*mail_drop = atoi(val) ? 1 : 0;
+		else if (!strcmp(key, "sectype")) {
+			if (!strcasecmp(val, "alpha"))
+				*secure_encoding = 0;
+			else if (!strcasecmp(val, "binary"))
+				*secure_encoding = 1;
+			else {
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: invalid sectype '%s', must be alpha or binary.\n", val);
+				*secure_encoding = -1; /* signal error */
+			}
+		}
+		else if (!strcmp(key, "sectag")) {
+			int st = atoi(val);
+			if (st >= 0 && st <= 3)
+				*secure_subtype = st;
+			else
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: sectag %d out of range (0-3), using default.\n", st);
+		}
+		else if (!strcmp(key, "msgnum")) {
+			int mn = atoi(val);
+			if (mn >= 0 && mn <= 63)
+				*numbered_msgnum = mn;
+			else
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: msgnum %d out of range (0-63), using auto-assign.\n", mn);
+		}
+		else if (!strcmp(key, "chan_setup"))
+			*msg_chan_setup = atoi(val) ? 1 : 0;
+	}
+
+	/* Derive sectag from sectype when operator didn't set it explicitly:
+	 * sectype=alpha → sectag=0 (t1t0=00), sectype=binary → sectag=2 (t1t0=10) */
+	if (*secure_subtype == -1) {
+		if (*secure_encoding == 1)
+			*secure_subtype = 2; /* binary default: t1t0=10 */
+		else
+			*secure_subtype = 0; /* alpha default: t1t0=00 */
 	}
 }
 
@@ -618,6 +702,10 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_phase;
 	int msg_blocking_length;
 	int msg_mail_drop;
+	int msg_secure_encoding;
+	int msg_secure_subtype;
+	int msg_numbered_msgnum;
+	int msg_chan_setup;
 	char msg_source[64];
 	const char *opts_start;
 	int opts_len;
@@ -878,7 +966,14 @@ static void fifo_process_line(const char *text, int text_length)
 			   &msg_polarity, &msg_priority,
 			   &msg_charset, &is_group, &is_temp_group,
 			   msg_source, &msg_phase, &msg_blocking_length,
-			   &msg_mail_drop);
+			   &msg_mail_drop,
+			   &msg_secure_encoding, &msg_secure_subtype,
+			   &msg_numbered_msgnum,
+			   &msg_chan_setup);
+
+	/* Discard message if sectype was invalid */
+	if (msg_secure_encoding == -1)
+		return;
 
 	/* Validate capcode */
 	capcode = strtoull(capcode_string, NULL, 10);
@@ -906,8 +1001,16 @@ static void fifo_process_line(const char *text, int text_length)
 		mtype = FLEX_MSG_TYPE_INSTRUCTION;
 	else if (!strcasecmp(type_string, "short") || !strcmp(type_string, "6"))
 		mtype = FLEX_MSG_TYPE_SHORT;
+	else if (!strcasecmp(type_string, "secure") || !strcasecmp(type_string, "sec") || !strcmp(type_string, "7"))
+		mtype = FLEX_MSG_TYPE_SECURE;
+	else if (!strcasecmp(type_string, "special") || !strcasecmp(type_string, "snum") || !strcmp(type_string, "8"))
+		mtype = FLEX_MSG_TYPE_SPECIAL_NUM;
+	else if (!strcasecmp(type_string, "nnumeric") || !strcasecmp(type_string, "nnum") || !strcmp(type_string, "9"))
+		mtype = FLEX_MSG_TYPE_NUMBERED_NUM;
+	else if (!strcasecmp(type_string, "nspecial") || !strcasecmp(type_string, "nsnum") || !strcmp(type_string, "10"))
+		mtype = FLEX_MSG_TYPE_NUMBERED_SPECIAL;
 	else {
-		LOGP(DFLEX, LOGL_NOTICE, "FIFO: invalid type '%s'. Use auto/tone/numeric/alpha/hex/instruction/short.\n", type_string);
+		LOGP(DFLEX, LOGL_NOTICE, "FIFO: invalid type '%s'. Use auto/tone/numeric/alpha/hex/instruction/short/secure/special/nnumeric/nspecial.\n", type_string);
 		return;
 	}
 
@@ -959,6 +1062,11 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->phase = msg_phase;
 				msg->blocking_length = msg_blocking_length;
 				msg->mail_drop = msg_mail_drop;
+				msg->secure_encoding = msg_secure_encoding;
+				msg->secure_subtype = msg_secure_subtype;
+				msg->numbered_msgnum = msg_numbered_msgnum;
+				if (msg_chan_setup >= 0)
+					flex->chan_setup_enabled = msg_chan_setup;
 				if (msg_source[0] != '\0') {
 					strncpy(msg->source_id, msg_source, sizeof(msg->source_id) - 1);
 					msg->source_id[sizeof(msg->source_id) - 1] = '\0';
@@ -979,6 +1087,20 @@ static void fifo_process_line(const char *text, int text_length)
 				     (msg_phase == 1) ? "B" :
 				     (msg_phase == 2) ? "C" : "D",
 				     message_length);
+				if (mtype == FLEX_MSG_TYPE_SECURE)
+					LOGP(DFLEX, LOGL_INFO,
+					     "FIFO:   secure options: sectype=%s sectag=%d\n",
+					     msg_secure_encoding ? "binary" : "alpha",
+					     msg_secure_subtype);
+				if (mtype == FLEX_MSG_TYPE_NUMBERED_NUM ||
+				    mtype == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
+					LOGP(DFLEX, LOGL_INFO,
+					     "FIFO:   numbered options: msgnum=%d\n",
+					     msg_numbered_msgnum);
+				if (mtype == FLEX_MSG_TYPE_HEX)
+					LOGP(DFLEX, LOGL_INFO,
+					     "FIFO:   hex options: blocking=%d\n",
+					     msg_blocking_length);
 			}
 		}
 	}
@@ -1165,6 +1287,7 @@ int main(int argc, char *argv[])
 			f->roaming_active = (ssid != 0 || nid != 0) ? 1 : 0;
 			f->num_transmissions = num_transmissions;
 			f->td_collapse = td_collapse;
+			f->chan_setup_enabled = chan_setup_enabled;
 
 			/* Parse POCSAG mixing frame slots if specified */
 			if (pocsag_mix) {

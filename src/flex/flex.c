@@ -56,11 +56,15 @@ static const char *flex_msg_type_names[] = {
 	"hex",
 	"instruction",
 	"short",
+	"secure",
+	"special_num",
+	"numbered_num",
+	"numbered_special",
 };
 
 const char *flex_msg_type_name(enum flex_msg_type type)
 {
-	if (type >= 0 && type < 7)
+	if (type >= 0 && type < 11)
 		return flex_msg_type_names[type];
 	return "unknown";
 }
@@ -205,6 +209,18 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->mail_drop = 0;
 	msg->phase = -1;
 
+	/* secure / numbered numeric defaults */
+	msg->secure_subtype = 0;
+	msg->secure_encoding = 0;
+	msg->numbered_r = 1;	/* TODO: wire to retransmission scheduler —
+				 * set R=0 on retransmissions with same N */
+	/* S flag derived from message type:
+	 *   NUMBERED_NUM     (nnumeric) → S=0: standard digit display
+	 *   NUMBERED_SPECIAL (nspecial) → S=1: ID-ROM display (like special/V=100)
+	 * Both use V=111 on the wire; S is the only difference. */
+	msg->numbered_s = (msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL) ? 1 : 0;
+	msg->numbered_msgnum = -1;
+
 	/* fragmentation state defaults */
 	msg->fragment_index = 0;
 	msg->total_fragments = 0;
@@ -216,6 +232,32 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	while ((*msgp))
 		msgp = &(*msgp)->next;
 	(*msgp) = msg;
+
+	/* Type-specific enqueue logging */
+	switch (msg_type) {
+	case FLEX_MSG_TYPE_SECURE:
+		LOGP(DFLEX, LOGL_INFO,
+		     "Enqueue: capcode=%" PRIu64 " type=secure subtype=%s len=%d\n",
+		     capcode,
+		     (msg->secure_encoding == 0) ? "alpha" : "binary",
+		     data_length);
+		break;
+	case FLEX_MSG_TYPE_SPECIAL_NUM:
+		LOGP(DFLEX, LOGL_INFO,
+		     "Enqueue: capcode=%" PRIu64 " type=special_num len=%d\n",
+		     capcode, data_length);
+		break;
+	case FLEX_MSG_TYPE_NUMBERED_NUM:
+	case FLEX_MSG_TYPE_NUMBERED_SPECIAL:
+		LOGP(DFLEX, LOGL_INFO,
+		     "Enqueue: capcode=%" PRIu64 " type=%s msgnum=%d len=%d\n",
+		     capcode, flex_msg_type_name(msg->msg_type),
+		     msg->numbered_msgnum,
+		     data_length);
+		break;
+	default:
+		break;
+	}
 
 	/* kick transmitter */
 	if (flex->state == FLEX_STATE_IDLE) {
@@ -329,7 +371,32 @@ static void flex_fragment_queue(flex_t *flex)
 				max_chars = 1;
 			break;
 		}
+		case FLEX_MSG_TYPE_SECURE: {
+			/* Secure messages use the same fragmentation as alpha
+			 * (for alpha encoding) or hex (for binary encoding).
+			 * The encoding mode is determined by secure_encoding. */
+			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
+			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
+					      - addr_words - 1; /* 1 vector */
+			if (msg->secure_encoding == 0) {
+				/* Alpha encoding: same sizing as alpha */
+				max_chars = (msg_words_avail - 1) * 3 - 2;
+				if (max_chars > FLEX_MAX_CHARS_ALPHA)
+					max_chars = FLEX_MAX_CHARS_ALPHA;
+			} else {
+				/* Binary encoding: same sizing as hex */
+				int data_words = msg_words_avail - 2;
+				max_chars = data_words * 5;
+				if (max_chars > FLEX_MAX_CHARS_HEX)
+					max_chars = FLEX_MAX_CHARS_HEX;
+			}
+			if (max_chars < 1)
+				max_chars = 1;
+			break;
+		}
 		default:
+			/* Numeric types (standard, special format, numbered)
+			 * are single-frame only — no fragmentation needed. */
 			continue;
 		}
 
@@ -385,6 +452,8 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->blocking_length = msg->blocking_length;
 			frag->mail_drop = msg->mail_drop;
 			frag->phase = msg->phase;
+			frag->secure_subtype = msg->secure_subtype;
+			frag->secure_encoding = msg->secure_encoding;
 
 			/* Set fragmentation state */
 			frag->fragment_index = i;
@@ -621,6 +690,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.roaming = flex->roaming_active ? 1 : 0;
 	params.collapse = flex->collapse;
 	params.biw_time = flex->biw_time_enabled;
+	params.chan_setup_enabled = flex->chan_setup_enabled;
 	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
 
 	/* Multiple transmission params (Spec Section 3.4.2) */
@@ -801,7 +871,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 			/* Encode this message into a temp buffer to get the 88 data words */
 			memset(&frame_msg, 0, sizeof(frame_msg));
 			frame_msg.capcode = candidate->capcode;
-			frame_msg.msg_type = (int)candidate->msg_type;
+			/* NUMBERED_SPECIAL uses the same V=111 encoder as NUMBERED_NUM;
+			 * the S flag (already in numbered_s) is the only difference. */
+			frame_msg.msg_type = (candidate->msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
+				? FLEX_FRAME_MSG_TYPE_NUMBERED_NUM
+				: (int)candidate->msg_type;
 			frame_msg.message = candidate->data;
 			frame_msg.message_length = candidate->data_length;
 			frame_msg.speed = candidate->speed;
@@ -819,6 +893,17 @@ static int flex_get_next_frame_network(flex_t *flex)
 			frame_msg.mail_drop = candidate->mail_drop;
 			frame_msg.fragment_index = candidate->fragment_index;
 			frame_msg.total_fragments = candidate->total_fragments;
+			frame_msg.secure_subtype = candidate->secure_subtype;
+			frame_msg.secure_encoding = candidate->secure_encoding;
+			frame_msg.numbered_r = candidate->numbered_r;
+			frame_msg.numbered_s = candidate->numbered_s;
+			/* Auto-assign numbered_msgnum from sequence counter when -1 */
+			if (candidate->numbered_msgnum >= 0) {
+				frame_msg.numbered_msgnum = candidate->numbered_msgnum;
+			} else {
+				frame_msg.numbered_msgnum = frame_msg.sequence_num;
+				frame_msg.numbered_r = 1;
+			}
 
 			len = flex_encode_frame_multi(&frame_msg, 1, &phase_params,
 						      phase_buf, sizeof(phase_buf),
@@ -932,7 +1017,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 		/* Encode the eligible message */
 		memset(&frame_msg, 0, sizeof(frame_msg));
 		frame_msg.capcode = msg->capcode;
-		frame_msg.msg_type = (int)msg->msg_type;
+		frame_msg.msg_type = (msg->msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
+			? FLEX_FRAME_MSG_TYPE_NUMBERED_NUM
+			: (int)msg->msg_type;
 		frame_msg.message = msg->data;
 		frame_msg.message_length = msg->data_length;
 		frame_msg.speed = msg->speed;
@@ -950,6 +1037,17 @@ static int flex_get_next_frame_network(flex_t *flex)
 		frame_msg.mail_drop = msg->mail_drop;
 		frame_msg.fragment_index = msg->fragment_index;
 		frame_msg.total_fragments = msg->total_fragments;
+		frame_msg.secure_subtype = msg->secure_subtype;
+		frame_msg.secure_encoding = msg->secure_encoding;
+		frame_msg.numbered_r = msg->numbered_r;
+		frame_msg.numbered_s = msg->numbered_s;
+		/* Auto-assign numbered_msgnum from sequence counter when -1 */
+		if (msg->numbered_msgnum >= 0) {
+			frame_msg.numbered_msgnum = msg->numbered_msgnum;
+		} else {
+			frame_msg.numbered_msgnum = frame_msg.sequence_num;
+			frame_msg.numbered_r = 1;
+		}
 
 		/* Carry-on computation (Spec Section 3.7.1 / 4.2.1).
 		 *
@@ -1151,6 +1249,7 @@ int flex_get_next_frame(flex_t *flex)
 			params.bitrate = msg->speed;
 			params.modulation_type = msg->modulation_type;
 			params.biw_time = flex->biw_time_enabled;
+			params.chan_setup_enabled = flex->chan_setup_enabled;
 			params.collapse = flex->collapse;
 			if (flex->ssid || flex->nid) {
 				params.local_id = flex->ssid;

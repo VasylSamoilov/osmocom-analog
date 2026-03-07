@@ -1825,6 +1825,9 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_FRAME_MSG_TYPE_HEX		4
 #define FLEX_FRAME_MSG_TYPE_INSTRUCTION	5
 #define FLEX_FRAME_MSG_TYPE_SHORT	6
+#define FLEX_FRAME_MSG_TYPE_SECURE	7
+#define FLEX_FRAME_MSG_TYPE_SPECIAL_NUM	8
+#define FLEX_FRAME_MSG_TYPE_NUMBERED_NUM 9
 
 /* ===== Sync Codes =====
  *
@@ -1990,6 +1993,16 @@ typedef struct flex_frame_msg {
 	 * fragment_index=0, total_fragments=0 means unfragmented. */
 	int		fragment_index;		/* 0-based index within message */
 	int		total_fragments;	/* total fragment count (0 = not fragmented) */
+
+	/* secure / numbered numeric per-message fields */
+	int		secure_subtype;		/* t1t0 pager-side type tag (0-3).
+					 * Independent of wire encoding. */
+	int		secure_encoding;	/* wire encoding: 0=7-bit alpha, 1=raw binary */
+	int		numbered_r;		/* R flag for numbered numeric (default 1,
+					 * TODO: retransmission scheduler sets 0) */
+	int		numbered_s;		/* S flag for numbered numeric: set from msg_type
+					 * (0 for nnumeric, 1 for nspecial) */
+	int		numbered_msgnum;	/* N field for numbered numeric, -1 = auto */
 } flex_frame_msg_t;
 
 /* Frame encoding parameters */
@@ -2029,6 +2042,9 @@ typedef struct flex_frame_params {
 	int		num_transmissions;	/* 1, 2, 3, or 4 */
 	int		td_collapse;		/* -1=system, 5/6/7=override */
 	int		subframe_index;		/* 0..num_transmissions-1 */
+
+	/* BIW Channel Setup (A-type 0x06) */
+	int		chan_setup_enabled;	/* 1 = emit channel setup BIW, default 0 */
 } flex_frame_params_t;
 
 /* ===== Phase Multiplexing ===== */

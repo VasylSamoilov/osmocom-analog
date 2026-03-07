@@ -18,6 +18,10 @@ enum flex_msg_type {
 	FLEX_MSG_TYPE_HEX,
 	FLEX_MSG_TYPE_INSTRUCTION,
 	FLEX_MSG_TYPE_SHORT,
+	FLEX_MSG_TYPE_SECURE,
+	FLEX_MSG_TYPE_SPECIAL_NUM,
+	FLEX_MSG_TYPE_NUMBERED_NUM,
+	FLEX_MSG_TYPE_NUMBERED_SPECIAL,	/* V=111 S=1: like special, with sequencing */
 };
 
 /* Transmitter state machine states */
@@ -65,6 +69,19 @@ typedef struct flex_msg {
 						 *   3200/2FSK: 0=A, 1=C
 						 *   3200/4FSK: 0=A, 1=C
 						 *   6400/4FSK: 0=A, 1=B, 2=C, 3=D */
+
+	/* secure / numbered numeric per-message fields */
+	int			secure_subtype;		/* t1t0 pager-side type tag (0-3), default 0.
+						 * Independent of wire encoding (secure_encoding). */
+	int			secure_encoding;	/* wire encoding: 0=7-bit alpha, 1=raw binary.
+						 * Controls how body bytes are packed on the wire. */
+	int			numbered_r;		/* retrieval flag R, default 1
+						 * TODO: wire to retransmission scheduler —
+						 * set R=0 on retransmissions with same N */
+	int			numbered_s;		/* special format flag S: set automatically
+						 * from msg_type (0 for NUMBERED_NUM,
+						 * 1 for NUMBERED_SPECIAL). Not operator-set. */
+	int			numbered_msgnum;	/* message number N (0-63), -1 = auto-assign */
 
 	/* fragmentation state (set by scheduler for long messages).
 	 * All fragments of one message share the same retrieval_num,
@@ -148,6 +165,7 @@ typedef struct flex {
 	int			ers_cycles_override;	/* -1 = auto, >0 = manual override */
 	int			no_ers;			/* skip ERS in single-shot mode */
 	int			biw_time_enabled;	/* BIW3/BIW4 time broadcast */
+	int			chan_setup_enabled;	/* BIW channel setup emission */
 	int			lpf_enabled;		/* baseband LPF */
 
 	/* Multiple transmission config (Spec Section 3.4.2).
@@ -453,6 +471,12 @@ typedef struct flex {
 			int		expected_f;	/* next expected F value */
 			int		msg_type;	/* FLEX_VECTOR_TYPE_ALPHA or _HEX_BINARY */
 			int		blocking;	/* HEX/Binary B field from initial frag */
+			int		kanji;		/* 1 = kanji/Shift-JIS 16-bit extraction
+						 * Set from rx_kanji_enabled on first
+						 * fragment so all fragments in a stream
+						 * use consistent 16-bit extraction. */
+			int		secure_subtype;	/* t1t0 value from secure message header
+						 * (-1 = not a secure message) */
 			char		buf[FLEX_REASM_MAX_LEN];
 			int		len;		/* bytes accumulated */
 			uint32_t	last_frame;	/* frame number of last fragment */

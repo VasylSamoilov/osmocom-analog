@@ -431,6 +431,26 @@ static uint32_t create_alpha_vector(uint32_t msg_start, uint32_t msg_words)
 }
 
 /*
+ * Secure vector (V=000).
+ *
+ * Identical layout to alphanumeric vector but with type V=000.
+ *   bits 0-3:   x  checksum (4-bit nibble sum)
+ *   bits 4-6:   V  type = 000 (secure)
+ *   bits 7-13:  b  message start word offset (7 bits, 0-87)
+ *   bits 14-20: n  message word count (7 bits)
+ */
+static uint32_t create_secure_vector(uint32_t msg_start, uint32_t msg_words)
+{
+	uint32_t dw = 0;
+	dw |= (FLEX_VECTOR_TYPE_SECURE & FLEX_VEC_TYPE_MASK) << FLEX_VEC_TYPE_SHIFT;
+	dw |= (msg_start               & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
+	dw |= (msg_words               & FLEX_VEC_LEN_MASK)   << FLEX_VEC_LEN_SHIFT;
+
+	dw = flex_word_checksum(dw);
+	return flex_encode_word(reverse_bits32(dw));
+}
+
+/*
  * Numeric vector (V=011/100/111).
  *
  * Numeric vectors differ from alpha/hex: the upper bits carry the
@@ -448,13 +468,14 @@ static uint32_t create_alpha_vector(uint32_t msg_start, uint32_t msg_words)
  * See encode_numeric_message() for the full K algorithm.
  */
 static uint32_t create_numeric_vector(uint32_t msg_start,
-				      uint32_t msg_words, uint32_t kbit)
+				      uint32_t msg_words, uint32_t kbit,
+				      uint32_t vector_type)
 {
 	uint32_t dw = 0;
-	dw |= (FLEX_VECTOR_TYPE_NUMERIC & FLEX_VEC_TYPE_MASK)  << FLEX_VEC_TYPE_SHIFT;
-	dw |= (msg_start                & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
-	dw |= (msg_words                & FLEX_VEC_NUM_LEN_MASK) << FLEX_VEC_LEN_SHIFT;
-	dw |= (kbit                     & FLEX_VEC_NUM_KBIT_MASK) << FLEX_VEC_NUM_KBIT_SHIFT;
+	dw |= (vector_type & FLEX_VEC_TYPE_MASK)  << FLEX_VEC_TYPE_SHIFT;
+	dw |= (msg_start   & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
+	dw |= (msg_words   & FLEX_VEC_NUM_LEN_MASK) << FLEX_VEC_LEN_SHIFT;
+	dw |= (kbit        & FLEX_VEC_NUM_KBIT_MASK) << FLEX_VEC_NUM_KBIT_SHIFT;
 
 	dw = flex_word_checksum(dw);
 	return flex_encode_word(reverse_bits32(dw));
@@ -541,6 +562,10 @@ void flex_fill_idle_phase(uint32_t *words, int phase_index,
 
 
 /* numeric_char_to_flex() removed — use shared flex_num_char_to_bcd() from frame.h */
+
+/* Forward declarations for hex helpers (defined later, needed by encode_secure_message) */
+static int is_valid_hex_char(char c);
+static uint8_t hex_char_to_nibble(char c);
 
 static int is_valid_numeric_char(char c)
 {
@@ -887,7 +912,521 @@ static uint32_t encode_numeric_message(uint32_t *frame_words, const char *msg,
 		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
 	*fwc_p = fwc;
 
-	return create_numeric_vector(msg_start, word_idx + 1, k_bit);
+	return create_numeric_vector(msg_start, word_idx + 1, k_bit,
+				    FLEX_VECTOR_TYPE_NUMERIC);
+}
+
+/*
+ * Secure message encoder (V=000).
+ *
+ * Two body encoding modes selected by secure_encoding:
+ *   0 = alpha: 7-bit character packing identical to encode_alpha_message()
+ *   1 = binary: hex nibble packing identical to encode_hex_message()
+ *
+ * Key difference from alpha/hex: bits 19-20 of the header word carry the
+ * t1t0 subtype on ALL fragments (not R/M on initial, U₀/V₀ on continuation).
+ * The C/F/N fragment fields are identical to alpha (same bit positions).
+ *
+ * Returns a secure vector word (V=000) with 7-bit start / 7-bit length.
+ */
+static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
+				      uint32_t msg_start, uint32_t *fwc_p,
+				      int sequence_num,
+				      const struct flex_msg_config *cfg,
+				      int secure_subtype, int secure_encoding,
+				      int *error)
+{
+	if (secure_encoding == 1) {
+		/* Binary mode: reuse hex nibble packing */
+		uint32_t msg_words[FLEX_MAX_MSG_WORDS_HEX];
+		uint32_t fwc;
+		size_t len, i;
+		int word_idx, nibble_idx, data_idx;
+		int frag_idx = 0, frag_total = 0;
+		int is_initial_frag;
+		uint32_t f_val, k_sum;
+		int c_val;
+
+		if (cfg) {
+			frag_idx = cfg->fragment_index;
+			frag_total = cfg->total_fragments;
+		}
+
+		is_initial_frag = (frag_total <= 1 || frag_idx == 0);
+		f_val = flex_fragment_number(frag_idx);
+		c_val = (frag_total > 1 && frag_idx < frag_total - 1) ? 1 : 0;
+
+		/* Validate all characters are hex */
+		len = strlen(msg);
+		for (i = 0; i < len; i++) {
+			if (!is_valid_hex_char(msg[i])) {
+				*error = -FLEX_ERR_INVALID_MESSAGE;
+				return 0;
+			}
+		}
+
+		if (len > FLEX_MAX_CHARS_HEX)
+			len = FLEX_MAX_CHARS_HEX;
+
+		memset(msg_words, 0, sizeof(msg_words));
+
+		/* Header word 1: C, F, N (same positions as alpha) */
+		msg_words[0] = (f_val << FLEX_ALPHA_HDR_F_SHIFT);
+		if (c_val)
+			msg_words[0] |= FLEX_ALPHA_HDR_C_MASK;
+		if (sequence_num >= 0) {
+			uint32_t n = (uint32_t)(sequence_num % 64);
+			msg_words[0] |= (n << FLEX_ALPHA_HDR_N_SHIFT);
+		}
+
+		/* Bits 19-20: t1t0 subtype on ALL fragments */
+		msg_words[0] |= ((uint32_t)(secure_subtype & FLEX_SEC_TYPE_MASK)
+				 << FLEX_SEC_TYPE_SHIFT);
+
+		/* Header word 2: initial fragment only (R/M/D/H/B/I/s/S) */
+		if (is_initial_frag) {
+			int b_field = 0;
+			if (cfg)
+				b_field = cfg->blocking_length & 0xF;
+			msg_words[1] = 0;
+			msg_words[1] |= ((uint32_t)b_field << FLEX_HEX_HDR2_B_SHIFT);
+			if (sequence_num >= 0)
+				msg_words[1] |= FLEX_HEX_HDR2_R_MASK;
+			if (cfg && cfg->mail_drop)
+				msg_words[1] |= FLEX_HEX_HDR2_M_MASK;
+			data_idx = 2;
+		} else {
+			data_idx = 1;
+		}
+
+		/* Pack hex nibbles into data words, 5 per word */
+		word_idx = data_idx;
+		nibble_idx = 0;
+
+		for (i = 0; i < len; i++) {
+			uint8_t nibble = hex_char_to_nibble(msg[i]);
+			msg_words[word_idx] |= ((uint32_t)nibble << (nibble_idx * 4));
+			nibble_idx++;
+			if (nibble_idx >= 5) {
+				nibble_idx = 0;
+				word_idx++;
+				if (word_idx >= FLEX_MAX_MSG_WORDS_HEX)
+					break;
+			}
+		}
+
+		/* Apply spec termination fill */
+		if (nibble_idx > 0) {
+			int last_data_bit = (msg_words[word_idx] >> (nibble_idx * 4 - 1)) & 1;
+			uint32_t fill_bit = last_data_bit ? 0 : 1;
+			uint32_t fill_mask = 0;
+			int b;
+			for (b = nibble_idx * 4; b < 21; b++)
+				fill_mask |= (fill_bit << b);
+			msg_words[word_idx] |= fill_mask;
+			word_idx++;
+
+			{
+				uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
+				if ((last_nib == 0x0 || last_nib == 0xF) &&
+				    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
+					uint32_t extra = 0;
+					for (b = 0; b < 21; b++)
+						extra |= (fill_bit << b);
+					msg_words[word_idx] = extra;
+					word_idx++;
+				}
+			}
+		} else if (len > 0) {
+			int prev_word = word_idx - 1;
+			int last_data_bit = (msg_words[prev_word] >> 20) & 1;
+			uint32_t fill_bit = last_data_bit ? 0 : 1;
+			uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
+			if ((last_nib == 0x0 || last_nib == 0xF) &&
+			    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
+				uint32_t extra = 0;
+				int b;
+				for (b = 0; b < 21; b++)
+					extra |= (fill_bit << b);
+				msg_words[word_idx] = extra;
+				word_idx++;
+			}
+		}
+
+		/* Signature: initial fragment only */
+		if (is_initial_frag) {
+			uint32_t sig_sum = 0;
+			int total_data_bits = (int)len * 4;
+			int bit_pos = 0;
+			uint8_t accum = 0;
+			int accum_bits = 0;
+
+			for (i = data_idx; i < (size_t)word_idx && bit_pos < total_data_bits; i++) {
+				int b;
+				for (b = 0; b < 21 && bit_pos < total_data_bits; b++) {
+					accum |= (uint8_t)(((msg_words[i] >> b) & 1) << accum_bits);
+					accum_bits++;
+					bit_pos++;
+					if (accum_bits == 8) {
+						sig_sum += accum;
+						accum = 0;
+						accum_bits = 0;
+					}
+				}
+			}
+			if (accum_bits > 0)
+				sig_sum += accum;
+
+			msg_words[1] |= (uint32_t)((~sig_sum) & 0xFF) << FLEX_HEX_HDR2_S_SHIFT;
+		}
+
+		/* K: 10-bit fragment checksum (same as alpha K) */
+		k_sum = 0;
+		for (i = 0; i < (size_t)word_idx; i++) {
+			k_sum += msg_words[i] & FLEX_ALPHA_K_GRP1_MASK;
+			k_sum += (msg_words[i] >> FLEX_ALPHA_K_GRP2_SHIFT) & FLEX_ALPHA_K_GRP2_MASK;
+			k_sum += (msg_words[i] >> FLEX_ALPHA_K_GRP3_SHIFT) & FLEX_ALPHA_K_GRP3_MASK;
+		}
+		msg_words[0] |= (~k_sum) & FLEX_ALPHA_HDR_K_MASK;
+
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "TX: Secure binary encoder: V=000 t1t0=%d, %d words, "
+		     "frag=%d/%d C=%d\n",
+		     secure_subtype, word_idx,
+		     frag_idx, frag_total > 0 ? frag_total : 1, c_val);
+
+		fwc = *fwc_p;
+		for (i = 0; i < (size_t)word_idx; i++)
+			frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
+		*fwc_p = fwc;
+
+		return create_secure_vector(msg_start, word_idx);
+	}
+
+	/* Alpha mode (secure_encoding == 0): 7-bit character packing */
+	{
+		uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
+		uint32_t word_idx, fwc;
+		size_t len, max_len;
+		uint32_t sig_sum, k_sum;
+		int shift;
+		uint32_t i;
+		int frag_idx = 0, frag_total = 0;
+		int is_initial_frag;
+		uint32_t f_val;
+		int c_val;
+
+		if (cfg) {
+			frag_idx = cfg->fragment_index;
+			frag_total = cfg->total_fragments;
+		}
+
+		is_initial_frag = (frag_total <= 1 || frag_idx == 0);
+		f_val = flex_fragment_number(frag_idx);
+		c_val = (frag_total > 1 && frag_idx < frag_total - 1) ? 1 : 0;
+
+		len = strlen(msg);
+		max_len = (len > FLEX_MAX_CHARS_ALPHA) ? FLEX_MAX_CHARS_ALPHA : len;
+
+		/* Header word: C, F, N (same positions as alpha) */
+		msg_word[0] = (f_val << FLEX_ALPHA_HDR_F_SHIFT);
+		if (c_val)
+			msg_word[0] |= FLEX_ALPHA_HDR_C_MASK;
+		if (sequence_num >= 0) {
+			uint32_t n = (uint32_t)(sequence_num % 64);
+			msg_word[0] |= (n << FLEX_ALPHA_HDR_N_SHIFT);
+		}
+
+		/* Bits 19-20: t1t0 subtype on ALL fragments (not R/M) */
+		msg_word[0] |= ((uint32_t)(secure_subtype & FLEX_SEC_TYPE_MASK)
+				<< FLEX_SEC_TYPE_SHIFT);
+
+		/* Pack 7-bit ASCII characters, 3 per word.
+		 * Initial fragment: signature in bits 0-6 of word 1,
+		 * characters start at bit 7.
+		 * Continuation: no signature, 3 chars per word from bit 0. */
+		i = 0;
+		if (is_initial_frag)
+			shift = FLEX_ALPHA_CHAR2_SHIFT;
+		else
+			shift = 0;
+		word_idx = 1;
+
+		while (i < max_len) {
+			msg_word[word_idx] |= ((uint32_t)msg[i++] & FLEX_ALPHA_CHAR_MASK) << shift;
+			shift += FLEX_ALPHA_CHAR_BITS;
+			if (shift == FLEX_BCH_DATA_BITS) {
+				if (++word_idx >= FLEX_MAX_MSG_WORDS_ALPHA)
+					break;
+				shift = 0;
+			}
+		}
+
+		/* Pad unused character slots with ETX */
+		if (is_initial_frag) {
+			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == 0 && word_idx > 1) {
+				/* word boundary — no padding needed */
+			}
+		} else {
+			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == FLEX_ALPHA_CHAR1_SHIFT) {
+				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR1_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+				word_idx++;
+			} else if (shift == 0 && word_idx > 1) {
+				/* word boundary — no padding needed */
+			}
+		}
+
+		/* Signature: initial fragment only */
+		if (is_initial_frag) {
+			sig_sum = 0;
+			for (i = 1; i < word_idx; i++) {
+				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+			}
+			msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
+		}
+
+		/* K: 10-bit fragment checksum */
+		k_sum = 0;
+		for (i = 0; i < word_idx; i++) {
+			k_sum += msg_word[i] & FLEX_ALPHA_K_GRP1_MASK;
+			k_sum += (msg_word[i] >> FLEX_ALPHA_K_GRP2_SHIFT) & FLEX_ALPHA_K_GRP2_MASK;
+			k_sum += (msg_word[i] >> FLEX_ALPHA_K_GRP3_SHIFT) & FLEX_ALPHA_K_GRP3_MASK;
+		}
+		msg_word[0] |= (~k_sum) & FLEX_ALPHA_HDR_K_MASK;
+
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "TX: Secure alpha encoder: V=000 t1t0=%d, %d words, "
+		     "frag=%d/%d C=%d\n",
+		     secure_subtype, word_idx,
+		     frag_idx, frag_total > 0 ? frag_total : 1, c_val);
+
+		fwc = *fwc_p;
+		for (i = 0; i < word_idx; i++)
+			frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_word[i]));
+		*fwc_p = fwc;
+
+		return create_secure_vector(msg_start, word_idx);
+	}
+}
+
+/*
+ * Special format numeric message encoder (V=100).
+ *
+ * Identical BCD encoding to standard numeric — same packing, K checksum,
+ * padding, and character set.  Only the vector type differs (V=100 vs V=011).
+ * Single-frame only; max 41 BCD characters.
+ */
+static uint32_t encode_special_numeric_message(uint32_t *frame_words,
+					       const char *msg,
+					       uint32_t msg_start,
+					       uint32_t *fwc_p,
+					       int *error)
+{
+	uint32_t msg_words[FLEX_MAX_MSG_WORDS_NUMERIC] = {0};
+	uint8_t last_ch;
+	int last_shift, bit_shift, word_idx, i;
+	uint32_t k_bit, fwc;
+	uint8_t ch;
+	size_t len;
+
+	len = strlen(msg);
+
+	/* Enforce 41-character max */
+	if (len > FLEX_MAX_CHARS_NUMERIC) {
+		*error = -FLEX_ERR_INVALID_MESSAGE;
+		return 0;
+	}
+
+	/* Validate all characters are valid BCD */
+	for (i = 0; msg[i] != '\0'; i++) {
+		if (!is_valid_numeric_char(msg[i])) {
+			*error = -FLEX_ERR_INVALID_MESSAGE;
+			return 0;
+		}
+	}
+
+	/* BCD packing — identical to encode_numeric_message() */
+	last_shift = 0;
+	bit_shift = FLEX_NUM_OVERHEAD_BITS;
+	word_idx = 0;
+	i = 0;
+
+	while (msg[i] != '\0' && word_idx < FLEX_MAX_MSG_WORDS_NUMERIC) {
+		if (bit_shift < FLEX_BCH_DATA_BITS) {
+			if (last_shift) {
+				ch = flex_num_char_to_bcd(last_ch) >> (4 - last_shift);
+				msg_words[word_idx] |= ((uint32_t)ch << bit_shift);
+				bit_shift += last_shift;
+				last_shift = 0;
+				continue;
+			}
+			ch = flex_num_char_to_bcd(msg[i++]);
+			msg_words[word_idx] |= ((uint32_t)ch << bit_shift) & FLEX_DATA_MASK;
+			bit_shift += 4;
+			continue;
+		}
+		last_ch = msg[i - 1];
+		last_shift = bit_shift - FLEX_BCH_DATA_BITS;
+		bit_shift = 0;
+		word_idx++;
+	}
+
+	/* Pad remaining space with BCD space */
+	for (; bit_shift < 18; bit_shift += 4)
+		msg_words[word_idx] |= ((uint32_t)FLEX_NUM_BCD_SPACE << bit_shift);
+
+	/* K checksum — identical to standard numeric */
+	k_bit = 0;
+	for (i = 0; i <= word_idx; i++) {
+		k_bit += (msg_words[i])       & 0xFF;
+		k_bit += (msg_words[i] >> 8)  & 0xFF;
+		k_bit += (msg_words[i] >> 16) & 0x1F;
+	}
+	k_bit &= 0xFF;
+	k_bit = (k_bit & 0x3F) + (k_bit >> 6);
+	k_bit = ~k_bit;
+	msg_words[0] |= (k_bit >> 4) & 0x3;
+
+	LOGP(DFLEX, LOGL_DEBUG,
+	     "TX: Special numeric encoder: V=100, %d words, "
+	     "K=0x%02X (K5K4=%d%d K3-0=0x%X)\n",
+	     word_idx + 1, k_bit & 0x3F,
+	     (k_bit >> 5) & 1, (k_bit >> 4) & 1, k_bit & 0xF);
+
+	fwc = *fwc_p;
+	for (i = 0; i <= word_idx; i++)
+		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
+	*fwc_p = fwc;
+
+	return create_numeric_vector(msg_start, word_idx + 1, k_bit,
+				    FLEX_VECTOR_TYPE_SPECIAL_NUM);
+}
+
+/*
+ * Numbered numeric message encoder (V=111).
+ *
+ * Extends the BCD encoding with a 10-bit header in the first message word:
+ *   bits 0-1:  K5,K4 (checksum overflow, same as standard numeric)
+ *   bits 2-7:  N5-N0 message number (0-63)
+ *   bit  8:    R0 retrieval flag
+ *   bit  9:    S0 special format flag
+ *   bits 10+:  BCD digit data (starting at bit offset 12)
+ *
+ * Max 39 BCD characters (8 words × 21 bits - 12 skip bits = 156 data bits
+ * = 39 nibbles).  Single-frame only.
+ */
+static uint32_t encode_numbered_numeric_message(uint32_t *frame_words,
+						const char *msg,
+						uint32_t msg_start,
+						uint32_t *fwc_p,
+						int msg_num, int r_flag,
+						int s_flag, int *error)
+{
+	uint32_t msg_words[FLEX_MAX_MSG_WORDS_NUMERIC] = {0};
+	uint8_t last_ch;
+	int last_shift, bit_shift, word_idx, i;
+	uint32_t k_bit, fwc;
+	uint8_t ch;
+	size_t len;
+
+	/* Max 39 characters for numbered numeric */
+	len = strlen(msg);
+	if (len > 39) {
+		*error = -FLEX_ERR_INVALID_MESSAGE;
+		return 0;
+	}
+
+	/* Validate all characters are valid BCD */
+	for (i = 0; msg[i] != '\0'; i++) {
+		if (!is_valid_numeric_char(msg[i])) {
+			*error = -FLEX_ERR_INVALID_MESSAGE;
+			return 0;
+		}
+	}
+
+	/* Encode 10-bit header in first message word (after K5K4 bits 0-1):
+	 *   bits 2-7:  N5-N0 message number
+	 *   bit  8:    R0 retrieval flag
+	 *   bit  9:    S0 special format flag */
+	msg_words[0] |= ((uint32_t)(msg_num & 0x3F) << 2);
+	if (r_flag)
+		msg_words[0] |= (1U << 8);
+	if (s_flag)
+		msg_words[0] |= (1U << 9);
+
+	/* BCD packing — starts at bit offset FLEX_NUM_NUMBERED_SKIP_BITS (12) */
+	last_shift = 0;
+	bit_shift = FLEX_NUM_NUMBERED_SKIP_BITS;
+	word_idx = 0;
+	i = 0;
+
+	while (msg[i] != '\0' && word_idx < FLEX_MAX_MSG_WORDS_NUMERIC) {
+		if (bit_shift < FLEX_BCH_DATA_BITS) {
+			if (last_shift) {
+				ch = flex_num_char_to_bcd(last_ch) >> (4 - last_shift);
+				msg_words[word_idx] |= ((uint32_t)ch << bit_shift);
+				bit_shift += last_shift;
+				last_shift = 0;
+				continue;
+			}
+			ch = flex_num_char_to_bcd(msg[i++]);
+			msg_words[word_idx] |= ((uint32_t)ch << bit_shift) & FLEX_DATA_MASK;
+			bit_shift += 4;
+			continue;
+		}
+		last_ch = msg[i - 1];
+		last_shift = bit_shift - FLEX_BCH_DATA_BITS;
+		bit_shift = 0;
+		word_idx++;
+	}
+
+	/* Pad remaining space with BCD space */
+	for (; bit_shift < 18; bit_shift += 4)
+		msg_words[word_idx] |= ((uint32_t)FLEX_NUM_BCD_SPACE << bit_shift);
+
+	/* K checksum over all message words including header bits */
+	k_bit = 0;
+	for (i = 0; i <= word_idx; i++) {
+		k_bit += (msg_words[i])       & 0xFF;
+		k_bit += (msg_words[i] >> 8)  & 0xFF;
+		k_bit += (msg_words[i] >> 16) & 0x1F;
+	}
+	k_bit &= 0xFF;
+	k_bit = (k_bit & 0x3F) + (k_bit >> 6);
+	k_bit = ~k_bit;
+	msg_words[0] |= (k_bit >> 4) & 0x3;  /* K5K4 in bits 0-1 */
+
+	LOGP(DFLEX, LOGL_DEBUG,
+	     "TX: Numbered numeric encoder: V=111, N=%d S=%d R=%d, "
+	     "%d words, K=0x%02X (K5K4=%d%d K3-0=0x%X)\n",
+	     msg_num, s_flag, r_flag, word_idx + 1, k_bit & 0x3F,
+	     (k_bit >> 5) & 1, (k_bit >> 4) & 1, k_bit & 0xF);
+
+	fwc = *fwc_p;
+	for (i = 0; i <= word_idx; i++)
+		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
+	*fwc_p = fwc;
+
+	return create_numeric_vector(msg_start, word_idx + 1, k_bit,
+				    FLEX_VECTOR_TYPE_NUMBERED_NUM);
 }
 
 /* ===== Message Type Detection ===== */
@@ -1982,6 +2521,83 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
 			return hdr_words + data_words;
 		}
 
+	case FLEX_FRAME_MSG_TYPE_SECURE:
+		if (!msg->message || !msg->message[0])
+			return -1;
+		len = (msg->message_length > 0)
+			? (size_t)msg->message_length
+			: strlen(msg->message);
+		if (msg->secure_encoding == 1) {
+			/* Binary encoding: same estimation as hex */
+			if (len > FLEX_MAX_CHARS_HEX)
+				return -1;
+			{
+				int is_continuation = (msg->total_fragments > 1 &&
+						       msg->fragment_index > 0);
+				int hdr_words = is_continuation ? 1 : 2;
+				int data_words = (int)((len + 4) / 5);
+				int is_last_frag = (msg->total_fragments <= 1 ||
+						    msg->fragment_index == msg->total_fragments - 1);
+				if (is_last_frag && len > 0) {
+					const char *m = msg->message;
+					char last_ch = m[len - 1];
+					if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
+						data_words++;
+				}
+				return hdr_words + data_words;
+			}
+		} else {
+			/* Alpha encoding: same estimation as alpha */
+			if (len > FLEX_MAX_CHARS_ALPHA)
+				return -1;
+			{
+				int is_continuation = (msg->total_fragments > 1 &&
+						       msg->fragment_index > 0);
+				if (is_continuation)
+					return 1 + (int)((len + 2) / 3);
+				else
+					return 1 + (int)((len + 2 + 2) / 3);
+			}
+		}
+
+	case FLEX_FRAME_MSG_TYPE_SPECIAL_NUM:
+		if (!msg->message || !msg->message[0])
+			return -1;
+		len = (msg->message_length > 0)
+			? (size_t)msg->message_length
+			: strlen(msg->message);
+		if (len > FLEX_MAX_CHARS_NUMERIC)
+			return -1;
+		/* Same as standard numeric: ceil((len*4+2)/21) */
+		{
+			int bits_needed = (int)len * 4 + 2;
+			int words = (bits_needed + 20) / 21;
+			if (words > FLEX_MAX_MSG_WORDS_NUMERIC)
+				words = FLEX_MAX_MSG_WORDS_NUMERIC;
+			if (words < 1)
+				words = 1;
+			return words;
+		}
+
+	case FLEX_FRAME_MSG_TYPE_NUMBERED_NUM:
+		if (!msg->message || !msg->message[0])
+			return -1;
+		len = (msg->message_length > 0)
+			? (size_t)msg->message_length
+			: strlen(msg->message);
+		if (len > 39)
+			return -1;
+		/* ceil((len*4+12)/21) — extra 10-bit header */
+		{
+			int bits_needed = (int)len * 4 + FLEX_NUM_NUMBERED_SKIP_BITS;
+			int words = (bits_needed + 20) / 21;
+			if (words > FLEX_MAX_MSG_WORDS_NUMERIC)
+				words = FLEX_MAX_MSG_WORDS_NUMERIC;
+			if (words < 1)
+				words = 1;
+			return words;
+		}
+
 	default:
 		return -1;
 	}
@@ -2679,6 +3295,32 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			     params->timezone_code,
 			     flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
 		}
+
+		/* Channel Setup (A-type 0x06) */
+		if (slots_left > 0 && params->chan_setup_enabled) {
+			uint32_t info = 0;
+			/* Frame offset: derived from collapse and current frame number */
+			uint32_t frame_ofs = params->collapse > 0
+				? (params->frame % (1U << params->collapse)) : 0;
+			info |= (frame_ofs & FLEX_BIW_SYSINFO_FRAME_OFS_MASK);
+			/* Carry-on: reuse existing carry_on field from params */
+			info |= ((params->carry_on & FLEX_BIW_SYSINFO_CARRY_ON_MASK)
+				 << FLEX_BIW_SYSINFO_CARRY_ON_SHIFT);
+			/* N0: set if current frame contains a NID system message */
+			int has_nid_sysmsg = 0;
+			if (has_nid_sysmsg)
+				info |= (1U << FLEX_BIW_SYSINFO_NID_BIT);
+			/* B0: set if current frame contains a system message */
+			int has_sysmsg = 0;
+			if (has_sysmsg)
+				info |= (1U << FLEX_BIW_SYSINFO_SYSMSG_BIT);
+			frame_words[fwc++] = flex_create_biw_sysinfo(
+				FLEX_BIW_SYSINFO_A_CHAN_SETUP, info);
+			slots_left--;
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX: BIW_CHAN_SETUP frame_offset=%u carry_on=%d N0=%d B0=%d\n",
+			     frame_ofs, params->carry_on, has_nid_sysmsg, has_sysmsg);
+		}
 	}
 
 	/* ---- Write address words ----
@@ -2869,6 +3511,41 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 							reverse_bits32(dw));
 					}
 				}
+				break;
+
+			case FLEX_FRAME_MSG_TYPE_SECURE: {
+				struct flex_msg_config scfg;
+				memset(&scfg, 0, sizeof(scfg));
+				scfg.fragment_index = msgs[idx].fragment_index;
+				scfg.total_fragments = msgs[idx].total_fragments;
+				scfg.mail_drop = msgs[idx].mail_drop;
+				scfg.blocking_length = msgs[idx].blocking_length;
+				vw = encode_secure_message(body_buf,
+					msgs[idx].message,
+					msg_start_for_vec, &body_fwc,
+					msgs[idx].sequence_num,
+					&scfg,
+					msgs[idx].secure_subtype,
+					msgs[idx].secure_encoding,
+					&enc_err);
+				break;
+			}
+
+			case FLEX_FRAME_MSG_TYPE_SPECIAL_NUM:
+				vw = encode_special_numeric_message(body_buf,
+					msgs[idx].message,
+					msg_start_for_vec, &body_fwc,
+					&enc_err);
+				break;
+
+			case FLEX_FRAME_MSG_TYPE_NUMBERED_NUM:
+				vw = encode_numbered_numeric_message(body_buf,
+					msgs[idx].message,
+					msg_start_for_vec, &body_fwc,
+					msgs[idx].numbered_msgnum,
+					msgs[idx].numbered_r,
+					msgs[idx].numbered_s,
+					&enc_err);
 				break;
 
 			default:

@@ -1301,6 +1301,8 @@ found:
 	flex->rx.reasm[i].msg_num = msg_num;
 	flex->rx.reasm[i].len = 0;
 	flex->rx.reasm[i].msg_type = msg_type;
+	flex->rx.reasm[i].kanji = 0;
+	flex->rx.reasm[i].secure_subtype = -1;
 	flex->rx.reasm[i].expected_f = 0; /* next after initial (F=11) is F=00 */
 	flex->rx.reasm[i].last_frame = flex->rx.fiw_frame;
 	flex->rx.reasm[i].last_cycle = flex->rx.fiw_cycle;
@@ -1341,13 +1343,24 @@ static void reasm_expire(flex_t *flex)
 			if (flex->rx.reasm[i].len > 0) {
 				const char *type_tag =
 					(flex->rx.reasm[i].msg_type == FLEX_VECTOR_TYPE_HEX_BINARY)
-					? "HEX" : "ALN";
-				LOGP(DDSP, LOGL_NOTICE,
-				     "RX: reassembly timeout [%09" PRIu64 "] msgnum=%d (%d frames stale) partial %s \"%s\"\n",
-				     flex->rx.reasm[i].capcode,
-				     flex->rx.reasm[i].msg_num, delta,
-				     type_tag,
-				     flex->rx.reasm[i].buf);
+					? "HEX" :
+					(flex->rx.reasm[i].msg_type == FLEX_VECTOR_TYPE_SECURE)
+					? "SEC" : "ALN";
+				if (flex->rx.reasm[i].msg_type == FLEX_VECTOR_TYPE_SECURE)
+					LOGP(DDSP, LOGL_NOTICE,
+					     "RX: reassembly timeout [%09" PRIu64 "] msgnum=%d (%d frames stale) partial %s t1t0=%d \"%s\"\n",
+					     flex->rx.reasm[i].capcode,
+					     flex->rx.reasm[i].msg_num, delta,
+					     type_tag,
+					     flex->rx.reasm[i].secure_subtype,
+					     flex->rx.reasm[i].buf);
+				else
+					LOGP(DDSP, LOGL_NOTICE,
+					     "RX: reassembly timeout [%09" PRIu64 "] msgnum=%d (%d frames stale) partial %s \"%s\"\n",
+					     flex->rx.reasm[i].capcode,
+					     flex->rx.reasm[i].msg_num, delta,
+					     type_tag,
+					     flex->rx.reasm[i].buf);
 			} else {
 				LOGP(DDSP, LOGL_DEBUG,
 				     "RX: reassembly timeout for capcode %" PRIu64 " msgnum=%d (%d frames stale, empty).\n",
@@ -2389,33 +2402,96 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					int is_initial = (hdr_f == 3); /* F=11 = first/only */
 					const char *alpha_sig_status = ""; /* signature validation result */
 
-					for (w = start_word; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
-						uint32_t dw;
-						unsigned char ch;
-
-						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-							continue;
-						dw = ph->words[w];
-
-						/* First slot: signature on initial
-						 * fragment, character otherwise */
-						if (w == start_word && is_initial) {
-							rx_sig = dw & FLEX_ALPHA_SIG_MASK;
+					/* Kanji mode: 16-bit Shift-JIS extraction
+					 * (1 char per word, bits 0-15) instead of
+					 * 7-bit ASCII (3 chars per word).
+					 * Only applies to alpha (V=101), not secure.
+					 *
+					 * For initial fragments: use global flag.
+					 * For continuation/final: use the reassembly
+					 * slot's kanji flag for consistency (Req 15.6),
+					 * so all fragments in a stream use the same
+					 * extraction mode even if the flag changes. */
+					int is_kanji = 0;
+					if (vec_type == FLEX_VECTOR_TYPE_ALPHA) {
+						if (is_initial) {
+							is_kanji = rx_kanji_enabled;
 						} else {
-							ch = (dw >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+							/* Check reassembly slot for this stream */
+							int kslot = reasm_find(flex, capcode, hdr_n);
+							if (kslot >= 0)
+								is_kanji = flex->rx.reasm[kslot].kanji;
+							else
+								is_kanji = rx_kanji_enabled;
+						}
+					}
+					if (is_kanji)
+						msg_tag = "ALN:KNJ";
+
+					if (is_kanji) {
+						/* Kanji/Shift-JIS: extract 16-bit chars,
+						 * 1 per word (bits 0-15).  Output as
+						 * 2-byte big-endian per character.
+						 * Signature field handling is the same:
+						 * first word on initial fragment has sig
+						 * in bits 0-6, but in kanji mode we skip
+						 * the signature word entirely for char
+						 * extraction (it doesn't carry a valid
+						 * 16-bit character). */
+						for (w = start_word; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+							uint16_t ch16;
+
+							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+								continue;
+
+							if (w == start_word && is_initial) {
+								/* Signature word — extract sig,
+								 * skip for character data */
+								rx_sig = ph->words[w] & FLEX_ALPHA_SIG_MASK;
+								continue;
+							}
+
+							ch16 = ph->words[w] & 0xFFFF;
+							if (ch16 == 0)
+								continue; /* skip NUL padding */
+							/* Output as 2-byte big-endian */
+							if (ti < (int)sizeof(text) - 2) {
+								text[ti++] = (ch16 >> 8) & 0xFF;
+								text[ti++] = ch16 & 0xFF;
+							}
+						}
+					} else {
+						/* Standard 7-bit ASCII extraction:
+						 * 3 characters per word */
+						for (w = start_word; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+							uint32_t dw;
+							unsigned char ch;
+
+							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+								continue;
+							dw = ph->words[w];
+
+							/* First slot: signature on initial
+							 * fragment, character otherwise */
+							if (w == start_word && is_initial) {
+								rx_sig = dw & FLEX_ALPHA_SIG_MASK;
+							} else {
+								ch = (dw >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+								sig_sum += ch;
+								if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
+									text[ti++] = ch;
+							}
+							ch = (dw >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+							sig_sum += ch;
+							if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
+								text[ti++] = ch;
+							ch = (dw >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
 							sig_sum += ch;
 							if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
 								text[ti++] = ch;
 						}
-						ch = (dw >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-						sig_sum += ch;
-						if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
-							text[ti++] = ch;
-						ch = (dw >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-						sig_sum += ch;
-						if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
-							text[ti++] = ch;
 					}
 					text[ti] = '\0';
 
@@ -2591,7 +2667,13 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					 * still append (best-effort reassembly). */
 					if (frag_flag == 'F' && is_initial) {
 						/* First fragment (F=11, C=1) — start reassembly */
-						int slot = reasm_alloc(flex, capcode, hdr_n, FLEX_VECTOR_TYPE_ALPHA);
+						int reasm_type = (vec_type == FLEX_VECTOR_TYPE_SECURE)
+							? FLEX_VECTOR_TYPE_SECURE : FLEX_VECTOR_TYPE_ALPHA;
+						int slot = reasm_alloc(flex, capcode, hdr_n, reasm_type);
+						if (vec_type == FLEX_VECTOR_TYPE_SECURE)
+							flex->rx.reasm[slot].secure_subtype = sec_t;
+						if (is_kanji)
+							flex->rx.reasm[slot].kanji = 1;
 						reasm_append(flex, slot, text, ti);
 					} else if (frag_flag == 'F') {
 						/* Continuation fragment (C=1, F≠11) — append */
@@ -2609,27 +2691,52 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						/* Final fragment (C=0, F≠11) — append and emit reassembled */
 						int slot = reasm_find(flex, capcode, hdr_n);
 						if (slot >= 0) {
+							const char *reasm_tag;
+							if (flex->rx.reasm[slot].kanji)
+								reasm_tag = "ALN:KNJ";
+							else if (flex->rx.reasm[slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
+								reasm_tag = "SEC";
+							else
+								reasm_tag = msg_tag;
 							if (hdr_f != flex->rx.reasm[slot].expected_f)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: Phase %c reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hdr_n,
 									  flex->rx.reasm[slot].expected_f, hdr_f);
 							reasm_append(flex, slot, text, ti);
-							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c%c %s \"%s\"\n",
-								  bitrate,
-								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-								  phase_name,
-								  flex->rx.sync_baud,
-								  flex->rx.sync_levels,
-								  flex->rx.polarity ? "neg" : "pos",
-								  "reassembled",
-								  capcode,
-								  flex_addr_type_flag(aw_type, is_long),
-								  grp_flag,
-								  prio_flag,
-								  msg_tag,
-								  flex->rx.reasm[slot].buf);
+							if (flex->rx.reasm[slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c%c %s t1t0=%d \"%s\"\n",
+									  bitrate,
+									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+									  phase_name,
+									  flex->rx.sync_baud,
+									  flex->rx.sync_levels,
+									  flex->rx.polarity ? "neg" : "pos",
+									  "reassembled",
+									  capcode,
+									  flex_addr_type_flag(aw_type, is_long),
+									  grp_flag,
+									  prio_flag,
+									  reasm_tag,
+									  flex->rx.reasm[slot].secure_subtype,
+									  flex->rx.reasm[slot].buf);
+							else
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c%c %s \"%s\"\n",
+									  bitrate,
+									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+									  phase_name,
+									  flex->rx.sync_baud,
+									  flex->rx.sync_levels,
+									  flex->rx.polarity ? "neg" : "pos",
+									  "reassembled",
+									  capcode,
+									  flex_addr_type_flag(aw_type, is_long),
+									  grp_flag,
+									  prio_flag,
+									  reasm_tag,
+									  flex->rx.reasm[slot].buf);
 							flex->rx.reasm[slot].active = 0;
 						}
 					}
@@ -2667,10 +2774,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					char digits[256];
 					int di = 0, w, bit_count;
 					int skip_bits;
-					/* Subtype tag for output: NUM/SNUM/NNUM */
-					const char *num_tag =
-						(vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM) ? "SNUM" :
-						(vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) ? "NNUM" : "NUM";
+					const char *num_tag;
 
 					/* Numbered numeric header extraction
 					 * (Section 3.10.1.1.2, Fig. 3.10.1.1.2-1) */
@@ -2695,12 +2799,22 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							num_r = (nhdr >> 8) & 1;
 							num_s = (nhdr >> 9) & 1;
 							LOGP_CHAN(DDSP, LOGL_DEBUG,
-								  "RX: Phase %c numbered numeric hdr[%d]=0x%05X: "
+								  "RX: Phase %c V=111 hdr[%d]=0x%05X: "
 								  "N=%d R=%d S=%d\n",
 								  phase_name, num_hdr_idx, nhdr,
 								  num_n, num_r, num_s);
 						}
 					}
+
+					/* Subtype tag for output:
+					 *   NUM   = standard numeric (V=011)
+					 *   SNUM  = special format numeric (V=100)
+					 *   NNUM  = numbered numeric (V=111 S=0, like NUM with sequencing)
+					 *   NSNUM = numbered special (V=111 S=1, like SNUM with sequencing) */
+					num_tag =
+						(vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM) ? "SNUM" :
+						(vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) ?
+							(num_s ? "NSNUM" : "NNUM") : "NUM";
 
 					bit_count = 0;
 					uint8_t nibble_acc = 0;
@@ -2821,7 +2935,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							num_k_status = ",K=incomplete";
 						}
 
-						/* Output with subtype tag and optional numbered fields */
+						/* Output with subtype tag and optional sequencing fields */
 						if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM && num_n >= 0) {
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
 								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c%c %s N=%d,R=%d,S=%d \"%s\"\n",
@@ -2857,6 +2971,8 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						}
 					}
 				} else {
+					/* V=111 without decoded header: can't determine S,
+					 * fall back to NNUM */
 					const char *num_tag =
 						(vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM) ? "SNUM" :
 						(vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) ? "NNUM" : "NUM";
@@ -2875,19 +2991,41 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  num_tag);
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_TONE) {
-				/* Tone-only */
-				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c TON\n",
-					  bitrate,
-					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-					  phase_name,
-					  flex->rx.sync_baud,
-					  flex->rx.sync_levels,
-					  flex->rx.polarity ? "neg" : "pos",
-					  capcode,
-					  flex_addr_type_flag(aw_type, is_long),
-					  grp_flag,
-					  prio_flag);
+				/* Tone-only / Short message (Section 8.7).
+				 * Bits 9-15 of the vector word carry a 7-bit
+				 * short message index.  Index 0 = pure tone-only
+				 * alert; index 1-127 = predefined short message
+				 * stored in the pager's ID-ROM. */
+				uint32_t viw = ph->words[j];
+				uint32_t smsg_idx = (viw >> 9) & 0x7F;
+				if (smsg_idx == 0) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c TON\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "neg" : "pos",
+						  capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  grp_flag,
+						  prio_flag);
+				} else {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG idx=%u\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "neg" : "pos",
+						  capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  grp_flag,
+						  prio_flag,
+						  smsg_idx);
+				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_HEX_BINARY) {
 				/* HEX/Binary message (Spec §3.10.1.2).
 				 *
