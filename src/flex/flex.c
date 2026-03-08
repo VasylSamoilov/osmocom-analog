@@ -200,6 +200,22 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 		LOGP(DFLEX, LOGL_ERROR, "No mem!\n");
 		abort();
 	}
+
+	/* Validate payload before enqueuing — reject messages that would
+	 * cause encoding errors at frame time and block the entire queue.
+	 * Note: secure_encoding is not yet known here (set by caller after
+	 * create), so secure binary validation must happen at the call site. */
+	{
+		int verr = flex_msg_validate(msg_type, data, data_length, 0);
+		if (verr) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "Rejecting capcode %" PRIu64 " type=%s: invalid payload (len=%d).\n",
+			     capcode, flex_msg_type_name(msg_type), data_length);
+			free(msg);
+			return NULL;
+		}
+	}
+
 	if ((size_t)data_length > sizeof(msg->data)) {
 		LOGP(DFLEX, LOGL_ERROR, "Text too long!\n");
 		data_length = sizeof(msg->data);
@@ -843,6 +859,361 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 	}
 }
 
+/* Compute BIW word count from frame params.
+ * Returns 1–4 (BIW1 + up to 3 extra BIW words).
+ *
+ * Must match the encoder's inline BIW computation in
+ * flex_encode_frame_multi() for consistency between the
+ * scheduler's capacity estimate and the actual encoded frame. */
+static int flex_compute_biw_count(const flex_frame_params_t *params)
+{
+	int extra = 0;
+
+	if (params->local_id || params->coverage_id)
+		extra++;
+	if (params->country_code || params->tmf)
+		extra++;
+	if (params->biw_time)
+		extra += 2; /* Date + Time */
+	if (params->timezone_code >= 0 &&
+	    params->timezone_code < (int)FLEX_TZ_ENTRIES)
+		extra++;
+	if (params->chan_setup_enabled)
+		extra++;
+	if (extra > 3)
+		extra = 3;
+
+	return 1 + extra;
+}
+
+/* Estimate total word cost for a queued message (address + vector + body).
+ * Mirrors estimate_msg_words() logic in frame.c but operates on flex_msg_t
+ * directly (queue entry struct) rather than flex_frame_msg_t (encoder input).
+ * Returns total words needed, or -1 if the message is invalid.
+ *
+ * Address/vector overhead:
+ *   Short address (capcode ≤ 2,097,151 or group): 1 addr + 1 vector word
+ *   Long address  (capcode > 2,097,151, non-group): 2 addr + 2 vector words
+ *   Tone-only: address words only (no vector, no body)
+ *
+ * For long addresses, body word count is reduced by 1 because body[0]
+ * is absorbed into the second vector word (Vy). */
+static int flex_estimate_msg_cost(const flex_msg_t *msg)
+{
+	int is_long = (msg->capcode > 2097151 && !msg->is_group);
+	int aw = is_long ? 2 : 1;
+	int vw, bw;
+	size_t len;
+
+	if (msg->msg_type == FLEX_MSG_TYPE_TONE)
+		return aw; /* address only, no vector, no body */
+
+	vw = is_long ? 2 : 1;
+
+	/* Estimate body words based on message type and length.
+	 * Same formulas as estimate_msg_words() in frame.c. */
+	len = (msg->data_length > 0) ? (size_t)msg->data_length : 0;
+
+	switch (msg->msg_type) {
+	case FLEX_MSG_TYPE_INSTRUCTION:
+	case FLEX_MSG_TYPE_SHORT:
+		bw = 0; /* vector word only */
+		break;
+
+	case FLEX_MSG_TYPE_ALPHA: {
+		if (len == 0)
+			return -1;
+		if (msg->charset == 1) {
+			/* KANJI: 16-bit chars, 1 char per word + 1 header */
+			size_t num_chars = len / 2;
+			if (num_chars == 0)
+				return -1;
+			bw = 1 + (int)num_chars;
+		} else {
+			int is_continuation = (msg->total_fragments > 1 &&
+					       msg->fragment_index > 0);
+			if (is_continuation)
+				bw = 1 + (int)((len + 2) / 3);
+			else
+				bw = 1 + (int)((len + 2 + 2) / 3);
+		}
+		break;
+	}
+
+	case FLEX_MSG_TYPE_NUMERIC: {
+		if (len == 0)
+			return -1;
+		int bits_needed = (int)len * 4 + 2;
+		bw = (bits_needed + 20) / 21;
+		if (bw > FLEX_MAX_MSG_WORDS_NUMERIC)
+			bw = FLEX_MAX_MSG_WORDS_NUMERIC;
+		if (bw < 1)
+			bw = 1;
+		break;
+	}
+
+	case FLEX_MSG_TYPE_HEX: {
+		if (len == 0)
+			return -1;
+		int is_continuation = (msg->total_fragments > 1 &&
+				       msg->fragment_index > 0);
+		int hdr_words = is_continuation ? 1 : 2;
+		int data_words = (int)((len + 4) / 5);
+		int is_last_frag = (msg->total_fragments <= 1 ||
+				    msg->fragment_index == msg->total_fragments - 1);
+		if (is_last_frag && len > 0) {
+			char last_ch = msg->data[len - 1];
+			if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
+				data_words++;
+		}
+		bw = hdr_words + data_words;
+		break;
+	}
+
+	case FLEX_MSG_TYPE_SECURE: {
+		if (len == 0)
+			return -1;
+		if (msg->secure_encoding == 1) {
+			/* Binary encoding: same as hex */
+			int is_continuation = (msg->total_fragments > 1 &&
+					       msg->fragment_index > 0);
+			int hdr_words = is_continuation ? 1 : 2;
+			int data_words = (int)((len + 4) / 5);
+			int is_last_frag = (msg->total_fragments <= 1 ||
+					    msg->fragment_index == msg->total_fragments - 1);
+			if (is_last_frag && len > 0) {
+				char last_ch = msg->data[len - 1];
+				if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
+					data_words++;
+			}
+			bw = hdr_words + data_words;
+		} else {
+			/* Alpha encoding */
+			int is_continuation = (msg->total_fragments > 1 &&
+					       msg->fragment_index > 0);
+			if (is_continuation)
+				bw = 1 + (int)((len + 2) / 3);
+			else
+				bw = 1 + (int)((len + 2 + 2) / 3);
+		}
+		break;
+	}
+
+	case FLEX_MSG_TYPE_SPECIAL_NUM: {
+		if (len == 0)
+			return -1;
+		int bits_needed = (int)len * 4 + 2;
+		bw = (bits_needed + 20) / 21;
+		if (bw > FLEX_MAX_MSG_WORDS_NUMERIC)
+			bw = FLEX_MAX_MSG_WORDS_NUMERIC;
+		if (bw < 1)
+			bw = 1;
+		break;
+	}
+
+	case FLEX_MSG_TYPE_NUMBERED_NUM:
+	case FLEX_MSG_TYPE_NUMBERED_SPECIAL: {
+		if (len == 0)
+			return -1;
+		/* ceil((len*4+10)/21) — 10-bit header (K5K4 + N + R + S) */
+		int bits_needed = (int)len * 4 + FLEX_NUM_NUMBERED_SKIP_BITS;
+		bw = (bits_needed + 20) / 21;
+		if (bw > FLEX_MAX_MSG_WORDS_NUMERIC)
+			bw = FLEX_MAX_MSG_WORDS_NUMERIC;
+		if (bw < 1)
+			bw = 1;
+		break;
+	}
+
+	default:
+		return -1;
+	}
+
+	/* Long address: body[0] absorbed into Vy */
+	if (is_long && bw > 0)
+		bw--;
+
+	return aw + vw + bw;
+}
+
+/* Candidate entry for multi-message collection.
+ * Built during three-pass candidate collection in the scheduler.
+ * File-scope only — not exposed in headers. */
+typedef struct {
+	flex_msg_t      *msg;           /* pointer into msg_list */
+	int              est_words;     /* estimated total word cost */
+	int              addr_words;    /* 1 (short) or 2 (long) */
+	int              vec_words;     /* 0 (tone), 1 (short), 2 (long) */
+	int              body_words;    /* message body words */
+	int              is_long;       /* 1 if capcode > 2,097,151 */
+} flex_candidate_t;
+
+/* In-flight fragment tracking entry.
+ * Built by scanning the queue before candidate collection.
+ * A capcode is "in-flight" if it has a fragmented message where
+ * fragment_index 0 has been transmitted (assigned_n >= 0) but
+ * the last fragment has not yet been transmitted.
+ * File-scope only — not exposed in headers. */
+typedef struct {
+	uint64_t         capcode;
+	uint32_t         retrieval_num;  /* identifies the fragment stream */
+	int              total_fragments;
+	int              last_sent_idx;  /* highest fragment_index already sent */
+	uint32_t         last_sent_frame;/* abs frame when last fragment was sent */
+} flex_inflight_frag_t;
+
+/* Fragment-transmission slot: one (fragment, transmission_repeat) pair
+ * to be placed in a specific subframe of a specific frame.
+ * File-scope only — not exposed in headers. */
+typedef struct {
+	flex_msg_t      *msg;           /* pointer to the fragment in msg_list */
+	int              fragment_idx;  /* 0-based fragment index */
+	int              tx_repeat;     /* 1-based transmission repeat number */
+	int              subframe_idx;  /* 0-based subframe index within frame */
+} flex_frag_slot_t;
+
+/* Per-frame fragment plan: which fragment-transmission pairs go into
+ * this frame, and how many continuing frames have been used so far.
+ * File-scope only — not exposed in headers. */
+typedef struct {
+	uint32_t         frame_number;          /* absolute frame number */
+	int              is_collapse_aligned;   /* 1 if this is a Collapse_Aligned_Frame */
+	int              is_continuing;         /* 1 if this is a Continuing_Frame (α frame) */
+	int              n_frag_slots;          /* number of fragment slots placed */
+	flex_frag_slot_t frag_slots[FLEX_MAX_FRAG_SLOTS]; /* max 4 subframes per frame */
+	int              remaining_capacity;    /* words left after fragments for co-packing */
+} flex_frame_frag_plan_t;
+
+/* Collapse-cycle state for an in-flight fragment stream.
+ * File-scope only — not exposed in headers. */
+typedef struct {
+	uint64_t         capcode;
+	uint32_t         retrieval_num;
+	int              total_fragments;
+	int              next_fragment_idx;     /* next fragment to transmit */
+	int              next_tx_repeat;        /* next transmission repeat (1-based) */
+	int              alpha_used;            /* continuing frames used so far */
+	int              alpha_max;             /* max continuing frames = 2^m - 1 */
+	uint32_t         collapse_frame;        /* the Collapse_Aligned_Frame that started this burst */
+} flex_collapse_frag_state_t;
+
+/* Check if a frame is collapse-aligned for a given capcode.
+ * Returns 1 if frame_number mod 2^m == assigned_frame mod 2^m.
+ * When collapse <= 0, every frame is "aligned" (return 1). */
+static inline int is_collapse_aligned(uint32_t frame_number,
+                                      uint32_t assigned_frame,
+                                      int collapse)
+{
+	if (collapse <= 0)
+		return 1; /* no collapse — every frame is "aligned" */
+	uint32_t period = 1U << collapse;
+	return (frame_number % period) == (assigned_frame % period);
+}
+
+/* Scan the message queue to identify capcodes with in-flight fragmented
+ * transmissions (§4.2 ①②).  A capcode is "in-flight" when:
+ *   - A fragment with fragment_index == 0 has been sent (assigned_n >= 0)
+ *   - The last fragment (fragment_index == total_fragments - 1) has NOT
+ *     been sent yet
+ *
+ * Returns the number of in-flight entries written to inflight[]. */
+static int flex_scan_inflight(flex_t *flex, flex_inflight_frag_t *inflight,
+                              int max_inflight)
+{
+	int n_inflight = 0;
+	flex_msg_t *m, *f;
+
+	for (m = flex->msg_list; m && n_inflight < max_inflight; m = m->next) {
+		flex_msg_t *last;
+		int highest_sent_idx;
+		int already_tracked;
+		int k;
+
+		/* Only interested in fragment_index==0 of multi-fragment streams */
+		if (m->total_fragments <= 1)
+			continue;
+		if (m->fragment_index != 0)
+			continue;
+		/* Fragment 0 must have been transmitted at least once */
+		if (m->assigned_n < 0)
+			continue;
+
+		/* Search for the last fragment and track highest sent index */
+		last = NULL;
+		highest_sent_idx = 0;
+		for (f = flex->msg_list; f; f = f->next) {
+			if (f->total_fragments != m->total_fragments)
+				continue;
+			if (f->retrieval_num != m->retrieval_num)
+				continue;
+			if (f->assigned_n >= 0 && f->fragment_index > highest_sent_idx)
+				highest_sent_idx = f->fragment_index;
+			if (f->fragment_index == m->total_fragments - 1)
+				last = f;
+		}
+
+		/* If last fragment exists and has been sent, stream is complete */
+		if (last && last->assigned_n >= 0)
+			continue;
+
+		/* Avoid duplicate entries for the same capcode */
+		already_tracked = 0;
+		for (k = 0; k < n_inflight; k++) {
+			if (inflight[k].capcode == m->capcode) {
+				already_tracked = 1;
+				break;
+			}
+		}
+		if (already_tracked)
+			continue;
+
+		/* Record this capcode as in-flight */
+		inflight[n_inflight].capcode = m->capcode;
+		inflight[n_inflight].retrieval_num = m->retrieval_num;
+		inflight[n_inflight].total_fragments = m->total_fragments;
+		inflight[n_inflight].last_sent_idx = highest_sent_idx;
+		inflight[n_inflight].last_sent_frame = 0;
+		n_inflight++;
+	}
+
+	return n_inflight;
+}
+
+/* Check if a message is excluded by fragmentation rules (§4.2 ①②).
+ * Returns 1 if the message should be skipped, 0 if allowed.
+ *
+ * Rules:
+ *  ① Same capcode can't start new fragmented TX while one is in-flight
+ *  ② Same capcode can't appear for unfragmented msg while fragment in-flight
+ *  Exception: the NEXT eligible fragment of the in-flight stream IS allowed */
+static inline int frag_excluded(const flex_msg_t *m,
+                                const flex_inflight_frag_t *inflight,
+                                int n_inflight)
+{
+	int k;
+	for (k = 0; k < n_inflight; k++) {
+		if (inflight[k].capcode != m->capcode)
+			continue;
+
+		/* Same capcode has in-flight fragment stream */
+
+		/* Is this message the next fragment of THAT stream? */
+		if (m->total_fragments == inflight[k].total_fragments &&
+		    m->retrieval_num == inflight[k].retrieval_num &&
+		    m->fragment_index == inflight[k].last_sent_idx + 1) {
+			return 0; /* allowed: this IS the continuation */
+		}
+
+		/* §4.2 ①: new fragmented message for same capcode → blocked */
+		if (m->total_fragments > 1)
+			return 1;
+
+		/* §4.2 ②: unfragmented message for same capcode → blocked */
+		return 1;
+	}
+	return 0; /* capcode has no in-flight fragments → allowed */
+}
+
 /*
  * Network mode frame generation.
  *
@@ -861,6 +1232,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 	int msgs_packed = 0;
 	int error = 0;
 	size_t len;
+	/* Multi-message candidate collection */
+	flex_candidate_t candidates[FLEX_MAX_CANDIDATES];
+	int n_candidates = 0;
+	flex_inflight_frag_t inflight[FLEX_MAX_INFLIGHT];
+	int n_inflight = 0;
+	int est_used = 0;
+	int capacity = 0;
 
 	/* === ERS streaming phase ===
 	 * ERS is a standalone re-sync burst emitted before data frames.
@@ -1006,86 +1384,208 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 	params.timezone_code = flex->timezone_code;
 
-	/* Find messages eligible for current frame (collapse-aware, speed-grouped).
-	 * Only pick messages matching the selected baud rate for this frame.
-	 * With collapse=0, all messages at the right speed are eligible.
-	 * With collapse>0, also check capcode-to-frame mapping. */
+	/* === Multi-message candidate collection ===
+	 * Collect multiple eligible messages into a candidate list,
+	 * ordered by priority class and deadline.
+	 *
+	 * Three-pass collection:
+	 *   Pass 0: Priority messages (non-tone), fragment continuations first
+	 *   Pass 1: Normal messages (non-tone), fragment continuations first
+	 *   Pass 2: Tone-only messages (if no system message content)
+	 *
+	 * Within each pass, messages are insertion-sorted by composite key:
+	 *   (is_fragment_continuation DESC, next_send_frame ASC)
+	 */
 	uint32_t current_abs = ft.cycle * 128 + ft.frame;
-	msg = NULL;
+
+	/* Scan for in-flight fragment streams (§4.2 ①②) */
+	n_inflight = flex_scan_inflight(flex, inflight, FLEX_MAX_INFLIGHT);
+
+	/* Compute available frame capacity */
 	{
-		flex_msg_t *candidate;
+		int biw_count = flex_compute_biw_count(&params);
+		if (params.num_transmissions > 1)
+			capacity = flex_subframe_words(params.num_transmissions) - biw_count;
+		else
+			capacity = FLEX_WORDS_PER_FRAME - biw_count;
 
-		/* Two-pass selection: priority messages first, then normal.
-		 * Per ARIB STD-43A Section 3.4.1, priority addresses come
-		 * before normal addresses in the frame.  We honor this at
-		 * the scheduling level too.
+		/* Determine if tone-only messages are excluded.
+		 * Tone-only cannot appear in frames with system message content
+		 * (BIW101 A=0000-0011 or Operator Messaging Address vectors).
+		 * Currently only timezone BIW (A=0100) is implemented, which
+		 * does NOT exclude tone-only. */
+		int has_sysmsg_content = 0; /* TODO: set when A=0000-0011 implemented */
+
+		/* Co-packing (§4.2.3, Req 20.1-20.5):
 		 *
-		 * Within each pass, prefer the eligible candidate with the
-		 * lowest next_send_frame (earliest deadline).  Use signed
-		 * difference for wrap-around-safe comparison. */
-		for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
-			if (!candidate->priority)
-				continue;
-			if (candidate->speed != params.bitrate ||
-			    candidate->modulation_type != params.modulation_type)
-				continue;
-			/* Skip messages not yet eligible for transmission */
-			if (!frame_is_eligible(candidate->next_send_frame, current_abs))
-				continue;
+		 * The three-pass collection inherently implements co-packing
+		 * of other-capcode messages alongside fragments. Fragment
+		 * continuations sort first within each priority class via
+		 * the composite sort key (is_continuation DESC, deadline ASC),
+		 * ensuring fragment addresses/vectors are placed before
+		 * other-capcode addresses in the encoded frame. The
+		 * frag_excluded() check prevents same-capcode conflicts
+		 * (§4.2 ①②) but allows different capcodes. Remaining
+		 * capacity after fragments is naturally filled with
+		 * other-capcode messages as est_used accumulates across
+		 * all candidates.
+		 *
+		 * Per-frame independent co-packing (Req 20.5) is inherent
+		 * in the frame-at-a-time architecture: each frame cycle
+		 * runs the full collection fresh with est_used starting
+		 * at 0, and unpacked messages remain in the queue for
+		 * the next frame. */
 
-			if (flex->collapse <= 0) {
-				if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
-					msg = candidate;
-				continue;
-			}
+		/* Three-pass collection */
+		int pass;
+		for (pass = 0; pass < 3; pass++) {
+			/* Build a temporary sorted list of eligible messages for this pass */
+			flex_msg_t *sorted[FLEX_MAX_CANDIDATES];
+			int n_sorted = 0;
+			flex_msg_t *candidate;
 
-			{
-				flex_capcode_sched_t sched;
-				uint32_t next_frame;
-
-				flex_scheduler_capcode_info(candidate->capcode, &sched);
-				next_frame = flex_scheduler_next_frame(ft.frame,
-								       sched.assigned_frame,
-								       flex->collapse);
-				if (next_frame == ft.frame) {
-					if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
-						msg = candidate;
-				}
-			}
-		}
-
-		/* Second pass: normal priority */
-		if (!msg) {
 			for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
+				int is_tone, m_is_cont, pos;
+
+				/* Filter: speed, modulation, eligibility */
 				if (candidate->speed != params.bitrate ||
 				    candidate->modulation_type != params.modulation_type)
 					continue;
-				/* Skip messages not yet eligible for transmission */
 				if (!frame_is_eligible(candidate->next_send_frame, current_abs))
 					continue;
 
-				if (flex->collapse <= 0) {
-					if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
-						msg = candidate;
+				/* Collapse filter */
+				if (flex->collapse > 0) {
+					flex_capcode_sched_t sched;
+					uint32_t nf;
+					flex_scheduler_capcode_info(candidate->capcode, &sched);
+					nf = flex_scheduler_next_frame(ft.frame,
+								       sched.assigned_frame,
+								       flex->collapse);
+					if (nf != ft.frame)
+						continue;
+				}
+
+				/* Pass filter */
+				is_tone = (candidate->msg_type == FLEX_MSG_TYPE_TONE);
+				if (pass == 0 && (!candidate->priority || is_tone))
+					continue;
+				if (pass == 1 && (candidate->priority || is_tone))
+					continue;
+				if (pass == 2 && !is_tone)
+					continue;
+				if (pass == 2 && has_sysmsg_content)
+					continue;
+
+				/* Fragmentation address exclusion (§4.2 ①②) */
+				if (frag_excluded(candidate, inflight, n_inflight)) {
+					LOGP(DFLEX, LOGL_DEBUG,
+					     "Scheduler: skip capcode=%" PRIu64 " frag_idx=%d — "
+					     "fragmentation address exclusion (§4.2)\n",
+					     candidate->capcode, candidate->fragment_index);
 					continue;
 				}
 
-				{
-					flex_capcode_sched_t sched;
-					uint32_t next_frame;
+				if (n_sorted >= FLEX_MAX_CANDIDATES)
+					break;
 
-					flex_scheduler_capcode_info(candidate->capcode, &sched);
-					next_frame = flex_scheduler_next_frame(ft.frame,
-									       sched.assigned_frame,
-									       flex->collapse);
-					if (next_frame == ft.frame) {
-						if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
-							msg = candidate;
+				/* Determine if this is a fragment continuation */
+				m_is_cont = 0;
+				{
+					int k;
+					for (k = 0; k < n_inflight; k++) {
+						if (inflight[k].capcode == candidate->capcode &&
+						    candidate->total_fragments == inflight[k].total_fragments &&
+						    candidate->retrieval_num == inflight[k].retrieval_num &&
+						    candidate->fragment_index == inflight[k].last_sent_idx + 1) {
+							m_is_cont = 1;
+							break;
+						}
 					}
+				}
+
+				/* Insertion sort by (is_continuation DESC, deadline ASC) */
+				pos = n_sorted;
+				while (pos > 0) {
+					flex_msg_t *s = sorted[pos - 1];
+					int s_is_cont = 0;
+					int k;
+					for (k = 0; k < n_inflight; k++) {
+						if (inflight[k].capcode == s->capcode &&
+						    s->total_fragments == inflight[k].total_fragments &&
+						    s->retrieval_num == inflight[k].retrieval_num &&
+						    s->fragment_index == inflight[k].last_sent_idx + 1) {
+							s_is_cont = 1;
+							break;
+						}
+					}
+					if (m_is_cont && !s_is_cont) {
+						pos--;
+						continue;
+					}
+					if (!m_is_cont && s_is_cont)
+						break;
+					if (frame_deadline_earlier(candidate->next_send_frame,
+								  s->next_send_frame, current_abs))
+						pos--;
+					else
+						break;
+				}
+				{
+					int k;
+					for (k = n_sorted; k > pos; k--)
+						sorted[k] = sorted[k - 1];
+				}
+				sorted[pos] = candidate;
+				n_sorted++;
+			}
+
+			/* Add sorted candidates until capacity exhausted */
+			{
+				int i;
+				for (i = 0; i < n_sorted && n_candidates < FLEX_MAX_CANDIDATES; i++) {
+					flex_msg_t *m = sorted[i];
+					int is_long = (m->capcode > 2097151 && !m->is_group);
+					int cost = flex_estimate_msg_cost(m);
+					int aw, vw, bw;
+
+					if (cost < 0)
+						continue; /* invalid message */
+
+					if (est_used + cost > capacity) {
+						LOGP(DFLEX, LOGL_DEBUG,
+						     "Scheduler: skip capcode=%" PRIu64
+						     " est=%d words (capacity=%d used=%d)\n",
+						     m->capcode, cost, capacity, est_used);
+						continue; /* skip, try smaller */
+					}
+
+					aw = is_long ? 2 : 1;
+					if (m->msg_type == FLEX_MSG_TYPE_TONE) {
+						vw = 0;
+						bw = 0;
+					} else {
+						vw = is_long ? 2 : 1;
+						bw = cost - aw - vw;
+					}
+
+					candidates[n_candidates].msg = m;
+					candidates[n_candidates].est_words = cost;
+					candidates[n_candidates].addr_words = aw;
+					candidates[n_candidates].vec_words = vw;
+					candidates[n_candidates].body_words = bw;
+					candidates[n_candidates].is_long = is_long;
+					n_candidates++;
+					est_used += cost;
 				}
 			}
 		}
 	}
+
+	/* Set msg pointer for multi-phase gate check below.
+	 * If we collected any candidates, msg is non-NULL to enter
+	 * the encoding path; otherwise fall through to idle. */
+	msg = (n_candidates > 0) ? candidates[0].msg : NULL;
 
 	/* Multi-phase encoding for A2/A3 (2 phases) and A4 (4 phases).
 	 * A1 is single-phase and skips this block. */
@@ -1094,25 +1594,58 @@ static int flex_get_next_frame_network(flex_t *flex)
 		flex_phase_data_t phases[FLEX_MAX_PHASES];
 		flex_frame_params_t phase_params;
 		uint8_t phase_buf[FLEX_BUFFER_SIZE];
-		int phase_has_msg[FLEX_MAX_PHASES];
-		flex_msg_t *candidate, *next;
-		int p, any_msg = 0;
+		int i, j, p, any_msg = 0;
+
+		/* Per-phase candidate distribution (Req 2.1, 2.2).
+		 * The three-pass collection already built candidates[].
+		 * Distribute them into per-phase lists by capcode phase. */
+		flex_candidate_t phase_cands[FLEX_MAX_PHASES][FLEX_MAX_CANDIDATES];
+		int phase_n_cands[FLEX_MAX_PHASES];
+		int phase_est_used[FLEX_MAX_PHASES];
 
 		memset(phases, 0, sizeof(phases));
-		memset(phase_has_msg, 0, sizeof(phase_has_msg));
+		memset(phase_n_cands, 0, sizeof(phase_n_cands));
+		memset(phase_est_used, 0, sizeof(phase_est_used));
 
 		/* Build per-phase params — same as frame params but force
 		 * single-phase output so we can extract the 88 data words */
 		phase_params = params;
 		phase_params.single_phase = 1;
 
+		{
+			int biw_count = flex_compute_biw_count(&params);
+			int phase_capacity = FLEX_WORDS_PER_FRAME - biw_count;
+
+			/* Distribute candidates to per-phase lists */
+			for (i = 0; i < n_candidates; i++) {
+				flex_msg_t *m = candidates[i].msg;
+				flex_capcode_sched_t sched;
+				int phase_idx;
+
+				flex_scheduler_capcode_info(m->capcode, &sched);
+				phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
+				if (m->phase >= 0)
+					phase_idx = flex_map_phase(m->phase, num_phases);
+
+				if (phase_n_cands[phase_idx] >= FLEX_MAX_CANDIDATES)
+					continue;
+				if (phase_est_used[phase_idx] + candidates[i].est_words > phase_capacity)
+					continue;
+
+				phase_cands[phase_idx][phase_n_cands[phase_idx]] = candidates[i];
+				phase_n_cands[phase_idx]++;
+				phase_est_used[phase_idx] += candidates[i].est_words;
+			}
+		}
+
 		/* Carry-on computation for multi-phase (Spec §3.7.1 / §4.2.1).
 		 *
 		 * Per spec: "values for Carry On must be identical for all
 		 * phases in one Frame."  Scan the queue for fragment messages
 		 * eligible for this frame and compute carry-on from the max
-		 * remaining fragment count.  Must be done before per-phase
-		 * encoding since BIW1 is baked into the encoded words.
+		 * remaining fragment count.  Alpha-bounded per §4.2.2 Rule ②
+		 * (Req 16.4, 17.1).  Must be done before per-phase encoding
+		 * since BIW1 is baked into the encoded words.
 		 * Only meaningful with collapse > 0.
 		 * Per spec: "Carry On is not allowed for multiple transmission." */
 		if (flex->collapse > 0 && flex->num_transmissions <= 1) {
@@ -1129,200 +1662,154 @@ static int flex_get_next_frame_network(flex_t *flex)
 						max_remaining = rem;
 				}
 			}
+			/* Alpha constraint (§4.2.2 Rule ②, Req 16.4, 17.1):
+			 * carry-on cannot exceed alpha_max = 2^m - 1, since
+			 * the number of continuing frames must be strictly
+			 * less than the collapse cycle length. */
+			{
+				int alpha_max = (1 << flex->collapse) - 1;
+				if (max_remaining > alpha_max)
+					max_remaining = alpha_max;
+			}
 			if (max_remaining > 0) {
 				params.carry_on = (max_remaining > 3) ? 3 : max_remaining;
 				phase_params.carry_on = params.carry_on;
 			}
 		}
 
-		/* Collect one message per phase from the queue.
-		 * First pass: select the best candidate per phase,
-		 * preferring earlier deadlines (lower next_send_frame)
-		 * among eligible messages mapping to the same phase. */
-		{
-			flex_msg_t *phase_best[FLEX_MAX_PHASES];
-			memset(phase_best, 0, sizeof(phase_best));
-
-			for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
-				flex_capcode_sched_t sched;
-				int phase_idx;
-
-				if (candidate->speed != params.bitrate ||
-				    candidate->modulation_type != params.modulation_type)
-					continue;
-
-				if (!frame_is_eligible(candidate->next_send_frame, current_abs))
-					continue;
-
-				if (flex->collapse > 0) {
-					uint32_t nf;
-					flex_scheduler_capcode_info(candidate->capcode, &sched);
-					nf = flex_scheduler_next_frame(ft.frame,
-								       sched.assigned_frame,
-								       flex->collapse);
-					if (nf != ft.frame)
-						continue;
-				} else {
-					flex_scheduler_capcode_info(candidate->capcode, &sched);
-				}
-
-				phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
-
-				if (candidate->phase >= 0)
-					phase_idx = flex_map_phase(candidate->phase, num_phases);
-
-				/* Keep the candidate with the earliest deadline */
-				if (!phase_best[phase_idx] ||
-				    frame_deadline_earlier(candidate->next_send_frame, phase_best[phase_idx]->next_send_frame, current_abs))
-					phase_best[phase_idx] = candidate;
-			}
-
-			/* Second pass: encode and process selected candidates */
-			for (candidate = flex->msg_list; candidate; candidate = next) {
-				flex_capcode_sched_t sched;
-				int phase_idx;
-				int is_selected = 0;
-
-				next = candidate->next;
-
-				/* Only process candidates that were selected in the first pass */
-				for (p = 0; p < num_phases; p++) {
-					if (phase_best[p] == candidate) {
-						is_selected = 1;
-						break;
-					}
-				}
-				if (!is_selected)
-					continue;
-
-				/* Re-derive phase_idx for this candidate */
-				if (flex->collapse > 0) {
-					flex_scheduler_capcode_info(candidate->capcode, &sched);
-				} else {
-					flex_scheduler_capcode_info(candidate->capcode, &sched);
-				}
-
-				phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
-
-				if (candidate->phase >= 0)
-					phase_idx = flex_map_phase(candidate->phase, num_phases);
-
-				/* Skip if this phase was already encoded (shouldn't happen) */
-				if (phase_has_msg[phase_idx])
-					continue;
-
-			/* Encode this message into a temp buffer to get the 88 data words */
-			memset(&frame_msg, 0, sizeof(frame_msg));
-			frame_msg.capcode = candidate->capcode;
-			/* NUMBERED_SPECIAL uses the same V=111 encoder as NUMBERED_NUM;
-			 * the S flag (already in numbered_s) is the only difference. */
-			frame_msg.msg_type = (candidate->msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
-				? FLEX_FRAME_MSG_TYPE_NUMBERED_NUM
-				: (int)candidate->msg_type;
-			frame_msg.message = candidate->data;
-			frame_msg.message_length = candidate->data_length;
-			frame_msg.speed = candidate->speed;
-			frame_msg.polarity = candidate->polarity;
-			frame_msg.priority = candidate->priority;
-			frame_msg.charset = candidate->charset;
-			frame_msg.is_group = candidate->is_group;
-			frame_msg.is_temp_group = candidate->is_temp_group;
-			/* R/N flag computation for retransmission */
-			{
-				int is_retransmission = (candidate->assigned_n >= 0);
-				if (!is_retransmission) {
-					/* Initial transmission: assign fresh N, set R=1 */
-					if (candidate->total_fragments > 1) {
-						candidate->assigned_n = (int)candidate->retrieval_num;
-					} else {
-						candidate->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
-					}
-					frame_msg.sequence_num = candidate->assigned_n;
-					frame_msg.alpha_r_flag = 1;
-					frame_msg.hex_r_flag = 1;
-					frame_msg.numbered_r = 1;
-					if (candidate->retransmit_max > 0) {
-						LOGP(DFLEX, LOGL_INFO,
-						     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
-						     candidate->capcode, flex_msg_type_name(candidate->msg_type),
-						     candidate->assigned_n, candidate->retransmit_max);
-					}
-				} else {
-					/* Retransmission: reuse assigned N, set R=0 */
-					frame_msg.sequence_num = candidate->assigned_n;
-					frame_msg.alpha_r_flag = 0;
-					frame_msg.hex_r_flag = 0;
-					frame_msg.numbered_r = 0;
-				}
-			}
-			frame_msg.source_id = candidate->source_id[0] ? candidate->source_id : NULL;
-			frame_msg.short_msg_idx = candidate->short_msg_index;
-			frame_msg.blocking_length = candidate->blocking_length;
-			frame_msg.mail_drop = candidate->mail_drop;
-			frame_msg.fragment_index = candidate->fragment_index;
-			frame_msg.total_fragments = candidate->total_fragments;
-			frame_msg.secure_subtype = candidate->secure_subtype;
-			frame_msg.secure_encoding = candidate->secure_encoding;
-			frame_msg.numbered_s = candidate->numbered_s;
-			/* Auto-assign numbered_msgnum from sequence counter when -1 */
-			if (candidate->numbered_msgnum >= 0) {
-				frame_msg.numbered_msgnum = candidate->numbered_msgnum;
-			} else {
-				frame_msg.numbered_msgnum = frame_msg.sequence_num;
-			}
-
-			len = flex_encode_frame_multi(&frame_msg, 1, &phase_params,
-						      phase_buf, sizeof(phase_buf),
-						      &msgs_packed, &error);
-
-			if (error || len == 0)
+		/* Encode each phase independently (Req 2.2, 2.3) */
+		for (p = 0; p < num_phases; p++) {
+			if (phase_n_cands[p] == 0) {
+				flex_fill_idle_phase(phases[p].words, p,
+						     params.modulation_type,
+						     params.bitrate);
+				phases[p].word_count = FLEX_WORDS_PER_FRAME;
 				continue;
-
-			/* Extract the 88 data words from the encoded output.
-			 * Layout: S1(14) + FIW(4) + S2(c_bytes) + data
-			 * S2 is 5 bytes × (bitrate/1600) to fill 25 ms. */
-			{
-				int w;
-				int s2_bytes = 5 * (params.bitrate / 1600);
-				uint8_t *dp = phase_buf + 14 + 4 + s2_bytes;
-				for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
-					phases[phase_idx].words[w] =
-						((uint32_t)dp[0] << 24) |
-						((uint32_t)dp[1] << 16) |
-						((uint32_t)dp[2] << 8) |
-						 (uint32_t)dp[3];
-					dp += 4;
-				}
-				phases[phase_idx].word_count = FLEX_WORDS_PER_FRAME;
 			}
 
-			phase_has_msg[phase_idx] = 1;
-			any_msg = 1;
-
-			LOGP_CHAN(DFLEX, LOGL_INFO,
-				  "Network mode: phase %d msg capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d.\n",
-				  phase_idx, frame_msg.capcode,
-				  flex_capcode_type_name(frame_msg.capcode),
-				  frame_msg.msg_type, candidate->speed,
-				  (candidate->modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-				  (candidate->polarity < 0) ? "neg" : "pos",
-				  candidate->priority,
-				  candidate->charset ? "kanji" : "ascii",
-				  candidate->is_group,
-				  frame_msg.sequence_num,
-				  candidate->data_length);
-
-			/* Post-transmit lifecycle: retain or destroy */
+			/* Build flex_frame_msg_t array for this phase.
+			 * Same field copying and R/N assignment as single-phase
+			 * (task 4.2, Req 8.1-8.3). */
 			{
-				flex_post_transmit(flex, candidate, current_abs);
+				flex_frame_msg_t phase_msgs[FLEX_MAX_CANDIDATES];
+				int phase_packed = 0;
+
+				for (j = 0; j < phase_n_cands[p]; j++) {
+					flex_msg_t *m = phase_cands[p][j].msg;
+					flex_frame_msg_t *fm = &phase_msgs[j];
+					memset(fm, 0, sizeof(*fm));
+
+					fm->capcode = m->capcode;
+					fm->msg_type = (m->msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
+						? FLEX_FRAME_MSG_TYPE_NUMBERED_NUM
+						: (int)m->msg_type;
+					fm->message = m->data;
+					fm->message_length = m->data_length;
+					fm->speed = m->speed;
+					fm->polarity = m->polarity;
+					fm->priority = m->priority;
+					fm->charset = m->charset;
+					fm->is_group = m->is_group;
+					fm->is_temp_group = m->is_temp_group;
+					fm->source_id = m->source_id[0] ? m->source_id : NULL;
+					fm->short_msg_idx = m->short_msg_index;
+					fm->blocking_length = m->blocking_length;
+					fm->mail_drop = m->mail_drop;
+					fm->fragment_index = m->fragment_index;
+					fm->total_fragments = m->total_fragments;
+					fm->secure_subtype = m->secure_subtype;
+					fm->secure_encoding = m->secure_encoding;
+					fm->numbered_s = m->numbered_s;
+
+					/* R/N flag assignment — independent per message */
+					{
+						int is_retransmission = (m->assigned_n >= 0);
+						if (!is_retransmission) {
+							if (m->total_fragments > 1)
+								m->assigned_n = (int)m->retrieval_num;
+							else
+								m->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
+							fm->sequence_num = m->assigned_n;
+							fm->alpha_r_flag = 1;
+							fm->hex_r_flag = 1;
+							fm->numbered_r = 1;
+							if (m->retransmit_max > 0) {
+								LOGP(DFLEX, LOGL_INFO,
+								     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
+								     m->capcode, flex_msg_type_name(m->msg_type),
+								     m->assigned_n, m->retransmit_max);
+							}
+						} else {
+							fm->sequence_num = m->assigned_n;
+							fm->alpha_r_flag = 0;
+							fm->hex_r_flag = 0;
+							fm->numbered_r = 0;
+						}
+					}
+
+					if (m->numbered_msgnum >= 0)
+						fm->numbered_msgnum = m->numbered_msgnum;
+					else
+						fm->numbered_msgnum = fm->sequence_num;
+				}
+
+				/* Encode this phase */
+				len = flex_encode_frame_multi(phase_msgs, phase_n_cands[p],
+							     &phase_params, phase_buf,
+							     sizeof(phase_buf),
+							     &phase_packed, &error);
+
+				if (error || len == 0) {
+					/* Encoding failed for this phase — fill idle,
+					 * other phases proceed normally (Req 2.2) */
+					flex_fill_idle_phase(phases[p].words, p,
+							     params.modulation_type,
+							     params.bitrate);
+					phases[p].word_count = FLEX_WORDS_PER_FRAME;
+					error = 0; /* reset for next phase */
+					continue;
+				}
+
+				/* Extract 88 data words from encoded output.
+				 * Layout: S1(14) + FIW(4) + S2(c_bytes) + data
+				 * S2 is 5 bytes × (bitrate/1600) to fill 25 ms. */
+				{
+					int w;
+					int s2_bytes = 5 * (params.bitrate / 1600);
+					uint8_t *dp = phase_buf + 14 + 4 + s2_bytes;
+					for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+						phases[p].words[w] =
+							((uint32_t)dp[0] << 24) |
+							((uint32_t)dp[1] << 16) |
+							((uint32_t)dp[2] << 8) |
+							 (uint32_t)dp[3];
+						dp += 4;
+					}
+					phases[p].word_count = FLEX_WORDS_PER_FRAME;
+				}
+
+				any_msg = 1;
+
+				/* Post-transmit for packed messages in this phase (Req 2.3).
+				 * Iterate by array index — safe even if flex_post_transmit()
+				 * destroys/unlinks messages from msg_list. */
+				for (j = 0; j < phase_packed; j++) {
+					flex_post_transmit(flex, phase_cands[p][j].msg, current_abs);
+				}
+
+				LOGP_CHAN(DFLEX, LOGL_INFO,
+					  "Network mode: phase %d packed %d/%d msgs.\n",
+					  p, phase_packed, phase_n_cands[p]);
 			}
 		}
-		} /* end of phase_best selection/encoding block */
 
 		if (any_msg) {
-			/* Fill empty phases with proper idle pattern (Section 3.4.1) */
+			/* Fill empty phases with proper idle pattern (Section 3.4.1)
+			 * — phases with no candidates were already filled above,
+			 * but phases that had candidates but failed encoding were
+			 * also filled. This loop catches any remaining gaps. */
 			for (p = 0; p < num_phases; p++) {
-				if (!phase_has_msg[p]) {
+				if (phases[p].word_count == 0) {
 					flex_fill_idle_phase(phases[p].words, p,
 							     params.modulation_type,
 							     params.bitrate);
@@ -1383,113 +1870,266 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 	/* Single-phase encoding (1600 bps or any speed) */
 	if (msg) {
-		/* Encode the eligible message */
-		memset(&frame_msg, 0, sizeof(frame_msg));
-		frame_msg.capcode = msg->capcode;
-		frame_msg.msg_type = (msg->msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
-			? FLEX_FRAME_MSG_TYPE_NUMBERED_NUM
-			: (int)msg->msg_type;
-		frame_msg.message = msg->data;
-		frame_msg.message_length = msg->data_length;
-		frame_msg.speed = msg->speed;
-		frame_msg.polarity = msg->polarity;
-		frame_msg.priority = msg->priority;
-		frame_msg.charset = msg->charset;
-		frame_msg.is_group = msg->is_group;
-		frame_msg.is_temp_group = msg->is_temp_group;
-		/* R/N flag computation for retransmission */
-		{
-			int is_retransmission = (msg->assigned_n >= 0);
-			if (!is_retransmission) {
-				/* Initial transmission: assign fresh N, set R=1 */
-				if (msg->total_fragments > 1) {
-					msg->assigned_n = (int)msg->retrieval_num;
+		flex_frame_msg_t frame_msgs[FLEX_MAX_CANDIDATES];
+		int i;
+
+		/* Build flex_frame_msg_t array from candidates.
+		 * Each message gets independent R/N flag assignment
+		 * based on its own retransmission state (Req 8.1-8.3). */
+		for (i = 0; i < n_candidates; i++) {
+			flex_msg_t *m = candidates[i].msg;
+			flex_frame_msg_t *fm = &frame_msgs[i];
+			memset(fm, 0, sizeof(*fm));
+
+			fm->capcode = m->capcode;
+			fm->msg_type = (m->msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
+				? FLEX_FRAME_MSG_TYPE_NUMBERED_NUM
+				: (int)m->msg_type;
+			fm->message = m->data;
+			fm->message_length = m->data_length;
+			fm->speed = m->speed;
+			fm->polarity = m->polarity;
+			fm->priority = m->priority;
+			fm->charset = m->charset;
+			fm->is_group = m->is_group;
+			fm->is_temp_group = m->is_temp_group;
+			fm->source_id = m->source_id[0] ? m->source_id : NULL;
+			fm->short_msg_idx = m->short_msg_index;
+			fm->blocking_length = m->blocking_length;
+			fm->mail_drop = m->mail_drop;
+			fm->fragment_index = m->fragment_index;
+			fm->total_fragments = m->total_fragments;
+			fm->secure_subtype = m->secure_subtype;
+			fm->secure_encoding = m->secure_encoding;
+			fm->numbered_s = m->numbered_s;
+
+			/* R/N flag assignment — independent per message */
+			{
+				int is_retransmission = (m->assigned_n >= 0);
+				if (!is_retransmission) {
+					/* Initial transmission: assign fresh N, set R=1 */
+					if (m->total_fragments > 1)
+						m->assigned_n = (int)m->retrieval_num;
+					else
+						m->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
+					fm->sequence_num = m->assigned_n;
+					fm->alpha_r_flag = 1;
+					fm->hex_r_flag = 1;
+					fm->numbered_r = 1;
+					if (m->retransmit_max > 0) {
+						LOGP(DFLEX, LOGL_INFO,
+						     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
+						     m->capcode, flex_msg_type_name(m->msg_type),
+						     m->assigned_n, m->retransmit_max);
+					}
 				} else {
-					msg->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
+					/* Retransmission: reuse assigned N, set R=0 */
+					fm->sequence_num = m->assigned_n;
+					fm->alpha_r_flag = 0;
+					fm->hex_r_flag = 0;
+					fm->numbered_r = 0;
 				}
-				frame_msg.sequence_num = msg->assigned_n;
-				frame_msg.alpha_r_flag = 1;
-				frame_msg.hex_r_flag = 1;
-				frame_msg.numbered_r = 1;
-				if (msg->retransmit_max > 0) {
-					LOGP(DFLEX, LOGL_INFO,
-					     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
-					     msg->capcode, flex_msg_type_name(msg->msg_type),
-					     msg->assigned_n, msg->retransmit_max);
-				}
-			} else {
-				/* Retransmission: reuse assigned N, set R=0 */
-				frame_msg.sequence_num = msg->assigned_n;
-				frame_msg.alpha_r_flag = 0;
-				frame_msg.hex_r_flag = 0;
-				frame_msg.numbered_r = 0;
 			}
-		}
-		frame_msg.source_id = msg->source_id[0] ? msg->source_id : NULL;
-		frame_msg.short_msg_idx = msg->short_msg_index;
-		frame_msg.blocking_length = msg->blocking_length;
-		frame_msg.mail_drop = msg->mail_drop;
-		frame_msg.fragment_index = msg->fragment_index;
-		frame_msg.total_fragments = msg->total_fragments;
-		frame_msg.secure_subtype = msg->secure_subtype;
-		frame_msg.secure_encoding = msg->secure_encoding;
-		frame_msg.numbered_s = msg->numbered_s;
-		/* Auto-assign numbered_msgnum from sequence counter when -1 */
-		if (msg->numbered_msgnum >= 0) {
-			frame_msg.numbered_msgnum = msg->numbered_msgnum;
-		} else {
-			frame_msg.numbered_msgnum = frame_msg.sequence_num;
+
+			/* Auto-assign numbered_msgnum from sequence counter when -1 */
+			if (m->numbered_msgnum >= 0)
+				fm->numbered_msgnum = m->numbered_msgnum;
+			else
+				fm->numbered_msgnum = fm->sequence_num;
 		}
 
 		/* Carry-on computation (Spec Section 3.7.1 / 4.2.1).
 		 *
-		 * When this message is a fragment and more fragments of the
-		 * same message follow in the queue, tell pagers to also
-		 * decode the next N consecutive frames (carry_on = 1..3).
+		 * Scan entire queue for max remaining fragment count across
+		 * all eligible messages (not just packed ones — Req 9.1).
+		 * Alpha-bounded per §4.2.2 Rule ② (Req 16.4, 17.1).
 		 * Only meaningful with collapse > 0 (battery saving active);
 		 * with collapse=0 pagers decode every frame anyway.
 		 * Per spec: "Carry On is not allowed for multiple transmission." */
-		if (flex->collapse > 0 &&
-		    flex->num_transmissions <= 1 &&
-		    msg->total_fragments > 1 &&
-		    msg->fragment_index < msg->total_fragments - 1) {
-			int remaining = msg->total_fragments - 1 - msg->fragment_index;
-			params.carry_on = (remaining > 3) ? 3 : remaining;
+		if (flex->collapse > 0 && flex->num_transmissions <= 1) {
+			flex_msg_t *qm;
+			int max_remaining = 0;
+			for (qm = flex->msg_list; qm; qm = qm->next) {
+				if (qm->speed != params.bitrate ||
+				    qm->modulation_type != params.modulation_type)
+					continue;
+				if (qm->total_fragments > 1 &&
+				    qm->fragment_index < qm->total_fragments - 1) {
+					int remaining = qm->total_fragments - 1 - qm->fragment_index;
+					if (remaining > max_remaining)
+						max_remaining = remaining;
+				}
+			}
+			/* Alpha constraint (§4.2.2 Rule ②, Req 16.4, 17.1):
+			 * carry-on cannot exceed alpha_max = 2^m - 1, since
+			 * the number of continuing frames must be strictly
+			 * less than the collapse cycle length. */
+			{
+				int alpha_max = (1 << flex->collapse) - 1;
+				if (max_remaining > alpha_max)
+					max_remaining = alpha_max;
+			}
+			if (max_remaining > 0)
+				params.carry_on = (max_remaining > 3) ? 3 : max_remaining;
 		}
 
-		/* Use split encoding: sync → sync_buffer, data → frame_buffer */
-		flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
-					&msgs_packed, &error);
+		/* Collapse-cycle fragment placement (§4.2.2, Req 15.1, 15.4).
+		 *
+		 * When collapse > 0, the first fragment (fragment_index == 0)
+		 * of a NEW fragmented stream must only be placed in a
+		 * Collapse_Aligned_Frame for the target capcode. If the
+		 * current frame is not collapse-aligned for a fragment's
+		 * capcode, remove it from the candidate list (defer to next
+		 * collapse-aligned frame).
+		 *
+		 * Continuing fragments (fragment_index > 0) are already
+		 * eligible if they passed the three-pass collection — the
+		 * alpha constraint is enforced via carry-on bounding (task 10).
+		 *
+		 * This filter runs after candidate collection but before
+		 * encoding, so deferred fragments remain in the queue for
+		 * the next frame cycle. */
+		if (flex->collapse > 0) {
+			int dst = 0;
+			uint32_t alpha_max = (1U << flex->collapse) - 1;
+			for (i = 0; i < n_candidates; i++) {
+				flex_msg_t *m = candidates[i].msg;
 
-		if (error || flex->frame_buffer_length == 0) {
-			/* Encoding failed — destroy message (error cleanup) */
-			flex_msg_destroy(msg);
-			LOGP_CHAN(DFLEX, LOGL_NOTICE, "Network mode: failed to encode frame (error=%d), sending idle.\n", error);
+				/* Only check first fragments of new streams */
+				if (m->total_fragments > 1 && m->fragment_index == 0 &&
+				    m->assigned_n < 0) {
+					/* New fragment stream — check collapse alignment */
+					flex_capcode_sched_t sched;
+					flex_scheduler_capcode_info(m->capcode, &sched);
+
+					if (!is_collapse_aligned(ft.frame,
+								 sched.assigned_frame,
+								 flex->collapse)) {
+						LOGP(DFLEX, LOGL_DEBUG,
+						     "Scheduler: defer new frag stream capcode=%"
+						     PRIu64 " — frame %u not collapse-aligned "
+						     "(assigned=%u collapse=%d)\n",
+						     m->capcode, ft.frame,
+						     sched.assigned_frame,
+						     flex->collapse);
+						est_used -= candidates[i].est_words;
+						continue; /* remove from candidates */
+					}
+				}
+
+				/* Non-continuous frame handling (§4.2.2, Req 18):
+				 *
+				 * Continuing fragments (fragment_index > 0) that
+				 * passed the three-pass collection are eligible for
+				 * this frame. However, if this frame is beyond the
+				 * alpha window for the fragment's capcode, the
+				 * fragment must be deferred to the next
+				 * Collapse_Aligned_Frame.
+				 *
+				 * In the frame-at-a-time scheduler architecture,
+				 * non-continuous frame handling is largely implicit:
+				 * - If a continuing frame is unavailable (used for
+				 *   other traffic), the fragment stays in the queue
+				 *   and is re-evaluated next frame cycle
+				 * - Skipped frames do not count against the alpha
+				 *   limit — only frames where fragments are actually
+				 *   placed consume alpha budget
+				 * - The carry-on field in BIW1 (task 10) tells
+				 *   pagers how many frames to stay awake; if a
+				 *   continuing frame is skipped, the pager may
+				 *   sleep, but the fragment will be retransmitted
+				 *   at the next Collapse_Aligned_Frame
+				 * - The fragment interval constraint (32/128 frames)
+				 *   provides the outer bound for retransmission
+				 *
+				 * This check is a safety net: the three-pass
+				 * collection already filters by collapse mapping,
+				 * so continuing fragments outside the alpha window
+				 * should not normally appear here. */
+				if (m->total_fragments > 1 && m->fragment_index > 0) {
+					flex_capcode_sched_t sched;
+					flex_scheduler_capcode_info(m->capcode, &sched);
+
+					if (!is_collapse_aligned(ft.frame,
+								 sched.assigned_frame,
+								 flex->collapse)) {
+						/* Frame is not collapse-aligned — check
+						 * if within alpha window */
+						uint32_t period = 1U << flex->collapse;
+						uint32_t aligned_frame = ft.frame - (ft.frame % period)
+							+ (sched.assigned_frame % period);
+						if (aligned_frame > ft.frame)
+							aligned_frame -= period;
+
+						if (ft.frame > aligned_frame + alpha_max) {
+							LOGP(DFLEX, LOGL_DEBUG,
+							     "Scheduler: defer continuing frag capcode=%"
+							     PRIu64 " idx=%d — frame %u beyond alpha "
+							     "window (aligned=%u alpha_max=%u)\n",
+							     m->capcode, m->fragment_index,
+							     ft.frame, aligned_frame,
+							     alpha_max);
+							est_used -= candidates[i].est_words;
+							continue; /* defer to next Collapse_Aligned_Frame */
+						}
+					}
+				}
+
+				if (dst != i)
+					candidates[dst] = candidates[i];
+				dst++;
+			}
+			if (dst != n_candidates) {
+				LOGP(DFLEX, LOGL_DEBUG,
+				     "Scheduler: collapse filter removed %d fragment candidates\n",
+				     n_candidates - dst);
+				n_candidates = dst;
+			}
+		}
+
+		/* Update msg pointer after collapse filtering — may have
+		 * removed all candidates */
+		if (n_candidates == 0) {
 			goto send_idle;
 		}
 
-		/* Post-transmit lifecycle: retain or destroy */
-		{
-			flex_post_transmit(flex, msg, current_abs);
+		/* Encode: pass full candidate array to encoder (Req 1.3) */
+		flex_setup_frame_buffers(flex, &params, frame_msgs, n_candidates,
+					&msgs_packed, &error);
+
+		if (error || flex->frame_buffer_length == 0) {
+			LOGP_CHAN(DFLEX, LOGL_NOTICE,
+				  "Network mode: failed to encode frame (error=%d), sending idle.\n", error);
+			goto send_idle;
 		}
+
+		/* Post-transmit for packed messages (Req 7.1-7.3).
+		 * Iterate by array index — safe even if flex_post_transmit()
+		 * destroys/unlinks messages, because candidates[i].msg
+		 * pointers were captured before any post-transmit calls. */
+		for (i = 0; i < msgs_packed; i++) {
+			flex_msg_t *m = candidates[i].msg;
+
+			LOGP_CHAN(DFLEX, LOGL_INFO,
+				  "Network mode: packed[%d] capcode=%" PRIu64 " type=%s priority=%d seq=%d\n",
+				  i, m->capcode, flex_msg_type_name(m->msg_type),
+				  m->priority, m->assigned_n);
+
+			flex_post_transmit(flex, m, current_abs);
+		}
+
+		/* Log packing summary (Req 14.1) */
+		LOGP_CHAN(DFLEX, LOGL_INFO,
+			  "Network mode: encoded frame C%u/F%u packed %d/%d msgs words=%d/%d speed=%d/%s num_tx=%d sf=%d/%d.\n",
+			  ft.cycle, ft.frame, msgs_packed, n_candidates,
+			  est_used, capacity,
+			  params.bitrate,
+			  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+			  params.num_transmissions,
+			  params.subframe_index, params.num_transmissions);
 
 		flex->sched_last_cycle = ft.cycle;
 		flex->sched_last_frame = ft.frame;
-
-		LOGP_CHAN(DFLEX, LOGL_INFO,
-			  "Network mode: encoded frame C%u/F%u capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s priority=%d charset=%s group=%d seq=%d len=%d num_tx=%d sf=%d/%d.\n",
-			  ft.cycle, ft.frame, frame_msg.capcode,
-			  flex_capcode_type_name(frame_msg.capcode),
-			  frame_msg.msg_type, params.bitrate,
-			  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-			  (frame_msg.polarity < 0) ? "neg" : "pos",
-			  frame_msg.priority,
-			  frame_msg.charset ? "kanji" : "ascii",
-			  frame_msg.is_group,
-			  frame_msg.sequence_num,
-			  frame_msg.message_length,
-			  params.num_transmissions,
-			  params.subframe_index, params.num_transmissions);
 
 		return 1;
 	}

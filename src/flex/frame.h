@@ -116,6 +116,32 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 	return subframe_index * flex_subframe_words(num_transmissions);
 }
 
+/* ===== Multi-Message Frame Packing Constants =====
+ *
+ * Limits and intervals for the multi-message scheduler that collects
+ * multiple eligible messages per frame and passes them as a batch to
+ * the frame encoder (flex_encode_frame_multi).
+ *
+ * Fragment interval values per ARIB STD-43A §4.2 ④. */
+
+/* Upper bound on candidate messages collected per frame or phase */
+#define FLEX_MAX_CANDIDATES		64
+
+/* Max tracked in-flight fragment streams (§4.2 ①②) */
+#define FLEX_MAX_INFLIGHT		32
+
+/* Max frames between consecutive fragments — single-channel (§4.2 ④) */
+#define FLEX_FRAG_INTERVAL_SINGLE	32
+
+/* Max frames between consecutive fragments — shared/multi-tx (§4.2 ④) */
+#define FLEX_FRAG_INTERVAL_SHARED	128
+
+/* Max subframes per frame (4x transmission) */
+#define FLEX_MAX_FRAG_SLOTS		4
+
+/* Max tracked collapse-cycle fragment streams */
+#define FLEX_MAX_COLLAPSE_STATE		32
+
 /* ===== Emergency Re-Synchronization ===== */
 
 /* Default ERS cycle count.
@@ -1621,16 +1647,16 @@ static inline uint8_t flex_num_char_to_bcd(uint8_t ch)
  *   → 5 digits per word (bits 3-6, 7-10, 11-14, 15-18, 19-20+carry)
  *   → max 8 words = 41 chars (37-41 chars need 8 words)
  *
- * Numbered word layout:
+ * Numbered word layout (Fig. 3.10.1.1.2-1):
  *   bits 1-2:  K5,K4 (checksum overflow)
  *   bits 3-8:  N5-N0 message number (0-63, displayed as N+1)
  *   bit  9:    R0 retrieval flag (1=check sequence, 0=retransmission)
  *   bit  10:   S0 special format (1=ID-ROM display format)
- *   bits 11+:  BCD nibbles
- *   → 10-bit header + 2 overhead = 12 skip bits
- *   → max 8 words = 39 chars (35-39 chars need 8 words) */
+ *   bits 11+:  BCD nibbles (a0 a1 a2 a3 ...)
+ *   → K5K4(2) + N(6) + R(1) + S(1) = 10 skip bits
+ *   → max 8 words = 40 chars (37-40 chars need 8 words) */
 #define FLEX_NUM_OVERHEAD_BITS		2
-#define FLEX_NUM_NUMBERED_HDR_BITS	10
+#define FLEX_NUM_NUMBERED_HDR_BITS	8	/* N(6) + R(1) + S(1), excludes K5K4 */
 #define FLEX_NUM_NUMBERED_SKIP_BITS	(FLEX_NUM_NUMBERED_HDR_BITS + FLEX_NUM_OVERHEAD_BITS)
 
 /* ===== Secure Message Type Field =====
@@ -1816,7 +1842,10 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_ERR_INVALID_GROUP		4
 
 /* ===== Message Type Constants ===== */
-/* (int values to avoid circular dependency with flex.h enum) */
+/* Message type constants — single source of truth.
+ * frame.h cannot include flex.h (circular dependency), so the canonical
+ * integer values live here as #defines.  flex.h's enum flex_msg_type
+ * references these defines to guarantee the values stay in sync. */
 
 #define FLEX_FRAME_MSG_TYPE_AUTO		0
 #define FLEX_FRAME_MSG_TYPE_TONE	1
@@ -1828,6 +1857,7 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_FRAME_MSG_TYPE_SECURE	7
 #define FLEX_FRAME_MSG_TYPE_SPECIAL_NUM	8
 #define FLEX_FRAME_MSG_TYPE_NUMBERED_NUM 9
+#define FLEX_FRAME_MSG_TYPE_NUMBERED_SPECIAL 10
 
 /* ===== Sync Codes =====
  *
@@ -2213,5 +2243,13 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 const char *flex_print_message(const char *message, int message_length);
 int flex_scan_message(const char *message_input, int message_input_length,
 		      char *message_output, int message_output_length);
+
+/* Validate message payload for a given type before enqueuing.
+ * Returns 0 if valid, or a negative FLEX_ERR_* code on failure.
+ * This catches encoding errors early (bad BCD chars, invalid hex,
+ * empty instruction payload, etc.) so they never enter the queue
+ * and poison frame encoding. */
+int flex_msg_validate(int msg_type, const char *data, int data_length,
+		      int secure_encoding);
 
 #endif /* FLEX_FRAME_H */

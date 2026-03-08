@@ -473,10 +473,15 @@ static uint32_t create_numeric_vector(uint32_t msg_start,
 				      uint32_t msg_words, uint32_t kbit,
 				      uint32_t vector_type)
 {
+	/* Per ARIB STD-43A §3.9.1, the n field encodes word_count - 1:
+	 *   "n: Indicates the number of words in the message =
+	 *    1 + 1·n₀ + 2·n₁ + 4·n₂"
+	 * So the 3-bit field value = msg_words - 1 (range 0-7 for 1-8 words). */
+	uint32_t n_field = (msg_words > 0) ? msg_words - 1 : 0;
 	uint32_t dw = 0;
 	dw |= (vector_type & FLEX_VEC_TYPE_MASK)  << FLEX_VEC_TYPE_SHIFT;
 	dw |= (msg_start   & FLEX_VEC_START_MASK) << FLEX_VEC_START_SHIFT;
-	dw |= (msg_words   & FLEX_VEC_NUM_LEN_MASK) << FLEX_VEC_LEN_SHIFT;
+	dw |= (n_field      & FLEX_VEC_NUM_LEN_MASK) << FLEX_VEC_LEN_SHIFT;
 	dw |= (kbit        & FLEX_VEC_NUM_KBIT_MASK) << FLEX_VEC_NUM_KBIT_SHIFT;
 
 	dw = flex_word_checksum(dw);
@@ -851,46 +856,44 @@ static uint32_t encode_numeric_message(uint32_t *frame_words, const char *msg,
 				   const void *config)
 {
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_NUMERIC] = {0};
-	uint8_t last_ch;
-	int last_shift, bit_shift, word_idx, i;
+	int bit, word_idx, i, b;
 	uint32_t k_bit, fwc;
-	uint8_t ch;
 
 	(void)config;
 
-	last_shift = 0;
-	bit_shift = FLEX_NUM_OVERHEAD_BITS;  /* First 2 bits reserved for checksum overflow */
-	word_idx = 0;
-	i = 0;
-
-	while (msg[i] != '\0' && word_idx < FLEX_MAX_MSG_WORDS_NUMERIC) {
-		if (bit_shift < FLEX_BCH_DATA_BITS) {
-			if (last_shift) {
-				/* Carry bits from previous nibble that crossed word boundary */
-				ch = flex_num_char_to_bcd(last_ch) >> (4 - last_shift);
-				msg_words[word_idx] |= ((uint32_t)ch << bit_shift);
-				bit_shift += last_shift;
-				last_shift = 0;
-				continue;
-			}
-			ch = flex_num_char_to_bcd(msg[i++]);
-			msg_words[word_idx] |= ((uint32_t)ch << bit_shift) & FLEX_DATA_MASK;
-			bit_shift += 4;
-			continue;
+	/* BCD packing — bit-by-bit, mirrors the RX decoder.
+	 * Each character is a 4-bit BCD nibble placed LSB-first
+	 * across 21-bit word boundaries without special carry logic. */
+	bit = FLEX_NUM_OVERHEAD_BITS;  /* First 2 bits reserved for K5K4 */
+	for (i = 0; msg[i] != '\0'; i++) {
+		uint8_t nibble = flex_num_char_to_bcd(msg[i]);
+		for (b = 0; b < 4; b++) {
+			word_idx = bit / FLEX_BCH_DATA_BITS;
+			if (word_idx >= FLEX_MAX_MSG_WORDS_NUMERIC)
+				break;
+			if (nibble & (1 << b))
+				msg_words[word_idx] |= (1U << (bit % FLEX_BCH_DATA_BITS));
+			bit++;
 		}
-		/* Nibble crossed word boundary — save overflow */
-		last_ch = msg[i - 1];
-		last_shift = bit_shift - FLEX_BCH_DATA_BITS;
-		bit_shift = 0;
-		word_idx++;
 	}
 
-	/* Pad remaining space with BCD space character (0xC per spec).
+	/* Pad with BCD space (0xC) to fill remaining nibble slots in last word.
+	 * Remaining partial bits stay 0 (Section 3.10.1.1.1:
 	 * "Space characters (HEX C) are inserted to fill unused 4-bit
 	 * character positions in the last word and 0s are inserted to
-	 * fill remaining partial characters." */
-	for (; bit_shift < 18; bit_shift += 4)
-		msg_words[word_idx] |= ((uint32_t)FLEX_NUM_BCD_SPACE << bit_shift);
+	 * fill remaining partial characters.") */
+	word_idx = (bit > 0) ? (bit - 1) / FLEX_BCH_DATA_BITS : 0;
+	{
+		int end_bit = (word_idx + 1) * FLEX_BCH_DATA_BITS;
+		while (bit + 4 <= end_bit) {
+			for (b = 0; b < 4; b++) {
+				if (FLEX_NUM_BCD_SPACE & (1 << b))
+					msg_words[bit / FLEX_BCH_DATA_BITS] |=
+						(1U << (bit % FLEX_BCH_DATA_BITS));
+				bit++;
+			}
+		}
+	}
 
 	/* K checksum.
 	 *
@@ -1250,10 +1253,8 @@ static uint32_t encode_special_numeric_message(uint32_t *frame_words,
 					       int *error)
 {
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_NUMERIC] = {0};
-	uint8_t last_ch;
-	int last_shift, bit_shift, word_idx, i;
+	int bit, word_idx, i, b;
 	uint32_t k_bit, fwc;
-	uint8_t ch;
 	size_t len;
 
 	len = strlen(msg);
@@ -1272,35 +1273,33 @@ static uint32_t encode_special_numeric_message(uint32_t *frame_words,
 		}
 	}
 
-	/* BCD packing — identical to encode_numeric_message() */
-	last_shift = 0;
-	bit_shift = FLEX_NUM_OVERHEAD_BITS;
-	word_idx = 0;
-	i = 0;
-
-	while (msg[i] != '\0' && word_idx < FLEX_MAX_MSG_WORDS_NUMERIC) {
-		if (bit_shift < FLEX_BCH_DATA_BITS) {
-			if (last_shift) {
-				ch = flex_num_char_to_bcd(last_ch) >> (4 - last_shift);
-				msg_words[word_idx] |= ((uint32_t)ch << bit_shift);
-				bit_shift += last_shift;
-				last_shift = 0;
-				continue;
-			}
-			ch = flex_num_char_to_bcd(msg[i++]);
-			msg_words[word_idx] |= ((uint32_t)ch << bit_shift) & FLEX_DATA_MASK;
-			bit_shift += 4;
-			continue;
+	/* BCD packing — bit-by-bit, identical to encode_numeric_message() */
+	bit = FLEX_NUM_OVERHEAD_BITS;
+	for (i = 0; msg[i] != '\0'; i++) {
+		uint8_t nibble = flex_num_char_to_bcd(msg[i]);
+		for (b = 0; b < 4; b++) {
+			word_idx = bit / FLEX_BCH_DATA_BITS;
+			if (word_idx >= FLEX_MAX_MSG_WORDS_NUMERIC)
+				break;
+			if (nibble & (1 << b))
+				msg_words[word_idx] |= (1U << (bit % FLEX_BCH_DATA_BITS));
+			bit++;
 		}
-		last_ch = msg[i - 1];
-		last_shift = bit_shift - FLEX_BCH_DATA_BITS;
-		bit_shift = 0;
-		word_idx++;
 	}
 
-	/* Pad remaining space with BCD space */
-	for (; bit_shift < 18; bit_shift += 4)
-		msg_words[word_idx] |= ((uint32_t)FLEX_NUM_BCD_SPACE << bit_shift);
+	/* Pad with BCD space, remaining partial bits stay 0 */
+	word_idx = (bit > 0) ? (bit - 1) / FLEX_BCH_DATA_BITS : 0;
+	{
+		int end_bit = (word_idx + 1) * FLEX_BCH_DATA_BITS;
+		while (bit + 4 <= end_bit) {
+			for (b = 0; b < 4; b++) {
+				if (FLEX_NUM_BCD_SPACE & (1 << b))
+					msg_words[bit / FLEX_BCH_DATA_BITS] |=
+						(1U << (bit % FLEX_BCH_DATA_BITS));
+				bit++;
+			}
+		}
+	}
 
 	/* K checksum — identical to standard numeric */
 	k_bit = 0;
@@ -1332,15 +1331,16 @@ static uint32_t encode_special_numeric_message(uint32_t *frame_words,
 /*
  * Numbered numeric message encoder (V=111).
  *
- * Extends the BCD encoding with a 10-bit header in the first message word:
+ * Extends the BCD encoding with a header in the first message word
+ * (Fig. 3.10.1.1.2-1):
  *   bits 0-1:  K5,K4 (checksum overflow, same as standard numeric)
  *   bits 2-7:  N5-N0 message number (0-63)
  *   bit  8:    R0 retrieval flag
  *   bit  9:    S0 special format flag
- *   bits 10+:  BCD digit data (starting at bit offset 12)
+ *   bits 10+:  BCD digit data (starting at bit offset 10)
  *
- * Max 39 BCD characters (8 words × 21 bits - 12 skip bits = 156 data bits
- * = 39 nibbles).  Single-frame only.
+ * Max 40 BCD characters (8 words × 21 bits - 10 skip bits = 158 data bits
+ * = 39.5 nibbles → 39 full nibbles + 2 leftover bits).  Single-frame only.
  */
 static uint32_t encode_numbered_numeric_message(uint32_t *frame_words,
 						const char *msg,
@@ -1350,10 +1350,8 @@ static uint32_t encode_numbered_numeric_message(uint32_t *frame_words,
 						int s_flag, int *error)
 {
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_NUMERIC] = {0};
-	uint8_t last_ch;
-	int last_shift, bit_shift, word_idx, i;
+	int bit, word_idx, i, b;
 	uint32_t k_bit, fwc;
-	uint8_t ch;
 	size_t len;
 
 	/* Max 39 characters for numbered numeric */
@@ -1381,35 +1379,33 @@ static uint32_t encode_numbered_numeric_message(uint32_t *frame_words,
 	if (s_flag)
 		msg_words[0] |= (1U << 9);
 
-	/* BCD packing — starts at bit offset FLEX_NUM_NUMBERED_SKIP_BITS (12) */
-	last_shift = 0;
-	bit_shift = FLEX_NUM_NUMBERED_SKIP_BITS;
-	word_idx = 0;
-	i = 0;
-
-	while (msg[i] != '\0' && word_idx < FLEX_MAX_MSG_WORDS_NUMERIC) {
-		if (bit_shift < FLEX_BCH_DATA_BITS) {
-			if (last_shift) {
-				ch = flex_num_char_to_bcd(last_ch) >> (4 - last_shift);
-				msg_words[word_idx] |= ((uint32_t)ch << bit_shift);
-				bit_shift += last_shift;
-				last_shift = 0;
-				continue;
-			}
-			ch = flex_num_char_to_bcd(msg[i++]);
-			msg_words[word_idx] |= ((uint32_t)ch << bit_shift) & FLEX_DATA_MASK;
-			bit_shift += 4;
-			continue;
+	/* BCD packing — bit-by-bit, starts after 10-bit header */
+	bit = FLEX_NUM_NUMBERED_SKIP_BITS;
+	for (i = 0; msg[i] != '\0'; i++) {
+		uint8_t nibble = flex_num_char_to_bcd(msg[i]);
+		for (b = 0; b < 4; b++) {
+			word_idx = bit / FLEX_BCH_DATA_BITS;
+			if (word_idx >= FLEX_MAX_MSG_WORDS_NUMERIC)
+				break;
+			if (nibble & (1 << b))
+				msg_words[word_idx] |= (1U << (bit % FLEX_BCH_DATA_BITS));
+			bit++;
 		}
-		last_ch = msg[i - 1];
-		last_shift = bit_shift - FLEX_BCH_DATA_BITS;
-		bit_shift = 0;
-		word_idx++;
 	}
 
-	/* Pad remaining space with BCD space */
-	for (; bit_shift < 18; bit_shift += 4)
-		msg_words[word_idx] |= ((uint32_t)FLEX_NUM_BCD_SPACE << bit_shift);
+	/* Pad with BCD space, remaining partial bits stay 0 */
+	word_idx = (bit > 0) ? (bit - 1) / FLEX_BCH_DATA_BITS : 0;
+	{
+		int end_bit = (word_idx + 1) * FLEX_BCH_DATA_BITS;
+		while (bit + 4 <= end_bit) {
+			for (b = 0; b < 4; b++) {
+				if (FLEX_NUM_BCD_SPACE & (1 << b))
+					msg_words[bit / FLEX_BCH_DATA_BITS] |=
+						(1U << (bit % FLEX_BCH_DATA_BITS));
+				bit++;
+			}
+		}
+	}
 
 	/* K checksum over all message words including header bits */
 	k_bit = 0;
@@ -1606,6 +1602,95 @@ int flex_scan_message(const char *message_input, int message_input_length,
 	}
 
 	return out;
+}
+
+/* ===== Pre-enqueue Payload Validation =====
+ *
+ * Validates message payload for a given type BEFORE it enters the TX queue.
+ * Catches the same errors that the per-type encoders would catch at frame
+ * encoding time, so bad messages never poison a frame batch.
+ *
+ * Returns 0 if valid, or -FLEX_ERR_INVALID_MESSAGE on failure. */
+int flex_msg_validate(int msg_type, const char *data, int data_length,
+		      int secure_encoding)
+{
+	int i;
+
+	switch (msg_type) {
+	case FLEX_FRAME_MSG_TYPE_INSTRUCTION:
+		/* Requires non-empty decimal integer 0-16383 */
+		if (!data || data_length <= 0)
+			return -FLEX_ERR_INVALID_MESSAGE;
+		{
+			unsigned long val;
+			char *endptr;
+			char buf[32];
+			int len = data_length;
+			if (len >= (int)sizeof(buf))
+				len = (int)sizeof(buf) - 1;
+			memcpy(buf, data, len);
+			buf[len] = '\0';
+			val = strtoul(buf, &endptr, 10);
+			if (*endptr != '\0' || val > 0x3FFF)
+				return -FLEX_ERR_INVALID_MESSAGE;
+		}
+		break;
+
+	case FLEX_FRAME_MSG_TYPE_SPECIAL_NUM:
+		/* BCD characters only, max 41 */
+		if (!data || data_length <= 0)
+			return -FLEX_ERR_INVALID_MESSAGE;
+		if (data_length > FLEX_MAX_CHARS_NUMERIC)
+			return -FLEX_ERR_INVALID_MESSAGE;
+		for (i = 0; i < data_length; i++) {
+			if (!is_valid_numeric_char(data[i]))
+				return -FLEX_ERR_INVALID_MESSAGE;
+		}
+		break;
+
+	case FLEX_FRAME_MSG_TYPE_NUMBERED_NUM:
+	case FLEX_FRAME_MSG_TYPE_NUMBERED_SPECIAL:
+		/* BCD characters only, max 39 */
+		if (!data || data_length <= 0)
+			return -FLEX_ERR_INVALID_MESSAGE;
+		if (data_length > 39)
+			return -FLEX_ERR_INVALID_MESSAGE;
+		for (i = 0; i < data_length; i++) {
+			if (!is_valid_numeric_char(data[i]))
+				return -FLEX_ERR_INVALID_MESSAGE;
+		}
+		break;
+
+	case FLEX_FRAME_MSG_TYPE_HEX:
+		/* Hex characters only */
+		if (!data || data_length <= 0)
+			return -FLEX_ERR_INVALID_MESSAGE;
+		for (i = 0; i < data_length; i++) {
+			if (!is_valid_hex_char(data[i]))
+				return -FLEX_ERR_INVALID_MESSAGE;
+		}
+		break;
+
+	case FLEX_FRAME_MSG_TYPE_SECURE:
+		if (!data || data_length <= 0)
+			return -FLEX_ERR_INVALID_MESSAGE;
+		if (secure_encoding == 1) {
+			/* Binary mode: hex characters only */
+			for (i = 0; i < data_length; i++) {
+				if (!is_valid_hex_char(data[i]))
+					return -FLEX_ERR_INVALID_MESSAGE;
+			}
+		}
+		/* Alpha mode: any 7-bit ASCII is fine */
+		break;
+
+	default:
+		/* Other types (tone, alpha, numeric) either have no payload
+		 * requirements or are validated elsewhere. */
+		break;
+	}
+
+	return 0;
 }
 
 void flex_frame_params_default(flex_frame_params_t *params)
@@ -2147,7 +2232,7 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 	if (is_initial_frag) {
 		/* R=retrieval, M=mail_drop, D=0 (LTR), H=0,
 		 * B=blocking_length (bits/char), I=0, s=0, S=0 (signature) */
-		int b_field = 0; /* default B=0000 (16 bits/char) */
+		int b_field = 1; /* default B=0001 (1 bit/char) per spec */
 		if (config) {
 			const struct flex_msg_config *cfg = config;
 			b_field = cfg->blocking_length & 0xF;
@@ -2599,7 +2684,7 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
 			: strlen(msg->message);
 		if (len > 39)
 			return -1;
-		/* ceil((len*4+12)/21) — extra 10-bit header */
+		/* ceil((len*4+10)/21) — 10-bit header (K5K4 + N + R + S) */
 		{
 			int bits_needed = (int)len * 4 + FLEX_NUM_NUMBERED_SKIP_BITS;
 			int words = (bits_needed + 20) / 21;

@@ -753,6 +753,93 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	}
 }
 
+/* --- FIFO logging helpers --- */
+
+static const char *flex_mod_name(int mod_type)
+{
+	return (mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk";
+}
+
+static const char *flex_phase_name(int phase)
+{
+	static const char *names[] = { "A", "B", "C", "D" };
+	if (phase < 0) return "auto";
+	if (phase >= 0 && phase <= 3) return names[phase];
+	return "?";
+}
+
+/* Build a human-readable flags string like "[GRP MAILDROP RETX]".
+ * Returns pointer to static buffer. */
+static const char *flex_flags_str(int is_group, int is_temp_group,
+				  int mail_drop, int secure_encoding,
+				  int retransmit)
+{
+	static char buf[64];
+	int pos = 0;
+
+	buf[pos++] = '[';
+	if (is_group)        pos += sprintf(buf + pos, "GRP ");
+	if (is_temp_group)   pos += sprintf(buf + pos, "TGRP ");
+	if (mail_drop)       pos += sprintf(buf + pos, "MAILDROP ");
+	if (secure_encoding) pos += sprintf(buf + pos, "SECBIN ");
+	if (retransmit > 0)  pos += sprintf(buf + pos, "RETX ");
+	/* trim trailing space */
+	if (pos > 1 && buf[pos - 1] == ' ')
+		pos--;
+	buf[pos++] = ']';
+	buf[pos] = '\0';
+	return buf;
+}
+
+/* Log message payload: text preview for alpha/numeric, hex dump for hex type. */
+static void flex_log_payload(enum flex_msg_type mtype,
+			     const char *data, int len)
+{
+	if (len <= 0)
+		return;
+
+	if (mtype == FLEX_MSG_TYPE_HEX) {
+		char hex_preview[1280]; /* 420 bytes * 3 chars + 1 */
+		int i;
+		for (i = 0; i < len && i < 420; i++)
+			sprintf(hex_preview + i * 3, "%02X ", (unsigned char)data[i]);
+		if (len > 0)
+			hex_preview[len * 3 - 1] = '\0';
+		LOGP(DFLEX, LOGL_INFO,
+		     "FIFO:   payload (hex): '%s'\n", hex_preview);
+	} else {
+		LOGP(DFLEX, LOGL_INFO,
+		     "FIFO:   payload: '%.*s'\n", len, data);
+	}
+}
+
+/* Log type-specific options for secure, numbered, and hex messages. */
+static void flex_log_type_options(enum flex_msg_type mtype,
+				  int secure_encoding, int secure_subtype,
+				  int numbered_msgnum, int blocking_length)
+{
+	switch (mtype) {
+	case FLEX_MSG_TYPE_SECURE:
+		LOGP(DFLEX, LOGL_INFO,
+		     "FIFO:   secure options: sectype=%s sectag=%d\n",
+		     secure_encoding ? "binary" : "alpha", secure_subtype);
+		break;
+	case FLEX_MSG_TYPE_NUMBERED_NUM:
+	case FLEX_MSG_TYPE_NUMBERED_SPECIAL:
+		LOGP(DFLEX, LOGL_INFO,
+		     "FIFO:   numbered options: msgnum=%d\n",
+		     numbered_msgnum);
+		break;
+	case FLEX_MSG_TYPE_HEX:
+		LOGP(DFLEX, LOGL_INFO,
+		     "FIFO:   hex options: blocking=%d\n",
+		     blocking_length);
+		break;
+	default:
+		break;
+	}
+}
+
 /* Process a single FIFO line: capcode,type,options,message */
 static void fifo_process_line(const char *text, int text_length)
 {
@@ -1109,9 +1196,9 @@ static void fifo_process_line(const char *text, int text_length)
 			    (msg_speed != flex->fixed_speed || msg_mod_type != flex->fixed_mod_type)) {
 				LOGP(DFLEX, LOGL_NOTICE, "fixed-mode: speed locked to %d/%s, discarding message with speed=%d/%s\n",
 				     flex->fixed_speed,
-				     (flex->fixed_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+				     flex_mod_name(flex->fixed_mod_type),
 				     msg_speed,
-				     (msg_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk");
+				     flex_mod_name(msg_mod_type));
 				return;
 			}
 			if (flex->fixed_polarity != 0.0 && msg_polarity != flex->fixed_polarity) {
@@ -1128,6 +1215,23 @@ static void fifo_process_line(const char *text, int text_length)
 		flex_t *flex = (flex_t *)sender_head;
 		if (flex) {
 			flex_msg_t *msg;
+
+			/* Pre-enqueue validation for secure binary: the
+			 * secure_encoding option is parsed from the FIFO line
+			 * but only set on the msg struct after create.
+			 * Validate here so bad payloads never enter the queue. */
+			if (mtype == FLEX_MSG_TYPE_SECURE && msg_secure_encoding == 1) {
+				int verr = flex_msg_validate(FLEX_MSG_TYPE_SECURE,
+							     msg_buf, message_length,
+							     msg_secure_encoding);
+				if (verr) {
+					LOGP(DFLEX, LOGL_NOTICE,
+					     "FIFO: rejecting secure binary capcode=%" PRIu64 ": invalid hex payload.\n",
+					     capcode);
+					return;
+				}
+			}
+
 			msg = flex_msg_create(flex, capcode, mtype, msg_buf, message_length);
 			if (msg) {
 				msg->speed = msg_speed;
@@ -1174,35 +1278,26 @@ static void fifo_process_line(const char *text, int text_length)
 					msg->retransmit_max = 0;
 				}
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d tempgroup=%d phase=%s len=%d\n",
+				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d tempgroup=%d phase=%s len=%d flags=%s\n",
 				     capcode,
 				     flex_msg_type_name(mtype),
 				     msg_speed,
-				     (msg_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
+				     flex_mod_name(msg_mod_type),
 				     (msg_polarity < 0) ? "neg" : "pos",
 				     msg_priority,
 				     msg_charset ? "kanji" : "ascii",
 				     is_group,
 				     is_temp_group,
-				     (msg_phase < 0) ? "auto" :
-				     (msg_phase == 0) ? "A" :
-				     (msg_phase == 1) ? "B" :
-				     (msg_phase == 2) ? "C" : "D",
-				     message_length);
-				if (mtype == FLEX_MSG_TYPE_SECURE)
-					LOGP(DFLEX, LOGL_INFO,
-					     "FIFO:   secure options: sectype=%s sectag=%d\n",
-					     msg_secure_encoding ? "binary" : "alpha",
-					     msg_secure_subtype);
-				if (mtype == FLEX_MSG_TYPE_NUMBERED_NUM ||
-				    mtype == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
-					LOGP(DFLEX, LOGL_INFO,
-					     "FIFO:   numbered options: msgnum=%d\n",
-					     msg_numbered_msgnum);
-				if (mtype == FLEX_MSG_TYPE_HEX)
-					LOGP(DFLEX, LOGL_INFO,
-					     "FIFO:   hex options: blocking=%d\n",
-					     msg_blocking_length);
+				     flex_phase_name(msg_phase),
+				     message_length,
+				     flex_flags_str(is_group, is_temp_group,
+						   msg_mail_drop, msg_secure_encoding,
+						   msg_retransmit));
+			flex_log_payload(mtype, msg_buf, message_length);
+				flex_log_type_options(mtype, msg_secure_encoding,
+						     msg_secure_subtype,
+						     msg_numbered_msgnum,
+						     msg_blocking_length);
 			}
 		}
 	}

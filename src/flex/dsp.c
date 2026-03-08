@@ -1263,6 +1263,23 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 
 /* ===== Fragment Reassembly Helpers ===== */
 
+/* Multi-message and co-packing compliance (Req 21.1-21.6):
+ *
+ * The fragment reassembly system correctly handles co-packed
+ * fragments and other-capcode messages:
+ * - Each address/vector pair is decoded independently, so
+ *   co-packed messages for different capcodes don't interfere
+ * - Reassembly matches on capcode + msg_num (retrieval number N),
+ *   accepting fragments from any frame within the timeout window
+ * - The 64-frame timeout is generous vs the 32-frame spec interval,
+ *   accommodating fragments received out of strict collapse-cycle
+ *   timing (e.g., due to non-continuous frame gaps)
+ * - Subframe store combines multiple transmission repeats via
+ *   best-of voting before message parsing
+ * - Carry-on field is parsed from BIW1 for logging; the RX decoder
+ *   does not need to act on it for message parsing (it's a pager
+ *   power management signal) */
+
 /* Find or allocate a reassembly slot for the given capcode + message number.
  * Returns slot index, or -1 if no slot available. */
 static int reasm_find(flex_t *flex, uint64_t capcode, int msg_num)
@@ -2173,6 +2190,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 		/* Walk address/vector pairs.
 		 *
+		 * Multi-message compliance (Req 10.1-10.4, 21.1):
+		 * This loop correctly handles frames with multiple packed
+		 * messages by walking ALL address/vector pairs from aoffset
+		 * to voffset using BIW1 field boundaries. Mixed short/long
+		 * addresses (1 vs 2 words), tone-only addresses (no vector),
+		 * and priority identification (BIW1 P field) are all handled
+		 * regardless of message count.
+		 *
 		 * Address/vector layout:
 		 * - Short address (1 word): Ax pairs with Vx
 		 * - Long address (2 words): Ax,Ay pair with Vx,Vy
@@ -2378,12 +2403,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				/* Numeric vectors
 				 * (types 3, 4, 7) have a 3-bit n field (bits 14-16)
 				 * and a 4-bit K checksum (bits 17-20).
+				 * Per §3.9.1: n field encodes word_count - 1,
+				 * i.e. "number of words = 1 + n₀ + 2·n₁ + 4·n₂".
 				 * Alpha/hex/secure vectors have a 7-bit n field
-				 * (bits 14-20). */
+				 * (bits 14-20) encoding word count directly. */
 				if (vec_type == FLEX_VECTOR_TYPE_NUMERIC ||
 				    vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM ||
 				    vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) {
-					len = (viw >> FLEX_VEC_LEN_SHIFT) & FLEX_VEC_NUM_LEN_MASK;
+					len = ((viw >> FLEX_VEC_LEN_SHIFT) & FLEX_VEC_NUM_LEN_MASK) + 1;
 				} else {
 					len = FLEX_VEC_LEN(viw);
 				}
@@ -3238,9 +3265,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				 *   V=011: Standard Numeric — 4-bit BCD, 5 chars/word
 				 *   V=100: Special Format Numeric — same encoding,
 				 *          display format per pager ID-ROM
-				 *   V=111: Numbered Numeric — 10-bit header (N5-N0
-				 *          message number + R retrieval + S special
-				 *          format + 2 reserved), then BCD digits
+				 *   V=111: Numbered Numeric — header (K5K4 +
+				 *          N5-N0 message number + R retrieval + S special
+				 *          format), then BCD digits from bit 11
 				 *
 				 * Word layout (Fig. 3.10.1.1.1-1, Standard/Special):
 				 *   1st word: K5 K4 a0 a1 a2 a3 b0 b1 b2 b3 c0...
