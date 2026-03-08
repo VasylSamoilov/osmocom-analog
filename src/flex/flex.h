@@ -5,6 +5,55 @@
 #include "../libfilter/iir_filter.h"
 #include "frame.h"
 
+/* Maximum subframe transmissions for RX combining (Req 15-16) */
+#define FLEX_RX_MAX_SUBFRAMES	4	/* max num_transmissions */
+
+/* Per-subframe storage for one phase */
+typedef struct flex_rx_subframe {
+	uint32_t		words[FLEX_WORDS_PER_FRAME];	/* 88 decoded words */
+	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];	/* 88 BCH statuses */
+	int			received;			/* 1 = this subframe has data */
+} flex_rx_subframe_t;
+
+/* Subframe store for one phase's worth of repeated transmissions */
+typedef struct flex_rx_subframe_store {
+	flex_rx_subframe_t	subframes[FLEX_RX_MAX_SUBFRAMES];
+	int			num_expected;		/* fiw_num_transmissions (2/3/4) */
+	int			num_received;		/* count of received subframes */
+	uint32_t		base_frame;		/* frame number of first subframe */
+	uint32_t		base_cycle;		/* cycle of first subframe */
+	uint32_t		timeout_frame;		/* absolute frame for 2×repeat_interval timeout */
+	int			active;			/* 1 = accumulating subframes */
+} flex_rx_subframe_store_t;
+
+/* Message history for RX retransmission detection (Req 17-18) */
+#define FLEX_RX_MSG_HISTORY_MAX		256
+#define FLEX_RX_MSG_HISTORY_WINDOW	1920	/* frames (1 hour) */
+#define FLEX_RX_MSG_MAX_WORDS		88	/* max words per message */
+
+typedef struct flex_rx_msg_entry {
+	/* Primary key fields */
+	uint64_t		capcode;
+	int			msg_num;		/* N (0-63) */
+	int			vec_type;		/* FLEX_VECTOR_TYPE_* */
+	int			rx_phase;		/* 0=A, 1=B, 2=C, 3=D */
+
+	/* Validation fields (must match for retransmission confirmation) */
+	int			word_count;		/* message word count (mw2 - mw1 + 1) */
+	int			frag_count;		/* total fragments (from C/F flags) */
+	int			is_long;		/* short vs long address format */
+	int			blocking;		/* blocking value (hex messages) */
+
+	/* Per-word data for cross-retransmission recovery */
+	uint32_t		words[FLEX_RX_MSG_MAX_WORDS];
+	enum flex_word_status	word_status[FLEX_RX_MSG_MAX_WORDS];
+	int			has_uncorrectable;	/* 1 = at least one UNCORRECTABLE word */
+
+	/* Housekeeping */
+	uint32_t		frame_abs;		/* absolute frame when stored */
+	int			active;			/* 1 = entry in use */
+} flex_rx_msg_entry_t;
+
 /* Forward declarations */
 struct flex;
 struct flex_msg;
@@ -75,9 +124,9 @@ typedef struct flex_msg {
 						 * Independent of wire encoding (secure_encoding). */
 	int			secure_encoding;	/* wire encoding: 0=7-bit alpha, 1=raw binary.
 						 * Controls how body bytes are packed on the wire. */
-	int			numbered_r;		/* retrieval flag R, default 1
-						 * TODO: wire to retransmission scheduler —
-						 * set R=0 on retransmissions with same N */
+	int			numbered_r;		/* retrieval flag R, default 1.
+						 * Retransmission scheduler sets R=0
+						 * on retransmissions with same N. */
 	int			numbered_s;		/* special format flag S: set automatically
 						 * from msg_type (0 for NUMBERED_NUM,
 						 * 1 for NUMBERED_SPECIAL). Not operator-set. */
@@ -91,6 +140,14 @@ typedef struct flex_msg {
 	int			fragment_index;
 	int			total_fragments;
 	uint32_t		retrieval_num;	/* → N field (6 bits, 0-63) */
+
+	/* retransmission scheduling state */
+	int			retransmit_max;		/* 0-15: retransmissions after initial TX (0=none) */
+	int			retransmit_count;	/* retransmissions completed so far */
+	int			retransmit_interval;	/* frames between retransmissions (1-1920, default 128) */
+	int			send_delay;		/* frames to defer initial TX (0-1920, default 0) */
+	uint32_t		next_send_frame;	/* absolute frame (cycle*128+frame) for next eligibility */
+	int			assigned_n;		/* N assigned at initial TX (-1=unassigned, 0-63) */
 } flex_msg_t;
 
 /* Instance of FLEX transmitter — embeds sender_t as first member */
@@ -483,6 +540,21 @@ typedef struct flex {
 			uint32_t	last_cycle;	/* cycle number of last fragment */
 			int		active;		/* 1 = in progress */
 		} reasm[FLEX_REASM_SLOTS];
+
+		/* Subframe combining state (Req 15-16).
+		 * Per-phase storage for word-level results across repeated subframes.
+		 * Only active when fiw_num_transmissions > 1.
+		 * Key: (cycle, frame%repeat_interval, phase, collapse parameters).
+		 * No message awareness — all 88 words benefit regardless of capcode. */
+		flex_rx_subframe_store_t subframe_store[FLEX_MAX_PHASES];
+
+		/* Message history for retransmission detection (Req 17-18).
+		 * Stores recently decoded messages keyed by (capcode, N, vec_type, phase)
+		 * with validation fields (word_count, frag_count, is_long, blocking)
+		 * for duplicate suppression and cross-retransmission word recovery.
+		 * This is a separate structure from the subframe_store — it operates
+		 * at the message layer after parsing, not at the frame/physical layer. */
+		flex_rx_msg_entry_t msg_history[FLEX_RX_MSG_HISTORY_MAX];
 	} rx;
 } flex_t;
 

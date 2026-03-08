@@ -40,6 +40,8 @@
 #include "dsp.h"
 #include "scheduler.h"
 
+#define FLEX_MAX_QUEUE_DEPTH 256
+
 static const char *flex_state_name[] = {
 	"IDLE",
 	"ERS",
@@ -177,6 +179,21 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 			     flex_special_addr_detail(aw) ? flex_special_addr_detail(aw) : "not a user-assignable capcode");
 	}
 
+	/* Queue overflow protection: count all messages including
+	 * retransmission-pending ones toward the depth limit. */
+	{
+		int depth = 0;
+		flex_msg_t *qm;
+		for (qm = flex->msg_list; qm; qm = qm->next)
+			depth++;
+		if (depth >= FLEX_MAX_QUEUE_DEPTH) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "Queue overflow: depth=%d, rejecting capcode=%" PRIu64 "\n",
+			     depth, capcode);
+			return NULL;
+		}
+	}
+
 	/* create */
 	msg = calloc(1, sizeof(*msg));
 	if (!msg) {
@@ -212,8 +229,8 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	/* secure / numbered numeric defaults */
 	msg->secure_subtype = 0;
 	msg->secure_encoding = 0;
-	msg->numbered_r = 1;	/* TODO: wire to retransmission scheduler —
-				 * set R=0 on retransmissions with same N */
+	msg->numbered_r = 1;	/* retransmission scheduler sets R=0
+				 * on retransmissions with same N */
 	/* S flag derived from message type:
 	 *   NUMBERED_NUM     (nnumeric) → S=0: standard digit display
 	 *   NUMBERED_SPECIAL (nspecial) → S=1: ID-ROM display (like special/V=100)
@@ -225,6 +242,14 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->fragment_index = 0;
 	msg->total_fragments = 0;
 	msg->retrieval_num = 0;
+
+	/* retransmission scheduling defaults */
+	msg->retransmit_max = 0;
+	msg->retransmit_count = 0;
+	msg->retransmit_interval = 128;
+	msg->send_delay = 0;
+	msg->next_send_frame = 0;
+	msg->assigned_n = -1;
 
 	/* link to tail of list */
 	msg->flex = flex;
@@ -455,6 +480,25 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->secure_subtype = msg->secure_subtype;
 			frag->secure_encoding = msg->secure_encoding;
 
+			/* Copy retransmission parameters from original.
+			 * retransmit_count/retransmit_max are authoritative
+			 * on the first fragment (index 0); other fragments
+			 * inherit the values for reference but the scheduler
+			 * only checks/updates the first fragment. */
+			frag->retransmit_max = msg->retransmit_max;
+			frag->retransmit_interval = msg->retransmit_interval;
+			frag->send_delay = msg->send_delay;
+			frag->next_send_frame = msg->next_send_frame;
+
+			/* Only the first fragment (index 0) is initially
+			 * eligible for transmission.  Non-first fragments
+			 * become eligible when the preceding fragment's
+			 * post-transmit handler sets their next_send_frame.
+			 * Place them 959 frames ahead (half the 1920-frame
+			 * hour minus 1) so frame_is_eligible() rejects them. */
+			if (i > 0)
+				frag->next_send_frame = (msg->next_send_frame + 959) % 1920;
+
 			/* Set fragmentation state */
 			frag->fragment_index = i;
 			frag->total_fragments = frag_count;
@@ -552,6 +596,251 @@ static int flex_map_phase(int user_phase, int num_phases)
 		return 0;          /* A or B → internal index 0 (=phase A) */
 	}
 	return 0;  /* single phase */
+}
+
+/* Frame eligibility check with 1920-frame wrap-around.
+ *
+ * Returns 1 if next_send_frame is at or before current_frame,
+ * accounting for the hourly wrap at 1920 frames (15 cycles × 128).
+ * Uses a half-range threshold of 960: if the signed difference
+ * is >= 0 the target is reached; if < -960 the target wrapped
+ * around and is actually in the past. */
+static inline int frame_is_eligible(uint32_t next_send_frame, uint32_t current_frame)
+{
+	int32_t diff = (int32_t)current_frame - (int32_t)next_send_frame;
+
+	if (diff >= 0)
+		return 1;
+	if (diff < -960)
+		return 1; /* wrapped */
+	return 0;
+}
+
+/* Compare two eligible next_send_frame values to determine which
+ * represents an earlier deadline.  Returns 1 if a's deadline is
+ * earlier (a has been waiting longer), using the modular distance
+ * from current_abs.  Both a and b must already be eligible. */
+static inline int frame_deadline_earlier(uint32_t a, uint32_t b,
+					 uint32_t current_abs)
+{
+	/* Compute how many frames each has been waiting (modular). */
+	int32_t da = (int32_t)current_abs - (int32_t)a;
+	int32_t db = (int32_t)current_abs - (int32_t)b;
+
+	/* For the wrapped case (diff < -960), add 1920 to get the
+	 * true modular distance within the 1920-frame hour. */
+	if (da < -960) da += 1920;
+	if (db < -960) db += 1920;
+
+	return da > db;
+}
+
+/* Check whether a message type carries R/N flags and thus supports
+ * message-level retransmission.
+ *
+ * Types with R/N: alpha (V=101), hex/binary (V=110), secure (V=000),
+ *                 numbered numeric (V=111), numbered special (V=111 S=1).
+ * Types without:  tone, standard numeric, special format numeric,
+ *                 short instruction, short message. */
+static int flex_msg_supports_retransmit(enum flex_msg_type type)
+{
+	switch (type) {
+	case FLEX_MSG_TYPE_ALPHA:
+	case FLEX_MSG_TYPE_HEX:
+	case FLEX_MSG_TYPE_SECURE:
+	case FLEX_MSG_TYPE_NUMBERED_NUM:
+	case FLEX_MSG_TYPE_NUMBERED_SPECIAL:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * Fragment queue helpers for retransmission.
+ *
+ * Fragments of the same message share the same retrieval_num and are
+ * linked as consecutive flex_msg_t nodes in the queue with incrementing
+ * fragment_index (0 through total_fragments-1).
+ */
+
+/* Find the first fragment (fragment_index == 0) of a message identified
+ * by retrieval_num in the queue.  Returns NULL if not found. */
+static flex_msg_t *flex_find_first_fragment(flex_t *flex, uint32_t retrieval_num,
+					    int total_fragments)
+{
+	flex_msg_t *m;
+
+	for (m = flex->msg_list; m; m = m->next) {
+		if (m->total_fragments == total_fragments &&
+		    m->retrieval_num == retrieval_num &&
+		    m->fragment_index == 0)
+			return m;
+	}
+	return NULL;
+}
+
+/* Find the next fragment (fragment_index == current + 1) of the same
+ * message in the queue.  Returns NULL if not found. */
+static flex_msg_t *flex_find_next_fragment(flex_t *flex, flex_msg_t *msg)
+{
+	flex_msg_t *m;
+	int next_idx = msg->fragment_index + 1;
+
+	if (next_idx >= msg->total_fragments)
+		return NULL;
+
+	for (m = flex->msg_list; m; m = m->next) {
+		if (m->total_fragments == msg->total_fragments &&
+		    m->retrieval_num == msg->retrieval_num &&
+		    m->fragment_index == next_idx)
+			return m;
+	}
+	return NULL;
+}
+
+/* Destroy all fragments of a message identified by retrieval_num.
+ * Walks the queue and removes every node with matching retrieval_num
+ * and total_fragments. */
+static void flex_destroy_all_fragments(flex_t *flex, uint32_t retrieval_num,
+				       int total_fragments)
+{
+	flex_msg_t *m, *next;
+
+	for (m = flex->msg_list; m; m = next) {
+		next = m->next;
+		if (m->total_fragments == total_fragments &&
+		    m->retrieval_num == retrieval_num)
+			flex_msg_destroy(m);
+	}
+}
+
+/*
+ * Post-transmission lifecycle: decide whether to retain a message for
+ * retransmission or destroy it.
+ *
+ * For non-fragmented messages:
+ * - Message types without R/N flags: always destroy immediately.
+ * - retransmit_max == 0: no retransmissions configured, destroy.
+ * - retransmit_count >= retransmit_max: all retransmissions done, destroy.
+ * - Otherwise: increment retransmit_count, schedule next send, retain.
+ *
+ * For fragmented messages (total_fragments > 1):
+ * - retransmit_count/retransmit_max are tracked on the first fragment
+ *   (fragment_index == 0); other fragments inherit the state.
+ * - Non-last fragments: make the next fragment eligible immediately.
+ * - Last fragment: if retransmissions remain, set next_send_frame on
+ *   the first fragment and increment retransmit_count once for the
+ *   whole cycle.  If done, destroy all fragments.
+ */
+static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
+			       uint32_t current_abs_frame)
+{
+	/* Message types without R/N: always destroy */
+	if (!flex_msg_supports_retransmit(msg->msg_type)) {
+		flex_msg_destroy(msg);
+		return;
+	}
+
+	/* --- Non-fragmented message path --- */
+	if (msg->total_fragments <= 1) {
+		if (msg->retransmit_max == 0 || msg->retransmit_count >= msg->retransmit_max) {
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX_COMPLETE: capcode=%" PRIu64 " type=%s N=%d total_tx=%d\n",
+			     msg->capcode, flex_msg_type_name(msg->msg_type),
+			     msg->assigned_n, 1 + msg->retransmit_count);
+			flex_msg_destroy(msg);
+			return;
+		}
+
+		/* Retain for retransmission */
+		msg->retransmit_count++;
+		msg->next_send_frame = (current_abs_frame + (uint32_t)msg->retransmit_interval) % 1920;
+
+		LOGP(DFLEX, LOGL_INFO,
+		     "TX_RETRANSMIT: capcode=%" PRIu64 " type=%s N=%d count=%d/%d next_frame=%u\n",
+		     msg->capcode, flex_msg_type_name(msg->msg_type),
+		     msg->assigned_n, msg->retransmit_count, msg->retransmit_max,
+		     msg->next_send_frame);
+		return;
+	}
+
+	/* --- Fragmented message path --- */
+
+	/* Look up the first fragment to get authoritative retransmission state */
+	{
+		flex_msg_t *first = flex_find_first_fragment(flex, msg->retrieval_num,
+							    msg->total_fragments);
+
+		/* Non-last fragment */
+		if (msg->fragment_index < msg->total_fragments - 1) {
+			flex_msg_t *next_frag = flex_find_next_fragment(flex, msg);
+			if (next_frag)
+				next_frag->next_send_frame = current_abs_frame;
+
+			if (!first || first->retransmit_max == 0) {
+				/* No retransmission — destroy this fragment now */
+				flex_msg_destroy(msg);
+			} else {
+				/* Retransmission configured — keep fragment but
+				 * mark ineligible until retransmission cycle
+				 * restarts from the first fragment. */
+				msg->next_send_frame = (current_abs_frame + 959) % 1920;
+			}
+			return;
+		}
+
+		/* Last fragment transmitted */
+
+		if (!first) {
+			/* First fragment missing (shouldn't happen) — clean up */
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "Fragment stream incomplete: capcode=%" PRIu64 " retrieval=%u, destroying.\n",
+			     msg->capcode, msg->retrieval_num);
+			flex_destroy_all_fragments(flex, msg->retrieval_num,
+						   msg->total_fragments);
+			return;
+		}
+
+		if (first->retransmit_max == 0 ||
+		    first->retransmit_count >= first->retransmit_max) {
+			/* All retransmissions done — destroy all fragments */
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX_COMPLETE: capcode=%" PRIu64 " type=%s N=%d total_tx=%d (fragmented, %d frags)\n",
+			     msg->capcode, flex_msg_type_name(msg->msg_type),
+			     first->assigned_n, 1 + first->retransmit_count,
+			     msg->total_fragments);
+			flex_destroy_all_fragments(flex, msg->retrieval_num,
+						   msg->total_fragments);
+			return;
+		}
+
+		/* Retransmissions remain — increment count on first fragment,
+		 * schedule next send on first fragment only.
+		 * Subsequent fragments become eligible after preceding is transmitted.
+		 * Mark all non-first fragments ineligible by placing them 959 frames
+		 * after the first fragment's target (well within the ineligible half
+		 * of the 1920-frame modular space relative to the retransmission time). */
+		first->retransmit_count++;
+		first->next_send_frame = (current_abs_frame + (uint32_t)first->retransmit_interval) % 1920;
+
+		{
+			flex_msg_t *frag;
+			uint32_t sentinel = (first->next_send_frame + 959) % 1920;
+			for (frag = flex->msg_list; frag; frag = frag->next) {
+				if (frag->total_fragments == msg->total_fragments &&
+				    frag->retrieval_num == msg->retrieval_num &&
+				    frag->fragment_index > 0)
+					frag->next_send_frame = sentinel;
+			}
+		}
+
+		LOGP(DFLEX, LOGL_INFO,
+		     "TX_RETRANSMIT: capcode=%" PRIu64 " type=%s N=%d count=%d/%d next_frame=%u (fragmented, %d frags)\n",
+		     msg->capcode, flex_msg_type_name(msg->msg_type),
+		     first->assigned_n, first->retransmit_count, first->retransmit_max,
+		     first->next_send_frame, msg->total_fragments);
+	}
 }
 
 /*
@@ -721,6 +1010,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 * Only pick messages matching the selected baud rate for this frame.
 	 * With collapse=0, all messages at the right speed are eligible.
 	 * With collapse>0, also check capcode-to-frame mapping. */
+	uint32_t current_abs = ft.cycle * 128 + ft.frame;
 	msg = NULL;
 	{
 		flex_msg_t *candidate;
@@ -728,17 +1018,25 @@ static int flex_get_next_frame_network(flex_t *flex)
 		/* Two-pass selection: priority messages first, then normal.
 		 * Per ARIB STD-43A Section 3.4.1, priority addresses come
 		 * before normal addresses in the frame.  We honor this at
-		 * the scheduling level too. */
+		 * the scheduling level too.
+		 *
+		 * Within each pass, prefer the eligible candidate with the
+		 * lowest next_send_frame (earliest deadline).  Use signed
+		 * difference for wrap-around-safe comparison. */
 		for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
 			if (!candidate->priority)
 				continue;
 			if (candidate->speed != params.bitrate ||
 			    candidate->modulation_type != params.modulation_type)
 				continue;
+			/* Skip messages not yet eligible for transmission */
+			if (!frame_is_eligible(candidate->next_send_frame, current_abs))
+				continue;
 
 			if (flex->collapse <= 0) {
-				msg = candidate;
-				break;
+				if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
+					msg = candidate;
+				continue;
 			}
 
 			{
@@ -750,8 +1048,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 								       sched.assigned_frame,
 								       flex->collapse);
 				if (next_frame == ft.frame) {
-					msg = candidate;
-					break;
+					if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
+						msg = candidate;
 				}
 			}
 		}
@@ -762,10 +1060,14 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (candidate->speed != params.bitrate ||
 				    candidate->modulation_type != params.modulation_type)
 					continue;
+				/* Skip messages not yet eligible for transmission */
+				if (!frame_is_eligible(candidate->next_send_frame, current_abs))
+					continue;
 
 				if (flex->collapse <= 0) {
-					msg = candidate;
-					break;
+					if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
+						msg = candidate;
+					continue;
 				}
 
 				{
@@ -777,8 +1079,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 									       sched.assigned_frame,
 									       flex->collapse);
 					if (next_frame == ft.frame) {
-						msg = candidate;
-						break;
+						if (!msg || frame_deadline_earlier(candidate->next_send_frame, msg->next_send_frame, current_abs))
+							msg = candidate;
 					}
 				}
 			}
@@ -833,40 +1135,81 @@ static int flex_get_next_frame_network(flex_t *flex)
 			}
 		}
 
-		/* Collect one message per phase from the queue */
-		for (candidate = flex->msg_list; candidate; candidate = next) {
-			flex_capcode_sched_t sched;
-			int phase_idx;
+		/* Collect one message per phase from the queue.
+		 * First pass: select the best candidate per phase,
+		 * preferring earlier deadlines (lower next_send_frame)
+		 * among eligible messages mapping to the same phase. */
+		{
+			flex_msg_t *phase_best[FLEX_MAX_PHASES];
+			memset(phase_best, 0, sizeof(phase_best));
 
-			next = candidate->next;
+			for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
+				flex_capcode_sched_t sched;
+				int phase_idx;
 
-			if (candidate->speed != params.bitrate ||
-			    candidate->modulation_type != params.modulation_type)
-				continue;
-
-			/* Collapse filter */
-			if (flex->collapse > 0) {
-				uint32_t nf;
-				flex_scheduler_capcode_info(candidate->capcode, &sched);
-				nf = flex_scheduler_next_frame(ft.frame,
-							       sched.assigned_frame,
-							       flex->collapse);
-				if (nf != ft.frame)
+				if (candidate->speed != params.bitrate ||
+				    candidate->modulation_type != params.modulation_type)
 					continue;
-			} else {
-				flex_scheduler_capcode_info(candidate->capcode, &sched);
+
+				if (!frame_is_eligible(candidate->next_send_frame, current_abs))
+					continue;
+
+				if (flex->collapse > 0) {
+					uint32_t nf;
+					flex_scheduler_capcode_info(candidate->capcode, &sched);
+					nf = flex_scheduler_next_frame(ft.frame,
+								       sched.assigned_frame,
+								       flex->collapse);
+					if (nf != ft.frame)
+						continue;
+				} else {
+					flex_scheduler_capcode_info(candidate->capcode, &sched);
+				}
+
+				phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
+
+				if (candidate->phase >= 0)
+					phase_idx = flex_map_phase(candidate->phase, num_phases);
+
+				/* Keep the candidate with the earliest deadline */
+				if (!phase_best[phase_idx] ||
+				    frame_deadline_earlier(candidate->next_send_frame, phase_best[phase_idx]->next_send_frame, current_abs))
+					phase_best[phase_idx] = candidate;
 			}
 
-			phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
+			/* Second pass: encode and process selected candidates */
+			for (candidate = flex->msg_list; candidate; candidate = next) {
+				flex_capcode_sched_t sched;
+				int phase_idx;
+				int is_selected = 0;
 
-			/* Phase override: if message specifies a phase, use it
-			 * (mapped to internal index for this mode's phase count) */
-			if (candidate->phase >= 0)
-				phase_idx = flex_map_phase(candidate->phase, num_phases);
+				next = candidate->next;
 
-			/* Skip if this phase already has a message */
-			if (phase_has_msg[phase_idx])
-				continue;
+				/* Only process candidates that were selected in the first pass */
+				for (p = 0; p < num_phases; p++) {
+					if (phase_best[p] == candidate) {
+						is_selected = 1;
+						break;
+					}
+				}
+				if (!is_selected)
+					continue;
+
+				/* Re-derive phase_idx for this candidate */
+				if (flex->collapse > 0) {
+					flex_scheduler_capcode_info(candidate->capcode, &sched);
+				} else {
+					flex_scheduler_capcode_info(candidate->capcode, &sched);
+				}
+
+				phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
+
+				if (candidate->phase >= 0)
+					phase_idx = flex_map_phase(candidate->phase, num_phases);
+
+				/* Skip if this phase was already encoded (shouldn't happen) */
+				if (phase_has_msg[phase_idx])
+					continue;
 
 			/* Encode this message into a temp buffer to get the 88 data words */
 			memset(&frame_msg, 0, sizeof(frame_msg));
@@ -884,9 +1227,34 @@ static int flex_get_next_frame_network(flex_t *flex)
 			frame_msg.charset = candidate->charset;
 			frame_msg.is_group = candidate->is_group;
 			frame_msg.is_temp_group = candidate->is_temp_group;
-			frame_msg.sequence_num = (candidate->total_fragments > 1)
-				? (int)candidate->retrieval_num
-				: (int)(flex->msg_sequence++ & 0x3F);
+			/* R/N flag computation for retransmission */
+			{
+				int is_retransmission = (candidate->assigned_n >= 0);
+				if (!is_retransmission) {
+					/* Initial transmission: assign fresh N, set R=1 */
+					if (candidate->total_fragments > 1) {
+						candidate->assigned_n = (int)candidate->retrieval_num;
+					} else {
+						candidate->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
+					}
+					frame_msg.sequence_num = candidate->assigned_n;
+					frame_msg.alpha_r_flag = 1;
+					frame_msg.hex_r_flag = 1;
+					frame_msg.numbered_r = 1;
+					if (candidate->retransmit_max > 0) {
+						LOGP(DFLEX, LOGL_INFO,
+						     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
+						     candidate->capcode, flex_msg_type_name(candidate->msg_type),
+						     candidate->assigned_n, candidate->retransmit_max);
+					}
+				} else {
+					/* Retransmission: reuse assigned N, set R=0 */
+					frame_msg.sequence_num = candidate->assigned_n;
+					frame_msg.alpha_r_flag = 0;
+					frame_msg.hex_r_flag = 0;
+					frame_msg.numbered_r = 0;
+				}
+			}
 			frame_msg.source_id = candidate->source_id[0] ? candidate->source_id : NULL;
 			frame_msg.short_msg_idx = candidate->short_msg_index;
 			frame_msg.blocking_length = candidate->blocking_length;
@@ -895,14 +1263,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 			frame_msg.total_fragments = candidate->total_fragments;
 			frame_msg.secure_subtype = candidate->secure_subtype;
 			frame_msg.secure_encoding = candidate->secure_encoding;
-			frame_msg.numbered_r = candidate->numbered_r;
 			frame_msg.numbered_s = candidate->numbered_s;
 			/* Auto-assign numbered_msgnum from sequence counter when -1 */
 			if (candidate->numbered_msgnum >= 0) {
 				frame_msg.numbered_msgnum = candidate->numbered_msgnum;
 			} else {
 				frame_msg.numbered_msgnum = frame_msg.sequence_num;
-				frame_msg.numbered_r = 1;
 			}
 
 			len = flex_encode_frame_multi(&frame_msg, 1, &phase_params,
@@ -946,9 +1312,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 				  frame_msg.sequence_num,
 				  candidate->data_length);
 
-			/* Destroy the transmitted message */
-			flex_msg_destroy(candidate);
+			/* Post-transmit lifecycle: retain or destroy */
+			{
+				flex_post_transmit(flex, candidate, current_abs);
+			}
 		}
+		} /* end of phase_best selection/encoding block */
 
 		if (any_msg) {
 			/* Fill empty phases with proper idle pattern (Section 3.4.1) */
@@ -1028,9 +1397,34 @@ static int flex_get_next_frame_network(flex_t *flex)
 		frame_msg.charset = msg->charset;
 		frame_msg.is_group = msg->is_group;
 		frame_msg.is_temp_group = msg->is_temp_group;
-		frame_msg.sequence_num = (msg->total_fragments > 1)
-			? (int)msg->retrieval_num
-			: (int)(flex->msg_sequence++ & 0x3F);
+		/* R/N flag computation for retransmission */
+		{
+			int is_retransmission = (msg->assigned_n >= 0);
+			if (!is_retransmission) {
+				/* Initial transmission: assign fresh N, set R=1 */
+				if (msg->total_fragments > 1) {
+					msg->assigned_n = (int)msg->retrieval_num;
+				} else {
+					msg->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
+				}
+				frame_msg.sequence_num = msg->assigned_n;
+				frame_msg.alpha_r_flag = 1;
+				frame_msg.hex_r_flag = 1;
+				frame_msg.numbered_r = 1;
+				if (msg->retransmit_max > 0) {
+					LOGP(DFLEX, LOGL_INFO,
+					     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
+					     msg->capcode, flex_msg_type_name(msg->msg_type),
+					     msg->assigned_n, msg->retransmit_max);
+				}
+			} else {
+				/* Retransmission: reuse assigned N, set R=0 */
+				frame_msg.sequence_num = msg->assigned_n;
+				frame_msg.alpha_r_flag = 0;
+				frame_msg.hex_r_flag = 0;
+				frame_msg.numbered_r = 0;
+			}
+		}
 		frame_msg.source_id = msg->source_id[0] ? msg->source_id : NULL;
 		frame_msg.short_msg_idx = msg->short_msg_index;
 		frame_msg.blocking_length = msg->blocking_length;
@@ -1039,14 +1433,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 		frame_msg.total_fragments = msg->total_fragments;
 		frame_msg.secure_subtype = msg->secure_subtype;
 		frame_msg.secure_encoding = msg->secure_encoding;
-		frame_msg.numbered_r = msg->numbered_r;
 		frame_msg.numbered_s = msg->numbered_s;
 		/* Auto-assign numbered_msgnum from sequence counter when -1 */
 		if (msg->numbered_msgnum >= 0) {
 			frame_msg.numbered_msgnum = msg->numbered_msgnum;
 		} else {
 			frame_msg.numbered_msgnum = frame_msg.sequence_num;
-			frame_msg.numbered_r = 1;
 		}
 
 		/* Carry-on computation (Spec Section 3.7.1 / 4.2.1).
@@ -1069,12 +1461,16 @@ static int flex_get_next_frame_network(flex_t *flex)
 		flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
 					&msgs_packed, &error);
 
-		/* Destroy the transmitted message */
-		flex_msg_destroy(msg);
-
 		if (error || flex->frame_buffer_length == 0) {
+			/* Encoding failed — destroy message (error cleanup) */
+			flex_msg_destroy(msg);
 			LOGP_CHAN(DFLEX, LOGL_NOTICE, "Network mode: failed to encode frame (error=%d), sending idle.\n", error);
 			goto send_idle;
+		}
+
+		/* Post-transmit lifecycle: retain or destroy */
+		{
+			flex_post_transmit(flex, msg, current_abs);
 		}
 
 		flex->sched_last_cycle = ft.cycle;

@@ -75,6 +75,9 @@ static int num_transmissions = 1;	/* --num-transmissions: 1/2/3/4 */
 static int td_collapse = -1;		/* --td-collapse: -1=system, 5/6/7 */
 static int chan_setup_enabled = 0;	/* --chan-setup: enable BIW channel setup */
 int rx_kanji_enabled = 0;		/* --rx-kanji: enable Kanji/Shift-JIS decode */
+static int default_retransmit = 0;		/* --retransmit: 0-15, default 0 (no retransmission) */
+static int default_retransmit_interval = 128;	/* --retransmit-interval: 1-1920 frames, default 128 (~4 min) */
+static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (immediate) */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -102,6 +105,9 @@ int rx_kanji_enabled = 0;		/* --rx-kanji: enable Kanji/Shift-JIS decode */
 #define OPT_TD_COLLAPSE		3022
 #define OPT_CHAN_SETUP		3023
 #define OPT_RX_KANJI		3024
+#define OPT_RETRANSMIT		3025
+#define OPT_RETRANSMIT_INTERVAL	3026
+#define OPT_SEND_DELAY		3027
 
 void print_help(const char *arg0)
 {
@@ -202,6 +208,17 @@ void print_help(const char *arg0)
 	printf("    --rx-kanji\n");
 	printf("        Enable Kanji/Shift-JIS 16-bit character decode for RX alpha messages.\n");
 	printf("        Output tagged ALN:KNJ instead of ALN.\n");
+	printf("    --retransmit <0-15>\n");
+	printf("        Default retransmission count after initial TX (default 0 = none).\n");
+	printf("        Each retransmission re-sends the message with R=0 and same N.\n");
+	printf("        Only applies to message types with R/N flags (alpha, hex, secure,\n");
+	printf("        numbered numeric, numbered special). Requires --network.\n");
+	printf("    --retransmit-interval <1-1920>\n");
+	printf("        Default frames between retransmissions (default 128 = ~4 minutes).\n");
+	printf("        1 frame = 1.875 seconds. Range: 1.875s to 1 hour.\n");
+	printf("    --send-delay <0-1920>\n");
+	printf("        Default frames to defer initial TX (default 0 = immediate).\n");
+	printf("        Delays first transmission by N frames after enqueue.\n");
 	printf("\n");
 	printf("    FIFO protocol (write to %s):\n", MSG_SEND);
 	printf("        Format: capcode,type,options,message\n");
@@ -217,6 +234,9 @@ void print_help(const char *arg0)
 	printf("          sectag=0|1|2|3  (secure: pager type tag, 0=alpha 1=vendor 2=binary 3=rsvd, default=sectype)\n");
 	printf("          msgnum=0-63  (nnumeric/nspecial: sequence number for dedup, default auto)\n");
 	printf("          chan_setup=0|1  (enable/disable BIW channel setup emission)\n");
+	printf("          retransmit=0-15  (retransmissions after initial TX, overrides --retransmit)\n");
+	printf("          retransmit_interval=1-1920  (frames between retransmissions, overrides --retransmit-interval)\n");
+	printf("          send_delay=0-1920  (frames to defer initial TX, overrides --send-delay)\n");
 	printf("        Special: ers,0,,  — trigger ERS re-sync burst\n");
 	printf("        Special: status,0,,  — dump system config + temp group assignments\n");
 	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
@@ -293,6 +313,9 @@ static void add_options(void)
 	option_add(OPT_TD_COLLAPSE, "td-collapse", 1);
 	option_add(OPT_CHAN_SETUP, "chan-setup", 0);
 	option_add(OPT_RX_KANJI, "rx-kanji", 0);
+	option_add(OPT_RETRANSMIT, "retransmit", 1);
+	option_add(OPT_RETRANSMIT_INTERVAL, "retransmit-interval", 1);
+	option_add(OPT_SEND_DELAY, "send-delay", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -508,6 +531,27 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_RX_KANJI:
 		rx_kanji_enabled = 1;
 		break;
+	case OPT_RETRANSMIT:
+		default_retransmit = atoi(argv[argi]);
+		if (default_retransmit < 0 || default_retransmit > 15) {
+			fprintf(stderr, "Retransmit count must be 0-15, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_RETRANSMIT_INTERVAL:
+		default_retransmit_interval = atoi(argv[argi]);
+		if (default_retransmit_interval < 1 || default_retransmit_interval > 1920) {
+			fprintf(stderr, "Retransmit interval must be 1-1920 frames, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_SEND_DELAY:
+		default_send_delay = atoi(argv[argi]);
+		if (default_send_delay < 0 || default_send_delay > 1920) {
+			fprintf(stderr, "Send delay must be 0-1920 frames, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -526,7 +570,9 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			       int *mail_drop,
 			       int *secure_encoding, int *secure_subtype,
 			       int *numbered_msgnum,
-			       int *msg_chan_setup)
+			       int *msg_chan_setup,
+			       int *retransmit, int *retransmit_interval,
+			       int *send_delay)
 {
 	char buf[256];
 	char *p, *key, *val;
@@ -548,6 +594,9 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*secure_subtype = -1;	/* pager-side type tag; -1 = derive from encoding */
 	*numbered_msgnum = -1;	/* sequence number for dedup; -1 = auto from counter */
 	*msg_chan_setup = -1;	/* -1 = not set (use global default) */
+	*retransmit = default_retransmit;
+	*retransmit_interval = default_retransmit_interval;
+	*send_delay = default_send_delay;
 
 	if (opts_len <= 0)
 		return;
@@ -668,6 +717,30 @@ static void parse_fifo_options(const char *opts, int opts_len,
 		}
 		else if (!strcmp(key, "chan_setup"))
 			*msg_chan_setup = atoi(val) ? 1 : 0;
+		else if (!strcmp(key, "retransmit")) {
+			int rv = atoi(val);
+			if (rv < 0) rv = 0;
+			if (rv > 15) rv = 15;
+			*retransmit = rv;
+		}
+		else if (!strcmp(key, "retransmit_interval")) {
+			int ri = atoi(val);
+			if (ri < 1) {
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: retransmit_interval %d clamped to 1.\n", ri);
+				ri = 1;
+			}
+			if (ri > 1920) {
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: retransmit_interval %d clamped to 1920.\n", ri);
+				ri = 1920;
+			}
+			*retransmit_interval = ri;
+		}
+		else if (!strcmp(key, "send_delay")) {
+			int sd = atoi(val);
+			if (sd < 0) sd = 0;
+			if (sd > 1920) sd = 1920;
+			*send_delay = sd;
+		}
 	}
 
 	/* Derive sectag from sectype when operator didn't set it explicitly:
@@ -706,6 +779,9 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_secure_subtype;
 	int msg_numbered_msgnum;
 	int msg_chan_setup;
+	int msg_retransmit;
+	int msg_retransmit_interval;
+	int msg_send_delay;
 	char msg_source[64];
 	const char *opts_start;
 	int opts_len;
@@ -969,7 +1045,9 @@ static void fifo_process_line(const char *text, int text_length)
 			   &msg_mail_drop,
 			   &msg_secure_encoding, &msg_secure_subtype,
 			   &msg_numbered_msgnum,
-			   &msg_chan_setup);
+			   &msg_chan_setup,
+			   &msg_retransmit, &msg_retransmit_interval,
+			   &msg_send_delay);
 
 	/* Discard message if sectype was invalid */
 	if (msg_secure_encoding == -1)
@@ -1070,6 +1148,30 @@ static void fifo_process_line(const char *text, int text_length)
 				if (msg_source[0] != '\0') {
 					strncpy(msg->source_id, msg_source, sizeof(msg->source_id) - 1);
 					msg->source_id[sizeof(msg->source_id) - 1] = '\0';
+				}
+				/* Wire retransmission parameters */
+				msg->retransmit_max = msg_retransmit;
+				msg->retransmit_interval = msg_retransmit_interval;
+				msg->send_delay = msg_send_delay;
+				if (msg->send_delay > 0) {
+					flex_t *fl = (flex_t *)sender_head;
+					uint32_t current_abs = fl->sched_last_cycle * 128 + fl->sched_last_frame;
+					msg->next_send_frame = (current_abs + msg->send_delay) % 1920;
+					LOGP(DFLEX, LOGL_DEBUG,
+					     "TX_DEFERRED: capcode=%" PRIu64 " send_delay=%d target_frame=%u\n",
+					     capcode, msg_send_delay, msg->next_send_frame);
+				}
+				/* Check retransmit on non-R/N types */
+				if (msg->retransmit_max > 0 &&
+				    mtype != FLEX_MSG_TYPE_ALPHA &&
+				    mtype != FLEX_MSG_TYPE_HEX &&
+				    mtype != FLEX_MSG_TYPE_SECURE &&
+				    mtype != FLEX_MSG_TYPE_NUMBERED_NUM &&
+				    mtype != FLEX_MSG_TYPE_NUMBERED_SPECIAL) {
+					LOGP(DFLEX, LOGL_NOTICE,
+					     "FIFO: retransmit=%d ignored for type %s (no R/N flag support).\n",
+					     msg->retransmit_max, flex_msg_type_name(mtype));
+					msg->retransmit_max = 0;
 				}
 				LOGP(DFLEX, LOGL_INFO,
 				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d tempgroup=%d phase=%s len=%d\n",

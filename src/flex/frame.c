@@ -35,6 +35,8 @@ struct flex_msg_config {
 	int	fragment_index;	/* 0-based fragment index */
 	int	total_fragments;/* total count (0 = not fragmented) */
 	int	blocking_length;/* HEX/Binary B field: bits/char (1-15, 0=16) */
+	int	alpha_r_flag;	/* passed through from flex_frame_msg_t */
+	int	hex_r_flag;	/* passed through from flex_frame_msg_t */
 };
 
 /*
@@ -654,8 +656,15 @@ static uint32_t encode_alpha_message(uint32_t *frame_words, const char *msg,
 				      cfg->fragment_index == 0);
 		}
 		if (is_initial) {
-			if (sequence_num >= 0)
-				msg_word[0] |= FLEX_ALPHA_HDR_R_MASK;
+			if (sequence_num >= 0) {
+				if (config) {
+					const struct flex_msg_config *cfg = config;
+					if (cfg->alpha_r_flag)
+						msg_word[0] |= FLEX_ALPHA_HDR_R_MASK;
+				} else {
+					msg_word[0] |= FLEX_ALPHA_HDR_R_MASK;
+				}
+			}
 			if (config) {
 				const struct flex_msg_config *cfg = config;
 				if (cfg->mail_drop)
@@ -2145,8 +2154,11 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 		}
 		msg_words[1] = 0;
 		msg_words[1] |= ((uint32_t)b_field << FLEX_HEX_HDR2_B_SHIFT);
-		if (sequence_num >= 0)
-			msg_words[1] |= FLEX_HEX_HDR2_R_MASK;
+		if (sequence_num >= 0 && config) {
+			const struct flex_msg_config *cfg = config;
+			if (cfg->hex_r_flag)
+				msg_words[1] |= FLEX_HEX_HDR2_R_MASK;
+		}
 		if (config) {
 			const struct flex_msg_config *cfg = config;
 			if (cfg->mail_drop)
@@ -3458,6 +3470,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 					acfg.fragment_index = msgs[idx].fragment_index;
 					acfg.total_fragments = msgs[idx].total_fragments;
 					acfg.mail_drop = msgs[idx].mail_drop;
+					acfg.alpha_r_flag = msgs[idx].alpha_r_flag;
 					vw = encode_alpha_message(body_buf,
 						msgs[idx].message,
 						msg_start_for_vec, &body_fwc,
@@ -3480,6 +3493,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				hcfg.total_fragments = msgs[idx].total_fragments;
 				hcfg.blocking_length = msgs[idx].blocking_length;
 				hcfg.mail_drop = msgs[idx].mail_drop;
+				hcfg.hex_r_flag = msgs[idx].hex_r_flag;
 				vw = encode_hex_message(body_buf,
 					msgs[idx].message,
 					msg_start_for_vec, &body_fwc,
@@ -3520,6 +3534,8 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				scfg.total_fragments = msgs[idx].total_fragments;
 				scfg.mail_drop = msgs[idx].mail_drop;
 				scfg.blocking_length = msgs[idx].blocking_length;
+				scfg.alpha_r_flag = msgs[idx].alpha_r_flag;
+				scfg.hex_r_flag = msgs[idx].hex_r_flag;
 				vw = encode_secure_message(body_buf,
 					msgs[idx].message,
 					msg_start_for_vec, &body_fwc,

@@ -1999,10 +1999,16 @@ typedef struct flex_frame_msg {
 					 * Independent of wire encoding. */
 	int		secure_encoding;	/* wire encoding: 0=7-bit alpha, 1=raw binary */
 	int		numbered_r;		/* R flag for numbered numeric (default 1,
-					 * TODO: retransmission scheduler sets 0) */
+					 * retransmission scheduler sets 0) */
 	int		numbered_s;		/* S flag for numbered numeric: set from msg_type
 					 * (0 for nnumeric, 1 for nspecial) */
 	int		numbered_msgnum;	/* N field for numbered numeric, -1 = auto */
+
+	/* Dynamic R flags for retransmission scheduling.
+	 * R=1 on initial transmission, R=0 on retransmissions.
+	 * numbered_r (above) already serves numbered numeric messages. */
+	int		alpha_r_flag;		/* R flag for alpha messages (0 or 1, default 1) */
+	int		hex_r_flag;		/* R flag for hex/binary messages (0 or 1, default 1) */
 } flex_frame_msg_t;
 
 /* Frame encoding parameters */

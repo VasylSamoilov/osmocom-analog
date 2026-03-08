@@ -34,6 +34,7 @@
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
+#include "scheduler.h"
 
 #define MAX_DISPLAY	1.4	/* something above speech level, no emphasis */
 
@@ -490,7 +491,8 @@ again:
 			 * last level as a guard.  In real operation with
 			 * back-to-back frames, the next S1 provides this
 			 * signal naturally. */
-			if (!flex->msg_list &&
+			if (!flex->network_mode &&
+			    !flex->msg_list &&
 			    flex->scan_from >= flex->scan_to &&
 			    !flex->sender.loopback) {
 				int guard = (int)(flex->fsk_bitduration + 1.0);
@@ -1371,6 +1373,327 @@ static void reasm_expire(flex_t *flex)
 	}
 }
 
+/* ---- Message History operations (Req 17) ---- */
+
+/* Find existing entry matching primary key (capcode, N, vec_type, phase).
+ * Returns pointer to matching entry, or NULL if not found. */
+static flex_rx_msg_entry_t *msg_history_find(flex_t *flex,
+    uint64_t capcode, int msg_num, int vec_type, int rx_phase)
+{
+	int i;
+	for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
+		flex_rx_msg_entry_t *e = &flex->rx.msg_history[i];
+		if (e->active &&
+		    e->capcode == capcode &&
+		    e->msg_num == msg_num &&
+		    e->vec_type == vec_type &&
+		    e->rx_phase == rx_phase)
+			return e;
+	}
+	return NULL;
+}
+
+/* Validate that a found entry matches the incoming message's parameters.
+ * Returns 1 if all validation fields match, 0 if N collision detected. */
+static int msg_history_validate(const flex_rx_msg_entry_t *entry,
+    int word_count, int frag_count, int is_long, int blocking)
+{
+	return (entry->word_count == word_count &&
+		entry->frag_count == frag_count &&
+		entry->is_long == is_long &&
+		entry->blocking == blocking);
+}
+
+/* Store or replace entry. Evicts oldest by frame_abs when at capacity.
+ * If an entry with the same primary key exists, it is replaced.
+ * Returns pointer to the stored entry. */
+static flex_rx_msg_entry_t *msg_history_store(flex_t *flex,
+    uint64_t capcode, int msg_num, int vec_type, int rx_phase,
+    const uint32_t *words, const enum flex_word_status *word_status,
+    int word_count, int frag_count, int is_long, int blocking,
+    uint32_t frame_abs)
+{
+	int i;
+	flex_rx_msg_entry_t *target = NULL;
+
+	/* First, check if an entry with the same key already exists */
+	target = msg_history_find(flex, capcode, msg_num, vec_type, rx_phase);
+
+	if (!target) {
+		/* Find an inactive slot */
+		for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
+			if (!flex->rx.msg_history[i].active) {
+				target = &flex->rx.msg_history[i];
+				break;
+			}
+		}
+	}
+
+	if (!target) {
+		/* All slots full — evict oldest by frame_abs.
+		 * Use modular arithmetic: the "oldest" entry is the one
+		 * whose frame_abs is furthest in the past relative to frame_abs. */
+		uint32_t oldest_age = 0;
+		int oldest_idx = 0;
+		for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
+			uint32_t age = (frame_abs - flex->rx.msg_history[i].frame_abs + 1920) % 1920;
+			if (age > oldest_age) {
+				oldest_age = age;
+				oldest_idx = i;
+			}
+		}
+		target = &flex->rx.msg_history[oldest_idx];
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "RX_MSG_HIST: evicting oldest entry idx=%d (age=%u frames)\n",
+		     oldest_idx, oldest_age);
+	}
+
+	/* Populate entry */
+	memset(target, 0, sizeof(*target));
+	target->active = 1;
+	target->capcode = capcode;
+	target->msg_num = msg_num;
+	target->vec_type = vec_type;
+	target->rx_phase = rx_phase;
+	target->word_count = word_count;
+	target->frag_count = frag_count;
+	target->is_long = is_long;
+	target->blocking = blocking;
+	target->frame_abs = frame_abs;
+
+	/* Copy word data (up to FLEX_RX_MSG_MAX_WORDS) */
+	int copy_count = word_count;
+	if (copy_count > FLEX_RX_MSG_MAX_WORDS)
+		copy_count = FLEX_RX_MSG_MAX_WORDS;
+	if (words && word_status) {
+		memcpy(target->words, words, copy_count * sizeof(uint32_t));
+		memcpy(target->word_status, word_status, copy_count * sizeof(enum flex_word_status));
+	}
+
+	/* Check for uncorrectable words */
+	target->has_uncorrectable = 0;
+	for (i = 0; i < copy_count; i++) {
+		if (target->word_status[i] == FLEX_WORD_UNCORRECTABLE) {
+			target->has_uncorrectable = 1;
+			break;
+		}
+	}
+
+	return target;
+}
+
+/* Expire entries older than FLEX_RX_MSG_HISTORY_WINDOW frames.
+ * Uses modular arithmetic for 1920-frame wrap-around. */
+static void msg_history_expire(flex_t *flex, uint32_t current_frame_abs)
+{
+	int i;
+	for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
+		flex_rx_msg_entry_t *e = &flex->rx.msg_history[i];
+		if (!e->active)
+			continue;
+		uint32_t age = (current_frame_abs - e->frame_abs + 1920) % 1920;
+		if (age >= FLEX_RX_MSG_HISTORY_WINDOW) {
+			e->active = 0;
+		}
+	}
+}
+
+/* Combine subframe word-level results into a single best-of phase.
+ * For each word position, select the best status across all received subframes:
+ *   CLEAN > CORRECTED > UNCORRECTABLE
+ * For CORRECTED ties, prefer the subframe with fewer total UNCORRECTABLE words.
+ * Writes the combined result into 'combined' and resets the store. */
+static void flex_rx_subframe_combine(flex_t *flex,
+				     flex_rx_subframe_store_t *store,
+				     flex_phase_data_t *combined,
+				     char phase_name)
+{
+	int i, sf;
+
+	(void)flex;
+
+	/* For each word position, select the best across all received subframes */
+	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+		enum flex_word_status best_status = FLEX_WORD_UNCORRECTABLE;
+		uint32_t best_word = 0;
+		int best_sf = -1;
+		int best_sf_uncorrectable_count = FLEX_WORDS_PER_FRAME;
+
+		for (sf = 0; sf < store->num_expected; sf++) {
+			if (!store->subframes[sf].received)
+				continue;
+
+			enum flex_word_status s = store->subframes[sf].status[i];
+
+			if (s == FLEX_WORD_CLEAN) {
+				/* CLEAN always wins */
+				best_status = s;
+				best_word = store->subframes[sf].words[i];
+				best_sf = sf;
+				break;
+			}
+			if (s == FLEX_WORD_CORRECTED) {
+				if (best_status != FLEX_WORD_CORRECTED) {
+					/* First CORRECTED beats UNCORRECTABLE */
+					best_status = s;
+					best_word = store->subframes[sf].words[i];
+					best_sf = sf;
+					/* Count uncorrectable words in this subframe for tiebreak */
+					int uc = 0;
+					for (int k = 0; k < FLEX_WORDS_PER_FRAME; k++)
+						if (store->subframes[sf].status[k] == FLEX_WORD_UNCORRECTABLE)
+							uc++;
+					best_sf_uncorrectable_count = uc;
+				} else {
+					/* Tiebreak: prefer subframe with fewer total UNCORRECTABLE */
+					int uc = 0;
+					for (int k = 0; k < FLEX_WORDS_PER_FRAME; k++)
+						if (store->subframes[sf].status[k] == FLEX_WORD_UNCORRECTABLE)
+							uc++;
+					if (uc < best_sf_uncorrectable_count) {
+						best_word = store->subframes[sf].words[i];
+						best_sf = sf;
+						best_sf_uncorrectable_count = uc;
+					}
+				}
+			}
+			/* UNCORRECTABLE only used if nothing better found */
+			if (best_status == FLEX_WORD_UNCORRECTABLE && best_sf < 0) {
+				best_word = store->subframes[sf].words[i];
+				best_sf = sf;
+			}
+		}
+
+		combined->words[i] = best_word;
+		combined->status[i] = best_status;
+
+		/* Log individual word recovery */
+		if (best_sf > 0 && best_status != FLEX_WORD_UNCORRECTABLE) {
+			LOGP(DFLEX, LOGL_DEBUG,
+			     "SF_COMBINE: word[%d] recovered: status=%d from subframe %d\n",
+			     i, best_status, best_sf);
+		}
+	}
+
+	/* Log summary */
+	int recovered = 0, remaining_uc = 0;
+	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+		if (combined->status[i] == FLEX_WORD_UNCORRECTABLE)
+			remaining_uc++;
+		/* A word is "recovered" if it was UNCORRECTABLE in subframe 0
+		 * but is now CLEAN or CORRECTED in the combined result */
+		if (store->subframes[0].received &&
+		    store->subframes[0].status[i] == FLEX_WORD_UNCORRECTABLE &&
+		    combined->status[i] != FLEX_WORD_UNCORRECTABLE)
+			recovered++;
+	}
+	LOGP(DFLEX, LOGL_INFO,
+	     "SF_COMBINE: phase %c total=%d recovered=%d remaining_uc=%d\n",
+	     phase_name, FLEX_WORDS_PER_FRAME, recovered, remaining_uc);
+
+	/* Reset store */
+	memset(store, 0, sizeof(*store));
+}
+
+/* Check whether an incoming message is a retransmission of a previously
+ * received message and decide how to handle it.
+ *
+ * Returns:
+ *   0  — output message normally (new message, N collision, or first reception)
+ *   1  — suppress (duplicate of complete message, or no improvement)
+ *  -1  — re-decode with recovered words from entry->words[] */
+static int flex_rx_check_retransmission(flex_t *flex,
+    uint64_t capcode, int r_flag, int msg_num, int vec_type, int rx_phase,
+    const uint32_t *words, const enum flex_word_status *status,
+    int word_count, int frag_count, int is_long, int blocking,
+    uint32_t frame_abs)
+{
+	/* R=1: always new message */
+	if (r_flag == 1) {
+		msg_history_store(flex, capcode, msg_num, vec_type, rx_phase,
+				  words, status, word_count, frag_count,
+				  is_long, blocking, frame_abs);
+		return 0; /* not a retransmission, output normally */
+	}
+
+	/* R=0: check history by primary key */
+	flex_rx_msg_entry_t *entry = msg_history_find(flex, capcode, msg_num,
+						      vec_type, rx_phase);
+
+	if (!entry) {
+		/* No match — first reception (original missed). Store and output. */
+		msg_history_store(flex, capcode, msg_num, vec_type, rx_phase,
+				  words, status, word_count, frag_count,
+				  is_long, blocking, frame_abs);
+		return 0;
+	}
+
+	/* Key matched — validate that this is truly the same message
+	 * (not an N collision where the same N was reused for a different message) */
+	if (!msg_history_validate(entry, word_count, frag_count, is_long, blocking)) {
+		/* Validation failed: N collision. Treat as new message. */
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "RX_N_COLLISION: capcode=%" PRIu64 " N=%d vec_type=%d phase=%d "
+		     "word_count %d!=%d or frag_count %d!=%d or is_long %d!=%d "
+		     "or blocking %d!=%d\n",
+		     capcode, msg_num, vec_type, rx_phase,
+		     word_count, entry->word_count,
+		     frag_count, entry->frag_count,
+		     is_long, entry->is_long,
+		     blocking, entry->blocking);
+		msg_history_store(flex, capcode, msg_num, vec_type, rx_phase,
+				  words, status, word_count, frag_count,
+				  is_long, blocking, frame_abs);
+		return 0; /* output as new message */
+	}
+
+	if (!entry->has_uncorrectable) {
+		/* Original was complete — suppress duplicate */
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "RX_DUP_SUPPRESS: capcode=%" PRIu64 " N=%d vec_type=%d "
+		     "phase=%d frame=%u\n",
+		     capcode, msg_num, vec_type, rx_phase, frame_abs);
+		return 1; /* suppress */
+	}
+
+	/* Original had UNCORRECTABLE words — attempt recovery */
+	int recovered = 0;
+	int i;
+	for (i = 0; i < word_count && i < entry->word_count; i++) {
+		if (entry->word_status[i] == FLEX_WORD_UNCORRECTABLE &&
+		    (status[i] == FLEX_WORD_CLEAN || status[i] == FLEX_WORD_CORRECTED)) {
+			entry->words[i] = words[i];
+			entry->word_status[i] = status[i];
+			recovered++;
+		}
+	}
+
+	if (recovered > 0) {
+		/* Recheck if message is now complete */
+		entry->has_uncorrectable = 0;
+		for (i = 0; i < entry->word_count; i++) {
+			if (entry->word_status[i] == FLEX_WORD_UNCORRECTABLE) {
+				entry->has_uncorrectable = 1;
+				break;
+			}
+		}
+		entry->frame_abs = frame_abs;
+
+		LOGP(DFLEX, LOGL_INFO,
+		     "RX_RECOVERED: capcode=%" PRIu64 " N=%d vec_type=%d "
+		     "phase=%d recovered=%d\n",
+		     capcode, msg_num, vec_type, rx_phase, recovered);
+		return -1; /* re-decode with recovered words */
+	}
+
+	/* Retransmission but no improvement — suppress */
+	LOGP(DFLEX, LOGL_DEBUG,
+	     "RX_DUP_SUPPRESS: capcode=%" PRIu64 " N=%d vec_type=%d "
+	     "phase=%d frame=%u (no improvement)\n",
+	     capcode, msg_num, vec_type, rx_phase, frame_abs);
+	return 1;
+}
+
 /* Decode one phase of a received frame.
  * De-interleave blocks, BCH decode, parse BIW/addresses/vectors/messages.
  * phaseptr points to 88 words of raw interleaved data. */
@@ -1379,8 +1702,55 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 	int i;
 	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
 
+	/* Check for subframe store timeouts across all phases.
+	 * If a store has been waiting too long for remaining subframes,
+	 * combine whatever we have and release the store. */
+	{
+		uint32_t current_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+		int p;
+		for (p = 0; p < FLEX_MAX_PHASES; p++) {
+			flex_rx_subframe_store_t *store = &flex->rx.subframe_store[p];
+			if (!store->active || store->num_received == 0)
+				continue;
+
+			/* Check timeout using modular arithmetic (same as frame_is_eligible).
+			 * If current_abs is at or past timeout_frame, the store has timed out. */
+			int32_t diff = (int32_t)current_abs - (int32_t)store->timeout_frame;
+			int timed_out = (diff >= 0) || (diff < -960);
+
+			if (timed_out) {
+				char pname = 'A' + p;
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Phase %c subframe store timeout (%d/%d received), combining partial.\n",
+					  pname, store->num_received, store->num_expected);
+
+				/* Combine whatever subframes we have */
+				flex_phase_data_t combined;
+				memset(&combined, 0, sizeof(combined));
+				/* Copy RX context from the phase that owns this store */
+				combined.rx_phase = p;
+				combined.rx_cycle = store->base_cycle;
+				combined.rx_frame = store->base_frame;
+
+				flex_rx_subframe_combine(flex, store, &combined, pname);
+
+				/* Note: The combined result from a timeout is not directly usable
+				 * for message parsing here since we're at the start of a new frame.
+				 * The combine call resets the store (via memset), which is the
+				 * primary purpose — releasing stale storage. The partial combine
+				 * logs recovery stats for diagnostic purposes. */
+			}
+		}
+	}
+
 	/* Expire stale reassembly slots at the start of each phase decode */
 	reasm_expire(flex);
+
+	/* Expire stale message history entries */
+	{
+		uint32_t current_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+		msg_history_expire(flex, current_abs);
+	}
 
 	/* Store reception context in the phase struct */
 	ph->rx_phase = phase_name - 'A';	/* 'A'→0, 'B'→1, 'C'→2, 'D'→3 */
@@ -1446,6 +1816,83 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					  "(raw=0x%08X).\n",
 					  phase_name, i, raw_words[i]);
 			}
+		}
+	}
+
+	/* --- Subframe store logic (Req 15) --- */
+	if (flex->rx.fiw_num_transmissions > 1) {
+		int phase_idx = ph->rx_phase;
+		flex_rx_subframe_store_t *store = &flex->rx.subframe_store[phase_idx];
+		uint32_t repeat_interval = flex_scheduler_repeat_interval(
+			flex->collapse, flex->rx.fiw_td_collapse);
+		int sf_idx = flex_scheduler_subframe_index(
+			flex->rx.fiw_frame, flex->rx.fiw_num_transmissions,
+			flex->collapse, flex->rx.fiw_td_collapse);
+		uint32_t base_frame = flex->rx.fiw_frame % repeat_interval;
+		uint32_t abs_frame = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+
+		/* Check if this is a new content group or continuation */
+		if (!store->active) {
+			/* First subframe for this content */
+			memset(store, 0, sizeof(*store));
+			store->active = 1;
+			store->num_expected = flex->rx.fiw_num_transmissions;
+			store->base_frame = base_frame;
+			store->base_cycle = flex->rx.fiw_cycle;
+			store->timeout_frame = (abs_frame + 2 * repeat_interval) % 1920;
+		} else if (store->base_frame != base_frame || store->base_cycle != flex->rx.fiw_cycle) {
+			/* Different content — reset store */
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: Phase %c subframe store reset (new content base_frame=%u cycle=%u).\n",
+				  phase_name, base_frame, flex->rx.fiw_cycle);
+			memset(store, 0, sizeof(*store));
+			store->active = 1;
+			store->num_expected = flex->rx.fiw_num_transmissions;
+			store->base_frame = base_frame;
+			store->base_cycle = flex->rx.fiw_cycle;
+			store->timeout_frame = (abs_frame + 2 * repeat_interval) % 1920;
+		}
+
+		/* Store this subframe's data */
+		if (sf_idx >= 0 && sf_idx < FLEX_RX_MAX_SUBFRAMES && !store->subframes[sf_idx].received) {
+			memcpy(store->subframes[sf_idx].words, ph->words, sizeof(ph->words));
+			memcpy(store->subframes[sf_idx].status, ph->status, sizeof(ph->status));
+			store->subframes[sf_idx].received = 1;
+			store->num_received++;
+
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: Phase %c stored subframe %d/%d (base_frame=%u cycle=%u).\n",
+				  phase_name, sf_idx, store->num_expected, base_frame, flex->rx.fiw_cycle);
+		}
+
+		/* Check if all subframes received */
+		if (store->num_received >= store->num_expected) {
+			LOGP_CHAN(DDSP, LOGL_INFO,
+				  "RX: Phase %c all %d subframes received, ready to combine.\n",
+				  phase_name, store->num_expected);
+			/* Combine subframes and replace phase data with best-of result */
+			flex_phase_data_t combined;
+			memset(&combined, 0, sizeof(combined));
+			/* Copy RX context from current phase */
+			combined.rx_phase = ph->rx_phase;
+			combined.rx_cycle = ph->rx_cycle;
+			combined.rx_frame = ph->rx_frame;
+			combined.rx_baud = ph->rx_baud;
+			combined.rx_levels = ph->rx_levels;
+			combined.rx_polarity = ph->rx_polarity;
+
+			flex_rx_subframe_combine(flex, store, &combined, phase_name);
+
+			/* Replace phase data with combined result */
+			memcpy(ph->words, combined.words, sizeof(ph->words));
+			memcpy(ph->status, combined.status, sizeof(ph->status));
+			/* Fall through to message parsing with improved data */
+		} else {
+			/* Not all subframes yet — skip message parsing */
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: Phase %c waiting for subframes (%d/%d received).\n",
+				  phase_name, store->num_received, store->num_expected);
+			return;
 		}
 	}
 
@@ -2366,6 +2813,45 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					}
 				}
 
+				/* Retransmission check for alpha messages.
+				 * Only applies to initial fragments (F=11) which
+				 * carry R and N flags.  Continuation/final fragments
+				 * have U₀/V₀ in bits 19-20 instead of R/M.
+				 * Secure (V=000) does not carry R/N — skip. */
+				int alpha_recovered = 0;
+				if (hdr_f == 3 && vec_type == FLEX_VECTOR_TYPE_ALPHA) {
+					int rx_phase_idx = phase_name - 'A';
+					uint32_t frame_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+					int alpha_wc = mw2 - mw1 + 1;
+					int alpha_frag_count = (hdr_c == 0) ? 1 : 0; /* 1=complete/final, 0=continued */
+					int retx = flex_rx_check_retransmission(flex,
+						capcode, hdr_r, hdr_n, vec_type, rx_phase_idx,
+						&ph->words[mw1], &ph->status[mw1],
+						alpha_wc, alpha_frag_count, is_long, 0,
+						frame_abs);
+					if (retx == 1) {
+						/* Suppress duplicate */
+						continue;
+					}
+					if (retx == -1) {
+						/* Re-decode with recovered words from history entry.
+						 * Copy recovered words back into phase data so the
+						 * normal decode path uses the improved data. */
+						flex_rx_msg_entry_t *entry = msg_history_find(flex,
+							capcode, hdr_n, vec_type, rx_phase_idx);
+						if (entry) {
+							int copy_n = alpha_wc;
+							if (copy_n > entry->word_count)
+								copy_n = entry->word_count;
+							memcpy(&ph->words[mw1], entry->words,
+							       copy_n * sizeof(uint32_t));
+							memcpy(&ph->status[mw1], entry->word_status,
+							       copy_n * sizeof(enum flex_word_status));
+						}
+						alpha_recovered = 1;
+					}
+				}
+
 				/* Extract 7-bit alphanumeric characters and
 				 * verify the message signature.
 				 *
@@ -2638,7 +3124,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s [%09" PRIu64 "] %c%c%c %s \"%s\"\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c%c %s \"%s\"\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -2650,6 +3136,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  "frag_end",
 						  alpha_sig_status,
 						  alpha_k_status,
+						  alpha_recovered ? ",RX_RECOVERED" : "",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  grp_flag,
@@ -2816,6 +3303,40 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						(vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) ?
 							(num_s ? "NSNUM" : "NNUM") : "NUM";
 
+					/* Retransmission check for numbered numeric (V=111).
+					 * Standard numeric (V=011) and special numeric (V=100)
+					 * do not carry R/N flags — pass through unchanged. */
+					int num_recovered = 0;
+					if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM && num_n >= 0) {
+						int rx_phase_idx = phase_name - 'A';
+						uint32_t frame_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+						int num_wc = mw2 - mw1 + 1;
+						int retx = flex_rx_check_retransmission(flex,
+							capcode, num_r, num_n, vec_type, rx_phase_idx,
+							&ph->words[mw1], &ph->status[mw1],
+							num_wc, 1, is_long, 0,
+							frame_abs);
+						if (retx == 1) {
+							/* Suppress duplicate */
+							continue;
+						}
+						if (retx == -1) {
+							/* Re-decode with recovered words */
+							flex_rx_msg_entry_t *entry = msg_history_find(flex,
+								capcode, num_n, vec_type, rx_phase_idx);
+							if (entry) {
+								int copy_n = num_wc;
+								if (copy_n > entry->word_count)
+									copy_n = entry->word_count;
+								memcpy(&ph->words[mw1], entry->words,
+								       copy_n * sizeof(uint32_t));
+								memcpy(&ph->status[mw1], entry->word_status,
+								       copy_n * sizeof(enum flex_word_status));
+							}
+							num_recovered = 1;
+						}
+					}
+
 					bit_count = 0;
 					uint8_t nibble_acc = 0;
 
@@ -2938,7 +3459,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						/* Output with subtype tag and optional sequencing fields */
 						if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM && num_n >= 0) {
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c%c %s N=%d,R=%d,S=%d \"%s\"\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s [%09" PRIu64 "] %c%c%c %s N=%d,R=%d,S=%d \"%s\"\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -2946,6 +3467,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  flex->rx.sync_levels,
 								  flex->rx.polarity ? "neg" : "pos",
 								  num_k_status,
+								  num_recovered ? ",RX_RECOVERED" : "",
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
 								  grp_flag,
@@ -3042,6 +3564,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					int hi = 0, w;
 					int hex_c = 0, hex_f = 0, hex_n = 0;
 					int hex_is_initial = 0;
+					int hex_r = 0; /* R flag from hdr2 (retransmission) */
 					int hex_blocking = 0; /* B field from hdr2 (0=16 bits/char) */
 					uint32_t rx_hex_sig = 0; /* S field from hdr2 (8-bit signature) */
 					int hex_has_sig = 0; /* 1 if we extracted S from hdr2 */
@@ -3083,13 +3606,15 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								    (ph->status[mw1] == FLEX_WORD_CLEAN ||
 								     ph->status[mw1] == FLEX_WORD_CORRECTED)) {
 									uint32_t hdr2 = ph->words[mw1];
+									hex_r = (hdr2 >> FLEX_HEX_HDR2_R_SHIFT) & 1;
 									hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
 									rx_hex_sig = (hdr2 >> FLEX_HEX_HDR2_S_SHIFT) & 0xFF;
 									hex_has_sig = 1;
 									LOGP_CHAN(DDSP, LOGL_DEBUG,
 										  "RX: Phase %c hex hdr2[%d]=0x%05X: "
-										  "B=%d (%d bits/char) S=0x%02X\n",
+										  "R=%d B=%d (%d bits/char) S=0x%02X\n",
 										  phase_name, mw1, hdr2,
+										  hex_r,
 										  hex_blocking,
 										  hex_blocking ? hex_blocking : 16,
 										  rx_hex_sig);
@@ -3105,13 +3630,15 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								    (ph->status[mw1 + 1] == FLEX_WORD_CLEAN ||
 								     ph->status[mw1 + 1] == FLEX_WORD_CORRECTED)) {
 									uint32_t hdr2 = ph->words[mw1 + 1];
+									hex_r = (hdr2 >> FLEX_HEX_HDR2_R_SHIFT) & 1;
 									hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
 									rx_hex_sig = (hdr2 >> FLEX_HEX_HDR2_S_SHIFT) & 0xFF;
 									hex_has_sig = 1;
 									LOGP_CHAN(DDSP, LOGL_DEBUG,
 										  "RX: Phase %c hex hdr2[%d]=0x%05X: "
-										  "B=%d (%d bits/char) S=0x%02X\n",
+										  "R=%d B=%d (%d bits/char) S=0x%02X\n",
 										  phase_name, mw1 + 1, hdr2,
+										  hex_r,
 										  hex_blocking,
 										  hex_blocking ? hex_blocking : 16,
 										  rx_hex_sig);
@@ -3131,6 +3658,41 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  (hex_frag_flag == 'K') ? "complete" :
 							  (hex_frag_flag == 'F') ? "continuation" :
 							  "final");
+					}
+
+					/* Retransmission check for hex/binary messages.
+					 * Only applies to initial fragments (F=11) which
+					 * carry R in header word 2. */
+					int hex_recovered = 0;
+					if (hex_is_initial) {
+						int rx_phase_idx = phase_name - 'A';
+						uint32_t frame_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+						int hex_wc = mw2 - mw1 + 1;
+						int hex_frag_count = (hex_c == 0) ? 1 : 0;
+						int retx = flex_rx_check_retransmission(flex,
+							capcode, hex_r, hex_n, vec_type, rx_phase_idx,
+							&ph->words[mw1], &ph->status[mw1],
+							hex_wc, hex_frag_count, is_long, hex_blocking,
+							frame_abs);
+						if (retx == 1) {
+							/* Suppress duplicate */
+							continue;
+						}
+						if (retx == -1) {
+							/* Re-decode with recovered words */
+							flex_rx_msg_entry_t *entry = msg_history_find(flex,
+								capcode, hex_n, vec_type, rx_phase_idx);
+							if (entry) {
+								int copy_n = hex_wc;
+								if (copy_n > entry->word_count)
+									copy_n = entry->word_count;
+								memcpy(&ph->words[mw1], entry->words,
+								       copy_n * sizeof(uint32_t));
+								memcpy(&ph->status[mw1], entry->word_status,
+								       copy_n * sizeof(enum flex_word_status));
+							}
+							hex_recovered = 1;
+						}
 					}
 
 					/* Unpack nibbles from data words to flat hex string.
@@ -3391,7 +3953,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d%s [%09" PRIu64 "] %c%c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d%s%s [%09" PRIu64 "] %c%c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3403,6 +3965,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
 						  hex_blocking,
 						  hex_sig_status,
+						  hex_recovered ? ",RX_RECOVERED" : "",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  grp_flag,
