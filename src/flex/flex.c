@@ -1358,6 +1358,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.collapse = flex->collapse;
 	params.biw_time = flex->biw_time_enabled;
 	params.chan_setup_enabled = flex->chan_setup_enabled;
+	params.hack_nonstandard_decoders = flex->hack_nonstandard_decoders;
 	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
 
 	/* Multiple transmission params (Spec Section 3.4.2) */
@@ -2286,6 +2287,7 @@ int flex_get_next_frame(flex_t *flex)
 			params.modulation_type = msg->modulation_type;
 			params.biw_time = flex->biw_time_enabled;
 			params.chan_setup_enabled = flex->chan_setup_enabled;
+			params.hack_nonstandard_decoders = flex->hack_nonstandard_decoders;
 			params.collapse = flex->collapse;
 			if (flex->ssid || flex->nid) {
 				params.local_id = flex->ssid;

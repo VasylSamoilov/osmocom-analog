@@ -2081,6 +2081,10 @@ typedef struct flex_frame_params {
 
 	/* BIW Channel Setup (A-type 0x06) */
 	int		chan_setup_enabled;	/* 1 = emit channel setup BIW, default 0 */
+
+	/* Non-standard decoder compatibility (--hack-for-non-standard-decoders) */
+	int		hack_nonstandard_decoders; /* 1 = flip bit 0 of all-zeros/all-ones
+						   * codewords at block boundaries */
 } flex_frame_params_t;
 
 /* ===== Phase Multiplexing ===== */
@@ -2181,6 +2185,7 @@ uint32_t flex_encode_oper_msg_address(uint32_t subtype_lsb);
 /* Individual encoding functions (exposed for testing) */
 uint32_t flex_encode_word(uint32_t dw);
 uint32_t flex_word_checksum(uint32_t dw);
+int flex_verify_word_checksum(uint32_t dw);
 uint32_t reverse_bits32(uint32_t v);
 void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
 

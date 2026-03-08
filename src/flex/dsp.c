@@ -2215,6 +2215,40 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			 * Priority addresses occupy addr_idx [aoffset..aoffset+prio-1]. */
 			int prio_end = aoffset + prio; /* first non-priority addr index */
 
+			/* Pre-scan: determine where real vectors end and
+			 * tone-only addresses begin (§3.8.1(6)).
+			 *
+			 * Tone-only addresses sit at the end of AF with no
+			 * corresponding vector.  The vector field starts at
+			 * voffset; we scan forward to find the last valid
+			 * vector.  A vector word is valid when it is BCH-clean
+			 * AND passes the §3.5.1 4-bit checksum.
+			 *
+			 * Tone-only boundary: the first vector slot where
+			 * this word AND all subsequent BCH-clean words fail
+			 * the checksum.  n_valid_vec_words is the count of
+			 * vector word slots before that boundary. */
+			int n_valid_vec_words;
+			{
+				/* Upper bound: vector words can't exceed
+				 * address words (1:1 for short, 2:2 for
+				 * long individual addresses). */
+				int max_vec = voffset - aoffset;
+				int last_valid = -1; /* last slot with passing checksum */
+				int vi;
+				if (max_vec > FLEX_WORDS_PER_FRAME - voffset)
+					max_vec = FLEX_WORDS_PER_FRAME - voffset;
+				for (vi = 0; vi < max_vec; vi++) {
+					int wi = voffset + vi;
+					if (ph->status[wi] == FLEX_WORD_UNCORRECTABLE ||
+					    ph->status[wi] == FLEX_WORD_NOT_RECEIVED)
+						continue; /* can't tell, skip */
+					if (flex_verify_word_checksum(ph->words[wi]))
+						last_valid = vi;
+				}
+				n_valid_vec_words = last_valid + 1;
+			}
+
 		for (; addr_idx < voffset; addr_idx++) {
 			int j = voffset + vec_count; /* vector index */
 			uint64_t capcode;
@@ -2263,24 +2297,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					 * single word, decode base as short-style */
 					capcode = flex_decode_short_address(aw_base);
 					is_long = 0;
-
-					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) → cap=%" PRIu64 ".\n",
-						  phase_name, addr_idx,
-						  flex_addr_type_name(aw_type),
-						  flex_addr_type_flag(aw_type, 0),
-						  grp_flag,
-						  aw_base, aw_raw, capcode);
-
-					if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
-					    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
-						LOGP_CHAN(DDSP, LOGL_DEBUG,
-							  "RX: Phase %c vec[%d] uncorrectable.\n",
-							  phase_name, j);
-						vec_count++;
-						continue;
-					}
-					vec_count++;
 				} else {
 					/* Individual long address: 2 words */
 					if (addr_idx + 1 >= voffset) {
@@ -2309,89 +2325,110 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						vec_count += 2;
 						continue;
 					}
-
-					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c long addr[%d,%d] %s[%c] aw=0x%05X(%s),0x%05X(%s) → cap=%" PRIu64 ".\n",
-						  phase_name, addr_idx - 1, addr_idx,
-						  flex_long_set_name(aw_base, aw2),
-						  flex_addr_type_flag(aw_type, 1),
-						  aw_base, flex_addr_type_name(aw_type),
-						  aw2, flex_addr_type_name(flex_classify_addr_word(aw2)),
-						  capcode);
-
-					if (j + 1 >= FLEX_WORDS_PER_FRAME) break;
-					if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
-					    ph->status[j] == FLEX_WORD_NOT_RECEIVED ||
-					    ph->status[j + 1] == FLEX_WORD_UNCORRECTABLE ||
-					    ph->status[j + 1] == FLEX_WORD_NOT_RECEIVED) {
-						LOGP_CHAN(DDSP, LOGL_DEBUG,
-							  "RX: Phase %c long vec[%d,%d] uncorrectable.\n",
-							  phase_name, j, j + 1);
-						vec_count += 2;
-						continue;
-					}
-					vec_count += 2;
 				}
 			} else {
 				/* Single-word address.
 				 * For group addresses, decode from the base word
 				 * (flags already stripped). */
 				capcode = flex_decode_short_address(aw_base);
+			}
 
-				/* Enhanced logging for special address types */
-				if (flex_addr_is_special(aw_base)) {
-					if (aw_type == FLEX_ADDR_OPER_MSG) {
-						LOGP_CHAN(DDSP, LOGL_INFO,
-							  "RX: Phase %c addr[%d] %s/%s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
-							  phase_name, addr_idx,
-							  flex_addr_type_name(aw_type),
-							  flex_oper_msg_subtype_name(aw_base),
-							  flex_addr_type_flag(aw_type, 0),
-							  aw_base, capcode);
-					} else if (aw_type == FLEX_ADDR_TEMPORARY) {
-						LOGP_CHAN(DDSP, LOGL_INFO,
-							  "RX: Phase %c addr[%d] %s[%c] slot=%u aw=0x%05X → cap=%" PRIu64 " — %s.\n",
-							  phase_name, addr_idx,
-							  flex_addr_type_name(aw_type),
-							  flex_addr_type_flag(aw_type, 0),
-							  flex_temp_addr_slot(aw_base),
-							  aw_base, capcode,
-							  flex_special_addr_detail(aw_base));
-					} else {
-						LOGP_CHAN(DDSP, LOGL_INFO,
-							  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 " — %s.\n",
-							  phase_name, addr_idx,
-							  flex_addr_type_name(aw_type),
-							  flex_addr_type_flag(aw_type, 0),
-							  aw_base, capcode,
-							  flex_special_addr_detail(aw_base));
-					}
-				} else if (addr_is_group) {
-					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) → cap=%" PRIu64 ".\n",
+			/* Address logging */
+			if (is_long) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Phase %c long addr[%d,%d] %s[%c] aw=0x%05X(%s),0x%05X(%s) → cap=%" PRIu64 ".\n",
+					  phase_name, addr_idx - 1, addr_idx,
+					  flex_long_set_name(aw_base, ph->words[addr_idx]),
+					  flex_addr_type_flag(aw_type, 1),
+					  aw_base, flex_addr_type_name(aw_type),
+					  ph->words[addr_idx],
+					  flex_addr_type_name(flex_classify_addr_word(ph->words[addr_idx])),
+					  capcode);
+			} else if (flex_addr_is_special(aw_base)) {
+				if (aw_type == FLEX_ADDR_OPER_MSG) {
+					LOGP_CHAN(DDSP, LOGL_INFO,
+						  "RX: Phase %c addr[%d] %s/%s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
 						  phase_name, addr_idx,
 						  flex_addr_type_name(aw_type),
-						  flex_addr_type_flag(aw_type, 0),
-						  grp_flag,
-						  aw_base, aw_raw, capcode);
-				} else {
-					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
-						  phase_name, addr_idx,
-						  flex_addr_type_name(aw_type),
+						  flex_oper_msg_subtype_name(aw_base),
 						  flex_addr_type_flag(aw_type, 0),
 						  aw_base, capcode);
+				} else if (aw_type == FLEX_ADDR_TEMPORARY) {
+					LOGP_CHAN(DDSP, LOGL_INFO,
+						  "RX: Phase %c addr[%d] %s[%c] slot=%u aw=0x%05X → cap=%" PRIu64 " — %s.\n",
+						  phase_name, addr_idx,
+						  flex_addr_type_name(aw_type),
+						  flex_addr_type_flag(aw_type, 0),
+						  flex_temp_addr_slot(aw_base),
+						  aw_base, capcode,
+						  flex_special_addr_detail(aw_base));
+				} else {
+					LOGP_CHAN(DDSP, LOGL_INFO,
+						  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 " — %s.\n",
+						  phase_name, addr_idx,
+						  flex_addr_type_name(aw_type),
+						  flex_addr_type_flag(aw_type, 0),
+						  aw_base, capcode,
+						  flex_special_addr_detail(aw_base));
 				}
+			} else if (addr_is_group) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) → cap=%" PRIu64 ".\n",
+					  phase_name, addr_idx,
+					  flex_addr_type_name(aw_type),
+					  flex_addr_type_flag(aw_type, 0),
+					  grp_flag,
+					  aw_base, aw_raw, capcode);
+			} else {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
+					  phase_name, addr_idx,
+					  flex_addr_type_name(aw_type),
+					  flex_addr_type_flag(aw_type, 0),
+					  aw_base, capcode);
+			}
 
-				if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
-				    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
-					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c vec[%d] uncorrectable.\n",
-						  phase_name, j);
-					vec_count++;
-					continue;
-				}
-				vec_count++;
+			/* Tone-only address detection (§3.8.1(6)).
+			 *
+			 * Tone-only addresses sit at the end of AF with no
+			 * vector.  The pre-scan counted n_valid_vec_words:
+			 * consecutive BCH-clean vector slots from voffset
+			 * with passing §3.5.1 checksums.  Once vec_count
+			 * reaches that limit, all remaining addresses are
+			 * tone-only — no vector access, no vec_count
+			 * increment. */
+			if (vec_count >= n_valid_vec_words) {
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c TON\n",
+					  bitrate,
+					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+					  phase_name,
+					  flex->rx.sync_baud,
+					  flex->rx.sync_levels,
+					  flex->rx.polarity ? "neg" : "pos",
+					  capcode,
+					  flex_addr_type_flag(aw_type, is_long),
+					  grp_flag,
+					  prio_flag);
+				continue;
+			}
+			vec_count += is_long ? 2 : 1;
+
+			/* Check vector word BCH status */
+			if (ph->status[j] == FLEX_WORD_UNCORRECTABLE ||
+			    ph->status[j] == FLEX_WORD_NOT_RECEIVED) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Phase %c vec[%d] uncorrectable.\n",
+					  phase_name, j);
+				continue;
+			}
+			if (is_long && (j + 1 >= FLEX_WORDS_PER_FRAME ||
+			    ph->status[j + 1] == FLEX_WORD_UNCORRECTABLE ||
+			    ph->status[j + 1] == FLEX_WORD_NOT_RECEIVED)) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Phase %c long vec[%d,%d] uncorrectable.\n",
+					  phase_name, j, j + 1);
+				continue;
 			}
 
 			/* Vector decode */
@@ -3722,83 +3759,124 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						}
 					}
 
-					/* Unpack nibbles from data words to flat hex string.
-					 * Each 21-bit word holds 5 × 4-bit nibbles (bits 0-19).
-					 * Output format: continuous uppercase hex chars like
-					 * "DEADBEEF01020304" (no spaces).
+					/* Unpack nibbles from data words as a continuous
+					 * bit stream across all 21 bits per word.
+					 * Per standard Fig 3.10.1.2-1, data fills all
+					 * 21 bits with nibble boundaries crossing word
+					 * boundaries freely.
 					 *
 					 * Termination detection (Spec §3.10.1.2):
-					 * The last data word's unused bits are filled with the
-					 * inverse of the last valid data bit.  We detect this
-					 * fill pattern in the last word to find the exact data
-					 * boundary and strip padding nibbles.
-					 *
-					 * For non-last fragments (C=1), the spec says data must
-					 * end at character boundaries and continue from bit 1
-					 * of the next fragment's 2nd word — so no partial-word
-					 * termination fill is expected (all 21 bits are data). */
+					 * After the last data nibble, remaining bits are
+					 * filled with the inverse of the last data bit.
+					 * We detect this by scanning backwards from the
+					 * end of the last word. */
 					{
+						int bit_count = 0;
+						uint8_t nibble_acc = 0;
 						int last_data_word = -1;
+
+						/* Debug dump raw data words */
+						{
+							char dbg[512];
+							int dpos = 0;
+							dpos += snprintf(dbg + dpos, sizeof(dbg) - dpos,
+								"RX: HEX cap=%" PRIu64 " mw1=%d mw2=%d data_start=%d hdr[%d]=0x%05X:",
+								capcode, mw1, mw2, data_start, mw1, ph->words[mw1] & 0x1FFFFF);
+							for (w = data_start; w <= mw2 && w < FLEX_WORDS_PER_FRAME && dpos < (int)sizeof(dbg) - 15; w++)
+								dpos += snprintf(dbg + dpos, sizeof(dbg) - dpos,
+									" [%d]=0x%05X", w, ph->words[w] & 0x1FFFFF);
+							LOGP_CHAN(DDSP, LOGL_INFO, "%s\n", dbg);
+						}
+
 						for (w = data_start; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
 							uint32_t dw;
-							int n;
+							int b;
 							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
 							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
 								continue;
 							dw = ph->words[w];
 							last_data_word = w;
-							for (n = 0; n < 5; n++) {
-								uint8_t nibble = (dw >> (n * 4)) & 0xF;
-								if (hi < (int)sizeof(hex) - 1)
-									hex[hi++] = "0123456789ABCDEF"[nibble];
+							for (b = 0; b < FLEX_BCH_DATA_BITS; b++) {
+								int nibble_pos = bit_count % 4;
+								if (nibble_pos == 0)
+									nibble_acc = 0;
+								nibble_acc |= ((dw >> b) & 1) << nibble_pos;
+								if (nibble_pos == 3 && hi < (int)sizeof(hex) - 1)
+									hex[hi++] = "0123456789ABCDEF"[nibble_acc & 0xF];
+								bit_count++;
 							}
 						}
 
-						/* Strip termination fill from last word of
-						 * last fragment (C=0) or complete message.
-						 * The fill is inverse-of-last-data-bit from
-						 * the end of real data to bit 20.
-						 *
-						 * Strategy: scan backwards from bit 20 of the
-						 * last word.  All consecutive identical bits
-						 * from the top are fill.  The transition point
-						 * marks the last real data bit.  We then round
-						 * up to the next nibble boundary to find how
-						 * many complete nibbles are real data.
+						/* Strip termination fill from last/complete
+						 * fragment (C=0).  Scan backwards from bit 20
+						 * of the last word: consecutive identical bits
+						 * from the top are fill.  The transition marks
+						 * the last real data bit.  Round up to the next
+						 * nibble boundary for the real data count.
 						 *
 						 * Per spec rule (3): if the last character is
 						 * all-0 or all-1, an extra fill word is appended.
-						 * We must strip that extra word first, then strip
-						 * partial fill from the actual last data word. */
+						 *
+						 * Algorithm:
+						 * 1. Rule (3) check: if last word is entirely
+						 *    one value (0x00000 or 0x1FFFFF), it may be
+						 *    an extra fill word.  Verify by checking
+						 *    that the previous word's data ends at a
+						 *    nibble boundary with last nibble all-0/all-1.
+						 *    If confirmed, strip the entire last word.
+						 * 2. Scan the (remaining) last word backwards
+						 *    from bit 20 to find where fill starts.
+						 *    Fill bits are all identical (inverse of
+						 *    last data bit).  Trim to nibble boundary. */
 						if (last_data_word >= 0 && hex_c == 0) {
-							/* Walk backwards through data words,
-							 * stripping fill from the end */
 							int strip_word = last_data_word;
-							int word_offset = 0;
-							int ww;
 
-							/* Count nibbles from all data words */
-							for (ww = data_start; ww <= last_data_word; ww++) {
-								if (ph->status[ww] == FLEX_WORD_UNCORRECTABLE ||
-								    ph->status[ww] == FLEX_WORD_NOT_RECEIVED)
-									continue;
-								word_offset += 5;
+							/* Step 1: Rule (3) extra word check */
+							if (strip_word > data_start) {
+								uint32_t lw = ph->words[strip_word] & FLEX_DATA_MASK;
+								if (lw == 0x000000 || lw == FLEX_DATA_MASK) {
+									/* Entire word is one value.
+									 * Count data bits before it. */
+									int bits_before = 0;
+									for (w = data_start; w < strip_word; w++) {
+										if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+										    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+											continue;
+										bits_before += FLEX_BCH_DATA_BITS;
+									}
+									/* Rule (3) applies when data before
+									 * this word ends at a word boundary
+									 * (bits_before % 21 == 0, always true)
+									 * AND at a nibble boundary, AND the
+									 * last nibble is all-0 or all-1.
+									 * Since each word is 21 bits = 5.25
+									 * nibbles, data ends at nibble boundary
+									 * when bits_before % 4 == 0. */
+									if (bits_before % 4 == 0 && bits_before > 0) {
+										int prev_nibs = bits_before / 4;
+										if (prev_nibs <= hi) {
+											/* Check last nibble of previous data */
+											uint8_t ln = (uint8_t)((hex[prev_nibs - 1] >= '0' &&
+												hex[prev_nibs - 1] <= '9')
+												? (hex[prev_nibs - 1] - '0')
+												: (hex[prev_nibs - 1] - 'A' + 10));
+											if (ln == 0x0 || ln == 0xF) {
+												hi = prev_nibs;
+												strip_word = -1; /* done */
+											}
+										}
+									}
+								}
 							}
 
-							/* Strip from the last word backwards */
-							while (strip_word >= data_start) {
-								uint32_t lw;
-								uint32_t top_bit;
-								int fill_start, b, real_nibbles;
-								int this_word_offset;
-
-								if (ph->status[strip_word] == FLEX_WORD_UNCORRECTABLE ||
-								    ph->status[strip_word] == FLEX_WORD_NOT_RECEIVED)
-									break;
-
-								lw = ph->words[strip_word];
-								top_bit = (lw >> 20) & 1;
-								fill_start = 21;
+							/* Step 2: Partial fill in last word */
+							if (strip_word >= data_start &&
+							    ph->status[strip_word] != FLEX_WORD_UNCORRECTABLE &&
+							    ph->status[strip_word] != FLEX_WORD_NOT_RECEIVED) {
+								uint32_t lw = ph->words[strip_word];
+								uint32_t top_bit = (lw >> 20) & 1;
+								int fill_start = 21;
+								int b;
 
 								for (b = 20; b >= 0; b--) {
 									if (((lw >> b) & 1) != top_bit)
@@ -3806,32 +3884,20 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									fill_start = b;
 								}
 
-								if (fill_start >= 21)
-									break; /* no fill in this word */
-
-								real_nibbles = (fill_start + 3) / 4;
-
-								/* Compute offset of this word's nibbles */
-								this_word_offset = 0;
-								for (ww = data_start; ww < strip_word; ww++) {
-									if (ph->status[ww] == FLEX_WORD_UNCORRECTABLE ||
-									    ph->status[ww] == FLEX_WORD_NOT_RECEIVED)
-										continue;
-									this_word_offset += 5;
+								if (fill_start < 21 && fill_start > 0) {
+									/* Partial fill found */
+									int bits_before = 0;
+									for (w = data_start; w < strip_word; w++) {
+										if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+										    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+											continue;
+										bits_before += FLEX_BCH_DATA_BITS;
+									}
+									int real_bits = bits_before + fill_start;
+									int real_nibbles = (real_bits + 3) / 4;
+									if (real_nibbles < hi)
+										hi = real_nibbles;
 								}
-
-								if (real_nibbles == 0) {
-									/* Entire word is fill — remove it
-									 * and check the previous word */
-									hi = this_word_offset;
-									strip_word--;
-									continue;
-								}
-
-								/* Partial fill — trim to real nibbles */
-								if (this_word_offset + real_nibbles < hi)
-									hi = this_word_offset + real_nibbles;
-								break;
 							}
 						}
 					}

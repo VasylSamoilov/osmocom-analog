@@ -278,6 +278,24 @@ uint32_t flex_word_checksum(uint32_t dw)
 	return dw | csum;
 }
 
+/*
+ * Verify the 4-bit checksum of a 21-bit data word (§3.5.1).
+ * Returns 1 if valid, 0 if invalid.
+ */
+int flex_verify_word_checksum(uint32_t dw)
+{
+	uint32_t sum;
+
+	sum  = (dw      ) & 0xF;
+	sum += (dw >>  4) & 0xF;
+	sum += (dw >>  8) & 0xF;
+	sum += (dw >> 12) & 0xF;
+	sum += (dw >> 16) & 0xF;
+	sum += (dw >> 20) & 0x1;
+
+	return (sum & 0xF) == 0xF;
+}
+
 /* ===== Address Encoding ===== */
 
 static int is_short_address(uint64_t capcode)
@@ -953,7 +971,7 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		uint32_t msg_words[FLEX_MAX_MSG_WORDS_HEX];
 		uint32_t fwc;
 		size_t len, i;
-		int word_idx, nibble_idx, data_idx;
+		int word_idx, data_idx;
 		int frag_idx = 0, frag_total = 0;
 		int is_initial_frag;
 		uint32_t f_val, k_sum;
@@ -1011,57 +1029,50 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 			data_idx = 1;
 		}
 
-		/* Pack hex nibbles into data words, 5 per word */
-		word_idx = data_idx;
-		nibble_idx = 0;
-
-		for (i = 0; i < len; i++) {
-			uint8_t nibble = hex_char_to_nibble(msg[i]);
-			msg_words[word_idx] |= ((uint32_t)nibble << (nibble_idx * 4));
-			nibble_idx++;
-			if (nibble_idx >= 5) {
-				nibble_idx = 0;
-				word_idx++;
-				if (word_idx >= FLEX_MAX_MSG_WORDS_HEX)
-					break;
-			}
-		}
-
-		/* Apply spec termination fill */
-		if (nibble_idx > 0) {
-			int last_data_bit = (msg_words[word_idx] >> (nibble_idx * 4 - 1)) & 1;
-			uint32_t fill_bit = last_data_bit ? 0 : 1;
-			uint32_t fill_mask = 0;
+		/* Pack hex nibbles as continuous bit stream (same as encode_hex_message) */
+		{
+			int bit = data_idx * FLEX_BCH_DATA_BITS;
 			int b;
-			for (b = nibble_idx * 4; b < 21; b++)
-				fill_mask |= (fill_bit << b);
-			msg_words[word_idx] |= fill_mask;
-			word_idx++;
 
-			{
+			for (i = 0; i < len; i++) {
+				uint8_t nibble = hex_char_to_nibble(msg[i]);
+				for (b = 0; b < 4; b++) {
+					int wi = bit / FLEX_BCH_DATA_BITS;
+					if (wi >= FLEX_MAX_MSG_WORDS_HEX)
+						break;
+					if (nibble & (1 << b))
+						msg_words[wi] |= (1U << (bit % FLEX_BCH_DATA_BITS));
+					bit++;
+				}
+			}
+
+			word_idx = (bit > 0) ? (bit - 1) / FLEX_BCH_DATA_BITS : data_idx;
+
+			/* Termination fill: inverse of last data bit */
+			if (bit > data_idx * FLEX_BCH_DATA_BITS) {
+				int last_data_bit = (msg_words[(bit - 1) / FLEX_BCH_DATA_BITS]
+						     >> ((bit - 1) % FLEX_BCH_DATA_BITS)) & 1;
+				uint32_t fill_bit = last_data_bit ? 0 : 1;
+				int end_bit = (word_idx + 1) * FLEX_BCH_DATA_BITS;
+				int b2;
+
+				for (b2 = bit; b2 < end_bit; b2++) {
+					if (fill_bit)
+						msg_words[b2 / FLEX_BCH_DATA_BITS] |=
+							(1U << (b2 % FLEX_BCH_DATA_BITS));
+				}
+				word_idx++;
+
 				uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
 				if ((last_nib == 0x0 || last_nib == 0xF) &&
 				    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
 					uint32_t extra = 0;
-					for (b = 0; b < 21; b++)
-						extra |= (fill_bit << b);
+					if (fill_bit)
+						for (b2 = 0; b2 < 21; b2++)
+							extra |= (1U << b2);
 					msg_words[word_idx] = extra;
 					word_idx++;
 				}
-			}
-		} else if (len > 0) {
-			int prev_word = word_idx - 1;
-			int last_data_bit = (msg_words[prev_word] >> 20) & 1;
-			uint32_t fill_bit = last_data_bit ? 0 : 1;
-			uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
-			if ((last_nib == 0x0 || last_nib == 0xF) &&
-			    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
-				uint32_t extra = 0;
-				int b;
-				for (b = 0; b < 21; b++)
-					extra |= (fill_bit << b);
-				msg_words[word_idx] = extra;
-				word_idx++;
 			}
 		}
 
@@ -2184,7 +2195,7 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 	uint32_t msg_words[FLEX_MAX_MSG_WORDS_HEX];
 	uint32_t fwc;
 	size_t len, i;
-	int word_idx, nibble_idx, data_idx;
+	int word_idx, data_idx;
 	int frag_idx = 0, frag_total = 0;
 	int is_initial_frag;
 	uint32_t f_val, k_sum;
@@ -2265,74 +2276,78 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 		data_idx = 1;
 	}
 
-	/* Pack hex nibbles into data words, 5 per word.
+	/* Pack hex nibbles as a continuous bit stream across 21-bit words.
+	 * Per standard Fig 3.10.1.2-1, data bits fill all 21 bits of each
+	 * word with nibble boundaries crossing word boundaries freely.
 	 *
-	 * Termination: when the last character ends
-	 * mid-word, remaining bits are filled with the inverse of the
-	 * last valid data bit.  If the last character is all-0 or all-1,
-	 * an extra word of inverse fill is appended.
-	 *
-	 * We pack nibbles (4-bit units) into 21-bit words.  After the
-	 * last nibble, we apply the spec's termination fill. */
-	word_idx = data_idx;
-	nibble_idx = 0;
-
-	for (i = 0; i < len; i++) {
-		uint8_t nibble = hex_char_to_nibble(msg[i]);
-		msg_words[word_idx] |= ((uint32_t)nibble << (nibble_idx * 4));
-		nibble_idx++;
-		if (nibble_idx >= 5) {
-			nibble_idx = 0;
-			word_idx++;
-			if (word_idx >= FLEX_MAX_MSG_WORDS_HEX)
-				break;
-		}
-	}
-
-	/* Apply spec termination fill to remaining bits in last word */
-	if (nibble_idx > 0) {
-		/* Last data bit determines fill pattern */
-		int last_data_bit = (msg_words[word_idx] >> (nibble_idx * 4 - 1)) & 1;
-		uint32_t fill_bit = last_data_bit ? 0 : 1; /* inverse */
-		uint32_t fill_mask = 0;
+	 * Termination (Section 3.10.1.2): remaining bits after the last
+	 * data nibble are filled with the inverse of the last data bit.
+	 * If the last nibble is all-0 or all-1, an extra word of inverse
+	 * fill is appended. */
+	{
+		int bit = data_idx * FLEX_BCH_DATA_BITS;
 		int b;
 
-		/* Fill remaining bits in this word (from nibble_idx*4 to bit 20) */
-		for (b = nibble_idx * 4; b < 21; b++)
-			fill_mask |= (fill_bit << b);
-		msg_words[word_idx] |= fill_mask;
-		word_idx++;
-
-		/* Spec rule (3): if last character is all-0 or all-1,
-		 * append an extra word of inverse fill.
-		 * "Last character" = last nibble (4 bits) for our B=4 packing. */
-		{
-			uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
-			if ((last_nib == 0x0 || last_nib == 0xF) &&
-			    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
-				uint32_t extra = 0;
-				for (b = 0; b < 21; b++)
-					extra |= (fill_bit << b);
-				msg_words[word_idx] = extra;
-				word_idx++;
+		for (i = 0; i < len; i++) {
+			uint8_t nibble = hex_char_to_nibble(msg[i]);
+			for (b = 0; b < 4; b++) {
+				int wi = bit / FLEX_BCH_DATA_BITS;
+				if (wi >= FLEX_MAX_MSG_WORDS_HEX)
+					break;
+				if (nibble & (1 << b))
+					msg_words[wi] |= (1U << (bit % FLEX_BCH_DATA_BITS));
+				bit++;
 			}
 		}
-	} else if (len > 0) {
-		/* Data ended exactly on a word boundary.
-		 * Spec rule (3): if last character is all-0 or all-1,
-		 * append an extra word of inverse fill. */
-		int prev_word = word_idx - 1;
-		int last_data_bit = (msg_words[prev_word] >> 20) & 1;
-		uint32_t fill_bit = last_data_bit ? 0 : 1;
-		uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
-		if ((last_nib == 0x0 || last_nib == 0xF) &&
-		    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
-			uint32_t extra = 0;
-			int b;
-			for (b = 0; b < 21; b++)
-				extra |= (fill_bit << b);
-			msg_words[word_idx] = extra;
+
+		word_idx = (bit > 0) ? (bit - 1) / FLEX_BCH_DATA_BITS : data_idx;
+
+		/* Termination fill (Spec §3.10.1.2 rules 2 & 3):
+		 *
+		 * Rule (2): When data ends in the middle of the last word,
+		 * fill remaining bits with the inverse of the last data bit.
+		 * When data ends exactly at a word boundary, no fill needed.
+		 *
+		 * Rule (3): For the LAST fragment only (C=0): same as (2),
+		 * EXCEPT when data ends exactly at a word boundary AND the
+		 * last character is all-0s or all-1s — in that case, append
+		 * an extra word filled with the inverse of the last data bit.
+		 *
+		 * The extra word prevents ambiguity: without it, the decoder
+		 * can't distinguish "message ended here" from "message data
+		 * that happens to look like fill". */
+		if (bit > data_idx * FLEX_BCH_DATA_BITS) {
+			int last_data_bit = (msg_words[(bit - 1) / FLEX_BCH_DATA_BITS]
+					     >> ((bit - 1) % FLEX_BCH_DATA_BITS)) & 1;
+			uint32_t fill_bit = last_data_bit ? 0 : 1;
+			int remainder = bit % FLEX_BCH_DATA_BITS;
+
+			if (remainder != 0) {
+				/* Data ends mid-word: fill remaining bits */
+				int end_bit = (word_idx + 1) * FLEX_BCH_DATA_BITS;
+				for (b = bit; b < end_bit; b++) {
+					if (fill_bit)
+						msg_words[b / FLEX_BCH_DATA_BITS] |=
+							(1U << (b % FLEX_BCH_DATA_BITS));
+				}
+			}
 			word_idx++;
+
+			/* Rule (3): extra word only when last fragment,
+			 * data ends at word boundary, and last char is
+			 * all-0s or all-1s */
+			if (c_val == 0 && remainder == 0 &&
+			    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
+				uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
+				if (last_nib == 0x0 || last_nib == 0xF) {
+					uint32_t extra = 0;
+					if (fill_bit)
+						for (b = 0; b < 21; b++)
+							extra |= (1U << b);
+					msg_words[word_idx] = extra;
+					word_idx++;
+				}
+			}
 		}
 	}
 
@@ -2410,6 +2425,17 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 	 * For long addresses,
 	 * body[0] is placed at Vy in the Vector Field by the caller. */
 	fwc = *fwc_p;
+	{
+		char dbg[512];
+		int dpos = 0;
+		dpos += snprintf(dbg + dpos, sizeof(dbg) - dpos,
+				 "TX: HEX body: start=%u words=%d data_idx=%d nibbles=%d:",
+				 msg_start, word_idx, data_idx, (int)len);
+		for (i = 0; i < (size_t)word_idx && dpos < (int)sizeof(dbg) - 10; i++)
+			dpos += snprintf(dbg + dpos, sizeof(dbg) - dpos,
+					 " [%d]=0x%05X", (int)i, msg_words[i] & FLEX_DATA_MASK);
+		LOGP(DFLEX, LOGL_INFO, "%s\n", dbg);
+	}
 	for (i = 0; i < (size_t)word_idx; i++)
 		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_words[i]));
 	*fwc_p = fwc;
@@ -3697,6 +3723,59 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	for (; fwc < FLEX_WORDS_PER_FRAME; fwc++)
 		frame_words[fwc] = (fwc % 2 == 0) ? FLEX_IDLE_WORD_1
 						   : FLEX_IDLE_WORD_2;
+
+	/* ---- Block-boundary fixup for decoder compatibility ----
+	 *
+	 * Per the standard (§3.4.1, §3.5.1), a compliant decoder uses
+	 * BIW and vector metadata to locate data words — it never needs
+	 * to scan for idle patterns.  The 4-bit checksum (§3.5.1) on
+	 * BIW/vector/FIW words guarantees they can't be all-zeros or
+	 * all-ones (checksum would be wrong), but message body words
+	 * have no such protection and CAN legitimately be all-zeros
+	 * (e.g. hex termination fill) or all-ones.
+	 *
+	 * However, PDW and multimon-ng use a non-standard optimization:
+	 * they check the last word of each 8-word block (indices 7, 15,
+	 * 23, ..., 87) for all-zeros or all-ones, and if found, assume
+	 * the rest of the frame is idle and stop processing.
+	 *
+	 * To maintain interoperability with these decoders, we apply a
+	 * 1-bit fixup: flip bit 0 of any all-zeros/all-ones codeword
+	 * at a block boundary when real data follows.  BCH(31,21) can
+	 * correct up to 2-bit errors, so the receiver's BCH decoder
+	 * recovers the original 21-bit data word transparently.
+	 *
+	 * Only applied when there's real (non-idle) data after the block.
+	 * Enabled by --hack-for-non-standard-decoders (default OFF). */
+	if (params->hack_nonstandard_decoders) {
+		uint32_t last_data_word = 0;
+
+		/* Find the last non-idle word index */
+		for (i = FLEX_WORDS_PER_FRAME; i > 0; i--) {
+			uint32_t w = frame_words[i - 1];
+			if (w != FLEX_IDLE_WORD_1 && w != FLEX_IDLE_WORD_2) {
+				last_data_word = i - 1;
+				break;
+			}
+		}
+
+		/* Check each block boundary */
+		for (i = FLEX_WORDS_PER_BLOCK - 1;
+		     i < FLEX_WORDS_PER_FRAME;
+		     i += FLEX_WORDS_PER_BLOCK) {
+			if (i >= last_data_word)
+				break; /* no real data after this block */
+			if (frame_words[i] == 0x00000000U ||
+			    frame_words[i] == 0xFFFFFFFFU) {
+				frame_words[i] ^= 1U;
+				LOGP(DFLEX, LOGL_INFO,
+				     "TX: Block-boundary fixup: word %u "
+				     "flipped bit 0 (was %s)\n",
+				     i, (frame_words[i] ^ 1U) == 0
+					? "all-zeros" : "all-ones");
+			}
+		}
+	}
 
 	/* ---- Block interleaving ---- */
 

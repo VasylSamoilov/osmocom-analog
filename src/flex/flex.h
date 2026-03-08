@@ -226,6 +226,7 @@ typedef struct flex {
 	int			no_ers;			/* skip ERS in single-shot mode */
 	int			biw_time_enabled;	/* BIW3/BIW4 time broadcast */
 	int			chan_setup_enabled;	/* BIW channel setup emission */
+	int			hack_nonstandard_decoders; /* block-boundary fixup for PDW/multimon-ng */
 	int			lpf_enabled;		/* baseband LPF */
 
 	/* Multiple transmission config (Spec Section 3.4.2).

@@ -78,6 +78,7 @@ int rx_kanji_enabled = 0;		/* --rx-kanji: enable Kanji/Shift-JIS decode */
 static int default_retransmit = 0;		/* --retransmit: 0-15, default 0 (no retransmission) */
 static int default_retransmit_interval = 128;	/* --retransmit-interval: 1-1920 frames, default 128 (~4 min) */
 static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (immediate) */
+static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: block-boundary fixup */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -108,6 +109,7 @@ static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (i
 #define OPT_RETRANSMIT		3025
 #define OPT_RETRANSMIT_INTERVAL	3026
 #define OPT_SEND_DELAY		3027
+#define OPT_HACK_NONSTANDARD	3028
 
 void print_help(const char *arg0)
 {
@@ -219,6 +221,14 @@ void print_help(const char *arg0)
 	printf("    --send-delay <0-1920>\n");
 	printf("        Default frames to defer initial TX (default 0 = immediate).\n");
 	printf("        Delays first transmission by N frames after enqueue.\n");
+	printf("    --hack-for-non-standard-decoders\n");
+	printf("        Enable block-boundary fixup for non-standard decoders.\n");
+	printf("        PDW and multimon-ng use idle-word detection (not in the\n");
+	printf("        standard) that causes early frame termination when a\n");
+	printf("        legitimate data word is all-zeros or all-ones at a block\n");
+	printf("        boundary (word 7, 15, 23, ...).  This flag flips bit 0\n");
+	printf("        of such words; BCH(31,21) corrects the 1-bit error on RX.\n");
+	printf("        Default OFF (standard-compliant behavior).\n");
 	printf("\n");
 	printf("    FIFO protocol (write to %s):\n", MSG_SEND);
 	printf("        Format: capcode,type,options,message\n");
@@ -316,6 +326,7 @@ static void add_options(void)
 	option_add(OPT_RETRANSMIT, "retransmit", 1);
 	option_add(OPT_RETRANSMIT_INTERVAL, "retransmit-interval", 1);
 	option_add(OPT_SEND_DELAY, "send-delay", 1);
+	option_add(OPT_HACK_NONSTANDARD, "hack-for-non-standard-decoders", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -551,6 +562,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Send delay must be 0-1920 frames, use '-h' for help.\n");
 			return -EINVAL;
 		}
+		break;
+	case OPT_HACK_NONSTANDARD:
+		hack_nonstandard_decoders = 1;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -1485,6 +1499,7 @@ int main(int argc, char *argv[])
 			f->num_transmissions = num_transmissions;
 			f->td_collapse = td_collapse;
 			f->chan_setup_enabled = chan_setup_enabled;
+			f->hack_nonstandard_decoders = hack_nonstandard_decoders;
 
 			/* Parse POCSAG mixing frame slots if specified */
 			if (pocsag_mix) {
