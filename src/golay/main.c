@@ -34,8 +34,10 @@
 #include "../libfm/fm.h"
 #include "golay.h"
 
-#define MSG_SEND "/tmp/golay_msg_send"
+#define MSG_SEND_DEFAULT "/tmp/golay_msg_send"
 #define MSG_RECEIVED "/tmp/golay_msg_received"
+#define FIFO_BUFFER_SIZE 4096
+static const char *msg_send_path = MSG_SEND_DEFAULT;
 static int msg_send_fd = -1;
 
 static int tx = 0;		/* we transmit */
@@ -47,6 +49,7 @@ static int polarity_given = 0;
 static const char *message = "1234";
 static const char *voice_dir = NULL;	/* voice recording output folder */
 static int voice_monitor = 0;		/* voice monitor mode (play to audio output) */
+static int batching_mode = BATCHING_OFF;
 
 void print_help(const char *arg0)
 {
@@ -64,6 +67,10 @@ void print_help(const char *arg0)
 	printf("        positive and a binary 0 negative deviation. (default %s).\n", (polarity < 0) ? "negative" : "positive");
 	printf("        For RX, locks polarity to this value. If not given, RX auto-detects\n");
 	printf("        polarity from the preamble.\n");
+	printf(" -B --batching off | normal | extended\n");
+	printf("        Set batch encoding mode. 'off' transmits each message individually\n");
+	printf("        (default). 'normal' groups up to 16 addresses per preamble. 'extended'\n");
+	printf("        groups up to 32 addresses per preamble.\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Send this message, if no caller ID was given or if built-in console\n");
 	printf("        is used. (default \"%s\").\n", message);
@@ -72,8 +79,10 @@ void print_help(const char *arg0)
 	printf("        Filenames: golay_voice_page_<timestamp>_<address>.wav\n");
 	printf("    --voice-monitor\n");
 	printf("        Also play received voice pages to the audio output device.\n");
+	printf("    --fifo <path>\n");
+	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
 	printf("\n");
-	printf("File: %s\n", MSG_SEND);
+	printf("File: %s\n", msg_send_path);
 	printf("        Write \"<address>[,message]\" to it, to send a default message.\n");
 	printf("        Write \"<address>,n,message\" to it, to send a numeric message.\n");
 	printf("        Write \"<address>,a,message\" to it, to send an alphanumeric message.\n");
@@ -99,7 +108,9 @@ static void add_options(void)
 	option_add('P', "polarity", 1);
 	option_add('M', "message", 1);
 	option_add('V', "voice-dir", 1);
+	option_add('B', "batching", 1);
 	option_add(0x100, "voice-monitor", 0);
+	option_add(0x101, "fifo", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -152,6 +163,21 @@ static int handle_options(int short_option, int argi, char **argv)
 	case 0x100: /* --voice-monitor */
 		voice_monitor = 1;
 		break;
+	case 0x101: /* --fifo */
+		msg_send_path = options_strdup(argv[argi++]);
+		break;
+	case 'B':
+		if (!strcmp(argv[argi], "off"))
+			batching_mode = BATCHING_OFF;
+		else if (!strcmp(argv[argi], "normal"))
+			batching_mode = BATCHING_NORMAL;
+		else if (!strcmp(argv[argi], "extended"))
+			batching_mode = BATCHING_EXTENDED;
+		else {
+			fprintf(stderr, "Invalid batching mode '%s', use 'off', 'normal', or 'extended'.\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -161,31 +187,66 @@ static int handle_options(int short_option, int argi, char **argv)
 
 static void myhandler(void)
 {
-	static char buffer[256];
-	static int pos = 0, rc, i;
-	int space = sizeof(buffer) - pos;
+	static char buffer[FIFO_BUFFER_SIZE];
+	static int buf_len = 0;
+	int rc, i, start;
+	int space = sizeof(buffer) - buf_len;
 
-	rc = read(msg_send_fd, buffer + pos, space);
+	rc = read(msg_send_fd, buffer + buf_len, space);
 	if (rc > 0) {
-		pos += rc;
-		if (pos == space) {
-			fprintf(stderr, "Message buffer overflow!\n");
-			pos = 0;
+		LOGP(DGOLAY, LOGL_DEBUG, "FIFO: read %d bytes, buf_len=%d\n", rc, buf_len + rc);
+		buf_len += rc;
+
+		/* Overflow handling: if buffer is full with no complete message,
+		 * log warning and discard all data */
+		if (buf_len == (int)sizeof(buffer)) {
+			int has_newline = 0;
+			for (i = 0; i < buf_len; i++) {
+				if (buffer[i] == '\r' || buffer[i] == '\n') {
+					has_newline = 1;
+					break;
+				}
+			}
+			if (!has_newline) {
+				LOGP(DGOLAY, LOGL_ERROR, "FIFO buffer overflow (%d bytes) with no complete message, discarding data!\n", buf_len);
+				buf_len = 0;
+				return;
+			}
 		}
-		/* check for end of line */
-		for (i = 0; i < pos; i++) {
-			if (buffer[i] == '\r' || buffer[i] == '\n')
-				break;
+
+		/* Process up to 16 complete messages per call to avoid starving
+		 * the audio loop when the FIFO is flooded. */
+		start = 0;
+		int msg_count = 0;
+		for (i = 0; i < buf_len; i++) {
+			if (buffer[i] == '\r' || buffer[i] == '\n') {
+				buffer[i] = '\0';
+				/* Only process non-empty lines */
+				if (i > start) {
+					LOGP(DGOLAY, LOGL_DEBUG, "FIFO: processing msg %d: '%s'\n", msg_count + 1, buffer + start);
+					if (tx)
+						golay_msg_send(buffer + start);
+					else
+						LOGP(DGOLAY, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
+					if (++msg_count >= 16)  {
+						start = i + 1;
+						break;
+					}
+				}
+				start = i + 1;
+			}
 		}
-		/* send msg */
-		if (i < pos) {
-			buffer[i] = '\0';
-			pos = 0;
-			if (tx)
-				golay_msg_send(buffer);
-			else
-				LOGP(DGOLAY, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
+
+		/* Retain any partial message (no trailing newline) via memmove */
+		LOGP(DGOLAY, LOGL_DEBUG, "FIFO: processed %d msgs, start=%d buf_len=%d\n", msg_count, start, buf_len);
+		if (start > 0 && start < buf_len) {
+			memmove(buffer, buffer + start, buf_len - start);
+			buf_len -= start;
+		} else if (start >= buf_len) {
+			/* All data was consumed */
+			buf_len = 0;
 		}
+		/* If start == 0, no newline was found yet — keep accumulating */
 	}
 }
 
@@ -254,15 +315,15 @@ int main(int argc, char *argv[])
 		tx = rx = 1;
 
 	/* create pipe for message sendy */
-	unlink(MSG_SEND);
-	rc = mkfifo(MSG_SEND, 0666);
+	unlink(msg_send_path);
+	rc = mkfifo(msg_send_path, 0666);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to create mwaaage send FIFO '%s'!\n", MSG_SEND);
+		fprintf(stderr, "Failed to create message send FIFO '%s'!\n", msg_send_path);
 		goto fail;
 	} else {
-		msg_send_fd = open(MSG_SEND, O_RDONLY | O_NONBLOCK);
+		msg_send_fd = open(msg_send_path, O_RDWR | O_NONBLOCK);
 		if (msg_send_fd < 0) {
-			fprintf(stderr, "Failed to open mwaaage send FIFO! '%s'\n", MSG_SEND);
+			fprintf(stderr, "Failed to open message send FIFO '%s'!\n", msg_send_path);
 			goto fail;
 		}
 	}
@@ -278,6 +339,10 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;
 		}
+		{
+			gsc_t *gsc = (gsc_t *)sender_head;
+			gsc->batching_mode = batching_mode;
+		}
 		printf("Base station ready, please tune transmitter (or receiver) to %.4f MHz\n", frequency / 1e6);
 	}
 
@@ -287,7 +352,7 @@ fail:
 	/* pipe */
 	if (msg_send_fd > 0)
 		close(msg_send_fd);
-	unlink(MSG_SEND);
+	unlink(msg_send_path);
 
 	/* destroy transceiver instance */
 	while(sender_head)

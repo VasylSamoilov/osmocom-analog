@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/param.h>
 #include "../libsample/sample.h"
@@ -95,6 +96,7 @@ int golay_create(const char *kanal, double frequency, const char *device, int us
 	gsc->tx = tx;
 	gsc->rx = rx;
 	gsc->default_message = message;
+	gsc->fsk_tx_polarity = gsc->fsk_polarity;
 
 	/* Initialize RX decoder state */
 	if (rx) {
@@ -122,6 +124,20 @@ int golay_create(const char *kanal, double frequency, const char *device, int us
 		LOGP(DGOLAY, LOGL_INFO, "Voice recording enabled, output dir: %s\n", voice_dir);
 	if (voice_monitor && rx)
 		LOGP(DGOLAY, LOGL_INFO, "Voice monitor mode enabled.\n");
+
+	/* Initialize scheduler state */
+	gsc->priority_list = NULL;
+	gsc->priority_count = 0;
+	gsc->normal_count = 0;
+	gsc->tx_msg_count = 0;
+	gsc->tx_preamble_index = 0;
+	gsc->batching_mode = BATCHING_OFF;
+	gsc->holdoff_ms = 100;
+	gsc->holdoff_active = 0;
+	memset(&gsc->holdoff_start, 0, sizeof(gsc->holdoff_start));
+	gsc->expiry_seconds = 300;
+	gsc->rx_batch_candidate = 0;
+	gsc->rx_batch_mode = 0;
 
 	LOGP(DGOLAY, LOGL_NOTICE, "Created %s%s%s for frequency %s\n",
 		tx ? "transmitter" : "",
@@ -160,9 +176,9 @@ void golay_destroy(sender_t *sender)
 }
 
 /* Create message and add to queue */
-static gsc_msg_t *golay_msg_create(gsc_t *gsc, const char *address, const char *text, enum gsc_msg_type type)
+static gsc_msg_t *golay_msg_create(gsc_t __attribute__((unused)) *gsc, const char *address, const char *text, enum gsc_msg_type type)
 {
-	gsc_msg_t *msg, **msgp;
+	gsc_msg_t *msg;
 
 	if (strlen(address) != sizeof(msg->address) - 1) {
 		LOGP(DGOLAY, LOGL_NOTICE, "Address has incorrect length, cannot page!\n");
@@ -207,11 +223,9 @@ static gsc_msg_t *golay_msg_create(gsc_t *gsc, const char *address, const char *
 	msg->type = type;
 	memcpy(msg->data, text, MIN(sizeof(msg->data) - 1, strlen(text) + 1));
 
-	/* link */
-	msgp = &gsc->msg_list;
-	while ((*msgp))
-		msgp = &(*msgp)->next;
-	(*msgp) = msg;
+	/* Message is returned without linking into any queue.
+	 * The caller is responsible for calling scheduler_enqueue()
+	 * after setting priority/polarity fields. */
 
 	return msg;
 }
@@ -1843,16 +1857,22 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		{
 			int alpha_pos = 0;
 			int alpha_broke_early = 0; /* 1 = loop broke due to not enough bits */
+			int prev_contbit = 1; /* first block is trusted (address/type confirmed data) */
 			contbit = 1;
 
 			for (i = 0; contbit && i < MAX_ADB; i++) {
 				int k, j;
+				int bch_bad[8] = {0}; /* per-codeword failure flags */
 
 				if (pos + 1 + bch_block_bits > total_bits) {
 					LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: not enough bits.\n", i);
 					alpha_broke_early = 1;
 					break;
 				}
+
+				/* If previous block did NOT confirm continuation and this
+				 * block has failures, we can't trust it belongs to the message.
+				 * But we must still attempt decode to know. */
 
 				/* Skip 1-bit inverted comma */
 				pos += 1;
@@ -1867,9 +1887,17 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 					if (rc < 0) {
 						LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: BCH[%d] decode failed.\n", i, k);
 						d[k] = 0;
-						msg->error_count++;
+						msg->uncorrectable_count++;
 						block_ok = 0;
+						bch_bad[k] = 1;
 					}
+				}
+
+				/* If block has failures and previous block didn't confirm
+				 * continuation, stop — can't trust this data. */
+				if (!block_ok && !prev_contbit) {
+					LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: BCH failures and no prior continuation, stopping.\n", i);
+					break;
 				}
 
 				/* Verify checksum: encoder sums the 15-bit encoded codewords,
@@ -1895,6 +1923,21 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				 *   bch[6] = (contbit << 6) | msg[7] */
 				{
 					uint8_t ch[8];
+					/* Which characters are tainted by failed BCH codewords:
+					 * ch[0] <- d[0]       ch[4] <- d[3],d[4]
+					 * ch[1] <- d[0],d[1]  ch[5] <- d[4],d[5]
+					 * ch[2] <- d[1],d[2]  ch[6] <- d[5]
+					 * ch[3] <- d[2],d[3]  ch[7] <- d[6]       */
+					int ch_bad[8];
+					ch_bad[0] = bch_bad[0];
+					ch_bad[1] = bch_bad[0] || bch_bad[1];
+					ch_bad[2] = bch_bad[1] || bch_bad[2];
+					ch_bad[3] = bch_bad[2] || bch_bad[3];
+					ch_bad[4] = bch_bad[3] || bch_bad[4];
+					ch_bad[5] = bch_bad[4] || bch_bad[5];
+					ch_bad[6] = bch_bad[5];
+					ch_bad[7] = bch_bad[6];
+
 					ch[0] = d[0] & 0x3f;
 					ch[1] = ((d[0] >> 6) | (d[1] << 1)) & 0x3f;
 					ch[2] = ((d[1] >> 5) | (d[2] << 2)) & 0x3f;
@@ -1906,17 +1949,26 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 					contbit = (d[6] >> 6) & 1;
 
 					for (j = 0; j < 8; j++) {
-						c = decode_alpha(ch[j]);
 						if (alpha_pos < (int)sizeof(msg->alpha_data) - 1) {
-							if (c != '\0')
-								msg->alpha_data[alpha_pos++] = c;
-							else if (ch[j] == 0x3e)
-								msg->alpha_fill++;
+							if (ch_bad[j]) {
+								msg->alpha_data[alpha_pos++] = '?';
+							} else {
+								c = decode_alpha(ch[j]);
+								if (c != '\0')
+									msg->alpha_data[alpha_pos++] = c;
+								else if (ch[j] == 0x3e)
+									msg->alpha_fill++;
+							}
 						}
 					}
 				}
 
-				LOGP(DGOLAY, LOGL_DEBUG, "Alpha block %d decoded, contbit=%d.\n", i, contbit);
+				/* Update prev_contbit: only trust contbit from a clean block.
+				 * If block had BCH failures, d[6] is 0 so contbit is garbage
+				 * (will be 0, causing natural loop exit). */
+				prev_contbit = block_ok ? contbit : 0;
+
+				LOGP(DGOLAY, LOGL_DEBUG, "Alpha block %d decoded, contbit=%d, block_ok=%d.\n", i, contbit, block_ok);
 			}
 
 			msg->alpha_data[alpha_pos] = '\0';
@@ -1949,6 +2001,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		{
 			int numeric_pos = 0;
 			int numeric_broke_early = 0; /* 1 = loop broke due to not enough bits */
+			int prev_contbit = 1; /* first block is trusted (address/type confirmed data) */
 			pos = data_start_pos; /* restore position to re-decode as numeric */
 			contbit = 1;
 			shifted = 0;
@@ -1956,6 +2009,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 			for (i = 0; contbit && i < MAX_NDB; i++) {
 				int k, j;
+				int bch_bad[8] = {0}; /* per-codeword failure flags */
 
 				if (pos + 1 + bch_block_bits > total_bits) {
 					LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: not enough bits.\n", i);
@@ -1976,9 +2030,17 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 					if (rc < 0) {
 						LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: BCH[%d] decode failed.\n", i, k);
 						d[k] = 0;
-						msg->error_count++;
+						msg->uncorrectable_count++;
 						block_ok = 0;
+						bch_bad[k] = 1;
 					}
+				}
+
+				/* If block has failures and previous block didn't confirm
+				 * continuation, stop — can't trust this data. */
+				if (!block_ok && !prev_contbit) {
+					LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: BCH failures and no prior continuation, stopping.\n", i);
+					break;
 				}
 
 				/* Verify checksum (same as alpha: sum of re-encoded codewords) */
@@ -1998,6 +2060,27 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				/* Unpack 7 data words into 12 four-bit nibbles */
 				{
 					uint8_t nib[12];
+					/* Which nibbles are tainted by failed BCH codewords:
+					 * nib[0]  <- d[0]        nib[6]  <- d[3]
+					 * nib[1]  <- d[0],d[1]   nib[7]  <- d[4]
+					 * nib[2]  <- d[1]         nib[8]  <- d[4],d[5]
+					 * nib[3]  <- d[1],d[2]   nib[9]  <- d[5]
+					 * nib[4]  <- d[2]         nib[10] <- d[5],d[6]
+					 * nib[5]  <- d[2],d[3]   nib[11] <- d[6]       */
+					int nib_bad[12];
+					nib_bad[0]  = bch_bad[0];
+					nib_bad[1]  = bch_bad[0] || bch_bad[1];
+					nib_bad[2]  = bch_bad[1];
+					nib_bad[3]  = bch_bad[1] || bch_bad[2];
+					nib_bad[4]  = bch_bad[2];
+					nib_bad[5]  = bch_bad[2] || bch_bad[3];
+					nib_bad[6]  = bch_bad[3];
+					nib_bad[7]  = bch_bad[4];
+					nib_bad[8]  = bch_bad[4] || bch_bad[5];
+					nib_bad[9]  = bch_bad[5];
+					nib_bad[10] = bch_bad[5] || bch_bad[6];
+					nib_bad[11] = bch_bad[6];
+
 					nib[0]  = d[0] & 0xf;
 					nib[1]  = ((d[0] >> 4) | (d[1] << 3)) & 0xf;
 					nib[2]  = (d[1] >> 1) & 0xf;
@@ -2017,15 +2100,23 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 						if (msg->numeric_nibble_count < (int)sizeof(msg->numeric_nibbles))
 							msg->numeric_nibbles[msg->numeric_nibble_count++] = nib[j];
 
-						c = decode_numeric(nib[j], &shifted);
-						if (c != '\0' && numeric_pos < (int)sizeof(msg->numeric_data) - 1)
-							msg->numeric_data[numeric_pos++] = c;
-						else if (c == '\0' && nib[j] == 0x0a)
-							msg->numeric_fill++;
+						if (nib_bad[j]) {
+							if (numeric_pos < (int)sizeof(msg->numeric_data) - 1)
+								msg->numeric_data[numeric_pos++] = '?';
+						} else {
+							c = decode_numeric(nib[j], &shifted);
+							if (c != '\0' && numeric_pos < (int)sizeof(msg->numeric_data) - 1)
+								msg->numeric_data[numeric_pos++] = c;
+							else if (c == '\0' && nib[j] == 0x0a)
+								msg->numeric_fill++;
+						}
 					}
 				}
 
-				LOGP(DGOLAY, LOGL_DEBUG, "Numeric block %d decoded, contbit=%d.\n", i, contbit);
+				/* Update prev_contbit: only trust contbit from a clean block. */
+				prev_contbit = block_ok ? contbit : 0;
+
+				LOGP(DGOLAY, LOGL_DEBUG, "Numeric block %d decoded, contbit=%d, block_ok=%d.\n", i, contbit, block_ok);
 			}
 
 			msg->numeric_data[numeric_pos] = '\0';
@@ -2154,13 +2245,17 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	/* ================================================================
 	 * Stage 8: BATCH MODE
 	 *
-	 * Currently single-message decode only.
+	 * After decoding one address+message, check for additional
+	 * address codewords in the bitstream. Batch mode transmissions
+	 * (inverted preamble) pack multiple address/data pairs after a
+	 * single preamble + start code. Extended batch inserts a second
+	 * start code after the 16th address.
 	 *
-	 * TODO: Batch mode (up to 16 addresses per batch):
-	 *   - After one address+message, check for additional address pairs
-	 *   - Extended batch: second start code without new preamble
-	 *   - New preamble: start of new individual transmission
-	 *   - Interleaved tone-only during voice page alert period
+	 * The decoder handles all three formats (individual, batch,
+	 * extended batch) regardless of the --batching CLI value.
+	 *
+	 * For each additional address decoded, output it as a separate
+	 * gsc_rx_msg_t via golay_msg_receive().
 	 * ================================================================ */
 
 	msg->decode_ok = 1;
@@ -2171,6 +2266,533 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		msg->type == TYPE_ALPHA ? "alpha" :
 		msg->type == TYPE_NUMERIC ? "numeric" : "tone",
 		msg->data, msg->error_count);
+
+	/* --- Batch continuation: peek ahead for more addresses --- */
+	{
+		int batch_count = 1; /* first message already decoded above */
+		int batch_pos = pos;
+
+		while (batch_count < 32) {
+			int saved_pos = batch_pos;
+			uint32_t peek_cw;
+			uint16_t peek_val;
+			int peek_rc;
+			int is_w1 = 0;
+			int is_start_code = 0;
+			int is_preamble = 0;
+
+			/* Need at least comma(28) + dup Golay(46) = 74 bits
+			 * to peek at the next codeword */
+			if (batch_pos + comma_len + dup_bits > total_bits) {
+				LOGP(DGOLAY, LOGL_DEBUG, "Batch: not enough bits for continuation check (%d remaining).\n",
+					total_bits - batch_pos);
+				break;
+			}
+
+			/* Skip 28-bit comma, read dup Golay codeword */
+			batch_pos += comma_len;
+			peek_cw = read_dup_golay(bits, &batch_pos);
+
+			/* Try to decode the codeword (normal polarity) */
+			peek_rc = decode_golay(peek_cw, &peek_val);
+			if (peek_rc == 0) {
+				/* Check if it's a valid W1 (another address) */
+				for (i = 0; i < 50; i++) {
+					if (peek_val == word1s[i]) {
+						is_w1 = 1;
+						break;
+					}
+				}
+
+				/* Check if it's the start code (extended batch continuation) */
+				if (!is_w1 && peek_val == start_code)
+					is_start_code = 1;
+
+				/* Check if it's a preamble value (new transmission) */
+				if (!is_w1 && !is_start_code) {
+					for (i = 0; i < 10; i++) {
+						if (peek_val == preamble_values[i]) {
+							is_preamble = 1;
+							break;
+						}
+					}
+				}
+			}
+
+			/* Also try inverted decode for W1 (function bit 1 set) */
+			if (!is_w1 && !is_start_code && !is_preamble) {
+				peek_rc = decode_golay(peek_cw ^ 0x7fffff, &peek_val);
+				if (peek_rc == 0) {
+					for (i = 0; i < 50; i++) {
+						if (peek_val == word1s[i]) {
+							is_w1 = 1;
+							break;
+						}
+					}
+				}
+			}
+
+			if (is_preamble) {
+				/* New transmission starting — stop batch decode */
+				LOGP(DGOLAY, LOGL_DEBUG, "Batch: preamble detected after message %d, new transmission.\n",
+					batch_count);
+				break;
+			}
+
+			if (is_start_code) {
+				/* Extended batch continuation: second start code.
+				 * Skip the 1-bit inverted comma + complement codeword
+				 * (same layout as the first start code's complement). */
+				LOGP(DGOLAY, LOGL_INFO, "Batch: extended batch start code after message %d.\n",
+					batch_count);
+
+				if (batch_pos + 1 + dup_bits > total_bits) {
+					LOGP(DGOLAY, LOGL_NOTICE, "Batch: not enough bits for extended start code complement.\n");
+					break;
+				}
+
+				/* Skip 1-bit inverted comma */
+				batch_pos += 1;
+
+				/* Skip complement codeword (46 bits) */
+				batch_pos += dup_bits;
+
+				/* Loop back to check for the next address */
+				continue;
+			}
+
+			if (!is_w1) {
+				/* Not a valid W1, start code, or preamble — end of batch */
+				LOGP(DGOLAY, LOGL_DEBUG, "Batch: no valid continuation after message %d, end of batch.\n",
+					batch_count);
+				break;
+			}
+
+			/* --- Valid W1 found: decode the next address+message ---
+			 *
+			 * We've already consumed the comma and W1 dup Golay.
+			 * Now we need to decode the full address (W1 already read,
+			 * need W2) and then the message data, same as Stages 3-7.
+			 *
+			 * Re-decode W1 properly with inversion detection since
+			 * the peek above was simplified. */
+
+			LOGP(DGOLAY, LOGL_INFO, "Batch: additional address %d found, decoding.\n",
+				batch_count + 1);
+
+			{
+				gsc_rx_msg_t batch_msg;
+				int bm_w1_inverted, bm_w2_inverted;
+				uint16_t bm_w1_value;
+				uint8_t bm_function;
+				int bm_g1, bm_g0, bm_a2, bm_a1, bm_a0;
+				int bm_g1g0, bm_idx;
+				char bm_suffix;
+				int bm_remaining;
+				enum gsc_msg_type bm_detected_type;
+
+				memset(&batch_msg, 0, sizeof(batch_msg));
+				batch_msg.preamble_index = preamble_idx;
+
+				/* --- Re-decode W1 with full inversion detection ---
+				 * Re-read from saved_pos + comma to get the raw codeword again */
+				{
+					int w1_pos = saved_pos + comma_len;
+					uint32_t w1_cw = read_dup_golay(bits, &w1_pos);
+
+					bm_w1_inverted = 0;
+					peek_rc = decode_golay(w1_cw, &peek_val);
+					if (peek_rc == 0) {
+						int found = 0;
+						for (i = 0; i < 50; i++) {
+							if (peek_val == word1s[i]) {
+								found = 1;
+								break;
+							}
+						}
+						if (found) {
+							bm_w1_value = peek_val;
+						} else {
+							peek_rc = decode_golay(w1_cw ^ 0x7fffff, &peek_val);
+							if (peek_rc == 0) {
+								bm_w1_value = peek_val;
+								bm_w1_inverted = 1;
+							} else {
+								LOGP(DGOLAY, LOGL_NOTICE, "Batch W1: re-decode failed.\n");
+								break;
+							}
+						}
+					} else {
+						peek_rc = decode_golay(w1_cw ^ 0x7fffff, &peek_val);
+						if (peek_rc == 0) {
+							bm_w1_value = peek_val;
+							bm_w1_inverted = 1;
+						} else {
+							LOGP(DGOLAY, LOGL_NOTICE, "Batch W1: both decodes failed.\n");
+							break;
+						}
+					}
+				}
+
+				/* Reverse-map W1 -> G1, G0 */
+				if (reverse_word1(bm_w1_value, &bm_g1, &bm_g0) < 0) {
+					LOGP(DGOLAY, LOGL_NOTICE, "Batch: W1 value %u not in word1s table.\n", bm_w1_value);
+					break;
+				}
+				bm_g1g0 = bm_g1 * 10 + bm_g0;
+
+				/* Skip 1-bit inverted comma between W1 and W2 */
+				if (batch_pos + 1 + dup_bits > total_bits) {
+					LOGP(DGOLAY, LOGL_NOTICE, "Batch: not enough bits for W2.\n");
+					break;
+				}
+				batch_pos += 1;
+
+				/* --- Decode W2 with inversion and range detection --- */
+				{
+					uint32_t w2_cw = read_dup_golay(bits, &batch_pos);
+					uint16_t w2_try[2] = { 0, 0 };
+					int golay_ok[2] = { 0, 0 };
+					int try_g1g0[2];
+					int best_inv = -1, best_range = -1;
+					int ta2, ta1, ta0;
+					int inv, rng;
+
+					try_g1g0[0] = bm_g1g0;
+					try_g1g0[1] = bm_g1g0 + 50;
+
+					peek_rc = decode_golay(w2_cw, &peek_val);
+					if (peek_rc == 0) { w2_try[0] = peek_val; golay_ok[0] = 1; }
+
+					peek_rc = decode_golay(w2_cw ^ 0x7fffff, &peek_val);
+					if (peek_rc == 0) { w2_try[1] = peek_val; golay_ok[1] = 1; }
+
+					for (inv = 0; inv < 2; inv++) {
+						if (!golay_ok[inv])
+							continue;
+						for (rng = 0; rng < 2; rng++) {
+							if (reverse_word2(w2_try[inv], try_g1g0[rng], &ta2, &ta1, &ta0) == 0) {
+								if (best_inv < 0) {
+									best_inv = inv;
+									best_range = rng;
+									bm_a2 = ta2; bm_a1 = ta1; bm_a0 = ta0;
+								}
+							}
+						}
+					}
+
+					if (best_inv < 0) {
+						LOGP(DGOLAY, LOGL_NOTICE, "Batch W2: no valid address from any combination.\n");
+						break;
+					}
+
+					bm_w2_inverted = best_inv;
+
+					if (best_range == 1) {
+						bm_g1g0 = try_g1g0[1];
+						bm_g1 = bm_g1g0 / 10;
+						bm_g0 = bm_g1g0 % 10;
+					}
+				}
+
+				/* Function from inversion pattern */
+				bm_function = (bm_w1_inverted ? 0x2 : 0) | (bm_w2_inverted ? 0x1 : 0);
+
+				/* Index digit */
+				bm_idx = (preamble_idx - bm_g0 + 10) % 10;
+
+				/* --- Type detection (same logic as Stage 3-7) --- */
+				bm_remaining = total_bits - batch_pos;
+
+				if (bm_remaining < 1 + bch_block_bits) {
+					bm_detected_type = TYPE_TONE;
+				} else {
+					bm_detected_type = TYPE_TONE;
+
+					/* Check for voice: peek for activation code */
+					if (bm_remaining >= comma_len + dup_bits + 1 + dup_bits) {
+						int vpeek_pos = batch_pos + comma_len;
+						uint32_t vpeek_cw = read_dup_golay(bits, &vpeek_pos);
+						uint16_t vpeek_val;
+						if (decode_golay(vpeek_cw, &vpeek_val) == 0 && vpeek_val == activation_code)
+							bm_detected_type = TYPE_VOICE;
+					}
+
+					/* If not voice, probe BCH for data vs tone */
+					if (bm_detected_type != TYPE_VOICE && bm_remaining >= 1 + bch_block_bits) {
+						int probe_pos = batch_pos + 1;
+						uint16_t probe_bch[8];
+						uint8_t probe_d[8];
+						uint8_t probe_cksum;
+						int probe_ok = 1;
+						int pk;
+
+						deinterleave_bch(bits, &probe_pos, probe_bch);
+						for (pk = 0; pk < 8; pk++) {
+							if (decode_bch(probe_bch[pk], &probe_d[pk]) < 0) {
+								probe_ok = 0;
+								break;
+							}
+						}
+
+						if (probe_ok) {
+							probe_cksum = 0;
+							for (pk = 0; pk < 7; pk++)
+								probe_cksum += calc_bch(probe_d[pk]);
+							probe_cksum &= 0x7f;
+
+							if (probe_cksum == probe_d[7]) {
+								/* Valid data block — distinguish alpha vs numeric */
+								uint8_t a_ch[8];
+								uint8_t n_nib[12];
+								int a_fill = 0, n_fill = 0;
+								int nk;
+
+								a_ch[0] = probe_d[0] & 0x3f;
+								a_ch[1] = ((probe_d[0] >> 6) | (probe_d[1] << 1)) & 0x3f;
+								a_ch[2] = ((probe_d[1] >> 5) | (probe_d[2] << 2)) & 0x3f;
+								a_ch[3] = ((probe_d[2] >> 4) | (probe_d[3] << 3)) & 0x3f;
+								a_ch[4] = ((probe_d[3] >> 3) | (probe_d[4] << 4)) & 0x3f;
+								a_ch[5] = ((probe_d[4] >> 2) | (probe_d[5] << 5)) & 0x3f;
+								a_ch[6] = (probe_d[5] >> 1) & 0x3f;
+								a_ch[7] = probe_d[6] & 0x3f;
+
+								n_nib[0]  = probe_d[0] & 0xf;
+								n_nib[1]  = ((probe_d[0] >> 4) | (probe_d[1] << 3)) & 0xf;
+								n_nib[2]  = (probe_d[1] >> 1) & 0xf;
+								n_nib[3]  = ((probe_d[1] >> 5) | (probe_d[2] << 2)) & 0xf;
+								n_nib[4]  = (probe_d[2] >> 2) & 0xf;
+								n_nib[5]  = ((probe_d[2] >> 6) | (probe_d[3] << 1)) & 0xf;
+								n_nib[6]  = (probe_d[3] >> 3) & 0xf;
+								n_nib[7]  = probe_d[4] & 0xf;
+								n_nib[8]  = ((probe_d[4] >> 4) | (probe_d[5] << 3)) & 0xf;
+								n_nib[9]  = (probe_d[5] >> 1) & 0xf;
+								n_nib[10] = ((probe_d[5] >> 5) | (probe_d[6] << 2)) & 0xf;
+								n_nib[11] = (probe_d[6] >> 2) & 0xf;
+
+								for (nk = 7; nk >= 0; nk--) {
+									if (a_ch[nk] == 0x3e) a_fill++;
+									else break;
+								}
+								for (nk = 11; nk >= 0; nk--) {
+									if (n_nib[nk] == 0x0a) n_fill++;
+									else break;
+								}
+
+								if (n_fill > 0 && a_fill == 0)
+									bm_detected_type = TYPE_NUMERIC;
+								else if (a_fill > 0 && n_fill == 0)
+									bm_detected_type = TYPE_ALPHA;
+								else if (n_fill > a_fill)
+									bm_detected_type = TYPE_NUMERIC;
+								else if (a_fill > n_fill)
+									bm_detected_type = TYPE_ALPHA;
+								else
+									bm_detected_type = TYPE_ALPHA;
+							}
+						}
+					}
+				}
+
+				/* Assign function suffix */
+				switch (bm_detected_type) {
+				case TYPE_VOICE:
+					bm_suffix = '1' + bm_function;
+					break;
+				case TYPE_ALPHA:
+				case TYPE_NUMERIC:
+					bm_suffix = '5' + bm_function;
+					break;
+				default:
+					bm_suffix = (bm_function == 0) ? '9' : '0';
+					break;
+				}
+
+				/* Build 7-digit functional address */
+				batch_msg.address[0] = '0' + bm_idx;
+				batch_msg.address[1] = '0' + bm_g1;
+				batch_msg.address[2] = '0' + bm_g0;
+				batch_msg.address[3] = '0' + bm_a2;
+				batch_msg.address[4] = '0' + bm_a1;
+				batch_msg.address[5] = '0' + bm_a0;
+				batch_msg.address[6] = bm_suffix;
+				batch_msg.address[7] = '\0';
+				batch_msg.address_number = bm_function + 1;
+				batch_msg.type = bm_detected_type;
+
+				LOGP(DGOLAY, LOGL_INFO, "Batch address %d: '%s' (function %d, type %s).\n",
+					batch_count + 1, batch_msg.address, bm_function,
+					bm_detected_type == TYPE_VOICE ? "voice" :
+					bm_detected_type == TYPE_ALPHA ? "alpha" :
+					bm_detected_type == TYPE_NUMERIC ? "numeric" : "tone");
+
+				/* --- Decode data for this address (Stages 4-7 equivalent) --- */
+
+				if (bm_detected_type == TYPE_ALPHA || bm_detected_type == TYPE_NUMERIC) {
+					int bm_data_start = batch_pos;
+					int bm_alpha_pos = 0;
+					int bm_numeric_pos = 0;
+					uint8_t bm_contbit;
+					int bm_shifted = 0;
+
+					/* Alpha decode */
+					bm_contbit = 1;
+					for (i = 0; bm_contbit && i < MAX_ADB; i++) {
+						int k, j;
+
+						if (batch_pos + 1 + bch_block_bits > total_bits)
+							break;
+
+						batch_pos += 1; /* skip 1-bit inverted comma */
+						deinterleave_bch(bits, &batch_pos, bch_cw);
+
+						int block_ok = 1;
+						for (k = 0; k < 8; k++) {
+							if (decode_bch(bch_cw[k], &d[k]) < 0) {
+								d[k] = 0;
+								batch_msg.error_count++;
+								block_ok = 0;
+							}
+						}
+
+						if (block_ok) {
+							checksum = 0;
+							for (k = 0; k < 7; k++)
+								checksum += calc_bch(d[k]);
+							checksum &= 0x7f;
+							if (checksum != d[7])
+								batch_msg.error_count++;
+						}
+
+						{
+							uint8_t ch[8];
+							ch[0] = d[0] & 0x3f;
+							ch[1] = ((d[0] >> 6) | (d[1] << 1)) & 0x3f;
+							ch[2] = ((d[1] >> 5) | (d[2] << 2)) & 0x3f;
+							ch[3] = ((d[2] >> 4) | (d[3] << 3)) & 0x3f;
+							ch[4] = ((d[3] >> 3) | (d[4] << 4)) & 0x3f;
+							ch[5] = ((d[4] >> 2) | (d[5] << 5)) & 0x3f;
+							ch[6] = (d[5] >> 1) & 0x3f;
+							ch[7] = d[6] & 0x3f;
+							bm_contbit = (d[6] >> 6) & 1;
+
+							for (j = 0; j < 8; j++) {
+								c = decode_alpha(ch[j]);
+								if (bm_alpha_pos < (int)sizeof(batch_msg.alpha_data) - 1) {
+									if (c != '\0')
+										batch_msg.alpha_data[bm_alpha_pos++] = c;
+									else if (ch[j] == 0x3e)
+										batch_msg.alpha_fill++;
+								}
+							}
+						}
+					}
+					batch_msg.alpha_data[bm_alpha_pos] = '\0';
+
+					/* Numeric decode (re-read from same position) */
+					batch_pos = bm_data_start;
+					bm_contbit = 1;
+					bm_shifted = 0;
+					batch_msg.numeric_nibble_count = 0;
+
+					for (i = 0; bm_contbit && i < MAX_NDB; i++) {
+						int k, j;
+
+						if (batch_pos + 1 + bch_block_bits > total_bits)
+							break;
+
+						batch_pos += 1;
+						deinterleave_bch(bits, &batch_pos, bch_cw);
+
+						int block_ok = 1;
+						for (k = 0; k < 8; k++) {
+							if (decode_bch(bch_cw[k], &d[k]) < 0) {
+								d[k] = 0;
+								block_ok = 0;
+							}
+						}
+						(void)block_ok;
+
+						{
+							uint8_t nib[12];
+							nib[0]  = d[0] & 0xf;
+							nib[1]  = ((d[0] >> 4) | (d[1] << 3)) & 0xf;
+							nib[2]  = (d[1] >> 1) & 0xf;
+							nib[3]  = ((d[1] >> 5) | (d[2] << 2)) & 0xf;
+							nib[4]  = (d[2] >> 2) & 0xf;
+							nib[5]  = ((d[2] >> 6) | (d[3] << 1)) & 0xf;
+							nib[6]  = (d[3] >> 3) & 0xf;
+							nib[7]  = d[4] & 0xf;
+							nib[8]  = ((d[4] >> 4) | (d[5] << 3)) & 0xf;
+							nib[9]  = (d[5] >> 1) & 0xf;
+							nib[10] = ((d[5] >> 5) | (d[6] << 2)) & 0xf;
+							nib[11] = (d[6] >> 2) & 0xf;
+							bm_contbit = (d[6] >> 6) & 1;
+
+							for (j = 0; j < 12; j++) {
+								if (batch_msg.numeric_nibble_count < (int)sizeof(batch_msg.numeric_nibbles))
+									batch_msg.numeric_nibbles[batch_msg.numeric_nibble_count++] = nib[j];
+
+								c = decode_numeric(nib[j], &bm_shifted);
+								if (c != '\0' && bm_numeric_pos < (int)sizeof(batch_msg.numeric_data) - 1)
+									batch_msg.numeric_data[bm_numeric_pos++] = c;
+								else if (c == '\0' && nib[j] == 0x0a)
+									batch_msg.numeric_fill++;
+							}
+						}
+					}
+					batch_msg.numeric_data[bm_numeric_pos] = '\0';
+
+					/* Score and discriminate */
+					batch_msg.alpha_score = gsc_score_alpha(batch_msg.alpha_data, strlen(batch_msg.alpha_data), batch_msg.alpha_fill);
+					batch_msg.numeric_score = gsc_score_numeric(batch_msg.numeric_nibbles, batch_msg.numeric_nibble_count, batch_msg.numeric_fill);
+					gsc_discriminate(&batch_msg);
+				}
+
+				/* Voice: decode activation code */
+				if (bm_detected_type == TYPE_VOICE) {
+					if (batch_pos + comma_len + dup_bits + 1 + dup_bits <= total_bits) {
+						batch_pos += comma_len;
+						codeword = read_dup_golay(bits, &batch_pos);
+						rc = decode_golay(codeword, &decoded_value);
+						if (rc < 0 || decoded_value != activation_code)
+							batch_msg.error_count++;
+						batch_pos += 1; /* skip inverted comma */
+						codeword = read_dup_golay(bits, &batch_pos);
+						/* skip complement verification for brevity */
+					}
+					batch_msg.type = TYPE_VOICE;
+				}
+
+				/* Tone-only: skip tone comma */
+				if (bm_detected_type == TYPE_TONE) {
+					bm_remaining = total_bits - batch_pos;
+					if (bm_remaining >= tone_comma_len)
+						batch_pos += tone_comma_len;
+					else
+						batch_pos += bm_remaining;
+					batch_msg.type = TYPE_TONE;
+				}
+
+				batch_msg.decode_ok = 1;
+				batch_msg.polarity_inverted = msg->polarity_inverted;
+
+				LOGP(DGOLAY, LOGL_INFO, "Batch message %d: address='%s' type=%s errors=%d.\n",
+					batch_count + 1, batch_msg.address,
+					batch_msg.type == TYPE_VOICE ? "voice" :
+					batch_msg.type == TYPE_ALPHA ? "alpha" :
+					batch_msg.type == TYPE_NUMERIC ? "numeric" : "tone",
+					batch_msg.error_count);
+
+				golay_msg_receive(&batch_msg);
+				batch_count++;
+			}
+		}
+
+		if (batch_count > 1) {
+			LOGP(DGOLAY, LOGL_INFO, "Batch decode: %d total messages decoded.\n", batch_count);
+		}
+	}
 
 	return 0;
 }
@@ -2214,7 +2836,10 @@ static inline void queue_comma(gsc_t *gsc, int bits, uint8_t polarity)
 	}
 }
 
-static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, const char *message)
+/* Forward declaration: queue_interleaved_tones is defined after queue_batch */
+static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polarity, int max_tones);
+
+static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, const char *message, double polarity)
 {
 	int preamble;
 	uint16_t word1, word2;
@@ -2398,6 +3023,11 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 		golay ^= 0x7fffff;
 		queue_bit(gsc, (golay & 1) ^ 1);
 		queue_dup(gsc, golay, 23);
+		/* Interleave tone-only addresses during the alert period */
+		{
+			double msg_polarity = (polarity != 0.0) ? polarity : gsc->fsk_polarity;
+			queue_interleaved_tones(gsc, preamble, msg_polarity, 8);
+		}
 		break;
 	default:
 		/* encode comma after message and store */
@@ -2411,6 +3041,351 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 		return -EOVERFLOW;
 	}
 
+	return 0;
+}
+
+/* Called during voice page encoding, after activation code.
+ * Interleaves up to max_tones tone-only addresses into the 1.92s alert period.
+ * Only tone-only messages matching the voice message's preamble index AND polarity are eligible.
+ * Each address pair (W1, W2) takes ~0.202s at 600 baud.
+ * Returns the number of tone-only addresses interleaved. */
+static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polarity, int max_tones)
+{
+	gsc_msg_t **msgp, *msg;
+	int preamble;
+	uint16_t word1, word2;
+	uint8_t function;
+	uint32_t golay;
+	int rc;
+	int count = 0;
+
+	/* Walk priority queue first — priority tone-only messages interleaved before normal ones */
+	msgp = &gsc->priority_list;
+	while (*msgp && count < max_tones) {
+		msg = *msgp;
+		if (msg->type == TYPE_TONE
+		    && msg->preamble_index == preamble_index
+		    && msg->polarity == polarity) {
+			/* Dequeue from priority list */
+			*msgp = msg->next;
+			gsc->priority_count--;
+
+			/* Encode address */
+			rc = encode_address(msg->address, &preamble, &word1, &word2);
+			if (rc < 0) {
+				LOGP(DGOLAY, LOGL_ERROR, "Failed to encode interleaved tone address '%s', skipping.\n", msg->address);
+				free(msg);
+				continue;
+			}
+
+			/* Get function from last digit */
+			switch (msg->address[6]) {
+				case '1': function = 0; break;
+				case '2': function = 1; break;
+				case '3': function = 2; break;
+				case '4': function = 3; break;
+				case '5': function = 0; break;
+				case '6': function = 1; break;
+				case '7': function = 2; break;
+				case '8': function = 3; break;
+				case '9': function = 0; break;
+				case '0': function = 1; break;
+				default:
+					LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in interleaved tone address.\n", msg->address[6]);
+					free(msg);
+					continue;
+			}
+
+			LOGP(DGOLAY, LOGL_DEBUG, "Interleaving tone-only address %d: '%s'.\n", count + 1, msg->address);
+
+			/* Encode W1: comma + dup Golay codeword */
+			golay = calc_golay(word1);
+			if (function & 0x2)
+				golay ^= 0x7fffff;
+			queue_comma(gsc, 28, golay & 1);
+			queue_dup(gsc, golay, 23);
+
+			/* Encode W2: inverted first bit + dup Golay codeword */
+			golay = calc_golay(word2);
+			if (function & 0x1)
+				golay ^= 0x7fffff;
+			queue_bit(gsc, (golay & 1) ^ 1);
+			queue_dup(gsc, golay, 23);
+
+			free(msg);
+			count++;
+		} else {
+			msgp = &(*msgp)->next;
+		}
+	}
+
+	/* Walk normal queue */
+	msgp = &gsc->msg_list;
+	while (*msgp && count < max_tones) {
+		msg = *msgp;
+		if (msg->type == TYPE_TONE
+		    && msg->preamble_index == preamble_index
+		    && msg->polarity == polarity) {
+			/* Dequeue from normal list */
+			*msgp = msg->next;
+			gsc->normal_count--;
+
+			/* Encode address */
+			rc = encode_address(msg->address, &preamble, &word1, &word2);
+			if (rc < 0) {
+				LOGP(DGOLAY, LOGL_ERROR, "Failed to encode interleaved tone address '%s', skipping.\n", msg->address);
+				free(msg);
+				continue;
+			}
+
+			/* Get function from last digit */
+			switch (msg->address[6]) {
+				case '1': function = 0; break;
+				case '2': function = 1; break;
+				case '3': function = 2; break;
+				case '4': function = 3; break;
+				case '5': function = 0; break;
+				case '6': function = 1; break;
+				case '7': function = 2; break;
+				case '8': function = 3; break;
+				case '9': function = 0; break;
+				case '0': function = 1; break;
+				default:
+					LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in interleaved tone address.\n", msg->address[6]);
+					free(msg);
+					continue;
+			}
+
+			LOGP(DGOLAY, LOGL_DEBUG, "Interleaving tone-only address %d: '%s'.\n", count + 1, msg->address);
+
+			/* Encode W1: comma + dup Golay codeword */
+			golay = calc_golay(word1);
+			if (function & 0x2)
+				golay ^= 0x7fffff;
+			queue_comma(gsc, 28, golay & 1);
+			queue_dup(gsc, golay, 23);
+
+			/* Encode W2: inverted first bit + dup Golay codeword */
+			golay = calc_golay(word2);
+			if (function & 0x1)
+				golay ^= 0x7fffff;
+			queue_bit(gsc, (golay & 1) ^ 1);
+			queue_dup(gsc, golay, 23);
+
+			free(msg);
+			count++;
+		} else {
+			msgp = &(*msgp)->next;
+		}
+	}
+
+	if (count > 0)
+		LOGP(DGOLAY, LOGL_INFO, "Interleaved %d tone-only address(es) during voice page (preamble_index=%d).\n", count, preamble_index);
+
+	return count;
+}
+
+
+/* Encode a group of messages sharing the same preamble index as a single batch.
+ * Uses inverted preamble (XOR 0x7FFFFF) to distinguish from individual mode.
+ * msgs is a linked list of messages to encode; count is the number of messages.
+ * Returns 0 on success, -EOVERFLOW if bitstream exceeds buffer. */
+static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
+{
+	int preamble;
+	uint16_t word1, word2;
+	uint8_t function;
+	uint32_t golay;
+	uint16_t bch[8];
+	uint8_t msg[12], digit, shifted, contbit, checksum;
+	int i, j, k;
+	int rc;
+	int msg_index;
+	gsc_msg_t *cur;
+
+	queue_reset(gsc);
+
+	if (!msgs || count <= 0)
+		return -EINVAL;
+
+	/* Get preamble index from first message */
+	preamble = msgs->preamble_index;
+
+	/* Encode INVERTED preamble: XOR each 23-bit codeword with 0x7FFFFF */
+	LOGP(DGOLAY, LOGL_DEBUG, "Encoding inverted preamble '%d' for batch of %d messages.\n", preamble, count);
+	golay = calc_golay(preamble_values[preamble]) ^ 0x7fffff;
+	queue_comma(gsc, 28, golay & 1);
+	for (i = 0; i < 18; i++) {
+		queue_dup(gsc, golay, 23);
+	}
+
+	/* Encode start code (same pattern as queue_batch) */
+	LOGP(DGOLAY, LOGL_DEBUG, "Encoding start code.\n");
+	golay = calc_golay(start_code);
+	queue_comma(gsc, 28, golay & 1);
+	queue_dup(gsc, golay, 23);
+	golay ^= 0x7fffff;
+	queue_bit(gsc, (golay & 1) ^ 1);
+	queue_dup(gsc, golay, 23);
+
+	/* Encode each message in the batch */
+	msg_index = 0;
+	for (cur = msgs; cur != NULL; cur = cur->next) {
+		/* Defensive: skip voice messages (should never be in a batch group) */
+		if (cur->type == TYPE_VOICE) {
+			LOGP(DGOLAY, LOGL_NOTICE, "Skipping voice message '%s' in batch group (voice is always individual).\n", cur->address);
+			continue;
+		}
+
+		/* Extended batch: insert second start code after 16th address */
+		if (msg_index == 16) {
+			LOGP(DGOLAY, LOGL_DEBUG, "Encoding second start code for extended batch.\n");
+			golay = calc_golay(start_code);
+			queue_comma(gsc, 28, golay & 1);
+			queue_dup(gsc, golay, 23);
+			golay ^= 0x7fffff;
+			queue_bit(gsc, (golay & 1) ^ 1);
+			queue_dup(gsc, golay, 23);
+		}
+
+		/* Encode address */
+		rc = encode_address(cur->address, &preamble, &word1, &word2);
+		if (rc < 0) {
+			LOGP(DGOLAY, LOGL_ERROR, "Failed to encode address '%s' in batch, skipping.\n", cur->address);
+			continue;
+		}
+
+		/* Get function from last digit (same switch as queue_batch) */
+		switch (cur->address[6]) {
+			case '1': function = 0; break;
+			case '2': function = 1; break;
+			case '3': function = 2; break;
+			case '4': function = 3; break;
+			case '5': function = 0; break;
+			case '6': function = 1; break;
+			case '7': function = 2; break;
+			case '8': function = 3; break;
+			case '9': function = 0; break;
+			case '0': function = 1; break;
+			default:
+				LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in batch address.\n", cur->address[6]);
+				continue;
+		}
+
+		LOGP(DGOLAY, LOGL_DEBUG, "Encoding batch address %d/%d: '%s' type=%d.\n", msg_index + 1, count, cur->address, cur->type);
+
+		/* Encode address W1/W2 with function bits (same as queue_batch) */
+		golay = calc_golay(word1);
+		if (function & 0x2)
+			golay ^= 0x7fffff;
+		queue_comma(gsc, 28, golay & 1);
+		queue_dup(gsc, golay, 23);
+		golay = calc_golay(word2);
+		if (function & 0x1)
+			golay ^= 0x7fffff;
+		queue_bit(gsc, (golay & 1) ^ 1);
+		queue_dup(gsc, golay, 23);
+
+		/* Encode data based on message type (same as queue_batch) */
+		switch (cur->type) {
+		case TYPE_ALPHA:
+		{
+			const char *message = cur->data;
+			LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d alphanumeric digits.\n", (int)strlen(message));
+			for (i = 0; *message; i++) {
+				if (i == MAX_ADB) {
+					LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping message.\n", MAX_ADB * 8);
+				}
+				for (j = 0; *message && j < 8; j++) {
+					msg[j] = encode_alpha(*message++);
+				}
+				while (j < 8)
+					msg[j++] = 0x3e;
+				bch[0] = calc_bch((msg[0] | (msg[1] << 6)) & 0x7f);
+				bch[1] = calc_bch(((msg[1] >> 1) | (msg[2] << 5)) & 0x7f);
+				bch[2] = calc_bch(((msg[2] >> 2) | (msg[3] << 4)) & 0x7f);
+				bch[3] = calc_bch(((msg[3] >> 3) | (msg[4] << 3)) & 0x7f);
+				bch[4] = calc_bch(((msg[4] >> 4) | (msg[5] << 2)) & 0x7f);
+				bch[5] = calc_bch(((msg[5] >> 5) | (msg[6] << 1)) & 0x7f);
+				if (*message && i < MAX_ADB)
+					contbit = 1;
+				else
+					contbit = 0;
+				bch[6] = calc_bch((contbit << 6) | msg[7]);
+				checksum = bch[0] + bch[1] + bch[2] + bch[3] + bch[4] + bch[5] + bch[6];
+				bch[7] = calc_bch(checksum & 0x7f);
+				queue_bit(gsc, (bch[0] & 1) ^ 1);
+				for (j = 0; j < 15; j++) {
+					for (k = 0; k < 8; k++)
+						queue_bit(gsc, (bch[k] >> j) & 1);
+				}
+			}
+			break;
+		}
+		case TYPE_NUMERIC:
+		{
+			const char *message = cur->data;
+			LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d numeric digits.\n", (int)strlen(message));
+			shifted = 0;
+			for (i = 0; *message; i++) {
+				if (i == MAX_NDB) {
+					LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping message.\n", MAX_NDB * 12);
+				}
+				for (j = 0; *message && j < 12; j++) {
+					if (shifted) {
+						digit = shifted & 0xf;
+						shifted = 0;
+					} else
+						digit = encode_numeric(*message);
+					if (digit > 0xf) {
+						shifted = digit;
+						msg[j] = digit >> 4;
+					} else {
+						msg[j] = digit;
+						message++;
+					}
+				}
+				while (j < 12)
+					msg[j++] = 0xa;
+				bch[0] = calc_bch((msg[0] | (msg[1] << 4)) & 0x7f);
+				bch[1] = calc_bch(((msg[1] >> 3) | (msg[2] << 1) | (msg[3] << 5)) & 0x7f);
+				bch[2] = calc_bch(((msg[3] >> 2) | (msg[4] << 2) | (msg[5] << 6)) & 0x7f);
+				bch[3] = calc_bch(((msg[5] >> 1) | (msg[6] << 3)) & 0x7f);
+				bch[4] = calc_bch((msg[7] | (msg[8] << 4)) & 0x7f);
+				bch[5] = calc_bch(((msg[8] >> 3) | (msg[9] << 1) | (msg[10] << 5)) & 0x7f);
+				if (*message && i < MAX_NDB)
+					contbit = 1;
+				else
+					contbit = 0;
+				bch[6] = calc_bch((contbit << 6) | (msg[10] >> 2) | (msg[11] << 2));
+				checksum = bch[0] + bch[1] + bch[2] + bch[3] + bch[4] + bch[5] + bch[6];
+				bch[7] = calc_bch(checksum & 0x7f);
+				queue_bit(gsc, (bch[0] & 1) ^ 1);
+				for (j = 0; j < 15; j++) {
+					for (k = 0; k < 8; k++)
+						queue_bit(gsc, (bch[k] >> j) & 1);
+				}
+			}
+			break;
+		}
+		default:
+			/* Tone-only: encode comma after address */
+			LOGP(DGOLAY, LOGL_DEBUG, "Encoding 'comma' sequence after tone-only address.\n");
+			queue_comma(gsc, 121 * 8, 1);
+			break;
+		}
+
+		msg_index++;
+
+		/* Check buffer overflow mid-batch */
+		if (gsc->bit_overflow) {
+			LOGP(DGOLAY, LOGL_ERROR, "Batch bitstream (%d bits) overflows buffer (%d bits) at message %d/%d.\n",
+			     gsc->bit_num, (int)sizeof(gsc->bit), msg_index, count);
+			return -EOVERFLOW;
+		}
+	}
+
+	LOGP(DGOLAY, LOGL_INFO, "Batch encoded: %d messages, preamble_index=%d, %d bits.\n", msg_index, preamble, gsc->bit_num);
 	return 0;
 }
 
@@ -2442,39 +3417,629 @@ int8_t get_bit(gsc_t *gsc)
 				return 2;
 			}
 			queue_reset(gsc);
-			LOGP(DGOLAY, LOGL_INFO, "Done transmitting message.\n");
+			LOGP(DGOLAY, LOGL_INFO, "Batch TX complete: msgs=%d preamble_index=%d remaining=%d\n",
+			     gsc->tx_msg_count, gsc->tx_preamble_index,
+			     gsc->priority_count + gsc->normal_count);
 			goto next_msg;
 		}
 		return gsc->bit[gsc->bit_index++];
 	}
 
 next_msg:
-	msg = gsc->msg_list;
+	/* Expire stale messages before selecting next batch */
+	scheduler_expire(gsc);
+
+	/* Use scheduler to get next message (or batch) */
+	msg = scheduler_next_batch(gsc);
 
 	/* no message pending, turn transmitter off */
 	if (!msg)
 		return -1;
 
-	/* encode first message in queue */
-	rc = queue_batch(gsc, msg->address, msg->type, msg->data);
-	if (rc >= 0)
-		LOGP(DGOLAY, LOGL_INFO, "Transmitting message to address '%s'.\n", msg->address);
-	golay_msg_destroy(gsc, msg);
-	if (rc < 0)
-		goto next_msg;
+	/* Count messages in the returned linked list */
+	{
+		gsc_msg_t *p;
+		int count = 0;
+		for (p = msg; p != NULL; p = p->next)
+			count++;
+
+		/* Set per-message TX polarity before encoding */
+		if (msg->polarity != 0.0)
+			gsc->fsk_tx_polarity = msg->polarity;
+		else
+			gsc->fsk_tx_polarity = gsc->fsk_polarity;
+
+		/* Record batch info for completion logging */
+		gsc->tx_preamble_index = msg->preamble_index;
+
+		if (count > 1 && gsc->batching_mode != BATCHING_OFF) {
+			/* Multi-message batch: use batch group encoder */
+			gsc->tx_msg_count = count;
+			rc = queue_batch_group(gsc, msg, count);
+			if (rc >= 0)
+				LOGP(DGOLAY, LOGL_INFO, "Transmitting batch of %d messages, preamble_index=%d.\n", count, msg->preamble_index);
+			/* Free all messages in the linked list */
+			while (msg) {
+				gsc_msg_t *next = msg->next;
+				free(msg);
+				msg = next;
+			}
+			if (rc < 0)
+				goto next_msg;
+		} else {
+			/* Single message or batching off: use individual encoder */
+			gsc->tx_msg_count = 1;
+			rc = queue_batch(gsc, msg->address, msg->type, msg->data, msg->polarity);
+			if (rc >= 0)
+				LOGP(DGOLAY, LOGL_INFO, "Transmitting message to address '%s'.\n", msg->address);
+			/* Free all messages (defensive: free extras if any) */
+			{
+				gsc_msg_t *next;
+				while (msg) {
+					next = msg->next;
+					free(msg);
+					msg = next;
+				}
+			}
+			if (rc < 0)
+				goto next_msg;
+		}
+	}
 
 	/* return first bit */
 	return gsc->bit[gsc->bit_index++];
 }
 
+/* Insert message into appropriate queue based on priority flag.
+ * Computes and caches preamble_index, records enqueue_time,
+ * logs message details, and starts hold-off timer if needed. */
+void scheduler_enqueue(gsc_t *gsc, gsc_msg_t *msg)
+{
+	gsc_msg_t **msgp;
+
+	/* Compute and cache preamble index: (I + G0) % 10
+	 * where I = address[0], G0 = address[2] */
+	msg->preamble_index = (msg->address[0] - '0' + msg->address[2] - '0') % 10;
+
+	/* Record submission timestamp for expiry */
+	clock_gettime(CLOCK_MONOTONIC, &msg->enqueue_time);
+
+	/* Insert into appropriate queue (FIFO order — append to tail) */
+	if (msg->priority == 1) {
+		msgp = &gsc->priority_list;
+		while (*msgp)
+			msgp = &(*msgp)->next;
+		*msgp = msg;
+		msg->next = NULL;
+		gsc->priority_count++;
+	} else {
+		msgp = &gsc->msg_list;
+		while (*msgp)
+			msgp = &(*msgp)->next;
+		*msgp = msg;
+		msg->next = NULL;
+		gsc->normal_count++;
+	}
+
+	LOGP(DGOLAY, LOGL_INFO, "Scheduler: enqueued '%s' type=%d priority=%d preamble_index=%d queue_depth=%d\n",
+	     msg->address, msg->type, msg->priority, msg->preamble_index,
+	     gsc->priority_count + gsc->normal_count);
+
+	/* Start hold-off timer if batching is enabled, hold-off is not
+	 * already running, and the transmitter is idle (no bits being
+	 * transmitted, i.e., bit_index >= bit_num). */
+	if (gsc->batching_mode != BATCHING_OFF
+	    && !gsc->holdoff_active
+	    && gsc->bit_index >= gsc->bit_num) {
+		clock_gettime(CLOCK_MONOTONIC, &gsc->holdoff_start);
+		gsc->holdoff_active = 1;
+		LOGP(DGOLAY, LOGL_DEBUG, "Scheduler: hold-off timer started (%d ms).\n", gsc->holdoff_ms);
+	}
+}
+
+/* Remove expired messages from both queues.
+ * Messages older than gsc->expiry_seconds are removed and freed.
+ * Priority message expiry is logged at ERROR level; normal at NOTICE. */
+void scheduler_expire(gsc_t *gsc)
+{
+	gsc_msg_t **msgp, *msg;
+	struct timespec now;
+	long age;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+
+	/* Walk priority queue */
+	msgp = &gsc->priority_list;
+	while (*msgp) {
+		msg = *msgp;
+		age = now.tv_sec - msg->enqueue_time.tv_sec;
+		if (age >= gsc->expiry_seconds) {
+			*msgp = msg->next;
+			gsc->priority_count--;
+			LOGP(DGOLAY, LOGL_ERROR, "Scheduler: priority message '%s' expired (age %ld seconds).\n",
+			     msg->address, age);
+			free(msg);
+		} else {
+			msgp = &(*msgp)->next;
+		}
+	}
+
+	/* Walk normal queue */
+	msgp = &gsc->msg_list;
+	while (*msgp) {
+		msg = *msgp;
+		age = now.tv_sec - msg->enqueue_time.tv_sec;
+		if (age >= gsc->expiry_seconds) {
+			*msgp = msg->next;
+			gsc->normal_count--;
+			LOGP(DGOLAY, LOGL_NOTICE, "Scheduler: message '%s' expired (age %ld seconds).\n",
+			     msg->address, age);
+			free(msg);
+		} else {
+			msgp = &(*msgp)->next;
+		}
+	}
+}
+
+/* Log queue status (called from dump_info). */
+void scheduler_dump(gsc_t *gsc)
+{
+	const char *mode_str;
+	int total_depth;
+	int ngroups = 0;
+	struct {
+		int preamble_index;
+		double polarity;
+	} groups[30];
+	gsc_msg_t *msg;
+	int i;
+
+	total_depth = gsc->priority_count + gsc->normal_count;
+
+	switch (gsc->batching_mode) {
+	case BATCHING_NORMAL:
+		mode_str = "normal";
+		break;
+	case BATCHING_EXTENDED:
+		mode_str = "extended";
+		break;
+	default:
+		mode_str = "off";
+		break;
+	}
+
+	/* Count unique (preamble_index, polarity) groups across both queues,
+	 * skipping voice messages (they are never batched). */
+	for (msg = gsc->priority_list; msg; msg = msg->next) {
+		if (msg->type == TYPE_VOICE)
+			continue;
+		for (i = 0; i < ngroups; i++) {
+			if (groups[i].preamble_index == msg->preamble_index
+			    && groups[i].polarity == msg->polarity)
+				break;
+		}
+		if (i == ngroups && ngroups < 30) {
+			groups[ngroups].preamble_index = msg->preamble_index;
+			groups[ngroups].polarity = msg->polarity;
+			ngroups++;
+		}
+	}
+	for (msg = gsc->msg_list; msg; msg = msg->next) {
+		if (msg->type == TYPE_VOICE)
+			continue;
+		for (i = 0; i < ngroups; i++) {
+			if (groups[i].preamble_index == msg->preamble_index
+			    && groups[i].polarity == msg->polarity)
+				break;
+		}
+		if (i == ngroups && ngroups < 30) {
+			groups[ngroups].preamble_index = msg->preamble_index;
+			groups[ngroups].polarity = msg->polarity;
+			ngroups++;
+		}
+	}
+
+	LOGP(DGOLAY, LOGL_INFO, "Scheduler: queue_depth=%d priority=%d normal=%d batch_groups=%d batching=%s\n",
+	     total_depth, gsc->priority_count, gsc->normal_count, ngroups, mode_str);
+}
+
+
+/* Helper: dequeue a batch of up to max_batch messages from a queue,
+ * selecting only messages matching the given (preamble_index, polarity) tuple.
+ * Uses pointer-to-pointer pattern to dequeue from the middle while
+ * maintaining FIFO order. Returns a linked list of dequeued messages.
+ * Decrements *count for each dequeued message. */
+static gsc_msg_t *dequeue_batch_group(gsc_msg_t **queue_head, int *count,
+				      int preamble_index, double polarity,
+				      int max_batch)
+{
+	gsc_msg_t *result = NULL, **result_tail = &result;
+	gsc_msg_t **msgp;
+	int dequeued = 0;
+
+	msgp = queue_head;
+	while (*msgp && dequeued < max_batch) {
+		gsc_msg_t *msg = *msgp;
+		if (msg->preamble_index == preamble_index && msg->polarity == polarity) {
+			/* Unlink from queue */
+			*msgp = msg->next;
+			/* Append to result list */
+			msg->next = NULL;
+			*result_tail = msg;
+			result_tail = &msg->next;
+			(*count)--;
+			dequeued++;
+		} else {
+			msgp = &(*msgp)->next;
+		}
+	}
+
+	return result;
+}
+
+/* Helper: find the (preamble_index, polarity) group with the most messages
+ * in a queue, considering only non-voice messages.
+ * Returns the count of the best group (0 if none found).
+ * Stores the winning preamble_index and polarity in *best_pi and *best_pol. */
+static int find_best_group(gsc_msg_t *head, int *best_pi, double *best_pol)
+{
+	/* preamble_index is 0-9, polarity is one of {-1.0, 0.0, 1.0} → 30 slots */
+	struct {
+		int preamble_index;
+		double polarity;
+		int count;
+	} groups[30];
+	int ngroups = 0;
+	gsc_msg_t *msg;
+	int i, best_count = 0;
+
+	for (msg = head; msg; msg = msg->next) {
+		/* Skip voice messages — they are never batched */
+		if (msg->type == TYPE_VOICE)
+			continue;
+
+		/* Find or create group entry */
+		for (i = 0; i < ngroups; i++) {
+			if (groups[i].preamble_index == msg->preamble_index
+			    && groups[i].polarity == msg->polarity)
+				break;
+		}
+		if (i == ngroups && ngroups < 30) {
+			groups[ngroups].preamble_index = msg->preamble_index;
+			groups[ngroups].polarity = msg->polarity;
+			groups[ngroups].count = 0;
+			ngroups++;
+		}
+		if (i < 30)
+			groups[i].count++;
+	}
+
+	/* Find group with most messages */
+	for (i = 0; i < ngroups; i++) {
+		if (groups[i].count > best_count) {
+			best_count = groups[i].count;
+			*best_pi = groups[i].preamble_index;
+			*best_pol = groups[i].polarity;
+		}
+	}
+
+	return best_count;
+}
+
+/* Select next message or batch for transmission.
+ * Groups messages by (preamble_index, polarity) tuple.
+ * Returns a linked list of messages sharing the same preamble index and polarity,
+ * or a single message if batching is off. Returns NULL if hold-off is active. */
+gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
+{
+	gsc_msg_t *msg;
+	int max_batch;
+	int best_pi = 0;
+	double best_pol = 0.0;
+
+	/* === BATCHING_OFF: simple single-message dequeue === */
+	if (gsc->batching_mode == BATCHING_OFF) {
+		/* Priority queue first */
+		if (gsc->priority_list) {
+			msg = gsc->priority_list;
+			gsc->priority_list = msg->next;
+			msg->next = NULL;
+			gsc->priority_count--;
+			return msg;
+		}
+		/* Normal queue */
+		if (gsc->msg_list) {
+			msg = gsc->msg_list;
+			gsc->msg_list = msg->next;
+			msg->next = NULL;
+			gsc->normal_count--;
+			return msg;
+		}
+		return NULL;
+	}
+
+	/* === Batching enabled === */
+	max_batch = (gsc->batching_mode == BATCHING_EXTENDED) ? 32 : 16;
+
+	/* Check hold-off timer */
+	if (gsc->holdoff_active) {
+		struct timespec now;
+		long elapsed_ms;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		elapsed_ms = (now.tv_sec - gsc->holdoff_start.tv_sec) * 1000
+			   + (now.tv_nsec - gsc->holdoff_start.tv_nsec) / 1000000;
+
+		if (elapsed_ms < gsc->holdoff_ms
+		    && gsc->priority_count + gsc->normal_count < 16) {
+			/* Hold-off still active and neither queue has reached 16 */
+			return NULL;
+		}
+		/* Timer expired or batch full — proceed */
+		gsc->holdoff_active = 0;
+		LOGP(DGOLAY, LOGL_DEBUG, "Scheduler: hold-off expired (elapsed %ld ms).\n", elapsed_ms);
+	}
+
+	/* --- Check priority queue --- */
+	if (gsc->priority_list) {
+		/* Voice messages at head are always dequeued individually */
+		if (gsc->priority_list->type == TYPE_VOICE) {
+			msg = gsc->priority_list;
+			gsc->priority_list = msg->next;
+			msg->next = NULL;
+			gsc->priority_count--;
+			return msg;
+		}
+
+		/* Group priority non-voice messages by (preamble_index, polarity) */
+		if (find_best_group(gsc->priority_list, &best_pi, &best_pol) > 0) {
+			return dequeue_batch_group(&gsc->priority_list,
+						   &gsc->priority_count,
+						   best_pi, best_pol, max_batch);
+		}
+	}
+
+	/* --- Fall through to normal queue --- */
+	if (gsc->msg_list) {
+		/* Voice messages at head are always dequeued individually */
+		if (gsc->msg_list->type == TYPE_VOICE) {
+			msg = gsc->msg_list;
+			gsc->msg_list = msg->next;
+			msg->next = NULL;
+			gsc->normal_count--;
+			return msg;
+		}
+
+		/* Group normal non-voice messages by (preamble_index, polarity) */
+		if (find_best_group(gsc->msg_list, &best_pi, &best_pol) > 0) {
+			return dequeue_batch_group(&gsc->msg_list,
+						   &gsc->normal_count,
+						   best_pi, best_pol, max_batch);
+		}
+	}
+
+	/* Both queues empty or only voice messages with none at head */
+	return NULL;
+}
+
+/* Returns 0 on success, -EINVAL on hard rejection.
+ * Logs warnings for soft issues (content, type-suffix).
+ *
+ * Validation stages (in order):
+ *  1. Address length — exactly 7 characters (hard reject)
+ *  2. Address digits — each character '0'-'9' (hard reject)
+ *  3. Illegal GSC codes — G1G0 vs illegal_low[]/illegal_high[] (hard reject)
+ *  4. Function suffix — 7th digit '0'-'9' (hard reject, covered by step 2)
+ *  5. TYPE_AUTO derivation from function suffix
+ *  6. Content warnings (log warning, accept)
+ *  7. Type-suffix consistency warnings (log warning, accept)
+ *  8. Voice file existence — access(path, R_OK) (hard reject)
+ */
+int golay_validate_msg(const char *address, enum gsc_msg_type type,
+                       const char *data)
+{
+	static const uint16_t illegal_low[16] = {   0,  25,  51, 103, 206, 340, 363, 412, 445, 530, 642, 726, 782, 810, 825, 877 };
+	static const uint16_t illegal_high[7] = {   0, 292, 425, 584, 631, 841, 851 };
+	int i, g1, g0, g1g0, a2, a1, a0, a2a1a0;
+	enum gsc_msg_type suffix_type;
+	int effective_type_is_auto = (type == TYPE_AUTO);
+	enum gsc_msg_type effective_type;
+
+	/* Stage 1: Address length — must be exactly 7 characters */
+	if (!address || strlen(address) != 7) {
+		LOGP(DGOLAY, LOGL_ERROR, "Validation failed: address must be exactly 7 characters (got %d).\n",
+		     address ? (int)strlen(address) : 0);
+		return -EINVAL;
+	}
+
+	/* Stage 2: Address digits — each character must be '0'-'9' */
+	for (i = 0; i < 7; i++) {
+		if (address[i] < '0' || address[i] > '9') {
+			LOGP(DGOLAY, LOGL_ERROR, "Validation failed: non-digit character '%c' at position %d in address '%s'.\n",
+			     address[i], i, address);
+			return -EINVAL;
+		}
+	}
+
+	/* Stage 3: Illegal GSC codes — G1G0 mapped against tables */
+	g1 = address[1] - '0';
+	g0 = address[2] - '0';
+	a2 = address[3] - '0';
+	a1 = address[4] - '0';
+	a0 = address[5] - '0';
+	g1g0 = g1 * 10 + g0;
+	a2a1a0 = a2 * 100 + a1 * 10 + a0;
+
+	if (g1g0 < 50) {
+		for (i = 0; i < 16; i++) {
+			if (a2a1a0 == (int)illegal_low[i]) {
+				LOGP(DGOLAY, LOGL_ERROR, "Validation failed: illegal GSC code, address digits '%03d' with G1G0=%02d matches illegal_low table.\n",
+				     a2a1a0, g1g0);
+				return -EINVAL;
+			}
+		}
+	} else {
+		for (i = 0; i < 7; i++) {
+			if (a2a1a0 == (int)illegal_high[i]) {
+				LOGP(DGOLAY, LOGL_ERROR, "Validation failed: illegal GSC code, address digits '%03d' with G1G0=%02d matches illegal_high table.\n",
+				     a2a1a0, g1g0);
+				return -EINVAL;
+			}
+		}
+	}
+
+	/* Stage 4: Function suffix — 7th digit must be '0'-'9'
+	 * Already guaranteed by stage 2, but kept explicit per design. */
+
+	/* Stage 5: TYPE_AUTO derivation from function suffix */
+	switch (address[6]) {
+	case '1': case '2': case '3': case '4':
+		suffix_type = TYPE_VOICE;
+		break;
+	case '5': case '6': case '7': case '8':
+		suffix_type = TYPE_ALPHA;
+		break;
+	case '9': case '0':
+		suffix_type = TYPE_TONE;
+		break;
+	default:
+		/* Cannot happen after stage 2, but be defensive */
+		LOGP(DGOLAY, LOGL_ERROR, "Validation failed: invalid function suffix '%c'.\n", address[6]);
+		return -EINVAL;
+	}
+
+	if (effective_type_is_auto)
+		effective_type = suffix_type;
+	else
+		effective_type = type;
+
+	/* Stage 6: Content warnings (log warning, accept) */
+	if (data && data[0] != '\0') {
+		if (effective_type == TYPE_NUMERIC) {
+			/* Check each char is in GSC numeric charset */
+			int digit_count = 0;
+			for (i = 0; data[i] != '\0'; i++) {
+				char c = data[i];
+				int valid = 0;
+				int shifted = 0;
+
+				if (c >= '0' && c <= '9') { valid = 1; }
+				else if (c == 'U' || c == 'u') { valid = 1; }
+				else if (c == ' ') { valid = 1; }
+				else if (c == '-') { valid = 1; }
+				else if (c == '*' || c == '=') { valid = 1; }
+				else if (c == 'A' || c == 'a') { valid = 1; shifted = 1; }
+				else if (c == 'B' || c == 'b') { valid = 1; shifted = 1; }
+				else if (c == 'C' || c == 'c') { valid = 1; shifted = 1; }
+				else if (c == 'D' || c == 'd') { valid = 1; shifted = 1; }
+				else if (c == 'E' || c == 'e') { valid = 1; shifted = 1; }
+				else if (c == 'F' || c == 'f') { valid = 1; shifted = 1; }
+				else if (c == 'G' || c == 'g') { valid = 1; shifted = 1; }
+				else if (c == 'H' || c == 'h') { valid = 1; shifted = 1; }
+				else if (c == 'J' || c == 'j') { valid = 1; shifted = 1; }
+				else if (c == 'L' || c == 'l') { valid = 1; shifted = 1; }
+				else if (c == 'N' || c == 'n') { valid = 1; shifted = 1; }
+				else if (c == 'P' || c == 'p') { valid = 1; shifted = 1; }
+				else if (c == 'R' || c == 'r') { valid = 1; shifted = 1; }
+
+				if (!valid)
+					LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: numeric message contains character '%c' at position %d not in GSC numeric charset.\n", c, i);
+
+				/* Count digits: shifted letters count as 2 */
+				digit_count += shifted ? 2 : 1;
+			}
+			if (digit_count > 24)
+				LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: numeric message length %d exceeds default maximum of 24 digits.\n", digit_count);
+		} else if (effective_type == TYPE_ALPHA) {
+			int len = (int)strlen(data);
+			if (len > 80)
+				LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: alphanumeric message length %d exceeds default maximum of 80 characters.\n", len);
+		}
+	}
+
+	/* Stage 7: Type-suffix consistency warnings (log warning, accept) */
+	if (!effective_type_is_auto && type != suffix_type) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: explicit type conflicts with function suffix '%c' (suffix implies %s).\n",
+		     address[6],
+		     suffix_type == TYPE_VOICE ? "voice" :
+		     suffix_type == TYPE_ALPHA ? "alpha" :
+		     suffix_type == TYPE_TONE  ? "tone" : "unknown");
+	}
+	if (effective_type == TYPE_TONE && (address[6] == '3' || address[6] == '4')) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: tone-only message for voice-only address (suffix '%c'), potential incompatibility.\n",
+		     address[6]);
+	}
+
+	/* Stage 8: Voice file existence check (hard reject) */
+	if (effective_type == TYPE_VOICE) {
+		if (!data || data[0] == '\0') {
+			LOGP(DGOLAY, LOGL_ERROR, "Validation failed: voice message requires a file path.\n");
+			return -EINVAL;
+		}
+		if (access(data, R_OK) != 0) {
+			LOGP(DGOLAY, LOGL_ERROR, "Validation failed: voice file '%s' does not exist or is not readable.\n", data);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+
 void golay_msg_send(const char *text)
 {
-	char buffer[strlen(text) + 1], *p = buffer, *address_string, *message;
+	char buffer[strlen(text) + 1], *p, *address_string, *message;
 	gsc_t *gsc;
+	gsc_msg_t *msg;
 	enum gsc_msg_type type = TYPE_AUTO;
+	int priority = 0;
+	double polarity = 0.0;
+	char *start, *end;
+	int i;
 
 	strcpy(buffer, text);
+
+	/* Trim leading whitespace */
+	start = buffer;
+	while (*start && isspace((unsigned char)*start))
+		start++;
+
+	/* Trim trailing whitespace */
+	end = start + strlen(start);
+	while (end > start && isspace((unsigned char)*(end - 1)))
+		end--;
+	*end = '\0';
+
+	/* Discard empty lines */
+	if (*start == '\0') {
+		LOGP(DGOLAY, LOGL_ERROR, "FIFO: discarding empty input line.\n");
+		return;
+	}
+
+	/* Parse optional priority prefix '!' */
+	if (*start == '!') {
+		priority = 1;
+		start++;
+	}
+
+	/* Parse: address[,type,message[,polarity]] */
+	p = start;
 	address_string = strsep(&p, ",");
+
+	/* Validate address is exactly 7 digits */
+	if (strlen(address_string) != 7) {
+		LOGP(DGOLAY, LOGL_ERROR, "FIFO: malformed input, address '%s' is not 7 characters (got %zu). Discarding: '%s'\n",
+		     address_string, strlen(address_string), text);
+		return;
+	}
+	for (i = 0; i < 7; i++) {
+		if (!isdigit((unsigned char)address_string[i])) {
+			LOGP(DGOLAY, LOGL_ERROR, "FIFO: malformed input, address '%s' contains non-digit '%c' at position %d. Discarding: '%s'\n",
+			     address_string, address_string[i], i, text);
+			return;
+		}
+	}
+
 	message = p;
 
 	/* If no comma was found, p is NULL — this is a tone-only/auto
@@ -2483,6 +4048,7 @@ void golay_msg_send(const char *text)
 		message = "";
 	}
 
+	/* Parse type prefix (a, n, v) followed by comma */
 	switch ((message[0] << 8) | message[1]) {
 	case ('a' << 8) | ',':
 		type = TYPE_ALPHA;
@@ -2500,8 +4066,40 @@ void golay_msg_send(const char *text)
 		message = "";
 	}
 
+	/* Parse optional trailing polarity field.
+	 * The polarity is the 4th comma-separated field: address,type,message,polarity
+	 * Only check when we have a type and message (i.e., type != TYPE_AUTO). */
+	if (type != TYPE_AUTO && message[0] != '\0') {
+		/* Find the last comma in the message portion */
+		char *last_comma = strrchr(message, ',');
+		if (last_comma) {
+			char *polarity_str = last_comma + 1;
+			/* Polarity field is a single character: '+' or '-' */
+			if (polarity_str[0] == '+' && polarity_str[1] == '\0') {
+				polarity = 1.0;
+				*last_comma = '\0'; /* trim polarity from message */
+			} else if (polarity_str[0] == '-' && polarity_str[1] == '\0') {
+				polarity = -1.0;
+				*last_comma = '\0'; /* trim polarity from message */
+			}
+			/* Otherwise it's part of the message content, not a polarity field */
+		}
+	}
+
+	if (golay_validate_msg(address_string, type, message) != 0) {
+		LOGP(DGOLAY, LOGL_ERROR, "Message rejected by validator for address '%s'.\n", address_string);
+		return;
+	}
+
 	gsc = (gsc_t *) sender_head;
-	golay_msg_create(gsc, address_string, message, type);
+	msg = golay_msg_create(gsc, address_string, message, type);
+	if (msg) {
+		msg->priority = priority;
+		msg->polarity = polarity;
+		scheduler_enqueue(gsc, msg);
+		LOGP(DGOLAY, LOGL_INFO, "FIFO: enqueued message for '%s' (priority=%d, polarity=%.1f, type=%d).\n",
+		     address_string, priority, polarity, type);
+	}
 }
 
 /* Output a decoded RX message to the log and to the receive FIFO.
@@ -2519,8 +4117,22 @@ void golay_msg_send(const char *text)
 void golay_msg_receive(const gsc_rx_msg_t *msg)
 {
 	const char *pol_str = msg->polarity_inverted ? "-" : "+";
+	const char *status_str;
+	char status_buf[48];
 	FILE *fp;
 	int is_data;
+
+	if (msg->uncorrectable_count > 0) {
+		snprintf(status_buf, sizeof(status_buf), "partial, %d uncorrectable",
+			msg->uncorrectable_count);
+		status_str = status_buf;
+	} else if (msg->error_count == 0) {
+		status_str = "ok";
+	} else {
+		snprintf(status_buf, sizeof(status_buf), "corrected, %d error%s",
+			msg->error_count, msg->error_count == 1 ? "" : "s");
+		status_str = status_buf;
+	}
 
 	is_data = (msg->type == TYPE_ALPHA || msg->type == TYPE_NUMERIC);
 
@@ -2539,8 +4151,8 @@ void golay_msg_receive(const gsc_rx_msg_t *msg)
 			numeric_marker = msg->guess_uncertain ? "[WINNER?]" : "[WINNER]";
 		}
 
-		LOGP(DGOLAY, LOGL_NOTICE, "Received message for address '%s' (errors=%d, polarity=%s):\n",
-			msg->address, msg->error_count, pol_str);
+		LOGP(DGOLAY, LOGL_NOTICE, "Received message for address '%s' (%s, polarity=%s):\n",
+			msg->address, status_str, pol_str);
 		LOGP(DGOLAY, LOGL_NOTICE, "  Alpha %s: '%s' (score=%d, fill=%d)\n",
 			alpha_marker, msg->alpha_data, msg->alpha_score, msg->alpha_fill);
 		LOGP(DGOLAY, LOGL_NOTICE, "  Numeric %s: '%s' (score=%d, fill=%d)\n",
@@ -2580,8 +4192,8 @@ void golay_msg_receive(const gsc_rx_msg_t *msg)
 			break;
 		}
 
-		LOGP(DGOLAY, LOGL_NOTICE, "Received %s message for address '%s': '%s' (errors=%d, polarity=%s).\n",
-			type_str, msg->address, msg->data, msg->error_count, pol_str);
+		LOGP(DGOLAY, LOGL_NOTICE, "Received %s message for address '%s': '%s' (%s, polarity=%s).\n",
+			type_str, msg->address, msg->data, status_str, pol_str);
 
 		fp = fopen("/tmp/golay_msg_received", "a");
 		if (fp) {
@@ -2639,6 +4251,7 @@ int call_down_setup(int __attribute__((unused)) callref, const char *caller_id, 
 	msg = golay_msg_create(gsc, address, message, TYPE_AUTO);
 	if (!msg)
 		return -CAUSE_INVALNUMBER;
+	scheduler_enqueue(gsc, msg);
 	return -CAUSE_NORMAL;
 }
 
@@ -2674,5 +4287,11 @@ void call_down_audio(void __attribute__((unused)) *decoder, void __attribute__((
 {
 }
 
-void dump_info(void) {}
+void dump_info(void)
+{
+	gsc_t *gsc = (gsc_t *) sender_head;
+
+	if (gsc)
+		scheduler_dump(gsc);
+}
 

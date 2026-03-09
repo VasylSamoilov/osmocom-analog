@@ -1,3 +1,4 @@
+#include <time.h>
 #include "../libmobile/sender.h"
 
 enum gsc_msg_type {
@@ -33,7 +34,8 @@ typedef struct gsc_rx_msg {
 	enum gsc_msg_type	type;			/* winner type: TYPE_ALPHA or TYPE_NUMERIC */
 	char			data[256];		/* winner's decoded message (for backward compat) */
 	int			preamble_index;		/* 0-9 */
-	int			error_count;		/* total bit errors corrected */
+	int			error_count;		/* corrected errors (Golay/BCH succeeded with corrections) */
+	int			uncorrectable_count;	/* uncorrectable errors (BCH decode failed entirely) */
 	int			decode_ok;		/* 1 = success, 0 = failure */
 	int			polarity_inverted;	/* 1 = received with inverted polarity */
 
@@ -63,6 +65,11 @@ typedef struct gsc_msg {
 	char			address[8];		/* 7 digits + EOL */
 	enum gsc_msg_type	type;			/* type of message */
 	char			data[256];		/* message to be transmitted */
+	/* --- New fields --- */
+	int			priority;		/* 0 = normal, 1 = priority */
+	double			polarity;		/* per-message FSK polarity: 1.0, -1.0, or 0.0 (use instance default) */
+	struct timespec		enqueue_time;		/* CLOCK_MONOTONIC timestamp at enqueue */
+	int			preamble_index;		/* cached (address[0]-'0' + address[2]-'0') % 10 */
 } gsc_msg_t;
 
 /* Known GSC Pager Models and Capabilities (Appendix III)
@@ -86,6 +93,12 @@ typedef struct gsc_msg {
  *     function = (W1_inverted << 1) | W2_inverted
  */
 
+enum gsc_batching_mode {
+	BATCHING_OFF = 0,	/* individual mode (current behavior, default) */
+	BATCHING_NORMAL = 1,	/* batch mode: up to 16 addresses per preamble */
+	BATCHING_EXTENDED = 2,	/* extended batch: up to 32 addresses per preamble */
+};
+
 typedef struct gsc {
 	sender_t		sender;
 	int			tx;
@@ -103,6 +116,7 @@ typedef struct gsc {
 	/* dsp states */
 	double			fsk_deviation;		/* deviation of FSK signal on sound card */
 	double			fsk_polarity;		/* polarity of FSK signal (-1.0 = bit '1' is down) */
+	double			fsk_tx_polarity;	/* effective polarity for current TX message */
 	sample_t		fsk_ramp_up[256];	/* samples of upward ramp shape */
 	sample_t		fsk_ramp_down[256];	/* samples of downward ramp shape */
 	double			fsk_bitduration;	/* duration of a bit in samples */
@@ -169,6 +183,30 @@ typedef struct gsc {
 	char			voice_address[8];	/* address of current voice message */
 	char			voice_filename[512];	/* path of current voice WAV file */
 	samplerate_t		voice_downsample;	/* resampler: DSP rate -> 8000 Hz */
+
+	/* --- Scheduler --- */
+	gsc_msg_t		*priority_list;		/* priority queue head (FIFO order) */
+	int			priority_count;		/* priority queue depth */
+	int			normal_count;		/* normal queue depth (msg_list) */
+
+	/* --- TX batch tracking (for completion logging) --- */
+	int			tx_msg_count;		/* messages in current TX batch */
+	int			tx_preamble_index;	/* preamble index of current TX batch */
+
+	/* --- Batch mode --- */
+	int			batching_mode;		/* 0=off, 1=normal, 2=extended */
+
+	/* --- Hold-off timer --- */
+	int			holdoff_ms;		/* configurable hold-off period (default 100) */
+	struct timespec		holdoff_start;		/* when hold-off started */
+	int			holdoff_active;		/* 1 = timer running */
+
+	/* --- Message expiry --- */
+	int			expiry_seconds;		/* configurable expiry timeout (default 300) */
+
+	/* --- RX batch mode disambiguation --- */
+	int			rx_batch_candidate;	/* 1 = inverted preamble seen, awaiting start code check */
+	int			rx_batch_mode;		/* 1 = confirmed batch mode for current reception */
 } gsc_t;
 
 int golay_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double deviation, double polarity, int tx, int rx, int auto_polarity, const char *message, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, const char *voice_dir, int voice_monitor);
@@ -180,6 +218,16 @@ void init_bch(void);
 int8_t get_bit(gsc_t *gsc);
 void golay_msg_send(const char *buffer);
 void golay_msg_receive(const gsc_rx_msg_t *msg);
+
+/* validator API */
+int golay_validate_msg(const char *address, enum gsc_msg_type type,
+                       const char *data);
+
+/* scheduler API */
+void scheduler_enqueue(gsc_t *gsc, gsc_msg_t *msg);
+void scheduler_expire(gsc_t *gsc);
+gsc_msg_t *scheduler_next_batch(gsc_t *gsc);
+void scheduler_dump(gsc_t *gsc);
 
 /* decoder API */
 int decode_golay(uint32_t codeword, uint16_t *data);
