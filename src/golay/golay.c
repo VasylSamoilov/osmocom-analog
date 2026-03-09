@@ -1325,7 +1325,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		rc = decode_golay(codeword, &decoded_value);
 		if (rc < 0) {
 			LOGP(DGOLAY, LOGL_DEBUG, "Preamble rep %d: Golay decode failed, skipping.\n", i);
-			msg->error_count++;
 			continue;
 		}
 
@@ -1339,7 +1338,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		if (j == 10) {
 			LOGP(DGOLAY, LOGL_DEBUG, "Preamble rep %d: value %u not in preamble table.\n",
 				i, decoded_value);
-			msg->error_count++;
 		}
 	}
 
