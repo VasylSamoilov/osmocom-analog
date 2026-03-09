@@ -718,7 +718,7 @@ int sdr_status_snapshot(double now)
 
 			c->has_signal = (c->snr_db > 6.0) ? 1 : 0;
 
-			LOGP(DSDR, LOGL_NOTICE, "RX CH%d: rf=%.1f dB nf=%.1f dB snr=%.1f dB %s | dev=%.0f Hz offset=%.0f Hz freq=%.6f MHz\n",
+			LOGP(DSDR, LOGL_DEBUG, "RX CH%d: rf=%.1f dB nf=%.1f dB snr=%.1f dB %s | dev=%.0f Hz offset=%.0f Hz freq=%.6f MHz\n",
 			     i, avg_rf_db, c->noise_floor_db, c->snr_db,
 			     c->has_signal ? "SIGNAL" : "noise",
 			     c->deviation_hz, c->freq_offset_hz,
@@ -747,7 +747,7 @@ int sdr_status_snapshot(double now)
 		hw->rx_sample_count = hw->_rx_count;
 		hw->valid = 1;
 
-		LOGP(DSDR, LOGL_NOTICE, "HW: TX peak=%.4f avg=%.4f clip=%d | RX peak=%.6f avg=%.4f rail=%d\n",
+		LOGP(DSDR, LOGL_DEBUG, "HW: TX peak=%.4f avg=%.4f clip=%d | RX peak=%.6f avg=%.4f rail=%d\n",
 		     hw->tx_peak, hw->tx_avg, hw->tx_clip_count,
 		     hw->rx_peak, hw->rx_avg, hw->rx_rail_count);
 	}

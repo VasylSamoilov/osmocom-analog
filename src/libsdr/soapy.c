@@ -790,7 +790,7 @@ int soapy_receive(float *buff, int max)
 			double now = ts.tv_sec + ts.tv_nsec / 1e9;
 			if (now - rx_rate_timer >= 1.0) {
 				double actual_rate = rx_sample_total / (now - rx_rate_timer);
-				LOGP(DSOAPY, LOGL_NOTICE, "RX RATE: actual=%.0f Hz (configured=%.0f Hz, diff=%.1f ppm)\n",
+				LOGP(DSOAPY, LOGL_DEBUG, "RX RATE: actual=%.0f Hz (configured=%.0f Hz, diff=%.1f ppm)\n",
 				     actual_rate, soapy_rx_inst->samplerate,
 				     1e6 * (actual_rate - soapy_rx_inst->samplerate) / soapy_rx_inst->samplerate);
 				rx_sample_total = 0;

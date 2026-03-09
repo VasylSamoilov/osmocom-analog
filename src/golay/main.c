@@ -45,6 +45,8 @@ static int deviation_given = 0;
 static double polarity = 1;
 static int polarity_given = 0;
 static const char *message = "1234";
+static const char *voice_dir = NULL;	/* voice recording output folder */
+static int voice_monitor = 0;		/* voice monitor mode (play to audio output) */
 
 void print_help(const char *arg0)
 {
@@ -57,12 +59,19 @@ void print_help(const char *arg0)
 	printf("        If none of the options -T nor -R is given, only transmitter is enabled.\n");
 	printf(" -D --deviation wide | 4.5 | narrow | 1.0 | <other KHz>\n"); /* NB confirmed by IQ data from signal-id-wiki */
 	printf("        Choose deviation of FFSK signal (default %.0f KHz).\n", deviation / 1000.0);
-	printf(" -P --polarity -1 | nagative | 1 | positive\n");
+	printf(" -P --polarity -1 | negative | 1 | positive\n");
 	printf("        Choose polarity of FFSK signal. 'positive' means that a binary 1 uses\n");
-	printf("        positive and a binary 0 negative deviation. (default %s KHz).\n", (polarity < 0) ? "negative" : "positive");
+	printf("        positive and a binary 0 negative deviation. (default %s).\n", (polarity < 0) ? "negative" : "positive");
+	printf("        For RX, locks polarity to this value. If not given, RX auto-detects\n");
+	printf("        polarity from the preamble.\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Send this message, if no caller ID was given or if built-in console\n");
 	printf("        is used. (default \"%s\").\n", message);
+	printf(" -V --voice-dir <path>\n");
+	printf("        Record received voice pages to WAV files in the given directory.\n");
+	printf("        Filenames: golay_voice_page_<timestamp>_<address>.wav\n");
+	printf("    --voice-monitor\n");
+	printf("        Also play received voice pages to the audio output device.\n");
 	printf("\n");
 	printf("File: %s\n", MSG_SEND);
 	printf("        Write \"<address>[,message]\" to it, to send a default message.\n");
@@ -89,6 +98,8 @@ static void add_options(void)
 	option_add('D', "deviation", 1);
 	option_add('P', "polarity", 1);
 	option_add('M', "message", 1);
+	option_add('V', "voice-dir", 1);
+	option_add(0x100, "voice-monitor", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -134,6 +145,12 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 'M':
 		message = options_strdup(argv[argi++]);
+		break;
+	case 'V':
+		voice_dir = options_strdup(argv[argi++]);
+		break;
+	case 0x100: /* --voice-monitor */
+		voice_monitor = 1;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -232,11 +249,6 @@ int main(int argc, char *argv[])
 	if (!tx && !rx)
 		tx = 1;
 
-	if (rx) {
-		fprintf(stderr, "Sorry, but RX is not yet supported and maybe never will.\n");
-		goto fail;
-	}
-
 	/* TX & RX if loopback */
 	if (loopback)
 		tx = rx = 1;
@@ -261,7 +273,7 @@ int main(int argc, char *argv[])
 	/* create transceiver instance */
 	for (i = 0; i < num_kanal; i++) {
 		frequency = atof(kanal[i]) * 1e6;
-		rc = golay_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, deviation, polarity, message, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
+		rc = golay_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, deviation, polarity, tx, rx, !polarity_given, message, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, voice_dir, voice_monitor);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;
