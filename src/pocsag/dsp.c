@@ -35,6 +35,28 @@
 
 #define MAX_DISPLAY	1.4	/* something above speech level, no emphasis */
 
+/*
+ * Count number of differing bits (hamming distance) between two 32-bit words.
+ */
+static inline int hamming32(uint32_t a, uint32_t b)
+{
+	uint32_t x = a ^ b;
+	/* popcount via bit manipulation */
+	x = x - ((x >> 1) & 0x55555555u);
+	x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+	x = (x + (x >> 4)) & 0x0f0f0f0fu;
+	return (int)((x * 0x01010101u) >> 24);
+}
+
+/*
+ * Maximum hamming distance for sync word detection.
+ * BCH(31,21) can correct up to 2-bit errors, so we accept sync words
+ * with up to 2 bit differences. This matches the correction capability
+ * without introducing false positives (probability of a random 32-bit
+ * word being within hamming distance 2 of SYNC is ~529/2^32 ≈ 1.2e-7).
+ */
+#define SYNC_MAX_HAMMING	2
+
 static void dsp_init_ramp(pocsag_t *pocsag)
 {
         double c;
@@ -55,9 +77,11 @@ static void dsp_init_ramp(pocsag_t *pocsag)
 }
 
 /* Init transceiver instance. */
-int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double deviation, double polarity)
+int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double deviation, double polarity, int auto_baud, int auto_polarity)
 {
+	static const int rates[] = { 512, 1200, 2400 };
 	int rc;
+	int i, n;
 
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Init DSP for transceiver.\n");
 
@@ -81,6 +105,50 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	pocsag->fsk_deviation = 1.0; // equals what we st at sender_set_fm()
 	pocsag->fsk_polarity = polarity;
 	dsp_init_ramp(pocsag);
+
+	/* store auto-detection config */
+	pocsag->rx_auto_baud = auto_baud;
+	pocsag->rx_auto_polarity = auto_polarity;
+	pocsag->rx_baud_locked = baudrate;
+	pocsag->rx_polarity_locked = polarity;
+	pocsag->samplerate = samplerate;
+
+	/* init multi-rate RX decoders */
+	if (auto_baud) {
+		n = 3;
+		for (i = 0; i < 3; i++) {
+			pocsag->rx_baud[i].baudrate = rates[i];
+			pocsag->rx_baud[i].bitstep = 1.0 / ((double)samplerate / (double)rates[i]);
+			pocsag->rx_baud[i].phase = 0.0;
+			pocsag->rx_baud[i].lastbit = 0;
+			pocsag->rx_baud[i].word = 0;
+			pocsag->rx_baud[i].word_inv = 0;
+			pocsag->rx_baud[i].preamble_count = 0;
+			pocsag->rx_baud[i].preamble_count_inv = 0;
+			pocsag->rx_baud[i].prev_bit = 0;
+			pocsag->rx_baud[i].prev_bit_inv = 0;
+		}
+		LOGP_CHAN(DDSP, LOGL_INFO, "RX baud rate: auto-detect (512/1200/2400).\n");
+	} else {
+		n = 1;
+		pocsag->rx_baud[0].baudrate = baudrate;
+		pocsag->rx_baud[0].bitstep = 1.0 / ((double)samplerate / (double)baudrate);
+		pocsag->rx_baud[0].phase = 0.0;
+		pocsag->rx_baud[0].lastbit = 0;
+		pocsag->rx_baud[0].word = 0;
+		pocsag->rx_baud[0].word_inv = 0;
+		pocsag->rx_baud[0].preamble_count = 0;
+		pocsag->rx_baud[0].preamble_count_inv = 0;
+		pocsag->rx_baud[0].prev_bit = 0;
+		pocsag->rx_baud[0].prev_bit_inv = 0;
+		LOGP_CHAN(DDSP, LOGL_INFO, "RX baud rate: locked to %d.\n", baudrate);
+	}
+	pocsag->rx_baud_count = n;
+
+	if (auto_polarity)
+		LOGP_CHAN(DDSP, LOGL_INFO, "RX polarity: auto-detect.\n");
+	else
+		LOGP_CHAN(DDSP, LOGL_INFO, "RX polarity: locked to %s.\n", (polarity < 0) ? "negative" : "positive");
 
 	return 0;
 
@@ -170,28 +238,305 @@ static int fsk_block_encode(pocsag_t *pocsag, uint32_t word)
 	return count;
 }
 
+/*
+ * Lock the receiver to a specific baud rate and polarity after sync detection.
+ * Reconfigures the main fsk_bitstep/phase so the existing locked-mode decoder
+ * (fsk_block_decode / fsk_decode) works at the detected rate.
+ */
+static void dsp_rx_lock(pocsag_t *pocsag, int baudrate, double polarity)
+{
+	pocsag->rx_baud_locked = baudrate;
+	pocsag->rx_polarity_locked = polarity;
+	pocsag->fsk_bitstep = 1.0 / ((double)pocsag->samplerate / (double)baudrate);
+	pocsag->fsk_polarity = polarity;
+	pocsag->rx_rate_locked = 1;
+	pocsag->rx_resync_countdown = 0;
+	/* reset main decoder phase to align with the sync we just found */
+	pocsag->fsk_rx_phase = 0.0;
+}
+
+/*
+ * Reset multi-rate search state. Called when sync is lost (batch ends)
+ * and we need to go back to scanning for preamble/sync.
+ */
+static void dsp_rx_unlock(pocsag_t *pocsag)
+{
+	int i;
+
+	pocsag->rx_rate_locked = 0;
+	pocsag->rx_resync_countdown = 0;
+
+	for (i = 0; i < pocsag->rx_baud_count; i++) {
+		pocsag->rx_baud[i].phase = 0.0;
+		pocsag->rx_baud[i].lastbit = 0;
+		pocsag->rx_baud[i].word = 0;
+		pocsag->rx_baud[i].word_inv = 0;
+		pocsag->rx_baud[i].preamble_count = 0;
+		pocsag->rx_baud[i].preamble_count_inv = 0;
+		pocsag->rx_baud[i].prev_bit = 0;
+		pocsag->rx_baud[i].prev_bit_inv = 0;
+	}
+}
+
+/*
+ * Maximum number of bits to search for the next FSC after a batch ends.
+ *
+ * Per POCSAG spec, consecutive batches are at the same rate with the FSC
+ * immediately following the last codeword (zero gap). We only need tolerance
+ * for minor bit slip / clock drift.
+ *
+ * Keep this small: while we're locked at one rate, the locked decoder is
+ * consuming samples. If a new transmission starts at a different rate,
+ * those samples are demodulated at the wrong rate and lost. At 512 baud,
+ * each bit is ~2ms, so 32 bits = ~62ms — short enough to not miss a
+ * new preamble at any rate (576 bits at 2400 baud = 240ms).
+ */
+#define RESYNC_TIMEOUT_BITS	32
+
+/* forward declaration — fsk_decode_resync calls fsk_decode on unlock */
+static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length);
+
 static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 {
 	if (!pocsag->fsk_rx_sync) {
 		pocsag->fsk_rx_word = (pocsag->fsk_rx_word << 1) | bit;
-		if (pocsag->fsk_rx_word == CODEWORD_SYNC) {
-			put_codeword(pocsag, pocsag->fsk_rx_word, -1, -1);
-			pocsag->fsk_rx_sync = 16;
-			pocsag->fsk_rx_index = 0;
-		} else
-		if (pocsag->fsk_rx_word == (uint32_t)(~CODEWORD_SYNC))
-			LOGP_CHAN(DDSP, LOGL_NOTICE, "Received inverted sync, caused by wrong polarity or by radio noise. Verify correct polarity!\n");
+
+		/* count down resync timeout if we're between batches */
+		if (pocsag->rx_resync_countdown > 0) {
+			if (--pocsag->rx_resync_countdown == 0) {
+				/* failed to find next FSC — transmission ended */
+				LOGP_CHAN(DDSP, LOGL_INFO, "No FSC found within %d bits after batch end, unlocking.\n", RESYNC_TIMEOUT_BITS);
+				if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity)
+					dsp_rx_unlock(pocsag);
+			}
+		}
+
+		/*
+		 * Check for sync word with BCH error correction.
+		 * The sync word (0x7CD215D8) is a valid BCH(31,21) codeword,
+		 * so we can attempt correction on the shift register contents.
+		 * In locked mode we already know the rate and polarity, so
+		 * the preamble requirement is not needed — just find the FSC.
+		 *
+		 * Use hamming distance as fast pre-filter to avoid expensive
+		 * BCH correction on every bit.
+		 */
+		if (hamming32(pocsag->fsk_rx_word, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
+			uint32_t trial = pocsag->fsk_rx_word;
+			if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
+				if (pocsag->fsk_rx_word != CODEWORD_SYNC)
+					LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync (0x%08x -> 0x%08x).\n",
+						  pocsag->fsk_rx_word, CODEWORD_SYNC);
+				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
+				pocsag->fsk_rx_sync = 16;
+				pocsag->fsk_rx_index = 0;
+				pocsag->rx_resync_countdown = 0;
+			}
+		} else if (hamming32(pocsag->fsk_rx_word, (uint32_t)(~CODEWORD_SYNC)) <= SYNC_MAX_HAMMING) {
+			uint32_t trial = ~pocsag->fsk_rx_word;
+			if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC)
+				LOGP_CHAN(DDSP, LOGL_NOTICE, "Received inverted sync (locked mode), caused by wrong polarity or by radio noise.\n");
+		}
 	} else {
 		pocsag->fsk_rx_word = (pocsag->fsk_rx_word << 1) | bit;
 		if (++pocsag->fsk_rx_index == 32) {
 			pocsag->fsk_rx_index = 0;
 			put_codeword(pocsag, pocsag->fsk_rx_word, (16 - pocsag->fsk_rx_sync) >> 1, pocsag->fsk_rx_sync & 1);
-			--pocsag->fsk_rx_sync;
+			if (--pocsag->fsk_rx_sync == 0) {
+				/*
+				 * Batch complete. Per POCSAG spec, all batches after
+				 * the preamble are at the same data rate. Stay locked
+				 * and search for the next FSC at the same rate.
+				 * Start a countdown — if no FSC is found within
+				 * RESYNC_TIMEOUT_BITS, the transmission has ended
+				 * and we unlock for the next preamble.
+				 */
+				pocsag->rx_resync_countdown = RESYNC_TIMEOUT_BITS;
+			}
 		}
 	}
 }
 
-static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length)
+/*
+ * Minimum preamble bits for sync acceptance.
+ *
+ * Exact sync match (0 bit errors): no preamble required.
+ *   False positive rate: 2400 baud × 6 scanners × 2^-32 ≈ 3e-6/sec.
+ *   Essentially zero — the 32-bit sync word is sufficient on its own.
+ *
+ * BCH-corrected sync (1-2 bit errors): require MIN_PREAMBLE_BITS_BCH.
+ *   529 words within hamming ≤ 2 of SYNC, so false positive rate without
+ *   preamble: 2400 × 6 × 529/2^32 ≈ 1.8e-3/sec (one every ~10 min).
+ *   Even 8 alternating preamble bits (probability ~2^-8 for random data)
+ *   reduces this to ~7e-6/sec — negligible.
+ */
+#define MIN_PREAMBLE_BITS_BCH	8
+
+/*
+ * Track preamble quality: count consecutive alternating bits.
+ * Preamble is 101010... so each bit must differ from the previous one.
+ * If it alternates, increment count; otherwise reset to 1 (current bit
+ * starts a potential new run).
+ */
+static inline void track_preamble(uint8_t bit, uint8_t *prev_bit, int *preamble_count)
+{
+	if (bit != *prev_bit)
+		(*preamble_count)++;
+	else
+		*preamble_count = 1;
+	*prev_bit = bit;
+}
+
+/*
+ * Multi-rate preamble/sync scanner.
+ *
+ * Runs all configured baud rate slots in parallel. Each slot maintains its
+ * own phase accumulator and shift register. We check both normal and inverted
+ * polarity shift registers for the sync word.
+ *
+ * Sync acceptance policy:
+ *   - Exact sync match: accepted immediately (no preamble needed).
+ *   - BCH-corrected sync (1-2 bit errors): requires MIN_PREAMBLE_BITS_BCH
+ *     alternating preamble bits to reduce false positive risk.
+ *
+ * When sync is found: lock to that rate/polarity, configure the main decoder,
+ * and hand off to fsk_decode_locked() for the rest of the batch.
+ *
+ * Returns 1 if sync was found (and we locked), 0 otherwise.
+ * *consumed is set to the number of samples processed before lock.
+ */
+static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *consumed)
+{
+	double polarity = pocsag->fsk_polarity;
+	int i, s;
+
+	for (i = 0; i < length; i++) {
+		double sample = spl[i];
+
+		for (s = 0; s < pocsag->rx_baud_count; s++) {
+			struct rx_baud_state *st = &pocsag->rx_baud[s];
+			uint8_t got_bit = 0;
+			uint8_t bit_val = 0;
+
+			/* simple zero-crossing FSK demod per slot */
+			if (sample * polarity > 0.0) {
+				if (!st->lastbit) {
+					st->phase = -0.5;
+					st->lastbit = 1;
+					got_bit = 1; bit_val = 1;
+				} else {
+					st->phase += st->bitstep;
+					if (st->phase >= 1.0) {
+						st->phase -= 1.0;
+						got_bit = 1; bit_val = 1;
+					}
+				}
+			} else {
+				if (st->lastbit) {
+					st->phase = -0.5;
+					st->lastbit = 0;
+					got_bit = 1; bit_val = 0;
+				} else {
+					st->phase += st->bitstep;
+					if (st->phase >= 1.0) {
+						st->phase -= 1.0;
+						got_bit = 1; bit_val = 0;
+					}
+				}
+			}
+
+			if (!got_bit)
+				continue;
+
+			/* shift bit into both normal and inverted registers */
+			st->word = (st->word << 1) | bit_val;
+			st->word_inv = (st->word_inv << 1) | (bit_val ^ 1);
+
+			/* track preamble alternation for both polarities */
+			track_preamble(bit_val, &st->prev_bit, &st->preamble_count);
+			track_preamble(bit_val ^ 1, &st->prev_bit_inv, &st->preamble_count_inv);
+
+			/*
+			 * Sync detection with tiered acceptance:
+			 *   - Exact match: accept immediately (no preamble needed)
+			 *   - BCH-corrected (hamming ≤ 2): require short preamble
+			 *
+			 * Hamming pre-filter avoids expensive BCH on every bit.
+			 */
+			/* check normal polarity */
+			if (st->word == CODEWORD_SYNC) {
+				LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (%d preamble bits).\n",
+					  st->baudrate, (polarity < 0) ? "negative" : "positive", st->preamble_count);
+				dsp_rx_lock(pocsag, st->baudrate, polarity);
+				pocsag->fsk_rx_lastbit = st->lastbit;
+				pocsag->fsk_rx_word = CODEWORD_SYNC;
+				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
+				pocsag->fsk_rx_sync = 16;
+				pocsag->fsk_rx_index = 0;
+				*consumed = i + 1;
+				return 1;
+			}
+			if (st->preamble_count >= MIN_PREAMBLE_BITS_BCH
+			    && hamming32(st->word, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
+				uint32_t trial = st->word;
+				if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
+					LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync at %d baud, %s polarity (%d preamble bits).\n",
+						  st->baudrate, (polarity < 0) ? "negative" : "positive", st->preamble_count);
+					dsp_rx_lock(pocsag, st->baudrate, polarity);
+					pocsag->fsk_rx_lastbit = st->lastbit;
+					pocsag->fsk_rx_word = CODEWORD_SYNC;
+					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
+					pocsag->fsk_rx_sync = 16;
+					pocsag->fsk_rx_index = 0;
+					*consumed = i + 1;
+					return 1;
+				}
+			}
+			/* check inverted polarity (only if auto-detecting polarity) */
+			if (pocsag->rx_auto_polarity) {
+				if (st->word_inv == CODEWORD_SYNC) {
+					double inv_pol = -polarity;
+					LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (inverted, %d preamble bits).\n",
+						  st->baudrate, (inv_pol < 0) ? "negative" : "positive", st->preamble_count_inv);
+					dsp_rx_lock(pocsag, st->baudrate, inv_pol);
+					pocsag->fsk_rx_lastbit = !st->lastbit;
+					pocsag->fsk_rx_word = CODEWORD_SYNC;
+					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
+					pocsag->fsk_rx_sync = 16;
+					pocsag->fsk_rx_index = 0;
+					*consumed = i + 1;
+					return 1;
+				}
+				if (st->preamble_count_inv >= MIN_PREAMBLE_BITS_BCH
+				    && hamming32(st->word_inv, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
+					uint32_t trial = st->word_inv;
+					if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
+						double inv_pol = -polarity;
+						LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync at %d baud, %s polarity (inverted, %d preamble bits).\n",
+							  st->baudrate, (inv_pol < 0) ? "negative" : "positive", st->preamble_count_inv);
+						dsp_rx_lock(pocsag, st->baudrate, inv_pol);
+						pocsag->fsk_rx_lastbit = !st->lastbit;
+						pocsag->fsk_rx_word = CODEWORD_SYNC;
+						put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
+						pocsag->fsk_rx_sync = 16;
+						pocsag->fsk_rx_index = 0;
+						*consumed = i + 1;
+						return 1;
+					}
+				}
+			}
+		}
+	}
+
+	*consumed = length;
+	return 0;
+}
+
+/*
+ * Locked-mode FSK decoder. Runs at the locked baud rate and polarity.
+ * This is the original fsk_decode logic, used after sync has been found.
+ */
+static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 {
 	double phase, bitstep, polarity;
 	int i;
@@ -205,26 +550,22 @@ static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length)
 	for (i = 0; i < length; i++) {
 		if (*spl++ * polarity > 0.0) {
 			if (lastbit) {
-				/* stay up */
 				phase += bitstep;
 				if (phase >= 1.0) {
 					phase -= 1.0;
 					fsk_block_decode(pocsag, 1);
 				}
 			} else {
-				/* ramp up */
 				phase = -0.5;
 				fsk_block_decode(pocsag, 1);
 				lastbit = 1;
 			}
 		} else {
 			if (lastbit) {
-				/* ramp down */
 				phase = -0.5;
 				fsk_block_decode(pocsag, 0);
 				lastbit = 0;
 			} else {
-				/* stay down */
 				phase += bitstep;
 				if (phase >= 1.0) {
 					phase -= 1.0;
@@ -236,6 +577,149 @@ static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length)
 
 	pocsag->fsk_rx_phase = phase;
 	pocsag->fsk_rx_lastbit = lastbit;
+}
+
+/*
+ * Between-batches decoder: runs the locked decoder AND the multi-rate
+ * scanner in parallel on the same samples.
+ *
+ * The locked decoder searches for the next FSC at the current rate
+ * (same transmission continuing). The scanner searches for a new
+ * preamble+sync at any rate (new transmission starting).
+ *
+ * Whoever finds a match first wins:
+ *   - Locked decoder finds FSC → continue at same rate (fsk_rx_sync set)
+ *   - Scanner finds preamble+sync → switch to new rate (dsp_rx_lock called)
+ *   - Resync timeout expires → unlock, scanner takes over
+ *
+ * We process sample-by-sample so both paths see every sample.
+ */
+static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
+{
+	double phase, bitstep, polarity;
+	int i, scan_consumed;
+	uint8_t lastbit;
+
+	polarity = pocsag->fsk_polarity;
+	phase = pocsag->fsk_rx_phase;
+	lastbit = pocsag->fsk_rx_lastbit;
+	bitstep = pocsag->fsk_bitstep;
+
+	for (i = 0; i < length; i++) {
+		/* Feed one sample to the locked decoder (searching for next FSC) */
+		if (spl[i] * polarity > 0.0) {
+			if (lastbit) {
+				phase += bitstep;
+				if (phase >= 1.0) {
+					phase -= 1.0;
+					fsk_block_decode(pocsag, 1);
+				}
+			} else {
+				phase = -0.5;
+				fsk_block_decode(pocsag, 1);
+				lastbit = 1;
+			}
+		} else {
+			if (lastbit) {
+				phase = -0.5;
+				fsk_block_decode(pocsag, 0);
+				lastbit = 0;
+			} else {
+				phase += bitstep;
+				if (phase >= 1.0) {
+					phase -= 1.0;
+					fsk_block_decode(pocsag, 0);
+				}
+			}
+		}
+
+		/* Did the locked decoder find the next FSC? */
+		if (pocsag->fsk_rx_sync) {
+			/* Yes — save state and hand remaining samples to locked decoder */
+			pocsag->fsk_rx_phase = phase;
+			pocsag->fsk_rx_lastbit = lastbit;
+			if (i + 1 < length)
+				fsk_decode_locked(pocsag, spl + i + 1, length - i - 1);
+			return;
+		}
+
+		/* Did the resync timeout expire (unlock happened)? */
+		if (!pocsag->rx_rate_locked) {
+			/* Yes — hand remaining samples to the scanner */
+			pocsag->fsk_rx_phase = phase;
+			pocsag->fsk_rx_lastbit = lastbit;
+			if (i + 1 < length)
+				fsk_decode(pocsag, spl + i + 1, length - i - 1);
+			return;
+		}
+
+		/* Feed the same sample to the multi-rate scanner in parallel */
+		if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity) {
+			if (fsk_decode_scan(pocsag, spl + i, 1, &scan_consumed)) {
+				/*
+				 * Scanner found preamble+sync at a different rate.
+				 * dsp_rx_lock() was called, which reconfigured
+				 * fsk_bitstep/fsk_polarity. Hand remaining samples
+				 * to the locked decoder at the new rate.
+				 */
+				if (i + 1 < length)
+					fsk_decode_locked(pocsag, spl + i + 1, length - i - 1);
+				return;
+			}
+		}
+	}
+
+	pocsag->fsk_rx_phase = phase;
+	pocsag->fsk_rx_lastbit = lastbit;
+}
+
+/*
+ * Main FSK decode entry point.
+ *
+ * Three modes of operation:
+ *
+ * 1. Synced (fsk_rx_sync > 0): Actively decoding a batch at locked rate.
+ *
+ * 2. Rate-locked, between batches (rx_rate_locked && !fsk_rx_sync):
+ *    Run locked decoder AND multi-rate scanner in parallel. Per POCSAG spec,
+ *    all batches in a transmission use the same rate, so the locked decoder
+ *    searches for the next FSC. But a new transmission at a different rate
+ *    could start, so the scanner runs simultaneously on the same samples.
+ *
+ * 3. Unlocked (!rx_rate_locked && !fsk_rx_sync): No active transmission.
+ *    Run the multi-rate preamble+sync scanner only.
+ */
+static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length)
+{
+	int consumed;
+
+	while (length > 0) {
+		if (pocsag->fsk_rx_sync) {
+			/* Actively decoding a batch — locked decoder only */
+			fsk_decode_locked(pocsag, spl, length);
+			return;
+		}
+
+		if (pocsag->rx_rate_locked) {
+			/* Between batches — run both paths in parallel */
+			fsk_decode_resync(pocsag, spl, length);
+			return;
+		}
+
+		if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity) {
+			/* Fully unlocked — scan for preamble/sync */
+			if (fsk_decode_scan(pocsag, spl, length, &consumed)) {
+				spl += consumed;
+				length -= consumed;
+				continue;
+			}
+			return;
+		}
+
+		/* Not auto-detecting — original single-rate behavior */
+		fsk_decode_locked(pocsag, spl, length);
+		return;
+	}
 }
 
 /* Process received audio stream from radio unit. */

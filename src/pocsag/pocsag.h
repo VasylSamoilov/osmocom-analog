@@ -100,7 +100,9 @@ enum pocsag_state {
 
 enum pocsag_language {
 	LANGUAGE_DEFAULT = 0,
-	LANGUAGE_GERMAN,
+	LANGUAGE_GERMAN,		/* unknown-unknown-german */
+	LANGUAGE_SKYPER,		/* nec-skyper-categories */
+	LANGUAGE_CYRILLIC,		/* motorola-advisor_linguist-cyrillic */
 };
 
 struct pocsag;
@@ -118,6 +120,13 @@ typedef struct pocsag_msg {
 	int			data_index;		/* current character transmitting */
 	int			bit_index;		/* current bit transmitting */
 	char			padding;		/* EOT or other padding */
+
+	/* retransmission scheduling */
+	int			retransmit_max;		/* total retransmissions after initial TX (0=none) */
+	int			retransmit_count;	/* retransmissions completed so far */
+	double			retransmit_interval;	/* seconds between retransmissions */
+	double			send_delay;		/* seconds to defer initial TX (0=immediate) */
+	double			next_send_time;		/* wall-clock time (seconds since epoch) for next eligibility */
 } pocsag_msg_t;
 
 /* instance of pocsag transmitter/receiver */
@@ -145,13 +154,76 @@ typedef struct pocsag {
 	uint32_t		rx_msg_ric;		/* ric of message */
 	enum pocsag_function	rx_msg_function;	/* sub-address of message */
 	enum pocsag_msg_type	rx_msg_type;		/* detected message type */
-	char			rx_msg_data[256];	/* data buffer (alpha) */
-	int			rx_msg_data_length;	/* complete characters received */
-	char			rx_msg_data_numeric[256]; /* numeric decode buffer */
-	int			rx_msg_data_length_numeric; /* numeric decode length */
-	char			rx_msg_data_hex[256];	/* hex decode buffer */
-	int			rx_msg_data_length_hex;	/* hex decode length */
-	int			rx_msg_bit_index;	/* current bit received for alphanumeric */
+
+	/* rx message buffers — all dynamic (malloc/realloc) */
+	char			*rx_msg_data;		/* alpha decode buffer */
+	uint8_t			*rx_msg_char_status;	/* alpha per-char: 0=ok 1=corrected 2=bad */
+	int			rx_msg_data_length;	/* alpha chars received */
+	int			rx_msg_data_alloc;	/* alpha buffer allocated size */
+
+	char			*rx_msg_data_skyper;	/* skyper decode buffer (derived from alpha) */
+	int			rx_msg_data_length_skyper;
+
+	char			*rx_msg_data_numeric;	/* numeric decode buffer */
+	uint8_t			*rx_msg_num_status;	/* numeric per-char status */
+	int			rx_msg_data_length_numeric;
+	int			rx_msg_numeric_alloc;	/* numeric buffer allocated size */
+
+	uint8_t			*rx_msg_data_raw;	/* raw message bytes (packed bits) */
+	int			rx_msg_data_raw_bits;
+	int			rx_msg_raw_alloc;	/* raw buffer allocated size */
+
+	int			rx_msg_bit_index;	/* current bit within 7-bit alpha char */
+	uint8_t			rx_msg_cur_char_bad;	/* accumulates status for current alpha char */
+
+	/* rx message stats */
+	int			rx_msg_codewords;	/* total codewords in this message */
+	int			rx_msg_corrected;	/* BCH-corrected codewords */
+	int			rx_msg_uncorrectable;	/* uncorrectable codewords */
+
+	/*
+	 * Sliding BER window: tracks error rates over last N codewords.
+	 * Persistent across messages for continuous signal quality monitoring.
+	 */
+#define POCSAG_BER_WINDOW	32
+	struct {
+		int		errors[POCSAG_BER_WINDOW];	/* bit errors per codeword slot */
+		int		total[POCSAG_BER_WINDOW];	/* total bits per slot (32) */
+		int		head;				/* ring buffer write position */
+		int		count;				/* slots filled */
+	} rx_ber;
+
+	/*
+	 * RX message history for retransmission dedup and recovery.
+	 *
+	 * POCSAG pagers have configurable dedup windows (15s, 30s, 1m, 2m).
+	 * Base stations retransmit the same message 2-3 times within this window.
+	 * We store recent messages keyed by (ric, function) and compare incoming
+	 * messages against the history:
+	 *   - If a duplicate is found within the dedup window, suppress the alarm
+	 *     and attempt to recover uncorrectable codewords from the previous copy.
+	 *   - If no match, treat as a new message.
+	 */
+#define POCSAG_RX_HISTORY_MAX		64
+#define POCSAG_RX_HISTORY_CW_MAX	256	/* max stored codewords per entry */
+	struct pocsag_rx_history_entry {
+		uint32_t		ric;
+		enum pocsag_function	function;
+		enum pocsag_msg_type	msg_type;
+		int			baudrate;
+		double			polarity;
+		int			codeword_count;		/* message codewords stored */
+		uint32_t		codewords[POCSAG_RX_HISTORY_CW_MAX];
+		int8_t			cw_status[POCSAG_RX_HISTORY_CW_MAX]; /* 0=ok, 1=corrected, -1=uncorrectable */
+		double			timestamp;		/* wall-clock time when received */
+		int			active;
+	} rx_history[POCSAG_RX_HISTORY_MAX];
+	double			rx_dedup_window;	/* dedup window in seconds (0=disabled) */
+
+	/* current message raw codewords for history storage */
+	int			rx_msg_cw_count;
+	uint32_t		rx_msg_cw_buf[POCSAG_RX_HISTORY_CW_MAX];
+	int8_t			rx_msg_cw_status[POCSAG_RX_HISTORY_CW_MAX];
 
 	/* calls */
 	pocsag_msg_t		*msg_list;		/* linked list of all calls */
@@ -174,6 +246,34 @@ typedef struct pocsag {
 	uint32_t		fsk_rx_word;		/* shift register to receive codeword */
 	int			fsk_rx_sync;		/* counts down to next sync */
 	int			fsk_rx_index;		/* counts bits of received codeword */
+
+	/* auto-detection state for baud rate and polarity */
+	int			rx_auto_baud;		/* 1 = auto-detect baud rate */
+	int			rx_auto_polarity;	/* 1 = auto-detect polarity */
+	int			rx_baud_locked;		/* baud rate currently locked */
+	double			rx_polarity_locked;	/* polarity currently locked */
+	int			samplerate;		/* stored for reconfiguration */
+	int			rx_rate_locked;		/* 1 = locked to a baud rate (between batches) */
+	int			rx_resync_countdown;	/* bits remaining to find next FSC before unlock */
+
+	/*
+	 * Multi-rate receiver: up to 3 parallel decoders (512/1200/2400).
+	 * Each tracks its own phase and shift register independently.
+	 * When not auto-detecting baud, only slot [0] is used.
+	 */
+	struct rx_baud_state {
+		int		baudrate;	/* baud rate for this slot */
+		double		bitstep;	/* 1.0 / (samplerate / baudrate) */
+		double		phase;		/* sample phase accumulator */
+		uint8_t		lastbit;	/* last demodulated bit */
+		uint32_t	word;		/* 32-bit shift register (normal polarity) */
+		uint32_t	word_inv;	/* 32-bit shift register (inverted polarity) */
+		int		preamble_count;	/* consecutive alternating bits seen */
+		uint8_t		prev_bit;	/* previous bit for alternation check */
+		uint8_t		prev_bit_inv;	/* previous bit (inverted) for alternation check */
+		int		preamble_count_inv; /* alternating bits seen (inverted polarity) */
+	} rx_baud[3];
+	int			rx_baud_count;	/* number of active baud slots */
 } pocsag_t;
 
 int msg_receive(const char *text);
@@ -190,8 +290,8 @@ void pocsag_exit(void);
 int pocsag_init(void);
 void pocsag_exit(void);
 void pocsag_new_state(pocsag_t *pocsag, enum pocsag_state new_state);
-void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message);
-int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback);
+void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, int baudrate, double polarity, const char *message);
+int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window);
 void pocsag_destroy(sender_t *sender);
 void pocsag_msg_send(enum pocsag_language language, const char *text, size_t text_length);
 void pocsag_msg_destroy(pocsag_msg_t *msg);

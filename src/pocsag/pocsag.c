@@ -52,16 +52,114 @@ static struct channel_info {
         { 0.0, 0.0, 0, NULL}
 };
 
-static const char pocsag_lang[9][4] = {
-	{ '@', 0xc2, 0xa7, '\0' },
-	{ '[', 0xc3, 0x84, '\0' },
-	{ '\\', 0xc3, 0x96, '\0' },
-	{ ']', 0xc3, 0x9c, '\0' },
-	{ '{', 0xc3, 0xa4, '\0' },
-	{ '|', 0xc3, 0xb6, '\0' },
-	{ '}', 0xc3, 0xbc, '\0' },
-	{ '~', 0xc3, 0x9f, '\0' },
-	{ '\0' },
+/*
+ * German encoding table (unknown-unknown-german).
+ * No specific pager model known for this codepage.
+ * Same struct format as Cyrillic table for uniform handling.
+ */
+static const struct pocsag_charset_entry {
+	uint8_t code;		/* 7-bit POCSAG value */
+	char utf8[5];		/* UTF-8 representation */
+} pocsag_german[] = {
+	{ '@',  "\xc2\xa7" },		/* § → '@' (0x40) */
+	{ '[',  "\xc3\x84" },		/* Ä → '[' (0x5B) */
+	{ '\\', "\xc3\x96" },		/* Ö → '\' (0x5C) */
+	{ ']',  "\xc3\x9c" },		/* Ü → ']' (0x5D) */
+	{ '{',  "\xc3\xa4" },		/* ä → '{' (0x7B) */
+	{ '|',  "\xc3\xb6" },		/* ö → '|' (0x7C) */
+	{ '}',  "\xc3\xbc" },		/* ü → '}' (0x7D) */
+	{ '~',  "\xc3\x9f" },		/* ß → '~' (0x7E) */
+	{ 0, "" },			/* sentinel */
+};
+
+/*
+ * Cyrillic encoding table (motorola-advisor_linguist-cyrillic).
+ *
+ * Motorola Advisor Linguist pager character set.
+ * Only entries that differ from standard ASCII are listed.
+ * For TX, the reverse mapping (UTF-8 → 7-bit) is done by searching this table.
+ *
+ * Format: { 7-bit value, UTF-8 byte sequence (up to 4 bytes), NUL terminated }
+ *
+ * Characters that map identically to ASCII (space, digits, punctuation, Latin
+ * letters that look like Cyrillic) are NOT listed — they pass through unchanged.
+ * Only the Cyrillic-specific mappings are here.
+ */
+static const struct pocsag_charset_entry pocsag_cyrillic[] = {
+	/* Control character region: special symbols */
+	{  1, "\xc2\xa4" },		/* ¤ → 0x01 */
+	{  5, "\xc2\xa2" },		/* ¢ → 0x05 */
+	{  6, "\xc3\x97" },		/* × → 0x06 */
+	{  7, "\xc3\xb7" },		/* ÷ → 0x07 */
+	{  8, "\xc2\xa3" },		/* £ → 0x08 */
+	{  9, "\xc2\xb0" },		/* ° → 0x09 */
+	{ 11, "\xc2\xab" },		/* « → 0x0B */
+	{ 12, "\xc2\xbf" },		/* ¿ → 0x0C */
+	{ 14, "\xc2\xbb" },		/* » → 0x0E */
+	{ 15, "\xc2\xa1" },		/* ¡ → 0x0F */
+	{ 16, "\\" },			/* \ → 0x10 */
+	{ 17, "\xc2\xaf" },		/* ¯ → 0x11 */
+	{ 18, "^" },			/* ^ → 0x12 */
+	{ 19, "_" },			/* _ → 0x13 */
+	{ 20, "\xc2\xa7" },		/* § → 0x14 */
+	{ 21, "{" },			/* { → 0x15 */
+	{ 22, "|" },			/* | → 0x16 */
+	{ 24, "}" },			/* } → 0x18 */
+	{ 25, "\xe2\x84\x96" },	/* № → 0x19 */
+	{ 26, "\xc2\xb7" },		/* · → 0x1A */
+	{ 28, "\xc2\xa5" },		/* ¥ → 0x1C */
+	{ 29, "\xc2\xb1" },		/* ± → 0x1D */
+	/* Lowercase region: Cyrillic letters mapped to 'a'-'z' range */
+	{ 'a', "\xd0\x91" },		/* Б → 'a' (0x61) */
+	{ 'b', "\xd0\x93" },		/* Г → 'b' (0x62) */
+	{ 'c', "\xd0\x83" },		/* Ѓ → 'c' (0x63) */
+	{ 'd', "\xd0\x94" },		/* Д → 'd' (0x64) */
+	{ 'e', "\xd0\x81" },		/* Ё → 'e' (0x65) */
+	{ 'f', "\xd0\x96" },		/* Ж → 'f' (0x66) */
+	{ 'g', "\xd0\x97" },		/* З → 'g' (0x67) */
+	{ 'h', "\xd0\x98" },		/* И → 'h' (0x68) */
+	{ 'i', "\xd0\x99" },		/* Й → 'i' (0x69) */
+	{ 'j', "\xd0\x9b" },		/* Л → 'j' (0x6A) */
+	{ 'k', "\xd0\x9f" },		/* П → 'k' (0x6B) */
+	{ 'l', "\xd0\xa3" },		/* У → 'l' (0x6C) */
+	{ 'm', "\xd0\xa4" },		/* Ф → 'm' (0x6D) */
+	{ 'n', "\xd0\xa6" },		/* Ц → 'n' (0x6E) */
+	{ 'o', "\xd0\xa7" },		/* Ч → 'o' (0x6F) */
+	{ 'p', "\xd0\xa8" },		/* Ш → 'p' (0x70) */
+	{ 'q', "\xd0\xa9" },		/* Щ → 'q' (0x71) */
+	{ 'r', "\xd0\xaa" },		/* Ъ → 'r' (0x72) */
+	{ 's', "\xd0\xab" },		/* Ы → 's' (0x73) */
+	{ 't', "\xd0\xac" },		/* Ь → 't' (0x74) */
+	{ 'u', "\xd0\xad" },		/* Э → 'u' (0x75) */
+	{ 'v', "\xd0\xae" },		/* Ю → 'v' (0x76) */
+	{ 'w', "\xd0\xaf" },		/* Я → 'w' (0x77) */
+	{ 'x', "\xd0\x82" },		/* Ђ → 'x' (0x78) */
+	{ 'y', "\xd0\x84" },		/* Є → 'y' (0x79) */
+	{ 'z', "\xd0\x87" },		/* Ї → 'z' (0x7A) */
+	/* Symbols remapped in Cyrillic mode */
+	{ '\\', "\xd0\x89" },		/* Љ → '\' (0x5C) */
+	{ '^', "\xd0\x8a" },		/* Њ → '^' (0x5E) */
+	{ '_', "\xd0\x8b" },		/* Ћ → '_' (0x5F) */
+	{ '{', "\xd0\x8c" },		/* Ќ → '{' (0x7B) */
+	{ '|', "\xd0\x8e" },		/* Ў → '|' (0x7C) */
+	{ '}', "\xd0\x8f" },		/* Џ → '}' (0x7D) */
+	/* Uppercase Latin letters that ARE Cyrillic lookalikes:
+	 * A=А, B=В, C=С, E=Е, H=Н, I=І, K=К, M=М, O=О, P=Р, T=Т, X=Х
+	 * These map to the same 7-bit code, so on RX we output the Cyrillic Unicode.
+	 */
+	{ 'A', "\xd0\x90" },		/* А → 'A' */
+	{ 'B', "\xd0\x92" },		/* В → 'B' */
+	{ 'C', "\xd0\xa1" },		/* С → 'C' */
+	{ 'E', "\xd0\x95" },		/* Е → 'E' */
+	{ 'H', "\xd0\x9d" },		/* Н → 'H' */
+	{ 'I', "\xd0\x86" },		/* І → 'I' */
+	{ 'K', "\xd0\x9a" },		/* К → 'K' */
+	{ 'M', "\xd0\x9c" },		/* М → 'M' */
+	{ 'O', "\xd0\x9e" },		/* О → 'O' */
+	{ 'P', "\xd0\xa0" },		/* Р → 'P' */
+	{ 'T', "\xd0\xa2" },		/* Т → 'T' */
+	{ 'X', "\xd0\xa5" },		/* Х → 'X' */
+	{ 0, "" },			/* sentinel */
 };
 
 
@@ -385,51 +483,73 @@ static int pocsag_scan_or_loopback(pocsag_t *pocsag)
 }
 
 /*
+ * Return the charset table for a given language, or NULL for default/skyper.
+ */
+static const struct pocsag_charset_entry *pocsag_charset_table(enum pocsag_language language)
+{
+	switch (language) {
+	case LANGUAGE_GERMAN:	return pocsag_german;
+	case LANGUAGE_CYRILLIC:	return pocsag_cyrillic;
+	default:		return NULL;
+	}
+}
+
+/*
  * Handle received message.
  *
  * Note: function (sub-address) and msg_type (encoding) are reported separately
  * as they are independent per the POCSAG standard.
  */
-void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message)
+void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, int baudrate, double polarity, const char *message)
 {
-	char text[256 + strlen(message) * 4], *p;
+	int msg_len = message ? strlen(message) : 0;
+	char text[256 + msg_len * 4], *p;
 	struct timeval tv;
 	struct tm *tm;
+	const struct pocsag_charset_entry *table;
 	int i, j;
 
 	gettimeofday(&tv, NULL);
 	tm = localtime(&tv.tv_sec);
 
-	/*
-	 * Output format: timestamp @channel RIC,function,type[,message]
-	 * Function is the sub-address (A-D), type is encoding (tone/numeric/alpha).
-	 */
-	sprintf(text, "%04d-%02d-%02d %02d:%02d:%02d.%03d @%s %d,%s,%s",
+	sprintf(text, "%04d-%02d-%02d %02d:%02d:%02d.%03d @%s %d%s,%s,%d,%s",
 		tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
 		tm->tm_hour, tm->tm_min, tm->tm_sec, (int)(tv.tv_usec / 10000.0),
-		channel, ric, pocsag_function_name[function], pocsag_msg_type_name(msg_type));
+		channel, ric, pocsag_function_name[function], pocsag_msg_type_name(msg_type),
+		baudrate, (polarity < 0) ? "neg" : "pos");
 	p = strchr(text, '\0');
 
-	if (message[0]) {
+	if (message && message[0]) {
 		*p++ = ',';
 
-		if (language == LANGUAGE_DEFAULT) {
-			strcpy(p, message);
-			p += strlen(p);
-		} else {
+		if (language == LANGUAGE_SKYPER) {
+			/* Skyper ROT-1 decode: subtract 1 from each 7-bit value */
 			for (i = 0; message[i]; i++) {
-				/* decode special chracter */
-				for (j = 0; pocsag_lang[j][0]; j++) {
-					if (pocsag_lang[j][0] == message[i])
+				unsigned char c = (unsigned char)message[i] & 0x7f;
+				if (c == 0)
+					c = 0x7f;
+				else
+					c = c - 1;
+				*p++ = (char)c;
+			}
+		} else if ((table = pocsag_charset_table(language)) != NULL) {
+			/* Table-based decode: 7-bit → UTF-8 */
+			for (i = 0; message[i]; i++) {
+				unsigned char c = (unsigned char)message[i] & 0x7f;
+				for (j = 0; table[j].code; j++) {
+					if (table[j].code == c)
 						break;
 				}
-				/* if character matches */
-				if (pocsag_lang[j][0]) {
-					strcpy(p, pocsag_lang[j] + 1);
+				if (table[j].code) {
+					strcpy(p, table[j].utf8);
 					p += strlen(p);
 				} else
-					*p++ = message[i];
+					*p++ = (char)c;
 			}
+		} else {
+			/* Default: pass through */
+			strcpy(p, message);
+			p += strlen(p);
 		}
 	}
 
@@ -445,7 +565,7 @@ void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint
  * per the POCSAG standard. The function bits provide 4 sub-addresses per RIC,
  * while msg_type determines how the message content is encoded/decoded.
  */
-int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback)
+int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window)
 {
 	pocsag_t *pocsag;
 	int rc;
@@ -466,7 +586,7 @@ int pocsag_create(const char *kanal, double frequency, const char *device, int u
 	}
 
 	/* init audio processing */
-	rc = dsp_init_sender(pocsag, samplerate, (double)baudrate, deviation, polarity);
+	rc = dsp_init_sender(pocsag, samplerate, (double)baudrate, deviation, polarity, auto_baud, auto_polarity);
 	if (rc < 0) {
 		LOGP(DPOCSAG, LOGL_ERROR, "Failed to init audio processing!\n");
 		goto error;
@@ -481,6 +601,7 @@ int pocsag_create(const char *kanal, double frequency, const char *device, int u
 	pocsag->scan_from = scan_from;
 	pocsag->scan_to = scan_to;
 	pocsag->padding = padding;
+	pocsag->rx_dedup_window = dedup_window;
 
 	pocsag_display_status();
 
@@ -506,6 +627,15 @@ void pocsag_destroy(sender_t *sender)
 	while (pocsag->msg_list)
 		pocsag_msg_destroy(pocsag->msg_list);
 	dsp_cleanup_sender(pocsag);
+
+	/* free dynamic rx message buffers */
+	free(pocsag->rx_msg_data);
+	free(pocsag->rx_msg_char_status);
+	free(pocsag->rx_msg_data_skyper);
+	free(pocsag->rx_msg_data_numeric);
+	free(pocsag->rx_msg_num_status);
+	free(pocsag->rx_msg_data_raw);
+
 	sender_destroy(&pocsag->sender);
 	free(pocsag);
 }
@@ -513,127 +643,271 @@ void pocsag_destroy(sender_t *sender)
 /*
  * Application sends us a message, we need to deliver.
  *
- * Format: RIC,function,type[,message]
+ * Format: RIC,function,type[,encoding,message] or RIC,function,type[,message]
  *
  * Per the POCSAG standard (CCIR Rec. 584):
- *   - RIC: 18-bit address (0-2097151, excluding 1003832 which is idle codeword)
+ *   - RIC: 18-bit address (0-2097151, excluding idle codeword range)
  *   - Function: 2-bit sub-address (0-3 or A-D), provides 4 addresses per RIC
  *   - Type: Message encoding (auto/tone/numeric/alpha) - INDEPENDENT of function
+ *   - Encoding: Optional codepage (default/unknown-unknown-german/nec-skyper-categories/motorola-advisor_linguist-cyrillic).
+ *              If omitted, uses the global -L setting.
  *   - Message: Optional message content
  *
  * The function bits and message type have NO mandatory correlation per the
  * POCSAG standard. Any correlation is manufacturer/pager specific.
  */
+static int pocsag_language_name2value(const char *text)
+{
+	if (!strcasecmp(text, "default") || !strcmp(text, "0"))
+		return LANGUAGE_DEFAULT;
+	if (!strcasecmp(text, "unknown-unknown-german") || !strcmp(text, "1"))
+		return LANGUAGE_GERMAN;
+	if (!strcasecmp(text, "nec-skyper-categories") || !strcmp(text, "2"))
+		return LANGUAGE_SKYPER;
+	if (!strcasecmp(text, "motorola-advisor_linguist-cyrillic") || !strcmp(text, "3"))
+		return LANGUAGE_CYRILLIC;
+	return -1;
+}
+
+/*
+ * Parse space-separated key=value options from FIFO message.
+ * Modifies language in-place if specified.
+ */
+static void parse_pocsag_options(const char *opts, int opts_len,
+				 enum pocsag_language *language_out,
+				 int *repeat_out, double *delay_out,
+				 double *interval_out)
+{
+	char buf[256];
+	char *p, *key, *val;
+	int len, rc;
+
+	if (opts_len <= 0)
+		return;
+
+	len = opts_len;
+	if (len >= (int)sizeof(buf))
+		len = sizeof(buf) - 1;
+	memcpy(buf, opts, len);
+	buf[len] = '\0';
+
+	p = buf;
+	while (*p) {
+		while (*p == ' ')
+			p++;
+		if (!*p)
+			break;
+
+		key = p;
+		val = NULL;
+		while (*p && *p != '=' && *p != ' ')
+			p++;
+		if (*p == '=') {
+			*p++ = '\0';
+			val = p;
+			while (*p && *p != ' ')
+				p++;
+			if (*p)
+				*p++ = '\0';
+		} else {
+			if (*p)
+				*p++ = '\0';
+		}
+
+		if (!val)
+			continue;
+
+		if (!strcmp(key, "charset") || !strcmp(key, "lang")) {
+			rc = pocsag_language_name2value(val);
+			if (rc >= 0)
+				*language_out = rc;
+			else
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid charset '%s', use default/unknown-unknown-german/nec-skyper-categories/motorola-advisor_linguist-cyrillic.\n", val);
+		}
+		else if (!strcmp(key, "speed")) {
+			int spd = atoi(val);
+			if (spd != 512 && spd != 1200 && spd != 2400)
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid speed '%s', use 512/1200/2400.\n", val);
+			/* TODO: per-message baud rate requires DSP reconfiguration */
+		}
+		else if (!strcmp(key, "polarity")) {
+			if (val[0] != 'n' && val[0] != 'N' && val[0] != 'p' && val[0] != 'P')
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid polarity '%s', use neg/pos.\n", val);
+			/* TODO: per-message polarity requires DSP reconfiguration */
+		}
+		else if (!strcmp(key, "repeat")) {
+			int r = atoi(val);
+			if (r < 0 || r > 10)
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid repeat '%s', use 0-10.\n", val);
+			else
+				*repeat_out = r;
+		}
+		else if (!strcmp(key, "delay")) {
+			double d = atof(val);
+			if (d < 0.0)
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid delay '%s', must be >= 0.\n", val);
+			else
+				*delay_out = d;
+		}
+		else if (!strcmp(key, "interval")) {
+			double iv = atof(val);
+			if (iv <= 0.0)
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid interval '%s', must be > 0.\n", val);
+			else
+				*interval_out = iv;
+		}
+	}
+}
+
+/*
+ * Application sends us a message via FIFO, we need to deliver.
+ *
+ * Format: capcode,type,options,message
+ *
+ * Fields (always 4, comma-separated):
+ *   - capcode: RIC with optional function suffix, e.g. 1234567A or 1234567
+ *       RIC: 0-2097151 (21-bit pager address)
+ *       Function: A-D or 0-3 suffix (default A if omitted)
+ *   - type: auto|tone|numeric|alpha (or 0-3)
+ *   - options: space-separated key=value pairs (can be empty):
+ *       charset=default|german|skyper|cyrillic  (overrides -L)
+ *       speed=512|1200|2400  (reserved for future use)
+ *       polarity=neg|pos  (reserved for future use)
+ *   - message: message content (may contain escape sequences)
+ *
+ * Examples:
+ *   1234567A,alpha,,Hello World
+ *   1234567,numeric,,12345
+ *   1234567B,alpha,charset=motorola-advisor_linguist-cyrillic,Привіт
+ *   1234567C,alpha,charset=nec-skyper-categories,Hello
+ *   1234567,tone,,
+ */
 void pocsag_msg_send(enum pocsag_language language, const char *text, size_t text_length)
 {
-	char ric_string[text_length + 1];
-	char function_string[text_length + 1];
+	char capcode_string[text_length + 1];
 	char type_string[text_length + 1];
-	char message[text_length];
+	char message[text_length + 1];
 	uint32_t ric;
-	uint8_t function;
+	enum pocsag_function function;
 	enum pocsag_msg_type msg_type;
 	pocsag_t *pocsag;
 	int message_length = 0;
-	int i, ii, j, k;
+	int i, ii, j;
 	int rc;
+	int comma_count = 0;
+	int comma1 = -1, comma2 = -1, comma3 = -1;
+	const char *opts_start;
+	int opts_len;
 
-	/* Parse RIC */
-	for (i = 0; text_length; i++) {
-		if (*text == ',')
-			break;
-		ric_string[i] = *text++;
-		text_length--;
-	}
-	ric_string[i] = '\0';
-	if (!text_length) {
-inval:
-		LOGP(DNMT, LOGL_NOTICE, "Given message MUST be in the following format: RIC,function,type[,<message>]\n");
-		LOGP(DNMT, LOGL_NOTICE, "  RIC: 0-2097151 (7 digits)\n");
-		LOGP(DNMT, LOGL_NOTICE, "  function: A/B/C/D or 0/1/2/3 (sub-address, per POCSAG standard)\n");
-		LOGP(DNMT, LOGL_NOTICE, "  type: auto/tone/numeric/alpha (encoding, INDEPENDENT of function)\n");
-		LOGP(DNMT, LOGL_NOTICE, "Note: Per POCSAG standard, function bits are sub-addresses with NO\n");
-		LOGP(DNMT, LOGL_NOTICE, "      mandatory correlation to message type.\n");
+	pocsag = (pocsag_t *) sender_head;
+	if (!pocsag) {
+		LOGP(DNMT, LOGL_ERROR, "No transmitter instance!\n");
 		return;
 	}
-	text++;
-	text_length--;
 
-	/* Parse function (sub-address) */
-	for (i = 0; text_length; i++) {
-		if (*text == ',')
-			break;
-		function_string[i] = *text++;
-		text_length--;
+	/* Function is parsed from capcode below, not from instance default */
+	/* Count commas and record positions */
+	for (i = 0; i < (int)text_length; i++) {
+		if (text[i] == ',') {
+			comma_count++;
+			if (comma_count == 1)
+				comma1 = i;
+			else if (comma_count == 2)
+				comma2 = i;
+			else if (comma_count == 3) {
+				comma3 = i;
+				break;
+			}
+		}
 	}
-	function_string[i] = '\0';
-	if (!text_length) {
-		goto inval;
-	}
-	text++;
-	text_length--;
 
-	/* Parse type (encoding) */
-	for (i = 0; text_length; i++) {
-		if (*text == ',')
-			break;
-		type_string[i] = *text++;
-		text_length--;
+	if (comma_count < 3) {
+		LOGP(DNMT, LOGL_NOTICE, "Given message MUST be in the format: capcode,type,options,message\n");
+		LOGP(DNMT, LOGL_NOTICE, "  capcode: RIC with optional function, e.g. 1234567A (default A)\n");
+		LOGP(DNMT, LOGL_NOTICE, "  type: auto|tone|numeric|alpha (or 0-3)\n");
+		LOGP(DNMT, LOGL_NOTICE, "  options: space-separated key=value (can be empty):\n");
+		LOGP(DNMT, LOGL_NOTICE, "    charset=default|unknown-unknown-german|nec-skyper-categories|motorola-advisor_linguist-cyrillic\n");
+		LOGP(DNMT, LOGL_NOTICE, "  message: text content\n");
+		LOGP(DNMT, LOGL_NOTICE, "  Example: 1234567A,alpha,,Hello World\n");
+		LOGP(DNMT, LOGL_NOTICE, "  Example: 1234567B,alpha,charset=motorola-advisor_linguist-cyrillic,Привіт\n");
+		return;
 	}
-	type_string[i] = '\0';
 
-	/* Parse optional message */
-	if (text_length) {
-		text++;
-		text_length--;
-		message_length = scan_message(text, text_length, message, sizeof(message));
+	/* Extract capcode field (RIC + optional function suffix) */
+	memcpy(capcode_string, text, comma1);
+	capcode_string[comma1] = '\0';
+
+	/* Parse RIC and function from capcode.
+	 * Format: digits followed by optional A-D or 0-3 suffix.
+	 * Default function is A if not specified. */
+	{
+		int clen = strlen(capcode_string);
+		char last = (clen > 0) ? capcode_string[clen - 1] : '\0';
+
+		if ((last >= 'A' && last <= 'D') || (last >= 'a' && last <= 'd')) {
+			if (last >= 'a')
+				function = last - 'a';
+			else
+				function = last - 'A';
+			capcode_string[clen - 1] = '\0';
+		} else if (clen > 7 && last >= '0' && last <= '3') {
+			/* Only treat trailing digit as function if capcode is >7 chars,
+			 * to distinguish from 7-digit RICs ending in 0-3 */
+			function = last - '0';
+			capcode_string[clen - 1] = '\0';
+		} else {
+			function = POCSAG_FUNCTION_A;
+		}
+		ric = atoi(capcode_string);
 	}
+
+	/* Extract type field */
+	{
+		int tlen = comma2 - comma1 - 1;
+		memcpy(type_string, text + comma1 + 1, tlen);
+		type_string[tlen] = '\0';
+	}
+
+	/* Extract options field */
+	opts_start = text + comma2 + 1;
+	opts_len = comma3 - comma2 - 1;
+
+	/* Extract message payload (everything after third comma) */
+	if (comma3 + 1 < (int)text_length)
+		message_length = scan_message(text + comma3 + 1, text_length - comma3 - 1, message, sizeof(message));
+
+	/* Parse options */
+	int repeat = 0;
+	double delay = 0.0;
+	double interval = 10.0;
+	parse_pocsag_options(opts_start, opts_len, &language, &repeat, &delay, &interval);
 
 	/* Validate RIC */
-	ric = atoi(ric_string);
 	if (ric > 2097151) {
 		LOGP(DNMT, LOGL_NOTICE, "Illegal RIC %d. Maximum allowed RIC is (2^21)-1. (2097151)\n", ric);
-		goto inval;
+		return;
 	}
-
-	if (ric == 1003832) {
-		LOGP(DNMT, LOGL_NOTICE, "Illegal RIC 1003832. (Used as idle codeword)\n");
-		goto inval;
+	if ((ric & 0xfffffff8) == 2007664) {
+		LOGP(DNMT, LOGL_NOTICE, "Illegal RIC %d. (Reserved for idle codeword, range 2007664-2007671)\n", ric);
+		return;
 	}
-
-	/* Validate function (sub-address) */
-	rc = pocsag_function_name2value(function_string);
-	if (rc < 0) {
-		LOGP(DNMT, LOGL_NOTICE, "Illegal function '%s'. Use A/B/C/D or 0/1/2/3.\n", function_string);
-		goto inval;
-	}
-	function = rc;
 
 	/* Validate message type */
 	rc = pocsag_msg_type_name2value(type_string);
 	if (rc < 0) {
 		LOGP(DNMT, LOGL_NOTICE, "Illegal type '%s'. Use auto/tone/numeric/alpha.\n", type_string);
-		goto inval;
+		return;
 	}
 	msg_type = rc;
 
-	/*
-	 * Auto-detect message type if set to AUTO:
-	 * - No message content -> TONE
-	 * - All numeric chars -> NUMERIC
-	 * - Otherwise -> ALPHA
-	 *
-	 * Note: This is independent of function bits per POCSAG standard.
-	 */
+	/* Auto-detect message type */
 	if (msg_type == POCSAG_MSG_TYPE_AUTO) {
 		if (message_length == 0) {
 			msg_type = POCSAG_MSG_TYPE_TONE;
 		} else {
-			/* Check if all characters are numeric-compatible */
 			int all_numeric = 1;
 			for (i = 0; i < message_length; i++) {
 				char c = message[i];
-				/* POCSAG numeric: 0-9, R, U, space, -, [, ] */
 				if (!((c >= '0' && c <= '9') || c == 'R' || c == 'U' ||
 				      c == ' ' || c == '-' || c == '[' || c == ']')) {
 					all_numeric = 0;
@@ -644,17 +918,10 @@ inval:
 		}
 	}
 
-	/*
-	 * Validate numeric message characters.
-	 *
-	 * Per POCSAG spec, BCD numeric encoding supports only 16 symbols:
-	 * 0-9, R (recv/return), U (urgent), space, hyphen, and brackets.
-	 * Invalid characters are rejected with an error showing the position.
-	 */
+	/* Validate numeric message characters */
 	if (msg_type == POCSAG_MSG_TYPE_NUMERIC && message_length > 0) {
 		for (i = 0; i < message_length; i++) {
 			char c = message[i];
-			/* POCSAG numeric BCD: 0-9, R, U, space, -, [, ] */
 			if (!((c >= '0' && c <= '9') || c == 'R' || c == 'U' ||
 			      c == ' ' || c == '-' || c == '[' || c == ']')) {
 				LOGP(DNMT, LOGL_ERROR, "Invalid character in numeric message: '%c'\n", c);
@@ -664,45 +931,84 @@ inval:
 		}
 	}
 
-	/* Handle language-specific character encoding */
-	if (message_length && language != LANGUAGE_DEFAULT) {
-		i = 0;
-		/* input counter is ii, output counter is i */
-		for (ii = 0; ii < message_length; i++) {
-			/* encode special chracter */
-			for (j = 0; pocsag_lang[j][0]; j++) {
-				for (k = 0; pocsag_lang[j][k + 1]; k++) {
-					/* break if input buffer ends */
-					if (ii + k == message_length)
-						break;
-					/* break if string does not match */
-					if (message[ii + k] != pocsag_lang[j][k + 1])
-						break;
-				}
-				/* break, if k-loop was completed */
-				if (!pocsag_lang[j][k + 1])
-					break;
-			}
-			/* if character matches (k-loop was completed, j-loop not) */
-			if (pocsag_lang[j][0]) {
-				message[i] = pocsag_lang[j][0];
-				ii += k;
-			} else
-				message[i] = message[ii++];
+	/* Handle language-specific character encoding (UTF-8 → 7-bit) */
+	if (message_length && language == LANGUAGE_SKYPER) {
+		for (i = 0; i < message_length; i++) {
+			unsigned char c = (unsigned char)message[i] & 0x7f;
+			message[i] = (c + 1) & 0x7f;
 		}
-		message_length = i;
+	} else if (message_length) {
+		const struct pocsag_charset_entry *table = pocsag_charset_table(language);
+		if (table) {
+			i = 0;
+			for (ii = 0; ii < message_length; i++) {
+				int found = 0;
+				for (j = 0; table[j].code; j++) {
+					int ulen = strlen(table[j].utf8);
+					if (ulen == 0)
+						continue;
+					if (ii + ulen > message_length)
+						continue;
+					if (memcmp(&message[ii], table[j].utf8, ulen) == 0) {
+						message[i] = (char)table[j].code;
+						ii += ulen;
+						found = 1;
+						break;
+					}
+				}
+				if (!found)
+					message[i] = message[ii++];
+			}
+			message_length = i;
+		}
 	}
 
-	LOGP(DNMT, LOGL_INFO, "Message for RIC '%d' / function '%s' / type '%s' with text '%s'\n",
-	     ric, pocsag_function_name[function], pocsag_msg_type_name(msg_type),
-	     print_message(message, message_length));
+	LOGP(DNMT, LOGL_INFO, "FIFO: enqueued RIC=%d type=%s function=%s charset=%d len=%d repeat=%d delay=%.1f interval=%.1f\n",
+	     ric, pocsag_msg_type_name(msg_type), pocsag_function_name[function],
+	     language, message_length, repeat, delay, interval);
 
-	pocsag = (pocsag_t *) sender_head;
-	pocsag_msg_create(pocsag, 0, ric, function, msg_type, message, message_length);
+	{
+		pocsag_msg_t *msg;
+		struct timeval tv;
+
+		msg = pocsag_msg_create(pocsag, 0, ric, function, msg_type, message, message_length);
+		if (msg) {
+			msg->retransmit_max = repeat;
+			msg->retransmit_count = 0;
+			msg->retransmit_interval = interval;
+			msg->send_delay = delay;
+			gettimeofday(&tv, NULL);
+			msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + delay;
+		}
+	}
 }
 
 void call_down_clock(void)
 {
+	sender_t *sender;
+	pocsag_t *pocsag;
+	pocsag_msg_t *msg;
+	struct timeval tv;
+	double now;
+
+	gettimeofday(&tv, NULL);
+	now = (double)tv.tv_sec + tv.tv_usec / 1e6;
+
+	/* Check if any deferred retransmission has become eligible.
+	 * If the transmitter is idle and a message is ready, kick it. */
+	for (sender = sender_head; sender; sender = sender->next) {
+		pocsag = (pocsag_t *)sender;
+		if (!pocsag->tx || pocsag->state != POCSAG_IDLE)
+			continue;
+		for (msg = pocsag->msg_list; msg; msg = msg->next) {
+			if (msg->next_send_time > 0.0 && now >= msg->next_send_time) {
+				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission for RIC %d now eligible, starting TX.\n", msg->ric);
+				pocsag_new_state(pocsag, POCSAG_PREAMBLE);
+				pocsag->word_count = 0;
+				break;
+			}
+		}
+	}
 }
 
 /*

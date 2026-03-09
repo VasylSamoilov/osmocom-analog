@@ -66,6 +66,7 @@ static char padding = 0;
 static enum pocsag_language language = LANGUAGE_DEFAULT;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
+static double dedup_window = 0.0;	/* RX dedup window in seconds (0=disabled) */
 
 void print_help(const char *arg0)
 {
@@ -77,12 +78,15 @@ void print_help(const char *arg0)
 	printf("        Receive POCSAG signal on given channel, so we are the receiver.\n");
 	printf("        If none of the options -T nor -R is given, only transmitter is enabled.\n");
 	printf(" -B --baud-rate 512 | 1200 | 2400\n");
-	printf("        Choose baud rate of transmitter.\n");
+	printf("        Choose baud rate of transmitter. For RX, locks auto-detection to this\n");
+	printf("        rate. If not given, RX auto-detects from preamble timing.\n");
 	printf(" -D --deviation wide | 4.5 | narrow | 2.5 | <other KHz>\n");
 	printf("        Choose deviation of FFSK signal (default %.0f KHz).\n", deviation / 1000.0);
-	printf(" -P --polarity -1 | nagative | 1 | positive\n");
+	printf(" -P --polarity -1 | negative | 1 | positive\n");
 	printf("        Choose polarity of FFSK signal. 'negative' means that a binary 0 uses\n");
-	printf("        positive and a binary 1 negative deviation. (default %s KHz).\n", (polarity < 0) ? "negative" : "positive");
+	printf("        positive and a binary 1 negative deviation. (default %s).\n", (polarity < 0) ? "negative" : "positive");
+	printf("        For RX, locks auto-detection to this polarity. If not given, RX\n");
+	printf("        auto-detects by trying both polarities during sync search.\n");
 	printf(" -F --function 0..3 | A..D\n");
 	printf("        Set default sub-address for 7-digit RICs. (default %s)\n", pocsag_function_name[function]);
 	printf(" -y --type auto | tone | numeric | alpha\n");
@@ -96,8 +100,11 @@ void print_help(const char *arg0)
 	printf(" -M --message \"...\"\n");
 	printf("        Send this message, if no caller ID was given or of built-in console\n");
 	printf("        is used. (default \"%s\").\n", message);
-	printf(" -L --language\n");
-	printf("        Translate German spcial characters from/to UTF-8.\n");
+	printf(" -L --language <maker-model-codepage>\n");
+	printf("        Select character encoding for TX/RX translation.\n");
+	printf("          unknown-unknown-german                - German Umlauts from/to UTF-8\n");
+	printf("          nec-skyper-categories                 - NEC Skyper ROT-1 Caesar cipher\n");
+	printf("          motorola-advisor_linguist-cyrillic    - Motorola Advisor Linguist Cyrillic\n");
 	printf(" -S --scan <from> <to>\n");
 	printf("        Scan through given IDs once (no repetition). This can be useful to find\n");
 	printf("        the RIC of a vintage pager. Note that scanning all RICs from 0 through\n");
@@ -111,6 +118,12 @@ void print_help(const char *arg0)
 	printf("        characters such as end of message, end of text, or null.'\n");
 	printf("        Recommended: 0 (NUL, default per spec), 3 (ETX), 4 (EOT).\n");
 	printf("        Only NULL can be incomplete (partial bits filled with zeros).\n");
+	printf("    --dedup <seconds>\n");
+	printf("        RX deduplication window in seconds (default 0 = disabled).\n");
+	printf("        When set, duplicate messages to the same RIC+function within this\n");
+	printf("        window are suppressed. Uncorrectable codewords from the new copy\n");
+	printf("        are recovered from the previous copy if possible.\n");
+	printf("        Typical pager dedup windows: 15, 30, 60, 120 seconds.\n");
 	printf("\n");
 	printf("RIC (Radio Identity Code) Structure:\n");
 	printf("      The RIC is a 21-bit pager address (0 to 2097151), formed as follows:\n");
@@ -126,10 +139,25 @@ void print_help(const char *arg0)
 	printf("      Message encoding (tone/numeric/alpha) is set separately with -y.\n");
 	printf("\n");
 	printf("File: %s\n", MSG_SEND);
-	printf("        Write \"<ric>,<function>,<type>,message\" to send a message.\n");
-	printf("        Example: \"1234567,A,numeric,12345\" or \"1234567,0,alpha,Hello\"\n");
+	printf("        Write \"<capcode>,<type>,<options>,<message>\" to send a message.\n");
+	printf("        Format: capcode,type,options,message (always 4 comma-separated fields)\n");
+	printf("          capcode: RIC with optional function suffix, e.g. 1234567A\n");
+	printf("            RIC: 0-2097151, function: A-D suffix (default A if omitted)\n");
+	printf("          type: auto|tone|numeric|alpha\n");
+	printf("          options: space-separated key=value pairs (can be empty):\n");
+	printf("            charset=default|unknown-unknown-german|nec-skyper-categories|motorola-advisor_linguist-cyrillic\n");
+	printf("            repeat=N          retransmissions after initial TX (0-10, default 0)\n");
+	printf("            delay=N           defer initial TX by N seconds (default 0)\n");
+	printf("            interval=N        seconds between retransmissions (default 10)\n");
+	printf("          message: text content\n");
+	printf("        Examples:\n");
+	printf("          1234567A,alpha,,Hello World\n");
+	printf("          1234567,numeric,,12345\n");
+	printf("          1234567B,alpha,charset=motorola-advisor_linguist-cyrillic,Привіт\n");
+	printf("          1234567C,alpha,charset=nec-skyper-categories,Hello\n");
+	printf("          1234567,tone,,\n");
 	printf("        Numeric messages: only 0-9 R U <space> - [ ] are valid.\n");
-	printf("        Alphanumeric messages may contain any 7-bit ASCII character.\n");
+	printf("        Alphanumeric messages may contain any 7-bit character (0-127).\n");
 	printf("        Use escape sequences for control characters (LF/CR terminate input):\n");
 	printf("          '<NUL>' '<SOH>' '<STX>' '<ETX>' '<EOT>' '<ENQ>' '<ACK>' '<BEL>'\n");
 	printf("          '<BS>'  '<HT>'  '<LF>'  '<VT>'  '<FF>'  '<CR>'  '<SO>'  '<SI>'\n");
@@ -144,6 +172,7 @@ void print_help(const char *arg0)
 }
 
 #define OPT_PADDING	256
+#define OPT_DEDUP	257
 
 static void add_options(void)
 {
@@ -156,9 +185,10 @@ static void add_options(void)
 	option_add('y', "type", 1);
 	option_add('P', "polarity", 1);
 	option_add('M', "message", 1);
-	option_add('L', "language", 0);
+	option_add('L', "language", 1);
 	option_add('S', "scan", 2);
 	option_add(OPT_PADDING, "padding", 1);
+	option_add(OPT_DEDUP, "dedup", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -232,7 +262,16 @@ static int handle_options(int short_option, int argi, char **argv)
 		message = options_strdup(argv[argi++]);
 		break;
 	case 'L':
-		language = LANGUAGE_GERMAN;
+		if (!strcasecmp(argv[argi], "unknown-unknown-german"))
+			language = LANGUAGE_GERMAN;
+		else if (!strcasecmp(argv[argi], "nec-skyper-categories"))
+			language = LANGUAGE_SKYPER;
+		else if (!strcasecmp(argv[argi], "motorola-advisor_linguist-cyrillic"))
+			language = LANGUAGE_CYRILLIC;
+		else {
+			fprintf(stderr, "Unknown language '%s'. Use unknown-unknown-german, nec-skyper-categories, or motorola-advisor_linguist-cyrillic.\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
 	case 'S':
 		scan_from = atoi(argv[argi++]);
@@ -267,6 +306,13 @@ static int handle_options(int short_option, int argi, char **argv)
 				fprintf(stderr, "         Per POCSAG spec, padding should be unprintable (NUL, ETX, EOT, etc.).\n");
 			}
 			padding = (char)pad_value;
+		}
+		break;
+	case OPT_DEDUP:
+		dedup_window = atof(argv[argi++]);
+		if (dedup_window < 0.0) {
+			fprintf(stderr, "Dedup window must be >= 0 seconds.\n");
+			return -EINVAL;
 		}
 		break;
 	default:
@@ -420,7 +466,7 @@ int main(int argc, char *argv[])
 			printf("Invalid channel '%s', Use '-k list' to get a list of all channels.\n\n", kanal[i]);
 			goto fail;
 		}
-		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
+		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, !baudrate_given, !polarity_given, dedup_window);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;

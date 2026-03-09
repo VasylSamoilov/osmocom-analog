@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/time.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "pocsag.h"
@@ -53,8 +54,43 @@
 #define CODEWORD_IDLE		0x7a89c197
 #define IDLE_BATCHES		2
 
+/* Initial and growth size for dynamic rx message buffers */
+#define RX_BUF_INIT		256
+#define RX_BUF_GROW		256
+
+/*
+ * Maximum message codewords per single message (safety limit).
+ *
+ * At 2400 baud this is ~7 minutes of continuous data — far beyond any
+ * real-world POCSAG message. Prevents unbounded memory growth from
+ * malformed signals or stuck decoders.
+ *
+ * 100000 alpha chars ÷ ~2.86 chars/codeword ≈ 35000 codewords.
+ */
+#define RX_MSG_MAX_CODEWORDS	35000
+
+/*
+ * Ensure rx buffer has room for at least one more element.
+ * buf: pointer to buffer pointer (char** or uint8_t**)
+ * len: current length
+ * alloc: pointer to allocated size
+ * elem_size: sizeof element
+ * Returns 0 on success, -1 on alloc failure.
+ */
+static int rx_buf_ensure(void **buf, int len, int *alloc, int elem_size)
+{
+	if (len < *alloc)
+		return 0;
+	int new_alloc = *alloc ? *alloc + RX_BUF_GROW : RX_BUF_INIT;
+	void *p = realloc(*buf, new_alloc * elem_size);
+	if (!p)
+		return -1;
+	*buf = p;
+	*alloc = new_alloc;
+	return 0;
+}
+
 static const char numeric[16] = "0123456789RU -][";
-static const char hex[16] = "0123456789abcdef";
 
 static const char *ctrl_char[32] = {
 	"<NUL>",
@@ -192,35 +228,159 @@ static uint32_t pocsag_parity(uint32_t word)
 	return word & 1;
 }
 
-static int debug_word(uint32_t word, int slot)
+/*
+ * BCH(31,21) error correction for POCSAG codewords.
+ *
+ * A POCSAG codeword is 32 bits: [21 data] [10 CRC] [1 parity].
+ * The BCH code operates on the upper 31 bits (data + CRC); the parity
+ * bit covers all 31 bits.
+ *
+ * Generator polynomial: g(x) = x^10 + x^9 + x^8 + x^6 + x^5 + x^3 + 1
+ *                             = 0x769
+ *
+ * This implementation computes the syndrome, then brute-force searches for
+ * 1-bit and 2-bit error patterns that zero the syndrome. This matches the
+ * approach used by gr-pager (bch3121.cc) and multimon-ng.
+ *
+ * Returns:
+ *   0  — no errors (or corrected)
+ *  -1  — uncorrectable (>2 bit errors)
+ *
+ * On success, *word is corrected in place.
+ */
+/*
+ * BCH(31,21) error correction for POCSAG codewords.
+ *
+ * Returns:
+ *   0          - no errors (codeword was already valid)
+ *   >0         - number of bits corrected (1 or 2)
+ *   -1         - uncorrectable (3+ bit errors)
+ *
+ * On success, *word is corrected in place.
+ * If corrections_out is non-NULL, the bitmask of flipped bit positions is stored there.
+ */
+int pocsag_bch_correct(uint32_t *word, uint32_t *corrections_out)
 {
-	if (pocsag_crc(word >> 11) != ((word >> 1) & 0x3ff)) {
-		LOGP(DPOCSAG, LOGL_NOTICE, "CRC error in codeword 0x%08x.\n", word);
-		return -EINVAL;
+	uint32_t cw, syndrome, mask, coeff;
+	int i, j;
+
+	if (corrections_out)
+		*corrections_out = 0;
+
+	cw = *word >> 1;
+
+	syndrome = cw;
+	mask = 1u << 30;
+	coeff = 0x769u << 20;
+
+	for (i = 21; i > 0; i--, mask >>= 1, coeff >>= 1) {
+		if (syndrome & mask)
+			syndrome ^= coeff;
 	}
 
-	if (pocsag_parity(word)) {
-		LOGP(DPOCSAG, LOGL_NOTICE, "Parity error in codeword 0x%08x.\n", word);
-		return -EINVAL;
+	if (pocsag_parity(*word))
+		syndrome |= (1u << 10);
+
+	if (syndrome == 0)
+		return 0; /* no errors */
+
+	/* Try all single-bit flips */
+	for (i = 0; i < 32; i++) {
+		uint32_t flip = 1u << i;
+		uint32_t trial = *word ^ flip;
+		uint32_t s;
+
+		cw = trial >> 1;
+		s = cw;
+		mask = 1u << 30;
+		coeff = 0x769u << 20;
+		for (j = 21; j > 0; j--, mask >>= 1, coeff >>= 1) {
+			if (s & mask)
+				s ^= coeff;
+		}
+		if (pocsag_parity(trial))
+			s |= (1u << 10);
+
+		if (s == 0) {
+			*word = trial;
+			if (corrections_out)
+				*corrections_out = flip;
+			return 1;
+		}
 	}
 
-	if (word == CODEWORD_SYNC) {
+	/* Try all two-bit flip combinations */
+	for (i = 0; i < 32; i++) {
+		for (j = i + 1; j < 32; j++) {
+			uint32_t flip = (1u << i) | (1u << j);
+			uint32_t trial = *word ^ flip;
+			uint32_t s;
+			int k;
+
+			cw = trial >> 1;
+			s = cw;
+			mask = 1u << 30;
+			coeff = 0x769u << 20;
+			for (k = 21; k > 0; k--, mask >>= 1, coeff >>= 1) {
+				if (s & mask)
+					s ^= coeff;
+			}
+			if (pocsag_parity(trial))
+				s |= (1u << 10);
+
+			if (s == 0) {
+				*word = trial;
+				if (corrections_out)
+					*corrections_out = flip;
+				return 2;
+			}
+		}
+	}
+
+	return -1; /* uncorrectable */
+}
+
+/*
+ * Validate/correct a received codeword.
+ * Returns: <0 uncorrectable, 0 clean, >0 number of bits corrected.
+ * *corrections_out receives the bitmask of flipped bit positions (0 if clean).
+ */
+static int debug_word(uint32_t *word, int slot, uint32_t *corrections_out)
+{
+	int bch_rc;
+
+	*corrections_out = 0;
+
+	if (pocsag_crc(*word >> 11) != ((*word >> 1) & 0x3ff) || pocsag_parity(*word)) {
+		bch_rc = pocsag_bch_correct(word, corrections_out);
+		if (bch_rc < 0) {
+			LOGP(DPOCSAG, LOGL_NOTICE, "Uncorrectable error in codeword 0x%08x.\n", *word);
+			return -EINVAL;
+		}
+		LOGP(DPOCSAG, LOGL_INFO, "BCH corrected %d bit(s) in codeword -> 0x%08x (mask: 0x%08x).\n",
+		     bch_rc, *word, *corrections_out);
+	}
+
+	if (*word == CODEWORD_SYNC) {
 		LOGP(DPOCSAG, LOGL_DEBUG, "-> valid sync word\n");
 		return 0;
 	}
 
-	if (word == CODEWORD_IDLE) {
+	if (*word == CODEWORD_IDLE) {
 		LOGP(DPOCSAG, LOGL_DEBUG, "-> valid idle word\n");
 		return 0;
 	}
 
-	if (!(word & 0x80000000)) {
-		LOGP(DPOCSAG, LOGL_DEBUG, "-> valid address word: RIC = '%d', function = '%d' (%s)\n", ((word >> 10) & 0x1ffff8) + slot, (word >> 11) & 0x3, pocsag_function_name[(word >> 11) & 0x3]);
+	if (!(*word & 0x80000000)) {
+		LOGP(DPOCSAG, LOGL_DEBUG, "-> valid address word: RIC = '%d', function = '%d' (%s)\n",
+		     ((*word >> 10) & 0x1ffff8) + slot, (*word >> 11) & 0x3,
+		     pocsag_function_name[(*word >> 11) & 0x3]);
 	} else {
-		LOGP(DPOCSAG, LOGL_DEBUG, "-> valid message word: message = '0x%05x'\n", (word >> 11) & 0xfffff);
+		LOGP(DPOCSAG, LOGL_DEBUG, "-> valid message word: message = '0x%05x'\n",
+		     (*word >> 11) & 0xfffff);
 	}
 
-	return 0;
+	return *corrections_out ? __builtin_popcount(*corrections_out) : 0;
 }
 
 static uint32_t encode_address(pocsag_msg_t *msg)
@@ -281,19 +441,44 @@ static uint32_t encode_numeric(pocsag_msg_t *msg)
 	return word;
 }
 
-static void decode_numeric(pocsag_t *pocsag, uint32_t word)
+static void decode_numeric(pocsag_t *pocsag, uint32_t word, uint32_t corrections)
 {
 	uint8_t digit;
-	int i;
+	int i, need;
 
 	for (i = 0; i < 5; i++) {
-		if (pocsag->rx_msg_data_length_numeric == sizeof(pocsag->rx_msg_data_numeric))
-			return;
-		digit = (word >> (27 - i * 4)) & 0x1;
-		digit = (digit << 1) | ((word >> (28 - i * 4)) & 0x1);
-		digit = (digit << 1) | ((word >> (29 - i * 4)) & 0x1);
-		digit = (digit << 1) | ((word >> (30 - i * 4)) & 0x1);
-		pocsag->rx_msg_data_numeric[pocsag->rx_msg_data_length_numeric++] = numeric[digit];
+		need = pocsag->rx_msg_data_length_numeric + 1;
+		if (need > pocsag->rx_msg_numeric_alloc) {
+			int new_alloc = pocsag->rx_msg_numeric_alloc ? pocsag->rx_msg_numeric_alloc + RX_BUF_GROW : RX_BUF_INIT;
+			char *nd = realloc(pocsag->rx_msg_data_numeric, new_alloc);
+			uint8_t *ns = realloc(pocsag->rx_msg_num_status, new_alloc);
+			if (!nd || !ns)
+				return;
+			pocsag->rx_msg_data_numeric = nd;
+			pocsag->rx_msg_num_status = ns;
+			pocsag->rx_msg_numeric_alloc = new_alloc;
+		}
+
+		/*
+		 * Check if any of the 4 source bits for this digit were affected.
+		 * corrections == 0xfffff800 means uncorrectable (all data bits bad),
+		 * otherwise individual set bits mean BCH-corrected positions.
+		 */
+		int bit0 = 30 - i * 4, bit1 = 29 - i * 4, bit2 = 28 - i * 4, bit3 = 27 - i * 4;
+		int any_affected = ((corrections >> bit0) | (corrections >> bit1) |
+				    (corrections >> bit2) | (corrections >> bit3)) & 1;
+		/* Status: 0=ok, 1=corrected, 2=uncorrectable */
+		uint8_t status = 0;
+		if (any_affected)
+			status = (corrections == 0xfffff800) ? 2 : 1;
+
+		digit = (word >> bit3) & 0x1;
+		digit = (digit << 1) | ((word >> bit2) & 0x1);
+		digit = (digit << 1) | ((word >> bit1) & 0x1);
+		digit = (digit << 1) | ((word >> bit0) & 0x1);
+		pocsag->rx_msg_data_numeric[pocsag->rx_msg_data_length_numeric] = numeric[digit];
+		pocsag->rx_msg_num_status[pocsag->rx_msg_data_length_numeric] = status;
+		pocsag->rx_msg_data_length_numeric++;
 	}
 }
 
@@ -372,46 +557,234 @@ static uint32_t encode_alpha(pocsag_msg_t *msg)
 	return word;
 }
 
-static void decode_alpha(pocsag_t *pocsag, uint32_t word)
+static void decode_alpha(pocsag_t *pocsag, uint32_t word, uint32_t corrections)
 {
 	int i;
+	int need;
 
 	for (i = 0; i < 20; i++) {
-		if (pocsag->rx_msg_data_length == sizeof(pocsag->rx_msg_data))
-			return;
-		if (!pocsag->rx_msg_bit_index)
+		int bit_pos = 30 - i;
+		int bit_corrected = (corrections >> bit_pos) & 1;
+
+		need = pocsag->rx_msg_data_length + 1;
+		if (need > pocsag->rx_msg_data_alloc) {
+			int new_alloc = pocsag->rx_msg_data_alloc ? pocsag->rx_msg_data_alloc + RX_BUF_GROW : RX_BUF_INIT;
+			char *nd = realloc(pocsag->rx_msg_data, new_alloc);
+			uint8_t *ns = realloc(pocsag->rx_msg_char_status, new_alloc);
+			if (!nd || !ns)
+				return;
+			pocsag->rx_msg_data = nd;
+			pocsag->rx_msg_char_status = ns;
+			pocsag->rx_msg_data_alloc = new_alloc;
+		}
+
+		if (!pocsag->rx_msg_bit_index) {
 			pocsag->rx_msg_data[pocsag->rx_msg_data_length] = 0x00;
+			pocsag->rx_msg_cur_char_bad = 0;
+		}
 		pocsag->rx_msg_data[pocsag->rx_msg_data_length] >>= 1;
-		pocsag->rx_msg_data[pocsag->rx_msg_data_length] |= ((word >> (30 - i)) & 0x1) << 6;
+		pocsag->rx_msg_data[pocsag->rx_msg_data_length] |= ((word >> bit_pos) & 0x1) << 6;
+		/*
+		 * Track per-char status: 0=ok, 1=corrected, 2=uncorrectable.
+		 * corrections == 0xfffff800 means the entire codeword was
+		 * uncorrectable (all data bits flagged as bad).
+		 */
+		if (bit_corrected) {
+			if (corrections == 0xfffff800)
+				pocsag->rx_msg_cur_char_bad = 2;
+			else if (pocsag->rx_msg_cur_char_bad < 1)
+				pocsag->rx_msg_cur_char_bad = 1;
+		}
 		if (++pocsag->rx_msg_bit_index == 7) {
+			pocsag->rx_msg_char_status[pocsag->rx_msg_data_length] = pocsag->rx_msg_cur_char_bad;
 			pocsag->rx_msg_bit_index = 0;
 			pocsag->rx_msg_data_length++;
 		}
 	}
 }
 
-static void decode_hex(pocsag_t *pocsag, uint32_t word)
+/*
+ * Decode Skyper (ROT-1 Caesar cipher on alpha).
+ * Skyper rubric names and content use ROT-1: each 7-bit character is
+ * shifted by +1 during encoding, so we subtract 1 to decode.
+ * This runs in parallel with normal alpha decode.
+ */
+static void decode_skyper(pocsag_t *pocsag)
 {
-	uint8_t digit;
 	int i;
 
-	for (i = 0; i < 5; i++) {
-		if (pocsag->rx_msg_data_length_hex == sizeof(pocsag->rx_msg_data_hex))
+	/* Derive Skyper text from the already-decoded alpha buffer */
+	pocsag->rx_msg_data_length_skyper = pocsag->rx_msg_data_length;
+
+	/* Ensure skyper buffer is large enough */
+	if (pocsag->rx_msg_data_length > 0) {
+		void *p = realloc(pocsag->rx_msg_data_skyper, pocsag->rx_msg_data_length);
+		if (!p)
 			return;
-		digit = (word >> (27 - i * 4)) & 0x1;
-		digit = (digit << 1) | ((word >> (28 - i * 4)) & 0x1);
-		digit = (digit << 1) | ((word >> (29 - i * 4)) & 0x1);
-		digit = (digit << 1) | ((word >> (30 - i * 4)) & 0x1);
-		pocsag->rx_msg_data_hex[pocsag->rx_msg_data_length_hex++] = hex[digit];
+		pocsag->rx_msg_data_skyper = p;
 	}
+
+	for (i = 0; i < pocsag->rx_msg_data_length; i++) {
+		unsigned char c = (unsigned char)pocsag->rx_msg_data[i];
+		/* ROT-1 decode: subtract 1, wrap 0x00 -> 0x7F within 7-bit range */
+		if (c == 0)
+			pocsag->rx_msg_data_skyper[i] = 0x7F;
+		else
+			pocsag->rx_msg_data_skyper[i] = c - 1;
+	}
+}
+
+/*
+ * Store raw message bits for base64 output.
+ * Packs the 20 data bits from each message codeword into a byte buffer.
+ */
+static void store_raw_bits(pocsag_t *pocsag, uint32_t word)
+{
+	int i;
+
+	for (i = 0; i < 20; i++) {
+		int byte_idx = pocsag->rx_msg_data_raw_bits / 8;
+		int bit_idx = 7 - (pocsag->rx_msg_data_raw_bits % 8); /* MSB first */
+
+		if (rx_buf_ensure((void **)&pocsag->rx_msg_data_raw, byte_idx + 1,
+				  &pocsag->rx_msg_raw_alloc, sizeof(uint8_t)) < 0)
+			return;
+
+		if (pocsag->rx_msg_data_raw_bits % 8 == 0)
+			pocsag->rx_msg_data_raw[byte_idx] = 0;
+
+		if ((word >> (30 - i)) & 1)
+			pocsag->rx_msg_data_raw[byte_idx] |= (1u << bit_idx);
+
+		pocsag->rx_msg_data_raw_bits++;
+	}
+}
+
+/*
+ * Heuristic scoring for message type detection.
+ *
+ * Combines approaches from multimon-ng and PDW:
+ *   - multimon-ng: per-character class scoring (printable, special, control)
+ *   - PDW: penalizes "bad" numeric chars (U, [, ], *) with escalating weights
+ *
+ * Returns a score where higher = more likely to be this type.
+ * Negative scores indicate the content is unlikely to be this type.
+ */
+static int score_alpha(const char *data, int len)
+{
+	int score = 0;
+	int i;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)data[i];
+		if (c >= 32 && c <= 126) {
+			/* printable ASCII */
+			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == ' ')
+				score += 3; /* letters and space — strong alpha signal */
+			else if (c >= '0' && c <= '9')
+				score += 1; /* digits are neutral */
+			else
+				score -= 1; /* special chars — mild penalty */
+		} else if (c == '\n' || c == '\r' || c == '\t') {
+			score += 0; /* common whitespace — neutral */
+		} else if (c == 0x04 || c == 0x00) {
+			score += 0; /* EOT/NULL padding — neutral */
+		} else {
+			score -= 5; /* non-printable control chars — strong penalty */
+		}
+	}
+
+	return score;
+}
+
+static int score_numeric(const char *data, int len)
+{
+	int score = 0;
+	int i;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)data[i];
+		if (c >= '0' && c <= '9')
+			score += 5; /* digits — strong numeric signal */
+		else if (c == ' ' || c == '-' || c == '.')
+			score += 1; /* common numeric separators */
+		else if (c == 'U')
+			score -= 10; /* 'U' (0xB) — very unlikely in real numeric */
+		else if (c == '[' || c == ']')
+			score -= 5; /* brackets — unlikely in numeric */
+		else if (c == 'R')
+			score -= 3; /* spare character */
+		else
+			score -= 2;
+	}
+
+	/* PDW-style: penalize long numeric messages (>20 chars are likely alpha) */
+	if (len > 20)
+		score -= (len - 20) * 2;
+
+	return score;
+}
+
+/*
+ * Check if a decoded string contains any printable content worth displaying.
+ * Returns 1 if at least one printable non-padding character exists.
+ */
+static int is_printable(const char *data, int len)
+{
+	int i;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)data[i];
+		if (c >= 32 && c <= 126)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Minimal base64 encoder for raw message data output.
+ */
+static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int base64_encode(const uint8_t *in, int in_len, char *out, int out_size)
+{
+	int i, o = 0;
+
+	for (i = 0; i < in_len; ) {
+		int remaining = in_len - i;
+		uint32_t a = in[i++];
+		uint32_t b = (remaining > 1) ? in[i++] : 0;
+		uint32_t c = (remaining > 2) ? in[i++] : 0;
+		uint32_t triple = (a << 16) | (b << 8) | c;
+
+		if (o + 4 >= out_size)
+			break;
+		out[o++] = b64[(triple >> 18) & 0x3F];
+		out[o++] = b64[(triple >> 12) & 0x3F];
+		out[o++] = (remaining > 1) ? b64[(triple >> 6) & 0x3F] : '=';
+		out[o++] = (remaining > 2) ? b64[triple & 0x3F] : '=';
+	}
+	if (o < out_size)
+		out[o] = '\0';
+	return o;
 }
 
 static enum pocsag_msg_type detect_msg_type(pocsag_t *pocsag)
 {
 	if (pocsag->rx_msg_data_length == 0)
-		return POCSAG_MSG_TYPE_TONE; /* No data codewords received -> Tone-only message */
+		return POCSAG_MSG_TYPE_TONE;
 
-	/* Always default to Alpha as per user request */
+	/*
+	 * Score-based detection combining multimon-ng and PDW approaches.
+	 * Compare alpha vs numeric scores to determine the primary type.
+	 * Skyper is a variant of alpha (ROT-1), scored separately.
+	 */
+	int sa = score_alpha(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
+	int sn = score_numeric(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
+
+	if (sn > sa && sn > 0)
+		return POCSAG_MSG_TYPE_NUMERIC;
+
 	return POCSAG_MSG_TYPE_ALPHA;
 }
 
@@ -476,11 +849,24 @@ int64_t get_codeword(pocsag_t *pocsag)
 			default:
 				word = CODEWORD_IDLE; /* tone-only: no message codewords */
 			}
-			/* if message is complete, reset index and remove message */
+			/* if message is complete, reset index and handle retransmission */
 			if (msg->data_index == msg->data_length) {
 				pocsag->current_msg = NULL;
-				msg->data_index = 0;
-				pocsag_msg_destroy(msg);
+				if (msg->retransmit_count < msg->retransmit_max) {
+					/* Re-enqueue for retransmission with delay */
+					struct timeval tv;
+					msg->retransmit_count++;
+					msg->data_index = 0;
+					msg->bit_index = 0;
+					gettimeofday(&tv, NULL);
+					msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + msg->retransmit_interval;
+					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission %d/%d for RIC %d scheduled in %.0fs.\n",
+						  msg->retransmit_count, msg->retransmit_max, msg->ric, msg->retransmit_interval);
+					/* msg stays in msg_list, will be picked up when eligible */
+				} else {
+					msg->data_index = 0;
+					pocsag_msg_destroy(msg);
+				}
 				pocsag_msg_done(pocsag);
 			}
 			/* prevent 'use-after-free' from this point on */
@@ -494,8 +880,18 @@ int64_t get_codeword(pocsag_t *pocsag)
 		/* if we are about to send an address codeword, we search for a pending message */
 		for (msg = pocsag->msg_list; msg; msg = msg->next) {
 			/* if a message matches the right time slot */
-			if ((msg->ric & 7) == slot)
+			if ((msg->ric & 7) == slot) {
+				/* skip if waiting for retransmit delay */
+				if (msg->next_send_time > 0.0) {
+					struct timeval tv;
+					double now;
+					gettimeofday(&tv, NULL);
+					now = (double)tv.tv_sec + tv.tv_usec / 1e6;
+					if (now < msg->next_send_time)
+						continue;
+				}
 				break;
+			}
 		}
 		if (msg) {
 			/*
@@ -519,8 +915,17 @@ int64_t get_codeword(pocsag_t *pocsag)
 				msg->data_index = 0;
 				msg->bit_index = 0;
 			} else {
-				/* tone-only: remove message, no data codewords */
-				pocsag_msg_destroy(msg);
+				/* tone-only: handle retransmission or remove */
+				if (msg->retransmit_count < msg->retransmit_max) {
+					struct timeval tv;
+					msg->retransmit_count++;
+					gettimeofday(&tv, NULL);
+					msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + msg->retransmit_interval;
+					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Tone retransmission %d/%d for RIC %d scheduled in %.0fs.\n",
+						  msg->retransmit_count, msg->retransmit_max, msg->ric, msg->retransmit_interval);
+				} else {
+					pocsag_msg_destroy(msg);
+				}
 				pocsag_msg_done(pocsag);
 				/* prevent 'use-after-free' from this point on */
 				msg = NULL;
@@ -536,8 +941,28 @@ int64_t get_codeword(pocsag_t *pocsag)
 		/* count codewords */
 		if (++pocsag->word_count == 17) {
 			pocsag->word_count = 0;
-			/* if no message has been scheduled during transmission and idle counter is reached, stop transmitter */
-			if (!pocsag->msg_list && pocsag->idle_count++ == IDLE_BATCHES) {
+			/*
+			 * Go idle if no message is ready to send.
+			 * Messages waiting for retransmit delay are in msg_list
+			 * but not eligible yet — don't keep transmitting idle
+			 * batches while waiting. The transmitter will restart
+			 * with preamble when a message becomes eligible.
+			 */
+			int any_ready = 0;
+			{
+				pocsag_msg_t *m;
+				struct timeval tv;
+				double now;
+				gettimeofday(&tv, NULL);
+				now = (double)tv.tv_sec + tv.tv_usec / 1e6;
+				for (m = pocsag->msg_list; m; m = m->next) {
+					if (m->next_send_time <= 0.0 || now >= m->next_send_time) {
+						any_ready = 1;
+						break;
+					}
+				}
+			}
+			if (!any_ready && pocsag->idle_count++ == IDLE_BATCHES) {
 				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Transmission done.\n");
 				LOGP_CHAN(DPOCSAG, LOGL_DEBUG, "Reached %d of idle batches, turning transmitter off.\n", IDLE_BATCHES);
 				pocsag_new_state(pocsag, POCSAG_IDLE);
@@ -547,8 +972,10 @@ int64_t get_codeword(pocsag_t *pocsag)
 		break;
 	}
 
-	if (word != CODEWORD_PREAMBLE)
-		debug_word(word, slot);
+	if (word != CODEWORD_PREAMBLE) {
+		uint32_t dummy;
+		debug_word(&word, slot, &dummy);
+	}
 
 	return word;
 }
@@ -556,52 +983,242 @@ int64_t get_codeword(pocsag_t *pocsag)
 static void done_rx_msg(pocsag_t *pocsag)
 {
 	const char *text;
+	int sa, sn, ss;
+	int raw_bytes;
 
 	if (!pocsag->rx_msg_valid)
 		return;
 
 	pocsag->rx_msg_valid = 0;
 
-	/* Detect message type based on content */
+	/* Compute sliding BER */
+	double ber = 0.0;
+	{
+		int total_errors = 0, total_bits = 0, i;
+		for (i = 0; i < pocsag->rx_ber.count; i++) {
+			total_errors += pocsag->rx_ber.errors[i];
+			total_bits += pocsag->rx_ber.total[i];
+		}
+		if (total_bits > 0)
+			ber = (double)total_errors / (double)total_bits;
+	}
+
+	/* Detect message type based on content scoring */
 	pocsag->rx_msg_type = detect_msg_type(pocsag);
 
-	/*
-	 * Log received message with detected msg_type.
-	 */
-	LOGP_CHAN(DPOCSAG, LOGL_INFO, "Received message from RIC '%d' / function '%s' / type '%s'\n",
+	/* Log message header with correction stats and BER */
+	LOGP_CHAN(DPOCSAG, LOGL_INFO, "Received message from RIC '%d' / function '%s' / type '%s'"
+		  " (%d codewords, %d corrected, %d uncorrectable, BER %.1e)\n",
 		  pocsag->rx_msg_ric, pocsag_function_name[pocsag->rx_msg_function],
-		  pocsag_msg_type_name(pocsag->rx_msg_type));
+		  pocsag_msg_type_name(pocsag->rx_msg_type),
+		  pocsag->rx_msg_codewords, pocsag->rx_msg_corrected,
+		  pocsag->rx_msg_uncorrectable, ber);
 
 	if (pocsag->rx_msg_type == POCSAG_MSG_TYPE_TONE) {
 		pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
-				   pocsag->rx_msg_function, pocsag->rx_msg_type, NULL);
+				   pocsag->rx_msg_function, pocsag->rx_msg_type,
+				   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, NULL);
 		return;
 	}
 
-	/* Log Content (Alpha is default) */
-	text = print_message(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
-	LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Alpha: \"%s\"\n", text);
-	
-	/* Log Numeric Content if short enough */
-	if (pocsag->rx_msg_data_length_numeric <= 20) {
-		text = print_message(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
-		LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Numeric: \"%s\"\n", text);
+	/* Derive Skyper (ROT-1) from alpha buffer */
+	decode_skyper(pocsag);
+
+	/* Score all candidates */
+	sa = score_alpha(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
+	sn = score_numeric(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
+	ss = score_alpha(pocsag->rx_msg_data_skyper, pocsag->rx_msg_data_length_skyper);
+
+	int alpha_printable = is_printable(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
+	int numeric_printable = is_printable(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
+	int skyper_printable = is_printable(pocsag->rx_msg_data_skyper, pocsag->rx_msg_data_length_skyper);
+
+	/* Build an ordered list of candidates by score */
+	struct {
+		const char *label;
+		const char *data;
+		const uint8_t *status; /* per-char correction status, or NULL */
+		int len;
+		int score;
+	} cand[3];
+	int ncand = 0;
+
+	if (alpha_printable) {
+		cand[ncand].label = "Alpha";
+		cand[ncand].data = pocsag->rx_msg_data;
+		cand[ncand].status = pocsag->rx_msg_char_status;
+		cand[ncand].len = pocsag->rx_msg_data_length;
+		cand[ncand].score = sa;
+		ncand++;
+	}
+	if (numeric_printable) {
+		cand[ncand].label = "Numeric";
+		cand[ncand].data = pocsag->rx_msg_data_numeric;
+		cand[ncand].status = pocsag->rx_msg_num_status;
+		cand[ncand].len = pocsag->rx_msg_data_length_numeric;
+		cand[ncand].score = sn;
+		ncand++;
+	}
+	if (skyper_printable) {
+		cand[ncand].label = "NEC-Skyper";
+		cand[ncand].data = pocsag->rx_msg_data_skyper;
+		cand[ncand].status = pocsag->rx_msg_char_status; /* same source bits as alpha */
+		cand[ncand].len = pocsag->rx_msg_data_length_skyper;
+		cand[ncand].score = ss;
+		ncand++;
 	}
 
-	/* Log Hex Output always */
-	text = print_message(pocsag->rx_msg_data_hex, pocsag->rx_msg_data_length_hex);
-	LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Hex: %s\n", text);
+	/* Simple insertion sort by score descending */
+	{
+		int i, j;
+		for (i = 1; i < ncand; i++) {
+			typeof(cand[0]) tmp = cand[i];
+			j = i - 1;
+			while (j >= 0 && cand[j].score < tmp.score) {
+				cand[j + 1] = cand[j];
+				j--;
+			}
+			cand[j + 1] = tmp;
+		}
+	}
 
-	/* Send Alpha to upper layer */
-	/* Re-generate alpha text as print_message uses static buffer */
-	text = print_message(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
-	pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
-			   pocsag->rx_msg_function, pocsag->rx_msg_type, text);
+	/* Log candidates in score order, marking corrected/bad characters */
+	{
+		int i;
+		for (i = 0; i < ncand; i++) {
+			text = print_message(cand[i].data, cand[i].len);
+			/* Count corrected and bad characters */
+			int n_corrected = 0, n_bad = 0, k;
+			if (cand[i].status) {
+				for (k = 0; k < cand[i].len; k++) {
+					if (cand[i].status[k] == 1) n_corrected++;
+					else if (cand[i].status[k] >= 2) n_bad++;
+				}
+			}
+			if (n_corrected || n_bad)
+				LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> %s (score %d, %d corrected, %d bad): \"%s\"\n",
+					  cand[i].label, cand[i].score, n_corrected, n_bad, text);
+			else
+				LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> %s (score %d): \"%s\"\n",
+					  cand[i].label, cand[i].score, text);
+		}
+	}
+
+	/* Always log base64-encoded raw message bits last */
+	raw_bytes = (pocsag->rx_msg_data_raw_bits + 7) / 8;
+	if (raw_bytes > 0) {
+		int b64_size = ((raw_bytes + 2) / 3) * 4 + 1;
+		char *b64buf = malloc(b64_size);
+		if (b64buf) {
+			base64_encode(pocsag->rx_msg_data_raw, raw_bytes, b64buf, b64_size);
+			LOGP_CHAN(DPOCSAG, LOGL_INFO, " -> Raw: %s\n", b64buf);
+			free(b64buf);
+		}
+	}
+
+	/* Send the highest-scoring printable candidate to upper layer */
+	if (ncand > 0) {
+		/*
+		 * RX dedup: check message history for retransmission.
+		 * If a matching (ric, function) message with the same codeword count
+		 * exists within the dedup window, attempt codeword-level recovery
+		 * and suppress duplicate delivery.
+		 */
+		int is_duplicate = 0;
+		if (pocsag->rx_dedup_window > 0.0 && pocsag->rx_msg_cw_count > 0) {
+			struct timeval tv;
+			double now;
+			int h;
+
+			gettimeofday(&tv, NULL);
+			now = (double)tv.tv_sec + tv.tv_usec / 1e6;
+
+			for (h = 0; h < POCSAG_RX_HISTORY_MAX; h++) {
+				struct pocsag_rx_history_entry *he = &pocsag->rx_history[h];
+				if (!he->active)
+					continue;
+				if (now - he->timestamp > pocsag->rx_dedup_window)
+					continue;
+				if (he->ric != pocsag->rx_msg_ric || he->function != pocsag->rx_msg_function)
+					continue;
+				if (he->baudrate != pocsag->rx_baud_locked || he->polarity != pocsag->rx_polarity_locked)
+					continue;
+				if (he->codeword_count != pocsag->rx_msg_cw_count)
+					continue;
+
+				/* Match found — attempt codeword-level recovery */
+				int recovered = 0, k;
+				for (k = 0; k < pocsag->rx_msg_cw_count; k++) {
+					if (pocsag->rx_msg_cw_status[k] == -1 && he->cw_status[k] >= 0) {
+						/* Current copy uncorrectable, history copy good — recover */
+						pocsag->rx_msg_cw_buf[k] = he->codewords[k];
+						pocsag->rx_msg_cw_status[k] = he->cw_status[k];
+						recovered++;
+					}
+					if (he->cw_status[k] == -1 && pocsag->rx_msg_cw_status[k] >= 0) {
+						/* History copy uncorrectable, current copy good — update history */
+						he->codewords[k] = pocsag->rx_msg_cw_buf[k];
+						he->cw_status[k] = pocsag->rx_msg_cw_status[k];
+					}
+				}
+				/* Update history timestamp to latest reception */
+				he->timestamp = now;
+
+				if (recovered)
+					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission dedup: recovered %d codeword(s) from previous copy.\n", recovered);
+				else
+					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission dedup: duplicate suppressed (RIC %d%s).\n",
+						  pocsag->rx_msg_ric, pocsag_function_name[pocsag->rx_msg_function]);
+				is_duplicate = 1;
+				break;
+			}
+
+			/* Store current message in history (replace oldest or first empty) */
+			{
+				int best = -1;
+				double oldest = 1e18;
+				for (h = 0; h < POCSAG_RX_HISTORY_MAX; h++) {
+					if (!pocsag->rx_history[h].active) {
+						best = h;
+						break;
+					}
+					if (pocsag->rx_history[h].timestamp < oldest) {
+						oldest = pocsag->rx_history[h].timestamp;
+						best = h;
+					}
+				}
+				if (best >= 0) {
+					struct pocsag_rx_history_entry *he = &pocsag->rx_history[best];
+					he->ric = pocsag->rx_msg_ric;
+					he->function = pocsag->rx_msg_function;
+					he->msg_type = pocsag->rx_msg_type;
+					he->baudrate = pocsag->rx_baud_locked;
+					he->polarity = pocsag->rx_polarity_locked;
+					he->codeword_count = pocsag->rx_msg_cw_count;
+					memcpy(he->codewords, pocsag->rx_msg_cw_buf,
+					       pocsag->rx_msg_cw_count * sizeof(uint32_t));
+					memcpy(he->cw_status, pocsag->rx_msg_cw_status,
+					       pocsag->rx_msg_cw_count * sizeof(int8_t));
+					he->timestamp = now;
+					he->active = 1;
+				}
+			}
+		}
+
+		if (!is_duplicate) {
+			text = print_message(cand[0].data, cand[0].len);
+			pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
+					   pocsag->rx_msg_function, pocsag->rx_msg_type,
+					   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, text);
+		}
+	}
 }
 
 void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
 {
 	int rc;
+	uint32_t corrections = 0;
+	int error_bits;
 
 	if (slot < 0 && word == CODEWORD_SYNC) {
 		LOGP_CHAN(DPOCSAG, LOGL_DEBUG, "Received 32 bits of sync pattern 0x%08x.\n", CODEWORD_SYNC);
@@ -615,8 +1232,43 @@ void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
 		LOGP_CHAN(DPOCSAG, LOGL_DEBUG, "Received 32 bits of address codeword 0x%08x (frame %d.%d).\n", word, slot, subslot);
 	else
 		LOGP_CHAN(DPOCSAG, LOGL_DEBUG, "Received 32 bits of message codeword 0x%08x (frame %d.%d).\n", word, slot, subslot);
-	rc = debug_word(word, slot);
+
+	/* Validate/correct codeword. Returns <0 uncorrectable, 0 clean, >0 bits corrected. */
+	rc = debug_word(&word, slot, &corrections);
+
+	/* Update sliding BER window */
+	error_bits = (rc < 0) ? 32 : __builtin_popcount(corrections);
+	{
+		int idx = pocsag->rx_ber.head;
+		pocsag->rx_ber.errors[idx] = error_bits;
+		pocsag->rx_ber.total[idx] = 32;
+		pocsag->rx_ber.head = (idx + 1) % POCSAG_BER_WINDOW;
+		if (pocsag->rx_ber.count < POCSAG_BER_WINDOW)
+			pocsag->rx_ber.count++;
+	}
+
 	if (rc < 0) {
+		/* Uncorrectable — mark all 20 data bits as bad for current codeword */
+		if (pocsag->rx_msg_valid) {
+			if (pocsag->rx_msg_codewords >= RX_MSG_MAX_CODEWORDS) {
+				LOGP_CHAN(DPOCSAG, LOGL_NOTICE, "Message exceeded %d codewords, truncating.\n", RX_MSG_MAX_CODEWORDS);
+				done_rx_msg(pocsag);
+				return;
+			}
+			pocsag->rx_msg_codewords++;
+			pocsag->rx_msg_uncorrectable++;
+			/* store codeword for dedup history */
+			if (pocsag->rx_msg_cw_count < POCSAG_RX_HISTORY_CW_MAX) {
+				pocsag->rx_msg_cw_buf[pocsag->rx_msg_cw_count] = word;
+				pocsag->rx_msg_cw_status[pocsag->rx_msg_cw_count] = -1;
+				pocsag->rx_msg_cw_count++;
+			}
+			/* Feed uncorrectable marker (all bits bad) to decode paths */
+			uint32_t all_data_bits = 0xfffff800; /* bits 31-11 */
+			decode_alpha(pocsag, word, all_data_bits);
+			decode_numeric(pocsag, word, all_data_bits);
+			store_raw_bits(pocsag, word);
+		}
 		done_rx_msg(pocsag);
 		return;
 	}
@@ -633,24 +1285,37 @@ void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
 		decode_address(word, slot, &pocsag->rx_msg_ric, &pocsag->rx_msg_function);
 		pocsag->rx_msg_data_length = 0;
 		pocsag->rx_msg_data_length_numeric = 0;
-		pocsag->rx_msg_data_length_hex = 0;
+		pocsag->rx_msg_data_length_skyper = 0;
+		pocsag->rx_msg_data_raw_bits = 0;
 		pocsag->rx_msg_bit_index = 0;
-		/*
-		 * Initialize msg_type to TONE (no message content expected yet).
-		 * Message type will be detected when we receive message codewords.
-		 */
+		pocsag->rx_msg_cur_char_bad = 0;
+		pocsag->rx_msg_codewords = 1;
+		pocsag->rx_msg_corrected = (rc > 0) ? 1 : 0;
+		pocsag->rx_msg_uncorrectable = 0;
 		pocsag->rx_msg_type = POCSAG_MSG_TYPE_TONE;
+		/* store address codeword for history */
+		pocsag->rx_msg_cw_count = 0;
 	} else {
-		/* Message codeword - decode content */
+		/* Message codeword - decode content in parallel */
 		if (!pocsag->rx_msg_valid)
 			return;
-		/*
-		 * Decoding strategy: Decode as Alpha, Numeric, and Hex simultaneously.
-		 * Later, we decide which one is valid.
-		 */
-		decode_alpha(pocsag, word);
-		decode_numeric(pocsag, word);
-		decode_hex(pocsag, word);
+		if (pocsag->rx_msg_codewords >= RX_MSG_MAX_CODEWORDS) {
+			LOGP_CHAN(DPOCSAG, LOGL_NOTICE, "Message exceeded %d codewords, truncating.\n", RX_MSG_MAX_CODEWORDS);
+			done_rx_msg(pocsag);
+			return;
+		}
+		pocsag->rx_msg_codewords++;
+		if (rc > 0)
+			pocsag->rx_msg_corrected++;
+		/* store codeword for dedup history */
+		if (pocsag->rx_msg_cw_count < POCSAG_RX_HISTORY_CW_MAX) {
+			pocsag->rx_msg_cw_buf[pocsag->rx_msg_cw_count] = word;
+			pocsag->rx_msg_cw_status[pocsag->rx_msg_cw_count] = (rc > 0) ? 1 : 0;
+			pocsag->rx_msg_cw_count++;
+		}
+		decode_alpha(pocsag, word, corrections);
+		decode_numeric(pocsag, word, corrections);
+		store_raw_bits(pocsag, word);
 	}
 }
 
