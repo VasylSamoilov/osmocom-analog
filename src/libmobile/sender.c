@@ -30,7 +30,6 @@
 #include <osmocom/core/timer.h>
 #ifdef HAVE_SDR
 #include "../libsdr/sdr_config.h"
-#include "../libsdr/split_sdr.h"
 #endif
 
 /* debug time consumption of audio processing */

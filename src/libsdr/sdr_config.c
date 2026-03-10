@@ -174,6 +174,15 @@ void sdr_config_print_help(void)
 	printf("        TX-specific upconverter offset (Hz).\n");
 	printf("    --sdr-rx-upconverter <Hz>\n");
 	printf("        RX-specific upconverter offset (Hz).\n");
+	printf("\nFrequency correction:\n");
+	printf("    --sdr-ppm <correction>\n");
+	printf("        Roles of crystal oscillator in PPM (parts per million).\n");
+	printf("        Positive value means crystal is fast, negative means slow.\n");
+	printf("        Applies to both TX and RX, or unified device.\n");
+	printf("    --sdr-tx-ppm <correction>\n");
+	printf("        PPM correction for TX device (split mode only).\n");
+	printf("    --sdr-rx-ppm <correction>\n");
+	printf("        PPM correction for RX device (split mode only).\n");
 }
 
 void sdr_config_print_hotkeys(void)
@@ -235,6 +244,10 @@ void sdr_config_print_hotkeys(void)
 #define	OPT_SDR_RPITX		1545
 #define	OPT_SDR_TX_RPITX	1546
 #endif
+/* PPM frequency correction */
+#define	OPT_SDR_PPM		1547
+#define	OPT_SDR_TX_PPM		1548
+#define	OPT_SDR_RX_PPM		1549
 
 void sdr_config_add_options(void)
 {
@@ -292,6 +305,10 @@ void sdr_config_add_options(void)
 #ifdef HAVE_RPITX
 	option_add(OPT_SDR_TX_RPITX, "sdr-tx-rpitx", 0);
 #endif
+	/* PPM frequency correction */
+	option_add(OPT_SDR_PPM, "sdr-ppm", 1);
+	option_add(OPT_SDR_TX_PPM, "sdr-tx-ppm", 1);
+	option_add(OPT_SDR_RX_PPM, "sdr-rx-ppm", 1);
 }
 
 int sdr_config_handle_options(int short_option, int argi, char **argv)
@@ -495,6 +512,18 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		fprintf(stderr, "SoapySDR support not compiled in!\n");
 		return -EINVAL;
 #endif
+		break;
+	/* PPM frequency correction */
+	case OPT_SDR_PPM:
+		sdr_config->ppm = atof(argv[argi]);
+		sdr_config->tx_ppm = sdr_config->ppm;
+		sdr_config->rx_ppm = sdr_config->ppm;
+		break;
+	case OPT_SDR_TX_PPM:
+		sdr_config->tx_ppm = atof(argv[argi]);
+		break;
+	case OPT_SDR_RX_PPM:
+		sdr_config->rx_ppm = atof(argv[argi]);
 		break;
 	default:
 		return -EINVAL;

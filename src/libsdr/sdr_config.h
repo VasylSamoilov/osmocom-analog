@@ -35,6 +35,10 @@ typedef struct sdr_config {
 	int		rx_samplerate;		/* RX sample rate */
 	double		rx_bandwidth;		/* RX IF bandwidth */
 	double		rx_lo_offset;		/* RX LO offset */
+	/* Frequency correction (crystal oscillator PPM error) */
+	double		ppm;			/* unified PPM correction (both TX and RX) */
+	double		tx_ppm;			/* split mode: TX device PPM correction */
+	double		rx_ppm;			/* split mode: RX device PPM correction */
 	/* Upconverter support (e.g., Ham-It-Up for kHz band reception) */
 	double		tx_upconverter;		/* TX upconverter offset (Hz) */
 	double		rx_upconverter;		/* RX upconverter offset (Hz) */

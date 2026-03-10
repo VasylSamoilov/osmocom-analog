@@ -71,6 +71,8 @@ typedef struct soapy_instance {
 	int			tx_samps_per_buff;
 	int			rx_samps_per_buff;
 	pthread_mutex_t		timestamp_mutex;
+	double			ppm_manual_rx;	/* nonzero if manual frequency correction needed (device doesn't support it) */
+	double			ppm_manual_tx;	/* nonzero if manual frequency correction needed (device doesn't support it) */
 } soapy_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -259,6 +261,36 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 			assign_instance_for_cleanup(inst, tx_frequency, rx_frequency);
 			soapy_close();
 			return -EINVAL;
+		}
+	}
+
+	/* apply PPM frequency correction */
+	if (sdr_config) {
+		double rx_ppm_val = sdr_config->rx_ppm;
+		double tx_ppm_val = sdr_config->tx_ppm;
+		if (rx_frequency && rx_ppm_val != 0.0) {
+			if (SoapySDRDevice_hasFrequencyCorrection(inst->sdr, SOAPY_SDR_RX, channel)) {
+				if (SoapySDRDevice_setFrequencyCorrection(inst->sdr, SOAPY_SDR_RX, channel, rx_ppm_val) != 0)
+					LOGP(DSOAPY, LOGL_ERROR, "Failed to set RX frequency correction to %.3f PPM\n", rx_ppm_val);
+				else
+					LOGP(DSOAPY, LOGL_INFO, "Set RX frequency correction to %.3f PPM\n", rx_ppm_val);
+			} else {
+				LOGP(DSOAPY, LOGL_NOTICE, "Device does not support RX frequency correction, will adjust frequency manually (%.3f PPM)\n", rx_ppm_val);
+				inst->ppm_manual_rx = rx_ppm_val;
+				rx_frequency = rx_frequency * (1.0 + rx_ppm_val / 1e6);
+			}
+		}
+		if (tx_frequency && tx_ppm_val != 0.0) {
+			if (SoapySDRDevice_hasFrequencyCorrection(inst->sdr, SOAPY_SDR_TX, channel)) {
+				if (SoapySDRDevice_setFrequencyCorrection(inst->sdr, SOAPY_SDR_TX, channel, tx_ppm_val) != 0)
+					LOGP(DSOAPY, LOGL_ERROR, "Failed to set TX frequency correction to %.3f PPM\n", tx_ppm_val);
+				else
+					LOGP(DSOAPY, LOGL_INFO, "Set TX frequency correction to %.3f PPM\n", tx_ppm_val);
+			} else {
+				LOGP(DSOAPY, LOGL_NOTICE, "Device does not support TX frequency correction, will adjust frequency manually (%.3f PPM)\n", tx_ppm_val);
+				inst->ppm_manual_tx = tx_ppm_val;
+				tx_frequency = tx_frequency * (1.0 + tx_ppm_val / 1e6);
+			}
 		}
 	}
 
@@ -644,21 +676,27 @@ int soapy_set_rx_frequency(double frequency)
 	soapy_instance_t *inst = soapy_rx_inst;
 	SoapySDRKwargs tune_args;
 	double got_frequency;
+	double corrected;
 
 	if (!inst || !inst->sdr) {
 		LOGP(DSOAPY, LOGL_ERROR, "Cannot set frequency: no device open\n");
 		return -ENODEV;
 	}
 
+	/* apply manual PPM correction if device doesn't support setFrequencyCorrection */
+	corrected = frequency;
+	if (inst->ppm_manual_rx != 0.0)
+		corrected = frequency * (1.0 + inst->ppm_manual_rx / 1e6);
+
 	memset(&tune_args, 0, sizeof(tune_args));
 
-	if (SoapySDRDevice_setFrequency(inst->sdr, SOAPY_SDR_RX, 0, frequency, &tune_args) != 0) {
+	if (SoapySDRDevice_setFrequency(inst->sdr, SOAPY_SDR_RX, 0, corrected, &tune_args) != 0) {
 		LOGP(DSOAPY, LOGL_ERROR, "Failed to set RX frequency to %.0f Hz\n", frequency);
 		return -EIO;
 	}
 
 	got_frequency = SoapySDRDevice_getFrequency(inst->sdr, SOAPY_SDR_RX, 0);
-	if (fabs(got_frequency - frequency) > 100.0) {
+	if (fabs(got_frequency - corrected) > 100.0) {
 		LOGP(DSOAPY, LOGL_ERROR, "Given RX frequency %.0f Hz is not supported, got %.0f Hz\n", frequency, got_frequency);
 		return -EINVAL;
 	}
@@ -672,21 +710,27 @@ int soapy_set_tx_frequency(double frequency)
 	soapy_instance_t *inst = soapy_tx_inst;
 	SoapySDRKwargs tune_args;
 	double got_frequency;
+	double corrected;
 
 	if (!inst || !inst->sdr) {
 		LOGP(DSOAPY, LOGL_ERROR, "Cannot set TX frequency: no device open\n");
 		return -ENODEV;
 	}
 
+	/* apply manual PPM correction if device doesn't support setFrequencyCorrection */
+	corrected = frequency;
+	if (inst->ppm_manual_tx != 0.0)
+		corrected = frequency * (1.0 + inst->ppm_manual_tx / 1e6);
+
 	memset(&tune_args, 0, sizeof(tune_args));
 
-	if (SoapySDRDevice_setFrequency(inst->sdr, SOAPY_SDR_TX, 0, frequency, &tune_args) != 0) {
+	if (SoapySDRDevice_setFrequency(inst->sdr, SOAPY_SDR_TX, 0, corrected, &tune_args) != 0) {
 		LOGP(DSOAPY, LOGL_ERROR, "Failed to set TX frequency to %.0f Hz\n", frequency);
 		return -EIO;
 	}
 
 	got_frequency = SoapySDRDevice_getFrequency(inst->sdr, SOAPY_SDR_TX, 0);
-	if (fabs(got_frequency - frequency) > 100.0) {
+	if (fabs(got_frequency - corrected) > 100.0) {
 		LOGP(DSOAPY, LOGL_ERROR, "Given TX frequency %.0f Hz is not supported, got %.0f Hz\n", frequency, got_frequency);
 		return -EINVAL;
 	}

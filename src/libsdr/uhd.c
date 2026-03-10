@@ -51,6 +51,8 @@ typedef struct uhd_instance {
 	int			tx_timestamps;
 	int			software_clock;
 	struct timespec		software_base_ts;
+	double			ppm_tx;		/* PPM correction to apply to TX frequencies */
+	double			ppm_rx;		/* PPM correction to apply to RX frequencies */
 } uhd_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -177,6 +179,26 @@ int uhd_open(size_t channel, const char *_device_args, const char *_stream_args,
 			uhd_tx_inst = uhd_rx_inst = inst;
 			uhd_close();
 			return -EINVAL;
+		}
+	}
+
+	/* apply PPM frequency correction (UHD has no native PPM API, adjust frequencies manually) */
+	if (sdr_config) {
+		if (sdr_config->tx_ppm != 0.0) {
+			inst->ppm_tx = sdr_config->tx_ppm;
+			if (tx_frequency) {
+				double corrected = tx_frequency * (1.0 + sdr_config->tx_ppm / 1e6);
+				LOGP(DUHD, LOGL_INFO, "Applying TX PPM correction %.3f: %.0f Hz -> %.0f Hz\n", sdr_config->tx_ppm, tx_frequency, corrected);
+				tx_frequency = corrected;
+			}
+		}
+		if (sdr_config->rx_ppm != 0.0) {
+			inst->ppm_rx = sdr_config->rx_ppm;
+			if (rx_frequency) {
+				double corrected = rx_frequency * (1.0 + sdr_config->rx_ppm / 1e6);
+				LOGP(DUHD, LOGL_INFO, "Applying RX PPM correction %.3f: %.0f Hz -> %.0f Hz\n", sdr_config->rx_ppm, rx_frequency, corrected);
+				rx_frequency = corrected;
+			}
 		}
 	}
 
@@ -679,14 +701,20 @@ int uhd_set_rx_frequency(double frequency)
 	uhd_tune_result_t tune_result;
 	uhd_error error;
 	double got_frequency;
+	double corrected;
 
 	if (!inst || !inst->usrp) {
 		LOGP(DUHD, LOGL_ERROR, "Cannot set frequency: no device open\n");
 		return -ENODEV;
 	}
 
+	/* apply manual PPM correction */
+	corrected = frequency;
+	if (inst->ppm_rx != 0.0)
+		corrected = frequency * (1.0 + inst->ppm_rx / 1e6);
+
 	memset(&tune_request, 0, sizeof(tune_request));
-	tune_request.target_freq = frequency;
+	tune_request.target_freq = corrected;
 	tune_request.rf_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO;
 	tune_request.dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO;
 	tune_request.args = "";
@@ -703,7 +731,7 @@ int uhd_set_rx_frequency(double frequency)
 		return -EIO;
 	}
 
-	if (fabs(got_frequency - frequency) > 100.0) {
+	if (fabs(got_frequency - corrected) > 100.0) {
 		LOGP(DUHD, LOGL_ERROR, "Given RX frequency %.0f Hz is not supported, got %.0f Hz\n", frequency, got_frequency);
 		return -EINVAL;
 	}
@@ -719,14 +747,20 @@ int uhd_set_tx_frequency(double frequency)
 	uhd_tune_result_t tune_result;
 	uhd_error error;
 	double got_frequency;
+	double corrected;
 
 	if (!inst || !inst->usrp) {
 		LOGP(DUHD, LOGL_ERROR, "Cannot set TX frequency: no device open\n");
 		return -ENODEV;
 	}
 
+	/* apply manual PPM correction */
+	corrected = frequency;
+	if (inst->ppm_tx != 0.0)
+		corrected = frequency * (1.0 + inst->ppm_tx / 1e6);
+
 	memset(&tune_request, 0, sizeof(tune_request));
-	tune_request.target_freq = frequency;
+	tune_request.target_freq = corrected;
 	tune_request.rf_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO;
 	tune_request.dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO;
 	tune_request.args = "";
@@ -743,7 +777,7 @@ int uhd_set_tx_frequency(double frequency)
 		return -EIO;
 	}
 
-	if (fabs(got_frequency - frequency) > 100.0) {
+	if (fabs(got_frequency - corrected) > 100.0) {
 		LOGP(DUHD, LOGL_ERROR, "Given TX frequency %.0f Hz is not supported, got %.0f Hz\n", frequency, got_frequency);
 		return -EINVAL;
 	}

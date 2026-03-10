@@ -848,7 +848,12 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 #endif
 #ifdef HAVE_RPITX
 		if (sdr_config->tx_rpitx) {
-			rc = rpitx_open(actual_tx_center, (double)sdr_config->tx_samplerate, sdr_config->tx_gain);
+			double rpitx_freq = actual_tx_center;
+			if (sdr_config->tx_ppm != 0.0) {
+				rpitx_freq = actual_tx_center * (1.0 + sdr_config->tx_ppm / 1e6);
+				LOGP(DSDR, LOGL_INFO, "Applying TX PPM correction %.3f for rpitx: %.0f Hz -> %.0f Hz\n", sdr_config->tx_ppm, actual_tx_center, rpitx_freq);
+			}
+			rc = rpitx_open(rpitx_freq, (double)sdr_config->tx_samplerate, sdr_config->tx_gain);
 			if (rc)
 				goto error;
 			tx_driver = 3;
@@ -896,7 +901,12 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 #endif
 #ifdef HAVE_RPITX
 		if (sdr_config->rpitx) {
-			rc = rpitx_open(actual_tx_center, (double)sdr_config->samplerate, sdr_config->tx_gain);
+			double rpitx_freq = actual_tx_center;
+			if (sdr_config->tx_ppm != 0.0) {
+				rpitx_freq = actual_tx_center * (1.0 + sdr_config->tx_ppm / 1e6);
+				LOGP(DSDR, LOGL_INFO, "Applying TX PPM correction %.3f for rpitx: %.0f Hz -> %.0f Hz\n", sdr_config->tx_ppm, actual_tx_center, rpitx_freq);
+			}
+			rc = rpitx_open(rpitx_freq, (double)sdr_config->samplerate, sdr_config->tx_gain);
 			if (rc)
 				goto error;
 			tx_driver = 3;

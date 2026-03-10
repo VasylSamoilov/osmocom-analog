@@ -21,8 +21,7 @@ if HAVE_SOAPY
 AM_CPPFLAGS += -DHAVE_SOAPY
 
 libsdr_a_SOURCES += \
-	soapy.c \
-	split_sdr.c
+	soapy.c
 endif
 
 if HAVE_RPITX
