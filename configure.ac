@@ -1,7 +1,7 @@
 dnl Process this file with autoconf to produce a configure script
 AC_INIT([abcnetz],[m4_esyscmd(./git-version-gen .tarball-version)],[jolly@eversberg.eu])
 
-AM_INIT_AUTOMAKE([dist-bzip2])
+AM_INIT_AUTOMAKE([dist-bzip2 subdir-objects])
 
 AC_CONFIG_MACRO_DIR([m4])
 
