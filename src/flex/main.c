@@ -38,7 +38,8 @@
 #include "dsp.h"
 #include "scheduler.h"
 
-#define MSG_SEND "/tmp/flex_msg_send"
+#define MSG_SEND_DEFAULT "/tmp/flex_msg_send"
+static const char *msg_send_path = MSG_SEND_DEFAULT;
 static int msg_send_fd = -1;
 
 static int tx = 0;
@@ -110,6 +111,7 @@ static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: b
 #define OPT_RETRANSMIT_INTERVAL	3026
 #define OPT_SEND_DELAY		3027
 #define OPT_HACK_NONSTANDARD	3028
+#define OPT_FIFO		3029
 
 void print_help(const char *arg0)
 {
@@ -229,8 +231,10 @@ void print_help(const char *arg0)
 	printf("        boundary (word 7, 15, 23, ...).  This flag flips bit 0\n");
 	printf("        of such words; BCH(31,21) corrects the 1-bit error on RX.\n");
 	printf("        Default OFF (standard-compliant behavior).\n");
+	printf("    --fifo <path>\n");
+	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
 	printf("\n");
-	printf("    FIFO protocol (write to %s):\n", MSG_SEND);
+	printf("    FIFO protocol (write to %s):\n", msg_send_path);
 	printf("        Format: capcode,type,options,message\n");
 	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short|secure|special|nnumeric|nspecial (or 0-10)\n");
 	printf("        Options: space-separated key=value pairs:\n");
@@ -327,6 +331,7 @@ static void add_options(void)
 	option_add(OPT_RETRANSMIT_INTERVAL, "retransmit-interval", 1);
 	option_add(OPT_SEND_DELAY, "send-delay", 1);
 	option_add(OPT_HACK_NONSTANDARD, "hack-for-non-standard-decoders", 0);
+	option_add(OPT_FIFO, "fifo", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -565,6 +570,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_HACK_NONSTANDARD:
 		hack_nonstandard_decoders = 1;
+		break;
+	case OPT_FIFO:
+		msg_send_path = options_strdup(argv[argi++]);
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -1443,15 +1451,15 @@ int main(int argc, char *argv[])
 		biw_time_enabled = network_mode;
 
 	/* create pipe for message send */
-	unlink(MSG_SEND);
-	rc = mkfifo(MSG_SEND, 0666);
+	unlink(msg_send_path);
+	rc = mkfifo(msg_send_path, 0666);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to create message send FIFO '%s'!\n", MSG_SEND);
+		fprintf(stderr, "Failed to create message send FIFO '%s'!\n", msg_send_path);
 		goto fail;
 	} else {
-		msg_send_fd = open(MSG_SEND, O_RDONLY | O_NONBLOCK);
+		msg_send_fd = open(msg_send_path, O_RDWR | O_NONBLOCK);
 		if (msg_send_fd < 0) {
-			fprintf(stderr, "Failed to open message send FIFO '%s'!\n", MSG_SEND);
+			fprintf(stderr, "Failed to open message send FIFO '%s'!\n", msg_send_path);
 			goto fail;
 		}
 	}
@@ -1526,7 +1534,7 @@ fail:
 	/* pipe cleanup */
 	if (msg_send_fd > 0)
 		close(msg_send_fd);
-	unlink(MSG_SEND);
+	unlink(msg_send_path);
 
 	/* destroy transceiver instance */
 	while (sender_head)

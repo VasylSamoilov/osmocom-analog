@@ -35,8 +35,9 @@
 #include "pocsag.h"
 #include "dsp.h"
 
-#define MSG_SEND "/tmp/pocsag_msg_send"
+#define MSG_SEND_DEFAULT "/tmp/pocsag_msg_send"
 #define MSG_RECEIVED "/tmp/pocsag_msg_received"
+static const char *msg_send_path = MSG_SEND_DEFAULT;
 static int msg_send_fd = -1;
 
 static int tx = 0;		/* we transmit */
@@ -138,7 +139,9 @@ void print_help(const char *arg0)
 	printf("NOTE: Function bits (0-3/A-D) are sub-addresses, NOT message types.\n");
 	printf("      Message encoding (tone/numeric/alpha) is set separately with -y.\n");
 	printf("\n");
-	printf("File: %s\n", MSG_SEND);
+	printf("    --fifo <path>\n");
+	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
+	printf("File: %s\n", msg_send_path);
 	printf("        Write \"<capcode>,<type>,<options>,<message>\" to send a message.\n");
 	printf("        Format: capcode,type,options,message (always 4 comma-separated fields)\n");
 	printf("          capcode: RIC with optional function suffix, e.g. 1234567A\n");
@@ -173,6 +176,7 @@ void print_help(const char *arg0)
 
 #define OPT_PADDING	256
 #define OPT_DEDUP	257
+#define OPT_FIFO	258
 
 static void add_options(void)
 {
@@ -189,6 +193,7 @@ static void add_options(void)
 	option_add('S', "scan", 2);
 	option_add(OPT_PADDING, "padding", 1);
 	option_add(OPT_DEDUP, "dedup", 1);
+	option_add(OPT_FIFO, "fifo", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -315,6 +320,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		}
 		break;
+	case OPT_FIFO:
+		msg_send_path = options_strdup(argv[argi++]);
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -324,29 +332,53 @@ static int handle_options(int short_option, int argi, char **argv)
 
 static void myhandler(void)
 {
-	static char buffer[256];
-	static int pos = 0, rc, i;
-	int space = sizeof(buffer) - pos;
+	static char buffer[4096];
+	static int buf_len = 0;
+	int rc, i, start;
+	int space = sizeof(buffer) - buf_len;
 
-	rc = read(msg_send_fd, buffer + pos, space);
+	rc = read(msg_send_fd, buffer + buf_len, space);
 	if (rc > 0) {
-		pos += rc;
-		if (pos == space) {
-			fprintf(stderr, "Message buffer overflow!\n");
-			pos = 0;
+		buf_len += rc;
+
+		/* Overflow handling: if buffer is full with no complete message,
+		 * discard all data */
+		if (buf_len == (int)sizeof(buffer)) {
+			int has_newline = 0;
+			for (i = 0; i < buf_len; i++) {
+				if (buffer[i] == '\r' || buffer[i] == '\n') {
+					has_newline = 1;
+					break;
+				}
+			}
+			if (!has_newline) {
+				fprintf(stderr, "Message buffer overflow, discarding!\n");
+				buf_len = 0;
+				return;
+			}
 		}
-		/* check for end of line */
-		for (i = 0; i < pos; i++) {
-			if (buffer[i] == '\r' || buffer[i] == '\n')
-				break;
+
+		/* Process all complete lines */
+		start = 0;
+		for (i = 0; i < buf_len; i++) {
+			if (buffer[i] == '\r' || buffer[i] == '\n') {
+				buffer[i] = '\0';
+				if (i > start) {
+					if (tx)
+						pocsag_msg_send(language, buffer + start, i - start);
+					else
+						LOGP(DPOCSAG, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
+				}
+				start = i + 1;
+			}
 		}
-		/* send msg */
-		if (i < pos) {
-			pos = 0;
-			if (tx)
-				pocsag_msg_send(language, buffer, i);
-			else
-				LOGP(DPOCSAG, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
+
+		/* Retain any partial line */
+		if (start > 0 && start < buf_len) {
+			memmove(buffer, buffer + start, buf_len - start);
+			buf_len -= start;
+		} else if (start >= buf_len) {
+			buf_len = 0;
 		}
 	}
 }
@@ -442,15 +474,15 @@ int main(int argc, char *argv[])
 	}
 
 	/* create pipe for message sendy */
-	unlink(MSG_SEND);
-	rc = mkfifo(MSG_SEND, 0666);
+	unlink(msg_send_path);
+	rc = mkfifo(msg_send_path, 0666);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to create mwaaage send FIFO '%s'!\n", MSG_SEND);
+		fprintf(stderr, "Failed to create message send FIFO '%s'!\n", msg_send_path);
 		goto fail;
 	} else {
-		msg_send_fd = open(MSG_SEND, O_RDONLY | O_NONBLOCK);
+		msg_send_fd = open(msg_send_path, O_RDWR | O_NONBLOCK);
 		if (msg_send_fd < 0) {
-			fprintf(stderr, "Failed to open mwaaage send FIFO! '%s'\n", MSG_SEND);
+			fprintf(stderr, "Failed to open message send FIFO '%s'!\n", msg_send_path);
 			goto fail;
 		}
 	}
@@ -480,7 +512,7 @@ fail:
 	/* pipe */
 	if (msg_send_fd > 0)
 		close(msg_send_fd);
-	unlink(MSG_SEND);
+	unlink(msg_send_path);
 
 	/* destroy transceiver instance */
 	while(sender_head)

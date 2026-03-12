@@ -48,8 +48,9 @@ enum paging_signal;
 #include "signal_meter.h"
 
 #define DEFAULT_LO_OFFSET -1000000.0
-#define RDS_PAGING_PIPE "/tmp/rds_paging_send"
+#define RDS_PAGING_PIPE_DEFAULT "/tmp/rds_paging_send"
 
+static const char *rds_paging_pipe_path = RDS_PAGING_PIPE_DEFAULT;
 static int paging_pipe_fd = -1;
 
 /* Signal meter (file-scope so tune callback can access it) */
@@ -437,8 +438,11 @@ static void print_help(const char *arg0)
 	printf("        Force RBDS decoding (callsign lookup, US PTY names).\n");
 	printf("    --rds-paging [rpc]\n");
 	printf("        Enable RDS Radio Paging (Group 7A/1A/13A). Implies --rds.\n");
-	printf("        Optional RPC value 0-31 (default 4: group 001, sync 00).\n");
-	printf("        Use named pipe /tmp/rds_paging_send to send messages.\n");
+	printf("        Optional RPC value 0-31 (default 4: group desig 001, batt sync 00).\n");
+	printf("        Pipe: echo 'addr,type[,repeats,interval],msg' > %s\n", rds_paging_pipe_path);
+	printf("        Types: tone, numeric, numeric10, numeric18, alpha. Addr: 0-999999.\n");
+	printf("    --rds-paging-fifo <path>\n");
+	printf("        Path for the RDS paging FIFO (default %s).\n", RDS_PAGING_PIPE_DEFAULT);
 	printf("    --rds-hexrds-file <filename>\n");
 	printf("        Write received RDS groups to file in hexrds format.\n");
 	printf("        Format: \"XXXX XXXX XXXX XXXX\" per line (---- for missing blocks).\n");
@@ -552,6 +556,7 @@ static double afc_max_hz = 5000.0;
 #define OPT_RIGCTL_ALLOWED	1115
 #define OPT_RDS_TX_HEXRDS_FILE	1116
 #define OPT_RDS_TX_BITSTREAM_FILE 1117
+#define OPT_RDS_PAGING_FIFO	1121
 
 static void add_options(void)
 {
@@ -588,6 +593,7 @@ static void add_options(void)
 	option_add(OPT_POLYPHASE, "polyphase-resampler", 0);
 	option_add(OPT_RBDS, "rbds", 0);
 	option_add(OPT_RDS_PAGING, "rds-paging", 1);
+	option_add(OPT_RDS_PAGING_FIFO, "rds-paging-fifo", 1);
 	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
 	option_add(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1);
 	option_add(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1);
@@ -746,6 +752,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			rds_paging_rpc = rpc_val;
 		}
 		break;
+	case OPT_RDS_PAGING_FIFO:
+		rds_paging_pipe_path = argv[argi++];
+		break;
 	case OPT_RDS_HEXRDS_FILE:
 		rds_hexrds_file = options_strdup(argv[argi]);
 		rds = 1;  /* auto-enable RDS */
@@ -836,38 +845,13 @@ static int handle_options(int short_option, int argi, char **argv)
 	return 1;
 }
 
-/* Process paging commands from named pipe.
+/* Process a single paging command line.
  * Format: <address>,<type>,<message>
  *     or: <address>,<type>,<repeats>,<interval_sec>,<message>
  * Types: tone, numeric, alpha */
-static void paging_pipe_handler(rds_encoder_t *enc)
+static void paging_process_line(rds_encoder_t *enc, char *line)
 {
-	static char buf[512];
-	static int pos = 0;
-	int space = sizeof(buf) - pos - 1;
-	int rc, i;
-
-	if (paging_pipe_fd < 0)
-		return;
-
-	rc = read(paging_pipe_fd, buf + pos, space);
-	if (rc <= 0)
-		return;
-	pos += rc;
-
-	/* look for newline */
-	for (i = 0; i < pos; i++) {
-		if (buf[i] == '\r' || buf[i] == '\n')
-			break;
-	}
-	if (i >= pos)
-		return;
-
-	buf[i] = '\0';
-	pos = 0;
-
-	/* Parse: address,type[,repeats,interval],message */
-	char *p = buf;
+	char *p = line;
 	char *addr_str = strsep(&p, ",");
 	char *type_str = strsep(&p, ",");
 	if (!addr_str || !type_str) {
@@ -955,6 +939,57 @@ static void paging_pipe_handler(rds_encoder_t *enc)
 		     address / 10000, address % 10000, msg, repeats);
 	} else {
 		LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: unknown type '%s'\n", type_str);
+	}
+}
+
+static void paging_pipe_handler(rds_encoder_t *enc)
+{
+	static char buf[4096];
+	static int buf_len = 0;
+	int rc, i, start;
+	int space = sizeof(buf) - buf_len;
+
+	if (paging_pipe_fd < 0)
+		return;
+
+	rc = read(paging_pipe_fd, buf + buf_len, space);
+	if (rc > 0) {
+		buf_len += rc;
+
+		/* Overflow handling */
+		if (buf_len == (int)sizeof(buf)) {
+			int has_newline = 0;
+			for (i = 0; i < buf_len; i++) {
+				if (buf[i] == '\r' || buf[i] == '\n') {
+					has_newline = 1;
+					break;
+				}
+			}
+			if (!has_newline) {
+				LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: buffer overflow, discarding!\n");
+				buf_len = 0;
+				return;
+			}
+		}
+
+		/* Process all complete lines */
+		start = 0;
+		for (i = 0; i < buf_len; i++) {
+			if (buf[i] == '\r' || buf[i] == '\n') {
+				buf[i] = '\0';
+				if (i > start)
+					paging_process_line(enc, buf + start);
+				start = i + 1;
+			}
+		}
+
+		/* Retain any partial line */
+		if (start > 0 && start < buf_len) {
+			memmove(buf, buf + start, buf_len - start);
+			buf_len -= start;
+		} else if (start >= buf_len) {
+			buf_len = 0;
+		}
 	}
 }
 
@@ -1178,19 +1213,19 @@ int main(int argc, char *argv[])
 		/* Enable paging decoder so 7A/13A are decoded as paging, not ODA */
 		radio.rds_dec.paging_enabled = 1;
 		/* Create named pipe for paging commands */
-		unlink(RDS_PAGING_PIPE);
-		rc = mkfifo(RDS_PAGING_PIPE, 0666);
+		unlink(rds_paging_pipe_path);
+		rc = mkfifo(rds_paging_pipe_path, 0666);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create paging FIFO '%s': %s\n",
-				RDS_PAGING_PIPE, strerror(errno));
+				rds_paging_pipe_path, strerror(errno));
 		} else {
-			paging_pipe_fd = open(RDS_PAGING_PIPE, O_RDONLY | O_NONBLOCK);
+			paging_pipe_fd = open(rds_paging_pipe_path, O_RDWR | O_NONBLOCK);
 			if (paging_pipe_fd < 0)
 				fprintf(stderr, "Failed to open paging FIFO '%s': %s\n",
-					RDS_PAGING_PIPE, strerror(errno));
+					rds_paging_pipe_path, strerror(errno));
 			else
 				printf("RDS Paging enabled (RPC=%d), pipe: %s\n",
-				       rds_paging_rpc, RDS_PAGING_PIPE);
+				       rds_paging_rpc, rds_paging_pipe_path);
 		}
 	}
 
@@ -1628,7 +1663,7 @@ error:
 	/* Clean up paging pipe */
 	if (paging_pipe_fd >= 0)
 		close(paging_pipe_fd);
-	unlink(RDS_PAGING_PIPE);
+	unlink(rds_paging_pipe_path);
 	
 	/* Clean up protocol servers */
 	if (xdr_enabled)
