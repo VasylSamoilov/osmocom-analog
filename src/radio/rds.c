@@ -28,6 +28,7 @@
 #include "rds_tables.h"
 #include "../liblogging/logging.h"
 #include "../libfm/fm.h"
+#include "../libmobile/mcc.h"
 
 
 /* Forward declaration for encoder loopback verification */
@@ -1040,7 +1041,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 				     pag->tx_total_groups, PAG_AB(pag->ab_flag),
 				     msg->tonetype, PAG_R(msg->is_repeat), msg->call_counter,
 				     msg->repeats_left + 1, msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left));
-			else
+			else {
 				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX: %s addr=%02u-%04u len=%d grp=%d flag=%s %s tx=%s cnt=%d repeat=%d/%d msg=\"%.*s\"\n",
 				     rds_paging_type_name(msg->type),
 				     msg->address / 10000, msg->address % 10000,
@@ -1048,6 +1049,12 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 				     PAG_NI(msg->ni), PAG_R(msg->is_repeat), msg->call_counter,
 				     msg->repeats_left + 1, msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left),
 				     msg->data_len, msg->data);
+				if (msg->ni && msg->country_code) {
+					const char *cname = mcc_name(msg->country_code);
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX:   international: MCC=%d (%s) OPC=%d\n",
+					     msg->country_code, cname ? cname : "unknown", msg->opc);
+				}
+			}
 			return;
 		}
 		break;  /* Head not ready yet, wait */
@@ -1136,7 +1143,7 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 /* Public API: queue an alphanumeric page */
 int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 			      const char *text, int repeats, int interval_sec,
-			      uint8_t ni)
+			      uint8_t ni, uint16_t country_code, uint8_t opc)
 {
 	rds_paging_msg_t *msg;
 	int len;
@@ -1145,8 +1152,11 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(text);
-	if (len > RDS_PAGING_ALPHA_MAX)
-		len = RDS_PAGING_ALPHA_MAX;
+	if (ni && country_code > 0) {
+		if (len > 78) len = 78; /* international max */
+	} else {
+		if (len > RDS_PAGING_ALPHA_MAX) len = RDS_PAGING_ALPHA_MAX;
+	}
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1156,6 +1166,8 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 	if (!msg)
 		return -1;
 	msg->ni = ni;
+	msg->country_code = country_code;
+	msg->opc = opc;
 
 	rds_paging_enqueue(&rds->paging, msg);
 	rds_paging_start_next(rds);
@@ -1165,7 +1177,7 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 /* Public API: queue a variable-length numeric page (enhanced, up to 160 digits) */
 int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 			     const char *digits, int repeats, int interval_sec,
-			     uint8_t ni)
+			     uint8_t ni, uint16_t country_code, uint8_t opc)
 {
 	rds_paging_msg_t *msg;
 	int len;
@@ -1174,8 +1186,11 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(digits);
-	if (len > RDS_PAGING_VNUM_MAX)
-		len = RDS_PAGING_VNUM_MAX;
+	if (ni && country_code > 0) {
+		if (len > 156) len = 156; /* international max */
+	} else {
+		if (len > RDS_PAGING_VNUM_MAX) len = RDS_PAGING_VNUM_MAX;
+	}
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1185,6 +1200,8 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 	if (!msg)
 		return -1;
 	msg->ni = ni;
+	msg->country_code = country_code;
+	msg->opc = opc;
 
 	rds_paging_enqueue(&rds->paging, msg);
 	rds_paging_start_next(rds);
@@ -1192,7 +1209,7 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 }
 
 /* Public API: enable/disable paging */
-void rds_enc_paging_enable(rds_encoder_t *rds, int enable)
+void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enabled = enable;
 	if (!enable)
@@ -1206,11 +1223,98 @@ void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc)
 	rds->paging.rpc = rpc & 0x1F;
 }
 
-/* Public API: enable/disable enhanced paging (13A) */
-void rds_enc_paging_set_enhanced(rds_encoder_t *rds, int enable)
+/* Public API: enable/disable 13A address notification groups */
+void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enhanced = enable;
 	rds_scheduler_update(rds);
+}
+
+/* Public API: set OPC for Group 1A (0=no enhanced paging, 1-15=operator) */
+void rds_enc_paging_set_opc(rds_encoder_t *rds, uint8_t opc)
+{
+	rds->paging.intl_opc = opc & 0x0F;
+}
+
+/* Public API: set PAC for Group 1A variant 2 (0=all areas, 1-63=area code) */
+void rds_enc_paging_set_pac(rds_encoder_t *rds, uint8_t pac)
+{
+	rds->paging.pac = pac & 0x3F;
+}
+
+/* Public API: set default E.212 MCC for international paging */
+void rds_enc_paging_set_cc(rds_encoder_t *rds, uint16_t cc)
+{
+	rds->paging.intl_country_code = cc;
+}
+
+/* Public API: encoder getters */
+int rds_enc_paging_get_enabled(const rds_encoder_t *rds)
+{
+	return rds->paging.enabled;
+}
+
+uint8_t rds_enc_paging_get_rpc(const rds_encoder_t *rds)
+{
+	return rds->paging.rpc;
+}
+
+int rds_enc_paging_get_13a_notify(const rds_encoder_t *rds)
+{
+	return rds->paging.enhanced;
+}
+
+uint8_t rds_enc_paging_get_opc(const rds_encoder_t *rds)
+{
+	return rds->paging.intl_opc;
+}
+
+uint8_t rds_enc_paging_get_pac(const rds_encoder_t *rds)
+{
+	return rds->paging.pac;
+}
+
+uint16_t rds_enc_paging_get_cc(const rds_encoder_t *rds)
+{
+	return rds->paging.intl_country_code;
+}
+
+/* Public API: decoder paging getters */
+uint8_t rds_dec_paging_get_rpc(const rds_decoder_t *rds, int *valid)
+{
+	if (valid) *valid = rds->paging_dec.rpc_valid;
+	return rds->paging_dec.rpc;
+}
+
+uint8_t rds_dec_paging_get_opc(const rds_decoder_t *rds, int *valid)
+{
+	if (valid) *valid = rds->paging_dec.opc_valid;
+	return rds->paging_dec.opc;
+}
+
+uint8_t rds_dec_paging_get_pac(const rds_decoder_t *rds, int *valid)
+{
+	if (valid) *valid = rds->paging_dec.pac_valid;
+	return rds->paging_dec.pac;
+}
+
+int rds_dec_paging_get_last_msg(const rds_decoder_t *rds,
+				uint32_t *address, char *msg, int max_len,
+				int *msg_len, int *type)
+{
+	const rds_paging_dec_t *pd = &rds->paging_dec;
+	if (!pd->msg_valid)
+		return 0;
+	if (address) *address = pd->last_address;
+	if (type) *type = (int)pd->last_type;
+	if (msg_len) *msg_len = pd->last_msg_len;
+	if (msg && max_len > 0) {
+		int copy = pd->last_msg_len;
+		if (copy >= max_len) copy = max_len - 1;
+		memcpy(msg, pd->last_msg, copy);
+		msg[copy] = '\0';
+	}
+	return 1;
 }
 
 /* ============================================================
@@ -1406,6 +1510,11 @@ static void rds_build_group_0b(rds_encoder_t *rds, uint8_t *group)
 	
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 0B: seg=%d PS='%s%s'\n",
+		     seg, rds_char_to_display((uint8_t)rds->ps[seg*2]),
+		     rds_char_to_display((uint8_t)rds->ps[seg*2+1]));
 	
 	rds->ps_segment = (seg + 1) & RDS_PS_SEG_MASK;
 	
@@ -1608,11 +1717,12 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	 * Bits 11-0:  Variant-specific payload */
 	switch (variant) {
 	case RDS_1A_VARIANT_ECC:
-		/* Variant 0: Extended Country Code
-		 * Bits 11-8: Paging (always 0, deprecated)
+		/* Variant 0: Extended Country Code (IEC 62106 Table 9)
+		 * Bits 11-8: OPC (EN 50067 M.3.2.4.1, 0=no enhanced paging)
 		 * Bits 7-0:  ECC value */
 		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
 		     (RDS_1A_VARIANT_ECC << RDS_1A_VARIANT_SHIFT) |
+		     ((rds->paging.enabled ? rds->paging.intl_opc & 0xF : 0) << 8) |
 		     (rds->ecc & 0xFF);
 		break;
 		
@@ -1625,11 +1735,14 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 		break;
 		
 	case RDS_1A_VARIANT_PAGER:
-		/* Variant 2: Paging identification (IEC 62106 Table 9)
-		 * Bits 11-0: Paging OPC (Operator's Programme Code)
-		 * Transmitted when paging is enabled; payload is 0 (no OPC field) */
+		/* Variant 2: Paging identification (EN 50067 M.3.2.4.2)
+		 * Bits 11-8: OPC (0=no enhanced paging, 1-15=operator)
+		 * Bits 7-6:  reserved (zero)
+		 * Bits 5-0:  PAC (Paging Area Code, 0=all areas) */
 		b3 = ((rds->linkage_actuator ? 1 : 0) << RDS_1A_LA_BIT) |
-		     (RDS_1A_VARIANT_PAGER << RDS_1A_VARIANT_SHIFT);
+		     (RDS_1A_VARIANT_PAGER << RDS_1A_VARIANT_SHIFT) |
+		     ((rds->paging.intl_opc & 0xF) << 8) |
+		     (rds->paging.pac & 0x3F);
 		break;
 		
 	case RDS_1A_VARIANT_LANGUAGE:
@@ -1676,6 +1789,23 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug) {
+		const char *vname;
+		switch (variant) {
+		case RDS_1A_VARIANT_ECC:      vname = "ECC"; break;
+		case RDS_1A_VARIANT_TMC_ID:   vname = "TMC"; break;
+		case RDS_1A_VARIANT_PAGER:    vname = "Pager"; break;
+		case RDS_1A_VARIANT_LANGUAGE: vname = "Lang"; break;
+		case RDS_1A_VARIANT_BCAST:    vname = "Bcast"; break;
+		case RDS_1A_VARIANT_EWS:      vname = "EWS"; break;
+		default:                      vname = "?"; break;
+		}
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 1A: var=%d(%s) RPC=%d C=%04X D=%04X\n",
+		     variant, vname,
+		     rds->paging.enabled ? (rds->paging.rpc & 0x1F) : 0,
+		     b3, b4);
+	}
 	
 	/* Advance to next variant for next call */
 	rds->slc_variant = (rds->slc_variant + 1) % slc_variant_count;
@@ -2114,6 +2244,9 @@ static void rds_build_group_4a(rds_encoder_t *rds, uint8_t *group)
 	
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 1B: PIN=%04X\n", b4);
 }
 
 
@@ -2146,6 +2279,14 @@ static void rds_build_group_10a(rds_encoder_t *rds, uint8_t *group)
 	
 	/* Pack into bytes using shared function */
 	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 10A: seg=%d AB=%c PTYN='%s%s%s%s'\n",
+		     seg, rds->ptyn_ab ? 'B' : 'A',
+		     rds_char_to_display((uint8_t)rds->ptyn[pos]),
+		     rds_char_to_display((uint8_t)rds->ptyn[pos+1]),
+		     rds_char_to_display((uint8_t)rds->ptyn[pos+2]),
+		     rds_char_to_display((uint8_t)rds->ptyn[pos+3]));
 	
 	rds->ptyn_segment = (seg + 1) % 2;
 }
@@ -2258,6 +2399,10 @@ static void rds_build_group_14a(rds_encoder_t *rds, uint8_t *group)
 	
 	/* Pack into bytes */
 	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 14A: ON-PI=%04X var=%d TP=%d C=%04X\n",
+		     eon->pi, variant, eon->tp ? 1 : 0, b3);
 	
 	/* Advance to next variant/station - cycle through ALL variants for testing:
 	 * 0-3: PS name (4 groups)
@@ -2330,6 +2475,10 @@ static void rds_build_group_14b(rds_encoder_t *rds, uint8_t *group)
 	
 	/* Pack into bytes */
 	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 14B: ON-PI=%04X TP=%d TA=%d\n",
+		     eon->pi, eon->tp ? 1 : 0, eon->ta ? 1 : 0);
 	
 	/* Move to next station */
 	rds->eon_tx_index = (rds->eon_tx_index + 1) % rds->eon_tx_count;
@@ -2423,16 +2572,17 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 	}
 
 	case RDS_PAGING_ALPHA: {
-		/* Variable groups: address, data groups (4 chars each), end marker */
+		/* Variable groups: address, data groups (4 chars each), end marker.
+		 * International (NI=1, EN 50067 M.3.5.7): first data group's
+		 * Block C carries E.212 country code + OPC instead of 2 chars.
+		 * Block D of that group still carries 2 chars. Max 78 chars. */
 		int len = msg->data_len;
-		int padded_len, ngroups, i;
+		int intl = msg->ni;
+		int max_len = intl ? 78 : RDS_PAGING_ALPHA_MAX;
+		int padded_len, ngroups, i, ci;
 
-		if (len > RDS_PAGING_ALPHA_MAX)
-			len = RDS_PAGING_ALPHA_MAX;
-
-		/* Pad to multiple of 4 */
-		padded_len = ((len + 3) / 4) * 4;
-		ngroups = padded_len / 4;
+		if (len > max_len)
+			len = max_len;
 
 		/* Group 0: address + control byte */
 		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
@@ -2440,22 +2590,51 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
 		idx = 1;
 
-		/* Data groups: 4 chars each, PSAC cycles 9-14.
+		if (intl) {
+			/* International: first data group (PSAC=9)
+			 * Block C = I1I2I3(12 bits) | OPC(4 bits)
+			 * Block D = first 2 message characters */
+			uint16_t cc = msg->country_code;
+			uint8_t i1 = (cc / 100) & 0xF;
+			uint8_t i2 = (cc / 10) % 10;
+			uint8_t i3 = cc % 10;
+			uint8_t c0 = (0 < len) ? (uint8_t)msg->data[0] : 0x20;
+			uint8_t c1 = (1 < len) ? (uint8_t)msg->data[1] : 0x20;
+
+			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;
+			pag->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
+			pag->tx_blocks_d[idx] = (c0 << 8) | c1;
+			idx++;
+			ci = 2; /* message offset: 2 chars consumed */
+		} else {
+			ci = 0;
+		}
+
+		/* Remaining data groups: 4 chars each, PSAC cycles 9-14.
 		 * Per EN 50067 Table M.4, the LAST data group uses PSAC=1111 (0xF)
 		 * which means "end of alphanumeric message: last four or fewer
 		 * message characters".  PSAC 0xF is NOT an empty sentinel — it
 		 * carries the final characters. */
+		{
+			int remaining = len - ci;
+			if (remaining < 0) remaining = 0;
+			padded_len = ((remaining + 3) / 4) * 4;
+			ngroups = padded_len / 4;
+			if (ngroups == 0) ngroups = 1; /* at least one end group */
+		}
+
 		for (i = 0; i < ngroups; i++) {
-			int ci = i * 4;
-			uint8_t c0 = (ci < len) ? (uint8_t)msg->data[ci] : 0x20;
-			uint8_t c1 = (ci + 1 < len) ? (uint8_t)msg->data[ci + 1] : 0x20;
-			uint8_t c2 = (ci + 2 < len) ? (uint8_t)msg->data[ci + 2] : 0x20;
-			uint8_t c3 = (ci + 3 < len) ? (uint8_t)msg->data[ci + 3] : 0x20;
+			int oi = ci + i * 4;
+			uint8_t c0 = (oi < len) ? (uint8_t)msg->data[oi] : 0x20;
+			uint8_t c1 = (oi + 1 < len) ? (uint8_t)msg->data[oi + 1] : 0x20;
+			uint8_t c2 = (oi + 2 < len) ? (uint8_t)msg->data[oi + 2] : 0x20;
+			uint8_t c3 = (oi + 3 < len) ? (uint8_t)msg->data[oi + 3] : 0x20;
+			int psac_offset = intl ? (i + 1) : i; /* intl: PSAC=9 already used */
 
 			if (i == ngroups - 1)
 				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
 			else
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (i % 6);
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
 			pag->tx_blocks_c[idx] = (c0 << 8) | c1;
 			pag->tx_blocks_d[idx] = (c2 << 8) | c3;
 			idx++;
@@ -2468,20 +2647,21 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 	case RDS_PAGING_VNUM: {
 		/* Enhanced variable-length numeric (EN 50067 M.3.5.5)
 		 * 8 BCD digits per data group, PSAC cycles 9-14, F=end.
-		 * BCD 0xA = space for padding. Max 160 digits. */
+		 * BCD 0xA = space for padding.
+		 * International (NI=1, M.3.5.7): first data group's Block C
+		 * carries E.212 country code + OPC. Block D = 4 BCD digits.
+		 * Max 156 digits (vs 160 national). */
 		int len = msg->data_len;
-		int padded_len, ngroups, i;
+		int intl = msg->ni;
+		int max_len = intl ? 156 : RDS_PAGING_VNUM_MAX;
+		int padded_len, ngroups, i, di;
 		uint8_t nibbles[RDS_PAGING_VNUM_MAX];
 
-		if (len > RDS_PAGING_VNUM_MAX)
-			len = RDS_PAGING_VNUM_MAX;
+		if (len > max_len)
+			len = max_len;
 
-		/* Encode digits to BCD nibbles, pad with 0xA (space) */
+		/* Encode digits to BCD nibbles */
 		rds_paging_bcd_encode(msg->data, len, nibbles, len);
-		padded_len = ((len + 7) / 8) * 8;
-		for (i = len; i < padded_len; i++)
-			nibbles[i] = RDS_PAGING_BCD_SPACE;
-		ngroups = padded_len / 8;
 
 		/* Group 0: address + control byte */
 		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
@@ -2489,17 +2669,52 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
 		idx = 1;
 
-		/* Data groups: 8 BCD digits each */
+		if (intl) {
+			/* International: first data group (PSAC=9)
+			 * Block C = I1I2I3(12 bits) | OPC(4 bits)
+			 * Block D = first 4 BCD digits */
+			uint16_t cc = msg->country_code;
+			uint8_t i1 = (cc / 100) & 0xF;
+			uint8_t i2 = (cc / 10) % 10;
+			uint8_t i3 = cc % 10;
+			uint8_t n0 = (0 < len) ? nibbles[0] : RDS_PAGING_BCD_SPACE;
+			uint8_t n1 = (1 < len) ? nibbles[1] : RDS_PAGING_BCD_SPACE;
+			uint8_t n2 = (2 < len) ? nibbles[2] : RDS_PAGING_BCD_SPACE;
+			uint8_t n3 = (3 < len) ? nibbles[3] : RDS_PAGING_BCD_SPACE;
+
+			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;
+			pag->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
+			pag->tx_blocks_d[idx] = (n0 << 12) | (n1 << 8) | (n2 << 4) | n3;
+			idx++;
+			di = 4; /* nibble offset: 4 digits consumed */
+		} else {
+			di = 0;
+		}
+
+		/* Remaining data groups: 8 BCD digits each */
+		{
+			int remaining = len - di;
+			if (remaining < 0) remaining = 0;
+			padded_len = ((remaining + 7) / 8) * 8;
+			/* Pad nibbles array */
+			for (i = len; i < di + padded_len; i++)
+				nibbles[i] = RDS_PAGING_BCD_SPACE;
+			ngroups = padded_len / 8;
+			if (ngroups == 0) ngroups = 1; /* at least one end group */
+		}
+
 		for (i = 0; i < ngroups; i++) {
-			int ni = i * 8;
+			int ni_off = di + i * 8;
+			int psac_offset = intl ? (i + 1) : i; /* intl: PSAC=9 already used */
+
 			if (i == ngroups - 1)
 				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
 			else
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (i % 6);
-			pag->tx_blocks_c[idx] = (nibbles[ni] << 12) | (nibbles[ni+1] << 8) |
-						 (nibbles[ni+2] << 4) | nibbles[ni+3];
-			pag->tx_blocks_d[idx] = (nibbles[ni+4] << 12) | (nibbles[ni+5] << 8) |
-						 (nibbles[ni+6] << 4) | nibbles[ni+7];
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
+			pag->tx_blocks_c[idx] = (nibbles[ni_off] << 12) | (nibbles[ni_off+1] << 8) |
+						 (nibbles[ni_off+2] << 4) | nibbles[ni_off+3];
+			pag->tx_blocks_d[idx] = (nibbles[ni_off+4] << 12) | (nibbles[ni_off+5] << 8) |
+						 (nibbles[ni_off+6] << 4) | nibbles[ni_off+7];
 			idx++;
 		}
 
@@ -2555,34 +2770,128 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 	}
 }
 
-/* Build Group 13A sub-type 000 for enhanced paging address notification. */
+/* Compute 25-bit notification bit index for an address (EN 50067 M.3.6, Table M.18).
+ * Address = Y1Y2Z1Z2Z3Z4. Z2Z3 determines the sub-group (hex-coded, 0x00-0xFF).
+ * For BCD addresses (our case), Z2 and Z3 are 0-9, so Z2Z3_hex = Z2*16 + Z3.
+ * 25-bit formula: bit = floor(Z2Z3_hex * 25 / 256). */
+static int rds_paging_notify_bit_25(uint32_t address)
+{
+	uint8_t z2 = (address / 100) % 10;
+	uint8_t z3 = (address / 10) % 10;
+	uint8_t z2z3_hex = (z2 << 4) | z3;
+
+	return (z2z3_hex * 25) / 256;
+}
+
+/* Compute 50-bit notification bit index for an address (EN 50067 M.3.6, Table M.17).
+ * 50-bit formula: rows 0-7 = floor(Z2Z3_hex * 25 / 128),
+ *                 rows 8-F = 25 + floor((Z2Z3_hex - 128) * 25 / 128). */
+static int rds_paging_notify_bit_50(uint32_t address)
+{
+	uint8_t z2 = (address / 100) % 10;
+	uint8_t z3 = (address / 10) % 10;
+	uint8_t z2z3_hex = (z2 << 4) | z3;
+
+	if (z2z3_hex < 128)
+		return (z2z3_hex * 25) / 128;
+	else
+		return 25 + ((z2z3_hex - 128) * 25) / 128;
+}
+
+/* Compute interval number from address Z4 digit (EN 50067 M.2.1.6.2). */
+static uint8_t rds_paging_interval_from_addr(uint32_t address)
+{
+	return address % 10;
+}
+
+/* Recompute notify_bits from queue + active TX message.
+ * Called each time a 13A group is built. */
+static void rds_paging_update_notify(rds_paging_enc_t *pag)
+{
+	uint64_t bits = 0;
+	rds_paging_msg_t *msg;
+	int use_50 = pag->notify_50bit;
+
+	/* Currently transmitting message */
+	if (pag->tx_active && pag->tx_msg) {
+		int bit = use_50 ? rds_paging_notify_bit_50(pag->tx_msg->address)
+				 : rds_paging_notify_bit_25(pag->tx_msg->address);
+		bits |= (1ULL << bit);
+	}
+
+	/* Queued messages */
+	for (msg = pag->queue_head; msg; msg = msg->next) {
+		int bit = use_50 ? rds_paging_notify_bit_50(msg->address)
+				 : rds_paging_notify_bit_25(msg->address);
+		bits |= (1ULL << bit);
+	}
+
+	pag->notify_bits = bits;
+}
+
+/* Build Group 13A for enhanced paging address notification.
+ * EN 50067 M.3.4.1: transmitted at start of each interval, tells pagers
+ * whether there are pending messages for their sub-group.
+ * 25-bit mode (STY=000): 1 group, bits 24-0.
+ * 50-bit mode: alternates STY=001 (bits 49-25) and STY=010 (bits 24-0). */
 static void rds_build_group_13a_paging(rds_encoder_t *rds, uint8_t *group)
 {
 	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
 	rds_paging_enc_t *pag = &rds->paging;
+	uint8_t interval;
+	uint8_t sty;
+	uint32_t notify_word; /* 25 bits to encode in this group */
+
+	/* Recompute notification bits from current queue state */
+	rds_paging_update_notify(pag);
+
+	/* Interval number from current TX message, or 0 if idle */
+	interval = (pag->tx_active && pag->tx_msg)
+		   ? rds_paging_interval_from_addr(pag->tx_msg->address) : 0;
+
+	if (pag->notify_50bit) {
+		/* 50-bit mode: alternate between STY=001 (high) and STY=010 (low).
+		 * Use notify_sty to track which half to send next. */
+		if (pag->notify_sty != 1) {
+			sty = 1; /* STY=001: bits 49-25 */
+			notify_word = (uint32_t)((pag->notify_bits >> 25) & 0x1FFFFFF);
+			pag->notify_sty = 1;
+		} else {
+			sty = 2; /* STY=010: bits 24-0 */
+			notify_word = (uint32_t)(pag->notify_bits & 0x1FFFFFF);
+			pag->notify_sty = 2;
+		}
+	} else {
+		sty = 0; /* STY=000: 25-bit mode */
+		notify_word = (uint32_t)(pag->notify_bits & 0x1FFFFFF);
+	}
 
 	/* Block A: PI */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 
-	/* Block B: Group 13A + TP + PTY + STY=000 */
+	/* Block B: Group 13A + TP + PTY + STY(3) + reserved(2) */
 	b2 = (RDS_GROUP_13A << RDS_B2_GROUP_SHIFT) |
 	     (rds->tp << RDS_B2_TP_BIT) |
-	     (rds->pty << RDS_B2_PTY_SHIFT);
-	/* STY=000, reserved bits=00 -> bits 4-0 = 0 */
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     ((sty & 0x07) << RDS_13A_STY_SHIFT);
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 
 	/* Block C: CS(2) + IT(4) + notify bits 24-15 (10 bits) */
 	b3 = ((pag->cycle_selection & 0x3) << RDS_13A_CS_SHIFT) |
-	     (0 << RDS_13A_IT_SHIFT) |  /* IT=0 for now */
-	     ((pag->notify_bits >> 15) & RDS_13A_NOTIFY_HI_MASK);
+	     ((interval & 0xF) << RDS_13A_IT_SHIFT) |
+	     ((notify_word >> 15) & RDS_13A_NOTIFY_HI_MASK);
 	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
 
 	/* Block D: notify bits 14-0 (15 bits) + S1(1) */
-	b4 = ((pag->notify_bits & 0x7FFF) << RDS_13A_NOTIFY_LO_SHIFT);
+	b4 = ((notify_word & 0x7FFF) << RDS_13A_NOTIFY_LO_SHIFT);
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 
 	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 13A: STY=%d CS=%d IT=%d notify=0x%07X C=%04X D=%04X\n",
+		     sty, pag->cycle_selection & 0x3, interval, notify_word, b3, b4);
 }
 
 
@@ -2693,8 +3002,9 @@ void rds_scheduler_update(rds_encoder_t *rds)
 		ADD_GRP(RDS_GROUP_7A);
 	}
 	
-	/* Block 7c: Enhanced paging (13A) - 1 slot when enabled */
-	if (rds->paging.enhanced) {
+	/* Block 7c: 13A address notification - only when paging AND 13A notify enabled.
+	 * Per EN 50067 M.3.2.5.2: 13A is optional, available for ODA when not used for paging. */
+	if (rds->paging.enabled && rds->paging.enhanced) {
 		ADD_GRP(RDS_GROUP_13A);
 	}
 	
@@ -2850,8 +3160,8 @@ static void rds_generate_group(rds_encoder_t *rds)
 			rds->last_ct_minute = now;
 			rds->group_sequence++; /* Increment total counter */
 			rds->group_bit_pos = 0;
-			// Debug log for CT
-			// LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Group 4A (CT Interrupt)\n");
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS TX 4A: CT interrupt\n");
 			return;
 		}
 	}
@@ -2943,11 +3253,11 @@ static void rds_generate_group(rds_encoder_t *rds)
 		goto oda_route;
 	/* Group 13A: Enhanced Radio Paging or ODA */
 	case RDS_GROUP_13A:
-		if (rds->paging.enhanced) {
+		if (rds->paging.enabled && rds->paging.enhanced) {
 			rds_build_group_13a_paging(rds, rds->group_buffer);
 			break;
 		}
-		/* Fall through to ODA routing when enhanced paging not active */
+		/* Fall through to ODA routing when 13A notify not active */
 		goto oda_route;
 	/* ODA groups (11A-13B, etc.) - route to specific ODA builders */
 	case RDS_GROUP_11A:
@@ -7453,20 +7763,18 @@ static void rds_decode_group(rds_decoder_t *rds)
 			if (b2_payload != 0 && rds->paging_enabled) {
 				/* 1A: Decode as Radio Paging Codes (EN 50067 Annex M) */
 				rds_paging_dec_t *pd = &rds->paging_dec;
+				uint8_t old_rpc = pd->rpc;
+				uint8_t was_valid = pd->rpc_valid;
 				pd->rpc = b2_payload & 0x1F;
-				pd->rpc_group_desig = (b2_payload >> 2) & 0x07;
-				pd->rpc_batt_sync = b2_payload & 0x03;
+				pd->rpc_group_desig = RDS_PAGING_RPC_DESIG(pd->rpc);
+				pd->rpc_batt_sync = RDS_PAGING_RPC_SYNC(pd->rpc);
 				pd->rpc_valid = 1;
-				/* Table M.1 group designation ranges */
-				static const char *group_ranges[] = {
-					"00-99", "00-99", "00-39", "40-69",
-					"70-99", "00-19", "20-39", "40-59"
-				};
-				LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Radio Paging RPC=%d "
-				     "(group desig=%d [groups %s], batt sync=%d)\n",
-				     pd->rpc, pd->rpc_group_desig,
-				     group_ranges[pd->rpc_group_desig],
-				     pd->rpc_batt_sync);
+				if (!was_valid || old_rpc != pd->rpc) {
+					char rpc_buf[80];
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Paging detected: %s\n",
+					     rds_paging_rpc_desc(pd->rpc, rpc_buf, sizeof(rpc_buf)));
+				} else if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: RPC=%d (unchanged)\n", pd->rpc);
 			} else if (b2_payload != 0) {
 				/* 1A without paging: bits 4-0 are spare per IEC 62106:2018 */
 				if (rds->verbose)
@@ -7548,45 +7856,40 @@ static void rds_decode_group(rds_decoder_t *rds)
 			
 		switch (variant) {
 			case RDS_1A_VARIANT_ECC:
-				/* Variant 0: Extended Country Code + Paging (IEC 62106 Table 9)
-				 * Bits 11-8: Paging codes (deprecated, usually 0)
+				/* Variant 0: Extended Country Code + OPC (EN 50067 M.3.2.4.1)
+				 * Bits 11-8: OPC (0=no enhanced paging, 1-15=operator)
 				 * Bits 7-0:  Extended Country Code */
 				rds->ecc = payload & 0xFF;
 				rds->ecc_status = rds->block_status[2];
 				{
-					int paging = (payload >> 8) & 0x0F;
+					uint8_t opc_val = (payload >> 8) & 0x0F;
 					/* EN 50067 Table D.1: Valid ECCs are E0-E4, A0-A5, D0-D3, F0-F2.
 					 * Any other value is not defined in the standard. */
 					if (!rds_is_valid_ecc(rds->ecc) && rds->verbose)
 						LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X -- "
 						     "not defined in EN 50067\n", rds->ecc);
-					/* Normal operation: paging=0 (deprecated), only log ECC */
-					if (paging != 0) {
-						/* Non-zero paging - log in both debug and verbose */
-						if (rds->debug)
-							LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: ECC=0x%02X Paging=%d (deprecated) CC=%d LA=%d\n",
-							     rds->ecc, paging, cc, rds->linkage_actuator);
-						if (rds->verbose)
-							LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X (%s), "
-							     "Paging=%d (deprecated), LA=%d. "
-							     "Country=\"%s\", Linkage=%s\n",
-							     rds->ecc, rds_get_ecc_name(rds->ecc),
-							     paging, rds->linkage_actuator,
-							     rds_get_country_code(cc, rds->ecc),
-							     rds->linkage_actuator ? "Yes" : "No");
-					} else {
-						/* Normal case: paging=0, just log ECC */
-						if (rds->debug)
-							LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: ECC=0x%02X CC=%d LA=%d\n",
-							     rds->ecc, cc, rds->linkage_actuator);
-						if (rds->verbose)
-							LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X (%s), LA=%d. "
-							     "Country=\"%s\", Linkage=%s\n",
-							     rds->ecc, rds_get_ecc_name(rds->ecc),
-							     rds->linkage_actuator,
-							     rds_get_country_code(cc, rds->ecc),
-							     rds->linkage_actuator ? "Yes" : "No");
+					/* Track OPC state (EN 50067 M.3.2.2) */
+					if (rds->paging_enabled) {
+						rds_paging_dec_t *pd = &rds->paging_dec;
+						if (!pd->opc_valid || pd->opc != opc_val) {
+							if (opc_val != 0)
+								LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Enhanced paging detected: OPC=%d\n", opc_val);
+							else
+								LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: No enhanced paging (OPC=0)\n");
+							pd->opc = opc_val;
+							pd->opc_valid = 1;
+						}
 					}
+					if (rds->debug)
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: ECC=0x%02X OPC=%d CC=%d LA=%d\n",
+						     rds->ecc, opc_val, cc, rds->linkage_actuator);
+					else if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X (%s), OPC=%d, LA=%d. "
+						     "Country=\"%s\", Linkage=%s\n",
+						     rds->ecc, rds_get_ecc_name(rds->ecc),
+						     opc_val, rds->linkage_actuator,
+						     rds_get_country_code(cc, rds->ecc),
+						     rds->linkage_actuator ? "Yes" : "No");
 				}
 				/* Check ECC vs mode mismatch (log once, only for valid ECCs) */
 				if (!rds->ecc_mismatch_logged && rds_is_valid_ecc(rds->ecc)) {
@@ -7634,19 +7937,39 @@ static void rds_decode_group(rds_decoder_t *rds)
 					     rds->tmc_id, rds->tmc_id, rds->linkage_actuator);
 				break;
 			case RDS_1A_VARIANT_PAGER:
-				/* Paging identification (IEC 62106 Table 9)
-				 * Bits 11-0: Paging OPC/identification data
-				 * Only decode when --rds-paging is enabled */
+				/* Paging identification (EN 50067 M.3.2.4.2)
+				 * Bits 11-8: OPC (0=no enhanced paging, 1-15=operator)
+				 * Bits 7-6:  reserved (zero)
+				 * Bits 5-0:  PAC (Paging Area Code, 0=all areas) */
 				if (rds->paging_enabled) {
+					rds_paging_dec_t *pd = &rds->paging_dec;
+					uint8_t opc_val = (payload >> 8) & 0xF;
+					uint8_t pac_val = payload & 0x3F;
 					rds->paging_id = payload & RDS_1A_PAYLOAD_MASK;
 					rds->paging_id_status = rds->block_status[2];
+					/* Track OPC state change */
+					if (!pd->opc_valid || pd->opc != opc_val) {
+						if (opc_val != 0)
+							LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Enhanced paging detected: OPC=%d\n", opc_val);
+						else
+							LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: No enhanced paging (OPC=0)\n");
+						pd->opc = opc_val;
+						pd->opc_valid = 1;
+					}
+					/* Track PAC state change */
+					if (!pd->pac_valid || pd->pac != pac_val) {
+						LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Paging area: PAC=%d%s\n",
+						     pac_val, pac_val ? "" : " (all areas)");
+						pd->pac = pac_val;
+						pd->pac_valid = 1;
+					}
 					if (rds->debug)
-						LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Paging=0x%03X LA=%d\n",
-						     rds->paging_id, rds->linkage_actuator);
-					if (rds->verbose)
-						LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging ID=0x%03X (%d), "
-						     "Linkage Actuator=%d\n",
-						     rds->paging_id, rds->paging_id,
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Paging OPC=%d PAC=%d LA=%d\n",
+						     opc_val, pac_val, rds->linkage_actuator);
+					else if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging OPC=%d, PAC=%d%s, LA=%d\n",
+						     opc_val, pac_val,
+						     pac_val ? "" : " (all areas)",
 						     rds->linkage_actuator);
 				} else if (rds->verbose) {
 					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging ID=0x%03X (ignored, "
@@ -8142,7 +8465,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 		}
 		case RDS_7A_PSAC_ALPHA_ADDR: {
 			/* PSAC=8: address group for alpha or enhanced variable-length.
-			 * Control byte in D lower byte determines message type via MT. */
+			 * Control byte in D lower byte determines message type via MT.
+			 * Only ALPHA and VNUM use this — tone/basic numeric do not. */
 			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
 			uint8_t ctrl = b4 & 0xFF;
 			uint8_t mt = (ctrl >> RDS_PAGING_CTRL_MT_SHIFT) & 0x03;
@@ -8158,19 +8482,16 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->last_ni = (ctrl >> RDS_PAGING_CTRL_NI_BIT) & 1;
 			pd->last_r_flag = (ctrl >> RDS_PAGING_CTRL_R_BIT) & 1;
 			pd->last_call_counter = ctrl & 0x0F;
-			if (mt == RDS_PAGING_CTRL_MT_NUMERIC) {
-				pd->msg_type = RDS_PAGING_VNUM;
-				if (rds->verbose)
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: VNUM addr=%02u-%04u flag=%s %s tx=%s cnt=%d (assembling)\n",
-					     addr / 10000, addr % 10000, PAG_AB(ab_flag),
-					     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter);
-			} else {
-				pd->msg_type = RDS_PAGING_ALPHA;
-				if (rds->verbose)
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: ALPHA addr=%02u-%04u flag=%s %s tx=%s cnt=%d (assembling)\n",
-					     addr / 10000, addr % 10000, PAG_AB(ab_flag),
-					     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter);
-			}
+			pd->last_country_code = 0;
+			pd->last_opc = 0;
+			pd->intl_pending = pd->last_ni; /* expect country code in next group */
+			pd->msg_type = (mt == RDS_PAGING_CTRL_MT_NUMERIC) ? RDS_PAGING_VNUM : RDS_PAGING_ALPHA;
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u flag=%s %s tx=%s cnt=%d ctrl=0x%02X (assembling)\n",
+				     rds_paging_type_name(pd->msg_type),
+				     addr / 10000, addr % 10000, PAG_AB(ab_flag),
+				     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag),
+				     pd->last_call_counter, ctrl);
 			break;
 		}
 		case RDS_7A_PSAC_ALPHA_END: {
@@ -8204,9 +8525,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 				pd->last_address = pd->address;
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: VNUM addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
+				     rds_paging_type_name(pd->last_type),
 				     pd->address / 10000, pd->address % 10000, pd->last_msg_len,
 				     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter, pd->last_msg);
+				if (pd->last_ni && pd->last_country_code) {
+					const char *cname = mcc_name(pd->last_country_code);
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX:   international: MCC=%d (%s) OPC=%d\n",
+					     pd->last_country_code, cname ? cname : "unknown", pd->last_opc);
+				}
 			} else {
 				/* Alpha: extract up to 4 characters from blocks C and D */
 				if (pd->msg_len + 4 <= (int)sizeof(pd->msg_buf) - 1) {
@@ -8228,9 +8555,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 				{
 					char alpha_disp[257];
 					rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, alpha_disp, sizeof(alpha_disp));
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: ALPHA addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
+					     rds_paging_type_name(pd->last_type),
 					     pd->address / 10000, pd->address % 10000, pd->last_msg_len,
 					     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter, alpha_disp);
+					if (pd->last_ni && pd->last_country_code) {
+						const char *cname = mcc_name(pd->last_country_code);
+						LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX:   international: MCC=%d (%s) OPC=%d\n",
+						     pd->last_country_code, cname ? cname : "unknown", pd->last_opc);
+					}
 				}
 			}
 			break;
@@ -8244,7 +8577,45 @@ static void rds_decode_group(rds_decoder_t *rds)
 						LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: data (PSAC=%d) without address, ignoring\n", psac);
 					break;
 				}
-				if (pd->msg_type == RDS_PAGING_VNUM) {
+				/* International mode (EN 50067 M.3.5.7): first data group
+				 * has Block C = I1I2I3(12) + OPC(4), Block D = message data.
+				 * Extract country code, then process Block D only. */
+				if (pd->intl_pending) {
+					pd->intl_pending = 0;
+					uint8_t i1 = (b3 >> 12) & 0xF;
+					uint8_t i2 = (b3 >> 8) & 0xF;
+					uint8_t i3 = (b3 >> 4) & 0xF;
+					pd->last_country_code = i1 * 100 + i2 * 10 + i3;
+					pd->last_opc = b3 & 0xF;
+					if (rds->verbose) {
+						const char *cname = mcc_name(pd->last_country_code);
+						LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u international: MCC=%d (%s) OPC=%d\n",
+						     rds_paging_type_name(pd->msg_type),
+						     pd->address / 10000, pd->address % 10000,
+						     pd->last_country_code,
+						     cname ? cname : "unknown",
+						     pd->last_opc);
+					}
+					/* Block D carries partial message data */
+					if (pd->msg_type == RDS_PAGING_VNUM) {
+						uint8_t nib[4] = {
+							(b4 >> 12) & 0xF, (b4 >> 8) & 0xF,
+							(b4 >> 4) & 0xF, b4 & 0xF
+						};
+						char tmp[5];
+						int n = rds_paging_bcd_decode(nib, 4, tmp, sizeof(tmp));
+						if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
+							memcpy(pd->msg_buf + pd->msg_len, tmp, n);
+							pd->msg_len += n;
+						}
+					} else {
+						/* Alpha: 2 chars from Block D */
+						if (pd->msg_len + 2 <= (int)sizeof(pd->msg_buf) - 1) {
+							pd->msg_buf[pd->msg_len++] = (b4 >> 8) & 0xFF;
+							pd->msg_buf[pd->msg_len++] = b4 & 0xFF;
+						}
+					}
+				} else if (pd->msg_type == RDS_PAGING_VNUM) {
 					/* 8 BCD digits per group */
 					uint8_t nib[8] = {
 						(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
@@ -8290,32 +8661,87 @@ static void rds_decode_group(rds_decoder_t *rds)
 			break;
 		}
 	}
-	else if (group_type == 13 && version == 0 && rds->paging_enabled) {
-		/* Group 13A: Enhanced Radio Paging (EN 50067 Annex M)
-		 * Block B bits 4-2: STY (sub-type), bits 1-0: reserved */
-		uint8_t sty = (b2 >> RDS_13A_STY_SHIFT) & 0x07;
+	else if (group_type == 13 && version == 0 && rds->paging_enabled
+		 && rds->paging_dec.opc_valid && rds->paging_dec.opc != 0) {
+		/* Group 13A: Enhanced Radio Paging (EN 50067 M.3.4)
+		 * Address notification for battery saving.
+		 * Only decoded as paging when enhanced paging is active (OPC≠0).
+		 * Per EN 50067: "13A groups are optional" and available for ODA
+		 * when not used for paging. If OPC=0 or not yet received,
+		 * this condition is false and falls through to ODA routing. */
 		rds_paging_dec_t *pd = &rds->paging_dec;
+		/* Block B bits 4-2: STY (sub-type), bits 1-0: reserved */
+		uint8_t sty = (b2 >> RDS_13A_STY_SHIFT) & 0x07;
 
 		if (sty == 0) {
-			/* Sub-type 000: Address notification
+			/* Sub-type 000: 25-bit address notification
 			 * Block C: CS(2) + IT(4) + notify_hi(10)
 			 * Block D: notify_lo(15) + S1(1) */
+			static const char * const cs_desc[] = {
+				"1-min cycle", "reserved", "2-min even", "2-min odd"
+			};
 			pd->cycle_selection = (b3 >> RDS_13A_CS_SHIFT) & 0x03;
 			pd->interval_num = (b3 >> RDS_13A_IT_SHIFT) & 0x0F;
 			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;
 			uint32_t notify_lo = (b4 & RDS_13A_NOTIFY_LO_MASK) >> RDS_13A_NOTIFY_LO_SHIFT;
-			pd->notify_bits = (notify_hi << 15) | notify_lo;
+			uint32_t word = (notify_hi << 15) | notify_lo;
+			pd->notify_bits = word;
+			pd->notify_50bit = 0;
+			pd->notify_sty = sty;
+			pd->enhanced_valid = 1;
+			uint8_t s1 = b4 & RDS_13A_S1_MASK;
+
+			/* Count active notification bits */
+			int active = 0;
+			uint32_t tmp = word;
+			while (tmp) { active += tmp & 1; tmp >>= 1; }
+
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: notify STY=000 (25-bit) CS=%d (%s) "
+			     "IT=%d notify=0x%07X (%d/25 sub-groups active) S1=%d\n",
+			     pd->cycle_selection, cs_desc[pd->cycle_selection],
+			     pd->interval_num, word, active, s1);
+		} else if (sty == 1) {
+			/* Sub-type 001: 50-bit notification, high half (bits 49-25) */
+			static const char * const cs_desc[] = {
+				"1-min cycle", "reserved", "2-min even", "2-min odd"
+			};
+			pd->cycle_selection = (b3 >> RDS_13A_CS_SHIFT) & 0x03;
+			pd->interval_num = (b3 >> RDS_13A_IT_SHIFT) & 0x0F;
+			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;
+			uint32_t notify_lo = (b4 & RDS_13A_NOTIFY_LO_MASK) >> RDS_13A_NOTIFY_LO_SHIFT;
+			pd->notify_bits_hi = (notify_hi << 15) | notify_lo;
+			pd->notify_50bit = 1;
 			pd->notify_sty = sty;
 			pd->enhanced_valid = 1;
 
-			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: Enhanced paging STY=000 "
-			     "CS=%d IT=%d notify=0x%07X S1=%d\n",
-			     pd->cycle_selection, pd->interval_num,
-			     pd->notify_bits, b4 & RDS_13A_S1_MASK);
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: notify STY=001 (50-bit high) CS=%d (%s) "
+			     "IT=%d bits_49_25=0x%07X\n",
+			     pd->cycle_selection, cs_desc[pd->cycle_selection],
+			     pd->interval_num, pd->notify_bits_hi);
+		} else if (sty == 2) {
+			/* Sub-type 010: 50-bit notification, low half (bits 24-0) */
+			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;
+			uint32_t notify_lo = (b4 & RDS_13A_NOTIFY_LO_MASK) >> RDS_13A_NOTIFY_LO_SHIFT;
+			pd->notify_bits_lo = (notify_hi << 15) | notify_lo;
+			pd->notify_sty = sty;
+
+			/* Combine with previously received high half */
+			pd->notify_bits = ((uint64_t)pd->notify_bits_hi << 25) | pd->notify_bits_lo;
+
+			int active = 0;
+			uint64_t tmp = pd->notify_bits;
+			while (tmp) { active += tmp & 1; tmp >>= 1; }
+
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: notify STY=010 (50-bit low) "
+			     "bits_24_0=0x%07X combined=0x%013llX (%d/50 sub-groups active)\n",
+			     pd->notify_bits_lo,
+			     (unsigned long long)pd->notify_bits, active);
+		} else if (sty == 3) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: VAS (Value Added Services) "
+			     "STY=011 C=0x%04X D=0x%04X\n", b3, b4);
 		} else {
-			/* Other sub-types: log but don't decode */
 			if (rds->debug)
-				LOGP(DRADIO, LOGL_DEBUG, "RDS 13A: STY=%d (not decoded)\n", sty);
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 13A: STY=%d (reserved)\n", sty);
 		}
 	}
 	else if (group_type == 14) {
@@ -10046,8 +10472,8 @@ void rds_decoder_status(rds_decoder_t *rds)
 					     pd->last_address % 10000);
 			}
 			if (pd->enhanced_valid)
-				LOGP(DRADIO, LOGL_NOTICE, "  13A Enhanced: CS=%d IT=%d notify=0x%07X\n",
-				     pd->cycle_selection, pd->interval_num, pd->notify_bits);
+				LOGP(DRADIO, LOGL_NOTICE, "  13A Enhanced: CS=%d IT=%d notify=0x%013llX\n",
+				     pd->cycle_selection, pd->interval_num, (unsigned long long)pd->notify_bits);
 		}
 	}
 	

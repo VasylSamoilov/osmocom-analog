@@ -710,6 +710,19 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_COUNTER_MAX      15  /* P3-P0 max (wraps 15->1) */
 #define RDS_PAGING_ADDR_HASH_SIZE   64  /* Per-address call counter hash slots */
 
+/* Radio Paging Codes (RPC) - Group 1A Block B bits 4-0 (EN 50067 M.2.1.2)
+ * Bits 4-2: group designation (which address groups this network covers)
+ * Bits 1-0: battery saving interval synchronization
+ * RPC=0 means no basic paging on channel (Table M.1). */
+#define RDS_PAGING_RPC_DESIG_SHIFT  2
+#define RDS_PAGING_RPC_DESIG_MASK   0x07  /* 3 bits after shift */
+#define RDS_PAGING_RPC_SYNC_MASK    0x03  /* bits 1-0 */
+#define RDS_PAGING_RPC_DESIG(rpc)   (((rpc) >> RDS_PAGING_RPC_DESIG_SHIFT) & RDS_PAGING_RPC_DESIG_MASK)
+#define RDS_PAGING_RPC_SYNC(rpc)    ((rpc) & RDS_PAGING_RPC_SYNC_MASK)
+#define RDS_PAGING_RPC_MAKE(desig, sync) \
+	((((desig) & RDS_PAGING_RPC_DESIG_MASK) << RDS_PAGING_RPC_DESIG_SHIFT) | \
+	 ((sync) & RDS_PAGING_RPC_SYNC_MASK))
+
 /* Enhanced paging control byte (EN 50067 M.3.5, Table M.12)
  * Block D lower byte of address group:
  *   Tone-only:  E2 E1 E0 R P3 P2 P1 P0
@@ -729,6 +742,28 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define PAG_AB(x)  ((x) ? "B" : "A")        /* A/B flag: new-call toggle */
 #define PAG_R(x)   ((x) ? "rpt" : "orig")   /* R flag: original / repeat */
 #define PAG_NI(x)  ((x) ? "intl" : "nat")   /* NI: national / international */
+
+/* Group designation address ranges (EN 50067 Table M.1)
+ * Index = group designation (bits 4-2 of RPC). */
+static const char * const rds_paging_desig_ranges[] = {
+	"none",  "00-99", "00-39", "40-69",
+	"70-99", "00-19", "20-39", "40-59"
+};
+
+/* Format RPC as human-readable string.
+ * E.g. "RPC=4 (desig=1 [groups 00-99], sync=0)" or "RPC=0 (no paging)". */
+static inline const char *rds_paging_rpc_desc(uint8_t rpc, char *buf, int buflen)
+{
+	uint8_t desig = RDS_PAGING_RPC_DESIG(rpc);
+	uint8_t sync = RDS_PAGING_RPC_SYNC(rpc);
+
+	if (rpc == 0)
+		snprintf(buf, buflen, "RPC=0 (no paging)");
+	else
+		snprintf(buf, buflen, "RPC=%d (desig=%d [groups %s], sync=%d)",
+			 rpc, desig, rds_paging_desig_ranges[desig], sync);
+	return buf;
+}
 
 /* ============================================================
  * Group 13A Bit Fields (EN 50067 Annex M / IEC 62106)
@@ -1425,6 +1460,9 @@ typedef struct rds_paging_msg {
 	uint8_t		ni;		/* NI: 0=national (default), 1=international */
 	uint8_t		call_counter;	/* P3-P0 assigned at TX time (1-15, 0=initial) */
 	uint8_t		is_repeat;	/* R flag: 0=original, 1=repeat */
+	/* International paging (EN 50067 M.3.5.7) */
+	uint16_t	country_code;	/* E.212 MCC, 3 BCD digits (e.g. 255=Ukraine) */
+	uint8_t		opc;		/* Operator Code, 4 bits (1-15, 0=not set) */
 } rds_paging_msg_t;
 
 /* Paging encoder state - embedded in rds_encoder_t */
@@ -1450,8 +1488,10 @@ typedef struct rds_paging_enc {
 	rds_paging_msg_t *queue_tail;
 	int		queue_count;
 
-	/* 13A enhanced paging state */
-	uint32_t	notify_bits;	/* Address notification bits (25 bits) */
+	/* 13A address notification state (EN 50067 M.3.4) */
+	uint64_t	notify_bits;	/* Address notification bits (25 or 50 bits) */
+	uint8_t		notify_50bit;	/* 0=25-bit (1 group), 1=50-bit (2 groups) */
+	uint8_t		notify_sty;	/* 50-bit alternation: last STY sent (1 or 2) */
 	uint8_t		cycle_selection;/* CS field (0-3) */
 
 	/* Per-address call counter (EN 50067 M.3.5, P3-P0)
@@ -1460,6 +1500,16 @@ typedef struct rds_paging_enc {
 		uint32_t	address;
 		uint8_t		counter;	/* 1-15, 0=unused slot */
 	} call_counters[RDS_PAGING_ADDR_HASH_SIZE];
+
+	/* Network-wide paging parameters (EN 50067 M.3.2)
+	 * Broadcast in Group 1A for channel locking / pager filtering. */
+	uint8_t		pac;			/* Paging Area Code (0-63, 0=all areas) */
+
+	/* International paging defaults (EN 50067 M.3.5.7)
+	 * Set via --rds-paging-cc and --rds-paging-opc.
+	 * Per-message cc= and opc= FIFO options override these. */
+	uint16_t	intl_country_code;	/* E.212 MCC default (e.g. 255=Ukraine) */
+	uint8_t		intl_opc;		/* OPC default (1-15) */
 } rds_paging_enc_t;
 
 /* Paging decoder state - embedded in rds_decoder_t */
@@ -1489,6 +1539,10 @@ typedef struct rds_paging_dec {
 	uint8_t		last_ni;	/* NI: 0=national, 1=international */
 	uint8_t		last_r_flag;	/* R: 0=original, 1=repeat */
 	uint8_t		last_call_counter; /* P3-P0 (1-15, 0=not implemented) */
+	/* International paging (EN 50067 M.3.5.7) */
+	uint16_t	last_country_code; /* E.212 MCC from 2nd group (0=national) */
+	uint8_t		last_opc;	/* OPC from 2nd group (0=not present) */
+	int		intl_pending;	/* Waiting for country code group */
 
 	/* Group 1A RPC state */
 	uint8_t		rpc;		/* Last received Radio Paging Code */
@@ -1496,9 +1550,18 @@ typedef struct rds_paging_dec {
 	uint8_t		rpc_batt_sync;	/* Battery saving sync (bits 1-0) */
 	uint8_t		rpc_valid;	/* RPC received at least once */
 
-	/* Group 13A enhanced paging state */
-	uint32_t	notify_bits;	/* Address notification bits (25 bits) */
-	uint8_t		notify_sty;	/* Last STY sub-type */
+	/* Group 1A OPC state (EN 50067 M.3.2.2) */
+	uint8_t		opc;		/* Last received Operator Code (0=none, 1-15) */
+	uint8_t		opc_valid;	/* OPC received at least once */
+	uint8_t		pac;		/* Last received Paging Area Code (0=all) */
+	uint8_t		pac_valid;	/* PAC received at least once */
+
+	/* Group 13A address notification state (EN 50067 M.3.4) */
+	uint64_t	notify_bits;	/* Address notification bits (25 or 50) */
+	uint32_t	notify_bits_hi;	/* STY=001: bits 49-25 (raw from group) */
+	uint32_t	notify_bits_lo;	/* STY=010: bits 24-0 (raw from group) */
+	uint8_t		notify_sty;	/* Last STY sub-type (0=25bit, 1/2=50bit) */
+	uint8_t		notify_50bit;	/* 1 if 50-bit mode detected (STY 1 or 2) */
 	uint8_t		cycle_selection;/* CS field */
 	uint8_t		interval_num;	/* Current interval number (0-9) */
 	uint8_t		enhanced_valid;	/* 13A data received at least once */
@@ -2176,15 +2239,26 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 				uint8_t ni);
 int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 			      const char *text, int repeats, int interval_sec,
-			      uint8_t ni);
+			      uint8_t ni, uint16_t country_code, uint8_t opc);
 int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 			     const char *digits, int repeats, int interval_sec,
-			     uint8_t ni);
+			     uint8_t ni, uint16_t country_code, uint8_t opc);
 
-/* Configuration */
-void rds_enc_paging_enable(rds_encoder_t *rds, int enable);
+/* Configuration — encoder setters */
+void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
-void rds_enc_paging_set_enhanced(rds_encoder_t *rds, int enable);
+void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable);
+void rds_enc_paging_set_opc(rds_encoder_t *rds, uint8_t opc);
+void rds_enc_paging_set_pac(rds_encoder_t *rds, uint8_t pac);
+void rds_enc_paging_set_cc(rds_encoder_t *rds, uint16_t cc);
+
+/* Configuration — encoder getters */
+int rds_enc_paging_get_enabled(const rds_encoder_t *rds);
+uint8_t rds_enc_paging_get_rpc(const rds_encoder_t *rds);
+int rds_enc_paging_get_13a_notify(const rds_encoder_t *rds);
+uint8_t rds_enc_paging_get_opc(const rds_encoder_t *rds);
+uint8_t rds_enc_paging_get_pac(const rds_encoder_t *rds);
+uint16_t rds_enc_paging_get_cc(const rds_encoder_t *rds);
 
 /* TX File Input (bypasses encoder, transmits from file) */
 int rds_encoder_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename);
@@ -2521,6 +2595,14 @@ uint16_t rds_dec_get_tmc_id(const rds_decoder_t *rds);
 uint16_t rds_dec_get_paging_id(const rds_decoder_t *rds);
 uint16_t rds_dec_get_ews_channel(const rds_decoder_t *rds);
 uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds);
+
+/* Decoder getters — paging state from Group 1A / 7A */
+uint8_t rds_dec_paging_get_rpc(const rds_decoder_t *rds, int *valid);
+uint8_t rds_dec_paging_get_opc(const rds_decoder_t *rds, int *valid);
+uint8_t rds_dec_paging_get_pac(const rds_decoder_t *rds, int *valid);
+int rds_dec_paging_get_last_msg(const rds_decoder_t *rds,
+				uint32_t *address, char *msg, int max_len,
+				int *msg_len, int *type);
 
 /* Print decoder status (PI, PS, RT, BER) */
 void rds_decoder_status(rds_decoder_t *rds);

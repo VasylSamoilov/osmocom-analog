@@ -46,6 +46,7 @@ enum paging_signal;
 #include "rds_protocol.h"
 #include "rigctl_server.h"
 #include "signal_meter.h"
+#include "../libmobile/mcc.h"
 
 #define DEFAULT_LO_OFFSET -1000000.0
 #define RDS_PAGING_PIPE_DEFAULT "/tmp/rds_paging_send"
@@ -116,6 +117,9 @@ static int sca_92k = 0;
 static int am_compandor = 0;
 static int rds_paging = 0;
 static int rds_paging_rpc = 4;  /* Default RPC=4: group desig 001, batt sync 00 */
+static uint16_t rds_paging_cc = 0;   /* E.212 MCC for international (0=not set) */
+static uint8_t rds_paging_opc = 0;   /* OPC for international (0=not set) */
+static uint8_t rds_paging_pac = 0;   /* PAC for paging area (0=all areas) */
 static const char *rds_hexrds_file = NULL;
 static const char *rds_bitstream_file = NULL;
 static const char *rds_tx_hexrds_file = NULL;
@@ -437,27 +441,51 @@ static void print_help(const char *arg0)
 	printf("    --rbds\n");
 	printf("        Force RBDS decoding (callsign lookup, US PTY names).\n");
 	printf("    --rds-paging [rpc]\n");
-	printf("        Enable RDS Radio Paging (Group 7A/1A/13A). Implies --rds.\n");
-	printf("        Optional RPC value 0-31 (default 4: group desig 001, batt sync 00).\n");
+	printf("        Enable RDS Radio Paging (EN 50067 Annex M, Groups 7A/1A/13A).\n");
+	printf("        Implies --rds. Messages are sent via a named pipe (FIFO).\n");
+	printf("        RPC = Radio Paging Code (0-31, default 4).\n");
+	printf("          Encodes group designation (which address ranges) and battery\n");
+	printf("          saving sync interval. RPC=0 means no paging. Default 4 covers\n");
+	printf("          address groups 00-99 with sync=0 (recommended).\n");
 	printf("        FIFO format: address,type,options,message\n");
 	printf("        Types: tone, numeric, numeric10, numeric18, alpha, vnum\n");
 	printf("        Options (space-separated key=value, can be empty):\n");
 	printf("          repeat=N      total send count, 1-15 (default 1)\n");
 	printf("          interval=N    seconds between repeats (default 5)\n");
-	printf("          tonetype=N    E2-E0 tone type 0-7 (tone only, default 0)\n");
-	printf("          ni=0|1        national/international (default 0)\n");
-	printf("        Hex escapes: <0xCC> in message sends raw byte 0xCC\n");
+	printf("          tonetype=N    tone alert type 0-7 (tone-only messages, default 0)\n");
+	printf("          ni=0|1        NI = National/International flag (default 0=national)\n");
+	printf("          cc=NNN        MCC = Mobile Country Code per ITU E.212 (e.g. 255=Ukraine)\n");
+	printf("          opc=N         OPC = Operator Code 1-15 for international messages\n");
+	printf("        International mode (ni=1, EN 50067 M.3.5.7):\n");
+	printf("          Requires cc= and opc= (per-message or --rds-paging-cc/opc).\n");
+	printf("          Only alpha and vnum support NI. Tone and basic numeric do not.\n");
+	printf("          MCC is 3 BCD digits (e.g. 255=Ukraine, 262=Germany, 208=France).\n");
+	printf("          Max alpha=78 chars, max vnum=156 digits (vs 80/160 national).\n");
+	printf("        Hex escapes: <0xCC> in message sends raw byte 0xCC.\n");
 	printf("        Examples:\n");
 	printf("          echo '200078,tone,,' > %s\n", rds_paging_pipe_path);
 	printf("          echo '200078,tone,tonetype=3 repeat=2,' > %s\n", rds_paging_pipe_path);
 	printf("          echo '200078,numeric,,1234567890' > %s\n", rds_paging_pipe_path);
 	printf("          echo '200078,alpha,,Hello World' > %s\n", rds_paging_pipe_path);
 	printf("          echo '200078,alpha,repeat=3 interval=5,Hello, World!' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,alpha,,Test<0x0D>End' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,alpha,ni=1 cc=255 opc=1,Intl msg' > %s\n", rds_paging_pipe_path);
 	printf("          echo '200078,vnum,,31415926535' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,vnum,ni=1 repeat=2,0123456789' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,vnum,ni=1 cc=262 opc=3,0123456789' > %s\n", rds_paging_pipe_path);
 	printf("    --rds-paging-fifo <path>\n");
-	printf("        Path for the RDS paging FIFO (default %s).\n", RDS_PAGING_PIPE_DEFAULT);
+	printf("        Path for the RDS paging named pipe (default %s).\n", RDS_PAGING_PIPE_DEFAULT);
+	printf("    --rds-paging-cc <mcc>\n");
+	printf("        MCC = Mobile Country Code, default for international paging (200-999).\n");
+	printf("        Per ITU-T E.212. Used when ni=1 and no per-message cc= is given.\n");
+	printf("        Examples: 255=Ukraine, 262=Germany, 208=France, 260=Poland.\n");
+	printf("    --rds-paging-opc <opc>\n");
+	printf("        OPC = Operator Code (0-15). Identifies the paging operator on this\n");
+	printf("        channel. Broadcast in Group 1A for receiver channel locking.\n");
+	printf("        0 = no enhanced paging (default, recommended unless multi-operator).\n");
+	printf("        Also used as default OPC for international messages (ni=1).\n");
+	printf("    --rds-paging-pac <pac>\n");
+	printf("        PAC = Paging Area Code (0-63). Network-wide area filter broadcast\n");
+	printf("        in Group 1A variant 2. Pagers outside this area ignore messages.\n");
+	printf("        0 = all areas (default, recommended for single-transmitter setups).\n");
 	printf("    --rds-hexrds-file <filename>\n");
 	printf("        Write received RDS groups to file in hexrds format.\n");
 	printf("        Format: \"XXXX XXXX XXXX XXXX\" per line (---- for missing blocks).\n");
@@ -572,6 +600,9 @@ static double afc_max_hz = 5000.0;
 #define OPT_RDS_TX_HEXRDS_FILE	1116
 #define OPT_RDS_TX_BITSTREAM_FILE 1117
 #define OPT_RDS_PAGING_FIFO	1121
+#define OPT_RDS_PAGING_CC	1122
+#define OPT_RDS_PAGING_OPC	1123
+#define OPT_RDS_PAGING_PAC	1124
 
 static void add_options(void)
 {
@@ -609,6 +640,9 @@ static void add_options(void)
 	option_add(OPT_RBDS, "rbds", 0);
 	option_add(OPT_RDS_PAGING, "rds-paging", 1);
 	option_add(OPT_RDS_PAGING_FIFO, "rds-paging-fifo", 1);
+	option_add(OPT_RDS_PAGING_CC, "rds-paging-cc", 1);
+	option_add(OPT_RDS_PAGING_OPC, "rds-paging-opc", 1);
+	option_add(OPT_RDS_PAGING_PAC, "rds-paging-pac", 1);
 	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
 	option_add(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1);
 	option_add(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1);
@@ -768,7 +802,36 @@ static int handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 	case OPT_RDS_PAGING_FIFO:
-		rds_paging_pipe_path = argv[argi++];
+		rds_paging_pipe_path = argv[argi];
+		break;
+	case OPT_RDS_PAGING_CC:
+		rds_paging_cc = (uint16_t)atoi(argv[argi]);
+		if (!mcc_valid(rds_paging_cc)) {
+			const char *cname = mcc_name(rds_paging_cc);
+			if (!cname) {
+				fprintf(stderr, "Invalid E.212 MCC %d (must be 200-999), use '-h' for help!\n", rds_paging_cc);
+				return -EINVAL;
+			}
+		}
+		{
+			const char *cname = mcc_name(rds_paging_cc);
+			fprintf(stderr, "RDS Paging: international MCC=%d (%s)\n",
+				rds_paging_cc, cname ? cname : "unknown");
+		}
+		break;
+	case OPT_RDS_PAGING_OPC:
+		rds_paging_opc = (uint8_t)atoi(argv[argi]);
+		if (rds_paging_opc > 15) {
+			fprintf(stderr, "Invalid OPC %d (must be 0-15), use '-h' for help!\n", rds_paging_opc);
+			return -EINVAL;
+		}
+		break;
+	case OPT_RDS_PAGING_PAC:
+		rds_paging_pac = (uint8_t)atoi(argv[argi]);
+		if (rds_paging_pac > 63) {
+			fprintf(stderr, "Invalid PAC %d (must be 0-63), use '-h' for help!\n", rds_paging_pac);
+			return -EINVAL;
+		}
 		break;
 	case OPT_RDS_HEXRDS_FILE:
 		rds_hexrds_file = options_strdup(argv[argi]);
@@ -888,10 +951,11 @@ static int paging_decode_hex_escapes(char *msg, int len)
 }
 
 /* Parse space-separated key=value options for paging FIFO.
- * Supported: repeat=N interval=N tonetype=N ni=0|1 */
+ * Supported: repeat=N interval=N tonetype=N ni=0|1 cc=NNN opc=N */
 static void paging_parse_options(const char *opts, int opts_len,
 				 int *repeat, int *interval,
-				 uint8_t *tonetype, uint8_t *ni)
+				 uint8_t *tonetype, uint8_t *ni,
+				 uint16_t *country_code, uint8_t *opc)
 {
 	char buf[256];
 	char *p, *token, *saveptr;
@@ -900,6 +964,8 @@ static void paging_parse_options(const char *opts, int opts_len,
 	*interval = 0;
 	*tonetype = 0;
 	*ni = 0;
+	*country_code = 0;
+	*opc = 0;
 
 	if (!opts || opts_len <= 0)
 		return;
@@ -922,6 +988,10 @@ static void paging_parse_options(const char *opts, int opts_len,
 				*tonetype = (uint8_t)atoi(p);
 			else if (!strcasecmp(token, "ni"))
 				*ni = (uint8_t)atoi(p);
+			else if (!strcasecmp(token, "cc"))
+				*country_code = (uint16_t)atoi(p);
+			else if (!strcasecmp(token, "opc"))
+				*opc = (uint8_t)atoi(p);
 		}
 	}
 }
@@ -934,6 +1004,8 @@ static void paging_parse_options(const char *opts, int opts_len,
  *   interval=N    seconds between repeats (default 5)
  *   tonetype=N    E2-E0 for tone-only (0-7, default 0)
  *   ni=0|1        national/international (default 0)
+ *   cc=NNN        E.212 MCC for international (e.g. 255=Ukraine)
+ *   opc=N         Operator Code 1-15 for international
  * Message: everything after 3rd comma (commas in payload preserved) */
 static void paging_process_line(rds_encoder_t *enc, char *line)
 {
@@ -943,6 +1015,8 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 	char addr_buf[16], type_buf[32];
 	int repeat, interval;
 	uint8_t tonetype, ni;
+	uint16_t country_code;
+	uint8_t opc;
 	uint32_t address;
 	char *msg;
 	int msg_len;
@@ -962,7 +1036,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 		     "RDS paging FIFO: format is address,type,options,message\n"
 		     "  address: 0-999999\n"
 		     "  types:   tone|numeric|numeric10|numeric18|alpha|vnum\n"
-		     "  options: repeat=N interval=N tonetype=N ni=0|1 (can be empty)\n"
+		     "  options: repeat=N interval=N tonetype=N ni=0|1 cc=NNN opc=N\n"
 		     "  message: payload after 3rd comma (commas allowed)\n"
 		     "  examples:\n"
 		     "    200078,tone,,\n"
@@ -970,6 +1044,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 		     "    200078,numeric,,1234567890\n"
 		     "    200078,alpha,,Hello World\n"
 		     "    200078,alpha,repeat=3 interval=5,Hello, World!\n"
+		     "    200078,alpha,ni=1 cc=255 opc=1,International msg\n"
 		     "    200078,vnum,,31415926535\n");
 		return;
 	}
@@ -995,7 +1070,29 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 
 	/* Parse options */
 	paging_parse_options(line + comma2 + 1, comma3 - comma2 - 1,
-			     &repeat, &interval, &tonetype, &ni);
+			     &repeat, &interval, &tonetype, &ni,
+			     &country_code, &opc);
+
+	/* International mode: fill in defaults from encoder config if not
+	 * specified per-message. ni=1 requires cc and opc. */
+	if (ni) {
+		if (!country_code)
+			country_code = enc->paging.intl_country_code;
+		if (!opc)
+			opc = enc->paging.intl_opc;
+		if (!country_code || !opc) {
+			LOGP(DRADIO, LOGL_ERROR,
+			     "RDS paging FIFO: ni=1 requires cc=NNN and opc=N "
+			     "(per-message or --rds-paging-cc/--rds-paging-opc)\n");
+			return;
+		}
+		if (!mcc_valid(country_code)) {
+			LOGP(DRADIO, LOGL_ERROR,
+			     "RDS paging FIFO: invalid MCC %d (must be 200-999)\n",
+			     country_code);
+			return;
+		}
+	}
 
 	/* Message is everything after 3rd comma */
 	msg = line + comma3 + 1;
@@ -1005,6 +1102,10 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 	msg_len = paging_decode_hex_escapes(msg, msg_len);
 
 	if (!strcasecmp(type_buf, "tone")) {
+		if (ni) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: tone-only has no NI bit (EN 50067 M.3.5.2)\n");
+			return;
+		}
 		rds_enc_paging_send_tone(enc, address, repeat, interval, tonetype);
 		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: TONE addr=%02u-%04u repeat=%d interval=%d tonetype=%d\n",
 		     address / 10000, address % 10000, repeat, interval, tonetype);
@@ -1013,25 +1114,43 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: numeric requires message digits\n");
 			return;
 		}
+		if (ni) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: basic numeric (10/18) has no NI bit; use vnum for international numeric\n");
+			return;
+		}
 		rds_enc_paging_send_numeric(enc, address, msg, repeat, interval, ni);
-		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: NUMERIC addr=%02u-%04u len=%d repeat=%d interval=%d %s msg=\"%s\"\n",
-		     address / 10000, address % 10000, msg_len, repeat, interval, PAG_NI(ni), msg);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: NUMERIC addr=%02u-%04u len=%d repeat=%d interval=%d msg=\"%s\"\n",
+		     address / 10000, address % 10000, msg_len, repeat, interval, msg);
 	} else if (!strcasecmp(type_buf, "alpha")) {
 		if (msg_len <= 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: alpha requires message text\n");
 			return;
 		}
-		rds_enc_paging_send_alpha(enc, address, msg, repeat, interval, ni);
-		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: ALPHA addr=%02u-%04u len=%d repeat=%d interval=%d %s msg=\"%s\"\n",
-		     address / 10000, address % 10000, msg_len, repeat, interval, PAG_NI(ni), msg);
+		rds_enc_paging_send_alpha(enc, address, msg, repeat, interval, ni, country_code, opc);
+		if (ni) {
+			const char *cname = mcc_name(country_code);
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: ALPHA addr=%02u-%04u len=%d repeat=%d interval=%d intl MCC=%d(%s) OPC=%d msg=\"%s\"\n",
+			     address / 10000, address % 10000, msg_len, repeat, interval,
+			     country_code, cname ? cname : "?", opc, msg);
+		} else {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: ALPHA addr=%02u-%04u len=%d repeat=%d interval=%d nat msg=\"%s\"\n",
+			     address / 10000, address % 10000, msg_len, repeat, interval, msg);
+		}
 	} else if (!strcasecmp(type_buf, "vnum")) {
 		if (msg_len <= 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: vnum requires message digits\n");
 			return;
 		}
-		rds_enc_paging_send_vnum(enc, address, msg, repeat, interval, ni);
-		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: VNUM addr=%02u-%04u len=%d repeat=%d interval=%d %s msg=\"%s\"\n",
-		     address / 10000, address % 10000, msg_len, repeat, interval, PAG_NI(ni), msg);
+		rds_enc_paging_send_vnum(enc, address, msg, repeat, interval, ni, country_code, opc);
+		if (ni) {
+			const char *cname = mcc_name(country_code);
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: VNUM addr=%02u-%04u len=%d repeat=%d interval=%d intl MCC=%d(%s) OPC=%d msg=\"%s\"\n",
+			     address / 10000, address % 10000, msg_len, repeat, interval,
+			     country_code, cname ? cname : "?", opc, msg);
+		} else {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: VNUM addr=%02u-%04u len=%d repeat=%d interval=%d nat msg=\"%s\"\n",
+			     address / 10000, address % 10000, msg_len, repeat, interval, msg);
+		}
 	} else {
 		LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: unknown type '%s'\n", type_buf);
 	}
@@ -1303,8 +1422,12 @@ int main(int argc, char *argv[])
 
 	/* Enable RDS paging if requested */
 	if (rds_paging) {
-		rds_enc_paging_enable(&radio.rds_enc, 1);
+		rds_enc_paging_set_enabled(&radio.rds_enc, 1);
 		rds_enc_paging_set_rpc(&radio.rds_enc, rds_paging_rpc);
+		rds_enc_paging_set_opc(&radio.rds_enc, rds_paging_opc);
+		rds_enc_paging_set_pac(&radio.rds_enc, rds_paging_pac);
+		/* International paging defaults (EN 50067 M.3.5.7) */
+		rds_enc_paging_set_cc(&radio.rds_enc, rds_paging_cc);
 		/* Enable paging decoder so 7A/13A are decoded as paging, not ODA */
 		radio.rds_dec.paging_enabled = 1;
 		/* Create named pipe for paging commands */
@@ -1318,9 +1441,21 @@ int main(int argc, char *argv[])
 			if (paging_pipe_fd < 0)
 				fprintf(stderr, "Failed to open paging FIFO '%s': %s\n",
 					rds_paging_pipe_path, strerror(errno));
-			else
-				printf("RDS Paging enabled (RPC=%d), pipe: %s\n",
-				       rds_paging_rpc, rds_paging_pipe_path);
+			else {
+				char rpc_buf[80];
+				printf("RDS Paging enabled: %s, OPC=%d%s, PAC=%d%s",
+				       rds_paging_rpc_desc(rds_paging_rpc, rpc_buf, sizeof(rpc_buf)),
+				       rds_paging_opc,
+				       rds_paging_opc ? "" : " (no enhanced paging)",
+				       rds_paging_pac,
+				       rds_paging_pac ? "" : " (all areas)");
+				if (rds_paging_cc) {
+					const char *cname = mcc_name(rds_paging_cc);
+					printf(", intl MCC=%d (%s)",
+					       rds_paging_cc, cname ? cname : "unknown");
+				}
+				printf(", pipe: %s\n", rds_paging_pipe_path);
+			}
 		}
 	}
 
