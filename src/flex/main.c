@@ -156,10 +156,13 @@ void print_help(const char *arg0)
 	printf("        Enable baseband low-pass filter (default).\n");
 	printf("    --no-lpf\n");
 	printf("        Disable baseband low-pass filter.\n");
-	printf("    --biw-time\n");
-	printf("        Enable BIW3/BIW4 time broadcast.\n");
+	printf("    --biw-time <auto|offset>\n");
+	printf("        Enable BIW date/time/timezone broadcast.\n");
+	printf("        auto    — detect timezone from system clock.\n");
+	printf("        offset  — UTC offset, e.g. +9, -5, +5:30, +0.\n");
+	printf("        Transmits BIW Date (001), Time (010), and Timezone (101).\n");
 	printf("    --no-biw-time\n");
-	printf("        Disable BIW3/BIW4 time broadcast.\n");
+	printf("        Disable BIW date/time/timezone broadcast.\n");
 	printf("    --no-ers\n");
 	printf("        Skip ERS burst in single-shot mode (workaround for decoders\n");
 	printf("        that choke on ERS sync patterns, e.g. PDW).\n");
@@ -308,7 +311,7 @@ static void add_options(void)
 	option_add(OPT_FIXED_POLARITY, "fixed-polarity", 1);
 	option_add(OPT_LPF, "lpf", 0);
 	option_add(OPT_NO_LPF, "no-lpf", 0);
-	option_add(OPT_BIW_TIME, "biw-time", 0);
+	option_add(OPT_BIW_TIME, "biw-time", 1);
 	option_add(OPT_NO_BIW_TIME, "no-biw-time", 0);
 	option_add(OPT_ERS_CYCLES, "ers-cycles", 1);
 	option_add(OPT_CHARSET, "charset", 1);
@@ -438,6 +441,55 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_BIW_TIME:
 		biw_time_enabled = 1;
+		if (!strcasecmp(argv[argi], "auto")) {
+			/* Auto-detect timezone from system */
+			timezone_code = flex_tz_auto_detect();
+			if (timezone_code < 0) {
+				fprintf(stderr, "Warning: --biw-time auto: could not map system timezone to FLEX zone code.\n");
+				fprintf(stderr, "         Use --biw-time <offset> (e.g. +9, -5, +5:30) or --timezone <0-31>.\n");
+				timezone_code = -1;
+			} else {
+				char tzbuf[20];
+				int tz_min = flex_tz_to_minutes((uint32_t)timezone_code);
+				fprintf(stderr, "BIW time: auto-detected timezone zone=%d (%s)\n",
+					timezone_code,
+					flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
+			}
+		} else {
+			/* Parse UTC offset string like +9, -5, +5:30 */
+			int offset_min = flex_tz_parse_offset(argv[argi]);
+			if (offset_min == INT_MIN) {
+				fprintf(stderr, "Invalid --biw-time offset '%s'. Use 'auto' or UTC offset like +9, -5, +5:30.\n", argv[argi]);
+				return -EINVAL;
+			}
+			uint32_t code = flex_tz_from_minutes(offset_min);
+			if (code == FLEX_TZ_RESERVED) {
+				char tzbuf[20];
+				fprintf(stderr, "UTC offset '%s' (%s) does not match any FLEX timezone zone code.\n",
+					argv[argi],
+					flex_tz_format(offset_min, tzbuf, sizeof(tzbuf)));
+				fprintf(stderr, "Valid offsets: ");
+				{
+					uint32_t i;
+					for (i = 0; i < FLEX_TZ_ENTRIES; i++) {
+						if (i == FLEX_TZ_RESERVED) continue;
+						fprintf(stderr, "%s%s",
+							i > 0 ? ", " : "",
+							flex_tz_format(flex_tz_table[i], tzbuf, sizeof(tzbuf)));
+					}
+				}
+				fprintf(stderr, "\n");
+				return -EINVAL;
+			}
+			timezone_code = (int)code;
+			{
+				char tzbuf[20];
+				int tz_min = flex_tz_to_minutes((uint32_t)timezone_code);
+				fprintf(stderr, "BIW time: timezone zone=%d (%s)\n",
+					timezone_code,
+					flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
+			}
+		}
 		break;
 	case OPT_NO_BIW_TIME:
 		biw_time_enabled = 0;
@@ -1448,7 +1500,23 @@ int main(int argc, char *argv[])
 		num_transmissions = 1;
 	}
 	if (biw_time_enabled == -1)
-		biw_time_enabled = network_mode;
+		biw_time_enabled = 0;
+
+	/* When biw_time is enabled (explicitly or via network mode) and no
+	 * timezone was set, auto-detect from system timezone. */
+	if (biw_time_enabled > 0 && timezone_code < 0) {
+		timezone_code = flex_tz_auto_detect();
+		if (timezone_code >= 0) {
+			char tzbuf[20];
+			int tz_min = flex_tz_to_minutes((uint32_t)timezone_code);
+			fprintf(stderr, "BIW time: auto-detected timezone zone=%d (%s)\n",
+				timezone_code,
+				flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
+		} else {
+			fprintf(stderr, "Warning: BIW time enabled but could not auto-detect timezone.\n");
+			fprintf(stderr, "         Time will be transmitted as UTC. Use --biw-time <offset> or --timezone <0-31>.\n");
+		}
+	}
 
 	/* create pipe for message send */
 	unlink(msg_send_path);

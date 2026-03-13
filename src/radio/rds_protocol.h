@@ -197,7 +197,7 @@
  *           Data: DSN(1) + PSN(1) + MEL(1) + config(1) + text(1-64)
  *                 MEL: length of config+text
  *                 config: bit 0 = A/B flag
- *           Mapping: rds_enc_set_radiotext(enc, rt)
+ *           Mapping: rds_enc_set_rt(enc, rt)
  *
  * MEC 0x0D: RTC (Real Time Clock)
  *           Data: MJD + time
@@ -269,14 +269,14 @@
  *   [x] 0x04 DI/PTYI            rds_enc_set_di()
  *   [x] 0x05 M/S                rds_enc_set_ms()
  *   [x] 0x07 PTY                rds_enc_set_pty()
- *   [x] 0x09 RTC Correction     ct_time_offset
- *   [x] 0x0A RT                 rds_enc_set_radiotext()
+ *   [x] 0x09 RTC Correction     Logged (system clock, always 0)
+ *   [x] 0x0A RT                 rds_enc_set_rt()
  *   [x] 0x0B PSN Enable         Logged (single-service encoder)
- *   [x] 0x0D RTC                local_offset updated
+ *   [x] 0x0D RTC                rds_enc_set_ct_local_offset()
  *   [x] 0x13 AF                 Logged (TODO: AF code conversion)
  *   [x] 0x14 EON-AF             Logged (TODO: EON-AF parsing)
  *   [x] 0x17 Request            uecp_handle_request()
- *   [x] 0x19 CT On/Off          ct_enabled
+ *   [x] 0x19 CT On/Off          rds_enc_set_ct_enabled()
  *   [x] 0x1A ECC                rds_enc_set_ecc()
  *   [x] 0x28 Make PSN List      Logged (single-service encoder)
  *   [x] 0x3E PTYN               rds_enc_set_ptyn()

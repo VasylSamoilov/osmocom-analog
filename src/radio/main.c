@@ -1403,7 +1403,7 @@ int main(int argc, char *argv[])
 		if (!tx) {
 			fprintf(stderr, "Warning: --rds-tx-hexrds-file requires --tx mode\n");
 		}
-		rc = rds_encoder_set_tx_hexrds_file(&radio.rds_enc, rds_tx_hexrds_file);
+		rc = rds_enc_set_tx_hexrds_file(&radio.rds_enc, rds_tx_hexrds_file);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to open TX hexrds input file, exitting!\n");
 			exit(0);
@@ -1413,7 +1413,7 @@ int main(int argc, char *argv[])
 		if (!tx) {
 			fprintf(stderr, "Warning: --rds-tx-bitstream-file requires --tx mode\n");
 		}
-		rc = rds_encoder_set_tx_bitstream_file(&radio.rds_enc, rds_tx_bitstream_file);
+		rc = rds_enc_set_tx_bitstream_file(&radio.rds_enc, rds_tx_bitstream_file);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to open TX bitstream input file, exitting!\n");
 			exit(0);

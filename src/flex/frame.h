@@ -18,6 +18,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <limits.h>
+#include <time.h>
 
 /* ===== BCH(31,21) Error Correction ===== */
 
@@ -434,6 +436,76 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 	return FLEX_TZ_RESERVED;
 }
 
+/* Parse a UTC offset string into minutes.
+ * Accepted formats: "+9", "-5", "+5:30", "-3:30", "+09:00", "0"
+ * Returns offset in minutes, or INT_MIN on parse error. */
+static inline int flex_tz_parse_offset(const char *s)
+{
+	int sign = 1, hours = 0, minutes = 0;
+	const char *p = s;
+
+	if (!s || !*s)
+		return INT_MIN;
+
+	if (*p == '+') { sign = 1; p++; }
+	else if (*p == '-') { sign = -1; p++; }
+
+	/* Parse hours */
+	if (*p < '0' || *p > '9')
+		return INT_MIN;
+	hours = 0;
+	while (*p >= '0' && *p <= '9')
+		hours = hours * 10 + (*p++ - '0');
+
+	/* Optional :MM */
+	if (*p == ':') {
+		p++;
+		if (*p < '0' || *p > '9')
+			return INT_MIN;
+		while (*p >= '0' && *p <= '9')
+			minutes = minutes * 10 + (*p++ - '0');
+	}
+
+	if (*p != '\0')
+		return INT_MIN;
+	if (hours > 12 || minutes > 59)
+		return INT_MIN;
+
+	return sign * (hours * 60 + minutes);
+}
+
+/* Auto-detect system timezone and return the FLEX 5-bit zone code.
+ * Uses localtime to determine UTC offset.
+ * Returns zone code (0-31), or -1 if no matching zone code found. */
+static inline int flex_tz_auto_detect(void)
+{
+	time_t now = time(NULL);
+	struct tm lt;
+	int offset_min;
+	uint32_t code;
+
+	localtime_r(&now, &lt);
+#ifdef __linux__
+	offset_min = (int)(lt.tm_gmtoff / 60);
+#else
+	/* Portable fallback: compute difference between local and UTC */
+	{
+		struct tm gt;
+		gmtime_r(&now, &gt);
+		int local_min = lt.tm_hour * 60 + lt.tm_min;
+		int utc_min = gt.tm_hour * 60 + gt.tm_min;
+		int day_diff = lt.tm_yday - gt.tm_yday;
+		if (day_diff > 1) day_diff = -1;   /* year wrap */
+		if (day_diff < -1) day_diff = 1;
+		offset_min = local_min - utc_min + day_diff * 1440;
+	}
+#endif
+	code = flex_tz_from_minutes(offset_min);
+	if (code == FLEX_TZ_RESERVED)
+		return -1;
+	return (int)code;
+}
+
 /* ===== BIW Type 001: Date =====
  *
  * Month, day, year.
@@ -586,282 +658,17 @@ static inline uint32_t flex_tz_from_minutes(int offset_min)
 #define FLEX_BIW_SSID2_COUNTRY_MASK	0x03FF	/* 10 bits */
 
 /* ===== ITU-T E.212 Mobile Country Code (MCC) Lookup =====
- *
- * Per ITU Operational Bulletin No. 1117 (1 February 2017),
- * Complement to Recommendation ITU-T E.212 (09/2016).
- *
- * The SSID2 country code field (c9-c0, 10 bits) carries the 3-digit
- * MCC.  This table maps MCC values to country/area names for RX
- * display and TX validation.
- *
- * Notes:
- *   a. MCCs beginning with 0, 1, or 8 are reserved for future use.
- *   b. UAE: Dubai=431, Abu Dhabi=430.
- *   c. 901 = International Mobile, shared code.
- *   d. Kosovo designation per UNSCR 1244 / ICJ Opinion.
- *
- * Only assigned codes (202-901) are included.  Codes not in this
- * table are either reserved or unassigned. */
+ * Shared table in libmobile/mcc.h, aliased here for FLEX API compat. */
+#include "../libmobile/mcc.h"
 
-typedef struct flex_mcc_entry {
-	uint16_t	code;
-	const char	*name;
-} flex_mcc_entry_t;
+/* FLEX-compatible aliases */
+typedef mcc_entry_t flex_mcc_entry_t;
+#define flex_mcc_table mcc_table
+#define FLEX_MCC_TABLE_SIZE MCC_TABLE_SIZE
 
-static const flex_mcc_entry_t flex_mcc_table[] = {
-	{ 202, "Greece" },
-	{ 204, "Netherlands" },
-	{ 206, "Belgium" },
-	{ 208, "France" },
-	{ 212, "Monaco" },
-	{ 213, "Andorra" },
-	{ 214, "Spain" },
-	{ 216, "Hungary" },
-	{ 218, "Bosnia-Herzegovina" },
-	{ 219, "Croatia" },
-	{ 220, "Serbia" },
-	{ 221, "Kosovo" },
-	{ 222, "Italy" },
-	{ 225, "Vatican" },
-	{ 226, "Romania" },
-	{ 228, "Switzerland" },
-	{ 230, "Czech Republic" },
-	{ 231, "Slovakia" },
-	{ 232, "Austria" },
-	{ 234, "UK" },
-	{ 235, "UK" },
-	{ 238, "Denmark" },
-	{ 240, "Sweden" },
-	{ 242, "Norway" },
-	{ 244, "Finland" },
-	{ 246, "Lithuania" },
-	{ 247, "Latvia" },
-	{ 248, "Estonia" },
-	{ 250, "Russia" },
-	{ 255, "Ukraine" },
-	{ 257, "Belarus" },
-	{ 259, "Moldova" },
-	{ 260, "Poland" },
-	{ 262, "Germany" },
-	{ 266, "Gibraltar" },
-	{ 268, "Portugal" },
-	{ 270, "Luxembourg" },
-	{ 272, "Ireland" },
-	{ 274, "Iceland" },
-	{ 276, "Albania" },
-	{ 278, "Malta" },
-	{ 280, "Cyprus" },
-	{ 282, "Georgia" },
-	{ 283, "Armenia" },
-	{ 284, "Bulgaria" },
-	{ 286, "Turkey" },
-	{ 288, "Faroe Islands" },
-	{ 290, "Greenland" },
-	{ 292, "San Marino" },
-	{ 293, "Slovenia" },
-	{ 294, "Macedonia" },
-	{ 295, "Liechtenstein" },
-	{ 297, "Montenegro" },
-	{ 302, "Canada" },
-	{ 308, "St. Pierre & Miquelon" },
-	{ 310, "USA" },
-	{ 311, "USA" },
-	{ 312, "USA" },
-	{ 313, "USA" },
-	{ 314, "USA" },
-	{ 315, "USA" },
-	{ 316, "USA" },
-	{ 330, "Puerto Rico" },
-	{ 332, "US Virgin Islands" },
-	{ 334, "Mexico" },
-	{ 338, "Jamaica" },
-	{ 340, "Guadeloupe/Martinique" },
-	{ 342, "Barbados" },
-	{ 344, "Antigua & Barbuda" },
-	{ 346, "Cayman Islands" },
-	{ 348, "British Virgin Islands" },
-	{ 350, "Bermuda" },
-	{ 352, "Grenada" },
-	{ 354, "Montserrat" },
-	{ 356, "St. Kitts & Nevis" },
-	{ 358, "St. Lucia" },
-	{ 360, "St. Vincent & Grenadines" },
-	{ 362, "Curacao/Sint Maarten/BES" },
-	{ 363, "Aruba" },
-	{ 364, "Bahamas" },
-	{ 365, "Anguilla" },
-	{ 366, "Dominica" },
-	{ 368, "Cuba" },
-	{ 370, "Dominican Republic" },
-	{ 372, "Haiti" },
-	{ 374, "Trinidad & Tobago" },
-	{ 376, "Turks & Caicos" },
-	{ 400, "Azerbaijan" },
-	{ 401, "Kazakhstan" },
-	{ 402, "Bhutan" },
-	{ 404, "India" },
-	{ 405, "India" },
-	{ 406, "India" },
-	{ 410, "Pakistan" },
-	{ 412, "Afghanistan" },
-	{ 413, "Sri Lanka" },
-	{ 414, "Myanmar" },
-	{ 415, "Lebanon" },
-	{ 416, "Jordan" },
-	{ 417, "Syria" },
-	{ 418, "Iraq" },
-	{ 419, "Kuwait" },
-	{ 420, "Saudi Arabia" },
-	{ 421, "Yemen" },
-	{ 422, "Oman" },
-	{ 424, "UAE" },
-	{ 425, "Israel" },
-	{ 426, "Bahrain" },
-	{ 427, "Qatar" },
-	{ 428, "Mongolia" },
-	{ 429, "Nepal" },
-	{ 430, "UAE (Abu Dhabi)" },
-	{ 431, "UAE (Dubai)" },
-	{ 432, "Iran" },
-	{ 434, "Uzbekistan" },
-	{ 436, "Tajikistan" },
-	{ 437, "Kyrgyzstan" },
-	{ 438, "Turkmenistan" },
-	{ 440, "Japan" },
-	{ 441, "Japan" },
-	{ 450, "South Korea" },
-	{ 452, "Vietnam" },
-	{ 454, "Hong Kong" },
-	{ 455, "Macao" },
-	{ 456, "Cambodia" },
-	{ 457, "Laos" },
-	{ 460, "China" },
-	{ 461, "China" },
-	{ 466, "Taiwan" },
-	{ 467, "North Korea" },
-	{ 470, "Bangladesh" },
-	{ 472, "Maldives" },
-	{ 502, "Malaysia" },
-	{ 505, "Australia" },
-	{ 510, "Indonesia" },
-	{ 514, "Timor-Leste" },
-	{ 515, "Philippines" },
-	{ 520, "Thailand" },
-	{ 525, "Singapore" },
-	{ 528, "Brunei" },
-	{ 530, "New Zealand" },
-	{ 536, "Nauru" },
-	{ 537, "Papua New Guinea" },
-	{ 539, "Tonga" },
-	{ 540, "Solomon Islands" },
-	{ 541, "Vanuatu" },
-	{ 542, "Fiji" },
-	{ 543, "Wallis & Futuna" },
-	{ 544, "American Samoa" },
-	{ 545, "Kiribati" },
-	{ 546, "New Caledonia" },
-	{ 547, "French Polynesia" },
-	{ 548, "Cook Islands" },
-	{ 549, "Samoa" },
-	{ 550, "Micronesia" },
-	{ 551, "Marshall Islands" },
-	{ 552, "Palau" },
-	{ 553, "Tuvalu" },
-	{ 554, "Tokelau" },
-	{ 555, "Niue" },
-	{ 602, "Egypt" },
-	{ 603, "Algeria" },
-	{ 604, "Morocco" },
-	{ 605, "Tunisia" },
-	{ 606, "Libya" },
-	{ 607, "Gambia" },
-	{ 608, "Senegal" },
-	{ 609, "Mauritania" },
-	{ 610, "Mali" },
-	{ 611, "Guinea" },
-	{ 612, "Cote d'Ivoire" },
-	{ 613, "Burkina Faso" },
-	{ 614, "Niger" },
-	{ 615, "Togo" },
-	{ 616, "Benin" },
-	{ 617, "Mauritius" },
-	{ 618, "Liberia" },
-	{ 619, "Sierra Leone" },
-	{ 620, "Ghana" },
-	{ 621, "Nigeria" },
-	{ 622, "Chad" },
-	{ 623, "Central African Rep." },
-	{ 624, "Cameroon" },
-	{ 625, "Cabo Verde" },
-	{ 626, "Sao Tome & Principe" },
-	{ 627, "Equatorial Guinea" },
-	{ 628, "Gabon" },
-	{ 629, "Congo" },
-	{ 630, "DR Congo" },
-	{ 631, "Angola" },
-	{ 632, "Guinea-Bissau" },
-	{ 633, "Seychelles" },
-	{ 634, "Sudan" },
-	{ 635, "Rwanda" },
-	{ 636, "Ethiopia" },
-	{ 637, "Somalia" },
-	{ 638, "Djibouti" },
-	{ 639, "Kenya" },
-	{ 640, "Tanzania" },
-	{ 641, "Uganda" },
-	{ 642, "Burundi" },
-	{ 643, "Mozambique" },
-	{ 645, "Zambia" },
-	{ 646, "Madagascar" },
-	{ 647, "French Indian Ocean" },
-	{ 648, "Zimbabwe" },
-	{ 649, "Namibia" },
-	{ 650, "Malawi" },
-	{ 651, "Lesotho" },
-	{ 652, "Botswana" },
-	{ 653, "Swaziland" },
-	{ 654, "Comoros" },
-	{ 655, "South Africa" },
-	{ 657, "Eritrea" },
-	{ 658, "St. Helena" },
-	{ 659, "South Sudan" },
-	{ 702, "Belize" },
-	{ 704, "Guatemala" },
-	{ 706, "El Salvador" },
-	{ 708, "Honduras" },
-	{ 710, "Nicaragua" },
-	{ 712, "Costa Rica" },
-	{ 714, "Panama" },
-	{ 716, "Peru" },
-	{ 722, "Argentina" },
-	{ 724, "Brazil" },
-	{ 730, "Chile" },
-	{ 732, "Colombia" },
-	{ 734, "Venezuela" },
-	{ 736, "Bolivia" },
-	{ 738, "Guyana" },
-	{ 740, "Ecuador" },
-	{ 742, "French Guiana" },
-	{ 744, "Paraguay" },
-	{ 746, "Suriname" },
-	{ 748, "Uruguay" },
-	{ 750, "Falkland Islands" },
-	{ 901, "International Mobile" },
-};
-
-#define FLEX_MCC_TABLE_SIZE \
-	(sizeof(flex_mcc_table) / sizeof(flex_mcc_table[0]))
-
-/* Look up country/area name for a 10-bit MCC value.
- * Returns short name string, or NULL if not found. */
 static inline const char *flex_mcc_name(uint32_t mcc)
 {
-	unsigned int i;
-	for (i = 0; i < FLEX_MCC_TABLE_SIZE; i++) {
-		if (flex_mcc_table[i].code == mcc)
-			return flex_mcc_table[i].name;
-	}
-	return NULL;
+	return mcc_name((uint16_t)mcc);
 }
 
 /* Extract BIW type field from a decoded 21-bit BIW word */

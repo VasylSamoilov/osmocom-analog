@@ -3347,7 +3347,14 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		if (params->biw_time) {
 			time_t now = time(NULL);
 			struct tm tm_now;
-			gmtime_r(&now, &tm_now);
+
+			/* Use local time when timezone is configured,
+			 * UTC otherwise.  Spec says "Standard time in
+			 * each region" — i.e. local time. */
+			if (params->timezone_code >= 0)
+				localtime_r(&now, &tm_now);
+			else
+				gmtime_r(&now, &tm_now);
 
 			if (slots_left > 0) {
 				/* Year field: standard range 0-31 (1994-2025).

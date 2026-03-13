@@ -1676,7 +1676,7 @@ static void uecp_handle_request(rds_server_t *srv, const uint8_t *data, int len)
 	case UECP_MEC_RT: {
 		char rt[65];
 		int i, text_len;
-		rds_enc_get_radiotext(enc, rt, sizeof(rt));
+		rds_enc_get_rt(enc, rt, sizeof(rt));
 		/* Find actual text length (before CR terminators) */
 		text_len = 64;
 		for (i = 0; i < 64; i++) {
@@ -1823,10 +1823,47 @@ static void uecp_handle_request(rds_server_t *srv, const uint8_t *data, int len)
 		break;
 	}
 	case UECP_MEC_CT_ONOFF:
-		resp[rlen++] = (uint8_t)(enc->ct_enabled ? UECP_FLAG_ON : UECP_FLAG_OFF);
+		resp[rlen++] = (uint8_t)(rds_enc_get_ct_enabled(enc) ? UECP_FLAG_ON : UECP_FLAG_OFF);
 		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): ct=%s\n",
-		     req_name, req_mec, enc->ct_enabled ? "on" : "off");
+		     req_name, req_mec, rds_enc_get_ct_enabled(enc) ? "on" : "off");
 		break;
+	case UECP_MEC_RTC_CORR:
+		/* We use system clock, correction is always 0 */
+		resp[rlen++] = 0;
+		resp[rlen++] = 0;
+		LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): correction=0 ms (system clock)\n",
+		     req_name, req_mec);
+		break;
+	case UECP_MEC_RTC: {
+		/* Return current (corrected) time + local offset */
+		time_t now = time(NULL) + rds_enc_get_ct_correction(enc);
+		struct tm *t = gmtime(&now);
+		if (t) {
+			resp[rlen++] = (uint8_t)(t->tm_year % 100);  /* year 00-99 */
+			resp[rlen++] = (uint8_t)(t->tm_mon + 1);      /* month 1-12 */
+			resp[rlen++] = (uint8_t)(t->tm_mday);          /* day 1-31 */
+			resp[rlen++] = (uint8_t)(t->tm_hour);           /* hour 0-23 */
+			resp[rlen++] = (uint8_t)(t->tm_min);            /* minute 0-59 */
+			resp[rlen++] = (uint8_t)(t->tm_sec);            /* second 0-59 */
+			resp[rlen++] = 0;                               /* centiseconds */
+			/* LTO: bit 5 = sign, bits 4-0 = magnitude in half-hours */
+			int8_t lto = rds_enc_get_ct_local_offset(enc);
+			if (lto < 0)
+				resp[rlen++] = (uint8_t)(0x20 | ((-lto) & 0x1F));
+			else
+				resp[rlen++] = (uint8_t)(lto & 0x1F);
+			LOGP(DRADIO, LOGL_INFO, "UECP: Reply %s (0x%02X): 20%02d-%02d-%02d %02d:%02d:%02d UTC, LTO=%+d half-hours\n",
+			     req_name, req_mec, t->tm_year % 100, t->tm_mon + 1, t->tm_mday,
+			     t->tm_hour, t->tm_min, t->tm_sec, lto);
+		} else {
+			/* gmtime failed — return zeros */
+			memset(resp + rlen, 0, 8);
+			rlen += 8;
+			LOGP(DRADIO, LOGL_ERROR, "UECP: Reply %s (0x%02X): gmtime failed\n",
+			     req_name, req_mec);
+		}
+		break;
+	}
 	case UECP_MEC_AF: {
 		/* Return actual AF list from encoder (Method A or B) */
 		uint8_t af_buf[64];
@@ -2157,13 +2194,13 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 				/* IEC 62106-10 A.2.8: config byte bit 0 = A/B flag control
 				 *   0 = do not toggle A/B flag
 				 *   1 = toggle A/B flag
-				 * rds_enc_set_radiotext() always toggles A/B.
+				 * rds_enc_set_rt() always toggles A/B.
 				 * If bit 0 = 0, we need to preserve the current A/B flag. */
 				uint8_t ab_toggle = config & 0x01;
 				uint8_t saved_ab = enc->rt_ab;
 				memcpy(rt, data + 4, text_len);
 				rt[text_len] = '\0';
-				rds_enc_set_radiotext(enc, rt);
+				rds_enc_set_rt(enc, rt);
 				if (!ab_toggle) {
 					/* Restore A/B flag — UECP source doesn't want toggle */
 					enc->rt_ab = saved_ab;
@@ -2247,7 +2284,7 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 		if (len >= 1) {
 			int ct_on = data[0] & UECP_FLAG_ON;
 			if (enc)
-				enc->ct_enabled = ct_on;
+				rds_enc_set_ct_enabled(enc, ct_on);
 			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): ct=%s\n",
 			     name, mec, ct_on ? "on" : "off");
 		}
@@ -2265,8 +2302,9 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 	case UECP_MEC_RTC_CORR:
 		if (len >= 2) {
 			int16_t corr_ms = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
-			enc->ct_time_offset = corr_ms / 1000;  /* Store as whole seconds */
-			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): correction=%d ms\n",
+			/* UECP RTC Correction is a hardware clock fine-tune (ms).
+			 * We use system time, so just log and ignore. */
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): correction=%d ms (ignored, using system clock)\n",
 			     name, mec, corr_ms);
 		}
 		break;
@@ -2334,7 +2372,7 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 			} else {
 				/* Main PSN: enable/disable EON globally */
 				enc->eon_enabled = (flags != 0) ? 1 : 0;
-				rds_scheduler_update(enc);
+				rds_enc_scheduler_update(enc);
 				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): flags=0x%02X %s "
 				     "(PS=%d AF=%d Link=%d PTY=%d PIN=%d Bcast=%d TA=%d)\n",
 				     name, mec, flags, enc->eon_enabled ? "enabled" : "disabled",
@@ -2478,19 +2516,45 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 			uint8_t second = data[5];
 			uint8_t centisec = data[6];
 			uint8_t lto = data[7];
-			/* We use system time for CT, but log the received time
-			 * and update local_offset if provided */
+
+			/* Update local_offset from LTO byte */
 			if (lto != 0xFF) {
-				/* Bits 5-0: magnitude in half-hours, bit 5: sign (1=negative) */
-				int8_t offset = (int8_t)(lto & 0x3F);
+				int8_t offset = (int8_t)(lto & 0x1F);
 				if (lto & 0x20)
 					offset = -offset;
-				enc->local_offset = offset;
+				rds_enc_set_ct_local_offset(enc, offset);
 			}
-			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): 20%02d-%02d-%02d %02d:%02d:%02d.%02d UTC, LTO=%s%d.%dh\n",
+
+			/* Compute correction: delta between received UTC and system time */
+			struct tm tm_rx = {0};
+			tm_rx.tm_year = 2000 + year - 1900;
+			tm_rx.tm_mon = month - 1;
+			tm_rx.tm_mday = day;
+			tm_rx.tm_hour = hour;
+			tm_rx.tm_min = minute;
+			tm_rx.tm_sec = second;
+			tm_rx.tm_isdst = -1;
+#if defined(__GLIBC__) || defined(__linux__)
+			time_t rx_utc = timegm(&tm_rx);
+#else
+			char *old_tz = getenv("TZ");
+			setenv("TZ", "UTC", 1);
+			tzset();
+			time_t rx_utc = mktime(&tm_rx);
+			if (old_tz) setenv("TZ", old_tz, 1);
+			else unsetenv("TZ");
+			tzset();
+#endif
+			time_t sys_now = time(NULL);
+			time_t correction = rx_utc - sys_now;
+			rds_enc_set_ct_correction(enc, correction);
+
+			LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): 20%02d-%02d-%02d %02d:%02d:%02d.%02d UTC, "
+			     "LTO=%s%d.%dh, correction=%ld s\n",
 			     name, mec, year, month, day, hour, minute, second, centisec,
-			     (enc->local_offset < 0) ? "-" : "+",
-			     abs(enc->local_offset) / 2, (abs(enc->local_offset) % 2) * 5);
+			     (rds_enc_get_ct_local_offset(enc) < 0) ? "-" : "+",
+			     abs(rds_enc_get_ct_local_offset(enc)) / 2, (abs(rds_enc_get_ct_local_offset(enc)) % 2) * 5,
+			     (long)correction);
 		}
 		break;
 
@@ -3170,12 +3234,13 @@ static void asciig_process_cmd(rds_server_t *srv, const char *line, int len)
 	/* ---- RT1 (RadioText) ---- */
 	if (strcmp(name, "RT1") == 0) {
 		if (!val) {
-			/* No getter for RT in the public API - just ack */
-			LOGP(DRADIO, LOGL_INFO, "ASCII-G: Query RT1 (not supported)\n");
-			asciig_reply(srv, '!');
+			char rt[RDS_RT_LENGTH_A + 1];
+			rds_enc_get_rt(enc, rt, sizeof(rt));
+			LOGP(DRADIO, LOGL_INFO, "ASCII-G: Query RT1 -> \"%s\"\n", rt);
+			tx_printf(srv, "%s\r\n", rt);
 			return;
 		}
-		rds_enc_set_radiotext(enc, val);
+		rds_enc_set_rt(enc, val);
 		LOGP(DRADIO, LOGL_INFO, "ASCII-G: RT1=\"%s\" -> +\n", val);
 		asciig_reply(srv, '+');
 		return;
@@ -3238,8 +3303,8 @@ static void asciig_process_cmd(rds_server_t *srv, const char *line, int len)
 	/* ---- TA ---- */
 	if (strcmp(name, "TA") == 0) {
 		if (!val) {
-			LOGP(DRADIO, LOGL_INFO, "ASCII-G: Query TA -> %d\n", rds_enc_get_tp(enc));
-			tx_printf(srv, "%d\r\n", rds_enc_get_tp(enc));
+			LOGP(DRADIO, LOGL_INFO, "ASCII-G: Query TA -> %d\n", rds_enc_get_ta(enc));
+			tx_printf(srv, "%d\r\n", rds_enc_get_ta(enc));
 			return;
 		}
 		int ta = atoi(val);
@@ -3427,7 +3492,7 @@ static void asciig_process_cmd(rds_server_t *srv, const char *line, int len)
 		}
 		/* Empty string stops dynamic PS */
 		if (*val == '\0') {
-			rds_enc_stop_dynamic_ps(enc);
+			rds_enc_clear_dynamic_ps(enc);
 			LOGP(DRADIO, LOGL_INFO, "ASCII-G: DPS1=\"\" (stop) -> +\n");
 		} else {
 			rds_enc_set_dynamic_ps(enc, val, RDS_DPS_SCROLL,
@@ -3514,6 +3579,64 @@ static void asciig_process_cmd(rds_server_t *srv, const char *line, int len)
 	/* ---- ECHO — echo mode (no-op, just ack) ---- */
 	if (strcmp(name, "ECHO") == 0) {
 		LOGP(DRADIO, LOGL_INFO, "ASCII-G: ECHO -> +\n");
+		asciig_reply(srv, '+');
+		return;
+	}
+
+	/* ---- CT (Clock-Time enable/disable) ---- */
+	if (strcmp(name, "CT") == 0) {
+		if (!val) {
+			LOGP(DRADIO, LOGL_INFO, "ASCII-G: Query CT -> %d\n", rds_enc_get_ct_enabled(enc));
+			tx_printf(srv, "%d\r\n", rds_enc_get_ct_enabled(enc));
+			return;
+		}
+		int ct = atoi(val);
+		if (ct < 0 || ct > 1) {
+			LOGP(DRADIO, LOGL_NOTICE, "ASCII-G: CT invalid arg \"%s\"\n", val);
+			asciig_reply(srv, '-');
+			return;
+		}
+		rds_enc_set_ct_enabled(enc, ct);
+		LOGP(DRADIO, LOGL_INFO, "ASCII-G: CT=%d -> +\n", ct);
+		asciig_reply(srv, '+');
+		return;
+	}
+
+	/* ---- CTCORR (Clock-Time correction in seconds) ---- */
+	if (strcmp(name, "CTCORR") == 0) {
+		if (!val) {
+			LOGP(DRADIO, LOGL_INFO, "ASCII-G: Query CTCORR -> %ld\n", (long)rds_enc_get_ct_correction(enc));
+			tx_printf(srv, "%ld\r\n", (long)rds_enc_get_ct_correction(enc));
+			return;
+		}
+		long corr = atol(val);
+		time_t result = time(NULL) + (time_t)corr;
+		if (result < 0) {
+			LOGP(DRADIO, LOGL_NOTICE, "ASCII-G: CTCORR=%ld would produce negative timestamp\n", corr);
+			asciig_reply(srv, '-');
+			return;
+		}
+		rds_enc_set_ct_correction(enc, (time_t)corr);
+		LOGP(DRADIO, LOGL_INFO, "ASCII-G: CTCORR=%ld -> +\n", corr);
+		asciig_reply(srv, '+');
+		return;
+	}
+
+	/* ---- CTOFF (Clock-Time local offset in half-hours, -24..+24) ---- */
+	if (strcmp(name, "CTOFF") == 0) {
+		if (!val) {
+			LOGP(DRADIO, LOGL_INFO, "ASCII-G: Query CTOFF -> %d\n", rds_enc_get_ct_local_offset(enc));
+			tx_printf(srv, "%d\r\n", rds_enc_get_ct_local_offset(enc));
+			return;
+		}
+		int off = atoi(val);
+		if (off < -24 || off > 24) {
+			LOGP(DRADIO, LOGL_NOTICE, "ASCII-G: CTOFF invalid arg \"%s\"\n", val);
+			asciig_reply(srv, '-');
+			return;
+		}
+		rds_enc_set_ct_local_offset(enc, (int8_t)off);
+		LOGP(DRADIO, LOGL_INFO, "ASCII-G: CTOFF=%d -> +\n", off);
 		asciig_reply(srv, '+');
 		return;
 	}

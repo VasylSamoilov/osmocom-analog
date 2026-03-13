@@ -401,7 +401,7 @@ static const rds_preset_t rds_presets[] = {
 		 *   rds_enc_oda_add(&radio->rds_enc, RDS_GROUP_11A, RDS_ODA_AID_RT_PLUS, 0x0000);
 		 *   
 		 *   // RT and RT+ are independent — set each separately:
-		 *   rds_enc_set_radiotext(enc, "Bohemian Rhapsody - Queen");
+		 *   rds_enc_set_rt(enc, "Bohemian Rhapsody - Queen");
 		 *   rds_enc_rtplus_set_tags(enc,
 		 *       RDS_RTPLUS_CT_ITEM_TITLE, 0, 18,
 		 *       RDS_RTPLUS_CT_ITEM_ARTIST, 21, 5);
@@ -977,9 +977,9 @@ static void rds_apply_preset(radio_t *radio)
 	 * - Scheduler update for RT presence changes
 	 * - RDS charset conversion from UTF-8 */
 	if (p->rt && p->rt[0] != '\0') {
-		rds_enc_set_radiotext(enc, p->rt);
+		rds_enc_set_rt(enc, p->rt);
 	} else {
-		rds_enc_clear_radiotext(enc);
+		rds_enc_clear_rt(enc);
 	}
 	
 	/* Update PTY and PTYN using API */
@@ -1168,12 +1168,12 @@ static void rds_apply_preset(radio_t *radio)
 				start2 = p->ert_plus.tags[1].start;
 				len2 = p->ert_plus.tags[1].length;
 			}
-			rds_enc_ert_plus_set_tags(enc, ct1, start1, len1, ct2, start2, len2);
+			rds_enc_ertplus_set_tags(enc, ct1, start1, len1, ct2, start2, len2);
 		}
 		
 		/* Apply toggle and item_running from preset */
-		rds_enc_ert_plus_set_item_running(enc, p->ert_plus.item_running);
-		rds_enc_ert_plus_set_toggle(enc, p->ert_plus.toggle);
+		rds_enc_ertplus_set_item_running(enc, p->ert_plus.item_running);
+		rds_enc_ertplus_set_toggle(enc, p->ert_plus.toggle);
 		
 		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: Enabled on group %d%c with %d tag(s)\n",
 		     p->ert_plus.carrier_group >> 1,
@@ -1182,7 +1182,7 @@ static void rds_apply_preset(radio_t *radio)
 	} else {
 		/* Remove eRT+ ODA if it was previously enabled */
 		rds_enc_oda_remove(enc, RDS_ODA_AID_ERT_PLUS);
-		rds_enc_ert_plus_clear_tags(enc);
+		rds_enc_ertplus_clear_tags(enc);
 	}
 	
 	/* Reset eRT segment counter to 0 on preset load
@@ -1219,7 +1219,7 @@ static void rds_apply_preset(radio_t *radio)
 	     enc->use_2b ? "2B" : "2A");
 	     
 	/* Rebuild group scheduler to reflect new configuration (e.g. enable/disable 10A PTYN) */
-	rds_scheduler_update(enc);
+	rds_enc_scheduler_update(enc);
 	
 	/* Dynamic PS: must be applied AFTER scheduler update so timing
 	 * estimates can inspect the actual group_sched_buffer[] */
@@ -1229,7 +1229,7 @@ static void rds_apply_preset(radio_t *radio)
 		                       p->dps.repeat ? p->dps.repeat : RDS_DPS_REPEAT_NORMAL,
 		                       p->dps.delimiter);
 	} else {
-		rds_enc_stop_dynamic_ps(enc);
+		rds_enc_clear_dynamic_ps(enc);
 	}
 }
 

@@ -1214,7 +1214,7 @@ void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable)
 	rds->paging.enabled = enable;
 	if (!enable)
 		rds_paging_queue_destroy(&rds->paging);
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 }
 
 /* Public API: set RPC value for Group 1A */
@@ -1227,7 +1227,7 @@ void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc)
 void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enhanced = enable;
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 }
 
 /* Public API: set OPC for Group 1A (0=no enhanced paging, 1-15=operator) */
@@ -2200,7 +2200,7 @@ static void rds_build_group_4a(rds_encoder_t *rds, uint8_t *group)
 {
 	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
-	time_t now = time(NULL) + rds->ct_time_offset;
+	time_t now = time(NULL) + rds->ct_correction;
 	struct tm *t = gmtime(&now);
 	
 	/* Calculate MJD using helper function */
@@ -2238,8 +2238,13 @@ static void rds_build_group_4a(rds_encoder_t *rds, uint8_t *group)
 	b3 = ((mjd & 0x7FFF) << 1) | ((hour >> 4) & 1);
 	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
 	
-	/* Block D: Hour 3-0, Min, Offset */
-	b4 = ((hour & 0x0F) << 12) | (min << 6) | (offset_half_hours & 0x1F);
+	/* Block D: Hour 3-0, Min, Offset (sign+magnitude encoding) */
+	int tz_encoded;
+	if (offset_half_hours < 0)
+		tz_encoded = 0x20 | ((-offset_half_hours) & 0x1F);
+	else
+		tz_encoded = offset_half_hours & 0x1F;
+	b4 = ((hour & 0x0F) << 12) | (min << 6) | tz_encoded;
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 	
 	/* Pack into bytes using shared function */
@@ -2911,7 +2916,7 @@ static void rds_build_group_13a_paging(rds_encoder_t *rds, uint8_t *group)
  * Group 4A (CT) remains a high-priority interrupt at minute boundaries.
  * ============================================================ */
 
-void rds_scheduler_update(rds_encoder_t *rds)
+void rds_enc_scheduler_update(rds_encoder_t *rds)
 {
 	rds->group_sched_len = 0;
 	rds->group_sched_index = 0;
@@ -3140,7 +3145,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 	 * Accuracy: within +/-100ms of UTC minute edge.
 	 * Rate: 1 group per minute (not per second). */
 	if (rds->ct_enabled) {
-		time_t now = time(NULL) + rds->ct_time_offset;
+		time_t now = time(NULL) + rds->ct_correction;
 		struct tm t_now_buf, t_last_buf;
 		
 		/* Use reentrant gmtime_r if available, or just copy immediately.
@@ -3187,7 +3192,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 	
 	/* Safety check: if sequence empty, fallback to 0A/0B */
 	if (rds->group_sched_len == 0) {
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 		if (rds->group_sched_len == 0) { // Should not happen
 			if (rds->use_0b)
 				rds_build_group_0b(rds, rds->group_buffer);
@@ -3550,7 +3555,7 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 
 	
 	/* Initialize Group Scheduler */
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 
 	/* Generate first group */
 	rds_generate_group(rds);
@@ -3710,7 +3715,7 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
  * starts transmitting with the new A/B flag.
  *
  * Returns encoded length, or -1 on error. */
-void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
+void rds_enc_set_rt(rds_encoder_t *rds, const char *rt)
 {
 	if (!rt) return;
 	
@@ -3764,10 +3769,10 @@ void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt)
 	}
 	
 	/* Update scheduler sequence (RT presence may have changed) */
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 }
 
-void rds_enc_clear_radiotext(rds_encoder_t *rds)
+void rds_enc_clear_rt(rds_encoder_t *rds)
 {
 	/* Set RT to 64 x 0x0D (carriage return) per EN 50067 */
 	memset(rds->rt, '\r', 64);
@@ -3775,18 +3780,23 @@ void rds_enc_clear_radiotext(rds_encoder_t *rds)
 	rds->rt_segment = 0;
 	
 	/* Update scheduler (RT presence may have changed) */
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	
 	LOGP(DRADIO, LOGL_INFO, "RDS: RadioText cleared\n");
 }
 
-void rds_enc_get_radiotext(const rds_encoder_t *rds, char *rt, size_t len)
+void rds_enc_get_rt(const rds_encoder_t *rds, char *rt, size_t len)
 {
 	if (!rt || len == 0) return;
 	
 	size_t copy_len = (len - 1 < 64) ? len - 1 : 64;
 	memcpy(rt, rds->rt, copy_len);
 	rt[copy_len] = '\0';
+}
+
+uint8_t rds_enc_get_rt_ab(const rds_encoder_t *rds)
+{
+	return rds->rt_ab;
 }
 
 void rds_enc_set_ta(rds_encoder_t *rds, int ta)
@@ -4407,7 +4417,7 @@ void rds_enc_set_dynamic_ps(rds_encoder_t *rds, const char *text,
 	     "  dynamic text.\n");
 }
 
-void rds_enc_stop_dynamic_ps(rds_encoder_t *rds)
+void rds_enc_clear_dynamic_ps(rds_encoder_t *rds)
 {
 	if (!rds)
 		return;
@@ -4418,7 +4428,7 @@ void rds_enc_stop_dynamic_ps(rds_encoder_t *rds)
 	}
 }
 
-int rds_enc_is_dynamic_ps(const rds_encoder_t *rds)
+int rds_enc_get_dynamic_ps_active(const rds_encoder_t *rds)
 {
 	return rds ? rds->ps_dyn_enabled : 0;
 }
@@ -4613,7 +4623,7 @@ int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,
 }
 
 /* eRT+ API (same as RT+ but for eRT) */
-int rds_enc_ert_plus_set_tags(rds_encoder_t *rds,
+int rds_enc_ertplus_set_tags(rds_encoder_t *rds,
                               uint8_t ct1, uint8_t start1, uint8_t len1,
                               uint8_t ct2, uint8_t start2, uint8_t len2)
 {
@@ -4707,7 +4717,7 @@ int rds_enc_ert_plus_set_tags(rds_encoder_t *rds,
 	return 0;
 }
 
-void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds)
+void rds_enc_ertplus_clear_tags(rds_encoder_t *rds)
 {
 	rds->ert_plus.tag_count = 0;
 	rds->ert_plus.item_running = 0;
@@ -4716,7 +4726,7 @@ void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds)
 	     rds->ert_plus.toggle, rds->ert_plus.item_running);
 }
 
-void rds_enc_ert_plus_set_toggle(rds_encoder_t *rds, int toggle)
+void rds_enc_ertplus_set_toggle(rds_encoder_t *rds, int toggle)
 {
 	int old = rds->ert_plus.toggle;
 	rds->ert_plus.toggle = toggle ? 1 : 0;
@@ -4724,7 +4734,7 @@ void rds_enc_ert_plus_set_toggle(rds_encoder_t *rds, int toggle)
 		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: toggle changed %d->%d\n", old, rds->ert_plus.toggle);
 }
 
-void rds_enc_ert_plus_set_item_running(rds_encoder_t *rds, int running)
+void rds_enc_ertplus_set_item_running(rds_encoder_t *rds, int running)
 {
 	int old = rds->ert_plus.item_running;
 	rds->ert_plus.item_running = running ? 1 : 0;
@@ -4732,12 +4742,12 @@ void rds_enc_ert_plus_set_item_running(rds_encoder_t *rds, int running)
 		LOGP(DRADIO, LOGL_INFO, "RDS eRT+: item_running changed %d->%d\n", old, rds->ert_plus.item_running);
 }
 
-int rds_enc_ert_plus_get_tag_count(const rds_encoder_t *rds)
+int rds_enc_ertplus_get_tag_count(const rds_encoder_t *rds)
 {
 	return rds->ert_plus.tag_count;
 }
 
-int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
+int rds_enc_ertplus_get_tag(const rds_encoder_t *rds, int index,
                               uint8_t *content_type, uint8_t *start, uint8_t *length)
 {
 	if (index < 0 || index >= rds->ert_plus.tag_count) {
@@ -5150,7 +5160,7 @@ void rds_enc_get_ert(const rds_encoder_t *rds, uint8_t *text, size_t *len, size_
 /* Set eRT text with explicit A/B flag control
  * ab_flag: -1 = auto-flip, 0 = force A, 1 = force B
  */
-void rds_enc_set_ert_with_ab(rds_encoder_t *rds, const uint8_t *text, size_t len, int ab_flag)
+void rds_enc_set_ert_and_ab(rds_encoder_t *rds, const uint8_t *text, size_t len, int ab_flag)
 {
 	if (ab_flag < 0) {
 		/* Auto-flip handled by rds_enc_set_ert */
@@ -5286,12 +5296,12 @@ int rds_dec_rtplus_get_item_running(const rds_decoder_t *rds)
 	return rds->rtplus.item_running;
 }
 
-int rds_dec_ert_plus_get_tag_count(const rds_decoder_t *rds)
+int rds_dec_ertplus_get_tag_count(const rds_decoder_t *rds)
 {
 	return rds->ert_plus.tag_count;
 }
 
-int rds_dec_ert_plus_get_tag(const rds_decoder_t *rds, int index,
+int rds_dec_ertplus_get_tag(const rds_decoder_t *rds, int index,
                               uint8_t *content_type, uint8_t *start, uint8_t *length)
 {
 	if (index < 0 || index >= rds->ert_plus.tag_count) {
@@ -5303,6 +5313,21 @@ int rds_dec_ert_plus_get_tag(const rds_decoder_t *rds, int index,
 	if (length) *length = rds->ert_plus.tags[index].length;
 	
 	return 0;
+}
+
+int rds_dec_ertplus_get_toggle(const rds_decoder_t *rds)
+{
+	return rds->ert_plus.toggle;
+}
+
+int rds_dec_ertplus_get_item_running(const rds_decoder_t *rds)
+{
+	return rds->ert_plus.item_running;
+}
+
+int rds_dec_get_ert_ab(const rds_decoder_t *rds)
+{
+	return rds->ert_ab;
 }
 
 void rds_dec_get_ert(const rds_decoder_t *rds, uint8_t *text, size_t *len, size_t max_len)
@@ -5339,6 +5364,154 @@ int rds_dec_get_ert_direction(const rds_decoder_t *rds)
 int rds_dec_get_ert_chartable(const rds_decoder_t *rds)
 {
 	return rds->ert_dec.chartable;
+}
+
+/* Decoder getters — basic fields */
+uint8_t rds_dec_get_pty(const rds_decoder_t *rds)
+{
+	return rds ? rds->pty : 0;
+}
+
+uint8_t rds_dec_get_tp(const rds_decoder_t *rds)
+{
+	return rds ? rds->tp : 0;
+}
+
+uint8_t rds_dec_get_ta(const rds_decoder_t *rds)
+{
+	return rds ? rds->ta : 0;
+}
+
+uint8_t rds_dec_get_ms(const rds_decoder_t *rds)
+{
+	return rds ? rds->ms : 0;
+}
+
+void rds_dec_get_di(const rds_decoder_t *rds, int *stereo, int *artificial, int *compressed, int *dynamic_pty)
+{
+	if (!rds) {
+		if (stereo) *stereo = 0;
+		if (artificial) *artificial = 0;
+		if (compressed) *compressed = 0;
+		if (dynamic_pty) *dynamic_pty = 0;
+		return;
+	}
+	if (stereo) *stereo = rds->di_stereo;
+	if (artificial) *artificial = rds->di_artificial_head;
+	if (compressed) *compressed = rds->di_compressed;
+	if (dynamic_pty) *dynamic_pty = rds->di_dynamic_pty;
+}
+
+void rds_dec_get_ptyn(const rds_decoder_t *rds, char *ptyn, size_t len)
+{
+	if (!ptyn || !len) return;
+	if (!rds) { ptyn[0] = '\0'; return; }
+	strncpy(ptyn, rds->ptyn, len - 1);
+	ptyn[len - 1] = '\0';
+}
+
+uint8_t rds_dec_get_ptyn_ab(const rds_decoder_t *rds)
+{
+	return rds ? rds->ptyn_ab : 0;
+}
+
+void rds_dec_get_pin(const rds_decoder_t *rds, uint8_t *day, uint8_t *hour, uint8_t *minute)
+{
+	if (day) *day = rds ? rds->pin_day : 0;
+	if (hour) *hour = rds ? rds->pin_hour : 0;
+	if (minute) *minute = rds ? rds->pin_minute : 0;
+}
+
+int rds_dec_get_ct(const rds_decoder_t *rds, time_t *timestamp, int8_t *local_offset, int32_t *delta)
+{
+	if (!rds || !rds->ct_valid) return 0;
+	if (timestamp) *timestamp = rds->ct_utc_timestamp;
+	if (local_offset) *local_offset = rds->ct_offset;
+	if (delta) *delta = (int32_t)(rds->ct_utc_timestamp - rds->ct_rx_sys_time);
+	return 1;
+}
+
+int rds_dec_get_af_a_count(const rds_decoder_t *rds)
+{
+	if (!rds) return 0;
+	return rds->af_method_a_dec.last_good_count;
+}
+
+int rds_dec_get_af_a_freq(const rds_decoder_t *rds, int index, uint16_t *freq, uint8_t *type)
+{
+	if (!rds || index < 0 || index >= rds->af_method_a_dec.last_good_count)
+		return -1;
+	if (freq) *freq = rds->af_method_a_dec.last_good_freq[index];
+	if (type) *type = rds->af_method_a_dec.last_good_type[index];
+	return 0;
+}
+
+int rds_dec_get_af_b_list_count(const rds_decoder_t *rds)
+{
+	if (!rds) return 0;
+	return rds->af_method_b_dec.history_count;
+}
+
+int rds_dec_get_af_b_list(const rds_decoder_t *rds, int index,
+			  uint16_t *pi, uint16_t *tuning_freq,
+			  int *af_count, int *complete)
+{
+	if (!rds || index < 0 || index >= rds->af_method_b_dec.history_count)
+		return -1;
+	const rds_af_method_b_history_t *h = &rds->af_method_b_dec.history[index];
+	if (pi) *pi = h->pi;
+	if (tuning_freq) *tuning_freq = h->tuning_freq;
+	if (af_count) *af_count = h->received_count;
+	if (complete) *complete = h->complete;
+	return 0;
+}
+
+int rds_dec_get_af_b_freq(const rds_decoder_t *rds, int list_index,
+			  int af_index, uint16_t *freq, uint8_t *is_regional)
+{
+	if (!rds || list_index < 0 || list_index >= rds->af_method_b_dec.history_count)
+		return -1;
+	const rds_af_method_b_history_t *h = &rds->af_method_b_dec.history[list_index];
+	if (af_index < 0 || af_index >= h->received_count)
+		return -1;
+	if (freq) *freq = h->af_freq[af_index];
+	if (is_regional) *is_regional = h->af_is_regional[af_index];
+	return 0;
+}
+
+int rds_dec_get_eon_count(const rds_decoder_t *rds)
+{
+	return rds ? rds->eon_count : 0;
+}
+
+const rds_eon_entry_t *rds_dec_get_eon_entry(const rds_decoder_t *rds, int index)
+{
+	if (!rds || index < 0 || index >= rds->eon_count) return NULL;
+	return &rds->eon[index];
+}
+
+const rds_eon_entry_t *rds_dec_get_eon_by_pi(const rds_decoder_t *rds, uint16_t pi)
+{
+	if (!rds) return NULL;
+	for (int i = 0; i < rds->eon_count; i++) {
+		if (rds->eon[i].pi == pi)
+			return &rds->eon[i];
+	}
+	return NULL;
+}
+
+int rds_dec_get_oda_count(const rds_decoder_t *rds)
+{
+	return rds ? rds->oda_app_count : 0;
+}
+
+int rds_dec_get_oda(const rds_decoder_t *rds, int index, uint8_t *carrier_group, uint16_t *aid, uint16_t *message)
+{
+	if (!rds || index < 0 || index >= rds->oda_app_count) return -1;
+	if (carrier_group) *carrier_group = rds->oda_apps[index].carrier_group;
+	if (aid) *aid = rds->oda_apps[index].aid;
+	if (message) *message = rds->oda_apps[index].message;
+	return 0;
 }
 
 void rds_enc_set_pty(rds_encoder_t *rds, uint8_t pty)
@@ -5380,7 +5553,7 @@ void rds_enc_set_ptyn(rds_encoder_t *rds, const char *ptyn)
 	rds->ptyn_segment = 0;
 	
 	/* Update scheduler (PTYN presence may have changed) */
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	
 	/* Convert RDS-encoded PTYN to Unicode for logging */
 	char ptyn_display[33];  /* 8 chars * 4 bytes UTF-8 max + 1 */
@@ -5395,7 +5568,7 @@ void rds_enc_clear_ptyn(rds_encoder_t *rds)
 	rds->ptyn_segment = 0;
 	
 	/* Update scheduler (PTYN presence may have changed) */
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	
 	LOGP(DRADIO, LOGL_INFO, "RDS: PTYN cleared\n");
 }
@@ -5407,6 +5580,11 @@ void rds_enc_get_ptyn(const rds_encoder_t *rds, char *ptyn, size_t len)
 	size_t copy_len = (len - 1 < 8) ? len - 1 : 8;
 	memcpy(ptyn, rds->ptyn, copy_len);
 	ptyn[copy_len] = '\0';
+}
+
+uint8_t rds_enc_get_ptyn_ab(const rds_encoder_t *rds)
+{
+	return rds->ptyn_ab;
 }
 
 void rds_enc_set_tp(rds_encoder_t *rds, int tp)
@@ -5453,7 +5631,7 @@ void rds_enc_set_ecc(rds_encoder_t *rds, uint8_t ecc)
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 0 (ECC) set to 0x%02X (%s)\n",
 		     ecc, rds_get_ecc_name(ecc));
 		/* Update scheduler (ECC presence affects Group 1A scheduling) */
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5463,7 +5641,7 @@ void rds_enc_clear_ecc(rds_encoder_t *rds)
 		rds->ecc = 0;
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 0 (ECC) cleared\n");
 		/* Update scheduler (ECC presence affects Group 1A scheduling) */
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5486,7 +5664,7 @@ void rds_enc_set_language(rds_encoder_t *rds, uint8_t lang)
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 3 (Language) set to %d (%s)\n",
 		     lang, rds_get_language_name(lang));
 		/* Update scheduler (language presence affects Group 1A scheduling) */
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5496,7 +5674,7 @@ void rds_enc_clear_language(rds_encoder_t *rds)
 		rds->language = 0;
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 3 (Language) cleared\n");
 		/* Update scheduler (language presence affects Group 1A scheduling) */
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5554,7 +5732,7 @@ void rds_enc_set_tmc_id(rds_encoder_t *rds, uint16_t tmc_id)
 	if (old != rds->tmc_id) {
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 1 (TMC) set to 0x%03X (%d)\n",
 		     rds->tmc_id, rds->tmc_id);
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5563,7 +5741,7 @@ void rds_enc_clear_tmc_id(rds_encoder_t *rds)
 	if (rds->tmc_id != 0) {
 		rds->tmc_id = 0;
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 1 (TMC) cleared\n");
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5579,7 +5757,7 @@ void rds_enc_set_ews_channel(rds_encoder_t *rds, uint16_t ews)
 	if (old != rds->ews_channel) {
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 7 (EWS) set to %d (0x%03X)\n",
 		     rds->ews_channel, rds->ews_channel);
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5588,7 +5766,7 @@ void rds_enc_clear_ews_channel(rds_encoder_t *rds)
 	if (rds->ews_channel != 0) {
 		rds->ews_channel = 0;
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 7 (EWS) cleared\n");
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5604,7 +5782,7 @@ void rds_enc_set_slc_broadcaster(rds_encoder_t *rds, uint16_t data)
 	if (old != rds->slc_broadcaster) {
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 6 (Broadcaster) set to 0x%03X\n",
 		     rds->slc_broadcaster);
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5613,7 +5791,7 @@ void rds_enc_clear_slc_broadcaster(rds_encoder_t *rds)
 	if (rds->slc_broadcaster != 0) {
 		rds->slc_broadcaster = 0;
 		LOGP(DRADIO, LOGL_INFO, "RDS: SLC variant 6 (Broadcaster) cleared\n");
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5647,7 +5825,7 @@ void rds_enc_set_pin(rds_encoder_t *rds, uint8_t day, uint8_t hour, uint8_t minu
 		LOGP(DRADIO, LOGL_INFO, "RDS: PIN set to day=%d, %02d:%02d\n", 
 		     day, hour, minute);
 		/* Update scheduler (PIN presence affects Group 1A scheduling) */
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5659,7 +5837,7 @@ void rds_enc_clear_pin(rds_encoder_t *rds)
 		rds->pin_minute = 0;
 		LOGP(DRADIO, LOGL_INFO, "RDS: PIN cleared\n");
 		/* Update scheduler (PIN presence affects Group 1A scheduling) */
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -5668,6 +5846,48 @@ void rds_enc_get_pin(const rds_encoder_t *rds, uint8_t *day, uint8_t *hour, uint
 	if (day) *day = rds->pin_day;
 	if (hour) *hour = rds->pin_hour;
 	if (minute) *minute = rds->pin_minute;
+}
+
+/* CT (Clock-Time) encoder API */
+void rds_enc_set_ct_enabled(rds_encoder_t *rds, int enabled)
+{
+	if (rds) rds->ct_enabled = enabled ? 1 : 0;
+}
+
+int rds_enc_get_ct_enabled(const rds_encoder_t *rds)
+{
+	return rds ? rds->ct_enabled : 0;
+}
+
+void rds_enc_set_ct_local_offset(rds_encoder_t *rds, int8_t half_hours)
+{
+	if (!rds) return;
+	if (half_hours < -24 || half_hours > 24) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: Invalid CT local offset %d (must be -24..+24 half-hours)\n", half_hours);
+		return;
+	}
+	rds->local_offset = half_hours;
+}
+
+int8_t rds_enc_get_ct_local_offset(const rds_encoder_t *rds)
+{
+	return rds ? rds->local_offset : 0;
+}
+
+void rds_enc_set_ct_correction(rds_encoder_t *rds, time_t seconds)
+{
+	if (!rds) return;
+	time_t result = time(NULL) + seconds;
+	if (result < 0) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS: CT correction %ld would produce negative unix timestamp\n", (long)seconds);
+		return;
+	}
+	rds->ct_correction = seconds;
+}
+
+time_t rds_enc_get_ct_correction(const rds_encoder_t *rds)
+{
+	return rds ? rds->ct_correction : 0;
 }
 
 void rds_enc_set_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty)
@@ -5747,7 +5967,7 @@ int rds_enc_af_set_method_a(rds_encoder_t *rds, const char *af_string)
 		rds->af_method_a_segment = 0;
 		/* Update scheduler (AF presence affects Group 0 version) */
 		rds->use_0b = 0;  /* Method A requires Group 0A */
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 		return 0;
 	}
 	
@@ -5800,7 +6020,7 @@ int rds_enc_af_method_b_add(rds_encoder_t *rds, const char *af_string)
 	
 	/* Update scheduler (AF presence affects Group 0 version) */
 	rds->use_0b = 0;  /* Method B requires Group 0A */
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	
 	return 0;
 }
@@ -5863,7 +6083,7 @@ int rds_enc_af_method_b_add_list(rds_encoder_t *rds, uint16_t tuning_freq, const
 	
 	/* Update scheduler (AF presence affects Group 0 version) */
 	rds->use_0b = 0;  /* Method B requires Group 0A */
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	
 	return 0;
 }
@@ -5891,7 +6111,7 @@ int rds_enc_af_method_b_remove_list(rds_encoder_t *rds, uint16_t tuning_freq)
 			}
 			
 			LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list removed: tuning=%.1f\n", tuning_freq / 10.0);
-			rds_scheduler_update(rds);
+			rds_enc_scheduler_update(rds);
 			return 0;
 		}
 	}
@@ -5930,7 +6150,7 @@ int rds_enc_af_method_b_remove_list_by_index(rds_encoder_t *rds, int index)
 	}
 	
 	LOGP(DRADIO, LOGL_INFO, "RDS: AF Method B list[%d] removed: tuning=%.1f\n", index, tuning_freq / 10.0);
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	return 0;
 }
 
@@ -6065,7 +6285,7 @@ void rds_enc_af_clear(rds_encoder_t *rds)
 	rds->use_0b = 1;
 	
 	LOGP(DRADIO, LOGL_INFO, "RDS: AF cleared (both Method A and B)\n");
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 }
 
 int rds_enc_af_get_method(const rds_encoder_t *rds)
@@ -6144,7 +6364,7 @@ int rds_enc_eon_add(rds_encoder_t *rds, uint16_t pi, const char *ps, uint8_t pty
 			}
 			eon->pty = pty;
 			eon->tp = tp;
-			rds_scheduler_update(rds);
+			rds_enc_scheduler_update(rds);
 			return 0;
 		}
 	}
@@ -6171,7 +6391,7 @@ int rds_enc_eon_add(rds_encoder_t *rds, uint16_t pi, const char *ps, uint8_t pty
 	LOGP(DRADIO, LOGL_INFO, "RDS: EON entry added: PI=0x%04X, PS=\"%s\", PTY=%d, TP=%d\n",
 	     pi, eon_ps_display, pty, tp);
 	
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	return 0;
 }
 
@@ -6218,7 +6438,7 @@ int rds_enc_eon_remove(rds_encoder_t *rds, uint16_t pi)
 			}
 			
 			LOGP(DRADIO, LOGL_INFO, "RDS: EON entry removed: PI=0x%04X\n", pi);
-			rds_scheduler_update(rds);
+			rds_enc_scheduler_update(rds);
 			return 0;
 		}
 	}
@@ -6237,7 +6457,7 @@ void rds_enc_eon_clear(rds_encoder_t *rds)
 		rds->eon_tx_variant = 0;
 		
 		LOGP(DRADIO, LOGL_INFO, "RDS: EON cleared\n");
-		rds_scheduler_update(rds);
+		rds_enc_scheduler_update(rds);
 	}
 }
 
@@ -6303,7 +6523,7 @@ rds_eon_entry_t *rds_enc_eon_ensure(rds_encoder_t *rds, uint16_t pi)
 
 	LOGP(DRADIO, LOGL_INFO, "RDS: EON entry created: PI=0x%04X (index %d)\n",
 	     pi, rds->eon_tx_count - 1);
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	return eon;
 }
 
@@ -6374,7 +6594,7 @@ uint8_t rds_enc_eon_build_enable_flags(const rds_eon_entry_t *eon)
 	return flags;
 }
 
-int rds_enc_eon_set_pi(rds_encoder_t *rds, int index, uint16_t new_pi)
+int rds_enc_eon_set_pi_by_index(rds_encoder_t *rds, int index, uint16_t new_pi)
 {
 	if (index < 0 || index >= rds->eon_tx_count)
 		return -1;
@@ -6521,7 +6741,7 @@ int rds_enc_oda_add(rds_encoder_t *rds, uint8_t carrier_group, uint16_t aid, uin
 				rds->ert.carrier_group = carrier_group;
 			}
 			
-			rds_scheduler_update(rds);
+			rds_enc_scheduler_update(rds);
 			return 0;
 		}
 	}
@@ -6583,7 +6803,7 @@ int rds_enc_oda_add(rds_encoder_t *rds, uint8_t carrier_group, uint16_t aid, uin
 			     carrier_group >> 1, (carrier_group & 1) ? 'B' : 'A', message);
 	}
 	
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 	return 0;
 }
 
@@ -6604,7 +6824,7 @@ int rds_enc_oda_remove(rds_encoder_t *rds, uint16_t aid)
 			if (rds->debug)
 				LOGP(DRADIO, LOGL_DEBUG, "RDS ODA: Removed AID=0x%04X\n", aid);
 			
-			rds_scheduler_update(rds);
+			rds_enc_scheduler_update(rds);
 			return 0;
 		}
 	}
@@ -6620,7 +6840,7 @@ void rds_enc_oda_clear(rds_encoder_t *rds)
 	if (rds->debug)
 		LOGP(DRADIO, LOGL_DEBUG, "RDS ODA: Cleared all ODAs\n");
 	
-	rds_scheduler_update(rds);
+	rds_enc_scheduler_update(rds);
 }
 
 void rds_encoder_exit(rds_encoder_t *rds)
@@ -6631,7 +6851,7 @@ void rds_encoder_exit(rds_encoder_t *rds)
 		rds->waveform_biphase = NULL;
 	}
 	/* Close TX file input if open */
-	rds_encoder_close_tx_file(rds);
+	rds_enc_close_tx_file(rds);
 	/* Free TX log decoder if allocated */
 	if (rds->tx_log_decoder) {
 		rds_decoder_exit(rds->tx_log_decoder);
@@ -6657,7 +6877,7 @@ void rds_encoder_exit(rds_encoder_t *rds)
  * ============================================================ */
 
 /* Close any open TX file */
-void rds_encoder_close_tx_file(rds_encoder_t *rds)
+void rds_enc_close_tx_file(rds_encoder_t *rds)
 {
 	if (rds->tx_hexrds_file) {
 		fclose(rds->tx_hexrds_file);
@@ -6673,10 +6893,10 @@ void rds_encoder_close_tx_file(rds_encoder_t *rds)
 }
 
 /* Set TX input file for hexrds format */
-int rds_encoder_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename)
+int rds_enc_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename)
 {
 	/* Close any existing TX file */
-	rds_encoder_close_tx_file(rds);
+	rds_enc_close_tx_file(rds);
 	
 	if (!filename)
 		return 0;
@@ -6712,10 +6932,10 @@ int rds_encoder_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename)
 }
 
 /* Set TX input file for bitstream format */
-int rds_encoder_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename)
+int rds_enc_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename)
 {
 	/* Close any existing TX file */
-	rds_encoder_close_tx_file(rds);
+	rds_enc_close_tx_file(rds);
 	
 	if (!filename)
 		return 0;
@@ -8233,7 +8453,21 @@ static void rds_decode_group(rds_decoder_t *rds)
 				/* We need UTC timestamp. timegm is non-standard but common on Linux */
 #if defined(__GLIBC__) || defined(__linux__)
 				time_t rx_utc = timegm(&tm_rx);
+#else
+				/* Portable fallback: temporarily set TZ to UTC */
+				char *old_tz = getenv("TZ");
+				setenv("TZ", "UTC", 1);
+				tzset();
+				time_t rx_utc = mktime(&tm_rx);
+				if (old_tz) setenv("TZ", old_tz, 1);
+				else unsetenv("TZ");
+				tzset();
+#endif
 				time_t sys_now = time(NULL);
+				rds->ct_utc_timestamp = rx_utc;
+				rds->ct_rx_sys_time = sys_now;
+
+#if defined(__GLIBC__) || defined(__linux__)
 				double delta = difftime(rx_utc, sys_now);
 				
 				LOGP(DRADIO, LOGL_INFO, "RDS 4A: Time Delta: RX (UTC) is %.0f seconds %s system time\n",
@@ -10067,6 +10301,16 @@ int rds_dec_get_rt(rds_decoder_t *rds, char *rt)
 	return 0;
 }
 
+uint8_t rds_dec_get_rt_ab(const rds_decoder_t *rds)
+{
+	return rds ? rds->rt_ab : 0;
+}
+
+uint8_t rds_dec_get_rt_version(const rds_decoder_t *rds)
+{
+	return rds ? rds->rt_display_version : 0xFF;
+}
+
 uint8_t rds_dec_get_ecc(const rds_decoder_t *rds)
 {
 	return rds->ecc;
@@ -10245,20 +10489,25 @@ void rds_decoder_status(rds_decoder_t *rds)
 	}
 
 	/* Alternative Frequencies (Method B History) */
-	if (rds->af_method_b_dec.history_count > 0) {
+	if (rds_dec_get_af_b_list_count(rds) > 0) {
 		LOGP(DRADIO, LOGL_NOTICE, "AF Method B History :\n");
-		for (int i = 0; i < rds->af_method_b_dec.history_count; i++) {
-			rds_af_method_b_history_t *h = &rds->af_method_b_dec.history[i];
+		for (int i = 0; i < rds_dec_get_af_b_list_count(rds); i++) {
+			uint16_t pi, tuning_freq;
+			int af_count, complete;
+			rds_dec_get_af_b_list(rds, i, &pi, &tuning_freq, &af_count, &complete);
 			char buf[256] = "";
 			int pos = 0;
 			
 			pos += snprintf(buf + pos, sizeof(buf) - pos, "  [%d] PI=%04X Tune=%.1f: ",
-			                i + 1, h->pi, h->tuning_freq / 10.0);
+			                i + 1, pi, tuning_freq / 10.0);
 			
-			for (int j = 0; j < h->received_count && pos < 240; j++) {
+			for (int j = 0; j < af_count && pos < 240; j++) {
+				uint16_t freq = 0;
+				uint8_t is_regional = 0;
+				rds_dec_get_af_b_freq(rds, i, j, &freq, &is_regional);
 				pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%.1f ",
-				                h->af_is_regional[j] ? "R" : "",
-				                h->af_freq[j] / 10.0);
+				                is_regional ? "R" : "",
+				                freq / 10.0);
 			}
 			LOGP(DRADIO, LOGL_NOTICE, "%s\n", buf);
 		}

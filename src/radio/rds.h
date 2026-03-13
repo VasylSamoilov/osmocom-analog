@@ -1651,7 +1651,7 @@ typedef struct rds_encoder {
 	char		ptyn[9];	/* Program Type Name (8 chars + NUL) */
 	uint8_t		ptyn_ab;	/* PTYN A/B flag */
 	int		ct_enabled;	/* Clock-Time transmission enabled */
-	time_t		ct_time_offset;	/* Offset from system time for CT (seconds) */
+	time_t		ct_correction;	/* Correction from system time for CT (seconds, +/-) */
 	int8_t		local_offset;	/* Local Time Offset from UTC (half-hours) */
 	/* PIN (Programme Item Number) - for THIS service (current PI)
 	 * IEC 62106:2015 S6.1.5.2 - receiver uses CT for month context */
@@ -1857,7 +1857,7 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 			 double pilot_phase, double pilot_phasestep);
 
 /* Set RadioText (can be changed dynamically) - converts UTF-8 to RDS charset */
-void rds_enc_set_radiotext(rds_encoder_t *rds, const char *rt);
+void rds_enc_set_rt(rds_encoder_t *rds, const char *rt);
 
 /* Set Traffic Announcement flag (1=enabled, 0=disabled) */
 void rds_enc_set_ta(rds_encoder_t *rds, int ta);
@@ -1908,14 +1908,14 @@ int rds_enc_rtplus_get_tag_count(const rds_encoder_t *rds);
 int rds_enc_rtplus_get_tag(const rds_encoder_t *rds, int index,
                             uint8_t *content_type, uint8_t *start, uint8_t *length);
 /* eRT+ API (same as RT+ but for eRT) */
-int rds_enc_ert_plus_set_tags(rds_encoder_t *rds,
+int rds_enc_ertplus_set_tags(rds_encoder_t *rds,
                               uint8_t ct1, uint8_t start1, uint8_t len1,
                               uint8_t ct2, uint8_t start2, uint8_t len2);
-void rds_enc_ert_plus_clear_tags(rds_encoder_t *rds);
-void rds_enc_ert_plus_set_toggle(rds_encoder_t *rds, int toggle);
-void rds_enc_ert_plus_set_item_running(rds_encoder_t *rds, int running);
-int rds_enc_ert_plus_get_tag_count(const rds_encoder_t *rds);
-int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
+void rds_enc_ertplus_clear_tags(rds_encoder_t *rds);
+void rds_enc_ertplus_set_toggle(rds_encoder_t *rds, int toggle);
+void rds_enc_ertplus_set_item_running(rds_encoder_t *rds, int running);
+int rds_enc_ertplus_get_tag_count(const rds_encoder_t *rds);
+int rds_enc_ertplus_get_tag(const rds_encoder_t *rds, int index,
                               uint8_t *content_type, uint8_t *start, uint8_t *length);
 
 /* ============================================================
@@ -1933,7 +1933,7 @@ int rds_enc_ert_plus_get_tag(const rds_encoder_t *rds, int index,
  *   rds_enc_set_ert(rds, (uint8_t *)"128 bytes of text...", 128);
  */
 void rds_enc_set_ert(rds_encoder_t *rds, const uint8_t *text, size_t len);
-void rds_enc_set_ert_with_ab(rds_encoder_t *rds, const uint8_t *text, size_t len, int ab_flag);
+void rds_enc_set_ert_and_ab(rds_encoder_t *rds, const uint8_t *text, size_t len, int ab_flag);
 void rds_enc_clear_ert(rds_encoder_t *rds);
 void rds_enc_get_ert(const rds_encoder_t *rds, uint8_t *text, size_t *len, size_t max_len);
 void rds_enc_set_ert_ab(rds_encoder_t *rds, int ab);
@@ -1952,7 +1952,7 @@ size_t rds_utf8_to_ucs2(const char *utf8, size_t utf8_len, uint8_t *ucs2, size_t
 
 
 /* Update group scheduler sequence (call after changing PTY, PTYN, EON, or ODA) */
-void rds_scheduler_update(rds_encoder_t *rds);
+void rds_enc_scheduler_update(rds_encoder_t *rds);
 
 /* ============================================================
  * Dynamic RDS Configuration API - Phase 1: Core Fields
@@ -1991,7 +1991,7 @@ void rds_enc_get_ps(const rds_encoder_t *rds, char *ps, size_t len);
  *                          RDS_DPS_PAGE, 1, '\n');
  *
  * To stop scrolling and return to static PS:
- *   rds_enc_stop_dynamic_ps(rds);
+ *   rds_enc_clear_dynamic_ps(rds);
  *   rds_enc_set_ps(rds, "RADIO 1 ");
  * ============================================================ */
 
@@ -2057,13 +2057,13 @@ void rds_enc_set_dynamic_ps(rds_encoder_t *rds, const char *text,
  * The current PS display value is frozen (not cleared).
  * Call rds_enc_set_ps() afterwards to set a new static PS.
  */
-void rds_enc_stop_dynamic_ps(rds_encoder_t *rds);
+void rds_enc_clear_dynamic_ps(rds_encoder_t *rds);
 
 /**
  * Check if dynamic PS is currently active.
  * @return 1 if scrolling/paging is active, 0 if static PS
  */
-int rds_enc_is_dynamic_ps(const rds_encoder_t *rds);
+int rds_enc_get_dynamic_ps_active(const rds_encoder_t *rds);
 
 /**
  * Get the full dynamic PS source text.
@@ -2080,6 +2080,7 @@ uint8_t rds_enc_get_pty(const rds_encoder_t *rds);
 void rds_enc_set_ptyn(rds_encoder_t *rds, const char *ptyn);
 void rds_enc_clear_ptyn(rds_encoder_t *rds);
 void rds_enc_get_ptyn(const rds_encoder_t *rds, char *ptyn, size_t len);
+uint8_t rds_enc_get_ptyn_ab(const rds_encoder_t *rds);
 
 /* TP (Traffic Programme) - 1 if station broadcasts traffic info */
 void rds_enc_set_tp(rds_encoder_t *rds, int tp);
@@ -2126,6 +2127,14 @@ uint16_t rds_enc_get_slc_broadcaster(const rds_encoder_t *rds);
 void rds_enc_set_pin(rds_encoder_t *rds, uint8_t day, uint8_t hour, uint8_t minute);
 void rds_enc_clear_pin(rds_encoder_t *rds);
 void rds_enc_get_pin(const rds_encoder_t *rds, uint8_t *day, uint8_t *hour, uint8_t *minute);
+
+/* CT (Clock-Time) - Group 4A transmission control */
+void rds_enc_set_ct_enabled(rds_encoder_t *rds, int enabled);
+int rds_enc_get_ct_enabled(const rds_encoder_t *rds);
+void rds_enc_set_ct_local_offset(rds_encoder_t *rds, int8_t half_hours);
+int8_t rds_enc_get_ct_local_offset(const rds_encoder_t *rds);
+void rds_enc_set_ct_correction(rds_encoder_t *rds, time_t seconds);
+time_t rds_enc_get_ct_correction(const rds_encoder_t *rds);
 
 /* SLC (Slow Labelling Codes) - Group 1A variant sequence query
  * Returns the active variant codes based on current encoder state.
@@ -2179,9 +2188,10 @@ int rds_enc_af_method_b_get_list(const rds_encoder_t *rds, int index, uint16_t *
  * ============================================================ */
 
 /* RadioText - Clear RadioText buffer */
-void rds_enc_clear_radiotext(rds_encoder_t *rds);
+void rds_enc_clear_rt(rds_encoder_t *rds);
 /* Get RadioText (converts RDS charset to UTF-8 for display) */
-void rds_enc_get_radiotext(const rds_encoder_t *rds, char *rt, size_t len);
+void rds_enc_get_rt(const rds_encoder_t *rds, char *rt, size_t len);
+uint8_t rds_enc_get_rt_ab(const rds_encoder_t *rds);
 
 /* ============================================================
  * Dynamic RDS Configuration API - Phase 5: EON
@@ -2199,7 +2209,7 @@ int rds_enc_eon_get_count(const rds_encoder_t *rds);
 int rds_enc_eon_get_entry(const rds_encoder_t *rds, int index, uint16_t *pi, char *ps, size_t ps_len, uint8_t *pty, uint8_t *tp, uint8_t *ta);
 
 /* EON field setters (by PI lookup) */
-int rds_enc_eon_set_pi(rds_encoder_t *rds, int index, uint16_t new_pi);
+int rds_enc_eon_set_pi_by_index(rds_encoder_t *rds, int index, uint16_t new_pi);
 int rds_enc_eon_set_ps(rds_encoder_t *rds, uint16_t pi, const char *ps);
 int rds_enc_eon_set_pty(rds_encoder_t *rds, uint16_t pi, uint8_t pty);
 int rds_enc_eon_set_tp(rds_encoder_t *rds, uint16_t pi, uint8_t tp);
@@ -2261,9 +2271,9 @@ uint8_t rds_enc_paging_get_pac(const rds_encoder_t *rds);
 uint16_t rds_enc_paging_get_cc(const rds_encoder_t *rds);
 
 /* TX File Input (bypasses encoder, transmits from file) */
-int rds_encoder_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename);
-int rds_encoder_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename);
-void rds_encoder_close_tx_file(rds_encoder_t *rds);
+int rds_enc_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename);
+int rds_enc_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename);
+void rds_enc_close_tx_file(rds_encoder_t *rds);
 
 /* Cleanup */
 void rds_encoder_exit(rds_encoder_t *rds);
@@ -2469,6 +2479,8 @@ typedef struct rds_decoder {
 	int8_t		ct_offset;		/* Local time offset in half-hours (-24 to +24) */
 	int		ct_valid;		/* CT received at least once */
 	uint8_t		ct_status;		/* Status of CT decode */
+	time_t		ct_utc_timestamp;	/* Decoded CT as unix timestamp (UTC) */
+	time_t		ct_rx_sys_time;		/* System time(NULL) when CT was received */
 	
 	/* Group 10A: Programme Type Name (IEC 62106 S6.1.5.8) */
 	char		ptyn[9];		/* PTY Name (8 chars) */
@@ -2586,6 +2598,8 @@ int rds_dec_get_pi(rds_decoder_t *rds, uint16_t *pi);
 int rds_dec_get_ps(rds_decoder_t *rds, char *ps);
 /* Get decoded RT (RadioText) - rt must be at least 65 bytes, returns 1 if new */
 int rds_dec_get_rt(rds_decoder_t *rds, char *rt);
+uint8_t rds_dec_get_rt_ab(const rds_decoder_t *rds);
+uint8_t rds_dec_get_rt_version(const rds_decoder_t *rds);
 
 /* Get decoded SLC fields (Group 1A) */
 uint8_t rds_dec_get_ecc(const rds_decoder_t *rds);
@@ -2620,17 +2634,62 @@ int rds_dec_rtplus_get_tag(const rds_decoder_t *rds, int index,
 int rds_dec_rtplus_get_toggle(const rds_decoder_t *rds);
 int rds_dec_rtplus_get_item_running(const rds_decoder_t *rds);
 /* eRT+ Decoder Getters */
-int rds_dec_ert_plus_get_tag_count(const rds_decoder_t *rds);
-int rds_dec_ert_plus_get_tag(const rds_decoder_t *rds, int index,
+int rds_dec_ertplus_get_tag_count(const rds_decoder_t *rds);
+int rds_dec_ertplus_get_tag(const rds_decoder_t *rds, int index,
                               uint8_t *content_type, uint8_t *start, uint8_t *length);
+int rds_dec_ertplus_get_toggle(const rds_decoder_t *rds);
+int rds_dec_ertplus_get_item_running(const rds_decoder_t *rds);
 /* eRT Decoder Getters */
 void rds_dec_get_ert(const rds_decoder_t *rds, uint8_t *text, size_t *len, size_t max_len);
+int rds_dec_get_ert_ab(const rds_decoder_t *rds);
 int rds_dec_get_ert_encoding(const rds_decoder_t *rds);
 int rds_dec_get_ert_direction(const rds_decoder_t *rds);
 /* Get eRT chartable value (RDS_ERT_CHARTABLE_E3 to RDS_ERT_CHARTABLE_MAX)
  * Default: RDS_ERT_CHARTABLE_DEFAULT (RDS_ERT_CHARTABLE_E3)
  * Note: Chartable is not used for character mapping for now. */
 int rds_dec_get_ert_chartable(const rds_decoder_t *rds);
+
+/* Decoder getters — basic fields (Group 0A/0B) */
+uint8_t rds_dec_get_pty(const rds_decoder_t *rds);
+uint8_t rds_dec_get_tp(const rds_decoder_t *rds);
+uint8_t rds_dec_get_ta(const rds_decoder_t *rds);
+uint8_t rds_dec_get_ms(const rds_decoder_t *rds);
+void rds_dec_get_di(const rds_decoder_t *rds, int *stereo, int *artificial, int *compressed, int *dynamic_pty);
+
+/* Decoder getters — PTYN (Group 10A) */
+void rds_dec_get_ptyn(const rds_decoder_t *rds, char *ptyn, size_t len);
+uint8_t rds_dec_get_ptyn_ab(const rds_decoder_t *rds);
+
+/* Decoder getters — PIN (Group 1A/1B) */
+void rds_dec_get_pin(const rds_decoder_t *rds, uint8_t *day, uint8_t *hour, uint8_t *minute);
+
+/* Decoder getters — CT (Group 4A)
+ * timestamp: decoded UTC as unix timestamp
+ * local_offset: timezone offset in half-hours as received
+ * delta: (received UTC timestamp) - (system time at reception), in seconds
+ * Returns 1 if CT valid, 0 if not */
+int rds_dec_get_ct(const rds_decoder_t *rds, time_t *timestamp, int8_t *local_offset, int32_t *delta);
+
+/* Decoder getters — AF Method A */
+int rds_dec_get_af_a_count(const rds_decoder_t *rds);
+int rds_dec_get_af_a_freq(const rds_decoder_t *rds, int index, uint16_t *freq, uint8_t *type);
+
+/* Decoder getters — AF Method B (history of completed lists) */
+int rds_dec_get_af_b_list_count(const rds_decoder_t *rds);
+int rds_dec_get_af_b_list(const rds_decoder_t *rds, int index,
+			  uint16_t *pi, uint16_t *tuning_freq,
+			  int *af_count, int *complete);
+int rds_dec_get_af_b_freq(const rds_decoder_t *rds, int list_index,
+			  int af_index, uint16_t *freq, uint8_t *is_regional);
+
+/* Decoder getters — EON (Group 14A/14B) */
+int rds_dec_get_eon_count(const rds_decoder_t *rds);
+const rds_eon_entry_t *rds_dec_get_eon_entry(const rds_decoder_t *rds, int index);
+const rds_eon_entry_t *rds_dec_get_eon_by_pi(const rds_decoder_t *rds, uint16_t pi);
+
+/* Decoder getters — ODA registry (Group 3A) */
+int rds_dec_get_oda_count(const rds_decoder_t *rds);
+int rds_dec_get_oda(const rds_decoder_t *rds, int index, uint8_t *carrier_group, uint16_t *aid, uint16_t *message);
 
 /* eRT+ tag text extraction with character position addressing */
 size_t rds_ert_extract_tag_text(const rds_ert_decoder_t *ert, 
