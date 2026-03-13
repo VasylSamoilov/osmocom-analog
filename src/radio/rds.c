@@ -821,6 +821,19 @@ int rds_paging_bcd_decode(const uint8_t *nibbles, int count, char *digits, int m
 	return len;
 }
 
+/* Human-readable helpers for paging log fields */
+static const char *rds_paging_type_name(enum rds_paging_msg_type type)
+{
+	switch (type) {
+	case RDS_PAGING_TONE:  return "TONE";
+	case RDS_PAGING_NUM10: return "NUM10";
+	case RDS_PAGING_NUM18: return "NUM18";
+	case RDS_PAGING_ALPHA: return "ALPHA";
+	case RDS_PAGING_VNUM:  return "VNUM";
+	default:               return "?";
+	}
+}
+
 /* Pack 6-digit address into Block C (16 bits) and Block D upper byte (8 bits).
  * address = Y1Y2Z1Z2Z3Z4 as integer (e.g. 100466).
  * Block C: Y1(4) Y2(4) Z1(4) Z2(4)
@@ -863,6 +876,66 @@ uint32_t rds_paging_addr_unpack(uint16_t block_c, uint8_t block_d_hi)
 
 /* Forward declarations */
 static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg);
+
+/* Per-address call counter (EN 50067 M.3.5, P3-P0).
+ * Returns next counter value (1-15) for the given address.
+ * Counter wraps from 15 back to 1. */
+static uint8_t rds_paging_next_counter(rds_paging_enc_t *pag, uint32_t address)
+{
+	int slot = address % RDS_PAGING_ADDR_HASH_SIZE;
+	/* Simple linear probe — if slot is occupied by a different address,
+	 * scan forward. For typical paging loads this is fine. */
+	int i;
+	for (i = 0; i < RDS_PAGING_ADDR_HASH_SIZE; i++) {
+		int idx = (slot + i) % RDS_PAGING_ADDR_HASH_SIZE;
+		if (pag->call_counters[idx].counter == 0 ||
+		    pag->call_counters[idx].address == address) {
+			pag->call_counters[idx].address = address;
+			uint8_t c = pag->call_counters[idx].counter;
+			c = (c >= RDS_PAGING_COUNTER_MAX) ? 1 : c + 1;
+			pag->call_counters[idx].counter = c;
+			return c;
+		}
+	}
+	/* Table full — return 1 (best effort) */
+	return 1;
+}
+
+/* Build enhanced paging control byte (block D lower byte).
+ * EN 50067 M.3.5, Table M.12.
+ * Only applies to tone-only and alpha address groups.
+ * Basic 10/18-digit numeric uses a different format where the
+ * lower byte carries message digits, not a control byte. */
+static uint8_t rds_paging_build_ctrl(rds_paging_msg_t *msg)
+{
+	uint8_t ctrl = 0;
+
+	ctrl |= (msg->call_counter & 0x0F);		/* P3-P0: bits 3-0 */
+	ctrl |= (msg->is_repeat ? 1 : 0) << RDS_PAGING_CTRL_R_BIT;	/* R: bit 4 */
+
+	switch (msg->type) {
+	case RDS_PAGING_TONE:
+		/* E2 E1 E0 R P3 P2 P1 P0 */
+		ctrl |= (msg->tonetype & 0x07) << RDS_PAGING_CTRL_E_SHIFT;
+		break;
+	case RDS_PAGING_ALPHA:
+		/* 0 0 NI R P3 P2 P1 P0 */
+		ctrl |= (msg->ni & 1) << RDS_PAGING_CTRL_NI_BIT;
+		ctrl |= (RDS_PAGING_CTRL_MT_ALPHA << RDS_PAGING_CTRL_MT_SHIFT);
+		break;
+	case RDS_PAGING_NUM10:
+	case RDS_PAGING_NUM18:
+		/* Basic numeric: no control byte (lower byte = message digits) */
+		break;
+	case RDS_PAGING_VNUM:
+		/* 0 1 NI R P3 P2 P1 P0 */
+		ctrl |= (msg->ni & 1) << RDS_PAGING_CTRL_NI_BIT;
+		ctrl |= (RDS_PAGING_CTRL_MT_NUMERIC << RDS_PAGING_CTRL_MT_SHIFT);
+		break;
+	}
+
+	return ctrl;
+}
 
 static rds_paging_msg_t *rds_paging_msg_alloc(enum rds_paging_msg_type type,
 					       uint32_t address, const char *data,
@@ -949,17 +1022,36 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 			rds_paging_dequeue(pag);
 			pag->tx_msg = msg;
 			pag->ab_flag ^= 1;  /* Toggle A/B flag */
+
+			/* Assign call counter and R flag (EN 50067 M.3.5).
+			 * Original send: R=0, P3-P0 = next counter for address.
+			 * Repeat: R=1, P3-P0 = same counter as original. */
+			if (!msg->is_repeat) {
+				msg->call_counter = rds_paging_next_counter(pag, msg->address);
+				msg->is_repeat = 0;
+			}
+			/* is_repeat and call_counter are preserved on re-enqueue */
+
 			rds_paging_precompute(pag, msg);
-			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging: TX start addr=%06u type=%d AB=%d repeats_left=%d\n",
-			     msg->address, msg->type, pag->ab_flag, msg->repeats_left);
-			rds_scheduler_update(rds);
+			if (msg->type == RDS_PAGING_TONE)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX: %s addr=%02u-%04u grp=%d flag=%s tone=%d tx=%s cnt=%d repeat=%d/%d\n",
+				     rds_paging_type_name(msg->type),
+				     msg->address / 10000, msg->address % 10000,
+				     pag->tx_total_groups, PAG_AB(pag->ab_flag),
+				     msg->tonetype, PAG_R(msg->is_repeat), msg->call_counter,
+				     msg->repeats_left + 1, msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left));
+			else
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX: %s addr=%02u-%04u len=%d grp=%d flag=%s %s tx=%s cnt=%d repeat=%d/%d msg=\"%.*s\"\n",
+				     rds_paging_type_name(msg->type),
+				     msg->address / 10000, msg->address % 10000,
+				     msg->data_len, pag->tx_total_groups, PAG_AB(pag->ab_flag),
+				     PAG_NI(msg->ni), PAG_R(msg->is_repeat), msg->call_counter,
+				     msg->repeats_left + 1, msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left),
+				     msg->data_len, msg->data);
 			return;
 		}
 		break;  /* Head not ready yet, wait */
 	}
-
-	/* No message to send - update scheduler to remove 7A */
-	rds_scheduler_update(rds);
 }
 
 /* Called when a message transmission completes (tx_active becomes 0) */
@@ -974,6 +1066,7 @@ static void rds_paging_tx_complete(rds_encoder_t *rds)
 	if (msg->repeats_left > 0) {
 		/* Re-enqueue for retransmission */
 		msg->repeats_left--;
+		msg->is_repeat = 1;  /* R=1 for subsequent transmissions */
 		msg->next_send_time = time(NULL) + msg->repeat_interval;
 		pag->tx_msg = NULL;
 		rds_paging_enqueue(pag, msg);
@@ -988,18 +1081,21 @@ static void rds_paging_tx_complete(rds_encoder_t *rds)
 
 /* Public API: queue a tone-only page */
 int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
-			     int repeats, int interval_sec)
+			     int repeats, int interval_sec, uint8_t tonetype)
 {
 	rds_paging_msg_t *msg;
 
 	if (address > RDS_PAGING_ADDR_MAX)
 		return -1;
-	if (repeats < 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+	if (tonetype > 7) tonetype = 0;
 
-	msg = rds_paging_msg_alloc(RDS_PAGING_TONE, address, NULL, 0, repeats, interval_sec);
+	msg = rds_paging_msg_alloc(RDS_PAGING_TONE, address, NULL, 0, repeats - 1, interval_sec);
 	if (!msg)
 		return -1;
+	msg->tonetype = tonetype;
 
 	rds_paging_enqueue(&rds->paging, msg);
 	rds_paging_start_next(rds);
@@ -1008,7 +1104,8 @@ int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
 
 /* Public API: queue a numeric page (auto-selects 10 or 18 digit) */
 int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
-				const char *digits, int repeats, int interval_sec)
+				const char *digits, int repeats, int interval_sec,
+				uint8_t ni)
 {
 	rds_paging_msg_t *msg;
 	enum rds_paging_msg_type type;
@@ -1022,12 +1119,14 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	type = (len <= RDS_PAGING_NUM10_DIGITS) ? RDS_PAGING_NUM10 : RDS_PAGING_NUM18;
-	if (repeats < 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
 
-	msg = rds_paging_msg_alloc(type, address, digits, len, repeats, interval_sec);
+	msg = rds_paging_msg_alloc(type, address, digits, len, repeats - 1, interval_sec);
 	if (!msg)
 		return -1;
+	msg->ni = ni;
 
 	rds_paging_enqueue(&rds->paging, msg);
 	rds_paging_start_next(rds);
@@ -1036,7 +1135,8 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 
 /* Public API: queue an alphanumeric page */
 int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
-			      const char *text, int repeats, int interval_sec)
+			      const char *text, int repeats, int interval_sec,
+			      uint8_t ni)
 {
 	rds_paging_msg_t *msg;
 	int len;
@@ -1048,12 +1148,43 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 	if (len > RDS_PAGING_ALPHA_MAX)
 		len = RDS_PAGING_ALPHA_MAX;
 
-	if (repeats < 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
 
-	msg = rds_paging_msg_alloc(RDS_PAGING_ALPHA, address, text, len, repeats, interval_sec);
+	msg = rds_paging_msg_alloc(RDS_PAGING_ALPHA, address, text, len, repeats - 1, interval_sec);
 	if (!msg)
 		return -1;
+	msg->ni = ni;
+
+	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
+/* Public API: queue a variable-length numeric page (enhanced, up to 160 digits) */
+int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
+			     const char *digits, int repeats, int interval_sec,
+			     uint8_t ni)
+{
+	rds_paging_msg_t *msg;
+	int len;
+
+	if (address > RDS_PAGING_ADDR_MAX || !digits)
+		return -1;
+
+	len = strlen(digits);
+	if (len > RDS_PAGING_VNUM_MAX)
+		len = RDS_PAGING_VNUM_MAX;
+
+	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
+	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+
+	msg = rds_paging_msg_alloc(RDS_PAGING_VNUM, address, digits, len, repeats - 1, interval_sec);
+	if (!msg)
+		return -1;
+	msg->ni = ni;
 
 	rds_paging_enqueue(&rds->paging, msg);
 	rds_paging_start_next(rds);
@@ -2215,16 +2346,18 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 {
 	uint16_t addr_c;
 	uint8_t addr_d_hi;
+	uint8_t ctrl;
 	int idx = 0;
 
 	rds_paging_addr_pack(msg->address, &addr_c, &addr_d_hi);
+	ctrl = rds_paging_build_ctrl(msg);
 
 	switch (msg->type) {
 	case RDS_PAGING_TONE:
-		/* 1 group: PSAC=0, address only */
+		/* 1 group: PSAC=0, address + control byte */
 		pag->tx_psac_seq[0] = RDS_7A_PSAC_TONE;
 		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8);
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
 		pag->tx_total_groups = 1;
 		break;
 
@@ -2301,13 +2434,17 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		padded_len = ((len + 3) / 4) * 4;
 		ngroups = padded_len / 4;
 
-		/* Group 0: address */
+		/* Group 0: address + control byte */
 		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
 		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8);
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
 		idx = 1;
 
-		/* Data groups: 4 chars each, PSAC cycles 9-14 */
+		/* Data groups: 4 chars each, PSAC cycles 9-14.
+		 * Per EN 50067 Table M.4, the LAST data group uses PSAC=1111 (0xF)
+		 * which means "end of alphanumeric message: last four or fewer
+		 * message characters".  PSAC 0xF is NOT an empty sentinel — it
+		 * carries the final characters. */
 		for (i = 0; i < ngroups; i++) {
 			int ci = i * 4;
 			uint8_t c0 = (ci < len) ? (uint8_t)msg->data[ci] : 0x20;
@@ -2315,17 +2452,56 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			uint8_t c2 = (ci + 2 < len) ? (uint8_t)msg->data[ci + 2] : 0x20;
 			uint8_t c3 = (ci + 3 < len) ? (uint8_t)msg->data[ci + 3] : 0x20;
 
-			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (i % 6);
+			if (i == ngroups - 1)
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
+			else
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (i % 6);
 			pag->tx_blocks_c[idx] = (c0 << 8) | c1;
 			pag->tx_blocks_d[idx] = (c2 << 8) | c3;
 			idx++;
 		}
 
-		/* End marker */
-		pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
-		pag->tx_blocks_c[idx] = 0;
-		pag->tx_blocks_d[idx] = 0;
-		idx++;
+		pag->tx_total_groups = idx;
+		break;
+	}
+
+	case RDS_PAGING_VNUM: {
+		/* Enhanced variable-length numeric (EN 50067 M.3.5.5)
+		 * 8 BCD digits per data group, PSAC cycles 9-14, F=end.
+		 * BCD 0xA = space for padding. Max 160 digits. */
+		int len = msg->data_len;
+		int padded_len, ngroups, i;
+		uint8_t nibbles[RDS_PAGING_VNUM_MAX];
+
+		if (len > RDS_PAGING_VNUM_MAX)
+			len = RDS_PAGING_VNUM_MAX;
+
+		/* Encode digits to BCD nibbles, pad with 0xA (space) */
+		rds_paging_bcd_encode(msg->data, len, nibbles, len);
+		padded_len = ((len + 7) / 8) * 8;
+		for (i = len; i < padded_len; i++)
+			nibbles[i] = RDS_PAGING_BCD_SPACE;
+		ngroups = padded_len / 8;
+
+		/* Group 0: address + control byte */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
+		idx = 1;
+
+		/* Data groups: 8 BCD digits each */
+		for (i = 0; i < ngroups; i++) {
+			int ni = i * 8;
+			if (i == ngroups - 1)
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
+			else
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (i % 6);
+			pag->tx_blocks_c[idx] = (nibbles[ni] << 12) | (nibbles[ni+1] << 8) |
+						 (nibbles[ni+2] << 4) | nibbles[ni+3];
+			pag->tx_blocks_d[idx] = (nibbles[ni+4] << 12) | (nibbles[ni+5] << 8) |
+						 (nibbles[ni+6] << 4) | nibbles[ni+7];
+			idx++;
+		}
 
 		pag->tx_total_groups = idx;
 		break;
@@ -2372,8 +2548,10 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 	if (pag->tx_group_idx >= pag->tx_total_groups) {
 		/* Message transmission complete */
 		pag->tx_active = 0;
-		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging: message transmission complete (addr=%06u type=%d)\n",
-		     pag->tx_msg->address, pag->tx_msg->type);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX: %s addr=%02u-%04u complete (%d grp)\n",
+		     rds_paging_type_name(pag->tx_msg->type),
+		     pag->tx_msg->address / 10000, pag->tx_msg->address % 10000,
+		     pag->tx_total_groups);
 	}
 }
 
@@ -2507,8 +2685,10 @@ void rds_scheduler_update(rds_encoder_t *rds)
 		ADD_GRP(RDS_GROUP_14A);
 	}
 	
-	/* Block 7b: Paging (7A) - 2 slots when message active for adequate bandwidth */
-	if (rds->paging.enabled && (rds->paging.tx_active || rds->paging.queue_head)) {
+	/* Block 7b: Paging (7A) - always present when paging enabled.
+	 * The 7A builder handles idle state internally (pulls from queue
+	 * on demand or falls back to 0A/0B when nothing to send). */
+	if (rds->paging.enabled) {
 		ADD_GRP(RDS_GROUP_7A);
 		ADD_GRP(RDS_GROUP_7A);
 	}
@@ -2744,11 +2924,22 @@ static void rds_generate_group(rds_encoder_t *rds)
 		break;
 	/* Group 7A: Radio Paging or ODA */
 	case RDS_GROUP_7A:
-		if (rds->paging.enabled && rds->paging.tx_active) {
-			rds_build_group_7a(rds, rds->group_buffer);
+		if (rds->paging.enabled) {
+			/* Try to start a queued message if nothing active */
+			if (!rds->paging.tx_active)
+				rds_paging_start_next(rds);
+			if (rds->paging.tx_active) {
+				rds_build_group_7a(rds, rds->group_buffer);
+				break;
+			}
+			/* Nothing to send — fall back to 0A/0B */
+			if (rds->use_0b)
+				rds_build_group_0b(rds, rds->group_buffer);
+			else
+				rds_build_group_0a(rds, rds->group_buffer);
 			break;
 		}
-		/* Fall through to ODA routing when paging not active */
+		/* Fall through to ODA routing when paging not enabled */
 		goto oda_route;
 	/* Group 13A: Enhanced Radio Paging or ODA */
 	case RDS_GROUP_13A:
@@ -7823,8 +8014,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 
 		switch (psac) {
 		case RDS_7A_PSAC_TONE: {
-			/* Tone-only: single group, address in C+D */
+			/* Tone-only: single group, address in C+D upper, ctrl in D lower */
 			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			uint8_t ctrl = b4 & 0xFF;
 			pd->address = addr;
 			pd->msg_type = RDS_PAGING_TONE;
 			pd->msg_valid = 1;
@@ -7832,8 +8024,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->last_address = addr;
 			pd->last_msg[0] = '\0';
 			pd->last_msg_len = 0;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: TONE page addr=%02u-%04u AB=%d\n",
-			     addr / 10000, addr % 10000, ab_flag);
+			/* Enhanced control byte: E2E1E0 R P3P2P1P0 */
+			pd->last_ctrl = ctrl;
+			pd->last_tonetype = (ctrl >> RDS_PAGING_CTRL_E_SHIFT) & 0x07;
+			pd->last_r_flag = (ctrl >> RDS_PAGING_CTRL_R_BIT) & 1;
+			pd->last_call_counter = ctrl & 0x0F;
+			pd->last_ni = 0;
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: TONE addr=%02u-%04u flag=%s tone=%d tx=%s cnt=%d\n",
+			     addr / 10000, addr % 10000, PAG_AB(ab_flag),
+			     pd->last_tonetype, PAG_R(pd->last_r_flag), pd->last_call_counter);
 			break;
 		}
 		case RDS_7A_PSAC_NUM10_ADDR: {
@@ -7849,8 +8048,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->msg_len = 2;
 			pd->expected_psac = RDS_7A_PSAC_NUM10_DATA;
 			if (rds->verbose)
-				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM10 addr=%02u-%04u AB=%d (assembling: \"%.*s????????\")\n",
-				     addr / 10000, addr % 10000, ab_flag,
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM10 addr=%02u-%04u flag=%s (assembling: \"%.*s????????\")\n",
+				     addr / 10000, addr % 10000, PAG_AB(ab_flag),
 				     pd->msg_len, pd->msg_buf);
 			break;
 		}
@@ -7876,8 +8075,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->last_address = pd->address;
 			memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 			pd->last_msg_len = pd->msg_len;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM10 complete addr=%02u-%04u msg=\"%s\"\n",
-			     pd->address / 10000, pd->address % 10000, pd->last_msg);
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM10 addr=%02u-%04u len=%d msg=\"%s\"\n",
+			     pd->address / 10000, pd->address % 10000, pd->last_msg_len, pd->last_msg);
 			break;
 		}
 		case RDS_7A_PSAC_NUM18_ADDR: {
@@ -7893,8 +8092,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->msg_len = 2;
 			pd->expected_psac = RDS_7A_PSAC_NUM18_DATA1;
 			if (rds->verbose)
-				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM18 addr=%02u-%04u AB=%d (assembling: \"%.*s????????????????\")\n",
-				     addr / 10000, addr % 10000, ab_flag,
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u flag=%s (assembling: \"%.*s????????????????\")\n",
+				     addr / 10000, addr % 10000, PAG_AB(ab_flag),
 				     pd->msg_len, pd->msg_buf);
 			break;
 		}
@@ -7930,76 +8129,155 @@ static void rds_decode_group(rds_decoder_t *rds)
 				pd->last_address = pd->address;
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
-				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM18 complete addr=%02u-%04u msg=\"%s\"\n",
-				     pd->address / 10000, pd->address % 10000, pd->last_msg);
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u len=%d msg=\"%s\"\n",
+				     pd->address / 10000, pd->address % 10000, pd->last_msg_len, pd->last_msg);
 			} else {
 				pd->expected_psac = RDS_7A_PSAC_NUM18_DATA2;
 				if (rds->verbose)
-					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: NUM18 data1 addr=%02u-%04u (assembling: \"%.*s????????\")\n",
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u (assembling: \"%.*s????????\")\n",
 					     pd->address / 10000, pd->address % 10000,
 					     pd->msg_len, pd->msg_buf);
 			}
 			break;
 		}
 		case RDS_7A_PSAC_ALPHA_ADDR: {
-			/* Alphanumeric: address group */
+			/* PSAC=8: address group for alpha or enhanced variable-length.
+			 * Control byte in D lower byte determines message type via MT. */
 			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			uint8_t ctrl = b4 & 0xFF;
+			uint8_t mt = (ctrl >> RDS_PAGING_CTRL_MT_SHIFT) & 0x03;
 			pd->address = addr;
-			pd->msg_type = RDS_PAGING_ALPHA;
 			pd->assembling = 1;
 			pd->assembly_start = time(NULL);
 			pd->msg_len = 0;
 			pd->expected_psac = RDS_7A_PSAC_ALPHA_DATA_FIRST;
-			if (rds->verbose)
-				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA addr=%02u-%04u AB=%d (assembling: \"\")\n",
-				     addr / 10000, addr % 10000, ab_flag);
+			/* Enhanced control byte: MT1 MT0 NI R P3P2P1P0 */
+			pd->last_ctrl = ctrl;
+			pd->last_tonetype = 0;
+			pd->assembly_mt = mt;
+			pd->last_ni = (ctrl >> RDS_PAGING_CTRL_NI_BIT) & 1;
+			pd->last_r_flag = (ctrl >> RDS_PAGING_CTRL_R_BIT) & 1;
+			pd->last_call_counter = ctrl & 0x0F;
+			if (mt == RDS_PAGING_CTRL_MT_NUMERIC) {
+				pd->msg_type = RDS_PAGING_VNUM;
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: VNUM addr=%02u-%04u flag=%s %s tx=%s cnt=%d (assembling)\n",
+					     addr / 10000, addr % 10000, PAG_AB(ab_flag),
+					     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter);
+			} else {
+				pd->msg_type = RDS_PAGING_ALPHA;
+				if (rds->verbose)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: ALPHA addr=%02u-%04u flag=%s %s tx=%s cnt=%d (assembling)\n",
+					     addr / 10000, addr % 10000, PAG_AB(ab_flag),
+					     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter);
+			}
 			break;
 		}
 		case RDS_7A_PSAC_ALPHA_END: {
-			/* Alphanumeric: end-of-message */
-			if (!pd->assembling || pd->msg_type != RDS_PAGING_ALPHA) {
+			/* PSAC=0xF: end-of-message for alpha or vnum.
+			 * This group carries the final data, not an empty sentinel. */
+			if (!pd->assembling ||
+			    (pd->msg_type != RDS_PAGING_ALPHA && pd->msg_type != RDS_PAGING_VNUM)) {
 				if (rds->debug)
-					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: ALPHA end without address, ignoring\n");
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: end (PSAC=F) without address, ignoring\n");
 				break;
 			}
-			pd->assembling = 0;
-			pd->msg_buf[pd->msg_len] = '\0';
-			pd->msg_valid = 1;
-			pd->last_type = RDS_PAGING_ALPHA;
-			pd->last_address = pd->address;
-			memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
-			pd->last_msg_len = pd->msg_len;
-			{
-				char alpha_disp[257];
-				rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, alpha_disp, sizeof(alpha_disp));
-				LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA complete addr=%02u-%04u msg=\"%s\"\n",
-				     pd->address / 10000, pd->address % 10000, alpha_disp);
-			}
-			break;
-		}
-		default:
-			/* PSAC 9-14: alphanumeric data groups */
-			if (psac >= RDS_7A_PSAC_ALPHA_DATA_FIRST && psac <= RDS_7A_PSAC_ALPHA_DATA_LAST) {
-				if (!pd->assembling || pd->msg_type != RDS_PAGING_ALPHA) {
-					if (rds->debug)
-						LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: ALPHA data without address, ignoring\n");
-					break;
+			if (pd->msg_type == RDS_PAGING_VNUM) {
+				/* Extract 8 BCD digits from blocks C and D */
+				uint8_t nib[8] = {
+					(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
+					(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
+				};
+				char tmp[9];
+				int n = rds_paging_bcd_decode(nib, 8, tmp, sizeof(tmp));
+				if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
+					memcpy(pd->msg_buf + pd->msg_len, tmp, n);
+					pd->msg_len += n;
 				}
-				/* Extract 4 characters from blocks C and D */
+				/* Strip trailing BCD spaces */
+				while (pd->msg_len > 0 && pd->msg_buf[pd->msg_len - 1] == ' ')
+					pd->msg_len--;
+				pd->assembling = 0;
+				pd->msg_buf[pd->msg_len] = '\0';
+				pd->msg_valid = 1;
+				pd->last_type = RDS_PAGING_VNUM;
+				pd->last_address = pd->address;
+				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
+				pd->last_msg_len = pd->msg_len;
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: VNUM addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
+				     pd->address / 10000, pd->address % 10000, pd->last_msg_len,
+				     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter, pd->last_msg);
+			} else {
+				/* Alpha: extract up to 4 characters from blocks C and D */
 				if (pd->msg_len + 4 <= (int)sizeof(pd->msg_buf) - 1) {
 					pd->msg_buf[pd->msg_len++] = (b3 >> 8) & 0xFF;
 					pd->msg_buf[pd->msg_len++] = b3 & 0xFF;
 					pd->msg_buf[pd->msg_len++] = (b4 >> 8) & 0xFF;
 					pd->msg_buf[pd->msg_len++] = b4 & 0xFF;
 				}
+				/* Strip trailing padding (spaces 0x20) from final group */
+				while (pd->msg_len > 0 && pd->msg_buf[pd->msg_len - 1] == 0x20)
+					pd->msg_len--;
+				pd->assembling = 0;
+				pd->msg_buf[pd->msg_len] = '\0';
+				pd->msg_valid = 1;
+				pd->last_type = RDS_PAGING_ALPHA;
+				pd->last_address = pd->address;
+				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
+				pd->last_msg_len = pd->msg_len;
+				{
+					char alpha_disp[257];
+					rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, alpha_disp, sizeof(alpha_disp));
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: ALPHA addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
+					     pd->address / 10000, pd->address % 10000, pd->last_msg_len,
+					     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter, alpha_disp);
+				}
+			}
+			break;
+		}
+		default:
+			/* PSAC 9-14: data groups for alpha or vnum */
+			if (psac >= RDS_7A_PSAC_ALPHA_DATA_FIRST && psac <= RDS_7A_PSAC_ALPHA_DATA_LAST) {
+				if (!pd->assembling ||
+				    (pd->msg_type != RDS_PAGING_ALPHA && pd->msg_type != RDS_PAGING_VNUM)) {
+					if (rds->debug)
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: data (PSAC=%d) without address, ignoring\n", psac);
+					break;
+				}
+				if (pd->msg_type == RDS_PAGING_VNUM) {
+					/* 8 BCD digits per group */
+					uint8_t nib[8] = {
+						(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
+						(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
+					};
+					char tmp[9];
+					int n = rds_paging_bcd_decode(nib, 8, tmp, sizeof(tmp));
+					if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
+						memcpy(pd->msg_buf + pd->msg_len, tmp, n);
+						pd->msg_len += n;
+					}
+				} else {
+					/* 4 alpha characters per group */
+					if (pd->msg_len + 4 <= (int)sizeof(pd->msg_buf) - 1) {
+						pd->msg_buf[pd->msg_len++] = (b3 >> 8) & 0xFF;
+						pd->msg_buf[pd->msg_len++] = b3 & 0xFF;
+						pd->msg_buf[pd->msg_len++] = (b4 >> 8) & 0xFF;
+						pd->msg_buf[pd->msg_len++] = b4 & 0xFF;
+					}
+				}
 				/* Update expected PSAC (cycles 9-14) */
 				pd->expected_psac = (psac < RDS_7A_PSAC_ALPHA_DATA_LAST) ? psac + 1 : RDS_7A_PSAC_ALPHA_DATA_FIRST;
 				if (rds->verbose) {
-					char alpha_partial[257];
 					pd->msg_buf[pd->msg_len] = '\0';
-					rds_text_to_display((uint8_t *)pd->msg_buf, pd->msg_len, alpha_partial, sizeof(alpha_partial));
-					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA data PSAC=%d addr=%02u-%04u (assembling: \"%s...\")\n",
-					     psac, pd->address / 10000, pd->address % 10000, alpha_partial);
+					if (pd->msg_type == RDS_PAGING_VNUM) {
+						LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: VNUM data PSAC=%d addr=%02u-%04u (assembling: \"%s...\")\n",
+						     psac, pd->address / 10000, pd->address % 10000, pd->msg_buf);
+					} else {
+						char alpha_partial[257];
+						rds_text_to_display((uint8_t *)pd->msg_buf, pd->msg_len, alpha_partial, sizeof(alpha_partial));
+						LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA data PSAC=%d addr=%02u-%04u (assembling: \"%s...\")\n",
+						     psac, pd->address / 10000, pd->address % 10000, alpha_partial);
+					}
 				}
 			} else if (psac == RDS_7A_PSAC_INTL15) {
 				/* International 15-digit - log but don't decode */
@@ -9750,6 +10028,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 				case RDS_PAGING_NUM10: type_str = "NUM10"; break;
 				case RDS_PAGING_NUM18: type_str = "NUM18"; break;
 				case RDS_PAGING_ALPHA: type_str = "ALPHA"; break;
+				case RDS_PAGING_VNUM:  type_str = "VNUM";  break;
 				}
 				if (pd->last_msg_len > 0) {
 					char paging_disp[257];

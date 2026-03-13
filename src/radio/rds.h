@@ -699,12 +699,36 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_NUM18_DIGITS 18      /* 18-digit numeric message */
 #define RDS_PAGING_ALPHA_MAX    80      /* Maximum alphanumeric chars */
 #define RDS_PAGING_ALPHA_PER_GROUP 4    /* Characters per alpha data group */
+#define RDS_PAGING_VNUM_MAX     160     /* Maximum variable-length numeric digits */
+#define RDS_PAGING_VNUM_PER_GROUP 8     /* BCD digits per vnum data group */
 #define RDS_PAGING_MAX_GROUPS   22      /* Max groups for 80-char alpha */
 #define RDS_PAGING_QUEUE_MAX    16      /* Maximum queued messages */
-#define RDS_PAGING_DEFAULT_REPEATS   2  /* Default retransmission count */
+#define RDS_PAGING_DEFAULT_REPEATS   1  /* Default repeat count (1 = send once) */
 #define RDS_PAGING_DEFAULT_INTERVAL  5  /* Default repeat interval (seconds) */
 #define RDS_PAGING_DEFAULT_TIMEOUT  30  /* Default reassembly timeout (seconds) */
 #define RDS_PAGING_DEFAULT_RPC       4  /* Default RPC (groups 00-99, sync 00) */
+#define RDS_PAGING_COUNTER_MAX      15  /* P3-P0 max (wraps 15->1) */
+#define RDS_PAGING_ADDR_HASH_SIZE   64  /* Per-address call counter hash slots */
+
+/* Enhanced paging control byte (EN 50067 M.3.5, Table M.12)
+ * Block D lower byte of address group:
+ *   Tone-only:  E2 E1 E0 R P3 P2 P1 P0
+ *   Alpha/Num:  MT1 MT0 NI R P3 P2 P1 P0
+ * MT: 00=alpha, 01=numeric, 10=reserved, 11=functions
+ * NI: 0=national, 1=international
+ * R:  0=original, 1=repeat
+ * P3-P0: per-address call counter (1-15, 0=not implemented) */
+#define RDS_PAGING_CTRL_R_BIT       4   /* Bit position of R flag */
+#define RDS_PAGING_CTRL_NI_BIT      5   /* Bit position of NI flag */
+#define RDS_PAGING_CTRL_MT_SHIFT    6   /* Shift for MT1-MT0 */
+#define RDS_PAGING_CTRL_E_SHIFT     5   /* Shift for E2-E0 (tone-only) */
+#define RDS_PAGING_CTRL_MT_ALPHA    0   /* MT=00: alphanumeric */
+#define RDS_PAGING_CTRL_MT_NUMERIC  1   /* MT=01: variable-length numeric */
+
+/* Human-readable log helpers for paging fields */
+#define PAG_AB(x)  ((x) ? "B" : "A")        /* A/B flag: new-call toggle */
+#define PAG_R(x)   ((x) ? "rpt" : "orig")   /* R flag: original / repeat */
+#define PAG_NI(x)  ((x) ? "intl" : "nat")   /* NI: national / international */
 
 /* ============================================================
  * Group 13A Bit Fields (EN 50067 Annex M / IEC 62106)
@@ -1380,9 +1404,10 @@ typedef struct {
 /* Paging message types */
 enum rds_paging_msg_type {
 	RDS_PAGING_TONE  = 0,	/* Tone-only (1 group) */
-	RDS_PAGING_NUM10 = 1,	/* 10-digit numeric (2 groups) */
-	RDS_PAGING_NUM18 = 2,	/* 18-digit numeric (3 groups) */
+	RDS_PAGING_NUM10 = 1,	/* 10-digit numeric (2 groups, basic) */
+	RDS_PAGING_NUM18 = 2,	/* 18-digit numeric (3 groups, basic) */
 	RDS_PAGING_ALPHA = 3,	/* Alphanumeric up to 80 chars */
+	RDS_PAGING_VNUM  = 4,	/* Variable-length numeric up to 160 digits (enhanced) */
 };
 
 /* Queued paging message */
@@ -1390,11 +1415,16 @@ typedef struct rds_paging_msg {
 	struct rds_paging_msg	*next;
 	enum rds_paging_msg_type type;
 	uint32_t	address;	/* 6-digit BCD address (0-999999) */
-	char		data[81];	/* Message content (max 80 + NUL) */
+	char		data[161];	/* Message content (max 160 digits or 80 alpha + NUL) */
 	int		data_len;	/* Length of message data */
 	int		repeats_left;	/* Remaining retransmissions */
 	int		repeat_interval;/* Seconds between retransmissions */
 	time_t		next_send_time;	/* Earliest time for next transmission */
+	/* Enhanced paging (EN 50067 M.3.5) */
+	uint8_t		tonetype;	/* E2-E0 for tone-only (0-7, default 0) */
+	uint8_t		ni;		/* NI: 0=national (default), 1=international */
+	uint8_t		call_counter;	/* P3-P0 assigned at TX time (1-15, 0=initial) */
+	uint8_t		is_repeat;	/* R flag: 0=original, 1=repeat */
 } rds_paging_msg_t;
 
 /* Paging encoder state - embedded in rds_encoder_t */
@@ -1423,6 +1453,13 @@ typedef struct rds_paging_enc {
 	/* 13A enhanced paging state */
 	uint32_t	notify_bits;	/* Address notification bits (25 bits) */
 	uint8_t		cycle_selection;/* CS field (0-3) */
+
+	/* Per-address call counter (EN 50067 M.3.5, P3-P0)
+	 * Simple hash table: address % HASH_SIZE -> counter (1-15, wraps) */
+	struct {
+		uint32_t	address;
+		uint8_t		counter;	/* 1-15, 0=unused slot */
+	} call_counters[RDS_PAGING_ADDR_HASH_SIZE];
 } rds_paging_enc_t;
 
 /* Paging decoder state - embedded in rds_decoder_t */
@@ -1433,7 +1470,8 @@ typedef struct rds_paging_dec {
 	uint32_t	address;	/* Decoded address */
 	uint8_t		ab_flag;	/* Last seen A/B flag */
 	int		expected_psac;	/* Next expected PSAC value */
-	char		msg_buf[81];	/* Reassembly buffer */
+	uint8_t		assembly_mt;	/* MT from control byte (0=alpha, 1=vnum) */
+	char		msg_buf[161];	/* Reassembly buffer (max 160 digits or 80 alpha + NUL) */
 	int		msg_len;	/* Current length in buffer */
 	time_t		assembly_start;	/* Timestamp when assembly began */
 	int		timeout_sec;	/* Configurable reassembly timeout */
@@ -1442,8 +1480,15 @@ typedef struct rds_paging_dec {
 	int		msg_valid;	/* 1 if a complete message is available */
 	enum rds_paging_msg_type last_type;
 	uint32_t	last_address;
-	char		last_msg[81];
+	char		last_msg[161];
 	int		last_msg_len;
+
+	/* Enhanced paging control byte (EN 50067 M.3.5) */
+	uint8_t		last_ctrl;	/* Raw control byte from address group */
+	uint8_t		last_tonetype;	/* E2-E0 (tone-only, 0-7) */
+	uint8_t		last_ni;	/* NI: 0=national, 1=international */
+	uint8_t		last_r_flag;	/* R: 0=original, 1=repeat */
+	uint8_t		last_call_counter; /* P3-P0 (1-15, 0=not implemented) */
 
 	/* Group 1A RPC state */
 	uint8_t		rpc;		/* Last received Radio Paging Code */
@@ -2125,11 +2170,16 @@ uint32_t rds_paging_addr_unpack(uint16_t block_c, uint8_t block_d_hi);
 
 /* Queue paging messages */
 int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
-			     int repeats, int interval_sec);
+			     int repeats, int interval_sec, uint8_t tonetype);
 int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
-				const char *digits, int repeats, int interval_sec);
+				const char *digits, int repeats, int interval_sec,
+				uint8_t ni);
 int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
-			      const char *text, int repeats, int interval_sec);
+			      const char *text, int repeats, int interval_sec,
+			      uint8_t ni);
+int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
+			     const char *digits, int repeats, int interval_sec,
+			     uint8_t ni);
 
 /* Configuration */
 void rds_enc_paging_enable(rds_encoder_t *rds, int enable);

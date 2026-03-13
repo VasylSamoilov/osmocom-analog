@@ -205,6 +205,37 @@ int rds_encode_text(const char *utf8, uint8_t *rds_out, int max_len, int *warn_u
 int rds_validate_text(const char *utf8, const char *field_name);
 
 /* ============================================================
+ * Nokia RDS Pager Character Set
+ * ============================================================
+ * Empirically determined character map for the Nokia RDS Alpha
+ * Text pager. Subset of IEC 62106 Annex E figure E.1 with
+ * ~170 displayable characters out of 256.
+ *
+ * Key differences from full RDS charset:
+ *   - 0x24 = $ (dollar), not ¤ (currency sign)
+ *   - 0x5E/0x5F/0x60/0x7E/0x7F display as blank
+ *   - 0x7C = ¦ (broken bar), not | (pipe)
+ *   - 30 extended positions unsupported (Ş, IJ, ı, ª, α, ©,
+ *     ‰, π, €, º, ¹-³, ±, ÷, ¼-¾, Œ/œ, ŷ, Þ/þ, Ŋ/ŋ, Ŧ/ŧ, ð)
+ * ============================================================ */
+
+/* Decode: Nokia pager RDS code -> UTF-8 string */
+const char *nokia_pager_get_char(uint8_t code);
+
+/* Check if a given RDS code is displayable on the Nokia pager */
+int nokia_pager_is_displayable(uint8_t code);
+
+/* Encode UTF-8 string to Nokia pager RDS codes.
+ * Characters not in the Nokia pager charset are replaced with '?'.
+ * @param utf8: Input UTF-8 string
+ * @param out: Output RDS 8-bit buffer
+ * @param max_len: Maximum output length (80 for alpha paging)
+ * @param warn_unencodable: If non-NULL, set to 1 if any chars couldn't be encoded
+ * @return: Actual output length */
+int nokia_pager_encode_text(const char *utf8, uint8_t *out, int max_len,
+			    int *warn_unencodable);
+
+/* ============================================================
  * Linkage Information Codes (LIC)
  * IEC 62106 Group 14A
  * ============================================================ */

@@ -439,8 +439,23 @@ static void print_help(const char *arg0)
 	printf("    --rds-paging [rpc]\n");
 	printf("        Enable RDS Radio Paging (Group 7A/1A/13A). Implies --rds.\n");
 	printf("        Optional RPC value 0-31 (default 4: group desig 001, batt sync 00).\n");
-	printf("        Pipe: echo 'addr,type[,repeats,interval],msg' > %s\n", rds_paging_pipe_path);
-	printf("        Types: tone, numeric, numeric10, numeric18, alpha. Addr: 0-999999.\n");
+	printf("        FIFO format: address,type,options,message\n");
+	printf("        Types: tone, numeric, numeric10, numeric18, alpha, vnum\n");
+	printf("        Options (space-separated key=value, can be empty):\n");
+	printf("          repeat=N      total send count, 1-15 (default 1)\n");
+	printf("          interval=N    seconds between repeats (default 5)\n");
+	printf("          tonetype=N    E2-E0 tone type 0-7 (tone only, default 0)\n");
+	printf("          ni=0|1        national/international (default 0)\n");
+	printf("        Hex escapes: <0xCC> in message sends raw byte 0xCC\n");
+	printf("        Examples:\n");
+	printf("          echo '200078,tone,,' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,tone,tonetype=3 repeat=2,' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,numeric,,1234567890' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,alpha,,Hello World' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,alpha,repeat=3 interval=5,Hello, World!' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,alpha,,Test<0x0D>End' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,vnum,,31415926535' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,vnum,ni=1 repeat=2,0123456789' > %s\n", rds_paging_pipe_path);
 	printf("    --rds-paging-fifo <path>\n");
 	printf("        Path for the RDS paging FIFO (default %s).\n", RDS_PAGING_PIPE_DEFAULT);
 	printf("    --rds-hexrds-file <filename>\n");
@@ -845,100 +860,180 @@ static int handle_options(int short_option, int argi, char **argv)
 	return 1;
 }
 
+/* Decode <0xCC> hex escapes in a message string in-place.
+ * Returns new length. E.g. "AB<0x0D>CD" -> "AB\rCD" (len=5).
+ * Invalid escapes are passed through verbatim. */
+static int paging_decode_hex_escapes(char *msg, int len)
+{
+	int r = 0, w = 0;
+
+	while (r < len) {
+		if (r + 5 < len &&
+		    msg[r] == '<' && msg[r+1] == '0' && msg[r+2] == 'x' &&
+		    msg[r+5] == '>') {
+			/* Try to parse 2 hex digits */
+			char hex[3] = { msg[r+3], msg[r+4], '\0' };
+			char *end;
+			unsigned long val = strtoul(hex, &end, 16);
+			if (end == hex + 2) {
+				msg[w++] = (char)(uint8_t)val;
+				r += 6;
+				continue;
+			}
+		}
+		msg[w++] = msg[r++];
+	}
+	msg[w] = '\0';
+	return w;
+}
+
+/* Parse space-separated key=value options for paging FIFO.
+ * Supported: repeat=N interval=N tonetype=N ni=0|1 */
+static void paging_parse_options(const char *opts, int opts_len,
+				 int *repeat, int *interval,
+				 uint8_t *tonetype, uint8_t *ni)
+{
+	char buf[256];
+	char *p, *token, *saveptr;
+
+	*repeat = 0;
+	*interval = 0;
+	*tonetype = 0;
+	*ni = 0;
+
+	if (!opts || opts_len <= 0)
+		return;
+
+	if (opts_len >= (int)sizeof(buf))
+		opts_len = sizeof(buf) - 1;
+	memcpy(buf, opts, opts_len);
+	buf[opts_len] = '\0';
+
+	for (token = strtok_r(buf, " \t", &saveptr);
+	     token;
+	     token = strtok_r(NULL, " \t", &saveptr)) {
+		if ((p = strchr(token, '=')) != NULL) {
+			*p++ = '\0';
+			if (!strcasecmp(token, "repeat"))
+				*repeat = atoi(p);
+			else if (!strcasecmp(token, "interval"))
+				*interval = atoi(p);
+			else if (!strcasecmp(token, "tonetype"))
+				*tonetype = (uint8_t)atoi(p);
+			else if (!strcasecmp(token, "ni"))
+				*ni = (uint8_t)atoi(p);
+		}
+	}
+}
+
 /* Process a single paging command line.
- * Format: <address>,<type>,<message>
- *     or: <address>,<type>,<repeats>,<interval_sec>,<message>
- * Types: tone, numeric, alpha */
+ * Format: address,type,options,message  (always 3 commas)
+ * Types: tone, numeric, numeric10, numeric18, alpha
+ * Options: space-separated key=value (can be empty):
+ *   repeat=N      total send count (1-15, default 1)
+ *   interval=N    seconds between repeats (default 5)
+ *   tonetype=N    E2-E0 for tone-only (0-7, default 0)
+ *   ni=0|1        national/international (default 0)
+ * Message: everything after 3rd comma (commas in payload preserved) */
 static void paging_process_line(rds_encoder_t *enc, char *line)
 {
-	char *p = line;
-	char *addr_str = strsep(&p, ",");
-	char *type_str = strsep(&p, ",");
-	if (!addr_str || !type_str) {
-		LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: invalid format\n");
+	int i, comma_count = 0;
+	int comma1 = -1, comma2 = -1, comma3 = -1;
+	int len = strlen(line);
+	char addr_buf[16], type_buf[32];
+	int repeat, interval;
+	uint8_t tonetype, ni;
+	uint32_t address;
+	char *msg;
+	int msg_len;
+
+	/* Find exactly 3 commas */
+	for (i = 0; i < len; i++) {
+		if (line[i] == ',') {
+			comma_count++;
+			if (comma_count == 1) comma1 = i;
+			else if (comma_count == 2) comma2 = i;
+			else if (comma_count == 3) { comma3 = i; break; }
+		}
+	}
+
+	if (comma_count < 3) {
+		LOGP(DRADIO, LOGL_NOTICE,
+		     "RDS paging FIFO: format is address,type,options,message\n"
+		     "  address: 0-999999\n"
+		     "  types:   tone|numeric|numeric10|numeric18|alpha|vnum\n"
+		     "  options: repeat=N interval=N tonetype=N ni=0|1 (can be empty)\n"
+		     "  message: payload after 3rd comma (commas allowed)\n"
+		     "  examples:\n"
+		     "    200078,tone,,\n"
+		     "    200078,tone,tonetype=3 repeat=2,\n"
+		     "    200078,numeric,,1234567890\n"
+		     "    200078,alpha,,Hello World\n"
+		     "    200078,alpha,repeat=3 interval=5,Hello, World!\n"
+		     "    200078,vnum,,31415926535\n");
 		return;
 	}
 
-	uint32_t address = (uint32_t)atoi(addr_str);
-	if (address > 999999) {
-		LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: address %u out of range\n", address);
+	/* Extract address */
+	if (comma1 >= (int)sizeof(addr_buf)) comma1 = sizeof(addr_buf) - 1;
+	memcpy(addr_buf, line, comma1);
+	addr_buf[comma1] = '\0';
+	address = (uint32_t)atoi(addr_buf);
+	if (address > RDS_PAGING_ADDR_MAX) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: address %u out of range (max %d)\n",
+		     address, RDS_PAGING_ADDR_MAX);
 		return;
 	}
 
-	/* Check for extended format: repeats,interval,message */
-	int repeats = 2;
-	int interval = 0;
-	char *msg = NULL;
+	/* Extract type */
+	{
+		int tlen = comma2 - comma1 - 1;
+		if (tlen >= (int)sizeof(type_buf)) tlen = sizeof(type_buf) - 1;
+		memcpy(type_buf, line + comma1 + 1, tlen);
+		type_buf[tlen] = '\0';
+	}
 
-	if (!strcasecmp(type_str, "tone")) {
-		/* Tone: no message needed, but check for repeats */
-		if (p) {
-			/* Could be repeats,interval or nothing */
-			char *r = strsep(&p, ",");
-			if (r && p) {
-				repeats = atoi(r);
-				char *iv = strsep(&p, ",");
-				if (iv) interval = atoi(iv);
-			}
-		}
-		rds_enc_paging_send_tone(enc, address, repeats, interval);
-		LOGP(DRADIO, LOGL_NOTICE, "RDS paging: queued TONE addr=%02u-%04u repeats=%d\n",
-		     address / 10000, address % 10000, repeats);
-	} else if (!strcasecmp(type_str, "numeric") || !strcasecmp(type_str, "numeric10") || !strcasecmp(type_str, "numeric18")) {
-		if (!p) {
-			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: numeric requires message\n");
+	/* Parse options */
+	paging_parse_options(line + comma2 + 1, comma3 - comma2 - 1,
+			     &repeat, &interval, &tonetype, &ni);
+
+	/* Message is everything after 3rd comma */
+	msg = line + comma3 + 1;
+	msg_len = len - comma3 - 1;
+
+	/* Decode <0xCC> hex escapes in message (in-place) */
+	msg_len = paging_decode_hex_escapes(msg, msg_len);
+
+	if (!strcasecmp(type_buf, "tone")) {
+		rds_enc_paging_send_tone(enc, address, repeat, interval, tonetype);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: TONE addr=%02u-%04u repeat=%d interval=%d tonetype=%d\n",
+		     address / 10000, address % 10000, repeat, interval, tonetype);
+	} else if (!strcasecmp(type_buf, "numeric") || !strcasecmp(type_buf, "numeric10") || !strcasecmp(type_buf, "numeric18")) {
+		if (msg_len <= 0) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: numeric requires message digits\n");
 			return;
 		}
-		/* Check for extended format */
-		char *next = strsep(&p, ",");
-		if (p) {
-			/* Could be repeats,interval,msg or just msg */
-			char *maybe_interval = strsep(&p, ",");
-			if (maybe_interval && p) {
-				repeats = atoi(next);
-				interval = atoi(maybe_interval);
-				msg = p;
-			} else {
-				/* Two fields: next is the message, maybe_interval is extra */
-				msg = next;
-			}
-		} else {
-			msg = next;
-		}
-		if (!msg || !*msg) {
-			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: empty numeric message\n");
+		rds_enc_paging_send_numeric(enc, address, msg, repeat, interval, ni);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: NUMERIC addr=%02u-%04u len=%d repeat=%d interval=%d %s msg=\"%s\"\n",
+		     address / 10000, address % 10000, msg_len, repeat, interval, PAG_NI(ni), msg);
+	} else if (!strcasecmp(type_buf, "alpha")) {
+		if (msg_len <= 0) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: alpha requires message text\n");
 			return;
 		}
-		rds_enc_paging_send_numeric(enc, address, msg, repeats, interval);
-		LOGP(DRADIO, LOGL_NOTICE, "RDS paging: queued NUMERIC addr=%02u-%04u msg=\"%s\" repeats=%d\n",
-		     address / 10000, address % 10000, msg, repeats);
-	} else if (!strcasecmp(type_str, "alpha")) {
-		if (!p) {
-			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: alpha requires message\n");
+		rds_enc_paging_send_alpha(enc, address, msg, repeat, interval, ni);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: ALPHA addr=%02u-%04u len=%d repeat=%d interval=%d %s msg=\"%s\"\n",
+		     address / 10000, address % 10000, msg_len, repeat, interval, PAG_NI(ni), msg);
+	} else if (!strcasecmp(type_buf, "vnum")) {
+		if (msg_len <= 0) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: vnum requires message digits\n");
 			return;
 		}
-		char *next = strsep(&p, ",");
-		if (p) {
-			char *maybe_interval = strsep(&p, ",");
-			if (maybe_interval && p) {
-				repeats = atoi(next);
-				interval = atoi(maybe_interval);
-				msg = p;
-			} else {
-				msg = next;
-			}
-		} else {
-			msg = next;
-		}
-		if (!msg || !*msg) {
-			LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: empty alpha message\n");
-			return;
-		}
-		rds_enc_paging_send_alpha(enc, address, msg, repeats, interval);
-		LOGP(DRADIO, LOGL_NOTICE, "RDS paging: queued ALPHA addr=%02u-%04u msg=\"%s\" repeats=%d\n",
-		     address / 10000, address % 10000, msg, repeats);
+		rds_enc_paging_send_vnum(enc, address, msg, repeat, interval, ni);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: VNUM addr=%02u-%04u len=%d repeat=%d interval=%d %s msg=\"%s\"\n",
+		     address / 10000, address % 10000, msg_len, repeat, interval, PAG_NI(ni), msg);
 	} else {
-		LOGP(DRADIO, LOGL_ERROR, "RDS paging pipe: unknown type '%s'\n", type_str);
+		LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: unknown type '%s'\n", type_buf);
 	}
 }
 
@@ -1445,7 +1540,14 @@ int main(int argc, char *argv[])
 	static int main_loop_dbg_cnt = 0;
 #endif
 	while (!quit) {
-		usleep(1000);
+		/* Adaptive sleep: shorter when TX buffer needs feeding.
+		 * In TX mode the write thread drains the ring buffer continuously;
+		 * sleeping a full 1ms risks starving the hardware (UHD underruns).
+		 * Use 100us when TX is active to keep the buffer fed. */
+		if (tx)
+			usleep(100);
+		else
+			usleep(1000);
 		/* Check paging pipe for new messages */
 		if (paging_pipe_fd >= 0)
 			paging_pipe_handler(&radio.rds_enc);

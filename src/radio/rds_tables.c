@@ -1238,21 +1238,21 @@ const char *rds_char_to_display(uint8_t code)
 {
 	static char hex_buf[8];
 	
-	/* Control characters shown as Unicode control pictures or <XX> */
+	/* Control characters shown as <0xCC> hex escape */
 	if (code < 0x20) {
 		if (code == 0x0A) {
 			return "\xE2\x90\x8A";  /* U+240A ␊ Line Feed symbol */
 		} else if (code == 0x0D) {
 			return "\xE2\x90\x8D";  /* U+240D ␍ Carriage Return symbol */
 		} else {
-			snprintf(hex_buf, sizeof(hex_buf), "<%02X>", code);
+			snprintf(hex_buf, sizeof(hex_buf), "<0x%02X>", code);
 			return hex_buf;
 		}
 	}
 	
 	/* DEL character (0x7F) */
 	if (code == 0x7F) {
-		return "<7F>";
+		return "<0x7F>";
 	}
 	
 	/* Normal printable character - return UTF-8 equivalent */
@@ -1497,6 +1497,398 @@ static int find_rds_code(uint32_t codepoint, uint8_t *rds_code)
 	}
 	
 	return 0; /* Not found */
+}
+
+/* ============================================================
+ * Nokia RDS Pager Character Set
+ * ============================================================
+ * Empirically determined character map for the Nokia RDS Alpha
+ * Text pager. The full 256-byte character set was recovered by
+ * sending raw bytes 0x00-0xFF via RDS enhanced paging using
+ * test_paging_charset.sh, then photographing and transcribing
+ * each message from the pager display (32 photos, 8 bytes each).
+ *
+ * The pager implements a subset of IEC 62106 Annex E figure E.1
+ * with approximately 170 displayable characters out of 256.
+ *
+ * Character ranges:
+ *   0x00-0x1F  Control codes — all render as filled block (█)
+ *   0x20-0x7E  Mostly ASCII, with five gaps and two deviations:
+ *              0x24 = $ (dollar), not ¤ (currency sign) as in Annex E
+ *              0x7C = ¦ (broken bar), not | (pipe)
+ *              0x5E/0x5F/0x60/0x7E/0x7F = blank (not in ROM)
+ *   0x80-0xFF  Extended characters — mostly Annex E, but 30 positions
+ *              are unsupported and render as blank on the pager
+ *
+ * Unsupported extended positions (render as blank):
+ *   0x8C (Ş)  0x8F (IJ)  0x9C (ş)  0x9E (ı)  0x9F (ij)
+ *   0xA0 (ª)  0xA1 (α)   0xA2 (©)  0xA3 (‰)  0xA8 (π)  0xA9 (€)
+ *   0xB0 (º)  0xB1 (¹)   0xB2 (²)  0xB3 (³)  0xB4 (±)  0xBA (÷)
+ *   0xBC (¼)  0xBD (½)   0xBE (¾)
+ *   0xE3 (Œ)  0xE4 (ŷ)   0xE8 (Þ)  0xE9 (Ŋ)  0xEE (Ŧ)  0xEF (ð)
+ *   0xF3 (œ)  0xF8 (þ)   0xF9 (ŋ)  0xFE (ŧ)
+ *
+ * See also: pager_charset_nokia.md for the full annotated map.
+ *
+ * Date: 2026-03-13
+ * ============================================================ */
+
+/*
+ * Forward map: Nokia pager RDS code (0x00-0xFF) -> UTF-8 string.
+ *
+ * Each entry is a NUL-terminated UTF-8 string representing what the
+ * Nokia pager actually displays for that byte value. Codes that the
+ * pager cannot render are mapped to " " (space) — the same visual
+ * result as on the pager itself.
+ *
+ * This table parallels rds_charmap[] (the standard RDS Annex E map)
+ * but reflects the Nokia pager's actual character ROM, which is a
+ * strict subset with the deviations noted above.
+ */
+static const char *nokia_pager_charmap[256] = {
+	/* 0x00-0x0F: Control characters (all render as block/undefined) */
+	" ", " ", " ", " ", " ", " ", " ", " ",
+	" ", " ", "\n", " ", " ", "\r", " ", " ",
+	/* 0x10-0x1F: Control characters continued */
+	" ", " ", " ", " ", " ", " ", " ", " ",
+	" ", " ", " ", " ", " ", " ", " ", " ",
+	/* 0x20-0x2F: ASCII punctuation (0x24 = $ not ¤) */
+	" ", "!", "\"", "#", "$", "%", "&", "'",
+	"(", ")", "*", "+", ",", "-", ".", "/",
+	/* 0x30-0x3F: Digits and punctuation */
+	"0", "1", "2", "3", "4", "5", "6", "7",
+	"8", "9", ":", ";", "<", "=", ">", "?",
+	/* 0x40-0x4F: Uppercase A-O */
+	"@", "A", "B", "C", "D", "E", "F", "G",
+	"H", "I", "J", "K", "L", "M", "N", "O",
+	/* 0x50-0x5F: Uppercase P-Z, symbols (0x5E-0x5F blank) */
+	"P", "Q", "R", "S", "T", "U", "V", "W",
+	"X", "Y", "Z", "[", "\\", "]", " ", " ",
+	/* 0x60-0x6F: Lowercase a-o (0x60 blank) */
+	" ", "a", "b", "c", "d", "e", "f", "g",
+	"h", "i", "j", "k", "l", "m", "n", "o",
+	/* 0x70-0x7F: Lowercase p-z, symbols (0x7C=broken bar, 0x7E-0x7F blank) */
+	"p", "q", "r", "s", "t", "u", "v", "w",
+	"x", "y", "z", "{", "\xC2\xA6", "}", " ", " ",
+	/* 0x80-0x8F: Accented lowercase (0x8C=Ş blank, 0x8F=IJ blank) */
+	"\xC3\xA1", "\xC3\xA0", "\xC3\xA9", "\xC3\xA8",  /* á à é è */
+	"\xC3\xAD", "\xC3\xAC", "\xC3\xB3", "\xC3\xB2",  /* í ì ó ò */
+	"\xC3\xBA", "\xC3\xB9", "\xC3\x91", "\xC3\x87",  /* ú ù Ñ Ç */
+	" ", "\xC3\x9F", "\xC2\xA1", " ",                  /* _blank_ ß ¡ _blank_ */
+	/* 0x90-0x9F: More accented (0x9C=ş, 0x9E=ı, 0x9F=ij blank) */
+	"\xC3\xA2", "\xC3\xA4", "\xC3\xAA", "\xC3\xAB",  /* â ä ê ë */
+	"\xC3\xAE", "\xC3\xAF", "\xC3\xB4", "\xC3\xB6",  /* î ï ô ö */
+	"\xC3\xBB", "\xC3\xBC", "\xC3\xB1", "\xC3\xA7",  /* û ü ñ ç */
+	" ", "\xC4\x9F", " ", " ",                          /* _blank_ ğ _blank_ _blank_ */
+	/* 0xA0-0xAF: Symbols (many blank: ª,α,©,‰,π,€) */
+	" ", " ", " ", " ",                                  /* _blank_ _blank_ _blank_ _blank_ */
+	"\xC4\x9E", "\xC4\x9B", "\xC5\x88", "\xC5\x91",  /* Ğ ě ň ő */
+	" ", " ", "\xC2\xA3", "$",                          /* _blank_ _blank_ £ $ */
+	"\xE2\x86\x90", "\xE2\x86\x91", "\xE2\x86\x92", "\xE2\x86\x93",  /* ← ↑ → ↓ */
+	/* 0xB0-0xBF: More symbols (many blank: º,¹,²,³,±,÷,¼,½,¾) */
+	" ", " ", " ", " ", " ",                            /* _blank_ x5 */
+	"\xC4\xB0", "\xC5\x84", "\xC5\xB1",               /* İ ń ű */
+	"\xC2\xB5", "\xC2\xBF", " ", "\xC2\xB0",          /* µ ¿ _blank_ ° */
+	" ", " ", " ", "\xC2\xA7",                          /* _blank_ _blank_ _blank_ § */
+	/* 0xC0-0xCF: Accented uppercase (all supported) */
+	"\xC3\x81", "\xC3\x80", "\xC3\x89", "\xC3\x88",  /* Á À É È */
+	"\xC3\x8D", "\xC3\x8C", "\xC3\x93", "\xC3\x92",  /* Í Ì Ó Ò */
+	"\xC3\x9A", "\xC3\x99", "\xC5\x98", "\xC4\x8C",  /* Ú Ù Ř Č */
+	"\xC5\xA0", "\xC5\xBD", "\xC4\x90", "\xC4\xBF",  /* Š Ž Đ Ŀ */
+	/* 0xD0-0xDF: More accented (all supported) */
+	"\xC3\x82", "\xC3\x84", "\xC3\x8A", "\xC3\x8B",  /* Â Ä Ê Ë */
+	"\xC3\x8E", "\xC3\x8F", "\xC3\x94", "\xC3\x96",  /* Î Ï Ô Ö */
+	"\xC3\x9B", "\xC3\x9C", "\xC5\x99", "\xC4\x8D",  /* Û Ü ř č */
+	"\xC5\xA1", "\xC5\xBE", "\xC4\x91", "\xC5\x80",  /* š ž đ ŀ */
+	/* 0xE0-0xEF: Nordic/special (0xE3=Œ, 0xE4=ŷ, 0xE8=Þ, 0xE9=Ŋ, 0xEE=Ŧ, 0xEF=ð blank) */
+	"\xC3\x83", "\xC3\x85", "\xC3\x86", " ",          /* Ã Å Æ _blank_ */
+	" ", "\xC3\x9D", "\xC3\x95", "\xC3\x98",          /* _blank_ Ý Õ Ø */
+	" ", " ", "\xC5\x94", "\xC4\x86",                  /* _blank_ _blank_ Ŕ Ć */
+	"\xC5\x9A", "\xC5\xB9", " ", " ",                  /* Ś Ź _blank_ _blank_ */
+	/* 0xF0-0xFF: Nordic/special lowercase (0xF3=œ, 0xF8=þ, 0xF9=ŋ, 0xFE=ŧ blank) */
+	"\xC3\xA3", "\xC3\xA5", "\xC3\xA6", " ",          /* ã å æ _blank_ */
+	"\xC5\xB5", "\xC3\xBD", "\xC3\xB5", "\xC3\xB8",  /* ŵ ý õ ø */
+	" ", " ", "\xC5\x95", "\xC4\x87",                  /* _blank_ _blank_ ŕ ć */
+	"\xC5\x9B", "\xC5\xBA", " ", " "                   /* ś ź _blank_ _blank_ */
+};
+
+/*
+ * Reverse map: Unicode codepoint -> Nokia pager RDS code.
+ *
+ * Only includes characters from the extended range (U+00A1 and above)
+ * that the Nokia pager can actually display. ASCII printable characters
+ * (0x20-0x7E) are handled by direct mapping in nokia_pager_find_code()
+ * and are not listed here.
+ *
+ * The table is sorted by codepoint to allow O(log n) binary search.
+ * 96 entries covering Latin Extended-A, Latin Extended-B, and Arrows.
+ */
+typedef struct {
+	uint32_t codepoint;  /* Unicode codepoint (e.g. 0x00E1 for á) */
+	uint8_t  pager_code; /* Corresponding RDS byte the pager expects */
+} nokia_pager_reverse_t;
+
+static const nokia_pager_reverse_t nokia_pager_reverse_map[] = {
+	/* ASCII 0x20-0x7E handled inline (direct mapping except exclusions) */
+	/* Extended characters the Nokia pager supports: */
+	{0x00A1, 0x8E},  /* ¡ */
+	{0x00A3, 0xAA},  /* £ */
+	{0x00A6, 0x7C},  /* ¦ (broken bar) */
+	{0x00A7, 0xBF},  /* § */
+	{0x00B0, 0xBB},  /* ° */
+	{0x00B5, 0xB8},  /* µ */
+	{0x00BF, 0xB9},  /* ¿ */
+	{0x00C0, 0xC1},  /* À */
+	{0x00C1, 0xC0},  /* Á */
+	{0x00C2, 0xD0},  /* Â */
+	{0x00C3, 0xE0},  /* Ã */
+	{0x00C4, 0xD1},  /* Ä */
+	{0x00C5, 0xE1},  /* Å */
+	{0x00C6, 0xE2},  /* Æ */
+	{0x00C7, 0x8B},  /* Ç */
+	{0x00C8, 0xC3},  /* È */
+	{0x00C9, 0xC2},  /* É */
+	{0x00CA, 0xD2},  /* Ê */
+	{0x00CB, 0xD3},  /* Ë */
+	{0x00CC, 0xC5},  /* Ì */
+	{0x00CD, 0xC4},  /* Í */
+	{0x00CE, 0xD4},  /* Î */
+	{0x00CF, 0xD5},  /* Ï */
+	{0x00D1, 0x8A},  /* Ñ */
+	{0x00D2, 0xC7},  /* Ò */
+	{0x00D3, 0xC6},  /* Ó */
+	{0x00D4, 0xD6},  /* Ô */
+	{0x00D5, 0xE6},  /* Õ */
+	{0x00D6, 0xD7},  /* Ö */
+	{0x00D8, 0xE7},  /* Ø */
+	{0x00D9, 0xC9},  /* Ù */
+	{0x00DA, 0xC8},  /* Ú */
+	{0x00DB, 0xD8},  /* Û */
+	{0x00DC, 0xD9},  /* Ü */
+	{0x00DD, 0xE5},  /* Ý */
+	{0x00DF, 0x8D},  /* ß */
+	{0x00E0, 0x81},  /* à */
+	{0x00E1, 0x80},  /* á */
+	{0x00E2, 0x90},  /* â */
+	{0x00E3, 0xF0},  /* ã */
+	{0x00E4, 0x91},  /* ä */
+	{0x00E5, 0xF1},  /* å */
+	{0x00E6, 0xF2},  /* æ */
+	{0x00E7, 0x9B},  /* ç */
+	{0x00E8, 0x83},  /* è */
+	{0x00E9, 0x82},  /* é */
+	{0x00EA, 0x92},  /* ê */
+	{0x00EB, 0x93},  /* ë */
+	{0x00EC, 0x85},  /* ì */
+	{0x00ED, 0x84},  /* í */
+	{0x00EE, 0x94},  /* î */
+	{0x00EF, 0x95},  /* ï */
+	{0x00F1, 0x9A},  /* ñ */
+	{0x00F2, 0x87},  /* ò */
+	{0x00F3, 0x86},  /* ó */
+	{0x00F4, 0x96},  /* ô */
+	{0x00F5, 0xF6},  /* õ */
+	{0x00F6, 0x97},  /* ö */
+	{0x00F8, 0xF7},  /* ø */
+	{0x00F9, 0x89},  /* ù */
+	{0x00FA, 0x88},  /* ú */
+	{0x00FB, 0x98},  /* û */
+	{0x00FC, 0x99},  /* ü */
+	{0x00FD, 0xF5},  /* ý */
+	{0x0106, 0xEB},  /* Ć */
+	{0x0107, 0xFB},  /* ć */
+	{0x010C, 0xCB},  /* Č */
+	{0x010D, 0xDB},  /* č */
+	{0x0110, 0xCE},  /* Đ */
+	{0x0111, 0xDE},  /* đ */
+	{0x011B, 0xA5},  /* ě */
+	{0x011E, 0xA4},  /* Ğ */
+	{0x011F, 0x9D},  /* ğ */
+	{0x0130, 0xB5},  /* İ */
+	{0x013F, 0xCF},  /* Ŀ */
+	{0x0140, 0xDF},  /* ŀ */
+	{0x0144, 0xB6},  /* ń */
+	{0x0148, 0xA6},  /* ň */
+	{0x0151, 0xA7},  /* ő */
+	{0x0154, 0xEA},  /* Ŕ */
+	{0x0155, 0xFA},  /* ŕ */
+	{0x0158, 0xCA},  /* Ř */
+	{0x0159, 0xDA},  /* ř */
+	{0x015A, 0xEC},  /* Ś */
+	{0x015B, 0xFC},  /* ś */
+	{0x0160, 0xCC},  /* Š */
+	{0x0161, 0xDC},  /* š */
+	{0x0171, 0xB7},  /* ű */
+	{0x0175, 0xF4},  /* ŵ */
+	{0x0179, 0xED},  /* Ź */
+	{0x017A, 0xFD},  /* ź */
+	{0x017D, 0xCD},  /* Ž */
+	{0x017E, 0xDD},  /* ž */
+	{0x2190, 0xAC},  /* ← */
+	{0x2191, 0xAD},  /* ↑ */
+	{0x2192, 0xAE},  /* → */
+	{0x2193, 0xAF},  /* ↓ */
+};
+
+#define NOKIA_PAGER_REVERSE_COUNT \
+	(sizeof(nokia_pager_reverse_map) / sizeof(nokia_pager_reverse_map[0]))
+
+/*
+ * nokia_pager_is_displayable - check if an RDS code renders on the pager
+ *
+ * Returns 1 if the code produces a visible glyph on the Nokia RDS Alpha
+ * Text pager, 0 if it renders as blank (space) or undefined (block).
+ *
+ * The 30 unsupported extended positions were identified empirically:
+ * the pager simply shows nothing for these codes, even though the full
+ * RDS Annex E standard defines glyphs for them. The pager's character
+ * ROM doesn't include them.
+ */
+int nokia_pager_is_displayable(uint8_t code)
+{
+	/* 0x00-0x1F: Control range — all render as filled block */
+	if (code < 0x20) return 0;
+
+	/* ASCII range holes: ^, _, `, ~, DEL not in pager ROM */
+	if (code == 0x5E || code == 0x5F || code == 0x60) return 0;
+	if (code == 0x7E || code == 0x7F) return 0;
+
+	/* Extended range: characters missing from pager ROM */
+	if (code == 0x8C || code == 0x8F) return 0;  /* Ş, IJ */
+	if (code == 0x9C || code == 0x9E || code == 0x9F) return 0;  /* ş, ı, ij */
+	if (code >= 0xA0 && code <= 0xA3) return 0;  /* ª, α, ©, ‰ */
+	if (code == 0xA8 || code == 0xA9) return 0;  /* π, € */
+	if (code >= 0xB0 && code <= 0xB4) return 0;  /* º, ¹, ², ³, ± */
+	if (code == 0xBA) return 0;                   /* ÷ */
+	if (code >= 0xBC && code <= 0xBE) return 0;  /* ¼, ½, ¾ */
+	if (code == 0xE3 || code == 0xE4) return 0;  /* Œ, ŷ */
+	if (code == 0xE8 || code == 0xE9) return 0;  /* Þ, Ŋ */
+	if (code == 0xEE || code == 0xEF) return 0;  /* Ŧ, ð */
+	if (code == 0xF3) return 0;                   /* œ */
+	if (code == 0xF8 || code == 0xF9) return 0;  /* þ, ŋ */
+	if (code == 0xFE || code == 0xFF) return 0;  /* ŧ, (end) */
+
+	return 1;
+}
+
+/*
+ * nokia_pager_get_char - decode a single RDS byte to UTF-8
+ *
+ * Returns a pointer to a static UTF-8 string for the given RDS code.
+ * Unsupported codes return " " (space). The returned pointer is valid
+ * for the lifetime of the program (points into nokia_pager_charmap[]).
+ */
+const char *nokia_pager_get_char(uint8_t code)
+{
+	return nokia_pager_charmap[code];
+}
+
+/*
+ * nokia_pager_find_code - encode a Unicode codepoint to a pager RDS byte
+ *
+ * Two-stage lookup:
+ *   1. ASCII printable (0x20-0x7E): direct identity mapping, minus the
+ *      five codes the pager can't render (^, _, `, ~).
+ *      Note: sending '|' (0x7C) will display as '¦' (broken bar) on
+ *      the pager — this is intentional, the pager has no pipe glyph.
+ *   2. Extended (U+00A1+): binary search in nokia_pager_reverse_map[].
+ *
+ * Returns 1 on success (pager_code written), 0 if the codepoint has
+ * no representation in the Nokia pager character ROM.
+ */
+static int nokia_pager_find_code(uint32_t codepoint, uint8_t *pager_code)
+{
+	/* ASCII printable range: direct mapping for supported chars */
+	if (codepoint >= 0x20 && codepoint <= 0x7E) {
+		uint8_t code = (uint8_t)codepoint;
+		/* Exclude chars the Nokia pager can't display */
+		if (code == 0x5E || code == 0x5F || code == 0x60 ||
+		    code == 0x7E) {
+			return 0;
+		}
+		*pager_code = code;
+		return 1;
+	}
+
+	/* LF and CR pass through as control codes */
+	if (codepoint == 0x0A || codepoint == 0x0D) {
+		*pager_code = (uint8_t)codepoint;
+		return 1;
+	}
+
+	/* $ at 0x24 is already handled above; also available at 0xAB */
+
+	/* Binary search in extended reverse map (sorted by codepoint) */
+	int lo = 0, hi = (int)NOKIA_PAGER_REVERSE_COUNT - 1;
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+		if (nokia_pager_reverse_map[mid].codepoint == codepoint) {
+			*pager_code = nokia_pager_reverse_map[mid].pager_code;
+			return 1;
+		} else if (nokia_pager_reverse_map[mid].codepoint < codepoint) {
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+
+	return 0; /* Not displayable on Nokia pager */
+}
+
+/*
+ * nokia_pager_encode_text - encode a UTF-8 string for the Nokia pager
+ *
+ * Converts a UTF-8 input string into the Nokia pager's RDS byte encoding.
+ * Characters that have no pager representation are replaced with '?' and
+ * the warn_unencodable flag is set. CR (0x0D) terminates the message
+ * (standard RDS text terminator). Control characters other than LF/CR
+ * are silently skipped.
+ *
+ * Uses utf8_decode() (defined earlier in this file) for multi-byte
+ * UTF-8 parsing, then nokia_pager_find_code() for the actual mapping.
+ *
+ * @param utf8:             NUL-terminated UTF-8 input string
+ * @param out:              Output buffer for RDS-encoded bytes
+ * @param max_len:          Maximum output length (80 for alpha paging)
+ * @param warn_unencodable: If non-NULL, set to 1 if any chars were replaced
+ * @return:                 Number of bytes written to out[]
+ */
+int nokia_pager_encode_text(const char *utf8, uint8_t *out, int max_len,
+			    int *warn_unencodable)
+{
+	int out_len = 0;
+	const char *p = utf8;
+	int warned = 0;
+
+	if (!utf8 || !out || max_len < 1) return 0;
+
+	while (*p && out_len < max_len) {
+		uint32_t cp = utf8_decode(&p);
+		uint8_t pager_code;
+
+		/* Skip control characters except LF and CR */
+		if (cp < 0x20 && cp != 0x0A && cp != 0x0D)
+			continue;
+
+		/* CR terminates */
+		if (cp == 0x0D) {
+			if (out_len < max_len)
+				out[out_len++] = 0x0D;
+			break;
+		}
+
+		if (nokia_pager_find_code(cp, &pager_code)) {
+			out[out_len++] = pager_code;
+		} else {
+			out[out_len++] = '?';
+			warned = 1;
+		}
+	}
+
+	if (warn_unencodable)
+		*warn_unencodable = warned;
+
+	return out_len;
 }
 
 int rds_encode_text(const char *utf8, uint8_t *rds_out, int max_len, int *warn_unencodable)
