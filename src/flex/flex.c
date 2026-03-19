@@ -2526,21 +2526,87 @@ void call_down_clock(void)
 /*
  * Validate a dialed capcode string from the console.
  *
- * FLEX capcodes can be 1-10 digits (short: 1-1933312, long: 2101249-4297068542).
+ * Accepts both plain numeric capcodes and Extended CAPCODE format
+ * per ARIB STD-43A Appendix A:
+ *   Plain:    1234567 (short: 1-1933312) or 007005031 (long: 2101249-4297068542)
+ *   Extended: [R][fff][b]<A-Z><digits>  e.g. 3E007005031, A1234567, 5U0000100
+ *
+ * For Extended CAPCODEs, the alpha prefix and optional frame/collapse/roaming
+ * metadata are stripped — only the trailing numeric address is validated.
+ *
  * Returns NULL if valid, or an error string if invalid.
  */
 const char *flex_number_valid(const char *number)
 {
 	uint64_t capcode;
 	int i;
+	int has_alpha = 0;
+	const char *alpha_pos = NULL;
+	const char *digits;
 
-	/* check all digits */
+	if (!number || !*number)
+		return "Empty capcode string";
+
+	/* Check if this is an Extended CAPCODE (contains alpha characters) */
 	for (i = 0; number[i]; i++) {
-		if (number[i] < '0' || number[i] > '9')
-			return "Illegal capcode digit (use 0..9 only)";
+		char ch = number[i];
+		if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+			has_alpha = 1;
+			alpha_pos = &number[i];
+		}
 	}
 
-	capcode = strtoull(number, NULL, 10);
+	if (!has_alpha) {
+		/* Plain numeric — all characters must be digits */
+		for (i = 0; number[i]; i++) {
+			if (number[i] < '0' || number[i] > '9')
+				return "Illegal capcode digit (use 0..9 only)";
+		}
+		digits = number;
+	} else {
+		/* Extended CAPCODE — validate structure:
+		 * Everything after the last alpha must be digits (the address).
+		 * Everything before it must be valid prefix chars. */
+		if (!alpha_pos || !*(alpha_pos + 1))
+			return "Extended CAPCODE: alpha prefix must be followed by digits";
+
+		/* Validate prefix characters before alpha */
+		{
+			const char *c;
+			for (c = number; c < alpha_pos; c++) {
+				char ch = *c;
+				int is_digit = (ch >= '0' && ch <= '9');
+				int is_roaming = (ch == 'P' || ch == 'p' ||
+						  ch == 'Q' || ch == 'q' ||
+						  ch == 'R' || ch == 'r' ||
+						  ch == 'S' || ch == 's');
+				if (!is_digit && !is_roaming)
+					return "Extended CAPCODE: invalid prefix (expect [P|Q|R|S][frame][collapse])";
+			}
+		}
+
+		/* Validate primary alpha is A-Z */
+		{
+			char a = *alpha_pos;
+			if (a >= 'a' && a <= 'z')
+				a = a - 'a' + 'A';
+			if (a < 'A' || a > 'Z')
+				return "Extended CAPCODE: invalid alpha prefix (expect A-Z)";
+		}
+
+		/* Validate trailing digits */
+		{
+			const char *d;
+			for (d = alpha_pos + 1; *d; d++) {
+				if (*d < '0' || *d > '9')
+					return "Extended CAPCODE: address must be numeric digits after alpha prefix";
+			}
+		}
+
+		digits = alpha_pos + 1;
+	}
+
+	capcode = strtoull(digits, NULL, 10);
 	if (!flex_capcode_valid(capcode))
 		return "Invalid FLEX capcode (short: 1-1933312, long: 2101249-4297068542)";
 
@@ -2571,12 +2637,30 @@ int call_down_setup(int callref, const char *caller_id, enum number_type __attri
 	else
 		message = flex->default_message;
 
-	/* parse capcode and create message */
+	/* parse capcode and create message.
+	 * Supports both plain numeric and Extended CAPCODE format
+	 * (e.g. "3E007005031" → address=007005031). */
 	{
-		uint64_t capcode = strtoull(dialing, NULL, 10);
+		uint64_t capcode;
+		const char *dp = dialing;
+		const char *alpha_pos = NULL;
+		int i;
 
-		LOGP(DFLEX, LOGL_INFO, "Paging capcode '%" PRIu64 "' with %s message '%s'.\n",
-		     capcode, flex_msg_type_name(flex->default_msg_type), message);
+		/* Find last alpha character — if present, digits after it
+		 * are the numeric address (Extended CAPCODE format). */
+		for (i = 0; dp[i]; i++) {
+			char ch = dp[i];
+			if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))
+				alpha_pos = &dp[i];
+		}
+
+		if (alpha_pos && *(alpha_pos + 1))
+			capcode = strtoull(alpha_pos + 1, NULL, 10);
+		else
+			capcode = strtoull(dialing, NULL, 10);
+
+		LOGP(DFLEX, LOGL_INFO, "Paging capcode '%" PRIu64 "' (dialed '%s') with %s message '%s'.\n",
+		     capcode, dialing, flex_msg_type_name(flex->default_msg_type), message);
 
 		msg = flex_msg_create(flex, capcode, flex->default_msg_type,
 				      message, strlen(message));

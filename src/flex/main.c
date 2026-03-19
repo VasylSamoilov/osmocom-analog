@@ -239,6 +239,32 @@ void print_help(const char *arg0)
 	printf("\n");
 	printf("    FIFO protocol (write to %s):\n", msg_send_path);
 	printf("        Format: capcode,type,options,message\n");
+	printf("\n");
+	printf("        Capcode field (ARIB STD-43A Appendix A Extended CAPCODE):\n");
+	printf("          Plain numeric:  1234567 (short) or 007005031 (long)\n");
+	printf("          Extended form:  [R][fff][b]<alpha><digits>\n");
+	printf("            R     = roaming prefix: P(none) Q(TMF) R(FrameOfs) S(both)\n");
+	printf("            fff   = explicit frame 0-127 (optional)\n");
+	printf("            b     = collapse cycle 0-7 (optional, wake every 2^b frames)\n");
+	printf("            alpha = pager type prefix (required for extended form):\n");
+	printf("              Standard rule (frame/phase derived from address digits):\n");
+	printf("                A-D = Single Phase (subtract 0-3 for multi-addr pagers)\n");
+	printf("                E-H = Any Phase    (subtract 0-3)\n");
+	printf("                I-L = All Phase    (subtract 0-3)\n");
+	printf("              Non-standard (explicit phase, not derived from address):\n");
+	printf("                U=Phase A  V=Phase B  W=Phase C  X=Phase D\n");
+	printf("                Y=Any Phase  Z=All Phase\n");
+	printf("            digits = 7-digit short or 9-digit long address\n");
+	printf("          Examples:\n");
+	printf("            3E007005031  → collapse=3, Any Phase, addr=007005031 (Long)\n");
+	printf("            A1234567     → Single Phase, subtract 0, addr=1234567 (Short)\n");
+	printf("            5U0000100    → collapse=5, Single Phase A, addr=0000100\n");
+	printf("            R3E007005031 → roaming=R(FrameOfs), collapse=3, Any Phase\n");
+	printf("          Phase/frame from standard rule (A-L):\n");
+	printf("            phase = (address / 4) mod 4    → 0=A 1=B 2=C 3=D\n");
+	printf("            frame = (address / 16) mod 128 → 0-127\n");
+	printf("          Non-standard U/V/W/X set phase= automatically (if not overridden).\n");
+	printf("\n");
 	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short|secure|special|nnumeric|nspecial (or 0-10)\n");
 	printf("        Options: space-separated key=value pairs:\n");
 	printf("          speed=1600|3200|3200-4fsk|6400  polarity=neg|pos\n");
@@ -276,6 +302,9 @@ void print_help(const char *arg0)
 	printf("          1234567,nspecial,,31415926\n");
 	printf("          group:1234567,alpha,group=1,Group message\n");
 	printf("          group:1234567,alpha,group=1 tempgroup=1,Temp group msg\n");
+	printf("          3E007005031,alpha,,Extended CAPCODE (Long, Any Phase, collapse=3)\n");
+	printf("          A1234567,numeric,,Standard rule Short CAPCODE\n");
+	printf("          5U0000100,tone,,Non-standard, collapse=5, Phase A\n");
 	printf("          sysmsg,0,,System maintenance at 03:00 UTC\n");
 	printf("          sysmsg,14,,\n");
 	printf("\n");
@@ -842,6 +871,372 @@ static const char *flex_phase_name(int phase)
 	return "?";
 }
 
+/*
+ * ARIB STD-43A Appendix A Extended CAPCODE parser.
+ *
+ * CAPCODE is the unified notation for FLEX pager addressing that bundles
+ * the numeric address with frame/phase/collapse metadata and pager type
+ * information into a single string.
+ *
+ * Formats (Appendix A Section 1):
+ *
+ *   Plain numeric:
+ *     1234567              — 7-digit short address (1 to 1,933,312)
+ *     123456789            — 9-digit long address  (2,101,249 to 4,297,068,542)
+ *
+ *   With alpha prefix (standard or non-standard rule):
+ *     [b]<alpha><digits>   — alpha prefix encodes pager type + phase rule
+ *
+ *   Form 1: fffbU1234567   — frame(fff) + collapse(b) + alpha + 7-digit short
+ *   Form 2: U1234567       — alpha + 7-digit short (frame/collapse from system)
+ *   Form 3: bA1234567      — collapse(b) + alpha + 7-digit short
+ *   Form 4: A1234567       — alpha + 7-digit short
+ *   (Same patterns with 9-digit for long addresses, 10-digit for extended)
+ *
+ * Alpha prefix meanings (Section 4):
+ *   Standard rule (frame/phase embedded in address digits):
+ *     A = Single Phase, subtract 0 (1st address)
+ *     B = Single Phase, subtract 1 (2nd address)
+ *     C = Single Phase, subtract 2 (3rd address)
+ *     D = Single Phase, subtract 3 (4th address)
+ *     E = Any Phase, subtract 0
+ *     F = Any Phase, subtract 1
+ *     G = Any Phase, subtract 2
+ *     H = Any Phase, subtract 3
+ *     I = All Phase, subtract 0
+ *     J = All Phase, subtract 1
+ *     K = All Phase, subtract 2
+ *     L = All Phase, subtract 3
+ *
+ *   Non-standard (frame/phase NOT embedded, explicit assignment):
+ *     U = Single Phase, Phase 0 (A)
+ *     V = Single Phase, Phase 1 (B)
+ *     W = Single Phase, Phase 2 (C)
+ *     X = Single Phase, Phase 3 (D)
+ *     Y = Any Phase
+ *     Z = All Phase
+ *
+ *   2nd alpha (roaming capability, prepended as P/Q/R/S):
+ *     P = no Frame Offset, no TMF
+ *     Q = no Frame Offset, TMF capable
+ *     R = Frame Offset capable, no TMF
+ *     S = Frame Offset + TMF capable
+ *
+ * Collapse cycle 'b' (0-7):
+ *   Pager wakes every 2^b frames.
+ *   b=0: every frame, b=1: every 2, ..., b=7: every 128 frames.
+ *
+ * Frame/phase extraction (Section 3, standard rule A-L):
+ *   phase = (address / 4) mod 4       → 0=A, 1=B, 2=C, 3=D
+ *   frame = (address / 16) mod 128    → 0-127
+ *
+ * This function parses the string, extracts the numeric capcode,
+ * and optionally populates metadata (collapse, phase override, etc.)
+ * for human-readable logging.  The numeric capcode is what gets
+ * passed to the encoder — the alpha prefix is informational.
+ *
+ * Returns 0 on success, -1 on parse error.
+ */
+
+/* Parsed CAPCODE metadata for logging */
+typedef struct capcode_parsed {
+	uint64_t	capcode;	/* numeric address for encoder */
+	int		has_alpha;	/* 1 if alpha prefix was present */
+	char		alpha;		/* primary alpha char (A-Z) */
+	int		has_roaming;	/* 1 if 2nd alpha (P/Q/R/S) present */
+	char		roaming;	/* 2nd alpha char */
+	int		has_collapse;	/* 1 if collapse digit present */
+	int		collapse;	/* collapse value 0-7 */
+	int		has_frame;	/* 1 if fff prefix present */
+	int		frame;		/* explicit frame 0-127 */
+	/* Derived from standard rule (A-L) + numeric address */
+	int		std_rule;	/* 1 if alpha is A-L (standard rule) */
+	int		computed_phase;	/* phase from address: (addr/4)%4 */
+	int		computed_frame;	/* frame from address: (addr/16)%128 */
+	const char	*phase_type;	/* "Single", "Any", or "All" */
+	int		subtract;	/* address offset (0-3) for multi-addr pagers */
+} capcode_parsed_t;
+
+/* Classify the alpha prefix per ARIB STD-43A Appendix A Section 4 */
+static void classify_capcode_alpha(char alpha, const char **phase_type,
+				   int *subtract, int *std_rule,
+				   int *explicit_phase)
+{
+	*std_rule = 0;
+	*explicit_phase = -1;
+	*subtract = 0;
+
+	switch (alpha) {
+	/* Standard rule: frame/phase embedded in address */
+	case 'A': *phase_type = "Single"; *subtract = 0; *std_rule = 1; break;
+	case 'B': *phase_type = "Single"; *subtract = 1; *std_rule = 1; break;
+	case 'C': *phase_type = "Single"; *subtract = 2; *std_rule = 1; break;
+	case 'D': *phase_type = "Single"; *subtract = 3; *std_rule = 1; break;
+	case 'E': *phase_type = "Any";    *subtract = 0; *std_rule = 1; break;
+	case 'F': *phase_type = "Any";    *subtract = 1; *std_rule = 1; break;
+	case 'G': *phase_type = "Any";    *subtract = 2; *std_rule = 1; break;
+	case 'H': *phase_type = "Any";    *subtract = 3; *std_rule = 1; break;
+	case 'I': *phase_type = "All";    *subtract = 0; *std_rule = 1; break;
+	case 'J': *phase_type = "All";    *subtract = 1; *std_rule = 1; break;
+	case 'K': *phase_type = "All";    *subtract = 2; *std_rule = 1; break;
+	case 'L': *phase_type = "All";    *subtract = 3; *std_rule = 1; break;
+	/* Non-standard: explicit phase assignment */
+	case 'U': *phase_type = "Single"; *explicit_phase = 0; break;
+	case 'V': *phase_type = "Single"; *explicit_phase = 1; break;
+	case 'W': *phase_type = "Single"; *explicit_phase = 2; break;
+	case 'X': *phase_type = "Single"; *explicit_phase = 3; break;
+	case 'Y': *phase_type = "Any";    break;
+	case 'Z': *phase_type = "All";    break;
+	default:  *phase_type = "Unknown"; break;
+	}
+}
+
+static int parse_capcode_string(const char *str, capcode_parsed_t *out)
+{
+	const char *p = str;
+	char *endptr;
+
+	memset(out, 0, sizeof(*out));
+	out->collapse = -1;
+	out->frame = -1;
+	out->computed_phase = -1;
+	out->computed_frame = -1;
+	out->phase_type = "Unknown";
+
+	if (!str || !*str)
+		return -1;
+
+	/*
+	 * Detect whether this is a plain numeric capcode or an Extended
+	 * CAPCODE with alpha prefix.  Plain numeric strings contain only
+	 * digits 0-9.  Extended CAPCODEs contain at least one letter A-Z.
+	 */
+	{
+		int has_alpha = 0;
+		const char *c;
+		for (c = str; *c; c++) {
+			char ch = *c;
+			if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+				has_alpha = 1;
+				break;
+			}
+		}
+
+		if (!has_alpha) {
+			/* Plain numeric capcode — pass through directly */
+			out->capcode = strtoull(str, &endptr, 10);
+			if (*endptr != '\0')
+				return -1;
+			/* Compute standard frame/phase for logging */
+			out->computed_frame = (int)((out->capcode / 16) % 128);
+			out->computed_phase = (int)((out->capcode / 4) % 4);
+			return 0;
+		}
+	}
+
+	/*
+	 * Extended CAPCODE parsing.
+	 *
+	 * Scan left-to-right, consuming optional components:
+	 *   [R|S|P|Q]          — optional 2nd alpha (roaming), if followed by
+	 *                        another alpha or digit+alpha
+	 *   [fff]              — optional 1-3 digit frame number (0-127)
+	 *   [b]                — optional 1 digit collapse (0-7)
+	 *   <A-Z>              — required primary alpha prefix
+	 *   <digits>           — required numeric address (7, 9, or 10 digits)
+	 *
+	 * The tricky part: a leading digit could be frame prefix OR collapse.
+	 * We use a right-to-left approach: find the alpha, then parse what's
+	 * before it as optional frame+collapse, and what's after as the address.
+	 */
+
+	/* Find the rightmost alpha character — that's the primary alpha prefix.
+	 * Everything after it must be digits (the address).
+	 * Everything before it is optional frame/collapse/roaming. */
+	{
+		const char *alpha_pos = NULL;
+		const char *c;
+		int explicit_phase = -1;
+
+		/* Scan for the last alpha character before the digit run */
+		for (c = p; *c; c++) {
+			char ch = *c;
+			if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))
+				alpha_pos = c;
+		}
+
+		if (!alpha_pos)
+			return -1; /* no alpha found — shouldn't happen */
+
+		/* Verify everything after alpha is digits */
+		{
+			const char *d;
+			for (d = alpha_pos + 1; *d; d++) {
+				if (*d < '0' || *d > '9')
+					return -1;
+			}
+		}
+
+		/* Extract the numeric address (after alpha) */
+		out->capcode = strtoull(alpha_pos + 1, &endptr, 10);
+		if (*endptr != '\0')
+			return -1;
+
+		/* Extract primary alpha (uppercase) */
+		out->alpha = (*alpha_pos >= 'a' && *alpha_pos <= 'z')
+			     ? (*alpha_pos - 'a' + 'A') : *alpha_pos;
+		out->has_alpha = 1;
+
+		/* Classify the alpha prefix */
+		classify_capcode_alpha(out->alpha, &out->phase_type,
+				       &out->subtract, &out->std_rule,
+				       &explicit_phase);
+
+		/* Parse what's before the alpha: [roaming][frame][collapse] */
+		{
+			int prefix_len = (int)(alpha_pos - p);
+			char prefix[16];
+			int pi = 0;
+
+			if (prefix_len > 0 && prefix_len < (int)sizeof(prefix)) {
+				memcpy(prefix, p, prefix_len);
+				prefix[prefix_len] = '\0';
+
+				/* Check for leading roaming alpha (P/Q/R/S) */
+				{
+					char ch = prefix[pi];
+					if (ch == 'P' || ch == 'p' ||
+					    ch == 'Q' || ch == 'q' ||
+					    ch == 'R' || ch == 'r' ||
+					    ch == 'S' || ch == 's') {
+						out->has_roaming = 1;
+						out->roaming = (ch >= 'a') ? (ch - 'a' + 'A') : ch;
+						pi++;
+					}
+				}
+
+				/* Remaining chars before alpha are digits: [fff][b]
+				 * The last digit is collapse (0-7).
+				 * Preceding digits (if any) are frame number (0-127). */
+				{
+					int remaining = prefix_len - pi;
+					if (remaining > 0) {
+						/* Last digit = collapse */
+						char collapse_ch = prefix[prefix_len - 1];
+						if (collapse_ch >= '0' && collapse_ch <= '7') {
+							out->has_collapse = 1;
+							out->collapse = collapse_ch - '0';
+						}
+
+						/* Digits before collapse = frame */
+						if (remaining > 1) {
+							char frame_buf[8];
+							int flen = remaining - 1;
+							memcpy(frame_buf, prefix + pi, flen);
+							frame_buf[flen] = '\0';
+							out->has_frame = 1;
+							out->frame = atoi(frame_buf);
+							if (out->frame < 0 || out->frame > 127) {
+								LOGP(DFLEX, LOGL_NOTICE,
+								     "CAPCODE: frame %d out of range (0-127), ignoring.\n",
+								     out->frame);
+								out->has_frame = 0;
+								out->frame = -1;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		/* Compute standard-rule frame/phase from the numeric address.
+		 * Per Appendix A Section 3:
+		 *   phase = (address / 4) mod 4
+		 *   frame = (address / 16) mod 128
+		 * For multi-address pagers (subtract > 0), the standard rule
+		 * says subtract N from the capcode before computing, so all
+		 * addresses for one pager land on the same frame. */
+		{
+			uint64_t adj = out->capcode;
+			if (out->std_rule && out->subtract > 0 && adj >= (uint64_t)out->subtract)
+				adj -= out->subtract;
+			out->computed_frame = (int)((adj / 16) % 128);
+			out->computed_phase = (int)((adj / 4) % 4);
+		}
+	}
+
+	return 0;
+}
+
+/* Log human-readable Extended CAPCODE breakdown.
+ * Called after successful parse to explain what the CAPCODE means. */
+static void log_capcode_parsed(const capcode_parsed_t *cp, const char *raw_str)
+{
+	static const char *phase_names[] = { "A", "B", "C", "D" };
+	static const char *roaming_desc[] = {
+		[0] = "no FrameOffset, no TMF",		/* P */
+		[1] = "no FrameOffset, TMF capable",	/* Q */
+		[2] = "FrameOffset capable, no TMF",	/* R */
+		[3] = "FrameOffset + TMF capable",	/* S */
+	};
+
+	if (!cp->has_alpha) {
+		/* Plain numeric — just log computed frame/phase */
+		LOGP(DFLEX, LOGL_INFO,
+		     "CAPCODE: plain numeric %" PRIu64 " → frame=%d phase=%s (%s)\n",
+		     cp->capcode,
+		     cp->computed_frame,
+		     (cp->computed_phase >= 0 && cp->computed_phase <= 3)
+		       ? phase_names[cp->computed_phase] : "?",
+		     (cp->capcode <= FLEX_SHORT_ADDR_MAX) ? "Short" : "Long");
+		return;
+	}
+
+	/* Extended CAPCODE — full breakdown */
+	LOGP(DFLEX, LOGL_INFO,
+	     "CAPCODE: parsed '%s' → address=%" PRIu64 " alpha=%c (%s Phase, subtract %d%s)\n",
+	     raw_str, cp->capcode, cp->alpha,
+	     cp->phase_type, cp->subtract,
+	     cp->std_rule ? ", standard rule" : ", non-standard");
+
+	if (cp->has_collapse)
+		LOGP(DFLEX, LOGL_INFO,
+		     "CAPCODE:   collapse=%d (wake every %d frames = %.1fs interval)\n",
+		     cp->collapse, 1 << cp->collapse,
+		     (1 << cp->collapse) * 1.875);
+
+	if (cp->has_frame)
+		LOGP(DFLEX, LOGL_INFO,
+		     "CAPCODE:   explicit frame=%d (from CAPCODE prefix)\n",
+		     cp->frame);
+
+	if (cp->has_roaming) {
+		int ri = cp->roaming - 'P'; /* P=0, Q=1, R=2, S=3 */
+		LOGP(DFLEX, LOGL_INFO,
+		     "CAPCODE:   roaming=%c (%s)\n",
+		     cp->roaming,
+		     (ri >= 0 && ri <= 3) ? roaming_desc[ri] : "unknown");
+	}
+
+	if (cp->std_rule) {
+		LOGP(DFLEX, LOGL_INFO,
+		     "CAPCODE:   standard rule → computed frame=%d phase=%s "
+		     "(from address: frame=(%" PRIu64 "/16)%%128=%d, phase=(%" PRIu64 "/4)%%4=%d)\n",
+		     cp->computed_frame,
+		     (cp->computed_phase >= 0 && cp->computed_phase <= 3)
+		       ? phase_names[cp->computed_phase] : "?",
+		     cp->capcode, cp->computed_frame,
+		     cp->capcode, cp->computed_phase);
+	}
+
+	LOGP(DFLEX, LOGL_INFO,
+	     "CAPCODE:   address type: %s (range: short 1-%llu, long %llu-%llu)\n",
+	     (cp->capcode <= FLEX_SHORT_ADDR_MAX) ? "Short (1 word)" : "Long (2 words)",
+	     (unsigned long long)FLEX_SHORT_ADDR_MAX,
+	     (unsigned long long)FLEX_LONG_ADDR_MIN,
+	     (unsigned long long)FLEX_LONG_ADDR_MAX);
+}
+
 /* Build a human-readable flags string like "[GRP MAILDROP RETX]".
  * Returns pointer to static buffer. */
 static const char *flex_flags_str(int is_group, int is_temp_group,
@@ -1214,11 +1609,56 @@ static void fifo_process_line(const char *text, int text_length)
 	if (msg_secure_encoding == -1)
 		return;
 
-	/* Validate capcode */
-	capcode = strtoull(capcode_string, NULL, 10);
-	if (!flex_capcode_valid(capcode)) {
-		LOGP(DFLEX, LOGL_NOTICE, "Invalid capcode '%" PRIu64 "'.\n", capcode);
-		return;
+	/* Parse capcode — supports both plain numeric and Extended CAPCODE
+	 * format per ARIB STD-43A Appendix A.
+	 *
+	 * Plain:    1234567 or 007005031
+	 * Extended: 3E007005031  (collapse=3, alpha=E, address=007005031)
+	 *           A1234567     (alpha=A, address=1234567)
+	 *           0073U123456  (frame=007, collapse=3, alpha=U, address=123456)
+	 *
+	 * The parser extracts the numeric address and optional metadata
+	 * (collapse, phase type, roaming capability) for logging.
+	 * Only the numeric address is passed to the encoder. */
+	{
+		capcode_parsed_t cp;
+		if (parse_capcode_string(capcode_string, &cp) < 0) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: cannot parse capcode '%s' — expected numeric or Extended CAPCODE format.\n",
+			     capcode_string);
+			return;
+		}
+		capcode = cp.capcode;
+		if (!flex_capcode_valid(capcode)) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: invalid numeric address %" PRIu64 " from capcode '%s' "
+			     "(valid: short 1-%llu, long %llu-%llu).\n",
+			     capcode, capcode_string,
+			     (unsigned long long)FLEX_SHORT_ADDR_MAX,
+			     (unsigned long long)FLEX_LONG_ADDR_MIN,
+			     (unsigned long long)FLEX_LONG_ADDR_MAX);
+			return;
+		}
+		log_capcode_parsed(&cp, capcode_string);
+
+		/* Apply phase from Extended CAPCODE alpha prefix if not
+		 * overridden by explicit phase= option.
+		 * Non-standard U/V/W/X specify an explicit phase. */
+		if (cp.has_alpha && !cp.std_rule) {
+			int explicit_phase = -1;
+			switch (cp.alpha) {
+			case 'U': explicit_phase = 0; break;
+			case 'V': explicit_phase = 1; break;
+			case 'W': explicit_phase = 2; break;
+			case 'X': explicit_phase = 3; break;
+			}
+			if (explicit_phase >= 0 && msg_phase < 0) {
+				msg_phase = explicit_phase;
+				LOGP(DFLEX, LOGL_INFO,
+				     "CAPCODE: applying phase=%s from non-standard alpha '%c'.\n",
+				     flex_phase_name(msg_phase), cp.alpha);
+			}
+		}
 	}
 
 	/* Validate message type.
@@ -1444,7 +1884,7 @@ int main(int argc, char *argv[])
 		{ 10, "long capcode (2101249-4297068542)" },
 		{ 0, NULL }
 	};
-	main_mobile_init("0123456789", number_lengths, NULL, flex_number_valid, NULL);
+	main_mobile_init("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", number_lengths, NULL, flex_number_valid, NULL);
 
 	/* handle options / config file */
 	add_options();
