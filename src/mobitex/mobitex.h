@@ -294,7 +294,6 @@ typedef struct mobitex {
 	double              tx_svp_timer;       /* Countdown to next SVP transmission */
 	int                 tx_svp_auto;        /* Auto-transmit SVP when idle */
 	int                 tx_svp_seq;         /* Rotation counter for SVP type cycling */
-	int                 tx_carousel_phase;  /* 0=SVP next, 1=FRI next */
 
 	/* TX SVP1/SVP3 parameters (roaming + link, broadcast to mobiles) */
 	uint8_t             tx_txpow;           /* TX power reduction for mobiles (dB) */
@@ -324,8 +323,9 @@ typedef struct mobitex {
 	uint8_t             tx_max_speech;      /* Max blocks for line connection */
 	uint8_t             tx_timeout;         /* Access timeout (seconds) */
 	uint8_t             tx_prio;            /* Priority level */
-	double              tx_fri_interval;    /* FRI interval in seconds (default 0.5) */
-	double              tx_fri_timer;       /* Countdown to next FRI transmission */
+	double              tx_fri_interval;    /* FRI interval in seconds (unused, kept for CLI compat) */
+	double              tx_fri_timer;       /* (unused, FRI now follows SVP directly) */
+	int                 tx_fri_pending;     /* 1 = FRI should follow the SVP just sent */
 
 	/* Channel access (Slotted Aloha) retry state */
 	int                 tx_access_retries;      /* Current retry count */

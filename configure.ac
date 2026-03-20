@@ -121,6 +121,7 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/pocsag/Makefile
     src/flex/Makefile
     src/golay/Makefile
+    src/mobitex/Makefile
     src/fuenf/Makefile
     src/tv/Makefile
     src/radio/Makefile

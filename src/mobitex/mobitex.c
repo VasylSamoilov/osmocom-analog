@@ -1011,7 +1011,7 @@ static void mobitex_tx_access_request(mobitex_t *mobitex, uint8_t frame_type)
 	lc.frame_id = frame_type;
 	lc.seq_num = 0;
 	lc.block_length = 1;
-	lc.bytes_last = 0;
+	lc.bytes_last = 1;
 	mobitex_build_link_control(&lc, block20);
 
 	memcpy(data18, block20, MOBITEX_DATA_BYTES);
@@ -1283,13 +1283,16 @@ static void mobitex_tx_svp(mobitex_t *mobitex)
 		/* Build primary data block */
 		memset(block20, 0, sizeof(block20));
 
-		/* Link Control: MAN = base station MAN, Frame ID = 0x0F (SVP), block_length = 1 */
+		/* Link Control: MAN = base station MAN, Frame ID = 0x0F (SVP), block_length = 1
+		 * bytes_last = 1, seq_num = 8: matches real base station captures.
+		 * PDW checks (block[4] & 0x1F) == 24 which requires exactly these values.
+		 * bytes_last = 0 caused modem to ignore SVP parameters entirely. */
 		memset(&lc, 0, sizeof(lc));
 		lc.dest_man = mobitex->tx_base_man;
 		lc.frame_id = MOBITEX_FT_SVP;
-		lc.seq_num = 0;
+		lc.seq_num = 8;
 		lc.block_length = 1;
-		lc.bytes_last = 0;
+		lc.bytes_last = 1;
 		mobitex_build_link_control(&lc, block20);
 
 		/* Byte 6: sweep type */
@@ -1399,7 +1402,7 @@ static void mobitex_tx_fri(mobitex_t *mobitex)
 	lc.frame_id = MOBITEX_FT_FRI;
 	lc.seq_num = 0;
 	lc.block_length = 1;
-	lc.bytes_last = 0;
+	lc.bytes_last = 1; /* match SVP convention from real base station captures */
 	mobitex_build_link_control(&lc, block20);
 
 	/* FRI parameters */
@@ -1464,7 +1467,7 @@ static void mobitex_tx_response(mobitex_t *mobitex, uint8_t frame_type, uint32_t
 	lc.frame_id = frame_type;
 	lc.seq_num = 0;
 	lc.block_length = 1;
-	lc.bytes_last = 0;
+	lc.bytes_last = 1;
 	mobitex_build_link_control(&lc, block20);
 
 	memcpy(data18, block20, MOBITEX_DATA_BYTES);
@@ -1550,17 +1553,19 @@ void mobitex_tx_idle_tick(mobitex_t *mobitex, int samples)
 	if (mobitex->msg_list)
 		return;
 
-	/* Count down the FRI timer (base station mode only) */
-	if (!mobitex_is_mobile_mode(mobitex) && mobitex->tx_fri_interval > 0) {
-		mobitex->tx_fri_timer -= elapsed;
-		if (mobitex->tx_fri_timer <= 0) {
-			mobitex_tx_fri(mobitex);
-			mobitex->tx_fri_timer = mobitex->tx_fri_interval;
-			return; /* FRI sent this tick, SVP next time */
-		}
+	/* MIS standard: idle channel cadence is <SVP> <FRI> pairs.
+	 * Each SVP is immediately followed by one FRI.  The pair repeats
+	 * at the SVP interval (roam signal at least twice per second).
+	 * Between pairs, filler frames keep the modem's bit clock locked. */
+
+	/* After SVP was sent, the next frame must be FRI (completing the pair) */
+	if (!mobitex_is_mobile_mode(mobitex) && mobitex->tx_fri_pending) {
+		mobitex->tx_fri_pending = 0;
+		mobitex_tx_fri(mobitex);
+		return;
 	}
 
-	/* Count down the SVP timer */
+	/* Count down SVP timer */
 	mobitex->tx_svp_timer -= elapsed;
 
 	if (mobitex->tx_svp_timer <= 0) {
@@ -1589,6 +1594,7 @@ void mobitex_tx_idle_tick(mobitex_t *mobitex, int samples)
 
 		mobitex_tx_svp(mobitex);
 		mobitex->tx_svp_timer = mobitex->tx_svp_interval;
+		mobitex->tx_fri_pending = 1; /* FRI follows on next tick */
 	}
 }
 
