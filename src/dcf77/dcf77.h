@@ -27,6 +27,11 @@ typedef struct dcf77_tx {
 	int temperature_day;
 	int temperature_night;
 	uint64_t weather_cipher;
+	/* baseband (SDR) mode timing */
+	double sample_counter;		/* fractional sample position within second */
+	double samples_per_second;	/* samplerate as double */
+	double samples_0;		/* samples for 100ms reduction ('0' bit) */
+	double samples_1;		/* samples for 200ms reduction ('1' bit) */
 } dcf77_tx_t;
 
 typedef struct dcf77_rx {
@@ -70,7 +75,9 @@ dcf77_t *dcf77_create(int samplerate, int use_tx, int use_rx, int test_tone);
 void dcf77_destroy(dcf77_t *dcf77);
 void dcf77_tx_start(dcf77_t *dcf77, time_t timestamp, double sub_sec);
 void dcf77_encode(dcf77_t *dcf77, sample_t *samples, int length);
+void dcf77_encode_baseband(dcf77_t *dcf77, sample_t *samples, int length);
 void dcf77_decode(dcf77_t *dcf77, sample_t *samples, int length);
+void dcf77_decode_baseband(dcf77_t *dcf77, sample_t *samples, int length);
 
 void list_weather(void);
 time_t dcf77_start_weather(time_t timestamp, int region, int offset);

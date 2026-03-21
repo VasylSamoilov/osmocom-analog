@@ -118,6 +118,12 @@ dcf77_t *dcf77_create(int samplerate, int use_tx, int use_rx, int test_tone)
 		tx->waves_sec = CARRIER_FREQUENCY;
 
 		tx->test_tone = test_tone;
+
+		/* baseband (SDR) mode timing */
+		tx->samples_per_second = (double)samplerate;
+		tx->samples_0 = (double)samplerate * 0.1;  /* 100ms reduction for '0' */
+		tx->samples_1 = (double)samplerate * 0.2;  /* 200ms reduction for '1' */
+		tx->sample_counter = 0.0;
 	}
 
 	/* prepare rx */
@@ -382,6 +388,59 @@ void dcf77_encode(dcf77_t *dcf77, sample_t *samples, int length)
 	}
 	tx->carrier_phase = carrier_phase;
 	tx->test_phase = test_phase;
+}
+
+/* encode baseband AM envelope for SDR transmission.
+ * Output is the amplitude envelope: 1.0 = full carrier, REDUCTION_FACTOR = reduced.
+ * The SDR library handles AM modulation onto the 77.5 kHz carrier. */
+void dcf77_encode_baseband(dcf77_t *dcf77, sample_t *samples, int length)
+{
+	dcf77_tx_t *tx = &dcf77->tx;
+	int i;
+
+	if (!tx->enable) {
+		memset(samples, 0, sizeof(*samples) * length);
+		return;
+	}
+
+	for (i = 0; i < length; i++) {
+		samples[i] = tx->level;
+		tx->sample_counter += 1.0;
+		if (tx->sample_counter >= tx->samples_per_second) {
+			tx->sample_counter -= tx->samples_per_second;
+			if (++tx->second == 60) {
+				tx->second = 0;
+				tx->timestamp += 60;
+			}
+			tx->symbol = tx_symbol(dcf77, tx->timestamp, tx->second);
+			/* set level for start of new second */
+			switch (tx->symbol) {
+			case '0':
+				tx->level = TX_LEVEL * REDUCTION_FACTOR;
+				break;
+			case '1':
+				tx->level = TX_LEVEL * REDUCTION_FACTOR;
+				break;
+			case 'm':
+				tx->level = TX_LEVEL;
+				break;
+			}
+		} else {
+			/* check if reduction period has ended */
+			switch (tx->symbol) {
+			case '0':
+				if (tx->sample_counter >= tx->samples_0)
+					tx->level = TX_LEVEL;
+				break;
+			case '1':
+				if (tx->sample_counter >= tx->samples_1)
+					tx->level = TX_LEVEL;
+				break;
+			default:
+				break;
+			}
+		}
+	}
 }
 
 /*
@@ -660,6 +719,72 @@ void dcf77_decode(dcf77_t *dcf77, sample_t *samples, int length)
 				rx->clock_count++;
 
 
+		}
+	}
+}
+
+/* decode baseband AM envelope from SDR.
+ * Input samples are the demodulated AM envelope (amplitude values).
+ * We skip the carrier mixing/filtering and feed directly into clock recovery. */
+void dcf77_decode_baseband(dcf77_t *dcf77, sample_t *samples, int length)
+{
+	dcf77_rx_t *rx = &dcf77->rx;
+	double level, delayed_level, reduction, quality;
+	int i;
+
+	display_wave(&dcf77->dispwav, samples, length, 1.0);
+
+	if (!rx->enable)
+		return;
+
+	for (i = 0; i < length; i++) {
+		rx->sample_counter += rx->sample_step;
+		if (rx->sample_counter >= 1.0) {
+			rx->sample_counter -= 1.0;
+
+			/* level is the absolute value of the envelope */
+			level = fabs(samples[i]);
+			if (level > 0.0)
+				display_measurements_update(dcf77->dmp_signal_level, level2db(level), 0.0);
+			display_measurements_update(dcf77->dmp_input_level, level2db(level), 0.0);
+
+			/* delay sample */
+			delayed_level = rx->delay_buffer[rx->delay_index];
+			rx->delay_buffer[rx->delay_index] = level;
+			if (++rx->delay_index == rx->delay_size)
+				rx->delay_index = 0;
+
+			if (rx->clock_count < 0 || rx->clock_count > 900) {
+				if (level / delayed_level < REDUCTION_TH)
+					rx->clock_count = 0;
+			}
+			if (rx->clock_count >= 0) {
+				if (rx->clock_count == 0)
+					rx->value_level = delayed_level;
+				if (rx->clock_count == 50) {
+					rx->value_short = level;
+					reduction = rx->value_short / rx->value_level;
+					if (reduction < REDUCTION_TH) {
+						if (reduction < REDUCTION_FACTOR)
+							reduction = REDUCTION_FACTOR;
+						quality = 1.0 - (reduction - REDUCTION_FACTOR) / (REDUCTION_TH - REDUCTION_FACTOR);
+						display_measurements_update(dcf77->dmp_signal_quality, quality * 100.0, 0.0);
+					}
+				}
+				if (rx->clock_count == 150) {
+					rx->value_long = level;
+					if (rx->value_long / rx->value_level < REDUCTION_TH)
+						rx_symbol(dcf77, '1');
+					else
+						rx_symbol(dcf77, '0');
+				}
+				if (rx->clock_count == 1100) {
+					rx->clock_count = -1;
+					rx_symbol(dcf77, 'm');
+				}
+			}
+			if (rx->clock_count >= 0)
+				rx->clock_count++;
 		}
 	}
 }

@@ -17,6 +17,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+enum paging_signal;
+
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -33,8 +35,17 @@
 #include "../libsample/sample.h"
 #include "../libaaimage/aaimage.h"
 #include <osmocom/cc/misc.h>
+#ifdef HAVE_SDR
+#include "../libsdr/sdr_config.h"
+#include "../libsdr/sdr.h"
+#endif
 #include "dcf77.h"
 #include "cities.h"
+#include "timesignal.h"
+#include "timesignal_tx.h"
+
+/* DCF77 carrier frequency (default) */
+#define DCF77_FREQUENCY		77500.0
 
 int num_kanal = 1;
 dcf77_t *dcf77 = NULL;
@@ -59,6 +70,16 @@ static int test_tone = 0;
 static int dsp_interval = 1; /* ms */
 static int rt_prio = 0;
 static int fast_math = 0;
+static double time_offset_minutes = 0.0;
+static int time_service = TIME_SERVICE_DCF77;
+static struct time_protocol time_proto;
+static struct timesignal_tx generic_tx;
+#ifdef HAVE_SDR
+int use_sdr = 0;
+static void *sdr = NULL;
+/* LO offset: negative to avoid DC spike in the narrow DCF77 signal */
+#define DEFAULT_LO_OFFSET	-10000.0
+#endif
 
 /* not static, in case we add libtimer some day, then compiler hits an error */
 double get_time(void);
@@ -136,7 +157,11 @@ static time_t feierabend_time()
 
 static void print_usage(const char *app)
 {
+#ifdef HAVE_SDR
+	printf("Usage: %s [-a hw:0,0] | [--sdr-soapy|--sdr-uhd <sdr options>] [<options>]\n", app);
+#else
 	printf("Usage: %s [-a hw:0,0] [<options>]\n", app);
+#endif
 }
 
 static void print_help(void)
@@ -147,6 +172,14 @@ static void print_help(void)
 	printf(" --config [~/]<path to config file>\n");
 	printf("        Give a config file to use. If it starts with '~/', path is at home dir.\n");
 	printf("        Each line in config file is one option, '-' or '--' must not be given!\n");
+	printf(" -S --service DCF77 | WWVB | MSF | JJY40 | JJY60\n");
+	printf("        Select time signal service (default: DCF77)\n");
+	printf("        DCF77 : Germany, 77.5 kHz\n");
+	printf("        WWVB  : USA, 60 kHz\n");
+	printf("        MSF   : United Kingdom, 60 kHz\n");
+	printf("        JJY40 : Japan, 40 kHz\n");
+	printf("        JJY60 : Japan, 60 kHz\n");
+	printf("        Sound card mode needs sample rate >= 2x carrier frequency.\n");
 	logging_print_help();
 	printf(" -a --audio-device hw:<card>,<device>\n");
 	printf("        Sound card and device number (default = '%s')\n", dsp_device);
@@ -158,7 +191,10 @@ static void print_help(void)
 	printf(" -T --tx\n");
 	printf("        Transmit time signal (default)\n");
 	printf(" -R --rx\n");
-	printf("        Receive time signal\n");
+	printf("        Receive time signal (DCF77 only, not yet supported for other services)\n");
+	printf(" -O --time-offset <minutes>\n");
+	printf("        Offset transmitted time by given number of minutes.\n");
+	printf("        Can be negative. Fractional values allowed (e.g. 1.5).\n");
 	printf(" -F --fake\n");
 	printf("        Use given time stamp: <year> <month> <day> <hour> <min> <sec>.\n");
 	printf("        All values have to be numerical. The year must have 4 digits.\n");
@@ -193,12 +229,24 @@ static void print_help(void)
 	printf("        Search for city (case insensitive) and display its region code.\n");
 	printf(" -D --double-amplitude\n");
 	printf("        Transmit with double amplitude by using differential stereo output.\n");
+	printf("        (Sound card mode only.)\n");
 	printf("     --test-tone\n");
 	printf("        Transmit a test tone (10%% level, 1000 Hz) with the carrier.\n");
+	printf("        (Sound card mode only.)\n");
 	printf(" -r --realtime <prio>\n");
 	printf("        Set prio: 0 to disable, 99 for maximum (default = %d)\n", rt_prio);
 	printf("    --fast-math\n");
 	printf("        Use fast math approximation for slow CPU / ARM based systems.\n");
+#ifdef HAVE_SDR
+	printf("\nSDR options:\n");
+	printf("    DCF77 transmits at 77.5 kHz. Most SDRs cannot tune this low directly.\n");
+	printf("    Use --sdr-rx-upconverter / --sdr-tx-upconverter to specify the offset\n");
+	printf("    of your upconverter (e.g. 125000000 for a Ham-It-Up at 125 MHz).\n");
+	printf("    Use --sdr-ppm to correct crystal oscillator frequency error.\n");
+	printf("    The SDR sample rate (-s) can be much lower than 192 kHz since the\n");
+	printf("    SDR handles the carrier; only the AM envelope is processed.\n");
+	sdr_config_print_help();
+#endif
 	printf("\n");
 	printf("Press 'w' key to toggle display of RX wave form.\n");
 	printf("Press 'm' key to toggle display of measurement values.\n");
@@ -218,11 +266,13 @@ static void add_options(void)
 {
 	option_add('h', "help", 0);
 	option_add('v', "verbose", 1);
+	option_add('S', "service", 1);
 	option_add('a', "audio-device", 1);
 	option_add('s', "samplerate", 1);
 	option_add('b', "buffer", 1);
 	option_add('T', "tx", 0);
 	option_add('R', "rx", 0);
+	option_add('O', "time-offset", 1);
 	option_add('F', "fake", 6);
 	option_add(OPT_F1, "feierabend", 0);
 	option_add(OPT_F2, "end-of-working-day", 0);
@@ -239,6 +289,9 @@ static void add_options(void)
 	option_add(OPT_TEST_TONE, "test-tone", 0);
 	option_add('r', "realtime", 1);
 	option_add(OPT_FAST_MATH, "fast-math", 0);
+#ifdef HAVE_SDR
+	sdr_config_add_options();
+#endif
 }
 
 static const char *wind_dirs[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
@@ -262,6 +315,13 @@ static int handle_options(int short_option, int argi, char **argv)
 			return rc;
 		}
 		break;
+	case 'S':
+		time_service = time_service_by_name(argv[argi]);
+		if (time_service < 0) {
+			fprintf(stderr, "Unknown time service '%s'. Use DCF77, WWVB, MSF, JJY40, or JJY60.\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
 	case 'a':
 		dsp_device = options_strdup(argv[argi]);
 		break;
@@ -276,6 +336,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 'R':
 		rx = 1;
+		break;
+	case 'O':
+		time_offset_minutes = atof(argv[argi]);
 		break;
 	case 'F':
 		timestamp = parse_time(argv + argi);
@@ -378,7 +441,11 @@ no_multiple_weathers:
 		fast_math = 1;
 		break;
 	default:
+#ifdef HAVE_SDR
+		return sdr_config_handle_options(short_option, argi, argv);
+#else
 		return -EINVAL;
+#endif
 	}
 
 	return 1;
@@ -412,6 +479,11 @@ static int get_char()
                 return -1;
 }
 
+/*
+ * Sound card interface (direct audio at >= 192 kHz with 77.5 kHz carrier)
+ */
+
+#ifdef HAVE_ALSA
 static int soundif_open(const char *audiodev, int samplerate, int buffer_size)
 {
 	enum sound_direction direction = SOUND_DIR_DUPLEX;
@@ -466,7 +538,10 @@ static void soundif_work(int buffer_size)
 			return;
 		}
 		if (count) {
-			dcf77_encode(dcf77, samples[0], count);
+			if (time_service == TIME_SERVICE_DCF77)
+				dcf77_encode(dcf77, samples[0], count);
+			else
+				timesignal_tx_encode_carrier(&generic_tx, samples[0], count);
 			if (double_amplitude) {
 				for (i = 0; i < count; i++)
 					samples[1][i] = -samples[0][i];
@@ -491,6 +566,7 @@ static void soundif_work(int buffer_size)
 		dcf77_decode(dcf77, samples[0], count);
 	}
 }
+#endif /* HAVE_ALSA */
 
 int main(int argc, char *argv[])
 {
@@ -499,8 +575,15 @@ int main(int argc, char *argv[])
 	struct termios term, term_orig;
 	double begin_time, now, sleep;
 	char c;
+#ifdef HAVE_SDR
+	float *sendbuff = NULL;
+#endif
 
 	logging_init();
+
+#ifdef HAVE_SDR
+	sdr_config_init(DEFAULT_LO_OFFSET);
+#endif
 
 	/* handle options / config file */
 	add_options();
@@ -511,14 +594,60 @@ int main(int argc, char *argv[])
 	if (argi <= 0)
 		return argi;
 
+#ifdef HAVE_SDR
+	/* check if SDR was selected */
+	rc = sdr_configure(dsp_samplerate);
+	if (rc < 0)
+		return rc;
+	use_sdr = (rc > 0);
+#endif
+
+#ifdef HAVE_SDR
+	if (!use_sdr && dsp_samplerate < 192000) {
+#else
 	if (dsp_samplerate < 192000) {
-		fprintf(stderr, "The sample rate must be at least 192000 to TX or RX 77.5 kHz. Quitting!\n");
-		goto error;
+#endif
+		/* Sound card mode needs sample rate >= 2x carrier frequency.
+		 * DCF77=77.5kHz needs >=192kHz, WWVB/MSF=60kHz needs >=120kHz,
+		 * JJY40=40kHz needs >=80kHz. Check Nyquist. */
+		double min_rate = time_service_frequency(time_service) * 2.0 + 1000.0;
+		if (dsp_samplerate < (int)min_rate) {
+			fprintf(stderr, "The sample rate must be at least %d to TX/RX %.1f kHz via sound card. Quitting!\n",
+				(int)min_rate, time_service_frequency(time_service) / 1000.0);
+			goto error;
+		}
 	}
 
 	/* default to TX, if --tx and --rx was not set */
 	if (!tx && !rx)
 		tx = 1;
+
+	/* RX decoding is only implemented for DCF77 */
+	if (rx && time_service != TIME_SERVICE_DCF77) {
+		fprintf(stderr, "Receive mode is only supported for DCF77. %s is TX-only for now.\n",
+			time_service_name(time_service));
+		goto error;
+	}
+
+#ifdef HAVE_SDR
+	if (use_sdr) {
+		/* In SDR mode, sync direction flags with SDR config */
+		if (rx && !tx) {
+			if (sdr_config->tx_only) {
+				fprintf(stderr, "Conflicting options: --rx cannot be combined with --sdr-tx-only\n");
+				goto error;
+			}
+			sdr_config->rx_only = 1;
+		}
+		if (tx && !rx) {
+			if (sdr_config->rx_only) {
+				fprintf(stderr, "Conflicting options: --tx cannot be combined with --sdr-rx-only\n");
+				goto error;
+			}
+			sdr_config->tx_only = 1;
+		}
+	}
+#endif
 
 	/* inits */
 	dcf77_init(fast_math);
@@ -526,28 +655,114 @@ int main(int argc, char *argv[])
 	/* size of dsp buffer in samples */
 	buffer_size = dsp_samplerate * dsp_buffer / 1000;
 
-	rc = soundif_open(dsp_device, dsp_samplerate, buffer_size);
-	if (rc < 0) {
-		printf("Failed to open sound for DCF77, use '-h' for help.\n");
+#ifdef HAVE_SDR
+	if (use_sdr) {
+		/* SDR mode: AM envelope at baseband, SDR handles the carrier.
+		 * No 192 kHz minimum needed — the sample rate just needs to be
+		 * enough for the ~10 Hz bandwidth AM envelope (1 kHz is plenty). */
+		double carrier_freq = time_service_frequency(time_service);
+		double tx_frequencies[1], rx_frequencies[1];
+		int am[1];
+
+		tx_frequencies[0] = carrier_freq;
+		rx_frequencies[0] = carrier_freq;
+		am[0] = 1; /* AM modulation */
+
+		/* Initialize generic protocol for non-DCF77 services */
+		time_service_init_protocol(time_service, &time_proto);
+
+		if (time_service == TIME_SERVICE_DCF77) {
+			/* DCF77: use existing full implementation (weather, etc.) */
+			dcf77 = dcf77_create(dsp_samplerate, tx, rx, test_tone);
+			if (!dcf77) {
+				fprintf(stderr, "Failed to create \"DCF77\" instance. Quitting!\n");
+				goto error;
+			}
+		} else {
+			/* Other services: use generic encoder, still need dcf77 struct for display */
+			dcf77 = dcf77_create(dsp_samplerate, 0, rx, 0);
+			if (!dcf77) {
+				fprintf(stderr, "Failed to create \"%s\" instance. Quitting!\n",
+					time_service_name(time_service));
+				goto error;
+			}
+			if (tx)
+				timesignal_tx_init(&generic_tx, &time_proto, dsp_samplerate);
+		}
+
+		sdr = sdr_open(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0,
+			       dsp_samplerate, buffer_size, 1.0, 0.0, 0.0, 1.0);
+		if (!sdr) {
+			fprintf(stderr, "Failed to open SDR for %s, use '-h' for help.\n",
+				time_service_name(time_service));
+			goto error;
+		}
+
+		sendbuff = calloc(buffer_size * 2, sizeof(*sendbuff));
+		if (!sendbuff) {
+			fprintf(stderr, "No mem!\n");
+			goto error;
+		}
+	} else
+#endif
+	{
+#ifdef HAVE_ALSA
+		/* Sound card mode: carrier generated directly in audio samples */
+		rc = soundif_open(dsp_device, dsp_samplerate, buffer_size);
+		if (rc < 0) {
+			printf("Failed to open sound for %s, use '-h' for help.\n",
+			       time_service_name(time_service));
+			goto error;
+		}
+
+		if (time_service == TIME_SERVICE_DCF77) {
+			dcf77 = dcf77_create(dsp_samplerate, tx, rx, test_tone);
+			if (!dcf77) {
+				fprintf(stderr, "Failed to create \"DCF77\" instance. Quitting!\n");
+				goto error;
+			}
+		} else {
+			/* Generic protocol via sound card */
+			time_service_init_protocol(time_service, &time_proto);
+			dcf77 = dcf77_create(dsp_samplerate, 0, rx, 0);
+			if (!dcf77) {
+				fprintf(stderr, "Failed to create \"%s\" instance. Quitting!\n",
+					time_service_name(time_service));
+				goto error;
+			}
+			if (tx)
+				timesignal_tx_init(&generic_tx, &time_proto, dsp_samplerate);
+		}
+#else
+		fprintf(stderr, "No SDR selected and no ALSA sound support compiled in. Quitting!\n");
 		goto error;
+#endif
 	}
 
-	dcf77 = dcf77_create(dsp_samplerate, tx, rx, test_tone);
-	if (!dcf77) {
-		fprintf(stderr, "Failed to create \"DCF77\" instance. Quitting!\n");
-		goto error;
+	if (weather) {
+		if (time_service != TIME_SERVICE_DCF77) {
+			fprintf(stderr, "Weather data is only supported for DCF77. Ignoring --weather for %s.\n",
+				time_service_name(time_service));
+			weather = 0;
+		} else {
+			dcf77_set_weather(dcf77, weather_day, weather_night, extreme, rain, wind_dir, wind_bft, temperature_day, temperature_night);
+		}
 	}
-	if (weather)
-		dcf77_set_weather(dcf77, weather_day, weather_night, extreme, rain, wind_dir, wind_bft, temperature_day, temperature_night);
 
 	/* no time stamp given, so we use our clock */
 	if (tx) {
-		if (timestamp < 0 && region < 0)
-			printf("No alternative time given, so you might not notice the difference between our transmission and the real DCF77 transmission.\n");
+		if (timestamp < 0 && region < 0 && time_offset_minutes == 0.0)
+			printf("No alternative time given, so you might not notice the difference between our transmission and the real %s transmission.\n",
+			       time_service_name(time_service));
 		if (timestamp < 0)
 			timestamp = get_time();
 		if (region >= 0 && weather)
 			timestamp = dcf77_start_weather((time_t)timestamp, region, region_advance);
+		/* apply time offset */
+		if (time_offset_minutes != 0.0) {
+			timestamp += time_offset_minutes * 60.0;
+			printf("Time offset: %.1f minutes applied.\n", time_offset_minutes);
+		}
 	}
 
 	/* set real time prio */
@@ -564,7 +779,16 @@ int main(int argc, char *argv[])
 	}
 
 	print_aaimage();
-	printf("DCF77 ready.\n");
+#ifdef HAVE_SDR
+	if (use_sdr)
+		printf("%s ready (SDR mode, %.1f kHz).\n",
+		       time_service_name(time_service),
+		       time_service_frequency(time_service) / 1000.0);
+	else
+#endif
+		printf("%s ready (sound card, %.1f kHz carrier).\n",
+		       time_service_name(time_service),
+		       time_service_frequency(time_service) / 1000.0);
 
 	/* prepare terminal */
 	tcgetattr(0, &term_orig);
@@ -579,16 +803,82 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, sighandler);
 	signal(SIGPIPE, sighandler);
 
-	soundif_start();
-	if (tx)
-		dcf77_tx_start(dcf77, (time_t)timestamp, fmod(timestamp, 1.0));
+#ifdef HAVE_SDR
+	if (use_sdr) {
+		sdr_start(sdr);
+	} else
+#endif
+	{
+#ifdef HAVE_ALSA
+		soundif_start();
+#endif
+	}
+
+	if (tx) {
+		if (time_service != TIME_SERVICE_DCF77)
+			timesignal_tx_start(&generic_tx, (time_t)timestamp, fmod(timestamp, 1.0));
+		else
+			dcf77_tx_start(dcf77, (time_t)timestamp, fmod(timestamp, 1.0));
+	}
 
 	while (!quit) {
 		int w;
 
 		begin_time = get_time();
 
-		soundif_work(buffer_size);
+#ifdef HAVE_SDR
+		if (use_sdr) {
+			/* SDR work loop.
+			 * With channels=0, sdr_read/sdr_write pass raw interleaved
+			 * IQ float pairs (I0,Q0,I1,Q1,...).  DCF77 is pure AM at
+			 * baseband (SDR tunes to 77.5 kHz), so:
+			 *   TX: amplitude envelope -> IQ with I=amplitude, Q=0
+			 *   RX: IQ -> magnitude = sqrt(I²+Q²) -> envelope decoder
+			 */
+			int got, tosend;
+
+			if (rx) {
+				got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
+				if (got > 0) {
+					sample_t rx_envelope[got];
+					int j, jj;
+					/* extract AM envelope from raw IQ */
+					for (j = 0, jj = 0; j < got; j++) {
+						double i_val = sendbuff[jj++];
+						double q_val = sendbuff[jj++];
+						rx_envelope[j] = sqrt(i_val * i_val + q_val * q_val);
+					}
+					dcf77_decode_baseband(dcf77, rx_envelope, got);
+				}
+			}
+
+			if (tx) {
+				tosend = sdr_get_tosend(sdr, buffer_size);
+				if (tosend > buffer_size / 4)
+					tosend = buffer_size / 4;
+				if (tosend > 0) {
+					sample_t tx_envelope[tosend];
+					int j, jj;
+					if (time_service == TIME_SERVICE_DCF77)
+						dcf77_encode_baseband(dcf77, tx_envelope, tosend);
+					else
+						timesignal_tx_encode(&generic_tx, tx_envelope, tosend);
+					/* convert amplitude envelope to IQ: I=amplitude, Q=0 */
+					for (j = 0, jj = 0; j < tosend; j++) {
+						sendbuff[jj++] = tx_envelope[j];
+						sendbuff[jj++] = 0.0f;
+					}
+					sdr_write(sdr, (void *)sendbuff, NULL, tosend, NULL, NULL, 0);
+				}
+			}
+		} else
+#endif
+		{
+#ifdef HAVE_ALSA
+			soundif_work(buffer_size);
+#endif
+		}
+
 		do {
 			w = 0;
 		} while (w);
@@ -642,11 +932,18 @@ int main(int argc, char *argv[])
 	tcsetattr(0, TCSANOW, &term_orig);
 
 error:
-	/* destroy UK0 instances */
+	/* destroy DCF77 instance */
 	if (dcf77)
 		dcf77_destroy(dcf77);
 
+#ifdef HAVE_SDR
+	if (sdr)
+		sdr_close(sdr);
+	free(sendbuff);
+#endif
+#ifdef HAVE_ALSA
 	soundif_close();
+#endif
 
 	dcf77_exit();
 
@@ -661,4 +958,3 @@ error:
 void osmo_cc_set_log_cat(int __attribute__((unused)) cc_log_cat) {}
 
 sender_t *get_sender_by_empfangsfrequenz(double __attribute__((unused)) freq) { return NULL; }
-
