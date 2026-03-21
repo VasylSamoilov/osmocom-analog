@@ -358,12 +358,19 @@ int main(int argc, char *argv[])
 	}
 
 	/* Output results */
+	double applied_ppm = sdr_config->rx_ppm;
+
 	if (json_output) {
-		printf("{\"success\": true, \"bands\": [");
+		printf("{\"success\": true, ");
+		if (applied_ppm != 0.0)
+			printf("\"applied_ppm\": %.6f, ", applied_ppm);
+		printf("\"bands\": [");
 		for (int i = 0; i < num_results; i++) {
+			double total_ppm = results[i].ppm_offset + applied_ppm;
 			if (i > 0) printf(", ");
 			printf("{\"band\": \"%s\", ", gsm_band_name(results[i].gsm_band));
-			printf("\"ppm\": %.6f, ", results[i].ppm_offset);
+			printf("\"ppm\": %.6f, ", total_ppm);
+			printf("\"residual_ppm\": %.6f, ", results[i].ppm_offset);
 			printf("\"hz\": %.2f, ", results[i].hz_offset);
 			printf("\"stddev_hz\": %.2f, ", results[i].stddev_hz);
 			printf("\"frequency\": %.0f, ", results[i].freq_hz);
@@ -373,12 +380,18 @@ int main(int argc, char *argv[])
 		printf("]}\n");
 	} else {
 		printf("\n=== Calibration Results ===\n");
+		if (applied_ppm != 0.0)
+			printf("  (applied --sdr-ppm %.3f during measurement)\n", applied_ppm);
 		for (int i = 0; i < num_results; i++) {
+			double total_ppm = results[i].ppm_offset + applied_ppm;
 			printf("\n  %s (%.3f MHz):\n",
 			       gsm_band_name(results[i].gsm_band),
 			       results[i].freq_hz / 1e6);
 			printf("    Offset:       %+.2f Hz (%.3f ppm)\n",
 			       results[i].hz_offset, results[i].ppm_offset);
+			if (applied_ppm != 0.0)
+				printf("    Total PPM:    %.3f (residual %+.3f + applied %+.3f)\n",
+				       total_ppm, results[i].ppm_offset, applied_ppm);
 			printf("    Std dev:      %.1f Hz\n", results[i].stddev_hz);
 			printf("    Measurements: %d (%.0f%% confidence)\n",
 			       results[i].num_measurements,
@@ -393,11 +406,15 @@ int main(int argc, char *argv[])
 		}
 
 		printf("\nBest result from %s:\n", gsm_band_name(results[best].gsm_band));
+		double best_total_ppm = results[best].ppm_offset + applied_ppm;
 		printf("  Frequency offset: %+.2f Hz\n", results[best].hz_offset);
 		printf("  PPM offset:       %.3f ppm\n", results[best].ppm_offset);
+		if (applied_ppm != 0.0)
+			printf("  Total PPM:        %.3f ppm (residual %+.3f + applied %+.3f)\n",
+			       best_total_ppm, results[best].ppm_offset, applied_ppm);
 		printf("  Std deviation:    %.1f Hz\n", results[best].stddev_hz);
 		printf("\nTo apply this correction:\n");
-		printf("  --ppm %.1f\n", -results[best].ppm_offset);
+		printf("  --sdr-ppm %.1f\n", best_total_ppm);
 	}
 
 	fflush(stdout);
