@@ -185,6 +185,13 @@ int sdr_check_separate_device_support(int tx_only, int rx_only, int split_mode)
 
 static int open_sdr_rx(double center_freq, int samplerate)
 {
+	/* Apply upconverter offset (mirrors sdr_open_internal in sdr.c) */
+	double actual_freq = center_freq + sdr_config->rx_upconverter;
+
+	if (sdr_config->rx_upconverter != 0.0)
+		LOGP(DSDR, LOGL_INFO, "Calibrate upconverter RX: %.6f MHz + %.6f MHz = %.6f MHz\n",
+		     center_freq / 1e6, sdr_config->rx_upconverter / 1e6, actual_freq / 1e6);
+
 #ifdef HAVE_UHD
 	if (sdr_config->uhd) {
 		int rc;
@@ -196,7 +203,7 @@ static int open_sdr_rx(double center_freq, int samplerate)
 		              sdr_config->rx_antenna,
 		              sdr_config->clock_source,
 		              0.0,
-		              center_freq,
+		              actual_freq,
 		              sdr_config->lo_offset,
 		              (double)samplerate,
 		              0.0,
@@ -220,7 +227,7 @@ static int open_sdr_rx(double center_freq, int samplerate)
 		                sdr_config->rx_antenna,
 		                sdr_config->clock_source,
 		                0.0,
-		                center_freq,
+		                actual_freq,
 		                sdr_config->lo_offset,
 		                (double)samplerate,
 		                0.0,

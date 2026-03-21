@@ -50,6 +50,7 @@ static const char *message = "1234";
 static const char *voice_dir = NULL;	/* voice recording output folder */
 static int voice_monitor = 0;		/* voice monitor mode (play to audio output) */
 static int batching_mode = BATCHING_OFF;
+static int protocol_dump = 0;
 
 void print_help(const char *arg0)
 {
@@ -81,6 +82,8 @@ void print_help(const char *arg0)
 	printf("        Also play received voice pages to the audio output device.\n");
 	printf("    --fifo <path>\n");
 	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
+	printf("    --protocol-dump\n");
+	printf("        Dump TX bit buffer to the log for protocol analysis.\n");
 	printf("\n");
 	printf("File: %s\n", msg_send_path);
 	printf("        Write \"<address>[,message]\" to it, to send a default message.\n");
@@ -111,6 +114,7 @@ static void add_options(void)
 	option_add('B', "batching", 1);
 	option_add(0x100, "voice-monitor", 0);
 	option_add(0x101, "fifo", 1);
+	option_add(0x102, "protocol-dump", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -177,6 +181,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Invalid batching mode '%s', use 'off', 'normal', or 'extended'.\n", argv[argi]);
 			return -EINVAL;
 		}
+		break;
+	case 0x102: /* --protocol-dump */
+		protocol_dump = 1;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -342,6 +349,7 @@ int main(int argc, char *argv[])
 		{
 			gsc_t *gsc = (gsc_t *)sender_head;
 			gsc->batching_mode = batching_mode;
+			gsc->protocol_dump = protocol_dump;
 		}
 		printf("Base station ready, please tune transmitter (or receiver) to %.4f MHz\n", frequency / 1e6);
 	}

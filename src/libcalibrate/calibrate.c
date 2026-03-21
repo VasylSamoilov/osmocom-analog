@@ -515,13 +515,16 @@ static int receive_iq_blocking(float *buffer, int max_samples)
 /* Retune SDR RX to new center frequency */
 static int retune_rx(double frequency)
 {
+	/* Apply upconverter offset (mirrors sdr_open_internal in sdr.c) */
+	double actual_freq = frequency + sdr_config->rx_upconverter;
+
 #ifdef HAVE_UHD
 	if (sdr_config->uhd)
-		return uhd_set_rx_frequency(frequency);
+		return uhd_set_rx_frequency(actual_freq);
 #endif
 #ifdef HAVE_SOAPY
 	if (sdr_config->soapy)
-		return soapy_set_rx_frequency(frequency);
+		return soapy_set_rx_frequency(actual_freq);
 #endif
 	return -ENODEV;
 }

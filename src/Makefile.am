@@ -61,6 +61,7 @@ SUBDIRS += \
 	pocsag \
 	flex \
 	golay \
+	mobitex \
 	fuenf \
 	tv \
 	radio \

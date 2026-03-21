@@ -2795,6 +2795,32 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	return 0;
 }
 
+/* Dump the TX bit buffer to the log, formatted for readability.
+ * Groups bits into rows of 46 (one duplicated Golay codeword = 23 bits * 2)
+ * so the protocol structure is visible. */
+static void dump_bitstream(gsc_t *gsc, const char *label)
+{
+	int i, row;
+	char line[128];
+	int pos;
+
+	LOGP(DGOLAY, LOGL_DEBUG, "=== TX bitstream dump: %s (%d bits) ===\n", label, gsc->bit_num);
+
+	row = 0;
+	pos = 0;
+	for (i = 0; i < gsc->bit_num; i++) {
+		line[pos++] = '0' + gsc->bit[i];
+		if (pos == 46 || i == gsc->bit_num - 1) {
+			line[pos] = '\0';
+			LOGP(DGOLAY, LOGL_INFO, "  [%4d] %s\n", row * 46, line);
+			pos = 0;
+			row++;
+		}
+	}
+
+	LOGP(DGOLAY, LOGL_DEBUG, "=== end bitstream dump ===\n");
+}
+
 static inline void queue_reset(gsc_t *gsc)
 {
 	gsc->bit_index = 0;
@@ -3038,6 +3064,9 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 		LOGP(DGOLAY, LOGL_ERROR, "Bit stream (%d bits) overflows bit buffer size (%d bits), please fix!\n", gsc->bit_num, (int)sizeof(gsc->bit));
 		return -EOVERFLOW;
 	}
+
+	if (gsc->protocol_dump)
+		dump_bitstream(gsc, address);
 
 	return 0;
 }
@@ -3384,6 +3413,8 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 	}
 
 	LOGP(DGOLAY, LOGL_INFO, "Batch encoded: %d messages, preamble_index=%d, %d bits.\n", msg_index, preamble, gsc->bit_num);
+	if (gsc->protocol_dump)
+		dump_bitstream(gsc, "batch");
 	return 0;
 }
 
@@ -4058,6 +4089,10 @@ void golay_msg_send(const char *text)
 		break;
 	case ('v' << 8) | ',':
 		type = TYPE_VOICE;
+		message += 2;
+		break;
+	case ('t' << 8) | ',':
+		type = TYPE_TONE;
 		message += 2;
 		break;
 	default:

@@ -207,6 +207,9 @@ typedef struct gsc {
 	/* --- RX batch mode disambiguation --- */
 	int			rx_batch_candidate;	/* 1 = inverted preamble seen, awaiting start code check */
 	int			rx_batch_mode;		/* 1 = confirmed batch mode for current reception */
+
+	/* --- Protocol dump --- */
+	int			protocol_dump;		/* 1 = dump TX bitstream to log */
 } gsc_t;
 
 int golay_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double deviation, double polarity, int tx, int rx, int auto_polarity, const char *message, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, const char *voice_dir, int voice_monitor);
