@@ -30,6 +30,7 @@
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "sender.h"
+#include "iq_wave.h"
 #include <osmocom/core/timer.h>
 #include <osmocom/core/select.h>
 #include <osmocom/cc/endpoint.h>
@@ -907,6 +908,18 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	rc = sdr_configure(dsp_samplerate);
 	if (rc < 0)
 		return;
+	/* If IQ wave options were given but no SDR driver was selected,
+	 * route them to the IQ wave virtual device instead. */
+	if (!use_sdr && sdr_config) {
+		if (sdr_config->read_iq_rx_wave)
+			iq_read_rx_wave = sdr_config->read_iq_rx_wave;
+		if (sdr_config->write_iq_rx_wave)
+			iq_write_rx_wave = sdr_config->write_iq_rx_wave;
+		if (sdr_config->read_iq_tx_wave)
+			iq_read_tx_wave = sdr_config->read_iq_tx_wave;
+		if (sdr_config->write_iq_tx_wave)
+			iq_write_tx_wave = sdr_config->write_iq_tx_wave;
+	}
 #endif
 
 	/* open audio */

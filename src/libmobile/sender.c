@@ -27,6 +27,7 @@
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "sender.h"
+#include "iq_wave.h"
 #include <osmocom/core/timer.h>
 #ifdef HAVE_SDR
 #include "../libsdr/sdr_config.h"
@@ -117,6 +118,14 @@ int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, dou
 		slave->slave = sender;
 	} else {
 		/* link audio device */
+		if (iq_wave_is_active()) {
+			sender->audio_open = iq_wave_open;
+			sender->audio_start = iq_wave_start;
+			sender->audio_close = iq_wave_close;
+			sender->audio_read = iq_wave_read;
+			sender->audio_write = iq_wave_write;
+			sender->audio_get_tosend = iq_wave_get_tosend;
+		} else
 #ifdef HAVE_SDR
 		if (use_sdr) {
 			/* sdr.c handles both single-device and split mode internally */
@@ -190,6 +199,18 @@ int sender_open_audio(int buffer_size, double interval)
 		/* skip audio slaves */
 		if (master->master)
 			continue;
+
+		/* Late re-selection: if IQ wave became active after sender_create
+		 * (e.g. options copied from sdr_config in main_mobile_loop),
+		 * switch the audio backend now before opening. */
+		if (iq_wave_is_active() && master->audio_open != iq_wave_open) {
+			master->audio_open = iq_wave_open;
+			master->audio_start = iq_wave_start;
+			master->audio_close = iq_wave_close;
+			master->audio_read = iq_wave_read;
+			master->audio_write = iq_wave_write;
+			master->audio_get_tosend = iq_wave_get_tosend;
+		}
 
 		/* get list of frequencies */
 		channels = 0;

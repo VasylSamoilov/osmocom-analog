@@ -9,7 +9,8 @@ libmobile_a_SOURCES = \
 	testton.c \
 	cause.c \
 	get_time.c \
-	main_mobile.c
+	main_mobile.c \
+	iq_wave.c
 
 if HAVE_ALSA
 AM_CPPFLAGS += -DHAVE_ALSA

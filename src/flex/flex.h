@@ -538,6 +538,11 @@ typedef struct flex {
 						 * use consistent 16-bit extraction. */
 			int		secure_subtype;	/* t1t0 value from secure message header
 						 * (-1 = not a secure message) */
+			uint32_t	rx_sig;		/* signature from first fragment */
+			uint32_t	sig_sum;	/* accumulated signature sum */
+			int		sig_valid;	/* 1 = all fragments had clean/corrected words */
+			char		word_status[256]; /* per-word BCH status across fragments */
+			int		ws_len;		/* length of word_status */
 			char		buf[FLEX_REASM_MAX_LEN];
 			int		len;		/* bytes accumulated */
 			uint32_t	last_frame;	/* frame number of last fragment */

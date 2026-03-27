@@ -1142,7 +1142,39 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 		}
 	}
 
-	LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: Unknown sync code 0x%04X.\n", sync_code);
+	/* Check for reserved sync codes (A5-A6, A8-A15).
+	 * These are valid BCH codewords but not assigned to any mode.
+	 * Log them at NOTICE level for protocol analysis. */
+	{
+		static const struct {
+			uint16_t code;
+			const char *name;
+		} reserved[] = {
+			{ FLEX_SYNC_A5,  "A5" },
+			{ FLEX_SYNC_A6,  "A6" },
+			{ FLEX_SYNC_A8,  "A8" },
+			{ FLEX_SYNC_A9,  "A9" },
+			{ FLEX_SYNC_A10, "A10" },
+			{ FLEX_SYNC_A11, "A11" },
+			{ FLEX_SYNC_A12, "A12" },
+			{ FLEX_SYNC_A13, "A13" },
+			{ FLEX_SYNC_A14, "A14" },
+			{ FLEX_SYNC_A15, "A15" },
+			{ 0, NULL }
+		};
+		for (i = 0; reserved[i].code != 0; i++) {
+			if (sync_code == reserved[i].code) {
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: Reserved sync code %s (0x%04X) detected, polarity=%s — no defined mode.\n",
+					  reserved[i].name, sync_code,
+					  flex->rx.polarity ? "NEG" : "POS");
+				return 0;
+			}
+		}
+	}
+
+	LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: Unknown sync code 0x%04X, polarity=%s.\n",
+		  sync_code, flex->rx.polarity ? "NEG" : "POS");
 	return 0;
 }
 
@@ -1709,6 +1741,25 @@ static int flex_rx_check_retransmission(flex_t *flex,
 	     "phase=%d frame=%u (no improvement)\n",
 	     capcode, msg_num, vec_type, rx_phase, frame_abs);
 	return 1;
+}
+
+/* Build per-word BCH status string for a message word range.
+ * '.' = clean, 'c' = corrected, 'X' = uncorrectable, '_' = not received.
+ * Returns length written (excluding NUL). */
+static int flex_build_word_status(flex_phase_data_t *ph, int start, int end,
+				  char *buf, int buf_size)
+{
+	int i, len = 0;
+	for (i = start; i <= end && i < FLEX_WORDS_PER_FRAME && len < buf_size - 1; i++) {
+		switch (ph->status[i]) {
+		case FLEX_WORD_CLEAN:		buf[len++] = '.'; break;
+		case FLEX_WORD_CORRECTED:	buf[len++] = 'c'; break;
+		case FLEX_WORD_UNCORRECTABLE:	buf[len++] = 'X'; break;
+		default:			buf[len++] = '_'; break;
+		}
+	}
+	buf[len] = '\0';
+	return len;
 }
 
 /* Decode one phase of a received frame.
@@ -2950,6 +3001,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					uint32_t rx_sig = 0;
 					uint32_t sig_sum = 0;
 					int is_initial = (hdr_f == 3); /* F=11 = first/only */
+					int frag_words_ok = 1; /* 0 if any msg word uncorrectable */
 					const char *alpha_sig_status = ""; /* signature validation result */
 
 					/* Kanji mode: 16-bit Shift-JIS extraction
@@ -2992,8 +3044,12 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							uint16_t ch16;
 
 							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED) {
+								frag_words_ok = 0;
+								if (!(w == start_word && is_initial) && ti < (int)sizeof(text) - 1)
+									text[ti++] = '?';
 								continue;
+							}
 
 							if (w == start_word && is_initial) {
 								/* Signature word — extract sig,
@@ -3019,8 +3075,18 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							unsigned char ch;
 
 							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED) {
+								frag_words_ok = 0;
+								/* Emit placeholder for lost characters.
+								 * Each word carries 3 characters (or 2 on
+								 * the signature word). Show '?' for each. */
+								int lost = 3;
+								if (w == start_word && is_initial)
+									lost = 2; /* sig word: only char2+char3 */
+								while (lost-- > 0 && ti < (int)sizeof(text) - 1)
+									text[ti++] = '?';
 								continue;
+							}
 							dw = ph->words[w];
 
 							/* First slot: signature on initial
@@ -3029,16 +3095,19 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								rx_sig = dw & FLEX_ALPHA_SIG_MASK;
 							} else {
 								ch = (dw >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-								sig_sum += ch;
+								if (ch != FLEX_ALPHA_ETX)
+									sig_sum += ch;
 								if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
 									text[ti++] = ch;
 							}
 							ch = (dw >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-							sig_sum += ch;
+							if (ch != FLEX_ALPHA_ETX)
+								sig_sum += ch;
 							if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
 								text[ti++] = ch;
 							ch = (dw >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-							sig_sum += ch;
+							if (ch != FLEX_ALPHA_ETX)
+								sig_sum += ch;
 							if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
 								text[ti++] = ch;
 						}
@@ -3055,7 +3124,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					 * transmitted as the Message Signature."
 					 *
 					 * Standard Fragmentation (U₀,V₀ = 0,0):
-					 *   ETX padding IS included in the sum (TX/RX agree).
+					 *   ETX padding is excluded from the sum.
+					 *   Real-world Motorola infrastructure does not
+					 *   include trailing ETX pad characters.
 					 * Enhanced Fragmentation (U₀,V₀ ≠ 0,0 — not impl.):
 					 *   ETX ($03) and NUL ($00) are NOT included.
 					 *
@@ -3186,9 +3257,15 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					 * When the final fragment arrives, the full reassembled
 					 * message is output as a separate "reassembled" line. */
 
-					/* Always output this fragment independently */
+					/* Build per-word BCH status for this message */
+					char word_status[128];
+					{
+						int ws_start = is_long ? hdr_idx : mw1;
+						flex_build_word_status(ph, ws_start, mw2,
+								      word_status, sizeof(word_status));
+					}
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c%c %s \"%s\"\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c%c %s \"%s\" {%s}\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3206,7 +3283,8 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  grp_flag,
 						  prio_flag,
 						  msg_tag,
-						  text);
+						  text,
+						  word_status);
 
 					/* Reassembly logic for fragmented messages.
 					 *
@@ -3225,6 +3303,12 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							flex->rx.reasm[slot].secure_subtype = sec_t;
 						if (is_kanji)
 							flex->rx.reasm[slot].kanji = 1;
+						flex->rx.reasm[slot].rx_sig = rx_sig;
+						flex->rx.reasm[slot].sig_sum = sig_sum;
+						flex->rx.reasm[slot].sig_valid = frag_words_ok;
+						strncpy(flex->rx.reasm[slot].word_status, word_status,
+							sizeof(flex->rx.reasm[slot].word_status) - 1);
+						flex->rx.reasm[slot].ws_len = strlen(word_status);
 						reasm_append(flex, slot, text, ti);
 					} else if (frag_flag == 'F') {
 						/* Continuation fragment (C=1, F≠11) — append */
@@ -3235,6 +3319,21 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  "RX: Phase %c reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hdr_n,
 									  flex->rx.reasm[slot].expected_f, hdr_f);
+							flex->rx.reasm[slot].sig_sum += sig_sum;
+							if (!frag_words_ok)
+								flex->rx.reasm[slot].sig_valid = 0;
+							/* Append word status with '|' separator */
+							{
+								int ws_left = (int)sizeof(flex->rx.reasm[slot].word_status) - flex->rx.reasm[slot].ws_len - 1;
+								if (ws_left > 1) {
+									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len++] = '|';
+									int ws_add = strlen(word_status);
+									if (ws_add > ws_left - 1) ws_add = ws_left - 1;
+									memcpy(flex->rx.reasm[slot].word_status + flex->rx.reasm[slot].ws_len, word_status, ws_add);
+									flex->rx.reasm[slot].ws_len += ws_add;
+									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len] = '\0';
+								}
+							}
 							reasm_append(flex, slot, text, ti);
 							flex->rx.reasm[slot].expected_f = (hdr_f + 1) % 3;
 						}
@@ -3243,6 +3342,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						int slot = reasm_find(flex, capcode, hdr_n);
 						if (slot >= 0) {
 							const char *reasm_tag;
+							const char *reasm_sig_status = "";
 							if (flex->rx.reasm[slot].kanji)
 								reasm_tag = "ALN:KNJ";
 							else if (flex->rx.reasm[slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
@@ -3254,10 +3354,50 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  "RX: Phase %c reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hdr_n,
 									  flex->rx.reasm[slot].expected_f, hdr_f);
+							/* Accumulate final fragment into signature */
+							flex->rx.reasm[slot].sig_sum += sig_sum;
+							if (!frag_words_ok)
+								flex->rx.reasm[slot].sig_valid = 0;
+							/* Validate signature across all fragments */
+							if (flex->rx.reasm[slot].sig_valid) {
+								uint32_t total_sum = flex->rx.reasm[slot].sig_sum;
+								uint32_t expected = (~total_sum) & FLEX_ALPHA_SIG_MASK;
+								uint32_t stored_sig = flex->rx.reasm[slot].rx_sig;
+								if (stored_sig == expected) {
+									reasm_sig_status = ",sig=OK";
+									LOGP_CHAN(DDSP, LOGL_DEBUG,
+										  "RX: Phase %c reassembled signature OK "
+										  "(S=0x%02X, sum=0x%02X)\n",
+										  phase_name, stored_sig,
+										  total_sum & 0x7F);
+								} else {
+									reasm_sig_status = ",sig=FAIL";
+									LOGP_CHAN(DDSP, LOGL_NOTICE,
+										  "RX: Phase %c reassembled signature MISMATCH: "
+										  "received=0x%02X computed=0x%02X "
+										  "(sum=0x%02X)\n",
+										  phase_name, stored_sig, expected,
+										  total_sum & 0x7F);
+								}
+							} else {
+								reasm_sig_status = ",sig=incomplete";
+							}
+							/* Accumulate final fragment word status */
+							{
+								int ws_left = (int)sizeof(flex->rx.reasm[slot].word_status) - flex->rx.reasm[slot].ws_len - 1;
+								if (ws_left > 1) {
+									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len++] = '|';
+									int ws_add = strlen(word_status);
+									if (ws_add > ws_left - 1) ws_add = ws_left - 1;
+									memcpy(flex->rx.reasm[slot].word_status + flex->rx.reasm[slot].ws_len, word_status, ws_add);
+									flex->rx.reasm[slot].ws_len += ws_add;
+									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len] = '\0';
+								}
+							}
 							reasm_append(flex, slot, text, ti);
 							if (flex->rx.reasm[slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c%c %s t1t0=%d \"%s\"\n",
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c%c %s t1t0=%d \"%s\" {%s}\n",
 									  bitrate,
 									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 									  phase_name,
@@ -3265,16 +3405,18 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  flex->rx.sync_levels,
 									  flex->rx.polarity ? "neg" : "pos",
 									  "reassembled",
+									  reasm_sig_status,
 									  capcode,
 									  flex_addr_type_flag(aw_type, is_long),
 									  grp_flag,
 									  prio_flag,
 									  reasm_tag,
 									  flex->rx.reasm[slot].secure_subtype,
-									  flex->rx.reasm[slot].buf);
+									  flex->rx.reasm[slot].buf,
+									  flex->rx.reasm[slot].word_status);
 							else
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s [%09" PRIu64 "] %c%c%c %s \"%s\"\n",
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c%c %s \"%s\" {%s}\n",
 									  bitrate,
 									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 									  phase_name,
@@ -3282,12 +3424,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  flex->rx.sync_levels,
 									  flex->rx.polarity ? "neg" : "pos",
 									  "reassembled",
+									  reasm_sig_status,
 									  capcode,
 									  flex_addr_type_flag(aw_type, is_long),
 									  grp_flag,
 									  prio_flag,
 									  reasm_tag,
-									  flex->rx.reasm[slot].buf);
+									  flex->rx.reasm[slot].buf,
+									  flex->rx.reasm[slot].word_status);
 							flex->rx.reasm[slot].active = 0;
 						}
 					}
@@ -3406,9 +3550,16 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					/* For long addresses, body[0] is at Vy (j+1)
 					 * per Section 3.9.1. Process it first. */
-					if (is_long && j + 1 < FLEX_WORDS_PER_FRAME &&
-					    ph->status[j + 1] != FLEX_WORD_UNCORRECTABLE &&
-					    ph->status[j + 1] != FLEX_WORD_NOT_RECEIVED) {
+					if (is_long && j + 1 < FLEX_WORDS_PER_FRAME) {
+						if (ph->status[j + 1] == FLEX_WORD_UNCORRECTABLE ||
+						    ph->status[j + 1] == FLEX_WORD_NOT_RECEIVED) {
+							/* Lost word — emit '?' for each digit that would have been here */
+							int lost_bits = FLEX_BCH_DATA_BITS - skip_bits;
+							int lost_digits = lost_bits / 4;
+							while (lost_digits-- > 0 && di < (int)sizeof(digits) - 1)
+								digits[di++] = '?';
+							bit_count = FLEX_BCH_DATA_BITS;
+						} else {
 						uint32_t dw = ph->words[j + 1];
 						int b;
 						for (b = 0; b < FLEX_BCH_DATA_BITS; b++) {
@@ -3426,6 +3577,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							}
 							bit_count++;
 						}
+						}
 					}
 
 					/* Process remaining body words from MF */
@@ -3434,8 +3586,17 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						uint32_t dw;
 
 						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-							break;
+						    ph->status[w] == FLEX_WORD_NOT_RECEIVED) {
+							/* Lost word — emit '?' for each digit */
+							int lost_bits = FLEX_BCH_DATA_BITS;
+							if (bit_count < skip_bits)
+								lost_bits -= (skip_bits - bit_count);
+							int lost_digits = lost_bits / 4;
+							while (lost_digits-- > 0 && di < (int)sizeof(digits) - 1)
+								digits[di++] = '?';
+							bit_count += FLEX_BCH_DATA_BITS;
+							continue;
+						}
 						dw = ph->words[w];
 
 						for (b = 0; b < FLEX_BCH_DATA_BITS; b++) {

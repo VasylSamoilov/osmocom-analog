@@ -808,9 +808,13 @@ static uint32_t encode_alpha_message(uint32_t *frame_words, const char *msg,
 		if (is_initial_frag) {
 			sig_sum = 0;
 			for (i = 1; i < word_idx; i++) {
-				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				uint32_t ch;
+				ch = (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
+				ch = (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
+				ch = (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
 			}
 			msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 
@@ -1219,9 +1223,13 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		if (is_initial_frag) {
 			sig_sum = 0;
 			for (i = 1; i < word_idx; i++) {
-				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				sig_sum += (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				uint32_t ch;
+				ch = (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
+				ch = (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
+				ch = (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
 			}
 			msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 		}
