@@ -2027,6 +2027,13 @@ typedef struct flex_frame_msg {
 	 * numbered_r (above) already serves numbered numeric messages. */
 	int		alpha_r_flag;		/* R flag for alpha messages (0 or 1, default 1) */
 	int		hex_r_flag;		/* R flag for hex/binary messages (0 or 1, default 1) */
+
+	/* System message method (§3.9.2, Fig. 3.7.2-2).
+	 * 'a' = BIW101 only (no address/vector in AF/VF)
+	 * 'b' = BIW101 + Operator Messaging Address
+	 * 'c' = Operator Messaging Address only
+	 *  0  = normal message (not a system message) */
+	char		sysmsg_method;
 } flex_frame_msg_t;
 
 /* Frame encoding parameters */
@@ -2069,6 +2076,18 @@ typedef struct flex_frame_params {
 
 	/* BIW Channel Setup (A-type 0x06) */
 	int		chan_setup_enabled;	/* 1 = emit channel setup BIW, default 0 */
+
+	/* BIW101 System Message A-type (method (b), §3.9.2 / Fig. 3.7.2-2).
+	 *
+	 * When an Operator Messaging Address with LSB 0-3 is being
+	 * transmitted, the spec requires BIW101 with the corresponding
+	 * A-type (0000-0011) to also be present in the frame.
+	 *
+	 * -1 = no system message BIW (default).
+	 * 0-3 = emit BIW101 with this A-type alongside the operator address.
+	 *
+	 * Set by the scheduler when it detects a system message candidate. */
+	int		sysmsg_a_type;		/* -1=none, 0-3=A-type for BIW101 */
 
 	/* Non-standard decoder compatibility (--hack-for-non-standard-decoders) */
 	int		hack_nonstandard_decoders; /* 1 = flip bit 0 of all-zeros/all-ones

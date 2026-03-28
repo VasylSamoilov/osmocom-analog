@@ -1122,6 +1122,17 @@ static int flex_compute_biw_count(const flex_frame_params_t *params)
 	if (params->timezone_code >= 0 &&
 	    params->timezone_code < (int)FLEX_TZ_ENTRIES)
 		extra++;
+	/* BIW101 for system message (method (b), §3.9.2).
+	 * When an Operator Messaging Address with LSB 0-3 is present,
+	 * emit BIW101 with the matching A-type.  This replaces the
+	 * timezone BIW101 slot if both are requested (only one type 101
+	 * word per phase per spec). */
+	if (params->sysmsg_a_type >= 0 && params->sysmsg_a_type <= 3) {
+		if (params->timezone_code < 0 ||
+		    params->timezone_code >= (int)FLEX_TZ_ENTRIES)
+			extra++; /* no timezone slot yet, add one */
+		/* else: reuse the timezone slot for sysmsg A-type */
+	}
 	if (params->chan_setup_enabled && params->frame <= 3)
 		extra++;
 	if (extra > 3)
@@ -1650,6 +1661,53 @@ static int flex_get_next_frame_network(flex_t *flex)
 	n_inflight = flex_scan_inflight(flex, inflight, FLEX_MAX_INFLIGHT);
 
 	/* Compute available frame capacity */
+
+	/* Pre-scan: detect system messages to set sysmsg_a_type
+	 * before BIW count computation (§3.9.2).
+	 *
+	 * Also determines tone-only exclusion per §3.9.2:
+	 * "Tone-Only Addresses cannot be transmitted in Frames
+	 * used for transmitting System Messages."  This applies
+	 * when the frame contains system message content — i.e.,
+	 * an Operator Messaging Address or Network Address with a
+	 * message body.  Timezone-only BIW (A=0100) does NOT
+	 * exclude tone-only since it carries data only in the
+	 * I-field, not in MF.
+	 *
+	 * sysmsg_a_type is set for methods (a) and (b) — both
+	 * require BIW101.  Method (c) skips BIW101. */
+	int has_sysmsg_content = 0;
+	{
+		flex_msg_t *scan;
+		for (scan = flex->msg_list; scan; scan = scan->next) {
+			enum flex_addr_type stype;
+			if (scan->speed != params.bitrate ||
+			    scan->modulation_type != params.modulation_type)
+				continue;
+			if (!frame_is_eligible(scan->next_send_frame, current_abs))
+				continue;
+			stype = flex_capcode_special_type(scan->capcode);
+			if (stype == FLEX_ADDR_OPER_MSG) {
+				uint32_t aw = (uint32_t)(scan->capcode
+					+ FLEX_SHORT_ADDR_OFFSET);
+				uint32_t lsb = aw & FLEX_OPER_MSG_LSB_MASK;
+				has_sysmsg_content = 1;
+				/* LSB 0-3 map directly to BIW101
+				 * A-type 0000-0011 (§3.7.2-2).
+				 * Only set for methods (a) and (b). */
+				if (lsb <= FLEX_BIW_SYSINFO_A_MSG_SSID &&
+				    params.sysmsg_a_type < 0 &&
+				    scan->sysmsg_method != 'c')
+					params.sysmsg_a_type = (int)lsb;
+				break;
+			}
+			if (stype == FLEX_ADDR_NETWORK) {
+				has_sysmsg_content = 1;
+				break;
+			}
+		}
+	}
+
 	{
 		int biw_count = flex_compute_biw_count(&params);
 		if (params.num_transmissions > 1)
@@ -1657,52 +1715,31 @@ static int flex_get_next_frame_network(flex_t *flex)
 		else
 			capacity = FLEX_WORDS_PER_FRAME - biw_count;
 
-		/* Determine if tone-only messages are excluded.
-		 * Per spec §3.9.2: "Tone-Only Addresses cannot be
-		 * transmitted in Frames used for transmitting System
-		 * Messages."  This applies when the frame contains
-		 * system message content — i.e., an Operator Messaging
-		 * Address or Network Address with a message body.
-		 * Timezone-only BIW (A=0100) does NOT exclude tone-only
-		 * since it carries data only in the I-field, not in MF. */
-		int has_sysmsg_content = 0;
-		{
-			flex_msg_t *scan;
-			for (scan = flex->msg_list; scan; scan = scan->next) {
-				enum flex_addr_type stype;
-				if (scan->speed != params.bitrate ||
-				    scan->modulation_type != params.modulation_type)
-					continue;
-				if (!frame_is_eligible(scan->next_send_frame, current_abs))
-					continue;
-				stype = flex_capcode_special_type(scan->capcode);
-				if (stype == FLEX_ADDR_OPER_MSG ||
-				    stype == FLEX_ADDR_NETWORK) {
-					has_sysmsg_content = 1;
-					break;
-				}
-			}
-		}
+		/* Reserve 1 word for the duplicate system message vector
+		 * at end of VF (method (b), §3.9.2, Fig. 3.7.2-2). */
+		if (params.sysmsg_a_type >= 0 && params.sysmsg_a_type <= 3)
+			capacity--;
+	}
 
-		/* Co-packing (§4.2.3, Req 20.1-20.5):
-		 *
-		 * The three-pass collection inherently implements co-packing
-		 * of other-capcode messages alongside fragments. Fragment
-		 * continuations sort first within each priority class via
-		 * the composite sort key (is_continuation DESC, deadline ASC),
-		 * ensuring fragment addresses/vectors are placed before
-		 * other-capcode addresses in the encoded frame. The
-		 * frag_excluded() check prevents same-capcode conflicts
-		 * (§4.2 ①②) but allows different capcodes. Remaining
-		 * capacity after fragments is naturally filled with
-		 * other-capcode messages as est_used accumulates across
-		 * all candidates.
-		 *
-		 * Per-frame independent co-packing (Req 20.5) is inherent
-		 * in the frame-at-a-time architecture: each frame cycle
-		 * runs the full collection fresh with est_used starting
-		 * at 0, and unpacked messages remain in the queue for
-		 * the next frame. */
+	/* Co-packing (§4.2.3, Req 20.1-20.5):
+	 *
+	 * The three-pass collection inherently implements co-packing
+	 * of other-capcode messages alongside fragments. Fragment
+	 * continuations sort first within each priority class via
+	 * the composite sort key (is_continuation DESC, deadline ASC),
+	 * ensuring fragment addresses/vectors are placed before
+	 * other-capcode addresses in the encoded frame. The
+	 * frag_excluded() check prevents same-capcode conflicts
+	 * (§4.2 ①②) but allows different capcodes. Remaining
+	 * capacity after fragments is naturally filled with
+	 * other-capcode messages as est_used accumulates across
+	 * all candidates.
+	 *
+	 * Per-frame independent co-packing (Req 20.5) is inherent
+	 * in the frame-at-a-time architecture: each frame cycle
+	 * runs the full collection fresh with est_used starting
+	 * at 0, and unpacked messages remain in the queue for
+	 * the next frame. */
 
 		/* Three-pass collection */
 		int pass;
@@ -1882,7 +1919,6 @@ static int flex_get_next_frame_network(flex_t *flex)
 				}
 			}
 		}
-	}
 
 	/* Set msg pointer for multi-phase gate check below.
 	 * If we collected any candidates, msg is non-NULL to enter
@@ -2054,6 +2090,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 							fm->alpha_r_flag = m->numbered_r ? 1 : 0;
 							fm->hex_r_flag = m->numbered_r ? 1 : 0;
 							fm->numbered_r = m->numbered_r ? 1 : 0;
+							fm->sysmsg_method = m->sysmsg_method;
 							if (m->retransmit_max > 0) {
 								LOGP(DFLEX, LOGL_INFO,
 								     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
@@ -2242,6 +2279,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					fm->alpha_r_flag = m->numbered_r ? 1 : 0;
 					fm->hex_r_flag = m->numbered_r ? 1 : 0;
 					fm->numbered_r = m->numbered_r ? 1 : 0;
+					fm->sysmsg_method = m->sysmsg_method;
 					if (m->retransmit_max > 0) {
 						LOGP(DFLEX, LOGL_INFO,
 						     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
@@ -2625,6 +2663,7 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.alpha_r_flag = msg->numbered_r ? 1 : 0;
 			frame_msg.hex_r_flag = msg->numbered_r ? 1 : 0;
 			frame_msg.numbered_r = msg->numbered_r ? 1 : 0;
+			frame_msg.sysmsg_method = msg->sysmsg_method;
 
 			/* Frame params: always cycle=0, frame=0.
 			 * Include BIW time + timezone when configured. */
@@ -2646,6 +2685,22 @@ int flex_get_next_frame(flex_t *flex)
 				params.tmf = flex->tmf;
 			}
 			params.timezone_code = flex->timezone_code;
+
+			/* Set sysmsg_a_type for methods (a)/(b) (§3.9.2).
+			 * Detect operator messaging address with LSB 0-3
+			 * and method != 'c' to emit BIW101. */
+			{
+				enum flex_addr_type stype =
+					flex_capcode_special_type(msg->capcode);
+				if (stype == FLEX_ADDR_OPER_MSG) {
+					uint32_t aw = (uint32_t)(msg->capcode
+						+ FLEX_SHORT_ADDR_OFFSET);
+					uint32_t lsb = aw & FLEX_OPER_MSG_LSB_MASK;
+					if (lsb <= FLEX_BIW_SYSINFO_A_MSG_SSID &&
+					    msg->sysmsg_method != 'c')
+						params.sysmsg_a_type = (int)lsb;
+				}
+			}
 
 			flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
 						&msgs_packed, &error);

@@ -301,12 +301,16 @@ void print_help(const char *arg0)
 	printf("        Special: status,0,,  — dump system config + temp group assignments\n");
 	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
 	printf("        Special: timezone,<code>,,  — show offset for zone code 0-31\n");
-	printf("        Special: sysmsg,<type>,lsb=<target>,<message>  — send system message via\n");
+	printf("        Special: sysmsg,<type>,lsb=<target> method=<m>,<message>  — send system message via\n");
 	printf("          Operator Messaging Address (§3.8.2.4).\n");
 	printf("          type: alpha, numeric, special, hex, tone (not secure per §3.9.2)\n");
 	printf("          lsb= target audience (name or 0-15, default all):\n");
 	printf("            all(0) home(1) roaming(2) ssid(3) time(4)\n");
 	printf("            ssidchange(14) sysevent(15)\n");
+	printf("          method= transmission method (§3.9.2, Fig. 3.7.2-2, default b):\n");
+	printf("            a = BIW101 only (implicit address, vector at end of VF, no operator addr)\n");
+	printf("            b = BIW101 + Operator Messaging Address (both, default)\n");
+	printf("            c = Operator Messaging Address only (no BIW101)\n");
 	printf("        Examples:\n");
 	printf("          1234567,alpha,,Hello World\n");
 	printf("          1234567,alpha,speed=3200 priority=1,Hello World\n");
@@ -1652,18 +1656,24 @@ static void fifo_process_line(const char *text, int text_length)
 		return;
 	}
 
-	/* === System Message command: "sysmsg,<type>,lsb=<N>,<message>" ===
+	/* === System Message command: "sysmsg,<type>,lsb=<N> method=<m>,<message>" ===
 	 * Sends a system message via Operator Messaging Address
 	 * (capcode derived from FLEX_ADDR_OPER_MSG_MIN + LSB).
 	 *
 	 * Follows standard FIFO convention: capcode,type,options,message.
 	 * "sysmsg" replaces the capcode field; the type field selects the
 	 * message encoding (alpha, numeric, hex, etc.); lsb= in options
-	 * selects the operator address sub-type (0-15).
+	 * selects the operator address sub-type (0-15); method= selects
+	 * the transmission method per §3.9.2 Fig. 3.7.2-2.
 	 *
 	 * LSB values (§3.8.2.4 Table 3.8.2.4-1):
 	 *   0 = all pagers    1 = home area    2 = roaming    3 = SSID
 	 *   4 = time related  5-13 = reserved  14 = SSIDChange  15 = SysEvent
+	 *
+	 * Method (§3.9.2, Fig. 3.7.2-2):
+	 *   a = BIW101 only — no operator address, vector at end of VF
+	 *   b = BIW101 + Operator Messaging Address (default)
+	 *   c = Operator Messaging Address only — no BIW101
 	 *
 	 * Secure (V=000) is rejected per §3.9.2: "all Vector types are
 	 * valid except the Secure Vector."
@@ -1671,6 +1681,7 @@ static void fifo_process_line(const char *text, int text_length)
 	 * Examples:
 	 *   sysmsg,alpha,,System maintenance at 03:00 UTC
 	 *   sysmsg,alpha,lsb=home,Home area update
+	 *   sysmsg,alpha,lsb=all method=c,Legacy mode test
 	 *   sysmsg,numeric,,31415926
 	 *   sysmsg,tone,lsb=ssidchange,
 	 *
@@ -1679,6 +1690,7 @@ static void fifo_process_line(const char *text, int text_length)
 	if (!strcasecmp(capcode_string, "sysmsg")) {
 		flex_t *flex = (flex_t *)sender_head;
 		int lsb = 0; /* default: all pagers */
+		char method = 'b'; /* default: BIW101 + Operator Messaging Address */
 		enum flex_msg_type smtype;
 
 		if (!flex) {
@@ -1758,12 +1770,37 @@ static void fifo_process_line(const char *text, int text_length)
 						lsb = atoi(lv);
 					*le = saved;
 				}
+				/* method= transmission method (a/b/c) */
+				char *mp = strstr(obuf, "method=");
+				if (mp) {
+					char mv = mp[7];
+					if (mv == 'a' || mv == 'A')
+						method = 'a';
+					else if (mv == 'b' || mv == 'B')
+						method = 'b';
+					else if (mv == 'c' || mv == 'C')
+						method = 'c';
+					else {
+						LOGP(DFLEX, LOGL_NOTICE,
+						     "FIFO: sysmsg invalid method='%c'"
+						     " — use a, b, or c.\n", mv);
+						return;
+					}
+				}
 			}
 		}
 
 		if (lsb < 0 || lsb > 15) {
 			LOGP(DFLEX, LOGL_NOTICE, "FIFO: sysmsg lsb=%d out of range (0-15).\n", lsb);
 			return;
+		}
+
+		if (method == 'a' && lsb > 3) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: sysmsg method=a only valid for"
+			     " lsb=0-3 (audience types), not %d."
+			     " Using method=b instead.\n", lsb);
+			method = 'b';
 		}
 
 		/* Extract message payload (after third comma) */
@@ -1788,10 +1825,12 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->polarity = FLEX_DEFAULT_POLARITY;
 				msg->priority = 1;
 				msg->numbered_r = 0; /* R=0 per §3.9.2 */
+				msg->sysmsg_method = method;
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: sysmsg enqueued LSB=%d (%s) type=%s capcode=%" PRIu64 " len=%d R=0\n",
+				     "FIFO: sysmsg enqueued LSB=%d (%s) type=%s method=%c capcode=%" PRIu64 " len=%d R=0\n",
 				     lsb, flex_oper_msg_subtype_name((uint32_t)(FLEX_ADDR_OPER_MSG_MIN + lsb)),
 				     flex_msg_type_name(smtype),
+				     method,
 				     oper_capcode, message_length);
 			}
 		}

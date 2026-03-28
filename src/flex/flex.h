@@ -163,6 +163,13 @@ typedef struct flex_msg {
 	int			send_delay;		/* frames to defer initial TX (0-1920, default 0) */
 	uint32_t		next_send_frame;	/* absolute frame (cycle*128+frame) for next eligibility */
 	int			assigned_n;		/* N assigned at initial TX (-1=unassigned, 0-63) */
+
+	/* System message transmission method (§3.9.2, Fig. 3.7.2-2).
+	 *   'a' = BIW101 only (no operator address, vector at end of VF)
+	 *   'b' = BIW101 + Operator Messaging Address (default for LSB 0-3)
+	 *   'c' = Operator Messaging Address only (no BIW101)
+	 *   0   = not a system message (normal pager message) */
+	char			sysmsg_method;
 } flex_msg_t;
 
 /* TX temp group slot states */
@@ -558,6 +565,8 @@ typedef struct flex {
 			uint32_t	timezone_extsec; /* S5-S3: extended seconds (0-7,
 						  * 1/64 min = 0.9375s steps) */
 			int		seen_timezone;
+			/* SysInfo system message (type 101, A=0000~0011) */
+			int		sysmsg_a_type;	/* -1=none, 0-3=A-type */
 		} biw[FLEX_RX_POLARITIES];
 
 		/* Fragment reassembly state.

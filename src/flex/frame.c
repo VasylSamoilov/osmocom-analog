@@ -1772,6 +1772,7 @@ void flex_frame_params_default(flex_frame_params_t *params)
 	params->bitrate = 1600;
 	params->modulation_type = FLEX_MOD_2FSK;
 	params->timezone_code = -1; /* no timezone by default */
+	params->sysmsg_a_type = -1; /* no system message BIW by default */
 	params->num_transmissions = 1; /* single transmission (no repeat) */
 	params->td_collapse = -1; /* use system collapse cycle */
 	params->subframe_index = 0;
@@ -3169,6 +3170,15 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			extra += 2; /* Date + Time */
 		if (params->timezone_code >= 0 && params->timezone_code < (int)FLEX_TZ_ENTRIES)
 			extra++;
+		/* BIW101 for system message (method (b), §3.9.2).
+		 * Reuses timezone slot if already counted. */
+		if (params->sysmsg_a_type >= 0 && params->sysmsg_a_type <= 3) {
+			if (params->timezone_code < 0 ||
+			    params->timezone_code >= (int)FLEX_TZ_ENTRIES)
+				extra++;
+		}
+		if (params->chan_setup_enabled && params->frame <= 3)
+			extra++;
 
 		/* Clamp to 3 (max e_biw) — drop SysInfo first if needed */
 		if (extra > 3)
@@ -3232,6 +3242,15 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			 * holds body[0], not a copy of Vx. */
 			info[i].vector_words = info[i].is_long ? 2 : 1;
 
+			/* Method (a) system message: no address, no normal
+			 * vector.  Body goes to MF, system message vector
+			 * at end of VF is handled separately. */
+			if (msgs[i].sysmsg_method == 'a') {
+				info[i].addr_words = 0;
+				info[i].vector_words = 0;
+				info[i].is_long = 0;
+			}
+
 			/* Tone-only addresses have no vector word and no message
 			 * body.
 			 * They sit at the end of the address field. */
@@ -3272,21 +3291,24 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 	/* Pass 1: priority messages (non-tone) */
 	for (i = 0; i < (uint32_t)msg_count; i++) {
-		if (info[i].addr_words == 0 && info[i].vector_words == 0)
+		if (info[i].addr_words == 0 && info[i].vector_words == 0
+		    && msgs[i].sysmsg_method != 'a')
 			continue; /* skip invalid */
 		if (msgs[i].priority && msgs[i].msg_type != FLEX_FRAME_MSG_TYPE_TONE)
 			order[n_prio++] = (int)i;
 	}
 	/* Pass 2: normal messages (non-tone) */
 	for (i = 0; i < (uint32_t)msg_count; i++) {
-		if (info[i].addr_words == 0 && info[i].vector_words == 0)
+		if (info[i].addr_words == 0 && info[i].vector_words == 0
+		    && msgs[i].sysmsg_method != 'a')
 			continue; /* skip invalid */
 		if (!msgs[i].priority && msgs[i].msg_type != FLEX_FRAME_MSG_TYPE_TONE)
 			order[n_prio + n_norm++] = (int)i;
 	}
 	/* Pass 3: tone-only messages last (no vector needed) */
 	for (i = 0; i < (uint32_t)msg_count; i++) {
-		if (info[i].addr_words == 0 && info[i].vector_words == 0)
+		if (info[i].addr_words == 0 && info[i].vector_words == 0
+		    && msgs[i].sysmsg_method != 'a')
 			continue; /* skip invalid */
 		if (msgs[i].msg_type == FLEX_FRAME_MSG_TYPE_TONE)
 			order[n_prio + n_norm + n_tone++] = (int)i;
@@ -3337,6 +3359,40 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			prio_addr_words += info[idx].addr_words;
 	}
 
+	/* Reserve an extra vector word at end of VF for BIW101 system
+	 * message (method (b), §3.9.2, Fig. 3.7.2-2).
+	 *
+	 * When BIW101 A=0000~0011 is present, the spec requires a
+	 * system message vector at the END of the vector field pointing
+	 * to the same message body as the operator messaging vector.
+	 * This is a duplicate — both vectors reference the same MF words.
+	 *
+	 * Only added when a system message (operator msg LSB 0-3) was
+	 * actually packed into this frame. */
+	int sysmsg_extra_vec = 0;
+	int sysmsg_packed_idx = -1;
+	if (params->sysmsg_a_type >= 0 && params->sysmsg_a_type <= 3) {
+		/* Find the packed system message */
+		for (i = 0; i < (uint32_t)(n_prio + n_norm); i++) {
+			int idx = order[i];
+			uint32_t aw;
+			if (!info[idx].packed)
+				continue;
+			aw = (uint32_t)(msgs[idx].capcode + FLEX_SHORT_ADDR_OFFSET);
+			if (aw >= FLEX_ADDR_OPER_MSG_MIN &&
+			    aw <= FLEX_ADDR_OPER_MSG_MAX &&
+			    (aw & FLEX_OPER_MSG_LSB_MASK) <= FLEX_BIW_SYSINFO_A_MSG_SSID) {
+				if (capacity >= 1) {
+					sysmsg_extra_vec = 1;
+					sysmsg_packed_idx = idx;
+					total_vector++;
+					capacity--;
+				}
+				break;
+			}
+		}
+	}
+
 	/* Pack tone-only messages — these need only addr words (no vector, no msg body).
 	 * Tone-only addresses sit at the end of the
 	 * address field, after the vector field start offset.  They don't
@@ -3366,11 +3422,18 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	 * be re-stated in each fragment's frame.  Requires frame
 	 * layout changes in flex_encode_frame_multi().
 	 *
-	 * TODO §3.9.2 method (b): BIW101 + Operator Messaging
+	 * DONE §3.9.2 method (b): BIW101 + Operator Messaging
 	 * Address together — when both BIW101 and an Operator
 	 * Messaging Address target the same audience, emit both.
 	 * BIW in BIW field, operator address in AF, operator
-	 * vector in VF, message in MF.
+	 * vector in VF, system message vector at end of VF,
+	 * message in MF.
+	 * Implemented via params->sysmsg_a_type: scheduler pre-scans
+	 * for Operator Messaging capcodes with LSB 0-3, sets the
+	 * A-type, and the BIW writing section emits BIW101 with
+	 * the matching A-type.  The system message vector (same
+	 * format for method (a) and (b)) is placed at the end of
+	 * VF after all normal vectors (Fig. 3.7.2-2 (b)).
 	 *
 	 * TODO §3.9.2 NID: Network Address must appear twice
 	 * consecutively in AF within frames 0-7.  First defines
@@ -3517,25 +3580,34 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			}
 		}
 
-		/* SysInfo/timezone (type 101, A=0100) — only if slot available.
+		/* SysInfo BIW101 — system message or timezone.
 		 *
-		 * Encodes timezone zone code in I4-I0 (5 bits, 0-31).
-		 * L0 (DST) and S5-S3 (extended seconds) are left at zero.
+		 * Only one type 101 word per phase per spec:
+		 * "The transmission of a System Message by Block
+		 * Information Word 101 must be one time per each phase."
 		 *
-		 * Example: --timezone 14 → zone=14 (UTC+0:00), I=0x00E.
-		 * Example: --timezone 24 → zone=24 (UTC+9:00, JST), I=0x018.
-		 *
-		 * This is a time instruction (A=0100), not a system message
-		 * with MF content (A=0000~0011).  The tone-only restriction
-		 * The tone-only restriction does not apply to time-only BIW words.
-		 *
-		 * "The transmission of a System Message
-		 * by Block Information Word 101 must be one time per each
-		 * phase."  Satisfied: BIW is in block 0, shared across all
-		 * phases. */
+		 * Priority: system message A-type (0000-0011) takes
+		 * precedence over timezone (A=0100) when both are
+		 * configured, since the system message requires the
+		 * BIW101 to be present per method (b) (Fig. 3.7.2-2).
+		 * Timezone can be transmitted in other frames. */
 		if (slots_left > 0 &&
-		    params->timezone_code >= 0 &&
-		    params->timezone_code < (int)FLEX_TZ_ENTRIES) {
+		    params->sysmsg_a_type >= 0 &&
+		    params->sysmsg_a_type <= 3) {
+			/* Method (b): BIW101 with A=0000~0011 alongside
+			 * Operator Messaging Address (§3.9.2, Fig. 3.7.2-2).
+			 * I-field is reserved (0) for A=0000~0011. */
+			frame_words[fwc++] = flex_create_biw_sysinfo(
+				(uint32_t)params->sysmsg_a_type, 0);
+			slots_left--;
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX: BIW101 SysMsg A=%d (%s)\n",
+			     params->sysmsg_a_type,
+			     flex_biw_sysinfo_a_name(
+				     (uint32_t)params->sysmsg_a_type));
+		} else if (slots_left > 0 &&
+			   params->timezone_code >= 0 &&
+			   params->timezone_code < (int)FLEX_TZ_ENTRIES) {
 			int tz_min = flex_tz_to_minutes((uint32_t)params->timezone_code);
 			char tzbuf[20];
 			frame_words[fwc++] = flex_create_biw_sysinfo(
@@ -3566,8 +3638,10 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			int has_nid_sysmsg = 0;
 			if (has_nid_sysmsg)
 				info |= (1U << FLEX_BIW_SYSINFO_NID_BIT);
-			/* B0: set if current frame contains a system message */
-			int has_sysmsg = 0;
+			/* B0: set if current frame contains a system message.
+			 * Now derived from sysmsg_a_type (method (b)). */
+			int has_sysmsg = (params->sysmsg_a_type >= 0 &&
+					  params->sysmsg_a_type <= 3) ? 1 : 0;
 			if (has_sysmsg)
 				info |= (1U << FLEX_BIW_SYSINFO_SYSMSG_BIT);
 			frame_words[fwc++] = flex_create_biw_sysinfo(
@@ -3586,6 +3660,10 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	for (i = 0; i < (uint32_t)(n_prio + n_norm + n_tone); i++) {
 		int idx = order[i];
 		if (!info[idx].packed)
+			continue;
+
+		/* Method (a): no address word in AF */
+		if (msgs[idx].sysmsg_method == 'a')
 			continue;
 
 		if (msgs[idx].temp_delivery_slot >= 0) {
@@ -3669,6 +3747,11 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		uint32_t vec_fwc;     /* write cursor in Vector Field */
 		uint32_t msg_fwc;     /* write cursor in Message Field */
 		uint32_t mf_start;    /* absolute word index where MF begins */
+
+		/* System message vector for end of VF (method (a)/(b)).
+		 * Generated from the message's start/count after encoding,
+		 * same vector format for both methods. */
+		uint32_t sysmsg_vw = 0;
 
 		vec_fwc = (uint32_t)(biw_count + total_addr);
 		mf_start = (uint32_t)(biw_count + total_addr + total_vector);
@@ -3923,16 +4006,26 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 			body_count = body_fwc;
 
-			/* Write Vx to Vector Field */
-			if (vec_fwc < FLEX_WORDS_PER_FRAME)
-				frame_words[vec_fwc++] = vw;
+			/* Write Vx to Vector Field.
+			 * Method (a): no normal vector — skip Vx write. */
+			if (msgs[idx].sysmsg_method != 'a') {
+				if (vec_fwc < FLEX_WORDS_PER_FRAME)
+					frame_words[vec_fwc++] = vw;
+			}
+
+			/* Capture vector word for system message at end of VF
+			 * (§3.9.2, Fig. 3.7.2-2).  Same vector for method
+			 * (a) and (b) — generated from message encoding. */
+			if (sysmsg_extra_vec && idx == sysmsg_packed_idx)
+				sysmsg_vw = vw;
 
 			/* For long addresses: write Vy to VF.
+			 * Method (a): no address, no Vy.
 			 * Most types: Vy = body[0] ("the 1st word of the
 			 * message is placed at the 2nd word of the vector").
 			 * Instruction/Short: Vy = all zeros (d11-d31 unused,
 			 * per §3.9.6 note: "All unused bits are set to 0"). */
-			if (info[idx].is_long) {
+			if (info[idx].is_long && msgs[idx].sysmsg_method != 'a') {
 				if (msgs[idx].msg_type == FLEX_FRAME_MSG_TYPE_INSTRUCTION) {
 					/* No body — 2nd vector word is zeros */
 					if (vec_fwc < FLEX_WORDS_PER_FRAME)
@@ -3961,6 +4054,24 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 					if (msg_fwc < FLEX_WORDS_PER_FRAME)
 						frame_words[msg_fwc++] = body_buf[j];
 				}
+			}
+		}
+
+		/* Write system message vector at end of VF
+		 * (§3.9.2, Fig. 3.7.2-2).
+		 *
+		 * Same vector word for method (a) and (b) — points to
+		 * the message body in MF with the correct start/count.
+		 * Placed at the end of the vector field per spec:
+		 * "corresponding vectors except Secure vector are
+		 * transmitted at the end of the vector field." */
+		if (sysmsg_extra_vec && sysmsg_vw) {
+			if (vec_fwc < mf_start && vec_fwc < FLEX_WORDS_PER_FRAME) {
+				frame_words[vec_fwc++] = sysmsg_vw;
+				LOGP(DFLEX, LOGL_DEBUG,
+				     "TX: VF[%u] SysMsg duplicate vector"
+				     " (method (b), end of VF)\n",
+				     vec_fwc - 1);
 			}
 		}
 

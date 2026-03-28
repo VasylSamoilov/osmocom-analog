@@ -1719,7 +1719,7 @@ static int flex_rx_check_retransmission(flex_t *flex,
 
 	if (!entry->has_uncorrectable) {
 		/* Original was complete — suppress duplicate */
-		LOGP(DFLEX, LOGL_DEBUG,
+		LOGP(DFLEX, LOGL_NOTICE,
 		     "RX_DUP_SUPPRESS: capcode=%" PRIu64 " N=%d vec_type=%d "
 		     "phase=%d frame=%u\n",
 		     capcode, msg_num, vec_type, rx_phase, frame_abs);
@@ -2045,6 +2045,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 		 * BIW1 aoffset_raw (bits 8-9) = number of extra BIW words.
 		 * aoffset = aoffset_raw + 1 = first address word index.
 		 * So extra BIW words are at indices 1..(aoffset-1). */
+		flex->rx.biw[pol].sysmsg_a_type = -1; /* reset per frame */
 		{
 			int bw;
 			for (bw = 1; bw < aoffset && bw < FLEX_WORDS_PER_FRAME; bw++) {
@@ -2188,13 +2189,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						 * Can also be transmitted via Operator Messaging Address
 						 * per the operator msg decode below. */
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps C%u/F%u phase=%c BIW SYSINFO %s I=0x%03X"
+							  "RX: %dbps C%u/F%u phase=%c BIW SYSINFO %s I=0x%03X (I-field reserved, not used)"
 							  " (vectors at end of VF, body in MF)\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
 							  flex_biw_sysinfo_a_name(a_type),
 							  info);
+						flex->rx.biw[pol].sysmsg_a_type = (int)a_type;
 					} else if (a_type == FLEX_BIW_SYSINFO_A_CHAN_SETUP) {
 						/* Channel Set Up Instruction (A=0110).
 						 *
@@ -2308,8 +2310,13 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			{
 				/* Upper bound: vector words can't exceed
 				 * address words (1:1 for short, 2:2 for
-				 * long individual addresses). */
+				 * long individual addresses).
+				 * Exception: BIW101 A=0000~0011 adds one
+				 * system message vector at end of VF with
+				 * no corresponding address (method (a)). */
 				int max_vec = voffset - aoffset;
+				if (flex->rx.biw[pol].sysmsg_a_type >= 0)
+					max_vec++;
 				int last_valid = -1; /* last slot with passing checksum */
 				int vi;
 				if (max_vec > FLEX_WORDS_PER_FRAME - voffset)
@@ -2325,19 +2332,30 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				n_valid_vec_words = last_valid + 1;
 			}
 
+		/* Variables shared between the address/vector loop and
+		 * the BIW101 system message vector decode (goto target). */
+		int j;
+		uint64_t capcode = 0;
+		int is_long = 0;
+		int vec_type = 0, mw1 = 0, mw2 = 0, len = 0;
+		char grp_flag = ' ';
+		char prio_flag = ' ';
+		uint32_t aw_raw = 0, aw_base = 0;
+		int addr_is_group = 0, addr_is_temp = 0;
+		enum flex_addr_type aw_type = FLEX_ADDR_UNKNOWN;
+
 		for (; addr_idx < voffset; addr_idx++) {
-			int j = voffset + vec_count; /* vector index */
-			uint64_t capcode;
-			int is_long = 0;
-			int vec_type, mw1, mw2, len;
-			uint32_t aw_raw, aw_base;
-			int addr_is_group = 0, addr_is_temp = 0;
-			enum flex_addr_type aw_type;
-			char grp_flag;
+
+			j = voffset + vec_count; /* vector index */
+			is_long = 0;
+			grp_flag = ' ';
+			addr_is_group = 0;
+			addr_is_temp = 0;
+			aw_type = FLEX_ADDR_UNKNOWN;
 			/* Priority addresses are in
 			 * addr_idx [aoffset..prio_end-1].  Show 'P' flag
 			 * on message output lines for priority addresses. */
-			char prio_flag = (addr_idx < prio_end) ? FLEX_RX_FLAG_PRIORITY : ' ';
+			prio_flag = (addr_idx < prio_end) ? FLEX_RX_FLAG_PRIORITY : ' ';
 
 			if (j >= FLEX_WORDS_PER_FRAME) break;
 
@@ -2517,6 +2535,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			}
 
 			/* Vector decode */
+			vector_decode:
 			{
 				uint32_t viw = ph->words[j];
 				vec_type = FLEX_VEC_TYPE(viw);
@@ -4481,6 +4500,44 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					  phase_name, vec_type, capcode);
 			}
 		}
+
+		/* BIW101 system message vector at end of VF (§3.9.2).
+		 *
+		 * When BIW101 A=0000~0011 was seen, the last vector word
+		 * in VF is the system message vector.  It sits after all
+		 * normal address/vector pairs.  Decode it using a synthetic
+		 * capcode derived from the Operator Messaging Address range
+		 * (FLEX_ADDR_OPER_MSG_MIN + A-type), matching the audience
+		 * the BIW101 A-type selects. */
+		if (flex->rx.biw[pol].sysmsg_a_type >= 0) {
+			int sva = flex->rx.biw[pol].sysmsg_a_type;
+			int sv_idx = voffset + n_valid_vec_words - 1;
+			if (sv_idx > voffset + vec_count - 1 &&
+			    sv_idx < FLEX_WORDS_PER_FRAME &&
+			    ph->status[sv_idx] != FLEX_WORD_UNCORRECTABLE &&
+			    ph->status[sv_idx] != FLEX_WORD_NOT_RECEIVED) {
+				capcode = (uint64_t)(FLEX_ADDR_OPER_MSG_MIN
+					- FLEX_SHORT_ADDR_OFFSET
+					+ (uint32_t)sva);
+				j = sv_idx;
+				is_long = 0;
+				prio_flag = ' ';
+				grp_flag = ' ';
+				aw_type = FLEX_ADDR_OPER_MSG;
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: %dbps C%u/F%u phase=%c BIW101 %s"
+					  " sysmsg vector at VF[%d]"
+					  " → synthetic cap=%" PRIu64 "\n",
+					  bitrate,
+					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+					  phase_name,
+					  flex_biw_sysinfo_a_name((uint32_t)sva),
+					  sv_idx, capcode);
+				flex->rx.biw[pol].sysmsg_a_type = -1;
+				goto vector_decode;
+			}
+		}
+
 		} /* end block scope for addr_idx/vec_count */
 	}
 }
