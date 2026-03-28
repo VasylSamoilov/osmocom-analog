@@ -1328,11 +1328,12 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
  * Returns slot index, or -1 if no slot available. */
 static int reasm_find(flex_t *flex, uint64_t capcode, int msg_num)
 {
+	int pol = flex->rx.polarity;
 	int i;
 	for (i = 0; i < FLEX_REASM_SLOTS; i++) {
-		if (flex->rx.reasm[i].active &&
-		    flex->rx.reasm[i].capcode == capcode &&
-		    flex->rx.reasm[i].msg_num == msg_num)
+		if (flex->rx.reasm[pol][i].active &&
+		    flex->rx.reasm[pol][i].capcode == capcode &&
+		    flex->rx.reasm[pol][i].msg_num == msg_num)
 			return i;
 	}
 	return -1;
@@ -1340,50 +1341,52 @@ static int reasm_find(flex_t *flex, uint64_t capcode, int msg_num)
 
 static int reasm_alloc(flex_t *flex, uint64_t capcode, int msg_num, int msg_type)
 {
+	int pol = flex->rx.polarity;
 	int i;
 	/* Find a free slot */
 	for (i = 0; i < FLEX_REASM_SLOTS; i++) {
-		if (!flex->rx.reasm[i].active)
+		if (!flex->rx.reasm[pol][i].active)
 			goto found;
 	}
 	/* Evict oldest slot */
 	{
 		int oldest = 0;
-		uint32_t oldest_frame = flex->rx.reasm[0].last_frame;
+		uint32_t oldest_frame = flex->rx.reasm[pol][0].last_frame;
 		for (i = 1; i < FLEX_REASM_SLOTS; i++) {
-			if (flex->rx.reasm[i].last_frame < oldest_frame) {
+			if (flex->rx.reasm[pol][i].last_frame < oldest_frame) {
 				oldest = i;
-				oldest_frame = flex->rx.reasm[i].last_frame;
+				oldest_frame = flex->rx.reasm[pol][i].last_frame;
 			}
 		}
 		i = oldest;
 	}
 found:
-	flex->rx.reasm[i].active = 1;
-	flex->rx.reasm[i].capcode = capcode;
-	flex->rx.reasm[i].msg_num = msg_num;
-	flex->rx.reasm[i].len = 0;
-	flex->rx.reasm[i].msg_type = msg_type;
-	flex->rx.reasm[i].kanji = 0;
-	flex->rx.reasm[i].secure_subtype = -1;
-	flex->rx.reasm[i].expected_f = 0; /* next after initial (F=11) is F=00 */
-	flex->rx.reasm[i].last_frame = flex->rx.fiw_frame;
-	flex->rx.reasm[i].last_cycle = flex->rx.fiw_cycle;
+	flex->rx.reasm[pol][i].active = 1;
+	flex->rx.reasm[pol][i].capcode = capcode;
+	flex->rx.reasm[pol][i].msg_num = msg_num;
+	flex->rx.reasm[pol][i].len = 0;
+	flex->rx.reasm[pol][i].msg_type = msg_type;
+	flex->rx.reasm[pol][i].kanji = 0;
+	flex->rx.reasm[pol][i].secure_subtype = -1;
+	flex->rx.reasm[pol][i].expected_f = 0; /* next after initial (F=11) is F=00 */
+	flex->rx.reasm[pol][i].last_frame = flex->rx.fiw_frame;
+	flex->rx.reasm[pol][i].last_cycle = flex->rx.fiw_cycle;
 	return i;
 }
 
 /* Append text to a reassembly slot. Returns 0 on success, -1 if full. */
 static int reasm_append(flex_t *flex, int slot, const char *text, int text_len)
 {
-	int avail = FLEX_REASM_MAX_LEN - 1 - flex->rx.reasm[slot].len;
+	int pol = flex->rx.polarity;
+	int avail = FLEX_REASM_MAX_LEN - 1 - flex->rx.reasm[pol][slot].len;
 	int copy = (text_len < avail) ? text_len : avail;
 	if (copy <= 0)
 		return -1;
-	memcpy(flex->rx.reasm[slot].buf + flex->rx.reasm[slot].len, text, copy);
-	flex->rx.reasm[slot].len += copy;
-	flex->rx.reasm[slot].buf[flex->rx.reasm[slot].len] = '\0';
-	flex->rx.reasm[slot].last_frame = flex->rx.fiw_frame;
-	flex->rx.reasm[slot].last_cycle = flex->rx.fiw_cycle;
+	memcpy(flex->rx.reasm[pol][slot].buf + flex->rx.reasm[pol][slot].len, text, copy);
+	flex->rx.reasm[pol][slot].len += copy;
+	flex->rx.reasm[pol][slot].buf[flex->rx.reasm[pol][slot].len] = '\0';
+	flex->rx.reasm[pol][slot].last_frame = flex->rx.fiw_frame;
+	flex->rx.reasm[pol][slot].last_cycle = flex->rx.fiw_cycle;
 	return 0;
 }
 
@@ -1391,46 +1394,48 @@ static int reasm_append(flex_t *flex, int slot, const char *text, int text_len)
  * we use 64 as a generous timeout). Outputs partial result on expiry. */
 static void reasm_expire(flex_t *flex)
 {
-	int i;
+	int pol, i;
 	uint32_t cur = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+	for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
 	for (i = 0; i < FLEX_REASM_SLOTS; i++) {
 		uint32_t last;
 		int delta;
-		if (!flex->rx.reasm[i].active)
+		if (!flex->rx.reasm[pol][i].active)
 			continue;
-		last = flex->rx.reasm[i].last_cycle * 128 + flex->rx.reasm[i].last_frame;
+		last = flex->rx.reasm[pol][i].last_cycle * 128 + flex->rx.reasm[pol][i].last_frame;
 		delta = (int)cur - (int)last;
 		if (delta < 0)
 			delta += 15 * 128; /* wrap around cycle boundary */
 		if (delta > FLEX_REASM_TIMEOUT) {
-			if (flex->rx.reasm[i].len > 0) {
+			if (flex->rx.reasm[pol][i].len > 0) {
 				const char *type_tag =
-					(flex->rx.reasm[i].msg_type == FLEX_VECTOR_TYPE_HEX_BINARY)
+					(flex->rx.reasm[pol][i].msg_type == FLEX_VECTOR_TYPE_HEX_BINARY)
 					? "HEX" :
-					(flex->rx.reasm[i].msg_type == FLEX_VECTOR_TYPE_SECURE)
+					(flex->rx.reasm[pol][i].msg_type == FLEX_VECTOR_TYPE_SECURE)
 					? "SEC" : "ALN";
-				if (flex->rx.reasm[i].msg_type == FLEX_VECTOR_TYPE_SECURE)
+				if (flex->rx.reasm[pol][i].msg_type == FLEX_VECTOR_TYPE_SECURE)
 					LOGP(DDSP, LOGL_NOTICE,
 					     "RX: reassembly timeout [%09" PRIu64 "] msgnum=%d (%d frames stale) partial %s t1t0=%d \"%s\"\n",
-					     flex->rx.reasm[i].capcode,
-					     flex->rx.reasm[i].msg_num, delta,
+					     flex->rx.reasm[pol][i].capcode,
+					     flex->rx.reasm[pol][i].msg_num, delta,
 					     type_tag,
-					     flex->rx.reasm[i].secure_subtype,
-					     flex->rx.reasm[i].buf);
+					     flex->rx.reasm[pol][i].secure_subtype,
+					     flex->rx.reasm[pol][i].buf);
 				else
 					LOGP(DDSP, LOGL_NOTICE,
 					     "RX: reassembly timeout [%09" PRIu64 "] msgnum=%d (%d frames stale) partial %s \"%s\"\n",
-					     flex->rx.reasm[i].capcode,
-					     flex->rx.reasm[i].msg_num, delta,
+					     flex->rx.reasm[pol][i].capcode,
+					     flex->rx.reasm[pol][i].msg_num, delta,
 					     type_tag,
-					     flex->rx.reasm[i].buf);
+					     flex->rx.reasm[pol][i].buf);
 			} else {
 				LOGP(DDSP, LOGL_DEBUG,
 				     "RX: reassembly timeout for capcode %" PRIu64 " msgnum=%d (%d frames stale, empty).\n",
-				     flex->rx.reasm[i].capcode, flex->rx.reasm[i].msg_num, delta);
+				     flex->rx.reasm[pol][i].capcode, flex->rx.reasm[pol][i].msg_num, delta);
 			}
-			flex->rx.reasm[i].active = 0;
+			flex->rx.reasm[pol][i].active = 0;
 		}
+	}
 	}
 }
 
@@ -1441,9 +1446,10 @@ static void reasm_expire(flex_t *flex)
 static flex_rx_msg_entry_t *msg_history_find(flex_t *flex,
     uint64_t capcode, int msg_num, int vec_type, int rx_phase)
 {
+	int pol = flex->rx.polarity;
 	int i;
 	for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
-		flex_rx_msg_entry_t *e = &flex->rx.msg_history[i];
+		flex_rx_msg_entry_t *e = &flex->rx.msg_history[pol][i];
 		if (e->active &&
 		    e->capcode == capcode &&
 		    e->msg_num == msg_num &&
@@ -1474,6 +1480,7 @@ static flex_rx_msg_entry_t *msg_history_store(flex_t *flex,
     int word_count, int frag_count, int is_long, int blocking,
     uint32_t frame_abs)
 {
+	int pol = flex->rx.polarity;
 	int i;
 	flex_rx_msg_entry_t *target = NULL;
 
@@ -1483,8 +1490,8 @@ static flex_rx_msg_entry_t *msg_history_store(flex_t *flex,
 	if (!target) {
 		/* Find an inactive slot */
 		for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
-			if (!flex->rx.msg_history[i].active) {
-				target = &flex->rx.msg_history[i];
+			if (!flex->rx.msg_history[pol][i].active) {
+				target = &flex->rx.msg_history[pol][i];
 				break;
 			}
 		}
@@ -1497,13 +1504,13 @@ static flex_rx_msg_entry_t *msg_history_store(flex_t *flex,
 		uint32_t oldest_age = 0;
 		int oldest_idx = 0;
 		for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
-			uint32_t age = (frame_abs - flex->rx.msg_history[i].frame_abs + 1920) % 1920;
+			uint32_t age = (frame_abs - flex->rx.msg_history[pol][i].frame_abs + 1920) % 1920;
 			if (age > oldest_age) {
 				oldest_age = age;
 				oldest_idx = i;
 			}
 		}
-		target = &flex->rx.msg_history[oldest_idx];
+		target = &flex->rx.msg_history[pol][oldest_idx];
 		LOGP(DFLEX, LOGL_DEBUG,
 		     "RX_MSG_HIST: evicting oldest entry idx=%d (age=%u frames)\n",
 		     oldest_idx, oldest_age);
@@ -1547,15 +1554,17 @@ static flex_rx_msg_entry_t *msg_history_store(flex_t *flex,
  * Uses modular arithmetic for 1920-frame wrap-around. */
 static void msg_history_expire(flex_t *flex, uint32_t current_frame_abs)
 {
-	int i;
+	int pol, i;
+	for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
 	for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
-		flex_rx_msg_entry_t *e = &flex->rx.msg_history[i];
+		flex_rx_msg_entry_t *e = &flex->rx.msg_history[pol][i];
 		if (!e->active)
 			continue;
 		uint32_t age = (current_frame_abs - e->frame_abs + 1920) % 1920;
 		if (age >= FLEX_RX_MSG_HISTORY_WINDOW) {
 			e->active = 0;
 		}
+	}
 	}
 }
 
@@ -1779,6 +1788,7 @@ static int flex_build_word_status(flex_phase_data_t *ph, int start, int end,
  * phaseptr points to 88 words of raw interleaved data. */
 static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase_name)
 {
+	int pol = flex->rx.polarity;
 	int i;
 	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
 
@@ -1787,9 +1797,10 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 	 * combine whatever we have and release the store. */
 	{
 		uint32_t current_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
-		int p;
+		int pol, p;
+		for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
 		for (p = 0; p < FLEX_MAX_PHASES; p++) {
-			flex_rx_subframe_store_t *store = &flex->rx.subframe_store[p];
+			flex_rx_subframe_store_t *store = &flex->rx.subframe_store[pol][p];
 			if (!store->active || store->num_received == 0)
 				continue;
 
@@ -1820,6 +1831,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				 * primary purpose — releasing stale storage. The partial combine
 				 * logs recovery stats for diagnostic purposes. */
 			}
+		}
 		}
 	}
 
@@ -1901,8 +1913,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 	/* --- Subframe store logic (Req 15) --- */
 	if (flex->rx.fiw_num_transmissions > 1) {
+		int pol = flex->rx.polarity;
 		int phase_idx = ph->rx_phase;
-		flex_rx_subframe_store_t *store = &flex->rx.subframe_store[phase_idx];
+		flex_rx_subframe_store_t *store = &flex->rx.subframe_store[pol][phase_idx];
 		uint32_t repeat_interval = flex_scheduler_repeat_interval(
 			flex->collapse, flex->rx.fiw_td_collapse);
 		int sf_idx = flex_scheduler_subframe_index(
@@ -2053,18 +2066,18 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				case FLEX_BIW_TYPE_SSID1: {
 					uint32_t cov = (bword >> FLEX_BIW_SSID1_COVERAGE_SHIFT) & FLEX_BIW_SSID1_COVERAGE_MASK;
 					uint32_t lid = (bword >> FLEX_BIW_SSID1_LOCALID_SHIFT) & FLEX_BIW_SSID1_LOCALID_MASK;
-					int changed = !flex->rx.biw.seen ||
-						      flex->rx.biw.local_id != lid ||
-						      flex->rx.biw.coverage != cov;
+					int changed = !flex->rx.biw[pol].seen ||
+						      flex->rx.biw[pol].local_id != lid ||
+						      flex->rx.biw[pol].coverage != cov;
 					LOGP_CHAN(DDSP, changed ? LOGL_NOTICE : LOGL_DEBUG,
 						  "RX: %dbps C%u/F%u phase=%c BIW SSID1 local_id=%u coverage=%u%s\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name, lid, cov,
 						  changed ? "" : " (unchanged)");
-					flex->rx.biw.local_id = lid;
-					flex->rx.biw.coverage = cov;
-					flex->rx.biw.seen = 1;
+					flex->rx.biw[pol].local_id = lid;
+					flex->rx.biw[pol].coverage = cov;
+					flex->rx.biw[pol].seen = 1;
 					break;
 				}
 				case FLEX_BIW_TYPE_DATE: {
@@ -2095,10 +2108,10 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  phase_name,
 							  biw_year, mon, day);
 					}
-					flex->rx.biw.date_year = real;
-					flex->rx.biw.date_month = mon;
-					flex->rx.biw.date_day = day;
-					flex->rx.biw.seen_date = 1;
+					flex->rx.biw[pol].date_year = real;
+					flex->rx.biw[pol].date_month = mon;
+					flex->rx.biw[pol].date_day = day;
+					flex->rx.biw[pol].seen_date = 1;
 					break;
 				}
 				case FLEX_BIW_TYPE_TIME: {
@@ -2111,10 +2124,10 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  hour, min, sec * FLEX_BIW_TIME_SECOND_STEP);
-					flex->rx.biw.time_hour = hour;
-					flex->rx.biw.time_minute = min;
-					flex->rx.biw.time_second = sec;
-					flex->rx.biw.seen_time = 1;
+					flex->rx.biw[pol].time_hour = hour;
+					flex->rx.biw[pol].time_minute = min;
+					flex->rx.biw[pol].time_second = sec;
+					flex->rx.biw[pol].seen_time = 1;
 					break;
 				}
 				case FLEX_BIW_TYPE_SYSINFO: {
@@ -2139,11 +2152,11 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  phase_name, a_type, zone,
 							  flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
 							  dst, esec);
-						flex->rx.biw.timezone_zone = zone;
-						flex->rx.biw.timezone_offset_min = tz_min;
-						flex->rx.biw.timezone_dst = (int)dst;
-						flex->rx.biw.timezone_extsec = esec;
-						flex->rx.biw.seen_timezone = 1;
+						flex->rx.biw[pol].timezone_zone = zone;
+						flex->rx.biw[pol].timezone_offset_min = tz_min;
+						flex->rx.biw[pol].timezone_dst = (int)dst;
+						flex->rx.biw[pol].timezone_extsec = esec;
+						flex->rx.biw[pol].seen_timezone = 1;
 					} else if (a_type <= FLEX_BIW_SYSINFO_A_MSG_SSID) {
 						/* System Message types A=0000~0011.
 						 *
@@ -2226,9 +2239,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					uint32_t tmf     = (bword >> FLEX_BIW_SSID2_TMF_SHIFT) & FLEX_BIW_SSID2_TMF_MASK;
 					uint32_t country = (bword >> FLEX_BIW_SSID2_COUNTRY_SHIFT) & FLEX_BIW_SSID2_COUNTRY_MASK;
 					const char *cname = flex_mcc_name(country);
-					int changed = !flex->rx.biw.seen_ssid2 ||
-						      flex->rx.biw.country != country ||
-						      flex->rx.biw.tmf != tmf;
+					int changed = !flex->rx.biw[pol].seen_ssid2 ||
+						      flex->rx.biw[pol].country != country ||
+						      flex->rx.biw[pol].tmf != tmf;
 					LOGP_CHAN(DDSP, changed ? LOGL_NOTICE : LOGL_DEBUG,
 						  "RX: %dbps C%u/F%u phase=%c BIW SSID2 country=%u (%s) tmf=0x%X%s\n",
 						  bitrate,
@@ -2237,9 +2250,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  cname ? cname : "unknown",
 						  tmf,
 						  changed ? "" : " (unchanged)");
-					flex->rx.biw.country = country;
-					flex->rx.biw.tmf = tmf;
-					flex->rx.biw.seen_ssid2 = 1;
+					flex->rx.biw[pol].country = country;
+					flex->rx.biw[pol].tmf = tmf;
+					flex->rx.biw[pol].seen_ssid2 = 1;
 					break;
 				}
 				default:
@@ -2575,7 +2588,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					int phase_idx = (phase_name == 'A') ? 0 :
 							(phase_name == 'B') ? 1 :
 							(phase_name == 'C') ? 2 : 3;
-					int cnt = flex->rx.temp_addr_map[phase_idx][slot].count;
+					int cnt = flex->rx.temp_addr_map[pol][phase_idx][slot].count;
 
 					/* New SETUP on this slot: if slot was active
 					 * from a previous assignment, overwrite it.
@@ -2584,13 +2597,13 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					 * so a new SETUP implies the old one
 					 * completed or was abandoned. */
 					if (slot < FLEX_TEMP_ADDR_SLOTS) {
-						if (!flex->rx.temp_addr_map[phase_idx][slot].active) {
+						if (!flex->rx.temp_addr_map[pol][phase_idx][slot].active) {
 							/* Fresh slot — initialize */
-							flex->rx.temp_addr_map[phase_idx][slot].count = 0;
-							flex->rx.temp_addr_map[phase_idx][slot].target_frame = tgt_frame;
-							flex->rx.temp_addr_map[phase_idx][slot].setup_frame = flex->rx.fiw_frame;
-							flex->rx.temp_addr_map[phase_idx][slot].setup_cycle = flex->rx.fiw_cycle;
-							flex->rx.temp_addr_map[phase_idx][slot].active = 1;
+							flex->rx.temp_addr_map[pol][phase_idx][slot].count = 0;
+							flex->rx.temp_addr_map[pol][phase_idx][slot].target_frame = tgt_frame;
+							flex->rx.temp_addr_map[pol][phase_idx][slot].setup_frame = flex->rx.fiw_frame;
+							flex->rx.temp_addr_map[pol][phase_idx][slot].setup_cycle = flex->rx.fiw_cycle;
+							flex->rx.temp_addr_map[pol][phase_idx][slot].active = 1;
 							cnt = 0;
 						}
 						/* Deduplicate: skip if capcode already in this slot
@@ -2598,14 +2611,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						{
 							int dup = 0, di;
 							for (di = 0; di < cnt; di++) {
-								if (flex->rx.temp_addr_map[phase_idx][slot].capcodes[di] == capcode) {
+								if (flex->rx.temp_addr_map[pol][phase_idx][slot].capcodes[di] == capcode) {
 									dup = 1;
 									break;
 								}
 							}
 							if (!dup && cnt < FLEX_TEMP_GROUP_MAX_MEMBERS) {
-								flex->rx.temp_addr_map[phase_idx][slot].capcodes[cnt] = capcode;
-								flex->rx.temp_addr_map[phase_idx][slot].count = cnt + 1;
+								flex->rx.temp_addr_map[pol][phase_idx][slot].capcodes[cnt] = capcode;
+								flex->rx.temp_addr_map[pol][phase_idx][slot].count = cnt + 1;
 							}
 						}
 					}
@@ -2617,7 +2630,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  phase_name, capcode,
 						  FLEX_RX_FLAG_TEMPORARY,
 						  slot, tgt_frame, capcode,
-						  flex->rx.temp_addr_map[phase_idx][slot].count);
+						  flex->rx.temp_addr_map[pol][phase_idx][slot].count);
 				} else if (aw_type == FLEX_ADDR_TEMPORARY) {
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
 						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  INS temp_slot=%u type=%s data=0x%04X\n",
@@ -2829,30 +2842,32 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 				/* Log DELIVERY with member list */
 				if (slot < FLEX_TEMP_ADDR_SLOTS &&
-				    flex->rx.temp_addr_map[phase_idx][slot].active) {
-					int cnt = flex->rx.temp_addr_map[phase_idx][slot].count;
+				    flex->rx.temp_addr_map[pol][phase_idx][slot].active) {
+					int cnt = flex->rx.temp_addr_map[pol][phase_idx][slot].count;
 					int m;
+					char mbuf[256];
+					int mpos = 0;
+					for (m = 0; m < cnt; m++)
+						mpos += snprintf(mbuf + mpos, sizeof(mbuf) - mpos,
+								 " %" PRIu64,
+								 flex->rx.temp_addr_map[pol][phase_idx][slot].capcodes[m]);
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  DELIVERY slot=%u members=%d%s:",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  DELIVERY slot=%u members=%d%s:%s\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name, capcode,
 						  FLEX_RX_FLAG_TEMPORARY,
 						  slot, cnt,
-						  is_complete ? " COMPLETE" : " CONTINUED");
-					for (m = 0; m < cnt; m++)
-						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  " %" PRIu64,
-							  flex->rx.temp_addr_map[phase_idx][slot].capcodes[m]);
-					LOGP_CHAN(DDSP, LOGL_NOTICE, "\n");
+						  is_complete ? " COMPLETE" : " CONTINUED",
+						  mbuf);
 
 					/* Teardown on completion */
 					if (is_complete) {
 						LOGP_CHAN(DDSP, LOGL_DEBUG,
 							  "RX: Phase %c temp slot=%u TEARDOWN — message complete.\n",
 							  phase_name, slot);
-						memset(&flex->rx.temp_addr_map[phase_idx][slot], 0,
-						       sizeof(flex->rx.temp_addr_map[phase_idx][slot]));
+						memset(&flex->rx.temp_addr_map[pol][phase_idx][slot], 0,
+						       sizeof(flex->rx.temp_addr_map[pol][phase_idx][slot]));
 					}
 				} else {
 					/* No tracked SETUP for this slot — log anyway */
@@ -3072,7 +3087,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							/* Check reassembly slot for this stream */
 							int kslot = reasm_find(flex, capcode, hdr_n);
 							if (kslot >= 0)
-								is_kanji = flex->rx.reasm[kslot].kanji;
+								is_kanji = flex->rx.reasm[pol][kslot].kanji;
 							else
 								is_kanji = rx_kanji_enabled;
 						}
@@ -3360,42 +3375,42 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							? FLEX_VECTOR_TYPE_SECURE : FLEX_VECTOR_TYPE_ALPHA;
 						int slot = reasm_alloc(flex, capcode, hdr_n, reasm_type);
 						if (vec_type == FLEX_VECTOR_TYPE_SECURE)
-							flex->rx.reasm[slot].secure_subtype = sec_t;
+							flex->rx.reasm[pol][slot].secure_subtype = sec_t;
 						if (is_kanji)
-							flex->rx.reasm[slot].kanji = 1;
-						flex->rx.reasm[slot].rx_sig = rx_sig;
-						flex->rx.reasm[slot].sig_sum = sig_sum;
-						flex->rx.reasm[slot].sig_valid = frag_words_ok;
-						strncpy(flex->rx.reasm[slot].word_status, word_status,
-							sizeof(flex->rx.reasm[slot].word_status) - 1);
-						flex->rx.reasm[slot].ws_len = strlen(word_status);
+							flex->rx.reasm[pol][slot].kanji = 1;
+						flex->rx.reasm[pol][slot].rx_sig = rx_sig;
+						flex->rx.reasm[pol][slot].sig_sum = sig_sum;
+						flex->rx.reasm[pol][slot].sig_valid = frag_words_ok;
+						strncpy(flex->rx.reasm[pol][slot].word_status, word_status,
+							sizeof(flex->rx.reasm[pol][slot].word_status) - 1);
+						flex->rx.reasm[pol][slot].ws_len = strlen(word_status);
 						reasm_append(flex, slot, text, ti);
 					} else if (frag_flag == 'F') {
 						/* Continuation fragment (C=1, F≠11) — append */
 						int slot = reasm_find(flex, capcode, hdr_n);
 						if (slot >= 0) {
-							if (hdr_f != flex->rx.reasm[slot].expected_f)
+							if (hdr_f != flex->rx.reasm[pol][slot].expected_f)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: Phase %c reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hdr_n,
-									  flex->rx.reasm[slot].expected_f, hdr_f);
-							flex->rx.reasm[slot].sig_sum += sig_sum;
+									  flex->rx.reasm[pol][slot].expected_f, hdr_f);
+							flex->rx.reasm[pol][slot].sig_sum += sig_sum;
 							if (!frag_words_ok)
-								flex->rx.reasm[slot].sig_valid = 0;
+								flex->rx.reasm[pol][slot].sig_valid = 0;
 							/* Append word status with '|' separator */
 							{
-								int ws_left = (int)sizeof(flex->rx.reasm[slot].word_status) - flex->rx.reasm[slot].ws_len - 1;
+								int ws_left = (int)sizeof(flex->rx.reasm[pol][slot].word_status) - flex->rx.reasm[pol][slot].ws_len - 1;
 								if (ws_left > 1) {
-									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len++] = '|';
+									flex->rx.reasm[pol][slot].word_status[flex->rx.reasm[pol][slot].ws_len++] = '|';
 									int ws_add = strlen(word_status);
 									if (ws_add > ws_left - 1) ws_add = ws_left - 1;
-									memcpy(flex->rx.reasm[slot].word_status + flex->rx.reasm[slot].ws_len, word_status, ws_add);
-									flex->rx.reasm[slot].ws_len += ws_add;
-									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len] = '\0';
+									memcpy(flex->rx.reasm[pol][slot].word_status + flex->rx.reasm[pol][slot].ws_len, word_status, ws_add);
+									flex->rx.reasm[pol][slot].ws_len += ws_add;
+									flex->rx.reasm[pol][slot].word_status[flex->rx.reasm[pol][slot].ws_len] = '\0';
 								}
 							}
 							reasm_append(flex, slot, text, ti);
-							flex->rx.reasm[slot].expected_f = (hdr_f + 1) % 3;
+							flex->rx.reasm[pol][slot].expected_f = (hdr_f + 1) % 3;
 						}
 					} else if (frag_flag == 'C') {
 						/* Final fragment (C=0, F≠11) — append and emit reassembled */
@@ -3403,26 +3418,26 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						if (slot >= 0) {
 							const char *reasm_tag;
 							const char *reasm_sig_status = "";
-							if (flex->rx.reasm[slot].kanji)
+							if (flex->rx.reasm[pol][slot].kanji)
 								reasm_tag = "ALN:KNJ";
-							else if (flex->rx.reasm[slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
+							else if (flex->rx.reasm[pol][slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
 								reasm_tag = "SEC";
 							else
 								reasm_tag = msg_tag;
-							if (hdr_f != flex->rx.reasm[slot].expected_f)
+							if (hdr_f != flex->rx.reasm[pol][slot].expected_f)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: Phase %c reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hdr_n,
-									  flex->rx.reasm[slot].expected_f, hdr_f);
+									  flex->rx.reasm[pol][slot].expected_f, hdr_f);
 							/* Accumulate final fragment into signature */
-							flex->rx.reasm[slot].sig_sum += sig_sum;
+							flex->rx.reasm[pol][slot].sig_sum += sig_sum;
 							if (!frag_words_ok)
-								flex->rx.reasm[slot].sig_valid = 0;
+								flex->rx.reasm[pol][slot].sig_valid = 0;
 							/* Validate signature across all fragments */
-							if (flex->rx.reasm[slot].sig_valid) {
-								uint32_t total_sum = flex->rx.reasm[slot].sig_sum;
+							if (flex->rx.reasm[pol][slot].sig_valid) {
+								uint32_t total_sum = flex->rx.reasm[pol][slot].sig_sum;
 								uint32_t expected = (~total_sum) & FLEX_ALPHA_SIG_MASK;
-								uint32_t stored_sig = flex->rx.reasm[slot].rx_sig;
+								uint32_t stored_sig = flex->rx.reasm[pol][slot].rx_sig;
 								if (stored_sig == expected) {
 									reasm_sig_status = ",sig=OK";
 									LOGP_CHAN(DDSP, LOGL_DEBUG,
@@ -3444,18 +3459,18 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							}
 							/* Accumulate final fragment word status */
 							{
-								int ws_left = (int)sizeof(flex->rx.reasm[slot].word_status) - flex->rx.reasm[slot].ws_len - 1;
+								int ws_left = (int)sizeof(flex->rx.reasm[pol][slot].word_status) - flex->rx.reasm[pol][slot].ws_len - 1;
 								if (ws_left > 1) {
-									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len++] = '|';
+									flex->rx.reasm[pol][slot].word_status[flex->rx.reasm[pol][slot].ws_len++] = '|';
 									int ws_add = strlen(word_status);
 									if (ws_add > ws_left - 1) ws_add = ws_left - 1;
-									memcpy(flex->rx.reasm[slot].word_status + flex->rx.reasm[slot].ws_len, word_status, ws_add);
-									flex->rx.reasm[slot].ws_len += ws_add;
-									flex->rx.reasm[slot].word_status[flex->rx.reasm[slot].ws_len] = '\0';
+									memcpy(flex->rx.reasm[pol][slot].word_status + flex->rx.reasm[pol][slot].ws_len, word_status, ws_add);
+									flex->rx.reasm[pol][slot].ws_len += ws_add;
+									flex->rx.reasm[pol][slot].word_status[flex->rx.reasm[pol][slot].ws_len] = '\0';
 								}
 							}
 							reasm_append(flex, slot, text, ti);
-							if (flex->rx.reasm[slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
+							if (flex->rx.reasm[pol][slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c%c %s t1t0=%d \"%s\" {%s}\n",
 									  bitrate,
@@ -3471,9 +3486,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  grp_flag,
 									  prio_flag,
 									  reasm_tag,
-									  flex->rx.reasm[slot].secure_subtype,
-									  flex->rx.reasm[slot].buf,
-									  flex->rx.reasm[slot].word_status);
+									  flex->rx.reasm[pol][slot].secure_subtype,
+									  flex->rx.reasm[pol][slot].buf,
+									  flex->rx.reasm[pol][slot].word_status);
 							else
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c%c %s \"%s\" {%s}\n",
@@ -3490,9 +3505,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  grp_flag,
 									  prio_flag,
 									  reasm_tag,
-									  flex->rx.reasm[slot].buf,
-									  flex->rx.reasm[slot].word_status);
-							flex->rx.reasm[slot].active = 0;
+									  flex->rx.reasm[pol][slot].buf,
+									  flex->rx.reasm[pol][slot].word_status);
+							flex->rx.reasm[pol][slot].active = 0;
 						}
 					}
 					/* frag_flag == 'K': complete message, no reassembly needed */
@@ -4318,7 +4333,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					if (!hex_is_initial && hex_blocking == 0) {
 						int slot = reasm_find(flex, capcode, hex_n);
 						if (slot >= 0)
-							hex_blocking = flex->rx.reasm[slot].blocking;
+							hex_blocking = flex->rx.reasm[pol][slot].blocking;
 					}
 
 					/* Pad output to full byte boundary for parseable
@@ -4396,33 +4411,33 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					 * continuous nibble stream, not text. */
 					if (hex_frag_flag == 'F' && hex_is_initial) {
 						int slot = reasm_alloc(flex, capcode, hex_n, FLEX_VECTOR_TYPE_HEX_BINARY);
-						flex->rx.reasm[slot].blocking = hex_blocking;
+						flex->rx.reasm[pol][slot].blocking = hex_blocking;
 						reasm_append(flex, slot, hex, hi);
 					} else if (hex_frag_flag == 'F') {
 						int slot = reasm_find(flex, capcode, hex_n);
 						if (slot >= 0) {
-							hex_blocking = flex->rx.reasm[slot].blocking;
-							if (hex_f != flex->rx.reasm[slot].expected_f)
+							hex_blocking = flex->rx.reasm[pol][slot].blocking;
+							if (hex_f != flex->rx.reasm[pol][slot].expected_f)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: Phase %c HEX reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hex_n,
-									  flex->rx.reasm[slot].expected_f, hex_f);
+									  flex->rx.reasm[pol][slot].expected_f, hex_f);
 							reasm_append(flex, slot, hex, hi);
-							flex->rx.reasm[slot].expected_f = (hex_f + 1) % 3;
+							flex->rx.reasm[pol][slot].expected_f = (hex_f + 1) % 3;
 						}
 					} else if (hex_frag_flag == 'C') {
 						int slot = reasm_find(flex, capcode, hex_n);
 						if (slot >= 0) {
-							hex_blocking = flex->rx.reasm[slot].blocking;
-							if (hex_f != flex->rx.reasm[slot].expected_f)
+							hex_blocking = flex->rx.reasm[pol][slot].blocking;
+							if (hex_f != flex->rx.reasm[pol][slot].expected_f)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: Phase %c HEX reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hex_n,
-									  flex->rx.reasm[slot].expected_f, hex_f);
+									  flex->rx.reasm[pol][slot].expected_f, hex_f);
 							reasm_append(flex, slot, hex, hi);
 							{
 								int rbl = hex_blocking ? hex_blocking : 16;
-								int r_bits = flex->rx.reasm[slot].len * 4;
+								int r_bits = flex->rx.reasm[pol][slot].len * 4;
 								int r_blocks = (rbl > 0) ? r_bits / rbl : 0;
 								LOGP_CHAN(DDSP, LOGL_DEBUG,
 									  "RX: Phase %c HEX/Binary reassembled: B=%d (%d bits/char), "
@@ -4444,8 +4459,8 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  flex_addr_type_flag(aw_type, is_long),
 								  grp_flag,
 								  prio_flag,
-								  flex->rx.reasm[slot].buf);
-							flex->rx.reasm[slot].active = 0;
+								  flex->rx.reasm[pol][slot].buf);
+							flex->rx.reasm[pol][slot].active = 0;
 						}
 					}
 					/* hex_frag_flag == 'K': complete message, no reassembly needed */
@@ -4491,15 +4506,16 @@ static void flex_rx_decode_data(flex_t *flex)
 	 * Frame numbers wrap at 128 (0-127), cycle at 15 (0-14).
 	 * Total frame count = cycle * 128 + frame. */
 	{
-		int p, s;
+		int pol, p, s;
 		uint32_t cur_total = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
 
+		for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
 		for (p = 0; p < FLEX_MAX_PHASES; p++) {
 			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
-				if (!flex->rx.temp_addr_map[p][s].active)
+				if (!flex->rx.temp_addr_map[pol][p][s].active)
 					continue;
-				uint32_t setup_total = flex->rx.temp_addr_map[p][s].setup_cycle * 128
-						     + flex->rx.temp_addr_map[p][s].setup_frame;
+				uint32_t setup_total = flex->rx.temp_addr_map[pol][p][s].setup_cycle * 128
+						     + flex->rx.temp_addr_map[pol][p][s].setup_frame;
 				/* Handle wraparound: 15 cycles * 128 frames = 1920 total */
 				uint32_t elapsed = (cur_total >= setup_total)
 						 ? (cur_total - setup_total)
@@ -4509,10 +4525,11 @@ static void flex_rx_decode_data(flex_t *flex)
 					LOGP_CHAN(DDSP, LOGL_DEBUG,
 						  "RX: Phase %c temp slot=%d TIMEOUT — %u frames since SETUP, clearing.\n",
 						  pn[p], s, elapsed);
-					memset(&flex->rx.temp_addr_map[p][s], 0,
-					       sizeof(flex->rx.temp_addr_map[p][s]));
+					memset(&flex->rx.temp_addr_map[pol][p][s], 0,
+					       sizeof(flex->rx.temp_addr_map[pol][p][s]));
 				}
 			}
+		}
 		}
 	}
 
@@ -4612,25 +4629,29 @@ static void flex_rx_decode_data(flex_t *flex)
 	{
 		static const char pnames[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
 		int p, s, m;
+		int pol = flex->rx.polarity;
 
 		for (p = 0; p < FLEX_MAX_PHASES; p++) {
 			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
-				if (!flex->rx.temp_addr_map[p][s].active)
+				if (!flex->rx.temp_addr_map[pol][p][s].active)
 					continue;
-				int cnt = flex->rx.temp_addr_map[p][s].count;
+				int cnt = flex->rx.temp_addr_map[pol][p][s].count;
 				if (cnt > 0) {
-					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: C%u/F%u phase=%c temp_group=%d ACTIVE members=%d target_frame=%u setup=C%u/F%u:",
-						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  pnames[p], s, cnt,
-						  flex->rx.temp_addr_map[p][s].target_frame,
-						  flex->rx.temp_addr_map[p][s].setup_cycle,
-						  flex->rx.temp_addr_map[p][s].setup_frame);
+					char mbuf[256];
+					int mpos = 0;
 					for (m = 0; m < cnt; m++)
-						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  " %" PRIu64,
-							  flex->rx.temp_addr_map[p][s].capcodes[m]);
-					LOGP_CHAN(DDSP, LOGL_NOTICE, "\n");
+						mpos += snprintf(mbuf + mpos, sizeof(mbuf) - mpos,
+								 " %" PRIu64,
+								 flex->rx.temp_addr_map[pol][p][s].capcodes[m]);
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: C%u/F%u pol=%s phase=%c temp_group=%d ACTIVE members=%d target_frame=%u setup=C%u/F%u:%s\n",
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  pol ? "neg" : "pos",
+						  pnames[p], s, cnt,
+						  flex->rx.temp_addr_map[pol][p][s].target_frame,
+						  flex->rx.temp_addr_map[pol][p][s].setup_cycle,
+						  flex->rx.temp_addr_map[pol][p][s].setup_frame,
+						  mbuf);
 				}
 			}
 		}

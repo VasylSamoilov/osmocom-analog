@@ -5,7 +5,12 @@
 #include "../libfilter/iir_filter.h"
 #include "frame.h"
 
-/* Maximum subframe transmissions for RX combining (Req 15-16) */
+/* Number of independent polarity networks (POS=0, NEG=1).
+ * Each polarity is a separate logical network with independent
+ * temp group tracking, reassembly, message history, and BIW state. */
+#define FLEX_RX_POLARITIES	2
+#define FLEX_POL_POS		0
+#define FLEX_POL_NEG		1
 #define FLEX_RX_MAX_SUBFRAMES	4	/* max num_transmissions */
 
 /* Per-subframe storage for one phase */
@@ -525,7 +530,7 @@ typedef struct flex {
 			uint32_t	setup_cycle;	/* cycle number where SETUP was observed */
 			int		count;		/* number of capcodes assigned */
 			int		active;		/* 1 = assignment active, 0 = empty */
-		} temp_addr_map[FLEX_MAX_PHASES][FLEX_TEMP_ADDR_SLOTS];
+		} temp_addr_map[FLEX_RX_POLARITIES][FLEX_MAX_PHASES][FLEX_TEMP_ADDR_SLOTS];
 
 		/* BIW state — track SSID/coverage/timezone/date/time across frames.
 		 * Log at NOTICE level when values change, DEBUG when repeated. */
@@ -553,7 +558,7 @@ typedef struct flex {
 			uint32_t	timezone_extsec; /* S5-S3: extended seconds (0-7,
 						  * 1/64 min = 0.9375s steps) */
 			int		seen_timezone;
-		} biw;
+		} biw[FLEX_RX_POLARITIES];
 
 		/* Fragment reassembly state.
 		 *
@@ -590,14 +595,14 @@ typedef struct flex {
 			uint32_t	last_frame;	/* frame number of last fragment */
 			uint32_t	last_cycle;	/* cycle number of last fragment */
 			int		active;		/* 1 = in progress */
-		} reasm[FLEX_REASM_SLOTS];
+		} reasm[FLEX_RX_POLARITIES][FLEX_REASM_SLOTS];
 
 		/* Subframe combining state (Req 15-16).
 		 * Per-phase storage for word-level results across repeated subframes.
 		 * Only active when fiw_num_transmissions > 1.
 		 * Key: (cycle, frame%repeat_interval, phase, collapse parameters).
 		 * No message awareness — all 88 words benefit regardless of capcode. */
-		flex_rx_subframe_store_t subframe_store[FLEX_MAX_PHASES];
+		flex_rx_subframe_store_t subframe_store[FLEX_RX_POLARITIES][FLEX_MAX_PHASES];
 
 		/* Message history for retransmission detection (Req 17-18).
 		 * Stores recently decoded messages keyed by (capcode, N, vec_type, phase)
@@ -605,7 +610,7 @@ typedef struct flex {
 		 * for duplicate suppression and cross-retransmission word recovery.
 		 * This is a separate structure from the subframe_store — it operates
 		 * at the message layer after parsing, not at the frame/physical layer. */
-		flex_rx_msg_entry_t msg_history[FLEX_RX_MSG_HISTORY_MAX];
+		flex_rx_msg_entry_t msg_history[FLEX_RX_POLARITIES][FLEX_RX_MSG_HISTORY_MAX];
 	} rx;
 } flex_t;
 

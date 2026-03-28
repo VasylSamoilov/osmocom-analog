@@ -1532,7 +1532,7 @@ static void fifo_process_line(const char *text, int text_length)
 	if (!strcasecmp(capcode_string, "status")) {
 		flex_t *flex = (flex_t *)sender_head;
 		static const char pnames[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
-		int p, s, m, any = 0;
+		int pol, p, s, m, any = 0;
 
 		if (!flex) {
 			LOGP(DFLEX, LOGL_ERROR, "No instance for status command.\n");
@@ -1558,26 +1558,28 @@ static void fifo_process_line(const char *text, int text_length)
 		}
 
 		LOGP(DFLEX, LOGL_NOTICE, "FIFO: Temp group assignments (16 groups/phase):\n");
+		for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
 		for (p = 0; p < FLEX_MAX_PHASES; p++) {
 			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
-				if (!flex->rx.temp_addr_map[p][s].active)
+				if (!flex->rx.temp_addr_map[pol][p][s].active)
 					continue;
-				int cnt = flex->rx.temp_addr_map[p][s].count;
+				int cnt = flex->rx.temp_addr_map[pol][p][s].count;
 				if (cnt > 0) {
 					LOGP(DFLEX, LOGL_NOTICE,
 					     "  phase=%c group=%d members=%d target_frame=%u setup=C%u/F%u:",
 					     pnames[p], s, cnt,
-					     flex->rx.temp_addr_map[p][s].target_frame,
-					     flex->rx.temp_addr_map[p][s].setup_cycle,
-					     flex->rx.temp_addr_map[p][s].setup_frame);
+					     flex->rx.temp_addr_map[pol][p][s].target_frame,
+					     flex->rx.temp_addr_map[pol][p][s].setup_cycle,
+					     flex->rx.temp_addr_map[pol][p][s].setup_frame);
 					for (m = 0; m < cnt; m++)
 						LOGP(DFLEX, LOGL_NOTICE,
 						     " %" PRIu64,
-						     flex->rx.temp_addr_map[p][s].capcodes[m]);
+						     flex->rx.temp_addr_map[pol][p][s].capcodes[m]);
 					LOGP(DFLEX, LOGL_NOTICE, "\n");
 					any = 1;
 				}
 			}
+		}
 		}
 		if (!any)
 			LOGP(DFLEX, LOGL_NOTICE, "  (no active RX assignments)\n");
