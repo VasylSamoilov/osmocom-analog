@@ -2673,7 +2673,12 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				continue;
 			}
 
-			if (mw1 == 0 && mw2 == 0) continue;
+			if (mw1 == 0 && mw2 == 0) {
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "RX: Phase %c cap=%" PRIu64 " vec_type=%d mw1=mw2=0, skipping.\n",
+					  phase_name, capcode, vec_type);
+				continue;
+			}
 
 			/* Network message payload parsing.
 			 * Network addresses use Secure (type 0) vectors.
@@ -2885,7 +2890,12 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 			/* Alpha message */
 			if (vec_type == FLEX_VECTOR_TYPE_ALPHA || vec_type == FLEX_VECTOR_TYPE_SECURE) {
-				if (mw1 > 87 || mw2 > 87) continue;
+				if (mw1 > 87 || mw2 > 87) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: Phase %c cap=%" PRIu64 " alpha/secure mw1=%d mw2=%d out of range, skipping.\n",
+						  phase_name, capcode, mw1, mw2);
+					continue;
+				}
 
 				/* Decode header word flags (frame.h has layout).
 				 * Per Sections 3.9.3/3.9.4: for long addresses,

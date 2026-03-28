@@ -301,10 +301,12 @@ void print_help(const char *arg0)
 	printf("        Special: status,0,,  — dump system config + temp group assignments\n");
 	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
 	printf("        Special: timezone,<code>,,  — show offset for zone code 0-31\n");
-	printf("        Special: sysmsg,<lsb>,,<payload>  — send system message via\n");
-	printf("          Operator Messaging Address (capcode 0x%X-0x%X).\n",
-	       FLEX_ADDR_OPER_MSG_MIN, FLEX_ADDR_OPER_MSG_MAX);
-	printf("          LSB: 0=all 1=home 2=roaming 3=ssid 4=time 14=SSIDChange 15=SysEvent\n");
+	printf("        Special: sysmsg,<type>,lsb=<target>,<message>  — send system message via\n");
+	printf("          Operator Messaging Address (§3.8.2.4).\n");
+	printf("          type: alpha, numeric, special, hex, tone (not secure per §3.9.2)\n");
+	printf("          lsb= target audience (name or 0-15, default all):\n");
+	printf("            all(0) home(1) roaming(2) ssid(3) time(4)\n");
+	printf("            ssidchange(14) sysevent(15)\n");
 	printf("        Examples:\n");
 	printf("          1234567,alpha,,Hello World\n");
 	printf("          1234567,alpha,speed=3200 priority=1,Hello World\n");
@@ -329,8 +331,11 @@ void print_help(const char *arg0)
 	printf("          3E007005031,alpha,,Extended CAPCODE (Long, Any Phase, collapse=3)\n");
 	printf("          A1234567,numeric,,Standard rule Short CAPCODE\n");
 	printf("          5U0000100,tone,,Non-standard, collapse=5, Phase A\n");
-	printf("          sysmsg,0,,System maintenance at 03:00 UTC\n");
-	printf("          sysmsg,14,,\n");
+	printf("          sysmsg,alpha,,System maintenance at 03:00 UTC\n");
+	printf("          sysmsg,alpha,lsb=home,Home area update\n");
+	printf("          sysmsg,numeric,,31415926\n");
+	printf("          sysmsg,tone,lsb=ssidchange,\n");
+	printf("          sysmsg,tone,,\n");
 	printf("\n");
 	printf("    Valid capcode ranges:\n");
 	printf("        Short:  %" PRIu64 "–%" PRIu64 " (1 address word, 21-bit d0-d20)\n",
@@ -1647,83 +1652,146 @@ static void fifo_process_line(const char *text, int text_length)
 		return;
 	}
 
-	/* === System Message command: "sysmsg,<lsb>,,<payload>" ===
+	/* === System Message command: "sysmsg,<type>,lsb=<N>,<message>" ===
 	 * Sends a system message via Operator Messaging Address
-	 * (capcode FLEX_ADDR_OPER_MSG_MIN + LSB, range 0x1F7810-0x1F781F).
+	 * (capcode derived from FLEX_ADDR_OPER_MSG_MIN + LSB).
 	 *
-	 * The <lsb> field (0-15) selects the operator address sub-type:
+	 * Follows standard FIFO convention: capcode,type,options,message.
+	 * "sysmsg" replaces the capcode field; the type field selects the
+	 * message encoding (alpha, numeric, hex, etc.); lsb= in options
+	 * selects the operator address sub-type (0-15).
+	 *
+	 * LSB values (§3.8.2.4 Table 3.8.2.4-1):
 	 *   0 = all pagers    1 = home area    2 = roaming    3 = SSID
 	 *   4 = time related  5-13 = reserved  14 = SSIDChange  15 = SysEvent
 	 *
-	 * The <payload> is sent as an alpha message body on the operator
-	 * messaging address.  The pager infrastructure interprets the
-	 * content based on the sub-type.
+	 * Secure (V=000) is rejected per §3.9.2: "all Vector types are
+	 * valid except the Secure Vector."
 	 *
 	 * Examples:
-	 *   sysmsg,0,,System maintenance at 03:00 UTC
-	 *   sysmsg,14,,                (SSIDChange, empty payload = TMF update)
-	 *   sysmsg,4,,                 (time-related system message)
+	 *   sysmsg,alpha,,System maintenance at 03:00 UTC
+	 *   sysmsg,alpha,lsb=home,Home area update
+	 *   sysmsg,numeric,,31415926
+	 *   sysmsg,tone,lsb=ssidchange,
 	 *
 	 * Note: Tone-Only Addresses cannot be transmitted in frames
 	 * used for transmitting System Messages. */
 	if (!strcasecmp(capcode_string, "sysmsg")) {
 		flex_t *flex = (flex_t *)sender_head;
-		int lsb;
-		int tlen;
-		char tbuf[16];
+		int lsb = 0; /* default: all pagers */
+		enum flex_msg_type smtype;
 
 		if (!flex) {
 			LOGP(DFLEX, LOGL_ERROR, "No transmitter instance for sysmsg command.\n");
 			return;
 		}
 
-		/* Extract LSB from type field */
-		tlen = comma2 - comma1 - 1;
-		if (tlen <= 0 || tlen >= (int)sizeof(tbuf)) {
-			LOGP(DFLEX, LOGL_NOTICE,
-			     "FIFO: sysmsg requires LSB (0-15). Format: sysmsg,<lsb>,,<payload>\n"
-			     "  LSB: 0=all 1=home 2=roaming 3=ssid 4=time 14=SSIDChange 15=SysEvent\n");
-			return;
+		/* Parse type from the type field (between 1st and 2nd comma) */
+		{
+			int tlen = comma2 - comma1 - 1;
+			char tbuf[32];
+			if (tlen <= 0 || tlen >= (int)sizeof(tbuf)) {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: sysmsg requires type. Format: sysmsg,<type>,lsb=<target>,<message>\n"
+				     "  Types: alpha, numeric, special, hex, tone\n"
+				     "  lsb: all(0) home(1) roaming(2) ssid(3) time(4) ssidchange(14) sysevent(15)\n");
+				return;
+			}
+			memcpy(tbuf, text + comma1 + 1, tlen);
+			tbuf[tlen] = '\0';
+
+			if (!strcasecmp(tbuf, "alpha"))
+				smtype = FLEX_MSG_TYPE_ALPHA;
+			else if (!strcasecmp(tbuf, "numeric"))
+				smtype = FLEX_MSG_TYPE_NUMERIC;
+			else if (!strcasecmp(tbuf, "special"))
+				smtype = FLEX_MSG_TYPE_SPECIAL_NUM;
+			else if (!strcasecmp(tbuf, "hex"))
+				smtype = FLEX_MSG_TYPE_HEX;
+			else if (!strcasecmp(tbuf, "tone"))
+				smtype = FLEX_MSG_TYPE_TONE;
+			else if (!strcasecmp(tbuf, "secure")) {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: sysmsg type=secure rejected — "
+				     "Secure vectors not allowed for system messages (§3.9.2).\n");
+				return;
+			} else {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: sysmsg invalid type '%s' — "
+				     "use alpha, numeric, special, hex, or tone.\n", tbuf);
+				return;
+			}
 		}
-		memcpy(tbuf, text + comma1 + 1, tlen);
-		tbuf[tlen] = '\0';
-		lsb = atoi(tbuf);
+
+		/* Parse lsb= from options field (between 2nd and 3rd comma).
+		 * Accepts numeric (0-15) or human-readable names:
+		 *   all, home, roaming, ssid, time, ssidchange, sysevent */
+		{
+			int olen = comma3 - comma2 - 1;
+			if (olen > 0) {
+				char obuf[64];
+				int ol = olen < (int)sizeof(obuf) - 1 ? olen : (int)sizeof(obuf) - 1;
+				memcpy(obuf, text + comma2 + 1, ol);
+				obuf[ol] = '\0';
+				char *lp = strstr(obuf, "lsb=");
+				if (lp) {
+					char *lv = lp + 4;
+					char *le = lv;
+					while (*le && *le != ' ') le++;
+					char saved = *le;
+					*le = '\0';
+					if (!strcasecmp(lv, "all"))
+						lsb = FLEX_OPER_MSG_ALL_PAGERS;
+					else if (!strcasecmp(lv, "home"))
+						lsb = FLEX_OPER_MSG_HOME;
+					else if (!strcasecmp(lv, "roaming"))
+						lsb = FLEX_OPER_MSG_ROAMING;
+					else if (!strcasecmp(lv, "ssid"))
+						lsb = FLEX_OPER_MSG_SSID;
+					else if (!strcasecmp(lv, "time"))
+						lsb = FLEX_OPER_MSG_TIME;
+					else if (!strcasecmp(lv, "ssidchange"))
+						lsb = FLEX_OPER_MSG_SSID_CHANGE;
+					else if (!strcasecmp(lv, "sysevent"))
+						lsb = FLEX_OPER_MSG_SYS_EVENT;
+					else
+						lsb = atoi(lv);
+					*le = saved;
+				}
+			}
+		}
 
 		if (lsb < 0 || lsb > 15) {
-			LOGP(DFLEX, LOGL_NOTICE, "FIFO: sysmsg LSB %d out of range (0-15).\n", lsb);
+			LOGP(DFLEX, LOGL_NOTICE, "FIFO: sysmsg lsb=%d out of range (0-15).\n", lsb);
 			return;
 		}
 
-		/* Compute the operator messaging capcode.
-		 * Base address FLEX_ADDR_OPER_MSG_MIN (0x1F7810) + LSB (range 0-15). */
+		/* Extract message payload (after third comma) */
+		if (comma3 + 1 < text_length) {
+			message_length = flex_scan_message(text + comma3 + 1,
+							   text_length - comma3 - 1,
+							   msg_buf, sizeof(msg_buf));
+		}
+
+		/* Compute capcode: aw = OPER_MSG_MIN + LSB, cap = aw - OFFSET */
 		{
-			uint64_t oper_capcode = (uint64_t)(FLEX_ADDR_OPER_MSG_MIN + (uint32_t)lsb);
+			uint64_t oper_capcode = (uint64_t)(FLEX_ADDR_OPER_MSG_MIN
+						- FLEX_SHORT_ADDR_OFFSET
+						+ (uint32_t)lsb);
 			flex_msg_t *msg;
 
-			/* Extract message payload (after third comma) */
-			if (comma3 + 1 < text_length) {
-				message_length = flex_scan_message(text + comma3 + 1,
-								   text_length - comma3 - 1,
-								   msg_buf, sizeof(msg_buf));
-			}
-
-			msg = flex_msg_create(flex, oper_capcode,
-					      message_length > 0 ? FLEX_MSG_TYPE_ALPHA : FLEX_MSG_TYPE_TONE,
+			msg = flex_msg_create(flex, oper_capcode, smtype,
 					      msg_buf, message_length);
 			if (msg) {
 				msg->speed = 1600;
 				msg->modulation_type = FLEX_MOD_2FSK;
 				msg->polarity = FLEX_DEFAULT_POLARITY;
-				msg->priority = 1; /* system messages are priority */
-				/* Per spec §3.9.2: "The Message Retrieval Flag
-				 * (R bit) must be set to zero for BIW System
-				 * Messages" and "for NID System Messages."
-				 * R=0 tells pagers to skip message number
-				 * sequence checking for system messages. */
-				msg->numbered_r = 0;
+				msg->priority = 1;
+				msg->numbered_r = 0; /* R=0 per §3.9.2 */
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: sysmsg enqueued LSB=%d (%s) capcode=%" PRIu64 " len=%d R=0\n",
+				     "FIFO: sysmsg enqueued LSB=%d (%s) type=%s capcode=%" PRIu64 " len=%d R=0\n",
 				     lsb, flex_oper_msg_subtype_name((uint32_t)(FLEX_ADDR_OPER_MSG_MIN + lsb)),
+				     flex_msg_type_name(smtype),
 				     oper_capcode, message_length);
 			}
 		}

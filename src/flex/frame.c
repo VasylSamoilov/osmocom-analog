@@ -318,6 +318,11 @@ static int is_capcode_valid(uint64_t capcode, int *is_long)
 		*is_long = 1;
 		return 1;
 	}
+	/* Special addresses in the gap between short and long ranges
+	 * (Network, Temporary, OperMsg, InfoSvc, Reserved Short).
+	 * Encoded like short addresses (capcode + SHORT_ADDR_OFFSET). */
+	if (flex_capcode_is_special(capcode))
+		return 1;
 	return 0;
 }
 
@@ -3188,6 +3193,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				info[i].is_long = 0;
 			} else if (msgs[i].is_group) {
 				if (!flex_capcode_valid(msgs[i].capcode)) {
+					LOGP(DFLEX, LOGL_ERROR,
+					     "TX: rejecting invalid group capcode %" PRIu64 "\n",
+					     msgs[i].capcode);
 					info[i].packed = 0;
 					info[i].addr_words = 0;
 					info[i].vector_words = 0;
@@ -3199,6 +3207,12 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				info[i].is_long = 0;
 			} else {
 				if (!is_capcode_valid(msgs[i].capcode, &is_long_addr)) {
+					LOGP(DFLEX, LOGL_ERROR,
+					     "TX: rejecting invalid capcode %" PRIu64
+					     " (not short 1-%u, not long %llu+, not special)\n",
+					     msgs[i].capcode,
+					     (unsigned)FLEX_SHORT_ADDR_MAX,
+					     (unsigned long long)FLEX_LONG_ADDR_MIN);
 					info[i].packed = 0;
 					info[i].addr_words = 0;
 					info[i].vector_words = 0;
@@ -3231,7 +3245,11 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			/* Estimate message body words */
 			mw = estimate_msg_words(&msgs[i]);
 			if (mw < 0) {
-				/* Invalid message — skip */
+				LOGP(DFLEX, LOGL_ERROR,
+				     "TX: rejecting invalid message for capcode %" PRIu64
+				     " type=%d len=%d\n",
+				     msgs[i].capcode, msgs[i].msg_type,
+				     msgs[i].message_length);
 				info[i].packed = 0;
 				info[i].msg_words = 0;
 				continue;
@@ -3357,7 +3375,19 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	 * TODO §3.9.2 NID: Network Address must appear twice
 	 * consecutively in AF within frames 0-7.  First defines
 	 * NID, second initiates associated system message.  Short
-	 * Message Vectors not allowed for NID system messages. */
+	 * Message Vectors not allowed for NID system messages.
+	 *
+	 * TODO §3.8.2.4 SysEvent scheduling: System Event
+	 * Notification (LSB=0xF) must be transmitted in each
+	 * Frame for ≥1 full collapse cycle.  Pre-alerts pagers
+	 * about changes within 4 cycles.  Uses Short Instruction
+	 * Vector (i=001).  Requires scheduler to auto-repeat.
+	 *
+	 * TODO §3.8.2.4 SSID Change scheduling: SSID Change
+	 * Instruction (LSB=0xE) must be in roaming frames
+	 * (F0-7 NID, F0-3 SSID-only) for 2 cycles before +
+	 * 2 cycles after the change (5 cycles total).  Must be
+	 * in same phase as SSID.  Desirable: once/hour after. */
 	{
 		int tone_addr_words = 0;
 		for (i = 0; i < (uint32_t)n_tone; i++) {
