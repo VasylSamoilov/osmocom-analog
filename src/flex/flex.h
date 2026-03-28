@@ -103,8 +103,15 @@ typedef struct flex_msg {
 	int			charset;		/* 0 = ASCII, 1 = KANJI */
 	int			is_group;		/* 0 = individual, 1 = group */
 	int			is_temp_group;		/* 0 = common group, 1 = temporary */
+	int			temp_delivery_slot;	/* internal: temp addr delivery slot (0-15)
+						 * set by flex_tempgroup_enqueue(), -1 = normal.
+						 * Frame builder uses FLEX_ADDR_TEMPORARY_MIN + slot
+						 * as address word (§3.8.2.3). NOT user-settable. */
 	char			source_id[64];		/* source/callback identifier ('\0' = none) */
-	int			short_msg_index;	/* short message index (-1 = N/A) */
+	int			short_msg_type;		/* FLEX_SMSG_TYPE_* (0-3, default 0=numeric) */
+	int			short_msg_source;	/* source code S (0-7) for t=01/10 */
+	int			short_msg_number;	/* message number N (0-63) for t=10 */
+	int			short_msg_r;		/* retrieval flag R (0/1) for t=10 */
 	int			blocking_length;	/* HEX/Binary B field: bits per character.
 						 * 1-15 = that many bits, 0 = 16 bits.
 						 * Default 1 (raw bits). */
@@ -152,6 +159,11 @@ typedef struct flex_msg {
 	uint32_t		next_send_frame;	/* absolute frame (cycle*128+frame) for next eligibility */
 	int			assigned_n;		/* N assigned at initial TX (-1=unassigned, 0-63) */
 } flex_msg_t;
+
+/* TX temp group slot states */
+#define FLEX_TG_FREE		0	/* slot available */
+#define FLEX_TG_SETUP		1	/* SETUP instructions queued/sending */
+#define FLEX_TG_DELIVERY	2	/* DELIVERY message queued/sending */
 
 /* Instance of FLEX transmitter — embeds sender_t as first member */
 typedef struct flex {
@@ -302,6 +314,36 @@ typedef struct flex {
 	/* message numbering */
 	uint32_t		msg_sequence;		/* monotonic counter, wraps at 64 (N is 6 bits) */
 	uint32_t		frag_retrieval_seq;	/* monotonic retrieval number for fragments (6-bit, 0-63) */
+
+	/* ===== TX Temporary Group Scheduling (§3.8.2.3, §3.9.6) =====
+	 *
+	 * Manages the 3-phase temp group protocol on the TX side:
+	 *   SETUP → DELIVERY → TEARDOWN
+	 *
+	 * FIFO command: "tempgroup:cap1 cap2 cap3,type,options,message"
+	 *
+	 * Flow:
+	 *   1. Allocate a free slot (0-15) on the target phase
+	 *   2. Enqueue SETUP: instruction messages for each capcode
+	 *      (individual addr + short instruction vector type=000)
+	 *   3. Enqueue DELIVERY: temp address word + vector + message
+	 *      (scheduled for target_frame from SETUP)
+	 *   4. TEARDOWN: free slot when delivery completes (C=0)
+	 *
+	 * Per spec: "The first transmission of the Group message must
+	 * be started within 128 Frames from the first transmission of
+	 * the Short Instruction Vector." */
+
+	/* TX temp group slot state */
+	struct {
+		int		state;		/* FLEX_TG_FREE/SETUP/DELIVERY */
+		uint64_t	capcodes[FLEX_TEMP_GROUP_MAX_MEMBERS];
+		int		count;		/* number of member capcodes */
+		int		setups_sent;	/* SETUP instructions sent so far */
+		uint32_t	target_frame;	/* frame for DELIVERY (f6-f0) */
+		uint32_t	setup_abs;	/* absolute frame of first SETUP */
+		flex_msg_t	*delivery_msg;	/* pointer to DELIVERY message in queue */
+	} tx_temp[FLEX_TEMP_ADDR_SLOTS];	/* 16 slots (shared across phases for TX) */
 
 	/* 4-FSK state (3200bps/4FSK and 6400bps/4FSK modes) */
 	sample_t		fsk4_ramps[4][4][256];	/* [from][to][phase] */
@@ -596,5 +638,12 @@ int flex_scan_or_loopback(flex_t *flex);
 /* Utility */
 const char *flex_msg_type_name(enum flex_msg_type type);
 const char *flex_number_valid(const char *number);
+
+/* TX Temporary Group (§3.8.2.3) */
+int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
+			   enum flex_msg_type msg_type, const char *data,
+			   int data_length, int speed, int modulation_type,
+			   double polarity, int priority, int phase);
+void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame);
 
 #endif /* FLEX_H */

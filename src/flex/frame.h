@@ -173,12 +173,32 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_LONG_ADDR_MIN	2101249ULL
 #define FLEX_LONG_ADDR_MAX	4297068542ULL
 
-/* Long address set boundaries (3 overlapping sets, w1+w2 encoding) */
+/* Long address set boundaries (3 overlapping sets, w1+w2 encoding)
+ *
+ * IMPORTANT: The constant names SET12/SET34/SET23 refer to the capcode
+ * range partitions, NOT the LA word-pair sets from Table 3.8.2.2-1.
+ *   SET12 capcodes encode as LA1+LA2 (spec Set 1-2)
+ *   SET34 capcodes encode as LA1+LA3 or LA1+LA4 (spec Sets 1-3, 1-4)
+ *   SET23 capcodes encode as LA2+LA3 (spec Set 2-3)
+ *
+ * Overlap: capcodes 3223326719–3223326720 (SET34_MAX-1, SET34_MAX) can
+ * be validly encoded as EITHER LA1+LA4 (Set 1-4) or LA2+LA3 (Set 2-3).
+ * Both encodings round-trip correctly through the decoder.  The encoder
+ * uses Set 1-4 (SET34 range checked first).  SET23_MIN starts at
+ * 3223326721 to avoid double-encoding.
+ *
+ * Reserved per §3.8.2.2: "A part of combinations of Long Address
+ * Set 2-3 and combinations of Long Address Set 2-4 are reserved for
+ * future use.  Also a part of the combination of Long Address Set 2-3
+ * is used for Information Service Addresses."
+ * Set 2-4 (LA2+LA4) is not reachable by the encoder — its min capcode
+ * (4297068543) falls 1 past SET23_MAX.  The decoder accepts LA2+LA4
+ * from the wire for robustness. */
 #define FLEX_LONG_SET12_MIN	2101249ULL
 #define FLEX_LONG_SET12_MAX	1075843072ULL
-#define FLEX_LONG_SET34_MIN	1075843073ULL
+#define FLEX_LONG_SET34_MIN	1075843073ULL	/* encodes as LA1+LA3 or LA1+LA4 */
 #define FLEX_LONG_SET34_MAX	3223326720ULL
-#define FLEX_LONG_SET23_MIN	3223326721ULL
+#define FLEX_LONG_SET23_MIN	3223326721ULL	/* encodes as LA2+LA3 */
 #define FLEX_LONG_SET23_MAX	4297068542ULL
 
 /* Long address encoding offsets (used in capcode ↔ w1/w2 conversion) */
@@ -259,6 +279,72 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_VEC_LEN(viw)	(((viw) >> FLEX_VEC_LEN_SHIFT) & FLEX_VEC_LEN_MASK)
 #define FLEX_VEC_INSTR_DATA(viw) (((viw) >> FLEX_VEC_INSTR_SHIFT) & FLEX_VEC_INSTR_MASK)
 
+/* ===== Short Message Vector (§3.9.2, Table 3.9.2-1) =====
+ *
+ * Vector type V=010 (FLEX_VECTOR_TYPE_TONE).
+ * No message body — all data is in the vector word(s).
+ *
+ * 21-bit layout:
+ *   bits 0-3:   checksum (x)
+ *   bits 4-6:   type = 010 (v2v1v0)
+ *   bits 7-8:   t0 t1 — short message sub-type
+ *   bits 9-20:  d0-d11 — data (meaning depends on t)
+ *
+ * For long addresses, a 2nd vector word carries d12-d32.
+ *
+ * t1t0 sub-types:
+ *   00 = Numeric: 3-digit BCD (short addr) or 8-digit BCD (long addr)
+ *        For network addresses: Service Area ID + Multiplier + TMF
+ *   01 = Source: S2S1S0 source codes (up to 8 sources)
+ *   10 = Numbered: S2S1S0 source + N5-N0 message number + R0 retrieval
+ *   11 = Reserved
+ */
+#define FLEX_SMSG_T_SHIFT	7
+#define FLEX_SMSG_T_MASK	0x03
+#define FLEX_SMSG_D_SHIFT	9
+#define FLEX_SMSG_D_MASK	0x0FFF	/* 12 bits (1st word) */
+
+/* Short message sub-type values (t1t0) */
+#define FLEX_SMSG_TYPE_NUMERIC		0	/* 00: BCD numeric digits */
+#define FLEX_SMSG_TYPE_SOURCE		1	/* 01: source codes only */
+#define FLEX_SMSG_TYPE_NUMBERED		2	/* 10: source + msg number + R */
+#define FLEX_SMSG_TYPE_RESERVED		3	/* 11: reserved */
+
+/* t=00 Numeric: 3 BCD digits in d0-d11 (4 bits each)
+ * d0-d3 = digit a, d4-d7 = digit b, d8-d11 = digit c */
+#define FLEX_SMSG_NUM_DIGIT_BITS	4
+#define FLEX_SMSG_NUM_SHORT_DIGITS	3	/* short addr: 3 digits */
+#define FLEX_SMSG_NUM_LONG_DIGITS	8	/* long addr: 3+5 = 8 digits */
+
+/* t=01 Source: S2S1S0 in d0-d2 (3 bits, 0-7) */
+#define FLEX_SMSG_SRC_MASK		0x07	/* 3 bits */
+
+/* t=10 Numbered: S2S1S0(3) + N5-N0(6) + R0(1) in d0-d9
+ * d0-d2 = S2S1S0 source codes
+ * d3-d8 = N5-N0 message number (0-63)
+ * d9    = R0 retrieval flag */
+#define FLEX_SMSG_NUMB_SRC_MASK		0x07	/* d0-d2: source (3 bits) */
+#define FLEX_SMSG_NUMB_N_SHIFT		3
+#define FLEX_SMSG_NUMB_N_MASK		0x3F	/* d3-d8: N (6 bits) */
+#define FLEX_SMSG_NUMB_R_SHIFT		9
+#define FLEX_SMSG_NUMB_R_MASK		0x01	/* d9: R flag */
+
+/* Extract short message fields from a decoded vector word */
+#define FLEX_SMSG_T(viw)	(((viw) >> FLEX_SMSG_T_SHIFT) & FLEX_SMSG_T_MASK)
+#define FLEX_SMSG_D(viw)	(((viw) >> FLEX_SMSG_D_SHIFT) & FLEX_SMSG_D_MASK)
+
+/* Human-readable name for short message sub-type */
+static inline const char *flex_smsg_type_name(uint32_t t)
+{
+	switch (t) {
+	case FLEX_SMSG_TYPE_NUMERIC:  return "Numeric";
+	case FLEX_SMSG_TYPE_SOURCE:   return "Source";
+	case FLEX_SMSG_TYPE_NUMBERED: return "Numbered";
+	case FLEX_SMSG_TYPE_RESERVED: return "Reserved";
+	}
+	return "?";
+}
+
 /* ===== FIW Bit Fields =====
  *
  * Frame Information Word layout (21 data bits):
@@ -267,7 +353,8 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
  *   bits 8-14:  frame (0-127)
  *   bit  15:    roaming flag (n)
  *   bit  16:    repeat flag (r)
- *   bits 17-20: low traffic flags (t) */
+ *   bits 17-20: t (when r=0: low traffic flags per phase t0=A t1=B t2=C t3=D;
+ *               when r=1: [t1t0]=num_tx, [t3t2]=td_collapse) */
 
 #define FLEX_FIW_CHECKSUM_MASK	0x0F
 #define FLEX_FIW_CYCLE_SHIFT	4
@@ -958,6 +1045,45 @@ static inline uint32_t flex_temp_addr_slot(uint32_t aw)
 #define FLEX_INSTR_TYPE_TEMP_ADDR	0x00U	/* 000: temp address assignment */
 #define FLEX_INSTR_TYPE_SYS_EVENT	0x01U	/* 001: system event notification */
 
+/* System Event flags (Table 3.9.6-1, i=001).
+ * d0-d10 = e0-e10 event flags (11 bits).
+ * Extracted from instruction data bits 3-13 (after i0-i2). */
+#define FLEX_SYSEVENT_DATA_SHIFT	3	/* event flags start at bit 3 of instr data */
+#define FLEX_SYSEVENT_FLAG_SSID_TMF	(1U << 0)	/* e0: traffic split by SSID TMF */
+#define FLEX_SYSEVENT_FLAG_NID_TMF	(1U << 1)	/* e1: traffic split by NID TMF */
+#define FLEX_SYSEVENT_FLAG_CHAN_SETUP	(1U << 2)	/* e2: channel setup instruction change */
+#define FLEX_SYSEVENT_FLAG_NID_FREQ	(1U << 3)	/* e3: new frequency for NID */
+#define FLEX_SYSEVENT_FLAG_SSID_FREQ	(1U << 4)	/* e4: new frequency for SSID coverage */
+/* e5-e10: reserved, default 0 */
+
+/* Extract event flags from 14-bit instruction data (i=001 SysEvent) */
+static inline uint32_t flex_sysevent_flags(uint32_t instr_data)
+{
+	return (instr_data >> FLEX_SYSEVENT_DATA_SHIFT) & 0x7FF;
+}
+
+/* Format SysEvent flags as human-readable string.
+ * buf must be at least 128 bytes. Returns buf. */
+static inline const char *flex_sysevent_format(uint32_t flags, char *buf, int bufsz)
+{
+	int pos = 0;
+	if (flags & FLEX_SYSEVENT_FLAG_SSID_TMF)
+		pos += snprintf(buf + pos, bufsz - pos, "SSID_TMF ");
+	if (flags & FLEX_SYSEVENT_FLAG_NID_TMF)
+		pos += snprintf(buf + pos, bufsz - pos, "NID_TMF ");
+	if (flags & FLEX_SYSEVENT_FLAG_CHAN_SETUP)
+		pos += snprintf(buf + pos, bufsz - pos, "CHAN_SETUP ");
+	if (flags & FLEX_SYSEVENT_FLAG_NID_FREQ)
+		pos += snprintf(buf + pos, bufsz - pos, "NID_FREQ ");
+	if (flags & FLEX_SYSEVENT_FLAG_SSID_FREQ)
+		pos += snprintf(buf + pos, bufsz - pos, "SSID_FREQ ");
+	if (pos == 0)
+		snprintf(buf, bufsz, "(none)");
+	else if (pos > 0 && buf[pos - 1] == ' ')
+		buf[pos - 1] = '\0'; /* trim trailing space */
+	return buf;
+}
+
 /* Extract instruction type (i2 i1 i0) from 14-bit instruction data */
 static inline uint32_t flex_instr_type(uint32_t instr_data)
 {
@@ -1247,7 +1373,7 @@ static inline const char *flex_long_set_name(uint32_t w1, uint32_t w2)
 	if (t1 == FLEX_ADDR_LONG1 && t2 == FLEX_ADDR_LONG3) return "Set1-3";
 	if (t1 == FLEX_ADDR_LONG1 && t2 == FLEX_ADDR_LONG4) return "Set1-4";
 	if (t1 == FLEX_ADDR_LONG2 && t2 == FLEX_ADDR_LONG3) return "Set2-3";
-	if (t1 == FLEX_ADDR_LONG2 && t2 == FLEX_ADDR_LONG4) return "Set2-4";
+	if (t1 == FLEX_ADDR_LONG2 && t2 == FLEX_ADDR_LONG4) return "Set2-4(Rsvd)";
 	return "InvalidSet";
 }
 
@@ -1261,7 +1387,7 @@ static inline const char *flex_capcode_type_name(uint64_t capcode)
 	if (capcode >= FLEX_LONG_SET12_MIN && capcode <= FLEX_LONG_SET12_MAX)
 		return "Long(Set1-2)";
 	if (capcode >= FLEX_LONG_SET34_MIN && capcode <= FLEX_LONG_SET34_MAX)
-		return "Long(Set3-4)";
+		return "Long(Set1-3/1-4)";
 	if (capcode >= FLEX_LONG_SET23_MIN && capcode <= FLEX_LONG_SET23_MAX)
 		return "Long(Set2-3)";
 	/* Special addresses in the gap between short and long ranges */
@@ -1284,8 +1410,8 @@ static inline int flex_addr_is_special(uint32_t aw)
 }
 
 /* Check if a capcode maps to a special protocol address.
- * Special addresses occupy the gap between short (max 1933312) and
- * long (min 2101249) capcode ranges.  Returns 1 if special. */
+ * Special addresses occupy the gap between short (max FLEX_SHORT_ADDR_MAX)
+ * and long (min FLEX_LONG_ADDR_MIN) capcode ranges.  Returns 1 if special. */
 static inline int flex_capcode_is_special(uint64_t capcode)
 {
 	uint32_t aw;
@@ -1368,7 +1494,8 @@ static inline uint64_t flex_decode_short_address(uint32_t aw)
 static inline uint64_t flex_decode_long_address(uint32_t w1, uint32_t w2)
 {
 	/* Set 1-2: w1 in LA1, w2 in LA2
-	 * capcode = w1 + (2097151 - w2) * 32768 + 2068480 */
+	 * capcode = w1 + (FLEX_LONG_W2_SET12 - w2) * FLEX_SHORT_ADDR_OFFSET
+	 *         + (FLEX_LONG_OFFSET_A - 1) */
 	if (w1 >= FLEX_LA1_MIN && w1 <= FLEX_LA1_MAX &&
 	    w2 >= FLEX_LA2_MIN && w2 <= FLEX_LA2_MAX)
 		return (uint64_t)w1
@@ -1376,7 +1503,8 @@ static inline uint64_t flex_decode_long_address(uint32_t w1, uint32_t w2)
 		       + (FLEX_LONG_OFFSET_A - 1);
 
 	/* Set 1-3 / 1-4: w1 in LA1, w2 in LA3 or LA4
-	 * capcode = w1 + (w2 - 1933312) * 32768 + 2068480 */
+	 * capcode = w1 + (w2 - FLEX_LONG_W2_SET34) * FLEX_SHORT_ADDR_OFFSET
+	 *         + (FLEX_LONG_OFFSET_A - 1) */
 	if (w1 >= FLEX_LA1_MIN && w1 <= FLEX_LA1_MAX &&
 	    w2 >= FLEX_LA3_MIN && w2 <= FLEX_LA4_MAX)
 		return (uint64_t)w1
@@ -1384,7 +1512,9 @@ static inline uint64_t flex_decode_long_address(uint32_t w1, uint32_t w2)
 		       + (FLEX_LONG_OFFSET_A - 1);
 
 	/* Set 2-3 / 2-4: w1 in LA2, w2 in LA3 or LA4
-	 * capcode = (w1 - 2064383) + (w2 - 1867776) * 32768 + 2068479 */
+	 * capcode = (w1 - FLEX_LONG_W1_SET23)
+	 *         + (w2 - FLEX_LONG_W2_SET23) * FLEX_SHORT_ADDR_OFFSET
+	 *         + FLEX_LONG_OFFSET_B */
 	if (w1 >= FLEX_LA2_MIN && w1 <= FLEX_LA2_MAX &&
 	    w2 >= FLEX_LA3_MIN && w2 <= FLEX_LA4_MAX)
 		return (uint64_t)(w1 - FLEX_LONG_W1_SET23)
@@ -1466,6 +1596,23 @@ static inline uint8_t flex_num_char_to_bcd(uint8_t ch)
 #define FLEX_NUM_NUMBERED_HDR_BITS	8	/* N(6) + R(1) + S(1), excludes K5K4 */
 #define FLEX_NUM_NUMBERED_SKIP_BITS	(FLEX_NUM_NUMBERED_HDR_BITS + FLEX_NUM_OVERHEAD_BITS)
 
+/* Numbered numeric header field positions (within 21-bit message word).
+ * Layout: K5(bit0) K4(bit1) N0..N5(bits2-7) R0(bit8) S0(bit9) digits...
+ *
+ * K5K4: overflow bits of the K checksum (2 bits, bits 0-1)
+ * N:    message number (6 bits, 0-63, displayed as N+1)
+ * R:    retrieval flag (1=check sequence, 0=retransmission)
+ * S:    special format (0=standard digit display, 1=ID-ROM format) */
+#define FLEX_NUM_K54_SHIFT		0
+#define FLEX_NUM_K54_MASK		0x03	/* bits 0-1 */
+#define FLEX_NUM_K54_FROM_K(k)		(((k) >> 4) & FLEX_NUM_K54_MASK)	/* extract K5K4 from 6-bit K */
+#define FLEX_NUM_N_SHIFT		2
+#define FLEX_NUM_N_MASK			0x3F	/* bits 2-7 */
+#define FLEX_NUM_R_SHIFT		8
+#define FLEX_NUM_R_MASK			0x01	/* bit 8 */
+#define FLEX_NUM_S_SHIFT		9
+#define FLEX_NUM_S_MASK			0x01	/* bit 9 */
+
 /* ===== Secure Message Type Field =====
  *
  * Bits 19-20 of the 1st word (header) on ALL secure fragments.
@@ -1486,6 +1633,22 @@ static inline uint8_t flex_num_char_to_bcd(uint8_t ch)
 #define FLEX_SEC_TYPE_BINARY		2	/* t1t0=10: binary data */
 #define FLEX_SEC_TYPE_RESERVED		3	/* t1t0=11: reserved */
 #define FLEX_SEC_TYPE_SHIFT		19	/* bit position in header word */
+#define FLEX_SEC_TYPE_MASK		0x3	/* 2-bit field */
+
+/* Registration Acknowledgment (§3.10.1.4-2, §6.7).
+ * Transmitted as a Secure Message (V=000, t1t0=00).
+ * 2nd word: bits 1-7 = operation code "=" (0x3D),
+ *           bits 8-21 = reserved (filled with ETX 0x03).
+ * The 1st word is a standard secure header (K, C, F, N, t). */
+#define FLEX_SEC_REGACK_OPCODE		0x3D	/* "=" operation code */
+#define FLEX_SEC_REGACK_OPCODE_SHIFT	0	/* bits 0-6 of 2nd word */
+#define FLEX_SEC_REGACK_OPCODE_MASK	0x7F
+
+/* Secure message wire encoding modes (secure_encoding field) */
+#define FLEX_SEC_ENC_ALPHA		0	/* 7-bit alphanumeric */
+#define FLEX_SEC_ENC_BINARY		1	/* raw binary (hex nibbles) */
+#define FLEX_SEC_ENC_REGACK		2	/* registration acknowledgment */
+
 #define FLEX_SEC_TYPE_MASK		0x3	/* 2-bit field */
 
 /* ===== Alpha Message Fragment Flags ===== */
@@ -1640,6 +1803,16 @@ static inline uint32_t flex_fragment_number(int fragment_index)
  *   Total max (4-phase, 6400):           = 420+14+4+20+1408 = 1866 bytes
  */
 #define FLEX_BUFFER_SIZE	1872
+
+/* ===== Default Polarity =====
+ *
+ * Default FSK polarity for FLEX transmission.
+ * +1.0 = positive (mark=high, space=low).
+ * -1.0 = negative (mark=low, space=high).
+ * Both polarities are valid; the S1 sync structure (A + inv.A)
+ * allows receivers to detect either.  One-shot mode transmits
+ * both polarities (default then inverted) for maximum coverage. */
+#define FLEX_DEFAULT_POLARITY	1.0
 
 /* ===== Error Codes ===== */
 
@@ -1803,11 +1976,12 @@ typedef struct flex_frame_msg {
 	const char	*message;
 	int		message_length;
 	int		speed;			/* 1600, 3200, or 6400 (default 1600) */
-	double		polarity;		/* -1.0 or +1.0 (default -1.0) */
+	double		polarity;		/* -1.0 or +1.0 (default FLEX_DEFAULT_POLARITY) */
 	int		priority;		/* 1 = priority, 0 = normal */
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
 	int		is_group;		/* 0 = individual, 1 = group */
 	int		is_temp_group;		/* 0 = common group, 1 = temporary group */
+	int		temp_delivery_slot;	/* internal: temp addr delivery (0-15, -1=normal) */
 	int		sequence_num;		/* N field: message number (0-63), or -1 to
 					 * disable numbering (R=0, N not set).
 					 * When R=1, pager checks
@@ -1816,7 +1990,14 @@ typedef struct flex_frame_msg {
 					 * For fragmented messages, all fragments share
 					 * the same N to identify the fragment stream. */
 	const char	*source_id;		/* source indication (NULL = none) */
-	int		short_msg_idx;		/* short message index, -1 = N/A */
+	int		short_msg_type;		/* short message sub-type (FLEX_SMSG_TYPE_*):
+					 * 0=numeric (3/8 BCD digits),
+					 * 1=source (source codes only),
+					 * 2=numbered (source + N + R),
+					 * 3=reserved.  Default 0. */
+	int		short_msg_source;	/* source code S (0-7) for t=01/10 */
+	int		short_msg_number;	/* message number N (0-63) for t=10 */
+	int		short_msg_r;		/* retrieval flag R (0/1) for t=10 */
 	int		blocking_length;	/* HEX/Binary B field: bits per character.
 					 * 1-15 = that many bits, 0 = 16 bits.
 					 * Default 1 (raw bits). */
@@ -1968,8 +2149,8 @@ int flex_capcode_valid(uint64_t capcode);
 /* Group address encoding */
 uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary);
 
-/* Temporary address assignment */
-uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr);
+/* Temporary address encoding (§3.8.2.3) */
+uint32_t flex_encode_temp_address(uint32_t temp_addr);
 
 /* Network address encoding.
  * Encodes a network (NID) address word from the raw address value.

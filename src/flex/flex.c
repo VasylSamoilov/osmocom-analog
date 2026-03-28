@@ -158,8 +158,8 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 {
 	flex_msg_t *msg, **msgp;
 
-	LOGP(DFLEX, LOGL_INFO, "Creating msg instance to page capcode '%" PRIu64 "' / type '%s'.\n",
-	     capcode, flex_msg_type_name(msg_type));
+	LOGP(DFLEX, LOGL_INFO, "Creating msg instance to page capcode '%" PRIu64 "' (%s) / type '%s'.\n",
+	     capcode, flex_capcode_type_name(capcode), flex_msg_type_name(msg_type));
 
 	/* Warn if capcode falls in a special protocol address range.
 	 * These are not user-assignable per Table 3.8.1-1 but we allow
@@ -231,13 +231,17 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	/* per-message parameter defaults (use flex->default_polarity from CLI -P) */
 	msg->speed = 1600;
 	msg->modulation_type = FLEX_MOD_2FSK;
-	msg->polarity = flex->default_polarity ? flex->default_polarity : -1.0;
+	msg->polarity = flex->default_polarity ? flex->default_polarity : FLEX_DEFAULT_POLARITY;
 	msg->priority = 0;
 	msg->charset = 0;
 	msg->is_group = 0;
 	msg->is_temp_group = 0;
+	msg->temp_delivery_slot = -1;
 	msg->source_id[0] = '\0';
-	msg->short_msg_index = -1;
+	msg->short_msg_type = FLEX_SMSG_TYPE_NUMERIC;
+	msg->short_msg_source = 0;
+	msg->short_msg_number = 0;
+	msg->short_msg_r = 0;
 	msg->blocking_length = flex->default_blocking_length;
 	msg->mail_drop = 0;
 	msg->phase = -1;
@@ -339,6 +343,223 @@ void flex_msg_destroy(flex_msg_t *msg)
 
 /* Number of idle frames to send after all messages before returning to IDLE */
 #define FLEX_IDLE_BATCHES	2
+
+/* ===== TX Temporary Group Scheduling (§3.8.2.3, §3.9.6) ===== */
+
+/* Frames of margin between last SETUP and DELIVERY target frame */
+#define FLEX_TG_SETUP_MARGIN	4
+
+/* Allocate a free temp slot. Returns 0-15, or -1 if all occupied. */
+static int flex_tg_alloc_slot(flex_t *flex)
+{
+	int i;
+	for (i = 0; i < FLEX_TEMP_ADDR_SLOTS; i++) {
+		if (flex->tx_temp[i].state == FLEX_TG_FREE)
+			return i;
+	}
+	return -1;
+}
+
+/* Free a temp slot after delivery completes. */
+static void flex_tg_free_slot(flex_t *flex, int slot)
+{
+	LOGP(DFLEX, LOGL_INFO,
+	     "TX: TEARDOWN temp slot=%d — delivery complete.\n", slot);
+	memset(&flex->tx_temp[slot], 0, sizeof(flex->tx_temp[slot]));
+}
+
+/*
+ * Enqueue a temporary group message.
+ *
+ * Allocates a temp slot, creates SETUP instruction messages for each
+ * member capcode, and creates the DELIVERY message with the temp
+ * address word.  All messages go into the normal queue.
+ *
+ * Returns 0 on success, -1 on failure (no free slot, invalid params).
+ */
+int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
+			   enum flex_msg_type msg_type, const char *data,
+			   int data_length, int speed, int modulation_type,
+			   double polarity, int priority, int phase)
+{
+	int slot, i;
+	uint32_t target_frame;
+	flex_frame_time_t ft;
+	uint32_t abs_frame;
+
+	if (count <= 0 || count > FLEX_TEMP_GROUP_MAX_MEMBERS) {
+		LOGP(DFLEX, LOGL_NOTICE,
+		     "FIFO: tempgroup requires 1-%d capcodes, got %d.\n",
+		     FLEX_TEMP_GROUP_MAX_MEMBERS, count);
+		return -1;
+	}
+
+	/* Validate all capcodes */
+	for (i = 0; i < count; i++) {
+		if (!flex_capcode_valid(capcodes[i])) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: tempgroup capcode %" PRIu64 " invalid.\n",
+			     capcodes[i]);
+			return -1;
+		}
+	}
+
+	/* Allocate slot */
+	slot = flex_tg_alloc_slot(flex);
+	if (slot < 0) {
+		LOGP(DFLEX, LOGL_NOTICE,
+		     "FIFO: tempgroup — no free slot (all 16 occupied), rejecting.\n");
+		return -1;
+	}
+
+	/* Compute target frame: current + count (for SETUPs) + margin */
+	if (flex_scheduler_get_time(flex, &ft) < 0) {
+		abs_frame = 0;
+	} else {
+		abs_frame = ft.cycle * 128 + ft.frame;
+	}
+	target_frame = (abs_frame + (uint32_t)count + FLEX_TG_SETUP_MARGIN) % 128;
+
+	/* Populate slot */
+	flex->tx_temp[slot].state = FLEX_TG_SETUP;
+	flex->tx_temp[slot].count = count;
+	flex->tx_temp[slot].setups_sent = 0;
+	flex->tx_temp[slot].target_frame = target_frame;
+	flex->tx_temp[slot].setup_abs = abs_frame;
+	for (i = 0; i < count; i++)
+		flex->tx_temp[slot].capcodes[i] = capcodes[i];
+
+	/* Create SETUP instruction messages (one per capcode) */
+	for (i = 0; i < count; i++) {
+		uint32_t idata = 0;
+		char ibuf[16];
+		flex_msg_t *msg;
+
+		idata = (FLEX_INSTR_TYPE_TEMP_ADDR & FLEX_INSTR_TYPE_MASK);
+		idata |= ((uint32_t)target_frame & FLEX_INSTR_FRAME_MASK)
+			 << FLEX_INSTR_FRAME_SHIFT;
+		idata |= ((uint32_t)slot & FLEX_INSTR_SLOT_MASK)
+			 << FLEX_INSTR_SLOT_SHIFT;
+
+		snprintf(ibuf, sizeof(ibuf), "%u", idata);
+		msg = flex_msg_create(flex, capcodes[i],
+				      FLEX_MSG_TYPE_INSTRUCTION,
+				      ibuf, (int)strlen(ibuf));
+		if (!msg) {
+			LOGP(DFLEX, LOGL_ERROR,
+			     "TX: tempgroup SETUP failed for cap=%" PRIu64 ".\n",
+			     capcodes[i]);
+			flex_tg_free_slot(flex, slot);
+			return -1;
+		}
+		msg->speed = speed;
+		msg->modulation_type = modulation_type;
+		msg->polarity = polarity;
+		msg->priority = 1; /* SETUP is priority */
+		if (phase >= 0)
+			msg->phase = phase;
+
+		LOGP(DFLEX, LOGL_INFO,
+		     "TX: SETUP slot=%d frame=%u cap=%" PRIu64 " (%d/%d) idata=0x%04X\n",
+		     slot, target_frame, capcodes[i], i + 1, count, idata);
+	}
+
+	/* Create DELIVERY message with temp address */
+	{
+		flex_msg_t *msg;
+
+		/* Use capcode 1 as a placeholder — the frame builder will
+		 * use the temp address word instead (temp_delivery_slot >= 0).
+		 * The capcode field is not used for addressing. */
+		msg = flex_msg_create(flex, 1, msg_type, data, data_length);
+		if (!msg) {
+			LOGP(DFLEX, LOGL_ERROR,
+			     "TX: tempgroup DELIVERY creation failed for slot=%d.\n",
+			     slot);
+			flex_tg_free_slot(flex, slot);
+			return -1;
+		}
+		msg->speed = speed;
+		msg->modulation_type = modulation_type;
+		msg->polarity = polarity;
+		msg->priority = priority;
+		msg->temp_delivery_slot = slot;
+		if (phase >= 0)
+			msg->phase = phase;
+
+		/* Defer delivery until target frame */
+		{
+			uint32_t delay = ((target_frame + 128) - (abs_frame % 128)) % 128;
+			if (delay == 0)
+				delay = 128; /* full cycle if exact match */
+			msg->send_delay = (int)delay;
+			msg->next_send_frame = abs_frame + delay;
+		}
+
+		flex->tx_temp[slot].delivery_msg = msg;
+
+		LOGP(DFLEX, LOGL_INFO,
+		     "TX: DELIVERY queued slot=%d frame=%u type=%s members=%d len=%d\n",
+		     slot, target_frame, flex_msg_type_name(msg_type),
+		     count, data_length);
+	}
+
+	return 0;
+}
+
+/*
+ * Tick the temp group scheduler — called each frame.
+ * Checks for completed deliveries and frees slots.
+ */
+void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame)
+{
+	int i;
+
+	for (i = 0; i < FLEX_TEMP_ADDR_SLOTS; i++) {
+		if (flex->tx_temp[i].state == FLEX_TG_FREE)
+			continue;
+
+		/* Check if delivery message has been consumed (removed from queue) */
+		if (flex->tx_temp[i].delivery_msg) {
+			flex_msg_t *m;
+			int found = 0;
+			for (m = flex->msg_list; m; m = m->next) {
+				if (m == flex->tx_temp[i].delivery_msg) {
+					found = 1;
+					break;
+				}
+			}
+			if (!found) {
+				/* Delivery consumed — teardown */
+				flex_tg_free_slot(flex, i);
+				continue;
+			}
+		}
+
+		/* 128-frame timeout from SETUP */
+		{
+			uint32_t elapsed = abs_frame - flex->tx_temp[i].setup_abs;
+			if (elapsed > 256) /* handle wraparound conservatively */
+				elapsed = 256;
+			if (elapsed >= 128) {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "TX: temp slot=%d TIMEOUT — %u frames since SETUP, clearing.\n",
+				     i, elapsed);
+				/* Remove delivery msg from queue if still there */
+				if (flex->tx_temp[i].delivery_msg) {
+					flex_msg_t *m;
+					for (m = flex->msg_list; m; m = m->next) {
+						if (m == flex->tx_temp[i].delivery_msg) {
+							flex_msg_destroy(m);
+							break;
+						}
+					}
+				}
+				memset(&flex->tx_temp[i], 0, sizeof(flex->tx_temp[i]));
+			}
+		}
+	}
+}
 
 /*
  * Check if a message needs fragmentation and split it if so.
@@ -488,8 +709,12 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->charset = msg->charset;
 			frag->is_group = msg->is_group;
 			frag->is_temp_group = msg->is_temp_group;
+			frag->temp_delivery_slot = msg->temp_delivery_slot;
 			memcpy(frag->source_id, msg->source_id, sizeof(frag->source_id));
-			frag->short_msg_index = msg->short_msg_index;
+			frag->short_msg_type = msg->short_msg_type;
+			frag->short_msg_source = msg->short_msg_source;
+			frag->short_msg_number = msg->short_msg_number;
+			frag->short_msg_r = msg->short_msg_r;
 			frag->blocking_length = msg->blocking_length;
 			frag->mail_drop = msg->mail_drop;
 			frag->phase = msg->phase;
@@ -919,7 +1144,7 @@ static int flex_compute_biw_count(const flex_frame_params_t *params)
  * is absorbed into the second vector word (Vy). */
 static int flex_estimate_msg_cost(const flex_msg_t *msg)
 {
-	int is_long = (msg->capcode > 2097151 && !msg->is_group);
+	int is_long = (msg->capcode >= FLEX_LONG_ADDR_MIN && !msg->is_group);
 	int aw = is_long ? 2 : 1;
 	int vw, bw;
 	size_t len;
@@ -1340,6 +1565,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 	/* Get current wall-clock cycle/frame */
 	flex_scheduler_get_time(flex, &ft);
 
+	/* Tick temp group scheduler */
+	flex_tempgroup_tick(flex, ft.cycle * 128 + ft.frame);
+
 	/* === POCSAG mixing: check if this frame slot is designated for POCSAG === */
 	if (flex_scheduler_is_pocsag_slot(flex, ft.frame)) {
 		/* Generate POCSAG idle batch and switch DSP to 1200 baud.
@@ -1619,7 +1847,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				int i;
 				for (i = 0; i < n_sorted && n_candidates < FLEX_MAX_CANDIDATES; i++) {
 					flex_msg_t *m = sorted[i];
-					int is_long = (m->capcode > 2097151 && !m->is_group);
+					int is_long = (m->capcode >= FLEX_LONG_ADDR_MIN && !m->is_group);
 					int cost = flex_estimate_msg_cost(m);
 					int aw, vw, bw;
 
@@ -1797,8 +2025,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 					fm->charset = m->charset;
 					fm->is_group = m->is_group;
 					fm->is_temp_group = m->is_temp_group;
+					fm->temp_delivery_slot = m->temp_delivery_slot;
 					fm->source_id = m->source_id[0] ? m->source_id : NULL;
-					fm->short_msg_idx = m->short_msg_index;
+					fm->short_msg_type = m->short_msg_type;
+					fm->short_msg_source = m->short_msg_source;
+					fm->short_msg_number = m->short_msg_number;
+					fm->short_msg_r = m->short_msg_r;
 					fm->blocking_length = m->blocking_length;
 					fm->mail_drop = m->mail_drop;
 					fm->fragment_index = m->fragment_index;
@@ -1982,8 +2214,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 			fm->charset = m->charset;
 			fm->is_group = m->is_group;
 			fm->is_temp_group = m->is_temp_group;
+			fm->temp_delivery_slot = m->temp_delivery_slot;
 			fm->source_id = m->source_id[0] ? m->source_id : NULL;
-			fm->short_msg_idx = m->short_msg_index;
+			fm->short_msg_type = m->short_msg_type;
+			fm->short_msg_source = m->short_msg_source;
+			fm->short_msg_number = m->short_msg_number;
+			fm->short_msg_r = m->short_msg_r;
 			fm->blocking_length = m->blocking_length;
 			fm->mail_drop = m->mail_drop;
 			fm->fragment_index = m->fragment_index;
@@ -2231,8 +2467,9 @@ send_idle:
 	frame_msg.msg_type = FLEX_FRAME_MSG_TYPE_TONE;
 	frame_msg.message = "";
 	frame_msg.message_length = 0;
+	frame_msg.temp_delivery_slot = -1;
 	frame_msg.speed = 1600;
-	frame_msg.polarity = -1.0;
+	frame_msg.polarity = FLEX_DEFAULT_POLARITY;
 
 	flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
 				&msgs_packed, &error);
@@ -2339,39 +2576,61 @@ int flex_get_next_frame(flex_t *flex)
 			flex_frame_msg_t frame_msg;
 			flex_frame_params_t params;
 			int msgs_packed = 0;
+			double polarity;
+			int is_inverted_pass = (flex->idle_count == 1);
 
-			/* reset idle counter when we have a message */
-			flex->idle_count = 0;
+			/* One-shot mode: transmit twice — once with default
+			 * polarity, once with inverted polarity, then exit.
+			 * idle_count tracks which pass:
+			 *   0 = first TX (default polarity)
+			 *   1 = second TX (inverted polarity) */
 
-			/* Switch DSP polarity if message requires it */
-			dsp_set_polarity(flex, msg->polarity);
+			if (is_inverted_pass) {
+				polarity = (msg->polarity < 0) ? 1.0 : -1.0;
+			} else {
+				polarity = msg->polarity;
+			}
+			dsp_set_polarity(flex, polarity);
 
-			/* Build frame message descriptor from queued message */
+			/* Build frame message descriptor */
 			memset(&frame_msg, 0, sizeof(frame_msg));
 			frame_msg.capcode = msg->capcode;
-			frame_msg.msg_type = (int)msg->msg_type;
+			frame_msg.msg_type = (msg->msg_type == FLEX_MSG_TYPE_NUMBERED_SPECIAL)
+				? FLEX_FRAME_MSG_TYPE_NUMBERED_NUM
+				: (int)msg->msg_type;
 			frame_msg.message = msg->data;
 			frame_msg.message_length = msg->data_length;
 			frame_msg.speed = msg->speed;
-			frame_msg.polarity = msg->polarity;
+			frame_msg.polarity = polarity;
 			frame_msg.priority = msg->priority;
 			frame_msg.charset = msg->charset;
 			frame_msg.is_group = msg->is_group;
 			frame_msg.is_temp_group = msg->is_temp_group;
+			frame_msg.temp_delivery_slot = msg->temp_delivery_slot;
 			frame_msg.sequence_num = (msg->total_fragments > 1)
 				? (int)msg->retrieval_num
-				: (int)(flex->msg_sequence++ & 0x3F);
+				: (int)(flex->msg_sequence & 0x3F);
 			frame_msg.phase = msg->phase;
 			frame_msg.blocking_length = msg->blocking_length;
 			frame_msg.mail_drop = msg->mail_drop;
 			frame_msg.fragment_index = msg->fragment_index;
 			frame_msg.total_fragments = msg->total_fragments;
+			frame_msg.short_msg_type = msg->short_msg_type;
+			frame_msg.short_msg_source = msg->short_msg_source;
+			frame_msg.short_msg_number = msg->short_msg_number;
+			frame_msg.short_msg_r = msg->short_msg_r;
+			frame_msg.numbered_s = msg->numbered_s;
+			frame_msg.numbered_msgnum = msg->numbered_msgnum;
+			/* R flag: R=1 for normal, R=0 for system msgs (§3.9.2) */
+			frame_msg.alpha_r_flag = msg->numbered_r ? 1 : 0;
+			frame_msg.hex_r_flag = msg->numbered_r ? 1 : 0;
+			frame_msg.numbered_r = msg->numbered_r ? 1 : 0;
 
-			/* Build frame params matching the message.
-			 * Copy BIW/coverage fields so BIW2/3/4 are emitted
-			 * in scan/one-shot mode when --biw-time or --ssid
-			 * are specified. */
+			/* Frame params: always cycle=0, frame=0.
+			 * Include BIW time + timezone when configured. */
 			flex_frame_params_default(&params);
+			params.cycle = 0;
+			params.frame = 0;
 			params.bitrate = msg->speed;
 			params.modulation_type = msg->modulation_type;
 			params.biw_time = flex->biw_time_enabled;
@@ -2388,73 +2647,51 @@ int flex_get_next_frame(flex_t *flex)
 			}
 			params.timezone_code = flex->timezone_code;
 
-			/* Set cycle/frame from wall clock so FIW matches
-			 * real time (same as network mode). */
-			{
-				flex_frame_time_t ft;
-				flex_scheduler_get_time(flex, &ft);
-				params.cycle = ft.cycle;
-				params.frame = ft.frame;
+			flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
+						&msgs_packed, &error);
+
+			if (error || flex->frame_buffer_length == 0) {
+				LOGP_CHAN(DFLEX, LOGL_NOTICE,
+					  "Failed to encode FLEX frame (error=%d).\n", error);
+				flex_msg_destroy(msg);
+				goto oneshot_done;
 			}
 
-			/* Capture log values before destroy */
-			{
-				uint64_t log_capcode = msg->capcode;
-				int log_msg_type = (int)msg->msg_type;
-				int log_speed = msg->speed;
-				int log_mod_type = msg->modulation_type;
-				double log_polarity = msg->polarity;
-				int log_data_length = msg->data_length;
+			LOGP_CHAN(DFLEX, LOGL_INFO,
+				  "One-shot: C0/F0 %s polarity=%s capcode=%" PRIu64
+				  " type=%d speed=%d len=%d.\n",
+				  is_inverted_pass ? "(inverted)" : "(default)",
+				  (polarity < 0) ? "neg" : "pos",
+				  msg->capcode, (int)msg->msg_type,
+				  msg->speed, msg->data_length);
 
-				/* Use split encoding: sync → sync_buffer, data → frame_buffer */
-				flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
-							&msgs_packed, &error);
-
-				/* destroy the transmitted message (after encoding!) */
+			if (is_inverted_pass) {
+				/* Second pass done — destroy message.
+				 * Set idle_count=2 so the next call falls
+				 * through to oneshot_done after the DSP
+				 * finishes outputting this frame. */
 				flex_msg_destroy(msg);
-				msg = NULL;
-
-				if (error || flex->frame_buffer_length == 0) {
-					LOGP_CHAN(DFLEX, LOGL_NOTICE, "Failed to encode FLEX frame (error=%d), skipping.\n", error);
-					if (flex->msg_list)
-						return flex_get_next_frame(flex);
-					goto check_idle;
-				}
-
-				LOGP_CHAN(DFLEX, LOGL_INFO,
-					  "Encoded FLEX frame (sync=%d data=%d bytes): capcode=%" PRIu64 " addr=%s type=%d speed=%d/%s polarity=%s deviation=%.0f len=%d.\n",
-					  flex->sync_buffer_length,
-					  flex->frame_buffer_length,
-					  log_capcode,
-					  flex_capcode_type_name(log_capcode),
-					  log_msg_type,
-					  log_speed,
-					  (log_mod_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-					  (log_polarity < 0) ? "neg" : "pos",
-					  flex->sender.speech_deviation,
-					  log_data_length);
+				flex->idle_count = 2;
+			} else {
+				/* First pass done — mark for inverted pass */
+				flex->idle_count = 1;
+				/* Bump sequence so inverted pass uses same N */
+				flex->msg_sequence++;
 			}
 			return 1;
 		}
 
-check_idle:
-		/* no messages in queue — check scan/loopback for more work */
-		if (flex_scan_or_loopback(flex)) {
-			/* scan/loopback enqueued a new message, encode it */
-			return flex_get_next_frame(flex);
+oneshot_done:
+		LOGP_CHAN(DFLEX, LOGL_INFO, "One-shot: transmission complete.\n");
+		flex_new_state(flex, FLEX_STATE_IDLE);
+		/* Delayed quit: let RX finish decoding the last frame.
+		 * quit_after_time is checked in myhandler() every loop
+		 * iteration (~1ms).  Set it to now + 250ms. */
+		{
+			extern double quit_after_time;
+			extern double get_time(void);
+			quit_after_time = get_time() + 0.25;
 		}
-
-		/* no more messages and no scan/loopback — count idle batches */
-		if (flex->idle_count++ >= FLEX_IDLE_BATCHES) {
-			LOGP_CHAN(DFLEX, LOGL_INFO, "Transmission done.\n");
-			LOGP_CHAN(DFLEX, LOGL_DEBUG, "Reached %d idle batches, turning transmitter off.\n", FLEX_IDLE_BATCHES);
-			flex_new_state(flex, FLEX_STATE_IDLE);
-			if (flex->wav_test_mode)
-				quit = 1;
-			return 0;
-		}
-
-		LOGP_CHAN(DFLEX, LOGL_DEBUG, "Idle batch %d of %d.\n", flex->idle_count, FLEX_IDLE_BATCHES);
 		return 0;
 
 	case FLEX_STATE_NET_ERS:
@@ -2575,8 +2812,9 @@ int flex_scan_or_loopback(flex_t *flex)
 			msg_text = autobuf;
 			msg_len = strlen(autobuf);
 		}
-		LOGP_CHAN(DFLEX, LOGL_NOTICE, "Transmitting %s message '%s' with capcode '%" PRIu64 "'.\n",
-			  flex_msg_type_name(flex->default_msg_type), msg_text, flex->scan_from);
+		LOGP_CHAN(DFLEX, LOGL_NOTICE, "Transmitting %s message '%s' with capcode '%" PRIu64 "' (%s).\n",
+			  flex_msg_type_name(flex->default_msg_type), msg_text, flex->scan_from,
+			  flex_capcode_type_name(flex->scan_from));
 		{
 			flex_msg_t *msg;
 			msg = flex_msg_create(flex, flex->scan_from, flex->default_msg_type,
@@ -2617,7 +2855,7 @@ void call_down_clock(void)
  *
  * Accepts both plain numeric capcodes and Extended CAPCODE format
  * per ARIB STD-43A Appendix A:
- *   Plain:    1234567 (short: 1-1933312) or 007005031 (long: 2101249-4297068542)
+ *   Plain:    1234567 (short) or 007005031 (long)
  *   Extended: [R][fff][b]<A-Z><digits>  e.g. 3E007005031, A1234567, 5U0000100
  *
  * For Extended CAPCODEs, the alpha prefix and optional frame/collapse/roaming
@@ -2696,8 +2934,15 @@ const char *flex_number_valid(const char *number)
 	}
 
 	capcode = strtoull(digits, NULL, 10);
-	if (!flex_capcode_valid(capcode))
-		return "Invalid FLEX capcode (short: 1-1933312, long: 2101249-4297068542)";
+	if (!flex_capcode_valid(capcode)) {
+		static char errbuf[128];
+		snprintf(errbuf, sizeof(errbuf),
+			 "Invalid FLEX capcode (short: %" PRIu64 "-%" PRIu64
+			 ", long: %" PRIu64 "-%" PRIu64 ")",
+			 (uint64_t)FLEX_SHORT_ADDR_MIN, (uint64_t)FLEX_SHORT_ADDR_MAX,
+			 (uint64_t)FLEX_LONG_ADDR_MIN, (uint64_t)FLEX_LONG_ADDR_MAX);
+		return errbuf;
+	}
 
 	return NULL;
 }
@@ -2748,8 +2993,8 @@ int call_down_setup(int callref, const char *caller_id, enum number_type __attri
 		else
 			capcode = strtoull(dialing, NULL, 10);
 
-		LOGP(DFLEX, LOGL_INFO, "Paging capcode '%" PRIu64 "' (dialed '%s') with %s message '%s'.\n",
-		     capcode, dialing, flex_msg_type_name(flex->default_msg_type), message);
+		LOGP(DFLEX, LOGL_INFO, "Paging capcode '%" PRIu64 "' (%s) (dialed '%s') with %s message '%s'.\n",
+		     capcode, flex_capcode_type_name(capcode), dialing, flex_msg_type_name(flex->default_msg_type), message);
 
 		msg = flex_msg_create(flex, capcode, flex->default_msg_type,
 				      message, strlen(message));

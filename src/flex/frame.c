@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <time.h>
 #include "../liblogging/logging.h"
 #include "frame.h"
@@ -321,7 +322,7 @@ static int is_capcode_valid(uint64_t capcode, int *is_long)
 }
 
 /*
- * Encode a short capcode (1-1933312) into a single address word.
+ * Encode a short capcode (FLEX_SHORT_ADDR_MIN–FLEX_SHORT_ADDR_MAX) into a single address word.
  *
  * The 21-bit information word d₀-d₂₀ holds the address value
  * (d₀=LSB, d₂₀=MSB).  The address is transmitted LSB first.
@@ -933,7 +934,7 @@ static uint32_t encode_numeric_message(uint32_t *frame_words, const char *msg,
 	k_bit &= 0xFF;
 	k_bit = (k_bit & 0x3F) + (k_bit >> 6);
 	k_bit = ~k_bit;
-	msg_words[0] |= (k_bit >> 4) & 0x3;  /* k5k4 bits */
+	msg_words[0] |= FLEX_NUM_K54_FROM_K(k_bit);  /* k5k4 bits */
 
 	LOGP(DFLEX, LOGL_DEBUG,
 	     "TX: Numeric encoder: %d words, K=0x%02X (K5K4=%d%d K3-0=0x%X)\n",
@@ -1128,6 +1129,50 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		*fwc_p = fwc;
 
 		return create_secure_vector(msg_start, word_idx);
+	}
+
+	/* Registration Acknowledgment mode (secure_encoding == 2).
+	 * Per §3.10.1.4-2: V=000, t1t0=00, 2nd word has opcode "="
+	 * (0x3D) in bits 0-6, ETX in bits 7-20. */
+	if (secure_encoding == FLEX_SEC_ENC_REGACK) {
+		uint32_t msg_word[2] = {0};
+		uint32_t fwc, k_sum;
+		uint32_t f_val = flex_fragment_number(0);
+
+		/* Header word: F=11 (initial), C=0 (not continued), t1t0=00 */
+		msg_word[0] = (f_val << FLEX_ALPHA_HDR_F_SHIFT);
+		if (sequence_num >= 0) {
+			uint32_t n = (uint32_t)(sequence_num % 64);
+			msg_word[0] |= (n << FLEX_ALPHA_HDR_N_SHIFT);
+		}
+		/* t1t0=00 (alpha) — already zero */
+
+		/* 2nd word: opcode "=" in bits 0-6, ETX in bits 7-13 and 14-20 */
+		msg_word[1] = (FLEX_SEC_REGACK_OPCODE & FLEX_SEC_REGACK_OPCODE_MASK)
+			    << FLEX_SEC_REGACK_OPCODE_SHIFT;
+		msg_word[1] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT);
+		msg_word[1] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+
+		/* K checksum */
+		k_sum = 0;
+		k_sum += msg_word[0] & FLEX_ALPHA_K_GRP1_MASK;
+		k_sum += (msg_word[0] >> FLEX_ALPHA_K_GRP2_SHIFT) & FLEX_ALPHA_K_GRP2_MASK;
+		k_sum += (msg_word[0] >> FLEX_ALPHA_K_GRP3_SHIFT) & FLEX_ALPHA_K_GRP3_MASK;
+		k_sum += msg_word[1] & FLEX_ALPHA_K_GRP1_MASK;
+		k_sum += (msg_word[1] >> FLEX_ALPHA_K_GRP2_SHIFT) & FLEX_ALPHA_K_GRP2_MASK;
+		k_sum += (msg_word[1] >> FLEX_ALPHA_K_GRP3_SHIFT) & FLEX_ALPHA_K_GRP3_MASK;
+		msg_word[0] |= (~k_sum) & FLEX_ALPHA_HDR_K_MASK;
+
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "TX: Secure REGACK encoder: V=000 t1t0=00, opcode=0x%02X\n",
+		     FLEX_SEC_REGACK_OPCODE);
+
+		fwc = *fwc_p;
+		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_word[0]));
+		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_word[1]));
+		*fwc_p = fwc;
+
+		return create_secure_vector(msg_start, 2);
 	}
 
 	/* Alpha mode (secure_encoding == 0): 7-bit character packing */
@@ -1330,7 +1375,7 @@ static uint32_t encode_special_numeric_message(uint32_t *frame_words,
 	k_bit &= 0xFF;
 	k_bit = (k_bit & 0x3F) + (k_bit >> 6);
 	k_bit = ~k_bit;
-	msg_words[0] |= (k_bit >> 4) & 0x3;
+	msg_words[0] |= FLEX_NUM_K54_FROM_K(k_bit);
 
 	LOGP(DFLEX, LOGL_DEBUG,
 	     "TX: Special numeric encoder: V=100, %d words, "
@@ -1388,15 +1433,15 @@ static uint32_t encode_numbered_numeric_message(uint32_t *frame_words,
 		}
 	}
 
-	/* Encode 10-bit header in first message word (after K5K4 bits 0-1):
-	 *   bits 2-7:  N5-N0 message number
-	 *   bit  8:    R0 retrieval flag
-	 *   bit  9:    S0 special format flag */
-	msg_words[0] |= ((uint32_t)(msg_num & 0x3F) << 2);
+	/* Encode header in first message word (after K5K4 bits 0-1):
+	 *   bits 2-7:  N5-N0 message number (FLEX_NUM_N_SHIFT/MASK)
+	 *   bit  8:    R0 retrieval flag (FLEX_NUM_R_SHIFT)
+	 *   bit  9:    S0 special format flag (FLEX_NUM_S_SHIFT) */
+	msg_words[0] |= ((uint32_t)(msg_num & FLEX_NUM_N_MASK) << FLEX_NUM_N_SHIFT);
 	if (r_flag)
-		msg_words[0] |= (1U << 8);
+		msg_words[0] |= (1U << FLEX_NUM_R_SHIFT);
 	if (s_flag)
-		msg_words[0] |= (1U << 9);
+		msg_words[0] |= (1U << FLEX_NUM_S_SHIFT);
 
 	/* BCD packing — bit-by-bit, starts after 10-bit header */
 	bit = FLEX_NUM_NUMBERED_SKIP_BITS;
@@ -1436,7 +1481,7 @@ static uint32_t encode_numbered_numeric_message(uint32_t *frame_words,
 	k_bit &= 0xFF;
 	k_bit = (k_bit & 0x3F) + (k_bit >> 6);
 	k_bit = ~k_bit;
-	msg_words[0] |= (k_bit >> 4) & 0x3;  /* K5K4 in bits 0-1 */
+	msg_words[0] |= FLEX_NUM_K54_FROM_K(k_bit);  /* K5K4 in bits 0-1 */
 
 	LOGP(DFLEX, LOGL_DEBUG,
 	     "TX: Numbered numeric encoder: V=111, N=%d S=%d R=%d, "
@@ -1522,9 +1567,13 @@ size_t flex_encode_frame(uint64_t capcode, int msg_type,
 	fmsg.message = message;
 	fmsg.message_length = message ? (int)strlen(message) : 0;
 	fmsg.speed = 1600;
-	fmsg.polarity = -1.0;
+	fmsg.polarity = FLEX_DEFAULT_POLARITY;
 	fmsg.sequence_num = -1;
-	fmsg.short_msg_idx = -1;
+	fmsg.temp_delivery_slot = -1;
+	fmsg.short_msg_type = FLEX_SMSG_TYPE_NUMERIC;
+	fmsg.short_msg_source = 0;
+	fmsg.short_msg_number = 0;
+	fmsg.short_msg_r = 0;
 
 	/* One-shot default parameters */
 	flex_frame_params_default(&params);
@@ -2003,29 +2052,26 @@ uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary)
 /* ===== Temporary Address Assignment ===== */
 
 /*
- * Encode a temporary address assignment word.
+ * Encode a temporary address word for the address field.
  * Base address = 0x1F7800 (1 1111 0111 1000 0000 0000₂).
  *
  * The Temporary Address is obtained by adding binary 0000 through 1111
  * (as indicated by a₃~a₀ of the Short Instruction Vector) to the base.
  *
- * Returns the encoded 32-bit BCH codeword for the temporary address,
- * or 0 on invalid input.
+ * temp_addr: the 21-bit address word value (FLEX_ADDR_TEMPORARY_MIN + slot).
+ *
+ * Returns the encoded 32-bit BCH codeword, or 0 on invalid input.
  */
-uint32_t flex_encode_temp_address(uint64_t capcode, uint64_t temp_addr)
+uint32_t flex_encode_temp_address(uint32_t temp_addr)
 {
 	uint32_t dw;
 
-	/* Validate permanent capcode */
-	if (!flex_capcode_valid(capcode))
-		return 0;
-
-	/* Validate temporary address — must fit in 21-bit data word */
-	if (temp_addr == 0 || temp_addr > ((1ULL << FLEX_BCH_DATA_BITS) - 1))
+	/* Validate: must be in the temporary address range */
+	if (temp_addr < FLEX_ADDR_TEMPORARY_MIN || temp_addr > FLEX_ADDR_TEMPORARY_MAX)
 		return 0;
 
 	/* Encode the temporary address value as a 21-bit BCH word */
-	dw = (uint32_t)temp_addr & FLEX_DATA_MASK;
+	dw = temp_addr & FLEX_DATA_MASK;
 
 	return flex_encode_word(reverse_bits32(dw));
 }
@@ -2829,8 +2875,11 @@ static size_t flex_encode_fiw(const flex_frame_params_t *params,
 	{
 		/* Compute FIW r and t fields from multiple transmission params.
 		 *
-		 * FIW r and t fields:
-		 *   When num_transmissions=1: r=0, t=low_traffic_flags.
+		 * FIW r and t fields (§3.6):
+		 *   When num_transmissions=1: r=0, t3-t0 = Low Traffic Flags
+		 *     per phase (t0=A, t1=B, t2=C, t3=D).
+		 *     Flag=1 means address field ends within block 0 for
+		 *     that phase — pager may sleep early.  Flag=0 = normal.
 		 *   When num_transmissions>1: r=1, and:
 		 *     [t1,t0] = num_transmissions (01=2x, 10=3x, 11=4x)
 		 *     [t3,t2] = TD Collapse override (00=system, 01=6, 10=7, 11=5) */
@@ -3132,7 +3181,12 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			int mw;
 
 			/* Validate capcode */
-			if (msgs[i].is_group) {
+			if (msgs[i].temp_delivery_slot >= 0) {
+				/* Temp address delivery: single address word
+				 * (FLEX_ADDR_TEMPORARY_MIN + slot) per §3.8.2.3 */
+				info[i].addr_words = 1;
+				info[i].is_long = 0;
+			} else if (msgs[i].is_group) {
 				if (!flex_capcode_valid(msgs[i].capcode)) {
 					info[i].packed = 0;
 					info[i].addr_words = 0;
@@ -3504,17 +3558,42 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		if (!info[idx].packed)
 			continue;
 
-		if (msgs[idx].is_group) {
+		if (msgs[idx].temp_delivery_slot >= 0) {
+			/* Temp address DELIVERY (§3.8.2.3) */
+			uint32_t ta = FLEX_ADDR_TEMPORARY_MIN
+				    + (uint32_t)msgs[idx].temp_delivery_slot;
+			frame_words[fwc++] = flex_encode_temp_address(ta);
+			LOGP(DFLEX, LOGL_DEBUG,
+			     "TX: AF[%u] Temporary addr slot=%d aw=0x%05X\n",
+			     fwc - 1, msgs[idx].temp_delivery_slot, ta);
+		} else if (msgs[idx].is_group) {
+			uint32_t gdw = ((uint32_t)msgs[idx].capcode + FLEX_SHORT_ADDR_OFFSET)
+				& FLEX_DATA_MASK;
 			frame_words[fwc++] = flex_encode_group_address(
 				msgs[idx].capcode, msgs[idx].is_temp_group);
+			LOGP(DFLEX, LOGL_DEBUG,
+			     "TX: AF[%u] %sgroup addr cap=%" PRIu64 " aw=0x%05X\n",
+			     fwc - 1,
+			     msgs[idx].is_temp_group ? "temp " : "",
+			     msgs[idx].capcode, gdw);
 		} else if (info[idx].is_long) {
 			uint32_t aw[2] = {0, 0};
 			encode_long_address(msgs[idx].capcode, aw);
 			frame_words[fwc++] = aw[0];
 			frame_words[fwc++] = aw[1];
+			LOGP(DFLEX, LOGL_DEBUG,
+			     "TX: AF[%u,%u] long addr %s cap=%" PRIu64 "\n",
+			     fwc - 2, fwc - 1,
+			     flex_capcode_type_name(msgs[idx].capcode),
+			     msgs[idx].capcode);
 		} else {
+			uint32_t sdw = ((uint32_t)msgs[idx].capcode + FLEX_SHORT_ADDR_OFFSET)
+				& FLEX_DATA_MASK;
 			frame_words[fwc++] = encode_short_address(
 				(uint32_t)msgs[idx].capcode);
+			LOGP(DFLEX, LOGL_DEBUG,
+			     "TX: AF[%u] short addr cap=%" PRIu64 " aw=0x%05X\n",
+			     fwc - 1, msgs[idx].capcode, sdw);
 		}
 	}
 
@@ -3670,19 +3749,99 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				break;
 
 			case FLEX_FRAME_MSG_TYPE_SHORT:
-				/* Short message vector:
-				 * all data in the vector word, no body. */
+				/* Short Message Vector (§3.9.2, Table 3.9.2-1).
+				 * All data in the vector word, no body words. */
 				{
-					int sidx = msgs[idx].short_msg_idx;
-					if (sidx < 0 || sidx > 127) {
+					uint32_t dw = 0;
+					dw |= (FLEX_VECTOR_TYPE_TONE & FLEX_VEC_TYPE_MASK)
+					      << FLEX_VEC_TYPE_SHIFT;
+
+					switch (msgs[idx].short_msg_type) {
+					case FLEX_SMSG_TYPE_NUMERIC: {
+						/* t=00: 3-digit BCD (short) or 8-digit (long).
+						 * 1st word: d0-d3=digit a, d4-d7=digit b, d8-d11=digit c.
+						 * 2nd word (long only): d0-d3=digit d, d4-d7=digit e,
+						 *   d8-d11=digit f, d12-d15=digit g, d16-d19=digit h,
+						 *   d20=spare (0).
+						 * Unused digits = space (0xC). */
+						const char *smsg = msgs[idx].message;
+						int slen = msgs[idx].message_length;
+						int max_digits = info[idx].is_long
+							? FLEX_SMSG_NUM_LONG_DIGITS
+							: FLEX_SMSG_NUM_SHORT_DIGITS;
+						uint8_t bcd_digits[8];
+						int di;
+						/* t1t0 = 00 — already zero */
+						for (di = 0; di < max_digits; di++) {
+							bcd_digits[di] = (di < slen && smsg[di])
+								? flex_num_char_to_bcd((uint8_t)smsg[di])
+								: FLEX_NUM_BCD_SPACE;
+						}
+						/* 1st word: digits a,b,c */
+						for (di = 0; di < 3 && di < max_digits; di++) {
+							dw |= ((uint32_t)bcd_digits[di] & 0xF)
+							      << (FLEX_SMSG_D_SHIFT + di * FLEX_SMSG_NUM_DIGIT_BITS);
+						}
+						/* 2nd word (long addr): digits d,e,f,g,h.
+						 * Stored in body_buf[0] so the Vy slot
+						 * logic writes it to the vector field. */
+						if (info[idx].is_long) {
+							uint32_t dw2 = 0;
+							for (di = 3; di < 8; di++) {
+								dw2 |= ((uint32_t)bcd_digits[di] & 0xF)
+								       << ((di - 3) * FLEX_SMSG_NUM_DIGIT_BITS);
+							}
+							/* d32 = spare, set to 0 (bit 20) — already zero */
+							body_buf[body_fwc++] = flex_encode_word(
+								reverse_bits32(dw2));
+						}
+						break;
+					}
+					case FLEX_SMSG_TYPE_SOURCE:
+						/* t=01: source codes S2S1S0 (0-7).
+						 * Message field = source code as decimal. */
+						dw |= (uint32_t)FLEX_SMSG_TYPE_SOURCE
+						      << FLEX_SMSG_T_SHIFT;
+						{
+							int src = 0;
+							if (msgs[idx].message && msgs[idx].message_length > 0)
+								src = atoi(msgs[idx].message);
+							if (src < 0 || src > 7) src = 0;
+							dw |= ((uint32_t)src & FLEX_SMSG_SRC_MASK)
+							      << FLEX_SMSG_D_SHIFT;
+						}
+						break;
+					case FLEX_SMSG_TYPE_NUMBERED:
+						/* t=10: S2S1S0 + N5-N0 + R0.
+						 * Message field = message number N (0-63).
+						 * ssource and sr from options. */
+						dw |= (uint32_t)FLEX_SMSG_TYPE_NUMBERED
+						      << FLEX_SMSG_T_SHIFT;
+						{
+							uint32_t d = 0;
+							int n = 0;
+							if (msgs[idx].message && msgs[idx].message_length > 0)
+								n = atoi(msgs[idx].message);
+							if (n < 0 || n > 63) n = 0;
+							d |= (uint32_t)msgs[idx].short_msg_source
+							     & FLEX_SMSG_NUMB_SRC_MASK;
+							d |= ((uint32_t)n
+							      & FLEX_SMSG_NUMB_N_MASK)
+							     << FLEX_SMSG_NUMB_N_SHIFT;
+							d |= ((uint32_t)msgs[idx].short_msg_r
+							      & FLEX_SMSG_NUMB_R_MASK)
+							     << FLEX_SMSG_NUMB_R_SHIFT;
+							dw |= d << FLEX_SMSG_D_SHIFT;
+						}
+						break;
+					default:
 						enc_err = -FLEX_ERR_INVALID_MESSAGE;
-					} else {
-						uint32_t dw = 0;
-						dw |= (FLEX_VECTOR_TYPE_TONE & 0x07) << 4;
-						dw |= ((uint32_t)sidx & 0x7F) << 9;
+						break;
+					}
+
+					if (!enc_err) {
 						dw = flex_word_checksum(dw);
-						vw = flex_encode_word(
-							reverse_bits32(dw));
+						vw = flex_encode_word(reverse_bits32(dw));
 					}
 				}
 				break;
@@ -3738,14 +3897,29 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			if (vec_fwc < FLEX_WORDS_PER_FRAME)
 				frame_words[vec_fwc++] = vw;
 
-			/* For long addresses: write Vy = body[0] to VF
-			 * ("the 1st word of the
-			 * message is placed at the 2nd word of the vector") */
+			/* For long addresses: write Vy to VF.
+			 * Most types: Vy = body[0] ("the 1st word of the
+			 * message is placed at the 2nd word of the vector").
+			 * Instruction/Short: Vy = all zeros (d11-d31 unused,
+			 * per §3.9.6 note: "All unused bits are set to 0"). */
 			if (info[idx].is_long) {
-				if (body_count > 0 && vec_fwc < FLEX_WORDS_PER_FRAME)
+				if (msgs[idx].msg_type == FLEX_FRAME_MSG_TYPE_INSTRUCTION) {
+					/* No body — 2nd vector word is zeros */
+					if (vec_fwc < FLEX_WORDS_PER_FRAME)
+						frame_words[vec_fwc++] = flex_encode_word(0);
+				} else if (msgs[idx].msg_type == FLEX_FRAME_MSG_TYPE_SHORT &&
+					   body_count > 0 && vec_fwc < FLEX_WORDS_PER_FRAME) {
+					/* Short msg long addr: 2nd word has digits d-h */
 					frame_words[vec_fwc++] = body_buf[0];
-				else if (vec_fwc < FLEX_WORDS_PER_FRAME)
-					frame_words[vec_fwc++] = vw; /* no body: Vy = Vx */
+				} else if (msgs[idx].msg_type == FLEX_FRAME_MSG_TYPE_SHORT) {
+					/* Short msg long addr but no body (e.g. source/numbered) */
+					if (vec_fwc < FLEX_WORDS_PER_FRAME)
+						frame_words[vec_fwc++] = flex_encode_word(0);
+				} else if (body_count > 0 && vec_fwc < FLEX_WORDS_PER_FRAME) {
+					frame_words[vec_fwc++] = body_buf[0];
+				} else if (vec_fwc < FLEX_WORDS_PER_FRAME) {
+					frame_words[vec_fwc++] = flex_encode_word(0);
+				}
 			}
 
 			/* Write remaining body words to Message Field.

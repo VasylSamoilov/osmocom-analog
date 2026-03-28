@@ -33,6 +33,7 @@
 #include "../libmobile/main_mobile.h"
 #include "../liboptions/options.h"
 #include "../libfm/fm.h"
+#include "../libmobile/get_time.h"
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
@@ -44,7 +45,7 @@ static int msg_send_fd = -1;
 
 static int tx = 0;
 static double deviation = 4800;
-static double polarity = -1;
+static double polarity = FLEX_DEFAULT_POLARITY;
 static enum flex_msg_type msg_type = FLEX_MSG_TYPE_AUTO;
 static const char *message = "1234";
 static uint64_t scan_from = 0;
@@ -273,7 +274,23 @@ void print_help(const char *arg0)
 	printf("          phase=A|B|C|D|auto\n");
 	printf("          blocking=0-16  (hex bits/char: 0 or 16=16bit, 1=raw, default 1)\n");
 	printf("          maildrop=0|1  (alpha/hex: separate handling from ordinary msgs)\n");
-	printf("          sectype=alpha|binary  (secure: wire encoding of body, default alpha)\n");
+	printf("          stype=numeric|source|numbered  (short msg sub-type, §3.9.2)\n");
+	printf("            numeric: message = up to 3 BCD digits (short addr)\n");
+	printf("                     or 8 BCD digits (long addr). Default.\n");
+	printf("            source:  message = source code (0-7)\n");
+	printf("            numbered: message = message number N (0-63)\n");
+	printf("                      ssource=0-7 and sr=0|1 in options\n");
+	printf("          ssource=0-7  (short msg source code S, for stype=source/numbered)\n");
+	printf("          sr=0|1  (short msg retrieval flag R, for stype=numbered)\n");
+	printf("          itype=tempaddr|sysevent  (instruction sub-type, §3.9.6)\n");
+	printf("            tempaddr: islot=0-15 iframe=0-127 (message field ignored)\n");
+	printf("            sysevent: message = space-separated flag names:\n");
+	printf("              SSID_TMF NID_TMF CHAN_SETUP NID_FREQ SSID_FREQ\n");
+	printf("            (omit itype for raw decimal instruction data in message)\n");
+	printf("          islot=0-15  (temp address slot, for itype=tempaddr)\n");
+	printf("          iframe=0-127  (target frame, for itype=tempaddr)\n");
+	printf("          sectype=alpha|binary|regack  (secure: wire encoding, default alpha)\n");
+	printf("            regack: Registration Acknowledgment (opcode '=' in 2nd word)\n");
 	printf("          sectag=0|1|2|3  (secure: pager type tag, 0=alpha 1=vendor 2=binary 3=rsvd, default=sectype)\n");
 	printf("          msgnum=0-63  (nnumeric/nspecial: sequence number for dedup, default auto)\n");
 	printf("          chan_setup=0|1  (enable/disable BIW channel setup emission)\n");
@@ -285,7 +302,8 @@ void print_help(const char *arg0)
 	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
 	printf("        Special: timezone,<code>,,  — show offset for zone code 0-31\n");
 	printf("        Special: sysmsg,<lsb>,,<payload>  — send system message via\n");
-	printf("          Operator Messaging Address (capcode 0x1F7800-0x1F780F).\n");
+	printf("          Operator Messaging Address (capcode 0x%X-0x%X).\n",
+	       FLEX_ADDR_OPER_MSG_MIN, FLEX_ADDR_OPER_MSG_MAX);
 	printf("          LSB: 0=all 1=home 2=roaming 3=ssid 4=time 14=SSIDChange 15=SysEvent\n");
 	printf("        Examples:\n");
 	printf("          1234567,alpha,,Hello World\n");
@@ -294,14 +312,20 @@ void print_help(const char *arg0)
 	printf("          1234567,hex,blocking=8,DEADBEEF\n");
 	printf("          1234567,tone,,\n");
 	printf("          1234567,instruction,,42\n");
-	printf("          1234567,short,,5\n");
+	printf("          1234567,instruction,itype=tempaddr islot=5 iframe=42,\n");
+	printf("          1234567,instruction,itype=sysevent,SSID_TMF NID_FREQ\n");
+	printf("          1234567,short,,123              (t=00 numeric: 3 BCD digits)\n");
+	printf("          1234567,short,stype=source,3    (t=01 source code 3)\n");
+	printf("          1234567,short,stype=numbered ssource=2 sr=1,7  (t=10 S=2 N=7 R=1)\n");
 	printf("          1234567,secure,,Secure alpha message\n");
 	printf("          1234567,secure,sectype=binary sectag=2,DEADBEEF\n");
+	printf("          1234567,secure,sectype=regack,  (Registration Acknowledgment)\n");
 	printf("          1234567,special,,31415926\n");
 	printf("          1234567,nnumeric,msgnum=7,31415926\n");
 	printf("          1234567,nspecial,,31415926\n");
 	printf("          group:1234567,alpha,group=1,Group message\n");
 	printf("          group:1234567,alpha,group=1 tempgroup=1,Temp group msg\n");
+	printf("          tempgroup:1234567 2345678 3456789,alpha,,Hello everyone\n");
 	printf("          3E007005031,alpha,,Extended CAPCODE (Long, Any Phase, collapse=3)\n");
 	printf("          A1234567,numeric,,Standard rule Short CAPCODE\n");
 	printf("          5U0000100,tone,,Non-standard, collapse=5, Phase A\n");
@@ -309,12 +333,18 @@ void print_help(const char *arg0)
 	printf("          sysmsg,14,,\n");
 	printf("\n");
 	printf("    Valid capcode ranges:\n");
-	printf("        Short:  1–1933312 (1 address word, 21-bit d0-d20)\n");
-	printf("        Long:   2101249–4297068542 (2 address words, d0-d20 + e0-e20)\n");
-	printf("          Set 1-2: 2101249–1075843072     (LA1+LA2)\n");
-	printf("          Set 1-3/1-4: 1075843073–3223326720 (LA1+LA3 or LA1+LA4)\n");
-	printf("          Set 2-3/2-4: 3223326721–4297068542 (LA2+LA3 or LA2+LA4)\n");
-	printf("        Special addresses (gap 1933313–2101248):\n");
+	printf("        Short:  %" PRIu64 "–%" PRIu64 " (1 address word, 21-bit d0-d20)\n",
+	       (uint64_t)FLEX_SHORT_ADDR_MIN, (uint64_t)FLEX_SHORT_ADDR_MAX);
+	printf("        Long:   %" PRIu64 "–%" PRIu64 " (2 address words, d0-d20 + e0-e20)\n",
+	       (uint64_t)FLEX_LONG_ADDR_MIN, (uint64_t)FLEX_LONG_ADDR_MAX);
+	printf("          Set 1-2: %" PRIu64 "–%" PRIu64 "     (LA1+LA2)\n",
+	       (uint64_t)FLEX_LONG_SET12_MIN, (uint64_t)FLEX_LONG_SET12_MAX);
+	printf("          Set 1-3/1-4: %" PRIu64 "–%" PRIu64 " (LA1+LA3 or LA1+LA4)\n",
+	       (uint64_t)FLEX_LONG_SET34_MIN, (uint64_t)FLEX_LONG_SET34_MAX);
+	printf("          Set 2-3: %" PRIu64 "–%" PRIu64 " (LA2+LA3)\n",
+	       (uint64_t)FLEX_LONG_SET23_MIN, (uint64_t)FLEX_LONG_SET23_MAX);
+	printf("        Special addresses (gap %" PRIu64 "–%" PRIu64 "):\n",
+	       (uint64_t)FLEX_SHORT_ADDR_MAX + 1, (uint64_t)FLEX_LONG_ADDR_MIN - 1);
 	printf("          Network:  NID system info (4096 addrs, area_id/zones/traffic)\n");
 	printf("          Temporary: 16 group slots (assigned via short instruction)\n");
 	printf("          Operator:  system messages (all/home/roaming/ssid/time),\n");
@@ -675,7 +705,10 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			       int *numbered_msgnum,
 			       int *msg_chan_setup,
 			       int *retransmit, int *retransmit_interval,
-			       int *send_delay)
+			       int *send_delay,
+			       int *short_msg_type, int *short_msg_source,
+			       int *short_msg_number, int *short_msg_r,
+			       int *instr_type, int *instr_slot, int *instr_frame)
 {
 	char buf[256];
 	char *p, *key, *val;
@@ -684,7 +717,7 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	/* defaults */
 	*speed = 1600;
 	*modulation_type = FLEX_MOD_2FSK;
-	*polarity_out = -1.0;
+	*polarity_out = FLEX_DEFAULT_POLARITY;
 	*priority = 0;
 	*charset = 0;
 	/* is_group already set from group: prefix */
@@ -700,6 +733,13 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*retransmit = default_retransmit;
 	*retransmit_interval = default_retransmit_interval;
 	*send_delay = default_send_delay;
+	*short_msg_type = FLEX_SMSG_TYPE_NUMERIC;
+	*short_msg_source = 0;
+	*short_msg_number = 0;
+	*short_msg_r = 0;
+	*instr_type = -1;	/* -1 = not set (raw decimal in message field) */
+	*instr_slot = 0;
+	*instr_frame = 0;
 
 	if (opts_len <= 0)
 		return;
@@ -796,11 +836,13 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			*mail_drop = atoi(val) ? 1 : 0;
 		else if (!strcmp(key, "sectype")) {
 			if (!strcasecmp(val, "alpha"))
-				*secure_encoding = 0;
+				*secure_encoding = FLEX_SEC_ENC_ALPHA;
 			else if (!strcasecmp(val, "binary"))
-				*secure_encoding = 1;
+				*secure_encoding = FLEX_SEC_ENC_BINARY;
+			else if (!strcasecmp(val, "regack"))
+				*secure_encoding = FLEX_SEC_ENC_REGACK;
 			else {
-				LOGP(DFLEX, LOGL_NOTICE, "FIFO: invalid sectype '%s', must be alpha or binary.\n", val);
+				LOGP(DFLEX, LOGL_NOTICE, "FIFO: invalid sectype '%s', must be alpha, binary, or regack.\n", val);
 				*secure_encoding = -1; /* signal error */
 			}
 		}
@@ -843,6 +885,63 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			if (sd < 0) sd = 0;
 			if (sd > 1920) sd = 1920;
 			*send_delay = sd;
+		}
+		else if (!strcmp(key, "stype")) {
+			/* Short message sub-type (§3.9.2 Table 3.9.2-1):
+			 *   numeric (0): 3-digit BCD (short) / 8-digit (long)
+			 *   source  (1): source codes S (0-7)
+			 *   numbered(2): source + message number N + R flag
+			 * Default: numeric */
+			if (!strcasecmp(val, "numeric") || !strcmp(val, "0"))
+				*short_msg_type = FLEX_SMSG_TYPE_NUMERIC;
+			else if (!strcasecmp(val, "source") || !strcmp(val, "1"))
+				*short_msg_type = FLEX_SMSG_TYPE_SOURCE;
+			else if (!strcasecmp(val, "numbered") || !strcmp(val, "2"))
+				*short_msg_type = FLEX_SMSG_TYPE_NUMBERED;
+			else
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: invalid stype '%s' — use numeric, source, or numbered.\n", val);
+		}
+		else if (!strcmp(key, "ssource")) {
+			int sv = atoi(val);
+			if (sv >= 0 && sv <= 7)
+				*short_msg_source = sv;
+			else
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: ssource %d out of range (0-7).\n", sv);
+		}
+		else if (!strcmp(key, "sr")) {
+			*short_msg_r = atoi(val) ? 1 : 0;
+		}
+		else if (!strcmp(key, "itype")) {
+			/* Short instruction sub-type (§3.9.6 Table 3.9.6-1):
+			 *   tempaddr (0): temp address assignment (slot + frame)
+			 *   sysevent (1): system event notification (event flags)
+			 * When set, the message field is interpreted per type
+			 * instead of as a raw decimal integer. */
+			if (!strcasecmp(val, "tempaddr") || !strcmp(val, "0"))
+				*instr_type = FLEX_INSTR_TYPE_TEMP_ADDR;
+			else if (!strcasecmp(val, "sysevent") || !strcmp(val, "1"))
+				*instr_type = FLEX_INSTR_TYPE_SYS_EVENT;
+			else
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: invalid itype '%s' — use tempaddr or sysevent.\n", val);
+		}
+		else if (!strcmp(key, "islot")) {
+			int sv = atoi(val);
+			if (sv >= 0 && sv <= 15)
+				*instr_slot = sv;
+			else
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: islot %d out of range (0-15).\n", sv);
+		}
+		else if (!strcmp(key, "iframe")) {
+			int fv = atoi(val);
+			if (fv >= 0 && fv <= 127)
+				*instr_frame = fv;
+			else
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: iframe %d out of range (0-127).\n", fv);
 		}
 	}
 
@@ -1188,7 +1287,7 @@ static void log_capcode_parsed(const capcode_parsed_t *cp, const char *raw_str)
 		     cp->computed_frame,
 		     (cp->computed_phase >= 0 && cp->computed_phase <= 3)
 		       ? phase_names[cp->computed_phase] : "?",
-		     (cp->capcode <= FLEX_SHORT_ADDR_MAX) ? "Short" : "Long");
+		     flex_capcode_type_name(cp->capcode));
 		return;
 	}
 
@@ -1230,11 +1329,8 @@ static void log_capcode_parsed(const capcode_parsed_t *cp, const char *raw_str)
 	}
 
 	LOGP(DFLEX, LOGL_INFO,
-	     "CAPCODE:   address type: %s (range: short 1-%llu, long %llu-%llu)\n",
-	     (cp->capcode <= FLEX_SHORT_ADDR_MAX) ? "Short (1 word)" : "Long (2 words)",
-	     (unsigned long long)FLEX_SHORT_ADDR_MAX,
-	     (unsigned long long)FLEX_LONG_ADDR_MIN,
-	     (unsigned long long)FLEX_LONG_ADDR_MAX);
+	     "CAPCODE:   address type: %s\n",
+	     flex_capcode_type_name(cp->capcode));
 }
 
 /* Build a human-readable flags string like "[GRP MAILDROP RETX]".
@@ -1309,6 +1405,34 @@ static void flex_log_type_options(enum flex_msg_type mtype,
 	}
 }
 
+/* Parse message type string. Returns FLEX_MSG_TYPE_AUTO for unknown types. */
+static enum flex_msg_type flex_parse_msg_type(const char *s)
+{
+	if (!strcasecmp(s, "auto") || !strcmp(s, "0"))
+		return FLEX_MSG_TYPE_AUTO;
+	if (!strcasecmp(s, "tone") || !strcmp(s, "1"))
+		return FLEX_MSG_TYPE_TONE;
+	if (!strcasecmp(s, "numeric") || !strcasecmp(s, "num") || !strcmp(s, "2"))
+		return FLEX_MSG_TYPE_NUMERIC;
+	if (!strcasecmp(s, "alpha") || !strcasecmp(s, "alphanumeric") || !strcmp(s, "3"))
+		return FLEX_MSG_TYPE_ALPHA;
+	if (!strcasecmp(s, "hex") || !strcasecmp(s, "binary") || !strcmp(s, "4"))
+		return FLEX_MSG_TYPE_HEX;
+	if (!strcasecmp(s, "instruction") || !strcasecmp(s, "instr") || !strcmp(s, "5"))
+		return FLEX_MSG_TYPE_INSTRUCTION;
+	if (!strcasecmp(s, "short") || !strcmp(s, "6"))
+		return FLEX_MSG_TYPE_SHORT;
+	if (!strcasecmp(s, "secure") || !strcasecmp(s, "sec") || !strcmp(s, "7"))
+		return FLEX_MSG_TYPE_SECURE;
+	if (!strcasecmp(s, "special") || !strcasecmp(s, "snum") || !strcmp(s, "8"))
+		return FLEX_MSG_TYPE_SPECIAL_NUM;
+	if (!strcasecmp(s, "nnumeric") || !strcasecmp(s, "nnum") || !strcmp(s, "9"))
+		return FLEX_MSG_TYPE_NUMBERED_NUM;
+	if (!strcasecmp(s, "nspecial") || !strcasecmp(s, "nsnum") || !strcmp(s, "10"))
+		return FLEX_MSG_TYPE_NUMBERED_SPECIAL;
+	return FLEX_MSG_TYPE_AUTO; /* unknown */
+}
+
 /* Process a single FIFO line: capcode,type,options,message */
 static void fifo_process_line(const char *text, int text_length)
 {
@@ -1338,6 +1462,13 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_retransmit;
 	int msg_retransmit_interval;
 	int msg_send_delay;
+	int msg_short_type;
+	int msg_short_source;
+	int msg_short_number;
+	int msg_short_r;
+	int msg_instr_type;
+	int msg_instr_slot;
+	int msg_instr_frame;
 	char msg_source[64];
 	const char *opts_start;
 	int opts_len;
@@ -1449,7 +1580,28 @@ static void fifo_process_line(const char *text, int text_length)
 			}
 		}
 		if (!any)
-			LOGP(DFLEX, LOGL_NOTICE, "  (no active assignments)\n");
+			LOGP(DFLEX, LOGL_NOTICE, "  (no active RX assignments)\n");
+
+		/* TX temp group slots */
+		any = 0;
+		LOGP(DFLEX, LOGL_NOTICE, "FIFO: TX temp group slots (16 slots):\n");
+		for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
+			if (flex->tx_temp[s].state == FLEX_TG_FREE)
+				continue;
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "  slot=%d state=%s frame=%u members=%d:",
+			     s,
+			     flex->tx_temp[s].state == FLEX_TG_SETUP ? "SETUP" : "DELIVERY",
+			     flex->tx_temp[s].target_frame,
+			     flex->tx_temp[s].count);
+			for (m = 0; m < flex->tx_temp[s].count; m++)
+				LOGP(DFLEX, LOGL_NOTICE,
+				     " %" PRIu64, flex->tx_temp[s].capcodes[m]);
+			LOGP(DFLEX, LOGL_NOTICE, "\n");
+			any = 1;
+		}
+		if (!any)
+			LOGP(DFLEX, LOGL_NOTICE, "  (no active TX slots)\n");
 		return;
 	}
 
@@ -1495,7 +1647,7 @@ static void fifo_process_line(const char *text, int text_length)
 
 	/* === System Message command: "sysmsg,<lsb>,,<payload>" ===
 	 * Sends a system message via Operator Messaging Address
-	 * (capcode 0x1F7800 + LSB, range 0x1F7800-0x1F780F).
+	 * (capcode FLEX_ADDR_OPER_MSG_MIN + LSB, range 0x1F7810-0x1F781F).
 	 *
 	 * The <lsb> field (0-15) selects the operator address sub-type:
 	 *   0 = all pagers    1 = home area    2 = roaming    3 = SSID
@@ -1541,7 +1693,7 @@ static void fifo_process_line(const char *text, int text_length)
 		}
 
 		/* Compute the operator messaging capcode.
-		 * Base address 0x1F7810 + LSB (range 0-15). */
+		 * Base address FLEX_ADDR_OPER_MSG_MIN (0x1F7810) + LSB (range 0-15). */
 		{
 			uint64_t oper_capcode = (uint64_t)(FLEX_ADDR_OPER_MSG_MIN + (uint32_t)lsb);
 			flex_msg_t *msg;
@@ -1559,7 +1711,7 @@ static void fifo_process_line(const char *text, int text_length)
 			if (msg) {
 				msg->speed = 1600;
 				msg->modulation_type = FLEX_MOD_2FSK;
-				msg->polarity = -1.0;
+				msg->polarity = FLEX_DEFAULT_POLARITY;
 				msg->priority = 1; /* system messages are priority */
 				/* Per spec §3.9.2: "The Message Retrieval Flag
 				 * (R bit) must be set to zero for BIW System
@@ -1572,6 +1724,99 @@ static void fifo_process_line(const char *text, int text_length)
 				     lsb, flex_oper_msg_subtype_name((uint32_t)(FLEX_ADDR_OPER_MSG_MIN + lsb)),
 				     oper_capcode, message_length);
 			}
+		}
+		return;
+	}
+
+	/* Handle tempgroup:cap1 cap2 cap3 prefix (§3.8.2.3).
+	 * Format: "tempgroup:cap1 cap2 cap3,type,options,message"
+	 * Automatically handles SETUP → DELIVERY → TEARDOWN. */
+	if (strncmp(capcode_string, "tempgroup:", 10) == 0) {
+		flex_t *flex = (flex_t *)sender_head;
+		char *tg_str = capcode_string + 10;
+		uint64_t tg_caps[FLEX_TEMP_GROUP_MAX_MEMBERS];
+		int tg_count = 0;
+		char *p = tg_str;
+		char type_str_tg[64];
+		int tlen_tg;
+		enum flex_msg_type mtype_tg;
+		int tg_speed = 1600, tg_mod = FLEX_MOD_2FSK;
+		double tg_pol = FLEX_DEFAULT_POLARITY;
+		int tg_prio = 0, tg_phase = -1;
+
+		if (!flex) {
+			LOGP(DFLEX, LOGL_ERROR, "No transmitter for tempgroup.\n");
+			return;
+		}
+
+		/* Parse space-separated capcodes */
+		while (*p && tg_count < FLEX_TEMP_GROUP_MAX_MEMBERS) {
+			while (*p == ' ') p++;
+			if (!*p) break;
+			tg_caps[tg_count++] = strtoull(p, &p, 10);
+		}
+		if (tg_count == 0) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: tempgroup requires at least 1 capcode.\n");
+			return;
+		}
+
+		/* Extract type field */
+		tlen_tg = comma2 - comma1 - 1;
+		if (tlen_tg <= 0 || tlen_tg >= (int)sizeof(type_str_tg)) {
+			LOGP(DFLEX, LOGL_NOTICE, "FIFO: tempgroup missing type field.\n");
+			return;
+		}
+		memcpy(type_str_tg, text + comma1 + 1, tlen_tg);
+		type_str_tg[tlen_tg] = '\0';
+
+		/* Parse type */
+		mtype_tg = flex_parse_msg_type(type_str_tg);
+		if (mtype_tg == FLEX_MSG_TYPE_AUTO) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: tempgroup unknown type '%s'.\n", type_str_tg);
+			return;
+		}
+
+		/* Extract and parse options (speed, polarity, phase, priority) */
+		{
+			int dummy_charset, dummy_group, dummy_tg;
+			char dummy_src[64];
+			int dummy_bl, dummy_md, dummy_se, dummy_ss, dummy_nm;
+			int dummy_cs, dummy_rt, dummy_ri, dummy_sd;
+			int dummy_st, dummy_ssrc, dummy_sn, dummy_sr;
+			int dummy_it, dummy_is, dummy_if;
+			parse_fifo_options(text + comma2 + 1, comma3 - comma2 - 1,
+					   &tg_speed, &tg_mod,
+					   &tg_pol, &tg_prio,
+					   &dummy_charset, &dummy_group, &dummy_tg,
+					   dummy_src, &tg_phase, &dummy_bl,
+					   &dummy_md,
+					   &dummy_se, &dummy_ss,
+					   &dummy_nm,
+					   &dummy_cs,
+					   &dummy_rt, &dummy_ri,
+					   &dummy_sd,
+					   &dummy_st, &dummy_ssrc,
+					   &dummy_sn, &dummy_sr,
+					   &dummy_it, &dummy_is, &dummy_if);
+		}
+
+		/* Extract message payload */
+		if (comma3 + 1 < text_length)
+			message_length = flex_scan_message(text + comma3 + 1,
+							   text_length - comma3 - 1,
+							   msg_buf, sizeof(msg_buf));
+
+		/* Enqueue */
+		{
+			int rc = flex_tempgroup_enqueue(flex, tg_caps, tg_count,
+						       mtype_tg, msg_buf, message_length,
+						       tg_speed, tg_mod, tg_pol,
+						       tg_prio, tg_phase);
+			if (rc < 0)
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: tempgroup enqueue failed.\n");
 		}
 		return;
 	}
@@ -1609,7 +1854,10 @@ static void fifo_process_line(const char *text, int text_length)
 			   &msg_numbered_msgnum,
 			   &msg_chan_setup,
 			   &msg_retransmit, &msg_retransmit_interval,
-			   &msg_send_delay);
+			   &msg_send_delay,
+			   &msg_short_type, &msg_short_source,
+			   &msg_short_number, &msg_short_r,
+			   &msg_instr_type, &msg_instr_slot, &msg_instr_frame);
 
 	/* Discard message if sectype was invalid */
 	if (msg_secure_encoding == -1)
@@ -1637,12 +1885,14 @@ static void fifo_process_line(const char *text, int text_length)
 		capcode = cp.capcode;
 		if (!flex_capcode_valid(capcode)) {
 			LOGP(DFLEX, LOGL_NOTICE,
-			     "FIFO: invalid numeric address %" PRIu64 " from capcode '%s' "
-			     "(valid: short 1-%llu, long %llu-%llu).\n",
+			     "FIFO: invalid capcode %" PRIu64 " from '%s' "
+			     "(valid: short %" PRIu64 "–%" PRIu64
+			     ", long %" PRIu64 "–%" PRIu64 ").\n",
 			     capcode, capcode_string,
-			     (unsigned long long)FLEX_SHORT_ADDR_MAX,
-			     (unsigned long long)FLEX_LONG_ADDR_MIN,
-			     (unsigned long long)FLEX_LONG_ADDR_MAX);
+			     (uint64_t)FLEX_SHORT_ADDR_MIN,
+			     (uint64_t)FLEX_SHORT_ADDR_MAX,
+			     (uint64_t)FLEX_LONG_ADDR_MIN,
+			     (uint64_t)FLEX_LONG_ADDR_MAX);
 			return;
 		}
 		log_capcode_parsed(&cp, capcode_string);
@@ -1672,29 +1922,8 @@ static void fifo_process_line(const char *text, int text_length)
 	 *   0=auto, 1=tone, 2=numeric, 3=alpha, 4=hex, 5=instruction, 6=short
 	 * Also accept vector type numbers directly for advanced use:
 	 *   vtype1=instruction, vtype2=tone, vtype3=numeric, vtype5=alpha, vtype6=hex */
-	if (!strcasecmp(type_string, "auto") || !strcmp(type_string, "0"))
-		mtype = FLEX_MSG_TYPE_AUTO;
-	else if (!strcasecmp(type_string, "tone") || !strcmp(type_string, "1"))
-		mtype = FLEX_MSG_TYPE_TONE;
-	else if (!strcasecmp(type_string, "numeric") || !strcasecmp(type_string, "num") || !strcmp(type_string, "2"))
-		mtype = FLEX_MSG_TYPE_NUMERIC;
-	else if (!strcasecmp(type_string, "alpha") || !strcasecmp(type_string, "alphanumeric") || !strcmp(type_string, "3"))
-		mtype = FLEX_MSG_TYPE_ALPHA;
-	else if (!strcasecmp(type_string, "hex") || !strcasecmp(type_string, "binary") || !strcmp(type_string, "4"))
-		mtype = FLEX_MSG_TYPE_HEX;
-	else if (!strcasecmp(type_string, "instruction") || !strcasecmp(type_string, "instr") || !strcmp(type_string, "5"))
-		mtype = FLEX_MSG_TYPE_INSTRUCTION;
-	else if (!strcasecmp(type_string, "short") || !strcmp(type_string, "6"))
-		mtype = FLEX_MSG_TYPE_SHORT;
-	else if (!strcasecmp(type_string, "secure") || !strcasecmp(type_string, "sec") || !strcmp(type_string, "7"))
-		mtype = FLEX_MSG_TYPE_SECURE;
-	else if (!strcasecmp(type_string, "special") || !strcasecmp(type_string, "snum") || !strcmp(type_string, "8"))
-		mtype = FLEX_MSG_TYPE_SPECIAL_NUM;
-	else if (!strcasecmp(type_string, "nnumeric") || !strcasecmp(type_string, "nnum") || !strcmp(type_string, "9"))
-		mtype = FLEX_MSG_TYPE_NUMBERED_NUM;
-	else if (!strcasecmp(type_string, "nspecial") || !strcasecmp(type_string, "nsnum") || !strcmp(type_string, "10"))
-		mtype = FLEX_MSG_TYPE_NUMBERED_SPECIAL;
-	else {
+	mtype = flex_parse_msg_type(type_string);
+	if (mtype == FLEX_MSG_TYPE_AUTO && strcasecmp(type_string, "auto") && strcmp(type_string, "0")) {
 		LOGP(DFLEX, LOGL_NOTICE, "FIFO: invalid type '%s'. Use auto/tone/numeric/alpha/hex/instruction/short/secure/special/nnumeric/nspecial.\n", type_string);
 		return;
 	}
@@ -1752,6 +1981,61 @@ static void fifo_process_line(const char *text, int text_length)
 				}
 			}
 
+			/* Construct instruction data from structured options (§3.9.6).
+			 * When itype= is set and type is instruction, build the
+			 * 14-bit instruction data and replace the message field. */
+			if (mtype == FLEX_MSG_TYPE_INSTRUCTION && msg_instr_type >= 0) {
+				static char instr_buf[16];
+				uint32_t idata = 0;
+
+				if (msg_instr_type == FLEX_INSTR_TYPE_TEMP_ADDR) {
+					idata = ((uint32_t)FLEX_INSTR_TYPE_TEMP_ADDR & FLEX_INSTR_TYPE_MASK);
+					idata |= ((uint32_t)msg_instr_frame & FLEX_INSTR_FRAME_MASK)
+						 << FLEX_INSTR_FRAME_SHIFT;
+					idata |= ((uint32_t)msg_instr_slot & FLEX_INSTR_SLOT_MASK)
+						 << FLEX_INSTR_SLOT_SHIFT;
+				} else if (msg_instr_type == FLEX_INSTR_TYPE_SYS_EVENT) {
+					uint32_t eflags = 0;
+					if (message_length > 0) {
+						char fbuf[256];
+						int flen = message_length;
+						if (flen >= (int)sizeof(fbuf)) flen = sizeof(fbuf) - 1;
+						memcpy(fbuf, msg_buf, flen);
+						fbuf[flen] = '\0';
+						char *fp = fbuf;
+						while (*fp) {
+							while (*fp == ' ') fp++;
+							if (!*fp) break;
+							char *end = fp;
+							while (*end && *end != ' ') end++;
+							char saved = *end;
+							*end = '\0';
+							if (!strcasecmp(fp, "SSID_TMF"))
+								eflags |= FLEX_SYSEVENT_FLAG_SSID_TMF;
+							else if (!strcasecmp(fp, "NID_TMF"))
+								eflags |= FLEX_SYSEVENT_FLAG_NID_TMF;
+							else if (!strcasecmp(fp, "CHAN_SETUP"))
+								eflags |= FLEX_SYSEVENT_FLAG_CHAN_SETUP;
+							else if (!strcasecmp(fp, "NID_FREQ"))
+								eflags |= FLEX_SYSEVENT_FLAG_NID_FREQ;
+							else if (!strcasecmp(fp, "SSID_FREQ"))
+								eflags |= FLEX_SYSEVENT_FLAG_SSID_FREQ;
+							else
+								LOGP(DFLEX, LOGL_NOTICE,
+								     "FIFO: unknown sysevent flag '%s'\n", fp);
+							*end = saved;
+							fp = end;
+						}
+					}
+					idata = ((uint32_t)FLEX_INSTR_TYPE_SYS_EVENT & FLEX_INSTR_TYPE_MASK);
+					idata |= (eflags & 0x7FF) << FLEX_SYSEVENT_DATA_SHIFT;
+				}
+
+				snprintf(instr_buf, sizeof(instr_buf), "%u", idata);
+				memcpy(msg_buf, instr_buf, strlen(instr_buf) + 1);
+				message_length = (int)strlen(instr_buf);
+			}
+
 			msg = flex_msg_create(flex, capcode, mtype, msg_buf, message_length);
 			if (msg) {
 				msg->speed = msg_speed;
@@ -1777,6 +2061,10 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->retransmit_max = msg_retransmit;
 				msg->retransmit_interval = msg_retransmit_interval;
 				msg->send_delay = msg_send_delay;
+				msg->short_msg_type = msg_short_type;
+				msg->short_msg_source = msg_short_source;
+				msg->short_msg_number = msg_short_number;
+				msg->short_msg_r = msg_short_r;
 				if (msg->send_delay > 0) {
 					flex_t *fl = (flex_t *)sender_head;
 					uint32_t current_abs = fl->sched_last_cycle * 128 + fl->sched_last_frame;
@@ -1798,8 +2086,9 @@ static void fifo_process_line(const char *text, int text_length)
 					msg->retransmit_max = 0;
 				}
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: enqueued capcode=%" PRIu64 " type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d tempgroup=%d phase=%s len=%d flags=%s\n",
+				     "FIFO: enqueued capcode=%" PRIu64 " addr=%s type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d tempgroup=%d phase=%s len=%d flags=%s\n",
 				     capcode,
+				     flex_capcode_type_name(capcode),
 				     flex_msg_type_name(mtype),
 				     msg_speed,
 				     flex_mod_name(msg_mod_type),
@@ -1822,6 +2111,12 @@ static void fifo_process_line(const char *text, int text_length)
 		}
 	}
 }
+
+/* Delayed quit: after one-shot TX completes, keep running for
+ * a short time so the RX path can finish decoding the last frame
+ * (loopback or off-air).  0 = not pending, >0 = quit time. */
+double quit_after_time = 0;
+#define QUIT_DELAY_SEC	0.25
 
 static void myhandler(void)
 {
@@ -1872,6 +2167,15 @@ static void myhandler(void)
 			memmove(buffer, buffer + line_start, remaining);
 		pos = remaining;
 	}
+
+	/* Delayed quit: wait for RX to finish processing */
+	if (quit_after_time > 0) {
+		double now = get_time();
+		if (now >= quit_after_time) {
+			quit = 1;
+			quit_after_time = 0;
+		}
+	}
 }
 
 
@@ -1885,9 +2189,16 @@ int main(int argc, char *argv[])
 	uses_emphasis = 0;
 
 	/* init mobile interface */
-	static const struct number_lengths number_lengths[] = {
-		{ 7, "short capcode (1-1933312)" },
-		{ 10, "long capcode (2101249-4297068542)" },
+	static char short_desc[64], long_desc[64];
+	snprintf(short_desc, sizeof(short_desc),
+		 "short capcode (%" PRIu64 "-%" PRIu64 ")",
+		 (uint64_t)FLEX_SHORT_ADDR_MIN, (uint64_t)FLEX_SHORT_ADDR_MAX);
+	snprintf(long_desc, sizeof(long_desc),
+		 "long capcode (%" PRIu64 "-%" PRIu64 ")",
+		 (uint64_t)FLEX_LONG_ADDR_MIN, (uint64_t)FLEX_LONG_ADDR_MAX);
+	const struct number_lengths number_lengths[] = {
+		{ 7, short_desc },
+		{ 10, long_desc },
 		{ 0, NULL }
 	};
 	main_mobile_init("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", number_lengths, NULL, flex_number_valid, NULL);
@@ -2040,6 +2351,25 @@ int main(int argc, char *argv[])
 		sender_t *s;
 		for (s = sender_head; s; s = s->next)
 			flex_scan_or_loopback((flex_t *)s);
+	}
+
+	/* One-shot auto-enqueue: if station_id is provided in
+	 * "capcode,type,,message" format and we're not in network mode,
+	 * parse it as a FIFO line to enqueue the message and trigger
+	 * transmission immediately (no interactive console needed). */
+	if (station_id[0] && !network_mode) {
+		fifo_process_line(station_id, (int)strlen(station_id));
+		{
+			sender_t *s;
+			for (s = sender_head; s; s = s->next) {
+				flex_t *f = (flex_t *)s;
+				if (f->tx && f->msg_list) {
+					flex_trigger_ers(f);
+					LOGP(DFLEX, LOGL_INFO,
+					     "One-shot: auto-enqueued from CLI, TX triggered.\n");
+				}
+			}
+		}
 	}
 
 	main_mobile_loop("flex", &quit, myhandler, station_id);

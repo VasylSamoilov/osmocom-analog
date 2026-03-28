@@ -493,6 +493,7 @@ again:
 			 * signal naturally. */
 			if (!flex->network_mode &&
 			    !flex->msg_list &&
+			    flex->idle_count >= 2 &&
 			    flex->scan_from >= flex->scan_to &&
 			    !flex->sender.loopback) {
 				int guard = (int)(flex->fsk_bitduration + 1.0);
@@ -1210,7 +1211,10 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 	 *   bits 17-20: t (depends on r — see below)
 	 *
 	 * When r=0: transmissions=1x, t3-t0 are Low Traffic Flags
-	 *   per phase (d,c,b,a).  t=1 means address field ≤ block 0.
+	 *   per phase (t0=A, t1=B, t2=C, t3=D).
+	 *   Flag=1 means address field ends within block 0 for that
+	 *   phase — pager may return to battery-save early.
+	 *   Flag=0 means normal traffic on that phase.
 	 * When r=1: [t1,t0] = num transmissions (01=2x, 10=3x, 11=4x)
 	 *           [t3,t2] = TD Collapse cycle override
 	 *             (00=system, 01=value 6, 10=value 7, 11=value 5)
@@ -1282,12 +1286,20 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 		flex->rx.fiw_num_transmissions = 1;
 		flex->rx.fiw_td_collapse = -1;
 
+		/* Low Traffic Flags (§3.6): one bit per phase.
+		 * t0=phase A, t1=phase B, t2=phase C, t3=phase D.
+		 * When set (1), the address field for that phase ends
+		 * within block 0 — pager may return to battery-save
+		 * mode early.  When clear (0), normal traffic. */
 		LOGP_CHAN(DDSP, LOGL_INFO,
 			  "RX: FIW decoded — cycle=%u frame=%u roaming=%u "
-			  "traffic=0x%X (low_traffic flags)\n",
+			  "low_traffic: A=%u B=%u C=%u D=%u\n",
 			  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 			  flex->rx.fiw_roaming,
-			  flex->rx.fiw_traffic);
+			  (flex->rx.fiw_traffic >> 0) & 1,
+			  (flex->rx.fiw_traffic >> 1) & 1,
+			  (flex->rx.fiw_traffic >> 2) & 1,
+			  (flex->rx.fiw_traffic >> 3) & 1);
 	}
 
 	return 0;
@@ -2327,12 +2339,21 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 			/* Address decode.
 			 *
-			 * First extract group/temporary flags from bit 20/19,
-			 * then classify the base address word.
-			 * Long address types (LA1-LA4) require a second word;
-			 * all other types are single-word addresses. */
+			 * Special addresses (Temporary, OperMsg, Network, etc.)
+			 * use the full 21-bit value — bits 20/19 are part of
+			 * the address, not group flags.  Check for special
+			 * addresses on the raw word FIRST.  For non-special
+			 * addresses, extract group/temporary flags from
+			 * bit 20/19, then classify the base word. */
 			aw_raw = ph->words[addr_idx];
-			aw_base = flex_decode_addr_flags(aw_raw, &addr_is_group, &addr_is_temp);
+			if (flex_addr_is_special(aw_raw)) {
+				/* Special address: use raw word directly */
+				aw_base = aw_raw;
+				addr_is_group = 0;
+				addr_is_temp = 0;
+			} else {
+				aw_base = flex_decode_addr_flags(aw_raw, &addr_is_group, &addr_is_temp);
+			}
 			aw_type = flex_classify_addr_word(aw_base);
 			grp_flag = flex_group_flag_char(addr_is_group, addr_is_temp);
 			is_long = flex_addr_is_long(aw_base);
@@ -2572,9 +2593,20 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							flex->rx.temp_addr_map[phase_idx][slot].active = 1;
 							cnt = 0;
 						}
-						if (cnt < FLEX_TEMP_GROUP_MAX_MEMBERS) {
-							flex->rx.temp_addr_map[phase_idx][slot].capcodes[cnt] = capcode;
-							flex->rx.temp_addr_map[phase_idx][slot].count = cnt + 1;
+						/* Deduplicate: skip if capcode already in this slot
+						 * (e.g. inverted polarity retransmission of same frame) */
+						{
+							int dup = 0, di;
+							for (di = 0; di < cnt; di++) {
+								if (flex->rx.temp_addr_map[phase_idx][slot].capcodes[di] == capcode) {
+									dup = 1;
+									break;
+								}
+							}
+							if (!dup && cnt < FLEX_TEMP_GROUP_MAX_MEMBERS) {
+								flex->rx.temp_addr_map[phase_idx][slot].capcodes[cnt] = capcode;
+								flex->rx.temp_addr_map[phase_idx][slot].count = cnt + 1;
+							}
 						}
 					}
 
@@ -2598,20 +2630,23 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  instr_data);
 				} else if (aw_type == FLEX_ADDR_OPER_MSG &&
 					   itype == FLEX_INSTR_TYPE_SYS_EVENT) {
-					/* System Event Notification via short instruction
-					 * on OperMsg address 0x1F781F.  Pre-alerts pagers
-					 * about upcoming changes within 4 cycles.
-					 * The 11-bit data field is infrastructure-defined. */
+					/* System Event Notification (Table 3.9.6-1, i=001).
+					 * Pre-alerts pagers about upcoming changes within
+					 * 4 cycles.  Event flags indicate what will change. */
+					uint32_t eflags = flex_sysevent_flags(instr_data);
+					char efbuf[128];
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  INS SysEvent pre-alert data=0x%04X (change within 4 cycles)\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  INS SysEvent flags=0x%03X [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name, capcode,
 						  FLEX_RX_FLAG_OPER_MSG,
-						  instr_data);
+						  eflags,
+						  flex_sysevent_format(eflags, efbuf, sizeof(efbuf)));
 				} else {
+					/* Reserved or unrecognized instruction type */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c%c%c INS type=%s data=0x%04X\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c%c%c INS %s(i=%u) data=0x%04X\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name, capcode,
@@ -2619,6 +2654,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  grp_flag,
 						  prio_flag,
 						  flex_instr_type_name(itype),
+						  itype,
 						  instr_data);
 				}
 				continue;
@@ -2700,7 +2736,10 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  flex_oper_msg_category_name(cat),
 						  hint);
 				}
-				continue;
+				/* Fall through to normal message decode below.
+				 * The OPR log above provides operator address context;
+				 * the message body is decoded by the standard
+				 * alpha/numeric/hex path like any other message. */
 			}
 
 			/* Info Service address (Spec Table 3.8.1-1, under study).
@@ -3275,6 +3314,16 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						flex_build_word_status(ph, ws_start, mw2,
 								      word_status, sizeof(word_status));
 					}
+
+					/* Registration Acknowledgment detection (§3.10.1.4-2).
+					 * Secure message (V=000) with t1t0=00 and opcode "="
+					 * (0x3D) in the 2nd word = Registration Ack. */
+					if (vec_type == FLEX_VECTOR_TYPE_SECURE &&
+					    sec_t == FLEX_SEC_TYPE_ALPHA &&
+					    ti >= 1 && text[0] == FLEX_SEC_REGACK_OPCODE) {
+						msg_tag = "SEC:REGACK";
+					}
+
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
 						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c%c %s \"%s\" {%s}\n",
 						  bitrate,
@@ -3500,10 +3549,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						    (ph->status[num_hdr_idx] == FLEX_WORD_CLEAN ||
 						     ph->status[num_hdr_idx] == FLEX_WORD_CORRECTED)) {
 							uint32_t nhdr = ph->words[num_hdr_idx];
-							/* bits 2-7 = N5-N0 (after K5K4 at bits 0-1) */
-							num_n = (nhdr >> 2) & 0x3F;
-							num_r = (nhdr >> 8) & 1;
-							num_s = (nhdr >> 9) & 1;
+							num_n = (nhdr >> FLEX_NUM_N_SHIFT) & FLEX_NUM_N_MASK;
+							num_r = (nhdr >> FLEX_NUM_R_SHIFT) & FLEX_NUM_R_MASK;
+							num_s = (nhdr >> FLEX_NUM_S_SHIFT) & FLEX_NUM_S_MASK;
 							LOGP_CHAN(DDSP, LOGL_DEBUG,
 								  "RX: Phase %c V=111 hdr[%d]=0x%05X: "
 								  "N=%d R=%d S=%d\n",
@@ -3642,7 +3690,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						if (body0_idx < FLEX_WORDS_PER_FRAME &&
 						    (ph->status[body0_idx] == FLEX_WORD_CLEAN ||
 						     ph->status[body0_idx] == FLEX_WORD_CORRECTED)) {
-							k54 = ph->words[body0_idx] & 0x3;
+							k54 = (ph->words[body0_idx] >> FLEX_NUM_K54_SHIFT) & FLEX_NUM_K54_MASK;
 						}
 						uint32_t rx_k = (k54 << 4) | vec_k30;
 
@@ -3652,7 +3700,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						if (is_long && body0_idx < FLEX_WORDS_PER_FRAME &&
 						    (ph->status[body0_idx] == FLEX_WORD_CLEAN ||
 						     ph->status[body0_idx] == FLEX_WORD_CORRECTED)) {
-							uint32_t dw = ph->words[body0_idx] & ~0x3U; /* zero K5K4 */
+							uint32_t dw = ph->words[body0_idx] & ~FLEX_NUM_K54_MASK; /* zero K5K4 */
 							k_sum += dw & 0xFF;
 							k_sum += (dw >> 8) & 0xFF;
 							k_sum += (dw >> 16) & 0x1F;
@@ -3666,7 +3714,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							}
 							dw = ph->words[w];
 							if (!is_long && w == mw1)
-								dw &= ~0x3U; /* zero K5K4 */
+								dw &= ~FLEX_NUM_K54_MASK; /* zero K5K4 */
 							k_sum += dw & 0xFF;
 							k_sum += (dw >> 8) & 0xFF;
 							k_sum += (dw >> 16) & 0x1F;
@@ -3749,29 +3797,135 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  num_tag);
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_TONE) {
-				/* Tone-only / Short message (Section 8.7).
-				 * Bits 9-15 of the vector word carry a 7-bit
-				 * short message index.  Index 0 = pure tone-only
-				 * alert; index 1-127 = predefined short message
-				 * stored in the pager's ID-ROM. */
+				/* Short Message Vector (§3.9.2, Table 3.9.2-1).
+				 *
+				 * t1t0 (bits 7-8) selects the short message type:
+				 *   00 = 3-digit BCD numeric (short addr, 1 vector word)
+				 *        or 8-digit BCD numeric (long addr, 2 vector words)
+				 *        or NID info for network addr
+				 *   01 = source codes
+				 *   10 = source codes + message number N + R flag
+				 *   11 = reserved
+				 *
+				 * For t=00 non-network: d0-d11 = 3 BCD digits (a,b,c).
+				 * Unused digits are space (0xC). */
 				uint32_t viw = ph->words[j];
-				uint32_t smsg_idx = (viw >> 9) & 0x7F;
-				if (smsg_idx == 0) {
-					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c TON\n",
-						  bitrate,
-						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  phase_name,
-						  flex->rx.sync_baud,
-						  flex->rx.sync_levels,
-						  flex->rx.polarity ? "neg" : "pos",
-						  capcode,
-						  flex_addr_type_flag(aw_type, is_long),
-						  grp_flag,
-						  prio_flag);
+				uint32_t t_field = (viw >> 7) & 0x03;
+				uint32_t d_field = (viw >> 9) & 0xFFF; /* 12 bits */
+
+				if (t_field == 0) {
+					/* t=00: BCD numeric.
+					 * Short addr: 3 digits from 1st vector word (d0-d11).
+					 * Long addr: 8 digits from 2 vector words
+					 *   (d0-d11 = digits a,b,c; d12-d31 = digits d,e,f,g,h;
+					 *    d32 = spare, set to 0). */
+					static const char bcd[] = FLEX_NUM_BCD_TABLE;
+					char digits[9]; /* max 8 digits + NUL */
+					int ndigits = 0;
+					uint8_t da = d_field & 0xF;
+					uint8_t db = (d_field >> 4) & 0xF;
+					uint8_t dc = (d_field >> 8) & 0xF;
+					digits[ndigits++] = bcd[da];
+					digits[ndigits++] = bcd[db];
+					digits[ndigits++] = bcd[dc];
+
+					if (is_long && j + 1 < FLEX_WORDS_PER_FRAME) {
+						/* 2nd vector word: d12-d31 = 5 more BCD digits */
+						uint32_t viw2 = ph->words[j + 1];
+						uint8_t dd = viw2 & 0xF;
+						uint8_t de = (viw2 >> 4) & 0xF;
+						uint8_t df = (viw2 >> 8) & 0xF;
+						uint8_t dg = (viw2 >> 12) & 0xF;
+						uint8_t dh = (viw2 >> 16) & 0xF;
+						digits[ndigits++] = bcd[dd];
+						digits[ndigits++] = bcd[de];
+						digits[ndigits++] = bcd[df];
+						digits[ndigits++] = bcd[dg];
+						digits[ndigits++] = bcd[dh];
+					}
+					digits[ndigits] = '\0';
+
+					/* All spaces = tone-only alert */
+					int all_space = 1;
+					{
+						int di;
+						for (di = 0; di < ndigits; di++) {
+							if (digits[di] != ' ') {
+								all_space = 0;
+								break;
+							}
+						}
+					}
+
+					if (all_space) {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG \"%*s\" (tone-only)\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name,
+							  flex->rx.sync_baud,
+							  flex->rx.sync_levels,
+							  flex->rx.polarity ? "neg" : "pos",
+							  capcode,
+							  flex_addr_type_flag(aw_type, is_long),
+							  grp_flag, prio_flag,
+							  ndigits, "        ");
+					} else {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG \"%s\"\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name,
+							  flex->rx.sync_baud,
+							  flex->rx.sync_levels,
+							  flex->rx.polarity ? "neg" : "pos",
+							  capcode,
+							  flex_addr_type_flag(aw_type, is_long),
+							  grp_flag, prio_flag,
+							  digits);
+					}
+				} else if (t_field == 1 || t_field == 2) {
+					/* t=01: Source codes S2S1S0 (0-7).
+					 * t=10: Source + message number N (0-63) + R flag. */
+					uint32_t src = d_field & FLEX_SMSG_SRC_MASK;
+
+					if (t_field == FLEX_SMSG_TYPE_SOURCE) {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG %s S=%u\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name,
+							  flex->rx.sync_baud,
+							  flex->rx.sync_levels,
+							  flex->rx.polarity ? "neg" : "pos",
+							  capcode,
+							  flex_addr_type_flag(aw_type, is_long),
+							  grp_flag, prio_flag,
+							  flex_smsg_type_name(t_field),
+							  src);
+					} else {
+						uint32_t n = (d_field >> FLEX_SMSG_NUMB_N_SHIFT)
+							   & FLEX_SMSG_NUMB_N_MASK;
+						uint32_t r = (d_field >> FLEX_SMSG_NUMB_R_SHIFT)
+							   & FLEX_SMSG_NUMB_R_MASK;
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG %s S=%u N=%u R=%u\n",
+							  bitrate,
+							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+							  phase_name,
+							  flex->rx.sync_baud,
+							  flex->rx.sync_levels,
+							  flex->rx.polarity ? "neg" : "pos",
+							  capcode,
+							  flex_addr_type_flag(aw_type, is_long),
+							  grp_flag, prio_flag,
+							  flex_smsg_type_name(t_field),
+							  src, n, r);
+					}
 				} else {
+					/* t=11: reserved sub-type */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG idx=%u\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG reserved (t=%u d=0x%03X)\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3780,9 +3934,8 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  flex->rx.polarity ? "neg" : "pos",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
-						  grp_flag,
-						  prio_flag,
-						  smsg_idx);
+						  grp_flag, prio_flag,
+						  t_field, d_field);
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_HEX_BINARY) {
 				/* HEX/Binary message (Spec §3.10.1.2).
