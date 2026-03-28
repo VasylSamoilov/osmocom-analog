@@ -3109,7 +3109,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 		if (params->local_id || params->coverage_id)
 			extra++;
-		if (params->country_code || params->tmf)
+		if ((params->country_code || params->tmf) && params->frame <= 3)
 			extra++;
 		if (params->biw_time)
 			extra += 2; /* Date + Time */
@@ -3284,9 +3284,26 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	 * word itself — no vectors or MF content — so the restriction
 	 * does not apply to timezone-only frames.
 	 *
-	 * TODO: When system message TX via A=0000~0011 or Operator
-	 * Messaging is implemented, add enforcement here:
-	 *   if (has_sysmsg_content) skip tone-only packing. */
+	 * Tone-only exclusion is enforced in the scheduler
+	 * (flex.c candidate collection, has_sysmsg_content flag).
+	 *
+	 * TODO §3.9.2 method (a): BIW101 A=0000~0011 as implicit
+	 * address — emit BIW101 in BIW field, place system message
+	 * vector at END of vector field (not normal position), body
+	 * in MF, R=0.  For fragmented system messages, BIW101 must
+	 * be re-stated in each fragment's frame.  Requires frame
+	 * layout changes in flex_encode_frame_multi().
+	 *
+	 * TODO §3.9.2 method (b): BIW101 + Operator Messaging
+	 * Address together — when both BIW101 and an Operator
+	 * Messaging Address target the same audience, emit both.
+	 * BIW in BIW field, operator address in AF, operator
+	 * vector in VF, message in MF.
+	 *
+	 * TODO §3.9.2 NID: Network Address must appear twice
+	 * consecutively in AF within frames 0-7.  First defines
+	 * NID, second initiates associated system message.  Short
+	 * Message Vectors not allowed for NID system messages. */
 	{
 		int tone_addr_words = 0;
 		for (i = 0; i < (uint32_t)n_tone; i++) {
@@ -3337,8 +3354,10 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			     params->local_id, params->coverage_id);
 		}
 
-		/* SSID2 (type 111) */
-		if (slots_left > 0 && (params->country_code || params->tmf)) {
+		/* SSID2 (type 111) — per §6.1.1.3, SSID2 must be
+		 * transmitted in frames 0 through 3 only. */
+		if (slots_left > 0 && (params->country_code || params->tmf) &&
+		    params->frame <= 3) {
 			const char *cname = flex_mcc_name(params->country_code);
 			frame_words[fwc++] = flex_create_biw_ssid2(
 				params->country_code,
@@ -3351,7 +3370,18 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			     params->tmf);
 		}
 
-		/* Date + Time (types 001, 010) */
+		/* Date + Time (types 001, 010)
+		 *
+		 * TODO §6.1.1.3 Note 1: Time-related BIW rotation.
+		 * In multi-phase modes, T1(Date/001), T2(Time/010),
+		 * and T3(SysInfo-Time/101) must rotate across phases
+		 * in Cycle 0, Frame 0.  At 6400bps (4 phases):
+		 *   Cycle N frame 0: a→T(1+N%3), b→T(2+N%3), etc.
+		 * At 3200bps (2 phases): similar with 2-phase mapping.
+		 * At 1600bps: all time BIWs in phase A, >2 allowed
+		 * if BIW slots are available.
+		 * Currently all time BIWs go in every phase — correct
+		 * for 1600bps but over-emits for multi-phase modes. */
 		if (params->biw_time) {
 			time_t now = time(NULL);
 			struct tm tm_now;
@@ -3434,8 +3464,12 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			     flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
 		}
 
-		/* Channel Setup (A-type 0x06) */
-		if (slots_left > 0 && params->chan_setup_enabled) {
+		/* Channel Setup (A-type 0x06).
+		 * Per §6.1.1.3 Note 3: "When Frame Offset is supported,
+		 * BIW101 must be transmitted in Frame 3 at minimum."
+		 * Emit in frames 0-3 following the dotted-box pattern. */
+		if (slots_left > 0 && params->chan_setup_enabled &&
+		    params->frame <= 3) {
 			uint32_t info = 0;
 			/* Frame offset: derived from collapse and current frame number */
 			uint32_t frame_ofs = params->collapse > 0

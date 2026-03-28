@@ -859,6 +859,25 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 	}
 }
 
+/* Compute which phase should carry SSID1 for a given frame (§6.1.1.3).
+ *
+ * 6400bps/4-phase: SSID1 rotates A→B→C→D per frame (frame % 4).
+ * 3200bps/2-phase: phases a,b → phase A; phases c,d → phase C.
+ *   So frame%4 in {0,1} → phase 0 (A), frame%4 in {2,3} → phase 1 (C).
+ * 1600bps/1-phase: always phase 0 (A).
+ *
+ * Returns the phase index (0-based) that should carry SSID1.
+ * SSID2 follows the same rotation pattern per §6.1.1.3 rule (3). */
+static int flex_ssid_phase(uint32_t frame, int num_phases)
+{
+	int slot = (int)(frame % 4);
+	switch (num_phases) {
+	case 4:  return slot;			/* A=0, B=1, C=2, D=3 */
+	case 2:  return (slot < 2) ? 0 : 1;	/* A=0 for 0,1; C=1 for 2,3 */
+	default: return 0;			/* single phase */
+	}
+}
+
 /* Compute BIW word count from frame params.
  * Returns 1–4 (BIW1 + up to 3 extra BIW words).
  *
@@ -871,14 +890,14 @@ static int flex_compute_biw_count(const flex_frame_params_t *params)
 
 	if (params->local_id || params->coverage_id)
 		extra++;
-	if (params->country_code || params->tmf)
+	if ((params->country_code || params->tmf) && params->frame <= 3)
 		extra++;
 	if (params->biw_time)
 		extra += 2; /* Date + Time */
 	if (params->timezone_code >= 0 &&
 	    params->timezone_code < (int)FLEX_TZ_ENTRIES)
 		extra++;
-	if (params->chan_setup_enabled)
+	if (params->chan_setup_enabled && params->frame <= 3)
 		extra++;
 	if (extra > 3)
 		extra = 3;
@@ -1411,11 +1430,31 @@ static int flex_get_next_frame_network(flex_t *flex)
 			capacity = FLEX_WORDS_PER_FRAME - biw_count;
 
 		/* Determine if tone-only messages are excluded.
-		 * Tone-only cannot appear in frames with system message content
-		 * (BIW101 A=0000-0011 or Operator Messaging Address vectors).
-		 * Currently only timezone BIW (A=0100) is implemented, which
-		 * does NOT exclude tone-only. */
-		int has_sysmsg_content = 0; /* TODO: set when A=0000-0011 implemented */
+		 * Per spec §3.9.2: "Tone-Only Addresses cannot be
+		 * transmitted in Frames used for transmitting System
+		 * Messages."  This applies when the frame contains
+		 * system message content — i.e., an Operator Messaging
+		 * Address or Network Address with a message body.
+		 * Timezone-only BIW (A=0100) does NOT exclude tone-only
+		 * since it carries data only in the I-field, not in MF. */
+		int has_sysmsg_content = 0;
+		{
+			flex_msg_t *scan;
+			for (scan = flex->msg_list; scan; scan = scan->next) {
+				enum flex_addr_type stype;
+				if (scan->speed != params.bitrate ||
+				    scan->modulation_type != params.modulation_type)
+					continue;
+				if (!frame_is_eligible(scan->next_send_frame, current_abs))
+					continue;
+				stype = flex_capcode_special_type(scan->capcode);
+				if (stype == FLEX_ADDR_OPER_MSG ||
+				    stype == FLEX_ADDR_NETWORK) {
+					has_sysmsg_content = 1;
+					break;
+				}
+			}
+		}
 
 		/* Co-packing (§4.2.3, Req 20.1-20.5):
 		 *
@@ -1465,6 +1504,40 @@ static int flex_get_next_frame_network(flex_t *flex)
 								       flex->collapse);
 					if (nf != ft.frame)
 						continue;
+				}
+
+				/* System message frame 0 preference (§3.9.2).
+				 *
+				 * "A System Message must be initiated in Frame 0
+				 * when a BIW position is open for System Messaging.
+				 * If a BIW position in Frame 0 is not available,
+				 * the first Frame transmitted after Frame 0 which
+				 * has an available BIW position is to be used."
+				 *
+				 * Skip system messages (Operator Messaging and
+				 * Network addresses) in non-frame-0 frames, unless
+				 * the message has been waiting for more than one
+				 * full cycle (128 frames) — safety valve to prevent
+				 * starvation if frame 0 is perpetually full. */
+				{
+					enum flex_addr_type stype =
+						flex_capcode_special_type(candidate->capcode);
+					if ((stype == FLEX_ADDR_OPER_MSG ||
+					     stype == FLEX_ADDR_NETWORK) &&
+					    ft.frame != 0) {
+						int32_t wait = (int32_t)current_abs
+							     - (int32_t)candidate->next_send_frame;
+						if (wait < 0)
+							wait += 1920;
+						if (wait < 128)
+							continue; /* defer to frame 0 */
+						LOGP(DFLEX, LOGL_INFO,
+						     "Scheduler: sysmsg capcode=%" PRIu64
+						     " waited %d frames, allowing non-F0"
+						     " frame %u (§3.9.2 fallback)\n",
+						     candidate->capcode, wait,
+						     ft.frame);
+					}
 				}
 
 				/* Pass filter */
@@ -1688,6 +1761,18 @@ static int flex_get_next_frame_network(flex_t *flex)
 				continue;
 			}
 
+			/* Per-phase SSID placement (§6.1.1.3).
+			 * SSID1/SSID2 rotate across phases per frame.
+			 * Clear SSID fields for phases that shouldn't
+			 * carry them this frame. */
+			{
+				int ssid_p = flex_ssid_phase(ft.frame, num_phases);
+				phase_params.local_id = (p == ssid_p) ? params.local_id : 0;
+				phase_params.coverage_id = (p == ssid_p) ? params.coverage_id : 0;
+				phase_params.country_code = (p == ssid_p) ? params.country_code : 0;
+				phase_params.tmf = (p == ssid_p) ? params.tmf : 0;
+			}
+
 			/* Build flex_frame_msg_t array for this phase.
 			 * Same field copying and R/N assignment as single-phase
 			 * (task 4.2, Req 8.1-8.3). */
@@ -1731,9 +1816,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 							else
 								m->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
 							fm->sequence_num = m->assigned_n;
-							fm->alpha_r_flag = 1;
-							fm->hex_r_flag = 1;
-							fm->numbered_r = 1;
+							/* R=1 for normal initial TX.
+							 * R=0 when msg->numbered_r is explicitly 0
+							 * (system messages per spec §3.9.2). */
+							fm->alpha_r_flag = m->numbered_r ? 1 : 0;
+							fm->hex_r_flag = m->numbered_r ? 1 : 0;
+							fm->numbered_r = m->numbered_r ? 1 : 0;
 							if (m->retransmit_max > 0) {
 								LOGP(DFLEX, LOGL_INFO,
 								     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
@@ -1908,15 +1996,16 @@ static int flex_get_next_frame_network(flex_t *flex)
 			{
 				int is_retransmission = (m->assigned_n >= 0);
 				if (!is_retransmission) {
-					/* Initial transmission: assign fresh N, set R=1 */
+					/* Initial transmission: assign fresh N, set R=1
+					 * (or R=0 for system messages per §3.9.2). */
 					if (m->total_fragments > 1)
 						m->assigned_n = (int)m->retrieval_num;
 					else
 						m->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
 					fm->sequence_num = m->assigned_n;
-					fm->alpha_r_flag = 1;
-					fm->hex_r_flag = 1;
-					fm->numbered_r = 1;
+					fm->alpha_r_flag = m->numbered_r ? 1 : 0;
+					fm->hex_r_flag = m->numbered_r ? 1 : 0;
+					fm->numbered_r = m->numbered_r ? 1 : 0;
 					if (m->retransmit_max > 0) {
 						LOGP(DFLEX, LOGL_INFO,
 						     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",

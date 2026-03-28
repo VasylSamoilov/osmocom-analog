@@ -2890,6 +2890,17 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					} else if (hdr_f == 3) {
 						hdr_r = (hdr & FLEX_ALPHA_HDR_R_MASK) >> FLEX_ALPHA_HDR_R_SHIFT;
 						hdr_m = (hdr & FLEX_ALPHA_HDR_M_MASK) >> FLEX_ALPHA_HDR_M_SHIFT;
+						/* Per spec §3.9.2: R must be 0 for system
+						 * messages (Operator Messaging, Network).
+						 * Warn if a transmitter violates this. */
+						if (hdr_r == 1 &&
+						    (aw_type == FLEX_ADDR_OPER_MSG ||
+						     aw_type == FLEX_ADDR_NETWORK))
+							LOGP_CHAN(DDSP, LOGL_NOTICE,
+								  "RX: Phase %c cap=%" PRIu64
+								  " system message with R=1"
+								  " (spec requires R=0)\n",
+								  phase_name, capcode);
 						LOGP_CHAN(DDSP, LOGL_DEBUG,
 							  "RX: Phase %c alpha hdr[%d]=0x%05X: "
 							  "K=0x%03X C=%d F=%d "

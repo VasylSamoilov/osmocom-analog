@@ -1561,8 +1561,14 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->modulation_type = FLEX_MOD_2FSK;
 				msg->polarity = -1.0;
 				msg->priority = 1; /* system messages are priority */
+				/* Per spec §3.9.2: "The Message Retrieval Flag
+				 * (R bit) must be set to zero for BIW System
+				 * Messages" and "for NID System Messages."
+				 * R=0 tells pagers to skip message number
+				 * sequence checking for system messages. */
+				msg->numbered_r = 0;
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: sysmsg enqueued LSB=%d (%s) capcode=%" PRIu64 " len=%d\n",
+				     "FIFO: sysmsg enqueued LSB=%d (%s) capcode=%" PRIu64 " len=%d R=0\n",
 				     lsb, flex_oper_msg_subtype_name((uint32_t)(FLEX_ADDR_OPER_MSG_MIN + lsb)),
 				     oper_capcode, message_length);
 			}
