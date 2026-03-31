@@ -1643,6 +1643,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 	params.timezone_code = flex->timezone_code;
 
+	/* When biw_time forces SSID1 emission, also enable
+	 * roaming so pagers recognize the SSID1 word. */
+	if (params.biw_time && !params.roaming)
+		params.roaming = 1;
+
 	/* === Multi-message candidate collection ===
 	 * Collect multiple eligible messages into a candidate list,
 	 * ordered by priority class and deadline.
@@ -2021,6 +2026,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 				flex_fill_idle_phase(phases[p].words, p,
 						     params.modulation_type,
 						     params.bitrate);
+				{
+					int blk;
+					for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
+						flex_interleave_block(blk, phases[p].words);
+				}
 				phases[p].word_count = FLEX_WORDS_PER_FRAME;
 				continue;
 			}
@@ -2123,6 +2133,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 					flex_fill_idle_phase(phases[p].words, p,
 							     params.modulation_type,
 							     params.bitrate);
+					{
+						int blk;
+						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
+							flex_interleave_block(blk, phases[p].words);
+					}
 					phases[p].word_count = FLEX_WORDS_PER_FRAME;
 					error = 0; /* reset for next phase */
 					continue;
@@ -2171,6 +2186,16 @@ static int flex_get_next_frame_network(flex_t *flex)
 					flex_fill_idle_phase(phases[p].words, p,
 							     params.modulation_type,
 							     params.bitrate);
+					/* Block-interleave the idle phase.
+					 * The phase interleaver expects all
+					 * phases to be block-interleaved;
+					 * without this, the receiver's
+					 * de-interleave produces garbage. */
+					{
+						int blk;
+						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
+							flex_interleave_block(blk, phases[p].words);
+					}
 					phases[p].word_count = FLEX_WORDS_PER_FRAME;
 				}
 			}
@@ -2679,12 +2704,18 @@ int flex_get_next_frame(flex_t *flex)
 			if (flex->ssid || flex->nid) {
 				params.local_id = flex->ssid;
 				params.coverage_id = flex->nid;
+				params.roaming = 1;
 			}
 			if (flex->country_code || flex->tmf) {
 				params.country_code = flex->country_code;
 				params.tmf = flex->tmf;
 			}
 			params.timezone_code = flex->timezone_code;
+
+			/* When biw_time forces SSID1 emission, also enable
+			 * roaming so pagers recognize the SSID1 word. */
+			if (params.biw_time && !params.roaming)
+				params.roaming = 1;
 
 			/* Set sysmsg_a_type for methods (a)/(b) (§3.9.2).
 			 * Detect operator messaging address with LSB 0-3

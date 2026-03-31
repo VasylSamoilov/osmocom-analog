@@ -2067,15 +2067,11 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				case FLEX_BIW_TYPE_SSID1: {
 					uint32_t cov = (bword >> FLEX_BIW_SSID1_COVERAGE_SHIFT) & FLEX_BIW_SSID1_COVERAGE_MASK;
 					uint32_t lid = (bword >> FLEX_BIW_SSID1_LOCALID_SHIFT) & FLEX_BIW_SSID1_LOCALID_MASK;
-					int changed = !flex->rx.biw[pol].seen ||
-						      flex->rx.biw[pol].local_id != lid ||
-						      flex->rx.biw[pol].coverage != cov;
-					LOGP_CHAN(DDSP, changed ? LOGL_NOTICE : LOGL_DEBUG,
-						  "RX: %dbps C%u/F%u phase=%c BIW SSID1 local_id=%u coverage=%u%s\n",
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps C%u/F%u phase=%c BIW SSID1 LID=%u CZ=%u\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  phase_name, lid, cov,
-						  changed ? "" : " (unchanged)");
+						  phase_name, lid, cov);
 					flex->rx.biw[pol].local_id = lid;
 					flex->rx.biw[pol].coverage = cov;
 					flex->rx.biw[pol].seen = 1;
@@ -2241,17 +2237,13 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					uint32_t tmf     = (bword >> FLEX_BIW_SSID2_TMF_SHIFT) & FLEX_BIW_SSID2_TMF_MASK;
 					uint32_t country = (bword >> FLEX_BIW_SSID2_COUNTRY_SHIFT) & FLEX_BIW_SSID2_COUNTRY_MASK;
 					const char *cname = flex_mcc_name(country);
-					int changed = !flex->rx.biw[pol].seen_ssid2 ||
-						      flex->rx.biw[pol].country != country ||
-						      flex->rx.biw[pol].tmf != tmf;
-					LOGP_CHAN(DDSP, changed ? LOGL_NOTICE : LOGL_DEBUG,
-						  "RX: %dbps C%u/F%u phase=%c BIW SSID2 country=%u (%s) tmf=0x%X%s\n",
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps C%u/F%u phase=%c BIW SSID2 CC=%u (%s) TMF=0x%X\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name, country,
 						  cname ? cname : "unknown",
-						  tmf,
-						  changed ? "" : " (unchanged)");
+						  tmf);
 					flex->rx.biw[pol].country = country;
 					flex->rx.biw[pol].tmf = tmf;
 					flex->rx.biw[pol].seen_ssid2 = 1;

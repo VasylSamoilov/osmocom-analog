@@ -402,14 +402,14 @@ static inline const char *flex_smsg_type_name(uint32_t t)
  *   bits 7-20:  data field (s0-s13) — content depends on type
  *
  * Type values:
- *   000 = SSID1 (local channel ID, coverage zone)
+ *   000 = SSID1 — Simulcast System ID 1 (LID, Coverage Zone)
  *   001 = Date (month/day/year)
  *   010 = Time (second/minute/hour)
  *   011 = Reserved
  *   100 = Reserved
  *   101 = System Information (timezone, system messages)
  *   110 = Reserved
- *   111 = SSID2 (country code, traffic management flags)
+ *   111 = SSID2 — Simulcast System ID 2 (Country Code, TMF)
  */
 #define FLEX_BIW_TYPE_SHIFT	4
 #define FLEX_BIW_TYPE_MASK	0x07
@@ -420,25 +420,30 @@ static inline const char *flex_smsg_type_name(uint32_t t)
 #define FLEX_BIW_TYPE_SYSINFO	0x05	/* 101: system information */
 #define FLEX_BIW_TYPE_SSID2	0x07	/* 111: SSID2 (country code, TMF) */
 
-/* ===== BIW Type 000: SSID1 =====
+/* ===== BIW Type 000: SSID1 (Simulcast System ID) =====
  *
- * Local channel ID and coverage zone.
- * Per PDW: "SSID/Local ID's (i8-i0)(512) & Coverage Zones (c4-c0)(32)"
+ * SSID1 (BIW000) — 1st Simulcast System ID word (§6.1.1, Table 6.1.1-1).
  *
- *   bits 7-11:  coverage zone (c4-c0, 5 bits, 0-31)
- *   bits 12-20: local ID (i8-i0, 9 bits, 0-511)
+ * Local channel ID (LID) and Coverage Zone (CZ).
  *
- * LID with Coverage Zone, Country Code and Traffic Management Flag
- * defines a specific simulcast coverage area.
+ *   bits 4-6:   type = 000
+ *   bits 7-11:  CZ — Coverage Zone (5 bits, 0-31)
+ *               32 systems can be assigned per LID.
+ *   bits 12-20: LID — Local channel ID (9 bits, 0-511)
+ *               Assigned so as not to be duplicated by multiple
+ *               operators across all frequencies.
+ *               Up to 16,384 systems can be identified.
  *
- * Spec requirements:
- * - On RF channels supporting SSID Roaming, BIW 000 (SSID1) must be
- *   transmitted in every Frame.
+ * Together with SSID2 (Country Code + TMF), the full SSID
+ * identifies a specific simulcast coverage area.
+ *
+ * Per §6.1.1: "On RF channels supporting SSID Roaming,
+ * BIW 000 (SSID1) must be transmitted in every Frame."
  */
 #define FLEX_BIW_SSID1_COVERAGE_SHIFT	7
-#define FLEX_BIW_SSID1_COVERAGE_MASK	0x1F	/* 5 bits */
+#define FLEX_BIW_SSID1_COVERAGE_MASK	0x1F	/* CZ: 5 bits, 32 zones per LID */
 #define FLEX_BIW_SSID1_LOCALID_SHIFT	12
-#define FLEX_BIW_SSID1_LOCALID_MASK	0x01FF	/* 9 bits */
+#define FLEX_BIW_SSID1_LOCALID_MASK	0x01FF	/* LID: 9 bits, 512 IDs */
 
 /* Time Zone conversion table.
  * Index = 5-bit zone area code (Z4..Z0), value = offset from UTC in minutes.
@@ -716,33 +721,31 @@ static inline int flex_tz_auto_detect(void)
 #define FLEX_BIW_SYSINFO_NID_BIT	 8	/* I8: N0 NID System Message Bit */
 #define FLEX_BIW_SYSINFO_SYSMSG_BIT	 9	/* I9: B0 System Message Bit */
 
-/* ===== BIW Type 111: SSID2 =====
+/* ===== BIW Type 111: SSID2 (Simulcast System ID) =====
  *
- * Country code and traffic management flags.
- *   bits 7-10:  traffic management flags (T3-T0, 4 bits)
- *   bits 11-20: country code (c9-c0, 10 bits, ITU-T E.212 Annex A)
+ * SSID2 (BIW111) — 2nd Simulcast System ID word (§6.1.1, Table 6.1.1-1).
  *
- * Country Codes comply with CCITT (ITU-T) E.212 Annex A.
- * Japan's Country Code is "440".
+ * Country Code (CC) and Traffic Management Flag (TMF).
  *
- * The 4 Traffic Management Flags indicate which of the four traffic
- * groups the channel is assigned to.  After a roaming pager detects
- * a channel with matching LID, Coverage Zone, and Country Code, the
- * pager checks which of the 4 flags corresponds to its group.  When
- * more than 1 flag is set to 0, the pager searches for other channels
- * with the same LID/Coverage/Country that have its flag set to 1.
+ *   bits 4-6:   type = 111
+ *   bits 7-10:  TMF — Traffic Management Flag (4 bits)
+ *               Identifies 4 channels for the same SSID1
+ *               and Country Code. Enables making traffic uniform
+ *               for a max of 4 radio channels within the same
+ *               unit area.
+ *   bits 11-20: CC — Country Code (10 bits, ITU-T E.212)
+ *               Indicates the ITU-T Country Code.
+ *               Example: 440 (0x1B8) for Japan.
  *
- * Spec requirements:
- * - On RF channels supporting SSID Roaming, BIW 000 (SSID1) must be
- *   transmitted in every Frame; BIW 111 (SSID2) must be transmitted
- *   in Frame 0 through Frame 3.
- * - If channels are shared or mixed on one channel ("channel mixing"),
- *   transmission of Frame 0 through Frame 3 must not be blocked.
+ * Per §6.1.1: "On RF channels supporting SSID Roaming,
+ * BIW 111 (SSID2) must be transmitted in Frame 0 through Frame 3."
+ * "If channels are shared or mixed on one channel, transmission
+ * of Frame 0 through Frame 3 must not be blocked."
  */
 #define FLEX_BIW_SSID2_TMF_SHIFT	7
-#define FLEX_BIW_SSID2_TMF_MASK		0x0F
+#define FLEX_BIW_SSID2_TMF_MASK		0x0F	/* TMF: 4 bits, 4 channels */
 #define FLEX_BIW_SSID2_COUNTRY_SHIFT	11
-#define FLEX_BIW_SSID2_COUNTRY_MASK	0x03FF	/* 10 bits */
+#define FLEX_BIW_SSID2_COUNTRY_MASK	0x03FF	/* CC: 10 bits, ITU-T E.212 */
 
 /* ===== ITU-T E.212 Mobile Country Code (MCC) Lookup =====
  * Shared table in libmobile/mcc.h, aliased here for FLEX API compat. */
@@ -2044,10 +2047,10 @@ typedef struct flex_frame_params {
 	int		collapse;		/* BIW1 collapse value (0-7) */
 	int		carry_on;		/* BIW1 carry-on (0-3 frames) */
 	int		biw_time;		/* include BIW3/BIW4 time broadcast */
-	uint32_t	local_id;		/* BIW2 local ID (9 bits, 0-511) */
-	uint32_t	coverage_id;		/* BIW2 coverage zone (5 bits, 0-31) */
-	uint32_t	country_code;		/* SSID2 country code (10 bits, ITU-T E.212) */
-	uint32_t	tmf;			/* SSID2 traffic management flags (4 bits) */
+	uint32_t	local_id;		/* SSID1 LID — Local channel ID (9 bits, 0-511) */
+	uint32_t	coverage_id;		/* SSID1 CZ — Coverage Zone (5 bits, 0-31) */
+	uint32_t	country_code;		/* SSID2 CC — Country Code (10 bits, ITU-T E.212) */
+	uint32_t	tmf;			/* SSID2 TMF — Traffic Management Flag (4 bits) */
 	int		timezone_code;		/* SysInfo timezone zone code (0-31, -1=none) */
 	int		bitrate;		/* bit rate: 1600, 3200, or 6400 (bps, not baud) */
 	int		modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */

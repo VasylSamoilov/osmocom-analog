@@ -3162,7 +3162,11 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	{
 		int extra = 0;
 
-		if (params->local_id || params->coverage_id)
+		/* SSID1 (BIW000): always emit when biw_time is enabled.
+		 * Per §3.7.2: when time-related BIWs are transmitted,
+		 * pagers expect SSID1 to be present in the frame.
+		 * Default to LID=0, CZ=1 if not explicitly configured. */
+		if (params->local_id || params->coverage_id || params->biw_time)
 			extra++;
 		if ((params->country_code || params->tmf) && params->frame <= 3)
 			extra++;
@@ -3489,16 +3493,22 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	 * each word by its type field, so order doesn't matter. */
 	{
 		int slots_left = biw_count - 1; /* extra slots available */
+		time_t biw_now = 0;
+		struct tm biw_tm;
+		int biw_tm_valid = 0;
 
-		/* SSID1 (type 000) */
-		if (slots_left > 0 && (params->local_id || params->coverage_id)) {
+		/* SSID1 (type 000) — emit when SSID is configured, or when
+		 * biw_time is enabled (pagers expect SSID1 present alongside
+		 * time-related BIWs per §3.7.2).  Default CZ=1 if not set. */
+		if (slots_left > 0 && (params->local_id || params->coverage_id || params->biw_time)) {
+			uint32_t cz = params->coverage_id ? params->coverage_id : 1;
 			frame_words[fwc++] = flex_create_biw2(
 				params->local_id,
-				params->coverage_id);
+				cz);
 			slots_left--;
 			LOGP(DFLEX, LOGL_INFO,
 			     "TX: BIW SSID1 local_id=%u coverage=%u\n",
-			     params->local_id, params->coverage_id);
+			     params->local_id, cz);
 		}
 
 		/* SSID2 (type 111) — per §6.1.1.3, SSID2 must be
@@ -3529,53 +3539,48 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		 * if BIW slots are available.
 		 * Currently all time BIWs go in every phase — correct
 		 * for 1600bps but over-emits for multi-phase modes. */
-		if (params->biw_time) {
-			time_t now = time(NULL);
-			struct tm tm_now;
-
-			/* Use local time when timezone is configured,
-			 * UTC otherwise.  Spec says "Standard time in
-			 * each region" — i.e. local time. */
+		/* Capture current time once for all time-related BIWs.
+		 * Used by Date (BIW3), Time (BIW4), and SysInfo timezone. */
+		if (params->biw_time || (params->timezone_code >= 0 &&
+					 params->timezone_code < (int)FLEX_TZ_ENTRIES)) {
+			biw_now = time(NULL);
 			if (params->timezone_code >= 0)
-				localtime_r(&now, &tm_now);
+				localtime_r(&biw_now, &biw_tm);
 			else
-				gmtime_r(&now, &tm_now);
+				gmtime_r(&biw_now, &biw_tm);
+			biw_tm_valid = 1;
+		}
 
+		if (params->biw_time && biw_tm_valid) {
 			if (slots_left > 0) {
-				/* Year field: standard range 0-31 (1994-2025).
-				 * For years >2025, find a calendar-equivalent
-				 * year in range (same leap status + same Jan 1
-				 * weekday) so pagers display correct day-of-week
-				 * and Feb 29 behavior. */
-				int real_year = tm_now.tm_year + 1900;
+				int real_year = biw_tm.tm_year + 1900;
 				int equiv = flex_biw_equiv_year(real_year);
 				uint32_t year_field = (uint32_t)(equiv - FLEX_BIW_DATE_YEAR_BASE);
 				frame_words[fwc++] = flex_create_biw3(
 					year_field,
-					(uint32_t)(tm_now.tm_mon + 1),
-					(uint32_t)tm_now.tm_mday);
+					(uint32_t)(biw_tm.tm_mon + 1),
+					(uint32_t)biw_tm.tm_mday);
 				slots_left--;
 				LOGP(DFLEX, LOGL_INFO,
 				     "TX: BIW DATE %04d-%02d-%02d (year field=%u%s)\n",
 				     real_year,
-				     tm_now.tm_mon + 1,
-				     tm_now.tm_mday,
+				     biw_tm.tm_mon + 1,
+				     biw_tm.tm_mday,
 				     year_field,
 				     (equiv != real_year) ? " equiv" : "");
 			}
 			if (slots_left > 0) {
-				/* Convert seconds to 7.5s steps (0-7) */
-				uint32_t sec_step = (uint32_t)(tm_now.tm_sec / 7.5);
+				uint32_t sec_step = (uint32_t)(biw_tm.tm_sec / 7.5);
 				if (sec_step > 7) sec_step = 7;
 				frame_words[fwc++] = flex_create_biw4(
-					(uint32_t)tm_now.tm_hour,
-					(uint32_t)tm_now.tm_min,
+					(uint32_t)biw_tm.tm_hour,
+					(uint32_t)biw_tm.tm_min,
 					sec_step);
 				slots_left--;
 				LOGP(DFLEX, LOGL_INFO,
 				     "TX: BIW TIME %02d:%02d:%04.1f\n",
-				     tm_now.tm_hour,
-				     tm_now.tm_min,
+				     biw_tm.tm_hour,
+				     biw_tm.tm_min,
 				     sec_step * FLEX_BIW_TIME_SECOND_STEP);
 			}
 		}
@@ -3610,9 +3615,27 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			   params->timezone_code < (int)FLEX_TZ_ENTRIES) {
 			int tz_min = flex_tz_to_minutes((uint32_t)params->timezone_code);
 			char tzbuf[20];
+			uint32_t tz_info = (uint32_t)params->timezone_code & FLEX_BIW_SYSINFO_TZ_MASK;
+
+			/* DST flag (L0): auto-detect from system time.
+			 * Spec: L0=0 means DST active, L0=1 means standard time. */
+			if (biw_tm_valid) {
+				if (biw_tm.tm_isdst <= 0)
+					tz_info |= (1U << FLEX_BIW_SYSINFO_DST_SHIFT);
+				/* Extended seconds (S5-S3): fine sub-step within
+				 * the 7.5s coarse step from BIW4.
+				 * 6-bit combined = floor(sec / 0.9375).
+				 * S2-S0 (BIW4) = combined >> 3 (coarse 7.5s).
+				 * S5-S3 (here) = combined & 7 (fine 0.9375s). */
+				{
+					uint32_t combined = (uint32_t)(biw_tm.tm_sec / 0.9375);
+					if (combined > 63) combined = 63;
+					tz_info |= ((combined & 7) << FLEX_BIW_SYSINFO_EXTSEC_SHIFT);
+				}
+			}
+
 			frame_words[fwc++] = flex_create_biw_sysinfo(
-				FLEX_BIW_SYSINFO_A_TIME,
-				(uint32_t)params->timezone_code & FLEX_BIW_SYSINFO_TZ_MASK);
+				FLEX_BIW_SYSINFO_A_TIME, tz_info);
 			slots_left--;
 			LOGP(DFLEX, LOGL_INFO,
 			     "TX: BIW SYSINFO timezone zone=%d (%s)\n",
