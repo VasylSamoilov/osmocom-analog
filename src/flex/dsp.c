@@ -493,7 +493,7 @@ again:
 			 * signal naturally. */
 			if (!flex->network_mode &&
 			    !flex->msg_list &&
-			    flex->idle_count >= 2 &&
+			    flex->idle_count >= 4 &&
 			    flex->scan_from >= flex->scan_to &&
 			    !flex->sender.loopback) {
 				int guard = (int)(flex->fsk_bitduration + 1.0);

@@ -3162,11 +3162,8 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	{
 		int extra = 0;
 
-		/* SSID1 (BIW000): always emit when biw_time is enabled.
-		 * Per §3.7.2: when time-related BIWs are transmitted,
-		 * pagers expect SSID1 to be present in the frame.
-		 * Default to LID=0, CZ=1 if not explicitly configured. */
-		if (params->local_id || params->coverage_id || params->biw_time)
+		/* SSID1 (BIW000): emit when --ssid or --nid configured. */
+		if (params->local_id || params->coverage_id)
 			extra++;
 		if ((params->country_code || params->tmf) && params->frame <= 3)
 			extra++;
@@ -3497,18 +3494,15 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		struct tm biw_tm;
 		int biw_tm_valid = 0;
 
-		/* SSID1 (type 000) — emit when SSID is configured, or when
-		 * biw_time is enabled (pagers expect SSID1 present alongside
-		 * time-related BIWs per §3.7.2).  Default CZ=1 if not set. */
-		if (slots_left > 0 && (params->local_id || params->coverage_id || params->biw_time)) {
-			uint32_t cz = params->coverage_id ? params->coverage_id : 1;
+		/* SSID1 (type 000) — emit when --ssid or --nid configured. */
+		if (slots_left > 0 && (params->local_id || params->coverage_id)) {
 			frame_words[fwc++] = flex_create_biw2(
 				params->local_id,
-				cz);
+				params->coverage_id);
 			slots_left--;
 			LOGP(DFLEX, LOGL_INFO,
-			     "TX: BIW SSID1 local_id=%u coverage=%u\n",
-			     params->local_id, cz);
+			     "TX: BIW SSID1 LID=%u CZ=%u\n",
+			     params->local_id, params->coverage_id);
 		}
 
 		/* SSID2 (type 111) — per §6.1.1.3, SSID2 must be

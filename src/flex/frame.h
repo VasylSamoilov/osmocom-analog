@@ -351,7 +351,11 @@ static inline const char *flex_smsg_type_name(uint32_t t)
  *   bits 0-3:   checksum (sum of all nibbles + bit20 = 0xF)
  *   bits 4-7:   cycle (0-14)
  *   bits 8-14:  frame (0-127)
- *   bit  15:    roaming flag (n)
+ *   bit  15:    n — Roaming Network flag (§6, Chapter 6).
+ *               n=0: roaming not provided (default).
+ *               n=1: roaming service provided on this channel.
+ *               When n=1, pagers enter roaming logic and check
+ *               SSID words. Only set when --ssid/--nid configured.
  *   bit  16:    repeat flag (r)
  *   bits 17-20: t (when r=0: low traffic flags per phase t0=A t1=B t2=C t3=D;
  *               when r=1: [t1t0]=num_tx, [t3t2]=td_collapse) */

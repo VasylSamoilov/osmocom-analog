@@ -81,6 +81,7 @@ static int default_retransmit = 0;		/* --retransmit: 0-15, default 0 (no retrans
 static int default_retransmit_interval = 128;	/* --retransmit-interval: 1-1920 frames, default 128 (~4 min) */
 static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (immediate) */
 static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: block-boundary fixup */
+static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -113,6 +114,9 @@ static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: b
 #define OPT_SEND_DELAY		3027
 #define OPT_HACK_NONSTANDARD	3028
 #define OPT_FIFO		3029
+#define OPT_ROAMING		3030
+#define OPT_SSID1		3031
+#define OPT_SSID2		3032
 
 void print_help(const char *arg0)
 {
@@ -171,14 +175,18 @@ void print_help(const char *arg0)
 	printf("        Override ERS cycle count (default auto).\n");
 	printf("    --charset <ascii|kanji>\n");
 	printf("        Set default character set (default ascii).\n");
-	printf("    --ssid <N>\n");
-	printf("        Set System Sub-ID for roaming (default 0).\n");
-	printf("    --nid <N>\n");
-	printf("        Set Network ID for roaming (default 0).\n");
-	printf("    --country-code <N>\n");
-	printf("        Set SSID2 country code (ITU-T E.212, 0-1023, e.g. 440=Japan).\n");
-	printf("    --tmf <N>\n");
-	printf("        Set SSID2 traffic management flags (0-15, 4-bit bitmask).\n");
+	printf("    --ssid1 <LID>,<CZ>\n");
+	printf("        Set SSID1 (BIW000): Local channel ID and Coverage Zone.\n");
+	printf("        LID: 0-511 (9 bits). Unique per operator across all frequencies.\n");
+	printf("        CZ:  0-31 (5 bits). 32 systems per LID.\n");
+	printf("        Example: --ssid1 10,1\n");
+	printf("    --ssid2 <CC>,<TMF>\n");
+	printf("        Set SSID2 (BIW111): Country Code and Traffic Management Flag.\n");
+	printf("        CC:  0-1023 (10 bits, ITU-T E.212). Example: 440=Japan.\n");
+	printf("        TMF: 0-15 (4 bits). Identifies up to 4 channels per SSID1+CC.\n");
+	printf("        Example: --ssid2 440,1\n");
+	printf("    --roaming\n");
+	printf("        Set FIW roaming flag n=1. Default n=0.\n");
 	printf("    --timezone <N>\n");
 	printf("        Set timezone zone code (0-31, 5-bit Z4..Z0).\n");
 	printf("        Emitted as BIW SysInfo type 101 (A=4). Use 'timezone,0,,' FIFO\n");
@@ -383,10 +391,9 @@ static void add_options(void)
 	option_add(OPT_NO_BIW_TIME, "no-biw-time", 0);
 	option_add(OPT_ERS_CYCLES, "ers-cycles", 1);
 	option_add(OPT_CHARSET, "charset", 1);
-	option_add(OPT_SSID, "ssid", 1);
-	option_add(OPT_NID, "nid", 1);
-	option_add(OPT_COUNTRY_CODE, "country-code", 1);
-	option_add(OPT_TMF, "tmf", 1);
+	option_add(OPT_SSID1, "ssid1", 1);
+	option_add(OPT_SSID2, "ssid2", 1);
+	option_add(OPT_ROAMING, "roaming", 0);
 	option_add(OPT_TIMEZONE, "timezone", 1);
 	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
@@ -579,25 +586,46 @@ static int handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		}
 		break;
-	case OPT_SSID:
+	case OPT_SSID1: {
+		/* --ssid1 LID,CZ */
+		char *comma = strchr(argv[argi], ',');
+		if (!comma) {
+			fprintf(stderr, "--ssid1 requires LID,CZ (e.g. --ssid1 10,1)\n");
+			return -EINVAL;
+		}
 		ssid = (uint32_t)strtoul(argv[argi], NULL, 10);
+		nid = (uint32_t)strtoul(comma + 1, NULL, 10);
+		if (ssid > 511) {
+			fprintf(stderr, "SSID1 LID must be 0-511.\n");
+			return -EINVAL;
+		}
+		if (nid > 31) {
+			fprintf(stderr, "SSID1 CZ must be 0-31.\n");
+			return -EINVAL;
+		}
 		break;
-	case OPT_NID:
-		nid = (uint32_t)strtoul(argv[argi], NULL, 10);
-		break;
-	case OPT_COUNTRY_CODE:
+	}
+	case OPT_SSID2: {
+		/* --ssid2 CC,TMF */
+		char *comma = strchr(argv[argi], ',');
+		if (!comma) {
+			fprintf(stderr, "--ssid2 requires CC,TMF (e.g. --ssid2 440,1)\n");
+			return -EINVAL;
+		}
 		country_code = (uint32_t)strtoul(argv[argi], NULL, 10);
+		tmf_flags = (uint32_t)strtoul(comma + 1, NULL, 10);
 		if (country_code > 1023) {
-			fprintf(stderr, "Country code must be 0-1023 (ITU-T E.212), use '-h' for help.\n");
+			fprintf(stderr, "SSID2 CC must be 0-1023.\n");
+			return -EINVAL;
+		}
+		if (tmf_flags > 15) {
+			fprintf(stderr, "SSID2 TMF must be 0-15.\n");
 			return -EINVAL;
 		}
 		break;
-	case OPT_TMF:
-		tmf_flags = (uint32_t)strtoul(argv[argi], NULL, 10);
-		if (tmf_flags > 15) {
-			fprintf(stderr, "TMF must be 0-15 (4-bit bitmask), use '-h' for help.\n");
-			return -EINVAL;
-		}
+	}
+	case OPT_ROAMING:
+		roaming_enabled = 1;
 		break;
 	case OPT_TIMEZONE:
 		timezone_code = atoi(argv[argi]);
@@ -2437,7 +2465,7 @@ int main(int argc, char *argv[])
 			f->country_code = country_code;
 			f->tmf = tmf_flags;
 			f->timezone_code = timezone_code;
-			f->roaming_active = (ssid != 0 || nid != 0) ? 1 : 0;
+			f->roaming_active = roaming_enabled;
 			f->num_transmissions = num_transmissions;
 			f->td_collapse = td_collapse;
 			f->chan_setup_enabled = chan_setup_enabled;

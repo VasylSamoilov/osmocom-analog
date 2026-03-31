@@ -1612,6 +1612,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 	flex_frame_params_default(&params);
 	params.cycle = ft.cycle;
 	params.frame = ft.frame;
+	/* FIW n flag: set by --roaming CLI flag (§6).
+	 * n=1 indicates Roaming Service is provided. Default n=0. */
 	params.roaming = flex->roaming_active ? 1 : 0;
 	params.collapse = flex->collapse;
 	params.biw_time = flex->biw_time_enabled;
@@ -1643,10 +1645,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 	params.timezone_code = flex->timezone_code;
 
-	/* When biw_time forces SSID1 emission, also enable
-	 * roaming so pagers recognize the SSID1 word. */
-	if (params.biw_time && !params.roaming)
-		params.roaming = 1;
+	/* FIW n=0 by default. Set by --roaming CLI flag. */
 
 	/* === Multi-message candidate collection ===
 	 * Collect multiple eligible messages into a candidate list,
@@ -2640,15 +2639,17 @@ int flex_get_next_frame(flex_t *flex)
 			flex_frame_params_t params;
 			int msgs_packed = 0;
 			double polarity;
-			int is_inverted_pass = (flex->idle_count == 1);
+			/* One-shot mode: transmit 4 frames total:
+			 *   0 = default polarity, R=1 (new message)
+			 *   1 = default polarity, R=0 (retransmission, same N)
+			 *   2 = inverted polarity, R=1
+			 *   3 = inverted polarity, R=0
+			 * idle_count tracks which pass (0-3). */
+			int pass = flex->idle_count;
+			int is_retransmit = (pass == 1 || pass == 3);
+			int is_inverted = (pass >= 2);
 
-			/* One-shot mode: transmit twice — once with default
-			 * polarity, once with inverted polarity, then exit.
-			 * idle_count tracks which pass:
-			 *   0 = first TX (default polarity)
-			 *   1 = second TX (inverted polarity) */
-
-			if (is_inverted_pass) {
+			if (is_inverted) {
 				polarity = (msg->polarity < 0) ? 1.0 : -1.0;
 			} else {
 				polarity = msg->polarity;
@@ -2684,10 +2685,10 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.short_msg_r = msg->short_msg_r;
 			frame_msg.numbered_s = msg->numbered_s;
 			frame_msg.numbered_msgnum = msg->numbered_msgnum;
-			/* R flag: R=1 for normal, R=0 for system msgs (§3.9.2) */
-			frame_msg.alpha_r_flag = msg->numbered_r ? 1 : 0;
-			frame_msg.hex_r_flag = msg->numbered_r ? 1 : 0;
-			frame_msg.numbered_r = msg->numbered_r ? 1 : 0;
+			/* R flag: R=1 for initial TX, R=0 for retransmit pass */
+			frame_msg.alpha_r_flag = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
+			frame_msg.hex_r_flag = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
+			frame_msg.numbered_r = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
 			frame_msg.sysmsg_method = msg->sysmsg_method;
 
 			/* Frame params: always cycle=0, frame=0.
@@ -2704,18 +2705,18 @@ int flex_get_next_frame(flex_t *flex)
 			if (flex->ssid || flex->nid) {
 				params.local_id = flex->ssid;
 				params.coverage_id = flex->nid;
-				params.roaming = 1;
 			}
+			/* FIW n flag: set by --roaming CLI flag (§6).
+			 * n=1 indicates Roaming Service is provided. Default n=0. */
+			if (flex->roaming_active)
+				params.roaming = 1;
 			if (flex->country_code || flex->tmf) {
 				params.country_code = flex->country_code;
 				params.tmf = flex->tmf;
 			}
 			params.timezone_code = flex->timezone_code;
 
-			/* When biw_time forces SSID1 emission, also enable
-			 * roaming so pagers recognize the SSID1 word. */
-			if (params.biw_time && !params.roaming)
-				params.roaming = 1;
+			/* FIW n=0 by default. Set by --roaming CLI flag. */
 
 			/* Set sysmsg_a_type for methods (a)/(b) (§3.9.2).
 			 * Detect operator messaging address with LSB 0-3
@@ -2744,25 +2745,21 @@ int flex_get_next_frame(flex_t *flex)
 			}
 
 			LOGP_CHAN(DFLEX, LOGL_INFO,
-				  "One-shot: C0/F0 %s polarity=%s capcode=%" PRIu64
+				  "One-shot: C0/F0 pass=%d polarity=%s R=%d capcode=%" PRIu64
 				  " type=%d speed=%d len=%d.\n",
-				  is_inverted_pass ? "(inverted)" : "(default)",
+				  pass,
 				  (polarity < 0) ? "neg" : "pos",
+				  is_retransmit ? 0 : 1,
 				  msg->capcode, (int)msg->msg_type,
 				  msg->speed, msg->data_length);
 
-			if (is_inverted_pass) {
-				/* Second pass done — destroy message.
-				 * Set idle_count=2 so the next call falls
-				 * through to oneshot_done after the DSP
-				 * finishes outputting this frame. */
+			if (pass >= 3) {
+				/* All 4 passes done — destroy message */
+				flex->msg_sequence++; /* bump for next message */
 				flex_msg_destroy(msg);
-				flex->idle_count = 2;
+				flex->idle_count = 4;
 			} else {
-				/* First pass done — mark for inverted pass */
-				flex->idle_count = 1;
-				/* Bump sequence so inverted pass uses same N */
-				flex->msg_sequence++;
+				flex->idle_count = pass + 1;
 			}
 			return 1;
 		}
