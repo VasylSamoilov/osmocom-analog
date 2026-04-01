@@ -582,16 +582,35 @@ static inline int flex_tz_auto_detect(void)
 
 	localtime_r(&now, &lt);
 #ifdef __linux__
-	offset_min = (int)(lt.tm_gmtoff / 60);
+	/* tm_gmtoff includes DST adjustment. To get the standard
+	 * (non-DST) offset, check a date known to be in standard
+	 * time (Jan 1) for the same timezone. */
+	if (lt.tm_isdst > 0) {
+		struct tm jan;
+		time_t jan_time;
+		/* Use Jan 1 of the current year */
+		memset(&jan, 0, sizeof(jan));
+		jan.tm_year = lt.tm_year;
+		jan.tm_mon = 0;
+		jan.tm_mday = 1;
+		jan.tm_hour = 12;
+		jan.tm_isdst = -1;
+		jan_time = mktime(&jan);
+		localtime_r(&jan_time, &jan);
+		offset_min = (int)(jan.tm_gmtoff / 60);
+	} else {
+		offset_min = (int)(lt.tm_gmtoff / 60);
+	}
 #else
-	/* Portable fallback: compute difference between local and UTC */
+	/* Portable fallback: compute difference between local and UTC.
+	 * Note: this returns the current offset including DST. */
 	{
 		struct tm gt;
 		gmtime_r(&now, &gt);
 		int local_min = lt.tm_hour * 60 + lt.tm_min;
 		int utc_min = gt.tm_hour * 60 + gt.tm_min;
 		int day_diff = lt.tm_yday - gt.tm_yday;
-		if (day_diff > 1) day_diff = -1;   /* year wrap */
+		if (day_diff > 1) day_diff = -1;
 		if (day_diff < -1) day_diff = 1;
 		offset_min = local_min - utc_min + day_diff * 1440;
 	}
