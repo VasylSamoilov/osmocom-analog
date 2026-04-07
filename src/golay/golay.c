@@ -1051,7 +1051,9 @@ int gsc_score_alpha(const char *str, int len, int fill)
  * Scoring per nibble (operates on the raw 4-bit nibble values,
  * not the decoded ASCII, to distinguish shift prefixes):
  *   +3  digit (nibble 0x0–0x9)
- *  -15  'U' (nibble 0xB) — very rare in real numeric messages;
+ *   -1  'U' (nibble 0xB) when it's the only U and at position 0
+ *       (urgent-prefix convention: "U" + phone number)
+ *  -15  'U' (nibble 0xB) otherwise — very rare in real numeric messages;
  *       common artifact when alpha data is misinterpreted as numeric
  *   -2  space (0xC), hyphen (0xD), asterisk (0xE)
  *   -2  shift prefix (0xF) — uncommon in numeric messages
@@ -1066,6 +1068,30 @@ int gsc_score_numeric(const uint8_t *nibbles, int count, int fill)
 {
 	int score = 0;
 	int i;
+	int u_count = 0;
+	int first_u = -1;
+
+	/* Pre-scan for 'U' (0xB) nibbles to detect urgent-prefix pattern */
+	for (i = 0; i < count; i++) {
+		uint8_t n = nibbles[i];
+		/* Skip fill nibbles */
+		if (n == 0x0A)
+			continue;
+		if (n == 0x0B) {
+			u_count++;
+			if (first_u < 0)
+				first_u = i;
+		}
+	}
+
+	/*
+	 * Urgent-prefix heuristic: a single 'U' as the first non-fill nibble
+	 * followed by phone-number digits is a legitimate paging convention
+	 * (urgent message). Only reduce the penalty when:
+	 *   - exactly one 'U' in the entire message
+	 *   - it's the first nibble (position 0)
+	 */
+	int urgent_prefix = (u_count == 1 && first_u == 0);
 
 	for (i = 0; i < count; i++) {
 		uint8_t n = nibbles[i];
@@ -1078,11 +1104,10 @@ int gsc_score_numeric(const uint8_t *nibbles, int count, int fill)
 			/* Digit (0-9): +3 */
 			score += 3;
 		} else if (n == 0x0B) {
-			/* 'U': -15 (very rare in real numeric messages;
-			 * common artifact when alpha data is misinterpreted
-			 * as numeric due to nibble 0x0B appearing in random
-			 * bit patterns) */
-			score -= 15;
+			if (urgent_prefix)
+				score -= 1; /* leading U = urgent prefix — mild penalty */
+			else
+				score -= 15; /* stray U — strong artifact signal */
 		} else if (n >= 0x0C && n <= 0x0E) {
 			/* Space (0xC), hyphen (0xD), asterisk (0xE): -2 */
 			score -= 2;

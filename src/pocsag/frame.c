@@ -459,6 +459,17 @@ static void decode_numeric(pocsag_t *pocsag, uint32_t word, uint32_t corrections
 			pocsag->rx_msg_numeric_alloc = new_alloc;
 		}
 
+		/* Grow raw nibble buffer in parallel */
+		need = pocsag->rx_msg_numeric_nibble_count + 1;
+		if (need > pocsag->rx_msg_nibble_alloc) {
+			int new_alloc = pocsag->rx_msg_nibble_alloc ? pocsag->rx_msg_nibble_alloc + RX_BUF_GROW : RX_BUF_INIT;
+			uint8_t *nn = realloc(pocsag->rx_msg_numeric_nibbles, new_alloc);
+			if (!nn)
+				return;
+			pocsag->rx_msg_numeric_nibbles = nn;
+			pocsag->rx_msg_nibble_alloc = new_alloc;
+		}
+
 		/*
 		 * Check if any of the 4 source bits for this digit were affected.
 		 * corrections == 0xfffff800 means uncorrectable (all data bits bad),
@@ -479,6 +490,9 @@ static void decode_numeric(pocsag_t *pocsag, uint32_t word, uint32_t corrections
 		pocsag->rx_msg_data_numeric[pocsag->rx_msg_data_length_numeric] = numeric[digit];
 		pocsag->rx_msg_num_status[pocsag->rx_msg_data_length_numeric] = status;
 		pocsag->rx_msg_data_length_numeric++;
+
+		/* Store raw nibble for scoring heuristics */
+		pocsag->rx_msg_numeric_nibbles[pocsag->rx_msg_numeric_nibble_count++] = digit;
 	}
 }
 
@@ -670,57 +684,314 @@ static void store_raw_bits(pocsag_t *pocsag, uint32_t word)
  * Returns a score where higher = more likely to be this type.
  * Negative scores indicate the content is unlikely to be this type.
  */
-static int score_alpha(const char *data, int len)
+/*
+ * Count trailing fill characters in the alpha decode buffer.
+ * POCSAG alpha messages are padded with NULL (0x00) or space (0x20)
+ * depending on the transmitter implementation.
+ *
+ * NULL padding: per POCSAG spec (AN142, CCIR Rec. 584), the standard
+ * fill character. Coincidental NULL is rare (1/128 per 7-bit slot).
+ *
+ * Space padding: some transmitters pad with spaces instead of NULL.
+ * Space (0x20 = 0100000) is also unlikely to appear coincidentally
+ * when alpha bits are misinterpreted as numeric nibbles.
+ *
+ * Both are counted as fill, but only a contiguous run of the same
+ * character from the end is counted (no mixing).
+ */
+static int count_alpha_fill(const char *data, int len)
+{
+	int fill = 0;
+	int i;
+	char fill_char;
+
+	if (len == 0)
+		return 0;
+
+	/* Determine which fill character is used (check last char) */
+	fill_char = data[len - 1];
+	if (fill_char != '\0' && fill_char != ' ')
+		return 0;
+
+	for (i = len - 1; i >= 0; i--) {
+		if (data[i] == fill_char)
+			fill++;
+		else
+			break;
+	}
+	return fill;
+}
+
+/*
+ * Count trailing fill nibbles in the numeric nibble buffer.
+ * POCSAG numeric messages are padded with 0xC (space) nibbles.
+ * Fill is a structural signal but weaker than alpha fill since
+ * coincidental 0xC nibbles are more likely (1/16 per nibble vs 1/128).
+ */
+static int count_numeric_fill(const uint8_t *nibbles, int count)
+{
+	int fill = 0;
+	int i;
+
+	for (i = count - 1; i >= 0; i--) {
+		if (nibbles[i] == 0x0C)
+			fill++;
+		else
+			break;
+	}
+	return fill;
+}
+
+/*
+ * Score the plausibility of an alpha interpretation.
+ *
+ * Modeled after the GSC/Golay alpha scorer: evaluates each character
+ * against expected alpha content patterns, then adds a quadratic fill
+ * bonus for trailing NULL padding characters.
+ *
+ * Scoring per character:
+ *   +3  letters (A-Z, a-z), digits (0-9), or space
+ *   -2  other printable ASCII (punctuation, special chars)
+ *   -5  non-printable control characters
+ *    0  common whitespace (newline, tab) and EOT/NULL padding
+ *
+ * Fill bonus: fill^2 * 2 (quadratic, strong — coincidental NULL is
+ * very rare at 1/128 per 7-bit slot).
+ */
+static int score_alpha(const char *data, int len, int fill)
 {
 	int score = 0;
+	int content_chars = 0;
 	int i;
 
 	for (i = 0; i < len; i++) {
 		unsigned char c = (unsigned char)data[i];
-		if (c >= 32 && c <= 126) {
-			/* printable ASCII */
-			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == ' ')
-				score += 3; /* letters and space — strong alpha signal */
-			else if (c >= '0' && c <= '9')
-				score += 1; /* digits are neutral */
-			else
-				score -= 1; /* special chars — mild penalty */
+
+		/* Exclude trailing fill characters (NULL or space padding).
+		 * Fill chars are scored via the fill bonus below, not here. */
+		if (i >= len - fill && (c == 0x00 || c == ' '))
+			continue;
+
+		/* Also skip embedded NULLs (incomplete chars at boundaries) */
+		if (c == 0x00)
+			continue;
+
+		content_chars++;
+
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		    (c >= '0' && c <= '9') || c == ' ') {
+			score += 3; /* alphanumeric or space — strong alpha signal */
+		} else if (c >= 0x20 && c <= 0x7E) {
+			score -= 2; /* other printable ASCII — mild penalty */
 		} else if (c == '\n' || c == '\r' || c == '\t') {
 			score += 0; /* common whitespace — neutral */
-		} else if (c == 0x04 || c == 0x00) {
-			score += 0; /* EOT/NULL padding — neutral */
+		} else if (c == 0x04) {
+			score += 0; /* EOT padding — neutral */
 		} else {
 			score -= 5; /* non-printable control chars — strong penalty */
 		}
 	}
 
+	/* Fill bonus only applies when there is actual content before the
+	 * fill. All-fill with no content (e.g. numeric 0000 producing
+	 * all-zero bits that look like NULL) is not evidence of alpha. */
+	if (content_chars > 0) {
+		/* Fill characters are strong structural evidence: the encoder
+		 * pads unused 7-bit slots with NULL or space. Coincidental fill
+		 * in the wrong interpretation is very rare (1/128 per 7-bit slot).
+		 *
+		 * POCSAG-specific: numeric gets 5 nibbles per codeword vs ~2.85
+		 * alpha chars. Short alpha messages are at a scoring disadvantage
+		 * because the same bits produce more numeric nibbles (which may
+		 * coincidentally look like digits). Alpha fill is therefore
+		 * weighted more heavily to compensate. */
+		score += fill * fill * 3 + fill * 5;
+	}
+
 	return score;
 }
 
-static int score_numeric(const char *data, int len)
+/*
+ * Score the plausibility of a numeric interpretation.
+ *
+ * Modeled after the GSC/Golay numeric scorer: operates on raw 4-bit
+ * nibbles (not decoded ASCII characters) to distinguish digits from
+ * artifacts. Adds a quadratic fill bonus for trailing 0xC (space) padding.
+ *
+ * Scoring per nibble:
+ *   +3  digit (0x0–0x9)
+ *   -1  'U' (0xB) when it's the only U and at position 0
+ *       (urgent-prefix convention: "U" + phone number)
+ *  -15  'U' (0xB) otherwise — very rare in real numeric messages;
+ *       common artifact when alpha data is misinterpreted as numeric
+ *   -2  space (0xC), hyphen (0xD), brackets (0xE, 0xF)
+ *   -3  'R' (0xA spare) — uncommon in real numeric messages
+ *
+ * Fill bonus: fill^2 (quadratic, weaker than alpha fill since
+ * coincidental 0xC nibbles are more likely: 1/16 vs 1/128).
+ *
+ * Normalization: scores are scaled to per-character rate then multiplied
+ * by a reference length to make alpha and numeric scores comparable
+ * despite their different bit densities (4-bit nibbles vs 7-bit chars).
+ * Without this, numeric always gets ~1.75x more scoring opportunities
+ * per codeword, biasing short messages toward numeric.
+ */
+static int score_numeric_nibbles(const uint8_t *nibbles, int count, int fill)
 {
-	int score = 0;
+	int raw_score = 0;
+	int scored_count = 0;
+	int digit_count = 0;
 	int i;
+	int u_count = 0;
+	int first_u = -1;
+	int r_count = 0;
 
-	for (i = 0; i < len; i++) {
-		unsigned char c = (unsigned char)data[i];
-		if (c >= '0' && c <= '9')
-			score += 5; /* digits — strong numeric signal */
-		else if (c == ' ' || c == '-' || c == '.')
-			score += 1; /* common numeric separators */
-		else if (c == 'U')
-			score -= 10; /* 'U' (0xB) — very unlikely in real numeric */
-		else if (c == '[' || c == ']')
-			score -= 5; /* brackets — unlikely in numeric */
-		else if (c == 'R')
-			score -= 3; /* spare character */
-		else
-			score -= 2;
+	/* Pre-scan for 'U' (0xB) and 'R' (0xA) nibbles */
+	for (i = 0; i < count; i++) {
+		/* Skip fill */
+		if (nibbles[i] == 0x0C && i >= count - fill)
+			continue;
+		if (nibbles[i] == 0x0B) {
+			u_count++;
+			if (first_u < 0)
+				first_u = i;
+		}
+		if (nibbles[i] == 0x0A)
+			r_count++;
 	}
 
-	/* PDW-style: penalize long numeric messages (>20 chars are likely alpha) */
-	if (len > 20)
-		score -= (len - 20) * 2;
+	/*
+	 * Urgent-prefix heuristic: a single 'U' as the first non-fill nibble
+	 * followed by phone-number digits is a legitimate paging convention
+	 * (urgent message). Only reduce the penalty when:
+	 *   - exactly one 'U' in the entire message
+	 *   - it's the first nibble (position 0)
+	 */
+	int urgent_prefix = (u_count == 1 && first_u == 0);
+
+	for (i = 0; i < count; i++) {
+		uint8_t n = nibbles[i];
+
+		/* Exclude fill nibbles (0xC = space padding) */
+		if (n == 0x0C && i >= count - fill)
+			continue;
+
+		scored_count++;
+
+		if (n <= 0x09) {
+			raw_score += 3; /* digit (0-9) — strong numeric signal */
+			digit_count++;
+		} else if (n == 0x0B) {
+			if (urgent_prefix)
+				raw_score -= 1; /* leading U = urgent prefix — mild penalty */
+			else
+				raw_score -= 15; /* stray U — strong artifact signal */
+		} else if (n == 0x0A) {
+			/* 'R' (return/received): at most one R at the start is
+			 * plausible in a real numeric message. Multiple R's are
+			 * a strong misdetection signal. */
+			if (r_count > 1)
+				raw_score -= 15; /* multiple R — strong artifact */
+			else
+				raw_score -= 5;  /* single R — uncommon but possible */
+		} else if (n >= 0x0C && n <= 0x0E) {
+			raw_score -= 2; /* space, hyphen, bracket — mild penalty */
+		} else if (n == 0x0F) {
+			raw_score -= 2; /* ']' — mild penalty */
+		}
+	}
+
+	/* Normalize: numeric gets 5 nibbles per codeword vs ~2.85 alpha chars.
+	 * Scale the raw score by (7/4) ≈ the bit-width ratio, implemented as
+	 * score * 4 / 7 to avoid floating point. This makes per-codeword
+	 * contribution comparable between the two interpretations. */
+	int score;
+	if (scored_count > 0)
+		score = raw_score * 4 / 7;
+	else
+		score = 0;
+
+	/* E.164 length penalty: real phone numbers have at most 15 digits
+	 * (not counting separators, brackets, U, R, spaces). Numeric
+	 * messages with more actual digits than this are almost certainly
+	 * alpha data misinterpreted as numeric. Apply a progressive penalty
+	 * for each digit beyond 15. */
+	if (digit_count > 15)
+		score -= (digit_count - 15) * 5;
+
+	/* Bracket structure validation: in real numeric messages, brackets
+	 * are used for area codes like [212] — always '[' (0xE) followed
+	 * by ']' (0xF) with digits inside. Malformed patterns are strong
+	 * evidence of alpha data misinterpreted as numeric:
+	 *   - ']' before '[' (close before open)
+	 *   - unmatched '[' or ']' (hanging brackets)
+	 *   - empty brackets '[]' (no content inside)
+	 *   - nested brackets '[[' or ']]'
+	 * Each violation gets a heavy penalty. */
+	{
+		int bracket_depth = 0;
+		int bracket_violations = 0;
+		int bracket_content = 0; /* digits inside current bracket pair */
+
+		for (i = 0; i < count; i++) {
+			uint8_t n = nibbles[i];
+
+			/* Skip fill */
+			if (n == 0x0C && i >= count - fill)
+				continue;
+
+			if (n == 0x0F) { /* '[' (index 15 in BCD table) */
+				if (bracket_depth > 0)
+					bracket_violations++; /* nested open */
+				bracket_depth++;
+				bracket_content = 0;
+			} else if (n == 0x0E) { /* ']' (index 14 in BCD table) */
+				if (bracket_depth <= 0)
+					bracket_violations++; /* close before open */
+				else if (bracket_content == 0)
+					bracket_violations++; /* empty brackets */
+				bracket_depth--;
+			} else if (bracket_depth > 0 && n <= 0x09) {
+				bracket_content++;
+			}
+		}
+		/* Unmatched open brackets */
+		if (bracket_depth > 0)
+			bracket_violations += bracket_depth;
+
+		score -= bracket_violations * 10;
+	}
+
+	/* Consecutive non-digit penalty: real phone numbers never have two
+	 * separators in a row (e.g. "- ", "  ", "][", "R ", "U-").  Each
+	 * pair of adjacent non-digit, non-fill nibbles is penalized as a
+	 * strong misdetection signal. */
+	{
+		int prev_is_nondigit = 0;
+
+		for (i = 0; i < count; i++) {
+			uint8_t n = nibbles[i];
+
+			/* Skip fill */
+			if (n == 0x0C && i >= count - fill)
+				continue;
+
+			if (n > 0x09) {
+				/* Non-digit nibble */
+				if (prev_is_nondigit)
+					score -= 5;
+				prev_is_nondigit = 1;
+			} else {
+				prev_is_nondigit = 0;
+			}
+		}
+	}
+
+	/* Fill nibbles (0xC = space) are evidence this is the correct type,
+	 * but weaker than alpha fill since coincidental 0xC nibbles are more
+	 * likely (1/16 per nibble vs 1/128 for alpha fill). Bonus scales
+	 * quadratically. */
+	score += fill * fill;
 
 	return score;
 }
@@ -769,20 +1040,80 @@ static int base64_encode(const uint8_t *in, int in_len, char *out, int out_size)
 	return o;
 }
 
+/*
+ * Uncertainty threshold for POCSAG dual-decode: when the absolute
+ * difference between alpha and numeric content scores is below this
+ * value, the result is flagged as uncertain in the log output.
+ */
+#define POCSAG_GUESS_UNCERTAIN_THRESHOLD 10
+
+/*
+ * Alpha prior bias: alpha messages are significantly more common than
+ * numeric in modern POCSAG usage. This flat bonus tips ambiguous cases
+ * toward alpha without affecting clear numeric messages (which typically
+ * win by 15+ points). A numeric message needs to outscore alpha by at
+ * least this margin to be selected.
+ */
+#define POCSAG_ALPHA_PRIOR_BIAS 2
+
 static enum pocsag_msg_type detect_msg_type(pocsag_t *pocsag)
 {
+	int alpha_fill, numeric_fill;
+	int sa, sn;
+
 	if (pocsag->rx_msg_data_length == 0)
 		return POCSAG_MSG_TYPE_TONE;
 
-	/*
-	 * Score-based detection combining multimon-ng and PDW approaches.
-	 * Compare alpha vs numeric scores to determine the primary type.
-	 * Skyper is a variant of alpha (ROT-1), scored separately.
-	 */
-	int sa = score_alpha(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
-	int sn = score_numeric(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
+	/* Count trailing fill in both interpretations */
+	alpha_fill = count_alpha_fill(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
+	numeric_fill = count_numeric_fill(pocsag->rx_msg_numeric_nibbles,
+					  pocsag->rx_msg_numeric_nibble_count);
 
-	if (sn > sa && sn > 0)
+	/* Unified scoring: content + fill bonus folded into a single score,
+	 * matching the GSC/Golay discriminator approach. */
+	sa = score_alpha(pocsag->rx_msg_data, pocsag->rx_msg_data_length, alpha_fill);
+	sn = score_numeric_nibbles(pocsag->rx_msg_numeric_nibbles,
+				   pocsag->rx_msg_numeric_nibble_count, numeric_fill);
+
+	/* Apply alpha prior bias */
+	sa += POCSAG_ALPHA_PRIOR_BIAS;
+
+	/* Short-message alpha boost: messages with 1-2 data codewords
+	 * (≤10 nibbles / ≤5 alpha chars) are where the heuristic struggles
+	 * most due to the 4-bit vs 7-bit density asymmetry. Short alpha
+	 * messages (OK, #1, GO) are common; short numeric that isn't a
+	 * clean digit string is rare. Add extra alpha lean for short
+	 * messages only — this doesn't affect longer messages where
+	 * numeric phone numbers are more plausible.
+	 * rx_msg_codewords includes the address codeword, so ≤3 means
+	 * 1-2 message codewords. */
+	if (pocsag->rx_msg_codewords <= 3)
+		sa += 3;
+
+	/* Long-message alpha override: real numeric messages are phone
+	 * numbers — at most ~6 data codewords (15 digits + separators +
+	 * fill). Messages with 7+ data codewords (rx_msg_codewords >= 8
+	 * including address) cannot be numeric. Force alpha regardless
+	 * of scores. */
+	if (pocsag->rx_msg_codewords >= 8) {
+		LOGP_CHAN(DPOCSAG, LOGL_DEBUG,
+			  "Type heuristic: %d codewords — too long for numeric, forcing alpha.\n",
+			  pocsag->rx_msg_codewords);
+		return POCSAG_MSG_TYPE_ALPHA;
+	}
+
+	/* Log scoring details for diagnostics */
+	{
+		int score_diff = sa - sn;
+		if (score_diff < 0) score_diff = -score_diff;
+		int uncertain = (score_diff < POCSAG_GUESS_UNCERTAIN_THRESHOLD) ? 1 : 0;
+		LOGP_CHAN(DPOCSAG, LOGL_DEBUG,
+			  "Type heuristic: alpha_score=%d (fill=%d, +%d bias) numeric_score=%d (fill=%d) diff=%d%s\n",
+			  sa, alpha_fill, POCSAG_ALPHA_PRIOR_BIAS, sn, numeric_fill,
+			  sa - sn, uncertain ? " [uncertain]" : "");
+	}
+
+	if (sn > sa)
 		return POCSAG_MSG_TYPE_NUMERIC;
 
 	return POCSAG_MSG_TYPE_ALPHA;
@@ -1024,10 +1355,14 @@ static void done_rx_msg(pocsag_t *pocsag)
 	/* Derive Skyper (ROT-1) from alpha buffer */
 	decode_skyper(pocsag);
 
-	/* Score all candidates */
-	sa = score_alpha(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
-	sn = score_numeric(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
-	ss = score_alpha(pocsag->rx_msg_data_skyper, pocsag->rx_msg_data_length_skyper);
+	/* Score all candidates (with fill detection) */
+	int alpha_fill = count_alpha_fill(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
+	int numeric_fill = count_numeric_fill(pocsag->rx_msg_numeric_nibbles,
+					      pocsag->rx_msg_numeric_nibble_count);
+	sa = score_alpha(pocsag->rx_msg_data, pocsag->rx_msg_data_length, alpha_fill);
+	sn = score_numeric_nibbles(pocsag->rx_msg_numeric_nibbles,
+				   pocsag->rx_msg_numeric_nibble_count, numeric_fill);
+	ss = score_alpha(pocsag->rx_msg_data_skyper, pocsag->rx_msg_data_length_skyper, 0);
 
 	int alpha_printable = is_printable(pocsag->rx_msg_data, pocsag->rx_msg_data_length);
 	int numeric_printable = is_printable(pocsag->rx_msg_data_numeric, pocsag->rx_msg_data_length_numeric);
@@ -1289,6 +1624,7 @@ void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
 		pocsag->rx_msg_data_raw_bits = 0;
 		pocsag->rx_msg_bit_index = 0;
 		pocsag->rx_msg_cur_char_bad = 0;
+		pocsag->rx_msg_numeric_nibble_count = 0;
 		pocsag->rx_msg_codewords = 1;
 		pocsag->rx_msg_corrected = (rc > 0) ? 1 : 0;
 		pocsag->rx_msg_uncorrectable = 0;

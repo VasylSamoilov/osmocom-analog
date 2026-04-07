@@ -169,6 +169,10 @@ typedef struct pocsag {
 	int			rx_msg_data_length_numeric;
 	int			rx_msg_numeric_alloc;	/* numeric buffer allocated size */
 
+	uint8_t			*rx_msg_numeric_nibbles;/* raw 4-bit nibbles (before char mapping) */
+	int			rx_msg_numeric_nibble_count;
+	int			rx_msg_nibble_alloc;	/* nibble buffer allocated size */
+
 	uint8_t			*rx_msg_data_raw;	/* raw message bytes (packed bits) */
 	int			rx_msg_data_raw_bits;
 	int			rx_msg_raw_alloc;	/* raw buffer allocated size */
