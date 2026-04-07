@@ -403,6 +403,8 @@ static pocsag_msg_t *pocsag_msg_create(pocsag_t *pocsag, uint32_t callref, uint3
 	memcpy(msg->data, message, message_length);
 	msg->data_length = message_length;
 	msg->padding = pocsag->padding;
+	msg->speed = pocsag->default_speed;
+	msg->polarity = pocsag->default_polarity;
 
 	/* link */
 	msg->pocsag = pocsag;
@@ -413,6 +415,9 @@ static pocsag_msg_t *pocsag_msg_create(pocsag_t *pocsag, uint32_t callref, uint3
 
 	/* kick transmitter */
 	if (pocsag->state == POCSAG_IDLE) {
+		pocsag->tx_speed = msg->speed;
+		pocsag->tx_polarity = msg->polarity;
+		pocsag->batch_count = 0;
 		pocsag_new_state(pocsag, POCSAG_PREAMBLE);
 		pocsag->word_count = 0;
 	} else
@@ -565,7 +570,7 @@ void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint
  * per the POCSAG standard. The function bits provide 4 sub-addresses per RIC,
  * while msg_type determines how the message content is encoded/decoded.
  */
-int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window)
+int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window, int max_batches)
 {
 	pocsag_t *pocsag;
 	int rc;
@@ -601,6 +606,9 @@ int pocsag_create(const char *kanal, double frequency, const char *device, int u
 	pocsag->scan_from = scan_from;
 	pocsag->scan_to = scan_to;
 	pocsag->padding = padding;
+	pocsag->default_speed = baudrate;
+	pocsag->default_polarity = polarity;
+	pocsag->max_batches = max_batches;
 	pocsag->rx_dedup_window = dedup_window;
 
 	pocsag_display_status();
@@ -675,6 +683,7 @@ static int pocsag_language_name2value(const char *text)
  */
 static void parse_pocsag_options(const char *opts, int opts_len,
 				 enum pocsag_language *language_out,
+				 int *speed_out, double *polarity_out,
 				 int *repeat_out, double *delay_out,
 				 double *interval_out)
 {
@@ -728,13 +737,18 @@ static void parse_pocsag_options(const char *opts, int opts_len,
 			int spd = atoi(val);
 			if (spd != 512 && spd != 1200 && spd != 2400)
 				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid speed '%s', use 512/1200/2400.\n", val);
-			/* TODO: per-message baud rate requires DSP reconfiguration */
+			else
+				*speed_out = spd;
 		}
 		else if (!strcmp(key, "polarity")) {
-			if (val[0] != 'n' && val[0] != 'N' && val[0] != 'i' && val[0] != 'I' &&
-			    val[0] != 'p' && val[0] != 'P')
+			if (val[0] == 'n' || val[0] == 'N')
+				*polarity_out = -1.0;
+			else if (val[0] == 'i' || val[0] == 'I')
+				*polarity_out = 1.0;
+			else if (val[0] == 'p' || val[0] == 'P')
+				*polarity_out = 1.0;  /* legacy "positive" = inverted */
+			else
 				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid polarity '%s', use normal/inverted.\n", val);
-			/* TODO: per-message polarity requires DSP reconfiguration */
 		}
 		else if (!strcmp(key, "repeat")) {
 			int r = atoi(val);
@@ -879,9 +893,11 @@ void pocsag_msg_send(enum pocsag_language language, const char *text, size_t tex
 
 	/* Parse options */
 	int repeat = 0;
+	int msg_speed = 0;		/* 0 = use default */
+	double msg_polarity = 0.0;	/* 0.0 = use default */
 	double delay = 0.0;
 	double interval = 10.0;
-	parse_pocsag_options(opts_start, opts_len, &language, &repeat, &delay, &interval);
+	parse_pocsag_options(opts_start, opts_len, &language, &msg_speed, &msg_polarity, &repeat, &delay, &interval);
 
 	/* Validate RIC */
 	if (ric > 2097151) {
@@ -978,6 +994,21 @@ void pocsag_msg_send(enum pocsag_language language, const char *text, size_t tex
 			msg->retransmit_count = 0;
 			msg->retransmit_interval = interval;
 			msg->send_delay = delay;
+			if (msg_speed)
+				msg->speed = msg_speed;
+			if (msg_polarity != 0.0)
+				msg->polarity = msg_polarity;
+
+			/* If locked mode (max_batches=0), discard messages with wrong speed/polarity */
+			if (pocsag->max_batches == 0 &&
+			    (msg->speed != pocsag->default_speed || msg->polarity != pocsag->default_polarity)) {
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: discarding RIC %d — speed %d/%s does not match locked %d/%s (--max-batches 0).\n",
+				     ric, msg->speed, (msg->polarity < 0) ? "normal" : "inverted",
+				     pocsag->default_speed, (pocsag->default_polarity < 0) ? "normal" : "inverted");
+				pocsag_msg_destroy(msg);
+				return;
+			}
+
 			gettimeofday(&tv, NULL);
 			msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + delay;
 		}
@@ -1004,6 +1035,9 @@ void call_down_clock(void)
 		for (msg = pocsag->msg_list; msg; msg = msg->next) {
 			if (msg->next_send_time > 0.0 && now >= msg->next_send_time) {
 				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission for RIC %d now eligible, starting TX.\n", msg->ric);
+				pocsag->tx_speed = msg->speed;
+				pocsag->tx_polarity = msg->polarity;
+				pocsag->batch_count = 0;
 				pocsag_new_state(pocsag, POCSAG_PREAMBLE);
 				pocsag->word_count = 0;
 				break;

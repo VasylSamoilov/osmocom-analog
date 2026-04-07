@@ -48,6 +48,7 @@ static double deviation = 4500;
 static int deviation_given = 0;
 static double polarity = -1;
 static int polarity_given = 0;
+static int max_batches = 128;	/* 0 = locked to CLI speed/polarity, no switching */
 /* Default function (sub-address) and message type */
 static enum pocsag_function function = POCSAG_FUNCTION_A;
 static enum pocsag_msg_type msg_type = POCSAG_MSG_TYPE_AUTO;
@@ -129,6 +130,13 @@ void print_help(const char *arg0)
 	printf("        window are suppressed. Uncorrectable codewords from the new copy\n");
 	printf("        are recovered from the previous copy if possible.\n");
 	printf("        Typical pager dedup windows: 15, 30, 60, 120 seconds.\n");
+	printf("    --max-batches <count>\n");
+	printf("        Maximum batches per transmission before switching speed/polarity\n");
+	printf("        group (default %d). FIFO messages can specify speed= and polarity=\n", max_batches);
+	printf("        per message. Messages are grouped by speed/polarity and transmitted\n");
+	printf("        in separate transmissions (each with its own preamble).\n");
+	printf("        Set to 0 to lock to CLI speed/polarity only — FIFO messages with\n");
+	printf("        different speed/polarity are discarded with a warning.\n");
 	printf("\n");
 	printf("RIC (Radio Identity Code) Structure:\n");
 	printf("      The RIC is a 21-bit pager address (0 to 2097151), formed as follows:\n");
@@ -181,6 +189,7 @@ void print_help(const char *arg0)
 #define OPT_PADDING	256
 #define OPT_DEDUP	257
 #define OPT_FIFO	258
+#define OPT_MAX_BATCHES	259
 
 static void add_options(void)
 {
@@ -197,6 +206,7 @@ static void add_options(void)
 	option_add('S', "scan", 2);
 	option_add(OPT_PADDING, "padding", 1);
 	option_add(OPT_DEDUP, "dedup", 1);
+	option_add(OPT_MAX_BATCHES, "max-batches", 1);
 	option_add(OPT_FIFO, "fifo", 1);
 }
 
@@ -323,6 +333,13 @@ static int handle_options(int short_option, int argi, char **argv)
 		dedup_window = atof(argv[argi++]);
 		if (dedup_window < 0.0) {
 			fprintf(stderr, "Dedup window must be >= 0 seconds.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_MAX_BATCHES:
+		max_batches = atoi(argv[argi++]);
+		if (max_batches < 0) {
+			fprintf(stderr, "Max batches must be >= 0.\n");
 			return -EINVAL;
 		}
 		break;
@@ -504,7 +521,7 @@ int main(int argc, char *argv[])
 			printf("Invalid channel '%s', Use '-k list' to get a list of all channels.\n\n", kanal[i]);
 			goto fail;
 		}
-		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, !baudrate_given, !polarity_given, dedup_window);
+		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, !baudrate_given, !polarity_given, dedup_window, max_batches);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;

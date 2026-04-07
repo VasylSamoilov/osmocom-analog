@@ -121,6 +121,10 @@ typedef struct pocsag_msg {
 	int			bit_index;		/* current bit transmitting */
 	char			padding;		/* EOT or other padding */
 
+	/* per-message TX parameters */
+	int			speed;			/* baud rate: 512, 1200, 2400 */
+	double			polarity;		/* -1.0 = normal, +1.0 = inverted */
+
 	/* retransmission scheduling */
 	int			retransmit_max;		/* total retransmissions after initial TX (0=none) */
 	int			retransmit_count;	/* retransmissions completed so far */
@@ -141,12 +145,18 @@ typedef struct pocsag {
 	enum pocsag_msg_type	default_msg_type;	/* default message type for encoding */
 	const char 		*default_message;	/* default message, if caller has no caller ID */
 	char			padding;		/* EOT or other padding */
+	int			default_speed;		/* default baud rate from CLI */
+	double			default_polarity;	/* default polarity from CLI */
+	int			max_batches;		/* 0 = locked to CLI speed/polarity */
 
 	/* tx states */
 	enum pocsag_state	state;			/* state (idle, preamble, message) */
 	pocsag_msg_t		*current_msg;		/* msg, if message codewords are transmitted */
 	int			word_count;		/* counter for codewords */
 	int			idle_count;		/* counts when to go idle */
+	int			batch_count;		/* batches sent in current transmission */
+	int			tx_speed;		/* baud rate of current transmission */
+	double			tx_polarity;		/* polarity of current transmission */
 	uint32_t		scan_from, scan_to;	/* if not equal: scnning mode */
 
 	/* rx states */
@@ -234,11 +244,14 @@ typedef struct pocsag {
 
 	/* dsp states */
 	double			fsk_deviation;		/* deviation of FSK signal on sound card */
-	double			fsk_polarity;		/* polarity of FSK signal (-1.0 = bit '1' is down) */
+	double			fsk_polarity;		/* polarity of FSK signal (-1.0 = bit '1' is down) — RX */
+	double			fsk_tx_polarity;	/* TX polarity (may differ during speed switching) */
 	sample_t		fsk_ramp_up[256];	/* samples of upward ramp shape */
 	sample_t		fsk_ramp_down[256];	/* samples of downward ramp shape */
-	double			fsk_bitduration;	/* duration of a bit in samples */
-	double			fsk_bitstep;		/* fraction of a bit each sample */
+	double			fsk_bitduration;	/* duration of a bit in samples — RX */
+	double			fsk_bitstep;		/* fraction of a bit each sample — RX */
+	double			fsk_tx_bitduration;	/* TX bit duration (may differ during speed switching) */
+	double			fsk_tx_bitstep;		/* TX bit step */
 	sample_t		*fsk_tx_buffer;		/* tx buffer for one data block */
 	int			fsk_tx_buffer_size;	/* size of tx buffer (in samples) */
 	int			fsk_tx_buffer_length;	/* usage of buffer (in samples) */
@@ -291,7 +304,7 @@ int pocsag_init(void);
 void pocsag_exit(void);
 void pocsag_new_state(pocsag_t *pocsag, enum pocsag_state new_state);
 void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, int baudrate, double polarity, const char *message);
-int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window);
+int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window, int max_batches);
 void pocsag_destroy(sender_t *sender);
 void pocsag_msg_send(enum pocsag_language language, const char *text, size_t text_length);
 void pocsag_msg_destroy(pocsag_msg_t *msg);

@@ -44,6 +44,7 @@
 #include "../liblogging/logging.h"
 #include "pocsag.h"
 #include "frame.h"
+#include "dsp.h"
 #include <ctype.h>
 
 #define CHAN pocsag->sender.kanal
@@ -1210,6 +1211,9 @@ int64_t get_codeword(pocsag_t *pocsag)
 		}
 		/* if we are about to send an address codeword, we search for a pending message */
 		for (msg = pocsag->msg_list; msg; msg = msg->next) {
+			/* skip messages for different speed/polarity group */
+			if (msg->speed != pocsag->tx_speed || msg->polarity != pocsag->tx_polarity)
+				continue;
 			/* if a message matches the right time slot */
 			if ((msg->ric & 7) == slot) {
 				/* skip if waiting for retransmit delay */
@@ -1272,14 +1276,18 @@ int64_t get_codeword(pocsag_t *pocsag)
 		/* count codewords */
 		if (++pocsag->word_count == 17) {
 			pocsag->word_count = 0;
+			pocsag->batch_count++;
+
 			/*
-			 * Go idle if no message is ready to send.
-			 * Messages waiting for retransmit delay are in msg_list
-			 * but not eligible yet — don't keep transmitting idle
-			 * batches while waiting. The transmitter will restart
-			 * with preamble when a message becomes eligible.
+			 * Check if we should end this transmission:
+			 * 1. No more messages for current speed/polarity group
+			 * 2. Reached MAX_BATCHES_PER_TX limit
+			 *
+			 * After ending, check if messages exist at a different
+			 * speed/polarity and start a new transmission for them.
 			 */
-			int any_ready = 0;
+			int any_ready_this_group = 0;
+			int any_ready_other_group = 0;
 			{
 				pocsag_msg_t *m;
 				struct timeval tv;
@@ -1287,16 +1295,62 @@ int64_t get_codeword(pocsag_t *pocsag)
 				gettimeofday(&tv, NULL);
 				now = (double)tv.tv_sec + tv.tv_usec / 1e6;
 				for (m = pocsag->msg_list; m; m = m->next) {
-					if (m->next_send_time <= 0.0 || now >= m->next_send_time) {
-						any_ready = 1;
-						break;
-					}
+					if (m->next_send_time > 0.0 && now < m->next_send_time)
+						continue;
+					if (m->speed == pocsag->tx_speed && m->polarity == pocsag->tx_polarity)
+						any_ready_this_group = 1;
+					else
+						any_ready_other_group = 1;
 				}
 			}
-			if (!any_ready && pocsag->idle_count++ == IDLE_BATCHES) {
-				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Transmission done.\n");
-				LOGP_CHAN(DPOCSAG, LOGL_DEBUG, "Reached %d of idle batches, turning transmitter off.\n", IDLE_BATCHES);
-				pocsag_new_state(pocsag, POCSAG_IDLE);
+
+			/* Force end if batch limit reached */
+			if (pocsag->max_batches > 0 &&
+			    pocsag->batch_count >= pocsag->max_batches &&
+			    (any_ready_other_group || !any_ready_this_group)) {
+				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Reached %d batch limit, ending transmission.\n", pocsag->max_batches);
+				any_ready_this_group = 0; /* force idle path */
+			}
+
+			if (!any_ready_this_group && pocsag->idle_count++ == IDLE_BATCHES) {
+				if (any_ready_other_group) {
+					/* Switch to next speed/polarity group */
+					pocsag_msg_t *m;
+					struct timeval tv;
+					double now;
+					gettimeofday(&tv, NULL);
+					now = (double)tv.tv_sec + tv.tv_usec / 1e6;
+					for (m = pocsag->msg_list; m; m = m->next) {
+						if (m->next_send_time > 0.0 && now < m->next_send_time)
+							continue;
+						if (m->speed != pocsag->tx_speed || m->polarity != pocsag->tx_polarity) {
+							LOGP_CHAN(DPOCSAG, LOGL_INFO, "Switching to %d baud, %s polarity.\n",
+								  m->speed, (m->polarity < 0) ? "normal" : "inverted");
+							pocsag->tx_speed = m->speed;
+							pocsag->tx_polarity = m->polarity;
+							pocsag->batch_count = 0;
+							/* Reconfigure DSP for new speed/polarity */
+							pocsag->fsk_bitstep = 1.0 / ((double)pocsag->samplerate / (double)m->speed);
+							pocsag->fsk_bitduration = (double)pocsag->samplerate / (double)m->speed;
+							pocsag->fsk_polarity = m->polarity;
+							dsp_init_ramp(pocsag);
+							/* Reset RX state — abort any in-progress decode
+							 * and let the scanner re-acquire at new speed */
+							pocsag->fsk_rx_sync = 0;
+							pocsag->fsk_rx_word = 0;
+							pocsag->rx_rate_locked = 0;
+							pocsag->rx_resync_countdown = 0;
+							/* Start new preamble */
+							pocsag_new_state(pocsag, POCSAG_PREAMBLE);
+							pocsag->word_count = 0;
+							pocsag->idle_count = 0;
+							break;
+						}
+					}
+				} else {
+					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Transmission done.\n");
+					pocsag_new_state(pocsag, POCSAG_IDLE);
+				}
 			}
 		}
 		word = CODEWORD_IDLE;
