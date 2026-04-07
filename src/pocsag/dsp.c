@@ -57,6 +57,112 @@ static inline int hamming32(uint32_t a, uint32_t b)
  */
 #define SYNC_MAX_HAMMING	2
 
+/*
+ * PLL-based clock recovery constants.
+ *
+ * The demodulator uses a phase accumulator that advances at the expected
+ * baud rate, with proportional correction on zero crossings. This is the
+ * same approach used by multimon-ng (since 1996) and our FLEX demodulator.
+ */
+
+/* Phase accumulator range.
+ * Use 24 bits for high precision. At 48000 Hz / 1200 baud:
+ *   pll_inc = 16777216 * 1200 / 48000 = 419430.4 → 419430
+ *   Error per sample: 0.4 / 419430 = 0.000000954 = 0.0001%
+ *   Over one batch (544 bits × 40 samples = 21760 samples):
+ *   drift = 0.4 × 21760 = 8704 phase units out of 419430/bit = 0.02 bits
+ * This is negligible — no bit drift over any realistic transmission. */
+#define PLL_PHASE_MAX		0x1000000u
+
+/* PLL correction gain: pll_inc >> 3 = 12.5% of one bit period per
+ * zero crossing, matching multimon-ng's SPHASEINC/8. Works correctly
+ * because subsampling normalizes samples-per-bit to ~9 at all rates. */
+
+/* Mid-symbol crossing threshold for sync acceptance in scanner.
+ * If the PLL has more than this many consecutive mid-symbol crossings,
+ * reject the sync candidate — the PLL is not tracking valid FSK. */
+#define PLL_NONCONSEC_MAX_SYNC	10
+
+/* Phase boundaries for mid-symbol crossing detection.
+ * In the PLL, phase 0 = just emitted a bit (symbol center).
+ * Phase ~50% = expected FSK transition point.
+ * Phase ~100% = about to emit next bit.
+ *
+ * Crossings in the middle range (10%-90%) are near the expected
+ * transition point — PLL is tracking. Crossings outside this range
+ * (near 0% or 100%, i.e., near symbol centers) indicate noise. */
+#define PLL_PHASE_10PCT		(PLL_PHASE_MAX / 10)
+#define PLL_PHASE_90PCT		(PLL_PHASE_MAX * 9 / 10)
+#define PLL_PHASE_50PCT		(PLL_PHASE_MAX / 2)
+
+/*
+ * PLL-based FSK demodulator: process one audio sample.
+ *
+ * Phase accumulator advances at the expected baud rate. Zero crossings
+ * nudge the phase toward the nearest symbol boundary by a fraction
+ * (12.5%, matching multimon-ng). Bits are emitted at phase wrap, not
+ * at zero crossings — so noise crossings don't produce extra bits.
+ *
+ * Returns 1 if a symbol boundary was reached (bit ready in *bit_out).
+ * Returns 0 if no bit yet.
+ *
+ * Also tracks signal quality:
+ *   nonconsec: consecutive mid-symbol crossings (noise/wrong speed)
+ *   timeout: symbol periods with no crossings (silence/carrier)
+ */
+static inline int pll_process_sample(
+	sample_t sample, double polarity,
+	uint32_t pll_inc,
+	uint32_t *pll_phase, uint8_t *lastsign,
+	uint8_t *nonconsec, uint8_t *timeout,
+	uint8_t *bit_out)
+{
+	uint8_t sign = (sample * polarity > 0.0) ? 1 : 0;
+
+	if (sign != *lastsign) {
+		uint32_t correction = pll_inc >> 3;
+		uint32_t threshold = PLL_PHASE_50PCT - (pll_inc >> 1);
+
+		if (*pll_phase < threshold)
+			*pll_phase += correction;
+		else
+			*pll_phase -= correction;
+
+		/* Mid-symbol crossing classification.
+		 * Crossings near the expected transition point (around 50% of
+		 * phase) are normal for FSK. Crossings far from it (near 0%
+		 * or near 100%, i.e., near the symbol center) indicate noise
+		 * or wrong baud rate. */
+		if (*pll_phase >= PLL_PHASE_10PCT && *pll_phase <= PLL_PHASE_90PCT) {
+			/* Crossing near expected transition point — good */
+			*nonconsec = 0;
+		} else {
+			/* Crossing near symbol center — bad */
+			if (*nonconsec < 255)
+				(*nonconsec)++;
+		}
+
+		*timeout = 0;
+		*lastsign = sign;
+	}
+
+	/* Advance phase accumulator */
+	*pll_phase += pll_inc;
+
+	/* Symbol boundary? */
+	if (*pll_phase >= PLL_PHASE_MAX) {
+		*pll_phase &= (PLL_PHASE_MAX - 1);
+		*bit_out = sign;
+
+		if (*timeout < 255)
+			(*timeout)++;
+
+		return 1;
+	}
+
+	return 0;
+}
+
 void dsp_init_ramp(pocsag_t *pocsag)
 {
         double c;
@@ -71,7 +177,7 @@ void dsp_init_ramp(pocsag_t *pocsag)
                         c = -1.0;
 		else
 	                c = cos((double)(i - 64) / 128.0 * M_PI);
-                pocsag->fsk_ramp_down[i] = c * pocsag->fsk_deviation * pocsag->fsk_polarity;
+                pocsag->fsk_ramp_down[i] = c * pocsag->fsk_deviation * pocsag->fsk_tx_polarity;
                 pocsag->fsk_ramp_up[i] = -pocsag->fsk_ramp_down[i];
         }
 }
@@ -90,12 +196,11 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	sender_set_fm(&pocsag->sender, deviation, baudrate, deviation, MAX_DISPLAY);
 
 	pocsag->fsk_bitduration = (double)samplerate / (double)baudrate;
-	pocsag->fsk_bitstep = 1.0 / pocsag->fsk_bitduration;
 	pocsag->fsk_tx_bitduration = pocsag->fsk_bitduration;
-	pocsag->fsk_tx_bitstep = pocsag->fsk_bitstep;
+	pocsag->fsk_tx_bitstep = 1.0 / pocsag->fsk_bitduration;
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Use %.4f samples for one bit duration @ %d.\n", pocsag->fsk_bitduration, pocsag->sender.samplerate);
 
-	pocsag->fsk_tx_buffer_size = pocsag->fsk_bitduration * 32.0 + 10; /* 32 bit, add some extra to prevent short buffer due to rounding */
+	pocsag->fsk_tx_buffer_size = pocsag->fsk_tx_bitduration * 32.0 + 10; /* 32 bit, add some extra to prevent short buffer due to rounding */
 	pocsag->fsk_tx_buffer = calloc(pocsag->fsk_tx_buffer_size, sizeof(sample_t));
 	if (!pocsag->fsk_tx_buffer) {
 		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory!\n");
@@ -106,6 +211,7 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	/* create deviation and ramp */
 	pocsag->fsk_deviation = 1.0; // equals what we st at sender_set_fm()
 	pocsag->fsk_polarity = polarity;
+	pocsag->fsk_tx_polarity = polarity;
 	dsp_init_ramp(pocsag);
 
 	/* store auto-detection config */
@@ -119,22 +225,38 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	if (auto_baud) {
 		n = 3;
 		for (i = 0; i < 3; i++) {
+			int spb = samplerate / rates[i];
+			int subsamp = spb / 9;
+			if (subsamp < 1) subsamp = 1;
 			pocsag->rx_baud[i].baudrate = rates[i];
-			pocsag->rx_baud[i].bitstep = 1.0 / ((double)samplerate / (double)rates[i]);
-			pocsag->rx_baud[i].phase = 0.0;
-			pocsag->rx_baud[i].lastbit = 0;
+			pocsag->rx_baud[i].subsamp = subsamp;
+			pocsag->rx_baud[i].subsamp_cnt = 0;
+			pocsag->rx_baud[i].pll_inc = (uint32_t)((uint64_t)PLL_PHASE_MAX * rates[i] * subsamp / samplerate);
+			pocsag->rx_baud[i].pll_phase = 0;
+			pocsag->rx_baud[i].lastsign = 0;
+			pocsag->rx_baud[i].nonconsec = 0;
+			pocsag->rx_baud[i].timeout = 0;
 			pocsag->rx_baud[i].word = 0;
 			pocsag->rx_baud[i].word_inv = 0;
 		}
 		LOGP_CHAN(DDSP, LOGL_INFO, "RX baud rate: auto-detect (512/1200/2400).\n");
 	} else {
 		n = 1;
-		pocsag->rx_baud[0].baudrate = baudrate;
-		pocsag->rx_baud[0].bitstep = 1.0 / ((double)samplerate / (double)baudrate);
-		pocsag->rx_baud[0].phase = 0.0;
-		pocsag->rx_baud[0].lastbit = 0;
-		pocsag->rx_baud[0].word = 0;
-		pocsag->rx_baud[0].word_inv = 0;
+		{
+			int spb = samplerate / baudrate;
+			int subsamp = spb / 9;
+			if (subsamp < 1) subsamp = 1;
+			pocsag->rx_baud[0].baudrate = baudrate;
+			pocsag->rx_baud[0].subsamp = subsamp;
+			pocsag->rx_baud[0].subsamp_cnt = 0;
+			pocsag->rx_baud[0].pll_inc = (uint32_t)((uint64_t)PLL_PHASE_MAX * baudrate * subsamp / samplerate);
+			pocsag->rx_baud[0].pll_phase = 0;
+			pocsag->rx_baud[0].lastsign = 0;
+			pocsag->rx_baud[0].nonconsec = 0;
+			pocsag->rx_baud[0].timeout = 0;
+			pocsag->rx_baud[0].word = 0;
+			pocsag->rx_baud[0].word_inv = 0;
+		}
 		LOGP_CHAN(DDSP, LOGL_INFO, "RX baud rate: locked to %d.\n", baudrate);
 	}
 	pocsag->rx_baud_count = n;
@@ -177,11 +299,11 @@ static int fsk_block_encode(pocsag_t *pocsag, uint32_t word)
 	int i, count;
 	uint8_t lastbit;
 
-	devpol = pocsag->fsk_deviation * pocsag->fsk_polarity;
+	devpol = pocsag->fsk_deviation * pocsag->fsk_tx_polarity;
 	spl = pocsag->fsk_tx_buffer;
 	phase = pocsag->fsk_tx_phase;
 	lastbit = pocsag->fsk_tx_lastbit;
-	bitstep = pocsag->fsk_bitstep * 256.0;
+	bitstep = pocsag->fsk_tx_bitstep * 256.0;
 
 	/* add 32 bits */
 	for (i = 0; i < 32; i++) {
@@ -234,18 +356,26 @@ static int fsk_block_encode(pocsag_t *pocsag, uint32_t word)
 
 /*
  * Lock the receiver to a specific baud rate and polarity after sync detection.
- * Reconfigures the main fsk_bitstep/phase so the existing locked-mode decoder
- * (fsk_block_decode / fsk_decode) works at the detected rate.
+ * Initializes the locked-decoder PLL at the detected rate.
  */
 static void dsp_rx_lock(pocsag_t *pocsag, int baudrate, double polarity)
 {
 	pocsag->rx_baud_locked = baudrate;
 	pocsag->rx_polarity_locked = polarity;
-	pocsag->fsk_bitstep = 1.0 / ((double)pocsag->samplerate / (double)baudrate);
 	pocsag->fsk_polarity = polarity;
 	pocsag->rx_rate_locked = 1;
 	pocsag->rx_resync_countdown = 0;
-	pocsag->fsk_rx_phase = 0.0;
+
+	/* Initialize locked decoder PLL.
+	 * Phase, lastsign, and subsamp_cnt are set by the caller from the
+	 * scanner slot that found sync, so the PLL continues seamlessly. */
+	{
+		int spb = pocsag->samplerate / baudrate;
+		int subsamp = spb / 9;
+		if (subsamp < 1) subsamp = 1;
+		pocsag->fsk_rx_subsamp = subsamp;
+		pocsag->fsk_rx_pll_inc = (uint32_t)((uint64_t)PLL_PHASE_MAX * baudrate * subsamp / pocsag->samplerate);
+	}
 }
 
 /*
@@ -260,8 +390,11 @@ static void dsp_rx_unlock(pocsag_t *pocsag)
 	pocsag->rx_resync_countdown = 0;
 
 	for (i = 0; i < pocsag->rx_baud_count; i++) {
-		pocsag->rx_baud[i].phase = 0.0;
-		pocsag->rx_baud[i].lastbit = 0;
+		pocsag->rx_baud[i].pll_phase = 0;
+		pocsag->rx_baud[i].lastsign = 0;
+		pocsag->rx_baud[i].nonconsec = 0;
+		pocsag->rx_baud[i].timeout = 0;
+		pocsag->rx_baud[i].subsamp_cnt = 0;
 		pocsag->rx_baud[i].word = 0;
 		pocsag->rx_baud[i].word_inv = 0;
 	}
@@ -280,7 +413,7 @@ static void dsp_rx_unlock(pocsag_t *pocsag)
  * each bit is ~2ms, so 32 bits = ~62ms — short enough to not miss a
  * new preamble at any rate (576 bits at 2400 baud = 240ms).
  */
-#define RESYNC_TIMEOUT_BITS	32
+#define RESYNC_TIMEOUT_BITS	48
 
 /* forward declaration — fsk_decode_resync calls fsk_decode on unlock */
 static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length);
@@ -296,6 +429,7 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 {
 	if (!pocsag->fsk_rx_sync) {
 		pocsag->fsk_rx_word = (pocsag->fsk_rx_word << 1) | bit;
+		pocsag->fsk_rx_bit_count++;
 		uint32_t w = (uint32_t)pocsag->fsk_rx_word;
 
 		/*
@@ -306,20 +440,31 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 		if (hamming32(w, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
 			uint32_t trial = w;
 			if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
-				int preamble = count_preamble_bits(pocsag->fsk_rx_word);
-				if (w != CODEWORD_SYNC)
-					LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected FSC in locked mode (0x%08x -> 0x%08x) at %d baud, %s polarity (%d%s preamble bits).\n",
-						  w, CODEWORD_SYNC,
-						  pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted",
-						  preamble, (preamble >= 31) ? "+" : "");
-				else
-					LOGP_CHAN(DDSP, LOGL_INFO, "FSC found in locked mode at %d baud, %s polarity (%d%s preamble bits).\n",
-						  pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted",
-						  preamble, (preamble >= 31) ? "+" : "");
+				if (pocsag->rx_resync_countdown > 0) {
+					/* Between batches — no preamble expected */
+					if (w != CODEWORD_SYNC)
+						LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected FSC (0x%08x) at %d baud, %s polarity.\n",
+							  w, pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted");
+					else
+						LOGP_CHAN(DDSP, LOGL_INFO, "FSC found at %d baud, %s polarity.\n",
+							  pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted");
+				} else {
+					/* First batch — report preamble quality */
+					int preamble = count_preamble_bits(pocsag->fsk_rx_word);
+					if (w != CODEWORD_SYNC)
+						LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected FSC (0x%08x) at %d baud, %s polarity (%d%s preamble bits).\n",
+							  w, pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted",
+							  preamble, (preamble >= 31) ? "+" : "");
+					else
+						LOGP_CHAN(DDSP, LOGL_INFO, "FSC found at %d baud, %s polarity (%d%s preamble bits).\n",
+							  pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted",
+							  preamble, (preamble >= 31) ? "+" : "");
+				}
 				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 				pocsag->fsk_rx_sync = 16;
 				pocsag->fsk_rx_index = 0;
 				pocsag->rx_resync_countdown = 0;
+				pocsag->fsk_rx_bit_count = 0;
 			}
 		} else if (hamming32(w, (uint32_t)(~CODEWORD_SYNC)) <= SYNC_MAX_HAMMING) {
 			uint32_t trial = ~w;
@@ -331,7 +476,7 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 						  (new_pol < 0) ? "normal" : "inverted",
 						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, pocsag->rx_baud_locked, new_pol);
-					pocsag->fsk_rx_lastbit = !pocsag->fsk_rx_lastbit;
+					pocsag->fsk_rx_lastsign = !pocsag->fsk_rx_lastsign;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
 					pocsag->fsk_rx_index = 0;
@@ -344,8 +489,27 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 
 		/* count down resync timeout AFTER FSC checks */
 		if (pocsag->rx_resync_countdown > 0) {
+			/*
+			 * Frame-level sanity check: during the between-batch
+			 * FSC search, the shift register should only contain
+			 * FSC or noise. If a non-FSC word BCH-corrects to a
+			 * valid codeword, the signal has changed (e.g., new
+			 * transmission at different speed). Immediately unlock
+			 * to prevent phantom messages from garbage data.
+			 */
+			if (pocsag->fsk_rx_bit_count >= 32) {
+				uint32_t trial = w;
+				if (pocsag_bch_correct(&trial, NULL) >= 0 && trial != CODEWORD_SYNC) {
+					LOGP_CHAN(DDSP, LOGL_INFO, "Non-FSC codeword (0x%08x) during resync — signal changed, unlocking.\n", trial);
+					pocsag->rx_resync_countdown = 0;
+					if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity)
+						dsp_rx_unlock(pocsag);
+					return;
+				}
+			}
 			if (--pocsag->rx_resync_countdown == 0) {
-				LOGP_CHAN(DDSP, LOGL_INFO, "No FSC found within %d bits after batch end, unlocking.\n", RESYNC_TIMEOUT_BITS);
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "No FSC found within %d bits after batch end, unlocking (last word=0x%08x, phase=%u, bits_since_fsc=%d).\n",
+					  RESYNC_TIMEOUT_BITS, w, pocsag->fsk_rx_pll_phase, pocsag->fsk_rx_bit_count);
 				if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity)
 					dsp_rx_unlock(pocsag);
 			}
@@ -365,6 +529,9 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 				 * and we unlock for the next preamble.
 				 */
 				pocsag->rx_resync_countdown = RESYNC_TIMEOUT_BITS;
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "Batch complete, searching for next FSC (phase=%u, last_cw=0x%08x).\n",
+					  pocsag->fsk_rx_pll_phase, (uint32_t)pocsag->fsk_rx_word);
+				pocsag->fsk_rx_bit_count = 0;
 			}
 		}
 	}
@@ -433,41 +600,21 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 	int i, s;
 
 	for (i = 0; i < length; i++) {
-		double sample = spl[i];
+		sample_t sample = spl[i];
 
 		for (s = 0; s < pocsag->rx_baud_count; s++) {
 			struct rx_baud_state *st = &pocsag->rx_baud[s];
-			uint8_t got_bit = 0;
-			uint8_t bit_val = 0;
+			uint8_t bit_val;
 
-			/* simple zero-crossing FSK demod per slot */
-			if (sample * polarity > 0.0) {
-				if (!st->lastbit) {
-					st->phase = -0.5;
-					st->lastbit = 1;
-					got_bit = 1; bit_val = 1;
-				} else {
-					st->phase += st->bitstep;
-					if (st->phase >= 1.0) {
-						st->phase -= 1.0;
-						got_bit = 1; bit_val = 1;
-					}
-				}
-			} else {
-				if (st->lastbit) {
-					st->phase = -0.5;
-					st->lastbit = 0;
-					got_bit = 1; bit_val = 0;
-				} else {
-					st->phase += st->bitstep;
-					if (st->phase >= 1.0) {
-						st->phase -= 1.0;
-						got_bit = 1; bit_val = 0;
-					}
-				}
-			}
+			/* PLL-based FSK demod per slot (with subsampling) */
+			if (++st->subsamp_cnt < st->subsamp)
+				continue;
+			st->subsamp_cnt = 0;
 
-			if (!got_bit)
+			if (!pll_process_sample(sample, polarity, st->pll_inc,
+						&st->pll_phase, &st->lastsign,
+						&st->nonconsec, &st->timeout,
+						&bit_val))
 				continue;
 
 			/* shift bit into both normal and inverted 64-bit registers */
@@ -478,6 +625,7 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 			 * Sync detection with tiered acceptance:
 			 *   - Exact match: accept immediately (no preamble needed)
 			 *   - BCH-corrected (hamming ≤ 2): require preamble
+			 *   - Both: require PLL tracking (low nonconsec)
 			 *
 			 * Compare lower 32 bits against sync word.
 			 * Upper 32 bits hold preceding data for preamble counting.
@@ -489,12 +637,19 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 
 			/* check normal polarity */
 			if (w == CODEWORD_SYNC) {
+				if (st->nonconsec >= PLL_NONCONSEC_MAX_SYNC) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG, "Sync candidate rejected at %d baud, %s polarity (nonconsec=%d).\n",
+						  st->baudrate, (polarity < 0) ? "normal" : "inverted", st->nonconsec);
+					goto check_inverted;
+				}
 				int preamble = count_preamble_bits(st->word);
 				LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (%d%s preamble bits).\n",
 					  st->baudrate, (polarity < 0) ? "normal" : "inverted",
 					  preamble, (preamble >= 31) ? "+" : "");
 				dsp_rx_lock(pocsag, st->baudrate, polarity);
-				pocsag->fsk_rx_lastbit = st->lastbit;
+				pocsag->fsk_rx_pll_phase = st->pll_phase;
+				pocsag->fsk_rx_lastsign = st->lastsign;
+				pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
 				pocsag->fsk_rx_word = CODEWORD_SYNC;
 				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 				pocsag->fsk_rx_sync = 16;
@@ -502,7 +657,8 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 				*consumed = i + 1;
 				return 1;
 			}
-			if (count_preamble_bits(st->word) >= MIN_PREAMBLE_BITS_BCH
+			if (st->nonconsec < PLL_NONCONSEC_MAX_SYNC
+			    && count_preamble_bits(st->word) >= MIN_PREAMBLE_BITS_BCH
 			    && hamming32(w, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
 				uint32_t trial = w;
 				if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
@@ -511,7 +667,9 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 						  st->baudrate, (polarity < 0) ? "normal" : "inverted",
 						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, st->baudrate, polarity);
-					pocsag->fsk_rx_lastbit = st->lastbit;
+					pocsag->fsk_rx_pll_phase = st->pll_phase;
+					pocsag->fsk_rx_lastsign = st->lastsign;
+				pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
@@ -520,16 +678,21 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 					return 1;
 				}
 			}
+check_inverted:
 			/* check inverted polarity (only if auto-detecting polarity) */
 			if (pocsag->rx_auto_polarity) {
 				if (w_inv == CODEWORD_SYNC) {
+					if (st->nonconsec >= PLL_NONCONSEC_MAX_SYNC)
+						continue;
 					double inv_pol = -polarity;
 					int preamble = count_preamble_bits(st->word_inv);
 					LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (inverted, %d%s preamble bits).\n",
 						  st->baudrate, (inv_pol < 0) ? "normal" : "inverted",
 						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, st->baudrate, inv_pol);
-					pocsag->fsk_rx_lastbit = !st->lastbit;
+					pocsag->fsk_rx_pll_phase = st->pll_phase;
+					pocsag->fsk_rx_lastsign = !st->lastsign;
+					pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
@@ -537,7 +700,8 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 					*consumed = i + 1;
 					return 1;
 				}
-				if (count_preamble_bits(st->word_inv) >= MIN_PREAMBLE_BITS_BCH
+				if (st->nonconsec < PLL_NONCONSEC_MAX_SYNC
+				    && count_preamble_bits(st->word_inv) >= MIN_PREAMBLE_BITS_BCH
 				    && hamming32(w_inv, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
 					uint32_t trial = w_inv;
 					if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
@@ -547,7 +711,9 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 							  st->baudrate, (inv_pol < 0) ? "normal" : "inverted",
 							  preamble, (preamble >= 31) ? "+" : "");
 						dsp_rx_lock(pocsag, st->baudrate, inv_pol);
-						pocsag->fsk_rx_lastbit = !st->lastbit;
+						pocsag->fsk_rx_pll_phase = st->pll_phase;
+						pocsag->fsk_rx_lastsign = !st->lastsign;
+					pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
 						pocsag->fsk_rx_word = CODEWORD_SYNC;
 						put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 						pocsag->fsk_rx_sync = 16;
@@ -571,139 +737,100 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
  */
 static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 {
-	double phase, bitstep, polarity;
+	double polarity;
+	uint32_t pll_phase, pll_inc;
+	uint8_t lastsign;
+	uint8_t nonconsec = 0, timeout = 0; /* unused, required by pll_process_sample */
+	int subsamp, subsamp_cnt;
 	int i;
-	uint8_t lastbit;
 
 	polarity = pocsag->fsk_polarity;
-	phase = pocsag->fsk_rx_phase;
-	lastbit = pocsag->fsk_rx_lastbit;
-	bitstep = pocsag->fsk_bitstep;
+	pll_phase = pocsag->fsk_rx_pll_phase;
+	pll_inc = pocsag->fsk_rx_pll_inc;
+	lastsign = pocsag->fsk_rx_lastsign;
+	subsamp = pocsag->fsk_rx_subsamp;
+	subsamp_cnt = pocsag->fsk_rx_subsamp_cnt;
 
 	for (i = 0; i < length; i++) {
-		if (*spl++ * polarity > 0.0) {
-			if (lastbit) {
-				phase += bitstep;
-				if (phase >= 1.0) {
-					phase -= 1.0;
-					fsk_block_decode(pocsag, 1);
-				}
-			} else {
-				phase = -0.5;
-				fsk_block_decode(pocsag, 1);
-				lastbit = 1;
-			}
-		} else {
-			if (lastbit) {
-				phase = -0.5;
-				fsk_block_decode(pocsag, 0);
-				lastbit = 0;
-			} else {
-				phase += bitstep;
-				if (phase >= 1.0) {
-					phase -= 1.0;
-					fsk_block_decode(pocsag, 0);
-				}
-			}
-		}
+		uint8_t bit_val;
+
+		if (++subsamp_cnt < subsamp)
+			continue;
+		subsamp_cnt = 0;
+
+		if (!pll_process_sample(spl[i], polarity, pll_inc,
+					&pll_phase, &lastsign,
+					&nonconsec, &timeout,
+					&bit_val))
+			continue;
+
+		fsk_block_decode(pocsag, bit_val);
 	}
 
-	pocsag->fsk_rx_phase = phase;
-	pocsag->fsk_rx_lastbit = lastbit;
+	pocsag->fsk_rx_pll_phase = pll_phase;
+	pocsag->fsk_rx_lastsign = lastsign;
+	pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 }
 
 /*
- * Between-batches decoder: runs the locked decoder AND the multi-rate
- * scanner in parallel on the same samples.
- *
- * The locked decoder searches for the next FSC at the current rate
- * (same transmission continuing). The scanner searches for a new
- * preamble+sync at any rate (new transmission starting).
- *
- * Whoever finds a match first wins:
- *   - Locked decoder finds FSC → continue at same rate (fsk_rx_sync set)
- *   - Scanner finds preamble+sync → switch to new rate (dsp_rx_lock called)
- *   - Resync timeout expires → unlock, scanner takes over
- *
- * We process sample-by-sample so both paths see every sample.
+ * Between-batches decoder: runs the locked decoder PLL searching for
+ * the next FSC at the current rate. The scanner is NOT run here — it
+ * only runs when fully unlocked (transmission ended).
  */
 static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
 {
-	double phase, bitstep, polarity;
-	int i, scan_consumed;
-	uint8_t lastbit;
+	double polarity;
+	uint32_t pll_phase, pll_inc;
+	uint8_t lastsign;
+	uint8_t nonconsec = 0, timeout = 0; /* unused, required by pll_process_sample */
+	int subsamp, subsamp_cnt;
+	int i;
 
 	polarity = pocsag->fsk_polarity;
-	phase = pocsag->fsk_rx_phase;
-	lastbit = pocsag->fsk_rx_lastbit;
-	bitstep = pocsag->fsk_bitstep;
+	pll_phase = pocsag->fsk_rx_pll_phase;
+	pll_inc = pocsag->fsk_rx_pll_inc;
+	lastsign = pocsag->fsk_rx_lastsign;
+	subsamp = pocsag->fsk_rx_subsamp;
+	subsamp_cnt = pocsag->fsk_rx_subsamp_cnt;
 
 	for (i = 0; i < length; i++) {
-		/* Feed one sample to the locked decoder (searching for next FSC) */
-		if (spl[i] * polarity > 0.0) {
-			if (lastbit) {
-				phase += bitstep;
-				if (phase >= 1.0) {
-					phase -= 1.0;
-					fsk_block_decode(pocsag, 1);
-				}
-			} else {
-				phase = -0.5;
-				fsk_block_decode(pocsag, 1);
-				lastbit = 1;
-			}
-		} else {
-			if (lastbit) {
-				phase = -0.5;
-				fsk_block_decode(pocsag, 0);
-				lastbit = 0;
-			} else {
-				phase += bitstep;
-				if (phase >= 1.0) {
-					phase -= 1.0;
-					fsk_block_decode(pocsag, 0);
-				}
-			}
+		uint8_t bit_val;
+
+		if (++subsamp_cnt < subsamp)
+			continue;
+		subsamp_cnt = 0;
+
+		if (pll_process_sample(spl[i], polarity, pll_inc,
+				       &pll_phase, &lastsign,
+				       &nonconsec, &timeout,
+				       &bit_val)) {
+			fsk_block_decode(pocsag, bit_val);
 		}
 
 		/* Did the locked decoder find the next FSC? */
 		if (pocsag->fsk_rx_sync) {
-			/* Yes — save state and hand remaining samples to locked decoder */
-			pocsag->fsk_rx_phase = phase;
-			pocsag->fsk_rx_lastbit = lastbit;
+			pocsag->fsk_rx_pll_phase = pll_phase;
+			pocsag->fsk_rx_lastsign = lastsign;
+			pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 			if (i + 1 < length)
 				fsk_decode_locked(pocsag, spl + i + 1, length - i - 1);
 			return;
 		}
 
-		/* Did the resync timeout expire (unlock happened)? */
+		/* Did the resync timeout expire? Unlock and let scanner take over. */
 		if (!pocsag->rx_rate_locked) {
-			/* Yes — hand remaining samples to the scanner */
-			pocsag->fsk_rx_phase = phase;
-			pocsag->fsk_rx_lastbit = lastbit;
+			pocsag->fsk_rx_pll_phase = pll_phase;
+			pocsag->fsk_rx_lastsign = lastsign;
+			pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 			if (i + 1 < length)
 				fsk_decode(pocsag, spl + i + 1, length - i - 1);
 			return;
 		}
-
-		/* Feed the same sample to the multi-rate scanner in parallel */
-		if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity) {
-			if (fsk_decode_scan(pocsag, spl + i, 1, &scan_consumed)) {
-				/*
-				 * Scanner found preamble+sync at a different rate.
-				 * dsp_rx_lock() was called, which reconfigured
-				 * fsk_bitstep/fsk_polarity. Hand remaining samples
-				 * to the locked decoder at the new rate.
-				 */
-				if (i + 1 < length)
-					fsk_decode_locked(pocsag, spl + i + 1, length - i - 1);
-				return;
-			}
-		}
 	}
 
-	pocsag->fsk_rx_phase = phase;
-	pocsag->fsk_rx_lastbit = lastbit;
+	pocsag->fsk_rx_pll_phase = pll_phase;
+	pocsag->fsk_rx_lastsign = lastsign;
+	pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 }
 
 /*
@@ -714,10 +841,8 @@ static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
  * 1. Synced (fsk_rx_sync > 0): Actively decoding a batch at locked rate.
  *
  * 2. Rate-locked, between batches (rx_rate_locked && !fsk_rx_sync):
- *    Run locked decoder AND multi-rate scanner in parallel. Per POCSAG spec,
- *    all batches in a transmission use the same rate, so the locked decoder
- *    searches for the next FSC. But a new transmission at a different rate
- *    could start, so the scanner runs simultaneously on the same samples.
+ *    Run locked decoder PLL only, searching for next FSC at same rate.
+ *    Per POCSAG spec, all batches in a transmission use the same rate.
  *
  * 3. Unlocked (!rx_rate_locked && !fsk_rx_sync): No active transmission.
  *    Run the multi-rate preamble+sync scanner only.

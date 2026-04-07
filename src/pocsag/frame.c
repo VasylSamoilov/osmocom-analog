@@ -355,7 +355,7 @@ static int debug_word(uint32_t *word, int slot, uint32_t *corrections_out)
 	if (pocsag_crc(*word >> 11) != ((*word >> 1) & 0x3ff) || pocsag_parity(*word)) {
 		bch_rc = pocsag_bch_correct(word, corrections_out);
 		if (bch_rc < 0) {
-			LOGP(DPOCSAG, LOGL_NOTICE, "Uncorrectable error in codeword 0x%08x.\n", *word);
+			LOGP(DPOCSAG, LOGL_NOTICE, "Bad codeword 0x%08x (BCH failed).\n", *word);
 			return -EINVAL;
 		}
 		LOGP(DPOCSAG, LOGL_INFO, "BCH corrected %d bit(s) in codeword -> 0x%08x (mask: 0x%08x).\n",
@@ -1137,6 +1137,54 @@ int64_t get_codeword(pocsag_t *pocsag)
 	switch (pocsag->state) {
 	case POCSAG_IDLE:
 		return -1;
+	case POCSAG_SILENCE:
+		/*
+		 * Silence gap between speed/polarity switches.
+		 * Return -1 (power off) for 2 words at 512 baud timing
+		 * to give the RX time to detect signal loss and unlock.
+		 */
+		if (pocsag->word_count == 0) {
+			/* Ensure TX buffer is large enough for 512 baud */
+			double slow_bitduration = (double)pocsag->samplerate / 512.0;
+			int need_size = (int)(slow_bitduration * 32.0 + 10);
+			if (need_size > pocsag->fsk_tx_buffer_size) {
+				sample_t *nb = realloc(pocsag->fsk_tx_buffer, need_size * sizeof(sample_t));
+				if (nb) {
+					pocsag->fsk_tx_buffer = nb;
+					pocsag->fsk_tx_buffer_size = need_size;
+				}
+			}
+			pocsag->fsk_tx_bitstep = 1.0 / slow_bitduration;
+			pocsag->fsk_tx_bitduration = slow_bitduration;
+			LOGP_CHAN(DPOCSAG, LOGL_INFO, "Speed switch: silence gap.\n");
+		}
+		pocsag->word_count++;
+		if (pocsag->word_count >= 3) {
+			/* Silence complete. Reconfigure TX DSP for new speed. */
+			pocsag->fsk_tx_bitstep = 1.0 / ((double)pocsag->samplerate / (double)pocsag->tx_speed);
+			pocsag->fsk_tx_bitduration = (double)pocsag->samplerate / (double)pocsag->tx_speed;
+			pocsag->fsk_tx_polarity = pocsag->tx_polarity;
+			dsp_init_ramp(pocsag);
+			{
+				int new_size = (int)(pocsag->fsk_tx_bitduration * 32.0 + 10);
+				if (new_size > pocsag->fsk_tx_buffer_size) {
+					sample_t *nb = realloc(pocsag->fsk_tx_buffer, new_size * sizeof(sample_t));
+					if (nb) {
+						pocsag->fsk_tx_buffer = nb;
+						pocsag->fsk_tx_buffer_size = new_size;
+					}
+				}
+			}
+			/* Reset TX phase so preamble starts clean */
+			pocsag->fsk_tx_phase = 0.0;
+			pocsag->fsk_tx_lastbit = 0;
+			pocsag_new_state(pocsag, POCSAG_PREAMBLE);
+			pocsag->word_count = 0;
+			pocsag->idle_count = 0;
+			LOGP_CHAN(DPOCSAG, LOGL_INFO, "Silence complete, starting preamble at %d baud, %s polarity.\n",
+				  pocsag->tx_speed, (pocsag->tx_polarity < 0) ? "normal" : "inverted");
+		}
+		return -1; /* power off */
 	case POCSAG_PREAMBLE:
 		if (!pocsag->word_count)
 			LOGP_CHAN(DPOCSAG, LOGL_INFO, "Sending preamble.\n");
@@ -1329,19 +1377,9 @@ int64_t get_codeword(pocsag_t *pocsag)
 							pocsag->tx_speed = m->speed;
 							pocsag->tx_polarity = m->polarity;
 							pocsag->batch_count = 0;
-							/* Reconfigure DSP for new speed/polarity */
-							pocsag->fsk_bitstep = 1.0 / ((double)pocsag->samplerate / (double)m->speed);
-							pocsag->fsk_bitduration = (double)pocsag->samplerate / (double)m->speed;
-							pocsag->fsk_polarity = m->polarity;
-							dsp_init_ramp(pocsag);
-							/* Reset RX state — abort any in-progress decode
-							 * and let the scanner re-acquire at new speed */
-							pocsag->fsk_rx_sync = 0;
-							pocsag->fsk_rx_word = 0;
-							pocsag->rx_rate_locked = 0;
-							pocsag->rx_resync_countdown = 0;
-							/* Start new preamble */
-							pocsag_new_state(pocsag, POCSAG_PREAMBLE);
+							/* Enter silence gap before new preamble.
+							 * TX DSP reconfiguration happens at end of silence. */
+							pocsag_new_state(pocsag, POCSAG_SILENCE);
 							pocsag->word_count = 0;
 							pocsag->idle_count = 0;
 							break;

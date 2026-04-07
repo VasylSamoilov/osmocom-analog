@@ -96,6 +96,7 @@ enum pocsag_state {
 	POCSAG_IDLE = 0,
 	POCSAG_PREAMBLE,
 	POCSAG_MESSAGE,
+	POCSAG_SILENCE,		/* TX silence gap between speed/polarity switches */
 };
 
 enum pocsag_language {
@@ -248,8 +249,7 @@ typedef struct pocsag {
 	double			fsk_tx_polarity;	/* TX polarity (may differ during speed switching) */
 	sample_t		fsk_ramp_up[256];	/* samples of upward ramp shape */
 	sample_t		fsk_ramp_down[256];	/* samples of downward ramp shape */
-	double			fsk_bitduration;	/* duration of a bit in samples — RX */
-	double			fsk_bitstep;		/* fraction of a bit each sample — RX */
+	double			fsk_bitduration;	/* duration of a bit in samples — used for TX buffer sizing */
 	double			fsk_tx_bitduration;	/* TX bit duration (may differ during speed switching) */
 	double			fsk_tx_bitstep;		/* TX bit step */
 	sample_t		*fsk_tx_buffer;		/* tx buffer for one data block */
@@ -258,11 +258,15 @@ typedef struct pocsag {
 	int			fsk_tx_buffer_pos;	/* current position sending buffer */
 	double			fsk_tx_phase;		/* current bit position */
 	uint8_t			fsk_tx_lastbit;		/* last bit of last message, to correctly ramp */
-	double			fsk_rx_phase;		/* current sample position */
-	uint8_t			fsk_rx_lastbit;		/* last bit of last message, to detect level */
+	uint32_t		fsk_rx_pll_inc;		/* PLL phase increment per (subsampled) sample */
+	uint32_t		fsk_rx_pll_phase;	/* PLL phase accumulator */
+	int			fsk_rx_subsamp;		/* subsample factor */
+	int			fsk_rx_subsamp_cnt;	/* subsample counter */
+	uint8_t			fsk_rx_lastsign;	/* sign of last sample (0=neg, 1=pos) */
 	uint64_t		fsk_rx_word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync/codeword */
 	int			fsk_rx_sync;		/* counts down to next sync */
 	int			fsk_rx_index;		/* counts bits of received codeword */
+	int			fsk_rx_bit_count;	/* bits since last FSC (for non-FSC codeword check) */
 
 	/* auto-detection state for baud rate and polarity */
 	int			rx_auto_baud;		/* 1 = auto-detect baud rate */
@@ -280,9 +284,13 @@ typedef struct pocsag {
 	 */
 	struct rx_baud_state {
 		int		baudrate;	/* baud rate for this slot */
-		double		bitstep;	/* 1.0 / (samplerate / baudrate) */
-		double		phase;		/* sample phase accumulator */
-		uint8_t		lastbit;	/* last demodulated bit */
+		uint32_t	pll_inc;	/* phase increment per (subsampled) sample */
+		uint32_t	pll_phase;	/* PLL phase accumulator */
+		int		subsamp;	/* subsample factor: process every Nth sample */
+		int		subsamp_cnt;	/* subsample counter */
+		uint8_t		lastsign;	/* sign of last sample (0=neg, 1=pos) */
+		uint8_t		nonconsec;	/* consecutive mid-symbol zero crossings */
+		uint8_t		timeout;	/* symbol periods with no zero crossing */
 		uint64_t	word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync detect */
 		uint64_t	word_inv;	/* same, inverted polarity */
 	} rx_baud[3];

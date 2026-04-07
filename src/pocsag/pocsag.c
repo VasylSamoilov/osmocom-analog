@@ -207,6 +207,7 @@ const char *pocsag_state_name[] = {
 	"IDLE",
 	"PREAMBLE",
 	"MESSAGE",
+	"SILENCE",
 };
 
 /*
