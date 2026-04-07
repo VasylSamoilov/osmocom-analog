@@ -247,7 +247,7 @@ typedef struct pocsag {
 	uint8_t			fsk_tx_lastbit;		/* last bit of last message, to correctly ramp */
 	double			fsk_rx_phase;		/* current sample position */
 	uint8_t			fsk_rx_lastbit;		/* last bit of last message, to detect level */
-	uint32_t		fsk_rx_word;		/* shift register to receive codeword */
+	uint64_t		fsk_rx_word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync/codeword */
 	int			fsk_rx_sync;		/* counts down to next sync */
 	int			fsk_rx_index;		/* counts bits of received codeword */
 
@@ -270,12 +270,8 @@ typedef struct pocsag {
 		double		bitstep;	/* 1.0 / (samplerate / baudrate) */
 		double		phase;		/* sample phase accumulator */
 		uint8_t		lastbit;	/* last demodulated bit */
-		uint32_t	word;		/* 32-bit shift register (normal polarity) */
-		uint32_t	word_inv;	/* 32-bit shift register (inverted polarity) */
-		int		preamble_count;	/* consecutive alternating bits seen */
-		uint8_t		prev_bit;	/* previous bit for alternation check */
-		uint8_t		prev_bit_inv;	/* previous bit (inverted) for alternation check */
-		int		preamble_count_inv; /* alternating bits seen (inverted polarity) */
+		uint64_t	word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync detect */
+		uint64_t	word_inv;	/* same, inverted polarity */
 	} rx_baud[3];
 	int			rx_baud_count;	/* number of active baud slots */
 } pocsag_t;

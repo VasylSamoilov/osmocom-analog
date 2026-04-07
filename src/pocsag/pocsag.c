@@ -516,7 +516,7 @@ void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint
 		tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
 		tm->tm_hour, tm->tm_min, tm->tm_sec, (int)(tv.tv_usec / 10000.0),
 		channel, ric, pocsag_function_name[function], pocsag_msg_type_name(msg_type),
-		baudrate, (polarity < 0) ? "neg" : "pos");
+		baudrate, (polarity < 0) ? "normal" : "inverted");
 	p = strchr(text, '\0');
 
 	if (message && message[0]) {
@@ -731,8 +731,9 @@ static void parse_pocsag_options(const char *opts, int opts_len,
 			/* TODO: per-message baud rate requires DSP reconfiguration */
 		}
 		else if (!strcmp(key, "polarity")) {
-			if (val[0] != 'n' && val[0] != 'N' && val[0] != 'p' && val[0] != 'P')
-				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid polarity '%s', use neg/pos.\n", val);
+			if (val[0] != 'n' && val[0] != 'N' && val[0] != 'i' && val[0] != 'I' &&
+			    val[0] != 'p' && val[0] != 'P')
+				LOGP(DNMT, LOGL_NOTICE, "FIFO: invalid polarity '%s', use normal/inverted.\n", val);
 			/* TODO: per-message polarity requires DSP reconfiguration */
 		}
 		else if (!strcmp(key, "repeat")) {
@@ -772,7 +773,7 @@ static void parse_pocsag_options(const char *opts, int opts_len,
  *   - options: space-separated key=value pairs (can be empty):
  *       charset=default|german|skyper|cyrillic  (overrides -L)
  *       speed=512|1200|2400  (reserved for future use)
- *       polarity=neg|pos  (reserved for future use)
+ *       polarity=normal|inverted  (reserved for future use)
  *   - message: message content (may contain escape sequences)
  *
  * Examples:

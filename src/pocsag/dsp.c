@@ -123,10 +123,6 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 			pocsag->rx_baud[i].lastbit = 0;
 			pocsag->rx_baud[i].word = 0;
 			pocsag->rx_baud[i].word_inv = 0;
-			pocsag->rx_baud[i].preamble_count = 0;
-			pocsag->rx_baud[i].preamble_count_inv = 0;
-			pocsag->rx_baud[i].prev_bit = 0;
-			pocsag->rx_baud[i].prev_bit_inv = 0;
 		}
 		LOGP_CHAN(DDSP, LOGL_INFO, "RX baud rate: auto-detect (512/1200/2400).\n");
 	} else {
@@ -137,10 +133,6 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 		pocsag->rx_baud[0].lastbit = 0;
 		pocsag->rx_baud[0].word = 0;
 		pocsag->rx_baud[0].word_inv = 0;
-		pocsag->rx_baud[0].preamble_count = 0;
-		pocsag->rx_baud[0].preamble_count_inv = 0;
-		pocsag->rx_baud[0].prev_bit = 0;
-		pocsag->rx_baud[0].prev_bit_inv = 0;
 		LOGP_CHAN(DDSP, LOGL_INFO, "RX baud rate: locked to %d.\n", baudrate);
 	}
 	pocsag->rx_baud_count = n;
@@ -148,7 +140,7 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	if (auto_polarity)
 		LOGP_CHAN(DDSP, LOGL_INFO, "RX polarity: auto-detect.\n");
 	else
-		LOGP_CHAN(DDSP, LOGL_INFO, "RX polarity: locked to %s.\n", (polarity < 0) ? "negative" : "positive");
+		LOGP_CHAN(DDSP, LOGL_INFO, "RX polarity: locked to %s.\n", (polarity < 0) ? "normal" : "inverted");
 
 	return 0;
 
@@ -251,7 +243,6 @@ static void dsp_rx_lock(pocsag_t *pocsag, int baudrate, double polarity)
 	pocsag->fsk_polarity = polarity;
 	pocsag->rx_rate_locked = 1;
 	pocsag->rx_resync_countdown = 0;
-	/* reset main decoder phase to align with the sync we just found */
 	pocsag->fsk_rx_phase = 0.0;
 }
 
@@ -271,10 +262,6 @@ static void dsp_rx_unlock(pocsag_t *pocsag)
 		pocsag->rx_baud[i].lastbit = 0;
 		pocsag->rx_baud[i].word = 0;
 		pocsag->rx_baud[i].word_inv = 0;
-		pocsag->rx_baud[i].preamble_count = 0;
-		pocsag->rx_baud[i].preamble_count_inv = 0;
-		pocsag->rx_baud[i].prev_bit = 0;
-		pocsag->rx_baud[i].prev_bit_inv = 0;
 	}
 }
 
@@ -296,52 +283,76 @@ static void dsp_rx_unlock(pocsag_t *pocsag)
 /* forward declaration — fsk_decode_resync calls fsk_decode on unlock */
 static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length);
 
+/* Minimum alternating bits to qualify as preamble (used for
+ * BCH-corrected sync gating). */
+#define MIN_PREAMBLE_BITS_BCH	8
+
+/* Count preamble bits preceding a sync word in a 64-bit shift register. */
+static int count_preamble_bits(uint64_t word);
+
 static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 {
 	if (!pocsag->fsk_rx_sync) {
 		pocsag->fsk_rx_word = (pocsag->fsk_rx_word << 1) | bit;
-
-		/* count down resync timeout if we're between batches */
-		if (pocsag->rx_resync_countdown > 0) {
-			if (--pocsag->rx_resync_countdown == 0) {
-				/* failed to find next FSC — transmission ended */
-				LOGP_CHAN(DDSP, LOGL_INFO, "No FSC found within %d bits after batch end, unlocking.\n", RESYNC_TIMEOUT_BITS);
-				if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity)
-					dsp_rx_unlock(pocsag);
-			}
-		}
+		uint32_t w = (uint32_t)pocsag->fsk_rx_word;
 
 		/*
-		 * Check for sync word with BCH error correction.
-		 * The sync word (0x7CD215D8) is a valid BCH(31,21) codeword,
-		 * so we can attempt correction on the shift register contents.
-		 * In locked mode we already know the rate and polarity, so
-		 * the preamble requirement is not needed — just find the FSC.
-		 *
-		 * Use hamming distance as fast pre-filter to avoid expensive
-		 * BCH correction on every bit.
+		 * Check for sync word BEFORE countdown — the FSC is 32 bits,
+		 * same as the timeout. If we check countdown first, we'd
+		 * unlock on the last bit of the FSC before detecting it.
 		 */
-		if (hamming32(pocsag->fsk_rx_word, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
-			uint32_t trial = pocsag->fsk_rx_word;
+		if (hamming32(w, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
+			uint32_t trial = w;
 			if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
-				if (pocsag->fsk_rx_word != CODEWORD_SYNC)
-					LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync (0x%08x -> 0x%08x).\n",
-						  pocsag->fsk_rx_word, CODEWORD_SYNC);
+				int preamble = count_preamble_bits(pocsag->fsk_rx_word);
+				if (w != CODEWORD_SYNC)
+					LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected FSC in locked mode (0x%08x -> 0x%08x) at %d baud, %s polarity (%d%s preamble bits).\n",
+						  w, CODEWORD_SYNC,
+						  pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted",
+						  preamble, (preamble >= 31) ? "+" : "");
+				else
+					LOGP_CHAN(DDSP, LOGL_INFO, "FSC found in locked mode at %d baud, %s polarity (%d%s preamble bits).\n",
+						  pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted",
+						  preamble, (preamble >= 31) ? "+" : "");
 				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 				pocsag->fsk_rx_sync = 16;
 				pocsag->fsk_rx_index = 0;
 				pocsag->rx_resync_countdown = 0;
 			}
-		} else if (hamming32(pocsag->fsk_rx_word, (uint32_t)(~CODEWORD_SYNC)) <= SYNC_MAX_HAMMING) {
-			uint32_t trial = ~pocsag->fsk_rx_word;
-			if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC)
-				LOGP_CHAN(DDSP, LOGL_NOTICE, "Received inverted sync (locked mode), caused by wrong polarity or by radio noise.\n");
+		} else if (hamming32(w, (uint32_t)(~CODEWORD_SYNC)) <= SYNC_MAX_HAMMING) {
+			uint32_t trial = ~w;
+			if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
+				if (pocsag->rx_auto_polarity) {
+					double new_pol = -pocsag->fsk_polarity;
+					int preamble = count_preamble_bits(~pocsag->fsk_rx_word);
+					LOGP_CHAN(DDSP, LOGL_INFO, "Inverted FSC in locked mode — flipping to %s polarity (%d%s preamble bits).\n",
+						  (new_pol < 0) ? "normal" : "inverted",
+						  preamble, (preamble >= 31) ? "+" : "");
+					dsp_rx_lock(pocsag, pocsag->rx_baud_locked, new_pol);
+					pocsag->fsk_rx_lastbit = !pocsag->fsk_rx_lastbit;
+					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
+					pocsag->fsk_rx_sync = 16;
+					pocsag->fsk_rx_index = 0;
+					pocsag->rx_resync_countdown = 0;
+				} else {
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "Inverted FSC in locked mode (polarity locked, ignoring).\n");
+				}
+			}
+		}
+
+		/* count down resync timeout AFTER FSC checks */
+		if (pocsag->rx_resync_countdown > 0) {
+			if (--pocsag->rx_resync_countdown == 0) {
+				LOGP_CHAN(DDSP, LOGL_INFO, "No FSC found within %d bits after batch end, unlocking.\n", RESYNC_TIMEOUT_BITS);
+				if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity)
+					dsp_rx_unlock(pocsag);
+			}
 		}
 	} else {
 		pocsag->fsk_rx_word = (pocsag->fsk_rx_word << 1) | bit;
 		if (++pocsag->fsk_rx_index == 32) {
 			pocsag->fsk_rx_index = 0;
-			put_codeword(pocsag, pocsag->fsk_rx_word, (16 - pocsag->fsk_rx_sync) >> 1, pocsag->fsk_rx_sync & 1);
+			put_codeword(pocsag, (uint32_t)pocsag->fsk_rx_word, (16 - pocsag->fsk_rx_sync) >> 1, pocsag->fsk_rx_sync & 1);
 			if (--pocsag->fsk_rx_sync == 0) {
 				/*
 				 * Batch complete. Per POCSAG spec, all batches after
@@ -370,21 +381,30 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
  *   Even 8 alternating preamble bits (probability ~2^-8 for random data)
  *   reduces this to ~7e-6/sec — negligible.
  */
-#define MIN_PREAMBLE_BITS_BCH	8
 
 /*
- * Track preamble quality: count consecutive alternating bits.
- * Preamble is 101010... so each bit must differ from the previous one.
- * If it alternates, increment count; otherwise reset to 1 (current bit
- * starts a potential new run).
+ * Count preamble bits preceding a sync word in a 64-bit shift register.
+ * The lower 32 bits hold the sync word, the upper 32 hold the preceding bits.
+ * Preamble is alternating 1-0, so we count backward from bit 32 (first bit
+ * above the sync word) checking that each bit differs from the previous one.
+ * Returns 0-32. If all 32 upper bits alternate, returns 32 (meaning "32+").
  */
-static inline void track_preamble(uint8_t bit, uint8_t *prev_bit, int *preamble_count)
+static int count_preamble_bits(uint64_t word)
 {
-	if (bit != *prev_bit)
-		(*preamble_count)++;
-	else
-		*preamble_count = 1;
-	*prev_bit = bit;
+	int count = 0;
+	int i;
+	uint8_t prev_bit = (word >> 32) & 1;  /* bit 32: first bit above sync */
+	
+	for (i = 33; i < 64; i++) {
+		uint8_t bit = (word >> i) & 1;
+		if (bit != prev_bit) {
+			count++;
+			prev_bit = bit;
+		} else {
+			break;
+		}
+	}
+	return count;
 }
 
 /*
@@ -448,25 +468,29 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 			if (!got_bit)
 				continue;
 
-			/* shift bit into both normal and inverted registers */
+			/* shift bit into both normal and inverted 64-bit registers */
 			st->word = (st->word << 1) | bit_val;
 			st->word_inv = (st->word_inv << 1) | (bit_val ^ 1);
-
-			/* track preamble alternation for both polarities */
-			track_preamble(bit_val, &st->prev_bit, &st->preamble_count);
-			track_preamble(bit_val ^ 1, &st->prev_bit_inv, &st->preamble_count_inv);
 
 			/*
 			 * Sync detection with tiered acceptance:
 			 *   - Exact match: accept immediately (no preamble needed)
-			 *   - BCH-corrected (hamming ≤ 2): require short preamble
+			 *   - BCH-corrected (hamming ≤ 2): require preamble
 			 *
+			 * Compare lower 32 bits against sync word.
+			 * Upper 32 bits hold preceding data for preamble counting.
 			 * Hamming pre-filter avoids expensive BCH on every bit.
 			 */
+			{
+			uint32_t w = (uint32_t)st->word;
+			uint32_t w_inv = (uint32_t)st->word_inv;
+
 			/* check normal polarity */
-			if (st->word == CODEWORD_SYNC) {
-				LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (%d preamble bits).\n",
-					  st->baudrate, (polarity < 0) ? "negative" : "positive", st->preamble_count);
+			if (w == CODEWORD_SYNC) {
+				int preamble = count_preamble_bits(st->word);
+				LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (%d%s preamble bits).\n",
+					  st->baudrate, (polarity < 0) ? "normal" : "inverted",
+					  preamble, (preamble >= 31) ? "+" : "");
 				dsp_rx_lock(pocsag, st->baudrate, polarity);
 				pocsag->fsk_rx_lastbit = st->lastbit;
 				pocsag->fsk_rx_word = CODEWORD_SYNC;
@@ -476,12 +500,14 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 				*consumed = i + 1;
 				return 1;
 			}
-			if (st->preamble_count >= MIN_PREAMBLE_BITS_BCH
-			    && hamming32(st->word, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
-				uint32_t trial = st->word;
+			if (count_preamble_bits(st->word) >= MIN_PREAMBLE_BITS_BCH
+			    && hamming32(w, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
+				uint32_t trial = w;
 				if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
-					LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync at %d baud, %s polarity (%d preamble bits).\n",
-						  st->baudrate, (polarity < 0) ? "negative" : "positive", st->preamble_count);
+					int preamble = count_preamble_bits(st->word);
+					LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync at %d baud, %s polarity (%d%s preamble bits).\n",
+						  st->baudrate, (polarity < 0) ? "normal" : "inverted",
+						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, st->baudrate, polarity);
 					pocsag->fsk_rx_lastbit = st->lastbit;
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
@@ -494,10 +520,12 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 			}
 			/* check inverted polarity (only if auto-detecting polarity) */
 			if (pocsag->rx_auto_polarity) {
-				if (st->word_inv == CODEWORD_SYNC) {
+				if (w_inv == CODEWORD_SYNC) {
 					double inv_pol = -polarity;
-					LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (inverted, %d preamble bits).\n",
-						  st->baudrate, (inv_pol < 0) ? "negative" : "positive", st->preamble_count_inv);
+					int preamble = count_preamble_bits(st->word_inv);
+					LOGP_CHAN(DDSP, LOGL_INFO, "Sync detected at %d baud, %s polarity (inverted, %d%s preamble bits).\n",
+						  st->baudrate, (inv_pol < 0) ? "normal" : "inverted",
+						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, st->baudrate, inv_pol);
 					pocsag->fsk_rx_lastbit = !st->lastbit;
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
@@ -507,13 +535,15 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 					*consumed = i + 1;
 					return 1;
 				}
-				if (st->preamble_count_inv >= MIN_PREAMBLE_BITS_BCH
-				    && hamming32(st->word_inv, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
-					uint32_t trial = st->word_inv;
+				if (count_preamble_bits(st->word_inv) >= MIN_PREAMBLE_BITS_BCH
+				    && hamming32(w_inv, CODEWORD_SYNC) <= SYNC_MAX_HAMMING) {
+					uint32_t trial = w_inv;
 					if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
 						double inv_pol = -polarity;
-						LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync at %d baud, %s polarity (inverted, %d preamble bits).\n",
-							  st->baudrate, (inv_pol < 0) ? "negative" : "positive", st->preamble_count_inv);
+						int preamble = count_preamble_bits(st->word_inv);
+						LOGP_CHAN(DDSP, LOGL_INFO, "BCH-corrected sync at %d baud, %s polarity (inverted, %d%s preamble bits).\n",
+							  st->baudrate, (inv_pol < 0) ? "normal" : "inverted",
+							  preamble, (preamble >= 31) ? "+" : "");
 						dsp_rx_lock(pocsag, st->baudrate, inv_pol);
 						pocsag->fsk_rx_lastbit = !st->lastbit;
 						pocsag->fsk_rx_word = CODEWORD_SYNC;
@@ -524,6 +554,7 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 						return 1;
 					}
 				}
+			}
 			}
 		}
 	}

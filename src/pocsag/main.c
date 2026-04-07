@@ -83,9 +83,13 @@ void print_help(const char *arg0)
 	printf("        rate. If not given, RX auto-detects from preamble timing.\n");
 	printf(" -D --deviation wide | 4.5 | narrow | 2.5 | <other KHz>\n");
 	printf("        Choose deviation of FFSK signal (default %.0f KHz).\n", deviation / 1000.0);
-	printf(" -P --polarity -1 | negative | 1 | positive\n");
-	printf("        Choose polarity of FFSK signal. 'negative' means that a binary 0 uses\n");
-	printf("        positive and a binary 1 negative deviation. (default %s).\n", (polarity < 0) ? "negative" : "positive");
+	printf(" -P --polarity normal | inverted | -1 | negative | 1 | positive\n");
+	printf("        Choose polarity of FFSK signal. (default %s).\n", (polarity < 0) ? "normal" : "inverted");
+	printf("        'normal' (CCIR Rec. 584 standard): binary 1 = negative deviation,\n");
+	printf("        binary 0 = positive deviation. This is the default for all known\n");
+	printf("        POCSAG networks (Scall, Quix, TeLMI, Skyper, Cityruf, DAPNET).\n");
+	printf("        'inverted': opposite mapping. Rarely used.\n");
+	printf("        Legacy names 'negative'/'positive' are accepted for compatibility.\n");
 	printf("        For RX, locks auto-detection to this polarity. If not given, RX\n");
 	printf("        auto-detects by trying both polarities during sync search.\n");
 	printf(" -F --function 0..3 | A..D\n");
@@ -234,15 +238,17 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 'P':
 		if (argv[argi][0] == 'n' || argv[argi][0] == 'N')
-			polarity = -1.0;
+			polarity = -1.0;  /* "normal" or legacy "negative" */
 		else if (argv[argi][0] == 'p' || argv[argi][0] == 'P')
-			polarity = 1.0;
+			polarity = 1.0;   /* legacy "positive" */
+		else if (argv[argi][0] == 'i' || argv[argi][0] == 'I')
+			polarity = 1.0;   /* "inverted" */
 		else if (atoi(argv[argi]) == -1)
 			polarity = -1.0;
 		else if (atoi(argv[argi]) == 1)
 			polarity = 1.0;
 		else {
-			fprintf(stderr, "Given polarity is not positive nor negative, use '-h' for help.\n");
+			fprintf(stderr, "Given polarity is invalid, use 'normal', 'inverted', or '-h' for help.\n");
 			return -EINVAL;
 		}
 		polarity_given = 1;

@@ -1339,9 +1339,12 @@ static void done_rx_msg(pocsag_t *pocsag)
 
 	/* Log message header with correction stats and BER */
 	LOGP_CHAN(DPOCSAG, LOGL_INFO, "Received message from RIC '%d' / function '%s' / type '%s'"
+		  " / %d baud / %s polarity"
 		  " (%d codewords, %d corrected, %d uncorrectable, BER %.1e)\n",
 		  pocsag->rx_msg_ric, pocsag_function_name[pocsag->rx_msg_function],
 		  pocsag_msg_type_name(pocsag->rx_msg_type),
+		  pocsag->rx_baud_locked,
+		  (pocsag->rx_polarity_locked < 0) ? "normal" : "inverted",
 		  pocsag->rx_msg_codewords, pocsag->rx_msg_corrected,
 		  pocsag->rx_msg_uncorrectable, ber);
 
@@ -1500,10 +1503,14 @@ static void done_rx_msg(pocsag_t *pocsag)
 				he->timestamp = now;
 
 				if (recovered)
-					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission dedup: recovered %d codeword(s) from previous copy.\n", recovered);
+					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission dedup: recovered %d codeword(s) from previous copy (%d baud, %s).\n",
+						  recovered, pocsag->rx_baud_locked,
+						  (pocsag->rx_polarity_locked < 0) ? "normal" : "inverted");
 				else
-					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission dedup: duplicate suppressed (RIC %d%s).\n",
-						  pocsag->rx_msg_ric, pocsag_function_name[pocsag->rx_msg_function]);
+					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission dedup: duplicate suppressed (RIC %d%s, %d baud, %s).\n",
+						  pocsag->rx_msg_ric, pocsag_function_name[pocsag->rx_msg_function],
+						  pocsag->rx_baud_locked,
+						  (pocsag->rx_polarity_locked < 0) ? "normal" : "inverted");
 				is_duplicate = 1;
 				break;
 			}
