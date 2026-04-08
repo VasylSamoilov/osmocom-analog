@@ -157,6 +157,46 @@ const char *print_message(const char *message, int message_length)
 	return message_print;
 }
 
+/*
+ * Format a decoded message for display, replacing characters from
+ * uncorrectable codewords with '?' to indicate unreliable data.
+ *
+ * status array: 0=ok, 1=BCH-corrected, 2=uncorrectable.
+ * If status is NULL, behaves identically to print_message().
+ */
+static const char *print_message_status(const char *message, const uint8_t *status, int message_length)
+{
+	static char message_print[1024];
+	const char *c;
+	int i, ii, clen;
+
+	for (i = 0, ii = 0; i < message_length; i++) {
+		if (status && status[i] >= 2) {
+			/* Uncorrectable — replace with '?' */
+			if (ii < (int)sizeof(message_print) - 1)
+				message_print[ii++] = '?';
+			continue;
+		}
+		if (message[i] >= 0 && message[i] <= 31)
+			c = ctrl_char[(int)message[i]];
+		else if (message[i] == 127)
+			c = del_char;
+		else {
+			if (ii < (int)sizeof(message_print) - 1)
+				message_print[ii++] = message[i];
+			continue;
+		}
+		clen = strlen(c);
+		if (ii + clen >= (int)sizeof(message_print))
+			break;
+		memcpy(message_print + ii, c, clen);
+		ii += clen;
+	}
+	message_print[ii] = '\0';
+
+	return message_print;
+}
+
 int scan_message(const char *message_input, int message_input_length, char *message_output, int message_output_length)
 {
 	int i, ii, j, clen;
@@ -1516,7 +1556,7 @@ static void done_rx_msg(pocsag_t *pocsag)
 	{
 		int i;
 		for (i = 0; i < ncand; i++) {
-			text = print_message(cand[i].data, cand[i].len);
+			text = print_message_status(cand[i].data, cand[i].status, cand[i].len);
 			/* Count corrected and bad characters */
 			int n_corrected = 0, n_bad = 0, k;
 			if (cand[i].status) {

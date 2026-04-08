@@ -1,26 +1,23 @@
 /* FSK Symbol Timing PLL Implementation
  *
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
+ * All Rights Reserved
+ *
  * Ported from the FLEX demodulator's flex_rx_build_symbol(), which is
  * itself derived from multimon-ng's FLEX decoder (1996, Thomas Sailer).
- *
- * Architecture:
- *   1. DC offset removal (IIR, optional)
- *   2. Majority voting over middle 80% of symbol period
- *   3. Zero crossing detection on RAW sample values
- *   4. Proportional phase correction with dual rates
- *   5. Bit decision at phase wrap by majority vote
- *
- * Key difference from multimon-ng's POCSAG decoder: that uses a fixed
- * 12.5% correction on quantized sign changes. This implementation uses
- * proportional correction on raw sample crossings, matching the FLEX
- * decoder which has proven more robust.
- *
- * (C) 2024 - osmocom-analog
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <string.h>
@@ -179,6 +176,11 @@ int fsk_pll_process(fsk_pll_t *pll, sample_t sample, double polarity, uint8_t *b
 	/* Step 6: Symbol boundary — decide bit by majority vote */
 	if (pll->phase >= pll->phase_max) {
 		pll->phase -= pll->phase_max;
+
+		/* Reset nonconsec at symbol boundary (matching FLEX).
+		 * Nonconsec only counts bad crossings within one symbol period,
+		 * not across symbols. */
+		pll->nonconsec = 0;
 
 		/* Decide bit by majority vote.
 		 * If no votes (e.g., first symbol), fall back to instantaneous. */

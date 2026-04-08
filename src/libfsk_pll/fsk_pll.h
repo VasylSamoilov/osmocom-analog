@@ -1,22 +1,24 @@
 /* FSK Symbol Timing PLL Library
  *
+ * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
+ * All Rights Reserved
+ *
  * PLL-based clock recovery for 2-level and 4-level FSK signals from
  * FM discriminator output. Ported from the FLEX demodulator's
  * flex_rx_build_symbol() (multimon-ng heritage).
- *
- * Features:
- *   - Proportional phase correction with dual rates (locked/unlocked)
- *   - Zero crossing detection on raw sample values (not quantized)
- *   - DC offset removal IIR
- *   - Majority voting over middle 80% of symbol period
- *   - Mid-symbol crossing detection for signal quality assessment
- *
- * (C) 2024 - osmocom-analog
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef _LIB_FSK_PLL_H

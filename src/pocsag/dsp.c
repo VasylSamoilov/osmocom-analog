@@ -611,6 +611,7 @@ static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 	int i;
 
 	fsk_pll_set_locked(&pocsag->fsk_rx_pll, 1);
+	fsk_pll_set_dc_removal(&pocsag->fsk_rx_pll, 0); /* freeze DC during data decode */
 
 	for (i = 0; i < length; i++) {
 		uint8_t bit_val;
