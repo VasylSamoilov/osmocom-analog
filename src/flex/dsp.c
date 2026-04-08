@@ -2501,6 +2501,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			 * tone-only — no vector access, no vec_count
 			 * increment. */
 			if (vec_count >= n_valid_vec_words) {
+				if (capcode == 1) continue;  /* idle artifact */
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c TON\n",
 					  bitrate,
