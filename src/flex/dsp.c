@@ -2035,6 +2035,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			return;
 		}
 
+		/* No addresses if voffset == aoffset (idle frame with BIW only) */
+		if (voffset == aoffset) {
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: Phase %c no addresses (voffset==aoffset=%d).\n",
+				  phase_name, voffset);
+			return;
+		}
+
 		/* Parse BIW2/3/4 (words 1 through aoffset-1).
 		 *
 		 * BIW1 is always word 0.
