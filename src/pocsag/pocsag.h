@@ -1,4 +1,5 @@
 #include "../libmobile/sender.h"
+#include "../libfsk_pll/fsk_pll.h"
 
 /*
  * POCSAG RIC (Radio Identity Code) - Pager Address Structure:
@@ -258,15 +259,7 @@ typedef struct pocsag {
 	int			fsk_tx_buffer_pos;	/* current position sending buffer */
 	double			fsk_tx_phase;		/* current bit position */
 	uint8_t			fsk_tx_lastbit;		/* last bit of last message, to correctly ramp */
-	uint32_t		fsk_rx_pll_inc;		/* PLL phase increment per (subsampled) sample */
-	uint32_t		fsk_rx_pll_phase;	/* PLL phase accumulator */
-	int			fsk_rx_subsamp;		/* subsample factor */
-	int			fsk_rx_subsamp_cnt;	/* subsample counter */
-	uint8_t			fsk_rx_lastsign;	/* sign of last sample (0=neg, 1=pos) */
-	double			fsk_rx_slicer_min;	/* adaptive slicer: running minimum (locked decoder) */
-	double			fsk_rx_slicer_max;	/* adaptive slicer: running maximum (locked decoder) */
-	double			fsk_rx_slicer_decay;	/* adaptive slicer: fixed decay per subsampled sample */
-	int			fsk_rx_slicer_skip;	/* samples to skip before trusting midpoint */
+	fsk_pll_t		fsk_rx_pll;		/* locked decoder PLL (FLEX-style) */
 	uint64_t		fsk_rx_word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync/codeword */
 	int			fsk_rx_sync;		/* counts down to next sync */
 	int			fsk_rx_index;		/* counts bits of received codeword */
@@ -288,17 +281,7 @@ typedef struct pocsag {
 	 */
 	struct rx_baud_state {
 		int		baudrate;	/* baud rate for this slot */
-		uint32_t	pll_inc;	/* phase increment per (subsampled) sample */
-		uint32_t	pll_phase;	/* PLL phase accumulator */
-		int		subsamp;	/* subsample factor: process every Nth sample */
-		int		subsamp_cnt;	/* subsample counter */
-		uint8_t		lastsign;	/* sign of last sample (0=neg, 1=pos) */
-		uint8_t		nonconsec;	/* consecutive mid-symbol zero crossings */
-		uint8_t		timeout;	/* symbol periods with no zero crossing */
-		double		fsk_min;	/* adaptive slicer: running minimum */
-		double		fsk_max;	/* adaptive slicer: running maximum */
-		double		slicer_decay;	/* adaptive slicer: fixed decay per subsampled sample */
-		int		slicer_skip;	/* samples to skip before trusting midpoint */
+		fsk_pll_t	pll;		/* PLL instance (FLEX-style) */
 		uint64_t	word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync detect */
 		uint64_t	word_inv;	/* same, inverted polarity */
 	} rx_baud[3];

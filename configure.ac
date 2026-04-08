@@ -90,6 +90,7 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/libscrambler/Makefile
     src/libemphasis/Makefile
     src/libfsk/Makefile
+    src/libfsk_pll/Makefile
     src/libam/Makefile
     src/libfm/Makefile
     src/libfilter/Makefile
