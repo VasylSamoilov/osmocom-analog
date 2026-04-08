@@ -21,6 +21,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 #include "fsk_pll.h"
 

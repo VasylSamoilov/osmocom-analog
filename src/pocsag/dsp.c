@@ -346,6 +346,7 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, pocsag->rx_baud_locked, new_pol);
 					pocsag->fsk_rx_pll.last_sample = -pocsag->fsk_rx_pll.last_sample;
+					pocsag->fsk_rx_pll.dc_offset = -pocsag->fsk_rx_pll.dc_offset;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
 					pocsag->fsk_rx_index = 0;
@@ -562,8 +563,9 @@ check_inverted:
 						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, st->baudrate, inv_pol);
 					fsk_pll_copy_state(&pocsag->fsk_rx_pll, &st->pll);
-					/* Flip last_sample sign for inverted polarity */
+					/* Flip last_sample and DC offset sign for inverted polarity */
 					pocsag->fsk_rx_pll.last_sample = -pocsag->fsk_rx_pll.last_sample;
+					pocsag->fsk_rx_pll.dc_offset = -pocsag->fsk_rx_pll.dc_offset;
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
@@ -584,6 +586,7 @@ check_inverted:
 						dsp_rx_lock(pocsag, st->baudrate, inv_pol);
 						fsk_pll_copy_state(&pocsag->fsk_rx_pll, &st->pll);
 						pocsag->fsk_rx_pll.last_sample = -pocsag->fsk_rx_pll.last_sample;
+						pocsag->fsk_rx_pll.dc_offset = -pocsag->fsk_rx_pll.dc_offset;
 						pocsag->fsk_rx_word = CODEWORD_SYNC;
 						put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 						pocsag->fsk_rx_sync = 16;
