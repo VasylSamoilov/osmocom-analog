@@ -263,6 +263,10 @@ typedef struct pocsag {
 	int			fsk_rx_subsamp;		/* subsample factor */
 	int			fsk_rx_subsamp_cnt;	/* subsample counter */
 	uint8_t			fsk_rx_lastsign;	/* sign of last sample (0=neg, 1=pos) */
+	double			fsk_rx_slicer_min;	/* adaptive slicer: running minimum (locked decoder) */
+	double			fsk_rx_slicer_max;	/* adaptive slicer: running maximum (locked decoder) */
+	double			fsk_rx_slicer_decay;	/* adaptive slicer: fixed decay per subsampled sample */
+	int			fsk_rx_slicer_skip;	/* samples to skip before trusting midpoint */
 	uint64_t		fsk_rx_word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync/codeword */
 	int			fsk_rx_sync;		/* counts down to next sync */
 	int			fsk_rx_index;		/* counts bits of received codeword */
@@ -291,6 +295,10 @@ typedef struct pocsag {
 		uint8_t		lastsign;	/* sign of last sample (0=neg, 1=pos) */
 		uint8_t		nonconsec;	/* consecutive mid-symbol zero crossings */
 		uint8_t		timeout;	/* symbol periods with no zero crossing */
+		double		fsk_min;	/* adaptive slicer: running minimum */
+		double		fsk_max;	/* adaptive slicer: running maximum */
+		double		slicer_decay;	/* adaptive slicer: fixed decay per subsampled sample */
+		int		slicer_skip;	/* samples to skip before trusting midpoint */
 		uint64_t	word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync detect */
 		uint64_t	word_inv;	/* same, inverted polarity */
 	} rx_baud[3];

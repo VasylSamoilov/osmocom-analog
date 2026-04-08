@@ -58,6 +58,45 @@ static inline int hamming32(uint32_t a, uint32_t b)
 #define SYNC_MAX_HAMMING	2
 
 /*
+ * Adaptive FSK slicer constants.
+ *
+ * Instead of comparing the FM discriminator output against a fixed zero
+ * threshold, we track the running min and max of the signal and slice
+ * at the midpoint (min + max) / 2. This automatically compensates for:
+ *   - DC offset from SDR frequency error
+ *   - Asymmetric deviation
+ *   - Amplitude drift
+ *
+ * Modeled after rtl_433's pulse_detect_fsk_minmax:
+ *   - Init min/max inverted so first sample sets both
+ *   - Skip initial samples to let trackers converge before using midpoint
+ *   - Asymmetric decay: only the side opposite to the current sample decays
+ *   - Fixed decay amount (not proportional to range) for stability on weak signals
+ *
+ * The decay amount is computed from a target convergence time so behavior
+ * is consistent regardless of sample rate. The slicer runs after subsampling,
+ * so the effective rate is samplerate/subsamp ≈ 9× baud rate.
+ */
+
+/* Slicer convergence time in seconds.
+ * Time for the min/max tracker to converge from full range to near-zero.
+ * 20ms matches rtl_433's behavior (decay=10 on int16 at 250kHz).
+ * Fast enough to track new signals, slow enough to not chase noise. */
+#define FSK_SLICER_CONVERGE_S	0.020
+
+/* Nominal signal range for decay computation.
+ * FM discriminator output is normalized to ±1.0 by the framework
+ * (gain_samples divides by speech_deviation), so full range is 2.0. */
+#define FSK_SLICER_NOMINAL_RANGE	2.0
+
+/* Number of subsampled samples to skip at slicer init.
+ * During skip, min/max are updated but the slicer falls back to
+ * simple zero-crossing (sample > 0). This lets the trackers see
+ * at least one full bit period before the midpoint is trusted.
+ * 9 subsampled samples ≈ 1 bit period (subsampling targets ~9 spl/bit). */
+#define FSK_SLICER_SKIP_SAMPLES	9
+
+/*
  * PLL-based clock recovery constants.
  *
  * The demodulator uses a phase accumulator that advances at the expected
@@ -115,9 +154,41 @@ static inline int pll_process_sample(
 	uint32_t pll_inc,
 	uint32_t *pll_phase, uint8_t *lastsign,
 	uint8_t *nonconsec, uint8_t *timeout,
-	uint8_t *bit_out)
+	uint8_t *bit_out,
+	double *fsk_min, double *fsk_max, double slicer_decay,
+	int *slicer_skip)
 {
-	uint8_t sign = (sample * polarity > 0.0) ? 1 : 0;
+	double val = sample * polarity;
+	uint8_t sign;
+
+	/* Adaptive min/max slicer (rtl_433-style).
+	 * Track signal envelope and slice at midpoint. */
+
+	/* Update min/max trackers */
+	if (val > *fsk_max) *fsk_max = val;
+	if (val < *fsk_min) *fsk_min = val;
+
+	if (*slicer_skip > 0) {
+		/* During skip: let min/max converge, but use simple zero-crossing */
+		(*slicer_skip)--;
+		sign = (val > 0.0) ? 1 : 0;
+	} else {
+		/* Symmetric decay: both min and max decay toward center every sample.
+		 * This ensures outliers (noise spikes during silence) get washed out
+		 * regardless of which side the current sample is on. */
+		*fsk_min += slicer_decay;
+		*fsk_max -= slicer_decay;
+
+		/* Prevent min/max from crossing (can happen during silence) */
+		if (*fsk_min > *fsk_max) {
+			double center = (*fsk_min + *fsk_max) * 0.5;
+			*fsk_min = center;
+			*fsk_max = center;
+		}
+
+		double mid = (*fsk_min + *fsk_max) * 0.5;
+		sign = (val > mid) ? 1 : 0;
+	}
 
 	if (sign != *lastsign) {
 		uint32_t correction = pll_inc >> 3;
@@ -221,6 +292,11 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	pocsag->rx_polarity_locked = polarity;
 	pocsag->samplerate = samplerate;
 
+	/* init adaptive slicer for locked decoder */
+	pocsag->fsk_rx_slicer_min = 1e30;
+	pocsag->fsk_rx_slicer_max = -1e30;
+	pocsag->fsk_rx_slicer_skip = FSK_SLICER_SKIP_SAMPLES;
+
 	/* init multi-rate RX decoders */
 	if (auto_baud) {
 		n = 3;
@@ -236,6 +312,10 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 			pocsag->rx_baud[i].lastsign = 0;
 			pocsag->rx_baud[i].nonconsec = 0;
 			pocsag->rx_baud[i].timeout = 0;
+			pocsag->rx_baud[i].fsk_min = 1e30;
+			pocsag->rx_baud[i].fsk_max = -1e30;
+			pocsag->rx_baud[i].slicer_decay = FSK_SLICER_NOMINAL_RANGE / (FSK_SLICER_CONVERGE_S * ((double)samplerate / subsamp));
+			pocsag->rx_baud[i].slicer_skip = FSK_SLICER_SKIP_SAMPLES;
 			pocsag->rx_baud[i].word = 0;
 			pocsag->rx_baud[i].word_inv = 0;
 		}
@@ -254,6 +334,10 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 			pocsag->rx_baud[0].lastsign = 0;
 			pocsag->rx_baud[0].nonconsec = 0;
 			pocsag->rx_baud[0].timeout = 0;
+			pocsag->rx_baud[0].fsk_min = 1e30;
+			pocsag->rx_baud[0].fsk_max = -1e30;
+			pocsag->rx_baud[0].slicer_decay = FSK_SLICER_NOMINAL_RANGE / (FSK_SLICER_CONVERGE_S * ((double)samplerate / subsamp));
+			pocsag->rx_baud[0].slicer_skip = FSK_SLICER_SKIP_SAMPLES;
 			pocsag->rx_baud[0].word = 0;
 			pocsag->rx_baud[0].word_inv = 0;
 		}
@@ -375,6 +459,7 @@ static void dsp_rx_lock(pocsag_t *pocsag, int baudrate, double polarity)
 		if (subsamp < 1) subsamp = 1;
 		pocsag->fsk_rx_subsamp = subsamp;
 		pocsag->fsk_rx_pll_inc = (uint32_t)((uint64_t)PLL_PHASE_MAX * baudrate * subsamp / pocsag->samplerate);
+		pocsag->fsk_rx_slicer_decay = FSK_SLICER_NOMINAL_RANGE / (FSK_SLICER_CONVERGE_S * ((double)pocsag->samplerate / subsamp));
 	}
 }
 
@@ -394,6 +479,9 @@ static void dsp_rx_unlock(pocsag_t *pocsag)
 		pocsag->rx_baud[i].lastsign = 0;
 		pocsag->rx_baud[i].nonconsec = 0;
 		pocsag->rx_baud[i].timeout = 0;
+		pocsag->rx_baud[i].fsk_min = 1e30;
+		pocsag->rx_baud[i].fsk_max = -1e30;
+		pocsag->rx_baud[i].slicer_skip = FSK_SLICER_SKIP_SAMPLES;
 		pocsag->rx_baud[i].subsamp_cnt = 0;
 		pocsag->rx_baud[i].word = 0;
 		pocsag->rx_baud[i].word_inv = 0;
@@ -614,7 +702,10 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 			if (!pll_process_sample(sample, polarity, st->pll_inc,
 						&st->pll_phase, &st->lastsign,
 						&st->nonconsec, &st->timeout,
-						&bit_val))
+						&bit_val,
+						&st->fsk_min, &st->fsk_max,
+						st->slicer_decay,
+						&st->slicer_skip))
 				continue;
 
 			/* shift bit into both normal and inverted 64-bit registers */
@@ -650,6 +741,9 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 				pocsag->fsk_rx_pll_phase = st->pll_phase;
 				pocsag->fsk_rx_lastsign = st->lastsign;
 				pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
+				pocsag->fsk_rx_slicer_min = st->fsk_min;
+				pocsag->fsk_rx_slicer_max = st->fsk_max;
+				pocsag->fsk_rx_slicer_skip = st->slicer_skip;
 				pocsag->fsk_rx_word = CODEWORD_SYNC;
 				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 				pocsag->fsk_rx_sync = 16;
@@ -669,7 +763,10 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 					dsp_rx_lock(pocsag, st->baudrate, polarity);
 					pocsag->fsk_rx_pll_phase = st->pll_phase;
 					pocsag->fsk_rx_lastsign = st->lastsign;
-				pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
+					pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
+					pocsag->fsk_rx_slicer_min = st->fsk_min;
+					pocsag->fsk_rx_slicer_max = st->fsk_max;
+					pocsag->fsk_rx_slicer_skip = st->slicer_skip;
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
@@ -693,6 +790,9 @@ check_inverted:
 					pocsag->fsk_rx_pll_phase = st->pll_phase;
 					pocsag->fsk_rx_lastsign = !st->lastsign;
 					pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
+					pocsag->fsk_rx_slicer_min = st->fsk_min;
+					pocsag->fsk_rx_slicer_max = st->fsk_max;
+					pocsag->fsk_rx_slicer_skip = st->slicer_skip;
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
@@ -713,7 +813,10 @@ check_inverted:
 						dsp_rx_lock(pocsag, st->baudrate, inv_pol);
 						pocsag->fsk_rx_pll_phase = st->pll_phase;
 						pocsag->fsk_rx_lastsign = !st->lastsign;
-					pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
+						pocsag->fsk_rx_subsamp_cnt = st->subsamp_cnt;
+						pocsag->fsk_rx_slicer_min = st->fsk_min;
+						pocsag->fsk_rx_slicer_max = st->fsk_max;
+						pocsag->fsk_rx_slicer_skip = st->slicer_skip;
 						pocsag->fsk_rx_word = CODEWORD_SYNC;
 						put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 						pocsag->fsk_rx_sync = 16;
@@ -741,6 +844,8 @@ static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 	uint32_t pll_phase, pll_inc;
 	uint8_t lastsign;
 	uint8_t nonconsec = 0, timeout = 0; /* unused, required by pll_process_sample */
+	double fsk_min, fsk_max;
+	int slicer_skip;
 	int subsamp, subsamp_cnt;
 	int i;
 
@@ -748,6 +853,9 @@ static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 	pll_phase = pocsag->fsk_rx_pll_phase;
 	pll_inc = pocsag->fsk_rx_pll_inc;
 	lastsign = pocsag->fsk_rx_lastsign;
+	fsk_min = pocsag->fsk_rx_slicer_min;
+	fsk_max = pocsag->fsk_rx_slicer_max;
+	slicer_skip = pocsag->fsk_rx_slicer_skip;
 	subsamp = pocsag->fsk_rx_subsamp;
 	subsamp_cnt = pocsag->fsk_rx_subsamp_cnt;
 
@@ -761,7 +869,10 @@ static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 		if (!pll_process_sample(spl[i], polarity, pll_inc,
 					&pll_phase, &lastsign,
 					&nonconsec, &timeout,
-					&bit_val))
+					&bit_val,
+					&fsk_min, &fsk_max,
+					pocsag->fsk_rx_slicer_decay,
+					&slicer_skip))
 			continue;
 
 		fsk_block_decode(pocsag, bit_val);
@@ -769,6 +880,9 @@ static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 
 	pocsag->fsk_rx_pll_phase = pll_phase;
 	pocsag->fsk_rx_lastsign = lastsign;
+	pocsag->fsk_rx_slicer_min = fsk_min;
+	pocsag->fsk_rx_slicer_max = fsk_max;
+	pocsag->fsk_rx_slicer_skip = slicer_skip;
 	pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 }
 
@@ -783,6 +897,8 @@ static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
 	uint32_t pll_phase, pll_inc;
 	uint8_t lastsign;
 	uint8_t nonconsec = 0, timeout = 0; /* unused, required by pll_process_sample */
+	double fsk_min, fsk_max;
+	int slicer_skip;
 	int subsamp, subsamp_cnt;
 	int i;
 
@@ -790,6 +906,9 @@ static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
 	pll_phase = pocsag->fsk_rx_pll_phase;
 	pll_inc = pocsag->fsk_rx_pll_inc;
 	lastsign = pocsag->fsk_rx_lastsign;
+	fsk_min = pocsag->fsk_rx_slicer_min;
+	fsk_max = pocsag->fsk_rx_slicer_max;
+	slicer_skip = pocsag->fsk_rx_slicer_skip;
 	subsamp = pocsag->fsk_rx_subsamp;
 	subsamp_cnt = pocsag->fsk_rx_subsamp_cnt;
 
@@ -803,7 +922,10 @@ static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
 		if (pll_process_sample(spl[i], polarity, pll_inc,
 				       &pll_phase, &lastsign,
 				       &nonconsec, &timeout,
-				       &bit_val)) {
+				       &bit_val,
+				       &fsk_min, &fsk_max,
+				       pocsag->fsk_rx_slicer_decay,
+				       &slicer_skip)) {
 			fsk_block_decode(pocsag, bit_val);
 		}
 
@@ -811,6 +933,9 @@ static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
 		if (pocsag->fsk_rx_sync) {
 			pocsag->fsk_rx_pll_phase = pll_phase;
 			pocsag->fsk_rx_lastsign = lastsign;
+			pocsag->fsk_rx_slicer_min = fsk_min;
+			pocsag->fsk_rx_slicer_max = fsk_max;
+			pocsag->fsk_rx_slicer_skip = slicer_skip;
 			pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 			if (i + 1 < length)
 				fsk_decode_locked(pocsag, spl + i + 1, length - i - 1);
@@ -821,6 +946,9 @@ static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
 		if (!pocsag->rx_rate_locked) {
 			pocsag->fsk_rx_pll_phase = pll_phase;
 			pocsag->fsk_rx_lastsign = lastsign;
+			pocsag->fsk_rx_slicer_min = fsk_min;
+			pocsag->fsk_rx_slicer_max = fsk_max;
+			pocsag->fsk_rx_slicer_skip = slicer_skip;
 			pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 			if (i + 1 < length)
 				fsk_decode(pocsag, spl + i + 1, length - i - 1);
@@ -830,6 +958,9 @@ static void fsk_decode_resync(pocsag_t *pocsag, sample_t *spl, int length)
 
 	pocsag->fsk_rx_pll_phase = pll_phase;
 	pocsag->fsk_rx_lastsign = lastsign;
+	pocsag->fsk_rx_slicer_min = fsk_min;
+	pocsag->fsk_rx_slicer_max = fsk_max;
+	pocsag->fsk_rx_slicer_skip = slicer_skip;
 	pocsag->fsk_rx_subsamp_cnt = subsamp_cnt;
 }
 
