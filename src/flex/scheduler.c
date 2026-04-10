@@ -31,24 +31,52 @@
 #include "scheduler.h"
 #include "flex.h"
 #include "frame.h"
+#include "n_counter.h"
+#include "biw_carousel.h"
 
 /* Initialize scheduler state.
  * Called once at flex_create time. */
 int flex_scheduler_init(struct flex *flex)
 {
+	int pol, ph;
+
 	flex->sched_fallback_cycle = 0;
 	flex->sched_fallback_frame = 0;
 	flex->sched_ers_done = 0;
 	flex->sched_last_cycle = 0;
 	flex->sched_last_frame = 0;
+	flex->last_tx_polarity = FLEX_POL_NORMAL;
+
+	/* Initialize per-polarity TX state */
+	for (pol = 0; pol < FLEX_TX_POLARITIES; pol++) {
+		flex->tx_pol[pol].msg_list = NULL;
+		flex->tx_pol[pol].msg_count = 0;
+		flex->tx_pol[pol].frag_retrieval_seq = 0;
+		flex->tx_pol[pol].n_inflight = 0;
+		flex->tx_pol[pol].last_abs_frame = 0;
+		memset(flex->tx_pol[pol].inflight, 0,
+		       sizeof(flex->tx_pol[pol].inflight));
+		memset(flex->tx_pol[pol].tx_temp, 0,
+		       sizeof(flex->tx_pol[pol].tx_temp));
+
+		/* N_Counter hash table */
+		if (flex_n_counter_init(&flex->tx_pol[pol]) < 0)
+			return -1;
+
+		/* BIW carousel per phase */
+		for (ph = 0; ph < FLEX_MAX_PHASES; ph++)
+			flex_biw_carousel_init(&flex->tx_pol[pol].biw_carousel[ph]);
+	}
+
 	return 0;
 }
 
-/* Cleanup scheduler resources.
- * No dynamic allocations yet — this is a no-op. */
+/* Cleanup scheduler resources -- free N_Counter tables. */
 void flex_scheduler_cleanup(struct flex *flex)
 {
-	(void)flex;
+	int pol;
+	for (pol = 0; pol < FLEX_TX_POLARITIES; pol++)
+		flex_n_counter_cleanup(&flex->tx_pol[pol]);
 }
 
 /* Compute current cycle/frame from wall clock.
@@ -273,6 +301,16 @@ int flex_scheduler_parse_pocsag_slots(struct flex *flex, const char *spec)
 	}
 
 	if (count > 0) {
+		/* Validate: frames 0-3 must not be POCSAG slots (Req 8.7).
+		 * These frames are reserved for SSID2 and mandatory BIW words. */
+		for (i = 0; i <= 3; i++) {
+			if (flex->pocsag_frame_slots[i]) {
+				LOGP(DFLEX, LOGL_ERROR,
+				     "POCSAG mix: frame %lu is reserved for FLEX (frames 0-3 protected).\n", i);
+				memset(flex->pocsag_frame_slots, 0, sizeof(flex->pocsag_frame_slots));
+				return -1;
+			}
+		}
 		flex->pocsag_mix_enabled = 1;
 		LOGP(DFLEX, LOGL_INFO,
 		     "POCSAG mix: %d frame slot(s) designated for POCSAG.\n", count);

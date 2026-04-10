@@ -3352,11 +3352,15 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					 * When the final fragment arrives, the full reassembled
 					 * message is output as a separate "reassembled" line. */
 
-					/* Build per-word BCH status for this message */
+					/* Build per-word BCH status for this message.
+					 * Range: mw1 (body start) to mw2 (body end).
+					 * For long addresses, hdr_idx (Vy word) is in
+					 * the vector field -- do NOT span from hdr_idx
+					 * to mw2 as that crosses other messages' data
+					 * when multiple messages are packed per frame. */
 					char word_status[128];
 					{
-						int ws_start = is_long ? hdr_idx : mw1;
-						flex_build_word_status(ph, ws_start, mw2,
+						flex_build_word_status(ph, mw1, mw2,
 								      word_status, sizeof(word_status));
 					}
 

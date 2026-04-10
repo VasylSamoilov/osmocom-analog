@@ -177,6 +177,99 @@ typedef struct flex_msg {
 #define FLEX_TG_SETUP		1	/* SETUP instructions queued/sending */
 #define FLEX_TG_DELIVERY	2	/* DELIVERY message queued/sending */
 
+/* ===== Per-Polarity TX Scheduling State (Req 1, 7) =====
+ *
+ * Each polarity is an independent logical network with its own
+ * message queue, N counters, fragment tracking, BIW carousel,
+ * and temp group slots.  Indexed by FLEX_POL_NORMAL (0) or
+ * FLEX_POL_INVERTED (1). */
+
+/* TX polarity count — matches RX side */
+#define FLEX_TX_POLARITIES	2
+
+/* N_Counter table: per-(capcode, polarity) message numbering.
+ * LRU-bounded to prevent unbounded memory growth. */
+#define FLEX_N_COUNTER_MAX	25000
+#define FLEX_N_COUNTER_BUCKETS	4096
+
+/* Message queue depth limit per polarity */
+#define FLEX_MSG_QUEUE_MAX	256
+
+/* BIW carousel: tracks last-transmitted frame per BIW type per phase.
+ * Used for least-recently-transmitted rotation. */
+enum flex_biw_type_id {
+	BIW_SSID1 = 0,		/* type 000 */
+	BIW_DATE,		/* type 001 */
+	BIW_TIME,		/* type 010 */
+	BIW_SYSINFO_TZ,	/* type 101, A=0100 */
+	BIW_SYSINFO_MSG,	/* type 101, A=0000-0011 */
+	BIW_CHAN_SETUP,		/* type 101, A=0110 */
+	BIW_SSID2,		/* type 111 */
+	BIW_TYPE_COUNT
+};
+
+typedef struct flex_biw_carousel {
+	uint32_t	last_tx_abs[BIW_TYPE_COUNT];	/* absolute frame of last TX per type */
+} flex_biw_carousel_t;
+
+/* N_Counter entry: hash-chained + LRU doubly-linked list node */
+typedef struct flex_n_counter {
+	uint64_t	capcode;
+	uint8_t		n_value;	/* 0-63, wrapping */
+	uint32_t	last_used_abs;	/* absolute frame for LRU ordering */
+	struct flex_n_counter *hash_next;	/* hash chain */
+	struct flex_n_counter *lru_prev;	/* LRU doubly-linked list */
+	struct flex_n_counter *lru_next;
+} flex_n_counter_t;
+
+/* In-flight fragment tracking entry (max FLEX_MAX_INFLIGHT per polarity) */
+typedef struct flex_inflight_frag {
+	uint64_t	capcode;
+	uint32_t	retrieval_num;		/* N field (0-63) */
+	int		total_fragments;
+	int		last_sent_idx;		/* last fragment_index transmitted */
+	uint32_t	last_sent_abs;		/* absolute frame of last fragment */
+	uint32_t	first_sent_abs;		/* absolute frame of first fragment */
+	int		active;			/* 1 = in progress */
+} flex_inflight_frag_t;
+
+/* Per-polarity TX scheduling state container */
+typedef struct flex_tx_polarity {
+	/* Message queue (singly-linked list) */
+	flex_msg_t		*msg_list;
+	int			msg_count;
+
+	/* Per-capcode message numbering (LRU hash table) */
+	flex_n_counter_t	**n_hash_buckets;	/* hash bucket array [FLEX_N_COUNTER_BUCKETS] */
+	flex_n_counter_t	*n_lru_head;		/* most recently used */
+	flex_n_counter_t	*n_lru_tail;		/* least recently used (eviction candidate) */
+	int			n_counter_count;	/* current entries in table */
+
+	/* Fragment retrieval counter (0-63, wrapping) */
+	uint32_t		frag_retrieval_seq;
+
+	/* In-flight fragment tracking */
+	flex_inflight_frag_t	inflight[FLEX_MAX_INFLIGHT];
+	int			n_inflight;
+
+	/* BIW carousel state: per-phase rotation tracking */
+	flex_biw_carousel_t	biw_carousel[FLEX_MAX_PHASES];
+
+	/* TX temp group slots (16 slots) */
+	struct {
+		int		state;		/* FLEX_TG_FREE/SETUP/DELIVERY */
+		uint64_t	capcodes[FLEX_TEMP_GROUP_MAX_MEMBERS];
+		int		count;
+		int		setups_sent;
+		uint32_t	target_frame;
+		uint32_t	setup_abs;
+		flex_msg_t	*delivery_msg;
+	} tx_temp[FLEX_TEMP_ADDR_SLOTS];
+
+	/* Last frame transmitted on this polarity */
+	uint32_t		last_abs_frame;
+} flex_tx_polarity_t;
+
 /* Instance of FLEX transmitter — embeds sender_t as first member */
 typedef struct flex {
 	sender_t		sender;
@@ -326,6 +419,15 @@ typedef struct flex {
 	/* message numbering */
 	uint32_t		msg_sequence;		/* monotonic counter, wraps at 64 (N is 6 bits) */
 	uint32_t		frag_retrieval_seq;	/* monotonic retrieval number for fragments (6-bit, 0-63) */
+
+	/* Per-polarity TX scheduling state (Req 1, 7).
+	 * tx_pol[0] = normal, tx_pol[1] = inverted.
+	 * In single-polarity mode, only tx_pol[0] is used.
+	 * The old global msg_list, msg_sequence, frag_retrieval_seq,
+	 * and tx_temp[] above are retained for backward compatibility
+	 * during migration — new code should use tx_pol[]. */
+	flex_tx_polarity_t	tx_pol[FLEX_TX_POLARITIES];
+	int			last_tx_polarity;	/* 0=normal, 1=inverted — for round-robin */
 
 	/* ===== TX Temporary Group Scheduling (§3.8.2.3, §3.9.6) =====
 	 *

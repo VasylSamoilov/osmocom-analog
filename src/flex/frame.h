@@ -2118,6 +2118,12 @@ typedef struct flex_frame_params {
 	/* Non-standard decoder compatibility (--hack-for-non-standard-decoders) */
 	int		hack_nonstandard_decoders; /* 1 = flip bit 0 of all-zeros/all-ones
 						   * codewords at block boundaries */
+
+	/* Carousel BIW count (set by scheduler, Req 3).
+	 * Total BIW words including BIW1 (1..4).
+	 * Used by the scheduler for capacity estimation.
+	 * 0 = not set (use flex_compute_biw_count fallback). */
+	int		carousel_biw_count;
 } flex_frame_params_t;
 
 /* ===== Phase Multiplexing ===== */

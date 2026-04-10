@@ -39,8 +39,16 @@
 #include "frame.h"
 #include "dsp.h"
 #include "scheduler.h"
+#include "n_counter.h"
+#include "biw_carousel.h"
 
 #define FLEX_MAX_QUEUE_DEPTH 256
+
+/* Map polarity double (+1.0/-1.0) to index (0=normal, 1=inverted). */
+static inline int pol_index(double polarity)
+{
+	return (polarity < 0) ? FLEX_POL_INVERTED : FLEX_POL_NORMAL;
+}
 
 static const char *flex_state_name[] = {
 	"IDLE",
@@ -179,17 +187,18 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 			     flex_special_addr_detail(aw) ? flex_special_addr_detail(aw) : "not a user-assignable capcode");
 	}
 
-	/* Queue overflow protection: count all messages including
-	 * retransmission-pending ones toward the depth limit. */
+	/* Queue overflow protection: check per-polarity depth limit.
+	 * Use the per-polarity msg_count for O(1) check.
+	 * At this point the message's polarity isn't set yet — use
+	 * the default polarity.  The actual polarity may be overridden
+	 * later by FIFO options, but the default is the best estimate. */
 	{
-		int depth = 0;
-		flex_msg_t *qm;
-		for (qm = flex->msg_list; qm; qm = qm->next)
-			depth++;
-		if (depth >= FLEX_MAX_QUEUE_DEPTH) {
+		int pi = pol_index(flex->default_polarity ? flex->default_polarity : FLEX_DEFAULT_POLARITY);
+		if (flex->tx_pol[pi].msg_count >= FLEX_MSG_QUEUE_MAX) {
 			LOGP(DFLEX, LOGL_NOTICE,
-			     "Queue overflow: depth=%d, rejecting capcode=%" PRIu64 "\n",
-			     depth, capcode);
+			     "Queue overflow: polarity=%s depth=%d, rejecting capcode=%" PRIu64 "\n",
+			     (pi == FLEX_POL_INVERTED) ? "inverted" : "normal",
+			     flex->tx_pol[pi].msg_count, capcode);
 			return NULL;
 		}
 	}
@@ -232,6 +241,11 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->speed = 1600;
 	msg->modulation_type = FLEX_MOD_2FSK;
 	msg->polarity = flex->default_polarity ? flex->default_polarity : FLEX_DEFAULT_POLARITY;
+
+	/* Apply fixed-mode polarity if set (CLI --fixed-polarity).
+	 * This overrides the default and any per-message setting. */
+	if (flex->fixed_polarity != 0.0)
+		msg->polarity = flex->fixed_polarity;
 	msg->priority = 0;
 	msg->charset = 0;
 	msg->is_group = 0;
@@ -271,12 +285,22 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->next_send_frame = 0;
 	msg->assigned_n = -1;
 
-	/* link to tail of list */
+	/* link to tail of list (legacy global queue) */
 	msg->flex = flex;
 	msgp = &flex->msg_list;
 	while ((*msgp))
 		msgp = &(*msgp)->next;
 	(*msgp) = msg;
+
+	/* Also link to per-polarity queue (new scheduler path).
+	 * Both lists share the same flex_msg_t nodes — the per-polarity
+	 * list uses a separate linkage via the same ->next pointer,
+	 * so for now we just track the count.  Full migration to
+	 * per-polarity-only lists happens in task 6+. */
+	{
+		int pi = pol_index(msg->polarity);
+		flex->tx_pol[pi].msg_count++;
+	}
 
 	/* Type-specific enqueue logging */
 	switch (msg_type) {
@@ -304,6 +328,13 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 		break;
 	}
 
+	/* Log polarity assignment at DEBUG level (Req 11.3) */
+	LOGP(DFLEX, LOGL_DEBUG,
+	     "Enqueue: capcode=%" PRIu64 " polarity=%s queue_depth=%d\n",
+	     capcode,
+	     (msg->polarity < 0) ? "inverted" : "normal",
+	     flex->tx_pol[pol_index(msg->polarity)].msg_count);
+
 	/* kick transmitter */
 	if (flex->state == FLEX_STATE_IDLE) {
 		if (flex->network_mode) {
@@ -327,8 +358,14 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 void flex_msg_destroy(flex_msg_t *msg)
 {
 	flex_msg_t **msgp;
+	int pi;
 
-	/* unlink */
+	/* decrement per-polarity count */
+	pi = pol_index(msg->polarity);
+	if (msg->flex->tx_pol[pi].msg_count > 0)
+		msg->flex->tx_pol[pi].msg_count--;
+
+	/* unlink from global list */
 	msgp = &msg->flex->msg_list;
 	while ((*msgp) != msg)
 		msgp = &(*msgp)->next;
@@ -349,23 +386,24 @@ void flex_msg_destroy(flex_msg_t *msg)
 /* Frames of margin between last SETUP and DELIVERY target frame */
 #define FLEX_TG_SETUP_MARGIN	4
 
-/* Allocate a free temp slot. Returns 0-15, or -1 if all occupied. */
-static int flex_tg_alloc_slot(flex_t *flex)
+/* Allocate a free temp slot for a given polarity. Returns 0-15, or -1 if all occupied. */
+static int flex_tg_alloc_slot(flex_t *flex, int pol)
 {
 	int i;
 	for (i = 0; i < FLEX_TEMP_ADDR_SLOTS; i++) {
-		if (flex->tx_temp[i].state == FLEX_TG_FREE)
+		if (flex->tx_pol[pol].tx_temp[i].state == FLEX_TG_FREE)
 			return i;
 	}
 	return -1;
 }
 
 /* Free a temp slot after delivery completes. */
-static void flex_tg_free_slot(flex_t *flex, int slot)
+static void flex_tg_free_slot(flex_t *flex, int pol, int slot)
 {
 	LOGP(DFLEX, LOGL_INFO,
-	     "TX: TEARDOWN temp slot=%d — delivery complete.\n", slot);
-	memset(&flex->tx_temp[slot], 0, sizeof(flex->tx_temp[slot]));
+	     "TX: TEARDOWN temp slot=%d pol=%s — delivery complete.\n",
+	     slot, (pol == FLEX_POL_INVERTED) ? "inverted" : "normal");
+	memset(&flex->tx_pol[pol].tx_temp[slot], 0, sizeof(flex->tx_pol[pol].tx_temp[slot]));
 }
 
 /*
@@ -382,10 +420,12 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 			   int data_length, int speed, int modulation_type,
 			   double polarity, int priority, int phase)
 {
-	int slot, i;
+	int slot, i, pol;
 	uint32_t target_frame;
 	flex_frame_time_t ft;
 	uint32_t abs_frame;
+
+	pol = pol_index(polarity);
 
 	if (count <= 0 || count > FLEX_TEMP_GROUP_MAX_MEMBERS) {
 		LOGP(DFLEX, LOGL_NOTICE,
@@ -404,11 +444,12 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 		}
 	}
 
-	/* Allocate slot */
-	slot = flex_tg_alloc_slot(flex);
+	/* Allocate slot from per-polarity pool */
+	slot = flex_tg_alloc_slot(flex, pol);
 	if (slot < 0) {
 		LOGP(DFLEX, LOGL_NOTICE,
-		     "FIFO: tempgroup — no free slot (all 16 occupied), rejecting.\n");
+		     "FIFO: tempgroup — no free slot (all 16 occupied on %s polarity), rejecting.\n",
+		     (pol == FLEX_POL_INVERTED) ? "inverted" : "normal");
 		return -1;
 	}
 
@@ -421,13 +462,13 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 	target_frame = (abs_frame + (uint32_t)count + FLEX_TG_SETUP_MARGIN) % 128;
 
 	/* Populate slot */
-	flex->tx_temp[slot].state = FLEX_TG_SETUP;
-	flex->tx_temp[slot].count = count;
-	flex->tx_temp[slot].setups_sent = 0;
-	flex->tx_temp[slot].target_frame = target_frame;
-	flex->tx_temp[slot].setup_abs = abs_frame;
+	flex->tx_pol[pol].tx_temp[slot].state = FLEX_TG_SETUP;
+	flex->tx_pol[pol].tx_temp[slot].count = count;
+	flex->tx_pol[pol].tx_temp[slot].setups_sent = 0;
+	flex->tx_pol[pol].tx_temp[slot].target_frame = target_frame;
+	flex->tx_pol[pol].tx_temp[slot].setup_abs = abs_frame;
 	for (i = 0; i < count; i++)
-		flex->tx_temp[slot].capcodes[i] = capcodes[i];
+		flex->tx_pol[pol].tx_temp[slot].capcodes[i] = capcodes[i];
 
 	/* Create SETUP instruction messages (one per capcode) */
 	for (i = 0; i < count; i++) {
@@ -449,7 +490,7 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 			LOGP(DFLEX, LOGL_ERROR,
 			     "TX: tempgroup SETUP failed for cap=%" PRIu64 ".\n",
 			     capcodes[i]);
-			flex_tg_free_slot(flex, slot);
+			flex_tg_free_slot(flex, pol, slot);
 			return -1;
 		}
 		msg->speed = speed;
@@ -468,15 +509,12 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 	{
 		flex_msg_t *msg;
 
-		/* Use capcode 1 as a placeholder — the frame builder will
-		 * use the temp address word instead (temp_delivery_slot >= 0).
-		 * The capcode field is not used for addressing. */
 		msg = flex_msg_create(flex, 1, msg_type, data, data_length);
 		if (!msg) {
 			LOGP(DFLEX, LOGL_ERROR,
 			     "TX: tempgroup DELIVERY creation failed for slot=%d.\n",
 			     slot);
-			flex_tg_free_slot(flex, slot);
+			flex_tg_free_slot(flex, pol, slot);
 			return -1;
 		}
 		msg->speed = speed;
@@ -496,7 +534,7 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 			msg->next_send_frame = abs_frame + delay;
 		}
 
-		flex->tx_temp[slot].delivery_msg = msg;
+		flex->tx_pol[pol].tx_temp[slot].delivery_msg = msg;
 
 		LOGP(DFLEX, LOGL_INFO,
 		     "TX: DELIVERY queued slot=%d frame=%u type=%s members=%d len=%d\n",
@@ -513,49 +551,51 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
  */
 void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame)
 {
-	int i;
+	int pol, i;
 
-	for (i = 0; i < FLEX_TEMP_ADDR_SLOTS; i++) {
-		if (flex->tx_temp[i].state == FLEX_TG_FREE)
-			continue;
-
-		/* Check if delivery message has been consumed (removed from queue) */
-		if (flex->tx_temp[i].delivery_msg) {
-			flex_msg_t *m;
-			int found = 0;
-			for (m = flex->msg_list; m; m = m->next) {
-				if (m == flex->tx_temp[i].delivery_msg) {
-					found = 1;
-					break;
-				}
-			}
-			if (!found) {
-				/* Delivery consumed — teardown */
-				flex_tg_free_slot(flex, i);
+	for (pol = 0; pol < FLEX_TX_POLARITIES; pol++) {
+		for (i = 0; i < FLEX_TEMP_ADDR_SLOTS; i++) {
+			if (flex->tx_pol[pol].tx_temp[i].state == FLEX_TG_FREE)
 				continue;
-			}
-		}
 
-		/* 128-frame timeout from SETUP */
-		{
-			uint32_t elapsed = abs_frame - flex->tx_temp[i].setup_abs;
-			if (elapsed > 256) /* handle wraparound conservatively */
-				elapsed = 256;
-			if (elapsed >= 128) {
-				LOGP(DFLEX, LOGL_NOTICE,
-				     "TX: temp slot=%d TIMEOUT — %u frames since SETUP, clearing.\n",
-				     i, elapsed);
-				/* Remove delivery msg from queue if still there */
-				if (flex->tx_temp[i].delivery_msg) {
-					flex_msg_t *m;
-					for (m = flex->msg_list; m; m = m->next) {
-						if (m == flex->tx_temp[i].delivery_msg) {
-							flex_msg_destroy(m);
-							break;
-						}
+			/* Check if delivery message has been consumed (removed from queue) */
+			if (flex->tx_pol[pol].tx_temp[i].delivery_msg) {
+				flex_msg_t *m;
+				int found = 0;
+				for (m = flex->msg_list; m; m = m->next) {
+					if (m == flex->tx_pol[pol].tx_temp[i].delivery_msg) {
+						found = 1;
+						break;
 					}
 				}
-				memset(&flex->tx_temp[i], 0, sizeof(flex->tx_temp[i]));
+				if (!found) {
+					/* Delivery consumed — teardown */
+					flex_tg_free_slot(flex, pol, i);
+					continue;
+				}
+			}
+
+			/* 128-frame timeout from SETUP */
+			{
+				uint32_t elapsed = abs_frame - flex->tx_pol[pol].tx_temp[i].setup_abs;
+				if (elapsed > 256) /* handle wraparound conservatively */
+					elapsed = 256;
+				if (elapsed >= 128) {
+					LOGP(DFLEX, LOGL_NOTICE,
+					     "TX: temp slot=%d pol=%s TIMEOUT — %u frames since SETUP, clearing.\n",
+					     i, (pol == FLEX_POL_INVERTED) ? "inverted" : "normal", elapsed);
+					/* Remove delivery msg from queue if still there */
+					if (flex->tx_pol[pol].tx_temp[i].delivery_msg) {
+						flex_msg_t *m;
+						for (m = flex->msg_list; m; m = m->next) {
+							if (m == flex->tx_pol[pol].tx_temp[i].delivery_msg) {
+								flex_msg_destroy(m);
+								break;
+							}
+						}
+					}
+					memset(&flex->tx_pol[pol].tx_temp[i], 0, sizeof(flex->tx_pol[pol].tx_temp[i]));
+				}
 			}
 		}
 	}
@@ -680,9 +720,11 @@ static void flex_fragment_queue(flex_t *flex)
 			continue;
 		}
 
-		/* Assign a retrieval number for this set of fragments */
-		uint32_t ret_num = flex->frag_retrieval_seq++;
-		flex->frag_retrieval_seq &= 0x3F; /* 6-bit counter: N is 0-63 per spec */
+		/* Assign a retrieval number for this set of fragments.
+		 * Use the per-polarity counter (Req 4.4). */
+		int frag_pol = pol_index(msg->polarity);
+		uint32_t ret_num = flex->tx_pol[frag_pol].frag_retrieval_seq++;
+		flex->tx_pol[frag_pol].frag_retrieval_seq &= 0x3F; /* 6-bit counter: N is 0-63 per spec */
 
 		LOGP(DFLEX, LOGL_INFO,
 		     "Fragmenting message for capcode %" PRIu64 " into %d fragments (retrieval=%u).\n",
@@ -1308,14 +1350,7 @@ typedef struct {
  * A capcode is "in-flight" if it has a fragmented message where
  * fragment_index 0 has been transmitted (assigned_n >= 0) but
  * the last fragment has not yet been transmitted.
- * File-scope only — not exposed in headers. */
-typedef struct {
-	uint64_t         capcode;
-	uint32_t         retrieval_num;  /* identifies the fragment stream */
-	int              total_fragments;
-	int              last_sent_idx;  /* highest fragment_index already sent */
-	uint32_t         last_sent_frame;/* abs frame when last fragment was sent */
-} flex_inflight_frag_t;
+ * Now defined in flex.h as flex_inflight_frag_t. */
 
 /* Fragment-transmission slot: one (fragment, transmission_repeat) pair
  * to be placed in a specific subframe of a specific frame.
@@ -1393,16 +1428,25 @@ static int flex_scan_inflight(flex_t *flex, flex_inflight_frag_t *inflight,
 		if (m->assigned_n < 0)
 			continue;
 
-		/* Search for the last fragment and track highest sent index */
+		/* Search for the last fragment and track highest sent index.
+		 * Also find the most recently sent fragment to get its
+		 * transmission frame for interval checking. */
 		last = NULL;
 		highest_sent_idx = 0;
+		uint32_t latest_sent_abs = 0;
 		for (f = flex->msg_list; f; f = f->next) {
 			if (f->total_fragments != m->total_fragments)
 				continue;
 			if (f->retrieval_num != m->retrieval_num)
 				continue;
-			if (f->assigned_n >= 0 && f->fragment_index > highest_sent_idx)
+			if (f->assigned_n >= 0 && f->fragment_index > highest_sent_idx) {
 				highest_sent_idx = f->fragment_index;
+				/* next_send_frame of a just-sent fragment is
+				 * set to current_abs by post_transmit, so it
+				 * approximates the frame it was sent in. */
+				if (f->next_send_frame > 0)
+					latest_sent_abs = f->next_send_frame;
+			}
 			if (f->fragment_index == m->total_fragments - 1)
 				last = f;
 		}
@@ -1427,25 +1471,39 @@ static int flex_scan_inflight(flex_t *flex, flex_inflight_frag_t *inflight,
 		inflight[n_inflight].retrieval_num = m->retrieval_num;
 		inflight[n_inflight].total_fragments = m->total_fragments;
 		inflight[n_inflight].last_sent_idx = highest_sent_idx;
-		inflight[n_inflight].last_sent_frame = 0;
+		inflight[n_inflight].last_sent_abs = latest_sent_abs;
+		inflight[n_inflight].first_sent_abs = m->next_send_frame;
+		inflight[n_inflight].active = 1;
 		n_inflight++;
 	}
 
 	return n_inflight;
 }
 
-/* Check if a message is excluded by fragmentation rules (§4.2 ①②).
+/* Check if a message is excluded by fragmentation rules (Req 5.3-5.7).
  * Returns 1 if the message should be skipped, 0 if allowed.
  *
  * Rules:
- *  ① Same capcode can't start new fragmented TX while one is in-flight
- *  ② Same capcode can't appear for unfragmented msg while fragment in-flight
- *  Exception: the NEXT eligible fragment of the in-flight stream IS allowed */
+ *  4.2 (1): Same capcode can't start new fragmented TX while one is in-flight
+ *  4.2 (2): Same capcode can't appear for unfragmented msg while in-flight
+ *  4.2 (4): Fragment interval must not exceed limit (32 or 128 frames)
+ *  Exception: the NEXT eligible fragment of the in-flight stream IS allowed
+ *
+ * interval_limit: max frames between consecutive fragments
+ *   (FLEX_FRAG_INTERVAL_SINGLE=32 or FLEX_FRAG_INTERVAL_SHARED=128).
+ * current_abs: current absolute frame number.
+ * interval_warning: set to 1 if interval is within 4 frames of limit. */
 static inline int frag_excluded(const flex_msg_t *m,
                                 const flex_inflight_frag_t *inflight,
-                                int n_inflight)
+                                int n_inflight,
+                                uint32_t current_abs,
+                                int interval_limit,
+                                int *interval_warning)
 {
 	int k;
+	if (interval_warning)
+		*interval_warning = 0;
+
 	for (k = 0; k < n_inflight; k++) {
 		if (inflight[k].capcode != m->capcode)
 			continue;
@@ -1456,17 +1514,45 @@ static inline int frag_excluded(const flex_msg_t *m,
 		if (m->total_fragments == inflight[k].total_fragments &&
 		    m->retrieval_num == inflight[k].retrieval_num &&
 		    m->fragment_index == inflight[k].last_sent_idx + 1) {
+			/* Check interval: if last_sent_abs is known and
+			 * the gap would exceed the limit, still allow
+			 * the fragment (it MUST go out to avoid timeout)
+			 * but set the warning flag. */
+			if (inflight[k].last_sent_abs > 0 && current_abs > 0) {
+				uint32_t gap = current_abs - inflight[k].last_sent_abs;
+				if (gap > (uint32_t)interval_limit) {
+					/* Interval exceeded -- fragment stream
+					 * is already lost on the pager side.
+					 * Still allow it so we finish the stream. */
+					LOGP(DFLEX, LOGL_ERROR,
+					     "Fragment interval EXCEEDED: cap=%" PRIu64
+					     " ret=%u gap=%u limit=%d -- pager may have abandoned.\n",
+					     m->capcode, m->retrieval_num,
+					     gap, interval_limit);
+				}
+				if (interval_warning &&
+				    gap >= (uint32_t)(interval_limit - 4))
+					*interval_warning = 1;
+			}
 			return 0; /* allowed: this IS the continuation */
 		}
 
-		/* §4.2 ①: new fragmented message for same capcode → blocked */
+		/* 4.2 (1): new fragmented message for same capcode -- blocked */
 		if (m->total_fragments > 1)
 			return 1;
 
-		/* §4.2 ②: unfragmented message for same capcode → blocked */
+		/* 4.2 (2): unfragmented message for same capcode -- blocked.
+		 *
+		 * NOTE: per 3.8.5 rule 3, the standard allows the same
+		 * address to appear ONCE per frame for unfragmented messages
+		 * during in-flight fragmentation.  We currently block all
+		 * unfragmented messages for the same capcode, which is more
+		 * restrictive than required but safe.  To relax this, the
+		 * caller would need to track per-frame address usage counts
+		 * and pass them here. */
 		return 1;
 	}
-	return 0; /* capcode has no in-flight fragments → allowed */
+	return 0; /* capcode has no in-flight fragments -- allowed */
 }
 
 /*
@@ -1552,6 +1638,37 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 
 	/* === Normal frame generation (ERS already sent) === */
+
+	/* === Polarity selection (Req 1.3-1.6) ===
+	 *
+	 * Select which polarity to transmit this frame period.
+	 * Round-robin when both have messages, single when only one,
+	 * normal default when idle. */
+	{
+		int selected_pol;
+		int normal_has = flex->tx_pol[FLEX_POL_NORMAL].msg_count > 0;
+		int inverted_has = flex->tx_pol[FLEX_POL_INVERTED].msg_count > 0;
+
+		if (flex->fixed_polarity != 0.0) {
+			/* Fixed-polarity mode: always use the fixed polarity */
+			selected_pol = pol_index(flex->fixed_polarity);
+		} else if (normal_has && inverted_has) {
+			/* Both have messages: round-robin */
+			selected_pol = (flex->last_tx_polarity == FLEX_POL_NORMAL)
+				? FLEX_POL_INVERTED : FLEX_POL_NORMAL;
+		} else if (normal_has) {
+			selected_pol = FLEX_POL_NORMAL;
+		} else if (inverted_has) {
+			selected_pol = FLEX_POL_INVERTED;
+		} else {
+			/* Neither has messages: default to normal for idle */
+			selected_pol = FLEX_POL_NORMAL;
+		}
+
+		/* Apply polarity to DSP */
+		dsp_set_polarity(flex, (selected_pol == FLEX_POL_INVERTED) ? -1.0 : 1.0);
+		flex->last_tx_polarity = selected_pol;
+	}
 
 	/* Fragment any oversized messages in the queue before selection */
 	flex_fragment_queue(flex);
@@ -1645,6 +1762,48 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 	params.timezone_code = flex->timezone_code;
 
+	/* === BIW carousel selection (Req 3) ===
+	 * Select which BIW2/3/4 words go in this frame.
+	 * The carousel tracks per-phase, per-polarity state.
+	 * Result is used for both capacity estimation and encoding. */
+	{
+		int selected_pol = flex->last_tx_polarity;
+		int phase_idx = 0; /* TODO: per-phase in multi-phase mode */
+		flex_biw_carousel_t *car = &flex->tx_pol[selected_pol].biw_carousel[phase_idx];
+		flex_biw_config_t biw_cfg;
+		int biw_types[BIW_MAX_EXTRA];
+		int biw_n = 0;
+		flex_biw_time_val_t biw_time_val;
+
+		memset(&biw_cfg, 0, sizeof(biw_cfg));
+		biw_cfg.ssid1_configured = (flex->ssid || flex->nid) ? 1 : 0;
+		biw_cfg.ssid2_configured = (flex->country_code || flex->tmf) ? 1 : 0;
+		biw_cfg.biw_time_enabled = flex->biw_time_enabled;
+		biw_cfg.timezone_configured = (flex->timezone_code >= 0) ? 1 : 0;
+		biw_cfg.chan_setup_enabled = flex->chan_setup_enabled;
+		biw_cfg.roaming_active = flex->roaming_active;
+		biw_cfg.has_sysmsg = 0; /* set later if sysmsg detected */
+
+		flex_biw_carousel_select(car, &biw_cfg,
+					 ft.frame, ft.cycle,
+					 ft.cycle * 128 + ft.frame,
+					 biw_types, &biw_n, &biw_time_val);
+
+		/* Store carousel BIW count for capacity estimation.
+		 * The old static flex_compute_biw_count() is still used
+		 * by the encoder -- this carousel count is for the
+		 * scheduler's capacity estimation only.  Full encoder
+		 * integration happens when the encoder reads carousel
+		 * output instead of computing BIW selection itself. */
+		params.carousel_biw_count = 1 + biw_n; /* BIW1 + extras */
+
+		/* Update carousel state after selection.
+		 * This must happen even if no messages are packed --
+		 * the carousel tracks transmission regardless. */
+		flex_biw_carousel_update(car, biw_types, biw_n,
+					 ft.cycle * 128 + ft.frame);
+	}
+
 	/* FIW n=0 by default. Set by --roaming CLI flag. */
 
 	/* === Multi-message candidate collection ===
@@ -1713,7 +1872,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 
 	{
-		int biw_count = flex_compute_biw_count(&params);
+		/* Use carousel BIW count if available, else fall back
+		 * to the static computation (for backward compat). */
+		int biw_count = (params.carousel_biw_count > 0)
+			? params.carousel_biw_count
+			: flex_compute_biw_count(&params);
 		if (params.num_transmissions > 1)
 			capacity = flex_subframe_words(params.num_transmissions) - biw_count;
 		else
@@ -1820,13 +1983,32 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (pass == 2 && has_sysmsg_content)
 					continue;
 
-				/* Fragmentation address exclusion (§4.2 ①②) */
-				if (frag_excluded(candidate, inflight, n_inflight)) {
-					LOGP(DFLEX, LOGL_DEBUG,
-					     "Scheduler: skip capcode=%" PRIu64 " frag_idx=%d — "
-					     "fragmentation address exclusion (§4.2)\n",
-					     candidate->capcode, candidate->fragment_index);
-					continue;
+				/* Fragmentation address exclusion and interval check
+				 * (Req 5.3-5.7, 4.2 rules 1-2-4) */
+				{
+					int frag_interval = (flex->num_transmissions > 1 ||
+							     flex->roaming_active ||
+							     flex->pocsag_mix_enabled)
+						? FLEX_FRAG_INTERVAL_SHARED
+						: FLEX_FRAG_INTERVAL_SINGLE;
+					int iw = 0;
+					if (frag_excluded(candidate, inflight, n_inflight,
+							  current_abs, frag_interval, &iw)) {
+						LOGP(DFLEX, LOGL_DEBUG,
+						     "Scheduler: skip cap=%" PRIu64 " frag_idx=%d"
+						     " -- frag address exclusion\n",
+						     candidate->capcode, candidate->fragment_index);
+						continue;
+					}
+					if (iw) {
+						LOGP(DFLEX, LOGL_NOTICE,
+						     "Scheduler: fragment interval WARNING:"
+						     " cap=%" PRIu64 " ret=%u approaching"
+						     " limit (%d frames)\n",
+						     candidate->capcode,
+						     candidate->retrieval_num,
+						     frag_interval);
+					}
 				}
 
 				if (n_sorted >= FLEX_MAX_CANDIDATES)
@@ -1955,7 +2137,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 		phase_params.single_phase = 1;
 
 		{
-			int biw_count = flex_compute_biw_count(&params);
+			int biw_count = (params.carousel_biw_count > 0)
+				? params.carousel_biw_count
+				: flex_compute_biw_count(&params);
 			int phase_capacity = FLEX_WORDS_PER_FRAME - biw_count;
 
 			/* Distribute candidates to per-phase lists */
@@ -1980,20 +2164,22 @@ static int flex_get_next_frame_network(flex_t *flex)
 			}
 		}
 
-		/* Carry-on computation for multi-phase (Spec §3.7.1 / §4.2.1).
+		/* Carry-on computation for multi-phase (Spec 3.7.1 / 4.2.1).
 		 *
 		 * Per spec: "values for Carry On must be identical for all
-		 * phases in one Frame."  Scan the queue for fragment messages
-		 * eligible for this frame and compute carry-on from the max
-		 * remaining fragment count.  Alpha-bounded per §4.2.2 Rule ②
-		 * (Req 16.4, 17.1).  Must be done before per-phase encoding
-		 * since BIW1 is baked into the encoded words.
+		 * phases in one Frame."  Scan the per-polarity queue for
+		 * fragment messages eligible for this frame and compute
+		 * carry-on from the max remaining fragment count.
+		 * Alpha-bounded per 4.2.2 Rule 2 (Req 5.8).
 		 * Only meaningful with collapse > 0.
 		 * Per spec: "Carry On is not allowed for multiple transmission." */
 		if (flex->collapse > 0 && flex->num_transmissions <= 1) {
 			flex_msg_t *qm;
 			int max_remaining = 0;
+			int sel_pol = flex->last_tx_polarity;
 			for (qm = flex->msg_list; qm; qm = qm->next) {
+				if (pol_index(qm->polarity) != sel_pol)
+					continue;
 				if (qm->speed != params.bitrate ||
 				    qm->modulation_type != params.modulation_type)
 					continue;
@@ -2090,12 +2276,24 @@ static int flex_get_next_frame_network(flex_t *flex)
 						if (!is_retransmission) {
 							if (m->total_fragments > 1)
 								m->assigned_n = (int)m->retrieval_num;
-							else
-								m->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
+							else {
+								/* Per-capcode N_Counter (Req 4.1-4.3) */
+								int mp = pol_index(m->polarity);
+								uint32_t af = ft.cycle * 128 + ft.frame;
+								m->assigned_n = (int)flex_n_counter_get(
+									&flex->tx_pol[mp], m->capcode, af);
+							}
 							fm->sequence_num = m->assigned_n;
+							LOGP(DFLEX, LOGL_INFO,
+							     "TX: capcode=%" PRIu64 " N=%d R=1 type=%s frags=%d retransmit=%d/%d C%u/F%u\n",
+							     m->capcode, m->assigned_n,
+							     flex_msg_type_name(m->msg_type),
+							     m->total_fragments,
+							     m->retransmit_count, m->retransmit_max,
+							     ft.cycle, ft.frame);
 							/* R=1 for normal initial TX.
 							 * R=0 when msg->numbered_r is explicitly 0
-							 * (system messages per spec §3.9.2). */
+							 * (system messages per spec 3.9.2). */
 							fm->alpha_r_flag = m->numbered_r ? 1 : 0;
 							fm->hex_r_flag = m->numbered_r ? 1 : 0;
 							fm->numbered_r = m->numbered_r ? 1 : 0;
@@ -2111,6 +2309,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 							fm->alpha_r_flag = 0;
 							fm->hex_r_flag = 0;
 							fm->numbered_r = 0;
+							LOGP(DFLEX, LOGL_INFO,
+							     "TX: capcode=%" PRIu64 " N=%d R=0 (retransmit %d/%d) type=%s C%u/F%u\n",
+							     m->capcode, m->assigned_n,
+							     m->retransmit_count, m->retransmit_max,
+							     flex_msg_type_name(m->msg_type),
+							     ft.cycle, ft.frame);
 						}
 					}
 
@@ -2297,9 +2501,24 @@ static int flex_get_next_frame_network(flex_t *flex)
 					 * (or R=0 for system messages per §3.9.2). */
 					if (m->total_fragments > 1)
 						m->assigned_n = (int)m->retrieval_num;
-					else
-						m->assigned_n = (int)(flex->msg_sequence++ & 0x3F);
+					else {
+						/* Per-capcode N_Counter (Req 4.1-4.3) */
+						int mp = pol_index(m->polarity);
+						uint32_t af = ft.cycle * 128 + ft.frame;
+						m->assigned_n = (int)flex_n_counter_get(
+							&flex->tx_pol[mp], m->capcode, af);
+					}
 					fm->sequence_num = m->assigned_n;
+					LOGP(DFLEX, LOGL_INFO,
+					     "TX: capcode=%" PRIu64 " N=%d R=1 type=%s frags=%d retransmit=%d/%d C%u/F%u\n",
+					     m->capcode, m->assigned_n,
+					     flex_msg_type_name(m->msg_type),
+					     m->total_fragments,
+					     m->retransmit_count, m->retransmit_max,
+					     ft.cycle, ft.frame);
+					/* R=1 for normal initial TX.
+					 * R=0 when msg->numbered_r is explicitly 0
+					 * (system messages per spec §3.9.2). */
 					fm->alpha_r_flag = m->numbered_r ? 1 : 0;
 					fm->hex_r_flag = m->numbered_r ? 1 : 0;
 					fm->numbered_r = m->numbered_r ? 1 : 0;
@@ -2316,6 +2535,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 					fm->alpha_r_flag = 0;
 					fm->hex_r_flag = 0;
 					fm->numbered_r = 0;
+					LOGP(DFLEX, LOGL_INFO,
+					     "TX: capcode=%" PRIu64 " N=%d R=0 (retransmit %d/%d) type=%s C%u/F%u\n",
+					     m->capcode, m->assigned_n,
+					     m->retransmit_count, m->retransmit_max,
+					     flex_msg_type_name(m->msg_type),
+					     ft.cycle, ft.frame);
 				}
 			}
 
@@ -2328,16 +2553,19 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 		/* Carry-on computation (Spec Section 3.7.1 / 4.2.1).
 		 *
-		 * Scan entire queue for max remaining fragment count across
-		 * all eligible messages (not just packed ones — Req 9.1).
-		 * Alpha-bounded per §4.2.2 Rule ② (Req 16.4, 17.1).
+		 * Scan per-polarity queue for max remaining fragment count
+		 * across all eligible messages (not just packed ones -- Req 5.8).
+		 * Alpha-bounded per 4.2.2 Rule 2.
 		 * Only meaningful with collapse > 0 (battery saving active);
 		 * with collapse=0 pagers decode every frame anyway.
 		 * Per spec: "Carry On is not allowed for multiple transmission." */
 		if (flex->collapse > 0 && flex->num_transmissions <= 1) {
 			flex_msg_t *qm;
 			int max_remaining = 0;
+			int sel_pol = flex->last_tx_polarity;
 			for (qm = flex->msg_list; qm; qm = qm->next) {
+				if (pol_index(qm->polarity) != sel_pol)
+					continue;
 				if (qm->speed != params.bitrate ||
 				    qm->modulation_type != params.modulation_type)
 					continue;
@@ -2834,6 +3062,25 @@ int flex_create(const char *kanal, double frequency, const char *device, int use
 	flex->rx.sample_freq = samplerate;
 	flex->rx.baud = 1600;
 
+	/* Init per-polarity TX scheduling state (Req 1, 7).
+	 * N_Counter hash tables and BIW carousel for both polarities. */
+	{
+		int p;
+		for (p = 0; p < FLEX_TX_POLARITIES; p++) {
+			rc = flex_n_counter_init(&flex->tx_pol[p]);
+			if (rc < 0) {
+				LOGP(DFLEX, LOGL_ERROR,
+				     "Failed to init N_Counter for polarity %d!\n", p);
+				goto error;
+			}
+			{
+				int ph;
+				for (ph = 0; ph < FLEX_MAX_PHASES; ph++)
+					flex_biw_carousel_init(&flex->tx_pol[p].biw_carousel[ph]);
+			}
+		}
+	}
+
 	flex_display_status();
 
 	LOGP(DFLEX, LOGL_NOTICE, "Created 'Kanal' %s: samplerate=%d deviation=%.0f polarity=%s tx=%d.\n",
@@ -2850,8 +3097,13 @@ error:
 void flex_destroy(sender_t *sender)
 {
 	flex_t *flex = (flex_t *) sender;
+	int p;
 
 	LOGP(DFLEX, LOGL_DEBUG, "Destroying 'FLEX' instance for 'Kanal' = %s.\n", sender->kanal);
+
+	/* Cleanup per-polarity TX state */
+	for (p = 0; p < FLEX_TX_POLARITIES; p++)
+		flex_n_counter_cleanup(&flex->tx_pol[p]);
 
 	while (flex->msg_list)
 		flex_msg_destroy(flex->msg_list);

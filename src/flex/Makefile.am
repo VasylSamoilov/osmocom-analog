@@ -7,6 +7,8 @@ flex_SOURCES = \
 	flex.c \
 	frame.c \
 	scheduler.c \
+	n_counter.c \
+	biw_carousel.c \
 	dsp.c \
 	image.c \
 	main.c

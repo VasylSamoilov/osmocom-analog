@@ -752,9 +752,9 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	char *p, *key, *val;
 	int len;
 
-	/* defaults */
-	*speed = 1600;
-	*modulation_type = FLEX_MOD_2FSK;
+	/* defaults — use fixed speed/modulation if set, else 1600/2FSK */
+	*speed = (fixed_speed > 0) ? fixed_speed : 1600;
+	*modulation_type = (fixed_speed > 0) ? fixed_mod_type : FLEX_MOD_2FSK;
 	*polarity_out = FLEX_DEFAULT_POLARITY;
 	*priority = 0;
 	*charset = 0;
@@ -2091,7 +2091,7 @@ static void fifo_process_line(const char *text, int text_length)
 				return;
 			}
 			if (flex->fixed_polarity != 0.0 && msg_polarity != flex->fixed_polarity) {
-				LOGP(DFLEX, LOGL_NOTICE, "fixed-mode: polarity locked to %s, discarding message with polarity=%s\n",
+				LOGP(DFLEX, LOGL_NOTICE, "fixed-mode: polarity locked to %s, rejecting message with polarity=%s\n",
 				     (flex->fixed_polarity < 0) ? "inverted" : "normal",
 				     (msg_polarity < 0) ? "inverted" : "normal");
 				return;
@@ -2395,6 +2395,18 @@ int main(int argc, char *argv[])
 	if (num_transmissions > 1 && collapse <= 0) {
 		fprintf(stderr, "Warning: --num-transmissions > 1 requires --collapse > 0, setting to 1.\n");
 		num_transmissions = 1;
+	}
+	if (td_collapse >= 0 && (td_collapse < 5 || td_collapse > 7)) {
+		fprintf(stderr, "Error: --td-collapse must be 5, 6, or 7.\n");
+		return -EINVAL;
+	}
+	if (td_collapse >= 0 && td_collapse <= collapse) {
+		fprintf(stderr, "Error: --td-collapse (%d) must be > --collapse (%d).\n",
+			td_collapse, collapse);
+		return -EINVAL;
+	}
+	if (roaming_enabled && !ssid && !nid) {
+		fprintf(stderr, "Warning: --roaming requires --ssid1 and/or --ssid2 to be useful.\n");
 	}
 	if (biw_time_enabled == -1)
 		biw_time_enabled = 0;
