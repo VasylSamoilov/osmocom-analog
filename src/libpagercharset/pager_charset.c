@@ -46,6 +46,12 @@ static const struct pager_charset *registry[] = {
 	&pager_charset_golay_generic_generic_ascii,
 	/* FLEX */
 	&pager_charset_flex_generic_generic_ascii,
+	&pager_charset_flex_motorola_linguist_cyrillic,
+	&pager_charset_flex_motorola_linguist_icelandic,
+	&pager_charset_flex_motorola_linguist_polish,
+	&pager_charset_flex_motorola_linguist_vietnamese,
+	&pager_charset_flex_motorola_linguist_arabic,
+	&pager_charset_flex_motorola_linguist_arabic_english,
 	/* RDS */
 	&pager_charset_rds_generic_generic_annex_e,
 	&pager_charset_rds_nokia_nkp2_annex_e,

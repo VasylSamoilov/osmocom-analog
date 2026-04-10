@@ -129,6 +129,12 @@ extern const struct pager_charset pager_charset_golay_generic_generic_ascii;
 /* --- Built-in FLEX codepages (7-bit, 128 codes) --- */
 
 extern const struct pager_charset pager_charset_flex_generic_generic_ascii;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_cyrillic;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_icelandic;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_polish;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_vietnamese;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_arabic;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_arabic_english;
 
 /* --- Built-in RDS codepages (8-bit, 256 codes) --- */
 
