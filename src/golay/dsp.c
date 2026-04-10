@@ -87,7 +87,7 @@ int dsp_init_sender(gsc_t *gsc, int samplerate, double deviation, double polarit
 	gsc->fsk_rx_phase = 0.0;
 	gsc->fsk_rx_last_sample = 0.0;
 	gsc->fsk_rx_last_bit = 0;
-	LOGP_CHAN(DDSP, LOGL_DEBUG, "RX DSP initialized: %.1f baud, polarity %.0f.\n", 600.0, polarity);
+	LOGP_CHAN(DDSP, LOGL_DEBUG, "RX DSP initialized: %.1f baud, polarity %s.\n", 600.0, polarity < 0 ? "inverted" : "normal");
 
 	return 0;
 
@@ -258,6 +258,9 @@ static void rx_reset_idle(gsc_t *gsc)
 	gsc->rx_polarity_inverted = 0;
 	gsc->rx_batch_candidate = 0;
 	gsc->rx_batch_mode = 0;
+	gsc->rx_nbs_count = 0;
+	gsc->rx_nbs_shift_count = 0;
+	gsc->rx_nbs_locked = 0;
 }
 
 /* Enter voice recording state after a voice message is decoded.
@@ -332,11 +335,72 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 {
 	gsc_rx_msg_t msg;
 	int min_batch_bits;
+	int rc;
 
 	memset(&msg, 0, sizeof(msg));
 
 	/* ---- Phase 1: RX_IDLE — scan for first preamble codeword ---- */
 	if (gsc->rx_state == RX_IDLE) {
+		/* ---- NBS preamble detection (§2.5) ----
+		 * Only active when --nbs flag is set.
+		 * The 75 Hz preamble is a 1,1,0,0 repeating pattern at 600 baud.
+		 * Track the last 4 bits and count consecutive pattern matches.
+		 * After 20 cycles (80 bits = 0.133s), lock as NBS preamble.
+		 * Once locked, watch for the pattern to break (comma starts),
+		 * then transition to RX_DATA for address decoding. */
+		if (gsc->nbs) {
+			/* Shift bit into 4-bit NBS register */
+			if (gsc->rx_nbs_shift_count < 4) {
+				gsc->rx_nbs_shift[gsc->rx_nbs_shift_count++] = bit;
+			} else {
+				gsc->rx_nbs_shift[0] = gsc->rx_nbs_shift[1];
+				gsc->rx_nbs_shift[1] = gsc->rx_nbs_shift[2];
+				gsc->rx_nbs_shift[2] = gsc->rx_nbs_shift[3];
+				gsc->rx_nbs_shift[3] = bit;
+			}
+
+			if (gsc->rx_nbs_shift_count >= 4) {
+				/* Check for 1,1,0,0 pattern */
+				if (gsc->rx_nbs_shift[0] == 1 && gsc->rx_nbs_shift[1] == 1 &&
+				    gsc->rx_nbs_shift[2] == 0 && gsc->rx_nbs_shift[3] == 0) {
+					gsc->rx_nbs_count++;
+					gsc->rx_nbs_shift_count = 0; /* reset for next 4-bit group */
+				} else if (gsc->rx_nbs_shift[0] == 0 && gsc->rx_nbs_shift[1] == 0 &&
+				           gsc->rx_nbs_shift[2] == 1 && gsc->rx_nbs_shift[3] == 1) {
+					/* Inverted 75 Hz pattern — count it too */
+					gsc->rx_nbs_count++;
+					gsc->rx_nbs_shift_count = 0;
+				} else if (gsc->rx_nbs_count >= 20) {
+					/* Pattern broke after lock — NBS preamble ended.
+					 * The current 4 bits are the start of post-preamble data.
+					 * Transition to RX_DATA and start buffering. */
+					LOGP_CHAN(DDSP, LOGL_INFO, "RX state: IDLE -> DATA (NBS preamble locked, %d cycles).\n",
+						gsc->rx_nbs_count);
+
+					gsc->rx_bit_num = 0;
+					gsc->rx_nbs_locked = 1;
+					gsc->rx_preamble_index = -1; /* unknown in NBS mode */
+					gsc->rx_no_transition = 0;
+					gsc->rx_shift_count = 0;
+					gsc->rx_state = RX_DATA;
+
+					/* Buffer the 4 bits that broke the pattern */
+					{
+						int b;
+						for (b = 0; b < 4; b++)
+							gsc->rx_bit[gsc->rx_bit_num++] = gsc->rx_nbs_shift[b];
+					}
+
+					gsc->rx_nbs_count = 0;
+					gsc->rx_nbs_shift_count = 0;
+					return;
+				} else {
+					/* Pattern didn't match and not locked — reset */
+					gsc->rx_nbs_count = 0;
+				}
+			}
+		}
+
 		/* Shift new bit into the 46-bit register */
 		if (gsc->rx_shift_count < 46) {
 			gsc->rx_shift[gsc->rx_shift_count++] = bit;
@@ -782,9 +846,10 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 		}
 	}
 
-	/* Minimum bits for a valid batch:
-	 * preamble(28 + 18*46) + start(121) + address(121) = 1098 bits. */
-	min_batch_bits = 28 + 18 * 46 + 121 + 121;
+	/* Minimum bits for a valid message:
+	 * GSC: preamble(28 + 18*46) + start(121) + address(121) = 1098 bits.
+	 * NBS: address(121) only (no preamble or start code). */
+	min_batch_bits = gsc->rx_nbs_locked ? 121 : (28 + 18 * 46 + 121 + 121);
 
 	if (gsc->rx_bit_num < min_batch_bits)
 		return;
@@ -849,7 +914,10 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 			memcpy(gsc->bit, gsc->rx_bit, nbits);
 			gsc->bit_num = nbits;
 
-			if (decode_batch(gsc, &msg, force) == 0) {
+			rc = gsc->rx_nbs_locked
+				? decode_nbs(gsc, &msg, force)
+				: decode_batch(gsc, &msg, force);
+			if (rc == 0) {
 				msg.polarity_inverted = gsc->rx_polarity_inverted;
 				golay_msg_receive(&msg);
 				if (msg.type == TYPE_VOICE) {

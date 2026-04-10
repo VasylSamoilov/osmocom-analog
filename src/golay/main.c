@@ -51,6 +51,7 @@ static const char *voice_dir = NULL;	/* voice recording output folder */
 static int voice_monitor = 0;		/* voice monitor mode (play to audio output) */
 static int batching_mode = BATCHING_OFF;
 static int protocol_dump = 0;
+static int nbs_mode = 0;
 
 void print_help(const char *arg0)
 {
@@ -63,9 +64,10 @@ void print_help(const char *arg0)
 	printf("        If none of the options -T nor -R is given, only transmitter is enabled.\n");
 	printf(" -D --deviation wide | 4.5 | narrow | 1.0 | <other KHz>\n"); /* NB confirmed by IQ data from signal-id-wiki */
 	printf("        Choose deviation of FFSK signal (default %.0f KHz).\n", deviation / 1000.0);
-	printf(" -P --polarity -1 | negative | 1 | positive\n");
-	printf("        Choose polarity of FFSK signal. 'positive' means that a binary 1 uses\n");
-	printf("        positive and a binary 0 negative deviation. (default %s).\n", (polarity < 0) ? "negative" : "positive");
+	printf(" -P --polarity normal | inverted | positive | negative | 1 | -1\n");
+	printf("        Choose polarity of FFSK signal. 'normal' (or 'positive' or '1') means\n");
+	printf("        binary 1 = positive deviation per GSC standard. 'inverted' (or\n");
+	printf("        'negative' or '-1') reverses the mapping. (default normal).\n");
 	printf("        For RX, locks polarity to this value. If not given, RX auto-detects\n");
 	printf("        polarity from the preamble.\n");
 	printf(" -B --batching off | normal | extended\n");
@@ -84,6 +86,9 @@ void print_help(const char *arg0)
 	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
 	printf("    --protocol-dump\n");
 	printf("        Dump TX bit buffer to the log for protocol analysis.\n");
+	printf("    --nbs\n");
+	printf("        Non-battery-saver mode: use 75 Hz preamble without coded preamble\n");
+	printf("        or start code. Higher throughput, but no battery saving groups.\n");
 	printf("\n");
 	printf("File: %s\n", msg_send_path);
 	printf("        Write \"<address>[,message]\" to it, to send a default message.\n");
@@ -115,6 +120,7 @@ static void add_options(void)
 	option_add(0x100, "voice-monitor", 0);
 	option_add(0x101, "fifo", 1);
 	option_add(0x102, "protocol-dump", 0);
+	option_add(0x103, "nbs", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -144,16 +150,16 @@ static int handle_options(int short_option, int argi, char **argv)
 		deviation_given = 1;
 		break;
 	case 'P':
-		if (argv[argi][0] == 'n' || argv[argi][0] == 'N')
-			polarity = -1.0;
-		else if (argv[argi][0] == 'p' || argv[argi][0] == 'P')
+		if (!strcmp(argv[argi], "normal") || !strcmp(argv[argi], "positive"))
 			polarity = 1.0;
-		else if (atoi(argv[argi]) == -1)
+		else if (!strcmp(argv[argi], "inverted") || !strcmp(argv[argi], "negative"))
 			polarity = -1.0;
 		else if (atoi(argv[argi]) == 1)
 			polarity = 1.0;
+		else if (atoi(argv[argi]) == -1)
+			polarity = -1.0;
 		else {
-			fprintf(stderr, "Given polarity is not positive nor negative, use '-h' for help.\n");
+			fprintf(stderr, "Given polarity '%s' is invalid, use 'normal', 'inverted', 'positive', 'negative', '1', or '-1'.\n", argv[argi]);
 			return -EINVAL;
 		}
 		polarity_given = 1;
@@ -184,6 +190,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 0x102: /* --protocol-dump */
 		protocol_dump = 1;
+		break;
+	case 0x103: /* --nbs */
+		nbs_mode = 1;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -350,6 +359,7 @@ int main(int argc, char *argv[])
 			gsc_t *gsc = (gsc_t *)sender_head;
 			gsc->batching_mode = batching_mode;
 			gsc->protocol_dump = protocol_dump;
+			gsc->nbs = nbs_mode;
 		}
 		printf("Base station ready, please tune transmitter (or receiver) to %.4f MHz\n", frequency / 1e6);
 	}

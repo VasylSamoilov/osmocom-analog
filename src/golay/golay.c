@@ -112,7 +112,7 @@ int golay_create(const char *kanal, double frequency, const char *device, int us
 		if (auto_polarity)
 			LOGP(DGOLAY, LOGL_INFO, "RX polarity: auto-detect.\n");
 		else
-			LOGP(DGOLAY, LOGL_INFO, "RX polarity: locked to %s.\n", (polarity < 0) ? "negative" : "positive");
+			LOGP(DGOLAY, LOGL_INFO, "RX polarity: locked to %s.\n", (polarity < 0) ? "inverted" : "normal");
 		LOGP(DGOLAY, LOGL_INFO, "Receive mode enabled.\n");
 	}
 
@@ -129,6 +129,7 @@ int golay_create(const char *kanal, double frequency, const char *device, int us
 	gsc->priority_list = NULL;
 	gsc->priority_count = 0;
 	gsc->normal_count = 0;
+	gsc->sched_current_group = 0;
 	gsc->tx_msg_count = 0;
 	gsc->tx_preamble_index = 0;
 	gsc->batching_mode = BATCHING_OFF;
@@ -941,12 +942,17 @@ char decode_alpha(uint8_t code)
  *
  * numeric_shift_table[16] — codes after 0xF prefix:
  *   0x0: 'A', 0x1: 'B', 0x2: 'C', 0x3: 'D', 0x4: 'E',
- *   0x5: '?' (unused), 0x6: 'F', 0x7: 'G', 0x8: 'H', 0x9: 'J',
- *   0xA: '?' (unused), 0xB: 'L', 0xC: 'N', 0xD: 'P', 0xE: 'R',
- *   0xF: '?' (unused)
+ *   0x5: ' ' (Space), 0x6: 'F', 0x7: 'G', 0x8: 'H', 0x9: 'J',
+ *   0xA: '\0' (Null), 0xB: 'L', 0xC: 'N', 0xD: 'P', 0xE: 'R',
+ *   0xF: '?' (Spare)
  *
- * Note: gaps at 0x5, 0xA, 0xF in the shift table correspond to letters
- * (I, K, Q) that are omitted from the GSC numeric character set.
+ * Per Table VII, shifted codes 0x5 and 0xA map to Space and Null
+ * respectively. Code 0xF is spare (undefined).
+ *
+ * UNCONFIRMED: Motorola GSC Table A-17 defines international characters
+ * (ä, ö, ü, ñ, ç, é, è, ê, Å, ß, etc.) via a SHIFT prefix in the
+ * alphanumeric stream. The SHIFT prefix code and full mechanism are not
+ * yet confirmed from the source document. Not implemented.
  */
 static const char numeric_decode_table[16] = {
 	/* 0x0 */ '0', '1', '2', '3', '4', '5', '6', '7',
@@ -954,8 +960,8 @@ static const char numeric_decode_table[16] = {
 };
 
 static const char numeric_shift_table[16] = {
-	/* 0x0 */ 'A', 'B', 'C', 'D', 'E', '?', 'F', 'G',
-	/* 0x8 */ 'H', 'J', '?', 'L', 'N', 'P', 'R', '?',
+	/* 0x0 */ 'A', 'B', 'C', 'D', 'E', ' ', 'F', 'G',
+	/* 0x8 */ 'H', 'J', '\0', 'L', 'N', 'P', 'R', '?',
 };
 
 /* Decode a single 4-bit numeric code, handling the shift prefix mechanism.
@@ -2820,6 +2826,291 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	return 0;
 }
 
+/* Decode a non-battery-saver (NBS) message from the RX bit buffer.
+ *
+ * NBS format has no coded preamble or start code — the bitstream starts
+ * directly with the address comma + W1 + comma_bit + W2, followed by
+ * optional data blocks.
+ *
+ * Layout: [28-bit comma] [dup(W1)] [1-bit] [dup(W2)] [data...]
+ *
+ * Returns 0 on success, -1 on decode failure. */
+int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
+{
+	const uint8_t *bits = gsc->bit;
+	int pos = 0;
+	int total_bits = gsc->bit_num;
+	const int comma_len = 28;
+	const int dup_bits = 46;
+	const int bch_block_bits = 120;
+	const int tone_comma_len = 121 * 8;
+
+	uint32_t codeword;
+	uint16_t decoded_value;
+	int rc, i;
+
+	uint16_t w1_value, w2_value;
+	int w1_inverted, w2_inverted;
+	uint8_t function;
+	int g1, g0, a2, a1, a0;
+	int g1g0, idx;
+	char suffix;
+	int remaining;
+	enum gsc_msg_type detected_type;
+
+	memset(msg, 0, sizeof(*msg));
+	msg->preamble_index = -1; /* unknown in NBS mode */
+
+	LOGP(DGOLAY, LOGL_DEBUG, "Decoding NBS message: %d bits in buffer.\n", total_bits);
+
+	/* ================================================================
+	 * ADDRESS (no preamble or start code in NBS mode)
+	 *
+	 * Layout: [28-bit comma] [dup(W1)] [1-bit] [dup(W2)]
+	 * ================================================================ */
+
+	if (pos + comma_len + dup_bits + 1 + dup_bits > total_bits) {
+		LOGP(DGOLAY, LOGL_NOTICE, "NBS: not enough bits for address (%d available).\n", total_bits);
+		return -1;
+	}
+
+	/* Skip 28-bit comma */
+	pos += comma_len;
+
+	/* Decode W1 with inversion detection */
+	codeword = read_dup_golay(bits, &pos);
+	w1_inverted = 0;
+
+	rc = decode_golay(codeword, &decoded_value);
+	if (rc == 0) {
+		int found = 0;
+		for (i = 0; i < 50; i++) {
+			if (decoded_value == word1s[i]) {
+				found = 1;
+				break;
+			}
+		}
+		if (found) {
+			w1_value = decoded_value;
+		} else {
+			rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
+			if (rc == 0) {
+				w1_value = decoded_value;
+				w1_inverted = 1;
+			} else {
+				LOGP(DGOLAY, LOGL_NOTICE, "NBS W1: not in table, complement failed.\n");
+				return -1;
+			}
+		}
+	} else {
+		rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
+		if (rc == 0) {
+			w1_value = decoded_value;
+			w1_inverted = 1;
+		} else {
+			LOGP(DGOLAY, LOGL_NOTICE, "NBS W1: both decodes failed.\n");
+			return -1;
+		}
+	}
+
+	rc = reverse_word1(w1_value, &g1, &g0);
+	if (rc < 0) {
+		LOGP(DGOLAY, LOGL_NOTICE, "NBS: W1 value %u not in word1s table.\n", w1_value);
+		return -1;
+	}
+	g1g0 = g1 * 10 + g0;
+
+	/* Skip 1-bit comma */
+	pos += 1;
+
+	/* Decode W2 with inversion and range detection */
+	codeword = read_dup_golay(bits, &pos);
+	w2_inverted = 0;
+
+	{
+		uint16_t w2_try[2] = { 0, 0 };
+		int golay_ok[2] = { 0, 0 };
+		int try_g1g0[2];
+		int best_inv = -1, best_range = -1;
+		int ta2, ta1, ta0;
+		int inv, rng;
+
+		try_g1g0[0] = g1g0;
+		try_g1g0[1] = g1g0 + 50;
+
+		rc = decode_golay(codeword, &decoded_value);
+		if (rc == 0) { w2_try[0] = decoded_value; golay_ok[0] = 1; }
+
+		rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
+		if (rc == 0) { w2_try[1] = decoded_value; golay_ok[1] = 1; }
+
+		for (inv = 0; inv < 2; inv++) {
+			if (!golay_ok[inv])
+				continue;
+			for (rng = 0; rng < 2; rng++) {
+				if (reverse_word2(w2_try[inv], try_g1g0[rng], &ta2, &ta1, &ta0) == 0) {
+					if (best_inv < 0) {
+						best_inv = inv;
+						best_range = rng;
+						a2 = ta2; a1 = ta1; a0 = ta0;
+					}
+				}
+			}
+		}
+
+		if (best_inv < 0) {
+			LOGP(DGOLAY, LOGL_NOTICE, "NBS W2: no valid address.\n");
+			return -1;
+		}
+
+		w2_value = w2_try[best_inv];
+		w2_inverted = best_inv;
+
+		if (best_range == 1) {
+			g1g0 = try_g1g0[1];
+			g1 = g1g0 / 10;
+			g0 = g1g0 % 10;
+		}
+	}
+
+	function = (w1_inverted ? 0x2 : 0) | (w2_inverted ? 0x1 : 0);
+
+	/* NBS has no preamble index — use 0 as placeholder for address reconstruction */
+	idx = 0;
+
+	/* Build function suffix from Table IX */
+	switch (function) {
+	case 0: suffix = '1'; break;
+	case 1: suffix = '2'; break;
+	case 2: suffix = '3'; break;
+	case 3: suffix = '4'; break;
+	default: suffix = '1'; break;
+	}
+
+	snprintf(msg->address, sizeof(msg->address), "%d%d%d%d%d%d%c",
+		idx, g1, g0, a2, a1, a0, suffix);
+
+	LOGP(DGOLAY, LOGL_INFO, "NBS address decoded: '%s' (W1=%u W2=%u func=%d).\n",
+		msg->address, w1_value, w2_value, function);
+
+	/* ================================================================
+	 * TYPE DETECTION + DATA DECODE
+	 *
+	 * Same logic as decode_batch() stages 4-7, but starting from
+	 * the current position (right after the address pair).
+	 * ================================================================ */
+
+	remaining = total_bits - pos;
+
+	if (remaining < 1 + bch_block_bits) {
+		if (!force) {
+			LOGP(DGOLAY, LOGL_DEBUG, "NBS: not enough post-address bits (%d), need more.\n", remaining);
+			return -1;
+		}
+		detected_type = TYPE_TONE;
+	} else {
+		detected_type = TYPE_TONE;
+
+		/* Check for voice: activation code after 28-bit comma */
+		if (remaining >= comma_len + dup_bits + 1 + dup_bits) {
+			int peek_pos = pos + comma_len;
+			uint32_t peek_cw = read_dup_golay(bits, &peek_pos);
+			uint16_t peek_val;
+			if (decode_golay(peek_cw, &peek_val) == 0 && peek_val == activation_code)
+				detected_type = TYPE_VOICE;
+		}
+
+		/* Probe BCH block to detect data */
+		if (detected_type != TYPE_VOICE && remaining >= 1 + bch_block_bits) {
+			int probe_pos = pos + 1;
+			uint16_t probe_bch[8];
+			uint8_t probe_d[8];
+			uint8_t probe_cksum;
+			int probe_ok = 1;
+			int pk;
+
+			deinterleave_bch(bits, &probe_pos, probe_bch);
+			for (pk = 0; pk < 8; pk++) {
+				if (decode_bch(probe_bch[pk], &probe_d[pk]) < 0) {
+					probe_ok = 0;
+					break;
+				}
+			}
+
+			if (probe_ok) {
+				probe_cksum = 0;
+				for (pk = 0; pk < 7; pk++)
+					probe_cksum += calc_bch(probe_d[pk]);
+				probe_cksum &= 0x7f;
+
+				if (probe_cksum == probe_d[7]) {
+					/* Valid data — use fill-count heuristic for alpha vs numeric */
+					uint8_t a_ch[8];
+					int a_fill = 0, n_fill = 0;
+					int nk;
+
+					a_ch[0] = probe_d[0] & 0x3f;
+					a_ch[1] = ((probe_d[0] >> 6) | (probe_d[1] << 1)) & 0x3f;
+					a_ch[2] = ((probe_d[1] >> 5) | (probe_d[2] << 2)) & 0x3f;
+					a_ch[3] = ((probe_d[2] >> 4) | (probe_d[3] << 3)) & 0x3f;
+					a_ch[4] = ((probe_d[3] >> 3) | (probe_d[4] << 4)) & 0x3f;
+					a_ch[5] = ((probe_d[4] >> 2) | (probe_d[5] << 5)) & 0x3f;
+					a_ch[6] = (probe_d[5] >> 1) & 0x3f;
+					a_ch[7] = probe_d[6] & 0x3f;
+
+					uint8_t n_nib[12];
+					n_nib[0]  = probe_d[0] & 0xf;
+					n_nib[1]  = ((probe_d[0] >> 4) | (probe_d[1] << 3)) & 0xf;
+					n_nib[2]  = (probe_d[1] >> 1) & 0xf;
+					n_nib[3]  = ((probe_d[1] >> 5) | (probe_d[2] << 2)) & 0xf;
+					n_nib[4]  = (probe_d[2] >> 2) & 0xf;
+					n_nib[5]  = ((probe_d[2] >> 6) | (probe_d[3] << 1)) & 0xf;
+					n_nib[6]  = (probe_d[3] >> 3) & 0xf;
+					n_nib[7]  = probe_d[4] & 0xf;
+					n_nib[8]  = ((probe_d[4] >> 4) | (probe_d[5] << 3)) & 0xf;
+					n_nib[9]  = (probe_d[5] >> 1) & 0xf;
+					n_nib[10] = ((probe_d[5] >> 5) | (probe_d[6] << 2)) & 0xf;
+					n_nib[11] = (probe_d[6] >> 2) & 0xf;
+
+					for (nk = 7; nk >= 0; nk--) {
+						if (a_ch[nk] == 0x3e) a_fill++;
+						else break;
+					}
+					for (nk = 11; nk >= 0; nk--) {
+						if (n_nib[nk] == 0x0a) n_fill++;
+						else break;
+					}
+
+					if (n_fill > 0 && a_fill == 0)
+						detected_type = TYPE_NUMERIC;
+					else if (a_fill > 0 && n_fill == 0)
+						detected_type = TYPE_ALPHA;
+					else if (n_fill > a_fill)
+						detected_type = TYPE_NUMERIC;
+					else
+						detected_type = TYPE_ALPHA;
+				}
+			}
+
+			if (detected_type == TYPE_TONE && remaining < tone_comma_len) {
+				if (!force)
+					return -1;
+			}
+		}
+	}
+
+	msg->type = detected_type;
+	msg->decode_ok = 1;
+
+	LOGP(DGOLAY, LOGL_INFO, "NBS decode: address='%s' type=%s.\n",
+		msg->address,
+		detected_type == TYPE_VOICE ? "voice" :
+		detected_type == TYPE_ALPHA ? "alpha" :
+		detected_type == TYPE_NUMERIC ? "numeric" : "tone");
+
+	return 0;
+}
+
 /* Dump the TX bit buffer to the log, formatted for readability.
  * Groups bits into rows of 46 (one duplicated Golay codeword = 23 bits * 2)
  * so the protocol structure is visible. */
@@ -2887,6 +3178,179 @@ static inline void queue_comma(gsc_t *gsc, int bits, uint8_t polarity)
 
 /* Forward declaration: queue_interleaved_tones is defined after queue_batch */
 static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polarity, int max_tones);
+
+/* Non-battery-saver mode encoder (§2.5).
+ *
+ * Uses a simple 75 Hz square wave preamble (1,1,0,0 pattern) for ≥1.25s
+ * instead of coded preamble. No start code. Address pairs follow directly.
+ * This is the original Golay format (pre-GSC, in service since 1973).
+ * Higher throughput but no battery saving groups.
+ *
+ * Layout: [75 Hz preamble ≥ 752 bits] [address pair 121 bits] [data blocks...]
+ */
+static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type type, const char *message, double polarity)
+{
+	uint16_t word1, word2;
+	uint8_t function;
+	uint32_t golay;
+	uint16_t bch[8];
+	uint8_t msg[12], digit, shifted, contbit, checksum;
+	int preamble;
+	int i, j, k;
+	int rc;
+
+	queue_reset(gsc);
+
+	if (!address || strlen(address) != 7) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Invalid functional address '%s' size. Only 7 digits are allowed.\n", address);
+		return -EINVAL;
+	}
+
+	rc = encode_address(address, &preamble, &word1, &word2);
+	if (rc < 0)
+		return rc;
+
+	switch (address[6]) {
+		case '1': function = 0; break;
+		case '2': function = 1; break;
+		case '3': function = 2; break;
+		case '4': function = 3; break;
+		case '5': function = 0; break;
+		case '6': function = 1; break;
+		case '7': function = 2; break;
+		case '8': function = 3; break;
+		case '9': function = 0; break;
+		case '0': function = 1; break;
+		default:
+			LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in last address digit.\n", address[6]);
+			return -EINVAL;
+	}
+
+	LOGP(DGOLAY, LOGL_INFO, "NBS mode: coding %s for functional address '%s'.\n",
+		type == TYPE_ALPHA ? "alpha" :
+		type == TYPE_NUMERIC ? "numeric" :
+		type == TYPE_VOICE ? "voice" : "tone-only", address);
+
+	/* §2.5: 75 Hz preamble = 1,1,0,0 pattern for at least 1.25s.
+	 * At 600 baud, 1.25s = 750 bits. Use 752 bits (188 × 4) for alignment. */
+	LOGP(DGOLAY, LOGL_DEBUG, "Encoding 75 Hz NBS preamble (752 bits).\n");
+	for (i = 0; i < 188; i++) {
+		queue_bit(gsc, 1);
+		queue_bit(gsc, 1);
+		queue_bit(gsc, 0);
+		queue_bit(gsc, 0);
+	}
+
+	/* No start code in NBS mode — address follows directly */
+
+	/* Encode address */
+	LOGP(DGOLAY, LOGL_DEBUG, "Encoding address words '%d' and '%d'.\n", word1, word2);
+	golay = calc_golay(word1);
+	if (function & 0x2)
+		golay ^= 0x7fffff;
+	queue_comma(gsc, 28, golay & 1);
+	queue_dup(gsc, golay, 23);
+	golay = calc_golay(word2);
+	if (function & 0x1)
+		golay ^= 0x7fffff;
+	queue_bit(gsc, (golay & 1) ^ 1);
+	queue_dup(gsc, golay, 23);
+
+	/* Encode message (same as queue_batch) */
+	switch (type) {
+	case TYPE_ALPHA:
+		LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d alphanumeric digits.\n", (int)strlen(message));
+		for (i = 0; *message; i++) {
+			if (i == MAX_ADB)
+				LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping.\n", MAX_ADB * 8);
+			for (j = 0; *message && j < 8; j++)
+				msg[j] = encode_alpha(*message++);
+			while (j < 8)
+				msg[j++] = 0x3e;
+			bch[0] = calc_bch((msg[0] | (msg[1] << 6)) & 0x7f);
+			bch[1] = calc_bch(((msg[1] >> 1) | (msg[2] << 5)) & 0x7f);
+			bch[2] = calc_bch(((msg[2] >> 2) | (msg[3] << 4)) & 0x7f);
+			bch[3] = calc_bch(((msg[3] >> 3) | (msg[4] << 3)) & 0x7f);
+			bch[4] = calc_bch(((msg[4] >> 4) | (msg[5] << 2)) & 0x7f);
+			bch[5] = calc_bch(((msg[5] >> 5) | (msg[6] << 1)) & 0x7f);
+			contbit = (*message && i < MAX_ADB) ? 1 : 0;
+			bch[6] = calc_bch((contbit << 6) | msg[7]);
+			checksum = bch[0] + bch[1] + bch[2] + bch[3] + bch[4] + bch[5] + bch[6];
+			bch[7] = calc_bch(checksum & 0x7f);
+			queue_bit(gsc, (bch[0] & 1) ^ 1);
+			for (j = 0; j < 15; j++)
+				for (k = 0; k < 8; k++)
+					queue_bit(gsc, (bch[k] >> j) & 1);
+		}
+		break;
+	case TYPE_NUMERIC:
+		LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d numeric digits.\n", (int)strlen(message));
+		shifted = 0;
+		for (i = 0; *message; i++) {
+			if (i == MAX_NDB)
+				LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping.\n", MAX_NDB * 12);
+			for (j = 0; *message && j < 12; j++) {
+				if (shifted) {
+					digit = shifted & 0xf;
+					shifted = 0;
+				} else
+					digit = encode_numeric(*message);
+				if (digit > 0xf) {
+					shifted = digit;
+					msg[j] = digit >> 4;
+				} else {
+					msg[j] = digit;
+					message++;
+				}
+			}
+			while (j < 12)
+				msg[j++] = 0xa;
+			bch[0] = calc_bch((msg[0] | (msg[1] << 4)) & 0x7f);
+			bch[1] = calc_bch(((msg[1] >> 3) | (msg[2] << 1) | (msg[3] << 5)) & 0x7f);
+			bch[2] = calc_bch(((msg[3] >> 2) | (msg[4] << 2) | (msg[5] << 6)) & 0x7f);
+			bch[3] = calc_bch(((msg[5] >> 1) | (msg[6] << 3)) & 0x7f);
+			bch[4] = calc_bch((msg[7] | (msg[8] << 4)) & 0x7f);
+			bch[5] = calc_bch(((msg[8] >> 3) | (msg[9] << 1) | (msg[10] << 5)) & 0x7f);
+			contbit = (*message && i < MAX_NDB) ? 1 : 0;
+			bch[6] = calc_bch((contbit << 6) | (msg[10] >> 2) | (msg[11] << 2));
+			checksum = bch[0] + bch[1] + bch[2] + bch[3] + bch[4] + bch[5] + bch[6];
+			bch[7] = calc_bch(checksum & 0x7f);
+			queue_bit(gsc, (bch[0] & 1) ^ 1);
+			for (j = 0; j < 15; j++)
+				for (k = 0; k < 8; k++)
+					queue_bit(gsc, (bch[k] >> j) & 1);
+		}
+		break;
+	case TYPE_VOICE:
+		memcpy(gsc->wave_tx_filename, message, MIN(sizeof(gsc->wave_tx_filename) - 1, strlen(message) + 1));
+		gsc->bit_ac = gsc->bit_num;
+		LOGP(DGOLAY, LOGL_DEBUG, "Encoding activation code.\n");
+		golay = calc_golay(activation_code);
+		queue_comma(gsc, 28, golay & 1);
+		queue_dup(gsc, golay, 23);
+		golay ^= 0x7fffff;
+		queue_bit(gsc, (golay & 1) ^ 1);
+		queue_dup(gsc, golay, 23);
+		{
+			double msg_polarity = (polarity != 0.0) ? polarity : gsc->fsk_polarity;
+			queue_interleaved_tones(gsc, preamble, msg_polarity, 8);
+		}
+		break;
+	default:
+		LOGP(DGOLAY, LOGL_DEBUG, "Encoding 'comma' sequence after tone-only address.\n");
+		queue_comma(gsc, 121 * 8, 1);
+	}
+
+	if (gsc->bit_overflow) {
+		LOGP(DGOLAY, LOGL_ERROR, "NBS bit stream (%d bits) overflows buffer (%d bits).\n", gsc->bit_num, (int)sizeof(gsc->bit));
+		return -EOVERFLOW;
+	}
+
+	if (gsc->protocol_dump)
+		dump_bitstream(gsc, address);
+
+	return 0;
+}
 
 static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, const char *message, double polarity)
 {
@@ -3437,6 +3901,20 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 		}
 	}
 
+	/* Per §2.1: "Unfilled batches should be filled out with comma."
+	 * Each address slot is 121 bits. Pad remaining slots up to 16
+	 * (or 32 for extended batch) with comma. */
+	{
+		int max_slots = (msg_index > 16) ? 32 : 16;
+		int pad_slots = max_slots - msg_index;
+		if (pad_slots > 0) {
+			LOGP(DGOLAY, LOGL_DEBUG, "Padding %d unfilled batch slots with comma (%d bits each).\n",
+				pad_slots, 121);
+			for (i = 0; i < pad_slots; i++)
+				queue_comma(gsc, 121, 1);
+		}
+	}
+
 	LOGP(DGOLAY, LOGL_INFO, "Batch encoded: %d messages, preamble_index=%d, %d bits.\n", msg_index, preamble, gsc->bit_num);
 	if (gsc->protocol_dump)
 		dump_bitstream(gsc, "batch");
@@ -3523,9 +4001,12 @@ next_msg:
 		} else {
 			/* Single message or batching off: use individual encoder */
 			gsc->tx_msg_count = 1;
-			rc = queue_batch(gsc, msg->address, msg->type, msg->data, msg->polarity);
+			if (gsc->nbs)
+				rc = queue_batch_nbs(gsc, msg->address, msg->type, msg->data, msg->polarity);
+			else
+				rc = queue_batch(gsc, msg->address, msg->type, msg->data, msg->polarity);
 			if (rc >= 0)
-				LOGP(DGOLAY, LOGL_INFO, "Transmitting message to address '%s'.\n", msg->address);
+				LOGP(DGOLAY, LOGL_INFO, "Transmitting message to address '%s'%s.\n", msg->address, gsc->nbs ? " (NBS)" : "");
 			/* Free all messages (defensive: free extras if any) */
 			{
 				gsc_msg_t *next;
@@ -3737,7 +4218,6 @@ static gsc_msg_t *dequeue_batch_group(gsc_msg_t **queue_head, int *count,
  * Stores the winning preamble_index and polarity in *best_pi and *best_pol. */
 static int find_best_group(gsc_msg_t *head, int *best_pi, double *best_pol)
 {
-	/* preamble_index is 0-9, polarity is one of {-1.0, 0.0, 1.0} → 30 slots */
 	struct {
 		int preamble_index;
 		double polarity;
@@ -3748,11 +4228,8 @@ static int find_best_group(gsc_msg_t *head, int *best_pi, double *best_pol)
 	int i, best_count = 0;
 
 	for (msg = head; msg; msg = msg->next) {
-		/* Skip voice messages — they are never batched */
 		if (msg->type == TYPE_VOICE)
 			continue;
-
-		/* Find or create group entry */
 		for (i = 0; i < ngroups; i++) {
 			if (groups[i].preamble_index == msg->preamble_index
 			    && groups[i].polarity == msg->polarity)
@@ -3768,7 +4245,6 @@ static int find_best_group(gsc_msg_t *head, int *best_pi, double *best_pol)
 			groups[i].count++;
 	}
 
-	/* Find group with most messages */
 	for (i = 0; i < ngroups; i++) {
 		if (groups[i].count > best_count) {
 			best_count = groups[i].count;
@@ -3781,13 +4257,26 @@ static int find_best_group(gsc_msg_t *head, int *best_pi, double *best_pol)
 }
 
 /* Select next message or batch for transmission.
- * Groups messages by (preamble_index, polarity) tuple.
- * Returns a linked list of messages sharing the same preamble index and polarity,
- * or a single message if batching is off. Returns NULL if hold-off is active. */
+ *
+ * BATCHING_OFF: simple FIFO dequeue, one message at a time.
+ *
+ * BATCHING_NORMAL: greedy — pick the preamble group with the most
+ * queued messages and transmit them as a batch.
+ *
+ * BATCHING_EXTENDED: round-robin through preamble groups 0-9 for
+ * battery saving. Each call advances to the next group that has
+ * queued messages, dequeues all matching messages (up to 32), and
+ * returns them as a linked list.
+ *
+ * Priority voice messages bypass batching and are sent immediately.
+ *
+ * Returns a linked list of messages, or NULL if nothing to send
+ * (or hold-off is active). */
 gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
 {
-	gsc_msg_t *msg;
+	gsc_msg_t *msg, *batch;
 	int max_batch;
+	int tried;
 	int best_pi = 0;
 	double best_pol = 0.0;
 
@@ -3834,45 +4323,140 @@ gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
 		LOGP(DGOLAY, LOGL_DEBUG, "Scheduler: hold-off expired (elapsed %ld ms).\n", elapsed_ms);
 	}
 
-	/* --- Check priority queue --- */
-	if (gsc->priority_list) {
-		/* Voice messages at head are always dequeued individually */
-		if (gsc->priority_list->type == TYPE_VOICE) {
-			msg = gsc->priority_list;
-			gsc->priority_list = msg->next;
-			msg->next = NULL;
-			gsc->priority_count--;
-			return msg;
-		}
-
-		/* Group priority non-voice messages by (preamble_index, polarity) */
-		if (find_best_group(gsc->priority_list, &best_pi, &best_pol) > 0) {
-			return dequeue_batch_group(&gsc->priority_list,
-						   &gsc->priority_count,
-						   best_pi, best_pol, max_batch);
-		}
+	/* --- Priority voice messages bypass round-robin --- */
+	if (gsc->priority_list && gsc->priority_list->type == TYPE_VOICE) {
+		msg = gsc->priority_list;
+		gsc->priority_list = msg->next;
+		msg->next = NULL;
+		gsc->priority_count--;
+		return msg;
 	}
 
-	/* --- Fall through to normal queue --- */
-	if (gsc->msg_list) {
-		/* Voice messages at head are always dequeued individually */
-		if (gsc->msg_list->type == TYPE_VOICE) {
-			msg = gsc->msg_list;
-			gsc->msg_list = msg->next;
-			msg->next = NULL;
-			gsc->normal_count--;
-			return msg;
-		}
-
-		/* Group normal non-voice messages by (preamble_index, polarity) */
-		if (find_best_group(gsc->msg_list, &best_pi, &best_pol) > 0) {
-			return dequeue_batch_group(&gsc->msg_list,
-						   &gsc->normal_count,
-						   best_pi, best_pol, max_batch);
-		}
+	/* --- Normal voice messages at head bypass batching --- */
+	if (gsc->msg_list && gsc->msg_list->type == TYPE_VOICE
+	    && !gsc->priority_list) {
+		msg = gsc->msg_list;
+		gsc->msg_list = msg->next;
+		msg->next = NULL;
+		gsc->normal_count--;
+		return msg;
 	}
 
-	/* Both queues empty or only voice messages with none at head */
+	/* === BATCHING_NORMAL: greedy — pick group with most messages === */
+	if (gsc->batching_mode == BATCHING_NORMAL) {
+		if (gsc->priority_list) {
+			if (find_best_group(gsc->priority_list, &best_pi, &best_pol) > 0)
+				return dequeue_batch_group(&gsc->priority_list,
+							   &gsc->priority_count,
+							   best_pi, best_pol, max_batch);
+		}
+		if (gsc->msg_list) {
+			if (find_best_group(gsc->msg_list, &best_pi, &best_pol) > 0)
+				return dequeue_batch_group(&gsc->msg_list,
+							   &gsc->normal_count,
+							   best_pi, best_pol, max_batch);
+		}
+		return NULL;
+	}
+
+	/* === BATCHING_EXTENDED: round-robin through preamble groups 0-9 ===
+	 *
+	 * Starting from sched_current_group, scan up to 10 groups looking
+	 * for one that has queued messages. Dequeue all matching messages
+	 * (across both priority and normal queues) for that group.
+	 * Advance sched_current_group to the next group after the one
+	 * we just served. */
+	for (tried = 0; tried < 10; tried++) {
+		int group = gsc->sched_current_group;
+		int has_priority = 0, has_normal = 0;
+		gsc_msg_t *p;
+
+		/* Check if this group has any non-voice messages in either queue */
+		for (p = gsc->priority_list; p; p = p->next) {
+			if (p->type != TYPE_VOICE && p->preamble_index == group) {
+				has_priority = 1;
+				break;
+			}
+		}
+		for (p = gsc->msg_list; p; p = p->next) {
+			if (p->type != TYPE_VOICE && p->preamble_index == group) {
+				has_normal = 1;
+				break;
+			}
+		}
+
+		if (!has_priority && !has_normal) {
+			/* Nothing for this group — advance and try next */
+			gsc->sched_current_group = (group + 1) % 10;
+			continue;
+		}
+
+		/* Dequeue from priority first, then fill from normal.
+		 * All messages share the same preamble_index but may have
+		 * different polarities. Use the polarity of the first message
+		 * found (priority queue takes precedence). */
+		batch = NULL;
+		if (has_priority) {
+			double pol = 0.0;
+			/* Find polarity of first matching priority message */
+			for (p = gsc->priority_list; p; p = p->next) {
+				if (p->type != TYPE_VOICE && p->preamble_index == group) {
+					pol = p->polarity;
+					break;
+				}
+			}
+			batch = dequeue_batch_group(&gsc->priority_list,
+						    &gsc->priority_count,
+						    group, pol, max_batch);
+		}
+
+		/* Count how many we got from priority */
+		{
+			int count = 0;
+			for (p = batch; p; p = p->next)
+				count++;
+
+			/* Fill remaining slots from normal queue */
+			if (count < max_batch && has_normal) {
+				double pol = 0.0;
+				if (batch) {
+					pol = batch->polarity;
+				} else {
+					for (p = gsc->msg_list; p; p = p->next) {
+						if (p->type != TYPE_VOICE && p->preamble_index == group) {
+							pol = p->polarity;
+							break;
+						}
+					}
+				}
+
+				gsc_msg_t *normal_batch = dequeue_batch_group(
+					&gsc->msg_list, &gsc->normal_count,
+					group, pol, max_batch - count);
+
+				if (normal_batch) {
+					if (!batch) {
+						batch = normal_batch;
+					} else {
+						/* Append normal batch to end of priority batch */
+						gsc_msg_t **tail = &batch;
+						while ((*tail)->next)
+							tail = &(*tail)->next;
+						(*tail)->next = normal_batch;
+					}
+				}
+			}
+		}
+
+		/* Advance to next group for next call */
+		gsc->sched_current_group = (group + 1) % 10;
+
+		LOGP(DGOLAY, LOGL_DEBUG, "Scheduler: round-robin group %d, dequeued batch.\n", group);
+
+		return batch;
+	}
+
+	/* All 10 groups empty */
 	return NULL;
 }
 

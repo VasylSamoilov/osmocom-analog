@@ -67,7 +67,7 @@ typedef struct gsc_msg {
 	char			data[256];		/* message to be transmitted */
 	/* --- New fields --- */
 	int			priority;		/* 0 = normal, 1 = priority */
-	double			polarity;		/* per-message FSK polarity: 1.0, -1.0, or 0.0 (use instance default) */
+	double			polarity;		/* per-message FSK polarity: 1.0 = normal, -1.0 = inverted, 0.0 = use instance default */
 	struct timespec		enqueue_time;		/* CLOCK_MONOTONIC timestamp at enqueue */
 	int			preamble_index;		/* cached (address[0]-'0' + address[2]-'0') % 10 */
 } gsc_msg_t;
@@ -115,7 +115,7 @@ typedef struct gsc {
 
 	/* dsp states */
 	double			fsk_deviation;		/* deviation of FSK signal on sound card */
-	double			fsk_polarity;		/* polarity of FSK signal (-1.0 = bit '1' is down) */
+	double			fsk_polarity;		/* FSK polarity: 1.0 = normal (per GSC standard), -1.0 = inverted */
 	double			fsk_tx_polarity;	/* effective polarity for current TX message */
 	sample_t		fsk_ramp_up[256];	/* samples of upward ramp shape */
 	sample_t		fsk_ramp_down[256];	/* samples of downward ramp shape */
@@ -189,6 +189,9 @@ typedef struct gsc {
 	int			priority_count;		/* priority queue depth */
 	int			normal_count;		/* normal queue depth (msg_list) */
 
+	/* --- Battery saver round-robin --- */
+	int			sched_current_group;	/* next preamble group to transmit (0-9) */
+
 	/* --- TX batch tracking (for completion logging) --- */
 	int			tx_msg_count;		/* messages in current TX batch */
 	int			tx_preamble_index;	/* preamble index of current TX batch */
@@ -210,6 +213,15 @@ typedef struct gsc {
 
 	/* --- Protocol dump --- */
 	int			protocol_dump;		/* 1 = dump TX bitstream to log */
+
+	/* --- Non-battery-saver mode (§2.5) --- */
+	int			nbs;			/* 1 = use 75 Hz preamble, no start code */
+
+	/* --- NBS RX state --- */
+	int			rx_nbs_count;		/* consecutive 1,1,0,0 pattern matches */
+	uint8_t			rx_nbs_shift[4];	/* last 4 bits for pattern detection */
+	int			rx_nbs_shift_count;	/* bits accumulated in NBS shift register */
+	int			rx_nbs_locked;		/* 1 = NBS preamble detected, buffering data */
 } gsc_t;
 
 int golay_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double deviation, double polarity, int tx, int rx, int auto_polarity, const char *message, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, const char *voice_dir, int voice_monitor);
@@ -236,6 +248,7 @@ void scheduler_dump(gsc_t *gsc);
 int decode_golay(uint32_t codeword, uint16_t *data);
 int decode_bch(uint16_t codeword, uint8_t *data);
 int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force);
+int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force);
 int reverse_word1(uint16_t w1, int *g1, int *g0);
 int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0);
 char decode_alpha(uint8_t code);
