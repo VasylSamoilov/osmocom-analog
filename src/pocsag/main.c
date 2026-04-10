@@ -52,6 +52,7 @@ static int max_batches = 128;	/* 0 = locked to CLI speed/polarity, no switching 
 /* Default function (sub-address) and message type */
 static enum pocsag_function function = POCSAG_FUNCTION_A;
 static enum pocsag_msg_type msg_type = POCSAG_MSG_TYPE_AUTO;
+static int msg_type_given = 0;
 static const char *message = "1234";
 /*
  * Default padding for alphanumeric messages.
@@ -112,9 +113,10 @@ void print_help(const char *arg0)
 	printf("          nec-skyper-categories                 - NEC Skyper ROT-1 Caesar cipher\n");
 	printf("          motorola-advisor_linguist-cyrillic    - Motorola Advisor Linguist Cyrillic\n");
 	printf(" -S --scan <from> <to>\n");
-	printf("        Scan through given IDs once (no repetition). This can be useful to find\n");
-	printf("        the RIC of a vintage pager. Note that scanning all RICs from 0 through\n");
-	printf("        2097151 would take about 16.5 Hours at 1200 Baud and known sub RIC.\n");
+	printf("        Scan through given RIC range. Messages are batch-packed (up to 8 per\n");
+	printf("        POCSAG batch) by filling all frame slots, dramatically reducing scan\n");
+	printf("        time. The message payload encodes the RIC so you can identify which\n");
+	printf("        capcode the pager responded to.\n");
 	printf("        Use -F to select sub-address and -y to select message type.\n");
 	printf("        Short messages with 5 numeric or 2 alpha chars are sent without\n");
 	printf("        increase in scanning time.\n");
@@ -278,6 +280,7 @@ static int handle_options(int short_option, int argi, char **argv)
 			return rc;
 		}
 		msg_type = rc;
+		msg_type_given = 1;
 		break;
 	case 'M':
 		message = options_strdup(argv[argi++]);
@@ -495,6 +498,10 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "You need to enable TX, in order to scan.\n");
 		goto fail;
 	}
+
+	/* scan mode: default to numeric if user didn't specify -y */
+	if (scan_to > scan_from && !msg_type_given)
+		msg_type = POCSAG_MSG_TYPE_NUMERIC;
 
 	/* create pipe for message sendy */
 	unlink(msg_send_path);

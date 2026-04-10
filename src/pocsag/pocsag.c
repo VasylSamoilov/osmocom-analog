@@ -453,30 +453,66 @@ static int pocsag_scan_or_loopback(pocsag_t *pocsag)
 {
 	if (pocsag->scan_from < pocsag->scan_to) {
 		char message[16];
+		uint32_t ric;
+		int queued = 0;
+		uint8_t slots_used = 0; /* bitmask of frame slots already in queue */
+		pocsag_msg_t *m;
 
 		/*
-		 * Generate scan message based on configured message type.
-		 * Note: function bits are independent of message type per POCSAG standard.
+		 * Batch-fill: enqueue messages to fill all 8 frame slots.
+		 * First, check which slots are already occupied by pending
+		 * messages in the queue.
 		 */
-		switch (pocsag->default_msg_type) {
-		case POCSAG_MSG_TYPE_NUMERIC:
-			sprintf(message, "%05d", pocsag->scan_from / 100);
-			break;
-		case POCSAG_MSG_TYPE_ALPHA:
-			sprintf(message, "%02x", pocsag->scan_from / 10000);
-			break;
-		case POCSAG_MSG_TYPE_TONE:
-		case POCSAG_MSG_TYPE_AUTO:
-		default:
-			message[0] = '\0';
+		for (m = pocsag->msg_list; m; m = m->next)
+			slots_used |= (1 << (m->ric & 7));
+
+		/*
+		 * Now fill empty slots with the next RICs from the scan range.
+		 * This packs up to 8 messages into a single POCSAG batch,
+		 * dramatically reducing scan time compared to one-at-a-time.
+		 *
+		 * The message payload encodes the RIC itself so the operator
+		 * can identify which capcode the pager responded to.
+		 */
+		for (ric = pocsag->scan_from; ric < pocsag->scan_to && slots_used != 0xFF; ric++) {
+			uint8_t slot = ric & 7;
+
+			/* skip if this frame slot is already occupied */
+			if (slots_used & (1 << slot))
+				continue;
+			slots_used |= (1 << slot);
+
+			/*
+			 * Generate scan message based on configured message type.
+			 * Encode the RIC into the message so the receiver can
+			 * identify which capcode was hit.
+			 */
+			switch (pocsag->default_msg_type) {
+			case POCSAG_MSG_TYPE_NUMERIC:
+				/* 5 digits: upper portion of RIC (RIC/100) */
+				sprintf(message, "%05d", ric / 100);
+				break;
+			case POCSAG_MSG_TYPE_ALPHA:
+				/* full RIC as decimal string */
+				sprintf(message, "%d", ric);
+				break;
+			case POCSAG_MSG_TYPE_TONE:
+			case POCSAG_MSG_TYPE_AUTO:
+			default:
+				message[0] = '\0';
+			}
+			LOGP_CHAN(DPOCSAG, LOGL_NOTICE, "Scan: enqueue RIC %d / function '%s' / type '%s' / msg '%s'\n",
+				  ric, pocsag_function_name[pocsag->default_function],
+				  pocsag_msg_type_name(pocsag->default_msg_type), message);
+			pocsag_msg_create(pocsag, 0, ric, pocsag->default_function,
+					  pocsag->default_msg_type, message, strlen(message));
+			queued++;
 		}
-		LOGP_CHAN(DPOCSAG, LOGL_NOTICE, "Transmitting %s message '%s' with RIC '%d' / function '%s'.\n",
-			  pocsag_msg_type_name(pocsag->default_msg_type), message, pocsag->scan_from,
-			  pocsag_function_name[pocsag->default_function]);
-		pocsag_msg_create(pocsag, 0, pocsag->scan_from, pocsag->default_function,
-				  pocsag->default_msg_type, message, strlen(message));
-		pocsag->scan_from++;
-		return 1;
+
+		/* advance scan_from past everything we considered */
+		pocsag->scan_from = ric;
+
+		return queued > 0;
 	}
 
 	if (pocsag->sender.loopback) {
