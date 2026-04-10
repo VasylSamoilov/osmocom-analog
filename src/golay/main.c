@@ -52,6 +52,9 @@ static int voice_monitor = 0;		/* voice monitor mode (play to audio output) */
 static int batching_mode = BATCHING_OFF;
 static int protocol_dump = 0;
 static int nbs_mode = 0;
+static uint32_t scan_from = 0;
+static uint32_t scan_to = 0;
+static enum gsc_msg_type scan_type = TYPE_NUMERIC;
 
 void print_help(const char *arg0)
 {
@@ -89,6 +92,10 @@ void print_help(const char *arg0)
 	printf("    --nbs\n");
 	printf("        Non-battery-saver mode: use 75 Hz preamble without coded preamble\n");
 	printf("        or start code. Higher throughput, but no battery saving groups.\n");
+	printf(" -S --scan <from> <to>\n");
+	printf("        Scan through given 7-digit functional address range.\n");
+	printf("        Messages are batch-packed by preamble group for efficiency.\n");
+	printf("        Use -y to select message type: numeric (default), alpha, or tone.\n");
 	printf("\n");
 	printf("File: %s\n", msg_send_path);
 	printf("        Write \"<address>[,message]\" to it, to send a default message.\n");
@@ -121,6 +128,8 @@ static void add_options(void)
 	option_add(0x101, "fifo", 1);
 	option_add(0x102, "protocol-dump", 0);
 	option_add(0x103, "nbs", 0);
+	option_add('S', "scan", 2);
+	option_add('y', "type", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -193,6 +202,30 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 0x103: /* --nbs */
 		nbs_mode = 1;
+		break;
+	case 'S':
+		scan_from = atoi(argv[argi++]);
+		if (scan_from > 9999999) {
+			fprintf(stderr, "Given address to scan from is out of range (max 9999999)!\n");
+			return -EINVAL;
+		}
+		scan_to = atoi(argv[argi++]) + 1;
+		if (scan_to > 9999999 + 1) {
+			fprintf(stderr, "Given address to scan to is out of range (max 9999999)!\n");
+			return -EINVAL;
+		}
+		break;
+	case 'y':
+		if (!strcmp(argv[argi], "numeric") || !strcmp(argv[argi], "n"))
+			scan_type = TYPE_NUMERIC;
+		else if (!strcmp(argv[argi], "alpha") || !strcmp(argv[argi], "a"))
+			scan_type = TYPE_ALPHA;
+		else if (!strcmp(argv[argi], "tone") || !strcmp(argv[argi], "t"))
+			scan_type = TYPE_TONE;
+		else {
+			fprintf(stderr, "Invalid type '%s', use numeric, alpha, or tone.\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -326,6 +359,12 @@ int main(int argc, char *argv[])
 	if (!tx && !rx)
 		tx = 1;
 
+	/* no TX, no scanning */
+	if (!tx && scan_to > scan_from) {
+		fprintf(stderr, "You need to enable TX, in order to scan.\n");
+		goto fail;
+	}
+
 	/* TX & RX if loopback */
 	if (loopback)
 		tx = rx = 1;
@@ -360,6 +399,17 @@ int main(int argc, char *argv[])
 			gsc->batching_mode = batching_mode;
 			gsc->protocol_dump = protocol_dump;
 			gsc->nbs = nbs_mode;
+			/* Set up scan mode */
+			if (scan_to > scan_from) {
+				gsc->scan_from = scan_from;
+				gsc->scan_to = scan_to;
+				gsc->scan_type = scan_type;
+				/* Auto-enable normal batching for scan */
+				if (gsc->batching_mode == BATCHING_OFF)
+					gsc->batching_mode = BATCHING_NORMAL;
+				/* Enqueue initial batch */
+				golay_scan_enqueue(gsc, &gsc->scan_from, gsc->scan_to, gsc->scan_type, 16);
+			}
 		}
 		printf("Base station ready, please tune transmitter (or receiver) to %.4f MHz\n", frequency / 1e6);
 	}

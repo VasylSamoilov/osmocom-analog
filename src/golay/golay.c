@@ -3952,6 +3952,11 @@ int8_t get_bit(gsc_t *gsc)
 			LOGP(DGOLAY, LOGL_INFO, "Batch TX complete: msgs=%d preamble_index=%d remaining=%d\n",
 			     gsc->tx_msg_count, gsc->tx_preamble_index,
 			     gsc->priority_count + gsc->normal_count);
+
+			/* Refill scan queue if scanning */
+			if (gsc->scan_from < gsc->scan_to)
+				golay_scan_enqueue(gsc, &gsc->scan_from, gsc->scan_to, gsc->scan_type, 16);
+
 			goto next_msg;
 		}
 		return gsc->bit[gsc->bit_index++];
@@ -4621,6 +4626,48 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 	}
 
 	return 0;
+}
+
+/*
+ * Scan mode: enqueue a batch of messages for sequential address scanning.
+ *
+ * GSC addresses are 7 digits.  The scan range iterates over full 7-digit
+ * addresses.  The message type is set by the caller via -y.
+ */
+void golay_scan_enqueue(gsc_t *gsc, uint32_t *scan_from, uint32_t scan_to, enum gsc_msg_type type, int batch_size)
+{
+	char address[8];
+	char message[16];
+	gsc_msg_t *msg;
+	int queued = 0;
+
+	while (*scan_from < scan_to && queued < batch_size) {
+		sprintf(address, "%07d", *scan_from);
+
+		/* Generate message payload */
+		switch (type) {
+		case TYPE_NUMERIC:
+			sprintf(message, "%07d", *scan_from);
+			break;
+		case TYPE_ALPHA:
+			sprintf(message, "%07d", *scan_from);
+			break;
+		case TYPE_TONE:
+		default:
+			message[0] = '\0';
+			break;
+		}
+
+		msg = golay_msg_create(gsc, address, message, type);
+		if (msg) {
+			scheduler_enqueue(gsc, msg);
+			LOGP(DGOLAY, LOGL_NOTICE, "Scan: enqueue address '%s' type=%d msg='%s'\n",
+			     address, type, message);
+			queued++;
+		}
+
+		(*scan_from)++;
+	}
 }
 
 

@@ -222,6 +222,11 @@ typedef struct gsc {
 	uint8_t			rx_nbs_shift[4];	/* last 4 bits for pattern detection */
 	int			rx_nbs_shift_count;	/* bits accumulated in NBS shift register */
 	int			rx_nbs_locked;		/* 1 = NBS preamble detected, buffering data */
+
+	/* --- Scan mode --- */
+	uint32_t		scan_from;		/* current scan position (6-digit base) */
+	uint32_t		scan_to;		/* scan end (exclusive) */
+	enum gsc_msg_type	scan_type;		/* message type for scan */
 } gsc_t;
 
 int golay_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double deviation, double polarity, int tx, int rx, int auto_polarity, const char *message, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, const char *voice_dir, int voice_monitor);
@@ -233,6 +238,7 @@ void init_bch(void);
 int8_t get_bit(gsc_t *gsc);
 void golay_msg_send(const char *buffer);
 void golay_msg_receive(const gsc_rx_msg_t *msg);
+void golay_scan_enqueue(gsc_t *gsc, uint32_t *scan_from, uint32_t scan_to, enum gsc_msg_type type, int batch_size);
 
 /* validator API */
 int golay_validate_msg(const char *address, enum gsc_msg_type type,
