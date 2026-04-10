@@ -2447,7 +2447,7 @@ int main(int argc, char *argv[])
 	/* create transceiver instance */
 	for (i = 0; i < num_kanal; i++) {
 		double frequency = atof(kanal[i]) * 1e6;
-		rc = flex_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, deviation, polarity, msg_type, message, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
+		rc = flex_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, deviation, polarity, msg_type, (scan_to > scan_from) ? "" : message, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;

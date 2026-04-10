@@ -193,7 +193,7 @@ typedef struct flex_msg {
 #define FLEX_N_COUNTER_BUCKETS	4096
 
 /* Message queue depth limit per polarity */
-#define FLEX_MSG_QUEUE_MAX	256
+#define FLEX_MSG_QUEUE_MAX	4096
 
 /* BIW carousel: tracks last-transmitted frame per BIW type per phase.
  * Used for least-recently-transmitted rotation. */

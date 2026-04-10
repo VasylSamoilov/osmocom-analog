@@ -1670,6 +1670,10 @@ static int flex_get_next_frame_network(flex_t *flex)
 		flex->last_tx_polarity = selected_pol;
 	}
 
+	/* Refill scan queue if running low */
+	if (flex->scan_from < flex->scan_to)
+		flex_scan_or_loopback(flex);
+
 	/* Fragment any oversized messages in the queue before selection */
 	flex_fragment_queue(flex);
 
@@ -2858,6 +2862,10 @@ int flex_get_next_frame(flex_t *flex)
 
 
 	case FLEX_STATE_MESSAGE:
+		/* Refill scan queue if running low */
+		if (flex->scan_from < flex->scan_to)
+			flex_scan_or_loopback(flex);
+
 		/* Fragment any oversized messages before selection */
 		flex_fragment_queue(flex);
 
@@ -3115,61 +3123,85 @@ void flex_destroy(sender_t *sender)
 /*
  * Scan or loopback: generate test messages for scanning or loopback mode.
  *
- * Scan mode: sequentially transmit to each capcode in the scan range.
- * Loopback mode: continuously generate test messages for self-testing.
+ * Scan mode: batch-fill the queue with up to FLEX_SCAN_BATCH_SIZE messages,
+ * skipping reserved/special capcodes.  The scheduler packs them efficiently
+ * into frames by capcode-to-frame/phase mapping.
  *
- * Returns 1 if a message was enqueued, 0 otherwise.
+ * Called at startup and periodically when the queue runs low.
+ *
+ * Returns the number of messages enqueued.
  */
+#define FLEX_SCAN_BATCH_SIZE	2048
+#define FLEX_SCAN_REFILL_THRESHOLD 1024
+
 int flex_scan_or_loopback(flex_t *flex)
 {
 	if (flex->scan_from < flex->scan_to) {
-		const char *msg_text;
-		int msg_len;
+		int queued = 0;
+		int pi = pol_index(flex->default_polarity ? flex->default_polarity : FLEX_DEFAULT_POLARITY);
 
-		/* Use CLI -M message if provided, otherwise generate a default */
-		if (flex->default_message && flex->default_message[0]) {
-			msg_text = flex->default_message;
-			msg_len = strlen(msg_text);
-		} else {
-			static char autobuf[16];
-			switch (flex->default_msg_type) {
-			case FLEX_MSG_TYPE_NUMERIC:
-				sprintf(autobuf, "%05d", (int)(flex->scan_from / 100));
-				break;
-			case FLEX_MSG_TYPE_ALPHA:
-				sprintf(autobuf, "%02x", (int)(flex->scan_from / 10000));
-				break;
-			case FLEX_MSG_TYPE_TONE:
-			case FLEX_MSG_TYPE_AUTO:
-			default:
-				autobuf[0] = '\0';
-			}
-			msg_text = autobuf;
-			msg_len = strlen(autobuf);
-		}
-		LOGP_CHAN(DFLEX, LOGL_NOTICE, "Transmitting %s message '%s' with capcode '%" PRIu64 "' (%s).\n",
-			  flex_msg_type_name(flex->default_msg_type), msg_text, flex->scan_from,
-			  flex_capcode_type_name(flex->scan_from));
-		{
+		/* Only refill if queue is below threshold */
+		if (flex->tx_pol[pi].msg_count >= FLEX_SCAN_REFILL_THRESHOLD)
+			return 0;
+
+		while (flex->scan_from < flex->scan_to && queued < FLEX_SCAN_BATCH_SIZE) {
+			uint64_t cap = flex->scan_from;
+			char autobuf[32];
+			const char *msg_text;
+			int msg_len;
 			flex_msg_t *msg;
-			msg = flex_msg_create(flex, flex->scan_from, flex->default_msg_type,
+
+			flex->scan_from++;
+
+			/* Skip special/reserved capcodes */
+			if (flex_capcode_is_special(cap))
+				continue;
+
+			/* Validate capcode is in a usable range */
+			if (!flex_capcode_valid(cap))
+				continue;
+
+			/* Generate message payload */
+			if (flex->default_message && flex->default_message[0]) {
+				msg_text = flex->default_message;
+				msg_len = strlen(msg_text);
+			} else {
+				switch (flex->default_msg_type) {
+				case FLEX_MSG_TYPE_NUMERIC:
+					sprintf(autobuf, "%" PRIu64, cap);
+					break;
+				case FLEX_MSG_TYPE_ALPHA:
+					sprintf(autobuf, "%" PRIu64, cap);
+					break;
+				case FLEX_MSG_TYPE_TONE:
+				case FLEX_MSG_TYPE_AUTO:
+				default:
+					autobuf[0] = '\0';
+				}
+				msg_text = autobuf;
+				msg_len = strlen(autobuf);
+			}
+
+			msg = flex_msg_create(flex, cap, flex->default_msg_type,
 					      msg_text, msg_len);
 			if (msg) {
-				/* Apply fixed-mode speed/modulation if set */
 				if (flex->fixed_speed != -1) {
 					msg->speed = flex->fixed_speed;
 					msg->modulation_type = flex->fixed_mod_type;
 				}
-				/* Apply fixed-mode polarity if set */
 				if (flex->fixed_polarity != 0.0)
 					msg->polarity = flex->fixed_polarity;
-				/* Apply default phase if set */
 				if (flex->default_phase >= 0)
 					msg->phase = flex->default_phase;
+				queued++;
 			}
 		}
-		flex->scan_from++;
-		return 1;
+
+		if (queued > 0)
+			LOGP_CHAN(DFLEX, LOGL_NOTICE, "Scan: enqueued %d messages (next=%" PRIu64 " end=%" PRIu64 " queue=%d).\n",
+				  queued, flex->scan_from, flex->scan_to, flex->tx_pol[pi].msg_count);
+
+		return queued;
 	}
 
 	if (flex->sender.loopback) {
