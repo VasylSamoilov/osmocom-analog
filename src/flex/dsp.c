@@ -139,7 +139,7 @@ void dsp_set_polarity(flex_t *flex, double polarity)
 	dsp_init_ramp(flex);
 	dsp_init_fsk4_ramps(flex);
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "DSP polarity set to %s.\n",
-		  polarity < 0 ? "neg" : "pos");
+		  polarity < 0 ? "inverted" : "normal");
 }
 
 int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polarity, int enable_lpf)
@@ -503,7 +503,7 @@ again:
 					flex->fsk_tx_buffer[flex->fsk_tx_buffer_length + gi] = last_val;
 				flex->fsk_tx_buffer_length += gi;
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "TX guard: appended %d samples (last_val=%.3f) — no more frames\n",
+					  "TX guard: appended %d samples (last_val=%.3f) -- no more frames\n",
 					  gi, last_val);
 			}
 		}
@@ -948,7 +948,7 @@ static uint32_t flex_combined_a_correction(flex_t *flex,
 			/* Match — high confidence */
 			LOGP_CHAN(DDSP, LOGL_DEBUG,
 				  "RX: A/inv.A both OK, match "
-				  "(A:%s, ~inv.A:%s) → 0x%08X\n",
+				  "(A:%s, ~inv.A:%s) -> 0x%08X\n",
 				  status_a == 0 ? "clean" : "corrected",
 				  status_b == 0 ? "clean" : "corrected",
 				  corr_a);
@@ -960,7 +960,7 @@ static uint32_t flex_combined_a_correction(flex_t *flex,
 		 * detection was a false positive. */
 		LOGP_CHAN(DDSP, LOGL_NOTICE,
 			  "RX: A/inv.A both %s but disagree "
-			  "(A=0x%08X, ~inv.A=0x%08X) — not a sync frame\n",
+			  "(A=0x%08X, ~inv.A=0x%08X) -- not a sync frame\n",
 			  (status_a == 0 && status_b == 0) ? "clean" : "decoded",
 			  corr_a, corr_b);
 		return 0;
@@ -1001,7 +1001,7 @@ static uint32_t flex_combined_a_correction(flex_t *flex,
 					LOGP_CHAN(DDSP, LOGL_INFO,
 						  "RX: %s recovered by "
 						  "flipping bit %d "
-						  "(raw 0x%08X → 0x%08X)\n",
+						  "(raw 0x%08X -> 0x%08X)\n",
 						  bad_name, bit,
 						  bad_raw, try_corr);
 					return good;
@@ -1094,7 +1094,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 
 		if (corrected_code != 0 && corrected_code != sync_code) {
 			LOGP_CHAN(DDSP, LOGL_INFO,
-				  "RX: BCH corrected sync code 0x%04X → 0x%04X.\n",
+				  "RX: BCH corrected sync code 0x%04X -> 0x%04X.\n",
 				  sync_code, corrected_code);
 			sync_code = corrected_code;
 		}
@@ -1107,7 +1107,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 	 * to sync-hunting state so it can lock onto the next data frame's
 	 * S1 sync after the ERS burst ends. */
 	if (sync_code == FLEX_SYNC_AR) {
-		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: Ar (ERS re-sync) detected — resetting sync.\n");
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: Ar (ERS re-sync) detected -- resetting sync.\n");
 		return 0;
 	}
 
@@ -1120,9 +1120,9 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 		flex->rx.sync_levels = 4;
 		flex->rx.reflex = 1;
 		LOGP_CHAN(DDSP, LOGL_NOTICE,
-			  "RX: ReFLEX sync detected — code=0x%04X, 6400bps/4FSK, 3200 baud, polarity=%s (stub).\n",
+			  "RX: ReFLEX sync detected -- code=0x%04X, 6400bps/4FSK, 3200 baud, polarity=%s (stub).\n",
 			  sync_code,
-			  flex->rx.polarity ? "NEG" : "POS");
+			  flex->rx.polarity ? "inverted" : "normal");
 		return 1;
 	}
 
@@ -1133,12 +1133,12 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 			flex->rx.sync_baud = modes[i].baud;
 			flex->rx.sync_levels = modes[i].levels;
 			LOGP_CHAN(DDSP, LOGL_INFO,
-				  "RX: Sync detected — code=0x%04X, %dbps/%dFSK, %d baud, polarity=%s.\n",
+				  "RX: Sync detected -- code=0x%04X, %dbps/%dFSK, %d baud, polarity=%s.\n",
 				  sync_code,
 				  modes[i].baud * (modes[i].levels == 4 ? 2 : 1),
 				  modes[i].levels,
 				  modes[i].baud,
-				  flex->rx.polarity ? "NEG" : "POS");
+				  flex->rx.polarity ? "inverted" : "normal");
 			return 1;
 		}
 	}
@@ -1166,16 +1166,16 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 		for (i = 0; reserved[i].code != 0; i++) {
 			if (sync_code == reserved[i].code) {
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: Reserved sync code %s (0x%04X) detected, polarity=%s — no defined mode.\n",
+					  "RX: Reserved sync code %s (0x%04X) detected, polarity=%s -- no defined mode.\n",
 					  reserved[i].name, sync_code,
-					  flex->rx.polarity ? "NEG" : "POS");
+					  flex->rx.polarity ? "inverted" : "normal");
 				return 0;
 			}
 		}
 	}
 
 	LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: Unknown sync code 0x%04X, polarity=%s.\n",
-		  sync_code, flex->rx.polarity ? "NEG" : "POS");
+		  sync_code, flex->rx.polarity ? "inverted" : "normal");
 	return 0;
 }
 
@@ -1198,7 +1198,7 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 	}
 	if (bch_status == 1) {
 		LOGP_CHAN(DDSP, LOGL_INFO,
-			  "RX: FIW BCH corrected (raw=0x%08X → data=0x%05X).\n",
+			  "RX: FIW BCH corrected (raw=0x%08X -> data=0x%05X).\n",
 			  fiw_raw, (unsigned int)data);
 	}
 
@@ -1273,7 +1273,7 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 		}
 
 		LOGP_CHAN(DDSP, LOGL_INFO,
-			  "RX: FIW decoded — cycle=%u frame=%u roaming=%u "
+			  "RX: FIW decoded -- cycle=%u frame=%u roaming=%u "
 			  "repeat=%ux td_collapse=%s\n",
 			  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 			  flex->rx.fiw_roaming,
@@ -1292,7 +1292,7 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 		 * within block 0 — pager may return to battery-save
 		 * mode early.  When clear (0), normal traffic. */
 		LOGP_CHAN(DDSP, LOGL_INFO,
-			  "RX: FIW decoded — cycle=%u frame=%u roaming=%u "
+			  "RX: FIW decoded -- cycle=%u frame=%u roaming=%u "
 			  "low_traffic: A=%u B=%u C=%u D=%u\n",
 			  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 			  flex->rx.fiw_roaming,
@@ -1899,7 +1899,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			if (ph->status[i] == FLEX_WORD_CORRECTED) {
 				LOGP_CHAN(DDSP, LOGL_INFO,
 					  "RX: Phase %c word %2d BCH corrected "
-					  "(raw=0x%08X → data=0x%05X).\n",
+					  "(raw=0x%08X -> data=0x%05X).\n",
 					  phase_name, i, raw_words[i],
 					  ph->words[i]);
 			} else if (ph->status[i] == FLEX_WORD_UNCORRECTABLE) {
@@ -2439,7 +2439,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			/* Address logging */
 			if (is_long) {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: Phase %c long addr[%d,%d] %s[%c] aw=0x%05X(%s),0x%05X(%s) → cap=%" PRIu64 ".\n",
+					  "RX: Phase %c long addr[%d,%d] %s[%c] aw=0x%05X(%s),0x%05X(%s) -> cap=%" PRIu64 ".\n",
 					  phase_name, addr_idx - 1, addr_idx,
 					  flex_long_set_name(aw_base, ph->words[addr_idx]),
 					  flex_addr_type_flag(aw_type, 1),
@@ -2450,7 +2450,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			} else if (flex_addr_is_special(aw_base)) {
 				if (aw_type == FLEX_ADDR_OPER_MSG) {
 					LOGP_CHAN(DDSP, LOGL_INFO,
-						  "RX: Phase %c addr[%d] %s/%s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
+						  "RX: Phase %c addr[%d] %s/%s[%c] aw=0x%05X -> cap=%" PRIu64 ".\n",
 						  phase_name, addr_idx,
 						  flex_addr_type_name(aw_type),
 						  flex_oper_msg_subtype_name(aw_base),
@@ -2458,7 +2458,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  aw_base, capcode);
 				} else if (aw_type == FLEX_ADDR_TEMPORARY) {
 					LOGP_CHAN(DDSP, LOGL_INFO,
-						  "RX: Phase %c addr[%d] %s[%c] slot=%u aw=0x%05X → cap=%" PRIu64 " — %s.\n",
+						  "RX: Phase %c addr[%d] %s[%c] slot=%u aw=0x%05X -> cap=%" PRIu64 " -- %s.\n",
 						  phase_name, addr_idx,
 						  flex_addr_type_name(aw_type),
 						  flex_addr_type_flag(aw_type, 0),
@@ -2467,7 +2467,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  flex_special_addr_detail(aw_base));
 				} else {
 					LOGP_CHAN(DDSP, LOGL_INFO,
-						  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 " — %s.\n",
+						  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X -> cap=%" PRIu64 " -- %s.\n",
 						  phase_name, addr_idx,
 						  flex_addr_type_name(aw_type),
 						  flex_addr_type_flag(aw_type, 0),
@@ -2476,7 +2476,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				}
 			} else if (addr_is_group) {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) → cap=%" PRIu64 ".\n",
+					  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) -> cap=%" PRIu64 ".\n",
 					  phase_name, addr_idx,
 					  flex_addr_type_name(aw_type),
 					  flex_addr_type_flag(aw_type, 0),
@@ -2484,7 +2484,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					  aw_base, aw_raw, capcode);
 			} else {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X → cap=%" PRIu64 ".\n",
+					  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X -> cap=%" PRIu64 ".\n",
 					  phase_name, addr_idx,
 					  flex_addr_type_name(aw_type),
 					  flex_addr_type_flag(aw_type, 0),
@@ -2509,7 +2509,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					  phase_name,
 					  flex->rx.sync_baud,
 					  flex->rx.sync_levels,
-					  flex->rx.polarity ? "neg" : "pos",
+					  flex->rx.polarity ? "inverted" : "normal",
 					  capcode,
 					  flex_addr_type_flag(aw_type, is_long),
 					  grp_flag,
@@ -2820,7 +2820,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			/* Reserved Short address — log and skip (no defined behavior). */
 			if (aw_type == FLEX_ADDR_RSVD_SHORT) {
 				LOGP_CHAN(DDSP, LOGL_INFO,
-					  "RX: Phase %c addr[%d] reserved short aw=0x%05X — ignoring.\n",
+					  "RX: Phase %c addr[%d] reserved short aw=0x%05X -- ignoring.\n",
 					  phase_name, addr_idx, aw_base);
 				continue;
 			}
@@ -2889,7 +2889,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					/* Teardown on completion */
 					if (is_complete) {
 						LOGP_CHAN(DDSP, LOGL_DEBUG,
-							  "RX: Phase %c temp slot=%u TEARDOWN — message complete.\n",
+							  "RX: Phase %c temp slot=%u TEARDOWN -- message complete.\n",
 							  phase_name, slot);
 						memset(&flex->rx.temp_addr_map[pol][phase_idx][slot], 0,
 						       sizeof(flex->rx.temp_addr_map[pol][phase_idx][slot]));
@@ -3376,7 +3376,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
-						  flex->rx.polarity ? "neg" : "pos",
+						  flex->rx.polarity ? "inverted" : "normal",
 						  (frag_flag == 'K') ? "complete" :
 						  (frag_flag == 'F') ? (is_initial ? "frag_start" : "frag_cont") :
 						  "frag_end",
@@ -3508,7 +3508,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  phase_name,
 									  flex->rx.sync_baud,
 									  flex->rx.sync_levels,
-									  flex->rx.polarity ? "neg" : "pos",
+									  flex->rx.polarity ? "inverted" : "normal",
 									  "reassembled",
 									  reasm_sig_status,
 									  capcode,
@@ -3527,7 +3527,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  phase_name,
 									  flex->rx.sync_baud,
 									  flex->rx.sync_levels,
-									  flex->rx.polarity ? "neg" : "pos",
+									  flex->rx.polarity ? "inverted" : "normal",
 									  "reassembled",
 									  reasm_sig_status,
 									  capcode,
@@ -3794,7 +3794,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  phase_name,
 								  flex->rx.sync_baud,
 								  flex->rx.sync_levels,
-								  flex->rx.polarity ? "neg" : "pos",
+								  flex->rx.polarity ? "inverted" : "normal",
 								  num_k_status,
 								  num_recovered ? ",RX_RECOVERED" : "",
 								  capcode,
@@ -3811,7 +3811,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  phase_name,
 								  flex->rx.sync_baud,
 								  flex->rx.sync_levels,
-								  flex->rx.polarity ? "neg" : "pos",
+								  flex->rx.polarity ? "inverted" : "normal",
 								  num_k_status,
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
@@ -3834,7 +3834,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
-						  flex->rx.polarity ? "neg" : "pos",
+						  flex->rx.polarity ? "inverted" : "normal",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  grp_flag,
@@ -3910,7 +3910,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
-							  flex->rx.polarity ? "neg" : "pos",
+							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  grp_flag, prio_flag,
@@ -3923,7 +3923,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
-							  flex->rx.polarity ? "neg" : "pos",
+							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  grp_flag, prio_flag,
@@ -3942,7 +3942,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
-							  flex->rx.polarity ? "neg" : "pos",
+							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  grp_flag, prio_flag,
@@ -3960,7 +3960,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
-							  flex->rx.polarity ? "neg" : "pos",
+							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  grp_flag, prio_flag,
@@ -3976,7 +3976,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
-						  flex->rx.polarity ? "neg" : "pos",
+						  flex->rx.polarity ? "inverted" : "normal",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  grp_flag, prio_flag,
@@ -4422,7 +4422,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
-						  flex->rx.polarity ? "neg" : "pos",
+						  flex->rx.polarity ? "inverted" : "normal",
 						  (hex_frag_flag == 'K') ? "complete" :
 						  (hex_frag_flag == 'F') ? (hex_is_initial ? "frag_start" : "frag_cont") :
 						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
@@ -4482,7 +4482,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  phase_name,
 								  flex->rx.sync_baud,
 								  flex->rx.sync_levels,
-								  flex->rx.polarity ? "neg" : "pos",
+								  flex->rx.polarity ? "inverted" : "normal",
 								  "reassembled",
 								  hex_blocking,
 								  capcode,
@@ -4528,7 +4528,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "RX: %dbps C%u/F%u phase=%c BIW101 %s"
 					  " sysmsg vector at VF[%d]"
-					  " → synthetic cap=%" PRIu64 "\n",
+					  " -> synthetic cap=%" PRIu64 "\n",
 					  bitrate,
 					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 					  phase_name,
@@ -4591,7 +4591,7 @@ static void flex_rx_decode_data(flex_t *flex)
 				if (elapsed >= 128) {
 					static const char pn[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
 					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c temp slot=%d TIMEOUT — %u frames since SETUP, clearing.\n",
+						  "RX: Phase %c temp slot=%d TIMEOUT -- %u frames since SETUP, clearing.\n",
 						  pn[p], s, elapsed);
 					memset(&flex->rx.temp_addr_map[pol][p][s], 0,
 					       sizeof(flex->rx.temp_addr_map[pol][p][s]));
@@ -4607,7 +4607,7 @@ static void flex_rx_decode_data(flex_t *flex)
 	 * phase layout than standard FLEX A4). */
 	if (flex->rx.reflex) {
 		LOGP_CHAN(DDSP, LOGL_NOTICE,
-			  "RX: ReFLEX frame C%u/F%u — attempting FLEX decode (may fail), then hex dump.\n",
+			  "RX: ReFLEX frame C%u/F%u -- attempting FLEX decode (may fail), then hex dump.\n",
 			  flex->rx.fiw_cycle, flex->rx.fiw_frame);
 
 		/* Try standard FLEX phase decode — ReFLEX shares the same
@@ -4714,7 +4714,7 @@ static void flex_rx_decode_data(flex_t *flex)
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
 						  "RX: C%u/F%u pol=%s phase=%c temp_group=%d ACTIVE members=%d target_frame=%u setup=C%u/F%u:%s\n",
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  pol ? "neg" : "pos",
+						  pol ? "inverted" : "normal",
 						  pnames[p], s, cnt,
 						  flex->rx.temp_addr_map[pol][p][s].target_frame,
 						  flex->rx.temp_addr_map[pol][p][s].setup_cycle,
@@ -4727,7 +4727,7 @@ static void flex_rx_decode_data(flex_t *flex)
 
 	/* Frame-level BCH summary (S1 + FIW + all data phases) */
 	LOGP_CHAN(DDSP, LOGL_INFO,
-		  "RX: Frame C%u/F%u BCH totals: %u codewords — "
+		  "RX: Frame C%u/F%u BCH totals: %u codewords -- "
 		  "%u clean, %u corrected, %u uncorrectable.\n",
 		  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 		  flex->bch_stats.total,
@@ -4953,7 +4953,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 				    flex->rx.sync_levels != prev_levels) {
 					LOGP_CHAN(DDSP, LOGL_INFO,
 						  "RX: combined correction "
-						  "changed mode: %d/%d → %d/%d.\n",
+						  "changed mode: %d/%d -> %d/%d.\n",
 						  prev_baud, prev_levels,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels);
@@ -4988,7 +4988,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 				flex->rx.sync2_sym_buf_start = 0;
 				flex->rx.rx_state = RX_STATE_SYNC2;
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: FIW→SYNC2, symbol rate switch to %d baud.\n",
+					  "RX: FIW->SYNC2, symbol rate switch to %d baud.\n",
 					  flex->rx.baud);
 			} else {
 				flex->rx.rx_state = RX_STATE_SYNC1;
@@ -5155,7 +5155,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 			 * count is the expected baseline. */
 			if (correction != 0) {
 				LOGP_CHAN(DDSP, LOGL_INFO,
-					  "RX: SYNC2→DATA (%s), boundary corrected "
+					  "RX: SYNC2->DATA (%s), boundary corrected "
 					  "by %+d symbol%s, "
 					  "C@%d(%de), inv.C@%d(%de), "
 					  "gap=%d (expected %d), "
@@ -5173,7 +5173,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 					  flex->rx.sync_levels);
 			} else if (!flex->rx.sync2_c_found && !flex->rx.sync2_cinv_found) {
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: SYNC2→DATA, neither C nor inv.C detected, "
+					  "RX: SYNC2->DATA, neither C nor inv.C detected, "
 					  "using blind count (%d symbols, %d baud/%dFSK).\n",
 					  s2_symbols,
 					  flex->rx.sync_baud,
@@ -5197,13 +5197,13 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 					}
 				}
 				if (replay_count > 0) {
-					LOGP_CHAN(DDSP, LOGL_INFO,
-						  "RX: replayed %d buffered symbol%s "
-						  "into data (boundary=%d, buf_start=%d).\n",
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: S2->DATA boundary at symbol %d "
+						  "(nominal %d): %d symbol%s buffered "
+						  "near boundary fed into data decoder.\n",
+						  boundary, s2_symbols,
 						  replay_count,
-						  replay_count == 1 ? "" : "s",
-						  boundary,
-						  flex->rx.sync2_sym_buf_start);
+						  replay_count == 1 ? "" : "s");
 				}
 			}
 		}

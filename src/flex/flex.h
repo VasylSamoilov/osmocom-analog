@@ -5,12 +5,12 @@
 #include "../libfilter/iir_filter.h"
 #include "frame.h"
 
-/* Number of independent polarity networks (POS=0, NEG=1).
+/* Number of independent polarity networks (NORMAL=0, INVERTED=1).
  * Each polarity is a separate logical network with independent
  * temp group tracking, reassembly, message history, and BIW state. */
 #define FLEX_RX_POLARITIES	2
-#define FLEX_POL_POS		0
-#define FLEX_POL_NEG		1
+#define FLEX_POL_NORMAL		0
+#define FLEX_POL_INVERTED	1
 #define FLEX_RX_MAX_SUBFRAMES	4	/* max num_transmissions */
 
 /* Per-subframe storage for one phase */
@@ -103,7 +103,7 @@ typedef struct flex_msg {
 	/* per-message parameters (set from FIFO key=value fields or CLI defaults) */
 	int			speed;			/* 1600, 3200, or 6400 (default 1600) */
 	int			modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK (default 2FSK) */
-	double			polarity;		/* -1.0 or +1.0 (default -1.0 = negative) */
+	double			polarity;		/* +1.0 = normal, -1.0 = inverted */
 	int			priority;		/* 0 = normal, 1 = priority */
 	int			charset;		/* 0 = ASCII, 1 = KANJI */
 	int			is_group;		/* 0 = individual, 1 = group */
@@ -276,7 +276,7 @@ typedef struct flex {
 
 	/* per-message defaults (CLI -M message and FIFO fallback) */
 	int			default_speed;		/* 1600, 3200, 6400 — default 1600 */
-	double			default_polarity;	/* -1.0 or +1.0 — default -1.0 */
+	double			default_polarity;	/* +1.0 = normal, -1.0 = inverted */
 	int			default_charset;	/* 0 = ASCII, 1 = KANJI — default 0 */
 	int			default_phase;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 	int			default_blocking_length; /* HEX/Binary B field default: 1-15 bits/char,
@@ -285,7 +285,7 @@ typedef struct flex {
 	/* fixed-mode flags (CLI --speed / --polarity lock) */
 	int			fixed_speed;		/* -1 = not fixed, else 1600/3200/6400 */
 	int			fixed_mod_type;		/* FLEX_MOD_2FSK (default) or FLEX_MOD_4FSK */
-	double			fixed_polarity;		/* 0.0 = not fixed, else -1.0/+1.0 */
+	double			fixed_polarity;		/* 0.0 = not fixed, else +1.0(normal)/-1.0(inverted) */
 
 	/* current frame parameters (set per-frame by scheduler/state machine) */
 	int			current_frame_speed;

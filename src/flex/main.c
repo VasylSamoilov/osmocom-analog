@@ -125,8 +125,9 @@ void print_help(const char *arg0)
 	printf("        Transmit FLEX signal on given channel. (default)\n");
 	printf(" -D --deviation <KHz>\n");
 	printf("        Choose deviation of FSK signal (default %.0f Hz).\n", deviation);
-	printf(" -P --polarity -1 | negative | 1 | positive\n");
-	printf("        Choose polarity of FSK signal. (default %s).\n", (polarity < 0) ? "negative" : "positive");
+	printf(" -P --polarity normal | inverted | positive | negative | 1 | -1\n");
+	printf("        Choose polarity of FSK signal. (default %s).\n", (polarity < 0) ? "inverted" : "normal");
+	printf("        normal=+4800Hz for '1' (spec-compliant), inverted=-4800Hz for '1'.\n");
 	printf(" -y --type auto | tone | numeric | alpha | hex | instruction | short | secure | special | snum | nnumeric | nnum | nspecial | nsnum\n");
 	printf("        Set message type. (default auto)\n");
 	printf("        Message types (V2V1V0 vector type field):\n");
@@ -155,7 +156,7 @@ void print_help(const char *arg0)
 	printf("        Set collapse cycle value (default %d, network mode only).\n", collapse);
 	printf("    --speed <1600|3200|3200-4fsk|6400>\n");
 	printf("        Lock transmitter to fixed baud rate (fixed-mode).\n");
-	printf("    --fixed-polarity <neg|pos>\n");
+	printf("    --fixed-polarity <normal|inverted|pos|neg>\n");
 	printf("        Lock transmitter to fixed FSK polarity (fixed-mode).\n");
 	printf("    --lpf\n");
 	printf("        Enable baseband low-pass filter (default).\n");
@@ -276,7 +277,7 @@ void print_help(const char *arg0)
 	printf("\n");
 	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short|secure|special|nnumeric|nspecial (or 0-10)\n");
 	printf("        Options: space-separated key=value pairs:\n");
-	printf("          speed=1600|3200|3200-4fsk|6400  polarity=neg|pos\n");
+	printf("          speed=1600|3200|3200-4fsk|6400  polarity=normal|inverted\n");
 	printf("          priority=0|1  charset=ascii|kanji\n");
 	printf("          group=0|1  tempgroup=0|1  source=<id>\n");
 	printf("          phase=A|B|C|D|auto\n");
@@ -422,16 +423,14 @@ static int handle_options(int short_option, int argi, char **argv)
 		deviation = atof(argv[argi]) * 1000.0;
 		break;
 	case 'P':
-		if (argv[argi][0] == 'n' || argv[argi][0] == 'N')
-			polarity = -1.0;
-		else if (argv[argi][0] == 'p' || argv[argi][0] == 'P')
+		if (!strcasecmp(argv[argi], "normal") || !strcasecmp(argv[argi], "positive") ||
+		    !strcasecmp(argv[argi], "pos") || !strcmp(argv[argi], "1"))
 			polarity = 1.0;
-		else if (atoi(argv[argi]) == -1)
+		else if (!strcasecmp(argv[argi], "inverted") || !strcasecmp(argv[argi], "negative") ||
+			 !strcasecmp(argv[argi], "neg") || !strcmp(argv[argi], "-1"))
 			polarity = -1.0;
-		else if (atoi(argv[argi]) == 1)
-			polarity = 1.0;
 		else {
-			fprintf(stderr, "Given polarity is not positive nor negative, use '-h' for help.\n");
+			fprintf(stderr, "Invalid polarity '%s'. Use normal|inverted (or positive|negative|1|-1).\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
@@ -499,12 +498,14 @@ static int handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 	case OPT_FIXED_POLARITY:
-		if (argv[argi][0] == 'n' || argv[argi][0] == 'N')
-			fixed_polarity = -1.0;
-		else if (argv[argi][0] == 'p' || argv[argi][0] == 'P')
+		if (!strcasecmp(argv[argi], "normal") || !strcasecmp(argv[argi], "positive") ||
+		    !strcasecmp(argv[argi], "pos"))
 			fixed_polarity = 1.0;
+		else if (!strcasecmp(argv[argi], "inverted") || !strcasecmp(argv[argi], "negative") ||
+			 !strcasecmp(argv[argi], "neg"))
+			fixed_polarity = -1.0;
 		else {
-			fprintf(stderr, "Polarity must be neg or pos, use '-h' for help.\n");
+			fprintf(stderr, "Invalid polarity '%s'. Use normal|inverted (or pos|neg).\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
@@ -830,10 +831,12 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			}
 		}
 		else if (!strcmp(key, "polarity")) {
-			if (val[0] == 'n' || val[0] == 'N')
-				*polarity_out = -1.0;
-			else if (val[0] == 'p' || val[0] == 'P')
+			if (!strcasecmp(val, "normal") || !strcasecmp(val, "positive") ||
+			    !strcasecmp(val, "pos"))
 				*polarity_out = 1.0;
+			else if (!strcasecmp(val, "inverted") || !strcasecmp(val, "negative") ||
+				 !strcasecmp(val, "neg"))
+				*polarity_out = -1.0;
 		}
 		else if (!strcmp(key, "priority"))
 			*priority = atoi(val);
@@ -2089,8 +2092,8 @@ static void fifo_process_line(const char *text, int text_length)
 			}
 			if (flex->fixed_polarity != 0.0 && msg_polarity != flex->fixed_polarity) {
 				LOGP(DFLEX, LOGL_NOTICE, "fixed-mode: polarity locked to %s, discarding message with polarity=%s\n",
-				     (flex->fixed_polarity < 0) ? "negative" : "positive",
-				     (msg_polarity < 0) ? "negative" : "positive");
+				     (flex->fixed_polarity < 0) ? "inverted" : "normal",
+				     (msg_polarity < 0) ? "inverted" : "normal");
 				return;
 			}
 		}
@@ -2229,7 +2232,7 @@ static void fifo_process_line(const char *text, int text_length)
 				     flex_msg_type_name(mtype),
 				     msg_speed,
 				     flex_mod_name(msg_mod_type),
-				     (msg_polarity < 0) ? "neg" : "pos",
+				     (msg_polarity < 0) ? "inverted" : "normal",
 				     msg_priority,
 				     msg_charset ? "kanji" : "ascii",
 				     is_group,

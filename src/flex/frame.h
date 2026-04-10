@@ -1833,11 +1833,11 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 /* ===== Default Polarity =====
  *
  * Default FSK polarity for FLEX transmission.
- * +1.0 = positive (mark=high, space=low).
- * -1.0 = negative (mark=low, space=high).
+ * +1.0 = normal (spec-compliant: +4800Hz for '1', -4800Hz for '0').
+ * -1.0 = inverted (+4800Hz for '0', -4800Hz for '1').
  * Both polarities are valid; the S1 sync structure (A + inv.A)
  * allows receivers to detect either.  One-shot mode transmits
- * both polarities (default then inverted) for maximum coverage. */
+ * both polarities (normal then inverted) for maximum coverage. */
 #define FLEX_DEFAULT_POLARITY	1.0
 
 /* ===== Error Codes ===== */

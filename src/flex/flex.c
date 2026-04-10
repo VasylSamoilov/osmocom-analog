@@ -2240,7 +2240,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				  "Network mode: encoded %d-phase frame C%u/F%u speed=%d/%s polarity=%s collapse=%d roaming=%d num_tx=%d sf=%d/%d.\n",
 				  num_phases, ft.cycle, ft.frame, params.bitrate,
 				  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-				  (flex->fsk_polarity < 0) ? "neg" : "pos",
+				  (flex->fsk_polarity < 0) ? "inverted" : "normal",
 				  params.collapse, params.roaming,
 				  params.num_transmissions,
 				  params.subframe_index, params.num_transmissions);
@@ -2748,7 +2748,7 @@ int flex_get_next_frame(flex_t *flex)
 				  "One-shot: C0/F0 pass=%d polarity=%s R=%d capcode=%" PRIu64
 				  " type=%d speed=%d len=%d.\n",
 				  pass,
-				  (polarity < 0) ? "neg" : "pos",
+				  (polarity < 0) ? "inverted" : "normal",
 				  is_retransmit ? 0 : 1,
 				  msg->capcode, (int)msg->msg_type,
 				  msg->speed, msg->data_length);
@@ -2837,7 +2837,7 @@ int flex_create(const char *kanal, double frequency, const char *device, int use
 	flex_display_status();
 
 	LOGP(DFLEX, LOGL_NOTICE, "Created 'Kanal' %s: samplerate=%d deviation=%.0f polarity=%s tx=%d.\n",
-	     kanal, samplerate, deviation, (polarity < 0) ? "neg" : "pos", tx);
+	     kanal, samplerate, deviation, (polarity < 0) ? "inverted" : "normal", tx);
 
 	return 0;
 
