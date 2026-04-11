@@ -2338,19 +2338,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 		uint64_t capcode = 0;
 		int is_long = 0;
 		int vec_type = 0, mw1 = 0, mw2 = 0, len = 0;
-		char grp_flag = ' ';
 		char prio_flag = ' ';
 		uint32_t aw_raw = 0, aw_base = 0;
-		int addr_is_group = 0, addr_is_temp = 0;
 		enum flex_addr_type aw_type = FLEX_ADDR_UNKNOWN;
 
 		for (; addr_idx < voffset; addr_idx++) {
 
 			j = voffset + vec_count; /* vector index */
 			is_long = 0;
-			grp_flag = ' ';
-			addr_is_group = 0;
-			addr_is_temp = 0;
 			aw_type = FLEX_ADDR_UNKNOWN;
 			/* Priority addresses are in
 			 * addr_idx [aoffset..prio_end-1].  Show 'P' flag
@@ -2370,69 +2365,48 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 			/* Address decode.
 			 *
-			 * Special addresses (Temporary, OperMsg, Network, etc.)
-			 * use the full 21-bit value — bits 20/19 are part of
-			 * the address, not group flags.  Check for special
-			 * addresses on the raw word FIRST.  For non-special
-			 * addresses, extract group/temporary flags from
-			 * bit 20/19, then classify the base word. */
+			 * All address words use the full 21 information bits
+			 * d₀–d₂₀ as address data (§3.8.2).  Address type is
+			 * determined by the word value range (Table 3.8.1-1).
+			 * Temporary Addresses are a specific 16-address range
+			 * (§3.8.2.3), not a flag bit. */
 			aw_raw = ph->words[addr_idx];
-			if (flex_addr_is_special(aw_raw)) {
-				/* Special address: use raw word directly */
-				aw_base = aw_raw;
-				addr_is_group = 0;
-				addr_is_temp = 0;
-			} else {
-				aw_base = flex_decode_addr_flags(aw_raw, &addr_is_group, &addr_is_temp);
-			}
+			aw_base = aw_raw;
 			aw_type = flex_classify_addr_word(aw_base);
-			grp_flag = flex_group_flag_char(addr_is_group, addr_is_temp);
 			is_long = flex_addr_is_long(aw_base);
 
 			if (is_long) {
 				/* Long address: 2 address words, 2 vector words.
-				 * Set detection + inverse formula.
-				 * Group long addresses use only w1 (with group
-				 * bit set), so they are single-word — the group
-				 * bit extraction above already handled this. */
-				if (addr_is_group) {
-					/* Group address with long-range base:
-					 * single word, decode base as short-style */
-					capcode = flex_decode_short_address(aw_base);
-					is_long = 0;
-				} else {
-					/* Individual long address: 2 words */
-					if (addr_idx + 1 >= voffset) {
-						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: Phase %c long addr[%d] truncated.\n",
-							  phase_name, addr_idx);
-						break;
-					}
-					if (ph->status[addr_idx + 1] == FLEX_WORD_UNCORRECTABLE ||
-					    ph->status[addr_idx + 1] == FLEX_WORD_NOT_RECEIVED) {
-						LOGP_CHAN(DDSP, LOGL_DEBUG,
-							  "RX: Phase %c long addr[%d] word2 uncorrectable.\n",
-							  phase_name, addr_idx);
-						addr_idx++;
-						vec_count += 2;
-						continue;
-					}
-					uint32_t aw2 = ph->words[addr_idx + 1];
-					capcode = flex_decode_long_address(aw_base, aw2);
+				 * Set detection + inverse formula (§3.8.2.2). */
+				if (addr_idx + 1 >= voffset) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: Phase %c long addr[%d] truncated.\n",
+						  phase_name, addr_idx);
+					break;
+				}
+				if (ph->status[addr_idx + 1] == FLEX_WORD_UNCORRECTABLE ||
+				    ph->status[addr_idx + 1] == FLEX_WORD_NOT_RECEIVED) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c long addr[%d] word2 uncorrectable.\n",
+						  phase_name, addr_idx);
 					addr_idx++;
+					vec_count += 2;
+					continue;
+				}
+				uint32_t aw2 = ph->words[addr_idx + 1];
+				capcode = flex_decode_long_address(aw_base, aw2);
+				addr_idx++;
 
-					if (capcode == 0) {
-						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: Phase %c long addr[%d,%d] aw=0x%05X,0x%05X invalid set.\n",
-							  phase_name, addr_idx - 1, addr_idx, aw_base, aw2);
-						vec_count += 2;
-						continue;
-					}
+				if (capcode == 0) {
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: Phase %c long addr[%d,%d] aw=0x%05X,0x%05X invalid set.\n",
+						  phase_name, addr_idx - 1, addr_idx, aw_base, aw2);
+					vec_count += 2;
+					continue;
 				}
 			} else {
-				/* Single-word address.
-				 * For group addresses, decode from the base word
-				 * (flags already stripped). */
+				/* Single-word address: classify directly
+				 * by range (Table 3.8.1-1). */
 				capcode = flex_decode_short_address(aw_base);
 			}
 
@@ -2474,14 +2448,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  aw_base, capcode,
 						  flex_special_addr_detail(aw_base));
 				}
-			} else if (addr_is_group) {
-				LOGP_CHAN(DDSP, LOGL_DEBUG,
-					  "RX: Phase %c addr[%d] %s[%c%c] aw=0x%05X(raw=0x%05X) -> cap=%" PRIu64 ".\n",
-					  phase_name, addr_idx,
-					  flex_addr_type_name(aw_type),
-					  flex_addr_type_flag(aw_type, 0),
-					  grp_flag,
-					  aw_base, aw_raw, capcode);
 			} else {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
 					  "RX: Phase %c addr[%d] %s[%c] aw=0x%05X -> cap=%" PRIu64 ".\n",
@@ -2503,7 +2469,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			if (vec_count >= n_valid_vec_words) {
 				if (capcode == 1) continue;  /* idle artifact */
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c TON\n",
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c TON\n",
 					  bitrate,
 					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 					  phase_name,
@@ -2512,7 +2478,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					  flex->rx.polarity ? "inverted" : "normal",
 					  capcode,
 					  flex_addr_type_flag(aw_type, is_long),
-					  grp_flag,
 					  prio_flag);
 				continue;
 			}
@@ -2576,7 +2541,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					  "RX: Phase %c cap=%" PRIu64 " type=%d mw1=%d len=%d%s%s.\n",
 					  phase_name, capcode, vec_type, mw1, len,
 					  is_long ? " (long)" : "",
-					  addr_is_group ? (addr_is_temp ? " (tempgroup)" : " (group)") : "");
+					  (aw_type == FLEX_ADDR_TEMPORARY) ? " (temp)" : "");
 			}
 
 			/* Short instruction vector.
@@ -2679,12 +2644,11 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				} else {
 					/* Reserved or unrecognized instruction type */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c%c%c INS %s(i=%u) data=0x%04X\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c%c INS %s(i=%u) data=0x%04X\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name, capcode,
 						  flex_addr_type_flag(aw_type, is_long),
-						  grp_flag,
 						  prio_flag,
 						  flex_instr_type_name(itype),
 						  itype,
@@ -3374,7 +3338,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 					}
 
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c%c %s \"%s\" {%s}\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3389,7 +3353,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  alpha_recovered ? ",RX_RECOVERED" : "",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
-						  grp_flag,
 						  prio_flag,
 						  msg_tag,
 						  text,
@@ -3506,7 +3469,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							reasm_append(flex, slot, text, ti);
 							if (flex->rx.reasm[pol][slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c%c %s t1t0=%d \"%s\" {%s}\n",
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c %s t1t0=%d \"%s\" {%s}\n",
 									  bitrate,
 									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 									  phase_name,
@@ -3517,7 +3480,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  reasm_sig_status,
 									  capcode,
 									  flex_addr_type_flag(aw_type, is_long),
-									  grp_flag,
 									  prio_flag,
 									  reasm_tag,
 									  flex->rx.reasm[pol][slot].secure_subtype,
@@ -3525,7 +3487,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  flex->rx.reasm[pol][slot].word_status);
 							else
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c%c %s \"%s\" {%s}\n",
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 									  bitrate,
 									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 									  phase_name,
@@ -3536,7 +3498,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  reasm_sig_status,
 									  capcode,
 									  flex_addr_type_flag(aw_type, is_long),
-									  grp_flag,
 									  prio_flag,
 									  reasm_tag,
 									  flex->rx.reasm[pol][slot].buf,
@@ -3792,7 +3753,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						/* Output with subtype tag and optional sequencing fields */
 						if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM && num_n >= 0) {
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s [%09" PRIu64 "] %c%c%c %s N=%d,R=%d,S=%d \"%s\"\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s [%09" PRIu64 "] %c%c %s N=%d,R=%d,S=%d \"%s\"\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -3803,13 +3764,12 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  num_recovered ? ",RX_RECOVERED" : "",
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
-								  grp_flag,
 								  prio_flag,
 								  num_tag, num_n, num_r, num_s,
 								  digits);
 						} else {
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c%c %s \"%s\"\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c %s \"%s\"\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -3819,7 +3779,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  num_k_status,
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
-								  grp_flag,
 								  prio_flag,
 								  num_tag,
 								  digits);
@@ -3832,7 +3791,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						(vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM) ? "SNUM" :
 						(vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) ? "NNUM" : "NUM";
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c %s\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c %s\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3841,7 +3800,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  flex->rx.polarity ? "inverted" : "normal",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
-						  grp_flag,
 						  prio_flag,
 						  num_tag);
 				}
@@ -3908,7 +3866,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					if (all_space) {
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG \"%*s\" (tone-only)\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG \"%*s\" (tone-only)\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
@@ -3917,11 +3875,11 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
-							  grp_flag, prio_flag,
+							  prio_flag,
 							  ndigits, "        ");
 					} else {
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG \"%s\"\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG \"%s\"\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
@@ -3930,7 +3888,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
-							  grp_flag, prio_flag,
+							  prio_flag,
 							  digits);
 					}
 				} else if (t_field == 1 || t_field == 2) {
@@ -3940,7 +3898,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					if (t_field == FLEX_SMSG_TYPE_SOURCE) {
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG %s S=%u\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG %s S=%u\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
@@ -3949,7 +3907,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
-							  grp_flag, prio_flag,
+							  prio_flag,
 							  flex_smsg_type_name(t_field),
 							  src);
 					} else {
@@ -3958,7 +3916,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						uint32_t r = (d_field >> FLEX_SMSG_NUMB_R_SHIFT)
 							   & FLEX_SMSG_NUMB_R_MASK;
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG %s S=%u N=%u R=%u\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG %s S=%u N=%u R=%u\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
@@ -3967,14 +3925,14 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 							  flex->rx.polarity ? "inverted" : "normal",
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
-							  grp_flag, prio_flag,
+							  prio_flag,
 							  flex_smsg_type_name(t_field),
 							  src, n, r);
 					}
 				} else {
 					/* t=11: reserved sub-type */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c%c SMSG reserved (t=%u d=0x%03X)\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG reserved (t=%u d=0x%03X)\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3983,7 +3941,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  flex->rx.polarity ? "inverted" : "normal",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
-						  grp_flag, prio_flag,
+						  prio_flag,
 						  t_field, d_field);
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_HEX_BINARY) {
@@ -4420,7 +4378,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d%s%s [%09" PRIu64 "] %c%c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -4435,7 +4393,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 						  hex_recovered ? ",RX_RECOVERED" : "",
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
-						  grp_flag,
 						  prio_flag,
 						  hex);
 
@@ -4480,7 +4437,7 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 									  r_bits, r_blocks);
 							}
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d [%09" PRIu64 "] %c%c%c HEX [%s]\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -4491,7 +4448,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 								  hex_blocking,
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
-								  grp_flag,
 								  prio_flag,
 								  flex->rx.reasm[pol][slot].buf);
 							flex->rx.reasm[pol][slot].active = 0;
@@ -4527,7 +4483,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				j = sv_idx;
 				is_long = 0;
 				prio_flag = ' ';
-				grp_flag = ' ';
 				aw_type = FLEX_ADDR_OPER_MSG;
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "RX: %dbps C%u/F%u phase=%c BIW101 %s"

@@ -1221,52 +1221,11 @@ static inline const char *flex_oper_msg_category_name(enum flex_oper_msg_categor
 	return "?";
 }
 
-/* ===== Address Word Group/Temporary Flags =====
+/* ===== Address Word Type Classification =====
  *
- * In the 21-bit address word, bit 20 (MSB) is the group flag and bit 19
- * is the temporary group flag.  These must be extracted BEFORE the
- * remaining bits are classified.
- *
- * Bit layout:
- *   bit 20:    G  — group address flag (1 = group, 0 = individual)
- *   bit 19:    T  — temporary group flag (1 = temporary, 0 = common)
- *   bits 0-18: base address word (classified by range)
- *
- * For individual addresses (G=0), bits 19-20 are part of the normal
- * address word value and the full 21-bit word is classified directly.
- * For group addresses (G=1), bit 19 distinguishes common vs temporary
- * group, and bits 0-18 encode the base capcode. */
-
-#define FLEX_ADDR_GROUP_BIT	(1U << 20)	/* bit 20: group flag */
-#define FLEX_ADDR_TEMP_BIT	(1U << 19)	/* bit 19: temporary group flag */
-#define FLEX_ADDR_BASE_MASK	0x0007FFFFU	/* bits 0-18: base address (19 bits) */
-
-/* Extract group/temporary flags and base address from a 21-bit address word.
- *
- * After BCH decode, call this BEFORE flex_classify_addr_word() to separate
- * the group/temp flags from the base address.
- *
- * Parameters:
- *   aw         — 21-bit BCH-decoded address word
- *   is_group   — output: 1 if group address, 0 if individual
- *   is_temp    — output: 1 if temporary group, 0 otherwise
- *                (only meaningful when is_group=1)
- *
- * Returns the base address word for classification:
- *   - If G=0 (individual): returns aw unchanged (full 21 bits)
- *   - If G=1 (group): returns bits 0-18 (base address without flags)
- */
-static inline uint32_t flex_decode_addr_flags(uint32_t aw, int *is_group, int *is_temp)
-{
-	*is_group = (aw & FLEX_ADDR_GROUP_BIT) ? 1 : 0;
-	*is_temp = (aw & FLEX_ADDR_TEMP_BIT) ? 1 : 0;
-
-	if (*is_group)
-		return aw & FLEX_ADDR_BASE_MASK;
-	return aw;
-}
-
-/* ===== Address Word Type Classification ===== */
+ * Address type is determined by the 21-bit word value range
+ * per Table 3.8.1-1.  All 21 information bits (d₀–d₂₀) are
+ * address data for all address types (§3.8.2). */
 
 enum flex_addr_type {
 	FLEX_ADDR_LONG1,		/* Long Address 1 (pair word) */
@@ -1320,8 +1279,8 @@ static inline const char *flex_addr_type_name(enum flex_addr_type t)
 }
 
 /* Check if an address word is a long address component (needs a pair).
- * NOTE: For group addresses, pass the base word (after flex_decode_addr_flags)
- * since the group bit would push the value out of the LA ranges. */
+ * All 21 information bits (d₀–d₂₀) are address data per §3.8.2.2.
+ * Classify the raw word directly by range (Table 3.8.1-1). */
 static inline int flex_addr_is_long(uint32_t aw)
 {
 	enum flex_addr_type t = flex_classify_addr_word(aw);
@@ -1340,8 +1299,6 @@ static inline int flex_addr_is_long(uint32_t aw)
  *   'O' = Operator messaging  'I' = Info service
  *   'R' = Reserved short      '?' = Unknown
  *
- * Group modifier flags (appended after type):
- *   'G' = Group address       'g' = Temporary group address
  */
 #define FLEX_RX_FLAG_SHORT	'S'
 #define FLEX_RX_FLAG_LONG	'L'
@@ -1351,8 +1308,6 @@ static inline int flex_addr_is_long(uint32_t aw)
 #define FLEX_RX_FLAG_INFO_SVC	'I'
 #define FLEX_RX_FLAG_RESERVED	'R'
 #define FLEX_RX_FLAG_UNKNOWN	'?'
-#define FLEX_RX_FLAG_GROUP	'G'
-#define FLEX_RX_FLAG_TEMP_GROUP	'g'
 #define FLEX_RX_FLAG_PRIORITY	'P'	/* address is in priority section of AF */
 
 /* Get the single-character address type flag for RX logging.
@@ -1376,17 +1331,6 @@ static inline char flex_addr_type_flag(enum flex_addr_type t, int is_long)
 	if (is_long)
 		return FLEX_RX_FLAG_LONG;
 	return FLEX_RX_FLAG_UNKNOWN;
-}
-
-/* Get the group modifier flag character for RX logging.
- * Returns 'G' for group, 'g' for temporary group, ' ' for individual. */
-static inline char flex_group_flag_char(int is_group, int is_temp)
-{
-	if (is_group && is_temp)
-		return FLEX_RX_FLAG_TEMP_GROUP;
-	if (is_group)
-		return FLEX_RX_FLAG_GROUP;
-	return ' ';
 }
 
 /* Long address set name from w1/w2 types. */
@@ -2005,8 +1949,7 @@ typedef struct flex_frame_msg {
 	double		polarity;		/* -1.0 or +1.0 (default FLEX_DEFAULT_POLARITY) */
 	int		priority;		/* 1 = priority, 0 = normal */
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
-	int		is_group;		/* 0 = individual, 1 = group */
-	int		is_temp_group;		/* 0 = common group, 1 = temporary group */
+	int		is_temp_group;		/* 1 = deliver via Temporary Address (§5.2) */
 	int		temp_delivery_slot;	/* internal: temp addr delivery (0-15, -1=normal) */
 	int		sequence_num;		/* N field: message number (0-63), or -1 to
 					 * disable numbering (R=0, N not set).
@@ -2196,9 +2139,6 @@ int flex_detect_msg_type(const char *message, int length);
 
 /* Validate capcode (returns 1 if valid, 0 if invalid) */
 int flex_capcode_valid(uint64_t capcode);
-
-/* Group address encoding */
-uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary);
 
 /* Temporary address encoding (§3.8.2.3) */
 uint32_t flex_encode_temp_address(uint32_t temp_addr);

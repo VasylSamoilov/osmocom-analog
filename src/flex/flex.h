@@ -106,8 +106,7 @@ typedef struct flex_msg {
 	double			polarity;		/* +1.0 = normal, -1.0 = inverted */
 	int			priority;		/* 0 = normal, 1 = priority */
 	int			charset;		/* 0 = ASCII, 1 = KANJI */
-	int			is_group;		/* 0 = individual, 1 = group */
-	int			is_temp_group;		/* 0 = common group, 1 = temporary */
+	int			is_temp_group;		/* 1 = deliver via Temporary Address (§5.2) */
 	int			temp_delivery_slot;	/* internal: temp addr delivery slot (0-15)
 						 * set by flex_tempgroup_enqueue(), -1 = normal.
 						 * Frame builder uses FLEX_ADDR_TEMPORARY_MIN + slot

@@ -248,7 +248,6 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 		msg->polarity = flex->fixed_polarity;
 	msg->priority = 0;
 	msg->charset = 0;
-	msg->is_group = 0;
 	msg->is_temp_group = 0;
 	msg->temp_delivery_slot = -1;
 	msg->source_id[0] = '\0';
@@ -749,7 +748,6 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->polarity = msg->polarity;
 			frag->priority = msg->priority;
 			frag->charset = msg->charset;
-			frag->is_group = msg->is_group;
 			frag->is_temp_group = msg->is_temp_group;
 			frag->temp_delivery_slot = msg->temp_delivery_slot;
 			memcpy(frag->source_id, msg->source_id, sizeof(frag->source_id));
@@ -1246,15 +1244,17 @@ static int flex_phase_capacity(const flex_frame_params_t *params,
  * Returns total words needed, or -1 if the message is invalid.
  *
  * Address/vector overhead:
- *   Short address (capcode ≤ 2,097,151 or group): 1 addr + 1 vector word
- *   Long address  (capcode > 2,097,151, non-group): 2 addr + 2 vector words
+ *   Short address (capcode ≤ 1,933,312): 1 addr + 1 vector word
+ *   Long address  (capcode ≥ 2,101,249): 2 addr + 2 vector words
+ *   Temp address delivery: 1 addr + 1 vector word
  *   Tone-only: address words only (no vector, no body)
  *
  * For long addresses, body word count is reduced by 1 because body[0]
  * is absorbed into the second vector word (Vy). */
 static int flex_estimate_msg_cost(const flex_msg_t *msg)
 {
-	int is_long = (msg->capcode >= FLEX_LONG_ADDR_MIN && !msg->is_group);
+	int is_long = (msg->capcode >= FLEX_LONG_ADDR_MIN
+		       && msg->temp_delivery_slot < 0);
 	int aw = is_long ? 2 : 1;
 	int vw, bw;
 	size_t len;
@@ -2126,7 +2126,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 				int i;
 				for (i = 0; i < n_sorted; i++) {
 					flex_msg_t *m = sorted[i];
-					int is_long = (m->capcode >= FLEX_LONG_ADDR_MIN && !m->is_group);
+					int is_long = (m->capcode >= FLEX_LONG_ADDR_MIN
+						       && m->temp_delivery_slot < 0);
 					int cost = flex_estimate_msg_cost(m);
 					int aw, vw, bw;
 					int phase_idx;
@@ -2294,7 +2295,6 @@ static int flex_get_next_frame_network(flex_t *flex)
 					fm->polarity = m->polarity;
 					fm->priority = m->priority;
 					fm->charset = m->charset;
-					fm->is_group = m->is_group;
 					fm->is_temp_group = m->is_temp_group;
 					fm->temp_delivery_slot = m->temp_delivery_slot;
 					fm->source_id = m->source_id[0] ? m->source_id : NULL;
@@ -2644,7 +2644,6 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.polarity = polarity;
 			frame_msg.priority = msg->priority;
 			frame_msg.charset = msg->charset;
-			frame_msg.is_group = msg->is_group;
 			frame_msg.is_temp_group = msg->is_temp_group;
 			frame_msg.temp_delivery_slot = msg->temp_delivery_slot;
 			frame_msg.sequence_num = (msg->total_fragments > 1)

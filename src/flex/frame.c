@@ -1993,68 +1993,6 @@ int flex_fragment_message(const char *message, int msg_type,
 	return count;
 }
 
-/* ===== Group Address Encoding ===== */
-
-/*
- * Encode a group address word for common or temporary group addresses.
- *
- * Group addresses use the same short/long address encoding as individual
- * addresses, but with the group flag indicated by setting bit 20 (the MSB
- * of the 21-bit data word) to 1. For temporary group addresses, bit 19
- * is also set.
- *
- * Returns the encoded 32-bit BCH codeword, or 0 on invalid capcode.
- */
-uint32_t flex_encode_group_address(uint64_t group_capcode, int is_temporary)
-{
-	uint32_t dw;
-
-	/* Validate capcode range using the same rules as individual addresses */
-	if (!flex_capcode_valid(group_capcode))
-		return 0;
-
-	/*
-	 * Build the 21-bit data word from the capcode.
-	 * Short addresses: single word with offset.
-	 * Long addresses: use only the first word (w1) for the group address word.
-	 */
-	if (is_short_address(group_capcode)) {
-		dw = ((uint32_t)group_capcode + FLEX_SHORT_ADDR_OFFSET)
-			& FLEX_DATA_MASK;
-	} else if (is_long_address(group_capcode)) {
-		uint64_t result;
-		uint32_t w1;
-
-		if (group_capcode >= FLEX_LONG_SET12_MIN &&
-		    group_capcode <= FLEX_LONG_SET12_MAX) {
-			result = group_capcode - FLEX_LONG_OFFSET_A;
-			w1 = (result % FLEX_SHORT_ADDR_OFFSET) + 1;
-		} else if (group_capcode >= FLEX_LONG_SET34_MIN &&
-			   group_capcode <= FLEX_LONG_SET34_MAX) {
-			result = group_capcode - FLEX_LONG_OFFSET_A;
-			w1 = (result % FLEX_SHORT_ADDR_OFFSET) + 1;
-		} else if (group_capcode >= FLEX_LONG_SET23_MIN &&
-			   group_capcode <= FLEX_LONG_SET23_MAX) {
-			result = group_capcode - FLEX_LONG_OFFSET_B;
-			w1 = (result % FLEX_SHORT_ADDR_OFFSET) + FLEX_LONG_W1_SET23;
-		} else {
-			return 0;
-		}
-		dw = w1 & FLEX_DATA_MASK;
-	} else {
-		return 0;
-	}
-
-	/* Set bit 20 (group flag) — MSB of the 21-bit data word */
-	dw |= (1U << 20);
-
-	/* Set bit 19 (temporary group flag) if requested */
-	if (is_temporary)
-		dw |= (1U << 19);
-
-	return flex_encode_word(reverse_bits32(dw));
-}
-
 /* ===== Temporary Address Assignment ===== */
 
 /*
@@ -3202,20 +3140,6 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				 * (FLEX_ADDR_TEMPORARY_MIN + slot) per §3.8.2.3 */
 				info[i].addr_words = 1;
 				info[i].is_long = 0;
-			} else if (msgs[i].is_group) {
-				if (!flex_capcode_valid(msgs[i].capcode)) {
-					LOGP(DFLEX, LOGL_ERROR,
-					     "TX: rejecting invalid group capcode %" PRIu64 "\n",
-					     msgs[i].capcode);
-					info[i].packed = 0;
-					info[i].addr_words = 0;
-					info[i].vector_words = 0;
-					info[i].msg_words = 0;
-					info[i].is_long = 0;
-					continue;
-				}
-				info[i].addr_words = 1; /* group = 1 address word */
-				info[i].is_long = 0;
 			} else {
 				if (!is_capcode_valid(msgs[i].capcode, &is_long_addr)) {
 					LOGP(DFLEX, LOGL_ERROR,
@@ -3691,16 +3615,6 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			LOGP(DFLEX, LOGL_DEBUG,
 			     "TX: AF[%u] Temporary addr slot=%d aw=0x%05X\n",
 			     fwc - 1, msgs[idx].temp_delivery_slot, ta);
-		} else if (msgs[idx].is_group) {
-			uint32_t gdw = ((uint32_t)msgs[idx].capcode + FLEX_SHORT_ADDR_OFFSET)
-				& FLEX_DATA_MASK;
-			frame_words[fwc++] = flex_encode_group_address(
-				msgs[idx].capcode, msgs[idx].is_temp_group);
-			LOGP(DFLEX, LOGL_DEBUG,
-			     "TX: AF[%u] %sgroup addr cap=%" PRIu64 " aw=0x%05X\n",
-			     fwc - 1,
-			     msgs[idx].is_temp_group ? "temp " : "",
-			     msgs[idx].capcode, gdw);
 		} else if (info[idx].is_long) {
 			uint32_t aw[2] = {0, 0};
 			encode_long_address(msgs[idx].capcode, aw);

@@ -283,7 +283,7 @@ void print_help(const char *arg0)
 	printf("        Options: space-separated key=value pairs:\n");
 	printf("          speed=1600|3200|3200-4fsk|6400  polarity=normal|inverted\n");
 	printf("          priority=0|1  charset=ascii|kanji\n");
-	printf("          group=0|1  tempgroup=0|1  source=<id>\n");
+	printf("          tempgroup=0|1  source=<id>\n");
 	printf("          phase=A|B|C|D|auto\n");
 	printf("          blocking=0-16  (hex bits/char: 0 or 16=16bit, 1=raw, default 1)\n");
 	printf("          maildrop=0|1  (alpha/hex: separate handling from ordinary msgs)\n");
@@ -342,8 +342,8 @@ void print_help(const char *arg0)
 	printf("          1234567,special,,31415926\n");
 	printf("          1234567,nnumeric,msgnum=7,31415926\n");
 	printf("          1234567,nspecial,,31415926\n");
-	printf("          group:1234567,alpha,group=1,Group message\n");
-	printf("          group:1234567,alpha,group=1 tempgroup=1,Temp group msg\n");
+	printf("          1234567,alpha,,Hello World\n");
+	printf("          1234567,alpha,tempgroup=1,Temp group msg\n");
 	printf("          tempgroup:1234567 2345678 3456789,alpha,,Hello everyone\n");
 	printf("          3E007005031,alpha,,Extended CAPCODE (Long, Any Phase, collapse=3)\n");
 	printf("          A1234567,numeric,,Standard rule Short CAPCODE\n");
@@ -741,7 +741,7 @@ static int handle_options(int short_option, int argi, char **argv)
 static void parse_fifo_options(const char *opts, int opts_len,
 			       int *speed, int *modulation_type,
 			       double *polarity_out, int *priority,
-			       int *charset, int *is_group, int *is_temp_group,
+			       int *charset, int *is_temp_group,
 			       char *source_id, int *phase, int *blocking_length,
 			       int *mail_drop,
 			       int *secure_encoding, int *secure_subtype,
@@ -763,7 +763,6 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*polarity_out = FLEX_DEFAULT_POLARITY;
 	*priority = 0;
 	*charset = 0;
-	/* is_group already set from group: prefix */
 	*is_temp_group = 0;
 	source_id[0] = '\0';
 	*phase = -1;
@@ -851,8 +850,6 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			else
 				*charset = 0;
 		}
-		else if (!strcmp(key, "group"))
-			*is_group = atoi(val);
 		else if (!strcmp(key, "tempgroup"))
 			*is_temp_group = atoi(val);
 		else if (!strcmp(key, "source")) {
@@ -1378,9 +1375,9 @@ static void log_capcode_parsed(const capcode_parsed_t *cp, const char *raw_str)
 	     flex_capcode_type_name(cp->capcode));
 }
 
-/* Build a human-readable flags string like "[GRP MAILDROP RETX]".
+/* Build a human-readable flags string like "[TGRP MAILDROP RETX]".
  * Returns pointer to static buffer. */
-static const char *flex_flags_str(int is_group, int is_temp_group,
+static const char *flex_flags_str(int is_temp_group,
 				  int mail_drop, int secure_encoding,
 				  int retransmit)
 {
@@ -1388,7 +1385,6 @@ static const char *flex_flags_str(int is_group, int is_temp_group,
 	int pos = 0;
 
 	buf[pos++] = '[';
-	if (is_group)        pos += sprintf(buf + pos, "GRP ");
 	if (is_temp_group)   pos += sprintf(buf + pos, "TGRP ");
 	if (mail_drop)       pos += sprintf(buf + pos, "MAILDROP ");
 	if (secure_encoding) pos += sprintf(buf + pos, "SECBIN ");
@@ -1488,7 +1484,6 @@ static void fifo_process_line(const char *text, int text_length)
 	enum flex_msg_type mtype;
 	int message_length = 0;
 	int j;
-	int is_group = 0;
 	int is_temp_group = 0;
 	int comma_count = 0;
 	int comma1 = -1, comma2 = -1, comma3 = -1;
@@ -1925,7 +1920,7 @@ static void fifo_process_line(const char *text, int text_length)
 
 		/* Extract and parse options (speed, polarity, phase, priority) */
 		{
-			int dummy_charset, dummy_group, dummy_tg;
+			int dummy_charset, dummy_tg;
 			char dummy_src[64];
 			int dummy_bl, dummy_md, dummy_se, dummy_ss, dummy_nm;
 			int dummy_cs, dummy_rt, dummy_ri, dummy_sd;
@@ -1934,7 +1929,7 @@ static void fifo_process_line(const char *text, int text_length)
 			parse_fifo_options(text + comma2 + 1, comma3 - comma2 - 1,
 					   &tg_speed, &tg_mod,
 					   &tg_pol, &tg_prio,
-					   &dummy_charset, &dummy_group, &dummy_tg,
+					   &dummy_charset, &dummy_tg,
 					   dummy_src, &tg_phase, &dummy_bl,
 					   &dummy_md,
 					   &dummy_se, &dummy_ss,
@@ -1966,12 +1961,6 @@ static void fifo_process_line(const char *text, int text_length)
 		return;
 	}
 
-	/* Handle group:capcode prefix */
-	if (strncmp(capcode_string, "group:", 6) == 0) {
-		is_group = 1;
-		memmove(capcode_string, capcode_string + 6, strlen(capcode_string + 6) + 1);
-	}
-
 	/* Extract type field (between first and second comma) */
 	{
 		int tlen = comma2 - comma1 - 1;
@@ -1992,7 +1981,7 @@ static void fifo_process_line(const char *text, int text_length)
 	parse_fifo_options(opts_start, opts_len,
 			   &msg_speed, &msg_mod_type,
 			   &msg_polarity, &msg_priority,
-			   &msg_charset, &is_group, &is_temp_group,
+			   &msg_charset, &is_temp_group,
 			   msg_source, &msg_phase, &msg_blocking_length,
 			   &msg_mail_drop,
 			   &msg_secure_encoding, &msg_secure_subtype,
@@ -2188,7 +2177,6 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->polarity = msg_polarity;
 				msg->priority = msg_priority;
 				msg->charset = msg_charset;
-				msg->is_group = is_group;
 				msg->is_temp_group = is_temp_group;
 				msg->phase = msg_phase;
 				msg->blocking_length = msg_blocking_length;
@@ -2231,7 +2219,7 @@ static void fifo_process_line(const char *text, int text_length)
 					msg->retransmit_max = 0;
 				}
 				LOGP(DFLEX, LOGL_INFO,
-				     "FIFO: enqueued capcode=%" PRIu64 " addr=%s type=%s speed=%d/%s polarity=%s priority=%d charset=%s group=%d tempgroup=%d phase=%s len=%d flags=%s\n",
+				     "FIFO: enqueued capcode=%" PRIu64 " addr=%s type=%s speed=%d/%s polarity=%s priority=%d charset=%s tempgroup=%d phase=%s len=%d flags=%s\n",
 				     capcode,
 				     flex_capcode_type_name(capcode),
 				     flex_msg_type_name(mtype),
@@ -2240,11 +2228,10 @@ static void fifo_process_line(const char *text, int text_length)
 				     (msg_polarity < 0) ? "inverted" : "normal",
 				     msg_priority,
 				     msg_charset ? "kanji" : "ascii",
-				     is_group,
 				     is_temp_group,
 				     flex_phase_name(msg_phase),
 				     message_length,
-				     flex_flags_str(is_group, is_temp_group,
+				     flex_flags_str(is_temp_group,
 						   msg_mail_drop, msg_secure_encoding,
 						   msg_retransmit));
 			flex_log_payload(mtype, msg_buf, message_length);
