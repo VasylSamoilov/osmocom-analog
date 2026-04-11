@@ -47,6 +47,7 @@ static int tx = 0;
 static double deviation = 4800;
 static double polarity = FLEX_DEFAULT_POLARITY;
 static enum flex_msg_type msg_type = FLEX_MSG_TYPE_AUTO;
+static int msg_type_given = 0;
 static const char *message = "1234";
 static uint64_t scan_from = 0;
 static uint64_t scan_to = 0;
@@ -149,7 +150,10 @@ void print_help(const char *arg0)
 	printf(" -M --message \"...\"\n");
 	printf("        Default message text. (default \"%s\").\n", message);
 	printf(" -S --scan <from> <to>\n");
-	printf("        Scan through given capcode range.\n");
+	printf("        Scan through given capcode range. Default type is 'short' (short\n");
+	printf("        numeric message in vector word only — no body overhead). Short\n");
+	printf("        addresses carry 3 BCD digits, long addresses carry 6 digits.\n");
+	printf("        Use -y to override: numeric, alpha, tone, short.\n");
 	printf("    --network\n");
 	printf("        Enable network mode (continuous operation).\n");
 	printf("    --collapse <0-7>\n");
@@ -461,6 +465,7 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Given type is invalid. Use auto/tone/numeric/alpha/hex/instruction/short/secure/special/nnumeric/nspecial.\n");
 			return -EINVAL;
 		}
+		msg_type_given = 1;
 		break;
 	case 'M':
 		message = options_strdup(argv[argi]);
@@ -2382,6 +2387,14 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "You need to enable TX, in order to scan.\n");
 		goto fail;
 	}
+
+	/* scan mode: default to short numeric if user didn't specify -y */
+	if (scan_to > scan_from && !msg_type_given)
+		msg_type = FLEX_MSG_TYPE_SHORT;
+
+	/* scan mode: imply --network for continuous operation */
+	if (scan_to > scan_from)
+		network_mode = 1;
 
 	/* STD-43A option validation */
 	if (collapse > 0 && !network_mode) {

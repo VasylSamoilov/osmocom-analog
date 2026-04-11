@@ -127,7 +127,7 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
  * Fragment interval values per ARIB STD-43A §4.2 ④. */
 
 /* Upper bound on candidate messages collected per frame or phase */
-#define FLEX_MAX_CANDIDATES		64
+#define FLEX_MAX_CANDIDATES		256
 
 /* Max tracked in-flight fragment streams (§4.2 ①②) */
 #define FLEX_MAX_INFLIGHT		32

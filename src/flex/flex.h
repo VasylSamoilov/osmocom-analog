@@ -193,7 +193,7 @@ typedef struct flex_msg {
 #define FLEX_N_COUNTER_BUCKETS	4096
 
 /* Message queue depth limit per polarity */
-#define FLEX_MSG_QUEUE_MAX	4096
+#define FLEX_MSG_QUEUE_MAX	32768
 
 /* BIW carousel: tracks last-transmitted frame per BIW type per phase.
  * Used for least-recently-transmitted rotation. */
@@ -288,6 +288,9 @@ typedef struct flex {
 
 	/* scan/loopback */
 	uint64_t		scan_from, scan_to;
+	uint64_t		scan_start;		/* initial scan_from for progress */
+	double			scan_start_time;	/* wall clock at scan start */
+	uint64_t		scan_last_progress;	/* last capcode when progress was printed */
 
 	/* message queue (singly-linked list) */
 	flex_msg_t		*msg_list;
