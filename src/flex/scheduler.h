@@ -99,4 +99,21 @@ uint32_t flex_scheduler_repeat_unit(int num_transmissions, int collapse, int td_
 int flex_scheduler_subframe_index(uint32_t frame, int num_transmissions,
 				  int collapse, int td_collapse);
 
+/* Request a parameter change (collapse, num_transmissions, td_collapse).
+ * Defers the change until the current repeat unit completes, then sends
+ * idle frames for one repeat unit at the old params before applying.
+ * Returns 1 if deferred, 0 if applied immediately. */
+int flex_scheduler_request_param_change(struct flex *flex,
+					int new_collapse,
+					int new_num_transmissions,
+					int new_td_collapse,
+					uint32_t current_abs_frame);
+
+/* Advance the parameter change state machine.
+ * Called each frame during network mode.
+ * Sets *force_idle = 1 during cooldown to suppress message packing. */
+void flex_scheduler_param_change_tick(struct flex *flex,
+				      uint32_t current_abs_frame,
+				      int *force_idle);
+
 #endif /* FLEX_SCHEDULER_H */

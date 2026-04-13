@@ -392,11 +392,6 @@ static inline const char *flex_smsg_type_name(uint32_t t)
 #define FLEX_BIW1_COLLAPSE_SHIFT 18
 #define FLEX_BIW1_COLLAPSE_MASK	0x07
 
-/* BIW1 idle detection: when BIW word 0 is all-zeros
- * or all-ones in the 21-bit data field, the frame contains no
- * addresses, vectors, or messages — skip decode. */
-#define FLEX_BIW_IDLE_ZEROS	0x00000000U
-#define FLEX_BIW_IDLE_ONES	0x001FFFFFU
 
 /* ===== BIW2/3/4 Type Field =====
  *
@@ -2023,6 +2018,11 @@ typedef struct flex_frame_params {
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
 	int		single_phase;		/* 1 = force single-phase output (for
 						 * network mode per-phase encoding) */
+	int		phase_index;		/* phase index for idle fill pattern:
+						 * 0=A, 1=B(6400)/C(3200), 2=C(6400), 3=D(6400).
+						 * Controls idle block default per §3.4.1:
+						 * MSB phases use alternating 1s/0s,
+						 * LSB phases (4FSK) use all-zeros. */
 
 	/* Multiple transmission (subframe repeat).
 	 *

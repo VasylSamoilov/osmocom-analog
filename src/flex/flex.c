@@ -1625,7 +1625,6 @@ static int flex_get_next_frame_network(flex_t *flex)
 {
 	flex_frame_time_t ft;
 	flex_frame_params_t params;
-	flex_frame_msg_t frame_msg;
 	flex_msg_t *msg;
 	int msgs_packed = 0;
 	int error = 0;
@@ -1793,6 +1792,17 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.chan_setup_enabled = flex->chan_setup_enabled;
 	params.hack_nonstandard_decoders = flex->hack_nonstandard_decoders;
 	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
+
+	/* Parameter change guard (§3.4.2).
+	 * Tick the state machine and check if we're in cooldown
+	 * (force_idle = suppress message packing, send idle frames). */
+	{
+		uint32_t abs_frame = ft.cycle * 128 + ft.frame;
+		int force_idle = 0;
+		flex_scheduler_param_change_tick(flex, abs_frame, &force_idle);
+		if (force_idle)
+			goto send_idle;
+	}
 
 	/* Multiple transmission params (Spec Section 3.4.2) */
 	params.num_transmissions = flex->num_transmissions;
@@ -2271,6 +2281,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				phase_params.coverage_id = (p == ssid_p) ? params.coverage_id : 0;
 				phase_params.country_code = (p == ssid_p) ? params.country_code : 0;
 				phase_params.tmf = (p == ssid_p) ? params.tmf : 0;
+				phase_params.phase_index = p;
 			}
 
 			/* Build flex_frame_msg_t array for this phase.
@@ -2495,17 +2506,16 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 
 send_idle:
-	/* No messages — send idle frame */
-	memset(&frame_msg, 0, sizeof(frame_msg));
-	frame_msg.capcode = 1;
-	frame_msg.msg_type = FLEX_FRAME_MSG_TYPE_TONE;
-	frame_msg.message = "";
-	frame_msg.message_length = 0;
-	frame_msg.temp_delivery_slot = -1;
-	frame_msg.speed = 1600;
-	frame_msg.polarity = FLEX_DEFAULT_POLARITY;
-
-	flex_setup_frame_buffers(flex, &params, &frame_msg, 1,
+	/* No messages — send proper idle frame per §3.4.1 Fig. 3.4.1-3.
+	 *
+	 * Pass msg_count=0 to flex_encode_frame_multi so it produces a
+	 * BIW-only frame: BIW1 with voffset==aoffset (no addresses,
+	 * vectors, or messages), remaining words filled with idle pattern
+	 * (alternating all-1s / all-0s codewords per Table 3.4.1-1).
+	 *
+	 * The collapse value in BIW1 is preserved from params so pagers
+	 * can maintain their decode schedule even during idle periods. */
+	flex_setup_frame_buffers(flex, &params, NULL, 0,
 				&msgs_packed, &error);
 
 	if (error || flex->frame_buffer_length == 0) {

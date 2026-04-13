@@ -13,21 +13,30 @@
 #define FLEX_POL_INVERTED	1
 #define FLEX_RX_MAX_SUBFRAMES	4	/* max num_transmissions */
 
-/* Per-subframe storage for one phase */
+/* Per-subframe storage for one copy of a repeated transmission.
+ * Stores only the subframe-local words (sf_words), not the full 88. */
 typedef struct flex_rx_subframe {
-	uint32_t		words[FLEX_WORDS_PER_FRAME];	/* 88 decoded words */
-	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];	/* 88 BCH statuses */
-	int			received;			/* 1 = this subframe has data */
+	uint32_t		words[FLEX_WORDS_PER_FRAME];	/* sf_words decoded words (max 44 for 2x) */
+	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];	/* sf_words BCH statuses */
+	int			word_count;			/* actual subframe word count */
+	int			received;			/* 1 = this copy has data */
+	int			copy_index;			/* which transmission (0=1st, 1=2nd, ...) */
+	int			clean;				/* 1 = all words CLEAN or CORRECTED */
+	int			uncorrectable_count;		/* number of UNCORRECTABLE words */
 } flex_rx_subframe_t;
 
-/* Subframe store for one phase's worth of repeated transmissions */
+/* Subframe store for one phase's worth of repeated transmissions.
+ * Accumulates N copies of the same subframe content across frames,
+ * combines best-of per word, and releases when complete or timed out. */
 typedef struct flex_rx_subframe_store {
 	flex_rx_subframe_t	subframes[FLEX_RX_MAX_SUBFRAMES];
 	int			num_expected;		/* fiw_num_transmissions (2/3/4) */
-	int			num_received;		/* count of received subframes */
+	int			num_received;		/* count of received copies */
+	int			sf_words;		/* words per subframe (44/29/22) */
+	int			decoded;		/* 1 = already decoded (early release) */
 	uint32_t		base_frame;		/* frame number of first subframe */
 	uint32_t		base_cycle;		/* cycle of first subframe */
-	uint32_t		timeout_frame;		/* absolute frame for 2×repeat_interval timeout */
+	uint32_t		timeout_frame;		/* absolute frame for timeout */
 	int			active;			/* 1 = accumulating subframes */
 } flex_rx_subframe_store_t;
 
@@ -368,6 +377,64 @@ typedef struct flex {
 	int			num_transmissions;	/* 1 (default), 2, 3, or 4 */
 	int			td_collapse;		/* -1=use system collapse (default),
 						 * 5, 6, or 7 = TD Collapse override */
+
+	/* Per-slot repeat state for multi-transmission scheduling (§3.4.2).
+	 *
+	 * The 88-word frame has N subframe slots (N = num_transmissions).
+	 * Each slot carries independent content.  The same content in a
+	 * slot is retransmitted N times across N frames in the repeat unit.
+	 * Slot position = copy number for that content group.
+	 *
+	 * Scheduling flow per frame:
+	 *   1. For each slot: if slot_copy > 0 and < num_transmissions,
+	 *      re-emit cached content (next copy).  Increment slot_copy.
+	 *   2. For free slots (slot_copy == 0 or == num_transmissions):
+	 *      pick messages from queue, encode into subframe, cache.
+	 *      Set slot_copy = 1.
+	 *   3. If no messages for a free slot: emit idle BIW.
+	 *   4. If all slots idle and queue empty: can switch to non-repeat.
+	 *   5. Assemble N subframes into 88-word frame at their offsets.
+	 *
+	 * slot_copy[i]:
+	 *   0 = free (no content, emit idle)
+	 *   1..N = copy number transmitted so far
+	 *   When slot_copy reaches num_transmissions, slot becomes free.
+	 *
+	 * slot_content[i]: cached encoded subframe words (sf_words long).
+	 *   Stored after first encoding so copies 2..N are identical
+	 *   ("the same bit stream" per spec). */
+	int			slot_copy[FLEX_RX_MAX_SUBFRAMES];
+	uint32_t		slot_content[FLEX_RX_MAX_SUBFRAMES][FLEX_WORDS_PER_FRAME];
+	int			slot_content_words[FLEX_RX_MAX_SUBFRAMES];
+
+	/* Parameter change guard (§3.4.2).
+	 *
+	 * "If the system has paging information being transmitted when
+	 * changing the collapse cycle, transmission speed, modulation
+	 * scheme or the number of repeated transmissions, the base
+	 * station waits until transmission of the multiple transmission
+	 * units for the paging information is completed, then changes
+	 * these parameters.  Once the parameters are changed, Frames
+	 * without paging information are transmitted for the duration
+	 * of one repeat unit at the value before the change."
+	 *
+	 * States:
+	 *   0 = normal (no pending change)
+	 *   1 = draining: waiting for current repeat unit to complete
+	 *   2 = cooldown: sending idle frames at old params for one repeat unit
+	 */
+	int			param_change_state;
+	uint32_t		param_change_deadline;	/* absolute frame when current state ends */
+	/* Snapshot of old parameters during change transition */
+	int			old_collapse;
+	int			old_num_transmissions;
+	int			old_td_collapse;
+	int			old_bitrate;
+	int			old_mod_type;
+	/* Pending new parameters (applied after cooldown) */
+	int			pending_collapse;
+	int			pending_num_transmissions;
+	int			pending_td_collapse;
 
 	/* per-message defaults (CLI -M message and FIFO fallback) */
 	int			default_speed;		/* 1600, 3200, 6400 — default 1600 */

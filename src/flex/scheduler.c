@@ -378,3 +378,131 @@ int flex_scheduler_subframe_index(uint32_t frame, int num_transmissions,
 	interval = flex_scheduler_repeat_interval(collapse, td_collapse);
 	return (int)((frame / interval) % (uint32_t)num_transmissions);
 }
+
+/* Request a parameter change (collapse, num_transmissions, td_collapse).
+ *
+ * Per §3.4.2: "the base station waits until transmission of the multiple
+ * transmission units for the paging information is completed, then changes
+ * these parameters.  Once the parameters are changed, Frames without paging
+ * information are transmitted for the duration of one repeat unit at the
+ * value before the change."
+ *
+ * If num_transmissions <= 1 (no repeat), the change is applied immediately.
+ * Otherwise, the scheduler enters a two-phase transition:
+ *   1. DRAIN: finish the current repeat unit (send remaining copies)
+ *   2. COOLDOWN: send idle frames for one repeat unit at old params
+ *   3. Apply new params
+ *
+ * Returns 1 if the change was deferred (transition started),
+ *         0 if applied immediately. */
+int flex_scheduler_request_param_change(struct flex *flex,
+					int new_collapse,
+					int new_num_transmissions,
+					int new_td_collapse,
+					uint32_t current_abs_frame)
+{
+	/* No transition needed if not currently using multiple transmission */
+	if (flex->num_transmissions <= 1) {
+		flex->collapse = new_collapse;
+		flex->num_transmissions = new_num_transmissions;
+		flex->td_collapse = new_td_collapse;
+		return 0;
+	}
+
+	/* No change — nothing to do */
+	if (new_collapse == flex->collapse &&
+	    new_num_transmissions == flex->num_transmissions &&
+	    new_td_collapse == flex->td_collapse)
+		return 0;
+
+	/* Already in a transition — update pending values */
+	if (flex->param_change_state > 0) {
+		flex->pending_collapse = new_collapse;
+		flex->pending_num_transmissions = new_num_transmissions;
+		flex->pending_td_collapse = new_td_collapse;
+		return 1;
+	}
+
+	/* Snapshot old params */
+	flex->old_collapse = flex->collapse;
+	flex->old_num_transmissions = flex->num_transmissions;
+	flex->old_td_collapse = flex->td_collapse;
+	flex->old_bitrate = flex->current_frame_speed;
+	flex->old_mod_type = flex->current_frame_mod_type;
+
+	/* Store pending new params */
+	flex->pending_collapse = new_collapse;
+	flex->pending_num_transmissions = new_num_transmissions;
+	flex->pending_td_collapse = new_td_collapse;
+
+	/* Compute drain deadline: end of current repeat unit.
+	 * repeat_unit = num_transmissions × 2^collapse frames.
+	 * We need to finish the current repeat unit boundary. */
+	{
+		uint32_t ru = flex_scheduler_repeat_unit(
+			flex->num_transmissions, flex->collapse, flex->td_collapse);
+		uint32_t next_boundary = ((current_abs_frame / ru) + 1) * ru;
+		flex->param_change_deadline = next_boundary % 1920;
+	}
+
+	flex->param_change_state = 1; /* DRAIN */
+	LOGP(DFLEX, LOGL_INFO,
+	     "SCHED: Parameter change requested, draining until frame %u.\n",
+	     flex->param_change_deadline);
+
+	return 1;
+}
+
+/* Called each frame during network mode to advance the parameter change
+ * state machine.  Returns the effective parameters to use for this frame.
+ *
+ * During DRAIN: use old params, allow messages.
+ * During COOLDOWN: use old params, force idle (no messages).
+ * After COOLDOWN: apply new params, return to normal.
+ *
+ * Sets *force_idle = 1 during cooldown to suppress message packing. */
+void flex_scheduler_param_change_tick(struct flex *flex,
+				      uint32_t current_abs_frame,
+				      int *force_idle)
+{
+	*force_idle = 0;
+
+	if (flex->param_change_state == 0)
+		return;
+
+	{
+		int32_t diff = (int32_t)current_abs_frame - (int32_t)flex->param_change_deadline;
+		int past_deadline = (diff >= 0) && (diff < 960);
+
+		if (flex->param_change_state == 1 && past_deadline) {
+			/* DRAIN complete → enter COOLDOWN.
+			 * Send idle frames for one repeat unit at old params. */
+			uint32_t ru = flex_scheduler_repeat_unit(
+				flex->old_num_transmissions,
+				flex->old_collapse, flex->old_td_collapse);
+			flex->param_change_deadline = (current_abs_frame + ru) % 1920;
+			flex->param_change_state = 2;
+			LOGP(DFLEX, LOGL_INFO,
+			     "SCHED: Drain complete, cooldown until frame %u.\n",
+			     flex->param_change_deadline);
+		}
+
+		if (flex->param_change_state == 2) {
+			*force_idle = 1;
+
+			diff = (int32_t)current_abs_frame - (int32_t)flex->param_change_deadline;
+			past_deadline = (diff >= 0) && (diff < 960);
+
+			if (past_deadline) {
+				/* COOLDOWN complete → apply new params */
+				flex->collapse = flex->pending_collapse;
+				flex->num_transmissions = flex->pending_num_transmissions;
+				flex->td_collapse = flex->pending_td_collapse;
+				flex->param_change_state = 0;
+				LOGP(DFLEX, LOGL_INFO,
+				     "SCHED: Cooldown complete, new params applied: collapse=%d num_tx=%d td_collapse=%d.\n",
+				     flex->collapse, flex->num_transmissions, flex->td_collapse);
+			}
+		}
+	}
+}

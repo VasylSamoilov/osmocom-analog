@@ -3025,10 +3025,19 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			       uint8_t *buffer, size_t buffer_size,
 			       int *msgs_packed, int *error)
 {
-	uint32_t frame_words[FLEX_WORDS_PER_FRAME] = {0};
+	uint32_t frame_words[FLEX_WORDS_PER_FRAME];
 	uint8_t *out;
 	uint32_t fwc, i;
 	int err_local = 0;
+
+	/* Pre-fill frame with idle pattern per §3.4.1 Table 3.4.1-1:
+	 * "Necessary information is written over the default for a block,
+	 * while Idle blocks are maintained as they are."
+	 * Pattern depends on phase and modulation — MSB phases use
+	 * alternating all-1s/all-0s, LSB phases (4FSK) use all-zeros
+	 * to produce the same 1600bps binary waveform on the channel. */
+	flex_fill_idle_phase(frame_words, params->phase_index,
+			     params->modulation_type, params->bitrate);
 
 	/* Per-message bookkeeping for the packing pass */
 	struct msg_info {
@@ -4010,14 +4019,51 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		fwc = msg_fwc;
 	}
 
-	/* ---- Fill remaining words with idle pattern ----
-	 * Unused word slots after message data get alternating 1s/0s.
-	 * If no messages were packed, this fills everything after BIW,
-	 * producing a minimal frame (block 0 = BI + IB only). */
+	/* ---- Idle fill is already in place from pre-fill ----
+	 * The frame was pre-filled with idle pattern at initialization.
+	 * Data words were written over the default starting from word 0.
+	 * Words beyond fwc retain their idle pattern unchanged, per §3.4.1:
+	 * "Idle blocks are maintained as they are." */
 
-	for (; fwc < FLEX_WORDS_PER_FRAME; fwc++)
-		frame_words[fwc] = (fwc % 2 == 0) ? FLEX_IDLE_WORD_1
-						   : FLEX_IDLE_WORD_2;
+	/* ---- Subframe placement for multiple transmission (§3.4.2) ----
+	 *
+	 * Slot position = copy number.  The encoder builds content into
+	 * words 0..sf_words-1, then moves it to the target slot offset.
+	 * Idle slots retain the pre-fill pattern.
+	 *
+	 * The caller (scheduler) is responsible for calling this function
+	 * once per active slot with the correct messages and subframe_index.
+	 * The results are assembled into the 88-word frame by the caller.
+	 *
+	 * Currently the scheduler populates one slot per frame.  To fill
+	 * multiple slots, the caller should:
+	 *   1. For each slot with content: call flex_encode_frame_multi
+	 *      with subframe_index = slot number
+	 *   2. For idle slots: leave the pre-fill pattern
+	 *   3. If no candidates for any slot: all slots idle, prepare
+	 *      to switch to non-repeat mode
+	 *
+	 * For 3x, the extra word (position 87) retains the idle pre-fill
+	 * value per spec. */
+	if (params->num_transmissions > 1 && params->subframe_index > 0) {
+		int sf_words = flex_subframe_words(params->num_transmissions);
+		int dst_offset = params->subframe_index * sf_words;
+		int w;
+
+		/* Copy content from position 0 to the target subframe offset */
+		for (w = sf_words - 1; w >= 0 && (dst_offset + w) < FLEX_WORDS_PER_FRAME; w--)
+			frame_words[dst_offset + w] = frame_words[w];
+
+		/* Restore idle pattern at position 0 (was overwritten by content).
+		 * Use the same phase-aware pattern as the pre-fill. */
+		{
+			uint32_t idle_words[FLEX_WORDS_PER_FRAME];
+			flex_fill_idle_phase(idle_words, params->phase_index,
+					     params->modulation_type, params->bitrate);
+			for (w = 0; w < sf_words && w < dst_offset; w++)
+				frame_words[w] = idle_words[w];
+		}
+	}
 
 	/* ---- Block-boundary fixup for decoder compatibility ----
 	 *
@@ -4567,6 +4613,7 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 			else if (num_phases == 2)
 				target_phase = (msgs[0].phase >= 2) ? 1 : 0;
 		}
+		phase_params.phase_index = target_phase;
 
 		/* Encode the actual message(s) into a temp buffer */
 		full_len = flex_encode_frame_multi(msgs, msg_count, &phase_params,

@@ -1573,21 +1573,32 @@ static void msg_history_expire(flex_t *flex, uint32_t current_frame_abs)
  *   CLEAN > CORRECTED > UNCORRECTABLE
  * For CORRECTED ties, prefer the subframe with fewer total UNCORRECTABLE words.
  * Writes the combined result into 'combined' and resets the store. */
-static void flex_rx_subframe_combine(flex_t *flex,
-				     flex_rx_subframe_store_t *store,
-				     flex_phase_data_t *combined,
-				     char phase_name)
+/* Combine all received copies of a subframe using forward/backward
+ * error correction.  For each word position, pick the best BCH result
+ * across all copies.  The goal is to reconstruct a perfect subframe
+ * from multiple imperfect copies received in a high-error environment.
+ *
+ * Priority: CLEAN > CORRECTED > UNCORRECTABLE.
+ * Among CORRECTED copies, prefer the one from the copy with fewer
+ * total uncorrectable words (better overall signal quality).
+ *
+ * Returns the number of remaining UNCORRECTABLE words (0 = perfect). */
+static int flex_rx_subframe_combine(flex_t *flex,
+				    flex_rx_subframe_store_t *store,
+				    flex_phase_data_t *combined,
+				    char phase_name)
 {
 	int i, sf;
+	int sf_words = store->sf_words;
+	int remaining_uc = 0;
 
 	(void)flex;
 
-	/* For each word position, select the best across all received subframes */
-	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
+	for (i = 0; i < sf_words; i++) {
 		enum flex_word_status best_status = FLEX_WORD_UNCORRECTABLE;
 		uint32_t best_word = 0;
 		int best_sf = -1;
-		int best_sf_uncorrectable_count = FLEX_WORDS_PER_FRAME;
+		int best_uc_count = sf_words + 1;
 
 		for (sf = 0; sf < store->num_expected; sf++) {
 			if (!store->subframes[sf].received)
@@ -1596,73 +1607,54 @@ static void flex_rx_subframe_combine(flex_t *flex,
 			enum flex_word_status s = store->subframes[sf].status[i];
 
 			if (s == FLEX_WORD_CLEAN) {
-				/* CLEAN always wins */
 				best_status = s;
 				best_word = store->subframes[sf].words[i];
 				best_sf = sf;
-				break;
+				break; /* can't do better */
 			}
 			if (s == FLEX_WORD_CORRECTED) {
-				if (best_status != FLEX_WORD_CORRECTED) {
-					/* First CORRECTED beats UNCORRECTABLE */
+				if (best_status != FLEX_WORD_CORRECTED ||
+				    store->subframes[sf].uncorrectable_count < best_uc_count) {
 					best_status = s;
 					best_word = store->subframes[sf].words[i];
 					best_sf = sf;
-					/* Count uncorrectable words in this subframe for tiebreak */
-					int uc = 0;
-					for (int k = 0; k < FLEX_WORDS_PER_FRAME; k++)
-						if (store->subframes[sf].status[k] == FLEX_WORD_UNCORRECTABLE)
-							uc++;
-					best_sf_uncorrectable_count = uc;
-				} else {
-					/* Tiebreak: prefer subframe with fewer total UNCORRECTABLE */
-					int uc = 0;
-					for (int k = 0; k < FLEX_WORDS_PER_FRAME; k++)
-						if (store->subframes[sf].status[k] == FLEX_WORD_UNCORRECTABLE)
-							uc++;
-					if (uc < best_sf_uncorrectable_count) {
-						best_word = store->subframes[sf].words[i];
-						best_sf = sf;
-						best_sf_uncorrectable_count = uc;
-					}
+					best_uc_count = store->subframes[sf].uncorrectable_count;
 				}
 			}
-			/* UNCORRECTABLE only used if nothing better found */
-			if (best_status == FLEX_WORD_UNCORRECTABLE && best_sf < 0) {
+			if (best_sf < 0) {
 				best_word = store->subframes[sf].words[i];
 				best_sf = sf;
+				best_uc_count = store->subframes[sf].uncorrectable_count;
 			}
 		}
 
 		combined->words[i] = best_word;
 		combined->status[i] = best_status;
+		if (best_status == FLEX_WORD_UNCORRECTABLE)
+			remaining_uc++;
+	}
 
-		/* Log individual word recovery */
-		if (best_sf > 0 && best_status != FLEX_WORD_UNCORRECTABLE) {
-			LOGP(DFLEX, LOGL_DEBUG,
-			     "SF_COMBINE: word[%d] recovered: status=%d from subframe %d\n",
-			     i, best_status, best_sf);
+	/* Clear words beyond subframe */
+	for (i = sf_words; i < FLEX_WORDS_PER_FRAME; i++) {
+		combined->words[i] = 0;
+		combined->status[i] = FLEX_WORD_NOT_RECEIVED;
+	}
+
+	/* Log recovery stats */
+	int recovered = 0;
+	if (store->subframes[0].received) {
+		for (i = 0; i < sf_words; i++) {
+			if (store->subframes[0].status[i] == FLEX_WORD_UNCORRECTABLE &&
+			    combined->status[i] != FLEX_WORD_UNCORRECTABLE)
+				recovered++;
 		}
 	}
-
-	/* Log summary */
-	int recovered = 0, remaining_uc = 0;
-	for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
-		if (combined->status[i] == FLEX_WORD_UNCORRECTABLE)
-			remaining_uc++;
-		/* A word is "recovered" if it was UNCORRECTABLE in subframe 0
-		 * but is now CLEAN or CORRECTED in the combined result */
-		if (store->subframes[0].received &&
-		    store->subframes[0].status[i] == FLEX_WORD_UNCORRECTABLE &&
-		    combined->status[i] != FLEX_WORD_UNCORRECTABLE)
-			recovered++;
-	}
 	LOGP(DFLEX, LOGL_INFO,
-	     "SF_COMBINE: phase %c total=%d recovered=%d remaining_uc=%d\n",
-	     phase_name, FLEX_WORDS_PER_FRAME, recovered, remaining_uc);
+	     "SF_COMBINE: phase %c sf_words=%d copies=%d/%d recovered=%d remaining_uc=%d%s\n",
+	     phase_name, sf_words, store->num_received, store->num_expected,
+	     recovered, remaining_uc, remaining_uc == 0 ? " PERFECT" : "");
 
-	/* Reset store */
-	memset(store, 0, sizeof(*store));
+	return remaining_uc;
 }
 
 /* Check whether an incoming message is a retransmission of a previously
@@ -1792,48 +1784,8 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 	int i;
 	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
 
-	/* Check for subframe store timeouts across all phases.
-	 * If a store has been waiting too long for remaining subframes,
-	 * combine whatever we have and release the store. */
-	{
-		uint32_t current_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
-		int pol, p;
-		for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
-		for (p = 0; p < FLEX_MAX_PHASES; p++) {
-			flex_rx_subframe_store_t *store = &flex->rx.subframe_store[pol][p];
-			if (!store->active || store->num_received == 0)
-				continue;
-
-			/* Check timeout using modular arithmetic (same as frame_is_eligible).
-			 * If current_abs is at or past timeout_frame, the store has timed out. */
-			int32_t diff = (int32_t)current_abs - (int32_t)store->timeout_frame;
-			int timed_out = (diff >= 0) || (diff < -960);
-
-			if (timed_out) {
-				char pname = 'A' + p;
-				LOGP_CHAN(DDSP, LOGL_INFO,
-					  "RX: Phase %c subframe store timeout (%d/%d received), combining partial.\n",
-					  pname, store->num_received, store->num_expected);
-
-				/* Combine whatever subframes we have */
-				flex_phase_data_t combined;
-				memset(&combined, 0, sizeof(combined));
-				/* Copy RX context from the phase that owns this store */
-				combined.rx_phase = p;
-				combined.rx_cycle = store->base_cycle;
-				combined.rx_frame = store->base_frame;
-
-				flex_rx_subframe_combine(flex, store, &combined, pname);
-
-				/* Note: The combined result from a timeout is not directly usable
-				 * for message parsing here since we're at the start of a new frame.
-				 * The combine call resets the store (via memset), which is the
-				 * primary purpose — releasing stale storage. The partial combine
-				 * logs recovery stats for diagnostic purposes. */
-			}
-		}
-		}
-	}
+	/* Subframe store timeouts are now handled inline in the
+	 * subframe extraction logic below (per-store, not global scan). */
 
 	/* Expire stale reassembly slots at the start of each phase decode */
 	reasm_expire(flex);
@@ -1911,62 +1863,132 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 		}
 	}
 
-	/* --- Subframe store logic (Req 15) --- */
+	/* --- Multi-slot subframe extraction and correction (§3.4.2) ---
+	 *
+	 * The 88-word frame has N subframe slots (N = num_transmissions).
+	 * Slot position = copy number.  Each non-idle slot carries a copy
+	 * of the same content.  The same content appears at slot 0 in
+	 * frame F, slot 1 in frame F+interval, slot 2 in F+2*interval, etc.
+	 *
+	 * We extract ALL N slots from each frame.  Each slot with a
+	 * non-idle BIW (voffset != aoffset after BCH decode) is stored
+	 * as a copy.  Forward/backward correction combines all copies
+	 * and releases when perfect or timed out. */
 	if (flex->rx.fiw_num_transmissions > 1) {
-		int pol = flex->rx.polarity;
+		int pol_idx = flex->rx.polarity;
 		int phase_idx = ph->rx_phase;
-		flex_rx_subframe_store_t *store = &flex->rx.subframe_store[pol][phase_idx];
+		flex_rx_subframe_store_t *store = &flex->rx.subframe_store[pol_idx][phase_idx];
 		uint32_t repeat_interval = flex_scheduler_repeat_interval(
 			flex->collapse, flex->rx.fiw_td_collapse);
-		int sf_idx = flex_scheduler_subframe_index(
-			flex->rx.fiw_frame, flex->rx.fiw_num_transmissions,
-			flex->collapse, flex->rx.fiw_td_collapse);
-		uint32_t base_frame = flex->rx.fiw_frame % repeat_interval;
+		int num_tx = flex->rx.fiw_num_transmissions;
+		int sf_words = flex_subframe_words(num_tx);
+		uint32_t repeat_unit = (uint32_t)num_tx * repeat_interval;
 		uint32_t abs_frame = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+		int slot;
 
-		/* Check if this is a new content group or continuation */
+		/* Initialize or reset store */
 		if (!store->active) {
-			/* First subframe for this content */
 			memset(store, 0, sizeof(*store));
 			store->active = 1;
-			store->num_expected = flex->rx.fiw_num_transmissions;
-			store->base_frame = base_frame;
+			store->num_expected = num_tx;
+			store->sf_words = sf_words;
 			store->base_cycle = flex->rx.fiw_cycle;
-			store->timeout_frame = (abs_frame + 2 * repeat_interval) % 1920;
-		} else if (store->base_frame != base_frame || store->base_cycle != flex->rx.fiw_cycle) {
-			/* Different content — reset store */
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: Phase %c subframe store reset (new content base_frame=%u cycle=%u).\n",
-				  phase_name, base_frame, flex->rx.fiw_cycle);
-			memset(store, 0, sizeof(*store));
-			store->active = 1;
-			store->num_expected = flex->rx.fiw_num_transmissions;
-			store->base_frame = base_frame;
-			store->base_cycle = flex->rx.fiw_cycle;
-			store->timeout_frame = (abs_frame + 2 * repeat_interval) % 1920;
+			store->base_frame = flex->rx.fiw_frame;
+			store->timeout_frame = (abs_frame + repeat_unit + repeat_interval) % 1920;
 		}
 
-		/* Store this subframe's data */
-		if (sf_idx >= 0 && sf_idx < FLEX_RX_MAX_SUBFRAMES && !store->subframes[sf_idx].received) {
-			memcpy(store->subframes[sf_idx].words, ph->words, sizeof(ph->words));
-			memcpy(store->subframes[sf_idx].status, ph->status, sizeof(ph->status));
-			store->subframes[sf_idx].received = 1;
+		/* Extract all N slots from this frame */
+		for (slot = 0; slot < num_tx; slot++) {
+			int sf_offset = slot * sf_words;
+			int i, uc_count = 0, all_ok = 1;
+			uint32_t slot_biw;
+
+			if (sf_offset + sf_words > FLEX_WORDS_PER_FRAME)
+				break;
+			if (store->subframes[slot].received)
+				continue; /* already have this copy */
+
+			/* Check if this slot's BIW is non-idle.
+			 * Word 0 of the slot = BIW.  If BCH failed, skip. */
+			if (ph->status[sf_offset] == FLEX_WORD_UNCORRECTABLE) {
+				/* Can't read BIW — store anyway as damaged copy,
+				 * might help with word-level recovery */
+				for (i = 0; i < sf_words; i++) {
+					store->subframes[slot].words[i] = ph->words[sf_offset + i];
+					store->subframes[slot].status[i] = ph->status[sf_offset + i];
+					if (ph->status[sf_offset + i] == FLEX_WORD_UNCORRECTABLE)
+						uc_count++;
+				}
+				store->subframes[slot].word_count = sf_words;
+				store->subframes[slot].received = 1;
+				store->subframes[slot].copy_index = slot;
+				store->subframes[slot].clean = 0;
+				store->subframes[slot].uncorrectable_count = uc_count;
+				store->num_received++;
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Phase %c slot %d/%d BIW uncorrectable, stored damaged copy (uc=%d).\n",
+					  phase_name, slot + 1, num_tx, uc_count);
+				continue;
+			}
+
+			slot_biw = ph->words[sf_offset];
+
+			/* Check if slot is idle: voffset == aoffset means no content */
+			{
+				int v = (slot_biw >> FLEX_BIW1_VSTART_SHIFT) & FLEX_BIW1_VSTART_MASK;
+				int a = ((slot_biw >> FLEX_BIW1_ASTART_SHIFT) & FLEX_BIW1_ASTART_MASK) + 1;
+				if (v == a) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c slot %d/%d idle (v==a=%d).\n",
+						  phase_name, slot + 1, num_tx, v);
+					continue; /* idle slot, skip */
+				}
+			}
+
+			/* Non-idle slot — extract as a copy */
+			for (i = 0; i < sf_words; i++) {
+				store->subframes[slot].words[i] = ph->words[sf_offset + i];
+				store->subframes[slot].status[i] = ph->status[sf_offset + i];
+				if (ph->status[sf_offset + i] == FLEX_WORD_UNCORRECTABLE) {
+					uc_count++;
+					all_ok = 0;
+				}
+			}
+			store->subframes[slot].word_count = sf_words;
+			store->subframes[slot].received = 1;
+			store->subframes[slot].copy_index = slot;
+			store->subframes[slot].clean = all_ok;
+			store->subframes[slot].uncorrectable_count = uc_count;
 			store->num_received++;
 
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: Phase %c stored subframe %d/%d (base_frame=%u cycle=%u).\n",
-				  phase_name, sf_idx, store->num_expected, base_frame, flex->rx.fiw_cycle);
+			LOGP_CHAN(DDSP, LOGL_INFO,
+				  "RX: Phase %c slot %d/%d copy received (sf_offset=%d, uc=%d%s).\n",
+				  phase_name, slot + 1, num_tx,
+				  sf_offset, uc_count,
+				  all_ok ? ", CLEAN" : "");
 		}
 
-		/* Check if all subframes received */
-		if (store->num_received >= store->num_expected) {
-			LOGP_CHAN(DDSP, LOGL_INFO,
-				  "RX: Phase %c all %d subframes received, ready to combine.\n",
-				  phase_name, store->num_expected);
-			/* Combine subframes and replace phase data with best-of result */
+		/* Already decoded — just accumulate for stats */
+		if (store->decoded) {
+			if (store->num_received >= store->num_expected)
+				memset(store, 0, sizeof(*store));
+			return;
+		}
+
+		/* No copies received at all in this frame — check timeout */
+		if (store->num_received == 0) {
+			int32_t diff = (int32_t)abs_frame - (int32_t)store->timeout_frame;
+			if (diff >= 0 || diff < -960)
+				memset(store, 0, sizeof(*store));
+			return;
+		}
+
+		/* Combine all received copies (forward/backward correction) */
+		{
 			flex_phase_data_t combined;
+			int remaining_uc;
+
 			memset(&combined, 0, sizeof(combined));
-			/* Copy RX context from current phase */
 			combined.rx_phase = ph->rx_phase;
 			combined.rx_cycle = ph->rx_cycle;
 			combined.rx_frame = ph->rx_frame;
@@ -1974,20 +1996,58 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			combined.rx_levels = ph->rx_levels;
 			combined.rx_polarity = ph->rx_polarity;
 
-			flex_rx_subframe_combine(flex, store, &combined, phase_name);
+			remaining_uc = flex_rx_subframe_combine(flex, store, &combined, phase_name);
 
-			/* Replace phase data with combined result */
-			memcpy(ph->words, combined.words, sizeof(ph->words));
-			memcpy(ph->status, combined.status, sizeof(ph->status));
-			/* Fall through to message parsing with improved data */
-		} else {
-			/* Not all subframes yet — skip message parsing */
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: Phase %c waiting for subframes (%d/%d received).\n",
-				  phase_name, store->num_received, store->num_expected);
-			return;
+			/* Perfect reconstruction — decode immediately */
+			if (remaining_uc == 0) {
+				store->decoded = 1;
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Phase %c perfect after %d/%d copies.\n",
+					  phase_name, store->num_received, store->num_expected);
+				memcpy(ph->words, combined.words, sizeof(ph->words));
+				memcpy(ph->status, combined.status, sizeof(ph->status));
+				if (store->num_received >= store->num_expected)
+					memset(store, 0, sizeof(*store));
+				goto parse_phase;
+			}
+
+			/* All copies received — release best effort */
+			if (store->num_received >= store->num_expected) {
+				store->decoded = 1;
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: Phase %c all %d copies, %d words uncorrectable.\n",
+					  phase_name, store->num_expected, remaining_uc);
+				memcpy(ph->words, combined.words, sizeof(ph->words));
+				memcpy(ph->status, combined.status, sizeof(ph->status));
+				memset(store, 0, sizeof(*store));
+				goto parse_phase;
+			}
+
+			/* Timeout — release best effort */
+			{
+				int32_t diff = (int32_t)abs_frame - (int32_t)store->timeout_frame;
+				if (diff >= 0 || diff < -960) {
+					store->decoded = 1;
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: Phase %c timeout %d/%d copies, %d uc.\n",
+						  phase_name, store->num_received,
+						  store->num_expected, remaining_uc);
+					memcpy(ph->words, combined.words, sizeof(ph->words));
+					memcpy(ph->status, combined.status, sizeof(ph->status));
+					memset(store, 0, sizeof(*store));
+					goto parse_phase;
+				}
+			}
 		}
+
+		/* Still waiting for more copies */
+		LOGP_CHAN(DDSP, LOGL_DEBUG,
+			  "RX: Phase %c waiting (%d/%d copies).\n",
+			  phase_name, store->num_received, store->num_expected);
+		return;
 	}
+
+parse_phase:
 
 	/* BIW1 (word 0) */
 	if (ph->status[0] == FLEX_WORD_UNCORRECTABLE ||
@@ -1999,16 +2059,6 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 	{
 		uint32_t biw = ph->words[0];
-
-		/* Nothing to decode if BIW is idle.
-		 * All-zeros or all-ones in the 21-bit data field means
-		 * no addresses, vectors, or messages in this frame. */
-		if (biw == FLEX_BIW_IDLE_ZEROS || biw == FLEX_BIW_IDLE_ONES) {
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: Phase %c idle frame (BIW=0x%05X).\n",
-				  phase_name, biw);
-			return;
-		}
 
 		/* BIW1 layout (21 data bits):
 		 * bits 0-3:   checksum (x)
