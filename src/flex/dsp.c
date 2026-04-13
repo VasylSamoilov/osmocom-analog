@@ -2085,14 +2085,6 @@ parse_phase:
 			return;
 		}
 
-		/* No addresses if voffset == aoffset (idle frame with BIW only) */
-		if (voffset == aoffset) {
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: Phase %c no addresses (voffset==aoffset=%d).\n",
-				  phase_name, voffset);
-			return;
-		}
-
 		/* Parse BIW2/3/4 (words 1 through aoffset-1).
 		 *
 		 * BIW1 is always word 0.
@@ -2102,7 +2094,10 @@ parse_phase:
 		 *
 		 * BIW1 aoffset_raw (bits 8-9) = number of extra BIW words.
 		 * aoffset = aoffset_raw + 1 = first address word index.
-		 * So extra BIW words are at indices 1..(aoffset-1). */
+		 * So extra BIW words are at indices 1..(aoffset-1).
+		 *
+		 * This must happen BEFORE the voffset==aoffset idle check
+		 * because idle frames can still carry BIW date/time/SSID. */
 		flex->rx.biw[pol].sysmsg_a_type = -1; /* reset per frame */
 		{
 			int bw;
@@ -2314,6 +2309,16 @@ parse_phase:
 					break;
 				}
 			}
+		}
+
+		/* No addresses if voffset == aoffset (idle frame with BIW only).
+		 * BIW2/3/4 have already been parsed above, so date/time/SSID
+		 * are captured even on idle frames. */
+		if (voffset == aoffset) {
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: Phase %c no addresses (voffset==aoffset=%d).\n",
+				  phase_name, voffset);
+			return;
 		}
 
 		/* Walk address/vector pairs.
