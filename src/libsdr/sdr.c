@@ -393,7 +393,12 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		if (!sdr_config->rx_only) {
 			LOGP(DSDR, LOGL_NOTICE, "Allocating TX thread buffers\n");
 			memset(&sdr->thread_write, 0, sizeof(sdr->thread_write));
-			sdr->thread_write.buffer_size = sdr->buffer_size * 2 + 2;
+			/* Ring buffer holds 2x buffer_size to allow the main loop to
+			 * write a full buffer_size while the write thread is still
+			 * draining the previous batch.  Without this headroom,
+			 * high sample rates (where buffer_size is large) cause
+			 * overflow on every other iteration. */
+			sdr->thread_write.buffer_size = sdr->buffer_size * 4 + 2;
 			sdr->thread_write.buffer = calloc(sdr->thread_write.buffer_size, sizeof(*sdr->thread_write.buffer));
 			if (!sdr->thread_write.buffer) {
 				LOGP(DSDR, LOGL_ERROR, "No mem!\n");

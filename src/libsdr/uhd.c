@@ -796,6 +796,7 @@ int uhd_send(float *buff, int num)
 	uhd_error error;
 	static int send_count = 0;
 	static size_t total_sent = 0;
+	double send_start, send_elapsed;
 
 	if (!uhd_tx_inst || !uhd_tx_inst->tx_streamer)
 		return 0;
@@ -805,6 +806,7 @@ int uhd_send(float *buff, int num)
 		return 0;
 
 	send_count++;
+	send_start = get_software_time(uhd_tx_inst);
 
 	while (num) {
 		chunk = num;
@@ -821,7 +823,14 @@ int uhd_send(float *buff, int num)
 		}
 		buffs_ptr[0] = buff;
 		count = 0;
+		double t_before = get_software_time(uhd_tx_inst);
 		error = uhd_tx_streamer_send(uhd_tx_inst->tx_streamer, buffs_ptr, chunk, &uhd_tx_inst->tx_metadata, 1.0, &count);
+		double t_after = get_software_time(uhd_tx_inst);
+		if (t_after - t_before > 0.01) {
+			LOGP(DUHD, LOGL_ERROR, "UHD SEND BLOCKED %.1fms (chunk=%d count=%zu ts=%d)\n",
+			     (t_after - t_before) * 1000.0, chunk, count,
+			     uhd_tx_inst->tx_timestamps);
+		}
 		if (error) {
 			LOGP(DUHD, LOGL_ERROR, "Failed to write to TX streamer (error=%d, chunk=%d, count=%zu)\n", error, chunk, count);
 			break;
@@ -844,12 +853,16 @@ int uhd_send(float *buff, int num)
 	}
 
 	total_sent += sent;
-	
-	/* Debug: log periodically */
-	if (send_count < 100 || (send_count % 5000) == 0) {
+	send_elapsed = get_software_time(uhd_tx_inst) - send_start;
+
+	/* Log every call if slow, or periodically */
+	if (send_elapsed > 0.01) {
+		LOGP(DUHD, LOGL_ERROR, "SEND SLOW[%d]: %.1fms sent=%zu num_in=%d\n",
+		     send_count, send_elapsed * 1000.0, sent, (int)(sent + num));
+	} else if (send_count < 100 || (send_count % 5000) == 0) {
 		double tx_time = (double)uhd_tx_inst->tx_time_secs + uhd_tx_inst->tx_time_fract_sec;
-		LOGP(DUHD, LOGL_DEBUG, "SEND[%d]: sent=%zu total=%zu tx_time=%.6f\n",
-		     send_count, sent, total_sent, tx_time);
+		LOGP(DUHD, LOGL_NOTICE, "SEND[%d]: sent=%zu total=%zu tx_time=%.6f elapsed=%.3fms\n",
+		     send_count, sent, total_sent, tx_time, send_elapsed * 1000.0);
 	}
 
 	return sent;
@@ -996,19 +1009,18 @@ int uhd_get_tosend(int buffer_size)
 			     call_count, now, tx_time, ahead_ms, tosend, buffer_size);
 		}
 		
-		/* Cap tosend to buffer_size - we can only produce this many per iteration.
-		 * If tosend > buffer_size, we're behind but will catch up over time. */
-		if (tosend > buffer_size) {
-			/* Only log if significantly behind (more than 2x buffer = 100ms) */
+		/* Allow up to 2x buffer_size for catch-up.
+		 * The comment "will catch up over time" was wrong — capping to
+		 * buffer_size means we can never produce MORE than real-time,
+		 * so the deficit only grows. Allow 2x so we can actually recover. */
+		if (tosend > buffer_size * 2) {
 			double behind_ms = (target_tx_time - tx_time - buffer_duration) * 1000.0;
-			if (behind_ms > buffer_duration * 1000.0) {
-				underrun_count++;
-				if (underrun_count <= 10 || (underrun_count % 100) == 0) {
-					LOGP(DUHD, LOGL_NOTICE, "SPLIT TX catching up #%d: %.1f ms behind target\n",
-					     underrun_count, behind_ms);
-				}
+			underrun_count++;
+			if (underrun_count <= 10 || (underrun_count % 100) == 0) {
+				LOGP(DUHD, LOGL_NOTICE, "SPLIT TX catching up #%d: %.1f ms behind target (capping to 2x buf)\n",
+				     underrun_count, behind_ms);
 			}
-			tosend = buffer_size;
+			tosend = buffer_size * 2;
 		}
 		if (tosend < 0)
 			tosend = 0;
@@ -1058,25 +1070,45 @@ int uhd_get_tosend(int buffer_size)
 	advance = ((double)uhd_tx_inst->tx_time_secs + uhd_tx_inst->tx_time_fract_sec) - ((double)uhd_rx_inst->rx_time_secs + uhd_rx_inst->rx_time_fract_sec);
 	tosend = buffer_size - (int)(advance * uhd_tx_inst->samplerate);
 
-	/* in case of underrun: tosend will exceed buffer_size */
-	if (tosend > buffer_size) {
-		LOGP(DUHD, LOGL_ERROR, "SDR TX underrun (%.1f ms behind), seems we are too slow. Use lower SDR sample rate.\n",
-			-advance * 1000.0);
-		if (!uhd_tx_inst->tx_timestamps) {
-			/* When TX timestamps are disabled, we must resync to recover.
-			 * This causes a slip in the transmit stream. */
-			uhd_tx_inst->tx_time_secs = uhd_rx_inst->rx_time_secs;
-			uhd_tx_inst->tx_time_fract_sec = uhd_rx_inst->rx_time_fract_sec;
-			uhd_tx_inst->tx_time_fract_sec += (double)buffer_size / uhd_tx_inst->samplerate;
-			if (uhd_tx_inst->tx_time_fract_sec >= 1.0) {
-				uhd_tx_inst->tx_time_fract_sec -= 1.0;
-				uhd_tx_inst->tx_time_secs++;
-			}
+	/* Periodic timing debug */
+	{
+		static double last_dbg = 0;
+		double now_dbg = (double)uhd_rx_inst->rx_time_secs + uhd_rx_inst->rx_time_fract_sec;
+		if (now_dbg - last_dbg >= 1.0 || tosend > buffer_size) {
+			double tx_t = (double)uhd_tx_inst->tx_time_secs + uhd_tx_inst->tx_time_fract_sec;
+			double rx_t = (double)uhd_rx_inst->rx_time_secs + uhd_rx_inst->rx_time_fract_sec;
+			LOGP(DUHD, LOGL_NOTICE,
+			     "TX_TIMING: tx=%.3f rx=%.3f advance=%.1fms tosend=%d buf=%d ts=%d swclk=%d\n",
+			     tx_t, rx_t, advance * 1000.0, tosend, buffer_size,
+			     uhd_tx_inst->tx_timestamps, uhd_tx_inst->software_clock);
+			last_dbg = now_dbg;
 		}
-		/* When TX timestamps are enabled, the UHD driver drops late packets.
-		 * The TX timestamp naturally catches up without causing a slip.
-		 * We just cap tosend to buffer_size and let recovery happen. */
+	}
+
+	/* Allow producing up to 2x buffer_size so the caller can catch up
+	 * from small deficits without triggering a hard resync.
+	 * Only resync when hopelessly behind (> 2x buffer = can't recover). */
+	if (tosend > buffer_size * 2) {
+		LOGP(DUHD, LOGL_ERROR, "SDR TX underrun (%.1f ms behind), resync.\n",
+			-advance * 1000.0);
+		/* Always resync tx_time regardless of timestamp mode.
+		 * With timestamps enabled, late packets are dropped by the driver,
+		 * but tx_time must still be reset or we'll be stuck sending
+		 * late-timestamped packets indefinitely. */
+		uhd_tx_inst->tx_time_secs = uhd_rx_inst->rx_time_secs;
+		uhd_tx_inst->tx_time_fract_sec = uhd_rx_inst->rx_time_fract_sec;
+		uhd_tx_inst->tx_time_fract_sec += (double)buffer_size / uhd_tx_inst->samplerate;
+		if (uhd_tx_inst->tx_time_fract_sec >= 1.0) {
+			uhd_tx_inst->tx_time_fract_sec -= 1.0;
+			uhd_tx_inst->tx_time_secs++;
+		}
 		tosend = buffer_size;
+	} else if (tosend > buffer_size) {
+		static int catchup_count = 0;
+		catchup_count++;
+		if (catchup_count <= 10 || (catchup_count % 100) == 0)
+			LOGP(DUHD, LOGL_NOTICE, "TX catching up #%d: %.1f ms behind, producing %d samples (buf=%d)\n",
+				catchup_count, -advance * 1000.0, tosend, buffer_size);
 	}
 	if (tosend < 0)
 		tosend = 0;

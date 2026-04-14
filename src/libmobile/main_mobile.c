@@ -974,9 +974,20 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	if (console_start_audio())
 		*quit = 1;
 
+	/* Loop timing instrumentation */
+	double dbg_t_audio_sum = 0, dbg_t_audio_max = 0;
+	double dbg_t_handler_sum = 0, dbg_t_handler_max = 0;
+	double dbg_t_osmo_sum = 0, dbg_t_osmo_max = 0;
+	double dbg_t_loop_sum = 0, dbg_t_loop_max = 0;
+	double dbg_t_sleep_sum = 0;
+	int dbg_loop_count = 0;
+	double dbg_timer = 0;
+
 	while(!(*quit)) {
 		int work;
+		double dbg_t0, dbg_t1, dbg_t2, dbg_t3, dbg_t4;
 		begin_time = get_time();
+		dbg_t0 = begin_time;
 
 		/* process sound of all transceivers */
 		for (sender = sender_head; sender; sender = sender->next) {
@@ -985,9 +996,10 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 				continue;
 			process_sender_audio(sender, quit, samples, powers, buffer_size);
 		}
+		dbg_t1 = get_time();
 
 		/* process audio for call instances */
-		now = get_time();
+		now = dbg_t1;
 		if (now - last_time_call >= 0.1)
 			last_time_call = now;
 		if (now - last_time_call >= 0.020) {
@@ -1068,11 +1080,13 @@ next_char:
 		}
 
 		/* handle all handlers until no more events */
+		dbg_t2 = get_time();
 		do {
 			work = 0;
 			work |= osmo_cc_handle();
 			work |= osmo_select_main(1);
 		} while (work);
+		dbg_t3 = get_time();
 
 		if (!use_osmocc_sock)
 			process_console(c);
@@ -1080,14 +1094,81 @@ next_char:
 		if (myhandler)
 			myhandler();
 
+		dbg_t4 = get_time();
+
 		display_measurements(dsp_interval / 1000.0);
 
 		now = get_time();
 
-		/* sleep interval */
-		sleep = (dsp_interval / 1000.0) - (now - begin_time);
-		if (sleep > 0)
+		/* Loop timing stats */
+		{
+			double dt_audio = dbg_t1 - dbg_t0;
+			double dt_osmo = dbg_t3 - dbg_t2;
+			double dt_handler = dbg_t4 - dbg_t3;
+			double dt_loop = now - begin_time;
+
+			dbg_t_audio_sum += dt_audio;
+			dbg_t_osmo_sum += dt_osmo;
+			dbg_t_handler_sum += dt_handler;
+			dbg_t_loop_sum += dt_loop;
+			if (dt_audio > dbg_t_audio_max) dbg_t_audio_max = dt_audio;
+			if (dt_osmo > dbg_t_osmo_max) dbg_t_osmo_max = dt_osmo;
+			if (dt_handler > dbg_t_handler_max) dbg_t_handler_max = dt_handler;
+			if (dt_loop > dbg_t_loop_max) dbg_t_loop_max = dt_loop;
+			dbg_loop_count++;
+
+			/* Alert on any single iteration > 5ms */
+			if (dt_loop > 0.005) {
+				LOGP(DSENDER, LOGL_NOTICE,
+				     "SLOW LOOP: %.1fms (audio=%.1f osmo=%.1f handler=%.1f)ms\n",
+				     dt_loop * 1000.0, dt_audio * 1000.0,
+				     dt_osmo * 1000.0, dt_handler * 1000.0);
+			}
+
+			if (dbg_timer == 0.0) dbg_timer = now;
+			if (now - dbg_timer >= 2.0) {
+				LOGP(DSENDER, LOGL_NOTICE,
+				     "LOOP STATS [%d iters, %.1fs]: "
+				     "avg=%.3f max=%.3f | "
+				     "audio avg=%.3f max=%.3f | "
+				     "osmo avg=%.3f max=%.3f | "
+				     "handler avg=%.3f max=%.3f | "
+				     "sleep=%.1f%% (ms)\n",
+				     dbg_loop_count, now - dbg_timer,
+				     dbg_t_loop_sum / dbg_loop_count * 1000.0,
+				     dbg_t_loop_max * 1000.0,
+				     dbg_t_audio_sum / dbg_loop_count * 1000.0,
+				     dbg_t_audio_max * 1000.0,
+				     dbg_t_osmo_sum / dbg_loop_count * 1000.0,
+				     dbg_t_osmo_max * 1000.0,
+				     dbg_t_handler_sum / dbg_loop_count * 1000.0,
+				     dbg_t_handler_max * 1000.0,
+				     dbg_t_sleep_sum / (now - dbg_timer) * 100.0);
+				dbg_t_audio_sum = dbg_t_audio_max = 0;
+				dbg_t_osmo_sum = dbg_t_osmo_max = 0;
+				dbg_t_handler_sum = dbg_t_handler_max = 0;
+				dbg_t_loop_sum = dbg_t_loop_max = 0;
+				dbg_t_sleep_sum = 0;
+				dbg_loop_count = 0;
+				dbg_timer = now;
+			}
+		}
+
+		/* sleep interval:
+		 * When using SDR, the write thread's send() is the real pacemaker.
+		 * Use a short yield (100us) instead of the full dsp_interval to keep
+		 * the TX ring buffer fed and prevent deficit accumulation from
+		 * usleep overshoot.  For sound card mode, keep the original interval
+		 * since there is no write thread pacemaker. */
+		if (use_sdr) {
+			sleep = 0.0001 - (now - begin_time);
+		} else {
+			sleep = (dsp_interval / 1000.0) - (now - begin_time);
+		}
+		if (sleep > 0) {
+			dbg_t_sleep_sum += sleep;
 			usleep(sleep * 1000000.0);
+		}
 
 //		now = get_time();
 //		printf("duration =%.6f\n", now - begin_time);

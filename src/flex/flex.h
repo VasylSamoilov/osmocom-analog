@@ -825,7 +825,8 @@ const char *flex_msg_type_name(enum flex_msg_type type);
 const char *flex_number_valid(const char *number);
 
 /* TX Temporary Group (§3.8.2.3) */
-int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
+int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
+			   const int *collapses, int count,
 			   enum flex_msg_type msg_type, const char *data,
 			   int data_length, int speed, int modulation_type,
 			   double polarity, int priority, int phase);

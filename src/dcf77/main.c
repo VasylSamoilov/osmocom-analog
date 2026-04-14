@@ -854,8 +854,8 @@ int main(int argc, char *argv[])
 
 			if (tx) {
 				tosend = sdr_get_tosend(sdr, buffer_size);
-				if (tosend > buffer_size / 4)
-					tosend = buffer_size / 4;
+				if (tosend > buffer_size)
+					tosend = buffer_size;
 				if (tosend > 0) {
 					sample_t tx_envelope[tosend];
 					int j, jj;
@@ -908,7 +908,12 @@ int main(int argc, char *argv[])
 		now = get_time();
 
 		/* sleep interval */
-		sleep = ((double)dsp_interval / 1000.0) - (now - begin_time);
+#ifdef HAVE_SDR
+		if (use_sdr)
+			sleep = 0.0001 - (now - begin_time);
+		else
+#endif
+			sleep = ((double)dsp_interval / 1000.0) - (now - begin_time);
 		if (sleep > 0)
 			usleep(sleep * 1000000.0);
 	}

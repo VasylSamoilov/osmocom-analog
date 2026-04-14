@@ -354,8 +354,8 @@ static void tx_bas(sample_t *sample_bas, __attribute__((__unused__)) sample_t *s
 			usleep(1000);
 			sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
 			tosend = sdr_get_tosend(sdr, buffer_size);
-			if (tosend > buffer_size / 10)
-				tosend = buffer_size / 10;
+			if (tosend > buffer_size)
+				tosend = buffer_size;
 			if (tosend == 0) {
 				continue;
 			}

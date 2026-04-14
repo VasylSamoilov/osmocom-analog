@@ -1767,16 +1767,15 @@ int main(int argc, char *argv[])
 #if 0 /* TX debug logging - uncomment to enable */
 			int tosend_raw = tosend;
 #endif
-			if (tosend > buffer_size / 10)
-				tosend = buffer_size / 10;
-			if (tosend == 0) {
-				continue;
-			}
+			if (tosend > buffer_size)
+				tosend = buffer_size;
+			if (tosend == 0)
+				goto next_char;
 #if 0 /* TX debug logging - uncomment to enable */
 			/* Log main loop buffer sizes periodically (~1/sec) */
 			if (++main_loop_dbg_cnt >= 333) {
-				LOGP(DRADIO, LOGL_DEBUG, "Main loop: buffer_size=%d tosend_raw=%d tosend_capped=%d (cap=%d) got=%d\n",
-				     buffer_size, tosend_raw, tosend, buffer_size / 10, got);
+				LOGP(DRADIO, LOGL_DEBUG, "Main loop: buffer_size=%d tosend_raw=%d tosend_capped=%d got=%d\n",
+				     buffer_size, tosend_raw, tosend, got);
 				main_loop_dbg_cnt = 0;
 			}
 #endif

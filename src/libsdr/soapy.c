@@ -946,19 +946,15 @@ int soapy_get_tosend(int buffer_size)
 			     now_ns, soapy_tx_inst->tx_timeNs, ahead_ms, tosend);
 		}
 		
-		/* Cap tosend to buffer_size - we can only produce this many per iteration.
-		 * If tosend > buffer_size, we're behind but will catch up over time. */
-		if (tosend > buffer_size) {
-			/* Only log if significantly behind */
+		/* Allow up to 2x buffer_size for catch-up. */
+		if (tosend > buffer_size * 2) {
 			double behind_ms = (double)(target_tx_time_ns - soapy_tx_inst->tx_timeNs - buffer_duration_ns) / 1000000.0;
-			if (behind_ms > (double)buffer_duration_ns / 1000000.0) {
-				underrun_count++;
-				if (underrun_count <= 10 || (underrun_count % 100) == 0) {
-					LOGP(DSOAPY, LOGL_NOTICE, "SPLIT TX catching up #%d: %.1f ms behind target\n",
-					     underrun_count, behind_ms);
-				}
+			underrun_count++;
+			if (underrun_count <= 10 || (underrun_count % 100) == 0) {
+				LOGP(DSOAPY, LOGL_NOTICE, "SPLIT TX catching up #%d: %.1f ms behind target (capping to 2x buf)\n",
+				     underrun_count, behind_ms);
 			}
-			tosend = buffer_size;
+			tosend = buffer_size * 2;
 		}
 		if (tosend < 0)
 			tosend = 0;
@@ -988,18 +984,21 @@ int soapy_get_tosend(int buffer_size)
 	pthread_mutex_lock(&soapy_tx_inst->timestamp_mutex);
 	tosend = buffer_size - (soapy_tx_inst->tx_timeNs - soapy_rx_inst->rx_timeNs) / soapy_tx_inst->Ns_per_sample;
 
-	/* in case of underrun, resync TX timestamp */
-	if (tosend > buffer_size) {
-		LOGP(DSOAPY, LOGL_ERROR, "SDR TX underrun, seems we are too slow. Use lower SDR sample rate.\n");
+	/* Allow producing up to 2x buffer_size so the caller can catch up
+	 * from small deficits without triggering a hard resync.
+	 * Only resync when hopelessly behind (> 2x buffer = can't recover). */
+	if (tosend > buffer_size * 2) {
+		LOGP(DSOAPY, LOGL_ERROR, "SDR TX underrun, resync.\n");
 		if (!soapy_tx_inst->use_time_stamps) {
-			/* When TX timestamps are disabled, we must resync to recover.
-			 * This causes a slip in the transmit stream. */
 			soapy_tx_inst->tx_timeNs = soapy_rx_inst->rx_timeNs;
 		}
-		/* When TX timestamps are enabled, the driver drops late packets.
-		 * The TX timestamp naturally catches up without causing a slip.
-		 * We just cap tosend to buffer_size and let recovery happen. */
 		tosend = buffer_size;
+	} else if (tosend > buffer_size) {
+		static int catchup_count = 0;
+		catchup_count++;
+		if (catchup_count <= 10 || (catchup_count % 100) == 0)
+			LOGP(DSOAPY, LOGL_NOTICE, "TX catching up #%d: %d samples behind, producing %d (buf=%d)\n",
+				catchup_count, tosend - buffer_size, tosend, buffer_size);
 	}
 	pthread_mutex_unlock(&soapy_tx_inst->timestamp_mutex);
 

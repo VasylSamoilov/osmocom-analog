@@ -1875,6 +1875,7 @@ static void fifo_process_line(const char *text, int text_length)
 		flex_t *flex = (flex_t *)sender_head;
 		char *tg_str = capcode_string + 10;
 		uint64_t tg_caps[FLEX_TEMP_GROUP_MAX_MEMBERS];
+		int tg_collapses[FLEX_TEMP_GROUP_MAX_MEMBERS];
 		int tg_count = 0;
 		char *p = tg_str;
 		char type_str_tg[64];
@@ -1889,11 +1890,57 @@ static void fifo_process_line(const char *text, int text_length)
 			return;
 		}
 
-		/* Parse space-separated capcodes */
+		/* Parse space-separated capcodes (supports Extended CAPCODEs).
+		 * Phase from non-standard alpha (U/V/W/X) of the first capcode
+		 * is applied to the group if no explicit phase= option given. */
 		while (*p && tg_count < FLEX_TEMP_GROUP_MAX_MEMBERS) {
+			capcode_parsed_t tg_cp;
+			char tg_tok[64];
+			const char *tok_start;
+			int tok_len;
+
 			while (*p == ' ') p++;
 			if (!*p) break;
-			tg_caps[tg_count++] = strtoull(p, &p, 10);
+
+			/* Extract next space-delimited token */
+			tok_start = p;
+			while (*p && *p != ' ') p++;
+			tok_len = (int)(p - tok_start);
+			if (tok_len <= 0 || tok_len >= (int)sizeof(tg_tok)) {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: tempgroup capcode token too long or empty.\n");
+				return;
+			}
+			memcpy(tg_tok, tok_start, tok_len);
+			tg_tok[tok_len] = '\0';
+
+			if (parse_capcode_string(tg_tok, &tg_cp) < 0) {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: tempgroup cannot parse capcode '%s'.\n",
+				     tg_tok);
+				return;
+			}
+			log_capcode_parsed(&tg_cp, tg_tok);
+			tg_collapses[tg_count] = tg_cp.has_collapse ? tg_cp.collapse : -1;
+			tg_caps[tg_count++] = tg_cp.capcode;
+
+			/* Apply phase from first Extended CAPCODE with
+			 * non-standard alpha (U/V/W/X) if not yet set. */
+			if (tg_phase < 0 && tg_cp.has_alpha && !tg_cp.std_rule) {
+				int ep = -1;
+				switch (tg_cp.alpha) {
+				case 'U': ep = 0; break;
+				case 'V': ep = 1; break;
+				case 'W': ep = 2; break;
+				case 'X': ep = 3; break;
+				}
+				if (ep >= 0) {
+					tg_phase = ep;
+					LOGP(DFLEX, LOGL_INFO,
+					     "FIFO: tempgroup applying phase=%s from capcode '%s' alpha '%c'.\n",
+					     flex_phase_name(tg_phase), tg_tok, tg_cp.alpha);
+				}
+			}
 		}
 		if (tg_count == 0) {
 			LOGP(DFLEX, LOGL_NOTICE,
@@ -1950,7 +1997,7 @@ static void fifo_process_line(const char *text, int text_length)
 
 		/* Enqueue */
 		{
-			int rc = flex_tempgroup_enqueue(flex, tg_caps, tg_count,
+			int rc = flex_tempgroup_enqueue(flex, tg_caps, tg_collapses, tg_count,
 						       mtype_tg, msg_buf, message_length,
 						       tg_speed, tg_mod, tg_pol,
 						       tg_prio, tg_phase);

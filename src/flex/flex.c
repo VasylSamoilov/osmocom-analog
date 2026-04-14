@@ -385,6 +385,9 @@ void flex_msg_destroy(flex_msg_t *msg)
 /* Frames of margin between last SETUP and DELIVERY target frame */
 #define FLEX_TG_SETUP_MARGIN	4
 
+/* Frames of lead time before first SETUP (queue processing headroom) */
+#define FLEX_TG_QUEUE_LEAD	2
+
 /* Allocate a free temp slot for a given polarity. Returns 0-15, or -1 if all occupied. */
 static int flex_tg_alloc_slot(flex_t *flex, int pol)
 {
@@ -406,15 +409,26 @@ static void flex_tg_free_slot(flex_t *flex, int pol, int slot)
 }
 
 /*
- * Enqueue a temporary group message.
+ * Enqueue a temporary group message (§5.2).
  *
- * Allocates a temp slot, creates SETUP instruction messages for each
- * member capcode, and creates the DELIVERY message with the temp
- * address word.  All messages go into the normal queue.
+ * Pre-computes the exact frame for every SETUP and the DELIVERY,
+ * then pins each message to its frame via next_send_frame.
  *
- * Returns 0 on success, -1 on failure (no free slot, invalid params).
+ * Schedule:
+ *   - Each SETUP is pinned to the next collapse-aligned frame for
+ *     that pager's capcode (deterministic from capcode + collapse).
+ *   - Frame N (DELIVERY) = last SETUP frame + margin, mod 128.
+ *   - N must be ≤128 frames from the first SETUP (§5.2).
+ *   - DELIVERY is pinned to the absolute frame corresponding to N.
+ *
+ * The scheduler honours next_send_frame: messages aren't eligible
+ * until that frame.  With priority=1 on SETUPs, they'll go out
+ * immediately when their frame arrives.
+ *
+ * Returns 0 on success, -1 on failure.
  */
-int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
+int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
+			   const int *collapses, int count,
 			   enum flex_msg_type msg_type, const char *data,
 			   int data_length, int speed, int modulation_type,
 			   double polarity, int priority, int phase)
@@ -422,7 +436,11 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 	int slot, i, pol;
 	uint32_t target_frame;
 	flex_frame_time_t ft;
-	uint32_t abs_frame;
+	uint32_t abs_frame, current_frame;
+	/* Per-pager: absolute frame when SETUP should be sent */
+	uint32_t setup_abs[FLEX_TEMP_GROUP_MAX_MEMBERS];
+	uint32_t first_setup_abs, last_setup_abs, delivery_abs;
+	int sys_collapse = flex->collapse;
 
 	pol = pol_index(polarity);
 
@@ -433,7 +451,6 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 		return -1;
 	}
 
-	/* Validate all capcodes */
 	for (i = 0; i < count; i++) {
 		if (!flex_capcode_valid(capcodes[i])) {
 			LOGP(DFLEX, LOGL_NOTICE,
@@ -443,7 +460,6 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 		}
 	}
 
-	/* Allocate slot from per-polarity pool */
 	slot = flex_tg_alloc_slot(flex, pol);
 	if (slot < 0) {
 		LOGP(DFLEX, LOGL_NOTICE,
@@ -452,15 +468,68 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 		return -1;
 	}
 
-	/* Compute target frame: current + count (for SETUPs) + margin */
 	if (flex_scheduler_get_time(flex, &ft) < 0) {
 		abs_frame = 0;
 	} else {
 		abs_frame = ft.cycle * 128 + ft.frame;
 	}
-	target_frame = (abs_frame + (uint32_t)count + FLEX_TG_SETUP_MARGIN) % 128;
+	current_frame = abs_frame % 128;
 
-	/* Populate slot */
+	/* --- Compute exact frame for each SETUP --- */
+	first_setup_abs = UINT32_MAX;
+	last_setup_abs = 0;
+
+	for (i = 0; i < count; i++) {
+		flex_capcode_sched_t sched;
+		int m;
+		uint32_t next_f, delta;
+
+		flex_scheduler_capcode_info(capcodes[i], &sched);
+		m = (collapses && collapses[i] >= 0) ? collapses[i] : sys_collapse;
+
+		/* Next collapse-aligned frame number (may be > 127).
+		 * Start from current + lead time so the message is
+		 * safely queued before the scheduler reaches that frame. */
+		next_f = flex_scheduler_next_frame(current_frame + FLEX_TG_QUEUE_LEAD,
+						   sched.assigned_frame, m);
+
+		/* Convert to absolute frame */
+		delta = next_f - current_frame;
+		setup_abs[i] = abs_frame + delta;
+
+		if (setup_abs[i] < first_setup_abs)
+			first_setup_abs = setup_abs[i];
+		if (setup_abs[i] > last_setup_abs)
+			last_setup_abs = setup_abs[i];
+
+		LOGP(DFLEX, LOGL_INFO,
+		     "TX: tempgroup SETUP[%d] cap=%" PRIu64 " collapse=%d "
+		     "assigned_frame=%u pinned_frame=%u (abs=%u)\n",
+		     i, capcodes[i], m, sched.assigned_frame,
+		     setup_abs[i] % 128, setup_abs[i]);
+	}
+
+	/* --- Compute frame N (DELIVERY) --- */
+	delivery_abs = last_setup_abs + FLEX_TG_SETUP_MARGIN;
+	target_frame = delivery_abs % 128;
+
+	/* §5.2: first transmission must start within 128 frames of first SETUP */
+	if (delivery_abs - first_setup_abs > 127) {
+		LOGP(DFLEX, LOGL_NOTICE,
+		     "FIFO: tempgroup DELIVERY frame %u exceeds 128-frame limit "
+		     "from first SETUP (span=%u).\n",
+		     target_frame, delivery_abs - first_setup_abs);
+		flex_tg_free_slot(flex, pol, slot);
+		return -1;
+	}
+
+	LOGP(DFLEX, LOGL_INFO,
+	     "TX: tempgroup schedule: first_setup=%u last_setup=%u "
+	     "delivery(N)=%u (abs=%u) slot=%d\n",
+	     first_setup_abs % 128, last_setup_abs % 128,
+	     target_frame, delivery_abs, slot);
+
+	/* --- Populate slot --- */
 	flex->tx_pol[pol].tx_temp[slot].state = FLEX_TG_SETUP;
 	flex->tx_pol[pol].tx_temp[slot].count = count;
 	flex->tx_pol[pol].tx_temp[slot].setups_sent = 0;
@@ -469,7 +538,7 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 	for (i = 0; i < count; i++)
 		flex->tx_pol[pol].tx_temp[slot].capcodes[i] = capcodes[i];
 
-	/* Create SETUP instruction messages (one per capcode) */
+	/* --- Create SETUP messages, each pinned to its frame --- */
 	for (i = 0; i < count; i++) {
 		uint32_t idata = 0;
 		char ibuf[16];
@@ -495,16 +564,21 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 		msg->speed = speed;
 		msg->modulation_type = modulation_type;
 		msg->polarity = polarity;
-		msg->priority = 1; /* SETUP is priority */
+		msg->priority = 1;
 		if (phase >= 0)
 			msg->phase = phase;
 
+		/* Pin to exact frame */
+		msg->next_send_frame = setup_abs[i] % 1920;
+
 		LOGP(DFLEX, LOGL_INFO,
-		     "TX: SETUP slot=%d frame=%u cap=%" PRIu64 " (%d/%d) idata=0x%04X\n",
-		     slot, target_frame, capcodes[i], i + 1, count, idata);
+		     "TX: SETUP slot=%d N=%u cap=%" PRIu64 " (%d/%d) "
+		     "idata=0x%04X pinned_abs=%u\n",
+		     slot, target_frame, capcodes[i], i + 1, count,
+		     idata, setup_abs[i]);
 	}
 
-	/* Create DELIVERY message with temp address */
+	/* --- Create DELIVERY message, pinned to frame N --- */
 	{
 		flex_msg_t *msg;
 
@@ -524,21 +598,17 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes, int count,
 		if (phase >= 0)
 			msg->phase = phase;
 
-		/* Defer delivery until target frame */
-		{
-			uint32_t delay = ((target_frame + 128) - (abs_frame % 128)) % 128;
-			if (delay == 0)
-				delay = 128; /* full cycle if exact match */
-			msg->send_delay = (int)delay;
-			msg->next_send_frame = abs_frame + delay;
-		}
+		/* Pin to frame N */
+		msg->next_send_frame = delivery_abs % 1920;
+		msg->send_delay = (int)(delivery_abs - abs_frame);
 
 		flex->tx_pol[pol].tx_temp[slot].delivery_msg = msg;
 
 		LOGP(DFLEX, LOGL_INFO,
-		     "TX: DELIVERY queued slot=%d frame=%u type=%s members=%d len=%d\n",
+		     "TX: DELIVERY queued slot=%d N=%u type=%s members=%d "
+		     "len=%d pinned_abs=%u\n",
 		     slot, target_frame, flex_msg_type_name(msg_type),
-		     count, data_length);
+		     count, data_length, delivery_abs);
 	}
 
 	return 0;
@@ -1991,8 +2061,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (!frame_is_eligible(candidate->next_send_frame, current_abs))
 					continue;
 
-				/* Collapse filter */
-				if (flex->collapse > 0) {
+				/* Collapse filter.
+				 * Skip for temp group DELIVERY — these use a
+				 * Temporary Address and are pinned to a specific
+				 * frame by next_send_frame, not by capcode. */
+				if (flex->collapse > 0 &&
+				    candidate->temp_delivery_slot < 0) {
 					flex_capcode_sched_t sched;
 					uint32_t nf;
 					flex_scheduler_capcode_info(candidate->capcode, &sched);
