@@ -4195,35 +4195,27 @@ parse_phase:
 						}
 
 						/* Strip termination fill from last/complete
-						 * fragment (C=0).  Scan backwards from bit 20
-						 * of the last word: consecutive identical bits
-						 * from the top are fill.  The transition marks
-						 * the last real data bit.  Round up to the next
-						 * nibble boundary for the real data count.
+						 * fragment (C=0).
 						 *
-						 * Per spec rule (3): if the last character is
-						 * all-0 or all-1, an extra fill word is appended.
+						 * Per spec §3.10.1.2:
+						 *   Rule (2): data ends mid-word → remaining
+						 *     bits filled with inverse of last data bit.
+						 *   Rule (3): data ends at word boundary AND
+						 *     last char is all-0 or all-1 → extra fill
+						 *     word appended (inverse of last data bit).
 						 *
-						 * Algorithm:
-						 * 1. Rule (3) check: if last word is entirely
-						 *    one value (0x00000 or 0x1FFFFF), it may be
-						 *    an extra fill word.  Verify by checking
-						 *    that the previous word's data ends at a
-						 *    nibble boundary with last nibble all-0/all-1.
-						 *    If confirmed, strip the entire last word.
-						 * 2. Scan the (remaining) last word backwards
-						 *    from bit 20 to find where fill starts.
-						 *    Fill bits are all identical (inverse of
-						 *    last data bit).  Trim to nibble boundary. */
+						 * Either strip a whole extra fill word, or
+						 * strip partial fill bits.  Never both. */
 						if (last_data_word >= 0 && hex_c == 0) {
 							int strip_word = last_data_word;
 
-							/* Step 1: Rule (3) extra word check */
+							/* Rule (3): if last word is entirely
+							 * one value (0x000000 or 0x1FFFFF),
+							 * it is an extra fill word — discard
+							 * it and truncate hex output. */
 							if (strip_word > data_start) {
 								uint32_t lw = ph->words[strip_word] & FLEX_DATA_MASK;
 								if (lw == 0x000000 || lw == FLEX_DATA_MASK) {
-									/* Entire word is one value.
-									 * Count data bits before it. */
 									int bits_before = 0;
 									for (w = data_start; w < strip_word; w++) {
 										if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
@@ -4231,32 +4223,17 @@ parse_phase:
 											continue;
 										bits_before += FLEX_BCH_DATA_BITS;
 									}
-									/* Rule (3) applies when data before
-									 * this word ends at a word boundary
-									 * (bits_before % 21 == 0, always true)
-									 * AND at a nibble boundary, AND the
-									 * last nibble is all-0 or all-1.
-									 * Since each word is 21 bits = 5.25
-									 * nibbles, data ends at nibble boundary
-									 * when bits_before % 4 == 0. */
-									if (bits_before % 4 == 0 && bits_before > 0) {
-										int prev_nibs = bits_before / 4;
-										if (prev_nibs <= hi) {
-											/* Check last nibble of previous data */
-											uint8_t ln = (uint8_t)((hex[prev_nibs - 1] >= '0' &&
-												hex[prev_nibs - 1] <= '9')
-												? (hex[prev_nibs - 1] - '0')
-												: (hex[prev_nibs - 1] - 'A' + 10));
-											if (ln == 0x0 || ln == 0xF) {
-												hi = prev_nibs;
-												strip_word = -1; /* done */
-											}
-										}
+									int nibs_before = bits_before / 4;
+									if (nibs_before > 0 && nibs_before <= hi) {
+										hi = nibs_before;
+										strip_word = -1; /* done */
 									}
 								}
 							}
 
-							/* Step 2: Partial fill in last word */
+							/* Rule (2): partial fill in last word.
+							 * Scan backwards from bit 20 — consecutive
+							 * identical bits from top are fill. */
 							if (strip_word >= data_start &&
 							    ph->status[strip_word] != FLEX_WORD_UNCORRECTABLE &&
 							    ph->status[strip_word] != FLEX_WORD_NOT_RECEIVED) {
@@ -4272,7 +4249,6 @@ parse_phase:
 								}
 
 								if (fill_start < 21 && fill_start > 0) {
-									/* Partial fill found */
 									int bits_before = 0;
 									for (w = data_start; w < strip_word; w++) {
 										if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
