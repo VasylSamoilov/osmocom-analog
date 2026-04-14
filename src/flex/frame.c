@@ -639,9 +639,21 @@ static uint32_t encode_alpha_message(uint32_t *frame_words, const char *msg,
 	/* First message word (header) — see frame.h for bit layout.
 	 * K checksum is computed last after all other fields are set.
 	 *
-	 * Fragment flags:
-	 *   F = fragment number (modulo 3 sequence: 11, 00, 01, 10, ...)
-	 *   C = message continued (1 = more fragments follow, 0 = last/only)
+	 * F: Message Fragment Number (2 bits, §3.10.1.3).
+	 *   F is a modulo 3 message fragment number which increments by 1
+	 *   for each of the consecutive fragments.  The first fragment
+	 *   starts with "11" and is incremented by 1 modulo 3 for each of
+	 *   the subsequent fragments (11, 00, 01, 10, 00, 01, 10, 00, ...).
+	 *   The state for "11" after the first fragment is skipped in order
+	 *   to prevent it from being mistaken as the first fragment of a
+	 *   non-consecutive message.
+	 *
+	 * C: Message Continued Flag (1 bit).
+	 *   The last fragment is indicated by resetting the Message
+	 *   Continued Flag (C) to 0.  C=1 means more fragments follow.
+	 *
+	 * Applies to Alpha (V=101), HEX/Binary (V=010), Secure (V=000).
+	 * Numeric messages (V=011, V=100, V=111) cannot be fragmented (§4.2).
 	 */
 	{
 		int frag_idx = 0, frag_total = 0;
@@ -663,10 +675,19 @@ static uint32_t encode_alpha_message(uint32_t *frame_words, const char *msg,
 	}
 
 	/* Message number N — present on ALL fragments (identifies the
-	 * fragment stream).  N is 6 bits (0-63).
-	 * "those message numbers which are newly assigned to a message
-	 * must be unique numbers so as to identify fragments for the
-	 * same message." */
+	 * fragment stream so the receiver can reassemble them).
+	 * N is 6 bits (0-63).  Per spec §4.2: "those message numbers which
+	 * are newly assigned to a message must be unique numbers so as to
+	 * identify fragments for the same message."  The same N value is
+	 * used across all fragments of a single long message.
+	 *
+	 * Per §4.1: when the full length of a message cannot be contained
+	 * in one Frame, the individual message must be broken down into
+	 * fragments.  The maximum number of words which can be transmitted
+	 * for an alpha message is 84 words (85 message words minus 1 header),
+	 * giving a maximum of 251 characters per frame [3 chars/word × 84
+	 * words - 1 = 251].  Longer messages are transmitted by
+	 * Fragmentation. */
 	if (sequence_num >= 0) {
 		uint32_t n = (uint32_t)(sequence_num % 64);
 		msg_word[0] |= (n << FLEX_ALPHA_HDR_N_SHIFT);
@@ -963,6 +984,13 @@ static uint32_t encode_numeric_message(uint32_t *frame_words, const char *msg,
  *   0 = alpha: 7-bit character packing identical to encode_alpha_message()
  *   1 = binary: hex nibble packing identical to encode_hex_message()
  *
+ * Supports fragmentation with the same C/F/N mechanism as Alpha and HEX:
+ *   F = 2-bit fragment number, modulo 3 sequence (11, 00, 01, 10, 00, ...)
+ *       — "11" is skipped after the first fragment to avoid ambiguity.
+ *   C = message continued flag (1 = more fragments follow, 0 = last/only).
+ *       The last fragment is indicated by resetting C to 0.
+ *   N = 6-bit message number (0-63) identifying the fragment stream.
+ *
  * Key difference from alpha/hex: bits 19-20 of the header word carry the
  * t1t0 subtype on ALL fragments (not R/M on initial, U₀/V₀ on continuation).
  * The C/F/N fragment fields are identical to alpha (same bit positions).
@@ -1010,7 +1038,10 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 
 		memset(msg_words, 0, sizeof(msg_words));
 
-		/* Header word 1: C, F, N (same positions as alpha) */
+		/* Header word 1: C, F, N (same bit positions as alpha).
+		 * F = modulo 3 fragment number (11, 00, 01, 10, 00, ...);
+		 * C = message continued (1 = more fragments, 0 = last/only);
+		 * N = 6-bit message number identifying the fragment stream. */
 		msg_words[0] = (f_val << FLEX_ALPHA_HDR_F_SHIFT);
 		if (c_val)
 			msg_words[0] |= FLEX_ALPHA_HDR_C_MASK;
@@ -1205,7 +1236,10 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		len = strlen(msg);
 		max_len = (len > FLEX_MAX_CHARS_ALPHA) ? FLEX_MAX_CHARS_ALPHA : len;
 
-		/* Header word: C, F, N (same positions as alpha) */
+		/* Header word: C, F, N (same bit positions as alpha).
+		 * F = modulo 3 fragment number (11, 00, 01, 10, 00, ...);
+		 * C = message continued (1 = more fragments, 0 = last/only);
+		 * N = 6-bit message number identifying the fragment stream. */
 		msg_word[0] = (f_val << FLEX_ALPHA_HDR_F_SHIFT);
 		if (c_val)
 			msg_word[0] |= FLEX_ALPHA_HDR_C_MASK;
@@ -1939,13 +1973,35 @@ size_t flex_generate_ers(uint8_t *buffer, size_t buffer_size, int cycles)
 	return needed;
 }
 
-/* Split a long message into fragments that each fit within max_chars_per_fragment.
- * Returns the number of fragments created. Each fragment is a newly allocated
- * string (caller must free). If the message fits in one fragment, return 1
- * with fragments[0] = strdup(message).
+/* Split a long message into fragments (§4.1).
+ *
+ * Per §4.1: when the full length of a message cannot be contained in one
+ * Frame, the individual message must be broken down into fragments.  For
+ * an Alphanumeric Message with a Short Address using single transmission,
+ * after removing one BIW, one address word, and one vector word from the
+ * maximum 88 words, the maximum length of message words is 85.  After the
+ * 1st word (header) is removed, the maximum number of words for the message
+ * is 84 words.  As 3 characters can be sent per word, the maximum number
+ * of characters which can be sent in one Frame is 251 [3 chars/word × 84
+ * words - 1 = 251].  Longer messages are transmitted by Fragmentation.
+ *
+ * Returns the number of fragments created. Each fragment is a newly
+ * allocated string (caller must free). If the message fits in one
+ * fragment, return 1 with fragments[0] = strdup(message).
+ *
+ * Fragmentation applies to Alpha (V=101), HEX/Binary (V=010), and Secure
+ * (V=000) message types.  Per §4.2 ③: Numeric Messages (V=011, V=100,
+ * V=111) cannot be fragmented.
+ *
+ * Each fragment carries:
+ *   F: 2-bit Fragment Number — modulo 3 sequence (11, 00, 01, 10, 00, ...).
+ *      "11" is skipped after the first to avoid ambiguity.
+ *   C: Message Continued Flag — 1 for all but the last fragment, which
+ *      resets C to 0 to indicate the end of the fragment stream.
+ *   N: 6-bit Message Number (0-63) — same across all fragments.
  *
  * The caller (flex_fragment_queue) handles assigning retrieval numbers,
- * fragment_index, total_fragments, and f0f1 flags on each flex_msg_t. */
+ * fragment_index, total_fragments, and C/F flags on each flex_msg_t. */
 int flex_fragment_message(const char *message, int msg_type,
 			  int max_chars_per_fragment,
 			  char **fragments, int max_fragments)
@@ -2228,7 +2284,24 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 	 * Continuation fragments skip header2, so data starts at word 1. */
 	memset(msg_words, 0, sizeof(msg_words));
 
-	/* Header word 1: C, F, N (K computed last) */
+	/* Header word 1: C, F, N (K computed last).
+	 *
+	 * F: Message Fragment Number (2 bits, §3.10.1.2).
+	 *   F is a modulo 3 message fragment number which increments by 1
+	 *   for each of the consecutive fragments.  The first fragment
+	 *   starts with "11" and is incremented by 1 modulo 3 for each of
+	 *   the subsequent fragments (11, 00, 01, 10, 00, 01, 10, 00, ...).
+	 *   The state for "11" after the first fragment is skipped in order
+	 *   to prevent it from being mistaken as the first fragment of a
+	 *   non-consecutive message.
+	 *
+	 * C: Message Continued Flag (1 bit).
+	 *   The last fragment is indicated by resetting the Message
+	 *   Continued Flag (C) to 0.  C=1 means more fragments follow.
+	 *
+	 * N: Message Number (6 bits, 0-63).
+	 *   Identifies the fragment stream — same N across all fragments
+	 *   of one message. */
 	msg_words[0] = (f_val << FLEX_HEX_HDR_F_SHIFT);
 	if (c_val)
 		msg_words[0] |= FLEX_HEX_HDR_C_MASK;
@@ -4739,7 +4812,9 @@ static uint32_t encode_kanji_message(uint32_t *frame_words, const char *msg,
 	if (num_chars > max_chars)
 		num_chars = max_chars;
 
-	/* Word 0: fragment flags f0f1=11 (initial fragment) */
+	/* Word 0: fragment flags f0f1=11 (initial fragment).
+	 * Kanji messages currently only support single-fragment encoding
+	 * (no C/F/N fragmentation fields — always F=11, C=0). */
 	msg_word[0] = FLEX_ALPHA_FRAG_INITIAL;
 
 	/* Pack 16-bit characters, 1 per 21-bit word */

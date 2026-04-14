@@ -132,10 +132,16 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 /* Max tracked in-flight fragment streams (§4.2 ①②) */
 #define FLEX_MAX_INFLIGHT		32
 
-/* Max frames between consecutive fragments — single-channel (§4.2 ④) */
+/* Max frames between consecutive fragments — single-channel (§4.2 ④).
+ * Per spec: "The transmission interval between each fragment of the same
+ * message must be 32 Frames (equivalent to 1 minute) or less." */
 #define FLEX_FRAG_INTERVAL_SINGLE	32
 
-/* Max frames between consecutive fragments — shared/multi-tx (§4.2 ④) */
+/* Max frames between consecutive fragments — shared/multi-tx (§4.2 ④).
+ * Per spec: "When use of the pertinent channel is shared with another
+ * system, however, (or in the case of multiple transmission or
+ * Multi-area/Roaming channel), the transmission interval for each
+ * fragment can be 128 Frames (equivalent to 4 minutes) or less." */
 #define FLEX_FRAG_INTERVAL_SHARED	128
 
 /* Max subframes per frame (4x transmission) */
@@ -1621,13 +1627,24 @@ static inline uint8_t flex_num_char_to_bcd(uint8_t ch)
 /* f0f1 = 11 indicates initial (and possibly only) fragment */
 #define FLEX_ALPHA_FRAG_INITIAL		0x1800U
 
-/* Fragment number F (2 bits) — modulo 3 sequence per spec:
- *   First fragment:  F=11 (3)
- *   Second:          F=00 (0) — skips 11 to avoid confusion with new initial
- *   Third:           F=01 (1)
- *   Fourth:          F=10 (2)
- *   Fifth:           F=00 (0), etc.
- * Sequence: 3, 0, 1, 2, 0, 1, 2, 0, 1, 2, ...
+/* F: Message Fragment Number (2 bits) — modulo 3 sequence per spec §3.10.
+ *
+ * A message can be divided into several fragments for transmission
+ * (refer to Chapter 4 for methods used for fragmenting long messages).
+ *
+ * F is a modulo 3 message fragment number which increments by 1 for
+ * each of the consecutive fragments.  The first fragment starts with
+ * "11" and is incremented by 1 modulo 3 for each of the subsequent
+ * fragments (11, 00, 01, 10, 00, 01, 10, 00, ...).
+ *
+ * The state for "11" after the first fragment is skipped in order to
+ * prevent it from being mistaken as the first fragment of a
+ * non-consecutive message.  The last fragment is indicated by
+ * resetting the Message Continued Flag (C) to 0.
+ *
+ * Decimal sequence: 3, 0, 1, 2, 0, 1, 2, 0, 1, 2, ...
+ *
+ * Applies to: Alpha (V=101), HEX/Binary (V=010), Secure (V=000).
  */
 static inline uint32_t flex_fragment_number(int fragment_index)
 {
@@ -1636,13 +1653,17 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 	return (uint32_t)((fragment_index - 1) % 3);
 }
 
-/* Alpha message header word (1st word) bit layout:
+/* Alpha message header word (1st word) bit layout (§3.10.1.3):
  *   bits 0-9:   K  (10-bit fragment checksum)
- *   bit  10:    C  (message continued flag)
- *   bits 11-12: F  (2-bit fragment number, mod 3)
- *   bits 13-18: N  (6-bit message number, 0-63)
- *   bit  19:    R  (message retrieval flag)
- *   bit  20:    M  (mail drop flag)
+ *   bit  10:    C  (message continued flag: 1 = more fragments follow,
+ *                    0 = last or only fragment)
+ *   bits 11-12: F  (2-bit fragment number, modulo 3 sequence:
+ *                    first fragment F=11; subsequent fragments increment
+ *                    by 1 mod 3 skipping 11: 00, 01, 10, 00, 01, 10, ...)
+ *   bits 13-18: N  (6-bit message number, 0-63; identifies the fragment
+ *                    stream — same N across all fragments of one message)
+ *   bit  19:    R  (message retrieval flag — first fragment only)
+ *   bit  20:    M  (mail drop flag — first fragment only)
  */
 #define FLEX_ALPHA_HDR_K_MASK		0x000003FFU	/* bits 0-9 */
 #define FLEX_ALPHA_HDR_K_BITS		10
@@ -1697,11 +1718,15 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_ALPHA_K_GRP3_SHIFT		16
 #define FLEX_ALPHA_K_GRP3_MASK		0x1FU		/* bits 16-20 */
 
-/* HEX/Binary message header word (1st word) bit layout:
+/* HEX/Binary message header word (1st word) bit layout (§3.10.1.2):
  *   bits 0-11:  K  (12-bit fragment checksum)
- *   bit  12:    C  (message continued flag)
- *   bits 13-14: F  (2-bit fragment number, mod 3)
- *   bits 15-20: N  (6-bit message number, 0-63)
+ *   bit  12:    C  (message continued flag: 1 = more fragments follow,
+ *                    0 = last or only fragment)
+ *   bits 13-14: F  (2-bit fragment number, modulo 3 sequence:
+ *                    first fragment F=11; subsequent fragments increment
+ *                    by 1 mod 3 skipping 11: 00, 01, 10, 00, 01, 10, ...)
+ *   bits 15-20: N  (6-bit message number, 0-63; identifies the fragment
+ *                    stream — same N across all fragments of one message)
  */
 #define FLEX_HEX_HDR_K_MASK		0x00000FFFU	/* bits 0-11 */
 #define FLEX_HEX_HDR_K_BITS		12

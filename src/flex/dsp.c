@@ -1307,7 +1307,23 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 
 /* ===== Fragment Reassembly Helpers ===== */
 
-/* Multi-message and co-packing compliance (Req 21.1-21.6):
+/* Fragment reassembly for Alpha (V=101), HEX/Binary (V=010), and Secure
+ * (V=000) messages.  These message types support fragmentation using:
+ *
+ *   F: 2-bit Fragment Number — modulo 3 sequence that increments by 1
+ *      for each consecutive fragment.  First fragment starts with F=11;
+ *      subsequent fragments cycle 00, 01, 10, 00, 01, 10, ...
+ *      The state "11" is skipped after the first fragment to prevent it
+ *      from being mistaken as the first fragment of a non-consecutive
+ *      message.
+ *
+ *   C: Message Continued flag — 1 = more fragments follow, 0 = last or
+ *      only fragment.  The last fragment is indicated by resetting C to 0.
+ *
+ *   N: 6-bit Message Number (0-63) — identifies the fragment stream so
+ *      the receiver can match fragments belonging to the same message.
+ *
+ * Multi-message and co-packing compliance (Req 21.1-21.6):
  *
  * The fragment reassembly system correctly handles co-packed
  * fragments and other-capcode messages:
@@ -1368,7 +1384,7 @@ found:
 	flex->rx.reasm[pol][i].msg_type = msg_type;
 	flex->rx.reasm[pol][i].kanji = 0;
 	flex->rx.reasm[pol][i].secure_subtype = -1;
-	flex->rx.reasm[pol][i].expected_f = 0; /* next after initial (F=11) is F=00 */
+	flex->rx.reasm[pol][i].expected_f = 0; /* next F after initial (F=11) is F=00 per mod 3 sequence */
 	flex->rx.reasm[pol][i].last_frame = flex->rx.fiw_frame;
 	flex->rx.reasm[pol][i].last_cycle = flex->rx.fiw_cycle;
 	return i;
@@ -1390,8 +1406,63 @@ static int reasm_append(flex_t *flex, int slot, const char *text, int text_len)
 	return 0;
 }
 
-/* Expire stale reassembly slots (per spec: 32 frames max between fragments,
- * we use 64 as a generous timeout). Outputs partial result on expiry. */
+/* Invalidate any active reassembly slot for a capcode (§4.2 ①).
+ *
+ * Per §4.2 ①: once an address begins transmitting a fragmented message,
+ * that same address must not start a new fragmented transmission until
+ * the first has been completed.  Therefore, if we receive a new initial
+ * fragment (F=11, C=1) or a complete unfragmented message (F=11, C=0)
+ * for a capcode that has an active reassembly slot, the previous fragment
+ * stream was abandoned (lost fragments on air).
+ *
+ * Behavior: log the partial content at NOTICE level (same as reasm_expire
+ * timeout path — both represent incomplete fragment streams) and deactivate
+ * the slot.  The partial data is NOT output as a decoded message because
+ * it is missing one or more fragments and would be truncated/corrupt.
+ *
+ * exclude_msg_num: if >= 0, don't invalidate a slot with this msg_num
+ *   (used when a new initial fragment for the same stream arrives — the
+ *   caller will reasm_alloc a fresh slot with the new msg_num). */
+static void reasm_invalidate_capcode(flex_t *flex, uint64_t capcode,
+				     int exclude_msg_num)
+{
+	int pol = flex->rx.polarity;
+	int i;
+	for (i = 0; i < FLEX_REASM_SLOTS; i++) {
+		if (!flex->rx.reasm[pol][i].active)
+			continue;
+		if (flex->rx.reasm[pol][i].capcode != capcode)
+			continue;
+		if (exclude_msg_num >= 0 &&
+		    flex->rx.reasm[pol][i].msg_num == exclude_msg_num)
+			continue;
+		/* Previous fragment stream was abandoned — log partial and release.
+		 * Same handling as reasm_expire (timeout): the incomplete data
+		 * is logged for diagnostics but not emitted as a decoded message. */
+		if (flex->rx.reasm[pol][i].len > 0) {
+			const char *type_tag =
+				(flex->rx.reasm[pol][i].msg_type == FLEX_VECTOR_TYPE_HEX_BINARY)
+				? "HEX" :
+				(flex->rx.reasm[pol][i].msg_type == FLEX_VECTOR_TYPE_SECURE)
+				? "SEC" : "ALN";
+			LOGP(DDSP, LOGL_NOTICE,
+			     "RX: reassembly ABANDONED [%09" PRIu64 "] msgnum=%d "
+			     "(new message for same capcode) partial %s \"%s\"\n",
+			     capcode, flex->rx.reasm[pol][i].msg_num,
+			     type_tag, flex->rx.reasm[pol][i].buf);
+		} else {
+			LOGP(DDSP, LOGL_DEBUG,
+			     "RX: reassembly ABANDONED [%09" PRIu64 "] msgnum=%d "
+			     "(new message for same capcode, empty)\n",
+			     capcode, flex->rx.reasm[pol][i].msg_num);
+		}
+		flex->rx.reasm[pol][i].active = 0;
+	}
+}
+
+/* Expire stale reassembly slots.  Per spec: 32 frames max between
+ * consecutive fragments; we use 64 as a generous timeout.
+ * Outputs partial result on expiry (incomplete fragment stream). */
 static void reasm_expire(flex_t *flex)
 {
 	int pol, i;
@@ -2857,7 +2928,8 @@ parse_phase:
 			 * regardless of message length."
 			 *
 			 * Teardown: clear the slot when the message is complete:
-			 *   - Alpha/Secure: C=0 in header (not continued)
+			 *   - Alpha/Secure: C=0 in header (Message Continued flag
+			 *     reset to 0 indicates last or only fragment)
 			 *   - Tone/Numeric/HEX: always complete (single frame)
 			 * If C=1 (continued), the slot stays active for the next
 			 * frame's fragment. */
@@ -2952,6 +3024,11 @@ parse_phase:
 				 * Present on ALL secure fragments (bits 19-20). */
 				int sec_t = -1; /* -1 = not secure */
 				const char *msg_tag = "ALN"; /* default for alpha */
+				/* Fragment classification from C and F fields:
+				 *   'K' = complete (C=0, F=11: single unfragmented msg)
+				 *   'F' = continuation (C=1: more fragments follow)
+				 *   'C' = final fragment (C=0, F≠11: last fragment,
+				 *          indicated by resetting C to 0) */
 				char frag_flag = '?';
 				int hdr_idx = is_long ? (j + 1) : mw1;
 				if (hdr_idx < FLEX_WORDS_PER_FRAME &&
@@ -3413,16 +3490,28 @@ parse_phase:
 						  text,
 						  word_status);
 
-					/* Reassembly logic for fragmented messages.
+					/* Reassembly logic for fragmented Alpha/Secure messages.
 					 *
-					 * F sequence per spec (§3.10.1.2/3):
-					 *   11(initial), 00, 01, 10, 00, 01, 10, ...
+					 * Fragment Number F uses a modulo 3 sequence:
+					 *   First fragment:  F=11 (initial)
+					 *   Subsequent:      00, 01, 10, 00, 01, 10, ...
+					 *   ("11" is skipped after the first fragment to
+					 *    prevent confusion with a new message start)
+					 *
+					 * Message Continued flag C:
+					 *   C=1: more fragments follow
+					 *   C=0: last or only fragment (resets to indicate end)
+					 *
 					 * We validate expected_f on continuation/final
 					 * fragments to detect missing or out-of-order
 					 * fragments.  On mismatch we log a warning but
 					 * still append (best-effort reassembly). */
 					if (frag_flag == 'F' && is_initial) {
-						/* First fragment (F=11, C=1) — start reassembly */
+						/* First fragment (F=11, C=1) — start reassembly.
+						 * Per §4.2 ①: if this capcode had an active
+						 * reassembly slot from a previous (abandoned)
+						 * fragment stream, invalidate it first. */
+						reasm_invalidate_capcode(flex, capcode, hdr_n);
 						int reasm_type = (vec_type == FLEX_VECTOR_TYPE_SECURE)
 							? FLEX_VECTOR_TYPE_SECURE : FLEX_VECTOR_TYPE_ALPHA;
 						int slot = reasm_alloc(flex, capcode, hdr_n, reasm_type);
@@ -3560,7 +3649,13 @@ parse_phase:
 							flex->rx.reasm[pol][slot].active = 0;
 						}
 					}
-					/* frag_flag == 'K': complete message, no reassembly needed */
+					/* frag_flag == 'K': complete (unfragmented) message.
+					 * Per §4.2 ①: if this capcode had an active
+					 * reassembly slot, the previous fragment stream
+					 * was abandoned — invalidate it. */
+					if (frag_flag == 'K') {
+						reasm_invalidate_capcode(flex, capcode, -1);
+					}
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_NUMERIC ||
 				   vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM ||
@@ -4002,6 +4097,15 @@ parse_phase:
 			} else if (vec_type == FLEX_VECTOR_TYPE_HEX_BINARY) {
 				/* HEX/Binary message (Spec §3.10.1.2).
 				 *
+				 * Supports fragmentation with C/F/N fields:
+				 *   F = 2-bit fragment number, modulo 3 sequence
+				 *       (first F=11, then 00, 01, 10, 00, ...
+				 *       — "11" skipped after first to avoid ambiguity).
+				 *   C = message continued (1 = more fragments follow,
+				 *       0 = last/only; last fragment resets C to 0).
+				 *   N = 6-bit message number (0-63) identifying the
+				 *       fragment stream.
+				 *
 				 * First message word = header: K(12), C(1), F(2), N(6).
 				 * First fragment also has a 2nd header word with
 				 * R, M, D, H, B, I, s, S fields.
@@ -4020,6 +4124,11 @@ parse_phase:
 					uint32_t rx_hex_sig = 0; /* S field from hdr2 (8-bit signature) */
 					int hex_has_sig = 0; /* 1 if we extracted S from hdr2 */
 					const char *hex_sig_status = ""; /* signature validation result */
+					/* Fragment classification from C and F fields:
+					 *   'K' = complete (C=0, F=11: single unfragmented msg)
+					 *   'F' = continuation (C=1: more fragments follow)
+					 *   'C' = final fragment (C=0, F≠11: last fragment,
+					 *          indicated by resetting C to 0) */
 					char hex_frag_flag = '?';
 					int data_start = mw1; /* default: all words */
 
@@ -4427,11 +4536,23 @@ parse_phase:
 						  prio_flag,
 						  hex);
 
-					/* HEX fragment reassembly (same pattern as alpha).
+					/* HEX fragment reassembly (same C/F/N pattern as alpha).
+					 *
+					 * Fragment Number F: modulo 3 sequence (11, 00, 01,
+					 * 10, 00, ...) — "11" skipped after first fragment.
+					 * Message Continued C: 1 = more fragments, 0 = last
+					 * (last fragment resets C to 0).
+					 * Message Number N: 6-bit (0-63), same across all
+					 * fragments of one message.
+					 *
 					 * We reassemble the hex string representation.
 					 * No separator between fragments — hex is a
 					 * continuous nibble stream, not text. */
 					if (hex_frag_flag == 'F' && hex_is_initial) {
+						/* First HEX fragment (F=11, C=1) — start reassembly.
+						 * Per §4.2 ①: invalidate any stale reassembly
+						 * for this capcode from an abandoned stream. */
+						reasm_invalidate_capcode(flex, capcode, hex_n);
 						int slot = reasm_alloc(flex, capcode, hex_n, FLEX_VECTOR_TYPE_HEX_BINARY);
 						flex->rx.reasm[pol][slot].blocking = hex_blocking;
 						reasm_append(flex, slot, hex, hi);
@@ -4484,7 +4605,13 @@ parse_phase:
 							flex->rx.reasm[pol][slot].active = 0;
 						}
 					}
-					/* hex_frag_flag == 'K': complete message, no reassembly needed */
+					/* hex_frag_flag == 'K': complete (unfragmented) message.
+					 * Per §4.2 ①: if this capcode had an active
+					 * reassembly slot, the previous fragment stream
+					 * was abandoned — invalidate it. */
+					if (hex_frag_flag == 'K') {
+						reasm_invalidate_capcode(flex, capcode, -1);
+					}
 				}
 			} else {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,

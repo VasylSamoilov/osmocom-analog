@@ -671,14 +671,65 @@ void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame)
 }
 
 /*
- * Check if a message needs fragmentation and split it if so.
+ * Check if a message needs fragmentation and split it if so (§4.1, §4.2).
+ *
+ * Per §4.1: when the full length of a message cannot be contained in one
+ * Frame, the individual message must be broken down into fragments.  The
+ * respective fragments need to be transmitted over several Frames in order
+ * for the complete message to be transmitted as one message.
  *
  * Walks the message queue and splits any message that exceeds the
- * single-frame capacity for its type. The original message is replaced
- * with fragment messages, each carrying the same retrieval number.
+ * single-frame capacity for its type.  The original message is replaced
+ * with fragment messages, each carrying the same retrieval number (N).
  *
- * Fragment flags (f0f1) are stored in the fragment_index/total_fragments
- * fields — the alpha encoder will use these when encoding each fragment.
+ * Fragment scheduling constraints (§4.2):
+ *   ① Once an address is used to begin transmitting a fragmented message,
+ *     that same address must not be used to start a new fragmented
+ *     transmission until the first fragmented transmission has been
+ *     completed.  (Enforced by frag_excluded() at scheduling time.)
+ *   ② For the duration that an address is being used to send a fragmented
+ *     message, that same address must not appear more than once in any
+ *     Frame to send an unfragmented message.  (Enforced by frag_excluded().)
+ *   ③ Numeric Messages (V=011, V=100, V=111) cannot be fragmented.
+ *   ④ The transmission interval between each fragment of the same message
+ *     must be 32 Frames or less (FLEX_FRAG_INTERVAL_SINGLE).  When the
+ *     channel is shared with another system or uses multiple transmission /
+ *     Multi-area/Roaming, the interval can be 128 Frames
+ *     (FLEX_FRAG_INTERVAL_SHARED).  (Enforced by frag_excluded().)
+ *
+ * Each fragment carries:
+ *   F: 2-bit Fragment Number — modulo 3 sequence (11, 00, 01, 10, 00, ...).
+ *      "11" is skipped after the first fragment.
+ *   C: Message Continued Flag — 1 = more fragments follow; the last
+ *      fragment resets C to 0.
+ *   N: 6-bit Message Number (0-63) — same across all fragments.
+ *
+ * The first fragment (index 0) is immediately eligible for transmission;
+ * subsequent fragments are held ineligible until the preceding fragment's
+ * post-transmit handler releases them.  The last fragment triggers
+ * retransmission cycling or stream destruction.
+ *
+ * Carry-on (§3.7.1, §4.2.1): when fragments span multiple frames, the
+ * scheduler sets the BIW1 carry-on field (0-3) to indicate how many
+ * additional frames the pager should continue decoding beyond its
+ * assigned collapse frame.  Carry-on is not allowed for multiple
+ * transmission (num_transmissions > 1).
+ *
+ * Polarity: retrieval numbers (N) are assigned per-polarity via
+ * frag_retrieval_seq to avoid N collisions across polarities.
+ *
+ * Phase: fragments inherit the phase assignment from the original message
+ * (capcode-based or explicit override).  The scheduler's phase assignment
+ * ensures all fragments of a message appear on the same phase.
+ *
+ * Collapse: the first fragment respects the collapse schedule — it is
+ * only eligible on frames matching the capcode's assigned collapse frame.
+ * Continuation fragments (index > 0) also respect the collapse schedule
+ * by default, but when carry-on is set (§4.2.1), they are allowed on
+ * frames within the carry-on window beyond the collapse frame.  This
+ * ensures the pager (which is told to keep decoding via BIW1 carry-on)
+ * can receive the continuation fragments without waiting for the next
+ * collapse-aligned frame.
  */
 static void flex_fragment_queue(flex_t *flex)
 {
@@ -704,14 +755,18 @@ static void flex_fragment_queue(flex_t *flex)
 	for (msg = flex->msg_list; msg; msg = next) {
 		next = msg->next;
 
-		/* Only fragment alpha, numeric, and hex messages */
+		/* Only fragment alpha, hex, and secure messages.
+		 * Per §4.2 ③: Numeric Messages (V=011, V=100, V=111)
+		 * cannot be fragmented. */
 		switch (msg->msg_type) {
 		case FLEX_MSG_TYPE_ALPHA: {
-			/* Available message words = 88 - biw - addr - vector.
+			/* Per §4.1: available message words = 88 - biw - addr - vector.
 			 * Short addr = 1 word, long = 2.  Vector = 1 word.
 			 * Alpha: chars = (msg_words - 1) * 3 - 2
 			 *   (1 header word, signature eats 1 char slot,
-			 *    ETX padding eats 1 more). */
+			 *    ETX padding eats 1 more).
+			 * For a Short Address with 1 BIW: 88-1-1-1 = 85 msg words,
+			 * 84 data words × 3 chars - 1 = 251 chars max (per §4.1). */
 			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
 			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
 					      - addr_words - 1; /* 1 vector */
@@ -766,8 +821,10 @@ static void flex_fragment_queue(flex_t *flex)
 			break;
 		}
 		default:
-			/* Numeric types (standard, special format, numbered)
-			 * are single-frame only — no fragmentation needed. */
+			/* Per §4.2 ③: Numeric Messages (those having a vector
+			 * type of 011, 100, 111) cannot be fragmented.
+			 * Standard numeric, special format, and numbered
+			 * numeric are single-frame only. */
 			continue;
 		}
 
@@ -789,8 +846,10 @@ static void flex_fragment_queue(flex_t *flex)
 			continue;
 		}
 
-		/* Assign a retrieval number for this set of fragments.
-		 * Use the per-polarity counter (Req 4.4). */
+		/* Assign a retrieval number (N) for this set of fragments.
+		 * Per §4.2: N identifies all fragments of the same message.
+		 * Use the per-polarity counter to avoid N collisions across
+		 * polarities (normal vs inverted). */
 		int frag_pol = pol_index(msg->polarity);
 		uint32_t ret_num = flex->tx_pol[frag_pol].frag_retrieval_seq++;
 		flex->tx_pol[frag_pol].frag_retrieval_seq &= 0x3F; /* 6-bit counter: N is 0-63 per spec */
@@ -800,7 +859,11 @@ static void flex_fragment_queue(flex_t *flex)
 		     msg->capcode, frag_count, ret_num);
 
 		/* Create fragment messages and insert them in place of the original.
-		 * We insert after the original, then destroy the original. */
+		 * We insert after the original, then destroy the original.
+		 *
+		 * Each fragment inherits the original message's polarity, phase,
+		 * speed, and modulation type — ensuring all fragments of a
+		 * message are transmitted on the same polarity/phase/speed. */
 		for (i = 0; i < frag_count; i++) {
 			flex_msg_t *frag;
 			int flen = (int)strlen(fragments[i]);
@@ -842,11 +905,19 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->next_send_frame = msg->next_send_frame;
 
 			/* Only the first fragment (index 0) is initially
-			 * eligible for transmission.  Non-first fragments
-			 * become eligible when the preceding fragment's
-			 * post-transmit handler sets their next_send_frame.
-			 * Place them 959 frames ahead (half the 1920-frame
-			 * hour minus 1) so frame_is_eligible() rejects them. */
+			 * eligible for transmission — it is the special case
+			 * that starts the fragment stream.  Non-first fragments
+			 * become eligible only when the preceding fragment's
+			 * post-transmit handler sets their next_send_frame to
+			 * the current frame (immediate chaining per §4.2 ④).
+			 *
+			 * Place non-first fragments 959 frames ahead (half the
+			 * 1920-frame hour minus 1) so frame_is_eligible()
+			 * rejects them until explicitly released.
+			 *
+			 * The first fragment respects the capcode's collapse
+			 * schedule — it will only be picked for frames matching
+			 * the capcode's assigned collapse frame. */
 			if (i > 0)
 				frag->next_send_frame = (msg->next_send_frame + 959) % 1920;
 
@@ -1010,9 +1081,13 @@ static int flex_msg_supports_retransmit(enum flex_msg_type type)
 /*
  * Fragment queue helpers for retransmission.
  *
- * Fragments of the same message share the same retrieval_num and are
+ * Fragments of the same message share the same retrieval_num (N) and are
  * linked as consecutive flex_msg_t nodes in the queue with incrementing
  * fragment_index (0 through total_fragments-1).
+ *
+ * All fragments inherit the same polarity, phase, speed, and modulation
+ * type from the original message, ensuring the entire fragment stream
+ * is transmitted consistently on the same channel parameters.
  */
 
 /* Find the first fragment (fragment_index == 0) of a message identified
@@ -1079,10 +1154,29 @@ static void flex_destroy_all_fragments(flex_t *flex, uint32_t retrieval_num,
  * For fragmented messages (total_fragments > 1):
  * - retransmit_count/retransmit_max are tracked on the first fragment
  *   (fragment_index == 0); other fragments inherit the state.
- * - Non-last fragments: make the next fragment eligible immediately.
- * - Last fragment: if retransmissions remain, set next_send_frame on
- *   the first fragment and increment retransmit_count once for the
- *   whole cycle.  If done, destroy all fragments.
+ *
+ * - First fragment (index 0): special case — it is the only fragment
+ *   initially eligible for transmission.  After it is sent, the next
+ *   fragment (index 1) becomes immediately eligible via next_send_frame.
+ *   The first fragment also holds the authoritative retransmit_count.
+ *
+ * - Non-last fragments (index 1..N-2): after transmission, make the
+ *   next fragment eligible immediately (next_send_frame = current).
+ *   If retransmission is configured, keep the fragment but mark it
+ *   ineligible until the retransmission cycle restarts from fragment 0.
+ *
+ * - Last fragment (index N-1): special case — completing the last
+ *   fragment finishes one full pass of the fragment stream.  If
+ *   retransmissions remain, increment retransmit_count on the first
+ *   fragment, schedule its next_send_frame for the retransmission
+ *   interval, and mark all non-first fragments ineligible.  If done,
+ *   destroy all fragments.
+ *
+ * Per §4.2 ④: the transmission interval between consecutive fragments
+ * must not exceed 32 Frames (or 128 when channel is shared).  The
+ * immediate-eligibility chaining (next_send_frame = current_abs)
+ * ensures fragments go out in consecutive eligible frames, well within
+ * the interval limit.
  */
 static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 			       uint32_t current_abs_frame)
@@ -1533,6 +1627,13 @@ static inline int is_collapse_aligned(uint32_t frame_number,
  *   - The last fragment (fragment_index == total_fragments - 1) has NOT
  *     been sent yet
  *
+ * This is used to enforce the §4.2 address exclusion rules: while a
+ * fragmented stream is in-flight for a capcode, no new fragmented or
+ * unfragmented message for that same capcode may be transmitted (except
+ * the next continuation fragment of the in-flight stream itself).
+ *
+ * Also tracks last_sent_abs for §4.2 ④ interval checking (32/128 frames).
+ *
  * Returns the number of in-flight entries written to inflight[]. */
 static int flex_scan_inflight(flex_t *flex, flex_inflight_frag_t *inflight,
                               int max_inflight)
@@ -1607,14 +1708,26 @@ static int flex_scan_inflight(flex_t *flex, flex_inflight_frag_t *inflight,
 	return n_inflight;
 }
 
-/* Check if a message is excluded by fragmentation rules (Req 5.3-5.7).
+/* Check if a message is excluded by fragmentation rules (§4.2).
  * Returns 1 if the message should be skipped, 0 if allowed.
  *
- * Rules:
- *  4.2 (1): Same capcode can't start new fragmented TX while one is in-flight
- *  4.2 (2): Same capcode can't appear for unfragmented msg while in-flight
- *  4.2 (4): Fragment interval must not exceed limit (32 or 128 frames)
- *  Exception: the NEXT eligible fragment of the in-flight stream IS allowed
+ * Enforces the following spec requirements:
+ *
+ *  §4.2 ①: Once an address is used to begin transmitting a fragmented
+ *     message, that same address must not be used to start a new
+ *     fragmented transmission until the first has been completed.
+ *
+ *  §4.2 ②: For the duration that an address is being used to send a
+ *     fragmented message, that same address must not appear more than
+ *     once in any Frame to send an unfragmented message.
+ *
+ *  §4.2 ④: The transmission interval between each fragment of the same
+ *     message must be 32 Frames or less.  When the channel is shared
+ *     with another system, or in the case of multiple transmission or
+ *     Multi-area/Roaming channel, the interval can be 128 Frames.
+ *
+ *  Exception: the NEXT eligible fragment of the in-flight stream IS
+ *     allowed (it must go out to maintain the fragment interval).
  *
  * interval_limit: max frames between consecutive fragments
  *   (FLEX_FRAG_INTERVAL_SINGLE=32 or FLEX_FRAG_INTERVAL_SHARED=128).
@@ -1959,6 +2072,46 @@ static int flex_get_next_frame_network(flex_t *flex)
 	/* Scan for in-flight fragment streams (§4.2 ①②) */
 	n_inflight = flex_scan_inflight(flex, inflight, FLEX_MAX_INFLIGHT);
 
+	/* Early carry-on computation (§3.7.1, §4.2.1, §4.2.2).
+	 *
+	 * Must be computed BEFORE the candidate collection loop so the
+	 * collapse filter can allow continuation fragments on non-collapse
+	 * frames within the carry-on window.
+	 *
+	 * Per §4.2.1: the 1st fragment is transmitted matching the Pager
+	 * Collapse value.  The 2nd and subsequent fragments are generally
+	 * sent in Frames which have continuance with the Frame in which
+	 * the 1st fragment was transmitted.  The BIW1 carry-on field
+	 * (0-3) tells the pager how many additional frames beyond its
+	 * assigned collapse frame it should continue decoding.
+	 *
+	 * Per §4.2.2 Rule ②: carry-on ≤ 2^m - 1 (collapse cycle - 1).
+	 * Per spec: "Carry On is not allowed for multiple transmission." */
+	if (flex->collapse > 0 && flex->num_transmissions <= 1 && n_inflight > 0) {
+		flex_msg_t *qm;
+		int max_remaining = 0;
+		int sel_pol = flex->last_tx_polarity;
+		for (qm = flex->msg_list; qm; qm = qm->next) {
+			if (pol_index(qm->polarity) != sel_pol)
+				continue;
+			if (qm->speed != params.bitrate ||
+			    qm->modulation_type != params.modulation_type)
+				continue;
+			if (qm->total_fragments > 1 &&
+			    qm->fragment_index < qm->total_fragments - 1) {
+				int rem = qm->total_fragments - 1 - qm->fragment_index;
+				if (rem > max_remaining)
+					max_remaining = rem;
+			}
+		}
+		if (max_remaining > 0) {
+			int alpha_max = (1 << flex->collapse) - 1;
+			if (max_remaining > alpha_max)
+				max_remaining = alpha_max;
+			params.carry_on = (max_remaining > 3) ? 3 : max_remaining;
+		}
+	}
+
 	/* Compute available frame capacity */
 
 	/* Pre-scan: detect system messages to set sysmsg_a_type
@@ -2023,7 +2176,10 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 	}
 
-	/* Co-packing (§4.2.3, Req 20.1-20.5):
+	/* Co-packing (§4.1, §4.2.3):
+	 *
+	 * Per §4.1: "other paging messages to other pagers can also exist
+	 * within the same Frame that a fragmented message is being sent in."
 	 *
 	 * The three-pass collection inherently implements co-packing
 	 * of other-capcode messages alongside fragments. Fragment
@@ -2037,11 +2193,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 * other-capcode messages as phase_est_used accumulates
 	 * per phase.
 	 *
-	 * Per-frame independent co-packing (Req 20.5) is inherent
-	 * in the frame-at-a-time architecture: each frame cycle
-	 * runs the full collection fresh with phase_est_used starting
-	 * at 0, and unpacked messages remain in the queue for
-	 * the next frame. */
+	 * Per-frame independent co-packing is inherent in the
+	 * frame-at-a-time architecture: each frame cycle runs the
+	 * full collection fresh with phase_est_used starting at 0,
+	 * and unpacked messages remain in the queue for the next
+	 * frame. */
 
 		/* Three-pass collection */
 		int pass;
@@ -2061,10 +2217,27 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (!frame_is_eligible(candidate->next_send_frame, current_abs))
 					continue;
 
-				/* Collapse filter.
-				 * Skip for temp group DELIVERY — these use a
-				 * Temporary Address and are pinned to a specific
-				 * frame by next_send_frame, not by capcode. */
+				/* Collapse filter (§3.1.2, §4.2.1).
+				 *
+				 * Each capcode has an assigned collapse frame; the
+				 * pager only decodes frames matching its schedule.
+				 *
+				 * Exception 1: temp group DELIVERY uses a Temporary
+				 * Address pinned to a specific frame, not by capcode.
+				 *
+				 * Exception 2 (§4.2.1): continuation fragments of an
+				 * in-flight fragmented message are allowed on frames
+				 * adjacent to the collapse frame, up to carry-on
+				 * frames beyond it.  Per spec: "the 2nd and subsequent
+				 * fragments are generally sent in Frames which have
+				 * continuance with the Frame in which the 1st fragment
+				 * was transmitted."  The BIW1 carry-on field tells the
+				 * pager to keep decoding these extra frames.
+				 *
+				 * Without this exception, continuation fragments would
+				 * be blocked until the next collapse-aligned frame,
+				 * potentially exceeding the §4.2 ④ interval limit
+				 * (32/128 frames). */
 				if (flex->collapse > 0 &&
 				    candidate->temp_delivery_slot < 0) {
 					flex_capcode_sched_t sched;
@@ -2073,8 +2246,54 @@ static int flex_get_next_frame_network(flex_t *flex)
 					nf = flex_scheduler_next_frame(ft.frame,
 								       sched.assigned_frame,
 								       flex->collapse);
-					if (nf != ft.frame)
-						continue;
+					if (nf != ft.frame) {
+						/* Not the assigned collapse frame.
+						 * Allow if this is a continuation fragment
+						 * of an in-flight stream AND we are within
+						 * carry-on range of the collapse frame. */
+						int is_continuation_frag = 0;
+						if (candidate->total_fragments > 1 &&
+						    candidate->fragment_index > 0) {
+							int k;
+							for (k = 0; k < n_inflight; k++) {
+								if (inflight[k].capcode == candidate->capcode &&
+								    candidate->total_fragments == inflight[k].total_fragments &&
+								    candidate->retrieval_num == inflight[k].retrieval_num &&
+								    candidate->fragment_index == inflight[k].last_sent_idx + 1) {
+									is_continuation_frag = 1;
+									break;
+								}
+							}
+						}
+						if (is_continuation_frag && params.carry_on > 0) {
+							/* Check if we're within carry-on range
+							 * of the most recent collapse frame.
+							 * The carry-on value (1-3) in BIW1
+							 * tells the pager to decode this many
+							 * extra frames beyond its assigned
+							 * collapse frame. */
+							uint32_t collapse_cycle = 1U << flex->collapse;
+							uint32_t target = sched.assigned_frame % collapse_cycle;
+							uint32_t cur_mod = ft.frame % collapse_cycle;
+							uint32_t dist;
+							/* Distance from most recent collapse frame */
+							if (cur_mod >= target)
+								dist = cur_mod - target;
+							else
+								dist = collapse_cycle - target + cur_mod;
+							if (dist > 0 && dist <= (uint32_t)params.carry_on) {
+								LOGP(DFLEX, LOGL_DEBUG,
+								     "Scheduler: allowing continuation frag cap=%" PRIu64
+								     " idx=%d on non-collapse frame %u (carry-on=%d, dist=%u)\n",
+								     candidate->capcode, candidate->fragment_index,
+								     ft.frame, params.carry_on, dist);
+							} else {
+								continue; /* outside carry-on range */
+							}
+						} else {
+							continue; /* not a continuation or no carry-on */
+						}
+					}
 				}
 
 				/* System message frame 0 preference (§3.9.2).
@@ -2123,7 +2342,19 @@ static int flex_get_next_frame_network(flex_t *flex)
 					continue;
 
 				/* Fragmentation address exclusion and interval check
-				 * (Req 5.3-5.7, 4.2 rules 1-2-4) */
+				 * (§4.2 rules ①②④).
+				 *
+				 * §4.2 ①: same capcode can't start new fragmented TX
+				 *   while one is in-flight.
+				 * §4.2 ②: same capcode can't appear for unfragmented
+				 *   msg while in-flight.
+				 * §4.2 ④: fragment interval must not exceed limit
+				 *   (32 frames single / 128 frames shared channel).
+				 *
+				 * The interval limit depends on channel sharing:
+				 *   - Single system: 32 frames (1 minute equivalent)
+				 *   - Shared / multiple TX / roaming: 128 frames
+				 *     (4 minutes equivalent) */
 				{
 					int frag_interval = (flex->num_transmissions > 1 ||
 							     flex->roaming_active ||
@@ -2289,46 +2520,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 		phase_params = params;
 		phase_params.single_phase = 1;
 
-		/* Carry-on computation for multi-phase (Spec 3.7.1 / 4.2.1).
+		/* Carry-on: propagate to phase_params.
 		 *
-		 * Per spec: "values for Carry On must be identical for all
-		 * phases in one Frame."  Scan the per-polarity queue for
-		 * fragment messages eligible for this frame and compute
-		 * carry-on from the max remaining fragment count.
-		 * Alpha-bounded per 4.2.2 Rule 2 (Req 5.8).
-		 * Only meaningful with collapse > 0.
-		 * Per spec: "Carry On is not allowed for multiple transmission." */
-		if (flex->collapse > 0 && flex->num_transmissions <= 1) {
-			flex_msg_t *qm;
-			int max_remaining = 0;
-			int sel_pol = flex->last_tx_polarity;
-			for (qm = flex->msg_list; qm; qm = qm->next) {
-				if (pol_index(qm->polarity) != sel_pol)
-					continue;
-				if (qm->speed != params.bitrate ||
-				    qm->modulation_type != params.modulation_type)
-					continue;
-				if (qm->total_fragments > 1 &&
-				    qm->fragment_index < qm->total_fragments - 1) {
-					int rem = qm->total_fragments - 1 - qm->fragment_index;
-					if (rem > max_remaining)
-						max_remaining = rem;
-				}
-			}
-			/* Alpha constraint (§4.2.2 Rule ②, Req 16.4, 17.1):
-			 * carry-on cannot exceed alpha_max = 2^m - 1, since
-			 * the number of continuing frames must be strictly
-			 * less than the collapse cycle length. */
-			{
-				int alpha_max = (1 << flex->collapse) - 1;
-				if (max_remaining > alpha_max)
-					max_remaining = alpha_max;
-			}
-			if (max_remaining > 0) {
-				params.carry_on = (max_remaining > 3) ? 3 : max_remaining;
-				phase_params.carry_on = params.carry_on;
-			}
-		}
+		 * params.carry_on was already computed early (before candidate
+		 * collection) so the collapse filter could use it.  Copy to
+		 * phase_params for per-phase encoding. */
+		phase_params.carry_on = params.carry_on;
 
 		/* Encode each phase independently (Req 2.2, 2.3) */
 		for (p = 0; p < num_phases; p++) {
