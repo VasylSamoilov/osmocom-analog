@@ -2023,6 +2023,11 @@ typedef struct flex_frame_msg {
 	 * 'c' = Operator Messaging Address only
 	 *  0  = normal message (not a system message) */
 	char		sysmsg_method;
+
+	/* Pre-computed whole-message signature for fragmented alpha messages.
+	 * 0xFFFFFFFF = not set (encoder computes from this fragment).
+	 * 0x00-0x7F = use this value on the initial fragment. */
+	uint32_t	precomputed_sig;
 } flex_frame_msg_t;
 
 /* Frame encoding parameters */

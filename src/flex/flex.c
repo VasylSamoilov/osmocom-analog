@@ -157,6 +157,57 @@ void flex_trigger_ers(flex_t *flex)
 	}
 }
 
+/* Compute alpha message signature from raw text.
+ * Per spec §3.10.1.3: 1's complement of binary sum of all 7-bit
+ * character values, excluding ETX (0x03) padding.
+ * Returns the 7-bit signature value (0x00-0x7F). */
+static uint32_t flex_compute_alpha_signature(const char *data, int len)
+{
+	uint32_t sum = 0;
+	int i;
+	for (i = 0; i < len; i++) {
+		unsigned char ch = (unsigned char)data[i] & 0x7F;
+		if (ch != 0x03)
+			sum += ch;
+	}
+	return (~sum) & 0x7F;
+}
+
+/* Compute hex/binary message signature from raw hex nibble string.
+ * Per spec §3.10.1.2: 1's complement of binary sum of all data
+ * taken 8 bits at a time. Input is hex nibble characters (0-9,A-F).
+ * Returns the 8-bit signature value (0x00-0xFF). */
+static uint32_t flex_compute_hex_signature(const char *data, int len)
+{
+	uint32_t sum = 0;
+	int bit_pos = 0;
+	uint8_t accum = 0;
+	int accum_bits = 0;
+	int i;
+	for (i = 0; i < len; i++) {
+		uint8_t nibble;
+		char c = data[i];
+		if (c >= '0' && c <= '9') nibble = c - '0';
+		else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+		else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+		else continue;
+		int b;
+		for (b = 0; b < 4; b++) {
+			accum |= (uint8_t)(((nibble >> b) & 1) << accum_bits);
+			accum_bits++;
+			bit_pos++;
+			if (accum_bits == 8) {
+				sum += accum;
+				accum = 0;
+				accum_bits = 0;
+			}
+		}
+	}
+	if (accum_bits > 0)
+		sum += accum;
+	return (~sum) & 0xFF;
+}
+
 /*
  * Create msg instance.
  */
@@ -275,6 +326,18 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->fragment_index = 0;
 	msg->total_fragments = 0;
 	msg->retrieval_num = 0;
+
+	/* Pre-compute message signature from raw text.
+	 * This covers the entire message before any fragmentation.
+	 * For alpha: 7-bit sig excluding ETX.
+	 * For hex: 8-bit sig over data bytes.
+	 * Secure messages are computed later (encoding not known yet). */
+	if (msg_type == FLEX_MSG_TYPE_ALPHA)
+		msg->precomputed_sig = flex_compute_alpha_signature(msg->data, msg->data_length);
+	else if (msg_type == FLEX_MSG_TYPE_HEX)
+		msg->precomputed_sig = flex_compute_hex_signature(msg->data, msg->data_length);
+	else
+		msg->precomputed_sig = 0xFFFFFFFF; /* not applicable or computed later */
 
 	/* retransmission scheduling defaults */
 	msg->retransmit_max = 0;
@@ -858,6 +921,16 @@ static void flex_fragment_queue(flex_t *flex)
 		     "Fragmenting message for capcode %" PRIu64 " into %d fragments (retrieval=%u).\n",
 		     msg->capcode, frag_count, ret_num);
 
+		/* The whole-message signature was pre-computed at message creation
+		 * time (precomputed_sig). For secure messages, compute it now
+		 * since encoding mode wasn't known at creation time. */
+		if (msg->precomputed_sig == 0xFFFFFFFF) {
+			if (msg->msg_type == FLEX_MSG_TYPE_SECURE && msg->secure_encoding == 0)
+				msg->precomputed_sig = flex_compute_alpha_signature(msg->data, msg->data_length);
+			else if (msg->msg_type == FLEX_MSG_TYPE_SECURE && msg->secure_encoding == 1)
+				msg->precomputed_sig = flex_compute_hex_signature(msg->data, msg->data_length);
+		}
+
 		/* Create fragment messages and insert them in place of the original.
 		 * We insert after the original, then destroy the original.
 		 *
@@ -904,27 +977,13 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->send_delay = msg->send_delay;
 			frag->next_send_frame = msg->next_send_frame;
 
-			/* Only the first fragment (index 0) is initially
-			 * eligible for transmission — it is the special case
-			 * that starts the fragment stream.  Non-first fragments
-			 * become eligible only when the preceding fragment's
-			 * post-transmit handler sets their next_send_frame to
-			 * the current frame (immediate chaining per §4.2 ④).
-			 *
-			 * Place non-first fragments 959 frames ahead (half the
-			 * 1920-frame hour minus 1) so frame_is_eligible()
-			 * rejects them until explicitly released.
-			 *
-			 * The first fragment respects the capcode's collapse
-			 * schedule — it will only be picked for frames matching
-			 * the capcode's assigned collapse frame. */
-			if (i > 0)
-				frag->next_send_frame = (msg->next_send_frame + 959) % 1920;
-
 			/* Set fragmentation state */
 			frag->fragment_index = i;
 			frag->total_fragments = frag_count;
 			frag->retrieval_num = ret_num;
+			/* Store whole-message signature on initial fragment */
+			if (i == 0)
+				frag->precomputed_sig = msg->precomputed_sig;
 		}
 
 		/* Destroy the original (now replaced by fragments) */
@@ -1212,6 +1271,9 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 
 	/* --- Fragmented message path --- */
 
+	/* Mark this fragment as transmitted */
+	msg->fragment_sent = 1;
+
 	/* Look up the first fragment to get authoritative retransmission state */
 	{
 		flex_msg_t *first = flex_find_first_fragment(flex, msg->retrieval_num,
@@ -1224,13 +1286,10 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 				next_frag->next_send_frame = current_abs_frame;
 
 			if (!first || first->retransmit_max == 0) {
-				/* No retransmission — destroy this fragment now */
 				flex_msg_destroy(msg);
 			} else {
-				/* Retransmission configured — keep fragment but
-				 * mark ineligible until retransmission cycle
-				 * restarts from the first fragment. */
-				msg->next_send_frame = (current_abs_frame + 959) % 1920;
+				/* Retransmission configured — keep fragment.
+				 * fragment_sent guard handles ordering on next cycle. */
 			}
 			return;
 		}
@@ -1238,10 +1297,12 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 		/* Last fragment transmitted */
 
 		if (!first) {
-			/* First fragment missing (shouldn't happen) — clean up */
-			LOGP(DFLEX, LOGL_NOTICE,
-			     "Fragment stream incomplete: capcode=%" PRIu64 " retrieval=%u, destroying.\n",
-			     msg->capcode, msg->retrieval_num);
+			/* First fragment already destroyed (normal when
+			 * retransmit_max == 0). Clean up remaining fragments. */
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX_COMPLETE: capcode=%" PRIu64 " type=%s total_tx=1 (fragmented, %d frags)\n",
+			     msg->capcode, flex_msg_type_name(msg->msg_type),
+			     msg->total_fragments);
 			flex_destroy_all_fragments(flex, msg->retrieval_num,
 						   msg->total_fragments);
 			return;
@@ -1262,21 +1323,21 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 
 		/* Retransmissions remain — increment count on first fragment,
 		 * schedule next send on first fragment only.
-		 * Subsequent fragments become eligible after preceding is transmitted.
-		 * Mark all non-first fragments ineligible by placing them 959 frames
-		 * after the first fragment's target (well within the ineligible half
-		 * of the 1920-frame modular space relative to the retransmission time). */
+		 * Reset fragment_sent flags so the ordering guard
+		 * enforces sequential transmission again. */
 		first->retransmit_count++;
+		first->fragment_sent = 0;
 		first->next_send_frame = (current_abs_frame + (uint32_t)first->retransmit_interval) % 1920;
 
 		{
 			flex_msg_t *frag;
-			uint32_t sentinel = (first->next_send_frame + 959) % 1920;
 			for (frag = flex->msg_list; frag; frag = frag->next) {
 				if (frag->total_fragments == msg->total_fragments &&
 				    frag->retrieval_num == msg->retrieval_num &&
-				    frag->fragment_index > 0)
-					frag->next_send_frame = sentinel;
+				    frag->fragment_index > 0) {
+					frag->next_send_frame = first->next_send_frame;
+					frag->fragment_sent = 0;
+				}
 			}
 		}
 
@@ -2217,6 +2278,33 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (!frame_is_eligible(candidate->next_send_frame, current_abs))
 					continue;
 
+				/* Fragment ordering: skip non-first fragments whose
+				 * preceding fragment hasn't been transmitted yet.
+				 * This prevents both fragments from being packed
+				 * into the same frame. */
+				if (candidate->total_fragments > 1 && candidate->fragment_index > 0) {
+					flex_msg_t *prev = NULL;
+					flex_msg_t *scan;
+					for (scan = flex->msg_list; scan; scan = scan->next) {
+						if (scan->total_fragments == candidate->total_fragments &&
+						    scan->retrieval_num == candidate->retrieval_num &&
+						    scan->fragment_index == candidate->fragment_index - 1) {
+							prev = scan;
+							break;
+						}
+					}
+					if (prev && !prev->fragment_sent)
+						continue;
+				}
+
+				/* Debug: log fragment scheduling */
+				if (candidate->total_fragments > 1) {
+					LOGP(DFLEX, LOGL_INFO,
+					     "Scheduler: frag candidate cap=%" PRIu64 " idx=%d/%d next_send=%u current=%u eligible=YES\n",
+					     candidate->capcode, candidate->fragment_index,
+					     candidate->total_fragments, candidate->next_send_frame, current_abs);
+				}
+
 				/* Collapse filter (§3.1.2, §4.2.1).
 				 *
 				 * Each capcode has an assigned collapse frame; the
@@ -2588,6 +2676,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					fm->mail_drop = m->mail_drop;
 					fm->fragment_index = m->fragment_index;
 					fm->total_fragments = m->total_fragments;
+					fm->precomputed_sig = m->precomputed_sig;
 					fm->secure_subtype = m->secure_subtype;
 					fm->secure_encoding = m->secure_encoding;
 					fm->numbered_s = m->numbered_s;

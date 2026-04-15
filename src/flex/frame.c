@@ -38,6 +38,9 @@ struct flex_msg_config {
 	int	blocking_length;/* HEX/Binary B field: bits/char (1-15, 0=16) */
 	int	alpha_r_flag;	/* passed through from flex_frame_msg_t */
 	int	hex_r_flag;	/* passed through from flex_frame_msg_t */
+	uint32_t precomputed_sig; /* whole-message signature for fragmented alpha.
+				   * 0xFFFFFFFF = not set (compute from this fragment).
+				   * 0x00-0x7F = use this value directly. */
 };
 
 /*
@@ -629,7 +632,7 @@ static uint32_t encode_alpha_message(uint32_t *frame_words, const char *msg,
 	uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
 	uint32_t word_idx, fwc;
 	size_t len, max_len;
-	uint32_t sig_sum, k_sum;
+	uint32_t k_sum;
 	int shift;
 	uint32_t i;
 
@@ -833,23 +836,12 @@ static uint32_t encode_alpha_message(uint32_t *frame_words, const char *msg,
 		 * calculation."  This requires tracking which characters
 		 * are function chars vs. data during the sum loop. */
 		if (is_initial_frag) {
-			sig_sum = 0;
-			for (i = 1; i < word_idx; i++) {
-				uint32_t ch;
-				ch = (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
-				ch = (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
-				ch = (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
+			/* Use precomputed whole-message signature.
+			 * Always set by flex_msg_create or flex_encode_frame. */
+			if (config) {
+				const struct flex_msg_config *cfg = config;
+				msg_word[1] |= cfg->precomputed_sig & FLEX_ALPHA_SIG_MASK;
 			}
-			msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
-
-			LOGP(DFLEX, LOGL_DEBUG,
-			     "TX: Alpha signature: sum=0x%02X S=0x%02X "
-			     "(%d data words, %d character slots)\n",
-			     sig_sum & 0x7F, (~sig_sum) & 0x7F,
-			     word_idx - 1, (word_idx - 1) * 3 - 1);
 		}
 	}
 
@@ -1119,29 +1111,8 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 
 		/* Signature: initial fragment only */
 		if (is_initial_frag) {
-			uint32_t sig_sum = 0;
-			int total_data_bits = (int)len * 4;
-			int bit_pos = 0;
-			uint8_t accum = 0;
-			int accum_bits = 0;
-
-			for (i = data_idx; i < (size_t)word_idx && bit_pos < total_data_bits; i++) {
-				int b;
-				for (b = 0; b < 21 && bit_pos < total_data_bits; b++) {
-					accum |= (uint8_t)(((msg_words[i] >> b) & 1) << accum_bits);
-					accum_bits++;
-					bit_pos++;
-					if (accum_bits == 8) {
-						sig_sum += accum;
-						accum = 0;
-						accum_bits = 0;
-					}
-				}
-			}
-			if (accum_bits > 0)
-				sig_sum += accum;
-
-			msg_words[1] |= (uint32_t)((~sig_sum) & 0xFF) << FLEX_HEX_HDR2_S_SHIFT;
+			if (cfg)
+				msg_words[1] |= (cfg->precomputed_sig & 0xFF) << FLEX_HEX_HDR2_S_SHIFT;
 		}
 
 		/* K: 10-bit fragment checksum (same as alpha K) */
@@ -1216,7 +1187,7 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
 		uint32_t word_idx, fwc;
 		size_t len, max_len;
-		uint32_t sig_sum, k_sum;
+		uint32_t k_sum;
 		int shift;
 		uint32_t i;
 		int frag_idx = 0, frag_total = 0;
@@ -1305,17 +1276,8 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 
 		/* Signature: initial fragment only */
 		if (is_initial_frag) {
-			sig_sum = 0;
-			for (i = 1; i < word_idx; i++) {
-				uint32_t ch;
-				ch = (msg_word[i] >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
-				ch = (msg_word[i] >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
-				ch = (msg_word[i] >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
-				if (ch != FLEX_ALPHA_ETX) sig_sum += ch;
-			}
-			msg_word[1] |= (~sig_sum) & FLEX_ALPHA_SIG_MASK;
+			if (cfg)
+				msg_word[1] |= cfg->precomputed_sig & FLEX_ALPHA_SIG_MASK;
 		}
 
 		/* K: 10-bit fragment checksum */
@@ -1613,6 +1575,44 @@ size_t flex_encode_frame(uint64_t capcode, int msg_type,
 	fmsg.short_msg_source = 0;
 	fmsg.short_msg_number = 0;
 	fmsg.short_msg_r = 0;
+
+	/* Pre-compute message signature for types that use it */
+	fmsg.precomputed_sig = 0xFFFFFFFF;
+	if (msg_type == FLEX_FRAME_MSG_TYPE_ALPHA ||
+	    msg_type == FLEX_FRAME_MSG_TYPE_SECURE) {
+		/* 7-bit alpha signature: sum of all chars excluding ETX */
+		uint32_t sum = 0;
+		int k;
+		for (k = 0; k < fmsg.message_length; k++) {
+			unsigned char ch = (unsigned char)message[k] & 0x7F;
+			if (ch != 0x03) sum += ch;
+		}
+		fmsg.precomputed_sig = (~sum) & 0x7F;
+	} else if (msg_type == FLEX_FRAME_MSG_TYPE_HEX) {
+		/* 8-bit hex signature: sum of data bytes */
+		uint32_t sum = 0;
+		int bit_pos = 0;
+		uint8_t accum = 0;
+		int accum_bits = 0;
+		int k;
+		for (k = 0; k < fmsg.message_length; k++) {
+			uint8_t nib;
+			char c = message[k];
+			if (c >= '0' && c <= '9') nib = c - '0';
+			else if (c >= 'A' && c <= 'F') nib = c - 'A' + 10;
+			else if (c >= 'a' && c <= 'f') nib = c - 'a' + 10;
+			else continue;
+			int b;
+			for (b = 0; b < 4; b++) {
+				accum |= (uint8_t)(((nib >> b) & 1) << accum_bits);
+				accum_bits++;
+				bit_pos++;
+				if (accum_bits == 8) { sum += accum; accum = 0; accum_bits = 0; }
+			}
+		}
+		if (accum_bits > 0) sum += accum;
+		fmsg.precomputed_sig = (~sum) & 0xFF;
+	}
 
 	/* One-shot default parameters */
 	flex_frame_params_default(&params);
@@ -2441,42 +2441,12 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 	 * word[data_idx+1] bits 0-20, etc.  We group these into 8-bit
 	 * chunks and sum them, then take the 1's complement (8-bit). */
 	if (is_initial_frag) {
-		uint32_t sig_sum = 0;
-		int total_data_bits;
-		int bit_pos = 0;
-		uint8_t accum = 0;
-		int accum_bits = 0;
-
-		/* Calculate total data bits excluding termination fill.
-		 * len = number of hex nibbles = number of 4-bit units.
-		 * Total data bits = len * 4. */
-		total_data_bits = (int)len * 4;
-
-		/* Walk through data words, extract bits, group into 8-bit sums */
-		for (i = data_idx; i < (size_t)word_idx && bit_pos < total_data_bits; i++) {
-			int b;
-			for (b = 0; b < 21 && bit_pos < total_data_bits; b++) {
-				accum |= (uint8_t)(((msg_words[i] >> b) & 1) << accum_bits);
-				accum_bits++;
-				bit_pos++;
-				if (accum_bits == 8) {
-					sig_sum += accum;
-					accum = 0;
-					accum_bits = 0;
-				}
-			}
+		/* Use precomputed whole-message signature.
+		 * Always set by flex_msg_create or flex_encode_frame. */
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			msg_words[1] |= (cfg->precomputed_sig & 0xFF) << FLEX_HEX_HDR2_S_SHIFT;
 		}
-		/* Include any remaining partial byte (< 8 bits) in the sum */
-		if (accum_bits > 0)
-			sig_sum += accum;
-
-		msg_words[1] |= (uint32_t)((~sig_sum) & 0xFF) << FLEX_HEX_HDR2_S_SHIFT;
-
-		LOGP(DFLEX, LOGL_DEBUG,
-		     "TX: HEX/Binary signature: sum=0x%02X S=0x%02X "
-		     "(%d data bits, %d complete bytes + %d remainder bits)\n",
-		     sig_sum & 0xFF, (~sig_sum) & 0xFF,
-		     total_data_bits, total_data_bits / 8, total_data_bits % 8);
 	}
 
 	/* K: 12-bit fragment checksum.
@@ -3836,6 +3806,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 					acfg.total_fragments = msgs[idx].total_fragments;
 					acfg.mail_drop = msgs[idx].mail_drop;
 					acfg.alpha_r_flag = msgs[idx].alpha_r_flag;
+					acfg.precomputed_sig = msgs[idx].precomputed_sig;
 					vw = encode_alpha_message(body_buf,
 						msgs[idx].message,
 						msg_start_for_vec, &body_fwc,
@@ -3859,6 +3830,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				hcfg.blocking_length = msgs[idx].blocking_length;
 				hcfg.mail_drop = msgs[idx].mail_drop;
 				hcfg.hex_r_flag = msgs[idx].hex_r_flag;
+				hcfg.precomputed_sig = msgs[idx].precomputed_sig;
 				vw = encode_hex_message(body_buf,
 					msgs[idx].message,
 					msg_start_for_vec, &body_fwc,
@@ -3981,6 +3953,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				scfg.blocking_length = msgs[idx].blocking_length;
 				scfg.alpha_r_flag = msgs[idx].alpha_r_flag;
 				scfg.hex_r_flag = msgs[idx].hex_r_flag;
+				scfg.precomputed_sig = msgs[idx].precomputed_sig;
 				vw = encode_secure_message(body_buf,
 					msgs[idx].message,
 					msg_start_for_vec, &body_fwc,

@@ -386,32 +386,6 @@ cant_recover:
 		}
 		return;
 	}
-
-	/* TX production debug */
-	{
-		static int psa_count = 0;
-		static int psa_total = 0;
-		static int psa_zero = 0;
-		static double psa_timer = 0;
-		psa_count++;
-		psa_total += count;
-		if (count == 0) psa_zero++;
-		if (psa_timer == 0.0) psa_timer = get_time();
-		double psa_now = get_time();
-		if (psa_now - psa_timer >= 2.0) {
-			LOGP(DSENDER, LOGL_NOTICE,
-			     "TX_PRODUCE: %d calls, %d samples (%.1f/call), %d zero (%.0f%%), buf=%d\n",
-			     psa_count, psa_total,
-			     psa_count > 0 ? (double)psa_total / psa_count : 0,
-			     psa_zero,
-			     psa_count > 0 ? 100.0 * psa_zero / psa_count : 0,
-			     buffer_size);
-			psa_count = 0;
-			psa_total = 0;
-			psa_zero = 0;
-			psa_timer = psa_now;
-		}
-	}
 #ifdef DEBUG_TIME_CONSUMPTION
 	t2 = get_time();
 #endif

@@ -163,6 +163,10 @@ typedef struct flex_msg {
 	int			fragment_index;
 	int			total_fragments;
 	uint32_t		retrieval_num;	/* → N field (6 bits, 0-63) */
+	int			fragment_sent;		/* 1 after this fragment has been transmitted */
+	uint32_t		precomputed_sig;	/* whole-message signature for fragmented alpha/hex.
+						 * Set by flex_fragment_queue() on the initial fragment
+						 * (fragment_index==0). -1 (0xFFFFFFFF) = not set. */
 
 	/* retransmission scheduling state */
 	int			retransmit_max;		/* 0-15: retransmissions after initial TX (0=none) */

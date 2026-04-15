@@ -794,9 +794,6 @@ int uhd_send(float *buff, int num)
 	size_t sent = 0, count;
 	size_t tx_samps_per_buff;
 	uhd_error error;
-	static int send_count = 0;
-	static size_t total_sent = 0;
-	double send_start, send_elapsed;
 
 	if (!uhd_tx_inst || !uhd_tx_inst->tx_streamer)
 		return 0;
@@ -804,9 +801,6 @@ int uhd_send(float *buff, int num)
 	error = uhd_tx_streamer_max_num_samps(uhd_tx_inst->tx_streamer, &tx_samps_per_buff);
 	if (error)
 		return 0;
-
-	send_count++;
-	send_start = get_software_time(uhd_tx_inst);
 
 	while (num) {
 		chunk = num;
@@ -850,19 +844,6 @@ int uhd_send(float *buff, int num)
 		sent += count;
 		buff += count * 2;
 		num -= count;
-	}
-
-	total_sent += sent;
-	send_elapsed = get_software_time(uhd_tx_inst) - send_start;
-
-	/* Log every call if slow, or periodically */
-	if (send_elapsed > 0.01) {
-		LOGP(DUHD, LOGL_ERROR, "SEND SLOW[%d]: %.1fms sent=%zu num_in=%d\n",
-		     send_count, send_elapsed * 1000.0, sent, (int)(sent + num));
-	} else if (send_count < 100 || (send_count % 5000) == 0) {
-		double tx_time = (double)uhd_tx_inst->tx_time_secs + uhd_tx_inst->tx_time_fract_sec;
-		LOGP(DUHD, LOGL_NOTICE, "SEND[%d]: sent=%zu total=%zu tx_time=%.6f elapsed=%.3fms\n",
-		     send_count, sent, total_sent, tx_time, send_elapsed * 1000.0);
 	}
 
 	return sent;
