@@ -5511,11 +5511,26 @@ static void flex_rx_demodulate(flex_t *flex, double sample)
 		}
 	}
 
-	/* Timeout: no zero crossings for too long → unlock */
+	/* Timeout: no zero crossings for too long - loss of signal.
+	 * If we were collecting data (RX_STATE_DATA), force-decode
+	 * whatever we have before unlocking - this recovers the last
+	 * frame when the input file ends mid-frame. */
 	flex->rx.pll_timeout++;
 	if (flex->rx.pll_timeout > DEMOD_TIMEOUT) {
 		if (flex->rx.pll_locked) {
-			LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: PLL timeout, unlocking.\n");
+			if (flex->rx.rx_state == RX_STATE_DATA &&
+			    flex->rx.data_count > 0) {
+				int expected = flex->rx.sync_baud * 1760 / 1000;
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: PLL timeout during DATA (%d/%d symbols), force-decoding partial frame.\n",
+					  flex->rx.data_count, expected);
+				flex_rx_decode_data(flex);
+				flex->rx.rx_state = RX_STATE_SYNC1;
+				flex->rx.s1_tail_count = 0;
+				flex->rx.baud = 1600;
+			} else {
+				LOGP_CHAN(DDSP, LOGL_DEBUG, "RX: PLL timeout, unlocking.\n");
+			}
 		}
 		flex->rx.pll_locked = 0;
 	}

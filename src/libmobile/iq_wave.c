@@ -83,8 +83,9 @@ typedef struct iq_wave {
 	int		tx_write_pos;
 	int		tx_read_pos;
 
-	/* RX EOF flag */
+	/* RX EOF flag and padding */
 	int		rx_eof;
+	int		rx_pad_remaining;	/* padding samples after EOF */
 } iq_wave_t;
 
 void *iq_wave_open(int direction, const char *audiodev, double *tx_frequency,
@@ -295,25 +296,48 @@ int iq_wave_read(void *inst, sample_t **samples, int num, int channels,
 		num = iq->buffer_size;
 
 	/* read IQ samples from wave file */
-	if (iq->wave_rx_play.fp) {
+	if (iq->wave_rx_play.fp || iq->rx_eof) {
+		if (iq->rx_eof) {
+			/* EOF already hit - feed silence padding so decoder
+			 * can finish processing the last frame */
+			if (iq->rx_pad_remaining <= 0) {
+				LOGP(DSDR, LOGL_NOTICE, "IQ RX padding exhausted, quitting.\n");
+				return -EPERM;
+			}
+			count = (num < iq->rx_pad_remaining) ? num : iq->rx_pad_remaining;
+			memset(spl_list[0], 0, count * sizeof(sample_t));
+			memset(spl_list[1], 0, count * sizeof(sample_t));
+			iq->rx_pad_remaining -= count;
+			num = count;
+			goto demod;
+		}
 		count = wave_read(&iq->wave_rx_play, spl_list, num);
 		if (count == 0 && iq->wave_rx_play.left == 0) {
-			if (!iq->rx_eof) {
-				iq->rx_eof = 1;
-				LOGP(DSDR, LOGL_NOTICE, "IQ RX wave EOF — quitting.\n");
-			}
-			return -EPERM;
+			/* File exhausted - start padding with silence for
+			 * one FLEX frame (1.875s) so the decoder can finish
+			 * processing any partially-received frame */
+			iq->rx_eof = 1;
+			iq->rx_pad_remaining = iq->samplerate * 2;
+			LOGP(DSDR, LOGL_NOTICE, "IQ RX wave EOF - padding %d samples for decoder flush.\n",
+			     iq->rx_pad_remaining);
+			count = (num < iq->rx_pad_remaining) ? num : iq->rx_pad_remaining;
+			memset(spl_list[0], 0, count * sizeof(sample_t));
+			memset(spl_list[1], 0, count * sizeof(sample_t));
+			iq->rx_pad_remaining -= count;
+			num = count;
+			goto demod;
 		}
 		if (count == 0) {
 			/* buffer temporarily empty, return silence */
 			return 0;
 		}
+		num = count;
 		/* interleave into float IQ buffer */
-		for (s = 0, ss = 0; s < count; s++) {
+demod:
+		for (s = 0, ss = 0; s < num; s++) {
 			buff[ss++] = (float)spl_list[0][s];
 			buff[ss++] = (float)spl_list[1][s];
 		}
-		num = count;
 	} else {
 		/* no RX wave file — return silence */
 		memset(buff, 0, num * 2 * sizeof(float));
