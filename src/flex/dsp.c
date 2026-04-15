@@ -1132,7 +1132,7 @@ static int flex_rx_decode_mode(flex_t *flex, unsigned int sync_code,
 		if (sync_code == modes[i].code) {
 			flex->rx.sync_baud = modes[i].baud;
 			flex->rx.sync_levels = modes[i].levels;
-			LOGP_CHAN(DDSP, LOGL_INFO,
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
 				  "RX: Sync detected -- code=0x%04X, %dbps/%dFSK, %d baud, polarity=%s.\n",
 				  sync_code,
 				  modes[i].baud * (modes[i].levels == 4 ? 2 : 1),
@@ -1272,7 +1272,7 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 		default:   flex->rx.fiw_td_collapse = -1; break; /* 00=use system */
 		}
 
-		LOGP_CHAN(DDSP, LOGL_INFO,
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
 			  "RX: FIW decoded -- cycle=%u frame=%u roaming=%u "
 			  "repeat=%ux td_collapse=%s\n",
 			  flex->rx.fiw_cycle, flex->rx.fiw_frame,
@@ -1291,7 +1291,7 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 		 * When set (1), the address field for that phase ends
 		 * within block 0 — pager may return to battery-save
 		 * mode early.  When clear (0), normal traffic. */
-		LOGP_CHAN(DDSP, LOGL_INFO,
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
 			  "RX: FIW decoded -- cycle=%u frame=%u roaming=%u "
 			  "low_traffic: A=%u B=%u C=%u D=%u\n",
 			  flex->rx.fiw_cycle, flex->rx.fiw_frame,
@@ -1914,19 +1914,19 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 			else
 				fail++;
 		}
-		LOGP_CHAN(DDSP, LOGL_INFO,
+		LOGP_CHAN(DDSP, fail > 0 ? LOGL_INFO : LOGL_DEBUG,
 			  "RX: Phase %c BCH: %d/%d clean, %d corrected, %d uncorrectable.\n",
 			  phase_name, ok, FLEX_WORDS_PER_FRAME, fixed, fail);
 
 		for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
 			if (ph->status[i] == FLEX_WORD_CORRECTED) {
-				LOGP_CHAN(DDSP, LOGL_INFO,
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
 					  "RX: Phase %c word %2d BCH corrected "
 					  "(raw=0x%08X -> data=0x%05X).\n",
 					  phase_name, i, raw_words[i],
 					  ph->words[i]);
 			} else if (ph->status[i] == FLEX_WORD_UNCORRECTABLE) {
-				LOGP_CHAN(DDSP, LOGL_NOTICE,
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
 					  "RX: Phase %c word %2d BCH uncorrectable "
 					  "(raw=0x%08X).\n",
 					  phase_name, i, raw_words[i]);
@@ -4843,7 +4843,7 @@ static void flex_rx_decode_data(flex_t *flex)
 	}
 
 	/* Frame-level BCH summary (S1 + FIW + all data phases) */
-	LOGP_CHAN(DDSP, LOGL_INFO,
+	LOGP_CHAN(DDSP, LOGL_NOTICE,
 		  "RX: Frame C%u/F%u BCH totals: %u codewords -- "
 		  "%u clean, %u corrected, %u uncorrectable.\n",
 		  flex->rx.fiw_cycle, flex->rx.fiw_frame,
@@ -5521,7 +5521,7 @@ static void flex_rx_demodulate(flex_t *flex, double sample)
 			if (flex->rx.rx_state == RX_STATE_DATA &&
 			    flex->rx.data_count > 0) {
 				int expected = flex->rx.sync_baud * 1760 / 1000;
-				LOGP_CHAN(DDSP, LOGL_INFO,
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "RX: PLL timeout during DATA (%d/%d symbols), force-decoding partial frame.\n",
 					  flex->rx.data_count, expected);
 				flex_rx_decode_data(flex);
