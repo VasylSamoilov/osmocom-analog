@@ -71,27 +71,166 @@ enum flex_word_status {
 /* Idle word 2: all zeros (odd-indexed idle words) */
 #define FLEX_IDLE_WORD_2	0x00000000U
 
-/* ===== Multiple Transmission Subframe Structure =====
+/* ===== Multiple Transmission Subframe Structure (Section 3.4.2) =====
  *
- * When multiple transmission is active (FIW r=1), the 88-word frame
- * is divided into N subframes (N = num_transmissions).
+ * WHAT IS A SUBFRAME
+ * ------------------
+ * When multiple transmission is active (FIW r=1, [t1,t0] encodes N),
+ * the 88-word data portion of a frame is divided into N subframes.
+ * Each subframe is a self-contained mini-frame with its own:
  *
- * Subframe sizes:
- *   2x: 2 subframes × 44 words = 88 words
- *   3x: 3 subframes × 29 words = 87 words (+1 extra idle word)
- *   4x: 4 subframes × 22 words = 88 words
+ *   [BIW] [AF] [VF] [MF] [IB]
  *
- * Word numbers within each subframe start at 0.
- * Word 0 always contains the Block Information Word.
+ *   BIW = Block Information Word (word 0 of the subframe, NOT FIW)
+ *   AF  = Address Field
+ *   VF  = Vector Field
+ *   MF  = Message Field
+ *   IB  = Idle Block (fill)
  *
- * Each subframe is transmitted at a repeat interval equal to the
- * System Collapse cycle (2^m frames).  The repeat unit =
- * num_transmissions × repeat_interval.
+ * A subframe does NOT have a FIW or sync signal.  The FIW is in the
+ * frame-level sync signal, transmitted once per frame.  The subframe
+ * BIW follows the same spec as a normal BIW1 (collapse, carry-on,
+ * priority count, address/vector offsets) but operates within the
+ * reduced word count of the subframe.
  *
- * Per spec: "the same bit stream as transmitted for the 1st
- * transmission is transmitted for the Block Information Word,
- * Address Field, Vector Field, Message Field and Idle Blocks
- * in the 2nd, 3rd and 4th transmissions." */
+ * Subframe sizes (Fig. 3.4.2-1, 3.4.2-2):
+ *   2x: 2 subframes x 44 words = 88 words
+ *   3x: 3 subframes x 29 words = 87 words (+1 extra idle word at 87)
+ *   4x: 4 subframes x 22 words = 88 words
+ *
+ * Word numbering within each subframe starts at 0.
+ * Word 0 always contains the subframe's BIW.
+ *
+ * HOW SUBFRAMES ARE PLACED IN A FRAME
+ * ------------------------------------
+ * The N subframes are laid out contiguously in the 88-word frame:
+ *
+ *   4x example (Fig. 3.4.2-2):
+ *   |<-- slot 0 (22w) -->|<-- slot 1 (22w) -->|<-- slot 2 (22w) -->|<-- slot 3 (22w) -->|
+ *   words 0-21             words 22-43          words 44-65          words 66-87
+ *
+ * Each slot position carries DIFFERENT content.  The slots within
+ * one frame are NOT copies of each other.  They carry content from
+ * different "subframe chains" at different stages of retransmission.
+ *
+ * HOW RETRANSMISSION WORKS (Fig. 3.4.2-3)
+ * ----------------------------------------
+ * The repeat_interval = 2^m frames (m = effective collapse value).
+ * The repeat_unit = N x repeat_interval frames.
+ *
+ * A piece of content (one subframe's worth of messages) is called
+ * a "subframe chain."  It gets transmitted N times total:
+ *
+ *   - 1st copy: in slot 0, at some repeat_interval-aligned frame
+ *   - 2nd copy: in slot 1, repeat_interval frames later
+ *   - 3rd copy: in slot 2, 2 x repeat_interval frames later
+ *   - Nth copy: in slot N-1, (N-1) x repeat_interval frames later
+ *
+ * The content moves to the next slot position every repeat_interval
+ * frames.  "The same bit stream as transmitted for the 1st
+ * transmission is transmitted for the BIW, AF, VF, MF and IB
+ * in the 2nd, 3rd and 4th transmissions."
+ *
+ * MULTIPLE CHAINS IN FLIGHT
+ * -------------------------
+ * Because the base station transmits for ALL collapse cycles (not
+ * just one pager's assigned frame), there are multiple subframe
+ * chains in flight simultaneously.  At any given frame, each of
+ * the N slot positions carries a different chain at a different
+ * stage of its N-copy retransmission cycle.
+ *
+ * Example: 4x transmission, collapse=3 (repeat_interval=8):
+ *   8 collapse cycles (0-7), each independent.
+ *
+ *   Collapse cycle 0 (frames 0, 8, 16, 24, ...):
+ *     Frame  0: slot0=A(1st) slot1=idle     slot2=idle     slot3=idle
+ *     Frame  8: slot0=B(1st) slot1=A(2nd)   slot2=idle     slot3=idle
+ *     Frame 16: slot0=C(1st) slot1=B(2nd)   slot2=A(3rd)   slot3=idle
+ *     Frame 24: slot0=D(1st) slot1=C(2nd)   slot2=B(3rd)   slot3=A(4th)
+ *     Frame 32: slot0=E(1st) slot1=D(2nd)   slot2=C(3rd)   slot3=B(4th)
+ *
+ *   Collapse cycle 1 (frames 1, 9, 17, 25, ...):
+ *     Frame  1: slot0=F(1st) slot1=idle     slot2=idle     slot3=idle
+ *     Frame  9: slot0=G(1st) slot1=F(2nd)   slot2=idle     slot3=idle
+ *     ...completely independent from cycle 0.
+ *
+ *   ...and so on for cycles 2-7.
+ *
+ * Every frame has unique content.  No two frames share the same
+ * 88 data words.  Each collapse cycle is an independent pipeline.
+ * Idle subframes fill slots that have no content yet (pipeline
+ * not fully primed) or when no messages are queued.
+ *
+ * Each collapse cycle (frame % repeat_interval) has its own
+ * independent set of chains.  Cycle 0 (frames 0,8,16,24,...) and
+ * cycle 3 (frames 3,11,19,27,...) never share chains.  There are
+ * repeat_interval independent collapse cycles, each with its own
+ * pipeline state.
+ *
+ * TX PIPELINE
+ * -----------
+ * When num_transmissions == 1: no subframes, no pipeline.  The full
+ * 88-word frame is encoded and transmitted directly.  Normal path.
+ *
+ * When num_transmissions > 1: per collapse cycle, the slot_content[]
+ * array caches the encoded subframe words for each slot position.
+ * Every frame triggers a pipeline shift for its collapse cycle:
+ *
+ *   1. Shift: slot[N-1] discarded, slot[i] = slot[i-1]
+ *   2. Encode new content into slot[0] (or idle subframe)
+ *   3. Assemble all N slots into 88-word frame
+ *
+ * Each collapse cycle has its own independent pipeline state.
+ * The pipeline shifts every frame -- because every frame belongs
+ * to exactly one collapse cycle, and that cycle advances.
+ *
+ * RX CROSS-SUBFRAME RECOVERY
+ * --------------------------
+ * When num_transmissions == 1: no subframes, no recovery.  The full
+ * 88-word frame is BCH-decoded and parsed directly.  Normal path.
+ *
+ * When num_transmissions > 1: the receiver buffers whole frames
+ * (88 BCH-decoded words + status), not individual subframes.
+ * Per phase, per collapse cycle, the last N frames are stored
+ * (N = num_transmissions).
+ *
+ * Storage: N frames per collapse cycle, N x repeat_interval total
+ * per phase.  (N = num_transmissions, repeat_interval = number of
+ * collapse cycles = 2^m.)
+ * Example: collapse=3, 4x, 1 phase = 4 x 8 = 32 frames buffered.
+ *
+ * Every frame belongs to exactly one collapse cycle
+ * (cycle = frame_number % repeat_interval).  On each new frame:
+ *
+ *   1. Determine collapse cycle: frame_number % repeat_interval
+ *   2. Push frame into that cycle's history (shift out oldest)
+ *   3. For each slot S (0..N-1), gather all copies of that chain:
+ *
+ *      N=2 (2x transmission, 2 slots per frame, 2 frames in history):
+ *        Slot 0: history[0] slot 0  (1 copy only, just received)
+ *        Slot 1: history[0] slot 1 + history[1] slot 0  (2 copies)
+ *
+ *      N=3 (3x transmission, 3 slots per frame, 3 frames in history):
+ *        Slot 0: history[0] slot 0  (1 copy)
+ *        Slot 1: history[0] slot 1 + history[1] slot 0  (2 copies)
+ *        Slot 2: history[0] slot 2 + history[1] slot 1 + history[2] slot 0  (3 copies)
+ *
+ *      N=4 (4x transmission, 4 slots per frame, 4 frames in history):
+ *        Slot 0: history[0] slot 0  (1 copy)
+ *        Slot 1: history[0] slot 1 + history[1] slot 0  (2 copies)
+ *        Slot 2: history[0] slot 2 + history[1] slot 1 + history[2] slot 0  (3 copies)
+ *        Slot 3: history[0] slot 3 + history[1] slot 2 + history[2] slot 1 + history[3] slot 0  (4 copies)
+ *   4. Combine copies: majority vote per word, prefer copy with
+ *      fewest uncorrectable words as tiebreaker
+ *   5. Decode the combined subframe if BIW is valid and non-idle.
+ *      Idle subframes (BIW with voffset==aoffset, idle fill after)
+ *      propagate through the pipeline the same way as content.
+ *      There are always N subframes per frame -- empty slots carry
+ *      a proper idle subframe with BIW, not raw idle pattern.
+ *
+ * This design is simple and matches how a pager works: it wakes
+ * every repeat_interval frames (one collapse cycle) and accumulates
+ * copies of each chain across successive wakeups. */
 
 /* Subframe word counts per transmission count */
 #define FLEX_SUBFRAME_WORDS_2X	44
@@ -2245,6 +2384,22 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
  * For 4FSK modes, LSB phases get all-zeros instead of alternating. */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
 			  int mod_type, int bitrate);
+
+/* Generate an idle subframe: BIW1 (with correct collapse, no addresses)
+ * followed by idle fill pattern.  Used for empty subframe slots in
+ * multiple transmission mode.  Every slot must have a valid BIW1 —
+ * raw idle pattern without BIW1 causes decoders to misparse.
+ *
+ * words:    output buffer (at least sf_words entries)
+ * sf_words: subframe word count (22, 29, or 44)
+ * params:   frame params (for collapse, carry_on, phase_index, etc.)
+ *
+ * The BIW1 has voffset == aoffset (no addresses, no vectors),
+ * and the remaining words are filled with the phase-appropriate
+ * idle pattern (alternating 1s/0s for MSB phases, all-zeros for
+ * LSB phases in 4FSK modes). */
+void flex_encode_idle_subframe(uint32_t *words, int sf_words,
+			       const flex_frame_params_t *params);
 
 /* Compute per-phase Low Traffic Flags for FIW t-field (§3.6).
  *

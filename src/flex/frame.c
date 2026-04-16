@@ -654,6 +654,61 @@ void flex_fill_idle_phase(uint32_t *words, int phase_index,
 	}
 }
 
+/* Generate an idle subframe: BIW1 (with correct collapse, no addresses)
+ * followed by idle fill pattern.  Used for empty subframe slots in
+ * multiple transmission mode.
+ *
+ * Every subframe slot must have a valid BIW1 at its start — raw idle
+ * pattern without BIW1 causes decoders to misparse the slot as
+ * containing addresses (the all-1s/all-0s idle words pass BCH but
+ * produce garbage capcodes).
+ *
+ * The BIW1 has voffset == aoffset (no addresses, no vectors, no
+ * messages).  Remaining words are filled with the phase-appropriate
+ * idle pattern. */
+void flex_encode_idle_subframe(uint32_t *words, int sf_words,
+			       const flex_frame_params_t *params)
+{
+	uint32_t biw1;
+	int biw_count = 1; /* BIW1 only for idle subframes */
+	uint32_t s_vfield = (uint32_t)biw_count; /* no addresses: voffset == aoffset */
+	int w;
+
+	/* Fill with idle pattern — only sf_words, not the full 88.
+	 * Use the same phase-aware pattern as flex_fill_idle_phase
+	 * but limited to the subframe size. */
+	{
+		int is_lsb_phase = 0;
+		if (params->modulation_type == FLEX_MOD_4FSK) {
+			if (params->bitrate <= 3200)
+				is_lsb_phase = (params->phase_index == 1);
+			else
+				is_lsb_phase = (params->phase_index == 1 || params->phase_index == 3);
+		}
+		for (w = 0; w < sf_words; w++) {
+			if (is_lsb_phase)
+				words[w] = FLEX_IDLE_WORD_2;
+			else
+				words[w] = (w % 2 == 0) ? FLEX_IDLE_WORD_1 : FLEX_IDLE_WORD_2;
+		}
+	}
+
+	/* Write BIW1 at position 0: no priority, no extra BIW,
+	 * voffset = 1 (right after BIW1), correct collapse */
+	biw1 = flex_create_biw1(0, 0, s_vfield, 0, (uint32_t)params->collapse);
+	words[0] = biw1;
+
+	/* Block-interleave the subframe words.
+	 * Each 8-word block within the subframe must be interleaved
+	 * so the receiver's de-interleave produces correct results. */
+	{
+		int blk;
+		int blocks_in_sf = sf_words / FLEX_WORDS_PER_BLOCK;
+		for (blk = 0; blk < blocks_in_sf; blk++)
+			flex_interleave_block(blk, words);
+	}
+}
+
 
 /* numeric_char_to_flex() removed — use shared flex_num_char_to_bcd() from frame.h */
 
@@ -1251,7 +1306,6 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		int shift;
 		uint32_t i;
 		int frag_idx = 0, frag_total = 0;
-		int is_initial_frag;
 		uint32_t f_val;
 		int c_val;
 
@@ -1260,7 +1314,6 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 			frag_total = cfg->total_fragments;
 		}
 
-		is_initial_frag = (frag_total <= 1 || frag_idx == 0);
 		f_val = flex_fragment_number(frag_idx);
 		c_val = (frag_total > 1 && frag_idx < frag_total - 1) ? 1 : 0;
 
@@ -1284,14 +1337,11 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 				<< FLEX_SEC_TYPE_SHIFT);
 
 		/* Pack 7-bit ASCII characters, 3 per word.
-		 * Initial fragment: signature in bits 0-6 of word 1,
-		 * characters start at bit 7.
-		 * Continuation: no signature, 3 chars per word from bit 0. */
+		 * Secure messages do NOT have a 7-bit signature field --
+		 * all 3 character slots are used from the 2nd word onward.
+		 * Characters start at bit 0 for all fragments. */
 		i = 0;
-		if (is_initial_frag)
-			shift = FLEX_ALPHA_CHAR2_SHIFT;
-		else
-			shift = 0;
+		shift = 0;
 		word_idx = 1;
 
 		while (i < max_len) {
@@ -1305,42 +1355,28 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		}
 
 		/* Pad unused character slots with ETX */
-		if (is_initial_frag) {
-			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == 0 && word_idx > 1) {
-				/* word boundary — no padding needed */
-			}
-		} else {
-			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == FLEX_ALPHA_CHAR1_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR1_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == 0 && word_idx > 1) {
-				/* word boundary — no padding needed */
-			}
+		/* Pad unused character slots with ETX.
+		 * Secure messages use all 3 character slots per word
+		 * (no signature field), so padding is the same for
+		 * initial and continuation fragments. */
+		if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
+			msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+					      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+			word_idx++;
+		} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
+			msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+			word_idx++;
+		} else if (shift == FLEX_ALPHA_CHAR1_SHIFT) {
+			msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR1_SHIFT) |
+					      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+					      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+			word_idx++;
+		} else if (shift == 0 && word_idx > 1) {
+			/* word boundary -- no padding needed */
 		}
 
-		/* Signature: initial fragment only */
-		if (is_initial_frag) {
-			if (cfg)
-				msg_word[1] |= cfg->precomputed_sig & FLEX_ALPHA_SIG_MASK;
-		}
-
-		/* K: 10-bit fragment checksum */
+		/* Secure messages do NOT have a 7-bit signature.
+		 * Integrity is provided by the 10-bit K checksum only. */
 		k_sum = 0;
 		for (i = 0; i < word_idx; i++) {
 			k_sum += msg_word[i] & FLEX_ALPHA_K_GRP1_MASK;
@@ -4166,45 +4202,24 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	 * Words beyond fwc retain their idle pattern unchanged, per §3.4.1:
 	 * "Idle blocks are maintained as they are." */
 
-	/* ---- Subframe placement for multiple transmission (§3.4.2) ----
+	/* ---- Subframe placement for multiple transmission ----
 	 *
-	 * Slot position = copy number.  The encoder builds content into
-	 * words 0..sf_words-1, then moves it to the target slot offset.
-	 * Idle slots retain the pre-fill pattern.
+	 * When num_transmissions > 1, the 88-word frame is divided into
+	 * N subframe slots.  The CALLER (scheduler) is responsible for
+	 * assembling all N slots into the full 88-word frame.
 	 *
-	 * The caller (scheduler) is responsible for calling this function
-	 * once per active slot with the correct messages and subframe_index.
-	 * The results are assembled into the 88-word frame by the caller.
+	 * The encoder produces content for ONE subframe at position 0
+	 * (words 0..sf_words-1).  The caller then:
+	 *   1. Extracts the sf_words from position 0
+	 *   2. Places them at the correct slot offset in the 88-word frame
+	 *   3. Fills other slots with cached retransmissions or idle BIW
 	 *
-	 * Currently the scheduler populates one slot per frame.  To fill
-	 * multiple slots, the caller should:
-	 *   1. For each slot with content: call flex_encode_frame_multi
-	 *      with subframe_index = slot number
-	 *   2. For idle slots: leave the pre-fill pattern
-	 *   3. If no candidates for any slot: all slots idle, prepare
-	 *      to switch to non-repeat mode
+	 * This function does NOT move content to a target slot offset.
+	 * The subframe_index in params is used only for BIW1 encoding
+	 * (the pager needs to know which copy it's receiving).
 	 *
-	 * For 3x, the extra word (position 87) retains the idle pre-fill
-	 * value per spec. */
-	if (params->num_transmissions > 1 && params->subframe_index > 0) {
-		int sf_words = flex_subframe_words(params->num_transmissions);
-		int dst_offset = params->subframe_index * sf_words;
-		int w;
-
-		/* Copy content from position 0 to the target subframe offset */
-		for (w = sf_words - 1; w >= 0 && (dst_offset + w) < FLEX_WORDS_PER_FRAME; w--)
-			frame_words[dst_offset + w] = frame_words[w];
-
-		/* Restore idle pattern at position 0 (was overwritten by content).
-		 * Use the same phase-aware pattern as the pre-fill. */
-		{
-			uint32_t idle_words[FLEX_WORDS_PER_FRAME];
-			flex_fill_idle_phase(idle_words, params->phase_index,
-					     params->modulation_type, params->bitrate);
-			for (w = 0; w < sf_words && w < dst_offset; w++)
-				frame_words[w] = idle_words[w];
-		}
-	}
+	 * For 3x, the extra word (position 87) is set to idle by the
+	 * caller when assembling the full frame. */
 
 	/* ---- Block-boundary fixup for decoder compatibility ----
 	 *

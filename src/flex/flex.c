@@ -2084,6 +2084,10 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.hack_nonstandard_decoders = flex->hack_nonstandard_decoders;
 	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
 
+	/* Compute phase count early — needed for candidate collection,
+	 * per-phase encoding, and the send_idle multi-tx path. */
+	int num_phases = flex_get_phase_count(params.bitrate, params.modulation_type);
+
 	/* Parameter change guard.
 	 * Tick the state machine and check if we're in cooldown
 	 * (force_idle = suppress message packing, send idle frames). */
@@ -2268,9 +2272,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 	}
 
-	/* Compute phase count and per-phase capacities early — needed
+	/* Compute per-phase capacities — needed
 	 * for candidate collection directly into per-phase lists. */
-	int num_phases = flex_get_phase_count(params.bitrate, params.modulation_type);
 	int pcap[FLEX_MAX_PHASES];
 	flex_candidate_t phase_cands[FLEX_MAX_PHASES][FLEX_MAX_CANDIDATES];
 	int phase_n_cands[FLEX_MAX_PHASES];
@@ -2967,10 +2970,14 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 		memset(phases, 0, sizeof(phases));
 
-		/* Build per-phase params — same as frame params but force
-		 * single-phase output so we can extract the 88 data words */
+		/* Build per-phase params -- same as frame params but force
+		 * single-phase output so we can extract the data words.
+		 * For multi-tx: always encode as subframe_index=0 (new content).
+		 * The slot pipeline handles placement into the correct slot. */
 		phase_params = params;
 		phase_params.single_phase = 1;
+		if (params.num_transmissions > 1)
+			phase_params.subframe_index = 0;
 
 		/* Carry-on: propagate to phase_params.
 		 *
@@ -3124,14 +3131,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 					continue;
 				}
 
-				/* Extract 88 data words from encoded output.
+				/* Extract subframe data words from encoded output.
 				 * Layout: S1(14) + FIW(4) + S2(c_bytes) + data
-				 * S2 is 5 bytes × (bitrate/1600) to fill 25 ms. */
+				 * S2 is 5 bytes × (bitrate/1600) to fill 25 ms.
+				 *
+				 * When num_transmissions > 1, the encoder produces
+				 * sf_words at position 0 (subframe-local content).
+				 * When num_transmissions == 1, it produces the full
+				 * 88 words. */
 				{
 					int w;
 					int s2_bytes = 5 * (params.bitrate / 1600);
 					uint8_t *dp = phase_buf + 14 + 4 + s2_bytes;
-					for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+					int extract_words = (params.num_transmissions > 1)
+						? flex_subframe_words(params.num_transmissions)
+						: FLEX_WORDS_PER_FRAME;
+
+					for (w = 0; w < extract_words; w++) {
 						phases[p].words[w] =
 							((uint32_t)dp[0] << 24) |
 							((uint32_t)dp[1] << 16) |
@@ -3139,7 +3155,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 							 (uint32_t)dp[3];
 						dp += 4;
 					}
-					phases[p].word_count = FLEX_WORDS_PER_FRAME;
+					phases[p].word_count = extract_words;
 				}
 
 				any_msg = 1;
@@ -3186,7 +3202,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 
 		if (any_msg) {
-			/* Fill empty phases with proper idle pattern (Section 3.4.1)
+			/* Fill empty phases with proper idle pattern
 			 * — phases with no candidates were already filled above,
 			 * but phases that had candidates but failed encoding were
 			 * also filled. This loop catches any remaining gaps. */
@@ -3195,17 +3211,108 @@ static int flex_get_next_frame_network(flex_t *flex)
 					flex_fill_idle_phase(phases[p].words, p,
 							     params.modulation_type,
 							     params.bitrate);
-					/* Block-interleave the idle phase.
-					 * The phase interleaver expects all
-					 * phases to be block-interleaved;
-					 * without this, the receiver's
-					 * de-interleave produces garbage. */
 					{
 						int blk;
 						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
 							flex_interleave_block(blk, phases[p].words);
 					}
 					phases[p].word_count = FLEX_WORDS_PER_FRAME;
+				}
+			}
+
+			/* === Multiple transmission: slot pipeline assembly ===
+			 *
+			 * When num_transmissions > 1, each phase's 88-word frame
+			 * is divided into N subframe slots.  The encoder produced
+			 * sf_words of content at position 0 for each phase (the
+			 * "new" content for slot 0).  Now we assemble the full
+			 * 88-word frame by filling all N slots:
+			 *
+			 *   Slot 0: new content just encoded (1st transmission)
+			 *   Slot 1: cached content from repeat_interval frames ago
+			 *           (2nd transmission of older content)
+			 *   Slot 2: cached content from 2×repeat_interval frames ago
+			 *           (3rd transmission of even older content)
+			 *   ...
+			 *
+			 * Each slot always has valid content — either real message
+			 * data or a proper idle subframe (BIW1 + idle fill).
+			 * Raw idle pattern without BIW1 is never used.
+			 *
+			 * The slot_content[] ring buffer in flex_t stores the
+			 * most recent sf_words for each slot position.  After
+			 * assembly, slot_content is shifted: old slot N-1 is
+			 * discarded, each slot moves up one position, and the
+			 * new content enters slot 0. */
+			if (params.num_transmissions > 1) {
+				int sf_words = flex_subframe_words(params.num_transmissions);
+				int n_slots = params.num_transmissions;
+				uint32_t ri = flex_scheduler_repeat_interval(
+					flex->collapse, flex->td_collapse);
+				int cycle = (int)(ft.frame % ri);
+
+				for (p = 0; p < num_phases; p++) {
+					uint32_t assembled[FLEX_WORDS_PER_FRAME];
+					int slot, w;
+
+					/* Start with idle fill for the full frame
+					 * (covers the 3x extra word at position 87
+					 * and any gaps). */
+					flex_fill_idle_phase(assembled, p,
+							     params.modulation_type,
+							     params.bitrate);
+
+					/* Shift this collapse cycle's pipeline:
+					 * slot[N-1] discarded, slot[i] = slot[i-1],
+					 * new content into slot[0]. */
+					for (slot = n_slots - 1; slot > 0; slot--) {
+						memcpy(flex->slot_content[cycle][slot],
+						       flex->slot_content[cycle][slot - 1],
+						       sf_words * sizeof(uint32_t));
+						flex->slot_content_words[cycle][slot] = sf_words;
+					}
+
+					/* Slot 0: cache the new content from this phase.
+					 * phases[p].words has sf_words of encoded content
+					 * at position 0 (or a full idle subframe if no
+					 * candidates were available for this phase). */
+					if (phases[p].word_count > 0 && phase_n_cands[p] > 0) {
+						memcpy(flex->slot_content[cycle][0],
+						       phases[p].words,
+						       sf_words * sizeof(uint32_t));
+					} else {
+						flex_frame_params_t idle_sf_params = params;
+						idle_sf_params.phase_index = p;
+						flex_encode_idle_subframe(
+							flex->slot_content[cycle][0],
+							sf_words, &idle_sf_params);
+					}
+					flex->slot_content_words[cycle][0] = sf_words;
+
+					/* Assemble all slots into the 88-word frame */
+					for (slot = 0; slot < n_slots; slot++) {
+						int offset = slot * sf_words;
+						int src_words = flex->slot_content_words[cycle][slot];
+
+						if (src_words > 0) {
+							for (w = 0; w < src_words && (offset + w) < FLEX_WORDS_PER_FRAME; w++)
+								assembled[offset + w] = flex->slot_content[cycle][slot][w];
+						} else {
+							flex_frame_params_t idle_sf_params = params;
+							idle_sf_params.phase_index = p;
+							flex_encode_idle_subframe(
+								&assembled[offset],
+								sf_words, &idle_sf_params);
+						}
+					}
+
+					memcpy(phases[p].words, assembled, FLEX_WORDS_PER_FRAME * sizeof(uint32_t));
+					phases[p].word_count = FLEX_WORDS_PER_FRAME;
+
+					LOGP(DFLEX, LOGL_DEBUG,
+					     "Scheduler: phase %d cycle %d assembled %d slots"
+					     " (%d words each) into 88-word frame\n",
+					     p, cycle, n_slots, sf_words);
 				}
 			}
 
@@ -3263,13 +3370,114 @@ static int flex_get_next_frame_network(flex_t *flex)
 send_idle:
 	/* No messages — send proper idle frame.
 	 *
-	 * Pass msg_count=0 to flex_encode_frame_multi so it produces a
-	 * BIW-only frame: BIW1 with voffset==aoffset (no addresses,
-	 * vectors, or messages), remaining words filled with idle pattern
-	 * (alternating all-1s / all-0s codewords per Table 3.4.1-1).
+	 * For single transmission: pass msg_count=0 to produce a
+	 * BIW-only frame (BIW1 with voffset==aoffset, idle fill).
 	 *
-	 * The collapse value in BIW1 is preserved from params so pagers
-	 * can maintain their decode schedule even during idle periods. */
+	 * For multiple transmission: the slot pipeline must still
+	 * advance even when idle.  Slot 0 gets an idle subframe,
+	 * but slots 1..N-1 may still have cached retransmissions
+	 * from previous frames that need to be emitted.  The
+	 * pipeline shift and assembly logic handles this. */
+	if (params.num_transmissions > 1) {
+		/* Multiple transmission idle: shift this collapse cycle's
+		 * pipeline with an idle subframe in slot 0, but still emit
+		 * cached retransmissions in other slots. */
+		flex_phase_data_t phases[FLEX_MAX_PHASES];
+		int sf_words = flex_subframe_words(params.num_transmissions);
+		int n_slots = params.num_transmissions;
+		int p_idle;
+		uint32_t ri = flex_scheduler_repeat_interval(
+			flex->collapse, flex->td_collapse);
+		int cycle = (int)(ft.frame % ri);
+
+		memset(phases, 0, sizeof(phases));
+
+		for (p_idle = 0; p_idle < num_phases; p_idle++) {
+			uint32_t assembled[FLEX_WORDS_PER_FRAME];
+			int slot, w;
+
+			flex_fill_idle_phase(assembled, p_idle,
+					     params.modulation_type,
+					     params.bitrate);
+
+			/* Shift this cycle's pipeline */
+			for (slot = n_slots - 1; slot > 0; slot--) {
+				memcpy(flex->slot_content[cycle][slot],
+				       flex->slot_content[cycle][slot - 1],
+				       sf_words * sizeof(uint32_t));
+				flex->slot_content_words[cycle][slot] = sf_words;
+			}
+
+			/* Slot 0: idle subframe with proper BIW1 */
+			{
+				flex_frame_params_t idle_sf_params = params;
+				idle_sf_params.phase_index = p_idle;
+				flex_encode_idle_subframe(
+					flex->slot_content[cycle][0],
+					sf_words, &idle_sf_params);
+			}
+			flex->slot_content_words[cycle][0] = sf_words;
+
+			/* Assemble all slots */
+			for (slot = 0; slot < n_slots; slot++) {
+				int offset = slot * sf_words;
+				int src_words = flex->slot_content_words[cycle][slot];
+
+				if (src_words > 0) {
+					for (w = 0; w < src_words && (offset + w) < FLEX_WORDS_PER_FRAME; w++)
+						assembled[offset + w] = flex->slot_content[cycle][slot][w];
+				} else {
+					flex_frame_params_t idle_sf_params = params;
+					idle_sf_params.phase_index = p_idle;
+					flex_encode_idle_subframe(
+						&assembled[offset],
+						sf_words, &idle_sf_params);
+				}
+			}
+
+			memcpy(phases[p_idle].words, assembled, FLEX_WORDS_PER_FRAME * sizeof(uint32_t));
+			phases[p_idle].word_count = FLEX_WORDS_PER_FRAME;
+		}
+
+		/* Encode the assembled multi-slot frame */
+		{
+			uint8_t phased_buf[FLEX_BUFFER_SIZE];
+			size_t phased_len;
+
+			phased_len = flex_encode_frame_phased(phases, num_phases,
+							      &params, phased_buf,
+							      sizeof(phased_buf),
+							      &error);
+			if (error || phased_len == 0) {
+				LOGP_CHAN(DFLEX, LOGL_ERROR,
+					  "Network mode: failed to encode idle multi-tx frame (error=%d).\n", error);
+				return 0;
+			}
+
+			memcpy(flex->sync_buffer, phased_buf, 18);
+			flex->sync_buffer_length = 18;
+			flex->sync_buffer_pos = 0;
+
+			flex->frame_buffer_length = (int)(phased_len - 18);
+			memcpy(flex->frame_buffer, phased_buf + 18,
+			       flex->frame_buffer_length);
+			flex->frame_buffer_pos = 0;
+		}
+
+		flex->frame_target_speed = params.bitrate;
+		flex->frame_target_mod_type = params.modulation_type;
+		dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
+
+		flex->sched_last_cycle = ft.cycle;
+		flex->sched_last_frame = ft.frame;
+
+		LOGP_CHAN(DFLEX, LOGL_DEBUG,
+			  "Network mode: idle multi-tx frame C%u/F%u (%d slots).\n",
+			  ft.cycle, ft.frame, n_slots);
+		return 1;
+	}
+
+	/* Single transmission idle frame */
 	flex_setup_frame_buffers(flex, &params, NULL, 0,
 				&msgs_packed, &error);
 
