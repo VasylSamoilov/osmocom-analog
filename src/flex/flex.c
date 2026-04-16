@@ -50,6 +50,18 @@ static inline int pol_index(double polarity)
 	return (polarity < 0) ? FLEX_POL_INVERTED : FLEX_POL_NORMAL;
 }
 
+/* Build ",G=N" tag for temp group delivery messages, "" otherwise.
+ * Uses a static buffer — not reentrant, fine for log formatting. */
+static const char *flex_grp_tag(int temp_delivery_slot)
+{
+	static char buf[16];
+	if (temp_delivery_slot >= 0)
+		snprintf(buf, sizeof(buf), ",G=%d", temp_delivery_slot);
+	else
+		buf[0] = '\0';
+	return buf;
+}
+
 static const char *flex_state_name[] = {
 	"IDLE",
 	"ERS",
@@ -217,8 +229,17 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 {
 	flex_msg_t *msg, **msgp;
 
-	LOGP(DFLEX, LOGL_INFO, "Creating msg instance to page capcode '%" PRIu64 "' (%s) / type '%s'.\n",
-	     capcode, flex_capcode_type_name(capcode), flex_msg_type_name(msg_type));
+	{
+		const char *type_name = flex_capcode_type_name(capcode);
+		if (flex_capcode_special_type(capcode) == FLEX_ADDR_TEMPORARY) {
+			uint32_t aw = (uint32_t)(capcode + FLEX_SHORT_ADDR_OFFSET);
+			LOGP(DFLEX, LOGL_INFO, "Creating msg instance to page capcode '%" PRIu64 "' (%s G=%u) / type '%s'.\n",
+			     capcode, type_name, flex_temp_addr_slot(aw), flex_msg_type_name(msg_type));
+		} else {
+			LOGP(DFLEX, LOGL_INFO, "Creating msg instance to page capcode '%" PRIu64 "' (%s) / type '%s'.\n",
+			     capcode, type_name, flex_msg_type_name(msg_type));
+		}
+	}
 
 	/* Warn if capcode falls in a special protocol address range.
 	 * These are not user-assignable per Table 3.8.1-1 but we allow
@@ -231,6 +252,10 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 			     "Warning: capcode %" PRIu64 " is special address %s/%s (aw=0x%05X) — not a user-assignable capcode.\n",
 			     capcode, flex_addr_type_name(stype),
 			     flex_oper_msg_subtype_name(aw), aw);
+		else if (stype == FLEX_ADDR_TEMPORARY)
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "Warning: capcode %" PRIu64 " is Temporary group slot %u (aw=0x%05X).\n",
+			     capcode, flex_temp_addr_slot(aw), aw);
 		else
 			LOGP(DFLEX, LOGL_NOTICE,
 			     "Warning: capcode %" PRIu64 " is special address %s (aw=0x%05X) — %s.\n",
@@ -644,8 +669,16 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 	/* --- Create DELIVERY message, pinned to frame N --- */
 	{
 		flex_msg_t *msg;
+		/* Use the real temp-slot capcode so logs, phase assignment,
+		 * fragmentation sizing, and N-counter all work correctly.
+		 * capcode = FLEX_ADDR_TEMPORARY_MIN + slot - SHORT_ADDR_OFFSET
+		 * The frame builder still uses temp_delivery_slot to encode
+		 * the address word, so the over-the-air format is unchanged. */
+		uint64_t delivery_capcode = (uint64_t)(FLEX_ADDR_TEMPORARY_MIN
+					    + (uint32_t)slot)
+					    - FLEX_SHORT_ADDR_OFFSET;
 
-		msg = flex_msg_create(flex, 1, msg_type, data, data_length);
+		msg = flex_msg_create(flex, delivery_capcode, msg_type, data, data_length);
 		if (!msg) {
 			LOGP(DFLEX, LOGL_ERROR,
 			     "TX: tempgroup DELIVERY creation failed for slot=%d.\n",
@@ -1250,8 +1283,9 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 	if (msg->total_fragments <= 1) {
 		if (msg->retransmit_max == 0 || msg->retransmit_count >= msg->retransmit_max) {
 			LOGP(DFLEX, LOGL_INFO,
-			     "TX_COMPLETE: capcode=%" PRIu64 " type=%s N=%d total_tx=%d\n",
-			     msg->capcode, flex_msg_type_name(msg->msg_type),
+			     "TX_COMPLETE: capcode=%" PRIu64 "%s type=%s N=%d total_tx=%d\n",
+			     msg->capcode, flex_grp_tag(msg->temp_delivery_slot),
+			     flex_msg_type_name(msg->msg_type),
 			     msg->assigned_n, 1 + msg->retransmit_count);
 			flex_msg_destroy(msg);
 			return;
@@ -1262,8 +1296,9 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 		msg->next_send_frame = (current_abs_frame + (uint32_t)msg->retransmit_interval) % 1920;
 
 		LOGP(DFLEX, LOGL_INFO,
-		     "TX_RETRANSMIT: capcode=%" PRIu64 " type=%s N=%d count=%d/%d next_frame=%u\n",
-		     msg->capcode, flex_msg_type_name(msg->msg_type),
+		     "TX_RETRANSMIT: capcode=%" PRIu64 "%s type=%s N=%d count=%d/%d next_frame=%u\n",
+		     msg->capcode, flex_grp_tag(msg->temp_delivery_slot),
+		     flex_msg_type_name(msg->msg_type),
 		     msg->assigned_n, msg->retransmit_count, msg->retransmit_max,
 		     msg->next_send_frame);
 		return;
@@ -1300,8 +1335,9 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 			/* First fragment already destroyed (normal when
 			 * retransmit_max == 0). Clean up remaining fragments. */
 			LOGP(DFLEX, LOGL_INFO,
-			     "TX_COMPLETE: capcode=%" PRIu64 " type=%s total_tx=1 (fragmented, %d frags)\n",
-			     msg->capcode, flex_msg_type_name(msg->msg_type),
+			     "TX_COMPLETE: capcode=%" PRIu64 "%s type=%s total_tx=1 (fragmented, %d frags)\n",
+			     msg->capcode, flex_grp_tag(msg->temp_delivery_slot),
+			     flex_msg_type_name(msg->msg_type),
 			     msg->total_fragments);
 			flex_destroy_all_fragments(flex, msg->retrieval_num,
 						   msg->total_fragments);
@@ -1312,8 +1348,9 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 		    first->retransmit_count >= first->retransmit_max) {
 			/* All retransmissions done — destroy all fragments */
 			LOGP(DFLEX, LOGL_INFO,
-			     "TX_COMPLETE: capcode=%" PRIu64 " type=%s N=%d total_tx=%d (fragmented, %d frags)\n",
-			     msg->capcode, flex_msg_type_name(msg->msg_type),
+			     "TX_COMPLETE: capcode=%" PRIu64 "%s type=%s N=%d total_tx=%d (fragmented, %d frags)\n",
+			     msg->capcode, flex_grp_tag(msg->temp_delivery_slot),
+			     flex_msg_type_name(msg->msg_type),
 			     first->assigned_n, 1 + first->retransmit_count,
 			     msg->total_fragments);
 			flex_destroy_all_fragments(flex, msg->retrieval_num,
@@ -1342,8 +1379,9 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 		}
 
 		LOGP(DFLEX, LOGL_INFO,
-		     "TX_RETRANSMIT: capcode=%" PRIu64 " type=%s N=%d count=%d/%d next_frame=%u (fragmented, %d frags)\n",
-		     msg->capcode, flex_msg_type_name(msg->msg_type),
+		     "TX_RETRANSMIT: capcode=%" PRIu64 "%s type=%s N=%d count=%d/%d next_frame=%u (fragmented, %d frags)\n",
+		     msg->capcode, flex_grp_tag(msg->temp_delivery_slot),
+		     flex_msg_type_name(msg->msg_type),
 		     first->assigned_n, first->retransmit_count, first->retransmit_max,
 		     first->next_send_frame, msg->total_fragments);
 	}
@@ -2696,8 +2734,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 							}
 							fm->sequence_num = m->assigned_n;
 							LOGP(DFLEX, LOGL_INFO,
-							     "TX: capcode=%" PRIu64 " N=%d R=1 type=%s frags=%d retransmit=%d/%d C%u/F%u\n",
-							     m->capcode, m->assigned_n,
+							     "TX: capcode=%" PRIu64 "%s N=%d R=1 type=%s frags=%d retransmit=%d/%d C%u/F%u\n",
+							     m->capcode, flex_grp_tag(m->temp_delivery_slot),
+							     m->assigned_n,
 							     flex_msg_type_name(m->msg_type),
 							     m->total_fragments,
 							     m->retransmit_count, m->retransmit_max,
@@ -2711,8 +2750,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 							fm->sysmsg_method = m->sysmsg_method;
 							if (m->retransmit_max > 0) {
 								LOGP(DFLEX, LOGL_INFO,
-								     "TX_INITIAL: capcode=%" PRIu64 " type=%s N=%d retransmit_max=%d\n",
-								     m->capcode, flex_msg_type_name(m->msg_type),
+								     "TX_INITIAL: capcode=%" PRIu64 "%s type=%s N=%d retransmit_max=%d\n",
+								     m->capcode, flex_grp_tag(m->temp_delivery_slot),
+								     flex_msg_type_name(m->msg_type),
 								     m->assigned_n, m->retransmit_max);
 							}
 						} else {
@@ -2721,8 +2761,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 							fm->hex_r_flag = 0;
 							fm->numbered_r = 0;
 							LOGP(DFLEX, LOGL_INFO,
-							     "TX: capcode=%" PRIu64 " N=%d R=0 (retransmit %d/%d) type=%s C%u/F%u\n",
-							     m->capcode, m->assigned_n,
+							     "TX: capcode=%" PRIu64 "%s N=%d R=0 (retransmit %d/%d) type=%s C%u/F%u\n",
+							     m->capcode, flex_grp_tag(m->temp_delivery_slot),
+							     m->assigned_n,
 							     m->retransmit_count, m->retransmit_max,
 							     flex_msg_type_name(m->msg_type),
 							     ft.cycle, ft.frame);

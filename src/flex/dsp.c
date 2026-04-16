@@ -2480,6 +2480,7 @@ parse_phase:
 		char prio_flag = ' ';
 		uint32_t aw_raw = 0, aw_base = 0;
 		enum flex_addr_type aw_type = FLEX_ADDR_UNKNOWN;
+		char grp_tag[16] = "";  /* ",G=N" for temp group, "" otherwise */
 
 		for (; addr_idx < voffset; addr_idx++) {
 
@@ -2513,6 +2514,13 @@ parse_phase:
 			aw_base = aw_raw;
 			aw_type = flex_classify_addr_word(aw_base);
 			is_long = flex_addr_is_long(aw_base);
+
+			/* Build group tag for temp addresses */
+			if (aw_type == FLEX_ADDR_TEMPORARY)
+				snprintf(grp_tag, sizeof(grp_tag), ",G=%u",
+					 flex_temp_addr_slot(aw_base));
+			else
+				grp_tag[0] = '\0';
 
 			if (is_long) {
 				/* Long address: 2 address words, 2 vector words.
@@ -2608,13 +2616,14 @@ parse_phase:
 			if (vec_count >= n_valid_vec_words) {
 				if (capcode == 1) continue;  /* idle artifact */
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c TON\n",
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c TON\n",
 					  bitrate,
 					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 					  phase_name,
 					  flex->rx.sync_baud,
 					  flex->rx.sync_levels,
 					  flex->rx.polarity ? "inverted" : "normal",
+					  grp_tag,
 					  capcode,
 					  flex_addr_type_flag(aw_type, is_long),
 					  prio_flag);
@@ -3483,13 +3492,14 @@ parse_phase:
 					}
 
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "inverted" : "normal",
+						  grp_tag,
 						  (frag_flag == 'K') ? "complete" :
 						  (frag_flag == 'F') ? (is_initial ? "frag_start" : "frag_cont") :
 						  "frag_end",
@@ -3626,13 +3636,14 @@ parse_phase:
 							reasm_append(flex, slot, text, ti);
 							if (flex->rx.reasm[pol][slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c %s t1t0=%d \"%s\" {%s}\n",
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s%s [%09" PRIu64 "] %c%c %s t1t0=%d \"%s\" {%s}\n",
 									  bitrate,
 									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 									  phase_name,
 									  flex->rx.sync_baud,
 									  flex->rx.sync_levels,
 									  flex->rx.polarity ? "inverted" : "normal",
+									  grp_tag,
 									  "reassembled",
 									  reasm_sig_status,
 									  capcode,
@@ -3644,13 +3655,14 @@ parse_phase:
 									  flex->rx.reasm[pol][slot].word_status);
 							else
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 									  bitrate,
 									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 									  phase_name,
 									  flex->rx.sync_baud,
 									  flex->rx.sync_levels,
 									  flex->rx.polarity ? "inverted" : "normal",
+									  grp_tag,
 									  "reassembled",
 									  reasm_sig_status,
 									  capcode,
@@ -3916,13 +3928,14 @@ parse_phase:
 						/* Output with subtype tag and optional sequencing fields */
 						if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM && num_n >= 0) {
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s [%09" PRIu64 "] %c%c %s N=%d,R=%d,S=%d \"%s\"\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s%s [%09" PRIu64 "] %c%c %s N=%d,R=%d,S=%d \"%s\"\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
 								  flex->rx.sync_baud,
 								  flex->rx.sync_levels,
 								  flex->rx.polarity ? "inverted" : "normal",
+								  grp_tag,
 								  num_k_status,
 								  num_recovered ? ",RX_RECOVERED" : "",
 								  capcode,
@@ -3932,13 +3945,14 @@ parse_phase:
 								  digits);
 						} else {
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c %s \"%s\"\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s [%09" PRIu64 "] %c%c %s \"%s\"\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
 								  flex->rx.sync_baud,
 								  flex->rx.sync_levels,
 								  flex->rx.polarity ? "inverted" : "normal",
+								  grp_tag,
 								  num_k_status,
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
@@ -3954,13 +3968,14 @@ parse_phase:
 						(vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM) ? "SNUM" :
 						(vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) ? "NNUM" : "NUM";
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c %s\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c %s\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "inverted" : "normal",
+						  grp_tag,
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  prio_flag,
@@ -4029,26 +4044,28 @@ parse_phase:
 
 					if (all_space) {
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG \"%*s\" (tone-only)\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c SMSG \"%*s\" (tone-only)\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
 							  flex->rx.polarity ? "inverted" : "normal",
+							  grp_tag,
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  prio_flag,
 							  ndigits, "        ");
 					} else {
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG \"%s\"\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c SMSG \"%s\"\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
 							  flex->rx.polarity ? "inverted" : "normal",
+							  grp_tag,
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  prio_flag,
@@ -4061,13 +4078,14 @@ parse_phase:
 
 					if (t_field == FLEX_SMSG_TYPE_SOURCE) {
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG %s S=%u\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c SMSG %s S=%u\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
 							  flex->rx.polarity ? "inverted" : "normal",
+							  grp_tag,
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  prio_flag,
@@ -4079,13 +4097,14 @@ parse_phase:
 						uint32_t r = (d_field >> FLEX_SMSG_NUMB_R_SHIFT)
 							   & FLEX_SMSG_NUMB_R_MASK;
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG %s S=%u N=%u R=%u\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c SMSG %s S=%u N=%u R=%u\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
 							  flex->rx.sync_baud,
 							  flex->rx.sync_levels,
 							  flex->rx.polarity ? "inverted" : "normal",
+							  grp_tag,
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  prio_flag,
@@ -4095,13 +4114,14 @@ parse_phase:
 				} else {
 					/* t=11: reserved sub-type */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s [%09" PRIu64 "] %c%c SMSG reserved (t=%u d=0x%03X)\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c SMSG reserved (t=%u d=0x%03X)\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "inverted" : "normal",
+						  grp_tag,
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  prio_flag,
@@ -4531,13 +4551,14 @@ parse_phase:
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,B=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  flex->rx.sync_baud,
 						  flex->rx.sync_levels,
 						  flex->rx.polarity ? "inverted" : "normal",
+						  grp_tag,
 						  (hex_frag_flag == 'K') ? "complete" :
 						  (hex_frag_flag == 'F') ? (hex_is_initial ? "frag_start" : "frag_cont") :
 						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
@@ -4602,13 +4623,14 @@ parse_phase:
 									  r_bits, r_blocks);
 							}
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s,frag=%s,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
 								  flex->rx.sync_baud,
 								  flex->rx.sync_levels,
 								  flex->rx.polarity ? "inverted" : "normal",
+								  grp_tag,
 								  "reassembled",
 								  hex_blocking,
 								  capcode,
