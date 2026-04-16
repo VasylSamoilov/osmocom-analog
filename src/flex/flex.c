@@ -351,6 +351,7 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->fragment_index = 0;
 	msg->total_fragments = 0;
 	msg->retrieval_num = 0;
+	msg->fragment_tx_phase = -1; /* not yet transmitted */
 
 	/* Pre-compute message signature from raw text.
 	 * This covers the entire message before any fragmentation.
@@ -470,7 +471,16 @@ void flex_msg_destroy(flex_msg_t *msg)
 
 /* ===== TX Temporary Group Scheduling (§3.8.2.3, §3.9.6) ===== */
 
-/* Frames of margin between last SETUP and DELIVERY target frame */
+/* Frames of margin between last SETUP and DELIVERY target frame.
+ *
+ * Per §5.2.1: "The Frame in which the Temporary Address is transmitted
+ * is any Frame except the first subsequent Frame after the multiple
+ * transmission for the page including the Short Instruction Vector
+ * is completed."
+ *
+ * This means a minimum gap of 2 frames: skip the first frame after
+ * SETUP completes, DELIVERY can start on the 2nd frame or later.
+ * We use 4 frames for safety margin (queue processing headroom). */
 #define FLEX_TG_SETUP_MARGIN	4
 
 /* Frames of lead time before first SETUP (queue processing headroom) */
@@ -997,6 +1007,7 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->blocking_length = msg->blocking_length;
 			frag->mail_drop = msg->mail_drop;
 			frag->phase = msg->phase;
+			frag->fragment_tx_phase = msg->fragment_tx_phase; /* -1 until initial is sent */
 			frag->secure_subtype = msg->secure_subtype;
 			frag->secure_encoding = msg->secure_encoding;
 
@@ -1360,10 +1371,12 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 
 		/* Retransmissions remain — increment count on first fragment,
 		 * schedule next send on first fragment only.
-		 * Reset fragment_sent flags so the ordering guard
-		 * enforces sequential transmission again. */
+		 * Reset fragment_sent flags and fragment_tx_phase so the
+		 * ordering guard enforces sequential transmission again
+		 * and the initial fragment re-establishes the TX phase. */
 		first->retransmit_count++;
 		first->fragment_sent = 0;
+		first->fragment_tx_phase = -1; /* re-establish on next initial TX */
 		first->next_send_frame = (current_abs_frame + (uint32_t)first->retransmit_interval) % 1920;
 
 		{
@@ -1374,6 +1387,7 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 				    frag->fragment_index > 0) {
 					frag->next_send_frame = first->next_send_frame;
 					frag->fragment_sent = 0;
+					frag->fragment_tx_phase = -1;
 				}
 			}
 		}
@@ -2562,9 +2576,46 @@ static int flex_get_next_frame_network(flex_t *flex)
 			}
 
 			/* Add sorted candidates directly to per-phase lists.
-			 * Each phase has its own capacity — no shared limit. */
+			 * Each phase has its own capacity — no shared limit.
+			 *
+			 * Three additional checks applied here:
+			 *
+			 * (a) Address reuse limit (§3.8.5): same capcode can
+			 *     appear at most FLEX_MAX_ADDR_REUSE_PER_FRAME
+			 *     times across ALL phases in one frame.
+			 *
+			 * (b) Soft RF phase preference: for messages with no
+			 *     fixed phase assignment (m->phase < 0), when the
+			 *     assigned phase is full, try to spill to an MSB
+			 *     (RF-robust) phase first before LSB phases.
+			 *     In 4-FSK modes, MSB phases have better noise
+			 *     margin than LSB phases (see flex_phase_is_msb).
+			 *
+			 * (c) Per-phase AF word tracking for Low Traffic Flags:
+			 *     accumulate address field words per phase so the
+			 *     FIW t-field can be computed after collection. */
 			{
 				int i;
+				/* Per-frame capcode usage counter for §3.8.5.
+				 * Tracks how many times each capcode has been
+				 * packed into this frame across all phases.
+				 * Simple linear scan — adequate for typical
+				 * frame sizes (< 256 candidates). */
+				struct { uint64_t cap; int count; } cap_usage[FLEX_MAX_CANDIDATES];
+				int n_cap_usage = 0;
+
+				/* Per-phase priority address word counter (§8.1, §3.7.1).
+				 * BIW1 p field is 4 bits (0-15), so each phase can
+				 * hold at most FLEX_BIW1_PRIO_MASK words of priority
+				 * addresses.  A short priority address = 1 word,
+				 * a long priority address = 2 words. */
+				int phase_prio_words[FLEX_MAX_PHASES];
+				{
+					int pp;
+					for (pp = 0; pp < FLEX_MAX_PHASES; pp++)
+						phase_prio_words[pp] = 0;
+				}
+
 				for (i = 0; i < n_sorted; i++) {
 					flex_msg_t *m = sorted[i];
 					int is_long = (m->capcode >= FLEX_LONG_ADDR_MIN
@@ -2577,34 +2628,242 @@ static int flex_get_next_frame_network(flex_t *flex)
 					if (cost < 0)
 						continue; /* invalid message */
 
+					/* --- §3.8.5 address reuse check --- */
+					{
+						int cu;
+						int usage_count = 0;
+						for (cu = 0; cu < n_cap_usage; cu++) {
+							if (cap_usage[cu].cap == m->capcode) {
+								usage_count = cap_usage[cu].count;
+								break;
+							}
+						}
+						if (usage_count >= FLEX_MAX_ADDR_REUSE_PER_FRAME) {
+							LOGP(DFLEX, LOGL_DEBUG,
+							     "Scheduler: skip capcode=%" PRIu64
+							     " -- address reuse limit (%d/%d per frame, §3.8.5)\n",
+							     m->capcode, usage_count,
+							     FLEX_MAX_ADDR_REUSE_PER_FRAME);
+							continue;
+						}
+					}
+
 					/* Determine target phase */
 					flex_scheduler_capcode_info(m->capcode, &sched);
 					phase_idx = (int)(sched.assigned_phase % (uint32_t)num_phases);
 					if (m->phase >= 0)
 						phase_idx = flex_map_phase(m->phase, num_phases);
 
+					/* Fragment phase tracking: continuation fragments
+					 * must follow the phase where the initial fragment
+					 * was actually transmitted.  This ensures the pager
+					 * (which is listening on that phase) can reassemble
+					 * the complete message.
+					 *
+					 * fragment_tx_phase is set by the scheduler after
+					 * the initial fragment is encoded and propagated
+					 * to all siblings in the same retrieval group. */
+					if (m->total_fragments > 1 &&
+					    m->fragment_index > 0 &&
+					    m->fragment_tx_phase >= 0) {
+						phase_idx = m->fragment_tx_phase % num_phases;
+					}
+
 					/* Single-phase mode: everything goes to phase 0 */
 					if (num_phases == 1)
 						phase_idx = 0;
 
-					if (phase_n_cands[phase_idx] >= FLEX_MAX_CANDIDATES)
-						continue;
-					if (phase_est_used[phase_idx] + cost > pcap[phase_idx]) {
+					/* Check capacity on the target phase.
+					 * If full and no explicit phase override, try
+					 * spillover with RF-robust phase preference.
+					 *
+					 * Spillover is BLOCKED for:
+					 *   - Explicit phase override (m->phase >= 0):
+					 *     Single Phase pager, must stay in assigned phase.
+					 *   - Single-phase mode (num_phases <= 1):
+					 *     nowhere to spill.
+					 *   - Temp group DELIVERY (temp_delivery_slot >= 0):
+					 *     pinned to specific frame, phase must match
+					 *     group members' expectations (§5.2).
+					 *
+					 * Spillover is STRONGLY DISCOURAGED for:
+					 *   - Fragment continuations (total_fragments > 1,
+					 *     fragment_index > 0): pager expects all
+					 *     fragments on the same phase as the initial
+					 *     fragment.  Only spill as last resort to
+					 *     avoid starvation (fragment interval limit
+					 *     §4.2 ④ would be violated otherwise).
+					 *   - Fragment initials (total_fragments > 1,
+					 *     fragment_index == 0): sets the phase for
+					 *     all subsequent fragments — should use the
+					 *     capcode's assigned phase if possible. */
+					if (phase_n_cands[phase_idx] >= FLEX_MAX_CANDIDATES ||
+					    phase_est_used[phase_idx] + cost > pcap[phase_idx]) {
+						/* Pinned messages: no spillover */
+						if (m->phase >= 0 || num_phases <= 1 ||
+						    m->temp_delivery_slot >= 0) {
+							LOGP(DFLEX, LOGL_DEBUG,
+							     "Scheduler: skip capcode=%" PRIu64
+							     " est=%d words (phase %d capacity=%d"
+							     " used=%d, %s)\n",
+							     m->capcode, cost, phase_idx,
+							     pcap[phase_idx],
+							     phase_est_used[phase_idx],
+							     m->temp_delivery_slot >= 0
+							     ? "temp delivery pinned"
+							     : m->phase >= 0
+							     ? "fixed phase" : "single-phase");
+							continue;
+						}
+
+						/* Fragments: must stay on the initial fragment's
+						 * assigned phase.  If fragment_tx_phase is set,
+						 * the phase is locked — no spillover allowed.
+						 * If fragment_tx_phase is not yet set (initial
+						 * fragment hasn't been sent), prefer the
+						 * capcode's assigned phase — skip and retry
+						 * on the next frame when the phase may have
+						 * capacity. */
+						if (m->total_fragments > 1) {
+							LOGP(DFLEX, LOGL_DEBUG,
+							     "Scheduler: skip fragment capcode=%" PRIu64
+							     " idx=%d/%d -- phase %d full,"
+							     " fragments locked to %s phase %d\n",
+							     m->capcode, m->fragment_index,
+							     m->total_fragments, phase_idx,
+							     m->fragment_tx_phase >= 0
+							     ? "initial TX" : "assigned",
+							     phase_idx);
+							continue;
+						}
+
+						/* Soft RF phase preference (§3.3.2 observation):
+						 * Try MSB (RF-robust) phases first, then LSB.
+						 * In 4-FSK modes, MSB phases carry the more
+						 * noise-resistant bit of each dibit symbol.
+						 * This is a non-enforced tie-breaker — lowest
+						 * priority after all other scheduling rules. */
+						int found = 0;
+						int try_p;
+
+						/* Pass 1: try MSB phases (excluding original) */
+						for (try_p = 0; try_p < num_phases; try_p++) {
+							if (try_p == phase_idx)
+								continue;
+							if (!flex_phase_is_msb(try_p, num_phases,
+									       params.modulation_type))
+								continue;
+							if (phase_n_cands[try_p] < FLEX_MAX_CANDIDATES &&
+							    phase_est_used[try_p] + cost <= pcap[try_p]) {
+								phase_idx = try_p;
+								found = 1;
+								break;
+							}
+						}
+						/* Pass 2: try LSB phases if no MSB available */
+						if (!found) {
+							for (try_p = 0; try_p < num_phases; try_p++) {
+								if (try_p == phase_idx)
+									continue;
+								if (flex_phase_is_msb(try_p, num_phases,
+										      params.modulation_type))
+									continue;
+								if (phase_n_cands[try_p] < FLEX_MAX_CANDIDATES &&
+								    phase_est_used[try_p] + cost <= pcap[try_p]) {
+									phase_idx = try_p;
+									found = 1;
+									break;
+								}
+							}
+						}
+						if (!found) {
+							LOGP(DFLEX, LOGL_DEBUG,
+							     "Scheduler: skip capcode=%" PRIu64
+							     " est=%d words (all phases full)\n",
+							     m->capcode, cost);
+							continue;
+						}
 						LOGP(DFLEX, LOGL_DEBUG,
-						     "Scheduler: skip capcode=%" PRIu64
-						     " est=%d words (phase %d capacity=%d used=%d)\n",
-						     m->capcode, cost, phase_idx,
-						     pcap[phase_idx], phase_est_used[phase_idx]);
-						continue;
+						     "Scheduler: capcode=%" PRIu64
+						     " spilled to phase %d (%s)\n",
+						     m->capcode, phase_idx,
+						     flex_phase_is_msb(phase_idx, num_phases,
+								      params.modulation_type)
+						     ? "MSB/robust" : "LSB");
 					}
 
 					aw = is_long ? 2 : 1;
+
+					/* System message method (a) (§3.9.2): no address
+					 * word in AF — the BIW101 serves as the implicit
+					 * address.  Override aw to 0 for accurate AF
+					 * word counting (used by Low Traffic Flags). */
+					if (m->sysmsg_method == 'a')
+						aw = 0;
+
 					if (m->msg_type == FLEX_MSG_TYPE_TONE) {
 						vw = 0;
 						bw = 0;
 					} else {
 						vw = is_long ? 2 : 1;
 						bw = cost - aw - vw;
+					}
+
+					/* Priority address word limit (§8.1, §3.7.1).
+					 * BIW1 p field is 4 bits (max 15 words per phase).
+					 * If this priority message would push the
+					 * per-phase priority word count over the limit,
+					 * try spillover to another phase (same logic as
+					 * capacity spillover — MSB phases first).
+					 * Only possible when no explicit phase override
+					 * and multiple phases are available.
+					 * If no phase has room, skip — stays in queue. */
+					if (m->priority && aw > 0 &&
+					    phase_prio_words[phase_idx] + aw > (int)FLEX_BIW1_PRIO_MASK) {
+						if (m->phase >= 0 || num_phases <= 1) {
+							LOGP(DFLEX, LOGL_NOTICE,
+							     "Scheduler: skip priority capcode=%" PRIu64
+							     " -- phase %d priority words full"
+							     " (%d+%d > %d), fixed phase\n",
+							     m->capcode, phase_idx,
+							     phase_prio_words[phase_idx], aw,
+							     (int)FLEX_BIW1_PRIO_MASK);
+							continue;
+						}
+						/* Try other phases: MSB first, then LSB */
+						int found_prio = 0;
+						int try_p;
+						for (try_p = 0; try_p < num_phases; try_p++) {
+							if (try_p == phase_idx)
+								continue;
+							if (phase_prio_words[try_p] + aw > (int)FLEX_BIW1_PRIO_MASK)
+								continue;
+							if (phase_n_cands[try_p] >= FLEX_MAX_CANDIDATES)
+								continue;
+							if (phase_est_used[try_p] + cost > pcap[try_p])
+								continue;
+							/* Prefer MSB phases */
+							if (!found_prio ||
+							    flex_phase_is_msb(try_p, num_phases,
+									      params.modulation_type)) {
+								phase_idx = try_p;
+								found_prio = 1;
+								if (flex_phase_is_msb(try_p, num_phases,
+										      params.modulation_type))
+									break; /* MSB found, stop */
+							}
+						}
+						if (!found_prio) {
+							LOGP(DFLEX, LOGL_NOTICE,
+							     "Scheduler: skip priority capcode=%" PRIu64
+							     " -- all phases priority-full\n",
+							     m->capcode);
+							continue;
+						}
+						LOGP(DFLEX, LOGL_DEBUG,
+						     "Scheduler: priority capcode=%" PRIu64
+						     " spilled to phase %d (prio words)\n",
+						     m->capcode, phase_idx);
 					}
 
 					phase_cands[phase_idx][phase_n_cands[phase_idx]].msg = m;
@@ -2615,6 +2874,28 @@ static int flex_get_next_frame_network(flex_t *flex)
 					phase_cands[phase_idx][phase_n_cands[phase_idx]].is_long = is_long;
 					phase_n_cands[phase_idx]++;
 					phase_est_used[phase_idx] += cost;
+
+					/* Track priority address words per phase */
+					if (m->priority && aw > 0)
+						phase_prio_words[phase_idx] += aw;
+
+					/* Update per-frame capcode usage counter (§3.8.5) */
+					{
+						int cu;
+						int found_cap = 0;
+						for (cu = 0; cu < n_cap_usage; cu++) {
+							if (cap_usage[cu].cap == m->capcode) {
+								cap_usage[cu].count++;
+								found_cap = 1;
+								break;
+							}
+						}
+						if (!found_cap && n_cap_usage < FLEX_MAX_CANDIDATES) {
+							cap_usage[n_cap_usage].cap = m->capcode;
+							cap_usage[n_cap_usage].count = 1;
+							n_cap_usage++;
+						}
+					}
 				}
 			}
 		}
@@ -2628,6 +2909,57 @@ static int flex_get_next_frame_network(flex_t *flex)
 				msg = phase_cands[p][0].msg;
 				break;
 			}
+		}
+	}
+
+	/* === Compute Low Traffic Flags for FIW t-field (§3.6) ===
+	 *
+	 * After candidate collection, compute per-phase address field
+	 * word counts.  The AF includes all address words (priority,
+	 * normal, tone-only) — each short address = 1 word, each long
+	 * address = 2 words.  Vectors and message body are NOT part of AF.
+	 *
+	 * The flags tell pagers whether the AF fits within block 0
+	 * (first FLEX_WORDS_PER_BLOCK words), allowing early battery-save.
+	 *
+	 * Only meaningful for single transmission (r=0 in FIW).
+	 * Suppressed when carry-on is active or collapse is changing. */
+	if (params.num_transmissions <= 1) {
+		int phase_af_words[FLEX_MAX_PHASES];
+		int biw_count_for_ltf;
+		int p, j;
+
+		for (p = 0; p < FLEX_MAX_PHASES; p++)
+			phase_af_words[p] = 0;
+
+		/* Sum address words per phase from packed candidates */
+		for (p = 0; p < num_phases; p++) {
+			for (j = 0; j < phase_n_cands[p]; j++)
+				phase_af_words[p] += phase_cands[p][j].addr_words;
+		}
+
+		/* Use the carousel BIW count if available, otherwise
+		 * fall back to the static computation */
+		biw_count_for_ltf = params.carousel_biw_count > 0
+			? params.carousel_biw_count
+			: flex_compute_biw_count(&params);
+
+		params.low_traffic_flags = flex_compute_low_traffic_flags(
+			phase_af_words, num_phases, biw_count_for_ltf,
+			params.carry_on,
+			flex->param_change_state != 0);
+
+		if (params.low_traffic_flags) {
+			LOGP_CHAN(DFLEX, LOGL_DEBUG,
+				  "Scheduler: Low Traffic Flags: A=%u B=%u C=%u D=%u"
+				  " (biw=%d, af=[%d,%d,%d,%d])\n",
+				  (params.low_traffic_flags >> 0) & 1,
+				  (params.low_traffic_flags >> 1) & 1,
+				  (params.low_traffic_flags >> 2) & 1,
+				  (params.low_traffic_flags >> 3) & 1,
+				  biw_count_for_ltf,
+				  phase_af_words[0], phase_af_words[1],
+				  phase_af_words[2], phase_af_words[3]);
 		}
 	}
 
@@ -2817,6 +3149,34 @@ static int flex_get_next_frame_network(flex_t *flex)
 				}
 
 				any_msg = 1;
+
+				/* Record the TX phase for fragment tracking.
+				 * When an initial fragment (index 0) is transmitted,
+				 * record which phase it was placed on and propagate
+				 * to all sibling fragments in the same retrieval
+				 * group.  Continuation fragments use this to stay
+				 * on the same phase as the initial. */
+				for (j = 0; j < phase_packed; j++) {
+					flex_msg_t *pm = phase_cands[p][j].msg;
+					if (pm->total_fragments > 1 &&
+					    pm->fragment_index == 0 &&
+					    pm->fragment_tx_phase < 0) {
+						flex_msg_t *sib;
+						pm->fragment_tx_phase = p;
+						/* Propagate to all siblings */
+						for (sib = flex->msg_list; sib; sib = sib->next) {
+							if (sib == pm)
+								continue;
+							if (sib->total_fragments == pm->total_fragments &&
+							    sib->retrieval_num == pm->retrieval_num)
+								sib->fragment_tx_phase = p;
+						}
+						LOGP(DFLEX, LOGL_DEBUG,
+						     "Scheduler: initial fragment cap=%" PRIu64
+						     " ret=%u assigned to phase %d\n",
+						     pm->capcode, pm->retrieval_num, p);
+					}
+				}
 
 				/* Post-transmit for packed messages in this phase (Req 2.3).
 				 * Iterate by array index — safe even if flex_post_transmit()

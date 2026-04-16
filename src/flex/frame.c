@@ -545,6 +545,66 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words)
 	memcpy(frame_words + block_num * FLEX_WORDS_PER_BLOCK, dst, sizeof(dst));
 }
 
+/* Compute per-phase Low Traffic Flags for FIW t-field (§3.6).
+ *
+ * For each phase, checks whether the address field (AF) fits entirely
+ * within block 0 (first FLEX_WORDS_PER_BLOCK words).  The AF includes
+ * all address words: priority, normal, and tone-only (short=1 word,
+ * long=2 words each).  Vectors, message body, and system message
+ * content are NOT part of the AF and do not affect this flag.
+ *
+ * Returns a 4-bit value: t0=phase A, t1=B, t2=C, t3=D.
+ *
+ * Per §3.6: "These flags are used for indicating Low Traffic and that
+ * all addresses have been allocated to block 0 at an earlier stage.
+ * When there is Carry On or a change in the Collapse cycle, flags
+ * are not set for 1, even when traffic is low." */
+uint32_t flex_compute_low_traffic_flags(const int *phase_af_words,
+					int num_phases, int biw_count,
+					int carry_on, int collapse_changing)
+{
+	uint32_t flags = 0;
+	int p;
+
+	/* §3.6: flags are suppressed when carry-on is active or
+	 * a Collapse cycle change is in progress */
+	if (carry_on > 0 || collapse_changing)
+		return 0;
+
+	/* Check each phase: AF must fit within block 0.
+	 * Block 0 = words 0..(FLEX_WORDS_PER_BLOCK-1).
+	 * BIW words precede AF, so AF starts at word biw_count.
+	 * Low traffic condition: biw_count + af_words <= FLEX_WORDS_PER_BLOCK */
+	for (p = 0; p < num_phases && p < FLEX_MAX_PHASES; p++) {
+		if (biw_count + phase_af_words[p] <= FLEX_WORDS_PER_BLOCK)
+			flags |= (1U << p);
+	}
+
+	/* Speed-dependent pairing (§3.6):
+	 *   At 3200 bps (2 phases): t3=t2 and t1=t0
+	 *   At 1600 bps (1 phase):  t3=t2=t1=t0
+	 * The pairing ensures unused phase bits mirror the active ones. */
+	switch (num_phases) {
+	case 1:
+		/* 1600 bps: single phase A — replicate t0 to all bits */
+		flags = (flags & 0x01) ? FLEX_FIW_TRAFFIC_MASK : 0;
+		break;
+	case 2:
+		/* 3200 bps: phases A(t0) and C(t1) — pair t1=t0, t3=t2 */
+		{
+			uint32_t t0 = (flags >> 0) & 1;
+			uint32_t t1 = (flags >> 1) & 1;
+			flags = t0 | (t0 << 1) | (t1 << 2) | (t1 << 3);
+		}
+		break;
+	default:
+		/* 6400 bps (4 phases): each bit independent */
+		break;
+	}
+
+	return flags & FLEX_FIW_TRAFFIC_MASK;
+}
+
 /*
  * Fill a phase's word array with the idle pattern.
  *
@@ -2893,6 +2953,11 @@ static size_t flex_encode_fiw(const flex_frame_params_t *params,
 			}
 
 			t_field = t10 | (t32 << 2);
+		} else {
+			/* Single transmission (r=0): use per-phase Low Traffic
+			 * Flags computed by the scheduler (§3.6).
+			 * Bit layout: t0=A, t1=B, t2=C, t3=D. */
+			t_field = params->low_traffic_flags & FLEX_FIW_TRAFFIC_MASK;
 		}
 
 		uint32_t fiw_cw = flex_create_fiw(params->cycle, params->frame,
@@ -3453,6 +3518,36 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	fwc = 0;
 	{
 		uint32_t s_vfield = (uint32_t)(biw_count + total_addr);
+
+		/* Validate BIW1 field limits.
+		 *
+		 * p field (§8.1, §3.7.1): 4 bits, max 15 priority address
+		 * words.  A long priority address consumes 2 words, so at
+		 * most 15 short or 7 long priority addresses per phase.
+		 *
+		 * s_vfield (§3.7.1): 6 bits, max 63.  This is the word
+		 * index where the Vector Field starts (= biw_count + all
+		 * AF words including priority, normal, and tone-only).
+		 * Overflow means the address field is too large for the
+		 * frame — the pager would mislocate the vector field. */
+		if (prio_addr_words > (int)FLEX_BIW1_PRIO_MASK) {
+			LOGP(DFLEX, LOGL_ERROR,
+			     "TX: BIW1 priority address words (%d) exceeds"
+			     " 4-bit max (%d) — clamping.  Some priority"
+			     " addresses will appear as normal to the pager.\n",
+			     prio_addr_words, (int)FLEX_BIW1_PRIO_MASK);
+			prio_addr_words = (int)FLEX_BIW1_PRIO_MASK;
+		}
+		if (s_vfield > FLEX_BIW1_VSTART_MASK) {
+			LOGP(DFLEX, LOGL_ERROR,
+			     "TX: BIW1 vector field start (%u) exceeds"
+			     " 6-bit max (%u) — frame has too many addresses."
+			     "  Pager will mislocate the vector field.\n",
+			     s_vfield, (uint32_t)FLEX_BIW1_VSTART_MASK);
+			if (!*error)
+				*error = -FLEX_ERR_INVALID_MESSAGE;
+		}
+
 		frame_words[fwc++] = flex_create_biw1(
 			(uint32_t)prio_addr_words,
 			(uint32_t)e_biw,

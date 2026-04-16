@@ -132,6 +132,16 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 /* Max tracked in-flight fragment streams (§4.2 ①②) */
 #define FLEX_MAX_INFLIGHT		32
 
+/* Maximum address reuse per capcode per frame (§3.8.5).
+ *
+ * "For messages which have not been fragmented, the same address can
+ * be used up to two times for any Frame, and in the case of multiple
+ * transmissions, the same address can be used up to two times in each
+ * Subframe."
+ *
+ * This limit applies across all phases in multiplexed frames. */
+#define FLEX_MAX_ADDR_REUSE_PER_FRAME	2
+
 /* Max frames between consecutive fragments — single-channel (§4.2 ④).
  * Per spec: "The transmission interval between each fragment of the same
  * message must be 32 Frames (equivalent to 1 minute) or less." */
@@ -2097,6 +2107,26 @@ typedef struct flex_frame_params {
 	 * Used by the scheduler for capacity estimation.
 	 * 0 = not set (use flex_compute_biw_count fallback). */
 	int		carousel_biw_count;
+
+	/* Low Traffic Flags for FIW t-field (§3.6).
+	 *
+	 * Per-phase flags indicating the address field fits within
+	 * block 0 (first FLEX_WORDS_PER_BLOCK words).  When set,
+	 * the pager may return to battery-save mode early.
+	 *
+	 * Bit layout matches FIW t-field: t0=phase A, t1=phase B,
+	 * t2=phase C, t3=phase D.  Only used when num_transmissions=1
+	 * (r=0 in FIW).
+	 *
+	 * Constraints (§3.6):
+	 *   - NOT set when carry_on > 0
+	 *   - NOT set during a Collapse cycle change
+	 *   - At 3200 bps (2 phases): t3=t2 and t1=t0
+	 *   - At 1600 bps (1 phase):  t3=t2=t1=t0
+	 *
+	 * Set by the scheduler after candidate collection.
+	 * 0 = normal traffic on all phases (default). */
+	uint32_t	low_traffic_flags;
 } flex_frame_params_t;
 
 /* ===== Phase Multiplexing ===== */
@@ -2215,6 +2245,66 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
  * For 4FSK modes, LSB phases get all-zeros instead of alternating. */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
 			  int mod_type, int bitrate);
+
+/* Compute per-phase Low Traffic Flags for FIW t-field (§3.6).
+ *
+ * For each phase, checks whether the address field (AF) fits entirely
+ * within block 0 (first FLEX_WORDS_PER_BLOCK words).  The AF includes
+ * all address words: priority, normal, and tone-only (short=1 word,
+ * long=2 words each).
+ *
+ * Returns a 4-bit value: t0=phase A, t1=B, t2=C, t3=D.
+ * Respects speed-dependent pairing (§3.6):
+ *   1600 bps: t3=t2=t1=t0 (single phase)
+ *   3200 bps: t3=t2 and t1=t0 (two phases)
+ *   6400 bps: independent per phase
+ *
+ * phase_af_words: array of per-phase address field word counts
+ *                 (must account for long addresses = 2 words each)
+ * num_phases:     number of active phases (1, 2, or 4)
+ * biw_count:      number of BIW words (1-4) preceding the AF
+ * carry_on:       BIW1 carry-on value (0-3)
+ * collapse_changing: 1 if a Collapse cycle change is in progress */
+uint32_t flex_compute_low_traffic_flags(const int *phase_af_words,
+					int num_phases, int biw_count,
+					int carry_on, int collapse_changing);
+
+/* Determine whether a phase index is an MSB (RF-robust) phase.
+ *
+ * In 4-FSK modes, each symbol carries 2 bits via Gray coding.
+ * The MSB (bit_a) has better noise margin than the LSB (bit_b)
+ * because the MSB distinguishes between symbol halves (wider
+ * separation) while the LSB distinguishes within a half (narrower).
+ *
+ * Phase-to-bit mapping per mode:
+ *   A3 (3200/4FSK, 2 phases): A=MSB (robust), C=LSB (less robust)
+ *   A4 (6400/4FSK, 4 phases): A,C=MSB (robust), B,D=LSB (less robust)
+ *   A1 (1600/2FSK, 1 phase):  A only — always robust
+ *   A2 (3200/2FSK, 2 phases): A,C equally robust (bit-interleaved)
+ *
+ * Returns 1 if the phase is MSB (preferred), 0 if LSB (less preferred).
+ * For 2-FSK modes, all phases return 1 (equally robust).
+ *
+ * This is a soft, non-enforced preference for load balancing:
+ * when a message can go in any phase, prefer MSB phases first. */
+static inline int flex_phase_is_msb(int phase_idx, int num_phases,
+				    int modulation_type)
+{
+	if (modulation_type != FLEX_MOD_4FSK)
+		return 1; /* 2-FSK: all phases equally robust */
+
+	switch (num_phases) {
+	case 2:
+		/* A3 (3200/4FSK): phase 0=A (MSB), phase 1=C (LSB) */
+		return (phase_idx == 0) ? 1 : 0;
+	case 4:
+		/* A4 (6400/4FSK): even symbols → A(0)=MSB, B(1)=LSB
+		 *                  odd symbols  → C(2)=MSB, D(3)=LSB */
+		return (phase_idx == 0 || phase_idx == 2) ? 1 : 0;
+	default:
+		return 1; /* single phase */
+	}
+}
 uint32_t flex_create_fiw(uint32_t cycle, uint32_t frame, uint32_t n,
 			 uint32_t r, uint32_t t);
 uint32_t flex_create_biw1(uint32_t prio, uint32_t e_biw,

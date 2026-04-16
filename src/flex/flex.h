@@ -164,6 +164,15 @@ typedef struct flex_msg {
 	int			total_fragments;
 	uint32_t		retrieval_num;	/* → N field (6 bits, 0-63) */
 	int			fragment_sent;		/* 1 after this fragment has been transmitted */
+	int			fragment_tx_phase;	/* phase index where the initial fragment
+						 * (fragment_index==0) was actually transmitted.
+						 * -1 = not yet transmitted (default).
+						 * Continuation fragments (fragment_index > 0)
+						 * must be placed on this same phase so the
+						 * pager can reassemble the message.
+						 * Set by the scheduler after encoding the
+						 * initial fragment; propagated to all sibling
+						 * fragments in the same retrieval group. */
 	uint32_t		precomputed_sig;	/* whole-message signature for fragmented alpha/hex.
 						 * Set by flex_fragment_queue() on the initial fragment
 						 * (fragment_index==0). -1 (0xFFFFFFFF) = not set. */

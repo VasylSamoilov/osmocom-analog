@@ -287,7 +287,7 @@ void print_help(const char *arg0)
 	printf("          phase=A|B|C|D|auto\n");
 	printf("          blocking=0-16  (hex bits/char: 0 or 16=16bit, 1=raw, default 1)\n");
 	printf("          maildrop=0|1  (alpha/hex: separate handling from ordinary msgs)\n");
-	printf("          stype=numeric|source|numbered  (short msg sub-type, §3.9.2)\n");
+	printf("          stype=numeric|source|numbered  (short msg sub-type)\n");
 	printf("            numeric: message = up to 3 BCD digits (short addr)\n");
 	printf("                     or 8 BCD digits (long addr). Default.\n");
 	printf("            source:  message = source code (0-7)\n");
@@ -295,7 +295,7 @@ void print_help(const char *arg0)
 	printf("                      ssource=0-7 and sr=0|1 in options\n");
 	printf("          ssource=0-7  (short msg source code S, for stype=source/numbered)\n");
 	printf("          sr=0|1  (short msg retrieval flag R, for stype=numbered)\n");
-	printf("          itype=tempaddr|sysevent  (instruction sub-type, §3.9.6)\n");
+	printf("          itype=tempaddr|sysevent  (instruction sub-type)\n");
 	printf("            tempaddr: islot=0-15 iframe=0-127 (message field ignored)\n");
 	printf("            sysevent: message = space-separated flag names:\n");
 	printf("              SSID_TMF NID_TMF CHAN_SETUP NID_FREQ SSID_FREQ\n");
@@ -315,12 +315,12 @@ void print_help(const char *arg0)
 	printf("        Special: timezone,0,,  — dump timezone table (32 entries)\n");
 	printf("        Special: timezone,<code>,,  — show offset for zone code 0-31\n");
 	printf("        Special: sysmsg,<type>,lsb=<target> method=<m>,<message>  — send system message via\n");
-	printf("          Operator Messaging Address (§3.8.2.4).\n");
-	printf("          type: alpha, numeric, special, hex, tone (not secure per §3.9.2)\n");
+	printf("          Operator Messaging Address.\n");
+	printf("          type: alpha, numeric, special, hex, tone (not secure)\n");
 	printf("          lsb= target audience (name or 0-15, default all):\n");
 	printf("            all(0) home(1) roaming(2) ssid(3) time(4)\n");
 	printf("            ssidchange(14) sysevent(15)\n");
-	printf("          method= transmission method (§3.9.2, Fig. 3.7.2-2, default b):\n");
+	printf("          method= transmission method (default b):\n");
 	printf("            a = BIW101 only (implicit address, vector at end of VF, no operator addr)\n");
 	printf("            b = BIW101 + Operator Messaging Address (both, default)\n");
 	printf("            c = Operator Messaging Address only (no BIW101)\n");
@@ -342,7 +342,6 @@ void print_help(const char *arg0)
 	printf("          1234567,special,,31415926\n");
 	printf("          1234567,nnumeric,msgnum=7,31415926\n");
 	printf("          1234567,nspecial,,31415926\n");
-	printf("          1234567,alpha,,Hello World\n");
 	printf("          1234567,alpha,tempgroup=1,Temp group msg\n");
 	printf("          tempgroup:1234567 2345678 3456789,alpha,,Hello everyone\n");
 	printf("          3E007005031,alpha,,Extended CAPCODE (Long, Any Phase, collapse=3)\n");
@@ -2223,6 +2222,18 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->modulation_type = msg_mod_type;
 				msg->polarity = msg_polarity;
 				msg->priority = msg_priority;
+
+				/* Tone-only messages cannot be priority.
+				 * Tone-only addresses are always at the end of AF,
+				 * priority addresses are always at the top — mutually
+				 * exclusive.  Silently clear the flag. */
+				if (mtype == FLEX_MSG_TYPE_TONE && msg->priority) {
+					LOGP(DFLEX, LOGL_NOTICE,
+					     "FIFO: priority=1 ignored for tone-only"
+					     " message — tone addresses are always"
+					     " at end of address field.\n");
+					msg->priority = 0;
+				}
 				msg->charset = msg_charset;
 				msg->is_temp_group = is_temp_group;
 				msg->phase = msg_phase;
