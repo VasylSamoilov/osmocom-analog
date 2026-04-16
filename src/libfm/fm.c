@@ -352,7 +352,15 @@ void fm_demod_afc_enable(fm_demod_t *demod, double time_constant_s, double max_c
 	demod->afc.freq_error_hz = 0;
 	demod->afc.correction_hz = 0;
 	demod->afc.peak_error_hz = 0;
+	demod->afc.deadband_hz = 0;
 	demod->afc.update_count = 0;
+}
+
+void fm_demod_afc_set_deadband(fm_demod_t *demod, double deadband_hz)
+{
+	if (deadband_hz < 0)
+		deadband_hz = 0;
+	demod->afc.deadband_hz = deadband_hz;
 }
 
 void fm_demod_afc_disable(fm_demod_t *demod)
@@ -494,6 +502,9 @@ void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, f
 				err_hz = demod->afc.max_correction_hz;
 			else if (err_hz < -demod->afc.max_correction_hz)
 				err_hz = -demod->afc.max_correction_hz;
+			if (demod->afc.deadband_hz > 0 &&
+			    fabs(err_hz) < demod->afc.deadband_hz)
+				err_hz = 0;
 			demod->afc.correction_hz = err_hz;
 			demod->afc.update_count++;
 			fm_demod_set_offset(demod, err_hz);

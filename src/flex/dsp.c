@@ -5723,6 +5723,7 @@ void sender_receive(sender_t *sender, sample_t *samples, int length,
 			demod = sdr_get_fm_demod(sender->audio, 0);
 		if (demod) {
 			fm_demod_afc_enable(demod, 5.0, 5000.0);
+			fm_demod_afc_set_deadband(demod, 50.0);
 			flex->rx.fm_demod = demod;
 		}
 		flex->rx.afc_initialized = 1;
