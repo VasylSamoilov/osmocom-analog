@@ -170,8 +170,8 @@ void flex_trigger_ers(flex_t *flex)
 }
 
 /* Compute alpha message signature from raw text.
- * Per spec §3.10.1.3: 1's complement of binary sum of all 7-bit
- * character values, excluding ETX (0x03) padding.
+ * 1's complement of binary sum of all 7-bit character values,
+ * excluding ETX (0x03) padding.
  * Returns the 7-bit signature value (0x00-0x7F). */
 static uint32_t flex_compute_alpha_signature(const char *data, int len)
 {
@@ -186,8 +186,8 @@ static uint32_t flex_compute_alpha_signature(const char *data, int len)
 }
 
 /* Compute hex/binary message signature from raw hex nibble string.
- * Per spec §3.10.1.2: 1's complement of binary sum of all data
- * taken 8 bits at a time. Input is hex nibble characters (0-9,A-F).
+ * 1's complement of binary sum of all data taken 8 bits at a time.
+ * Input is hex nibble characters (0-9,A-F).
  * Returns the 8-bit signature value (0x00-0xFF). */
 static uint32_t flex_compute_hex_signature(const char *data, int len)
 {
@@ -469,7 +469,7 @@ void flex_msg_destroy(flex_msg_t *msg)
 /* Number of idle frames to send after all messages before returning to IDLE */
 #define FLEX_IDLE_BATCHES	2
 
-/* ===== TX Temporary Group Scheduling (§3.8.2.3, §3.9.6) ===== */
+/* ===== TX Temporary Group Scheduling ===== */
 
 /* Frames of margin between last SETUP and DELIVERY target frame.
  *
@@ -507,7 +507,7 @@ static void flex_tg_free_slot(flex_t *flex, int pol, int slot)
 }
 
 /*
- * Enqueue a temporary group message (§5.2).
+ * Enqueue a temporary group message.
  *
  * Pre-computes the exact frame for every SETUP and the DELIVERY,
  * then pins each message to its frame via next_send_frame.
@@ -516,7 +516,7 @@ static void flex_tg_free_slot(flex_t *flex, int pol, int slot)
  *   - Each SETUP is pinned to the next collapse-aligned frame for
  *     that pager's capcode (deterministic from capcode + collapse).
  *   - Frame N (DELIVERY) = last SETUP frame + margin, mod 128.
- *   - N must be ≤128 frames from the first SETUP (§5.2).
+ *   - N must be ≤128 frames from the first SETUP.
  *   - DELIVERY is pinned to the absolute frame corresponding to N.
  *
  * The scheduler honours next_send_frame: messages aren't eligible
@@ -611,7 +611,7 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 	delivery_abs = last_setup_abs + FLEX_TG_SETUP_MARGIN;
 	target_frame = delivery_abs % 128;
 
-	/* §5.2: first transmission must start within 128 frames of first SETUP */
+	/* First DELIVERY must start within 128 frames of first SETUP */
 	if (delivery_abs - first_setup_abs > 127) {
 		LOGP(DFLEX, LOGL_NOTICE,
 		     "FIFO: tempgroup DELIVERY frame %u exceeds 128-frame limit "
@@ -777,18 +777,17 @@ void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame)
 }
 
 /*
- * Check if a message needs fragmentation and split it if so (§4.1, §4.2).
+ * Check if a message needs fragmentation and split it if so.
  *
- * Per §4.1: when the full length of a message cannot be contained in one
- * Frame, the individual message must be broken down into fragments.  The
- * respective fragments need to be transmitted over several Frames in order
- * for the complete message to be transmitted as one message.
+ * When the full length of a message cannot be contained in one
+ * Frame, it must be broken down into fragments transmitted over
+ * several Frames.
  *
  * Walks the message queue and splits any message that exceeds the
  * single-frame capacity for its type.  The original message is replaced
  * with fragment messages, each carrying the same retrieval number (N).
  *
- * Fragment scheduling constraints (§4.2):
+ * Fragment scheduling constraints:
  *   ① Once an address is used to begin transmitting a fragmented message,
  *     that same address must not be used to start a new fragmented
  *     transmission until the first fragmented transmission has been
@@ -815,11 +814,10 @@ void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame)
  * post-transmit handler releases them.  The last fragment triggers
  * retransmission cycling or stream destruction.
  *
- * Carry-on (§3.7.1, §4.2.1): when fragments span multiple frames, the
- * scheduler sets the BIW1 carry-on field (0-3) to indicate how many
- * additional frames the pager should continue decoding beyond its
- * assigned collapse frame.  Carry-on is not allowed for multiple
- * transmission (num_transmissions > 1).
+ * Carry-on: when fragments span multiple frames, the scheduler sets the
+ * BIW1 carry-on field (0-3) to indicate how many additional frames the
+ * pager should continue decoding beyond its assigned collapse frame.
+ * Carry-on is not allowed for multiple transmission (num_transmissions > 1).
  *
  * Polarity: retrieval numbers (N) are assigned per-polarity via
  * frag_retrieval_seq to avoid N collisions across polarities.
@@ -831,11 +829,10 @@ void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame)
  * Collapse: the first fragment respects the collapse schedule — it is
  * only eligible on frames matching the capcode's assigned collapse frame.
  * Continuation fragments (index > 0) also respect the collapse schedule
- * by default, but when carry-on is set (§4.2.1), they are allowed on
- * frames within the carry-on window beyond the collapse frame.  This
- * ensures the pager (which is told to keep decoding via BIW1 carry-on)
- * can receive the continuation fragments without waiting for the next
- * collapse-aligned frame.
+ * by default, but when carry-on is set, they are allowed on frames within
+ * the carry-on window beyond the collapse frame.  This ensures the pager
+ * (which is told to keep decoding via BIW1 carry-on) can receive the
+ * continuation fragments without waiting for the next collapse-aligned frame.
  */
 static void flex_fragment_queue(flex_t *flex)
 {
@@ -862,17 +859,16 @@ static void flex_fragment_queue(flex_t *flex)
 		next = msg->next;
 
 		/* Only fragment alpha, hex, and secure messages.
-		 * Per §4.2 ③: Numeric Messages (V=011, V=100, V=111)
-		 * cannot be fragmented. */
+		 * Numeric Messages (V=011, V=100, V=111) cannot be fragmented. */
 		switch (msg->msg_type) {
 		case FLEX_MSG_TYPE_ALPHA: {
-			/* Per §4.1: available message words = 88 - biw - addr - vector.
+			/* Available message words = 88 - biw - addr - vector.
 			 * Short addr = 1 word, long = 2.  Vector = 1 word.
 			 * Alpha: chars = (msg_words - 1) * 3 - 2
 			 *   (1 header word, signature eats 1 char slot,
 			 *    ETX padding eats 1 more).
 			 * For a Short Address with 1 BIW: 88-1-1-1 = 85 msg words,
-			 * 84 data words × 3 chars - 1 = 251 chars max (per §4.1). */
+			 * 84 data words × 3 chars - 1 = 251 chars max. */
 			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
 			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
 					      - addr_words - 1; /* 1 vector */
@@ -927,10 +923,9 @@ static void flex_fragment_queue(flex_t *flex)
 			break;
 		}
 		default:
-			/* Per §4.2 ③: Numeric Messages (those having a vector
-			 * type of 011, 100, 111) cannot be fragmented.
-			 * Standard numeric, special format, and numbered
-			 * numeric are single-frame only. */
+			/* Numeric Messages (vector type 011, 100, 111) cannot
+			 * be fragmented.  Standard numeric, special format,
+			 * and numbered numeric are single-frame only. */
 			continue;
 		}
 
@@ -953,7 +948,7 @@ static void flex_fragment_queue(flex_t *flex)
 		}
 
 		/* Assign a retrieval number (N) for this set of fragments.
-		 * Per §4.2: N identifies all fragments of the same message.
+		 * N identifies all fragments of the same message.
 		 * Use the per-polarity counter to avoid N collisions across
 		 * polarities (normal vs inverted). */
 		int frag_pol = pol_index(msg->polarity);
@@ -1275,8 +1270,8 @@ static void flex_destroy_all_fragments(flex_t *flex, uint32_t retrieval_num,
  *   interval, and mark all non-first fragments ineligible.  If done,
  *   destroy all fragments.
  *
- * Per §4.2 ④: the transmission interval between consecutive fragments
- * must not exceed 32 Frames (or 128 when channel is shared).  The
+ * The transmission interval between consecutive fragments must not
+ * exceed 32 Frames (or 128 when channel is shared).  The
  * immediate-eligibility chaining (next_send_frame = current_abs)
  * ensures fragments go out in consecutive eligible frames, well within
  * the interval limit.
@@ -1401,7 +1396,7 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 	}
 }
 
-/* Compute which phase should carry SSID1 for a given frame (§6.1.1.3).
+/* Compute which phase should carry SSID1 for a given frame.
  *
  * 6400bps/4-phase: SSID1 rotates A→B→C→D per frame (frame % 4).
  * 3200bps/2-phase: phases a,b → phase A; phases c,d → phase C.
@@ -1409,7 +1404,7 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
  * 1600bps/1-phase: always phase 0 (A).
  *
  * Returns the phase index (0-based) that should carry SSID1.
- * SSID2 follows the same rotation pattern per §6.1.1.3 rule (3). */
+ * SSID2 follows the same rotation pattern. */
 static int flex_ssid_phase(uint32_t frame, int num_phases)
 {
 	int slot = (int)(frame % 4);
@@ -1439,7 +1434,7 @@ static int flex_compute_biw_count(const flex_frame_params_t *params)
 	if (params->timezone_code >= 0 &&
 	    params->timezone_code < (int)FLEX_TZ_ENTRIES)
 		extra++;
-	/* BIW101 for system message (method (b), §3.9.2).
+	/* BIW101 for system message (method (b)).
 	 * When an Operator Messaging Address with LSB 0-3 is present,
 	 * emit BIW101 with the matching A-type.  This replaces the
 	 * timezone BIW101 slot if both are requested (only one type 101
@@ -1461,9 +1456,9 @@ static int flex_compute_biw_count(const flex_frame_params_t *params)
 /* Compute available message words for a specific phase.
  *
  * Builds the exact params that the encoder will see for this phase
- * (SSID/timezone/sysmsg rotate across phases per §6.1.1.3), then
- * computes BIW count via flex_compute_biw_count() — the same function
- * the encoder uses — ensuring scheduler and encoder agree exactly.
+ * (SSID/timezone/sysmsg rotate across phases), then computes BIW count
+ * via flex_compute_biw_count() — the same function the encoder uses —
+ * ensuring scheduler and encoder agree exactly.
  *
  * phase_idx: 0-based phase index
  * num_phases: total phases (1, 2, or 4)
@@ -1478,7 +1473,7 @@ static int flex_phase_capacity(const flex_frame_params_t *params,
 	int biw_count;
 	int cap;
 
-	/* SSID1/SSID2 only in the designated phase (§6.1.1.3) */
+	/* SSID1/SSID2 only in the designated phase */
 	if (phase_idx != ssid_phase) {
 		pp.local_id = 0;
 		pp.coverage_id = 0;
@@ -1498,7 +1493,7 @@ static int flex_phase_capacity(const flex_frame_params_t *params,
 	if (phase_idx != ssid_phase)
 		pp.chan_setup_enabled = 0;
 
-	/* Date/Time BIW rotation across phases (§6.1.1.3 Note 1).
+	/* Date/Time BIW rotation across phases.
 	 * TODO: implement proper T1/T2/T3 rotation for multi-phase.
 	 * Currently all phases emit date+time — conservative (over-counts
 	 * BIW, under-counts capacity) but safe. */
@@ -1507,7 +1502,7 @@ static int flex_phase_capacity(const flex_frame_params_t *params,
 	cap = FLEX_WORDS_PER_FRAME - biw_count;
 
 	/* Reserve 1 word for system message vector at end of VF
-	 * (method (b), §3.9.2) — only in the phase carrying BIW101 */
+	 * (method (b)) — only in the phase carrying BIW101 */
 	if (phase_idx == ssid_phase &&
 	    pp.sysmsg_a_type >= 0 && pp.sysmsg_a_type <= 3)
 		cap--;
@@ -1735,17 +1730,17 @@ static inline int is_collapse_aligned(uint32_t frame_number,
 }
 
 /* Scan the message queue to identify capcodes with in-flight fragmented
- * transmissions (§4.2 ①②).  A capcode is "in-flight" when:
+ * transmissions.  A capcode is "in-flight" when:
  *   - A fragment with fragment_index == 0 has been sent (assigned_n >= 0)
  *   - The last fragment (fragment_index == total_fragments - 1) has NOT
  *     been sent yet
  *
- * This is used to enforce the §4.2 address exclusion rules: while a
- * fragmented stream is in-flight for a capcode, no new fragmented or
- * unfragmented message for that same capcode may be transmitted (except
- * the next continuation fragment of the in-flight stream itself).
+ * This is used to enforce address exclusion rules: while a fragmented
+ * stream is in-flight for a capcode, no new fragmented or unfragmented
+ * message for that same capcode may be transmitted (except the next
+ * continuation fragment of the in-flight stream itself).
  *
- * Also tracks last_sent_abs for §4.2 ④ interval checking (32/128 frames).
+ * Also tracks last_sent_abs for fragment interval checking (32/128 frames).
  *
  * Returns the number of in-flight entries written to inflight[]. */
 static int flex_scan_inflight(flex_t *flex, flex_inflight_frag_t *inflight,
@@ -1821,20 +1816,20 @@ static int flex_scan_inflight(flex_t *flex, flex_inflight_frag_t *inflight,
 	return n_inflight;
 }
 
-/* Check if a message is excluded by fragmentation rules (§4.2).
+/* Check if a message is excluded by fragmentation rules.
  * Returns 1 if the message should be skipped, 0 if allowed.
  *
- * Enforces the following spec requirements:
+ * Enforces the following requirements:
  *
- *  §4.2 ①: Once an address is used to begin transmitting a fragmented
+ *  ① Once an address is used to begin transmitting a fragmented
  *     message, that same address must not be used to start a new
  *     fragmented transmission until the first has been completed.
  *
- *  §4.2 ②: For the duration that an address is being used to send a
+ *  ② For the duration that an address is being used to send a
  *     fragmented message, that same address must not appear more than
  *     once in any Frame to send an unfragmented message.
  *
- *  §4.2 ④: The transmission interval between each fragment of the same
+ *  ④ The transmission interval between each fragment of the same
  *     message must be 32 Frames or less.  When the channel is shared
  *     with another system, or in the case of multiple transmission or
  *     Multi-area/Roaming channel, the interval can be 128 Frames.
@@ -2080,7 +2075,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	flex_frame_params_default(&params);
 	params.cycle = ft.cycle;
 	params.frame = ft.frame;
-	/* FIW n flag: set by --roaming CLI flag (§6).
+	/* FIW n flag: set by --roaming CLI flag.
 	 * n=1 indicates Roaming Service is provided. Default n=0. */
 	params.roaming = flex->roaming_active ? 1 : 0;
 	params.collapse = flex->collapse;
@@ -2089,7 +2084,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	params.hack_nonstandard_decoders = flex->hack_nonstandard_decoders;
 	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
 
-	/* Parameter change guard (§3.4.2).
+	/* Parameter change guard.
 	 * Tick the state machine and check if we're in cooldown
 	 * (force_idle = suppress message packing, send idle frames). */
 	{
@@ -2182,23 +2177,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 */
 	uint32_t current_abs = ft.cycle * 128 + ft.frame;
 
-	/* Scan for in-flight fragment streams (§4.2 ①②) */
+	/* Scan for in-flight fragment streams */
 	n_inflight = flex_scan_inflight(flex, inflight, FLEX_MAX_INFLIGHT);
 
-	/* Early carry-on computation (§3.7.1, §4.2.1, §4.2.2).
+	/* Early carry-on computation.
 	 *
 	 * Must be computed BEFORE the candidate collection loop so the
 	 * collapse filter can allow continuation fragments on non-collapse
 	 * frames within the carry-on window.
 	 *
-	 * Per §4.2.1: the 1st fragment is transmitted matching the Pager
+	 * Per the spec: the 1st fragment is transmitted matching the Pager
 	 * Collapse value.  The 2nd and subsequent fragments are generally
 	 * sent in Frames which have continuance with the Frame in which
 	 * the 1st fragment was transmitted.  The BIW1 carry-on field
 	 * (0-3) tells the pager how many additional frames beyond its
 	 * assigned collapse frame it should continue decoding.
 	 *
-	 * Per §4.2.2 Rule ②: carry-on ≤ 2^m - 1 (collapse cycle - 1).
+	 * Per spec Rule ②: carry-on ≤ 2^m - 1 (collapse cycle - 1).
 	 * Per spec: "Carry On is not allowed for multiple transmission." */
 	if (flex->collapse > 0 && flex->num_transmissions <= 1 && n_inflight > 0) {
 		flex_msg_t *qm;
@@ -2228,9 +2223,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 	/* Compute available frame capacity */
 
 	/* Pre-scan: detect system messages to set sysmsg_a_type
-	 * before BIW count computation (§3.9.2).
+	 * before BIW count computation.
 	 *
-	 * Also determines tone-only exclusion per §3.9.2:
+	 * Also determines tone-only exclusion:
 	 * "Tone-Only Addresses cannot be transmitted in Frames
 	 * used for transmitting System Messages."  This applies
 	 * when the frame contains system message content — i.e.,
@@ -2258,7 +2253,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				uint32_t lsb = aw & FLEX_OPER_MSG_LSB_MASK;
 				has_sysmsg_content = 1;
 				/* LSB 0-3 map directly to BIW101
-				 * A-type 0000-0011 (§3.7.2-2).
+				 * A-type 0000-0011.
 				 * Only set for methods (a) and (b). */
 				if (lsb <= FLEX_BIW_SYSINFO_A_MSG_SSID &&
 				    params.sysmsg_a_type < 0 &&
@@ -2289,9 +2284,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 	}
 
-	/* Co-packing (§4.1, §4.2.3):
+	/* Co-packing:
 	 *
-	 * Per §4.1: "other paging messages to other pagers can also exist
+	 * "Other paging messages to other pagers can also exist
 	 * within the same Frame that a fragmented message is being sent in."
 	 *
 	 * The three-pass collection inherently implements co-packing
@@ -2301,7 +2296,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 * ensuring fragment addresses/vectors are placed before
 	 * other-capcode addresses in the encoded frame. The
 	 * frag_excluded() check prevents same-capcode conflicts
-	 * (§4.2 ①②) but allows different capcodes. Remaining
+	 * but allows different capcodes. Remaining
 	 * capacity after fragments is naturally filled with
 	 * other-capcode messages as phase_est_used accumulates
 	 * per phase.
@@ -2357,7 +2352,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					     candidate->total_fragments, candidate->next_send_frame, current_abs);
 				}
 
-				/* Collapse filter (§3.1.2, §4.2.1).
+				/* Collapse filter.
 				 *
 				 * Each capcode has an assigned collapse frame; the
 				 * pager only decodes frames matching its schedule.
@@ -2365,7 +2360,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				 * Exception 1: temp group DELIVERY uses a Temporary
 				 * Address pinned to a specific frame, not by capcode.
 				 *
-				 * Exception 2 (§4.2.1): continuation fragments of an
+				 * Exception 2: continuation fragments of an
 				 * in-flight fragmented message are allowed on frames
 				 * adjacent to the collapse frame, up to carry-on
 				 * frames beyond it.  Per spec: "the 2nd and subsequent
@@ -2376,7 +2371,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				 *
 				 * Without this exception, continuation fragments would
 				 * be blocked until the next collapse-aligned frame,
-				 * potentially exceeding the §4.2 ④ interval limit
+				 * potentially exceeding the fragment interval limit
 				 * (32/128 frames). */
 				if (flex->collapse > 0 &&
 				    candidate->temp_delivery_slot < 0) {
@@ -2436,7 +2431,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					}
 				}
 
-				/* System message frame 0 preference (§3.9.2).
+				/* System message frame 0 preference.
 				 *
 				 * "A System Message must be initiated in Frame 0
 				 * when a BIW position is open for System Messaging.
@@ -2464,7 +2459,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 						LOGP(DFLEX, LOGL_INFO,
 						     "Scheduler: sysmsg capcode=%" PRIu64
 						     " waited %d frames, allowing non-F0"
-						     " frame %u (§3.9.2 fallback)\n",
+						     " frame %u (starvation fallback)\n",
 						     candidate->capcode, wait,
 						     ft.frame);
 					}
@@ -2481,14 +2476,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (pass == 2 && has_sysmsg_content)
 					continue;
 
-				/* Fragmentation address exclusion and interval check
-				 * (§4.2 rules ①②④).
+				/* Fragmentation address exclusion and interval check.
 				 *
-				 * §4.2 ①: same capcode can't start new fragmented TX
+				 * Same capcode can't start new fragmented TX
 				 *   while one is in-flight.
-				 * §4.2 ②: same capcode can't appear for unfragmented
+				 * Same capcode can't appear for unfragmented
 				 *   msg while in-flight.
-				 * §4.2 ④: fragment interval must not exceed limit
+				 * Fragment interval must not exceed limit
 				 *   (32 frames single / 128 frames shared channel).
 				 *
 				 * The interval limit depends on channel sharing:
@@ -2580,7 +2574,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 			 *
 			 * Three additional checks applied here:
 			 *
-			 * (a) Address reuse limit (§3.8.5): same capcode can
+			 * (a) Address reuse limit: same capcode can
 			 *     appear at most FLEX_MAX_ADDR_REUSE_PER_FRAME
 			 *     times across ALL phases in one frame.
 			 *
@@ -2596,7 +2590,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 			 *     FIW t-field can be computed after collection. */
 			{
 				int i;
-				/* Per-frame capcode usage counter for §3.8.5.
+				/* Per-frame capcode usage counter.
 				 * Tracks how many times each capcode has been
 				 * packed into this frame across all phases.
 				 * Simple linear scan — adequate for typical
@@ -2604,7 +2598,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				struct { uint64_t cap; int count; } cap_usage[FLEX_MAX_CANDIDATES];
 				int n_cap_usage = 0;
 
-				/* Per-phase priority address word counter (§8.1, §3.7.1).
+				/* Per-phase priority address word counter.
 				 * BIW1 p field is 4 bits (0-15), so each phase can
 				 * hold at most FLEX_BIW1_PRIO_MASK words of priority
 				 * addresses.  A short priority address = 1 word,
@@ -2628,7 +2622,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					if (cost < 0)
 						continue; /* invalid message */
 
-					/* --- §3.8.5 address reuse check --- */
+					/* --- address reuse check --- */
 					{
 						int cu;
 						int usage_count = 0;
@@ -2641,7 +2635,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 						if (usage_count >= FLEX_MAX_ADDR_REUSE_PER_FRAME) {
 							LOGP(DFLEX, LOGL_DEBUG,
 							     "Scheduler: skip capcode=%" PRIu64
-							     " -- address reuse limit (%d/%d per frame, §3.8.5)\n",
+							     " -- address reuse limit (%d/%d per frame)\n",
 							     m->capcode, usage_count,
 							     FLEX_MAX_ADDR_REUSE_PER_FRAME);
 							continue;
@@ -2684,7 +2678,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					 *     nowhere to spill.
 					 *   - Temp group DELIVERY (temp_delivery_slot >= 0):
 					 *     pinned to specific frame, phase must match
-					 *     group members' expectations (§5.2).
+					 *     group members' expectations.
 					 *
 					 * Spillover is STRONGLY DISCOURAGED for:
 					 *   - Fragment continuations (total_fragments > 1,
@@ -2692,7 +2686,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					 *     fragments on the same phase as the initial
 					 *     fragment.  Only spill as last resort to
 					 *     avoid starvation (fragment interval limit
-					 *     §4.2 ④ would be violated otherwise).
+					 *     fragment interval limit would be violated otherwise).
 					 *   - Fragment initials (total_fragments > 1,
 					 *     fragment_index == 0): sets the phase for
 					 *     all subsequent fragments — should use the
@@ -2737,7 +2731,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 							continue;
 						}
 
-						/* Soft RF phase preference (§3.3.2 observation):
+						/* Soft RF phase preference (empirical observation):
 						 * Try MSB (RF-robust) phases first, then LSB.
 						 * In 4-FSK modes, MSB phases carry the more
 						 * noise-resistant bit of each dibit symbol.
@@ -2794,7 +2788,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 					aw = is_long ? 2 : 1;
 
-					/* System message method (a) (§3.9.2): no address
+					/* System message method (a): no address
 					 * word in AF — the BIW101 serves as the implicit
 					 * address.  Override aw to 0 for accurate AF
 					 * word counting (used by Low Traffic Flags). */
@@ -2809,7 +2803,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 						bw = cost - aw - vw;
 					}
 
-					/* Priority address word limit (§8.1, §3.7.1).
+					/* Priority address word limit.
 					 * BIW1 p field is 4 bits (max 15 words per phase).
 					 * If this priority message would push the
 					 * per-phase priority word count over the limit,
@@ -2879,7 +2873,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					if (m->priority && aw > 0)
 						phase_prio_words[phase_idx] += aw;
 
-					/* Update per-frame capcode usage counter (§3.8.5) */
+					/* Update per-frame capcode usage counter */
 					{
 						int cu;
 						int found_cap = 0;
@@ -2912,7 +2906,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 	}
 
-	/* === Compute Low Traffic Flags for FIW t-field (§3.6) ===
+	/* === Compute Low Traffic Flags for FIW t-field ===
 	 *
 	 * After candidate collection, compute per-phase address field
 	 * word counts.  The AF includes all address words (priority,
@@ -3000,7 +2994,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				continue;
 			}
 
-			/* Per-phase SSID placement (§6.1.1.3).
+			/* Per-phase SSID placement.
 			 * SSID1/SSID2 rotate across phases per frame.
 			 * Clear SSID fields for phases that shouldn't
 			 * carry them this frame. */
@@ -3267,7 +3261,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 
 send_idle:
-	/* No messages — send proper idle frame per §3.4.1 Fig. 3.4.1-3.
+	/* No messages — send proper idle frame.
 	 *
 	 * Pass msg_count=0 to flex_encode_frame_multi so it produces a
 	 * BIW-only frame: BIW1 with voffset==aoffset (no addresses,
@@ -3452,7 +3446,7 @@ int flex_get_next_frame(flex_t *flex)
 				params.local_id = flex->ssid;
 				params.coverage_id = flex->nid;
 			}
-			/* FIW n flag: set by --roaming CLI flag (§6).
+			/* FIW n flag: set by --roaming CLI flag.
 			 * n=1 indicates Roaming Service is provided. Default n=0. */
 			if (flex->roaming_active)
 				params.roaming = 1;
@@ -3464,7 +3458,7 @@ int flex_get_next_frame(flex_t *flex)
 
 			/* FIW n=0 by default. Set by --roaming CLI flag. */
 
-			/* Set sysmsg_a_type for methods (a)/(b) (§3.9.2).
+			/* Set sysmsg_a_type for methods (a)/(b).
 			 * Detect operator messaging address with LSB 0-3
 			 * and method != 'c' to emit BIW101. */
 			{
