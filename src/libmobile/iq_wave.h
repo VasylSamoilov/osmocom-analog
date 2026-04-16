@@ -26,6 +26,7 @@
 #define _IQ_WAVE_H
 
 #include "../libsample/sample.h"
+#include "../libfm/fm.h"
 
 enum paging_signal;
 
@@ -41,6 +42,11 @@ int iq_wave_write(void *inst, sample_t **samples, uint8_t **power, int num,
 int iq_wave_read(void *inst, sample_t **samples, int num, int channels,
 		 double *rf_level_db);
 int iq_wave_get_tosend(void *inst, int buffer_size);
+
+/* Return pointer to the FM demodulator for a given channel.
+ * Returns NULL if channel is invalid or uses AM.
+ * Caller can use this to enable AFC via fm_demod_afc_enable(). */
+fm_demod_t *iq_wave_get_fm_demod(void *inst, int channel);
 
 /* Global config — set from main_mobile option parsing */
 extern const char *iq_read_rx_wave;

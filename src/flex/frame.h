@@ -2117,6 +2117,19 @@ typedef struct flex_frame_params {
 typedef struct flex_phase_data {
 	uint32_t		words[FLEX_WORDS_PER_FRAME];
 	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];
+	/* Per-bit soft-decision info for Chase decoding.
+	 * low_conf_bita: bitmask where 1 = bit_a vote was close
+	 *   (sample near zero crossing). Flipping this symbol
+	 *   changes BOTH bit_a and bit_b (Gray coding property).
+	 * low_conf_bitb: bitmask where 1 = bit_b vote was close
+	 *   (sample near inner/outer threshold). Flipping this
+	 *   symbol changes only bit_b. */
+	uint32_t		low_conf_bita[FLEX_WORDS_PER_FRAME];
+	uint32_t		low_conf_bitb[FLEX_WORDS_PER_FRAME];
+	/* Soft-decision alternative words. Populated by weighted
+	 * voting in parallel with hard-decision words[]. BCH decoder
+	 * picks whichever produces a cleaner result per word. */
+	uint32_t		soft_words[FLEX_WORDS_PER_FRAME];
 	int			word_count;	/* TX: actual words used */
 	int			idle_count;	/* RX: idle words seen (all-0s or all-1s),
 					 * used to detect shortened frames */

@@ -563,6 +563,8 @@ typedef struct flex {
 	/* RX state — standard-compliant FLEX decoder (ARIB STD-43A) */
 	struct {
 		int		enabled;
+		int		afc_initialized;	/* 1 after AFC setup on first audio */
+		struct fm_demod	*fm_demod;		/* cached pointer to FM demodulator (any backend) */
 
 		/* PLL-based symbol timing recovery (per multimon-ng buildSymbol) */
 		int		sample_freq;		/* audio sample rate (e.g. 48000) */
@@ -572,8 +574,33 @@ typedef struct flex {
 		double		pll_envelope;		/* signal envelope estimate */
 		double		pll_envelope_sum;	/* running sum for envelope */
 		int		pll_envelope_count;	/* sample count for envelope */
+		/* Positive/negative level tracking (from S1 sync) for
+		 * asymmetry-aware normalization (EQUiSat technique) */
+		double		pll_pos_sum;		/* sum of positive samples during S1 */
+		int		pll_pos_count;		/* count of positive samples */
+		double		pll_neg_sum;		/* sum of negative samples during S1 */
+		int		pll_neg_count;		/* count of negative samples */
+		double		pll_pos_level;		/* average positive level */
+		double		pll_neg_level;		/* average negative level (negative value) */
 		double		pll_last_sample;	/* previous sample for zero-crossing */
 		int		pll_symcount[4];	/* symbol vote counters per period */
+		/* Per-frame diagnostics (DATA state) */
+		int		data_sym_count[4];	/* symbol counts per level */
+		double		data_sym_sum[4];	/* sample value sums per level */
+		double		data_sym_sum2[4];	/* sample value squared sums (for stddev) */
+		double		data_dc_sum;		/* running sum of samples */
+		int		data_dc_count;		/* sample count */
+		/* Per-bit margin tracking */
+		int		data_bita_close;	/* symbols where bit_a vote was close */
+		int		data_bitb_close;	/* symbols where bit_b vote was close */
+		int		data_sym_total;		/* total decided symbols in DATA */
+		/* Current symbol's per-bit low-confidence flags (set by
+		 * demodulator, consumed by flex_rx_read_data) */
+		int		sym_bita_low;		/* 1 = bit_a had close vote */
+		int		sym_bitb_low;		/* 1 = bit_b had close vote */
+		/* Per-quarter DC tracking (detect intra-frame freq jumps) */
+		double		data_dc_q[4];		/* DC sum per quarter */
+		int		data_dc_qn[4];		/* sample count per quarter */
 		int		pll_nonconsec;		/* non-consecutive zero crossings */
 		int		pll_timeout;		/* timeout counter */
 		uint64_t	pll_sample_count;	/* total samples processed */

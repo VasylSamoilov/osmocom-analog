@@ -31,6 +31,8 @@
 #include "../liblogging/logging.h"
 #include "../libfilter/iir_filter.h"
 #include "../libmobile/main_mobile.h"
+#include "../libmobile/iq_wave.h"
+#include "../libsdr/sdr.h"
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
@@ -174,7 +176,11 @@ int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polar
 	 *   Scaling factor applied by process_sender_audio() to convert
 	 *   normalized baseband samples (±1.0) to frequency in Hz.
 	 *   Since our FSK samples are already normalized to ±1.0 = ±4800 Hz,
-	 *   speech_deviation equals max_deviation. */
+	 *   speech_deviation equals max_deviation.
+	 *
+	 * We use max_modulation = 3200 Hz (the highest symbol rate).
+	 * Carson bandwidth = 2 x (4800 + 3200) = 16 kHz, matching the
+	 * occupied bandwidth limit. */
 	sender_set_fm(&flex->sender, deviation, 3200, deviation, MAX_DISPLAY);
 
 	/* Size buffer for slowest speed (1600 baud = most samples per word) */
@@ -541,7 +547,8 @@ enum {
 
 /* PLL tuning constants (per multimon-ng, empirically validated) */
 #define SLICE_THRESHOLD		0.667	/* 4-level quantization at 2/3 envelope */
-#define DC_OFFSET_FILTER	0.010	/* DC removal IIR time constant (seconds) */
+#define DC_OFFSET_FILTER	0.010	/* DC removal IIR time constant (seconds) - sync */
+#define DC_OFFSET_FILTER_DATA	0.100	/* DC removal IIR time constant (seconds) - data */
 #define PHASE_LOCKED_RATE	0.045	/* PLL correction when locked */
 #define PHASE_UNLOCKED_RATE	0.050	/* PLL correction when unlocked */
 #define LOCK_LEN		24	/* symbols to check for lock pattern */
@@ -758,13 +765,13 @@ static int32_t flex_bch_decode(flex_t *flex, uint32_t codeword,
 
 	if (key == 0) {
 		if (!parity_bad) {
-			/* syndrome=0, parity OK → clean */
+			/* syndrome=0, parity OK - clean */
 			*status = 0;
 			flex->bch_stats.clean++;
 		} else {
-			/* syndrome=0, parity BAD → single error in parity bit.
+			/* syndrome=0, parity BAD - single error in parity bit.
 			 * code31 is a valid BCH codeword; only the parity bit
-			 * was flipped.  Treat as corrected. */
+			 * was flipped.  Treat as corrected (1 bit). */
 			*status = 1;
 			flex->bch_stats.corrected++;
 		}
@@ -773,7 +780,7 @@ static int32_t flex_bch_decode(flex_t *flex, uint32_t codeword,
 
 	error = bch_err_tbl[key];
 	if (error == 0) {
-		/* syndrome≠0, no correction → uncorrectable */
+		/* syndrome!=0, no correction - uncorrectable */
 		*status = -1;
 		flex->bch_stats.uncorrectable++;
 		return -1;
@@ -783,16 +790,20 @@ static int32_t flex_bch_decode(flex_t *flex, uint32_t codeword,
 	 * Reassemble the full 32-bit word with the RECEIVED parity bit
 	 * and the CORRECTED code31.  If parity is now OK, the correction
 	 * was valid (1 or 2 bit errors in code31).  If parity is still
-	 * BAD, there were 3+ total errors and BCH miscorrected — reject. */
+	 * BAD, there were 3+ total errors and BCH miscorrected - reject. */
 	code31 ^= error;
 	if (count_bits((codeword & 0x80000000U) | code31) & 1) {
-		/* parity BAD after correction → 3+ errors, reject */
+		/* parity BAD after correction - 3+ errors, reject */
 		*status = -1;
 		flex->bch_stats.uncorrectable++;
 		return -1;
 	}
 
-	*status = 1;
+	/* Report actual correction weight:
+	 * count_bits(error) = number of bits corrected in code31.
+	 * If parity was also bad, add 1 for the parity bit fix.
+	 * This lets callers distinguish 1-bit from 2-bit corrections. */
+	*status = (int)count_bits(error) + (parity_bad ? 1 : 0);
 	flex->bch_stats.corrected++;
 
 success:
@@ -980,7 +991,7 @@ static uint32_t flex_combined_a_correction(flex_t *flex,
 			  "(raw=0x%08X, %d bit diff)\n",
 			  good_name, good, bad_name, bad_raw, ndiff);
 
-		if (ndiff <= 3) {
+		if (ndiff <= 31) {
 			/* Try flipping each diff bit in bad_raw and
 			 * re-attempt BCH.  If it succeeds and matches
 			 * the good side, we've recovered.
@@ -1196,9 +1207,10 @@ static int flex_rx_decode_fiw(flex_t *flex, uint32_t fiw_raw)
 			  fiw_raw);
 		return -1;
 	}
-	if (bch_status == 1) {
+	if (bch_status > 0) {
 		LOGP_CHAN(DDSP, LOGL_INFO,
-			  "RX: FIW BCH corrected (raw=0x%08X -> data=0x%05X).\n",
+			  "RX: FIW BCH corrected %d bit%s (raw=0x%08X -> data=0x%05X).\n",
+			  bch_status, bch_status == 1 ? "" : "s",
 			  fiw_raw, (unsigned int)data);
 	}
 
@@ -1894,12 +1906,12 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 
 		raw_words[i] = ph->words[i];
 		int32_t result = flex_bch_decode(flex, ph->words[i], &bch_status, NULL);
-		if (result < 0) {
-			ph->status[i] = FLEX_WORD_UNCORRECTABLE;
-		} else {
+		if (result >= 0) {
 			ph->words[i] = (uint32_t)result;
 			ph->status[i] = (bch_status == 0) ? FLEX_WORD_CLEAN
 							   : FLEX_WORD_CORRECTED;
+		} else {
+			ph->status[i] = FLEX_WORD_UNCORRECTABLE;
 		}
 	}
 
@@ -1915,8 +1927,9 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 				fail++;
 		}
 		LOGP_CHAN(DDSP, fail > 0 ? LOGL_INFO : LOGL_DEBUG,
-			  "RX: Phase %c BCH: %d/%d clean, %d corrected, %d uncorrectable.\n",
-			  phase_name, ok, FLEX_WORDS_PER_FRAME, fixed, fail);
+			  "RX: Phase %c BCH (C%u/F%u): %d/%d clean, %d corrected, %d uncorrectable.\n",
+			  phase_name, flex->rx.fiw_cycle, flex->rx.fiw_frame,
+			  ok, FLEX_WORDS_PER_FRAME, fixed, fail);
 
 		for (i = 0; i < FLEX_WORDS_PER_FRAME; i++) {
 			if (ph->status[i] == FLEX_WORD_CORRECTED) {
@@ -4896,6 +4909,9 @@ static void flex_rx_read_data(flex_t *flex, unsigned char sym)
 	if (flex->rx.sync_levels == 4)
 		bit_b = (sym == 1) || (sym == 2);
 
+	/* Soft-decision bits - reserved for future use.
+	 * Currently soft_words[] are not populated. */
+
 	if (flex->rx.sync_baud == 1600)
 		flex->rx.phase_toggle = 0;
 
@@ -4911,8 +4927,16 @@ static void flex_rx_read_data(flex_t *flex, unsigned char sym)
 	if (flex->rx.phase_toggle == 0) {
 		flex->rx.phase[0].words[idx] = (flex->rx.phase[0].words[idx] >> 1) |
 					       (bit_a ? 0x80000000U : 0);
+		flex->rx.phase[0].low_conf_bita[idx] = (flex->rx.phase[0].low_conf_bita[idx] >> 1) |
+					       (flex->rx.sym_bita_low ? 0x80000000U : 0);
+		flex->rx.phase[0].low_conf_bitb[idx] = (flex->rx.phase[0].low_conf_bitb[idx] >> 1) |
+					       (flex->rx.sym_bitb_low ? 0x80000000U : 0);
 		flex->rx.phase[1].words[idx] = (flex->rx.phase[1].words[idx] >> 1) |
 					       (bit_b ? 0x80000000U : 0);
+		flex->rx.phase[1].low_conf_bita[idx] = (flex->rx.phase[1].low_conf_bita[idx] >> 1) |
+					       (flex->rx.sym_bita_low ? 0x80000000U : 0);
+		flex->rx.phase[1].low_conf_bitb[idx] = (flex->rx.phase[1].low_conf_bitb[idx] >> 1) |
+					       (flex->rx.sym_bitb_low ? 0x80000000U : 0);
 		flex->rx.phase_toggle = 1;
 
 		/* Track idle words for early termination (Fig. 3.4.1-3).
@@ -4929,8 +4953,16 @@ static void flex_rx_read_data(flex_t *flex, unsigned char sym)
 	} else {
 		flex->rx.phase[2].words[idx] = (flex->rx.phase[2].words[idx] >> 1) |
 					       (bit_a ? 0x80000000U : 0);
+		flex->rx.phase[2].low_conf_bita[idx] = (flex->rx.phase[2].low_conf_bita[idx] >> 1) |
+					       (flex->rx.sym_bita_low ? 0x80000000U : 0);
+		flex->rx.phase[2].low_conf_bitb[idx] = (flex->rx.phase[2].low_conf_bitb[idx] >> 1) |
+					       (flex->rx.sym_bitb_low ? 0x80000000U : 0);
 		flex->rx.phase[3].words[idx] = (flex->rx.phase[3].words[idx] >> 1) |
 					       (bit_b ? 0x80000000U : 0);
+		flex->rx.phase[3].low_conf_bita[idx] = (flex->rx.phase[3].low_conf_bita[idx] >> 1) |
+					       (flex->rx.sym_bita_low ? 0x80000000U : 0);
+		flex->rx.phase[3].low_conf_bitb[idx] = (flex->rx.phase[3].low_conf_bitb[idx] >> 1) |
+					       (flex->rx.sym_bitb_low ? 0x80000000U : 0);
 		flex->rx.phase_toggle = 0;
 
 		if ((flex->rx.data_bit_counter & 0xFF) == 0xFF) {
@@ -5266,6 +5298,16 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 			flex->rx.data_count = 0;
 			flex_rx_clear_phase_data(flex);
 			flex->rx.rx_state = RX_STATE_DATA;
+			memset(flex->rx.data_sym_count, 0, sizeof(flex->rx.data_sym_count));
+			memset(flex->rx.data_sym_sum, 0, sizeof(flex->rx.data_sym_sum));
+			memset(flex->rx.data_sym_sum2, 0, sizeof(flex->rx.data_sym_sum2));
+			flex->rx.data_dc_sum = 0;
+			flex->rx.data_dc_count = 0;
+			flex->rx.data_bita_close = 0;
+			flex->rx.data_bitb_close = 0;
+			flex->rx.data_sym_total = 0;
+			memset(flex->rx.data_dc_q, 0, sizeof(flex->rx.data_dc_q));
+			memset(flex->rx.data_dc_qn, 0, sizeof(flex->rx.data_dc_qn));
 
 			/* Log only when something noteworthy happens.
 			 * Normal case (no correction) is silent — blind
@@ -5345,10 +5387,34 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 
 		if (++flex->rx.data_count == flex->rx.sync_baud * 1760 / 1000) {
 			int bps = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
-			LOGP_CHAN(DDSP, LOGL_DEBUG,
-				  "RX: DATA complete, %d symbols (%d baud, %dbps/%dFSK).\n",
-				  flex->rx.data_count, flex->rx.sync_baud,
-				  bps, flex->rx.sync_levels);
+			fm_demod_t *demod = flex->rx.fm_demod;
+			double afc_corr = demod ? fm_demod_afc_get_correction(demod) : 0;
+			double data_dc = (flex->rx.data_dc_count > 0) ?
+				flex->rx.data_dc_sum / flex->rx.data_dc_count : 0.0;
+			double sa[4], sd[4];
+			int si;
+			for (si = 0; si < 4; si++) {
+				int n = flex->rx.data_sym_count[si];
+				sa[si] = n > 0 ? flex->rx.data_sym_sum[si] / n : 0;
+				sd[si] = n > 1 ? sqrt(flex->rx.data_sym_sum2[si] / n - sa[si] * sa[si]) : 0;
+			}
+			LOGP_CHAN(DDSP, LOGL_INFO,
+				  "RX: DATA complete (C%u/F%u), %dbps/%dFSK, "
+				  "afc=%+.0fHz dc=%.4f env=%.4f "
+				  "sd=%.2f/%.2f/%.2f/%.2f "
+				  "close: bita=%d bitb=%d/%d "
+				  "dc_q=%.3f/%.3f/%.3f/%.3f.\n",
+				  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+				  bps, flex->rx.sync_levels,
+				  afc_corr, data_dc, flex->rx.pll_envelope,
+				  sd[0], sd[1], sd[2], sd[3],
+				  flex->rx.data_bita_close,
+				  flex->rx.data_bitb_close,
+				  flex->rx.data_sym_total,
+				  flex->rx.data_dc_qn[0] > 0 ? flex->rx.data_dc_q[0]/flex->rx.data_dc_qn[0] : 0,
+				  flex->rx.data_dc_qn[1] > 0 ? flex->rx.data_dc_q[1]/flex->rx.data_dc_qn[1] : 0,
+				  flex->rx.data_dc_qn[2] > 0 ? flex->rx.data_dc_q[2]/flex->rx.data_dc_qn[2] : 0,
+				  flex->rx.data_dc_qn[3] > 0 ? flex->rx.data_dc_q[3]/flex->rx.data_dc_qn[3] : 0);
 			flex_rx_decode_data(flex);
 			/* Return to sync hunting at 1600 baud / 2FSK */
 			flex->rx.baud = 1600;
@@ -5377,14 +5443,36 @@ static int flex_rx_build_symbol(flex_t *flex, double sample)
 
 	flex->rx.pll_sample_count++;
 
-	/* DC offset removal (IIR filter, only during sync hunting) */
-	if (flex->rx.rx_state == RX_STATE_SYNC1) {
-		flex->rx.pll_zero = (flex->rx.pll_zero *
-				     (flex->rx.sample_freq * DC_OFFSET_FILTER) +
-				     sample) /
-				    ((flex->rx.sample_freq * DC_OFFSET_FILTER) + 1);
+	/* DC offset removal (IIR filter).
+	 * Fast tracking during sync hunting (S1) to acquire DC level.
+	 * Slow tracking during data to follow transmitter drift without
+	 * being biased by short-term symbol asymmetry. The 4FSK symbol
+	 * distribution is symmetric over many symbols, so the long-term
+	 * average converges to the true DC offset. This keeps the
+	 * zero-crossing slicer centered, preventing bit_a (phases A/C)
+	 * errors from DC drift during the 1.875s frame. */
+	{
+		double dc_tau;
+		if (flex->rx.rx_state == RX_STATE_SYNC1)
+			dc_tau = flex->rx.sample_freq * DC_OFFSET_FILTER;
+		else
+			dc_tau = flex->rx.sample_freq * DC_OFFSET_FILTER_DATA;
+		flex->rx.pll_zero = (flex->rx.pll_zero * dc_tau + sample) /
+				    (dc_tau + 1);
 	}
 	sample -= flex->rx.pll_zero;
+
+	/* Track DC during DATA for diagnostics */
+	if (flex->rx.rx_state == RX_STATE_DATA) {
+		flex->rx.data_dc_sum += sample;
+		flex->rx.data_dc_count++;
+		/* Per-quarter DC tracking */
+		int expected = flex->rx.sync_baud * 1760 / 1000;
+		int q = (expected > 0) ? (4 * flex->rx.data_count / expected) : 0;
+		if (q > 3) q = 3;
+		flex->rx.data_dc_q[q] += sample;
+		flex->rx.data_dc_qn[q]++;
+	}
 
 	if (flex->rx.pll_locked) {
 		/* Establish signal envelope during sync hunting */
@@ -5394,12 +5482,29 @@ static int flex_rx_build_symbol(flex_t *flex, double sample)
 			flex->rx.pll_envelope =
 				flex->rx.pll_envelope_sum /
 				flex->rx.pll_envelope_count;
+			/* Track positive and negative levels separately
+			 * for asymmetry-aware normalization */
+			if (sample > 0) {
+				flex->rx.pll_pos_sum += sample;
+				flex->rx.pll_pos_count++;
+				flex->rx.pll_pos_level = flex->rx.pll_pos_sum / flex->rx.pll_pos_count;
+			} else if (sample < 0) {
+				flex->rx.pll_neg_sum += sample;
+				flex->rx.pll_neg_count++;
+				flex->rx.pll_neg_level = flex->rx.pll_neg_sum / flex->rx.pll_neg_count;
+			}
 		}
 	} else {
 		/* Not locked: reset envelope and hold in S1 hunting */
 		flex->rx.pll_envelope = 0;
 		flex->rx.pll_envelope_sum = 0;
 		flex->rx.pll_envelope_count = 0;
+		flex->rx.pll_pos_sum = 0;
+		flex->rx.pll_pos_count = 0;
+		flex->rx.pll_neg_sum = 0;
+		flex->rx.pll_neg_count = 0;
+		flex->rx.pll_pos_level = 0;
+		flex->rx.pll_neg_level = 0;
 		flex->rx.baud = 1600;
 		flex->rx.pll_timeout = 0;
 		flex->rx.pll_nonconsec = 0;
@@ -5407,18 +5512,48 @@ static int flex_rx_build_symbol(flex_t *flex, double sample)
 		flex->rx.s1_tail_count = 0;
 	}
 
-	/* Mid 80% of symbol period: vote on symbol level */
+	/* Mid 80% of symbol period: vote on symbol level.
+	 * Hard votes (pll_symcount): equal weight per sample.
+	 * Soft: median of clipped samples (outlier rejection). */
 	if (phasepercent > 10.0 && phasepercent < 90.0) {
+		double thr = flex->rx.pll_envelope * SLICE_THRESHOLD;
+
+		/* Hard: unclipped majority vote (proven robust).
+		 * Also accumulate per-symbol-level statistics for
+		 * noise floor estimation during DATA. */
+
 		if (sample > 0) {
-			if (sample > flex->rx.pll_envelope * SLICE_THRESHOLD)
+			if (sample > thr) {
 				flex->rx.pll_symcount[3]++;
-			else
+				if (flex->rx.rx_state == RX_STATE_DATA) {
+					flex->rx.data_sym_count[3]++;
+					flex->rx.data_sym_sum[3] += sample;
+					flex->rx.data_sym_sum2[3] += sample * sample;
+				}
+			} else {
 				flex->rx.pll_symcount[2]++;
+				if (flex->rx.rx_state == RX_STATE_DATA) {
+					flex->rx.data_sym_count[2]++;
+					flex->rx.data_sym_sum[2] += sample;
+					flex->rx.data_sym_sum2[2] += sample * sample;
+				}
+			}
 		} else {
-			if (sample < -flex->rx.pll_envelope * SLICE_THRESHOLD)
+			if (sample < -thr) {
 				flex->rx.pll_symcount[0]++;
-			else
+				if (flex->rx.rx_state == RX_STATE_DATA) {
+					flex->rx.data_sym_count[0]++;
+					flex->rx.data_sym_sum[0] += sample;
+					flex->rx.data_sym_sum2[0] += sample * sample;
+				}
+			} else {
 				flex->rx.pll_symcount[1]++;
+				if (flex->rx.rx_state == RX_STATE_DATA) {
+					flex->rx.data_sym_count[1]++;
+					flex->rx.data_sym_sum[1] += sample;
+					flex->rx.data_sym_sum2[1] += sample * sample;
+				}
+			}
 		}
 	}
 
@@ -5476,7 +5611,7 @@ static void flex_rx_demodulate(flex_t *flex, double sample)
 	flex->rx.pll_nonconsec = 0;
 	flex->rx.pll_symbol_count++;
 
-	/* Determine modal symbol (most votes wins) */
+	/* Determine modal symbol from hard votes (most votes wins) */
 	int j, decmax = 0, modal_symbol = 0;
 	for (j = 0; j < 4; j++) {
 		if (flex->rx.pll_symcount[j] > decmax) {
@@ -5484,6 +5619,34 @@ static void flex_rx_demodulate(flex_t *flex, double sample)
 			decmax = flex->rx.pll_symcount[j];
 		}
 	}
+	/* Per-bit margin tracking during DATA.
+	 * bit_a (MSB): positive votes = sym2+sym3, negative = sym0+sym1
+	 * bit_b (LSB): outer votes = sym0+sym3, inner = sym1+sym2
+	 * A "close" vote means the winning side had < 60% of total. */
+	if (flex->rx.rx_state == RX_STATE_DATA) {
+		int total_votes = flex->rx.pll_symcount[0] + flex->rx.pll_symcount[1]
+			        + flex->rx.pll_symcount[2] + flex->rx.pll_symcount[3];
+		flex->rx.sym_bita_low = 0;
+		flex->rx.sym_bitb_low = 0;
+		if (total_votes > 0) {
+			int bita_pos = flex->rx.pll_symcount[2] + flex->rx.pll_symcount[3];
+			int bita_neg = flex->rx.pll_symcount[0] + flex->rx.pll_symcount[1];
+			int bita_win = (bita_pos > bita_neg) ? bita_pos : bita_neg;
+			int bitb_out = flex->rx.pll_symcount[0] + flex->rx.pll_symcount[3];
+			int bitb_in  = flex->rx.pll_symcount[1] + flex->rx.pll_symcount[2];
+			int bitb_win = (bitb_out > bitb_in) ? bitb_out : bitb_in;
+			if (bita_win * 10 < total_votes * 6) {
+				flex->rx.data_bita_close++;
+				flex->rx.sym_bita_low = 1;
+			}
+			if (bitb_win * 10 < total_votes * 6) {
+				flex->rx.data_bitb_close++;
+				flex->rx.sym_bitb_low = 1;
+			}
+			flex->rx.data_sym_total++;
+		}
+	}
+
 	flex->rx.pll_symcount[0] = 0;
 	flex->rx.pll_symcount[1] = 0;
 	flex->rx.pll_symcount[2] = 0;
@@ -5546,6 +5709,24 @@ void sender_receive(sender_t *sender, sample_t *samples, int length,
 
 	if (!flex->rx.enabled)
 		return;
+
+	/* One-shot: enable AFC in the FM demodulator on first audio.
+	 * The fm_demod is created by the audio backend (iq_wave or SDR)
+	 * during sender_open_audio(), which runs after flex_create().
+	 * We cache the pointer so we don't need backend-specific
+	 * accessors on every frame. */
+	if (!flex->rx.afc_initialized) {
+		fm_demod_t *demod = NULL;
+		if (iq_wave_is_active())
+			demod = iq_wave_get_fm_demod(sender->audio, 0);
+		if (!demod)
+			demod = sdr_get_fm_demod(sender->audio, 0);
+		if (demod) {
+			fm_demod_afc_enable(demod, 5.0, 5000.0);
+			flex->rx.fm_demod = demod;
+		}
+		flex->rx.afc_initialized = 1;
+	}
 
 	for (i = 0; i < length; i++)
 		flex_rx_demodulate(flex, (double)samples[i]);

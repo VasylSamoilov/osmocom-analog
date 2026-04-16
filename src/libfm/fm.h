@@ -2,6 +2,7 @@
 #define _LIB_FM_H
 
 #include "../libfilter/iir_filter.h"
+#include <stdint.h>
 
 int fm_init(int fast_math);
 void fm_exit(void);
@@ -36,13 +37,39 @@ typedef struct fm_demod {
 	double samplerate;	/* sample rate of in and out */
 	double phase;		/* current rotation phase (used to shift) */
 	double rot;		/* rotation step per sample to shift rx frequency (used to shift) */
+	double rot_base;	/* base rotation (from init offset, before AFC) */
 	double last_phase;	/* last phase of FM (used to demodulate) */
 	iir_filter_t lp[2];	/* filters received IQ signal */
+	/* AFC (Automatic Frequency Control) - FLL on IQ before lowpass.
+	 * Measures carrier offset from IQ phase differences, then adjusts
+	 * the IQ mixer to re-center the signal before the lowpass filter. */
+	struct {
+		int	enabled;
+		/* FLL state */
+		double	fll_last_phase;		/* previous IQ phase */
+		double	fll_freq;		/* IIR-filtered freq (rad/sample) */
+		double	fll_alpha;		/* IIR coeff = 1/(tc*samplerate) */
+		int	fll_initialized;
+		/* Parameters */
+		double	time_constant_s;	/* IIR time constant */
+		double	max_correction_hz;	/* clamp limit */
+		/* Status */
+		double	freq_error_hz;		/* measured carrier offset (Hz) */
+		double	correction_hz;		/* applied NCO correction (Hz) */
+		double	peak_error_hz;		/* peak error seen (Hz) */
+		uint64_t update_count;		/* number of AFC updates */
+	} afc;
 } fm_demod_t;
 
 int fm_demod_init(fm_demod_t *demod, double samplerate, double offset, double bandwidth);
 void fm_demod_exit(fm_demod_t *demod);
 void fm_demod_set_offset(fm_demod_t *demod, double offset_hz);
+void fm_demod_afc_enable(fm_demod_t *demod, double time_constant_s, double max_correction_hz);
+void fm_demod_afc_disable(fm_demod_t *demod);
+double fm_demod_afc_get_correction(fm_demod_t *demod);
+double fm_demod_afc_get_freq_error(fm_demod_t *demod);
+double fm_demod_afc_get_peak_error(fm_demod_t *demod);
+void fm_demod_afc_reset_peak(fm_demod_t *demod);
 void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, float *baseband, sample_t *I, sample_t *Q);
 void fm_demodulate_real(fm_demod_t *demod, sample_t *frequency, int length, sample_t *baseband, sample_t *I, sample_t *Q);
 

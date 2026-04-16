@@ -437,3 +437,15 @@ int iq_wave_get_tosend(void *inst, int buffer_size)
 	(void)iq;
 	return buffer_size;
 }
+
+fm_demod_t *iq_wave_get_fm_demod(void *inst, int channel)
+{
+	iq_wave_t *iq = (iq_wave_t *)inst;
+
+	if (!iq || channel < 0 || channel >= iq->channels)
+		return NULL;
+	if (iq->chan[channel].am)
+		return NULL;
+
+	return &iq->chan[channel].fm_demod;
+}

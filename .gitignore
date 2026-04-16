@@ -51,6 +51,7 @@ src/fuvst/fuvst
 src/fuvst/fuvst_sniffer
 src/dcf77/dcf77
 src/mate/matesimulator
+src/mobitex/mobitex
 src/osmocalibrate/osmocalibrate
 extra/cnetz_memory_card_generator
 

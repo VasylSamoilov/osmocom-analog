@@ -53,4 +53,9 @@ typedef struct sdr_caps {
  * Returns 0 on success, -1 on error */
 int sdr_query_caps(sdr_caps_t *caps);
 
+/* Return pointer to the FM demodulator for a given channel.
+ * Returns NULL if inst is NULL, channel is invalid, or uses AM. */
+#include "../libfm/fm.h"
+fm_demod_t *sdr_get_fm_demod(void *inst, int channel);
+
 #endif /* SDR_H */

@@ -306,6 +306,7 @@ int fm_demod_init(fm_demod_t *demod, double samplerate, double offset, double ba
 		demod->rot = 65536.0 * -offset / samplerate;
 	else
 		demod->rot = 2 * M_PI * -offset / samplerate;
+	demod->rot_base = demod->rot;
 
 	/* use fourth order (2 iter) filter, since it is as fast as second order (1 iter) filter */
 	iir_lowpass_init(&demod->lp[0], bandwidth / 2.0, samplerate, 2);
@@ -321,14 +322,65 @@ void fm_demod_exit(fm_demod_t __attribute__ ((unused)) *demod)
 /* Update FM demodulator frequency offset (for AFC) */
 void fm_demod_set_offset(fm_demod_t *demod, double offset_hz)
 {
-	/* Protect against NaN - don't update if offset is invalid */
+	/* Apply AFC correction on top of the base rotation.
+	 * rot_base is the original channel offset from init.
+	 * offset_hz is the AFC correction to add. */
 	if (!isfinite(offset_hz))
 		return;
 	
+	double correction_rot;
 	if (fast_math)
-		demod->rot = 65536.0 * -offset_hz / demod->samplerate;
+		correction_rot = 65536.0 * -offset_hz / demod->samplerate;
 	else
-		demod->rot = 2 * M_PI * -offset_hz / demod->samplerate;
+		correction_rot = 2 * M_PI * -offset_hz / demod->samplerate;
+	demod->rot = demod->rot_base + correction_rot;
+}
+
+/* Enable AFC with given time constant and max correction.
+ * The FLL runs on IQ samples inside fm_demodulate_complex(),
+ * measuring carrier offset before the lowpass filter. */
+void fm_demod_afc_enable(fm_demod_t *demod, double time_constant_s, double max_correction_hz)
+{
+	if (time_constant_s < 0.001)
+		time_constant_s = 0.001;
+	demod->afc.enabled = 1;
+	demod->afc.time_constant_s = time_constant_s;
+	demod->afc.max_correction_hz = max_correction_hz;
+	demod->afc.fll_alpha = 1.0 / (time_constant_s * demod->samplerate);
+	demod->afc.fll_freq = 0;
+	demod->afc.fll_initialized = 0;
+	demod->afc.freq_error_hz = 0;
+	demod->afc.correction_hz = 0;
+	demod->afc.peak_error_hz = 0;
+	demod->afc.update_count = 0;
+}
+
+void fm_demod_afc_disable(fm_demod_t *demod)
+{
+	demod->afc.enabled = 0;
+	demod->afc.correction_hz = 0;
+	demod->afc.freq_error_hz = 0;
+	fm_demod_set_offset(demod, 0.0);
+}
+
+double fm_demod_afc_get_correction(fm_demod_t *demod)
+{
+	return demod->afc.correction_hz;
+}
+
+double fm_demod_afc_get_freq_error(fm_demod_t *demod)
+{
+	return demod->afc.freq_error_hz;
+}
+
+double fm_demod_afc_get_peak_error(fm_demod_t *demod)
+{
+	return demod->afc.peak_error_hz;
+}
+
+void fm_demod_afc_reset_peak(fm_demod_t *demod)
+{
+	demod->afc.peak_error_hz = 0;
 }
 
 static inline float fast_tan(float z)
@@ -418,6 +470,35 @@ void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, f
 		frequency[s] = dev;
 	}
 	demod->last_phase = last_phase;
+
+	/* AFC: measure carrier offset from the DC component of the
+	 * demodulated FM output. A carrier offset of X Hz produces
+	 * a constant DC bias of X Hz in the demodulated frequency.
+	 * IIR-filter this to get a smooth estimate, then correct
+	 * the mixer to re-center the signal.
+	 *
+	 * This is more robust than I/Q phase-rate measurement because
+	 * the FM demod output naturally separates carrier offset (DC)
+	 * from modulation (AC), regardless of lowpass filter quality. */
+	if (demod->afc.enabled && length > 0) {
+		for (s = 0; s < length; s++) {
+			demod->afc.fll_freq = demod->afc.fll_alpha * frequency[s]
+				+ (1.0 - demod->afc.fll_alpha) * demod->afc.fll_freq;
+		}
+		double err_hz = demod->afc.fll_freq;
+		if (isfinite(err_hz)) {
+			demod->afc.freq_error_hz = err_hz;
+			if (fabs(err_hz) > demod->afc.peak_error_hz)
+				demod->afc.peak_error_hz = fabs(err_hz);
+			if (err_hz > demod->afc.max_correction_hz)
+				err_hz = demod->afc.max_correction_hz;
+			else if (err_hz < -demod->afc.max_correction_hz)
+				err_hz = -demod->afc.max_correction_hz;
+			demod->afc.correction_hz = err_hz;
+			demod->afc.update_count++;
+			fm_demod_set_offset(demod, err_hz);
+		}
+	}
 }
 
 void fm_demodulate_real(fm_demod_t *demod, sample_t *frequency, int length, sample_t *baseband, sample_t *I, sample_t *Q)
