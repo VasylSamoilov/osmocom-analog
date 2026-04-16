@@ -817,6 +817,33 @@ success:
 	return (int32_t)(code31 & FLEX_DATA_MASK);
 }
 
+/* De-interleave one block of 8 × 32-bit words.
+ * Reverses the column-wise interleaving done by flex_interleave_block().
+ *
+ * NOTE: Not used in the current RX path because the idx formula in
+ * flex_rx_read_data() performs de-interleaving inline during bit
+ * accumulation. Kept for potential future use (e.g., raw bit buffer
+ * approach).
+ */
+static void __attribute__((unused)) flex_deinterleave_block(uint32_t *words)
+{
+	uint8_t src[FLEX_CODEWORD_BITS]; /* 32 bytes of interleaved data */
+	uint32_t out[FLEX_WORDS_PER_BLOCK];
+	int i, w;
+
+	memcpy(src, words, sizeof(src));
+	memset(out, 0, sizeof(out));
+
+	for (i = 0; i < (int)FLEX_CODEWORD_BITS; i++) {
+		for (w = 0; w < (int)FLEX_WORDS_PER_BLOCK; w++) {
+			if (src[i] & (1 << (7 - w)))
+				out[w] |= (1U << (31 - i));
+		}
+	}
+
+	memcpy(words, out, sizeof(out));
+}
+
 /* Check a 64-bit buffer against the FLEX sync pattern.
  * Returns the outer sync code (upper 16 bits) if matched, 0 otherwise.
  * The 64-bit sync word is: AAAA:BBBBBBBB:CCCC where
@@ -1624,110 +1651,91 @@ static void msg_history_expire(flex_t *flex, uint32_t current_frame_abs)
 	}
 }
 
-/* Combine all stored copies of a subframe into a best-of result.
+/* Combine subframe word-level results into a single best-of phase.
+ * For each word position, select the best status across all received subframes:
+ *   CLEAN > CORRECTED > UNCORRECTABLE
+ * For CORRECTED ties, prefer the subframe with fewer total UNCORRECTABLE words.
+ * Writes the combined result into 'combined' and resets the store. */
+/* Combine all received copies of a subframe using forward/backward
+ * error correction.  For each word position, pick the best BCH result
+ * across all copies.  The goal is to reconstruct a perfect subframe
+ * from multiple imperfect copies received in a high-error environment.
  *
- * For each word position:
- *   1. Collect all copies that have this word as CLEAN or CORRECTED
- *   2. If multiple copies agree on the value: use that value (majority vote)
- *   3. If copies disagree: prefer the word from the copy with fewest
- *      total uncorrectable words (better overall signal quality)
- *   4. If no copy has a good word: mark as UNCORRECTABLE
+ * Priority: CLEAN > CORRECTED > UNCORRECTABLE.
+ * Among CORRECTED copies, prefer the one from the copy with fewer
+ * total uncorrectable words (better overall signal quality).
  *
- * Majority vote catches the case where a garbage codeword happens to
- * pass BCH and produces a valid but wrong value — the other copies
- * will outvote it.  The "fewest errors" tiebreaker handles the 2-copy
- * disagreement case where we can't do majority vote.
- *
- * Writes the combined result into out_words/out_status.
- * Returns the number of remaining uncorrectable words. */
-/* Combine multiple copies of a subframe using majority vote.
- *
- * copies[]:     array of pointers to subframe word arrays (from frame history)
- * statuses[]:   array of pointers to subframe status arrays
- * uc_counts[]:  per-copy uncorrectable word count
- * n_copies:     number of valid copies (1..4)
- * sf_words:     words per subframe (22/29/44)
- * out_words:    output combined words
- * out_status:   output combined status
- * phase_name:   for logging
- *
- * Returns the number of remaining uncorrectable words. */
-static int __attribute__((unused)) flex_rx_sf_combine(const uint32_t *copies[], const enum flex_word_status *statuses[],
-			      const int *uc_counts, int n_copies, int sf_words,
-			      uint32_t *out_words, enum flex_word_status *out_status,
-			      char phase_name)
+ * Returns the number of remaining UNCORRECTABLE words (0 = perfect). */
+static int flex_rx_subframe_combine(flex_t *flex,
+				    flex_rx_subframe_store_t *store,
+				    flex_phase_data_t *combined,
+				    char phase_name)
 {
-	int i, c;
+	int i, sf;
+	int sf_words = store->sf_words;
 	int remaining_uc = 0;
-	int recovered = 0;
-	int voted = 0;
+
+	(void)flex;
 
 	for (i = 0; i < sf_words; i++) {
-		uint32_t values[FLEX_RX_MAX_SUBFRAMES];
-		int value_uc[FLEX_RX_MAX_SUBFRAMES];
-		int n_good = 0;
+		enum flex_word_status best_status = FLEX_WORD_UNCORRECTABLE;
+		uint32_t best_word = 0;
+		int best_sf = -1;
+		int best_uc_count = sf_words + 1;
 
-		for (c = 0; c < n_copies; c++) {
-			if (statuses[c][i] == FLEX_WORD_CLEAN ||
-			    statuses[c][i] == FLEX_WORD_CORRECTED) {
-				values[n_good] = copies[c][i];
-				value_uc[n_good] = uc_counts[c];
-				n_good++;
+		for (sf = 0; sf < store->num_expected; sf++) {
+			if (!store->subframes[sf].received)
+				continue;
+
+			enum flex_word_status s = store->subframes[sf].status[i];
+
+			if (s == FLEX_WORD_CLEAN) {
+				best_status = s;
+				best_word = store->subframes[sf].words[i];
+				best_sf = sf;
+				break; /* can't do better */
+			}
+			if (s == FLEX_WORD_CORRECTED) {
+				if (best_status != FLEX_WORD_CORRECTED ||
+				    store->subframes[sf].uncorrectable_count < best_uc_count) {
+					best_status = s;
+					best_word = store->subframes[sf].words[i];
+					best_sf = sf;
+					best_uc_count = store->subframes[sf].uncorrectable_count;
+				}
+			}
+			if (best_sf < 0) {
+				best_word = store->subframes[sf].words[i];
+				best_sf = sf;
+				best_uc_count = store->subframes[sf].uncorrectable_count;
 			}
 		}
 
-		if (n_good == 0) {
-			out_words[i] = 0;
-			out_status[i] = FLEX_WORD_UNCORRECTABLE;
+		combined->words[i] = best_word;
+		combined->status[i] = best_status;
+		if (best_status == FLEX_WORD_UNCORRECTABLE)
 			remaining_uc++;
-			continue;
-		}
-
-		if (n_good == 1) {
-			out_words[i] = values[0];
-			out_status[i] = FLEX_WORD_CORRECTED;
-			if (n_good < n_copies)
-				recovered++;
-			continue;
-		}
-
-		/* Majority vote */
-		{
-			uint32_t best_val = values[0];
-			int best_count = 0;
-			int best_uc = sf_words + 1;
-			int j, k;
-
-			for (j = 0; j < n_good; j++) {
-				int count = 0;
-				for (k = 0; k < n_good; k++) {
-					if (values[k] == values[j])
-						count++;
-				}
-				if (count > best_count ||
-				    (count == best_count && value_uc[j] < best_uc)) {
-					best_val = values[j];
-					best_count = count;
-					best_uc = value_uc[j];
-				}
-			}
-
-			out_words[i] = best_val;
-			out_status[i] = (best_count == n_good) ? FLEX_WORD_CLEAN : FLEX_WORD_CORRECTED;
-			if (best_count < n_good)
-				voted++;
-		}
 	}
 
+	/* Clear words beyond subframe */
 	for (i = sf_words; i < FLEX_WORDS_PER_FRAME; i++) {
-		out_words[i] = 0;
-		out_status[i] = FLEX_WORD_NOT_RECEIVED;
+		combined->words[i] = 0;
+		combined->status[i] = FLEX_WORD_NOT_RECEIVED;
 	}
 
+	/* Log recovery stats */
+	int recovered = 0;
+	if (store->subframes[0].received) {
+		for (i = 0; i < sf_words; i++) {
+			if (store->subframes[0].status[i] == FLEX_WORD_UNCORRECTABLE &&
+			    combined->status[i] != FLEX_WORD_UNCORRECTABLE)
+				recovered++;
+		}
+	}
 	LOGP(DFLEX, LOGL_INFO,
-	     "SF_COMBINE: phase %c copies=%d recovered=%d voted=%d remaining_uc=%d%s\n",
-	     phase_name, n_copies, recovered, voted, remaining_uc,
-	     remaining_uc == 0 ? " PERFECT" : "");
+	     "SF_COMBINE: phase %c sf_words=%d copies=%d/%d recovered=%d remaining_uc=%d%s\n",
+	     phase_name, sf_words, store->num_received, store->num_expected,
+	     recovered, remaining_uc, remaining_uc == 0 ? " PERFECT" : "");
 
 	return remaining_uc;
 }
@@ -1850,14 +1858,12 @@ static int flex_build_word_status(flex_phase_data_t *ph, int start, int end,
 	return len;
 }
 
-/* Forward declaration -- defined after flex_rx_decode_phase */
-static void flex_rx_parse_phase_content(flex_t *flex, flex_phase_data_t *ph, char phase_name);
-
 /* Decode one phase of a received frame.
  * De-interleave blocks, BCH decode, parse BIW/addresses/vectors/messages.
  * phaseptr points to 88 words of raw interleaved data. */
 static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase_name)
 {
+	int pol = flex->rx.polarity;
 	int i;
 	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
 
@@ -1941,33 +1947,191 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 		}
 	}
 
-	/* --- Multiple transmission (experimental, disabled) ---
+	/* --- Multi-slot subframe extraction and correction (§3.4.2) ---
 	 *
-	 * When FIW indicates num_transmissions > 1, the frame contains
-	 * N subframes.  The cross-subframe recovery code exists but is
-	 * experimental.  For now, log a warning and decode the full
-	 * 88-word frame normally -- the first subframe's BIW at word 0
-	 * will be parsed, and content beyond the first subframe will
-	 * appear as idle or be ignored by the BIW offsets. */
+	 * The 88-word frame has N subframe slots (N = num_transmissions).
+	 * Slot position = copy number.  Each non-idle slot carries a copy
+	 * of the same content.  The same content appears at slot 0 in
+	 * frame F, slot 1 in frame F+interval, slot 2 in F+2*interval, etc.
+	 *
+	 * We extract ALL N slots from each frame.  Each slot with a
+	 * non-idle BIW (voffset != aoffset after BCH decode) is stored
+	 * as a copy.  Forward/backward correction combines all copies
+	 * and releases when perfect or timed out. */
 	if (flex->rx.fiw_num_transmissions > 1) {
-		LOGP_CHAN(DDSP, LOGL_NOTICE,
-			  "RX: Phase %c multiple transmission detected (n=%d)"
-			  " -- experimental subframe decode disabled,"
-			  " decoding as normal frame.\n",
-			  phase_name, flex->rx.fiw_num_transmissions);
+		int pol_idx = flex->rx.polarity;
+		int phase_idx = ph->rx_phase;
+		flex_rx_subframe_store_t *store = &flex->rx.subframe_store[pol_idx][phase_idx];
+		uint32_t repeat_interval = flex_scheduler_repeat_interval(
+			flex->collapse, flex->rx.fiw_td_collapse);
+		int num_tx = flex->rx.fiw_num_transmissions;
+		int sf_words = flex_subframe_words(num_tx);
+		uint32_t repeat_unit = (uint32_t)num_tx * repeat_interval;
+		uint32_t abs_frame = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
+		int slot;
+
+		/* Initialize or reset store */
+		if (!store->active) {
+			memset(store, 0, sizeof(*store));
+			store->active = 1;
+			store->num_expected = num_tx;
+			store->sf_words = sf_words;
+			store->base_cycle = flex->rx.fiw_cycle;
+			store->base_frame = flex->rx.fiw_frame;
+			store->timeout_frame = (abs_frame + repeat_unit + repeat_interval) % 1920;
+		}
+
+		/* Extract all N slots from this frame */
+		for (slot = 0; slot < num_tx; slot++) {
+			int sf_offset = slot * sf_words;
+			int i, uc_count = 0, all_ok = 1;
+			uint32_t slot_biw;
+
+			if (sf_offset + sf_words > FLEX_WORDS_PER_FRAME)
+				break;
+			if (store->subframes[slot].received)
+				continue; /* already have this copy */
+
+			/* Check if this slot's BIW is non-idle.
+			 * Word 0 of the slot = BIW.  If BCH failed, skip. */
+			if (ph->status[sf_offset] == FLEX_WORD_UNCORRECTABLE) {
+				/* Can't read BIW — store anyway as damaged copy,
+				 * might help with word-level recovery */
+				for (i = 0; i < sf_words; i++) {
+					store->subframes[slot].words[i] = ph->words[sf_offset + i];
+					store->subframes[slot].status[i] = ph->status[sf_offset + i];
+					if (ph->status[sf_offset + i] == FLEX_WORD_UNCORRECTABLE)
+						uc_count++;
+				}
+				store->subframes[slot].word_count = sf_words;
+				store->subframes[slot].received = 1;
+				store->subframes[slot].copy_index = slot;
+				store->subframes[slot].clean = 0;
+				store->subframes[slot].uncorrectable_count = uc_count;
+				store->num_received++;
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Phase %c slot %d/%d BIW uncorrectable, stored damaged copy (uc=%d).\n",
+					  phase_name, slot + 1, num_tx, uc_count);
+				continue;
+			}
+
+			slot_biw = ph->words[sf_offset];
+
+			/* Check if slot is idle: voffset == aoffset means no content */
+			{
+				int v = (slot_biw >> FLEX_BIW1_VSTART_SHIFT) & FLEX_BIW1_VSTART_MASK;
+				int a = ((slot_biw >> FLEX_BIW1_ASTART_SHIFT) & FLEX_BIW1_ASTART_MASK) + 1;
+				if (v == a) {
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c slot %d/%d idle (v==a=%d).\n",
+						  phase_name, slot + 1, num_tx, v);
+					continue; /* idle slot, skip */
+				}
+			}
+
+			/* Non-idle slot — extract as a copy */
+			for (i = 0; i < sf_words; i++) {
+				store->subframes[slot].words[i] = ph->words[sf_offset + i];
+				store->subframes[slot].status[i] = ph->status[sf_offset + i];
+				if (ph->status[sf_offset + i] == FLEX_WORD_UNCORRECTABLE) {
+					uc_count++;
+					all_ok = 0;
+				}
+			}
+			store->subframes[slot].word_count = sf_words;
+			store->subframes[slot].received = 1;
+			store->subframes[slot].copy_index = slot;
+			store->subframes[slot].clean = all_ok;
+			store->subframes[slot].uncorrectable_count = uc_count;
+			store->num_received++;
+
+			LOGP_CHAN(DDSP, LOGL_INFO,
+				  "RX: Phase %c slot %d/%d copy received (sf_offset=%d, uc=%d%s).\n",
+				  phase_name, slot + 1, num_tx,
+				  sf_offset, uc_count,
+				  all_ok ? ", CLEAN" : "");
+		}
+
+		/* Already decoded — just accumulate for stats */
+		if (store->decoded) {
+			if (store->num_received >= store->num_expected)
+				memset(store, 0, sizeof(*store));
+			return;
+		}
+
+		/* No copies received at all in this frame — check timeout */
+		if (store->num_received == 0) {
+			int32_t diff = (int32_t)abs_frame - (int32_t)store->timeout_frame;
+			if (diff >= 0 || diff < -960)
+				memset(store, 0, sizeof(*store));
+			return;
+		}
+
+		/* Combine all received copies (forward/backward correction) */
+		{
+			flex_phase_data_t combined;
+			int remaining_uc;
+
+			memset(&combined, 0, sizeof(combined));
+			combined.rx_phase = ph->rx_phase;
+			combined.rx_cycle = ph->rx_cycle;
+			combined.rx_frame = ph->rx_frame;
+			combined.rx_baud = ph->rx_baud;
+			combined.rx_levels = ph->rx_levels;
+			combined.rx_polarity = ph->rx_polarity;
+
+			remaining_uc = flex_rx_subframe_combine(flex, store, &combined, phase_name);
+
+			/* Perfect reconstruction — decode immediately */
+			if (remaining_uc == 0) {
+				store->decoded = 1;
+				LOGP_CHAN(DDSP, LOGL_INFO,
+					  "RX: Phase %c perfect after %d/%d copies.\n",
+					  phase_name, store->num_received, store->num_expected);
+				memcpy(ph->words, combined.words, sizeof(ph->words));
+				memcpy(ph->status, combined.status, sizeof(ph->status));
+				if (store->num_received >= store->num_expected)
+					memset(store, 0, sizeof(*store));
+				goto parse_phase;
+			}
+
+			/* All copies received — release best effort */
+			if (store->num_received >= store->num_expected) {
+				store->decoded = 1;
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: Phase %c all %d copies, %d words uncorrectable.\n",
+					  phase_name, store->num_expected, remaining_uc);
+				memcpy(ph->words, combined.words, sizeof(ph->words));
+				memcpy(ph->status, combined.status, sizeof(ph->status));
+				memset(store, 0, sizeof(*store));
+				goto parse_phase;
+			}
+
+			/* Timeout — release best effort */
+			{
+				int32_t diff = (int32_t)abs_frame - (int32_t)store->timeout_frame;
+				if (diff >= 0 || diff < -960) {
+					store->decoded = 1;
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: Phase %c timeout %d/%d copies, %d uc.\n",
+						  phase_name, store->num_received,
+						  store->num_expected, remaining_uc);
+					memcpy(ph->words, combined.words, sizeof(ph->words));
+					memcpy(ph->status, combined.status, sizeof(ph->status));
+					memset(store, 0, sizeof(*store));
+					goto parse_phase;
+				}
+			}
+		}
+
+		/* Still waiting for more copies */
+		LOGP_CHAN(DDSP, LOGL_DEBUG,
+			  "RX: Phase %c waiting (%d/%d copies).\n",
+			  phase_name, store->num_received, store->num_expected);
+		return;
 	}
 
-	flex_rx_parse_phase_content(flex, ph, phase_name);
-}
-
-/* Parse the content of a phase (or subframe slot) after BCH decode.
- * ph->words[0..N] must contain the decoded data with ph->status[].
- * For multi-tx subframes, only sf_words are valid; the rest are
- * FLEX_WORD_NOT_RECEIVED. */
-static void flex_rx_parse_phase_content(flex_t *flex, flex_phase_data_t *ph, char phase_name)
-{
-	int pol = flex->rx.polarity;
-	int bitrate = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
+parse_phase:
 
 	/* BIW1 (word 0) */
 	if (ph->status[0] == FLEX_WORD_UNCORRECTABLE ||
@@ -3130,8 +3294,7 @@ static void flex_rx_parse_phase_content(flex_t *flex, flex_phase_data_t *ph, cha
 								 * Each word carries 3 characters (or 2 on
 								 * the signature word). Show '?' for each. */
 								int lost = 3;
-								if (w == start_word && is_initial &&
-								    vec_type != FLEX_VECTOR_TYPE_SECURE)
+								if (w == start_word && is_initial)
 									lost = 2; /* sig word: only char2+char3 */
 								while (lost-- > 0 && ti < (int)sizeof(text) - 1)
 									text[ti++] = '?';
@@ -3140,13 +3303,8 @@ static void flex_rx_parse_phase_content(flex_t *flex, flex_phase_data_t *ph, cha
 							dw = ph->words[w];
 
 							/* First slot: signature on initial
-							 * fragment, character otherwise.
-							 * Secure messages (V=000) do NOT have
-							 * a 7-bit signature -- the 1st body word
-							 * starts with character data directly.
-							 * Only alpha (V=101) has the signature. */
-							if (w == start_word && is_initial &&
-							    vec_type != FLEX_VECTOR_TYPE_SECURE) {
+							 * fragment, character otherwise */
+							if (w == start_word && is_initial) {
 								rx_sig = dw & FLEX_ALPHA_SIG_MASK;
 							} else {
 								ch = (dw >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
@@ -3193,12 +3351,8 @@ static void flex_rx_parse_phase_content(flex_t *flex, flex_phase_data_t *ph, cha
 					 * For a complete (single-fragment) message, we validate
 					 * immediately.  For multi-fragment messages, the
 					 * signature covers ALL fragments — validation must
-					 * wait until reassembly is complete.
-					 *
-					 * Secure messages (V=000) do not carry a 7-bit
-					 * signature -- integrity is checked via the
-					 * 10-bit K checksum only.  Skip sig verification. */
-					if (is_initial && vec_type != FLEX_VECTOR_TYPE_SECURE) {
+					 * wait until reassembly is complete. */
+					if (is_initial) {
 						uint32_t expected_sig = (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 						if (hdr_c == 0) {
 							/* Complete message — validate now */

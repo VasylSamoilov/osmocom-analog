@@ -686,10 +686,6 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Number of transmissions must be 1-4, use '-h' for help.\n");
 			return -EINVAL;
 		}
-		if (num_transmissions > 1) {
-			fprintf(stderr, "Warning: --num-transmissions %d requested but multiple transmission TX/RX is experimental and disabled. Using 1.\n", num_transmissions);
-			num_transmissions = 1;
-		}
 		break;
 	case OPT_TD_COLLAPSE:
 		td_collapse = atoi(argv[argi]);

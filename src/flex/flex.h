@@ -12,20 +12,33 @@
 #define FLEX_POL_NORMAL		0
 #define FLEX_POL_INVERTED	1
 #define FLEX_RX_MAX_SUBFRAMES	4	/* max num_transmissions */
-#define FLEX_RX_MAX_REPEAT_INTERVAL 128	/* max 2^7, collapse 0-7 */
 
-/* Cross-subframe recovery: per-collapse-cycle frame history.
- *
- * Stores the last N whole frames (88 BCH-decoded words + status)
- * for one collapse cycle of one phase.  N = num_transmissions.
- * history[0] = most recent frame, history[N-1] = oldest.
- *
- * See frame.h "RX CROSS-SUBFRAME RECOVERY" for the full algorithm. */
-typedef struct flex_rx_frame_hist {
-	uint32_t		words[FLEX_WORDS_PER_FRAME];
-	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];
-	int			valid;		/* 1 = frame stored, 0 = empty */
-} flex_rx_frame_hist_t;
+/* Per-subframe storage for one copy of a repeated transmission.
+ * Stores only the subframe-local words (sf_words), not the full 88. */
+typedef struct flex_rx_subframe {
+	uint32_t		words[FLEX_WORDS_PER_FRAME];	/* sf_words decoded words (max 44 for 2x) */
+	enum flex_word_status	status[FLEX_WORDS_PER_FRAME];	/* sf_words BCH statuses */
+	int			word_count;			/* actual subframe word count */
+	int			received;			/* 1 = this copy has data */
+	int			copy_index;			/* which transmission (0=1st, 1=2nd, ...) */
+	int			clean;				/* 1 = all words CLEAN or CORRECTED */
+	int			uncorrectable_count;		/* number of UNCORRECTABLE words */
+} flex_rx_subframe_t;
+
+/* Subframe store for one phase's worth of repeated transmissions.
+ * Accumulates N copies of the same subframe content across frames,
+ * combines best-of per word, and releases when complete or timed out. */
+typedef struct flex_rx_subframe_store {
+	flex_rx_subframe_t	subframes[FLEX_RX_MAX_SUBFRAMES];
+	int			num_expected;		/* fiw_num_transmissions (2/3/4) */
+	int			num_received;		/* count of received copies */
+	int			sf_words;		/* words per subframe (44/29/22) */
+	int			decoded;		/* 1 = already decoded (early release) */
+	uint32_t		base_frame;		/* frame number of first subframe */
+	uint32_t		base_cycle;		/* cycle of first subframe */
+	uint32_t		timeout_frame;		/* absolute frame for timeout */
+	int			active;			/* 1 = accumulating subframes */
+} flex_rx_subframe_store_t;
 
 /* Message history for RX retransmission detection (Req 17-18) */
 #define FLEX_RX_MSG_HISTORY_MAX		256
@@ -378,13 +391,34 @@ typedef struct flex {
 	int			td_collapse;		/* -1=use system collapse (default),
 						 * 5, 6, or 7 = TD Collapse override */
 
-	/* Per-collapse-cycle slot pipeline for multi-transmission (§3.4.2).
-	 * EXPERIMENTAL -- disabled.  Uncomment when multi-tx TX is
-	 * implemented and tested. */
-#if 0
-	uint32_t		slot_content[1][1][FLEX_WORDS_PER_FRAME];
-	int			slot_content_words[1][1];
-#endif
+	/* Per-slot repeat state for multi-transmission scheduling (§3.4.2).
+	 *
+	 * The 88-word frame has N subframe slots (N = num_transmissions).
+	 * Each slot carries independent content.  The same content in a
+	 * slot is retransmitted N times across N frames in the repeat unit.
+	 * Slot position = copy number for that content group.
+	 *
+	 * Scheduling flow per frame:
+	 *   1. For each slot: if slot_copy > 0 and < num_transmissions,
+	 *      re-emit cached content (next copy).  Increment slot_copy.
+	 *   2. For free slots (slot_copy == 0 or == num_transmissions):
+	 *      pick messages from queue, encode into subframe, cache.
+	 *      Set slot_copy = 1.
+	 *   3. If no messages for a free slot: emit idle BIW.
+	 *   4. If all slots idle and queue empty: can switch to non-repeat.
+	 *   5. Assemble N subframes into 88-word frame at their offsets.
+	 *
+	 * slot_copy[i]:
+	 *   0 = free (no content, emit idle)
+	 *   1..N = copy number transmitted so far
+	 *   When slot_copy reaches num_transmissions, slot becomes free.
+	 *
+	 * slot_content[i]: cached encoded subframe words (sf_words long).
+	 *   Stored after first encoding so copies 2..N are identical
+	 *   ("the same bit stream" per spec). */
+	int			slot_copy[FLEX_RX_MAX_SUBFRAMES];
+	uint32_t		slot_content[FLEX_RX_MAX_SUBFRAMES][FLEX_WORDS_PER_FRAME];
+	int			slot_content_words[FLEX_RX_MAX_SUBFRAMES];
 
 	/* Parameter change guard (§3.4.2).
 	 *
@@ -783,24 +817,18 @@ typedef struct flex {
 			int		active;		/* 1 = in progress */
 		} reasm[FLEX_RX_POLARITIES][FLEX_REASM_SLOTS];
 
-		/* Cross-subframe recovery: per-collapse-cycle frame history.
-		 * EXPERIMENTAL -- disabled.  Uncomment when multi-tx RX
-		 * is implemented and tested.
-		 *
-		 * Dimensions: [polarity][phase][collapse_cycle][history_depth]
-		 * Worst case: 2 x 4 x 128 x 4 = 4096 entries x ~360 bytes
-		 * = ~1.4MB.  Static allocation -- acceptable for desktop. */
-#if 0
-		flex_rx_frame_hist_t sf_hist[FLEX_RX_POLARITIES][FLEX_MAX_PHASES]
-					    [FLEX_RX_MAX_REPEAT_INTERVAL]
-					    [FLEX_RX_MAX_SUBFRAMES];
-#endif
+		/* Subframe combining state (Req 15-16).
+		 * Per-phase storage for word-level results across repeated subframes.
+		 * Only active when fiw_num_transmissions > 1.
+		 * Key: (cycle, frame%repeat_interval, phase, collapse parameters).
+		 * No message awareness — all 88 words benefit regardless of capcode. */
+		flex_rx_subframe_store_t subframe_store[FLEX_RX_POLARITIES][FLEX_MAX_PHASES];
 
-		/* Message history for retransmission detection.
+		/* Message history for retransmission detection (Req 17-18).
 		 * Stores recently decoded messages keyed by (capcode, N, vec_type, phase)
 		 * with validation fields (word_count, frag_count, is_long, blocking)
 		 * for duplicate suppression and cross-retransmission word recovery.
-		 * This is a separate structure from sf_state — it operates
+		 * This is a separate structure from the subframe_store — it operates
 		 * at the message layer after parsing, not at the frame/physical layer. */
 		flex_rx_msg_entry_t msg_history[FLEX_RX_POLARITIES][FLEX_RX_MSG_HISTORY_MAX];
 	} rx;
