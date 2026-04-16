@@ -853,7 +853,12 @@ static void flex_fragment_queue(flex_t *flex)
 	if (flex->timezone_code >= 0 && flex->timezone_code < (int)FLEX_TZ_ENTRIES)
 		biw_count++;
 	if (biw_count > 4)
-		biw_count = 4; /* max e_biw=3 → 4 total */
+		biw_count = 4; /* max e_biw=3 -> 4 total */
+
+	/* Frame word capacity for fragmentation.
+	 * Always use full 88-word frame capacity.  Multiple transmission
+	 * subframe support is experimental and disabled on TX side. */
+	int frame_words = FLEX_WORDS_PER_FRAME;
 
 	for (msg = flex->msg_list; msg; msg = next) {
 		next = msg->next;
@@ -862,15 +867,8 @@ static void flex_fragment_queue(flex_t *flex)
 		 * Numeric Messages (V=011, V=100, V=111) cannot be fragmented. */
 		switch (msg->msg_type) {
 		case FLEX_MSG_TYPE_ALPHA: {
-			/* Available message words = 88 - biw - addr - vector.
-			 * Short addr = 1 word, long = 2.  Vector = 1 word.
-			 * Alpha: chars = (msg_words - 1) * 3 - 2
-			 *   (1 header word, signature eats 1 char slot,
-			 *    ETX padding eats 1 more).
-			 * For a Short Address with 1 BIW: 88-1-1-1 = 85 msg words,
-			 * 84 data words × 3 chars - 1 = 251 chars max. */
 			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
-			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
+			int msg_words_avail = frame_words - biw_count
 					      - addr_words - 1; /* 1 vector */
 			max_chars = (msg_words_avail - 1) * 3 - 2;
 			if (max_chars > FLEX_MAX_CHARS_ALPHA)
@@ -883,13 +881,8 @@ static void flex_fragment_queue(flex_t *flex)
 			max_chars = FLEX_MAX_CHARS_NUMERIC;
 			break;
 		case FLEX_MSG_TYPE_HEX: {
-			/* Available message words = 88 - biw - addr - vector.
-			 * HEX: initial fragment has 2 header words (hdr1+hdr2),
-			 * continuation has 1 (hdr1 only).
-			 * Data words hold 5 hex nibbles each.
-			 * Use initial fragment sizing (worst case = 2 headers). */
 			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
-			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
+			int msg_words_avail = frame_words - biw_count
 					      - addr_words - 1; /* 1 vector */
 			int data_words = msg_words_avail - 2; /* 2 header words */
 			max_chars = data_words * 5;
@@ -900,11 +893,8 @@ static void flex_fragment_queue(flex_t *flex)
 			break;
 		}
 		case FLEX_MSG_TYPE_SECURE: {
-			/* Secure messages use the same fragmentation as alpha
-			 * (for alpha encoding) or hex (for binary encoding).
-			 * The encoding mode is determined by secure_encoding. */
 			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
-			int msg_words_avail = FLEX_WORDS_PER_FRAME - biw_count
+			int msg_words_avail = frame_words - biw_count
 					      - addr_words - 1; /* 1 vector */
 			if (msg->secure_encoding == 0) {
 				/* Alpha encoding: same sizing as alpha */
@@ -2991,7 +2981,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 			if (phase_n_cands[p] == 0) {
 				flex_fill_idle_phase(phases[p].words, p,
 						     params.modulation_type,
-						     params.bitrate);
+						     params.bitrate, params.collapse);
 				{
 					int blk;
 					for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
@@ -3120,7 +3110,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					 * other phases proceed normally (Req 2.2) */
 					flex_fill_idle_phase(phases[p].words, p,
 							     params.modulation_type,
-							     params.bitrate);
+							     params.bitrate, params.collapse);
 					{
 						int blk;
 						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
@@ -3156,6 +3146,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 						dp += 4;
 					}
 					phases[p].word_count = extract_words;
+
+				/* EXPERIMENTAL -- multi-tx de-interleave disabled.
+				 * When multi-tx TX is re-enabled, extracted subframe
+				 * words need de-interleaving before storing in
+				 * slot_content so block boundaries align correctly
+				 * after assembly. */
 				}
 
 				any_msg = 1;
@@ -3210,7 +3206,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				if (phases[p].word_count == 0) {
 					flex_fill_idle_phase(phases[p].words, p,
 							     params.modulation_type,
-							     params.bitrate);
+							     params.bitrate, params.collapse);
 					{
 						int blk;
 						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
@@ -3244,6 +3240,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 			 * assembly, slot_content is shifted: old slot N-1 is
 			 * discarded, each slot moves up one position, and the
 			 * new content enters slot 0. */
+#if 0 /* EXPERIMENTAL -- multi-tx TX pipeline disabled */
 			if (params.num_transmissions > 1) {
 				int sf_words = flex_subframe_words(params.num_transmissions);
 				int n_slots = params.num_transmissions;
@@ -3260,7 +3257,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					 * and any gaps). */
 					flex_fill_idle_phase(assembled, p,
 							     params.modulation_type,
-							     params.bitrate);
+							     params.bitrate, params.collapse);
 
 					/* Shift this collapse cycle's pipeline:
 					 * slot[N-1] discarded, slot[i] = slot[i-1],
@@ -3309,12 +3306,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 					memcpy(phases[p].words, assembled, FLEX_WORDS_PER_FRAME * sizeof(uint32_t));
 					phases[p].word_count = FLEX_WORDS_PER_FRAME;
 
+					/* Block-interleave the full assembled frame.
+					 * Slot content is stored non-interleaved so
+					 * block boundaries align with the frame's
+					 * 8-word blocks regardless of slot offset. */
+					{
+						int blk;
+						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
+							flex_interleave_block(blk, phases[p].words);
+					}
+
 					LOGP(DFLEX, LOGL_DEBUG,
 					     "Scheduler: phase %d cycle %d assembled %d slots"
 					     " (%d words each) into 88-word frame\n",
 					     p, cycle, n_slots, sf_words);
 				}
 			}
+#endif /* EXPERIMENTAL multi-tx TX pipeline */
 
 			/* Encode sync → sync_buffer, data → frame_buffer.
 			 * flex_encode_frame_phased produces S1+FIW+S2+DATA
@@ -3378,6 +3386,7 @@ send_idle:
 	 * but slots 1..N-1 may still have cached retransmissions
 	 * from previous frames that need to be emitted.  The
 	 * pipeline shift and assembly logic handles this. */
+#if 0 /* EXPERIMENTAL -- multi-tx idle pipeline disabled */
 	if (params.num_transmissions > 1) {
 		/* Multiple transmission idle: shift this collapse cycle's
 		 * pipeline with an idle subframe in slot 0, but still emit
@@ -3398,7 +3407,7 @@ send_idle:
 
 			flex_fill_idle_phase(assembled, p_idle,
 					     params.modulation_type,
-					     params.bitrate);
+					     params.bitrate, params.collapse);
 
 			/* Shift this cycle's pipeline */
 			for (slot = n_slots - 1; slot > 0; slot--) {
@@ -3437,6 +3446,13 @@ send_idle:
 
 			memcpy(phases[p_idle].words, assembled, FLEX_WORDS_PER_FRAME * sizeof(uint32_t));
 			phases[p_idle].word_count = FLEX_WORDS_PER_FRAME;
+
+			/* Block-interleave the full assembled frame */
+			{
+				int blk;
+				for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
+					flex_interleave_block(blk, phases[p_idle].words);
+			}
 		}
 
 		/* Encode the assembled multi-slot frame */
@@ -3476,6 +3492,7 @@ send_idle:
 			  ft.cycle, ft.frame, n_slots);
 		return 1;
 	}
+#endif /* EXPERIMENTAL multi-tx idle pipeline */
 
 	/* Single transmission idle frame */
 	flex_setup_frame_buffers(flex, &params, NULL, 0,

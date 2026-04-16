@@ -817,33 +817,6 @@ success:
 	return (int32_t)(code31 & FLEX_DATA_MASK);
 }
 
-/* De-interleave one block of 8 × 32-bit words.
- * Reverses the column-wise interleaving done by flex_interleave_block().
- *
- * NOTE: Not used in the current RX path because the idx formula in
- * flex_rx_read_data() performs de-interleaving inline during bit
- * accumulation. Kept for potential future use (e.g., raw bit buffer
- * approach).
- */
-static void __attribute__((unused)) flex_deinterleave_block(uint32_t *words)
-{
-	uint8_t src[FLEX_CODEWORD_BITS]; /* 32 bytes of interleaved data */
-	uint32_t out[FLEX_WORDS_PER_BLOCK];
-	int i, w;
-
-	memcpy(src, words, sizeof(src));
-	memset(out, 0, sizeof(out));
-
-	for (i = 0; i < (int)FLEX_CODEWORD_BITS; i++) {
-		for (w = 0; w < (int)FLEX_WORDS_PER_BLOCK; w++) {
-			if (src[i] & (1 << (7 - w)))
-				out[w] |= (1U << (31 - i));
-		}
-	}
-
-	memcpy(words, out, sizeof(out));
-}
-
 /* Check a 64-bit buffer against the FLEX sync pattern.
  * Returns the outer sync code (upper 16 bits) if matched, 0 otherwise.
  * The 64-bit sync word is: AAAA:BBBBBBBB:CCCC where
@@ -1679,7 +1652,7 @@ static void msg_history_expire(flex_t *flex, uint32_t current_frame_abs)
  * phase_name:   for logging
  *
  * Returns the number of remaining uncorrectable words. */
-static int flex_rx_sf_combine(const uint32_t *copies[], const enum flex_word_status *statuses[],
+static int __attribute__((unused)) flex_rx_sf_combine(const uint32_t *copies[], const enum flex_word_status *statuses[],
 			      const int *uc_counts, int n_copies, int sf_words,
 			      uint32_t *out_words, enum flex_word_status *out_status,
 			      char phase_name)
@@ -1968,148 +1941,20 @@ static void flex_rx_decode_phase(flex_t *flex, flex_phase_data_t *ph, char phase
 		}
 	}
 
-	/* --- Multiple transmission: decode each subframe slot independently ---
+	/* --- Multiple transmission (experimental, disabled) ---
 	 *
-	 * When num_transmissions > 1, the 88-word frame contains N
-	 * independent subframe slots.  Each slot is a complete small
-	 * frame with its own BIW1, address field, vector field, and
-	 * message field — just in fewer words (22/29/44 instead of 88).
-	 *
-	 * We store the whole frame in the per-collapse-cycle history,
-	 * then for each slot, gather copies from history and combine. */
+	 * When FIW indicates num_transmissions > 1, the frame contains
+	 * N subframes.  The cross-subframe recovery code exists but is
+	 * experimental.  For now, log a warning and decode the full
+	 * 88-word frame normally -- the first subframe's BIW at word 0
+	 * will be parsed, and content beyond the first subframe will
+	 * appear as idle or be ignored by the BIW offsets. */
 	if (flex->rx.fiw_num_transmissions > 1) {
-		int num_tx = flex->rx.fiw_num_transmissions;
-		int sf_words_local = flex_subframe_words(num_tx);
-		int pol_idx = flex->rx.polarity;
-		int phase_idx = ph->rx_phase;
-		uint32_t ri = flex_scheduler_repeat_interval(
-			flex->collapse, flex->rx.fiw_td_collapse);
-		int cycle = (int)(flex->rx.fiw_frame % ri);
-		int slot, h, w;
-
-		/* Bounds check */
-		if (cycle >= FLEX_RX_MAX_REPEAT_INTERVAL)
-			cycle = FLEX_RX_MAX_REPEAT_INTERVAL - 1;
-
-		/* Push current frame into this cycle's history.
-		 * Shift: history[N-1] discarded, history[i] = history[i-1],
-		 * current frame into history[0]. */
-		for (h = num_tx - 1; h > 0; h--) {
-			flex->rx.sf_hist[pol_idx][phase_idx][cycle][h] =
-				flex->rx.sf_hist[pol_idx][phase_idx][cycle][h - 1];
-		}
-		memcpy(flex->rx.sf_hist[pol_idx][phase_idx][cycle][0].words,
-		       ph->words, sizeof(ph->words));
-		memcpy(flex->rx.sf_hist[pol_idx][phase_idx][cycle][0].status,
-		       ph->status, sizeof(ph->status));
-		flex->rx.sf_hist[pol_idx][phase_idx][cycle][0].valid = 1;
-
-		/* For each slot S, gather copies from history and decode.
-		 *
-		 * Slot S in history[0] = copy 1 (just received)
-		 * Slot S-1 in history[1] = copy 2 (same chain, previous frame in this cycle)
-		 * Slot S-2 in history[2] = copy 3
-		 * ...
-		 * Slot 0 in history[S] = copy S+1
-		 *
-		 * Total copies for slot S = min(S+1, num_tx). */
-		for (slot = 0; slot < num_tx; slot++) {
-			const uint32_t *copies[FLEX_RX_MAX_SUBFRAMES];
-			const enum flex_word_status *statuses[FLEX_RX_MAX_SUBFRAMES];
-			int uc_counts[FLEX_RX_MAX_SUBFRAMES];
-			int n_copies = 0;
-			uint32_t combined_words[FLEX_WORDS_PER_FRAME];
-			enum flex_word_status combined_status[FLEX_WORDS_PER_FRAME];
-
-			/* Gather all available copies of this chain */
-			for (h = 0; h <= slot && h < num_tx; h++) {
-				int src_slot = slot - h;
-				int sf_offset = src_slot * sf_words_local;
-				flex_rx_frame_hist_t *fh =
-					&flex->rx.sf_hist[pol_idx][phase_idx][cycle][h];
-
-				if (!fh->valid)
-					continue;
-				if (sf_offset + sf_words_local > FLEX_WORDS_PER_FRAME)
-					continue;
-
-				copies[n_copies] = &fh->words[sf_offset];
-				statuses[n_copies] = &fh->status[sf_offset];
-
-				/* Count uncorrectable words in this copy */
-				{
-					int uc = 0;
-					for (w = 0; w < sf_words_local; w++) {
-						if (fh->status[sf_offset + w] == FLEX_WORD_UNCORRECTABLE)
-							uc++;
-					}
-					uc_counts[n_copies] = uc;
-				}
-				n_copies++;
-			}
-
-			if (n_copies == 0)
-				continue;
-
-			/* Single copy: use directly. Multiple: combine. */
-			if (n_copies == 1) {
-				memcpy(combined_words, copies[0],
-				       sf_words_local * sizeof(uint32_t));
-				memcpy(combined_status, statuses[0],
-				       sf_words_local * sizeof(enum flex_word_status));
-				for (w = sf_words_local; w < FLEX_WORDS_PER_FRAME; w++) {
-					combined_words[w] = 0;
-					combined_status[w] = FLEX_WORD_NOT_RECEIVED;
-				}
-			} else {
-				flex_rx_sf_combine(copies, statuses, uc_counts,
-						   n_copies, sf_words_local,
-						   combined_words, combined_status,
-						   phase_name);
-			}
-
-			/* Check if idle or damaged BIW -- skip decode */
-			if (combined_status[0] == FLEX_WORD_UNCORRECTABLE ||
-			    combined_status[0] == FLEX_WORD_NOT_RECEIVED) {
-				if (n_copies >= num_tx)
-					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: Phase %c cycle %d slot %d/%d"
-						  " unrecoverable (BIW damaged, %d copies).\n",
-						  phase_name, cycle, slot + 1, num_tx, n_copies);
-				continue;
-			}
-
-			{
-				uint32_t biw = combined_words[0];
-				int v = (biw >> FLEX_BIW1_VSTART_SHIFT) & FLEX_BIW1_VSTART_MASK;
-				int a = ((biw >> FLEX_BIW1_ASTART_SHIFT) & FLEX_BIW1_ASTART_MASK) + 1;
-
-				if (v <= a) {
-					/* Confirmed idle subframe */
-					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c cycle %d slot %d/%d idle (v=%d a=%d, %d copies).\n",
-						  phase_name, cycle, slot + 1, num_tx, v, a, n_copies);
-					continue;
-				}
-			}
-
-			LOGP_CHAN(DDSP, LOGL_INFO,
-				  "RX: Phase %c cycle %d slot %d/%d decoding (%d copies).\n",
-				  phase_name, cycle, slot + 1, num_tx, n_copies);
-
-			/* Load combined subframe into ph for parsing */
-			memcpy(ph->words, combined_words,
-			       sf_words_local * sizeof(uint32_t));
-			memcpy(ph->status, combined_status,
-			       sf_words_local * sizeof(enum flex_word_status));
-			for (w = sf_words_local; w < FLEX_WORDS_PER_FRAME; w++) {
-				ph->words[w] = 0;
-				ph->status[w] = FLEX_WORD_NOT_RECEIVED;
-			}
-
-			flex_rx_parse_phase_content(flex, ph, phase_name);
-		}
-		return;
+		LOGP_CHAN(DDSP, LOGL_NOTICE,
+			  "RX: Phase %c multiple transmission detected (n=%d)"
+			  " -- experimental subframe decode disabled,"
+			  " decoding as normal frame.\n",
+			  phase_name, flex->rx.fiw_num_transmissions);
 	}
 
 	flex_rx_parse_phase_content(flex, ph, phase_name);

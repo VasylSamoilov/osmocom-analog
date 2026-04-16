@@ -545,6 +545,28 @@ void flex_interleave_block(uint32_t block_num, uint32_t *frame_words)
 	memcpy(frame_words + block_num * FLEX_WORDS_PER_BLOCK, dst, sizeof(dst));
 }
 
+/* De-interleave one 8-word block within a frame.
+ * Inverse of flex_interleave_block: transposes the 8x32 bit matrix
+ * back from column-major (interleaved) to row-major (raw codewords). */
+void flex_deinterleave_block(uint32_t block_num, uint32_t *frame_words)
+{
+	uint8_t src[FLEX_CODEWORD_BITS];
+	uint32_t out[FLEX_WORDS_PER_BLOCK];
+	int i, w;
+
+	memcpy(src, frame_words + block_num * FLEX_WORDS_PER_BLOCK, sizeof(src));
+	memset(out, 0, sizeof(out));
+
+	for (i = 0; i < (int)FLEX_CODEWORD_BITS; i++) {
+		for (w = 0; w < (int)FLEX_WORDS_PER_BLOCK; w++) {
+			if (src[i] & (1 << (7 - w)))
+				out[w] |= (1U << (31 - i));
+		}
+	}
+
+	memcpy(frame_words + block_num * FLEX_WORDS_PER_BLOCK, out, sizeof(out));
+}
+
 /* Compute per-phase Low Traffic Flags for FIW t-field (§3.6).
  *
  * For each phase, checks whether the address field (AF) fits entirely
@@ -625,33 +647,35 @@ uint32_t flex_compute_low_traffic_flags(const int *phase_af_words,
  * bitrate: 1600, 3200, or 6400 (bps)
  */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
-			  int mod_type, int bitrate)
+			  int mod_type, int bitrate, int collapse)
 {
 	int w;
 	int is_lsb_phase = 0;
 
 	if (mod_type == FLEX_MOD_4FSK) {
 		if (bitrate <= 3200) {
-			/* 3200/4FSK: phase 0=A (MSB, alternating),
-			 *            phase 1=C (LSB, all zeros) */
 			is_lsb_phase = (phase_index == 1);
 		} else {
-			/* 6400/4FSK: phases 0=A, 2=C (MSB, alternating),
-			 *            phases 1=B, 3=D (LSB, all zeros) */
 			is_lsb_phase = (phase_index == 1 || phase_index == 3);
 		}
 	}
 
 	if (is_lsb_phase) {
-		/* LSB phase: all zeros */
 		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++)
 			words[w] = FLEX_IDLE_WORD_2;
 	} else {
-		/* MSB phase (or 2FSK): alternating 1s and 0s */
 		for (w = 0; w < FLEX_WORDS_PER_FRAME; w++)
 			words[w] = (w % 2 == 0) ? FLEX_IDLE_WORD_1
 						 : FLEX_IDLE_WORD_2;
 	}
+
+	/* Write a proper idle BIW1 at word 0.
+	 * Without this, the raw idle pattern (all-zeros on LSB phases,
+	 * all-ones on MSB phases) decodes to an invalid BIW that causes
+	 * the receiver to parse garbage addresses.
+	 * Idle BIW1: no priority, no extra BIW, voffset=1 (== aoffset),
+	 * no carry-on, collapse from config. */
+	words[0] = flex_create_biw1(0, 0, 1, 0, (uint32_t)collapse);
 }
 
 /* Generate an idle subframe: BIW1 (with correct collapse, no addresses)
@@ -698,15 +722,11 @@ void flex_encode_idle_subframe(uint32_t *words, int sf_words,
 	biw1 = flex_create_biw1(0, 0, s_vfield, 0, (uint32_t)params->collapse);
 	words[0] = biw1;
 
-	/* Block-interleave the subframe words.
-	 * Each 8-word block within the subframe must be interleaved
-	 * so the receiver's de-interleave produces correct results. */
-	{
-		int blk;
-		int blocks_in_sf = sf_words / FLEX_WORDS_PER_BLOCK;
-		for (blk = 0; blk < blocks_in_sf; blk++)
-			flex_interleave_block(blk, words);
-	}
+	/* NOTE: No block interleaving here.  The caller is responsible
+	 * for interleaving the full 88-word assembled frame after all
+	 * subframes are placed at their slot offsets.  Interleaving
+	 * individual subframes would misalign with the frame's 8-word
+	 * block boundaries when placed at non-zero offsets. */
 }
 
 
@@ -3181,7 +3201,7 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	 * alternating all-1s/all-0s, LSB phases (4FSK) use all-zeros
 	 * to produce the same 1600bps binary waveform on the channel. */
 	flex_fill_idle_phase(frame_words, params->phase_index,
-			     params->modulation_type, params->bitrate);
+			     params->modulation_type, params->bitrate, params->collapse);
 
 	/* Per-message bookkeeping for the packing pass */
 	struct msg_info {
@@ -4807,7 +4827,7 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 				continue;
 			flex_fill_idle_phase(phases[p].words, p,
 					     params->modulation_type,
-					     params->bitrate);
+					     params->bitrate, params->collapse);
 			/* Block-interleave the idle phase */
 			{
 				int blk;

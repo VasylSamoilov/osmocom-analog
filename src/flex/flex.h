@@ -379,21 +379,12 @@ typedef struct flex {
 						 * 5, 6, or 7 = TD Collapse override */
 
 	/* Per-collapse-cycle slot pipeline for multi-transmission (§3.4.2).
-	 *
-	 * Each collapse cycle (frame % repeat_interval) has its own
-	 * independent pipeline of N subframe slots.  Every frame, the
-	 * pipeline for that frame's collapse cycle shifts: slot[N-1]
-	 * discarded, slot[i] = slot[i-1], new content into slot[0].
-	 *
-	 * slot_content[cycle][slot]: cached encoded subframe words.
-	 *   Stored after first encoding so copies 2..N are identical
-	 *   ("the same bit stream" per spec).
-	 * slot_content_words[cycle][slot]: word count per cached slot.
-	 *
-	 * Dimensions: [repeat_interval][num_transmissions].
-	 * Worst case: 128 cycles x 4 slots x 88 words x 4 bytes = ~176KB. */
-	uint32_t		slot_content[FLEX_RX_MAX_REPEAT_INTERVAL][FLEX_RX_MAX_SUBFRAMES][FLEX_WORDS_PER_FRAME];
-	int			slot_content_words[FLEX_RX_MAX_REPEAT_INTERVAL][FLEX_RX_MAX_SUBFRAMES];
+	 * EXPERIMENTAL -- disabled.  Uncomment when multi-tx TX is
+	 * implemented and tested. */
+#if 0
+	uint32_t		slot_content[1][1][FLEX_WORDS_PER_FRAME];
+	int			slot_content_words[1][1];
+#endif
 
 	/* Parameter change guard (§3.4.2).
 	 *
@@ -793,16 +784,17 @@ typedef struct flex {
 		} reasm[FLEX_RX_POLARITIES][FLEX_REASM_SLOTS];
 
 		/* Cross-subframe recovery: per-collapse-cycle frame history.
-		 * Per phase, per collapse cycle, stores the last N frames
-		 * (N = num_transmissions).  Only active when
-		 * fiw_num_transmissions > 1.
+		 * EXPERIMENTAL -- disabled.  Uncomment when multi-tx RX
+		 * is implemented and tested.
 		 *
 		 * Dimensions: [polarity][phase][collapse_cycle][history_depth]
 		 * Worst case: 2 x 4 x 128 x 4 = 4096 entries x ~360 bytes
 		 * = ~1.4MB.  Static allocation -- acceptable for desktop. */
+#if 0
 		flex_rx_frame_hist_t sf_hist[FLEX_RX_POLARITIES][FLEX_MAX_PHASES]
 					    [FLEX_RX_MAX_REPEAT_INTERVAL]
 					    [FLEX_RX_MAX_SUBFRAMES];
+#endif
 
 		/* Message history for retransmission detection.
 		 * Stores recently decoded messages keyed by (capcode, N, vec_type, phase)

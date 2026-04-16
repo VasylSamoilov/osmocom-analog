@@ -2379,11 +2379,12 @@ uint32_t flex_word_checksum(uint32_t dw);
 int flex_verify_word_checksum(uint32_t dw);
 uint32_t reverse_bits32(uint32_t v);
 void flex_interleave_block(uint32_t block_num, uint32_t *frame_words);
+void flex_deinterleave_block(uint32_t block_num, uint32_t *frame_words);
 
 /* Fill a phase's word array with idle pattern.
  * For 4FSK modes, LSB phases get all-zeros instead of alternating. */
 void flex_fill_idle_phase(uint32_t *words, int phase_index,
-			  int mod_type, int bitrate);
+			  int mod_type, int bitrate, int collapse);
 
 /* Generate an idle subframe: BIW1 (with correct collapse, no addresses)
  * followed by idle fill pattern.  Used for empty subframe slots in
