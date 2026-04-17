@@ -365,7 +365,6 @@ typedef struct flex {
 	int			collapse;		/* 0-7, default 0 */
 	int			ers_cycles_override;	/* -1 = auto, >0 = manual override */
 	int			no_ers;			/* skip ERS in single-shot mode */
-	int			biw_time_enabled;	/* BIW3/BIW4 time broadcast */
 	int			chan_setup_enabled;	/* BIW channel setup emission */
 	int			hack_nonstandard_decoders; /* block-boundary fixup for PDW/multimon-ng */
 	int			lpf_enabled;		/* baseband LPF */
@@ -467,13 +466,32 @@ typedef struct flex {
 	int			current_frame_mod_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */
 	double			current_frame_polarity;
 
-	/* roaming config */
-	uint32_t		ssid;			/* System Sub-ID */
-	uint32_t		nid;			/* Network ID */
-	uint32_t		country_code;		/* SSID2 country code (10 bits, ITU-T E.212) */
-	uint32_t		tmf;			/* SSID2 traffic management flags (4 bits) */
-	int			timezone_code;		/* SysInfo timezone zone code (0-31, -1=auto) */
+	/* roaming config — FIW n=1 flag.
+	 * Set by --roaming CLI flag.  Requires both --biw-ssid1 and
+	 * --biw-ssid2 to be set (validated at startup).
+	 * Does NOT auto-activate from SSID options. */
 	int			roaming_active;		/* FIW n flag */
+
+	/* --biw-datetime config */
+	int			biw_datetime_enabled;	/* 0=off (default), 1=on */
+	time_t			biw_time_offset;	/* offset from wall clock (0 for auto) */
+	int			biw_retro_time;		/* --retro-time: calendar-equiv year mapping */
+
+	/* --biw-sysinfo config */
+	int			biw_sysinfo_enabled;	/* 0=off (default), 1=on */
+	int			biw_tz_code;		/* timezone zone code (0-31) */
+	int			biw_dst;		/* DST flag: 0=DST active, 1=standard */
+	int			biw_sysinfo_auto;	/* 1=auto-detect tz/dst from system */
+
+	/* --biw-ssid1 config */
+	int			biw_ssid1_enabled;	/* 0=off (default), 1=on */
+	uint32_t		ssid1_local_id;		/* LID (0-511) */
+	uint32_t		ssid1_coverage_id;	/* CZ (0-31) */
+
+	/* --biw-ssid2 config */
+	int			biw_ssid2_enabled;	/* 0=off (default), 1=on */
+	uint32_t		ssid2_country_code;	/* CC (0-1023) */
+	uint32_t		ssid2_tmf;		/* TMF (0-15) */
 
 	/* scheduler state */
 	uint32_t		sched_fallback_cycle;

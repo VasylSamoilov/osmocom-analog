@@ -844,13 +844,13 @@ static void flex_fragment_queue(flex_t *flex)
 	 * This determines how many frame words are consumed by BIW,
 	 * which reduces the space available for message data. */
 	int biw_count = 1; /* BIW1 always present */
-	if (flex->ssid || flex->nid)
+	if (flex->biw_ssid1_enabled)
 		biw_count++;
-	if (flex->country_code || flex->tmf)
+	if (flex->biw_ssid2_enabled)
 		biw_count++;
-	if (flex->biw_time_enabled)
+	if (flex->biw_datetime_enabled)
 		biw_count += 2; /* Date + Time */
-	if (flex->timezone_code >= 0 && flex->timezone_code < (int)FLEX_TZ_ENTRIES)
+	if (flex->biw_sysinfo_enabled)
 		biw_count++;
 	if (biw_count > 4)
 		biw_count = 4; /* max e_biw=3 → 4 total */
@@ -1425,25 +1425,23 @@ static int flex_compute_biw_count(const flex_frame_params_t *params)
 {
 	int extra = 0;
 
-	if (params->local_id || params->coverage_id)
+	if (params->biw_ssid1)
 		extra++;
-	if ((params->country_code || params->tmf) && params->frame <= 3)
+	if (params->biw_ssid2 && params->frame <= 3)
 		extra++;
-	if (params->biw_time)
+	if (params->biw_datetime && params->biw_is_time_frame)
 		extra += 2; /* Date + Time */
-	if (params->timezone_code >= 0 &&
-	    params->timezone_code < (int)FLEX_TZ_ENTRIES)
+	if (params->biw_sysinfo && params->biw_is_sysinfo_frame)
 		extra++;
 	/* BIW101 for system message (method (b)).
 	 * When an Operator Messaging Address with LSB 0-3 is present,
 	 * emit BIW101 with the matching A-type.  This replaces the
-	 * timezone BIW101 slot if both are requested (only one type 101
+	 * sysinfo BIW101 slot if both are requested (only one type 101
 	 * word per phase per spec). */
 	if (params->sysmsg_a_type >= 0 && params->sysmsg_a_type <= 3) {
-		if (params->timezone_code < 0 ||
-		    params->timezone_code >= (int)FLEX_TZ_ENTRIES)
-			extra++; /* no timezone slot yet, add one */
-		/* else: reuse the timezone slot for sysmsg A-type */
+		if (!params->biw_sysinfo || !params->biw_is_sysinfo_frame)
+			extra++; /* no sysinfo slot yet, add one */
+		/* else: reuse the sysinfo slot for sysmsg A-type */
 	}
 	if (params->chan_setup_enabled && params->frame <= 3)
 		extra++;
@@ -1475,18 +1473,16 @@ static int flex_phase_capacity(const flex_frame_params_t *params,
 
 	/* SSID1/SSID2 only in the designated phase */
 	if (phase_idx != ssid_phase) {
-		pp.local_id = 0;
-		pp.coverage_id = 0;
-		pp.country_code = 0;
-		pp.tmf = 0;
+		pp.biw_ssid1 = 0;
+		pp.biw_ssid2 = 0;
 	}
 
 	/* SysInfo BIW101 — only one per phase per spec.
 	 * System message BIW101 (A=0000~0011) follows SSID rotation.
-	 * Timezone BIW101 (A=0100) also follows SSID rotation. */
+	 * SysInfo BIW101 (A=0100) also follows SSID rotation. */
 	if (phase_idx != ssid_phase) {
 		pp.sysmsg_a_type = -1;
-		pp.timezone_code = -1;
+		pp.biw_is_sysinfo_frame = 0;
 	}
 
 	/* Channel setup BIW only in SSID phase */
@@ -2075,11 +2071,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 	flex_frame_params_default(&params);
 	params.cycle = ft.cycle;
 	params.frame = ft.frame;
-	/* FIW n flag: set by --roaming CLI flag.
-	 * n=1 indicates Roaming Service is provided. Default n=0. */
+	/* FIW n flag: auto-set when ssid1 or ssid2 is configured. */
 	params.roaming = flex->roaming_active ? 1 : 0;
 	params.collapse = flex->collapse;
-	params.biw_time = flex->biw_time_enabled;
 	params.chan_setup_enabled = flex->chan_setup_enabled;
 	params.hack_nonstandard_decoders = flex->hack_nonstandard_decoders;
 	params.bitrate = flex_scheduler_select_speed(flex, &params.modulation_type);
@@ -2108,16 +2102,99 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 * encoding path — always starts at 1600/2FSK for sync_buffer,
 	 * then switches to target speed for frame_buffer. */
 
-	/* Coverage/roaming fields */
-	if (flex->ssid || flex->nid) {
-		params.local_id = flex->ssid;
-		params.coverage_id = flex->nid;
+	/* BIW SSID1/SSID2 fields */
+	if (flex->biw_ssid1_enabled) {
+		params.biw_ssid1 = 1;
+		params.local_id = flex->ssid1_local_id;
+		params.coverage_id = flex->ssid1_coverage_id;
 	}
-	if (flex->country_code || flex->tmf) {
-		params.country_code = flex->country_code;
-		params.tmf = flex->tmf;
+	if (flex->biw_ssid2_enabled) {
+		params.biw_ssid2 = 1;
+		params.country_code = flex->ssid2_country_code;
+		params.tmf = flex->ssid2_tmf;
 	}
-	params.timezone_code = flex->timezone_code;
+
+	/* BIW DateTime: determine if this frame is a time TX frame.
+	 * Time TX interval = max(16, 2^collapse) frames.
+	 * Frame 0 Cycle 0 is always a time frame (mandatory). */
+	if (flex->biw_datetime_enabled) {
+		uint32_t time_interval = FLEX_BIW_TIME_INTERVAL_BASE;
+		if (flex->collapse > 4)
+			time_interval = (1U << flex->collapse);
+		int is_time_frame = (ft.frame == 0 && ft.cycle == 0)
+				    || (ft.frame % time_interval == 0);
+		params.biw_datetime = 1;
+		params.biw_is_time_frame = is_time_frame;
+
+		if (is_time_frame) {
+			/* Calculate time from frame position within the hour.
+			 * Per §2.5: time refers to leading edge of S1 of Frame 0
+			 * of the current cycle. */
+			time_t base_time = time(NULL) + flex->biw_time_offset;
+			struct tm tm_val;
+			localtime_r(&base_time, &tm_val);
+
+			/* Frame-position-based time calculation */
+			double frame_seconds = (double)(ft.cycle * 128 + ft.frame) * 1.875;
+			int total_sec = (int)frame_seconds;
+			int hour_offset = total_sec / 3600;
+			int min_in_hour = (total_sec % 3600) / 60;
+			int sec_in_min = total_sec % 60;
+
+			/* For Frame 0 Cycle 0: use the hour boundary */
+			if (ft.frame == 0 && ft.cycle == 0) {
+				params.biw_hour = (uint32_t)tm_val.tm_hour;
+				params.biw_minute = 0;
+				params.biw_second = 0;
+			} else {
+				params.biw_hour = (uint32_t)((tm_val.tm_hour + hour_offset) % 24);
+				params.biw_minute = (uint32_t)min_in_hour;
+				params.biw_second = (uint32_t)(sec_in_min / 7.5);
+				if (params.biw_second > 7)
+					params.biw_second = 7;
+			}
+
+			/* Date from current time + offset */
+			int real_year = tm_val.tm_year + 1900;
+			if (flex->biw_retro_time)
+				params.biw_year = (uint32_t)(flex_biw_equiv_year(real_year) - FLEX_BIW_DATE_YEAR_BASE);
+			else
+				params.biw_year = flex_biw_year_field(real_year);
+			params.biw_month = (uint32_t)(tm_val.tm_mon + 1);
+			params.biw_day = (uint32_t)tm_val.tm_mday;
+		}
+	}
+
+	/* BIW SysInfo: follows 1-3 frames behind a time frame.
+	 * Never in the same frame as Date/Time. */
+	if (flex->biw_sysinfo_enabled) {
+		uint32_t time_interval = FLEX_BIW_TIME_INTERVAL_BASE;
+		if (flex->collapse > 4)
+			time_interval = (1U << flex->collapse);
+		/* SysInfo goes in frame N+1 after a time frame (or N+1 after
+		 * where a time frame would be if datetime is not enabled) */
+		int sysinfo_offset = (ft.frame > 0) ? ((ft.frame - 1) % time_interval) : 0;
+		int is_sysinfo_frame = (sysinfo_offset == 0 && ft.frame > 0)
+				       || (!flex->biw_datetime_enabled && ft.frame % time_interval == 0);
+		/* Never co-locate with datetime */
+		if (params.biw_is_time_frame)
+			is_sysinfo_frame = 0;
+
+		params.biw_sysinfo = 1;
+		params.biw_is_sysinfo_frame = is_sysinfo_frame;
+		params.biw_tz_code = flex->biw_tz_code;
+		params.biw_dst = flex->biw_dst;
+
+		/* Extended seconds from current time */
+		if (is_sysinfo_frame && flex->biw_datetime_enabled) {
+			time_t base_time = time(NULL) + flex->biw_time_offset;
+			struct tm tm_val;
+			localtime_r(&base_time, &tm_val);
+			uint32_t combined = (uint32_t)(tm_val.tm_sec / 0.9375);
+			if (combined > 63) combined = 63;
+			params.biw_ext_seconds = combined & 7;
+		}
+	}
 
 	/* === BIW carousel selection (Req 3) ===
 	 * Select which BIW2/3/4 words go in this frame.
@@ -2133,10 +2210,10 @@ static int flex_get_next_frame_network(flex_t *flex)
 		flex_biw_time_val_t biw_time_val;
 
 		memset(&biw_cfg, 0, sizeof(biw_cfg));
-		biw_cfg.ssid1_configured = (flex->ssid || flex->nid) ? 1 : 0;
-		biw_cfg.ssid2_configured = (flex->country_code || flex->tmf) ? 1 : 0;
-		biw_cfg.biw_time_enabled = flex->biw_time_enabled;
-		biw_cfg.timezone_configured = (flex->timezone_code >= 0) ? 1 : 0;
+		biw_cfg.ssid1_configured = flex->biw_ssid1_enabled;
+		biw_cfg.ssid2_configured = flex->biw_ssid2_enabled;
+		biw_cfg.biw_time_enabled = flex->biw_datetime_enabled;
+		biw_cfg.timezone_configured = flex->biw_sysinfo_enabled;
 		biw_cfg.chan_setup_enabled = flex->chan_setup_enabled;
 		biw_cfg.roaming_active = flex->roaming_active;
 		biw_cfg.has_sysmsg = 0; /* set later if sysmsg detected */
@@ -2146,17 +2223,10 @@ static int flex_get_next_frame_network(flex_t *flex)
 					 ft.cycle * 128 + ft.frame,
 					 biw_types, &biw_n, &biw_time_val);
 
-		/* Store carousel BIW count for capacity estimation.
-		 * The old static flex_compute_biw_count() is still used
-		 * by the encoder -- this carousel count is for the
-		 * scheduler's capacity estimation only.  Full encoder
-		 * integration happens when the encoder reads carousel
-		 * output instead of computing BIW selection itself. */
+		/* Store carousel BIW count for capacity estimation. */
 		params.carousel_biw_count = 1 + biw_n; /* BIW1 + extras */
 
-		/* Update carousel state after selection.
-		 * This must happen even if no messages are packed --
-		 * the carousel tracks transmission regardless. */
+		/* Update carousel state after selection. */
 		flex_biw_carousel_update(car, biw_types, biw_n,
 					 ft.cycle * 128 + ft.frame);
 	}
@@ -2982,15 +3052,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 		/* Encode each phase independently (Req 2.2, 2.3) */
 		for (p = 0; p < num_phases; p++) {
 			if (phase_n_cands[p] == 0) {
-				flex_fill_idle_phase(phases[p].words, p,
-						     params.modulation_type,
-						     params.bitrate);
-				{
-					int blk;
-					for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
-						flex_interleave_block(blk, phases[p].words);
-				}
-				phases[p].word_count = FLEX_WORDS_PER_FRAME;
+				/* No candidates — leave word_count=0 so the
+				 * idle fill loop below generates a proper
+				 * BIW + idle frame for this phase. */
 				continue;
 			}
 
@@ -3109,17 +3173,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 							     &phase_packed, &error);
 
 				if (error || len == 0) {
-					/* Encoding failed for this phase — fill idle,
-					 * other phases proceed normally (Req 2.2) */
-					flex_fill_idle_phase(phases[p].words, p,
-							     params.modulation_type,
-							     params.bitrate);
-					{
-						int blk;
-						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
-							flex_interleave_block(blk, phases[p].words);
-					}
-					phases[p].word_count = FLEX_WORDS_PER_FRAME;
+					/* Encoding failed for this phase — leave
+					 * word_count=0 so the idle fill loop below
+					 * generates a proper BIW + idle frame. */
 					error = 0; /* reset for next phase */
 					continue;
 				}
@@ -3186,24 +3242,36 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 
 		if (any_msg) {
-			/* Fill empty phases with proper idle pattern (Section 3.4.1)
-			 * — phases with no candidates were already filled above,
-			 * but phases that had candidates but failed encoding were
-			 * also filled. This loop catches any remaining gaps. */
+			/* Fill empty phases with proper idle frames.
+			 * Each phase needs its own BIW1 so the receiver
+			 * can decode it independently (§3.4.1).
+			 * Use flex_encode_frame_multi with msg_count=0
+			 * to produce BIW + idle fill + block interleaving. */
 			for (p = 0; p < num_phases; p++) {
 				if (phases[p].word_count == 0) {
-					flex_fill_idle_phase(phases[p].words, p,
-							     params.modulation_type,
-							     params.bitrate);
-					/* Block-interleave the idle phase.
-					 * The phase interleaver expects all
-					 * phases to be block-interleaved;
-					 * without this, the receiver's
-					 * de-interleave produces garbage. */
-					{
-						int blk;
-						for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
-							flex_interleave_block(blk, phases[p].words);
+					flex_frame_params_t idle_params = params;
+					uint8_t idle_tmp[FLEX_BUFFER_SIZE + 32];
+					size_t idle_len;
+					int idle_err = 0;
+					int s2_bytes = 5 * (params.bitrate / 1600);
+					size_t sync_oh = 14 + 4 + (size_t)s2_bytes;
+
+					idle_params.phase_index = p;
+					idle_params.single_phase = 1;
+					idle_len = flex_encode_frame_multi(NULL, 0,
+						&idle_params, idle_tmp,
+						sizeof(idle_tmp), NULL, &idle_err);
+					if (idle_len > 0 && !idle_err) {
+						uint8_t *dp = idle_tmp + sync_oh;
+						int w;
+						for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+							phases[p].words[w] =
+								((uint32_t)dp[0] << 24) |
+								((uint32_t)dp[1] << 16) |
+								((uint32_t)dp[2] << 8) |
+								 (uint32_t)dp[3];
+							dp += 4;
+						}
 					}
 					phases[p].word_count = FLEX_WORDS_PER_FRAME;
 				}
@@ -3432,31 +3500,53 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.sysmsg_method = msg->sysmsg_method;
 
 			/* Frame params: always cycle=0, frame=0.
-			 * Include BIW time + timezone when configured. */
+			 * Include BIW fields when configured. */
 			flex_frame_params_default(&params);
 			params.cycle = 0;
 			params.frame = 0;
 			params.bitrate = msg->speed;
 			params.modulation_type = msg->modulation_type;
-			params.biw_time = flex->biw_time_enabled;
 			params.chan_setup_enabled = flex->chan_setup_enabled;
 			params.hack_nonstandard_decoders = flex->hack_nonstandard_decoders;
 			params.collapse = flex->collapse;
-			if (flex->ssid || flex->nid) {
-				params.local_id = flex->ssid;
-				params.coverage_id = flex->nid;
+			params.roaming = flex->roaming_active ? 1 : 0;
+			if (flex->biw_ssid1_enabled) {
+				params.biw_ssid1 = 1;
+				params.local_id = flex->ssid1_local_id;
+				params.coverage_id = flex->ssid1_coverage_id;
 			}
-			/* FIW n flag: set by --roaming CLI flag.
-			 * n=1 indicates Roaming Service is provided. Default n=0. */
-			if (flex->roaming_active)
-				params.roaming = 1;
-			if (flex->country_code || flex->tmf) {
-				params.country_code = flex->country_code;
-				params.tmf = flex->tmf;
+			if (flex->biw_ssid2_enabled) {
+				params.biw_ssid2 = 1;
+				params.country_code = flex->ssid2_country_code;
+				params.tmf = flex->ssid2_tmf;
 			}
-			params.timezone_code = flex->timezone_code;
-
-			/* FIW n=0 by default. Set by --roaming CLI flag. */
+			if (flex->biw_datetime_enabled) {
+				params.biw_datetime = 1;
+				params.biw_is_time_frame = 1; /* single-shot: always emit time */
+				/* Use wall clock + offset */
+				time_t base_time = time(NULL) + flex->biw_time_offset;
+				struct tm tm_val;
+				localtime_r(&base_time, &tm_val);
+				int real_year = tm_val.tm_year + 1900;
+				if (flex->biw_retro_time)
+					params.biw_year = (uint32_t)(flex_biw_equiv_year(real_year) - FLEX_BIW_DATE_YEAR_BASE);
+				else
+					params.biw_year = flex_biw_year_field(real_year);
+				params.biw_month = (uint32_t)(tm_val.tm_mon + 1);
+				params.biw_day = (uint32_t)tm_val.tm_mday;
+				params.biw_hour = (uint32_t)tm_val.tm_hour;
+				params.biw_minute = (uint32_t)tm_val.tm_min;
+				uint32_t sec_step = (uint32_t)(tm_val.tm_sec / 7.5);
+				params.biw_second = (sec_step > 7) ? 7 : sec_step;
+			}
+			if (flex->biw_sysinfo_enabled) {
+				params.biw_sysinfo = 1;
+				/* In single-shot, sysinfo goes in same frame
+				 * (no multi-frame scheduling) */
+				params.biw_is_sysinfo_frame = !params.biw_is_time_frame;
+				params.biw_tz_code = flex->biw_tz_code;
+				params.biw_dst = flex->biw_dst;
+			}
 
 			/* Set sysmsg_a_type for methods (a)/(b).
 			 * Detect operator messaging address with LSB 0-3

@@ -59,20 +59,29 @@ static int fixed_speed = -1;		/* -1 = not fixed */
 static int fixed_mod_type = FLEX_MOD_2FSK;	/* default 2FSK */
 static double fixed_polarity = 0.0;	/* 0.0 = not fixed */
 static int lpf_enabled = 1;
-static int biw_time_enabled = -1;	/* -1 = auto (on in network mode) */
 static int ers_cycles_override = -1;
 static int default_charset = 0;
-static uint32_t ssid = 0;
-static uint32_t nid = 0;
-static uint32_t country_code = 0;
-static uint32_t tmf_flags = 0;
-static int timezone_code = -1;		/* -1 = none, 0-31 = 5-bit zone code (Z4..Z0) */
 static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
 static int no_ers = 0;
 static int default_phase = -1;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 static int default_blocking_length = 1;	/* HEX/Binary B field: 1-15 bits/char, 0=16.
 					 * Default 1 (raw bits). */
+
+/* New BIW options */
+static int biw_datetime_enabled = 0;	/* --biw-datetime */
+static time_t biw_time_offset = 0;	/* offset from wall clock for --biw-datetime */
+static int biw_retro_time = 0;		/* --retro-time */
+static int biw_sysinfo_enabled = 0;	/* --biw-sysinfo */
+static int biw_tz_code = -1;		/* timezone zone code (0-31) */
+static int biw_dst = 1;		/* DST flag: 0=DST active, 1=standard (default standard) */
+static int biw_sysinfo_auto = 0;	/* 1=auto-detect tz/dst */
+static int biw_ssid1_enabled = 0;	/* --biw-ssid1 */
+static uint32_t ssid1_local_id = 0;
+static uint32_t ssid1_coverage_id = 0;
+static int biw_ssid2_enabled = 0;	/* --biw-ssid2 */
+static uint32_t ssid2_country_code = 0;
+static uint32_t ssid2_tmf = 0;
 static int wav_test = 0;		/* --wav-test: exit after TX completes */
 static int num_transmissions = 1;	/* --num-transmissions: 1/2/3/4 */
 static int td_collapse = -1;		/* --td-collapse: -1=system, 5/6/7 */
@@ -91,21 +100,17 @@ static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
 #define OPT_FIXED_POLARITY	3003
 #define OPT_LPF		3004
 #define OPT_NO_LPF		3005
-#define OPT_BIW_TIME		3006
-#define OPT_NO_BIW_TIME	3007
+#define OPT_BIW_DATETIME	3006
+#define OPT_NO_BIW_DATETIME	3007
 #define OPT_ERS_CYCLES		3008
 #define OPT_CHARSET		3009
-#define OPT_SSID		3010
-#define OPT_NID			3011
 #define OPT_POCSAG_MIX		3012
 #define OPT_TEMP_ADDR		3013
 #define OPT_NO_ERS		3014
 #define OPT_PHASE		3015
 #define OPT_WAV_TEST		3016
 #define OPT_BLOCKING		3017
-#define OPT_COUNTRY_CODE	3018
-#define OPT_TMF			3019
-#define OPT_TIMEZONE		3020
+#define OPT_BIW_SYSINFO		3020
 #define OPT_NUM_TX		3021
 #define OPT_TD_COLLAPSE		3022
 #define OPT_CHAN_SETUP		3023
@@ -116,8 +121,9 @@ static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
 #define OPT_HACK_NONSTANDARD	3028
 #define OPT_FIFO		3029
 #define OPT_ROAMING		3030
-#define OPT_SSID1		3031
-#define OPT_SSID2		3032
+#define OPT_BIW_SSID1		3031
+#define OPT_BIW_SSID2		3032
+#define OPT_RETRO_TIME		3033
 
 void print_help(const char *arg0)
 {
@@ -166,13 +172,36 @@ void print_help(const char *arg0)
 	printf("        Enable baseband low-pass filter (default).\n");
 	printf("    --no-lpf\n");
 	printf("        Disable baseband low-pass filter.\n");
-	printf("    --biw-time <auto|offset>\n");
-	printf("        Enable BIW date/time/timezone broadcast.\n");
-	printf("        auto    — detect timezone from system clock.\n");
-	printf("        offset  — UTC offset, e.g. +9, -5, +5:30, +0.\n");
-	printf("        Transmits BIW Date (001), Time (010), and Timezone (101).\n");
-	printf("    --no-biw-time\n");
-	printf("        Disable BIW date/time/timezone broadcast.\n");
+	printf("    --biw-datetime <auto|yyyy-mm-dd|yyyy-mm-dd hh:mm:ss>\n");
+	printf("        Enable BIW Date (001) + Time (010) broadcast.\n");
+	printf("        auto                  — use current system clock.\n");
+	printf("        yyyy-mm-dd            — override date, keep current time.\n");
+	printf("        yyyy-mm-dd hh:mm:ss   — fixed start time (offset calculated).\n");
+	printf("        Time is calculated from frame position, not wall clock.\n");
+	printf("        Transmitted at F0C0 (mandatory) and every ~30s.\n");
+	printf("    --no-biw-datetime\n");
+	printf("        Disable BIW date/time broadcast.\n");
+	printf("    --biw-sysinfo <auto|tz_offset,dst>\n");
+	printf("        Enable BIW SysInfo (101, A=0100) timezone/DST broadcast.\n");
+	printf("        auto        — detect timezone and DST from system clock.\n");
+	printf("        tz_offset,dst — e.g. +2,on or -5,off or +5:30,off\n");
+	printf("        Never in same frame as Date/Time — follows 1-3 frames behind.\n");
+	printf("    --biw-ssid1 <LID>,<CZ>\n");
+	printf("        Enable SSID1 (BIW000): Local channel ID and Coverage Zone.\n");
+	printf("        LID: 0-511 (9 bits). CZ: 0-31 (5 bits).\n");
+	printf("        Transmitted in every frame when enabled.\n");
+	printf("        Example: --biw-ssid1 10,1\n");
+	printf("    --biw-ssid2 <CC>,<TMF>\n");
+	printf("        Enable SSID2 (BIW111): Country Code and Traffic Management Flag.\n");
+	printf("        CC: 0-1023 (10 bits, ITU-T E.212). TMF: 0-15 (4 bits).\n");
+	printf("        Transmitted in frames 0-3 when enabled.\n");
+	printf("        Example: --biw-ssid2 440,1\n");
+	printf("    --roaming\n");
+	printf("        Set FIW roaming flag n=1. Default n=0.\n");
+	printf("        Requires --biw-ssid1 and --biw-ssid2 for spec compliance.\n");
+	printf("    --retro-time\n");
+	printf("        Map year to calendar-equivalent in 1994-2025 range.\n");
+	printf("        For old pagers that assume era 0. Only with --biw-datetime.\n");
 	printf("    --no-ers\n");
 	printf("        Skip ERS burst in single-shot mode (workaround for decoders\n");
 	printf("        that choke on ERS sync patterns, e.g. PDW).\n");
@@ -180,22 +209,6 @@ void print_help(const char *arg0)
 	printf("        Override ERS cycle count (default auto).\n");
 	printf("    --charset <ascii|kanji>\n");
 	printf("        Set default character set (default ascii).\n");
-	printf("    --ssid1 <LID>,<CZ>\n");
-	printf("        Set SSID1 (BIW000): Local channel ID and Coverage Zone.\n");
-	printf("        LID: 0-511 (9 bits). Unique per operator across all frequencies.\n");
-	printf("        CZ:  0-31 (5 bits). 32 systems per LID.\n");
-	printf("        Example: --ssid1 10,1\n");
-	printf("    --ssid2 <CC>,<TMF>\n");
-	printf("        Set SSID2 (BIW111): Country Code and Traffic Management Flag.\n");
-	printf("        CC:  0-1023 (10 bits, ITU-T E.212). Example: 440=Japan.\n");
-	printf("        TMF: 0-15 (4 bits). Identifies up to 4 channels per SSID1+CC.\n");
-	printf("        Example: --ssid2 440,1\n");
-	printf("    --roaming\n");
-	printf("        Set FIW roaming flag n=1. Default n=0.\n");
-	printf("    --timezone <N>\n");
-	printf("        Set timezone zone code (0-31, 5-bit Z4..Z0).\n");
-	printf("        Emitted as BIW SysInfo type 101 (A=4). Use 'timezone,0,,' FIFO\n");
-	printf("        command to list all zone codes. Common: 9=JST, 24=PST, 27=EST.\n");
 	printf("    --pocsag-mix <frames>\n");
 	printf("        Enable POCSAG frame slot allocation.\n");
 	printf("    --temp-addr <cap:temp>\n");
@@ -391,14 +404,15 @@ static void add_options(void)
 	option_add(OPT_FIXED_POLARITY, "fixed-polarity", 1);
 	option_add(OPT_LPF, "lpf", 0);
 	option_add(OPT_NO_LPF, "no-lpf", 0);
-	option_add(OPT_BIW_TIME, "biw-time", 1);
-	option_add(OPT_NO_BIW_TIME, "no-biw-time", 0);
+	option_add(OPT_BIW_DATETIME, "biw-datetime", 1);
+	option_add(OPT_NO_BIW_DATETIME, "no-biw-datetime", 0);
 	option_add(OPT_ERS_CYCLES, "ers-cycles", 1);
 	option_add(OPT_CHARSET, "charset", 1);
-	option_add(OPT_SSID1, "ssid1", 1);
-	option_add(OPT_SSID2, "ssid2", 1);
+	option_add(OPT_BIW_SSID1, "biw-ssid1", 1);
+	option_add(OPT_BIW_SSID2, "biw-ssid2", 1);
 	option_add(OPT_ROAMING, "roaming", 0);
-	option_add(OPT_TIMEZONE, "timezone", 1);
+	option_add(OPT_BIW_SYSINFO, "biw-sysinfo", 1);
+	option_add(OPT_RETRO_TIME, "retro-time", 0);
 	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
 	option_add(OPT_NO_ERS, "no-ers", 0);
@@ -519,60 +533,50 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_NO_LPF:
 		lpf_enabled = 0;
 		break;
-	case OPT_BIW_TIME:
-		biw_time_enabled = 1;
+	case OPT_BIW_DATETIME:
+		biw_datetime_enabled = 1;
 		if (!strcasecmp(argv[argi], "auto")) {
-			/* Auto-detect timezone from system */
-			timezone_code = flex_tz_auto_detect();
-			if (timezone_code < 0) {
-				fprintf(stderr, "Warning: --biw-time auto: could not map system timezone to FLEX zone code.\n");
-				fprintf(stderr, "         Use --biw-time <offset> (e.g. +9, -5, +5:30) or --timezone <0-31>.\n");
-				timezone_code = -1;
-			} else {
-				char tzbuf[20];
-				int tz_min = flex_tz_to_minutes((uint32_t)timezone_code);
-				fprintf(stderr, "BIW time: auto-detected timezone zone=%d (%s)\n",
-					timezone_code,
-					flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
-			}
+			/* auto = use current system clock, offset = 0 */
+			biw_time_offset = 0;
 		} else {
-			/* Parse UTC offset string like +9, -5, +5:30 */
-			int offset_min = flex_tz_parse_offset(argv[argi]);
-			if (offset_min == INT_MIN) {
-				fprintf(stderr, "Invalid --biw-time offset '%s'. Use 'auto' or UTC offset like +9, -5, +5:30.\n", argv[argi]);
+			struct tm parsed;
+			memset(&parsed, 0, sizeof(parsed));
+			/* Try full format: yyyy-mm-dd hh:mm:ss */
+			if (sscanf(argv[argi], "%d-%d-%d %d:%d:%d",
+				   &parsed.tm_year, &parsed.tm_mon, &parsed.tm_mday,
+				   &parsed.tm_hour, &parsed.tm_min, &parsed.tm_sec) == 6) {
+				/* Full datetime */
+				parsed.tm_year -= 1900;
+				parsed.tm_mon -= 1;
+				parsed.tm_isdst = -1;
+			} else if (sscanf(argv[argi], "%d-%d-%d",
+					  &parsed.tm_year, &parsed.tm_mon, &parsed.tm_mday) == 3) {
+				/* Date only: use current time-of-day */
+				time_t now = time(NULL);
+				struct tm now_tm;
+				localtime_r(&now, &now_tm);
+				parsed.tm_year -= 1900;
+				parsed.tm_mon -= 1;
+				parsed.tm_hour = now_tm.tm_hour;
+				parsed.tm_min = now_tm.tm_min;
+				parsed.tm_sec = now_tm.tm_sec;
+				parsed.tm_isdst = -1;
+			} else {
+				fprintf(stderr, "Invalid --biw-datetime format '%s'.\n", argv[argi]);
+				fprintf(stderr, "Use 'auto', 'yyyy-mm-dd', or 'yyyy-mm-dd hh:mm:ss'.\n");
 				return -EINVAL;
 			}
-			uint32_t code = flex_tz_from_minutes(offset_min);
-			if (code == FLEX_TZ_RESERVED) {
-				char tzbuf[20];
-				fprintf(stderr, "UTC offset '%s' (%s) does not match any FLEX timezone zone code.\n",
-					argv[argi],
-					flex_tz_format(offset_min, tzbuf, sizeof(tzbuf)));
-				fprintf(stderr, "Valid offsets: ");
-				{
-					uint32_t i;
-					for (i = 0; i < FLEX_TZ_ENTRIES; i++) {
-						if (i == FLEX_TZ_RESERVED) continue;
-						fprintf(stderr, "%s%s",
-							i > 0 ? ", " : "",
-							flex_tz_format(flex_tz_table[i], tzbuf, sizeof(tzbuf)));
-					}
-				}
-				fprintf(stderr, "\n");
+			time_t target = mktime(&parsed);
+			if (target == (time_t)-1) {
+				fprintf(stderr, "Invalid date/time in --biw-datetime '%s'.\n", argv[argi]);
 				return -EINVAL;
 			}
-			timezone_code = (int)code;
-			{
-				char tzbuf[20];
-				int tz_min = flex_tz_to_minutes((uint32_t)timezone_code);
-				fprintf(stderr, "BIW time: timezone zone=%d (%s)\n",
-					timezone_code,
-					flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
-			}
+			biw_time_offset = target - time(NULL);
+			fprintf(stderr, "BIW datetime: offset = %ld seconds\n", (long)biw_time_offset);
 		}
 		break;
-	case OPT_NO_BIW_TIME:
-		biw_time_enabled = 0;
+	case OPT_NO_BIW_DATETIME:
+		biw_datetime_enabled = 0;
 		break;
 	case OPT_ERS_CYCLES:
 		ers_cycles_override = atoi(argv[argi]);
@@ -591,56 +595,120 @@ static int handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		}
 		break;
-	case OPT_SSID1: {
-		/* --ssid1 LID,CZ */
+	case OPT_BIW_SSID1: {
+		/* --biw-ssid1 LID,CZ */
 		char *comma = strchr(argv[argi], ',');
 		if (!comma) {
-			fprintf(stderr, "--ssid1 requires LID,CZ (e.g. --ssid1 10,1)\n");
+			fprintf(stderr, "--biw-ssid1 requires LID,CZ (e.g. --biw-ssid1 10,1)\n");
 			return -EINVAL;
 		}
-		ssid = (uint32_t)strtoul(argv[argi], NULL, 10);
-		nid = (uint32_t)strtoul(comma + 1, NULL, 10);
-		if (ssid > 511) {
+		ssid1_local_id = (uint32_t)strtoul(argv[argi], NULL, 10);
+		ssid1_coverage_id = (uint32_t)strtoul(comma + 1, NULL, 10);
+		if (ssid1_local_id > 511) {
 			fprintf(stderr, "SSID1 LID must be 0-511.\n");
 			return -EINVAL;
 		}
-		if (nid > 31) {
+		if (ssid1_coverage_id > 31) {
 			fprintf(stderr, "SSID1 CZ must be 0-31.\n");
 			return -EINVAL;
 		}
+		biw_ssid1_enabled = 1;
 		break;
 	}
-	case OPT_SSID2: {
-		/* --ssid2 CC,TMF */
+	case OPT_BIW_SSID2: {
+		/* --biw-ssid2 CC,TMF */
 		char *comma = strchr(argv[argi], ',');
 		if (!comma) {
-			fprintf(stderr, "--ssid2 requires CC,TMF (e.g. --ssid2 440,1)\n");
+			fprintf(stderr, "--biw-ssid2 requires CC,TMF (e.g. --biw-ssid2 440,1)\n");
 			return -EINVAL;
 		}
-		country_code = (uint32_t)strtoul(argv[argi], NULL, 10);
-		tmf_flags = (uint32_t)strtoul(comma + 1, NULL, 10);
-		if (country_code > 1023) {
+		ssid2_country_code = (uint32_t)strtoul(argv[argi], NULL, 10);
+		ssid2_tmf = (uint32_t)strtoul(comma + 1, NULL, 10);
+		if (ssid2_country_code > 1023) {
 			fprintf(stderr, "SSID2 CC must be 0-1023.\n");
 			return -EINVAL;
 		}
-		if (tmf_flags > 15) {
+		if (ssid2_tmf > 15) {
 			fprintf(stderr, "SSID2 TMF must be 0-15.\n");
 			return -EINVAL;
 		}
+		biw_ssid2_enabled = 1;
 		break;
 	}
 	case OPT_ROAMING:
 		roaming_enabled = 1;
 		break;
-	case OPT_TIMEZONE:
-		timezone_code = atoi(argv[argi]);
-		if (timezone_code < 0 || timezone_code >= (int)FLEX_TZ_ENTRIES) {
-			fprintf(stderr, "Timezone code must be 0-31 (5-bit Z4..Z0), use '-h' for help.\n");
-			return -EINVAL;
+	case OPT_BIW_SYSINFO:
+		/* --biw-sysinfo: auto or tz_offset,dst */
+		biw_sysinfo_enabled = 1;
+		if (!strcasecmp(argv[argi], "auto")) {
+			biw_sysinfo_auto = 1;
+			biw_tz_code = flex_tz_auto_detect();
+			if (biw_tz_code < 0) {
+				fprintf(stderr, "Warning: --biw-sysinfo auto: could not map system timezone to FLEX zone code.\n");
+				biw_tz_code = 0; /* fallback to GMT */
+			} else {
+				char tzbuf[20];
+				int tz_min = flex_tz_to_minutes((uint32_t)biw_tz_code);
+				fprintf(stderr, "BIW sysinfo: auto-detected timezone zone=%d (%s)\n",
+					biw_tz_code,
+					flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
+			}
+			/* Auto-detect DST from system */
+			{
+				time_t now = time(NULL);
+				struct tm lt;
+				localtime_r(&now, &lt);
+				biw_dst = (lt.tm_isdst > 0) ? 0 : 1; /* L0=0 means DST active */
+			}
+		} else {
+			/* Parse tz_offset,dst (e.g. +2,on or -5,off) */
+			char *comma = strchr(argv[argi], ',');
+			if (!comma) {
+				fprintf(stderr, "--biw-sysinfo requires 'auto' or 'tz_offset,dst' (e.g. +2,on or -5,off).\n");
+				return -EINVAL;
+			}
+			/* Parse timezone offset */
+			char tz_buf[32];
+			int tz_len = (int)(comma - argv[argi]);
+			if (tz_len >= (int)sizeof(tz_buf)) tz_len = (int)sizeof(tz_buf) - 1;
+			memcpy(tz_buf, argv[argi], tz_len);
+			tz_buf[tz_len] = '\0';
+			int offset_min = flex_tz_parse_offset(tz_buf);
+			if (offset_min == INT_MIN) {
+				fprintf(stderr, "Invalid timezone offset '%s' in --biw-sysinfo.\n", tz_buf);
+				return -EINVAL;
+			}
+			uint32_t code = flex_tz_from_minutes(offset_min);
+			if (code == FLEX_TZ_RESERVED) {
+				char tzbuf[20];
+				fprintf(stderr, "UTC offset '%s' (%s) does not match any FLEX timezone zone code.\n",
+					tz_buf, flex_tz_format(offset_min, tzbuf, sizeof(tzbuf)));
+				return -EINVAL;
+			}
+			biw_tz_code = (int)code;
+			/* Parse DST flag */
+			const char *dst_str = comma + 1;
+			if (!strcasecmp(dst_str, "on"))
+				biw_dst = 0; /* L0=0 means DST active */
+			else if (!strcasecmp(dst_str, "off"))
+				biw_dst = 1; /* L0=1 means standard time */
+			else {
+				fprintf(stderr, "Invalid DST flag '%s'. Use 'on' or 'off'.\n", dst_str);
+				return -EINVAL;
+			}
+			{
+				char tzbuf[20];
+				int tz_min = flex_tz_to_minutes((uint32_t)biw_tz_code);
+				fprintf(stderr, "BIW sysinfo: timezone zone=%d (%s) DST=%s\n",
+					biw_tz_code,
+					flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
+					biw_dst ? "off" : "on");
+			}
 		}
-		if (timezone_code == (int)FLEX_TZ_RESERVED) {
-			fprintf(stderr, "Warning: timezone zone code 16 is reserved in the standard.\n");
-		}
+		break;
+	case OPT_RETRO_TIME:
+		biw_retro_time = 1;
 		break;
 	case OPT_POCSAG_MIX:
 		pocsag_mix = options_strdup(argv[argi]);
@@ -2463,26 +2531,14 @@ int main(int argc, char *argv[])
 			td_collapse, collapse);
 		return -EINVAL;
 	}
-	if (roaming_enabled && !ssid && !nid) {
-		fprintf(stderr, "Warning: --roaming requires --ssid1 and/or --ssid2 to be useful.\n");
+	if (roaming_enabled && !biw_ssid1_enabled && !biw_ssid2_enabled) {
+		fprintf(stderr, "Warning: --roaming requires --biw-ssid1 and --biw-ssid2 to be useful.\n");
 	}
-	if (biw_time_enabled == -1)
-		biw_time_enabled = 0;
-
-	/* When biw_time is enabled (explicitly or via network mode) and no
-	 * timezone was set, auto-detect from system timezone. */
-	if (biw_time_enabled > 0 && timezone_code < 0) {
-		timezone_code = flex_tz_auto_detect();
-		if (timezone_code >= 0) {
-			char tzbuf[20];
-			int tz_min = flex_tz_to_minutes((uint32_t)timezone_code);
-			fprintf(stderr, "BIW time: auto-detected timezone zone=%d (%s)\n",
-				timezone_code,
-				flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
-		} else {
-			fprintf(stderr, "Warning: BIW time enabled but could not auto-detect timezone.\n");
-			fprintf(stderr, "         Time will be transmitted as UTC. Use --biw-time <offset> or --timezone <0-31>.\n");
-		}
+	if (roaming_enabled && !biw_ssid1_enabled) {
+		fprintf(stderr, "Warning: --roaming without --biw-ssid1 — SSID1 will not be transmitted.\n");
+	}
+	if (roaming_enabled && !biw_ssid2_enabled) {
+		fprintf(stderr, "Warning: --roaming without --biw-ssid2 — SSID2 will not be transmitted.\n");
 	}
 
 	/* create pipe for message send */
@@ -2524,7 +2580,6 @@ int main(int argc, char *argv[])
 			f->fixed_mod_type = fixed_mod_type;
 			f->fixed_polarity = fixed_polarity;
 			f->lpf_enabled = lpf_enabled;
-			f->biw_time_enabled = biw_time_enabled;
 			f->ers_cycles_override = ers_cycles_override;
 			f->no_ers = no_ers;
 			f->default_charset = default_charset;
@@ -2533,12 +2588,20 @@ int main(int argc, char *argv[])
 			f->default_blocking_length = default_blocking_length;
 			if (wav_test)
 				f->wav_test_mode = 1;
-			f->ssid = ssid;
-			f->nid = nid;
-			f->country_code = country_code;
-			f->tmf = tmf_flags;
-			f->timezone_code = timezone_code;
 			f->roaming_active = roaming_enabled;
+			f->biw_datetime_enabled = biw_datetime_enabled;
+			f->biw_time_offset = biw_time_offset;
+			f->biw_retro_time = biw_retro_time;
+			f->biw_sysinfo_enabled = biw_sysinfo_enabled;
+			f->biw_tz_code = biw_tz_code;
+			f->biw_dst = biw_dst;
+			f->biw_sysinfo_auto = biw_sysinfo_auto;
+			f->biw_ssid1_enabled = biw_ssid1_enabled;
+			f->ssid1_local_id = ssid1_local_id;
+			f->ssid1_coverage_id = ssid1_coverage_id;
+			f->biw_ssid2_enabled = biw_ssid2_enabled;
+			f->ssid2_country_code = ssid2_country_code;
+			f->ssid2_tmf = ssid2_tmf;
 			f->num_transmissions = num_transmissions;
 			f->td_collapse = td_collapse;
 			f->chan_setup_enabled = chan_setup_enabled;

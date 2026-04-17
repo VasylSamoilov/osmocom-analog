@@ -206,6 +206,14 @@ int flex_scheduler_select_speed(struct flex *flex, int *modulation_type_out)
 {
 	flex_msg_t *m;
 	int c1600 = 0, c3200_2fsk = 0, c3200_4fsk = 0, c6400 = 0;
+	int default_speed = 1600;
+	int default_mod = FLEX_MOD_2FSK;
+
+	/* When --speed is set, use it as the default for idle frames too */
+	if (flex->fixed_speed > 0) {
+		default_speed = flex->fixed_speed;
+		default_mod = flex->fixed_mod_type;
+	}
 
 	for (m = flex->msg_list; m; m = m->next) {
 		switch (m->speed) {
@@ -236,8 +244,8 @@ int flex_scheduler_select_speed(struct flex *flex, int *modulation_type_out)
 		*modulation_type_out = FLEX_MOD_2FSK;
 		return 3200;
 	}
-	*modulation_type_out = FLEX_MOD_2FSK;
-	return 1600;
+	*modulation_type_out = default_mod;
+	return default_speed;
 }
 
 /* Parse --pocsag-mix frame slot specification.

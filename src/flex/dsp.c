@@ -2218,30 +2218,34 @@ parse_phase:
 					uint32_t year_raw = (bword >> FLEX_BIW_DATE_YEAR_SHIFT) & FLEX_BIW_DATE_YEAR_MASK;
 					uint32_t day  = (bword >> FLEX_BIW_DATE_DAY_SHIFT) & FLEX_BIW_DATE_DAY_MASK;
 					uint32_t mon  = (bword >> FLEX_BIW_DATE_MONTH_SHIFT) & FLEX_BIW_DATE_MONTH_MASK;
-					int biw_year = (int)year_raw + FLEX_BIW_DATE_YEAR_BASE;
-					/* Reverse the calendar-equivalent mapping:
-					 * if system year >2025, the TX may have mapped
-					 * the real year to an equivalent in 1994-2025. */
-					time_t now_t = time(NULL);
-					struct tm now_tm;
-					gmtime_r(&now_t, &now_tm);
-					int sys_year = now_tm.tm_year + 1900;
-					int real = flex_biw_real_year(biw_year, sys_year);
-					if (real != biw_year) {
-						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps C%u/F%u phase=%c BIW DATE %04d-%02u-%02u (probably %d)\n",
-							  bitrate,
-							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-							  phase_name,
-							  biw_year, mon, day, real);
+					int real;
+					if (flex->biw_retro_time) {
+						/* --retro-time: TX used calendar-equivalent
+						 * year in 1994-2025, decode as-is. */
+						real = (int)year_raw + FLEX_BIW_DATE_YEAR_BASE;
 					} else {
-						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps C%u/F%u phase=%c BIW DATE %04d-%02u-%02u\n",
-							  bitrate,
-							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-							  phase_name,
-							  biw_year, mon, day);
+						/* Per §2.5.1: year field is modulo arithmetic.
+						 * 0-31 → 1994-2025, 2026-2057, 2058-2089, etc.
+						 * Determine the correct 32-year era from system clock. */
+						time_t now_t = time(NULL);
+						struct tm now_tm;
+						gmtime_r(&now_t, &now_tm);
+						int sys_year = now_tm.tm_year + 1900;
+						int era = (sys_year - FLEX_BIW_DATE_YEAR_BASE) / FLEX_BIW_DATE_YEAR_WRAP;
+						real = FLEX_BIW_DATE_YEAR_BASE + era * FLEX_BIW_DATE_YEAR_WRAP + (int)year_raw;
+						/* If decoded year is >16 years from system year,
+						 * try adjacent era (handles wrap boundary) */
+						if (real - sys_year > 16)
+							real -= FLEX_BIW_DATE_YEAR_WRAP;
+						else if (sys_year - real > 16)
+							real += FLEX_BIW_DATE_YEAR_WRAP;
 					}
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps C%u/F%u phase=%c BIW DATE %04d-%02u-%02u\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  real, mon, day);
 					flex->rx.biw[pol].date_year = real;
 					flex->rx.biw[pol].date_month = mon;
 					flex->rx.biw[pol].date_day = day;

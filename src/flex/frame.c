@@ -1865,11 +1865,11 @@ void flex_frame_params_default(flex_frame_params_t *params)
 	memset(params, 0, sizeof(*params));
 	params->bitrate = 1600;
 	params->modulation_type = FLEX_MOD_2FSK;
-	params->timezone_code = -1; /* no timezone by default */
 	params->sysmsg_a_type = -1; /* no system message BIW by default */
 	params->num_transmissions = 1; /* single transmission (no repeat) */
 	params->td_collapse = -1; /* use system collapse cycle */
 	params->subframe_index = 0;
+	params->biw_tz_code = -1; /* no timezone by default */
 }
 
 /*
@@ -3200,16 +3200,19 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 	/* ---- Compute BIW count ---- */
 	/* Build list of extra BIW words to emit (max 3, limited by
-	 * BIW1 e_biw field = 2 bits).  The
-	 * transmission order of BIW 2/3/4 is not regulated — receivers
-	 * dispatch on the type field.  We prioritize:
-	 *   1. SSID1 (type 000) — required for roaming
-	 *   2. SSID2 (type 111) — required for roaming per spec
-	 *   3. Date  (type 001) — if biw_time enabled
-	 *   4. Time  (type 010) — if biw_time enabled
-	 *   5. SysInfo/timezone (type 101) — if timezone_code set
-	 * If more than 3 are needed, SysInfo is dropped (it can be
-	 * transmitted in other frames per spec). */
+	 * BIW1 e_biw field = 2 bits).
+	 *
+	 * SSID1 (000) is in EVERY frame when configured — not optional.
+	 *
+	 * Slot allocation examples (all options enabled):
+	 *   F0 C0:  Time(010) + SSID1(000) + SSID2(111)  [Date deferred]
+	 *   F1:     SSID1(000) + SSID2(111) + Date(001) or SysInfo(101)
+	 *   F4+:    SSID1(000) [+ SysInfo on chase frames]
+	 *   F16:    Date(001) + Time(010) + SSID1(000)
+	 *   F17:    SSID1(000) + SysInfo(101)
+	 *
+	 * SysInfo (101) is never in the same frame as Date/Time.
+	 */
 
 	biw_count = 1; /* BIW1 always present */
 	e_biw = 0;
@@ -3217,26 +3220,27 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	{
 		int extra = 0;
 
-		/* SSID1 (BIW000): emit when --ssid or --nid configured. */
-		if (params->local_id || params->coverage_id)
+		/* SSID1 (BIW000): every frame when configured. */
+		if (params->biw_ssid1)
 			extra++;
-		if ((params->country_code || params->tmf) && params->frame <= 3)
+		/* SSID2 (BIW111): frames 0-3 when configured. */
+		if (params->biw_ssid2 && params->frame <= 3)
 			extra++;
-		if (params->biw_time)
+		/* Date + Time: only on time TX frames. */
+		if (params->biw_datetime && params->biw_is_time_frame)
 			extra += 2; /* Date + Time */
-		if (params->timezone_code >= 0 && params->timezone_code < (int)FLEX_TZ_ENTRIES)
+		/* SysInfo/timezone: only on sysinfo frames (never with Date/Time). */
+		if (params->biw_sysinfo && params->biw_is_sysinfo_frame)
 			extra++;
-		/* BIW101 for system message (method (b), §3.9.2).
-		 * Reuses timezone slot if already counted. */
+		/* BIW101 for system message (method (b), §3.9.2). */
 		if (params->sysmsg_a_type >= 0 && params->sysmsg_a_type <= 3) {
-			if (params->timezone_code < 0 ||
-			    params->timezone_code >= (int)FLEX_TZ_ENTRIES)
+			if (!params->biw_sysinfo || !params->biw_is_sysinfo_frame)
 				extra++;
 		}
 		if (params->chan_setup_enabled && params->frame <= 3)
 			extra++;
 
-		/* Clamp to 3 (max e_biw) — drop SysInfo first if needed */
+		/* Clamp to 3 (max e_biw) */
 		if (extra > 3)
 			extra = 3;
 
@@ -3561,12 +3565,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	 * each word by its type field, so order doesn't matter. */
 	{
 		int slots_left = biw_count - 1; /* extra slots available */
-		time_t biw_now = 0;
-		struct tm biw_tm;
-		int biw_tm_valid = 0;
 
-		/* SSID1 (type 000) — emit when --ssid or --nid configured. */
-		if (slots_left > 0 && (params->local_id || params->coverage_id)) {
+		/* SSID1 (type 000) — every frame when --biw-ssid1 configured. */
+		if (slots_left > 0 && params->biw_ssid1) {
 			frame_words[fwc++] = flex_create_biw2(
 				params->local_id,
 				params->coverage_id);
@@ -3576,9 +3577,8 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			     params->local_id, params->coverage_id);
 		}
 
-		/* SSID2 (type 111) — per §6.1.1.3, SSID2 must be
-		 * transmitted in frames 0 through 3 only. */
-		if (slots_left > 0 && (params->country_code || params->tmf) &&
+		/* SSID2 (type 111) — frames 0-3 when --biw-ssid2 configured. */
+		if (slots_left > 0 && params->biw_ssid2 &&
 		    params->frame <= 3) {
 			const char *cname = flex_mcc_name(params->country_code);
 			frame_words[fwc++] = flex_create_biw_ssid2(
@@ -3592,81 +3592,47 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			     params->tmf);
 		}
 
-		/* Date + Time (types 001, 010)
+		/* Date + Time (types 001, 010) — only on time TX frames.
+		 * Time values are pre-calculated by the scheduler from
+		 * frame position within the hour, not wall clock.
 		 *
-		 * TODO §6.1.1.3 Note 1: Time-related BIW rotation.
-		 * In multi-phase modes, T1(Date/001), T2(Time/010),
-		 * and T3(SysInfo-Time/101) must rotate across phases
-		 * in Cycle 0, Frame 0.  At 6400bps (4 phases):
-		 *   Cycle N frame 0: a→T(1+N%3), b→T(2+N%3), etc.
-		 * At 3200bps (2 phases): similar with 2-phase mapping.
-		 * At 1600bps: all time BIWs in phase A, >2 allowed
-		 * if BIW slots are available.
-		 * Currently all time BIWs go in every phase — correct
-		 * for 1600bps but over-emits for multi-phase modes. */
-		/* Capture current time once for all time-related BIWs.
-		 * Used by Date (BIW3), Time (BIW4), and SysInfo timezone. */
-		if (params->biw_time || (params->timezone_code >= 0 &&
-					 params->timezone_code < (int)FLEX_TZ_ENTRIES)) {
-			biw_now = time(NULL);
-			if (params->timezone_code >= 0)
-				localtime_r(&biw_now, &biw_tm);
-			else
-				gmtime_r(&biw_now, &biw_tm);
-			biw_tm_valid = 1;
-		}
-
-		if (params->biw_time && biw_tm_valid) {
+		 * TODO §6.1.1.3 Note 1: Time-related BIW rotation
+		 * across phases in multi-phase modes. */
+		if (params->biw_datetime && params->biw_is_time_frame) {
 			if (slots_left > 0) {
-				int real_year = biw_tm.tm_year + 1900;
-				int equiv = flex_biw_equiv_year(real_year);
-				uint32_t year_field = (uint32_t)(equiv - FLEX_BIW_DATE_YEAR_BASE);
 				frame_words[fwc++] = flex_create_biw3(
-					year_field,
-					(uint32_t)(biw_tm.tm_mon + 1),
-					(uint32_t)biw_tm.tm_mday);
+					params->biw_year,
+					params->biw_month,
+					params->biw_day);
 				slots_left--;
 				LOGP(DFLEX, LOGL_INFO,
-				     "TX: BIW DATE %04d-%02d-%02d (year field=%u%s)\n",
-				     real_year,
-				     biw_tm.tm_mon + 1,
-				     biw_tm.tm_mday,
-				     year_field,
-				     (equiv != real_year) ? " equiv" : "");
+				     "TX: BIW DATE year_field=%u month=%u day=%u\n",
+				     params->biw_year,
+				     params->biw_month,
+				     params->biw_day);
 			}
 			if (slots_left > 0) {
-				uint32_t sec_step = (uint32_t)(biw_tm.tm_sec / 7.5);
-				if (sec_step > 7) sec_step = 7;
 				frame_words[fwc++] = flex_create_biw4(
-					(uint32_t)biw_tm.tm_hour,
-					(uint32_t)biw_tm.tm_min,
-					sec_step);
+					params->biw_hour,
+					params->biw_minute,
+					params->biw_second);
 				slots_left--;
 				LOGP(DFLEX, LOGL_INFO,
-				     "TX: BIW TIME %02d:%02d:%04.1f\n",
-				     biw_tm.tm_hour,
-				     biw_tm.tm_min,
-				     sec_step * FLEX_BIW_TIME_SECOND_STEP);
+				     "TX: BIW TIME %02u:%02u:%04.1f\n",
+				     params->biw_hour,
+				     params->biw_minute,
+				     (double)params->biw_second * FLEX_BIW_TIME_SECOND_STEP);
 			}
 		}
 
-		/* SysInfo BIW101 — system message or timezone.
+		/* SysInfo BIW101 — system message or timezone/DST.
 		 *
-		 * Only one type 101 word per phase per spec:
-		 * "The transmission of a System Message by Block
-		 * Information Word 101 must be one time per each phase."
-		 *
-		 * Priority: system message A-type (0000-0011) takes
-		 * precedence over timezone (A=0100) when both are
-		 * configured, since the system message requires the
-		 * BIW101 to be present per method (b) (Fig. 3.7.2-2).
-		 * Timezone can be transmitted in other frames. */
+		 * Only one type 101 word per phase per spec.
+		 * System message A-type (0000-0011) takes precedence
+		 * over timezone (A=0100). */
 		if (slots_left > 0 &&
 		    params->sysmsg_a_type >= 0 &&
 		    params->sysmsg_a_type <= 3) {
-			/* Method (b): BIW101 with A=0000~0011 alongside
-			 * Operator Messaging Address (§3.9.2, Fig. 3.7.2-2).
-			 * I-field is reserved (0) for A=0000~0011. */
 			frame_words[fwc++] = flex_create_biw_sysinfo(
 				(uint32_t)params->sysmsg_a_type, 0);
 			slots_left--;
@@ -3676,36 +3642,30 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			     flex_biw_sysinfo_a_name(
 				     (uint32_t)params->sysmsg_a_type));
 		} else if (slots_left > 0 &&
-			   params->timezone_code >= 0 &&
-			   params->timezone_code < (int)FLEX_TZ_ENTRIES) {
-			int tz_min = flex_tz_to_minutes((uint32_t)params->timezone_code);
-			char tzbuf[20];
-			uint32_t tz_info = (uint32_t)params->timezone_code & FLEX_BIW_SYSINFO_TZ_MASK;
+			   params->biw_sysinfo && params->biw_is_sysinfo_frame) {
+			uint32_t tz_info = (uint32_t)params->biw_tz_code & FLEX_BIW_SYSINFO_TZ_MASK;
 
-			/* DST flag (L0): auto-detect from system time.
-			 * Spec: L0=0 means DST active, L0=1 means standard time. */
-			if (biw_tm_valid) {
-				if (biw_tm.tm_isdst <= 0)
-					tz_info |= (1U << FLEX_BIW_SYSINFO_DST_SHIFT);
-				/* Extended seconds (S5-S3): fine sub-step within
-				 * the 7.5s coarse step from BIW4.
-				 * 6-bit combined = floor(sec / 0.9375).
-				 * S2-S0 (BIW4) = combined >> 3 (coarse 7.5s).
-				 * S5-S3 (here) = combined & 7 (fine 0.9375s). */
-				{
-					uint32_t combined = (uint32_t)(biw_tm.tm_sec / 0.9375);
-					if (combined > 63) combined = 63;
-					tz_info |= ((combined & 7) << FLEX_BIW_SYSINFO_EXTSEC_SHIFT);
-				}
-			}
+			/* DST flag (L0): L0=1 standard time, L0=0 DST. */
+			if (params->biw_dst)
+				tz_info |= (1U << FLEX_BIW_SYSINFO_DST_SHIFT);
+
+			/* Extended seconds (S5-S3): additive fine sub-step. */
+			tz_info |= ((params->biw_ext_seconds & FLEX_BIW_SYSINFO_EXTSEC_MASK)
+				    << FLEX_BIW_SYSINFO_EXTSEC_SHIFT);
 
 			frame_words[fwc++] = flex_create_biw_sysinfo(
 				FLEX_BIW_SYSINFO_A_TIME, tz_info);
 			slots_left--;
-			LOGP(DFLEX, LOGL_INFO,
-			     "TX: BIW SYSINFO timezone zone=%d (%s)\n",
-			     params->timezone_code,
-			     flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)));
+			{
+				int tz_min = flex_tz_to_minutes((uint32_t)params->biw_tz_code);
+				char tzbuf[20];
+				LOGP(DFLEX, LOGL_INFO,
+				     "TX: BIW SYSINFO timezone zone=%d (%s) DST=%d ext_sec=%u\n",
+				     params->biw_tz_code,
+				     flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
+				     params->biw_dst,
+				     params->biw_ext_seconds);
+			}
 		}
 
 		/* Channel Setup (A-type 0x06).
@@ -3715,19 +3675,14 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 		if (slots_left > 0 && params->chan_setup_enabled &&
 		    params->frame <= 3) {
 			uint32_t info = 0;
-			/* Frame offset: derived from collapse and current frame number */
 			uint32_t frame_ofs = params->collapse > 0
 				? (params->frame % (1U << params->collapse)) : 0;
 			info |= (frame_ofs & FLEX_BIW_SYSINFO_FRAME_OFS_MASK);
-			/* Carry-on: reuse existing carry_on field from params */
 			info |= ((params->carry_on & FLEX_BIW_SYSINFO_CARRY_ON_MASK)
 				 << FLEX_BIW_SYSINFO_CARRY_ON_SHIFT);
-			/* N0: set if current frame contains a NID system message */
 			int has_nid_sysmsg = 0;
 			if (has_nid_sysmsg)
 				info |= (1U << FLEX_BIW_SYSINFO_NID_BIT);
-			/* B0: set if current frame contains a system message.
-			 * Now derived from sysmsg_a_type (method (b)). */
 			int has_sysmsg = (params->sysmsg_a_type >= 0 &&
 					  params->sysmsg_a_type <= 3) ? 1 : 0;
 			if (has_sysmsg)
@@ -4782,22 +4737,36 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 			phases[target_phase].word_count = FLEX_WORDS_PER_FRAME;
 		}
 
-		/* Fill remaining phases with idle pattern.
-		 * For 4FSK, LSB phases get all-zeros; MSB phases alternate.
-		 * Idle words must be block-interleaved just like message data,
-		 * because the phase interleaver operates on interleaved words
-		 * and the receiver de-interleaves blocks per-phase. */
+		/* Fill remaining phases with proper idle frames.
+		 * Each phase needs its own BIW1 (+ extra BIW words like
+		 * SSID1/SSID2/Date/Time) so the receiver can decode the
+		 * phase independently.  Reuse flex_encode_frame_multi with
+		 * msg_count=0 which produces BIW + idle fill + block
+		 * interleaving — identical to the target phase path. */
 		for (p = 0; p < num_phases; p++) {
+			int idle_err = 0;
 			if (p == target_phase)
 				continue;
-			flex_fill_idle_phase(phases[p].words, p,
-					     params->modulation_type,
-					     params->bitrate);
-			/* Block-interleave the idle phase */
+			phase_params.phase_index = p;
+			full_len = flex_encode_frame_multi(NULL, 0, &phase_params,
+							   tmp, sizeof(tmp),
+							   NULL, &idle_err);
+			if (full_len == 0 || idle_err) {
+				LOGP(DFLEX, LOGL_ERROR,
+				     "TX: idle phase %d encode failed: len=%zu err=%d\n",
+				     p, full_len, idle_err);
+				return 0;
+			}
 			{
-				int blk;
-				for (blk = 0; blk < FLEX_BLOCKS_PER_FRAME; blk++)
-					flex_interleave_block(blk, phases[p].words);
+				uint8_t *dp = tmp + sync_overhead;
+				for (w = 0; w < FLEX_WORDS_PER_FRAME; w++) {
+					phases[p].words[w] =
+						((uint32_t)dp[0] << 24) |
+						((uint32_t)dp[1] << 16) |
+						((uint32_t)dp[2] << 8) |
+						 (uint32_t)dp[3];
+					dp += 4;
+				}
 			}
 			phases[p].word_count = FLEX_WORDS_PER_FRAME;
 		}

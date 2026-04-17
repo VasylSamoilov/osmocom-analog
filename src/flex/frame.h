@@ -454,6 +454,12 @@ static inline const char *flex_smsg_type_name(uint32_t t)
  *
  * Per §6.1.1: "On RF channels supporting SSID Roaming,
  * BIW 000 (SSID1) must be transmitted in every Frame."
+ *
+ * Enabled by --biw-ssid1 <localid,coverageid>.
+ * Not transmitted unless explicitly set.
+ * When --roaming is also set, SSID1 is mandatory in every frame.
+ * SSID1 occupies one BIW slot in every frame, including Frame 0
+ * Cycle 0 where it coexists with Time (010).
  */
 #define FLEX_BIW_SSID1_COVERAGE_SHIFT	7
 #define FLEX_BIW_SSID1_COVERAGE_MASK	0x1F	/* CZ: 5 bits, 32 zones per LID */
@@ -632,42 +638,61 @@ static inline int flex_tz_auto_detect(void)
 	return (int)code;
 }
 
-/* ===== BIW Type 001: Date =====
+/* ===== BIW Type 001: Date (§2.5.1, Table 2-5) =====
  *
- * Month, day, year.
+ * Month/Day/Year Block Information Word.
  * Layout (BIW type 001, 21 data bits):
- *   bits 7-11:  year (Y4-Y0, 5 bits, 00000-11111, 1994-2025)
+ *   bits 4-6:   type = 001
+ *   bits 7-11:  year (Y4-Y0, 5 bits, modulo arithmetic)
+ *               00000-11111 → 1994-2025, 2026-2057, 2058-2089, etc.
+ *               Encoding: year_field = (year - 1994) % 32
+ *               With --retro-time: calendar-equivalent year in 1994-2025
+ *               (matching leap year + Jan 1 weekday for old pagers).
  *   bits 12-16: day (d4-d0, 5 bits, 00001-11111, 1-31)
  *   bits 17-20: month (m3-m0, 4 bits, 0001-1100, Jan-Dec)
  *
  * Date, Time and Time Zone based on the Standard time in each region
- * are transmitted by BIW 001, 010 and 101 respectively.  To display
- * or update the data more frequently, the information can be
- * transmitted in other Frames.
+ * are transmitted by BIW 001, 010 and 101 respectively.
+ *
+ * Enabled by --biw-datetime.  Not transmitted unless explicitly set.
  */
 #define FLEX_BIW_DATE_YEAR_SHIFT	7
 #define FLEX_BIW_DATE_YEAR_MASK		0x1F
-#define FLEX_BIW_DATE_YEAR_BASE		1994
+#define FLEX_BIW_DATE_YEAR_BASE		1994	/* 32-year modulo base */
+#define FLEX_BIW_DATE_YEAR_WRAP		32	/* modulo period */
 #define FLEX_BIW_DATE_DAY_SHIFT		12
 #define FLEX_BIW_DATE_DAY_MASK		0x1F
 #define FLEX_BIW_DATE_MONTH_SHIFT	17
 #define FLEX_BIW_DATE_MONTH_MASK	0x0F
 
-/* ===== BIW Type 010: Time =====
+/* ===== BIW Type 010: Time (§2.5.2, Table 2-6) =====
  *
- * Hour, minute, second.
+ * Second/Minute/Hour Block Information Word.
  * Layout (BIW type 010, 21 data bits):
- *   bits 7-11:  hour (h4-h0, 5 bits, 00000-10111, 0-23)
- *   bits 12-17: minute (m5-m0, 6 bits, 000000-111011, 0-59)
- *   bits 18-20: second (s2-s0, 3 bits, 000-111, 1/8 minute = 7.5s steps)
+ *   bits 4-6:   type = 010
+ *   bits 7-11:  hour (H4-H0, 5 bits, 00000-10111, 0-23)
+ *   bits 12-17: minute (M5-M0, 6 bits, 000000-111011, 0-59)
+ *   bits 18-20: second (S2-S0, 3 bits, coarse 1/8 minute = 7.5s steps)
+ *               000-111 → 0.0s through 52.5s
  *
- * The synchronization to the real time is based on the rising edge
- * of the 1st bit of the Bit Sync 1 of the Frame 0 for the Cycle
- * which contains that Frame.  (In the case of multiple transmission,
- * the Frame first transmission is done.)
+ * Per §2.5: "The time transmitted is the local time for the
+ * transmitted time zone and refers to the actual time at the
+ * leading edge of the first bit of Sync 1 of Frame 0 of the
+ * current cycle."
  *
- * The Second field can be extended to 1/64 minute (0.9375s) resolution
- * by the S5-S3 field in BIW SysInfo type 101 (A=0100 or A=0101).
+ * Time values are calculated from frame position within the hour,
+ * not from wall clock at encoding time.
+ *
+ * The coarse Second field (S2-S0) can be refined to ~1s resolution
+ * by the S5-S3 field in BIW SysInfo type 101 (A=0100 or A=0101):
+ *   total_seconds = (S2S1S0 * 7.5) + (S5S4S3 * 60/64)
+ *
+ * Enabled by --biw-datetime.  Not transmitted unless explicitly set.
+ *
+ * Transmission schedule:
+ *   - Mandatory at Frame 0 Cycle 0 (top-of-hour sync point).
+ *   - Periodic every max(16, 2^collapse) frames (~30s or collapse-aligned).
+ *   - At F0C0, Time has highest BIW slot priority.
  */
 #define FLEX_BIW_TIME_HOUR_SHIFT	7
 #define FLEX_BIW_TIME_HOUR_MASK		0x1F
@@ -677,11 +702,19 @@ static inline int flex_tz_auto_detect(void)
 #define FLEX_BIW_TIME_SECOND_MASK	0x07
 #define FLEX_BIW_TIME_SECOND_STEP	7.5	/* each unit = 7.5 seconds */
 
-/* ===== BIW Type 101: System Information =====
+/* Time transmission interval in frames (30 seconds at 1.875s/frame).
+ * Adjusted upward for collapse > 4 to align with pager wake cycle. */
+#define FLEX_BIW_TIME_INTERVAL_BASE	16
+
+/* ===== BIW Type 101: System Information (§2.5.3, Table 2-7) =====
  *
- * System messages, timezone, DST, and extended seconds.
- *   bits 7-10:  A3-A0 (4 bits, system message type — see A values below)
- *   bits 11-20: I9-I0 (10 bits, system info data — layout depends on A)
+ * Accurate Seconds / Daylight Savings Time / Time Zone.
+ * Also used for system messages and channel setup (non-time A-types).
+ *
+ * Layout (BIW type 101, 21 data bits):
+ *   bits 4-6:   type = 101
+ *   bits 7-10:  A3-A0 (4 bits, sub-type selector)
+ *   bits 11-20: I9-I0 (10 bits, data — layout depends on A)
  *
  * A3-A0 values:
  *   0000 = System Message for all subscriber units
@@ -693,15 +726,22 @@ static inline int flex_tz_auto_detect(void)
  *   0110 = Channel Set Up Instruction
  *   0111-1111 = Reserved
  *
- * For A=0100 and A=0101 (time-related), the I field is structured as:
- *   I9-I7 (3 bits): S5-S3 extended Second field (0-7, 1/64 minute
- *                   = 0.9375s steps).  Extends the 3-bit Second field
- *                   in BIW Time word (type 010) for finer resolution.
- *   I6    (1 bit):  reserved
- *   I5    (1 bit):  L0 Day Light Saving Time flag.
- *                   L0=0: transmitted time is Day Light Saving Time.
- *                   L0=1: transmitted time is standard time.
- *   I4-I0 (5 bits): Z4-Z0 Time Zone code (5-bit zone code, 0-31).
+ * Note (§2.5.3): "When the s3 s2 s1 s0 field is set to 0100 or 0101,
+ * the other s4 through s13 are defined as [time-related]. The system
+ * messages with the s3 s2 s1 s0 field set to some other value do not
+ * contain time-related information."
+ *
+ * For A=0100 and A=0101 (time-related), the I field is:
+ *   I9-I7 (3 bits): S5-S3 Accurate Seconds — additive refinement to
+ *                   the coarse S2-S0 from BIW Time (type 010).
+ *                   Total seconds = (S2S1S0 × 7.5) + (S5S4S3 × 60/64).
+ *                   Provides ~1 second resolution.
+ *   I6    (1 bit):  reserved (0)
+ *   I5    (1 bit):  L0 Daylight Savings Time flag.
+ *                   L0=1: transmitted time is Local Standard Time.
+ *                   L0=0: transmitted time is Daylight Savings Time.
+ *   I4-I0 (5 bits): Z4-Z0 Time Zone code (5-bit, 0-31, Table 2-8).
+ *                   Offset from GMT for local standard time.
  *
  * For A=0110 (Channel Set Up Instruction), the I field is:
  *   I9    (1 bit):  B0 System Message Bit (1=channel supports SysMsg)
@@ -717,6 +757,10 @@ static inline int flex_tz_auto_detect(void)
  * - Tone-Only addresses cannot be in frames carrying System Messages.
  * - At least 1 time-related BIW (001, 010, or 101) must be in each
  *   phase of Frame 0 Cycle 0.
+ *
+ * Enabled by --biw-sysinfo.  Not transmitted unless explicitly set.
+ * Never co-located with Date/Time in the same frame — follows 1-3
+ * frames behind the Date/Time frame.
  */
 #define FLEX_BIW_SYSINFO_A_SHIFT	7
 #define FLEX_BIW_SYSINFO_A_MASK		0x0F
@@ -775,6 +819,10 @@ static inline int flex_tz_auto_detect(void)
  * BIW 111 (SSID2) must be transmitted in Frame 0 through Frame 3."
  * "If channels are shared or mixed on one channel, transmission
  * of Frame 0 through Frame 3 must not be blocked."
+ *
+ * Enabled by --biw-ssid2 <country_code,tmf>.
+ * Not transmitted unless explicitly set.
+ * When --roaming is also set, SSID2 is mandatory in frames 0-3.
  */
 #define FLEX_BIW_SSID2_TMF_SHIFT	7
 #define FLEX_BIW_SSID2_TMF_MASK		0x0F	/* TMF: 4 bits, 4 channels */
@@ -840,14 +888,29 @@ static inline int flex_biw_sysinfo_is_sysmsg(uint32_t a_type)
 	return (a_type <= FLEX_BIW_SYSINFO_A_TIME) ? 1 : 0;
 }
 
-/* ===== BIW Date Year Equivalence (for years >2025) =====
+/* ===== BIW Date Year Encoding =====
  *
- * The standard's 5-bit year field covers 1994-2025.  For years beyond
- * 2025, find a calendar-equivalent year in range: same leap/non-leap
- * status AND same Jan 1 weekday, so pagers display correct day-of-week.
+ * Per §2.5.1: "Y: Year field. This represents the year with modulo
+ * arithmetic (00000 through 11111 binary), representing 1994 through
+ * 2025, 2026 through 2057, etc."
+ *
+ * Default encoding: year_field = (year - 1994) % 32
+ * This is correct per spec — the pager knows which 32-year era it's in.
+ *
+ * --retro-time mode: find a calendar-equivalent year in 1994-2025
+ * (same leap/non-leap AND same Jan 1 weekday) so old pagers that
+ * assume era 0 still display the correct day-of-week.
  * E.g. 2026 (Thu Jan 1, non-leap) → 2015 (Thu Jan 1, non-leap).
  *
  * Tomohiko Sakamoto's algorithm for day-of-week (no mktime needed). */
+
+/* Simple modulo year encoding (default, per spec §2.5.1). */
+static inline uint32_t flex_biw_year_field(int year)
+{
+	return (uint32_t)((year - FLEX_BIW_DATE_YEAR_BASE) % FLEX_BIW_DATE_YEAR_WRAP)
+	       & FLEX_BIW_DATE_YEAR_MASK;
+}
+
 static inline int flex_biw_is_leap(int y)
 {
 	return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
@@ -860,6 +923,7 @@ static inline int flex_biw_jan1_dow(int y)
 }
 
 /* Map any year to a calendar-equivalent year in 1994-2025.
+ * Used only in --retro-time mode for old pagers that assume era 0.
  * Returns the original year if already in range. */
 static inline int flex_biw_equiv_year(int year)
 {
@@ -884,7 +948,9 @@ static inline int flex_biw_equiv_year(int year)
 }
 
 /* Reverse: given a decoded BIW year (1994-2025), find the real year
- * closest to sys_year that is calendar-equivalent. */
+ * closest to sys_year that is calendar-equivalent.
+ * Used only for --retro-time reverse mapping.  Normal decode uses
+ * modulo arithmetic (era detection from system clock) instead. */
 static inline int flex_biw_real_year(int biw_year, int sys_year)
 {
 	int y;
@@ -2044,15 +2110,48 @@ typedef struct flex_frame_msg {
 typedef struct flex_frame_params {
 	uint32_t	cycle;			/* FIW cycle (0-14) */
 	uint32_t	frame;			/* FIW frame (0-127) */
-	uint32_t	roaming;		/* FIW roaming flag n */
+	uint32_t	roaming;		/* FIW roaming flag n (set by --roaming) */
 	int		collapse;		/* BIW1 collapse value (0-7) */
 	int		carry_on;		/* BIW1 carry-on (0-3 frames) */
-	int		biw_time;		/* include BIW3/BIW4 time broadcast */
+
+	/* --biw-datetime: Date (001) + Time (010) broadcast.
+	 * Time values are pre-calculated from frame position, not wall clock.
+	 * 0 = disabled (default), 1 = enabled. */
+	int		biw_datetime;
+
+	/* Pre-calculated time values for this frame (set by scheduler).
+	 * Only valid when biw_datetime=1 and this frame is a time TX frame. */
+	uint32_t	biw_year;		/* year field: (year-1994)%32 or equiv year */
+	uint32_t	biw_month;		/* 1-12 */
+	uint32_t	biw_day;		/* 1-31 */
+	uint32_t	biw_hour;		/* 0-23 */
+	uint32_t	biw_minute;		/* 0-59 */
+	uint32_t	biw_second;		/* 0-7 (coarse, 7.5s steps) */
+	int		biw_is_time_frame;	/* 1 = this frame should carry Date/Time BIWs */
+
+	/* --biw-sysinfo: SysInfo (101, A=0100) timezone/DST broadcast.
+	 * 0 = disabled (default), 1 = enabled.
+	 * Never in same frame as Date/Time — follows 1-3 frames behind. */
+	int		biw_sysinfo;
+	int		biw_tz_code;		/* timezone zone code (0-31) */
+	int		biw_dst;		/* DST flag: 0=DST active, 1=standard time */
+	uint32_t	biw_ext_seconds;	/* S5-S3 accurate seconds (0-7), additive to coarse */
+	int		biw_is_sysinfo_frame;	/* 1 = this frame should carry SysInfo BIW */
+
+	/* --biw-ssid1 <localid,coverageid>: SSID1 (000) broadcast.
+	 * 0 = disabled (default), 1 = enabled.
+	 * When enabled, transmitted in every frame per §6.1.1. */
+	int		biw_ssid1;
 	uint32_t	local_id;		/* SSID1 LID — Local channel ID (9 bits, 0-511) */
 	uint32_t	coverage_id;		/* SSID1 CZ — Coverage Zone (5 bits, 0-31) */
+
+	/* --biw-ssid2 <country_code,tmf>: SSID2 (111) broadcast.
+	 * 0 = disabled (default), 1 = enabled.
+	 * When enabled, transmitted in frames 0-3 per §6.1.1. */
+	int		biw_ssid2;
 	uint32_t	country_code;		/* SSID2 CC — Country Code (10 bits, ITU-T E.212) */
 	uint32_t	tmf;			/* SSID2 TMF — Traffic Management Flag (4 bits) */
-	int		timezone_code;		/* SysInfo timezone zone code (0-31, -1=none) */
+
 	int		bitrate;		/* bit rate: 1600, 3200, or 6400 (bps, not baud) */
 	int		modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */
 	int		charset;		/* 0 = ASCII, 1 = KANJI */
