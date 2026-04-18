@@ -26,13 +26,16 @@ enum rx_state {
  * value, the result is flagged as uncertain. */
 #define GSC_GUESS_UNCERTAIN_THRESHOLD 10
 
+#define MAX_ADB		32	/* 256 characters (protocol uses continuation bit, no fixed limit) */
+#define MAX_NDB		2	/* 24 digits */
+
 /* instance of decoded (received) message */
 typedef struct gsc_rx_msg {
 	/* --- existing fields (unchanged) --- */
 	char			address[8];		/* 7-digit functional address + NUL */
 	int			address_number;		/* 1-4 */
 	enum gsc_msg_type	type;			/* winner type: TYPE_ALPHA or TYPE_NUMERIC */
-	char			data[256];		/* winner's decoded message (for backward compat) */
+	char			data[MAX_ADB * 8 + 1];		/* winner's decoded message (for backward compat) */
 	int			preamble_index;		/* 0-9 */
 	int			error_count;		/* corrected errors (Golay/BCH succeeded with corrections) */
 	int			uncorrectable_count;	/* uncorrectable errors (BCH decode failed entirely) */
@@ -40,8 +43,8 @@ typedef struct gsc_rx_msg {
 	int			polarity_inverted;	/* 1 = received with inverted polarity */
 
 	/* --- new fields for dual-decode guess mode --- */
-	char			alpha_data[256];	/* alpha interpretation string */
-	char			numeric_data[256];	/* numeric interpretation string */
+	char			alpha_data[MAX_ADB * 8 + 1];	/* alpha interpretation string */
+	char			numeric_data[MAX_NDB * 12 + 1];	/* numeric interpretation string */
 	int			alpha_score;		/* content score for alpha interpretation */
 	int			numeric_score;		/* content score for numeric interpretation */
 	int			alpha_fill;		/* trailing fill count in alpha decode */
@@ -51,13 +54,10 @@ typedef struct gsc_rx_msg {
 	int			guess_method;		/* 0 = fill-count, 1 = content-score */
 
 	/* raw nibble array for numeric scoring (before character mapping) */
-	uint8_t			numeric_nibbles[256];	/* raw 4-bit nibbles */
+	uint8_t			numeric_nibbles[MAX_NDB * 12 + 1];	/* raw 4-bit nibbles */
 	int			numeric_nibble_count;	/* number of nibbles decoded */
 } gsc_rx_msg_t;
 
-
-#define MAX_ADB		10	/* 80 characters */
-#define MAX_NDB		2	/* 24 digits */
 
 /* instance of outgoing message */
 typedef struct gsc_msg {
@@ -107,7 +107,7 @@ typedef struct gsc {
 	const char		*default_message;
 
 	/* current trasmitting message */
-	uint8_t			bit[4096];
+	uint8_t			bit[16384];
 	int			bit_num;
 	int			bit_ac;			/* where activation code starts (voice only). */
 	int			bit_index;		/* when playing out */
@@ -142,7 +142,7 @@ typedef struct gsc {
 	int			rx_polarity_inverted;	/* 1 = current batch uses inverted polarity */
 
 	/* RX bit buffer (mirrors TX bit buffer) */
-	uint8_t			rx_bit[8192];		/* received bit buffer */
+	uint8_t			rx_bit[16384];		/* received bit buffer */
 	int			rx_bit_num;		/* number of bits received */
 	int			rx_bit_index;		/* current decode position */
 

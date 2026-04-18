@@ -1328,7 +1328,7 @@ static void deinterleave_bch(const uint8_t *bits, int *pos, uint16_t bch[8])
  * Returns a static buffer — not reentrant, use immediately. */
 static const char *log_escape(const char *s)
 {
-	static char buf[512];
+	static char buf[MAX_ADB * 8 * 2 + 1];
 	int i = 0;
 	while (*s && i < (int)sizeof(buf) - 3) {
 		if (*s == '\n') { buf[i++] = '\\'; buf[i++] = 'n'; }
@@ -2043,11 +2043,12 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 			msg->alpha_data[alpha_pos] = '\0';
 
-			/* Track why the loop exited with contbit still set:
-			 * - hit MAX_ADB limit: the message has more blocks than
-			 *   alpha can represent; this is expected for long numeric
-			 *   messages and should NOT block the decode.
-			 * - broke early (not enough bits): genuinely need more data. */
+			/* Track why the loop exited with contbit still set */
+			if (contbit && !alpha_broke_early) {
+				/* Hit MAX_ADB with contbit still set — message truncated */
+				LOGP(DGOLAY, LOGL_NOTICE, "Alpha message truncated at %d blocks (%d chars), transmitter sent more data.\n",
+					i, alpha_pos);
+			}
 			if (contbit && alpha_broke_early)
 				alpha_need_bits = 1;
 		}

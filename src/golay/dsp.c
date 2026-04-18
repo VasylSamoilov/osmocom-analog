@@ -870,11 +870,11 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 	 *    longest possible GSC batch without a successful decode, the
 	 *    signal is garbage — give up and return to idle. This prevents
 	 *    sitting in RX_DATA indefinitely on bad reception.
-	 *    Max batch: preamble(856) + start(121) + 16*address(1936)
-	 *    + 10*alpha(1210) + activation(121) + tone(968) ≈ 4000 bits.
-	 *    Use 4096 as a round safety limit. */
+	 *    Max batch: preamble(856) + start(121) + 2 * [address(121)
+	 *    + 32*alpha(3872)] = ~8962 bits for a 2-address batch.
+	 *    Use 16384 as a practical limit. */
 	{
-		const int max_batch_bits = 4096;
+		const int max_batch_bits = 16384;
 		int do_decode = 0;
 		int trim_trailing = 0;
 		int force_reset = 0;
