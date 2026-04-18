@@ -161,6 +161,12 @@ typedef struct gsc {
 	int			rx_shift_count;		/* total bits shifted in (saturates at 46) */
 	int			rx_no_transition;	/* consecutive same-value bits (end-of-TX detect) */
 
+	/* Preamble-during-DATA tracking: require multiple consecutive
+	 * matches before interrupting an active decode. */
+	int			rx_data_preamble_idx;	/* candidate preamble index */
+	int			rx_data_preamble_inv;	/* candidate polarity */
+	int			rx_data_preamble_count;	/* consecutive matches */
+
 	/* RX preamble confirmation phase:
 	 * After the first preamble hit in RX_IDLE, we enter RX_PREAMBLE
 	 * and collect additional 46-bit codewords. We require

@@ -767,45 +767,46 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 		gsc->rx_no_transition = 0;
 
 	/* Scan for new preamble in parallel with data accumulation.
-	 * If a new transmission starts while we're still in RX_DATA
-	 * (e.g. back-to-back pages), we detect it here, force-decode
-	 * the old message, and start confirming the new preamble.
-	 *
-	 * Only start scanning after we've passed the preamble region
-	 * of the current message (856 bits = 28 comma + 18×46 codewords),
-	 * otherwise we'd false-trigger on our own preamble codewords. */
+	 * Requires PREAMBLE_LOCK_THRESHOLD consecutive matches (same as
+	 * the IDLE path) to avoid false-triggering on data content that
+	 * accidentally matches a preamble codeword. */
 	if (gsc->rx_bit_num > 856) {
 		gsc->rx_shift[gsc->rx_shift_count % 46] = bit;
 		gsc->rx_shift_count++;
 
 		if (gsc->rx_shift_count >= 46) {
-			/* We have a fresh 46-bit window — check for preamble.
-			 * Try both normal and inverted polarity, since the new
-			 * transmission may use either. */
 			uint32_t codeword = resolve_shift_register(gsc->rx_shift);
 			uint16_t decoded;
+			int new_idx = -1;
 			int new_inverted = 0;
 
 			gsc->rx_shift_count = 0;
 
-			if (decode_golay(codeword, &decoded) == 0 && match_preamble(decoded) >= 0) {
-				new_inverted = 0;
-			} else if (decode_golay(codeword ^ 0x7FFFFF, &decoded) == 0 && match_preamble(decoded) >= 0) {
-				new_inverted = 1;
-			} else {
-				goto scan_done;
+			if (decode_golay(codeword, &decoded) == 0)
+				new_idx = match_preamble(decoded);
+			if (new_idx < 0 && decode_golay(codeword ^ 0x7FFFFF, &decoded) == 0) {
+				new_idx = match_preamble(decoded);
+				if (new_idx >= 0)
+					new_inverted = 1;
 			}
 
-			{
-				int idx = match_preamble(decoded);
-				/* New preamble detected while buffering data.
-				 * Force-decode whatever we have for the old
-				 * message (minus the 46 preamble bits we just
-				 * consumed), then start confirming the new one. */
-				int old_bits = gsc->rx_bit_num - 46;
+			if (new_idx >= 0 && new_idx == gsc->rx_data_preamble_idx) {
+				gsc->rx_data_preamble_count++;
+			} else if (new_idx >= 0) {
+				gsc->rx_data_preamble_idx = new_idx;
+				gsc->rx_data_preamble_inv = new_inverted;
+				gsc->rx_data_preamble_count = 1;
+			} else {
+				gsc->rx_data_preamble_count = 0;
+			}
 
-				LOGP_CHAN(DDSP, LOGL_INFO, "RX: new preamble (index %d, polarity %s) detected during DATA, force-decoding old batch (%d bits).\n",
-					idx, new_inverted ? "inverted" : "normal", old_bits);
+			if (gsc->rx_data_preamble_count >= PREAMBLE_LOCK_THRESHOLD) {
+				int idx = gsc->rx_data_preamble_idx;
+				int inv = gsc->rx_data_preamble_inv;
+				int old_bits = gsc->rx_bit_num - gsc->rx_data_preamble_count * 46;
+
+				LOGP_CHAN(DDSP, LOGL_INFO, "RX: new preamble (index %d, %s) confirmed during DATA (%d matches), force-decoding old batch (%d bits).\n",
+					idx, inv ? "inverted" : "normal", gsc->rx_data_preamble_count, old_bits);
 
 				if (old_bits >= (28 + 18 * 46 + 121 + 121)) {
 					memcpy(gsc->bit, gsc->rx_bit, old_bits);
@@ -813,15 +814,13 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 					if (decode_batch(gsc, &msg, 1) == 0) {
 						msg.polarity_inverted = gsc->rx_polarity_inverted;
 						golay_msg_receive(&msg);
-					} else
-						LOGP_CHAN(DDSP, LOGL_INFO, "RX: old batch decode failed.\n");
+					}
 				}
 
-				/* Start confirming the new preamble */
 				gsc->rx_state = RX_PREAMBLE;
 				gsc->rx_confirm_index = idx;
-				gsc->rx_confirm_count = 1;
-				if (new_inverted) {
+				gsc->rx_confirm_count = gsc->rx_data_preamble_count;
+				if (inv) {
 					gsc->rx_batch_candidate = 1;
 					gsc->rx_polarity_inverted = 0;
 				} else {
@@ -832,12 +831,9 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 				gsc->rx_confirm_bit_count = 0;
 				gsc->rx_bit_num = 0;
 				gsc->rx_no_transition = 0;
-
-				LOGP_CHAN(DDSP, LOGL_INFO, "RX state: DATA -> PREAMBLE (new candidate index %d, polarity %s).\n",
-					idx, new_inverted ? "inverted" : "normal");
+				gsc->rx_data_preamble_count = 0;
 				return;
 			}
-		scan_done: ;
 		}
 	}
 
@@ -872,9 +868,11 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 	 *    sitting in RX_DATA indefinitely on bad reception.
 	 *    Max batch: preamble(856) + start(121) + 2 * [address(121)
 	 *    + 32*alpha(3872)] = ~8962 bits for a 2-address batch.
-	 *    Use 16384 as a practical limit. */
+	 *    Use 4096 as a practical limit for individual transmissions.
+	 *    Batch transmissions with multiple addresses are handled by
+	 *    decode_batch's batch continuation logic. */
 	{
-		const int max_batch_bits = 16384;
+		const int max_batch_bits = 4096;
 		int do_decode = 0;
 		int trim_trailing = 0;
 		int force_reset = 0;

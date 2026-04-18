@@ -1472,8 +1472,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		return -1;
 	}
 	if (decoded_value != start_code) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Start code: expected %u, got %u.\n",
-			(unsigned)start_code, decoded_value);
 		return -1;
 	}
 
@@ -1859,11 +1857,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		}
 	}
 
-	LOGP(DGOLAY, LOGL_DEBUG, "Message type detected: %s (%d post-address bits).\n",
-		detected_type == TYPE_VOICE ? "voice" :
-		detected_type == TYPE_ALPHA ? "alpha" :
-		detected_type == TYPE_NUMERIC ? "numeric" : "tone",
-		remaining);
 	/* Assign function suffix per Function Plan "A":
 	 *   Voice:   function 0-3 -> suffix 1-4
 	 *   Alpha:   function 0-3 -> suffix 5-8
@@ -1957,7 +1950,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				for (k = 0; k < 8; k++) {
 					rc = decode_bch(bch_cw[k], &d[k]);
 					if (rc < 0) {
-						LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: BCH[%d] decode failed.\n", i, k);
+						LOGP(DGOLAY, LOGL_DEBUG, "Alpha block %d: BCH[%d] decode failed.\n", i, k);
 						d[k] = 0;
 						msg->uncorrectable_count++;
 						block_ok = 0;
@@ -1968,7 +1961,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				/* If block has failures and previous block didn't confirm
 				 * continuation, stop - can't trust this data. */
 				if (!block_ok && !prev_contbit) {
-					LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: BCH failures and no prior continuation, stopping.\n", i);
+					LOGP(DGOLAY, LOGL_DEBUG, "Alpha block %d: BCH failures and no prior continuation, stopping.\n", i);
 					break;
 				}
 
@@ -1981,7 +1974,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 					checksum &= 0x7f;
 
 					if (checksum != d[7]) {
-						LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: checksum mismatch (0x%02x != 0x%02x).\n",
+						LOGP(DGOLAY, LOGL_DEBUG, "Alpha block %d: checksum mismatch (0x%02x != 0x%02x).\n",
 							i, checksum, d[7]);
 						msg->error_count++;
 					}
@@ -2091,7 +2084,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		 * ============================================================ */
 		{
 			int numeric_pos = 0;
-			int numeric_broke_early = 0; /* 1 = loop broke due to not enough bits */
 			int prev_contbit = 1; /* first block is trusted (address/type confirmed data) */
 			pos = data_start_pos; /* restore position to re-decode as numeric */
 			contbit = 1;
@@ -2103,7 +2095,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				int bch_bad[8] = {0}; /* per-codeword failure flags */
 
 				if (pos + 1 + bch_block_bits > total_bits) {
-					numeric_broke_early = 1;
 					break;
 				}
 
@@ -2118,7 +2109,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				for (k = 0; k < 8; k++) {
 					rc = decode_bch(bch_cw[k], &d[k]);
 					if (rc < 0) {
-						LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: BCH[%d] decode failed.\n", i, k);
+						LOGP(DGOLAY, LOGL_DEBUG, "Numeric block %d: BCH[%d] decode failed.\n", i, k);
 						d[k] = 0;
 						msg->uncorrectable_count++;
 						block_ok = 0;
@@ -2129,7 +2120,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				/* If block has failures and previous block didn't confirm
 				 * continuation, stop - can't trust this data. */
 				if (!block_ok && !prev_contbit) {
-					LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: BCH failures and no prior continuation, stopping.\n", i);
+					LOGP(DGOLAY, LOGL_DEBUG, "Numeric block %d: BCH failures and no prior continuation, stopping.\n", i);
 					break;
 				}
 
@@ -2141,7 +2132,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 					checksum &= 0x7f;
 
 					if (checksum != d[7]) {
-						LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: checksum mismatch (0x%02x != 0x%02x).\n",
+						LOGP(DGOLAY, LOGL_DEBUG, "Numeric block %d: checksum mismatch (0x%02x != 0x%02x).\n",
 							i, checksum, d[7]);
 						msg->error_count++;
 					}
@@ -2209,10 +2200,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 			msg->numeric_data[numeric_pos] = '\0';
 
-			/* (numeric_need_bits tracking removed — we now wait
-			 * based on alpha_need_bits alone, since exceeding
-			 * MAX_NDB implies the message is alpha.) */
-			(void)numeric_broke_early;
 		}
 
 		/* ---- Decide whether to wait for more data or proceed ----
