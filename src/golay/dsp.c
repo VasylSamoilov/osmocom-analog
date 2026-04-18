@@ -234,8 +234,9 @@ static int match_preamble(uint16_t value)
 /* Reset the receiver to idle state, clearing all RX buffers. */
 static void rx_reset_idle(gsc_t *gsc)
 {
-	if (gsc->rx_state != RX_IDLE)
-		LOGP_CHAN(DDSP, LOGL_INFO, "RX state: returning to IDLE.\n");
+	if (gsc->rx_state != RX_IDLE) {
+		/* (no log — this fires constantly on noise) */
+	}
 
 	/* Stop any in-progress voice recording */
 	if (gsc->voice_recording) {
@@ -449,9 +450,6 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 				 * inversion (everything inverted). Set batch_candidate
 				 * instead of polarity_inverted; the start code check
 				 * after preamble lock will disambiguate. */
-				LOGP_CHAN(DDSP, LOGL_INFO, "RX state: IDLE -> PREAMBLE (candidate index %d, polarity %s).\n",
-					idx, inverted ? "inverted" : "normal");
-
 				gsc->rx_confirm_index = idx;
 				gsc->rx_confirm_count = 1;
 				if (inverted) {
@@ -496,7 +494,6 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 
 			if (decode_golay(codeword, &decoded) != 0) {
 				/* Decode failed — not a real preamble */
-				LOGP_CHAN(DDSP, LOGL_INFO, "RX state: PREAMBLE -> IDLE (confirmation failed, decode error).\n");
 				rx_reset_idle(gsc);
 				return;
 			}
@@ -504,8 +501,6 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 			idx = match_preamble(decoded);
 			if (idx != gsc->rx_confirm_index) {
 				/* Different preamble index or not a preamble at all */
-				LOGP_CHAN(DDSP, LOGL_INFO, "RX state: PREAMBLE -> IDLE (confirmation failed, index %d != %d).\n",
-					idx, gsc->rx_confirm_index);
 				rx_reset_idle(gsc);
 				return;
 			}

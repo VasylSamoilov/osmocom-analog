@@ -476,7 +476,7 @@ int decode_golay(uint32_t codeword, uint16_t *data)
 	/* Look up the error pattern for this syndrome */
 	error_pattern = golay_syndrome[syndrome];
 	if (error_pattern == 0xFFFFFFFF) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Golay decode failed: uncorrectable error (syndrome 0x%03x).\n", syndrome);
+		LOGP(DGOLAY, LOGL_DEBUG, "Golay decode failed: uncorrectable error (syndrome 0x%03x).\n", syndrome);
 		return -1;
 	}
 
@@ -511,7 +511,7 @@ int decode_bch(uint16_t codeword, uint8_t *data)
 	/* Look up the error pattern for this syndrome */
 	error_pattern = bch_syndrome[syndrome];
 	if (error_pattern == 0xFFFF) {
-		LOGP(DGOLAY, LOGL_NOTICE, "BCH decode failed: uncorrectable error (syndrome 0x%02x).\n", syndrome);
+		LOGP(DGOLAY, LOGL_DEBUG, "BCH decode failed: uncorrectable error (syndrome 0x%02x).\n", syndrome);
 		return -1;
 	}
 
@@ -1323,6 +1323,23 @@ static void deinterleave_bch(const uint8_t *bits, int *pos, uint16_t bch[8])
  * type cannot be determined from insufficient post-address bits. This
  * is used when the caller knows no more bits will arrive (timeout or
  * end-of-transmission detected). */
+
+/* Escape newlines/CRs in a string for single-line log output.
+ * Returns a static buffer — not reentrant, use immediately. */
+static const char *log_escape(const char *s)
+{
+	static char buf[512];
+	int i = 0;
+	while (*s && i < (int)sizeof(buf) - 3) {
+		if (*s == '\n') { buf[i++] = '\\'; buf[i++] = 'n'; }
+		else if (*s == '\r') { buf[i++] = '\\'; buf[i++] = 'r'; }
+		else buf[i++] = *s;
+		s++;
+	}
+	buf[i] = '\0';
+	return buf;
+}
+
 int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 {
 	const uint8_t *bits = gsc->bit;
@@ -1377,8 +1394,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 * ================================================================ */
 
 	if (pos + comma_len + preamble_reps * dup_bits > total_bits) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Not enough bits for preamble (%d available, %d needed).\n",
-			total_bits - pos, comma_len + preamble_reps * dup_bits);
 		return -1;
 	}
 
@@ -1443,7 +1458,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 * ================================================================ */
 
 	if (pos + comma_len + dup_bits + 1 + dup_bits > total_bits) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Not enough bits for start code.\n");
 		return -1;
 	}
 
@@ -1500,7 +1514,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 * ================================================================ */
 
 	if (pos + comma_len + dup_bits + 1 + dup_bits > total_bits) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Not enough bits for address.\n");
 		return -1;
 	}
 
@@ -1846,12 +1859,11 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		}
 	}
 
-	LOGP(DGOLAY, LOGL_INFO, "Message type detected: %s (%d post-address bits).\n",
+	LOGP(DGOLAY, LOGL_DEBUG, "Message type detected: %s (%d post-address bits).\n",
 		detected_type == TYPE_VOICE ? "voice" :
 		detected_type == TYPE_ALPHA ? "alpha" :
 		detected_type == TYPE_NUMERIC ? "numeric" : "tone",
 		remaining);
-
 	/* Assign function suffix per Function Plan "A":
 	 *   Voice:   function 0-3 -> suffix 1-4
 	 *   Alpha:   function 0-3 -> suffix 5-8
@@ -1882,12 +1894,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	msg->address_number = function + 1;
 	msg->type = detected_type;
 
-	LOGP(DGOLAY, LOGL_INFO, "Address decoded: '%s' (number %d, function %d, type %s).\n",
-		msg->address, msg->address_number, function,
-		detected_type == TYPE_VOICE ? "voice" :
-		detected_type == TYPE_ALPHA ? "alpha" :
-		detected_type == TYPE_NUMERIC ? "numeric" : "tone");
-
 	/* ================================================================
 	 * Stages 4 & 5: DUAL-DECODE DATA BLOCKS
 	 *
@@ -1903,7 +1909,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	if (detected_type == TYPE_ALPHA || detected_type == TYPE_NUMERIC) {
 		int data_start_pos = pos; /* save position for numeric re-decode */
 		int alpha_need_bits = 0;   /* 1 = alpha loop broke due to insufficient bits */
-		int numeric_need_bits = 0; /* 1 = numeric loop broke due to insufficient bits */
 
 		/* ============================================================
 		 * Stage 4: ALPHA DATA BLOCKS
@@ -1933,7 +1938,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				int bch_bad[8] = {0}; /* per-codeword failure flags */
 
 				if (pos + 1 + bch_block_bits > total_bits) {
-					LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: not enough bits.\n", i);
 					alpha_broke_early = 1;
 					break;
 				}
@@ -2035,13 +2039,9 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				 * If block had BCH failures, d[6] is 0 so contbit is garbage
 				 * (will be 0, causing natural loop exit). */
 				prev_contbit = block_ok ? contbit : 0;
-
-				LOGP(DGOLAY, LOGL_DEBUG, "Alpha block %d decoded, contbit=%d, block_ok=%d.\n", i, contbit, block_ok);
 			}
 
 			msg->alpha_data[alpha_pos] = '\0';
-			LOGP(DGOLAY, LOGL_INFO, "Alpha interpretation: '%s' (%d chars, %d fill).\n",
-				msg->alpha_data, alpha_pos, msg->alpha_fill);
 
 			/* Track why the loop exited with contbit still set:
 			 * - hit MAX_ADB limit: the message has more blocks than
@@ -2050,6 +2050,28 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 			 * - broke early (not enough bits): genuinely need more data. */
 			if (contbit && alpha_broke_early)
 				alpha_need_bits = 1;
+		}
+
+		/* If alpha already decoded more chars than numeric can ever
+		 * produce (MAX_NDB * 12 = 24 digits), this is definitively
+		 * alpha. Skip the numeric stage entirely. */
+		if (strlen(msg->alpha_data) > (unsigned)(MAX_NDB * 8)) {
+			/* Wait for more data if alpha isn't done yet */
+			if (alpha_need_bits && !force) {
+				return -1;
+			}
+
+			msg->alpha_score = gsc_score_alpha(msg->alpha_data, strlen(msg->alpha_data), msg->alpha_fill);
+			msg->numeric_score = 0;
+			msg->guess_winner = TYPE_ALPHA;
+			msg->guess_uncertain = 0;
+			msg->type = TYPE_ALPHA;
+			strcpy(msg->data, msg->alpha_data);
+
+			LOGP(DGOLAY, LOGL_INFO, "Discrimination: winner=alpha (message exceeds MAX_NDB blocks, must be alpha), score=%d.\n",
+				msg->alpha_score);
+
+			goto decode_done;
 		}
 
 		/* ============================================================
@@ -2080,7 +2102,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				int bch_bad[8] = {0}; /* per-codeword failure flags */
 
 				if (pos + 1 + bch_block_bits > total_bits) {
-					LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: not enough bits.\n", i);
 					numeric_broke_early = 1;
 					break;
 				}
@@ -2183,50 +2204,47 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 				/* Update prev_contbit: only trust contbit from a clean block. */
 				prev_contbit = block_ok ? contbit : 0;
-
-				LOGP(DGOLAY, LOGL_DEBUG, "Numeric block %d decoded, contbit=%d, block_ok=%d.\n", i, contbit, block_ok);
 			}
 
 			msg->numeric_data[numeric_pos] = '\0';
-			LOGP(DGOLAY, LOGL_INFO, "Numeric interpretation: '%s' (%d chars, %d fill, %d nibbles).\n",
-				msg->numeric_data, numeric_pos, msg->numeric_fill, msg->numeric_nibble_count);
 
-			/* Track why the loop exited with contbit still set (same
-			 * logic as the alpha stage above). */
-			if (contbit && numeric_broke_early)
-				numeric_need_bits = 1;
+			/* (numeric_need_bits tracking removed — we now wait
+			 * based on alpha_need_bits alone, since exceeding
+			 * MAX_NDB implies the message is alpha.) */
+			(void)numeric_broke_early;
 		}
 
 		/* ---- Decide whether to wait for more data or proceed ----
 		 *
-		 * We only return -1 (need more data) if BOTH stages genuinely
-		 * need more bits. If one stage completed (contbit=0) or hit its
-		 * block limit (contbit=1 but i>=MAX), the message data is fully
-		 * available in the bitstream - the other stage just can't
-		 * represent it. Proceed to discrimination.
+		 * If alpha needs more bits, we should keep waiting — alpha
+		 * supports up to MAX_ADB blocks (80 chars) and the message
+		 * may genuinely be that long. The numeric stage hitting its
+		 * MAX_NDB limit (2 blocks / 24 digits) does NOT mean the
+		 * message is complete — it just means numeric can't represent
+		 * more. In fact, if numeric hit its limit with contbit still
+		 * set, the message has more than 2 data blocks, which means
+		 * it's definitely alpha (no numeric message exceeds 2 blocks).
 		 *
-		 * Cases:
-		 *   alpha complete + numeric complete     -> proceed
-		 *   alpha complete + numeric hit limit     -> proceed
-		 *   alpha complete + numeric need bits     -> proceed (alpha is authoritative)
-		 *   alpha hit limit + numeric complete     -> proceed
-		 *   alpha hit limit + numeric hit limit    -> proceed (both maxed out)
-		 *   alpha hit limit + numeric need bits    -> proceed (alpha consumed all blocks)
-		 *   alpha need bits + numeric complete     -> proceed (numeric is authoritative)
-		 *   alpha need bits + numeric hit limit    -> proceed (numeric consumed its blocks)
-		 *   alpha need bits + numeric need bits    -> WAIT (genuinely incomplete)
+		 * Wait if alpha needs more bits, unless forced.
+		 * Only proceed immediately if alpha is complete (contbit=0
+		 * or hit MAX_ADB).
 		 */
-		if (alpha_need_bits && numeric_need_bits && !force) {
-			LOGP(DGOLAY, LOGL_DEBUG, "Both alpha and numeric stages need more data, waiting.\n");
+		if (alpha_need_bits && !force) {
 			return -1;
 		}
 
 		/* ============================================================
 		 * Scoring and discrimination: score both interpretations and
 		 * pick the winner using unified scoring (content + fill).
+		 *
+		 * However, if the message has more data blocks than MAX_NDB
+		 * can hold (i.e. numeric hit its block limit with contbit
+		 * still set), the message is definitively alpha — no valid
+		 * numeric message exceeds 2 blocks (24 digits).
 		 * ============================================================ */
 		msg->alpha_score = gsc_score_alpha(msg->alpha_data, strlen(msg->alpha_data), msg->alpha_fill);
 		msg->numeric_score = gsc_score_numeric(msg->numeric_nibbles, msg->numeric_nibble_count, msg->numeric_fill);
+
 		gsc_discriminate(msg);
 
 		LOGP(DGOLAY, LOGL_INFO, "Discrimination: winner=%s, method=%s, alpha_score=%d, numeric_score=%d, uncertain=%d.\n",
@@ -2326,6 +2344,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 * gsc_rx_msg_t via golay_msg_receive().
 	 * ================================================================ */
 
+decode_done:
 	msg->decode_ok = 1;
 
 	LOGP(DGOLAY, LOGL_INFO, "Batch decode complete: address='%s' type=%s data='%s' errors=%d.\n",
@@ -2333,7 +2352,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		msg->type == TYPE_VOICE ? "voice" :
 		msg->type == TYPE_ALPHA ? "alpha" :
 		msg->type == TYPE_NUMERIC ? "numeric" : "tone",
-		msg->data, msg->error_count);
+		log_escape(msg->data), msg->error_count);
 
 	/* --- Batch continuation: peek ahead for more addresses --- */
 	{
@@ -4842,6 +4861,7 @@ void golay_msg_send(const char *text)
  * For tone-only and voice messages, the existing format is retained:
  *   "<address>,<type>,<polarity>,<data>\n"
  */
+
 void golay_msg_receive(const gsc_rx_msg_t *msg)
 {
 	const char *pol_str = msg->polarity_inverted ? "-" : "+";
@@ -4882,9 +4902,10 @@ void golay_msg_receive(const gsc_rx_msg_t *msg)
 		LOGP(DGOLAY, LOGL_NOTICE, "Received message for address '%s' (%s, polarity=%s):\n",
 			msg->address, status_str, pol_str);
 		LOGP(DGOLAY, LOGL_NOTICE, "  Alpha %s: '%s' (score=%d, fill=%d)\n",
-			alpha_marker, msg->alpha_data, msg->alpha_score, msg->alpha_fill);
-		LOGP(DGOLAY, LOGL_NOTICE, "  Numeric %s: '%s' (score=%d, fill=%d)\n",
-			numeric_marker, msg->numeric_data, msg->numeric_score, msg->numeric_fill);
+			alpha_marker, log_escape(msg->alpha_data), msg->alpha_score, msg->alpha_fill);
+		if (msg->numeric_data[0] || msg->numeric_score)
+			LOGP(DGOLAY, LOGL_NOTICE, "  Numeric %s: '%s' (score=%d, fill=%d)\n",
+				numeric_marker, log_escape(msg->numeric_data), msg->numeric_score, msg->numeric_fill);
 
 		if (msg->guess_uncertain) {
 			delta = msg->alpha_score - msg->numeric_score;
