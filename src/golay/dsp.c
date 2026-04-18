@@ -805,12 +805,13 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 					idx, inv ? "inverted" : "normal", gsc->rx_data_preamble_count, old_bits);
 
 				if (old_bits >= 242) { /* start(121) + address(121) minimum */
-					memcpy(gsc->bit, gsc->rx_bit, old_bits);
-					gsc->bit_num = old_bits;
+					int saved_rx_num = gsc->rx_bit_num;
+					gsc->rx_bit_num = old_bits;
 					if (decode_batch(gsc, &msg, 1) == 0) {
 						msg.polarity_inverted = gsc->rx_polarity_inverted;
 						golay_msg_receive(&msg);
 					}
+					gsc->rx_bit_num = saved_rx_num;
 				}
 
 				gsc->rx_state = RX_PREAMBLE;
@@ -900,12 +901,18 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 					nbits = min_batch_bits;
 			}
 
-			memcpy(gsc->bit, gsc->rx_bit, nbits);
-			gsc->bit_num = nbits;
+			/* Temporarily set rx_bit_num for decode_batch.
+			 * decode_batch reads directly from rx_bit/rx_bit_num
+			 * to avoid clobbering the TX bit[] buffer. */
+			int saved_rx_num = gsc->rx_bit_num;
+			gsc->rx_bit_num = nbits;
 
 			rc = gsc->rx_nbs_locked
 				? decode_nbs(gsc, &msg, force)
 				: decode_batch(gsc, &msg, force);
+
+			gsc->rx_bit_num = saved_rx_num;
+
 			if (rc == 0) {
 				msg.polarity_inverted = gsc->rx_polarity_inverted;
 				golay_msg_receive(&msg);

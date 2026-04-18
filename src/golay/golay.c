@@ -1342,9 +1342,9 @@ static const char *log_escape(const char *s)
 
 int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 {
-	const uint8_t *bits = gsc->bit;
+	const uint8_t *bits = gsc->rx_bit;
 	int pos = 0;
-	int total_bits = gsc->bit_num;
+	int total_bits = gsc->rx_bit_num;
 
 	/* Protocol constants (matching encoder's hardcoded values) */
 	const int comma_len = 28;		/* comma sequence length */
@@ -2867,9 +2867,9 @@ decode_done:
  * Returns 0 on success, -1 on decode failure. */
 int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 {
-	const uint8_t *bits = gsc->bit;
+	const uint8_t *bits = gsc->rx_bit;
 	int pos = 0;
-	int total_bits = gsc->bit_num;
+	int total_bits = gsc->rx_bit_num;
 	const int comma_len = 28;
 	const int dup_bits = 46;
 	const int bch_block_bits = 120;
