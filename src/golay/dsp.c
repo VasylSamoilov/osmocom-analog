@@ -524,24 +524,12 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 				gsc->rx_batch_candidate ? "batch candidate" :
 				gsc->rx_polarity_inverted ? "inverted" : "normal");
 
+			/* Start rx_bit[] empty — don't copy preamble bits.
+			 * The preamble index is already known from confirmation.
+			 * DATA state will fill rx_bit[] starting from the first
+			 * post-confirmation bit. decode_batch() will scan for
+			 * the start code in this buffer. */
 			gsc->rx_bit_num = 0;
-			memset(gsc->rx_bit, 0, 28);
-			gsc->rx_bit_num = 28;
-
-			/* Copy confirmed preamble codeword bits into rx_bit[].
-			 * If polarity is inverted (either batch_candidate or
-			 * confirmed whole-signal inversion), flip each bit so
-			 * decode_batch() sees normal-polarity preamble data. */
-			if (gsc->rx_polarity_inverted || gsc->rx_batch_candidate) {
-				int b;
-				for (b = 0; b < gsc->rx_confirm_count * 46; b++)
-					gsc->rx_bit[gsc->rx_bit_num + b] = !gsc->rx_confirm_bits[b];
-			} else {
-				memcpy(gsc->rx_bit + gsc->rx_bit_num,
-				       gsc->rx_confirm_bits,
-				       gsc->rx_confirm_count * 46);
-			}
-			gsc->rx_bit_num += gsc->rx_confirm_count * 46;
 
 			gsc->rx_preamble_index = gsc->rx_confirm_index;
 			gsc->rx_preamble_count = gsc->rx_confirm_count;
@@ -713,45 +701,53 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 	 *   - If it fails without inversion but succeeds with inversion → WHOLE-SIGNAL INVERSION
 	 *   - If both fail → reset to idle (corrupted signal)
 	 *
-	 * Start code layout: 28-bit comma + 46-bit dup Golay + 1-bit + 46-bit dup Golay
-	 * The first dup Golay starts at bit offset 856 + 28 = 884. */
-	if (gsc->rx_batch_candidate && gsc->rx_bit_num >= 856 + 28 + 46) {
-		/* We have enough bits to read the first dup Golay of the start code */
+	 * Scan for start code in the buffer. The buffer starts from the
+	 * first post-confirmation bit, so the remaining preamble codewords
+	 * and start code are at the beginning. */
+	if (gsc->rx_batch_candidate && gsc->rx_bit_num >= 28 + 46) {
 		uint32_t sc_codeword;
 		uint16_t sc_decoded;
-		int sc_pos = 856 + 28; /* skip preamble region + comma */
+		int sc_found = 0;
+		int scan_end = gsc->rx_bit_num - 28 - 46;
+		int scan;
 
-		sc_codeword = resolve_shift_register(gsc->rx_bit + sc_pos);
+		/* Limit scan range — start code should be within first ~800 bits */
+		if (scan_end > 800)
+			scan_end = 800;
 
-		/* Try normal polarity first (batch mode: start code is NOT inverted) */
-		if (decode_golay(sc_codeword, &sc_decoded) == 0 && sc_decoded == 713) {
-			/* BATCH MODE confirmed: inverted preamble only */
-			gsc->rx_batch_mode = 1;
-			gsc->rx_batch_candidate = 0;
-			gsc->rx_polarity_inverted = 0;
+		for (scan = 0; scan <= scan_end && !sc_found; scan++) {
+			int try_pos = scan + 28; /* skip comma */
+			if (try_pos + 46 > gsc->rx_bit_num)
+				break;
 
-			LOGP_CHAN(DDSP, LOGL_INFO, "RX: auto-polarity: batch mode confirmed (start code decoded without inversion).\n");
-		} else if (decode_golay(sc_codeword ^ 0x7FFFFF, &sc_decoded) == 0 && sc_decoded == 713) {
-			/* WHOLE-SIGNAL INVERSION confirmed: start code needed inversion */
-			gsc->rx_polarity_inverted = 1;
-			gsc->rx_batch_candidate = 0;
-			gsc->rx_batch_mode = 0;
+			sc_codeword = resolve_shift_register(gsc->rx_bit + try_pos);
 
-			LOGP_CHAN(DDSP, LOGL_INFO, "RX: auto-polarity: negative polarity confirmed.\n");
-
-			/* Re-invert all post-preamble bits in rx_bit[].
-			 * The preamble bits (0..855) were already un-inverted
-			 * during the preamble lock copy, so they stay as-is.
-			 * The post-preamble bits (856+) were buffered without
-			 * inversion and need to be flipped now. */
-			{
-				int b;
-				for (b = 856; b < gsc->rx_bit_num; b++)
-					gsc->rx_bit[b] = !gsc->rx_bit[b];
+			if (decode_golay(sc_codeword, &sc_decoded) == 0 && sc_decoded == 713) {
+				gsc->rx_batch_mode = 1;
+				gsc->rx_batch_candidate = 0;
+				gsc->rx_polarity_inverted = 0;
+				sc_found = 1;
+				LOGP_CHAN(DDSP, LOGL_INFO, "RX: auto-polarity: batch mode confirmed (start code at bit %d).\n", try_pos);
+			} else if (decode_golay(sc_codeword ^ 0x7FFFFF, &sc_decoded) == 0 && sc_decoded == 713) {
+				gsc->rx_polarity_inverted = 1;
+				gsc->rx_batch_candidate = 0;
+				gsc->rx_batch_mode = 0;
+				sc_found = 1;
+				LOGP_CHAN(DDSP, LOGL_INFO, "RX: auto-polarity: negative polarity confirmed (start code at bit %d).\n", try_pos);
+				{
+					int b;
+					for (b = scan; b < gsc->rx_bit_num; b++)
+						gsc->rx_bit[b] = !gsc->rx_bit[b];
+				}
 			}
-		} else {
-			/* Neither decode succeeded — corrupted signal */
-			LOGP_CHAN(DDSP, LOGL_INFO, "RX: auto-polarity: disambiguation failed (start code decode failed both ways), lost lock.\n");
+		}
+
+		if (!sc_found) {
+			if (gsc->rx_bit_num < 800) {
+				/* Not enough bits yet */
+				return;
+			}
+			LOGP_CHAN(DDSP, LOGL_INFO, "RX: auto-polarity: disambiguation failed, lost lock.\n");
 			rx_reset_idle(gsc);
 			return;
 		}
@@ -808,7 +804,7 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 				LOGP_CHAN(DDSP, LOGL_INFO, "RX: new preamble (index %d, %s) confirmed during DATA (%d matches), force-decoding old batch (%d bits).\n",
 					idx, inv ? "inverted" : "normal", gsc->rx_data_preamble_count, old_bits);
 
-				if (old_bits >= (28 + 18 * 46 + 121 + 121)) {
+				if (old_bits >= 242) { /* start(121) + address(121) minimum */
 					memcpy(gsc->bit, gsc->rx_bit, old_bits);
 					gsc->bit_num = old_bits;
 					if (decode_batch(gsc, &msg, 1) == 0) {
@@ -838,9 +834,9 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 	}
 
 	/* Minimum bits for a valid message:
-	 * GSC: preamble(28 + 18*46) + start(121) + address(121) = 1098 bits.
+	 * GSC: start(121) + address(121) = 242 bits minimum (preamble not in buffer).
 	 * NBS: address(121) only (no preamble or start code). */
-	min_batch_bits = gsc->rx_nbs_locked ? 121 : (28 + 18 * 46 + 121 + 121);
+	min_batch_bits = gsc->rx_nbs_locked ? 121 : 242;
 
 	if (gsc->rx_bit_num < min_batch_bits)
 		return;
@@ -983,47 +979,28 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 	}
 
 	polarity = gsc->fsk_polarity;
-	phase = gsc->fsk_rx_phase;
-	lastbit = gsc->fsk_rx_last_bit;
-	bitstep = gsc->fsk_bitstep;
 
 	for (i = 0; i < length; i++) {
-		/* Zero-crossing FSK demodulation on baseband samples:
-		 * sample * polarity > 0 means binary 1, <= 0 means binary 0.
-		 * On transitions, reset PLL phase for clock recovery. */
-		if (samples[i] * polarity > 0.0) {
-			if (lastbit) {
-				/* Same bit — advance clock */
-				phase += bitstep;
-				if (phase >= 1.0) {
-					phase -= 1.0;
-					fsk_receive_bit(gsc, 1);
-				}
-			} else {
-				/* Transition 0->1 — sync PLL */
-				phase = -0.5;
-				fsk_receive_bit(gsc, 1);
-				lastbit = 1;
-			}
-		} else {
-			if (lastbit) {
-				/* Transition 1->0 — sync PLL */
-				phase = -0.5;
-				fsk_receive_bit(gsc, 0);
-				lastbit = 0;
-			} else {
-				/* Same bit — advance clock */
-				phase += bitstep;
-				if (phase >= 1.0) {
-					phase -= 1.0;
-					fsk_receive_bit(gsc, 0);
-				}
-			}
+		/* Soft PLL bit clock recovery (same approach as multimon-ng).
+		 * Sample the demodulated signal, track transitions with a
+		 * gradual phase correction instead of hard resets. */
+		gsc->fsk_rx_dcd_shreg <<= 1;
+		gsc->fsk_rx_dcd_shreg |= ((samples[i] * polarity) > 0.0) ? 1 : 0;
+
+		/* Check for transition */
+		if ((gsc->fsk_rx_dcd_shreg ^ (gsc->fsk_rx_dcd_shreg >> 1)) & 1) {
+			if (gsc->fsk_rx_phase < 0.5)
+				gsc->fsk_rx_phase += gsc->fsk_bitstep / 8.0;
+			else
+				gsc->fsk_rx_phase -= gsc->fsk_bitstep / 8.0;
+		}
+
+		gsc->fsk_rx_phase += gsc->fsk_bitstep;
+		if (gsc->fsk_rx_phase >= 1.0) {
+			gsc->fsk_rx_phase -= 1.0;
+			fsk_receive_bit(gsc, gsc->fsk_rx_dcd_shreg & 1);
 		}
 	}
-
-	gsc->fsk_rx_phase = phase;
-	gsc->fsk_rx_last_bit = lastbit;
 }
 
 /* Provide stream of audio toward radio unit */

@@ -150,6 +150,7 @@ typedef struct gsc {
 	double			fsk_rx_phase;		/* bit clock phase for recovery */
 	sample_t		fsk_rx_last_sample;	/* previous sample for zero-crossing */
 	int			fsk_rx_last_bit;	/* last demodulated bit */
+	uint32_t		fsk_rx_dcd_shreg;	/* shift register for transition detection */
 
 	/* RX decoder state machine */
 	enum rx_state		rx_state;		/* current decoder state */

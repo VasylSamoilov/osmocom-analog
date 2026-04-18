@@ -1387,92 +1387,73 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	/* ================================================================
 	 * Stage 1: PREAMBLE
 	 *
-	 * Encoder: queue_comma(gsc, 28, golay & 1)
-	 *          for (i = 0; i < 18; i++) queue_dup(gsc, golay, 23)
-	 *
-	 * Layout: 28-bit comma + 18 x 46-bit dup Golay = 856 bits
+	 * The preamble index is already known from the DSP layer's
+	 * confirmation phase. The rx_bit[] buffer starts from the first
+	 * post-confirmation bit (remaining preamble + start code + data).
+	 * Skip directly to the start code scan.
 	 * ================================================================ */
 
-	if (pos + comma_len + preamble_reps * dup_bits > total_bits) {
-		return -1;
-	}
-
-	/* Skip 28-bit comma sequence */
-	pos += comma_len;
-
-	/* Read 18 duplicate Golay codewords and majority-vote the preamble */
-	memset(preamble_votes, 0, sizeof(preamble_votes));
-
-	for (i = 0; i < preamble_reps; i++) {
-		int j;
-
-		codeword = read_dup_golay(bits, &pos);
-		rc = decode_golay(codeword, &decoded_value);
-		if (rc < 0) {
-			LOGP(DGOLAY, LOGL_DEBUG, "Preamble rep %d: Golay decode failed, skipping.\n", i);
-			continue;
-		}
-
-		/* Match decoded value against preamble_values[0..9] */
-		for (j = 0; j < 10; j++) {
-			if (decoded_value == preamble_values[j]) {
-				preamble_votes[j]++;
-				break;
-			}
-		}
-		if (j == 10) {
-			LOGP(DGOLAY, LOGL_DEBUG, "Preamble rep %d: value %u not in preamble table.\n",
-				i, decoded_value);
-		}
-	}
-
-	/* Select preamble index with the most votes */
-	best_count = 0;
-	for (i = 0; i < 10; i++) {
-		if (preamble_votes[i] > best_count) {
-			best_count = preamble_votes[i];
-			preamble_idx = i;
-		}
-	}
-
-	if (preamble_idx < 0) {
-		LOGP(DGOLAY, LOGL_DEBUG, "Preamble detection failed: no valid codewords decoded.\n");
-		return -1;
-	}
-
-	msg->preamble_index = preamble_idx;
-	LOGP(DGOLAY, LOGL_DEBUG, "Preamble detected: index %d (value %u, %d/%d votes).\n",
-		preamble_idx, preamble_values[preamble_idx], best_count, preamble_reps);
+	msg->preamble_index = gsc->rx_preamble_index;
+	preamble_idx = gsc->rx_preamble_index;
 
 	/* ================================================================
 	 * Stage 2: START CODE
 	 *
-	 * Encoder: golay = calc_golay(start_code)
-	 *          queue_comma(gsc, 28, golay & 1)
-	 *          queue_dup(gsc, golay, 23)
-	 *          golay ^= 0x7fffff
-	 *          queue_bit(gsc, (golay & 1) ^ 1)
-	 *          queue_dup(gsc, golay, 23)
+	 * Scan for start code (713) in the buffer. The buffer contains
+	 * remaining preamble codewords followed by the start code.
+	 * Scan from position 0 to find it.
 	 *
 	 * Layout: 28 + 46 + 1 + 46 = 121 bits
 	 * ================================================================ */
 
-	if (pos + comma_len + dup_bits + 1 + dup_bits > total_bits) {
+	if (total_bits < 28 + 46) {
 		return -1;
 	}
 
-	/* Skip 28-bit comma */
-	pos += comma_len;
+	/* Scan for start code with a ±46 bit window around the expected
+	 * position. The IDLE scanner's sliding window may match at any
+	 * offset within the dup codeword, shifting the entire rx_bit[]
+	 * buffer. Scanning handles this alignment variation. */
+	{
+		int sc_found = 0;
+		int scan_end = total_bits - 28 - 46;
+		int scan_pos;
 
-	/* Read and verify first codeword (normal start code = 713) */
-	codeword = read_dup_golay(bits, &pos);
-	rc = decode_golay(codeword, &decoded_value);
-	if (rc < 0) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Start code: first Golay decode failed.\n");
-		return -1;
-	}
-	if (decoded_value != start_code) {
-		return -1;
+		/* Limit scan to first 800 bits — start code should be there */
+		if (scan_end > 800)
+			scan_end = 800;
+
+		for (scan_pos = 0; scan_pos <= scan_end; scan_pos++) {
+			int try_pos = scan_pos + comma_len;
+			if (try_pos + dup_bits > total_bits)
+				break;
+
+			codeword = read_dup_golay(bits, &try_pos);
+			rc = decode_golay(codeword, &decoded_value);
+			if (rc >= 0 && decoded_value == start_code) {
+				LOGP(DGOLAY, LOGL_INFO, "Start code found at scan_pos=%d try_pos=%d total=%d\n",
+					scan_pos, try_pos, total_bits);
+				pos = try_pos; /* past the dup Golay */
+				sc_found = 1;
+				if (rc > 0)
+					msg->error_count += rc;
+
+				/* Dump 300 bits from start code position for diagnosis */
+				{
+					char dump[320];
+					int d = 0, b;
+					int dump_start = scan_pos;
+					for (b = dump_start; b < dump_start + 300 && b < total_bits && d < 310; b++)
+						dump[d++] = bits[b] ? '1' : '0';
+					dump[d] = '\0';
+					LOGP(DGOLAY, LOGL_INFO, "Bitstream from SC: %s\n", dump);
+				}
+				break;
+			}
+		}
+
+		if (!sc_found)
+			return -1;
 	}
 
 	/* Skip 1-bit inverted comma */
@@ -1875,6 +1856,8 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	}
 
 	/* Build the 7-digit functional address: I G1 G0 A2 A1 A0 suffix */
+	LOGP(DGOLAY, LOGL_INFO, "Address: idx=%d g1=%d g0=%d a2=%d a1=%d a0=%d func=%d w1=%u w2=%u w1_inv=%d w2_inv=%d\n",
+		idx, g1, g0, a2, a1, a0, function, w1_value, w2_value, w1_inverted, w2_inverted);
 	msg->address[0] = '0' + idx;
 	msg->address[1] = '0' + g1;
 	msg->address[2] = '0' + g0;
@@ -2518,7 +2501,8 @@ decode_done:
 
 				/* Skip 1-bit inverted comma between W1 and W2 */
 				if (batch_pos + 1 + dup_bits > total_bits) {
-					LOGP(DGOLAY, LOGL_NOTICE, "Batch: not enough bits for W2.\n");
+					if (!force)
+						return -1;
 					break;
 				}
 				batch_pos += 1;
