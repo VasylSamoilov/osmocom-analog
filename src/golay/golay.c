@@ -467,7 +467,7 @@ int decode_golay(uint32_t codeword, uint16_t *data)
 	/* Compute the 11-bit syndrome of the received codeword */
 	syndrome = golay_syndrome_calc(codeword);
 
-	/* Syndrome 0 means no errors — codeword is valid */
+	/* Syndrome 0 means no errors - codeword is valid */
 	if (syndrome == 0) {
 		*data = codeword & 0xFFF;
 		return 0;
@@ -502,7 +502,7 @@ int decode_bch(uint16_t codeword, uint8_t *data)
 	/* Compute the 8-bit syndrome of the received codeword */
 	syndrome = bch_syndrome_calc(codeword);
 
-	/* Syndrome 0 means no errors — codeword is valid */
+	/* Syndrome 0 means no errors - codeword is valid */
 	if (syndrome == 0) {
 		*data = codeword & 0x7F;
 		return 0;
@@ -821,10 +821,43 @@ int reverse_word1(uint16_t w1, int *g1, int *g0)
  *   6. Validate a2a1a0 against illegal_low[]/illegal_high[] tables
  *
  * g1g0: the full group digit pair (0-99), used to select high/low range.
- * Returns 0 on success (a2, a1, a0 written), -1 if mapping is invalid. */
+ * Returns 0 on success (a2, a1, a0 written), -1 if mapping is invalid.
+ *
+ * Invalid GSC codes (Appendix I):
+ *   Certain A2A1A0 values are invalid for given G1G0 ranges and must
+ *   be skipped when assigning codes. These arise from the W2 address
+ *   arithmetic producing values that collide with protocol-reserved
+ *   codewords or cause ambiguity in the W2-to-address reverse mapping.
+ *
+ *   G1G0 00-49: A2A1A0 must not equal
+ *     000, 025, 051, 103, 206, 340, 363, 412,
+ *     445, 530, 642, 726, 782, 810, 825, 877
+ *
+ *   G1G0 50-99: A2A1A0 must not equal
+ *     000, 292, 425, 584, 631, 841, 851
+ *
+ *   For non-battery-saver ("N" code) systems, G1G0 must never
+ *   equal 40 or 90 regardless of A2A1A0.
+ *
+ * W1 table ambiguity: word1s[] has 50 entries. G1G0 0-49 maps directly,
+ * G1G0 50-99 uses word1s[G1G0-50] (same entry, W2 offset by +50).
+ * The decoder tries both ranges and uses reverse_word2() success as
+ * the discriminator. When both ranges produce valid addresses (the
+ * invalid code tables do not cover all cases), the result is ambiguous.
+ * A real pager knows its own address; a monitoring decoder cannot
+ * always disambiguate.
+ *
+ * Code Assignment Plans (Figure 7.1):
+ *   Plan 1: 50-100 codes, 1 preamble, fixed G1G0A2
+ *   Plan 2: 500-1000 codes, 10 preambles, fixed G1A2
+ *   Plan 3: 500-1000 codes, 1 preamble, fixed G1A2
+ *   Plan 4: 5000-10000 codes, 10 preambles, fixed G1
+ *   Plan 5: 5000-10000 codes, 1 preamble (I fixed), fixed G0
+ *   Plan 6: 50000-100000 codes, 50 preambles, all digits variable */
 int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0)
 {
-	/* These tables match the ones in encode_address() — duplicated here
+	/* Invalid GSC code tables (Appendix I).
+	 * These match the ones in encode_address() -- duplicated here
 	 * because the encoder's copies are local to that function. */
 	static const uint16_t illegal_low[16] = {   0,  25,  51, 103, 206, 340, 363, 412, 445, 530, 642, 726, 782, 810, 825, 877 };
 	static const uint16_t illegal_high[7] = {   0, 292, 425, 584, 631, 841, 851 };
@@ -838,6 +871,10 @@ int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0)
 		raw = w2 - 50;
 	else
 		raw = w2;
+
+	/* raw must be non-negative for valid arithmetic */
+	if (raw < 0)
+		return -1;
 
 	/* Step 2: Extract b3b2 and b1b0 from the raw W2 value */
 	b3b2 = raw / 100;
@@ -857,8 +894,10 @@ int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0)
 	*a1 = (ap / 20) % 10;
 	*a0 = (ap / 2) % 10;
 
-	/* Validate digit range: each must be 0-9 */
-	if (*a2 > 9 || *a1 > 9 || *a0 > 9) {
+	/* Validate digit range: each must be 0-9.
+	 * Negative values can occur when the W2 arithmetic overflows
+	 * for invalid range combinations. */
+	if (*a2 < 0 || *a2 > 9 || *a1 < 0 || *a1 > 9 || *a0 < 0 || *a0 > 9) {
 		LOGP(DGOLAY, LOGL_DEBUG, "Reverse W2: digits out of range (A2=%d A1=%d A0=%d).\n", *a2, *a1, *a0);
 		return -1;
 	}
@@ -931,16 +970,16 @@ char decode_alpha(uint8_t code)
  * the first nibble is 0xF (shift prefix), the second nibble is the letter code.
  * The decoder tracks shift state via the caller-provided *shifted flag.
  *
- * numeric_decode_table[16] — unshifted codes:
+ * numeric_decode_table[16] - unshifted codes:
  *   0x0-0x9: '0'-'9'
  *   0xA:     '\0' (NULL fill, used for padding empty digit slots)
  *   0xB:     'U'
  *   0xC:     ' ' (space)
  *   0xD:     '-' (hyphen)
  *   0xE:     '*' (asterisk; encoder also accepts '=' as alias)
- *   0xF:     '\0' (shift prefix — sets shifted mode, no character emitted)
+ *   0xF:     '\0' (shift prefix - sets shifted mode, no character emitted)
  *
- * numeric_shift_table[16] — codes after 0xF prefix:
+ * numeric_shift_table[16] - codes after 0xF prefix:
  *   0x0: 'A', 0x1: 'B', 0x2: 'C', 0x3: 'D', 0x4: 'E',
  *   0x5: ' ' (Space), 0x6: 'F', 0x7: 'G', 0x8: 'H', 0x9: 'J',
  *   0xA: '\0' (Null), 0xB: 'L', 0xC: 'N', 0xD: 'P', 0xE: 'R',
@@ -950,7 +989,7 @@ char decode_alpha(uint8_t code)
  * respectively. Code 0xF is spare (undefined).
  *
  * UNCONFIRMED: Motorola GSC Table A-17 defines international characters
- * (ä, ö, ü, ñ, ç, é, è, ê, Å, ß, etc.) via a SHIFT prefix in the
+ * (ae, oe, ue, n, c, e, e, e, A, ss, etc.) via a SHIFT prefix in the
  * alphanumeric stream. The SHIFT prefix code and full mechanism are not
  * yet confirmed from the source document. Not implemented.
  */
@@ -982,7 +1021,7 @@ char decode_numeric(uint8_t code, int *shifted)
 	code &= 0x0F;
 
 	if (*shifted) {
-		/* Previous nibble was 0xF shift prefix — decode shifted letter */
+		/* Previous nibble was 0xF shift prefix - decode shifted letter */
 		c = numeric_shift_table[code];
 		*shifted = 0;
 		LOGP(DGOLAY, LOGL_DEBUG, "Decode numeric (shifted): 0x%x -> '%c'.\n", code, c);
@@ -1056,13 +1095,13 @@ int gsc_score_alpha(const char *str, int len, int fill)
  *
  * Scoring per nibble (operates on the raw 4-bit nibble values,
  * not the decoded ASCII, to distinguish shift prefixes):
- *   +3  digit (nibble 0x0–0x9)
+ *   +3  digit (nibble 0x0-0x9)
  *   -1  'U' (nibble 0xB) when it's the only U and at position 0
  *       (urgent-prefix convention: "U" + phone number)
- *  -15  'U' (nibble 0xB) otherwise — very rare in real numeric messages;
+ *  -15  'U' (nibble 0xB) otherwise - very rare in real numeric messages;
  *       common artifact when alpha data is misinterpreted as numeric
  *   -2  space (0xC), hyphen (0xD), asterisk (0xE)
- *   -2  shift prefix (0xF) — uncommon in numeric messages
+ *   -2  shift prefix (0xF) - uncommon in numeric messages
  *   +fill^2  quadratic fill bonus (weaker than alpha fill since
  *            coincidental 0x0A nibbles are more likely: 1/16 vs 1/64)
  *
@@ -1111,9 +1150,9 @@ int gsc_score_numeric(const uint8_t *nibbles, int count, int fill)
 			score += 3;
 		} else if (n == 0x0B) {
 			if (urgent_prefix)
-				score -= 1; /* leading U = urgent prefix — mild penalty */
+				score -= 1; /* leading U = urgent prefix - mild penalty */
 			else
-				score -= 15; /* stray U — strong artifact signal */
+				score -= 15; /* stray U - strong artifact signal */
 		} else if (n >= 0x0C && n <= 0x0E) {
 			/* Space (0xC), hyphen (0xD), asterisk (0xE): -2 */
 			score -= 2;
@@ -1139,10 +1178,10 @@ int gsc_score_numeric(const uint8_t *nibbles, int count, int fill)
  * Decision logic:
  *   1) If one interpretation has trailing fill and the other doesn't,
  *      the one with fill wins (fill is inserted by the encoder to pad
- *      short messages — its presence is a strong structural signal).
+ *      short messages - its presence is a strong structural signal).
  *   2) If both have fill, the one with more fill wins (shorter message
  *      = more fill = stronger signal).
- *   3) If neither has fill (full block), compare content scores —
+ *   3) If neither has fill (full block), compare content scores -
  *      higher score wins.
  *
  * Sets msg->type to the winner, populates score/method fields.
@@ -1165,7 +1204,7 @@ void gsc_discriminate(gsc_rx_msg_t *msg)
 	} else if (msg->numeric_score > msg->alpha_score) {
 		msg->guess_winner = TYPE_NUMERIC;
 	} else {
-		/* Scores equal — default to alpha, flag uncertain */
+		/* Scores equal - default to alpha, flag uncertain */
 		msg->guess_winner = TYPE_ALPHA;
 		msg->guess_uncertain = 1;
 	}
@@ -1200,7 +1239,7 @@ static uint32_t read_dup_golay(const uint8_t *bits, int *pos)
 		if (bit1 == bit2) {
 			resolved = bit1;
 		} else {
-			/* Bits disagree — prefer first bit, log for diagnostics */
+			/* Bits disagree - prefer first bit, log for diagnostics */
 			resolved = bit1;
 			LOGP(DGOLAY, LOGL_DEBUG, "Duplicate bit disagreement at bit %d (pos %d): %d vs %d, using %d.\n",
 				i, p, bit1, bit2, resolved);
@@ -1226,7 +1265,7 @@ static uint32_t read_dup_golay(const uint8_t *bits, int *pos)
  *       for (k = 0; k < 8; k++)
  *           queue_bit(gsc, (bch[k] >> j) & 1);
  *
- * The encoder writes 120 bits total (15 bit-positions × 8 codewords).
+ * The encoder writes 120 bits total (15 bit-positions x 8 codewords).
  * For each bit position j (0..14), it writes bit j of codewords k=0..7
  * in order.  We reverse this by reading in the same j,k order and
  * reconstructing each codeword bit-by-bit.
@@ -1535,7 +1574,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 *    a +50 offset for high range.
 	 *
 	 * 3) Both: we must try all 4 combinations of (normal/complement)
-	 *    × (low/high range) and use reverse_word2() success as the
+	 *    x (low/high range) and use reverse_word2() success as the
 	 *    discriminator.
 	 *
 	 * If exactly one combination succeeds, use it. If multiple succeed
@@ -1560,7 +1599,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
 		if (rc == 0) { w2_try[1] = decoded_value; golay_ok[1] = 1; }
 
-		/* Try all 4 combinations: inv={0,1} × range={0,1} */
+		/* Try all 4 combinations: inv={0,1} x range={0,1} */
 		for (inv = 0; inv < 2; inv++) {
 			if (!golay_ok[inv])
 				continue;
@@ -1617,7 +1656,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 *
 	 * If there aren't enough remaining bits to distinguish the type
 	 * (minimum 121 for any post-address content), we cannot determine
-	 * the message type yet — return -1 so the caller can buffer more
+	 * the message type yet - return -1 so the caller can buffer more
 	 * bits and retry. */
 	remaining = total_bits - pos;
 
@@ -1708,7 +1747,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 						 * A block with trailing fill chars in one
 						 * scheme but not the other is a strong signal.
 						 * For full blocks (no fill), we default to
-						 * alpha here — the final type decision is
+						 * alpha here - the final type decision is
 						 * made by gsc_discriminate() after both
 						 * decode stages run with content scoring. */
 						{
@@ -1765,7 +1804,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 							 * 2) If both have fill, prefer the one with
 							 *    more fill (shorter message).
 							 * 3) If neither has fill (full block), default
-							 *    to alpha — gsc_discriminate() will make
+							 *    to alpha - gsc_discriminate() will make
 							 *    the final type decision using content
 							 *    scoring after both decode stages run. */
 							if (n_fill > 0 && a_fill == 0) {
@@ -1793,7 +1832,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 			}
 
 			/* If BCH probe didn't identify data and we don't have
-			 * enough bits for a full tone comma yet, we can't tell —
+			 * enough bits for a full tone comma yet, we can't tell -
 			 * request more data unless forced. */
 			if (!data_detected && remaining < tone_comma_len) {
 				if (!force) {
@@ -1923,7 +1962,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				}
 
 				/* If block has failures and previous block didn't confirm
-				 * continuation, stop — can't trust this data. */
+				 * continuation, stop - can't trust this data. */
 				if (!block_ok && !prev_contbit) {
 					LOGP(DGOLAY, LOGL_NOTICE, "Alpha block %d: BCH failures and no prior continuation, stopping.\n", i);
 					break;
@@ -2066,7 +2105,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				}
 
 				/* If block has failures and previous block didn't confirm
-				 * continuation, stop — can't trust this data. */
+				 * continuation, stop - can't trust this data. */
 				if (!block_ok && !prev_contbit) {
 					LOGP(DGOLAY, LOGL_NOTICE, "Numeric block %d: BCH failures and no prior continuation, stopping.\n", i);
 					break;
@@ -2163,7 +2202,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		 * We only return -1 (need more data) if BOTH stages genuinely
 		 * need more bits. If one stage completed (contbit=0) or hit its
 		 * block limit (contbit=1 but i>=MAX), the message data is fully
-		 * available in the bitstream — the other stage just can't
+		 * available in the bitstream - the other stage just can't
 		 * represent it. Proceed to discrimination.
 		 *
 		 * Cases:
@@ -2362,7 +2401,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 			}
 
 			if (is_preamble) {
-				/* New transmission starting — stop batch decode */
+				/* New transmission starting - stop batch decode */
 				LOGP(DGOLAY, LOGL_DEBUG, "Batch: preamble detected after message %d, new transmission.\n",
 					batch_count);
 				break;
@@ -2391,7 +2430,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 			}
 
 			if (!is_w1) {
-				/* Not a valid W1, start code, or preamble — end of batch */
+				/* Not a valid W1, start code, or preamble - end of batch */
 				LOGP(DGOLAY, LOGL_DEBUG, "Batch: no valid continuation after message %d, end of batch.\n",
 					batch_count);
 				break;
@@ -2571,7 +2610,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 							probe_cksum &= 0x7f;
 
 							if (probe_cksum == probe_d[7]) {
-								/* Valid data block — distinguish alpha vs numeric */
+								/* Valid data block - distinguish alpha vs numeric */
 								uint8_t a_ch[8];
 								uint8_t n_nib[12];
 								int a_fill = 0, n_fill = 0;
@@ -2828,7 +2867,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 /* Decode a non-battery-saver (NBS) message from the RX bit buffer.
  *
- * NBS format has no coded preamble or start code — the bitstream starts
+ * NBS format has no coded preamble or start code - the bitstream starts
  * directly with the address comma + W1 + comma_bit + W2, followed by
  * optional data blocks.
  *
@@ -2975,7 +3014,7 @@ int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 	function = (w1_inverted ? 0x2 : 0) | (w2_inverted ? 0x1 : 0);
 
-	/* NBS has no preamble index — use 0 as placeholder for address reconstruction */
+	/* NBS has no preamble index - use 0 as placeholder for address reconstruction */
 	idx = 0;
 
 	/* Build function suffix from Table IX */
@@ -3044,7 +3083,7 @@ int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				probe_cksum &= 0x7f;
 
 				if (probe_cksum == probe_d[7]) {
-					/* Valid data — use fill-count heuristic for alpha vs numeric */
+					/* Valid data - use fill-count heuristic for alpha vs numeric */
 					uint8_t a_ch[8];
 					int a_fill = 0, n_fill = 0;
 					int nk;
@@ -3179,14 +3218,14 @@ static inline void queue_comma(gsc_t *gsc, int bits, uint8_t polarity)
 /* Forward declaration: queue_interleaved_tones is defined after queue_batch */
 static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polarity, int max_tones);
 
-/* Non-battery-saver mode encoder (§2.5).
+/* Non-battery-saver mode encoder (S2.5).
  *
- * Uses a simple 75 Hz square wave preamble (1,1,0,0 pattern) for ≥1.25s
+ * Uses a simple 75 Hz square wave preamble (1,1,0,0 pattern) for >=1.25s
  * instead of coded preamble. No start code. Address pairs follow directly.
  * This is the original Golay format (pre-GSC, in service since 1973).
  * Higher throughput but no battery saving groups.
  *
- * Layout: [75 Hz preamble ≥ 752 bits] [address pair 121 bits] [data blocks...]
+ * Layout: [75 Hz preamble >= 752 bits] [address pair 121 bits] [data blocks...]
  */
 static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type type, const char *message, double polarity)
 {
@@ -3231,8 +3270,8 @@ static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type ty
 		type == TYPE_NUMERIC ? "numeric" :
 		type == TYPE_VOICE ? "voice" : "tone-only", address);
 
-	/* §2.5: 75 Hz preamble = 1,1,0,0 pattern for at least 1.25s.
-	 * At 600 baud, 1.25s = 750 bits. Use 752 bits (188 × 4) for alignment. */
+	/* S2.5: 75 Hz preamble = 1,1,0,0 pattern for at least 1.25s.
+	 * At 600 baud, 1.25s = 750 bits. Use 752 bits (188 x 4) for alignment. */
 	LOGP(DGOLAY, LOGL_DEBUG, "Encoding 75 Hz NBS preamble (752 bits).\n");
 	for (i = 0; i < 188; i++) {
 		queue_bit(gsc, 1);
@@ -3241,7 +3280,7 @@ static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type ty
 		queue_bit(gsc, 0);
 	}
 
-	/* No start code in NBS mode — address follows directly */
+	/* No start code in NBS mode - address follows directly */
 
 	/* Encode address */
 	LOGP(DGOLAY, LOGL_DEBUG, "Encoding address words '%d' and '%d'.\n", word1, word2);
@@ -3575,7 +3614,7 @@ static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polari
 	int rc;
 	int count = 0;
 
-	/* Walk priority queue first — priority tone-only messages interleaved before normal ones */
+	/* Walk priority queue first - priority tone-only messages interleaved before normal ones */
 	msgp = &gsc->priority_list;
 	while (*msgp && count < max_tones) {
 		msg = *msgp;
@@ -3901,7 +3940,7 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 		}
 	}
 
-	/* Per §2.1: "Unfilled batches should be filled out with comma."
+	/* Per S2.1: "Unfilled batches should be filled out with comma."
 	 * Each address slot is 121 bits. Pad remaining slots up to 16
 	 * (or 32 for extended batch) with comma. */
 	{
@@ -4044,7 +4083,7 @@ void scheduler_enqueue(gsc_t *gsc, gsc_msg_t *msg)
 	/* Record submission timestamp for expiry */
 	clock_gettime(CLOCK_MONOTONIC, &msg->enqueue_time);
 
-	/* Insert into appropriate queue (FIFO order — append to tail) */
+	/* Insert into appropriate queue (FIFO order - append to tail) */
 	if (msg->priority == 1) {
 		msgp = &gsc->priority_list;
 		while (*msgp)
@@ -4265,7 +4304,7 @@ static int find_best_group(gsc_msg_t *head, int *best_pi, double *best_pol)
  *
  * BATCHING_OFF: simple FIFO dequeue, one message at a time.
  *
- * BATCHING_NORMAL: greedy — pick the preamble group with the most
+ * BATCHING_NORMAL: greedy - pick the preamble group with the most
  * queued messages and transmit them as a batch.
  *
  * BATCHING_EXTENDED: round-robin through preamble groups 0-9 for
@@ -4323,7 +4362,7 @@ gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
 			/* Hold-off still active and neither queue has reached 16 */
 			return NULL;
 		}
-		/* Timer expired or batch full — proceed */
+		/* Timer expired or batch full - proceed */
 		gsc->holdoff_active = 0;
 		LOGP(DGOLAY, LOGL_DEBUG, "Scheduler: hold-off expired (elapsed %ld ms).\n", elapsed_ms);
 	}
@@ -4347,7 +4386,7 @@ gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
 		return msg;
 	}
 
-	/* === BATCHING_NORMAL: greedy — pick group with most messages === */
+	/* === BATCHING_NORMAL: greedy - pick group with most messages === */
 	if (gsc->batching_mode == BATCHING_NORMAL) {
 		if (gsc->priority_list) {
 			if (find_best_group(gsc->priority_list, &best_pi, &best_pol) > 0)
@@ -4391,7 +4430,7 @@ gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
 		}
 
 		if (!has_priority && !has_normal) {
-			/* Nothing for this group — advance and try next */
+			/* Nothing for this group - advance and try next */
 			gsc->sched_current_group = (group + 1) % 10;
 			continue;
 		}
@@ -4469,14 +4508,14 @@ gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
  * Logs warnings for soft issues (content, type-suffix).
  *
  * Validation stages (in order):
- *  1. Address length — exactly 7 characters (hard reject)
- *  2. Address digits — each character '0'-'9' (hard reject)
- *  3. Illegal GSC codes — G1G0 vs illegal_low[]/illegal_high[] (hard reject)
- *  4. Function suffix — 7th digit '0'-'9' (hard reject, covered by step 2)
+ *  1. Address length - exactly 7 characters (hard reject)
+ *  2. Address digits - each character '0'-'9' (hard reject)
+ *  3. Illegal GSC codes - G1G0 vs illegal_low[]/illegal_high[] (hard reject)
+ *  4. Function suffix - 7th digit '0'-'9' (hard reject, covered by step 2)
  *  5. TYPE_AUTO derivation from function suffix
  *  6. Content warnings (log warning, accept)
  *  7. Type-suffix consistency warnings (log warning, accept)
- *  8. Voice file existence — access(path, R_OK) (hard reject)
+ *  8. Voice file existence - access(path, R_OK) (hard reject)
  */
 int golay_validate_msg(const char *address, enum gsc_msg_type type,
                        const char *data)
@@ -4488,14 +4527,14 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 	int effective_type_is_auto = (type == TYPE_AUTO);
 	enum gsc_msg_type effective_type;
 
-	/* Stage 1: Address length — must be exactly 7 characters */
+	/* Stage 1: Address length - must be exactly 7 characters */
 	if (!address || strlen(address) != 7) {
 		LOGP(DGOLAY, LOGL_ERROR, "Validation failed: address must be exactly 7 characters (got %d).\n",
 		     address ? (int)strlen(address) : 0);
 		return -EINVAL;
 	}
 
-	/* Stage 2: Address digits — each character must be '0'-'9' */
+	/* Stage 2: Address digits - each character must be '0'-'9' */
 	for (i = 0; i < 7; i++) {
 		if (address[i] < '0' || address[i] > '9') {
 			LOGP(DGOLAY, LOGL_ERROR, "Validation failed: non-digit character '%c' at position %d in address '%s'.\n",
@@ -4504,7 +4543,7 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 		}
 	}
 
-	/* Stage 3: Illegal GSC codes — G1G0 mapped against tables */
+	/* Stage 3: Illegal GSC codes - G1G0 mapped against tables */
 	g1 = address[1] - '0';
 	g0 = address[2] - '0';
 	a2 = address[3] - '0';
@@ -4531,7 +4570,7 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 		}
 	}
 
-	/* Stage 4: Function suffix — 7th digit must be '0'-'9'
+	/* Stage 4: Function suffix - 7th digit must be '0'-'9'
 	 * Already guaranteed by stage 2, but kept explicit per design. */
 
 	/* Stage 5: TYPE_AUTO derivation from function suffix */
@@ -4727,7 +4766,7 @@ void golay_msg_send(const char *text)
 
 	message = p;
 
-	/* If no comma was found, p is NULL — this is a tone-only/auto
+	/* If no comma was found, p is NULL - this is a tone-only/auto
 	 * message with just an address and no payload. */
 	if (!message) {
 		message = "";
