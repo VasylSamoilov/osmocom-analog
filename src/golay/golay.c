@@ -1348,7 +1348,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 	/* Protocol constants (matching encoder's hardcoded values) */
 	const int comma_len = 28;		/* comma sequence length */
-	const int preamble_reps = 18;		/* preamble codeword repetitions */
 	const int dup_bits = 46;		/* duplicate-transmitted Golay codeword (23 x 2) */
 	const int bch_block_bits = 120;		/* interleaved BCH block (15 x 8) */
 	const int tone_comma_len = 121 * 8;	/* tone-only comma (968 bits) */
@@ -1357,10 +1356,8 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	uint16_t decoded_value;
 	int rc, i;
 
-	/* Preamble majority-vote tracking */
-	uint16_t preamble_votes[10];
+	/* Preamble index (from DSP layer) */
 	int preamble_idx = -1;
-	int best_count;
 
 	/* Address decoding variables */
 	uint16_t w1_value, w2_value;
@@ -1431,23 +1428,12 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 			codeword = read_dup_golay(bits, &try_pos);
 			rc = decode_golay(codeword, &decoded_value);
 			if (rc >= 0 && decoded_value == start_code) {
-				LOGP(DGOLAY, LOGL_INFO, "Start code found at scan_pos=%d try_pos=%d total=%d\n",
+				LOGP(DGOLAY, LOGL_DEBUG, "Start code found at scan_pos=%d try_pos=%d total=%d\n",
 					scan_pos, try_pos, total_bits);
 				pos = try_pos; /* past the dup Golay */
 				sc_found = 1;
 				if (rc > 0)
 					msg->error_count += rc;
-
-				/* Dump 300 bits from start code position for diagnosis */
-				{
-					char dump[320];
-					int d = 0, b;
-					int dump_start = scan_pos;
-					for (b = dump_start; b < dump_start + 300 && b < total_bits && d < 310; b++)
-						dump[d++] = bits[b] ? '1' : '0';
-					dump[d] = '\0';
-					LOGP(DGOLAY, LOGL_INFO, "Bitstream from SC: %s\n", dump);
-				}
 				break;
 			}
 		}
@@ -1851,7 +1837,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	}
 
 	/* Build the 7-digit functional address: I G1 G0 A2 A1 A0 suffix */
-	LOGP(DGOLAY, LOGL_INFO, "Address: idx=%d g1=%d g0=%d a2=%d a1=%d a0=%d func=%d w1=%u w2=%u w1_inv=%d w2_inv=%d\n",
+	LOGP(DGOLAY, LOGL_DEBUG, "Address: idx=%d g1=%d g0=%d a2=%d a1=%d a0=%d func=%d w1=%u w2=%u w1_inv=%d w2_inv=%d\n",
 		idx, g1, g0, a2, a1, a0, function, w1_value, w2_value, w1_inverted, w2_inverted);
 	msg->address[0] = '0' + idx;
 	msg->address[1] = '0' + g1;
@@ -3279,7 +3265,7 @@ static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type ty
 	switch (type) {
 	case TYPE_ALPHA:
 		LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d alphanumeric digits.\n", (int)strlen(message));
-		for (i = 0; *message; i++) {
+		for (i = 0; i == 0 || *message; i++) {
 			if (i == MAX_ADB)
 				LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping.\n", MAX_ADB * 8);
 			for (j = 0; *message && j < 8; j++)
@@ -3305,7 +3291,7 @@ static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type ty
 	case TYPE_NUMERIC:
 		LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d numeric digits.\n", (int)strlen(message));
 		shifted = 0;
-		for (i = 0; *message; i++) {
+		for (i = 0; i == 0 || *message; i++) {
 			if (i == MAX_NDB)
 				LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping.\n", MAX_NDB * 12);
 			for (j = 0; *message && j < 12; j++) {
@@ -3458,7 +3444,7 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 	switch (type) {
 	case TYPE_ALPHA:
 		LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d alphanumeric digits.\n", (int)strlen(message));
-		for (i = 0; *message; i++) {
+		for (i = 0; i == 0 || *message; i++) {
 			if (i == MAX_ADB) {
 				LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping message.\n", MAX_ADB * 8);
 			}
@@ -3495,7 +3481,7 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 	case TYPE_NUMERIC:
 		LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d numeric digits.\n", (int)strlen(message));
 		shifted = 0;
-		for (i = 0; *message; i++) {
+		for (i = 0; i == 0 || *message; i++) {
 			if (i == MAX_NDB) {
 				LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping message.\n", MAX_NDB * 12);
 			}
@@ -3827,7 +3813,7 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 		{
 			const char *message = cur->data;
 			LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d alphanumeric digits.\n", (int)strlen(message));
-			for (i = 0; *message; i++) {
+			for (i = 0; i == 0 || *message; i++) {
 				if (i == MAX_ADB) {
 					LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping message.\n", MAX_ADB * 8);
 				}
@@ -3862,7 +3848,7 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 			const char *message = cur->data;
 			LOGP(DGOLAY, LOGL_DEBUG, "Encoding %d numeric digits.\n", (int)strlen(message));
 			shifted = 0;
-			for (i = 0; *message; i++) {
+			for (i = 0; i == 0 || *message; i++) {
 				if (i == MAX_NDB) {
 					LOGP(DGOLAY, LOGL_NOTICE, "Message overflows %d characters, cropping message.\n", MAX_NDB * 12);
 				}
