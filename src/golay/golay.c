@@ -1553,7 +1553,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 	/* --- Decode W2 with inversion and range detection ---
 	 *
-	 * Three ambiguities must be resolved simultaneously:
+	 * Two things must be resolved:
 	 *
 	 * 1) Inversion: the encoder XORs the Golay codeword with 0x7FFFFF
 	 *    when function bit 0 is set. Both the normal and complement
@@ -1565,25 +1565,22 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 *    value is used (word1s[g1g0-50]). The W2 encoding differs by
 	 *    a +50 offset for high range.
 	 *
-	 * 3) Both: we must try all 4 combinations of (normal/complement)
-	 *    x (low/high range) and use reverse_word2() success as the
-	 *    discriminator.
+	 * Range detection: the encoder computes b1b0 = (ap1*10 + ap0) / 2,
+	 * which is always 0-49 (max input 99 / 2 = 49). For low range,
+	 * W2 % 100 = b1b0 (0-49). For high range, W2 % 100 = b1b0 + 50
+	 * (50-99). So W2 % 100 deterministically identifies the range.
 	 *
-	 * If exactly one combination succeeds, use it. If multiple succeed
-	 * (rare but possible), prefer non-inverted and low-range. */
+	 * We try both Golay polarities (normal/complement) and use the
+	 * W2 value's low two digits to select the correct range. */
 	codeword = read_dup_golay(bits, &pos);
 	w2_inverted = 0;
 
 	{
 		uint16_t w2_try[2] = { 0, 0 };	/* [0]=normal, [1]=complement */
 		int golay_ok[2] = { 0, 0 };
-		int try_g1g0[2];			/* [0]=low, [1]=high */
-		int best_inv = -1, best_range = -1;
+		int best_inv = -1;
 		int ta2, ta1, ta0;
-		int inv, rng;
-
-		try_g1g0[0] = g1g0;
-		try_g1g0[1] = g1g0 + 50;
+		int inv, det_range;
 
 		rc = decode_golay(codeword, &decoded_value);
 		if (rc == 0) { w2_try[0] = decoded_value; golay_ok[0] = 1; }
@@ -1591,20 +1588,24 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
 		if (rc == 0) { w2_try[1] = decoded_value; golay_ok[1] = 1; }
 
-		/* Try all 4 combinations: inv={0,1} x range={0,1} */
+		/* Try both Golay polarities, determine range from W2 value */
 		for (inv = 0; inv < 2; inv++) {
 			if (!golay_ok[inv])
 				continue;
-			for (rng = 0; rng < 2; rng++) {
-				if (reverse_word2(w2_try[inv], try_g1g0[rng], &ta2, &ta1, &ta0) == 0) {
-					if (best_inv < 0) {
-						best_inv = inv;
-						best_range = rng;
-						a2 = ta2; a1 = ta1; a0 = ta0;
+			/* W2 % 100 >= 50 means high range (g1g0 + 50) */
+			det_range = (w2_try[inv] % 100 >= 50) ? 1 : 0;
+			if (reverse_word2(w2_try[inv], g1g0 + det_range * 50, &ta2, &ta1, &ta0) == 0) {
+				if (best_inv < 0) {
+					best_inv = inv;
+					a2 = ta2; a1 = ta1; a0 = ta0;
+					if (det_range) {
+						g1g0 += 50;
+						g1 = g1g0 / 10;
+						g0 = g1g0 % 10;
 					}
-					LOGP(DGOLAY, LOGL_DEBUG, "W2 candidate: value=%u inv=%d g1g0=%d -> A2=%d A1=%d A0=%d.\n",
-						w2_try[inv], inv, try_g1g0[rng], ta2, ta1, ta0);
 				}
+				LOGP(DGOLAY, LOGL_DEBUG, "W2 candidate: value=%u inv=%d g1g0=%d -> A2=%d A1=%d A0=%d.\n",
+					w2_try[inv], inv, g1g0 + (best_inv < 0 ? det_range * 50 : 0), ta2, ta1, ta0);
 			}
 		}
 
@@ -1615,13 +1616,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 		w2_value = w2_try[best_inv];
 		w2_inverted = best_inv;
-
-		/* Update g1g0 if high range was selected */
-		if (best_range == 1) {
-			g1g0 = try_g1g0[1];
-			g1 = g1g0 / 10;
-			g0 = g1g0 % 10;
-		}
 	}
 
 	LOGP(DGOLAY, LOGL_DEBUG, "W2 decoded: %u (inverted=%d, g1g0=%d).\n", w2_value, w2_inverted, g1g0);
@@ -1851,7 +1845,8 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		suffix = '5' + function;
 		break;
 	default: /* TYPE_TONE */
-		suffix = (function == 0) ? '9' : '0';
+		/* Table IX tone suffixes: func 1→9, 2→0, 3→3, 4→4 */
+		suffix = "9034"[function];
 		break;
 	}
 
@@ -2512,13 +2507,9 @@ decode_done:
 					uint32_t w2_cw = read_dup_golay(bits, &batch_pos);
 					uint16_t w2_try[2] = { 0, 0 };
 					int golay_ok[2] = { 0, 0 };
-					int try_g1g0[2];
-					int best_inv = -1, best_range = -1;
+					int best_inv = -1;
 					int ta2, ta1, ta0;
-					int inv, rng;
-
-					try_g1g0[0] = bm_g1g0;
-					try_g1g0[1] = bm_g1g0 + 50;
+					int inv, det_range;
 
 					peek_rc = decode_golay(w2_cw, &peek_val);
 					if (peek_rc == 0) { w2_try[0] = peek_val; golay_ok[0] = 1; }
@@ -2529,12 +2520,16 @@ decode_done:
 					for (inv = 0; inv < 2; inv++) {
 						if (!golay_ok[inv])
 							continue;
-						for (rng = 0; rng < 2; rng++) {
-							if (reverse_word2(w2_try[inv], try_g1g0[rng], &ta2, &ta1, &ta0) == 0) {
-								if (best_inv < 0) {
-									best_inv = inv;
-									best_range = rng;
-									bm_a2 = ta2; bm_a1 = ta1; bm_a0 = ta0;
+						/* W2 % 100 >= 50 means high range */
+						det_range = (w2_try[inv] % 100 >= 50) ? 1 : 0;
+						if (reverse_word2(w2_try[inv], bm_g1g0 + det_range * 50, &ta2, &ta1, &ta0) == 0) {
+							if (best_inv < 0) {
+								best_inv = inv;
+								bm_a2 = ta2; bm_a1 = ta1; bm_a0 = ta0;
+								if (det_range) {
+									bm_g1g0 += 50;
+									bm_g1 = bm_g1g0 / 10;
+									bm_g0 = bm_g1g0 % 10;
 								}
 							}
 						}
@@ -2546,12 +2541,6 @@ decode_done:
 					}
 
 					bm_w2_inverted = best_inv;
-
-					if (best_range == 1) {
-						bm_g1g0 = try_g1g0[1];
-						bm_g1 = bm_g1g0 / 10;
-						bm_g0 = bm_g1g0 % 10;
-					}
 				}
 
 				/* Function from inversion pattern */
@@ -2663,7 +2652,7 @@ decode_done:
 					bm_suffix = '5' + bm_function;
 					break;
 				default:
-					bm_suffix = (bm_function == 0) ? '9' : '0';
+					bm_suffix = "9034"[bm_function];
 					break;
 				}
 
