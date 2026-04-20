@@ -943,9 +943,8 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 void sender_receive(sender_t *sender, sample_t *samples, int length, double __attribute__((unused)) rf_level_db)
 {
 	gsc_t *gsc = (gsc_t *) sender;
-	double phase, bitstep, polarity;
+	double polarity;
 	int i;
-	uint8_t lastbit;
 
 	if (!gsc->rx)
 		return;

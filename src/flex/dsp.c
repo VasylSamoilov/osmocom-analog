@@ -31,8 +31,6 @@
 #include "../liblogging/logging.h"
 #include "../libfilter/iir_filter.h"
 #include "../libmobile/main_mobile.h"
-#include "../libmobile/iq_wave.h"
-#include "../libsdr/sdr.h"
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
@@ -5413,8 +5411,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 
 		if (++flex->rx.data_count == flex->rx.sync_baud * 1760 / 1000) {
 			int bps = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
-			fm_demod_t *demod = flex->rx.fm_demod;
-			double afc_corr = demod ? fm_demod_afc_get_correction(demod) : 0;
+			double afc_corr = 0;
 			double data_dc = (flex->rx.data_dc_count > 0) ?
 				flex->rx.data_dc_sum / flex->rx.data_dc_count : 0.0;
 			double sa[4], sd[4];
@@ -5735,25 +5732,6 @@ void sender_receive(sender_t *sender, sample_t *samples, int length,
 
 	if (!flex->rx.enabled)
 		return;
-
-	/* One-shot: enable AFC in the FM demodulator on first audio.
-	 * The fm_demod is created by the audio backend (iq_wave or SDR)
-	 * during sender_open_audio(), which runs after flex_create().
-	 * We cache the pointer so we don't need backend-specific
-	 * accessors on every frame. */
-	if (!flex->rx.afc_initialized) {
-		fm_demod_t *demod = NULL;
-		if (iq_wave_is_active())
-			demod = iq_wave_get_fm_demod(sender->audio, 0);
-		if (!demod)
-			demod = sdr_get_fm_demod(sender->audio, 0);
-		if (demod) {
-			fm_demod_afc_enable(demod, 5.0, 5000.0);
-			fm_demod_afc_set_deadband(demod, 50.0);
-			flex->rx.fm_demod = demod;
-		}
-		flex->rx.afc_initialized = 1;
-	}
 
 	for (i = 0; i < length; i++)
 		flex_rx_demodulate(flex, (double)samples[i]);

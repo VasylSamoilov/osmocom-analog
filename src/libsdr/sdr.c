@@ -2398,14 +2398,4 @@ int sdr_query_caps(sdr_caps_t *caps)
 	return rc;
 }
 
-fm_demod_t *sdr_get_fm_demod(void *inst, int channel)
-{
-	sdr_t *sdr = (sdr_t *)inst;
 
-	if (!sdr || channel < 0 || channel >= sdr->channels)
-		return NULL;
-	if (sdr->chan[channel].am)
-		return NULL;
-
-	return &sdr->chan[channel].fm_demod;
-}
