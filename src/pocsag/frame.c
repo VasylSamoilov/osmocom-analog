@@ -1413,8 +1413,10 @@ int64_t get_codeword(pocsag_t *pocsag)
 				any_ready_this_group = 0; /* force switch path */
 			}
 
-			/* Force end if batch limit reached */
-			if (pocsag->max_batches > 0 &&
+			/* Force end if batch limit reached (not in network or scan mode) */
+			if (!pocsag->network_mode &&
+			    pocsag->scan_from >= pocsag->scan_to &&
+			    pocsag->max_batches > 0 &&
 			    pocsag->batch_count >= pocsag->max_batches &&
 			    (any_ready_other_group || !any_ready_this_group)) {
 				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Reached %d batch limit, ending transmission.\n", pocsag->max_batches);
@@ -1488,8 +1490,13 @@ int64_t get_codeword(pocsag_t *pocsag)
 					}
 					switched: ;
 				} else {
-					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Transmission done.\n");
-					pocsag_new_state(pocsag, POCSAG_IDLE);
+					if (pocsag->network_mode) {
+						/* Network mode: keep sending idle batches, reset idle count */
+						pocsag->idle_count = 0;
+					} else {
+						LOGP_CHAN(DPOCSAG, LOGL_INFO, "Transmission done.\n");
+						pocsag_new_state(pocsag, POCSAG_IDLE);
+					}
 				}
 			}
 		}

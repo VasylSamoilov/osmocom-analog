@@ -618,7 +618,7 @@ void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint
  * per the POCSAG standard. The function bits provide 4 sub-addresses per RIC,
  * while msg_type determines how the message content is encoded/decoded.
  */
-int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window, int max_batches)
+int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window, int max_batches, int network_mode)
 {
 	pocsag_t *pocsag;
 	int rc;
@@ -657,11 +657,23 @@ int pocsag_create(const char *kanal, double frequency, const char *device, int u
 	pocsag->default_speed = baudrate;
 	pocsag->default_polarity = polarity;
 	pocsag->max_batches = max_batches;
+	pocsag->network_mode = network_mode;
 	pocsag->rx_dedup_window = dedup_window;
 
 	pocsag_display_status();
 
 	LOGP(DPOCSAG, LOGL_NOTICE, "Created 'Kanal' %s\n", kanal);
+
+	/* In network mode, start transmitting immediately (preamble + idle batches) */
+	if (network_mode && tx) {
+		pocsag->tx_speed = baudrate;
+		pocsag->tx_polarity = polarity;
+		pocsag->batch_count = 0;
+		pocsag->msg_count = 0;
+		pocsag_new_state(pocsag, POCSAG_PREAMBLE);
+		pocsag->word_count = 0;
+		LOGP(DPOCSAG, LOGL_INFO, "Network mode: starting continuous transmission.\n");
+	}
 
 	pocsag_scan_or_loopback(pocsag);
 

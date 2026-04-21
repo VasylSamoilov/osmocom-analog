@@ -70,6 +70,7 @@ static enum pocsag_language language = LANGUAGE_DEFAULT;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
 static double dedup_window = 0.0;	/* RX dedup window in seconds (0=disabled) */
+static int network_mode = 0;		/* continuous TX: idle frames when queue empty */
 
 void print_help(const char *arg0)
 {
@@ -137,8 +138,13 @@ void print_help(const char *arg0)
 	printf("        group (default %d). FIFO messages can specify speed= and polarity=\n", max_batches);
 	printf("        per message. Messages are grouped by speed/polarity and transmitted\n");
 	printf("        in separate transmissions (each with its own preamble).\n");
-	printf("        Set to 0 to lock to CLI speed/polarity only — FIFO messages with\n");
+	printf("        Set to 0 to lock to CLI speed/polarity only -- FIFO messages with\n");
 	printf("        different speed/polarity are discarded with a warning.\n");
+	printf("    --network\n");
+	printf("        Network mode: continuous transmission. Sends preamble once at start,\n");
+	printf("        then transmits batches indefinitely. Idle frames fill unused slots.\n");
+	printf("        Messages from the queue are inserted into the stream as they arrive.\n");
+	printf("        The transmitter never powers off.\n");
 	printf("\n");
 	printf("RIC (Radio Identity Code) Structure:\n");
 	printf("      The RIC is a 21-bit pager address (0 to 2097151), formed as follows:\n");
@@ -192,6 +198,7 @@ void print_help(const char *arg0)
 #define OPT_DEDUP	257
 #define OPT_FIFO	258
 #define OPT_MAX_BATCHES	259
+#define OPT_NETWORK	260
 
 static void add_options(void)
 {
@@ -210,6 +217,7 @@ static void add_options(void)
 	option_add(OPT_DEDUP, "dedup", 1);
 	option_add(OPT_MAX_BATCHES, "max-batches", 1);
 	option_add(OPT_FIFO, "fifo", 1);
+	option_add(OPT_NETWORK, "network", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -348,6 +356,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_FIFO:
 		msg_send_path = options_strdup(argv[argi++]);
+		break;
+	case OPT_NETWORK:
+		network_mode = 1;
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -528,7 +539,7 @@ int main(int argc, char *argv[])
 			printf("Invalid channel '%s', Use '-k list' to get a list of all channels.\n\n", kanal[i]);
 			goto fail;
 		}
-		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, !baudrate_given, !polarity_given, dedup_window, max_batches);
+		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, !baudrate_given, !polarity_given, dedup_window, max_batches, network_mode);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;
