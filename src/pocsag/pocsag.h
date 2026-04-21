@@ -157,6 +157,7 @@ typedef struct pocsag {
 	int			word_count;		/* counter for codewords */
 	int			idle_count;		/* counts when to go idle */
 	int			batch_count;		/* batches sent in current transmission */
+	int			msg_count;		/* messages sent in current group transmission */
 	int			tx_speed;		/* baud rate of current transmission */
 	double			tx_polarity;		/* polarity of current transmission */
 	uint32_t		scan_from, scan_to;	/* if not equal: scnning mode */
@@ -241,8 +242,22 @@ typedef struct pocsag {
 	uint32_t		rx_msg_cw_buf[POCSAG_RX_HISTORY_CW_MAX];
 	int8_t			rx_msg_cw_status[POCSAG_RX_HISTORY_CW_MAX];
 
-	/* calls */
-	pocsag_msg_t		*msg_list;		/* linked list of all calls */
+	/* calls — one queue per polarity, speed, and frame for proper POCSAG batch construction.
+	 * Normal and inverted polarity are completely separate networks.
+	 * Index: msg_list[pol][spd][frame]
+	 *   pol: 0=normal(-1.0), 1=inverted(+1.0)
+	 *   spd: 0=512, 1=1200, 2=2400 */
+#define POCSAG_POL_NORMAL	0
+#define POCSAG_POL_INVERTED	1
+#define POCSAG_NUM_POL		2
+#define POCSAG_SPD_512		0
+#define POCSAG_SPD_1200		1
+#define POCSAG_SPD_2400		2
+#define POCSAG_NUM_SPD		3
+	pocsag_msg_t		*msg_list[POCSAG_NUM_POL][POCSAG_NUM_SPD][8];
+
+	/* periodic queue stats */
+	double			last_queue_stats_time;
 
 	/* dsp states */
 	double			fsk_deviation;		/* deviation of FSK signal on sound card */
@@ -287,6 +302,22 @@ typedef struct pocsag {
 	} rx_baud[3];
 	int			rx_baud_count;	/* number of active baud slots */
 } pocsag_t;
+
+/* Map baud rate to speed queue index */
+static inline int pocsag_speed_index(int speed)
+{
+	switch (speed) {
+	case 512:  return POCSAG_SPD_512;
+	case 2400: return POCSAG_SPD_2400;
+	default:   return POCSAG_SPD_1200;
+	}
+}
+
+/* Map polarity to queue index */
+static inline int pocsag_pol_index(double polarity)
+{
+	return (polarity < 0) ? POCSAG_POL_NORMAL : POCSAG_POL_INVERTED;
+}
 
 int msg_receive(const char *text);
 

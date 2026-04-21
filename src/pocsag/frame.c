@@ -1298,12 +1298,10 @@ int64_t get_codeword(pocsag_t *pocsag)
 			break;
 		}
 		/* if we are about to send an address codeword, we search for a pending message */
-		for (msg = pocsag->msg_list; msg; msg = msg->next) {
-			/* skip messages for different speed/polarity group */
-			if (msg->speed != pocsag->tx_speed || msg->polarity != pocsag->tx_polarity)
-				continue;
-			/* if a message matches the right time slot */
-			if ((msg->ric & 7) == slot) {
+		{
+			int tx_pol = pocsag_pol_index(pocsag->tx_polarity);
+			int tx_spd = pocsag_speed_index(pocsag->tx_speed);
+			for (msg = pocsag->msg_list[tx_pol][tx_spd][slot]; msg; msg = msg->next) {
 				/* skip if waiting for retransmit delay */
 				if (msg->next_send_time > 0.0) {
 					struct timeval tv;
@@ -1323,8 +1321,9 @@ int64_t get_codeword(pocsag_t *pocsag)
 			 */
 			LOGP_CHAN(DPOCSAG, LOGL_INFO, "Sending message to RIC '%d' / function '%s' / type '%s'\n",
 				  msg->ric, pocsag_function_name[msg->function], pocsag_msg_type_name(msg->msg_type));
-			/* reset idle counter */
+			/* reset idle counter, count message */
 			pocsag->idle_count = 0;
+			pocsag->msg_count++;
 			/* encode address */
 			word = encode_address(msg);
 			/*
@@ -1380,16 +1379,38 @@ int64_t get_codeword(pocsag_t *pocsag)
 				pocsag_msg_t *m;
 				struct timeval tv;
 				double now;
+				int p, s, f;
+				int tx_pol = pocsag_pol_index(pocsag->tx_polarity);
+				int tx_spd = pocsag_speed_index(pocsag->tx_speed);
 				gettimeofday(&tv, NULL);
 				now = (double)tv.tv_sec + tv.tv_usec / 1e6;
-				for (m = pocsag->msg_list; m; m = m->next) {
-					if (m->next_send_time > 0.0 && now < m->next_send_time)
-						continue;
-					if (m->speed == pocsag->tx_speed && m->polarity == pocsag->tx_polarity)
-						any_ready_this_group = 1;
-					else
-						any_ready_other_group = 1;
+				for (p = 0; p < POCSAG_NUM_POL; p++) {
+					for (s = 0; s < POCSAG_NUM_SPD; s++) {
+						for (f = 0; f < 8; f++) {
+							for (m = pocsag->msg_list[p][s][f]; m; m = m->next) {
+								if (m->next_send_time > 0.0 && now < m->next_send_time)
+									continue;
+								if (p == tx_pol && s == tx_spd)
+									any_ready_this_group = 1;
+								else
+									any_ready_other_group = 1;
+							}
+						}
+					}
 				}
+			}
+
+			/*
+			 * Yield to other speed/polarity groups after every 100 messages,
+			 * but only if another group actually has messages waiting.
+			 * Switching is expensive (silence + preamble), so don't switch
+			 * unless there's a reason to.
+			 */
+			if (any_ready_other_group &&
+			    any_ready_this_group &&
+			    pocsag->msg_count >= 100) {
+				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Sent %d messages, yielding to other group.\n", pocsag->msg_count);
+				any_ready_this_group = 0; /* force switch path */
 			}
 
 			/* Force end if batch limit reached */
@@ -1402,29 +1423,70 @@ int64_t get_codeword(pocsag_t *pocsag)
 
 			if (!any_ready_this_group && pocsag->idle_count++ == IDLE_BATCHES) {
 				if (any_ready_other_group) {
-					/* Switch to next speed/polarity group */
+					/*
+					 * Carousel group switching.
+					 * Fixed order: 1200n→512n→2400n→1200i→512i→2400i→wrap
+					 * Starting from current group, check the next in sequence.
+					 * This ensures every group gets fair access.
+					 */
+					static const struct { int speed; double polarity; } carousel[] = {
+						{ 1200, -1.0 },  /* 1200 normal */
+						{  512, -1.0 },  /*  512 normal */
+						{ 2400, -1.0 },  /* 2400 normal */
+						{ 1200,  1.0 },  /* 1200 inverted */
+						{  512,  1.0 },  /*  512 inverted */
+						{ 2400,  1.0 },  /* 2400 inverted */
+					};
+					int ngroups = sizeof(carousel) / sizeof(carousel[0]);
+					int cur, i;
 					pocsag_msg_t *m;
 					struct timeval tv;
 					double now;
+					int f;
+
+					/* find current position in carousel */
+					for (cur = 0; cur < ngroups; cur++) {
+						if (carousel[cur].speed == pocsag->tx_speed &&
+						    carousel[cur].polarity == pocsag->tx_polarity)
+							break;
+					}
+					if (cur >= ngroups)
+						cur = 0; /* fallback */
+
 					gettimeofday(&tv, NULL);
 					now = (double)tv.tv_sec + tv.tv_usec / 1e6;
-					for (m = pocsag->msg_list; m; m = m->next) {
-						if (m->next_send_time > 0.0 && now < m->next_send_time)
-							continue;
-						if (m->speed != pocsag->tx_speed || m->polarity != pocsag->tx_polarity) {
-							LOGP_CHAN(DPOCSAG, LOGL_INFO, "Switching to %d baud, %s polarity.\n",
-								  m->speed, (m->polarity < 0) ? "normal" : "inverted");
-							pocsag->tx_speed = m->speed;
-							pocsag->tx_polarity = m->polarity;
+
+					/* check next groups in carousel order */
+					for (i = 1; i < ngroups; i++) {
+						int idx = (cur + i) % ngroups;
+						int cspeed = carousel[idx].speed;
+						double cpol = carousel[idx].polarity;
+						int cpol_idx = pocsag_pol_index(cpol);
+						int cspd_idx = pocsag_speed_index(cspeed);
+						int has_ready = 0;
+
+						for (f = 0; f < 8 && !has_ready; f++) {
+							for (m = pocsag->msg_list[cpol_idx][cspd_idx][f]; m; m = m->next) {
+								if (m->next_send_time > 0.0 && now < m->next_send_time)
+									continue;
+								has_ready = 1;
+								break;
+							}
+						}
+						if (has_ready) {
+							LOGP_CHAN(DPOCSAG, LOGL_INFO, "Carousel: switching to %d baud, %s polarity.\n",
+								  cspeed, (cpol < 0) ? "normal" : "inverted");
+							pocsag->tx_speed = cspeed;
+							pocsag->tx_polarity = cpol;
 							pocsag->batch_count = 0;
-							/* Enter silence gap before new preamble.
-							 * TX DSP reconfiguration happens at end of silence. */
+							pocsag->msg_count = 0;
 							pocsag_new_state(pocsag, POCSAG_SILENCE);
 							pocsag->word_count = 0;
 							pocsag->idle_count = 0;
-							break;
+							goto switched;
 						}
 					}
+					switched: ;
 				} else {
 					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Transmission done.\n");
 					pocsag_new_state(pocsag, POCSAG_IDLE);

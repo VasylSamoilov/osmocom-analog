@@ -356,8 +356,14 @@ static void pocsag_display_status(void)
 	for (sender = sender_head; sender; sender = sender->next) {
 		pocsag = (pocsag_t *) sender;
 		display_status_channel(pocsag->sender.kanal, NULL, pocsag_state_name[pocsag->state]);
-		for (msg = pocsag->msg_list; msg; msg = msg->next)
-			display_status_subscriber(print_ric(msg), NULL);
+		{
+			int p, s, f;
+			for (p = 0; p < POCSAG_NUM_POL; p++)
+				for (s = 0; s < POCSAG_NUM_SPD; s++)
+					for (f = 0; f < 8; f++)
+						for (msg = pocsag->msg_list[p][s][f]; msg; msg = msg->next)
+							display_status_subscriber(print_ric(msg), NULL);
+		}
 	}
 	display_status_end();
 }
@@ -407,18 +413,24 @@ static pocsag_msg_t *pocsag_msg_create(pocsag_t *pocsag, uint32_t callref, uint3
 	msg->speed = pocsag->default_speed;
 	msg->polarity = pocsag->default_polarity;
 
-	/* link */
+	/* link to per-frame, per-polarity queue */
 	msg->pocsag = pocsag;
-	msgp = &pocsag->msg_list;
-	while ((*msgp))
-		msgp = &(*msgp)->next;
-	(*msgp) = msg;
+	{
+		uint8_t frame = ric & 7;
+		int pol = pocsag_pol_index(msg->polarity);
+		int spd = pocsag_speed_index(msg->speed);
+		msgp = &pocsag->msg_list[pol][spd][frame];
+		while ((*msgp))
+			msgp = &(*msgp)->next;
+		(*msgp) = msg;
+	}
 
 	/* kick transmitter */
 	if (pocsag->state == POCSAG_IDLE) {
 		pocsag->tx_speed = msg->speed;
 		pocsag->tx_polarity = msg->polarity;
 		pocsag->batch_count = 0;
+		pocsag->msg_count = 0;
 		pocsag_new_state(pocsag, POCSAG_PREAMBLE);
 		pocsag->word_count = 0;
 	} else
@@ -432,11 +444,16 @@ void pocsag_msg_destroy(pocsag_msg_t *msg)
 {
 	pocsag_msg_t **msgp;
 
-	/* unlink */
-	msgp = &msg->pocsag->msg_list;
-	while ((*msgp) != msg)
-		msgp = &(*msgp)->next;
-	(*msgp) = msg->next;
+	/* unlink from per-frame, per-polarity queue */
+	{
+		uint8_t frame = msg->ric & 7;
+		int pol = pocsag_pol_index(msg->polarity);
+		int spd = pocsag_speed_index(msg->speed);
+		msgp = &msg->pocsag->msg_list[pol][spd][frame];
+		while ((*msgp) != msg)
+			msgp = &(*msgp)->next;
+		(*msgp) = msg->next;
+	}
 
 	/* remove from current transmitting message */
 	if (msg == msg->pocsag->current_msg)
@@ -455,32 +472,26 @@ static int pocsag_scan_or_loopback(pocsag_t *pocsag)
 		char message[16];
 		uint32_t ric;
 		int queued = 0;
-		uint8_t slots_used = 0; /* bitmask of frame slots already in queue */
-		pocsag_msg_t *m;
 
 		/*
-		 * Batch-fill: enqueue messages to fill all 8 frame slots.
-		 * First, check which slots are already occupied by pending
-		 * messages in the queue.
+		 * Batch-fill: enqueue one message per frame slot.
+		 * With per-frame queues, we simply check if the target
+		 * frame's queue is empty before enqueuing.
 		 */
-		for (m = pocsag->msg_list; m; m = m->next)
-			slots_used |= (1 << (m->ric & 7));
+		int scan_pol = pocsag_pol_index(pocsag->default_polarity);
+		int scan_spd = pocsag_speed_index(pocsag->default_speed);
+		for (ric = pocsag->scan_from; ric < pocsag->scan_to; ric++) {
+			uint8_t frame = ric & 7;
 
-		/*
-		 * Now fill empty slots with the next RICs from the scan range.
-		 * This packs up to 8 messages into a single POCSAG batch,
-		 * dramatically reducing scan time compared to one-at-a-time.
-		 *
-		 * The message payload encodes the RIC itself so the operator
-		 * can identify which capcode the pager responded to.
-		 */
-		for (ric = pocsag->scan_from; ric < pocsag->scan_to && slots_used != 0xFF; ric++) {
-			uint8_t slot = ric & 7;
-
-			/* skip if this frame slot is already occupied */
-			if (slots_used & (1 << slot))
+			/* skip reserved idle codeword RICs (2007664-2007671) */
+			if ((ric & 0xfffffff8) == 2007664) {
+				pocsag->scan_from = ric + 1;
 				continue;
-			slots_used |= (1 << slot);
+			}
+
+			/* stop if this frame already has a pending message */
+			if (pocsag->msg_list[scan_pol][scan_spd][frame])
+				break;
 
 			/*
 			 * Generate scan message based on configured message type.
@@ -509,8 +520,8 @@ static int pocsag_scan_or_loopback(pocsag_t *pocsag)
 			queued++;
 		}
 
-		/* advance scan_from past everything we considered */
-		pocsag->scan_from = ric;
+		/* only advance past RICs we actually enqueued */
+		pocsag->scan_from = pocsag->scan_from + queued;
 
 		return queued > 0;
 	}
@@ -669,8 +680,14 @@ void pocsag_destroy(sender_t *sender)
 
 	LOGP(DPOCSAG, LOGL_DEBUG, "Destroying 'POCSAG' instance for 'Kanal' = %s.\n", sender->kanal);
 
-	while (pocsag->msg_list)
-		pocsag_msg_destroy(pocsag->msg_list);
+	{
+		int p, s, f;
+		for (p = 0; p < POCSAG_NUM_POL; p++)
+			for (s = 0; s < POCSAG_NUM_SPD; s++)
+				for (f = 0; f < 8; f++)
+					while (pocsag->msg_list[p][s][f])
+						pocsag_msg_destroy(pocsag->msg_list[p][s][f]);
+	}
 	dsp_cleanup_sender(pocsag);
 
 	/* free dynamic rx message buffers */
@@ -1067,18 +1084,50 @@ void call_down_clock(void)
 	 * If the transmitter is idle and a message is ready, kick it. */
 	for (sender = sender_head; sender; sender = sender->next) {
 		pocsag = (pocsag_t *)sender;
+
+		/* Periodic queue stats (every 5 seconds) */
+		if (now - pocsag->last_queue_stats_time >= 5.0) {
+			int p, s, f;
+			int total = 0, per_pol[POCSAG_NUM_POL] = {0};
+			for (p = 0; p < POCSAG_NUM_POL; p++) {
+				for (s = 0; s < POCSAG_NUM_SPD; s++) {
+					for (f = 0; f < 8; f++) {
+						for (msg = pocsag->msg_list[p][s][f]; msg; msg = msg->next) {
+							per_pol[p]++;
+							total++;
+						}
+					}
+				}
+			}
+			if (total > 0) {
+				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Queue stats: %d msgs (normal=%d, inverted=%d) state=%s batch=%d\n",
+					  total, per_pol[POCSAG_POL_NORMAL], per_pol[POCSAG_POL_INVERTED],
+					  pocsag_state_name[pocsag->state], pocsag->batch_count);
+			}
+			pocsag->last_queue_stats_time = now;
+		}
+
 		if (!pocsag->tx || pocsag->state != POCSAG_IDLE)
 			continue;
-		for (msg = pocsag->msg_list; msg; msg = msg->next) {
-			if (msg->next_send_time > 0.0 && now >= msg->next_send_time) {
-				LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission for RIC %d now eligible, starting TX.\n", msg->ric);
-				pocsag->tx_speed = msg->speed;
-				pocsag->tx_polarity = msg->polarity;
-				pocsag->batch_count = 0;
-				pocsag_new_state(pocsag, POCSAG_PREAMBLE);
-				pocsag->word_count = 0;
-				break;
-			}
+		{
+			int p, s, f;
+			int kicked = 0;
+			for (p = 0; p < POCSAG_NUM_POL && !kicked; p++)
+				for (s = 0; s < POCSAG_NUM_SPD && !kicked; s++)
+					for (f = 0; f < 8 && !kicked; f++) {
+						for (msg = pocsag->msg_list[p][s][f]; msg; msg = msg->next) {
+							if (msg->next_send_time > 0.0 && now >= msg->next_send_time) {
+								LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission for RIC %d now eligible, starting TX.\n", msg->ric);
+								pocsag->tx_speed = msg->speed;
+								pocsag->tx_polarity = msg->polarity;
+								pocsag->batch_count = 0;
+								pocsag_new_state(pocsag, POCSAG_PREAMBLE);
+								pocsag->word_count = 0;
+								kicked = 1;
+								break;
+							}
+						}
+					}
 		}
 	}
 }
