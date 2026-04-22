@@ -92,6 +92,7 @@ static int default_retransmit_interval = 128;	/* --retransmit-interval: 1-1920 f
 static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (immediate) */
 static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: block-boundary fixup */
 static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
+static int oneshot = 0;				/* --oneshot: enqueue + ERS + TX + exit */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -124,6 +125,7 @@ static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
 #define OPT_BIW_SSID1		3031
 #define OPT_BIW_SSID2		3032
 #define OPT_RETRO_TIME		3033
+#define OPT_ONESHOT		3034
 
 void print_help(const char *arg0)
 {
@@ -205,6 +207,11 @@ void print_help(const char *arg0)
 	printf("    --no-ers\n");
 	printf("        Skip ERS burst in single-shot mode (workaround for decoders\n");
 	printf("        that choke on ERS sync patterns, e.g. PDW).\n");
+	printf("    --oneshot\n");
+	printf("        Fully automatic single message TX: enqueue message from CLI\n");
+	printf("        args (capcode, -y type, -M message), send ERS, transmit\n");
+	printf("        4 frames (R=1/R=0 x both polarities), then exit.\n");
+	printf("        Implies -T. No interactive console needed.\n");
 	printf("    --ers-cycles <N>\n");
 	printf("        Override ERS cycle count (default auto).\n");
 	printf("    --charset <ascii|kanji>\n");
@@ -416,6 +423,7 @@ static void add_options(void)
 	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
 	option_add(OPT_NO_ERS, "no-ers", 0);
+	option_add(OPT_ONESHOT, "oneshot", 0);
 	option_add(OPT_PHASE, "phase", 1);
 	option_add(OPT_WAV_TEST, "wav-test", 0);
 	option_add(OPT_BLOCKING, "blocking", 1);
@@ -719,6 +727,10 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_NO_ERS:
 		no_ers = 1;
 		break;
+	case OPT_ONESHOT:
+		oneshot = 1;
+		tx = 1;
+		break;
 	case OPT_PHASE:
 		if (!strcasecmp(argv[argi], "auto") || !strcmp(argv[argi], "-1"))
 			default_phase = -1;
@@ -827,7 +839,7 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	/* defaults — use fixed speed/modulation if set, else 1600/2FSK */
 	*speed = (fixed_speed > 0) ? fixed_speed : 1600;
 	*modulation_type = (fixed_speed > 0) ? fixed_mod_type : FLEX_MOD_2FSK;
-	*polarity_out = FLEX_DEFAULT_POLARITY;
+	*polarity_out = (polarity != 0.0) ? polarity : FLEX_DEFAULT_POLARITY;
 	*priority = 0;
 	*charset = 0;
 	*is_temp_group = 0;
@@ -2501,6 +2513,16 @@ int main(int argc, char *argv[])
 		goto fail;
 	}
 
+	/* --oneshot conflicts with --network and scan */
+	if (oneshot && network_mode) {
+		fprintf(stderr, "--oneshot and --network are mutually exclusive.\n");
+		goto fail;
+	}
+	if (oneshot && scan_to > scan_from) {
+		fprintf(stderr, "--oneshot and --scan are mutually exclusive.\n");
+		goto fail;
+	}
+
 	/* scan mode: default to short numeric if user didn't specify -y */
 	if (scan_to > scan_from && !msg_type_given)
 		msg_type = FLEX_MSG_TYPE_SHORT;
@@ -2630,7 +2652,7 @@ int main(int argc, char *argv[])
 	 * "capcode,type,,message" format and we're not in network mode,
 	 * parse it as a FIFO line to enqueue the message and trigger
 	 * transmission immediately (no interactive console needed). */
-	if (station_id[0] && !network_mode) {
+	if (station_id[0] && !network_mode && !oneshot) {
 		fifo_process_line(station_id, (int)strlen(station_id));
 		{
 			sender_t *s;
@@ -2642,6 +2664,44 @@ int main(int argc, char *argv[])
 					     "One-shot: auto-enqueued from CLI, TX triggered.\n");
 				}
 			}
+		}
+	}
+
+	/* --oneshot: build message from CLI args and fire immediately */
+	if (oneshot) {
+		flex_t *flex = (flex_t *)sender_head;
+		if (!flex || !flex->tx) {
+			fprintf(stderr, "--oneshot requires a transmitter instance.\n");
+			goto fail;
+		}
+		if (!station_id[0]) {
+			fprintf(stderr, "--oneshot requires a capcode as positional argument.\n");
+			goto fail;
+		}
+		{
+			char fifo_line[4096];
+			int len;
+			const char *type_name = "auto";
+			if (msg_type_given)
+				type_name = flex_msg_type_name(msg_type);
+			len = snprintf(fifo_line, sizeof(fifo_line),
+				       "%s,%s,,%s",
+				       station_id, type_name, message);
+			if (len > 0 && len < (int)sizeof(fifo_line))
+				fifo_process_line(fifo_line, len);
+			if (!flex->msg_list) {
+				fprintf(stderr, "--oneshot: failed to enqueue message.\n");
+				goto fail;
+			}
+			/* Apply --speed if given */
+			if (fixed_speed > 0) {
+				flex->msg_list->speed = fixed_speed;
+				flex->msg_list->modulation_type = fixed_mod_type;
+			}
+			LOGP(DFLEX, LOGL_INFO,
+			     "One-shot: capcode=%s type=%s speed=%d message=\"%s\"\n",
+			     station_id, type_name,
+			     flex->msg_list->speed, message);
 		}
 	}
 

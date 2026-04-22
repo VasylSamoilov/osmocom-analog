@@ -933,6 +933,18 @@ static void flex_fragment_queue(flex_t *flex)
 		if (msg->total_fragments > 0)
 			continue;
 
+		/* Compute secure message signature if not yet set.
+		 * secure_encoding isn't known at flex_msg_create() time,
+		 * so we compute it here for all secure messages (fragmented
+		 * or not). */
+		if (msg->precomputed_sig == 0xFFFFFFFF &&
+		    msg->msg_type == FLEX_MSG_TYPE_SECURE) {
+			if (msg->secure_encoding == 0)
+				msg->precomputed_sig = flex_compute_alpha_signature(msg->data, msg->data_length);
+			else if (msg->secure_encoding == 1)
+				msg->precomputed_sig = flex_compute_hex_signature(msg->data, msg->data_length);
+		}
+
 		/* Fits in one frame? Skip. */
 		if (msg->data_length <= max_chars)
 			continue;
@@ -959,15 +971,8 @@ static void flex_fragment_queue(flex_t *flex)
 		     "Fragmenting message for capcode %" PRIu64 " into %d fragments (retrieval=%u).\n",
 		     msg->capcode, frag_count, ret_num);
 
-		/* The whole-message signature was pre-computed at message creation
-		 * time (precomputed_sig). For secure messages, compute it now
-		 * since encoding mode wasn't known at creation time. */
-		if (msg->precomputed_sig == 0xFFFFFFFF) {
-			if (msg->msg_type == FLEX_MSG_TYPE_SECURE && msg->secure_encoding == 0)
-				msg->precomputed_sig = flex_compute_alpha_signature(msg->data, msg->data_length);
-			else if (msg->msg_type == FLEX_MSG_TYPE_SECURE && msg->secure_encoding == 1)
-				msg->precomputed_sig = flex_compute_hex_signature(msg->data, msg->data_length);
-		}
+		/* precomputed_sig was already computed above for all types
+		 * (alpha/hex at creation, secure earlier in this function). */
 
 		/* Create fragment messages and insert them in place of the original.
 		 * We insert after the original, then destroy the original.
@@ -3498,6 +3503,7 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.hex_r_flag = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
 			frame_msg.numbered_r = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
 			frame_msg.sysmsg_method = msg->sysmsg_method;
+			frame_msg.precomputed_sig = msg->precomputed_sig;
 
 			/* Frame params: always cycle=0, frame=0.
 			 * Include BIW fields when configured. */
