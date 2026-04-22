@@ -52,6 +52,7 @@ static int voice_monitor = 0;		/* voice monitor mode (play to audio output) */
 static int batching_mode = BATCHING_OFF;
 static int protocol_dump = 0;
 static int nbs_mode = 0;
+static int oneshot = 0;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
 static enum gsc_msg_type scan_type = TYPE_NUMERIC;
@@ -94,6 +95,10 @@ void print_help(const char *arg0)
 	printf("    --nbs\n");
 	printf("        Non-battery-saver mode: use 75 Hz preamble without coded preamble\n");
 	printf("        or start code. Higher throughput, but no battery saving groups.\n");
+	printf("    --oneshot\n");
+	printf("        Automatic single message TX: enqueue message from CLI args\n");
+	printf("        (address, -y type, -M message), transmit, then exit.\n");
+	printf("        Implies -T. No interactive console needed.\n");
 	printf(" -y --type auto | tone | voice | numeric | alpha\n");
 	printf("        Override message type for console and scan modes (default auto).\n");
 	printf("        'auto' determines type from the 7th address digit:\n");
@@ -148,6 +153,7 @@ static void add_options(void)
 	option_add(0x101, "fifo", 1);
 	option_add(0x102, "protocol-dump", 0);
 	option_add(0x103, "nbs", 0);
+	option_add(0x104, "oneshot", 0);
 	option_add('S', "scan", 2);
 	option_add('y', "type", 1);
 }
@@ -222,6 +228,10 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 0x103: /* --nbs */
 		nbs_mode = 1;
+		break;
+	case 0x104: /* --oneshot */
+		oneshot = 1;
+		tx = 1;
 		break;
 	case 'S':
 		scan_from = atoi(argv[argi++]);
@@ -326,6 +336,16 @@ static void myhandler(void)
 		}
 		/* If start == 0, no newline was found yet — keep accumulating */
 	}
+
+	/* --oneshot: quit after transmission completes */
+	if (oneshot) {
+		gsc_t *gsc = (gsc_t *)sender_head;
+		if (gsc && gsc->bit_num == 0 &&
+		    !gsc->msg_list &&
+		    gsc->priority_count == 0 &&
+		    gsc->normal_count == 0)
+			quit = 1;
+	}
 }
 
 static const struct number_lengths number_lengths[] = {
@@ -394,6 +414,12 @@ int main(int argc, char *argv[])
 		goto fail;
 	}
 
+	/* --oneshot conflicts with scan */
+	if (oneshot && scan_to > scan_from) {
+		fprintf(stderr, "--oneshot and --scan are mutually exclusive.\n");
+		goto fail;
+	}
+
 	/* TX & RX if loopback */
 	if (loopback)
 		tx = rx = 1;
@@ -442,6 +468,25 @@ int main(int argc, char *argv[])
 			}
 		}
 		printf("Base station ready, please tune transmitter (or receiver) to %.4f MHz\n", frequency / 1e6);
+	}
+
+	/* --oneshot: enqueue message from CLI args and quit when TX done */
+	if (oneshot) {
+		if (!station_id[0]) {
+			fprintf(stderr, "--oneshot requires an address as positional argument.\n");
+			goto fail;
+		}
+		{
+			char fifo_line[4096];
+			char type_char = 'a'; /* default auto */
+			if (default_msg_type == TYPE_NUMERIC) type_char = 'n';
+			else if (default_msg_type == TYPE_ALPHA) type_char = 'a';
+			else if (default_msg_type == TYPE_TONE) type_char = 't';
+			else if (default_msg_type == TYPE_VOICE) type_char = 'v';
+			snprintf(fifo_line, sizeof(fifo_line),
+				 "%s,%c,%s", station_id, type_char, message);
+			golay_msg_send(fifo_line);
+		}
 	}
 
 	main_mobile_loop("golay", &quit, myhandler, station_id);

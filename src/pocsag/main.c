@@ -71,6 +71,7 @@ static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
 static double dedup_window = 0.0;	/* RX dedup window in seconds (0=disabled) */
 static int network_mode = 0;		/* continuous TX: idle frames when queue empty */
+static int oneshot = 0;
 
 void print_help(const char *arg0)
 {
@@ -145,6 +146,10 @@ void print_help(const char *arg0)
 	printf("        then transmits batches indefinitely. Idle frames fill unused slots.\n");
 	printf("        Messages from the queue are inserted into the stream as they arrive.\n");
 	printf("        The transmitter never powers off.\n");
+	printf("    --oneshot\n");
+	printf("        Automatic single message TX: enqueue message from CLI args\n");
+	printf("        (capcode, -F function, -y type, -M message), transmit, then exit.\n");
+	printf("        Implies -T. No interactive console needed.\n");
 	printf("\n");
 	printf("RIC (Radio Identity Code) Structure:\n");
 	printf("      The RIC is a 21-bit pager address (0 to 2097151), formed as follows:\n");
@@ -199,6 +204,7 @@ void print_help(const char *arg0)
 #define OPT_FIFO	258
 #define OPT_MAX_BATCHES	259
 #define OPT_NETWORK	260
+#define OPT_ONESHOT	261
 
 static void add_options(void)
 {
@@ -218,6 +224,7 @@ static void add_options(void)
 	option_add(OPT_MAX_BATCHES, "max-batches", 1);
 	option_add(OPT_FIFO, "fifo", 1);
 	option_add(OPT_NETWORK, "network", 0);
+	option_add(OPT_ONESHOT, "oneshot", 0);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -360,6 +367,10 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_NETWORK:
 		network_mode = 1;
 		break;
+	case OPT_ONESHOT:
+		oneshot = 1;
+		tx = 1;
+		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
 	}
@@ -417,6 +428,13 @@ static void myhandler(void)
 		} else if (start >= buf_len) {
 			buf_len = 0;
 		}
+	}
+
+	/* --oneshot: quit after transmission completes */
+	if (oneshot) {
+		pocsag_t *pocsag = (pocsag_t *)sender_head;
+		if (pocsag && pocsag->state == POCSAG_IDLE)
+			quit = 1;
 	}
 }
 
@@ -510,6 +528,16 @@ int main(int argc, char *argv[])
 		goto fail;
 	}
 
+	/* --oneshot conflicts with --network and scan */
+	if (oneshot && network_mode) {
+		fprintf(stderr, "--oneshot and --network are mutually exclusive.\n");
+		goto fail;
+	}
+	if (oneshot && scan_to > scan_from) {
+		fprintf(stderr, "--oneshot and --scan are mutually exclusive.\n");
+		goto fail;
+	}
+
 	/* scan mode: default to numeric if user didn't specify -y */
 	if (scan_to > scan_from && !msg_type_given)
 		msg_type = POCSAG_MSG_TYPE_NUMERIC;
@@ -545,6 +573,26 @@ int main(int argc, char *argv[])
 			goto fail;
 		}
 		printf("Base station ready, please tune transmitter (or receiver) to %.4f MHz\n", frequency / 1e6);
+	}
+
+	/* --oneshot: enqueue message from CLI args and quit when TX done */
+	if (oneshot) {
+		if (!station_id[0]) {
+			fprintf(stderr, "--oneshot requires a RIC as positional argument.\n");
+			goto fail;
+		}
+		{
+			char fifo_line[4096];
+			int len;
+			len = snprintf(fifo_line, sizeof(fifo_line),
+				       "%s%s,%s,,%s",
+				       station_id,
+				       pocsag_function_name[function],
+				       pocsag_msg_type_name(msg_type),
+				       message);
+			if (len > 0 && len < (int)sizeof(fifo_line))
+				pocsag_msg_send(language, fifo_line, len);
+		}
 	}
 
 	main_mobile_loop("pocsag", &quit, myhandler, station_id);
