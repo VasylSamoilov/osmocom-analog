@@ -38,6 +38,9 @@
 #include "frame.h"
 #include "dsp.h"
 #include "scheduler.h"
+#ifdef HAVE_SDR
+#include "../libsdr/sdr.h"
+#endif
 
 #define MSG_SEND_DEFAULT "/tmp/flex_msg_send"
 static const char *msg_send_path = MSG_SEND_DEFAULT;
@@ -93,6 +96,11 @@ static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (i
 static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: block-boundary fixup */
 static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
 static int oneshot = 0;				/* --oneshot: enqueue + ERS + TX + exit */
+static double oneshot_freq_start = 0.0;		/* --oneshot sweep: start freq Hz */
+static double oneshot_freq_stop = 0.0;		/* --oneshot sweep: stop freq Hz */
+static double oneshot_freq_step = 0.0;		/* --oneshot sweep: step Hz */
+static double oneshot_freq_current = 0.0;	/* current sweep frequency */
+static const char *oneshot_station_id = "";	/* saved capcode for sweep re-enqueue */
 
 /* Long-only option IDs (3000+ range to avoid conflicts with main_mobile) */
 #define OPT_NETWORK		3000
@@ -126,6 +134,7 @@ static int oneshot = 0;				/* --oneshot: enqueue + ERS + TX + exit */
 #define OPT_BIW_SSID2		3032
 #define OPT_RETRO_TIME		3033
 #define OPT_ONESHOT		3034
+#define OPT_ONESHOT_FREQ	3035
 
 void print_help(const char *arg0)
 {
@@ -212,6 +221,10 @@ void print_help(const char *arg0)
 	printf("        args (capcode, -y type, -M message), send ERS, transmit\n");
 	printf("        4 frames (R=1/R=0 x both polarities), then exit.\n");
 	printf("        Implies -T. No interactive console needed.\n");
+	printf("    --oneshot-freq <start>,<stop>,<step>\n");
+	printf("        Frequency sweep with --oneshot. Frequencies in MHz, step in kHz.\n");
+	printf("        Transmits one-shot on each frequency from start to stop.\n");
+	printf("        Example: --oneshot-freq 940.0125,941.0125,25\n");
 	printf("    --ers-cycles <N>\n");
 	printf("        Override ERS cycle count (default auto).\n");
 	printf("    --charset <ascii|kanji>\n");
@@ -424,6 +437,7 @@ static void add_options(void)
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
 	option_add(OPT_NO_ERS, "no-ers", 0);
 	option_add(OPT_ONESHOT, "oneshot", 0);
+	option_add(OPT_ONESHOT_FREQ, "oneshot-freq", 1);
 	option_add(OPT_PHASE, "phase", 1);
 	option_add(OPT_WAV_TEST, "wav-test", 0);
 	option_add(OPT_BLOCKING, "blocking", 1);
@@ -730,6 +744,21 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_ONESHOT:
 		oneshot = 1;
 		tx = 1;
+		break;
+	case OPT_ONESHOT_FREQ:
+		oneshot = 1;
+		tx = 1;
+		{
+			double f1 = 0, f2 = 0, step_khz = 0;
+			if (sscanf(argv[argi], "%lf,%lf,%lf", &f1, &f2, &step_khz) != 3 ||
+			    f1 <= 0 || f2 <= 0 || step_khz <= 0 || f2 < f1) {
+				fprintf(stderr, "--oneshot-freq requires start,stop,step (MHz,MHz,kHz). Example: 940.0125,941.0125,25\n");
+				return -EINVAL;
+			}
+			oneshot_freq_start = f1 * 1e6;
+			oneshot_freq_stop = f2 * 1e6;
+			oneshot_freq_step = step_khz * 1e3;
+		}
 		break;
 	case OPT_PHASE:
 		if (!strcasecmp(argv[argi], "auto") || !strcmp(argv[argi], "-1"))
@@ -2442,8 +2471,42 @@ static void myhandler(void)
 	if (quit_after_time > 0) {
 		double now = get_time();
 		if (now >= quit_after_time) {
-			quit = 1;
 			quit_after_time = 0;
+
+			/* Frequency sweep: retune and re-enqueue instead of quitting */
+			if (oneshot && oneshot_freq_step > 0 &&
+			    oneshot_freq_current + oneshot_freq_step <= oneshot_freq_stop + 0.5) {
+				flex_t *flex = (flex_t *)sender_head;
+				oneshot_freq_current += oneshot_freq_step;
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "One-shot sweep: retuning to %.4f MHz\n",
+				     oneshot_freq_current / 1e6);
+#ifdef HAVE_SDR
+				if (use_sdr) {
+					sdr_set_tx_frequency(oneshot_freq_current);
+					sdr_set_rx_frequency(oneshot_freq_current);
+				}
+#endif
+				/* Re-enqueue the message */
+				{
+					char fifo_line[4096];
+					int len;
+					const char *type_name = "auto";
+					if (msg_type_given)
+						type_name = flex_msg_type_name(msg_type);
+					len = snprintf(fifo_line, sizeof(fifo_line),
+						       "%s,%s,,%s",
+						       oneshot_station_id, type_name, message);
+					if (len > 0 && len < (int)sizeof(fifo_line))
+						fifo_process_line(fifo_line, len);
+					if (flex && flex->msg_list && fixed_speed > 0) {
+						flex->msg_list->speed = fixed_speed;
+						flex->msg_list->modulation_type = fixed_mod_type;
+					}
+				}
+			} else {
+				quit = 1;
+			}
 		}
 	}
 }
@@ -2678,6 +2741,12 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "--oneshot requires a capcode as positional argument.\n");
 			goto fail;
 		}
+		oneshot_station_id = station_id;
+		/* Init sweep frequency from -k if --oneshot-freq not given */
+		if (oneshot_freq_start == 0.0)
+			oneshot_freq_current = atof(kanal[0]) * 1e6;
+		else
+			oneshot_freq_current = oneshot_freq_start;
 		{
 			char fifo_line[4096];
 			int len;
@@ -2702,6 +2771,12 @@ int main(int argc, char *argv[])
 			     "One-shot: capcode=%s type=%s speed=%d message=\"%s\"\n",
 			     station_id, type_name,
 			     flex->msg_list->speed, message);
+			if (oneshot_freq_step > 0)
+				LOGP(DFLEX, LOGL_INFO,
+				     "One-shot sweep: %.4f -> %.4f MHz, step %.0f kHz\n",
+				     oneshot_freq_start / 1e6,
+				     oneshot_freq_stop / 1e6,
+				     oneshot_freq_step / 1e3);
 		}
 	}
 
