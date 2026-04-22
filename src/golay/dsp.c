@@ -1020,7 +1020,7 @@ again:
 	if (gsc->wait_2_sec) {
 		int tosend = MIN(length, gsc->wait_2_sec);
 		memset(power, 1, tosend);
-		memset(samples, 0, sizeof(samples) * tosend);
+		memset(samples, 0, sizeof(*samples) * tosend);
 		power += tosend;
 		samples += tosend;
 		gsc->wait_2_sec -= tosend;
@@ -1072,8 +1072,38 @@ again:
 
 		/* no message, power is off */
 		if (bit < 0) {
-			memset(samples, 0, sizeof(samples) * length);
-			memset(power, 0, length);
+			/* Append one extra bit duration of the last FSK level
+			 * as a guard before going silent.  This prevents the
+			 * receiver PLL from drifting into silence during the
+			 * last symbol's vote window, which can cause decode
+			 * errors in one-shot operation.
+			 *
+			 * fsk_tx_buffer_length is already 0 (cleared by the
+			 * output loop), but fsk_tx_buffer_pos still equals the
+			 * old length and the sample data is still in the buffer. */
+			if (gsc->fsk_tx_buffer_pos > 0 &&
+			    !gsc->msg_list &&
+			    gsc->priority_count == 0 &&
+			    gsc->normal_count == 0 &&
+			    gsc->scan_from >= gsc->scan_to &&
+			    !gsc->sender.loopback) {
+				int guard = (int)(gsc->fsk_bitduration + 1.0);
+				sample_t last_val = gsc->fsk_tx_buffer[gsc->fsk_tx_buffer_pos - 1];
+				int gi;
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "TX guard: %d samples (last_val=%.3f) -- no more bits\n",
+					  guard, last_val);
+				for (gi = 0; gi < guard && length > 0; gi++) {
+					*samples++ = last_val;
+					*power++ = 1;
+					length--;
+				}
+			}
+			gsc->fsk_tx_buffer_pos = 0;
+			if (length > 0) {
+				memset(samples, 0, sizeof(*samples) * length);
+				memset(power, 0, length);
+			}
 			return;
 		}
 

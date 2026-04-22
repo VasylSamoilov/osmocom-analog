@@ -728,8 +728,36 @@ again:
 
 		/* no message, power is off */
 		if (word < 0) {
-			memset(samples, 0, sizeof(samples) * length);
-			memset(power, 0, length);
+			/* Append one extra bit duration of the last FSK level
+			 * as a guard before going silent.  This prevents the
+			 * receiver PLL from drifting into silence during the
+			 * last symbol's vote window, which can cause CRC
+			 * errors in one-shot operation.
+			 *
+			 * fsk_tx_buffer_length is already 0 (cleared by the
+			 * output loop), but fsk_tx_buffer_pos still equals the
+			 * old length and the sample data is still in the buffer. */
+			if (pocsag->fsk_tx_buffer_pos > 0 &&
+			    !pocsag->network_mode &&
+			    pocsag->scan_from >= pocsag->scan_to &&
+			    !pocsag->sender.loopback) {
+				int guard = (int)(pocsag->fsk_tx_bitduration + 1.0);
+				sample_t last_val = pocsag->fsk_tx_buffer[pocsag->fsk_tx_buffer_pos - 1];
+				int gi;
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "TX guard: %d samples (last_val=%.3f) -- no more codewords\n",
+					  guard, last_val);
+				for (gi = 0; gi < guard && length > 0; gi++) {
+					*samples++ = last_val;
+					*power++ = 1;
+					length--;
+				}
+			}
+			pocsag->fsk_tx_buffer_pos = 0;
+			if (length > 0) {
+				memset(samples, 0, sizeof(*samples) * length);
+				memset(power, 0, length);
+			}
 			return;
 		}
 
@@ -738,7 +766,7 @@ again:
 		pocsag->fsk_tx_buffer_pos = 0;
 	}
 
-	/* send encoded word until end of source or destination buffer is reaced */
+	/* send encoded word until end of source or destination buffer is reached */
 	while (length) {
 		*power++ = 1;
 		*samples++ = pocsag->fsk_tx_buffer[pocsag->fsk_tx_buffer_pos++];
