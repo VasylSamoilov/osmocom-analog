@@ -105,6 +105,7 @@ typedef struct gsc {
 
 	gsc_msg_t		*msg_list;		/* queue of messages */
 	const char		*default_message;
+	enum gsc_msg_type	default_msg_type;	/* CLI -y override (TYPE_AUTO = use address) */
 
 	/* current trasmitting message */
 	uint8_t			bit[16384];

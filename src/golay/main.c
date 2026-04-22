@@ -55,6 +55,7 @@ static int nbs_mode = 0;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
 static enum gsc_msg_type scan_type = TYPE_NUMERIC;
+static enum gsc_msg_type default_msg_type = TYPE_AUTO;
 
 void print_help(const char *arg0)
 {
@@ -79,7 +80,8 @@ void print_help(const char *arg0)
 	printf("        groups up to 32 addresses per preamble.\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Send this message, if no caller ID was given or if built-in console\n");
-	printf("        is used. (default \"%s\").\n", message);
+	printf("        is used. For voice pages (-y voice), this is the WAV file path.\n");
+	printf("        (default \"%s\").\n", message);
 	printf(" -V --voice-dir <path>\n");
 	printf("        Record received voice pages to WAV files in the given directory.\n");
 	printf("        Filenames: golay_voice_page_<timestamp>_<address>.wav\n");
@@ -92,24 +94,42 @@ void print_help(const char *arg0)
 	printf("    --nbs\n");
 	printf("        Non-battery-saver mode: use 75 Hz preamble without coded preamble\n");
 	printf("        or start code. Higher throughput, but no battery saving groups.\n");
+	printf(" -y --type auto | tone | voice | numeric | alpha\n");
+	printf("        Override message type for console and scan modes (default auto).\n");
+	printf("        'auto' determines type from the 7th address digit:\n");
+	printf("          1-4 = voice, 5-8 = alpha, 9/0 = tone-only.\n");
+	printf("        'tone' sends tone-only alert (no data, no voice).\n");
+	printf("        'voice' sends voice page.\n");
+	printf("        'numeric' sends BCD-encoded numeric message.\n");
+	printf("        'alpha' sends alphanumeric message.\n");
 	printf(" -S --scan <from> <to>\n");
 	printf("        Scan through given 7-digit functional address range.\n");
 	printf("        Messages are batch-packed by preamble group for efficiency.\n");
 	printf("        Use -y to select message type: numeric (default), alpha, or tone.\n");
 	printf("\n");
 	printf("File: %s\n", msg_send_path);
-	printf("        Write \"<address>[,message]\" to it, to send a default message.\n");
-	printf("        Write \"<address>,n,message\" to it, to send a numeric message.\n");
-	printf("        Write \"<address>,a,message\" to it, to send an alphanumeric message.\n");
-	printf("        Write \"<address>,v,<wave file name>\" to it, to send a voice message.\n");
+	printf("        Write \"<address>\" to send a tone-only/auto message.\n");
+	printf("        Write \"<address>,n,message\" to send a numeric message.\n");
+	printf("        Write \"<address>,a,message\" to send an alphanumeric message.\n");
+	printf("        Write \"<address>,v,<wave file name>\" to send a voice message.\n");
+	printf("        Write \"<address>,t,\" to send a tone-only message.\n");
+	printf("        Optional polarity suffix: append ',+' or ',-' as last field.\n");
+	printf("        Optional priority prefix: prepend '!' before address.\n");
+	printf("        Examples:\n");
+	printf("          1234569              (auto: tone-only, 7th digit is 9)\n");
+	printf("          1234565,a,HELLO      (alpha message)\n");
+	printf("          1234561,n,5551234    (numeric message)\n");
+	printf("          1234561,t,           (tone-only, override voice default)\n");
+	printf("          1234561,v,alert.wav  (voice page)\n");
+	printf("          !1234565,a,URGENT    (priority alpha message)\n");
 	printf("\n");
-	printf("By default, an alphanumic message is sent, if last digit of the functional\n");
-	printf("address is 5..8. Otherwise a tone only message is sent.\n");
+	printf("By default (auto), type is determined by the 7th digit of the address:\n");
+	printf("  1-4 = voice, 5-8 = alpha, 9/0 = tone-only.\n");
 	printf("\n");
 	printf("A numeric message can have up to 24 digits, they are: 0123456789U-* and space\n");
 	printf("Also 'shifted' digits can be sent using two digits, they are: ABCDEFGHJLNPR\n");
 	printf("\n");
-	printf("An aplhanumeric message can have up to 80 digits, sent upper case only.\n");
+	printf("An alphanumeric message can have up to 80 digits, sent upper case only.\n");
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
 }
@@ -216,14 +236,23 @@ static int handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 	case 'y':
-		if (!strcmp(argv[argi], "numeric") || !strcmp(argv[argi], "n"))
+		if (!strcmp(argv[argi], "numeric") || !strcmp(argv[argi], "n")) {
 			scan_type = TYPE_NUMERIC;
-		else if (!strcmp(argv[argi], "alpha") || !strcmp(argv[argi], "a"))
+			default_msg_type = TYPE_NUMERIC;
+		} else if (!strcmp(argv[argi], "alpha") || !strcmp(argv[argi], "a")) {
 			scan_type = TYPE_ALPHA;
-		else if (!strcmp(argv[argi], "tone") || !strcmp(argv[argi], "t"))
+			default_msg_type = TYPE_ALPHA;
+		} else if (!strcmp(argv[argi], "tone") || !strcmp(argv[argi], "t")) {
 			scan_type = TYPE_TONE;
-		else {
-			fprintf(stderr, "Invalid type '%s', use numeric, alpha, or tone.\n", argv[argi]);
+			default_msg_type = TYPE_TONE;
+		} else if (!strcmp(argv[argi], "voice") || !strcmp(argv[argi], "v")) {
+			scan_type = TYPE_VOICE;
+			default_msg_type = TYPE_VOICE;
+		} else if (!strcmp(argv[argi], "auto")) {
+			scan_type = TYPE_NUMERIC;
+			default_msg_type = TYPE_AUTO;
+		} else {
+			fprintf(stderr, "Invalid type '%s', use auto, tone, voice, numeric, or alpha.\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
@@ -399,6 +428,7 @@ int main(int argc, char *argv[])
 			gsc->batching_mode = batching_mode;
 			gsc->protocol_dump = protocol_dump;
 			gsc->nbs = nbs_mode;
+			gsc->default_msg_type = default_msg_type;
 			/* Set up scan mode */
 			if (scan_to > scan_from) {
 				gsc->scan_from = scan_from;

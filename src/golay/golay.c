@@ -4944,7 +4944,7 @@ int call_down_setup(int __attribute__((unused)) callref, const char *caller_id, 
 		message = gsc->default_message;
 
 	/* create call process to page station */
-	msg = golay_msg_create(gsc, address, message, TYPE_AUTO);
+	msg = golay_msg_create(gsc, address, message, gsc->default_msg_type);
 	if (!msg)
 		return -CAUSE_INVALNUMBER;
 	scheduler_enqueue(gsc, msg);
