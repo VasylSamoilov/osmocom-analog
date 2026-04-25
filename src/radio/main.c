@@ -115,6 +115,7 @@ static int rds_force_rbds = 0;
 static int sca_67k = 0;
 static int sca_92k = 0;
 static int am_compandor = 0;
+static int fm_compandor = 0;
 static int rds_paging = 0;
 static int rds_paging_rpc = 4;  /* Default RPC=4: group desig 001, batt sync 00 */
 static uint16_t rds_paging_cc = 0;   /* E.212 MCC for international (0=not set) */
@@ -419,6 +420,10 @@ static void print_help(const char *arg0)
 	printf(" -C --compandor\n");
 	printf("        Enable audio compressor for AM to improve modulation depth.\n");
 	printf("        Uses 2:1 compression with 5ms attack, 200ms recovery.\n");
+	printf("    --fm-compandor\n");
+	printf("        Enable audio compressor for FM to improve broadcast loudness.\n");
+	printf("        Uses 2:1 compression with 1ms attack, 50ms recovery.\n");
+	printf("        Raises average modulation to match commercial FM stations.\n");
 	printf(" -E --emphasis <uS> | 0\n");
 	printf("        Use given time constant of pre- and de-emphasis for frequency\n");
 	printf("        modulation. Give 0 to disable emphasis. (default = %.0f uS)\n", time_constant_us);
@@ -603,6 +608,7 @@ static double afc_max_hz = 5000.0;
 #define OPT_RDS_PAGING_CC	1122
 #define OPT_RDS_PAGING_OPC	1123
 #define OPT_RDS_PAGING_PAC	1124
+#define OPT_FM_COMPANDOR	1125
 
 static void add_options(void)
 {
@@ -620,6 +626,7 @@ static void add_options(void)
 	option_add('D', "deviation", 1);
 	option_add('I', "modulation-index", 1);
 	option_add('C', "compandor", 0);
+	option_add(OPT_FM_COMPANDOR, "fm-compandor", 0);
 	option_add('E', "emphasis", 1);
 	option_add('V', "volume", 1);
 	option_add('S', "stereo", 0);
@@ -730,6 +737,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case 'C':
 		am_compandor = 1;
+		break;
+	case OPT_FM_COMPANDOR:
+		fm_compandor = 1;
 		break;
 	case 'E':
 		time_constant_us = atof(argv[argi]);
@@ -1353,7 +1363,7 @@ int main(int argc, char *argv[])
 	if (use_polyphase)
 		radio_set_polyphase(1);
 
-	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor, rds_force_rbds);
+	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor, fm_compandor, rds_force_rbds);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
 		exit(0);

@@ -51,7 +51,7 @@
  * Acquisition/loss require the signal to be continuously in-range for
  * PILOT_ACQUIRE_S / PILOT_LOSS_S seconds before the state changes.
  * This rejects noise spikes and brief dropouts.
- * IEC 62106 / ITU-R BS.450 consumer practice: 50–200 ms each direction.
+ * IEC 62106 / ITU-R BS.450 consumer practice: 50-200 ms each direction.
  *
  * COOLDOWN_S: minimum hold time after any transition (prevents re-entry). */
 #define PILOT_LOCK_THR		0.04	/* acquire: pilot must stay above this (~3 kHz) */
@@ -261,7 +261,7 @@ static const rds_preset_t rds_presets[] = {
 		.pi       = 0x6ACE,
 		.ps       = "Osmo RDS",
 		/* 64-char RT (max for Group 2A).
-		 * Space-padded to full 64 chars to avoid 0x0D CR terminator —
+		 * Space-padded to full 64 chars to avoid 0x0D CR terminator --
 		 * some receivers handle CR poorly (EN 50067 S6.1.5.3). */
 		.rt       = "osmocom-analog FM RDS Radio - Open Source Broadcast FM Encoder! ",
 		.pty      = 10,		/* Pop music (RDS) */
@@ -347,7 +347,7 @@ static const rds_preset_t rds_presets[] = {
 		 * IEC 62106-6:2018 Annex C: RT+ tags use CHARACTER positions (0-63 max)
 		 * The 6-bit start marker limits tagging to first 64 CHARACTERS of eRT
 		 * 
-		 * eRT text: "osmocom-analog — Analoge Funktechnik · Open Source FM RDS Encoder"
+		 * eRT text: "osmocom-analog -- Analoge Funktechnik . Open Source FM RDS Encoder"
 		 *            ^0               ^17                   ^40
 		 * 
 		 * Character positions (NOT byte positions):
@@ -369,9 +369,9 @@ static const rds_preset_t rds_presets[] = {
 		 * IEC 62106-6:2018 Annex C: eRT supports 128 bytes (32 segments x 4 bytes)
 		 * but RT+ can only tag first 64 CHARACTERS
 		 * 
-		 * This text uses UTF-8 em-dash (—) and middle dot (·) to demonstrate
+		 * This text uses UTF-8 em-dash and middle dot to demonstrate
 		 * eRT's extended character support beyond basic ASCII RadioText.
-		 * 65 characters, 69 bytes (— = 3 bytes, · = 2 bytes)
+		 * 65 characters, 69 bytes (em-dash = 3 bytes, middle dot = 2 bytes)
 		 * Terminated with CR if < 128 bytes */
 		.ert = {
 			.enabled = 0,	/* Disabled -- eRT eats 30% bandwidth, most receivers don't support it */
@@ -400,7 +400,7 @@ static const rds_preset_t rds_presets[] = {
 		 *   // Register RT+ ODA on Group 11A (carrier_group=22)
 		 *   rds_enc_oda_add(&radio->rds_enc, RDS_GROUP_11A, RDS_ODA_AID_RT_PLUS, 0x0000);
 		 *   
-		 *   // RT and RT+ are independent — set each separately:
+		 *   // RT and RT+ are independent -- set each separately:
 		 *   rds_enc_set_rt(enc, "Bohemian Rhapsody - Queen");
 		 *   rds_enc_rtplus_set_tags(enc,
 		 *       RDS_RTPLUS_CT_ITEM_TITLE, 0, 18,
@@ -779,7 +779,7 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xE0,	/* Germany */
 		.lang     = 8,		/* German */
-		/* RT+: info.weather example — common on German radio
+		/* RT+: info.weather example -- common on German radio
 		 * "Größe, Müller, Schöne Grüße! Fünf Äpfel für Österreich."
 		 *  ^0                           ^29
 		 * Tag1: info.news @0+28 "Größe, Müller, Schöne Grüße!"
@@ -815,7 +815,7 @@ static const rds_preset_t rds_presets[] = {
 		.ms       = 1,
 		.ecc      = 0xE1,	/* France */
 		.lang     = 15,		/* French */
-		/* RT+: info.event + info.weather — common on French radio
+		/* RT+: info.event + info.weather -- common on French radio
 		 * "Bienvenue à Noël! Très bel été, où êtes-vous? Ça va!"
 		 *  ^0                ^18
 		 * Tag1: info.event @0+17 "Bienvenue à Noël!"
@@ -872,7 +872,7 @@ static const rds_preset_t rds_presets[] = {
 	 * EXTENDED CHARACTER DEMO - Greek (IEC 62106 Annex E)
 	 * ============================================================
 	 * Demonstrates: Greek letters available in RDS charset.
-	 * Note: RDS Annex E has very limited Greek: α (0xA1), π (0xA8)
+	 * Note: RDS Annex E has very limited Greek: alpha (0xA1), pi (0xA8)
 	 * Real Greek stations use Latin transliteration for RDS.
 	 * ============================================================ */
 	{
@@ -1123,7 +1123,7 @@ static void rds_apply_preset(radio_t *radio)
 	/* Update RT+ (RadioText Plus) Configuration
 	 *
 	 * RT and RT+ are independent. RT is already set above.
-	 * Per IEC 62106-6 §A.5: 3A announces AID=0x4BD7 on carrier group,
+	 * Per IEC 62106-6 A.5: 3A announces AID=0x4BD7 on carrier group,
 	 * carrier group carries toggle + running + 2 tags. */
 	if (p->rtplus.enabled) {
 		/* Register RT+ ODA (adds 3A + carrier to scheduler) */
@@ -1144,7 +1144,7 @@ static void rds_apply_preset(radio_t *radio)
 				ct2, s2, l2);
 		}
 		
-		/* Set flags — toggle=0 default per IEC 62106-6 A.5.3 NOTE 2 */
+		/* Set flags -- toggle=0 default per IEC 62106-6 A.5.3 NOTE 2 */
 		rds_enc_rtplus_set_toggle(enc, p->rtplus.toggle);
 		rds_enc_rtplus_set_item_running(enc, p->rtplus.item_running);
 	} else {
@@ -1318,24 +1318,24 @@ double radio_afc_get_freq_error(radio_t *radio)
 	return radio->afc.freq_error_hz;
 }
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int rds_force_rbds)
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int fm_compandor, int rds_force_rbds)
 {
 	int rc = -EINVAL;
 	double clip_level = 1.0;  /* clipper threshold, reduced for pilot/RDS headroom */
 
 	/* 
-	 * FM COMPOSITE MODULATION BUDGET — Zero Over-Deviation Design
+	 * FM COMPOSITE MODULATION BUDGET -- Zero Over-Deviation Design
 	 * ============================================================
-	 * ITU-R BS.412-9 / IEC 62106 deviation budget (±75 kHz = 1.0):
+	 * ITU-R BS.412-9 / IEC 62106 deviation budget (+/-75 kHz = 1.0):
 	 *
 	 *   Component          Stereo    Mono (no pilot)
-	 *   ─────────────────  ────────  ───────────────
+	 *   -----------------  --------  ---------------
 	 *   Audio sum (L+R)    0.45      1.0
-	 *   Audio diff (L-R)   0.45      —
-	 *   Pilot 19 kHz       0.10      —
+	 *   Audio diff (L-R)   0.45      --
+	 *   Pilot 19 kHz       0.10      --
 	 *   RDS 57 kHz         0.067     0.067
 	 *
-	 * Strategy: Two-layer protection ensures composite ≤ 1.0:
+	 * Strategy: Two-layer protection ensures composite <= 1.0:
 	 *
 	 *   1. CLIPPER THRESHOLD = 1.0 - pilot - rds
 	 *      The soft clipper (atan-based) limits each audio channel
@@ -1348,9 +1348,9 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	 *      below the clip threshold. This means the clipper only
 	 *      activates on HF peaks, not on normal program content.
 	 *
-	 * Pre-emphasis gain: G(f) = sqrt(1 + (2π·f·τ)²)
-	 *   50µs: G(1kHz)=1.046, G(5kHz)=2.62, G(15kHz)=7.13
-	 *   75µs: G(1kHz)=1.097, G(5kHz)=3.75, G(15kHz)=10.5
+	 * Pre-emphasis gain: G(f) = sqrt(1 + (2*pi*f*tau)^2)
+	 *   50us: G(1kHz)=1.046, G(5kHz)=2.62, G(15kHz)=7.13
+	 *   75us: G(1kHz)=1.097, G(5kHz)=3.75, G(15kHz)=10.5
 	 */
 	{
 		double pilot_level = 0.0;
@@ -1365,8 +1365,26 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		}
 		if (rds || rds2)
 			rds_level = RDS_INJECTION_NRSC * 2.0 * 0.5;
-			/* RDS_INJECTION_NRSC = 5/75 = 0.0667, ×2.0 gain in encoder,
-			 * ×0.5 for typical waveform peak (shaped biphase) ≈ 0.067 */
+			/* RDS_INJECTION_NRSC = 5/75 = 0.0667, x2.0 gain in encoder,
+			 * x0.5 for typical waveform peak (shaped biphase) ~= 0.067 */
+
+		/* FM compandor mode: use commercial broadcast practice values.
+		 * - Pilot 9% (ITU-R BS.450-4 / Telos practice, not the conservative 10%)
+		 * - FCC 73.1570(b)(2): with SCA/RDS subcarriers, peak modulation may
+		 *   increase by 0.5% per 1% injection, up to 110% (+/-82.5 kHz).
+		 *   Our RDS at 6.7% allows +3.3% -> 103.3% composite (+/-77.5 kHz).
+		 *   We use a modest 101% (+/-75.75 kHz) to stay well within limits.
+		 * These values are non-standard but match real-world commercial FM. */
+		if (fm_compandor) {
+			if (stereo) {
+				pilot_level = 0.09;       /* 9% pilot -- commercial practice */
+				audio_matrix_peak = 0.91; /* 1.0 - pilot */
+			}
+			LOGP(DRADIO, LOGL_NOTICE,
+			     "FM compandor: using commercial broadcast modulation budget "
+			     "(pilot=%.0f%%, matrix=%.0f%%)\n",
+			     pilot_level * 100.0, audio_matrix_peak * 100.0);
+		}
 
 		/* Pre-emphasis gain at 1 kHz reference tone */
 		if (time_constant_us > 0.0) {
@@ -1381,14 +1399,14 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* Layer 1: Set clipper threshold.
 		 *
 		 * Mono: composite = audio + RDS, so clip at (1.0 - rds) guarantees
-		 *   audio_clipped + rds ≤ 1.0. No over-deviation possible.
+		 *   audio_clipped + rds <= 1.0. No over-deviation possible.
 		 *
-		 * Stereo: composite = sum + pilot + diff*sin(2θ) + rds*sin(3θ).
+		 * Stereo: composite = sum + pilot + diff*sin(2*theta) + rds*sin(3*theta).
 		 *   Sum and diff are on different subcarriers (baseband vs 38 kHz).
 		 *   Worst-case instantaneous: sum + diff + pilot + rds.
-		 *   To keep composite ≤ 1.0 would require clip = (1-pilot-rds)/2 = 0.42,
+		 *   To keep composite <= 1.0 would require clip = (1-pilot-rds)/2 = 0.42,
 		 *   which is far too aggressive. The ITU standard allows stereo composite
-		 *   to exceed ±75 kHz momentarily — this is inherent to pilot-tone stereo.
+		 *   to exceed +/-75 kHz momentarily -- this is inherent to pilot-tone stereo.
 		 *   We clip each channel at audio_budget, same as mono. The composite may
 		 *   briefly exceed 1.0 when sum and diff peak simultaneously, but this is
 		 *   standard-compliant and all receivers handle it. */
@@ -1401,14 +1419,14 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		if (volume_scale < 1.0) {
 			LOGP(DRADIO, LOGL_NOTICE,
 			     "FM modulation budget: pilot=%.1f%% rds=%.1f%% audio_budget=%.1f%% "
-			     "preemph_1kHz=%.3f matrix_peak=%.2f → volume_scale=%.4f\n",
+			     "preemph_1kHz=%.3f matrix_peak=%.2f -> volume_scale=%.4f\n",
 			     pilot_level * 100.0, rds_level * 100.0, audio_budget * 100.0,
 			     preemph_gain_1k, audio_matrix_peak, volume_scale);
 			volume *= volume_scale;
 		}
 
 		LOGP(DRADIO, LOGL_INFO,
-		     "FM deviation budget (±%.0f kHz): audio=%.1f kHz (%.1f%%) "
+		     "FM deviation budget (+/-%.0f kHz): audio=%.1f kHz (%.1f%%) "
 		     "pilot=%.1f kHz (%.1f%%) rds=%.1f kHz (%.1f%%) "
 		     "clip_level=%.4f effective_volume=%.4f preemph_1kHz=+%.1fdB\n",
 		     deviation / 1000.0,
@@ -1419,7 +1437,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	}
 
 	/* Soft clipper at audio_budget level.
-	 * Guarantees: audio_after_clip + pilot + RDS ≤ 1.0 (no over-deviation).
+	 * Guarantees: audio_after_clip + pilot + RDS <= 1.0 (no over-deviation).
 	 * Only activates on HF peaks from pre-emphasis, not normal content. */
 	clipper_init(clip_level);
 
@@ -1455,7 +1473,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	 * FM: baseband_extent = deviation + highest_subcarrier
 	 *   - Mono:   deviation + audio_bw (75k + 15k = 90 kHz)
 	 *   - Stereo: deviation + 53k (pilot 19k + L-R up to 53k)
-	 *   - RDS:    deviation + 60k (RDS subcarrier at 57k ± 2.4k)
+	 *   - RDS:    deviation + 60k (RDS subcarrier at 57k +/- 2.4k)
 	 *   - RDS2:   deviation + 80k (additional subcarriers)
 	 *   - SCA:    deviation + 67k/92k/100k (subsidiary carriers)
 	 * AM: baseband_extent = audio_bandwidth */
@@ -1468,7 +1486,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			radio->audio_bandwidth = STEREO_BW;
 		}
 		if (radio->rds)
-			radio->baseband_extent = deviation + 60000.0;  /* RDS at 57 kHz ± 2.4 kHz */
+			radio->baseband_extent = deviation + 60000.0;  /* RDS at 57 kHz +/- 2.4 kHz */
 		if (radio->rds2)
 			radio->baseband_extent = deviation + 80000.0;  /* RDS2 additional subcarriers */
 		/* SCA extends bandwidth further */
@@ -1638,6 +1656,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 
 	/* stereo pilot tone phase */
 	radio->pilot_phasestep = 2.0 * M_PI * PILOT_FREQ / radio->signal_samplerate;
+	radio->pilot_level = fm_compandor ? 0.09 : 0.10;
 
 	/* Initialize PLL for 19 kHz pilot tracking
 	 * freq: 19000 / samplerate (normalized)
@@ -1757,8 +1776,20 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* Initialize AFC for mono FM (disabled by default, enable with --afc) */
 		memset(&radio->afc, 0, sizeof(radio->afc));
 		radio->afc.time_constant_s = 0.3;      /* 300ms IIR time constant */
-		radio->afc.max_correction_hz = 5000.0; /* ±5 kHz max correction */
+		radio->afc.max_correction_hz = 5000.0; /* +/-5 kHz max correction */
 		
+		/* Initialize FM compandor if enabled
+		 * FM broadcast uses: attack 1ms, recovery 50ms
+		 * Faster attack than AM to catch HF transients before pre-emphasis
+		 * amplifies them. Longer recovery for natural-sounding dynamics.
+		 */
+		radio->fm_compandor = fm_compandor;
+		if (fm_compandor) {
+			compandor_init();
+			setup_compandor(&radio->fm_compandor_state, radio->signal_samplerate, 1.0, 50.0);
+			LOGP(DRADIO, LOGL_INFO, "FM compandor enabled (attack=1ms, recovery=50ms)\n");
+		}
+
 		if (stereo) {
 			sprintf(freq_name[0], "%.4f MHz left", frequency / 1e6);
 			sprintf(freq_name[1], "%.4f MHz right", frequency / 1e6);
@@ -2323,20 +2354,22 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	/* convert mono/stereo, generate differential signal */
 	/* (Skip this if we want pure clean signal, but let's keep it to test stereo proc) */
 	if (radio->stereo && radio->tx_audio_channels == 1) {
-		/* mono to stereo: scale sum to 90%, differential signal is 0 */
+		/* mono to stereo: scale sum to (1-pilot), differential signal is 0 */
+		double sum_scale = radio->fm_compandor ? 0.91 : 0.9;
 		for (i = 0; i < audio_num; i++) {
-			audio_samples[0][i] *= 0.9;
+			audio_samples[0][i] *= sum_scale;
 			audio_samples[1][i] = 0.0;
 		}
 	}
 	if (radio->stereo && radio->tx_audio_channels == 2) {
-		/* stereo: sum is 90%, diffential is 90% */
+		/* stereo: sum and diff each get (1-pilot)/2 */
+		double half_scale = radio->fm_compandor ? 0.455 : 0.45;
 		double left, right;
 		for (i = 0; i < audio_num; i++) {
 			left = audio_samples[0][i];
 			right = audio_samples[1][i];
-			audio_samples[0][i] = (left + right) * 0.45;
-			audio_samples[1][i] = (left - right) * 0.45;
+			audio_samples[0][i] = (left + right) * half_scale;
+			audio_samples[1][i] = (left - right) * half_scale;
 		}
 	}
 	if (!radio->stereo && radio->tx_audio_channels == 2) {
@@ -2446,6 +2479,16 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	 * and modulate */
 	switch (radio->modulation) {
 	case MODULATION_FM:
+		/* Apply FM compandor (audio compressor) if enabled -- before pre-emphasis.
+		 * This raises average modulation depth to match commercial broadcast
+		 * loudness. Placed before pre-emphasis so the compressor sees flat
+		 * audio, not boosted HF. */
+		if (radio->fm_compandor) {
+			compress_audio(&radio->fm_compandor_state, signal_samples[0], signal_num);
+			if (radio->stereo)
+				compress_audio(&radio->fm_compandor_state, signal_samples[1], signal_num);
+		}
+
 		if (radio->emphasis) {
 			/* Use TX-only filters for pre-emphasis */
 			if (fm_fast_math_enabled())
@@ -2497,12 +2540,12 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 						double sc_sin, sc_cos;
 						/* 19 kHz pilot */
 						fm_fast_sincos(phase * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
-						signal_samples[0][i] += sc_sin * 0.1;
+						signal_samples[0][i] += sc_sin * radio->pilot_level;
 						/* 38 kHz stereo subcarrier (2x pilot) */
 						fm_fast_sincos(phase * 2.0 * (65536.0 / (2.0 * M_PI)), &sc_sin, &sc_cos);
 						signal_samples[0][i] += signal_samples[1][i] * sc_sin;
 					} else {
-						signal_samples[0][i] += sin(phase) * 0.1;
+						signal_samples[0][i] += sin(phase) * radio->pilot_level;
 						signal_samples[0][i] += signal_samples[1][i] * sin(phase * 2);
 					}
 				}
@@ -2562,7 +2605,7 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 			double peak_khz = peak_norm * radio->fm_deviation / 1000.0;
 			int clipping = (peak_norm > 1.0);
 			LOGP(DRADIO, LOGL_DEBUG,
-			     "TX DEVIATION: peak=%.3f (%.1f kHz / ±%.0f kHz = %.1f%%)%s\n",
+			     "TX DEVIATION: peak=%.3f (%.1f kHz / +/-%.0f kHz = %.1f%%)%s\n",
 			     peak_norm, peak_khz, radio->fm_deviation / 1000.0,
 			     peak_norm * 100.0, clipping ? " ** OVER-DEVIATION **" : "");
 
@@ -2946,13 +2989,13 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 			 * The PLL provides fast lock detection, but we add hysteresis to prevent
 			 * rapid switching on weak/noisy signals.
 			 *
-			 * IEC 62106 / ITU-R BS.450 consumer practice: 50–200 ms each way.
+			 * IEC 62106 / ITU-R BS.450 consumer practice: 50-200 ms each way.
 			 */
 			if (radio->rx_pilot_cooldown > 0.0)
 				radio->rx_pilot_cooldown -= signal_num;
 
 			if (!radio->rx_pilot_locked) {
-				/* Trying to acquire stereo — use smoothed magnitude to ignore noise dips */
+				/* Trying to acquire stereo -- use smoothed magnitude to ignore noise dips */
 				if (radio->rx_pilot_mag_avg >= PILOT_LOCK_THR && pll_locked) {
 					radio->rx_pilot_above_samples += signal_num;
 					radio->rx_pilot_below_samples  = 0.0;
@@ -3307,7 +3350,7 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		 * Industry standard is to apply +3 dB gain compensation to stereo
 		 * output to match perceived loudness with mono. This is a compromise:
 		 * - +6 dB would match perfectly for center-panned content
-		 * - +3 dB (sqrt(2) ≈ 1.414) is standard for typical music with panning
+		 * - +3 dB (sqrt(2) ~= 1.414) is standard for typical music with panning
 		 * 
 		 * Reference: ITU-R BS.412, typical FM receiver design practice
 		 */

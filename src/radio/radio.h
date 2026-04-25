@@ -107,6 +107,7 @@ typedef struct radio {
 	fm_mod_t	fm_mod;			/* FM modulation */
 	fm_demod_t	fm_demod;		/* FM modulation */
 	double		pilot_phasestep;	/* phase change of pilot tone for each sample */
+	double		pilot_level;		/* pilot injection level (0.10 standard, 0.09 compandor) */
 	double		tx_pilot_phase;		/* current phase of tx sine */
 	double		rx_pilot_phase;		/* current phase of rx mixer (legacy, kept for TX) */
 	pll_t		rx_pilot_pll;		/* PLL for 19 kHz pilot tracking */
@@ -151,6 +152,9 @@ typedef struct radio {
 	/* AM compandor (audio compressor for better modulation depth) */
 	int		am_compandor;		/* enable AM compandor */
 	compandor_t	am_compandor_state;	/* compandor state for AM */
+	/* FM compandor (audio compressor for broadcast-like loudness) */
+	int		fm_compandor;		/* enable FM compandor */
+	compandor_t	fm_compandor_state;	/* compandor state for FM */
 	/* buffers */
 	sample_t	*audio_buffer;
 	int		audio_buffer_size;
@@ -165,7 +169,7 @@ typedef struct radio {
 	afc_state_t	afc;
 } radio_t;
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int rds_force_rbds);
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int fm_compandor, int rds_force_rbds);
 void radio_exit(radio_t *radio);
 int radio_start(radio_t *radio);
 int radio_tx(radio_t *radio, float *baseband, int num);
