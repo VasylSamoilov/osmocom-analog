@@ -121,6 +121,11 @@ extern const struct pager_charset pager_charset_pocsag_truly_supervisor_latin_cy
 extern const struct pager_charset pager_charset_pocsag_philips_prg2220_latin_cyrillic;
 extern const struct pager_charset pager_charset_pocsag_motorola_advisor_cyrillic;
 extern const struct pager_charset pager_charset_pocsag_nec_21a_latin_cyrillic;
+extern const struct pager_charset pager_charset_pocsag_nec_maxima_compact_cyrillic;
+extern const struct pager_charset pager_charset_pocsag_swissphone_de506_ascii;
+extern const struct pager_charset pager_charset_pocsag_swissphone_de506_cyrillic;
+extern const struct pager_charset pager_charset_pocsag_partner_generic_cyrillic;
+extern const struct pager_charset pager_charset_pocsag_multitone_generic_ascii;
 
 /* --- Built-in Golay/GSC codepages (6-bit, 64 codes) --- */
 
