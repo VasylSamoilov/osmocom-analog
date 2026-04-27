@@ -898,9 +898,7 @@ int uhd_receive(float *buff, int max)
 		return -EIO;
 	}
 	if (count) {
-		/* Check for overflow (lost samples) — this is the primary cause
-		 * of audio glitches in RX-only mode where the main loop can't
-		 * drain the ring buffer fast enough. */
+		/* Check for overflow (lost samples) */
 		uhd_rx_metadata_error_code_t error_code;
 		uhd_rx_metadata_error_code(uhd_rx_inst->rx_metadata, &error_code);
 		if (error_code == UHD_RX_METADATA_ERROR_CODE_OVERFLOW) {
@@ -908,7 +906,7 @@ int uhd_receive(float *buff, int max)
 			static int overflow_count = 0;
 			overflow_count++;
 			if (overflow_count <= 10 || (overflow_count % 100) == 0)
-				LOGP(DUHD, LOGL_ERROR, "RX overflow #%d (lost samples) — ring buffer not draining fast enough\n", overflow_count);
+				LOGP(DUHD, LOGL_ERROR, "RX overflow #%d (lost samples)\n", overflow_count);
 		}
 		if (uhd_rx_inst->tx_timestamps) {
 			/* get time stamp of received RX packet */

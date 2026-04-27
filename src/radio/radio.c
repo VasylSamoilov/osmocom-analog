@@ -3022,11 +3022,8 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 						radio->rx_pilot_cooldown      = PILOT_COOLDOWN_S * radio->signal_samplerate;
 						LOGP(DRADIO, LOGL_NOTICE, "Stereo pilot lost (mag=%.4f avg=%.4f), switching to mono\n",
 						     pilot_mag, radio->rx_pilot_mag_avg);
-						/* Let PLL free-run rather than resetting.
-						 * Resetting zeroes phase/freq, causing a discontinuity
-						 * in the 38 kHz carrier that produces a pop in the
-						 * diff channel before blend reaches zero.
-						 * The blend smoothly fades diff to silence anyway. */
+						/* Reset PLL when lock is lost */
+						pll_reset(&radio->rx_pilot_pll);
 					}
 				} else {
 					radio->rx_pilot_below_samples = 0.0;
@@ -3338,7 +3335,7 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		/* samples[0] already contains sum, nothing to do */
 	}
 	if (radio->stereo && radio->rx_audio_channels == 2) {
-		/* FM Stereo Matrix Decoding with Smooth Level Compensation
+		/* FM Stereo Matrix Decoding with Level Compensation
 		 * 
 		 * sum = L+R (mono-compatible, 0-15 kHz)
 		 * diff = L-R (DSB-SC on 38 kHz subcarrier, half amplitude after demod)
@@ -3355,33 +3352,23 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 		 * - +6 dB would match perfectly for center-panned content
 		 * - +3 dB (sqrt(2) ~= 1.414) is standard for typical music with panning
 		 * 
-		 * We use the already-smoothed blend factor to crossfade between mono
-		 * and stereo output, eliminating the 3 dB level discontinuity that
-		 * occurred with the hard if/else on rx_pilot_locked.
-		 * 
 		 * Reference: ITU-R BS.412, typical FM receiver design practice
 		 */
 #define STEREO_LEVEL_COMP	1.414	/* +3 dB = sqrt(2), industry standard */
 		
-		{
-			/* Smooth crossfade between mono and stereo using blend factor.
-			 * blend=0: mono (output = sum), blend=1: full stereo.
-			 * The diff channel is already attenuated by blend, so the
-			 * matrix math produces the correct intermediate result.
-			 * We only need to smoothly interpolate the sum scaling. */
-			double blend = radio->rx_stereo_blend;
+		if (radio->rx_pilot_locked && !radio->rx_forced_mono) {
+			/* True stereo decode with level compensation */
 			double sum, diff;
 			for (i = 0; i < audio_num; i++) {
 				sum = samples[0][i];
 				diff = samples[1][i];
-				/* Stereo: L = (sum/2 + diff) * 1.414, R = (sum/2 - diff) * 1.414
-				 * Mono:   L = R = sum
-				 * Crossfade: lerp between the two based on blend */
-				double L_stereo = (sum / 2.0 + diff) * STEREO_LEVEL_COMP;
-				double R_stereo = (sum / 2.0 - diff) * STEREO_LEVEL_COMP;
-				samples[0][i] = sum + blend * (L_stereo - sum);
-				samples[1][i] = sum + blend * (R_stereo - sum);
+				samples[0][i] = (sum / 2.0 + diff) * STEREO_LEVEL_COMP;  /* L */
+				samples[1][i] = (sum / 2.0 - diff) * STEREO_LEVEL_COMP;  /* R */
 			}
+		} else {
+			/* Mono fallback - clone sum to both channels (no compensation needed) */
+			for (i = 0; i < audio_num; i++)
+				samples[1][i] = samples[0][i];
 		}
 	}
 	if (!radio->stereo && radio->rx_audio_channels == 2) {
