@@ -39,6 +39,7 @@ typedef struct fm_demod {
 	double rot;		/* rotation step per sample to shift rx frequency (used to shift) */
 	double rot_base;	/* base rotation (from init offset, before AFC) */
 	double last_phase;	/* last phase of FM (used to demodulate) */
+	double last_I, last_Q;	/* previous filtered I/Q for conjugate-product demod */
 	iir_filter_t lp[2];	/* filters received IQ signal */
 	/* AFC (Automatic Frequency Control) - FLL on IQ before lowpass.
 	 * Measures carrier offset from IQ phase differences, then adjusts

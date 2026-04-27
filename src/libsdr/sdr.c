@@ -1380,8 +1380,13 @@ static void *sdr_read_child(void *arg)
 			thr_timer = now;
 		}
 
-		/* If receive functions block, we always receive something, so don't sleep. */
-		if (!num || count <= 0)
+		/* If receive functions block, we always receive something, so don't sleep.
+		 * When ring buffer is full (num==0), use a very short sleep to
+		 * avoid burning CPU while waiting for the consumer, but keep it
+		 * short enough that UHD's internal FIFO doesn't overflow. */
+		if (!num)
+			usleep(100);
+		else if (count <= 0)
 			usleep(sdr->interval * 1000.0);
 	}
 

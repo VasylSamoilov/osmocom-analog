@@ -428,7 +428,7 @@ static inline float fast_atan2(float y, float x)
 /* do frequency demodulation of baseband and write them to samples */
 void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, float *baseband, sample_t *I, sample_t *Q)
 {
-	double phase, rot, last_phase, dev, rate;
+	double phase, rot, dev, rate;
 	double _sin, _cos;
 	sample_t i, q;
 	int s, ss;
@@ -462,22 +462,30 @@ void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, f
 	demod->phase = phase;
 	iir_process(&demod->lp[0], I, length);
 	iir_process(&demod->lp[1], Q, length);
-	last_phase = demod->last_phase;
-	for (s = 0; s < length; s++) {
-		if (fast_math)
-			phase = fast_atan2(Q[s], I[s]);
-		else
-			phase = atan2(Q[s], I[s]);
-		dev = (phase - last_phase) / 2 / M_PI;
-		last_phase = phase;
-		if (dev < -0.49)
-			dev += 1.0;
-		else if (dev > 0.49)
-			dev -= 1.0;
-		dev *= rate;
-		frequency[s] = dev;
+
+	/* Conjugate-product FM discriminator:
+	 * Compute phase difference as atan2(I[n]*Q[n-1] - Q[n]*I[n-1],
+	 *                                   I[n]*I[n-1] + Q[n]*Q[n-1])
+	 * This gives the instantaneous phase difference in [-pi, pi]
+	 * without explicit phase unwrapping. No dead-zone artifacts
+	 * during silence like the atan2-difference method. */
+	{
+		double prev_I = demod->last_I;
+		double prev_Q = demod->last_Q;
+		for (s = 0; s < length; s++) {
+			double ci = I[s];
+			double cq = Q[s];
+			double cross = ci * prev_Q - cq * prev_I;
+			double dot   = ci * prev_I + cq * prev_Q;
+			dev = atan2(cross, dot) / (2.0 * M_PI);
+			dev *= rate;
+			frequency[s] = dev;
+			prev_I = ci;
+			prev_Q = cq;
+		}
+		demod->last_I = prev_I;
+		demod->last_Q = prev_Q;
 	}
-	demod->last_phase = last_phase;
 
 	/* AFC: measure carrier offset from the DC component of the
 	 * demodulated FM output. A carrier offset of X Hz produces
@@ -514,7 +522,7 @@ void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, f
 
 void fm_demodulate_real(fm_demod_t *demod, sample_t *frequency, int length, sample_t *baseband, sample_t *I, sample_t *Q)
 {
-	double phase, rot, last_phase, dev, rate;
+	double phase, rot, dev, rate;
 	double _sin, _cos;
 	sample_t i;
 	int s, ss;
@@ -546,21 +554,24 @@ void fm_demodulate_real(fm_demod_t *demod, sample_t *frequency, int length, samp
 	demod->phase = phase;
 	iir_process(&demod->lp[0], I, length);
 	iir_process(&demod->lp[1], Q, length);
-	last_phase = demod->last_phase;
-	for (s = 0; s < length; s++) {
-		if (fast_math)
-			phase = fast_atan2(Q[s], I[s]);
-		else
-			phase = atan2(Q[s], I[s]);
-		dev = (phase - last_phase) / 2 / M_PI;
-		last_phase = phase;
-		if (dev < -0.49)
-			dev += 1.0;
-		else if (dev > 0.49)
-			dev -= 1.0;
-		dev *= rate;
-		frequency[s] = dev;
+
+	/* Conjugate-product FM discriminator (see fm_demodulate_complex) */
+	{
+		double prev_I = demod->last_I;
+		double prev_Q = demod->last_Q;
+		for (s = 0; s < length; s++) {
+			double ci = I[s];
+			double cq = Q[s];
+			double cross = ci * prev_Q - cq * prev_I;
+			double dot   = ci * prev_I + cq * prev_Q;
+			dev = atan2(cross, dot) / (2.0 * M_PI);
+			dev *= rate;
+			frequency[s] = dev;
+			prev_I = ci;
+			prev_Q = cq;
+		}
+		demod->last_I = prev_I;
+		demod->last_Q = prev_Q;
 	}
-	demod->last_phase = last_phase;
 }
 
