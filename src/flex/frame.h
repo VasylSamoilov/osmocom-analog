@@ -1960,7 +1960,39 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 /* A7 (Reserved): ReFLEX protocol — spec: 1011001110000011 0101100100111001
  * Normal bytes: {0xB3,0x83,0x59,0x39}  Inv bytes: {0x4C,0x7C,0xA6,0xC6}
  * RX outer code = inv upper16 = 0x4C7C
- * Motorola ReFLEX uses A7 reserved code; same physical layer as A4. */
+ * Motorola ReFLEX uses A7 reserved code; same physical layer as A4.
+ *
+ * ReFLEX protocol characteristics (from IQ capture analysis):
+ *
+ *   Physical layer:
+ *     - 6400 bps, 4FSK, 3200 baud (same symbol rate as A4)
+ *     - Half deviation: ±2400 Hz outer, ±800 Hz inner (vs FLEX ±4800/±1600)
+ *     - Carson bandwidth: 8 kHz per channel (vs FLEX 16 kHz)
+ *     - S1 sync at 1600 baud 2FSK with ±2400 Hz deviation
+ *     - Same 1.875s frame timing, same FIW format
+ *     - Polarity: inverted observed in captures
+ *
+ *   Frame structure:
+ *     - Single-phase bitstream — NO multi-phase interleaving
+ *     - 352 words per frame (not 88 × 4 phases like FLEX A4)
+ *     - Standard FLEX block interleave applies within the stream
+ *     - BIW format is ReFLEX-proprietary (not standard FLEX BIW)
+ *
+ *   ReFLEX50 channel architecture:
+ *     - 4 subchannels within 50 kHz allocation
+ *     - 10 kHz channel spacing, ±15/±5 kHz from band center
+ *     - Per-channel bandwidth ~5 kHz (±2400 Hz deviation)
+ *     - ~5 kHz guard bands between channels
+ *     - All subchannels broadcast identical system info
+ *     - 25.6 kbps aggregate (4 × 6400 bps)
+ *
+ *   Protocol:
+ *     - Trunked operation: scan → SPID match → register → grant
+ *     - BIW carries SPID, Aloha boundary, reverse channel params,
+ *       collapse/cluster values for both forward and reverse
+ *     - Forward channel transmitted in 2^n frames per minute
+ *     - Connection-less model with complex registration state
+ *     - ReFLEX 2.7: foreground/background scanning, roaming */
 #define FLEX_SYNC_A7		0x4C7C
 #define FLEX_SYNC_REFLEX	FLEX_SYNC_A7
 
