@@ -368,7 +368,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			} else {
 				rx_in_size = sdr->buffer_size * sdr->rx_oversample;
 			}
-			sdr->thread_read.buffer_size = rx_in_size * 2 + 2;
+			sdr->thread_read.buffer_size = rx_in_size * 2 * 4 + 2;  /* 4x headroom to absorb main loop jitter */
 			sdr->thread_read.buffer = calloc(sdr->thread_read.buffer_size, sizeof(*sdr->thread_read.buffer));
 			if (!sdr->thread_read.buffer) {
 				LOGP(DSDR, LOGL_ERROR, "No mem!\n");

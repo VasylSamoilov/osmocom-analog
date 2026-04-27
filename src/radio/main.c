@@ -1688,11 +1688,13 @@ int main(int argc, char *argv[])
 		/* Adaptive sleep: shorter when TX buffer needs feeding.
 		 * In TX mode the write thread drains the ring buffer continuously;
 		 * sleeping a full 1ms risks starving the hardware (UHD underruns).
-		 * Use 100us when TX is active to keep the buffer fed. */
+		 * Use 100us when TX is active to keep the buffer fed.
+		 * In RX-only mode, use 250us to reduce ring buffer pressure
+		 * and avoid SDR-side overflow on high sample rate devices. */
 		if (tx)
 			usleep(100);
 		else
-			usleep(1000);
+			usleep(250);
 		/* Check paging pipe for new messages */
 		if (paging_pipe_fd >= 0)
 			paging_pipe_handler(&radio.rds_enc);

@@ -470,9 +470,9 @@ void fm_demodulate_complex(fm_demod_t *demod, sample_t *frequency, int length, f
 			phase = atan2(Q[s], I[s]);
 		dev = (phase - last_phase) / 2 / M_PI;
 		last_phase = phase;
-		if (dev < -0.49)
+		if (dev < -0.5)
 			dev += 1.0;
-		else if (dev > 0.49)
+		else if (dev > 0.5)
 			dev -= 1.0;
 		dev *= rate;
 		frequency[s] = dev;
@@ -554,9 +554,9 @@ void fm_demodulate_real(fm_demod_t *demod, sample_t *frequency, int length, samp
 			phase = atan2(Q[s], I[s]);
 		dev = (phase - last_phase) / 2 / M_PI;
 		last_phase = phase;
-		if (dev < -0.49)
+		if (dev < -0.5)
 			dev += 1.0;
-		else if (dev > 0.49)
+		else if (dev > 0.5)
 			dev -= 1.0;
 		dev *= rate;
 		frequency[s] = dev;
