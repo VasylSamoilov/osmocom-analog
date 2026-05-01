@@ -806,7 +806,13 @@ int uhd_send(float *buff, int num)
 		chunk = num;
 		if (chunk > (int)tx_samps_per_buff)
 			chunk = (int)tx_samps_per_buff;
-		/* create tx metadata */
+		/* Create TX metadata for this chunk.
+		 * uhd_tx_metadata_make() allocates a new C++ object each call,
+		 * so free the previous handle first to avoid leaking memory. */
+		if (uhd_tx_inst->tx_metadata) {
+			uhd_tx_metadata_free(&uhd_tx_inst->tx_metadata);
+			uhd_tx_inst->tx_metadata = NULL;
+		}
 		if (uhd_tx_inst->tx_timestamps)
 			error = uhd_tx_metadata_make(&uhd_tx_inst->tx_metadata, true, uhd_tx_inst->tx_time_secs, uhd_tx_inst->tx_time_fract_sec, false, false);
 		else
