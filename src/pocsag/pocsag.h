@@ -117,7 +117,7 @@ typedef struct pocsag_msg {
 	uint32_t		ric;			/* Full 21-bit RIC: upper 18 bits transmitted, lower 3 bits = frame */
 	enum pocsag_function	function;		/* sub-address (0-3) */
 	enum pocsag_msg_type	msg_type;		/* message encoding type */
-	char			data[256];		/* message to be transmitted */
+	char			data[4096];		/* message to be transmitted */
 	int			data_length;		/* length of message that is not 0-terminated */
 	int			data_index;		/* current character transmitting */
 	int			bit_index;		/* current bit transmitting */
