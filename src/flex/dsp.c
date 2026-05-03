@@ -4417,6 +4417,15 @@ parse_phase:
 					int hex_is_initial = 0;
 					int hex_r = 0; /* R flag from hdr2 (retransmission) */
 					int hex_blocking = 0; /* B field from hdr2 (0=16 bits/char) */
+					int hex_display_rtl = 0; /* D: Display direction per §3.10.1.2.
+								  * 0=left-to-right (default), 1=right-to-left.
+								  * Only for blocking length != 1. */
+					int hex_header_msg = 0;  /* H: Header message flag per §3.10.1.2.
+								  * 1=displayable header, transparent data
+								  * with same N follows. */
+					int hex_status_info = 0; /* I: Status info field enabler per §3.10.1.2.
+								  * 0=standard HEX data, 1=first 8 data bits
+								  * indicate encoding method (reserved). */
 					uint32_t rx_hex_sig = 0; /* S field from hdr2 (8-bit signature) */
 					int hex_has_sig = 0; /* 1 if we extracted S from hdr2 */
 					const char *hex_sig_status = ""; /* signature validation result */
@@ -4464,15 +4473,21 @@ parse_phase:
 									uint32_t hdr2 = ph->words[mw1];
 									hex_r = (hdr2 >> FLEX_HEX_HDR2_R_SHIFT) & 1;
 									hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
+									hex_display_rtl = (hdr2 >> FLEX_HEX_HDR2_D_SHIFT) & 1;
+									hex_header_msg = (hdr2 >> FLEX_HEX_HDR2_H_SHIFT) & 1;
+									hex_status_info = (hdr2 >> FLEX_HEX_HDR2_I_SHIFT) & 1;
 									rx_hex_sig = (hdr2 >> FLEX_HEX_HDR2_S_SHIFT) & 0xFF;
 									hex_has_sig = 1;
 									LOGP_CHAN(DDSP, LOGL_DEBUG,
 										  "RX: Phase %c hex hdr2[%d]=0x%05X: "
-										  "R=%d B=%d (%d bits/char) S=0x%02X\n",
+										  "R=%d D=%d H=%d B=%d (%d bits/char) I=%d S=0x%02X\n",
 										  phase_name, mw1, hdr2,
 										  hex_r,
+										  hex_display_rtl,
+										  hex_header_msg,
 										  hex_blocking,
 										  hex_blocking ? hex_blocking : 16,
+										  hex_status_info,
 										  rx_hex_sig);
 								}
 							} else {
@@ -4488,15 +4503,21 @@ parse_phase:
 									uint32_t hdr2 = ph->words[mw1 + 1];
 									hex_r = (hdr2 >> FLEX_HEX_HDR2_R_SHIFT) & 1;
 									hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
+									hex_display_rtl = (hdr2 >> FLEX_HEX_HDR2_D_SHIFT) & 1;
+									hex_header_msg = (hdr2 >> FLEX_HEX_HDR2_H_SHIFT) & 1;
+									hex_status_info = (hdr2 >> FLEX_HEX_HDR2_I_SHIFT) & 1;
 									rx_hex_sig = (hdr2 >> FLEX_HEX_HDR2_S_SHIFT) & 0xFF;
 									hex_has_sig = 1;
 									LOGP_CHAN(DDSP, LOGL_DEBUG,
 										  "RX: Phase %c hex hdr2[%d]=0x%05X: "
-										  "R=%d B=%d (%d bits/char) S=0x%02X\n",
+										  "R=%d D=%d H=%d B=%d (%d bits/char) I=%d S=0x%02X\n",
 										  phase_name, mw1 + 1, hdr2,
 										  hex_r,
+										  hex_display_rtl,
+										  hex_header_msg,
 										  hex_blocking,
 										  hex_blocking ? hex_blocking : 16,
+										  hex_status_info,
 										  rx_hex_sig);
 								}
 							} else {
@@ -4814,7 +4835,7 @@ parse_phase:
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,B=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,D=%d,H=%d,B=%d,I=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -4826,7 +4847,10 @@ parse_phase:
 						  (hex_frag_flag == 'F') ? (hex_is_initial ? "frag_start" : "frag_cont") :
 						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
 						  hex_n, hex_r,
+						  hex_display_rtl,
+						  hex_header_msg,
 						  hex_blocking,
+						  hex_status_info,
 						  hex_sig_status,
 						  hex_recovered ? ",RX_RECOVERED" : "",
 						  capcode,
@@ -4854,6 +4878,9 @@ parse_phase:
 						int slot = reasm_alloc(flex, capcode, hex_n, FLEX_VECTOR_TYPE_HEX_BINARY);
 						flex->rx.reasm[pol][slot].r_flag = hex_r;
 						flex->rx.reasm[pol][slot].blocking = hex_blocking;
+						flex->rx.reasm[pol][slot].display_rtl = hex_display_rtl;
+						flex->rx.reasm[pol][slot].header_msg = hex_header_msg;
+						flex->rx.reasm[pol][slot].status_info = hex_status_info;
 						reasm_append(flex, slot, hex, hi);
 					} else if (hex_frag_flag == 'F') {
 						int slot = reasm_find(flex, capcode, hex_n);
@@ -4888,7 +4915,7 @@ parse_phase:
 									  r_bits, r_blocks);
 							}
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,D=%d,H=%d,B=%d,I=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -4899,7 +4926,10 @@ parse_phase:
 								  "reassembled",
 								  flex->rx.reasm[pol][slot].msg_num,
 								  flex->rx.reasm[pol][slot].r_flag,
+								  flex->rx.reasm[pol][slot].display_rtl,
+								  flex->rx.reasm[pol][slot].header_msg,
 								  hex_blocking,
+								  flex->rx.reasm[pol][slot].status_info,
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
 								  prio_flag,

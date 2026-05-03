@@ -36,6 +36,15 @@ struct flex_msg_config {
 	int	fragment_index;	/* 0-based fragment index */
 	int	total_fragments;/* total count (0 = not fragmented) */
 	int	blocking_length;/* HEX/Binary B field: bits/char (1-15, 0=16) */
+	int	hex_display_rtl;/* D: Display direction per Section 3.10.1.2.
+				 * 0=left-to-right (default), 1=right-to-left.
+				 * Only meaningful when blocking length != 1. */
+	int	hex_header_msg;	/* H: Header message flag per Section 3.10.1.2.
+				 * 1=displayable header, transparent data with
+				 * same N follows. 0=normal (default). */
+	int	hex_status_info;/* I: Status info field enabler per Section 3.10.1.2.
+				 * 0=standard HEX data (default), 1=first 8 data
+				 * bits indicate encoding method (reserved). */
 	int	alpha_r_flag;	/* passed through from flex_frame_msg_t */
 	int	hex_r_flag;	/* passed through from flex_frame_msg_t */
 	uint32_t precomputed_sig; /* whole-message signature for fragmented alpha.
@@ -1117,6 +1126,15 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 				msg_words[1] |= FLEX_HEX_HDR2_R_MASK;
 			if (cfg && cfg->mail_drop)
 				msg_words[1] |= FLEX_HEX_HDR2_M_MASK;
+			/* D: Display direction (§3.10.1.2) */
+			if (cfg && cfg->hex_display_rtl)
+				msg_words[1] |= FLEX_HEX_HDR2_D_MASK;
+			/* H: Header message flag (§3.10.1.2) */
+			if (cfg && cfg->hex_header_msg)
+				msg_words[1] |= FLEX_HEX_HDR2_H_MASK;
+			/* I: Status info field enabler (§3.10.1.2) */
+			if (cfg && cfg->hex_status_info)
+				msg_words[1] |= FLEX_HEX_HDR2_I_MASK;
 			data_idx = 2;
 		} else {
 			data_idx = 1;
@@ -2391,6 +2409,24 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 			if (cfg->mail_drop)
 				msg_words[1] |= FLEX_HEX_HDR2_M_MASK;
 		}
+		/* D: Display direction (§3.10.1.2) */
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			if (cfg->hex_display_rtl)
+				msg_words[1] |= FLEX_HEX_HDR2_D_MASK;
+		}
+		/* H: Header message flag (§3.10.1.2) */
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			if (cfg->hex_header_msg)
+				msg_words[1] |= FLEX_HEX_HDR2_H_MASK;
+		}
+		/* I: Status info field enabler (§3.10.1.2) */
+		if (config) {
+			const struct flex_msg_config *cfg = config;
+			if (cfg->hex_status_info)
+				msg_words[1] |= FLEX_HEX_HDR2_I_MASK;
+		}
 		data_idx = 2;
 
 		/* Log blocking length and data metrics */
@@ -2398,10 +2434,16 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 			int bl = b_field ? b_field : 16;
 			int data_bits = (int)len * 4;
 			int blocks = (bl > 0) ? (data_bits + bl - 1) / bl : 0;
+			const struct flex_msg_config *cfg = config;
 			LOGP(DFLEX, LOGL_DEBUG,
 			     "TX: HEX/Binary encoder: B=%d (%d bits/char), "
+			     "D=%d H=%d I=%d, "
 			     "data=%d bits, %d blocks\n",
-			     b_field, bl, data_bits, blocks);
+			     b_field, bl,
+			     cfg ? cfg->hex_display_rtl : 0,
+			     cfg ? cfg->hex_header_msg : 0,
+			     cfg ? cfg->hex_status_info : 0,
+			     data_bits, blocks);
 		}
 	} else {
 		data_idx = 1;
@@ -3878,6 +3920,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				hcfg.fragment_index = msgs[idx].fragment_index;
 				hcfg.total_fragments = msgs[idx].total_fragments;
 				hcfg.blocking_length = msgs[idx].blocking_length;
+				hcfg.hex_display_rtl = msgs[idx].hex_display_rtl;
+				hcfg.hex_header_msg = msgs[idx].hex_header_msg;
+				hcfg.hex_status_info = msgs[idx].hex_status_info;
 				hcfg.mail_drop = msgs[idx].mail_drop;
 				hcfg.hex_r_flag = msgs[idx].hex_r_flag;
 				hcfg.precomputed_sig = msgs[idx].precomputed_sig;
@@ -4001,6 +4046,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				scfg.total_fragments = msgs[idx].total_fragments;
 				scfg.mail_drop = msgs[idx].mail_drop;
 				scfg.blocking_length = msgs[idx].blocking_length;
+				scfg.hex_display_rtl = msgs[idx].hex_display_rtl;
+				scfg.hex_header_msg = msgs[idx].hex_header_msg;
+				scfg.hex_status_info = msgs[idx].hex_status_info;
 				scfg.alpha_r_flag = msgs[idx].alpha_r_flag;
 				scfg.hex_r_flag = msgs[idx].hex_r_flag;
 				scfg.precomputed_sig = msgs[idx].precomputed_sig;

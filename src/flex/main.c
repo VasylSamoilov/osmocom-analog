@@ -319,6 +319,9 @@ void print_help(const char *arg0)
 	printf("          tempgroup=0|1  source=<id>\n");
 	printf("          phase=A|B|C|D|auto\n");
 	printf("          blocking=0-16  (hex bits/char: 0 or 16=16bit, 1=raw, default 1)\n");
+	printf("          display=ltr|rtl  (hex display direction: ltr=left-to-right (default), rtl=right-to-left)\n");
+	printf("          header=0|1  (hex header message flag: 1=displayable header, default 0)\n");
+	printf("          statusinfo=0|1  (hex status info: 1=first 8 data bits = encoding method, default 0)\n");
 	printf("          maildrop=0|1  (alpha/hex: separate handling from ordinary msgs)\n");
 	printf("          stype=numeric|source|numbered  (short msg sub-type)\n");
 	printf("            numeric: message = up to 3 BCD digits (short addr)\n");
@@ -852,6 +855,8 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			       double *polarity_out, int *priority,
 			       int *charset, int *is_temp_group,
 			       char *source_id, int *phase, int *blocking_length,
+			       int *hex_display_rtl, int *hex_header_msg,
+			       int *hex_status_info,
 			       int *mail_drop,
 			       int *secure_encoding, int *secure_subtype,
 			       int *numbered_msgnum, int *numbered_r,
@@ -876,6 +881,9 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	source_id[0] = '\0';
 	*phase = -1;
 	*blocking_length = default_blocking_length;
+	*hex_display_rtl = 0;
+	*hex_header_msg = 0;
+	*hex_status_info = 0;
 	*mail_drop = 0;
 	*secure_encoding = 0;	/* wire encoding: 0=7-bit alpha, 1=raw binary */
 	*secure_subtype = -1;	/* pager-side type tag; -1 = derive from encoding */
@@ -986,6 +994,29 @@ static void parse_fifo_options(const char *opts, int opts_len,
 		}
 		else if (!strcmp(key, "maildrop"))
 			*mail_drop = atoi(val) ? 1 : 0;
+		else if (!strcmp(key, "display")) {
+			/* D: Display direction per Section 3.10.1.2.
+			 * 0=left-to-right (default), 1=right-to-left.
+			 * Only meaningful when blocking length != 1. */
+			if (!strcasecmp(val, "ltr") || !strcmp(val, "0"))
+				*hex_display_rtl = 0;
+			else if (!strcasecmp(val, "rtl") || !strcmp(val, "1"))
+				*hex_display_rtl = 1;
+			else
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: invalid display '%s' — use ltr or rtl.\n", val);
+		}
+		else if (!strcmp(key, "header")) {
+			/* H: Header message flag per Section 3.10.1.2.
+			 * 1=displayable header, transparent data with same N follows. */
+			*hex_header_msg = atoi(val) ? 1 : 0;
+		}
+		else if (!strcmp(key, "statusinfo")) {
+			/* I: Status info field enabler per Section 3.10.1.2.
+			 * 0=standard HEX data, 1=first 8 data bits indicate
+			 * encoding method (reserved). */
+			*hex_status_info = atoi(val) ? 1 : 0;
+		}
 		else if (!strcmp(key, "sectype")) {
 			if (!strcasecmp(val, "alpha"))
 				*secure_encoding = FLEX_SEC_ENC_ALPHA;
@@ -1535,7 +1566,9 @@ static void flex_log_payload(enum flex_msg_type mtype,
 /* Log type-specific options for secure, numbered, and hex messages. */
 static void flex_log_type_options(enum flex_msg_type mtype,
 				  int secure_encoding, int secure_subtype,
-				  int numbered_msgnum, int blocking_length)
+				  int numbered_msgnum, int blocking_length,
+				  int hex_display_rtl, int hex_header_msg,
+				  int hex_status_info)
 {
 	switch (mtype) {
 	case FLEX_MSG_TYPE_SECURE:
@@ -1551,8 +1584,11 @@ static void flex_log_type_options(enum flex_msg_type mtype,
 		break;
 	case FLEX_MSG_TYPE_HEX:
 		LOGP(DFLEX, LOGL_INFO,
-		     "FIFO:   hex options: blocking=%d\n",
-		     blocking_length);
+		     "FIFO:   hex options: blocking=%d display=%s header=%d statusinfo=%d\n",
+		     blocking_length,
+		     hex_display_rtl ? "rtl" : "ltr",
+		     hex_header_msg,
+		     hex_status_info);
 		break;
 	default:
 		break;
@@ -1607,6 +1643,9 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_charset;
 	int msg_phase;
 	int msg_blocking_length;
+	int msg_hex_display_rtl;
+	int msg_hex_header_msg;
+	int msg_hex_status_info;
 	int msg_mail_drop;
 	int msg_secure_encoding;
 	int msg_secure_subtype;
@@ -2087,11 +2126,13 @@ static void fifo_process_line(const char *text, int text_length)
 			int dummy_cs, dummy_rt, dummy_ri, dummy_sd;
 			int dummy_st, dummy_ssrc, dummy_sn, dummy_sr;
 			int dummy_it, dummy_is, dummy_if;
+			int dummy_drtl, dummy_hmsg, dummy_sinfo;
 			parse_fifo_options(text + comma2 + 1, comma3 - comma2 - 1,
 					   &tg_speed, &tg_mod,
 					   &tg_pol, &tg_prio,
 					   &dummy_charset, &dummy_tg,
 					   dummy_src, &tg_phase, &dummy_bl,
+					   &dummy_drtl, &dummy_hmsg, &dummy_sinfo,
 					   &dummy_md,
 					   &dummy_se, &dummy_ss,
 					   &dummy_nm, &dummy_nr,
@@ -2144,6 +2185,8 @@ static void fifo_process_line(const char *text, int text_length)
 			   &msg_polarity, &msg_priority,
 			   &msg_charset, &is_temp_group,
 			   msg_source, &msg_phase, &msg_blocking_length,
+			   &msg_hex_display_rtl, &msg_hex_header_msg,
+			   &msg_hex_status_info,
 			   &msg_mail_drop,
 			   &msg_secure_encoding, &msg_secure_subtype,
 			   &msg_numbered_msgnum, &msg_numbered_r,
@@ -2353,6 +2396,9 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->is_temp_group = is_temp_group;
 				msg->phase = msg_phase;
 				msg->blocking_length = msg_blocking_length;
+				msg->hex_display_rtl = msg_hex_display_rtl;
+				msg->hex_header_msg = msg_hex_header_msg;
+				msg->hex_status_info = msg_hex_status_info;
 				msg->mail_drop = msg_mail_drop;
 				msg->secure_encoding = msg_secure_encoding;
 				msg->secure_subtype = msg_secure_subtype;
@@ -2413,7 +2459,10 @@ static void fifo_process_line(const char *text, int text_length)
 				flex_log_type_options(mtype, msg_secure_encoding,
 						     msg_secure_subtype,
 						     msg_numbered_msgnum,
-						     msg_blocking_length);
+						     msg_blocking_length,
+						     msg_hex_display_rtl,
+						     msg_hex_header_msg,
+						     msg_hex_status_info);
 			}
 		}
 	}

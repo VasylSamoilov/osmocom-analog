@@ -332,6 +332,9 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->short_msg_number = 0;
 	msg->short_msg_r = 0;
 	msg->blocking_length = flex->default_blocking_length;
+	msg->hex_display_rtl = 0;
+	msg->hex_header_msg = 0;
+	msg->hex_status_info = 0;
 	msg->mail_drop = 0;
 	msg->phase = -1;
 
@@ -1005,6 +1008,9 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->short_msg_number = msg->short_msg_number;
 			frag->short_msg_r = msg->short_msg_r;
 			frag->blocking_length = msg->blocking_length;
+			frag->hex_display_rtl = msg->hex_display_rtl;
+			frag->hex_header_msg = msg->hex_header_msg;
+			frag->hex_status_info = msg->hex_status_info;
 			frag->mail_drop = msg->mail_drop;
 			frag->phase = msg->phase;
 			frag->fragment_tx_phase = msg->fragment_tx_phase; /* -1 until initial is sent */
@@ -3106,6 +3112,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 					fm->short_msg_number = m->short_msg_number;
 					fm->short_msg_r = m->short_msg_r;
 					fm->blocking_length = m->blocking_length;
+					fm->hex_display_rtl = m->hex_display_rtl;
+					fm->hex_header_msg = m->hex_header_msg;
+					fm->hex_status_info = m->hex_status_info;
 					fm->mail_drop = m->mail_drop;
 					fm->fragment_index = m->fragment_index;
 					fm->total_fragments = m->total_fragments;
@@ -3501,6 +3510,9 @@ int flex_get_next_frame(flex_t *flex)
 				: (int)(flex->msg_sequence & 0x3F);
 			frame_msg.phase = msg->phase;
 			frame_msg.blocking_length = msg->blocking_length;
+			frame_msg.hex_display_rtl = msg->hex_display_rtl;
+			frame_msg.hex_header_msg = msg->hex_header_msg;
+			frame_msg.hex_status_info = msg->hex_status_info;
 			frame_msg.mail_drop = msg->mail_drop;
 			frame_msg.fragment_index = msg->fragment_index;
 			frame_msg.total_fragments = msg->total_fragments;

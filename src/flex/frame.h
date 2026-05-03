@@ -2098,6 +2098,15 @@ typedef struct flex_frame_msg {
 	int		blocking_length;	/* HEX/Binary B field: bits per character.
 					 * 1-15 = that many bits, 0 = 16 bits.
 					 * Default 1 (raw bits). */
+	int		hex_display_rtl;	/* D: Display direction per Section 3.10.1.2.
+					 * 0=left-to-right (default), 1=right-to-left.
+					 * Only meaningful when blocking length != 1. */
+	int		hex_header_msg;		/* H: Header message flag per Section 3.10.1.2.
+					 * 1=displayable header, transparent data with
+					 * same N follows. 0=normal (default). */
+	int		hex_status_info;	/* I: Status info field enabler per Section 3.10.1.2.
+					 * 0=standard HEX data (default), 1=first 8 data
+					 * bits indicate encoding method (reserved). */
 	int		mail_drop;		/* M flag:
 					 * 0 = ordinary message (default)
 					 * 1 = can be handled separately */
