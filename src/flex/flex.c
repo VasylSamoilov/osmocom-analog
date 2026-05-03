@@ -3118,7 +3118,15 @@ static int flex_get_next_frame_network(flex_t *flex)
 					{
 						int is_retransmission = (m->assigned_n >= 0);
 						if (!is_retransmission) {
-							if (m->total_fragments > 1)
+							if (m->numbered_msgnum >= 0) {
+								m->assigned_n = m->numbered_msgnum;
+								/* Sync counter so next auto-assign continues from here */
+								int mp = pol_index(m->polarity);
+								uint32_t af = ft.cycle * 128 + ft.frame;
+								flex_n_counter_set(
+									&flex->tx_pol[mp], m->capcode, af,
+									(uint8_t)m->numbered_msgnum);
+							} else if (m->total_fragments > 1)
 								m->assigned_n = (int)m->retrieval_num;
 							else {
 								/* Per-capcode N_Counter (Req 4.1-4.3) */
@@ -3129,9 +3137,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 							}
 							fm->sequence_num = m->assigned_n;
 							LOGP(DFLEX, LOGL_INFO,
-							     "TX: capcode=%" PRIu64 "%s N=%d R=1 type=%s frags=%d retransmit=%d/%d C%u/F%u\n",
+							     "TX: capcode=%" PRIu64 "%s N=%d R=%d M=%d type=%s frags=%d retransmit=%d/%d C%u/F%u\n",
 							     m->capcode, flex_grp_tag(m->temp_delivery_slot),
 							     m->assigned_n,
+							     m->numbered_r ? 1 : 0,
+							     m->mail_drop,
 							     flex_msg_type_name(m->msg_type),
 							     m->total_fragments,
 							     m->retransmit_count, m->retransmit_max,
@@ -3484,7 +3494,9 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.charset = msg->charset;
 			frame_msg.is_temp_group = msg->is_temp_group;
 			frame_msg.temp_delivery_slot = msg->temp_delivery_slot;
-			frame_msg.sequence_num = (msg->total_fragments > 1)
+			frame_msg.sequence_num = (msg->numbered_msgnum >= 0)
+				? msg->numbered_msgnum
+				: (msg->total_fragments > 1)
 				? (int)msg->retrieval_num
 				: (int)(flex->msg_sequence & 0x3F);
 			frame_msg.phase = msg->phase;

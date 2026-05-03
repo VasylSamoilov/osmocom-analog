@@ -2972,7 +2972,8 @@ parse_phase:
 			}
 
 			/* Info Service address (Spec Table 3.8.1-1, under study).
-			 * Log raw payload for analysis — no defined protocol yet. */
+			 * Log raw payload for analysis, then fall through to
+			 * normal message decoding (alpha/numeric/hex). */
 			if (aw_type == FLEX_ADDR_INFO_SVC) {
 				if (mw1 <= 87 && mw2 <= 87) {
 					char hex[512];
@@ -2990,22 +2991,11 @@ parse_phase:
 						hex[--hi] = '\0';
 					else
 						hex[hi] = '\0';
-					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  ISV [%s]\n",
-						  bitrate,
-						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  phase_name, capcode,
-						  FLEX_RX_FLAG_INFO_SVC,
-						  hex);
-				} else {
-					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  ISV\n",
-						  bitrate,
-						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  phase_name, capcode,
-						  FLEX_RX_FLAG_INFO_SVC);
+					LOGP_CHAN(DDSP, LOGL_DEBUG,
+						  "RX: Phase %c InfoSvc raw [%09" PRIu64 "] [%s]\n",
+						  phase_name, capcode, hex);
 				}
-				continue;
+				/* Fall through to normal message decoding */
 			}
 
 			/* Reserved Short address — log and skip (no defined behavior). */
@@ -3571,7 +3561,7 @@ parse_phase:
 					}
 
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3582,6 +3572,7 @@ parse_phase:
 						  (frag_flag == 'K') ? "complete" :
 						  (frag_flag == 'F') ? (is_initial ? "frag_start" : "frag_cont") :
 						  "frag_end",
+						  hdr_n, hdr_r, hdr_m,
 						  alpha_sig_status,
 						  alpha_k_status,
 						  alpha_recovered ? ",RX_RECOVERED" : "",
@@ -3617,6 +3608,7 @@ parse_phase:
 						int reasm_type = (vec_type == FLEX_VECTOR_TYPE_SECURE)
 							? FLEX_VECTOR_TYPE_SECURE : FLEX_VECTOR_TYPE_ALPHA;
 						int slot = reasm_alloc(flex, capcode, hdr_n, reasm_type);
+						flex->rx.reasm[pol][slot].r_flag = hdr_r;
 						if (vec_type == FLEX_VECTOR_TYPE_SECURE)
 							flex->rx.reasm[pol][slot].secure_subtype = sec_t;
 						if (is_kanji)
@@ -3734,7 +3726,7 @@ parse_phase:
 									  flex->rx.reasm[pol][slot].word_status);
 							else
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 									  bitrate,
 									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 									  phase_name,
@@ -3743,6 +3735,8 @@ parse_phase:
 									  flex->rx.polarity ? "inverted" : "normal",
 									  grp_tag,
 									  "reassembled",
+									  flex->rx.reasm[pol][slot].msg_num,
+									  flex->rx.reasm[pol][slot].r_flag,
 									  reasm_sig_status,
 									  capcode,
 									  flex_addr_type_flag(aw_type, is_long),
@@ -4630,7 +4624,7 @@ parse_phase:
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,B=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,B=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -4641,6 +4635,7 @@ parse_phase:
 						  (hex_frag_flag == 'K') ? "complete" :
 						  (hex_frag_flag == 'F') ? (hex_is_initial ? "frag_start" : "frag_cont") :
 						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
+						  hex_n, hex_r,
 						  hex_blocking,
 						  hex_sig_status,
 						  hex_recovered ? ",RX_RECOVERED" : "",
@@ -4667,6 +4662,7 @@ parse_phase:
 						 * for this capcode from an abandoned stream. */
 						reasm_invalidate_capcode(flex, capcode, hex_n);
 						int slot = reasm_alloc(flex, capcode, hex_n, FLEX_VECTOR_TYPE_HEX_BINARY);
+						flex->rx.reasm[pol][slot].r_flag = hex_r;
 						flex->rx.reasm[pol][slot].blocking = hex_blocking;
 						reasm_append(flex, slot, hex, hi);
 					} else if (hex_frag_flag == 'F') {
@@ -4702,7 +4698,7 @@ parse_phase:
 									  r_bits, r_blocks);
 							}
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,B=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -4711,6 +4707,8 @@ parse_phase:
 								  flex->rx.polarity ? "inverted" : "normal",
 								  grp_tag,
 								  "reassembled",
+								  flex->rx.reasm[pol][slot].msg_num,
+								  flex->rx.reasm[pol][slot].r_flag,
 								  hex_blocking,
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),

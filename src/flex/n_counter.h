@@ -45,4 +45,11 @@ uint8_t flex_n_counter_get(struct flex_tx_polarity *pol,
  * Moves entry to LRU head (it was recently referenced). */
 int flex_n_counter_peek(struct flex_tx_polarity *pol, uint64_t capcode);
 
+/* Set the N counter for capcode to a specific value (0-63).
+ * Creates the entry if it doesn't exist.  Moves to LRU head.
+ * Use when an explicit msgnum= is provided via FIFO to keep
+ * the counter in sync for subsequent auto-assigned messages. */
+void flex_n_counter_set(struct flex_tx_polarity *pol,
+			uint64_t capcode, uint32_t abs_frame, uint8_t value);
+
 #endif /* FLEX_N_COUNTER_H */

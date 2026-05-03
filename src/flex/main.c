@@ -2444,7 +2444,9 @@ static void myhandler(void)
 	if (rc > 0)
 		pos += rc;
 
-	/* Process all complete lines in the buffer */
+	/* Process up to a batch of complete lines per call.
+	 * This prevents bulk FIFO writes from starving TX/RX processing. */
+	int lines_processed = 0;
 	line_start = 0;
 	while (line_start < pos) {
 		/* Find next line terminator */
@@ -2465,6 +2467,9 @@ static void myhandler(void)
 		while (i < pos && (buffer[i] == '\r' || buffer[i] == '\n'))
 			i++;
 		line_start = i;
+
+		if (++lines_processed >= 64)
+			break;  /* yield to TX/RX, process rest next call */
 	}
 
 	/* Shift any remaining partial line to the front of the buffer */

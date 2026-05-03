@@ -830,6 +830,7 @@ typedef struct flex {
 		struct {
 			uint64_t	capcode;
 			int		msg_num;	/* N field (0-63) */
+			int		r_flag;		/* R field from initial fragment */
 			int		expected_f;	/* next expected F value */
 			int		msg_type;	/* FLEX_VECTOR_TYPE_ALPHA or _HEX_BINARY */
 			int		blocking;	/* HEX/Binary B field from initial frag */

@@ -197,3 +197,22 @@ int flex_n_counter_peek(flex_tx_polarity_t *pol, uint64_t capcode)
 
 	return (int)e->n_value;
 }
+
+void flex_n_counter_set(flex_tx_polarity_t *pol,
+			uint64_t capcode, uint32_t abs_frame, uint8_t value)
+{
+	flex_n_counter_t *e = hash_find(pol, capcode);
+
+	if (e) {
+		lru_remove(pol, e);
+		lru_push_head(pol, e);
+		e->last_used_abs = abs_frame;
+		e->n_value = value & 0x3F;
+		return;
+	}
+
+	/* Create new entry with the explicit value */
+	e = entry_create(pol, capcode, abs_frame);
+	if (e)
+		e->n_value = value & 0x3F;
+}
