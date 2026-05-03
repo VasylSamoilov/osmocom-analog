@@ -1867,6 +1867,84 @@ static int flex_build_word_status(flex_phase_data_t *ph, int start, int end,
 	return len;
 }
 
+/* ===== Flextime validation helpers =====
+ *
+ * Validate BIW date/time/timezone readings before promoting
+ * them to confirmed state, filtering out garbage from corrupted
+ * BCH words on noisy signals.
+ */
+
+/* Cross-validate a BIW minute against the FIW-derived minute.
+ * Returns 1 if they agree within +/-tolerance, handling :59/:00 wrap. */
+#define FLEX_TIME_CROSS_TOLERANCE 2  /* minutes */
+
+static int flextime_fiw_validate(uint32_t biw_min,
+				 uint32_t cycleno, uint32_t frameno)
+{
+	int fiw_seconds = (int)(cycleno * 240 + frameno * 240 / 128);
+	int fiw_min = fiw_seconds / 60;
+	int diff = (int)biw_min - fiw_min;
+	if (diff > 30) diff -= 60;
+	if (diff < -30) diff += 60;
+	if (diff < 0) diff = -diff;
+	return diff <= FLEX_TIME_CROSS_TOLERANCE;
+}
+
+/* Validate calendar date (days-in-month, leap year). */
+static int flextime_date_valid(int year, uint32_t mon, uint32_t day)
+{
+	static const uint32_t dim[13] = {
+		0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+	};
+	if (mon < 1 || mon > 12 || day < 1)
+		return 0;
+	uint32_t max_day = dim[mon];
+	if (mon == 2) {
+		unsigned int y = (unsigned int)year;
+		if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0))
+			max_day = 29;
+	}
+	return day <= max_day;
+}
+
+/* Compute next calendar day. */
+static void flextime_next_day(int y, uint32_t m, uint32_t d,
+			      int *ny, uint32_t *nm, uint32_t *nd)
+{
+	static const uint32_t dim[13] = {
+		0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+	};
+	uint32_t max_d = dim[m];
+	if (m == 2) {
+		unsigned int yu = (unsigned int)y;
+		if ((yu % 4 == 0 && yu % 100 != 0) || (yu % 400 == 0))
+			max_d = 29;
+	}
+	if (d < max_d) {
+		*ny = y; *nm = m; *nd = d + 1;
+	} else if (m < 12) {
+		*ny = y; *nm = m + 1; *nd = 1;
+	} else {
+		*ny = y + 1; *nm = 1; *nd = 1;
+	}
+}
+
+/* Check if two dates agree (same or adjacent calendar day). */
+static int flextime_dates_agree(int y1, uint32_t m1, uint32_t d1,
+				int y2, uint32_t m2, uint32_t d2)
+{
+	int ny; uint32_t nm, nd;
+	if (y1 == y2 && m1 == m2 && d1 == d2)
+		return 1;
+	flextime_next_day(y1, m1, d1, &ny, &nm, &nd);
+	if (ny == y2 && nm == m2 && nd == d2)
+		return 1;
+	flextime_next_day(y2, m2, d2, &ny, &nm, &nd);
+	if (ny == y1 && nm == m1 && nd == d1)
+		return 1;
+	return 0;
+}
+
 /* Decode one phase of a received frame.
  * De-interleave blocks, BCH decode, parse BIW/addresses/vectors/messages.
  * phaseptr points to 88 words of raw interleaved data. */
@@ -2321,10 +2399,41 @@ parse_phase:
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  real, mon, day);
-					flex->rx.biw[pol].date_year = real;
-					flex->rx.biw[pol].date_month = mon;
-					flex->rx.biw[pol].date_day = day;
-					flex->rx.biw[pol].seen_date = 1;
+					/* Validate and vote before promoting */
+					if (!flextime_date_valid(real, mon, day)) {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: BIW DATE invalid calendar: %04d-%02u-%02u, discarding\n",
+							  real, mon, day);
+						break;
+					}
+					{
+						/* Push into date ring */
+						typeof(flex->rx.biw[pol]) *b = &flex->rx.biw[pol];
+						int ri;
+						b->date_ring_year[b->date_ring_idx] = real;
+						b->date_ring_month[b->date_ring_idx] = mon;
+						b->date_ring_day[b->date_ring_idx] = day;
+						b->date_ring_idx = (b->date_ring_idx + 1) % FLEX_VOTE_RING;
+						if (b->date_ring_count < FLEX_VOTE_RING)
+							b->date_ring_count++;
+						/* Count agreeing entries */
+						int agree = 0;
+						for (ri = 0; ri < b->date_ring_count; ri++) {
+							if (flextime_dates_agree(real, mon, day,
+								b->date_ring_year[ri], b->date_ring_month[ri],
+								b->date_ring_day[ri]))
+								agree++;
+						}
+						if (agree >= FLEX_VOTE_THRESHOLD) {
+							b->date_year = real;
+							b->date_month = mon;
+							b->date_day = day;
+							b->seen_date = 1;
+							LOGP_CHAN(DDSP, LOGL_NOTICE,
+								  "RX: flextime DATE confirmed (%d/%d agree): %04d-%02u-%02u\n",
+								  agree, b->date_ring_count, real, mon, day);
+						}
+					}
 					break;
 				}
 				case FLEX_BIW_TYPE_TIME: {
@@ -2337,10 +2446,51 @@ parse_phase:
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
 						  hour, min, sec * FLEX_BIW_TIME_SECOND_STEP);
-					flex->rx.biw[pol].time_hour = hour;
-					flex->rx.biw[pol].time_minute = min;
-					flex->rx.biw[pol].time_second = sec;
-					flex->rx.biw[pol].seen_time = 1;
+					/* Range check */
+					if (hour > 23 || min > 59 || sec > 7) {
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: BIW TIME out of range: h=%u m=%u s=%u\n",
+							  hour, min, sec);
+						break;
+					}
+					/* FIW cross-check */
+					if (!flextime_fiw_validate(min, flex->rx.fiw_cycle, flex->rx.fiw_frame)) {
+						int fiw_sec = (int)(flex->rx.fiw_cycle * 240 + flex->rx.fiw_frame * 240 / 128);
+						LOGP_CHAN(DDSP, LOGL_NOTICE,
+							  "RX: BIW TIME FIW cross-check failed: BIW %02u:%02u vs FIW min %d\n",
+							  hour, min, fiw_sec / 60);
+						flex->rx.biw[pol].vote_time_count = 0;
+						break;
+					}
+					/* Forward-ticking check */
+					{
+						typeof(flex->rx.biw[pol]) *b = &flex->rx.biw[pol];
+						if (b->vote_time_count > 0) {
+							int prev = (int)(b->vote_time_hour * 60 + b->vote_time_min);
+							int curr = (int)(hour * 60 + min);
+							int delta = curr - prev;
+							if (delta < -720) delta += 1440;
+							if (delta < 0) {
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: BIW TIME went backward: %02u:%02u -> %02u:%02u\n",
+									  b->vote_time_hour, b->vote_time_min, hour, min);
+								b->vote_time_count = 0;
+							}
+						}
+						b->vote_time_hour = hour;
+						b->vote_time_min = min;
+						b->vote_time_sec = sec;
+						b->vote_time_count++;
+						if (b->vote_time_count >= FLEX_VOTE_THRESHOLD) {
+							b->time_hour = hour;
+							b->time_minute = min;
+							b->time_second = sec;
+							b->seen_time = 1;
+							LOGP_CHAN(DDSP, LOGL_NOTICE,
+								  "RX: flextime TIME confirmed after %d votes: %02u:%02u:%04.1f\n",
+								  FLEX_VOTE_THRESHOLD, hour, min, sec * 7.5);
+						}
+					}
 					break;
 				}
 				case FLEX_BIW_TYPE_SYSINFO: {
@@ -2365,11 +2515,51 @@ parse_phase:
 							  phase_name, a_type, zone,
 							  flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
 							  dst, esec);
-						flex->rx.biw[pol].timezone_zone = zone;
-						flex->rx.biw[pol].timezone_offset_min = tz_min;
-						flex->rx.biw[pol].timezone_dst = (int)dst;
-						flex->rx.biw[pol].timezone_extsec = esec;
-						flex->rx.biw[pol].seen_timezone = 1;
+						/* esec FIW sanity gate */
+						{
+							int expected_ext = (int)(((flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame) % 32) / 4);
+							int ediff = (int)esec - expected_ext;
+							if (ediff > 4) ediff -= 8;
+							if (ediff < -4) ediff += 8;
+							if (ediff < 0) ediff = -ediff;
+							if (ediff > 1) {
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: TZ esec FIW sanity failed: esec=%u expected=%d (c=%u f=%u)\n",
+									  esec, expected_ext,
+									  flex->rx.fiw_cycle, flex->rx.fiw_frame);
+								break;
+							}
+						}
+						/* Push into tz ring and vote */
+						{
+							typeof(flex->rx.biw[pol]) *b = &flex->rx.biw[pol];
+							int ri;
+							b->tz_ring_zone[b->tz_ring_idx] = zone;
+							b->tz_ring_dst[b->tz_ring_idx] = (int)dst;
+							b->tz_ring_esec[b->tz_ring_idx] = esec;
+							b->tz_ring_idx = (b->tz_ring_idx + 1) % FLEX_VOTE_RING;
+							if (b->tz_ring_count < FLEX_VOTE_RING)
+								b->tz_ring_count++;
+							int agree = 0;
+							for (ri = 0; ri < b->tz_ring_count; ri++) {
+								if (b->tz_ring_zone[ri] == zone &&
+								    b->tz_ring_dst[ri] == (int)dst &&
+								    b->tz_ring_esec[ri] == esec)
+									agree++;
+							}
+							if (agree >= FLEX_VOTE_THRESHOLD) {
+								b->timezone_zone = zone;
+								b->timezone_offset_min = tz_min;
+								b->timezone_dst = (int)dst;
+								b->timezone_extsec = esec;
+								b->seen_timezone = 1;
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: flextime TZ confirmed (%d/%d agree): zone=%u (%s) DST=%u esec=%u\n",
+									  agree, b->tz_ring_count, zone,
+									  flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
+									  dst, esec);
+							}
+						}
 					} else if (a_type <= FLEX_BIW_SYSINFO_A_MSG_SSID) {
 						/* System Message types A=0000~0011.
 						 *

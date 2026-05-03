@@ -784,8 +784,17 @@ typedef struct flex {
 			int		active;		/* 1 = assignment active, 0 = empty */
 		} temp_addr_map[FLEX_RX_POLARITIES][FLEX_MAX_PHASES][FLEX_TEMP_ADDR_SLOTS];
 
-		/* BIW state — track SSID/coverage/timezone/date/time across frames.
-		 * Log at NOTICE level when values change, DEBUG when repeated. */
+		/* BIW state -- track SSID/coverage/timezone/date/time across frames.
+		 * Log at NOTICE level when values change, DEBUG when repeated.
+		 *
+		 * Consistency voting: each time component uses validation
+		 * before being promoted to "confirmed" (seen_*) state.
+		 * - Time: FIW cross-check + 3 consecutive forward-ticking.
+		 * - Date: calendar validation + history ring majority vote.
+		 * - Timezone: esec FIW sanity gate + history ring identical match.
+		 */
+#define FLEX_VOTE_THRESHOLD	3
+#define FLEX_VOTE_RING		8
 		struct {
 			uint32_t	local_id;
 			uint32_t	coverage;
@@ -793,17 +802,17 @@ typedef struct flex {
 			uint32_t	tmf;
 			int		seen;		/* 1 = at least one SSID1 received */
 			int		seen_ssid2;	/* 1 = at least one SSID2 received */
-			/* Date (type 001) */
+			/* Date (type 001) -- confirmed */
 			int		date_year;	/* decoded year (with equiv mapping) */
 			uint32_t	date_month;
 			uint32_t	date_day;
 			int		seen_date;
-			/* Time (type 010) */
+			/* Time (type 010) -- confirmed */
 			uint32_t	time_hour;
 			uint32_t	time_minute;
-			uint32_t	time_second;	/* raw 3-bit value (0-7, ×7.5s) */
+			uint32_t	time_second;	/* raw 3-bit value (0-7, x7.5s) */
 			int		seen_time;
-			/* SysInfo timezone (type 101, A=0100/0101) */
+			/* SysInfo timezone (type 101, A=0100/0101) -- confirmed */
 			uint32_t	timezone_zone;	/* 5-bit zone code (Z4-Z0) */
 			int		timezone_offset_min; /* UTC offset in minutes */
 			int		timezone_dst;	/* L0: 0=DST, 1=standard time */
@@ -812,6 +821,26 @@ typedef struct flex {
 			int		seen_timezone;
 			/* SysInfo system message (type 101, A=0000~0011) */
 			int		sysmsg_a_type;	/* -1=none, 0-3=A-type */
+
+			/* --- Voting state for time --- */
+			int		vote_time_count;
+			uint32_t	vote_time_hour;
+			uint32_t	vote_time_min;
+			uint32_t	vote_time_sec;
+
+			/* --- Date history ring --- */
+			int		date_ring_count;
+			int		date_ring_idx;
+			int		date_ring_year[FLEX_VOTE_RING];
+			uint32_t	date_ring_month[FLEX_VOTE_RING];
+			uint32_t	date_ring_day[FLEX_VOTE_RING];
+
+			/* --- Timezone history ring --- */
+			int		tz_ring_count;
+			int		tz_ring_idx;
+			uint32_t	tz_ring_zone[FLEX_VOTE_RING];
+			int		tz_ring_dst[FLEX_VOTE_RING];
+			uint32_t	tz_ring_esec[FLEX_VOTE_RING];
 		} biw[FLEX_RX_POLARITIES];
 
 		/* Fragment reassembly state.
