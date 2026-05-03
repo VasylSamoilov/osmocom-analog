@@ -338,7 +338,8 @@ void print_help(const char *arg0)
 	printf("          sectype=alpha|binary|regack  (secure: wire encoding, default alpha)\n");
 	printf("            regack: Registration Acknowledgment (opcode '=' in 2nd word)\n");
 	printf("          sectag=0|1|2|3  (secure: pager type tag, 0=alpha 1=vendor 2=binary 3=rsvd, default=sectype)\n");
-	printf("          msgnum=0-63  (nnumeric/nspecial: sequence number for dedup, default auto)\n");
+	printf("          msgnum=0-63  (alpha/hex/nnumeric/nspecial: message sequence number N, default auto)\n");
+	printf("          r=0|1  (alpha/hex/nnumeric/nspecial: retrieval flag R, default auto: 1=new, 0=retransmit)\n");
 	printf("          chan_setup=0|1  (enable/disable BIW channel setup emission)\n");
 	printf("          retransmit=0-15  (retransmissions after initial TX, overrides --retransmit)\n");
 	printf("          retransmit_interval=1-1920  (frames between retransmissions, overrides --retransmit-interval)\n");
@@ -853,7 +854,7 @@ static void parse_fifo_options(const char *opts, int opts_len,
 			       char *source_id, int *phase, int *blocking_length,
 			       int *mail_drop,
 			       int *secure_encoding, int *secure_subtype,
-			       int *numbered_msgnum,
+			       int *numbered_msgnum, int *numbered_r,
 			       int *msg_chan_setup,
 			       int *retransmit, int *retransmit_interval,
 			       int *send_delay,
@@ -879,6 +880,7 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*secure_encoding = 0;	/* wire encoding: 0=7-bit alpha, 1=raw binary */
 	*secure_subtype = -1;	/* pager-side type tag; -1 = derive from encoding */
 	*numbered_msgnum = -1;	/* sequence number for dedup; -1 = auto from counter */
+	*numbered_r = -1;	/* R flag; -1 = auto (1 on first TX, 0 on retransmit) */
 	*msg_chan_setup = -1;	/* -1 = not set (use global default) */
 	*retransmit = default_retransmit;
 	*retransmit_interval = default_retransmit_interval;
@@ -1009,6 +1011,9 @@ static void parse_fifo_options(const char *opts, int opts_len,
 				*numbered_msgnum = mn;
 			else
 				LOGP(DFLEX, LOGL_NOTICE, "FIFO: msgnum %d out of range (0-63), using auto-assign.\n", mn);
+		}
+		else if (!strcmp(key, "r")) {
+			*numbered_r = atoi(val) ? 1 : 0;
 		}
 		else if (!strcmp(key, "chan_setup"))
 			*msg_chan_setup = atoi(val) ? 1 : 0;
@@ -1606,6 +1611,7 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_secure_encoding;
 	int msg_secure_subtype;
 	int msg_numbered_msgnum;
+	int msg_numbered_r;
 	int msg_chan_setup;
 	int msg_retransmit;
 	int msg_retransmit_interval;
@@ -2077,7 +2083,7 @@ static void fifo_process_line(const char *text, int text_length)
 		{
 			int dummy_charset, dummy_tg;
 			char dummy_src[64];
-			int dummy_bl, dummy_md, dummy_se, dummy_ss, dummy_nm;
+			int dummy_bl, dummy_md, dummy_se, dummy_ss, dummy_nm, dummy_nr;
 			int dummy_cs, dummy_rt, dummy_ri, dummy_sd;
 			int dummy_st, dummy_ssrc, dummy_sn, dummy_sr;
 			int dummy_it, dummy_is, dummy_if;
@@ -2088,7 +2094,7 @@ static void fifo_process_line(const char *text, int text_length)
 					   dummy_src, &tg_phase, &dummy_bl,
 					   &dummy_md,
 					   &dummy_se, &dummy_ss,
-					   &dummy_nm,
+					   &dummy_nm, &dummy_nr,
 					   &dummy_cs,
 					   &dummy_rt, &dummy_ri,
 					   &dummy_sd,
@@ -2140,7 +2146,7 @@ static void fifo_process_line(const char *text, int text_length)
 			   msg_source, &msg_phase, &msg_blocking_length,
 			   &msg_mail_drop,
 			   &msg_secure_encoding, &msg_secure_subtype,
-			   &msg_numbered_msgnum,
+			   &msg_numbered_msgnum, &msg_numbered_r,
 			   &msg_chan_setup,
 			   &msg_retransmit, &msg_retransmit_interval,
 			   &msg_send_delay,
@@ -2351,6 +2357,8 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->secure_encoding = msg_secure_encoding;
 				msg->secure_subtype = msg_secure_subtype;
 				msg->numbered_msgnum = msg_numbered_msgnum;
+				if (msg_numbered_r >= 0)
+					msg->numbered_r = msg_numbered_r;
 				if (msg_chan_setup >= 0)
 					flex->chan_setup_enabled = msg_chan_setup;
 				if (msg_source[0] != '\0') {
