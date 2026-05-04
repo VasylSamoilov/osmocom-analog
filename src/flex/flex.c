@@ -2082,6 +2082,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 	flex_frame_params_default(&params);
 	params.cycle = ft.cycle;
 	params.frame = ft.frame;
+	LOGP_CHAN(DFLEX, LOGL_INFO,
+		  "TX: Encoding frame C%u/F%u (scheduler time)\n",
+		  ft.cycle, ft.frame);
 	/* FIW n flag: auto-set when ssid1 or ssid2 is configured. */
 	params.roaming = flex->roaming_active ? 1 : 0;
 	params.collapse = flex->collapse;
@@ -2125,85 +2128,33 @@ static int flex_get_next_frame_network(flex_t *flex)
 		params.tmf = flex->ssid2_tmf;
 	}
 
-	/* BIW DateTime: determine if this frame is a time TX frame.
-	 * Time TX interval = max(16, 2^collapse) frames.
-	 * Frame 0 Cycle 0 is always a time frame (mandatory). */
+	/* BIW DateTime: the carousel controls which frames get DATE/TIME.
+	 * We just set biw_datetime=1 so the frame encoder knows time is
+	 * enabled.  The actual per-frame decision comes from the carousel
+	 * selection below (biw_is_time_frame is set after carousel runs). */
 	if (flex->biw_datetime_enabled) {
-		uint32_t time_interval = FLEX_BIW_TIME_INTERVAL_BASE;
-		if (flex->collapse > 4)
-			time_interval = (1U << flex->collapse);
-		int is_time_frame = (ft.frame == 0 && ft.cycle == 0)
-				    || (ft.frame % time_interval == 0);
 		params.biw_datetime = 1;
-		params.biw_is_time_frame = is_time_frame;
-
-		if (is_time_frame) {
-			/* Calculate time from frame position within the hour.
-			 * Per §2.5: time refers to leading edge of S1 of Frame 0
-			 * of the current cycle. */
-			time_t base_time = time(NULL) + flex->biw_time_offset;
-			struct tm tm_val;
-			localtime_r(&base_time, &tm_val);
-
-			/* Frame-position-based time calculation */
-			double frame_seconds = (double)(ft.cycle * 128 + ft.frame) * 1.875;
-			int total_sec = (int)frame_seconds;
-			int hour_offset = total_sec / 3600;
-			int min_in_hour = (total_sec % 3600) / 60;
-			int sec_in_min = total_sec % 60;
-
-			/* For Frame 0 Cycle 0: use the hour boundary */
-			if (ft.frame == 0 && ft.cycle == 0) {
-				params.biw_hour = (uint32_t)tm_val.tm_hour;
-				params.biw_minute = 0;
-				params.biw_second = 0;
-			} else {
-				params.biw_hour = (uint32_t)((tm_val.tm_hour + hour_offset) % 24);
-				params.biw_minute = (uint32_t)min_in_hour;
-				params.biw_second = (uint32_t)(sec_in_min / 7.5);
-				if (params.biw_second > 7)
-					params.biw_second = 7;
-			}
-
-			/* Date from current time + offset */
-			int real_year = tm_val.tm_year + 1900;
-			if (flex->biw_retro_time)
-				params.biw_year = (uint32_t)(flex_biw_equiv_year(real_year) - FLEX_BIW_DATE_YEAR_BASE);
-			else
-				params.biw_year = flex_biw_year_field(real_year);
-			params.biw_month = (uint32_t)(tm_val.tm_mon + 1);
-			params.biw_day = (uint32_t)tm_val.tm_mday;
-		}
+		params.biw_is_time_frame = 0; /* will be set by carousel result */
 	}
 
-	/* BIW SysInfo: follows 1-3 frames behind a time frame.
-	 * Never in the same frame as Date/Time. */
+	/* BIW SysInfo: the carousel handles scheduling.
+	 * Ext seconds are always computed from cycle/frame position.
+	 * Never co-locate with datetime (carousel enforces this). */
 	if (flex->biw_sysinfo_enabled) {
-		uint32_t time_interval = FLEX_BIW_TIME_INTERVAL_BASE;
-		if (flex->collapse > 4)
-			time_interval = (1U << flex->collapse);
-		/* SysInfo goes in frame N+1 after a time frame (or N+1 after
-		 * where a time frame would be if datetime is not enabled) */
-		int sysinfo_offset = (ft.frame > 0) ? ((ft.frame - 1) % time_interval) : 0;
-		int is_sysinfo_frame = (sysinfo_offset == 0 && ft.frame > 0)
-				       || (!flex->biw_datetime_enabled && ft.frame % time_interval == 0);
-		/* Never co-locate with datetime */
-		if (params.biw_is_time_frame)
-			is_sysinfo_frame = 0;
-
 		params.biw_sysinfo = 1;
-		params.biw_is_sysinfo_frame = is_sysinfo_frame;
+		params.biw_is_sysinfo_frame = 1; /* carousel decides; always ready */
 		params.biw_tz_code = flex->biw_tz_code;
 		params.biw_dst = flex->biw_dst;
 
-		/* Extended seconds from current time */
-		if (is_sysinfo_frame && flex->biw_datetime_enabled) {
-			time_t base_time = time(NULL) + flex->biw_time_offset;
-			struct tm tm_val;
-			localtime_r(&base_time, &tm_val);
-			uint32_t combined = (uint32_t)(tm_val.tm_sec / 0.9375);
-			if (combined > 63) combined = 63;
-			params.biw_ext_seconds = combined & 7;
+		/* Extended seconds from cycle/frame position. */
+		if (flex->biw_datetime_enabled) {
+			double total_sec = (double)ft.cycle * 240.0 + (double)ft.frame * 1.875;
+			double sec_in_min = fmod(total_sec, 60.0);
+			int coarse = (int)(sec_in_min / 7.5);
+			double remainder = sec_in_min - coarse * 7.5;
+			uint32_t ext_sec = (uint32_t)(remainder / 0.9375);
+			if (ext_sec > 7) ext_sec = 7;
+			params.biw_ext_seconds = ext_sec;
 		}
 	}
 
@@ -2228,6 +2179,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		biw_cfg.chan_setup_enabled = flex->chan_setup_enabled;
 		biw_cfg.roaming_active = flex->roaming_active;
 		biw_cfg.has_sysmsg = 0; /* set later if sysmsg detected */
+		biw_cfg.queue_has_messages = (flex->tx_pol[selected_pol].msg_count > 0) ? 1 : 0;
 
 		flex_biw_carousel_select(car, &biw_cfg,
 					 ft.frame, ft.cycle,
@@ -2236,6 +2188,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 		/* Store carousel BIW count for capacity estimation. */
 		params.carousel_biw_count = 1 + biw_n; /* BIW1 + extras */
+
+		/* If carousel selected DATE or TIME, set time frame params
+		 * from the carousel's computed values. */
+		if (biw_time_val.valid) {
+			params.biw_is_time_frame = 1;
+			params.biw_hour = biw_time_val.hour;
+			params.biw_minute = biw_time_val.minute;
+			params.biw_second = biw_time_val.second;
+
+			int real_year = (int)biw_time_val.year;
+			if (flex->biw_retro_time)
+				params.biw_year = (uint32_t)(flex_biw_equiv_year(real_year) - FLEX_BIW_DATE_YEAR_BASE);
+			else
+				params.biw_year = flex_biw_year_field(real_year);
+			params.biw_month = biw_time_val.month;
+			params.biw_day = biw_time_val.day;
+		}
 
 		/* Update carousel state after selection. */
 		flex_biw_carousel_update(car, biw_types, biw_n,

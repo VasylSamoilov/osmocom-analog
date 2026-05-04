@@ -34,6 +34,7 @@ typedef struct flex_biw_config {
 	int	chan_setup_enabled;	/* 1 = channel setup BIW emission enabled */
 	int	roaming_active;		/* 1 = FIW n=1 */
 	int	has_sysmsg;		/* 1 = system message BIW101 content present this frame */
+	int	queue_has_messages;	/* 1 = message queue non-empty (time may yield capacity) */
 } flex_biw_config_t;
 
 /* Maximum additional BIW words beyond BIW1 */

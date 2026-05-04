@@ -8,10 +8,19 @@
  *   - Constraint: at most one BIW type 101 per frame per phase.
  *   - Hard limit: 3 extra BIW words beyond BIW1 (4 total).
  *
- * Also computes time values for Date/Time/Timezone BIWs:
- *   - Frame 0 Cycle 0: exact top-of-hour (xx:00:00), hour rounded
- *     to nearest boundary so 13:59 does not become 13:00.
- *   - Other frames: current wall clock time.
+ * Time payload computation:
+ *   - Derived from cycle/frame position (not wall clock).
+ *   - Wall clock provides base hour and date only.
+ *   - Frame 0 Cycle 0: exact top-of-hour (xx:00:00).
+ *   - Other frames: minute and second from cycle*240 + frame*1.875.
+ *
+ * DATE/TIME scheduling:
+ *   - Always eligible when queue is empty (fills idle frames).
+ *   - Yields BIW capacity when messages are queued (preserves
+ *     address space in block 0 for low_traffic optimization).
+ *   - Re-eligible after 3 frames without time TX, even when busy
+ *     (ensures all pager base frames see time updates regardless
+ *     of collapse value).
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -73,8 +82,16 @@ static int is_eligible(int type_id, const flex_biw_config_t *cfg,
  *
  * Two-pass algorithm:
  *   Pass 1 -- mandatory placements (SSID1, SSID2, sysmsg, Time at F0C0).
- *   Pass 2 -- carousel rotation: fill remaining slots with the type
- *             that has gone longest without transmission (LRT-first).
+ *   Pass 2 -- LRT rotation: fill remaining slots with the eligible type
+ *             that has gone longest without transmission.
+ *
+ * DATE/TIME capacity management:
+ *   Each BIW word consumes one slot in block 0, reducing address
+ *   capacity.  When the message queue is non-empty, DATE/TIME yields
+ *   its slots so addresses fit in block 0 (preserving low_traffic flag
+ *   for pager battery savings).  After 3 frames without time TX, it
+ *   becomes eligible again to ensure all pager base frames receive
+ *   time updates regardless of system collapse value.
  *
  * Outputs:
  *   biw_out[]  -- array of selected BIW type IDs (max BIW_MAX_EXTRA).
@@ -100,8 +117,6 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 	if (time_out)
 		memset(time_out, 0, sizeof(*time_out));
 
-	(void)abs_frame; /* used by caller in _update(), not here */
-
 	/* ---- Pass 1: mandatory placements ---- */
 
 	/* SSID1 (type 000): every frame when configured */
@@ -124,9 +139,8 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 	}
 
 	/* Frame 0 Cycle 0: Time BIW (type 010) is mandatory.
-	 * This is the top-of-hour sync point -- pagers calibrate their
-	 * real-time clock from this frame.  The time value is set to
-	 * exactly xx:00:00 (see time computation below). */
+	 * Top-of-hour sync point -- pagers calibrate their real-time
+	 * clock from this frame. Value is set to exactly xx:00:00. */
 	if (frame == 0 && cycle == 0 && cfg->biw_time_enabled
 	    && n < BIW_MAX_EXTRA && !selected[BIW_TIME]) {
 		biw_out[n++] = BIW_TIME;
@@ -134,11 +148,22 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 		needs_time = 1;
 	}
 
-	/* ---- Pass 2: carousel rotation (LRT-first) ----
+	/* ---- Pass 2: LRT rotation ----
 	 *
-	 * Fill remaining slots from eligible, non-selected types.
-	 * Pick the type with the smallest last_tx_abs (oldest).
-	 * Respect the one-BIW101-per-frame-per-phase constraint. */
+	 * DATE/TIME eligibility:
+	 *   - Queue empty: always eligible.
+	 *   - Queue has messages: not eligible (yield capacity to
+	 *     addresses so they fit in block 0 / low_traffic).
+	 *   - Queue has messages but last time TX was >=3 frames ago:
+	 *     eligible again (covers all pager base frames at any
+	 *     collapse value by rotating through frame positions). */
+	int time_overdue = 0;
+	if (cfg->biw_time_enabled && abs_frame > 0) {
+		uint32_t last_time = carousel->last_tx_abs[BIW_TIME];
+		if (last_time == 0 || (abs_frame - last_time) >= 3)
+			time_overdue = 1;
+	}
+
 	while (n < BIW_MAX_EXTRA) {
 		int best = -1;
 		uint32_t best_age = 0;
@@ -148,9 +173,12 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 				continue;
 			if (!is_eligible(i, cfg, frame, cycle))
 				continue;
+			if ((i == BIW_DATE || i == BIW_TIME)
+			    && cfg->queue_has_messages && !time_overdue)
+				continue;
 			if (is_biw101(i) && has_biw101)
 				continue;
-			/* last_tx_abs == 0 means never transmitted -- wins. */
+		/* last_tx_abs == 0 means never transmitted -- wins. */
 			if (best < 0 || carousel->last_tx_abs[i] < best_age) {
 				best = i;
 				best_age = carousel->last_tx_abs[i];
@@ -168,64 +196,35 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 			needs_time = 1;
 	}
 
-	/* Log any eligible types that were deferred due to slot limit */
-	for (i = 0; i < BIW_TYPE_COUNT; i++) {
-		if (!selected[i] && is_eligible(i, cfg, frame, cycle)) {
-			LOGP(DFLEX, LOGL_DEBUG,
-			     "BIW carousel: deferred type %d in F%u/C%u (slot limit).\n",
-			     i, frame, cycle);
-		}
-	}
-
-	/* ---- Compute time values for Date/Time/Timezone BIWs ----
+	/* ---- Compute time values from cycle/frame position ----
 	 *
-	 * The carousel owns time computation so the encoder does not
-	 * need to know about frame semantics.
+	 * FLEX timing structure:
+	 *   total_seconds_in_hour = cycle * 240 + frame * 1.875
+	 *   minute = floor(total_seconds / 60)
+	 *   second = floor((total_seconds mod 60) / 7.5)   [0-7]
 	 *
-	 * Frame 0 Cycle 0 (top of hour):
-	 *   hour = nearest hour boundary (round at :30:00).
-	 *   minute = 0, second = 0.
-	 *   This avoids transmitting e.g. 13:00 when wall clock is 13:59
-	 *   (which would round to 14:00 instead).
-	 *
-	 * All other frames:
-	 *   Current wall clock, seconds quantized to 1/8-minute steps. */
+	 * Wall clock provides base hour and date.
+	 * Frame 0 Cycle 0: forced to xx:00:00 (top-of-hour). */
 	if (needs_time && time_out) {
 		time_t now = time(NULL);
 		struct tm tm_val;
-		int is_top = (frame == 0 && cycle == 0);
 
 		localtime_r(&now, &tm_val);
 
-		if (is_top) {
-			/* Top-of-hour: round to nearest hour boundary.
-			 * Frame 0 Cycle 0 should be within ~2 min of the
-			 * actual hour mark.  If past :58, use next hour;
-			 * if before :02, use current hour.  Outside that
-			 * window something is wrong with clock sync but
-			 * we still pick the closest hour. */
-			int hour = tm_val.tm_hour;
-			if (tm_val.tm_min >= 58)
-				hour = (hour + 1) % 24;
-			time_out->top_of_hour = 1;
-			time_out->hour   = (uint32_t)hour;
-			time_out->minute = 0;
-			time_out->second = 0;
-		} else {
-			/* Normal frame: current wall clock. */
-			time_out->top_of_hour = 0;
-			time_out->hour   = (uint32_t)tm_val.tm_hour;
-			time_out->minute = (uint32_t)tm_val.tm_min;
-			/* Seconds -> 1/8 minute steps (7.5s each, 0-7). */
-			time_out->second = (uint32_t)(tm_val.tm_sec / 7.5);
-			if (time_out->second > 7)
-				time_out->second = 7;
-		}
+		/* Time from cycle/frame position.
+		 * F0C0 naturally produces 00:00.0 (top-of-hour). */
+		double total_sec = (double)cycle * 240.0 + (double)frame * 1.875;
+		int minute = (int)(total_sec / 60.0);
+		int sec_quant = (int)(((double)((int)total_sec % 60) +
+				       (total_sec - (int)total_sec)) / 7.5);
+		if (sec_quant > 7) sec_quant = 7;
 
-		/* Date: use wall clock date.  For top-of-hour the date
-		 * might roll over (23:59 -> next day), but the hour
-		 * rounding handles that -- the date stays as-is since
-		 * the pager only uses the date field for display. */
+		time_out->top_of_hour = (frame == 0 && cycle == 0) ? 1 : 0;
+		time_out->hour   = (uint32_t)tm_val.tm_hour;
+		time_out->minute = (uint32_t)minute;
+		time_out->second = (uint32_t)sec_quant;
+
+		/* Date from wall clock. */
 		time_out->year  = (uint32_t)(tm_val.tm_year + 1900);
 		time_out->month = (uint32_t)(tm_val.tm_mon + 1);
 		time_out->day   = (uint32_t)tm_val.tm_mday;
@@ -236,6 +235,21 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 	}
 
 	*n_biw_out = n;
+
+	/* Debug: log when DATE/TIME is selected */
+	if (n > 0) {
+		int has_date = 0, has_time = 0;
+		for (i = 0; i < n; i++) {
+			if (biw_out[i] == BIW_DATE) has_date = 1;
+			if (biw_out[i] == BIW_TIME) has_time = 1;
+		}
+		if (has_date || has_time) {
+			LOGP(DFLEX, LOGL_INFO,
+			     "BIW carousel: C%u/F%u selected DATE=%d TIME=%d\n",
+			     cycle, frame, has_date, has_time);
+		}
+	}
+
 	return n;
 }
 
