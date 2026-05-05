@@ -3005,6 +3005,13 @@ static size_t flex_encode_fiw(const flex_frame_params_t *params,
 		uint32_t fiw_cw = flex_create_fiw(params->cycle, params->frame,
 						  params->roaming, r_flag, t_field);
 		EMIT_WORD(out, fiw_cw);
+
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "TX: FIW C%u/F%u n=%u r=%u t=0x%X (low_traffic: A=%u B=%u C=%u D=%u)\n",
+		     params->cycle, params->frame,
+		     params->roaming, r_flag, t_field,
+		     (t_field >> 0) & 1, (t_field >> 1) & 1,
+		     (t_field >> 2) & 1, (t_field >> 3) & 1);
 	}
 
 	return 4;
@@ -3600,6 +3607,12 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			s_vfield,
 			(uint32_t)params->carry_on,
 			(uint32_t)params->collapse);
+
+		LOGP(DFLEX, LOGL_DEBUG,
+		     "TX: BIW1 p=%d e_biw=%d s_vfield=%u carry=%d collapse=%d (biw_count=%d addr=%d vec=%d msg=%d)\n",
+		     prio_addr_words, e_biw, s_vfield,
+		     params->carry_on, params->collapse,
+		     biw_count, total_addr, total_vector, total_msg);
 	}
 
 	/* ---- Write BIW2/3/4 if enabled ---- */
@@ -4161,6 +4174,23 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 
 		/* Advance fwc past all written data */
 		fwc = msg_fwc;
+
+		/* Hard overflow check: if any cursor exceeded frame bounds,
+		 * the scheduler's capacity estimate was wrong.  The frame
+		 * is corrupt — pager will misparse addresses/vectors/body.
+		 * This should never happen; if it does, it's a bug in the
+		 * capacity estimation (flex_phase_capacity / flex_estimate_msg_cost). */
+		if (msg_fwc > FLEX_WORDS_PER_FRAME ||
+		    vec_fwc > FLEX_WORDS_PER_FRAME) {
+			LOGP(DFLEX, LOGL_ERROR,
+			     "ENCODER OVERFLOW: msg_fwc=%u vec_fwc=%u mf_start=%u "
+			     "frame_limit=%d biw=%d addr=%d vec=%d — frame corrupt!\n",
+			     msg_fwc, vec_fwc, mf_start,
+			     FLEX_WORDS_PER_FRAME, biw_count,
+			     total_addr, total_vector);
+			if (!*error)
+				*error = -FLEX_ERR_INVALID_MESSAGE;
+		}
 	}
 
 	/* ---- Idle fill is already in place from pre-fill ----
@@ -4263,6 +4293,19 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 	}
 
 	/* ---- Block interleaving ---- */
+
+	/* Hard check: frame_words must be exactly FLEX_WORDS_PER_FRAME (88)
+	 * words.  The output is always 88 × 32 bits = 2816 bits of data
+	 * per phase.  If fwc somehow exceeds 88, we've corrupted memory.
+	 * If it's less, the pre-fill idle pattern covers the rest. */
+	if (fwc > FLEX_WORDS_PER_FRAME) {
+		LOGP(DFLEX, LOGL_ERROR,
+		     "ENCODER BUG: fwc=%u exceeds frame size %d — memory corruption!\n",
+		     fwc, FLEX_WORDS_PER_FRAME);
+		if (!*error)
+			*error = -FLEX_ERR_INVALID_MESSAGE;
+		return 0;
+	}
 
 	for (i = 0; i < FLEX_BLOCKS_PER_FRAME; i++)
 		flex_interleave_block(i, frame_words);

@@ -1041,6 +1041,9 @@ static void flex_fragment_queue(flex_t *flex)
 	}
 }
 
+/* Forward declaration — defined after flex_setup_frame_buffers */
+static int flex_get_phase_count(int bitrate, int modulation_type);
+
 /*
  * Set up the split sync/data buffers for a frame.
  *
@@ -1065,6 +1068,13 @@ static void flex_setup_frame_buffers(flex_t *flex,
 	flex->sync_buffer_length = (int)sync_len;
 	flex->sync_buffer_pos = 0;
 
+	/* Hard check: sync must be exactly 18 bytes */
+	if (sync_len != 18) {
+		LOGP_CHAN(DFLEX, LOGL_ERROR,
+			  "FATAL: sync size mismatch! got=%zu expected=18 — SYNC LOSS\n",
+			  sync_len);
+	}
+
 	/* Data portion: S2 + interleaved phase data → frame_buffer */
 	data_len = flex_encode_data(msgs, msg_count, params,
 				    flex->frame_buffer,
@@ -1072,6 +1082,27 @@ static void flex_setup_frame_buffers(flex_t *flex,
 				    msgs_packed, error);
 	flex->frame_buffer_length = (int)data_len;
 	flex->frame_buffer_pos = 0;
+
+	/* Hard frame size check.
+	 * A FLEX frame is a fixed number of bits per speed/modulation.
+	 * If the data portion size is wrong, the pager loses sync.
+	 * Expected: S2 + DATA (88 words × 4 bytes × num_phases)
+	 * S2 size: (2*bs2_bits + 32 + 7) / 8
+	 *   bs2_bits: 4 (1600), 24 (3200), 64 (6400) */
+	{
+		int nph = flex_get_phase_count(params->bitrate, params->modulation_type);
+		int bs2_bits = (params->bitrate == 6400) ? 64
+			     : (params->bitrate == 3200) ? 24 : 4;
+		size_t s2_expect = (size_t)(2 * bs2_bits + 32 + 7) / 8;
+		size_t data_expect = s2_expect + (size_t)(FLEX_WORDS_PER_FRAME * nph * 4);
+		if (data_len != data_expect) {
+			LOGP_CHAN(DFLEX, LOGL_ERROR,
+				  "FATAL: data size mismatch! got=%zu expected=%zu "
+				  "(speed=%d mod=%d phases=%d) — SYNC LOSS\n",
+				  data_len, data_expect,
+				  params->bitrate, params->modulation_type, nph);
+		}
+	}
 
 	/* Target speed for the data portion */
 	flex->frame_target_speed = params->bitrate;
@@ -2017,6 +2048,15 @@ static int flex_get_next_frame_network(flex_t *flex)
 		/* Apply polarity to DSP */
 		dsp_set_polarity(flex, (selected_pol == FLEX_POL_INVERTED) ? -1.0 : 1.0);
 		flex->last_tx_polarity = selected_pol;
+
+		LOGP_CHAN(DFLEX, LOGL_INFO,
+			  "Scheduler: polarity=%s (normal_q=%d inverted_q=%d fixed=%s)\n",
+			  (selected_pol == FLEX_POL_INVERTED) ? "inverted" : "normal",
+			  flex->tx_pol[FLEX_POL_NORMAL].msg_count,
+			  flex->tx_pol[FLEX_POL_INVERTED].msg_count,
+			  (flex->fixed_polarity != 0.0)
+			  ? ((flex->fixed_polarity < 0) ? "inverted" : "normal")
+			  : "none");
 	}
 
 	/* Refill scan queue if running low */
@@ -2137,12 +2177,15 @@ static int flex_get_next_frame_network(flex_t *flex)
 		params.biw_is_time_frame = 0; /* will be set by carousel result */
 	}
 
-	/* BIW SysInfo: the carousel handles scheduling.
-	 * Ext seconds are always computed from cycle/frame position.
-	 * Never co-locate with datetime (carousel enforces this). */
+	/* BIW SysInfo: eligible when configured.
+	 * Actual emission depends on whether carousel selected time
+	 * for this frame (sysinfo and time don't co-locate — only one
+	 * BIW101 per phase per spec, and time consumes 2 of 3 slots).
+	 * Set biw_is_sysinfo_frame=0 here; it will be set to 1 below
+	 * if the carousel did NOT select time for this frame. */
 	if (flex->biw_sysinfo_enabled) {
 		params.biw_sysinfo = 1;
-		params.biw_is_sysinfo_frame = 1; /* carousel decides; always ready */
+		params.biw_is_sysinfo_frame = 0; /* set after carousel decision */
 		params.biw_tz_code = flex->biw_tz_code;
 		params.biw_dst = flex->biw_dst;
 
@@ -2179,7 +2222,29 @@ static int flex_get_next_frame_network(flex_t *flex)
 		biw_cfg.chan_setup_enabled = flex->chan_setup_enabled;
 		biw_cfg.roaming_active = flex->roaming_active;
 		biw_cfg.has_sysmsg = 0; /* set later if sysmsg detected */
-		biw_cfg.queue_has_messages = (flex->tx_pol[selected_pol].msg_count > 0) ? 1 : 0;
+
+		/* queue_has_messages: only count messages that will actually
+		 * be packed into THIS frame (matching speed, modulation,
+		 * polarity, and frame eligibility).  If only wrong-speed
+		 * messages are queued, the carousel should NOT suppress
+		 * DATE/TIME — otherwise the frame has neither time nor
+		 * messages, wasting airtime. */
+		{
+			flex_msg_t *qscan;
+			int eligible_count = 0;
+			for (qscan = flex->msg_list; qscan; qscan = qscan->next) {
+				if (pol_index(qscan->polarity) != selected_pol)
+					continue;
+				if (qscan->speed != params.bitrate ||
+				    qscan->modulation_type != params.modulation_type)
+					continue;
+				if (!frame_is_eligible(qscan->next_send_frame, ft.cycle * 128 + ft.frame))
+					continue;
+				eligible_count++;
+				break; /* only need to know if > 0 */
+			}
+			biw_cfg.queue_has_messages = (eligible_count > 0) ? 1 : 0;
+		}
 
 		flex_biw_carousel_select(car, &biw_cfg,
 					 ft.frame, ft.cycle,
@@ -2206,9 +2271,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 			params.biw_day = biw_time_val.day;
 		}
 
+		/* SysInfo BIW101 (timezone): eligible when time was NOT
+		 * selected for this frame.  Only one BIW101 per phase,
+		 * and Date+Time already consumes 2 of 3 extra slots. */
+		if (flex->biw_sysinfo_enabled && !biw_time_val.valid) {
+			params.biw_is_sysinfo_frame = 1;
+		}
+
 		/* Update carousel state after selection. */
 		flex_biw_carousel_update(car, biw_types, biw_n,
 					 ft.cycle * 128 + ft.frame);
+
+		LOGP(DFLEX, LOGL_INFO,
+		     "Scheduler: C%u/F%u BIW: carousel_n=%d time_frame=%d sysinfo_frame=%d ssid1=%d ssid2=%d capacity=%d\n",
+		     ft.cycle, ft.frame, biw_n,
+		     params.biw_is_time_frame, params.biw_is_sysinfo_frame,
+		     params.biw_ssid1, params.biw_ssid2,
+		     FLEX_WORDS_PER_FRAME - (1 + biw_n));
 	}
 
 	/* FIW n=0 by default. Set by --roaming CLI flag. */
@@ -2367,6 +2446,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 			for (candidate = flex->msg_list; candidate; candidate = candidate->next) {
 				int is_tone, m_is_cont, pos;
+
+				/* Filter: polarity must match selected TX polarity.
+				 * Each frame is transmitted on one polarity — packing
+				 * a message for the wrong polarity means the target
+				 * pager won't decode it. */
+				if (pol_index(candidate->polarity) != flex->last_tx_polarity)
+					continue;
 
 				/* Filter: speed, modulation, eligibility */
 				if (candidate->speed != params.bitrate ||
@@ -2944,6 +3030,19 @@ static int flex_get_next_frame_network(flex_t *flex)
 			}
 		}
 
+	/* Log candidate collection results */
+	{
+		int p;
+		for (p = 0; p < num_phases; p++) {
+			if (phase_n_cands[p] > 0 || phase_est_used[p] > 0) {
+				LOGP(DFLEX, LOGL_INFO,
+				     "Scheduler: C%u/F%u phase %d: %d candidates, %d/%d words used\n",
+				     ft.cycle, ft.frame, p,
+				     phase_n_cands[p], phase_est_used[p], pcap[p]);
+			}
+		}
+	}
+
 	/* Set msg pointer: if any phase has candidates, enter encoding path */
 	{
 		int p;
@@ -3038,16 +3137,38 @@ static int flex_get_next_frame_network(flex_t *flex)
 				continue;
 			}
 
-			/* Per-phase SSID placement.
-			 * SSID1/SSID2 rotate across phases per frame.
-			 * Clear SSID fields for phases that shouldn't
-			 * carry them this frame. */
+			/* Per-phase SSID/BIW placement.
+			 * SSID1/SSID2/SysInfo/ChanSetup rotate across phases.
+			 * Must clear both the enable FLAGS and content fields
+			 * for non-SSID phases — otherwise the encoder emits
+			 * empty BIW words that consume capacity the scheduler
+			 * didn't account for (flex_phase_capacity clears flags,
+			 * encoder must match). */
 			{
 				int ssid_p = flex_ssid_phase(ft.frame, num_phases);
-				phase_params.local_id = (p == ssid_p) ? params.local_id : 0;
-				phase_params.coverage_id = (p == ssid_p) ? params.coverage_id : 0;
-				phase_params.country_code = (p == ssid_p) ? params.country_code : 0;
-				phase_params.tmf = (p == ssid_p) ? params.tmf : 0;
+				if (p == ssid_p) {
+					phase_params.biw_ssid1 = params.biw_ssid1;
+					phase_params.biw_ssid2 = params.biw_ssid2;
+					phase_params.local_id = params.local_id;
+					phase_params.coverage_id = params.coverage_id;
+					phase_params.country_code = params.country_code;
+					phase_params.tmf = params.tmf;
+					phase_params.biw_sysinfo = params.biw_sysinfo;
+					phase_params.biw_is_sysinfo_frame = params.biw_is_sysinfo_frame;
+					phase_params.sysmsg_a_type = params.sysmsg_a_type;
+					phase_params.chan_setup_enabled = params.chan_setup_enabled;
+				} else {
+					phase_params.biw_ssid1 = 0;
+					phase_params.biw_ssid2 = 0;
+					phase_params.local_id = 0;
+					phase_params.coverage_id = 0;
+					phase_params.country_code = 0;
+					phase_params.tmf = 0;
+					phase_params.biw_sysinfo = 0;
+					phase_params.biw_is_sysinfo_frame = 0;
+					phase_params.sysmsg_a_type = -1;
+					phase_params.chan_setup_enabled = 0;
+				}
 				phase_params.phase_index = p;
 			}
 
@@ -3166,11 +3287,22 @@ static int flex_get_next_frame_network(flex_t *flex)
 							     &phase_packed, &error);
 
 				if (error || len == 0) {
+					LOGP(DFLEX, LOGL_ERROR,
+					     "Scheduler: C%u/F%u phase %d encode FAILED error=%d len=%zu\n",
+					     ft.cycle, ft.frame, p, error, len);
 					/* Encoding failed for this phase — leave
 					 * word_count=0 so the idle fill loop below
 					 * generates a proper BIW + idle frame. */
 					error = 0; /* reset for next phase */
 					continue;
+				}
+
+				if (phase_packed < phase_n_cands[p]) {
+					LOGP(DFLEX, LOGL_NOTICE,
+					     "Scheduler: C%u/F%u phase %d encoder packed %d/%d (capacity overflow, %d words estimated)\n",
+					     ft.cycle, ft.frame, p,
+					     phase_packed, phase_n_cands[p],
+					     phase_est_used[p]);
 				}
 
 				/* Extract 88 data words from encoded output.
@@ -3286,6 +3418,30 @@ static int flex_get_next_frame_network(flex_t *flex)
 					LOGP_CHAN(DFLEX, LOGL_NOTICE,
 						  "Network mode: failed to encode phased frame (error=%d), sending idle.\n", error);
 					goto send_idle;
+				}
+
+				/* Hard frame size check.
+				 * A FLEX frame is a fixed number of bits — if the
+				 * output size is wrong, the pager loses sync.
+				 * Expected: S1(14) + FIW(4) + S2 + DATA
+				 *   S2: (2*bs2_bits + 32 + 7) / 8
+				 *     bs2_bits: 4 (1600), 24 (3200), 64 (6400)
+				 *   DATA: 88 words × 4 bytes × num_phases */
+				{
+					int bs2_bits = (params.bitrate == 6400) ? 64
+						     : (params.bitrate == 3200) ? 24 : 4;
+					size_t s2_expect = (size_t)(2 * bs2_bits + 32 + 7) / 8;
+					size_t data_expect = (size_t)(FLEX_WORDS_PER_FRAME * num_phases * 4);
+					size_t total_expect = 14 + 4 + s2_expect + data_expect;
+					if (phased_len != total_expect) {
+						LOGP_CHAN(DFLEX, LOGL_ERROR,
+							  "FATAL: frame size mismatch! got=%zu expected=%zu "
+							  "(speed=%d phases=%d s2=%zu data=%zu) — SYNC LOSS\n",
+							  phased_len, total_expect,
+							  params.bitrate, num_phases,
+							  s2_expect, data_expect);
+						goto send_idle;
+					}
 				}
 
 				/* Split: first 18 bytes = sync, rest = data */

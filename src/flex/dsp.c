@@ -6008,8 +6008,16 @@ static void flex_rx_demodulate(flex_t *flex, double sample)
 			unsigned int idx = ((flex->rx.data_bit_counter >> 5) & 0xFFF8) |
 					   (flex->rx.data_bit_counter & 0x0007);
 
+			/* At 1600 baud, phase_toggle is always 0.
+			 * flex_rx_read_data() forces this at the top of each
+			 * call, but the alt slicer runs BEFORE it, so it sees
+			 * the stale toggle=1 from the previous symbol. */
+			int alt_toggle = flex->rx.phase_toggle;
+			if (flex->rx.sync_baud == 1600)
+				alt_toggle = 0;
+
 			if (idx < FLEX_WORDS_PER_FRAME) {
-				if (flex->rx.phase_toggle == 0) {
+				if (alt_toggle == 0) {
 					flex->rx.alt_phase[0].words[idx] =
 						(flex->rx.alt_phase[0].words[idx] >> 1) |
 						(alt_bit_a ? 0x80000000U : 0);
