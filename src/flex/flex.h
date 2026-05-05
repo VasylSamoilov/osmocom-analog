@@ -324,6 +324,7 @@ typedef struct flex {
 
 	/* message queue (singly-linked list) */
 	flex_msg_t		*msg_list;
+	flex_msg_t		*msg_list_tail;	/* O(1) tail append */
 
 	/* Sync buffer — S1 + FIW, always transmitted at 1600/2FSK.
 	 * Per ARIB STD-43A Section 3.2, the sync portion is always
@@ -376,6 +377,7 @@ typedef struct flex {
 	int			no_ers;			/* skip ERS in single-shot mode */
 	int			chan_setup_enabled;	/* BIW channel setup emission */
 	int			hack_nonstandard_decoders; /* block-boundary fixup for PDW/multimon-ng */
+	int			no_message_numbering;	/* force N=0 R=0 in encoder */
 	int			lpf_enabled;		/* baseband LPF */
 
 	/* Multiple transmission config (Spec Section 3.4.2).

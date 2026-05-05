@@ -94,6 +94,7 @@ static int default_retransmit = 0;		/* --retransmit: 0-15, default 0 (no retrans
 static int default_retransmit_interval = 128;	/* --retransmit-interval: 1-1920 frames, default 128 (~4 min) */
 static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (immediate) */
 static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: block-boundary fixup */
+static int no_message_numbering = 0;		/* --no-message-numbering: force N=0 R=0 in encoder */
 static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
 static int oneshot = 0;				/* --oneshot: enqueue + ERS + TX + exit */
 static double oneshot_freq_start = 0.0;		/* --oneshot sweep: start freq Hz */
@@ -135,6 +136,7 @@ static const char *oneshot_station_id = "";	/* saved capcode for sweep re-enqueu
 #define OPT_RETRO_TIME		3033
 #define OPT_ONESHOT		3034
 #define OPT_ONESHOT_FREQ	3035
+#define OPT_NO_MSG_NUMBERING	3036
 
 void print_help(const char *arg0)
 {
@@ -281,6 +283,11 @@ void print_help(const char *arg0)
 	printf("        boundary (word 7, 15, 23, ...).  This flag flips bit 0\n");
 	printf("        of such words; BCH(31,21) corrects the 1-bit error on RX.\n");
 	printf("        Default OFF (standard-compliant behavior).\n");
+	printf("    --no-message-numbering\n");
+	printf("        Disable message numbering: always encode N=0 R=0.\n");
+	printf("        Some pagers use N for duplicate detection and may\n");
+	printf("        suppress repeated messages with the same N value.\n");
+	printf("        Default OFF (N increments per capcode, R=1 on initial TX).\n");
 	printf("    --fifo <path>\n");
 	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
 	printf("\n");
@@ -453,6 +460,7 @@ static void add_options(void)
 	option_add(OPT_RETRANSMIT_INTERVAL, "retransmit-interval", 1);
 	option_add(OPT_SEND_DELAY, "send-delay", 1);
 	option_add(OPT_HACK_NONSTANDARD, "hack-for-non-standard-decoders", 0);
+	option_add(OPT_NO_MSG_NUMBERING, "no-message-numbering", 0);
 	option_add(OPT_FIFO, "fifo", 1);
 }
 
@@ -836,6 +844,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_HACK_NONSTANDARD:
 		hack_nonstandard_decoders = 1;
+		break;
+	case OPT_NO_MSG_NUMBERING:
+		no_message_numbering = 1;
 		break;
 	case OPT_FIFO:
 		msg_send_path = options_strdup(argv[argi++]);
@@ -2753,6 +2764,7 @@ int main(int argc, char *argv[])
 			f->td_collapse = td_collapse;
 			f->chan_setup_enabled = chan_setup_enabled;
 			f->hack_nonstandard_decoders = hack_nonstandard_decoders;
+			f->no_message_numbering = no_message_numbering;
 
 			/* Parse POCSAG mixing frame slots if specified */
 			if (pocsag_mix) {

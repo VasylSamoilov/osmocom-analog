@@ -227,7 +227,7 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 			    enum flex_msg_type msg_type,
 			    const char *data, int data_length)
 {
-	flex_msg_t *msg, **msgp;
+	flex_msg_t *msg;
 
 	{
 		const char *type_name = flex_capcode_type_name(capcode);
@@ -376,12 +376,14 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->next_send_frame = 0;
 	msg->assigned_n = -1;
 
-	/* link to tail of list (legacy global queue) */
+	/* link to tail of list (legacy global queue) — O(1) via tail pointer */
 	msg->flex = flex;
-	msgp = &flex->msg_list;
-	while ((*msgp))
-		msgp = &(*msgp)->next;
-	(*msgp) = msg;
+	if (flex->msg_list_tail) {
+		flex->msg_list_tail->next = msg;
+	} else {
+		flex->msg_list = msg;
+	}
+	flex->msg_list_tail = msg;
 
 	/* Also link to per-polarity queue (new scheduler path).
 	 * Both lists share the same flex_msg_t nodes — the per-polarity
@@ -456,11 +458,25 @@ void flex_msg_destroy(flex_msg_t *msg)
 	if (msg->flex->tx_pol[pi].msg_count > 0)
 		msg->flex->tx_pol[pi].msg_count--;
 
+	/* update tail pointer if removing the tail */
+	if (msg == msg->flex->msg_list_tail)
+		msg->flex->msg_list_tail = NULL;
+
 	/* unlink from global list */
 	msgp = &msg->flex->msg_list;
 	while ((*msgp) != msg)
 		msgp = &(*msgp)->next;
 	(*msgp) = msg->next;
+
+	/* fix tail pointer: if list is non-empty and tail was reset,
+	 * walk to find new tail.  This only happens when removing the
+	 * last element (rare) — normal removal from head/middle is O(1). */
+	if (msg->flex->msg_list && !msg->flex->msg_list_tail) {
+		flex_msg_t *t = msg->flex->msg_list;
+		while (t->next)
+			t = t->next;
+		msg->flex->msg_list_tail = t;
+	}
 
 	/* destroy */
 	free(msg);
@@ -3272,6 +3288,14 @@ static int flex_get_next_frame_network(flex_t *flex)
 							     flex_msg_type_name(m->msg_type),
 							     ft.cycle, ft.frame);
 						}
+					}
+
+					/* --no-message-numbering: override N=0 R=0 */
+					if (flex->no_message_numbering) {
+						fm->sequence_num = 0;
+						fm->alpha_r_flag = 0;
+						fm->hex_r_flag = 0;
+						fm->numbered_r = 0;
 					}
 
 					if (m->numbered_msgnum >= 0)
