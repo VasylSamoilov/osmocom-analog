@@ -3161,7 +3161,7 @@ parse_phase:
 				 * alpha/numeric/hex path like any other message. */
 			}
 
-			/* Info Service address (Spec Table 3.8.1-1, under study).
+			/* Info Service address (Spec Table 3.8.1-1, maildrop).
 			 * Log raw payload for analysis, then fall through to
 			 * normal message decoding (alpha/numeric/hex). */
 			if (aw_type == FLEX_ADDR_INFO_SVC) {

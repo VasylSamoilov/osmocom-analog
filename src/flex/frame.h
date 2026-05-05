@@ -1032,7 +1032,7 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
  */
 #define FLEX_ADDR_RSVD_SHORT1_MIN	0x1F0001U	/* 2,031,617 — reserved for future use */
 #define FLEX_ADDR_RSVD_SHORT1_MAX	0x1F27FFU	/* 2,041,855 */
-#define FLEX_ADDR_INFO_SVC_MIN		0x1F2800U	/* 2,041,856 — under study */
+#define FLEX_ADDR_INFO_SVC_MIN		0x1F2800U	/* 2,041,856 — maildrop */
 #define FLEX_ADDR_INFO_SVC_MAX		0x1F67FFU	/* 2,058,239 */
 #define FLEX_ADDR_NETWORK_MIN		0x1F6800U	/* 2,058,240 — NID */
 #define FLEX_ADDR_NETWORK_MAX		0x1F77FFU	/* 2,062,335 */
@@ -1513,7 +1513,7 @@ static inline const char *flex_special_addr_detail(uint32_t aw)
 	case FLEX_ADDR_NETWORK:    return "NID system info (Secure vector, area/zones/traffic)";
 	case FLEX_ADDR_TEMPORARY:  return "temp group slot (16 slots, assigned via short instruction)";
 	case FLEX_ADDR_OPER_MSG:   return NULL; /* caller uses flex_oper_msg_subtype_name() */
-	case FLEX_ADDR_INFO_SVC:   return "info service (under study)";
+	case FLEX_ADDR_INFO_SVC:   return "info service (maildrop)";
 	case FLEX_ADDR_RSVD_SHORT: return "reserved for future use";
 	default:                   return NULL;
 	}
