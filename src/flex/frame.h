@@ -974,6 +974,10 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
  * After BCH decode, the 21-bit address word value determines its type.
  * All ranges below are the raw 21-bit word values (NOT capcodes).
  *
+ * For short/special addresses: address_word = capcode + FLEX_SHORT_ADDR_OFFSET (32768).
+ * The standard (ARIB STD-43A Table 3.8.1-1) lists capcode ranges; these are
+ * the corresponding on-wire address word values used for classification.
+ *
  * Long Address words (used in pairs):
  *   LA1: 0x000001–0x008000  (1–32,768)         32,768 addresses
  *   LA3: 0x1E0001–0x1E8000  (1,966,081–1,998,848)  32,768
@@ -981,15 +985,15 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
  *   LA2: 0x1F7FFF–0x1FFFFE  (2,064,383–2,097,150)  32,768
  *
  * Short Address (individual, single word):
- *   SA:  0x008001–0x1E0000  (32,769–1,966,080)  1,933,312
+ *   SA:  0x008001–0x1E0000  (32,769–1,966,080)  1,933,312  [capcodes 1–1,933,312]
  *
  * Special single-word address types (between LA4 and LA2):
- *   Reserved Short:     0x1F0001–0x1F27FF  (2,031,617–2,041,855)  10,239
- *   Info Service:       0x1F2800–0x1F67FF  (2,041,856–2,058,239)  16,384
- *   Network:            0x1F6800–0x1F77FF  (2,058,240–2,062,335)   4,096
- *   Temporary:          0x1F7800–0x1F780F  (2,062,336–2,062,351)      16
- *   Operator Messaging: 0x1F7810–0x1F781F  (2,062,352–2,062,367)      16
- *   Reserved Short 2:   0x1F7820–0x1F7FFE  (2,062,368–2,064,382)   2,015
+ *   Reserved Short:     0x1F0001–0x1F27FF  (2,031,617–2,041,855)  10,239  [capcodes 1,998,849–2,009,087]
+ *   Info Service:       0x1F2800–0x1F67FF  (2,041,856–2,058,239)  16,384  [capcodes 2,009,088–2,025,471]
+ *   Network:            0x1F6800–0x1F77FF  (2,058,240–2,062,335)   4,096  [capcodes 2,025,472–2,029,567]
+ *   Temporary:          0x1F7800–0x1F780F  (2,062,336–2,062,351)      16  [capcodes 2,029,568–2,029,583]
+ *   Operator Messaging: 0x1F7810–0x1F781F  (2,062,352–2,062,367)      16  [capcodes 2,029,584–2,029,599]
+ *   Reserved Short 2:   0x1F7820–0x1F7FFE  (2,062,368–2,064,382)   2,015  [capcodes 2,029,600–2,031,614]
  */
 
 /* Long Address word ranges */
@@ -1030,18 +1034,18 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
  *                     LSB 1110–1111 (2 addrs): system change instructions
  *                     LSB 0101–1101 (9 addrs): reserved for future use
  */
-#define FLEX_ADDR_RSVD_SHORT1_MIN	0x1F0001U	/* 2,031,617 — reserved for future use */
-#define FLEX_ADDR_RSVD_SHORT1_MAX	0x1F27FFU	/* 2,041,855 */
-#define FLEX_ADDR_INFO_SVC_MIN		0x1F2800U	/* 2,041,856 — maildrop */
-#define FLEX_ADDR_INFO_SVC_MAX		0x1F67FFU	/* 2,058,239 */
-#define FLEX_ADDR_NETWORK_MIN		0x1F6800U	/* 2,058,240 — NID */
-#define FLEX_ADDR_NETWORK_MAX		0x1F77FFU	/* 2,062,335 */
-#define FLEX_ADDR_TEMPORARY_MIN		0x1F7800U	/* 2,062,336 — group messaging */
-#define FLEX_ADDR_TEMPORARY_MAX		0x1F780FU	/* 2,062,351 */
-#define FLEX_ADDR_OPER_MSG_MIN		0x1F7810U	/* 2,062,352 — system messages */
-#define FLEX_ADDR_OPER_MSG_MAX		0x1F781FU	/* 2,062,367 */
-#define FLEX_ADDR_RSVD_SHORT2_MIN	0x1F7820U	/* 2,062,368 — reserved for future use */
-#define FLEX_ADDR_RSVD_SHORT2_MAX	0x1F7FFEU	/* 2,064,382 */
+#define FLEX_ADDR_RSVD_SHORT1_MIN	0x1F0001U	/* aw 2,031,617 — capcode 1,998,849 — reserved for future use */
+#define FLEX_ADDR_RSVD_SHORT1_MAX	0x1F27FFU	/* aw 2,041,855 — capcode 2,009,087 */
+#define FLEX_ADDR_INFO_SVC_MIN		0x1F2800U	/* aw 2,041,856 — capcode 2,009,088 — maildrop */
+#define FLEX_ADDR_INFO_SVC_MAX		0x1F67FFU	/* aw 2,058,239 — capcode 2,025,471 */
+#define FLEX_ADDR_NETWORK_MIN		0x1F6800U	/* aw 2,058,240 — capcode 2,025,472 — NID */
+#define FLEX_ADDR_NETWORK_MAX		0x1F77FFU	/* aw 2,062,335 — capcode 2,029,567 */
+#define FLEX_ADDR_TEMPORARY_MIN		0x1F7800U	/* aw 2,062,336 — capcode 2,029,568 — group messaging */
+#define FLEX_ADDR_TEMPORARY_MAX		0x1F780FU	/* aw 2,062,351 — capcode 2,029,583 */
+#define FLEX_ADDR_OPER_MSG_MIN		0x1F7810U	/* aw 2,062,352 — capcode 2,029,584 — system messages */
+#define FLEX_ADDR_OPER_MSG_MAX		0x1F781FU	/* aw 2,062,367 — capcode 2,029,599 */
+#define FLEX_ADDR_RSVD_SHORT2_MIN	0x1F7820U	/* aw 2,062,368 — capcode 2,029,600 — reserved for future use */
+#define FLEX_ADDR_RSVD_SHORT2_MAX	0x1F7FFEU	/* aw 2,064,382 — capcode 2,031,614 */
 
 /* Operator Messaging Address sub-types.
  * Base address: 1 1111 0111 1000 0001 0000 (0x1F7810).
