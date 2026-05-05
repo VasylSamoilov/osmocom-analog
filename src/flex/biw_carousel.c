@@ -150,7 +150,18 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 
 	/* ---- Pass 2: LRT rotation ----
 	 *
-	 * DATE/TIME eligibility:
+	 * Time (010) is sent frequently — pagers need it to maintain
+	 * their clock.  Date (001) is sent less often but always paired
+	 * with Time (never alone).  This matches real network captures:
+	 *   - Most frames: Time only (1 slot)
+	 *   - Periodically: Date+Time pair (2 slots)
+	 *
+	 * LRT age is tracked independently for BIW_DATE and BIW_TIME.
+	 * When BIW_DATE wins the LRT contest, it pulls BIW_TIME along
+	 * (requires 2 free slots).  When BIW_TIME wins alone, it's
+	 * emitted without Date (1 slot).
+	 *
+	 * Eligibility:
 	 *   - Queue empty: always eligible.
 	 *   - Queue has messages: not eligible (yield capacity to
 	 *     addresses so they fit in block 0 / low_traffic).
@@ -173,6 +184,10 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 				continue;
 			if (!is_eligible(i, cfg, frame, cycle))
 				continue;
+			/* DATE needs 2 free slots (it always brings TIME) */
+			if (i == BIW_DATE && (BIW_MAX_EXTRA - n) < 2)
+				continue;
+			/* Skip DATE/TIME when queue busy and not overdue */
 			if ((i == BIW_DATE || i == BIW_TIME)
 			    && cfg->queue_has_messages && !time_overdue)
 				continue;
@@ -188,12 +203,21 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 		if (best < 0)
 			break; /* no more eligible types */
 
-		biw_out[n++] = best;
-		selected[best] = 1;
-		if (is_biw101(best))
-			has_biw101 = 1;
-		if (best == BIW_TIME || best == BIW_DATE || best == BIW_SYSINFO_TZ)
+		/* DATE always brings TIME along (never sent alone). */
+		if (best == BIW_DATE) {
+			biw_out[n++] = BIW_DATE;
+			biw_out[n++] = BIW_TIME;
+			selected[BIW_DATE] = 1;
+			selected[BIW_TIME] = 1;
 			needs_time = 1;
+		} else {
+			biw_out[n++] = best;
+			selected[best] = 1;
+			if (is_biw101(best))
+				has_biw101 = 1;
+			if (best == BIW_TIME || best == BIW_SYSINFO_TZ)
+				needs_time = 1;
+		}
 	}
 
 	/* ---- Compute time values from cycle/frame position ----

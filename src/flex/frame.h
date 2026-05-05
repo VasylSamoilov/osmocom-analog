@@ -2151,6 +2151,19 @@ typedef struct flex_frame_msg {
 	uint32_t	precomputed_sig;
 } flex_frame_msg_t;
 
+/* BIW type IDs for carousel selection and frame encoding.
+ * Used in biw_selected[] to tell the encoder which BIW words to emit. */
+enum flex_biw_type_id {
+	BIW_SSID1 = 0,		/* type 000 */
+	BIW_DATE,		/* type 001 */
+	BIW_TIME,		/* type 010 */
+	BIW_SYSINFO_TZ,	/* type 101, A=0100 */
+	BIW_SYSINFO_MSG,	/* type 101, A=0000-0011 */
+	BIW_CHAN_SETUP,		/* type 101, A=0110 */
+	BIW_SSID2,		/* type 111 */
+	BIW_TYPE_COUNT
+};
+
 /* Frame encoding parameters */
 typedef struct flex_frame_params {
 	uint32_t	cycle;			/* FIW cycle (0-14) */
@@ -2165,23 +2178,20 @@ typedef struct flex_frame_params {
 	int		biw_datetime;
 
 	/* Pre-calculated time values for this frame (set by scheduler).
-	 * Only valid when biw_datetime=1 and this frame is a time TX frame. */
+	 * Valid when biw_datetime=1 and BIW_DATE or BIW_TIME is in biw_selected[]. */
 	uint32_t	biw_year;		/* year field: (year-1994)%32 or equiv year */
 	uint32_t	biw_month;		/* 1-12 */
 	uint32_t	biw_day;		/* 1-31 */
 	uint32_t	biw_hour;		/* 0-23 */
 	uint32_t	biw_minute;		/* 0-59 */
 	uint32_t	biw_second;		/* 0-7 (coarse, 7.5s steps) */
-	int		biw_is_time_frame;	/* 1 = this frame should carry Date/Time BIWs */
 
 	/* --biw-sysinfo: SysInfo (101, A=0100) timezone/DST broadcast.
-	 * 0 = disabled (default), 1 = enabled.
-	 * Never in same frame as Date/Time — follows 1-3 frames behind. */
+	 * 0 = disabled (default), 1 = enabled. */
 	int		biw_sysinfo;
 	int		biw_tz_code;		/* timezone zone code (0-31) */
 	int		biw_dst;		/* DST flag: 0=DST active, 1=standard time */
 	uint32_t	biw_ext_seconds;	/* S5-S3 accurate seconds (0-7), additive to coarse */
-	int		biw_is_sysinfo_frame;	/* 1 = this frame should carry SysInfo BIW */
 
 	/* --biw-ssid1 <localid,coverageid>: SSID1 (000) broadcast.
 	 * 0 = disabled (default), 1 = enabled.
@@ -2196,6 +2206,13 @@ typedef struct flex_frame_params {
 	int		biw_ssid2;
 	uint32_t	country_code;		/* SSID2 CC — Country Code (10 bits, ITU-T E.212) */
 	uint32_t	tmf;			/* SSID2 TMF — Traffic Management Flag (4 bits) */
+
+	/* BIW carousel output: which BIW types to emit this frame.
+	 * Filled by the scheduler from flex_biw_carousel_select().
+	 * The frame encoder iterates this array and emits each type.
+	 * This is the single source of truth for BIW word selection. */
+	int		biw_selected[3];		/* type IDs (enum flex_biw_type_id), max 3 */
+	int		biw_selected_n;			/* count (0-3) */
 
 	int		bitrate;		/* bit rate: 1600, 3200, or 6400 (bps, not baud) */
 	int		modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */

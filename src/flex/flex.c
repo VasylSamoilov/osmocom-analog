@@ -1481,26 +1481,23 @@ static int flex_ssid_phase(uint32_t frame, int num_phases)
  * scheduler's capacity estimate and the actual encoded frame. */
 static int flex_compute_biw_count(const flex_frame_params_t *params)
 {
+	/* When the carousel has filled biw_selected, use it directly. */
+	if (params->biw_selected_n > 0)
+		return 1 + params->biw_selected_n;
+
+	/* Fallback for single-shot mode or when carousel hasn't run. */
 	int extra = 0;
 
 	if (params->biw_ssid1)
 		extra++;
 	if (params->biw_ssid2 && params->frame <= 3)
 		extra++;
-	if (params->biw_datetime && params->biw_is_time_frame)
+	if (params->biw_datetime)
 		extra += 2; /* Date + Time */
-	if (params->biw_sysinfo && params->biw_is_sysinfo_frame)
+	if (params->biw_sysinfo)
 		extra++;
-	/* BIW101 for system message (method (b)).
-	 * When an Operator Messaging Address with LSB 0-3 is present,
-	 * emit BIW101 with the matching A-type.  This replaces the
-	 * sysinfo BIW101 slot if both are requested (only one type 101
-	 * word per phase per spec). */
-	if (params->sysmsg_a_type >= 0 && params->sysmsg_a_type <= 3) {
-		if (!params->biw_sysinfo || !params->biw_is_sysinfo_frame)
-			extra++; /* no sysinfo slot yet, add one */
-		/* else: reuse the sysinfo slot for sysmsg A-type */
-	}
+	if (params->sysmsg_a_type >= 0 && params->sysmsg_a_type <= 3)
+		extra++;
 	if (params->chan_setup_enabled && params->frame <= 3)
 		extra++;
 	if (extra > 3)
@@ -1540,7 +1537,16 @@ static int flex_phase_capacity(const flex_frame_params_t *params,
 	 * SysInfo BIW101 (A=0100) also follows SSID rotation. */
 	if (phase_idx != ssid_phase) {
 		pp.sysmsg_a_type = -1;
-		pp.biw_is_sysinfo_frame = 0;
+		/* Remove BIW101 types from selection for non-SSID phases */
+		int new_n = 0;
+		for (int bi = 0; bi < pp.biw_selected_n; bi++) {
+			if (pp.biw_selected[bi] == BIW_SYSINFO_TZ ||
+			    pp.biw_selected[bi] == BIW_SYSINFO_MSG ||
+			    pp.biw_selected[bi] == BIW_CHAN_SETUP)
+				continue;
+			pp.biw_selected[new_n++] = pp.biw_selected[bi];
+		}
+		pp.biw_selected_n = new_n;
 	}
 
 	/* Channel setup BIW only in SSID phase */
@@ -2185,23 +2191,15 @@ static int flex_get_next_frame_network(flex_t *flex)
 	}
 
 	/* BIW DateTime: the carousel controls which frames get DATE/TIME.
-	 * We just set biw_datetime=1 so the frame encoder knows time is
-	 * enabled.  The actual per-frame decision comes from the carousel
-	 * selection below (biw_is_time_frame is set after carousel runs). */
+	 * We set biw_datetime=1 so the frame encoder knows time values
+	 * are available.  The carousel decides per-frame which types to emit. */
 	if (flex->biw_datetime_enabled) {
 		params.biw_datetime = 1;
-		params.biw_is_time_frame = 0; /* will be set by carousel result */
 	}
 
-	/* BIW SysInfo: eligible when configured.
-	 * Actual emission depends on whether carousel selected time
-	 * for this frame (sysinfo and time don't co-locate — only one
-	 * BIW101 per phase per spec, and time consumes 2 of 3 slots).
-	 * Set biw_is_sysinfo_frame=0 here; it will be set to 1 below
-	 * if the carousel did NOT select time for this frame. */
+	/* BIW SysInfo: timezone/DST values for the encoder. */
 	if (flex->biw_sysinfo_enabled) {
 		params.biw_sysinfo = 1;
-		params.biw_is_sysinfo_frame = 0; /* set after carousel decision */
 		params.biw_tz_code = flex->biw_tz_code;
 		params.biw_dst = flex->biw_dst;
 
@@ -2217,10 +2215,11 @@ static int flex_get_next_frame_network(flex_t *flex)
 		}
 	}
 
-	/* === BIW carousel selection (Req 3) ===
+	/* === BIW carousel selection ===
 	 * Select which BIW2/3/4 words go in this frame.
 	 * The carousel tracks per-phase, per-polarity state.
-	 * Result is used for both capacity estimation and encoding. */
+	 * Output goes directly into params.biw_selected[] — the frame
+	 * encoder emits exactly what the carousel chose. */
 	{
 		int selected_pol = flex->last_tx_polarity;
 		int phase_idx = 0; /* TODO: per-phase in multi-phase mode */
@@ -2267,13 +2266,14 @@ static int flex_get_next_frame_network(flex_t *flex)
 					 ft.cycle * 128 + ft.frame,
 					 biw_types, &biw_n, &biw_time_val);
 
-		/* Store carousel BIW count for capacity estimation. */
-		params.carousel_biw_count = 1 + biw_n; /* BIW1 + extras */
+		/* Copy carousel output directly into params — single source of truth. */
+		params.biw_selected_n = biw_n;
+		for (int bi = 0; bi < biw_n; bi++)
+			params.biw_selected[bi] = biw_types[bi];
+		params.carousel_biw_count = 1 + biw_n;
 
-		/* If carousel selected DATE or TIME, set time frame params
-		 * from the carousel's computed values. */
+		/* If carousel selected any time-related BIW, fill time values. */
 		if (biw_time_val.valid) {
-			params.biw_is_time_frame = 1;
 			params.biw_hour = biw_time_val.hour;
 			params.biw_minute = biw_time_val.minute;
 			params.biw_second = biw_time_val.second;
@@ -2287,21 +2287,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 			params.biw_day = biw_time_val.day;
 		}
 
-		/* SysInfo BIW101 (timezone): eligible when time was NOT
-		 * selected for this frame.  Only one BIW101 per phase,
-		 * and Date+Time already consumes 2 of 3 extra slots. */
-		if (flex->biw_sysinfo_enabled && !biw_time_val.valid) {
-			params.biw_is_sysinfo_frame = 1;
-		}
-
 		/* Update carousel state after selection. */
 		flex_biw_carousel_update(car, biw_types, biw_n,
 					 ft.cycle * 128 + ft.frame);
 
 		LOGP(DFLEX, LOGL_INFO,
-		     "Scheduler: C%u/F%u BIW: carousel_n=%d time_frame=%d sysinfo_frame=%d ssid1=%d ssid2=%d capacity=%d\n",
+		     "Scheduler: C%u/F%u BIW: carousel_n=%d ssid1=%d ssid2=%d capacity=%d\n",
 		     ft.cycle, ft.frame, biw_n,
-		     params.biw_is_time_frame, params.biw_is_sysinfo_frame,
 		     params.biw_ssid1, params.biw_ssid2,
 		     FLEX_WORDS_PER_FRAME - (1 + biw_n));
 	}
@@ -3170,9 +3162,12 @@ static int flex_get_next_frame_network(flex_t *flex)
 					phase_params.country_code = params.country_code;
 					phase_params.tmf = params.tmf;
 					phase_params.biw_sysinfo = params.biw_sysinfo;
-					phase_params.biw_is_sysinfo_frame = params.biw_is_sysinfo_frame;
 					phase_params.sysmsg_a_type = params.sysmsg_a_type;
 					phase_params.chan_setup_enabled = params.chan_setup_enabled;
+					/* Copy carousel selection */
+					phase_params.biw_selected_n = params.biw_selected_n;
+					for (int bi = 0; bi < params.biw_selected_n; bi++)
+						phase_params.biw_selected[bi] = params.biw_selected[bi];
 				} else {
 					phase_params.biw_ssid1 = 0;
 					phase_params.biw_ssid2 = 0;
@@ -3181,9 +3176,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 					phase_params.country_code = 0;
 					phase_params.tmf = 0;
 					phase_params.biw_sysinfo = 0;
-					phase_params.biw_is_sysinfo_frame = 0;
 					phase_params.sysmsg_a_type = -1;
 					phase_params.chan_setup_enabled = 0;
+					phase_params.biw_selected_n = 0;
 				}
 				phase_params.phase_index = p;
 			}
@@ -3701,7 +3696,6 @@ int flex_get_next_frame(flex_t *flex)
 			}
 			if (flex->biw_datetime_enabled) {
 				params.biw_datetime = 1;
-				params.biw_is_time_frame = 1; /* single-shot: always emit time */
 				/* Use wall clock + offset */
 				time_t base_time = time(NULL) + flex->biw_time_offset;
 				struct tm tm_val;
@@ -3720,11 +3714,25 @@ int flex_get_next_frame(flex_t *flex)
 			}
 			if (flex->biw_sysinfo_enabled) {
 				params.biw_sysinfo = 1;
-				/* In single-shot, sysinfo goes in same frame
-				 * (no multi-frame scheduling) */
-				params.biw_is_sysinfo_frame = !params.biw_is_time_frame;
 				params.biw_tz_code = flex->biw_tz_code;
 				params.biw_dst = flex->biw_dst;
+			}
+			/* Single-shot: build biw_selected[] directly.
+			 * Emit all configured types that fit (max 3). */
+			{
+				int n = 0;
+				if (flex->biw_ssid1_enabled && n < BIW_MAX_EXTRA)
+					params.biw_selected[n++] = BIW_SSID1;
+				if (flex->biw_ssid2_enabled && params.frame <= 3 && n < BIW_MAX_EXTRA)
+					params.biw_selected[n++] = BIW_SSID2;
+				if (flex->biw_datetime_enabled && n < BIW_MAX_EXTRA)
+					params.biw_selected[n++] = BIW_DATE;
+				if (flex->biw_datetime_enabled && n < BIW_MAX_EXTRA)
+					params.biw_selected[n++] = BIW_TIME;
+				if (flex->biw_sysinfo_enabled && n < BIW_MAX_EXTRA)
+					params.biw_selected[n++] = BIW_SYSINFO_TZ;
+				params.biw_selected_n = n;
+				params.carousel_biw_count = 1 + n;
 			}
 
 			/* Set sysmsg_a_type for methods (a)/(b).

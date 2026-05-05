@@ -226,17 +226,8 @@ typedef struct flex_msg {
 #define FLEX_MSG_QUEUE_MAX	32768
 
 /* BIW carousel: tracks last-transmitted frame per BIW type per phase.
- * Used for least-recently-transmitted rotation. */
-enum flex_biw_type_id {
-	BIW_SSID1 = 0,		/* type 000 */
-	BIW_DATE,		/* type 001 */
-	BIW_TIME,		/* type 010 */
-	BIW_SYSINFO_TZ,	/* type 101, A=0100 */
-	BIW_SYSINFO_MSG,	/* type 101, A=0000-0011 */
-	BIW_CHAN_SETUP,		/* type 101, A=0110 */
-	BIW_SSID2,		/* type 111 */
-	BIW_TYPE_COUNT
-};
+ * Used for least-recently-transmitted rotation.
+ * (enum flex_biw_type_id is defined in frame.h) */
 
 typedef struct flex_biw_carousel {
 	uint32_t	last_tx_abs[BIW_TYPE_COUNT];	/* absolute frame of last TX per type */
