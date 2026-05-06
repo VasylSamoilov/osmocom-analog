@@ -222,26 +222,35 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 
 	/* ---- Compute time values from cycle/frame position ----
 	 *
-	 * FLEX timing structure:
-	 *   total_seconds_in_hour = cycle * 240 + frame * 1.875
-	 *   minute = floor(total_seconds / 60)
-	 *   second = floor((total_seconds mod 60) / 7.5)   [0-7]
+	 * Per the FLEX standard (§3.7.2): "The Time transmitted in the BIW
+	 * reflects the Present Local Time at the leading edge of the first
+	 * bit of Bit Sync 1 of Frame 0 for the current Cycle."
 	 *
-	 * Wall clock provides base hour and date.
-	 * Frame 0 Cycle 0: forced to xx:00:00 (top-of-hour). */
+	 * The pager knows its frame number (from FIW) and adds frame*1.875s
+	 * internally to derive the current time.  We encode only the time
+	 * at Frame 0 of this cycle:
+	 *
+	 *   minute = cycle * 4  (each cycle = 128 frames = 240s = 4 min)
+	 *   second = 0          (Frame 0 is always at a minute boundary)
+	 *
+	 * The companion ext_sec field (in BIW SYSINFO) would encode any
+	 * fractional-second offset between the frame grid and the clock
+	 * reference.  In our implementation the grid is clock-synchronized,
+	 * so ext_sec = 0.  Real infrastructure with GPS/frame misalignment
+	 * may use non-zero ext_sec.
+	 *
+	 * Wall clock provides base hour and date. */
 	if (needs_time && time_out) {
 		time_t now = time(NULL);
 		struct tm tm_val;
 
 		localtime_r(&now, &tm_val);
 
-		/* Time from cycle/frame position.
-		 * F0C0 naturally produces 00:00.0 (top-of-hour). */
-		double total_sec = (double)cycle * 240.0 + (double)frame * 1.875;
-		int minute = (int)(total_sec / 60.0);
-		int sec_quant = (int)(((double)((int)total_sec % 60) +
-				       (total_sec - (int)total_sec)) / 7.5);
-		if (sec_quant > 7) sec_quant = 7;
+		/* Time at Frame 0 of this cycle.
+		 * Each cycle = 4 minutes, so minute = cycle*4, second = 0.
+		 * Pager offsets by frame*1.875s to get current time. */
+		int minute = (int)cycle * 4;
+		int sec_quant = 0;
 
 		time_out->top_of_hour = (frame == 0 && cycle == 0) ? 1 : 0;
 		time_out->hour   = (uint32_t)tm_val.tm_hour;

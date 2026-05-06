@@ -78,6 +78,7 @@ static int biw_retro_time = 0;		/* --retro-time */
 static int biw_sysinfo_enabled = 0;	/* --biw-sysinfo */
 static int biw_tz_code = -1;		/* timezone zone code (0-31) */
 static int biw_dst = 1;		/* DST flag: 0=DST active, 1=standard (default standard) */
+static int biw_ext_sec = 0;		/* ext_sec: 0-7, clock/frame-grid offset in 0.9375s steps */
 static int biw_sysinfo_auto = 0;	/* 1=auto-detect tz/dst */
 static int biw_ssid1_enabled = 0;	/* --biw-ssid1 */
 static uint32_t ssid1_local_id = 0;
@@ -194,11 +195,17 @@ void print_help(const char *arg0)
 	printf("        Transmitted at F0C0 (mandatory) and every ~30s.\n");
 	printf("    --no-biw-datetime\n");
 	printf("        Disable BIW date/time broadcast.\n");
-	printf("    --biw-sysinfo <auto|tz_offset,dst>\n");
+	printf("    --biw-sysinfo <auto[,extsec]|tz_offset,dst[,extsec]>\n");
 	printf("        Enable BIW SysInfo (101, A=0101) timezone/DST broadcast.\n");
-	printf("        auto        — detect timezone and DST from system clock.\n");
+	printf("        auto          — detect timezone and DST from system clock.\n");
+	printf("        auto,N        — same, with ext_sec=N (0-7, default 0).\n");
 	printf("        tz_offset,dst — e.g. +2,on or -5,off or +5:30,off\n");
-	printf("        Never in same frame as Date/Time — follows 1-3 frames behind.\n");
+	printf("        tz_offset,dst,N — same, with ext_sec=N.\n");
+	printf("        ext_sec: sub-second time trim in 0.9375s steps (0-7).\n");
+	printf("          Adds N*0.9375s to the pager's reconstructed time.\n");
+	printf("          Use 0 (default) when frame grid is clock-synchronized.\n");
+	printf("          Use non-zero to compensate for clock/frame-grid offset\n");
+	printf("          (e.g. GPS startup delay, simulcast alignment).\n");
 	printf("    --biw-ssid1 <LID>,<CZ>\n");
 	printf("        Enable SSID1 (BIW000): Local channel ID and Coverage Zone.\n");
 	printf("        LID: 0-511 (9 bits). CZ: 0-31 (5 bits).\n");
@@ -673,9 +680,10 @@ static int handle_options(int short_option, int argi, char **argv)
 		roaming_enabled = 1;
 		break;
 	case OPT_BIW_SYSINFO:
-		/* --biw-sysinfo: auto or tz_offset,dst */
+		/* --biw-sysinfo: auto[,extsec] or tz_offset,dst[,extsec] */
 		biw_sysinfo_enabled = 1;
-		if (!strcasecmp(argv[argi], "auto")) {
+		if (!strncasecmp(argv[argi], "auto", 4) &&
+		    (argv[argi][4] == '\0' || argv[argi][4] == ',')) {
 			biw_sysinfo_auto = 1;
 			biw_tz_code = flex_tz_auto_detect();
 			if (biw_tz_code < 0) {
@@ -695,11 +703,22 @@ static int handle_options(int short_option, int argi, char **argv)
 				localtime_r(&now, &lt);
 				biw_dst = (lt.tm_isdst > 0) ? 0 : 1; /* L0=0 means DST active */
 			}
+			/* Optional ext_sec after "auto," */
+			if (argv[argi][4] == ',') {
+				int es = atoi(&argv[argi][5]);
+				if (es < 0 || es > 7) {
+					fprintf(stderr, "ext_sec must be 0-7 (got %d).\n", es);
+					return -EINVAL;
+				}
+				biw_ext_sec = es;
+			}
+			fprintf(stderr, "BIW sysinfo: DST=%s ext_sec=%d\n",
+				biw_dst ? "off" : "on", biw_ext_sec);
 		} else {
-			/* Parse tz_offset,dst (e.g. +2,on or -5,off) */
+			/* Parse tz_offset,dst[,extsec] (e.g. +2,on or -5,off,3) */
 			char *comma = strchr(argv[argi], ',');
 			if (!comma) {
-				fprintf(stderr, "--biw-sysinfo requires 'auto' or 'tz_offset,dst' (e.g. +2,on or -5,off).\n");
+				fprintf(stderr, "--biw-sysinfo requires 'auto[,extsec]' or 'tz_offset,dst[,extsec]'.\n");
 				return -EINVAL;
 			}
 			/* Parse timezone offset */
@@ -721,8 +740,24 @@ static int handle_options(int short_option, int argi, char **argv)
 				return -EINVAL;
 			}
 			biw_tz_code = (int)code;
-			/* Parse DST flag */
+			/* Parse DST flag (and optional ext_sec after second comma) */
 			const char *dst_str = comma + 1;
+			char *comma2 = strchr(dst_str, ',');
+			char dst_buf[8];
+			if (comma2) {
+				int dst_len = (int)(comma2 - dst_str);
+				if (dst_len >= (int)sizeof(dst_buf)) dst_len = (int)sizeof(dst_buf) - 1;
+				memcpy(dst_buf, dst_str, dst_len);
+				dst_buf[dst_len] = '\0';
+				dst_str = dst_buf;
+				/* Parse ext_sec */
+				int es = atoi(comma2 + 1);
+				if (es < 0 || es > 7) {
+					fprintf(stderr, "ext_sec must be 0-7 (got %d).\n", es);
+					return -EINVAL;
+				}
+				biw_ext_sec = es;
+			}
 			if (!strcasecmp(dst_str, "on"))
 				biw_dst = 0; /* L0=0 means DST active */
 			else if (!strcasecmp(dst_str, "off"))
@@ -734,10 +769,11 @@ static int handle_options(int short_option, int argi, char **argv)
 			{
 				char tzbuf[20];
 				int tz_min = flex_tz_to_minutes((uint32_t)biw_tz_code);
-				fprintf(stderr, "BIW sysinfo: timezone zone=%d (%s) DST=%s\n",
+				fprintf(stderr, "BIW sysinfo: timezone zone=%d (%s) DST=%s ext_sec=%d\n",
 					biw_tz_code,
 					flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
-					biw_dst ? "off" : "on");
+					biw_dst ? "off" : "on",
+					biw_ext_sec);
 			}
 		}
 		break;
@@ -2698,6 +2734,10 @@ int main(int argc, char *argv[])
 	if (roaming_enabled && !biw_ssid2_enabled) {
 		fprintf(stderr, "Warning: --roaming without --biw-ssid2 — SSID2 will not be transmitted.\n");
 	}
+	if (biw_datetime_enabled && !biw_sysinfo_enabled) {
+		fprintf(stderr, "Error: --biw-datetime requires --biw-sysinfo (pager needs timezone to set clock).\n");
+		return -EINVAL;
+	}
 
 	/* create pipe for message send */
 	unlink(msg_send_path);
@@ -2753,6 +2793,7 @@ int main(int argc, char *argv[])
 			f->biw_sysinfo_enabled = biw_sysinfo_enabled;
 			f->biw_tz_code = biw_tz_code;
 			f->biw_dst = biw_dst;
+			f->biw_ext_sec = biw_ext_sec;
 			f->biw_sysinfo_auto = biw_sysinfo_auto;
 			f->biw_ssid1_enabled = biw_ssid1_enabled;
 			f->ssid1_local_id = ssid1_local_id;

@@ -2515,29 +2515,22 @@ parse_phase:
 							  phase_name, a_type, zone,
 							  flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
 							  dst, esec);
-						/* esec FIW sanity gate.
+						/* ext_sec validity note:
 						 *
-						 * ext_sec encodes the sub-7.5s position within
-						 * the coarse second group.  From pure frame timing:
-						 *   frame_in_min = (cycle*128 + frame) % 32
-						 *   ext_sec = (frame_in_min % 4) * 2
-						 * Only even values {0,2,4,6} are frame-aligned;
-						 * allow ±1 tolerance for rounding in other encoders. */
-						{
-							uint32_t frame_in_min = (flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame) % 32;
-							int expected_ext = (int)(frame_in_min % 4) * 2;
-							int ediff = (int)esec - expected_ext;
-							if (ediff > 4) ediff -= 8;
-							if (ediff < -4) ediff += 8;
-							if (ediff < 0) ediff = -ediff;
-							if (ediff > 1) {
-								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: TZ esec FIW sanity failed: esec=%u expected=%d (c=%u f=%u)\n",
-									  esec, expected_ext,
-									  flex->rx.fiw_cycle, flex->rx.fiw_frame);
-								break;
-							}
-						}
+						 * ext_sec encodes the fractional-second offset between
+						 * the frame grid and the clock reference at Frame 0.
+						 * It is constant across all frames in a cycle (it does
+						 * NOT vary per frame — the pager uses its own frame
+						 * counter for sub-second current-time derivation).
+						 *
+						 * For frame-grid-synchronized transmitters: ext_sec=0.
+						 * For infrastructure with clock/frame misalignment
+						 * (GPS startup delay, simulcast, mid-hour restart):
+						 * ext_sec may be 1-7 (each unit = 0.9375s offset).
+						 *
+						 * We accept any value — no sanity gate needed since
+						 * ext_sec is an infrastructure property, not derivable
+						 * from cycle/frame position alone. */
 						/* Push into tz ring and vote */
 						{
 							typeof(flex->rx.biw[pol]) *b = &flex->rx.biw[pol];

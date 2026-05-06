@@ -2203,23 +2203,25 @@ static int flex_get_next_frame_network(flex_t *flex)
 		params.biw_tz_code = flex->biw_tz_code;
 		params.biw_dst = flex->biw_dst;
 
-		/* Extended seconds from cycle/frame position.
+		/* Extended seconds (ext_sec, 3 bits, 0-7, 0.9375s steps).
 		 *
-		 * FLEX timing is integer-rational:
-		 *   32 frames = 1 minute, 4 frames = 1 coarse second (7.5s).
-		 *   ext_sec refines within the coarse group: each frame is
-		 *   exactly 2 ext_sec units (1.875s / 0.9375s = 2).
+		 * This field encodes the sub-second offset between the actual
+		 * Frame 0 start time and the nearest whole-second boundary
+		 * representable by the coarse BIW TIME second field (7.5s steps).
 		 *
-		 *   abs_frame = cycle*128 + frame
-		 *   frame_in_min = abs_frame % 32        (0-31)
-		 *   coarse       = frame_in_min / 4      (0-7, the BIW 010 seconds field)
-		 *   ext_sec      = (frame_in_min % 4) * 2  (0,2,4,6)
-		 */
+		 * In our implementation, the frame grid is synchronized to the
+		 * wall clock so Frame 0 always starts at an exact 4-minute
+		 * boundary (cycle*240s), meaning second=0 and ext_sec=0.
+		 *
+		 * In real-world paging infrastructure, ext_sec may be non-zero
+		 * when the frame grid has a fractional-second offset from the
+		 * clock reference (e.g., GPS startup delay, simulcast alignment,
+		 * or mid-hour transmitter restart).
+		 *
+		 * Configurable via --biw-sysinfo auto,N or tz,dst,N (N=0-7).
+		 * Adds N*0.9375s to the pager's reconstructed time. */
 		if (flex->biw_datetime_enabled) {
-			uint32_t abs_frame = ft.cycle * 128 + ft.frame;
-			uint32_t frame_in_min = abs_frame % 32;
-			uint32_t ext_sec = (frame_in_min % 4) * 2;
-			params.biw_ext_seconds = ext_sec;
+			params.biw_ext_seconds = (uint32_t)flex->biw_ext_sec;
 		}
 	}
 
