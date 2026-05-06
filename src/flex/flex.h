@@ -484,6 +484,7 @@ typedef struct flex {
 	int			biw_tz_code;		/* timezone zone code (0-31) */
 	int			biw_dst;		/* DST flag: 0=DST active, 1=standard */
 	int			biw_ext_sec;		/* ext_sec: 0-7, sub-second trim (0.9375s steps) */
+	int			biw_time_mode;		/* 0=frame0 (default), 1=curframe (P2000-style) */
 	int			biw_sysinfo_auto;	/* 1=auto-detect tz/dst from system */
 
 	/* --biw-ssid1 config */

@@ -24,6 +24,10 @@
 /* Forward declarations */
 struct flex_biw_carousel;
 
+/* BIW TIME encoding mode */
+#define BIW_TIME_MODE_FRAME0	0	/* Frame 0 time (watch-compatible, default) */
+#define BIW_TIME_MODE_CURFRAME	1	/* Current-frame time (P2000-style) */
+
 /* BIW carousel configuration — what's enabled on this system.
  * Passed to the selection function each frame. */
 typedef struct flex_biw_config {
@@ -35,6 +39,7 @@ typedef struct flex_biw_config {
 	int	roaming_active;		/* 1 = FIW n=1 */
 	int	has_sysmsg;		/* 1 = system message BIW101 content present this frame */
 	int	queue_has_messages;	/* 1 = message queue non-empty (time may yield capacity) */
+	int	time_mode;		/* BIW_TIME_MODE_FRAME0 or BIW_TIME_MODE_CURFRAME */
 } flex_biw_config_t;
 
 /* Maximum additional BIW words beyond BIW1 */

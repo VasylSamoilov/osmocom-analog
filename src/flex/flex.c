@@ -2205,23 +2205,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 
 		/* Extended seconds (ext_sec, 3 bits, 0-7, 0.9375s steps).
 		 *
-		 * This field encodes the sub-second offset between the actual
-		 * Frame 0 start time and the nearest whole-second boundary
-		 * representable by the coarse BIW TIME second field (7.5s steps).
-		 *
-		 * In our implementation, the frame grid is synchronized to the
-		 * wall clock so Frame 0 always starts at an exact 4-minute
-		 * boundary (cycle*240s), meaning second=0 and ext_sec=0.
-		 *
-		 * In real-world paging infrastructure, ext_sec may be non-zero
-		 * when the frame grid has a fractional-second offset from the
-		 * clock reference (e.g., GPS startup delay, simulcast alignment,
-		 * or mid-hour transmitter restart).
-		 *
-		 * Configurable via --biw-sysinfo auto,N or tz,dst,N (N=0-7).
-		 * Adds N*0.9375s to the pager's reconstructed time. */
+		 * Standard mode: ext_sec is a configurable trim value (default 0).
+		 * Direct mode: ext_sec encodes the sub-7.5s remainder of the
+		 * current frame's position within the minute:
+		 *   frame_in_min = (cycle*128 + frame) % 32
+		 *   ext_sec = (frame_in_min % 4) * 2
+		 * This gives the pager sub-second precision without needing
+		 * to compute frame offsets. */
 		if (flex->biw_datetime_enabled) {
-			params.biw_ext_seconds = (uint32_t)flex->biw_ext_sec;
+			if (flex->biw_time_mode == 1) {
+				/* Direct mode: compute from frame position */
+				uint32_t abs_frame = ft.cycle * 128 + ft.frame;
+				uint32_t frame_in_min = abs_frame % 32;
+				params.biw_ext_seconds = (frame_in_min % 4) * 2;
+			} else {
+				/* Standard mode: use configured value */
+				params.biw_ext_seconds = (uint32_t)flex->biw_ext_sec;
+			}
 		}
 	}
 
@@ -2247,6 +2247,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 		biw_cfg.chan_setup_enabled = flex->chan_setup_enabled;
 		biw_cfg.roaming_active = flex->roaming_active;
 		biw_cfg.has_sysmsg = 0; /* set later if sysmsg detected */
+		biw_cfg.time_mode = flex->biw_time_mode;
 
 		/* queue_has_messages: only count messages that will actually
 		 * be packed into THIS frame (matching speed, modulation,

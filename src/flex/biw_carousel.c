@@ -145,10 +145,15 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 
 	/* ---- Compute time values ----
 	 *
-	 * Per FLEX standard §3.7.2: BIW TIME encodes the time at Frame 0
-	 * of the current cycle.  The pager adds frame*1.875s internally.
-	 * Since cycle*240s is always a whole number of minutes:
-	 *   minute = cycle * 4, second = 0.
+	 * Two encoding modes:
+	 *   FRAME0 (default, watch-compatible):
+	 *     BIW TIME = time at Frame 0 of the cycle.
+	 *     Pager adds frame*1.875s internally.
+	 *     minute = cycle*4, second = 0.
+	 *   CURFRAME (P2000-style):
+	 *     BIW TIME = current frame's time.
+	 *     Pager uses value directly without offset.
+	 *     minute/second derived from cycle*240 + frame*1.875.
 	 *
 	 * Wall clock provides hour and date. */
 	if (needs_time && time_out) {
@@ -159,8 +164,21 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 
 		time_out->top_of_hour = (frame == 0 && cycle == 0) ? 1 : 0;
 		time_out->hour   = (uint32_t)tm_val.tm_hour;
-		time_out->minute = (uint32_t)((int)cycle * 4);
-		time_out->second = 0;
+
+		if (cfg->time_mode == BIW_TIME_MODE_CURFRAME) {
+			/* Current-frame time (P2000-style) */
+			int total_sec_int = (int)cycle * 240 + (int)frame * 15 / 8;
+			int frac = ((int)frame * 15) % 8; /* fractional 1/8s */
+			double total_sec = (double)total_sec_int + (double)frac / 8.0;
+			time_out->minute = (uint32_t)((int)(total_sec / 60.0));
+			double sec_in_min = total_sec - (double)time_out->minute * 60.0;
+			time_out->second = (uint32_t)((int)(sec_in_min / 7.5));
+			if (time_out->second > 7) time_out->second = 7;
+		} else {
+			/* Frame 0 time (watch-compatible, default) */
+			time_out->minute = (uint32_t)((int)cycle * 4);
+			time_out->second = 0;
+		}
 
 		time_out->year  = (uint32_t)(tm_val.tm_year + 1900);
 		time_out->month = (uint32_t)(tm_val.tm_mon + 1);

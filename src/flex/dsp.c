@@ -1874,20 +1874,31 @@ static int flex_build_word_status(flex_phase_data_t *ph, int start, int end,
  * BCH words on noisy signals.
  */
 
-/* Cross-validate a BIW minute against the FIW-derived minute.
- * Returns 1 if they agree within +/-tolerance, handling :59/:00 wrap. */
-#define FLEX_TIME_CROSS_TOLERANCE 2  /* minutes */
+/* Cross-validate BIW TIME minute against FIW cycle position.
+ *
+ * Two conventions exist in the wild:
+ *   (a) Frame 0 time: minute = cycle*4, second = 0.
+ *       Pager adds frame*1.875s internally.
+ *   (b) Current-frame time: minute/second reflect the actual time
+ *       at the transmitted frame.  Pager uses value directly.
+ *   Real networks (e.g., P2000) use convention (b).
+ *
+ * We accept both: biw_min must be within the cycle's 4-minute span
+ * [cycle*4 .. cycle*4+3] mod 60, which covers both interpretations.
+ *
+ * Returns 1 if valid, 0 otherwise. */
 
 static int flextime_fiw_validate(uint32_t biw_min,
 				 uint32_t cycleno, uint32_t frameno)
 {
-	int fiw_seconds = (int)(cycleno * 240 + frameno * 240 / 128);
-	int fiw_min = fiw_seconds / 60;
-	int diff = (int)biw_min - fiw_min;
-	if (diff > 30) diff -= 60;
+	(void)frameno;
+	int base_min = (int)(cycleno * 4) % 60;
+	int bmin = (int)biw_min;
+	int diff = bmin - base_min;
 	if (diff < -30) diff += 60;
-	if (diff < 0) diff = -diff;
-	return diff <= FLEX_TIME_CROSS_TOLERANCE;
+	if (diff > 30) diff -= 60;
+	/* Accept anything within the 4-minute cycle span */
+	return diff >= 0 && diff <= 3;
 }
 
 /* Validate calendar date (days-in-month, leap year). */

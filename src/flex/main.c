@@ -79,6 +79,7 @@ static int biw_sysinfo_enabled = 0;	/* --biw-sysinfo */
 static int biw_tz_code = -1;		/* timezone zone code (0-31) */
 static int biw_dst = 1;		/* DST flag: 0=DST active, 1=standard (default standard) */
 static int biw_ext_sec = 0;		/* ext_sec: 0-7, clock/frame-grid offset in 0.9375s steps */
+static int biw_time_mode = 0;		/* 0=standard (frame0), 1=direct (curframe) */
 static int biw_sysinfo_auto = 0;	/* 1=auto-detect tz/dst */
 static int biw_ssid1_enabled = 0;	/* --biw-ssid1 */
 static uint32_t ssid1_local_id = 0;
@@ -138,6 +139,7 @@ static const char *oneshot_station_id = "";	/* saved capcode for sweep re-enqueu
 #define OPT_ONESHOT		3034
 #define OPT_ONESHOT_FREQ	3035
 #define OPT_NO_MSG_NUMBERING	3036
+#define OPT_BIW_TIME_MODE	3037
 
 void print_help(const char *arg0)
 {
@@ -195,6 +197,15 @@ void print_help(const char *arg0)
 	printf("        Transmitted at F0C0 (mandatory) and every ~30s.\n");
 	printf("    --no-biw-datetime\n");
 	printf("        Disable BIW date/time broadcast.\n");
+	printf("    --biw-time-mode <standard|direct>\n");
+	printf("        BIW TIME encoding convention (default: standard).\n");
+	printf("        standard - encode time at Frame 0 of the cycle (S3.7.2:\n");
+	printf("          \"Present Local Time at the leading edge of the first bit\n");
+	printf("          of Bit Sync 1 of Frame 0 for the current Cycle\").\n");
+	printf("          Pager adds frame*1.875s internally. Requires --biw-sysinfo.\n");
+	printf("        direct   - encode current frame's time directly.\n");
+	printf("          Pager uses value as-is without adding frame offset.\n");
+	printf("          Does not require --biw-sysinfo.\n");
 	printf("    --biw-sysinfo <auto[,extsec]|tz_offset,dst[,extsec]>\n");
 	printf("        Enable BIW SysInfo (101, A=0101) timezone/DST broadcast.\n");
 	printf("        auto          — detect timezone and DST from system clock.\n");
@@ -450,6 +461,7 @@ static void add_options(void)
 	option_add(OPT_BIW_SSID2, "biw-ssid2", 1);
 	option_add(OPT_ROAMING, "roaming", 0);
 	option_add(OPT_BIW_SYSINFO, "biw-sysinfo", 1);
+	option_add(OPT_BIW_TIME_MODE, "biw-time-mode", 1);
 	option_add(OPT_RETRO_TIME, "retro-time", 0);
 	option_add(OPT_POCSAG_MIX, "pocsag-mix", 1);
 	option_add(OPT_TEMP_ADDR, "temp-addr", 1);
@@ -779,6 +791,16 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_RETRO_TIME:
 		biw_retro_time = 1;
+		break;
+	case OPT_BIW_TIME_MODE:
+		if (!strcasecmp(argv[argi], "standard"))
+			biw_time_mode = 0;
+		else if (!strcasecmp(argv[argi], "direct"))
+			biw_time_mode = 1;
+		else {
+			fprintf(stderr, "Invalid --biw-time-mode '%s'. Use 'standard' or 'direct'.\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
 	case OPT_POCSAG_MIX:
 		pocsag_mix = options_strdup(argv[argi]);
@@ -2734,8 +2756,8 @@ int main(int argc, char *argv[])
 	if (roaming_enabled && !biw_ssid2_enabled) {
 		fprintf(stderr, "Warning: --roaming without --biw-ssid2 — SSID2 will not be transmitted.\n");
 	}
-	if (biw_datetime_enabled && !biw_sysinfo_enabled) {
-		fprintf(stderr, "Error: --biw-datetime requires --biw-sysinfo (pager needs timezone to set clock).\n");
+	if (biw_datetime_enabled && !biw_sysinfo_enabled && biw_time_mode == 0) {
+		fprintf(stderr, "Error: --biw-datetime in standard mode requires --biw-sysinfo (pager needs timezone to set clock).\n");
 		return -EINVAL;
 	}
 
@@ -2794,6 +2816,7 @@ int main(int argc, char *argv[])
 			f->biw_tz_code = biw_tz_code;
 			f->biw_dst = biw_dst;
 			f->biw_ext_sec = biw_ext_sec;
+			f->biw_time_mode = biw_time_mode;
 			f->biw_sysinfo_auto = biw_sysinfo_auto;
 			f->biw_ssid1_enabled = biw_ssid1_enabled;
 			f->ssid1_local_id = ssid1_local_id;
