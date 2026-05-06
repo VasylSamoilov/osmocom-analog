@@ -2515,9 +2515,17 @@ parse_phase:
 							  phase_name, a_type, zone,
 							  flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
 							  dst, esec);
-						/* esec FIW sanity gate */
+						/* esec FIW sanity gate.
+						 *
+						 * ext_sec encodes the sub-7.5s position within
+						 * the coarse second group.  From pure frame timing:
+						 *   frame_in_min = (cycle*128 + frame) % 32
+						 *   ext_sec = (frame_in_min % 4) * 2
+						 * Only even values {0,2,4,6} are frame-aligned;
+						 * allow ±1 tolerance for rounding in other encoders. */
 						{
-							int expected_ext = (int)(((flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame) % 32) / 4);
+							uint32_t frame_in_min = (flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame) % 32;
+							int expected_ext = (int)(frame_in_min % 4) * 2;
 							int ediff = (int)esec - expected_ext;
 							if (ediff > 4) ediff -= 8;
 							if (ediff < -4) ediff += 8;
