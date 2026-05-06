@@ -2,25 +2,28 @@
  *
  * Decides which BIW2/3/4 words go into each frame:
  *   - Mandatory placement: SSID1 every frame, SSID2 frames 0-3,
- *     Time BIW in Frame 0 Cycle 0 (top-of-hour sync).
- *   - Carousel rotation: remaining slots filled by least-recently-
- *     transmitted type, ensuring all configured types get airtime.
+ *     system message BIW101 when present.
+ *   - Time-related group (DATE, TIME, SYSINFO_TZ): fills remaining
+ *     slots via mod-3 round-robin across frames.
  *   - Constraint: at most one BIW type 101 per frame per phase.
  *   - Hard limit: 3 extra BIW words beyond BIW1 (4 total).
  *
- * Time payload computation:
- *   - Derived from cycle/frame position (not wall clock).
- *   - Wall clock provides base hour and date only.
- *   - Frame 0 Cycle 0: exact top-of-hour (xx:00:00).
- *   - Other frames: minute and second from cycle*240 + frame*1.875.
+ * Time-related BIW scheduling:
+ *   DATE, TIME, and SYSINFO_TZ are treated as a group of 3.
+ *   They are distributed across frames using abs_frame % 3 rotation:
+ *     - 3 free slots: all 3 in every frame (instant coverage).
+ *     - 2 free slots: 2 of 3 per frame, rotating which is left out.
+ *     - 1 free slot:  1 of 3 per frame, cycling through all three.
+ *   Since gcd(2^N, 3) = 1 for any collapse value N, a pager waking
+ *   every 2^N frames is guaranteed to see all 3 types within at most
+ *   3 wake cycles regardless of its base frame alignment.
  *
- * DATE/TIME scheduling:
- *   - Always eligible when queue is empty (fills idle frames).
- *   - Yields BIW capacity when messages are queued (preserves
- *     address space in block 0 for low_traffic optimization).
- *   - Re-eligible after 3 frames without time TX, even when busy
- *     (ensures all pager base frames see time updates regardless
- *     of collapse value).
+ * Time payload computation:
+ *   Per FLEX standard §3.7.2, BIW TIME encodes the time at Frame 0
+ *   of the current cycle (not the current frame).  The pager adds
+ *   frame*1.875s internally.  Since each cycle = 4 minutes:
+ *     minute = cycle * 4, second = 0 (always whole-minute boundary).
+ *   Wall clock provides base hour and date.
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -55,43 +58,17 @@ static inline int is_biw101(int type_id)
 	       type_id == BIW_CHAN_SETUP;
 }
 
-/* Return 1 if type_id is configured and eligible for this frame/cycle.
- * SSID1: every frame when configured.
- * SSID2: frames 0-3 only.
- * Time/Date: when biw_time enabled.
- * Timezone: when timezone configured.
- * System message: when content present this frame.
- * Channel setup: frames 0-3 when enabled. */
-static int is_eligible(int type_id, const flex_biw_config_t *cfg,
-		       uint32_t frame, uint32_t cycle)
-{
-	(void)cycle;
-	switch (type_id) {
-	case BIW_SSID1:      return cfg->ssid1_configured;
-	case BIW_SSID2:      return cfg->ssid2_configured && frame <= 3;
-	case BIW_TIME:       return cfg->biw_time_enabled;
-	case BIW_DATE:       return cfg->biw_time_enabled;
-	case BIW_SYSINFO_TZ: return cfg->timezone_configured;
-	case BIW_SYSINFO_MSG:return cfg->has_sysmsg;
-	case BIW_CHAN_SETUP:  return cfg->chan_setup_enabled && frame <= 3;
-	}
-	return 0;
-}
+/* Time-related BIW types in rotation order. */
+static const int time_group[] = { BIW_DATE, BIW_TIME, BIW_SYSINFO_TZ };
+#define TIME_GROUP_COUNT 3
 
 /* Select BIW words for one frame.
  *
- * Two-pass algorithm:
- *   Pass 1 -- mandatory placements (SSID1, SSID2, sysmsg, Time at F0C0).
- *   Pass 2 -- LRT rotation: fill remaining slots with the eligible type
- *             that has gone longest without transmission.
- *
- * DATE/TIME capacity management:
- *   Each BIW word consumes one slot in block 0, reducing address
- *   capacity.  When the message queue is non-empty, DATE/TIME yields
- *   its slots so addresses fit in block 0 (preserving low_traffic flag
- *   for pager battery savings).  After 3 frames without time TX, it
- *   becomes eligible again to ensure all pager base frames receive
- *   time updates regardless of system collapse value.
+ * Algorithm:
+ *   1. Mandatory placements (SSID1, SSID2, system message).
+ *   2. Fill remaining slots with time-related BIWs using mod-3
+ *      round-robin keyed on abs_frame.  SYSINFO_TZ (a BIW101) is
+ *      skipped if a system message BIW101 already occupies the frame.
  *
  * Outputs:
  *   biw_out[]  -- array of selected BIW type IDs (max BIW_MAX_EXTRA).
@@ -108,12 +85,12 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 			     flex_biw_time_val_t *time_out)
 {
 	int n = 0;
-	int has_biw101 = 0;   /* 1 once a BIW101 variant is selected */
-	int needs_time = 0;   /* 1 if any time-related BIW was picked */
-	int selected[BIW_TYPE_COUNT];
+	int has_biw101 = 0;
+	int needs_time = 0;
 	int i;
 
-	memset(selected, 0, sizeof(selected));
+	(void)carousel; /* no LRT state needed for mod-3 rotation */
+
 	if (time_out)
 		memset(time_out, 0, sizeof(*time_out));
 
@@ -122,164 +99,91 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 	/* SSID1 (type 000): every frame when configured */
 	if (cfg->ssid1_configured && n < BIW_MAX_EXTRA) {
 		biw_out[n++] = BIW_SSID1;
-		selected[BIW_SSID1] = 1;
 	}
 
 	/* SSID2 (type 111): frames 0-3 when configured */
 	if (cfg->ssid2_configured && frame <= 3 && n < BIW_MAX_EXTRA) {
 		biw_out[n++] = BIW_SSID2;
-		selected[BIW_SSID2] = 1;
 	}
 
-	/* System message BIW101 (A=0000-0011): highest-priority BIW101 */
+	/* System message BIW101 (A=0000-0011): when content present */
 	if (cfg->has_sysmsg && n < BIW_MAX_EXTRA) {
 		biw_out[n++] = BIW_SYSINFO_MSG;
-		selected[BIW_SYSINFO_MSG] = 1;
 		has_biw101 = 1;
 	}
 
-	/* Frame 0 Cycle 0: Time BIW (type 010) is mandatory.
-	 * Top-of-hour sync point -- pagers calibrate their real-time
-	 * clock from this frame. Value is set to exactly xx:00:00. */
-	if (frame == 0 && cycle == 0 && cfg->biw_time_enabled
-	    && n < BIW_MAX_EXTRA && !selected[BIW_TIME]) {
-		biw_out[n++] = BIW_TIME;
-		selected[BIW_TIME] = 1;
-		needs_time = 1;
-	}
-
-	/* ---- Pass 2: LRT rotation ----
+	/* ---- Pass 2: time-related group (mod-3 rotation) ----
 	 *
-	 * Time (010) is sent frequently — pagers need it to maintain
-	 * their clock.  Date (001) is sent less often but always paired
-	 * with Time (never alone).  This matches real network captures:
-	 *   - Most frames: Time only (1 slot)
-	 *   - Periodically: Date+Time pair (2 slots)
+	 * Fill remaining slots from {DATE, TIME, SYSINFO_TZ}.
+	 * Rotation offset = abs_frame % 3 determines priority order.
+	 * With K free slots, we pick the first K eligible types from
+	 * the rotated sequence.
 	 *
-	 * LRT age is tracked independently for BIW_DATE and BIW_TIME.
-	 * When BIW_DATE wins the LRT contest, it pulls BIW_TIME along
-	 * (requires 2 free slots).  When BIW_TIME wins alone, it's
-	 * emitted without Date (1 slot).
-	 *
-	 * Eligibility:
-	 *   - Queue empty: always eligible.
-	 *   - Queue has messages: not eligible (yield capacity to
-	 *     addresses so they fit in block 0 / low_traffic).
-	 *   - Queue has messages but last time TX was >=3 frames ago:
-	 *     eligible again (covers all pager base frames at any
-	 *     collapse value by rotating through frame positions). */
-	int time_overdue = 0;
-	if (cfg->biw_time_enabled && abs_frame > 0) {
-		uint32_t last_time = carousel->last_tx_abs[BIW_TIME];
-		if (last_time == 0 || (abs_frame - last_time) >= 3)
-			time_overdue = 1;
-	}
+	 * This guarantees that across 3 consecutive frames, all 3 types
+	 * appear.  Since gcd(2^N, 3) = 1, any pager with collapse=N
+	 * sees all 3 within 3 wake cycles. */
+	if (cfg->biw_time_enabled && n < BIW_MAX_EXTRA) {
+		int rot = (int)(abs_frame % TIME_GROUP_COUNT);
 
-	while (n < BIW_MAX_EXTRA) {
-		int best = -1;
-		uint32_t best_age = 0;
+		for (i = 0; i < TIME_GROUP_COUNT && n < BIW_MAX_EXTRA; i++) {
+			int idx = (rot + i) % TIME_GROUP_COUNT;
+			int type_id = time_group[idx];
 
-		for (i = 0; i < BIW_TYPE_COUNT; i++) {
-			if (selected[i])
+			/* SYSINFO_TZ is BIW101 — skip if one already placed */
+			if (type_id == BIW_SYSINFO_TZ && has_biw101)
 				continue;
-			if (!is_eligible(i, cfg, frame, cycle))
+			/* SYSINFO_TZ requires timezone to be configured */
+			if (type_id == BIW_SYSINFO_TZ && !cfg->timezone_configured)
 				continue;
-			/* DATE needs 2 free slots (it always brings TIME) */
-			if (i == BIW_DATE && (BIW_MAX_EXTRA - n) < 2)
-				continue;
-			/* Skip DATE/TIME when queue busy and not overdue */
-			if ((i == BIW_DATE || i == BIW_TIME)
-			    && cfg->queue_has_messages && !time_overdue)
-				continue;
-			if (is_biw101(i) && has_biw101)
-				continue;
-		/* last_tx_abs == 0 means never transmitted -- wins. */
-			if (best < 0 || carousel->last_tx_abs[i] < best_age) {
-				best = i;
-				best_age = carousel->last_tx_abs[i];
-			}
-		}
 
-		if (best < 0)
-			break; /* no more eligible types */
-
-		/* DATE always brings TIME along (never sent alone). */
-		if (best == BIW_DATE) {
-			biw_out[n++] = BIW_DATE;
-			biw_out[n++] = BIW_TIME;
-			selected[BIW_DATE] = 1;
-			selected[BIW_TIME] = 1;
-			needs_time = 1;
-		} else {
-			biw_out[n++] = best;
-			selected[best] = 1;
-			if (is_biw101(best))
+			biw_out[n++] = type_id;
+			if (is_biw101(type_id))
 				has_biw101 = 1;
-			if (best == BIW_TIME || best == BIW_SYSINFO_TZ)
-				needs_time = 1;
+			needs_time = 1;
 		}
 	}
 
-	/* ---- Compute time values from cycle/frame position ----
+	/* ---- Compute time values ----
 	 *
-	 * Per the FLEX standard (§3.7.2): "The Time transmitted in the BIW
-	 * reflects the Present Local Time at the leading edge of the first
-	 * bit of Bit Sync 1 of Frame 0 for the current Cycle."
+	 * Per FLEX standard §3.7.2: BIW TIME encodes the time at Frame 0
+	 * of the current cycle.  The pager adds frame*1.875s internally.
+	 * Since cycle*240s is always a whole number of minutes:
+	 *   minute = cycle * 4, second = 0.
 	 *
-	 * The pager knows its frame number (from FIW) and adds frame*1.875s
-	 * internally to derive the current time.  We encode only the time
-	 * at Frame 0 of this cycle:
-	 *
-	 *   minute = cycle * 4  (each cycle = 128 frames = 240s = 4 min)
-	 *   second = 0          (Frame 0 is always at a minute boundary)
-	 *
-	 * The companion ext_sec field (in BIW SYSINFO) would encode any
-	 * fractional-second offset between the frame grid and the clock
-	 * reference.  In our implementation the grid is clock-synchronized,
-	 * so ext_sec = 0.  Real infrastructure with GPS/frame misalignment
-	 * may use non-zero ext_sec.
-	 *
-	 * Wall clock provides base hour and date. */
+	 * Wall clock provides hour and date. */
 	if (needs_time && time_out) {
 		time_t now = time(NULL);
 		struct tm tm_val;
 
 		localtime_r(&now, &tm_val);
 
-		/* Time at Frame 0 of this cycle.
-		 * Each cycle = 4 minutes, so minute = cycle*4, second = 0.
-		 * Pager offsets by frame*1.875s to get current time. */
-		int minute = (int)cycle * 4;
-		int sec_quant = 0;
-
 		time_out->top_of_hour = (frame == 0 && cycle == 0) ? 1 : 0;
 		time_out->hour   = (uint32_t)tm_val.tm_hour;
-		time_out->minute = (uint32_t)minute;
-		time_out->second = (uint32_t)sec_quant;
+		time_out->minute = (uint32_t)((int)cycle * 4);
+		time_out->second = 0;
 
-		/* Date from wall clock. */
 		time_out->year  = (uint32_t)(tm_val.tm_year + 1900);
 		time_out->month = (uint32_t)(tm_val.tm_mon + 1);
 		time_out->day   = (uint32_t)tm_val.tm_mday;
 
-		/* Timezone: caller sets from flex->timezone_code. */
 		time_out->tz_code = -1;
 		time_out->valid = 1;
 	}
 
 	*n_biw_out = n;
 
-	/* Debug: log when DATE/TIME is selected */
+	/* Debug log */
 	if (n > 0) {
-		int has_date = 0, has_time = 0;
+		int has_date = 0, has_time = 0, has_tz = 0;
 		for (i = 0; i < n; i++) {
 			if (biw_out[i] == BIW_DATE) has_date = 1;
 			if (biw_out[i] == BIW_TIME) has_time = 1;
+			if (biw_out[i] == BIW_SYSINFO_TZ) has_tz = 1;
 		}
-		if (has_date || has_time) {
+		if (has_date || has_time || has_tz) {
 			LOGP(DFLEX, LOGL_INFO,
-			     "BIW carousel: C%u/F%u selected DATE=%d TIME=%d\n",
-			     cycle, frame, has_date, has_time);
+			     "BIW carousel: C%u/F%u selected DATE=%d TIME=%d TZ=%d\n",
+			     cycle, frame, has_date, has_time, has_tz);
 		}
 	}
 
@@ -287,8 +191,7 @@ int flex_biw_carousel_select(flex_biw_carousel_t *carousel,
 }
 
 /* Update carousel state after a frame has been encoded.
- * Records the absolute frame number for each transmitted BIW type
- * so the LRT rotation knows which type is oldest next time. */
+ * Records the absolute frame number for each transmitted BIW type. */
 void flex_biw_carousel_update(flex_biw_carousel_t *carousel,
 			      const int *biw_types, int n_biw,
 			      uint32_t abs_frame)
