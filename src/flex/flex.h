@@ -845,6 +845,23 @@ typedef struct flex {
 			uint32_t	tz_ring_zone[FLEX_VOTE_RING];
 			int		tz_ring_dst[FLEX_VOTE_RING];
 			uint32_t	tz_ring_esec[FLEX_VOTE_RING];
+
+			/* --- Time mode detection (standard vs direct) ---
+			 * Standard: TIME constant for entire cycle.
+			 * Direct: TIME changes every 4 frames (second ticks).
+			 * Detect by comparing TIME across frames >= 4 apart
+			 * in the same cycle. */
+			int		tmode_detected;	/* -1=unknown, 0=standard, 1=direct */
+			int		tmode_votes_std;
+			int		tmode_votes_dir;
+			uint32_t	tmode_last_min;
+			uint32_t	tmode_last_sec;
+			uint32_t	tmode_last_frame;
+			uint32_t	tmode_last_cycle;
+			int		tmode_last_valid;
+
+			/* Last printed flextime line (suppress duplicates) */
+			char		flextime_last[80];
 		} biw[FLEX_RX_POLARITIES];
 
 		/* Fragment reassembly state.

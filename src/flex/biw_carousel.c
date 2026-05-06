@@ -19,7 +19,7 @@
  *   3 wake cycles regardless of its base frame alignment.
  *
  * Time payload computation:
- *   Per FLEX standard §3.7.2, BIW TIME encodes the time at Frame 0
+ *   Per FLEX standard S3.7.2, BIW TIME encodes the time at Frame 0
  *   of the current cycle (not the current frame).  The pager adds
  *   frame*1.875s internally.  Since each cycle = 4 minutes:
  *     minute = cycle * 4, second = 0 (always whole-minute boundary).

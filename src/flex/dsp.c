@@ -1874,6 +1874,60 @@ static int flex_build_word_status(flex_phase_data_t *ph, int start, int end,
  * BCH words on noisy signals.
  */
 
+/* Output flextime whenever a confirmed component changes.
+ * Builds a complete line with all known components and only
+ * prints if it differs from the last output (suppresses duplicates). */
+static void flextime_output(struct flex *flex, int pol)
+{
+	typeof(flex->rx.biw[pol]) *b = &flex->rx.biw[pol];
+	char line[80];
+	int pos = 0;
+
+	/* Need at least time to output anything */
+	if (!b->seen_time)
+		return;
+
+	/* Date */
+	if (b->seen_date)
+		pos += snprintf(line + pos, sizeof(line) - pos, "%04d-%02u-%02u ",
+				b->date_year, b->date_month, b->date_day);
+
+	/* Compute corrected time */
+	double base_sec = (double)b->time_minute * 60.0 +
+			  (double)b->time_second * 7.5;
+	uint32_t esec = b->seen_timezone ? b->timezone_extsec : 0;
+	base_sec += (double)esec * 0.9375;
+
+	if (b->tmode_detected == 0)
+		base_sec += (double)flex->rx.fiw_frame * 1.875;
+
+	int hour = (int)b->time_hour;
+	int minute = (int)(base_sec / 60.0);
+	double sec = base_sec - (double)minute * 60.0;
+	if (minute >= 60) { minute -= 60; hour = (hour + 1) % 24; }
+
+	pos += snprintf(line + pos, sizeof(line) - pos, "%02d:%02d:%05.2f",
+			hour, minute, sec);
+
+	/* Timezone */
+	if (b->seen_timezone) {
+		char tzbuf[20];
+		flex_tz_format(b->timezone_offset_min, tzbuf, sizeof(tzbuf));
+		pos += snprintf(line + pos, sizeof(line) - pos, " %s DST=%s esec=%u",
+				tzbuf, b->timezone_dst ? "off" : "on", esec);
+	}
+
+	/* Mode */
+	pos += snprintf(line + pos, sizeof(line) - pos, " [%s]",
+			b->tmode_detected == 0 ? "standard" : "direct");
+
+	/* Only print if changed */
+	if (strcmp(line, b->flextime_last) != 0) {
+		snprintf(b->flextime_last, sizeof(b->flextime_last), "%s", line);
+		LOGP_CHAN(DDSP, LOGL_NOTICE, "RX: flextime: %s\n", line);
+	}
+}
+
 /* Cross-validate BIW TIME minute against FIW cycle position.
  *
  * Two conventions exist in the wild:
@@ -2443,6 +2497,7 @@ parse_phase:
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
 								  "RX: flextime DATE confirmed (%d/%d agree): %04d-%02u-%02u\n",
 								  agree, b->date_ring_count, real, mon, day);
+							flextime_output(flex, pol);
 						}
 					}
 					break;
@@ -2497,9 +2552,73 @@ parse_phase:
 							b->time_minute = min;
 							b->time_second = sec;
 							b->seen_time = 1;
-							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: flextime TIME confirmed after %d votes: %02u:%02u:%04.1f\n",
-								  FLEX_VOTE_THRESHOLD, hour, min, sec * 7.5);
+							/* Compute actual current time based on mode */
+							if (b->tmode_detected == 0) {
+								/* Standard: add frame*1.875s to BIW TIME */
+								double biw_sec = (double)min * 60.0 + (double)sec * 7.5;
+								double frame_ofs = (double)flex->rx.fiw_frame * 1.875;
+								double actual_sec = biw_sec + frame_ofs;
+								int act_min = (int)(actual_sec / 60.0);
+								double act_sec_fine = actual_sec - act_min * 60.0;
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: flextime TIME confirmed after %d votes: %02u:%02u:%04.1f (actual %02u:%02u:%04.1f, standard mode)\n",
+									  FLEX_VOTE_THRESHOLD, hour, min, sec * 7.5,
+									  hour, act_min, act_sec_fine);
+							} else {
+								/* Direct: BIW TIME is the actual time */
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: flextime TIME confirmed after %d votes: %02u:%02u:%04.1f (direct mode)\n",
+									  FLEX_VOTE_THRESHOLD, hour, min, sec * 7.5);
+							}
+							flextime_output(flex, pol);
+						}
+						/* Time mode detection: standard vs direct.
+						 * Standard: TIME is identical for all frames in a cycle.
+						 * Direct: second field changes every 4 frames.
+						 * With frame_diff >= 5, two observations are guaranteed
+						 * to be in different 4-frame groups, so in direct mode
+						 * the second field MUST differ.
+						 * Same TIME with >= 5 frame separation -> standard.
+						 * Different TIME with >= 5 frame separation -> direct.
+						 * Anchor only updates after a conclusive comparison
+						 * or on new cycle, so consecutive frames don't
+						 * overwrite it before the gap is reached. */
+						if (b->tmode_last_valid &&
+						    b->tmode_last_cycle == flex->rx.fiw_cycle) {
+							int fdiff = (int)flex->rx.fiw_frame - (int)b->tmode_last_frame;
+							if (fdiff < 0) fdiff = -fdiff;
+							if (fdiff >= 5) {
+								int same = (min == b->tmode_last_min &&
+									    sec == b->tmode_last_sec);
+								if (same) {
+									b->tmode_votes_std++;
+									b->tmode_votes_dir = 0;
+								} else {
+									b->tmode_votes_dir++;
+									b->tmode_votes_std = 0;
+								}
+								if (b->tmode_votes_std >= 3 && b->tmode_detected != 0) {
+									b->tmode_detected = 0;
+									LOGP_CHAN(DDSP, LOGL_NOTICE,
+										  "RX: flextime mode detected: STANDARD (Frame 0 time)\n");
+								}
+								if (b->tmode_votes_dir >= 3 && b->tmode_detected != 1) {
+									b->tmode_detected = 1;
+									LOGP_CHAN(DDSP, LOGL_NOTICE,
+										  "RX: flextime mode detected: DIRECT (current frame time)\n");
+								}
+								/* Update anchor after comparison */
+								b->tmode_last_min = min;
+								b->tmode_last_sec = sec;
+								b->tmode_last_frame = flex->rx.fiw_frame;
+							}
+						} else {
+							/* New cycle or first observation: set anchor */
+							b->tmode_last_min = min;
+							b->tmode_last_sec = sec;
+							b->tmode_last_frame = flex->rx.fiw_frame;
+							b->tmode_last_cycle = flex->rx.fiw_cycle;
+							b->tmode_last_valid = 1;
 						}
 					}
 					break;
@@ -2570,6 +2689,7 @@ parse_phase:
 									  agree, b->tz_ring_count, zone,
 									  flex_tz_format(tz_min, tzbuf, sizeof(tzbuf)),
 									  dst, esec);
+								flextime_output(flex, pol);
 							}
 						}
 					} else if (a_type <= FLEX_BIW_SYSINFO_A_MSG_SSID) {

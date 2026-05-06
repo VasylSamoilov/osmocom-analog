@@ -190,9 +190,9 @@ void print_help(const char *arg0)
 	printf("        Disable baseband low-pass filter.\n");
 	printf("    --biw-datetime <auto|yyyy-mm-dd|yyyy-mm-dd hh:mm:ss>\n");
 	printf("        Enable BIW Date (001) + Time (010) broadcast.\n");
-	printf("        auto                  — use current system clock.\n");
-	printf("        yyyy-mm-dd            — override date, keep current time.\n");
-	printf("        yyyy-mm-dd hh:mm:ss   — fixed start time (offset calculated).\n");
+	printf("        auto                  - use current system clock.\n");
+	printf("        yyyy-mm-dd            - override date, keep current time.\n");
+	printf("        yyyy-mm-dd hh:mm:ss   - fixed start time (offset calculated).\n");
 	printf("        Time is calculated from frame position, not wall clock.\n");
 	printf("        Transmitted at F0C0 (mandatory) and every ~30s.\n");
 	printf("    --no-biw-datetime\n");
@@ -208,10 +208,10 @@ void print_help(const char *arg0)
 	printf("          Does not require --biw-sysinfo.\n");
 	printf("    --biw-sysinfo <auto[,extsec]|tz_offset,dst[,extsec]>\n");
 	printf("        Enable BIW SysInfo (101, A=0101) timezone/DST broadcast.\n");
-	printf("        auto          — detect timezone and DST from system clock.\n");
-	printf("        auto,N        — same, with ext_sec=N (0-7, default 0).\n");
-	printf("        tz_offset,dst — e.g. +2,on or -5,off or +5:30,off\n");
-	printf("        tz_offset,dst,N — same, with ext_sec=N.\n");
+	printf("        auto          - detect timezone and DST from system clock.\n");
+	printf("        auto,N        - same, with ext_sec=N (0-7, default 0).\n");
+	printf("        tz_offset,dst - e.g. +2,on or -5,off or +5:30,off\n");
+	printf("        tz_offset,dst,N - same, with ext_sec=N.\n");
 	printf("        ext_sec: sub-second time trim in 0.9375s steps (0-7).\n");
 	printf("          Adds N*0.9375s to the pager's reconstructed time.\n");
 	printf("          Use 0 (default) when frame grid is clock-synchronized.\n");
