@@ -3660,14 +3660,17 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 				}
 				break;
 			case BIW_SYSINFO_TZ: {
-				/* Timezone/DST BIW101 (A=0100) */
+				/* Timezone/DST BIW101 (A=0101: Additional Time Instruction).
+				 * A=0101 is the correct type when no system message text
+				 * accompanies the time data.  A=0100 implies an Operator
+				 * Messaging Address with a message in the frame (§3.7.2). */
 				uint32_t tz_info = (uint32_t)params->biw_tz_code & FLEX_BIW_SYSINFO_TZ_MASK;
 				if (params->biw_dst)
 					tz_info |= (1U << FLEX_BIW_SYSINFO_DST_SHIFT);
 				tz_info |= ((params->biw_ext_seconds & FLEX_BIW_SYSINFO_EXTSEC_MASK)
 					    << FLEX_BIW_SYSINFO_EXTSEC_SHIFT);
 				frame_words[fwc++] = flex_create_biw_sysinfo(
-					FLEX_BIW_SYSINFO_A_TIME, tz_info);
+					FLEX_BIW_SYSINFO_A_TIME_ADD, tz_info);
 				{
 					int tz_min = flex_tz_to_minutes((uint32_t)params->biw_tz_code);
 					char tzbuf[20];

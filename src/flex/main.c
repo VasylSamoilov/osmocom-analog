@@ -195,7 +195,7 @@ void print_help(const char *arg0)
 	printf("    --no-biw-datetime\n");
 	printf("        Disable BIW date/time broadcast.\n");
 	printf("    --biw-sysinfo <auto|tz_offset,dst>\n");
-	printf("        Enable BIW SysInfo (101, A=0100) timezone/DST broadcast.\n");
+	printf("        Enable BIW SysInfo (101, A=0101) timezone/DST broadcast.\n");
 	printf("        auto        — detect timezone and DST from system clock.\n");
 	printf("        tz_offset,dst — e.g. +2,on or -5,off or +5:30,off\n");
 	printf("        Never in same frame as Date/Time — follows 1-3 frames behind.\n");
