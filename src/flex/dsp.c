@@ -5758,8 +5758,6 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 			flex->rx.data_bita_close = 0;
 			flex->rx.data_bitb_close = 0;
 			flex->rx.data_sym_total = 0;
-			memset(flex->rx.data_dc_q, 0, sizeof(flex->rx.data_dc_q));
-			memset(flex->rx.data_dc_qn, 0, sizeof(flex->rx.data_dc_qn));
 
 			/* Log only when something noteworthy happens.
 			 * Normal case (no correction) is silent — blind
@@ -5849,23 +5847,52 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 				sa[si] = n > 0 ? flex->rx.data_sym_sum[si] / n : 0;
 				sd[si] = n > 1 ? sqrt(flex->rx.data_sym_sum2[si] / n - sa[si] * sa[si]) : 0;
 			}
+			/* Per-frame demodulator statistics log (INFO level).
+			 *   dc:    residual DC in the DC-corrected signal (should be ~0)
+			 *   env:   signal envelope (mean |sample| from S1 preamble)
+			 *   sd:    per-level standard deviation [sym0/sym1/sym2/sym3]
+			 *          (high sd on one level = slicer threshold problem)
+			 *   bita:  symbols where bit_a vote margin < 60% (zero-crossing errors)
+			 *   bitb:  symbols where bit_b vote margin < 60% / total symbols
+			 *          (inner/outer threshold errors — the 4FSK-specific metric) */
 			LOGP_CHAN(DDSP, LOGL_INFO,
 				  "RX: DATA complete (C%u/F%u), %dbps/%dFSK, "
 				  "afc=%+.0fHz dc=%.4f env=%.4f "
 				  "sd=%.2f/%.2f/%.2f/%.2f "
-				  "close: bita=%d bitb=%d/%d "
-				  "dc_q=%.3f/%.3f/%.3f/%.3f.\n",
+				  "close: bita=%d bitb=%d/%d.\n",
 				  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 				  bps, flex->rx.sync_levels,
 				  afc_corr, data_dc, flex->rx.pll_envelope,
 				  sd[0], sd[1], sd[2], sd[3],
 				  flex->rx.data_bita_close,
 				  flex->rx.data_bitb_close,
-				  flex->rx.data_sym_total,
-				  flex->rx.data_dc_qn[0] > 0 ? flex->rx.data_dc_q[0]/flex->rx.data_dc_qn[0] : 0,
-				  flex->rx.data_dc_qn[1] > 0 ? flex->rx.data_dc_q[1]/flex->rx.data_dc_qn[1] : 0,
-				  flex->rx.data_dc_qn[2] > 0 ? flex->rx.data_dc_q[2]/flex->rx.data_dc_qn[2] : 0,
-				  flex->rx.data_dc_qn[3] > 0 ? flex->rx.data_dc_q[3]/flex->rx.data_dc_qn[3] : 0);
+				  flex->rx.data_sym_total);
+			/* Detailed demodulator internals (DEBUG level).
+			 *   sym_mean: mean sample value per slicer bin [sym0/sym1/sym2/sym3]
+			 *             ideal: -env / -env/3 / +env/3 / +env (~-0.87/-0.29/+0.29/+0.87)
+			 *   sym_n:   number of samples classified into each bin
+			 *            (unequal counts reveal DC offset or threshold misplacement)
+			 *   thr:     inner/outer slicer threshold (env * 0.667)
+			 *   dc_frozen: DC offset value frozen at DATA entry (from S1 preamble)
+			 *   pos/neg: mean positive/negative sample levels from S1 (asymmetry check)
+			 *   env_n:   total samples used to compute envelope during S1 */
+			LOGP_CHAN(DDSP, LOGL_DEBUG,
+				  "RX: DATA demod (C%u/F%u): "
+				  "sym_mean=%.3f/%.3f/%.3f/%.3f "
+				  "sym_n=%d/%d/%d/%d "
+				  "thr=%.4f dc_frozen=%.4f "
+				  "pos=%.4f neg=%.4f env_n=%d.\n",
+				  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+				  sa[0], sa[1], sa[2], sa[3],
+				  flex->rx.data_sym_count[0],
+				  flex->rx.data_sym_count[1],
+				  flex->rx.data_sym_count[2],
+				  flex->rx.data_sym_count[3],
+				  flex->rx.pll_envelope * SLICE_THRESHOLD,
+				  flex->rx.pll_zero,
+				  flex->rx.pll_pos_level,
+				  flex->rx.pll_neg_level,
+				  flex->rx.pll_envelope_count);
 			flex_rx_decode_data(flex);
 			/* Return to sync hunting at 1600 baud / 2FSK */
 			flex->rx.baud = 1600;
@@ -5896,33 +5923,33 @@ static int flex_rx_build_symbol(flex_t *flex, double sample)
 
 	/* DC offset removal (IIR filter).
 	 * Fast tracking during sync hunting (S1) to acquire DC level.
-	 * Slow tracking during data to follow transmitter drift without
-	 * being biased by short-term symbol asymmetry. The 4FSK symbol
-	 * distribution is symmetric over many symbols, so the long-term
-	 * average converges to the true DC offset. This keeps the
-	 * zero-crossing slicer centered, preventing bit_a (phases A/C)
-	 * errors from DC drift during the 1.875s frame. */
+	 * Slow tracking during FIW and S2 to refine the estimate.
+	 * FROZEN during DATA: the 4FSK symbol distribution is NOT
+	 * guaranteed to be DC-balanced over short intervals, so tracking
+	 * during DATA causes the filter to chase data content and shift
+	 * the slicer threshold, destroying bit_b (phases B/D).
+	 * The S1 preamble (symmetric 2FSK) provides a reliable DC
+	 * estimate that remains valid for the 1.875s frame duration. */
 	{
-		double dc_tau;
-		if (flex->rx.rx_state == RX_STATE_SYNC1)
-			dc_tau = flex->rx.sample_freq * DC_OFFSET_FILTER;
-		else
-			dc_tau = flex->rx.sample_freq * DC_OFFSET_FILTER_DATA;
-		flex->rx.pll_zero = (flex->rx.pll_zero * dc_tau + sample) /
-				    (dc_tau + 1);
+		if (flex->rx.rx_state != RX_STATE_DATA) {
+			double dc_tau;
+			if (flex->rx.rx_state == RX_STATE_SYNC1)
+				dc_tau = flex->rx.sample_freq * DC_OFFSET_FILTER;
+			else
+				dc_tau = flex->rx.sample_freq * DC_OFFSET_FILTER_DATA;
+			flex->rx.pll_zero = (flex->rx.pll_zero * dc_tau + sample) /
+					    (dc_tau + 1);
+		}
 	}
+
 	sample -= flex->rx.pll_zero;
 
-	/* Track DC during DATA for diagnostics */
+	/* Track residual DC during DATA for diagnostics (cheap: one add per sample).
+	 * Since DC is frozen during DATA, this measures how well the S1-derived
+	 * DC estimate matches the actual signal center during data. */
 	if (flex->rx.rx_state == RX_STATE_DATA) {
 		flex->rx.data_dc_sum += sample;
 		flex->rx.data_dc_count++;
-		/* Per-quarter DC tracking */
-		int expected = flex->rx.sync_baud * 1760 / 1000;
-		int q = (expected > 0) ? (4 * flex->rx.data_count / expected) : 0;
-		if (q > 3) q = 3;
-		flex->rx.data_dc_q[q] += sample;
-		flex->rx.data_dc_qn[q]++;
 	}
 
 	if (flex->rx.pll_locked) {

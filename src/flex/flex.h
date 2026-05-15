@@ -638,9 +638,6 @@ typedef struct flex {
 		 * demodulator, consumed by flex_rx_read_data) */
 		int		sym_bita_low;		/* 1 = bit_a had close vote */
 		int		sym_bitb_low;		/* 1 = bit_b had close vote */
-		/* Per-quarter DC tracking (detect intra-frame freq jumps) */
-		double		data_dc_q[4];		/* DC sum per quarter */
-		int		data_dc_qn[4];		/* sample count per quarter */
 		int		pll_nonconsec;		/* non-consecutive zero crossings */
 		int		pll_timeout;		/* timeout counter */
 		uint64_t	pll_sample_count;	/* total samples processed */
