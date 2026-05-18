@@ -120,6 +120,10 @@ typedef struct flex_msg {
 						 * set by flex_tempgroup_enqueue(), -1 = normal.
 						 * Frame builder uses FLEX_ADDR_TEMPORARY_MIN + slot
 						 * as address word (§3.8.2.3). NOT user-settable. */
+	int			pinned;			/* 1 = message has a hard frame deadline
+						 * (temp group SETUP or DELIVERY).
+						 * Scheduled in dedicated pass before normal
+						 * messages to guarantee frame placement. */
 	char			source_id[64];		/* source/callback identifier ('\0' = none) */
 	int			short_msg_type;		/* FLEX_SMSG_TYPE_* (0-3, default 0=numeric) */
 	int			short_msg_source;	/* source code S (0-7) for t=01/10 */
@@ -286,6 +290,12 @@ typedef struct flex_tx_polarity {
 		uint32_t	setup_abs;
 		flex_msg_t	*delivery_msg;
 	} tx_temp[FLEX_TEMP_ADDR_SLOTS];
+
+	/* Round-robin tracker for temp group slot allocation.
+	 * Stores the last allocated slot index (0-15), or -1 if
+	 * no slot has been allocated yet.  Initialized to -1 in
+	 * flex_create() so first allocation starts at slot 0. */
+	int			last_tg_slot;
 
 	/* Last frame transmitted on this polarity */
 	uint32_t		last_abs_frame;
@@ -773,7 +783,11 @@ typedef struct flex {
 		 *      non-fragmented message type like tone/numeric), OR
 		 *   b) 128 frames elapse without delivery (timeout, ~2 minutes).
 		 *
-		 * Each phase has its own independent set of 16 slots.
+		 * Slots are shared across all phases — SETUP instructions
+		 * from any phase accumulate members into the same slot.
+		 * The DELIVERY is sent once in one phase (determined by the
+		 * temporary address capcode), and all members receive it
+		 * regardless of which phase their SETUP appeared in.
 		 * Each slot can have up to FLEX_TEMP_GROUP_MAX_MEMBERS
 		 * capcodes assigned. */
 		struct {
@@ -783,7 +797,7 @@ typedef struct flex {
 			uint32_t	setup_cycle;	/* cycle number where SETUP was observed */
 			int		count;		/* number of capcodes assigned */
 			int		active;		/* 1 = assignment active, 0 = empty */
-		} temp_addr_map[FLEX_RX_POLARITIES][FLEX_MAX_PHASES][FLEX_TEMP_ADDR_SLOTS];
+		} temp_addr_map[FLEX_RX_POLARITIES][FLEX_TEMP_ADDR_SLOTS];
 
 		/* BIW state -- track SSID/coverage/timezone/date/time across frames.
 		 * Log at NOTICE level when values change, DEBUG when repeated.
@@ -954,7 +968,8 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 			   const int *collapses, int count,
 			   enum flex_msg_type msg_type, const char *data,
 			   int data_length, int speed, int modulation_type,
-			   double polarity, int priority, int phase);
+			   double polarity, int priority, int phase,
+			   int mail_drop);
 void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame);
 
 #endif /* FLEX_H */

@@ -490,28 +490,29 @@ void flex_msg_destroy(flex_msg_t *msg)
 
 /* ===== TX Temporary Group Scheduling ===== */
 
-/* Frames of margin between last SETUP and DELIVERY target frame.
- *
- * Per §5.2.1: "The Frame in which the Temporary Address is transmitted
- * is any Frame except the first subsequent Frame after the multiple
- * transmission for the page including the Short Instruction Vector
- * is completed."
- *
- * This means a minimum gap of 2 frames: skip the first frame after
- * SETUP completes, DELIVERY can start on the 2nd frame or later.
- * We use 4 frames for safety margin (queue processing headroom). */
-#define FLEX_TG_SETUP_MARGIN	4
-
-/* Frames of lead time before first SETUP (queue processing headroom) */
+/* Frames of lead time before first SETUP.
+ * Must account for ERS burst if one will be triggered.
+ * ERS duration = ers_cycles * 96 bits / bitrate / 1.875 sec per frame.
+ * If the system is idle (no ERS done yet), an ERS will be triggered
+ * when the first message is enqueued, so we must skip past it. */
 #define FLEX_TG_QUEUE_LEAD	2
 
-/* Allocate a free temp slot for a given polarity. Returns 0-15, or -1 if all occupied. */
+/* Allocate a free temp slot for a given polarity using round-robin.
+ * Starts from the slot after the last allocated one, wrapping around.
+ * First allocation starts at slot 0 (last_tg_slot initialized to -1).
+ * Returns 0-15, or -1 if all occupied. */
 static int flex_tg_alloc_slot(flex_t *flex, int pol)
 {
-	int i;
+	int i, idx;
+	int last = flex->tx_pol[pol].last_tg_slot;
+	int start = (last + 1) % FLEX_TEMP_ADDR_SLOTS;
+
 	for (i = 0; i < FLEX_TEMP_ADDR_SLOTS; i++) {
-		if (flex->tx_pol[pol].tx_temp[i].state == FLEX_TG_FREE)
-			return i;
+		idx = (start + i) % FLEX_TEMP_ADDR_SLOTS;
+		if (flex->tx_pol[pol].tx_temp[idx].state == FLEX_TG_FREE) {
+			flex->tx_pol[pol].last_tg_slot = idx;
+			return idx;
+		}
 	}
 	return -1;
 }
@@ -548,12 +549,13 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 			   const int *collapses, int count,
 			   enum flex_msg_type msg_type, const char *data,
 			   int data_length, int speed, int modulation_type,
-			   double polarity, int priority, int phase)
+			   double polarity, int priority, int phase,
+			   int mail_drop)
 {
 	int slot, i, pol;
 	uint32_t target_frame;
 	flex_frame_time_t ft;
-	uint32_t abs_frame, current_frame;
+	uint32_t abs_frame;
 	/* Per-pager: absolute frame when SETUP should be sent */
 	uint32_t setup_abs[FLEX_TEMP_GROUP_MAX_MEMBERS];
 	uint32_t first_setup_abs, last_setup_abs, delivery_abs;
@@ -590,44 +592,85 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 	} else {
 		abs_frame = ft.cycle * 128 + ft.frame;
 	}
-	current_frame = abs_frame % 128;
 
-	/* --- Compute exact frame for each SETUP --- */
-	first_setup_abs = UINT32_MAX;
-	last_setup_abs = 0;
+	/* --- Compute exact absolute frame for each SETUP ---
+	 *
+	 * Each SETUP must land on a collapse-aligned frame for its capcode.
+	 * We find the first such frame at or after (abs_frame + lead).
+	 * All arithmetic is in absolute frame space to avoid wrap issues. */
+	{
+		uint32_t earliest_abs = abs_frame + FLEX_TG_QUEUE_LEAD;
 
-	for (i = 0; i < count; i++) {
-		flex_capcode_sched_t sched;
-		int m;
-		uint32_t next_f, delta;
+		first_setup_abs = UINT32_MAX;
+		last_setup_abs = 0;
 
-		flex_scheduler_capcode_info(capcodes[i], &sched);
-		m = (collapses && collapses[i] >= 0) ? collapses[i] : sys_collapse;
+		for (i = 0; i < count; i++) {
+			flex_capcode_sched_t sched;
+			int m;
+			uint32_t period, target, frame_mod;
 
-		/* Next collapse-aligned frame number (may be > 127).
-		 * Start from current + lead time so the message is
-		 * safely queued before the scheduler reaches that frame. */
-		next_f = flex_scheduler_next_frame(current_frame + FLEX_TG_QUEUE_LEAD,
-						   sched.assigned_frame, m);
+			flex_scheduler_capcode_info(capcodes[i], &sched);
+			m = (collapses && collapses[i] >= 0) ? collapses[i] : sys_collapse;
 
-		/* Convert to absolute frame */
-		delta = next_f - current_frame;
-		setup_abs[i] = abs_frame + delta;
+			if (m <= 0) {
+				/* collapse=0: any frame is valid */
+				setup_abs[i] = earliest_abs;
+			} else {
+				/* Find first frame >= earliest_abs where
+				 * (frame % 128) % period == assigned_frame % period */
+				period = 1U << m;
+				target = sched.assigned_frame % period;
+				frame_mod = (earliest_abs % 128) % period;
 
-		if (setup_abs[i] < first_setup_abs)
-			first_setup_abs = setup_abs[i];
-		if (setup_abs[i] > last_setup_abs)
-			last_setup_abs = setup_abs[i];
+				if (frame_mod <= target)
+					setup_abs[i] = earliest_abs + (target - frame_mod);
+				else
+					setup_abs[i] = earliest_abs + (period - frame_mod + target);
+			}
 
-		LOGP(DFLEX, LOGL_INFO,
-		     "TX: tempgroup SETUP[%d] cap=%" PRIu64 " collapse=%d "
-		     "assigned_frame=%u pinned_frame=%u (abs=%u)\n",
-		     i, capcodes[i], m, sched.assigned_frame,
-		     setup_abs[i] % 128, setup_abs[i]);
+			if (setup_abs[i] < first_setup_abs)
+				first_setup_abs = setup_abs[i];
+			if (setup_abs[i] > last_setup_abs)
+				last_setup_abs = setup_abs[i];
+
+			LOGP(DFLEX, LOGL_INFO,
+			     "TX: tempgroup SETUP[%d] cap=%" PRIu64 " collapse=%d "
+			     "assigned_frame=%u pinned_frame=%u (abs=%u)\n",
+			     i, capcodes[i], m, sched.assigned_frame,
+			     setup_abs[i] % 128, setup_abs[i]);
+		}
 	}
 
-	/* --- Compute frame N (DELIVERY) --- */
-	delivery_abs = last_setup_abs + FLEX_TG_SETUP_MARGIN;
+	/* --- Compute frame N (DELIVERY) ---
+	 *
+	 * The delivery frame must be AFTER the last actual transmission
+	 * of ALL SETUPs.  With num_transmissions > 1, each SETUP is
+	 * retransmitted on successive collapse-aligned frames:
+	 *   last_tx_for_member_i = setup_abs[i] + (num_tx - 1) * 2^collapse_i
+	 *
+	 * Per §5.2.1: "The Frame in which the Temporary Address is
+	 * transmitted is any Frame except the first subsequent Frame
+	 * after the multiple transmission for the page including the
+	 * Short Instruction Vector is completed."
+	 *
+	 * Algorithm:
+	 *   1. Compute actual_last_setup = max over all members of
+	 *      setup_abs[i] + (num_tx - 1) * 2^collapse_i
+	 *   2. Delivery = actual_last_setup + 2 (skip one frame per §5.2.1) */
+	{
+		uint32_t actual_last_setup_abs = 0;
+
+		for (i = 0; i < count; i++) {
+			int m = (collapses && collapses[i] >= 0) ? collapses[i] : sys_collapse;
+			uint32_t period = (m > 0) ? (1U << m) : 1;
+			uint32_t last_tx = setup_abs[i]
+					 + (uint32_t)(flex->num_transmissions - 1) * period;
+			if (last_tx > actual_last_setup_abs)
+				actual_last_setup_abs = last_tx;
+		}
+
+		delivery_abs = actual_last_setup_abs + 2;
+	}
 	target_frame = delivery_abs % 128;
 
 	/* First DELIVERY must start within 128 frames of first SETUP */
@@ -681,7 +724,7 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 		msg->speed = speed;
 		msg->modulation_type = modulation_type;
 		msg->polarity = polarity;
-		msg->priority = 1;
+		msg->pinned = 1;
 		if (phase >= 0)
 			msg->phase = phase;
 
@@ -695,14 +738,9 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 		     idata, setup_abs[i]);
 	}
 
-	/* --- Create DELIVERY message, pinned to frame N --- */
+	/* --- Create single DELIVERY message, pinned to frame N --- */
 	{
 		flex_msg_t *msg;
-		/* Use the real temp-slot capcode so logs, phase assignment,
-		 * fragmentation sizing, and N-counter all work correctly.
-		 * capcode = FLEX_ADDR_TEMPORARY_MIN + slot - SHORT_ADDR_OFFSET
-		 * The frame builder still uses temp_delivery_slot to encode
-		 * the address word, so the over-the-air format is unchanged. */
 		uint64_t delivery_capcode = (uint64_t)(FLEX_ADDR_TEMPORARY_MIN
 					    + (uint32_t)slot)
 					    - FLEX_SHORT_ADDR_OFFSET;
@@ -720,6 +758,8 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 		msg->polarity = polarity;
 		msg->priority = priority;
 		msg->temp_delivery_slot = slot;
+		msg->pinned = 1;
+		msg->mail_drop = mail_drop;
 		if (phase >= 0)
 			msg->phase = phase;
 
@@ -2315,10 +2355,13 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 * Collect multiple eligible messages into a candidate list,
 	 * ordered by priority class and deadline.
 	 *
-	 * Three-pass collection:
-	 *   Pass 0: Priority messages (non-tone), fragment continuations first
-	 *   Pass 1: Normal messages (non-tone), fragment continuations first
-	 *   Pass 2: Tone-only messages (if no system message content)
+	 * Five-pass collection:
+	 *   Pass 0: Priority + pinned messages (priority=1, pinned=1)
+	 *   Pass 1: Priority messages (priority=1, not pinned, non-tone)
+	 *   Pass 2: Pinned-frame messages (pinned=1, not priority) — temp group
+	 *           SETUP/DELIVERY with hard frame deadlines
+	 *   Pass 3: Normal messages (non-tone, non-priority, non-pinned)
+	 *   Pass 4: Tone-only messages (if no system message content)
 	 *
 	 * Within each pass, messages are insertion-sorted by composite key:
 	 *   (is_fragment_continuation DESC, next_send_frame ASC)
@@ -2437,7 +2480,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 * "Other paging messages to other pagers can also exist
 	 * within the same Frame that a fragmented message is being sent in."
 	 *
-	 * The three-pass collection inherently implements co-packing
+	 * The five-pass collection inherently implements co-packing
 	 * of other-capcode messages alongside fragments. Fragment
 	 * continuations sort first within each priority class via
 	 * the composite sort key (is_continuation DESC, deadline ASC),
@@ -2455,9 +2498,9 @@ static int flex_get_next_frame_network(flex_t *flex)
 	 * and unpacked messages remain in the queue for the next
 	 * frame. */
 
-		/* Three-pass collection */
+		/* Five-pass collection */
 		int pass;
-		for (pass = 0; pass < 3; pass++) {
+		for (pass = 0; pass < 5; pass++) {
 			/* Build a temporary sorted list of eligible messages for this pass */
 			flex_msg_t *sorted[FLEX_MAX_CANDIDATES];
 			int n_sorted = 0;
@@ -2507,6 +2550,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 					     candidate->total_fragments, candidate->next_send_frame, current_abs);
 				}
 
+				/* Temp group DELIVERY gate: don't send the delivery
+				 * until all SETUPs for this slot have been transmitted
+				 * (removed from queue).  This guarantees SETUP→DELIVERY
+				 * ordering regardless of scheduler deferral. */
+				if (candidate->temp_delivery_slot >= 0) {
+					flex_msg_t *sq;
+					int setups_remaining = 0;
+					for (sq = flex->msg_list; sq; sq = sq->next) {
+						if (sq->pinned &&
+						    sq->temp_delivery_slot < 0 &&
+						    sq->msg_type == FLEX_MSG_TYPE_INSTRUCTION)
+							setups_remaining++;
+					}
+					if (setups_remaining > 0)
+						continue;
+				}
+
 				/* Collapse filter.
 				 *
 				 * Each capcode has an assigned collapse frame; the
@@ -2529,7 +2589,8 @@ static int flex_get_next_frame_network(flex_t *flex)
 				 * potentially exceeding the fragment interval limit
 				 * (32/128 frames). */
 				if (flex->collapse > 0 &&
-				    candidate->temp_delivery_slot < 0) {
+				    candidate->temp_delivery_slot < 0 &&
+				    !candidate->pinned) {
 					flex_capcode_sched_t sched;
 					uint32_t nf;
 					flex_scheduler_capcode_info(candidate->capcode, &sched);
@@ -2620,16 +2681,29 @@ static int flex_get_next_frame_network(flex_t *flex)
 					}
 				}
 
-				/* Pass filter */
+				/* Pass filter:
+				 *   Pass 0: Priority + pinned (both flags set)
+				 *   Pass 1: Priority only (priority=1, not pinned)
+				 *   Pass 2: Pinned only (pinned=1, not priority)
+				 *   Pass 3: Normal (not priority, not pinned, not tone)
+				 *   Pass 4: Tone-only */
 				is_tone = (candidate->msg_type == FLEX_MSG_TYPE_TONE);
-				if (pass == 0 && (!candidate->priority || is_tone))
-					continue;
-				if (pass == 1 && (candidate->priority || is_tone))
-					continue;
-				if (pass == 2 && !is_tone)
-					continue;
-				if (pass == 2 && has_sysmsg_content)
-					continue;
+				{
+					int is_pinned = candidate->pinned;
+					int is_prio = candidate->priority;
+					if (pass == 0 && !(is_prio && is_pinned))
+						continue;
+					if (pass == 1 && !(is_prio && !is_pinned && !is_tone))
+						continue;
+					if (pass == 2 && !(is_pinned && !is_prio))
+						continue;
+					if (pass == 3 && (is_prio || is_pinned || is_tone))
+						continue;
+					if (pass == 4 && !is_tone)
+						continue;
+					if (pass == 4 && has_sysmsg_content)
+						continue;
+				}
 
 				/* Fragmentation address exclusion and interval check.
 				 *
@@ -3874,6 +3948,7 @@ int flex_create(const char *kanal, double frequency, const char *device, int use
 	{
 		int p;
 		for (p = 0; p < FLEX_TX_POLARITIES; p++) {
+			flex->tx_pol[p].last_tg_slot = -1;
 			rc = flex_n_counter_init(&flex->tx_pol[p]);
 			if (rc < 0) {
 				LOGP(DFLEX, LOGL_ERROR,

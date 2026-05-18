@@ -1790,11 +1790,10 @@ static void fifo_process_line(const char *text, int text_length)
 	 * Dumps current temporary group assignments (persistent across frames).
 	 * Assignments persist until group message delivery completes or
 	 * 128-frame timeout (~2 minutes).
-	 * 16 group slots per phase, each can have multiple members. */
+	 * 16 group slots, each can have multiple members. */
 	if (!strcasecmp(capcode_string, "status")) {
 		flex_t *flex = (flex_t *)sender_head;
-		static const char pnames[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
-		int pol, p, s, m, any = 0;
+		int pol, s, m, any = 0;
 
 		if (!flex) {
 			LOGP(DFLEX, LOGL_ERROR, "No instance for status command.\n");
@@ -1819,29 +1818,27 @@ static void fifo_process_line(const char *text, int text_length)
 			     flex->sched_last_cycle, flex->sched_last_frame);
 		}
 
-		LOGP(DFLEX, LOGL_NOTICE, "FIFO: Temp group assignments (16 groups/phase):\n");
+		LOGP(DFLEX, LOGL_NOTICE, "FIFO: Temp group assignments (16 slots):\n");
 		for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
-		for (p = 0; p < FLEX_MAX_PHASES; p++) {
 			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
-				if (!flex->rx.temp_addr_map[pol][p][s].active)
+				if (!flex->rx.temp_addr_map[pol][s].active)
 					continue;
-				int cnt = flex->rx.temp_addr_map[pol][p][s].count;
+				int cnt = flex->rx.temp_addr_map[pol][s].count;
 				if (cnt > 0) {
 					LOGP(DFLEX, LOGL_NOTICE,
-					     "  phase=%c group=%d members=%d target_frame=%u setup=C%u/F%u:",
-					     pnames[p], s, cnt,
-					     flex->rx.temp_addr_map[pol][p][s].target_frame,
-					     flex->rx.temp_addr_map[pol][p][s].setup_cycle,
-					     flex->rx.temp_addr_map[pol][p][s].setup_frame);
+					     "  group=%d members=%d target_frame=%u setup=C%u/F%u:",
+					     s, cnt,
+					     flex->rx.temp_addr_map[pol][s].target_frame,
+					     flex->rx.temp_addr_map[pol][s].setup_cycle,
+					     flex->rx.temp_addr_map[pol][s].setup_frame);
 					for (m = 0; m < cnt; m++)
 						LOGP(DFLEX, LOGL_NOTICE,
 						     " %" PRIu64,
-						     flex->rx.temp_addr_map[pol][p][s].capcodes[m]);
+						     flex->rx.temp_addr_map[pol][s].capcodes[m]);
 					LOGP(DFLEX, LOGL_NOTICE, "\n");
 					any = 1;
 				}
 			}
-		}
 		}
 		if (!any)
 			LOGP(DFLEX, LOGL_NOTICE, "  (no active RX assignments)\n");
@@ -2187,11 +2184,12 @@ static void fifo_process_line(const char *text, int text_length)
 			return;
 		}
 
-		/* Extract and parse options (speed, polarity, phase, priority) */
+		/* Extract and parse options (speed, polarity, phase, priority, maildrop) */
+		int tg_mail_drop = 0;
 		{
 			int dummy_charset, dummy_tg;
 			char dummy_src[64];
-			int dummy_bl, dummy_md, dummy_se, dummy_ss, dummy_nm, dummy_nr;
+			int dummy_bl, dummy_se, dummy_ss, dummy_nm, dummy_nr;
 			int dummy_cs, dummy_rt, dummy_ri, dummy_sd;
 			int dummy_st, dummy_ssrc, dummy_sn, dummy_sr;
 			int dummy_it, dummy_is, dummy_if;
@@ -2202,7 +2200,7 @@ static void fifo_process_line(const char *text, int text_length)
 					   &dummy_charset, &dummy_tg,
 					   dummy_src, &tg_phase, &dummy_bl,
 					   &dummy_drtl, &dummy_hmsg, &dummy_sinfo,
-					   &dummy_md,
+					   &tg_mail_drop,
 					   &dummy_se, &dummy_ss,
 					   &dummy_nm, &dummy_nr,
 					   &dummy_cs,
@@ -2224,7 +2222,7 @@ static void fifo_process_line(const char *text, int text_length)
 			int rc = flex_tempgroup_enqueue(flex, tg_caps, tg_collapses, tg_count,
 						       mtype_tg, msg_buf, message_length,
 						       tg_speed, tg_mod, tg_pol,
-						       tg_prio, tg_phase);
+						       tg_prio, tg_phase, tg_mail_drop);
 			if (rc < 0)
 				LOGP(DFLEX, LOGL_NOTICE,
 				     "FIFO: tempgroup enqueue failed.\n");
@@ -2549,6 +2547,13 @@ static void myhandler(void)
 	static int pos = 0;
 	int rc, i, line_start;
 	int space;
+	flex_t *flex = (flex_t *)sender_head;
+
+	/* Don't process FIFO lines while ERS is running.
+	 * Buffer incoming data but defer processing until ERS completes.
+	 * This ensures abs_frame at enqueue time reflects the actual
+	 * scheduler position, not a time during ERS when no frames are sent. */
+	int ers_active = (flex && !flex->sched_ers_done);
 
 	/* Read whatever is available from the FIFO */
 	space = (int)sizeof(buffer) - pos;
@@ -2561,6 +2566,10 @@ static void myhandler(void)
 	rc = read(msg_send_fd, buffer + pos, space);
 	if (rc > 0)
 		pos += rc;
+
+	/* Defer line processing while ERS is active */
+	if (ers_active)
+		return;
 
 	/* Process up to a batch of complete lines per call.
 	 * This prevents bulk FIFO writes from starving TX/RX processing. */

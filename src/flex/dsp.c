@@ -3119,10 +3119,7 @@ parse_phase:
 				if (itype == FLEX_INSTR_TYPE_TEMP_ADDR) {
 					uint32_t slot = flex_instr_slot(instr_data);
 					uint32_t tgt_frame = flex_instr_frame(instr_data);
-					int phase_idx = (phase_name == 'A') ? 0 :
-							(phase_name == 'B') ? 1 :
-							(phase_name == 'C') ? 2 : 3;
-					int cnt = flex->rx.temp_addr_map[pol][phase_idx][slot].count;
+					int cnt = flex->rx.temp_addr_map[pol][slot].count;
 
 					/* New SETUP on this slot: if slot was active
 					 * from a previous assignment, overwrite it.
@@ -3131,13 +3128,13 @@ parse_phase:
 					 * so a new SETUP implies the old one
 					 * completed or was abandoned. */
 					if (slot < FLEX_TEMP_ADDR_SLOTS) {
-						if (!flex->rx.temp_addr_map[pol][phase_idx][slot].active) {
+						if (!flex->rx.temp_addr_map[pol][slot].active) {
 							/* Fresh slot — initialize */
-							flex->rx.temp_addr_map[pol][phase_idx][slot].count = 0;
-							flex->rx.temp_addr_map[pol][phase_idx][slot].target_frame = tgt_frame;
-							flex->rx.temp_addr_map[pol][phase_idx][slot].setup_frame = flex->rx.fiw_frame;
-							flex->rx.temp_addr_map[pol][phase_idx][slot].setup_cycle = flex->rx.fiw_cycle;
-							flex->rx.temp_addr_map[pol][phase_idx][slot].active = 1;
+							flex->rx.temp_addr_map[pol][slot].count = 0;
+							flex->rx.temp_addr_map[pol][slot].target_frame = tgt_frame;
+							flex->rx.temp_addr_map[pol][slot].setup_frame = flex->rx.fiw_frame;
+							flex->rx.temp_addr_map[pol][slot].setup_cycle = flex->rx.fiw_cycle;
+							flex->rx.temp_addr_map[pol][slot].active = 1;
 							cnt = 0;
 						}
 						/* Deduplicate: skip if capcode already in this slot
@@ -3145,14 +3142,14 @@ parse_phase:
 						{
 							int dup = 0, di;
 							for (di = 0; di < cnt; di++) {
-								if (flex->rx.temp_addr_map[pol][phase_idx][slot].capcodes[di] == capcode) {
+								if (flex->rx.temp_addr_map[pol][slot].capcodes[di] == capcode) {
 									dup = 1;
 									break;
 								}
 							}
 							if (!dup && cnt < FLEX_TEMP_GROUP_MAX_MEMBERS) {
-								flex->rx.temp_addr_map[pol][phase_idx][slot].capcodes[cnt] = capcode;
-								flex->rx.temp_addr_map[pol][phase_idx][slot].count = cnt + 1;
+								flex->rx.temp_addr_map[pol][slot].capcodes[cnt] = capcode;
+								flex->rx.temp_addr_map[pol][slot].count = cnt + 1;
 							}
 						}
 					}
@@ -3164,7 +3161,7 @@ parse_phase:
 						  phase_name, capcode,
 						  FLEX_RX_FLAG_TEMPORARY,
 						  slot, tgt_frame, capcode,
-						  flex->rx.temp_addr_map[pol][phase_idx][slot].count);
+						  flex->rx.temp_addr_map[pol][slot].count);
 				} else if (aw_type == FLEX_ADDR_TEMPORARY) {
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
 						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  INS temp_slot=%u type=%s data=0x%04X\n",
@@ -3348,9 +3345,6 @@ parse_phase:
 			 * frame's fragment. */
 			if (aw_type == FLEX_ADDR_TEMPORARY) {
 				uint32_t slot = flex_temp_addr_slot(aw_base);
-				int phase_idx = (phase_name == 'A') ? 0 :
-						(phase_name == 'B') ? 1 :
-						(phase_name == 'C') ? 2 : 3;
 				int is_complete = 1; /* assume complete unless alpha says otherwise */
 
 				/* Check alpha header for continuation flag.
@@ -3371,15 +3365,15 @@ parse_phase:
 
 				/* Log DELIVERY with member list */
 				if (slot < FLEX_TEMP_ADDR_SLOTS &&
-				    flex->rx.temp_addr_map[pol][phase_idx][slot].active) {
-					int cnt = flex->rx.temp_addr_map[pol][phase_idx][slot].count;
+				    flex->rx.temp_addr_map[pol][slot].active) {
+					int cnt = flex->rx.temp_addr_map[pol][slot].count;
 					int m;
 					char mbuf[256];
 					int mpos = 0;
 					for (m = 0; m < cnt; m++)
 						mpos += snprintf(mbuf + mpos, sizeof(mbuf) - mpos,
 								 " %" PRIu64,
-								 flex->rx.temp_addr_map[pol][phase_idx][slot].capcodes[m]);
+								 flex->rx.temp_addr_map[pol][slot].capcodes[m]);
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
 						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  DELIVERY slot=%u members=%d%s:%s\n",
 						  bitrate,
@@ -3395,8 +3389,8 @@ parse_phase:
 						LOGP_CHAN(DDSP, LOGL_DEBUG,
 							  "RX: Phase %c temp slot=%u TEARDOWN -- message complete.\n",
 							  phase_name, slot);
-						memset(&flex->rx.temp_addr_map[pol][phase_idx][slot], 0,
-						       sizeof(flex->rx.temp_addr_map[pol][phase_idx][slot]));
+						memset(&flex->rx.temp_addr_map[pol][slot], 0,
+						       sizeof(flex->rx.temp_addr_map[pol][slot]));
 					}
 				} else {
 					/* No tracked SETUP for this slot — log anyway */
@@ -5156,30 +5150,27 @@ static void flex_rx_decode_data(flex_t *flex)
 	 * Frame numbers wrap at 128 (0-127), cycle at 15 (0-14).
 	 * Total frame count = cycle * 128 + frame. */
 	{
-		int pol, p, s;
+		int pol, s;
 		uint32_t cur_total = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
 
 		for (pol = 0; pol < FLEX_RX_POLARITIES; pol++) {
-		for (p = 0; p < FLEX_MAX_PHASES; p++) {
 			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
-				if (!flex->rx.temp_addr_map[pol][p][s].active)
+				if (!flex->rx.temp_addr_map[pol][s].active)
 					continue;
-				uint32_t setup_total = flex->rx.temp_addr_map[pol][p][s].setup_cycle * 128
-						     + flex->rx.temp_addr_map[pol][p][s].setup_frame;
+				uint32_t setup_total = flex->rx.temp_addr_map[pol][s].setup_cycle * 128
+						     + flex->rx.temp_addr_map[pol][s].setup_frame;
 				/* Handle wraparound: 15 cycles * 128 frames = 1920 total */
 				uint32_t elapsed = (cur_total >= setup_total)
 						 ? (cur_total - setup_total)
 						 : (15 * 128 - setup_total + cur_total);
 				if (elapsed >= 128) {
-					static const char pn[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
 					LOGP_CHAN(DDSP, LOGL_DEBUG,
-						  "RX: Phase %c temp slot=%d TIMEOUT -- %u frames since SETUP, clearing.\n",
-						  pn[p], s, elapsed);
-					memset(&flex->rx.temp_addr_map[pol][p][s], 0,
-					       sizeof(flex->rx.temp_addr_map[pol][p][s]));
+						  "RX: temp slot=%d TIMEOUT -- %u frames since SETUP, clearing.\n",
+						  s, elapsed);
+					memset(&flex->rx.temp_addr_map[pol][s], 0,
+					       sizeof(flex->rx.temp_addr_map[pol][s]));
 				}
 			}
-		}
 		}
 	}
 
@@ -5277,32 +5268,29 @@ static void flex_rx_decode_data(flex_t *flex)
 	 * Per §5.2: "The Temporary Address is valid until the Group
 	 * message ends." */
 	{
-		static const char pnames[FLEX_MAX_PHASES] = { 'A', 'B', 'C', 'D' };
-		int p, s, m;
+		int s, m;
 		int pol = flex->rx.polarity;
 
-		for (p = 0; p < FLEX_MAX_PHASES; p++) {
-			for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
-				if (!flex->rx.temp_addr_map[pol][p][s].active)
-					continue;
-				int cnt = flex->rx.temp_addr_map[pol][p][s].count;
-				if (cnt > 0) {
-					char mbuf[256];
-					int mpos = 0;
-					for (m = 0; m < cnt; m++)
-						mpos += snprintf(mbuf + mpos, sizeof(mbuf) - mpos,
-								 " %" PRIu64,
-								 flex->rx.temp_addr_map[pol][p][s].capcodes[m]);
-					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: C%u/F%u pol=%s phase=%c temp_group=%d ACTIVE members=%d target_frame=%u setup=C%u/F%u:%s\n",
-						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  pol ? "inverted" : "normal",
-						  pnames[p], s, cnt,
-						  flex->rx.temp_addr_map[pol][p][s].target_frame,
-						  flex->rx.temp_addr_map[pol][p][s].setup_cycle,
-						  flex->rx.temp_addr_map[pol][p][s].setup_frame,
-						  mbuf);
-				}
+		for (s = 0; s < FLEX_TEMP_ADDR_SLOTS; s++) {
+			if (!flex->rx.temp_addr_map[pol][s].active)
+				continue;
+			int cnt = flex->rx.temp_addr_map[pol][s].count;
+			if (cnt > 0) {
+				char mbuf[256];
+				int mpos = 0;
+				for (m = 0; m < cnt; m++)
+					mpos += snprintf(mbuf + mpos, sizeof(mbuf) - mpos,
+							 " %" PRIu64,
+							 flex->rx.temp_addr_map[pol][s].capcodes[m]);
+				LOGP_CHAN(DDSP, LOGL_NOTICE,
+					  "RX: C%u/F%u pol=%s temp_group=%d ACTIVE members=%d target_frame=%u setup=C%u/F%u:%s\n",
+					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+					  pol ? "inverted" : "normal",
+					  s, cnt,
+					  flex->rx.temp_addr_map[pol][s].target_frame,
+					  flex->rx.temp_addr_map[pol][s].setup_cycle,
+					  flex->rx.temp_addr_map[pol][s].setup_frame,
+					  mbuf);
 			}
 		}
 	}
