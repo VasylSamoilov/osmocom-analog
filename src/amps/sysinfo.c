@@ -78,10 +78,10 @@ void init_sysinfo(amps_si *si, int cmac, int vmac, int dtx, int dcc, int sid1, i
 	si->word2.regh = regh;
 	si->word2.regr = regr;
 	si->word2.dtx = dtx; /* DTX seems not to work with my White Dynatac 8000 */
-	si->word2.n_1 = 20;
+	si->word2.n_1 = 20;	/* default; overridable via -S n1= (paging channels - 1) */
 	si->word2.rcf = (bis) ? 0 : 1; /* must be set to ignore B/I bit */
 	si->word2.cpa = 1; /* must be set for combined CC+PC */
-	si->word2.cmax_1 = 20;
+	si->word2.cmax_1 = 20;	/* default; overridable via -S cmax1= (access channels - 1) */
 
 	/* registration increment */
 	si->reg_incr.regincr = regincr;

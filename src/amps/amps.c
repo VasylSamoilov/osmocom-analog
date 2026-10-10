@@ -43,6 +43,7 @@
 #include <string.h>
 #include <errno.h>
 #include <math.h>
+#include <assert.h>
 #include "../libsample/sample.h"
 #include "../libmobile/get_time.h"
 #include "../liblogging/logging.h"
@@ -60,8 +61,26 @@
 /* Uncomment this to test SAT via loopback */
 //#define DEBUG_VC
 
+/* AMPS order codes (TIA/EIA-553-A Table 3.7.1-1). The 5-bit ORDER field is
+ * easy to get wrong by one bit: Disable DTMF is 22 = 0b10110, and the very
+ * next code 23 = 0b10111 is Message Encryption Mode. A one-bit slip would
+ * silently send an encryption order instead of muting DTMF, so pin the value
+ * with a name and a compile-time check and use the name at every call site. */
+#define AMPS_ORDER_DISABLE_DTMF		22	/* 0b10110 */
+#define AMPS_ORDER_MESSAGE_ENCRYPTION	23	/* 0b10111 - NOT Disable DTMF */
+_Static_assert(AMPS_ORDER_DISABLE_DTMF == 0x16,
+	"Disable DTMF order must be 22 (0b10110); 23 (0b10111) is Message Encryption");
+_Static_assert(AMPS_ORDER_MESSAGE_ENCRYPTION == AMPS_ORDER_DISABLE_DTMF + 1,
+	"Message Encryption is the code immediately after Disable DTMF");
+
 #define SAT_TO1		5,0		/* 5 sec to detect after setup */
-#define SAT_TO2		5,0		/* 5 sec lost until abort (specs say 5) */
+/* Base-side mirror of the mobile station's fade timer. Per TIA/EIA-553-A
+ * 2.6.4.1 "Loss of radio link continuity" (PDF p.70), the mobile monitors
+ * the fade timing status (2.4.1.3, p.34): while SAT is absent or does not
+ * match SCCr the fade timer runs, and when it reaches 5 seconds the mobile
+ * drops the call. We arm the same 5 s so the base tears down in step with
+ * the mobile instead of waiting indefinitely for a mobile that has gone. */
+#define SAT_TO2		5,0		/* 5 sec losing/mismatched SAT until abort (TIA/EIA-553-A 2.6.4.1) */
 #define PAGE_TRIES	2		/* how many times to page the phone */
 #define PAGE_TO1	8,0		/* max time to wait for paging reply */
 #define PAGE_TO2	4,0		/* max time to wait for last paging reply */
@@ -1142,10 +1161,15 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 	if (tone) {
 		osmo_timer_del(&trans->timer);
 	} else {
-		if (!trans->dtx)
+		/* SAT lost: arm the fade timer (TIA/EIA-553-A 2.6.4.1, p.70).
+		 * This must run even for a DTX call: DTX only suspends SAT for
+		 * short, bounded intervals (<< the 5 s fade window), so a SAT
+		 * absence that outlasts the fade timer is a genuine loss of radio
+		 * link continuity and must release. Previously the timer was
+		 * deleted for DTX calls, so a dropped DTX call was never torn
+		 * down. */
+		if (!osmo_timer_pending(&trans->timer))
 			osmo_timer_schedule(&trans->timer, SAT_TO2);
-		else
-			osmo_timer_del(&trans->timer);
 	}
 
 	if (amps->sender.loopback)
@@ -1192,26 +1216,24 @@ void amps_rx_sat_mismatch(amps_t *amps, enum sat_state expected, enum sat_state 
 	          sat_state_name(detected));
 
 	/*
-	 * TODO: Implement handoff logic here
-	 *
-	 * Per TIA/EIA-553-A section 2.6.2.3:
-	 * - If SAT does not match SCCr, enable fade timing
-	 * - The mobile may have locked onto a different cell's SAT
-	 * - This indicates potential handoff candidate
-	 *
-	 * Possible actions:
-	 * 1. Start fade timer (if not already running from SAT loss)
-	 * 2. Notify higher layer (e.g., MSC) for handoff decision
-	 * 3. Log for inter-cell coordination
-	 *
-	 * For now, we just log the event. Full handoff implementation
-	 * would require inter-cell coordination protocol.
+	 * Per TIA/EIA-553-A 2.4.1.3 (fade timing status, p.34) and 2.6.4.1
+	 * (loss of radio link continuity, p.70): a SAT that does not agree with
+	 * SCCr enables fade timing. We mirror the mobile's fade timer below and
+	 * release the call if the correct SAT is not restored in time. A full
+	 * network would also notify the MSC here so it can evaluate a handoff to
+	 * the cell whose SAT the mobile actually locked onto; that inter-cell
+	 * coordination is out of scope for this single-cell base station, so we
+	 * log the candidate and let the fade timer govern teardown.
 	 */
 
-	/* Start fade timer if not already set (treat as potential SAT loss) */
-	if (!trans->dtx && trans->state == TRANS_CALL) {
+	/* SAT does not match SCCr: this is loss of radio link continuity just
+	 * like SAT absence (TIA/EIA-553-A 2.4.1.3 fade timing status, p.34;
+	 * 2.6.4.1, p.70). Arm the fade timer so the call releases if the
+	 * correct SAT is not restored within the fade window. Armed regardless
+	 * of DTX, for the same reason as the SAT-loss path. */
+	if (trans->state == TRANS_CALL) {
 		if (!osmo_timer_pending(&trans->timer)) {
-			LOGP_CHAN(DAMPS, LOGL_INFO, "Starting fade timer due to SAT mismatch\n");
+			LOGP_CHAN(DAMPS, LOGL_INFO, "SAT mismatch: enabling fade timing (%d s) per TIA/EIA-553-A 2.4.1.3\n", 5);
 			osmo_timer_schedule(&trans->timer, SAT_TO2);
 		}
 	}
@@ -3649,7 +3671,8 @@ int amps_disable_dtmf(const char *number)
 	trans->chan = 0;
 	trans->msg_type = 0;     /* MSG_TYPE=0 for Disable DTMF */
 	trans->ordq = 0;         /* ORDQ=0 for Disable DTMF */
-	trans->order = 22;       /* Order 22 = Disable DTMF */
+	trans->order = AMPS_ORDER_DISABLE_DTMF;       /* Order 22 = Disable DTMF (0b10110) */
+	assert(trans->order == AMPS_ORDER_DISABLE_DTMF && trans->order != AMPS_ORDER_MESSAGE_ENCRYPTION);
 
 	/* Set transaction state to trigger FVC transmission */
 	trans_new_state(trans, TRANS_CALL_DISABLE_DTMF);
@@ -5026,7 +5049,8 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		trans->chan = 0;
 		trans->msg_type = 0;
 		trans->ordq = 0;    /* ORDQ=0 for Disable DTMF */
-		trans->order = 22;  /* Order 22 = Disable DTMF */
+		trans->order = AMPS_ORDER_DISABLE_DTMF;  /* Order 22 = Disable DTMF (0b10110) */
+		assert(trans->order == AMPS_ORDER_DISABLE_DTMF && trans->order != AMPS_ORDER_MESSAGE_ENCRYPTION);
 		trans_new_state(trans, TRANS_CALL_DISABLE_DTMF_SEND);
 		return trans;
 	case TRANS_CALL_DISABLE_DTMF_SEND:

@@ -164,6 +164,7 @@ struct amps {
 	uint32_t		tx_focc_min1;		/* mobile id */
 	uint16_t		tx_focc_min2;
 	int			tx_focc_chan;		/* channel to assign for voice call */
+	int			tx_focc_scc;		/* SAT color code of the ASSIGNED voice channel (not the CC's) per TIA/EIA-553-A 2.6.4.1 */
 	uint8_t			tx_focc_msg_type;	/* message (3 values) */
 	uint8_t			tx_focc_ordq;
 	uint8_t			tx_focc_order;

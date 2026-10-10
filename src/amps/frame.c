@@ -4156,6 +4156,23 @@ int amps_encode_frame_focc(amps_t *amps, char *bits)
 			amps->tx_focc_ordq = trans->ordq;
 			amps->tx_focc_order = trans->order;
 			amps->tx_focc_chan = trans->chan;
+			/* SCC in the Initial Voice Channel Designation must be the
+			 * SAT of the ASSIGNED voice channel, which can differ from
+			 * this control channel's SAT in a multi-SAT deployment. The
+			 * mobile sets SCCs from this field and transponds that SAT on
+			 * the VC (TIA/EIA-553-A 2.6.4.1, p.70). Resolve the target VC
+			 * by channel number and use its SAT; fall back to this
+			 * channel's SAT if the VC can't be found or none is assigned. */
+			amps->tx_focc_scc = amps->sat;
+			if (trans->chan) {
+				sender_t *s;
+				for (s = sender_head; s; s = s->next) {
+					if (atoi(s->kanal) == trans->chan) {
+						amps->tx_focc_scc = ((amps_t *)s)->sat;
+						break;
+					}
+				}
+			}
 			amps->tx_focc_send = 1;
 			amps->tx_focc_word_count = 0;
 			amps->tx_focc_word_repeat = 0;
@@ -4183,18 +4200,22 @@ int amps_encode_frame_focc(amps_t *amps, char *bits)
 			word = amps_encode_word1_abbreviated_address_word(amps->si.dcc, amps->tx_focc_min1, 1);
 		else if (amps->tx_focc_word_count == 1) {
 			if (amps->tx_focc_chan)
-				word = amps_encode_word2_extended_address_word_b(amps->sat, amps->tx_focc_min2, amps->si.vmac, amps->tx_focc_chan);
+				word = amps_encode_word2_extended_address_word_b(amps->tx_focc_scc, amps->tx_focc_min2, amps->si.vmac, amps->tx_focc_chan);
 			else
 				word = amps_encode_word2_extended_address_word_a(amps->tx_focc_min2, amps->tx_focc_msg_type, amps->tx_focc_ordq, amps->tx_focc_order);
 		} else if (amps->tx_focc_word_count == 2) {
-			/* Word 3 - First Directed-Retry Word (channels 1-3) */
-			word = amps_encode_word3_directed_retry(amps->sat,
+			/* Word 3 - First Directed-Retry Word (channels 1-3).
+			 * SCC field = 11 (binary) is the type marker for this word
+			 * form, NOT a SAT color code (TIA/EIA-553-A 3.7.1.1, word
+			 * format p.106). It must be 3, not the channel's SAT. */
+			word = amps_encode_word3_directed_retry(3,
 				amps->tx_focc_retry_channels[0],
 				amps->tx_focc_retry_channels[1],
 				amps->tx_focc_retry_channels[2]);
 		} else if (amps->tx_focc_word_count == 3) {
-			/* Word 4 - Second Directed-Retry Word (channels 4-6) */
-			word = amps_encode_word4_directed_retry(amps->sat,
+			/* Word 4 - Second Directed-Retry Word (channels 4-6).
+			 * SCC = 11 marker, same as Word 3. */
+			word = amps_encode_word4_directed_retry(3,
 				amps->tx_focc_retry_channels[3],
 				amps->tx_focc_retry_channels[4],
 				amps->tx_focc_retry_channels[5]);
