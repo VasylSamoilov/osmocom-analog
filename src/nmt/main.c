@@ -71,6 +71,16 @@ static int sms_deliver_fd = -1;
 #define MWI_DELIVER "/tmp/nmt_mwi"
 static int mwi_deliver_fd = -1;
 
+/* MOVE (SCIP) control FIFO — move an active call to another voice channel.
+ * See docs/NMT_SCIP.md.
+ *   Format: <subscriber>[,<channel>]   (channel omitted = auto-select a free TC)
+ *   Examples:
+ *     echo "3735859"   > /tmp/nmt_move    (move to any free TC)
+ *     echo "3735859,5" > /tmp/nmt_move    (move to channel 5)
+ */
+#define MOVE_DELIVER "/tmp/nmt_move"
+static int move_deliver_fd = -1;
+
 /* settings */
 int nmt_system = 450;
 int num_chan_type = 0;
@@ -257,6 +267,8 @@ static void myhandler(void)
 	static int sms_pos = 0;
 	static char mwi_buffer[256];
 	static int mwi_pos = 0;
+	static char move_buffer[256];
+	static int move_pos = 0;
 	int rc, i, space;
 
 	/* Handle SMS deliver FIFO */
@@ -282,8 +294,7 @@ static void myhandler(void)
 	}
 
 	/* Handle MWI deliver FIFO */
-	if (mwi_deliver_fd < 0)
-		return;
+	if (mwi_deliver_fd >= 0) {
 	space = sizeof(mwi_buffer) - mwi_pos;
 	rc = read(mwi_deliver_fd, mwi_buffer + mwi_pos, space);
 	if (rc > 0) {
@@ -302,6 +313,31 @@ static void myhandler(void)
 			mwi_buffer[i] = '\0';
 			mwi_pos = 0;
 			deliver_mwi(mwi_buffer);
+		}
+	}
+	}
+
+	/* Handle MOVE (SCIP) deliver FIFO */
+	if (move_deliver_fd < 0)
+		return;
+	space = sizeof(move_buffer) - move_pos;
+	rc = read(move_deliver_fd, move_buffer + move_pos, space);
+	if (rc > 0) {
+		move_pos += rc;
+		if (move_pos == space) {
+			fprintf(stderr, "MOVE buffer overflow!\n");
+			move_pos = 0;
+		}
+		/* check for end of line */
+		for (i = 0; i < move_pos; i++) {
+			if (move_buffer[i] == '\r' || move_buffer[i] == '\n')
+				break;
+		}
+		/* deliver move */
+		if (i < move_pos) {
+			move_buffer[i] = '\0';
+			move_pos = 0;
+			deliver_move(move_buffer);
 		}
 	}
 }
@@ -472,6 +508,22 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* create pipe for MOVE (SCIP) control — move an active call to another voice channel.
+	 * See docs/NMT_SCIP.md for command format and usage.
+	 */
+	unlink(MOVE_DELIVER);
+	rc = mkfifo(MOVE_DELIVER, 0666);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to create MOVE deliver FIFO '%s'!\n", MOVE_DELIVER);
+		goto fail;
+	} else {
+		move_deliver_fd = open(MOVE_DELIVER, O_RDONLY | O_NONBLOCK);
+		if (move_deliver_fd < 0) {
+			fprintf(stderr, "Failed to open MOVE deliver FIFO! '%s'\n", MOVE_DELIVER);
+			goto fail;
+		}
+	}
+
 	/* inits */
 	fm_init(fast_math);
 	rc = init_frame();
@@ -509,6 +561,9 @@ fail:
 	if (mwi_deliver_fd > 0)
 		close(mwi_deliver_fd);
 	unlink(MWI_DELIVER);
+	if (move_deliver_fd > 0)
+		close(move_deliver_fd);
+	unlink(MOVE_DELIVER);
 
 	/* destroy transceiver instance */
 	while (sender_head)

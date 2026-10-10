@@ -39,12 +39,15 @@ enum nmt_state {
 	STATE_MO_DIALING,	/* receiving digits from phone */
 	STATE_MO_COMPLETE,	/* all digits received, completing call */
 	STATE_MT_PAGING,	/* paging mobile phone */
+	STATE_MT_QUEUE,		/* no free TC: queueing call, MS waits on CC (frame 2c/2f) */
 	STATE_MT_CHANNEL,	/* assigning traffic channel */
 	STATE_MT_IDENT,		/* waiting for identity */
 	STATE_MT_AUTOANSWER,	/* sending autoanswer, waiting for reply */
 	STATE_MT_RINGING,	/* mobile phone is ringing, waiting for answer */
 	STATE_MT_COMPLETE,	/* mobile phone has answered, completing call */
 	STATE_ACTIVE,		/* during active call */
+	STATE_SCIP_ORDER,	/* SCIP: sending channel change order (frame 3a) on current TC */
+	STATE_SCIP_IDENT,	/* SCIP: on new TC, waiting for identity (frame 10b) */
 	STATE_MO_RELEASE,	/* acknowlegde release from mobile phone */
 	STATE_MT_RELEASE,	/* sending release toward mobile phone */
 };
@@ -92,6 +95,7 @@ struct nmt {
 	/* sender's states */
 	enum nmt_state		state;
 	int			wait_autoanswer;	/* wait for frame 15 before we can send autoanswer */
+	struct nmt		*scip_target;		/* SCIP: destination channel we are moving the call to */
 	enum nmt_active_state	active_state;
 	struct osmo_timer_list		timer;
 	int			rx_frame_count;		/* receive frame counter */
@@ -174,4 +178,11 @@ int submit_sms(const char *sms);
  * Clearing sequence (5c x2 then L(15) x4) is sent at call end per NMT 4.4.1.16.
  */
 void deliver_mwi(const char *command);
+
+/* SCIP (Switching Call In Progress) — move an active call to another voice (traffic) channel.
+ * See docs/NMT_SCIP.md. Command format: <subscriber>[,<channel>]  (channel omitted = auto-select).
+ * Sends frame 3a (channel change order, NMT Doc 450-3 4.3.2.2 / 5.4.5) on the current TC; the MS
+ * retunes and re-identifies with frame 10b on the new TC. Falls back to the old TC on timeout.
+ */
+void deliver_move(const char *command);
 

@@ -21,6 +21,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -57,9 +58,11 @@ static int sms_ref = 0;
 #define RELEASE_TO	2,0	/* how long do we wait for release guard of the phone */
 #define DIALING_TO	1,0	/* if we have a pause during dialing, we abort the call */
 #define CHANNEL_TO	2,0	/* how long do we wait for phone to appear on assigned channel */
+#define QUEUE_TO	60,0	/* how long a queued MT call waits on the CC for a free TC */
 #define RINGING_TO	60,0	/* how long may the phone ring */
 #define SUPERVISORY_TO1	3	/* 3 sec to detect after setup */
 #define SUPERVISORY_TO2	20,0	/* 20 sec lost until abort */
+#define SCIP_TO		3,0	/* how long we wait for the MS to re-appear (frame 10b) on the new TC */
 #define DTMF_DURATION	0.1	/* 100ms */
 
 /* Counters */
@@ -88,6 +91,8 @@ static const char *nmt_state_name(enum nmt_state state)
 		return "MO CALL COMPLETE";
 	case STATE_MT_PAGING:
 		return "MT CALL PAGING";
+	case STATE_MT_QUEUE:
+		return "MT CALL QUEUE";
 	case STATE_MT_CHANNEL:
 		return "MT CALL CHANNEL";
 	case STATE_MT_IDENT:
@@ -100,6 +105,10 @@ static const char *nmt_state_name(enum nmt_state state)
 		return "MT CALL COMPLETE";
 	case STATE_ACTIVE:
 		return "ACTIVE";
+	case STATE_SCIP_ORDER:
+		return "SCIP ORDER";
+	case STATE_SCIP_IDENT:
+		return "SCIP IDENT";
 	case STATE_MO_RELEASE:
 		return "RELEASE MTX->MS";
 	case STATE_MT_RELEASE:
@@ -1108,12 +1117,17 @@ static void rx_mt_paging(nmt_t *nmt, frame_t *frame)
 	nmt_t *other;
 
 	switch (frame->mt) {
+	case NMT_MESSAGE_11b: /* priority MS call acknowledgment (PMS) */
 	case NMT_MESSAGE_10a: /* call acknowledgment */
 	case NMT_MESSAGE_10d: /* call ack on alternate type */
 		if (!match_channel(nmt, frame))
 			break;
 		if (!match_subscriber(trans, frame))
 			break;
+		if (frame->mt == NMT_MESSAGE_11b) {
+			trans->priority = 1;
+			LOGP_CHAN(DNMT, LOGL_INFO, "Call acknowledgment is from a priority MS (PMS).\n");
+		}
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received call acknowledgment from subscriber %c,%s.\n", trans->subscriber.country, trans->subscriber.number);
 		if (trans->sms_string[0])
 			trans->dms_call = 1;
@@ -1135,6 +1149,52 @@ static void rx_mt_paging(nmt_t *nmt, frame_t *frame)
 	}
 }
 
+/* Queued MT call: send queue-info (2c priority / 2f ordinary) on the calling channel.
+ * Each frame we re-check for a free TC; as soon as one is available, go to the normal
+ * channel-assignment path (STATE_MT_CHANNEL -> 2b). NMT Doc 450-1 4.4.1.6/4.4.1.7:
+ * "2b is sent instead of 2c" once an idle TC is available.
+ */
+static void tx_mt_channel(nmt_t *nmt, frame_t *frame);
+
+static void tx_mt_queue(nmt_t *nmt, frame_t *frame)
+{
+	transaction_t *trans = nmt->trans;
+
+	/* a TC became free -> stop queueing, proceed to assignment */
+	if (search_free_tc(nmt)) {
+		LOGP_CHAN(DNMT, LOGL_INFO, "TC became free, assigning queued call.\n");
+		osmo_timer_del(&nmt->timer);
+		nmt_new_state(nmt, STATE_MT_CHANNEL);
+		nmt->tx_frame_count = 0;
+		tx_mt_channel(nmt, frame);
+		return;
+	}
+
+	/* otherwise keep telling the MS it is queued (2c priority, 2f ordinary) */
+	frame->mt = trans->priority ? NMT_MESSAGE_2c : NMT_MESSAGE_2f;
+	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
+	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
+	/* H8H9H10 distinguishes the queue type: 3F1 = 2c (priority), 3F0 = 2f (ordinary) */
+	frame->additional_info = trans->priority ? 0x3f1 : 0x3f0;
+	if (++nmt->tx_frame_count == 1)
+		LOGP_CHAN(DNMT, LOGL_INFO, "Send queue info to mobile (%s).\n", trans->priority ? "2c priority" : "2f ordinary");
+}
+
+static void timeout_mt_queue(nmt_t *nmt)
+{
+	transaction_t *trans = nmt->trans;
+
+	LOGP_CHAN(DNMT, LOGL_NOTICE, "Queue timeout, no TC became free; releasing call.\n");
+	LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
+	if (trans->callref) {
+		call_up_release(trans->callref, CAUSE_NOCHANNEL);
+		trans->callref = 0;
+	}
+	nmt_release(nmt);
+}
+
 static void tx_mt_channel(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans = nmt->trans;
@@ -1143,16 +1203,15 @@ static void tx_mt_channel(nmt_t *nmt, frame_t *frame)
 	/* get free channel (after releasing all channels) */
 	tc = search_free_tc(nmt);
 	if (!tc) {
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "TC is not free anymore.\n");
-		LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
-		call_up_release(trans->callref, CAUSE_NOCHANNEL);
-		trans->callref = 0;
-		nmt_release(nmt);
-		/* send idle for now, then continue with release */
-		tx_idle(nmt, frame);
+		/* No free TC: queue the call on the calling channel instead of dropping it. */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "No free TC, queueing call (%s).\n", trans->priority ? "priority" : "ordinary");
+		nmt_new_state(nmt, STATE_MT_QUEUE);
+		nmt->tx_frame_count = 0;
+		osmo_timer_schedule(&nmt->timer, QUEUE_TO);
+		/* send the queue-info frame now */
+		tx_mt_queue(nmt, frame);
 		return;
 	}
-
 	if (nmt != tc) {
 		/* link trans and tc together, so we can continue with channel assignment */
 		LOGP_CHAN(DNMT, LOGL_NOTICE, "Switching to TC channel #%s.\n", tc->sender.kanal);
@@ -1516,6 +1575,102 @@ static void timeout_mt_release(nmt_t *nmt)
 }
 
 /*
+ * SCIP — Switching Call In Progress (move active call to another TC)
+ *
+ * Operator-triggered intra-cell channel change, modelled on the AMPS handoff path
+ * (src/amps/amps.c amps_handoff) but using the NMT frames:
+ *   - frame 3a "Traffic channel allocation on traffic channel" (prefix 5), carrying the
+ *     new TC number in NaNbNc, sent on the CURRENT TC (NMT Doc 450-1 4.3.2 msg 3a);
+ *   - the MS stops TX, retunes to the new TC and re-identifies with frame 10b there
+ *     (NMT Doc 450-3 5.4.5 "Switching call in progress"). On the new TC the base station
+ *     is already radiating idle frames + supervisory, so the MS finds the channel live.
+ * On timeout (MS did not re-appear) we fall back to the original TC and resume the call,
+ * per 5.4.5 ("if the change of channel fails ... the MS shall go back to the previous TC").
+ */
+
+#define SCIP_ORDER_FRAMES	4	/* repeat frame 3a this many times before the move (min 4 per 5.4.5) */
+
+static void tx_scip_order(nmt_t *nmt, frame_t *frame)
+{
+	transaction_t *trans = nmt->trans;
+	nmt_t *tc = nmt->scip_target;
+
+	/* build frame 3a: channel change order to the new TC */
+	frame->mt = NMT_MESSAGE_3a;
+	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
+	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
+	frame->tc_no = nmt_encode_tc(tc->sysinfo.system, atoi(tc->sender.kanal), tc->sysinfo.ms_power);
+
+	if (++nmt->tx_frame_count == 1)
+		LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: sending channel change order (3a) -> TC #%s.\n", tc->sender.kanal);
+
+	if (nmt->tx_frame_count >= SCIP_ORDER_FRAMES) {
+		/* order delivered: move the transaction to the target TC and wait for the MS there.
+		 * Re-parent BEFORE idling the old channel, so the live transaction is not torn down
+		 * when the old channel goes idle (same ordering as AMPS and as tx_mt_channel). */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: order sent, moving call #%s -> #%s, awaiting identity on new TC.\n", nmt->sender.kanal, tc->sender.kanal);
+		nmt->scip_target = NULL;
+		nmt->trans = NULL;		/* detach old channel without releasing the transaction */
+		nmt_go_idle(nmt);		/* old channel back to idle */
+		tc->trans = trans;
+		trans->nmt = tc;
+		nmt_new_state(tc, STATE_SCIP_IDENT);
+		tc->tx_frame_count = 0;
+		tc->rx_frame_count = 0;
+		nmt_set_dsp_mode(tc, DSP_MODE_FRAME);
+		osmo_timer_schedule(&tc->timer, SCIP_TO);
+	}
+}
+
+/* On the new TC we send idle (free) frames while waiting for the MS to re-identify. */
+static void tx_scip_ident(nmt_t *nmt, frame_t *frame)
+{
+	tx_ident(nmt, frame);
+}
+
+static void rx_scip_ident(nmt_t *nmt, frame_t *frame)
+{
+	transaction_t *trans = nmt->trans;
+
+	switch (frame->mt) {
+	case NMT_MESSAGE_10b: /* seizure / identity on the new TC */
+		if (!match_channel(nmt, frame))
+			break;
+		if (!match_subscriber(trans, frame))
+			break;
+		nmt_value2digits(frame->ms_password, trans->subscriber.password, 3);
+		LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: MS re-identified on new TC (password %s), call active.\n", trans->subscriber.password);
+		osmo_timer_del(&nmt->timer);
+		nmt_new_state(nmt, STATE_ACTIVE);
+		nmt->active_state = ACTIVE_STATE_VOICE;
+		nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+		if (nmt->supervisory) {
+			super_reset(nmt);
+			osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1,0);
+		}
+		break;
+	default:
+		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame->mt), nmt_state_name(nmt->state));
+	}
+}
+
+static void timeout_scip_ident(nmt_t *nmt)
+{
+	transaction_t *trans = nmt->trans;
+
+	/* MS never re-appeared on the new TC. Per 5.4.5 the MS returns to the previous TC,
+	 * but we cannot know it did; the robust server action is to release the call. */
+	LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: timeout waiting for MS on new TC, releasing call.\n");
+	if (trans->callref) {
+		call_up_release(trans->callref, CAUSE_TEMPFAIL);
+		trans->callref = 0;
+	}
+	nmt_release(nmt);
+}
+
+/*
  * handle call
  */
 
@@ -1563,6 +1718,17 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 		osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO2);
 
 	switch (frame->mt) {
+	case NMT_MESSAGE_13b: /* coin-box answer acknowledgment with echoed tariff class */
+		if (!match_channel(nmt, frame))
+			break;
+		if (!match_subscriber(trans, frame))
+			break;
+		/* The coin-box MS echoes the tariff class it received from the MTX (in frame 5b),
+		 * for control purposes (NMT Doc 450-1 4.2.1 / 4.3.2, frame 13b). We do not drive a
+		 * charging back-end, so we only decode and log what the phone reports. */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received coin-box answer acknowledgment (frame 13b): line signal L(%d), tariff class 0x%x.\n",
+			frame->line_signal & 0xf, frame->tariff_class);
+		break;
 	case NMT_MESSAGE_13a: /* line signal */
 		if (!match_channel(nmt, frame))
 			break;
@@ -1763,6 +1929,36 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 	if (nmt->sender.loopback)
 		return;
 
+	/* Observe-and-log frames that the MTX receives but this single-node implementation
+	 * does not act on. We never originate the corresponding orders (frame 7 authentication,
+	 * 21/22 measurement/management, 20 channel activation), so these are decode-only: report
+	 * what the MS/BS reports, for diagnostics and capture analysis, then fall through. */
+	switch (frame.mt) {
+	case NMT_MESSAGE_16: /* Signed response (SRES) from MS — reply to an authentication request */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signed response (frame 16, SRES=0x%" PRIx64 "); authentication is not implemented, logging only.\n", (uint64_t)frame.sres);
+		break;
+	case NMT_MESSAGE_26: /* Signal strength measurement result (BS -> MTX) */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signal strength measurement result (frame 26, TC=%d, result=0x%x); handover is not implemented, logging only.\n", frame.tc_no, frame.meas);
+		break;
+	case NMT_MESSAGE_25_1:
+	case NMT_MESSAGE_25_2:
+	case NMT_MESSAGE_25_3:
+	case NMT_MESSAGE_25_4: /* Channel status information (SCC, BS -> MTX) */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received channel status information (frame 25, A=0x%x super=0x%x limit=0x%x c=0x%x); not acted on, logging only.\n", frame.chan_act, frame.supervisory, frame.limit_strength_eval, frame.c);
+		break;
+	case NMT_MESSAGE_27: /* Response on management/maintenance order (BS -> MTX) */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received management/maintenance response (frame 27, V=0x%x); management orders not implemented, logging only.\n", frame.meas_order);
+		break;
+	case NMT_MESSAGE_28: /* Other maintenance information from BS (BS -> MTX) */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received maintenance information from BS (frame 28, V=0x%x); not acted on, logging only.\n", frame.meas_order);
+		break;
+	case NMT_MESSAGE_10c: /* Seizure and identity from called MS after a traffic channel scanning order */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received called-MS seizure on TC (frame 10c, subscriber %u,%06u); traffic channel scanning order not implemented, logging only.\n", frame.ms_country, frame.ms_number);
+		break;
+	default:
+		break;
+	}
+
 	/* MS releases, but this is not the acknowledge of MTX release */
 	if (frame.mt == NMT_MESSAGE_13a
 	 && (frame.line_signal & 0xf) == 1
@@ -1846,6 +2042,9 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 	case STATE_ACTIVE:
 		rx_active(nmt, &frame);
 		break;
+	case STATE_SCIP_IDENT:
+		rx_scip_ident(nmt, &frame);
+		break;
 	default:
 		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame.mt), nmt_state_name(nmt->state));
 	}
@@ -1863,11 +2062,17 @@ static void nmt_timeout(void *data)
 	case STATE_MT_RINGING:
 		timeout_mt_ringing(nmt);
 		break;
+	case STATE_MT_QUEUE:
+		timeout_mt_queue(nmt);
+		break;
 	case STATE_MT_RELEASE:
 		timeout_mt_release(nmt);
 		break;
 	case STATE_ACTIVE:
 		timeout_active(nmt, nmt->timer.timeout.tv_sec);
+		break;
+	case STATE_SCIP_IDENT:
+		timeout_scip_ident(nmt);
 		break;
 	default:
 		break;
@@ -1909,6 +2114,9 @@ const char *nmt_get_frame(nmt_t *nmt)
 	case STATE_MT_PAGING:
 		tx_mt_paging(nmt, &frame);
 		break;
+	case STATE_MT_QUEUE:
+		tx_mt_queue(nmt, &frame);
+		break;
 	case STATE_MT_CHANNEL:
 		tx_mt_channel(nmt, &frame);
 		break;
@@ -1929,6 +2137,12 @@ const char *nmt_get_frame(nmt_t *nmt)
 		break;
 	case STATE_ACTIVE:
 		tx_active(nmt, &frame);
+		break;
+	case STATE_SCIP_ORDER:
+		tx_scip_order(nmt, &frame);
+		break;
+	case STATE_SCIP_IDENT:
+		tx_scip_ident(nmt, &frame);
 		break;
 	default:
 		break;
@@ -2482,6 +2696,136 @@ void deliver_mwi(const char *command)
 		printf("MWI failed!\n");
 		return;
 	}
+}
+
+/*
+ * SCIP (Switching Call In Progress): move an active call to another voice/traffic channel.
+ * Modelled on AMPS amps_handoff(). Operator-triggered via the /tmp/nmt_move FIFO.
+ */
+
+/* Find a free TC other than 'own' (own stays busy with the call we are moving). */
+static nmt_t *scip_find_target(nmt_t *own, int want_channel)
+{
+	sender_t *sender;
+	nmt_t *nmt;
+
+	for (sender = sender_head; sender; sender = sender->next) {
+		nmt = (nmt_t *) sender;
+		if (nmt == own)
+			continue;
+		if (nmt->state != STATE_IDLE)
+			continue;
+		if (!is_chan_class_tc(nmt->sysinfo.chan_type))
+			continue;
+		if (want_channel) {
+			if (atoi(nmt->sender.kanal) == want_channel)
+				return nmt;
+			continue;
+		}
+		return nmt; /* auto-select: first free TC */
+	}
+
+	return NULL;
+}
+
+/* Initiate the move. want_channel == 0 -> auto-select a free TC. */
+static int nmt_scip(const char *dialing, int want_channel)
+{
+	nmt_subscriber_t subscr;
+	transaction_t *trans;
+	nmt_t *nmt, *tc;
+
+	memset(&subscr, 0, sizeof(subscr));
+	if (dialstring2number(dialing, &subscr.country, subscr.number)) {
+		LOGP(DNMT, LOGL_NOTICE, "SCIP: invalid number '%s'\n", dialing);
+		return -CAUSE_INVALNUMBER;
+	}
+
+	trans = get_transaction_by_number(&subscr);
+	if (!trans || !trans->nmt) {
+		LOGP(DNMT, LOGL_NOTICE, "SCIP: subscriber '%s' not found in a call\n", dialing);
+		return -CAUSE_OUTOFORDER;
+	}
+	nmt = trans->nmt;
+
+	if (nmt->state != STATE_ACTIVE) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: subscriber '%s' not in active call (state %s)\n", dialing, nmt_state_name(nmt->state));
+		return -CAUSE_BUSY;
+	}
+	/* only move a normal voice call; MFT/MWI sub-states and data calls are not movable */
+	if (nmt->active_state != ACTIVE_STATE_VOICE || trans->dms_call || trans->mwi_call) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: call for '%s' is not in plain voice state, not moving\n", dialing);
+		return -CAUSE_BUSY;
+	}
+	if (want_channel && want_channel == atoi(nmt->sender.kanal)) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: already on channel %d\n", want_channel);
+		return -CAUSE_INVALNUMBER;
+	}
+
+	tc = scip_find_target(nmt, want_channel);
+	if (!tc) {
+		if (want_channel)
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: target channel %d is not a free TC\n", want_channel);
+		else
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: no free traffic channel to move to\n");
+		return -CAUSE_NOCHANNEL;
+	}
+
+	LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: moving call '%c%s' from TC #%s to TC #%s\n",
+		trans->subscriber.country, trans->subscriber.number, nmt->sender.kanal, tc->sender.kanal);
+
+	/* arm the order on the current channel; the move happens in tx_scip_order() */
+	nmt->scip_target = tc;
+	nmt->tx_frame_count = 0;
+	osmo_timer_del(&nmt->timer); /* stop supervisory timer while ordering */
+	nmt_new_state(nmt, STATE_SCIP_ORDER);
+	nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
+
+	return 0;
+}
+
+/* Deliver a move command from the control FIFO.
+ * Format: <subscriber>[,<channel>]   e.g. "3735859" (auto) or "3735859,5" (to channel 5)
+ */
+void deliver_move(const char *command)
+{
+	char buffer[256], *p, *number, *chan_str;
+	int want_channel = 0;
+	int rc;
+
+	if (!command || !command[0]) {
+		LOGP(DNMT, LOGL_NOTICE, "MOVE: empty command\n");
+		return;
+	}
+
+	strncpy(buffer, command, sizeof(buffer) - 1);
+	buffer[sizeof(buffer) - 1] = '\0';
+	p = buffer;
+
+	number = strsep(&p, ",");
+	chan_str = p; /* may be NULL */
+
+	if (!number || strlen(number) != 7) {
+		LOGP(DNMT, LOGL_NOTICE, "MOVE: number must be 7 digits. Use: <number>[,<channel>]\n");
+		return;
+	}
+	if (chan_str && chan_str[0])
+		want_channel = atoi(chan_str);
+
+	LOGP(DNMT, LOGL_INFO, "MOVE '%s' to %s\n", number, want_channel ? chan_str : "free channel");
+	printf("MOVE '%s' to %s\n", number, want_channel ? chan_str : "auto-selected free channel");
+
+	rc = nmt_scip(number, want_channel);
+	if (rc < 0) {
+		LOGP(DNMT, LOGL_NOTICE, "MOVE failed: %s\n",
+			(rc == -CAUSE_INVALNUMBER) ? "invalid number / same channel" :
+			(rc == -CAUSE_OUTOFORDER) ? "subscriber not in a call" :
+			(rc == -CAUSE_BUSY) ? "call not in a movable state" :
+			(rc == -CAUSE_NOCHANNEL) ? "no free traffic channel" : "unknown error");
+		printf("MOVE failed!\n");
+		return;
+	}
+	printf("MOVE ordered.\n");
 }
 
 void dump_info(void) {}
