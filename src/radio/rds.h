@@ -846,6 +846,27 @@ static inline const char *rds_paging_rpc_desc(uint8_t rpc, char *buf, int buflen
 #define RDS_ODA_AID_TMC_ALERT2  0xCD47  /* RDS-TMC Alert-C (alt) */
 #define RDS_ODA_AID_STATION_LOGO 0xFF7F /* RFT: Station logo */
 
+/* ============================================================
+ * Group 8A: Traffic Message Channel (TMC / ALERT-C)
+ * EN 50067 §3.1.5.12, Fig 27; ISO 14819.
+ * Bit layout: gr-rds parser_impl.cc (GPLv3) + redsea message.cc (MIT).
+ *
+ * Block B[4:0]:  b4=T  b3=F  b2:0=DP/CI
+ * First/single group Block C: b15=D(diversion), b14=direction,
+ *   b13:11=extent, b10:0=event(11-bit); Block D: location(16-bit).
+ * Multi-group follow-on Block C: b14=SG, b13:12=GSI, b11:0+D=free_format(28-bit).
+ * ============================================================ */
+typedef struct {
+	int      t;          /* 0=user message, 1=tuning info */
+	int      f;          /* 0=multi-group, 1=single-group */
+	uint8_t  dp;         /* Duration & Persistence (single) or CI (multi) */
+	int      diversion;  /* D bit: 1=diversion recommended */
+	int      direction;  /* 0=positive/downstream, 1=negative/upstream */
+	uint8_t  extent;     /* segments affected (0-7; add 1 for actual count) */
+	uint16_t event;      /* 11-bit ISO 14819-2 event code */
+	uint16_t location;   /* 16-bit ISO 14819-3 location code */
+} rds_tmc_msg_t;
+
 /* Maximum simultaneous ODA configurations */
 #define RDS_ODA_MAX_CONFIGS     8
 
@@ -1887,6 +1908,16 @@ typedef struct rds_encoder {
 	struct rds_decoder *tx_log_decoder;	/* Decoder for logging TX groups */
 
 	/* ============================================================
+	 * Group 8A: Traffic Message Channel (TMC)
+	 * EN 50067 §3.1.5.12. Single-group user messages only (TX).
+	 * Announced via Group 3A (AID=0xCD46) and Group 1A (variant 1, TMC ID).
+	 * ============================================================ */
+	struct {
+		int      active;    /* 1 = transmit TMC groups */
+		rds_tmc_msg_t msg;  /* current message to transmit */
+	}		tmc;
+
+	/* ============================================================
 	 * Group 5: Transparent Data Channels (TDC)
 	 * EN 50067 §3.1.5.8, §3.2.4. 32 independent channels (0-31).
 	 * 5A: 4 data bytes/group (blocks C+D, offset C/D).
@@ -2647,6 +2678,20 @@ typedef struct rds_decoder {
 	void		(*ih_callback)(uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data, void *arg);
 	void		*ih_callback_arg;
 
+	/* Group 8A: TMC (Traffic Message Channel) receive callback
+	 * Called when a single-group or complete multi-group user message is decoded.
+	 * msg contains the extracted T/F/DP/direction/extent/event/location fields. */
+	void		(*tmc_callback)(const rds_tmc_msg_t *msg, void *arg);
+	void		*tmc_callback_arg;
+	struct {
+		int      pending;       /* 1 = multi-group assembly in progress */
+		uint8_t  ci;            /* continuity index of current multi-group message */
+		uint16_t c_first;       /* block C of the first (header) group */
+		uint16_t d_first;       /* block D of the first (header) group */
+		uint32_t free_fmt[4];   /* free-format words [GSI 3..0] */
+		int      n_groups;      /* GSI from the second group (number of follow-ons) */
+	}		tmc_asm;
+
 } rds_decoder_t;
 
 /* Initialize RDS decoder
@@ -2808,5 +2853,15 @@ void rds_decoder_set_ih_callback(rds_decoder_t *rds,
 				 void (*fn)(uint8_t b_payload, int is_6b,
 					    uint16_t c_data, uint16_t d_data, void *arg),
 				 void *arg);
+
+/* Group 8A: TMC (Traffic Message Channel) TX/RX API
+ * EN 50067 §3.1.5.12.  Bit layout from gr-rds (GPLv3) + redsea (MIT).
+ * TX emits single-group user messages.  Announce via 3A (AID=0xCD46)
+ * and 1A variant-1 (TMC ID) in the scheduler before enabling. */
+void rds_enc_tmc_set_msg(rds_encoder_t *rds, const rds_tmc_msg_t *msg);
+void rds_enc_tmc_clear(rds_encoder_t *rds);
+void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
+				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
+				  void *arg);
 
 #endif /* _RDS_H */

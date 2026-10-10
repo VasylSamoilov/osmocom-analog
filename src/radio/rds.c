@@ -3193,6 +3193,7 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 static void rds_build_group_5a(rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_5b(rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_6 (rds_encoder_t *rds, uint8_t *group);
+static void rds_build_group_8a(rds_encoder_t *rds, uint8_t *group);
 
 static void rds_generate_group(rds_encoder_t *rds)
 {
@@ -3346,6 +3347,14 @@ static void rds_generate_group(rds_encoder_t *rds)
 	case RDS_GROUP_6B:
 		if (rds->ih.active) {
 			rds_build_group_6(rds, rds->group_buffer);
+		} else {
+			rds_build_group_0a(rds, rds->group_buffer);
+		}
+		break;
+	/* Group 8: Traffic Message Channel (TMC) */
+	case RDS_GROUP_8A:
+		if (rds->tmc.active) {
+			rds_build_group_8a(rds, rds->group_buffer);
 		} else {
 			rds_build_group_0a(rds, rds->group_buffer);
 		}
@@ -3943,6 +3952,75 @@ void rds_decoder_set_tdc_callback(rds_decoder_t *rds,
 	if (!rds) return;
 	rds->tdc_callback = fn;
 	rds->tdc_callback_arg = arg;
+}
+
+/* ============================================================
+ * Group 8A: Traffic Message Channel (TMC / ALERT-C)
+ * EN 50067 §3.1.5.12, Figure 27; ISO 14819.
+ * Bit layout verified against gr-rds (GPLv3) and redsea (MIT).
+ *
+ * TX: single-group user messages only.  Announce via a 3A group with
+ *     AID=0xCD46 and a 1A group with variant 1 (TMC ID) before enabling.
+ * RX: single-group user messages decoded and delivered via callback;
+ *     multi-group messages recognised and assembled (GSI countdown).
+ * ============================================================ */
+
+static void rds_build_group_8a(rds_encoder_t *rds, uint8_t *group)
+{
+	const rds_tmc_msg_t *m = &rds->tmc.msg;
+	uint32_t blocks[4] = {0};
+	uint16_t b2, b3, b4;
+
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+
+	/* Block B: 8A + TP + PTY + T=0(user) + F=1(single) + DP(2:0) */
+	b2 = (RDS_GROUP_8A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp  << RDS_B2_TP_BIT)  |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     /* T=0 (user message), F=1 (single-group) */
+	     (1 << 3) |                             /* F=1: single-group */
+	     (m->dp & 0x07);                        /* DP bits 2:0 */
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+
+	/* Block C: D[15]=diversion, direction[14], extent[13:11], event[10:0] */
+	b3 = ((m->diversion ? 1 : 0)       << 15) |
+	     ((m->direction  ? 1 : 0)       << 14) |
+	     ((m->extent     & 0x07)        << 11) |
+	     (m->event       & 0x07FF);
+	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+
+	/* Block D: location code (16-bit) */
+	b4 = m->location;
+	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
+
+	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG,
+		     "RDS TX 8A TMC: event=%u loc=%u dir=%s ext=%u div=%d DP=%u\n",
+		     m->event, m->location,
+		     m->direction ? "neg" : "pos",
+		     m->extent + 1, m->diversion, m->dp);
+}
+
+/* TMC encoder API */
+void rds_enc_tmc_set_msg(rds_encoder_t *rds, const rds_tmc_msg_t *msg)
+{
+	if (!rds || !msg) return;
+	rds->tmc.msg    = *msg;
+	rds->tmc.active = 1;
+}
+void rds_enc_tmc_clear(rds_encoder_t *rds)
+{
+	if (rds) rds->tmc.active = 0;
+}
+void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
+				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
+				  void *arg)
+{
+	if (!rds) return;
+	rds->tmc_callback     = fn;
+	rds->tmc_callback_arg = arg;
 }
 
 /* ============================================================
@@ -9818,7 +9896,105 @@ group14_done:
 		case RDS_ODA_AID_ERT:
 			rds_decode_ert(rds, rds->blocks, rds->block_status, oda);
 			break;
-		default:
+		case RDS_ODA_AID_TMC_ALERT:
+		case RDS_ODA_AID_TMC_ALERT2:
+			/* Group 8A: Traffic Message Channel (ALERT-C)
+			 * EN 50067 §3.1.5.12, Figure 27; ISO 14819.
+			 * Bit layout from gr-rds (GPLv3) + redsea (MIT).
+			 * Only handles type 8A (version A = user messages).  8B is ODA-only. */
+			if (version == 0 && (rds->group_mask & (1<<1))) {
+				int t = (b2 >> 4) & 1;   /* 0=user message, 1=tuning info */
+				int f = (b2 >> 3) & 1;   /* 0=multi-group, 1=single-group */
+				int dp_ci = b2 & 0x07;
+
+				if (t) {
+					/* Tuning info: log raw variant + data for future use */
+					int variant = b2 & 0x0F;
+					if (rds->debug)
+						LOGP(DRADIO, LOGL_DEBUG,
+						     "RDS 8A TMC: tuning info variant=%d C=%04X D=%04X\n",
+						     variant, b3, b4);
+				} else if (f || ((b2 & 0x08) == 0 && (b3 & 0x8000))) {
+					/* Single-group, OR first group of multi-group
+					 * (F=0 but D bit set → first group by gr-rds heuristic) */
+					if (!f) {
+						/* Start of multi-group — save header blocks */
+						rds->tmc_asm.pending  = 1;
+						rds->tmc_asm.ci       = dp_ci;
+						rds->tmc_asm.c_first  = b3;
+						rds->tmc_asm.d_first  = b4;
+						rds->tmc_asm.n_groups = 0;
+					}
+					if (f || 1) {
+						/* Deliver the single-group / first-group message now */
+						rds_tmc_msg_t msg = {0};
+						msg.t         = 0;
+						msg.f         = f;
+						msg.dp        = dp_ci;
+						msg.diversion = (b3 >> 15) & 1;
+						msg.direction = (b3 >> 14) & 1;
+						msg.extent    = (b3 >> 11) & 7;
+						msg.event     = b3 & 0x07FF;
+						msg.location  = b4;
+						if (rds->debug)
+							LOGP(DRADIO, LOGL_DEBUG,
+							     "RDS 8A TMC %s: event=%u loc=%u dir=%s "
+							     "ext=%u div=%d DP=%u\n",
+							     f ? "single" : "multi-first",
+							     msg.event, msg.location,
+							     msg.direction ? "neg" : "pos",
+							     msg.extent + 1, msg.diversion, msg.dp);
+						if (rds->verbose)
+							LOGP(DRADIO, LOGL_INFO,
+							     "RDS 8A TMC: event=%u loc=%u "
+							     "dir=%s extent=%u%s DP=%u\n",
+							     msg.event, msg.location,
+							     msg.direction ? "neg" : "pos",
+							     msg.extent + 1,
+							     msg.diversion ? " (diversion)" : "",
+							     msg.dp);
+						if (rds->tmc_callback)
+							rds->tmc_callback(&msg, rds->tmc_callback_arg);
+					}
+				} else {
+					/* Follow-on group of a multi-group message */
+					uint8_t ci  = b2 & 0x07;
+					int sg       = (b3 >> 14) & 1;  /* second-group flag */
+					int gsi      = (b3 >> 12) & 0x3; /* group sequence, counts down */
+					uint32_t ff  = ((uint32_t)(b3 & 0x0FFF) << 16) | b4;
+
+					if (rds->tmc_asm.pending && ci == rds->tmc_asm.ci) {
+						if (sg) rds->tmc_asm.n_groups = gsi;
+						if (gsi < 4) rds->tmc_asm.free_fmt[gsi] = ff;
+						if (rds->debug)
+							LOGP(DRADIO, LOGL_DEBUG,
+							     "RDS 8A TMC multi-follow: CI=%u SG=%d "
+							     "GSI=%d free_fmt=0x%07X\n",
+							     ci, sg, gsi, ff);
+						if (gsi == 0) {
+							/* Last follow-on: reassembled; re-deliver header */
+							rds_tmc_msg_t msg = {0};
+							msg.f         = 0;
+							msg.dp        = rds->tmc_asm.ci;
+							msg.diversion = (rds->tmc_asm.c_first >> 15) & 1;
+							msg.direction = (rds->tmc_asm.c_first >> 14) & 1;
+							msg.extent    = (rds->tmc_asm.c_first >> 11) & 7;
+							msg.event     = rds->tmc_asm.c_first & 0x07FF;
+							msg.location  = rds->tmc_asm.d_first;
+							rds->tmc_asm.pending = 0;
+							if (rds->tmc_callback)
+								rds->tmc_callback(&msg,
+								    rds->tmc_callback_arg);
+						}
+					} else if (rds->debug) {
+						LOGP(DRADIO, LOGL_DEBUG,
+						     "RDS 8A TMC multi-follow: CI mismatch "
+						     "(got %u, expected %u) — discarded\n",
+						     ci, rds->tmc_asm.ci);
+					}
+				}
+			}
+			break;
 			/* ODA registered but no specific decoder -- log the raw data */
 			if (rds->verbose)
 				LOGP(DRADIO, LOGL_INFO, "RDS %d%c: ODA data for AID=0x%04X (no decoder), "
