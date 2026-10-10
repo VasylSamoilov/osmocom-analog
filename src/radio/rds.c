@@ -11886,6 +11886,10 @@ void rds_decoder_display(rds_decoder_t *rds, FILE *fp)
 		char ps_disp[32] = "--------";
 		if (rds->ps_segments == 0x0F)
 			rds_text_to_display((uint8_t *)rds->ps, 8, ps_disp, sizeof(ps_disp));
+		else if (rds->ps_changes > 0)
+			/* Use last successfully completed PS when current cycle is partial */
+			rds_text_to_display((uint8_t *)rds->ps_prev_successful, 8,
+			                    ps_disp, sizeof(ps_disp));
 
 		const char *pty_name = rds_get_pty_name(rds->pty,
 		                           rds->force_rbds || RDS_IS_RBDS(rds->ecc));
