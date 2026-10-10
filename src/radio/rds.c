@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -8673,6 +8674,13 @@ static void rds_decode_group(rds_decoder_t *rds)
 	if (rds->group_mask & (1<<1)) {
 		rds->tp = tp;
 		rds->tp_status = rds->block_status[1];
+		/* Fire INFO when PTY changes (once per new value) */
+		if (pty != rds->pty_shown) {
+			LOGP(DRADIO, LOGL_INFO, "RDS PTY: %d (%s)\n",
+			     pty, rds_get_pty_name(pty,
+			         rds->force_rbds || RDS_IS_RBDS(rds->ecc)));
+			rds->pty_shown = pty;
+		}
 		rds->pty = pty;
 		rds->pty_status = rds->block_status[1];
 	}
@@ -9275,6 +9283,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 			
 			/* Check A/B flag change for 2A buffer */
 			if (ab_flag != rds->rt_2a_ab) {
+				/* A/B flip = new RadioText message starting.
+				 * Log the completed RT we are about to replace (if any). */
+				if (rds->rt_2a[0] != ' ' && rds->rt_2a[0] != '\0') {
+					char rt_disp[256];
+					rds_text_to_display((uint8_t *)rds->rt_2a, 64,
+					                    rt_disp, sizeof(rt_disp));
+					LOGP(DRADIO, LOGL_INFO, "RDS RT: \"%s\" (2A, A/B=%c)\n",
+					     rt_disp, rds->rt_2a_ab ? 'B' : 'A');
+				}
 				rds->rt_2a_ab = ab_flag;
 				rds->rt_2a_segments = 0;
 				memset(rds->rt_2a, ' ', 64);
@@ -9487,16 +9504,24 @@ static void rds_decode_group(rds_decoder_t *rds)
 
 #if defined(__GLIBC__) || defined(__linux__)
 				double delta = difftime(rx_utc, sys_now);
-				
-				LOGP(DRADIO, LOGL_INFO, "RDS 4A: Time Delta: RX (UTC) is %.0f seconds %s system time\n",
+
+				/* Demote raw time-delta to DEBUG -- it repeats every 4A group */
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 4A: Time Delta: RX (UTC) is %.0f seconds %s system time\n",
 				     fabs(delta), (delta >= 0) ? "ahead of" : "behind");
-				     
-				/* User Requested Format: UTC, Offset, Local, Delta */
-				LOGP(DRADIO, LOGL_INFO, "RDS 4A Report: UTC=%04d-%02d-%02dT%02d:%02dZ  "
-				     "Offset=%+.1fh  Local=%02d:%02d  Delta=%+.0fs\n",
-				     utc_year, utc_month, utc_day, utc_hour, utc_minute,
-				     tz_offset / 2.0,
-				     local_hour, local_minute, delta);
+
+				/* Fire the user-readable report only when the displayed minute
+				 * changes -- avoids one INFO line per 4A group (dozens/hour). */
+				if (rds->ct_hour != rds->ct_shown_hour ||
+				    rds->ct_minute != rds->ct_shown_minute) {
+					LOGP(DRADIO, LOGL_INFO,
+					     "RDS CT: %04d-%02d-%02dT%02d:%02dZ  Offset=%+.1fh"
+					     "  Local=%02d:%02d  (Delta=%+.0fs)\n",
+					     utc_year, utc_month, utc_day, utc_hour, utc_minute,
+					     tz_offset / 2.0,
+					     local_hour, local_minute, delta);
+					rds->ct_shown_hour   = rds->ct_hour;
+					rds->ct_shown_minute = rds->ct_minute;
+				}
 #endif
 			} else {
 				if (rds->debug)
@@ -10462,12 +10487,14 @@ group14_done:
 		if (rds->debug)
 			LOGP(DRADIO, LOGL_DEBUG, "RDS 15A: Long PS seg=%d\n", seg);
 
-		if (rds->long_ps_segments == 0xFF && rds->verbose) {
-			/* All 8 segments received -- display complete long PS */
+		if (rds->long_ps_segments == 0xFF) {
+			/* All 8 segments received -- display complete long PS.
+			 * Always log at INFO (not gated on verbose) -- it is the
+			 * Long PS equivalent of the PS INFO line. */
 			char display[RDS_LONG_PS_LEN + 1];
-			memcpy(display, rds->long_ps, RDS_LONG_PS_LEN);
-			display[RDS_LONG_PS_LEN] = '\0';
-			LOGP(DRADIO, LOGL_INFO, "RDS 15A: Long PS complete: \"%s\"\n", display);
+			rds_text_to_display((uint8_t *)rds->long_ps, RDS_LONG_PS_LEN,
+			                    display, sizeof(display));
+			LOGP(DRADIO, LOGL_INFO, "RDS LPS: \"%s\"\n", display);
 		}
 	}
 	else if (group_type == 15 && version == 1) {
@@ -10977,6 +11004,12 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->force_rbds = force_rbds;
 	rds->time_constant_us = time_constant_us;
 
+	/* Display defaults: colour if stdout is a tty, sentinels for change-detection */
+	rds->ansi_display    = isatty(fileno(stdout));
+	rds->pty_shown       = 0xFF;  /* fire INFO on first PTY */
+	rds->ct_shown_hour   = 0xFF;
+	rds->ct_shown_minute = 0xFF;
+
 	/* Log emphasis/mode mismatch hints once at startup.
 	 * Do NOT auto-set ECC -- let the actual ECC from Group 1A determine the mode.
 	 * The force_rbds flag only affects decoder interpretation (PTY names, callsign). */
@@ -11114,7 +11147,13 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	rds->verbose = verbose;
 	rds->force_rbds = force_rbds;
 	rds->time_constant_us = time_constant_us;
-	
+
+	/* Reset change-detection sentinels (new stream = fire INFO on first decode) */
+	rds->ansi_display    = isatty(fileno(stdout));
+	rds->pty_shown       = 0xFF;
+	rds->ct_shown_hour   = 0xFF;
+	rds->ct_shown_minute = 0xFF;
+
 	/* Restore callbacks */
 	rds->group_callback = group_callback;
 	rds->group_callback_arg = group_callback_arg;
@@ -11799,6 +11838,262 @@ uint16_t rds_dec_get_ews_channel(const rds_decoder_t *rds)
 uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds)
 {
 	return rds->slc_broadcaster;
+}
+
+/* ============================================================
+ * rds_decoder_display() -- formatted one-page RDS panel
+ *
+ * Writes a compact TEF6686-style RDS display to fp.
+ * No LOGP() prefix -- suitable for stdout, a log file, or
+ * periodic screen-refresh (caller emits \033[H before calling).
+ *
+ * ASCII layout (78 chars wide, pure ASCII box-drawing):
+ *
+ *  +-- FM RDS -----------------------------------------------+
+ *  | PI: XXXX  PS: "Station"  PTY: N (Name)  TP: Y  TA: N   |
+ *  | RT: "Now playing: Song - Artist                        " |
+ *  | AF: 98.8 | 97.3 | 99.5 MHz  (N freq, complete/partial) |
+ *  | DI: [S]Has stereo  [_]Artificial head  [_]Dynamic PTY  |
+ *  | CT: 2019-05-28T12:49Z  +1.0h  Local: 13:49             |
+ *  | ECC: E1 (United Kingdom)  LIC: 9 (English)  Mode: RDS  |
+ *  | BLER: 0.023%  OK:55595  Errors:13  Groups:55608         |
+ *  | Groups: 0A:47.2%  2A:36.8%  1A:3.4%  10A:0.7%  ...    |
+ *  +---------------------------------------------------------+
+ *
+ * ANSI colour: enabled when rds->ansi_display = 1 (set from isatty
+ * at decoder_init, overridable by the application).
+ * ============================================================ */
+void rds_decoder_display(rds_decoder_t *rds, FILE *fp)
+{
+	if (!rds || !fp) return;
+
+/* ANSI helpers (pure ASCII escape sequences, safe in C string literals) */
+#define ANSI_BOLD    (rds->ansi_display ? "\033[1m"    : "")
+#define ANSI_DIM     (rds->ansi_display ? "\033[2m"    : "")
+#define ANSI_GREEN   (rds->ansi_display ? "\033[32m"   : "")
+#define ANSI_YELLOW  (rds->ansi_display ? "\033[33m"   : "")
+#define ANSI_CYAN    (rds->ansi_display ? "\033[36m"   : "")
+#define ANSI_RED     (rds->ansi_display ? "\033[31m"   : "")
+#define ANSI_RESET   (rds->ansi_display ? "\033[0m"    : "")
+
+	const char *sep = "+--------------------------------------------------------"
+	                  "---------------------+";
+
+	fprintf(fp, "%s%s%s\n", ANSI_CYAN, sep, ANSI_RESET);
+
+	/* --- Line 1: PI / PS / PTY / TP / TA / MS --- */
+	{
+		char ps_disp[32] = "--------";
+		if (rds->ps_segments == 0x0F)
+			rds_text_to_display((uint8_t *)rds->ps, 8, ps_disp, sizeof(ps_disp));
+
+		const char *pty_name = rds_get_pty_name(rds->pty,
+		                           rds->force_rbds || RDS_IS_RBDS(rds->ecc));
+		const char *mode = RDS_IS_RBDS(rds->ecc) ? "RBDS" : "RDS";
+
+		fprintf(fp, "| %sPI:%s %s%04X%s  %sPS:%s \"%s%-8s%s\"  "
+		            "%sPTY:%s %d (%s) [%s]\n",
+		        ANSI_DIM,  ANSI_RESET,
+		        ANSI_BOLD, rds->pi,      ANSI_RESET,
+		        ANSI_DIM,  ANSI_RESET,
+		        ANSI_BOLD, ps_disp,      ANSI_RESET,
+		        ANSI_DIM,  ANSI_RESET,
+		        rds->pty,  pty_name ? pty_name : "?", mode);
+
+		fprintf(fp, "|   %sTP:%s %s%-3s%s  %sTA:%s %s%-3s%s  "
+		            "%sM/S:%s %s%-6s%s"
+		            "                                     |\n",
+		        ANSI_DIM,   ANSI_RESET,
+		        rds->tp ? ANSI_GREEN : ANSI_DIM, rds->tp ? "Y" : "N", ANSI_RESET,
+		        ANSI_DIM,   ANSI_RESET,
+		        rds->ta ? ANSI_YELLOW : ANSI_DIM, rds->ta ? "YES" : "N", ANSI_RESET,
+		        ANSI_DIM,   ANSI_RESET,
+		        ANSI_BOLD,  rds->ms ? "Music" : "Speech", ANSI_RESET);
+	}
+
+	/* --- Line 2: RadioText --- */
+	{
+		char rt_disp[80] = "";
+		if (rds->rt_segments) {
+			rds_text_to_display((uint8_t *)rds->rt,
+			                    rds->rt_version == 0 ? 64 : 32,
+			                    rt_disp, sizeof(rt_disp));
+		}
+		if (rt_disp[0])
+			fprintf(fp, "| %sRT:%s %s\"%-64s\"%s |\n",
+			        ANSI_DIM,  ANSI_RESET,
+			        ANSI_BOLD, rt_disp, ANSI_RESET);
+		else
+			fprintf(fp, "| %sRT:%s %s(not yet received)%s"
+			            "                                              |\n",
+			        ANSI_DIM, ANSI_RESET, ANSI_DIM, ANSI_RESET);
+	}
+
+	/* --- Line 3: AF --- */
+	{
+		const rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
+		int count = 0;
+		/* Count valid entries */
+		for (int i = 0; i < 25; i++) {
+			if (afd->freq[i]) count++;
+		}
+		if (count > 0) {
+			char af_buf[256] = "";
+			int pos = 0;
+			int shown = 0;
+			for (int i = 0; i < 25 && shown < 10; i++) {
+				if (!afd->freq[i]) continue;
+				if (afd->type[i] == RDS_AF_FREQ_VHF) {
+					pos += snprintf(af_buf + pos, sizeof(af_buf) - pos,
+					                "%.1f", afd->freq[i] / 10.0);
+				} else {
+					pos += snprintf(af_buf + pos, sizeof(af_buf) - pos,
+					                "%d(%s)", afd->freq[i],
+					                afd->type[i] == RDS_AF_FREQ_LF ? "LF" : "MF");
+				}
+				shown++;
+				if (shown < count && shown < 10)
+					pos += snprintf(af_buf + pos, sizeof(af_buf) - pos, " | ");
+			}
+			if (count > 10)
+				snprintf(af_buf + pos, sizeof(af_buf) - pos, " | ...");
+			fprintf(fp, "| %sAF:%s %s%-56s%s  %s(%d %s)%s  |\n",
+			        ANSI_DIM, ANSI_RESET,
+			        ANSI_BOLD, af_buf, ANSI_RESET,
+			        ANSI_DIM, count,
+			        afd->complete ? "complete" : "partial",
+			        ANSI_RESET);
+		} else {
+			fprintf(fp, "| %sAF:%s %s(no AF list)%s"
+			            "                                                  |\n",
+			        ANSI_DIM, ANSI_RESET, ANSI_DIM, ANSI_RESET);
+		}
+	}
+
+	/* --- Line 4: DI flags --- */
+	{
+#define DI_CHR(v)  ((v) ? (rds->ansi_display ? "\033[32mS\033[0m" : "S") : \
+                           (rds->ansi_display ? "\033[2m_\033[0m" : "_"))
+		fprintf(fp, "| %sDI:%s [%s] Has stereo  [%s] Artificial head"
+		            "  [%s] Compressed  [%s] Dynamic PTY"
+		            "                  |\n",
+		        ANSI_DIM, ANSI_RESET,
+		        DI_CHR(rds->di_stereo),
+		        DI_CHR(rds->di_artificial_head),
+		        DI_CHR(rds->di_compressed),
+		        DI_CHR(rds->di_dynamic_pty));
+#undef DI_CHR
+	}
+
+	/* --- Line 5: CT --- */
+	if (rds->ct_valid) {
+		int tz_h  = rds->ct_offset / 2;
+		int tz_m  = (abs(rds->ct_offset) % 2) ? 30 : 0;
+		int local_h = ((rds->ct_hour * 60 + rds->ct_minute) +
+		               (tz_h * 60 + (rds->ct_offset >= 0 ? tz_m : -tz_m))
+		              ) / 60 % 24;
+		int local_m = ((rds->ct_hour * 60 + rds->ct_minute) +
+		               (tz_h * 60 + (rds->ct_offset >= 0 ? tz_m : -tz_m))
+		              ) % 60;
+		fprintf(fp, "| %sCT:%s %s%02d:%02dZ%s  Offset%+.1fh  Local: %02d:%02d"
+		            "                                         |\n",
+		        ANSI_DIM, ANSI_RESET,
+		        ANSI_BOLD, rds->ct_hour, rds->ct_minute, ANSI_RESET,
+		        rds->ct_offset / 2.0,
+		        local_h, local_m);
+	}
+
+	/* --- Line 6: ECC / Language --- */
+	{
+		const char *ecc_full = rds_get_ecc_name(rds->ecc);
+		const char *lic_full = rds_get_language_name(rds->language_code);
+		/* Truncate ECC country list to first entry for brevity */
+		char ecc_short[32] = "?";
+		if (ecc_full) {
+			const char *paren = strchr(ecc_full, '(');
+			size_t len = paren ? (size_t)(paren - ecc_full) : strlen(ecc_full);
+			if (len > 31) len = 31;
+			memcpy(ecc_short, ecc_full, len);
+			ecc_short[len] = '\0';
+			/* Strip trailing space */
+			while (len > 0 && ecc_short[len-1] == ' ') ecc_short[--len] = '\0';
+		}
+		const char *lic_name = lic_full ? lic_full : "?";
+		fprintf(fp, "| %sECC:%s %s%02X%s (%s)  %sLIC:%s %s%02X%s (%s)"
+		            "                                 |\n",
+		        ANSI_DIM, ANSI_RESET,
+		        ANSI_BOLD, rds->ecc, ANSI_RESET, ecc_short,
+		        ANSI_DIM, ANSI_RESET,
+		        ANSI_BOLD, rds->language_code, ANSI_RESET, lic_name);
+	}
+
+	/* --- Line 7: Block error rate + counts --- */
+	{
+		uint32_t total = rds->blocks_received ? rds->blocks_received : 1;
+		double bler = 100.0 * rds->blocks_bad / total;
+		const char *quality = bler < 0.5 ? "clean" :
+		                      bler < 2.0 ? "fair"  : "poor";
+		const char *qcol    = bler < 0.5 ? ANSI_GREEN :
+		                      bler < 2.0 ? ANSI_YELLOW : ANSI_RED;
+		fprintf(fp, "| %sBLER:%s %s%.3f%%%s (%s%s%s)  "
+		            "OK:%lu  Err:%lu  Groups:%lu"
+		            "                        |\n",
+		        ANSI_DIM, ANSI_RESET,
+		        ANSI_BOLD, bler, ANSI_RESET,
+		        qcol, quality, ANSI_RESET,
+		        (unsigned long)rds->blocks_ok,
+		        (unsigned long)rds->blocks_bad,
+		        (unsigned long)rds->groups_received);
+	}
+
+	/* --- Line 8: Group type distribution (top 5, rest folded) --- */
+	{
+		typedef struct { int idx; int cnt; } grp_entry_t;
+		grp_entry_t top[5];
+		int ntop = 0;
+		uint32_t total = rds->groups_received ? rds->groups_received : 1;
+
+		for (int i = 0; i < 32; i++) {
+			if (!rds->group_type_counts[i]) continue;
+			if (ntop < 5) {
+				top[ntop].idx = i;
+				top[ntop].cnt = rds->group_type_counts[i];
+				ntop++;
+				for (int j = ntop-1; j > 0 &&
+				     top[j].cnt > top[j-1].cnt; j--) {
+					grp_entry_t tmp = top[j]; top[j] = top[j-1]; top[j-1] = tmp;
+				}
+			} else if (rds->group_type_counts[i] > top[4].cnt) {
+				top[4].idx = i;
+				top[4].cnt = rds->group_type_counts[i];
+				for (int j = 4; j > 0 && top[j].cnt > top[j-1].cnt; j--) {
+					grp_entry_t tmp = top[j]; top[j] = top[j-1]; top[j-1] = tmp;
+				}
+			}
+		}
+
+		char gbuf[160] = "";
+		int  gpos = 0;
+		for (int i = 0; i < ntop; i++) {
+			int    gi  = top[i].idx;
+			double pct = 100.0 * (double)top[i].cnt / (double)total;
+			gpos += snprintf(gbuf + gpos, sizeof(gbuf) - gpos,
+			                 " %d%c:%.1f%%",
+			                 gi >> 1, (gi & 1) ? 'B' : 'A', pct);
+		}
+		fprintf(fp, "| %sGroups:%s%s%-74s%s|\n",
+		        ANSI_DIM, ANSI_RESET, ANSI_DIM, gbuf, ANSI_RESET);
+	}
+
+	fprintf(fp, "%s%s%s\n", ANSI_CYAN, sep, ANSI_RESET);
+
+#undef ANSI_BOLD
+#undef ANSI_DIM
+#undef ANSI_GREEN
+#undef ANSI_YELLOW
+#undef ANSI_CYAN
+#undef ANSI_RED
+#undef ANSI_RESET
 }
 
 void rds_decoder_status(rds_decoder_t *rds)
