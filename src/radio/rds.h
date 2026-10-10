@@ -1233,9 +1233,18 @@ typedef struct {
 #define RDS_14A_VARIANT_BCAST   15      /* Broadcaster data (reserved) */
 
 /* 14A Variant 12 (Linkage) Block C fields */
-#define RDS_14A_LINK_LA_BIT     15      /* Linkage Actuator */
+#define RDS_14A_LINK_LA_BIT     15      /* Linkage Actuator (b15) */
 #define RDS_14A_LINK_LA_MASK    0x8000
-#define RDS_14A_LINK_LSN_MASK   0x0FFF  /* Linkage Set Number (12 bits) */
+#define RDS_14A_LINK_EG_BIT     14      /* Extended Generic (b14): 0=national/ODA, 1=intl/extended */
+#define RDS_14A_LINK_EG_MASK    0x4000
+/* b13 = X, unassigned */
+#define RDS_14A_LINK_ILS_BIT    12      /* International Linkage Set (b12): 0=national LSN, 1=CI+LI */
+#define RDS_14A_LINK_ILS_MASK   0x1000
+#define RDS_14A_LINK_LSN_MASK   0x0FFF  /* Linkage Set Number (bits 11-0) */
+/* When ILS=1: bits 11-8 = CI (Country Identifier), bits 7-0 = LI (Linkage Identifier) */
+#define RDS_14A_LINK_CI_SHIFT   8
+#define RDS_14A_LINK_CI_MASK    0x0F00
+#define RDS_14A_LINK_LI_MASK    0x00FF
 
 /* 14A Variant 13 (Info) Block C fields */
 #define RDS_14A_INFO_PTY_SHIFT  11
@@ -1438,8 +1447,10 @@ typedef struct {
 	uint8_t		mapped_af_count;
 	
 	/* Linkage (variant 12) */
-	uint8_t		linkage_la;	/* Linkage Actuator */
-	uint16_t	linkage_lsn;	/* Linkage Set Number (12 bits) */
+	uint8_t		linkage_la;	/* Linkage Actuator (LA, bit 15) */
+	uint8_t		linkage_eg;	/* Extended Generic (EG, bit 14): 0=national, 1=intl/extended */
+	uint8_t		linkage_ils;	/* Intl Linkage Set (ILS, bit 12): 0=national LSN, 1=CI+LI */
+	uint16_t	linkage_lsn;	/* Linkage Set Number (bits 11-0); when ILS=1: CI=bits11-8, LI=bits7-0 */
 	
 	/* PIN (variant 14) - for LINKED service (this ON), not current station
 	 * IEC 62106:2015 S6.1.5.2 - receiver uses CT for month context */

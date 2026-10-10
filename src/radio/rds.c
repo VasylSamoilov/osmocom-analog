@@ -2381,8 +2381,12 @@ static void rds_build_group_14a(rds_encoder_t *rds, uint8_t *group)
 		}
 		break;
 	case RDS_14A_VARIANT_LINK:
-		/* Linkage Information */
-		b3 = ((eon->linkage_la ? 1 : 0) << RDS_14A_LINK_LA_BIT) |
+		/* Linkage Information (EN 50067 §3.2.1.8, Fig 41/42)
+		 * b15=LA, b14=EG, b13=X(0), b12=ILS, b11..b0=LSN */
+		b3 = ((eon->linkage_la  ? 1 : 0) << RDS_14A_LINK_LA_BIT)  |
+		     ((eon->linkage_eg  ? 1 : 0) << RDS_14A_LINK_EG_BIT)  |
+		     /* b13 = X, always 0 */
+		     ((eon->linkage_ils ? 1 : 0) << RDS_14A_LINK_ILS_BIT) |
 		     (eon->linkage_lsn & RDS_14A_LINK_LSN_MASK);
 		break;
 	case RDS_14A_VARIANT_INFO:
@@ -9181,22 +9185,40 @@ static void rds_decode_group(rds_decoder_t *rds)
 				}
 			}
 			else if (usage == RDS_14A_VARIANT_LINK) {
-				/* Variant 12: Linkage Information (IEC 62106 S6.1.5.14)
-				 * Block C structure: LA(1) + EG/ILS(2) + SG(1) + LSN(12)
-				 * LA = Linkage Actuator, LSN = Linkage Set Number
-				 * The upper 4 bits of LSN [11:8] contain the LIC */
+				/* Variant 12: Linkage Information (EN 50067 §3.2.1.8, Fig 41/42)
+				 * Block C (b15..b0):
+				 *   b15 = LA (Linkage Actuator)
+				 *   b14 = EG (Extended Generic): 0=national/ODA, 1=international/extended
+				 *   b13 = X  (unassigned)
+				 *   b12 = ILS (International Linkage Set): 0=national flat LSN, 1=CI+LI
+				 *   b11..b0 = LSN (Linkage Set Number)
+				 *     When ILS=0: flat 12-bit national LSN
+				 *     When ILS=1: bits 11-8 = CI (Country Identifier), bits 7-0 = LI
+				 */
 				if (rds->group_mask & (1<<2)) {
-					int la = (b3 >> RDS_14A_LINK_LA_BIT) & 1;
+					int la  = (b3 >> RDS_14A_LINK_LA_BIT)  & 1;
+					int eg  = (b3 >> RDS_14A_LINK_EG_BIT)  & 1;
+					int ils = (b3 >> RDS_14A_LINK_ILS_BIT) & 1;
 					uint16_t lsn = b3 & RDS_14A_LINK_LSN_MASK;
-					uint8_t lic = (lsn >> 8) & 0x0F;  /* LIC in bits 11-8 */
-					
-					eon->linkage_la = la;
+
+					eon->linkage_la  = la;
+					eon->linkage_eg  = eg;
+					eon->linkage_ils = ils;
 					eon->linkage_lsn = lsn;
-					
-					if (rds->verbose)
-						LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Linkage: "
-						     "LA=%d LSN=0x%03X LIC=%d (%s)\n", 
-						     on_pi, la, lsn, lic, rds_get_linkage_name(lic));
+
+					if (rds->verbose) {
+						if (ils) {
+							uint8_t ci = (lsn >> RDS_14A_LINK_CI_SHIFT) & 0x0F;
+							uint8_t li = lsn & RDS_14A_LINK_LI_MASK;
+							LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Linkage: "
+							     "LA=%d EG=%d ILS=1 CI=0x%X LI=0x%02X\n",
+							     on_pi, la, eg, ci, li);
+						} else {
+							LOGP(DRADIO, LOGL_INFO, "RDS 14A: ON (PI=%04X) Linkage: "
+							     "LA=%d EG=%d ILS=0 LSN=0x%03X\n",
+							     on_pi, la, eg, lsn);
+						}
+					}
 				}
 			}
 			else if (usage == 13) {
