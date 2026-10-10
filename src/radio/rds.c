@@ -9794,13 +9794,14 @@ group14_done:
 						     "RDS 3A TMC sys-info v0: LTN=%u %s AFI=%d scope=0x%X\n",
 						     ltn, ltn ? "" : "(encrypted)", afi, mgs);
 						break; }
-					case 1: { /* Gap/timing */
+					case 1: { /* Gap/timing + LTCC */
 						static const int gap_vals[4] = {3,5,8,11};
-						int g   = (oda_message >> 12) & 0x3;
-						int sid = (oda_message >> 6) & 0x3F;
+						int g    = (oda_message >> 12) & 0x3;
+						int sid  = (oda_message >> 6) & 0x3F;
+						int ltcc = oda_message & 0xF;  /* location table country code */
 						LOGP(DRADIO, LOGL_INFO,
-						     "RDS 3A TMC sys-info v1: SID=%u gap=%d groups\n",
-						     sid, gap_vals[g]);
+						     "RDS 3A TMC sys-info v1: SID=%u gap=%d groups LTCC=%u\n",
+						     sid, gap_vals[g], ltcc);
 						break; }
 					case 2: { /* Encrypted service */
 						int sid   = (oda_message >> 6) & 0x3F;
