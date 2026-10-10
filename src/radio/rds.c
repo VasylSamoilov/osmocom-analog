@@ -3237,12 +3237,20 @@ static void rds_generate_group(rds_encoder_t *rds)
 	 * PRIORITY 1: Time-Triggered Group 4A (Clock-Time)
 	 * ============================================================
 	 * IEC 62106 S6.1.5.4: CT transmitted at minute boundaries.
-	 * Accuracy: within +/-100ms of UTC minute edge.
-	 * Rate: 1 group per minute (not per second). */
+	 * EN 50067 §3.1.5.6 Note 4: the minute edge should occur within ±0.1 s
+	 * of the END of the CT group.
+	 * Software TX limitation: rds_generate_group() is called at fixed group
+	 * boundaries locked to the audio sample clock.  A group slot cannot be
+	 * moved forward in time without breaking stream sync.  We fire the 4A on
+	 * the first group slot AFTER the UTC minute changes — this places the group
+	 * ~0..87.6 ms AFTER the edge, not centred on it.  Tighter compliance with
+	 * Note 4 requires hardware-level timing (SDR sample counter aligned to GPS
+	 * PPS or an RTC interrupt), which is outside the scope of software TX.
+	 * Rate: 1 group per minute. */
 	if (rds->ct_enabled) {
 		time_t now = time(NULL) + rds->ct_correction;
 		struct tm t_now_buf, t_last_buf;
-		
+
 		/* Use reentrant gmtime_r if available, or just copy immediately.
 		 * Since we can't assume gmtime_r exists on all platforms (though likely on Linux),
 		 * we'll use a safe pattern with standard gmtime */
@@ -3250,7 +3258,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 		struct tm *ptr = gmtime(&now);
 		if (ptr) memcpy(&t_now_buf, ptr, sizeof(struct tm));
 		else memset(&t_now_buf, 0, sizeof(struct tm));
-		
+
 		ptr = gmtime(&rds->last_ct_minute);
 		if (ptr) memcpy(&t_last_buf, ptr, sizeof(struct tm));
 		else memset(&t_last_buf, 0, sizeof(struct tm));
@@ -3258,7 +3266,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 		if (t_now_buf.tm_min != t_last_buf.tm_min) {
 			rds_build_group_4a(rds, rds->group_buffer);
 			rds->last_ct_minute = now;
-			rds->group_sequence++; /* Increment total counter */
+			rds->group_sequence++;
 			rds->group_bit_pos = 0;
 			if (rds->debug)
 				LOGP(DRADIO, LOGL_DEBUG, "RDS TX 4A: CT interrupt\n");
