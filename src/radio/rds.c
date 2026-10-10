@@ -9268,8 +9268,20 @@ group14_done:
 			     app_group >> 1, (app_group & 1) ? 'B' : 'A', aid, oda_message);
 		
 		/* Store ODA registration in oda_apps[] indexed by carrier group type
-		 * This allows the decoder to later identify ODA data on other groups */
+		 * This allows the decoder to later identify ODA data on other groups.
+		 * EN 50067 §3.1.5.4: code 0x00 = "not currently carried in associated
+		 * group"; code 0x1F = "temporary data fault". These are encoder-status
+		 * indicators, not real carrier-group assignments — do not register them. */
 		if ((rds->group_mask & (1<<3))) {  /* Block D (AID) valid */
+			if (app_group == 0x00 || app_group == 0x1F) {
+				/* Status indication only */
+				if (rds->debug)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 3A: status code 0x%02X "
+					     "(%s) AID=0x%04X — not a carrier assignment\n",
+					     app_group,
+					     app_group == 0x00 ? "not carried" : "data fault",
+					     aid);
+			} else {
 			rds_oda_app_t *oda = &rds->oda_apps[app_group];
 			
 			/* Check if this is a new or updated registration */
@@ -9303,6 +9315,7 @@ group14_done:
 				     app_group >> 1, (app_group & 1) ? 'B' : 'A',
 				     oda_message);
 			}
+			} /* else: valid carrier assignment */
 		}
 	}
 	else if (group_type == 3 && version == 1) {
