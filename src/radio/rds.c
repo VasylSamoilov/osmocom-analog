@@ -4044,6 +4044,108 @@ uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds)
 	return rds ? rds->tmc_ltn : 0;
 }
 
+/* TMC encoder query */
+int rds_enc_tmc_get_active(const rds_encoder_t *rds)
+{
+	return rds ? rds->tmc.active : 0;
+}
+void rds_enc_tmc_get_msg(const rds_encoder_t *rds, rds_tmc_msg_t *msg_out)
+{
+	if (!rds || !msg_out) return;
+	*msg_out = rds->tmc.msg;
+}
+
+/* TDC state queries */
+int rds_enc_tdc_get_active(const rds_encoder_t *rds, int channel)
+{
+	if (!rds || channel < 0 || channel >= RDS_TDC_MAX_CHANNELS) return 0;
+	return rds->tdc_ch[channel].len > 0 ? 1 : 0;
+}
+int rds_enc_tdc_get_pending(const rds_encoder_t *rds, int channel)
+{
+	if (!rds || channel < 0 || channel >= RDS_TDC_MAX_CHANNELS) return 0;
+	return rds->tdc_ch[channel].len;
+}
+
+/* Long PS state queries */
+int rds_enc_get_long_ps_active(const rds_encoder_t *rds)
+{
+	return rds ? rds->long_ps_active : 0;
+}
+int rds_dec_get_long_ps_complete(const rds_decoder_t *rds)
+{
+	return rds ? (rds->long_ps_segments == 0xFF) : 0;
+}
+
+/* ============================================================
+ * TMC event-code text lookup (optional runtime table)
+ * Loads docs/rds/tmc_events.csv (semicolon-delimited, 10 columns).
+ * Column 0 = event code (integer), column 1 = English description.
+ * ============================================================ */
+#define TMC_EVENT_TABLE_SIZE 2048
+static char *tmc_event_table[TMC_EVENT_TABLE_SIZE]; /* NULL until loaded */
+static int   tmc_events_loaded = 0;
+
+int rds_tmc_load_events(const char *csv_path)
+{
+	FILE *f = fopen(csv_path, "r");
+	if (!f) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS TMC: cannot open event table '%s'\n", csv_path);
+		return -1;
+	}
+	rds_tmc_unload_events(); /* free any previous table */
+
+	char line[512];
+	int  loaded = 0;
+	int  lineno = 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		lineno++;
+		/* Skip header line (starts with "Code") */
+		if (lineno == 1) continue;
+
+		/* Parse: Code;Description;... (semicolon-delimited) */
+		char *p = line;
+		char *code_s = p;
+		while (*p && *p != ';') p++;
+		if (!*p) continue;
+		*p++ = '\0';
+
+		char *desc_s = p;
+		while (*p && *p != ';' && *p != '\n' && *p != '\r') p++;
+		*p = '\0';
+
+		int code = atoi(code_s);
+		if (code <= 0 || code >= TMC_EVENT_TABLE_SIZE) continue;
+		if (!*desc_s) continue;
+
+		free(tmc_event_table[code]);
+		tmc_event_table[code] = strdup(desc_s);
+		if (tmc_event_table[code]) loaded++;
+	}
+
+	fclose(f);
+	tmc_events_loaded = 1;
+	LOGP(DRADIO, LOGL_INFO, "RDS TMC: loaded %d event descriptions from '%s'\n",
+	     loaded, csv_path);
+	return loaded;
+}
+
+const char *rds_tmc_event_desc(uint16_t code)
+{
+	if (!tmc_events_loaded || code >= TMC_EVENT_TABLE_SIZE) return NULL;
+	return tmc_event_table[code]; /* may be NULL if not in table */
+}
+
+void rds_tmc_unload_events(void)
+{
+	for (int i = 0; i < TMC_EVENT_TABLE_SIZE; i++) {
+		free(tmc_event_table[i]);
+		tmc_event_table[i] = NULL;
+	}
+	tmc_events_loaded = 0;
+}
+
 /* ============================================================
  * Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
  * Bit layout from redsea station.cc::decodeType15A (MIT licence).
@@ -10182,17 +10284,23 @@ group14_done:
 							     msg.direction ? "neg" : "pos",
 							     msg.extent + 1, msg.diversion,
 							     dp_ci, dp_short[dp_ci]);
-						if (rds->verbose)
-							LOGP(DRADIO, LOGL_INFO,
-							     "RDS 8A TMC: event=%u loc=%u "
-							     "dir=%s extent=%u%s "
-							     "duration=%s\n",
-							     msg.event, msg.location,
-							     msg.direction ? "neg" : "pos",
-							     msg.extent + 1,
-							     msg.diversion ? " (diversion)" : "",
-							     msg.direction ? dp_long[dp_ci]
-									   : dp_short[dp_ci]);
+						if (rds->verbose) {
+						const char *desc = rds_tmc_event_desc(msg.event);
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 8A TMC: event=%u%s%s loc=%u "
+						     "dir=%s extent=%u%s "
+						     "duration=%s\n",
+						     msg.event,
+						     desc ? " (" : "",
+						     desc ? desc  : "",
+						     desc ? ")" : "",
+						     msg.location,
+						     msg.direction ? "neg" : "pos",
+						     msg.extent + 1,
+						     msg.diversion ? " (diversion)" : "",
+						     msg.direction ? dp_long[dp_ci]
+								   : dp_short[dp_ci]);
+					}
 						if (rds->tmc_callback)
 							rds->tmc_callback(&msg, rds->tmc_callback_arg);
 					}

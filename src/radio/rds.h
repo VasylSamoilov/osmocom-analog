@@ -2881,11 +2881,26 @@ void rds_decoder_set_ih_callback(rds_decoder_t *rds,
  * and 1A variant-1 (TMC ID) in the scheduler before enabling. */
 void rds_enc_tmc_set_msg(rds_encoder_t *rds, const rds_tmc_msg_t *msg);
 void rds_enc_tmc_clear(rds_encoder_t *rds);
+int  rds_enc_tmc_get_active(const rds_encoder_t *rds);
+void rds_enc_tmc_get_msg(const rds_encoder_t *rds, rds_tmc_msg_t *msg_out);
 void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
 				  void *arg);
 /* Get the TMC Location Table Number announced via 3A system-info (0 = encrypted) */
 uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds);
+
+/* TMC event code text lookup (optional runtime table).
+ * Call rds_tmc_load_events(csv_path) once to load docs/rds/tmc_events.csv.
+ * After loading, rds_tmc_event_desc(code) returns the English description
+ * string for event codes 0-2047, or NULL when not found / not loaded.
+ * rds_tmc_unload_events() frees the table. */
+int         rds_tmc_load_events(const char *csv_path);
+const char *rds_tmc_event_desc(uint16_t code);
+void        rds_tmc_unload_events(void);
+
+/* Group 5: TDC state queries */
+int rds_enc_tdc_get_active(const rds_encoder_t *rds, int channel);
+int rds_enc_tdc_get_pending(const rds_encoder_t *rds, int channel);
 
 /* Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
  * 32-char UTF-8 programme service name transmitted over 8 segments.
@@ -2893,6 +2908,8 @@ uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds);
  * Source: redsea station.cc::decodeType15A (MIT). */
 void rds_enc_set_long_ps(rds_encoder_t *rds, const char *text);
 void rds_enc_clear_long_ps(rds_encoder_t *rds);
+int  rds_enc_get_long_ps_active(const rds_encoder_t *rds);
 void rds_dec_get_long_ps(const rds_decoder_t *rds, char *text, size_t max_len);
+int  rds_dec_get_long_ps_complete(const rds_decoder_t *rds);
 
 #endif /* _RDS_H */
