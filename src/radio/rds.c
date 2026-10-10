@@ -3087,7 +3087,7 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 	if (has_eon) {
 		ADD_GRP(RDS_GROUP_14A);
 	}
-	
+
 	/* Block 7b: Paging (7A) - always present when paging enabled.
 	 * The 7A builder handles idle state internally (pulls from queue
 	 * on demand or falls back to 0A/0B when nothing to send). */
@@ -3095,12 +3095,55 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 		ADD_GRP(RDS_GROUP_7A);
 		ADD_GRP(RDS_GROUP_7A);
 	}
-	
+
 	/* Block 7c: 13A address notification - only when paging AND 13A notify enabled.
 	 * Per EN 50067 M.3.2.5.2: 13A is optional, available for ODA when not used for paging. */
 	if (rds->paging.enabled && rds->paging.enhanced) {
 		ADD_GRP(RDS_GROUP_13A);
 	}
+
+	/* Block 7d: TDC (5A/5B) -- one slot per active channel per cycle.
+	 * EN 50067 S.3.1.5.8: data rate depends on how many channel
+	 * slots are present; one per scheduler cycle suffices for low-rate data. */
+	{
+		int tdc_any = 0;
+		for (int ch = 0; ch < RDS_TDC_MAX_CHANNELS; ch++) {
+			if (rds->tdc_ch[ch].len > 0) { tdc_any = 1; break; }
+		}
+		if (tdc_any) {
+			ADD_GRP(rds->tdc_use_5b ? RDS_GROUP_5B : RDS_GROUP_5A);
+		}
+	}
+
+	/* Block 7e: IH (6A/6B) -- one slot per cycle when active.
+	 * EN 50067 S.3.1.5.9: in-house use groups are infrequently transmitted. */
+	if (rds->ih.active) {
+		ADD_GRP(rds->ih.use_6b ? RDS_GROUP_6B : RDS_GROUP_6A);
+	}
+
+	/* Block 7f: TMC (8A) -- one slot per cycle when a message is queued.
+	 * EN 50067 S.3.1.5.12: TMC messages interleave with the normal stream.
+	 * The 8A builder handles multi-group sequencing internally. */
+	if (rds->tmc.active) {
+		ADD_GRP(RDS_GROUP_8A);
+	}
+
+	/* Block 7g: EWS (9A) -- transmitted very infrequently unless an
+	 * emergency is active. EN 50067 S.3.1.5.13: one slot per cycle. */
+	if (rds->ews_9a_active) {
+		ADD_GRP(RDS_GROUP_9A);
+	}
+
+	/* Block 7h: Long PS (15A, RBDS) and 15B (fast basic tuning).
+	 * 15A cycles through 8 segments per activation; the builder
+	 * advances the segment counter internally.
+	 * 15B is always transmitted alongside Group 0A in RBDS mode. */
+	if (rds->long_ps_active) {
+		ADD_GRP(RDS_GROUP_15A);
+	}
+	/* 15B fast basic tuning: transmit one slot per cycle.
+	 * The builder falls back to Group 0A when no specific 15B data. */
+	ADD_GRP(RDS_GROUP_15B);
 	
 	/* Block 8: ODA identification (3A) + RT+ ODA group pair
 	 *
@@ -3194,6 +3237,7 @@ static void rds_build_group_5a(rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_5b(rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_6 (rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_8a(rds_encoder_t *rds, uint8_t *group);
+static void rds_build_group_9a(rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_15a(rds_encoder_t *rds, uint8_t *group);
 
 static void rds_generate_group(rds_encoder_t *rds)
@@ -3371,6 +3415,16 @@ static void rds_generate_group(rds_encoder_t *rds)
 	case RDS_GROUP_8A:
 		if (rds->tmc.active) {
 			rds_build_group_8a(rds, rds->group_buffer);
+		} else {
+			rds_build_group_0a(rds, rds->group_buffer);
+		}
+		break;
+	/* Group 9A: Emergency Warning System (EWS)
+	 * EN 50067 S.3.1.5.13, Figure 29.
+	 * 36 country-defined bits: B[3:0] + block C + block D. */
+	case RDS_GROUP_9A:
+		if (rds->ews_9a_active) {
+			rds_build_group_9a(rds, rds->group_buffer);
 		} else {
 			rds_build_group_0a(rds, rds->group_buffer);
 		}
@@ -4053,6 +4107,89 @@ void rds_enc_tmc_get_msg(const rds_encoder_t *rds, rds_tmc_msg_t *msg_out)
 {
 	if (!rds || !msg_out) return;
 	*msg_out = rds->tmc.msg;
+}
+/* ============================================================
+ * Group 9A: Emergency Warning System (EWS)
+ * EN 50067 S.3.1.5.13, Figure 29.
+ *
+ * Block B: [gt4..gt0=10010][B0=0][TP][PTY4..PTY0][b_lo3..b_lo0]
+ *   -- b_lo (B[3:0]) = 4 country-defined bits
+ * Block C: data_c (16 bits, country-defined)
+ * Block D: data_d (16 bits, country-defined)
+ * Total EWS payload: 36 bits (B[3:0] + C + D).
+ *
+ * "Format and application of these EWS message bits may be
+ *  assigned unilaterally by each country." (EN 50067 Fig 29 note)
+ *
+ * 9B is an ODA group (handled by the ODA eligibility mechanism).
+ * ============================================================ */
+static void rds_build_group_9a(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2;
+
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+
+	/* Block B: Group 9A + TP + PTY + B[3:0] (country-defined) */
+	b2 = (RDS_GROUP_9A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp  << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     (rds->ews_9a_b_lo & 0x0F);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+
+	/* Block C: country-defined EWS data (16 bits) */
+	blocks[2] = rds_build_block(rds->ews_9a_data_c, RDS_OFFSET_C);
+
+	/* Block D: country-defined EWS data (16 bits) */
+	blocks[3] = rds_build_block(rds->ews_9a_data_d, RDS_OFFSET_D);
+
+	rds_group_pack(blocks, group, 0);
+
+	if (rds->verbose)
+		LOGP(DRADIO, LOGL_INFO,
+		     "RDS TX 9A EWS: b_lo=0x%X c=0x%04X d=0x%04X\n",
+		     rds->ews_9a_b_lo, rds->ews_9a_data_c, rds->ews_9a_data_d);
+}
+
+/* Group 9A EWS TX setters/getters */
+void rds_enc_set_ews_9a(rds_encoder_t *rds, uint8_t b_lo,
+                        uint16_t data_c, uint16_t data_d)
+{
+	if (!rds) return;
+	rds->ews_9a_b_lo   = b_lo & 0x0F;
+	rds->ews_9a_data_c = data_c;
+	rds->ews_9a_data_d = data_d;
+	rds->ews_9a_active = 1;
+	rds_enc_scheduler_update(rds);
+	LOGP(DRADIO, LOGL_INFO,
+	     "RDS: EWS 9A set: b_lo=0x%X c=0x%04X d=0x%04X\n",
+	     rds->ews_9a_b_lo, data_c, data_d);
+}
+
+void rds_enc_clear_ews_9a(rds_encoder_t *rds)
+{
+	if (!rds) return;
+	if (rds->ews_9a_active) {
+		rds->ews_9a_active = 0;
+		rds_enc_scheduler_update(rds);
+		LOGP(DRADIO, LOGL_INFO, "RDS: EWS 9A cleared\n");
+	}
+}
+
+int rds_enc_get_ews_9a_active(const rds_encoder_t *rds)
+{
+	return rds ? rds->ews_9a_active : 0;
+}
+
+/* Group 9A EWS RX getter */
+uint8_t rds_dec_get_ews_9a(const rds_decoder_t *rds,
+                            uint8_t *b_lo, uint16_t *data_c, uint16_t *data_d)
+{
+	if (!rds) return 0;
+	if (b_lo)   *b_lo   = rds->ews_9a_b_lo;
+	if (data_c) *data_c = rds->ews_9a_data_c;
+	if (data_d) *data_d = rds->ews_9a_data_d;
+	return rds->ews_9a_status;
 }
 
 /* TDC state queries */
@@ -6408,6 +6545,10 @@ void rds_enc_set_ptyn(rds_encoder_t *rds, const char *ptyn)
 	int warn = 0;
 	rds_encode_text(ptyn, (uint8_t *)rds->ptyn, 8, &warn);
 	
+	/* EN 50067 Figure 31 Note 1: toggle A/B flag on every PTYN change so
+	 * receivers can detect that a new PTYN is being transmitted. */
+	rds->ptyn_ab ^= 1;
+
 	/* Reset PTYN segment for fresh transmission */
 	rds->ptyn_segment = 0;
 	
@@ -6417,7 +6558,8 @@ void rds_enc_set_ptyn(rds_encoder_t *rds, const char *ptyn)
 	/* Convert RDS-encoded PTYN to Unicode for logging */
 	char ptyn_display[33];  /* 8 chars * 4 bytes UTF-8 max + 1 */
 	rds_text_to_display((uint8_t *)rds->ptyn, 8, ptyn_display, sizeof(ptyn_display));
-	LOGP(DRADIO, LOGL_INFO, "RDS: PTYN set to \"%s\"\n", ptyn_display);
+	LOGP(DRADIO, LOGL_INFO, "RDS: PTYN set to \"%s\" (A/B=%c)\n",
+	     ptyn_display, rds->ptyn_ab ? 'B' : 'A');
 }
 
 void rds_enc_clear_ptyn(rds_encoder_t *rds)
@@ -9362,6 +9504,21 @@ static void rds_decode_group(rds_decoder_t *rds)
 					     "(MJD=%u hour=%d min=%d)\n", mjd, hour, minute);
 			}
 		}
+	}
+	else if (group_type == 9 && version == 0) {
+		/* Group 9A: Emergency Warning System (EWS)
+		 * EN 50067 S.3.1.5.13, Figure 29.
+		 * B[3:0] = 4 country-defined bits; C = 16-bit data; D = 16-bit data.
+		 * Format assigned unilaterally per country -- we store raw bits. */
+		uint8_t ews_b_lo = b2 & 0x0F;
+		rds->ews_9a_b_lo   = ews_b_lo;
+		rds->ews_9a_data_c = b3;
+		rds->ews_9a_data_d = b4;
+		rds->ews_9a_status = RDS_STATUS_VALID;
+		if (rds->verbose)
+			LOGP(DRADIO, LOGL_INFO,
+			     "RDS 9A EWS: b_lo=0x%X c=0x%04X d=0x%04X\n",
+			     ews_b_lo, b3, b4);
 	}
 	else if (group_type == 10 && version == 0) {
 		/* Group 10A: Programme Type Name (IEC 62106 S6.1.5.8)

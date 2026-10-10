@@ -1929,6 +1929,18 @@ typedef struct rds_encoder {
 	int		long_ps_active;                /* 1 = transmit 15A groups */
 
 	/* ============================================================
+	 * Group 9A: Emergency Warning System (EWS)
+	 * EN 50067 S.3.1.5.13 Fig 29.
+	 * 36 country-defined bits: B[3:0] (4b) + C[15:0] (16b) + D[15:0] (16b).
+	 * Format assigned unilaterally per country; we expose raw bits.
+	 * 9B is handled via ODA (no dedicated builder needed).
+	 * ============================================================ */
+	int		ews_9a_active;	/* 1 = transmit 9A EWS groups */
+	uint8_t		ews_9a_b_lo;	/* B[3:0] -- country-defined (4 bits) */
+	uint16_t	ews_9a_data_c;	/* Block C -- country-defined (16 bits) */
+	uint16_t	ews_9a_data_d;	/* Block D -- country-defined (16 bits) */
+
+	/* ============================================================
 	 * Group 5: Transparent Data Channels (TDC)
 	 * EN 50067 S.3.1.5.8, S.3.2.4. 32 independent channels (0-31).
 	 * 5A: 4 data bytes/group (blocks C+D, offset C/D).
@@ -2228,6 +2240,14 @@ uint16_t rds_enc_get_tmc_id(const rds_encoder_t *rds);
 void rds_enc_set_ews_channel(rds_encoder_t *rds, uint16_t ews);
 void rds_enc_clear_ews_channel(rds_encoder_t *rds);
 uint16_t rds_enc_get_ews_channel(const rds_encoder_t *rds);
+
+/* Group 9A EWS message TX (EN 50067 S.3.1.5.13 Fig 29).
+ * b_lo: 4-bit country-defined B[3:0]; data_c/data_d: 16-bit C/D blocks.
+ * Total 36 country-defined bits. Use rds_enc_clear_ews_9a() to stop. */
+void rds_enc_set_ews_9a(rds_encoder_t *rds, uint8_t b_lo,
+                        uint16_t data_c, uint16_t data_d);
+void rds_enc_clear_ews_9a(rds_encoder_t *rds);
+int  rds_enc_get_ews_9a_active(const rds_encoder_t *rds);
 
 /* Broadcaster Data - variant 6, 12-bit (0-4095, 0 = disabled) */
 void rds_enc_set_slc_broadcaster(rds_encoder_t *rds, uint16_t data);
@@ -2583,6 +2603,12 @@ typedef struct rds_decoder {
 	uint8_t		ews_channel_status;	/* Status of EWS decode */
 	uint16_t	slc_broadcaster;	/* Broadcaster data (variant 6, 12 bits) */
 	uint8_t		slc_broadcaster_status;	/* Status of broadcaster decode */
+
+	/* Group 9A EWS message (EN 50067 S.3.1.5.13 Fig 29) */
+	uint8_t		ews_9a_b_lo;		/* B[3:0] country-defined bits */
+	uint16_t	ews_9a_data_c;		/* Block C (16 bits) */
+	uint16_t	ews_9a_data_d;		/* Block D (16 bits) */
+	uint8_t		ews_9a_status;		/* 0=none, RDS_STATUS_VALID=received */
 	
 	/* Group 4A: Clock-Time and Date (IEC 62106 S6.1.5.4) */
 	uint32_t	ct_mjd;			/* Modified Julian Date */
@@ -2755,6 +2781,12 @@ uint8_t rds_dec_get_linkage_actuator(const rds_decoder_t *rds);
 uint16_t rds_dec_get_tmc_id(const rds_decoder_t *rds);
 uint16_t rds_dec_get_paging_id(const rds_decoder_t *rds);
 uint16_t rds_dec_get_ews_channel(const rds_decoder_t *rds);
+
+/* Group 9A EWS message RX (EN 50067 S.3.1.5.13 Fig 29).
+ * Returns RDS_STATUS_VALID once a 9A group has been decoded.
+ * b_lo/data_c/data_d carry the 36 country-defined bits. */
+uint8_t  rds_dec_get_ews_9a(const rds_decoder_t *rds,
+                             uint8_t *b_lo, uint16_t *data_c, uint16_t *data_d);
 uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds);
 
 /* Decoder getters -- paging state from Group 1A / 7A */
