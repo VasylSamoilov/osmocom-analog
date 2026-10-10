@@ -11442,14 +11442,16 @@ void rds_decoder_status(rds_decoder_t *rds)
 		     rds->ta ? "Y" : "N", STATUS_CHAR(rds->ta_status));
 	}
 	
-	/* Music/Speech and Decoder Identification flags */
+	/* Music/Speech and Decoder Identification flags (TEF6686 naming conventions) */
 	{
-		LOGP(DRADIO, LOGL_NOTICE, "M/S=%s %c  DI: Stereo=%s ArtHead=%s Compress=%s DynPTY=%s %c\n",
+		LOGP(DRADIO, LOGL_NOTICE,
+		     "M/S: %s %c  "
+		     "DI: Has stereo=%s  Artificial head=%s  Compressed=%s  Dynamic PTY=%s %c\n",
 		     rds->ms ? "Music" : "Speech", STATUS_CHAR(rds->ms_status),
-		     rds->di_stereo ? "Y" : "N",
+		     rds->di_stereo         ? "Y" : "N",
 		     rds->di_artificial_head ? "Y" : "N",
-		     rds->di_compressed ? "Y" : "N",
-		     rds->di_dynamic_pty ? "Y" : "N",
+		     rds->di_compressed     ? "Y" : "N",
+		     rds->di_dynamic_pty    ? "Y" : "N",
 		     STATUS_CHAR(rds->di_status));
 	}
 	
