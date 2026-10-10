@@ -327,6 +327,8 @@ typedef struct {
 	uint16_t vhf_freq[25];		/* VHF frequencies in 0.1 MHz (e.g., 910 = 91.0 MHz) */
 	uint16_t lf_mf_freq[12];	/* LF/MF frequencies in kHz (e.g., 225, 1008) */
 	uint8_t  lf_mf_type[12];	/* rds_af_freq_type_t: RDS_AF_FREQ_LF or RDS_AF_FREQ_MF */
+	uint8_t  mf_region2;		/* 1 = ITU region 2 (RBDS): MF on 10 kHz grid from 540 kHz;
+					 * 0 = region 1/3 (RDS): MF on 9 kHz grid from 531 kHz */
 } rds_af_method_a_t;
 
 /* AF Method A Decoder List - Rebuilt from RDS stream */
@@ -1221,8 +1223,8 @@ typedef struct {
 #define RDS_14A_INFO_TA_MASK    0x0001
 
 /* Group 14B Block B payload */
-#define RDS_14B_TA_BIT          4       /* TA for ON (Block B bit 4) */
-#define RDS_14B_TA_MASK         0x0010
+#define RDS_14B_TA_BIT          3       /* TA for ON (Block B bit 3; bit 4 is TP(ON)) */
+#define RDS_14B_TA_MASK         0x0008
 
 /* ============================================================
  * Group 15B Bit Fields (IEC 62106 S6.1.5.16)
@@ -1611,11 +1613,14 @@ typedef struct rds_encoder {
 	int		debug;		/* Debug logging (--rds-debug) */
 	int		verbose;	/* Verbose logging (--rds-verbose) */
 	
-	/* Decoder Identification (DI) flags - transmitted via Group 0A/0B */
-	uint8_t		di_stereo;		/* d3: Stereo (1) or Mono (0) */
-	uint8_t		di_artificial_head;	/* d2: Artificial head recording */
-	uint8_t		di_compressed;		/* d1: Compressed audio */
-	uint8_t		di_dynamic_pty;		/* d0: Dynamic PTY indicator */
+	/* Decoder Identification (DI) flags - transmitted via Group 0A/0B.
+	 * EN 50067 Table 9: d0=Stereo, d1=Artificial head, d2=Compressed,
+	 * d3=Dynamic PTY. The segment address selects which bit is sent
+	 * (seg 0 = d3 ... seg 3 = d0, MSB first). */
+	uint8_t		di_stereo;		/* d0: Stereo (1) or Mono (0) */
+	uint8_t		di_artificial_head;	/* d1: Artificial head recording */
+	uint8_t		di_compressed;		/* d2: Compressed audio */
+	uint8_t		di_dynamic_pty;		/* d3: Dynamic PTY indicator */
 	
 	/* Group 0A: Alternative Frequencies - Method A only
 	 * Uses human-readable frequency string format (IEC 62106 S3.2.1.6.3) */
@@ -2396,10 +2401,11 @@ typedef struct rds_decoder {
 	/* Group 0A/0B: Music/Speech and Decoder Identification (IEC 62106 S6.1.5.1) */
 	uint8_t		ms;			/* Music (1) / Speech (0) flag */
 	uint8_t		ms_status;		/* Status of M/S decode */
-	uint8_t		di_stereo;		/* d3: Stereo (1) or Mono (0) */
-	uint8_t		di_artificial_head;	/* d2: Artificial head recording */
-	uint8_t		di_compressed;		/* d1: Compressed audio */
-	uint8_t		di_dynamic_pty;		/* d0: Dynamic PTY indicator */
+	/* EN 50067 Table 9: d0=Stereo, d1=Artificial head, d2=Compressed, d3=Dynamic PTY */
+	uint8_t		di_stereo;		/* d0: Stereo (1) or Mono (0) */
+	uint8_t		di_artificial_head;	/* d1: Artificial head recording */
+	uint8_t		di_compressed;		/* d2: Compressed audio */
+	uint8_t		di_dynamic_pty;		/* d3: Dynamic PTY indicator */
 	uint8_t		di_status;		/* Status of DI decode (any flag) */
 	
 	/* Group 0A: Alternative Frequencies - Method A only

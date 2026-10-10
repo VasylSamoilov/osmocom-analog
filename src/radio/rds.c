@@ -292,13 +292,20 @@ int rds_af_method_a_parse(const char *input, rds_af_method_a_t *out)
 			
 			out->lf_mf_freq[out->lf_mf_count] = freq_khz;
 			out->lf_mf_type[out->lf_mf_count] = RDS_AF_FREQ_MF;
+			/* Region 2 (RBDS) uses a 10 kHz MF grid from 540 kHz; region 1/3
+			 * (RDS) uses 9 kHz from 531 kHz. A frequency on the 10 kHz grid
+			 * that is NOT on the 9 kHz grid (e.g. 540,550,1700) is region 2. */
+			if ((freq_khz - 540) % 10 == 0 && (freq_khz - 531) % 9 != 0)
+				out->mf_region2 = 1;
 			out->lf_mf_count++;
 			out->slot_count++;  /* 1 frequency (uses 2 codes) */
 			
 		} else {
-			/* VHF frequency (87.6-107.9 MHz) */
+			/* VHF frequency. Valid AF codes are 1..204 = 87.6..107.9 MHz
+			 * (code 0 reserved, 205+ are special). Reject band edges that
+			 * have no AF code so the transmitted count matches what is sent. */
 			double freq_mhz = atof(token);
-			if (freq_mhz < 87.5 || freq_mhz > 108.0) {
+			if (freq_mhz < 87.6 || freq_mhz > 107.9) {
 				LOGP(DRADIO, LOGL_ERROR, "AF Method A: Invalid VHF frequency %.1f MHz (valid: 87.6-107.9)\n", freq_mhz);
 				return -1;
 			}
@@ -376,9 +383,12 @@ int rds_af_method_a_build_codes(const rds_af_method_a_t *af, uint8_t *codes, int
 		if (af->lf_mf_type[i] == RDS_AF_FREQ_LF) {
 			/* LF: code 1-15 for 153-279 kHz (9 kHz spacing) */
 			codes[idx++] = (uint8_t)((af->lf_mf_freq[i] - 144) / 9);
+		} else if (af->mf_region2) {
+			/* MF region 2 (RBDS): code 16-? for 540-1700 kHz, 10 kHz grid.
+			 * Table 12 (region 2): code = 16 + (freq - 540)/10. */
+			codes[idx++] = (uint8_t)(16 + (af->lf_mf_freq[i] - 540) / 10);
 		} else {
-			/* MF: code 16-135 for 531-1602 kHz (9 kHz RDS) */
-			/* TODO: RBDS uses 10 kHz spacing from 540 kHz */
+			/* MF region 1/3 (RDS): code 16-135 for 531-1602 kHz (9 kHz) */
 			codes[idx++] = (uint8_t)(16 + (af->lf_mf_freq[i] - 531) / 9);
 		}
 	}
@@ -442,9 +452,9 @@ int rds_af_method_b_parse(const char *input, rds_af_method_b_list_t *out)
 			token++;
 		}
 		
-		/* Parse frequency */
+		/* Parse frequency. Valid AF codes 1..204 = 87.6..107.9 MHz. */
 		double freq_mhz = atof(token);
-		if (freq_mhz < 87.5 || freq_mhz > 108.0) {
+		if (freq_mhz < 87.6 || freq_mhz > 107.9) {
 			LOGP(DRADIO, LOGL_ERROR, "AF Method B: Invalid frequency %.1f MHz (valid: 87.6-107.9)\n", freq_mhz);
 			return -1;
 		}
@@ -1330,12 +1340,16 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 	uint16_t b2, b3;
 	int seg = rds->ps_segment;
 	
-	/* DI flag depends on segment address */
+	/* DI flag depends on segment address.
+	 * Verified against redsea (EN 50067:1998 3.2.1.5): the DI codeword is
+	 * indexed directly by segment address C1C0:
+	 *   seg 0 = d0 = dynamic PTY, seg 1 = d1 = compressed,
+	 *   seg 2 = d2 = artificial head, seg 3 = d3 = stereo. */
 	uint8_t di_flags[4] = {
-		rds->di_dynamic_pty,
-		rds->di_compressed,
-		rds->di_artificial_head,
-		rds->di_stereo
+		rds->di_dynamic_pty,     /* seg 0 */
+		rds->di_compressed,      /* seg 1 */
+		rds->di_artificial_head, /* seg 2 */
+		rds->di_stereo           /* seg 3 */
 	};
 	uint8_t di = di_flags[seg & 3] ? 1 : 0;
 	
@@ -1479,14 +1493,16 @@ static void rds_build_group_0b(rds_encoder_t *rds, uint8_t *group)
 	uint16_t b2;
 	int seg = rds->ps_segment;
 	
-	/* DI flag depends on segment address (same as 0A) */
+	/* DI flag depends on segment address (same mapping as 0A, verified
+	 * against redsea EN 50067:1998 3.2.1.5):
+	 * seg 0=dynamic PTY, 1=compressed, 2=artificial head, 3=stereo. */
 	uint8_t di_flags[4] = {
-		rds->di_dynamic_pty,
-		rds->di_compressed,
-		rds->di_artificial_head,
-		rds->di_stereo
+		rds->di_dynamic_pty,     /* seg 0 */
+		rds->di_compressed,      /* seg 1 */
+		rds->di_artificial_head, /* seg 2 */
+		rds->di_stereo           /* seg 3 */
 	};
-	uint8_t di = di_flags[seg] ? 1 : 0;
+	uint8_t di = di_flags[seg & 3] ? 1 : 0;
 	
 	/* Block A: PI code */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
@@ -2176,6 +2192,11 @@ static int mjd_from_date(int year, int month, int day)
  *   m' = provisional month (March=3 to February=14)
  *   k  = correction for Jan/Feb (they're months 13-14 of prev year)
  *
+ * NOTE: valid only for mjd >= RDS_VALID_MJD (15079 = 1900-02-01). Below that,
+ * near the epoch edge, the (MJD - 15078.2) term yields an early provisional
+ * year and the result is off by a day or two. All CT groups are gated by
+ * RDS_VALID_MJD(mjd) before this is called, so no valid RDS stream is affected.
+ *
  * Formulas:
  *   y' = floor((MJD - 15078.2) / 365.25)
  *   m' = floor((MJD - 14956.1 - floor(y' * 365.25)) / 30.6001)
@@ -2650,77 +2671,86 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 	}
 
 	case RDS_PAGING_VNUM: {
-		/* Enhanced variable-length numeric (EN 50067 M.3.5.5)
-		 * 8 BCD digits per data group, PSAC cycles 9-14, F=end.
-		 * BCD 0xA = space for padding.
-		 * International (NI=1, M.3.5.7): first data group's Block C
-		 * carries E.212 country code + OPC. Block D = 4 BCD digits.
-		 * Max 156 digits (vs 160 national). */
+		/* Variable-length numeric paging.
+		 * EN 50067 Annex M defines numeric paging as FIXED-length formats
+		 * (Table M.2/M.3): 10-digit (PSAC 0010/0011) and 18-digit
+		 * (PSAC 0100/0101/0110), plus 15-digit INTERNATIONAL (PSAC 0111).
+		 * There is NO open-ended "variable numeric" wire format and NO
+		 * cyclic-numeric PSAC — the cyclic 1001..1110 codes are ALPHANUMERIC
+		 * (Table M.4). The previous implementation emitted BCD-numeric payload
+		 * tagged with the ALPHA PSAC (0x8/0x9), which a conformant pager (and
+		 * this project's own decoder, rds.c:8710) decodes as text, not digits.
+		 * So we map national VNUM onto the standard 18-digit numeric format
+		 * (max 18 digits) and international onto the 15-digit format. */
 		int len = msg->data_len;
 		int intl = msg->ni;
-		int max_len = intl ? 156 : RDS_PAGING_VNUM_MAX;
-		int padded_len, ngroups, i, di;
-		uint8_t nibbles[RDS_PAGING_VNUM_MAX];
+		int max_len = intl ? 15 : 18;
+		int i;
+		uint8_t nibbles[18];
 
-		if (len > max_len)
+		if (len > max_len) {
+			LOGP(DRADIO, LOGL_NOTICE,
+			     "RDS 7A VNUM: %d digits exceeds the standard %s numeric limit "
+			     "(%d); truncating. EN 50067 Annex M has no variable-length "
+			     "numeric format.\n",
+			     len, intl ? "international 15-digit" : "national 18-digit",
+			     max_len);
 			len = max_len;
+		}
 
-		/* Encode digits to BCD nibbles */
+		/* Pad to the fixed field length with BCD space (0xA) */
 		rds_paging_bcd_encode(msg->data, len, nibbles, len);
-
-		/* Group 0: address + control byte */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
-		idx = 1;
+		for (i = len; i < max_len; i++)
+			nibbles[i] = RDS_PAGING_BCD_SPACE;
 
 		if (intl) {
-			/* International: first data group (PSAC=9)
-			 * Block C = I1I2I3(12 bits) | OPC(4 bits)
-			 * Block D = first 4 BCD digits */
+			/* International 15-digit (PSAC 0111). Address group carries
+			 * E.212 country code + OPC; see M.3.5.7. */
 			uint16_t cc = msg->country_code;
 			uint8_t i1 = (cc / 100) & 0xF;
 			uint8_t i2 = (cc / 10) % 10;
 			uint8_t i3 = cc % 10;
-			uint8_t n0 = (0 < len) ? nibbles[0] : RDS_PAGING_BCD_SPACE;
-			uint8_t n1 = (1 < len) ? nibbles[1] : RDS_PAGING_BCD_SPACE;
-			uint8_t n2 = (2 < len) ? nibbles[2] : RDS_PAGING_BCD_SPACE;
-			uint8_t n3 = (3 < len) ? nibbles[3] : RDS_PAGING_BCD_SPACE;
-
-			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;
-			pag->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
-			pag->tx_blocks_d[idx] = (n0 << 12) | (n1 << 8) | (n2 << 4) | n3;
-			idx++;
-			di = 4; /* nibble offset: 4 digits consumed */
+			pag->tx_psac_seq[0] = RDS_7A_PSAC_INTL15;
+			pag->tx_blocks_c[0] = addr_c;
+			pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
+			pag->tx_psac_seq[1] = RDS_7A_PSAC_INTL15;
+			pag->tx_blocks_c[1] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
+			pag->tx_blocks_d[1] = (nibbles[0] << 12) | (nibbles[1] << 8) |
+					       (nibbles[2] << 4) | nibbles[3];
+			idx = 2;
+			/* remaining 11 digits in two further INTL15 groups */
+			pag->tx_psac_seq[2] = RDS_7A_PSAC_INTL15;
+			pag->tx_blocks_c[2] = (nibbles[4] << 12) | (nibbles[5] << 8) |
+					       (nibbles[6] << 4) | nibbles[7];
+			pag->tx_blocks_d[2] = (nibbles[8] << 12) | (nibbles[9] << 8) |
+					       (nibbles[10] << 4) | nibbles[11];
+			pag->tx_psac_seq[3] = RDS_7A_PSAC_INTL15;
+			pag->tx_blocks_c[3] = (nibbles[12] << 12) | (nibbles[13] << 8) |
+					       (nibbles[14] << 4) | RDS_PAGING_BCD_SPACE;
+			pag->tx_blocks_d[3] = (RDS_PAGING_BCD_SPACE << 12) | (RDS_PAGING_BCD_SPACE << 8) |
+					       (RDS_PAGING_BCD_SPACE << 4) | RDS_PAGING_BCD_SPACE;
+			idx = 4;
 		} else {
-			di = 0;
-		}
-
-		/* Remaining data groups: 8 BCD digits each */
-		{
-			int remaining = len - di;
-			if (remaining < 0) remaining = 0;
-			padded_len = ((remaining + 7) / 8) * 8;
-			/* Pad nibbles array */
-			for (i = len; i < di + padded_len; i++)
-				nibbles[i] = RDS_PAGING_BCD_SPACE;
-			ngroups = padded_len / 8;
-			if (ngroups == 0) ngroups = 1; /* at least one end group */
-		}
-
-		for (i = 0; i < ngroups; i++) {
-			int ni_off = di + i * 8;
-			int psac_offset = intl ? (i + 1) : i; /* intl: PSAC=9 already used */
-
-			if (i == ngroups - 1)
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
-			else
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
-			pag->tx_blocks_c[idx] = (nibbles[ni_off] << 12) | (nibbles[ni_off+1] << 8) |
-						 (nibbles[ni_off+2] << 4) | nibbles[ni_off+3];
-			pag->tx_blocks_d[idx] = (nibbles[ni_off+4] << 12) | (nibbles[ni_off+5] << 8) |
-						 (nibbles[ni_off+6] << 4) | nibbles[ni_off+7];
-			idx++;
+			/* National 18-digit numeric (Table M.3):
+			 *   PSAC 0100: address group + Y1Y2 Z1..Z4 + digits A1..A2
+			 *   PSAC 0101: digits A3..A10
+			 *   PSAC 0110: digits A11..A18
+			 * This matches the 18-digit TONE/numeric decoder path. */
+			pag->tx_psac_seq[0] = RDS_7A_PSAC_NUM18_ADDR;   /* 0100 */
+			pag->tx_blocks_c[0] = addr_c;
+			pag->tx_blocks_d[0] = (nibbles[0] << 12) | (nibbles[1] << 8) |
+					       (addr_d_hi << 4) | (ctrl & 0xF);
+			pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;  /* 0101: A3..A10 */
+			pag->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) |
+					       (nibbles[4] << 4) | nibbles[5];
+			pag->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) |
+					       (nibbles[8] << 4) | nibbles[9];
+			pag->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;  /* 0110: A11..A18 */
+			pag->tx_blocks_c[2] = (nibbles[10] << 12) | (nibbles[11] << 8) |
+					       (nibbles[12] << 4) | nibbles[13];
+			pag->tx_blocks_d[2] = (nibbles[14] << 12) | (nibbles[15] << 8) |
+					       (nibbles[16] << 4) | nibbles[17];
+			idx = 3;
 		}
 
 		pag->tx_total_groups = idx;
@@ -7205,12 +7235,15 @@ void rds2_encoder_process(rds2_encoder_t *rds2, sample_t *samples, int num,
 /* ==================== RDS DECODER ==================== */
 
 /* Forward Error Correction (FEC) per IEC 62106 Annex B */
-/* Offset words (Table B.1) - indexed by block_idx (0=A, 1=B, 2=C, 3=D) */
-static const uint16_t RDS_OFFSET_WORDS[4] = {
-	0x0FC, /* A - block_idx 0 */
-	0x198, /* B - block_idx 1 */
-	0x168, /* C - block_idx 2 (also covers C' for type B groups) */
-	0x1B4  /* D - block_idx 3 */
+/* Offset words (Table B.1) - index 0=A, 1=B, 2=C, 3=D, 4=C' (type-B block 3).
+ * C (0x168) and C' (0x350) have DIFFERENT offset words and therefore different
+ * syndromes, so C' needs its own FEC table - it is NOT covered by C. */
+static const uint16_t RDS_OFFSET_WORDS[5] = {
+	0x0FC, /* A  - index 0 */
+	0x198, /* B  - index 1 */
+	0x168, /* C  - index 2 */
+	0x1B4, /* D  - index 3 */
+	0x350  /* C' - index 4 (block 3 of version-B groups) */
 };
 
 /* FEC Lookup Table Entry */
@@ -7220,9 +7253,15 @@ typedef struct {
 } rds_fec_entry_t;
 
 /* Pre-computed FEC lookup tables (one per offset) */
-/* Each table contains syndromes for 1-bit and 2-bit burst errors */
+/* Each table contains syndromes for 1-bit and 2-bit burst errors.
+ * The shortened cyclic code could correct bursts up to 5 bits, but correction
+ * is DELIBERATELY restricted to spans <=2 bits per the IEC 62106 / EN 50067
+ * receiver recommendation (Kopitz & Marks, "RDS: The Radio Data System", p.224):
+ * longer-burst correction causes mis-framing on noisy mobile reception. This
+ * matches the redsea reference decoder. Do not widen without reason. */
 #define FEC_TABLE_SIZE 52  /* 26 * 2 patterns (1-bit + 2-bit) */
-static rds_fec_entry_t rds_fec_table[4][FEC_TABLE_SIZE];
+#define FEC_OFFSET_COUNT 5 /* A, B, C, D, C' */
+static rds_fec_entry_t rds_fec_table[FEC_OFFSET_COUNT][FEC_TABLE_SIZE];
 static int rds_fec_table_initialized = 0;
 
 /* Initialize FEC lookup tables */
@@ -7230,7 +7269,7 @@ static void rds_fec_init(void)
 {
 	if (rds_fec_table_initialized) return;
 	
-	for (int offset_idx = 0; offset_idx < 4; offset_idx++) {
+	for (int offset_idx = 0; offset_idx < FEC_OFFSET_COUNT; offset_idx++) {
 		int entry = 0;
 		uint16_t offset_word = RDS_OFFSET_WORDS[offset_idx];
 		
@@ -9802,7 +9841,17 @@ void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
 				rds->errors = 0;
 			} else {
 				uint32_t corrected_block;
-				if (rds_correct_errors(rds->shift_reg, rds->block_idx, &corrected_block)) {
+				/* For block 3 (block_idx 2) the offset word is C for a
+				 * version-A group and C' for a version-B group. The group
+				 * version is bit B0 of block B's group-type field, and block B
+				 * has already been received this group, so select the correct
+				 * FEC table (index 4 = C') instead of guessing. */
+				int fec_offset = rds->block_idx;
+				if (rds->block_idx == 2 &&
+				    (rds->group_mask & (1 << 1)) &&
+				    (rds->blocks[1] & RDS_B2_VERSION_MASK))
+					fec_offset = 4; /* C' table */
+				if (rds_correct_errors(rds->shift_reg, fec_offset, &corrected_block)) {
 					uint16_t data = (corrected_block >> 10) & 0xFFFF;
 					rds->blocks[rds->block_idx] = data;
 					rds->group_mask |= (1 << rds->block_idx);
@@ -10093,7 +10142,14 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 							} else {
 								/* Mismatch or Invalid - Try FEC */
 								uint32_t corrected_block;
-								if (rds_correct_errors(rds->shift_reg, rds->block_idx, &corrected_block)) {
+								/* Block 3 uses C' (index 4) for version-B groups;
+								 * version is bit B0 of the already-received block B. */
+								int fec_offset = rds->block_idx;
+								if (rds->block_idx == 2 &&
+								    (rds->group_mask & (1 << 1)) &&
+								    (rds->blocks[1] & RDS_B2_VERSION_MASK))
+									fec_offset = 4; /* C' table */
+								if (rds_correct_errors(rds->shift_reg, fec_offset, &corrected_block)) {
 									/* FEC succeeded! */
 									uint16_t data = (corrected_block >> 10) & 0xFFFF;
 									// LOGP(DRADIO, LOGL_DEBUG, "RDS FEC: Corrected block %c data=%04X\n", 'A'+rds->block_idx, data);
