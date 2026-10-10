@@ -126,6 +126,7 @@ static const char *rds_bitstream_file = NULL;
 static const char *rds_tx_hexrds_file = NULL;
 static const char *rds_tx_bitstream_file = NULL;
 static const char *rds_tmc_events_file = NULL;
+static const char *rds_tmc_locations_path = NULL;
 
 /* Protocol server endpoints */
 static const char *xdr_gtk_server = NULL;
@@ -511,6 +512,13 @@ static void print_help(const char *arg0)
 	printf("        (docs/rds/tmc_events.csv) for human-readable TMC event names in\n");
 	printf("        the verbose log. Format: Code;Description;...\n");
 	printf("        Source: OSM wiki TMC/Event_Code_List (1552 ALERT-C events).\n");
+	printf("    --rds-tmc-locations <path>\n");
+	printf("        Load TMC location descriptions for human-readable road names in\n");
+	printf("        the verbose log. Accepts either:\n");
+	printf("          - A standard ISO 14819-3 LCL directory with NAMES.DAT + ROADS.DAT\n");
+	printf("            (produces 'A1 - road name' per LCD code)\n");
+	printf("          - A plain CSV file: LCD;Name (e.g. converted from gr-rds Italy\n");
+	printf("            tmc_locations_italy.h or any national NAMES.DAT)\n");
 	printf("    --xdr-gtk-server <endpoint>\n");
 	printf("        Enable XDR-GTK protocol server for RDS decoder output.\n");
 	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:7373)\n");
@@ -611,6 +619,7 @@ static double afc_max_hz = 5000.0;
 #define OPT_RDS_TX_HEXRDS_FILE	1116
 #define OPT_RDS_TX_BITSTREAM_FILE 1117
 #define OPT_RDS_TMC_EVENTS	1118
+#define OPT_RDS_TMC_LOCATIONS	1119
 #define OPT_RDS_PAGING_FIFO	1121
 #define OPT_RDS_PAGING_CC	1122
 #define OPT_RDS_PAGING_OPC	1123
@@ -662,6 +671,7 @@ static void add_options(void)
 	option_add(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1);
 	option_add(OPT_RDS_TX_BITSTREAM_FILE, "rds-tx-bitstream-file", 1);
 	option_add(OPT_RDS_TMC_EVENTS, "rds-tmc-events", 1);
+	option_add(OPT_RDS_TMC_LOCATIONS, "rds-tmc-locations", 1);
 	option_add(OPT_XDR_GTK_SERVER, "xdr-gtk-server", 1);
 	option_add(OPT_RDSSPY_SERVER, "rdsspy-server", 1);
 	option_add(OPT_UECP_SERVER, "uecp-server", 1);
@@ -869,6 +879,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_RDS_TMC_EVENTS:
 		rds_tmc_events_file = options_strdup(argv[argi]);
+		break;
+	case OPT_RDS_TMC_LOCATIONS:
+		rds_tmc_locations_path = options_strdup(argv[argi]);
 		break;
 	case OPT_XDR_GTK_SERVER:
 		xdr_gtk_server = options_strdup(argv[argi]);
@@ -1421,6 +1434,14 @@ int main(int argc, char *argv[])
 		if (rds_tmc_load_events(rds_tmc_events_file) < 0)
 			fprintf(stderr, "Warning: failed to load TMC events from '%s'\n",
 			        rds_tmc_events_file);
+	}
+
+	/* Load optional TMC location table (ISO 14819-3 LCL directory or CSV).
+	 * When loaded, the RDS 8A decoder logs human-readable road names. */
+	if (rds_tmc_locations_path) {
+		if (rds_tmc_load_locations(rds_tmc_locations_path) < 0)
+			fprintf(stderr, "Warning: failed to load TMC locations from '%s'\n",
+			        rds_tmc_locations_path);
 	}
 
 	/* Set up RDS TX file input if requested (bypasses encoder) */

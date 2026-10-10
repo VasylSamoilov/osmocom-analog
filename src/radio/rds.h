@@ -2898,6 +2898,22 @@ int         rds_tmc_load_events(const char *csv_path);
 const char *rds_tmc_event_desc(uint16_t code);
 void        rds_tmc_unload_events(void);
 
+/* TMC Location Table (ISO 14819-3 LCL) -- optional, for road-name display.
+ *
+ * rds_tmc_load_locations() accepts either:
+ *   - A standard LCL directory (must contain NAMES.DAT + ROADS.DAT).
+ *     Produces "ROADNUMBER - road_name" strings per LCD code.
+ *   - A plain semicolon-delimited CSV file (LCD;Name per line).
+ *     Header row is skipped if non-numeric. Compatible with the Italy
+ *     NAMES-only table from gr-rds (GPL-2.0+).
+ *
+ * After loading, rds_tmc_location_desc(lcd) returns the location name
+ * (e.g. "A1 - Autostrada del Sole") for use in the 8A verbose log.
+ * Returns number of entries loaded on success, -1 on error. */
+int         rds_tmc_load_locations(const char *lcl_dir_or_csv);
+const char *rds_tmc_location_desc(uint16_t lcd);
+void        rds_tmc_unload_locations(void);
+
 /* Group 5: TDC state queries */
 int rds_enc_tdc_get_active(const rds_encoder_t *rds, int channel);
 int rds_enc_tdc_get_pending(const rds_encoder_t *rds, int channel);

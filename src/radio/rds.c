@@ -4147,6 +4147,215 @@ void rds_tmc_unload_events(void)
 }
 
 /* ============================================================
+ * TMC Location Table lookup (ISO 14819-3 LCL, read-only)
+ *
+ * Loader reads a standard LCL directory (NAMES.DAT + ROADS.DAT),
+ * or a plain two-column CSV file (LCD;Name).
+ *
+ * Standard LCL format (semicolon-delimited, header row):
+ *   NAMES.DAT:   NID;NAME;...
+ *   ROADS.DAT:   LCD;ROADNUMBER;RNID;...
+ *
+ * Road name lookup: LCD -> ROADS.DAT (roadnumber + rnid) ->
+ *   NAMES.DAT[rnid] -> "ROADNUMBER - road_name"
+ *
+ * Plain CSV format (auto-detected when no ROADS.DAT columns):
+ *   LCD;Name   (no header required, or "Code;Name" header)
+ *
+ * References:
+ *   redsea src/tmc/locationdb.cc  (ISC, Oona Raisanen)
+ *   gr-rds lib/tmc_locations_italy.h (GPL-2.0+)
+ * ============================================================ */
+
+/* LCD codes are 16-bit (0..65535). Sparse table: NULL = not loaded. */
+#define TMC_LOC_TABLE_SIZE 65536
+
+static char *tmc_loc_table[TMC_LOC_TABLE_SIZE]; /* NULL until loaded */
+static int   tmc_locs_loaded = 0;
+
+/* Internal: load NAMES.DAT into a temporary NID->name map.
+ * names[] must be TMC_LOC_TABLE_SIZE entries, caller frees. */
+static int tmc_load_names(const char *path, char **names)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) return -1;
+
+	char line[512];
+	int  loaded = 0;
+	int  lineno = 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		lineno++;
+		/* Skip header: first line or any line starting with "NID" */
+		if (lineno == 1) continue;
+
+		char *p = line;
+		/* NID field */
+		char *nid_s = p;
+		while (*p && *p != ';') p++;
+		if (!*p) continue;
+		*p++ = '\0';
+
+		/* NAME field */
+		char *name_s = p;
+		while (*p && *p != ';' && *p != '\n' && *p != '\r') p++;
+		*p = '\0';
+
+		int nid = atoi(nid_s);
+		if (nid <= 0 || nid >= TMC_LOC_TABLE_SIZE) continue;
+		if (!*name_s) continue;
+
+		free(names[nid]);
+		names[nid] = strdup(name_s);
+		if (names[nid]) loaded++;
+	}
+
+	fclose(f);
+	return loaded;
+}
+
+int rds_tmc_load_locations(const char *lcl_dir_or_csv)
+{
+	if (!lcl_dir_or_csv || !*lcl_dir_or_csv) return -1;
+
+	rds_tmc_unload_locations();
+
+	/* Detect mode: if the path ends in .csv or .dat (case-insensitive),
+	 * or there is no ROADS.DAT alongside it, treat as plain LCD;Name CSV.
+	 * Otherwise treat as a directory containing NAMES.DAT + ROADS.DAT. */
+	char roads_path[512], names_path[512];
+	snprintf(roads_path, sizeof(roads_path), "%s/ROADS.DAT", lcl_dir_or_csv);
+	snprintf(names_path, sizeof(names_path), "%s/NAMES.DAT", lcl_dir_or_csv);
+
+	FILE *roads_f = fopen(roads_path, "r");
+
+	if (!roads_f) {
+		/* Plain LCD;Name CSV (single file) */
+		FILE *f = fopen(lcl_dir_or_csv, "r");
+		if (!f) {
+			LOGP(DRADIO, LOGL_ERROR,
+			     "RDS TMC: cannot open location table '%s'\n",
+			     lcl_dir_or_csv);
+			return -1;
+		}
+
+		char line[512];
+		int  loaded = 0, lineno = 0;
+
+		while (fgets(line, sizeof(line), f)) {
+			lineno++;
+			char *p = line;
+			char *lcd_s = p;
+			while (*p && *p != ';') p++;
+			if (!*p) continue;
+			*p++ = '\0';
+
+			/* Skip non-numeric header */
+			if (lineno == 1 && !(*lcd_s >= '0' && *lcd_s <= '9'))
+				continue;
+
+			char *name_s = p;
+			while (*p && *p != ';' && *p != '\n' && *p != '\r') p++;
+			*p = '\0';
+
+			int lcd = atoi(lcd_s);
+			if (lcd <= 0 || lcd >= TMC_LOC_TABLE_SIZE) continue;
+			if (!*name_s) continue;
+
+			free(tmc_loc_table[lcd]);
+			tmc_loc_table[lcd] = strdup(name_s);
+			if (tmc_loc_table[lcd]) loaded++;
+		}
+
+		fclose(f);
+		tmc_locs_loaded = 1;
+		LOGP(DRADIO, LOGL_INFO,
+		     "RDS TMC: loaded %d location entries from '%s'\n",
+		     loaded, lcl_dir_or_csv);
+		return loaded;
+	}
+
+	/* Standard LCL directory: load NAMES.DAT first, then ROADS.DAT */
+	char **names = calloc(TMC_LOC_TABLE_SIZE, sizeof(char *));
+	if (!names) { fclose(roads_f); return -1; }
+
+	tmc_load_names(names_path, names);
+
+	/* Parse ROADS.DAT: LCD;ROADNUMBER;RNID;... */
+	char line[512];
+	int  loaded = 0, lineno = 0;
+
+	while (fgets(line, sizeof(line), roads_f)) {
+		lineno++;
+		if (lineno == 1) continue; /* skip header */
+
+		char *p = line;
+
+		char *lcd_s = p;
+		while (*p && *p != ';') p++;
+		if (!*p) continue;
+		*p++ = '\0';
+
+		char *roadnum_s = p;
+		while (*p && *p != ';') p++;
+		if (!*p) continue;
+		*p++ = '\0';
+
+		char *rnid_s = p;
+		while (*p && *p != ';' && *p != '\n' && *p != '\r') p++;
+		*p = '\0';
+
+		int lcd  = atoi(lcd_s);
+		int rnid = atoi(rnid_s);
+		if (lcd <= 0 || lcd >= TMC_LOC_TABLE_SIZE) continue;
+
+		const char *road_name = (rnid > 0 && rnid < TMC_LOC_TABLE_SIZE)
+		                        ? names[rnid] : NULL;
+
+		char buf[256];
+		if (*roadnum_s && road_name)
+			snprintf(buf, sizeof(buf), "%s - %s", roadnum_s, road_name);
+		else if (*roadnum_s)
+			snprintf(buf, sizeof(buf), "%s", roadnum_s);
+		else if (road_name)
+			snprintf(buf, sizeof(buf), "%s", road_name);
+		else
+			continue; /* no useful data */
+
+		free(tmc_loc_table[lcd]);
+		tmc_loc_table[lcd] = strdup(buf);
+		if (tmc_loc_table[lcd]) loaded++;
+	}
+
+	fclose(roads_f);
+
+	for (int i = 0; i < TMC_LOC_TABLE_SIZE; i++)
+		free(names[i]);
+	free(names);
+
+	tmc_locs_loaded = 1;
+	LOGP(DRADIO, LOGL_INFO,
+	     "RDS TMC: loaded %d road locations from '%s'\n",
+	     loaded, lcl_dir_or_csv);
+	return loaded;
+}
+
+const char *rds_tmc_location_desc(uint16_t lcd)
+{
+	if (!tmc_locs_loaded || lcd == 0) return NULL;
+	return tmc_loc_table[lcd]; /* may be NULL if not in table */
+}
+
+void rds_tmc_unload_locations(void)
+{
+	for (int i = 0; i < TMC_LOC_TABLE_SIZE; i++) {
+		free(tmc_loc_table[i]);
+		tmc_loc_table[i] = NULL;
+	}
+	tmc_locs_loaded = 0;
+}
+
+/* ============================================================
  * Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
  * Bit layout from redsea station.cc::decodeType15A (MIT licence).
  *
@@ -10286,8 +10495,9 @@ group14_done:
 							     dp_ci, dp_short[dp_ci]);
 						if (rds->verbose) {
 						const char *desc = rds_tmc_event_desc(msg.event);
+						const char *loc  = rds_tmc_location_desc(msg.location);
 						LOGP(DRADIO, LOGL_INFO,
-						     "RDS 8A TMC: event=%u%s%s%s loc=%u "
+						     "RDS 8A TMC: event=%u%s%s%s loc=%u%s%s%s "
 						     "dir=%s extent=%u%s "
 						     "duration=%s\n",
 						     msg.event,
@@ -10295,6 +10505,9 @@ group14_done:
 						     desc ? desc  : "",
 						     desc ? ")" : "",
 						     msg.location,
+						     loc ? " (" : "",
+						     loc ? loc   : "",
+						     loc ? ")" : "",
 						     msg.direction ? "neg" : "pos",
 						     msg.extent + 1,
 						     msg.diversion ? " (diversion)" : "",
