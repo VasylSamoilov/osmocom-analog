@@ -167,7 +167,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x79 */ { "Є", "є" },                                  /* U+0404 cyr-Ie-ukr, U+0454 cyr-ie-ukr */
 	/* 0x7A */ { "Ї", "Ï", "ї", "ï" },                       /* U+0407 cyr-Yi, U+00CF lat-I-diaeresis, U+0457 cyr-yi, U+00EF lat-i-diaeresis */
 	/* 0x7B */ { "{" },                                       /* U+007B — standard ASCII (not Ќ like Linguist) */
-	/* 0x7C */ { "|" },                                       /* U+007C — standard ASCII (not Ў like Linguist) */
+	/* 0x7C */ { "Ѕ", "ѕ" },                                  /* U+0405 cyr-Dze, U+0455 cyr-dze — confirmed by NEC 21A programming manual (Приложение 3) + live operator .21A profiles; was wrongly ASCII '|' */
 	/* 0x7D */ { "}" },                                       /* U+007D — standard ASCII (not Џ like Linguist) */
 	/* 0x7E */ { "~" },                                       /* U+007E */
 	/* 0x7F */ { NULL },

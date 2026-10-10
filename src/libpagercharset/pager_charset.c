@@ -52,6 +52,13 @@ static const struct pager_charset *registry[] = {
 	&pager_charset_flex_motorola_linguist_vietnamese,
 	&pager_charset_flex_motorola_linguist_arabic,
 	&pager_charset_flex_motorola_linguist_arabic_english,
+	&pager_charset_flex_motorola_linguist_turkish,
+	&pager_charset_flex_motorola_linguist_hebrew,
+	&pager_charset_flex_motorola_linguist_greek,
+	&pager_charset_flex_motorola_linguist_latin1,
+	&pager_charset_flex_motorola_linguist_latin2,
+	&pager_charset_flex_motorola_linguist_latin3,
+	&pager_charset_flex_motorola_linguist_latin4,
 	/* RDS */
 	&pager_charset_rds_generic_generic_annex_e,
 	&pager_charset_rds_nokia_nkp2_annex_e,

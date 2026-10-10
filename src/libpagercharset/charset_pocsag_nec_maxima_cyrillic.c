@@ -16,17 +16,22 @@
  *
  * Pagers: NEC Maxima, NEC Compact, OI Electric PB2301.
  *
- * NOTE: This is NOT the same as the Advisor Linguist / NEC 21A (Skyper)
- * codepage. The NEC Maxima uses a completely different Cyrillic mapping
- * where letters are scattered across 0x41-0x77 in a non-alphabetic,
- * non-phonetic order.
+ * NOTE: NEC 21A = Maxima (same model family), so this table shares the NEC
+ * Cyrillic layout documented in the NEC 21A programming manual (Приложение 3):
+ * the no-Latin-lookalike Cyrillic letters sit in alphabetical order across
+ * 0x61-0x77 (Б Г Д Ё Ж З И Й Л П У Ф Ц Ч Ш Щ Ъ Ы Ь Э Ю Я), while the
+ * Latin-lookalike Cyrillic letters (А В Е К М Н О Р С Т Х) reuse their Latin
+ * code points in 0x41-0x5A rather than getting their own slots. This is the
+ * SAME backbone as charset_pocsag_nec_21a_latin_cyrillic.c (the Advisor
+ * Linguist layout differs; see that file's note).
  *
  * Layout:
  *   0x20-0x3F: Standard ASCII punctuation and digits.
- *   0x40-0x5F: Latin uppercase A-Z (standard ASCII).
+ *   0x40-0x5F: Latin uppercase A-Z (standard ASCII); Latin-lookalike Cyrillic
+ *              letters are entered via these codes.
  *   0x60:      unmapped (backtick not available).
- *   0x61-0x77: Cyrillic А-Я (non-sequential, vendor-specific order).
- *   0x7B-0x7E: ASCII symbols {|}~.
+ *   0x61-0x77: Cyrillic (alphabetical, NEC-family order; no-lookalike letters).
+ *   0x7B-0x7E: {, Ѕ (0x7C, U+0405 cyr-Dze), }, ~.
  *
  * Case-insensitive: lowercase Latin maps to uppercase.
  * Cyrillic uppercase and lowercase map to the same codes.
@@ -106,29 +111,29 @@ static const pager_charset_entry entries[128] = {
 	/* 0x40-0x5F: Latin uppercase (standard ASCII) */
 	/* 0x40 */ { "@" },
 	/* 0x41 */ { "A", "a" },
-	/* 0x42 */ { "B", "b" },
-	/* 0x43 */ { "C", "c" },
+	/* 0x42 */ { "B", "b", "В", "в" },     /* Latin B + Cyrillic Ве lookalike (no own slot) */
+	/* 0x43 */ { "C", "c", "С", "с" },     /* Latin C + Cyrillic Es lookalike (no own slot) */
 	/* 0x44 */ { "D", "d" },
 	/* 0x45 */ { "E", "e" },
 	/* 0x46 */ { "F", "f" },
 	/* 0x47 */ { "G", "g" },
-	/* 0x48 */ { "H", "h" },
+	/* 0x48 */ { "H", "h", "Н", "н" },     /* Latin H + Cyrillic En lookalike (no own slot) */
 	/* 0x49 */ { "I", "i" },
 	/* 0x4A */ { "J", "j" },
-	/* 0x4B */ { "K", "k" },
+	/* 0x4B */ { "K", "k", "К", "к" },     /* Latin K + Cyrillic Ka lookalike (no own slot) */
 	/* 0x4C */ { "L", "l" },
-	/* 0x4D */ { "M", "m" },
+	/* 0x4D */ { "M", "m", "М", "м" },     /* Latin M + Cyrillic Em lookalike (no own slot) */
 	/* 0x4E */ { "N", "n" },
-	/* 0x4F */ { "O", "o" },
-	/* 0x50 */ { "P", "p" },
+	/* 0x4F */ { "O", "o", "О", "о" },     /* Latin O + Cyrillic O lookalike (no own slot) */
+	/* 0x50 */ { "P", "p", "Р", "р" },     /* Latin P + Cyrillic Er lookalike (no own slot) */
 	/* 0x51 */ { "Q", "q" },
 	/* 0x52 */ { "R", "r" },
 	/* 0x53 */ { "S", "s" },
-	/* 0x54 */ { "T", "t" },
+	/* 0x54 */ { "T", "t", "Т", "т" },     /* Latin T + Cyrillic Te lookalike (no own slot) */
 	/* 0x55 */ { "U", "u" },
 	/* 0x56 */ { "V", "v" },
 	/* 0x57 */ { "W", "w" },
-	/* 0x58 */ { "X", "x" },
+	/* 0x58 */ { "X", "x", "Х", "х" },     /* Latin X + Cyrillic Ha lookalike (no own slot) */
 	/* 0x59 */ { "Y", "y" },
 	/* 0x5A */ { "Z", "z" },
 	/* 0x5B */ { "[" },
@@ -167,7 +172,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x79 */ { NULL },
 	/* 0x7A */ { NULL },
 	/* 0x7B */ { "{" },
-	/* 0x7C */ { "|" },
+	/* 0x7C */ { "Ѕ", "ѕ" },	/* U+0405 cyr-Dze, U+0455 cyr-dze — NEC family glyph, confirmed by NEC 21A programming manual + live operator profiles; was wrongly ASCII '|' */
 	/* 0x7D */ { "}" },
 	/* 0x7E */ { "~" },
 	/* 0x7F */ { NULL },

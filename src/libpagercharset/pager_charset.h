@@ -140,6 +140,13 @@ extern const struct pager_charset pager_charset_flex_motorola_linguist_polish;
 extern const struct pager_charset pager_charset_flex_motorola_linguist_vietnamese;
 extern const struct pager_charset pager_charset_flex_motorola_linguist_arabic;
 extern const struct pager_charset pager_charset_flex_motorola_linguist_arabic_english;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_turkish;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_hebrew;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_greek;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_latin1;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_latin2;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_latin3;
+extern const struct pager_charset pager_charset_flex_motorola_linguist_latin4;
 
 /* --- Built-in RDS codepages (8-bit, 256 codes) --- */
 
