@@ -3189,6 +3189,11 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 	}
 }
 
+/* Forward declarations for builders defined later (after the scheduler) */
+static void rds_build_group_5a(rds_encoder_t *rds, uint8_t *group);
+static void rds_build_group_5b(rds_encoder_t *rds, uint8_t *group);
+static void rds_build_group_6 (rds_encoder_t *rds, uint8_t *group);
+
 static void rds_generate_group(rds_encoder_t *rds)
 {
 	/* ============================================================
@@ -3328,6 +3333,22 @@ static void rds_generate_group(rds_encoder_t *rds)
 		break;
 	case RDS_GROUP_15B:
 		rds_build_group_15b(rds, rds->group_buffer);
+		break;
+	/* Group 5: Transparent Data Channels */
+	case RDS_GROUP_5A:
+		rds_build_group_5a(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_5B:
+		rds_build_group_5b(rds, rds->group_buffer);
+		break;
+	/* Group 6: In-House applications */
+	case RDS_GROUP_6A:
+	case RDS_GROUP_6B:
+		if (rds->ih.active) {
+			rds_build_group_6(rds, rds->group_buffer);
+		} else {
+			rds_build_group_0a(rds, rds->group_buffer);
+		}
 		break;
 	/* Group 7A: Radio Paging or ODA */
 	case RDS_GROUP_7A:
@@ -3816,6 +3837,179 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
  * starts transmitting with the new A/B flag.
  *
  * Returns encoded length, or -1 on error. */
+
+/* ============================================================
+ * Group 5: Transparent Data Channels (TDC)
+ * EN 50067 §3.1.5.8, Figure 22 (5A) and Figure 23 (5B), §3.2.4.
+ *
+ * 5A: Block B b4..b0 = channel (0-31); Block C = bytes 0-1; Block D = bytes 2-3.
+ * 5B: Block B b4..b0 = channel (0-31); Block C = PI@C'; Block D = bytes 0-1.
+ * The channel number is a 5-bit address identifying the data stream (0-31).
+ * Content is operator-defined; the standard specifies only the framing.
+ * ============================================================ */
+static void rds_build_group_5a(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2;
+	/* Find the next channel with pending data (round-robin) */
+	int ch = -1;
+	for (int i = 0; i < RDS_TDC_MAX_CHANNELS; i++) {
+		int c = (rds->tdc_next_ch + i) % RDS_TDC_MAX_CHANNELS;
+		if (rds->tdc_ch[c].len >= 4) { ch = c; break; }
+	}
+	if (ch < 0) { rds_build_group_0a(rds, group); return; }
+
+	uint8_t *buf = rds->tdc_ch[ch].buf;
+	int pos = rds->tdc_ch[ch].pos;
+
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	/* Block B: 5A + TP + PTY + channel (b4:0) */
+	b2 = (RDS_GROUP_5A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     (ch & 0x1F);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	/* Block C: bytes 0-1, offset C */
+	blocks[2] = rds_build_block(((uint16_t)buf[(pos+0)%RDS_TDC_CHANNEL_BUF] << 8) |
+				    buf[(pos+1)%RDS_TDC_CHANNEL_BUF], RDS_OFFSET_C);
+	/* Block D: bytes 2-3, offset D */
+	blocks[3] = rds_build_block(((uint16_t)buf[(pos+2)%RDS_TDC_CHANNEL_BUF] << 8) |
+				    buf[(pos+3)%RDS_TDC_CHANNEL_BUF], RDS_OFFSET_D);
+
+	rds->tdc_ch[ch].pos = (pos + 4) % RDS_TDC_CHANNEL_BUF;
+	rds->tdc_ch[ch].len -= 4;
+	if (rds->tdc_ch[ch].len < 0) rds->tdc_ch[ch].len = 0;
+	rds->tdc_next_ch = (ch + 1) % RDS_TDC_MAX_CHANNELS;
+	rds_group_pack(blocks, group, 0);
+}
+
+static void rds_build_group_5b(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2;
+	int ch = -1;
+	for (int i = 0; i < RDS_TDC_MAX_CHANNELS; i++) {
+		int c = (rds->tdc_next_ch + i) % RDS_TDC_MAX_CHANNELS;
+		if (rds->tdc_ch[c].len >= 2) { ch = c; break; }
+	}
+	if (ch < 0) { rds_build_group_0b(rds, group); return; }
+
+	uint8_t *buf = rds->tdc_ch[ch].buf;
+	int pos = rds->tdc_ch[ch].pos;
+
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	/* Block B: 5B + TP + PTY + channel (b4:0) */
+	b2 = (RDS_GROUP_5B << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     (ch & 0x1F);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+	/* Block C: PI repeat (version-B), offset C' */
+	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+	/* Block D: bytes 0-1, offset D */
+	blocks[3] = rds_build_block(((uint16_t)buf[(pos+0)%RDS_TDC_CHANNEL_BUF] << 8) |
+				    buf[(pos+1)%RDS_TDC_CHANNEL_BUF], RDS_OFFSET_D);
+
+	rds->tdc_ch[ch].pos = (pos + 2) % RDS_TDC_CHANNEL_BUF;
+	rds->tdc_ch[ch].len -= 2;
+	if (rds->tdc_ch[ch].len < 0) rds->tdc_ch[ch].len = 0;
+	rds->tdc_next_ch = (ch + 1) % RDS_TDC_MAX_CHANNELS;
+	rds_group_pack(blocks, group, 0);
+}
+
+/* TDC encoder API */
+void rds_enc_tdc_set_channel(rds_encoder_t *rds, int ch, const uint8_t *data, int len)
+{
+	if (!rds || ch < 0 || ch >= RDS_TDC_MAX_CHANNELS || !data || len <= 0) return;
+	if (len > RDS_TDC_CHANNEL_BUF) len = RDS_TDC_CHANNEL_BUF;
+	memcpy(rds->tdc_ch[ch].buf, data, len);
+	rds->tdc_ch[ch].len = len;
+	rds->tdc_ch[ch].pos = 0;
+}
+void rds_enc_tdc_clear_channel(rds_encoder_t *rds, int ch)
+{
+	if (!rds || ch < 0 || ch >= RDS_TDC_MAX_CHANNELS) return;
+	rds->tdc_ch[ch].len = 0;
+	rds->tdc_ch[ch].pos = 0;
+}
+void rds_enc_tdc_set_version(rds_encoder_t *rds, int use_5b)
+{
+	if (rds) rds->tdc_use_5b = use_5b ? 1 : 0;
+}
+void rds_decoder_set_tdc_callback(rds_decoder_t *rds,
+				  void (*fn)(uint8_t ch, const uint8_t *data, int len, void *arg),
+				  void *arg)
+{
+	if (!rds) return;
+	rds->tdc_callback = fn;
+	rds->tdc_callback_arg = arg;
+}
+
+/* ============================================================
+ * Group 6: In-House applications (IH)
+ * EN 50067 §3.1.5.9, Figure 24 (6A and 6B), §3.2.5.
+ * Content is entirely operator-defined; the standard only defines
+ * the bit allocation. Consumer receivers should ignore IH groups.
+ *
+ * 6A: Block B b4..b0 = IH bits; Block C = 16-bit IH data (offset C); Block D = 16-bit IH data.
+ * 6B: Block B b4..b0 = IH bits; Block C = PI repeat (offset C'); Block D = 16-bit IH data.
+ * ============================================================ */
+static void rds_build_group_6(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2;
+	int is_6b = rds->ih.use_6b;
+
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+	b2 = ((is_6b ? RDS_GROUP_6B : RDS_GROUP_6A) << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp << RDS_B2_TP_BIT) |
+	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     (rds->ih.b_payload & 0x1F);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+
+	if (is_6b) {
+		/* 6B: Block C = PI repeat (offset C') */
+		blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+	} else {
+		/* 6A: Block C = 16-bit IH data (offset C) */
+		blocks[2] = rds_build_block(rds->ih.c_data, RDS_OFFSET_C);
+	}
+	blocks[3] = rds_build_block(rds->ih.d_data, RDS_OFFSET_D);
+	rds_group_pack(blocks, group, 0);
+}
+
+/* IH encoder API */
+void rds_enc_ih_set_6a(rds_encoder_t *rds, uint8_t b_payload, uint16_t c_data, uint16_t d_data)
+{
+	if (!rds) return;
+	rds->ih.b_payload = b_payload & 0x1F;
+	rds->ih.c_data    = c_data;
+	rds->ih.d_data    = d_data;
+	rds->ih.use_6b    = 0;
+	rds->ih.active    = 1;
+}
+void rds_enc_ih_set_6b(rds_encoder_t *rds, uint8_t b_payload, uint16_t d_data)
+{
+	if (!rds) return;
+	rds->ih.b_payload = b_payload & 0x1F;
+	rds->ih.d_data    = d_data;
+	rds->ih.use_6b    = 1;
+	rds->ih.active    = 1;
+}
+void rds_enc_ih_clear(rds_encoder_t *rds)
+{
+	if (rds) rds->ih.active = 0;
+}
+void rds_decoder_set_ih_callback(rds_decoder_t *rds,
+				 void (*fn)(uint8_t b_payload, int is_6b,
+					    uint16_t c_data, uint16_t d_data, void *arg),
+				 void *arg)
+{
+	if (!rds) return;
+	rds->ih_callback     = fn;
+	rds->ih_callback_arg = arg;
+}
+
 void rds_enc_set_rt(rds_encoder_t *rds, const char *rt)
 {
 	if (!rt) return;
@@ -9432,6 +9626,55 @@ group14_done:
 			if (rds->verbose)
 				LOGP(DRADIO, LOGL_INFO, "RDS 3B: ODA data (no 3A registration yet)\n");
 		}
+	}
+	else if (group_type == 5) {
+		/* Group 5: Transparent Data Channels (TDC) or ODA
+		 * EN 50067 §3.1.5.8, Fig 22 (5A) / Fig 23 (5B).
+		 * Block B b4:0 = channel number (0-31).
+		 * 5A: Block C + Block D = 4 data bytes (offsets C/D).
+		 * 5B: Block C = PI repeat (offset C'), Block D = 2 data bytes. */
+		uint8_t channel = b2 & 0x1F;
+		uint8_t data[4];
+		int len = 0;
+
+		if (version == 0 && (rds->group_mask & (1<<2)) && (rds->group_mask & (1<<3))) {
+			/* 5A: 4 bytes from blocks C and D */
+			data[0] = (b3 >> 8) & 0xFF;
+			data[1] =  b3       & 0xFF;
+			data[2] = (b4 >> 8) & 0xFF;
+			data[3] =  b4       & 0xFF;
+			len = 4;
+		} else if (version == 1 && (rds->group_mask & (1<<3))) {
+			/* 5B: 2 bytes from block D; block C = PI repeat */
+			data[0] = (b4 >> 8) & 0xFF;
+			data[1] =  b4       & 0xFF;
+			len = 2;
+		}
+
+		if (len > 0) {
+			if (rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 5%c: TDC ch=%d %d bytes\n",
+				     version ? 'B' : 'A', channel, len);
+			if (rds->tdc_callback)
+				rds->tdc_callback(channel, data, len, rds->tdc_callback_arg);
+		}
+	}
+	else if (group_type == 6) {
+		/* Group 6: In-House applications (IH) or ODA
+		 * EN 50067 §3.1.5.9, Fig 24.
+		 * Block B b4:0 = operator-defined IH bits.
+		 * 6A: Block C = 16-bit IH data (offset C), Block D = 16-bit IH data.
+		 * 6B: Block C = PI repeat (offset C'), Block D = 16-bit IH data. */
+		uint8_t b_payload = b2 & 0x1F;
+		uint16_t c_data   = (rds->group_mask & (1<<2)) ? b3 : 0;
+		uint16_t d_data   = (rds->group_mask & (1<<3)) ? b4 : 0;
+
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 6%c: IH b_payload=%02X c=%04X d=%04X\n",
+			     version ? 'B' : 'A', b_payload, c_data, d_data);
+		if (rds->ih_callback)
+			rds->ih_callback(b_payload, version, c_data, d_data,
+					 rds->ih_callback_arg);
 	}
 	else if (group_type == 15 && version == 1) {
 		/* Group 15B: Fast Basic Tuning and Switching (EN 50067 §3.1.5.21, Fig 39)

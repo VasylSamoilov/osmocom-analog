@@ -1885,7 +1885,36 @@ typedef struct rds_encoder {
 	
 	/* TX file logging decoder (decodes transmitted groups for logging) */
 	struct rds_decoder *tx_log_decoder;	/* Decoder for logging TX groups */
-	
+
+	/* ============================================================
+	 * Group 5: Transparent Data Channels (TDC)
+	 * EN 50067 §3.1.5.8, §3.2.4. 32 independent channels (0-31).
+	 * 5A: 4 data bytes/group (blocks C+D, offset C/D).
+	 * 5B: 2 data bytes/group (block D, block C = PI@C').
+	 * ============================================================ */
+#define RDS_TDC_MAX_CHANNELS   32
+#define RDS_TDC_CHANNEL_BUF    256	/* bytes per channel, power of 2 */
+	struct {
+		uint8_t  buf[RDS_TDC_CHANNEL_BUF];
+		int      len;		/* bytes pending */
+		int      pos;		/* next byte to send */
+	}		tdc_ch[RDS_TDC_MAX_CHANNELS];	/* per-channel ring */
+	int		tdc_next_ch;	/* round-robin channel cursor */
+	int		tdc_use_5b;	/* 0=5A (4 B/group), 1=5B (2 B/group) */
+
+	/* ============================================================
+	 * Group 6: In-House applications (IH)
+	 * EN 50067 §3.1.5.9, Fig 24. Content is operator-defined.
+	 * B[4:0]=IH bits; 6A adds blocks C+D; 6B adds block D only (C=PI@C').
+	 * ============================================================ */
+	struct {
+		int      active;
+		uint8_t  b_payload;	/* 5 bits of block B, operator-defined */
+		uint16_t c_data;	/* block C data (6A only) */
+		uint16_t d_data;	/* block D data (both 6A and 6B) */
+		int      use_6b;	/* 0=6A (PI@C + C+D), 1=6B (PI@C' + D) */
+	}		ih;
+
 } rds_encoder_t;
 
 /* Initialize RDS encoder */
@@ -2607,6 +2636,17 @@ typedef struct rds_decoder {
 	/* Protocol server callback (for XDR-GTK, RDS Spy output) */
 	void		(*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg);
 	void		*group_callback_arg;
+
+	/* Group 5: Transparent Data Channel (TDC) receive callback
+	 * Called for every 5A/5B group with: channel (0-31), data bytes, length (4 or 2) */
+	void		(*tdc_callback)(uint8_t channel, const uint8_t *data, int len, void *arg);
+	void		*tdc_callback_arg;
+
+	/* Group 6: In-House application receive callback
+	 * Called for every 6A/6B group with: b_payload (5 bits), is_6b, c_data, d_data */
+	void		(*ih_callback)(uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data, void *arg);
+	void		*ih_callback_arg;
+
 } rds_decoder_t;
 
 /* Initialize RDS decoder
@@ -2748,5 +2788,25 @@ int rds_decoder_set_bitstream_file(rds_decoder_t *rds, const char *filename);
 void rds_decoder_set_group_callback(rds_decoder_t *rds,
                                     void (*callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg),
                                     void *arg);
+
+/* Group 5: Transparent Data Channel (TDC) encoder API
+ * EN 50067 §3.1.5.8, §3.2.4.  32 independent channels (0-31).
+ * 5A: 4 data bytes/group; 5B: 2 data bytes/group (block C = PI@C').  */
+void rds_enc_tdc_set_channel(rds_encoder_t *rds, int channel, const uint8_t *data, int len);
+void rds_enc_tdc_clear_channel(rds_encoder_t *rds, int channel);
+void rds_enc_tdc_set_version(rds_encoder_t *rds, int use_5b);
+void rds_decoder_set_tdc_callback(rds_decoder_t *rds,
+				  void (*fn)(uint8_t channel, const uint8_t *data, int len, void *arg),
+				  void *arg);
+
+/* Group 6: In-House applications (IH) encoder API
+ * EN 50067 §3.1.5.9, Fig 24.  Payload is operator-defined. */
+void rds_enc_ih_set_6a(rds_encoder_t *rds, uint8_t b_payload, uint16_t c_data, uint16_t d_data);
+void rds_enc_ih_set_6b(rds_encoder_t *rds, uint8_t b_payload, uint16_t d_data);
+void rds_enc_ih_clear(rds_encoder_t *rds);
+void rds_decoder_set_ih_callback(rds_decoder_t *rds,
+				 void (*fn)(uint8_t b_payload, int is_6b,
+					    uint16_t c_data, uint16_t d_data, void *arg),
+				 void *arg);
 
 #endif /* _RDS_H */
