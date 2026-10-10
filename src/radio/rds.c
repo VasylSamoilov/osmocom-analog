@@ -8090,9 +8090,11 @@ static void rds_decode_group(rds_decoder_t *rds)
 			rds->pin_hour = (b4 & RDS_PIN_HOUR_MASK) >> RDS_PIN_HOUR_SHIFT;
 			rds->pin_minute = b4 & RDS_PIN_MINUTE_MASK;
 			
-			/* Validate PIN fields (RDS_VALID_* macros) */
+			/* Validate PIN fields.
+			 * Hour 0-23 = start time; hour 24 = programme end time
+			 * (EN 50067 §3.1.5.2 Note 2 p.24) — accept both. */
 			int pin_valid = RDS_VALID_PIN_DAY(rds->pin_day) &&
-			                RDS_VALID_HOUR(rds->pin_hour) &&
+			                RDS_VALID_PIN_HOUR(rds->pin_hour) &&
 			                RDS_VALID_MINUTE(rds->pin_minute);
 			
 			if (rds->debug)
@@ -8102,9 +8104,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 			
 			if (rds->verbose && pin_valid) {
 				if (rds->pin_day != 0) {
-					LOGP(DRADIO, LOGL_INFO, "RDS 1%c: Programme Item Number - "
-					     "Scheduled broadcast: Day %d of month, %02d:%02d\n",
-					     version ? 'B' : 'A', rds->pin_day, rds->pin_hour, rds->pin_minute);
+					if (rds->pin_hour == 24) {
+						LOGP(DRADIO, LOGL_INFO, "RDS 1%c: Programme Item Number - "
+						     "Programme end time: Day %d of month at %02d:%02d\n",
+						     version ? 'B' : 'A', rds->pin_day, 0, rds->pin_minute);
+					} else {
+						LOGP(DRADIO, LOGL_INFO, "RDS 1%c: Programme Item Number - "
+						     "Scheduled broadcast: Day %d of month, %02d:%02d\n",
+						     version ? 'B' : 'A', rds->pin_day, rds->pin_hour, rds->pin_minute);
+					}
 				} else {
 					LOGP(DRADIO, LOGL_INFO, "RDS 1%c: Programme Item Number - "
 					     "No scheduled broadcast time (day=0)\n",

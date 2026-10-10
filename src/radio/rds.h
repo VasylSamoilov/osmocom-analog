@@ -1277,6 +1277,9 @@ typedef struct {
  * ============================================================ */
 #define RDS_VALID_PTY(pty)        ((pty) <= 31)
 #define RDS_VALID_HOUR(h)         ((h) <= 23)
+/* PIN hour range is 0-23 for start time, PLUS 24 which means
+ * "programme end time" (EN 50067 §3.1.5.2 Note 2, p.24). */
+#define RDS_VALID_PIN_HOUR(h)     ((h) <= 24)
 #define RDS_VALID_MINUTE(m)       ((m) <= 59)
 #define RDS_VALID_TZ_OFFSET(o)    ((o) >= -24 && (o) <= 24)
 #define RDS_VALID_PIN_DAY(d)      ((d) >= 0 && (d) <= 31)
