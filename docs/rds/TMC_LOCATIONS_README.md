@@ -2,24 +2,30 @@
 
 ## tmc_locations_italy.csv
 
-Italian ALERT-C location code list (LCL) -- 13,194 entries, LCD codes 0..13445.
+Italian ALERT-C location code list (LCL v4.8) -- 5,911 road entries.
+Full LCL: NAMES.DAT + ROADS.DAT join, from CCISS/MIT v4.8 (2024-02-22).
 
 ### Provenance
 
-Converted from `tmc_locations_italy.h` in gr-rds (GNU Radio):
-  https://github.com/bastibl/gr-rds/blob/master/lib/tmc_locations_italy.h
+Converted from Database RDS-TMC 4.8 published by CCISS (Centro di
+Coordinamento Informazioni sulla Sicurezza Stradale) on behalf of the
+Italian Ministry of Infrastructure and Transport (MIT):
+  https://www.cciss.it/web/cciss/database-rds-tmc
 
-The gr-rds file was built from the official Italian LCL v2.2 (DAT_22.zip)
-published by il portale dell'automobilista (Italian MCTC). Only the NAMES.dat
-portion (LCD -> location name) was carried over; ROADS/SEGMENTS/POINTS were
-discarded.
+Source: NAMES.DAT + ROADS.DAT joined by RNID (same method as Germany).
+Produces "ROADNUMBER - road_name" per LCD code (e.g. "A1", "SP12 - Bucine").
+CID=25, TABCD=1, version 4.8, dated 22/02/2024. UTF-8.
+
+Previous version: gr-rds tmc_locations_italy.h (GPL-2.0+, v2.2 NAMES-only,
+13,194 entries). CCISS 4.8 has 5,911 road records with road numbers vs
+13,194 name-only entries -- proper "A1" format rather than bare place names.
 
 ### License
 
-The gr-rds file carries: Copyright 2004 Free Software Foundation, Inc.,
-GNU General Public License v2 or later. The underlying Italian location data
-has separate terms from the original Italian source.
-osmocom-analog is GPL-licensed; this file is compatible.
+The CCISS database is publicly distributed by MIT/CCISS with no login
+required. No explicit redistribution license is bundled. The download page
+states this is the official database for TIC/TCC data exchange and the
+RAI RDS-TMC service. Attribution: CCISS/MIT, Database RDS-TMC v4.8.
 
 ### Format
 
