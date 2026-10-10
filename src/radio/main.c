@@ -125,6 +125,7 @@ static const char *rds_hexrds_file = NULL;
 static const char *rds_bitstream_file = NULL;
 static const char *rds_tx_hexrds_file = NULL;
 static const char *rds_tx_bitstream_file = NULL;
+static const char *rds_tmc_events_file = NULL;
 
 /* Protocol server endpoints */
 static const char *xdr_gtk_server = NULL;
@@ -505,6 +506,11 @@ static void print_help(const char *arg0)
 	printf("        Transmit RDS bitstream from binary file (bypasses encoder).\n");
 	printf("        Raw bits packed MSB first. Loops continuously.\n");
 	printf("        Transmitted groups are logged using the decoder.\n");
+	printf("    --rds-tmc-events <filename>\n");
+	printf("        Load TMC event code descriptions from a semicolon-delimited CSV\n");
+	printf("        (docs/rds/tmc_events.csv) for human-readable TMC event names in\n");
+	printf("        the verbose log. Format: Code;Description;...\n");
+	printf("        Source: OSM wiki TMC/Event_Code_List (1552 ALERT-C events).\n");
 	printf("    --xdr-gtk-server <endpoint>\n");
 	printf("        Enable XDR-GTK protocol server for RDS decoder output.\n");
 	printf("        TCP: <ip>:<port> (e.g., 127.0.0.1:7373)\n");
@@ -604,6 +610,7 @@ static double afc_max_hz = 5000.0;
 #define OPT_RIGCTL_ALLOWED	1115
 #define OPT_RDS_TX_HEXRDS_FILE	1116
 #define OPT_RDS_TX_BITSTREAM_FILE 1117
+#define OPT_RDS_TMC_EVENTS	1118
 #define OPT_RDS_PAGING_FIFO	1121
 #define OPT_RDS_PAGING_CC	1122
 #define OPT_RDS_PAGING_OPC	1123
@@ -654,6 +661,7 @@ static void add_options(void)
 	option_add(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1);
 	option_add(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1);
 	option_add(OPT_RDS_TX_BITSTREAM_FILE, "rds-tx-bitstream-file", 1);
+	option_add(OPT_RDS_TMC_EVENTS, "rds-tmc-events", 1);
 	option_add(OPT_XDR_GTK_SERVER, "xdr-gtk-server", 1);
 	option_add(OPT_RDSSPY_SERVER, "rdsspy-server", 1);
 	option_add(OPT_UECP_SERVER, "uecp-server", 1);
@@ -858,6 +866,9 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_RDS_TX_BITSTREAM_FILE:
 		rds_tx_bitstream_file = options_strdup(argv[argi]);
 		rds = 1;  /* auto-enable RDS */
+		break;
+	case OPT_RDS_TMC_EVENTS:
+		rds_tmc_events_file = options_strdup(argv[argi]);
 		break;
 	case OPT_XDR_GTK_SERVER:
 		xdr_gtk_server = options_strdup(argv[argi]);
@@ -1402,6 +1413,14 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to open bitstream output file, exitting!\n");
 			exit(0);
 		}
+	}
+
+	/* Load optional TMC event description table (docs/rds/tmc_events.csv).
+	 * When loaded, the RDS 8A decoder logs human-readable event names. */
+	if (rds_tmc_events_file) {
+		if (rds_tmc_load_events(rds_tmc_events_file) < 0)
+			fprintf(stderr, "Warning: failed to load TMC events from '%s'\n",
+			        rds_tmc_events_file);
 	}
 
 	/* Set up RDS TX file input if requested (bypasses encoder) */
