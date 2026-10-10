@@ -894,7 +894,7 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg);
 static uint8_t rds_paging_next_counter(rds_paging_enc_t *pag, uint32_t address)
 {
 	int slot = address % RDS_PAGING_ADDR_HASH_SIZE;
-	/* Simple linear probe — if slot is occupied by a different address,
+	/* Simple linear probe -- if slot is occupied by a different address,
 	 * scan forward. For typical paging loads this is fine. */
 	int i;
 	for (i = 0; i < RDS_PAGING_ADDR_HASH_SIZE; i++) {
@@ -908,7 +908,7 @@ static uint8_t rds_paging_next_counter(rds_paging_enc_t *pag, uint32_t address)
 			return c;
 		}
 	}
-	/* Table full — return 1 (best effort) */
+	/* Table full -- return 1 (best effort) */
 	return 1;
 }
 
@@ -1597,7 +1597,7 @@ static void rds_build_group_2a(rds_encoder_t *rds, uint8_t *group)
 	 * carriage return - if the current message requires less than 16
 	 * segment addresses."
 	 * Once we transmit a segment containing the first 0x0D terminator,
-	 * wrap back to segment 0 — no need to keep transmitting padding.
+	 * wrap back to segment 0 -- no need to keep transmitting padding.
 	 * This reduces unnecessary air time and matches standard behavior. */
 	int next_seg = seg + 1;
 	int has_cr = (rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r' ||
@@ -1673,7 +1673,7 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
 	rds_group_pack(blocks, group, 0);
 	
 	/* Advance segment. Reset to 0 once we hit the first 0x0D terminator
-	 * in the current segment — no need to transmit padding beyond that.
+	 * in the current segment -- no need to transmit padding beyond that.
 	 * EN 50067: message ended by 0x0D if fewer than 16 segments needed. */
 	int next_seg = seg + 1;
 	int has_cr = (rds->rt[pos] == '\r' || rds->rt[pos+1] == '\r');
@@ -2381,7 +2381,7 @@ static void rds_build_group_14a(rds_encoder_t *rds, uint8_t *group)
 		}
 		break;
 	case RDS_14A_VARIANT_LINK:
-		/* Linkage Information (EN 50067 §3.2.1.8, Fig 41/42)
+		/* Linkage Information (EN 50067 S.3.2.1.8, Fig 41/42)
 		 * b15=LA, b14=EG, b13=X(0), b12=ILS, b11..b0=LSN */
 		b3 = ((eon->linkage_la  ? 1 : 0) << RDS_14A_LINK_LA_BIT)  |
 		     ((eon->linkage_eg  ? 1 : 0) << RDS_14A_LINK_EG_BIT)  |
@@ -2516,7 +2516,7 @@ static void rds_build_group_14b(rds_encoder_t *rds, uint8_t *group)
 
 /* ============================================================
  * Group 15B: Fast basic tuning and switching
- * EN 50067:1998 §3.1.5.21, Figure 39 (p.39)
+ * EN 50067:1998 S.3.1.5.21, Figure 39 (p.39)
  *
  * Transmits TP/PTY/TA/MS/DI flags at a fast repetition rate without
  * carrying AF or PS text. Both block B and block D carry identical
@@ -2558,7 +2558,7 @@ static void rds_build_group_15b(rds_encoder_t *rds, uint8_t *group)
 	     seg;                                    /* bits 1-0 */
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 
-	/* Block C: PI repeat (offset C' — version-B group) */
+	/* Block C: PI repeat (offset C' -- version-B group) */
 	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
 
 	/* Block D: identical payload to block B (Fig 39: same TP/PTY/TA/MS/DI/seg), offset D */
@@ -2700,7 +2700,7 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		/* Remaining data groups: 4 chars each, PSAC cycles 9-14.
 		 * Per EN 50067 Table M.4, the LAST data group uses PSAC=1111 (0xF)
 		 * which means "end of alphanumeric message: last four or fewer
-		 * message characters".  PSAC 0xF is NOT an empty sentinel — it
+		 * message characters".  PSAC 0xF is NOT an empty sentinel -- it
 		 * carries the final characters. */
 		{
 			int remaining = len - ci;
@@ -2732,7 +2732,7 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 	}
 
 	case RDS_PAGING_VNUM: {
-		/* Variable-length numeric paging — EN 50067 M.3.5.5 (Fig M.15, Table M.15).
+		/* Variable-length numeric paging -- EN 50067 M.3.5.5 (Fig M.15, Table M.15).
 		 * Uses the SAME PSAC space as alphanumeric (1000 addr, 1001..1110 cyclic,
 		 * 1111 end) but the CONTROL BYTE MT field is 01 (numeric) instead of
 		 * 00 (alpha). The RX decodes MT from the control byte and routes to VNUM.
@@ -2863,7 +2863,7 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
  * For BCD addresses (our case), Z2 and Z3 are 0-9, so Z2Z3_hex = Z2*16 + Z3.
  * 25-bit formula (EN 50067 Table M.18, p.123): replace Z2Z3 by INT(Z2Z3/2)
  * in the 50-bit formula: bit = INT(INT(Z2Z3_hex/2) * 50 / 256).
- * Example: Z2Z3=0x9E=158 → INT(79*50/256) = INT(15.43) = 15 ✓ */
+ * Example: Z2Z3=0x9E=158 -> INT(79*50/256) = INT(15.43) = 15 (ok) */
 static int rds_paging_notify_bit_25(uint32_t address)
 {
 	uint8_t z2 = (address / 100) % 10;
@@ -2972,12 +2972,12 @@ static void rds_build_group_13a_paging(rds_encoder_t *rds, uint8_t *group)
 	/* Block C: IT(b15:12) + S1(b11) + S2(b10) + X=0(b9) + notify[24:16](b8:0)
 	 * EN 50067 Fig M.11a: C = IT(4) | S1 | S2 | X | notify_hi(9 bits) */
 	b3 = ((interval & 0x0F) << RDS_13A_IT_SHIFT) |
-	     /* S1=0, S2=0 (not sorted) — set when needed */
+	     /* S1=0, S2=0 (not sorted) -- set when needed */
 	     /* X=0 (reserved) */
 	     ((notify_word >> 16) & RDS_13A_NOTIFY_HI_MASK);
 	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
 
-	/* Block D: notify[15:0] (16 bits) — EN 50067 Fig M.11a */
+	/* Block D: notify[15:0] (16 bits) -- EN 50067 Fig M.11a */
 	b4 = (uint16_t)(notify_word & RDS_13A_NOTIFY_LO_MASK);
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 
@@ -3104,9 +3104,9 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 	
 	/* Block 8: ODA identification (3A) + RT+ ODA group pair
 	 *
-	 * IEC 62106-6 §A.6: "3A type groups shall be transmitted at least every
+	 * IEC 62106-6 S.A.6: "3A type groups shall be transmitted at least every
 	 * 10 s" and RT+ app groups "with a minimum frequency of 0.5 groups per
-	 * second". Per §A.7 the receiver uses 3A to register the ODA before
+	 * second". Per S.A.7 the receiver uses 3A to register the ODA before
 	 * decoding RT+ tags, so we place 3A immediately before the RT+ carrier
 	 * group to minimize the gap between announcement and data.
 	 *
@@ -3142,7 +3142,7 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 	}
 	
 	/* RT+ pair: 3A then RT+ carrier group.
-	 * IEC 62106-6 §A.6: 3A at least every 10s, RT+ app group at
+	 * IEC 62106-6 S.A.6: 3A at least every 10s, RT+ app group at
 	 * least 0.5 groups/sec. One pair per cycle at ~11.4 groups/sec
 	 * satisfies both requirements. 3A immediately before carrier
 	 * ensures receiver sees registration before tag data. */
@@ -3194,6 +3194,7 @@ static void rds_build_group_5a(rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_5b(rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_6 (rds_encoder_t *rds, uint8_t *group);
 static void rds_build_group_8a(rds_encoder_t *rds, uint8_t *group);
+static void rds_build_group_15a(rds_encoder_t *rds, uint8_t *group);
 
 static void rds_generate_group(rds_encoder_t *rds)
 {
@@ -3237,12 +3238,12 @@ static void rds_generate_group(rds_encoder_t *rds)
 	 * PRIORITY 1: Time-Triggered Group 4A (Clock-Time)
 	 * ============================================================
 	 * IEC 62106 S6.1.5.4: CT transmitted at minute boundaries.
-	 * EN 50067 §3.1.5.6 Note 4: the minute edge should occur within ±0.1 s
+	 * EN 50067 S.3.1.5.6 Note 4: the minute edge should occur within +/-0.1 s
 	 * of the END of the CT group.
 	 * Software TX limitation: rds_generate_group() is called at fixed group
 	 * boundaries locked to the audio sample clock.  A group slot cannot be
 	 * moved forward in time without breaking stream sync.  We fire the 4A on
-	 * the first group slot AFTER the UTC minute changes — this places the group
+	 * the first group slot AFTER the UTC minute changes -- this places the group
 	 * ~0..87.6 ms AFTER the edge, not centred on it.  Tighter compliance with
 	 * Note 4 requires hardware-level timing (SDR sample counter aligned to GPS
 	 * PPS or an RTC interrupt), which is outside the scope of software TX.
@@ -3343,6 +3344,13 @@ static void rds_generate_group(rds_encoder_t *rds)
 	case RDS_GROUP_15B:
 		rds_build_group_15b(rds, rds->group_buffer);
 		break;
+	case RDS_GROUP_15A:
+		if (rds->long_ps_active) {
+			rds_build_group_15a(rds, rds->group_buffer);
+		} else {
+			rds_build_group_0a(rds, rds->group_buffer);
+		}
+		break;
 	/* Group 5: Transparent Data Channels */
 	case RDS_GROUP_5A:
 		rds_build_group_5a(rds, rds->group_buffer);
@@ -3377,7 +3385,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 				rds_build_group_7a(rds, rds->group_buffer);
 				break;
 			}
-			/* Nothing to send — fall back to 0A/0B */
+			/* Nothing to send -- fall back to 0A/0B */
 			if (rds->use_0b)
 				rds_build_group_0b(rds, rds->group_buffer);
 			else
@@ -3418,11 +3426,11 @@ static void rds_generate_group(rds_encoder_t *rds)
 					blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 					
 					if (aid == RDS_ODA_AID_RT_PLUS) {
-						/* RT+ group — always transmit tags alongside 3A. */
+						/* RT+ group -- always transmit tags alongside 3A. */
 						rds_build_rtplus_group(rds, &rds->rtplus, &b2, &b3, &b4);
 						b2 |= (type << RDS_B2_GROUP_SHIFT);
 						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
-						/* Version-B: block 3 = PI repeat at offset C' (EN 50067 §3.1.3) */
+						/* Version-B: block 3 = PI repeat at offset C' (EN 50067 S.3.1.3) */
 						if (is_version_b) {
 							blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
 						} else {
@@ -3848,7 +3856,7 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
  * application that need to set tags before the scheduler sees the
  * new A/B state.
  *
- * Per IEC 62106-6 §A.6: "The RT+ tag information for the application
+ * Per IEC 62106-6 S.A.6: "The RT+ tag information for the application
  * group shall be sent to the RDS encoder immediately after the new
  * RadioText." This means tags must be ready BEFORE the scheduler
  * starts transmitting with the new A/B flag.
@@ -3857,7 +3865,7 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 
 /* ============================================================
  * Group 5: Transparent Data Channels (TDC)
- * EN 50067 §3.1.5.8, Figure 22 (5A) and Figure 23 (5B), §3.2.4.
+ * EN 50067 S.3.1.5.8, Figure 22 (5A) and Figure 23 (5B), S.3.2.4.
  *
  * 5A: Block B b4..b0 = channel (0-31); Block C = bytes 0-1; Block D = bytes 2-3.
  * 5B: Block B b4..b0 = channel (0-31); Block C = PI@C'; Block D = bytes 0-1.
@@ -3964,7 +3972,7 @@ void rds_decoder_set_tdc_callback(rds_decoder_t *rds,
 
 /* ============================================================
  * Group 8A: Traffic Message Channel (TMC / ALERT-C)
- * EN 50067 §3.1.5.12, Figure 27; ISO 14819.
+ * EN 50067 S.3.1.5.12, Figure 27; ISO 14819.
  * Bit layout verified against gr-rds (GPLv3) and redsea (MIT).
  *
  * TX: single-group user messages only.  Announce via a 3A group with
@@ -4032,8 +4040,85 @@ void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 }
 
 /* ============================================================
+ * Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
+ * Bit layout from redsea station.cc::decodeType15A (MIT licence).
+ *
+ * 8 segments (3-bit addr in B[2:0]); each segment = 4 UTF-8 chars:
+ *   Block C (offset C): chars[seg*4+0] and chars[seg*4+1]
+ *   Block D (offset D): chars[seg*4+2] and chars[seg*4+3]
+ * Group type code 11110 (15, version A). No B0=1, so block C uses
+ * offset C (not C').
+ *
+ * NOTE (NRSC-4-B): not compatible with pre-2008 RBDS receivers.
+ * ============================================================ */
+static void rds_build_group_15a(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2;
+	int seg = rds->long_ps_segment & 0x07;
+	int pos = seg * 4;
+
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+
+	/* Block B: 15A + TP + PTY + segment (b2:0) */
+	b2 = (RDS_GROUP_15A << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp  << RDS_B2_TP_BIT)           |
+	     (rds->pty << RDS_B2_PTY_SHIFT)         |
+	     (seg & 0x07);
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+
+	/* Block C (offset C): chars[pos] and chars[pos+1] */
+	blocks[2] = rds_build_block(
+		((uint16_t)(uint8_t)rds->long_ps[pos]   << 8) |
+		 (uint8_t)rds->long_ps[pos + 1], RDS_OFFSET_C);
+
+	/* Block D (offset D): chars[pos+2] and chars[pos+3] */
+	blocks[3] = rds_build_block(
+		((uint16_t)(uint8_t)rds->long_ps[pos + 2] << 8) |
+		 (uint8_t)rds->long_ps[pos + 3], RDS_OFFSET_D);
+
+	rds_group_pack(blocks, group, 0);
+
+	rds->long_ps_segment = (seg + 1) & 0x07;
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG,
+		     "RDS TX 15A: Long PS seg=%d \"%c%c%c%c\"\n",
+		     seg,
+		     rds->long_ps[pos]   >= 0x20 ? rds->long_ps[pos]   : '.',
+		     rds->long_ps[pos+1] >= 0x20 ? rds->long_ps[pos+1] : '.',
+		     rds->long_ps[pos+2] >= 0x20 ? rds->long_ps[pos+2] : '.',
+		     rds->long_ps[pos+3] >= 0x20 ? rds->long_ps[pos+3] : '.');
+}
+
+/* Long PS encoder API */
+void rds_enc_set_long_ps(rds_encoder_t *rds, const char *text)
+{
+	if (!rds || !text) return;
+	memset(rds->long_ps, ' ', RDS_LONG_PS_LEN);
+	rds->long_ps[RDS_LONG_PS_LEN] = '\0';
+	size_t len = strlen(text);
+	if (len > RDS_LONG_PS_LEN) len = RDS_LONG_PS_LEN;
+	memcpy(rds->long_ps, text, len);
+	rds->long_ps_segment = 0;
+	rds->long_ps_active  = 1;
+}
+void rds_enc_clear_long_ps(rds_encoder_t *rds)
+{
+	if (rds) rds->long_ps_active = 0;
+}
+
+/* Long PS decoder API */
+void rds_dec_get_long_ps(const rds_decoder_t *rds, char *text, size_t max_len)
+{
+	if (!rds || !text || max_len == 0) return;
+	size_t n = (max_len - 1 < RDS_LONG_PS_LEN) ? max_len - 1 : RDS_LONG_PS_LEN;
+	memcpy(text, rds->long_ps, n);
+	text[n] = '\0';
+}
+/* ============================================================
  * Group 6: In-House applications (IH)
- * EN 50067 §3.1.5.9, Figure 24 (6A and 6B), §3.2.5.
+ * EN 50067 S.3.1.5.9, Figure 24 (6A and 6B), S.3.2.5.
  * Content is entirely operator-defined; the standard only defines
  * the bit allocation. Consumer receivers should ignore IH groups.
  *
@@ -4125,7 +4210,7 @@ void rds_enc_set_rt(rds_encoder_t *rds, const char *rt)
 	rds->rt_complete_count = 0;
 	
 	/* Warn if RT is shorter than the full group capacity or contains an
-	 * embedded 0x0D — both cause early termination per EN 50067. */
+	 * embedded 0x0D -- both cause early termination per EN 50067. */
 	int full_len = rds->use_2b ? 32 : 64;
 	int cr_pos = -1;
 	for (int i = 0; i < len; i++) {
@@ -5747,7 +5832,7 @@ int rds_dec_get_ert_chartable(const rds_decoder_t *rds)
 	return rds->ert_dec.chartable;
 }
 
-/* Decoder getters — basic fields */
+/* Decoder getters -- basic fields */
 uint8_t rds_dec_get_pty(const rds_decoder_t *rds)
 {
 	return rds ? rds->pty : 0;
@@ -6075,7 +6160,7 @@ int rds_enc_get_slc_variants(const rds_encoder_t *rds, int *variants, int max)
 	if (max < 1)
 		return 0;
 
-	/* Variant 0 (ECC) always included — carries LA flag */
+	/* Variant 0 (ECC) always included -- carries LA flag */
 	variants[count++] = RDS_1A_VARIANT_ECC;
 
 	if (count < max && rds->tmc_id != 0)
@@ -7695,10 +7780,10 @@ static int rds_check_syndrome(uint32_t block, uint16_t *offset_out)
 /* Decode RT+ ODA group (IEC 62106-6 A.5.3, A.7)
  *
  * Receiver state machine:
- *   - item_toggle change → new Item started. Archive/discard old Item-category
+ *   - item_toggle change -> new Item started. Archive/discard old Item-category
  *     tags, begin collecting for new Item (A.5.3 note 3).
- *   - item_running 1→0 → Item ended (e.g. news break, jingle).
- *   - item_running 0→1 → Item started.
+ *   - item_running 1->0 -> Item ended (e.g. news break, jingle).
+ *   - item_running 0->1 -> Item started.
  *   - RT A/B flag change is handled in Group 2A/2B decoder, which invalidates
  *     old tags (they reference positions in the old RadioText).
  *   - toggle and running are independent from tag content (A.5.3 note 2).
@@ -7726,7 +7811,7 @@ static void rds_decode_rtplus(rds_decoder_t *rds, const uint16_t *blocks,
 	
 	/* Log state transitions per IEC 62106-6 A.5.3 */
 	if (toggle != rtplus->toggle) {
-		/* item_toggle changed → new Item (A.5.3 note 3:
+		/* item_toggle changed -> new Item (A.5.3 note 3:
 		 * "group all RT content types of category Item sent for one item") */
 		if (rds->verbose)
 			LOGP(DRADIO, LOGL_INFO, "RDS RT+: item_toggle changed %d->%d (new Item)\n",
@@ -8436,7 +8521,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 			
 			/* Validate PIN fields.
 			 * Hour 0-23 = start time; hour 24 = programme end time
-			 * (EN 50067 §3.1.5.2 Note 2 p.24) — accept both. */
+			 * (EN 50067 S.3.1.5.2 Note 2 p.24) -- accept both. */
 			int pin_valid = RDS_VALID_PIN_DAY(rds->pin_day) &&
 			                RDS_VALID_PIN_HOUR(rds->pin_hour) &&
 			                RDS_VALID_MINUTE(rds->pin_minute);
@@ -9098,7 +9183,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 		case RDS_7A_PSAC_ALPHA_ADDR: {
 			/* PSAC=8: address group for alpha or enhanced variable-length.
 			 * Control byte in D lower byte determines message type via MT.
-			 * Only ALPHA and VNUM use this — tone/basic numeric do not. */
+			 * Only ALPHA and VNUM use this -- tone/basic numeric do not. */
 			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
 			uint8_t ctrl = b4 & 0xFF;
 			uint8_t mt = (ctrl >> RDS_PAGING_CTRL_MT_SHIFT) & 0x03;
@@ -9297,12 +9382,12 @@ static void rds_decode_group(rds_decoder_t *rds)
 		 && rds->paging_dec.opc_valid && rds->paging_dec.opc != 0) {
 		/* Group 13A: Enhanced Radio Paging (EN 50067 M.3.4)
 		 * Address notification for battery saving.
-		 * Only decoded as paging when enhanced paging is active (OPC≠0).
+		 * Only decoded as paging when enhanced paging is active (OPC 0).
 		 * Per EN 50067: "13A groups are optional" and available for ODA
 		 * when not used for paging. If OPC=0 or not yet received,
 		 * this condition is false and falls through to ODA routing. */
 		rds_paging_dec_t *pd = &rds->paging_dec;
-		/* Block B bits 4-3: CS, bits 2-0: STY — per EN 50067 Fig M.11a */
+		/* Block B bits 4-3: CS, bits 2-0: STY -- per EN 50067 Fig M.11a */
 		uint8_t sty = (b2 >> RDS_13A_STY_SHIFT) & 0x07;
 
 		if (sty == 0) {
@@ -9525,7 +9610,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				}
 			}
 			else if (usage == RDS_14A_VARIANT_LINK) {
-				/* Variant 12: Linkage Information (EN 50067 §3.2.1.8, Fig 41/42)
+				/* Variant 12: Linkage Information (EN 50067 S.3.2.1.8, Fig 41/42)
 				 * Block C (b15..b0):
 				 *   b15 = LA (Linkage Actuator)
 				 *   b14 = EG (Extended Generic): 0=national/ODA, 1=international/extended
@@ -9639,15 +9724,15 @@ group14_done:
 		
 		/* Store ODA registration in oda_apps[] indexed by carrier group type
 		 * This allows the decoder to later identify ODA data on other groups.
-		 * EN 50067 §3.1.5.4: code 0x00 = "not currently carried in associated
+		 * EN 50067 S.3.1.5.4: code 0x00 = "not currently carried in associated
 		 * group"; code 0x1F = "temporary data fault". These are encoder-status
-		 * indicators, not real carrier-group assignments — do not register them. */
+		 * indicators, not real carrier-group assignments -- do not register them. */
 		if ((rds->group_mask & (1<<3))) {  /* Block D (AID) valid */
 			if (app_group == 0x00 || app_group == 0x1F) {
 				/* Status indication only */
 				if (rds->debug)
 					LOGP(DRADIO, LOGL_DEBUG, "RDS 3A: status code 0x%02X "
-					     "(%s) AID=0x%04X — not a carrier assignment\n",
+					     "(%s) AID=0x%04X -- not a carrier assignment\n",
 					     app_group,
 					     app_group == 0x00 ? "not carried" : "data fault",
 					     aid);
@@ -9715,7 +9800,7 @@ group14_done:
 	}
 	else if (group_type == 5) {
 		/* Group 5: Transparent Data Channels (TDC) or ODA
-		 * EN 50067 §3.1.5.8, Fig 22 (5A) / Fig 23 (5B).
+		 * EN 50067 S.3.1.5.8, Fig 22 (5A) / Fig 23 (5B).
 		 * Block B b4:0 = channel number (0-31).
 		 * 5A: Block C + Block D = 4 data bytes (offsets C/D).
 		 * 5B: Block C = PI repeat (offset C'), Block D = 2 data bytes. */
@@ -9747,7 +9832,7 @@ group14_done:
 	}
 	else if (group_type == 6) {
 		/* Group 6: In-House applications (IH) or ODA
-		 * EN 50067 §3.1.5.9, Fig 24.
+		 * EN 50067 S.3.1.5.9, Fig 24.
 		 * Block B b4:0 = operator-defined IH bits.
 		 * 6A: Block C = 16-bit IH data (offset C), Block D = 16-bit IH data.
 		 * 6B: Block C = PI repeat (offset C'), Block D = 16-bit IH data. */
@@ -9762,10 +9847,43 @@ group14_done:
 			rds->ih_callback(b_payload, version, c_data, d_data,
 					 rds->ih_callback_arg);
 	}
+	else if (group_type == 15 && version == 0) {
+		/* Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
+		 * 8 segments x 4 chars = 32-char UTF-8 long programme service name.
+		 * Block B[2:0] = segment (0-7); Block C+D = 4 chars.
+		 * Source: redsea station.cc::decodeType15A (MIT). */
+		int seg = b2 & 0x07;
+		int pos = seg * 4;
+
+		if ((rds->group_mask & (1<<2)) && pos < RDS_LONG_PS_LEN - 1) {
+			rds->long_ps[pos]     = (b3 >> 8) & 0xFF;
+			rds->long_ps[pos + 1] =  b3       & 0xFF;
+			rds->long_ps_status[pos]     = rds->block_status[2];
+			rds->long_ps_status[pos + 1] = rds->block_status[2];
+		}
+		if ((rds->group_mask & (1<<3)) && pos + 2 < RDS_LONG_PS_LEN - 1) {
+			rds->long_ps[pos + 2] = (b4 >> 8) & 0xFF;
+			rds->long_ps[pos + 3] =  b4       & 0xFF;
+			rds->long_ps_status[pos + 2] = rds->block_status[3];
+			rds->long_ps_status[pos + 3] = rds->block_status[3];
+		}
+		rds->long_ps_segments |= (1 << seg);
+
+		if (rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 15A: Long PS seg=%d\n", seg);
+
+		if (rds->long_ps_segments == 0xFF && rds->verbose) {
+			/* All 8 segments received -- display complete long PS */
+			char display[RDS_LONG_PS_LEN + 1];
+			memcpy(display, rds->long_ps, RDS_LONG_PS_LEN);
+			display[RDS_LONG_PS_LEN] = '\0';
+			LOGP(DRADIO, LOGL_INFO, "RDS 15A: Long PS complete: \"%s\"\n", display);
+		}
+	}
 	else if (group_type == 15 && version == 1) {
-		/* Group 15B: Fast Basic Tuning and Switching (EN 50067 §3.1.5.21, Fig 39)
+		/* Group 15B: Fast Basic Tuning and Switching (EN 50067 S.3.1.5.21, Fig 39)
 		 * Blocks 2 and 4 carry identical flag sets (TA/MS/DI/segment) for
-		 * robustness — if one block is lost the other still carries the update.
+		 * robustness -- if one block is lost the other still carries the update.
 		 * Block 3 = PI repeat (offset C').
 		 *
 		 * Use block 2 when available; fall back to block 4 when block 2 is
@@ -9794,7 +9912,7 @@ group14_done:
 		rds->ms_status = bflags_status;
 
 		/* Store DI bit into the appropriate decoder flag field, exactly as
-		 * the 0A/0B path does (EN 50067 Table 9: seg0→d3=dynamic_pty … seg3→d0=stereo) */
+		 * the 0A/0B path does (EN 50067 Table 9: seg0->d3=dynamic_pty   seg3->d0=stereo) */
 		switch (seg) {
 		case 0: rds->di_dynamic_pty    = di; break;
 		case 1: rds->di_compressed     = di; break;
@@ -9907,7 +10025,7 @@ group14_done:
 		case RDS_ODA_AID_TMC_ALERT:
 		case RDS_ODA_AID_TMC_ALERT2:
 			/* Group 8A: Traffic Message Channel (ALERT-C)
-			 * EN 50067 §3.1.5.12, Figure 27; ISO 14819.
+			 * EN 50067 S.3.1.5.12, Figure 27; ISO 14819.
 			 * Bit layout from gr-rds (GPLv3) + redsea (MIT).
 			 * Only handles type 8A (version A = user messages).  8B is ODA-only. */
 			if (version == 0 && (rds->group_mask & (1<<1))) {
@@ -9924,9 +10042,9 @@ group14_done:
 						     variant, b3, b4);
 				} else if (f || ((b2 & 0x08) == 0 && (b3 & 0x8000))) {
 					/* Single-group, OR first group of multi-group
-					 * (F=0 but D bit set → first group by gr-rds heuristic) */
+					 * (F=0 but D bit set -> first group by gr-rds heuristic) */
 					if (!f) {
-						/* Start of multi-group — save header blocks */
+						/* Start of multi-group -- save header blocks */
 						rds->tmc_asm.pending  = 1;
 						rds->tmc_asm.ci       = dp_ci;
 						rds->tmc_asm.c_first  = b3;
@@ -9997,7 +10115,7 @@ group14_done:
 					} else if (rds->debug) {
 						LOGP(DRADIO, LOGL_DEBUG,
 						     "RDS 8A TMC multi-follow: CI mismatch "
-						     "(got %u, expected %u) — discarded\n",
+						     "(got %u, expected %u) -- discarded\n",
 						     ci, rds->tmc_asm.ci);
 					}
 				}
@@ -10162,14 +10280,14 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->freq_subcarrier = 57000.0;
 	
 	/* AGC for Costas PLL error normalization
-	 * Redsea uses liquid-dsp AGC with bandwidth=500Hz/171kHz ≈ 0.003.
+	 * Redsea uses liquid-dsp AGC with bandwidth=500Hz/171kHz   0.003.
 	 * We use a simpler approach: track signal magnitude with a slow IIR
 	 * and normalize bb_i/bb_q before computing the Costas error.
 	 * This ensures the error signal bb_i*bb_q has consistent magnitude
 	 * regardless of input signal level.
 	 * 
 	 * agc_alpha controls adaptation speed: smaller = slower, more stable.
-	 * ~50 Hz bandwidth at 250 kHz → alpha ≈ 2*pi*50/250000 ≈ 0.00126
+	 * ~50 Hz bandwidth at 250 kHz -> alpha   2*pi*50/250000   0.00126
 	 * This is slow enough to track the envelope without following
 	 * instantaneous oscillations of the baseband signal.
 	 */

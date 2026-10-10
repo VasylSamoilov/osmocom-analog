@@ -785,12 +785,12 @@ static inline const char *rds_paging_rpc_desc(uint8_t rpc, char *buf, int buflen
  *   Bit  0:     S1 (Sort indicator)
  * ============================================================ */
 /* ============================================================
- * Group 13A Bit Fields — EN 50067:1998 Annex M, Figure M.11a/b (p.110-111)
+ * Group 13A Bit Fields -- EN 50067:1998 Annex M, Figure M.11a/b (p.110-111)
  * Enhanced Radio Paging address-notification group.
  *
  * Block B payload (bits 4-0):
- *   b4-b3 = CS   Cycle Selection (2 bits) — Table M.9
- *   b2-b0 = STY  Sub-type S2 S1 S0 (3 bits) — Table 7
+ *   b4-b3 = CS   Cycle Selection (2 bits) -- Table M.9
+ *   b2-b0 = STY  Sub-type S2 S1 S0 (3 bits) -- Table 7
  *
  * Block C (16 bits):
  *   b15-b12 = IT   Paging interval numbering (4 bits)
@@ -848,7 +848,7 @@ static inline const char *rds_paging_rpc_desc(uint8_t rpc, char *buf, int buflen
 
 /* ============================================================
  * Group 8A: Traffic Message Channel (TMC / ALERT-C)
- * EN 50067 §3.1.5.12, Fig 27; ISO 14819.
+ * EN 50067 S.3.1.5.12, Fig 27; ISO 14819.
  * Bit layout: gr-rds parser_impl.cc (GPLv3) + redsea message.cc (MIT).
  *
  * Block B[4:0]:  b4=T  b3=F  b2:0=DP/CI
@@ -1308,7 +1308,7 @@ typedef struct {
 #define RDS_VALID_PTY(pty)        ((pty) <= 31)
 #define RDS_VALID_HOUR(h)         ((h) <= 23)
 /* PIN hour range is 0-23 for start time, PLUS 24 which means
- * "programme end time" (EN 50067 §3.1.5.2 Note 2, p.24). */
+ * "programme end time" (EN 50067 S.3.1.5.2 Note 2, p.24). */
 #define RDS_VALID_PIN_HOUR(h)     ((h) <= 24)
 #define RDS_VALID_MINUTE(m)       ((m) <= 59)
 #define RDS_VALID_TZ_OFFSET(o)    ((o) >= -24 && (o) <= 24)
@@ -1909,7 +1909,7 @@ typedef struct rds_encoder {
 
 	/* ============================================================
 	 * Group 8A: Traffic Message Channel (TMC)
-	 * EN 50067 §3.1.5.12. Single-group user messages only (TX).
+	 * EN 50067 S.3.1.5.12. Single-group user messages only (TX).
 	 * Announced via Group 3A (AID=0xCD46) and Group 1A (variant 1, TMC ID).
 	 * ============================================================ */
 	struct {
@@ -1918,8 +1918,19 @@ typedef struct rds_encoder {
 	}		tmc;
 
 	/* ============================================================
+	 * Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
+	 * 8 segments x 4 chars = 32 chars, UTF-8, 3-bit segment address.
+	 * Block B[2:0] = segment (0-7); Blocks C+D = 4 chars.
+	 * NOTE: not compatible with pre-2008 RBDS receivers.
+	 * ============================================================ */
+#define RDS_LONG_PS_LEN   32
+	char		long_ps[RDS_LONG_PS_LEN + 1]; /* 32-char long PS + NUL */
+	int		long_ps_segment;               /* current segment 0-7 */
+	int		long_ps_active;                /* 1 = transmit 15A groups */
+
+	/* ============================================================
 	 * Group 5: Transparent Data Channels (TDC)
-	 * EN 50067 §3.1.5.8, §3.2.4. 32 independent channels (0-31).
+	 * EN 50067 S.3.1.5.8, S.3.2.4. 32 independent channels (0-31).
 	 * 5A: 4 data bytes/group (blocks C+D, offset C/D).
 	 * 5B: 2 data bytes/group (block D, block C = PI@C').
 	 * ============================================================ */
@@ -1935,7 +1946,7 @@ typedef struct rds_encoder {
 
 	/* ============================================================
 	 * Group 6: In-House applications (IH)
-	 * EN 50067 §3.1.5.9, Fig 24. Content is operator-defined.
+	 * EN 50067 S.3.1.5.9, Fig 24. Content is operator-defined.
 	 * B[4:0]=IH bits; 6A adds blocks C+D; 6B adds block D only (C=PI@C').
 	 * ============================================================ */
 	struct {
@@ -2319,7 +2330,7 @@ int rds_enc_eon_af_add(rds_encoder_t *rds, uint16_t pi, uint16_t freq_01mhz);
 void rds_enc_eon_af_clear(rds_encoder_t *rds, uint16_t pi);
 int rds_enc_eon_af_get(const rds_encoder_t *rds, uint16_t pi, uint16_t *freqs, int max, int *count);
 
-/* EON entry ensure — find by PI or create if not exists */
+/* EON entry ensure -- find by PI or create if not exists */
 rds_eon_entry_t *rds_enc_eon_ensure(rds_encoder_t *rds, uint16_t pi);
 
 /* EON lookup by index (for UECP PSN mapping) */
@@ -2354,7 +2365,7 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 			     const char *digits, int repeats, int interval_sec,
 			     uint8_t ni, uint16_t country_code, uint8_t opc);
 
-/* Configuration — encoder setters */
+/* Configuration -- encoder setters */
 void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
 void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable);
@@ -2362,7 +2373,7 @@ void rds_enc_paging_set_opc(rds_encoder_t *rds, uint8_t opc);
 void rds_enc_paging_set_pac(rds_encoder_t *rds, uint8_t pac);
 void rds_enc_paging_set_cc(rds_encoder_t *rds, uint16_t cc);
 
-/* Configuration — encoder getters */
+/* Configuration -- encoder getters */
 int rds_enc_paging_get_enabled(const rds_encoder_t *rds);
 uint8_t rds_enc_paging_get_rpc(const rds_encoder_t *rds);
 int rds_enc_paging_get_13a_notify(const rds_encoder_t *rds);
@@ -2415,7 +2426,7 @@ typedef struct rds_decoder {
 	double		agc_alpha;		/* AGC smoothing constant */
 	
 	/* Clock Recovery (direct 1187.5 Hz oscillator) */
-	double		clock_phi;		/* Bit clock phase (0..2π) */
+	double		clock_phi;		/* Bit clock phase (0..2pi) */
 	int		prev_clock_bit;		/* Previous clock level (+1/-1) */
 	double		prev_bb_sample;		/* Previous baseband sample (for zero cross) */
 	double		integrator;		/* Integrate-and-dump accumulator */
@@ -2692,6 +2703,13 @@ typedef struct rds_decoder {
 		int      n_groups;      /* GSI from the second group (number of follow-ons) */
 	}		tmc_asm;
 
+	/* Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20, redsea MIT)
+	 * 8 segments x 4 chars = 32 chars, UTF-8 encoded.
+	 * Block B[2:0] = segment (0-7); Blocks C+D = 4 chars. */
+	char		long_ps[RDS_LONG_PS_LEN + 1];        /* assembled name (NUL-terminated) */
+	uint8_t		long_ps_status[RDS_LONG_PS_LEN];     /* RDS_STATUS_* per char */
+	uint8_t		long_ps_segments;                    /* bitmask: bit N set when segment N received */
+
 } rds_decoder_t;
 
 /* Initialize RDS decoder
@@ -2736,7 +2754,7 @@ uint16_t rds_dec_get_paging_id(const rds_decoder_t *rds);
 uint16_t rds_dec_get_ews_channel(const rds_decoder_t *rds);
 uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds);
 
-/* Decoder getters — paging state from Group 1A / 7A */
+/* Decoder getters -- paging state from Group 1A / 7A */
 uint8_t rds_dec_paging_get_rpc(const rds_decoder_t *rds, int *valid);
 uint8_t rds_dec_paging_get_opc(const rds_decoder_t *rds, int *valid);
 uint8_t rds_dec_paging_get_pac(const rds_decoder_t *rds, int *valid);
@@ -2775,32 +2793,32 @@ int rds_dec_get_ert_direction(const rds_decoder_t *rds);
  * Note: Chartable is not used for character mapping for now. */
 int rds_dec_get_ert_chartable(const rds_decoder_t *rds);
 
-/* Decoder getters — basic fields (Group 0A/0B) */
+/* Decoder getters -- basic fields (Group 0A/0B) */
 uint8_t rds_dec_get_pty(const rds_decoder_t *rds);
 uint8_t rds_dec_get_tp(const rds_decoder_t *rds);
 uint8_t rds_dec_get_ta(const rds_decoder_t *rds);
 uint8_t rds_dec_get_ms(const rds_decoder_t *rds);
 void rds_dec_get_di(const rds_decoder_t *rds, int *stereo, int *artificial, int *compressed, int *dynamic_pty);
 
-/* Decoder getters — PTYN (Group 10A) */
+/* Decoder getters -- PTYN (Group 10A) */
 void rds_dec_get_ptyn(const rds_decoder_t *rds, char *ptyn, size_t len);
 uint8_t rds_dec_get_ptyn_ab(const rds_decoder_t *rds);
 
-/* Decoder getters — PIN (Group 1A/1B) */
+/* Decoder getters -- PIN (Group 1A/1B) */
 void rds_dec_get_pin(const rds_decoder_t *rds, uint8_t *day, uint8_t *hour, uint8_t *minute);
 
-/* Decoder getters — CT (Group 4A)
+/* Decoder getters -- CT (Group 4A)
  * timestamp: decoded UTC as unix timestamp
  * local_offset: timezone offset in half-hours as received
  * delta: (received UTC timestamp) - (system time at reception), in seconds
  * Returns 1 if CT valid, 0 if not */
 int rds_dec_get_ct(const rds_decoder_t *rds, time_t *timestamp, int8_t *local_offset, int32_t *delta);
 
-/* Decoder getters — AF Method A */
+/* Decoder getters -- AF Method A */
 int rds_dec_get_af_a_count(const rds_decoder_t *rds);
 int rds_dec_get_af_a_freq(const rds_decoder_t *rds, int index, uint16_t *freq, uint8_t *type);
 
-/* Decoder getters — AF Method B (history of completed lists) */
+/* Decoder getters -- AF Method B (history of completed lists) */
 int rds_dec_get_af_b_list_count(const rds_decoder_t *rds);
 int rds_dec_get_af_b_list(const rds_decoder_t *rds, int index,
 			  uint16_t *pi, uint16_t *tuning_freq,
@@ -2808,12 +2826,12 @@ int rds_dec_get_af_b_list(const rds_decoder_t *rds, int index,
 int rds_dec_get_af_b_freq(const rds_decoder_t *rds, int list_index,
 			  int af_index, uint16_t *freq, uint8_t *is_regional);
 
-/* Decoder getters — EON (Group 14A/14B) */
+/* Decoder getters -- EON (Group 14A/14B) */
 int rds_dec_get_eon_count(const rds_decoder_t *rds);
 const rds_eon_entry_t *rds_dec_get_eon_entry(const rds_decoder_t *rds, int index);
 const rds_eon_entry_t *rds_dec_get_eon_by_pi(const rds_decoder_t *rds, uint16_t pi);
 
-/* Decoder getters — ODA registry (Group 3A) */
+/* Decoder getters -- ODA registry (Group 3A) */
 int rds_dec_get_oda_count(const rds_decoder_t *rds);
 int rds_dec_get_oda(const rds_decoder_t *rds, int index, uint8_t *carrier_group, uint16_t *aid, uint16_t *message);
 
@@ -2835,7 +2853,7 @@ void rds_decoder_set_group_callback(rds_decoder_t *rds,
                                     void *arg);
 
 /* Group 5: Transparent Data Channel (TDC) encoder API
- * EN 50067 §3.1.5.8, §3.2.4.  32 independent channels (0-31).
+ * EN 50067 S.3.1.5.8, S.3.2.4.  32 independent channels (0-31).
  * 5A: 4 data bytes/group; 5B: 2 data bytes/group (block C = PI@C').  */
 void rds_enc_tdc_set_channel(rds_encoder_t *rds, int channel, const uint8_t *data, int len);
 void rds_enc_tdc_clear_channel(rds_encoder_t *rds, int channel);
@@ -2845,7 +2863,7 @@ void rds_decoder_set_tdc_callback(rds_decoder_t *rds,
 				  void *arg);
 
 /* Group 6: In-House applications (IH) encoder API
- * EN 50067 §3.1.5.9, Fig 24.  Payload is operator-defined. */
+ * EN 50067 S.3.1.5.9, Fig 24.  Payload is operator-defined. */
 void rds_enc_ih_set_6a(rds_encoder_t *rds, uint8_t b_payload, uint16_t c_data, uint16_t d_data);
 void rds_enc_ih_set_6b(rds_encoder_t *rds, uint8_t b_payload, uint16_t d_data);
 void rds_enc_ih_clear(rds_encoder_t *rds);
@@ -2855,7 +2873,7 @@ void rds_decoder_set_ih_callback(rds_decoder_t *rds,
 				 void *arg);
 
 /* Group 8A: TMC (Traffic Message Channel) TX/RX API
- * EN 50067 §3.1.5.12.  Bit layout from gr-rds (GPLv3) + redsea (MIT).
+ * EN 50067 S.3.1.5.12.  Bit layout from gr-rds (GPLv3) + redsea (MIT).
  * TX emits single-group user messages.  Announce via 3A (AID=0xCD46)
  * and 1A variant-1 (TMC ID) in the scheduler before enabling. */
 void rds_enc_tmc_set_msg(rds_encoder_t *rds, const rds_tmc_msg_t *msg);
@@ -2863,5 +2881,13 @@ void rds_enc_tmc_clear(rds_encoder_t *rds);
 void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
 				  void *arg);
+
+/* Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
+ * 32-char UTF-8 programme service name transmitted over 8 segments.
+ * NOTE: not compatible with pre-2008 RBDS receivers.
+ * Source: redsea station.cc::decodeType15A (MIT). */
+void rds_enc_set_long_ps(rds_encoder_t *rds, const char *text);
+void rds_enc_clear_long_ps(rds_encoder_t *rds);
+void rds_dec_get_long_ps(const rds_decoder_t *rds, char *text, size_t max_len);
 
 #endif /* _RDS_H */
