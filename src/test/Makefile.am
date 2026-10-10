@@ -16,8 +16,7 @@ noinst_PROGRAMS = \
 	test_echo_analysis \
 	test_echo_analysis_edge_cases \
 	test_echo_analysis_final_checkpoint \
-	test_amps_orders \
-	test_signal_meter
+	test_amps_orders
 
 test_filter_SOURCES = test_filter.c dummy.c
 
@@ -238,12 +237,6 @@ test_echo_analysis_final_checkpoint_LDADD = \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(LIBOSMOCC_LIBS) \
 	$(LIBOSMOCORE_LIBS) \
-	-lm
-
-test_signal_meter_SOURCES = test_signal_meter.c $(top_builddir)/src/radio/signal_meter.c
-
-test_signal_meter_LDADD = \
-	$(top_builddir)/src/libfft/libfft.a \
 	-lm
 
 test_amps_orders_SOURCES = test_amps_orders.c
