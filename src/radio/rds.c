@@ -8007,7 +8007,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				     version ? 'B' : 'A', pty, rds_get_pty_name(pty, rds->force_rbds || RDS_IS_RBDS(rds->ecc)),
 				     tp, ta, rds_get_tp_ta_description(tp, ta),
 				     rds_get_ms_name(ms),
-				     rds_get_di_name(3 - seg), rds_get_di_value_name(3 - seg, di),
+				     rds_get_di_name(seg), rds_get_di_value_name(seg, di),
 				     seg,
 				     (rds->ps[seg*2] >= 0x20 && rds->ps[seg*2] <= 0x7E) ? rds->ps[seg*2] : '.',
 				     (rds->ps[seg*2+1] >= 0x20 && rds->ps[seg*2+1] <= 0x7E) ? rds->ps[seg*2+1] : '.');
@@ -9357,7 +9357,7 @@ group14_done:
 			     "TA=%s, M/S=%s, DI[%d]=%d\n",
 			     ta ? "Yes" : "No",
 			     ms ? "Music" : "Speech",
-			     3 - seg, di);
+			     seg, di);
 	}
 	else {
 		/* Unhandled group type -- check if ODA-eligible.
