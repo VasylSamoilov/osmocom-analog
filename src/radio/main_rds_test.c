@@ -27,6 +27,7 @@ static int rds_debug = 0;
 static int rds_verbose = 0;
 static int force_rbds = 0;
 static int paging_enabled = 0;
+static int ansi_override = -1; /* -1=auto, 0=force off, 1=force on */
 
 /* Parse a single hex group line from .hexrds format.
  * Handles:
@@ -158,7 +159,7 @@ static int is_binary_rds(const char *filename)
 static void print_usage(const char *prog)
 {
 	printf("Usage: %s [options] file1.hexrds [file2.rds ...]\n\n", prog);
-	printf("RDS file decoder — validates decoder against captured RDS data.\n\n");
+	printf("RDS file decoder -- validates decoder against captured RDS data.\n\n");
 	printf("Options:\n");
 	printf("  -v <level>    Set logging verbosity (0=debug .. 7=fatal, default=5/notice)\n");
 	printf("  --rds-debug   Enable RDS decoder debug (raw hex codes, field extraction)\n");
@@ -200,6 +201,10 @@ int main(int argc, char *argv[])
 			force_rbds = 1;
 		} else if (strcmp(argv[i], "--paging") == 0) {
 			paging_enabled = 1;
+		} else if (strcmp(argv[i], "--ansi") == 0) {
+			ansi_override = 1;
+		} else if (strcmp(argv[i], "--no-ansi") == 0) {
+			ansi_override = 0;
 		} else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
 			print_usage(argv[0]);
 			return 0;
@@ -236,6 +241,12 @@ int main(int argc, char *argv[])
 		 * Set emphasis to match mode flag -- no actual radio, so avoid
 		 * spurious emphasis/mode mismatch notices. */
 		rc = rds_decoder_init(&rds, 250000.0, rds_debug, rds_verbose, force_rbds ? 75.0 : 50.0, force_rbds);
+		/* Apply --ansi / --no-ansi override after init (init sets from isatty) */
+		if (ansi_override >= 0)
+			rds.ansi_display = ansi_override;
+		/* Respect NO_COLOR environment variable (de-facto standard) */
+		if (getenv("NO_COLOR"))
+			rds.ansi_display = 0;
 		if (rc) {
 			fprintf(stderr, "Failed to init decoder for %s\n", files[i]);
 			continue;
@@ -250,6 +261,9 @@ int main(int argc, char *argv[])
 
 		if (groups > 0) {
 			total_groups += groups;
+			/* Compact panel display (to stdout, no log prefix) */
+			rds_decoder_display(&rds, stdout);
+			/* Full detail dump (to log, gated by log level) */
 			rds_decoder_status(&rds);
 		}
 
