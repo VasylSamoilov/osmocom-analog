@@ -2514,6 +2514,63 @@ static void rds_build_group_14b(rds_encoder_t *rds, uint8_t *group)
 	rds->eon_tx_index = (rds->eon_tx_index + 1) % rds->eon_tx_count;
 }
 
+/* ============================================================
+ * Group 15B: Fast basic tuning and switching
+ * EN 50067:1998 §3.1.5.21, Figure 39 (p.39)
+ *
+ * Transmits TP/PTY/TA/MS/DI flags at a fast repetition rate without
+ * carrying AF or PS text. Both block B and block D carry identical
+ * payloads for robustness; block C = PI repeat (offset C').
+ *
+ * Block B (and D) b15..b0:
+ *   b15-b11 = group type code 1111 (15) + version 1 (B)
+ *   b10     = TP
+ *   b9-b5   = PTY
+ *   b4      = TA  (bit 4, same as 0A/0B)
+ *   b3      = M/S (bit 3)
+ *   b2      = DI  (one DI bit, located by segment)
+ *   b1-b0   = segment (DI segment address C1C0)
+ * Block C: PI code, offset C' (version-B rule)
+ * ============================================================ */
+static void rds_build_group_15b(rds_encoder_t *rds, uint8_t *group)
+{
+	uint32_t blocks[4] = {0};
+	uint16_t b2;
+	int seg = rds->ps_segment & 0x03;  /* cycle segments 0-3 same as 0A */
+	uint8_t di_flags[4] = {
+		rds->di_dynamic_pty,     /* seg 0 */
+		rds->di_compressed,      /* seg 1 */
+		rds->di_artificial_head, /* seg 2 */
+		rds->di_stereo           /* seg 3 */
+	};
+	uint8_t di = di_flags[seg] ? 1 : 0;
+
+	/* Block A: PI */
+	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
+
+	/* Block B: 15B + TP + PTY + TA + M/S + DI + segment */
+	b2 = (RDS_GROUP_15B << RDS_B2_GROUP_SHIFT) |
+	     (rds->tp  << RDS_B2_TP_BIT)        |
+	     (rds->pty << RDS_B2_PTY_SHIFT)      |
+	     (rds->ta  << RDS_15B_TA_BIT)        |  /* bit 4 */
+	     (rds->ms  << RDS_15B_MS_BIT)        |  /* bit 3 */
+	     (di       << RDS_15B_DI_BIT)        |  /* bit 2 */
+	     seg;                                    /* bits 1-0 */
+	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
+
+	/* Block C: PI repeat (offset C' — version-B group) */
+	blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+
+	/* Block D: identical payload to block B (Fig 39: same TP/PTY/TA/MS/DI/seg), offset D */
+	blocks[3] = rds_build_block(b2 & 0x07FF, RDS_OFFSET_D);
+
+	rds_group_pack(blocks, group, 0);
+
+	if (rds->debug)
+		LOGP(DRADIO, LOGL_DEBUG, "RDS TX 15B: TP=%d TA=%d M/S=%s DI[%d]=%d\n",
+		     rds->tp, rds->ta, rds->ms ? "Music" : "Speech", seg, di);
+}
+
 
 /* ============================================================
  * GROUP 7A: RADIO PAGING (EN 50067 Annex M)
@@ -3268,6 +3325,9 @@ static void rds_generate_group(rds_encoder_t *rds)
 		break;
 	case RDS_GROUP_14B:
 		rds_build_group_14b(rds, rds->group_buffer);
+		break;
+	case RDS_GROUP_15B:
+		rds_build_group_15b(rds, rds->group_buffer);
 		break;
 	/* Group 7A: Radio Paging or ODA */
 	case RDS_GROUP_7A:
