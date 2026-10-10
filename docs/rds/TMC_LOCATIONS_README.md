@@ -54,3 +54,26 @@ Known open sources (verify licensing before use):
   - Germany: BAST (Federal Highway Research Institute) -- check bast.de
   - Norway: Datex-II national portal (registration required)
   - Netherlands: NDW uses VILD (incompatible format, not directly loadable)
+
+## tmc_locations_germany.csv
+
+German ALERT-C location code list (LCL 22.0) -- 4,185 road entries.
+
+### Provenance
+
+Converted from BASt LCL 22.0 (lcl-download.zip), published by
+Bundesanstalt fuer Strassenwesen (BASt) on behalf of BMDV.
+Landing page: https://www.bast.de/DE/Themen/Digitales/HF_1/Massnahmen/LCL/location-code-list.html
+
+Conversion: NAMES.DAT + ROADS.DAT joined by RNID into LCD;Name CSV.
+Only ROADS entries with a ROADNUMBER or resolved road name are included.
+
+### License
+
+Creative Commons Attribution 4.0 International (CC BY 4.0).
+Attribution: Bundesanstalt fuer Strassenwesen (BASt) / BMDV, LCL 22.0, 2023.
+
+### Coverage
+
+Covers German motorways (Autobahnen), federal roads (Bundesstrassen),
+Landstrassen, Staatsstrassen and urban roads.

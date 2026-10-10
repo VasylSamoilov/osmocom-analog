@@ -4180,33 +4180,69 @@ static int tmc_load_names(const char *path, char **names)
 	FILE *f = fopen(path, "r");
 	if (!f) return -1;
 
-	char line[512];
+	char line[1024];
 	int  loaded = 0;
-	int  lineno = 0;
+	int  col_nid = 0, col_name = 1;  /* defaults for simple NID;NAME format */
+	int  lineno  = 0;
 
 	while (fgets(line, sizeof(line), f)) {
 		lineno++;
-		/* Skip header: first line or any line starting with "NID" */
-		if (lineno == 1) continue;
 
+		/* Strip UTF-8 BOM (EF BB BF) on first line */
 		char *p = line;
-		/* NID field */
-		char *nid_s = p;
-		while (*p && *p != ';') p++;
-		if (!*p) continue;
-		*p++ = '\0';
+		if (lineno == 1 && (unsigned char)p[0] == 0xEF &&
+		    (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
+			p += 3;
 
-		/* NAME field */
-		char *name_s = p;
-		while (*p && *p != ';' && *p != '\n' && *p != '\r') p++;
-		*p = '\0';
+		/* Parse header row: discover NID and NAME column positions */
+		if (lineno == 1) {
+			int col = 0;
+			char *h = p;
+			while (*h) {
+				char *token = h;
+				while (*h && *h != ';' && *h != '\n' && *h != '\r') h++;
+				char sep = *h;
+				*h = '\0';
+				if (strcmp(token, "NID") == 0)  col_nid  = col;
+				if (strcmp(token, "NAME") == 0) col_name = col;
+				if (!sep || sep == '\n' || sep == '\r') break;
+				h++;
+				col++;
+			}
+			continue;
+		}
 
-		int nid = atoi(nid_s);
+		/* Data row: extract NID and NAME by column index */
+		char *fields[32];
+		int   nfields = 0;
+		char *q = p;
+		fields[nfields++] = q;
+		while (*q && nfields < 32) {
+			if (*q == ';') {
+				*q = '\0';
+				fields[nfields++] = q + 1;
+			} else if (*q == '\n' || *q == '\r') {
+				*q = '\0';
+				break;
+			}
+			q++;
+		}
+		if (nfields <= col_nid || nfields <= col_name) continue;
+
+		int nid = atoi(fields[col_nid]);
+		const char *name = fields[col_name];
+		/* Skip trailing whitespace from name */
+		char name_buf[256];
+		int  nlen = 0;
+		while (*name && *name != '\n' && *name != '\r' && nlen < 255)
+			name_buf[nlen++] = *name++;
+		name_buf[nlen] = '\0';
+
 		if (nid <= 0 || nid >= TMC_LOC_TABLE_SIZE) continue;
-		if (!*name_s) continue;
+		if (!name_buf[0]) continue;
 
 		free(names[nid]);
-		names[nid] = strdup(name_s);
+		names[nid] = strdup(name_buf);
 		if (names[nid]) loaded++;
 	}
 
@@ -4220,9 +4256,11 @@ int rds_tmc_load_locations(const char *lcl_dir_or_csv)
 
 	rds_tmc_unload_locations();
 
-	/* Detect mode: if the path ends in .csv or .dat (case-insensitive),
-	 * or there is no ROADS.DAT alongside it, treat as plain LCD;Name CSV.
-	 * Otherwise treat as a directory containing NAMES.DAT + ROADS.DAT. */
+	/* Detect mode: if ROADS.DAT exists inside the path, treat as an LCL
+	 * directory (ISO 14819-3 LTEF format); otherwise treat as a flat
+	 * LCD;Name CSV. The LCL loader is header-driven and handles any column
+	 * order plus UTF-8 BOM (as produced by BASt LCL 22.0 and other national
+	 * tables). */
 	char roads_path[512], names_path[512];
 	snprintf(roads_path, sizeof(roads_path), "%s/ROADS.DAT", lcl_dir_or_csv);
 	snprintf(names_path, sizeof(names_path), "%s/NAMES.DAT", lcl_dir_or_csv);
@@ -4230,7 +4268,8 @@ int rds_tmc_load_locations(const char *lcl_dir_or_csv)
 	FILE *roads_f = fopen(roads_path, "r");
 
 	if (!roads_f) {
-		/* Plain LCD;Name CSV (single file) */
+		/* Plain LCD;Name CSV (single file).
+		 * First line may be a "LCD;Name" header (skipped) or a data row. */
 		FILE *f = fopen(lcl_dir_or_csv, "r");
 		if (!f) {
 			LOGP(DRADIO, LOGL_ERROR,
@@ -4245,14 +4284,18 @@ int rds_tmc_load_locations(const char *lcl_dir_or_csv)
 		while (fgets(line, sizeof(line), f)) {
 			lineno++;
 			char *p = line;
+			/* Strip UTF-8 BOM */
+			if (lineno == 1 && (unsigned char)p[0] == 0xEF &&
+			    (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
+				p += 3;
+
 			char *lcd_s = p;
 			while (*p && *p != ';') p++;
 			if (!*p) continue;
 			*p++ = '\0';
 
 			/* Skip non-numeric header */
-			if (lineno == 1 && !(*lcd_s >= '0' && *lcd_s <= '9'))
-				continue;
+			if (!(*lcd_s >= '0' && *lcd_s <= '9')) continue;
 
 			char *name_s = p;
 			while (*p && *p != ';' && *p != '\n' && *p != '\r') p++;
@@ -4275,52 +4318,86 @@ int rds_tmc_load_locations(const char *lcl_dir_or_csv)
 		return loaded;
 	}
 
-	/* Standard LCL directory: load NAMES.DAT first, then ROADS.DAT */
+	/* Standard LCL directory (NAMES.DAT + ROADS.DAT).
+	 * Header-driven: discovers column positions from the header row.
+	 * Handles real national LCL files from BASt, Highways England, etc.
+	 * Format (from BASt LCL 22.0, ISO 14819-3 LTEF):
+	 *   NAMES.DAT: CID;LID;NID;NAME;NCOMMENT;OFFICIALNAME
+	 *   ROADS.DAT: CID;TABCD;LCD;CLASS;TCD;STCD;ROADNUMBER;RNID;... */
 	char **names = calloc(TMC_LOC_TABLE_SIZE, sizeof(char *));
 	if (!names) { fclose(roads_f); return -1; }
 
 	tmc_load_names(names_path, names);
 
-	/* Parse ROADS.DAT: LCD;ROADNUMBER;RNID;... */
-	char line[512];
+	/* Parse ROADS.DAT: header-driven column discovery */
+	char line[1024];
 	int  loaded = 0, lineno = 0;
+	int  col_lcd = 2, col_roadnum = 6, col_rnid = 7; /* BASt LCL22 defaults */
 
 	while (fgets(line, sizeof(line), roads_f)) {
 		lineno++;
-		if (lineno == 1) continue; /* skip header */
 
 		char *p = line;
+		/* Strip UTF-8 BOM */
+		if (lineno == 1 && (unsigned char)p[0] == 0xEF &&
+		    (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
+			p += 3;
 
-		char *lcd_s = p;
-		while (*p && *p != ';') p++;
-		if (!*p) continue;
-		*p++ = '\0';
+		if (lineno == 1) {
+			/* Discover LCD, ROADNUMBER, RNID column indices from header */
+			int col = 0;
+			char *h = p;
+			while (*h) {
+				char *token = h;
+				while (*h && *h != ';' && *h != '\n' && *h != '\r') h++;
+				char sep = *h;
+				*h = '\0';
+				if (strcmp(token, "LCD") == 0)        col_lcd     = col;
+				if (strcmp(token, "ROADNUMBER") == 0) col_roadnum = col;
+				if (strcmp(token, "RNID") == 0)       col_rnid    = col;
+				if (!sep || sep == '\n' || sep == '\r') break;
+				h++;
+				col++;
+			}
+			continue;
+		}
 
-		char *roadnum_s = p;
-		while (*p && *p != ';') p++;
-		if (!*p) continue;
-		*p++ = '\0';
+		/* Data row: extract fields by column index */
+		char *fields[32];
+		int   nfields = 0;
+		char *q = p;
+		fields[nfields++] = q;
+		while (*q && nfields < 32) {
+			if (*q == ';') {
+				*q = '\0';
+				fields[nfields++] = q + 1;
+			} else if (*q == '\n' || *q == '\r') {
+				*q = '\0';
+				break;
+			}
+			q++;
+		}
+		int need = col_lcd > col_roadnum ? col_lcd : col_roadnum;
+		if (col_rnid > need) need = col_rnid;
+		if (nfields <= need) continue;
 
-		char *rnid_s = p;
-		while (*p && *p != ';' && *p != '\n' && *p != '\r') p++;
-		*p = '\0';
-
-		int lcd  = atoi(lcd_s);
-		int rnid = atoi(rnid_s);
+		int lcd  = atoi(fields[col_lcd]);
+		const char *roadnum = fields[col_roadnum];
+		int rnid = atoi(fields[col_rnid]);
 		if (lcd <= 0 || lcd >= TMC_LOC_TABLE_SIZE) continue;
 
 		const char *road_name = (rnid > 0 && rnid < TMC_LOC_TABLE_SIZE)
 		                        ? names[rnid] : NULL;
 
 		char buf[256];
-		if (*roadnum_s && road_name)
-			snprintf(buf, sizeof(buf), "%s - %s", roadnum_s, road_name);
-		else if (*roadnum_s)
-			snprintf(buf, sizeof(buf), "%s", roadnum_s);
+		if (*roadnum && road_name)
+			snprintf(buf, sizeof(buf), "%s - %s", roadnum, road_name);
+		else if (*roadnum)
+			snprintf(buf, sizeof(buf), "%s", roadnum);
 		else if (road_name)
 			snprintf(buf, sizeof(buf), "%s", road_name);
 		else
-			continue; /* no useful data */
+			continue; /* no useful data for this LCD */
 
 		free(tmc_loc_table[lcd]);
 		tmc_loc_table[lcd] = strdup(buf);
@@ -4335,7 +4412,7 @@ int rds_tmc_load_locations(const char *lcl_dir_or_csv)
 
 	tmc_locs_loaded = 1;
 	LOGP(DRADIO, LOGL_INFO,
-	     "RDS TMC: loaded %d road locations from '%s'\n",
+	     "RDS TMC: loaded %d road locations from LCL directory '%s'\n",
 	     loaded, lcl_dir_or_csv);
 	return loaded;
 }
