@@ -16,6 +16,7 @@ typedef struct transaction {
 	struct nmt_subscriber	subscriber;
 	struct osmo_timer_list		timer;
 	int			page_try;		/* number of paging try */
+	int			priority;		/* MS replied with priority seizure (11b): queue with 2c, not 2f */
 
 	/* caller ID */
 	char			caller_id[33];		/* caller id digits */
