@@ -9352,22 +9352,45 @@ group14_done:
 		}
 	}
 	else if (group_type == 15 && version == 1) {
-		/* Group 15B: Fast Basic Tuning and Switching (IEC 62106 S6.1.5.16)
-		 * Mirrors Group 0B Block B payload for fast TA/TP detection.
-		 * Block B bits 4-0: TA, M/S, DI, segment (same as 0A/0B)
-		 * Block C: PI repeat
-		 * Block D: Repeat of Block B payload structure
-		 */
-		int ta = (b2 & RDS_15B_TA_MASK) >> RDS_15B_TA_BIT;
-		int ms = (b2 & RDS_15B_MS_MASK) >> RDS_15B_MS_BIT;
-		int di = (b2 & RDS_15B_DI_MASK) >> RDS_15B_DI_BIT;
-		int seg = b2 & RDS_15B_SEG_MASK;
-		
-		/* Update TA (fast switching use case) */
-		rds->ta = ta;
-		rds->ta_status = rds->block_status[1];
-		rds->ms = ms;
-		rds->ms_status = rds->block_status[1];
+		/* Group 15B: Fast Basic Tuning and Switching (EN 50067 §3.1.5.21, Fig 39)
+		 * Blocks 2 and 4 carry identical flag sets (TA/MS/DI/segment) for
+		 * robustness — if one block is lost the other still carries the update.
+		 * Block 3 = PI repeat (offset C').
+		 *
+		 * Use block 2 when available; fall back to block 4 when block 2 is
+		 * missing/uncorrectable (per redsea station.cc). */
+		uint16_t bflags;
+		uint8_t  bflags_status;
+		if (rds->group_mask & (1<<1)) {
+			/* Block 2 (B) present */
+			bflags        = b2;
+			bflags_status = rds->block_status[1];
+		} else {
+			/* Block 2 absent but block 4 (D) may carry the same data */
+			bflags        = b4;
+			bflags_status = rds->block_status[3];
+		}
+
+		int ta  = (bflags & RDS_15B_TA_MASK)  >> RDS_15B_TA_BIT;
+		int ms  = (bflags & RDS_15B_MS_MASK)  >> RDS_15B_MS_BIT;
+		int di  = (bflags & RDS_15B_DI_MASK)  >> RDS_15B_DI_BIT;
+		int seg =  bflags & RDS_15B_SEG_MASK;
+
+		/* Update TA and M/S */
+		rds->ta        = ta;
+		rds->ta_status = bflags_status;
+		rds->ms        = ms;
+		rds->ms_status = bflags_status;
+
+		/* Store DI bit into the appropriate decoder flag field, exactly as
+		 * the 0A/0B path does (EN 50067 Table 9: seg0→d3=dynamic_pty … seg3→d0=stereo) */
+		switch (seg) {
+		case 0: rds->di_dynamic_pty    = di; break;
+		case 1: rds->di_compressed     = di; break;
+		case 2: rds->di_artificial_head= di; break;
+		case 3: rds->di_stereo         = di; break;
+		}
+		rds->di_status = bflags_status;
 		
 		if (rds->debug)
 			LOGP(DRADIO, LOGL_DEBUG, "RDS 15B: TA=%d M/S=%d DI=%d seg=%d\n",
