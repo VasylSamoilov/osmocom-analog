@@ -784,16 +784,37 @@ static inline const char *rds_paging_rpc_desc(uint8_t rpc, char *buf, int buflen
  *   Bits 15-1:  Notification bits 14-0
  *   Bit  0:     S1 (Sort indicator)
  * ============================================================ */
-#define RDS_13A_STY_SHIFT       2
-#define RDS_13A_STY_MASK        0x001C  /* Bits 4-2: Sub-type */
-#define RDS_13A_CS_SHIFT        14
-#define RDS_13A_CS_MASK         0xC000  /* Block C bits 15-14 */
-#define RDS_13A_IT_SHIFT        10
-#define RDS_13A_IT_MASK         0x3C00  /* Block C bits 13-10 */
-#define RDS_13A_NOTIFY_HI_MASK  0x03FF  /* Block C bits 9-0: notify 24-15 */
-#define RDS_13A_NOTIFY_LO_SHIFT 1
-#define RDS_13A_NOTIFY_LO_MASK  0xFFFE  /* Block D bits 15-1: notify 14-0 */
-#define RDS_13A_S1_MASK         0x0001  /* Block D bit 0: sort indicator */
+/* ============================================================
+ * Group 13A Bit Fields — EN 50067:1998 Annex M, Figure M.11a/b (p.110-111)
+ * Enhanced Radio Paging address-notification group.
+ *
+ * Block B payload (bits 4-0):
+ *   b4-b3 = CS   Cycle Selection (2 bits) — Table M.9
+ *   b2-b0 = STY  Sub-type S2 S1 S0 (3 bits) — Table 7
+ *
+ * Block C (16 bits):
+ *   b15-b12 = IT   Paging interval numbering (4 bits)
+ *   b11     = S1   Sort indicator bit 1 (Table M.10)
+ *   b10     = S2   Sort indicator bit 2 (Table M.10)
+ *   b9      = X    Reserved for future use (set 0)
+ *   b8-b0   = Address notification bits 24..16 (9 bits, high part)
+ *
+ * Block D (16 bits):
+ *   b15-b0  = Address notification bits 15..0 (16 bits, low part)
+ *
+ * Total notification bits: 9 + 16 = 25 (STY=000) or two 13A groups = 50.
+ * ============================================================ */
+#define RDS_13A_CS_SHIFT        3               /* Block B bits 4-3: CS */
+#define RDS_13A_CS_MASK         0x0018
+#define RDS_13A_STY_SHIFT       0               /* Block B bits 2-0: STY */
+#define RDS_13A_STY_MASK        0x0007
+#define RDS_13A_IT_SHIFT        12              /* Block C bits 15-12: IT */
+#define RDS_13A_IT_MASK         0xF000
+#define RDS_13A_S1_BIT          11              /* Block C bit 11: S1 */
+#define RDS_13A_S2_BIT          10              /* Block C bit 10: S2 */
+/* bit 9 = X (reserved, write 0) */
+#define RDS_13A_NOTIFY_HI_MASK  0x01FF          /* Block C bits 8-0: notify[24:16] (9 bits) */
+#define RDS_13A_NOTIFY_LO_MASK  0xFFFF          /* Block D bits 15-0: notify[15:0] (16 bits) */
 
 /* ============================================================
  * Group 3A Bit Fields (IEC 62106 S6.1.5.5)

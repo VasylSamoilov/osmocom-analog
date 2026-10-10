@@ -2671,86 +2671,78 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 	}
 
 	case RDS_PAGING_VNUM: {
-		/* Variable-length numeric paging.
-		 * EN 50067 Annex M defines numeric paging as FIXED-length formats
-		 * (Table M.2/M.3): 10-digit (PSAC 0010/0011) and 18-digit
-		 * (PSAC 0100/0101/0110), plus 15-digit INTERNATIONAL (PSAC 0111).
-		 * There is NO open-ended "variable numeric" wire format and NO
-		 * cyclic-numeric PSAC — the cyclic 1001..1110 codes are ALPHANUMERIC
-		 * (Table M.4). The previous implementation emitted BCD-numeric payload
-		 * tagged with the ALPHA PSAC (0x8/0x9), which a conformant pager (and
-		 * this project's own decoder, rds.c:8710) decodes as text, not digits.
-		 * So we map national VNUM onto the standard 18-digit numeric format
-		 * (max 18 digits) and international onto the 15-digit format. */
+		/* Variable-length numeric paging — EN 50067 M.3.5.5 (Fig M.15, Table M.15).
+		 * Uses the SAME PSAC space as alphanumeric (1000 addr, 1001..1110 cyclic,
+		 * 1111 end) but the CONTROL BYTE MT field is 01 (numeric) instead of
+		 * 00 (alpha). The RX decodes MT from the control byte and routes to VNUM.
+		 * 8 BCD digits per data group (vs 4 chars for alpha).
+		 * Up to 160 digits national / 156 international.
+		 * International M.3.5.7: second group carries country code + OPC in block C. */
 		int len = msg->data_len;
 		int intl = msg->ni;
-		int max_len = intl ? 15 : 18;
-		int i;
-		uint8_t nibbles[18];
+		int max_len = intl ? 156 : RDS_PAGING_VNUM_MAX;
+		int padded_len, ngroups, i, di;
+		uint8_t nibbles[RDS_PAGING_VNUM_MAX];
 
-		if (len > max_len) {
-			LOGP(DRADIO, LOGL_NOTICE,
-			     "RDS 7A VNUM: %d digits exceeds the standard %s numeric limit "
-			     "(%d); truncating. EN 50067 Annex M has no variable-length "
-			     "numeric format.\n",
-			     len, intl ? "international 15-digit" : "national 18-digit",
-			     max_len);
+		if (len > max_len)
 			len = max_len;
-		}
 
-		/* Pad to the fixed field length with BCD space (0xA) */
+		/* Encode digits to BCD nibbles */
 		rds_paging_bcd_encode(msg->data, len, nibbles, len);
-		for (i = len; i < max_len; i++)
-			nibbles[i] = RDS_PAGING_BCD_SPACE;
+
+		/* Group 0: address + control byte (ctrl has MT=01 set by build_ctrl) */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;   /* 0x8 per M.3.5.5 */
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
+		idx = 1;
 
 		if (intl) {
-			/* International 15-digit (PSAC 0111). Address group carries
-			 * E.212 country code + OPC; see M.3.5.7. */
+			/* International (NI=1, M.3.5.7): second group block C carries
+			 * E.212 country code (3 BCD digits I1I2I3) + OPC (4 bits).
+			 * Block D carries first 4 BCD digits. */
 			uint16_t cc = msg->country_code;
 			uint8_t i1 = (cc / 100) & 0xF;
 			uint8_t i2 = (cc / 10) % 10;
 			uint8_t i3 = cc % 10;
-			pag->tx_psac_seq[0] = RDS_7A_PSAC_INTL15;
-			pag->tx_blocks_c[0] = addr_c;
-			pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
-			pag->tx_psac_seq[1] = RDS_7A_PSAC_INTL15;
-			pag->tx_blocks_c[1] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
-			pag->tx_blocks_d[1] = (nibbles[0] << 12) | (nibbles[1] << 8) |
-					       (nibbles[2] << 4) | nibbles[3];
-			idx = 2;
-			/* remaining 11 digits in two further INTL15 groups */
-			pag->tx_psac_seq[2] = RDS_7A_PSAC_INTL15;
-			pag->tx_blocks_c[2] = (nibbles[4] << 12) | (nibbles[5] << 8) |
-					       (nibbles[6] << 4) | nibbles[7];
-			pag->tx_blocks_d[2] = (nibbles[8] << 12) | (nibbles[9] << 8) |
-					       (nibbles[10] << 4) | nibbles[11];
-			pag->tx_psac_seq[3] = RDS_7A_PSAC_INTL15;
-			pag->tx_blocks_c[3] = (nibbles[12] << 12) | (nibbles[13] << 8) |
-					       (nibbles[14] << 4) | RDS_PAGING_BCD_SPACE;
-			pag->tx_blocks_d[3] = (RDS_PAGING_BCD_SPACE << 12) | (RDS_PAGING_BCD_SPACE << 8) |
-					       (RDS_PAGING_BCD_SPACE << 4) | RDS_PAGING_BCD_SPACE;
-			idx = 4;
+			uint8_t n0 = (0 < len) ? nibbles[0] : RDS_PAGING_BCD_SPACE;
+			uint8_t n1 = (1 < len) ? nibbles[1] : RDS_PAGING_BCD_SPACE;
+			uint8_t n2 = (2 < len) ? nibbles[2] : RDS_PAGING_BCD_SPACE;
+			uint8_t n3 = (3 < len) ? nibbles[3] : RDS_PAGING_BCD_SPACE;
+
+			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;  /* 0x9 */
+			pag->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
+			pag->tx_blocks_d[idx] = (n0 << 12) | (n1 << 8) | (n2 << 4) | n3;
+			idx++;
+			di = 4; /* nibble offset: 4 digits already sent in the intl header */
 		} else {
-			/* National 18-digit numeric (Table M.3):
-			 *   PSAC 0100: address group + Y1Y2 Z1..Z4 + digits A1..A2
-			 *   PSAC 0101: digits A3..A10
-			 *   PSAC 0110: digits A11..A18
-			 * This matches the 18-digit TONE/numeric decoder path. */
-			pag->tx_psac_seq[0] = RDS_7A_PSAC_NUM18_ADDR;   /* 0100 */
-			pag->tx_blocks_c[0] = addr_c;
-			pag->tx_blocks_d[0] = (nibbles[0] << 12) | (nibbles[1] << 8) |
-					       (addr_d_hi << 4) | (ctrl & 0xF);
-			pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;  /* 0101: A3..A10 */
-			pag->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) |
-					       (nibbles[4] << 4) | nibbles[5];
-			pag->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) |
-					       (nibbles[8] << 4) | nibbles[9];
-			pag->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;  /* 0110: A11..A18 */
-			pag->tx_blocks_c[2] = (nibbles[10] << 12) | (nibbles[11] << 8) |
-					       (nibbles[12] << 4) | nibbles[13];
-			pag->tx_blocks_d[2] = (nibbles[14] << 12) | (nibbles[15] << 8) |
-					       (nibbles[16] << 4) | nibbles[17];
-			idx = 3;
+			di = 0;
+		}
+
+		/* Remaining data groups: 8 BCD digits each, PSAC cycles 0x9..0xE, end 0xF */
+		{
+			int remaining = len - di;
+			if (remaining < 0) remaining = 0;
+			padded_len = ((remaining + 7) / 8) * 8;
+			/* Pad nibbles array with BCD space (0xA) */
+			for (i = len; i < di + padded_len; i++)
+				nibbles[i] = RDS_PAGING_BCD_SPACE;
+			ngroups = padded_len / 8;
+			if (ngroups == 0) ngroups = 1; /* at least one end group */
+		}
+
+		for (i = 0; i < ngroups; i++) {
+			int ni_off = di + i * 8;
+			int psac_offset = intl ? (i + 1) : i; /* intl: PSAC=9 already used */
+
+			if (i == ngroups - 1)
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
+			else
+				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
+			pag->tx_blocks_c[idx] = (nibbles[ni_off] << 12) | (nibbles[ni_off+1] << 8) |
+						 (nibbles[ni_off+2] << 4) | nibbles[ni_off+3];
+			pag->tx_blocks_d[idx] = (nibbles[ni_off+4] << 12) | (nibbles[ni_off+5] << 8) |
+						 (nibbles[ni_off+6] << 4) | nibbles[ni_off+7];
+			idx++;
 		}
 
 		pag->tx_total_groups = idx;
@@ -2808,14 +2800,16 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 /* Compute 25-bit notification bit index for an address (EN 50067 M.3.6, Table M.18).
  * Address = Y1Y2Z1Z2Z3Z4. Z2Z3 determines the sub-group (hex-coded, 0x00-0xFF).
  * For BCD addresses (our case), Z2 and Z3 are 0-9, so Z2Z3_hex = Z2*16 + Z3.
- * 25-bit formula: bit = floor(Z2Z3_hex * 25 / 256). */
+ * 25-bit formula (EN 50067 Table M.18, p.123): replace Z2Z3 by INT(Z2Z3/2)
+ * in the 50-bit formula: bit = INT(INT(Z2Z3_hex/2) * 50 / 256).
+ * Example: Z2Z3=0x9E=158 → INT(79*50/256) = INT(15.43) = 15 ✓ */
 static int rds_paging_notify_bit_25(uint32_t address)
 {
 	uint8_t z2 = (address / 100) % 10;
 	uint8_t z3 = (address / 10) % 10;
 	uint8_t z2z3_hex = (z2 << 4) | z3;
 
-	return (z2z3_hex * 25) / 256;
+	return ((z2z3_hex / 2) * 50) / 256;
 }
 
 /* Compute 50-bit notification bit index for an address (EN 50067 M.3.6, Table M.17).
@@ -2905,21 +2899,25 @@ static void rds_build_group_13a_paging(rds_encoder_t *rds, uint8_t *group)
 	/* Block A: PI */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 
-	/* Block B: Group 13A + TP + PTY + STY(3) + reserved(2) */
+	/* Block B: Group 13A + TP + PTY + CS(b4:3) + STY(b2:0)
+	 * EN 50067 Fig M.11a: B payload = CS[1:0] at bits 4-3, STY=S2S1S0 at bits 2-0 */
 	b2 = (RDS_GROUP_13A << RDS_B2_GROUP_SHIFT) |
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT) |
+	     ((pag->cycle_selection & 0x03) << RDS_13A_CS_SHIFT) |
 	     ((sty & 0x07) << RDS_13A_STY_SHIFT);
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 
-	/* Block C: CS(2) + IT(4) + notify bits 24-15 (10 bits) */
-	b3 = ((pag->cycle_selection & 0x3) << RDS_13A_CS_SHIFT) |
-	     ((interval & 0xF) << RDS_13A_IT_SHIFT) |
-	     ((notify_word >> 15) & RDS_13A_NOTIFY_HI_MASK);
+	/* Block C: IT(b15:12) + S1(b11) + S2(b10) + X=0(b9) + notify[24:16](b8:0)
+	 * EN 50067 Fig M.11a: C = IT(4) | S1 | S2 | X | notify_hi(9 bits) */
+	b3 = ((interval & 0x0F) << RDS_13A_IT_SHIFT) |
+	     /* S1=0, S2=0 (not sorted) — set when needed */
+	     /* X=0 (reserved) */
+	     ((notify_word >> 16) & RDS_13A_NOTIFY_HI_MASK);
 	blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
 
-	/* Block D: notify bits 14-0 (15 bits) + S1(1) */
-	b4 = ((notify_word & 0x7FFF) << RDS_13A_NOTIFY_LO_SHIFT);
+	/* Block D: notify[15:0] (16 bits) — EN 50067 Fig M.11a */
+	b4 = (uint16_t)(notify_word & RDS_13A_NOTIFY_LO_MASK);
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 
 	rds_group_pack(blocks, group, 0);
@@ -3304,6 +3302,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 		/* Route to ODA-specific builders based on configured ODAs */
 		{
 			int carrier_code = (int)type;
+			int is_version_b = (carrier_code & 1); /* odd = version B */
 			uint32_t blocks[4] = {0};
 			uint16_t b2, b3, b4;
 			int found = 0;
@@ -3317,25 +3316,29 @@ static void rds_generate_group(rds_encoder_t *rds)
 					blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
 					
 					if (aid == RDS_ODA_AID_RT_PLUS) {
-						/* RT+ group — always transmit tags alongside 3A.
-						 * Real-world encoders (2wcom etc.) send RT+ from
-						 * the start, even with dummy tags. Suppressing 11A
-						 * while 3A announces it causes receivers to ignore
-						 * the ODA registration entirely. The receiver stores
-						 * tags and applies them when RT text arrives. */
+						/* RT+ group — always transmit tags alongside 3A. */
 						rds_build_rtplus_group(rds, &rds->rtplus, &b2, &b3, &b4);
 						b2 |= (type << RDS_B2_GROUP_SHIFT);
 						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
-						blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						/* Version-B: block 3 = PI repeat at offset C' (EN 50067 §3.1.3) */
+						if (is_version_b) {
+							blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+						} else {
+							blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						}
 						blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 						found = 1;
 						break;
 					} else if (aid == RDS_ODA_AID_ERT_PLUS) {
-						/* eRT+ group (same format as RT+ but operates on eRT text) */
+						/* eRT+ group (same format as RT+) */
 						rds_build_rtplus_group(rds, &rds->ert_plus, &b2, &b3, &b4);
 						b2 |= (type << RDS_B2_GROUP_SHIFT);
 						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
-						blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						if (is_version_b) {
+							blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+						} else {
+							blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						}
 						blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 						found = 1;
 						break;
@@ -3344,7 +3347,11 @@ static void rds_generate_group(rds_encoder_t *rds)
 						rds_build_ert_group(rds, &b2, &b3, &b4);
 						b2 |= (type << RDS_B2_GROUP_SHIFT);
 						blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
-						blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						if (is_version_b) {
+							blocks[2] = rds_build_block(rds->pi, RDS_OFFSET_Cp);
+						} else {
+							blocks[2] = rds_build_block(b3, RDS_OFFSET_C);
+						}
 						blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 						found = 1;
 						break;
@@ -8943,26 +8950,28 @@ static void rds_decode_group(rds_decoder_t *rds)
 		 * when not used for paging. If OPC=0 or not yet received,
 		 * this condition is false and falls through to ODA routing. */
 		rds_paging_dec_t *pd = &rds->paging_dec;
-		/* Block B bits 4-2: STY (sub-type), bits 1-0: reserved */
+		/* Block B bits 4-3: CS, bits 2-0: STY — per EN 50067 Fig M.11a */
 		uint8_t sty = (b2 >> RDS_13A_STY_SHIFT) & 0x07;
 
 		if (sty == 0) {
-			/* Sub-type 000: 25-bit address notification
-			 * Block C: CS(2) + IT(4) + notify_hi(10)
-			 * Block D: notify_lo(15) + S1(1) */
+			/* Sub-type 000: 25-bit address notification (one 13A group)
+			 * Block B: CS[4:3], STY=000[2:0]
+			 * Block C: IT[15:12], S1[11], S2[10], X[9], notify[24:16][8:0]
+			 * Block D: notify[15:0] */
 			static const char * const cs_desc[] = {
 				"1-min cycle", "reserved", "2-min even", "2-min odd"
 			};
-			pd->cycle_selection = (b3 >> RDS_13A_CS_SHIFT) & 0x03;
-			pd->interval_num = (b3 >> RDS_13A_IT_SHIFT) & 0x0F;
-			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;
-			uint32_t notify_lo = (b4 & RDS_13A_NOTIFY_LO_MASK) >> RDS_13A_NOTIFY_LO_SHIFT;
-			uint32_t word = (notify_hi << 15) | notify_lo;
-			pd->notify_bits = word;
-			pd->notify_50bit = 0;
-			pd->notify_sty = sty;
+			pd->cycle_selection = (b2 >> RDS_13A_CS_SHIFT) & 0x03;
+			pd->interval_num    = (b3 >> RDS_13A_IT_SHIFT) & 0x0F;
+			uint8_t  s1        = (b3 >> RDS_13A_S1_BIT) & 1;
+			uint8_t  s2        = (b3 >> RDS_13A_S2_BIT) & 1;
+			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;           /* bits 8:0 = notify[24:16] */
+			uint32_t notify_lo = b4 & RDS_13A_NOTIFY_LO_MASK;           /* bits 15:0 = notify[15:0] */
+			uint32_t word      = (notify_hi << 16) | notify_lo;
+			pd->notify_bits    = word;
+			pd->notify_50bit   = 0;
+			pd->notify_sty     = sty;
 			pd->enhanced_valid = 1;
-			uint8_t s1 = b4 & RDS_13A_S1_MASK;
 
 			/* Count active notification bits */
 			int active = 0;
@@ -8970,33 +8979,38 @@ static void rds_decode_group(rds_decoder_t *rds)
 			while (tmp) { active += tmp & 1; tmp >>= 1; }
 
 			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: notify STY=000 (25-bit) CS=%d (%s) "
-			     "IT=%d notify=0x%07X (%d/25 sub-groups active) S1=%d\n",
+			     "IT=%d notify=0x%07X (%d/25 sub-groups active) S1=%d S2=%d\n",
 			     pd->cycle_selection, cs_desc[pd->cycle_selection],
-			     pd->interval_num, word, active, s1);
+			     pd->interval_num, word, active, s1, s2);
 		} else if (sty == 1) {
-			/* Sub-type 001: 50-bit notification, high half (bits 49-25) */
+			/* Sub-type 001: 50-bit notification, high half (bits 49-25)
+			 * Block B: CS[4:3], STY=001[2:0]
+			 * Block C: IT[15:12], S1[11], S2[10], X[9], notify[49:41][8:0]
+			 * Block D: notify[40:25] (16 bits) */
 			static const char * const cs_desc[] = {
 				"1-min cycle", "reserved", "2-min even", "2-min odd"
 			};
-			pd->cycle_selection = (b3 >> RDS_13A_CS_SHIFT) & 0x03;
-			pd->interval_num = (b3 >> RDS_13A_IT_SHIFT) & 0x0F;
-			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;
-			uint32_t notify_lo = (b4 & RDS_13A_NOTIFY_LO_MASK) >> RDS_13A_NOTIFY_LO_SHIFT;
-			pd->notify_bits_hi = (notify_hi << 15) | notify_lo;
-			pd->notify_50bit = 1;
-			pd->notify_sty = sty;
-			pd->enhanced_valid = 1;
+			pd->cycle_selection = (b2 >> RDS_13A_CS_SHIFT) & 0x03;
+			pd->interval_num    = (b3 >> RDS_13A_IT_SHIFT) & 0x0F;
+			uint32_t notify_hi  = b3 & RDS_13A_NOTIFY_HI_MASK;
+			uint32_t notify_lo  = b4 & RDS_13A_NOTIFY_LO_MASK;
+			pd->notify_bits_hi  = (notify_hi << 16) | notify_lo;
+			pd->notify_50bit    = 1;
+			pd->notify_sty      = sty;
+			pd->enhanced_valid  = 1;
 
 			LOGP(DRADIO, LOGL_NOTICE, "RDS 13A: notify STY=001 (50-bit high) CS=%d (%s) "
 			     "IT=%d bits_49_25=0x%07X\n",
 			     pd->cycle_selection, cs_desc[pd->cycle_selection],
 			     pd->interval_num, pd->notify_bits_hi);
 		} else if (sty == 2) {
-			/* Sub-type 010: 50-bit notification, low half (bits 24-0) */
-			uint32_t notify_hi = b3 & RDS_13A_NOTIFY_HI_MASK;
-			uint32_t notify_lo = (b4 & RDS_13A_NOTIFY_LO_MASK) >> RDS_13A_NOTIFY_LO_SHIFT;
-			pd->notify_bits_lo = (notify_hi << 15) | notify_lo;
-			pd->notify_sty = sty;
+			/* Sub-type 010: 50-bit notification, low half (bits 24-0)
+			 * Block C: IT[15:12], S1[11], S2[10], X[9], notify[24:16][8:0]
+			 * Block D: notify[15:0] */
+			uint32_t notify_hi  = b3 & RDS_13A_NOTIFY_HI_MASK;
+			uint32_t notify_lo  = b4 & RDS_13A_NOTIFY_LO_MASK;
+			pd->notify_bits_lo  = (notify_hi << 16) | notify_lo;
+			pd->notify_sty      = sty;
 
 			/* Combine with previously received high half */
 			pd->notify_bits = ((uint64_t)pd->notify_bits_hi << 25) | pd->notify_bits_lo;
