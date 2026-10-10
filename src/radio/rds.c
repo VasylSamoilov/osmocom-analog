@@ -10287,7 +10287,7 @@ group14_done:
 						if (rds->verbose) {
 						const char *desc = rds_tmc_event_desc(msg.event);
 						LOGP(DRADIO, LOGL_INFO,
-						     "RDS 8A TMC: event=%u%s%s loc=%u "
+						     "RDS 8A TMC: event=%u%s%s%s loc=%u "
 						     "dir=%s extent=%u%s "
 						     "duration=%s\n",
 						     msg.event,
@@ -11734,6 +11734,27 @@ void rds_decoder_status(rds_decoder_t *rds)
 		}
 	}
 	
+	/* Long PS (RBDS Group 15A) */
+	if (rds->long_ps_segments) {
+		char long_ps_disp[RDS_LONG_PS_LEN + 1];
+		memcpy(long_ps_disp, rds->long_ps, RDS_LONG_PS_LEN);
+		long_ps_disp[RDS_LONG_PS_LEN] = '\0';
+		LOGP(DRADIO, LOGL_NOTICE, "Long PS (15A)%s: \"%s\"\n",
+		     rds->long_ps_segments == 0xFF ? " [complete]" : " [partial]",
+		     long_ps_disp);
+	}
+
+	/* TMC service info (if announced via 3A system-info) */
+	if (rds->tmc_ltn > 0 || rds->group_type_counts[8 * 2] > 0) {
+		if (rds->tmc_ltn > 0)
+			LOGP(DRADIO, LOGL_NOTICE, "TMC: LTN=%u (location table)  groups received=%d\n",
+			     rds->tmc_ltn, rds->group_type_counts[8 * 2]);
+		else
+			LOGP(DRADIO, LOGL_NOTICE, "TMC: groups received=%d%s\n",
+			     rds->group_type_counts[8 * 2],
+			     rds->tmc_ltn == 0 ? " (LTN not yet announced via 3A)" : "");
+	}
+
 	#undef STATUS_CHAR
 }
 
