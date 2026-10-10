@@ -83,3 +83,28 @@ Attribution: Bundesanstalt fuer Strassenwesen (BASt) / BMDV, LCL 22.0, 2023.
 
 Covers German motorways (Autobahnen), federal roads (Bundesstrassen),
 Landstrassen, Staatsstrassen and urban roads.
+
+## European LCL availability survey (2026-10)
+
+| Country | Status | Source | License | Notes |
+|---------|--------|--------|---------|-------|
+| Germany | INCLUDED | BASt LCL 22.0 | CC BY 4.0 | tmc_locations_germany.csv |
+| Italy | INCLUDED | CCISS/MIT v4.8 | Public (MIT/CCISS) | tmc_locations_italy.csv |
+| Czech Rep. | Free, registration | NDIC registry v10.1 | Free of charge (2025-09) | registr.dopravniinfo.cz -- requires NDIC subscription |
+| France | Dead link | bison fute v12.1 | Free | diffusion-numerique.info-routiere.gouv.fr DNS dead; no mirror |
+| Austria | Free, email | ASFINAG LCL 3.5 | Free license | Email-verification gated; contact content.asfinag.at |
+| Spain | Request-only | DGT v2.1 | Free (DGT owns IP) | Request by letter/email; 2006 contact stale |
+| UK | TISA-licensed | National Highways | Not public | No open download |
+| Sweden | TISA-licensed | Trafikverket | Not public | No open download |
+| Norway | TISA-licensed | Statens vegvesen | Not public | vegdata.no dead; no archive |
+| Finland | TISA-licensed | Fintraffic | Not public | avoindata.fi WAF-blocked |
+| Switzerland | TISA-licensed | ASTRA | Not public | astra tmc page 404 |
+| Netherlands | Incompatible | NDW VILD | -- | Uses VILD format, not AlertC LCL |
+| Poland | TISA-licensed | GDDKiA | Not public | Commercial only |
+| Hungary | TISA-licensed | -- | Not public | Commercial only |
+
+Note: TISA (Traveller Information Services Association / ERTICO) distributes
+~180 national LCLs worldwide but only to members under license. Germany and
+Italy are the main countries with freely downloadable official LCLs.
+For other countries, the OSM TMC viewer (mhohmann.dev.openstreetmap.org/tmc/)
+contains imported location data usable for display purposes.
