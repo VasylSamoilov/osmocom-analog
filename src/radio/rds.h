@@ -2710,6 +2710,9 @@ typedef struct rds_decoder {
 	uint8_t		long_ps_status[RDS_LONG_PS_LEN];     /* RDS_STATUS_* per char */
 	uint8_t		long_ps_segments;                    /* bitmask: bit N set when segment N received */
 
+	/* TMC service configuration (from 3A ODA system-info variant 0) */
+	uint8_t		tmc_ltn;             /* Location Table Number (0=encrypted, 1-63=national) */
+
 } rds_decoder_t;
 
 /* Initialize RDS decoder
@@ -2881,6 +2884,8 @@ void rds_enc_tmc_clear(rds_encoder_t *rds);
 void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
 				  void *arg);
+/* Get the TMC Location Table Number announced via 3A system-info (0 = encrypted) */
+uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds);
 
 /* Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
  * 32-char UTF-8 programme service name transmitted over 8 segments.

@@ -4039,6 +4039,11 @@ void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 	rds->tmc_callback_arg = arg;
 }
 
+uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds)
+{
+	return rds ? rds->tmc_ltn : 0;
+}
+
 /* ============================================================
  * Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
  * Bit layout from redsea station.cc::decodeType15A (MIT licence).
@@ -9769,6 +9774,45 @@ group14_done:
 				     aid, oda_name,
 				     app_group >> 1, (app_group & 1) ? 'B' : 'A',
 				     oda_message);
+
+				/* TMC system-info: the 3A ODA message field (block C of the
+				 * 3A group) carries TMC service configuration.
+				 * redsea tmc.cc: variant = getBits<2>(message,14).
+				 * Variant 0: LTN=bits[11:6], AFI=bit[5], MGS=bits[3:0]
+				 * Variant 1: SID=bits[11:6], gap=bits[13:12], LTCC/ltecc
+				 * Variant 2: SID=bits[11:6], EncID=bits[5:1], LTN=bits[27:22] */
+				if (aid == RDS_ODA_AID_TMC_ALERT ||
+				    aid == RDS_ODA_AID_TMC_ALERT2) {
+					int tmc_variant = (oda_message >> 14) & 0x3;
+					switch (tmc_variant) {
+					case 0: { /* Service info: LTN, AFI, scope */
+						int ltn = (oda_message >> 6) & 0x3F;
+						int afi = (oda_message >> 5) & 1;
+						int mgs = oda_message & 0xF;
+						rds->tmc_ltn = ltn;
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 3A TMC sys-info v0: LTN=%u %s AFI=%d scope=0x%X\n",
+						     ltn, ltn ? "" : "(encrypted)", afi, mgs);
+						break; }
+					case 1: { /* Gap/timing */
+						static const int gap_vals[4] = {3,5,8,11};
+						int g   = (oda_message >> 12) & 0x3;
+						int sid = (oda_message >> 6) & 0x3F;
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 3A TMC sys-info v1: SID=%u gap=%d groups\n",
+						     sid, gap_vals[g]);
+						break; }
+					case 2: { /* Encrypted service */
+						int sid   = (oda_message >> 6) & 0x3F;
+						int encid = oda_message & 0x1F;
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 3A TMC sys-info v2: SID=%u EncID=%u (encrypted)\n",
+						     sid, encid);
+						break; }
+					default:
+						break;
+					}
+				}
 			}
 			} /* else: valid carrier assignment */
 		}
@@ -10026,33 +10070,99 @@ group14_done:
 		case RDS_ODA_AID_TMC_ALERT2:
 			/* Group 8A: Traffic Message Channel (ALERT-C)
 			 * EN 50067 S.3.1.5.12, Figure 27; ISO 14819.
-			 * Bit layout from gr-rds (GPLv3) + redsea (MIT).
-			 * Only handles type 8A (version A = user messages).  8B is ODA-only. */
-			if (version == 0 && (rds->group_mask & (1<<1))) {
-				int t = (b2 >> 4) & 1;   /* 0=user message, 1=tuning info */
-				int f = (b2 >> 3) & 1;   /* 0=multi-group, 1=single-group */
-				int dp_ci = b2 & 0x07;
+			 * Bit layout: gr-rds constants.h/parser_impl.cc (GPLv2) +
+			 * redsea src/tmc/ (MIT).
+			 *
+			 * DP/Duration table (ISO 14819-1 p.12, via gr-rds constants.h):
+			 *   col[0] = short event duration, col[1] = long persistence
+			 *   0="no duration" 1="15 min"/"next few hours"
+			 *   2="30 min"/"rest of day" 3="1 hour"/"until tomorrow"
+			 *   4="2 hours"/"rest of week" 5="3 hours"/"end of next week"
+			 *   6="4 hours"/"end of month" 7="rest of day"/"long period"
+			 *
+			 * Free-format label table (ISO 14819-1 S.5.5, via gr-rds+redsea):
+			 *   bits: {3,3,5,5,5,8,8,8,8,11,16,16,16,16,0,0}
+			 *   0=Duration 1=ControlCode 2=AffectedLen 3=SpeedLimit
+			 *   4=Quant5 5=Quant8 6=Suppl 7=StartTime 8=StopTime
+			 *   9=AddEvent(11bit) 10=DetailedDiv 11=Dest 12=RFU
+			 *   13=CrossLink 14=Separator 15=RFU/term
+			 *
+			 * Control codes (label 1, 3-bit value):
+			 *   0=IncreaseUrgency 1=ReduceUrgency 2=ChangeDir
+			 *   3=ChangeDurType 4=Spoken/Unspoken 5=SetDiversion
+			 *   6=+8extent 7=+16extent
+			 */
 
-				if (t) {
-					/* Tuning info: log raw variant + data for future use */
-					int variant = b2 & 0x0F;
+			/* -- Tuning-info subhandler (T=1) -- */
+			if (version == 0 && (rds->group_mask & (1<<1)) &&
+			    ((b2 >> 4) & 1)) {
+				/* T=1: tuning info variants 4-9 (redsea tmc.cc) */
+				int variant = b2 & 0x0F;
+				switch (variant) {
+				case 4: /* Provider name chars 1-4 */
+				case 5: /* Provider name chars 5-8 */
+					if (rds->verbose) {
+						char c[5] = {(char)(b3>>8), (char)(b3&0xFF),
+							     (char)(b4>>8), (char)(b4&0xFF), 0};
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 8A TMC tuning: provider name v%d = \"%s\"\n",
+						     variant, c);
+					}
+					break;
+				case 6: /* Other-network AF list (ON PI in b4, AFs in b3) */
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 8A TMC tuning: ON PI=%04X AFs=%04X\n",
+						     b4, b3);
+					break;
+				case 8: /* Other-network PI codes */
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 8A TMC tuning: ON PI1=%04X PI2=%04X\n",
+						     b3, b4);
+					break;
+				case 9: /* ON service info: SID+MGS+LTN */
+					if (rds->verbose)
+						LOGP(DRADIO, LOGL_INFO,
+						     "RDS 8A TMC tuning: service SID=%u MGS=%u LTN=%u\n",
+						     b4 & 0x3F, (b3>>6)&0xF, (b3>>10)&0x3F);
+					break;
+				default:
 					if (rds->debug)
 						LOGP(DRADIO, LOGL_DEBUG,
-						     "RDS 8A TMC: tuning info variant=%d C=%04X D=%04X\n",
+						     "RDS 8A TMC tuning: v%d C=%04X D=%04X\n",
 						     variant, b3, b4);
-				} else if (f || ((b2 & 0x08) == 0 && (b3 & 0x8000))) {
-					/* Single-group, OR first group of multi-group
-					 * (F=0 but D bit set -> first group by gr-rds heuristic) */
+					break;
+				}
+			}
+
+			/* -- User message subhandler (T=0) -- */
+			else if (version == 0 && (rds->group_mask & (1<<1))) {
+				int f     = (b2 >> 3) & 1;   /* 0=multi-group, 1=single */
+				int dp_ci = b2 & 0x07;
+
+				/* Short/long duration descriptions (ISO 14819-1 p.12) */
+				static const char * const dp_short[8] = {
+					"no duration", "15 min", "30 min", "1 hour",
+					"2 hours",     "3 hours", "4 hours", "rest of day"
+				};
+				static const char * const dp_long[8] = {
+					"no duration", "next few hours", "rest of day",
+					"until tomorrow evening", "rest of week",
+					"end of next week", "end of month", "long period"
+				};
+
+				if (f || ((b2 & 0x08) == 0 && (b3 & 0x8000))) {
+					/* Single-group or first group of multi-group */
 					if (!f) {
-						/* Start of multi-group -- save header blocks */
+						/* Start of multi-group: save header */
 						rds->tmc_asm.pending  = 1;
 						rds->tmc_asm.ci       = dp_ci;
 						rds->tmc_asm.c_first  = b3;
 						rds->tmc_asm.d_first  = b4;
 						rds->tmc_asm.n_groups = 0;
 					}
-					if (f || 1) {
-						/* Deliver the single-group / first-group message now */
+					{
 						rds_tmc_msg_t msg = {0};
 						msg.t         = 0;
 						msg.f         = f;
@@ -10064,30 +10174,33 @@ group14_done:
 						msg.location  = b4;
 						if (rds->debug)
 							LOGP(DRADIO, LOGL_DEBUG,
-							     "RDS 8A TMC %s: event=%u loc=%u dir=%s "
-							     "ext=%u div=%d DP=%u\n",
+							     "RDS 8A TMC %s: event=%u loc=%u "
+							     "dir=%s ext=%u div=%d DP=%u (%s)\n",
 							     f ? "single" : "multi-first",
 							     msg.event, msg.location,
 							     msg.direction ? "neg" : "pos",
-							     msg.extent + 1, msg.diversion, msg.dp);
+							     msg.extent + 1, msg.diversion,
+							     dp_ci, dp_short[dp_ci]);
 						if (rds->verbose)
 							LOGP(DRADIO, LOGL_INFO,
 							     "RDS 8A TMC: event=%u loc=%u "
-							     "dir=%s extent=%u%s DP=%u\n",
+							     "dir=%s extent=%u%s "
+							     "duration=%s\n",
 							     msg.event, msg.location,
 							     msg.direction ? "neg" : "pos",
 							     msg.extent + 1,
 							     msg.diversion ? " (diversion)" : "",
-							     msg.dp);
+							     msg.direction ? dp_long[dp_ci]
+									   : dp_short[dp_ci]);
 						if (rds->tmc_callback)
 							rds->tmc_callback(&msg, rds->tmc_callback_arg);
 					}
 				} else {
-					/* Follow-on group of a multi-group message */
-					uint8_t ci  = b2 & 0x07;
-					int sg       = (b3 >> 14) & 1;  /* second-group flag */
-					int gsi      = (b3 >> 12) & 0x3; /* group sequence, counts down */
-					uint32_t ff  = ((uint32_t)(b3 & 0x0FFF) << 16) | b4;
+					/* Follow-on group of multi-group message */
+					uint8_t ci = b2 & 0x07;
+					int sg      = (b3 >> 14) & 1;
+					int gsi     = (b3 >> 12) & 0x3; /* counts down; last = 0 */
+					uint32_t ff = ((uint32_t)(b3 & 0x0FFF) << 16) | b4;
 
 					if (rds->tmc_asm.pending && ci == rds->tmc_asm.ci) {
 						if (sg) rds->tmc_asm.n_groups = gsi;
@@ -10095,10 +10208,56 @@ group14_done:
 						if (rds->debug)
 							LOGP(DRADIO, LOGL_DEBUG,
 							     "RDS 8A TMC multi-follow: CI=%u SG=%d "
-							     "GSI=%d free_fmt=0x%07X\n",
+							     "GSI=%d ff=0x%07X\n",
 							     ci, sg, gsi, ff);
 						if (gsi == 0) {
-							/* Last follow-on: reassembled; re-deliver header */
+							/* All follow-ons received: parse free-format
+							 * labels (ISO 14819-1 S.5.5) and deliver header.
+							 * field_size[label]: {3,3,5,5,5,8,8,8,8,11,16,16,16,16,0,0} */
+							static const uint8_t fsize[16] = {
+								3,3,5,5,5,8,8,8,8,11,16,16,16,16,0,0
+							};
+							/* Walk the free-format words bit by bit */
+							int total_groups = rds->tmc_asm.n_groups;
+							for (int gi = total_groups; gi >= 0; gi--) {
+								if (gi >= 4) continue;
+								uint32_t word = rds->tmc_asm.free_fmt[gi];
+								int bit_pos = (gi == total_groups) ? 24 : 28;
+								while (bit_pos > 0) {
+									int label = (word >> (bit_pos - 4)) & 0xF;
+									bit_pos -= 4;
+									if (fsize[label] == 0) break;
+									if (bit_pos < fsize[label]) break;
+									int fdata = (word >> (bit_pos - fsize[label]))
+										    & ((1 << fsize[label]) - 1);
+									bit_pos -= fsize[label];
+									if (label == 0 && fdata == 0) break; /* terminator */
+									if (rds->debug) {
+										const char * const lnames[16] = {
+											"Duration","ControlCode",
+											"AffectedLen","SpeedLimit",
+											"Quant5","Quant8","Suppl",
+											"StartTime","StopTime",
+											"AddEvent","DetailedDiv",
+											"Dest","RFU","CrossLink",
+											"Sep","RFU"
+										};
+										LOGP(DRADIO, LOGL_DEBUG,
+										     "RDS 8A TMC free-fmt: "
+										     "%s=%d\n",
+										     lnames[label], fdata);
+									}
+									if (label == 9 && rds->verbose) /* AddEvent */
+										LOGP(DRADIO, LOGL_INFO,
+										     "RDS 8A TMC: additional event=%u\n",
+										     fdata);
+									if (label == 3 && rds->verbose) /* SpeedLimit */
+										LOGP(DRADIO, LOGL_INFO,
+										     "RDS 8A TMC: speed limit=%u km/h\n",
+										     fdata);
+								}
+							}
+							/* Deliver the header message */
 							rds_tmc_msg_t msg = {0};
 							msg.f         = 0;
 							msg.dp        = rds->tmc_asm.ci;
@@ -10109,8 +10268,7 @@ group14_done:
 							msg.location  = rds->tmc_asm.d_first;
 							rds->tmc_asm.pending = 0;
 							if (rds->tmc_callback)
-								rds->tmc_callback(&msg,
-								    rds->tmc_callback_arg);
+								rds->tmc_callback(&msg, rds->tmc_callback_arg);
 						}
 					} else if (rds->debug) {
 						LOGP(DRADIO, LOGL_DEBUG,
