@@ -107,6 +107,19 @@ int send_callerid = 0;
  * bis      - Busy/Idle Status: If 1, phone checks B/I bit before TX. Set to 0 (osmocom can't respond fast enough)
  */
 int dcc = 0, scc = 0, sid = 0, regh = 1, regr = 1, pureg = 1, pdreg = 1, locaid = -1, regincr = 300, bis = 0;
+/* Overhead system-parameter capacity for System Parameter Overhead Word 2
+ * (TIA/EIA-553-A 3.7.1.2). N-1 = (paging channels) - 1; CMAX-1 = (access
+ * channels) - 1; both 5-bit (0..31). Value -1 means AUTO: count the channels
+ * the base was actually started with. An explicit -S n1=/cmax1= overrides. */
+int n1 = -1, cmax1 = -1;
+/* Remaining System Parameter Overhead global-action words, previously
+ * hardcoded in init_sysinfo() to their "no-op" defaults so the encoders never
+ * fired. -1 = keep the default (word not broadcast); any other value makes the
+ * base broadcast the word. TIA/EIA-553-A 3.7.1.2 Global Action messages. */
+int olc_mask = -1;	/* Overload Control: 16-bit allow-mask, bit i = access overload class i permitted (ACT=1000) */
+int acc_maxbusy = -1;	/* Access Attempt: max reverse-CC-busy retries, 0..15, applied to PGR+OTHER (ACT=1010) */
+int acc_maxsztr = -1;	/* Access Attempt: max seizure-rejection retries, 0..15, applied to PGR+OTHER */
+int newacc = -1;	/* New Access Channel Set: new access channel number 0..2047, -1 = not sent (ACT=0110) */
 
 int tolerant = 0;
 int vmac_enable = 0;
@@ -193,6 +206,31 @@ void print_help(const char *arg0)
 	printf(" -S --sysinfo bis=0 | bis=1\n");
 	printf("        If 0, phone ignores BUSY/IDLE bit on FOCC (default = '%d')\n", bis);
 	printf("        If 1, be sure to have a round-trip delay (latency) not more than 5 ms\n");
+	printf(" -S --sysinfo n1=<N minus 1>\n");
+	printf("        N = how many PAGING channels your system has. The phone needs N to\n");
+	printf("        work out which paging channel to listen on, so it hears its own pages.\n");
+	printf("        The field holds N-1 (so n1=0 means 1 paging channel). Range 0..31.\n");
+	printf("        DEFAULT: auto - counted from the channels you start the base with\n");
+	printf("        (CC/PC/combined channels). Set this only to override the auto count.\n");
+	printf("        Wrong value: the phone scans for paging channels that do not exist and\n");
+	printf("        may miss incoming-call pages.\n");
+	printf(" -S --sysinfo cmax1=<CMAX minus 1>\n");
+	printf("        CMAX = how many ACCESS channels your system has. The phone uses CMAX to\n");
+	printf("        choose the access channel it originates calls / answers pages on.\n");
+	printf("        The field holds CMAX-1 (so cmax1=0 means 1 access channel). Range 0..31.\n");
+	printf("        DEFAULT: auto - counted from the control channels you start with.\n");
+	printf("        Set this only to override the auto count.\n");
+	printf("        Wrong value: the phone may try to access channels that do not exist.\n");
+	printf(" -S --sysinfo olc=<16-bit mask>\n");
+	printf("        Overload Control (access overload classes): bit i = class i permitted.\n");
+	printf("        Default: not broadcast (all classes implicitly allowed). Also settable at\n");
+	printf("        runtime via the control FIFO: echo \"olc,0xFF00\" > /tmp/amps_control\n");
+	printf(" -S --sysinfo maxbusy=<0-15> | maxsztr=<0-15>\n");
+	printf("        Access Attempt retry limits (reverse-CC busy / seizure rejection).\n");
+	printf("        Default: not broadcast. Runtime: accattempt,<maxbusy>,<maxsztr> via FIFO.\n");
+	printf(" -S --sysinfo newacc=<channel 0-2047>\n");
+	printf("        New Access Channel Set: redirect mobiles to a new access channel.\n");
+	printf("        Default: not broadcast. Runtime: newacc,<channel> via FIFO.\n");
 	printf(" -O --tolerant\n");
 	printf("        Be more tolerant when hunting for sync sequence\n");
 	printf("    --network-timeout <seconds>\n");
@@ -311,11 +349,58 @@ void print_help(const char *arg0)
 	printf("        echo \"alerttci,<number>,<tci_data>\" > /tmp/amps_control\n");
 	printf("        WARNING: Value mapping unknown, may not work with real mobiles\n");
 	*/
+	printf("    Overhead system parameters (runtime, all control channels):\n");
+	printf("        echo \"olc,<16-bit mask>\" > /tmp/amps_control\n");
+	printf("        Overload Control: bit i = access overload class i permitted.\n");
+	printf("        e.g. olc,0xFFFF = all allowed; olc,0x00FF = bar classes 8-15 (load shedding).\n");
+	printf("        echo \"accattempt,<maxbusy>,<maxsztr>\" > /tmp/amps_control\n");
+	printf("        Access Attempt retry limits, each 0-15 (busy / seizure-reject).\n");
+	printf("        echo \"newacc,<channel>\" > /tmp/amps_control\n");
+	printf("        New Access Channel Set: redirect mobiles to access channel 0-2047.\n");
+	printf("        All three take effect on the next overhead train.\n");
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
 }
 
-/* Handler for AMPS Control FIFO commands */
+/* Apply an overhead system-parameter change to EVERY control channel at
+ * runtime. The overhead train is rebuilt from each channel's si on every pass
+ * (prepare_sysinfo is called per-train in frame.c), so updating si here makes
+ * the change take effect on the next overhead train automatically. 'which'
+ * selects the word; <0 fields are left unchanged. Returns channels updated. */
+static int apply_overhead_runtime(const char *which, int olc16, int maxbusy, int maxsztr, int newacc_val)
+{
+	sender_t *sender;
+	int updated = 0;
+
+	for (sender = sender_head; sender; sender = sender->next) {
+		amps_t *a = (amps_t *)sender;
+		/* only channels that carry the control/overhead function */
+		if (a->chan_type != CHAN_TYPE_CC
+		 && a->chan_type != CHAN_TYPE_CC_PC
+		 && a->chan_type != CHAN_TYPE_CC_PC_VC)
+			continue;
+		if (olc16 >= 0) {
+			int b;
+			for (b = 0; b < 16; b++)
+				a->si.overload.olc[b] = (olc16 >> b) & 1;
+		}
+		if (maxbusy >= 0) {
+			a->si.acc_attempt.maxbusy_pgr = maxbusy;
+			a->si.acc_attempt.maxbusy_other = maxbusy;
+		}
+		if (maxsztr >= 0) {
+			a->si.acc_attempt.maxsztr_pgr = maxsztr;
+			a->si.acc_attempt.maxsztr_other = maxsztr;
+		}
+		if (newacc_val >= 0)
+			a->si.new_acc.newacc = newacc_val;
+		updated++;
+	}
+	LOGP(DAMPS, LOGL_NOTICE, "Overhead runtime update (%s) applied to %d control channel(s); takes effect next overhead train\n",
+		which, updated);
+	return updated;
+}
+
 static void amps_myhandler(void)
 {
 	static char buffer[256];
@@ -812,8 +897,44 @@ static void amps_myhandler(void)
 				rc = amps_rescan(number);
 				if (rc < 0)
 					fprintf(stderr, "Rescan order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "olc") == 0) {
+				/* Overload Control: olc,<16-bit allow-mask>
+				 * bit i = access overload class i permitted (1) or barred (0).
+				 * e.g. olc,0xFFFF = all classes allowed; olc,0x00FF = bar classes 8..15.
+				 * Takes effect on the next overhead train on every control channel. */
+				char *mask_str = strsep(&p, ",");
+				if (!mask_str) {
+					fprintf(stderr, "Usage: olc,<16-bit mask>  (e.g. olc,0xFF00 to bar classes 0-7)\n");
+					return;
+				}
+				int mask = (int)strtol(mask_str, NULL, 0) & 0xffff;
+				apply_overhead_runtime("overload control", mask, -1, -1, -1);
+				fprintf(stderr, "Overload Control set to 0x%04x\n", mask);
+			} else if (strcasecmp(cmd, "accattempt") == 0) {
+				/* Access Attempt params: accattempt,<maxbusy>,<maxsztr>  (each 0..15) */
+				char *mb = strsep(&p, ",");
+				char *ms = strsep(&p, ",");
+				if (!mb || !ms) {
+					fprintf(stderr, "Usage: accattempt,<maxbusy 0-15>,<maxsztr 0-15>\n");
+					return;
+				}
+				int mbv = atoi(mb) & 0xf, msv = atoi(ms) & 0xf;
+				apply_overhead_runtime("access attempt", -1, mbv, msv, -1);
+				fprintf(stderr, "Access Attempt set: MAXBUSY=%d MAXSZTR=%d\n", mbv, msv);
+			} else if (strcasecmp(cmd, "newacc") == 0) {
+				/* New Access Channel Set: newacc,<channel 0..2047> */
+				char *ch = strsep(&p, ",");
+				if (!ch) {
+					fprintf(stderr, "Usage: newacc,<access channel 0-2047>\n");
+					return;
+				}
+				int nv = atoi(ch);
+				if (nv < 0) nv = 0;
+				if (nv > 2047) nv = 2047;
+				apply_overhead_runtime("new access channel set", -1, -1, -1, nv);
+				fprintf(stderr, "New Access Channel Set to %d\n", nv);
 			} else {
-				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry' or 'rescan'\n", cmd);
+				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry', 'rescan', 'olc', 'accattempt' or 'newacc'\n", cmd);
 			}
 		}
 	}
@@ -936,6 +1057,35 @@ static int handle_options(int short_option, int argi, char **argv)
 		} else
 		if (!strncasecmp(argv[argi], "bis=", p - argv[argi])) {
 			bis = atoi(p) & 1;
+		} else
+		if (!strncasecmp(argv[argi], "n1=", p - argv[argi])) {
+			n1 = atoi(p);
+			if (n1 > 31) n1 = 31;
+			if (n1 < 0) n1 = 0;
+		} else
+		if (!strncasecmp(argv[argi], "cmax1=", p - argv[argi])) {
+			cmax1 = atoi(p);
+			if (cmax1 > 31) cmax1 = 31;
+			if (cmax1 < 0) cmax1 = 0;
+		} else
+		if (!strncasecmp(argv[argi], "olc=", p - argv[argi])) {
+			/* 16-bit allow-mask; accept 0x.... hex or decimal */
+			olc_mask = (int)strtol(p, NULL, 0) & 0xffff;
+		} else
+		if (!strncasecmp(argv[argi], "maxbusy=", p - argv[argi])) {
+			acc_maxbusy = atoi(p);
+			if (acc_maxbusy > 15) acc_maxbusy = 15;
+			if (acc_maxbusy < 0) acc_maxbusy = 0;
+		} else
+		if (!strncasecmp(argv[argi], "maxsztr=", p - argv[argi])) {
+			acc_maxsztr = atoi(p);
+			if (acc_maxsztr > 15) acc_maxsztr = 15;
+			if (acc_maxsztr < 0) acc_maxsztr = 0;
+		} else
+		if (!strncasecmp(argv[argi], "newacc=", p - argv[argi])) {
+			newacc = atoi(p);
+			if (newacc > 2047) newacc = 2047;
+			if (newacc < 0) newacc = 0;
 		} else {
 			fprintf(stderr, "Given sysinfo parameter '%s' unknown, use '-h' for help!\n", argv[argi]);
 			return -EINVAL;
@@ -1237,10 +1387,79 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 #endif
 
 	/* create transceiver instance */
+	/* Resolve N-1 / CMAX-1 (System Parameter Overhead Word 2, TIA/EIA-553-A
+	 * 3.7.1.2). When left at AUTO (-1), count the control-channel group the
+	 * base was actually started with: N = channels carrying the paging
+	 * function, CMAX = channels carrying the access function. In this type
+	 * model control/paging/access are combined on CC_PC / CC_PC_VC (and PC is
+	 * paging-only), and there is no access-only type, so the access count is
+	 * the control-channel group. The fields hold count-1 and are 5-bit, so
+	 * clamp to 0..31. An explicit -S n1=/cmax1= wins over the auto value. */
+	{
+		int paging_ch = 0, access_ch = 0;
+		int n1_auto, cmax1_auto;
+		for (i = 0; i < num_kanal; i++) {
+			if (chan_type[i] == CHAN_TYPE_PC
+			 || chan_type[i] == CHAN_TYPE_CC_PC
+			 || chan_type[i] == CHAN_TYPE_CC_PC_VC)
+				paging_ch++;
+			if (chan_type[i] == CHAN_TYPE_CC
+			 || chan_type[i] == CHAN_TYPE_CC_PC
+			 || chan_type[i] == CHAN_TYPE_CC_PC_VC)
+				access_ch++;
+		}
+		if (paging_ch < 1) paging_ch = 1;   /* always at least one control channel */
+		if (access_ch < 1) access_ch = 1;
+		n1_auto = (n1 < 0);
+		cmax1_auto = (cmax1 < 0);
+		if (n1_auto) {
+			n1 = paging_ch - 1;
+			if (n1 > 31) n1 = 31;
+			LOGP(DAMPS, LOGL_INFO, "Auto N-1=%d (%d paging channel%s detected)\n",
+				n1, paging_ch, paging_ch == 1 ? "" : "s");
+		} else
+			LOGP(DAMPS, LOGL_INFO, "N-1=%d set explicitly (%d paging channels detected)\n", n1, paging_ch);
+		if (cmax1_auto) {
+			cmax1 = access_ch - 1;
+			if (cmax1 > 31) cmax1 = 31;
+			LOGP(DAMPS, LOGL_INFO, "Auto CMAX-1=%d (%d access channel%s detected)\n",
+				cmax1, access_ch, access_ch == 1 ? "" : "s");
+		} else
+			LOGP(DAMPS, LOGL_INFO, "CMAX-1=%d set explicitly (%d access channels detected)\n", cmax1, access_ch);
+
+		/* One-line summary of how the capacity parameters were derived. */
+		LOGP(DAMPS, LOGL_INFO,
+			"Overhead Word 2 capacity: N=%d paging ch (N-1=%d, %s), CMAX=%d access ch (CMAX-1=%d, %s); broadcast on all %d channel(s)\n",
+			n1 + 1, n1, n1_auto ? "auto" : "override",
+			cmax1 + 1, cmax1, cmax1_auto ? "auto" : "override",
+			num_kanal);
+	}
+
 	for (i = 0; i < num_kanal; i++) {
 		amps_si si;
 
 		init_sysinfo(&si, ms_power, ms_power, dtx, dcc, sid >> 1, regh, regr, pureg, pdreg, locaid, regincr, bis);
+		/* Apply resolved N-1 / CMAX-1 (auto-counted above, or -S override). */
+		si.word2.n_1 = n1;
+		si.word2.cmax_1 = cmax1;
+		/* Remaining overhead global-action words: apply only when the
+		 * operator set them (otherwise leave init_sysinfo's defaults, which
+		 * prepare_sysinfo recognises as "do not broadcast"). */
+		if (olc_mask >= 0) {
+			int b;
+			for (b = 0; b < 16; b++)
+				si.overload.olc[b] = (olc_mask >> b) & 1;
+		}
+		if (acc_maxbusy >= 0) {
+			si.acc_attempt.maxbusy_pgr = acc_maxbusy;
+			si.acc_attempt.maxbusy_other = acc_maxbusy;
+		}
+		if (acc_maxsztr >= 0) {
+			si.acc_attempt.maxsztr_pgr = acc_maxsztr;
+			si.acc_attempt.maxsztr_other = acc_maxsztr;
+		}
+		if (newacc >= 0)
+			si.new_acc.newacc = newacc;
 		rc = amps_create(kanal[i], chan_type[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, do_pre_emphasis, do_de_emphasis, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, &si, sid, scc, polarity, send_callerid, tolerant, loopback);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");

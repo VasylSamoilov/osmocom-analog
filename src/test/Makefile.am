@@ -16,6 +16,7 @@ noinst_PROGRAMS = \
 	test_echo_analysis \
 	test_echo_analysis_edge_cases \
 	test_echo_analysis_final_checkpoint \
+	test_amps_orders \
 	test_signal_meter
 
 test_filter_SOURCES = test_filter.c dummy.c
@@ -243,4 +244,9 @@ test_signal_meter_SOURCES = test_signal_meter.c $(top_builddir)/src/radio/signal
 
 test_signal_meter_LDADD = \
 	$(top_builddir)/src/libfft/libfft.a \
+	-lm
+
+test_amps_orders_SOURCES = test_amps_orders.c
+
+test_amps_orders_LDADD = \
 	-lm
