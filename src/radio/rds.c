@@ -9371,7 +9371,7 @@ group14_done:
 		int gc = (group_type << 1) | version;
 		int is_oda_eligible = (group_type == 5 || group_type == 6 ||
 				       (group_type == 7 && version == 0) ||
-				       (group_type == 8 && version == 0) ||
+				       group_type == 8 ||
 				       (group_type == 9 && version == 0) ||
 				       group_type == 11 || group_type == 12 ||
 				       group_type == 13);
