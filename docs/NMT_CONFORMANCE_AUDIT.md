@@ -282,8 +282,16 @@ genuine deviations, worst-interesting first:
    on failure (no call drop). Code-path verified (build + trace audit), not handset-tested.
    Only the measurement-driven *automatic* trigger remains out (needs BS link, SCOPED-OUT).
    §7.7.
-4. **Release / roaming-confirmation line-signal values** (L=15 release, L=3 roaming
-   confirm) differ from the diagrams' 5a(L=13/15) — needs L-code-table confirm. §7.3/7.4.
+4. **Release / roaming-confirmation line-signal values** — **RESOLVED, no bug** (branch
+   `fix/nmt-release-roaming-lvalues`): the §4.3.3.3 L(n) table confirms **L(3)** = "proceed
+   to send unencrypted digits (roaming updating confirmation)" and **L(15)** = "clearing,
+   call transfer not activated" — exactly what `tx_roaming_confirm` and `tx_mt_release`
+   send. The diagrams' "L(13/15)" is not a choice of release code but two distinct signals:
+   L(15) plain clearing vs **L(13)** "clearing, call transfer activated" — and L(13) belongs
+   to the call-transfer supplementary service, which is not implemented (frame 5c
+   call-transfer flag, PARTIAL). So the code is correct for every implemented case; only the
+   optional L(13) variant is absent, with its unimplemented feature. Comments added citing
+   the table. §7.3/7.4.
 
 ### SMS (verifiable against captures)
 5. **Outgoing SMS length cap** — **FIXED** (branch `fix/nmt-sms-length-timers`): raised
@@ -333,8 +341,6 @@ genuine deviations, worst-interesting first:
 15. **RP-ACK/ERROR MO/MT macro names swapped** vs spec convention (wire correct).
 
 ### UNCONFIRMED (honest limitations of this audit)
-- Roaming/release L-code semantics (L=13 vs 15 vs the "/" notation) not re-confirmed
-  on the detailed §4.3.3 line-signal coding table.
 - Battery-saving H3 period table read from native text only, not PNG.
 - No end-to-end on-air test performed anywhere — all statuses are code-vs-spec
   reads plus the clean build + NMT unit tests, not handset-verified.
