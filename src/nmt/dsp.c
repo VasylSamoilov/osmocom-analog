@@ -70,13 +70,29 @@
 #define SUPER_DETECT_COUNT	6	/* number of measures to detect supervisory signal */
 #define MUTE_DURATION		0.280	/* a tiny bit more than two frames */
 
-/* two supervisory tones */
+/* four supervisory tones (NMT Doc 450-1 §4.5, p.83):
+ * NMT-450: 3955, 3985, 4015, 4045 Hz (30 Hz uniform spacing)
+ * NMT-900: values differ (see §4.5 of 900-1 spec)
+ *
+ * NOTE ON SPEC DISCREPANCY: the 1997-08-08 PDF (§4.5, p.83) lists the first
+ * 450 supervisory tone as "3055 Hz". This is almost certainly a print/scan
+ * defect in the document: a "9" in "3955" printed with a broken bowl, reading
+ * as "0". Evidence:
+ *   1. 3955/3985/4015/4045 Hz = uniform 30 Hz spacing throughout.
+ *   2. 3055 Hz falls inside the speech passband (speech ≤ 3.4 kHz) -- a poor
+ *      choice for a supervisory tone that must be filtered out at the BS while
+ *      leaving speech intact. All four tones must be above the speech band.
+ *   3. The NMT 450-3 Mobile Station spec (1995) names 4015 Hz as "the
+ *      supervisory signal" -- the exact centre of the 3955–4045 Hz set.
+ *   4. The raw PDF text layer and OCR both reproduce "3055" from the scan.
+ * The code uses 3955 Hz. If hardware testing shows 3055 Hz is correct,
+ * change index [0] here and re-verify against a real NMT 450 handset. */
 static double super_freq[5] = {
-	3955.0, /* 0-Signal 1 */
-	3985.0, /* 0-Signal 2 */
-	4015.0, /* 0-Signal 3 */
-	4045.0, /* 0-Signal 4 */
-	3895.0, /* noise level to check against */
+	3955.0, /* ø-Signal 1 (see note above; spec PDF prints "3055" -- likely typo) */
+	3985.0, /* ø-Signal 2 */
+	4015.0, /* ø-Signal 3 */
+	4045.0, /* ø-Signal 4 */
+	3895.0, /* noise reference level (below signal band) */
 };
 
 /* table for fast sine generation */
