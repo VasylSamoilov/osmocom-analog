@@ -49,11 +49,22 @@ void init_sysinfo(amps_si *si, int cmac, int vmac, int dtx, int dcc, int sid1, i
 
 	memset(si, 0, sizeof(*si));
 
-	/* how oftern to repeat the overhead train */
+	/* How often to repeat the overhead train, expressed as the number of
+	 * FOCC frames between trains.
+	 *
+	 * This IS the data-restriction mitigation of TIA/EIA-553-A 3.7.1.3
+	 * ("restricting the overhead message transmission rate to about once
+	 * per second"), which keeps the 11-bit word-sync sequence from
+	 * appearing periodically in the FOCC stream. One FOCC transmit buffer
+	 * is 463 bits at 10 kbit/s (AMPS) = 46.3 ms, so a period of 17 frames
+	 * is ~0.79 s between trains -- i.e. about once per second, as required.
+	 * TACS runs at 8 kbit/s, so 14 frames gives a comparable period.
+	 * Keep this value such that overhead_repeat * frame_duration stays near
+	 * 1 s; do not raise it so far that the rate exceeds roughly 1 Hz. */
 	if (!tacs)
-		si->overhead_repeat = 17;
+		si->overhead_repeat = 17;	/* ~0.79 s @ 10 kbit/s, 463-bit frames */
 	else
-		si->overhead_repeat = 14;
+		si->overhead_repeat = 14;	/* comparable period @ 8 kbit/s */
 
 	/* all words */
 	si->dcc = dcc;
