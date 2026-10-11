@@ -62,7 +62,7 @@ static int sms_ref = 0;
 #define RINGING_TO	60,0	/* how long may the phone ring */
 #define SUPERVISORY_TO1	3	/* 3 sec to detect after setup */
 #define SUPERVISORY_TO2	20,0	/* 20 sec lost until abort */
-#define SCIP_TO		3,0	/* how long we wait for the MS to re-appear (frame 10b) on the new TC */
+#define SCIP_TO		0,553000	/* T' = 553 ms (4 frames): MS re-identify window on the new TC (NMT 450-1 Scheme C2') */
 #define DTMF_DURATION	0.1	/* 100ms */
 
 /* Counters */
@@ -109,6 +109,8 @@ static const char *nmt_state_name(enum nmt_state state)
 		return "SCIP ORDER";
 	case STATE_SCIP_IDENT:
 		return "SCIP IDENT";
+	case STATE_SCIP_IDENT_REQ:
+		return "SCIP IDENT REQ";
 	case STATE_MO_RELEASE:
 		return "RELEASE MTX->MS";
 	case STATE_MT_RELEASE:
@@ -1592,49 +1594,107 @@ static void tx_scip_order(nmt_t *nmt, frame_t *frame)
 		LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: sending channel change order (3c, short procedure) -> TC #%s.\n", tc->sender.kanal);
 
 	if (nmt->tx_frame_count >= SCIP_ORDER_FRAMES) {
-		/* order delivered: move the transaction to the target TC and wait for the MS there.
-		 * Re-parent BEFORE idling the old channel, so the live transaction is not torn down
-		 * when the old channel goes idle (same ordering as AMPS and as tx_mt_channel). */
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: order sent, moving call #%s -> #%s, awaiting identity on new TC.\n", nmt->sender.kanal, tc->sender.kanal);
-		nmt->scip_target = NULL;
-		nmt->trans = NULL;		/* detach old channel without releasing the transaction */
-		nmt_go_idle(nmt);		/* old channel back to idle */
-		tc->trans = trans;
-		trans->nmt = tc;
+		/* Order delivered (step 6).  Per Scheme C2' the OLD TC keeps the speech
+		 * path and stays supervised until the MS has re-identified on the new TC
+		 * (step 8); only then is the old TC released (step 11), and on failure
+		 * (step 9) the call simply stays on the old TC.  So the old TC KEEPS the
+		 * transaction and returns to the active/supervised state; the TARGET is
+		 * armed only to RECEIVE the identity (10b) there, carrying a copy of the
+		 * expected subscriber for matching.  The transaction is handed over only
+		 * once the MS actually appears on the new TC (rx_scip_ident). */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: order sent, awaiting identity on new TC #%s (old TC #%s keeps speech until re-identified).\n", tc->sender.kanal, nmt->sender.kanal);
+		nmt->scip_target = tc;			/* remember target so we can give up on failure */
+		/* arm the target to receive the identity, pointing back to the origin */
+		tc->scip_source = nmt;
+		tc->scip_country = trans->subscriber.country;	/* who to expect on the new TC */
+		memcpy(tc->scip_number, trans->subscriber.number, sizeof(tc->scip_number));
 		nmt_new_state(tc, STATE_SCIP_IDENT);
 		tc->tx_frame_count = 0;
 		tc->rx_frame_count = 0;
 		nmt_set_dsp_mode(tc, DSP_MODE_FRAME);
 		osmo_timer_schedule(&tc->timer, SCIP_TO);
-	}
-}
-
-/* On the new TC we send idle (free) frames while waiting for the MS to re-identify. */
-static void tx_scip_ident(nmt_t *nmt, frame_t *frame)
-{
-	tx_ident(nmt, frame);
-}
-
-static void rx_scip_ident(nmt_t *nmt, frame_t *frame)
-{
-	transaction_t *trans = nmt->trans;
-
-	switch (frame->mt) {
-	case NMT_MESSAGE_10b: /* seizure / identity on the new TC */
-		if (!match_channel(nmt, frame))
-			break;
-		if (!match_subscriber(trans, frame))
-			break;
-		nmt_value2digits(frame->ms_password, trans->subscriber.password, 3);
-		LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: MS re-identified on new TC (password %s), call active.\n", trans->subscriber.password);
-		osmo_timer_del(&nmt->timer);
+		/* old TC: back to the supervised active state, still holding the call */
 		nmt_new_state(nmt, STATE_ACTIVE);
 		nmt->active_state = ACTIVE_STATE_VOICE;
 		nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
 		if (nmt->supervisory) {
 			super_reset(nmt);
-			osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1,0);
+			osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
 		}
+	}
+}
+
+/* On the new TC: in STATE_SCIP_IDENT we radiate idle (free) frames while the
+ * ø-signal is up (DSP mixes it in for this state); in STATE_SCIP_IDENT_REQ we
+ * send the identity request 3b (Scheme C2' step 9). */
+static void tx_scip_ident(nmt_t *nmt, frame_t *frame)
+{
+	if (nmt->state == STATE_SCIP_IDENT_REQ) {
+		/* identity request on the new TC, addressed to the expected subscriber */
+		frame->mt = NMT_MESSAGE_3b;
+		frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+		frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+		frame->ms_country = nmt_digits2value(&nmt->scip_country, 1);
+		frame->ms_number = nmt_digits2value(nmt->scip_number, 6);
+		if (++nmt->tx_frame_count == 1)
+			LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: no identity within T', re-requesting identity (3b) on new TC.\n");
+		return;
+	}
+	tx_ident(nmt, frame);
+}
+
+/* Hand the live call over from the old TC to this (new) TC and throughconnect
+ * (Scheme C2' step 8); then release the old TC (step 11, stop ø-signal). */
+static void scip_complete_move(nmt_t *nmt)
+{
+	nmt_t *old = nmt->scip_source;
+	transaction_t *trans = old ? old->trans : NULL;
+
+	if (!old || !trans) {
+		LOGP_CHAN(DNMT, LOGL_ERROR, "SCIP: lost origin channel on completion, releasing.\n");
+		if (nmt->scip_source)
+			nmt->scip_source = NULL;
+		return;
+	}
+
+	/* move the transaction onto the new TC */
+	old->trans = NULL;
+	old->scip_target = NULL;
+	nmt->trans = trans;
+	trans->nmt = nmt;
+	nmt->scip_source = NULL;
+	memcpy(trans->subscriber.password, nmt->scip_password, sizeof(trans->subscriber.password));
+
+	/* old TC: stop ø-signal, back to idle (step 11) */
+	osmo_timer_del(&old->timer);
+	nmt_go_idle(old);
+
+	/* new TC: throughconnect speech + supervision */
+	osmo_timer_del(&nmt->timer);
+	nmt_new_state(nmt, STATE_ACTIVE);
+	nmt->active_state = ACTIVE_STATE_VOICE;
+	nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+	if (nmt->supervisory) {
+		super_reset(nmt);
+		osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
+	}
+	LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: MS re-identified on new TC, speech throughconnected; old TC released.\n");
+}
+
+static void rx_scip_ident(nmt_t *nmt, frame_t *frame)
+{
+	switch (frame->mt) {
+	case NMT_MESSAGE_10b: /* seizure / identity on the new TC */
+		if (!match_channel(nmt, frame))
+			break;
+		if (nmt_digits2value(&nmt->scip_country, 1) != frame->ms_country
+		 || nmt_digits2value(nmt->scip_number, 6) != frame->ms_number) {
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: identity on new TC does not match expected subscriber, ignoring.\n");
+			break;
+		}
+		/* capture the password echoed in the identity for completeness */
+		nmt_value2digits(frame->ms_password, nmt->scip_password, 3);
+		scip_complete_move(nmt);
 		break;
 	default:
 		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame->mt), nmt_state_name(nmt->state));
@@ -1643,16 +1703,38 @@ static void rx_scip_ident(nmt_t *nmt, frame_t *frame)
 
 static void timeout_scip_ident(nmt_t *nmt)
 {
-	transaction_t *trans = nmt->trans;
+	nmt_t *old = nmt->scip_source;
 
-	/* MS never re-appeared on the new TC. Per 5.4.5 the MS returns to the previous TC,
-	 * but we cannot know it did; the robust server action is to release the call. */
-	LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: timeout waiting for MS on new TC, releasing call.\n");
-	if (trans->callref) {
-		call_up_release(trans->callref, CAUSE_TEMPFAIL);
-		trans->callref = 0;
+	if (nmt->state == STATE_SCIP_IDENT) {
+		/* Step 9: no identity within T' after the 3c order -> request identity
+		 * (3b) on the new TC and wait another T'. */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: no identity within T' on new TC, requesting identity (3b).\n");
+		nmt_new_state(nmt, STATE_SCIP_IDENT_REQ);
+		nmt->tx_frame_count = 0;
+		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
+		osmo_timer_schedule(&nmt->timer, SCIP_TO);
+		return;
 	}
-	nmt_release(nmt);
+
+	/* STATE_SCIP_IDENT_REQ: identity still not received after the 3b request.
+	 * Per Scheme C2' the MTX throughconnects speech on the PREVIOUS TC (the call
+	 * was never torn down there) and sends a forced release on the NEW TC. The
+	 * call survives on the old channel. */
+	LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: MS did not re-identify on new TC; reverting call to old TC #%s, forced-releasing new TC.\n",
+		old ? old->sender.kanal : "?");
+
+	/* give up the target */
+	nmt->scip_country = 0;
+	nmt->scip_number[0] = '\0';
+	nmt->scip_source = NULL;
+	osmo_timer_del(&nmt->timer);
+	nmt_go_idle(nmt);			/* forced release on the new TC */
+
+	/* the old TC still owns the transaction and its ø-signal has been up the
+	 * whole time (step: supervisory controls the previous TC) -- just clear its
+	 * pointer to the abandoned target so it is a plain active call again. */
+	if (old)
+		old->scip_target = NULL;
 }
 
 /*
@@ -2026,6 +2108,7 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 		rx_active(nmt, &frame);
 		break;
 	case STATE_SCIP_IDENT:
+	case STATE_SCIP_IDENT_REQ:
 		rx_scip_ident(nmt, &frame);
 		break;
 	default:
@@ -2055,6 +2138,7 @@ static void nmt_timeout(void *data)
 		timeout_active(nmt, nmt->timer.timeout.tv_sec);
 		break;
 	case STATE_SCIP_IDENT:
+	case STATE_SCIP_IDENT_REQ:
 		timeout_scip_ident(nmt);
 		break;
 	default:
@@ -2125,6 +2209,7 @@ const char *nmt_get_frame(nmt_t *nmt)
 		tx_scip_order(nmt, &frame);
 		break;
 	case STATE_SCIP_IDENT:
+	case STATE_SCIP_IDENT_REQ:
 		tx_scip_ident(nmt, &frame);
 		break;
 	default:

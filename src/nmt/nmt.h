@@ -48,6 +48,7 @@ enum nmt_state {
 	STATE_ACTIVE,		/* during active call */
 	STATE_SCIP_ORDER,	/* SCIP: sending channel change order (frame 3c, short procedure) on current TC */
 	STATE_SCIP_IDENT,	/* SCIP: on new TC, waiting for identity (frame 10b) */
+	STATE_SCIP_IDENT_REQ,	/* SCIP: on new TC, re-requesting identity (frame 3b) after T' (Scheme C2' step 9) */
 	STATE_MO_RELEASE,	/* acknowlegde release from mobile phone */
 	STATE_MT_RELEASE,	/* sending release toward mobile phone */
 };
@@ -96,6 +97,10 @@ struct nmt {
 	enum nmt_state		state;
 	int			wait_autoanswer;	/* wait for frame 15 before we can send autoanswer */
 	struct nmt		*scip_target;		/* SCIP: destination channel we are moving the call to */
+	struct nmt		*scip_source;		/* SCIP: origin channel, kept armed so a failed move can revert */
+	char			scip_country;		/* SCIP: subscriber country digit expected on the target TC */
+	char			scip_number[7];		/* SCIP: subscriber number expected on the target TC */
+	char			scip_password[4];	/* SCIP: subscriber password echoed on re-identification */
 	enum nmt_active_state	active_state;
 	struct osmo_timer_list		timer;
 	int			rx_frame_count;		/* receive frame counter */

@@ -195,22 +195,29 @@ RELEASE_TO=2s matches "max 2s". Stop-ø to BS (20/25) SCOPED-OUT.
 2a→10a→(no TC)→2c/2f loop→2b. `STATE_MT_QUEUE`, QUEUE_TO=60s. Matches note "2b
 sent instead of 2c once idle TC available".
 
-### 7.7 SCIP channel-change (Scheme C2', CLI pp.76/107) — now conformant frame, 2 gaps
-The implemented flow is the **short procedure (Scheme C2', §4.4.1.4.3)**: a single
-order that combines "change to the new TC" and "send identity there", so the MS
-re-identifies with **10b on the new TC without a separate 3b request** — exactly what
-`STATE_SCIP_IDENT` does. **FIXED** (branch `fix/nmt-scip-3c`): the order frame is now
-**3c** (prefix 9), matching that flow, with the channel-number field set to the new TC
-per the §4.7.2.4b rule N₁'N₂'N₃' = NₐNᵦN_c. (Was frame 3a / Scheme C, which requires a
-*separate* 3b identity request the code never sent — a frame/flow mismatch.) Three **real
-gaps** remain in the usage logic: **(a)** the target TC is **not armed before the order** —
-C2' steps 4-5 start the ø-signal (supervisory) on the *new* channel first, so the MS hears
-supervision on arrival; the code leaves the target in `STATE_IDLE` (free-marked, frame 4)
-until the MS's 10b flips it active, so the retuning MS briefly finds a free channel rather
-than a supervised call channel (this is the AMPS "prepare-target-first" discipline, done in
-AMPS handoff but missing here); **(b)** no identity re-request + bounded retry if 10b is
-late; **(c)** failure **releases the call** instead of reverting to the old TC. (`nmt.c:1578,
-scip_find_target, timeout_scip_ident`.) Operator-triggered, not signal-strength automatic.
+### 7.7 SCIP channel-change (Scheme C2', CLI pp.76/107) — now implemented in full
+The implemented flow is the **short procedure (Scheme C2', §4.4.1.4.3)**, now following
+the standard's full step sequence (branch `fix/nmt-scip-conformant`):
+- **order (step 6):** frame **3c** ×4 on the old TC (prefix 9, channel-number field =
+  target TC per §4.7.2.4b N₁'N₂'N₃' = NₐNᵦN_c);
+- **target armed (steps 4-5):** the target TC radiates its **ø-signal while awaiting the
+  MS** (dsp.c emits supervisory in `DSP_MODE_FRAME` for `STATE_SCIP_IDENT`/`_REQ`), so the
+  MS retunes onto a supervised channel, not a free one — the AMPS prepare-target-first
+  discipline, now present;
+- **old TC held (step 8):** the old TC keeps the transaction + speech, supervised, until
+  the MS re-identifies — only then is it released (step 11);
+- **re-request (step 9):** if no 10b within **T' = 553 ms (4 frames)**, the MTX sends
+  **3b** identity requests on the new TC (`STATE_SCIP_IDENT_REQ`) for another T';
+- **failure revert:** if the MS still does not appear, the call **stays on the old TC**
+  (speech throughconnected there, never torn down) and the new TC is **forced-released** —
+  per the standard, not a call drop.
+
+Timers match the spec (T' = 4 frames). **Verification:** builds clean, existing NMT tests
+pass; this is a **code-path implementation verified by build + state-machine trace audit**,
+NOT an on-air/handset-verified handshake (no scripted MS exists in the test harness).
+Remaining non-conformances: operator-triggered rather than signal-strength-automatic (the
+measurement-driven trigger needs the BS link, SCOPED-OUT); the MS-side RF-level-A decision
+is the phone's, not ours.
 
 ### 7.8 MFT / MWI — IMPL
 MFT-in L(4), MFT-out L(10); MWI 5c×2 then L(15)×4 per §4.4.1.16. All **IMPL**.
@@ -269,11 +276,12 @@ genuine deviations, worst-interesting first:
    unchanged. §9.
 2. **Line-signal acceptance stricter than spec** — **FIXED** (same branch):
    `nmt_line_signal_majority()` implements the ≥3-of-5 vote at 5 RX sites. §6.
-3. **SCIP frame now 3c (Scheme C2')** — **FIXED** (branch `fix/nmt-scip-3c`): the
-   order frame matches the implemented short-procedure flow (combined change +
-   identity, no separate 3b). Remaining robustness gaps: no identity re-request /
-   bounded retry if 10b is late, and failure releases the call instead of reverting
-   to the old TC. §7.7.
+3. **SCIP now implements Scheme C2' in full** — **DONE** (branch
+   `fix/nmt-scip-conformant`): 3c order, target ø-signal armed before the MS arrives, old
+   TC held until re-identify, 3b re-request after T', and revert-to-old-TC + forced-release
+   on failure (no call drop). Code-path verified (build + trace audit), not handset-tested.
+   Only the measurement-driven *automatic* trigger remains out (needs BS link, SCOPED-OUT).
+   §7.7.
 4. **Release / roaming-confirmation line-signal values** (L=15 release, L=3 roaming
    confirm) differ from the diagrams' 5a(L=13/15) — needs L-code-table confirm. §7.3/7.4.
 
