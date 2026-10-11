@@ -535,18 +535,70 @@ static void nmt_release(nmt_t *nmt)
 	osmo_timer_schedule(&nmt->timer, RELEASE_TO);
 }
 
+/* Battery-saving group membership (NMT Doc 450-1 para 4.3.3.12.3): does the
+ * phone whose last subscriber digit is x6 belong to the group addressed by H7? */
+static int nmt_bs_group_contains(int h7, int x6)
+{
+	switch (h7) {
+	case 1: return (x6 & 1) == 1;		/* 1,3,5,7,9 */
+	case 2: return (x6 & 1) == 0;		/* 2,4,6,8,0 */
+	case 3: return x6 == 1 || x6 == 2;
+	case 4: return x6 == 3 || x6 == 4;
+	case 5: return x6 == 5 || x6 == 6;
+	case 6: return x6 == 7 || x6 == 8;
+	case 7: return x6 == 9 || x6 == 0;
+	case 8: return 1;			/* all phones */
+	default: return 0;			/* 0 and 9..15: no group */
+	}
+}
+
+/* Battery-saving period for H3 code (NMT Doc 450-1 para 4.3.3.12.4), in frames
+ * (1 frame = 138.33 ms). Returns 0 for H3=0 (disabled) and the spare codes. */
+static int nmt_bs_period_frames(int h3)
+{
+	static const int tbl[10] = { 0, 24, 40, 56, 72, 88, 112, 168, 224, 280 };
+	if (h3 < 1 || h3 > 9)
+		return 0;
+	return tbl[h3];
+}
+
 /* Enter paging state and transmit phone's number on calling channel.
  *
- * Battery-saving interaction (when enabled, bs_period>0): a phone that is
- * asleep for its group's H3 period will not hear the first page. This is
- * covered by the PAGE_TRIES retries (3 attempts, ~3 s) for short periods;
- * frame-exact deferral of the page to the group's wake window is NOT
- * implemented, so a long H3 period (several seconds) can outlast the retries
- * and miss the call. Enable long battery-saving periods with that in mind. */
+ * Battery-saving interaction (when enabled, bs_period>0): a phone asleep for its
+ * group's H3 period will not hear an immediate page, so the first attempt is
+ * DEFERRED by one H3 period (see below), which guarantees the phone has woken
+ * before we page. The deferral is group-aware: only subscribers whose last
+ * digit X6 falls in the addressed H7 group are held; others page immediately. */
 static void nmt_page(transaction_t *trans, int try)
 {
 	sender_t *sender;
 	nmt_t *nmt;
+
+	/* Battery-saving page deferral (NMT Doc 450-1 para 4.3.3.12): on the first
+	 * attempt, if any calling channel runs battery saving and this subscriber's
+	 * group is addressed by it, the phone may be asleep. Hold the page for one
+	 * H3 period, which guarantees the phone has woken (whatever its phase)
+	 * before we page; timeout_mt_paging() then performs the real page. */
+	if (try == 1 && !trans->page_deferred) {
+		int x6 = trans->subscriber.number[5] - '0';
+		for (sender = sender_head; sender; sender = sender->next) {
+			nmt = (nmt_t *)sender;
+			if (!is_chan_class_cc(nmt->sysinfo.chan_type))
+				continue;
+			if (nmt->bs_period > 0 && nmt_bs_group_contains(nmt->bs_group, x6)) {
+				int frames = nmt_bs_period_frames(nmt->bs_period);
+				/* 1 frame = 138.33 ms; round up to whole seconds for the timer */
+				int secs = (frames * 13833 + 999999) / 1000000;
+				if (secs < 1)
+					secs = 1;
+				LOGP(DNMT, LOGL_INFO, "Battery saving active for this subscriber's group (H3=%d, %d frames); deferring page ~%d s to the wake window.\n", nmt->bs_period, frames, secs);
+				trans->page_deferred = 1;
+				trans->page_try = try;
+				osmo_timer_schedule(&trans->timer, secs, 0);
+				return;
+			}
+		}
+	}
 
 	LOGP(DNMT, LOGL_INFO, "Entering paging state (try %d), sending call to '%c,%s'.\n", try, trans->subscriber.country, trans->subscriber.number);
 	trans->page_try = try;
@@ -1167,6 +1219,14 @@ static void tx_mt_paging(nmt_t *nmt, frame_t *frame)
 
 void timeout_mt_paging(transaction_t *trans)
 {
+	/* battery saving: the deferral timer fired, the group's wake window has
+	 * arrived -- now actually page (this was not a failed attempt). */
+	if (trans->page_deferred) {
+		trans->page_deferred = 0;
+		LOGP(DNMT, LOGL_INFO, "Battery-saving wake window reached, paging now.\n");
+		nmt_page(trans, 1);
+		return;
+	}
 	LOGP(DNMT, LOGL_NOTICE, "No answer from mobile phone (try %d).\n", trans->page_try);
 	if (trans->page_try == PAGE_TRIES) {
 		LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
