@@ -1281,6 +1281,15 @@ static void rx_mt_paging(nmt_t *nmt, frame_t *frame)
 		if (frame->mt == NMT_MESSAGE_11b) {
 			trans->priority = 1;
 			LOGP_CHAN(DNMT, LOGL_INFO, "Call acknowledgment is from a priority MS (PMS).\n");
+			/* NMT Doc 450-1 §4.4.1.7: after ringing+answer, the PMS continues as
+			 * Scheme A (MO call) -- state 11a = authentication request (5a(L=3/11)),
+			 * states 14-16 = PMS dials its own outgoing call (14a/14b digit pairs).
+			 * This single-node emulator routes the PMS through the normal MT call
+			 * path instead: priority queueing (2c) and identity (10b) are correct,
+			 * but the post-answer MO-dialing path (the PMS's own outgoing call) is
+			 * NOT implemented -- there is no mechanism to set up a second outgoing
+			 * call from the answered-PMS context. STANDARD POINT: §4.4.1.7 states
+			 * 11a/13a/14-16 are not reached. */
 		}
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received call acknowledgment from subscriber %c,%s.\n", trans->subscriber.country, trans->subscriber.number);
 		if (trans->sms_string[0])
@@ -2121,12 +2130,12 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 
 	switch (nmt->active_state) {
 	case ACTIVE_STATE_COINBOX_ANSWER:
-		/* Coin-box answer sequence (NMT Doc 450-1 4.7.2): send frame 5b carrying
-		 * the operator-supplied tariff class, repeated like other line signals,
-		 * then return to the voice path. The coin-box MS acknowledges by echoing
-		 * the tariff class in frame 13b (decoded/logged in rx_active). */
+		/* Coin-box answer sequence (NMT Doc 450-1 4.4.1.6, state 13): send frame 5b
+		 * carrying the operator-supplied tariff class 4 times, then return to
+		 * the voice path. The coin-box MS echoes the tariff class in frame 13b
+		 * (decoded/logged in rx_active). */
 		set_coinbox_answer(nmt, frame, nmt->coinbox_tariff & 0x3);
-		if (++nmt->tx_frame_count > 4) {
+		if (++nmt->tx_frame_count >= 4) {
 			trans->coinbox_answer_pending = 0;
 			nmt->active_state = ACTIVE_STATE_VOICE;
 			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
