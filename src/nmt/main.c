@@ -144,6 +144,7 @@ void print_help(const char *arg0)
 	printf("        If set, the caller ID is sent while ringing the phone. (default = '%d')\n", send_callerid);
 	printf(" -U --clock 1 | 0\n");
 	printf("        If set, the current time is transmitted with CC. (default = '%d')\n", send_clock);
+	printf("        Note that this works only with pure CC, not with combined CC+TC.\n");
 	printf(" -b --battery-saving <H3 period 0..9>\n");
 	printf("        Enable battery saving on the calling channel (NMT Doc 450-1 4.3.3.12).\n");
 	printf("        0 = disabled (phones never sleep), 1..9 = sleep period code\n");
@@ -151,7 +152,6 @@ void print_help(const char *arg0)
 	printf(" -E --sis-demo 1 | 0\n");
 	printf("        Enable the SIS authentication DEMONSTRATOR (frame 7/16 exchange only;\n");
 	printf("        there is NO real SIS algorithm, it cannot authenticate). (default = '%d')\n", sis_demo);
-	printf("        Note that this works only with pure CC, not with combined CC+TC.\n");
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
 }

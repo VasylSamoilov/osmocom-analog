@@ -581,11 +581,13 @@ static void nmt_page(transaction_t *trans, int try)
 	 * before we page; timeout_mt_paging() then performs the real page. */
 	if (try == 1 && !trans->page_deferred) {
 		int x6 = trans->subscriber.number[5] - '0';
+		if (x6 < 0 || x6 > 9)
+			x6 = -1;	/* malformed number: matches no group, pages immediately */
 		for (sender = sender_head; sender; sender = sender->next) {
 			nmt = (nmt_t *)sender;
 			if (!is_chan_class_cc(nmt->sysinfo.chan_type))
 				continue;
-			if (nmt->bs_period > 0 && nmt_bs_group_contains(nmt->bs_group, x6)) {
+			if (nmt->bs_period > 0 && x6 >= 0 && nmt_bs_group_contains(nmt->bs_group, x6)) {
 				int frames = nmt_bs_period_frames(nmt->bs_period);
 				/* 1 frame = 138.33 ms; round up to whole seconds for the timer */
 				int secs = (frames * 13833 + 999999) / 1000000;
