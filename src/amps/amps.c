@@ -832,14 +832,18 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 	case TRANS_CALL_MO_ASSIGN_CONFIRM: // should not happen
 	case TRANS_CALL:
 		if (tone) {
-			/* ST detected during active call */
-			if (trans->st_start_time == 0.0) {
+			/* ST detected during active call.
+			 * TIA/EIA-553-A 3.6.4: the (SAT,ST)=(0,1) status shall always
+			 * be treated as (0,0) -- an ST with no SAT behind it is not a
+			 * valid signaling event (interference, or a mobile that has
+			 * drifted off channel), so do not start flash/release timing
+			 * unless SAT is present. */
+			if (trans->sat_detected && trans->st_start_time == 0.0) {
 				/* Start timing the ST duration */
 				LOGP_CHAN(DAMPS, LOGL_DEBUG, "Signaling Tone detected in active call - starting timer\n");
 				trans->st_start_time = get_time();
 				/* Schedule timer for Release condition (1.8s) */
-				if (trans->sat_detected)
-					osmo_timer_schedule(&trans->timer, ST_RELEASE_TIME);
+				osmo_timer_schedule(&trans->timer, ST_RELEASE_TIME);
 			}
 		} else {
 			/* ST Lost during active call */
