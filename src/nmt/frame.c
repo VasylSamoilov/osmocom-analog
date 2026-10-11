@@ -388,7 +388,7 @@ static struct nmt_frame {
 	{ NMT_MESSAGE_10c,	"NNNPZXXXXXXTYKKK", MS_TO_MTX, 6,	"10c",	"Seizure and identity from called MS on traffic channel" },
 	{ NMT_MESSAGE_10d,	"NNNPZXXXXXXTJJJJ", MS_TO_MTX, 6,	"10d",	"Call acknowledgement from MS on the alternative type of call on combined CC/TC (shortened frame)" },
 	{ NMT_MESSAGE_11a,	"NNNPZXXXXXXTYKKK", MS_TO_MTX, 14,	"11a",	"Roaming updating seizure and identity on traffic channel" },
-	{ NMT_MESSAGE_11b,	"NNNPZXXXXXXTYJJJ", MS_TO_MTX, 15,	"11b",	"Seizure and call achnowledgment on calling channel from MS with priority (shortened frame)" },
+	{ NMT_MESSAGE_11b,	"NNNPZXXXXXXTJJJJ", MS_TO_MTX, 15,	"11b",	"Seizure and call achnowledgment on calling channel from MS with priority (shortened frame)" },
 	{ NMT_MESSAGE_12,	"NNNPZXXXXXXTYKKK", MS_TO_MTX, 11,	"12",	"Seizure from coin-box on traffic channel" },
 	{ NMT_MESSAGE_13a,	"NNNPZXXXXXXLLLLL", MS_TO_MTX, 8,	"13a",	"Line signal" },
 	{ NMT_MESSAGE_13b,	"NNNPZXXXXXXLLLQQ", MS_TO_MTX, 8,	"13b",	"Line signal: Answer acknowledgment from coin box" },
@@ -859,7 +859,11 @@ static enum nmt_mt decode_frame_mt(const uint8_t *digits, enum nmt_direction dir
 			/* no subscriber */
 			if (digits[6] == 0)
 				return NMT_MESSAGE_1a;
-			/* battery saving */
+			/* Battery-saving frame (Z=14, additional info per 4.3.3.12).
+			 * The single-node MTX has no battery-save scheduler and never
+			 * originates these, so there is no H3-period/H7-group behaviour
+			 * to drive; a received one is treated as a plain calling-channel
+			 * indication (1a) rather than decoded into unused fields. */
 			if (digits[6] == 14)
 				return NMT_MESSAGE_1a;
 			/* info to BS (should not happen here) */

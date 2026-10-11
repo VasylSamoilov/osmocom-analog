@@ -1354,7 +1354,8 @@ static void rx_mt_autoanswer(nmt_t *nmt, frame_t *frame)
 			break;
 		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 12)
 			break;
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received acknowledge to autoanswer.\n");
+		LOGP_CHAN(DNMT, LOGL_INFO, "Received acknowledge to autoanswer (line signal L(12) '%s').\n",
+			nmt_linesignal_name(12, 1));
 		nmt_new_state(nmt, STATE_MT_COMPLETE);
 		nmt->tx_frame_count = 0;
 		call_up_answer(trans->callref, &trans->subscriber.country);
@@ -1405,7 +1406,8 @@ static void rx_mt_ringing(nmt_t *nmt, frame_t *frame)
 			break;
 		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 14)
 			break;
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received 'answer' from phone.\n");
+		LOGP_CHAN(DNMT, LOGL_INFO, "Received 'answer' from phone (line signal L(14) '%s').\n",
+			nmt_linesignal_name(14, 0));
 		nmt_new_state(nmt, STATE_MT_COMPLETE);
 		nmt->tx_frame_count = 0;
 		osmo_timer_del(&nmt->timer);
@@ -1562,7 +1564,8 @@ static void rx_mt_release(nmt_t *nmt, frame_t *frame)
 			break;
 		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 1)
 			break;
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received release guard L(1).\n");
+		LOGP_CHAN(DNMT, LOGL_INFO, "Received release guard (line signal L(1) '%s').\n",
+			nmt_linesignal_name(1, 0));
 		if (trans->mwi_call) {
 			/* MWI delivery confirmed - phone acknowledged clearing
 			 * Note: This confirms phone received clearing signal,
@@ -2040,8 +2043,26 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 	 * what the MS/BS reports, for diagnostics and capture analysis, then fall through. */
 	switch (frame.mt) {
 	case NMT_MESSAGE_16: /* Signed response (SRES) from MS — reply to an authentication request */
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signed response (frame 16, SRES=0x%" PRIx64 "); authentication is not implemented, logging only.\n", (uint64_t)frame.sres);
+	    {
+		/* Frame 16 carries R1R2R3R4 repeated three times (format
+		 * NNNPRRRRRRRRRRRR). Recover the 16-bit SRES by majority across the
+		 * three 4-digit copies, so a single corrupted copy does not spoil it
+		 * (same tolerance the standard gives line signals). */
+		uint16_t c0 = (frame.sres >> 32) & 0xffff;
+		uint16_t c1 = (frame.sres >> 16) & 0xffff;
+		uint16_t c2 = frame.sres & 0xffff;
+		uint16_t sres;
+		if (c0 == c1 || c0 == c2)
+			sres = c0;
+		else if (c1 == c2)
+			sres = c1;
+		else {
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signed response (frame 16) with three differing copies (0x%04x/0x%04x/0x%04x), corrupt; authentication is not implemented, logging only.\n", c0, c1, c2);
+			break;
+		}
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signed response (frame 16, SRES=0x%04x); authentication is not implemented, logging only.\n", sres);
 		break;
+	    }
 	case NMT_MESSAGE_26: /* Signal strength measurement result (BS -> MTX) */
 		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signal strength measurement result (frame 26, TC=%d, result=0x%x); handover is not implemented, logging only.\n", frame.tc_no, frame.meas);
 		break;
@@ -2078,7 +2099,8 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal not accepted: no majority of equal, meaningful characters (corrupt frame).\n");
 			return;
 		}
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received clearing by mobile phone in state %s.\n", nmt_state_name(nmt->state));
+		LOGP_CHAN(DNMT, LOGL_INFO, "Received clearing by mobile phone (line signal L(1) '%s') in state %s.\n",
+			nmt_linesignal_name(1, 0), nmt_state_name(nmt->state));
 		if (nmt->trans->callref) {
 			LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
 			call_up_release(nmt->trans->callref, CAUSE_NORMAL);

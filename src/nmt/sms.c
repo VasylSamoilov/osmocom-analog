@@ -82,13 +82,14 @@
 #define FSC_MEMORY_EXCEEDED	0xD3
 #define FSC_UNSPECIFIED_ERROR	0xFF
 
-/* RP-Message-Type-Indicator (RP-MTI) */
+/* RP-Message-Type-Indicator (RP-MTI), GSM 04.11 convention:
+ * MO = mobile-originated (MS -> SC), MT = mobile-terminated (SC -> MS). */
 #define RP_MO_DATA		0x00	/* MS -> SC */
 #define RP_MT_DATA		0x01	/* SC -> MS */
-#define RP_MT_ACK		0x02	/* MS -> SC */
-#define RP_MO_ACK		0x03	/* SC -> MS */
-#define RP_MT_ERROR		0x04	/* MS -> SC */
-#define RP_MO_ERROR		0x05	/* SC -> MS */
+#define RP_MO_ACK		0x02	/* MS -> SC */
+#define RP_MT_ACK		0x03	/* SC -> MS */
+#define RP_MO_ERROR		0x04	/* MS -> SC */
+#define RP_MT_ERROR		0x05	/* SC -> MS */
 #define RP_SM_MEMORY_AVAILABLE	0x06	/* MS -> SC */
 #define RP_SM_READY_TO_RECEIVE	0x07	/* MS -> SC */
 #define RP_SM_NO_MESSAGE	0x07	/* SC -> MS */
@@ -418,7 +419,7 @@ static void sms_submit_report(nmt_t *nmt, uint8_t ref, int error)
 	length = encode_header(data);
 
 	/* RP */
-	data[length++] = (error) ? RP_MO_ERROR : RP_MO_ACK;
+	data[length++] = (error) ? RP_MT_ERROR : RP_MT_ACK;
 	data[length++] = ref;
 
 	dms_send(nmt, data, length, 1);
@@ -688,7 +689,7 @@ static int decode_deliver_report(nmt_t *nmt, const uint8_t *data, int length)
 
 	ref = data[1];
 
-	if ((data[0] & RP_MTI_MASK) == RP_MT_ERROR) {
+	if ((data[0] & RP_MTI_MASK) == RP_MO_ERROR) {
 		error = 1;
 		if (length < 4) {
 			LOGP(DSMS, LOGL_DEBUG, "deliver report still incomplete, waiting for cause IE\n");
@@ -773,20 +774,20 @@ release:
 		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MT_DATA (0x%02x) from mobile, ignoring.\n", data[0]);
 		rc = 0;
 		break;
-	case RP_MT_ACK:
+	case RP_MO_ACK:
 		rc = decode_deliver_report(nmt, data, length);
 		break;
-	case RP_MO_ACK:
-		/* RP_MO_ACK (3) is SC->MS, should not be received from mobile. */
-		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MO_ACK (0x%02x) from mobile, ignoring.\n", data[0]);
+	case RP_MT_ACK:
+		/* RP_MT_ACK (0x03) is SC->MS, should not be received from mobile. */
+		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MT_ACK (0x%02x) from mobile, ignoring.\n", data[0]);
 		rc = 0;
 		break;
-	case RP_MT_ERROR:
+	case RP_MO_ERROR:
 		rc = decode_deliver_report(nmt, data, length);
 		break;
-	case RP_MO_ERROR:
-		/* RP_MO_ERROR (5) is SC->MS, should not be received from mobile. */
-		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MO_ERROR (0x%02x) from mobile, ignoring.\n", data[0]);
+	case RP_MT_ERROR:
+		/* RP_MT_ERROR (0x05) is SC->MS, should not be received from mobile. */
+		LOGP(DSMS, LOGL_NOTICE, "Received unexpected RP_MT_ERROR (0x%02x) from mobile, ignoring.\n", data[0]);
 		rc = 0;
 		break;
 	case RP_SM_MEMORY_AVAILABLE:
