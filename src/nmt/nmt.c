@@ -958,11 +958,13 @@ static void tx_roaming_confirm(nmt_t *nmt, frame_t *frame)
 {
 	/* L(3) = "proceed to send unencrypted digits (roaming updating
 	 * confirmation)" per NMT Doc 450-1 para 4.3.3.3. L(11) is the encrypted
-	 * (SIS) variant, which is not used here (SIS is not implemented). */
+	 * (SIS) variant, which is not used here (SIS is not implemented).
+	 * §4.4.1.5 Scheme D (p.65) shows L(3) sent 4 times before the forced
+	 * release (5a(L=13/15)). */
 	set_line_signal(nmt, frame, 3);
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send 'Roaming updating confirmation'.\n");
-	if (nmt->tx_frame_count == 2)
+	if (nmt->tx_frame_count == 4)
 		nmt_release(nmt); /* continue with this frame, then release */
 }
 
@@ -1601,7 +1603,9 @@ static void tx_mt_complete(nmt_t *nmt, frame_t *frame)
 		set_line_signal(nmt, frame, 5);
 	} else
 		frame->mt = NMT_MESSAGE_6;
-	if (nmt->tx_frame_count == 5) {
+	/* §4.4.1.2 Scheme B (p.59) shows 4 frames of compander-in / idle before
+	 * throughconnecting (state 14 → 14b). Transition on frame 4. */
+	if (nmt->tx_frame_count == 4) {
 		nmt_new_state(nmt, STATE_ACTIVE);
 		if (trans->mwi_call) {
 			/* Out-of-call MWI delivery per NMT spec 4.4.1.16:
