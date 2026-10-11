@@ -129,6 +129,13 @@ int newacc = -1;	/* New Access Channel Set: new access channel number 0..2047, -
  * 2-bit field. A non-zero combination enables the SDCC feature. */
 int sdcc1 = -1, sdcc2 = -1;
 
+/* Base station air-interface version advertised in the Access Type Parameters
+ * global action overhead message (TIA/EIA-553-A, p.19): BSCAP = core analog
+ * protocol version (3-bit field), BSPC = advanced protocol capability version
+ * (4-bit field). -1 = keep the init_sysinfo defaults (bscap=1, bspc=0);
+ * 0..7 sets BSCAP, 0..15 sets BSPC. */
+int bscap = -1, bspc = -1;
+
 /* Authentication (TIA/EIA-553-A 2.3.12) is NOT supported by this base (no CAVE
  * engine). AUTH is permanently 0 in the overhead -- see sysinfo.c -- which tells
  * every mobile not to use authentication. There is intentionally no operator
@@ -250,6 +257,10 @@ void print_help(const char *arg0)
 	printf("        enables the SDCC feature (extends 4 color codes to 64); the mobile\n");
 	printf("        echoes it to indicate SDCC capability. Default 0,0 = feature off.\n");
 	printf("        Runtime: sdcc,<sdcc1>,<sdcc2> via FIFO.\n");
+	printf(" -S --sysinfo bscap=<0-7>  bspc=<0-15>\n");
+	printf("        Air-interface version advertised in the access-type overhead\n");
+	printf("        (TIA/EIA-553-A p.19): BSCAP = core analog protocol version,\n");
+	printf("        BSPC = advanced protocol capability version. Default 1,0.\n");
 	printf(" -O --tolerant\n");
 	printf("        Be more tolerant when hunting for sync sequence\n");
 	printf("    --network-timeout <seconds>\n");
@@ -387,12 +398,29 @@ void print_help(const char *arg0)
 	main_mobile_print_hotkeys();
 }
 
+/* Named overrides for a runtime overhead change. Each field <0 is left
+ * unchanged; a value >=0 is applied (and masked to its field width). Build one
+ * with OVERHEAD_OVERRIDE_NONE and set only the field(s) you are changing, so a
+ * new field never has to be threaded through a long positional argument list. */
+struct overhead_override {
+	int olc16;	/* 16-bit overload-class mask */
+	int maxbusy;	/* access-attempt max busy */
+	int maxsztr;	/* access-attempt max seize-tries */
+	int newacc;	/* new access channel set */
+	int sdcc1;	/* supplementary digital color code 1 (0-3) */
+	int sdcc2;	/* supplementary digital color code 2 (0-3) */
+	int bscap;	/* base station core analog protocol version (0-7) */
+	int bspc;	/* base station advanced protocol capability version (0-15) */
+};
+#define OVERHEAD_OVERRIDE_NONE { -1, -1, -1, -1, -1, -1, -1, -1 }
+
 /* Apply an overhead system-parameter change to EVERY control channel at
  * runtime. The overhead train is rebuilt from each channel's si on every pass
  * (prepare_sysinfo is called per-train in frame.c), so updating si here makes
  * the change take effect on the next overhead train automatically. 'which'
- * selects the word; <0 fields are left unchanged. Returns channels updated. */
-static int apply_overhead_runtime(const char *which, int olc16, int maxbusy, int maxsztr, int newacc_val, int sdcc1_val, int sdcc2_val)
+ * selects the word for the log line; each override field <0 is left unchanged.
+ * Returns channels updated. */
+static int apply_overhead_runtime(const char *which, const struct overhead_override *ov)
 {
 	sender_t *sender;
 	int updated = 0;
@@ -404,25 +432,29 @@ static int apply_overhead_runtime(const char *which, int olc16, int maxbusy, int
 		 && a->chan_type != CHAN_TYPE_CC_PC
 		 && a->chan_type != CHAN_TYPE_CC_PC_VC)
 			continue;
-		if (olc16 >= 0) {
+		if (ov->olc16 >= 0) {
 			int b;
 			for (b = 0; b < 16; b++)
-				a->si.overload.olc[b] = (olc16 >> b) & 1;
+				a->si.overload.olc[b] = (ov->olc16 >> b) & 1;
 		}
-		if (maxbusy >= 0) {
-			a->si.acc_attempt.maxbusy_pgr = maxbusy;
-			a->si.acc_attempt.maxbusy_other = maxbusy;
+		if (ov->maxbusy >= 0) {
+			a->si.acc_attempt.maxbusy_pgr = ov->maxbusy;
+			a->si.acc_attempt.maxbusy_other = ov->maxbusy;
 		}
-		if (maxsztr >= 0) {
-			a->si.acc_attempt.maxsztr_pgr = maxsztr;
-			a->si.acc_attempt.maxsztr_other = maxsztr;
+		if (ov->maxsztr >= 0) {
+			a->si.acc_attempt.maxsztr_pgr = ov->maxsztr;
+			a->si.acc_attempt.maxsztr_other = ov->maxsztr;
 		}
-		if (newacc_val >= 0)
-			a->si.new_acc.newacc = newacc_val;
-		if (sdcc1_val >= 0)
-			a->si.filler.sdcc1 = sdcc1_val & 3;
-		if (sdcc2_val >= 0)
-			a->si.filler.sdcc2 = sdcc2_val & 3;
+		if (ov->newacc >= 0)
+			a->si.new_acc.newacc = ov->newacc;
+		if (ov->sdcc1 >= 0)
+			a->si.filler.sdcc1 = ov->sdcc1 & 3;
+		if (ov->sdcc2 >= 0)
+			a->si.filler.sdcc2 = ov->sdcc2 & 3;
+		if (ov->bscap >= 0)
+			a->si.acc_type.bscap = ov->bscap & 7;
+		if (ov->bspc >= 0)
+			a->si.acc_type.bspc = ov->bspc & 15;
 		updated++;
 	}
 	LOGP(DAMPS, LOGL_NOTICE, "Overhead runtime update (%s) applied to %d control channel(s); takes effect next overhead train\n",
@@ -950,7 +982,9 @@ static void amps_myhandler(void)
 					return;
 				}
 				int mask = (int)strtol(mask_str, NULL, 0) & 0xffff;
-				apply_overhead_runtime("overload control", mask, -1, -1, -1, -1, -1);
+				struct overhead_override ov = OVERHEAD_OVERRIDE_NONE;
+				ov.olc16 = mask;
+				apply_overhead_runtime("overload control", &ov);
 				fprintf(stderr, "Overload Control set to 0x%04x\n", mask);
 			} else if (strcasecmp(cmd, "accattempt") == 0) {
 				/* Access Attempt params: accattempt,<maxbusy>,<maxsztr>  (each 0..15) */
@@ -961,7 +995,10 @@ static void amps_myhandler(void)
 					return;
 				}
 				int mbv = atoi(mb) & 0xf, msv = atoi(ms) & 0xf;
-				apply_overhead_runtime("access attempt", -1, mbv, msv, -1, -1, -1);
+				struct overhead_override ov = OVERHEAD_OVERRIDE_NONE;
+				ov.maxbusy = mbv;
+				ov.maxsztr = msv;
+				apply_overhead_runtime("access attempt", &ov);
 				fprintf(stderr, "Access Attempt set: MAXBUSY=%d MAXSZTR=%d\n", mbv, msv);
 			} else if (strcasecmp(cmd, "newacc") == 0) {
 				/* New Access Channel Set: newacc,<channel 0..2047> */
@@ -973,7 +1010,9 @@ static void amps_myhandler(void)
 				int nv = atoi(ch);
 				if (nv < 0) nv = 0;
 				if (nv > 2047) nv = 2047;
-				apply_overhead_runtime("new access channel set", -1, -1, -1, nv, -1, -1);
+				struct overhead_override ov = OVERHEAD_OVERRIDE_NONE;
+				ov.newacc = nv;
+				apply_overhead_runtime("new access channel set", &ov);
 				fprintf(stderr, "New Access Channel Set to %d\n", nv);
 			} else if (strcasecmp(cmd, "sdcc") == 0) {
 				/* Supplementary Digital Color Code: sdcc,<sdcc1 0..3>,<sdcc2 0..3>
@@ -987,11 +1026,32 @@ static void amps_myhandler(void)
 					return;
 				}
 				int s1v = atoi(s1) & 3, s2v = atoi(s2) & 3;
-				apply_overhead_runtime("supplementary digital color code", -1, -1, -1, -1, s1v, s2v);
+				struct overhead_override ov = OVERHEAD_OVERRIDE_NONE;
+				ov.sdcc1 = s1v;
+				ov.sdcc2 = s2v;
+				apply_overhead_runtime("supplementary digital color code", &ov);
 				fprintf(stderr, "SDCC set: SDCC1=%d SDCC2=%d (%s)\n", s1v, s2v,
 					(s1v || s2v) ? "feature enabled" : "feature disabled");
+			} else if (strcasecmp(cmd, "bscap") == 0 || strcasecmp(cmd, "bspc") == 0) {
+				/* Air-interface version advertised in the access-type overhead
+				 * (TIA/EIA-553-A p.19). bscap,<0-7> sets the core analog
+				 * protocol version; bspc,<0-15> the advanced capability version. */
+				int is_bscap = (strcasecmp(cmd, "bscap") == 0);
+				char *v = strsep(&p, ",");
+				if (!v) {
+					fprintf(stderr, "Usage: %s,<%s>\n", cmd, is_bscap ? "0-7" : "0-15");
+					return;
+				}
+				int val = atoi(v) & (is_bscap ? 7 : 15);
+				struct overhead_override ov = OVERHEAD_OVERRIDE_NONE;
+				if (is_bscap)
+					ov.bscap = val;
+				else
+					ov.bspc = val;
+				apply_overhead_runtime(is_bscap ? "BSCAP" : "BSPC", &ov);
+				fprintf(stderr, "%s set to %d\n", is_bscap ? "BSCAP" : "BSPC", val);
 			} else {
-				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'paramupdate', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry', 'rescan', 'olc', 'accattempt', 'newacc' or 'sdcc'\n", cmd);
+				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'paramupdate', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry', 'rescan', 'olc', 'accattempt', 'newacc', 'sdcc', 'bscap' or 'bspc'\n", cmd);
 			}
 		}
 	}
@@ -1149,6 +1209,12 @@ static int handle_options(int short_option, int argi, char **argv)
 		} else
 		if (!strncasecmp(argv[argi], "sdcc2=", p - argv[argi])) {
 			sdcc2 = atoi(p) & 3;
+		} else
+		if (!strncasecmp(argv[argi], "bscap=", p - argv[argi])) {
+			bscap = atoi(p) & 7;   /* 3-bit field */
+		} else
+		if (!strncasecmp(argv[argi], "bspc=", p - argv[argi])) {
+			bspc = atoi(p) & 15;   /* 4-bit field */
 		} else {
 			fprintf(stderr, "Given sysinfo parameter '%s' unknown, use '-h' for help!\n", argv[argi]);
 			return -EINVAL;
@@ -1532,6 +1598,15 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 			si.filler.sdcc2 = sdcc2;
 		if (si.filler.sdcc1 || si.filler.sdcc2)
 			LOGP(DAMPS, LOGL_INFO, "SDCC feature enabled on channel %s: SDCC1=%d, SDCC2=%d (mobiles echo a non-zero combination to indicate SDCC capability)\n", kanal[i], si.filler.sdcc1, si.filler.sdcc2);
+		/* BSCAP/BSPC: advertise air-interface versions in the access-type
+		 * overhead (TIA/EIA-553-A p.19). Apply only when the operator set
+		 * them; otherwise keep the init_sysinfo defaults (bscap=1, bspc=0). */
+		if (bscap >= 0)
+			si.acc_type.bscap = bscap & 7;
+		if (bspc >= 0)
+			si.acc_type.bspc = bspc & 15;
+		if (bscap >= 0 || bspc >= 0)
+			LOGP(DAMPS, LOGL_INFO, "Access-type air-interface version on channel %s: BSCAP=%d, BSPC=%d\n", kanal[i], si.acc_type.bscap, si.acc_type.bspc);
 		/* Authentication stays OFF: init_sysinfo sets word1.auth=0 and there is
 		 * no switch to enable it (no CAVE engine). Mobiles are told auth is not
 		 * supported; any auth word they send is decode-logged in amps.c. */
