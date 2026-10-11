@@ -67,31 +67,39 @@ static int sms_deliver_fd = -1;
  *   indicators: space-separated text (sms voice fax email data) or numeric 0-31
  *
  * Examples:
- *   echo "3735859,set,sms" > /tmp/nmt_mwi
- *   echo "3735859,set,sms voice" > /tmp/nmt_mwi
- *   echo "3735859,set,3" > /tmp/nmt_mwi
+ *   echo "3735859,set,sms" > /tmp/nmt_cmd
+ *   echo "3735859,set,sms voice" > /tmp/nmt_cmd
+ *   echo "3735859,set,3" > /tmp/nmt_cmd
  *
  * Clearing sequence (5c x2 then L(15) x4) is sent per NMT spec 4.4.1.16.
  */
-#define MWI_DELIVER "/tmp/nmt_mwi"
-static int mwi_deliver_fd = -1;
-
-/* MOVE (SCIP) control FIFO — move an active call to another voice channel.
- * See docs/NMT_SCIP.md.
- *   Format: <subscriber>[,<channel>]   (channel omitted = auto-select a free TC)
- *   Examples:
- *     echo "3735859"   > /tmp/nmt_move    (move to any free TC)
- *     echo "3735859,5" > /tmp/nmt_move    (move to channel 5)
+/* UNIFIED COMMAND FIFO — operator control of mid-call and subscriber features.
+ * One command per line. Commands:
+ *
+ *   mwi <subscriber>,set,<indicators>
+ *       Set message-waiting indicators on the MS (NMT Doc 450-1 §4.3.3.11).
+ *       indicators: space-separated text (sms voice fax email data) or numeric 0-31
+ *       Examples:
+ *         echo "mwi 3735859,set,sms"       > /tmp/nmt_cmd
+ *         echo "mwi 3735859,set,sms voice" > /tmp/nmt_cmd
+ *         echo "mwi 3735859,set,3"         > /tmp/nmt_cmd   (bits 0+1 = SMS + voice)
+ *
+ *   move <subscriber>[,<channel>]
+ *       Move an active call to another traffic channel via SCIP (NMT Doc 450-1
+ *       §4.4.1.4). Channel omitted = auto-select a free TC.
+ *       Examples:
+ *         echo "move 3735859"   > /tmp/nmt_cmd   (move to any free TC)
+ *         echo "move 3735859,5" > /tmp/nmt_cmd   (move to channel 5)
+ *       See docs/NMT_SCIP.md for full detail.
+ *
+ *   power <subscriber>,<level>
+ *       Change MS output power level during a call (NMT Doc 450-1 §4.4.1.8).
+ *       level: 0..7
+ *       Example:
+ *         echo "power 3735859,2" > /tmp/nmt_cmd
  */
-#define MOVE_DELIVER "/tmp/nmt_move"
-static int move_deliver_fd = -1;
-
-/* POWER CHANGE control FIFO — change MS output power level during a call (4.4.1.8).
- *   Format: <7-digit-subscriber>,<power 0-7>
- *   Example: echo "3735859,2" > /tmp/nmt_power
- */
-#define POWER_DELIVER "/tmp/nmt_power"
-static int power_deliver_fd = -1;
+#define NMT_CMD_FIFO "/tmp/nmt_cmd"
+static int nmt_cmd_fd = -1;
 
 /* settings */
 int nmt_system = 450;
@@ -170,6 +178,19 @@ void print_help(const char *arg0)
 	printf("        Tariff class sent to a coin-box MS at answer (frame 5b, NMT Doc 450-1 4.7.2).\n");
 	printf("        Default -1 = disabled (no charging source; the answer sequence is logged\n");
 	printf("        but no frame 5b is sent). 0..3 enables the frame-5b answer sequence.\n");
+	printf("\nNMT command FIFO: %s\n", NMT_CMD_FIFO);
+	printf("  One command per line. Commands:\n");
+	printf("  mwi <subscriber>,set,<indicators>\n");
+	printf("    Set message-waiting indicators. indicators: 'sms', 'voice', 'fax',\n");
+	printf("    'email', 'data' (space-separated) or numeric 0-31.\n");
+	printf("    Example: echo \"mwi 3735859,set,sms voice\" > %s\n", NMT_CMD_FIFO);
+	printf("  move <subscriber>[,<channel>]\n");
+	printf("    Move active call to another TC via SCIP (see docs/NMT_SCIP.md).\n");
+	printf("    Example: echo \"move 3735859\"   > %s\n", NMT_CMD_FIFO);
+	printf("             echo \"move 3735859,5\" > %s  (specific channel)\n", NMT_CMD_FIFO);
+	printf("  power <subscriber>,<level>\n");
+	printf("    Change MS output power level (0-7) during a call.\n");
+	printf("    Example: echo \"power 3735859,2\" > %s\n", NMT_CMD_FIFO);
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
 }
@@ -318,10 +339,6 @@ static void myhandler(void)
 {
 	static char sms_buffer[256];
 	static int sms_pos = 0;
-	static char mwi_buffer[256];
-	static int mwi_pos = 0;
-	static char move_buffer[256];
-	static int move_pos = 0;
 	int rc, i, space;
 
 	/* Handle SMS deliver FIFO */
@@ -346,78 +363,57 @@ static void myhandler(void)
 		}
 	}
 
-	/* Handle MWI deliver FIFO */
-	if (mwi_deliver_fd >= 0) {
-	space = sizeof(mwi_buffer) - mwi_pos;
-	rc = read(mwi_deliver_fd, mwi_buffer + mwi_pos, space);
-	if (rc > 0) {
-		mwi_pos += rc;
-		if (mwi_pos == space) {
-			fprintf(stderr, "MWI buffer overflow!\n");
-			mwi_pos = 0;
-		}
-		/* check for end of line */
-		for (i = 0; i < mwi_pos; i++) {
-			if (mwi_buffer[i] == '\r' || mwi_buffer[i] == '\n')
-				break;
-		}
-		/* deliver mwi */
-		if (i < mwi_pos) {
-			mwi_buffer[i] = '\0';
-			mwi_pos = 0;
-			deliver_mwi(mwi_buffer);
-		}
-	}
-	}
-
-	/* Handle MOVE (SCIP) deliver FIFO */
-	if (move_deliver_fd < 0)
-		return;
-	space = sizeof(move_buffer) - move_pos;
-	rc = read(move_deliver_fd, move_buffer + move_pos, space);
-	if (rc > 0) {
-		move_pos += rc;
-		if (move_pos == space) {
-			fprintf(stderr, "MOVE buffer overflow!\n");
-			move_pos = 0;
-		}
-		/* check for end of line */
-		for (i = 0; i < move_pos; i++) {
-			if (move_buffer[i] == '\r' || move_buffer[i] == '\n')
-				break;
-		}
-		/* deliver move */
-		if (i < move_pos) {
-			move_buffer[i] = '\0';
-			move_pos = 0;
-			deliver_move(move_buffer);
-		}
-	}
-
-	/* Handle POWER CHANGE deliver FIFO */
-	{
-	static char power_buffer[64];
-	static int power_pos = 0;
-	if (power_deliver_fd >= 0) {
-		space = sizeof(power_buffer) - power_pos;
-		rc = read(power_deliver_fd, power_buffer + power_pos, space);
+	/* Handle unified NMT command FIFO (/tmp/nmt_cmd).
+	 * Commands: "mwi ...", "move ...", "power ..."
+	 * One command per line; arguments follow the command name separated by a space.
+	 * See the NMT_CMD_FIFO definition at the top of this file for full syntax. */
+	if (nmt_cmd_fd >= 0) {
+		static char cmd_buffer[512];
+		static int  cmd_pos = 0;
+		char *cmd, *args;
+		space = sizeof(cmd_buffer) - cmd_pos - 1;
+		rc = read(nmt_cmd_fd, cmd_buffer + cmd_pos, space);
 		if (rc > 0) {
-			power_pos += rc;
-			if (power_pos == space) {
-				fprintf(stderr, "POWER buffer overflow!\n");
-				power_pos = 0;
+			cmd_pos += rc;
+			cmd_buffer[cmd_pos] = '\0';
+			/* process all complete lines */
+			for (;;) {
+				char *nl = NULL;
+				int j;
+				for (j = 0; j < cmd_pos; j++) {
+					if (cmd_buffer[j] == '\r' || cmd_buffer[j] == '\n') {
+						nl = cmd_buffer + j;
+						break;
+					}
+				}
+				if (!nl) break;
+				*nl = '\0';
+				cmd = cmd_buffer;
+				/* split on first space: command + arguments */
+				args = strchr(cmd, ' ');
+				if (args) {
+					*args++ = '\0';
+					while (*args == ' ') args++;
+				} else {
+					args = cmd + strlen(cmd); /* empty args */
+				}
+				if (!strcasecmp(cmd, "mwi"))
+					deliver_mwi(args);
+				else if (!strcasecmp(cmd, "move"))
+					deliver_move(args);
+				else if (!strcasecmp(cmd, "power"))
+					deliver_power_change(args);
+				else
+					fprintf(stderr, "NMT command FIFO: unknown command '%s' (known: mwi, move, power)\n", cmd);
+				/* shift the remaining buffer */
+				cmd_pos -= (int)(nl + 1 - cmd_buffer);
+				memmove(cmd_buffer, nl + 1, cmd_pos);
 			}
-			for (i = 0; i < power_pos; i++) {
-				if (power_buffer[i] == '\r' || power_buffer[i] == '\n')
-					break;
-			}
-			if (i < power_pos) {
-				power_buffer[i] = '\0';
-				power_pos = 0;
-				deliver_power_change(power_buffer);
+			if (cmd_pos >= (int)sizeof(cmd_buffer) - 1) {
+				fprintf(stderr, "NMT command FIFO: line too long, discarding buffer\n");
+				cmd_pos = 0;
 			}
 		}
-	}
 	}
 }
 
@@ -571,51 +567,30 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* create pipe for MWI (Message Waiting Indicator) delivery
-	 * See docs/NMT_MWI.md for command format and usage.
-	 */
-	unlink(MWI_DELIVER);
-	rc = mkfifo(MWI_DELIVER, 0666);
+	/* create unified NMT command FIFO (see NMT_CMD_FIFO definition for command syntax) */
+	unlink(NMT_CMD_FIFO);
+	rc = mkfifo(NMT_CMD_FIFO, 0666);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to create MWI deliver FIFO '%s'!\n", MWI_DELIVER);
+		fprintf(stderr, "Failed to create NMT command FIFO '%s'!\n", NMT_CMD_FIFO);
 		goto fail;
 	} else {
-		mwi_deliver_fd = open(MWI_DELIVER, O_RDONLY | O_NONBLOCK);
-		if (mwi_deliver_fd < 0) {
-			fprintf(stderr, "Failed to open MWI deliver FIFO! '%s'\n", MWI_DELIVER);
+		nmt_cmd_fd = open(NMT_CMD_FIFO, O_RDONLY | O_NONBLOCK);
+		if (nmt_cmd_fd < 0) {
+			fprintf(stderr, "Failed to open NMT command FIFO '%s'!\n", NMT_CMD_FIFO);
 			goto fail;
 		}
 	}
 
-	/* create pipe for MOVE (SCIP) control — move an active call to another voice channel.
-	 * See docs/NMT_SCIP.md for command format and usage.
-	 */
-	unlink(MOVE_DELIVER);
-	rc = mkfifo(MOVE_DELIVER, 0666);
+	/* create unified NMT command FIFO (see NMT_CMD_FIFO for command syntax) */
+	unlink(NMT_CMD_FIFO);
+	rc = mkfifo(NMT_CMD_FIFO, 0666);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to create MOVE deliver FIFO '%s'!\n", MOVE_DELIVER);
+		fprintf(stderr, "Failed to create NMT command FIFO '%s'!\n", NMT_CMD_FIFO);
 		goto fail;
 	} else {
-		move_deliver_fd = open(MOVE_DELIVER, O_RDONLY | O_NONBLOCK);
-		if (move_deliver_fd < 0) {
-			fprintf(stderr, "Failed to open MOVE deliver FIFO! '%s'\n", MOVE_DELIVER);
-			goto fail;
-		}
-	}
-
-	/* create pipe for POWER CHANGE control — change MS output power during a call.
-	 * Format: <7-digit-subscriber>,<power 0-7>
-	 * Example: echo "3735859,2" > /tmp/nmt_power
-	 */
-	unlink(POWER_DELIVER);
-	rc = mkfifo(POWER_DELIVER, 0666);
-	if (rc < 0) {
-		fprintf(stderr, "Failed to create POWER deliver FIFO '%s'!\n", POWER_DELIVER);
-		goto fail;
-	} else {
-		power_deliver_fd = open(POWER_DELIVER, O_RDONLY | O_NONBLOCK);
-		if (power_deliver_fd < 0) {
-			fprintf(stderr, "Failed to open POWER deliver FIFO! '%s'\n", POWER_DELIVER);
+		nmt_cmd_fd = open(NMT_CMD_FIFO, O_RDONLY | O_NONBLOCK);
+		if (nmt_cmd_fd < 0) {
+			fprintf(stderr, "Failed to open NMT command FIFO '%s'!\n", NMT_CMD_FIFO);
 			goto fail;
 		}
 	}
@@ -654,12 +629,9 @@ fail:
 	if (sms_deliver_fd > 0)
 		close(sms_deliver_fd);
 	unlink(SMS_DELIVER);
-	if (mwi_deliver_fd > 0)
-		close(mwi_deliver_fd);
-	unlink(MWI_DELIVER);
-	if (move_deliver_fd > 0)
-		close(move_deliver_fd);
-	unlink(MOVE_DELIVER);
+	if (nmt_cmd_fd > 0)
+		close(nmt_cmd_fd);
+	unlink(NMT_CMD_FIFO);
 
 	/* destroy transceiver instance */
 	while (sender_head)

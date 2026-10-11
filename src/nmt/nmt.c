@@ -137,6 +137,22 @@ static void nmt_display_status(void)
 	display_status_end();
 }
 
+static const char *nmt_active_state_name(enum nmt_active_state state)
+{
+	switch (state) {
+	case ACTIVE_STATE_VOICE:		return "voice";
+	case ACTIVE_STATE_MFT_IN:		return "MFT-in (ack)";
+	case ACTIVE_STATE_MFT:			return "MFT (digit receive)";
+	case ACTIVE_STATE_MFT_OUT:		return "MFT-out (ack)";
+	case ACTIVE_STATE_MWI:			return "MWI (sending 5c)";
+	case ACTIVE_STATE_MWI_CLEAR:		return "MWI-clear (5c+L15)";
+	case ACTIVE_STATE_REGISTER_RECALL:	return "register-recall";
+	case ACTIVE_STATE_COINBOX_ANSWER:	return "coin-box answer (5b)";
+	case ACTIVE_STATE_POWER_CHANGE:		return "power-change (3a)";
+	}
+	return "unknown";
+}
+
 static void nmt_new_state(nmt_t *nmt, enum nmt_state new_state)
 {
 	if (nmt->state == new_state)
@@ -2168,7 +2184,7 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			 * the MFT-converter-in handshake (L(8) request -> L(4) ack, 4.4.1.9).
 			 * Per spec it is only valid in MFT state; log the dropped keypress so
 			 * it is visible rather than silently lost. */
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14a: received outside MFT converter state (active_state=%d) -- MFT-in handshake L(8)/L(4) not completed, keypress ignored.\n", nmt->active_state);
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14a: received outside MFT converter state (%s); MFT-in handshake (L(8)->L(4)) not completed, keypress ignored.\n", nmt_active_state_name(nmt->active_state));
 			break;
 		}
 		if ((nmt->mft_num & 1)) {
@@ -2198,7 +2214,7 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			break;
 		if (nmt->active_state != ACTIVE_STATE_MFT) {
 			/* Keypress digit (frame 14b) outside MFT state: see 14a above. */
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14b: received outside MFT converter state (active_state=%d) -- MFT-in handshake L(8)/L(4) not completed, keypress ignored.\n", nmt->active_state);
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14b: received outside MFT converter state (%s); MFT-in handshake (L(8)->L(4)) not completed, keypress ignored.\n", nmt_active_state_name(nmt->active_state));
 			break;
 		}
 		if (!(nmt->mft_num & 1)) {
@@ -3433,7 +3449,7 @@ void deliver_power_change(const char *command)
 	}
 	nmt = trans->nmt;
 	if (nmt->active_state != ACTIVE_STATE_VOICE) {
-		LOGP(DNMT, LOGL_NOTICE, "Power change: subscriber '%s' not in voice state (active_state=%d).\n", number, nmt->active_state);
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Power change: subscriber '%s' is not in voice state (currently '%s'), cannot issue power change.\n", number, nmt_active_state_name(nmt->active_state));
 		return;
 	}
 	LOGP_CHAN(DNMT, LOGL_NOTICE, "Power change ordered: subscriber '%s', new power level %d (current %d).\n",
