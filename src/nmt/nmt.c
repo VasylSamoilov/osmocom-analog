@@ -303,7 +303,7 @@ static inline int is_chan_class_tc(enum nmt_chan_type chan_type)
 static void nmt_timeout(void *data);
 
 /* Create transceiver instance and link to a list. */
-int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int loopback)
+int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int coinbox_tariff, int loopback)
 {
 	nmt_t *nmt;
 	int rc;
@@ -368,8 +368,9 @@ int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_
 	nmt->bs_group = (bs_group >= 0 && bs_group <= 8) ? bs_group : 8;
 	nmt->sis_demo = sis_demo ? 1 : 0;
 	/* coin-box tariff class: no charging/PSTN source in this emulator, so it
-	 * is disabled by default (-1); an operator may wire a value in later. */
-	nmt->coinbox_tariff = -1;
+	 * is disabled by default (-1); an operator may set 0..3 to exercise the
+	 * frame-5b answer sequence. Any out-of-range value disables it. */
+	nmt->coinbox_tariff = (coinbox_tariff >= 0 && coinbox_tariff <= 3) ? coinbox_tariff : -1;
 	strncpy(nmt->smsc_number, smsc_number, sizeof(nmt->smsc_number) - 1);
 
 	/* init audio processing */
