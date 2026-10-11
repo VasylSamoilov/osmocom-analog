@@ -343,9 +343,11 @@ genuine deviations, worst-interesting first:
     marker with hardcoded H7=8/H3=0 ("no saving"); now H3 (period) and H7 (group) are
     configurable via `-b/--battery-saving <0..9>`, default 0 = disabled = byte-identical to
     the previous behaviour. When enabled, phones in the addressed group may sleep for the H3
-    period. Honest limitation documented at `nmt_page`: frame-exact deferral of a page to a
-    sleeping group's wake window is NOT implemented, so a long period can outlast the 3×
-    paging retries — documented, not silently shipped.
+    period. Page deferral is now implemented (branch `fix/nmt-bs-page-deferral`):
+    `nmt_page` holds the first attempt for one H3 period when the paged subscriber's last
+    digit X6 falls in the addressed H7 group (§4.3.3.12.3 table), guaranteeing the phone has
+    woken before we page; `timeout_mt_paging` then performs the real page. Group-aware
+    (subscribers outside the addressed group page immediately) and inert when disabled.
 
 **SIS authentication DEMONSTRATOR** (same branch, `-E/--sis-demo 1`): optional, off by
 default. When enabled, `tx_ident` originates frame 7 (RAND) and the received frame 16 (SRES)
