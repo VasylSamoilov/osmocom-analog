@@ -330,15 +330,27 @@ genuine deviations, worst-interesting first:
     already uses those (distinguishable, interoperable), and the comment now explains why
     rather than just calling the doc "wrong". No code value change. §8.
 
-### Decode fidelity (dormant / cosmetic)
-11. **Frame 11b format string carries an extra `Y`** — mis-decodes one idle nibble
-    as traffic-area (11b never originated; low impact). §4-fields.
-12. **Frame 16 SRES** decoded as flat 12-digit value, not R1R2R3R4×3 with cross-copy
-    vote (dormant while auth is logging-only).
-13. **Battery-saving frames** (H7 group / H3 period / Y3 operator-id / H8-10 RTC)
-    collapse to frame 1a — neither decoded nor logged.
-14. **Frame 25 cause value / BS alarm levels** logged as raw hex, not expanded.
-15. **RP-ACK/ERROR MO/MT macro names swapped** vs spec convention (wire correct).
+### Decode fidelity (addressed)
+11. **Frame 11b format string** — **FIXED** (branch `fix/nmt-decode-fidelity`): corrected
+    from `NNNPZXXXXXXTYJJJ` to `NNNPZXXXXXXTJJJJ` — the shortened 11b carries T + 4 idle J
+    (spec p.29), not T+Y+3J. Verified 11b's handler reads only priority, never the mis-split
+    nibble, so the fix is safe.
+12. **Frame 16 SRES** — **FIXED** (same branch): now recovers the 16-bit SRES by majority
+    across the three R1R2R3R4 copies and logs a mismatch, instead of a flat 48-bit value
+    (dormant while auth is logging-only, but now correct).
+13. **Battery-saving frames** — **DOCUMENTED** (same branch): Z=14 maps to 1a with a comment
+    explaining the single-node MTX never originates battery-saving (no scheduler), so there
+    is no H3/H7 behaviour to decode-and-act-on. Not a live path.
+14. **Frame 25 cause value / BS alarm levels** — logged complete in raw hex (A/super/limit/c);
+    this is a BS→MTX OBSERVE frame we never receive, and the §4.3.3.14 cause-name table was
+    not PNG-confirmed, so no fabricated name expansion. Left as the adequate raw-hex observe.
+15. **RP-ACK/ERROR MO/MT macro names** — **FIXED** (same branch): renamed to the GSM 04.11
+    convention (MO = MS→SC, MT = SC→MS) and flipped every usage site so the wire bytes are
+    unchanged (test_sms's exact-PDU check still passes). Names no longer mislead.
+
+Also: line-signal logging — a `nmt_linesignal_name()` helper now names every L(n) by
+direction, and both the TX (`set_line_signal`) and the RX accept paths log the signal by
+name, so every line-signal scenario is self-describing (branch `fix/nmt-linesignal-logging`).
 
 ### UNCONFIRMED (honest limitations of this audit)
 - Battery-saving H3 period table read from native text only, not PNG.
