@@ -222,6 +222,27 @@ is the phone's, not ours.
 ### 7.8 MFT / MWI — IMPL
 MFT-in L(4), MFT-out L(10); MWI 5c×2 then L(15)×4 per §4.4.1.16. All **IMPL**.
 
+**MFT in-call keypress path audited against §4.4.1.9 "Push button data transmission
+from MS" (p.70-71):**
+- Handshake signals correct: MFT-in request L(8) → ack **L(4)**; MFT-out request
+  L(7) → ack **L(10)**. Digit frames 14a (odd) / 14b (even) alternate on `mft_num`
+  parity; each decoded digit is validated (position marker 0x00/0xff + triple
+  repetition) before being emitted as a 100 ms DTMF tone into the speech path.
+- **Dropped-keypress visibility (fixed):** 14a/14b frames arriving outside
+  `ACTIVE_STATE_MFT` (keypress before the L(8)/L(4) handshake completes), or with
+  the wrong odd/even parity (lost/duplicated frame), were silently dropped. Now
+  each is logged (NOTICE) so a lost keypress is visible.
+- **Gap — ø-signal alarm suppression (documented, not a live bug):** the spec has
+  the MTX order the BS to suppress the ø-signal (supervision) alarm (frame 20
+  A=4/A=7, states 4-5) for the MFT period and cancel it on exit (state 11),
+  because DTMF in the speech path disturbs supervision. This single-node emulator
+  has no BS alarm back-end, so that order is not sent; exit approximates it with
+  `super_reset()`. Commented at the MFT-in/out handlers.
+- **Gap — ack count:** acks are sent 5× (frames 1-5) where the spec diagram shows
+  4×; harmless (MS accepts on majority), noted. MFT-out "within T'" timing is not
+  enforced. MTX never originates MFT forced-release (states 13-14) — we don't
+  originate, so acceptable.
+
 ---
 
 ## 8. SMS / DMS data services (annex24-sms-1998, 39 pp) vs `sms.c`/`dms.c`

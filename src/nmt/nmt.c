@@ -2012,10 +2012,20 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			break;
 		if (!match_area(nmt, frame))
 			break;
-		if (nmt->active_state != ACTIVE_STATE_MFT)
+		if (nmt->active_state != ACTIVE_STATE_MFT) {
+			/* A keypress digit (frame 14a) arrived without, or before completing,
+			 * the MFT-converter-in handshake (L(8) request -> L(4) ack, 4.4.1.9).
+			 * Per spec it is only valid in MFT state; log the dropped keypress so
+			 * it is visible rather than silently lost. */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14a: received outside MFT converter state (active_state=%d) -- MFT-in handshake L(8)/L(4) not completed, keypress ignored.\n", nmt->active_state);
 			break;
-		if ((nmt->mft_num & 1))
+		}
+		if ((nmt->mft_num & 1)) {
+			/* 14a carries ODD-position digits; receiving one when an even digit was
+			 * expected is a sequence error (lost/duplicated frame). Log it. */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14a (odd): out of sequence, expected an even digit (mft_num=%d).\n", nmt->mft_num);
 			break;
+		}
 		if ((frame->digit >> 12) != 0x00) {
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Position information of digit does not match, ignoring due to corrupt frame.\n");
 			break;
@@ -2035,10 +2045,17 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			break;
 		if (!match_area(nmt, frame))
 			break;
-		if (nmt->active_state != ACTIVE_STATE_MFT)
+		if (nmt->active_state != ACTIVE_STATE_MFT) {
+			/* Keypress digit (frame 14b) outside MFT state: see 14a above. */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14b: received outside MFT converter state (active_state=%d) -- MFT-in handshake L(8)/L(4) not completed, keypress ignored.\n", nmt->active_state);
 			break;
-		if (!(nmt->mft_num & 1))
+		}
+		if (!(nmt->mft_num & 1)) {
+			/* 14b carries EVEN-position digits; receiving one when an odd digit was
+			 * expected is a sequence error (lost/duplicated frame). */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14b (even): out of sequence, expected an odd digit (mft_num=%d).\n", nmt->mft_num);
 			break;
+		}
 		if ((frame->digit >> 12) != 0xff) {
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Position information of digit does not match, ignoring due to corrupt frame.\n");
 			break;
@@ -2078,6 +2095,15 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 		}
 		break;
 	case ACTIVE_STATE_MFT_IN:
+		/* MFT converter in: acknowledge the MS request with L(4) (NMT Doc 450-1
+		 * 4.4.1.9 state 6), then switch the speech path to DTMF generation.
+		 * Conformance notes: (1) the spec shows the ack sent 4 times; we send it
+		 * for frames 1..5 (one extra), harmless to the MS which accepts on
+		 * majority. (2) The spec also has the MTX suppress the BS ø-signal alarm
+		 * (frame 20 A=4/A=7 to BS, states 4-5) for the MFT period, since DTMF in
+		 * the speech path disturbs supervision, and cancel it on exit (state 11).
+		 * This single-node emulator has no BS alarm back-end, so that order is not
+		 * sent; supervision handling is approximated by super_reset() on exit. */
 		set_line_signal(nmt, frame, 4);
 		if (++nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'MFT in acknowledge'.\n");
@@ -2087,6 +2113,9 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 		}
 		break;
 	case ACTIVE_STATE_MFT_OUT:
+		/* MFT converter out: acknowledge with L(10) (NMT Doc 450-1 4.4.1.9 state
+		 * 10, "within T'"), then return to the voice path and resume supervision.
+		 * (Same ack-count note as MFT_IN; T' timing is not enforced here.) */
 		set_line_signal(nmt, frame, 10);
 		if (++nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'MFT out acknowledge'.\n");
