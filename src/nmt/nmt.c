@@ -24,6 +24,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <time.h>
 #include "../libsample/sample.h"
@@ -1462,7 +1463,7 @@ static void tx_mt_complete(nmt_t *nmt, frame_t *frame)
 			nmt->active_state = ACTIVE_STATE_VOICE;
 			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
 			time_t ti = time(NULL);
-			sms_deliver(nmt, sms_ref, trans->caller_id, trans->caller_type, SMS_PLAN_ISDN_TEL, ti, 1, trans->sms_string);
+			sms_deliver(nmt, sms_ref, trans->caller_id, trans->caller_type, SMS_PLAN_ISDN_TEL, ti, 1, trans->sms_string, trans->sms_len);
 		} else {
 			/* Normal call: switch to audio mode */
 			LOGP_CHAN(DNMT, LOGL_INFO, "Connect audio.\n");
@@ -2253,7 +2254,7 @@ const char *nmt_get_frame(nmt_t *nmt)
  */
 
 /* Call control starts call towards mobile station. */
-static int _out_setup(int callref, const char *caller_id, enum number_type caller_type, const char *dialing, const char *sms)
+static int _out_setup(int callref, const char *caller_id, enum number_type caller_type, const char *dialing, const char *sms, int sms_len)
 {
 	sender_t *sender;
 	nmt_t *nmt;
@@ -2302,7 +2303,10 @@ static int _out_setup(int callref, const char *caller_id, enum number_type calle
 	}
 	trans->callref = callref;
 	if (sms) {
-		strncpy(trans->sms_string, sms, sizeof(trans->sms_string) - 1);
+		if (sms_len > (int)sizeof(trans->sms_string))
+			sms_len = sizeof(trans->sms_string);
+		memcpy(trans->sms_string, sms, sms_len);
+		trans->sms_len = sms_len;
 	}
 	if (caller_type == TYPE_INTERNATIONAL) {
 		trans->caller_id[0] = '+'; /* not done by phone */
@@ -2316,11 +2320,11 @@ static int _out_setup(int callref, const char *caller_id, enum number_type calle
 }
 int call_down_setup(int callref, const char *caller_id, enum number_type caller_type, const char *dialing)
 {
-	return _out_setup(callref, caller_id, caller_type, dialing, NULL);
+	return _out_setup(callref, caller_id, caller_type, dialing, NULL, 0);
 }
-static int sms_out_setup(char *dialing, const char *caller_id, enum number_type caller_type, const char *sms)
+static int sms_out_setup(char *dialing, const char *caller_id, enum number_type caller_type, const char *sms, int sms_len)
 {
-	return _out_setup(0, caller_id, caller_type, dialing, sms);
+	return _out_setup(0, caller_id, caller_type, dialing, sms, sms_len);
 }
 
 void call_down_answer(int __attribute__((unused)) callref, struct timeval __attribute__((unused)) *tv_meter)
@@ -2435,20 +2439,34 @@ void sms_release(nmt_t *nmt)
  *   dest       = Destination address
  *   message    = SMS text
  */
-int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message)
+int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message, int msg_len)
 {
-	char sms[512];
+	char sms[1024];
 	char subscriber[8];
+	char text[768];
+	int i, p = 0;
 
 	/* Get mobile station's subscriber number (country + number) */
 	snprintf(subscriber, sizeof(subscriber), "%c%s",
 		nmt->trans->subscriber.country, nmt->trans->subscriber.number);
 
+	/* Render the message for the text FIFO: printable ASCII verbatim, every
+	 * other byte (incl. 0x00 and the 8-bit NMT national letters) as <0xNN>,
+	 * so no information is lost and the operator sees exactly what arrived. */
+	for (i = 0; i < msg_len && p < (int)sizeof(text) - 7; i++) {
+		uint8_t c = (uint8_t)message[i];
+		if (c >= 0x20 && c < 0x7f && c != '<')
+			text[p++] = (char)c;
+		else
+			p += snprintf(text + p, sizeof(text) - p, "<0x%02x>", c);
+	}
+	text[p] = '\0';
+
 	LOGP_CHAN(DNMT, LOGL_NOTICE, "Received SMS from subscriber '%s' (rp_orig='%s') to '%s' (ref=%d): %s\n",
-		subscriber, orig_address, dest_address, ref, message);
+		subscriber, orig_address, dest_address, ref, text);
 
 	/* Format: subscriber,rp_orig,dest,message */
-	snprintf(sms, sizeof(sms) - 1, "%s,%s,%s,%s", subscriber, orig_address, dest_address, message);
+	snprintf(sms, sizeof(sms) - 1, "%s,%s,%s,%s", subscriber, orig_address, dest_address, text);
 	sms[sizeof(sms) - 1] = '\0';
 
 	return submit_sms(sms);
@@ -2513,7 +2531,25 @@ inval:
 	LOGP(DNMT, LOGL_INFO, "SMS from '%s' for subscriber '%s' with message '%s'\n", caller_id, number, message);
 	printf("SMS sending '%s' -> '%s': %s\n", caller_id, number, message);
 
-	rc = sms_out_setup(number, caller_id, caller_type, message);
+	/* Decode <0xNN> escapes so the operator can inject any byte, including
+	 * non-printable ones and 0x00, through the text FIFO. Everything else is
+	 * copied verbatim. The result is a byte buffer with an explicit length. */
+	char msg_bytes[256];
+	int msg_len = 0;
+	{
+		const char *s = message;
+		while (*s && msg_len < (int)sizeof(msg_bytes)) {
+			if (s[0] == '<' && (s[1] == '0') && (s[2] == 'x' || s[2] == 'X')
+			 && isxdigit((unsigned char)s[3]) && isxdigit((unsigned char)s[4]) && s[5] == '>') {
+				msg_bytes[msg_len++] = (uint8_t)strtol(s + 1, NULL, 16);
+				s += 6;
+			} else {
+				msg_bytes[msg_len++] = *s++;
+			}
+		}
+	}
+
+	rc = sms_out_setup(number, caller_id, caller_type, msg_bytes, msg_len);
 	if (rc < 0) {
 		LOGP(DNMT, LOGL_INFO, "SMS delivery failed with cause '%d'\n", -rc);
 		return;

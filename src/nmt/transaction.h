@@ -24,7 +24,8 @@ typedef struct transaction {
 
 	/* DMS/SMS */
 	int			dms_call;		/* indicates to use DMS (used for SMS) */
-	char			sms_string[256];	/* current string to deliver */
+	char			sms_string[256];	/* current message to deliver (may contain any byte, see sms_len) */
+	int			sms_len;		/* length of sms_string in bytes (so an embedded 0x00 is kept) */
 
 	/* MWI (Message Waiting Indicator)
 	 * See docs/NMT_MWI.md for details on MWI implementation.

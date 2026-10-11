@@ -254,17 +254,19 @@ static int encode_time(uint8_t *data, time_t timestamp, int local)
 }
 
 /* encode user data */
-static int encode_userdata(uint8_t *data, const char *message)
+/* encode user data (GSM 7-bit packed). 'msg_len' bytes are encoded (not a
+ * C-string scan), so a message byte 0x00 is a normal character, not a stop. */
+static int encode_userdata(uint8_t *data, const char *message, int msg_len)
 {
 	int length = 1;
 	uint8_t character;
 	int i, j, pos;
 
-	LOGP(DSMS, LOGL_DEBUG, "Encode user data '%s'\n", message);
+	LOGP(DSMS, LOGL_DEBUG, "Encode user data (%d characters)\n", msg_len);
 
 	j = 0;
 	pos = 0;
-	for (i = 0; message[i]; i++) {
+	for (i = 0; i < msg_len; i++) {
 		if ((int8_t)message[i] >= 0) {
 			character = message[i]; /* 0..0x7f: representable in GSM 7-bit */
 		} else {
@@ -307,8 +309,7 @@ static int encode_userdata(uint8_t *data, const char *message)
 /* Encode user data as NMT 8-bit characters: one character per octet
  * (Annex 24 para 2.2.3.13 / para 4.3, TP-DCS coding group 0011).  Unlike the
  * 7-bit path this stores each byte verbatim, so national letters (0x80..0xff)
- * survive.  'msg_len' is the octet/character count (the message is a C string,
- * so an embedded NUL cannot be represented -- see sms_deliver). */
+ * and the 0x00 code point survive.  'msg_len' is the character/octet count. */
 static int encode_userdata_8(uint8_t *data, const char *message, int msg_len)
 {
 	data[0] = msg_len;			/* TP-UDL = number of 8-bit characters */
@@ -317,19 +318,19 @@ static int encode_userdata_8(uint8_t *data, const char *message, int msg_len)
 }
 
 /* deliver SMS (SC->MS) */
-int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_type, uint8_t orig_plan, time_t timestamp, int local, const char *message)
+int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_type, uint8_t orig_plan, time_t timestamp, int local, const char *message, int msg_len)
 {
 	uint8_t data[256], *tpdu_length;
 	int length = 0;
 	int orig_len;
-	int msg_len;
 	int i, need_8bit;
 	uint8_t dcs;
 
 	LOGP(DSMS, LOGL_INFO, "Delivering SMS from upper layer\n");
 
 	orig_len = strlen(orig_address);
-	msg_len = strlen(message);
+	/* msg_len is supplied by the caller (not strlen) so a message byte 0x00 --
+	 * the GSM/NMT '@' code point -- is carried, not cut as a C-string NUL. */
 
 	if (orig_len > 24) {
 		LOGP(DSMS, LOGL_NOTICE, "Originator Address too long (%d characters)\n", orig_len);
@@ -383,7 +384,7 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 		LOGP(DSMS, LOGL_INFO, "Message contains 8-bit characters, using NMT 8-bit alphabet (DCS 0x%02x)\n", dcs);
 		length += encode_userdata_8(data + length, message, msg_len);
 	} else {
-		length += encode_userdata(data + length, message);
+		length += encode_userdata(data + length, message, msg_len);
 	}
 
 	/* RP length */
@@ -665,7 +666,7 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 
 	LOGP(DSMS, LOGL_INFO, "Submitting SMS to upper layer\n");
 
-	rc = sms_submit(nmt, ref, orig_address, orig_type, orig_plan, msg_ref, dest_address, dest_type, dest_plan, message);
+	rc = sms_submit(nmt, ref, orig_address, orig_type, orig_plan, msg_ref, dest_address, dest_type, dest_plan, message, msg_chars);
 	if (rc < 0)
 		return -FSC_SC_SYSTEM_FAILURE;
 
