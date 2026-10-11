@@ -202,10 +202,15 @@ re-identifies with **10b on the new TC without a separate 3b request** — exact
 `STATE_SCIP_IDENT` does. **FIXED** (branch `fix/nmt-scip-3c`): the order frame is now
 **3c** (prefix 9), matching that flow, with the channel-number field set to the new TC
 per the §4.7.2.4b rule N₁'N₂'N₃' = NₐNᵦN_c. (Was frame 3a / Scheme C, which requires a
-*separate* 3b identity request the code never sent — a frame/flow mismatch.) Two **real
-gaps** remain: **(a)** no identity re-request + bounded retry if 10b is late; **(b)**
-failure **releases the call** instead of reverting to the old TC. (`nmt.c:1578, 1628,
-~1655`.) Operator-triggered, not signal-strength automatic.
+*separate* 3b identity request the code never sent — a frame/flow mismatch.) Three **real
+gaps** remain in the usage logic: **(a)** the target TC is **not armed before the order** —
+C2' steps 4-5 start the ø-signal (supervisory) on the *new* channel first, so the MS hears
+supervision on arrival; the code leaves the target in `STATE_IDLE` (free-marked, frame 4)
+until the MS's 10b flips it active, so the retuning MS briefly finds a free channel rather
+than a supervised call channel (this is the AMPS "prepare-target-first" discipline, done in
+AMPS handoff but missing here); **(b)** no identity re-request + bounded retry if 10b is
+late; **(c)** failure **releases the call** instead of reverting to the old TC. (`nmt.c:1578,
+scip_find_target, timeout_scip_ident`.) Operator-triggered, not signal-strength automatic.
 
 ### 7.8 MFT / MWI — IMPL
 MFT-in L(4), MFT-out L(10); MWI 5c×2 then L(15)×4 per §4.4.1.16. All **IMPL**.
