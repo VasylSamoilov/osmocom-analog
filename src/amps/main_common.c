@@ -67,7 +67,7 @@
  * EXTENDED FEATURES:
  *   flash,<number>,<msg>[,pi,si]  In-call Caller ID (Order 18)
  *   pci,<number>                  Query Protocol Capability
- *   audit,<number>                Audit mobile (Order 2)
+ *   audit,<number>                Audit mobile (Order 7)
  *   handoff,<number>[,channel]    Transfer to different VC
  *   rescan,<number>               Auto-calculated Directed Retry
  *   silentpage,<number>           Page + Maintenance (no ring)
