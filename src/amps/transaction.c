@@ -84,6 +84,10 @@ static const char *trans_state_name(int state)
 		return "AUDIT";
 	case TRANS_CALL_AUDIT_SEND:
 		return "AUDIT SEND";
+	case TRANS_CALL_PARAM_UPDATE:
+		return "PARAM UPDATE";
+	case TRANS_CALL_PARAM_UPDATE_SEND:
+		return "PARAM UPDATE SEND";
 	case TRANS_AUDIT:
 		return "FOCC AUDIT";
 	case TRANS_AUDIT_SEND:
@@ -264,6 +268,9 @@ const char *trans_short_state_name(int state)
 	case TRANS_CALL_DISABLE_DTMF:
 	case TRANS_CALL_DISABLE_DTMF_SEND:
 		return "DTMF";
+	case TRANS_CALL_PARAM_UPDATE:
+	case TRANS_CALL_PARAM_UPDATE_SEND:
+		return "PARAMUPD";
 	case TRANS_CALL_HANDOFF:
 	case TRANS_CALL_HANDOFF_SEND:
 	case TRANS_CALL_HANDOFF_CONFIRM:

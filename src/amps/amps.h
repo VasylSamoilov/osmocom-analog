@@ -275,6 +275,7 @@ int amps_alert_with_cri(const char *number, const char *cri_data);
 int amps_alert_with_tci(const char *number, const char *tci_data);
 int amps_pci_query(const char *number);
 int amps_audit_order(const char *number);
+int amps_param_update(const char *number);
 int amps_alert_order(const char *number);
 int amps_abbreviated_alert(const char *number);
 int amps_release_order(const char *number);

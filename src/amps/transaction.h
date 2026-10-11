@@ -27,6 +27,8 @@ enum amps_trans_state {
 	TRANS_CALL_PCI_QUERY_SEND,	/* PCI query on FVC, sending */
 	TRANS_CALL_AUDIT,		/* Audit order on FVC, waiting to send */
 	TRANS_CALL_AUDIT_SEND,		/* Audit order, sending */
+	TRANS_CALL_PARAM_UPDATE,	/* Parameter Update order (Order 15, ORDQ=0) on FVC, waiting to send */
+	TRANS_CALL_PARAM_UPDATE_SEND,	/* Parameter Update order on FVC, sending */
 	TRANS_CALL_RELEASE,		/* release call towards phone, waiting to send */
 	TRANS_CALL_RELEASE_SEND,	/* release call towards phone, sending release */
 	TRANS_CALL_REORDER,		/* sending Reorder order (Order 4), waiting to send */

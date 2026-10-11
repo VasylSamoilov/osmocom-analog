@@ -2401,6 +2401,7 @@ struct amps_table4_def {
 	{ "01100", "000", "00010", "Directed Retry to Primary Dedicated Control Channels - analog channels only, Authentication enabled, not last try" },
 	{ "01100", "001", "00000", "Directed Retry - last try" },
 	{ "01100", "001", "00001", "Directed Retry to Primary Dedicated Control Channels - analog channels only, Authentication disabled, last try" },
+	{ "01111", "000", "00000", "Parameter Update Order/Confirmation" },
 	{ "01111", "001", "00000", "Serial Number Request / Response" },
 	{ "01100", "001", "00010", "Directed Retry to Primary Dedicated Control Channels - analog channels only, Authentication enabled, last try" },
 	/* Non-autonomous Registration (ORDER=13, ORDQ=0/1) - mobile responds to registration order from base */
@@ -3900,6 +3901,14 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: %s (Order=5 ORDQ=%d MSG_TYPE=%d)\n",
 				amps_table4_name((int)frame->ie[AMPS_IE_LOCAL_MSG_TYPE], (int)frame->ie[AMPS_IE_ORDQ], 5),
 				(int)frame->ie[AMPS_IE_ORDQ], (int)frame->ie[AMPS_IE_LOCAL_MSG_TYPE]);
+		} else if (frame->ie[AMPS_IE_ORDER] == 15 && frame->ie[AMPS_IE_ORDQ] == 0) {
+			/* Order 15 (01111) with ORDQ=0 = Parameter Update Confirmation
+			 * (TIA/EIA-553-A Table 3.7.1-1). The mobile increments its
+			 * Call History Parameter COUNTs-p (2.3.12.1.3) and confirms.
+			 * COUNTs-p is an authentication parameter; this base does not
+			 * perform authentication, so the confirmation is decode-logged
+			 * only -- no stored per-subscriber count is tracked or compared. */
+			LOGP_CHAN(DFRAME, LOGL_INFO, "Received RVC Order Confirmation: Parameter Update (Order=15 ORDQ=0) -- COUNTs-p incremented at mobile, not tracked by this base\n");
 		} else if (frame->ie[AMPS_IE_ORDER] == 15 && frame->ie[AMPS_IE_ORDQ] == 1) {
 			/* Order 15 with ORDQ=1 = Serial Number Response (Word 1)
 			 * Per TIA/EIA-553-A Table 3.7.1-1:

@@ -1086,6 +1086,8 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 	 && trans->state != TRANS_CALL_PCI_QUERY_SEND
 	 && trans->state != TRANS_CALL_AUDIT
 	 && trans->state != TRANS_CALL_AUDIT_SEND
+	 && trans->state != TRANS_CALL_PARAM_UPDATE
+	 && trans->state != TRANS_CALL_PARAM_UPDATE_SEND
 	 && trans->state != TRANS_CALL_MWI
 	 && trans->state != TRANS_CALL_MWI_SEND
 	 && trans->state != TRANS_CALL_DIGITS_REQUEST
@@ -3445,6 +3447,56 @@ int amps_audit_order(const char *number)
 }
 
 /*
+ * Send Parameter Update Order (Order 15, ORDQ=0) to subscriber on the FVC.
+ *
+ * TIA/EIA-553-A 2.3.12.1.3 / Table 3.7.1-1: on receipt the mobile station
+ * increments its Call History Parameter COUNTs-p and sends an order
+ * confirmation. COUNTs-p is an authentication parameter (clone/replay
+ * detection); this base does not implement authentication, so no
+ * per-subscriber count is stored or compared -- the order is sent and its
+ * confirmation is decode-logged only. FVC-only: the mobile must be in an
+ * active call (the order is defined on the forward voice channel).
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int amps_param_update(const char *number)
+{
+	sender_t *sender;
+	amps_t *amps;
+	transaction_t *trans = NULL;
+	uint32_t min1;
+	uint16_t min2;
+
+	if (amps_number2min(number, &min1, &min2) < 0)
+		return -1;
+
+	for (sender = sender_head; sender; sender = sender->next) {
+		amps = (amps_t *) sender;
+		trans = search_transaction_number(amps, min1, min2);
+		if (trans)
+			break;
+	}
+
+	/* Parameter Update is an FVC order: the mobile must be on a voice
+	 * channel in an active call. */
+	if (!trans || trans->state != TRANS_CALL) {
+		LOGP(DAMPS, LOGL_NOTICE, "Parameter Update: subscriber '%s' is not in an active call -- order is FVC-only\n",
+			number);
+		return -CAUSE_BUSY;
+	}
+
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Parameter Update Order to '%s'\n", number);
+	trans->chan = 0;
+	trans->msg_type = 0;
+	trans->ordq = 0;    /* ORDQ=0 for Parameter Update */
+	trans->order = 15;  /* 01111 */
+	trans_new_state(trans, TRANS_CALL_PARAM_UPDATE);
+	amps_set_dsp_mode(trans->amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+
+	return 0;
+}
+
+/*
  * Send Change Power Order (Order 11) to subscriber via control FIFO
  *
  * This function sends a Change Power order to adjust the mobile station's
@@ -4856,6 +4908,25 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		return trans;
 	case TRANS_CALL_AUDIT_SEND:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Audit Order sent\n");
+		trans_new_state(trans, TRANS_CALL);
+		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+		return NULL;
+	case TRANS_CALL_PARAM_UPDATE:
+		/* Parameter Update Order (Order 15, ORDQ=0) on FVC.
+		 * TIA/EIA-553-A 2.3.12.1.3: the mobile increments its Call History
+		 * Parameter COUNTs-p on receipt. COUNTs-p is an authentication
+		 * parameter; this base does not authenticate, so no per-subscriber
+		 * count is tracked -- the order is sent and its confirmation is
+		 * decode-logged (see frame.c), nothing is compared. */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Parameter Update order (Order 15, ORDQ=0) -- COUNTs-p not tracked by this base\n");
+		trans->chan = 0;
+		trans->msg_type = 0;
+		trans->ordq = 0;    /* ORDQ=0 for Parameter Update */
+		trans->order = 15;  /* 01111 = Parameter Update (ORDQ=0) / Serial Number (ORDQ=1) */
+		trans_new_state(trans, TRANS_CALL_PARAM_UPDATE_SEND);
+		return trans;
+	case TRANS_CALL_PARAM_UPDATE_SEND:
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Parameter Update Order sent\n");
 		trans_new_state(trans, TRANS_CALL);
 		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
 		return NULL;

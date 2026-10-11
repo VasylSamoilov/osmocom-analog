@@ -68,6 +68,7 @@
  *   flash,<number>,<msg>[,pi,si]  In-call Caller ID (Order 18)
  *   pci,<number>                  Query Protocol Capability
  *   audit,<number>                Audit mobile (Order 7)
+ *   paramupdate,<number>          Parameter Update: bump mobile COUNTs-p (Order 15 ORDQ=0, FVC, decode/log scaffold)
  *   handoff,<number>[,channel]    Transfer to different VC
  *   rescan,<number>               Auto-calculated Directed Retry
  *   silentpage,<number>           Page + Maintenance (no ring)
@@ -278,6 +279,10 @@ void print_help(const char *arg0)
 	printf("    Audit Order:\n");
 	printf("        echo \"audit,<number>\" > /tmp/amps_control\n");
 	printf("        Example: echo \"audit,1234567890\" > /tmp/amps_control\n");
+	printf("    Parameter Update Order (COUNTs-p, FVC, decode/log scaffold):\n");
+	printf("        echo \"paramupdate,<number>\" > /tmp/amps_control\n");
+	printf("        Sends Order 15 (ORDQ=0) in an active call; mobile bumps COUNTs-p.\n");
+	printf("        Auth parameter -- this base does not track or compare it.\n");
 	printf("    Alert Order (Ring Mobile Station):\n");
 	printf("        echo \"alert,<number>\" > /tmp/amps_control\n");
 	printf("        Example: echo \"alert,1234567890\" > /tmp/amps_control\n");
@@ -503,6 +508,19 @@ static void amps_myhandler(void)
 				rc = amps_audit_order(number);
 				if (rc < 0)
 					fprintf(stderr, "Audit order failed: %d\n", rc);
+			} else if (strcasecmp(cmd, "paramupdate") == 0) {
+				/* Parse: paramupdate,number
+				 * Send Parameter Update Order (Order 15, ORDQ=0) on the FVC.
+				 * Mobile increments COUNTs-p (auth parameter); decode/log
+				 * scaffold only -- this base does not track or compare it. */
+				number = strsep(&p, ",");
+				if (!number) {
+					fprintf(stderr, "Usage: paramupdate,<number>\n");
+					return;
+				}
+				rc = amps_param_update(number);
+				if (rc < 0)
+					fprintf(stderr, "Parameter Update order failed: %d\n", rc);
 			} else if (strcasecmp(cmd, "alert") == 0) {
 				/* Parse: alert,number
 				 * Send Alert Order (Order 1, ORDQ=0) to ring the mobile station
@@ -973,7 +991,7 @@ static void amps_myhandler(void)
 				fprintf(stderr, "SDCC set: SDCC1=%d SDCC2=%d (%s)\n", s1v, s2v,
 					(s1v || s2v) ? "feature enabled" : "feature disabled");
 			} else {
-				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry', 'rescan', 'olc', 'accattempt', 'newacc' or 'sdcc'\n", cmd);
+				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'paramupdate', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry', 'rescan', 'olc', 'accattempt', 'newacc' or 'sdcc'\n", cmd);
 			}
 		}
 	}
