@@ -190,12 +190,13 @@ typedef struct rds_frame {
 	uint16_t		paging_block_c;	/* Raw Block C data */
 	uint16_t		paging_block_d;	/* Raw Block D data */
 
-	/* Group 13A specific (EN 50067 Annex M) - Enhanced Radio Paging */
-	uint8_t			erp_sty;	/* Sub-type - from B bits 4-2 */
-	uint8_t			erp_cs;		/* Cycle Selection - from C bits 15-14 */
-	uint8_t			erp_it;		/* Interval Number - from C bits 13-10 */
-	uint32_t		erp_notify;	/* 25 notification bits - from C+D */
-	uint8_t			erp_s1;		/* Sort indicator - from D bit 0 */
+	/* Group 13A specific (EN 50067 Annex M, Figures M.11a/M.11b) - Enhanced Radio Paging */
+	uint8_t			erp_cs;		/* Cycle Selection - from B bits 4-3 (Table M.9) */
+	uint8_t			erp_sty;	/* Sub-type S2S1S0 - from B bits 2-0 (Table 7) */
+	uint8_t			erp_it;		/* Interval Number - from C bits 15-12 */
+	uint8_t			erp_s1;		/* Sort indicator S1 - from C bit 11 (Table M.10) */
+	uint8_t			erp_s2;		/* Sort indicator S2 - from C bit 10 (Table M.10) */
+	uint32_t		erp_notify;	/* 25 notification bits - C bits 8-0 (24..16) + D (15..0) */
 
 } rds_frame_t;
 

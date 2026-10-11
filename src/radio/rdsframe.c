@@ -804,17 +804,22 @@ void rds_group_decode(const uint16_t blocks[4], const uint8_t block_status[4],
 				frame->paging_block_d = blocks[3];
 			break;
 		}
-		/* Group 13A: Enhanced Radio Paging */
+		/* Group 13A: Enhanced Radio Paging (EN 50067 Annex M, Fig M.11a/M.11b)
+		 * Block B: bits 4-3 = CS, bits 2-0 = STY
+		 * Block C: bits 15-12 = IT, bit 11 = S1, bit 10 = S2, bit 9 = X (rsvd),
+		 *          bits 8-0 = notification bits 24..16
+		 * Block D: bits 15-0 = notification bits 15..0 */
 		if (frame->group_type == RDS_GROUP_13A) {
-			frame->erp_sty = (b2 >> 2) & 0x07;
+			frame->erp_cs = (b2 >> 3) & 0x03;
+			frame->erp_sty = b2 & 0x07;
 			if (block_status[2] != RDS_STATUS_ERROR) {
-				frame->erp_cs = (blocks[2] >> 14) & 0x03;
-				frame->erp_it = (blocks[2] >> 10) & 0x0F;
-				frame->erp_notify = (blocks[2] & 0x03FF) << 15;
+				frame->erp_it = (blocks[2] >> 12) & 0x0F;
+				frame->erp_s1 = (blocks[2] >> 11) & 1;
+				frame->erp_s2 = (blocks[2] >> 10) & 1;
+				frame->erp_notify = (uint32_t)(blocks[2] & 0x01FF) << 16;
 			}
 			if (block_status[3] != RDS_STATUS_ERROR) {
-				frame->erp_notify |= (blocks[3] >> 1) & 0x7FFF;
-				frame->erp_s1 = blocks[3] & 1;
+				frame->erp_notify |= blocks[3];
 			}
 			break;
 		}

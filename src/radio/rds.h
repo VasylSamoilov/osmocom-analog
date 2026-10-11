@@ -768,23 +768,6 @@ static inline const char *rds_paging_rpc_desc(uint8_t rpc, char *buf, int buflen
 }
 
 /* ============================================================
- * Group 13A Bit Fields (EN 50067 Annex M / IEC 62106)
- * Enhanced Radio Paging (or ODA when paging not enabled)
- *
- * Block B payload (bits 4-0):
- *   Bits 4-2: STY (Sub-Type, 000 for address notification)
- *   Bits 1-0: Reserved
- *
- * Block C (sub-type 000):
- *   Bits 15-14: CS (Cycle Selection)
- *   Bits 13-10: IT (Interval Number, 0-9)
- *   Bits 9-0:   Notification bits 24-15
- *
- * Block D (sub-type 000):
- *   Bits 15-1:  Notification bits 14-0
- *   Bit  0:     S1 (Sort indicator)
- * ============================================================ */
-/* ============================================================
  * Group 13A Bit Fields -- EN 50067:1998 Annex M, Figure M.11a/b (p.110-111)
  * Enhanced Radio Paging address-notification group.
  *
