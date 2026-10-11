@@ -286,9 +286,13 @@ genuine deviations, worst-interesting first:
    confirm) differ from the diagrams' 5a(L=13/15) — needs L-code-table confirm. §7.3/7.4.
 
 ### SMS (verifiable against captures)
-5. **Outgoing SMS capped at 140 chars** (spec 160 / 255 for 8-bit). §8.
+5. **Outgoing SMS length cap** — **FIXED** (branch `fix/nmt-sms-length-timers`): raised
+   from 140 to the spec **160 characters** (§2.2.3.13; 7-bit → 140 octets, fits data[256]).
+   8-bit NMT-alphabet and the optional 255-char case remain unimplemented (gap #8).
 6. **TP-VP absolute 7-octet form not parsed** → parse desync on VPF=11. §8.
-7. **SMS-call timers 5s/2s vs spec 10s/20s/≥5s**. §8.
+7. **SMS-call timers** — **FIXED** (branch `fix/nmt-sms-length-timers`): mapped to the
+   §1.1 values — 20 s awaiting a response to a sent SMS packet, 10 s awaiting the next DMS
+   frame, and ≥5 s before clearing after the last packet (was a single 5 s/2 s pair). §8.
 8. **DELIVER always DCS=0** — no 8-bit NMT-alphabet send; char sets 0–4 unmapped. §8.
 9. **DMS NR flow-control is a FIXME** — not acted on. §8.
 10. **RP-User-Data IEI 0x41 vs 0x42** doc/impl discrepancy (code flags doc as wrong;
