@@ -1898,6 +1898,20 @@ static void timeout_scip_ident(nmt_t *nmt)
  * handle call
  */
 
+/* True while the MFT converter is being set up, active, or torn down. During
+ * this window the standard (NMT Doc 450-1 4.4.1.9, states 4-5 / 11) has the MTX
+ * order the BS to SUPPRESS the ø-signal (supervisory) alarm, because the MS is
+ * sending digits (DTMF) instead of maintaining the ø-signal, so the supervision
+ * detector would otherwise time out and drop the call. In this combined MTX+BS
+ * node there is no external BS to send frame 20 to, so the suppression is applied
+ * locally: the supervisory timeout is not armed while this predicate holds. */
+static int nmt_in_mft(nmt_t *nmt)
+{
+	return nmt->active_state == ACTIVE_STATE_MFT_IN
+	    || nmt->active_state == ACTIVE_STATE_MFT
+	    || nmt->active_state == ACTIVE_STATE_MFT_OUT;
+}
+
 void nmt_rx_super(nmt_t *nmt, int tone, double quality)
 {
 	if (tone)
@@ -1911,6 +1925,14 @@ void nmt_rx_super(nmt_t *nmt, int tone, double quality)
 	/* only detect supervisory signal during active call */
 	if (nmt->state != STATE_ACTIVE || !nmt->supervisory)
 		return;
+
+	/* ø-signal alarm suppressed during the MFT converter window (4.4.1.9): the
+	 * MS sends DTMF, not the ø-signal, so a "lost" tone here is expected and must
+	 * not arm the release timeout. */
+	if (nmt_in_mft(nmt)) {
+		osmo_timer_del(&nmt->timer);
+		return;
+	}
 
 	if (tone)
 		osmo_timer_del(&nmt->timer);
@@ -1937,8 +1959,9 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 	transaction_t *trans = nmt->trans;
 	char digit;
 
-	/* restart timer on every reception of frame */
-	if (nmt->supervisory)
+	/* restart timer on every reception of frame (except during MFT, where the
+	 * ø-signal alarm is suppressed per 4.4.1.9 -- see nmt_in_mft) */
+	if (nmt->supervisory && !nmt_in_mft(nmt))
 		osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO2);
 
 	switch (frame->mt) {
@@ -1991,6 +2014,15 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			if (nmt->active_state != ACTIVE_STATE_VOICE)
 				break;
 			LOGP_CHAN(DNMT, LOGL_INFO, "Received 'MFT in' request.\n");
+			/* Suppress the ø-signal (supervisory) alarm for the MFT window
+			 * (NMT Doc 450-1 4.4.1.9 states 4-5: frame 20 A=4/A=7 order to BS).
+			 * No external BS in this combined node, so apply it locally: cancel
+			 * the pending supervisory timeout so DTMF (not ø-signal) does not drop
+			 * the call. nmt_in_mft() keeps it suppressed until MFT-out. */
+			if (nmt->supervisory) {
+				osmo_timer_del(&nmt->timer);
+				LOGP_CHAN(DNMT, LOGL_INFO, "Suppressing supervisory alarm during MFT (local equivalent of frame 20 A=4/A=7 to BS).\n");
+			}
 			nmt->active_state = ACTIVE_STATE_MFT_IN;
 			nmt->tx_frame_count = 0;
 			nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
@@ -2095,19 +2127,15 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 		}
 		break;
 	case ACTIVE_STATE_MFT_IN:
-		/* MFT converter in: acknowledge the MS request with L(4) (NMT Doc 450-1
-		 * 4.4.1.9 state 6), then switch the speech path to DTMF generation.
-		 * Conformance notes: (1) the spec shows the ack sent 4 times; we send it
-		 * for frames 1..5 (one extra), harmless to the MS which accepts on
-		 * majority. (2) The spec also has the MTX suppress the BS ø-signal alarm
-		 * (frame 20 A=4/A=7 to BS, states 4-5) for the MFT period, since DTMF in
-		 * the speech path disturbs supervision, and cancel it on exit (state 11).
-		 * This single-node emulator has no BS alarm back-end, so that order is not
-		 * sent; supervision handling is approximated by super_reset() on exit. */
+		/* MFT converter in: acknowledge the MS request with L(4) exactly 4 times
+		 * (NMT Doc 450-1 4.4.1.9 state 6), then switch the speech path to DTMF
+		 * generation. The ø-signal supervision alarm was already suppressed on
+		 * entry (L(8) handler), the local equivalent of the frame-20 A=4/A=7 order
+		 * to the BS; it is kept suppressed by nmt_in_mft() and resumed at MFT-out. */
 		set_line_signal(nmt, frame, 4);
 		if (++nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'MFT in acknowledge'.\n");
-		if (nmt->tx_frame_count > 4) {
+		if (nmt->tx_frame_count >= 4) {
 			nmt->active_state = ACTIVE_STATE_MFT;
 			nmt_set_dsp_mode(nmt, DSP_MODE_DTMF);
 		}
@@ -2119,11 +2147,18 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 		set_line_signal(nmt, frame, 10);
 		if (++nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'MFT out acknowledge'.\n");
-		if (nmt->tx_frame_count > 4) {
+		if (nmt->tx_frame_count >= 4) {
 			nmt->active_state = ACTIVE_STATE_VOICE;
 			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
-			if (nmt->supervisory)
+			/* Cancel the ø-signal alarm suppression and resume supervision
+			 * (NMT Doc 450-1 4.4.1.9 state 11: frame 20 A=10 to BS). nmt_in_mft()
+			 * is now false, so re-establish the detector baseline and re-arm the
+			 * loss timeout. */
+			if (nmt->supervisory) {
 				super_reset(nmt);
+				osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
+				LOGP_CHAN(DNMT, LOGL_INFO, "Resuming supervisory alarm after MFT (local equivalent of frame 20 A=10 to BS).\n");
+			}
 		}
 		break;
 	case ACTIVE_STATE_MWI:

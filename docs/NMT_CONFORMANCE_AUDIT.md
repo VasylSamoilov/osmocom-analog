@@ -232,16 +232,19 @@ from MS" (p.70-71):**
   `ACTIVE_STATE_MFT` (keypress before the L(8)/L(4) handshake completes), or with
   the wrong odd/even parity (lost/duplicated frame), were silently dropped. Now
   each is logged (NOTICE) so a lost keypress is visible.
-- **Gap — ø-signal alarm suppression (documented, not a live bug):** the spec has
-  the MTX order the BS to suppress the ø-signal (supervision) alarm (frame 20
-  A=4/A=7, states 4-5) for the MFT period and cancel it on exit (state 11),
-  because DTMF in the speech path disturbs supervision. This single-node emulator
-  has no BS alarm back-end, so that order is not sent; exit approximates it with
-  `super_reset()`. Commented at the MFT-in/out handlers.
-- **Gap — ack count:** acks are sent 5× (frames 1-5) where the spec diagram shows
-  4×; harmless (MS accepts on majority), noted. MFT-out "within T'" timing is not
-  enforced. MTX never originates MFT forced-release (states 13-14) — we don't
-  originate, so acceptable.
+- **ø-signal alarm suppression (FIXED per 4.4.1.9):** the spec has the MTX order
+  the BS to suppress the ø-signal (supervision) alarm (frame 20 A=4/A=7, states
+  4-5) for the MFT period and cancel it on exit (state 11), because DTMF in the
+  speech path disturbs supervision and would otherwise drop the call. This is a
+  combined MTX+BS node with no external BS to message, so the EFFECT is applied
+  locally: on MFT-in (L(8)) the supervisory loss timeout is cancelled, kept
+  suppressed by `nmt_in_mft()` across `nmt_rx_super`/`rx_active` for the whole MFT
+  window, and resumed on MFT-out (L(10), state 11) via `super_reset()` + re-armed
+  timeout. Entry/exit are logged as the frame-20 A=4/A=10 equivalents.
+- **Ack count (FIXED):** L(4)/L(10) acks now sent exactly 4× per the §4.4.1.9
+  diagram (was 5×). MFT-out "within T'" timing is still not separately enforced
+  (the 4-frame ack burst is ~553 ms, i.e. T', so it is met in practice). MTX never
+  originates MFT forced-release (states 13-14) — we do not originate, so acceptable.
 
 ---
 
