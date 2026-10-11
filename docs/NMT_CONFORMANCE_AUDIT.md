@@ -55,12 +55,12 @@ Code dir: `src/nmt/` — `nmt.c` (state machine + tx/rx), `frame.c` (encode/deco
 | **4** | Free traffic channel indication (continuous) | MTX→MS | **IMPL** | idle tx `nmt.c:665` |
 | **4b** | Access-channel free indication | MTX→MS | **IMPL** | idle tx `nmt.c:668` |
 | **5a** | Line signal (L-values) | MTX→MS | **IMPL** | `set_line_signal` `nmt.c:632`; L=3/5/6/9/12/15 sent — per-L audit in §3 |
-| **5a(L=0)** | Answer to coin-box + tariff class | MTX→MS | **SCOPED-OUT** | no charging backend / no answer-supervision event (`call_down_answer` empty) |
+| **5a(L=0)** | Answer to coin-box + tariff class | MTX→MS | **SCAFFOLDED** | `call_down_answer` now hooks the coin-box answer sequence; sends 5b when a tariff class is configured, else logs the standard point reached (no charging source) |
 | **5a(L=12)** | Automatic answer order (data mode, DMS/SMS) | MTX→MS | **IMPL** | DMS/SMS autoanswer path |
-| **5b** | Answer to coin-box (tariff) frame variant | MTX→MS | **SCOPED-OUT** | same as 5a(L=0) |
+| **5b** | Answer to coin-box (tariff) frame variant | MTX→MS | **SCAFFOLDED** | `set_coinbox_answer()` builds L(0)+Q1Q2; emitted via `ACTIVE_STATE_COINBOX_ANSWER` when a tariff class is operator-configured |
 | **5c** | Clearing with call-transfer / message indicators | MTX→MS | **PARTIAL** | sent `nmt.c:1423`; MWI flags wired, call-transfer flag not driven |
 | **6** | Idle frame (MTX→MS waiting) | MTX→MS | **IMPL** | `nmt.c:1061/1291/1352/1459` |
-| **7** | Authentication request (RAND) | MTX→MS | **SCOPED-OUT** | needs SIS Authentication Register + SAK; unverifiable without SAK handset |
+| **7** | Authentication request (RAND) | MTX→MS | **SCAFFOLDED (demo)** | `-E/--sis-demo` originates frame 7 (labeled demonstrator); real auth still needs SIS+SAK |
 | **8** | Calling line identity (A-number, optionally encrypted) | MTX→MS | **IMPL** | `nmt_encode_a_number` `frame.c:212`, sent in ringing `nmt.c:1350` |
 
 ## 2. §4.2 Signal catalog — direction MS → MTX (spec CLI pp.32–34)
@@ -73,13 +73,13 @@ Code dir: `src/nmt/` — `nmt.c` (state machine + tx/rx), `frame.c` (encode/deco
 | **10d** | Seizure (alternative call type ack) | MS→MTX | **IMPL** | rx handler |
 | **11a** | — (seizure variant) | MS→MTX | **IMPL** | rx (2 handlers) |
 | **11b** | Roaming updating seizure on TC / priority call-ack | MS→MTX | **IMPL** | rx `nmt.c:1120`; sets `trans->priority` |
-| **12** | Seizure from coin-box MS | MS→MTX | **PARTIAL** | rx sets `subscr.coinbox=1` `nmt.c:737`; special answer sequence not driven (SCOPED-OUT send side) |
+| **12** | Seizure from coin-box MS | MS→MTX | **DONE/SCAFFOLDED** | rx sets `subscriber.coinbox=1`; the special answer sequence is now driven from `call_down_answer` (frame 5b) |
 | **13a** | Line signal (MS→MTX) | MS→MTX | **IMPL** | rx (5 handlers) |
-| **13b** | Answer-ack from coin-box (echoed tariff class) | MS→MTX | **OBSERVE** (this session) | logged `nmt.c:767`-area |
+| **13b** | Answer-ack from coin-box (echoed tariff class) | MS→MTX | **DECODE+LOG** | decoded; echoed tariff class logged for control (the 5b counterpart) |
 | **14a/14b** | Digit signal (dialled digits, one per frame) | MS→MTX | **IMPL** | rx (2+2 handlers) |
 | **15** | Idle frame (MS→MTX waiting) | MS→MTX | **IMPL** | rx (2 handlers) |
-| **16** | Authentication response (SRES) | MS→MTX | **OBSERVE** (this session) | logged; auth not implemented |
-| **Register recall (L=5)** | Connect MTX register during conversation | MS→MTX | **OBSERVE** | logs "Register Recall is not supported." |
+| **16** | Authentication response (SRES) | MS→MTX | **SCAFFOLDED** | SRES majority-decoded; logs the exact SIS verification point (XRES=SIS(RAND,SAK) compare) that cannot run without a SAK |
+| **Register recall (L=5)** | Connect MTX register during conversation | MS→MTX | **SCAFFOLDED** | enters `ACTIVE_STATE_REGISTER_RECALL`; logs the 4.7.2.11 point reached (no MTX register/digit-collection back-end) |
 | **MFT in / out** | 1200-Baud↔MFT converter activate/deactivate | MS→MTX | **IMPL** | ACTIVE_STATE_MFT path |
 | **Answer** | MS lifted handset after ringing | MS→MTX | **IMPL** | MT-complete path |
 | **Clearing / release-guard** | Release from MS | MS→MTX | **IMPL** | 13a clearing path |
