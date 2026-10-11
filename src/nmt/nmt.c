@@ -1567,23 +1567,29 @@ static void timeout_mt_release(nmt_t *nmt)
  * per 5.4.5 ("if the change of channel fails ... the MS shall go back to the previous TC").
  */
 
-#define SCIP_ORDER_FRAMES	4	/* repeat frame 3a this many times before the move (min 4 per 5.4.5) */
+#define SCIP_ORDER_FRAMES	4	/* repeat frame 3c this many times before the move (min 4 per 5.4.5) */
 
 static void tx_scip_order(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans = nmt->trans;
 	nmt_t *tc = nmt->scip_target;
 
-	/* build frame 3a: channel change order to the new TC */
-	frame->mt = NMT_MESSAGE_3a;
-	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+	/* Build frame 3c (channel change on traffic channel, short procedure --
+	 * NMT Doc 450-1 Scheme C2', para 4.4.1.4.3 / 4.7.2.4b).  The short
+	 * procedure combines "change to the new TC" and "send identity there"
+	 * into one order, so the MS re-identifies with 10b on the new TC without
+	 * a separate 3b request -- which is exactly the flow STATE_SCIP_IDENT
+	 * implements.  Per 4.7.2.4b the channel-number field N1'N2'N3' must equal
+	 * the ordered TC NaNbNc, so both carry the target channel. */
+	frame->mt = NMT_MESSAGE_3c;
+	frame->channel_no = nmt_encode_channel(tc->sysinfo.system, atoi(tc->sender.kanal), tc->sysinfo.ms_power);
 	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
 	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
 	frame->tc_no = nmt_encode_tc(tc->sysinfo.system, atoi(tc->sender.kanal), tc->sysinfo.ms_power);
 
 	if (++nmt->tx_frame_count == 1)
-		LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: sending channel change order (3a) -> TC #%s.\n", tc->sender.kanal);
+		LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: sending channel change order (3c, short procedure) -> TC #%s.\n", tc->sender.kanal);
 
 	if (nmt->tx_frame_count >= SCIP_ORDER_FRAMES) {
 		/* order delivered: move the transaction to the target TC and wait for the MS there.

@@ -46,7 +46,7 @@ enum nmt_state {
 	STATE_MT_RINGING,	/* mobile phone is ringing, waiting for answer */
 	STATE_MT_COMPLETE,	/* mobile phone has answered, completing call */
 	STATE_ACTIVE,		/* during active call */
-	STATE_SCIP_ORDER,	/* SCIP: sending channel change order (frame 3a) on current TC */
+	STATE_SCIP_ORDER,	/* SCIP: sending channel change order (frame 3c, short procedure) on current TC */
 	STATE_SCIP_IDENT,	/* SCIP: on new TC, waiting for identity (frame 10b) */
 	STATE_MO_RELEASE,	/* acknowlegde release from mobile phone */
 	STATE_MT_RELEASE,	/* sending release toward mobile phone */
