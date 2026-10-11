@@ -340,8 +340,8 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 	/* Choose the coding by content (Annex 24 para 2.2.3.10): the GSM 7-bit
 	 * alphabet carries only 0x00..0x7f, so if the message contains any byte
 	 * >= 0x80 (a national letter) it must be sent with an NMT 8-bit alphabet
-	 * (one octet per character).  A C string cannot hold an embedded NUL, so
-	 * byte 0x00 inside a message is not representable through this interface. */
+	 * (one octet per character).  The message is carried as bytes + msg_len,
+	 * so a 0x00 byte is a normal character here, not a terminator. */
 	need_8bit = 0;
 	for (i = 0; i < msg_len; i++) {
 		if ((uint8_t)message[i] >= 0x80) {
