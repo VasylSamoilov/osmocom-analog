@@ -121,6 +121,16 @@ struct nmt {
 	int			supervisory;		/* if set, use supervisory signal 1..4 */
 	int			send_callerid;		/* if set, send caller ID while ringing the phone */
 	int			send_clock;		/* if set, send clock with CC */
+	/* Battery saving (NMT Doc 450-1 para 4.3.3.12), optional, OFF by default:
+	 * bs_period is the H3 code 0..9 (0 = disabled, phones never sleep);
+	 * bs_group is the H7 group code 0..8 the CC broadcast addresses. */
+	int			bs_period;		/* H3 battery-saving period code (0 = disabled) */
+	int			bs_group;		/* H7 group code (default 8 = all phones) */
+	/* SIS authentication DEMONSTRATOR (NMT Doc 450-1 frame 7/16), optional,
+	 * OFF by default. When set, the MTX exchanges the authentication frames,
+	 * but there is NO real SIS algorithm behind it (the SAK is a secret
+	 * operator key, not public) -- it cannot actually authenticate. */
+	int			sis_demo;		/* if set, originate frame 7 (RAND) as a labeled demo */
 
 	/* dsp states */
 	enum dsp_mode		dsp_mode;		/* current mode: audio, durable tone 0 or 1, paging */
@@ -163,7 +173,7 @@ void nmt_channel_list(int nmt_system);
 int nmt_channel_by_short_name(int nmt_system, const char *short_name);
 const char *chan_type_short_name(int nmt_system, enum nmt_chan_type chan_type);
 const char *chan_type_long_name(int nmt_system, enum nmt_chan_type chan_type);
-int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int loopback);
+int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int loopback);
 void nmt_check_channels(int nmt_system);
 void nmt_destroy(sender_t *sender);
 void nmt_go_idle(nmt_t *nmt);

@@ -303,7 +303,7 @@ static inline int is_chan_class_tc(enum nmt_chan_type chan_type)
 static void nmt_timeout(void *data);
 
 /* Create transceiver instance and link to a list. */
-int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int loopback)
+int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int loopback)
 {
 	nmt_t *nmt;
 	int rc;
@@ -362,6 +362,11 @@ int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_
 	nmt->supervisory = supervisory;
 	nmt->send_callerid = send_callerid;
 	nmt->send_clock = send_clock;
+	/* optional, off by default: battery saving (period 0 = disabled) and the
+	 * SIS authentication demonstrator */
+	nmt->bs_period = (bs_period >= 0 && bs_period <= 9) ? bs_period : 0;
+	nmt->bs_group = (bs_group >= 0 && bs_group <= 8) ? bs_group : 8;
+	nmt->sis_demo = sis_demo ? 1 : 0;
 	strncpy(nmt->smsc_number, smsc_number, sizeof(nmt->smsc_number) - 1);
 
 	/* init audio processing */
@@ -530,7 +535,14 @@ static void nmt_release(nmt_t *nmt)
 	osmo_timer_schedule(&nmt->timer, RELEASE_TO);
 }
 
-/* Enter paging state and transmit phone's number on calling channel */
+/* Enter paging state and transmit phone's number on calling channel.
+ *
+ * Battery-saving interaction (when enabled, bs_period>0): a phone that is
+ * asleep for its group's H3 period will not hear the first page. This is
+ * covered by the PAGE_TRIES retries (3 attempts, ~3 s) for short periods;
+ * frame-exact deferral of the page to the group's wake window is NOT
+ * implemented, so a long H3 period (several seconds) can outlast the retries
+ * and miss the call. Enable long battery-saving periods with that in mind. */
 static void nmt_page(transaction_t *trans, int try)
 {
 	sender_t *sender;
@@ -651,6 +663,21 @@ static void tx_ident(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans = nmt->trans;
 
+	/* SIS authentication DEMONSTRATOR (optional, off by default): on the first
+	 * identity frame, originate frame 7 (authentication request) carrying a
+	 * RAND. This exercises the frame-7/frame-16 exchange only -- there is NO
+	 * real SIS algorithm (the SAK is a secret operator key, not public), so the
+	 * SRES cannot be checked. Labeled as a demo so it is never mistaken for
+	 * working authentication. */
+	if (nmt->sis_demo && nmt->tx_frame_count == 0) {
+		frame->mt = NMT_MESSAGE_7;
+		frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+		frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+		frame->rand = 0x1234567; /* fixed demo RAND (C1..C7); NOT cryptographic */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SIS DEMO: sending authentication request (frame 7, RAND=0x%07x) -- demonstrator only, no SIS algorithm, SRES will not be verified.\n", (unsigned)frame->rand);
+		return;
+	}
+
 	frame->mt = NMT_MESSAGE_3b;
 	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
 	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
@@ -713,8 +740,13 @@ static void tx_idle(nmt_t *nmt, frame_t *frame)
 	/* additional info */
 	frame->additional_info = 0;
 	if (frame->mt == NMT_MESSAGE_1a || frame->mt == NMT_MESSAGE_1a_a || frame->mt == NMT_MESSAGE_1a_b || frame->mt == NMT_MESSAGE_1b) {
-		/* no battery saving, just use group 8 (all phones) with no saving period */
-		frame->additional_info |= 0xeb00008000;
+		/* Battery-saving additional info (NMT Doc 450-1 para 4.3.3.12):
+		 * H1=14(E) H2=11(B) marker, H3 = period code, H7 = addressed group.
+		 * Default bs_period=0 means "no saving" (phones never sleep) = the
+		 * historic behaviour; a non-zero period enables battery saving. */
+		frame->additional_info |= 0xeb00000000;			/* H1=E, H2=B marker */
+		frame->additional_info |= ((uint64_t)(nmt->bs_period & 0xf)) << 28;	/* H3 period */
+		frame->additional_info |= ((uint64_t)(nmt->bs_group & 0xf)) << 12;	/* H7 group */
 		/* phone is allowed to send overdecadic dialing digits */
 		frame->additional_info |= 0x0000020000;
 		/* no clock on combined CC+TC */
