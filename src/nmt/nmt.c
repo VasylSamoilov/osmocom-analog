@@ -1362,8 +1362,22 @@ static void tx_mt_queue(nmt_t *nmt, frame_t *frame)
 
 	/* a TC became free -> stop queueing, proceed to assignment */
 	if (search_free_tc(nmt)) {
-		LOGP_CHAN(DNMT, LOGL_INFO, "TC became free, assigning queued call.\n");
 		osmo_timer_del(&nmt->timer);
+		if (trans->priority_mo) {
+			/* PMS MO call (4.4.1.7, states 4-5): when a TC becomes free the
+			 * standard requires the MTX to send 2a again on the CC to confirm
+			 * the PMS is still waiting, and wait for a T''' 11b acknowledgement
+			 * BEFORE sending the 2b TC allocation (state 7). A direct jump to
+			 * 2b (the normal path) would skip this re-confirmation handshake.
+			 * nmt_page re-enters STATE_MT_PAGING and schedules the paging timer;
+			 * rx_mt_paging handles the 11b ack and transitions to STATE_MT_CHANNEL
+			 * for the 2b TC allocation as usual. */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "PMS: TC became free; re-paging MS before TC allocation (4.4.1.7 state 4).\n");
+			nmt_page(trans, 1);
+			tx_mt_paging(nmt, frame);	/* fill current frame with 2a */
+			return;
+		}
+		LOGP_CHAN(DNMT, LOGL_INFO, "TC became free, assigning queued call.\n");
 		nmt_new_state(nmt, STATE_MT_CHANNEL);
 		nmt->tx_frame_count = 0;
 		tx_mt_channel(nmt, frame);
