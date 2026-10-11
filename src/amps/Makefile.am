@@ -16,6 +16,7 @@ libamps_a_SOURCES = \
 	frame.c \
 	dsp.c \
 	sysinfo.c \
+	auth.c \
 	esn.c
 
 amps_SOURCES = \

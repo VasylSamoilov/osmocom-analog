@@ -1240,7 +1240,7 @@ void amps_rx_sat_mismatch(amps_t *amps, enum sat_state expected, enum sat_state 
 }
 
 
-void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing, uint8_t mspc, uint8_t mscap)
+void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing, uint8_t mspc, uint8_t mscap, uint8_t sdcc1, uint8_t sdcc2)
 {
 	amps_t *vc;
 	transaction_t *trans;
@@ -1274,10 +1274,60 @@ void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t e
 		return;
 	}
 
-	/* Log Protocol Capability if received */
+	/* Protocol Capability (MSPC/MSCAP): logged, and now also used to
+	 * decide whether the mobile is protocol-capable (acted on below). */
 	if (mspc || mscap) {
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Protocol Capability: MSPC=%d (%s), MSCAP=%d (%s)\n",
 			mspc, ie_mspc(mspc), mscap, ie_mscap(mscap));
+	}
+
+	/* Act on the mobile's SDCC echo (TIA/EIA-553-A 3.6.3.1, p.80):
+	 * the mobile retransmits the DCC/SDCC1/SDCC2 it received. A non-zero
+	 * SDCC1/SDCC2 combination means the mobile supports SDCC; a zero
+	 * combination means SDCC unused or unsupported. If this base is
+	 * broadcasting a non-zero SDCC but the mobile echoes a DIFFERENT
+	 * combination, the mobile is locked to a different base transmitter
+	 * (color-code mismatch) -- surface it rather than silently proceeding. */
+	{
+		int base_sdcc = (amps->si.filler.sdcc1 << 2) | amps->si.filler.sdcc2;
+		int ms_sdcc = (sdcc1 << 2) | sdcc2;
+		int ms_supports_sdcc = (ms_sdcc != 0);
+
+		if (base_sdcc != 0 || ms_sdcc != 0) {
+			LOGP_CHAN(DAMPS, LOGL_INFO, "SDCC: mobile echo SDCC1=%d SDCC2=%d -> %s; base broadcasts SDCC1=%d SDCC2=%d\n",
+				sdcc1, sdcc2, ms_supports_sdcc ? "SDCC-capable" : "no SDCC",
+				amps->si.filler.sdcc1, amps->si.filler.sdcc2);
+			if (base_sdcc != 0 && ms_sdcc != 0 && ms_sdcc != base_sdcc)
+				LOGP_CHAN(DAMPS, LOGL_NOTICE, "SDCC mismatch: mobile echoed a different color-code combination than this base transmits -- the mobile may be reading another base station.\n");
+		}
+	}
+
+	/* Authentication (TIA/EIA-553-A 2.3.12): if the base advertises AUTH
+	 * and the mobile supplied an Authentication Word (AUTHR/COUNT/RANDC),
+	 * verify the response through the pluggable CAVE provider and act on
+	 * the verdict. Without a provider the result is UNAVAILABLE and the
+	 * base cannot authenticate -- surfaced here rather than silently
+	 * accepting the access. The verification is scaffolded (see auth.c);
+	 * the CAVE primitive is not shipped. */
+	if (amps->si.word1.auth && amps->rx_recc_auth_present) {
+		amps_auth_ctx auth;
+		enum amps_auth_result ar;
+
+		amps_auth_ctx_init(&auth);
+		auth.count = amps->rx_recc_count;
+		/* The RAND that produced this AUTHR is the globally broadcast RAND;
+		 * RANDC is the mobile's 8-bit confirmation of it. A full
+		 * implementation keys off the stored per-mobile RAND and checks
+		 * RANDC against it; the scaffold passes the confirmation value
+		 * through to the provider. */
+		ar = amps_auth_verify_response(&auth, amps->rx_recc_randc, esn, min1, amps->rx_recc_authr);
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Authentication: AUTHR=0x%05x COUNT=%d RANDC=0x%02x -> %s\n",
+			amps->rx_recc_authr & 0x3ffff, amps->rx_recc_count, amps->rx_recc_randc,
+			amps_auth_result_name(ar));
+		if (ar == AMPS_AUTH_RESULT_FAIL)
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Authentication FAILED for this mobile -- a conformant base would deny service (not enforced in scaffold).\n");
+		else if (ar == AMPS_AUTH_RESULT_UNAVAILABLE)
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Authentication requested but no CAVE provider is registered -- cannot verify (scaffold).\n");
 	}
 
 	if (order == 13 && (ordq == 0 || ordq == 1 || ordq == 2 || ordq == 3) && msg_type == 0) {

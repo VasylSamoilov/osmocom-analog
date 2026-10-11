@@ -121,6 +121,19 @@ int acc_maxbusy = -1;	/* Access Attempt: max reverse-CC-busy retries, 0..15, app
 int acc_maxsztr = -1;	/* Access Attempt: max seizure-rejection retries, 0..15, applied to PGR+OTHER */
 int newacc = -1;	/* New Access Channel Set: new access channel number 0..2047, -1 = not sent (ACT=0110) */
 
+/* Supplementary Digital Color Code (SDCC1/SDCC2), broadcast in the
+ * control-filler message. The base advertises the SDCC combination; a mobile
+ * that echoes a non-zero combination is SDCC-capable (TIA/EIA-553-A 3.6.3.1,
+ * p.80). -1 = keep init_sysinfo default of 0 (feature off); 0..3 each sets the
+ * 2-bit field. A non-zero combination enables the SDCC feature. */
+int sdcc1 = -1, sdcc2 = -1;
+
+/* Authentication (TIA/EIA-553-A 2.3.12). -S auth=1 advertises AUTH=1 in the
+ * System Parameter Overhead (Word 1) so mobiles include authentication words.
+ * The verification flow is scaffolded in auth.c; without a registered CAVE
+ * signature provider every response verifies as UNAVAILABLE. Default off. */
+int auth_enable = 0;
+
 int tolerant = 0;
 int vmac_enable = 0;
 double vmac_level_low = 0.95;
@@ -231,6 +244,16 @@ void print_help(const char *arg0)
 	printf(" -S --sysinfo newacc=<channel 0-2047>\n");
 	printf("        New Access Channel Set: redirect mobiles to a new access channel.\n");
 	printf("        Default: not broadcast. Runtime: newacc,<channel> via FIFO.\n");
+	printf(" -S --sysinfo sdcc1=<0-3>  sdcc2=<0-3>\n");
+	printf("        Supplementary Digital Color Code. A non-zero SDCC1/SDCC2 combination\n");
+	printf("        enables the SDCC feature (extends 4 color codes to 64); the mobile\n");
+	printf("        echoes it to indicate SDCC capability. Default 0,0 = feature off.\n");
+	printf("        Runtime: sdcc,<sdcc1>,<sdcc2> via FIFO.\n");
+	printf(" -S --sysinfo auth=<0|1>\n");
+	printf("        Advertise authentication (AUTH=1) so mobiles include authentication\n");
+	printf("        words. NOTE: the CAVE signature algorithm is export-restricted and is\n");
+	printf("        NOT included; without a registered provider responses verify as\n");
+	printf("        UNAVAILABLE (scaffold only). Default 0 = off.\n");
 	printf(" -O --tolerant\n");
 	printf("        Be more tolerant when hunting for sync sequence\n");
 	printf("    --network-timeout <seconds>\n");
@@ -357,7 +380,9 @@ void print_help(const char *arg0)
 	printf("        Access Attempt retry limits, each 0-15 (busy / seizure-reject).\n");
 	printf("        echo \"newacc,<channel>\" > /tmp/amps_control\n");
 	printf("        New Access Channel Set: redirect mobiles to access channel 0-2047.\n");
-	printf("        All three take effect on the next overhead train.\n");
+	printf("        echo \"sdcc,<sdcc1>,<sdcc2>\" > /tmp/amps_control\n");
+	printf("        Supplementary Digital Color Code, each 0-3 (0,0 disables SDCC).\n");
+	printf("        All take effect on the next overhead train.\n");
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
 }
@@ -367,7 +392,7 @@ void print_help(const char *arg0)
  * (prepare_sysinfo is called per-train in frame.c), so updating si here makes
  * the change take effect on the next overhead train automatically. 'which'
  * selects the word; <0 fields are left unchanged. Returns channels updated. */
-static int apply_overhead_runtime(const char *which, int olc16, int maxbusy, int maxsztr, int newacc_val)
+static int apply_overhead_runtime(const char *which, int olc16, int maxbusy, int maxsztr, int newacc_val, int sdcc1_val, int sdcc2_val)
 {
 	sender_t *sender;
 	int updated = 0;
@@ -394,6 +419,10 @@ static int apply_overhead_runtime(const char *which, int olc16, int maxbusy, int
 		}
 		if (newacc_val >= 0)
 			a->si.new_acc.newacc = newacc_val;
+		if (sdcc1_val >= 0)
+			a->si.filler.sdcc1 = sdcc1_val & 3;
+		if (sdcc2_val >= 0)
+			a->si.filler.sdcc2 = sdcc2_val & 3;
 		updated++;
 	}
 	LOGP(DAMPS, LOGL_NOTICE, "Overhead runtime update (%s) applied to %d control channel(s); takes effect next overhead train\n",
@@ -908,7 +937,7 @@ static void amps_myhandler(void)
 					return;
 				}
 				int mask = (int)strtol(mask_str, NULL, 0) & 0xffff;
-				apply_overhead_runtime("overload control", mask, -1, -1, -1);
+				apply_overhead_runtime("overload control", mask, -1, -1, -1, -1, -1);
 				fprintf(stderr, "Overload Control set to 0x%04x\n", mask);
 			} else if (strcasecmp(cmd, "accattempt") == 0) {
 				/* Access Attempt params: accattempt,<maxbusy>,<maxsztr>  (each 0..15) */
@@ -919,7 +948,7 @@ static void amps_myhandler(void)
 					return;
 				}
 				int mbv = atoi(mb) & 0xf, msv = atoi(ms) & 0xf;
-				apply_overhead_runtime("access attempt", -1, mbv, msv, -1);
+				apply_overhead_runtime("access attempt", -1, mbv, msv, -1, -1, -1);
 				fprintf(stderr, "Access Attempt set: MAXBUSY=%d MAXSZTR=%d\n", mbv, msv);
 			} else if (strcasecmp(cmd, "newacc") == 0) {
 				/* New Access Channel Set: newacc,<channel 0..2047> */
@@ -931,10 +960,25 @@ static void amps_myhandler(void)
 				int nv = atoi(ch);
 				if (nv < 0) nv = 0;
 				if (nv > 2047) nv = 2047;
-				apply_overhead_runtime("new access channel set", -1, -1, -1, nv);
+				apply_overhead_runtime("new access channel set", -1, -1, -1, nv, -1, -1);
 				fprintf(stderr, "New Access Channel Set to %d\n", nv);
+			} else if (strcasecmp(cmd, "sdcc") == 0) {
+				/* Supplementary Digital Color Code: sdcc,<sdcc1 0..3>,<sdcc2 0..3>
+				 * A non-zero combination enables the SDCC feature; 0,0 disables it.
+				 * The base advertises it in the control-filler message and the
+				 * mobile echoes it to indicate SDCC capability (p.80). */
+				char *s1 = strsep(&p, ",");
+				char *s2 = strsep(&p, ",");
+				if (!s1 || !s2) {
+					fprintf(stderr, "Usage: sdcc,<sdcc1 0-3>,<sdcc2 0-3>  (0,0 disables SDCC)\n");
+					return;
+				}
+				int s1v = atoi(s1) & 3, s2v = atoi(s2) & 3;
+				apply_overhead_runtime("supplementary digital color code", -1, -1, -1, -1, s1v, s2v);
+				fprintf(stderr, "SDCC set: SDCC1=%d SDCC2=%d (%s)\n", s1v, s2v,
+					(s1v || s2v) ? "feature enabled" : "feature disabled");
 			} else {
-				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry', 'rescan', 'olc', 'accattempt' or 'newacc'\n", cmd);
+				fprintf(stderr, "Unknown command '%s', use 'flash', 'pci', 'audit', 'alert', 'abbalert', 'release', 'reorder', 'mwi', 'stopalert', 'intercept', 'power', 'esn', 'local', 'handoff', 'retry', 'rescan', 'olc', 'accattempt', 'newacc' or 'sdcc'\n", cmd);
 			}
 		}
 	}
@@ -1086,6 +1130,15 @@ static int handle_options(int short_option, int argi, char **argv)
 			newacc = atoi(p);
 			if (newacc > 2047) newacc = 2047;
 			if (newacc < 0) newacc = 0;
+		} else
+		if (!strncasecmp(argv[argi], "sdcc1=", p - argv[argi])) {
+			sdcc1 = atoi(p) & 3;
+		} else
+		if (!strncasecmp(argv[argi], "sdcc2=", p - argv[argi])) {
+			sdcc2 = atoi(p) & 3;
+		} else
+		if (!strncasecmp(argv[argi], "auth=", p - argv[argi])) {
+			auth_enable = atoi(p) & 1;
 		} else {
 			fprintf(stderr, "Given sysinfo parameter '%s' unknown, use '-h' for help!\n", argv[argi]);
 			return -EINVAL;
@@ -1460,6 +1513,25 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 		}
 		if (newacc >= 0)
 			si.new_acc.newacc = newacc;
+		/* SDCC: apply only when the operator set it (default stays 0 =
+		 * feature off, as init_sysinfo leaves it). A non-zero combination
+		 * enables the SDCC feature (TIA/EIA-553-A 3.6.3.1, p.80). */
+		if (sdcc1 >= 0)
+			si.filler.sdcc1 = sdcc1;
+		if (sdcc2 >= 0)
+			si.filler.sdcc2 = sdcc2;
+		if (si.filler.sdcc1 || si.filler.sdcc2)
+			LOGP(DAMPS, LOGL_INFO, "SDCC feature enabled on channel %s: SDCC1=%d, SDCC2=%d (mobiles echo a non-zero combination to indicate SDCC capability)\n", kanal[i], si.filler.sdcc1, si.filler.sdcc2);
+		/* Authentication: advertise AUTH in Word 1 when enabled. Warn that
+		 * the CAVE signature provider is absent, so responses cannot be
+		 * verified (TIA/EIA-553-A 2.3.12; see auth.c scaffold). */
+		si.word1.auth = auth_enable;
+		if (auth_enable) {
+			if (amps_auth_available())
+				LOGP(DAMPS, LOGL_INFO, "Authentication advertised (AUTH=1) on channel %s; CAVE provider registered.\n", kanal[i]);
+			else
+				LOGP(DAMPS, LOGL_NOTICE, "Authentication advertised (AUTH=1) on channel %s, but NO CAVE signature provider is registered -- responses will verify as UNAVAILABLE (scaffold only).\n", kanal[i]);
+		}
 		rc = amps_create(kanal[i], chan_type[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, do_pre_emphasis, do_de_emphasis, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, &si, sid, scc, polarity, send_callerid, tolerant, loopback);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");

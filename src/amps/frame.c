@@ -3588,6 +3588,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		memset(amps->rx_recc_dialing, 0, sizeof(amps->rx_recc_dialing));
 		amps->rx_recc_word_count = 0;
 		amps->rx_recc_nawc = nawc;
+		amps->rx_recc_auth_present = 0;
 		if (f == 0) {
 			LOGP_CHAN(DFRAME, LOGL_NOTICE, "Received first word, but F bit is not set.\n");
 			return 0;
@@ -3780,7 +3781,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 			if (nawc == 0) {
 				/* All words received - pass to handler */
 				LOGP_CHAN(DFRAME, LOGL_INFO, "RVC Called-Address complete: '%s'\n", amps->rx_recc_dialing);
-				amps_rx_recc(amps, 0, 0, 0, 0, 0, 0, 0, 0, 0, amps->rx_recc_dialing, 0, 0);
+				amps_rx_recc(amps, 0, 0, 0, 0, 0, 0, 0, 0, 0, amps->rx_recc_dialing, 0, 0, 0, 0);
 				amps->rx_recc_word_count = 0;
 			}
 			
@@ -3960,12 +3961,28 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		amps->rx_recc_order = frame->ie[AMPS_IE_ORDER];
 		amps->rx_recc_scm |= frame->ie[AMPS_IE_SCM] << 4;
 		amps->rx_recc_mpci = frame->ie[AMPS_IE_MPCI];
+		/* Mobile's echo of the SDCC the base broadcast. A non-zero
+		 * SDCC1/SDCC2 combination means the mobile supports SDCC;
+		 * zero means unused/unsupported (TIA/EIA-553-A 3.6.3.1, p.80). */
+		amps->rx_recc_sdcc1 = frame->ie[AMPS_IE_SDCC1];
+		amps->rx_recc_sdcc2 = frame->ie[AMPS_IE_SDCC2];
 	}
 	if (amps->rx_recc_word_count == 2 && frame) {
 		if (amps->si.word2.s)
 			amps->rx_recc_esn = frame->ie[AMPS_IE_ESN];
 		else
 			amps->rx_recc_esn = 0;
+	}
+	/* Extract AUTHR/COUNT/RANDC from Word C (Authentication) if present.
+	 * The decode path selects authentication_word at msg_count==3 when
+	 * AUTH is advertised and this is not an origination's digit word
+	 * (TIA/EIA-553-A 2.3.12; word layout p.90/91). */
+	if (msg_count == 3 && frame && amps->si.word1.auth
+	 && !(amps->rx_recc_t == 1 && amps->rx_recc_order == 0 && nawc == 0)) {
+		amps->rx_recc_authr = frame->ie[AMPS_IE_AUTHR];
+		amps->rx_recc_count = frame->ie[AMPS_IE_COUNT];
+		amps->rx_recc_randc = frame->ie[AMPS_IE_RANDC];
+		amps->rx_recc_auth_present = 1;
 	}
 	/* Extract MSPC and MSCAP from Word C (PCI) if present */
 	if (msg_count == 4 && frame && (amps->si.acc_type.pci_home || amps->si.acc_type.pci_roam)) {
@@ -4018,7 +4035,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 
 	if (msg_count >= 3 && amps->rx_recc_nawc == 0) {
 		/* if no digit messages are present, send NULL as dial string (paging reply) */
-		amps_rx_recc(amps, amps->rx_recc_t, amps->rx_recc_scm, amps->rx_recc_mpci, amps->rx_recc_esn, amps->rx_recc_min1, amps->rx_recc_min2, amps->rx_recc_msg_type, amps->rx_recc_ordq, amps->rx_recc_order, (msg_count > 4) ? amps->rx_recc_dialing : NULL, amps->rx_recc_mspc, amps->rx_recc_mscap);
+		amps_rx_recc(amps, amps->rx_recc_t, amps->rx_recc_scm, amps->rx_recc_mpci, amps->rx_recc_esn, amps->rx_recc_min1, amps->rx_recc_min2, amps->rx_recc_msg_type, amps->rx_recc_ordq, amps->rx_recc_order, (msg_count > 4) ? amps->rx_recc_dialing : NULL, amps->rx_recc_mspc, amps->rx_recc_mscap, amps->rx_recc_sdcc1, amps->rx_recc_sdcc2);
 	}
 
 
@@ -4164,11 +4181,18 @@ int amps_encode_frame_focc(amps_t *amps, char *bits)
 			 * by channel number and use its SAT; fall back to this
 			 * channel's SAT if the VC can't be found or none is assigned. */
 			amps->tx_focc_scc = amps->sat;
+			amps->tx_focc_vmac = amps->si.vmac;
 			if (trans->chan) {
 				sender_t *s;
 				for (s = sender_head; s; s = s->next) {
 					if (atoi(s->kanal) == trans->chan) {
 						amps->tx_focc_scc = ((amps_t *)s)->sat;
+						/* VMAC must be the ASSIGNED VC's power level, not
+						 * this control channel's (TIA/EIA-553-A p.91: VMAC
+						 * "indicates the mobile station power level
+						 * associated with the designated traffic channel").
+						 * Same CC-vs-VC shape as the SCC above. */
+						amps->tx_focc_vmac = ((amps_t *)s)->si.vmac;
 						break;
 					}
 				}
@@ -4200,7 +4224,7 @@ int amps_encode_frame_focc(amps_t *amps, char *bits)
 			word = amps_encode_word1_abbreviated_address_word(amps->si.dcc, amps->tx_focc_min1, 1);
 		else if (amps->tx_focc_word_count == 1) {
 			if (amps->tx_focc_chan)
-				word = amps_encode_word2_extended_address_word_b(amps->tx_focc_scc, amps->tx_focc_min2, amps->si.vmac, amps->tx_focc_chan);
+				word = amps_encode_word2_extended_address_word_b(amps->tx_focc_scc, amps->tx_focc_min2, amps->tx_focc_vmac, amps->tx_focc_chan);
 			else
 				word = amps_encode_word2_extended_address_word_a(amps->tx_focc_min2, amps->tx_focc_msg_type, amps->tx_focc_ordq, amps->tx_focc_order);
 		} else if (amps->tx_focc_word_count == 2) {

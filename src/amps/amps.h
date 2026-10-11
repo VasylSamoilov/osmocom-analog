@@ -155,6 +155,12 @@ struct amps {
 	uint8_t			rx_recc_mpci;
 	uint8_t			rx_recc_mspc;		/* from Word C - Protocol Capability */
 	uint8_t			rx_recc_mscap;		/* from Word C - Protocol Capability */
+	uint8_t			rx_recc_sdcc1;		/* mobile's echo of SDCC1 (Word B); non-zero combo => SDCC-capable, p.80 */
+	uint8_t			rx_recc_sdcc2;		/* mobile's echo of SDCC2 (Word B) */
+	uint32_t		rx_recc_authr;		/* mobile's AUTHR (Authentication Word C), 18-bit */
+	uint8_t			rx_recc_count;		/* mobile's COUNT (Authentication Word C), modulo-64 */
+	uint8_t			rx_recc_randc;		/* mobile's RANDC (Authentication Word C), 8-bit */
+	uint8_t			rx_recc_auth_present;	/* 1 = an authentication word was received this message */
 	char			rx_recc_dialing[33];	/* received dial string */
 	int			rx_rvc_esn_pending;	/* waiting for ESN word (Order 15 response) */
 	/* FOCC frame states */
@@ -165,6 +171,7 @@ struct amps {
 	uint16_t		tx_focc_min2;
 	int			tx_focc_chan;		/* channel to assign for voice call */
 	int			tx_focc_scc;		/* SAT color code of the ASSIGNED voice channel (not the CC's) per TIA/EIA-553-A 2.6.4.1 */
+	int			tx_focc_vmac;		/* VMAC = power level of the ASSIGNED voice channel (not the CC's) per TIA/EIA-553-A p.91 */
 	uint8_t			tx_focc_msg_type;	/* message (3 values) */
 	uint8_t			tx_focc_ordq;
 	uint8_t			tx_focc_order;
@@ -257,7 +264,7 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality);
 void amps_rx_sat(amps_t *amps, int tone, double quality);
 void amps_rx_sat_mismatch(amps_t *amps, enum sat_state expected, enum sat_state detected);
 const char *sat_state_name(enum sat_state state);
-void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing, uint8_t mspc, uint8_t mscap);
+void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing, uint8_t mspc, uint8_t mscap, uint8_t sdcc1, uint8_t sdcc2);
 transaction_t *amps_tx_frame_focc(amps_t *amps);
 transaction_t *amps_tx_frame_fvc(amps_t *amps);
 void amps_display_status();

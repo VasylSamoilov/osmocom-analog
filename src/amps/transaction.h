@@ -1,4 +1,6 @@
 
+#include "auth.h"
+
 enum amps_trans_state {
 	TRANS_NULL = 0,
 	TRANS_REGISTER_ACK,		/* attach request received, waiting to ack */
@@ -116,6 +118,8 @@ typedef struct transaction {
 	/* Handoff fields */
 	int			handoff_channel;	/* target channel for handoff */
 	int			handoff_scc;		/* target SAT color code for handoff */
+	/* Authentication (TIA/EIA-553-A 2.3.12) -- scaffold; see auth.h */
+	amps_auth_ctx		auth;			/* per-mobile authentication state */
 } transaction_t;
 
 transaction_t *create_transaction(amps_t *amps, enum amps_trans_state trans_state, uint32_t min1, uint16_t min2, uint32_t esn, uint8_t msg_type, uint8_t ordq, uint8_t order, uint16_t chan);

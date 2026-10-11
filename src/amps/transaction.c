@@ -311,6 +311,7 @@ transaction_t *create_transaction(amps_t *amps, enum amps_trans_state state, uin
 
 	osmo_timer_setup(&trans->timer, transaction_timeout, trans);
 
+	amps_auth_ctx_init(&trans->auth);
 	trans_new_state(trans, state);
 	trans->min1 = min1;
 	trans->min2 = min2;
