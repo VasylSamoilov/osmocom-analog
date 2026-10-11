@@ -874,6 +874,40 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 		nmt->rx_frame_count = 0;
 		nmt->tx_frame_count = 0;
 		break;
+	case NMT_MESSAGE_11b: /* priority MS (PMS) outgoing call (NMT Doc 450-1 4.4.1.7):
+			       * the MS pressed the priority button to make an outgoing call.
+			       * Frame 11b carries the subscriber number (NNNPZXXXXXXTJJJJ).
+			       * We page the MS with frame 2a to verify its identity, then
+			       * allocate a TC, and after "answer" (L=14) send L(3) to proceed
+			       * to unencrypted digit transmission (states 14-16 without SIS). */
+		if (!match_channel(nmt, frame))
+			break;
+		if (!is_chan_class_cc(nmt->sysinfo.chan_type)) {
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received PMS priority seizure (11b) on non-CC channel, ignoring.\n");
+			break;
+		}
+		/* extract subscriber from the 11b frame */
+		memset(&subscr, 0, sizeof(subscr));
+		nmt_value2digits(frame->ms_country, &subscr.country, 1);
+		nmt_value2digits(frame->ms_number, subscr.number, 6);
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received PMS priority seizure (frame 11b) from subscriber %c,%s -- MS wants to place a priority outgoing call (4.4.1.7).\n",
+			subscr.country, subscr.number);
+		/* create a transaction for the PMS outgoing call; callref = 0
+		 * (there is no incoming network call -- the MS is calling out) */
+		trans = create_transaction(&subscr);
+		if (!trans) {
+			LOGP(DNMT, LOGL_NOTICE, "Failed to create transaction for PMS call!\n");
+			break;
+		}
+		trans->priority = 1;		/* priority queueing (2c) if TC not immediately free */
+		trans->priority_mo = 1;		/* MO flag: post-answer → L(3) proceed + digit collection */
+		/* page the MS on this CC to verify its identity, exactly as the
+		 * standard's state 2a specifies ("MTX checks identity by sending normal
+		 * paging 2a to PMS"). nmt_page() handles the 3× paging retries. */
+		nmt->trans = trans;
+		trans->nmt = nmt;
+		nmt_page(trans, 1);
+		break;
 	case NMT_MESSAGE_10b: /* seizure from ordinary MS */
 	case NMT_MESSAGE_12: /* seizure from coinbox MS */
 	case NMT_MESSAGE_10a: /* access signal */
@@ -1405,8 +1439,12 @@ static void tx_mt_ident(nmt_t *nmt, frame_t *frame)
 	tx_ident(nmt, frame);
 	if (nmt->tx_frame_count == 8) {
 		LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout waiting for identity reply\n");
-		LOGP_CHAN(DNMT, LOGL_INFO, "Release call towards network.\n");
-		call_up_release(trans->callref, CAUSE_TEMPFAIL);
+		if (trans->priority_mo) {
+			LOGP_CHAN(DNMT, LOGL_INFO, "PMS priority MO call: no identity reply, releasing.\n");
+		} else {
+			LOGP_CHAN(DNMT, LOGL_INFO, "Release call towards network.\n");
+			call_up_release(trans->callref, CAUSE_TEMPFAIL);
+		}
 		destroy_transaction(trans);
 	}
 }
@@ -1426,6 +1464,16 @@ static void rx_mt_ident(nmt_t *nmt, frame_t *frame)
 			nmt_new_state(nmt, STATE_MT_AUTOANSWER);
 			nmt->wait_autoanswer = 1;
 			nmt->tx_frame_count = 0;
+		} else if (trans->priority_mo) {
+			/* PMS MO call (4.4.1.7): MS is calling OUT -- no incoming callref.
+			 * Send ringing L(9) ×4 (state 11 in the diagram) so the MS knows
+			 * the TC is ready and can lift the handset. No call_up_alerting(). */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "PMS priority MO call: identity received, sending ringing order (L=9) to notify MS the TC is ready.\n");
+			nmt_new_state(nmt, STATE_MT_RINGING);
+			nmt->tx_frame_count = 0;
+			nmt->tx_callerid_count = 0;
+			osmo_timer_schedule(&nmt->timer, RINGING_TO);
+			/* do NOT call call_up_alerting() -- there is no incoming call */
 		} else {
 			nmt_new_state(nmt, STATE_MT_RINGING);
 			/* start with caller ID before ringing */
@@ -1536,10 +1584,21 @@ static void rx_mt_ringing(nmt_t *nmt, frame_t *frame)
 			break;
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received 'answer' from phone (line signal L(14) '%s').\n",
 			nmt_linesignal_name(14, 0));
-		nmt_new_state(nmt, STATE_MT_COMPLETE);
-		nmt->tx_frame_count = 0;
 		osmo_timer_del(&nmt->timer);
-		call_up_answer(trans->callref, &trans->subscriber.country);
+		if (trans->priority_mo) {
+			/* PMS MO call (4.4.1.7, state 14 without SIS): MS has lifted the
+			 * handset and is ready to dial. Send L(3) proceed (tx_mo_confirm,
+			 * 2 frames) then enter STATE_MO_DIALING to collect 14a/14b digits
+			 * from the MS. call_up_setup() follows once dialing is complete. */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "PMS priority MO call: MS answered, entering MO dialing mode (proceed L(3) -> digit collection).\n");
+			nmt_new_state(nmt, STATE_MO_CONFIRM);
+			nmt->tx_frame_count = 0;
+			/* no call_up_answer() -- there is no incoming call to answer */
+		} else {
+			nmt_new_state(nmt, STATE_MT_COMPLETE);
+			nmt->tx_frame_count = 0;
+			call_up_answer(trans->callref, &trans->subscriber.country);
+		}
 		break;
 	default:
 		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame->mt), nmt_state_name(nmt->state));
@@ -1650,9 +1709,14 @@ static void timeout_mt_ringing(nmt_t *nmt)
 	transaction_t *trans = nmt->trans;
 
 	LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout while waiting for answer of the phone.\n");
-	LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
-	call_up_release(trans->callref, CAUSE_NOANSWER);
-	trans->callref = 0;
+	if (trans->priority_mo) {
+		/* PMS MO call: MS didn't lift the handset -- just release the TC. */
+		LOGP_CHAN(DNMT, LOGL_INFO, "PMS priority MO call: no answer (handset not lifted), releasing.\n");
+	} else {
+		LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
+		call_up_release(trans->callref, CAUSE_NOANSWER);
+		trans->callref = 0;
+	}
 	nmt_release(nmt);
 }
 
