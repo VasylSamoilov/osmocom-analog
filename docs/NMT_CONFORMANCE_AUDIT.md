@@ -309,7 +309,12 @@ genuine deviations, worst-interesting first:
    receiving, making all 256 code points operator-accessible (round-trip proven by
    `test_sms_escape`). The glyph tables for character sets 1–3 (Baltic/Central/Western) are
    the handset's; the SC carries octets verbatim.
-9. **DMS NR flow-control is a FIXME** — not acted on. §8.
+9. **DMS NR flow-control** — **FIXED** (branch `fix/nmt-dms-nr`): a received NR
+   (receive-not-ready) frame now acknowledges up to (n-1) like RR (shared `dms_ack_upto`)
+   AND sets a `peer_busy` condition that holds back new I-frames in
+   `trigger_frame_transmission` (a pending RR still goes, being our own ack); a later RR
+   clears it. RR ack behaviour unchanged (test_dms passes after the refactor); the NR path
+   reuses that tested ack logic plus the busy gate. §8.
 10. **RP-User-Data IEI 0x41 vs 0x42** doc/impl discrepancy (code flags doc as wrong;
     which real MSs use is UNCONFIRMED). §8.
 

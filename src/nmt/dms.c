@@ -361,6 +361,14 @@ void trigger_frame_transmission(nmt_t *nmt)
 		return;
 	}
 
+	/* peer signalled not-ready (NR): hold back new I-frames until it clears
+	 * the condition with an RR. The pending RR above is still sent, because it
+	 * is our acknowledgement to the peer, not an I-frame. */
+	if (dms->state.peer_busy) {
+		LOGP(DDMS, LOGL_DEBUG, "Peer is busy (NR), not sending new frames.\n");
+		return;
+	}
+
 	/* get next frame to send */
 	/* loop 4 times, because only 4 unacked frames may be transmitted */
 	dms_frame = dms->state.frame_list;
@@ -515,21 +523,15 @@ static void dms_rx_dt(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n, uint8_t *data
 	trigger_frame_transmission(nmt);
 }
 
-/* decode RR frame from mobile */
-static void dms_rx_rr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
+/* Acknowledge all frames up to (n-1): flush them from the send list and advance
+ * the ack/send counters.  Shared by RR and NR (both carry an acknowledgement;
+ * NR additionally signals the peer-busy condition).  Returns 1 if the ack
+ * matched an outstanding frame, 0 if it was already acked (ignored). */
+static int dms_ack_upto(nmt_t *nmt, uint8_t n)
 {
 	dms_t *dms = &nmt->dms;
 	struct dms_frame *dms_frame, *dms_frame_next;
 	int i, j;
-
-	if (!dms->state.started)
-		return;
-
-	if (dms->state.dir != d && !dms_allow_loopback) {
-		/* drop frames with wrong direction indicator */
-		LOGP(DDMS, LOGL_INFO, "DMS frame ignored, direction indicator mismatch!\n");
-		return;
-	}
 
 	/* check to which entry in the list of frames this ack belongs to */
 	/* loop 4 times, because only 4 unacked frames may have been transmitted */
@@ -540,13 +542,9 @@ static void dms_rx_rr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 		dms_frame = dms_frame->next;
 	}
 
-	/* if we don't find a frame, it must have been already acked, so we ignore RR */
-	if (!dms_frame || i == 4) {
-		LOGP(DDMS, LOGL_DEBUG, "Received already acked DMS frame: RR(%d) (s = %d), ignoring\n", n, s);
-		return;
-	}
-
-	LOGP(DDMS, LOGL_INFO, "Received valid DMS frame: RR(%d) (s = %d)\n", n, s);
+	/* if we don't find a frame, it must have been already acked, so we ignore it */
+	if (!dms_frame || i == 4)
+		return 0;
 
 	/* flush all acked frames. */
 	dms_frame = dms->state.frame_list;
@@ -568,11 +566,45 @@ static void dms_rx_rr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 		dms_frame = dms_frame_next;
 	}
 
+	return 1;
+}
+
+/* decode RR frame from mobile */
+static void dms_rx_rr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
+{
+	dms_t *dms = &nmt->dms;
+
+	if (!dms->state.started)
+		return;
+
+	if (dms->state.dir != d && !dms_allow_loopback) {
+		/* drop frames with wrong direction indicator */
+		LOGP(DDMS, LOGL_INFO, "DMS frame ignored, direction indicator mismatch!\n");
+		return;
+	}
+
+	if (!dms_ack_upto(nmt, n)) {
+		LOGP(DDMS, LOGL_DEBUG, "Received already acked DMS frame: RR(%d) (s = %d), ignoring\n", n, s);
+		return;
+	}
+
+	LOGP(DDMS, LOGL_INFO, "Received valid DMS frame: RR(%d) (s = %d)\n", n, s);
+
+	/* RR clears any peer-busy condition previously signalled by NR */
+	if (dms->state.peer_busy) {
+		LOGP(DDMS, LOGL_INFO, "Peer is ready again (RR after NR), resuming transmission\n");
+		dms->state.peer_busy = 0;
+	}
+
 	/* now trigger frame transmission */
 	trigger_frame_transmission(nmt);
 }
 
-/* decode NR frame from mobile */
+/* decode NR (receive-not-ready) frame from mobile.
+ * NR carries an acknowledgement up to (n-1) like RR, but additionally tells us
+ * the peer's receiver is temporarily busy: we must stop sending new I-frames
+ * until the peer clears the condition with a later RR (Annex 21 / para 1.2.1
+ * flow control). */
 static void dms_rx_nr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 {
 	dms_t *dms = &nmt->dms;
@@ -588,9 +620,18 @@ static void dms_rx_nr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 
 	LOGP(DDMS, LOGL_INFO, "Received valid DMS frame: NR(%d) (s = %d)\n", n, s);
 
-	// FIXME: support NR
+	/* process the acknowledgement part (ignored if already acked) */
+	dms_ack_upto(nmt, n);
 
-	/* now trigger frame transmission */
+	/* set the peer-busy condition: trigger_frame_transmission() will hold back
+	 * new I-frames (but still honour a pending RR) until an RR clears it. */
+	if (!dms->state.peer_busy) {
+		LOGP(DDMS, LOGL_INFO, "Peer signalled not-ready (NR), pausing new frame transmission\n");
+		dms->state.peer_busy = 1;
+	}
+
+	/* still process the queue: a pending RR may need sending, and any
+	 * acknowledged frames were just flushed. */
 	trigger_frame_transmission(nmt);
 }
 

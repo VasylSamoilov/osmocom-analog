@@ -19,6 +19,7 @@ struct dms_state {
 	int			eight_bits;		/* what mode are used for DT frames */
 	struct dms_frame	*frame_list;		/* list of frames to transmit */
 	int			send_rr;		/* RR must be sent next */
+	int			peer_busy;		/* peer sent NR (receive-not-ready): pause new I-frames until RR */
 };
 
 typedef struct dms {
