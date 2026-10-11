@@ -63,6 +63,7 @@ static int sms_ref = 0;
 #define RINGING_TO	60,0	/* how long may the phone ring */
 #define SUPERVISORY_TO1	3	/* 3 sec to detect after setup */
 #define SUPERVISORY_TO2	20,0	/* 20 sec lost until abort */
+#define RECALL_TO	30,0	/* register recall: max time to receive all digits (4.4.1.10) */
 #define SCIP_TO		0,553000	/* T' = 553 ms (4 frames): MS re-identify window on the new TC (NMT 450-1 Scheme C2') */
 #define DTMF_DURATION	0.1	/* 100ms */
 
@@ -149,6 +150,8 @@ static const char *nmt_active_state_name(enum nmt_active_state state)
 	case ACTIVE_STATE_REGISTER_RECALL:	return "register-recall";
 	case ACTIVE_STATE_COINBOX_ANSWER:	return "coin-box answer (5b)";
 	case ACTIVE_STATE_POWER_CHANGE:		return "power-change (3a)";
+	case ACTIVE_STATE_RECALL_PROCEED:	return "register-recall (L(3) proceed)";
+	case ACTIVE_STATE_RECALL_DIGITS:	return "register-recall (digit collection)";
 	}
 	return "unknown";
 }
@@ -2012,18 +2015,17 @@ static void timeout_scip_ident(nmt_t *nmt)
  * handle call
  */
 
-/* True while the MFT converter is being set up, active, or torn down. During
- * this window the standard (NMT Doc 450-1 4.4.1.9, states 4-5 / 11) has the MTX
- * order the BS to SUPPRESS the ø-signal (supervisory) alarm, because the MS is
- * sending digits (DTMF) instead of maintaining the ø-signal, so the supervision
- * detector would otherwise time out and drop the call. In this combined MTX+BS
- * node there is no external BS to send frame 20 to, so the suppression is applied
- * locally: the supervisory timeout is not armed while this predicate holds. */
+/* True while the MFT converter is being set up, active, or torn down, OR while
+ * a register-recall digit session is in progress. During these windows the MS is
+ * sending digital frames instead of maintaining the ø-signal, so the supervision
+ * alarm must be locally suppressed (NMT Doc 450-1 4.4.1.9/4.4.1.10). */
 static int nmt_in_mft(nmt_t *nmt)
 {
 	return nmt->active_state == ACTIVE_STATE_MFT_IN
 	    || nmt->active_state == ACTIVE_STATE_MFT
-	    || nmt->active_state == ACTIVE_STATE_MFT_OUT;
+	    || nmt->active_state == ACTIVE_STATE_MFT_OUT
+	    || nmt->active_state == ACTIVE_STATE_RECALL_PROCEED
+	    || nmt->active_state == ACTIVE_STATE_RECALL_DIGITS;
 }
 
 void nmt_rx_super(nmt_t *nmt, int tone, double quality)
@@ -2057,6 +2059,28 @@ void nmt_rx_super(nmt_t *nmt, int tone, double quality)
 static void timeout_active(nmt_t *nmt, int duration)
 {
 	transaction_t *trans = nmt->trans;
+
+	/* Register recall inactivity timeout (4.4.1.10, state 9): the MS stopped
+	 * sending digits (or never started). Log the collected code, cancel the
+	 * ø-signal alarm suppression, and return to voice. */
+	if (nmt->active_state == ACTIVE_STATE_RECALL_DIGITS) {
+		if (trans->recall_code_len > 0) {
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall complete: collected code '%.*s' (%d digit%s). STANDARD POINT REACHED (4.4.1.10 state 9) -- no MTX register backend to process this code; returning to voice.\n",
+				trans->recall_code_len, trans->recall_code, trans->recall_code_len,
+				trans->recall_code_len == 1 ? "" : "s");
+		} else {
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall timeout: no digits received from MS; returning to voice.\n");
+		}
+		/* cancel ø-signal suppression (local equivalent of frame 20 A=10, 4.4.1.10 state 10) */
+		if (nmt->supervisory) {
+			super_reset(nmt);
+			osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
+			LOGP_CHAN(DNMT, LOGL_INFO, "Resuming supervisory alarm after register recall (local equivalent of frame 20 A=10 to BS).\n");
+		}
+		nmt->active_state = ACTIVE_STATE_VOICE;
+		nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+		return;
+	}
 
 	if (duration == SUPERVISORY_TO1)
 		LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout after %d seconds not receiving supervisory signal.\n", duration);
@@ -2125,25 +2149,33 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 		}
 		switch (ls) {
 		case 5:
-			/* Register recall (NMT Doc 450-1 4.3.2 L(5) in frame 13a, procedure
-			 * 4.7.2.11 "Subscriber service by register recall and code sending").
-			 * In conversation state the subscriber requests that a REGISTER in the
-			 * MTX be connected to the line; digits/codes are then sent MS->MTX using
-			 * the authentication frame pair (frame 7 request / frame 16 response,
-			 * per 4.7.2.11 which refers to 4.7.2.1). We decode the request and move
-			 * to the register-recall state, but STOP here: there is no MTX register /
-			 * digit-collection / supplementary-service back-end in this single-node
-			 * emulator to connect the line to, so the standard's next step cannot be
-			 * performed. The call stays up (voice) -- we do not drop or alter it. */
+			/* Register recall (NMT Doc 450-1 4.4.1.10 / 4.7.2.11): the MS requests
+			 * that the MTX connect a register to the line for code sending.
+			 * The MTX must acknowledge with L(3) "proceed to send unencrypted
+			 * digits" (state 6 in the diagram), preceded by idle frames and the
+			 * local equivalent of the ø-signal alarm suppression (frame 20 A=4/A=7
+			 * to BS; no external BS, so suppressed locally via nmt_in_mft).
+			 * Digit collection (14a/14b) follows in ACTIVE_STATE_RECALL_DIGITS. */
 			if (nmt->active_state != ACTIVE_STATE_VOICE) {
-				LOGP_CHAN(DNMT, LOGL_NOTICE, "Received register-recall request (L(5)) outside voice state; ignoring.\n");
+				LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall request (L(5) '%s') received outside voice state (%s); ignoring.\n",
+					nmt_linesignal_name(5, 0), nmt_active_state_name(nmt->active_state));
 				break;
 			}
-			nmt->active_state = ACTIVE_STATE_REGISTER_RECALL;
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall requested (L(5), NMT Doc 450-1 4.7.2.11): the MS asks to connect an MTX register to the line for code sending. STANDARD POINT REACHED but NOT IMPLEMENTED -- this emulator has no MTX register / digit-collection back-end, so no register is connected and no supplementary-service code can be processed. Call stays in voice; the MS will see no register response.\n");
-			/* Remain in conversation: nothing to send back, so drop straight back to
-			 * voice so the open call is not stuck in a dead sub-state. */
-			nmt->active_state = ACTIVE_STATE_VOICE;
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall requested (L(5) '%s'): entering proceed + digit-collection mode (4.4.1.10).\n",
+				nmt_linesignal_name(5, 0));
+			/* suppress ø-signal alarm (same as MFT: delete timer, kept suppressed
+			 * by nmt_in_mft while in recall states) */
+			if (nmt->supervisory) {
+				osmo_timer_del(&nmt->timer);
+				LOGP_CHAN(DNMT, LOGL_INFO, "Suppressing supervisory alarm during register recall (local equivalent of frame 20 A=7 to BS).\n");
+			}
+			/* clear digit buffer */
+			memset(trans->recall_code, 0, sizeof(trans->recall_code));
+			trans->recall_code_len = 0;
+			trans->recall_mft_num = 0;
+			nmt->active_state = ACTIVE_STATE_RECALL_PROCEED;
+			nmt->tx_frame_count = 0;
+			nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
 			break;
 		case 8:
 			if (nmt->active_state != ACTIVE_STATE_VOICE)
@@ -2179,6 +2211,27 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			break;
 		if (!match_area(nmt, frame))
 			break;
+		/* register recall digit collection (4.4.1.10): 14a carries odd-position
+		 * digits; collect into trans->recall_code and restart the inactivity timer. */
+		if (nmt->active_state == ACTIVE_STATE_RECALL_DIGITS) {
+			if (!(trans->recall_mft_num & 1)) {
+				/* validate triple repetition */
+				if (((frame->digit >> 8) & 0xf) != ((frame->digit >> 4) & 0xf)
+				 || ((frame->digit >> 4) & 0xf) != (frame->digit & 0xf)) {
+					LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall: digit repetition mismatch in 14a, ignoring corrupt frame.\n");
+					break;
+				}
+				char d = nmt_value2digit(frame->digit);
+				if (trans->recall_code_len < (int)sizeof(trans->recall_code) - 1)
+					trans->recall_code[trans->recall_code_len++] = d;
+				trans->recall_mft_num++;
+				LOGP_CHAN(DNMT, LOGL_INFO, "Register recall digit (odd) received: '%c' (code so far: '%.*s').\n",
+					d, trans->recall_code_len, trans->recall_code);
+				/* restart inactivity timeout */
+				osmo_timer_schedule(&nmt->timer, RECALL_TO);
+			}
+			break;
+		}
 		if (nmt->active_state != ACTIVE_STATE_MFT) {
 			/* A keypress digit (frame 14a) arrived without, or before completing,
 			 * the MFT-converter-in handshake (L(8) request -> L(4) ack, 4.4.1.9).
@@ -2212,6 +2265,24 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			break;
 		if (!match_area(nmt, frame))
 			break;
+		/* register recall: 14b carries even-position digits */
+		if (nmt->active_state == ACTIVE_STATE_RECALL_DIGITS) {
+			if (trans->recall_mft_num & 1) {
+				if (((frame->digit >> 8) & 0xf) != ((frame->digit >> 4) & 0xf)
+				 || ((frame->digit >> 4) & 0xf) != (frame->digit & 0xf)) {
+					LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall: digit repetition mismatch in 14b, ignoring corrupt frame.\n");
+					break;
+				}
+				char d = nmt_value2digit(frame->digit);
+				if (trans->recall_code_len < (int)sizeof(trans->recall_code) - 1)
+					trans->recall_code[trans->recall_code_len++] = d;
+				trans->recall_mft_num++;
+				LOGP_CHAN(DNMT, LOGL_INFO, "Register recall digit (even) received: '%c' (code so far: '%.*s').\n",
+					d, trans->recall_code_len, trans->recall_code);
+				osmo_timer_schedule(&nmt->timer, RECALL_TO);
+			}
+			break;
+		}
 		if (nmt->active_state != ACTIVE_STATE_MFT) {
 			/* Keypress digit (frame 14b) outside MFT state: see 14a above. */
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14b: received outside MFT converter state (%s); MFT-in handshake (L(8)->L(4)) not completed, keypress ignored.\n", nmt_active_state_name(nmt->active_state));
@@ -2247,6 +2318,27 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 	transaction_t *trans = nmt->trans;
 
 	switch (nmt->active_state) {
+	case ACTIVE_STATE_RECALL_PROCEED:
+		/* Register recall proceed (NMT Doc 450-1 4.4.1.10, state 6): send L(3)
+		 * "proceed to send unencrypted digits" 4 times, then switch to dialtone
+		 * so the subscriber hears the register is ready. */
+		set_line_signal(nmt, frame, 3);
+		if (++nmt->tx_frame_count == 1)
+			LOGP_CHAN(DNMT, LOGL_INFO, "Sending register recall proceed (L(3) '%s'): MS may now send digits.\n",
+				nmt_linesignal_name(3, 1));
+		if (nmt->tx_frame_count >= 4) {
+			LOGP_CHAN(DNMT, LOGL_INFO, "Register recall: proceed sent; entering digit collection.\n");
+			nmt->active_state = ACTIVE_STATE_RECALL_DIGITS;
+			nmt->tx_frame_count = 0;
+			nmt_set_dsp_mode(nmt, DSP_MODE_DIALTONE);
+		}
+		break;
+	case ACTIVE_STATE_RECALL_DIGITS:
+		/* Register recall digit collection (4.4.1.10, states 7-9a): send idle
+		 * frames while the MS transmits 14a/14b digit pairs. The digit handler
+		 * in rx_active collects them into trans->recall_code. */
+		frame->mt = NMT_MESSAGE_6;
+		break;
 	case ACTIVE_STATE_POWER_CHANGE:
 		/* MS output power change (NMT Doc 450-1 4.4.1.8): send frame 3a up to
 		 * max T (8 frames) carrying the same TC channel number but with the
