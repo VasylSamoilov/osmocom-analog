@@ -811,6 +811,27 @@ int rds_paging_bcd_encode(const char *digits, int len, uint8_t *nibbles, int max
 	return count;
 }
 
+/* Encode functions-message characters to hex nibbles (EN 50067 M.3.5.6).
+ * Functions use the full 0-F range (0xA is a literal hex digit here, not the
+ * BCD space); a literal space maps to 0xA as in the numeric convention. */
+int rds_paging_hex_encode(const char *digits, int len, uint8_t *nibbles, int max_nibbles)
+{
+	int i, count = 0;
+
+	for (i = 0; i < len && count < max_nibbles; i++) {
+		char c = digits[i];
+		if (c >= '0' && c <= '9')
+			nibbles[count++] = c - '0';
+		else if (c >= 'A' && c <= 'F')
+			nibbles[count++] = 10 + (c - 'A');
+		else if (c >= 'a' && c <= 'f')
+			nibbles[count++] = 10 + (c - 'a');
+		else if (c == ' ')
+			nibbles[count++] = RDS_PAGING_BCD_SPACE;
+	}
+	return count;
+}
+
 /* Decode BCD nibbles to digit string.
  * 0x0-0x9 -> '0'-'9', 0xA -> ' '.
  * Nibbles 0xB-0xF treated as space with warning.
@@ -833,6 +854,31 @@ int rds_paging_bcd_decode(const uint8_t *nibbles, int count, char *digits, int m
 	return len;
 }
 
+/* Decode functions-message nibbles to a hex string (EN 50067 M.3.5.6).
+ * 0x0-0x9 -> '0'-'9', 0xA-0xF -> 'A'-'F' (full hex range, no space mapping). */
+int rds_paging_hex_decode(const uint8_t *nibbles, int count, char *digits, int max_len)
+{
+	int i, len = 0;
+
+	for (i = 0; i < count && len < max_len - 1; i++) {
+		uint8_t n = nibbles[i] & 0x0F;
+		digits[len++] = (n < 10) ? ('0' + n) : ('A' + (n - 10));
+	}
+	digits[len] = '\0';
+	return len;
+}
+
+/* Decode a variable-length data group's nibbles by message type: functions
+ * use the full hex 0-F alphabet, numeric uses BCD (0-9 with 0xA = space). */
+static int rds_paging_vdata_decode(enum rds_paging_msg_type type,
+				   const uint8_t *nibbles, int count,
+				   char *digits, int max_len)
+{
+	if (type == RDS_PAGING_FUNCTIONS)
+		return rds_paging_hex_decode(nibbles, count, digits, max_len);
+	return rds_paging_bcd_decode(nibbles, count, digits, max_len);
+}
+
 /* Human-readable helpers for paging log fields */
 static const char *rds_paging_type_name(enum rds_paging_msg_type type)
 {
@@ -842,6 +888,9 @@ static const char *rds_paging_type_name(enum rds_paging_msg_type type)
 	case RDS_PAGING_NUM18: return "NUM18";
 	case RDS_PAGING_ALPHA: return "ALPHA";
 	case RDS_PAGING_VNUM:  return "VNUM";
+	case RDS_PAGING_FUNCTIONS: return "FUNC";
+	case RDS_PAGING_INTL15: return "INTL15";
+	case RDS_PAGING_INTLFUNC: return "INTLFUNC";
 	default:               return "?";
 	}
 }
@@ -937,12 +986,20 @@ static uint8_t rds_paging_build_ctrl(rds_paging_msg_t *msg)
 		break;
 	case RDS_PAGING_NUM10:
 	case RDS_PAGING_NUM18:
-		/* Basic numeric: no control byte (lower byte = message digits) */
+	case RDS_PAGING_INTL15:
+	case RDS_PAGING_INTLFUNC:
+		/* Basic / international basic formats: no control byte (the block D
+		 * lower byte carries message digits or country-code digits). */
 		break;
 	case RDS_PAGING_VNUM:
 		/* 0 1 NI R P3 P2 P1 P0 */
 		ctrl |= (msg->ni & 1) << RDS_PAGING_CTRL_NI_BIT;
 		ctrl |= (RDS_PAGING_CTRL_MT_NUMERIC << RDS_PAGING_CTRL_MT_SHIFT);
+		break;
+	case RDS_PAGING_FUNCTIONS:
+		/* 1 1 NI R P3 P2 P1 P0 */
+		ctrl |= (msg->ni & 1) << RDS_PAGING_CTRL_NI_BIT;
+		ctrl |= (RDS_PAGING_CTRL_MT_FUNCTIONS << RDS_PAGING_CTRL_MT_SHIFT);
 		break;
 	}
 
@@ -1214,6 +1271,94 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
+	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
+/* Public API: queue a variable-length functions message (EN 50067 M.3.5.6).
+ * digits is a hex string 0-9/A-F; encoded with the full hex alphabet. */
+int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
+				  const char *digits, int repeats, int interval_sec,
+				  uint8_t ni, uint16_t country_code, uint8_t opc)
+{
+	rds_paging_msg_t *msg;
+	int len;
+
+	if (address > RDS_PAGING_ADDR_MAX || !digits)
+		return -1;
+
+	len = strlen(digits);
+	if (ni && country_code > 0) {
+		if (len > 156) len = 156; /* international max */
+	} else {
+		if (len > RDS_PAGING_VNUM_MAX) len = RDS_PAGING_VNUM_MAX;
+	}
+
+	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
+	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+
+	msg = rds_paging_msg_alloc(RDS_PAGING_FUNCTIONS, address, digits, len, repeats - 1, interval_sec);
+	if (!msg)
+		return -1;
+	msg->ni = ni;
+	msg->country_code = country_code;
+	msg->opc = opc;
+
+	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
+/* Public API: queue a 15-digit international numeric message (M.2.1.6.5). */
+int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
+			       const char *digits, int repeats, int interval_sec,
+			       uint16_t country_code)
+{
+	rds_paging_msg_t *msg;
+	int len;
+
+	if (address > RDS_PAGING_ADDR_MAX || !digits)
+		return -1;
+	len = strlen(digits);
+	if (len > 15) len = 15;
+	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
+	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+
+	msg = rds_paging_msg_alloc(RDS_PAGING_INTL15, address, digits, len, repeats - 1, interval_sec);
+	if (!msg)
+		return -1;
+	msg->ni = 1;
+	msg->country_code = country_code;
+	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
+/* Public API: queue an international functions message (M.2.1.6.6). digits is
+ * a hex string 0-9/A-F, up to 7 characters. */
+int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
+				 const char *digits, int repeats, int interval_sec,
+				 uint16_t country_code)
+{
+	rds_paging_msg_t *msg;
+	int len;
+
+	if (address > RDS_PAGING_ADDR_MAX || !digits)
+		return -1;
+	len = strlen(digits);
+	if (len > 7) len = 7;
+	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
+	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
+	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
+
+	msg = rds_paging_msg_alloc(RDS_PAGING_INTLFUNC, address, digits, len, repeats - 1, interval_sec);
+	if (!msg)
+		return -1;
+	msg->ni = 1;
+	msg->country_code = country_code;
 	rds_paging_enqueue(&rds->paging, msg);
 	rds_paging_start_next(rds);
 	return 0;
@@ -2732,12 +2877,14 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		break;
 	}
 
-	case RDS_PAGING_VNUM: {
-		/* Variable-length numeric paging -- EN 50067 M.3.5.5 (Fig M.15, Table M.15).
-		 * Uses the SAME PSAC space as alphanumeric (1000 addr, 1001..1110 cyclic,
-		 * 1111 end) but the CONTROL BYTE MT field is 01 (numeric) instead of
-		 * 00 (alpha). The RX decodes MT from the control byte and routes to VNUM.
-		 * 8 BCD digits per data group (vs 4 chars for alpha).
+	case RDS_PAGING_VNUM:
+	case RDS_PAGING_FUNCTIONS: {
+		/* Variable-length numeric (M.3.5.5, Fig M.15) and functions (M.3.5.6,
+		 * Fig M.16) paging. Both use the SAME PSAC space as alphanumeric
+		 * (1000 addr, 1001..1110 cyclic, 1111 end) and 8 nibbles per data
+		 * group; they differ only in the control-byte MT field (01 numeric /
+		 * 11 functions, set by build_ctrl) and the digit alphabet: numeric is
+		 * BCD 0-9 (hex A = space), functions is full hex 0-F.
 		 * Up to 160 digits national / 156 international.
 		 * International M.3.5.7: second group carries country code + OPC in block C. */
 		int len = msg->data_len;
@@ -2749,8 +2896,11 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		if (len > max_len)
 			len = max_len;
 
-		/* Encode digits to BCD nibbles */
-		rds_paging_bcd_encode(msg->data, len, nibbles, len);
+		/* Encode digits to nibbles (hex 0-F for functions, BCD 0-9 otherwise) */
+		if (msg->type == RDS_PAGING_FUNCTIONS)
+			rds_paging_hex_encode(msg->data, len, nibbles, len);
+		else
+			rds_paging_bcd_encode(msg->data, len, nibbles, len);
 
 		/* Group 0: address + control byte (ctrl has MT=01 set by build_ctrl) */
 		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;   /* 0x8 per M.3.5.5 */
@@ -2780,14 +2930,19 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			di = 0;
 		}
 
-		/* Remaining data groups: 8 BCD digits each, PSAC cycles 0x9..0xE, end 0xF */
+		/* Remaining data groups: 8 nibbles each, PSAC cycles 0x9..0xE, end 0xF.
+		 * The end group carries "the last eight or fewer digits" (Table M.15/
+		 * M.16); unused trailing nibbles are not message data. Pad numeric with
+		 * the BCD space 0xA (its documented space marker); functions have no
+		 * space marker (full 0-F alphabet), so pad with 0x0 -- 0xA would be a
+		 * literal 'A' digit. */
 		{
 			int remaining = len - di;
+			uint8_t pad = (msg->type == RDS_PAGING_FUNCTIONS) ? 0x0 : RDS_PAGING_BCD_SPACE;
 			if (remaining < 0) remaining = 0;
 			padded_len = ((remaining + 7) / 8) * 8;
-			/* Pad nibbles array with BCD space (0xA) */
 			for (i = len; i < di + padded_len; i++)
-				nibbles[i] = RDS_PAGING_BCD_SPACE;
+				nibbles[i] = pad;
 			ngroups = padded_len / 8;
 			if (ngroups == 0) ngroups = 1; /* at least one end group */
 		}
@@ -2808,6 +2963,72 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		}
 
 		pag->tx_total_groups = idx;
+		break;
+	}
+
+	case RDS_PAGING_INTL15: {
+		/* International 15-digit numeric (EN 50067 M.2.1.6.5, Fig M.6, Table
+		 * M.5). Fixed 3-group sequence PSAC 7 -> 5 -> 6, no control byte.
+		 * Country code X1X2X3 split: X1X2 in group 1 block D low byte, X3 in
+		 * group 2 block C high nibble. 15 BCD digits A1..A15. */
+		uint8_t nib[RDS_PAGING_NUM18_DIGITS];
+		char padded[16];
+		uint16_t cc = msg->country_code;
+		uint8_t x1 = (cc / 100) & 0xF, x2 = (cc / 10) % 10, x3 = cc % 10;
+		int i, plen = msg->data_len;
+
+		if (plen > 15)
+			plen = 15;
+		memcpy(padded, msg->data, plen);
+		for (i = plen; i < 15; i++)
+			padded[i] = ' ';
+		rds_paging_bcd_encode(padded, 15, nib, 15);
+
+		/* Group 0 (PSAC 7): address + country digits X1 X2 */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_INTL15;
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (x1 << 4) | x2;
+		/* Group 1 (PSAC 5): X3 + digits A1..A7 */
+		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;
+		pag->tx_blocks_c[1] = (x3 << 12) | (nib[0] << 8) | (nib[1] << 4) | nib[2];
+		pag->tx_blocks_d[1] = (nib[3] << 12) | (nib[4] << 8) | (nib[5] << 4) | nib[6];
+		/* Group 2 (PSAC 6): digits A8..A15 */
+		pag->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;
+		pag->tx_blocks_c[2] = (nib[7] << 12) | (nib[8] << 8) | (nib[9] << 4) | nib[10];
+		pag->tx_blocks_d[2] = (nib[11] << 12) | (nib[12] << 8) | (nib[13] << 4) | nib[14];
+		pag->tx_total_groups = 3;
+		break;
+	}
+
+	case RDS_PAGING_INTLFUNC: {
+		/* International functions message (EN 50067 M.2.1.6.6, Fig M.7, Table
+		 * M.6). Fixed 2-group sequence PSAC 1 -> 3, no control byte. Country
+		 * code X1X2X3 (X1X2 in group 1 block D low byte, X3 in group 2 block C
+		 * high nibble), then 7 hex functions digits F1..F7. */
+		uint8_t nib[8];
+		char padded[8];
+		uint16_t cc = msg->country_code;
+		uint8_t x1 = (cc / 100) & 0xF, x2 = (cc / 10) % 10, x3 = cc % 10;
+		int i, plen = msg->data_len;
+
+		if (plen > 7)
+			plen = 7;
+		memcpy(padded, msg->data, plen);
+		rds_paging_hex_encode(padded, plen, nib, plen);
+		/* Functions have no space marker; pad unused trailing nibbles with 0x0
+		 * (0xA would be a literal hex 'A'). End group carries "fewer" digits. */
+		for (i = plen; i < 7; i++)
+			nib[i] = 0x0;
+
+		/* Group 0 (PSAC 1): address + country digits X1 X2 */
+		pag->tx_psac_seq[0] = RDS_7A_PSAC_FUNC_ADDR;
+		pag->tx_blocks_c[0] = addr_c;
+		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (x1 << 4) | x2;
+		/* Group 1 (PSAC 3): X3 + functions digits F1..F7 */
+		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM10_DATA;
+		pag->tx_blocks_c[1] = (x3 << 12) | (nib[0] << 8) | (nib[1] << 4) | nib[2];
+		pag->tx_blocks_d[1] = (nib[3] << 12) | (nib[4] << 8) | (nib[5] << 4) | nib[6];
+		pag->tx_total_groups = 2;
 		break;
 	}
 	}
@@ -9628,6 +9849,40 @@ static void rds_decode_group(rds_decoder_t *rds)
 		}
 
 		switch (psac) {
+		case RDS_7A_PSAC_FUNC_ADDR: {
+			/* PSAC 1: international functions address group (M.2.1.6.6).
+			 * Address in C + D high byte; D low byte = country digits X1 X2. */
+			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			pd->address = addr;
+			pd->msg_type = RDS_PAGING_INTLFUNC;
+			pd->assembling = 1;
+			pd->assembly_start = time(NULL);
+			pd->msg_len = 0;
+			pd->last_ni = 1;
+			pd->last_country_code = ((b4 >> 4) & 0xF) * 100 + (b4 & 0xF) * 10;
+			pd->expected_psac = RDS_7A_PSAC_NUM10_DATA;
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: INTLFUNC addr=%02u-%04u flag=%s (assembling)\n",
+				     addr / 10000, addr % 10000, PAG_AB(ab_flag));
+			break;
+		}
+		case RDS_7A_PSAC_INTL15: {
+			/* PSAC 7: international 15-digit numeric address group (M.2.1.6.5).
+			 * Address in C + D high byte; D low byte = country digits X1 X2. */
+			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
+			pd->address = addr;
+			pd->msg_type = RDS_PAGING_INTL15;
+			pd->assembling = 1;
+			pd->assembly_start = time(NULL);
+			pd->msg_len = 0;
+			pd->last_ni = 1;
+			pd->last_country_code = ((b4 >> 4) & 0xF) * 100 + (b4 & 0xF) * 10;
+			pd->expected_psac = RDS_7A_PSAC_NUM18_DATA1;
+			if (rds->verbose)
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: INTL15 addr=%02u-%04u flag=%s (assembling)\n",
+				     addr / 10000, addr % 10000, PAG_AB(ab_flag));
+			break;
+		}
 		case RDS_7A_PSAC_TONE: {
 			/* Tone-only: single group, address in C+D upper, ctrl in D lower */
 			uint32_t addr = rds_paging_addr_unpack(b3, (b4 >> 8) & 0xFF);
@@ -9662,13 +9917,46 @@ static void rds_decode_group(rds_decoder_t *rds)
 			rds_paging_bcd_decode(nib, 2, pd->msg_buf, sizeof(pd->msg_buf));
 			pd->msg_len = 2;
 			pd->expected_psac = RDS_7A_PSAC_NUM10_DATA;
-			if (rds->verbose)
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM10 addr=%02u-%04u flag=%s (assembling: \"%.*s????????\")\n",
-				     addr / 10000, addr % 10000, PAG_AB(ab_flag),
-				     pd->msg_len, pd->msg_buf);
+			if (rds->verbose) {
+				char prog[RDS_PAGING_NUM10_DIGITS + 1];
+				int k;
+				for (k = 0; k < RDS_PAGING_NUM10_DIGITS; k++)
+					prog[k] = (k < pd->msg_len) ? pd->msg_buf[k] : '_';
+				prog[RDS_PAGING_NUM10_DIGITS] = '\0';
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM10 addr=%02u-%04u flag=%s (assembling: \"%s\")\n",
+				     addr / 10000, addr % 10000, PAG_AB(ab_flag), prog);
+			}
 			break;
 		}
 		case RDS_7A_PSAC_NUM10_DATA: {
+			/* PSAC 3: 10-digit numeric data group, OR the international
+			 * functions data group (X3 + F1..F7 hex). */
+			if (pd->assembling && pd->msg_type == RDS_PAGING_INTLFUNC) {
+				/* Block C: X3 (hi nibble) completes country code; F1 F2 F3.
+				 * Block D: F4 F5 F6 F7. Functions use full hex 0-F. */
+				uint8_t x3 = (b3 >> 12) & 0xF;
+				pd->last_country_code += x3;
+				uint8_t nib[7] = {
+					(b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
+					(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
+				};
+				char tmp[8];
+				int n = rds_paging_hex_decode(nib, 7, tmp, sizeof(tmp));
+				memcpy(pd->msg_buf + pd->msg_len, tmp, n);
+				pd->msg_len += n;
+				pd->msg_buf[pd->msg_len] = '\0';
+				pd->assembling = 0;
+				pd->msg_valid = 1;
+				pd->last_type = RDS_PAGING_INTLFUNC;
+				pd->last_address = pd->address;
+				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
+				pd->last_msg_len = pd->msg_len;
+				const char *cname = mcc_name(pd->last_country_code);
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: INTLFUNC addr=%02u-%04u MCC=%d(%s) msg=\"%s\"\n",
+				     pd->address / 10000, pd->address % 10000,
+				     pd->last_country_code, cname ? cname : "?", pd->last_msg);
+				break;
+			}
 			/* 10-digit numeric: data group (8 digits) */
 			if (!pd->assembling || pd->msg_type != RDS_PAGING_NUM10) {
 				if (rds->debug)
@@ -9706,14 +9994,60 @@ static void rds_decode_group(rds_decoder_t *rds)
 			rds_paging_bcd_decode(nib, 2, pd->msg_buf, sizeof(pd->msg_buf));
 			pd->msg_len = 2;
 			pd->expected_psac = RDS_7A_PSAC_NUM18_DATA1;
-			if (rds->verbose)
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u flag=%s (assembling: \"%.*s????????????????\")\n",
-				     addr / 10000, addr % 10000, PAG_AB(ab_flag),
-				     pd->msg_len, pd->msg_buf);
+			if (rds->verbose) {
+				char prog[RDS_PAGING_NUM18_DIGITS + 1];
+				int k;
+				for (k = 0; k < RDS_PAGING_NUM18_DIGITS; k++)
+					prog[k] = (k < pd->msg_len) ? pd->msg_buf[k] : '_';
+				prog[RDS_PAGING_NUM18_DIGITS] = '\0';
+				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u flag=%s (assembling: \"%s\")\n",
+				     addr / 10000, addr % 10000, PAG_AB(ab_flag), prog);
+			}
 			break;
 		}
 		case RDS_7A_PSAC_NUM18_DATA1:
 		case RDS_7A_PSAC_NUM18_DATA2: {
+			/* PSAC 5/6: 18-digit national data groups, OR 15-digit
+			 * international data groups (M.2.1.6.5). */
+			if (pd->assembling && pd->msg_type == RDS_PAGING_INTL15) {
+				if (psac == RDS_7A_PSAC_NUM18_DATA1) {
+					/* Group 2: X3 (block C hi nibble) completes country
+					 * code, then A1 A2 A3 (C) + A4 A5 A6 A7 (D). */
+					uint8_t x3 = (b3 >> 12) & 0xF;
+					pd->last_country_code += x3;
+					uint8_t nib[7] = {
+						(b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
+						(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
+					};
+					char tmp[8];
+					int n = rds_paging_bcd_decode(nib, 7, tmp, sizeof(tmp));
+					memcpy(pd->msg_buf + pd->msg_len, tmp, n);
+					pd->msg_len += n;
+					pd->expected_psac = RDS_7A_PSAC_NUM18_DATA2;
+				} else {
+					/* Group 3: A8..A15 (8 digits across C and D). */
+					uint8_t nib[8] = {
+						(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
+						(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
+					};
+					char tmp[9];
+					int n = rds_paging_bcd_decode(nib, 8, tmp, sizeof(tmp));
+					memcpy(pd->msg_buf + pd->msg_len, tmp, n);
+					pd->msg_len += n;
+					pd->msg_buf[pd->msg_len] = '\0';
+					pd->assembling = 0;
+					pd->msg_valid = 1;
+					pd->last_type = RDS_PAGING_INTL15;
+					pd->last_address = pd->address;
+					memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
+					pd->last_msg_len = pd->msg_len;
+					const char *cname = mcc_name(pd->last_country_code);
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: INTL15 addr=%02u-%04u MCC=%d(%s) msg=\"%s\"\n",
+					     pd->address / 10000, pd->address % 10000,
+					     pd->last_country_code, cname ? cname : "?", pd->last_msg);
+				}
+				break;
+			}
 			/* 18-digit numeric: data groups */
 			if (!pd->assembling || pd->msg_type != RDS_PAGING_NUM18) {
 				if (rds->debug)
@@ -9748,10 +10082,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 				     pd->address / 10000, pd->address % 10000, pd->last_msg_len, pd->last_msg);
 			} else {
 				pd->expected_psac = RDS_7A_PSAC_NUM18_DATA2;
-				if (rds->verbose)
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u (assembling: \"%.*s????????\")\n",
-					     pd->address / 10000, pd->address % 10000,
-					     pd->msg_len, pd->msg_buf);
+				if (rds->verbose) {
+					char prog[RDS_PAGING_NUM18_DIGITS + 1];
+					int k;
+					for (k = 0; k < RDS_PAGING_NUM18_DIGITS; k++)
+						prog[k] = (k < pd->msg_len) ? pd->msg_buf[k] : '_';
+					prog[RDS_PAGING_NUM18_DIGITS] = '\0';
+					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u (assembling: \"%s\")\n",
+					     pd->address / 10000, pd->address % 10000, prog);
+				}
 			}
 			break;
 		}
@@ -9777,7 +10116,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->last_country_code = 0;
 			pd->last_opc = 0;
 			pd->intl_pending = pd->last_ni; /* expect country code in next group */
-			pd->msg_type = (mt == RDS_PAGING_CTRL_MT_NUMERIC) ? RDS_PAGING_VNUM : RDS_PAGING_ALPHA;
+			pd->msg_type = (mt == RDS_PAGING_CTRL_MT_NUMERIC)   ? RDS_PAGING_VNUM
+				       : (mt == RDS_PAGING_CTRL_MT_FUNCTIONS) ? RDS_PAGING_FUNCTIONS
+									      : RDS_PAGING_ALPHA;
 			if (rds->verbose)
 				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u flag=%s %s tx=%s cnt=%d ctrl=0x%02X (assembling)\n",
 				     rds_paging_type_name(pd->msg_type),
@@ -9790,30 +10131,32 @@ static void rds_decode_group(rds_decoder_t *rds)
 			/* PSAC=0xF: end-of-message for alpha or vnum.
 			 * This group carries the final data, not an empty sentinel. */
 			if (!pd->assembling ||
-			    (pd->msg_type != RDS_PAGING_ALPHA && pd->msg_type != RDS_PAGING_VNUM)) {
+			    (pd->msg_type != RDS_PAGING_ALPHA && pd->msg_type != RDS_PAGING_VNUM &&
+			     pd->msg_type != RDS_PAGING_FUNCTIONS)) {
 				if (rds->debug)
 					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: end (PSAC=F) without address, ignoring\n");
 				break;
 			}
-			if (pd->msg_type == RDS_PAGING_VNUM) {
-				/* Extract 8 BCD digits from blocks C and D */
+			if (pd->msg_type != RDS_PAGING_ALPHA) {
+				/* VNUM / FUNCTIONS: extract 8 nibbles from blocks C and D */
 				uint8_t nib[8] = {
 					(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
 					(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
 				};
 				char tmp[9];
-				int n = rds_paging_bcd_decode(nib, 8, tmp, sizeof(tmp));
+				int n = rds_paging_vdata_decode(pd->msg_type, nib, 8, tmp, sizeof(tmp));
 				if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
 					memcpy(pd->msg_buf + pd->msg_len, tmp, n);
 					pd->msg_len += n;
 				}
-				/* Strip trailing BCD spaces */
-				while (pd->msg_len > 0 && pd->msg_buf[pd->msg_len - 1] == ' ')
-					pd->msg_len--;
+				/* Strip trailing BCD spaces (numeric only; functions has none) */
+				if (pd->msg_type == RDS_PAGING_VNUM)
+					while (pd->msg_len > 0 && pd->msg_buf[pd->msg_len - 1] == ' ')
+						pd->msg_len--;
 				pd->assembling = 0;
 				pd->msg_buf[pd->msg_len] = '\0';
 				pd->msg_valid = 1;
-				pd->last_type = RDS_PAGING_VNUM;
+				pd->last_type = pd->msg_type;
 				pd->last_address = pd->address;
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
@@ -9861,10 +10204,11 @@ static void rds_decode_group(rds_decoder_t *rds)
 			break;
 		}
 		default:
-			/* PSAC 9-14: data groups for alpha or vnum */
+			/* PSAC 9-14: data groups for alpha, vnum or functions */
 			if (psac >= RDS_7A_PSAC_ALPHA_DATA_FIRST && psac <= RDS_7A_PSAC_ALPHA_DATA_LAST) {
 				if (!pd->assembling ||
-				    (pd->msg_type != RDS_PAGING_ALPHA && pd->msg_type != RDS_PAGING_VNUM)) {
+				    (pd->msg_type != RDS_PAGING_ALPHA && pd->msg_type != RDS_PAGING_VNUM &&
+				     pd->msg_type != RDS_PAGING_FUNCTIONS)) {
 					if (rds->debug)
 						LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: data (PSAC=%d) without address, ignoring\n", psac);
 					break;
@@ -9889,13 +10233,13 @@ static void rds_decode_group(rds_decoder_t *rds)
 						     pd->last_opc);
 					}
 					/* Block D carries partial message data */
-					if (pd->msg_type == RDS_PAGING_VNUM) {
+					if (pd->msg_type != RDS_PAGING_ALPHA) {
 						uint8_t nib[4] = {
 							(b4 >> 12) & 0xF, (b4 >> 8) & 0xF,
 							(b4 >> 4) & 0xF, b4 & 0xF
 						};
 						char tmp[5];
-						int n = rds_paging_bcd_decode(nib, 4, tmp, sizeof(tmp));
+						int n = rds_paging_vdata_decode(pd->msg_type, nib, 4, tmp, sizeof(tmp));
 						if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
 							memcpy(pd->msg_buf + pd->msg_len, tmp, n);
 							pd->msg_len += n;
@@ -9907,14 +10251,14 @@ static void rds_decode_group(rds_decoder_t *rds)
 							pd->msg_buf[pd->msg_len++] = b4 & 0xFF;
 						}
 					}
-				} else if (pd->msg_type == RDS_PAGING_VNUM) {
-					/* 8 BCD digits per group */
+				} else if (pd->msg_type != RDS_PAGING_ALPHA) {
+					/* VNUM / FUNCTIONS: 8 nibbles per group */
 					uint8_t nib[8] = {
 						(b3 >> 12) & 0xF, (b3 >> 8) & 0xF, (b3 >> 4) & 0xF, b3 & 0xF,
 						(b4 >> 12) & 0xF, (b4 >> 8) & 0xF, (b4 >> 4) & 0xF, b4 & 0xF
 					};
 					char tmp[9];
-					int n = rds_paging_bcd_decode(nib, 8, tmp, sizeof(tmp));
+					int n = rds_paging_vdata_decode(pd->msg_type, nib, 8, tmp, sizeof(tmp));
 					if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
 						memcpy(pd->msg_buf + pd->msg_len, tmp, n);
 						pd->msg_len += n;
@@ -9942,10 +10286,6 @@ static void rds_decode_group(rds_decoder_t *rds)
 						     psac, pd->address / 10000, pd->address % 10000, alpha_partial);
 					}
 				}
-			} else if (psac == RDS_7A_PSAC_INTL15) {
-				/* International 15-digit - log but don't decode */
-				if (rds->verbose)
-					LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: International 15-digit (PSAC=7), not decoded\n");
 			} else {
 				if (rds->debug)
 					LOGP(DRADIO, LOGL_DEBUG, "RDS 7A: unknown PSAC=%d\n", psac);
@@ -12460,6 +12800,9 @@ void rds_decoder_status(rds_decoder_t *rds)
 				case RDS_PAGING_NUM18: type_str = "NUM18"; break;
 				case RDS_PAGING_ALPHA: type_str = "ALPHA"; break;
 				case RDS_PAGING_VNUM:  type_str = "VNUM";  break;
+				case RDS_PAGING_FUNCTIONS: type_str = "FUNC"; break;
+				case RDS_PAGING_INTL15: type_str = "INTL15"; break;
+				case RDS_PAGING_INTLFUNC: type_str = "INTLFUNC"; break;
 				}
 				if (pd->last_msg_len > 0) {
 					char paging_disp[257];

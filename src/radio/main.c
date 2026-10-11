@@ -455,7 +455,7 @@ static void print_help(const char *arg0)
 	printf("          saving sync interval. RPC=0 means no paging. Default 4 covers\n");
 	printf("          address groups 00-99 with sync=0 (recommended).\n");
 	printf("        FIFO format: address,type,options,message\n");
-	printf("        Types: tone, numeric, numeric10, numeric18, alpha, vnum\n");
+	printf("        Types: tone, numeric, numeric10, numeric18, alpha, vnum, functions, intl15, intlfunc\n");
 	printf("        Options (space-separated key=value, can be empty):\n");
 	printf("          repeat=N      total send count, 1-15 (default 1)\n");
 	printf("          interval=N    seconds between repeats (default 5)\n");
@@ -1069,7 +1069,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 		LOGP(DRADIO, LOGL_NOTICE,
 		     "RDS paging FIFO: format is address,type,options,message\n"
 		     "  address: 0-999999\n"
-		     "  types:   tone|numeric|numeric10|numeric18|alpha|vnum\n"
+		     "  types:   tone|numeric|numeric10|numeric18|alpha|vnum|functions|intl15|intlfunc\n"
 		     "  options: repeat=N interval=N tonetype=N ni=0|1 cc=NNN opc=N\n"
 		     "  message: payload after 3rd comma (commas allowed)\n"
 		     "  examples:\n"
@@ -1185,6 +1185,37 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: VNUM addr=%02u-%04u len=%d repeat=%d interval=%d nat msg=\"%s\"\n",
 			     address / 10000, address % 10000, msg_len, repeat, interval, msg);
 		}
+	} else if (!strcasecmp(type_buf, "functions") || !strcasecmp(type_buf, "func")) {
+		if (msg_len <= 0) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: functions requires hex digits\n");
+			return;
+		}
+		rds_enc_paging_send_functions(enc, address, msg, repeat, interval, ni, country_code, opc);
+		if (ni) {
+			const char *cname = mcc_name(country_code);
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: FUNC addr=%02u-%04u len=%d repeat=%d interval=%d intl MCC=%d(%s) OPC=%d msg=\"%s\"\n",
+			     address / 10000, address % 10000, msg_len, repeat, interval,
+			     country_code, cname ? cname : "?", opc, msg);
+		} else {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: FUNC addr=%02u-%04u len=%d repeat=%d interval=%d nat msg=\"%s\"\n",
+			     address / 10000, address % 10000, msg_len, repeat, interval, msg);
+		}
+	} else if (!strcasecmp(type_buf, "intl15")) {
+		if (msg_len <= 0 || !country_code) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: intl15 requires digits and cc=\n");
+			return;
+		}
+		rds_enc_paging_send_intl15(enc, address, msg, repeat, interval, country_code);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: INTL15 addr=%02u-%04u len=%d MCC=%d msg=\"%s\"\n",
+		     address / 10000, address % 10000, msg_len, country_code, msg);
+	} else if (!strcasecmp(type_buf, "intlfunc")) {
+		if (msg_len <= 0 || !country_code) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: intlfunc requires hex digits and cc=\n");
+			return;
+		}
+		rds_enc_paging_send_intlfunc(enc, address, msg, repeat, interval, country_code);
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging FIFO: INTLFUNC addr=%02u-%04u len=%d MCC=%d msg=\"%s\"\n",
+		     address / 10000, address % 10000, msg_len, country_code, msg);
 	} else {
 		LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: unknown type '%s'\n", type_buf);
 	}

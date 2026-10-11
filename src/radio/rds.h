@@ -680,6 +680,7 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 
 /* PSAC values (EN 50067 Annex M Table M.2) */
 #define RDS_7A_PSAC_TONE        0x0     /* Tone-only (1 group) */
+#define RDS_7A_PSAC_FUNC_ADDR   0x1     /* International functions: address group (M.2.1.6.6) */
 #define RDS_7A_PSAC_NUM10_ADDR  0x2     /* 10-digit numeric: address group */
 #define RDS_7A_PSAC_NUM10_DATA  0x3     /* 10-digit numeric: data group */
 #define RDS_7A_PSAC_NUM18_ADDR  0x4     /* 18-digit numeric: address group */
@@ -739,6 +740,7 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_CTRL_E_SHIFT     5   /* Shift for E2-E0 (tone-only) */
 #define RDS_PAGING_CTRL_MT_ALPHA    0   /* MT=00: alphanumeric */
 #define RDS_PAGING_CTRL_MT_NUMERIC  1   /* MT=01: variable-length numeric */
+#define RDS_PAGING_CTRL_MT_FUNCTIONS 3  /* MT=11: variable-length functions */
 
 /* Human-readable log helpers for paging fields */
 #define PAG_AB(x)  ((x) ? "B" : "A")        /* A/B flag: new-call toggle */
@@ -1484,6 +1486,9 @@ enum rds_paging_msg_type {
 	RDS_PAGING_NUM18 = 2,	/* 18-digit numeric (3 groups, basic) */
 	RDS_PAGING_ALPHA = 3,	/* Alphanumeric up to 80 chars */
 	RDS_PAGING_VNUM  = 4,	/* Variable-length numeric up to 160 digits (enhanced) */
+	RDS_PAGING_FUNCTIONS = 5, /* Variable-length functions, hex 0-F (M.3.5.6) */
+	RDS_PAGING_INTL15 = 6,	/* International 15-digit numeric (M.2.1.6.5, PSAC 7/5/6) */
+	RDS_PAGING_INTLFUNC = 7, /* International functions message (M.2.1.6.6, PSAC 1/3) */
 };
 
 /* Queued paging message */
@@ -2350,6 +2355,8 @@ uint8_t rds_enc_eon_build_enable_flags(const rds_eon_entry_t *eon);
 /* BCD encoding/decoding utilities */
 int rds_paging_bcd_encode(const char *digits, int len, uint8_t *nibbles, int max_nibbles);
 int rds_paging_bcd_decode(const uint8_t *nibbles, int count, char *digits, int max_len);
+int rds_paging_hex_encode(const char *digits, int len, uint8_t *nibbles, int max_nibbles);
+int rds_paging_hex_decode(const uint8_t *nibbles, int count, char *digits, int max_len);
 
 /* Address packing/unpacking */
 void rds_paging_addr_pack(uint32_t address, uint16_t *block_c, uint8_t *block_d_hi);
@@ -2367,6 +2374,15 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 			     const char *digits, int repeats, int interval_sec,
 			     uint8_t ni, uint16_t country_code, uint8_t opc);
+int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
+				  const char *digits, int repeats, int interval_sec,
+				  uint8_t ni, uint16_t country_code, uint8_t opc);
+int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
+			       const char *digits, int repeats, int interval_sec,
+			       uint16_t country_code);
+int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
+				 const char *digits, int repeats, int interval_sec,
+				 uint16_t country_code);
 
 /* Configuration -- encoder setters */
 void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable);
