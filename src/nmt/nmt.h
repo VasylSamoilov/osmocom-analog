@@ -68,6 +68,11 @@ enum nmt_active_state {
 	ACTIVE_STATE_POWER_CHANGE,	/* MS output power change (NMT Doc 450-1 4.4.1.8): sending 3a with
 					 * the new power level in Na (max T); waits for 10b ack then updates
 					 * nmt->sysinfo.ms_power and resumes voice. */
+	ACTIVE_STATE_RECALL_PROCEED,	/* register recall (NMT Doc 450-1 4.4.1.10): sending L(3) proceed-
+					 * to-send after the MS's L(5) register-recall request. */
+	ACTIVE_STATE_RECALL_DIGITS,	/* register recall: collecting 14a/14b digit pairs from the MS
+					 * into trans->recall_code; returns to voice after address-complete
+					 * or timeout, logging the collected code. */
 };
 
 enum nmt_direction {

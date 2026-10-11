@@ -20,6 +20,9 @@ typedef struct transaction {
 	int			coinbox_answer_pending;	/* coin-box: far end answered, frame 5b (tariff) must be sent next */
 	int			priority_mo;		/* PMS: MS-initiated MO call via priority seizure (4.4.1.7); no network callref */
 	int			pending_power;		/* power-change (4.4.1.8): -1 = none, else new ms_power to request via 3a */
+	char			recall_code[64];	/* register recall (4.4.1.10): digits collected via 14a/14b */
+	int			recall_code_len;	/* number of recall digits collected so far */
+	int			recall_mft_num;		/* odd/even parity counter for 14a/14b sequencing during recall */
 	int			priority;		/* MS replied with priority seizure (11b): queue with 2c, not 2f */
 
 	/* caller ID */
