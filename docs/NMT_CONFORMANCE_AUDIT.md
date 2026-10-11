@@ -338,18 +338,20 @@ genuine deviations, worst-interesting first:
 12. **Frame 16 SRES** — **FIXED** (same branch): now recovers the 16-bit SRES by majority
     across the three R1R2R3R4 copies and logs a mismatch, instead of a flat 48-bit value
     (dormant while auth is logging-only, but now correct).
-13. **Battery-saving frames** — **DOCUMENTED, implementable but unimplemented** (§4.3.3.12).
-    These are a CC broadcast (1a-class, Z=14, H1=14/H2=11 marker) telling a *group* of idle
-    phones (grouped by last subscriber digit X6 via H7, schemes A=H7(1)+H7(2) / B=H7(3..7) /
-    C=H7(8)) they may sleep for the H3 period (0..280 frames, 1 frame=138.33 ms); the MTX
-    buffers calls to sleeping phones until the group's wake window. **To originate them**
-    osmocom would need: a battery-saving 1a-variant TX frame, a scheduler emitting one per
-    group from the CC `tx_idle` path when nothing higher-priority is pending (H3/scheme as
-    config), AND — for correctness — deferral of a page to a sleeping group until its wake
-    window (coupling `nmt_page` to the schedule). Not done because it is a network-capacity
-    optimisation with no benefit at emulator scale, and a half-implementation (broadcast
-    without page-deferral) could make a conformant phone sleep through a call. Decoder maps a
-    received one to 1a (we never receive these — they are MTX→MS).
+13. **Battery-saving frames** — **IMPLEMENTED as an off-by-default option** (branch
+    `fix/nmt-battery-saving-sis-demo`): the idle CC frame already carried the H1=14/H2=11
+    marker with hardcoded H7=8/H3=0 ("no saving"); now H3 (period) and H7 (group) are
+    configurable via `-b/--battery-saving <0..9>`, default 0 = disabled = byte-identical to
+    the previous behaviour. When enabled, phones in the addressed group may sleep for the H3
+    period. Honest limitation documented at `nmt_page`: frame-exact deferral of a page to a
+    sleeping group's wake window is NOT implemented, so a long period can outlast the 3×
+    paging retries — documented, not silently shipped.
+
+**SIS authentication DEMONSTRATOR** (same branch, `-E/--sis-demo 1`): optional, off by
+default. When enabled, `tx_ident` originates frame 7 (RAND) and the received frame 16 (SRES)
+is majority-decoded and logged — but there is **no real SIS algorithm** (the SAK is a secret
+operator key, never public), so it cannot authenticate. Every log line and comment labels it
+a demonstrator so it is never mistaken for working authentication.
 14. **Frame 25 cause value / BS alarm levels** — logged complete in raw hex (A/super/limit/c);
     this is a BS→MTX OBSERVE frame we never receive, and the §4.3.3.14 cause-name table was
     not PNG-confirmed, so no fabricated name expansion. Left as the adequate raw-hex observe.

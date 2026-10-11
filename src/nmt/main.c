@@ -101,6 +101,9 @@ int supervisory[MAX_SENDER] = { 1 };
 const char *smsc_number = "767";
 int send_callerid = 0;
 int send_clock = 0;
+int bs_period = 0;	/* battery saving: H3 period code, 0 = disabled (default) */
+int bs_group = 8;	/* battery saving: H7 group code (default 8 = all) */
+int sis_demo = 0;	/* SIS authentication demonstrator, off by default */
 
 void print_help(const char *arg0)
 {
@@ -141,6 +144,13 @@ void print_help(const char *arg0)
 	printf("        If set, the caller ID is sent while ringing the phone. (default = '%d')\n", send_callerid);
 	printf(" -U --clock 1 | 0\n");
 	printf("        If set, the current time is transmitted with CC. (default = '%d')\n", send_clock);
+	printf(" -b --battery-saving <H3 period 0..9>\n");
+	printf("        Enable battery saving on the calling channel (NMT Doc 450-1 4.3.3.12).\n");
+	printf("        0 = disabled (phones never sleep), 1..9 = sleep period code\n");
+	printf("        (24/40/56/72/88/112/168/224/280 frames). (default = '%d')\n", bs_period);
+	printf(" -E --sis-demo 1 | 0\n");
+	printf("        Enable the SIS authentication DEMONSTRATOR (frame 7/16 exchange only;\n");
+	printf("        there is NO real SIS algorithm, it cannot authenticate). (default = '%d')\n", sis_demo);
 	printf("        Note that this works only with pure CC, not with combined CC+TC.\n");
 	main_mobile_print_station_id();
 	main_mobile_print_hotkeys();
@@ -159,6 +169,8 @@ static void add_options(void)
 	option_add('S', "smsc-number", 1);
 	option_add('I', "caller-id", 1);
 	option_add('U', "clock", 1);
+	option_add('b', "battery-saving", 1);
+	option_add('E', "sis-demo", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -258,6 +270,16 @@ error_ta:
 		break;
 	case 'U':
 		send_clock = atoi(argv[argi]);
+		break;
+	case 'b':
+		bs_period = atoi(argv[argi]);
+		if (bs_period < 0 || bs_period > 9) {
+			fprintf(stderr, "Battery-saving period '%s' out of range, use H3 code 0..9 (0 = disabled)\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case 'E':
+		sis_demo = atoi(argv[argi]);
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -546,7 +568,7 @@ int main(int argc, char *argv[])
 
 	/* create transceiver instance */
 	for (i = 0; i < num_kanal; i++) {
-		rc = nmt_create(nmt_system, country, kanal[i], chan_type[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, do_pre_emphasis, do_de_emphasis, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, ms_power, traffic_area, area_no, compandor, supervisory[i], smsc_number, send_callerid, send_clock, loopback);
+		rc = nmt_create(nmt_system, country, kanal[i], chan_type[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, do_pre_emphasis, do_de_emphasis, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, ms_power, traffic_area, area_no, compandor, supervisory[i], smsc_number, send_callerid, send_clock, bs_period, bs_group, sis_demo, loopback);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create transceiver instance. Quitting!\n");
 			goto fail;
