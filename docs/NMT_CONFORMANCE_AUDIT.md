@@ -338,9 +338,18 @@ genuine deviations, worst-interesting first:
 12. **Frame 16 SRES** — **FIXED** (same branch): now recovers the 16-bit SRES by majority
     across the three R1R2R3R4 copies and logs a mismatch, instead of a flat 48-bit value
     (dormant while auth is logging-only, but now correct).
-13. **Battery-saving frames** — **DOCUMENTED** (same branch): Z=14 maps to 1a with a comment
-    explaining the single-node MTX never originates battery-saving (no scheduler), so there
-    is no H3/H7 behaviour to decode-and-act-on. Not a live path.
+13. **Battery-saving frames** — **DOCUMENTED, implementable but unimplemented** (§4.3.3.12).
+    These are a CC broadcast (1a-class, Z=14, H1=14/H2=11 marker) telling a *group* of idle
+    phones (grouped by last subscriber digit X6 via H7, schemes A=H7(1)+H7(2) / B=H7(3..7) /
+    C=H7(8)) they may sleep for the H3 period (0..280 frames, 1 frame=138.33 ms); the MTX
+    buffers calls to sleeping phones until the group's wake window. **To originate them**
+    osmocom would need: a battery-saving 1a-variant TX frame, a scheduler emitting one per
+    group from the CC `tx_idle` path when nothing higher-priority is pending (H3/scheme as
+    config), AND — for correctness — deferral of a page to a sleeping group until its wake
+    window (coupling `nmt_page` to the schedule). Not done because it is a network-capacity
+    optimisation with no benefit at emulator scale, and a half-implementation (broadcast
+    without page-deferral) could make a conformant phone sleep through a call. Decoder maps a
+    received one to 1a (we never receive these — they are MTX→MS).
 14. **Frame 25 cause value / BS alarm levels** — logged complete in raw hex (A/super/limit/c);
     this is a BS→MTX OBSERVE frame we never receive, and the §4.3.3.14 cause-name table was
     not PNG-confirmed, so no fabricated name expansion. Left as the adequate raw-hex observe.
