@@ -19,6 +19,7 @@ typedef struct transaction {
 	int			page_deferred;		/* battery saving: page is waiting for the group's wake window */
 	int			coinbox_answer_pending;	/* coin-box: far end answered, frame 5b (tariff) must be sent next */
 	int			priority_mo;		/* PMS: MS-initiated MO call via priority seizure (4.4.1.7); no network callref */
+	int			pending_power;		/* power-change (4.4.1.8): -1 = none, else new ms_power to request via 3a */
 	int			priority;		/* MS replied with priority seizure (11b): queue with 2c, not 2f */
 
 	/* caller ID */

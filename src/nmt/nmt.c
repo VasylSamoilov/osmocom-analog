@@ -2063,6 +2063,27 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 		osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO2);
 
 	switch (frame->mt) {
+	case NMT_MESSAGE_10b: /* identity with new power level (NMT Doc 450-1 4.4.1.8) */
+		if (nmt->active_state != ACTIVE_STATE_POWER_CHANGE)
+			break;
+		if (!match_channel(nmt, frame))
+			break;
+		if (!match_subscriber(trans, frame))
+			break;
+		/* The MS re-identifies with 10b carrying the new power level in N1.
+		 * Decode N1 to get the new power and update our sysinfo accordingly. */
+		{
+			int new_power = trans->pending_power;
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received power-change ack (frame 10b): MS confirmed new power level %d (was %d).\n",
+				new_power, nmt->sysinfo.ms_power);
+			nmt->sysinfo.ms_power = new_power;
+			trans->pending_power = -1;
+			nmt->active_state = ACTIVE_STATE_VOICE;
+			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+			if (nmt->supervisory)
+				super_reset(nmt);
+		}
+		break;
 	case NMT_MESSAGE_13b: /* coin-box answer acknowledgment with echoed tariff class */
 		if (!match_channel(nmt, frame))
 			break;
@@ -2210,6 +2231,30 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 	transaction_t *trans = nmt->trans;
 
 	switch (nmt->active_state) {
+	case ACTIVE_STATE_POWER_CHANGE:
+		/* MS output power change (NMT Doc 450-1 4.4.1.8): send frame 3a up to
+		 * max T (8 frames) carrying the same TC channel number but with the
+		 * new power level encoded in Na. The MS re-identifies with 10b carrying
+		 * the new power level; that response is handled in rx_active. */
+		if (nmt->tx_frame_count == 1)
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Sending power change order (frame 3a, new power=%d).\n", trans->pending_power);
+		frame->mt = NMT_MESSAGE_3a;
+		frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+		frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+		frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
+		frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
+		/* Na = new TC with new power level */
+		frame->tc_no = nmt_encode_tc(nmt->sysinfo.system, atoi(nmt->sender.kanal), trans->pending_power);
+		if (++nmt->tx_frame_count >= 8) {
+			/* T expired without 10b ack -- MS did not respond; stay on old power */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Power change timeout: no 10b ack from MS, keeping power=%d.\n", nmt->sysinfo.ms_power);
+			trans->pending_power = -1;
+			nmt->active_state = ACTIVE_STATE_VOICE;
+			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+			if (nmt->supervisory)
+				super_reset(nmt);
+		}
+		break;
 	case ACTIVE_STATE_COINBOX_ANSWER:
 		/* Coin-box answer sequence (NMT Doc 450-1 4.4.1.6, state 13): send frame 5b
 		 * carrying the operator-supplied tariff class 4 times, then return to
@@ -3338,6 +3383,65 @@ void deliver_move(const char *command)
 		return;
 	}
 	printf("MOVE ordered.\n");
+}
+
+/* Change MS output power level during a call (NMT Doc 450-1 §4.4.1.8).
+ * Command format: <7-digit-number>,<power-level 0-7>
+ * The MTX sends frame 3a (same TC, new power encoded in Na) up to T (8 frames).
+ * The MS re-identifies with 10b confirming the new power; nmt->sysinfo.ms_power
+ * is then updated for all subsequent channel-number encodings.
+ * Example: echo "3735859,2" > /tmp/nmt_power */
+void deliver_power_change(const char *command)
+{
+	char buffer[64], *p, *number, *power_str;
+	int new_power;
+	nmt_subscriber_t subscr;
+	transaction_t *trans;
+	nmt_t *nmt;
+
+	if (!command || !command[0]) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: empty command.\n");
+		return;
+	}
+	strncpy(buffer, command, sizeof(buffer) - 1);
+	buffer[sizeof(buffer) - 1] = '\0';
+	p = buffer;
+	number = strsep(&p, ",");
+	power_str = p;
+	if (!number || !power_str || !power_str[0]) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: invalid format. Use: <7-digit-number>,<power 0-7>\n");
+		return;
+	}
+	if (strlen(number) != 7) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: subscriber number must be 7 digits.\n");
+		return;
+	}
+	new_power = atoi(power_str);
+	if (new_power < 0 || new_power > 7) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: power level %d out of range 0..7.\n", new_power);
+		return;
+	}
+	memset(&subscr, 0, sizeof(subscr));
+	if (dialstring2number(number, &subscr.country, subscr.number)) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: invalid subscriber number '%s'.\n", number);
+		return;
+	}
+	trans = get_transaction_by_number(&subscr);
+	if (!trans || !trans->nmt || trans->nmt->state != STATE_ACTIVE) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: subscriber '%s' not in an active call.\n", number);
+		return;
+	}
+	nmt = trans->nmt;
+	if (nmt->active_state != ACTIVE_STATE_VOICE) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: subscriber '%s' not in voice state (active_state=%d).\n", number, nmt->active_state);
+		return;
+	}
+	LOGP_CHAN(DNMT, LOGL_NOTICE, "Power change ordered: subscriber '%s', new power level %d (current %d).\n",
+		number, new_power, nmt->sysinfo.ms_power);
+	trans->pending_power = new_power;
+	nmt->active_state = ACTIVE_STATE_POWER_CHANGE;
+	nmt->tx_frame_count = 0;
+	nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
 }
 
 void dump_info(void) {}
