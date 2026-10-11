@@ -236,6 +236,33 @@ const char *nmt_dir_name(enum nmt_direction dir)
 	return "invalid";
 }
 
+/* Human-readable meaning of a line-signal number L(n), per direction
+ * (NMT Doc 450-1 para 4.3.3.3, line signals in frames 5 and 13). Used for log
+ * text so every line-signal scenario is self-describing rather than a bare
+ * number. 'to_ms' selects the MTX->MS column (1) or the MS->MTX column (0). */
+const char *nmt_linesignal_name(uint8_t signal, int to_ms)
+{
+	switch (signal & 0xf) {
+	case 0:  return to_ms ? "answer to coin-box" : "spare";
+	case 1:  return to_ms ? "spare" : "clearing, release guard";
+	case 2:  return to_ms ? "spare" : "answer acknowledgement (coin-box)";
+	case 3:  return to_ms ? "proceed to send unencrypted digits / roaming updating confirmation" : "spare";
+	case 4:  return to_ms ? "acknowledge MFT converter in" : "spare";
+	case 5:  return to_ms ? "switch compander in" : "register recall";
+	case 6:  return to_ms ? "address complete" : "spare";
+	case 7:  return to_ms ? "switch compander out" : "MFT converter out acknowledge / forced release";
+	case 8:  return to_ms ? "spare" : "MFT converter in";
+	case 9:  return to_ms ? "ringing order" : "spare";
+	case 10: return to_ms ? "acknowledge MFT converter out / forced release" : "spare";
+	case 11: return to_ms ? "proceed to send encrypted digits / roaming updating confirmation" : "spare";
+	case 12: return to_ms ? "request to receive short message (SMS data)" : "acknowledge SMS request";
+	case 13: return to_ms ? "clearing, call transfer activated" : "spare";
+	case 14: return to_ms ? "spare" : "answer";
+	case 15: return to_ms ? "clearing, call transfer not activated" : "spare";
+	}
+	return "invalid";
+}
+
 /* convert 7-digits dial string to NMT number */
 static int dialstring2number(const char *dialstring, char *ms_country, char *ms_number)
 {
@@ -642,6 +669,8 @@ static void set_line_signal(nmt_t *nmt, frame_t *frame, uint8_t signal)
 	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
 	frame->line_signal = (signal << 8) | (signal << 4) | signal;
+	LOGP_CHAN(DNMT, LOGL_INFO, "Sending line signal L(%d) '%s'.\n",
+		signal & 0xf, nmt_linesignal_name(signal, 1 /* MTX->MS */));
 }
 
 /*
