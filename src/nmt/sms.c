@@ -259,10 +259,16 @@ static int encode_userdata(uint8_t *data, const char *message)
 	j = 0;
 	pos = 0;
 	for (i = 0; message[i]; i++) {
-		if ((int8_t)message[i] >= 0)
-			character = message[i]; /* 0..127 */
-		else
-			character = '?'; /* 128..255 */
+		if ((int8_t)message[i] >= 0) {
+			character = message[i]; /* 0..0x7f: representable in GSM 7-bit */
+		} else {
+			/* Annex 24 para 2.2.3.10 uses characters 0..0x7f; a byte above
+			 * that range is not representable in the 7-bit alphabet. Log the
+			 * substitution rather than dropping it silently. */
+			LOGP(DSMS, LOGL_NOTICE, "SMS character 0x%02x at position %d is outside the 7-bit alphabet, substituting '?'\n",
+				(uint8_t)message[i], i);
+			character = '?';
+		}
 		j++;
 		if (pos == 0) {
 			/* character fits and is aligned to the right, new octet */
@@ -370,24 +376,36 @@ static void sms_submit_report(nmt_t *nmt, uint8_t ref, int error)
  */
 
 /* decode 7-bit character message from 8 bit data */
-static void decode_message_7(const uint8_t *data, int length, char *message)
+/* Decode a GSM 7-bit packed octet stream into characters.
+ * 'octets' is the number of packed input octets; 'max_chars' bounds the output
+ * so a trailing partial septet (septet packing can yield one more character
+ * than the declared TP-UDL) can never write past message[max_chars]. The caller
+ * sizes 'message' as max_chars + 1 for the NUL. */
+static void decode_message_7(const uint8_t *data, int octets, int max_chars, char *message)
 {
 	int fill;
 	int i;
+	int chars = 0;
 	uint16_t result;
 
 	fill = 0;
 	result = 0;
-	for (i = 0; i < length; i++) {
+	for (i = 0; i < octets; i++) {
 		result |= data[i] << fill;
 		fill += 8;
 		while (fill >= 7) {
+			if (chars >= max_chars) {
+				/* declared length reached: ignore any leftover bits */
+				fill = 0;
+				break;
+			}
 			*message++ = result & 0x7f;
+			chars++;
 			result >>= 7;
 			fill -= 7;
 		}
 	}
-	*message++ = '\0';
+	*message = '\0';
 }
 
 static const char digits2ascii[16] = {
@@ -416,11 +434,17 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 	int orig_len, tpdu_len, dest_len, msg_len;
 	int orig_digits, dest_digits, msg_chars;
 	uint8_t orig_type, orig_plan, dest_type, dest_plan;
-	int tp_vpf_present = 0;
+	int tp_vpf = VPF_NOT_PRESENT;
 	int coding = 0;
 	int rc;
 
 	LOGP(DSMS, LOGL_DEBUG, "decode_sms_submit: got %d bytes\n", length);
+
+	/* need the 2-octet RP header (MTI + message reference) before anything */
+	if (length < 2) {
+		LOGP(DSMS, LOGL_DEBUG, "SMS still incomplete, waiting for RP header\n");
+		return 0;
+	}
 
 	/* decode ref */
 	ref = data[1];
@@ -480,8 +504,7 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 		LOGP(DSMS, LOGL_NOTICE, "especting SUBMIT MTI, but got 0x%02x\n", data[0]);
 		return -FSC_ERROR_IN_MS;
 	}
-	if ((data[0] & VPF_MASK))
-		tp_vpf_present = 1;
+	tp_vpf = data[0] & VPF_MASK;
 	data++;
 	length--;
 
@@ -540,14 +563,17 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 	data++;
 	length--;
 
-	/* skip validity period */
-	if (tp_vpf_present) {
-		if (length < 1) {
-			LOGP(DSMS, LOGL_NOTICE, "short read validity period IE\n");
+	/* skip validity period (Annex 24 para 2.2.3.12): the integer/relative form
+	 * is 1 octet, the absolute semi-octet form is 7 octets.  Skip exactly the
+	 * right number so the user-data parse stays aligned. */
+	if (tp_vpf != VPF_NOT_PRESENT) {
+		int vp_len = (tp_vpf == VPF_PRESENT_SEMI_OCTET) ? 7 : 1;
+		if (length < vp_len) {
+			LOGP(DSMS, LOGL_NOTICE, "short read validity period IE (need %d octets)\n", vp_len);
 			return -FSC_ERROR_IN_MS;
 		}
-		data++;
-		length--;
+		data += vp_len;
+		length -= vp_len;
 	}
 
 	/* decode data message text */
@@ -557,17 +583,33 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 	}
 	msg_data = data + 1;
 	msg_chars = data[0];
-	if (coding == 7)
+	/* Annex 24 para 2.2.3.13: at most 160 characters for both codings
+	 * (optionally 255 for the 8-bit NMT alphabets). Reject an over-long
+	 * declared length rather than trusting an attacker/garbled count. */
+	if (coding == 7) {
+		if (msg_chars > 160) {
+			LOGP(DSMS, LOGL_NOTICE, "SMS user data too long: %d 7-bit characters (max 160), rejecting\n", msg_chars);
+			return -FSC_ERROR_IN_MS;
+		}
 		msg_len = (msg_chars * 7 + 7) / 8;
-	else
+	} else {
+		if (msg_chars > 255) {
+			LOGP(DSMS, LOGL_NOTICE, "SMS user data too long: %d 8-bit characters (max 255), rejecting\n", msg_chars);
+			return -FSC_ERROR_IN_MS;
+		}
+		if (msg_chars > 160)
+			LOGP(DSMS, LOGL_INFO, "SMS user data uses the optional extended 8-bit length (%d characters)\n", msg_chars);
 		msg_len = msg_chars;
+	}
 	if (length < 1 + msg_len) {
 		LOGP(DSMS, LOGL_NOTICE, "short read user data IE\n");
 		return -FSC_ERROR_IN_MS;
 	}
 	char message[msg_chars + 1];
 	if (coding == 7) {
-		decode_message_7(msg_data, msg_len, message);
+		/* bound the decode by the declared character count (septet packing
+		 * can otherwise emit one extra character and overflow message[]) */
+		decode_message_7(msg_data, msg_len, msg_chars, message);
 		LOGP(DSMS, LOGL_DEBUG, "Decoded message: '%s'\n", message);
 	} else {
 		memcpy(message, msg_data, msg_len);

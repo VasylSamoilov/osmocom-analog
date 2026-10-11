@@ -289,11 +289,18 @@ genuine deviations, worst-interesting first:
 5. **Outgoing SMS length cap** — **FIXED** (branch `fix/nmt-sms-length-timers`): raised
    from 140 to the spec **160 characters** (§2.2.3.13; 7-bit → 140 octets, fits data[256]).
    8-bit NMT-alphabet and the optional 255-char case remain unimplemented (gap #8).
-6. **TP-VP absolute 7-octet form not parsed** → parse desync on VPF=11. §8.
+6. **TP-VP absolute 7-octet form** — **FIXED** (branch `fix/nmt-sms-length-timers`): the
+   SUBMIT decoder now skips the VP by its true length (1 octet integer/relative, 7 octets
+   absolute semi-octet) per §2.2.3.12, so VPF=11 no longer desyncs the parse. Also hardened
+   the whole SUBMIT decode: RP-header entry guard, per-coding length validation against the
+   160/255 ceilings with rejection+log, and a char-bounded `decode_message_7` that cannot
+   overflow on a trailing partial septet. §8.
 7. **SMS-call timers** — **FIXED** (branch `fix/nmt-sms-length-timers`): mapped to the
    §1.1 values — 20 s awaiting a response to a sent SMS packet, 10 s awaiting the next DMS
    frame, and ≥5 s before clearing after the last packet (was a single 5 s/2 s pair). §8.
-8. **DELIVER always DCS=0** — no 8-bit NMT-alphabet send; char sets 0–4 unmapped. §8.
+8. **DELIVER always DCS=0 (7-bit)** — 8-bit NMT-alphabet *origination* still unimplemented
+   (char sets 0–4 unmapped); the encoder now **logs** any byte outside the 0–0x7F alphabet
+   instead of silently substituting '?'. Receive side decodes both 7-bit and 8-bit. §8.
 9. **DMS NR flow-control is a FIXME** — not acted on. §8.
 10. **RP-User-Data IEI 0x41 vs 0x42** doc/impl discrepancy (code flags doc as wrong;
     which real MSs use is UNCONFIRMED). §8.
