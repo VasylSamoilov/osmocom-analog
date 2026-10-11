@@ -56,6 +56,11 @@ typedef struct gsc_rx_msg {
 	/* raw nibble array for numeric scoring (before character mapping) */
 	uint8_t			numeric_nibbles[MAX_NDB * 12 + 1];	/* raw 4-bit nibbles */
 	int			numeric_nibble_count;	/* number of nibbles decoded */
+
+	/* raw 6-bit code array for alpha scoring (before character mapping,
+	 * so the <0xNN> rendering of the output string never affects scoring) */
+	uint8_t			alpha_codes[MAX_ADB * 8 + 1];	/* raw 6-bit alpha codes */
+	int			alpha_code_count;	/* number of alpha codes decoded */
 } gsc_rx_msg_t;
 
 
@@ -267,7 +272,7 @@ int reverse_word1(uint16_t w1, int *g1, int *g0);
 int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0);
 char decode_alpha(uint8_t code);
 char decode_numeric(uint8_t code, int *shifted);
-int gsc_score_alpha(const char *str, int len, int fill);
+int gsc_score_alpha(const uint8_t *codes, int count, int fill);
 int gsc_score_numeric(const uint8_t *nibbles, int count, int fill);
 void gsc_discriminate(gsc_rx_msg_t *msg);
 

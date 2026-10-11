@@ -176,6 +176,30 @@ void golay_destroy(sender_t *sender)
 	free(gsc);
 }
 
+/* Normalize an input message: copy src -> dst, converting each "<0xNN>" escape
+ * (two lowercase or uppercase hex digits) into the single raw byte it names.
+ * This is the inverse of append_decoded_char()'s rendering, so a non-printable
+ * byte that was emitted as "<0xNN>" on decode can be typed back in and encoded.
+ * A '<' that does not begin a well-formed "<0xNN>" token is copied verbatim.
+ * dst is NUL-terminated and never written past dstsize-1 bytes of content. */
+static void normalize_input_escapes(char *dst, const char *src, int dstsize)
+{
+	int o = 0;
+
+	while (*src && o < dstsize - 1) {
+		if (src[0] == '<' && src[1] == '0' && (src[2] == 'x' || src[2] == 'X')
+		    && isxdigit((unsigned char)src[3]) && isxdigit((unsigned char)src[4])
+		    && src[5] == '>') {
+			char hx[3] = { src[3], src[4], 0 };
+			dst[o++] = (char)(unsigned char)strtol(hx, NULL, 16);
+			src += 6;
+			continue;
+		}
+		dst[o++] = *src++;
+	}
+	dst[o] = '\0';
+}
+
 /* Create message and add to queue */
 static gsc_msg_t *golay_msg_create(gsc_t __attribute__((unused)) *gsc, const char *address, const char *text, enum gsc_msg_type type)
 {
@@ -222,7 +246,9 @@ static gsc_msg_t *golay_msg_create(gsc_t __attribute__((unused)) *gsc, const cha
 	/* init */
 	memcpy(msg->address, address, MIN(sizeof(msg->address) - 1, strlen(address) + 1));
 	msg->type = type;
-	memcpy(msg->data, text, MIN(sizeof(msg->data) - 1, strlen(text) + 1));
+	/* Convert any "<0xNN>" escapes in the input to raw bytes before storing;
+	 * the escape form is longer than its byte, so this never overflows. */
+	normalize_input_escapes(msg->data, text, (int)sizeof(msg->data));
 
 	/* Message is returned without linking into any queue.
 	 * The caller is responsible for calling scheduler_enqueue()
@@ -949,10 +975,10 @@ static const char alpha_decode_table[64] = {
 	/* 0x08 */ '(', ')', '*', '+', ',', '-', '.', '/',
 	/* 0x10 */ '0', '1', '2', '3', '4', '5', '6', '7',
 	/* 0x18 */ '8', '9', ':', ';', '<', '=', '>', '?',
-	/* 0x20 */ '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G',
+	/* 0x20 */ '\\', 'A', 'B', 'C', 'D', 'E', 'F', 'G',
 	/* 0x28 */ 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
 	/* 0x30 */ 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W',
-	/* 0x38 */ 'X', 'Y', 'Z', '[', '\r', ']', '\0', '_',
+	/* 0x38 */ 'X', 'Y', 'Z', '{', '\r', '}', '\0', '_',
 };
 
 char decode_alpha(uint8_t code)
@@ -976,7 +1002,7 @@ char decode_alpha(uint8_t code)
  *   0xB:     'U'
  *   0xC:     ' ' (space)
  *   0xD:     '-' (hyphen)
- *   0xE:     '*' (asterisk; encoder also accepts '=' as alias)
+ *   0xE:     '\0' (Null/EOM end-of-message marker per Table VII, not a character)
  *   0xF:     '\0' (shift prefix - sets shifted mode, no character emitted)
  *
  * numeric_shift_table[16] - codes after 0xF prefix:
@@ -995,7 +1021,7 @@ char decode_alpha(uint8_t code)
  */
 static const char numeric_decode_table[16] = {
 	/* 0x0 */ '0', '1', '2', '3', '4', '5', '6', '7',
-	/* 0x8 */ '8', '9', '\0', 'U', ' ', '-', '*', '\0',
+	/* 0x8 */ '8', '9', '\0', 'U', ' ', '-', '\0', '\0',
 };
 
 static const char numeric_shift_table[16] = {
@@ -1040,6 +1066,31 @@ char decode_numeric(uint8_t code, int *shifted)
 	return c;
 }
 
+/* Append a decoded message character to a bounded output buffer.
+ *
+ * A printable ASCII character (0x20-0x7E) is written as-is. Any other
+ * (non-printable) character is rendered as a 6-byte "<0xNN>" escape so the
+ * byte survives in the text output instead of being dropped or corrupting
+ * the display. The write is bounds-checked against *size*; a character that
+ * does not fully fit (including the whole escape) is not written, and *pos is
+ * left unchanged. The caller keeps the buffer NUL-terminated separately. */
+static void append_decoded_char(char *buf, int *pos, int size, char c)
+{
+	unsigned char u = (unsigned char)c;
+
+	if (u >= 0x20 && u <= 0x7e) {
+		if (*pos < size - 1)
+			buf[(*pos)++] = c;
+		return;
+	}
+	/* non-printable: "<0xNN>" needs 6 bytes plus room for the terminator */
+	if (*pos < size - 6) {
+		int n = snprintf(buf + *pos, 7, "<0x%02x>", u);
+		if (n == 6)
+			*pos += 6;
+	}
+}
+
 /* Score the plausibility of an alpha interpretation.
  * Evaluates each character in the decoded alpha string against
  * the GSC alpha character set (Rep. 900-2 Table VII).
@@ -1055,26 +1106,33 @@ char decode_numeric(uint8_t code, int *shifted)
  * fill bonus.
  *
  * Returns the total score (sum of per-character contributions). */
-int gsc_score_alpha(const char *str, int len, int fill)
+int gsc_score_alpha(const uint8_t *codes, int count, int fill)
 {
 	int score = 0;
 	int i;
 
-	for (i = 0; i < len; i++) {
-		char c = str[i];
+	for (i = 0; i < count; i++) {
+		uint8_t code = codes[i] & 0x3f;
+		char c;
 
-		/* Exclude fill characters (decode_alpha(0x3E) == '\0') */
-		if (c == '\0')
+		/* Fill (0x3E -> '\0') is scored via the fill bonus, not here. */
+		if (code == 0x3e)
 			continue;
 
-		if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') {
+		c = decode_alpha(code);
+
+		/* A code that maps to '\0' but is not fill (e.g. a reserved cell)
+		 * is a non-character: treat as a strong wrong-type signal. */
+		if (c == '\0') {
+			score -= 5;
+		} else if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') {
 			/* Alphanumeric or space: +3 */
 			score += 3;
-		} else if (c >= 0x20 && c <= 0x7E) {
+		} else if ((unsigned char)c >= 0x20 && (unsigned char)c <= 0x7E) {
 			/* Other printable ASCII (special/punctuation): -2 */
 			score -= 2;
 		} else {
-			/* Non-printable, control, or unmapped: -5 */
+			/* Non-printable / control (e.g. CR): -5 */
 			score -= 5;
 		}
 	}
@@ -1154,7 +1212,7 @@ int gsc_score_numeric(const uint8_t *nibbles, int count, int fill)
 			else
 				score -= 15; /* stray U - strong artifact signal */
 		} else if (n >= 0x0C && n <= 0x0E) {
-			/* Space (0xC), hyphen (0xD), asterisk (0xE): -2 */
+			/* Space (0xC), hyphen (0xD), Null/EOM (0xE): -2 */
 			score -= 2;
 		} else if (n == 0x0F) {
 			/* Shift prefix: -2 (uncommon in numeric messages) */
@@ -1982,9 +2040,11 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 							if (ch_bad[j]) {
 								msg->alpha_data[alpha_pos++] = '?';
 							} else {
+								if (msg->alpha_code_count < (int)sizeof(msg->alpha_codes))
+									msg->alpha_codes[msg->alpha_code_count++] = ch[j];
 								c = decode_alpha(ch[j]);
 								if (c != '\0')
-									msg->alpha_data[alpha_pos++] = c;
+									append_decoded_char(msg->alpha_data, &alpha_pos, (int)sizeof(msg->alpha_data), c);
 								else if (ch[j] == 0x3e)
 									msg->alpha_fill++;
 							}
@@ -2019,7 +2079,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				return -1;
 			}
 
-			msg->alpha_score = gsc_score_alpha(msg->alpha_data, strlen(msg->alpha_data), msg->alpha_fill);
+			msg->alpha_score = gsc_score_alpha(msg->alpha_codes, msg->alpha_code_count, msg->alpha_fill);
 			msg->numeric_score = 0;
 			msg->guess_winner = TYPE_ALPHA;
 			msg->guess_uncertain = 0;
@@ -2150,8 +2210,8 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 								msg->numeric_data[numeric_pos++] = '?';
 						} else {
 							c = decode_numeric(nib[j], &shifted);
-							if (c != '\0' && numeric_pos < (int)sizeof(msg->numeric_data) - 1)
-								msg->numeric_data[numeric_pos++] = c;
+							if (c != '\0')
+								append_decoded_char(msg->numeric_data, &numeric_pos, (int)sizeof(msg->numeric_data), c);
 							else if (c == '\0' && nib[j] == 0x0a)
 								msg->numeric_fill++;
 						}
@@ -2194,7 +2254,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 		 * still set), the message is definitively alpha — no valid
 		 * numeric message exceeds 2 blocks (24 digits).
 		 * ============================================================ */
-		msg->alpha_score = gsc_score_alpha(msg->alpha_data, strlen(msg->alpha_data), msg->alpha_fill);
+		msg->alpha_score = gsc_score_alpha(msg->alpha_codes, msg->alpha_code_count, msg->alpha_fill);
 		msg->numeric_score = gsc_score_numeric(msg->numeric_nibbles, msg->numeric_nibble_count, msg->numeric_fill);
 
 		gsc_discriminate(msg);
@@ -2712,9 +2772,11 @@ decode_done:
 
 							for (j = 0; j < 8; j++) {
 								c = decode_alpha(ch[j]);
+								if (batch_msg.alpha_code_count < (int)sizeof(batch_msg.alpha_codes))
+									batch_msg.alpha_codes[batch_msg.alpha_code_count++] = ch[j];
 								if (bm_alpha_pos < (int)sizeof(batch_msg.alpha_data) - 1) {
 									if (c != '\0')
-										batch_msg.alpha_data[bm_alpha_pos++] = c;
+										append_decoded_char(batch_msg.alpha_data, &bm_alpha_pos, (int)sizeof(batch_msg.alpha_data), c);
 									else if (ch[j] == 0x3e)
 										batch_msg.alpha_fill++;
 								}
@@ -2768,8 +2830,8 @@ decode_done:
 									batch_msg.numeric_nibbles[batch_msg.numeric_nibble_count++] = nib[j];
 
 								c = decode_numeric(nib[j], &bm_shifted);
-								if (c != '\0' && bm_numeric_pos < (int)sizeof(batch_msg.numeric_data) - 1)
-									batch_msg.numeric_data[bm_numeric_pos++] = c;
+								if (c != '\0')
+									append_decoded_char(batch_msg.numeric_data, &bm_numeric_pos, (int)sizeof(batch_msg.numeric_data), c);
 								else if (c == '\0' && nib[j] == 0x0a)
 									batch_msg.numeric_fill++;
 							}
@@ -2778,7 +2840,7 @@ decode_done:
 					batch_msg.numeric_data[bm_numeric_pos] = '\0';
 
 					/* Score and discriminate */
-					batch_msg.alpha_score = gsc_score_alpha(batch_msg.alpha_data, strlen(batch_msg.alpha_data), batch_msg.alpha_fill);
+					batch_msg.alpha_score = gsc_score_alpha(batch_msg.alpha_codes, batch_msg.alpha_code_count, batch_msg.alpha_fill);
 					batch_msg.numeric_score = gsc_score_numeric(batch_msg.numeric_nibbles, batch_msg.numeric_nibble_count, batch_msg.numeric_fill);
 					gsc_discriminate(&batch_msg);
 				}
@@ -4563,11 +4625,16 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 
 	/* Stage 6: Content warnings (log warning, accept) */
 	if (data && data[0] != '\0') {
+		/* Scan the normalized form so a "<0xNN>" escape counts as the single
+		 * byte it names rather than six literal characters. Sized to the TX
+		 * message buffer (gsc_msg_t.data); normalization only shrinks. */
+		char ndata[256];
+		normalize_input_escapes(ndata, data, (int)sizeof(ndata));
 		if (effective_type == TYPE_NUMERIC) {
 			/* Check each char is in GSC numeric charset */
 			int digit_count = 0;
-			for (i = 0; data[i] != '\0'; i++) {
-				char c = data[i];
+			for (i = 0; ndata[i] != '\0'; i++) {
+				char c = ndata[i];
 				int valid = 0;
 				int shifted = 0;
 
@@ -4599,7 +4666,7 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 			if (digit_count > 24)
 				LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: numeric message length %d exceeds default maximum of 24 digits.\n", digit_count);
 		} else if (effective_type == TYPE_ALPHA) {
-			int len = (int)strlen(data);
+			int len = (int)strlen(ndata);
 			if (len > 80)
 				LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: alphanumeric message length %d exceeds default maximum of 80 characters.\n", len);
 		}
