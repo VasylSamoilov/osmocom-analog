@@ -353,9 +353,13 @@ direction, and both the TX (`set_line_signal`) and the RX accept paths log the s
 name, so every line-signal scenario is self-describing (branch `fix/nmt-linesignal-logging`).
 
 ### UNCONFIRMED (honest limitations of this audit)
-- Battery-saving H3 period table read from native text only, not PNG.
 - No end-to-end on-air test performed anywhere — all statuses are code-vs-spec
   reads plus the clean build + NMT unit tests, not handset-verified.
+
+_Battery-saving H3 period table PNG-confirmed (§4.3.3.12, CLI p.65): H3 =
+0/1/2/3/4/5/6/7/8/9 → 0/24/40/56/72/88/112/168/224/280 frames (1 frame =
+138.33 ms), 10–15 spare. Matches the values recorded earlier; osmocom does not
+originate battery-saving frames (item 13), so this is reference only._
 
 ---
 
