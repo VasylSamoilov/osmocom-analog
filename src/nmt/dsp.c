@@ -499,8 +499,12 @@ again:
 		/* Encode frame into audio stream. If frames have
 		 * stopped, process again for rest of stream. */
 		count = fsk_mod_send(&nmt->fsk_mod, samples, length, 0);
-		/* special case: add supervisory signal to frame at loop test */
-		if (nmt->sender.loopback && nmt->supervisory)
+		/* Radiate the supervisory (ø) signal together with the frames while a
+		 * SCIP move is in progress: the target TC must already be supervised
+		 * when the MS retunes to it (NMT Doc 450-1 Scheme C2', steps 4-5), and
+		 * at loop test for self-testing. */
+		if (nmt->supervisory
+		 && (nmt->sender.loopback || nmt->state == STATE_SCIP_IDENT || nmt->state == STATE_SCIP_IDENT_REQ))
 			super_encode(nmt, samples, count);
 		samples += count;
 		length -= count;
