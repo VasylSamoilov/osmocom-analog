@@ -80,6 +80,7 @@ typedef struct nmt_sysinfo {
 } nmt_sysinfo_t;
 
 const char *nmt_dir_name(enum nmt_direction dir);
+const char *nmt_linesignal_name(uint8_t signal, int to_ms);
 
 struct nmt {
 	sender_t		sender;
