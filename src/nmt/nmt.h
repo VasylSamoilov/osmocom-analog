@@ -90,6 +90,16 @@ typedef struct nmt_sysinfo {
 	int			ms_power;		/* ms power level 3 = full */
 	uint8_t			traffic_area;		/* two digits traffic area, encoded as YY */
 	uint8_t			area_no;		/* Area no. 1..4, 0 = no Area no. */
+	/* NMT 900 §4.3.3.13 channel band advertisement (ignored for NMT 450).
+	 * Ordinary (non-interleaved) channel numbers only; 0 = not configured,
+	 * MS falls back to its preprogrammed basic band.
+	 * cc_band_start/end: range broadcast in H3H4/H5H6 of frames 1a/1b.
+	 * tc_band_start/end: range broadcast in H7H8/H9H10 of frames 1a;
+	 *   on combined CC+TC (1b) H7 is set to J (spare) per §4.3.3.13.1. */
+	int			cc_band_start;		/* CC band start channel (1..999, 0 = unset) */
+	int			cc_band_end;		/* CC band end channel   (1..999, 0 = unset) */
+	int			tc_band_start;		/* TC/AC band start channel (1..999, 0 = unset) */
+	int			tc_band_end;		/* TC/AC band end channel   (1..999, 0 = unset) */
 } nmt_sysinfo_t;
 
 const char *nmt_dir_name(enum nmt_direction dir);
@@ -193,7 +203,7 @@ void nmt_channel_list(int nmt_system);
 int nmt_channel_by_short_name(int nmt_system, const char *short_name);
 const char *chan_type_short_name(int nmt_system, enum nmt_chan_type chan_type);
 const char *chan_type_long_name(int nmt_system, enum nmt_chan_type chan_type);
-int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int coinbox_tariff, int loopback);
+int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int coinbox_tariff, int cc_band_start, int cc_band_end, int tc_band_start, int tc_band_end, int loopback);
 void nmt_check_channels(int nmt_system);
 void nmt_destroy(sender_t *sender);
 void nmt_go_idle(nmt_t *nmt);

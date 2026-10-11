@@ -120,12 +120,20 @@ int bs_period = 0;	/* battery saving: H3 period code, 0 = disabled (default) */
 int bs_group = 8;	/* battery saving: H7 group code (default 8 = all) */
 int sis_demo = 0;	/* SIS authentication demonstrator, off by default */
 int coinbox_tariff = -1;	/* coin-box answer tariff class, -1 = disabled (default) */
+int cc_band_start = 0;	/* NMT 900 §4.3.3.13: CC  band start channel (0 = unset) */
+int cc_band_end   = 0;	/* NMT 900 §4.3.3.13: CC  band end channel   (0 = unset) */
+int tc_band_start = 0;	/* NMT 900 §4.3.3.13: TC/AC band start channel (0 = unset) */
+int tc_band_end   = 0;	/* NMT 900 §4.3.3.13: TC/AC band end channel   (0 = unset) */
 
 /* Long-only option ids (>=256 so they never match a single-char '-x' flag) for
  * rare operator-only options that do not warrant a short flag. */
 #define OPT_BATTERY_SAVING	256
 #define OPT_SIS_DEMO		257
 #define OPT_COINBOX_TARIFF	258
+#define OPT_CC_BAND_START	259
+#define OPT_CC_BAND_END		260
+#define OPT_TC_BAND_START	261
+#define OPT_TC_BAND_END		262
 
 void print_help(const char *arg0)
 {
@@ -178,6 +186,25 @@ void print_help(const char *arg0)
 	printf("        Tariff class sent to a coin-box MS at answer (frame 5b, NMT Doc 450-1 4.7.2).\n");
 	printf("        Default -1 = disabled (no charging source; the answer sequence is logged\n");
 	printf("        but no frame 5b is sent). 0..3 enables the frame-5b answer sequence.\n");
+	printf("    --cc-band-start <channel 1..999>\n");
+	printf("        NMT 900 only (§4.3.3.13.3): start of calling channel (CC) band\n");
+	printf("        advertised in frames 1a/1b. Informs the MS which ordinary channels to\n");
+	printf("        scan for a CC. Must be set together with --cc-band-end and must be lower.\n");
+	printf("        Omit (or set 0) to let the MS use its preprogrammed basic CC band.\n");
+	printf("    --cc-band-end <channel 1..999>\n");
+	printf("        NMT 900 only (§4.3.3.13.3): end of calling channel (CC) band.\n");
+	printf("        Must be set together with --cc-band-start and must be higher.\n");
+	printf("    --tc-band-start <channel 1..999>\n");
+	printf("        NMT 900 only (§4.3.3.13.4): start of traffic/access channel (TC/AC) band\n");
+	printf("        advertised in frames 1a (not 1b -- H7 is set to spare on combined CC+TC).\n");
+	printf("        Must be set together with --tc-band-end and must be lower.\n");
+	printf("        Omit (or set 0) to let the MS use its preprogrammed basic TC band.\n");
+	printf("    --tc-band-end <channel 1..999>\n");
+	printf("        NMT 900 only (§4.3.3.13.4): end of traffic/access channel (TC/AC) band.\n");
+	printf("        Must be set together with --tc-band-start and must be higher.\n");
+	printf("    NOTE: band advertisement (§4.3.3.13) and battery saving (§4.3.3.14)\n");
+	printf("        both use H1=14: they are mutually exclusive. If battery saving is\n");
+	printf("        active (--battery-saving > 0) band advertisement is suppressed.\n");
 	printf("\nNMT command FIFO: %s\n", NMT_CMD_FIFO);
 	printf("  One command per line. Commands:\n");
 	printf("  mwi <subscriber>,set,<indicators>\n");
@@ -211,6 +238,10 @@ static void add_options(void)
 	option_add(OPT_BATTERY_SAVING, "battery-saving", 1);
 	option_add(OPT_SIS_DEMO, "sis-demo", 1);
 	option_add(OPT_COINBOX_TARIFF, "coinbox-tariff", 1);
+	option_add(OPT_CC_BAND_START, "cc-band-start", 1);
+	option_add(OPT_CC_BAND_END,   "cc-band-end",   1);
+	option_add(OPT_TC_BAND_START, "tc-band-start", 1);
+	option_add(OPT_TC_BAND_END,   "tc-band-end",   1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -325,6 +356,34 @@ error_ta:
 		coinbox_tariff = atoi(argv[argi]);
 		if (coinbox_tariff < -1 || coinbox_tariff > 3) {
 			fprintf(stderr, "Coin-box tariff class '%s' out of range, use 0..3 (or -1 to disable)\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_CC_BAND_START:
+		cc_band_start = atoi(argv[argi]);
+		if (cc_band_start < 1 || cc_band_start > 999) {
+			fprintf(stderr, "--cc-band-start '%s' out of range (1..999, ordinary NMT 900 channels only)\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_CC_BAND_END:
+		cc_band_end = atoi(argv[argi]);
+		if (cc_band_end < 1 || cc_band_end > 999) {
+			fprintf(stderr, "--cc-band-end '%s' out of range (1..999, ordinary NMT 900 channels only)\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_TC_BAND_START:
+		tc_band_start = atoi(argv[argi]);
+		if (tc_band_start < 1 || tc_band_start > 999) {
+			fprintf(stderr, "--tc-band-start '%s' out of range (1..999, ordinary NMT 900 channels only)\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_TC_BAND_END:
+		tc_band_end = atoi(argv[argi]);
+		if (tc_band_end < 1 || tc_band_end > 999) {
+			fprintf(stderr, "--tc-band-end '%s' out of range (1..999, ordinary NMT 900 channels only)\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
@@ -610,9 +669,33 @@ int main(int argc, char *argv[])
 		do_de_emphasis = 1;
 	}
 
+	/* NMT 900 §4.3.3.13: validate channel band advertisement options.
+	 * Both start and end must be given together, start < end, NMT 900 only.
+	 * Interleaved channels (>= 1000) are not valid band limits (§4.3.3.13.5). */
+	if ((cc_band_start == 0) != (cc_band_end == 0)) {
+		fprintf(stderr, "Error: --cc-band-start and --cc-band-end must both be given (or both omitted).\n");
+		goto fail;
+	}
+	if (cc_band_start && cc_band_end && cc_band_start >= cc_band_end) {
+		fprintf(stderr, "Error: --cc-band-start (%d) must be lower than --cc-band-end (%d).\n", cc_band_start, cc_band_end);
+		goto fail;
+	}
+	if ((tc_band_start == 0) != (tc_band_end == 0)) {
+		fprintf(stderr, "Error: --tc-band-start and --tc-band-end must both be given (or both omitted).\n");
+		goto fail;
+	}
+	if (tc_band_start && tc_band_end && tc_band_start >= tc_band_end) {
+		fprintf(stderr, "Error: --tc-band-start (%d) must be lower than --tc-band-end (%d).\n", tc_band_start, tc_band_end);
+		goto fail;
+	}
+	if ((cc_band_start || tc_band_start) && nmt_system != 900) {
+		fprintf(stderr, "Error: channel band advertisement (--cc-band-start/--tc-band-start) is NMT 900 only (§4.3.3.13).\n");
+		goto fail;
+	}
+
 	/* create transceiver instance */
 	for (i = 0; i < num_kanal; i++) {
-		rc = nmt_create(nmt_system, country, kanal[i], chan_type[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, do_pre_emphasis, do_de_emphasis, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, ms_power, traffic_area, area_no, compandor, supervisory[i], smsc_number, send_callerid, send_clock, bs_period, bs_group, sis_demo, coinbox_tariff, loopback);
+		rc = nmt_create(nmt_system, country, kanal[i], chan_type[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, do_pre_emphasis, do_de_emphasis, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, ms_power, traffic_area, area_no, compandor, supervisory[i], smsc_number, send_callerid, send_clock, bs_period, bs_group, sis_demo, coinbox_tariff, cc_band_start, cc_band_end, tc_band_start, tc_band_end, loopback);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create transceiver instance. Quitting!\n");
 			goto fail;

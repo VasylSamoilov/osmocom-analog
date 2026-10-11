@@ -70,6 +70,47 @@ static int sms_ref = 0;
 /* Counters */
 #define PAGE_TRIES	3	/* How many time do we try to page the phone */
 
+/* Fictitious channel numbers for H8H9H10 in frames 2c, 2f, 2d (queue signalling).
+ *
+ * NMT Doc 450-1 §4.3.3.11 (p.51): these are raw 12-bit H8H9H10 values placed
+ * directly in additional_info -- NOT BCD channel numbers:
+ *   3F0  ordinary MS queue info (frame 2f)
+ *   3F1  PMS priority queue info (frame 2c)
+ *   3F2  TC scanning order (frame 2d)
+ *
+ * NMT Doc 900-1 §4.3.3.12 (p.51): the same wire values are expressed as
+ * fictitious channel numbers ch.1008/1009/1010. These pass through the NMT 900
+ * interleaved-channel encoding (bit a9 -> bit 11 of N1N2N3) to produce:
+ *   ch.1008 -> 0x9F0 (ordinary 2f)   ch.1009 -> 0x9F1 (PMS 2c)   ch.1010 -> 0x9F2 (2d)
+ * NMT 450 ch.1008 is outside the valid BCD range (1..400), so the two specs
+ * cannot be unified: system-specific constants are necessary.
+ */
+#define NMT_QUEUE_H8H9H10_ORDINARY_450  0x3F0	/* NMT 450 §4.3.3.11: ordinary MS (2f) */
+#define NMT_QUEUE_H8H9H10_PRIORITY_450  0x3F1	/* NMT 450 §4.3.3.11: PMS (2c) */
+#define NMT_QUEUE_H8H9H10_SCANNING_450  0x3F2	/* NMT 450 §4.3.3.11: TC scanning (2d) */
+#define NMT_QUEUE_H8H9H10_ORDINARY_900  0x9F0	/* NMT 900 §4.3.3.12: ch.1008 encoded */
+#define NMT_QUEUE_H8H9H10_PRIORITY_900  0x9F1	/* NMT 900 §4.3.3.12: ch.1009 encoded */
+#define NMT_QUEUE_H8H9H10_SCANNING_900  0x9F2	/* NMT 900 §4.3.3.12: ch.1010 encoded */
+
+/* NMT 900 §4.3.3.13.5 -- translate a channel number to a band-limit octet.
+ *
+ * Band limits are given in steps of 100 kHz (4 × 25 kHz channels): the 8-bit
+ * field H3H4 (or H5H6, H7H8, H9H10) carries bits a9..a2 of the ordinary
+ * (non-interleaved) channel number; bits a10, a1 and a0 are always 0.
+ * Encoding: field = (channel >> 2) & 0xFF.
+ *
+ * Special case (§4.3.3.13.5, p.53): channel 1 cannot be represented directly
+ * because a0=1 gives field=0. The spec reserves 0x00 to mean "channel 1 is
+ * the band start". nmt_encode_band_limit(1) returns 0x00, which is correct --
+ * both 0x00 and (1>>2)&0xFF=0x00 agree.
+ *
+ * 0 (unset) is never passed here; callers check first.
+ */
+static uint8_t nmt_encode_band_limit(int channel)
+{
+	return (uint8_t)((channel >> 2) & 0xFF);
+}
+
 static const char *nmt_state_name(enum nmt_state state)
 {
 	static char invalid[16];
@@ -322,7 +363,7 @@ static inline int is_chan_class_tc(enum nmt_chan_type chan_type)
 static void nmt_timeout(void *data);
 
 /* Create transceiver instance and link to a list. */
-int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int coinbox_tariff, int loopback)
+int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_chan_type chan_type, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, uint8_t ms_power, uint8_t traffic_area, uint8_t area_no, int compandor, int supervisory, const char *smsc_number, int send_callerid, int send_clock, int bs_period, int bs_group, int sis_demo, int coinbox_tariff, int cc_band_start, int cc_band_end, int tc_band_start, int tc_band_end, int loopback)
 {
 	nmt_t *nmt;
 	int rc;
@@ -390,6 +431,15 @@ int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_
 	 * is disabled by default (-1); an operator may set 0..3 to exercise the
 	 * frame-5b answer sequence. Any out-of-range value disables it. */
 	nmt->coinbox_tariff = (coinbox_tariff >= 0 && coinbox_tariff <= 3) ? coinbox_tariff : -1;
+	/* NMT 900 §4.3.3.13 channel band advertisement.
+	 * Only meaningful for NMT 900 CC/CC_TC channels; silently ignored for
+	 * NMT 450. 0 = not configured (MS falls back to preprogrammed basic band).
+	 * Validation (start < end, range 1..999, ordinary channels) was already
+	 * done in main.c before nmt_create() is called. */
+	nmt->sysinfo.cc_band_start = cc_band_start;
+	nmt->sysinfo.cc_band_end   = cc_band_end;
+	nmt->sysinfo.tc_band_start = tc_band_start;
+	nmt->sysinfo.tc_band_end   = tc_band_end;
 	strncpy(nmt->smsc_number, smsc_number, sizeof(nmt->smsc_number) - 1);
 
 	/* init audio processing */
@@ -836,40 +886,110 @@ static void tx_idle(nmt_t *nmt, frame_t *frame)
 	/* additional info */
 	frame->additional_info = 0;
 	if (frame->mt == NMT_MESSAGE_1a || frame->mt == NMT_MESSAGE_1a_a || frame->mt == NMT_MESSAGE_1a_b || frame->mt == NMT_MESSAGE_1b) {
-		/* Battery-saving additional info (NMT Doc 450-1 para 4.3.3.12):
-		 * H1=14(E) H2=11(B) marker, H3 = period code, H7 = addressed group.
-		 * Default bs_period=0 means "no saving" (phones never sleep) = the
-		 * historic behaviour; a non-zero period enables battery saving. */
-		frame->additional_info |= 0xeb00000000;			/* H1=E, H2=B marker */
-		frame->additional_info |= ((uint64_t)(nmt->bs_period & 0xf)) << 28;	/* H3 period */
-		frame->additional_info |= ((uint64_t)(nmt->bs_group & 0xf)) << 12;	/* H7 group */
-		/* phone is allowed to send overdecadic dialing digits */
-		frame->additional_info |= 0x0000020000;
-		/* no clock on combined CC+TC */
-		if (nmt->send_clock && frame->mt != NMT_MESSAGE_1b) {
-			/* send battery saving message including clock */
-			time_sec = get_time();
-			tm = localtime(&time_sec);
-			clock = (1 << 11) | (tm->tm_hour << 6) | tm->tm_min;
-			/* add clock with flag */
-			frame->additional_info |= clock;
+		/* NMT 900 §4.3.3.13 channel band advertisement (NMT 900 only).
+		 *
+		 * §4.3.3.1 Note 2 (p.34): H1=Z is the additional-information selector.
+		 *   Z(14) / H1(14) = additional info present; H2 selects the sub-type:
+		 *     H2=0  (§4.3.3.13): channel band advertisement (CC+TC band)
+		 *     H2=11 (§4.3.3.14): battery saving synchronisation
+		 *   Z(0) / H1(0) = no additional info (basic band, no battery saving)
+		 *
+		 * §4.7.4.1 (p.84): the MS accepts H1..H10 in frame 1a if the content
+		 * is meaningful according to §4.3.3.13 and §4.3.3.14. Both sub-types
+		 * are valid; the MTX sends one per frame based on what is configured.
+		 *
+		 * Channel band (§4.3.3.13) and battery saving (§4.3.3.14) use the same
+		 * H1=14 with different H2 values. A single MTX frame can carry only one.
+		 * Configuring both at once is an operator error: channel band takes
+		 * precedence (it is the less common feature and explicitly configured),
+		 * and a one-time warning is logged.
+		 *
+		 * NMT 450: §4.3.3.13 does not exist; only battery saving (§4.3.3.12 in
+		 * the 450-1 spec, printed as §4.3.3.12 there) is used.
+		 */
+		int use_band_advert = (nmt->sysinfo.system == 900) &&
+				      (nmt->sysinfo.cc_band_start || nmt->sysinfo.cc_band_end ||
+				       nmt->sysinfo.tc_band_start || nmt->sysinfo.tc_band_end);
+
+		if (use_band_advert && nmt->bs_period > 0 && nmt->tx_frame_count == 1) {
+			LOGP_CHAN(DNMT, LOGL_NOTICE,
+				"Both channel band advertisement (§4.3.3.13) and battery saving "
+				"(§4.3.3.14) are configured, but a single frame can carry only one "
+				"(both use H1=14 with different H2). Channel band takes precedence; "
+				"disable --battery-saving to suppress this warning.\n");
+		}
+
+		if (use_band_advert) {
+			/* §4.3.3.13.2: H1(14) H2(0) = CC band + TC band advertisement.
+			 * H1(14) H2(12) would be CC+AC band; not used here (TC channels). */
+			frame->additional_info |= (uint64_t)0xe0 << 32;	/* H1=14(E), H2=0 */
+
+			/* §4.3.3.13.3: CC band limits in H3H4 (start) / H5H6 (end).
+			 * H3H4=H5H6=00 means "no CC band info; use preprogrammed basic band". */
+			if (nmt->sysinfo.cc_band_start && nmt->sysinfo.cc_band_end) {
+				frame->additional_info |=
+					(uint64_t)nmt_encode_band_limit(nmt->sysinfo.cc_band_start) << 24;	/* H3H4 */
+				frame->additional_info |=
+					(uint64_t)nmt_encode_band_limit(nmt->sysinfo.cc_band_end)   << 16;	/* H5H6 */
+			}
+
+			/* §4.3.3.13.4: TC/AC band limits in H7H8 (start) / H9H10 (end).
+			 * §4.3.3.13.1: On combined CC+TC frame 1b, H7=J (spare=0); TC limits
+			 * are not transmitted in frame 1b, only in frames 1a/1a_a/1a_b.
+			 * H7H8=H9H10=00 means "no TC band info; use preprogrammed basic band". */
+			if (frame->mt != NMT_MESSAGE_1b) {
+				if (nmt->sysinfo.tc_band_start && nmt->sysinfo.tc_band_end) {
+					frame->additional_info |=
+						(uint64_t)nmt_encode_band_limit(nmt->sysinfo.tc_band_start) << 8;	/* H7H8 */
+					frame->additional_info |=
+						(uint64_t)nmt_encode_band_limit(nmt->sysinfo.tc_band_end);		/* H9H10 */
+				}
+
+				/* phone is allowed to send overdecadic dialing digits */
+				frame->additional_info |= 0x0000020000;
+			}
+			/* frame 1b: H7=J, already zero from H1=E H2=0 initialisation */
+
+			if (nmt->tx_frame_count == 1) {
+				LOGP_CHAN(DNMT, LOGL_INFO,
+					"NMT 900 channel band advertisement (§4.3.3.13, H1=14 H2=0): "
+					"CC %d..%d (H3H4=%02X H5H6=%02X); "
+					"TC %d..%d (H7H8=%02X H9H10=%02X); "
+					"frame %s%s.\n",
+					nmt->sysinfo.cc_band_start, nmt->sysinfo.cc_band_end,
+					nmt_encode_band_limit(nmt->sysinfo.cc_band_start),
+					nmt_encode_band_limit(nmt->sysinfo.cc_band_end),
+					nmt->sysinfo.tc_band_start, nmt->sysinfo.tc_band_end,
+					nmt_encode_band_limit(nmt->sysinfo.tc_band_start),
+					nmt_encode_band_limit(nmt->sysinfo.tc_band_end),
+					frame->mt == NMT_MESSAGE_1b ? "1b" : "1a",
+					frame->mt == NMT_MESSAGE_1b ? " (TC limits suppressed per §4.3.3.13.1)" : "");
+			}
+		} else {
+			/* Battery-saving additional info (NMT Doc 450-1 §4.3.3.12 /
+			 * NMT Doc 900-1 §4.3.3.14): H1=14(E) H2=11(B) marker.
+			 * H3 = period code (bs_period, 0 = disabled / phones never sleep).
+			 * H7 = addressed group (bs_group). */
+			frame->additional_info |= 0xeb00000000;				/* H1=E, H2=B marker */
+			frame->additional_info |= ((uint64_t)(nmt->bs_period & 0xf)) << 28;	/* H3 period */
+			frame->additional_info |= ((uint64_t)(nmt->bs_group & 0xf)) << 12;	/* H7 group */
+			/* phone is allowed to send overdecadic dialing digits */
+			frame->additional_info |= 0x0000020000;
+			/* no clock on combined CC+TC */
+			if (nmt->send_clock && frame->mt != NMT_MESSAGE_1b) {
+				/* send battery saving message including clock */
+				time_sec = get_time();
+				tm = localtime(&time_sec);
+				clock = (1 << 11) | (tm->tm_hour << 6) | tm->tm_min;
+				/* add clock with flag */
+				frame->additional_info |= clock;
+			}
 		}
 	}
 	if (frame->mt == NMT_MESSAGE_1b || frame->mt == NMT_MESSAGE_4 || frame->mt == NMT_MESSAGE_4b || frame->mt == NMT_MESSAGE_30) {
 		/* sent area info on traffic channels; it is always H8H9H10, because all IEs are aligned 'to the right' */
 		frame->additional_info |= nmt_encode_area_no(nmt->sysinfo.area_no);
 	}
-	/* NMT 900 §4.3.3.13 channel band information (STANDARD POINT REACHED):
-	 * On calling channels (1a/1a_a/1a_b/1b), H1H2 may signal the start/end of the
-	 * CC band (H3H4..H5H6, §4.3.3.13.3) and TC/AC band (H7H8..H9H10, §4.3.3.13.4)
-	 * to allow an MS to scan a wider or different band than its preprogrammed basic
-	 * band. H1(14) H2(0) signals CC+TC band info present; H1(14) H2(12) signals
-	 * CC+AC band info. If H3H4=H5H6=00 or H7H8=H9H10=00, the preprogrammed band
-	 * is used. Currently this node always sends H1=E H2=B (battery saving marker)
-	 * for NMT 450, and NMT 900 uses the same encoding -- the channel band fields
-	 * (H3-H10) are always zero, so the MS falls back to its basic channel band.
-	 * Full band advertisement would require --cc-band-start/--cc-band-end options
-	 * and is not implemented. */
 }
 
 static void rx_idle(nmt_t *nmt, frame_t *frame)
@@ -1449,32 +1569,8 @@ static void tx_mt_queue(nmt_t *nmt, frame_t *frame)
 	}
 
 	/* otherwise keep telling the MS it is queued (2c priority, 2f ordinary) */
-	/* Fictitious channel numbers for H8H9H10 in frames 2c, 2f, 2d.
-	 *
-	 * NMT Doc 450-1 §4.3.3.11 (p.51): raw 12-bit H8H9H10 values placed directly
-	 * in additional_info -- these are NOT channel numbers in the BCD sense:
-	 *   3F0 -> queuing info to ordinary MS (frame 2f)
-	 *   3F1 -> queuing info to PMS (frame 2c)
-	 *   3F2 -> TC scanning order (frame 2d)
-	 *
-	 * NMT Doc 900-1 §4.3.3.12 (p.51): same wire values expressed as fictitious
-	 * channel numbers ch.1008/1009/1010. These must pass through nmt_encode_channel()
-	 * (interleaved-channel encoding) to get the correct 12-bit H8H9H10 bit pattern:
-	 *   ch.1008 -> nmt_encode_channel(900, 1008, 0) = 0x9F0 (ordinary 2f)
-	 *   ch.1009 -> nmt_encode_channel(900, 1009, 0) = 0x9F1 (PMS 2c)
-	 *   ch.1010 -> nmt_encode_channel(900, 1010, 0) = 0x9F2 (TC scanning 2d)
-	 *
-	 * NMT 450 ch.1008 is outside the valid BCD channel range (1-400), so the
-	 * two specs cannot be unified through nmt_encode_channel(): system-specific
-	 * raw constants are used instead.
-	 */
-#define NMT_QUEUE_H8H9H10_ORDINARY_450  0x3F0	/* NMT 450 §4.3.3.11: ordinary MS (2f) */
-#define NMT_QUEUE_H8H9H10_PRIORITY_450  0x3F1	/* NMT 450 §4.3.3.11: PMS (2c) */
-#define NMT_QUEUE_H8H9H10_SCANNING_450  0x3F2	/* NMT 450 §4.3.3.11: TC scanning (2d) */
-#define NMT_QUEUE_H8H9H10_ORDINARY_900  0x9F0	/* NMT 900 §4.3.3.12: ch.1008 encoded */
-#define NMT_QUEUE_H8H9H10_PRIORITY_900  0x9F1	/* NMT 900 §4.3.3.12: ch.1009 encoded */
-#define NMT_QUEUE_H8H9H10_SCANNING_900  0x9F2	/* NMT 900 §4.3.3.12: ch.1010 encoded */
-
+	/* H8H9H10: system-specific encoding per NMT 450 §4.3.3.11 / NMT 900 §4.3.3.12.
+	 * Constants are defined at file scope above (NMT_QUEUE_H8H9H10_*). */
 	frame->mt = trans->priority ? NMT_MESSAGE_2c : NMT_MESSAGE_2f;
 	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
 	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
