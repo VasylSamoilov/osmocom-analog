@@ -687,21 +687,28 @@ static const char *param_password(uint64_t value, int ndigits, enum nmt_directio
 static const char *param_waiting(uint64_t value, int __attribute__((unused)) ndigits, enum nmt_direction __attribute__((unused)) direction)
 {
 	static char result[128];
+	uint8_t i_high, i_low;
 
-	if (value & 0x01)
-		strcat(result, "SMS ");
-	if (value & 0x02)
-		strcat(result, "voice-mail ");
-	if (value & 0x04)
-		strcat(result, "fax ");
-	if (value & 0x08)
-		strcat(result, "e-mail ");
-	if (value & 0x10)
-		strcat(result, "data ");
-	if (value & 0x20)
-		strcat(result, "(spare) ");
-	strcat(result, " is waiting");
-
+	/* F1F2F3 wire layout (NMT Doc 450-1 §4.3.3.11, p.51):
+	 *   bit 11..6 = i1 i2 i3 i4 i5 i6   (primary indicator bits)
+	 *   bit  5..0 = i'1 i'2 i'3 i'4 i'5 i'6  (redundant copy for error-checking)
+	 * i1=SMS, i2=voice-mail, i3=fax, i4=e-mail, i5=data, i6=spare.
+	 * Note: in=0 "carries no information on the corresponding indicator
+	 * setting (does not reset the indicator)" -- only i=1 has meaning. */
+	result[0] = '\0';
+	if (value & 0x800) strcat(result, "SMS ");		/* i1 = bit 11 */
+	if (value & 0x400) strcat(result, "voice-mail ");	/* i2 = bit 10 */
+	if (value & 0x200) strcat(result, "fax ");		/* i3 = bit 9  */
+	if (value & 0x100) strcat(result, "e-mail ");		/* i4 = bit 8  */
+	if (value & 0x080) strcat(result, "data ");		/* i5 = bit 7  */
+	/* bit 6 = i6 = spare */
+	/* Validate the i/i' redundant copy: i_high (bits 11..6) must equal i_low (bits 5..0). */
+	i_high = (value >> 6) & 0x3f;
+	i_low  =  value       & 0x3f;
+	if (i_high != i_low)
+		strcat(result, "(i/i' mismatch!) ");
+	if (result[0] == '\0') strcat(result, "(none) ");
+	strcat(result, "is waiting");
 	return result;
 }
 

@@ -1566,14 +1566,18 @@ static void set_mwi_frame(nmt_t *nmt, frame_t *frame, uint8_t flags)
 	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
 
-	/* Encode flags into FFF field with correct bit positions
-	 * Each indicator sets both i_n (bits 11-6) and i'_n (bits 5-0)
-	 */
-	if (flags & 0x01) info |= 0x820;  /* SMS:   i1 at bit 11, i'1 at bit 5 */
-	if (flags & 0x02) info |= 0x410;  /* voice: i2 at bit 10, i'2 at bit 4 */
-	if (flags & 0x04) info |= 0x208;  /* fax:   i3 at bit 9,  i'3 at bit 3 */
-	if (flags & 0x08) info |= 0x104;  /* email: i4 at bit 8,  i'4 at bit 2 */
-	if (flags & 0x10) info |= 0x082;  /* data:  i5 at bit 7,  i'5 at bit 1 */
+	/* Encode flags into F1F2F3 field per NMT Doc 450-1 §4.3.3.11 (p.51):
+	 *   F1F2F3 = i1 i2 i3 i4  i5 i6  i'1 i'2  i'3 i'4 i'5 i'6
+	 *   bit:     11 10  9  8    7  6    5   4    3   2   1   0
+	 * Each indicator is set in both the primary (in) and redundant (i'n) copy.
+	 * IMPORTANT: "in = 0 carries no information on the corresponding indicator
+	 * setting (does not reset the indicator)" -- only in=1 has meaning.
+	 * There is no mechanism to reset an indicator via frame 5c alone. */
+	if (flags & 0x01) info |= 0x820;  /* SMS:   i1(bit 11) + i'1(bit 5) */
+	if (flags & 0x02) info |= 0x410;  /* voice: i2(bit 10) + i'2(bit 4) */
+	if (flags & 0x04) info |= 0x208;  /* fax:   i3(bit 9)  + i'3(bit 3) */
+	if (flags & 0x08) info |= 0x104;  /* email: i4(bit 8)  + i'4(bit 2) */
+	if (flags & 0x10) info |= 0x082;  /* data:  i5(bit 7)  + i'5(bit 1) */
 
 	frame->waiting_info = info;
 
@@ -3011,7 +3015,10 @@ static uint8_t parse_mwi_flags(const char *indicators)
 
 	/* Check if numeric */
 	if (indicators[0] >= '0' && indicators[0] <= '9') {
-		flags = atoi(indicators) & 0x1F;
+		int raw = atoi(indicators);
+		flags = raw & 0x1F;
+		if (raw < 0 || raw > 0x1F)
+			LOGP(DNMT, LOGL_NOTICE, "MWI numeric flags %d out of range for the 5 defined indicators (0..31), using 0x%02x.\n", raw, flags);
 		LOGP(DNMT, LOGL_DEBUG, "MWI flags (numeric): 0x%02x\n", flags);
 		return flags;
 	}
