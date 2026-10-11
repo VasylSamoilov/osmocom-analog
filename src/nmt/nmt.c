@@ -1317,14 +1317,7 @@ static void rx_mt_autoanswer(nmt_t *nmt, frame_t *frame)
 			break;
 		if (!match_subscriber(trans, frame))
 			break;
-		if (((frame->line_signal >> 16) & 0xf) != ((frame->line_signal >> 12) & 0xf)
-		 || ((frame->line_signal >> 12) & 0xf) != ((frame->line_signal >> 8) & 0xf)
-		 || ((frame->line_signal >> 8) & 0xf) != ((frame->line_signal >> 4) & 0xf)
-		 || ((frame->line_signal >> 4) & 0xf) != (frame->line_signal & 0xf)) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal repetition in frame does not match, ignoring due to corrupt frame.\n");
-			break;
-		}
-		if ((frame->line_signal & 0xf) != 12)
+		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 12)
 			break;
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received acknowledge to autoanswer.\n");
 		nmt_new_state(nmt, STATE_MT_COMPLETE);
@@ -1375,14 +1368,7 @@ static void rx_mt_ringing(nmt_t *nmt, frame_t *frame)
 			break;
 		if (!match_subscriber(trans, frame))
 			break;
-		if (((frame->line_signal >> 16) & 0xf) != ((frame->line_signal >> 12) & 0xf)
-		 || ((frame->line_signal >> 12) & 0xf) != ((frame->line_signal >> 8) & 0xf)
-		 || ((frame->line_signal >> 8) & 0xf) != ((frame->line_signal >> 4) & 0xf)
-		 || ((frame->line_signal >> 4) & 0xf) != (frame->line_signal & 0xf)) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal repetition in frame does not match, ignoring due to corrupt frame.\n");
-			break;
-		}
-		if ((frame->line_signal & 0xf) != 14)
+		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 14)
 			break;
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received 'answer' from phone.\n");
 		nmt_new_state(nmt, STATE_MT_COMPLETE);
@@ -1535,14 +1521,7 @@ static void rx_mt_release(nmt_t *nmt, frame_t *frame)
 			break;
 		if (!match_subscriber(trans, frame))
 			break;
-		if (((frame->line_signal >> 16) & 0xf) != ((frame->line_signal >> 12) & 0xf)
-		 || ((frame->line_signal >> 12) & 0xf) != ((frame->line_signal >> 8) & 0xf)
-		 || ((frame->line_signal >> 8) & 0xf) != ((frame->line_signal >> 4) & 0xf)
-		 || ((frame->line_signal >> 4) & 0xf) != (frame->line_signal & 0xf)) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal repetition in frame does not match, ignoring due to corrupt frame.\n");
-			break;
-		}
-		if ((frame->line_signal & 0xf) != 1)
+		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 1)
 			break;
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received release guard L(1).\n");
 		if (trans->mwi_call) {
@@ -1730,18 +1709,18 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			frame->line_signal & 0xf, frame->tariff_class);
 		break;
 	case NMT_MESSAGE_13a: /* line signal */
+	    {
+		int ls;
 		if (!match_channel(nmt, frame))
 			break;
 		if (!match_subscriber(trans, frame))
 			break;
-		if (((frame->line_signal >> 16) & 0xf) != ((frame->line_signal >> 12) & 0xf)
-		 || ((frame->line_signal >> 12) & 0xf) != ((frame->line_signal >> 8) & 0xf)
-		 || ((frame->line_signal >> 8) & 0xf) != ((frame->line_signal >> 4) & 0xf)
-		 || ((frame->line_signal >> 4) & 0xf) != (frame->line_signal & 0xf)) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal repetition in frame does not match, ignoring due to corrupt frame.\n");
+		ls = nmt_line_signal_majority(frame->line_signal, 5, 3);
+		if (ls < 0) {
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal not accepted: no majority of equal, meaningful characters (corrupt frame).\n");
 			break;
 		}
-		switch ((frame->line_signal & 0xf)) {
+		switch (ls) {
 		case 5:
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register Recall is not supported.\n");
 			break;
@@ -1764,6 +1743,7 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 			break;
 		}
 		break;
+	    }
 	case NMT_MESSAGE_14a: /* digits */
 		if (!match_channel(nmt, frame))
 			break;
@@ -1969,11 +1949,8 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 			return;
 		if (!match_subscriber(nmt->trans, &frame))
 			return;
-		if (((frame.line_signal >> 16) & 0xf) != ((frame.line_signal >> 12) & 0xf)
-		 || ((frame.line_signal >> 12) & 0xf) != ((frame.line_signal >> 8) & 0xf)
-		 || ((frame.line_signal >> 8) & 0xf) != ((frame.line_signal >> 4) & 0xf)
-		 || ((frame.line_signal >> 4) & 0xf) != (frame.line_signal & 0xf)) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal repetition in frame does not match, ignoring due to corrupt frame.\n");
+		if (nmt_line_signal_majority(frame.line_signal, 5, 3) != 1) {
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Line signal not accepted: no majority of equal, meaningful characters (corrupt frame).\n");
 			return;
 		}
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received clearing by mobile phone in state %s.\n", nmt_state_name(nmt->state));

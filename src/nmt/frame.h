@@ -85,6 +85,7 @@ typedef struct frame {
 
 int init_frame(void);
 
+int nmt_line_signal_majority(uint64_t line_signal, int num_chars, int min_equal);
 uint64_t nmt_encode_channel(int nmt_system, int channel, int power);
 int nmt_decode_channel(int nmt_system, uint64_t value, int *channel, int *power);
 uint64_t nmt_encode_tc(int nmt_system, int channel, int power);

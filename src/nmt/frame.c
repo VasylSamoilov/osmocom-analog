@@ -28,21 +28,65 @@
 #include "nmt.h"
 #include "frame.h"
 
+/* Line-signal acceptance by majority vote (NMT Doc 450-1 para 4.7.2.3).
+ *
+ * A line signal repeats the signal number L(n) across several hex characters
+ * of the frame.  The standard accepts the signal if "at least two of three"
+ * (frames 5a/5b/5c, MTX->MS) or "at least three" (frames 13a/13b, MS->MTX)
+ * characters are equal and meaningful -- a majority vote that tolerates a
+ * minority of corrupted characters, not an all-equal match.
+ *
+ * line_signal holds the characters in the low nibbles, most significant char
+ * first: for num_chars=5 the characters are at bit offsets 16,12,8,4,0.
+ * Returns the value that occurs at least min_equal times, or -1 if none does.
+ */
+int nmt_line_signal_majority(uint64_t line_signal, int num_chars, int min_equal)
+{
+	int count[16] = { 0 };
+	int i, best = -1, best_count = 0, v;
+
+	for (i = 0; i < num_chars; i++) {
+		v = (line_signal >> (i * 4)) & 0xf;
+		if (++count[v] > best_count) {
+			best_count = count[v];
+			best = v;
+		}
+	}
+
+	if (best_count >= min_equal)
+		return best;
+
+	return -1;
+}
+
 uint64_t nmt_encode_channel(int nmt_system, int channel, int power)
 {
 	uint64_t value = 0;
 
 	if (nmt_system == 450) {
-		if (channel >= 200) {
-			value |= 0x800;
+		/* NMT Doc 450-1 para 4.3.3.1 Note 1 + Note 3:
+		 * bits 1 and 4 of N1 select the hundreds base
+		 *   0xx0 -> 1..99, 0xx1 -> 100..199,
+		 *   1xx0 -> 200..299, 1xx1 -> 300..400
+		 * within a base the tens:units run as BCD; channel 400 is the
+		 * special top of the 300 base, coded '39A' (tens=9, units=A). */
+		if (channel >= 300) {
+			value |= 0x900;		/* bit1 | bit4 */
+			channel -= 300;
+		} else if (channel >= 200) {
+			value |= 0x800;		/* bit1 */
 			channel -= 200;
-		}
-		if (channel >= 100) {
-			value |= 0x100;
+		} else if (channel >= 100) {
+			value |= 0x100;		/* bit4 */
 			channel -= 100;
 		}
-		value |= channel % 10;
-		value |= (channel / 10) << 4;
+		if (channel == 100) {
+			/* channel 400: top of the 300 base, coded '9A' */
+			value |= 0x9a;
+		} else {
+			value |= channel % 10;
+			value |= (channel / 10) << 4;
+		}
 		value |= power << 9;
 	} else {
 		/* interleaved channels are indicated in traffic area */
@@ -61,15 +105,23 @@ uint64_t nmt_encode_channel(int nmt_system, int channel, int power)
 int nmt_decode_channel(int nmt_system, uint64_t value, int *channel, int *power)
 {
 	if (nmt_system == 450) {
-		if ((value & 0x00f) > 0x009)
-			return -1;
-		if ((value & 0x0f0) > 0x090)
-			return -1;
+		/* NMT Doc 450-1 para 4.3.3.1 Note 1 + Note 3: hundreds base is
+		 * selected by bits 1 (0x800) and 4 (0x100) of N1; within a base
+		 * N2N3 are BCD tens:units.  Channel 400 is the special '9A' at
+		 * the top of the 300 base (units = A). */
+		int base = (((value & 0x800) >> 11) << 1 | ((value & 0x100) >> 8)) * 100;
 
-		*channel = (value & 0x00f) +
-			((value & 0x0f0) >> 4) * 10 +
-			((value & 0x100) >> 8) * 100 +
-			((value & 0x800) >> 11) * 200;
+		if (base == 300 && (value & 0x0ff) == 0x9a) {
+			*channel = 400;		/* '39A' */
+		} else {
+			if ((value & 0x00f) > 0x009)
+				return -1;
+			if ((value & 0x0f0) > 0x090)
+				return -1;
+			*channel = base +
+				(value & 0x00f) +
+				((value & 0x0f0) >> 4) * 10;
+		}
 	} else {
 		*channel = (value & 0x1ff) +
 			((value & 0x800) >> 2);
@@ -84,16 +136,23 @@ uint64_t nmt_encode_tc(int nmt_system, int channel, int power)
 	uint64_t value = 0;
 
 	if (nmt_system == 450) {
-		if (channel >= 200) {
+		/* NMT Doc 450-1 para 4.3.3.1 Note 1 + Note 3 (see nmt_encode_channel). */
+		if (channel >= 300) {
+			value |= 0x900;
+			channel -= 300;
+		} else if (channel >= 200) {
 			value |= 0x800;
 			channel -= 200;
-		}
-		if (channel >= 100) {
+		} else if (channel >= 100) {
 			value |= 0x100;
 			channel -= 100;
 		}
-		value |= channel % 10;
-		value |= (channel / 10) << 4;
+		if (channel == 100) {
+			value |= 0x9a;		/* channel 400: '9A' */
+		} else {
+			value |= channel % 10;
+			value |= (channel / 10) << 4;
+		}
 		value |= power << 9;
 	} else {
 		value = channel;
@@ -105,15 +164,20 @@ uint64_t nmt_encode_tc(int nmt_system, int channel, int power)
 static int nmt_decode_tc(int nmt_system, uint64_t value, int *channel, int *power)
 {
 	if (nmt_system == 450) {
-		if ((value & 0x00f) > 0x009)
-			return -1;
-		if ((value & 0x0f0) > 0x090)
-			return -1;
+		/* NMT Doc 450-1 para 4.3.3.1 Note 1 + Note 3 (see nmt_decode_channel). */
+		int base = (((value & 0x800) >> 11) << 1 | ((value & 0x100) >> 8)) * 100;
 
-		*channel = (value & 0x00f) +
-			((value & 0x0f0) >> 4) * 10 +
-			((value & 0x100) >> 8) * 100 +
-			((value & 0x800) >> 11) * 200;
+		if (base == 300 && (value & 0x0ff) == 0x9a) {
+			*channel = 400;		/* '39A' */
+		} else {
+			if ((value & 0x00f) > 0x009)
+				return -1;
+			if ((value & 0x0f0) > 0x090)
+				return -1;
+			*channel = base +
+				(value & 0x00f) +
+				((value & 0x0f0) >> 4) * 10;
+		}
 		*power = (value & 0x600) >> 9;
 	} else {
 		*channel = value & 0x3ff;
