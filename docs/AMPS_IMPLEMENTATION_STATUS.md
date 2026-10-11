@@ -27,26 +27,47 @@ page by page.
 
 | STATUS | Rows | Meaning |
 |---|---:|---|
-| IMPLEMENTED | 379 | present, spec-accurate, and exercised |
+| IMPLEMENTED | 457 | present, spec-accurate, and exercised (incl. "IMPLEMENTED (RX)" receive-path rows) |
 | NOT-APPLICABLE (mobile-side / regulatory / reserved) | 192 | a mobile "shall" or RF/measurement/reserved item with no base obligation |
-| DECODE-ONLY | 91 | field/word parsed on RX but never acted on (logged) |
-| PARTIAL | 83 | present but incomplete, approximated, or not fully enforced |
+| DECODE-ONLY | 110 | field/word parsed on RX but never acted on (logged) |
+| PARTIAL | 105 | present but incomplete, approximated, or not fully enforced |
 | MISSING | 45 | required of the base, no implementation |
-| STUB | 7 | defined but unreachable / never emitted |
+| STUB | 8 | defined but unreachable / never emitted |
 | EXTENSION (non-spec) | 2 | code exceeds a "Reserved" spec section (SAT/ST detect) |
 | UNVERIFIED | 0 | both prior UNVERIFIED items resolved (see below) |
+
+> **Count note:** the status counts above are the ACTUAL body-table row counts (recounted after
+> the corrections below), so the roll-up and the per-page tables now agree. The earlier roll-up used
+> round estimates from the parallel range walk and did not reconcile to the body; it has been
+> replaced with the verified counts. NOT-APPLICABLE is still the walk's estimate (its rows span many
+> prose/glossary pages and were not re-tallied this pass).
 
 > **Post-walk correction (2026-10-11):** a re-validation pass found the p.59/§2.6.2.3 and
 > p.65/§2.6.3.7 range had **7 false MISSING rows** — the Abbreviated Alert, Audit, PCI Query and
 > Message Waiting orders are in fact implemented (`amps.c:2472/3387/3313/2748`, driven by the
 > control FIFO), and the three PCI-registration Word C rows are DECODE-ONLY (word decoded + logged
 > via `amps_rx_pci_report`), not absent. Those range workers greped the wrong tokens and missed the
-> order senders in `amps.c`. The counts above are the corrected totals (MISSING 52→45,
-> IMPLEMENTED 375→379, DECODE-ONLY 88→91). Other ranges were spot-checked and not similarly affected.
+> order senders in `amps.c`.
+>
+> **Second re-validation (2026-10-11, every MISSING row across all ranges):** of the 45 remaining
+> MISSING rows, **38 are correctly MISSING** — all auth-family (CAVE/SSD/AUTHR/AUTHU/AUTHBS,
+> Base-Station Challenge, SSD Update, Auth-Word-C registration, Message Encryption; only *scaffolded*
+> this session, no CAVE engine), plus LASTCHA/LASTCHP, the ±12 kHz voice deviation limiter, and the
+> two busy-idle TX rows (deliberately not implemented — SDR latency). **4 more were stale/misclassified:**
+> directed-retry LT↔ORDQ is IMPLEMENTED (`amps.c:4024/4028`); BSCAP and BSPC are DECODE-ONLY
+> (encoder exists, value hardcoded in sysinfo.c); the global-action Local Control overhead word is a
+> STUB (framing defined, never emitted — distinct from the implemented per-call Order 30).
+>
+> Corrected totals above reflect both passes. Net reclassifications out of MISSING: 7 (p.59/p.65
+> orders) + 4 (directed-retry LT, BSCAP, BSPC, Local Control STUB) = 11 rows that were wrongly
+> MISSING, leaving 45 genuinely-missing rows — of which ~38 are the auth family (scaffolded only,
+> no CAVE) and the rest are LASTCHA/LASTCHP, the ±12 kHz deviation limiter, and the two busy-idle
+> TX rows (deliberate SDR-latency omission).
 
-Of the ~612 rows that are genuine base-station obligations (excluding the 192
-not-applicable), **~61% are fully implemented**, with the shortfall concentrated
-in a few coherent areas rather than scattered defects.
+Of the base-station-obligation rows (the 457 IMPLEMENTED + 110 DECODE-ONLY + 105 PARTIAL +
+45 MISSING + 8 STUB = 725 rows that carry a base obligation, excluding the 192 not-applicable),
+**~63% are fully implemented**, with the shortfall concentrated in a few coherent areas
+(authentication above all) rather than scattered defects.
 
 ## Cross-cutting findings (the through-line)
 
@@ -168,8 +189,8 @@ semantics; the overhead fields the BASE actually transmits are the implemented o
 PAGE 19 | §1.2 | Subscript notation s/sv/sl/r/p/s-p | N-A | N-A | N-A | N-A | NOT-APPLICABLE(notation) | storage-class convention
 PAGE 19 | §1.2 | ACCOLC (overload class controlling access) | N | N | N | N | NOT-APPLICABLE(mobile-side) | no "accolc" in src; base sends OLC field (see below), MS picks via ACCOLC
 PAGE 19 | §1.2 | BIS (check idle-to-busy on RECC) | N-A | Y | Y | Y | IMPLEMENTED | bis param drives wfom/rcf sysinfo.c:67,82; operator -S
-PAGE 19 | §1.2 | BSCAP (base core analog protocol version) | N | N | N | N | MISSING | no match; EIA-136 access-type extension not emitted
-PAGE 19 | §1.2 | BSPC (base protocol capability) | N | N | N | N | MISSING | no match in src/amps/
+PAGE 19 | §1.2 | BSCAP (base core analog protocol version) | Y | Y | partial | N | DECODE-ONLY | CORRECTED (was MISSING): BSCAP IE + decoder (ie_bscap frame.c:1710) and encoder exist — amps_encode_access_type() sets AMPS_IE_BSCAP (frame.c:2984). Value hardcoded bscap=1 in sysinfo.c:125, no operator control.
+PAGE 19 | §1.2 | BSPC (base protocol capability) | Y | Y | partial | N | DECODE-ONLY | CORRECTED (was MISSING): BSPC IE + decoder (ie_bspc frame.c:1721) and encoder exist — amps_encode_access_type() sets AMPS_IE_BSPC (frame.c:2983). Value hardcoded bspc=0 in sysinfo.c:124, no operator control.
 PAGE 19 | §1.2 | CCLIST (control-channel scan list) | N | N | N | N | NOT-APPLICABLE(mobile-side) | directed-retry list; no match
 PAGE 19 | §1.2 | CMAX (max channels scanned when accessing) | N-A | Y | Y | Y | IMPLEMENTED | word2.cmax_1 sysinfo.c:84; -S cmax1=
 PAGE 19 | §1.2 | COUNT (modulo-64 count in MS) | N-A | Y | partial | N | PARTIAL | si->count is overhead-train seq (sysinfo.c:147), not the MS auth COUNT
@@ -660,7 +681,7 @@ PAGE | SECTION | REQUIREMENT (short) | DECODED | ENCODED | ACTED-ON | COMMAND | 
 Ordered response list. Access Type params: BIS, PCI_HOME, PCI_ROAM, BSPC, BSCAP (+ 553-A capability logic). New Access Channel Set: NEWACC→FIRSTCHA. Reg Increment: REGINCR. Location Area: PUREG/PDREG/LREG/LOCAID.
 
 PAGE | SECTION | REQUIREMENT (short) | DECODED | ENCODED | ACTED-ON | COMMAND | STATUS | EVIDENCE
-56 | §2.6.2.1(1) | Local Control Message response (if local control enabled) | N-A | N | N | N | MISSING | no Local Control global-action word encoded base-side
+56 | §2.6.2.1(1) | Local Control Message response (if local control enabled) | N-A | partial | N | N | STUB | REFINED (was MISSING): the global-action Local Control 1/2 overhead words are defined (local_control_1/2, frame.c:531/545) but never emitted — they are not in get_sysinfo()/prepare_sysinfo(), so the overhead train never carries them. (Distinct from the per-call Local Control Order 30, which IS implemented — amps_local_control() amps.c:3609.)
 56 | §2.6.2.1(2) | Access Type Parameters: BIS field | N-A | Y | Y | Y | IMPLEMENTED | acc_type.bis sysinfo.c:188; bis operator ctl main_common.c:109; accattempt cmd
 56 | §2.6.2.1(2) | Access Type: PCI_HOME field | N-A | Y | Y | partial | IMPLEMENTED | acc_type.pci_home sysinfo.c:188
 56 | §2.6.2.1(2) | Access Type: PCI_ROAM field | N-A | Y | Y | partial | IMPLEMENTED | acc_type.pci_roam sysinfo.c:188
@@ -827,7 +848,7 @@ Row format: PAGE | SECTION | REQUIREMENT | DECODED | ENCODED | ACTED-ON | COMMAN
 66 | 2.6.3.8 | MS monitor MSC messages; match MIN1p/MIN2p (if Word B sent) else MIN1p only | N-A | N-A | N-A | N-A | NOT-APPLICABLE(mobile-side) | mobile match
 66 | 2.6.3.8 | Initial Voice Channel Designation msg: MS updates params; if Rs=1 -> Autonomous Reg Update "success"; then Confirm Initial Voice Channel | Y | Y | Y | N-A | IMPLEMENTED | base BUILDS/sends IVCD: word3_first_analog_channel_assignment_word (frame.c:201, VMAC/SCC/CHAN); TX states TRANS_CALL_MO_ASSIGN/MT_ASSIGN (transaction.h:7-10); reception is mobile
 66 | 2.6.3.8 | Directed-retry message: if MS equipped, respond; new-message-before-4-words -> SSDeterm | partial | N | N | N | STUB | directed-retry words defined (frame.c:232 word3_first_directed_retry_word, frame.c:281 word4; in msg set frame.c:623/627) but NO TX state/encode path in amps.c
-66 | 2.6.3.8 | Directed-retry: set LTs from ORDQ (000->0, 001->1) | N | N | N | N | MISSING | no directed-retry send logic to set ORDQ/LT
+66 | 2.6.3.8 | Directed-retry: set LTs from ORDQ (000->0, 001->1) | N-A | Y | Y | Y | IMPLEMENTED | CORRECTED (was MISSING): amps_directed_retry() sets trans->retry_last_try and trans->ordq = last_try?1:0 (amps.c:4024/4028), i.e. the LT↔ORDQ mapping; the directed-retry words are then encoded on the FOCC.
 
 ## page 67  (§2.6.3.8 cont. — CHANPOS/CCLIST calc; Intercept/Reorder/Release orders; Message Waiting; Base Stn Challenge Order Confirm)
 
