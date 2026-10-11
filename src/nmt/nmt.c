@@ -886,6 +886,8 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received PMS priority seizure (11b) on non-CC channel, ignoring.\n");
 			break;
 		}
+		if (!match_area(nmt, frame))
+			break;
 		/* extract subscriber from the 11b frame */
 		memset(&subscr, 0, sizeof(subscr));
 		nmt_value2digits(frame->ms_country, &subscr.country, 1);
@@ -1291,7 +1293,8 @@ void timeout_mt_paging(transaction_t *trans)
 	LOGP(DNMT, LOGL_NOTICE, "No answer from mobile phone (try %d).\n", trans->page_try);
 	if (trans->page_try == PAGE_TRIES) {
 		LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
-		call_up_release(trans->callref, CAUSE_OUTOFORDER);
+		if (trans->callref)
+			call_up_release(trans->callref, CAUSE_OUTOFORDER);
 		destroy_transaction(trans);
 		return;
 	}
