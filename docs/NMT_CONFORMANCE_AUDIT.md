@@ -195,12 +195,16 @@ RELEASE_TO=2s matches "max 2s". Stop-ø to BS (20/25) SCOPED-OUT.
 2a→10a→(no TC)→2c/2f loop→2b. `STATE_MT_QUEUE`, QUEUE_TO=60s. Matches note "2b
 sent instead of 2c once idle TC available".
 
-### 7.7 SCIP channel-change (Scheme C2', CLI p.76) — PARTIAL, 3 deviations
-order→retune→10b→active sequence matches, but: **(a)** order uses **frame 3a**
-(prefix 5), spec C2' uses **3c** (prefix 9); **(b)** no 3b identity re-request
-fallback (spec st.9); **(c)** failure **releases the call** instead of reverting to
-the old TC + forced-release-on-new-TC. (`nmt.c:1593, 1628, ~1655`.) Operator-
-triggered, not signal-strength automatic.
+### 7.7 SCIP channel-change (CLI p.107) — PARTIAL, 2 real gaps
+order→retune→10b→active sequence matches. The order uses **frame 3a** (Scheme C,
+§4.7.2.4: `N₁N₂N₃ P(5) … NₐNᵦN_c`, current channel in N₁N₂N₃, new TC in NₐNᵦN_c) —
+`tx_scip_order` builds exactly this and it is **conformant**, NOT a deviation. Frame
+**3c** (Scheme C2', §4.7.2.4b "short procedure", N₁'N₂'N₃' = NₐNᵦN_c) is an optional
+faster variant that is simply **not implemented** — no functional loss, since both
+chain to the same re-identify step. Two **real gaps** remain: **(a)** no 3b identity
+re-request fallback (spec st.9); **(b)** failure **releases the call** instead of
+reverting to the old TC + forced-release-on-new-TC. (`nmt.c:1593, 1628, ~1655`.)
+Operator-triggered, not signal-strength automatic.
 
 ### 7.8 MFT / MWI — IMPL
 MFT-in L(4), MFT-out L(10); MWI 5c×2 then L(15)×4 per §4.4.1.16. All **IMPL**.
@@ -259,8 +263,10 @@ genuine deviations, worst-interesting first:
    unchanged. §9.
 2. **Line-signal acceptance stricter than spec** — **FIXED** (same branch):
    `nmt_line_signal_majority()` implements the ≥3-of-5 vote at 5 RX sites. §6.
-3. **SCIP uses frame 3a, not 3c**, and lacks the 3b re-request + revert-to-old-TC
-   failure handling of Scheme C2'. §7.7.
+3. **SCIP robustness gaps** (the frame choice is NOT a gap — 3a is a conformant
+   Scheme-C channel-change order per §4.7.2.4; 3c is an optional unimplemented
+   fast-path): no 3b identity re-request fallback, and failure releases the call
+   instead of reverting to the old TC. §7.7.
 4. **Release / roaming-confirmation line-signal values** (L=15 release, L=3 roaming
    confirm) differ from the diagrams' 5a(L=13/15) — needs L-code-table confirm. §7.3/7.4.
 
