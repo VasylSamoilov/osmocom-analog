@@ -818,6 +818,9 @@ static void rx_roaming_ident(nmt_t *nmt, frame_t *frame)
 
 static void tx_roaming_confirm(nmt_t *nmt, frame_t *frame)
 {
+	/* L(3) = "proceed to send unencrypted digits (roaming updating
+	 * confirmation)" per NMT Doc 450-1 para 4.3.3.3. L(11) is the encrypted
+	 * (SIS) variant, which is not used here (SIS is not implemented). */
 	set_line_signal(nmt, frame, 3);
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send 'Roaming updating confirmation'.\n");
@@ -1509,6 +1512,10 @@ static void tx_mo_release(nmt_t *nmt, frame_t *frame)
 
 static void tx_mt_release(nmt_t *nmt, frame_t *frame)
 {
+	/* L(15) = "clearing, call transfer not activated" per NMT Doc 450-1 para
+	 * 4.3.3.3 -- the plain release. L(13) is the "call transfer activated"
+	 * variant, used only with the call-transfer supplementary service (not
+	 * implemented), so the diagrams' "L(13/15)" reduces to L(15) here. */
 	set_line_signal(nmt, frame, 15);
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send release.\n");
