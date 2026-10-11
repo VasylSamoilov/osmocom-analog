@@ -859,6 +859,17 @@ static void tx_idle(nmt_t *nmt, frame_t *frame)
 		/* sent area info on traffic channels; it is always H8H9H10, because all IEs are aligned 'to the right' */
 		frame->additional_info |= nmt_encode_area_no(nmt->sysinfo.area_no);
 	}
+	/* NMT 900 §4.3.3.13 channel band information (STANDARD POINT REACHED):
+	 * On calling channels (1a/1a_a/1a_b/1b), H1H2 may signal the start/end of the
+	 * CC band (H3H4..H5H6, §4.3.3.13.3) and TC/AC band (H7H8..H9H10, §4.3.3.13.4)
+	 * to allow an MS to scan a wider or different band than its preprogrammed basic
+	 * band. H1(14) H2(0) signals CC+TC band info present; H1(14) H2(12) signals
+	 * CC+AC band info. If H3H4=H5H6=00 or H7H8=H9H10=00, the preprogrammed band
+	 * is used. Currently this node always sends H1=E H2=B (battery saving marker)
+	 * for NMT 450, and NMT 900 uses the same encoding -- the channel band fields
+	 * (H3-H10) are always zero, so the MS falls back to its basic channel band.
+	 * Full band advertisement would require --cc-band-start/--cc-band-end options
+	 * and is not implemented. */
 }
 
 static void rx_idle(nmt_t *nmt, frame_t *frame)
@@ -1438,13 +1449,41 @@ static void tx_mt_queue(nmt_t *nmt, frame_t *frame)
 	}
 
 	/* otherwise keep telling the MS it is queued (2c priority, 2f ordinary) */
+	/* Fictitious channel numbers for H8H9H10 in frames 2c, 2f, 2d.
+	 *
+	 * NMT Doc 450-1 §4.3.3.11 (p.51): raw 12-bit H8H9H10 values placed directly
+	 * in additional_info -- these are NOT channel numbers in the BCD sense:
+	 *   3F0 -> queuing info to ordinary MS (frame 2f)
+	 *   3F1 -> queuing info to PMS (frame 2c)
+	 *   3F2 -> TC scanning order (frame 2d)
+	 *
+	 * NMT Doc 900-1 §4.3.3.12 (p.51): same wire values expressed as fictitious
+	 * channel numbers ch.1008/1009/1010. These must pass through nmt_encode_channel()
+	 * (interleaved-channel encoding) to get the correct 12-bit H8H9H10 bit pattern:
+	 *   ch.1008 -> nmt_encode_channel(900, 1008, 0) = 0x9F0 (ordinary 2f)
+	 *   ch.1009 -> nmt_encode_channel(900, 1009, 0) = 0x9F1 (PMS 2c)
+	 *   ch.1010 -> nmt_encode_channel(900, 1010, 0) = 0x9F2 (TC scanning 2d)
+	 *
+	 * NMT 450 ch.1008 is outside the valid BCD channel range (1-400), so the
+	 * two specs cannot be unified through nmt_encode_channel(): system-specific
+	 * raw constants are used instead.
+	 */
+#define NMT_QUEUE_H8H9H10_ORDINARY_450  0x3F0	/* NMT 450 §4.3.3.11: ordinary MS (2f) */
+#define NMT_QUEUE_H8H9H10_PRIORITY_450  0x3F1	/* NMT 450 §4.3.3.11: PMS (2c) */
+#define NMT_QUEUE_H8H9H10_SCANNING_450  0x3F2	/* NMT 450 §4.3.3.11: TC scanning (2d) */
+#define NMT_QUEUE_H8H9H10_ORDINARY_900  0x9F0	/* NMT 900 §4.3.3.12: ch.1008 encoded */
+#define NMT_QUEUE_H8H9H10_PRIORITY_900  0x9F1	/* NMT 900 §4.3.3.12: ch.1009 encoded */
+#define NMT_QUEUE_H8H9H10_SCANNING_900  0x9F2	/* NMT 900 §4.3.3.12: ch.1010 encoded */
+
 	frame->mt = trans->priority ? NMT_MESSAGE_2c : NMT_MESSAGE_2f;
 	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
 	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
 	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-	/* H8H9H10 distinguishes the queue type: 3F1 = 2c (priority), 3F0 = 2f (ordinary) */
-	frame->additional_info = trans->priority ? 0x3f1 : 0x3f0;
+	if (nmt->sysinfo.system == 450)
+		frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_450 : NMT_QUEUE_H8H9H10_ORDINARY_450;
+	else
+		frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_900 : NMT_QUEUE_H8H9H10_ORDINARY_900;
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send queue info to mobile (%s).\n", trans->priority ? "2c priority" : "2f ordinary");
 }
