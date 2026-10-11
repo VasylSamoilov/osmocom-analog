@@ -60,6 +60,11 @@ enum nmt_active_state {
 	ACTIVE_STATE_MFT_OUT,	/* ack MFT converter out */
 	ACTIVE_STATE_MWI,	/* sending MWI (message waiting indicator) */
 	ACTIVE_STATE_MWI_CLEAR,	/* sending clearing signal after MWI */
+	ACTIVE_STATE_REGISTER_RECALL,	/* MS requested register recall (L(5), NMT Doc 450-1 4.7.2.11): a register
+					 * in the MTX would be connected to the line for code/digit sending.
+					 * Scaffold only -- there is no MTX register/digit-collection back-end. */
+	ACTIVE_STATE_COINBOX_ANSWER,	/* coin-box answer sequence: sending frame 5b (tariff class) after answer
+					 * (NMT Doc 450-1 4.7.2); returns to voice once sent. */
 };
 
 enum nmt_direction {
@@ -131,6 +136,13 @@ struct nmt {
 	 * but there is NO real SIS algorithm behind it (the SAK is a secret
 	 * operator key, not public) -- it cannot actually authenticate. */
 	int			sis_demo;		/* if set, originate frame 7 (RAND) as a labeled demo */
+	/* Coin-box tariff class (NMT Doc 450-1 4.2.1/4.7.2 frame 5b), optional.
+	 * A real MTX sources this from the charging/PSTN side at answer; this
+	 * emulator has no such source, so it is operator-supplied for the
+	 * answer-sequence scaffold. -1 = none configured (default): the coin-box
+	 * answer sequence logs that the standard point was reached with no tariff
+	 * source rather than sending an invented value. 0..3 = Q1Q2 tariff class. */
+	int			coinbox_tariff;		/* -1 = none, else tariff class 0..3 for frame 5b */
 
 	/* dsp states */
 	enum dsp_mode		dsp_mode;		/* current mode: audio, durable tone 0 or 1, paging */

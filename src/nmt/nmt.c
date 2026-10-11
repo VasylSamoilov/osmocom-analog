@@ -367,6 +367,9 @@ int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_
 	nmt->bs_period = (bs_period >= 0 && bs_period <= 9) ? bs_period : 0;
 	nmt->bs_group = (bs_group >= 0 && bs_group <= 8) ? bs_group : 8;
 	nmt->sis_demo = sis_demo ? 1 : 0;
+	/* coin-box tariff class: no charging/PSTN source in this emulator, so it
+	 * is disabled by default (-1); an operator may wire a value in later. */
+	nmt->coinbox_tariff = -1;
 	strncpy(nmt->smsc_number, smsc_number, sizeof(nmt->smsc_number) - 1);
 
 	/* init audio processing */
@@ -752,6 +755,25 @@ static void set_line_signal(nmt_t *nmt, frame_t *frame, uint8_t signal)
 	frame->line_signal = (signal << 8) | (signal << 4) | signal;
 	LOGP_CHAN(DNMT, LOGL_INFO, "Sending line signal L(%d) '%s'.\n",
 		signal & 0xf, nmt_linesignal_name(signal, 1 /* MTX->MS */));
+}
+
+/* Build frame 5b, "Answer to coin-box" (NMT Doc 450-1 4.2.1/4.7.2, format
+ * NNNPYYZXXXXXXLQQ): line signal L(0) = answer-to-coin-box carrying the tariff
+ * class Q1Q2. The coin-box MS uses the tariff class to meter the call, and
+ * echoes it back for control in frame 13b. The tariff value is operator-supplied
+ * (nmt->coinbox_tariff); callers must only invoke this when a class is configured. */
+static void set_coinbox_answer(nmt_t *nmt, frame_t *frame, uint8_t tariff_class)
+{
+	transaction_t *trans = nmt->trans;
+
+	frame->mt = NMT_MESSAGE_5b;
+	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
+	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
+	frame->line_signal = 0;			/* L(0) = answer to coin-box */
+	frame->tariff_class = tariff_class & 0x3;
+	LOGP_CHAN(DNMT, LOGL_NOTICE, "Sending coin-box answer (frame 5b): L(0) answer-to-coin-box, tariff class 0x%x (operator-supplied).\n", frame->tariff_class);
 }
 
 /*
@@ -1944,7 +1966,25 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 		}
 		switch (ls) {
 		case 5:
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register Recall is not supported.\n");
+			/* Register recall (NMT Doc 450-1 4.3.2 L(5) in frame 13a, procedure
+			 * 4.7.2.11 "Subscriber service by register recall and code sending").
+			 * In conversation state the subscriber requests that a REGISTER in the
+			 * MTX be connected to the line; digits/codes are then sent MS->MTX using
+			 * the authentication frame pair (frame 7 request / frame 16 response,
+			 * per 4.7.2.11 which refers to 4.7.2.1). We decode the request and move
+			 * to the register-recall state, but STOP here: there is no MTX register /
+			 * digit-collection / supplementary-service back-end in this single-node
+			 * emulator to connect the line to, so the standard's next step cannot be
+			 * performed. The call stays up (voice) -- we do not drop or alter it. */
+			if (nmt->active_state != ACTIVE_STATE_VOICE) {
+				LOGP_CHAN(DNMT, LOGL_NOTICE, "Received register-recall request (L(5)) outside voice state; ignoring.\n");
+				break;
+			}
+			nmt->active_state = ACTIVE_STATE_REGISTER_RECALL;
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall requested (L(5), NMT Doc 450-1 4.7.2.11): the MS asks to connect an MTX register to the line for code sending. STANDARD POINT REACHED but NOT IMPLEMENTED -- this emulator has no MTX register / digit-collection back-end, so no register is connected and no supplementary-service code can be processed. Call stays in voice; the MS will see no register response.\n");
+			/* Remain in conversation: nothing to send back, so drop straight back to
+			 * voice so the open call is not stuck in a dead sub-state. */
+			nmt->active_state = ACTIVE_STATE_VOICE;
 			break;
 		case 8:
 			if (nmt->active_state != ACTIVE_STATE_VOICE)
@@ -2022,6 +2062,20 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 	transaction_t *trans = nmt->trans;
 
 	switch (nmt->active_state) {
+	case ACTIVE_STATE_COINBOX_ANSWER:
+		/* Coin-box answer sequence (NMT Doc 450-1 4.7.2): send frame 5b carrying
+		 * the operator-supplied tariff class, repeated like other line signals,
+		 * then return to the voice path. The coin-box MS acknowledges by echoing
+		 * the tariff class in frame 13b (decoded/logged in rx_active). */
+		set_coinbox_answer(nmt, frame, nmt->coinbox_tariff & 0x3);
+		if (++nmt->tx_frame_count > 4) {
+			trans->coinbox_answer_pending = 0;
+			nmt->active_state = ACTIVE_STATE_VOICE;
+			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+			if (nmt->supervisory)
+				super_reset(nmt);
+		}
+		break;
 	case ACTIVE_STATE_MFT_IN:
 		set_line_signal(nmt, frame, 4);
 		if (++nmt->tx_frame_count == 1)
@@ -2154,7 +2208,7 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signed response (frame 16) with three differing copies (0x%04x/0x%04x/0x%04x), corrupt; authentication is not implemented, logging only.\n", c0, c1, c2);
 			break;
 		}
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signed response (frame 16, SRES=0x%04x); authentication is not implemented, logging only.\n", sres);
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received signed response (frame 16, SRES=0x%04x). STANDARD POINT REACHED (NMT Doc 450-1 4.7.2.1 authentication / SIS): the MTX would now compute the expected response XRES = SIS(RAND, SAK) and compare it to this SRES, accepting the MS only on a match. NOT IMPLEMENTED -- the SIS algorithm and the per-subscriber Subscriber Authentication Key (SAK) are a secret operator provision, not part of this emulator, so no comparison is made and the response is logged only.\n", sres);
 		break;
 	    }
 	case NMT_MESSAGE_26: /* Signal strength measurement result (BS -> MTX) */
@@ -2479,8 +2533,44 @@ static int sms_out_setup(char *dialing, const char *caller_id, enum number_type 
 	return _out_setup(0, caller_id, caller_type, dialing, sms, sms_len);
 }
 
-void call_down_answer(int __attribute__((unused)) callref, struct timeval __attribute__((unused)) *tv_meter)
+/* Call control signals that the far (network) end has answered.
+ *
+ * This is the standard-defined point for the COIN-BOX ANSWER SEQUENCE (NMT Doc
+ * 450-1 4.2.1 / 4.7.2, frame 12 seizure -> special answer procedure): for a
+ * coin-box MS the MTX must answer with frame 5b carrying the TARIFF CLASS Q1Q2,
+ * which the coin-box uses to meter the call and echoes back in frame 13b.
+ *
+ * A real MTX obtains the tariff class from the charging/PSTN side at this moment.
+ * This emulator has no such source, so:
+ *   - if the operator configured a tariff class (nmt->coinbox_tariff >= 0), flag
+ *     frame 5b to be sent on the active channel;
+ *   - otherwise log that the standard point was reached but no tariff source
+ *     exists, and continue as an ordinary answer (no invented value is sent). */
+void call_down_answer(int callref, struct timeval __attribute__((unused)) *tv_meter)
 {
+	transaction_t *trans;
+	nmt_t *nmt;
+
+	trans = get_transaction_by_callref(callref);
+	if (!trans)
+		return;
+	nmt = trans->nmt;
+	if (!nmt || !trans->subscriber.coinbox)
+		return;		/* not a coin-box call: ordinary answer, nothing special */
+
+	if (nmt->coinbox_tariff < 0) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Coin-box call answered: STANDARD POINT REACHED (NMT Doc 450-1 4.7.2 coin-box answer sequence) -- frame 5b with a tariff class Q1Q2 is due here, but this emulator has NO charging/PSTN tariff source, so none is sent. Configure a tariff class to exercise the sequence. Continuing as a normal answer.\n");
+		return;
+	}
+	LOGP_CHAN(DNMT, LOGL_INFO, "Coin-box call answered: scheduling frame 5b with configured tariff class 0x%x.\n", nmt->coinbox_tariff & 0x3);
+	trans->coinbox_answer_pending = 1;
+	/* Only inject the 5b sequence from an established voice call; outside it the
+	 * frame cannot be placed safely, so just leave the flag logged. */
+	if (nmt->state == STATE_ACTIVE && nmt->active_state == ACTIVE_STATE_VOICE) {
+		nmt->active_state = ACTIVE_STATE_COINBOX_ANSWER;
+		nmt->tx_frame_count = 0;
+		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
+	}
 }
 
 void call_down_proceeding(int __attribute__((unused)) callref)

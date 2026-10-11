@@ -17,6 +17,7 @@ typedef struct transaction {
 	struct osmo_timer_list		timer;
 	int			page_try;		/* number of paging try */
 	int			page_deferred;		/* battery saving: page is waiting for the group's wake window */
+	int			coinbox_answer_pending;	/* coin-box: far end answered, frame 5b (tariff) must be sent next */
 	int			priority;		/* MS replied with priority seizure (11b): queue with 2c, not 2f */
 
 	/* caller ID */
