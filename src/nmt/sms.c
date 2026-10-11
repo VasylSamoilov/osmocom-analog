@@ -27,8 +27,15 @@
 #include "../liblogging/logging.h"
 #include "nmt.h"
 
-#define SMS_RECEIVE_TO		5,0
-#define SMS_RELEASE_TO		2,0
+/* SMS-call clearing timers, NMT Doc 450-3/900-3 Annex 24 para 1.1:
+ *  - no DMS frame received within 10 s           -> clear
+ *  - no response to a sent SMS packet within 20 s -> clear
+ *  - after the last SMS packet, wait at least 5 s before clearing
+ *    (lets the final acknowledgement arrive through data-link buffering)
+ */
+#define SMS_PACKET_TO		20,0	/* awaiting a response to a sent SMS packet */
+#define SMS_DMS_TO		10,0	/* awaiting the next DMS frame on a live link */
+#define SMS_RELEASE_TO		5,0	/* min wait before clearing after the last packet */
 
 /* TP-Message-Type-Indicator (TP-MTI) */
 #define	MTI_SMS_DELIVER		0x00 /* SC -> MS */
@@ -302,8 +309,11 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 		LOGP(DSMS, LOGL_NOTICE, "Originator Address too long (%d characters)\n", orig_len);
 		return -EINVAL;
 	}
-	if (msg_len > 140) {
-		LOGP(DSMS, LOGL_NOTICE, "Message too long (%d characters)\n", msg_len);
+	/* Annex 24 para 2.2.3.13: the maximum is 160 characters for both 7-bit and
+	 * 8-bit coding (140 and 160 octets respectively).  This path emits 7-bit
+	 * (DCS=0), so 160 characters pack into 140 octets, well within data[256]. */
+	if (msg_len > 160) {
+		LOGP(DSMS, LOGL_NOTICE, "Message too long (%d characters, max 160)\n", msg_len);
 		return -EINVAL;
 	}
 
@@ -332,7 +342,7 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 	dms_send(nmt, data, length, 1);
 
 	/* start timer */
-	osmo_timer_schedule(&nmt->sms_timer, SMS_RECEIVE_TO);
+	osmo_timer_schedule(&nmt->sms_timer, SMS_PACKET_TO);
 
 	return 0;
 }
@@ -618,7 +628,7 @@ void dms_receive(nmt_t *nmt, const uint8_t *data, int length, int __attribute__(
 	debug_text[length * 5] = '\0';
 
 	/* restart timer */
-	osmo_timer_schedule(&nmt->sms_timer, SMS_RECEIVE_TO);
+	osmo_timer_schedule(&nmt->sms_timer, SMS_DMS_TO);
 
 	LOGP(DSMS, LOGL_DEBUG, "Received %d bytes from DMS layer:%s\n", length, debug_text);
 
