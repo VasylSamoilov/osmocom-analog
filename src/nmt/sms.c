@@ -95,7 +95,13 @@
 #define RP_MTI_MASK		0x07
 
 /* RP IEs */
-#define RP_IE_USER_DATA		0x41 /* wrong in NMT Doc.450-3 1998-04-03 */
+/* RP information-element identifiers.
+ * NMT Doc 450-3/900-3 Annex 24 (1998-04-03) para 2.4.3.2/2.4.3.3 draws BOTH the
+ * RP-User-Data IEI and the RP-Cause IEI with the bit pattern 0100 0010 (0x42),
+ * which is a documentation typo: two different IEs cannot share one identifier.
+ * Annex 24 references GSM 04.11 for the RP layer, where RP-User-Data = 0x41 and
+ * RP-Cause = 0x42, so we use those (they are distinguishable and interoperable). */
+#define RP_IE_USER_DATA		0x41 /* per GSM 04.11; Annex 24 figure's 0x42 is a typo */
 #define RP_IE_CAUSE		0x42
 
 /* SC -> MS header */

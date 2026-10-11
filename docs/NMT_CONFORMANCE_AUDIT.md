@@ -234,11 +234,11 @@ semi-octet coding — all PNG-confirmed. SMS-STATUS-REPORT / SMS-COMMAND are
 SCOPED-OUT (ANNEX 21, single-node).
 
 **Real gaps (see Gap summary §10):** outgoing length capped at 140 (spec 160/255);
-TP-VP absolute 7-octet form not parsed (desync risk); DELIVER always DCS=0 (no
-8-bit NMT alphabet on TX); SMS-call timers 5s/2s vs spec 10s/20s/≥5s; NR flow-
-control a FIXME; header spare bytes hard-coded; RP-User-Data IEI 0x41 vs PNG 0x42
-(code flags the doc as inconsistent — UNCONFIRMED which real MSs use); MO/MT macro
-names for RP-ACK/ERROR swapped (wire values correct, labels misleading).
+TP-VP absolute 7-octet form (desync risk); 8-bit NMT alphabet on TX; SMS-call
+timers; NR flow-control; outgoing length cap; and the RP-User-Data IEI question
+have all since been addressed — see the itemised status in §10. Remaining minor
+items: header spare bytes hard-coded, and the MO/MT macro names for RP-ACK/ERROR
+swapped (wire values correct, labels misleading).
 
 ---
 
@@ -315,8 +315,12 @@ genuine deviations, worst-interesting first:
    `trigger_frame_transmission` (a pending RR still goes, being our own ack); a later RR
    clears it. RR ack behaviour unchanged (test_dms passes after the refactor); the NR path
    reuses that tested ack logic plus the busy gate. §8.
-10. **RP-User-Data IEI 0x41 vs 0x42** doc/impl discrepancy (code flags doc as wrong;
-    which real MSs use is UNCONFIRMED). §8.
+10. **RP-User-Data IEI 0x41 vs 0x42** — **RESOLVED** (branch `fix/nmt-rp-iei-doc`): the
+    Annex 24 figures (§2.4.3.2/2.4.3.3) draw BOTH the RP-User-Data IEI and the RP-Cause IEI
+    as 0x42, which is a documentation typo — two IEs cannot share one identifier. Annex 24
+    references GSM 04.11, where RP-User-Data = **0x41** and RP-Cause = **0x42**; the code
+    already uses those (distinguishable, interoperable), and the comment now explains why
+    rather than just calling the doc "wrong". No code value change. §8.
 
 ### Decode fidelity (dormant / cosmetic)
 11. **Frame 11b format string carries an extra `Y`** — mis-decodes one idle nibble
@@ -332,7 +336,6 @@ genuine deviations, worst-interesting first:
 - Roaming/release L-code semantics (L=13 vs 15 vs the "/" notation) not re-confirmed
   on the detailed §4.3.3 line-signal coding table.
 - Battery-saving H3 period table read from native text only, not PNG.
-- Whether real MSs use RP-User-Data IEI 0x41 or 0x42.
 - No end-to-end on-air test performed anywhere — all statuses are code-vs-spec
   reads plus the clean build + NMT unit tests, not handset-verified.
 
