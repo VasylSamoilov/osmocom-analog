@@ -10,6 +10,7 @@ noinst_PROGRAMS = \
 	test_dms \
 	test_sms \
 	test_linesignal \
+	test_sms_escape \
 	test_performance \
 	test_hagelbarger \
 	test_v27scrambler \
@@ -161,6 +162,11 @@ endif
 test_linesignal_SOURCES = test_linesignal.c
 
 test_linesignal_LDADD = \
+	-lm
+
+test_sms_escape_SOURCES = test_sms_escape.c
+
+test_sms_escape_LDADD = \
 	-lm
 
 test_performance_SOURCES = dummy.c test_performance.c

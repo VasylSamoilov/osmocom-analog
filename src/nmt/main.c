@@ -41,6 +41,11 @@
  * SMS_DELIVER: FIFO to send SMS to mobile stations
  *   Format: <dest>,<orig>,<message>
  *   Example: echo "3704021,3735859,Hello" > /tmp/nmt_sms_deliver
+ *   The coding is chosen automatically: GSM 7-bit for plain ASCII, the NMT
+ *   8-bit alphabet (TP-DCS 0x30) as soon as the message contains a byte >=0x80.
+ *   Any byte that is not printable ASCII -- including 0x00 and the 8-bit
+ *   national letters -- is written in the message as the escape <0xNN>, e.g.
+ *     echo "3704021,3735859,caf<0xe9>" > /tmp/nmt_sms_deliver
  *
  * SMS_SUBMIT: File where received SMS from mobile stations are written
  *   Format: <subscriber>,<rp_orig>,<dest>,<message>
@@ -48,7 +53,7 @@
  *     subscriber = Mobile station's NMT number (from call setup)
  *     rp_orig    = RP-Originator-Address from SMS (may be empty)
  *     dest       = Destination address
- *     message    = SMS text
+ *     message    = SMS text; non-printable bytes are rendered as <0xNN>
  */
 #define SMS_DELIVER "/tmp/nmt_sms_deliver"
 #define SMS_SUBMIT "/tmp/nmt_sms_submit"

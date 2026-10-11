@@ -89,7 +89,7 @@ void sms_release(nmt_t __attribute__((unused)) *nmt)
 	printf("(got release from SMS layer)\n");
 }
 
-int sms_submit(nmt_t __attribute__((unused)) *nmt, uint8_t __attribute__((unused)) ref, const char __attribute__((unused)) *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char __attribute__((unused)) *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message)
+int sms_submit(nmt_t __attribute__((unused)) *nmt, uint8_t __attribute__((unused)) ref, const char __attribute__((unused)) *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char __attribute__((unused)) *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message, int __attribute__((unused)) msg_len)
 {
 	strcpy((char *)dms_buffer, message);
 	dms_buffer_count = strlen(message);
@@ -123,7 +123,7 @@ int main(void)
 	/* deliver */
 	printf("(delivering SMS)\n");
 	expect_reference_pdu = 1;
-	rc = sms_deliver(nmt, 1, test_mt_sms_tel, SMS_TYPE_INTERNATIONAL, SMS_PLAN_ISDN_TEL, test_mt_sms_time, 0, test_mt_sms_text);
+	rc = sms_deliver(nmt, 1, test_mt_sms_tel, SMS_TYPE_INTERNATIONAL, SMS_PLAN_ISDN_TEL, test_mt_sms_time, 0, test_mt_sms_text, (int)strlen(test_mt_sms_text));
 	expect_reference_pdu = 0;
 	assert(rc == 0, "Expecting sms_deliver() to return 0");
 
@@ -146,7 +146,7 @@ int main(void)
 		int k, dcs_pos = -1;
 
 		dms_buffer_count = 0;
-		rc = sms_deliver(nmt, 2, test_mt_sms_tel, SMS_TYPE_INTERNATIONAL, SMS_PLAN_ISDN_TEL, test_mt_sms_time, 0, eight_bit_text);
+		rc = sms_deliver(nmt, 2, test_mt_sms_tel, SMS_TYPE_INTERNATIONAL, SMS_PLAN_ISDN_TEL, test_mt_sms_time, 0, eight_bit_text, tlen);
 		assert(rc == 0, "Expecting 8-bit sms_deliver() to return 0");
 
 		/* the DELIVER PDU: ...TP-PID(0) TP-DCS TP-SCTS(7) TP-UDL TP-UD...

@@ -302,12 +302,13 @@ genuine deviations, worst-interesting first:
    auto-selects coding by content — any byte ≥ 0x80 (a national letter) is sent with the
    NMT 8-bit alphabet (TP-DCS 0x30, NMT Set 0, one octet per character, §4.3); plain ASCII
    still uses GSM 7-bit. Receive already decodes both. Verified by a round-trip test (8-bit
-   DELIVER encode + 8-bit SUBMIT decode). **Known interface limit:** the message crosses the
-   `/tmp/nmt_sms_submit` FIFO and the sms_submit/sms_deliver API as a C string, so a byte
-   0x00 inside a message is not representable (no national letter is 0x00); carrying an
-   embedded NUL would require a length-carrying message interface. The glyph tables for
-   character sets 1–3 (Baltic/Central/Western) are the handset's; the SC carries octets
-   verbatim.
+   DELIVER encode + 8-bit SUBMIT decode). The operator SMS interface is now **length-
+   carrying** (`sms_deliver`/`sms_submit`/`sms_string` keep an explicit byte count, not a C
+   string), so a message byte **0x00** is preserved end to end; on the text FIFO any
+   non-printable byte is written as the escape **`<0xNN>`** both when sending and when
+   receiving, making all 256 code points operator-accessible (round-trip proven by
+   `test_sms_escape`). The glyph tables for character sets 1–3 (Baltic/Central/Western) are
+   the handset's; the SC carries octets verbatim.
 9. **DMS NR flow-control is a FIXME** — not acted on. §8.
 10. **RP-User-Data IEI 0x41 vs 0x42** doc/impl discrepancy (code flags doc as wrong;
     which real MSs use is UNCONFIRMED). §8.
