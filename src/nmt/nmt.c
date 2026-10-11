@@ -959,6 +959,40 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 		nmt->rx_frame_count = 0;
 		nmt->tx_frame_count = 0;
 		break;
+	case NMT_MESSAGE_10c: /* called-MS seizure on TC after blocking/congestion path (§4.4.1.2.2, B1;
+			       * §4.4.1.14, B4). The MS found this TC independently after receiving the
+			       * 2d blocking order and sends 10c as its seizure + identity.
+			       * Find the MT transaction paging this subscriber and bind it to this TC. */
+		if (!match_channel(nmt, frame))
+			break;
+		if (!is_chan_class_tc(nmt->sysinfo.chan_type)) {
+			LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping frame 10c on non-TC channel.\n");
+			break;
+		}
+		{
+			nmt_subscriber_t tsubscr;
+			memset(&tsubscr, 0, sizeof(tsubscr));
+			nmt_value2digits(frame->ms_country, &tsubscr.country, 1);
+			nmt_value2digits(frame->ms_number, tsubscr.number, 6);
+			trans = get_transaction_by_number(&tsubscr);
+			if (!trans) {
+				LOGP_CHAN(DNMT, LOGL_NOTICE, "Received TC seizure (frame 10c) from %c,%s but no pending MT transaction; ignoring.\n",
+					tsubscr.country, tsubscr.number);
+				break;
+			}
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received TC seizure (frame 10c) from %c,%s matching pending MT call; binding TC and requesting identity.\n",
+				tsubscr.country, tsubscr.number);
+			/* bind transaction to this TC (was on CC during paging) */
+			if (trans->nmt && trans->nmt != nmt)
+				nmt_go_idle(trans->nmt);
+			trans->nmt = nmt;
+			nmt->trans = trans;
+			osmo_timer_del(&trans->timer);
+			nmt_new_state(nmt, STATE_MT_IDENT);
+			nmt->tx_frame_count = 0;
+			nmt->rx_frame_count = 0;
+		}
+		break;
 	/* signals after release */
 	case NMT_MESSAGE_13a: /* line signal */
 		break;
@@ -1490,7 +1524,8 @@ static void rx_mt_ident(nmt_t *nmt, frame_t *frame)
 	transaction_t *trans = nmt->trans;
 
 	switch (frame->mt) {
-	case NMT_MESSAGE_10b: /* seizure */
+	case NMT_MESSAGE_10b: /* seizure / identity */
+	case NMT_MESSAGE_10c: /* seizure / identity after blocking-path TC scan (§4.4.1.2.2 Scheme B1, §4.4.1.14 Scheme B4) */
 		if (!match_subscriber(trans, frame))
 			break;
 		nmt_value2digits(frame->ms_password, trans->subscriber.password, 3);
@@ -2542,8 +2577,11 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 	case NMT_MESSAGE_28: /* Other maintenance information from BS (BS -> MTX) */
 		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received maintenance information from BS (frame 28, V=0x%x); not acted on, logging only.\n", frame.meas_order);
 		break;
-	case NMT_MESSAGE_10c: /* Seizure and identity from called MS after a traffic channel scanning order */
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received called-MS seizure on TC (frame 10c, subscriber %u,%06u); traffic channel scanning order not implemented, logging only.\n", frame.ms_country, frame.ms_number);
+	case NMT_MESSAGE_10c: /* called-MS TC seizure (Scheme B1/B4 blocking path) */
+		/* Handled in rx_idle when the TC is in STATE_IDLE. If we see it here
+		 * the TC was not idle (call already set up, or wrong TC) -- log and ignore. */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Received frame 10c (called-MS TC seizure) from subscriber %u,%06u outside idle state; ignoring.\n",
+			frame.ms_country, frame.ms_number);
 		break;
 	default:
 		break;
