@@ -86,6 +86,13 @@ static int mwi_deliver_fd = -1;
 #define MOVE_DELIVER "/tmp/nmt_move"
 static int move_deliver_fd = -1;
 
+/* POWER CHANGE control FIFO — change MS output power level during a call (4.4.1.8).
+ *   Format: <7-digit-subscriber>,<power 0-7>
+ *   Example: echo "3735859,2" > /tmp/nmt_power
+ */
+#define POWER_DELIVER "/tmp/nmt_power"
+static int power_deliver_fd = -1;
+
 /* settings */
 int nmt_system = 450;
 int num_chan_type = 0;
@@ -386,6 +393,32 @@ static void myhandler(void)
 			deliver_move(move_buffer);
 		}
 	}
+
+	/* Handle POWER CHANGE deliver FIFO */
+	{
+	static char power_buffer[64];
+	static int power_pos = 0;
+	if (power_deliver_fd >= 0) {
+		space = sizeof(power_buffer) - power_pos;
+		rc = read(power_deliver_fd, power_buffer + power_pos, space);
+		if (rc > 0) {
+			power_pos += rc;
+			if (power_pos == space) {
+				fprintf(stderr, "POWER buffer overflow!\n");
+				power_pos = 0;
+			}
+			for (i = 0; i < power_pos; i++) {
+				if (power_buffer[i] == '\r' || power_buffer[i] == '\n')
+					break;
+			}
+			if (i < power_pos) {
+				power_buffer[i] = '\0';
+				power_pos = 0;
+				deliver_power_change(power_buffer);
+			}
+		}
+	}
+	}
 }
 
 /* Write received SMS to file
@@ -566,6 +599,23 @@ int main(int argc, char *argv[])
 		move_deliver_fd = open(MOVE_DELIVER, O_RDONLY | O_NONBLOCK);
 		if (move_deliver_fd < 0) {
 			fprintf(stderr, "Failed to open MOVE deliver FIFO! '%s'\n", MOVE_DELIVER);
+			goto fail;
+		}
+	}
+
+	/* create pipe for POWER CHANGE control — change MS output power during a call.
+	 * Format: <7-digit-subscriber>,<power 0-7>
+	 * Example: echo "3735859,2" > /tmp/nmt_power
+	 */
+	unlink(POWER_DELIVER);
+	rc = mkfifo(POWER_DELIVER, 0666);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to create POWER deliver FIFO '%s'!\n", POWER_DELIVER);
+		goto fail;
+	} else {
+		power_deliver_fd = open(POWER_DELIVER, O_RDONLY | O_NONBLOCK);
+		if (power_deliver_fd < 0) {
+			fprintf(stderr, "Failed to open POWER deliver FIFO! '%s'\n", POWER_DELIVER);
 			goto fail;
 		}
 	}

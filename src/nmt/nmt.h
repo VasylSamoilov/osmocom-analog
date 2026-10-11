@@ -65,6 +65,9 @@ enum nmt_active_state {
 					 * Scaffold only -- there is no MTX register/digit-collection back-end. */
 	ACTIVE_STATE_COINBOX_ANSWER,	/* coin-box answer sequence: sending frame 5b (tariff class) after answer
 					 * (NMT Doc 450-1 4.7.2); returns to voice once sent. */
+	ACTIVE_STATE_POWER_CHANGE,	/* MS output power change (NMT Doc 450-1 4.4.1.8): sending 3a with
+					 * the new power level in Na (max T); waits for 10b ack then updates
+					 * nmt->sysinfo.ms_power and resumes voice. */
 };
 
 enum nmt_direction {
@@ -213,4 +216,5 @@ void deliver_mwi(const char *command);
  * retunes and re-identifies with frame 10b on the new TC. Falls back to the old TC on timeout.
  */
 void deliver_move(const char *command);
+void deliver_power_change(const char *command);
 
