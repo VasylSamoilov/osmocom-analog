@@ -407,6 +407,17 @@ static const char *amps_mpci(uint8_t mpci)
 
 }
 
+/* Whether an MPCI value marks a dual-mode mobile (digital-capable). MPCI
+ * (TIA/EIA-553-A p.82): 0 = analog-only (553/IS-54A), 1 = TIA/EIA-627
+ * dual-mode, 2 = reserved/IS-95, 3 = TIA/EIA-136 dual-mode. This base is
+ * analog-only and has no digital traffic channel, so a dual-mode mobile is
+ * served on analog like any other -- we only surface the fact for the
+ * operator (decode-only; no behaviour change). */
+static int amps_mpci_is_dualmode(uint8_t mpci)
+{
+	return (mpci == 1 || mpci == 3);
+}
+
 static const char *amps_state_name(enum amps_state state)
 {
 	static char invalid[16];
@@ -1352,6 +1363,8 @@ void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t e
 			reg_type, whereabouts, ordq, callerid, esn_to_string(esn), amps_scm(scm), amps_mpci(mpci), (mspc || mscap) ? " +PCI" : "");
 		LOGP_CHAN(DAMPS, LOGL_INFO, " -> %s, %s\n", human_readable, human_reachable);
 _register:
+		if (amps_mpci_is_dualmode(mpci))
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, " -> Dual-mode (digital-capable) mobile; this base is analog-only, serving on analog.\n");
 		numbering(callerid, &carrier, &country, &national_number);
 		if (carrier)
 			LOGP_CHAN(DAMPS, LOGL_INFO, " -> Home carrier: %s\n", carrier);
@@ -1388,6 +1401,8 @@ _register:
 			/* Unexpected: T=1 but no dialing digits */
 			LOGP_CHAN(DAMPS, LOGL_NOTICE, "ORDER=0 with T=%d %s (ESN = %s, %s, %s)\n", t, dialing ? "with digits" : "without digits", esn_to_string(esn), amps_scm(scm), amps_mpci(mpci));
 		}
+		if (amps_mpci_is_dualmode(mpci))
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, " -> Dual-mode (digital-capable) mobile; this base is analog-only, serving on analog.\n");
 		
 		/* DEBUG: Log transaction search details */
 		LOGP_CHAN(DAMPS, LOGL_DEBUG, "DEBUG: Searching for transaction with MIN1=%u MIN2=%u\n", min1, min2);
