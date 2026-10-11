@@ -1302,32 +1302,18 @@ void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t e
 		}
 	}
 
-	/* Authentication (TIA/EIA-553-A 2.3.12): if the base advertises AUTH
-	 * and the mobile supplied an Authentication Word (AUTHR/COUNT/RANDC),
-	 * verify the response through the pluggable CAVE provider and act on
-	 * the verdict. Without a provider the result is UNAVAILABLE and the
-	 * base cannot authenticate -- surfaced here rather than silently
-	 * accepting the access. The verification is scaffolded (see auth.c);
-	 * the CAVE primitive is not shipped. */
-	if (amps->si.word1.auth && amps->rx_recc_auth_present) {
-		amps_auth_ctx auth;
-		enum amps_auth_result ar;
-
-		amps_auth_ctx_init(&auth);
-		auth.count = amps->rx_recc_count;
-		/* The RAND that produced this AUTHR is the globally broadcast RAND;
-		 * RANDC is the mobile's 8-bit confirmation of it. A full
-		 * implementation keys off the stored per-mobile RAND and checks
-		 * RANDC against it; the scaffold passes the confirmation value
-		 * through to the provider. */
-		ar = amps_auth_verify_response(&auth, amps->rx_recc_randc, esn, min1, amps->rx_recc_authr);
-		LOGP_CHAN(DAMPS, LOGL_INFO, "Authentication: AUTHR=0x%05x COUNT=%d RANDC=0x%02x -> %s\n",
-			amps->rx_recc_authr & 0x3ffff, amps->rx_recc_count, amps->rx_recc_randc,
-			amps_auth_result_name(ar));
-		if (ar == AMPS_AUTH_RESULT_FAIL)
-			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Authentication FAILED for this mobile -- a conformant base would deny service (not enforced in scaffold).\n");
-		else if (ar == AMPS_AUTH_RESULT_UNAVAILABLE)
-			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Authentication requested but no CAVE provider is registered -- cannot verify (scaffold).\n");
+	/* Authentication (TIA/EIA-553-A 2.3.12) -- SCAFFOLD / DECODE-ONLY.
+	 * We cannot implement authentication properly (no CAVE), so by default
+	 * this base ADVERTISES that it does not support auth: the AUTH bit in
+	 * the System Parameter Overhead Word 1 is 0 (sysinfo.c), which is the
+	 * standard way a base tells every mobile "do not use authentication"
+	 * (p.80). If a mobile sends an Authentication Word anyway, we only
+	 * DEBUG-LOG the decoded fields -- never verify, enforce, or deny -- and
+	 * serve it exactly as in the no-auth path. */
+	if (amps->rx_recc_auth_present) {
+		amps_auth_ctx astub;
+		amps_auth_ctx_init(&astub);
+		amps_auth_log_stub(&astub, amps->rx_recc_authr, amps->rx_recc_count, amps->rx_recc_randc);
 	}
 
 	if (order == 13 && (ordq == 0 || ordq == 1 || ordq == 2 || ordq == 3) && msg_type == 0) {

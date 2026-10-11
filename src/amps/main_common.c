@@ -128,11 +128,11 @@ int newacc = -1;	/* New Access Channel Set: new access channel number 0..2047, -
  * 2-bit field. A non-zero combination enables the SDCC feature. */
 int sdcc1 = -1, sdcc2 = -1;
 
-/* Authentication (TIA/EIA-553-A 2.3.12). -S auth=1 advertises AUTH=1 in the
- * System Parameter Overhead (Word 1) so mobiles include authentication words.
- * The verification flow is scaffolded in auth.c; without a registered CAVE
- * signature provider every response verifies as UNAVAILABLE. Default off. */
-int auth_enable = 0;
+/* Authentication (TIA/EIA-553-A 2.3.12) is NOT supported by this base (no CAVE
+ * engine). AUTH is permanently 0 in the overhead -- see sysinfo.c -- which tells
+ * every mobile not to use authentication. There is intentionally no operator
+ * switch to turn it on: the decode path in amps.c debug-logs any auth word a
+ * mobile sends anyway (see auth.c), but the base never advertises support. */
 
 int tolerant = 0;
 int vmac_enable = 0;
@@ -249,11 +249,6 @@ void print_help(const char *arg0)
 	printf("        enables the SDCC feature (extends 4 color codes to 64); the mobile\n");
 	printf("        echoes it to indicate SDCC capability. Default 0,0 = feature off.\n");
 	printf("        Runtime: sdcc,<sdcc1>,<sdcc2> via FIFO.\n");
-	printf(" -S --sysinfo auth=<0|1>\n");
-	printf("        Advertise authentication (AUTH=1) so mobiles include authentication\n");
-	printf("        words. NOTE: the CAVE signature algorithm is export-restricted and is\n");
-	printf("        NOT included; without a registered provider responses verify as\n");
-	printf("        UNAVAILABLE (scaffold only). Default 0 = off.\n");
 	printf(" -O --tolerant\n");
 	printf("        Be more tolerant when hunting for sync sequence\n");
 	printf("    --network-timeout <seconds>\n");
@@ -1136,9 +1131,6 @@ static int handle_options(int short_option, int argi, char **argv)
 		} else
 		if (!strncasecmp(argv[argi], "sdcc2=", p - argv[argi])) {
 			sdcc2 = atoi(p) & 3;
-		} else
-		if (!strncasecmp(argv[argi], "auth=", p - argv[argi])) {
-			auth_enable = atoi(p) & 1;
 		} else {
 			fprintf(stderr, "Given sysinfo parameter '%s' unknown, use '-h' for help!\n", argv[argi]);
 			return -EINVAL;
@@ -1522,16 +1514,9 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 			si.filler.sdcc2 = sdcc2;
 		if (si.filler.sdcc1 || si.filler.sdcc2)
 			LOGP(DAMPS, LOGL_INFO, "SDCC feature enabled on channel %s: SDCC1=%d, SDCC2=%d (mobiles echo a non-zero combination to indicate SDCC capability)\n", kanal[i], si.filler.sdcc1, si.filler.sdcc2);
-		/* Authentication: advertise AUTH in Word 1 when enabled. Warn that
-		 * the CAVE signature provider is absent, so responses cannot be
-		 * verified (TIA/EIA-553-A 2.3.12; see auth.c scaffold). */
-		si.word1.auth = auth_enable;
-		if (auth_enable) {
-			if (amps_auth_available())
-				LOGP(DAMPS, LOGL_INFO, "Authentication advertised (AUTH=1) on channel %s; CAVE provider registered.\n", kanal[i]);
-			else
-				LOGP(DAMPS, LOGL_NOTICE, "Authentication advertised (AUTH=1) on channel %s, but NO CAVE signature provider is registered -- responses will verify as UNAVAILABLE (scaffold only).\n", kanal[i]);
-		}
+		/* Authentication stays OFF: init_sysinfo sets word1.auth=0 and there is
+		 * no switch to enable it (no CAVE engine). Mobiles are told auth is not
+		 * supported; any auth word they send is decode-logged in amps.c. */
 		rc = amps_create(kanal[i], chan_type[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, do_pre_emphasis, do_de_emphasis, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, &si, sid, scc, polarity, send_callerid, tolerant, loopback);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");

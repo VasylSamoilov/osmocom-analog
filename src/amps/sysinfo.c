@@ -80,6 +80,10 @@ void init_sysinfo(amps_si *si, int cmac, int vmac, int dtx, int dcc, int sid1, i
 	/* Word 1 */
 	si->word1.sid1 = sid1;
 	si->word1.ep = 0; /* shall be 0 */
+	/* AUTH=0: this base does not support authentication (no CAVE engine).
+	 * Broadcasting 0 is the standard way to tell every mobile not to use
+	 * authentication (TIA/EIA-553-A). Overridable to 1 via -S auth=1 for
+	 * DEBUG decode-logging only -- see main_common.c / auth.c. */
 	si->word1.auth = 0;
 	si->word1.pci = 0;
 
