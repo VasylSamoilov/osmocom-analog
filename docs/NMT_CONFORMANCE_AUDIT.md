@@ -298,9 +298,16 @@ genuine deviations, worst-interesting first:
 7. **SMS-call timers** — **FIXED** (branch `fix/nmt-sms-length-timers`): mapped to the
    §1.1 values — 20 s awaiting a response to a sent SMS packet, 10 s awaiting the next DMS
    frame, and ≥5 s before clearing after the last packet (was a single 5 s/2 s pair). §8.
-8. **DELIVER always DCS=0 (7-bit)** — 8-bit NMT-alphabet *origination* still unimplemented
-   (char sets 0–4 unmapped); the encoder now **logs** any byte outside the 0–0x7F alphabet
-   instead of silently substituting '?'. Receive side decodes both 7-bit and 8-bit. §8.
+8. **8-bit NMT-alphabet SMS** — **FIXED** (branch `fix/nmt-sms-8bit`): `sms_deliver` now
+   auto-selects coding by content — any byte ≥ 0x80 (a national letter) is sent with the
+   NMT 8-bit alphabet (TP-DCS 0x30, NMT Set 0, one octet per character, §4.3); plain ASCII
+   still uses GSM 7-bit. Receive already decodes both. Verified by a round-trip test (8-bit
+   DELIVER encode + 8-bit SUBMIT decode). **Known interface limit:** the message crosses the
+   `/tmp/nmt_sms_submit` FIFO and the sms_submit/sms_deliver API as a C string, so a byte
+   0x00 inside a message is not representable (no national letter is 0x00); carrying an
+   embedded NUL would require a length-carrying message interface. The glyph tables for
+   character sets 1–3 (Baltic/Central/Western) are the handset's; the SC carries octets
+   verbatim.
 9. **DMS NR flow-control is a FIXME** — not acted on. §8.
 10. **RP-User-Data IEI 0x41 vs 0x42** doc/impl discrepancy (code flags doc as wrong;
     which real MSs use is UNCONFIRMED). §8.

@@ -59,6 +59,12 @@
 
 /* TP-Status-Report-Indication (TP-SRI) */
 #define SRI_NO_REPORT		0x00
+/* TP-DCS coding (Annex 24 para 2.2.3.10 / para 4): 0x00 = GSM default 7-bit;
+ * 0x30..0x3f = NMT 8-bit alphabets (one octet per character), low nibble =
+ * character set (0 Cyrillic, 1 Baltic, 2 Central, 3 Western). We originate the
+ * GSM-compatible NMT Set 0 when an 8-bit message is needed. */
+#define DCS_GSM_7BIT		0x00
+#define DCS_NMT_8BIT_SET0	0x30
 #define SRI_REPORT		0x20
 #define SRI_MASK		0x20
 
@@ -298,6 +304,18 @@ static int encode_userdata(uint8_t *data, const char *message)
 	return length;
 }
 
+/* Encode user data as NMT 8-bit characters: one character per octet
+ * (Annex 24 para 2.2.3.13 / para 4.3, TP-DCS coding group 0011).  Unlike the
+ * 7-bit path this stores each byte verbatim, so national letters (0x80..0xff)
+ * survive.  'msg_len' is the octet/character count (the message is a C string,
+ * so an embedded NUL cannot be represented -- see sms_deliver). */
+static int encode_userdata_8(uint8_t *data, const char *message, int msg_len)
+{
+	data[0] = msg_len;			/* TP-UDL = number of 8-bit characters */
+	memcpy(data + 1, message, msg_len);
+	return 1 + msg_len;
+}
+
 /* deliver SMS (SC->MS) */
 int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_type, uint8_t orig_plan, time_t timestamp, int local, const char *message)
 {
@@ -305,6 +323,8 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 	int length = 0;
 	int orig_len;
 	int msg_len;
+	int i, need_8bit;
+	uint8_t dcs;
 
 	LOGP(DSMS, LOGL_INFO, "Delivering SMS from upper layer\n");
 
@@ -315,13 +335,34 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 		LOGP(DSMS, LOGL_NOTICE, "Originator Address too long (%d characters)\n", orig_len);
 		return -EINVAL;
 	}
-	/* Annex 24 para 2.2.3.13: the maximum is 160 characters for both 7-bit and
-	 * 8-bit coding (140 and 160 octets respectively).  This path emits 7-bit
-	 * (DCS=0), so 160 characters pack into 140 octets, well within data[256]. */
-	if (msg_len > 160) {
-		LOGP(DSMS, LOGL_NOTICE, "Message too long (%d characters, max 160)\n", msg_len);
+
+	/* Choose the coding by content (Annex 24 para 2.2.3.10): the GSM 7-bit
+	 * alphabet carries only 0x00..0x7f, so if the message contains any byte
+	 * >= 0x80 (a national letter) it must be sent with an NMT 8-bit alphabet
+	 * (one octet per character).  A C string cannot hold an embedded NUL, so
+	 * byte 0x00 inside a message is not representable through this interface. */
+	need_8bit = 0;
+	for (i = 0; i < msg_len; i++) {
+		if ((uint8_t)message[i] >= 0x80) {
+			need_8bit = 1;
+			break;
+		}
+	}
+
+	/* Length ceilings (para 2.2.3.13): 160 characters for 7-bit (-> 140
+	 * octets) and 160 (optionally 255) for 8-bit (-> up to 255 octets). Both
+	 * fit data[256] once the header/RP/TP overhead is added only for <=160. */
+	if (!need_8bit && msg_len > 160) {
+		LOGP(DSMS, LOGL_NOTICE, "Message too long (%d 7-bit characters, max 160)\n", msg_len);
 		return -EINVAL;
 	}
+	if (need_8bit && msg_len > 160) {
+		/* the extended 255 case would overflow data[256] with the ~30-octet
+		 * header/RP/TP overhead, so cap at 160 here and say so */
+		LOGP(DSMS, LOGL_NOTICE, "8-bit message too long (%d characters, max 160 supported)\n", msg_len);
+		return -EINVAL;
+	}
+	dcs = need_8bit ? DCS_NMT_8BIT_SET0 : DCS_GSM_7BIT;
 
 	/* HEADER */
 	length = encode_header(data);
@@ -336,9 +377,14 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 	data[length++] = MTI_SMS_DELIVER | MMS_NO_MORE | VPF_NOT_PRESENT | SRI_NO_REPORT;
 	length += encode_address(data + length, orig_address, orig_type, orig_plan); /* TP-OA */
 	data[length++] = 0; /* TP-PID */
-	data[length++] = 0; /* TP-DCS */
+	data[length++] = dcs; /* TP-DCS */
 	length += encode_time(data + length, timestamp, local);
-	length += encode_userdata(data + length, message);
+	if (need_8bit) {
+		LOGP(DSMS, LOGL_INFO, "Message contains 8-bit characters, using NMT 8-bit alphabet (DCS 0x%02x)\n", dcs);
+		length += encode_userdata_8(data + length, message, msg_len);
+	} else {
+		length += encode_userdata(data + length, message);
+	}
 
 	/* RP length */
 	*tpdu_length = length - (uint8_t)(tpdu_length - data) - 1;

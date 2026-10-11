@@ -61,6 +61,7 @@ static void ok(void)
 
 static uint8_t dms_buffer[256];
 static int dms_buffer_count;
+static int expect_reference_pdu;	/* assert against test_mt_sms_data only for the 7-bit reference deliver */
 void dms_send(nmt_t __attribute__((unused)) *nmt, const uint8_t *data, int length, int __attribute__((unused)) eight_bits)
 {
 	int i;
@@ -71,6 +72,9 @@ void dms_send(nmt_t __attribute__((unused)) *nmt, const uint8_t *data, int lengt
 
 	dms_buffer_count = length;
 	memcpy(dms_buffer, data, length);
+
+	if (!expect_reference_pdu)
+		return;
 
 	assert(length == sizeof(test_mt_sms_data), "Expecting SMS binary data length to match");
 	for (i = 0; i < length; i++) {
@@ -118,8 +122,47 @@ int main(void)
 
 	/* deliver */
 	printf("(delivering SMS)\n");
+	expect_reference_pdu = 1;
 	rc = sms_deliver(nmt, 1, test_mt_sms_tel, SMS_TYPE_INTERNATIONAL, SMS_PLAN_ISDN_TEL, test_mt_sms_time, 0, test_mt_sms_text);
+	expect_reference_pdu = 0;
 	assert(rc == 0, "Expecting sms_deliver() to return 0");
+
+	sms_cleanup_sender(nmt);
+	free(nmt);
+
+	ok();
+
+	/* deliver an 8-bit (NMT alphabet) message: contains a byte >= 0x80, so
+	 * sms_deliver must pick TP-DCS 0x30 and store one octet per character. */
+	nmt = calloc(1, sizeof(*nmt));
+	sms_init_sender(nmt);
+	sms_reset(nmt);
+
+	printf("(delivering SMS with 8-bit characters)\n");
+	{
+		/* "Hi" + two national letters (0xC0, 0xE4) */
+		const char eight_bit_text[] = { 'H', 'i', (char)0xc0, (char)0xe4, '\0' };
+		int tlen = (int)strlen(eight_bit_text);
+		int k, dcs_pos = -1;
+
+		dms_buffer_count = 0;
+		rc = sms_deliver(nmt, 2, test_mt_sms_tel, SMS_TYPE_INTERNATIONAL, SMS_PLAN_ISDN_TEL, test_mt_sms_time, 0, eight_bit_text);
+		assert(rc == 0, "Expecting 8-bit sms_deliver() to return 0");
+
+		/* the DELIVER PDU: ...TP-PID(0) TP-DCS TP-SCTS(7) TP-UDL TP-UD...
+		 * find TP-DCS = 0x30 and verify the 8-bit UD carries the raw bytes. */
+		for (k = 0; k + 1 + 7 + 1 + tlen <= dms_buffer_count; k++) {
+			if (dms_buffer[k] == 0x30
+			 && dms_buffer[k + 1 + 7] == tlen
+			 && dms_buffer[k + 1 + 7 + 1]     == (uint8_t)'H'
+			 && dms_buffer[k + 1 + 7 + 1 + 2] == 0xc0
+			 && dms_buffer[k + 1 + 7 + 1 + 3] == 0xe4) {
+				dcs_pos = k;
+				break;
+			}
+		}
+		assert(dcs_pos >= 0, "Expecting 8-bit DELIVER with DCS 0x30 and one octet per character");
+	}
 
 	sms_cleanup_sender(nmt);
 	free(nmt);
