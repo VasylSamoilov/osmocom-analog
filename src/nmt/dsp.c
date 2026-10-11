@@ -70,25 +70,24 @@
 #define SUPER_DETECT_COUNT	6	/* number of measures to detect supervisory signal */
 #define MUTE_DURATION		0.280	/* a tiny bit more than two frames */
 
-/* four supervisory tones (NMT Doc 450-1 §4.5, p.83):
+/* four supervisory tones (NMT Doc 450-1 §4.5, p.83; NMT Doc 900-1 §4.5, p.75):
  * NMT-450: 3955, 3985, 4015, 4045 Hz (30 Hz uniform spacing)
- * NMT-900: values differ (see §4.5 of 900-1 spec)
+ * NMT-900: identical set — 3955, 3985, 4015, 4045 Hz (same four tones)
  *
- * NOTE ON SPEC DISCREPANCY: the 1997-08-08 PDF (§4.5, p.83) lists the first
- * 450 supervisory tone as "3055 Hz". This is almost certainly a print/scan
- * defect in the document: a "9" in "3955" printed with a broken bowl, reading
- * as "0". Evidence:
- *   1. 3955/3985/4015/4045 Hz = uniform 30 Hz spacing throughout.
- *   2. 3055 Hz falls inside the speech passband (speech ≤ 3.4 kHz) -- a poor
- *      choice for a supervisory tone that must be filtered out at the BS while
- *      leaving speech intact. All four tones must be above the speech band.
- *   3. The NMT 450-3 Mobile Station spec (1995) names 4015 Hz as "the
- *      supervisory signal" -- the exact centre of the 3955–4045 Hz set.
- *   4. The raw PDF text layer and OCR both reproduce "3055" from the scan.
- * The code uses 3955 Hz. If hardware testing shows 3055 Hz is correct,
- * change index [0] here and re-verify against a real NMT 450 handset. */
+ * NOTE ON SPEC DISCREPANCY (now definitively resolved):
+ * The 1997-08-08 NMT Doc 450-1 PDF (§4.5, p.83) lists the first tone as
+ * "3055 Hz". This is a print/scan defect in that document: the 1995-01-25
+ * NMT Doc 900-1 §4.5 (p.75) explicitly writes "3955 Hz" for the same first
+ * tone. Cross-confirmed:
+ *   1. NMT 900-1 §4.5 clearly shows 3955 Hz — same spec, different edition.
+ *   2. 3955/3985/4015/4045 Hz = uniform 30 Hz spacing throughout.
+ *   3. All four tones are above the speech passband (~3.5 kHz+); 3055 Hz is
+ *      inside the speech band, a poor choice for a supervisory tone.
+ *   4. The raw PDF text layer and OCR of the 450-1 both reproduce "3055" from
+ *      the scan defect (a "9" printing with a broken bowl, reading as "0").
+ * The code uses 3955 Hz. This is correct. */
 static double super_freq[5] = {
-	3955.0, /* ø-Signal 1 (see note above; spec PDF prints "3055" -- likely typo) */
+	3955.0, /* ø-Signal 1 (confirmed 3955 Hz; 450-1 §4.5 PDF prints "3055" — print defect) */
 	3985.0, /* ø-Signal 2 */
 	4015.0, /* ø-Signal 3 */
 	4045.0, /* ø-Signal 4 */
