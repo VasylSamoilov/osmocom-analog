@@ -50,8 +50,13 @@ void get_win_size(int *w, int *h)
 
 	rc = ioctl(0, TIOCGWINSZ, &win);
 	if (rc) {
-		*w = 80;
-		*h = 25;
+		/* No TTY (e.g. stdin not a terminal): fall back to a default
+		 * size. Callers may pass NULL for either dimension, so honour
+		 * the same NULL guards as the success path below. */
+		if (w)
+			*w = 80;
+		if (h)
+			*h = 25;
 		return;
 	}
 

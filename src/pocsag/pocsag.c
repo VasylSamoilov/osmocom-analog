@@ -384,7 +384,7 @@ void pocsag_new_state(pocsag_t *pocsag, enum pocsag_state new_state)
  * per the POCSAG standard. The function bits provide 4 sub-addresses,
  * while msg_type determines how the message content is encoded.
  */
-static pocsag_msg_t *pocsag_msg_create(pocsag_t *pocsag, uint32_t callref, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, size_t message_length)
+static pocsag_msg_t *pocsag_msg_create(pocsag_t *pocsag, uint32_t callref, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, size_t message_length, int speed, double polarity)
 {
 	pocsag_msg_t *msg, **msgp;
 
@@ -410,10 +410,15 @@ static pocsag_msg_t *pocsag_msg_create(pocsag_t *pocsag, uint32_t callref, uint3
 	memcpy(msg->data, message, message_length);
 	msg->data_length = message_length;
 	msg->padding = pocsag->padding;
-	msg->speed = pocsag->default_speed;
-	msg->polarity = pocsag->default_polarity;
+	msg->speed = speed;
+	msg->polarity = polarity;
 
-	/* link to per-frame, per-polarity queue */
+	/* link to per-frame, per-polarity queue.
+	 * The bucket is derived from msg->speed/msg->polarity, so these MUST
+	 * be set before linking and MUST NOT be changed afterwards without
+	 * re-linking: pocsag_msg_destroy() recomputes the bucket from these
+	 * fields, and a mismatch would walk the wrong (possibly empty) list
+	 * off its end. */
 	msg->pocsag = pocsag;
 	{
 		uint8_t frame = ric & 7;
@@ -450,9 +455,13 @@ void pocsag_msg_destroy(pocsag_msg_t *msg)
 		int pol = pocsag_pol_index(msg->polarity);
 		int spd = pocsag_speed_index(msg->speed);
 		msgp = &msg->pocsag->msg_list[pol][spd][frame];
-		while ((*msgp) != msg)
+		while ((*msgp) && (*msgp) != msg)
 			msgp = &(*msgp)->next;
-		(*msgp) = msg->next;
+		if (*msgp == msg)
+			(*msgp) = msg->next;
+		else
+			LOGP(DPOCSAG, LOGL_ERROR, "pocsag_msg_destroy: RIC %d not found in queue [pol=%d spd=%d frame=%d] (bug: speed/polarity changed after linking)\n",
+			     msg->ric, pol, spd, frame);
 	}
 
 	/* remove from current transmitting message */
@@ -516,7 +525,8 @@ static int pocsag_scan_or_loopback(pocsag_t *pocsag)
 				  ric, pocsag_function_name[pocsag->default_function],
 				  pocsag_msg_type_name(pocsag->default_msg_type), message);
 			pocsag_msg_create(pocsag, 0, ric, pocsag->default_function,
-					  pocsag->default_msg_type, message, strlen(message));
+					  pocsag->default_msg_type, message, strlen(message),
+					  pocsag->default_speed, pocsag->default_polarity);
 			queued++;
 		}
 
@@ -528,7 +538,8 @@ static int pocsag_scan_or_loopback(pocsag_t *pocsag)
 
 	if (pocsag->sender.loopback) {
 		LOGP(DPOCSAG, LOGL_INFO, "Sending message for loopback test.\n");
-		pocsag_msg_create(pocsag, 0, 1234567, POCSAG_FUNCTION_A, POCSAG_MSG_TYPE_NUMERIC, "1234", 4);
+		pocsag_msg_create(pocsag, 0, 1234567, POCSAG_FUNCTION_A, POCSAG_MSG_TYPE_NUMERIC, "1234", 4,
+				  pocsag->default_speed, pocsag->default_polarity);
 		return 1;
 	}
 
@@ -1053,27 +1064,26 @@ void pocsag_msg_send(enum pocsag_language language, const char *text, size_t tex
 	{
 		pocsag_msg_t *msg;
 		struct timeval tv;
+		int eff_speed = msg_speed ? msg_speed : pocsag->default_speed;
+		double eff_polarity = (msg_polarity != 0.0) ? msg_polarity : pocsag->default_polarity;
 
-		msg = pocsag_msg_create(pocsag, 0, ric, function, msg_type, message, message_length);
+		/* If locked mode (max_batches=0), discard messages with wrong
+		 * speed/polarity before creating/linking them. */
+		if (pocsag->max_batches == 0 &&
+		    (eff_speed != pocsag->default_speed || eff_polarity != pocsag->default_polarity)) {
+			LOGP(DNMT, LOGL_NOTICE, "FIFO: discarding RIC %d — speed %d/%s does not match locked %d/%s (--max-batches 0).\n",
+			     ric, eff_speed, (eff_polarity < 0) ? "normal" : "inverted",
+			     pocsag->default_speed, (pocsag->default_polarity < 0) ? "normal" : "inverted");
+			return;
+		}
+
+		msg = pocsag_msg_create(pocsag, 0, ric, function, msg_type, message, message_length,
+					eff_speed, eff_polarity);
 		if (msg) {
 			msg->retransmit_max = repeat;
 			msg->retransmit_count = 0;
 			msg->retransmit_interval = interval;
 			msg->send_delay = delay;
-			if (msg_speed)
-				msg->speed = msg_speed;
-			if (msg_polarity != 0.0)
-				msg->polarity = msg_polarity;
-
-			/* If locked mode (max_batches=0), discard messages with wrong speed/polarity */
-			if (pocsag->max_batches == 0 &&
-			    (msg->speed != pocsag->default_speed || msg->polarity != pocsag->default_polarity)) {
-				LOGP(DNMT, LOGL_NOTICE, "FIFO: discarding RIC %d — speed %d/%s does not match locked %d/%s (--max-batches 0).\n",
-				     ric, msg->speed, (msg->polarity < 0) ? "normal" : "inverted",
-				     pocsag->default_speed, (pocsag->default_polarity < 0) ? "normal" : "inverted");
-				pocsag_msg_destroy(msg);
-				return;
-			}
 
 			gettimeofday(&tv, NULL);
 			msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + delay;
@@ -1210,7 +1220,8 @@ int call_down_setup(int callref, const char *caller_id, enum number_type __attri
 	msg_type = pocsag->default_msg_type;
 
 	/* create call process to page station */
-	msg = pocsag_msg_create(pocsag, callref, ric, function, msg_type, message, strlen(message));
+	msg = pocsag_msg_create(pocsag, callref, ric, function, msg_type, message, strlen(message),
+				pocsag->default_speed, pocsag->default_polarity);
 	if (!msg)
 		return -CAUSE_INVALNUMBER;
 	return -CAUSE_NORMAL;
