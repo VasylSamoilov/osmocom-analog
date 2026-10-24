@@ -268,12 +268,16 @@ static void fsk_decode(mobitex_t *mobitex, sample_t *spl, int length)
 		case 0: /* HUNT mode */
 			mobitex->fsk_rx_word = (mobitex->fsk_rx_word << 1) | bit;
 
-			/* Check for bitsync (upper 16) + framesync (lower 16) */
+			/* Check for bitsync (upper 16) + framesync (lower 16).
+			 * In base station mode (tx bitsync=0xCCCC) we must also
+			 * accept mobile-originated frames (bitsync=0x3333). */
 			{
 				uint16_t upper = (mobitex->fsk_rx_word >> 16) & 0xFFFF;
 				uint16_t lower = mobitex->fsk_rx_word & 0xFFFF;
+				uint16_t mobile_bitsync = (mobitex->bitsync == MOBITEX_BITSYNC_BASE)
+				                        ? MOBITEX_BITSYNC_MOBILE : MOBITEX_BITSYNC_BASE;
 
-				if (upper == mobitex->bitsync) {
+				if (upper == mobitex->bitsync || upper == mobile_bitsync) {
 					int frsync_idx;
 					int pol = mobitex_match_frsync(lower, &frsync_idx);
 					if (pol != 0) {

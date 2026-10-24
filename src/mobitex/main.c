@@ -39,7 +39,7 @@ static int frsync_index = 1;  /* Default: index 1 = 0xB433 (US RAM Mobile Data /
 static int base_id = 0;
 static int area_id = 0;
 static uint32_t base_man = 1;
-static double svp_interval = 1.0;
+static double svp_interval = 0.5;
 static int svp_type = 1;
 
 /* SVP1/SVP3 parameters (roaming + link, base station broadcasts to mobiles) */

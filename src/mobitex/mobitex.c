@@ -25,6 +25,7 @@
 static void mobitex_tx_frame(mobitex_t *mobitex, mobitex_msg_t *msg);
 static int mobitex_emit_preamble(mobitex_t *mobitex, uint8_t *bits);
 static void mobitex_assemble_message(mobitex_t *mobitex);
+static void mobitex_tx_logingra(mobitex_t *mobitex, uint32_t mobile_man);
 static void mobitex_tx_response(mobitex_t *mobitex, uint8_t frame_type, uint32_t dest_man);
 
 int mobitex_create(const char *kanal, double rx_frequency, double tx_frequency,
@@ -727,6 +728,16 @@ static void mobitex_rx_process_mrm(mobitex_t *mobitex)
 			  mobitex->mpak_header.mpak_type);
 		mobitex_decode_dteserv(mobitex, mobitex->mpak_header.mpak_type,
 				       decoded_text, sizeof(decoded_text));
+
+		/* Base station response: grant every LOGINREQ unconditionally.
+		 * Real networks check the password/HG; we accept all for now.
+		 * The mobile sender_man is in mpak_header.sender_man (set by
+		 * mobitex_parse_mpak_header above). */
+		if (mobitex->tx && mobitex->mpak_header.mpak_type == MPAK_DTE_LOGINREQ) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE, "LOGINREQ from MAN=%06X -- sending LOGINGRA.\n",
+				  mobitex->mpak_header.sender_man);
+			mobitex_tx_logingra(mobitex, mobitex->mpak_header.sender_man);
+		}
 	} else if (mobitex->mpak_header.mpak_class == MPAK_CLASS_PSUBCOM) {
 		LOGP_CHAN(DDSP, LOGL_INFO, "PSUBCOM: %s (type %d)\n",
 			  mobitex_psubcom_name(mobitex->mpak_header.mpak_type,
@@ -1288,7 +1299,7 @@ static void mobitex_tx_svp(mobitex_t *mobitex)
 		 * PDW checks (block[4] & 0x1F) == 24 which requires exactly these values.
 		 * bytes_last = 0 caused modem to ignore SVP parameters entirely. */
 		memset(&lc, 0, sizeof(lc));
-		lc.dest_man = mobitex->tx_base_man;
+		lc.dest_man = 0; /* SVP is broadcast — real RAM captures show MAN=000000 */
 		lc.frame_id = MOBITEX_FT_SVP;
 		lc.seq_num = 8;
 		lc.block_length = 1;
@@ -1302,17 +1313,29 @@ static void mobitex_tx_svp(mobitex_t *mobitex)
 		switch (mobitex->tx_svp_type) {
 		case 1:
 		case 3:
-			/* SVP1/SVP3: FRI + link parameters in bytes 7-17 */
-			block20[7]  = mobitex->tx_max_rep;
-			block20[8]  = mobitex->tx_slot_length;
-			block20[9]  = mobitex->tx_free_slots;
-			block20[10] = mobitex->tx_rssi_period;
-			block20[11] = mobitex->tx_timeout;
-			block20[12] = 0; /* reserved */
-			block20[13] = mobitex->tx_rand_slots;
-			block20[14] = mobitex->tx_max_speech;
-			block20[15] = mobitex->tx_max_access;
-			block20[16] = mobitex->tx_txpow;
+			/* SVP1/SVP3: roaming + link parameters.
+			 * Byte order verified against MobyMon live-capture decoder
+			 * (mobymon.cpp moby::svp(), bit offsets 84-199):
+			 *   byte 7:  TXPOW        (dB, TX power reduction)
+			 *   byte 8:  RSSI_PROC    (bit 7 = 1 Continuous, 0 Frame)
+			 *   byte 9:  RSSI_PERIOD  (× 20 ms)
+			 *   byte 10: TIME_TO_NEXT (roaming hold-off)
+			 *   byte 11: MAX_REP      (max retransmissions)
+			 *   byte 12: BASEST       (base station quality threshold)
+			 *   byte 13: SCAN_TIME    (× 100 ms)
+			 *   byte 14: BAD_BASE     (dBµV minimum usable)
+			 *   byte 15: GOOD_BASE    (dBµV acceptable)
+			 *   byte 16: BETTER_BASE  (dBµV roaming trigger) */
+			block20[7]  = mobitex->tx_txpow;
+			block20[8]  = mobitex->tx_rssi_proc ? 0x80 : 0x00;
+			block20[9]  = mobitex->tx_rssi_period;
+			block20[10] = 0; /* TIME_TO_NEXT: not used in simple BS, set 0 */
+			block20[11] = mobitex->tx_max_rep;
+			block20[12] = 0; /* BASEST: 0 = no quality threshold */
+			block20[13] = mobitex->tx_scan_time;
+			block20[14] = mobitex->tx_bad_base;
+			block20[15] = mobitex->tx_good_base;
+			block20[16] = mobitex->tx_better_base;
 			block20[17] = mobitex->tx_prio;
 			break;
 
@@ -1398,22 +1421,30 @@ static void mobitex_tx_fri(mobitex_t *mobitex)
 
 	memset(block20, 0, sizeof(block20));
 	memset(&lc, 0, sizeof(lc));
-	lc.dest_man = mobitex->tx_base_man;
+	lc.dest_man = 0; /* FRI is always broadcast — all mobiles must receive it */
 	lc.frame_id = MOBITEX_FT_FRI;
-	lc.seq_num = 0;
+	lc.seq_num = 8;    /* matches real RAM captures: byte4=0x18 → seq=8, byteslast_low=1 */
 	lc.block_length = 1;
-	lc.bytes_last = 1; /* match SVP convention from real base station captures */
+	lc.bytes_last = 17; /* real RAM FRI: bytes_last=17, PDW check (block[4]&0x1F)==24=0x18 */
 	mobitex_build_link_control(&lc, block20);
 
-	/* FRI parameters */
-	block20[6]  = mobitex->tx_slot_length;
+	/* FRI parameters.
+	 * Byte order verified against MobyMon live-capture decoder
+	 * (mobymon.cpp moby::fri(), bit offsets 72-127):
+	 *   byte 6:  RAND_SLOTS   (random access slots)
+	 *   byte 7:  FREE_SLOTS   (total free slots)
+	 *   byte 8:  MAX_ACCESS   (max blocks per access without re-request)
+	 *   byte 9:  SLOT_LENGTH  (slot duration, 32/bitrate units)
+	 *   byte 10: MAX_SPEECH   (max concurrent voice, not used in data-only BS)
+	 *   byte 11: TIMEOUT      (access timeout)
+	 *   byte 12: PRIO         (priority group) */
+	block20[6]  = mobitex->tx_rand_slots;
 	block20[7]  = mobitex->tx_free_slots;
-	block20[8]  = mobitex->tx_rand_slots;
-	block20[9]  = mobitex->tx_max_rep;
-	block20[10] = mobitex->tx_max_access;
-	block20[11] = mobitex->tx_max_speech;
-	block20[12] = mobitex->tx_timeout;
-	block20[13] = mobitex->tx_prio;
+	block20[8]  = mobitex->tx_max_access;
+	block20[9]  = mobitex->tx_slot_length;
+	block20[10] = mobitex->tx_max_speech;
+	block20[11] = mobitex->tx_timeout;
+	block20[12] = mobitex->tx_prio;
 
 	memcpy(data18, block20, MOBITEX_DATA_BYTES);
 	mobitex_scrambler_reset(&mobitex->scrambler_tx_sr);
@@ -1428,6 +1459,73 @@ static void mobitex_tx_fri(mobitex_t *mobitex)
 	LOGP_CHAN(DDSP, LOGL_INFO, "TX FRI: SlotLen=%d FreeSlots=%d RandSlots=%d MaxRep=%d, %d bits.\n",
 		  mobitex->tx_slot_length, mobitex->tx_free_slots,
 		  mobitex->tx_rand_slots, mobitex->tx_max_rep, pos);
+}
+
+/* Build and transmit a LOGINGRA (Login Granted) MPAK to a mobile.
+ * Called after receiving a LOGINREQ. Sends MPAK class=3 (DTESERV),
+ * type=2 (LOGINGRA), addressed to the mobile's MAN.
+ * Per MobyMon moby::logingra() the payload is the mobile's MAN in the
+ * standard MPAK sender/address fields — no additional data bytes needed. */
+static void mobitex_tx_logingra(mobitex_t *mobitex, uint32_t mobile_man)
+{
+	uint8_t bits[5200];
+	uint8_t block_bits[MOBITEX_BLOCK_BITS];
+	uint8_t block20[20];
+	uint8_t data18[MOBITEX_DATA_BYTES];
+	mobitex_frame_header_t hdr;
+	mobitex_link_control_t lc;
+	mobitex_mpak_header_t  mpak;
+	int pos, i, nsamples;
+	uint16_t sync_word;
+	int frsync_idx;
+
+	pos = mobitex_emit_preamble(mobitex, bits);
+
+	frsync_idx = mobitex->frsync_index;
+	if (frsync_idx < 0 || frsync_idx >= 18)
+		frsync_idx = 1;
+	sync_word = mobitex_frsyncs[frsync_idx];
+	for (i = 15; i >= 0; i--)
+		bits[pos++] = (sync_word >> i) & 1;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.base_id = mobitex->tx_base_id;
+	hdr.area_id = mobitex->tx_area_id;
+	hdr.cflags = 0;
+	mobitex_encode_header(&hdr, bits + pos);
+	pos += MOBITEX_HEADER_BITS;
+
+	memset(block20, 0, sizeof(block20));
+
+	/* Link Control: 1 block, dest = mobile being granted */
+	memset(&lc, 0, sizeof(lc));
+	lc.dest_man    = mobile_man;
+	lc.frame_id    = MOBITEX_FT_MRM;
+	lc.seq_num     = 0;
+	lc.block_length = 1;
+	lc.bytes_last  = 1;
+	mobitex_build_link_control(&lc, block20);
+
+	/* MPAK header: class=DTESERV, type=LOGINGRA, sender=base, dest=mobile */
+	memset(&mpak, 0, sizeof(mpak));
+	mpak.sender_man  = mobitex->tx_base_man;
+	mpak.dest_man    = mobile_man;
+	mpak.mpak_class  = MPAK_CLASS_DTESERV;
+	mpak.mpak_type   = MPAK_DTE_LOGINGRA;
+	mobitex_build_mpak_header(&mpak, block20);
+
+	memcpy(data18, block20, MOBITEX_DATA_BYTES);
+	mobitex_scrambler_reset(&mobitex->scrambler_tx_sr);
+	mobitex_encode_block(mobitex, data18, block_bits);
+	memcpy(bits + pos, block_bits, MOBITEX_BLOCK_BITS);
+	pos += MOBITEX_BLOCK_BITS;
+
+	nsamples = fsk_encode_bits(mobitex, bits, pos);
+	mobitex->fsk_tx_buffer_length = nsamples;
+	mobitex->fsk_tx_buffer_pos    = 0;
+
+	LOGP_CHAN(DDSP, LOGL_INFO, "TX LOGINGRA: MobileMANs=%06X, %d bits, %d samples.\n",
+		  mobile_man, pos, nsamples);
 }
 
 /* Build and transmit a single-block base station response frame.
