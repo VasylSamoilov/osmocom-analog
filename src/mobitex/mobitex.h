@@ -326,6 +326,8 @@ typedef struct mobitex {
 	double              tx_fri_interval;    /* FRI interval in seconds (unused, kept for CLI compat) */
 	double              tx_fri_timer;       /* (unused, FRI now follows SVP directly) */
 	int                 tx_fri_pending;     /* 1 = FRI should follow the SVP just sent */
+	int                 tx_silence_pending; /* 1 = free-cycle window open, silence frame due */
+	double              tx_silence_timer;   /* countdown to Silence frame (free_slots × slot_length × 4ms) */
 
 	/* Channel access (Slotted Aloha) retry state */
 	int                 tx_access_retries;      /* Current retry count */

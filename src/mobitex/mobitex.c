@@ -26,6 +26,7 @@ static void mobitex_tx_frame(mobitex_t *mobitex, mobitex_msg_t *msg);
 static int mobitex_emit_preamble(mobitex_t *mobitex, uint8_t *bits);
 static void mobitex_assemble_message(mobitex_t *mobitex);
 static void mobitex_tx_logingra(mobitex_t *mobitex, uint32_t mobile_man);
+static void mobitex_tx_silence(mobitex_t *mobitex);
 static void mobitex_tx_response(mobitex_t *mobitex, uint8_t frame_type, uint32_t dest_man);
 
 int mobitex_create(const char *kanal, double rx_frequency, double tx_frequency,
@@ -1205,6 +1206,40 @@ static int mobitex_emit_preamble(mobitex_t *mobitex, uint8_t *bits)
 	return pos;
 }
 
+/* Build and transmit a Silence signal frame (CFlags=2).
+ * Sent during the free-cycle window after FRI. CFlags=2 keeps mobile
+ * clock locked and signals the uplink access window is open.
+ * Real captures (MOBITEX_II_868828_48k.wav) show cflags=2 frames
+ * repeating every frame duration (~400ms window) between FRI pairs. */
+static void mobitex_tx_silence(mobitex_t *mobitex)
+{
+	uint8_t bits[64];
+	mobitex_frame_header_t hdr;
+	int pos, i, nsamples;
+	uint16_t sync_word;
+	int frsync_idx;
+
+	pos = mobitex_emit_preamble(mobitex, bits);
+
+	frsync_idx = mobitex->frsync_index;
+	if (frsync_idx < 0 || frsync_idx >= 18)
+		frsync_idx = 1;
+	sync_word = mobitex_frsyncs[frsync_idx];
+	for (i = 15; i >= 0; i--)
+		bits[pos++] = (sync_word >> i) & 1;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.base_id = mobitex->tx_base_id;
+	hdr.area_id = mobitex->tx_area_id;
+	hdr.cflags  = 2;
+	mobitex_encode_header(&hdr, bits + pos);
+	pos += MOBITEX_HEADER_BITS;
+
+	nsamples = fsk_encode_bits(mobitex, bits, pos);
+	mobitex->fsk_tx_buffer_length = nsamples;
+	mobitex->fsk_tx_buffer_pos    = 0;
+}
+
 /* Generate a header-only ROSI filler frame into the TX buffer.
  * Real Mobitex base stations transmit continuously — between data-carrying
  * SVP/FRI/MRM frames, they send header-only frames (CFlags != 0) to keep
@@ -1657,16 +1692,39 @@ void mobitex_tx_idle_tick(mobitex_t *mobitex, int samples)
 	if (mobitex->msg_list)
 		return;
 
-	/* MIS standard: idle channel cadence is <SVP> <FRI> pairs.
-	 * Each SVP is immediately followed by one FRI.  The pair repeats
-	 * at the SVP interval (roam signal at least twice per second).
-	 * Between pairs, filler frames keep the modem's bit clock locked. */
+	/* MIS standard: idle channel cadence is <SVP> <FRI> [free-cycle] <Silence> pairs.
+	 * Each SVP is immediately followed by one FRI.  During the free-cycle window
+	 * (free_slots × slot_length × 4ms) the base sends Silence frames (CFlags=2)
+	 * to keep mobile clock locked and signal the open access window.
+	 * After the window closes, normal SVP/FRI rotation resumes. */
 
 	/* After SVP was sent, the next frame must be FRI (completing the pair) */
 	if (!mobitex_is_mobile_mode(mobitex) && mobitex->tx_fri_pending) {
-		mobitex->tx_fri_pending = 0;
+		mobitex->tx_fri_pending  = 0;
 		mobitex_tx_fri(mobitex);
+		/* Start free-cycle window: free_slots × slot_length × 4ms
+		 * slot_length units are 32/bitrate seconds = 32/8000 = 4ms each */
+		double slot_ms = (double)mobitex->tx_slot_length * 4.0 / 1000.0;
+		mobitex->tx_silence_timer   = (double)mobitex->tx_free_slots * slot_ms;
+		mobitex->tx_silence_pending = 1;
+		LOGP_CHAN(DDSP, LOGL_DEBUG, "Free-cycle window open: %.0fms (%d slots × %dms)\n",
+			  mobitex->tx_silence_timer * 1000.0,
+			  mobitex->tx_free_slots,
+			  (int)(slot_ms * 1000));
 		return;
+	}
+
+	/* Free-cycle window: send Silence frames until timer expires */
+	if (!mobitex_is_mobile_mode(mobitex) && mobitex->tx_silence_pending) {
+		mobitex->tx_silence_timer -= elapsed;
+		if (mobitex->tx_silence_timer <= 0) {
+			mobitex->tx_silence_pending = 0;
+			LOGP_CHAN(DDSP, LOGL_DEBUG, "Free-cycle window closed.\n");
+			/* Fall through to SVP timer */
+		} else {
+			mobitex_tx_silence(mobitex);
+			return;
+		}
 	}
 
 	/* Count down SVP timer */
