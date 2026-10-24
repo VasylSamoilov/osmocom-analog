@@ -1327,9 +1327,9 @@ static void mobitex_tx_svp(mobitex_t *mobitex)
 			 *   byte 15: GOOD_BASE    (dBµV acceptable)
 			 *   byte 16: BETTER_BASE  (dBµV roaming trigger) */
 			block20[7]  = mobitex->tx_txpow;
-			block20[8]  = mobitex->tx_rssi_proc ? 0x80 : 0x00;
+			block20[8]  = mobitex->tx_rssi_proc ? 0x01 : 0x00; /* bit0 = RSSI_PROC, per real RAM captures byte8=0x01 */
 			block20[9]  = mobitex->tx_rssi_period;
-			block20[10] = 0; /* TIME_TO_NEXT: not used in simple BS, set 0 */
+			block20[10] = 9; /* TIME_TO_NEXT=9, matching real RAM captures */
 			block20[11] = mobitex->tx_max_rep;
 			block20[12] = 0; /* BASEST: 0 = no quality threshold */
 			block20[13] = mobitex->tx_scan_time;
@@ -1436,15 +1436,21 @@ static void mobitex_tx_fri(mobitex_t *mobitex)
 	 *   byte 8:  MAX_ACCESS   (max blocks per access without re-request)
 	 *   byte 9:  SLOT_LENGTH  (slot duration, 32/bitrate units)
 	 *   byte 10: MAX_SPEECH   (max concurrent voice, not used in data-only BS)
-	 *   byte 11: TIMEOUT      (access timeout)
-	 *   byte 12: PRIO         (priority group) */
+	 *   byte 11: TIMEOUT      (access timeout, 0 in real RAM captures)
+	 *   byte 12: PRIO         (priority group)
+	 *   byte 17: traffic_type (1 = data access permitted, per real RAM captures) */
 	block20[6]  = mobitex->tx_rand_slots;
 	block20[7]  = mobitex->tx_free_slots;
 	block20[8]  = mobitex->tx_max_access;
 	block20[9]  = mobitex->tx_slot_length;
 	block20[10] = mobitex->tx_max_speech;
-	block20[11] = mobitex->tx_timeout;
+	block20[11] = 0; /* TIMEOUT: real RAM captures show 0 */
 	block20[12] = mobitex->tx_prio;
+	block20[17] = 1; /* traffic_type: 1 = data access permitted (real RAM byte17=0x01) */
+
+	/* byte3 bit6 is set in real RAM FRI captures (0x6E vs 0x2E).
+	 * Exact meaning unknown but required for Palm VII compatibility. */
+	block20[3] |= 0x40;
 
 	memcpy(data18, block20, MOBITEX_DATA_BYTES);
 	mobitex_scrambler_reset(&mobitex->scrambler_tx_sr);

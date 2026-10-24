@@ -46,10 +46,10 @@ static int svp_type = 1;
 static int txpow = 0;
 static int rssi_proc = 1;
 static int rssi_period = 5;
-static int scan_time = 15;
-static int bad_base = 1;
-static int good_base = 5;
-static int better_base = 6;
+static int scan_time = 5;   /* real RAM: 5 (×100ms = 500ms) */
+static int bad_base = 9;    /* real RAM: 9 dBuV */
+static int good_base = 9;   /* real RAM: 9 dBuV */
+static int better_base = 5; /* real RAM: 5 dBuV */
 static int upfreq_ch = 0;
 static int dofreq_ch = 0;
 
