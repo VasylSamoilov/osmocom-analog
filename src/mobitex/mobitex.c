@@ -28,6 +28,10 @@ static void mobitex_assemble_message(mobitex_t *mobitex);
 static void mobitex_tx_logingra(mobitex_t *mobitex, uint32_t mobile_man);
 static void mobitex_tx_silence(mobitex_t *mobitex);
 static void mobitex_tx_response(mobitex_t *mobitex, uint8_t frame_type, uint32_t dest_man);
+static void mobitex_tx_response_seq(mobitex_t *mobitex, uint8_t frame_type, uint32_t dest_man, uint8_t seq_num);
+static void mobitex_tx_dteserv_mpak(mobitex_t *mobitex, uint32_t mobile_man, uint8_t mpak_type, const uint8_t *payload, int payload_len);
+static void mobitex_tx_live(mobitex_t *mobitex, uint32_t mobile_man);
+static void mobitex_tx_grouplist(mobitex_t *mobitex, uint32_t mobile_man);
 
 int mobitex_create(const char *kanal, double rx_frequency, double tx_frequency,
                    const char *device, int use_sdr, int samplerate,
@@ -144,6 +148,8 @@ int mobitex_create(const char *kanal, double rx_frequency, double tx_frequency,
 	mobitex->tx_access_retries = 0;
 	mobitex->tx_access_max_retries = 3;
 	mobitex->tx_access_backoff = 0.0;
+	mobitex->tx_seq_num = 0;
+	mobitex->tx_mrm_repeat = 1; /* send each downlink MRM twice (seq, seq+1) per MIS */
 
 	LOGP(DDSP, LOGL_NOTICE, "Created 'Kanal' %s\n", kanal);
 
@@ -739,6 +745,47 @@ static void mobitex_rx_process_mrm(mobitex_t *mobitex)
 				  mobitex->mpak_header.sender_man);
 			mobitex_tx_logingra(mobitex, mobitex->mpak_header.sender_man);
 		}
+		/* MIS Dialogue 16.2: BORN -> LIVE + GROUPLIST.
+		 * An unborn terminal sends BORN in lieu of ACTIVE.  The network
+		 * must respond with LIVE then GROUPLIST so the modem enables its
+		 * transmitter and begins normal operation.  ESN is in the BORN
+		 * payload (decoded_text); we accept all ESNs unconditionally.
+		 * ESNREQ (Dialogue 16.1) is a separate probe for already-active
+		 * terminals and is NOT part of the BORN flow. */
+		if (mobitex->tx && mobitex->mpak_header.mpak_type == MPAK_DTE_BORN) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
+				  "BORN from MAN=%06X (%s) -- sending LIVE then GROUPLIST.\n",
+				  mobitex->mpak_header.sender_man, decoded_text);
+			mobitex_tx_live(mobitex, mobitex->mpak_header.sender_man);
+			mobitex_tx_grouplist(mobitex, mobitex->mpak_header.sender_man);
+		}
+		/* MIS Dialogue 7.1: ACTIVE -- terminal announces presence.
+		 * Network takes no action (empty mailbox case); just log. */
+		if (mobitex->mpak_header.mpak_type == MPAK_DTE_ACTIVE) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
+				  "ACTIVE from MAN=%06X -- mobile is present.\n",
+				  mobitex->mpak_header.sender_man);
+		}
+		/* MIS Dialogue 8.1: INACTIVE -- terminal powering off.
+		 * No response required. */
+		if (mobitex->mpak_header.mpak_type == MPAK_DTE_INACTIVE) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
+				  "INACTIVE from MAN=%06X -- mobile going offline.\n",
+				  mobitex->mpak_header.sender_man);
+		}
+		/* ROAM -- terminal roamed; update routing in real network.
+		 * We log only. */
+		if (mobitex->mpak_header.mpak_type == MPAK_DTE_ROAM) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
+				  "ROAM from MAN=%06X -- mobile roaming.\n",
+				  mobitex->mpak_header.sender_man);
+		}
+		/* ESNINFO -- response to a prior ESNREQ; log the ESN. */
+		if (mobitex->mpak_header.mpak_type == MPAK_DTE_ESNINFO) {
+			LOGP_CHAN(DDSP, LOGL_NOTICE,
+				  "ESNINFO from MAN=%06X: %s\n",
+				  mobitex->mpak_header.sender_man, decoded_text);
+		}
 	} else if (mobitex->mpak_header.mpak_class == MPAK_CLASS_PSUBCOM) {
 		LOGP_CHAN(DDSP, LOGL_INFO, "PSUBCOM: %s (type %d)\n",
 			  mobitex_psubcom_name(mobitex->mpak_header.mpak_type,
@@ -1120,12 +1167,16 @@ void mobitex_rx_frame_complete(mobitex_t *mobitex)
 	switch (frame_id) {
 	case MOBITEX_FT_MRM:
 		mobitex_rx_process_mrm(mobitex);
-		/* Base station mode: auto-ACK received MRM */
+		/* Base station mode: ACK the received MRM using its seq_num.
+		 * MIS requires ACK seq_num to match the uplink message seq_num
+		 * so the mobile knows which frame was acknowledged. */
 		if (mobitex->tx && !mobitex_is_mobile_mode(mobitex)) {
-			LOGP_CHAN(DDSP, LOGL_INFO, "Base: sending ACK to MAN=%06X\n",
+			LOGP_CHAN(DDSP, LOGL_INFO, "Base: sending ACK(seq=%d) to MAN=%06X\n",
+				  mobitex->link_control.seq_num,
 				  mobitex->link_control.dest_man);
-			mobitex_tx_response(mobitex, MOBITEX_FT_ACK,
-					    mobitex->link_control.dest_man);
+			mobitex_tx_response_seq(mobitex, MOBITEX_FT_ACK,
+						mobitex->link_control.dest_man,
+						mobitex->link_control.seq_num);
 		}
 		break;
 	case MOBITEX_FT_SVP:
@@ -1376,12 +1427,16 @@ static void mobitex_tx_svp(mobitex_t *mobitex)
 
 		case 2:
 		case 4:
-			/* SVP2/SVP4: channel change command
-			 * byte 7 = direction: 1 = switch to this channel
-			 * bytes 10-11 = downlink channel number
-			 * The mobile retunes its receiver to this channel and
-			 * automatically derives the uplink via duplex offset. */
-			block20[7]  = 1; /* direction: 1 = channel change */
+			/* SVP2/SVP4: channel change command.
+			 * MobyMon SVP2 decoder (blk[0][84-115]):
+			 *   byte 7: channel type (1=local opened, 3=closed, 4=access opened)
+			 *   bytes 8-9: UPFREQ (16-bit BE)
+			 *   bytes 10-11: DOFREQ (16-bit BE)
+			 * The mobile retunes its receiver to DOFREQ and derives
+			 * the uplink channel via the duplex offset. */
+			block20[7]  = 1; /* chatyp=1: local system channel opened */
+			block20[8]  = (mobitex->tx_upfreq >> 8) & 0xFF;
+			block20[9]  = mobitex->tx_upfreq & 0xFF;
 			block20[10] = (mobitex->tx_dofreq >> 8) & 0xFF;
 			block20[11] = mobitex->tx_dofreq & 0xFF;
 			break;
@@ -1408,6 +1463,68 @@ static void mobitex_tx_svp(mobitex_t *mobitex)
 		mobitex_encode_block(mobitex, data18, block_bits);
 		memcpy(bits + pos, block_bits, MOBITEX_BLOCK_BITS);
 		pos += MOBITEX_BLOCK_BITS;
+
+		/* SVP3: add a second block containing the neighbour channel list.
+		 * MIS/MobyMon block-1 layout (blk[1][N] = codeword N/12, bit N%12):
+		 *   byte 0: channel count
+		 *   byte 1: reserved
+		 *   bytes 2-3: UPFREQ 1 (16-bit BE)
+		 *   bytes 4-5: DOFREQ 1 (16-bit BE)
+		 *   bytes 6-7: UPFREQ 2 (16-bit BE)
+		 *   bytes 8-9: DOFREQ 2 (16-bit BE)
+		 *   ...up to 4 channel pairs per block (bytes 2-17)
+		 * We list our own channel pair so the mobile stores it as CURRENT_LIST. */
+		if (mobitex->tx_svp_type == 3 &&
+		    (mobitex->tx_dofreq != 0 || mobitex->tx_upfreq != 0)) {
+			uint8_t ch_block[MOBITEX_DATA_BYTES];
+			int num_ch = 0;
+
+			memset(ch_block, 0, sizeof(ch_block));
+			/* Count channels we have */
+			if (mobitex->tx_upfreq != 0 || mobitex->tx_dofreq != 0)
+				num_ch = 1;
+
+			ch_block[0] = (uint8_t)num_ch;  /* byte 0: channel count */
+			/* byte 1: reserved */
+			/* bytes 2-3: UPFREQ */
+			ch_block[2] = (mobitex->tx_upfreq >> 8) & 0xFF;
+			ch_block[3] = mobitex->tx_upfreq & 0xFF;
+			/* bytes 4-5: DOFREQ */
+			ch_block[4] = (mobitex->tx_dofreq >> 8) & 0xFF;
+			ch_block[5] = mobitex->tx_dofreq & 0xFF;
+
+			if (num_ch > 0) {
+				/* Update block_length=2, bytes_last=6 and re-encode block0 */
+				lc.block_length = 2;
+				lc.bytes_last   = 6; /* 6 valid bytes in block1 */
+				memset(block20, 0, sizeof(block20));
+				mobitex_build_link_control(&lc, block20);
+				block20[6] = mobitex->tx_svp_type;
+				block20[7]  = mobitex->tx_txpow;
+				block20[8]  = mobitex->tx_rssi_proc ? 0x01 : 0x00;
+				block20[9]  = mobitex->tx_rssi_period;
+				block20[10] = 9;
+				block20[11] = mobitex->tx_max_rep;
+				block20[12] = 0;
+				block20[13] = mobitex->tx_scan_time;
+				block20[14] = mobitex->tx_bad_base;
+				block20[15] = mobitex->tx_good_base;
+				block20[16] = mobitex->tx_better_base;
+				block20[17] = mobitex->tx_prio;
+				pos -= MOBITEX_BLOCK_BITS;
+				mobitex_scrambler_reset(&mobitex->scrambler_tx_sr);
+				memcpy(data18, block20, MOBITEX_DATA_BYTES);
+				mobitex_encode_block(mobitex, data18, block_bits);
+				memcpy(bits + pos, block_bits, MOBITEX_BLOCK_BITS);
+				pos += MOBITEX_BLOCK_BITS;
+				mobitex_encode_block(mobitex, ch_block, block_bits);
+				memcpy(bits + pos, block_bits, MOBITEX_BLOCK_BITS);
+				pos += MOBITEX_BLOCK_BITS;
+				LOGP_CHAN(DDSP, LOGL_DEBUG,
+					  "SVP3: channel-list block: count=%d UP=%d DO=%d\n",
+					  num_ch, mobitex->tx_upfreq, mobitex->tx_dofreq);
+			}
+		}
 	}
 
 	/* Modulate and push to DSP TX buffer */
@@ -1483,9 +1600,14 @@ static void mobitex_tx_fri(mobitex_t *mobitex)
 	block20[12] = mobitex->tx_prio;
 	block20[17] = 1; /* traffic_type: 1 = data access permitted (real RAM byte17=0x01) */
 
-	/* byte3 bit6 is set in real RAM FRI captures (0x6E vs 0x2E).
-	 * Exact meaning unknown but required for Palm VII compatibility. */
-	block20[3] |= 0x40;
+	/* byte3 bit6 is set in real RAM FRI captures (0x6E vs 0x2E): meaning unknown.
+	 * byte3 bits 1-2 are the FFG (Free Frame Group) traffic-type flags.
+	 * MobyMon moby::fri() reads blk[0][37] and blk[0][38] (byte 3 bits 1 and 2)
+	 * as FFG: 0=Alert only, 1=Alert+Data, 2=Alert+Speech, 3=Alert+Speech+Data.
+	 * Real RAM FRI byte3=0x6E = 0110 1110: bit1=1, bit2=1 → FFG=3 (all traffic).
+	 * FFG bits tell the mobile which traffic types may use the free cycle.
+	 * FFG=3 is required for data access to be permitted. */
+	block20[3] |= 0x46; /* bit6 (unknown RAM flag) | bit2 | bit1 = FFG=3 */
 
 	memcpy(data18, block20, MOBITEX_DATA_BYTES);
 	mobitex_scrambler_reset(&mobitex->scrambler_tx_sr);
@@ -1567,6 +1689,183 @@ static void mobitex_tx_logingra(mobitex_t *mobitex, uint32_t mobile_man)
 
 	LOGP_CHAN(DDSP, LOGL_INFO, "TX LOGINGRA: MobileMANs=%06X, %d bits, %d samples.\n",
 		  mobile_man, pos, nsamples);
+}
+
+/* Build and transmit a single-block base station response frame with an
+ * explicit seq_num.  Used for ACK where we mirror the uplink seq_num per MIS. */
+static void mobitex_tx_response_seq(mobitex_t *mobitex, uint8_t frame_type,
+				    uint32_t dest_man, uint8_t seq_num)
+{
+	uint8_t bits[500];
+	uint8_t block_bits[MOBITEX_BLOCK_BITS];
+	uint8_t block20[20];
+	uint8_t data18[MOBITEX_DATA_BYTES];
+	mobitex_frame_header_t hdr;
+	mobitex_link_control_t lc;
+	int pos, i, nsamples;
+	uint16_t sync_word;
+	int frsync_idx;
+
+	pos = mobitex_emit_preamble(mobitex, bits);
+
+	frsync_idx = mobitex->frsync_index;
+	if (frsync_idx < 0 || frsync_idx >= 18)
+		frsync_idx = 1;
+	sync_word = mobitex_frsyncs[frsync_idx];
+	for (i = 15; i >= 0; i--)
+		bits[pos++] = (sync_word >> i) & 1;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.base_id = mobitex->tx_base_id;
+	hdr.area_id = mobitex->tx_area_id;
+	hdr.cflags = 0;
+	mobitex_encode_header(&hdr, bits + pos);
+	pos += MOBITEX_HEADER_BITS;
+
+	memset(block20, 0, sizeof(block20));
+	memset(&lc, 0, sizeof(lc));
+	lc.dest_man = dest_man;
+	lc.frame_id = frame_type;
+	lc.seq_num = seq_num & 0x0F;
+	lc.block_length = 1;
+	lc.bytes_last = 1;
+	mobitex_build_link_control(&lc, block20);
+
+	memcpy(data18, block20, MOBITEX_DATA_BYTES);
+	mobitex_scrambler_reset(&mobitex->scrambler_tx_sr);
+	mobitex_encode_block(mobitex, data18, block_bits);
+	memcpy(bits + pos, block_bits, MOBITEX_BLOCK_BITS);
+	pos += MOBITEX_BLOCK_BITS;
+
+	nsamples = fsk_encode_bits(mobitex, bits, pos);
+	mobitex->fsk_tx_buffer_length = nsamples;
+	mobitex->fsk_tx_buffer_pos = 0;
+
+	LOGP_CHAN(DDSP, LOGL_INFO, "TX %s(seq=%d): DestMAN=%06X, %d bits, %d samples.\n",
+		  mobitex_frametype_name(frame_type), seq_num, dest_man, pos, nsamples);
+}
+
+/* Build and transmit a DTESERV MPAK frame to a mobile.
+ * Used for LIVE, GROUPLIST, ESNREQ, LOGOUTORD, TIME, etc.
+ * payload/payload_len carry the type-dependent bytes placed in block 1+.
+ * For packets with no type-dependent data pass payload=NULL, payload_len=0. */
+static void mobitex_tx_dteserv_mpak(mobitex_t *mobitex, uint32_t mobile_man,
+				    uint8_t mpak_type,
+				    const uint8_t *payload, int payload_len)
+{
+	uint8_t bits[5200];
+	uint8_t block_bits[MOBITEX_BLOCK_BITS];
+	uint8_t block20[20];
+	uint8_t data18[MOBITEX_DATA_BYTES];
+	mobitex_frame_header_t hdr;
+	mobitex_link_control_t lc;
+	mobitex_mpak_header_t  mpak;
+	int num_data_blocks, block_length, bytes_last;
+	int pos, i, blk, n, nsamples;
+	uint16_t sync_word;
+	int frsync_idx;
+
+	/* Number of extra blocks needed for type-dependent payload */
+	if (!payload || payload_len <= 0) {
+		num_data_blocks = 0;
+	} else {
+		num_data_blocks = (payload_len + MOBITEX_DATA_BYTES - 1) / MOBITEX_DATA_BYTES;
+	}
+	block_length = 1 + num_data_blocks;
+	if (num_data_blocks == 0) {
+		bytes_last = 1; /* single-block broadcast convention per real captures */
+	} else {
+		bytes_last = payload_len % MOBITEX_DATA_BYTES;
+		if (bytes_last == 0)
+			bytes_last = MOBITEX_DATA_BYTES;
+	}
+
+	pos = mobitex_emit_preamble(mobitex, bits);
+
+	frsync_idx = mobitex->frsync_index;
+	if (frsync_idx < 0 || frsync_idx >= 18)
+		frsync_idx = 1;
+	sync_word = mobitex_frsyncs[frsync_idx];
+	for (i = 15; i >= 0; i--)
+		bits[pos++] = (sync_word >> i) & 1;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.base_id = mobitex->tx_base_id;
+	hdr.area_id = mobitex->tx_area_id;
+	hdr.cflags = 0;
+	mobitex_encode_header(&hdr, bits + pos);
+	pos += MOBITEX_HEADER_BITS;
+
+	/* Primary block: Link Control + MPAK header */
+	memset(block20, 0, sizeof(block20));
+	memset(&lc, 0, sizeof(lc));
+	lc.dest_man     = mobile_man;
+	lc.frame_id     = MOBITEX_FT_MRM;
+	lc.seq_num      = 0;
+	lc.block_length = block_length;
+	lc.bytes_last   = bytes_last;
+	mobitex_build_link_control(&lc, block20);
+
+	memset(&mpak, 0, sizeof(mpak));
+	mpak.sender_man = mobitex->tx_base_man;
+	mpak.dest_man   = mobile_man;
+	mpak.mpak_class = MPAK_CLASS_DTESERV;
+	mpak.mpak_type  = mpak_type;
+	mobitex_build_mpak_header(&mpak, block20);
+
+	memcpy(data18, block20, MOBITEX_DATA_BYTES);
+	mobitex_scrambler_reset(&mobitex->scrambler_tx_sr);
+	mobitex_encode_block(mobitex, data18, block_bits);
+	memcpy(bits + pos, block_bits, MOBITEX_BLOCK_BITS);
+	pos += MOBITEX_BLOCK_BITS;
+
+	/* Additional blocks for type-dependent payload */
+	for (blk = 0; blk < num_data_blocks; blk++) {
+		memset(data18, 0, MOBITEX_DATA_BYTES);
+		if (blk == num_data_blocks - 1 && bytes_last > 0)
+			n = bytes_last;
+		else
+			n = MOBITEX_DATA_BYTES;
+		memcpy(data18, payload + blk * MOBITEX_DATA_BYTES, n);
+		mobitex_encode_block(mobitex, data18, block_bits);
+		memcpy(bits + pos, block_bits, MOBITEX_BLOCK_BITS);
+		pos += MOBITEX_BLOCK_BITS;
+	}
+
+	nsamples = fsk_encode_bits(mobitex, bits, pos);
+	mobitex->fsk_tx_buffer_length = nsamples;
+	mobitex->fsk_tx_buffer_pos    = 0;
+
+	LOGP_CHAN(DDSP, LOGL_INFO, "TX DTESERV %s(type=%d): DestMAN=%06X, %d bits, %d samples.\n",
+		  mobitex_dteserv_name(mpak_type), mpak_type, mobile_man, pos, nsamples);
+}
+
+/* MIS Dialogue 9.2: send LIVE to a mobile.
+ * LIVE has no type-dependent payload; it is the signal that the terminal
+ * may resume sending user traffic after a DIE or initial BORN exchange. */
+static void mobitex_tx_live(mobitex_t *mobitex, uint32_t mobile_man)
+{
+	LOGP_CHAN(DDSP, LOGL_NOTICE, "TX LIVE -> MAN=%06X\n", mobile_man);
+	mobitex_tx_dteserv_mpak(mobitex, mobile_man, MPAK_DTE_LIVE, NULL, 0);
+}
+
+/* MIS Dialogue 11.1: send GROUPLIST to a mobile.
+ * GROUPLIST carries the group MANs the terminal should listen for.
+ * Payload byte 0 = group count; then 3-byte MANs follow.
+ * We send a minimal list with one entry: the All-Terminals Group MAN=7
+ * (mandated by MIS spec, section 5 of the 400-network chapter). */
+static void mobitex_tx_grouplist(mobitex_t *mobitex, uint32_t mobile_man)
+{
+	/* Payload: count(1) + All-Terminals Group MAN=7 (3 bytes) */
+	uint8_t payload[4];
+	payload[0] = 1;          /* one group */
+	payload[1] = 0x00;
+	payload[2] = 0x00;
+	payload[3] = 0x07;       /* MAN = 7 = All-Terminals Group */
+	LOGP_CHAN(DDSP, LOGL_NOTICE,
+		  "TX GROUPLIST -> MAN=%06X (All-Terminals Group=7)\n", mobile_man);
+	mobitex_tx_dteserv_mpak(mobitex, mobile_man, MPAK_DTE_GROUPLIST,
+				payload, sizeof(payload));
 }
 
 /* Build and transmit a single-block base station response frame.
@@ -1801,7 +2100,15 @@ static void mobitex_tx_frame(mobitex_t *mobitex, mobitex_msg_t *msg)
 	memset(&lc, 0, sizeof(lc));
 	lc.dest_man = msg->dest_man;
 	lc.frame_id = msg->frame_type;
-	lc.seq_num = 0;
+	/* Rolling downlink seq_num (0-15) per MIS to protect against duplicate
+	 * reception.  Mobile discards a message whose seq_num matches the
+	 * last-received seq_num, preventing duplicates from retransmits. */
+	if (msg->frame_type == MOBITEX_FT_MRM && !mobitex_is_mobile_mode(mobitex)) {
+		lc.seq_num = mobitex->tx_seq_num & 0x0F;
+		mobitex->tx_seq_num = (mobitex->tx_seq_num + 1) & 0x0F;
+	} else {
+		lc.seq_num = 0;
+	}
 	lc.block_length = block_length;
 	lc.bytes_last = bytes_last;
 	mobitex_build_link_control(&lc, block20);

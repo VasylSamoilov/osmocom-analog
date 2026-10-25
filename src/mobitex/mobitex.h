@@ -334,6 +334,10 @@ typedef struct mobitex {
 	int                 tx_access_max_retries;  /* Max retries (default 3) */
 	double              tx_access_backoff;      /* Current backoff timer (seconds) */
 
+	/* Downlink sequencing */
+	uint8_t             tx_seq_num;             /* 4-bit rolling seq number for downlink MRM (0-15) */
+	int                 tx_mrm_repeat;          /* How many times to repeat each downlink MRM (0=once, 1=twice) */
+
 	/* DSP state */
 	double              fsk_deviation;
 	double              fsk_polarity;
