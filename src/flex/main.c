@@ -24,6 +24,7 @@
 #include <string.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -2445,6 +2446,14 @@ static void fifo_process_line(const char *text, int text_length)
 			if (msg) {
 				msg->speed = msg_speed;
 				msg->modulation_type = msg_mod_type;
+				/* Re-credit msg_count if polarity differs from the default
+				 * that flex_msg_create already counted it under. */
+				if ((msg_polarity < 0) != (msg->polarity < 0)) {
+					int old_pi = (msg->polarity < 0) ? 1 : 0;
+					int new_pi = (msg_polarity  < 0) ? 1 : 0;
+					flex->tx_pol[old_pi].msg_count--;
+					flex->tx_pol[new_pi].msg_count++;
+				}
 				msg->polarity = msg_polarity;
 				msg->priority = msg_priority;
 
@@ -2541,6 +2550,16 @@ static void fifo_process_line(const char *text, int text_length)
 double quit_after_time = 0;
 #define QUIT_DELAY_SEC	0.25
 
+/* SIGUSR1: dump scheduler queue and next-decision state to stderr.
+ * Usage: kill -USR1 $(pidof flex)   or   kill -USR1 <pid> */
+static volatile sig_atomic_t dump_scheduler_requested = 0;
+
+static void sigusr1_handler(int sig)
+{
+	(void)sig;
+	dump_scheduler_requested = 1;
+}
+
 static void myhandler(void)
 {
 	static char buffer[4096 + 256];
@@ -2548,6 +2567,12 @@ static void myhandler(void)
 	int rc, i, line_start;
 	int space;
 	flex_t *flex = (flex_t *)sender_head;
+
+	/* SIGUSR1: dump scheduler state on request */
+	if (dump_scheduler_requested) {
+		dump_scheduler_requested = 0;
+		flex_dump_scheduler(flex);
+	}
 
 	/* Don't process FIFO lines while ERS is running.
 	 * Buffer incoming data but defer processing until ERS completes.
@@ -2925,6 +2950,17 @@ int main(int argc, char *argv[])
 				     oneshot_freq_stop / 1e6,
 				     oneshot_freq_step / 1e3);
 		}
+	}
+
+	/* Install SIGUSR1 handler for scheduler dump (persistent, not one-shot).
+	 * Usage: kill -USR1 $(pidof flex)  or  kill -USR1 <pid> */
+	{
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = sigusr1_handler;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = SA_RESTART; /* don't interrupt syscalls */
+		sigaction(SIGUSR1, &sa, NULL);
 	}
 
 	main_mobile_loop("flex", &quit, myhandler, station_id);

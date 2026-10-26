@@ -511,6 +511,7 @@ void main_mobile_print_hotkeys(void)
 	printf("Press 'w' key to toggle display of RX wave form.\n");
 	printf("Press 'c' key to toggle display of channel status.\n");
 	printf("Press 'm' key to toggle display of measurement value.\n");
+	printf("Press 'z' key to dump scheduler queue and next-decision state.\n");
 #ifdef HAVE_SDR
     if (allow_sdr) {
 	sdr_config_print_hotkeys();
@@ -1059,6 +1060,10 @@ next_char:
 		case 'i':
 			/* dump info */
 			dump_info();
+			goto next_char;
+		case 'z':
+			/* dump scheduler / decoder state (system-specific) */
+			dump_scheduler_hotkey();
 			goto next_char;
 #ifdef HAVE_SDR
 		case 'b':

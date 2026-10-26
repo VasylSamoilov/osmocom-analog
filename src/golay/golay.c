@@ -5058,3 +5058,4 @@ void dump_info(void)
 		scheduler_dump(gsc);
 }
 
+void dump_scheduler_hotkey(void) {}

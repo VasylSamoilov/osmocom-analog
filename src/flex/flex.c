@@ -3617,6 +3617,107 @@ send_idle:
  *
  * Returns 1 if a frame is ready in frame_buffer, 0 if no frame to send.
  */
+void flex_dump_scheduler(flex_t *flex)
+{
+	flex_msg_t *m;
+	int pi, q_total = 0, q1600 = 0, q3200_2 = 0, q3200_4 = 0, q6400 = 0;
+	uint32_t current_abs;
+
+	if (!flex) {
+		fprintf(stderr, "[SCHED DUMP] no flex instance\n");
+		return;
+	}
+
+	current_abs = flex->sched_last_cycle * 128 + flex->sched_last_frame;
+
+	fprintf(stderr, "\n");
+	fprintf(stderr, "========== FLEX SCHEDULER DUMP ==========\n");
+	fprintf(stderr, "Current position: C%u/F%u (abs=%u)\n",
+		flex->sched_last_cycle, flex->sched_last_frame, current_abs);
+	fprintf(stderr, "Collapse: %d  ERS done: %d\n",
+		flex->collapse, flex->sched_ers_done);
+	fprintf(stderr, "Frame target: %dbps %s\n",
+		flex->frame_target_speed,
+		(flex->frame_target_mod_type == FLEX_MOD_4FSK) ? "4FSK" : "2FSK");
+
+	/* Per-polarity state */
+	for (pi = 0; pi < FLEX_TX_POLARITIES; pi++) {
+		const flex_tx_polarity_t *pol = &flex->tx_pol[pi];
+		fprintf(stderr, "  Polarity %s: msg_count=%d inflight=%d last_abs_frame=%u\n",
+			pi == 0 ? "NORMAL" : "INVERTED",
+			pol->msg_count, pol->n_inflight,
+			pol->last_abs_frame);
+		if (pol->n_inflight > 0) {
+			int ii;
+			for (ii = 0; ii < pol->n_inflight; ii++) {
+				const flex_inflight_frag_t *inf = &pol->inflight[ii];
+				fprintf(stderr, "    inflight[%d]: cap=%" PRIu64
+					" frags=%d/%d ret=%u first_sent=%u last_sent=%u\n",
+					ii, inf->capcode,
+					inf->last_sent_idx + 1, inf->total_fragments,
+					inf->retrieval_num,
+					inf->first_sent_abs, inf->last_sent_abs);
+			}
+		}
+	}
+
+	/* Queue contents */
+	fprintf(stderr, "--- Message Queue ---\n");
+	for (m = flex->msg_list; m; m = m->next) {
+		int eligible = frame_is_eligible(m->next_send_frame, current_abs);
+		int frames_until;
+		if (eligible)
+			frames_until = 0;
+		else {
+			frames_until = (int)m->next_send_frame - (int)current_abs;
+			if (frames_until < 0) frames_until += 1920;
+		}
+		fprintf(stderr,
+			"  cap=%-12" PRIu64 " type=%-10s speed=%d pol=%s "
+			"frag=%d/%d next_send=%u (%s, %d frames away) "
+			"retx=%d/%d sent=%d\n",
+			m->capcode,
+			flex_msg_type_name(m->msg_type),
+			m->speed,
+			(pol_index(m->polarity) == 0) ? "NRM" : "INV",
+			m->total_fragments > 1 ? m->fragment_index + 1 : 1,
+			m->total_fragments > 1 ? m->total_fragments : 1,
+			m->next_send_frame,
+			eligible ? "ELIGIBLE" : "deferred",
+			frames_until,
+			m->retransmit_count, m->retransmit_max,
+			m->fragment_sent);
+		q_total++;
+		if (m->speed == 6400) q6400++;
+		else if (m->speed == 3200 && m->modulation_type == FLEX_MOD_4FSK) q3200_4++;
+		else if (m->speed == 3200) q3200_2++;
+		else q1600++;
+	}
+	fprintf(stderr, "Total: %d (1600=%d 3200/2fsk=%d 3200/4fsk=%d 6400=%d)\n",
+		q_total, q1600, q3200_2, q3200_4, q6400);
+
+	/* Next-decision preview: which messages would be selected now */
+	fprintf(stderr, "--- Next Decision Preview ---\n");
+	fprintf(stderr, "Last TX polarity: %s\n",
+		flex->last_tx_polarity == 0 ? "NORMAL" : "INVERTED");
+	fprintf(stderr, "Normal queue depth: %d  Inverted queue depth: %d\n",
+		flex->tx_pol[0].msg_count, flex->tx_pol[1].msg_count);
+	{
+		int eligible_normal = 0, eligible_inverted = 0;
+		for (m = flex->msg_list; m; m = m->next) {
+			if (!frame_is_eligible(m->next_send_frame, current_abs))
+				continue;
+			if (pol_index(m->polarity) == 0)
+				eligible_normal++;
+			else
+				eligible_inverted++;
+		}
+		fprintf(stderr, "Eligible now: NORMAL=%d INVERTED=%d\n",
+			eligible_normal, eligible_inverted);
+	}
+	fprintf(stderr, "=========================================\n\n");
+}
+
 int flex_get_next_frame(flex_t *flex)
 {
 	flex_msg_t *msg;
@@ -4311,3 +4412,9 @@ void call_down_audio(void __attribute__((unused)) *decoder, void __attribute__((
 }
 
 void dump_info(void) {}
+
+void dump_scheduler_hotkey(void)
+{
+	flex_t *flex = (flex_t *)sender_head;
+	flex_dump_scheduler(flex);
+}

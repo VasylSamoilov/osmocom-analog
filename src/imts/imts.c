@@ -1296,3 +1296,4 @@ void call_down_release(int callref, __attribute__((unused)) int cause)
 
 void dump_info(void) {}
 
+void dump_scheduler_hotkey(void) {}

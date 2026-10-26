@@ -1810,3 +1810,4 @@ void dump_info(void)
 	dump_db();
 }
 
+void dump_scheduler_hotkey(void) {}

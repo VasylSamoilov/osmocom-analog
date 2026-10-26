@@ -972,4 +972,8 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 			   int mail_drop);
 void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame);
 
+/* Dump the current scheduler queue and next-decision state to stderr.
+ * Called from SIGUSR1 handler in main.c. */
+void flex_dump_scheduler(flex_t *flex);
+
 #endif /* FLEX_H */

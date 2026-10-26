@@ -3727,3 +3727,4 @@ void deliver_power_change(const char *command)
 
 void dump_info(void) {}
 
+void dump_scheduler_hotkey(void) {}

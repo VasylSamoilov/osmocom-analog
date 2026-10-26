@@ -19,3 +19,4 @@ void sender_send(sender_t __attribute__((unused)) *sender, sample_t __attribute_
 void sender_receive(sender_t __attribute__((unused)) *sender, sample_t __attribute__((unused)) *samples, int __attribute__((unused)) count, double __attribute__((unused)) rf_level_db) { }
 void dump_info(void);
 void dump_info() {}
+void dump_scheduler_hotkey(void) {}

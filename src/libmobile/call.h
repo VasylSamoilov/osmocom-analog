@@ -65,4 +65,5 @@ void call_down_clock(void); /* towards mobile implementation */
 
 /* display call states */
 void dump_info(void);
+void dump_scheduler_hotkey(void);
 

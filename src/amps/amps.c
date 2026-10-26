@@ -5277,3 +5277,4 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 
 void dump_info(void) {}
 
+void dump_scheduler_hotkey(void) {}

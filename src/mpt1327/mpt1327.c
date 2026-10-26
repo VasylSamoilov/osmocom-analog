@@ -1657,3 +1657,4 @@ void dump_info(void)
 	dump_units();
 }
 
+void dump_scheduler_hotkey(void) {}

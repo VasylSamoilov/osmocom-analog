@@ -2274,3 +2274,4 @@ void call_down_disconnect(int callref, int cause)
 void call_down_release(int __attribute__((unused)) callref, int __attribute__((unused)) cause) {}
 
 void call_down_audio(void __attribute__((unused)) *decoder, void __attribute__((unused)) *decoder_priv, int __attribute__((unused)) callref, uint16_t __attribute__((unused)) sequence, uint8_t __attribute__((unused)) marker, uint32_t __attribute__((unused)) timestamp, uint32_t __attribute__((unused)) ssrc, uint8_t __attribute__((unused)) *payload, int __attribute__((unused)) payload_len) {}
+void dump_scheduler_hotkey(void) {}

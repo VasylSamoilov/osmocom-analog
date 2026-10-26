@@ -770,3 +770,4 @@ void call_down_audio(void __attribute__((unused)) *decoder, void __attribute__((
 
 void dump_info(void) {}
 
+void dump_scheduler_hotkey(void) {}

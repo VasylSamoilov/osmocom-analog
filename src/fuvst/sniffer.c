@@ -275,3 +275,4 @@ const char *aaimage[] = { NULL };
 
 void dump_info(void) {}
 
+void dump_scheduler_hotkey(void) {}
