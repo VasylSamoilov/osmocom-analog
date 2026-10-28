@@ -3569,15 +3569,25 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 {
 	struct def_word *w = NULL;
 	int msg_count, f, nawc;
+	int is_rvc;
 	static frame_t *frame;
 
 	f = (word >> 47) & 0x1;
-	
-	/* NAWC extraction depends on channel type:
+
+	/* A reverse burst is RVC only while the channel is actually carrying a
+	 * voice call (an audio dsp mode). A combined CC/PC/VC channel sits in
+	 * DSP_MODE_FRAME_RX_FRAME_TX while idle and must decode reverse bursts
+	 * as RECC control-channel messages (e.g. registration). A pure VC is
+	 * always in an audio mode. Keying on dsp_mode rather than chan_type
+	 * restores the pre-refactor RECC routing for an idle combined channel
+	 * while preserving RVC handling during a call. */
+	is_rvc = (amps->dsp_mode != DSP_MODE_FRAME_RX_FRAME_TX);
+
+	/* NAWC extraction depends on channel mode:
 	 * - RECC: 3 bits at position 44-46
 	 * - RVC: 2 bits at position 45-46
 	 */
-	if (amps->chan_type == CHAN_TYPE_VC || amps->chan_type == CHAN_TYPE_CC_PC_VC) {
+	if (is_rvc) {
 		nawc = (word >> 45) & 0x3;  /* RVC: 2 bits */
 	} else {
 		nawc = (word >> 44) & 0x7;  /* RECC: 3 bits */
@@ -3620,7 +3630,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		return 0;
 	}
 
-	if (amps->chan_type == CHAN_TYPE_VC || amps->chan_type == CHAN_TYPE_CC_PC_VC) {
+	if (is_rvc) {
 		/* RVC (Voice Channel) Logic
 		 * RVC Format (TIA-553 §2.7.2):
 		 * F(1) NAWC(2) T(1) ...
@@ -3854,7 +3864,7 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		/* Log the raw word data at ERROR level for debugging */
 		LOGP_CHAN(DFRAME, LOGL_ERROR, "Received unparseable RECC/RVC message: raw=0x%012llx msg_count=%d\n",
 			(unsigned long long)word, msg_count);
-		if (amps->chan_type == CHAN_TYPE_VC || amps->chan_type == CHAN_TYPE_CC_PC_VC) {
+		if (is_rvc) {
 			int nawc_rvc = (word >> 45) & 0x3;
 			int t = (word >> 44) & 1;
 			int msg_type = (word >> 36) & 0x1F;
