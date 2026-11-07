@@ -9619,7 +9619,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				}
 				
 				/* Process 1 or 2 items based on start_idx */
-				int is_us = rds->force_rbds || RDS_IS_RBDS(rds->ecc);
+				int is_us = rds->force_rbds || RDS_IS_ITU_REGION2(rds->ecc);
 				
 				for (int i = start_idx; i < 2; i++) {
 					uint8_t code = codes[i];
@@ -9976,10 +9976,10 @@ static void rds_decode_group(rds_decoder_t *rds)
 				}
 				/* Check ECC vs mode mismatch (log once, only for valid ECCs) */
 				if (!rds->ecc_mismatch_logged && rds_is_valid_ecc(rds->ecc)) {
-					int ecc_is_rbds = (rds->ecc >= 0xA0 && rds->ecc <= 0xA5);
+					int ecc_is_rbds = rds_ecc_is_rbds(rds->ecc);
 					if (rds->force_rbds && !ecc_is_rbds) {
 						LOGP(DRADIO, LOGL_NOTICE, "RDS: --rbds forced but ECC=0x%02X (%s) "
-						     "is not Americas. Received stream is likely RDS.\n",
+						     "is not US/Canada/Mexico. Received stream is likely RDS.\n",
 						     rds->ecc, rds_get_ecc_name(rds->ecc));
 						rds->ecc_mismatch_logged = 1;
 					} else if (!rds->force_rbds && ecc_is_rbds) {

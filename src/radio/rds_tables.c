@@ -940,6 +940,11 @@ const char *rds_get_ecc_name(uint8_t ecc)
 	return "Not defined in EN 50067";
 }
 
+int rds_ecc_is_rbds(uint8_t ecc)
+{
+	return ecc == 0xA0 || ecc == 0xA1 || ecc == 0xA5;
+}
+
 int rds_is_valid_ecc(uint8_t ecc)
 {
 	for (const ecc_name_t *e = ecc_names; e->name != NULL; e++) {
@@ -2236,7 +2241,7 @@ void rds_decode_pi(uint16_t pi, uint8_t ecc, int force_rbds, rds_pi_info_t *info
 	info->ref_valid = (info->ref != 0);
 
 	/* Determine if this is RBDS */
-	info->is_rbds = force_rbds || (ecc >= 0xA0 && ecc <= 0xA5);
+	info->is_rbds = force_rbds || rds_ecc_is_rbds(ecc);
 
 	/* Country name from CC + ECC.
 	 * When ECC is known, we get a specific country.
@@ -2253,7 +2258,7 @@ void rds_decode_pi(uint16_t pi, uint8_t ecc, int force_rbds, rds_pi_info_t *info
 	info->coverage_name = rds_get_coverage_name(info->coverage);
 
 	/* RBDS call sign -- only when confirmed RBDS (ECC or forced).
-	 * NRSC-4-B Annex N: ECC 0xA0-0xA5 = North America.
+	 * NRSC-4-B D.7: US, Canada, Mexico (ECC A0, A1, A5).
 	 * When ECC is unknown, default to RDS (more common globally). */
 	info->callsign = NULL;
 	if (info->is_rbds)

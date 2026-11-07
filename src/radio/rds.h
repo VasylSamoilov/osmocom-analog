@@ -278,13 +278,13 @@
 #define RDS_AF_FLAG_LF          0x02    /* LF band frequency */
 #define RDS_AF_FLAG_MF          0x04    /* MF band frequency */
 
-/* Detect RBDS (US/Canada) from Extended Country Code
- * ECC 0xA0-0xA5 = Americas (RBDS, 10kHz AM spacing, US PTY names)
- * All others = RDS (EU/world, 9kHz AM spacing, EU PTY names)
- * See NRSC-4-B for RBDS, IEC 62106 Annex D for ECC tables */
-#define RDS_ECC_RBDS_MIN        0xA0
-#define RDS_ECC_RBDS_MAX        0xA5
-#define RDS_IS_RBDS(ecc)        ((ecc) >= RDS_ECC_RBDS_MIN && (ecc) <= RDS_ECC_RBDS_MAX)
+/* Detect RBDS from Extended Country Code: US, Canada, Mexico
+ * (ECC A0, A1, A5, NRSC-4-B D.7) use US PTY names and call sign PI.
+ * All other ECCs, including the other Americas rows A2-A4/A6, are RDS.
+ * rds_ecc_is_rbds() is in rds_tables.c. */
+#define RDS_IS_RBDS(ecc)        rds_ecc_is_rbds(ecc)
+/* Americas (ECC Ax, ITU Region 2): MF frequencies on 10 kHz raster */
+#define RDS_IS_ITU_REGION2(ecc) (((ecc) & 0xF0) == 0xA0)
 
 /* Detect RBDS from de-emphasis time constant (heuristic)
  * 75us (+/-1us tolerance) triggers RBDS assumption (Americas: USA, Canada, S. Korea).

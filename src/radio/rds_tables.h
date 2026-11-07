@@ -59,6 +59,11 @@ const char *rds_get_ecc_name(uint8_t ecc);
  * Returns 1 if valid, 0 if not defined. */
 int rds_is_valid_ecc(uint8_t ecc);
 
+/* Check if ECC is a North American RBDS country (NRSC-4-B D.7: US, Canada,
+ * Mexico = ECC A0, A1, A5). Other Americas ECCs (A2-A4, A6) are RDS.
+ * Returns 1 if RBDS, 0 otherwise. */
+int rds_ecc_is_rbds(uint8_t ecc);
+
 /* ECCs that give a country with PI country digit cc (1-15), as
  * "E0 (IL), E1 (CH), ...". Static buffer, empty if none. */
 const char *rds_ecc_suggest(uint8_t cc);
