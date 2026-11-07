@@ -1045,6 +1045,8 @@ static void sdr_bias(float *buffer, int count)
 	}
 }
 
+static int sdr_tx_device_paced(void);
+
 static void *sdr_write_child(void *arg)
 {
 	sdr_t *sdr = (sdr_t *)arg;
@@ -1060,6 +1062,12 @@ static void *sdr_write_child(void *arg)
 	int max_fill_diag = 0;
 	int min_fill_diag = INT_MAX;
 	int split_mode = sdr_config && sdr_config->split_mode;
+
+	/* Device TX event counters and send() drain rate */
+	unsigned long ev_underflow = 0, ev_seq_error = 0, ev_time_error = 0;
+	unsigned long ev_underflow_logged = 0, ev_seq_error_logged = 0, ev_time_error_logged = 0;
+	double pace_start = 0.0, pace_last = 0.0, pace_last_poll = 0.0;
+	long pace_samples = 0;
 
 	/* Use tx_oversample for TX operations in split mode (only for integer resampling) */
 	int tx_os = split_mode ? sdr->tx_oversample : sdr->oversample;
@@ -1266,8 +1274,61 @@ static void *sdr_write_child(void *arg)
 		if (tx_driver == 3)
 			rpitx_send(sdr->thread_write.buffer2, out_samples);
 #endif
+		pace_samples += num;
+
+		/* Device TX events and pacing check, every 100 ms */
+		{
+			double now = get_time();
+
+			if (pace_start == 0.0) {
+				pace_start = now;
+				pace_last = now;
+				pace_last_poll = now;
+			}
+			if (now - pace_last_poll >= 0.1) {
+				unsigned long u = 0, sq = 0, te = 0;
+
+				pace_last_poll = now;
+#ifdef HAVE_UHD
+				if (tx_driver == 1)
+					uhd_tx_poll_events(&u, &sq, &te);
+#endif
+#ifdef HAVE_SOAPY
+				if (tx_driver == 2)
+					soapy_tx_poll_events(&u, &sq, &te);
+#endif
+				ev_underflow += u;
+				ev_seq_error += sq;
+				ev_time_error += te;
+			}
+			if (now - pace_last >= 1.0) {
+				unsigned long du = ev_underflow - ev_underflow_logged;
+				unsigned long dsq = ev_seq_error - ev_seq_error_logged;
+				unsigned long dte = ev_time_error - ev_time_error_logged;
+				double rate = pace_samples / (now - pace_last);
+
+				if (du || dsq || dte)
+					LOGP(DSDR, LOGL_ERROR, "SDR TX device events in last %.1fs: underflow %lu, seq error %lu, time error %lu (total %lu/%lu/%lu)\n",
+					     now - pace_last, du, dsq, dte, ev_underflow, ev_seq_error, ev_time_error);
+				ev_underflow_logged = ev_underflow;
+				ev_seq_error_logged = ev_seq_error;
+				ev_time_error_logged = ev_time_error;
+
+				/* After the device buffers are filled, a device paced
+				 * send() drains at the sample rate. Much faster means
+				 * send() does not block and TX is not paced at all. */
+				if (sdr_tx_device_paced() && now - pace_start > 5.0 && rate > 1.5 * sdr->samplerate)
+					LOGP(DSDR, LOGL_ERROR, "SDR TX: send() drains %.0f samples/s, expected %d: driver send() is not blocking, TX is unpaced\n",
+					     rate, sdr->samplerate);
+				pace_samples = 0;
+				pace_last = now;
+			}
+		}
 	}
 
+	if (ev_underflow || ev_seq_error || ev_time_error)
+		LOGP(DSDR, LOGL_NOTICE, "SDR TX device events total: underflow %lu, seq error %lu, time error %lu\n",
+		     ev_underflow, ev_seq_error, ev_time_error);
 	LOGP(DSDR, LOGL_DEBUG, "Thread received exit!\n");
 	sdr->thread_write.exit = 1;
 	return NULL;
@@ -2244,6 +2305,21 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 	return count;
 }
 
+/* TX driver has no device time reference, so its send() backpressure is the
+ * only clock that matches the DAC rate. */
+static int sdr_tx_device_paced(void)
+{
+#ifdef HAVE_UHD
+	if (tx_driver == 1)
+		return uhd_tx_device_paced();
+#endif
+#ifdef HAVE_SOAPY
+	if (tx_driver == 2)
+		return soapy_tx_device_paced();
+#endif
+	return 0;
+}
+
 /* how much do we need to send (in audio sample duration) to get the target delay (buffer size) */
 int sdr_get_tosend(void *inst, int buffer_size)
 {
@@ -2254,6 +2330,22 @@ int sdr_get_tosend(void *inst, int buffer_size)
 	if (sdr_config && sdr_config->rx_only) {
 		LOGP(DSDR, LOGL_ERROR, "sdr_get_tosend() called in RX-only mode - this is a bug!\n");
 		return 0;
+	}
+
+	/* Device paced: keep the write ring filled to buffer_size. The write
+	 * thread drains it through the blocking send(), i.e. at the device
+	 * sample clock, so production follows that clock and cannot drift. */
+	if (sdr->threads && sdr_tx_device_paced()) {
+		int fill = (sdr->thread_write.in - sdr->thread_write.out + sdr->thread_write.buffer_size) % sdr->thread_write.buffer_size;
+		static int logged = 0;
+
+		if (!logged) {
+			LOGP(DSDR, LOGL_NOTICE, "TX pacing: device sample clock (send backpressure), ring target %d samples (%.1f ms)\n",
+			     buffer_size, 1000.0 * buffer_size / sdr->samplerate);
+			logged = 1;
+		}
+		count = buffer_size - fill / 2;
+		return (count > 0) ? count : 0;
 	}
 
 	int tx_os = sdr_config->split_mode ? sdr->tx_oversample : sdr->oversample;

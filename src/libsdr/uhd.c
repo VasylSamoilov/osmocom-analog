@@ -53,6 +53,7 @@ typedef struct uhd_instance {
 	struct timespec		software_base_ts;
 	double			ppm_tx;		/* PPM correction to apply to TX frequencies */
 	double			ppm_rx;		/* PPM correction to apply to RX frequencies */
+	uhd_async_metadata_handle tx_async_md;	/* TX async event (underflow, seq error) */
 } uhd_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -671,6 +672,8 @@ void uhd_close(void)
 			uhd_tx_streamer_free(&uhd_tx_inst->tx_streamer);
 		if (uhd_tx_inst->tx_metadata)
 			uhd_tx_metadata_free(&uhd_tx_inst->tx_metadata);
+		if (uhd_tx_inst->tx_async_md)
+			uhd_async_metadata_free(&uhd_tx_inst->tx_async_md);
 		if (uhd_tx_inst == uhd_rx_inst) {
 			/* single-device mode: also free RX resources from same instance */
 			if (uhd_tx_inst->rx_streamer)
@@ -853,6 +856,41 @@ int uhd_send(float *buff, int num)
 	}
 
 	return sent;
+}
+
+/* TX has no device time reference (TX-only or split mode). The host clock
+ * must not pace TX then: it drifts against the USRP sample clock and drains
+ * the device FIFO. Pacing is done by send() backpressure instead. */
+int uhd_tx_device_paced(void)
+{
+	return uhd_tx_inst && uhd_tx_inst->tx_streamer && uhd_tx_inst->software_clock;
+}
+
+/* Collect pending TX async events without blocking, add them to the counters. */
+void uhd_tx_poll_events(unsigned long *underflow, unsigned long *seq_error, unsigned long *time_error)
+{
+	uhd_async_metadata_event_code_t code;
+	bool valid;
+	int i;
+
+	if (!uhd_tx_inst || !uhd_tx_inst->tx_streamer)
+		return;
+	if (!uhd_tx_inst->tx_async_md && uhd_async_metadata_make(&uhd_tx_inst->tx_async_md))
+		return;
+
+	for (i = 0; i < 256; i++) {
+		valid = false;
+		if (uhd_tx_streamer_recv_async_msg(uhd_tx_inst->tx_streamer, &uhd_tx_inst->tx_async_md, 0.0, &valid) || !valid)
+			break;
+		if (uhd_async_metadata_event_code(uhd_tx_inst->tx_async_md, &code))
+			break;
+		if (code & (UHD_ASYNC_METADATA_EVENT_CODE_UNDERFLOW | UHD_ASYNC_METADATA_EVENT_CODE_UNDERFLOW_IN_PACKET))
+			(*underflow)++;
+		if (code & (UHD_ASYNC_METADATA_EVENT_CODE_SEQ_ERROR | UHD_ASYNC_METADATA_EVENT_CODE_SEQ_ERROR_IN_BURST))
+			(*seq_error)++;
+		if (code & UHD_ASYNC_METADATA_EVENT_CODE_TIME_ERROR)
+			(*time_error)++;
+	}
 }
 
 /* Return the TX streamer MTU (max samples per send call) */

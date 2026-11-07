@@ -73,6 +73,7 @@ typedef struct soapy_instance {
 	pthread_mutex_t		timestamp_mutex;
 	double			ppm_manual_rx;	/* nonzero if manual frequency correction needed (device doesn't support it) */
 	double			ppm_manual_tx;	/* nonzero if manual frequency correction needed (device doesn't support it) */
+	int			tx_status_unsupported; /* readStreamStatus() not implemented by driver */
 } soapy_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -740,6 +741,46 @@ int soapy_set_tx_frequency(double frequency)
 }
 
 
+/* TX timing comes from the host clock (TX-only, split mode or no hardware
+ * time stamps). The host clock must not pace TX then: it drifts against
+ * the device sample clock and drains the device FIFO. Pacing is done by
+ * writeStream() backpressure instead. */
+int soapy_tx_device_paced(void)
+{
+	if (!soapy_tx_inst || !soapy_tx_inst->txStream)
+		return 0;
+	return soapy_tx_inst->software_clock || (soapy_rx_inst && soapy_rx_inst->software_clock);
+}
+
+/* Collect pending TX stream status events without blocking, add them to the counters. */
+void soapy_tx_poll_events(unsigned long *underflow, unsigned long *seq_error, unsigned long *time_error)
+{
+	size_t chan_mask;
+	int flags, rc, i;
+	long long time_ns;
+
+	(void)seq_error;
+	if (!soapy_tx_inst || !soapy_tx_inst->txStream || soapy_tx_inst->tx_status_unsupported)
+		return;
+
+	for (i = 0; i < 256; i++) {
+		chan_mask = 0;
+		flags = 0;
+		time_ns = 0;
+		rc = SoapySDRDevice_readStreamStatus(soapy_tx_inst->sdr, soapy_tx_inst->txStream, &chan_mask, &flags, &time_ns, 0);
+		if (rc == SOAPY_SDR_UNDERFLOW)
+			(*underflow)++;
+		else if (rc == SOAPY_SDR_TIME_ERROR)
+			(*time_error)++;
+		else if (rc == SOAPY_SDR_NOT_SUPPORTED) {
+			LOGP(DSOAPY, LOGL_NOTICE, "SDR TX: driver does not report stream status, no underflow counter\n");
+			soapy_tx_inst->tx_status_unsupported = 1;
+			break;
+		} else
+			break;	/* timeout (nothing pending) or other status */
+	}
+}
+
 int soapy_send(float *buff, int num)
 {
     	const void *buffs_ptr[1];
@@ -776,7 +817,11 @@ int soapy_send(float *buff, int num)
 			LOGP(DUHD, LOGL_ERROR, "Failed to write to TX streamer (error=%d)\n", count);
 			break;
 		}
-		/* Update TX time for samples actually sent */
+		/* Update TX time for samples actually sent.
+		 * When device paced, tosend() is not used and TX time is
+		 * only a sample counter. */
+		if (!soapy_tx_inst->tx_valid && soapy_tx_device_paced())
+			soapy_tx_inst->tx_valid = 1;
 		if (!soapy_tx_inst->tx_valid)
 			LOGP(DSOAPY, LOGL_ERROR, "SDR TX: tosend() was not called before, please fix!\n");
 		else {
