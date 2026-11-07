@@ -9349,6 +9349,63 @@ static void write_hex16(FILE *f, uint16_t val)
 	fputc(hex[val & 0xF], f);
 }
 
+/* Battery saving interval sync from 1A block B bits B1/B0 (EN 50067 M.2.1.3):
+ *   1A number:  1  2   3   4   5   6+
+ *   B1:         1  1   0   0   0   0
+ *   B0:         0  J3  J2  J1  J0  1   (J3..J0 = BCD interval number)
+ * In interval 0 the first 1A is replaced by 4A, so a B1=1 that follows a
+ * 4A is 1A number 2. A receiver is out of sync when the interval marking
+ * is not the one expected. */
+static void rds_paging_dec_interval_sync(rds_decoder_t *rds, uint8_t b1b0)
+{
+	rds_paging_dec_t *pd = &rds->paging_dec;
+	uint8_t b1 = (b1b0 >> 1) & 1, b0 = b1b0 & 1;
+
+	if (b1) {
+		if (pd->sync_prev_b1 && pd->sync_k == 1) {
+			pd->sync_k = 2;		/* 2nd marker after 1A #1 */
+		} else if (pd->sync_after_4a) {
+			pd->sync_k = 2;		/* 2nd marker of interval 0, 1st was 4A */
+		} else {
+			pd->sync_k = 1;		/* 1st marker */
+			if (b0 && rds->debug)
+				LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: 1st interval marker with B0=1 (expected 0)\n");
+		}
+		if (pd->sync_k == 2)
+			pd->sync_j = b0;	/* J3 */
+	} else if (pd->sync_k >= 2 && pd->sync_k <= 4) {
+		pd->sync_k++;
+		pd->sync_j = (pd->sync_j << 1) | b0;	/* J2, J1, J0 */
+		if (pd->sync_k == 5) {
+			uint8_t iv = pd->sync_j & 0x0F;
+
+			if (iv > 9) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: invalid interval marking J=%X\n", iv);
+				pd->sync_ivalid = 0;
+			} else {
+				if (pd->sync_ivalid && iv != (pd->sync_interval + 1) % 10)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: interval I%u, expected I%u: interval sync lost\n",
+					     iv, (pd->sync_interval + 1) % 10);
+				else if (!pd->sync_ivalid)
+					LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: interval sync: I%u\n", iv);
+				else if (rds->verbose)
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: interval I%u\n", iv);
+				pd->sync_interval = iv;
+				pd->sync_ivalid = 1;
+			}
+		}
+	} else if (pd->sync_k >= 5) {
+		if (pd->sync_k < 255)
+			pd->sync_k++;
+		if (!b0 && rds->debug)
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: excess 1A with B0=0 (expected 1)\n");
+	} else {
+		pd->sync_k = 0;	/* B1=0 without a marker before: wait for the next interval */
+	}
+	pd->sync_prev_b1 = b1;
+	pd->sync_after_4a = 0;
+}
+
 static void rds_decode_group(rds_decoder_t *rds)
 {
 	uint16_t pi = rds->blocks[0];
@@ -9733,18 +9790,23 @@ static void rds_decode_group(rds_decoder_t *rds)
 			if (b2_payload != 0 && rds->paging_enabled) {
 				/* 1A: Decode as Radio Paging Codes (EN 50067 Annex M) */
 				rds_paging_dec_t *pd = &rds->paging_dec;
-				uint8_t old_rpc = pd->rpc;
+				uint8_t old_desig = pd->rpc_group_desig;
 				uint8_t was_valid = pd->rpc_valid;
 				pd->rpc = b2_payload & 0x1F;
 				pd->rpc_group_desig = RDS_PAGING_RPC_DESIG(pd->rpc);
 				pd->rpc_batt_sync = RDS_PAGING_RPC_SYNC(pd->rpc);
 				pd->rpc_valid = 1;
-				if (!was_valid || old_rpc != pd->rpc) {
+				/* B1/B0 change from 1A to 1A (interval sync), so only a
+				 * change of the group designation is reported */
+				if (!was_valid || old_desig != pd->rpc_group_desig) {
 					char rpc_buf[80];
 					LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Paging detected: %s\n",
 					     rds_paging_rpc_desc(pd->rpc, rpc_buf, sizeof(rpc_buf)));
 				} else if (rds->debug)
-					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: RPC=%d (unchanged)\n", pd->rpc);
+					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: RPC=%d B1=%d B0=%d\n", pd->rpc,
+					     (pd->rpc_batt_sync >> 1) & 1, pd->rpc_batt_sync & 1);
+				if (rds->block_status[1] <= RDS_STATUS_CORRECTED)
+					rds_paging_dec_interval_sync(rds, pd->rpc_batt_sync);
 			} else if (b2_payload != 0) {
 				/* 1A without paging: bits 4-0 are spare per IEC 62106:2018 */
 				if (rds->verbose)
@@ -9806,6 +9868,49 @@ static void rds_decode_group(rds_decoder_t *rds)
 				     version ? 'B' : 'A', rds->pin, rds->pin_day, rds->pin_hour, rds->pin_minute,
 				     pin_valid ? "" : " [INVALID]");
 			
+			/* Paging 1A without valid PIN (day bits 0): block D carries the
+			 * paging system information (EN 50067 M.3.2.4.3, Fig. M.10a/b):
+			 *   bit 10 = 0: sub type 0, PAC bits 9-4, OPC bits 3-0
+			 *   bit 10 = 1: sub type 1, usage bits 9-8 (Table M.7):
+			 *     00 ECC bits 7-0, 11 CCF bits 7-0, 01/10 reserved */
+			if (version == 0 && rds->paging_enabled && rds->pin_day == 0 &&
+			    rds->block_status[3] <= RDS_STATUS_CORRECTED) {
+				rds_paging_dec_t *pd = &rds->paging_dec;
+
+				if (!(b4 & (1 << 10))) {
+					uint8_t pac = (b4 >> 4) & 0x3F, opc = b4 & 0x0F;
+
+					if (!(pd->si_valid & 1) || pd->si_pac != pac || pd->si_opc != opc)
+						LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: block D SI sub type 0: PAC=%u%s OPC=%u%s\n",
+						     pac, pac ? "" : " (all areas)", opc, opc ? "" : " (no enhanced paging)");
+					pd->si_pac = pac;
+					pd->si_opc = opc;
+					pd->si_valid |= 1;
+					/* OPC in block 4 as in blocks 3 of variants 0/2 (M.3.2.5.2) */
+					pd->opc = opc;
+					pd->opc_valid = 1;
+				} else {
+					uint8_t usage = (b4 >> 8) & 0x03, val = b4 & 0xFF;
+
+					if (usage == 0) {
+						if (!(pd->si_valid & 2) || pd->si_ecc != val)
+							LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: block D SI sub type 1: ECC=0x%02X (%s)\n",
+							     val, rds_get_ecc_name(val));
+						pd->si_ecc = val;
+						pd->si_valid |= 2;
+						/* same ECC as 1A variant 0 (M.3.2.5.2.1: ECC in block 4) */
+						rds->ecc = val;
+						rds->ecc_status = rds->block_status[3];
+					} else if (usage == 3) {
+						if (rds->verbose)
+							LOGP(DRADIO, LOGL_INFO, "RDS 1A: block D SI sub type 1: CCF=%u\n", val);
+					} else if (rds->debug) {
+						LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: block D SI sub type 1: reserved usage %u\n", usage);
+					}
+				}
+				pin_valid = 0;	/* not a PIN */
+			}
+
 			if (rds->verbose && pin_valid) {
 				if (rds->pin_day != 0) {
 					if (rds->pin_hour == 24) {
@@ -10137,6 +10242,10 @@ static void rds_decode_group(rds_decoder_t *rds)
 		}
 	}
 	else if (group_type == 4 && version == 0) {
+		/* Paging: 4A replaces the first 1A of interval 0 (EN 50067 M.2.1.3) */
+		if (rds->paging_enabled)
+			rds->paging_dec.sync_after_4a = 1;
+
 		/* Group 4A: Clock-Time and Date (IEC 62106 S6.1.5.4)
 		 * See RDS_4A_* macros in rds.h for bit field definitions
 		 * Requires all 4 blocks for complete CT decode */

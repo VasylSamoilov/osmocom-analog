@@ -520,9 +520,9 @@ static const ecc_country_t country_table[] = {
 	/* ECC 0xE2: Europe 3 */
 	{ 0xE2, { "MA", "CZ", "PL", "VA", "SK", "SY", "TN", "--", "LI", "IS", "MC", "LT", "RS", "ES", "NO" }},
 	/* ECC 0xE3: Europe 4 */
-	{ 0xE3, { "ME", "IE", "TR", "MK", "--", "--", "--", "NL", "LV", "LB", "AZ", "HR", "KZ", "SE", "BY" }},
-	/* ECC 0xE4: Europe 5 */
-	{ 0xE4, { "MD", "EE", "KG", "--", "--", "UA", "XK", "PT", "SI", "AM", "--", "GE", "--", "--", "BA" }},
+	{ 0xE3, { "ME", "IE", "TR", "MK", "TJ", "--", "--", "NL", "LV", "LB", "AZ", "HR", "KZ", "SE", "BY" }},
+	/* ECC 0xE4: Europe 5 (TJ, TM, UZ: EN 50067 Annex N.2) */
+	{ 0xE4, { "MD", "EE", "KG", "--", "--", "UA", "XK", "PT", "SI", "AM", "UZ", "GE", "--", "TM", "BA" }},
 	/* ECC 0xA0: Americas - US */
 	{ 0xA0, { "US", "US", "US", "US", "US", "US", "US", "US", "US", "US", "US", "--", "US", "US", "--" }},
 	/* ECC 0xA1: Americas - Canada */
@@ -587,6 +587,50 @@ const char *rds_get_cc_countries(uint8_t cc)
 		return "--";
 	buf[pos] = '\0';
 	return buf;
+}
+
+/* List the ECCs that give a country with PI country digit cc, as
+ * "E0 (IL), E1 (CH), ..." (EN 50067 Table D.1 / Annex N). */
+const char *rds_ecc_suggest(uint8_t cc)
+{
+	static char buf[256];
+	int pos = 0;
+
+	buf[0] = '\0';
+	if (cc < 1 || cc > 15)
+		return buf;
+	for (const ecc_country_t *e = country_table; e->ecc != 0; e++) {
+		const char *code = e->countries[cc - 1];
+		int n;
+
+		if (!code || !strcmp(code, "--"))
+			continue;
+		n = snprintf(buf + pos, sizeof(buf) - pos, "%s%02X (%s)", pos ? ", " : "", e->ecc, code);
+		if (n < 0 || n >= (int)sizeof(buf) - pos)
+			break;
+		pos += n;
+	}
+	return buf;
+}
+
+/* Print the ECC + PI country digit -> country mapping
+ * (EN 50067 Table D.1 / Annex N). */
+void rds_ecc_table_print(FILE *fp)
+{
+	fprintf(fp, "ECC + PI country digit -> country (EN 50067 Table D.1, Annex N)\n");
+	fprintf(fp, "ECC  ");
+	for (int cc = 1; cc <= 15; cc++)
+		fprintf(fp, " %X  ", cc);
+	fprintf(fp, " region\n");
+	for (const ecc_country_t *e = country_table; e->ecc != 0; e++) {
+		fprintf(fp, "%02X   ", e->ecc);
+		for (int cc = 1; cc <= 15; cc++) {
+			const char *code = e->countries[cc - 1];
+			fprintf(fp, " %-2s ", code ? code : "--");
+		}
+		fprintf(fp, " %s\n", rds_get_ecc_name(e->ecc));
+	}
+	fprintf(fp, "Example: --pi 62E7 --rds-ecc E4 -> row E4, column 6 = UA\n");
 }
 
 /* ============================================================

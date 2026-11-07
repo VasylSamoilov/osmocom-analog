@@ -24,6 +24,7 @@ enum paging_signal;
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -44,6 +45,7 @@ enum paging_signal;
 #include "radio.h"
 #include "rds.h"
 #include "rds_protocol.h"
+#include "rds_tables.h"
 #include "rigctl_server.h"
 #include "signal_meter.h"
 #include "../libmobile/mcc.h"
@@ -123,6 +125,7 @@ static uint8_t rds_paging_opc = 0;   /* OPC for international (0=not set) */
 static uint8_t rds_paging_pac = 0;   /* PAC for paging area (0=all areas) */
 static int rds_paging_battery = 0;   /* pagers use battery saving: place calls in their interval */
 static uint8_t rds_ecc = 0;          /* Extended Country Code for 1A variant 0 (0 = not set) */
+static uint16_t rds_pi_opt = 0;      /* --pi, for the ECC / PI country digit check */
 static int rds_paging_13a = 0;       /* enhanced paging 13A address notification */
 static int rds_paging_scan = 0;      /* address range scan enabled */
 static uint32_t rds_paging_scan_from = 0;
@@ -500,12 +503,13 @@ static void print_help(const char *arg0)
 	printf("        PAC = Paging Area Code (0-63). Network-wide area filter broadcast\n");
 	printf("        in Group 1A variant 2. Pagers outside this area ignore messages.\n");
 	printf("        0 = all areas (default, recommended for single-transmitter setups).\n");
-	printf("    --rds-ecc <hex>\n");
+	printf("    --rds-ecc <hex> | list\n");
 	printf("        ECC = Extended Country Code (hex 01-FF, EN 50067 Annex D), sent in\n");
 	printf("        Group 1A variant 0. Together with the first digit of the PI it\n");
 	printf("        identifies the country (e.g. PI Dxxx + ECC E0 = Germany). Required\n");
 	printf("        with --rds-paging and --tx: paging pagers lock to the channel by\n");
 	printf("        country (PI country digit and ECC, EN 50067 M.3.2.3).\n");
+	printf("        'list' prints the ECC / PI country digit -> country mapping.\n");
 	printf("    --rds-paging-13a\n");
 	printf("        Enhanced paging address notification (EN 50067 M.3.4.1): one\n");
 	printf("        Group 13A (25 notification bits) right after the first marker of\n");
@@ -871,7 +875,8 @@ static int handle_options(int short_option, int argi, char **argv)
 		radio_set_callsign(argv[argi]);
 		break;
 	case OPT_PI:
-		radio_set_pi((uint16_t)strtoul(argv[argi], NULL, 16));
+		rds_pi_opt = (uint16_t)strtoul(argv[argi], NULL, 16);
+		radio_set_pi(rds_pi_opt);
 		break;
 	case OPT_POLYPHASE:
 		use_polyphase = 1;
@@ -927,15 +932,20 @@ static int handle_options(int short_option, int argi, char **argv)
 		rds_paging_13a = 1;
 		break;
 	case OPT_RDS_ECC: {
+		const char *a = argv[argi];
 		char *end;
-		unsigned long v = strtoul(argv[argi], &end, 16);
+		unsigned long v;
 
-		if (*argv[argi] == '\0' || *end != '\0' || v < 0x01 || v > 0xff) {
-			fprintf(stderr, "Invalid ECC '%s' (hex 01-FF, see EN 50067 Annex D), use '-h' for help!\n", argv[argi]);
+		if (!strcasecmp(a, "list")) {
+			rds_ecc_table_print(stdout);
+			exit(0);
+		}
+		v = strtoul(a, &end, 16);
+		if (*a == '\0' || *end != '\0' || v < 0x01 || v > 0xff) {
+			fprintf(stderr, "Invalid ECC '%s' (hex 01-FF or 'list'), use '-h' for help!\n", a);
 			return -EINVAL;
 		}
 		rds_ecc = (uint8_t)v;
-		radio_set_ecc(rds_ecc);	/* overrides the preset ECC, also on preset change */
 		rds = 1;  /* auto-enable RDS */
 		break;
 	}
@@ -1415,8 +1425,39 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
+	/* --rds-ecc: check ECC + PI country digit against EN 50067 Table D.1.
+	 * A mismatch is only a warning: the ECC is still transmitted as given. */
+	if (rds_ecc && rds_pi_opt) {
+		uint8_t pi_cc = rds_pi_opt >> 12;
+		const char *c = rds_get_country_code(pi_cc, rds_ecc);
+
+		if (c && strcmp(c, "--")) {
+			fprintf(stderr, "RDS: ECC %02X + PI %04X (country digit %X) = country %s\n", rds_ecc, rds_pi_opt, pi_cc, c);
+		} else {
+			const char *s = rds_ecc_suggest(pi_cc);
+
+			fprintf(stderr, "Warning: ECC %02X + PI %04X (country digit %X) is no country in EN 50067 Table D.1.\n", rds_ecc, rds_pi_opt, pi_cc);
+			fprintf(stderr, "         Receivers show no or a wrong country, pagers may not lock to this channel.\n");
+			fprintf(stderr, "         ECC %02X is still transmitted as given.\n", rds_ecc);
+			if (s[0]) {
+				fprintf(stderr, "         For PI country digit %X use --rds-ecc %s\n", pi_cc, s);
+				fprintf(stderr, "         or set --pi to your country digit, see '--rds-ecc list'.\n");
+			} else {
+				fprintf(stderr, "         PI country digit %X is not a country digit (1-F), set --pi to your\n", pi_cc);
+				fprintf(stderr, "         country digit, see '--rds-ecc list'.\n");
+			}
+		}
+	}
+	if (rds_ecc)
+		radio_set_ecc(rds_ecc);	/* overrides the preset ECC, also on preset change */
+
 	if (rds_paging && tx && !rds_ecc) {
 		fprintf(stderr, "RDS paging TX requires --rds-ecc <hex> (Extended Country Code, EN 50067 Annex D), use '-h' for help!\n");
+		exit(0);
+	}
+	/* 13A enhanced paging needs the operator code (EN 50067 M.3.2.7.2) */
+	if (rds_paging_13a && (rds_paging_opc < 1 || rds_paging_opc > 15)) {
+		fprintf(stderr, "--rds-paging-13a requires --rds-paging-opc 1-15 (EN 50067 M.3.2.7.2), use '-h' for help!\n");
 		exit(0);
 	}
 

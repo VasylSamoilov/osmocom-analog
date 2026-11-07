@@ -17,6 +17,7 @@
 #define _RDS_TABLES_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 /* ============================================================
  * Programme Type (PTY) Names
@@ -57,6 +58,13 @@ const char *rds_get_ecc_name(uint8_t ecc);
  * Valid: E0-E4 (Europe), A0-A5 (Americas), D0-D3 (Africa), F0-F2 (Asia/Pacific).
  * Returns 1 if valid, 0 if not defined. */
 int rds_is_valid_ecc(uint8_t ecc);
+
+/* ECCs that give a country with PI country digit cc (1-15), as
+ * "E0 (IL), E1 (CH), ...". Static buffer, empty if none. */
+const char *rds_ecc_suggest(uint8_t cc);
+
+/* Print the ECC + PI country digit -> country mapping */
+void rds_ecc_table_print(FILE *fp);
 
 /* Get North American (RBDS) Call Sign from PI code
  * Returns pointer to static buffer (not thread-safe) or NULL if not a valid call sign */

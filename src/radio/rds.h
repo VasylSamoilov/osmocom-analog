@@ -1626,6 +1626,20 @@ typedef struct rds_paging_dec {
 	uint8_t		rpc_batt_sync;	/* Battery saving sync (bits 1-0) */
 	uint8_t		rpc_valid;	/* RPC received at least once */
 
+	/* Interval sync from 1A B1/B0 (EN 50067 M.2.1.3) */
+	uint8_t		sync_k;		/* 1A number in the current interval, 0 = not in sync */
+	uint8_t		sync_j;		/* J3..J0 collected so far */
+	uint8_t		sync_prev_b1;	/* B1 of the previous 1A */
+	uint8_t		sync_after_4a;	/* 4A received since the last 1A (I0 marker) */
+	uint8_t		sync_interval;	/* decoded interval number 0-9 */
+	uint8_t		sync_ivalid;	/* sync_interval is valid */
+
+	/* System information from 1A block D without PIN (M.3.2.4.3) */
+	uint8_t		si_pac;		/* PAC from sub type 0 */
+	uint8_t		si_opc;		/* OPC from sub type 0 */
+	uint8_t		si_ecc;		/* ECC from sub type 1 */
+	uint8_t		si_valid;	/* bit 0: sub type 0 seen, bit 1: sub type 1 seen */
+
 	/* Group 1A OPC state (EN 50067 M.3.2.2) */
 	uint8_t		opc;		/* Last received Operator Code (0=none, 1-15) */
 	uint8_t		opc_valid;	/* OPC received at least once */
