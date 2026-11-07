@@ -54,6 +54,9 @@ typedef struct uhd_instance {
 	double			ppm_tx;		/* PPM correction to apply to TX frequencies */
 	double			ppm_rx;		/* PPM correction to apply to RX frequencies */
 	uhd_async_metadata_handle tx_async_md;	/* TX async event (underflow, seq error) */
+	int			rx_dev_valid;	/* rx_dev_next is set */
+	double			rx_dev_next;	/* device time of the next expected RX sample */
+	int			rx_dev_warned;	/* overflow without device time logged */
 } uhd_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -941,8 +944,9 @@ int uhd_receive(float *buff, int max)
 		LOGP(DUHD, LOGL_ERROR, "Failed to read from UHD device.\n");
 		return -EIO;
 	}
-	if (count) {
-		/* Check for overflow (lost samples) */
+	{
+		/* Check for overflow (lost samples). UHD reports it on a recv()
+		 * that returns no samples, so check before testing count. */
 		uhd_rx_metadata_error_code_t error_code;
 		uhd_rx_metadata_error_code(uhd_rx_inst->rx_metadata, &error_code);
 		if (error_code == UHD_RX_METADATA_ERROR_CODE_OVERFLOW) {
@@ -952,6 +956,8 @@ int uhd_receive(float *buff, int max)
 			if (overflow_count <= 10 || (overflow_count % 100) == 0)
 				LOGP(DUHD, LOGL_ERROR, "RX overflow #%d (lost samples)\n", overflow_count);
 		}
+	}
+	if (count) {
 		if (uhd_rx_inst->tx_timestamps) {
 			/* get time stamp of received RX packet */
 			rc = uhd_rx_metadata_has_time_spec(uhd_rx_inst->rx_metadata, &has_time_spec);
@@ -963,6 +969,38 @@ int uhd_receive(float *buff, int max)
 			}
 		}
 		if (!uhd_rx_inst->tx_timestamps) {
+			/* RX time is a count of received samples. Samples lost in an
+			 * overflow are not counted, so RX time would fall behind the
+			 * device and TX headroom (tx_time - rx_time) would shrink by
+			 * the lost amount, permanently. If the packet carries a device
+			 * time stamp, add the measured gap to RX time. */
+			bool hts = false;
+			int64_t pkt_secs;
+			double pkt_frac;
+
+			if (uhd_rx_metadata_has_time_spec(uhd_rx_inst->rx_metadata, &hts) == 0 && hts &&
+			    uhd_rx_metadata_time_spec(uhd_rx_inst->rx_metadata, &pkt_secs, &pkt_frac) == 0) {
+				double pkt_time = (double)pkt_secs + pkt_frac;
+
+				if (uhd_rx_inst->rx_dev_valid) {
+					long long lost = llround((pkt_time - uhd_rx_inst->rx_dev_next) * uhd_rx_inst->samplerate);
+					if (lost > 0) {
+						LOGP(DUHD, LOGL_ERROR, "RX gap of %lld samples (%.3f ms), RX time corrected\n",
+						     lost, 1000.0 * (double)lost / uhd_rx_inst->samplerate);
+						uhd_rx_inst->rx_time_fract_sec += (double)lost / uhd_rx_inst->samplerate;
+						while (uhd_rx_inst->rx_time_fract_sec >= 1.0) {
+							uhd_rx_inst->rx_time_secs++;
+							uhd_rx_inst->rx_time_fract_sec -= 1.0;
+						}
+					}
+				}
+				uhd_rx_inst->rx_dev_next = pkt_time + (double)count / uhd_rx_inst->samplerate;
+				uhd_rx_inst->rx_dev_valid = 1;
+			} else if (sdr_rx_overflow && !uhd_rx_inst->rx_dev_warned) {
+				LOGP(DUHD, LOGL_ERROR, "RX overflow without device time stamps: lost samples cannot be counted, TX headroom is reduced\n");
+				uhd_rx_inst->rx_dev_warned = 1;
+			}
+
 			/* increment time stamp */
 			uhd_rx_inst->rx_time_fract_sec += (double)count / uhd_rx_inst->samplerate;
 			if (uhd_rx_inst->rx_time_fract_sec >= 1.0) {
