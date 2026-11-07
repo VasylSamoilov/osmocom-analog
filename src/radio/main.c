@@ -530,7 +530,8 @@ static void print_help(const char *arg0)
 	printf("        RPC 4 covers 00-99). The group schedule is: 4A each minute, 1A at\n");
 	printf("        the battery saving interval layout of EN 50067 M.2.1.3 (13 per 6 s\n");
 	printf("        interval, 1A #1/#2 one second apart, interval sync bits in B1/B0),\n");
-	printf("        0A four per second for PS (EN 50067 3.1.3) and 7A for the rest.\n");
+	printf("        type 0 groups two per second for PS (EN 50067 3.1.3 minimum when\n");
+	printf("        capacity is needed for other applications) and 7A for the rest.\n");
 	printf("        Clock-time (4A) is forced on. The FIFO stays usable.\n");
 	printf("        Starts with the \"Paging\" RDS preset: PS \"PAGING\", PTY 0, TP 0,\n");
 	printf("        no AF, LIC, PIN, RT or other services; PI from --pi, ECC from\n");

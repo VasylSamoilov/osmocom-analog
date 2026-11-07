@@ -714,6 +714,7 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_GROUP_US         87579 /* one RDS group: 104 bit / 1187.5 bit/s */
 #define RDS_PAGING_SCAN_SLOTS       12  /* 1A slots after the 2nd marker, per 6 s interval */
 #define RDS_PAGING_0A_PER_SEC       4   /* 0A groups per second in the timed schedule (EN 50067 3.1.3) */
+#define RDS_PAGING_0A_PER_SEC_SCAN  2   /* scan: minimum for PS and AF, capacity to 7A (EN 50067 3.1.3) */
 #define RDS_PAGING_ADDR_HASH_SIZE   64  /* Per-address call counter hash slots */
 
 /* Radio Paging Codes (RPC) - Group 1A Block B bits 4-0 (EN 50067 M.2.1.2)

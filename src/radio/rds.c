@@ -1080,10 +1080,14 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 #define RDS_PAGING_SCAN_QUEUE	32	/* kept queued during a scan, rest is free for the FIFO */
 #define RDS_PAGING_SCAN_ELIGIBLE 32	/* battery saving: calls kept queued that can be sent now */
 #define RDS_PAGING_SCAN_QUEUE_BS (RDS_PAGING_QUEUE_MAX * 3 / 4) /* battery saving: queue limit */
+/* Type 0 groups per second in the timed schedule. EN 50067 3.1.3: four
+ * for PS; the rate may be reduced when capacity is needed for other
+ * applications, but not below two. A scan uses the minimum. */
+#define RDS_PAGING_0A_RATE(pag)	((pag)->scan_active ? RDS_PAGING_0A_PER_SEC_SCAN : RDS_PAGING_0A_PER_SEC)
 /* Share of groups left for 7A in the timed schedule. Per 6 s interval
- * (~68.5 groups): 13 x 1A and 6 x RDS_PAGING_0A_PER_SEC x 0A. */
+ * (~68.5 groups): 13 x 1A and 6 x RDS_PAGING_0A_RATE x 0A. */
 #define RDS_PAGING_GROUPS_6S	(6000000.0 / RDS_PAGING_GROUP_US)
-#define RDS_PAGING_7A_PERCENT	(100.0 * (RDS_PAGING_GROUPS_6S - 13 - 6 * RDS_PAGING_0A_PER_SEC) / RDS_PAGING_GROUPS_6S)
+#define RDS_PAGING_7A_PERCENT(pag) (100.0 * (RDS_PAGING_GROUPS_6S - 13 - 6 * RDS_PAGING_0A_RATE(pag)) / RDS_PAGING_GROUPS_6S)
 
 /* Interval number (0-9) and position in it (ms) from the paging group clock. */
 static void rds_paging_clock(const rds_paging_enc_t *pag, unsigned *interval, unsigned *pos_ms)
@@ -1167,7 +1171,7 @@ static int rds_paging_slot_ok(const rds_paging_enc_t *pag, uint32_t address, int
 	k = 2 - (int)off;
 	left_ms = (double)(6000 - pos) + 6000.0 * k;
 	/* groups of 7A that fit in the rest of the window; one group of margin */
-	avail = left_ms * RDS_PAGING_7A_PERCENT / 100.0 / (RDS_PAGING_GROUP_US / 1000.0) - 1.0;
+	avail = left_ms * RDS_PAGING_7A_PERCENT(pag) / 100.0 / (RDS_PAGING_GROUP_US / 1000.0) - 1.0;
 	if (k_out)
 		*k_out = k;
 	return avail >= groups;
@@ -3687,8 +3691,8 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 		/* 1A slots are inserted by rds_generate_group() */
 		ADD_GRP(RDS_GROUP_7A);
 		LOGP(DRADIO, LOGL_INFO, "RDS Scheduler: paging %s, 13 x 1A per 6 s interval, %d x %s per second, 7A otherwise\n",
-		     rds->paging.battery_saving ? "battery saving" : "scan",
-		     RDS_PAGING_0A_PER_SEC, rds->use_0b ? "0B" : "0A");
+		     rds->paging.scan_active ? "scan" : "battery saving",
+		     RDS_PAGING_0A_RATE(&rds->paging), rds->use_0b ? "0B" : "0A");
 		return;
 	}
 
@@ -4036,8 +4040,8 @@ static void rds_generate_group(rds_encoder_t *rds)
 	enum rds_group_type type = rds->group_sched_buffer[rds->group_sched_index];
 
 	/* Paging scan / battery saving: 1A at the slots of the interval layout,
-	 * 0A (PS) RDS_PAGING_0A_PER_SEC times per second (EN 50067 3.1.3: four
-	 * 0A per second for PS), 7A otherwise. A 1A slot has priority; a 0A that
+	 * type 0 (PS) RDS_PAGING_0A_RATE times per second (EN 50067 3.1.3: four
+	 * per second, two in a scan), 7A otherwise. A 1A slot has priority; a 0A that
 	 * meets a 1A follows in the next group. */
 	int keep_sched_index = 0;
 
@@ -4067,7 +4071,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 
 		if (ms > 59999)
 			ms = 59999;
-		key_0a = (uint32_t)(ms * RDS_PAGING_0A_PER_SEC / 1000);
+		key_0a = (uint32_t)(ms * RDS_PAGING_0A_RATE(pag) / 1000);
 		if (rds_paging_1a_slot(pag)) {
 			type = RDS_GROUP_1A;
 		} else if (pag->pending_13a) {
