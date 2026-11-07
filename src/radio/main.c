@@ -122,6 +122,7 @@ static uint16_t rds_paging_cc = 0;   /* E.212 MCC for international (0=not set) 
 static uint8_t rds_paging_opc = 0;   /* OPC for international (0=not set) */
 static uint8_t rds_paging_pac = 0;   /* PAC for paging area (0=all areas) */
 static int rds_paging_battery = 0;   /* pagers use battery saving: place calls in their interval */
+static uint8_t rds_ecc = 0;          /* Extended Country Code for 1A variant 0 (0 = not set) */
 static int rds_paging_scan = 0;      /* address range scan enabled */
 static uint32_t rds_paging_scan_from = 0;
 static uint32_t rds_paging_scan_to = 0;
@@ -498,6 +499,12 @@ static void print_help(const char *arg0)
 	printf("        PAC = Paging Area Code (0-63). Network-wide area filter broadcast\n");
 	printf("        in Group 1A variant 2. Pagers outside this area ignore messages.\n");
 	printf("        0 = all areas (default, recommended for single-transmitter setups).\n");
+	printf("    --rds-ecc <hex>\n");
+	printf("        ECC = Extended Country Code (hex 01-FF, EN 50067 Annex D), sent in\n");
+	printf("        Group 1A variant 0. Together with the first digit of the PI it\n");
+	printf("        identifies the country (e.g. PI Dxxx + ECC E0 = Germany). Required\n");
+	printf("        with --rds-paging and --tx: paging pagers lock to the channel by\n");
+	printf("        country (PI country digit and ECC, EN 50067 M.3.2.3).\n");
 	printf("    --rds-paging-battery-saving\n");
 	printf("        For pagers that use battery saving (EN 50067 M.2.1.3). Each minute\n");
 	printf("        has ten 6 s intervals I0..I9; a pager sleeps outside the interval of\n");
@@ -506,17 +513,17 @@ static void print_help(const char *arg0)
 	printf("        its address: interval d and the two following (d = last digit), and\n");
 	printf("        it must end inside the window. Other calls wait in the queue, so a\n");
 	printf("        single call can be delayed up to 54 s. Clock-time (4A) is forced on\n");
-	printf("        and the schedule is reduced to 4A, 1A and 7A. Without this option\n");
+	printf("        and the schedule is 4A, 1A, 0A (4 per second, PS) and 7A. Without this option\n");
 	printf("        calls are sent at once, as for pagers that listen all the time.\n");
 	printf("    --rds-paging-scan <from> <to>\n");
 	printf("        Scan through the given paging address range (0-999999) with one\n");
 	printf("        message per address. The message carries the 6-digit address, so\n");
 	printf("        you can tell which address a pager responded to. Requires\n");
 	printf("        --rds-paging; the RPC must cover the scanned group codes (default\n");
-	printf("        RPC 4 covers 00-99). The group schedule is reduced to what paging\n");
-	printf("        needs: 4A each minute, 1A at the battery saving interval layout\n");
-	printf("        of EN 50067 M.2.1.3 (13 per 6 s interval, 1A #1/#2 one second\n");
-	printf("        apart, interval sync bits in B1/B0) and 7A for everything else.\n");
+	printf("        RPC 4 covers 00-99). The group schedule is: 4A each minute, 1A at\n");
+	printf("        the battery saving interval layout of EN 50067 M.2.1.3 (13 per 6 s\n");
+	printf("        interval, 1A #1/#2 one second apart, interval sync bits in B1/B0),\n");
+	printf("        0A four per second for PS (EN 50067 3.1.3) and 7A for the rest.\n");
 	printf("        Clock-time (4A) is forced on. The FIFO stays usable.\n");
 	printf("    --rds-paging-scan-type numeric | alpha | tone\n");
 	printf("        Message type for the scan (default numeric, 10 digit; alpha sends\n");
@@ -659,6 +666,7 @@ static double afc_max_hz = 5000.0;
 #define OPT_RDS_PAGING_SCAN	1128
 #define OPT_RDS_PAGING_SCAN_TYPE 1129
 #define OPT_RDS_PAGING_BATTERY	1130
+#define OPT_RDS_ECC		1131
 
 static void add_options(void)
 {
@@ -701,6 +709,7 @@ static void add_options(void)
 	option_add(OPT_RDS_PAGING_OPC, "rds-paging-opc", 1);
 	option_add(OPT_RDS_PAGING_PAC, "rds-paging-pac", 1);
 	option_add(OPT_RDS_PAGING_BATTERY, "rds-paging-battery-saving", 0);
+	option_add(OPT_RDS_ECC, "rds-ecc", 1);
 	option_add(OPT_RDS_PAGING_SCAN, "rds-paging-scan", 2);
 	option_add(OPT_RDS_PAGING_SCAN_TYPE, "rds-paging-scan-type", 1);
 	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
@@ -901,6 +910,18 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_RDS_PAGING_BATTERY:
 		rds_paging_battery = 1;
 		break;
+	case OPT_RDS_ECC: {
+		char *end;
+		unsigned long v = strtoul(argv[argi], &end, 16);
+
+		if (*argv[argi] == '\0' || *end != '\0' || v < 0x01 || v > 0xff) {
+			fprintf(stderr, "Invalid ECC '%s' (hex 01-FF, see EN 50067 Annex D), use '-h' for help!\n", argv[argi]);
+			return -EINVAL;
+		}
+		rds_ecc = (uint8_t)v;
+		rds = 1;  /* auto-enable RDS */
+		break;
+	}
 	case OPT_RDS_PAGING_SCAN: {
 		long from = atol(argv[argi++]);
 		long to = atol(argv[argi++]);
@@ -1376,6 +1397,11 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 
+	if (rds_paging && tx && !rds_ecc) {
+		fprintf(stderr, "RDS paging TX requires --rds-ecc <hex> (Extended Country Code, EN 50067 Annex D), use '-h' for help!\n");
+		exit(0);
+	}
+
 	/* global inits */
 	fm_init(fast_math);
 	am_init(fast_math);
@@ -1565,6 +1591,13 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to open TX bitstream input file, exitting!\n");
 			exit(0);
 		}
+	}
+
+	/* ECC in 1A variant 0. Paging needs 1A, not 1B (RPC is in 1A block 2). */
+	if (rds_ecc && tx) {
+		if (rds_paging)
+			radio.rds_enc.use_1b = 0;
+		rds_enc_set_ecc(&radio.rds_enc, rds_ecc);
 	}
 
 	/* Enable RDS paging if requested */

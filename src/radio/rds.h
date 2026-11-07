@@ -713,6 +713,7 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_COUNTER_MAX      15  /* P3-P0 max (wraps 15->1) */
 #define RDS_PAGING_GROUP_US         87579 /* one RDS group: 104 bit / 1187.5 bit/s */
 #define RDS_PAGING_SCAN_SLOTS       12  /* 1A slots after the 2nd marker, per 6 s interval */
+#define RDS_PAGING_0A_PER_SEC       4   /* 0A groups per second in the timed schedule (EN 50067 3.1.3) */
 #define RDS_PAGING_ADDR_HASH_SIZE   64  /* Per-address call counter hash slots */
 
 /* Radio Paging Codes (RPC) - Group 1A Block B bits 4-0 (EN 50067 M.2.1.2)
@@ -1562,8 +1563,8 @@ typedef struct rds_paging_enc {
 	uint8_t		intl_opc;		/* OPC default (1-15) */
 
 	/* Address range scan: one message per address in [scan_next, scan_end),
-	 * refilled into the queue on demand. Group schedule is reduced to the
-	 * mandatory 1A plus 7A groups. */
+	 * refilled into the queue on demand. Group schedule is 4A each minute,
+	 * 1A at the interval layout, 0A for PS and 7A for the rest. */
 	int		scan_active;
 	uint32_t	scan_from;		/* first address of the scan */
 	uint32_t	scan_next;		/* next address to queue */
@@ -1572,6 +1573,7 @@ typedef struct rds_paging_enc {
 	uint32_t	scan_end;		/* exclusive end (max 1000000) */
 	uint32_t	scan_grp;		/* groups since the last 4A (minute marker) */
 	uint32_t	scan_last_key;		/* interval*16 + slot of the last 1A/4A sent */
+	uint32_t	scan_last_0a;		/* 0A slot of the last 0A sent */
 	uint8_t		scan_n;			/* 1A number in interval: 1, 2 .. 5, 6 = excess */
 	uint8_t		scan_interval;		/* interval number 0-9 of the current 1A */
 	enum rds_paging_msg_type scan_type;	/* TONE, NUM10 or ALPHA */
