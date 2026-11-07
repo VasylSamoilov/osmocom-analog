@@ -393,12 +393,13 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		if (!sdr_config->rx_only) {
 			LOGP(DSDR, LOGL_NOTICE, "Allocating TX thread buffers\n");
 			memset(&sdr->thread_write, 0, sizeof(sdr->thread_write));
-			/* Ring buffer holds 2x buffer_size to allow the main loop to
-			 * write a full buffer_size while the write thread is still
-			 * draining the previous batch.  Without this headroom,
-			 * high sample rates (where buffer_size is large) cause
-			 * overflow on every other iteration. */
-			sdr->thread_write.buffer_size = sdr->buffer_size * 4 + 2;
+			/* Ring buffer holds 3x buffer_size. sdr_get_tosend() allows
+			 * fill + tosend up to 2x buffer_size (catch-up in time stamp
+			 * mode), so a 2x ring had no margin and any extra sample
+			 * would be cut off in sdr_write(), dropping TX samples. The
+			 * extra buffer_size is margin only: device paced mode still
+			 * keeps the fill at buffer_size, so latency is unchanged. */
+			sdr->thread_write.buffer_size = sdr->buffer_size * 6 + 2;
 			sdr->thread_write.buffer = calloc(sdr->thread_write.buffer_size, sizeof(*sdr->thread_write.buffer));
 			if (!sdr->thread_write.buffer) {
 				LOGP(DSDR, LOGL_ERROR, "No mem!\n");
@@ -1047,6 +1048,21 @@ static void sdr_bias(float *buffer, int count)
 
 static int sdr_tx_device_paced(void);
 
+/* Number of RX samples the device dropped before the last received packet
+ * (measured from device time stamps, 0 if unknown). Clears the value. */
+static long sdr_rx_take_gap(void)
+{
+#ifdef HAVE_UHD
+	if (rx_driver == 1)
+		return uhd_rx_take_gap();
+#endif
+#ifdef HAVE_SOAPY
+	if (rx_driver == 2)
+		return soapy_rx_take_gap();
+#endif
+	return 0;
+}
+
 static void *sdr_write_child(void *arg)
 {
 	sdr_t *sdr = (sdr_t *)arg;
@@ -1395,6 +1411,7 @@ static void *sdr_read_child(void *arg)
 #ifdef DEBUG_BUFFER
 				printf("Thread read %d samples from SDR and writes them to read buffer.\n", count);
 #endif
+				int rx_filter = 0;
 #ifndef DISABLE_FILTER
 				/* filter spectrum */
 				/* If channelizer is used (RX or TX), we MUST skip this filter because
@@ -1405,13 +1422,53 @@ static void *sdr_read_child(void *arg)
 				int skip_filter = 0;
 				if (sdr->chan && (sdr->chan[0].use_channelizer || sdr->chan[0].use_tx_channelizer))
 					skip_filter = 1;
+				rx_filter = (!skip_filter && rx_os > 1);
+#endif
+				in = sdr->thread_read.in;
 
-				if (!skip_filter && rx_os > 1) {
+				/* Samples lost before this packet (device overflow), measured
+				 * from device time stamps: insert the same number of zero
+				 * samples, so the sample timeline seen by the DSP stays
+				 * continuous (a fade of the right length, no time jump for
+				 * PLLs and symbol timing). Limited by the free ring space. */
+				{
+					long gap = sdr_rx_take_gap();
+
+					if (gap > 0) {
+						long room = num - count;	/* free ring space after this packet */
+						long fill_n = (gap < room) ? gap : room;
+						float z[1024];
+
+						if (fill_n < gap)
+							LOGP(DSDR, LOGL_ERROR, "RX gap of %ld samples, ring has room for %ld: %ld samples skipped\n",
+							     gap, fill_n, gap - fill_n);
+						while (fill_n > 0) {
+							int n = (fill_n > 512) ? 512 : (int)fill_n;
+
+							memset(z, 0, sizeof(float) * n * 2);
+#ifndef DISABLE_FILTER
+							if (rx_filter) {
+								iir_process_baseband(&sdr->thread_read.lp[0], z, n);
+								iir_process_baseband(&sdr->thread_read.lp[1], z + 1, n);
+							}
+#endif
+							for (s = 0, ss = 0; s < n; s++) {
+								sdr->thread_read.buffer[in++] = z[ss++];
+								sdr->thread_read.buffer[in++] = z[ss++];
+								in %= sdr->thread_read.buffer_size;
+							}
+							fill_n -= n;
+						}
+					}
+				}
+
+#ifndef DISABLE_FILTER
+				if (rx_filter) {
 					iir_process_baseband(&sdr->thread_read.lp[0], sdr->thread_read.buffer2, count);
 					iir_process_baseband(&sdr->thread_read.lp[1], sdr->thread_read.buffer2 + 1, count);
 				}
 #endif
-				in = sdr->thread_read.in;
+				(void)rx_filter;
 				for (s = 0, ss = 0; s < count; s++) {
 					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];
 					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];

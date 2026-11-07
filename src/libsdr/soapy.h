@@ -10,6 +10,7 @@ int soapy_send(float *buff, int num);
 int soapy_receive(float *buff, int max);
 int soapy_get_tosend(int buffer_size);
 int soapy_tx_device_paced(void);
+long soapy_rx_take_gap(void);
 void soapy_tx_poll_events(unsigned long *underflow, unsigned long *seq_error, unsigned long *time_error);
 
 int soapy_set_rx_frequency(double frequency);

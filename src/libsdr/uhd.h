@@ -11,6 +11,7 @@ int uhd_receive(float *buff, int max);
 int uhd_get_tosend(int buffer_size);
 int uhd_get_tx_mtu(void);
 int uhd_tx_device_paced(void);
+long uhd_rx_take_gap(void);
 void uhd_tx_poll_events(unsigned long *underflow, unsigned long *seq_error, unsigned long *time_error);
 
 int uhd_set_rx_frequency(double frequency);

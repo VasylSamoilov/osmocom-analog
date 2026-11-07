@@ -74,6 +74,7 @@ typedef struct soapy_instance {
 	double			ppm_manual_rx;	/* nonzero if manual frequency correction needed (device doesn't support it) */
 	double			ppm_manual_tx;	/* nonzero if manual frequency correction needed (device doesn't support it) */
 	int			tx_status_unsupported; /* readStreamStatus() not implemented by driver */
+	long long		rx_gap;		/* samples lost before the last packet, not yet filled */
 } soapy_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -925,14 +926,21 @@ int soapy_receive(float *buff, int max)
 		}
 		pthread_mutex_lock(&soapy_rx_inst->timestamp_mutex);
 		long long expected_advance = samples_to_ns(soapy_rx_inst, count);
-		if (soapy_rx_inst->rx_timeNs != timeNs) {
+		/* Gap in whole samples: per-chunk ns rounding gives small
+		 * mismatches that are not lost samples. */
+		long long lost = llround((double)(timeNs - soapy_rx_inst->rx_timeNs) * soapy_rx_inst->samplerate / 1e9);
+		if (lost != 0) {
 			if (rx_debug_count < 20) {
-				LOGP(DSOAPY, LOGL_ERROR, "SDR RX overflow: expected=%lld actual=%lld diff=%lld count=%d expected_adv=%lld Ns_per_sample=%lld\n",
-				     soapy_rx_inst->rx_timeNs, timeNs, timeNs - soapy_rx_inst->rx_timeNs, count, 
+				LOGP(DSOAPY, LOGL_ERROR, "SDR RX overflow: expected=%lld actual=%lld diff=%lld (%lld samples) count=%d expected_adv=%lld Ns_per_sample=%lld\n",
+				     soapy_rx_inst->rx_timeNs, timeNs, timeNs - soapy_rx_inst->rx_timeNs, lost, count,
 				     expected_advance, soapy_rx_inst->Ns_per_sample);
 				rx_debug_count++;
 			}
 			sdr_rx_overflow = 1;
+			/* positive gap: lost samples, zero-filled by the caller.
+			 * Negative or huge: time stamp jump, resync only. */
+			if (lost > 0 && lost <= (long long)soapy_rx_inst->samplerate * 10)
+				soapy_rx_inst->rx_gap += lost;
 		}
 		soapy_rx_inst->rx_timeNs = timeNs + expected_advance;
 		pthread_mutex_unlock(&soapy_rx_inst->timestamp_mutex);
@@ -942,6 +950,21 @@ int soapy_receive(float *buff, int max)
 	}
 
 	return count;
+}
+
+/* Return and clear the number of RX samples lost before the last packet
+ * (hardware time stamp mode only, 0 otherwise). */
+long soapy_rx_take_gap(void)
+{
+	long long gap;
+
+	if (!soapy_rx_inst)
+		return 0;
+	pthread_mutex_lock(&soapy_rx_inst->timestamp_mutex);
+	gap = soapy_rx_inst->rx_gap;
+	soapy_rx_inst->rx_gap = 0;
+	pthread_mutex_unlock(&soapy_rx_inst->timestamp_mutex);
+	return (long)gap;
 }
 
 /* estimate number of samples that can be sent */

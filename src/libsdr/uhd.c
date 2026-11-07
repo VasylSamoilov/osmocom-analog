@@ -57,6 +57,7 @@ typedef struct uhd_instance {
 	int			rx_dev_valid;	/* rx_dev_next is set */
 	double			rx_dev_next;	/* device time of the next expected RX sample */
 	int			rx_dev_warned;	/* overflow without device time logged */
+	long long		rx_gap;		/* samples lost before the last packet, not yet filled */
 } uhd_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -958,6 +959,40 @@ int uhd_receive(float *buff, int max)
 		}
 	}
 	if (count) {
+		/* Measure samples lost before this packet from the device time
+		 * stamp: compare the packet time with the expected time of the
+		 * next sample. The gap is zero-filled by the caller and, without
+		 * TX timestamps, added to the counted RX time below. */
+		long long lost = 0;
+		{
+			bool hts = false;
+			int64_t pkt_secs;
+			double pkt_frac;
+
+			if (uhd_rx_metadata_has_time_spec(uhd_rx_inst->rx_metadata, &hts) == 0 && hts &&
+			    uhd_rx_metadata_time_spec(uhd_rx_inst->rx_metadata, &pkt_secs, &pkt_frac) == 0) {
+				double pkt_time = (double)pkt_secs + pkt_frac;
+
+				if (uhd_rx_inst->rx_dev_valid) {
+					lost = llround((pkt_time - uhd_rx_inst->rx_dev_next) * uhd_rx_inst->samplerate);
+					if (lost < 0 || lost > (long long)uhd_rx_inst->samplerate * 10) {
+						/* time went backwards or jumped (device time reset): resync only */
+						LOGP(DUHD, LOGL_ERROR, "RX time stamp jumped by %lld samples, resync without fill\n", lost);
+						lost = 0;
+					} else if (lost > 0) {
+						LOGP(DUHD, LOGL_ERROR, "RX gap of %lld samples (%.3f ms) before packet\n",
+						     lost, 1000.0 * (double)lost / uhd_rx_inst->samplerate);
+						uhd_rx_inst->rx_gap += lost;
+					}
+				}
+				uhd_rx_inst->rx_dev_next = pkt_time + (double)count / uhd_rx_inst->samplerate;
+				uhd_rx_inst->rx_dev_valid = 1;
+			} else if (sdr_rx_overflow && !uhd_rx_inst->rx_dev_warned) {
+				LOGP(DUHD, LOGL_ERROR, "RX overflow without device time stamps: lost samples cannot be measured or filled\n");
+				uhd_rx_inst->rx_dev_warned = 1;
+			}
+		}
+
 		if (uhd_rx_inst->tx_timestamps) {
 			/* get time stamp of received RX packet */
 			rc = uhd_rx_metadata_has_time_spec(uhd_rx_inst->rx_metadata, &has_time_spec);
@@ -972,33 +1007,13 @@ int uhd_receive(float *buff, int max)
 			/* RX time is a count of received samples. Samples lost in an
 			 * overflow are not counted, so RX time would fall behind the
 			 * device and TX headroom (tx_time - rx_time) would shrink by
-			 * the lost amount, permanently. If the packet carries a device
-			 * time stamp, add the measured gap to RX time. */
-			bool hts = false;
-			int64_t pkt_secs;
-			double pkt_frac;
-
-			if (uhd_rx_metadata_has_time_spec(uhd_rx_inst->rx_metadata, &hts) == 0 && hts &&
-			    uhd_rx_metadata_time_spec(uhd_rx_inst->rx_metadata, &pkt_secs, &pkt_frac) == 0) {
-				double pkt_time = (double)pkt_secs + pkt_frac;
-
-				if (uhd_rx_inst->rx_dev_valid) {
-					long long lost = llround((pkt_time - uhd_rx_inst->rx_dev_next) * uhd_rx_inst->samplerate);
-					if (lost > 0) {
-						LOGP(DUHD, LOGL_ERROR, "RX gap of %lld samples (%.3f ms), RX time corrected\n",
-						     lost, 1000.0 * (double)lost / uhd_rx_inst->samplerate);
-						uhd_rx_inst->rx_time_fract_sec += (double)lost / uhd_rx_inst->samplerate;
-						while (uhd_rx_inst->rx_time_fract_sec >= 1.0) {
-							uhd_rx_inst->rx_time_secs++;
-							uhd_rx_inst->rx_time_fract_sec -= 1.0;
-						}
-					}
+			 * the lost amount, permanently. Add the measured gap. */
+			if (lost > 0) {
+				uhd_rx_inst->rx_time_fract_sec += (double)lost / uhd_rx_inst->samplerate;
+				while (uhd_rx_inst->rx_time_fract_sec >= 1.0) {
+					uhd_rx_inst->rx_time_secs++;
+					uhd_rx_inst->rx_time_fract_sec -= 1.0;
 				}
-				uhd_rx_inst->rx_dev_next = pkt_time + (double)count / uhd_rx_inst->samplerate;
-				uhd_rx_inst->rx_dev_valid = 1;
-			} else if (sdr_rx_overflow && !uhd_rx_inst->rx_dev_warned) {
-				LOGP(DUHD, LOGL_ERROR, "RX overflow without device time stamps: lost samples cannot be counted, TX headroom is reduced\n");
-				uhd_rx_inst->rx_dev_warned = 1;
 			}
 
 			/* increment time stamp */
@@ -1011,6 +1026,18 @@ int uhd_receive(float *buff, int max)
 	}
 
 	return count;
+}
+
+/* Return and clear the number of RX samples lost before the last packet. */
+long uhd_rx_take_gap(void)
+{
+	long long gap;
+
+	if (!uhd_rx_inst)
+		return 0;
+	gap = uhd_rx_inst->rx_gap;
+	uhd_rx_inst->rx_gap = 0;
+	return (long)gap;
 }
 
 /* estimate number of samples that can be sent */
