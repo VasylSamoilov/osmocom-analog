@@ -123,6 +123,7 @@ static uint8_t rds_paging_opc = 0;   /* OPC for international (0=not set) */
 static uint8_t rds_paging_pac = 0;   /* PAC for paging area (0=all areas) */
 static int rds_paging_battery = 0;   /* pagers use battery saving: place calls in their interval */
 static uint8_t rds_ecc = 0;          /* Extended Country Code for 1A variant 0 (0 = not set) */
+static int rds_paging_13a = 0;       /* enhanced paging 13A address notification */
 static int rds_paging_scan = 0;      /* address range scan enabled */
 static uint32_t rds_paging_scan_from = 0;
 static uint32_t rds_paging_scan_to = 0;
@@ -505,6 +506,12 @@ static void print_help(const char *arg0)
 	printf("        identifies the country (e.g. PI Dxxx + ECC E0 = Germany). Required\n");
 	printf("        with --rds-paging and --tx: paging pagers lock to the channel by\n");
 	printf("        country (PI country digit and ECC, EN 50067 M.3.2.3).\n");
+	printf("    --rds-paging-13a\n");
+	printf("        Enhanced paging address notification (EN 50067 M.3.4.1): one\n");
+	printf("        Group 13A (25 notification bits) right after the first marker of\n");
+	printf("        each interval. The bits flag pending messages for the sub groups\n");
+	printf("        (address digits Z2Z3) of the pagers of that interval, so enhanced\n");
+	printf("        pagers with a clear bit can go back to battery saving at once.\n");
 	printf("    --rds-paging-battery-saving\n");
 	printf("        For pagers that use battery saving (EN 50067 M.2.1.3). Each minute\n");
 	printf("        has ten 6 s intervals I0..I9; a pager sleeps outside the interval of\n");
@@ -667,6 +674,7 @@ static double afc_max_hz = 5000.0;
 #define OPT_RDS_PAGING_SCAN_TYPE 1129
 #define OPT_RDS_PAGING_BATTERY	1130
 #define OPT_RDS_ECC		1131
+#define OPT_RDS_PAGING_13A	1132
 
 static void add_options(void)
 {
@@ -710,6 +718,7 @@ static void add_options(void)
 	option_add(OPT_RDS_PAGING_PAC, "rds-paging-pac", 1);
 	option_add(OPT_RDS_PAGING_BATTERY, "rds-paging-battery-saving", 0);
 	option_add(OPT_RDS_ECC, "rds-ecc", 1);
+	option_add(OPT_RDS_PAGING_13A, "rds-paging-13a", 0);
 	option_add(OPT_RDS_PAGING_SCAN, "rds-paging-scan", 2);
 	option_add(OPT_RDS_PAGING_SCAN_TYPE, "rds-paging-scan-type", 1);
 	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
@@ -909,6 +918,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_RDS_PAGING_BATTERY:
 		rds_paging_battery = 1;
+		break;
+	case OPT_RDS_PAGING_13A:
+		rds_paging_13a = 1;
 		break;
 	case OPT_RDS_ECC: {
 		char *end;
@@ -1610,6 +1622,8 @@ int main(int argc, char *argv[])
 		rds_enc_paging_set_cc(&radio.rds_enc, rds_paging_cc);
 		if (rds_paging_battery)
 			rds_enc_paging_set_battery_saving(&radio.rds_enc, 1);
+		if (rds_paging_13a)
+			rds_enc_paging_set_13a_notify(&radio.rds_enc, 1);
 		/* Enable paging decoder so 7A/13A are decoded as paging, not ODA */
 		radio.rds_dec.paging_enabled = 1;
 		/* Create named pipe for paging commands */

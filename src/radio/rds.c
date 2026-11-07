@@ -1096,6 +1096,37 @@ static void rds_paging_clock(const rds_paging_enc_t *pag, unsigned *interval, un
 	*pos_ms = (unsigned)(ms % 6000);
 }
 
+/* First marker of an interval (1A #1, or 4A in interval 0): with enhanced
+ * paging, 13A sub type 0 (25 bits, one group) or 1+2 (50 bits, two groups)
+ * follow it (EN 50067 M.3.4.1.1). */
+static void rds_paging_marker(rds_paging_enc_t *pag)
+{
+	pag->pending_13a = pag->enhanced ? (pag->notify_50bit ? 2 : 1) : 0;
+	pag->notify_sty = 0;	/* 50 bits: STY 001 first, then STY 010 */
+}
+
+/* Returns 1 if the paging group clock is at a new 1A slot of the interval
+ * layout (EN 50067 M.2.1.3): slot 0 at the interval start, slot 1 one second
+ * later, then RDS_PAGING_SCAN_SLOTS equally spaced slots. Sets the interval
+ * number and the 1A number within the interval for the sync bits. */
+static int rds_paging_1a_slot(rds_paging_enc_t *pag)
+{
+	unsigned interval, pos, slot;
+	uint32_t key;
+
+	rds_paging_clock(pag, &interval, &pos);
+	slot = (pos < 1000) ? 0 : 1 + (pos - 1000) * RDS_PAGING_SCAN_SLOTS / 5000;
+	key = interval * 16 + slot;
+	if (key == pag->scan_last_key)
+		return 0;
+	pag->scan_last_key = key;
+	pag->scan_interval = interval;
+	pag->scan_n = (slot < 5) ? slot + 1 : 6;
+	if (slot == 0)
+		rds_paging_marker(pag);
+	return 1;
+}
+
 /* Align the group clock to the wall clock minute, so interval 0 starts at the
  * next 4A. The startup 4A is skipped, the next 4A is the real minute edge. */
 static void rds_paging_clock_sync(rds_encoder_t *rds)
@@ -1672,6 +1703,11 @@ void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable)
 	if (!enable) {
 		rds->paging.scan_active = 0;
 		rds_paging_queue_destroy(&rds->paging);
+	} else {
+		/* Paging needs 4A at each minute and 1A once per second at the
+		 * interval layout, driven by the paging group clock (M.2.1.1). */
+		rds_enc_set_ct_enabled(rds, 1);
+		rds_paging_clock_sync(rds);
 	}
 	rds_enc_scheduler_update(rds);
 }
@@ -2189,12 +2225,28 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	int slc_variant_count = rds_enc_get_slc_variants(rds, slc_variants, RDS_1A_VARIANT_MAX);
 	
 	int variant = slc_variants[rds->slc_variant % slc_variant_count];
+	int pin_valid = (rds->pin_day != 0);	/* day 0: no valid PIN (M.3.2.4.3) */
+	int other_variants = 0;			/* 1A variants other than 0 and 2 in use */
+	int i;
 
-	/* Paging scan / battery saving: interval sync bits replace the static
-	 * sync field and the first 1A of an interval carries variant 0 (M.3.2.5.2.3). */
-	if (RDS_PAGING_TIMED(&rds->paging)) {
+	for (i = 0; i < slc_variant_count; i++)
+		if (slc_variants[i] != RDS_1A_VARIANT_ECC && slc_variants[i] != RDS_1A_VARIANT_PAGER)
+			other_variants = 1;
+
+	/* Paging: interval sync bits from the paging group clock replace the
+	 * static sync field (M.2.1.3), and the variant follows EN 50067
+	 * M.3.2.5.2:
+	 *  - no other 1A variants (M.3.2.5.2.1 / .2): every 1A is variant 2
+	 *    (M.3.2.5.1 recommends variant 2 when no other 1A application);
+	 *  - other variants in use (M.3.2.5.2.3 / .4): the 1st marker of an
+	 *    interval is variant 0 sub type 0, and in interval 0 (1st marker is
+	 *    4A) the 2nd marker as well (general remark 2); the other 1A rotate
+	 *    through the configured variants. */
+	if (rds->paging.enabled) {
 		rpc = (rpc & 0x1C) | rds_paging_1a_sync(rds, &sync_k);
-		if (sync_k <= 2)
+		if (!other_variants)
+			variant = RDS_1A_VARIANT_PAGER;
+		else if (sync_k == 1 || (sync_k == 2 && rds->paging.scan_interval == 0))
 			variant = RDS_1A_VARIANT_ECC;
 	}
 	
@@ -2286,6 +2338,37 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	b4 = ((rds->pin_day & (RDS_PIN_DAY_MASK >> RDS_PIN_DAY_SHIFT)) << RDS_PIN_DAY_SHIFT) |
 	     ((rds->pin_hour & (RDS_PIN_HOUR_MASK >> RDS_PIN_HOUR_SHIFT)) << RDS_PIN_HOUR_SHIFT) |
 	     (rds->pin_minute & RDS_PIN_MINUTE_MASK);
+
+	/* Paging: block D carries the paging System Information instead of
+	 * PIN (EN 50067 M.3.2.4.3, Fig. M.10a/b). Day bits 15-11 = 0, bit 10 =
+	 * sub type:
+	 *   sub type 0: bits 9-4 PAC, bits 3-0 OPC
+	 *   sub type 1: bits 9-8 usage (00 = ECC, Table M.7), bits 7-0 ECC
+	 * Selection (M.3.2.5.2):
+	 *   variant 2: sub type 1 with ECC (.1, .3 note 3); with a valid PIN
+	 *     the 1st marker sends sub type 1, the others the PIN (.2);
+	 *   variant 0: sub type 0 (1st/2nd marker, .3 / .4); with a valid PIN
+	 *     and no marker the PIN (.4);
+	 *   other variants: sub type 0 (.3 note 1, .4). */
+	if (rds->paging.enabled) {
+		uint16_t sty0 = (uint16_t)(((rds->paging.pac & 0x3F) << 4) | (rds->paging.intl_opc & 0x0F));
+		uint16_t sty1 = (uint16_t)((1 << 10) | (0 << 8) | (rds->ecc & 0xFF));
+		int marker = (sync_k == 1 || (sync_k == 2 && rds->paging.scan_interval == 0));
+
+		switch (variant) {
+		case RDS_1A_VARIANT_PAGER:
+			if (!pin_valid || marker)
+				b4 = sty1;
+			break;
+		case RDS_1A_VARIANT_ECC:
+			if (!pin_valid || marker)
+				b4 = sty0;
+			break;
+		default:
+			b4 = sty0;
+			break;
+		}
+	}
 	blocks[3] = rds_build_block(b4, RDS_OFFSET_D);
 	
 	/* Pack into bytes using shared function */
@@ -3457,14 +3540,18 @@ static uint8_t rds_paging_interval_from_addr(uint32_t address)
 
 /* Recompute notify_bits from queue + active TX message.
  * Called each time a 13A group is built. */
-static void rds_paging_update_notify(rds_paging_enc_t *pag)
+static void rds_paging_update_notify(rds_paging_enc_t *pag, unsigned interval)
 {
 	uint64_t bits = 0;
 	rds_paging_msg_t *msg;
 	int use_50 = pag->notify_50bit;
 
+	/* The bits tell the pagers of this interval (last digit Z4 = interval,
+	 * EN 50067 M.3.4.1.2) whether a message for their sub group Z2Z3 is
+	 * pending; messages for pagers of other intervals are not counted. */
+
 	/* Currently transmitting message */
-	if (pag->tx_active && pag->tx_msg) {
+	if (pag->tx_active && pag->tx_msg && rds_paging_interval_from_addr(pag->tx_msg->address) == interval) {
 		int bit = use_50 ? rds_paging_notify_bit_50(pag->tx_msg->address)
 				 : rds_paging_notify_bit_25(pag->tx_msg->address);
 		bits |= (1ULL << bit);
@@ -3472,8 +3559,12 @@ static void rds_paging_update_notify(rds_paging_enc_t *pag)
 
 	/* Queued messages */
 	for (msg = pag->queue_head; msg; msg = msg->next) {
-		int bit = use_50 ? rds_paging_notify_bit_50(msg->address)
-				 : rds_paging_notify_bit_25(msg->address);
+		int bit;
+
+		if (rds_paging_interval_from_addr(msg->address) != interval)
+			continue;
+		bit = use_50 ? rds_paging_notify_bit_50(msg->address)
+			     : rds_paging_notify_bit_25(msg->address);
 		bits |= (1ULL << bit);
 	}
 
@@ -3494,12 +3585,12 @@ static void rds_build_group_13a_paging(rds_encoder_t *rds, uint8_t *group)
 	uint8_t sty;
 	uint32_t notify_word; /* 25 bits to encode in this group */
 
-	/* Recompute notification bits from current queue state */
-	rds_paging_update_notify(pag);
+	/* 13A follows the first marker of the interval (M.3.4.1.1): IT is the
+	 * current interval of the paging group clock */
+	interval = pag->scan_interval;
 
-	/* Interval number from current TX message, or 0 if idle */
-	interval = (pag->tx_active && pag->tx_msg)
-		   ? rds_paging_interval_from_addr(pag->tx_msg->address) : 0;
+	/* Recompute notification bits from current queue state */
+	rds_paging_update_notify(pag, interval);
 
 	if (pag->notify_50bit) {
 		/* 50-bit mode: alternate between STY=001 (high) and STY=010 (low).
@@ -3669,11 +3760,9 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 		ADD_GRP(RDS_GROUP_7A);
 	}
 
-	/* Block 7c: 13A address notification - only when paging AND 13A notify enabled.
-	 * Per EN 50067 M.3.2.5.2: 13A is optional, available for ODA when not used for paging. */
-	if (rds->paging.enabled && rds->paging.enhanced) {
-		ADD_GRP(RDS_GROUP_13A);
-	}
+	/* 13A address notification is not in the cyclic schedule: it is
+	 * inserted by rds_generate_group() right after the first marker of
+	 * each interval (EN 50067 M.3.4.1.1). */
 
 	/* Block 7d: TDC (5A/5B) -- one slot per active channel per cycle.
 	 * EN 50067 S.3.1.5.8: data rate depends on how many channel
@@ -3815,7 +3904,7 @@ static void rds_build_group_15a(rds_encoder_t *rds, uint8_t *group);
 
 static void rds_generate_group(rds_encoder_t *rds)
 {
-	if (RDS_PAGING_TIMED(&rds->paging))
+	if (rds->paging.enabled)
 		rds->paging.scan_grp++;
 
 	/* ============================================================
@@ -3892,6 +3981,11 @@ static void rds_generate_group(rds_encoder_t *rds)
 			rds->paging.scan_grp = 0;
 			rds->paging.scan_last_key = 0;
 			rds->paging.scan_last_0a = 0xffffffff;
+			/* 4A is the first marker of interval 0 */
+			rds->paging.scan_interval = 0;
+			rds->paging.scan_n = 1;
+			if (rds->paging.enabled)
+				rds_paging_marker(&rds->paging);
 			rds->group_sequence++;
 			rds->group_bit_pos = 0;
 			if (rds->debug)
@@ -3906,7 +4000,13 @@ static void rds_generate_group(rds_encoder_t *rds)
 	 * Transmit ONLY Group 0 (PS + PI) to help receivers acquire quickly. */
 	if (rds->warmup_countdown > 0) {
 		rds->warmup_countdown--;
-		if (rds->use_0b)
+		/* paging: the 1A interval layout continues during warmup */
+		if (rds->paging.enabled && rds_paging_1a_slot(&rds->paging)) {
+			rds_build_group_1a(rds, rds->group_buffer);
+		} else if (rds->paging.enabled && rds->paging.pending_13a) {
+			rds->paging.pending_13a--;
+			rds_build_group_13a_paging(rds, rds->group_buffer);
+		} else if (rds->use_0b)
 			rds_build_group_0b(rds, rds->group_buffer);
 		else
 			rds_build_group_0a(rds, rds->group_buffer);
@@ -3939,25 +4039,41 @@ static void rds_generate_group(rds_encoder_t *rds)
 	 * 0A (PS) RDS_PAGING_0A_PER_SEC times per second (EN 50067 3.1.3: four
 	 * 0A per second for PS), 7A otherwise. A 1A slot has priority; a 0A that
 	 * meets a 1A follows in the next group. */
+	int keep_sched_index = 0;
+
+	/* Normal paging schedule: 1A only from the paging clock, inserted
+	 * over the cyclic schedule (EN 50067 3.1.5.2 / M.2.1.3: 1A regularly
+	 * once per second in the interval layout). The cyclic group is sent
+	 * next; a cyclic 1A/1B slot would add a 1A outside the layout and
+	 * shift the 1A count of the interval, so it is sent as 0A/0B. */
+	if (rds->paging.enabled && !RDS_PAGING_TIMED(&rds->paging)) {
+		if (rds_paging_1a_slot(&rds->paging)) {
+			type = RDS_GROUP_1A;
+			keep_sched_index = 1;
+		} else if (rds->paging.pending_13a) {
+			/* 13A right after the first marker (M.3.4.1.1) */
+			rds->paging.pending_13a--;
+			type = RDS_GROUP_13A;
+			keep_sched_index = 1;
+		} else if (type == RDS_GROUP_1A || type == RDS_GROUP_1B) {
+			type = rds->use_0b ? RDS_GROUP_0B : RDS_GROUP_0A;
+		}
+	}
+
 	if (RDS_PAGING_TIMED(&rds->paging)) {
 		rds_paging_enc_t *pag = &rds->paging;
 		uint64_t ms = (uint64_t)pag->scan_grp * RDS_PAGING_GROUP_US / 1000;
-		uint32_t interval, pos, slot, key, key_0a;
+		uint32_t key_0a;
 
 		if (ms > 59999)
 			ms = 59999;
-		interval = ms / 6000;
-		pos = ms % 6000;
-		/* slot 0 at 0 ms, slot 1 at 1000 ms (2nd marker), then
-		 * RDS_PAGING_SCAN_SLOTS equally spaced slots up to 6000 ms */
-		slot = (pos < 1000) ? 0 : 1 + (pos - 1000) * RDS_PAGING_SCAN_SLOTS / 5000;
-		key = interval * 16 + slot;
 		key_0a = (uint32_t)(ms * RDS_PAGING_0A_PER_SEC / 1000);
-		if (key != pag->scan_last_key) {
-			pag->scan_last_key = key;
-			pag->scan_interval = interval;
-			pag->scan_n = (slot < 5) ? slot + 1 : 6;
+		if (rds_paging_1a_slot(pag)) {
 			type = RDS_GROUP_1A;
+		} else if (pag->pending_13a) {
+			/* 13A right after the first marker (M.3.4.1.1) */
+			pag->pending_13a--;
+			type = RDS_GROUP_13A;
 		} else if (key_0a != pag->scan_last_0a) {
 			pag->scan_last_0a = key_0a;
 			type = rds->use_0b ? RDS_GROUP_0B : RDS_GROUP_0A;
@@ -4160,8 +4276,9 @@ static void rds_generate_group(rds_encoder_t *rds)
 	}
 
 	
-	/* Advance index */
-	rds->group_sched_index++;
+	/* Advance index (not for an inserted paging 1A: the cyclic group follows) */
+	if (!keep_sched_index)
+		rds->group_sched_index++;
 	if (rds->group_sched_index >= rds->group_sched_len) {
 		rds->group_sched_index = 0;
 	}
