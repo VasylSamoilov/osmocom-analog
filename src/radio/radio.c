@@ -912,12 +912,34 @@ static const rds_preset_t rds_presets[] = {
 		.af_method_a_str = "91.0, 95.5, 102.3, 88.1, 106.7",
 		/* .af_method_a_str = "91.0, 95.5, 102.3, LF225, MF1008", */
 	},
+	/* ============================================================
+	 * Paging: only what EN 50067 requires of a station plus radio
+	 * paging. Selected for --rds-paging-scan (must stay last, see
+	 * RDS_PRESET_PAGING).
+	 *  - PI/PTY/TP in every group; PI from --pi, PTY 0 (none), TP 0
+	 *  - PS in type 0 groups (3.1.3); no AF, so 0B (3.1.5.1)
+	 *  - ECC from --rds-ecc in 1A (Annex D), 1A forced (paging codes)
+	 *  - no LIC, no PIN, no RT/PTYN/EON/ODA: 1A is variant 2 with
+	 *    ECC in block 4 (M.3.2.5.2.1)
+	 * ============================================================ */
+	{
+		.name     = "Paging",
+		.pi       = 0x6ACE,	/* placeholder, --pi overrides */
+		.ps       = "PAGING  ",
+		.pty      = 0,
+		.tp       = 0,
+		.ms       = 0,
+		.group1_version = RDS_GROUP_VERSION_A,
+	},
 	/* End of presets */
 };
 
 #define RDS_PRESET_COUNT (sizeof(rds_presets) / sizeof(rds_presets[0]))
+#define RDS_PRESET_PAGING (RDS_PRESET_COUNT - 1)
 
 static int rds_current_preset = 0;
+static int rds_use_paging_preset = 0;	/* start with the paging preset */
+static uint8_t rds_user_ecc = 0;	/* --rds-ecc, overrides the preset ECC (0 = not set) */
 
 /* Additional settings not in presets (common to all) */
 static uint8_t rds_ta        = 0;		/* Traffic Announcement */
@@ -997,8 +1019,10 @@ static void rds_apply_preset(radio_t *radio)
 	/* Update DI stereo flag based on broadcast mode (-S flag) */
 	enc->di_stereo = radio->stereo ? 1 : 0;
 	
-	/* Update country codes using API */
-	if (p->ecc != 0) {
+	/* Update country codes using API (--rds-ecc overrides the preset) */
+	if (rds_user_ecc != 0) {
+		rds_enc_set_ecc(enc, rds_user_ecc);
+	} else if (p->ecc != 0) {
 		rds_enc_set_ecc(enc, p->ecc);
 	} else {
 		rds_enc_clear_ecc(enc);
@@ -1107,8 +1131,10 @@ static void rds_apply_preset(radio_t *radio)
 		enc->use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
 	
 	/* Group 1: 1A (ECC/Lang/PIN) vs 1B (PIN only) */
-	if (p->group1_version == RDS_GROUP_VERSION_AUTO)
-		enc->use_1b = (p->ecc == 0 && p->lang == 0);  /* No ECC/Lang -> 1B */
+	if (enc->paging.enabled)
+		enc->use_1b = 0;  /* radio paging codes are only in 1A */
+	else if (p->group1_version == RDS_GROUP_VERSION_AUTO)
+		enc->use_1b = (enc->ecc == 0 && p->lang == 0);  /* No ECC/Lang -> 1B */
 	else
 		enc->use_1b = (p->group1_version == RDS_GROUP_VERSION_B);
 	
@@ -1800,7 +1826,10 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			/* Select preset based on emphasis (heuristic for region):
 			 * 75us -> Americas (RBDS) - preset 1
 			 * 50us and others -> Europe/World (RDS) - preset 0 */
-			if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
+			if (rds_use_paging_preset) {
+				rds_current_preset = RDS_PRESET_PAGING;
+				LOGP(DRADIO, LOGL_INFO, "RDS: using paging preset\n");
+			} else if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
 				rds_current_preset = 1;  /* USA/RBDS (75us) */
 				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fus detected: using RBDS (Americas) preset\n", time_constant_us);
 			} else {
@@ -3452,5 +3481,17 @@ void radio_set_callsign(const char *callsign)
 void radio_set_pi(uint16_t pi)
 {
 	rds_user_pi = pi;
+}
+
+/* ECC that overrides the preset ECC, also when presets are switched */
+void radio_set_ecc(uint8_t ecc)
+{
+	rds_user_ecc = ecc;
+}
+
+/* Start with the paging preset instead of the emphasis-selected one */
+void radio_set_paging_preset(int enable)
+{
+	rds_use_paging_preset = enable ? 1 : 0;
 }
 

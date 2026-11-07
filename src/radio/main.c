@@ -532,6 +532,9 @@ static void print_help(const char *arg0)
 	printf("        interval, 1A #1/#2 one second apart, interval sync bits in B1/B0),\n");
 	printf("        0A four per second for PS (EN 50067 3.1.3) and 7A for the rest.\n");
 	printf("        Clock-time (4A) is forced on. The FIFO stays usable.\n");
+	printf("        Starts with the \"Paging\" RDS preset: PS \"PAGING\", PTY 0, TP 0,\n");
+	printf("        no AF, LIC, PIN, RT or other services; PI from --pi, ECC from\n");
+	printf("        --rds-ecc. 'f' still cycles through the other presets.\n");
 	printf("    --rds-paging-scan-type numeric | alpha | tone\n");
 	printf("        Message type for the scan (default numeric, 10 digit; alpha sends\n");
 	printf("        the address as text; tone sends a tone-only page).\n");
@@ -931,6 +934,7 @@ static int handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		}
 		rds_ecc = (uint8_t)v;
+		radio_set_ecc(rds_ecc);	/* overrides the preset ECC, also on preset change */
 		rds = 1;  /* auto-enable RDS */
 		break;
 	}
@@ -946,6 +950,7 @@ static int handle_options(int short_option, int argi, char **argv)
 		rds_paging_scan = 1;
 		rds_paging_scan_from = from;
 		rds_paging_scan_to = to;
+		radio_set_paging_preset(1);
 		break;
 	}
 	case OPT_RDS_PAGING_SCAN_TYPE:
@@ -1603,13 +1608,6 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to open TX bitstream input file, exitting!\n");
 			exit(0);
 		}
-	}
-
-	/* ECC in 1A variant 0. Paging needs 1A, not 1B (RPC is in 1A block 2). */
-	if (rds_ecc && tx) {
-		if (rds_paging)
-			radio.rds_enc.use_1b = 0;
-		rds_enc_set_ecc(&radio.rds_enc, rds_ecc);
 	}
 
 	/* Enable RDS paging if requested */

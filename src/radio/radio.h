@@ -196,4 +196,6 @@ double radio_afc_get_freq_error(radio_t *radio);
 
 void radio_set_callsign(const char *callsign);
 void radio_set_pi(uint16_t pi);
+void radio_set_ecc(uint8_t ecc);
+void radio_set_paging_preset(int enable);
 void radio_set_polyphase(int enable);
