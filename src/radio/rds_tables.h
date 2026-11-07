@@ -55,7 +55,7 @@ const char *rds_get_ecc_country_name(int index);
 const char *rds_get_ecc_name(uint8_t ecc);
 
 /* Check if ECC value is defined in EN 50067 Table D.1 / Annex N.
- * Valid: E0-E4 (Europe), A0-A5 (Americas), D0-D3 (Africa), F0-F2 (Asia/Pacific).
+ * Valid: E0-E4 (Europe), A0-A6 (Americas), D0-D3 (Africa), F0-F2 (Asia/Pacific).
  * Returns 1 if valid, 0 if not defined. */
 int rds_is_valid_ecc(uint8_t ecc);
 

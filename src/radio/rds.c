@@ -9946,7 +9946,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				rds->ecc_status = rds->block_status[2];
 				{
 					uint8_t opc_val = (payload >> 8) & 0x0F;
-					/* EN 50067 Table D.1: Valid ECCs are E0-E4, A0-A5, D0-D3, F0-F2.
+					/* EN 50067 Table D.1: Valid ECCs are E0-E4, A0-A6, D0-D3, F0-F2.
 					 * Any other value is not defined in the standard. */
 					if (!rds_is_valid_ecc(rds->ecc) && rds->verbose)
 						LOGP(DRADIO, LOGL_INFO, "RDS 1A: ECC=0x%02X -- "

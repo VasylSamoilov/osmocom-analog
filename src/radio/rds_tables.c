@@ -513,8 +513,8 @@ typedef struct {
 } ecc_country_t;
 
 static const ecc_country_t country_table[] = {
-	/* ECC 0xE0: Europe 1 */
-	{ 0xE0, { "DE", "DZ", "AD", "IL", "IT", "BE", "RU", "PS", "AL", "AT", "HU", "MT", "DE", "--", "EG" }},
+	/* ECC 0xE0: Europe 1 (ES = Canary Islands: EN 50067 Annex N.1) */
+	{ 0xE0, { "DE", "DZ", "AD", "IL", "IT", "BE", "RU", "PS", "AL", "AT", "HU", "MT", "DE", "ES", "EG" }},
 	/* ECC 0xE1: Europe 2 */
 	{ 0xE1, { "GR", "CY", "SM", "CH", "JO", "FI", "LU", "BG", "DK", "GI", "IQ", "GB", "LY", "RO", "FR" }},
 	/* ECC 0xE2: Europe 3 */
@@ -527,6 +527,21 @@ static const ecc_country_t country_table[] = {
 	{ 0xA0, { "US", "US", "US", "US", "US", "US", "US", "US", "US", "US", "US", "--", "US", "US", "--" }},
 	/* ECC 0xA1: Americas - Canada */
 	{ 0xA1, { "--", "--", "--", "--", "--", "--", "--", "--", "--", "--", "CA", "CA", "CA", "CA", "GL" }},
+	/* ECC 0xA2-0xA6: Americas (EN 50067 Annex N.3). A5/F is listed for
+	 * both Mexico and Virgin Islands [British]; MX is used, Mexican
+	 * stations use PI Fxxx (NRSC-4-B D.7). */
+	{ 0xA2, { "AI", "AG", "EC", "FK", "BB", "BZ", "KY", "CR", "CU", "AR", "BR", "BM", "AN", "GP", "BS" }},
+	{ 0xA3, { "BO", "CO", "JM", "MQ", "GF", "PY", "NI", "--", "PA", "DM", "DO", "CL", "GD", "TC", "GY" }},
+	{ 0xA4, { "GT", "HN", "AW", "--", "MS", "TT", "PE", "SR", "UY", "KN", "LC", "SV", "HT", "VE", "--" }},
+	{ 0xA5, { "--", "--", "--", "--", "--", "--", "--", "--", "--", "--", "MX", "VC", "MX", "MX", "MX" }},
+	{ 0xA6, { "--", "--", "--", "--", "--", "--", "--", "--", "--", "--", "--", "--", "--", "--", "PM" }},
+	/* ECC 0xD0-0xD3: Africa (EN 50067 Annex N.1). Ascension Island (D1/A),
+	 * Cabinda (D3/4) and Zanzibar (D2/D) have no ISO code in the standard;
+	 * Gabon (D0/8) has none listed, GA is used. ZR as listed (now CD). */
+	{ 0xD0, { "CM", "CF", "DJ", "MG", "ML", "AO", "GQ", "GA", "GN", "ZA", "BF", "CG", "TG", "BJ", "MW" }},
+	{ 0xD1, { "NA", "LR", "GH", "MR", "ST", "CV", "SN", "GM", "BI", "--", "BW", "KM", "TZ", "ET", "NG" }},
+	{ 0xD2, { "SL", "ZW", "MZ", "UG", "SZ", "KE", "SO", "NE", "TD", "GW", "ZR", "CI", "--", "ZM", "--" }},
+	{ 0xD3, { "--", "--", "EH", "--", "RW", "LS", "--", "SC", "--", "MU", "--", "SD", "--", "--", "--" }},
 	/* ECC 0xF0: Asia/Pacific 1 */
 	{ 0xF0, { "AU", "AU", "AU", "AU", "AU", "AU", "AU", "AU", "SA", "AF", "MM", "CN", "KP", "BH", "MY" }},
 	/* ECC 0xF1: Asia/Pacific 2 */
@@ -886,7 +901,7 @@ typedef struct {
 	const char *name;
 } ecc_name_t;
 
-/* EN 50067 Table D.1 / Annex N: Valid ECCs are E0-E4, A0-A5, D0-D3, F0-F2.
+/* EN 50067 Table D.1 / Annex N: Valid ECCs are E0-E4, A0-A6, D0-D3, F0-F2.
  * Any other value (including 0x00) is not defined in the standard. */
 static const ecc_name_t ecc_names[] = {
 	/* European ECCs (EN 50067 Table D.1) */
@@ -902,6 +917,7 @@ static const ecc_name_t ecc_names[] = {
 	{ 0xA3, "Americas - Caribbean/Central" },
 	{ 0xA4, "Americas - Central/South" },
 	{ 0xA5, "Americas - Mexico" },
+	{ 0xA6, "Americas - St Pierre and Miquelon" },
 	/* African ECCs (EN 50067 Annex N) */
 	{ 0xD0, "Africa 1" },
 	{ 0xD1, "Africa 2" },
