@@ -121,6 +121,10 @@ static int rds_paging_rpc = 4;  /* Default RPC=4: group desig 001, batt sync 00 
 static uint16_t rds_paging_cc = 0;   /* E.212 MCC for international (0=not set) */
 static uint8_t rds_paging_opc = 0;   /* OPC for international (0=not set) */
 static uint8_t rds_paging_pac = 0;   /* PAC for paging area (0=all areas) */
+static int rds_paging_scan = 0;      /* address range scan enabled */
+static uint32_t rds_paging_scan_from = 0;
+static uint32_t rds_paging_scan_to = 0;
+static int rds_paging_scan_type = 1; /* enum rds_paging_msg_type: NUM10 */
 static const char *rds_hexrds_file = NULL;
 static const char *rds_bitstream_file = NULL;
 static const char *rds_tx_hexrds_file = NULL;
@@ -493,6 +497,19 @@ static void print_help(const char *arg0)
 	printf("        PAC = Paging Area Code (0-63). Network-wide area filter broadcast\n");
 	printf("        in Group 1A variant 2. Pagers outside this area ignore messages.\n");
 	printf("        0 = all areas (default, recommended for single-transmitter setups).\n");
+	printf("    --rds-paging-scan <from> <to>\n");
+	printf("        Scan through the given paging address range (0-999999) with one\n");
+	printf("        message per address. The message carries the 6-digit address, so\n");
+	printf("        you can tell which address a pager responded to. Requires\n");
+	printf("        --rds-paging; the RPC must cover the scanned group codes (default\n");
+	printf("        RPC 4 covers 00-99). The group schedule is reduced to what paging\n");
+	printf("        needs: 4A each minute, 1A at the battery saving interval layout\n");
+	printf("        of EN 50067 M.2.1.3 (13 per 6 s interval, 1A #1/#2 one second\n");
+	printf("        apart, interval sync bits in B1/B0) and 7A for everything else.\n");
+	printf("        Clock-time (4A) is forced on. The FIFO stays usable.\n");
+	printf("    --rds-paging-scan-type numeric | alpha | tone\n");
+	printf("        Message type for the scan (default numeric, 10 digit; alpha sends\n");
+	printf("        the address as text; tone sends a tone-only page).\n");
 	printf("    --rds-hexrds-file <filename>\n");
 	printf("        Write received RDS groups to file in hexrds format.\n");
 	printf("        Format: \"XXXX XXXX XXXX XXXX\" per line (---- for missing blocks).\n");
@@ -625,6 +642,8 @@ static double afc_max_hz = 5000.0;
 #define OPT_RDS_PAGING_OPC	1123
 #define OPT_RDS_PAGING_PAC	1124
 #define OPT_FM_COMPANDOR	1125
+#define OPT_RDS_PAGING_SCAN	1128
+#define OPT_RDS_PAGING_SCAN_TYPE 1129
 
 static void add_options(void)
 {
@@ -666,6 +685,8 @@ static void add_options(void)
 	option_add(OPT_RDS_PAGING_CC, "rds-paging-cc", 1);
 	option_add(OPT_RDS_PAGING_OPC, "rds-paging-opc", 1);
 	option_add(OPT_RDS_PAGING_PAC, "rds-paging-pac", 1);
+	option_add(OPT_RDS_PAGING_SCAN, "rds-paging-scan", 2);
+	option_add(OPT_RDS_PAGING_SCAN_TYPE, "rds-paging-scan-type", 1);
 	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
 	option_add(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1);
 	option_add(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1);
@@ -858,6 +879,32 @@ static int handle_options(int short_option, int argi, char **argv)
 		rds_paging_pac = (uint8_t)atoi(argv[argi]);
 		if (rds_paging_pac > 63) {
 			fprintf(stderr, "Invalid PAC %d (must be 0-63), use '-h' for help!\n", rds_paging_pac);
+			return -EINVAL;
+		}
+		break;
+	case OPT_RDS_PAGING_SCAN: {
+		long from = atol(argv[argi++]);
+		long to = atol(argv[argi++]);
+
+		if (from < 0 || to < from || to > RDS_PAGING_ADDR_MAX) {
+			fprintf(stderr, "Invalid paging scan range %ld-%ld (must be 0-%d, from <= to), use '-h' for help!\n",
+				from, to, RDS_PAGING_ADDR_MAX);
+			return -EINVAL;
+		}
+		rds_paging_scan = 1;
+		rds_paging_scan_from = from;
+		rds_paging_scan_to = to;
+		break;
+	}
+	case OPT_RDS_PAGING_SCAN_TYPE:
+		if (!strcasecmp(argv[argi], "numeric"))
+			rds_paging_scan_type = RDS_PAGING_NUM10;
+		else if (!strcasecmp(argv[argi], "alpha"))
+			rds_paging_scan_type = RDS_PAGING_ALPHA;
+		else if (!strcasecmp(argv[argi], "tone"))
+			rds_paging_scan_type = RDS_PAGING_TONE;
+		else {
+			fprintf(stderr, "Invalid paging scan type '%s' (numeric, alpha or tone), use '-h' for help!\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
@@ -1538,6 +1585,25 @@ int main(int argc, char *argv[])
 				printf(", pipe: %s\n", rds_paging_pipe_path);
 			}
 		}
+	}
+
+	if (rds_paging_scan) {
+		if (!rds_paging) {
+			fprintf(stderr, "--rds-paging-scan requires --rds-paging, use '-h' for help!\n");
+			exit(0);
+		}
+		if (!tx) {
+			fprintf(stderr, "--rds-paging-scan requires --tx, use '-h' for help!\n");
+			exit(0);
+		}
+		rc = rds_enc_paging_scan_start(&radio.rds_enc, rds_paging_scan_from, rds_paging_scan_to,
+					       (enum rds_paging_msg_type)rds_paging_scan_type);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to start paging scan\n");
+			exit(0);
+		}
+		printf("RDS Paging scan: addresses %06u-%06u\n",
+		       (unsigned)rds_paging_scan_from, (unsigned)rds_paging_scan_to);
 	}
 
 	/* Initialize protocol servers */

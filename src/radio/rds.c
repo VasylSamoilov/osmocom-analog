@@ -1069,6 +1069,63 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 	pag->tx_active = 0;
 }
 
+/* per-message TX logs drop to INFO during a scan; the 60 s progress line stays at NOTICE */
+#define RDS_PAGING_TX_LOGL(pag)	((pag)->scan_active ? LOGL_INFO : LOGL_NOTICE)
+
+#define RDS_PAGING_SCAN_QUEUE	(RDS_PAGING_QUEUE_MAX / 2) /* kept queued during a scan, rest is free for the FIFO */
+
+/* Keep the queue filled from the scan range; end the scan when the last
+ * address has been transmitted. The address is carried in the payload
+ * (6 digits) so the pager that responded can be identified. */
+static void rds_paging_scan_service(rds_encoder_t *rds)
+{
+	rds_paging_enc_t *pag = &rds->paging;
+
+	if (!pag->scan_active)
+		return;
+
+	while (pag->queue_count < RDS_PAGING_SCAN_QUEUE && pag->scan_next < pag->scan_end) {
+		char text[8] = "";
+		int len = 0;
+		rds_paging_msg_t *msg;
+
+		if (pag->scan_type != RDS_PAGING_TONE)
+			len = snprintf(text, sizeof(text), "%06u", (unsigned)pag->scan_next);
+		msg = rds_paging_msg_alloc(pag->scan_type, pag->scan_next, text, len, 0, 0);
+		if (!msg)
+			break;
+		rds_paging_enqueue(pag, msg);
+		pag->scan_next++;
+	}
+
+	/* Progress every 60 s: addresses completed (not merely queued) */
+	{
+		time_t now = time(NULL);
+
+		if (now - pag->scan_log_time >= 60) {
+			uint32_t total = pag->scan_end - pag->scan_from;
+			uint32_t done = pag->scan_next - pag->scan_from;
+			double elapsed = difftime(now, pag->scan_start_time);
+			double rate, eta;
+
+			done = (done > (uint32_t)pag->queue_count) ? done - pag->queue_count : 0;
+			rate = (elapsed > 0) ? done / elapsed : 0;
+			eta = (rate > 0) ? (total - done) / rate : 0;
+			pag->scan_log_time = now;
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: %u of %u addresses sent (%.1f%%), next %06u, %.2f addr/s, ETA %uh%02um\n",
+			     (unsigned)done, (unsigned)total, 100.0 * done / total,
+			     (unsigned)(pag->scan_from + done), rate,
+			     (unsigned)(eta / 3600), (unsigned)(eta / 60) % 60);
+		}
+	}
+
+	if (pag->scan_next >= pag->scan_end && !pag->queue_head && !pag->tx_active && !pag->tx_msg) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: complete\n");
+		pag->scan_active = 0;
+		rds_enc_scheduler_update(rds);
+	}
+}
+
 /* Try to start transmitting the next queued message */
 static void rds_paging_start_next(rds_encoder_t *rds)
 {
@@ -1084,6 +1141,8 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 		free(pag->tx_msg);
 		pag->tx_msg = NULL;
 	}
+
+	rds_paging_scan_service(rds);
 
 	/* Find next ready message */
 	while ((msg = pag->queue_head) != NULL) {
@@ -1103,14 +1162,14 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 
 			rds_paging_precompute(pag, msg);
 			if (msg->type == RDS_PAGING_TONE)
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX: %s addr=%02u-%04u grp=%d flag=%s tone=%d tx=%s cnt=%d repeat=%d/%d\n",
+				LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX: %s addr=%02u-%04u grp=%d flag=%s tone=%d tx=%s cnt=%d repeat=%d/%d\n",
 				     rds_paging_type_name(msg->type),
 				     msg->address / 10000, msg->address % 10000,
 				     pag->tx_total_groups, PAG_AB(pag->ab_flag),
 				     msg->tonetype, PAG_R(msg->is_repeat), msg->call_counter,
 				     msg->repeats_left + 1, msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left));
 			else {
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX: %s addr=%02u-%04u len=%d grp=%d flag=%s %s tx=%s cnt=%d repeat=%d/%d msg=\"%.*s\"\n",
+				LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX: %s addr=%02u-%04u len=%d grp=%d flag=%s %s tx=%s cnt=%d repeat=%d/%d msg=\"%.*s\"\n",
 				     rds_paging_type_name(msg->type),
 				     msg->address / 10000, msg->address % 10000,
 				     msg->data_len, pag->tx_total_groups, PAG_AB(pag->ab_flag),
@@ -1119,7 +1178,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 				     msg->data_len, msg->data);
 				if (msg->ni && msg->country_code) {
 					const char *cname = mcc_name(msg->country_code);
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX:   international: MCC=%d (%s) OPC=%d\n",
+					LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX:   international: MCC=%d (%s) OPC=%d\n",
 					     msg->country_code, cname ? cname : "unknown", msg->opc);
 				}
 			}
@@ -1364,12 +1423,54 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 	return 0;
 }
 
+/* Public API: scan addresses from..to (inclusive) with one message each.
+ * type: RDS_PAGING_TONE, RDS_PAGING_NUM10 or RDS_PAGING_ALPHA. */
+int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
+			      enum rds_paging_msg_type type)
+{
+	rds_paging_enc_t *pag = &rds->paging;
+
+	if (!pag->enabled || from > to || to > RDS_PAGING_ADDR_MAX)
+		return -1;
+	if (type != RDS_PAGING_TONE && type != RDS_PAGING_NUM10 && type != RDS_PAGING_ALPHA)
+		return -1;
+
+	pag->scan_from = from;
+	pag->scan_next = from;
+	pag->scan_end = to + 1;
+	pag->scan_start_time = time(NULL);
+	pag->scan_log_time = pag->scan_start_time;
+	pag->scan_type = type;
+	pag->scan_active = 1;
+	/* pagers need the 4A minute marker for interval sync */
+	rds_enc_set_ct_enabled(rds, 1);
+	{
+		/* start the group clock at the current second of the minute and
+		 * skip the immediate startup 4A; the next 4A is the real minute edge */
+		struct timespec ts;
+		time_t now;
+		uint64_t ms;
+
+		clock_gettime(CLOCK_REALTIME, &ts);
+		now = ts.tv_sec + rds->ct_correction;
+		ms = (uint64_t)(now % 60) * 1000 + ts.tv_nsec / 1000000;
+		pag->scan_grp = ms * 1000 / RDS_PAGING_GROUP_US;
+		pag->scan_last_key = 0xffffffff;
+		rds->last_ct_minute = now;
+	}
+	rds_enc_scheduler_update(rds);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
 /* Public API: enable/disable paging */
 void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enabled = enable;
-	if (!enable)
+	if (!enable) {
+		rds->paging.scan_active = 0;
 		rds_paging_queue_destroy(&rds->paging);
+	}
 	rds_enc_scheduler_update(rds);
 }
 
@@ -1848,16 +1949,52 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
  *
  *   Most receivers only implement Group 1A PIN and ignore Group 14A PIN entirely.
  */
+/* Battery saving interval sync bits B1/B0 of a paging 1A group
+ * (EN 50067 M.2.1.3). Each minute has ten 6 s intervals I0..I9; k is the
+ * number of this 1A in its interval:
+ *   k:  1  2  3  4  5  6+ (excessive 1A groups)
+ *   B1: 1  1  0  0  0  0
+ *   B0: 0  J3 J2 J1 J0 1     (J3..J0 = BCD interval number)
+ * In I0 the 1A with k=1 is replaced by the 4A group. k and the interval
+ * are set by the scan group scheduler. Returns B1B0 and k. */
+static uint8_t rds_paging_1a_sync(const rds_encoder_t *rds, int *k_out)
+{
+	unsigned interval = rds->paging.scan_interval;
+	int k = rds->paging.scan_n;
+	uint8_t b1, b0;
+
+	switch (k) {
+	case 1:  b1 = 1; b0 = 0; break;
+	case 2:  b1 = 1; b0 = (interval >> 3) & 1; break;
+	case 3:  b1 = 0; b0 = (interval >> 2) & 1; break;
+	case 4:  b1 = 0; b0 = (interval >> 1) & 1; break;
+	case 5:  b1 = 0; b0 = interval & 1; break;
+	default: b1 = 0; b0 = 1; break;
+	}
+	*k_out = k;
+	return (uint8_t)((b1 << 1) | b0);
+}
+
 static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 {
 	uint32_t blocks[4] = {0};
 	uint16_t b2, b3, b4;
+	uint8_t rpc = rds->paging.rpc & 0x1F;
+	int sync_k = 0;
 	
 	/* Build dynamic SLC variant sequence from shared API */
 	int slc_variants[RDS_1A_VARIANT_MAX];
 	int slc_variant_count = rds_enc_get_slc_variants(rds, slc_variants, RDS_1A_VARIANT_MAX);
 	
 	int variant = slc_variants[rds->slc_variant % slc_variant_count];
+
+	/* Paging scan: interval sync bits replace the static sync field and
+	 * the first 1A of an interval carries variant 0 (M.3.2.5.2.3). */
+	if (rds->paging.enabled && rds->paging.scan_active) {
+		rpc = (rpc & 0x1C) | rds_paging_1a_sync(rds, &sync_k);
+		if (sync_k <= 2)
+			variant = RDS_1A_VARIANT_ECC;
+	}
 	
 	/* Block A: PI */
 	blocks[0] = rds_build_block(rds->pi, RDS_OFFSET_A);
@@ -1870,7 +2007,7 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT);
 	if (rds->paging.enabled)
-		b2 |= (rds->paging.rpc & 0x1F);
+		b2 |= rpc;
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 	
 	/* Block C: LA + Variant + Payload (IEC 62106 Table 9)
@@ -3073,7 +3210,7 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 	if (pag->tx_group_idx >= pag->tx_total_groups) {
 		/* Message transmission complete */
 		pag->tx_active = 0;
-		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging TX: %s addr=%02u-%04u complete (%d grp)\n",
+		LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX: %s addr=%02u-%04u complete (%d grp)\n",
 		     rds_paging_type_name(pag->tx_msg->type),
 		     pag->tx_msg->address / 10000, pag->tx_msg->address % 10000,
 		     pag->tx_total_groups);
@@ -3250,6 +3387,16 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 			rds->group_sched_buffer[rds->group_sched_len++] = (g); \
 	} while(0)
 	
+	/* Address scan: only the announcement EN 50067 M.4 requires for basic
+	 * paging (one 1A per second, 4A at each minute is a separate interrupt)
+	 * and all remaining groups carry paging. */
+	if (rds->paging.enabled && rds->paging.scan_active) {
+		/* 1A slots are inserted by rds_generate_group() */
+		ADD_GRP(RDS_GROUP_7A);
+		LOGP(DRADIO, LOGL_INFO, "RDS Scheduler: paging scan, 7A + 13 x 1A per 6 s interval\n");
+		return;
+	}
+
 	/* 
 	 * BUILD SEQUENCE
 	 * Pattern based on Pira.cz and 2wcom recommendations for "Full Features"
@@ -3464,6 +3611,9 @@ static void rds_build_group_15a(rds_encoder_t *rds, uint8_t *group);
 
 static void rds_generate_group(rds_encoder_t *rds)
 {
+	if (rds->paging.enabled && rds->paging.scan_active)
+		rds->paging.scan_grp++;
+
 	/* ============================================================
 	 * PRIORITY 0: TX File Input (bypasses ALL other generation)
 	 * ============================================================
@@ -3533,6 +3683,10 @@ static void rds_generate_group(rds_encoder_t *rds)
 		if (t_now_buf.tm_min != t_last_buf.tm_min) {
 			rds_build_group_4a(rds, rds->group_buffer);
 			rds->last_ct_minute = now;
+			/* 4A is the first marker of interval 0 and anchors the
+			 * paging scan group clock */
+			rds->paging.scan_grp = 0;
+			rds->paging.scan_last_key = 0;
 			rds->group_sequence++;
 			rds->group_bit_pos = 0;
 			if (rds->debug)
@@ -3575,6 +3729,30 @@ static void rds_generate_group(rds_encoder_t *rds)
 	
 	/* Get next group from sequence */
 	enum rds_group_type type = rds->group_sched_buffer[rds->group_sched_index];
+
+	/* Paging scan: 1A at the slots of the interval layout, 7A otherwise. */
+	if (rds->paging.enabled && rds->paging.scan_active) {
+		rds_paging_enc_t *pag = &rds->paging;
+		uint64_t ms = (uint64_t)pag->scan_grp * RDS_PAGING_GROUP_US / 1000;
+		uint32_t interval, pos, slot, key;
+
+		if (ms > 59999)
+			ms = 59999;
+		interval = ms / 6000;
+		pos = ms % 6000;
+		/* slot 0 at 0 ms, slot 1 at 1000 ms (2nd marker), then
+		 * RDS_PAGING_SCAN_SLOTS equally spaced slots up to 6000 ms */
+		slot = (pos < 1000) ? 0 : 1 + (pos - 1000) * RDS_PAGING_SCAN_SLOTS / 5000;
+		key = interval * 16 + slot;
+		if (key != pag->scan_last_key) {
+			pag->scan_last_key = key;
+			pag->scan_interval = interval;
+			pag->scan_n = (slot < 5) ? slot + 1 : 6;
+			type = RDS_GROUP_1A;
+		} else {
+			type = RDS_GROUP_7A;
+		}
+	}
 
 	switch (type) {
 	case RDS_GROUP_0A:
