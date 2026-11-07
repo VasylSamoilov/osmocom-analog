@@ -705,7 +705,7 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_VNUM_MAX     160     /* Maximum variable-length numeric digits */
 #define RDS_PAGING_VNUM_PER_GROUP 8     /* BCD digits per vnum data group */
 #define RDS_PAGING_MAX_GROUPS   22      /* Max groups for 80-char alpha */
-#define RDS_PAGING_QUEUE_MAX    64      /* Maximum queued messages */
+#define RDS_PAGING_QUEUE_MAX    256     /* Maximum queued messages */
 #define RDS_PAGING_DEFAULT_REPEATS   1  /* Default repeat count (1 = send once) */
 #define RDS_PAGING_DEFAULT_INTERVAL  5  /* Default repeat interval (seconds) */
 #define RDS_PAGING_DEFAULT_TIMEOUT  30  /* Default reassembly timeout (seconds) */
@@ -1511,6 +1511,8 @@ typedef struct rds_paging_msg {
 	/* International paging (EN 50067 M.3.5.7) */
 	uint16_t	country_code;	/* E.212 MCC, 3 BCD digits (e.g. 255=Ukraine) */
 	uint8_t		opc;		/* Operator Code, 4 bits (1-15, 0=not set) */
+	uint8_t		defer_logged;	/* deferral to its interval window was logged */
+	uint8_t		ngroups;	/* groups on air, 0 = not computed yet */
 } rds_paging_msg_t;
 
 /* Paging encoder state - embedded in rds_encoder_t */
@@ -1573,6 +1575,13 @@ typedef struct rds_paging_enc {
 	uint8_t		scan_n;			/* 1A number in interval: 1, 2 .. 5, 6 = excess */
 	uint8_t		scan_interval;		/* interval number 0-9 of the current 1A */
 	enum rds_paging_msg_type scan_type;	/* TONE, NUM10 or ALPHA */
+	int		scan_alpha_chars;	/* alpha payload: 4 (one data group) or 6 */
+
+	/* Battery saving (EN 50067 M.2.1.3): the group clock drives the 1A
+	 * interval sync bits and calls are only started inside the window of
+	 * their address (last digit d: intervals d, d+1, d+2). */
+	int		battery_saving;
+	unsigned long	bs_deferred;		/* calls held back for their window */
 } rds_paging_enc_t;
 
 /* Paging decoder state - embedded in rds_decoder_t */
@@ -2404,6 +2413,7 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 /* Configuration -- encoder setters */
 int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
 			      enum rds_paging_msg_type type);
+void rds_enc_paging_set_battery_saving(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
 void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable);

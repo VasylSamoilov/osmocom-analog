@@ -121,6 +121,7 @@ static int rds_paging_rpc = 4;  /* Default RPC=4: group desig 001, batt sync 00 
 static uint16_t rds_paging_cc = 0;   /* E.212 MCC for international (0=not set) */
 static uint8_t rds_paging_opc = 0;   /* OPC for international (0=not set) */
 static uint8_t rds_paging_pac = 0;   /* PAC for paging area (0=all areas) */
+static int rds_paging_battery = 0;   /* pagers use battery saving: place calls in their interval */
 static int rds_paging_scan = 0;      /* address range scan enabled */
 static uint32_t rds_paging_scan_from = 0;
 static uint32_t rds_paging_scan_to = 0;
@@ -497,6 +498,16 @@ static void print_help(const char *arg0)
 	printf("        PAC = Paging Area Code (0-63). Network-wide area filter broadcast\n");
 	printf("        in Group 1A variant 2. Pagers outside this area ignore messages.\n");
 	printf("        0 = all areas (default, recommended for single-transmitter setups).\n");
+	printf("    --rds-paging-battery-saving\n");
+	printf("        For pagers that use battery saving (EN 50067 M.2.1.3). Each minute\n");
+	printf("        has ten 6 s intervals I0..I9; a pager sleeps outside the interval of\n");
+	printf("        the last digit of its address. With this option 1A carries the\n");
+	printf("        interval sync bits and a call is only started inside the window of\n");
+	printf("        its address: interval d and the two following (d = last digit), and\n");
+	printf("        it must end inside the window. Other calls wait in the queue, so a\n");
+	printf("        single call can be delayed up to 54 s. Clock-time (4A) is forced on\n");
+	printf("        and the schedule is reduced to 4A, 1A and 7A. Without this option\n");
+	printf("        calls are sent at once, as for pagers that listen all the time.\n");
 	printf("    --rds-paging-scan <from> <to>\n");
 	printf("        Scan through the given paging address range (0-999999) with one\n");
 	printf("        message per address. The message carries the 6-digit address, so\n");
@@ -510,6 +521,9 @@ static void print_help(const char *arg0)
 	printf("    --rds-paging-scan-type numeric | alpha | tone\n");
 	printf("        Message type for the scan (default numeric, 10 digit; alpha sends\n");
 	printf("        the address as text; tone sends a tone-only page).\n");
+	printf("        Groups per call: tone 1, numeric 2, alpha 2 if the range stays in one\n");
+	printf("        group code (first two digits, e.g. 120000 129999: the pager shows\n");
+	printf("        the last four digits), else alpha 3 (all six digits).\n");
 	printf("    --rds-hexrds-file <filename>\n");
 	printf("        Write received RDS groups to file in hexrds format.\n");
 	printf("        Format: \"XXXX XXXX XXXX XXXX\" per line (---- for missing blocks).\n");
@@ -644,6 +658,7 @@ static double afc_max_hz = 5000.0;
 #define OPT_FM_COMPANDOR	1125
 #define OPT_RDS_PAGING_SCAN	1128
 #define OPT_RDS_PAGING_SCAN_TYPE 1129
+#define OPT_RDS_PAGING_BATTERY	1130
 
 static void add_options(void)
 {
@@ -685,6 +700,7 @@ static void add_options(void)
 	option_add(OPT_RDS_PAGING_CC, "rds-paging-cc", 1);
 	option_add(OPT_RDS_PAGING_OPC, "rds-paging-opc", 1);
 	option_add(OPT_RDS_PAGING_PAC, "rds-paging-pac", 1);
+	option_add(OPT_RDS_PAGING_BATTERY, "rds-paging-battery-saving", 0);
 	option_add(OPT_RDS_PAGING_SCAN, "rds-paging-scan", 2);
 	option_add(OPT_RDS_PAGING_SCAN_TYPE, "rds-paging-scan-type", 1);
 	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
@@ -881,6 +897,9 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Invalid PAC %d (must be 0-63), use '-h' for help!\n", rds_paging_pac);
 			return -EINVAL;
 		}
+		break;
+	case OPT_RDS_PAGING_BATTERY:
+		rds_paging_battery = 1;
 		break;
 	case OPT_RDS_PAGING_SCAN: {
 		long from = atol(argv[argi++]);
@@ -1556,6 +1575,8 @@ int main(int argc, char *argv[])
 		rds_enc_paging_set_pac(&radio.rds_enc, rds_paging_pac);
 		/* International paging defaults (EN 50067 M.3.5.7) */
 		rds_enc_paging_set_cc(&radio.rds_enc, rds_paging_cc);
+		if (rds_paging_battery)
+			rds_enc_paging_set_battery_saving(&radio.rds_enc, 1);
 		/* Enable paging decoder so 7A/13A are decoded as paging, not ODA */
 		radio.rds_dec.paging_enabled = 1;
 		/* Create named pipe for paging commands */
