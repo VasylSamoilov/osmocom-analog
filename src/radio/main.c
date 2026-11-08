@@ -482,7 +482,14 @@ static void print_help(const char *arg0)
 	printf("          Requires cc= and opc= (per-message or --rds-paging-cc/opc).\n");
 	printf("          Only alpha and vnum support NI. Tone and basic numeric do not.\n");
 	printf("          MCC is 3 BCD digits (e.g. 255=Ukraine, 262=Germany, 208=France).\n");
-	printf("          Max alpha=78 chars, max vnum=156 digits (vs 80/160 national).\n");
+	printf("          Recommended max alpha=78 chars, vnum=156 digits (vs 80/160 national).\n");
+	printf("        Message length limits (EN 50067):\n");
+	printf("          numeric 18 digits, national alpha 80 chars, intl15 15 digits,\n");
+	printf("          intlfunc 7 digits: longer messages are rejected.\n");
+	printf("          vnum, functions and international alpha only have a recommended\n");
+	printf("          maximum: longer messages are sent with a warning up to 10 times\n");
+	printf("          that value and rejected beyond it. With battery saving a call must\n");
+	printf("          fit the three interval windows of its address (about 90 groups).\n");
 	printf("        Hex escapes: <0xCC> in message sends raw byte 0xCC.\n");
 	printf("        Examples:\n");
 	printf("          echo '200078,tone,,' > %s\n", rds_paging_pipe_path);

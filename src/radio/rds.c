@@ -879,6 +879,20 @@ static int rds_paging_vdata_decode(enum rds_paging_msg_type type,
 	return rds_paging_bcd_decode(nibbles, count, digits, max_len);
 }
 
+/* Check that n more characters fit the reassembly buffer. A message longer
+ * than RDS_PAGING_MSG_MAX is cut there, the cut is logged once per message. */
+static int rds_paging_dec_room(rds_paging_dec_t *pd, int n)
+{
+	if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1)
+		return 1;
+	if (!pd->overflow_logged) {
+		pd->overflow_logged = 1;
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: addr=%02u-%04u message longer than %d, rest dropped\n",
+		     pd->address / 10000, pd->address % 10000, RDS_PAGING_MSG_MAX);
+	}
+	return 0;
+}
+
 /* Human-readable helpers for paging log fields */
 static const char *rds_paging_type_name(enum rds_paging_msg_type type)
 {
@@ -1219,6 +1233,29 @@ static void rds_paging_unlink(rds_paging_enc_t *pag, rds_paging_msg_t *prev, rds
 	pag->queue_count--;
 }
 
+/* With battery saving a call has to fit the three interval windows of its
+ * address. A longer call never does, it is dropped instead of waiting in the
+ * queue for ever. */
+static void rds_paging_bs_drop_unfit(rds_paging_enc_t *pag)
+{
+	double max_groups = 3 * 6000.0 * RDS_PAGING_7A_PERCENT(pag) / 100.0 / (RDS_PAGING_GROUP_US / 1000.0) - 1.0;
+	rds_paging_msg_t *m, *prev = NULL, *next;
+
+	for (m = pag->queue_head; m; m = next) {
+		int groups = rds_paging_msg_groups(pag, m);
+
+		next = m->next;
+		if (groups > max_groups) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS Paging: addr=%02u-%04u needs %d groups, battery saving windows hold %d, dropped\n",
+			     m->address / 10000, m->address % 10000, groups, (int)max_groups);
+			rds_paging_unlink(pag, prev, m);
+			free(m);
+			continue;
+		}
+		prev = m;
+	}
+}
+
 /* Keep the queue filled from the scan range; end the scan when the last
  * address has been transmitted. The address is carried in the payload
  * (6 digits) so the pager that responded can be identified. */
@@ -1333,6 +1370,8 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 			rds_paging_msg_t *best = NULL, *best_prev = NULL, *prev = NULL, *m;
 			int best_k = 3;
 
+			rds_paging_bs_drop_unfit(pag);
+
 			for (m = pag->queue_head; m; prev = m, m = m->next) {
 				int k;
 
@@ -1438,16 +1477,31 @@ static void rds_paging_tx_complete(rds_encoder_t *rds)
 	rds_paging_start_next(rds);
 }
 
-/* Limit a message length to the maximum of its format and log when the
- * message is cut. */
-static int rds_paging_clamp_len(int len, int max, const char *what)
+/* Check a message length against the limit of its format. Returns -1 and logs
+ * an error when the message is rejected.
+ * hard=1: the standard gives a maximum, longer messages are rejected.
+ * hard=0: the standard gives a recommended maximum. Longer messages are
+ * accepted with a warning up to RDS_PAGING_RECOMMENDED_FACTOR times that
+ * value, beyond it they are rejected. */
+static int rds_paging_check_len(int len, int max, int hard, const char *what)
 {
-	if (len > max) {
-		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging: %s message of %d is longer than the maximum of %d, truncated\n",
-		     what, len, max);
-		return max;
+	if (hard) {
+		if (len > max) {
+			LOGP(DRADIO, LOGL_ERROR, "RDS Paging: %s message of %d is longer than the maximum of %d (EN 50067), rejected\n",
+			     what, len, max);
+			return -1;
+		}
+		return 0;
 	}
-	return len;
+	if (len > max * RDS_PAGING_RECOMMENDED_FACTOR) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: %s message of %d is longer than %d times the recommended maximum of %d, rejected\n",
+		     what, len, RDS_PAGING_RECOMMENDED_FACTOR, max);
+		return -1;
+	}
+	if (len > max)
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging: warning: %s message of %d is longer than the recommended maximum of %d (EN 50067), a pager may not accept it\n",
+		     what, len, max);
+	return 0;
 }
 
 /* Public API: queue a tone-only page */
@@ -1519,10 +1573,14 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(text);
-	if (ni && country_code > 0)
-		len = rds_paging_clamp_len(len, 78, "international alpha"); /* international max */
-	else
-		len = rds_paging_clamp_len(len, RDS_PAGING_ALPHA_MAX, "alpha");
+	/* National alpha is basic paging with a maximum (M.2.1.6.4), international
+	 * alpha is enhanced paging with a recommended maximum (M.3.5.7). */
+	if (ni && country_code > 0) {
+		if (rds_paging_check_len(len, RDS_PAGING_ALPHA_INTL_MAX, 0, "international alpha") < 0)
+			return -1;
+	} else if (rds_paging_check_len(len, RDS_PAGING_ALPHA_MAX, 1, "alpha") < 0) {
+		return -1;
+	}
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1552,10 +1610,9 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(digits);
-	if (ni && country_code > 0)
-		len = rds_paging_clamp_len(len, 156, "international vnum"); /* international max */
-	else
-		len = rds_paging_clamp_len(len, RDS_PAGING_VNUM_MAX, "vnum");
+	if (rds_paging_check_len(len, (ni && country_code > 0) ? RDS_PAGING_VNUM_INTL_MAX : RDS_PAGING_VNUM_MAX,
+				 0, (ni && country_code > 0) ? "international vnum" : "vnum") < 0)
+		return -1;
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1586,10 +1643,9 @@ int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(digits);
-	if (ni && country_code > 0)
-		len = rds_paging_clamp_len(len, 156, "international functions"); /* international max */
-	else
-		len = rds_paging_clamp_len(len, RDS_PAGING_VNUM_MAX, "functions");
+	if (rds_paging_check_len(len, (ni && country_code > 0) ? RDS_PAGING_VNUM_INTL_MAX : RDS_PAGING_VNUM_MAX,
+				 0, (ni && country_code > 0) ? "international functions" : "functions") < 0)
+		return -1;
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1618,7 +1674,8 @@ int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
 	if (address > RDS_PAGING_ADDR_MAX || !digits)
 		return -1;
 	len = strlen(digits);
-	len = rds_paging_clamp_len(len, 15, "intl15");
+	if (rds_paging_check_len(len, RDS_PAGING_INTL15_DIGITS, 1, "intl15") < 0)
+		return -1;
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
@@ -1645,7 +1702,8 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 	if (address > RDS_PAGING_ADDR_MAX || !digits)
 		return -1;
 	len = strlen(digits);
-	len = rds_paging_clamp_len(len, 7, "intlfunc");
+	if (rds_paging_check_len(len, RDS_PAGING_INTLFUNC_DIGITS, 1, "intlfunc") < 0)
+		return -1;
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
@@ -3246,14 +3304,11 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		/* Variable groups: address, data groups (4 chars each), end marker.
 		 * International (NI=1, EN 50067 M.3.5.7): first data group's
 		 * Block C carries E.212 country code + OPC instead of 2 chars.
-		 * Block D of that group still carries 2 chars. Max 78 chars. */
+		 * Block D of that group still carries 2 chars. The length was
+		 * checked when the message was queued. */
 		int len = msg->data_len;
 		int intl = msg->ni;
-		int max_len = intl ? 78 : RDS_PAGING_ALPHA_MAX;
 		int padded_len, ngroups, i, ci;
-
-		if (len > max_len)
-			len = max_len;
 
 		/* Group 0: address + control byte */
 		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
@@ -3327,12 +3382,9 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		 * International M.3.5.7: second group carries country code + OPC in block C. */
 		int len = msg->data_len;
 		int intl = msg->ni;
-		int max_len = intl ? 156 : RDS_PAGING_VNUM_MAX;
 		int padded_len, ngroups, i, di;
-		uint8_t nibbles[RDS_PAGING_VNUM_MAX];
-
-		if (len > max_len)
-			len = max_len;
+		/* room for the padding of the last data group */
+		uint8_t nibbles[RDS_PAGING_MSG_MAX + 8];
 
 		/* Encode digits to nibbles (hex 0-F for functions, BCD 0-9 otherwise) */
 		if (msg->type == RDS_PAGING_FUNCTIONS)
@@ -10737,6 +10789,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->assembling = 1;
 			pd->assembly_start = time(NULL);
 			pd->msg_len = 0;
+			pd->overflow_logged = 0;
 			pd->expected_psac = RDS_7A_PSAC_ALPHA_DATA_FIRST;
 			/* Enhanced control byte: MT1 MT0 NI R P3P2P1P0 */
 			pd->last_ctrl = ctrl;
@@ -10777,7 +10830,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				};
 				char tmp[9];
 				int n = rds_paging_vdata_decode(pd->msg_type, nib, 8, tmp, sizeof(tmp));
-				if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
+				if (rds_paging_dec_room(pd, n)) {
 					memcpy(pd->msg_buf + pd->msg_len, tmp, n);
 					pd->msg_len += n;
 				}
@@ -10803,7 +10856,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				}
 			} else {
 				/* Alpha: extract up to 4 characters from blocks C and D */
-				if (pd->msg_len + 4 <= (int)sizeof(pd->msg_buf) - 1) {
+				if (rds_paging_dec_room(pd, 4)) {
 					pd->msg_buf[pd->msg_len++] = (b3 >> 8) & 0xFF;
 					pd->msg_buf[pd->msg_len++] = b3 & 0xFF;
 					pd->msg_buf[pd->msg_len++] = (b4 >> 8) & 0xFF;
@@ -10820,7 +10873,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
 				{
-					char alpha_disp[257];
+					char alpha_disp[RDS_PAGING_DISP_SIZE];
 					rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, alpha_disp, sizeof(alpha_disp));
 					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
 					     rds_paging_type_name(pd->last_type),
@@ -10872,13 +10925,13 @@ static void rds_decode_group(rds_decoder_t *rds)
 						};
 						char tmp[5];
 						int n = rds_paging_vdata_decode(pd->msg_type, nib, 4, tmp, sizeof(tmp));
-						if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
+						if (rds_paging_dec_room(pd, n)) {
 							memcpy(pd->msg_buf + pd->msg_len, tmp, n);
 							pd->msg_len += n;
 						}
 					} else {
 						/* Alpha: 2 chars from Block D */
-						if (pd->msg_len + 2 <= (int)sizeof(pd->msg_buf) - 1) {
+						if (rds_paging_dec_room(pd, 2)) {
 							pd->msg_buf[pd->msg_len++] = (b4 >> 8) & 0xFF;
 							pd->msg_buf[pd->msg_len++] = b4 & 0xFF;
 						}
@@ -10891,13 +10944,13 @@ static void rds_decode_group(rds_decoder_t *rds)
 					};
 					char tmp[9];
 					int n = rds_paging_vdata_decode(pd->msg_type, nib, 8, tmp, sizeof(tmp));
-					if (pd->msg_len + n <= (int)sizeof(pd->msg_buf) - 1) {
+					if (rds_paging_dec_room(pd, n)) {
 						memcpy(pd->msg_buf + pd->msg_len, tmp, n);
 						pd->msg_len += n;
 					}
 				} else {
 					/* 4 alpha characters per group */
-					if (pd->msg_len + 4 <= (int)sizeof(pd->msg_buf) - 1) {
+					if (rds_paging_dec_room(pd, 4)) {
 						pd->msg_buf[pd->msg_len++] = (b3 >> 8) & 0xFF;
 						pd->msg_buf[pd->msg_len++] = b3 & 0xFF;
 						pd->msg_buf[pd->msg_len++] = (b4 >> 8) & 0xFF;
@@ -10912,7 +10965,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 						LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: VNUM data PSAC=%d addr=%02u-%04u (assembling: \"%s...\")\n",
 						     psac, pd->address / 10000, pd->address % 10000, pd->msg_buf);
 					} else {
-						char alpha_partial[257];
+						char alpha_partial[RDS_PAGING_DISP_SIZE];
 						rds_text_to_display((uint8_t *)pd->msg_buf, pd->msg_len, alpha_partial, sizeof(alpha_partial));
 						LOGP(DRADIO, LOGL_NOTICE, "RDS 7A: ALPHA data PSAC=%d addr=%02u-%04u (assembling: \"%s...\")\n",
 						     psac, pd->address / 10000, pd->address % 10000, alpha_partial);
@@ -13437,7 +13490,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 				case RDS_PAGING_INTLFUNC: type_str = "INTLFUNC"; break;
 				}
 				if (pd->last_msg_len > 0) {
-					char paging_disp[257];
+					char paging_disp[RDS_PAGING_DISP_SIZE];
 					if (pd->last_type == RDS_PAGING_ALPHA)
 						rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, paging_disp, sizeof(paging_disp));
 					else

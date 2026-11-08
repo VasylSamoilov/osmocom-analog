@@ -700,11 +700,18 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_ADDR_MAX     999999  /* Maximum 6-digit address */
 #define RDS_PAGING_NUM10_DIGITS 10      /* 10-digit numeric message */
 #define RDS_PAGING_NUM18_DIGITS 18      /* 18-digit numeric message */
-#define RDS_PAGING_ALPHA_MAX    80      /* Maximum alphanumeric chars */
+#define RDS_PAGING_ALPHA_MAX    80      /* Basic alphanumeric: maximum chars (M.2.1.6.4); enhanced: recommended */
 #define RDS_PAGING_ALPHA_PER_GROUP 4    /* Characters per alpha data group */
-#define RDS_PAGING_VNUM_MAX     160     /* Maximum variable-length numeric digits */
+#define RDS_PAGING_VNUM_MAX     160     /* Variable-length numeric/functions: recommended maximum digits (M.3.5.5, M.3.5.6) */
+#define RDS_PAGING_ALPHA_INTL_MAX 78    /* International alphanumeric: recommended maximum chars (M.3.5.7) */
+#define RDS_PAGING_VNUM_INTL_MAX 156    /* International variable-length numeric/functions: recommended maximum digits */
+#define RDS_PAGING_INTL15_DIGITS 15     /* International numeric message digits (M.2.1.6.5) */
+#define RDS_PAGING_INTLFUNC_DIGITS 7    /* International functions message digits (M.2.1.6.6) */
+#define RDS_PAGING_RECOMMENDED_FACTOR 10 /* Enhanced messages are accepted up to this multiple of the recommended maximum */
+#define RDS_PAGING_MSG_MAX      (RDS_PAGING_VNUM_MAX * RDS_PAGING_RECOMMENDED_FACTOR) /* Longest message accepted */
+#define RDS_PAGING_DISP_SIZE    (RDS_PAGING_MSG_MAX * 4 + 1) /* Display string of a message (UTF-8) */
 #define RDS_PAGING_VNUM_PER_GROUP 8     /* BCD digits per vnum data group */
-#define RDS_PAGING_MAX_GROUPS   22      /* Max groups for 80-char alpha */
+#define RDS_PAGING_MAX_GROUPS   202     /* Max groups: address group + RDS_PAGING_MSG_MAX digits at 8 per group */
 #define RDS_PAGING_QUEUE_MAX    256     /* Maximum queued messages */
 #define RDS_PAGING_DEFAULT_REPEATS   1  /* Default repeat count (1 = send once) */
 #define RDS_PAGING_DEFAULT_INTERVAL  5  /* Default repeat interval (seconds) */
@@ -1500,7 +1507,7 @@ typedef struct rds_paging_msg {
 	struct rds_paging_msg	*next;
 	enum rds_paging_msg_type type;
 	uint32_t	address;	/* 6-digit BCD address (0-999999) */
-	char		data[161];	/* Message content (max 160 digits or 80 alpha + NUL) */
+	char		data[RDS_PAGING_MSG_MAX + 1];	/* Message content + NUL */
 	int		data_len;	/* Length of message data */
 	int		repeats_left;	/* Remaining retransmissions */
 	int		repeat_interval;/* Seconds between retransmissions */
@@ -1597,8 +1604,9 @@ typedef struct rds_paging_dec {
 	uint8_t		ab_flag;	/* Last seen A/B flag */
 	int		expected_psac;	/* Next expected PSAC value */
 	uint8_t		assembly_mt;	/* MT from control byte (0=alpha, 1=vnum) */
-	char		msg_buf[161];	/* Reassembly buffer (max 160 digits or 80 alpha + NUL) */
+	char		msg_buf[RDS_PAGING_MSG_MAX + 1];	/* Reassembly buffer + NUL */
 	int		msg_len;	/* Current length in buffer */
+	int		overflow_logged;/* Message longer than the buffer was reported */
 	time_t		assembly_start;	/* Timestamp when assembly began */
 	int		timeout_sec;	/* Configurable reassembly timeout */
 
@@ -1606,7 +1614,7 @@ typedef struct rds_paging_dec {
 	int		msg_valid;	/* 1 if a complete message is available */
 	enum rds_paging_msg_type last_type;
 	uint32_t	last_address;
-	char		last_msg[161];
+	char		last_msg[RDS_PAGING_MSG_MAX + 1];
 	int		last_msg_len;
 
 	/* Enhanced paging control byte (EN 50067 M.3.5) */
