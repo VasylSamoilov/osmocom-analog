@@ -483,6 +483,14 @@ static void print_help(const char *arg0)
 	printf("          Only alpha and vnum support NI. Tone and basic numeric do not.\n");
 	printf("          MCC is 3 BCD digits (e.g. 255=Ukraine, 262=Germany, 208=France).\n");
 	printf("          Recommended max alpha=78 chars, vnum=156 digits (vs 80/160 national).\n");
+	printf("        International mode on a basic pager (EN 50067 M.2, roaming):\n");
+	printf("          Basic paging has only intl15 and intlfunc as international\n");
+	printf("          formats (M.2.1.6.5/6); cc must be the pager's home MCC.\n");
+	printf("          The pager is set to the foreign PI country digit (--pi).\n");
+	printf("          It ignores NI: ni=1 alpha shows I1I2I3OPC as two characters.\n");
+	printf("          Tested pager: national types not shown in this mode. Example:\n");
+	printf("          --pi D2E7 --rds-ecc E0, pager set to D, home MCC 255 (Ukraine):\n");
+	printf("          echo '200078,intl15,cc=255,123456789012345' > %s\n", rds_paging_pipe_path);
 	printf("        Message length limits (EN 50067):\n");
 	printf("          numeric 18 digits, national alpha 80 chars, intl15 15 digits,\n");
 	printf("          intlfunc 7 digits: longer messages are rejected.\n");

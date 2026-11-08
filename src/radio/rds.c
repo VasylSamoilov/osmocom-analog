@@ -1451,8 +1451,13 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 				     msg->data_len, msg->data);
 				if (msg->ni && msg->country_code) {
 					const char *cname = mcc_name(msg->country_code);
-					LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX:   international: MCC=%d (%s) OPC=%d\n",
-					     msg->country_code, cname ? cname : "unknown", msg->opc);
+					/* basic intl15/intlfunc (M.2.1.6.5/6) carry no OPC */
+					if (msg->type == RDS_PAGING_INTL15 || msg->type == RDS_PAGING_INTLFUNC)
+						LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX:   international: MCC=%d (%s)\n",
+						     msg->country_code, cname ? cname : "unknown");
+					else
+						LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX:   international: MCC=%d (%s) OPC=%d\n",
+						     msg->country_code, cname ? cname : "unknown", msg->opc);
 				}
 			}
 			if (pag->battery_saving) {
