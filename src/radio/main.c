@@ -466,6 +466,11 @@ static void print_help(const char *arg0)
 	printf("          address groups 00-99 with sync=0 (recommended).\n");
 	printf("        FIFO format: address,type,options,message\n");
 	printf("        Types: tone, numeric, numeric10, numeric18, alpha, vnum, functions, intl15, intlfunc\n");
+	printf("        tone, numeric and alpha are basic paging (EN 50067 M.2).\n");
+	printf("        vnum, functions and any message with ni=1 use the enhanced protocol\n");
+	printf("        (M.3.5). They need a pager that implements it and --rds-paging-opc\n");
+	printf("        1-15. A basic pager ignores the control byte and shows the digits\n");
+	printf("        as garbled alpha text.\n");
 	printf("        Options (space-separated key=value, can be empty):\n");
 	printf("          repeat=N      total send count, 1-15 (default 1)\n");
 	printf("          interval=N    seconds between repeats (default 5)\n");
