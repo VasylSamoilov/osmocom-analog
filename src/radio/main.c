@@ -490,6 +490,12 @@ static void print_help(const char *arg0)
 	printf("          maximum: longer messages are sent with a warning up to 10 times\n");
 	printf("          that value and rejected beyond it. With battery saving a call must\n");
 	printf("          fit the three interval windows of its address (about 90 groups).\n");
+	printf("        Valid message characters (others are rejected):\n");
+	printf("          numeric, numeric10, numeric18, vnum, intl15: digits 0-9 and space\n");
+	printf("          (space is sent as hex A).\n");
+	printf("          functions, intlfunc: hex digits 0-9 A-F (a-f too) and space.\n");
+	printf("          alpha: any 8-bit character, see the pager charset; <0xCC> sends a raw byte.\n");
+	printf("          tone: no message.\n");
 	printf("        Hex escapes: <0xCC> in message sends raw byte 0xCC.\n");
 	printf("        Examples:\n");
 	printf("          echo '200078,tone,,' > %s\n", rds_paging_pipe_path);

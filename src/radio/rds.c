@@ -893,6 +893,21 @@ static int rds_paging_dec_room(rds_paging_dec_t *pd, int n)
 	return 0;
 }
 
+/* Warn when a received alpha, vnum or functions message is longer than the
+ * recommended maximum of EN 50067 (M.2.1.6.4, M.3.5.4 to M.3.5.7). */
+static void rds_paging_dec_check_len(const rds_paging_dec_t *pd)
+{
+	int max;
+
+	if (pd->msg_type == RDS_PAGING_ALPHA)
+		max = pd->last_ni ? RDS_PAGING_ALPHA_INTL_MAX : RDS_PAGING_ALPHA_MAX;
+	else
+		max = pd->last_ni ? RDS_PAGING_VNUM_INTL_MAX : RDS_PAGING_VNUM_MAX;
+	if (pd->msg_len > max)
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: warning: addr=%02u-%04u message of %d is longer than the recommended maximum of %d\n",
+		     pd->address / 10000, pd->address % 10000, pd->msg_len, max);
+}
+
 /* Human-readable helpers for paging log fields */
 static const char *rds_paging_type_name(enum rds_paging_msg_type type)
 {
@@ -1504,6 +1519,29 @@ static int rds_paging_check_len(int len, int max, int hard, const char *what)
 	return 0;
 }
 
+/* Check the characters of a numeric or functions message. Numeric messages
+ * (basic, international 15 digit, variable length) carry BCD digits 0-9 and
+ * the space (hex A). Functions messages carry hex digits 0-9 A-F (EN 50067
+ * M.2.1.6.3, M.2.1.6.5, M.2.1.6.6, M.3.5.5, M.3.5.6). Returns -1 and logs
+ * an error at the first other character. */
+static int rds_paging_check_chars(const char *s, int hex, const char *what)
+{
+	int i;
+
+	for (i = 0; s[i]; i++) {
+		char c = s[i];
+
+		if ((c >= '0' && c <= '9') || c == ' ')
+			continue;
+		if (hex && ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+			continue;
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: %s message has invalid character 0x%02X at position %d, valid are %s, rejected\n",
+		     what, (unsigned char)c, i + 1, hex ? "0-9 A-F and space" : "0-9 and space");
+		return -1;
+	}
+	return 0;
+}
+
 /* Public API: queue a tone-only page */
 int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
 			     int repeats, int interval_sec, uint8_t tonetype)
@@ -1545,6 +1583,9 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 		     len, RDS_PAGING_NUM18_DIGITS);
 		return -1;
 	}
+
+	if (rds_paging_check_chars(digits, 0, "numeric") < 0)
+		return -1;
 
 	type = (len <= RDS_PAGING_NUM10_DIGITS) ? RDS_PAGING_NUM10 : RDS_PAGING_NUM18;
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
@@ -1613,6 +1654,8 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 	if (rds_paging_check_len(len, (ni && country_code > 0) ? RDS_PAGING_VNUM_INTL_MAX : RDS_PAGING_VNUM_MAX,
 				 0, (ni && country_code > 0) ? "international vnum" : "vnum") < 0)
 		return -1;
+	if (rds_paging_check_chars(digits, 0, "vnum") < 0)
+		return -1;
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1646,6 +1689,8 @@ int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
 	if (rds_paging_check_len(len, (ni && country_code > 0) ? RDS_PAGING_VNUM_INTL_MAX : RDS_PAGING_VNUM_MAX,
 				 0, (ni && country_code > 0) ? "international functions" : "functions") < 0)
 		return -1;
+	if (rds_paging_check_chars(digits, 1, "functions") < 0)
+		return -1;
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1676,6 +1721,8 @@ int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
 	len = strlen(digits);
 	if (rds_paging_check_len(len, RDS_PAGING_INTL15_DIGITS, 1, "intl15") < 0)
 		return -1;
+	if (rds_paging_check_chars(digits, 0, "intl15") < 0)
+		return -1;
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
@@ -1703,6 +1750,8 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	len = strlen(digits);
 	if (rds_paging_check_len(len, RDS_PAGING_INTLFUNC_DIGITS, 1, "intlfunc") < 0)
+		return -1;
+	if (rds_paging_check_chars(digits, 1, "intlfunc") < 0)
 		return -1;
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -10838,6 +10887,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				if (pd->msg_type == RDS_PAGING_VNUM)
 					while (pd->msg_len > 0 && pd->msg_buf[pd->msg_len - 1] == ' ')
 						pd->msg_len--;
+				rds_paging_dec_check_len(pd);
 				pd->assembling = 0;
 				pd->msg_buf[pd->msg_len] = '\0';
 				pd->msg_valid = 1;
@@ -10865,6 +10915,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				/* Strip trailing padding (spaces 0x20) from final group */
 				while (pd->msg_len > 0 && pd->msg_buf[pd->msg_len - 1] == 0x20)
 					pd->msg_len--;
+				rds_paging_dec_check_len(pd);
 				pd->assembling = 0;
 				pd->msg_buf[pd->msg_len] = '\0';
 				pd->msg_valid = 1;
