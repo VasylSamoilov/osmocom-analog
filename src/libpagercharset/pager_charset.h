@@ -152,5 +152,6 @@ extern const struct pager_charset pager_charset_flex_motorola_linguist_latin4;
 
 extern const struct pager_charset pager_charset_rds_generic_generic_annex_e;
 extern const struct pager_charset pager_charset_rds_nokia_nkp2_annex_e;
+extern const struct pager_charset pager_charset_rds_nokia_finder_text_cyrillic;
 
 #endif /* PAGER_CHARSET_H */

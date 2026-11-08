@@ -62,6 +62,7 @@ static const struct pager_charset *registry[] = {
 	/* RDS */
 	&pager_charset_rds_generic_generic_annex_e,
 	&pager_charset_rds_nokia_nkp2_annex_e,
+	&pager_charset_rds_nokia_finder_text_cyrillic,
 	NULL,
 };
 
