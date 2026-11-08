@@ -1438,6 +1438,18 @@ static void rds_paging_tx_complete(rds_encoder_t *rds)
 	rds_paging_start_next(rds);
 }
 
+/* Limit a message length to the maximum of its format and log when the
+ * message is cut. */
+static int rds_paging_clamp_len(int len, int max, const char *what)
+{
+	if (len > max) {
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging: %s message of %d is longer than the maximum of %d, truncated\n",
+		     what, len, max);
+		return max;
+	}
+	return len;
+}
+
 /* Public API: queue a tone-only page */
 int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
 			     int repeats, int interval_sec, uint8_t tonetype)
@@ -1474,8 +1486,11 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(digits);
-	if (len > RDS_PAGING_NUM18_DIGITS)
+	if (len > RDS_PAGING_NUM18_DIGITS) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: numeric message of %d digits exceeds the maximum of %d (EN 50067 Table M.3)\n",
+		     len, RDS_PAGING_NUM18_DIGITS);
 		return -1;
+	}
 
 	type = (len <= RDS_PAGING_NUM10_DIGITS) ? RDS_PAGING_NUM10 : RDS_PAGING_NUM18;
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
@@ -1504,11 +1519,10 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(text);
-	if (ni && country_code > 0) {
-		if (len > 78) len = 78; /* international max */
-	} else {
-		if (len > RDS_PAGING_ALPHA_MAX) len = RDS_PAGING_ALPHA_MAX;
-	}
+	if (ni && country_code > 0)
+		len = rds_paging_clamp_len(len, 78, "international alpha"); /* international max */
+	else
+		len = rds_paging_clamp_len(len, RDS_PAGING_ALPHA_MAX, "alpha");
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1538,11 +1552,10 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(digits);
-	if (ni && country_code > 0) {
-		if (len > 156) len = 156; /* international max */
-	} else {
-		if (len > RDS_PAGING_VNUM_MAX) len = RDS_PAGING_VNUM_MAX;
-	}
+	if (ni && country_code > 0)
+		len = rds_paging_clamp_len(len, 156, "international vnum"); /* international max */
+	else
+		len = rds_paging_clamp_len(len, RDS_PAGING_VNUM_MAX, "vnum");
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1573,11 +1586,10 @@ int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
 		return -1;
 
 	len = strlen(digits);
-	if (ni && country_code > 0) {
-		if (len > 156) len = 156; /* international max */
-	} else {
-		if (len > RDS_PAGING_VNUM_MAX) len = RDS_PAGING_VNUM_MAX;
-	}
+	if (ni && country_code > 0)
+		len = rds_paging_clamp_len(len, 156, "international functions"); /* international max */
+	else
+		len = rds_paging_clamp_len(len, RDS_PAGING_VNUM_MAX, "functions");
 
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
@@ -1606,7 +1618,7 @@ int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
 	if (address > RDS_PAGING_ADDR_MAX || !digits)
 		return -1;
 	len = strlen(digits);
-	if (len > 15) len = 15;
+	len = rds_paging_clamp_len(len, 15, "intl15");
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
@@ -1633,7 +1645,7 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 	if (address > RDS_PAGING_ADDR_MAX || !digits)
 		return -1;
 	len = strlen(digits);
-	if (len > 7) len = 7;
+	len = rds_paging_clamp_len(len, 7, "intlfunc");
 	if (repeats <= 0) repeats = RDS_PAGING_DEFAULT_REPEATS;
 	if (repeats > RDS_PAGING_COUNTER_MAX) repeats = RDS_PAGING_COUNTER_MAX;
 	if (interval_sec <= 0) interval_sec = RDS_PAGING_DEFAULT_INTERVAL;
