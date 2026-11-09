@@ -4176,8 +4176,12 @@ int8_t get_bit(gsc_t *gsc)
 		if (gsc->bit_index == gsc->bit_num) {
 			/* on voice message... */
 			if (gsc->bit_ac) {
-				/* rewind to play the AC again after voice transmission */
+				/* rewind to play the AC again after voice transmission:
+				 * only the AC (comma, AC, bit, complement = 121 bits) as the
+				 * turn-off word, not the tone-only addresses interleaved
+				 * after it (Motorola GSC manual, Figure 6-1) */
 				gsc->bit_index = gsc->bit_ac;
+				gsc->bit_num = gsc->bit_ac + 121;
 				gsc->bit_ac = 0;
 				/* indicate voice message to DSP */
 				return 2;
