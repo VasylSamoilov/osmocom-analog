@@ -79,6 +79,9 @@ void print_help(const char *arg0)
 	printf("        Set batch encoding mode. 'off' transmits each message individually\n");
 	printf("        (default). 'normal' groups up to 16 addresses per preamble. 'extended'\n");
 	printf("        groups up to 32 addresses per preamble.\n");
+	printf("        A batch has 16 slots: every address and every data block of a\n");
+	printf("        message takes one. When they are used, the start code is sent again\n");
+	printf("        and 16 more slots follow, without a new preamble.\n");
 	printf(" -M --message \"...\"\n");
 	printf("        Send this message, if no caller ID was given or if built-in console\n");
 	printf("        is used. For voice pages (-y voice), this is the WAV file path.\n");

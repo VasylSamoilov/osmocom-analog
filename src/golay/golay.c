@@ -1398,6 +1398,136 @@ static const char *log_escape(const char *s)
 	return buf;
 }
 
+/* A block of 121 bits is a comma: alternating bits, at most 12 transitions
+ * missing (unused batch slots are filled with comma, S2.1). */
+static int gsc_is_comma_block(const uint8_t *bits)
+{
+	int i, transitions = 0;
+
+	for (i = 1; i < 121; i++) {
+		if (bits[i] != bits[i - 1])
+			transitions++;
+	}
+
+	return transitions >= 108;
+}
+
+/* Bits to skip after a tone-only address. A tone-only page is the address
+ * alone: the next address, start code or preamble may follow at once (S2.5;
+ * Motorola GSC manual, Figure 6-2), then nothing is skipped. A comma after a
+ * tone-only address, as some encoders send it, is skipped block by block as
+ * long as it lasts, up to 968 bits. Returns -1 if more bits are needed. */
+static int gsc_tone_skip(const uint8_t *bits, int pos, int total_bits, int force)
+{
+	int skip = 0;
+
+	while (skip < 121 * 8) {
+		if (pos + skip + 121 > total_bits)
+			return force ? skip : -1;
+		if (!gsc_is_comma_block(bits + pos + skip))
+			break;
+		skip += 121;
+	}
+
+	return skip;
+}
+
+/* Every bit of a Golay word is sent twice. Number of the 23 bit pairs of
+ * 46 bits whose two bits differ: 0 for a word without errors, about 23 for
+ * a comma and about 11 for random bits (voice audio). */
+int gsc_split_pairs(const uint8_t *bits)
+{
+	int i, split = 0;
+
+	for (i = 0; i < 23; i++) {
+		if (bits[2 * i] != bits[2 * i + 1])
+			split++;
+	}
+
+	return split;
+}
+
+/* Decode a tone-only address from a block of 121 bits (28 bit comma, W1,
+ * 1 bit, W2) without logging, e.g. tone-only addresses interleaved in the
+ * alert time of a voice page (Motorola GSC manual, Figure 6-1; they share
+ * the preamble of the voice page). The comma may have up to 2 bit errors.
+ * Returns 0 and fills the message, -1 if the block is no address. */
+int gsc_decode_tone_address(const uint8_t *bits, int preamble_idx, gsc_rx_msg_t *msg)
+{
+	uint16_t w1 = 0, w2_try[2];
+	int golay_ok[2] = { 0, 0 };
+	int w1_inverted = -1, w2_inverted = -1;
+	int g1, g0, g1g0, a2 = 0, a1 = 0, a0 = 0;
+	int inv, i, errors = 0, pos;
+	uint8_t function;
+	uint32_t codeword;
+
+	for (i = 1; i < 28; i++) {
+		if (bits[i] == bits[i - 1])
+			errors++;
+	}
+	if (errors > 2)
+		return -1;
+	if (gsc_split_pairs(bits + 28) > GSC_MAX_SPLIT_PAIRS || gsc_split_pairs(bits + 28 + 46 + 1) > GSC_MAX_SPLIT_PAIRS)
+		return -1;
+
+	pos = 28;
+	codeword = read_dup_golay(bits, &pos);
+	for (inv = 0; inv < 2 && w1_inverted < 0; inv++) {
+		uint16_t value;
+		if (decode_golay(inv ? codeword ^ 0x7fffff : codeword, &value) == 0 && reverse_word1(value, &g1, &g0) == 0) {
+			w1 = value;
+			w1_inverted = inv;
+		}
+	}
+	if (w1_inverted < 0)
+		return -1;
+	(void)w1;
+	g1g0 = g1 * 10 + g0;
+
+	pos += 1;
+	codeword = read_dup_golay(bits, &pos);
+	if (decode_golay(codeword, &w2_try[0]) == 0)
+		golay_ok[0] = 1;
+	if (decode_golay(codeword ^ 0x7fffff, &w2_try[1]) == 0)
+		golay_ok[1] = 1;
+	for (inv = 0; inv < 2 && w2_inverted < 0; inv++) {
+		int high;
+		if (!golay_ok[inv])
+			continue;
+		/* W2 % 100 >= 50 means groups 50-99 */
+		high = (w2_try[inv] % 100 >= 50) ? 1 : 0;
+		if (reverse_word2(w2_try[inv], g1g0 + high * 50, &a2, &a1, &a0) == 0) {
+			w2_inverted = inv;
+			if (high) {
+				g1g0 += 50;
+				g1 = g1g0 / 10;
+				g0 = g1g0 % 10;
+			}
+		}
+	}
+	if (w2_inverted < 0)
+		return -1;
+
+	function = (w1_inverted ? 0x2 : 0) | (w2_inverted ? 0x1 : 0);
+
+	memset(msg, 0, sizeof(*msg));
+	msg->address[0] = '0' + (preamble_idx - g0 + 10) % 10;
+	msg->address[1] = '0' + g1;
+	msg->address[2] = '0' + g0;
+	msg->address[3] = '0' + a2;
+	msg->address[4] = '0' + a1;
+	msg->address[5] = '0' + a0;
+	msg->address[6] = "9034"[function];
+	msg->address[7] = '\0';
+	msg->address_number = function + 1;
+	msg->preamble_index = preamble_idx;
+	msg->type = TYPE_TONE;
+	msg->decode_ok = 1;
+
+	return 0;
+}
+
 int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 {
 	const uint8_t *bits = gsc->rx_bit;
@@ -1408,7 +1538,6 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	const int comma_len = 28;		/* comma sequence length */
 	const int dup_bits = 46;		/* duplicate-transmitted Golay codeword (23 x 2) */
 	const int bch_block_bits = 120;		/* interleaved BCH block (15 x 8) */
-	const int tone_comma_len = 121 * 8;	/* tone-only comma (968 bits) */
 
 	uint32_t codeword;
 	uint16_t decoded_value;
@@ -1677,12 +1806,12 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 * The three message types produce distinct bitstream signatures:
 	 *   Voice:  28-bit comma + Golay pair (activation_code = 2563) = 121 bits
 	 *   Data:   1-bit inverted comma + 120 interleaved BCH bits   = 121 bits
-	 *   Tone:   968-bit comma sequence (121 * 8)
+	 *   Tone:   nothing, the next address, start code or preamble
+	 *           follows (some encoders send a comma of up to 968 bits)
 	 *
 	 * Strategy: peek ahead for activation code to detect voice,
-	 * then use remaining bit count to distinguish data vs tone.
-	 * The encoder produces exact bit counts, so remaining == 968
-	 * unambiguously identifies tone-only.
+	 * then probe the first BCH block to detect data. Anything else
+	 * after the address is tone-only.
 	 *
 	 * If there aren't enough remaining bits to distinguish the type
 	 * (minimum 121 for any post-address content), we cannot determine
@@ -1692,20 +1821,11 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 	/* Type detection strategy:
 	 *
-	 * The three message types produce distinct post-address signatures:
-	 *   Voice:  28-bit comma + dup Golay pair (activation_code) = 121 bits
-	 *   Data:   1-bit inverted comma + 120 interleaved BCH bits = 121 bits/block
-	 *   Tone:   968-bit comma sequence (121 * 8)
-	 *
-	 * The periodic decode fires every 46 bits, so we may attempt type
-	 * detection before the full tone comma (968 bits) has arrived.
-	 * With only ~144 remaining bits, we can't distinguish "tone comma
-	 * still being received" from "alpha data block" by bit count alone.
-	 *
-	 * Solution: probe the first BCH block. If all 8 codewords decode
-	 * and the checksum matches, it's data (~1/128 false positive rate).
-	 * If the probe fails and we don't have 968+ bits yet, return -1
-	 * (need more data) unless force=1. */
+	 * The periodic decode fires every 46 bits, so we wait until the
+	 * 121 bits after the address are in (return -1 unless force=1).
+	 * Then probe the first BCH block: if all 8 codewords decode and
+	 * the checksum matches, it's data (~1/128 false positive rate).
+	 * Otherwise it is tone-only. */
 	if (remaining < 1 + bch_block_bits) {
 		if (!force) {
 			LOGP(DGOLAY, LOGL_DEBUG, "Not enough post-address bits to determine type (%d remaining), need more data.\n", remaining);
@@ -1861,18 +1981,12 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				}
 			}
 
-			/* If BCH probe didn't identify data and we don't have
-			 * enough bits for a full tone comma yet, we can't tell -
-			 * request more data unless forced. */
-			if (!data_detected && remaining < tone_comma_len) {
-				if (!force) {
-					LOGP(DGOLAY, LOGL_DEBUG, "Type ambiguous: %d post-address bits (need %d for tone), waiting for more data.\n",
-						remaining, tone_comma_len);
-					return -1;
-				}
-				LOGP(DGOLAY, LOGL_NOTICE, "Forced decode: %d post-address bits, defaulting to tone-only.\n", remaining);
+			/* Neither the activation code nor a data block after the
+			 * address: tone-only. A tone-only page is the address alone,
+			 * the next address, start code or preamble may follow at once
+			 * (S2.5; Motorola GSC manual, Figure 6-2). */
+			if (!data_detected)
 				detected_type = TYPE_TONE;
-			}
 		}
 	}
 
@@ -1923,6 +2037,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 	if (detected_type == TYPE_ALPHA || detected_type == TYPE_NUMERIC) {
 		int data_start_pos = pos; /* save position for numeric re-decode */
+		int alpha_end_pos;        /* end of the data blocks, from the alpha pass */
 		int alpha_need_bits = 0;   /* 1 = alpha loop broke due to insufficient bits */
 
 		/* ============================================================
@@ -2069,6 +2184,11 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 			if (contbit && alpha_broke_early)
 				alpha_need_bits = 1;
 		}
+
+		/* The alpha pass follows the continue bits through all blocks
+		 * (up to MAX_ADB); the numeric pass stops at MAX_NDB. The message
+		 * ends where the alpha pass ended. */
+		alpha_end_pos = pos;
 
 		/* If alpha already decoded more chars than numeric can ever
 		 * produce (MAX_NDB * 12 = 24 digits), this is definitively
@@ -2245,6 +2365,11 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 			return -1;
 		}
 
+		/* Continue after the last data block, not after the last
+		 * block the numeric pass read */
+		if (pos < alpha_end_pos)
+			pos = alpha_end_pos;
+
 		/* ============================================================
 		 * Scoring and discrimination: score both interpretations and
 		 * pick the winner using unified scoring (content + fill).
@@ -2324,17 +2449,16 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	/* ================================================================
 	 * Stage 7: TONE-ONLY
 	 *
-	 * Encoder: queue_comma(gsc, 121 * 8, 1) = 968 bits alternating
-	 *
-	 * The tone-only comma has already been identified by the type
-	 * detection logic. Skip past it.
+	 * The address alone. A comma after it (as some encoders send it)
+	 * is skipped as long as it lasts, up to 968 bits.
 	 * ================================================================ */
 
 	if (detected_type == TYPE_TONE) {
-		if (remaining >= tone_comma_len)
-			pos += tone_comma_len;
-		else
-			pos += remaining;
+		int skip = gsc_tone_skip(bits, pos, total_bits, force);
+
+		if (skip < 0)
+			return -1;
+		pos += skip;
 
 		msg->type = TYPE_TONE;
 		LOGP(DGOLAY, LOGL_INFO, "Tone-only message for address '%s'.\n", msg->address);
@@ -2366,8 +2490,17 @@ decode_done:
 		msg->type == TYPE_NUMERIC ? "numeric" : "tone",
 		log_escape(msg->data), msg->error_count);
 
-	/* --- Batch continuation: peek ahead for more addresses --- */
+	/* --- Batch continuation: peek ahead for more addresses ---
+	 *
+	 * The messages are collected and only reported once the batch has
+	 * ended (something that is no address or start code follows), or
+	 * when forced. Unless forced, running out of bits returns -1, so the
+	 * caller buffers more and decodes again: a batch is not cut at the
+	 * end of what has been received so far, and nothing is reported
+	 * twice. */
 	{
+		static gsc_rx_msg_t batch_out[32];
+		int batch_out_count = 0;
 		int batch_count = 1; /* first message already decoded above */
 		int batch_pos = pos;
 
@@ -2383,6 +2516,8 @@ decode_done:
 			/* Need at least comma(28) + dup Golay(46) = 74 bits
 			 * to peek at the next codeword */
 			if (batch_pos + comma_len + dup_bits > total_bits) {
+				if (!force)
+					return -1;
 				LOGP(DGOLAY, LOGL_DEBUG, "Batch: not enough bits for continuation check (%d remaining).\n",
 					total_bits - batch_pos);
 				break;
@@ -2446,6 +2581,8 @@ decode_done:
 					batch_count);
 
 				if (batch_pos + 1 + dup_bits > total_bits) {
+					if (!force)
+						return -1;
 					LOGP(DGOLAY, LOGL_NOTICE, "Batch: not enough bits for extended start code complement.\n");
 					break;
 				}
@@ -2599,6 +2736,8 @@ decode_done:
 				bm_remaining = total_bits - batch_pos;
 
 				if (bm_remaining < 1 + bch_block_bits) {
+					if (!force)
+						return -1;
 					bm_detected_type = TYPE_TONE;
 				} else {
 					bm_detected_type = TYPE_TONE;
@@ -2724,6 +2863,7 @@ decode_done:
 
 				if (bm_detected_type == TYPE_ALPHA || bm_detected_type == TYPE_NUMERIC) {
 					int bm_data_start = batch_pos;
+					int bm_data_end;
 					int bm_alpha_pos = 0;
 					int bm_numeric_pos = 0;
 					uint8_t bm_contbit;
@@ -2734,8 +2874,11 @@ decode_done:
 					for (i = 0; bm_contbit && i < MAX_ADB; i++) {
 						int k, j;
 
-						if (batch_pos + 1 + bch_block_bits > total_bits)
+						if (batch_pos + 1 + bch_block_bits > total_bits) {
+							if (!force)
+								return -1;
 							break;
+						}
 
 						batch_pos += 1; /* skip 1-bit inverted comma */
 						deinterleave_bch(bits, &batch_pos, bch_cw);
@@ -2784,6 +2927,10 @@ decode_done:
 						}
 					}
 					batch_msg.alpha_data[bm_alpha_pos] = '\0';
+
+					/* The alpha pass follows the continue bits through all
+					 * blocks; the message ends there */
+					bm_data_end = batch_pos;
 
 					/* Numeric decode (re-read from same position) */
 					batch_pos = bm_data_start;
@@ -2839,6 +2986,9 @@ decode_done:
 					}
 					batch_msg.numeric_data[bm_numeric_pos] = '\0';
 
+					/* Continue after the last data block */
+					batch_pos = bm_data_end;
+
 					/* Score and discriminate */
 					batch_msg.alpha_score = gsc_score_alpha(batch_msg.alpha_codes, batch_msg.alpha_code_count, batch_msg.alpha_fill);
 					batch_msg.numeric_score = gsc_score_numeric(batch_msg.numeric_nibbles, batch_msg.numeric_nibble_count, batch_msg.numeric_fill);
@@ -2847,6 +2997,8 @@ decode_done:
 
 				/* Voice: decode activation code */
 				if (bm_detected_type == TYPE_VOICE) {
+					if (batch_pos + comma_len + dup_bits + 1 + dup_bits > total_bits && !force)
+						return -1;
 					if (batch_pos + comma_len + dup_bits + 1 + dup_bits <= total_bits) {
 						batch_pos += comma_len;
 						codeword = read_dup_golay(bits, &batch_pos);
@@ -2860,13 +3012,14 @@ decode_done:
 					batch_msg.type = TYPE_VOICE;
 				}
 
-				/* Tone-only: skip tone comma */
+				/* Tone-only: the address alone, a comma after it is skipped
+				 * as long as it lasts (up to 968 bits) */
 				if (bm_detected_type == TYPE_TONE) {
-					bm_remaining = total_bits - batch_pos;
-					if (bm_remaining >= tone_comma_len)
-						batch_pos += tone_comma_len;
-					else
-						batch_pos += bm_remaining;
+					int skip = gsc_tone_skip(bits, batch_pos, total_bits, force);
+
+					if (skip < 0)
+						return -1;
+					batch_pos += skip;
 					batch_msg.type = TYPE_TONE;
 				}
 
@@ -2880,10 +3033,14 @@ decode_done:
 					batch_msg.type == TYPE_NUMERIC ? "numeric" : "tone",
 					batch_msg.error_count);
 
-				golay_msg_receive(&batch_msg);
+				batch_out[batch_out_count++] = batch_msg;
 				batch_count++;
 			}
 		}
+
+		/* The batch has ended: report its further messages */
+		for (i = 0; i < batch_out_count; i++)
+			golay_msg_receive(&batch_out[i]);
 
 		if (batch_count > 1) {
 			LOGP(DGOLAY, LOGL_INFO, "Batch decode: %d total messages decoded.\n", batch_count);
@@ -2910,7 +3067,6 @@ int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	const int comma_len = 28;
 	const int dup_bits = 46;
 	const int bch_block_bits = 120;
-	const int tone_comma_len = 121 * 8;
 
 	uint32_t codeword;
 	uint16_t decoded_value;
@@ -3159,10 +3315,7 @@ int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 				}
 			}
 
-			if (detected_type == TYPE_TONE && remaining < tone_comma_len) {
-				if (!force)
-					return -1;
-			}
+			/* Neither voice nor data: tone-only, the address alone (S2.5) */
 		}
 	}
 
@@ -3404,8 +3557,10 @@ static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type ty
 		}
 		break;
 	default:
-		LOGP(DGOLAY, LOGL_DEBUG, "Encoding 'comma' sequence after tone-only address.\n");
-		queue_comma(gsc, 121 * 8, 1);
+		/* Tone-only: the address alone (S2.5: "only the pager addresses
+		 * need to be transmitted for tone only paging") */
+		LOGP(DGOLAY, LOGL_DEBUG, "Tone-only: address only.\n");
+		break;
 	}
 
 	if (gsc->bit_overflow) {
@@ -3610,9 +3765,10 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 		}
 		break;
 	default:
-		/* encode comma after message and store */
-		LOGP(DGOLAY, LOGL_DEBUG, "Encoding 'comma' sequence after message.\n");
-		queue_comma(gsc, 121 * 8, 1);
+		/* Tone-only: the address alone, the next transmission may follow
+		 * at once (Motorola GSC manual, Figure 6-2, individual mode) */
+		LOGP(DGOLAY, LOGL_DEBUG, "Tone-only: address only.\n");
+		break;
 	}
 
 	/* check overflow */
@@ -3784,6 +3940,8 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 	int i, j, k;
 	int rc;
 	int msg_index;
+	int slots_used;
+	int message_start;
 	gsc_msg_t *cur;
 
 	queue_reset(gsc);
@@ -3811,8 +3969,16 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 	queue_bit(gsc, (golay & 1) ^ 1);
 	queue_dup(gsc, golay, 23);
 
-	/* Encode each message in the batch */
+	/* Encode each message in the batch.
+	 *
+	 * Batch slots are blocks of 121 bits: an address, a data block, a repeated
+	 * start code or a fill comma (S2.1, S2.6: a data block has the length of an
+	 * address block and takes its place in the batch). A batch holds 16 slots
+	 * after its start code. A message started in it runs on to its end (S2.1),
+	 * the next address then extends the batch with the start code, without a
+	 * new preamble (Motorola GSC manual, Figure 6-2, extended batch mode). */
 	msg_index = 0;
+	slots_used = 0;
 	for (cur = msgs; cur != NULL; cur = cur->next) {
 		/* Defensive: skip voice messages (should never be in a batch group) */
 		if (cur->type == TYPE_VOICE) {
@@ -3820,9 +3986,10 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 			continue;
 		}
 
-		/* Extended batch: insert second start code after 16th address */
-		if (msg_index == 16) {
-			LOGP(DGOLAY, LOGL_DEBUG, "Encoding second start code for extended batch.\n");
+		/* Extended batch: the start code follows the 16 slots of the batch */
+		if (slots_used >= 16) {
+			slots_used = 0;
+			LOGP(DGOLAY, LOGL_DEBUG, "Encoding repeated start code for extended batch.\n");
 			golay = calc_golay(start_code);
 			queue_comma(gsc, 28, golay & 1);
 			queue_dup(gsc, golay, 23);
@@ -3856,6 +4023,7 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 		}
 
 		LOGP(DGOLAY, LOGL_DEBUG, "Encoding batch address %d/%d: '%s' type=%d.\n", msg_index + 1, count, cur->address, cur->type);
+		message_start = gsc->bit_num;
 
 		/* Encode address W1/W2 with function bits (same as queue_batch) */
 		golay = calc_golay(word1);
@@ -3952,12 +4120,12 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 			break;
 		}
 		default:
-			/* Tone-only: encode comma after address */
-			LOGP(DGOLAY, LOGL_DEBUG, "Encoding 'comma' sequence after tone-only address.\n");
-			queue_comma(gsc, 121 * 8, 1);
+			/* Tone-only: the address alone, the next address follows at once
+			 * (S2.5; Motorola GSC manual, Figure 6-2) */
 			break;
 		}
 
+		slots_used += (gsc->bit_num - message_start) / 121;
 		msg_index++;
 
 		/* Check buffer overflow mid-batch */
@@ -3969,11 +4137,10 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 	}
 
 	/* Per S2.1: "Unfilled batches should be filled out with comma."
-	 * Each address slot is 121 bits. Pad remaining slots up to 16
-	 * (or 32 for extended batch) with comma. */
+	 * Each slot is 121 bits. Pad the remaining slots of the last batch
+	 * up to 16 with comma. */
 	{
-		int max_slots = (msg_index > 16) ? 32 : 16;
-		int pad_slots = max_slots - msg_index;
+		int pad_slots = 16 - slots_used;
 		if (pad_slots > 0) {
 			LOGP(DGOLAY, LOGL_DEBUG, "Padding %d unfilled batch slots with comma (%d bits each).\n",
 				pad_slots, 121);

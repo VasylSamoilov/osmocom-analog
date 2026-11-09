@@ -192,7 +192,14 @@ typedef struct gsc {
 	wave_rec_t		voice_rec;		/* wave file writer for voice recording */
 	int			voice_recording;	/* 1 = wave file is open and recording */
 	int			voice_alert_wait;	/* samples remaining in 2-sec alert pause */
-	int			voice_timeout;		/* samples remaining before 2-min timeout */
+	int			voice_timeout;		/* samples remaining before the voice timeout */
+	uint8_t			voice_window[121];	/* last 121 bits in the voice state (oldest first) */
+	int			voice_window_count;	/* bits in voice_window */
+	int8_t			voice_hits[93];		/* preamble hit history (index * 2 + inverted, -1 = none), ring */
+	int			voice_hit_pos;		/* position of the newest hit in voice_hits */
+	int			voice_bits;		/* bits received since the voice page */
+	int			voice_hold;		/* bits before the next word may be taken */
+	int			voice_preamble_index;	/* preamble of the voice page (for interleaved addresses) */
 	char			voice_address[8];	/* address of current voice message */
 	char			voice_filename[512];	/* path of current voice WAV file */
 	samplerate_t		voice_downsample;	/* resampler: DSP rate -> 8000 Hz */
@@ -267,6 +274,10 @@ void scheduler_dump(gsc_t *gsc);
 int decode_golay(uint32_t codeword, uint16_t *data);
 int decode_bch(uint16_t codeword, uint8_t *data);
 int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force);
+int gsc_decode_tone_address(const uint8_t *bits, int preamble_idx, gsc_rx_msg_t *msg);
+/* Split bit pairs of a word (46 bits) above which the bits are taken for no word */
+#define GSC_MAX_SPLIT_PAIRS	4
+int gsc_split_pairs(const uint8_t *bits);
 int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force);
 int reverse_word1(uint16_t w1, int *g1, int *g0);
 int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0);

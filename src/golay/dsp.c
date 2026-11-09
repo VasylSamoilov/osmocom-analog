@@ -35,6 +35,9 @@
 
 #define MAX_DISPLAY	1.4	/* something above speech level, no emphasis */
 #define VOICE_BANDWIDTH	3000	/* just guessing */
+/* Voice timeout in seconds: the longest documented pager timeout (OPTRX, 50 s;
+ * DIMENSION 1000 has 20 s, Motorola GSC manual, Code Word Automatic Reset) */
+#define VOICE_TIMEOUT	50
 
 static void dsp_init_ramp(gsc_t *gsc)
 {
@@ -279,13 +282,19 @@ static void rx_enter_voice(gsc_t *gsc, const gsc_rx_msg_t *msg)
 	/* 2-second alert pause: pager beeps during this time, audio is not voice yet */
 	gsc->voice_alert_wait = gsc->sender.samplerate * 2;
 
-	/* 2-minute recording timeout */
-	gsc->voice_timeout = gsc->sender.samplerate * 120;
+	/* Voice timeout, if neither the turn-off word nor a new preamble comes */
+	gsc->voice_timeout = gsc->sender.samplerate * VOICE_TIMEOUT;
 
-	/* Reset preamble scanner for stop detection during voice */
+	/* Reset the scanners for stop detection during voice */
 	gsc->rx_shift_count = 0;
 	gsc->rx_no_transition = 0;
 	gsc->rx_bit_num = 0;
+	gsc->voice_window_count = 0;
+	memset(gsc->voice_hits, -1, sizeof(gsc->voice_hits));
+	gsc->voice_hit_pos = 0;
+	gsc->voice_bits = 0;
+	gsc->voice_hold = 0;
+	gsc->voice_preamble_index = msg->preamble_index;
 
 	/* Open WAV file if voice_dir is configured */
 	if (gsc->voice_dir) {
@@ -542,97 +551,77 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 	/* ---- Phase 3a: RX_VOICE — scan for new preamble as stop condition ---- */
 	if (gsc->rx_state == RX_VOICE) {
 		/* During voice recording, the FSK demodulator still runs on
-		 * the audio. We use the demodulated bits only to detect a new
-		 * preamble (which means a new transmission is starting and we
-		 * should stop recording). The actual audio sample capture
-		 * happens in sender_receive().
+		 * the audio. The demodulated bits are used to detect the end
+		 * of the voice message and tone-only addresses interleaved in
+		 * the alert time (Motorola GSC manual, Figure 6-1 and Code Word
+		 * Automatic Reset). The actual audio sample capture happens in
+		 * sender_receive().
 		 *
-		 * No stop detection during the 2-second alert wait — the TX
-		 * sends silence during this period (pager is alerting), which
-		 * would false-trigger the silence detector. */
-		if (gsc->voice_alert_wait > 0)
-			return;
+		 * The voice audio gives random bits, so a single Golay word is
+		 * not enough (any 46 bits decode to a given word with 3 errors
+		 * at a rate of 2.4e-4), and a word is only taken where its bit
+		 * pairs agree (at most GSC_MAX_SPLIT_PAIRS split pairs: every
+		 * bit of a word is sent twice). The voice message ends on:
+		 *   - the turn-off word: the activation code after a 28-bit comma
+		 *     (at most 2 bit errors), on Word 1 or its complement on Word 2
+		 *   - a new preamble: PREAMBLE_LOCK_THRESHOLD consecutive words of
+		 *     the same preamble, 46 bits apart (as in RX_IDLE)
+		 *   - silence (loopback), or the timeout in sender_receive(). */
+		uint8_t *w = gsc->voice_window;
+		int n;
+
+		if (gsc->voice_window_count < 121) {
+			w[gsc->voice_window_count++] = bit;
+		} else {
+			memmove(w, w + 1, 120);
+			w[120] = bit;
+		}
+		n = gsc->voice_window_count;
+		gsc->voice_bits++;
 
 		/* Track consecutive same-value bits for silence detection.
-		 * rx_bit[0] stores the previous bit value (rx_bit[] is unused
-		 * for data buffering during RX_VOICE). */
-		if (gsc->rx_bit_num >= 1 && bit == gsc->rx_bit[0])
+		 * No silence detection during the 2-second alert wait — the TX
+		 * may send silence during this period (pager is alerting). */
+		if (n >= 2 && w[n - 1] == w[n - 2])
 			gsc->rx_no_transition++;
 		else
 			gsc->rx_no_transition = 0;
-		gsc->rx_bit[0] = bit;
-		gsc->rx_bit_num++;
 
 		/* Silence detection: 48+ consecutive same-value bits means
 		 * the transmitter stopped. On a real radio this may not fire
 		 * (noise produces transitions), but works in loopback. */
-		if (gsc->rx_no_transition >= 48) {
+		if (gsc->voice_alert_wait == 0 && gsc->rx_no_transition >= 48) {
 			LOGP_CHAN(DDSP, LOGL_INFO, "RX: voice recording stopped (silence detected).\n");
 			rx_reset_idle(gsc);
 			return;
 		}
 
-		/* Preamble scanning: sliding window, check after every bit.
-		 * Unlike RX_DATA (which uses fixed 46-bit boundaries), we need
-		 * a sliding window here because we have no bit alignment — the
-		 * FSK demodulator produces garbage during voice audio, so we
-		 * can't predict where the next preamble will start. */
-		if (gsc->rx_shift_count < 46) {
-			gsc->rx_shift[gsc->rx_shift_count++] = bit;
-		} else {
-			memmove(gsc->rx_shift, gsc->rx_shift + 1, 45);
-			gsc->rx_shift[45] = bit;
-		}
+		/* New preamble: the last 46 bits are a preamble word, and so were
+		 * the 46 bits before them and the 46 before those */
+		{
+			int hit = -1;
+			int p1, p2;
 
-		if (gsc->rx_shift_count >= 46) {
-			uint32_t codeword = resolve_shift_register(gsc->rx_shift);
-			uint16_t decoded;
-			int new_inverted = 0;
-			int is_preamble = 0;
-			int is_activation = 0;
+			if (n >= 46 && gsc_split_pairs(w + n - 46) <= GSC_MAX_SPLIT_PAIRS) {
+				uint32_t codeword = resolve_shift_register(w + n - 46);
+				uint16_t decoded;
+				int idx;
 
-			/* Check for activation code (voice stop sequence) */
-			if (decode_golay(codeword, &decoded) == 0) {
-				if (match_preamble(decoded) >= 0) {
-					is_preamble = 1;
-					new_inverted = 0;
-				} else if (decoded == activation_code) {
-					is_activation = 1;
-				}
-			}
-			if (!is_preamble && !is_activation) {
-				if (decode_golay(codeword ^ 0x7FFFFF, &decoded) == 0) {
-					if (match_preamble(decoded) >= 0) {
-						is_preamble = 1;
-						new_inverted = 1;
-					} else if (decoded == activation_code) {
-						is_activation = 1;
-					}
-				}
+				if (decode_golay(codeword, &decoded) == 0 && (idx = match_preamble(decoded)) >= 0)
+					hit = idx * 2;
+				else if (decode_golay(codeword ^ 0x7FFFFF, &decoded) == 0 && (idx = match_preamble(decoded)) >= 0)
+					hit = idx * 2 + 1;
 			}
 
-			if (!is_preamble && !is_activation)
-				return; /* no match, keep recording */
+			gsc->voice_hit_pos = (gsc->voice_hit_pos + 1) % 93;
+			gsc->voice_hits[gsc->voice_hit_pos] = hit;
+			p1 = (gsc->voice_hit_pos + 93 - 46) % 93;
+			p2 = (gsc->voice_hit_pos + 93 - 92) % 93;
 
-			if (is_activation) {
-				/* Activation code = voice stop sequence */
-				LOGP_CHAN(DDSP, LOGL_INFO, "RX: activation code detected during voice, stopping recording.\n");
-				if (gsc->voice_recording) {
-					double dur = (gsc->voice_rec.samplerate > 0) ? (double)gsc->voice_rec.written / gsc->voice_rec.samplerate : 0.0;
-					wave_destroy_record(&gsc->voice_rec);
-					gsc->voice_recording = 0;
-					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended for address '%s' (%.1fs), saved: %s\n", gsc->voice_address, dur, gsc->voice_filename);
-				} else {
-					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended for address '%s' (not recorded).\n", gsc->voice_address);
-				}
-				rx_reset_idle(gsc);
-				return;
-			}
+			if (hit >= 0 && gsc->voice_hits[p1] == hit && gsc->voice_hits[p2] == hit) {
+				int idx = hit >> 1;
+				int new_inverted = hit & 1;
 
-			/* New preamble detected — stop voice recording and
-			 * start confirming the new preamble. */
-			{
-				int idx = match_preamble(decoded);
 				LOGP_CHAN(DDSP, LOGL_INFO, "RX: new preamble (index %d) detected during voice, stopping recording.\n", idx);
 
 				/* Stop recording */
@@ -640,32 +629,86 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 					double dur = (gsc->voice_rec.samplerate > 0) ? (double)gsc->voice_rec.written / gsc->voice_rec.samplerate : 0.0;
 					wave_destroy_record(&gsc->voice_rec);
 					gsc->voice_recording = 0;
-					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended for address '%s' (%.1fs), saved: %s\n", gsc->voice_address, dur, gsc->voice_filename);
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended by a new transmission for address '%s' (%.1fs), saved: %s\n", gsc->voice_address, dur, gsc->voice_filename);
 				} else {
-					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended for address '%s' (not recorded).\n", gsc->voice_address);
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended by a new transmission for address '%s' (not recorded).\n", gsc->voice_address);
 				}
 
-				/* Start confirming the new preamble */
+				/* Confirm the new preamble on its next word, as when a
+				 * preamble is found during RX_DATA */
 				gsc->rx_state = RX_PREAMBLE;
 				gsc->rx_confirm_index = idx;
-				gsc->rx_confirm_count = 1;
-				if (new_inverted) {
-					gsc->rx_batch_candidate = 1;
-					gsc->rx_polarity_inverted = 0;
-				} else {
-					gsc->rx_batch_candidate = 0;
-					gsc->rx_polarity_inverted = 0;
-				}
-				memcpy(gsc->rx_confirm_bits, gsc->rx_shift, 46);
+				gsc->rx_confirm_count = PREAMBLE_LOCK_THRESHOLD;
+				gsc->rx_batch_candidate = new_inverted;
+				gsc->rx_polarity_inverted = 0;
+				memcpy(gsc->rx_confirm_bits, w + n - 46, 46);
 				gsc->rx_confirm_bit_count = 0;
 				gsc->rx_bit_num = 0;
 				gsc->rx_no_transition = 0;
 
 				LOGP_CHAN(DDSP, LOGL_INFO, "RX state: VOICE -> PREAMBLE (new candidate index %d, polarity %s).\n",
 					idx, new_inverted ? "inverted" : "normal");
+				return;
 			}
 		}
-		return;
+
+		if (gsc->voice_hold > 0) {
+			gsc->voice_hold--;
+			return;
+		}
+		if (n < 121)
+			return;
+
+		{
+			int errors = 0, i, pos;
+			uint32_t codeword;
+			uint16_t decoded;
+			int is_activation = 0;
+			gsc_rx_msg_t tone;
+
+			/* A word pair needs its 28-bit comma */
+			for (i = 1; i < 28; i++) {
+				if (w[i] == w[i - 1])
+					errors++;
+			}
+			if (errors > 2)
+				return;
+
+			pos = 28;
+			codeword = resolve_shift_register(w + pos);
+			if (gsc_split_pairs(w + pos) <= GSC_MAX_SPLIT_PAIRS && decode_golay(codeword, &decoded) == 0 && decoded == activation_code)
+				is_activation = 1;
+			pos = 28 + 46 + 1;
+			codeword = resolve_shift_register(w + pos);
+			if (gsc_split_pairs(w + pos) <= GSC_MAX_SPLIT_PAIRS && decode_golay(codeword ^ 0x7FFFFF, &decoded) == 0 && decoded == activation_code)
+				is_activation = 1;
+
+			/* Tone-only addresses interleaved in the 2 s alert time */
+			if (!is_activation) {
+				if (gsc->voice_bits <= 1200 + 121 && gsc_decode_tone_address(w, gsc->voice_preamble_index, &tone) == 0) {
+					tone.polarity_inverted = gsc->rx_polarity_inverted;
+					LOGP_CHAN(DDSP, LOGL_INFO, "RX: tone-only address '%s' interleaved in the voice alert time.\n", tone.address);
+					golay_msg_receive(&tone);
+					gsc->voice_hold = 120;
+				}
+				return;
+			}
+
+			{
+				/* Activation code again = turn-off word, end of the voice message */
+				LOGP_CHAN(DDSP, LOGL_INFO, "RX: turn-off word (activation code) detected during voice, stopping recording.\n");
+				if (gsc->voice_recording) {
+					double dur = (gsc->voice_rec.samplerate > 0) ? (double)gsc->voice_rec.written / gsc->voice_rec.samplerate : 0.0;
+					wave_destroy_record(&gsc->voice_rec);
+					gsc->voice_recording = 0;
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended by the turn-off word for address '%s' (%.1fs), saved: %s\n", gsc->voice_address, dur, gsc->voice_filename);
+				} else {
+					LOGP_CHAN(DDSP, LOGL_NOTICE, "Voice page ended by the turn-off word for address '%s' (not recorded).\n", gsc->voice_address);
+				}
+				rx_reset_idle(gsc);
+				return;
+			}
+		}
 	}
 
 	/* ---- Phase 3b: RX_DATA — buffer bits until end of transmission ---- */
@@ -869,7 +912,9 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 	 *    Batch transmissions with multiple addresses are handled by
 	 *    decode_batch's batch continuation logic. */
 	{
-		const int max_batch_bits = 4096;
+		/* A batch is decoded only once it has ended (decode_batch()
+		 * returns -1 until then), so it may fill the whole buffer */
+		const int max_batch_bits = gsc->rx_batch_mode ? (int)sizeof(gsc->rx_bit) - 46 : 4096;
 		int do_decode = 0;
 		int trim_trailing = 0;
 		int force_reset = 0;
@@ -910,6 +955,18 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 			rc = gsc->rx_nbs_locked
 				? decode_nbs(gsc, &msg, force)
 				: decode_batch(gsc, &msg, force);
+
+			/* The trimmed run of equal bits may have begun inside the
+			 * last codeword (a tone-only page ends with its address, its
+			 * last bits may equal the silence after it): try again with
+			 * the run kept. The run is shorter than a data block, so it is
+			 * not taken for data. */
+			if (rc != 0 && trim_trailing && nbits < saved_rx_num) {
+				gsc->rx_bit_num = saved_rx_num;
+				rc = gsc->rx_nbs_locked
+					? decode_nbs(gsc, &msg, force)
+					: decode_batch(gsc, &msg, force);
+			}
 
 			gsc->rx_bit_num = saved_rx_num;
 
@@ -975,10 +1032,10 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 			wave_write(&gsc->voice_rec, rec_samples, out_count);
 		}
 
-		/* 2-minute timeout: decrement by buffer length */
+		/* Voice timeout: decrement by buffer length */
 		gsc->voice_timeout -= length;
 		if (gsc->voice_timeout <= 0) {
-			LOGP_CHAN(DDSP, LOGL_INFO, "Voice recording timeout (2 min) for '%s'.\n", gsc->voice_address);
+			LOGP_CHAN(DDSP, LOGL_INFO, "Voice page ended by the timeout (%d s) for '%s'.\n", VOICE_TIMEOUT, gsc->voice_address);
 			rx_reset_idle(gsc);
 			return;
 		}
