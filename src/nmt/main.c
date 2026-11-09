@@ -640,26 +640,12 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* create unified NMT command FIFO (see NMT_CMD_FIFO for command syntax) */
-	unlink(NMT_CMD_FIFO);
-	rc = mkfifo(NMT_CMD_FIFO, 0666);
-	if (rc < 0) {
-		fprintf(stderr, "Failed to create NMT command FIFO '%s'!\n", NMT_CMD_FIFO);
-		goto fail;
-	} else {
-		nmt_cmd_fd = open(NMT_CMD_FIFO, O_RDONLY | O_NONBLOCK);
-		if (nmt_cmd_fd < 0) {
-			fprintf(stderr, "Failed to open NMT command FIFO '%s'!\n", NMT_CMD_FIFO);
-			goto fail;
-		}
-	}
-
 	/* inits */
 	fm_init(fast_math);
 	rc = init_frame();
 	if (rc < 0) {
 		fprintf(stderr, "Failed to setup frames. Quitting!\n");
-		return -1;
+		goto fail;
 	}
 	dsp_init();
 

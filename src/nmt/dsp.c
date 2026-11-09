@@ -341,6 +341,7 @@ void super_reset(nmt_t *nmt)
 {
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Supervisory detector reset.\n");
 	nmt->super_detected = 0;
+	nmt->super_seen = 0;
 	nmt->super_detect_count = 0;
 }
 

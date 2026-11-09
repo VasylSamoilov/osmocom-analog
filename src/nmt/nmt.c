@@ -1001,6 +1001,10 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 	case NMT_MESSAGE_11a: /* roaming update and seizure */
 		if (!match_channel(nmt, frame))
 			break;
+		if (!is_chan_class_tc(nmt->sysinfo.chan_type)) {
+			LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping frame 11a on non-TC channel.\n");
+			break;
+		}
 		if (!match_area(nmt, frame))
 			break;
 		/* set subscriber */
@@ -1060,11 +1064,14 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 		trans->nmt = nmt;
 		nmt_page(trans, 1);
 		break;
-	case NMT_MESSAGE_10b: /* seizure from ordinary MS */
+	case NMT_MESSAGE_10b: /* seizure from ordinary MS, or access signal on an access channel */
 	case NMT_MESSAGE_12: /* seizure from coinbox MS */
-	case NMT_MESSAGE_10a: /* access signal */
 		if (!match_channel(nmt, frame))
 			break;
+		if (!is_chan_class_tc(nmt->sysinfo.chan_type)) {
+			LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping frame %s on non-TC channel.\n", nmt_frame_name(frame->mt));
+			break;
+		}
 		if (!match_area(nmt, frame))
 			break;
 		/* set subscriber */
@@ -2084,7 +2091,9 @@ static void tx_scip_ident(nmt_t *nmt, frame_t *frame)
 			LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: no identity within T', re-requesting identity (3b) on new TC.\n");
 		return;
 	}
-	tx_ident(nmt, frame);
+	/* STATE_SCIP_IDENT: no transaction on this channel yet, radiate the
+	 * idle frame 6 until the MS identifies itself (Scheme C2', new TC). */
+	frame->mt = NMT_MESSAGE_6;
 }
 
 /* Hand the live call over from the old TC to this (new) TC and throughconnect
@@ -2200,9 +2209,10 @@ static int nmt_in_mft(nmt_t *nmt)
 
 void nmt_rx_super(nmt_t *nmt, int tone, double quality)
 {
-	if (tone)
+	if (tone) {
+		nmt->super_seen = 1;
 		LOGP_CHAN(DNMT, LOGL_INFO, "Detected supervisory signal with quality=%.0f.\n", quality * 100.0);
-	else
+	} else
 		LOGP_CHAN(DNMT, LOGL_INFO, "Lost supervisory signal\n");
 
 	if (nmt->sender.loopback)
@@ -2226,7 +2236,7 @@ void nmt_rx_super(nmt_t *nmt, int tone, double quality)
 		osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO2);
 }
 
-static void timeout_active(nmt_t *nmt, int duration)
+static void timeout_active(nmt_t *nmt)
 {
 	transaction_t *trans = nmt->trans;
 
@@ -2252,10 +2262,10 @@ static void timeout_active(nmt_t *nmt, int duration)
 		return;
 	}
 
-	if (duration == SUPERVISORY_TO1)
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout after %d seconds not receiving supervisory signal.\n", duration);
+	if (!nmt->super_seen)
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout after %d seconds not receiving supervisory signal.\n", SUPERVISORY_TO1);
 	else
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout after %d seconds loosing supervisory signal.\n", duration);
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Timeout after %d seconds loosing supervisory signal.\n", 20);
 	LOGP_CHAN(DNMT, LOGL_INFO, "Release call towards network.\n");
 	call_up_release(trans->callref, CAUSE_TEMPFAIL);
 	trans->callref = 0;
@@ -2831,7 +2841,7 @@ static void nmt_timeout(void *data)
 		timeout_mt_release(nmt);
 		break;
 	case STATE_ACTIVE:
-		timeout_active(nmt, nmt->timer.timeout.tv_sec);
+		timeout_active(nmt);
 		break;
 	case STATE_SCIP_IDENT:
 	case STATE_SCIP_IDENT_REQ:

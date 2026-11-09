@@ -186,6 +186,7 @@ struct nmt {
 	uint64_t		rx_bits_count_current;	/* sample counter of current frame */
 	uint64_t		rx_bits_count_last;	/* sample counter of last frame */
 	int			super_detected;		/* current detection state flag */
+	int			super_seen;		/* supervisory signal was detected since the last reset */
 	int			super_detect_count;	/* current number of consecutive detections/losses */
 	char			tx_frame[166];		/* carries bits of one frame to transmit */
 	int			tx_frame_length;
