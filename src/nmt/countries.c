@@ -94,11 +94,12 @@ static struct nmt_frequency frq_450_hu[] = {
 	{   0,	0,	0.0,		0.0,	0.0,	0.0,	0 }
 };
 
-/* channel allocation used in Turkey */
+/* unused: 450 style allocation for Turkey under NMT-900, no source found
 static struct nmt_frequency frq_900_tr[] = {
 	{   1,	180,	461.500,	0.025,	1.0,	10.0,	0 },
 	{   0,	0,	0.0,		0.0,	0.0,	0.0,	0 }
 };
+*/
 
 /* channel allocation used in France */
 static struct nmt_frequency frq_900_f[] = {
@@ -172,7 +173,7 @@ static struct nmt_country {
 	{ 450, 0, 9, 1,3,	"A2",	"Austria 2",		"PTV",				frq_450_a },
 	{ 900, 0, 5, 1,9,	"CH",	"Switzerland",		"PTT",				frq_900_scandinavia },
 	{ 900, 0, 6, 1,15,	"NL",	"Netherlands",		"Royal Dutch Post & Telecom",	frq_900_nl },
-	{ 900, 0, 1, 1,9,	"TR",	"Turkey",		"Turkcell",			frq_900_tr },
+	{ 900, 0, 1, 1,9,	"TR",	"Turkey",		"Turkcell",			frq_900_scandinavia },	/* no Turkish allocation known, standard NMT-900 plan (NMT Doc 900-3) */
 	{ 0,0, 0, 0,0,		NULL,	NULL,			NULL,				NULL }
 };
 

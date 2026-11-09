@@ -85,7 +85,10 @@ _Static_assert(AMPS_ORDER_MESSAGE_ENCRYPTION == AMPS_ORDER_DISABLE_DTMF + 1,
 #define PAGE_TO1	8,0		/* max time to wait for paging reply */
 #define PAGE_TO2	4,0		/* max time to wait for last paging reply */
 #define ALERT_TRIES	3		/* how many times to alert the phone */
-#define ALERT_TO	0,600000	/* max time to wait for alert confirm */
+#define ALERT_TO	0,900000	/* max time to wait for ST confirm, started after the order is generated:
+					 * 100 ms mobile reaction (TIA/EIA-553-A 2.6.4.3.1)
+					 * + 467 ms ST detection (SIG_DETECT_COUNT + 1 window of 66.7 ms)
+					 * + 300 ms TX/RX round trip (SDR) */
 #define ANSWER_TO	60,0		/* max time to wait for answer */
 #define RELEASE_TIMER	5,0		/* max time to send release messages */
 #define ST_FLASH_MIN	0.2		/* min duration for flash (200ms) */
@@ -1870,7 +1873,7 @@ void call_down_release(int callref, int cause)
  * 2. ST-CONFIRMED ORDER HANDLING (Requirement 1.2):
  *    Orders confirmed by Signaling Tone (10 kHz) use amps_rx_signaling_tone():
  *    - Alert (Order 1), Release (Order 3), Maintenance (Order 10), Alert With Info (Order 17)
- *    - Timeout: ALERT_TO (0.6 seconds)
+ *    - Timeout: ALERT_TO (0.9 seconds)
  *    - Retry logic: typically 3 attempts before failure
  *    - State transition: TRANS_CALL_<ORDER>_SEND -> wait for ST -> TRANS_CALL
  *
@@ -5263,7 +5266,7 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		/* Silent Page: Maintenance sent - wait for ST confirmation
 		 * Per TIA/EIA-553-A: Mobile turns on ST for 500ms
 		 * ST confirmation handled in amps_rx_signaling_tone()
-		 * Use ALERT_TO (0.6 seconds) for ST confirmation
+		 * Use ALERT_TO (0.9 seconds) for ST confirmation
 		 */
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Silent Page: Maintenance order sent, waiting for ST confirmation\n");
 		osmo_timer_schedule(&trans->timer, ALERT_TO);

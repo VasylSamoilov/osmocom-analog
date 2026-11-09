@@ -64,7 +64,10 @@ static int sms_ref = 0;
 #define SUPERVISORY_TO1	3	/* 3 sec to detect after setup */
 #define SUPERVISORY_TO2	20,0	/* 20 sec lost until abort */
 #define RECALL_TO	30,0	/* register recall: max time to receive all digits (4.4.1.10) */
-#define SCIP_TO		0,553000	/* T' = 553 ms (4 frames): MS re-identify window on the new TC (NMT 450-1 Scheme C2') */
+#define SCIP_TO		0,553000	/* T' = 553 ms (4 frames): MS re-identify window on the new TC (NMT 450-1 Scheme C2'),
+					 * started after the last 3c is generated, so it already spans the 3c frames on air */
+#define SCIP_REQ_TO	0,853000	/* T' + 300 ms TX/RX round trip (SDR): identity reply window after the 3b request,
+					 * started when the first 3b is generated */
 #define DTMF_DURATION	0.1	/* 100ms */
 
 /* Counters */
@@ -2172,7 +2175,7 @@ static void timeout_scip_ident(nmt_t *nmt)
 		nmt_new_state(nmt, STATE_SCIP_IDENT_REQ);
 		nmt->tx_frame_count = 0;
 		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
-		osmo_timer_schedule(&nmt->timer, SCIP_TO);
+		osmo_timer_schedule(&nmt->timer, SCIP_REQ_TO);
 		return;
 	}
 
