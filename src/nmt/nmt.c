@@ -58,7 +58,7 @@ static int sms_ref = 0;
 #define PAGING_TO	1,0	/* wait for paging response: fictive value */
 #define RELEASE_TO	2,0	/* how long do we wait for release guard of the phone */
 #define DIALING_TO	1,0	/* if we have a pause during dialing, we abort the call */
-#define CHANNEL_TO	2,0	/* how long do we wait for phone to appear on assigned channel */
+/* unused: #define CHANNEL_TO	2,0	(how long do we wait for phone to appear on assigned channel) */
 #define QUEUE_TO	60,0	/* how long a queued MT call waits on the CC for a free TC */
 #define RINGING_TO	60,0	/* how long may the phone ring */
 #define SUPERVISORY_TO1	3	/* 3 sec to detect after setup */
@@ -1715,10 +1715,17 @@ static void tx_mt_autoanswer(nmt_t *nmt, frame_t *frame)
 		frame->mt = NMT_MESSAGE_6;
 		return;
 	}
+	/* NMT Doc 450-1 Scheme B2 (4.4.1.12) steps 10-12: send 5a(L=12) four
+	 * times (T'), then idle frames 6 while the MS acknowledges with
+	 * 13a(L=12) within T'. The acknowledgement is accepted until T' after
+	 * the last 5a has elapsed. */
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send 'autoanswer order'.\n");
-	set_line_signal(nmt, frame, 12);
-	if (nmt->tx_frame_count == 4) {
+	if (nmt->tx_frame_count <= 4)
+		set_line_signal(nmt, frame, 12);
+	else
+		frame->mt = NMT_MESSAGE_6;
+	if (nmt->tx_frame_count == 8) {
 		LOGP_CHAN(DNMT, LOGL_INFO, "No reaction to autoanswer, proceed with ringing.\n");
 		nmt_new_state(nmt, STATE_MT_RINGING);
 		nmt->tx_frame_count = 0;
