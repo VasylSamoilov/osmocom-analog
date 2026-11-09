@@ -1617,8 +1617,9 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 	msg->preamble_index = gsc->rx_preamble_index;
 	preamble_idx = gsc->rx_preamble_index;
-	/* Also of the further messages of a batch, reported from here */
+	/* Also of the further messages of a batch */
 	msg->polarity_inverted = gsc->rx_polarity_inverted;
+	gsc->rx_batch_out_count = 0;
 
 	/* Non-battery-saver (S2.5): no coded preamble and no start code, the
 	 * first address follows the 1,1,0,0 pattern, and any number of
@@ -2557,14 +2558,15 @@ decode_done:
 
 	/* --- Batch continuation: peek ahead for more addresses ---
 	 *
-	 * The messages are collected and only reported once the batch has
-	 * ended (something that is no address or start code follows), or
-	 * when forced. Unless forced, running out of bits returns -1, so the
-	 * caller buffers more and decodes again: a batch is not cut at the
-	 * end of what has been received so far, and nothing is reported
-	 * twice. */
+	 * The further messages are collected in gsc->rx_batch_out[] and only
+	 * returned once the batch has ended (something that is no address or
+	 * start code follows), or when forced; the caller reports them after
+	 * the first message, in the order received. Unless forced, running out
+	 * of bits returns -1, so the caller buffers more and decodes again: a
+	 * batch is not cut at the end of what has been received so far, and
+	 * nothing is reported twice. */
 	{
-		static gsc_rx_msg_t batch_out[32];
+		gsc_rx_msg_t *batch_out = gsc->rx_batch_out;
 		int batch_out_count = 0;
 		int batch_count = 1; /* first message already decoded above */
 		int batch_pos = pos;
@@ -3103,9 +3105,8 @@ decode_done:
 			}
 		}
 
-		/* The batch has ended: report its further messages */
-		for (i = 0; i < batch_out_count; i++)
-			golay_msg_receive(&batch_out[i]);
+		/* The batch has ended: its further messages are returned */
+		gsc->rx_batch_out_count = batch_out_count;
 
 		if (batch_count > 1) {
 			LOGP(DGOLAY, LOGL_INFO, "Batch decode: %d total messages decoded.\n", batch_count);

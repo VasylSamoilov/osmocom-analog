@@ -331,6 +331,19 @@ static void rx_reset_idle(gsc_t *gsc)
 	gsc->rx_nbs_polarity_pending = 0;
 }
 
+/* Report what decode_batch() decoded, in the order received: the message it
+ * returned, then the further messages of the batch. */
+static void rx_report(gsc_t *gsc, gsc_rx_msg_t *msg)
+{
+	int i;
+
+	msg->polarity_inverted = gsc->rx_polarity_inverted;
+	golay_msg_receive(msg);
+	for (i = 0; i < gsc->rx_batch_out_count; i++)
+		golay_msg_receive(&gsc->rx_batch_out[i]);
+	gsc->rx_batch_out_count = 0;
+}
+
 /* NBS has no coded preamble or start code to tell the polarity by. With
  * auto-polarity it is taken from the 121 bits after the first address: a
  * data block or an activation code decodes in the right polarity only. A
@@ -922,10 +935,8 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 				if (old_bits >= 242) { /* start(121) + address(121) minimum */
 					int saved_rx_num = gsc->rx_bit_num;
 					gsc->rx_bit_num = old_bits;
-					if (decode_batch(gsc, &msg, 1) == 0) {
-						msg.polarity_inverted = gsc->rx_polarity_inverted;
-						golay_msg_receive(&msg);
-					}
+					if (decode_batch(gsc, &msg, 1) == 0)
+						rx_report(gsc, &msg);
 					gsc->rx_bit_num = saved_rx_num;
 				}
 
@@ -1046,8 +1057,7 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 			gsc->rx_bit_num = saved_rx_num;
 
 			if (rc == 0) {
-				msg.polarity_inverted = gsc->rx_polarity_inverted;
-				golay_msg_receive(&msg);
+				rx_report(gsc, &msg);
 				if (msg.type == TYPE_VOICE) {
 					rx_enter_voice(gsc, &msg);
 				} else {

@@ -260,6 +260,10 @@ typedef struct gsc {
 	int			rx_nbs_locked;		/* 1 = NBS preamble detected, buffering data */
 	int			rx_nbs_polarity_pending; /* 1 = NBS polarity not decided yet (auto-polarity) */
 
+	/* --- Further messages of the batch decode_batch() returned the first of --- */
+	gsc_rx_msg_t		rx_batch_out[31];
+	int			rx_batch_out_count;
+
 	/* --- Scan mode --- */
 	uint32_t		scan_from;		/* current scan position (6-digit base) */
 	uint32_t		scan_to;		/* scan end (exclusive) */
