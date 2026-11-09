@@ -700,8 +700,8 @@ int amps_create(const char *kanal, enum amps_chan_type chan_type, const char *de
 	 * while maintaining the +6 dB/octave slope characteristic. */
 	init_emphasis_fast(&amps->estate_tx_fast, 8000, 318.3e-6, 2000.0);
 
-	/* init TX post-limiter low pass filter (cutoff 3000 Hz, 4th order approx) */
-	iir_lowpass_init(&amps->tx_post_filter, 3000.0, samplerate, 4);
+	/* TX post-limiter low pass filter (cutoff 3000 Hz, 4th order approx): not applied anywhere
+	iir_lowpass_init(&amps->tx_post_filter, 3000.0, samplerate, 4); */
 
 	/* RX LPF removed - downsampler already has 3400Hz anti-aliasing filter.
 	 * The notch filter below removes SAT tones. Extra LPF was causing
@@ -1119,13 +1119,12 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 		return;
 	}
 
-	/* Check grace period - Ignore SAT status updates during power change / blank-and-burst */
-	if (trans->vmac_grace_count > 0) {
+	/* Grace period after a power change / blank-and-burst: only the power
+	 * control average is frozen. SAT detection and loss are still handled,
+	 * so a SAT loss arms the fade timer (TIA/EIA-553-A 2.6.4.1); the 5 s
+	 * fade timer already tolerates the short interruption. */
+	if (tone && trans->vmac_grace_count > 0)
 		trans->vmac_grace_count--;
-		/* Update average but with very low weight to avoid dragging it down */
-		// if (tone) trans->sat_level_avg = (trans->sat_level_avg * 0.99) + (quality * 0.01);
-		return;
-	}
 
 	if (tone) {
 		if (!trans->sat_detected)
@@ -1133,7 +1132,7 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 		trans->sat_detected = 1;
 		
 		/* Power Control Logic */
-		if (trans->state == TRANS_CALL && vmac_enable) {
+		if (trans->state == TRANS_CALL && vmac_enable && trans->vmac_grace_count == 0) {
 			/* Initialize average on first sample */
 			if (trans->sat_level_avg == 0.0)
 				trans->sat_level_avg = quality;
@@ -1871,7 +1870,7 @@ void call_down_release(int callref, int cause)
  * 2. ST-CONFIRMED ORDER HANDLING (Requirement 1.2):
  *    Orders confirmed by Signaling Tone (10 kHz) use amps_rx_signaling_tone():
  *    - Alert (Order 1), Release (Order 3), Maintenance (Order 10), Alert With Info (Order 17)
- *    - Timeout: 5 seconds (configurable via ALERT_TO, etc.)
+ *    - Timeout: ALERT_TO (0.6 seconds)
  *    - Retry logic: typically 3 attempts before failure
  *    - State transition: TRANS_CALL_<ORDER>_SEND -> wait for ST -> TRANS_CALL
  *
@@ -4883,8 +4882,8 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Change Power sent\n");
 		trans_new_state(trans, TRANS_CALL);
 		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
-		/* Set grace period to ignore SAT drop caused by interruption (1/2 of SAT loss timer) */
-		trans->vmac_grace_count = 75; /* ~2.5 seconds worth of samples */
+		/* Grace period: do not adjust power again until the mobile has settled on the new level */
+		trans->vmac_grace_count = 75; /* SAT measurements (66.7 ms each, ~5 s) without power adjustment */
 		return NULL;
 	case TRANS_CALL_FLASH_INFO:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Flash With Info order\n");
@@ -5264,9 +5263,9 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		/* Silent Page: Maintenance sent - wait for ST confirmation
 		 * Per TIA/EIA-553-A: Mobile turns on ST for 500ms
 		 * ST confirmation handled in amps_rx_signaling_tone()
-		 * Use 5 second timeout (ALERT_TO) for ST confirmation
+		 * Use ALERT_TO (0.6 seconds) for ST confirmation
 		 */
-		LOGP_CHAN(DAMPS, LOGL_INFO, "Silent Page: Maintenance order sent, waiting for ST confirmation (5s timeout)\n");
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Silent Page: Maintenance order sent, waiting for ST confirmation\n");
 		osmo_timer_schedule(&trans->timer, ALERT_TO);
 		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
 		return NULL;

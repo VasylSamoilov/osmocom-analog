@@ -120,13 +120,13 @@
 #define TACS_BITRATE		8000
 #define SAT_BANDWIDTH		30.0	/* distance between two SAT tones, also bandwidth for goertzel filter */
 #define SAT_QUALITY		0.85	/* quality needed to detect SAT signal */
-#define SAT_PRINT		10	/* print sat measurement every 0.5 seconds */
+#define SAT_PRINT		10	/* print sat measurement every 10 measurements (~0.67 seconds) */
 #define DTX_LEVEL		0.50	/* SAT level needed to mute/unmute */
 #define SIG_QUALITY		0.80	/* quality needed to detect Signaling Tone */
 #define SIG_LEVEL		0.20	/* minimum level needed to detect Signaling Tone (relative to 8kHz deviation) */
-#define SAT_DETECT_COUNT	5	/* number of measures to detect SAT signal (~250ms per spec) */
-#define SAT_LOST_COUNT		5	/* number of measures to loose SAT signal (~250ms per spec) */
-#define SAT_FREQ_CHANGE_COUNT	5	/* number of measures for SAT frequency change (~250ms per spec) */
+#define SAT_DETECT_COUNT	5	/* number of measures to detect SAT signal (66.7 ms each, ~333 ms) */
+#define SAT_LOST_COUNT		5	/* number of measures to loose SAT signal (66.7 ms each, ~333 ms) */
+#define SAT_FREQ_CHANGE_COUNT	5	/* number of measures for SAT frequency change (66.7 ms each, ~333 ms) */
 #define SIG_DETECT_COUNT	6	/* number of measures to detect Signaling Tone */
 #define SIG_LOST_COUNT		4	/* number of measures to loose Signaling Tone */
 #define CUT_OFF_HIGHPASS	300.0   /* cut off frequency for high pass filter to remove dc level from sound card / sample */
@@ -824,7 +824,7 @@ prepare_frame:
 #endif
 			amps->fsk_rx_sync = FSK_SYNC_NEGATIVE;
 			goto prepare_frame;
-			return;
+			/* unreachable: return; */
 		}
 		/* if no sync, count down the dotting life counter */
 		if (--amps->fsk_rx_dotting_life == 0) {
