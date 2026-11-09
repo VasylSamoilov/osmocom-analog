@@ -416,10 +416,14 @@ void dsp_cleanup_sender(amps_t *amps)
 {
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Cleanup DSP for treansceiver.\n");
 
-	if (amps->fsk_tx_buffer)
+	if (amps->fsk_tx_buffer) {
 		free(amps->fsk_tx_buffer);
-	if (amps->fsk_rx_window)
+		amps->fsk_tx_buffer = NULL;
+	}
+	if (amps->fsk_rx_window) {
 		free(amps->fsk_rx_window);
+		amps->fsk_rx_window = NULL;
+	}
 	if (amps->sat_filter_spl) {
 		free(amps->sat_filter_spl);
 		amps->sat_filter_spl = NULL;
@@ -689,7 +693,7 @@ again:
 		/* Deviation limiter (per TIA/EIA-553 §2.1.3.1.3): scale down if peak exceeds limit.
 		 * Applied AFTER upsample to limit actual FM deviation. Leave headroom for SAT. */
 		{
-			double sat_headroom = (!tacs) ? 0.69 : 0.59;  /* SAT amplitude in normalized units (1700/2900 for TACS) */
+			double sat_headroom = (!tacs) ? AMPS_SAT_DEVIATION : TACS_SAT_DEVIATION;  /* SAT amplitude in normalized units */
 			double max_speech = sender->max_deviation / sender->speech_deviation - sat_headroom;
 			double peak = 0;
 			int i;
