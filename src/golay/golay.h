@@ -29,6 +29,16 @@ enum rx_state {
 #define MAX_ADB		32	/* 256 characters (protocol uses continuation bit, no fixed limit) */
 #define MAX_NDB		2	/* 24 digits */
 
+/* Non-battery-saver 1,1,0,0 pattern (S2.5). A bit fits the pattern when it
+ * equals the bit 4 before and differs from the bit 2 before; a bit error is
+ * off the pattern for at most 3 bits, the comma after it at every bit, and
+ * random bits fit it with probability 1/4. */
+#define GSC_NBS_LOCK_BITS	80	/* bits the pattern locks on */
+#define GSC_NBS_LOCK_MISSES	6	/* bits off the pattern allowed in them: 2 bit errors */
+#define GSC_NBS_END_BITS	8	/* consecutive bits off the pattern that end it */
+#define GSC_NBS_HANDOVER	(GSC_NBS_END_BITS + 7) /* last bits passed to the address search */
+#define GSC_NBS_ADDRESS_SCAN	48	/* bit offsets searched for the first address */
+
 /* instance of decoded (received) message */
 typedef struct gsc_rx_msg {
 	/* --- existing fields (unchanged) --- */
@@ -238,10 +248,17 @@ typedef struct gsc {
 	int			nbs;			/* 1 = use 75 Hz preamble, no start code */
 
 	/* --- NBS RX state --- */
-	int			rx_nbs_count;		/* consecutive 1,1,0,0 pattern matches */
-	uint8_t			rx_nbs_shift[4];	/* last 4 bits for pattern detection */
-	int			rx_nbs_shift_count;	/* bits accumulated in NBS shift register */
+	uint32_t		rx_nbs_reg;		/* last bits, newest in bit 0, for the 1,1,0,0 pattern */
+	int			rx_nbs_bits;		/* bits in rx_nbs_reg, up to 32 */
+	uint8_t			rx_nbs_miss[GSC_NBS_LOCK_BITS]; /* 1 = bit off the pattern, ring before the lock */
+	int			rx_nbs_miss_pos;	/* next entry of rx_nbs_miss */
+	int			rx_nbs_miss_fill;	/* entries of rx_nbs_miss in use */
+	int			rx_nbs_miss_count;	/* entries of rx_nbs_miss that are 1 */
+	int			rx_nbs_pattern;		/* 1 = locked on the 1,1,0,0 pattern */
+	int			rx_nbs_run;		/* bits of the pattern since the lock */
+	int			rx_nbs_off;		/* consecutive bits off the pattern since the lock */
 	int			rx_nbs_locked;		/* 1 = NBS preamble detected, buffering data */
+	int			rx_nbs_polarity_pending; /* 1 = NBS polarity not decided yet (auto-polarity) */
 
 	/* --- Scan mode --- */
 	uint32_t		scan_from;		/* current scan position (6-digit base) */
@@ -275,10 +292,10 @@ int decode_golay(uint32_t codeword, uint16_t *data);
 int decode_bch(uint16_t codeword, uint8_t *data);
 int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force);
 int gsc_decode_tone_address(const uint8_t *bits, int preamble_idx, gsc_rx_msg_t *msg);
+int gsc_is_message_block(const uint8_t *bits);
 /* Split bit pairs of a word (46 bits) above which the bits are taken for no word */
 #define GSC_MAX_SPLIT_PAIRS	4
 int gsc_split_pairs(const uint8_t *bits);
-int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force);
 int reverse_word1(uint16_t w1, int *g1, int *g0);
 int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0);
 char decode_alpha(uint8_t code);

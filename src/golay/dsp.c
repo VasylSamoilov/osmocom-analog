@@ -234,6 +234,70 @@ static int match_preamble(uint16_t value)
  * preamble window). */
 #define PREAMBLE_LOCK_THRESHOLD	3
 
+/* Restart the search for the NBS 1,1,0,0 pattern. */
+static void rx_nbs_reset(gsc_t *gsc)
+{
+	gsc->rx_nbs_reg = 0;
+	gsc->rx_nbs_bits = 0;
+	memset(gsc->rx_nbs_miss, 0, sizeof(gsc->rx_nbs_miss));
+	gsc->rx_nbs_miss_pos = 0;
+	gsc->rx_nbs_miss_fill = 0;
+	gsc->rx_nbs_miss_count = 0;
+	gsc->rx_nbs_pattern = 0;
+	gsc->rx_nbs_run = 0;
+	gsc->rx_nbs_off = 0;
+}
+
+/* Feed one bit to the NBS 1,1,0,0 pattern search (see GSC_NBS_LOCK_BITS).
+ * Returns 1 when a locked pattern has ended: its last bits are the newest
+ * GSC_NBS_HANDOVER bits of rx_nbs_reg. */
+static int rx_nbs_bit(gsc_t *gsc, uint8_t bit)
+{
+	uint32_t reg;
+	int on;
+
+	gsc->rx_nbs_reg = (gsc->rx_nbs_reg << 1) | (bit & 1);
+	if (gsc->rx_nbs_bits < 32)
+		gsc->rx_nbs_bits++;
+	if (gsc->rx_nbs_bits < 5)
+		return 0;
+
+	reg = gsc->rx_nbs_reg;
+	on = (((reg ^ (reg >> 4)) & 1) == 0) && (((reg ^ (reg >> 2)) & 1) == 1);
+
+	if (!gsc->rx_nbs_pattern) {
+		/* Locked on the last GSC_NBS_LOCK_BITS bits with few bit errors */
+		if (gsc->rx_nbs_miss_fill == GSC_NBS_LOCK_BITS)
+			gsc->rx_nbs_miss_count -= gsc->rx_nbs_miss[gsc->rx_nbs_miss_pos];
+		else
+			gsc->rx_nbs_miss_fill++;
+		gsc->rx_nbs_miss[gsc->rx_nbs_miss_pos] = !on;
+		gsc->rx_nbs_miss_count += !on;
+		gsc->rx_nbs_miss_pos = (gsc->rx_nbs_miss_pos + 1) % GSC_NBS_LOCK_BITS;
+
+		if (gsc->rx_nbs_miss_fill == GSC_NBS_LOCK_BITS && gsc->rx_nbs_miss_count <= GSC_NBS_LOCK_MISSES) {
+			gsc->rx_nbs_pattern = 1;
+			gsc->rx_nbs_run = GSC_NBS_LOCK_BITS;
+			gsc->rx_nbs_off = 0;
+		}
+		return 0;
+	}
+
+	if (on) {
+		gsc->rx_nbs_run++;
+		gsc->rx_nbs_off = 0;
+		return 0;
+	}
+
+	/* A bit error within the pattern, or its end */
+	if (++gsc->rx_nbs_off < GSC_NBS_END_BITS) {
+		gsc->rx_nbs_run++;
+		return 0;
+	}
+
+	return 1;
+}
+
 /* Reset the receiver to idle state, clearing all RX buffers. */
 static void rx_reset_idle(gsc_t *gsc)
 {
@@ -262,9 +326,47 @@ static void rx_reset_idle(gsc_t *gsc)
 	gsc->rx_polarity_inverted = 0;
 	gsc->rx_batch_candidate = 0;
 	gsc->rx_batch_mode = 0;
-	gsc->rx_nbs_count = 0;
-	gsc->rx_nbs_shift_count = 0;
+	rx_nbs_reset(gsc);
 	gsc->rx_nbs_locked = 0;
+	gsc->rx_nbs_polarity_pending = 0;
+}
+
+/* NBS has no coded preamble or start code to tell the polarity by. With
+ * auto-polarity it is taken from the 121 bits after the first address: a
+ * data block or an activation code decodes in the right polarity only. A
+ * tone-only page has no such block and is taken in normal polarity, as is
+ * the stream if no address is found. Returns 1 once decided, 0 if more bits
+ * are needed (unless force). */
+static int rx_nbs_polarity(gsc_t *gsc, int force)
+{
+	uint8_t inverted[121];
+	gsc_rx_msg_t probe;
+	int scan, i, normal_ok, inverted_ok;
+
+	for (scan = 0; scan < GSC_NBS_ADDRESS_SCAN; scan++) {
+		if (scan + 121 > gsc->rx_bit_num)
+			return force;
+		if (gsc_decode_tone_address(gsc->rx_bit + scan, -1, &probe) == 0)
+			break;
+	}
+	if (scan == GSC_NBS_ADDRESS_SCAN)
+		return 1;
+	if (scan + 2 * 121 > gsc->rx_bit_num)
+		return force;
+
+	normal_ok = gsc_is_message_block(gsc->rx_bit + scan + 121);
+	for (i = 0; i < 121; i++)
+		inverted[i] = !gsc->rx_bit[scan + 121 + i];
+	inverted_ok = gsc_is_message_block(inverted);
+
+	if (inverted_ok && !normal_ok) {
+		for (i = 0; i < gsc->rx_bit_num; i++)
+			gsc->rx_bit[i] = !gsc->rx_bit[i];
+		gsc->rx_polarity_inverted = 1;
+		LOGP_CHAN(DDSP, LOGL_INFO, "RX: auto-polarity: NBS negative polarity (message block after the first address).\n");
+	}
+
+	return 1;
 }
 
 /* Enter voice recording state after a voice message is decoded.
@@ -353,62 +455,32 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 	if (gsc->rx_state == RX_IDLE) {
 		/* ---- NBS preamble detection (§2.5) ----
 		 * Only active when --nbs flag is set.
-		 * The 75 Hz preamble is a 1,1,0,0 repeating pattern at 600 baud.
-		 * Track the last 4 bits and count consecutive pattern matches.
-		 * After 20 cycles (80 bits = 0.133s), lock as NBS preamble.
-		 * Once locked, watch for the pattern to break (comma starts),
-		 * then transition to RX_DATA for address decoding. */
-		if (gsc->nbs) {
-			/* Shift bit into 4-bit NBS register */
-			if (gsc->rx_nbs_shift_count < 4) {
-				gsc->rx_nbs_shift[gsc->rx_nbs_shift_count++] = bit;
-			} else {
-				gsc->rx_nbs_shift[0] = gsc->rx_nbs_shift[1];
-				gsc->rx_nbs_shift[1] = gsc->rx_nbs_shift[2];
-				gsc->rx_nbs_shift[2] = gsc->rx_nbs_shift[3];
-				gsc->rx_nbs_shift[3] = bit;
-			}
+		 * The 75 Hz preamble is a 1,1,0,0 repeating pattern at 600 baud,
+		 * in either polarity. It locks on GSC_NBS_LOCK_BITS bits with at
+		 * most GSC_NBS_LOCK_MISSES bits off the pattern, and ends after
+		 * GSC_NBS_END_BITS consecutive bits off it: bit errors within the
+		 * pattern neither prevent the lock nor end it. Once it ended, the
+		 * last GSC_NBS_HANDOVER bits go to RX_DATA, where decode_batch()
+		 * searches them for the comma and the first address. */
+		if (gsc->nbs && rx_nbs_bit(gsc, bit)) {
+			int b;
 
-			if (gsc->rx_nbs_shift_count >= 4) {
-				/* Check for 1,1,0,0 pattern */
-				if (gsc->rx_nbs_shift[0] == 1 && gsc->rx_nbs_shift[1] == 1 &&
-				    gsc->rx_nbs_shift[2] == 0 && gsc->rx_nbs_shift[3] == 0) {
-					gsc->rx_nbs_count++;
-					gsc->rx_nbs_shift_count = 0; /* reset for next 4-bit group */
-				} else if (gsc->rx_nbs_shift[0] == 0 && gsc->rx_nbs_shift[1] == 0 &&
-				           gsc->rx_nbs_shift[2] == 1 && gsc->rx_nbs_shift[3] == 1) {
-					/* Inverted 75 Hz pattern — count it too */
-					gsc->rx_nbs_count++;
-					gsc->rx_nbs_shift_count = 0;
-				} else if (gsc->rx_nbs_count >= 20) {
-					/* Pattern broke after lock — NBS preamble ended.
-					 * The current 4 bits are the start of post-preamble data.
-					 * Transition to RX_DATA and start buffering. */
-					LOGP_CHAN(DDSP, LOGL_INFO, "RX state: IDLE -> DATA (NBS preamble locked, %d cycles).\n",
-						gsc->rx_nbs_count);
+			LOGP_CHAN(DDSP, LOGL_INFO, "RX state: IDLE -> DATA (NBS preamble locked, %d bits).\n",
+				gsc->rx_nbs_run);
 
-					gsc->rx_bit_num = 0;
-					gsc->rx_nbs_locked = 1;
-					gsc->rx_preamble_index = -1; /* unknown in NBS mode */
-					gsc->rx_no_transition = 0;
-					gsc->rx_shift_count = 0;
-					gsc->rx_state = RX_DATA;
+			gsc->rx_bit_num = 0;
+			gsc->rx_nbs_locked = 1;
+			gsc->rx_nbs_polarity_pending = gsc->rx_auto_polarity;
+			gsc->rx_preamble_index = -1; /* unknown in NBS mode */
+			gsc->rx_no_transition = 0;
+			gsc->rx_shift_count = 0;
+			gsc->rx_state = RX_DATA;
 
-					/* Buffer the 4 bits that broke the pattern */
-					{
-						int b;
-						for (b = 0; b < 4; b++)
-							gsc->rx_bit[gsc->rx_bit_num++] = gsc->rx_nbs_shift[b];
-					}
+			for (b = GSC_NBS_HANDOVER - 1; b >= 0; b--)
+				gsc->rx_bit[gsc->rx_bit_num++] = (gsc->rx_nbs_reg >> b) & 1;
 
-					gsc->rx_nbs_count = 0;
-					gsc->rx_nbs_shift_count = 0;
-					return;
-				} else {
-					/* Pattern didn't match and not locked — reset */
-					gsc->rx_nbs_count = 0;
-				}
-			}
+			rx_nbs_reset(gsc);
+			return;
 		}
 
 		/* Shift new bit into the 46-bit register */
@@ -877,6 +949,15 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 		}
 	}
 
+	/* NBS with auto-polarity: nothing is decoded before the polarity is known */
+	if (gsc->rx_nbs_locked && gsc->rx_nbs_polarity_pending) {
+		int end = (gsc->rx_no_transition >= 48) || (gsc->rx_bit_num >= 4096);
+
+		if (!rx_nbs_polarity(gsc, end))
+			return;
+		gsc->rx_nbs_polarity_pending = 0;
+	}
+
 	/* Minimum bits for a valid message:
 	 * GSC: start(121) + address(121) = 242 bits minimum (preamble not in buffer).
 	 * NBS: address(121) only (no preamble or start code). */
@@ -946,26 +1027,20 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 					nbits = min_batch_bits;
 			}
 
-			/* Temporarily set rx_bit_num for decode_batch.
-			 * decode_batch reads directly from rx_bit/rx_bit_num
+			/* decode_batch reads directly from rx_bit/rx_bit_num
 			 * to avoid clobbering the TX bit[] buffer. */
 			int saved_rx_num = gsc->rx_bit_num;
-			gsc->rx_bit_num = nbits;
 
-			rc = gsc->rx_nbs_locked
-				? decode_nbs(gsc, &msg, force)
-				: decode_batch(gsc, &msg, force);
+			/* At the end of the transmission the run of equal bits is
+			 * kept first: it may have begun inside the last codeword or
+			 * data block (their last bits may equal the silence after
+			 * them). The run is shorter than a data block, so it is not
+			 * taken for data. Failing that, without the run. */
+			rc = decode_batch(gsc, &msg, force);
 
-			/* The trimmed run of equal bits may have begun inside the
-			 * last codeword (a tone-only page ends with its address, its
-			 * last bits may equal the silence after it): try again with
-			 * the run kept. The run is shorter than a data block, so it is
-			 * not taken for data. */
 			if (rc != 0 && trim_trailing && nbits < saved_rx_num) {
-				gsc->rx_bit_num = saved_rx_num;
-				rc = gsc->rx_nbs_locked
-					? decode_nbs(gsc, &msg, force)
-					: decode_batch(gsc, &msg, force);
+				gsc->rx_bit_num = nbits;
+				rc = decode_batch(gsc, &msg, force);
 			}
 
 			gsc->rx_bit_num = saved_rx_num;

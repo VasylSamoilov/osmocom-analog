@@ -1447,6 +1447,18 @@ int gsc_split_pairs(const uint8_t *bits)
 	return split;
 }
 
+/* Index digit of a received address: the encoder sends preamble
+ * (index + G0) % 10, so index = (preamble - G0) % 10. Non-battery-saver
+ * codes have no index digit, they are written with 'N' (Motorola GSC
+ * manual, code assignment). */
+static char gsc_index_digit(int preamble_idx, int g0)
+{
+	if (preamble_idx < 0)
+		return 'N';
+
+	return '0' + (preamble_idx - g0 + 10) % 10;
+}
+
 /* Decode a tone-only address from a block of 121 bits (28 bit comma, W1,
  * 1 bit, W2) without logging, e.g. tone-only addresses interleaved in the
  * alert time of a voice page (Motorola GSC manual, Figure 6-1; they share
@@ -1512,7 +1524,7 @@ int gsc_decode_tone_address(const uint8_t *bits, int preamble_idx, gsc_rx_msg_t 
 	function = (w1_inverted ? 0x2 : 0) | (w2_inverted ? 0x1 : 0);
 
 	memset(msg, 0, sizeof(*msg));
-	msg->address[0] = '0' + (preamble_idx - g0 + 10) % 10;
+	msg->address[0] = gsc_index_digit(preamble_idx, g0);
 	msg->address[1] = '0' + g1;
 	msg->address[2] = '0' + g0;
 	msg->address[3] = '0' + a2;
@@ -1526,6 +1538,32 @@ int gsc_decode_tone_address(const uint8_t *bits, int preamble_idx, gsc_rx_msg_t 
 	msg->decode_ok = 1;
 
 	return 0;
+}
+
+/* Whether the 121 bits that follow an address are a message block: a data
+ * block (1 bit, 8 BCH codewords that decode, block check character, S2.6.1)
+ * or the activation code of a voice page (28 bit comma, the activation code).
+ * Received in the wrong polarity, neither of them decodes. */
+int gsc_is_message_block(const uint8_t *bits)
+{
+	uint16_t bch[8], value;
+	uint8_t d[8], checksum = 0;
+	int pos = 1, k;
+
+	deinterleave_bch(bits, &pos, bch);
+	for (k = 0; k < 8; k++) {
+		if (decode_bch(bch[k], &d[k]) < 0)
+			break;
+	}
+	if (k == 8) {
+		for (k = 0; k < 7; k++)
+			checksum += calc_bch(d[k]);
+		if ((checksum & 0x7f) == d[7])
+			return 1;
+	}
+
+	pos = 28;
+	return decode_golay(read_dup_golay(bits, &pos), &value) == 0 && value == activation_code;
 }
 
 int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
@@ -1551,8 +1589,8 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	int w1_inverted, w2_inverted;
 	uint8_t function;
 	int g1, g0, a2, a1, a0;
-	int g1g0, idx;
-	char suffix;
+	int g1g0;
+	char idx, suffix;
 	int remaining;
 	enum gsc_msg_type detected_type;
 
@@ -1579,6 +1617,34 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 
 	msg->preamble_index = gsc->rx_preamble_index;
 	preamble_idx = gsc->rx_preamble_index;
+	/* Also of the further messages of a batch, reported from here */
+	msg->polarity_inverted = gsc->rx_polarity_inverted;
+
+	/* Non-battery-saver (S2.5): no coded preamble and no start code, the
+	 * first address follows the 1,1,0,0 pattern, and any number of
+	 * consecutive calls after it. The DSP layer starts the buffer with the
+	 * last bits of the pattern: the comma and address are searched for in
+	 * the first GSC_NBS_ADDRESS_SCAN bit offsets. */
+	if (gsc->rx_nbs_locked) {
+		int scan;
+
+		for (scan = 0; scan < GSC_NBS_ADDRESS_SCAN; scan++) {
+			gsc_rx_msg_t probe;
+
+			if (scan + comma_len + dup_bits + 1 + dup_bits > total_bits)
+				return -1;
+			if (gsc_decode_tone_address(bits + scan, -1, &probe) == 0)
+				break;
+		}
+		if (scan == GSC_NBS_ADDRESS_SCAN) {
+			LOGP(DGOLAY, LOGL_NOTICE, "NBS: no address after the 1,1,0,0 pattern.\n");
+			return -1;
+		}
+
+		LOGP(DGOLAY, LOGL_DEBUG, "NBS: first address at bit %d.\n", scan);
+		pos = scan;
+		goto address;
+	}
 
 	/* ================================================================
 	 * Stage 2: START CODE
@@ -1665,6 +1731,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 * try decode_golay on (codeword ^ 0x7FFFFF).
 	 * ================================================================ */
 
+address:
 	if (pos + comma_len + dup_bits + 1 + dup_bits > total_bits) {
 		return -1;
 	}
@@ -1797,9 +1864,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	 *   bit 1 = W1 inverted, bit 0 = W2 inverted */
 	function = (w1_inverted ? 0x2 : 0) | (w2_inverted ? 0x1 : 0);
 
-	/* Index digit: encoder sets preamble = (idx + g0) % 10,
-	 * so idx = (preamble - g0 + 10) % 10 */
-	idx = (preamble_idx - g0 + 10) % 10;
+	idx = gsc_index_digit(preamble_idx, g0);
 
 	/* Detect message type by examining what follows the address.
 	 *
@@ -2009,9 +2074,9 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	}
 
 	/* Build the 7-digit functional address: I G1 G0 A2 A1 A0 suffix */
-	LOGP(DGOLAY, LOGL_DEBUG, "Address: idx=%d g1=%d g0=%d a2=%d a1=%d a0=%d func=%d w1=%u w2=%u w1_inv=%d w2_inv=%d\n",
+	LOGP(DGOLAY, LOGL_DEBUG, "Address: idx=%c g1=%d g0=%d a2=%d a1=%d a0=%d func=%d w1=%u w2=%u w1_inv=%d w2_inv=%d\n",
 		idx, g1, g0, a2, a1, a0, function, w1_value, w2_value, w1_inverted, w2_inverted);
-	msg->address[0] = '0' + idx;
+	msg->address[0] = idx;
 	msg->address[1] = '0' + g1;
 	msg->address[2] = '0' + g0;
 	msg->address[3] = '0' + a2;
@@ -2622,8 +2687,8 @@ decode_done:
 				uint16_t bm_w1_value;
 				uint8_t bm_function;
 				int bm_g1, bm_g0, bm_a2, bm_a1, bm_a0;
-				int bm_g1g0, bm_idx;
-				char bm_suffix;
+				int bm_g1g0;
+				char bm_idx, bm_suffix;
 				int bm_remaining;
 				enum gsc_msg_type bm_detected_type;
 
@@ -2730,7 +2795,7 @@ decode_done:
 				bm_function = (bm_w1_inverted ? 0x2 : 0) | (bm_w2_inverted ? 0x1 : 0);
 
 				/* Index digit */
-				bm_idx = (preamble_idx - bm_g0 + 10) % 10;
+				bm_idx = gsc_index_digit(preamble_idx, bm_g0);
 
 				/* --- Type detection (same logic as Stage 3-7) --- */
 				bm_remaining = total_bits - batch_pos;
@@ -2842,7 +2907,7 @@ decode_done:
 				}
 
 				/* Build 7-digit functional address */
-				batch_msg.address[0] = '0' + bm_idx;
+				batch_msg.address[0] = bm_idx;
 				batch_msg.address[1] = '0' + bm_g1;
 				batch_msg.address[2] = '0' + bm_g0;
 				batch_msg.address[3] = '0' + bm_a2;
@@ -3046,287 +3111,6 @@ decode_done:
 			LOGP(DGOLAY, LOGL_INFO, "Batch decode: %d total messages decoded.\n", batch_count);
 		}
 	}
-
-	return 0;
-}
-
-/* Decode a non-battery-saver (NBS) message from the RX bit buffer.
- *
- * NBS format has no coded preamble or start code - the bitstream starts
- * directly with the address comma + W1 + comma_bit + W2, followed by
- * optional data blocks.
- *
- * Layout: [28-bit comma] [dup(W1)] [1-bit] [dup(W2)] [data...]
- *
- * Returns 0 on success, -1 on decode failure. */
-int decode_nbs(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
-{
-	const uint8_t *bits = gsc->rx_bit;
-	int pos = 0;
-	int total_bits = gsc->rx_bit_num;
-	const int comma_len = 28;
-	const int dup_bits = 46;
-	const int bch_block_bits = 120;
-
-	uint32_t codeword;
-	uint16_t decoded_value;
-	int rc, i;
-
-	uint16_t w1_value, w2_value;
-	int w1_inverted, w2_inverted;
-	uint8_t function;
-	int g1, g0, a2, a1, a0;
-	int g1g0, idx;
-	char suffix;
-	int remaining;
-	enum gsc_msg_type detected_type;
-
-	memset(msg, 0, sizeof(*msg));
-	msg->preamble_index = -1; /* unknown in NBS mode */
-
-	LOGP(DGOLAY, LOGL_DEBUG, "Decoding NBS message: %d bits in buffer.\n", total_bits);
-
-	/* ================================================================
-	 * ADDRESS (no preamble or start code in NBS mode)
-	 *
-	 * Layout: [28-bit comma] [dup(W1)] [1-bit] [dup(W2)]
-	 * ================================================================ */
-
-	if (pos + comma_len + dup_bits + 1 + dup_bits > total_bits) {
-		LOGP(DGOLAY, LOGL_NOTICE, "NBS: not enough bits for address (%d available).\n", total_bits);
-		return -1;
-	}
-
-	/* Skip 28-bit comma */
-	pos += comma_len;
-
-	/* Decode W1 with inversion detection */
-	codeword = read_dup_golay(bits, &pos);
-	w1_inverted = 0;
-
-	rc = decode_golay(codeword, &decoded_value);
-	if (rc == 0) {
-		int found = 0;
-		for (i = 0; i < 50; i++) {
-			if (decoded_value == word1s[i]) {
-				found = 1;
-				break;
-			}
-		}
-		if (found) {
-			w1_value = decoded_value;
-		} else {
-			rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
-			if (rc == 0) {
-				w1_value = decoded_value;
-				w1_inverted = 1;
-			} else {
-				LOGP(DGOLAY, LOGL_NOTICE, "NBS W1: not in table, complement failed.\n");
-				return -1;
-			}
-		}
-	} else {
-		rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
-		if (rc == 0) {
-			w1_value = decoded_value;
-			w1_inverted = 1;
-		} else {
-			LOGP(DGOLAY, LOGL_NOTICE, "NBS W1: both decodes failed.\n");
-			return -1;
-		}
-	}
-
-	rc = reverse_word1(w1_value, &g1, &g0);
-	if (rc < 0) {
-		LOGP(DGOLAY, LOGL_NOTICE, "NBS: W1 value %u not in word1s table.\n", w1_value);
-		return -1;
-	}
-	g1g0 = g1 * 10 + g0;
-
-	/* Skip 1-bit comma */
-	pos += 1;
-
-	/* Decode W2 with inversion and range detection */
-	codeword = read_dup_golay(bits, &pos);
-	w2_inverted = 0;
-
-	{
-		uint16_t w2_try[2] = { 0, 0 };
-		int golay_ok[2] = { 0, 0 };
-		int try_g1g0[2];
-		int best_inv = -1, best_range = -1;
-		int ta2, ta1, ta0;
-		int inv, rng;
-
-		try_g1g0[0] = g1g0;
-		try_g1g0[1] = g1g0 + 50;
-
-		rc = decode_golay(codeword, &decoded_value);
-		if (rc == 0) { w2_try[0] = decoded_value; golay_ok[0] = 1; }
-
-		rc = decode_golay(codeword ^ 0x7fffff, &decoded_value);
-		if (rc == 0) { w2_try[1] = decoded_value; golay_ok[1] = 1; }
-
-		for (inv = 0; inv < 2; inv++) {
-			if (!golay_ok[inv])
-				continue;
-			for (rng = 0; rng < 2; rng++) {
-				if (reverse_word2(w2_try[inv], try_g1g0[rng], &ta2, &ta1, &ta0) == 0) {
-					if (best_inv < 0) {
-						best_inv = inv;
-						best_range = rng;
-						a2 = ta2; a1 = ta1; a0 = ta0;
-					}
-				}
-			}
-		}
-
-		if (best_inv < 0) {
-			LOGP(DGOLAY, LOGL_NOTICE, "NBS W2: no valid address.\n");
-			return -1;
-		}
-
-		w2_value = w2_try[best_inv];
-		w2_inverted = best_inv;
-
-		if (best_range == 1) {
-			g1g0 = try_g1g0[1];
-			g1 = g1g0 / 10;
-			g0 = g1g0 % 10;
-		}
-	}
-
-	function = (w1_inverted ? 0x2 : 0) | (w2_inverted ? 0x1 : 0);
-
-	/* NBS has no preamble index - use 0 as placeholder for address reconstruction */
-	idx = 0;
-
-	/* Build function suffix from Table IX */
-	switch (function) {
-	case 0: suffix = '1'; break;
-	case 1: suffix = '2'; break;
-	case 2: suffix = '3'; break;
-	case 3: suffix = '4'; break;
-	default: suffix = '1'; break;
-	}
-
-	snprintf(msg->address, sizeof(msg->address), "%d%d%d%d%d%d%c",
-		idx, g1, g0, a2, a1, a0, suffix);
-
-	LOGP(DGOLAY, LOGL_INFO, "NBS address decoded: '%s' (W1=%u W2=%u func=%d).\n",
-		msg->address, w1_value, w2_value, function);
-
-	/* ================================================================
-	 * TYPE DETECTION + DATA DECODE
-	 *
-	 * Same logic as decode_batch() stages 4-7, but starting from
-	 * the current position (right after the address pair).
-	 * ================================================================ */
-
-	remaining = total_bits - pos;
-
-	if (remaining < 1 + bch_block_bits) {
-		if (!force) {
-			LOGP(DGOLAY, LOGL_DEBUG, "NBS: not enough post-address bits (%d), need more.\n", remaining);
-			return -1;
-		}
-		detected_type = TYPE_TONE;
-	} else {
-		detected_type = TYPE_TONE;
-
-		/* Check for voice: activation code after 28-bit comma */
-		if (remaining >= comma_len + dup_bits + 1 + dup_bits) {
-			int peek_pos = pos + comma_len;
-			uint32_t peek_cw = read_dup_golay(bits, &peek_pos);
-			uint16_t peek_val;
-			if (decode_golay(peek_cw, &peek_val) == 0 && peek_val == activation_code)
-				detected_type = TYPE_VOICE;
-		}
-
-		/* Probe BCH block to detect data */
-		if (detected_type != TYPE_VOICE && remaining >= 1 + bch_block_bits) {
-			int probe_pos = pos + 1;
-			uint16_t probe_bch[8];
-			uint8_t probe_d[8];
-			uint8_t probe_cksum;
-			int probe_ok = 1;
-			int pk;
-
-			deinterleave_bch(bits, &probe_pos, probe_bch);
-			for (pk = 0; pk < 8; pk++) {
-				if (decode_bch(probe_bch[pk], &probe_d[pk]) < 0) {
-					probe_ok = 0;
-					break;
-				}
-			}
-
-			if (probe_ok) {
-				probe_cksum = 0;
-				for (pk = 0; pk < 7; pk++)
-					probe_cksum += calc_bch(probe_d[pk]);
-				probe_cksum &= 0x7f;
-
-				if (probe_cksum == probe_d[7]) {
-					/* Valid data - use fill-count heuristic for alpha vs numeric */
-					uint8_t a_ch[8];
-					int a_fill = 0, n_fill = 0;
-					int nk;
-
-					a_ch[0] = probe_d[0] & 0x3f;
-					a_ch[1] = ((probe_d[0] >> 6) | (probe_d[1] << 1)) & 0x3f;
-					a_ch[2] = ((probe_d[1] >> 5) | (probe_d[2] << 2)) & 0x3f;
-					a_ch[3] = ((probe_d[2] >> 4) | (probe_d[3] << 3)) & 0x3f;
-					a_ch[4] = ((probe_d[3] >> 3) | (probe_d[4] << 4)) & 0x3f;
-					a_ch[5] = ((probe_d[4] >> 2) | (probe_d[5] << 5)) & 0x3f;
-					a_ch[6] = (probe_d[5] >> 1) & 0x3f;
-					a_ch[7] = probe_d[6] & 0x3f;
-
-					uint8_t n_nib[12];
-					n_nib[0]  = probe_d[0] & 0xf;
-					n_nib[1]  = ((probe_d[0] >> 4) | (probe_d[1] << 3)) & 0xf;
-					n_nib[2]  = (probe_d[1] >> 1) & 0xf;
-					n_nib[3]  = ((probe_d[1] >> 5) | (probe_d[2] << 2)) & 0xf;
-					n_nib[4]  = (probe_d[2] >> 2) & 0xf;
-					n_nib[5]  = ((probe_d[2] >> 6) | (probe_d[3] << 1)) & 0xf;
-					n_nib[6]  = (probe_d[3] >> 3) & 0xf;
-					n_nib[7]  = probe_d[4] & 0xf;
-					n_nib[8]  = ((probe_d[4] >> 4) | (probe_d[5] << 3)) & 0xf;
-					n_nib[9]  = (probe_d[5] >> 1) & 0xf;
-					n_nib[10] = ((probe_d[5] >> 5) | (probe_d[6] << 2)) & 0xf;
-					n_nib[11] = (probe_d[6] >> 2) & 0xf;
-
-					for (nk = 7; nk >= 0; nk--) {
-						if (a_ch[nk] == 0x3e) a_fill++;
-						else break;
-					}
-					for (nk = 11; nk >= 0; nk--) {
-						if (n_nib[nk] == 0x0a) n_fill++;
-						else break;
-					}
-
-					if (n_fill > 0 && a_fill == 0)
-						detected_type = TYPE_NUMERIC;
-					else if (a_fill > 0 && n_fill == 0)
-						detected_type = TYPE_ALPHA;
-					else if (n_fill > a_fill)
-						detected_type = TYPE_NUMERIC;
-					else
-						detected_type = TYPE_ALPHA;
-				}
-			}
-
-			/* Neither voice nor data: tone-only, the address alone (S2.5) */
-		}
-	}
-
-	msg->type = detected_type;
-	msg->decode_ok = 1;
-
-	LOGP(DGOLAY, LOGL_INFO, "NBS decode: address='%s' type=%s.\n",
-		msg->address,
-		detected_type == TYPE_VOICE ? "voice" :
-		detected_type == TYPE_ALPHA ? "alpha" :
-		detected_type == TYPE_NUMERIC ? "numeric" : "tone");
 
 	return 0;
 }
