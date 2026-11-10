@@ -3203,7 +3203,10 @@ parse_phase:
 				continue;
 			}
 
-			if (mw1 == 0 && mw2 == 0) {
+			/* A Short Message Vector (3.9.2) has no message
+			 * field: bits 7-20 carry t and d0-d11, not a start
+			 * and a length, so mw1/mw2 do not apply to it. */
+			if (mw1 == 0 && mw2 == 0 && vec_type != FLEX_VECTOR_TYPE_TONE) {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,
 					  "RX: Phase %c cap=%" PRIu64 " vec_type=%d mw1=mw2=0, skipping.\n",
 					  phase_name, capcode, vec_type);
@@ -4387,7 +4390,28 @@ parse_phase:
 				uint32_t t_field = (viw >> 7) & 0x03;
 				uint32_t d_field = (viw >> 9) & 0xFFF; /* 12 bits */
 
-				if (t_field == 0) {
+				if (t_field == 0 && aw_type == FLEX_ADDR_NETWORK) {
+					/* t=00 with a Network Address: the NID
+					 * (Table 3.9.2-1 (1), 6.1.2, Table 6.1.2-1).
+					 * d11-d0 = F3-F0 M2-M0 A4-A0: Traffic
+					 * Management Flag, Multiplier, Service Area
+					 * Identifier.  No digits. */
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c SMSG NID service_area=%u multiplier=%u tmf=0x%X\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "inverted" : "normal",
+						  grp_tag,
+						  capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  prio_flag,
+						  d_field & 0x1F,
+						  (d_field >> 5) & 0x07,
+						  (d_field >> 8) & 0x0F);
+				} else if (t_field == 0) {
 					/* t=00: BCD numeric.
 					 * Short addr: 3 digits from 1st vector word (d0-d11).
 					 * Long addr: 8 digits from 2 vector words
