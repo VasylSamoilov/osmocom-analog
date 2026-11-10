@@ -3225,48 +3225,76 @@ parse_phase:
 					  FLEX_RX_FLAG_NETWORK,
 					  vec_type);
 
-			/* Secure t1t0=01 (data defined separately) and t1t0=11
-			 * (reserved), STD-43A 3.10.1.4 p.70: not characters and
-			 * no published layout, so the data words after the
-			 * header are logged as hex.  t1t0=01 on a Network
-			 * Address is the System NID Change Instruction
-			 * (FLEX-93001 3.9.7, p.48). */
+			/* Secure messages other than t1t0=00 are not characters
+			 * (STD-43A 3.10.1.4 p.70): 10 is binary data, 01 data
+			 * defined separately, 11 reserved.  The data bits after
+			 * the header are logged as hex: one bit stream, d0 of
+			 * each word first, 4 bits a digit with the first bit the
+			 * least significant, the last digit padded with 0, a
+			 * digit with a lost bit '?'.  The last fragment of
+			 * binary data ends with fill bits, the inverse of the
+			 * last data bit, or a termination word of them; the
+			 * termination of 01 is not defined.  t1t0=01 on a
+			 * Network Address is the System NID Change Instruction
+			 * (FLEX-93001 3.9.7, p.48).  Each fragment is logged
+			 * with its C, F and N. */
 			if (vec_type == FLEX_VECTOR_TYPE_SECURE && mw1 <= 87 && mw2 <= 87) {
 				int sh_idx = is_long ? (j + 1) : mw1;
-				uint32_t sh_t = 0;
+				uint32_t sh_hdr = 0, sh_t = 0;
 				int sh_ok = sh_idx < FLEX_WORDS_PER_FRAME &&
 					    (ph->status[sh_idx] == FLEX_WORD_CLEAN ||
 					     ph->status[sh_idx] == FLEX_WORD_CORRECTED);
 
-				if (sh_ok)
-					sh_t = (ph->words[sh_idx] >> FLEX_SEC_TYPE_SHIFT) & FLEX_SEC_TYPE_MASK;
-				if (sh_ok && (sh_t == FLEX_SEC_TYPE_SEPARATE || sh_t == 3)) {
-					char hex[600];
-					int hi = 0, w;
+				if (sh_ok) {
+					sh_hdr = ph->words[sh_idx];
+					sh_t = (sh_hdr >> FLEX_SEC_TYPE_SHIFT) & FLEX_SEC_TYPE_MASK;
+				}
+				if (sh_ok && sh_t != FLEX_SEC_TYPE_ALPHA) {
+					static const char hex_digits[] = "0123456789ABCDEF";
+					int8_t bits[FLEX_WORDS_PER_FRAME * FLEX_BCH_DATA_BITS];
+					char hex[FLEX_WORDS_PER_FRAME * FLEX_BCH_DATA_BITS / 4 + 2];
+					int nbits = 0, nhex = 0, w, b;
+					int sh_c = (sh_hdr & FLEX_ALPHA_HDR_C_MASK) >> FLEX_ALPHA_HDR_C_SHIFT;
+					int sh_f = (sh_hdr & FLEX_ALPHA_HDR_F_MASK) >> FLEX_ALPHA_HDR_F_SHIFT;
+					int sh_n = (sh_hdr & FLEX_ALPHA_HDR_N_MASK) >> FLEX_ALPHA_HDR_N_SHIFT;
 					int nid_change = (aw_type == FLEX_ADDR_NETWORK &&
 							  sh_t == FLEX_SECURE_T_NID_CHANGE);
 
-					hex[0] = '\0';
 					for (w = is_long ? mw1 : (mw1 + 1); w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
-						if (hi >= (int)sizeof(hex) - 8)
-							break;
-						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-							hi += snprintf(hex + hi, sizeof(hex) - hi, "%s??????", hi ? " " : "");
-						else
-							hi += snprintf(hex + hi, sizeof(hex) - hi, "%s%06X", hi ? " " : "",
-								       ph->words[w] & FLEX_DATA_MASK);
+						int lost = (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[w] == FLEX_WORD_NOT_RECEIVED);
+						for (b = 0; b < FLEX_BCH_DATA_BITS; b++)
+							bits[nbits++] = lost ? -1 : (int8_t)((ph->words[w] >> b) & 1);
 					}
+					if (sh_t == FLEX_SEC_TYPE_BINARY && sh_c == 0 && nbits > 0 && bits[nbits - 1] >= 0) {
+						int8_t fill = bits[nbits - 1];
+						while (nbits > 0 && bits[nbits - 1] == fill)
+							nbits--;
+					}
+					for (b = 0; b < nbits; b += 4) {
+						unsigned v = 0;
+						int k, lostbit = 0;
+						for (k = 0; k < 4 && b + k < nbits; k++) {
+							if (bits[b + k] < 0)
+								lostbit = 1;
+							else
+								v |= (unsigned)bits[b + k] << k;
+						}
+						hex[nhex++] = lostbit ? '?' : hex_digits[v];
+					}
+					hex[nhex] = '\0';
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  SEC t=%u%s payload=[%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  SEC t=%u %s%s C=%d F=%d N=%d hex nibble=4 order=lsb_first bits=%d [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name, capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  sh_t,
-						  nid_change ? " NID change instruction" :
-						  (sh_t == 3) ? " reserved" : " data defined separately",
-						  hex);
+						  (sh_t == FLEX_SEC_TYPE_BINARY) ? "binary" :
+						  (sh_t == FLEX_SEC_TYPE_SEPARATE) ? "data defined separately" : "reserved",
+						  nid_change ? " NID change instruction" : "",
+						  sh_c, sh_f, sh_n,
+						  nbits, hex);
 					continue;
 				}
 			}

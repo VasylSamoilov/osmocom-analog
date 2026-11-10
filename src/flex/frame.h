@@ -1486,7 +1486,7 @@ static inline const char *flex_special_addr_detail(uint32_t aw)
 {
 	enum flex_addr_type t = flex_classify_addr_word(aw);
 	switch (t) {
-	case FLEX_ADDR_NETWORK:    return "NID system info (Secure vector, area/zones/traffic)";
+	case FLEX_ADDR_NETWORK:    return "NID (short message vector) or NID system message";
 	case FLEX_ADDR_TEMPORARY:  return "temp group slot (16 slots, assigned via short instruction)";
 	case FLEX_ADDR_OPER_MSG:   return NULL; /* caller uses flex_oper_msg_subtype_name() */
 	case FLEX_ADDR_INFO_SVC:   return "info service (maildrop)";
