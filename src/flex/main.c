@@ -971,8 +971,11 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*instr_slot = 0;
 	*instr_frame = 0;
 
-	if (opts_len <= 0)
+	/* No options: the pager-side type follows the (alpha) encoding */
+	if (opts_len <= 0) {
+		*secure_subtype = 0;
 		return;
+	}
 
 	len = opts_len;
 	if (len >= (int)sizeof(buf))

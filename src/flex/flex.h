@@ -904,6 +904,16 @@ typedef struct flex {
 						 * use consistent 16-bit extraction. */
 			int		secure_subtype;	/* t1t0 value from secure message header
 						 * (-1 = not a secure message) */
+			/* HEX/Binary data bits of all fragments of the message
+			 * end to end: 0, 1, or -1 for a bit of a lost word
+			 * (STD-43A 3.10.1.2). */
+			int8_t		bits[FLEX_REASM_MAX_LEN * 4];
+			int		nbits;		/* data bits in bits[] */
+			int		k_state;	/* K of all fragments: 0 OK, 1 FAIL, 2 incomplete */
+			int		gap;		/* 1 = a fragment was missed */
+			int		frag_count;	/* fragments received */
+			int		mail_drop;	/* M of the first fragment */
+			int		rsv_s;		/* s3-s0 of the first fragment */
 			uint32_t	rx_sig;		/* signature from first fragment */
 			uint32_t	sig_sum;	/* accumulated signature sum */
 			int		sig_valid;	/* 1 = all fragments had clean/corrected words */

@@ -2010,6 +2010,174 @@ static int flextime_dates_agree(int y1, uint32_t m1, uint32_t d1,
 	return 0;
 }
 
+/* ---- HEX/Binary data bits (STD-43A 3.10.1.2) ----
+ *
+ * The data of a fragment are 21 bits per word, d0 first, a bit of a lost
+ * word is -1.  A fragment ends on a character boundary (B bits, B=0 is 16).
+ * Termination (p.61-62):
+ *   - data end in the middle of the last word: the rest of the word is the
+ *     inverse of the last data bit;
+ *   - data end exactly at the end of the last word: nothing is added, except
+ *     in the last fragment when the last character is all 0s or all 1s: then
+ *     a word of the inverse of the last data bit is added.
+ * The receiver finds the data length from the rules: the length is a
+ * multiple of B.  A fill that is also a valid data end (a fragment that is not
+ * the last, ending exactly at a word end with B or more equal bits) cannot be
+ * told apart by the standard; the bits are taken as fill. */
+
+/* Length in bits of the data of a fragment of n bits (a multiple of 21).
+ * *state: 0 = consistent, 1 = does not follow the rules, 2 = cannot be told
+ * (lost bits at the end, or B unknown: blocking <= 0). */
+static int flex_hex_terminate(const int8_t *bits, int n, int blocking, int last_fragment, int *state)
+{
+	const int8_t *lw;
+	int i, run;
+
+	*state = 0;
+	if (n <= 0)
+		return 0;
+	if (blocking <= 0) {
+		*state = 2;
+		return n;
+	}
+	lw = bits + n - FLEX_BCH_DATA_BITS;
+	for (i = 0; i < FLEX_BCH_DATA_BITS; i++) {
+		if (lw[i] < 0) {
+			*state = 2;
+			return n;
+		}
+	}
+
+	/* Rule (3): an extra word of the inverse of the last data bit */
+	if (last_fragment && n >= 2 * FLEX_BCH_DATA_BITS && ((n - FLEX_BCH_DATA_BITS) % blocking) == 0 &&
+	    n - FLEX_BCH_DATA_BITS >= blocking) {
+		int uniform = 1, last_char_inverse = 1;
+
+		for (i = 1; i < FLEX_BCH_DATA_BITS; i++) {
+			if (lw[i] != lw[0]) {
+				uniform = 0;
+				break;
+			}
+		}
+		if (uniform) {
+			for (i = 1; i <= blocking; i++) {
+				int8_t b = bits[n - FLEX_BCH_DATA_BITS - i];
+
+				if (b < 0) {
+					*state = 2;
+					return n;
+				}
+				if (b == lw[0])
+					last_char_inverse = 0;
+			}
+			if (last_char_inverse)
+				return n - FLEX_BCH_DATA_BITS;
+		}
+	}
+
+	/* Rule (2): fill in the last word, the run of equal bits at its end */
+	for (run = 0; run < FLEX_BCH_DATA_BITS && lw[FLEX_BCH_DATA_BITS - 1 - run] == lw[FLEX_BCH_DATA_BITS - 1]; run++)
+		;
+	if (run == FLEX_BCH_DATA_BITS) {
+		/* A whole word of one value is not fill (fill is shorter) */
+		if ((n % blocking) != 0)
+			*state = 1;
+		return n;
+	}
+	if (run >= blocking) {
+		if (((n - run) % blocking) == 0)
+			return n - run;
+		/* Equal bits that do not end on a character boundary: for a last
+		 * fragment the rules are not followed; else the data end exactly */
+		*state = (last_fragment || (n % blocking) != 0) ? 1 : 0;
+		return n;
+	}
+	if ((n % blocking) == 0)
+		return n;
+	if (((n - run) % blocking) == 0)
+		return n - run;
+	*state = 1;
+	return n;
+}
+
+/* Hex digits of n data bits, 4 bits a digit, the first bit the least
+ * significant, the last digit padded with 0; '?' for a digit with a lost bit.
+ * Returns the number of digits. */
+static int flex_hex_digits(const int8_t *bits, int n, char *out, int out_size)
+{
+	int i, k, o = 0;
+
+	for (i = 0; i < n && o < out_size - 1; i += 4) {
+		unsigned v = 0;
+		int lost = 0;
+
+		for (k = 0; k < 4 && i + k < n; k++) {
+			if (bits[i + k] < 0)
+				lost = 1;
+			else
+				v |= (unsigned)bits[i + k] << k;
+		}
+		out[o++] = lost ? '?' : "0123456789ABCDEF"[v];
+	}
+	out[o] = '\0';
+	return o;
+}
+
+/* Signature S (3.10.1.2 p.61): 1's complement of the sum of the data bits in
+ * groups of 8, the first bit the least significant of a group, a last group
+ * with fewer bits padded with 0.  The termination bits are not included.
+ * *lost = 1 if a bit is lost. */
+static uint32_t flex_hex_signature(const int8_t *bits, int n, int *lost)
+{
+	uint32_t sum = 0, acc = 0;
+	int i;
+
+	*lost = 0;
+	for (i = 0; i < n; i++) {
+		if (bits[i] < 0)
+			*lost = 1;
+		else
+			acc |= (uint32_t)bits[i] << (i % 8);
+		if ((i % 8) == 7) {
+			sum += acc;
+			acc = 0;
+		}
+	}
+	if ((n % 8) != 0)
+		sum += acc;
+	return sum;
+}
+
+/* Append data bits to a reassembly slot and refresh its hex text. */
+static void reasm_bits_append(flex_t *flex, int slot, const int8_t *bits, int n)
+{
+	int pol = flex->rx.polarity;
+	int room = FLEX_REASM_MAX_LEN * 4 - flex->rx.reasm[pol][slot].nbits;
+
+	if (n > room) {
+		n = room;
+		flex->rx.reasm[pol][slot].gap = 1;
+	}
+	if (n > 0) {
+		memcpy(flex->rx.reasm[pol][slot].bits + flex->rx.reasm[pol][slot].nbits, bits, n);
+		flex->rx.reasm[pol][slot].nbits += n;
+	}
+	flex->rx.reasm[pol][slot].len = flex_hex_digits(flex->rx.reasm[pol][slot].bits,
+		flex->rx.reasm[pol][slot].nbits, flex->rx.reasm[pol][slot].buf, FLEX_REASM_MAX_LEN);
+	flex->rx.reasm[pol][slot].last_frame = flex->rx.fiw_frame;
+	flex->rx.reasm[pol][slot].last_cycle = flex->rx.fiw_cycle;
+}
+
+/* K states of a message: FAIL beats incomplete beats OK */
+static int flex_k_combine(int a, int b)
+{
+	if (a == 1 || b == 1)
+		return 1;
+	if (a == 2 || b == 2)
+		return 2;
+	return 0;
+}
+
 /* Decode one phase of a received frame.
  * De-interleave blocks, BCH decode, parse BIW/addresses/vectors/messages.
  * phaseptr points to 88 words of raw interleaved data. */
@@ -3250,51 +3418,131 @@ parse_phase:
 					sh_t = (sh_hdr >> FLEX_SEC_TYPE_SHIFT) & FLEX_SEC_TYPE_MASK;
 				}
 				if (sh_ok && sh_t != FLEX_SEC_TYPE_ALPHA) {
-					static const char hex_digits[] = "0123456789ABCDEF";
-					int8_t bits[FLEX_WORDS_PER_FRAME * FLEX_BCH_DATA_BITS];
-					char hex[FLEX_WORDS_PER_FRAME * FLEX_BCH_DATA_BITS / 4 + 2];
-					int nbits = 0, nhex = 0, w, b;
+					int8_t sbits[FLEX_WORDS_PER_FRAME * FLEX_BCH_DATA_BITS];
+					char shex[FLEX_WORDS_PER_FRAME * FLEX_BCH_DATA_BITS / 4 + 2];
+					int nbits = 0, slen, sst = 0, w, b;
 					int sh_c = (sh_hdr & FLEX_ALPHA_HDR_C_MASK) >> FLEX_ALPHA_HDR_C_SHIFT;
 					int sh_f = (sh_hdr & FLEX_ALPHA_HDR_F_MASK) >> FLEX_ALPHA_HDR_F_SHIFT;
 					int sh_n = (sh_hdr & FLEX_ALPHA_HDR_N_MASK) >> FLEX_ALPHA_HDR_N_SHIFT;
 					int nid_change = (aw_type == FLEX_ADDR_NETWORK &&
 							  sh_t == FLEX_SECURE_T_NID_CHANGE);
+					int sh_initial = (sh_f == 3);
+					int sh_k_state = 2;
+					const char *sh_k = ",K=incomplete";
+					const char *sh_name = (sh_t == FLEX_SEC_TYPE_BINARY) ? "binary" :
+							      (sh_t == FLEX_SEC_TYPE_SEPARATE) ? "data defined separately" : "reserved";
 
+					/* Data bits of the fragment from word 2 of every
+					 * fragment, a lost word keeps its place */
 					for (w = is_long ? mw1 : (mw1 + 1); w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
 						int lost = (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
 							    ph->status[w] == FLEX_WORD_NOT_RECEIVED);
 						for (b = 0; b < FLEX_BCH_DATA_BITS; b++)
-							bits[nbits++] = lost ? -1 : (int8_t)((ph->words[w] >> b) & 1);
+							sbits[nbits++] = lost ? -1 : (int8_t)((ph->words[w] >> b) & 1);
 					}
-					if (sh_t == FLEX_SEC_TYPE_BINARY && sh_c == 0 && nbits > 0 && bits[nbits - 1] >= 0) {
-						int8_t fill = bits[nbits - 1];
-						while (nbits > 0 && bits[nbits - 1] == fill)
-							nbits--;
-					}
-					for (b = 0; b < nbits; b += 4) {
-						unsigned v = 0;
-						int k, lostbit = 0;
-						for (k = 0; k < 4 && b + k < nbits; k++) {
-							if (bits[b + k] < 0)
-								lostbit = 1;
-							else
-								v |= (unsigned)bits[b + k] << k;
+					/* Binary data (t1t0=10): termination of p.70, characters
+					 * of 1 bit.  The termination of t1t0=01 is not defined. */
+					slen = (sh_t == FLEX_SEC_TYPE_BINARY) ?
+						flex_hex_terminate(sbits, nbits, 1, sh_c == 0, &sst) : nbits;
+					flex_hex_digits(sbits, slen, shex, sizeof(shex));
+
+					/* K: 10 bit checksum of all words of the fragment,
+					 * K field counted as 0 (3.10.1.4 p.69) */
+					{
+						uint32_t ksum = 0, kmask = FLEX_ALPHA_HDR_K_MASK;
+						int kok = 1, kw;
+
+						ksum += (sh_hdr & ~kmask) & 0xFF;
+						ksum += ((sh_hdr & ~kmask) >> 8) & 0xFF;
+						ksum += ((sh_hdr & ~kmask) >> 16) & 0x1F;
+						for (kw = mw1; kw <= mw2 && kw < FLEX_WORDS_PER_FRAME; kw++) {
+							if (!is_long && kw == mw1)
+								continue;
+							if (ph->status[kw] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[kw] == FLEX_WORD_NOT_RECEIVED) {
+								kok = 0;
+								break;
+							}
+							ksum += ph->words[kw] & 0xFF;
+							ksum += (ph->words[kw] >> 8) & 0xFF;
+							ksum += (ph->words[kw] >> 16) & 0x1F;
 						}
-						hex[nhex++] = lostbit ? '?' : hex_digits[v];
+						if (kok) {
+							sh_k_state = ((~ksum & kmask) == (sh_hdr & kmask)) ? 0 : 1;
+							sh_k = sh_k_state ? ",K=FAIL" : ",K=OK";
+						}
 					}
-					hex[nhex] = '\0';
+
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  SEC t=%u %s%s C=%d F=%d N=%d hex nibble=4 order=lsb_first bits=%d [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,t1t0=%d%s,bits=%d,nibble=4,order=lsb_first%s [%09" PRIu64 "] %c%c SEC %s%s [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
-						  phase_name, capcode,
+						  phase_name,
+						  flex->rx.sync_baud,
+						  flex->rx.sync_levels,
+						  flex->rx.polarity ? "inverted" : "normal",
+						  grp_tag,
+						  (sh_c == 0 && sh_initial) ? "complete" :
+						  sh_c ? (sh_initial ? "frag_start" : "frag_cont") : "frag_end",
+						  sh_n, sh_t, sh_k, slen,
+						  sst == 1 ? ",fill=inconsistent" : sst == 2 ? ",fill=unknown" : "",
+						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
-						  sh_t,
-						  (sh_t == FLEX_SEC_TYPE_BINARY) ? "binary" :
-						  (sh_t == FLEX_SEC_TYPE_SEPARATE) ? "data defined separately" : "reserved",
+						  prio_flag,
+						  sh_name,
 						  nid_change ? " NID change instruction" : "",
-						  sh_c, sh_f, sh_n,
-						  nbits, hex);
+						  shex);
+
+					/* Fragments joined end to end in a reassembly slot */
+					if (sh_c == 0 && sh_initial) {
+						reasm_invalidate_capcode(flex, capcode, -1);
+					} else if (sh_c && sh_initial) {
+						int slot;
+
+						reasm_invalidate_capcode(flex, capcode, sh_n);
+						slot = reasm_alloc(flex, capcode, sh_n, FLEX_VECTOR_TYPE_SECURE);
+						flex->rx.reasm[pol][slot].secure_subtype = (int)sh_t;
+						flex->rx.reasm[pol][slot].nbits = 0;
+						flex->rx.reasm[pol][slot].k_state = sh_k_state;
+						flex->rx.reasm[pol][slot].gap = (sst == 2);
+						flex->rx.reasm[pol][slot].frag_count = 1;
+						reasm_bits_append(flex, slot, sbits, slen);
+					} else {
+						int slot = reasm_find(flex, capcode, sh_n);
+
+						if (slot >= 0) {
+							if (sh_f != flex->rx.reasm[pol][slot].expected_f || sst == 2)
+								flex->rx.reasm[pol][slot].gap = 1;
+							flex->rx.reasm[pol][slot].k_state = flex_k_combine(flex->rx.reasm[pol][slot].k_state, sh_k_state);
+							flex->rx.reasm[pol][slot].frag_count++;
+							reasm_bits_append(flex, slot, sbits, slen);
+							flex->rx.reasm[pol][slot].expected_f = (sh_f + 1) % 3;
+							if (sh_c == 0) {
+								LOGP_CHAN(DDSP, LOGL_NOTICE,
+									  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=reassembled,N=%d,t1t0=%d,K=%s,fragments=%d,bits=%d,nibble=4,order=lsb_first%s [%09" PRIu64 "] %c%c SEC %s%s [%s]\n",
+									  bitrate,
+									  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+									  phase_name,
+									  flex->rx.sync_baud,
+									  flex->rx.sync_levels,
+									  flex->rx.polarity ? "inverted" : "normal",
+									  grp_tag,
+									  sh_n, sh_t,
+									  flex->rx.reasm[pol][slot].k_state == 0 ? "OK" :
+									  flex->rx.reasm[pol][slot].k_state == 1 ? "FAIL" : "incomplete",
+									  flex->rx.reasm[pol][slot].frag_count,
+									  flex->rx.reasm[pol][slot].nbits,
+									  flex->rx.reasm[pol][slot].gap ? ",fragment_gap" : "",
+									  capcode,
+									  flex_addr_type_flag(aw_type, is_long),
+									  prio_flag,
+									  sh_name,
+									  nid_change ? " NID change instruction" : "",
+									  flex->rx.reasm[pol][slot].buf);
+								flex->rx.reasm[pol][slot].active = 0;
+							}
+						}
+					}
 					continue;
 				}
 			}
@@ -4658,10 +4906,12 @@ parse_phase:
 				 * raw hex from the data words. */
 				if (mw1 <= 87 && mw2 <= 87) {
 					char hex[512];
-					int hi = 0, w;
+					int w;
 					int hex_c = 0, hex_f = 0, hex_n = 0;
 					int hex_is_initial = 0;
 					int hex_r = 0; /* R flag from hdr2 (retransmission) */
+					int hex_mail_drop = 0; /* M flag from hdr2 */
+					int hex_rsv_s = 0; /* s3-s0 reserved bits from hdr2 */
 					int hex_blocking = 0; /* B field from hdr2 (0=16 bits/char) */
 					int hex_display_rtl = 0; /* D: Display direction per §3.10.1.2.
 								  * 0=left-to-right (default), 1=right-to-left.
@@ -4718,6 +4968,8 @@ parse_phase:
 								     ph->status[mw1] == FLEX_WORD_CORRECTED)) {
 									uint32_t hdr2 = ph->words[mw1];
 									hex_r = (hdr2 >> FLEX_HEX_HDR2_R_SHIFT) & 1;
+									hex_mail_drop = (hdr2 >> FLEX_HEX_HDR2_M_SHIFT) & 1;
+									hex_rsv_s = (hdr2 >> FLEX_HEX_HDR2_s_SHIFT) & 0xF;
 									hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
 									hex_display_rtl = (hdr2 >> FLEX_HEX_HDR2_D_SHIFT) & 1;
 									hex_header_msg = (hdr2 >> FLEX_HEX_HDR2_H_SHIFT) & 1;
@@ -4748,6 +5000,8 @@ parse_phase:
 								     ph->status[mw1 + 1] == FLEX_WORD_CORRECTED)) {
 									uint32_t hdr2 = ph->words[mw1 + 1];
 									hex_r = (hdr2 >> FLEX_HEX_HDR2_R_SHIFT) & 1;
+									hex_mail_drop = (hdr2 >> FLEX_HEX_HDR2_M_SHIFT) & 1;
+									hex_rsv_s = (hdr2 >> FLEX_HEX_HDR2_s_SHIFT) & 0xF;
 									hex_blocking = (hdr2 >> FLEX_HEX_HDR2_B_SHIFT) & 0xF;
 									hex_display_rtl = (hdr2 >> FLEX_HEX_HDR2_D_SHIFT) & 1;
 									hex_header_msg = (hdr2 >> FLEX_HEX_HDR2_H_SHIFT) & 1;
@@ -4818,125 +5072,40 @@ parse_phase:
 						}
 					}
 
-					/* Unpack nibbles from data words as a continuous
-					 * bit stream across all 21 bits per word.
-					 * Per standard Fig 3.10.1.2-1, data fills all
-					 * 21 bits with nibble boundaries crossing word
-					 * boundaries freely.
-					 *
-					 * Termination detection (Spec §3.10.1.2):
-					 * After the last data nibble, remaining bits are
-					 * filled with the inverse of the last data bit.
-					 * We detect this by scanning backwards from the
-					 * end of the last word. */
+					/* Data bits of the fragment (Fig. 3.10.1.2-1: all 21
+					 * bits of a word, characters crossing word
+					 * boundaries freely), a lost word keeps its place.
+					 * The data length follows from the termination
+					 * rules (flex_hex_terminate). */
+					int8_t fbits[FLEX_WORDS_PER_FRAME * FLEX_BCH_DATA_BITS];
+					int nbits = 0, fbits_len = 0, term_state = 0, blocking_known = 0;
 					{
-						int bit_count = 0;
-						uint8_t nibble_acc = 0;
-						int last_data_word = -1;
+						/* A continuation fragment has no header word 2: the
+						 * blocking length is the one of the first fragment */
+						if (hex_is_initial) {
+							blocking_known = hex_has_sig;
+						} else {
+							int bslot = reasm_find(flex, capcode, hex_n);
 
-						/* Debug dump raw data words */
-						{
-							char dbg[512];
-							int dpos = 0;
-							dpos += snprintf(dbg + dpos, sizeof(dbg) - dpos,
-								"RX: HEX cap=%" PRIu64 " mw1=%d mw2=%d data_start=%d hdr[%d]=0x%05X:",
-								capcode, mw1, mw2, data_start, mw1, ph->words[mw1] & 0x1FFFFF);
-							for (w = data_start; w <= mw2 && w < FLEX_WORDS_PER_FRAME && dpos < (int)sizeof(dbg) - 15; w++)
-								dpos += snprintf(dbg + dpos, sizeof(dbg) - dpos,
-									" [%d]=0x%05X", w, ph->words[w] & 0x1FFFFF);
-							LOGP_CHAN(DDSP, LOGL_INFO, "%s\n", dbg);
+							if (bslot >= 0) {
+								hex_blocking = flex->rx.reasm[pol][bslot].blocking;
+								blocking_known = 1;
+							}
 						}
 
 						for (w = data_start; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
-							uint32_t dw;
+							int lost = (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+								    ph->status[w] == FLEX_WORD_NOT_RECEIVED);
 							int b;
-							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-								continue;
-							dw = ph->words[w];
-							last_data_word = w;
-							for (b = 0; b < FLEX_BCH_DATA_BITS; b++) {
-								int nibble_pos = bit_count % 4;
-								if (nibble_pos == 0)
-									nibble_acc = 0;
-								nibble_acc |= ((dw >> b) & 1) << nibble_pos;
-								if (nibble_pos == 3 && hi < (int)sizeof(hex) - 1)
-									hex[hi++] = "0123456789ABCDEF"[nibble_acc & 0xF];
-								bit_count++;
-							}
+
+							for (b = 0; b < FLEX_BCH_DATA_BITS; b++)
+								fbits[nbits++] = lost ? -1 : (int8_t)((ph->words[w] >> b) & 1);
 						}
-
-						/* Strip termination fill from last/complete
-						 * fragment (C=0).
-						 *
-						 * Per spec §3.10.1.2:
-						 *   Rule (2): data ends mid-word → remaining
-						 *     bits filled with inverse of last data bit.
-						 *   Rule (3): data ends at word boundary AND
-						 *     last char is all-0 or all-1 → extra fill
-						 *     word appended (inverse of last data bit).
-						 *
-						 * Either strip a whole extra fill word, or
-						 * strip partial fill bits.  Never both. */
-						if (last_data_word >= 0 && hex_c == 0) {
-							int strip_word = last_data_word;
-
-							/* Rule (3): if last word is entirely
-							 * one value (0x000000 or 0x1FFFFF),
-							 * it is an extra fill word — discard
-							 * it and truncate hex output. */
-							if (strip_word > data_start) {
-								uint32_t lw = ph->words[strip_word] & FLEX_DATA_MASK;
-								if (lw == 0x000000 || lw == FLEX_DATA_MASK) {
-									int bits_before = 0;
-									for (w = data_start; w < strip_word; w++) {
-										if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-										    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-											continue;
-										bits_before += FLEX_BCH_DATA_BITS;
-									}
-									int nibs_before = bits_before / 4;
-									if (nibs_before > 0 && nibs_before <= hi) {
-										hi = nibs_before;
-										strip_word = -1; /* done */
-									}
-								}
-							}
-
-							/* Rule (2): partial fill in last word.
-							 * Scan backwards from bit 20 — consecutive
-							 * identical bits from top are fill. */
-							if (strip_word >= data_start &&
-							    ph->status[strip_word] != FLEX_WORD_UNCORRECTABLE &&
-							    ph->status[strip_word] != FLEX_WORD_NOT_RECEIVED) {
-								uint32_t lw = ph->words[strip_word];
-								uint32_t top_bit = (lw >> 20) & 1;
-								int fill_start = 21;
-								int b;
-
-								for (b = 20; b >= 0; b--) {
-									if (((lw >> b) & 1) != top_bit)
-										break;
-									fill_start = b;
-								}
-
-								if (fill_start < 21 && fill_start > 0) {
-									int bits_before = 0;
-									for (w = data_start; w < strip_word; w++) {
-										if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-										    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-											continue;
-										bits_before += FLEX_BCH_DATA_BITS;
-									}
-									int real_bits = bits_before + fill_start;
-									int real_nibbles = (real_bits + 3) / 4;
-									if (real_nibbles < hi)
-										hi = real_nibbles;
-								}
-							}
-						}
+						fbits_len = flex_hex_terminate(fbits, nbits, blocking_known ? (hex_blocking ? hex_blocking : 16) : 0,
+							hex_c == 0, &term_state);
+						flex_hex_digits(fbits, fbits_len, hex, sizeof(hex));
 					}
-					hex[hi] = '\0';
+
 
 					/* S: Verify 8-bit message signature on initial fragment.
 					 *
@@ -4954,41 +5123,19 @@ parse_phase:
 					 * the signature covers ALL fragments — validation
 					 * must wait until reassembly is complete.
 					 *
-					 * We compute the sum over the raw data bits from the
-					 * data words, stopping at hi*4 bits (the actual data
-					 * length after termination stripping). */
+					 * The sum is over the data bits of the fragment
+					 * (fbits_len, termination excluded). */
 					if (hex_is_initial && hex_has_sig) {
-						uint32_t sig_sum = 0;
-						int total_data_bits = hi * 4;
-						int bit_pos = 0;
-						uint8_t accum = 0;
-						int accum_bits = 0;
-
-						for (w = data_start; w <= mw2 && w < FLEX_WORDS_PER_FRAME && bit_pos < total_data_bits; w++) {
-							int b;
-							uint32_t dw;
-							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-							    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
-								continue;
-							dw = ph->words[w];
-							for (b = 0; b < 21 && bit_pos < total_data_bits; b++) {
-								accum |= (uint8_t)(((dw >> b) & 1) << accum_bits);
-								accum_bits++;
-								bit_pos++;
-								if (accum_bits == 8) {
-									sig_sum += accum;
-									accum = 0;
-									accum_bits = 0;
-								}
-							}
-						}
-						/* Include any remaining partial byte */
-						if (accum_bits > 0)
-							sig_sum += accum;
+						int total_data_bits = fbits_len;
+						int sig_lost = 0;
+						uint32_t sig_sum = flex_hex_signature(fbits, fbits_len, &sig_lost);
 
 						{
 							uint32_t expected_sig = (~sig_sum) & 0xFF;
-							if (hex_c == 0) {
+							if (hex_c == 0 && (sig_lost || term_state == 2)) {
+								/* Lost bits or an unknown data end: no verdict */
+								hex_sig_status = ",sig=incomplete";
+							} else if (hex_c == 0) {
 								/* Complete message — validate now */
 								if (rx_hex_sig == expected_sig) {
 									hex_sig_status = ",sig=OK";
@@ -5022,55 +5169,10 @@ parse_phase:
 						}
 					}
 
-					/* For continuation/final fragments, recover B
-					 * from the reassembly slot (only the initial
-					 * fragment carries header2 with the B field). */
-					if (!hex_is_initial && hex_blocking == 0) {
-						int slot = reasm_find(flex, capcode, hex_n);
-						if (slot >= 0)
-							hex_blocking = flex->rx.reasm[pol][slot].blocking;
-					}
-
-					/* Pad output to full byte boundary for parseable
-					 * hex display, using the spec's termination fill
-					 * convention (ARIB STD-43A §3.10.1.2):
-					 * inverse of the last data bit.
-					 *
-					 * If data already ends on a byte boundary, append
-					 * a full byte of fill so consumers can always
-					 * detect the fill/data boundary by scanning
-					 * identical trailing bits.
-					 *
-					 * This means the hex string is always a whole
-					 * number of bytes, and the real data length can
-					 * be recovered by stripping trailing fill bits
-					 * (same algorithm as the spec's termination
-					 * detection). */
-					if (hi > 0) {
-						/* Last data nibble → last data bit */
-						uint8_t last_nib = (uint8_t)((hex[hi - 1] >= '0' && hex[hi - 1] <= '9')
-							? (hex[hi - 1] - '0')
-							: (hex[hi - 1] - 'A' + 10));
-						uint8_t last_bit = (last_nib >> 3) & 1;
-						uint8_t fill_nib = last_bit ? 0x0 : 0xF;
-						char fill_char = "0123456789ABCDEF"[fill_nib];
-
-						if ((hi & 1) == 0) {
-							/* Already on byte boundary — add full
-							 * fill byte (2 nibbles) */
-							hex[hi++] = fill_char;
-							hex[hi++] = fill_char;
-						} else {
-							/* Odd nibble count — pad to byte */
-							hex[hi++] = fill_char;
-						}
-						hex[hi] = '\0';
-					}
-
 					/* Log blocking length and decoded block count */
 					{
 						int bl = hex_blocking ? hex_blocking : 16;
-						int data_bits = hi * 4;
+						int data_bits = fbits_len;
 						int blocks = (bl > 0) ? data_bits / bl : 0;
 						LOGP_CHAN(DDSP, LOGL_DEBUG,
 							  "RX: Phase %c HEX/Binary: B=%d (%d bits/char), "
@@ -5087,6 +5189,7 @@ parse_phase:
 					 * words are header word 1 (at Vy for a long
 					 * address) and the message field words. */
 					const char *hex_k_status = ",K=incomplete";
+					int hex_k_state = 2;	/* 0 OK, 1 FAIL, 2 incomplete */
 					{
 						int k_words_ok = (hex_hdr_idx < FLEX_WORDS_PER_FRAME &&
 								  (ph->status[hex_hdr_idx] == FLEX_WORD_CLEAN ||
@@ -5118,16 +5221,25 @@ parse_phase:
 						if (k_words_ok) {
 							uint32_t k_expected = (~k_sum) & FLEX_HEX_HDR_K_MASK;
 
-							hex_k_status = (k_expected == (k_hdr & FLEX_HEX_HDR_K_MASK)) ? ",K=OK" : ",K=FAIL";
+							hex_k_state = (k_expected == (k_hdr & FLEX_HEX_HDR_K_MASK)) ? 0 : 1;
+							hex_k_status = hex_k_state ? ",K=FAIL" : ",K=OK";
 							LOGP_CHAN(DDSP, LOGL_DEBUG,
 								  "RX: Phase %c HEX K received=0x%03X computed=0x%03X\n",
 								  phase_name, k_hdr & FLEX_HEX_HDR_K_MASK, k_expected);
 						}
 					}
 
+					/* Data bits, digit size and order, and how the data end
+					 * was found (flex_hex_terminate) */
+					char hex_bits_info[96];
+					snprintf(hex_bits_info, sizeof(hex_bits_info), ",bits=%d,nibble=4,order=lsb_first%s",
+						 fbits_len,
+						 term_state == 1 ? ",fill=inconsistent" :
+						 term_state == 2 ? ",fill=unknown" : "");
+
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,D=%d,H=%d,B=%d,I=%d%s%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d%s%s%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -5138,11 +5250,13 @@ parse_phase:
 						  (hex_frag_flag == 'K') ? "complete" :
 						  (hex_frag_flag == 'F') ? (hex_is_initial ? "frag_start" : "frag_cont") :
 						  (hex_frag_flag == 'C') ? "frag_end" : "unknown",
-						  hex_n, hex_r,
+						  hex_n, hex_r, hex_mail_drop,
 						  hex_display_rtl,
 						  hex_header_msg,
 						  hex_blocking,
 						  hex_status_info,
+						  hex_rsv_s,
+						  hex_bits_info,
 						  hex_k_status,
 						  hex_sig_status,
 						  hex_recovered ? ",RX_RECOVERED" : "",
@@ -5160,9 +5274,11 @@ parse_phase:
 					 * Message Number N: 6-bit (0-63), same across all
 					 * fragments of one message.
 					 *
-					 * We reassemble the hex string representation.
-					 * No separator between fragments — hex is a
-					 * continuous nibble stream, not text. */
+					 * The data bits of the fragments are joined end to end
+					 * (a fragment ends on a character boundary, not on a
+					 * digit): hex, K and signature are made of the joined
+					 * bits.  A lost fragment is a gap: the signature is
+					 * not checked. */
 					if (hex_frag_flag == 'F' && hex_is_initial) {
 						/* First HEX fragment (F=11, C=1) — start reassembly.
 						 * Per §4.2 ①: invalidate any stale reassembly
@@ -5170,45 +5286,53 @@ parse_phase:
 						reasm_invalidate_capcode(flex, capcode, hex_n);
 						int slot = reasm_alloc(flex, capcode, hex_n, FLEX_VECTOR_TYPE_HEX_BINARY);
 						flex->rx.reasm[pol][slot].r_flag = hex_r;
+						flex->rx.reasm[pol][slot].mail_drop = hex_mail_drop;
+						flex->rx.reasm[pol][slot].rsv_s = hex_rsv_s;
 						flex->rx.reasm[pol][slot].blocking = hex_blocking;
 						flex->rx.reasm[pol][slot].display_rtl = hex_display_rtl;
 						flex->rx.reasm[pol][slot].header_msg = hex_header_msg;
 						flex->rx.reasm[pol][slot].status_info = hex_status_info;
-						reasm_append(flex, slot, hex, hi);
-					} else if (hex_frag_flag == 'F') {
+						flex->rx.reasm[pol][slot].rx_sig = hex_has_sig ? rx_hex_sig : 0;
+						flex->rx.reasm[pol][slot].sig_valid = hex_has_sig;
+						flex->rx.reasm[pol][slot].nbits = 0;
+						flex->rx.reasm[pol][slot].k_state = hex_k_state;
+						flex->rx.reasm[pol][slot].gap = (term_state == 2);
+						flex->rx.reasm[pol][slot].frag_count = 1;
+						reasm_bits_append(flex, slot, fbits, fbits_len);
+					} else if (hex_frag_flag == 'F' || hex_frag_flag == 'C') {
 						int slot = reasm_find(flex, capcode, hex_n);
 						if (slot >= 0) {
 							hex_blocking = flex->rx.reasm[pol][slot].blocking;
-							if (hex_f != flex->rx.reasm[pol][slot].expected_f)
+							if (hex_f != flex->rx.reasm[pol][slot].expected_f) {
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
 									  "RX: Phase %c HEX reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
 									  phase_name, capcode, hex_n,
 									  flex->rx.reasm[pol][slot].expected_f, hex_f);
-							reasm_append(flex, slot, hex, hi);
+								flex->rx.reasm[pol][slot].gap = 1;
+							}
+							if (term_state == 2)
+								flex->rx.reasm[pol][slot].gap = 1;
+							flex->rx.reasm[pol][slot].k_state = flex_k_combine(flex->rx.reasm[pol][slot].k_state, hex_k_state);
+							flex->rx.reasm[pol][slot].frag_count++;
+							reasm_bits_append(flex, slot, fbits, fbits_len);
 							flex->rx.reasm[pol][slot].expected_f = (hex_f + 1) % 3;
 						}
-					} else if (hex_frag_flag == 'C') {
-						int slot = reasm_find(flex, capcode, hex_n);
-						if (slot >= 0) {
-							hex_blocking = flex->rx.reasm[pol][slot].blocking;
-							if (hex_f != flex->rx.reasm[pol][slot].expected_f)
-								LOGP_CHAN(DDSP, LOGL_NOTICE,
-									  "RX: Phase %c HEX reassembly F mismatch for [%09" PRIu64 "] msgnum=%d: expected=%d got=%d (missing fragment?)\n",
-									  phase_name, capcode, hex_n,
-									  flex->rx.reasm[pol][slot].expected_f, hex_f);
-							reasm_append(flex, slot, hex, hi);
-							{
-								int rbl = hex_blocking ? hex_blocking : 16;
-								int r_bits = flex->rx.reasm[pol][slot].len * 4;
-								int r_blocks = (rbl > 0) ? r_bits / rbl : 0;
-								LOGP_CHAN(DDSP, LOGL_DEBUG,
-									  "RX: Phase %c HEX/Binary reassembled: B=%d (%d bits/char), "
-									  "%d data bits, %d blocks\n",
-									  phase_name, hex_blocking, rbl,
-									  r_bits, r_blocks);
-							}
+						if (slot >= 0 && hex_frag_flag == 'C') {
+							int r_bits = flex->rx.reasm[pol][slot].nbits;
+							int r_lost = 0;
+							uint32_t r_sum = flex_hex_signature(flex->rx.reasm[pol][slot].bits, r_bits, &r_lost);
+							const char *r_sig;
+							const char *r_k = flex->rx.reasm[pol][slot].k_state == 0 ? "OK" :
+									  flex->rx.reasm[pol][slot].k_state == 1 ? "FAIL" : "incomplete";
+
+							/* Signature over the data bits of all fragments */
+							if (!flex->rx.reasm[pol][slot].sig_valid || flex->rx.reasm[pol][slot].gap || r_lost)
+								r_sig = "incomplete";
+							else
+								r_sig = (flex->rx.reasm[pol][slot].rx_sig == ((~r_sum) & 0xFF)) ? "OK" : "FAIL";
+
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,D=%d,H=%d,B=%d,I=%d [%09" PRIu64 "] %c%c HEX [%s]\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d,K=%s,sig=%s,fragments=%d,bits=%d,nibble=4,order=lsb_first%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -5219,10 +5343,16 @@ parse_phase:
 								  "reassembled",
 								  flex->rx.reasm[pol][slot].msg_num,
 								  flex->rx.reasm[pol][slot].r_flag,
+								  flex->rx.reasm[pol][slot].mail_drop,
 								  flex->rx.reasm[pol][slot].display_rtl,
 								  flex->rx.reasm[pol][slot].header_msg,
 								  hex_blocking,
 								  flex->rx.reasm[pol][slot].status_info,
+								  flex->rx.reasm[pol][slot].rsv_s,
+								  r_k, r_sig,
+								  flex->rx.reasm[pol][slot].frag_count,
+								  r_bits,
+								  flex->rx.reasm[pol][slot].gap ? ",fragment_gap" : "",
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
 								  prio_flag,
