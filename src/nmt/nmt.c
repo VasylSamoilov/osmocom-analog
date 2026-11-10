@@ -947,9 +947,9 @@ static void tx_idle(nmt_t *nmt, frame_t *frame)
 					frame->additional_info |=
 						(uint64_t)nmt_encode_band_limit(nmt->sysinfo.tc_band_end);		/* H9H10 */
 				}
-
-				/* phone is allowed to send overdecadic dialing digits */
-				frame->additional_info |= 0x0000020000;
+				/* no overdecadic bit here: H5H6 is the CC band end limit;
+				 * the bit belongs to the battery saving frame only
+				 * (NMT Doc 450-1 para 4.3.3.12.5) */
 			}
 			/* frame 1b: H7=J, already zero from H1=E H2=0 initialisation */
 
@@ -1229,6 +1229,10 @@ static void rx_mo_ident(nmt_t *nmt, frame_t *frame)
 	case NMT_MESSAGE_10b: /* seizure */
 	case NMT_MESSAGE_12: /* seizure */
 		if (!match_channel(nmt, frame))
+			break;
+		/* area info is returned to the MTX against co-channel
+		 * interference (NMT Doc 450-1 para 4.1.1.2, 4.3.3.10.2) */
+		if (!match_area(nmt, frame))
 			break;
 		if (!match_subscriber(trans, frame))
 			break;
@@ -1578,6 +1582,14 @@ static void tx_mt_queue(nmt_t *nmt, frame_t *frame)
 		return;
 	}
 
+	/* the queue info goes between the idle frames of the calling channel
+	 * (NMT Doc 450-1 scheme 4.4.1.7: X = 1a, 2a/b/c/d/f), so idle MS keep
+	 * their calling channel */
+	if (nmt->tx_frame_count++ & 1) {
+		tx_idle(nmt, frame);
+		return;
+	}
+
 	/* otherwise keep telling the MS it is queued (2c priority, 2f ordinary) */
 	/* H8H9H10: system-specific encoding per NMT 450 §4.3.3.11 / NMT 900 §4.3.3.12.
 	 * Constants are defined at file scope above (NMT_QUEUE_H8H9H10_*). */
@@ -1590,7 +1602,7 @@ static void tx_mt_queue(nmt_t *nmt, frame_t *frame)
 		frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_450 : NMT_QUEUE_H8H9H10_ORDINARY_450;
 	else
 		frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_900 : NMT_QUEUE_H8H9H10_ORDINARY_900;
-	if (++nmt->tx_frame_count == 1)
+	if (nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send queue info to mobile (%s).\n", trans->priority ? "2c priority" : "2f ordinary");
 }
 
@@ -1679,6 +1691,7 @@ static void rx_mt_ident(nmt_t *nmt, frame_t *frame)
 			/* DMS (SMS) or MWI call - use autoanswer path */
 			nmt_new_state(nmt, STATE_MT_AUTOANSWER);
 			nmt->wait_autoanswer = 1;
+			nmt->autoanswer_acked = 0;
 			nmt->tx_frame_count = 0;
 		} else if (trans->priority_mo) {
 			/* PMS MO call (4.4.1.7): MS is calling OUT -- no incoming callref.
@@ -1709,26 +1722,44 @@ static void rx_mt_ident(nmt_t *nmt, frame_t *frame)
 	}
 }
 
+static void tx_mt_complete(nmt_t *nmt, frame_t *frame);
+static void tx_active(nmt_t *nmt, frame_t *frame);
+
 static void tx_mt_autoanswer(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans = nmt->trans;
 
-	/* first we need to wait for autoanswer */
+	/* NMT Doc 450-1 Scheme B2 (4.4.1.12) steps 9-12: 6 idle frames after
+	 * the identity, then 5a(L=12) four times (T'), then 3 idle frames while
+	 * the MS acknowledges with 13a(L=12). The order is always sent to its
+	 * end; the acknowledgement is accepted until T' after the last 5a. */
 	if (nmt->wait_autoanswer) {
 		frame->mt = NMT_MESSAGE_6;
+		if (++nmt->tx_frame_count >= 6) {
+			nmt->wait_autoanswer = 0;
+			nmt->tx_frame_count = 0;
+		}
 		return;
 	}
-	/* NMT Doc 450-1 Scheme B2 (4.4.1.12) steps 10-12: send 5a(L=12) four
-	 * times (T'), then idle frames 6 while the MS acknowledges with
-	 * 13a(L=12) within T'. The acknowledgement is accepted until T' after
-	 * the last 5a has elapsed. */
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send 'autoanswer order'.\n");
-	if (nmt->tx_frame_count <= 4)
+	if (nmt->tx_frame_count <= 4) {
 		set_line_signal(nmt, frame, 12);
-	else
-		frame->mt = NMT_MESSAGE_6;
-	if (nmt->tx_frame_count == 8) {
+		return;
+	}
+	if (nmt->tx_frame_count >= 8 && nmt->autoanswer_acked) {
+		/* order and 3 idle frames are out: deliver */
+		LOGP_CHAN(DNMT, LOGL_INFO, "Autoanswer acknowledged, deliver.\n");
+		nmt_new_state(nmt, STATE_MT_COMPLETE);
+		nmt->tx_frame_count = 3;
+		call_up_answer(trans->callref, &trans->subscriber.country);
+		tx_mt_complete(nmt, frame);
+		if (nmt->state == STATE_ACTIVE && nmt->active_state == ACTIVE_STATE_MWI)
+			tx_active(nmt, frame);
+		return;
+	}
+	frame->mt = NMT_MESSAGE_6;
+	if (nmt->tx_frame_count == 9) {
 		LOGP_CHAN(DNMT, LOGL_INFO, "No reaction to autoanswer, proceed with ringing.\n");
 		nmt_new_state(nmt, STATE_MT_RINGING);
 		nmt->tx_frame_count = 0;
@@ -1743,21 +1774,21 @@ static void rx_mt_autoanswer(nmt_t *nmt, frame_t *frame)
 	transaction_t *trans = nmt->trans;
 
 	switch (frame->mt) {
-	case NMT_MESSAGE_15: /* idle */
-		nmt->wait_autoanswer = 0;
-		break;
 	case NMT_MESSAGE_13a: /* line signal */
+		/* no order sent yet: nothing to acknowledge */
+		if (nmt->wait_autoanswer)
+			break;
 		if (!match_channel(nmt, frame))
 			break;
 		if (!match_subscriber(trans, frame))
 			break;
 		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 12)
 			break;
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received acknowledge to autoanswer (line signal L(12) '%s').\n",
-			nmt_linesignal_name(12, 1));
-		nmt_new_state(nmt, STATE_MT_COMPLETE);
-		nmt->tx_frame_count = 0;
-		call_up_answer(trans->callref, &trans->subscriber.country);
+		if (!nmt->autoanswer_acked)
+			LOGP_CHAN(DNMT, LOGL_INFO, "Received acknowledge to autoanswer (line signal L(12) '%s').\n",
+				nmt_linesignal_name(12, 1));
+		/* delivery starts when the order and 3 idle frames are out (tx_mt_autoanswer) */
+		nmt->autoanswer_acked = 1;
 		break;
 	default:
 		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame->mt), nmt_state_name(nmt->state));
@@ -1771,11 +1802,14 @@ static void tx_mt_ringing(nmt_t *nmt, frame_t *frame)
 	set_line_signal(nmt, frame, 9);
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send 'ringing order'.\n");
-	if (nmt->tx_frame_count >= 4) {
+	/* ringing order for 4 frames (NMT Doc 450-1 scheme B, T'), then idle
+	 * frames or the A-number; the sequence starts with M(0), which carries
+	 * its length (para 4.3.3.13) */
+	if (nmt->tx_frame_count > 4) {
 		if (nmt->tx_callerid_count) {
 			if (nmt->tx_frame_count == 5)
 				LOGP_CHAN(DNMT, LOGL_INFO, "Send 'A-number'.\n");
-			nmt_encode_a_number(frame, nmt->tx_frame_count - 4, trans->caller_type, trans->caller_id, nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power, nmt->sysinfo.traffic_area);
+			nmt_encode_a_number(frame, nmt->tx_frame_count - 5, trans->caller_type, trans->caller_id, nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power, nmt->sysinfo.traffic_area);
 		} else
 			frame->mt = NMT_MESSAGE_6;
 	}
@@ -2537,12 +2571,19 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 		if (nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Sending power change order (frame 3a, new power=%d).\n", trans->pending_power);
 		frame->mt = NMT_MESSAGE_3a;
-		frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
 		frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
 		frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 		frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-		/* Na = new TC with new power level */
-		frame->tc_no = nmt_encode_tc(nmt->sysinfo.system, atoi(nmt->sender.kanal), trans->pending_power);
+		if (nmt->sysinfo.system == 900) {
+			/* NMT Doc 900-1 para 4.4.1.8: new power level in N1,
+			 * NaNbNc has no power bits */
+			frame->channel_no = nmt_encode_channel(900, atoi(nmt->sender.kanal), trans->pending_power);
+			frame->tc_no = nmt_encode_tc(900, atoi(nmt->sender.kanal), 0);
+		} else {
+			/* NMT Doc 450-1 para 4.4.1.8: new power level in Na */
+			frame->channel_no = nmt_encode_channel(450, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+			frame->tc_no = nmt_encode_tc(450, atoi(nmt->sender.kanal), trans->pending_power);
+		}
 		if (++nmt->tx_frame_count >= 8) {
 			/* T expired without 10b ack -- MS did not respond; stay on old power */
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Power change timeout: no 10b ack from MS, keeping power=%d.\n", nmt->sysinfo.ms_power);
@@ -3003,10 +3044,9 @@ static int _out_setup(int callref, const char *caller_id, enum number_type calle
 		LOGP(DNMT, LOGL_NOTICE, "Outgoing call, but no free calling channel, rejecting!\n");
 		return -CAUSE_NOCHANNEL;
 	}
-	if (!search_free_tc(NULL)) {
-		LOGP(DNMT, LOGL_NOTICE, "Outgoing call, but no free traffic channel, rejecting!\n");
-		return -CAUSE_NOCHANNEL;
-	}
+	/* no free traffic channel: the MS is paged all the same and the call is
+	 * queued when it answers (2f/2c, NMT Doc 450-1 para 4.1.1.2, scheme B
+	 * step 5) */
 
 	LOGP(DNMT, LOGL_INFO, "Call to mobile station, paging station id '%c%s'\n", subscr.country, subscr.number);
 
@@ -3413,10 +3453,8 @@ static int mwi_set(const char *dialing, uint8_t flags)
 		LOGP(DNMT, LOGL_NOTICE, "MWI: no free calling channel\n");
 		return -CAUSE_NOCHANNEL;
 	}
-	if (!search_free_tc(NULL)) {
-		LOGP(DNMT, LOGL_NOTICE, "MWI: no free traffic channel\n");
-		return -CAUSE_NOCHANNEL;
-	}
+	/* no free traffic channel: paged all the same, queued when the MS
+	 * answers (as any call to the MS) */
 
 	LOGP(DNMT, LOGL_INFO, "MWI out-of-call to '%c%s': %s(0x%02x)\n",
 		subscr.country, subscr.number,

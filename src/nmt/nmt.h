@@ -119,7 +119,8 @@ struct nmt {
 
 	/* sender's states */
 	enum nmt_state		state;
-	int			wait_autoanswer;	/* wait for frame 15 before we can send autoanswer */
+	int			wait_autoanswer;	/* idle frames after the identity are still going out (scheme B2) */
+	int			autoanswer_acked;	/* the MS acknowledged the autoanswer order */
 	struct nmt		*scip_target;		/* SCIP: destination channel we are moving the call to */
 	struct nmt		*scip_source;		/* SCIP: origin channel, kept armed so a failed move can revert */
 	char			scip_country;		/* SCIP: subscriber country digit expected on the target TC */
