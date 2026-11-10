@@ -935,10 +935,22 @@ static int flex_fragment_binary(const char *data, int blocking, int words_first,
 
 		if (words < 2)
 			words = 2;
-		if (rest_bits <= (words - 1) * FLEX_BCH_DATA_BITS)
+		if (rest_bits <= (words - 1) * FLEX_BCH_DATA_BITS) {
 			digits = len - pos;
-		else
-			digits = flex_binary_fragment_bits(words, blocking) / 4;
+		} else {
+			/* Not the last: it leaves data for the last fragment (the
+			 * rest does not fit with its termination, it may without) */
+			int w = words;
+
+			do {
+				digits = flex_binary_fragment_bits(w, blocking) / 4;
+			} while (digits >= len - pos && --w >= 1);
+			if (digits >= len - pos || digits <= 0) {
+				while (count > 0)
+					free(fragments[--count]);
+				return 0;
+			}
+		}
 		LOGP(DFLEX, LOGL_DEBUG, "Binary fragment %d: digits %d..%d of %d\n",
 		     count, pos, pos + digits, len);
 		fragments[count] = malloc(digits + 1);

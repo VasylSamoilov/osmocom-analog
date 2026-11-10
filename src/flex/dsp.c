@@ -2050,6 +2050,14 @@ static int flex_hex_terminate(const int8_t *bits, int n, int blocking, int last_
 		}
 	}
 
+	/* A fragment that is not the last is packed full: no fill and no
+	 * padding word, the only bits after its last character are the ones
+	 * too few for another character (fewer than B).  Their value tells
+	 * nothing (they may equal the last data bits): the data are the whole
+	 * characters */
+	if (!last_fragment)
+		return n - (n % blocking);
+
 	/* Rule (3): an extra word of the inverse of the last data bit */
 	if (last_fragment && n >= 2 * FLEX_BCH_DATA_BITS && ((n - FLEX_BCH_DATA_BITS) % blocking) == 0 &&
 	    n - FLEX_BCH_DATA_BITS >= blocking) {
@@ -2086,14 +2094,7 @@ static int flex_hex_terminate(const int8_t *bits, int n, int blocking, int last_
 		return n - (n % blocking);
 	}
 	if (run >= blocking) {
-		/* A fragment that is not the last is packed full: no fill and no
-		 * padding word, the only bits after its last character are the
-		 * ones too few for another character (fewer than B).  A run of B
-		 * bits or more is data; the data end exactly at the word end. */
-		if (!last_fragment) {
-			*state = ((n % blocking) != 0) ? 1 : 0;
-			return n;
-		}
+		/* Last fragment: fill of B bits or more after the last character */
 		if (((n - run) % blocking) == 0)
 			return n - run;
 		/* Equal bits that do not end on a character boundary: the rules
