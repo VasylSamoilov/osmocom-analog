@@ -73,9 +73,19 @@ static int sms_ref = 0;
 #define RINGING_TO	60,0	/* how long may the phone ring */
 #define SUPERVISORY_TO1	3	/* 3 sec to detect after setup */
 #define SUPERVISORY_TO2	20,0	/* 20 sec lost until abort */
-#define RECALL_TO	30,0	/* register recall: max time to receive all digits (4.4.1.10) */
-#define SCIP_TO		0,553000	/* T' = 553 ms (4 frames): MS re-identify window on the new TC (NMT 450-1 Scheme C2'),
-					 * started after the last 3c is generated, so it already spans the 3c frames on air */
+/* The standard has the forced release of the MFT state (NMT Doc 450-1 4.4.1.9,
+ * states 13-16) and the end of a register recall "after timeout" (4.4.1.10,
+ * state 9), without values. These are ours: a MS in the MFT state that sends
+ * no frame for MFT_TO is let out; a recall waits RECALL_TO for the first digit
+ * and RECALL_NEXT_TO for each next one, RECALL_MAX digits at most. If phones
+ * need longer pauses, the simple fallback is RECALL_TO restarted with every
+ * digit, and no MFT_TO. */
+#define MFT_TO		10,0	/* MFT state: no frame from the MS, forced release */
+#define RECALL_TO	30,0	/* register recall: first digit */
+#define RECALL_NEXT_TO	8,0	/* register recall: each next digit */
+#define RECALL_MAX	32	/* register recall: most digits */
+#define SCIP_TO		0,553000	/* T' = 553 ms (4 frames): MS re-identify window on the new TC, from the start
+					 * of the 3c transmission (NMT 450-1 Scheme C2' step 9) */
 #define SCIP_REQ_TO	0,853000	/* T' + 300 ms TX/RX round trip (SDR): identity reply window after the 3b request,
 					 * started when the first 3b is generated */
 #define DTMF_DURATION	0.1	/* 100ms */
@@ -161,6 +171,8 @@ static const char *nmt_state_name(enum nmt_state state)
 		return "SCIP IDENT";
 	case STATE_SCIP_IDENT_REQ:
 		return "SCIP IDENT REQ";
+	case STATE_SCIP_RELEASE:
+		return "SCIP RELEASE";
 	case STATE_MO_RELEASE:
 		return "RELEASE MTX->MS";
 	case STATE_MT_RELEASE:
@@ -200,6 +212,7 @@ static const char *nmt_active_state_name(enum nmt_active_state state)
 	case ACTIVE_STATE_POWER_CHANGE:		return "power-change (3a)";
 	case ACTIVE_STATE_RECALL_PROCEED:	return "register-recall (L(3) proceed)";
 	case ACTIVE_STATE_RECALL_DIGITS:	return "register-recall (digit collection)";
+	case ACTIVE_STATE_RECALL_END:		return "register-recall (L(6) address complete)";
 	}
 	return "unknown";
 }
@@ -423,6 +436,7 @@ int nmt_create(int nmt_system, const char *country, const char *kanal, enum nmt_
 	nmt->sysinfo.system = nmt_system;
 	nmt->sysinfo.chan_type = chan_type;
 	nmt->sysinfo.ms_power = ms_power;
+	nmt->sysinfo.ms_power_default = ms_power;
 	nmt->sysinfo.traffic_area = traffic_area;
 	nmt->sysinfo.area_no = area_no;
 	nmt->compandor = compandor;
@@ -575,6 +589,8 @@ void nmt_go_idle(nmt_t *nmt)
 	nmt_new_state(nmt, STATE_IDLE);
 	nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
 	memset(&nmt->dialing, 0, sizeof(nmt->dialing));
+	/* a power order was for the call that is over (NMT Doc 450-1 4.4.1.8) */
+	nmt->sysinfo.ms_power = nmt->sysinfo.ms_power_default;
 
 #if 0
 	/* go active for loopback tests */
@@ -917,6 +933,7 @@ static int cc_carousel(nmt_t *cc, frame_t *frame)
 		trans->nmt = tc;
 		nmt_new_state(tc, STATE_MT_IDENT);
 		tc->tx_frame_count = 0;
+		tc->rx_frame_count = 0;
 		return 1;
 	}
 
@@ -1273,10 +1290,41 @@ static void tx_idle(nmt_t *nmt, frame_t *frame)
 	}
 }
 
+/* A MS has one transaction: its radio channel carries one call. Services of
+ * the exchange like call waiting (NMT Doc 450/900-2 para 5.7) are operated by
+ * register recall within that call. A seizure from a MS that has a transaction
+ * is not taken, except over a message call that is still on the calling
+ * channels: that gives way, its indicators go out with the new call (with its
+ * clearing, 4.4.1.16). Returns 1 if the MS may get a new transaction, the
+ * indicators to carry in *carried. */
+static int ms_transaction_free(nmt_subscriber_t *subscr, uint8_t *carried)
+{
+	transaction_t *trans;
+
+	*carried = 0;
+	trans = get_transaction_by_number(subscr);
+	if (!trans)
+		return 1;
+	if (!trans->mwi_call || trans->cc_phase == CC_PHASE_NONE) {
+		LOGP(DNMT, LOGL_NOTICE, "Subscriber %c,%s has a transaction already, ignoring seizure.\n",
+			subscr->country, subscr->number);
+		return 0;
+	}
+	LOGP(DNMT, LOGL_INFO, "Subscriber %c,%s seizes during its MWI call on the calling channels; the indicators go with the new call.\n",
+		subscr->country, subscr->number);
+	*carried = trans->mwi_pending;
+	if (trans->nmt)
+		nmt_go_idle(trans->nmt);
+	cc_leave(trans);
+	destroy_transaction(trans);
+	return 1;
+}
+
 static void rx_idle(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans;
 	nmt_subscriber_t subscr;
+	uint8_t carried;
 
 	switch (frame->mt) {
 	case NMT_MESSAGE_11a: /* roaming update and seizure */
@@ -1296,11 +1344,14 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received roaming seizure from subscriber %c,%s\n", subscr.country, subscr.number);
 
 		/* create transaction */
+		if (!ms_transaction_free(&subscr, &carried))
+			break;
 		trans = create_transaction(&subscr);
 		if (!trans) {
 			LOGP(DNMT, LOGL_NOTICE, "Failed to create transaction!\n");
 			break;
 		}
+		trans->mwi_pending = carried;
 
 		/* change state */
 		nmt->trans = trans; /* add transaction before state change, so status is shown correctly */
@@ -1334,11 +1385,14 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 			subscr.country, subscr.number);
 		/* create a transaction for the PMS outgoing call; callref = 0
 		 * (there is no incoming network call -- the MS is calling out) */
+		if (!ms_transaction_free(&subscr, &carried))
+			break;
 		trans = create_transaction(&subscr);
 		if (!trans) {
 			LOGP(DNMT, LOGL_NOTICE, "Failed to create transaction for PMS call!\n");
 			break;
 		}
+		trans->mwi_pending = carried;
 		trans->priority = 1;		/* priority queueing (2c) if TC not immediately free */
 		trans->priority_mo = 1;		/* MO flag: post-answer → L(3) proceed + digit collection */
 		/* page the MS to verify its identity, as the standard's state 2a
@@ -1374,11 +1428,14 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received call from subscriber %c,%s%s\n", subscr.country, subscr.number, (subscr.coinbox) ? " (coinbox)" : "");
 
 		/* create transaction */
+		if (!ms_transaction_free(&subscr, &carried))
+			break;
 		trans = create_transaction(&subscr);
 		if (!trans) {
 			LOGP(DNMT, LOGL_NOTICE, "Failed to create transaction!\n");
 			break;
 		}
+		trans->mwi_pending = carried;
 
 		/* change state */
 		nmt->trans = trans; /* add transaction before state change, so status is shown correctly */
@@ -1403,7 +1460,9 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 			nmt_value2digits(frame->ms_country, &tsubscr.country, 1);
 			nmt_value2digits(frame->ms_number, tsubscr.number, 6);
 			trans = get_transaction_by_number(&tsubscr);
-			if (!trans) {
+			/* only an unanswered call to the MS that is still on the
+			 * calling channels can be taken over (no other call of the MS) */
+			if (!trans || trans->cc_phase == CC_PHASE_NONE) {
 				LOGP_CHAN(DNMT, LOGL_NOTICE, "Received TC seizure (frame 10c) from %c,%s but no pending MT transaction; ignoring.\n",
 					tsubscr.country, tsubscr.number);
 				break;
@@ -1477,12 +1536,12 @@ static void tx_roaming_confirm(nmt_t *nmt, frame_t *frame)
 	/* L(3) = "proceed to send unencrypted digits (roaming updating
 	 * confirmation)" per NMT Doc 450-1 para 4.3.3.3. L(11) is the encrypted
 	 * (SIS) variant, which is not used here (SIS is not implemented).
-	 * §4.4.1.5 Scheme D (p.65) shows L(3) sent 4 times before the forced
-	 * release (5a(L=13/15)). */
+	 * 4.4.1.5 Scheme D (p.65) step 6 shows L(3) for T''' (2 frames) before
+	 * the forced release (5a(L=13/15)). */
 	set_line_signal(nmt, frame, 3);
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send 'Roaming updating confirmation'.\n");
-	if (nmt->tx_frame_count == 4)
+	if (nmt->tx_frame_count == 2)
 		nmt_release(nmt); /* continue with this frame, then release */
 }
 
@@ -1822,6 +1881,13 @@ static void rx_mt_ident(nmt_t *nmt, frame_t *frame)
 	case NMT_MESSAGE_10c: /* seizure / identity after blocking-path TC scan (§4.4.1.2.2 Scheme B1, §4.4.1.14 Scheme B4) */
 		if (!match_subscriber(trans, frame))
 			break;
+		/* On a CC/TC the MS repeats its call acknowledgment (10a, decoded as
+		 * 10b here, without password) for a while after the 2b; the identity
+		 * answers our 3b, at least two frame periods after the allocation. */
+		if (nmt->sysinfo.chan_type == CHAN_TYPE_CC_TC && nmt->rx_frame_count < 2) {
+			LOGP_CHAN(DNMT, LOGL_DEBUG, "Ignoring repeated call acknowledgment on CC/TC.\n");
+			break;
+		}
 		nmt_value2digits(frame->ms_password, trans->subscriber.password, 3);
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received identity (password %s).\n", trans->subscriber.password);
 		if (trans->dms_call || trans->mwi_call) {
@@ -2203,10 +2269,30 @@ static void timeout_mt_release(nmt_t *nmt)
 
 #define SCIP_ORDER_FRAMES	4	/* repeat frame 3c this many times before the move (min 4 per 5.4.5) */
 
+/* old TC: back to the supervised active state, still holding the call */
+static void scip_order_done(nmt_t *nmt)
+{
+	nmt_new_state(nmt, STATE_ACTIVE);
+	nmt->active_state = ACTIVE_STATE_VOICE;
+	nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+	if (nmt->supervisory) {
+		super_reset(nmt);
+		osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
+	}
+}
+
 static void tx_scip_order(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans = nmt->trans;
 	nmt_t *tc = nmt->scip_target;
+
+	/* the move failed while the order was still going out */
+	if (!tc) {
+		tx_idle(nmt, frame);
+		frame->mt = NMT_MESSAGE_6;
+		scip_order_done(nmt);
+		return;
+	}
 
 	/* Build frame 3c (channel change on traffic channel, short procedure --
 	 * NMT Doc 450-1 Scheme C2', para 4.4.1.4.3 / 4.7.2.4b).  The short
@@ -2215,28 +2301,20 @@ static void tx_scip_order(nmt_t *nmt, frame_t *frame)
 	 * a separate 3b request -- which is exactly the flow STATE_SCIP_IDENT
 	 * implements.  Per 4.7.2.4b the channel-number field N1'N2'N3' must equal
 	 * the ordered TC NaNbNc, so both carry the target channel. */
+	/* the power level on the new channel (in Na) is the one of the call */
 	frame->mt = NMT_MESSAGE_3c;
-	frame->channel_no = nmt_encode_channel(tc->sysinfo.system, atoi(tc->sender.kanal), tc->sysinfo.ms_power);
+	frame->channel_no = nmt_encode_channel(tc->sysinfo.system, atoi(tc->sender.kanal), nmt->sysinfo.ms_power);
 	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
 	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-	frame->tc_no = nmt_encode_tc(tc->sysinfo.system, atoi(tc->sender.kanal), tc->sysinfo.ms_power);
+	frame->tc_no = nmt_encode_tc(tc->sysinfo.system, atoi(tc->sender.kanal), nmt->sysinfo.ms_power);
 
-	if (++nmt->tx_frame_count == 1)
+	if (++nmt->tx_frame_count == 1) {
 		LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: sending channel change order (3c, short procedure) -> TC #%s.\n", tc->sender.kanal);
-
-	if (nmt->tx_frame_count >= SCIP_ORDER_FRAMES) {
-		/* Order delivered (step 6).  Per Scheme C2' the OLD TC keeps the speech
-		 * path and stays supervised until the MS has re-identified on the new TC
-		 * (step 8); only then is the old TC released (step 11), and on failure
-		 * (step 9) the call simply stays on the old TC.  So the old TC KEEPS the
-		 * transaction and returns to the active/supervised state; the TARGET is
-		 * armed only to RECEIVE the identity (10b) there, carrying a copy of the
-		 * expected subscriber for matching.  The transaction is handed over only
-		 * once the MS actually appears on the new TC (rx_scip_ident). */
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: order sent, awaiting identity on new TC #%s (old TC #%s keeps speech until re-identified).\n", tc->sender.kanal, nmt->sender.kanal);
-		nmt->scip_target = tc;			/* remember target so we can give up on failure */
-		/* arm the target to receive the identity, pointing back to the origin */
+		/* Arm the target to receive the identity, pointing back to the
+		 * origin. T' runs from the start of the 3c (Scheme C2' step 9). The
+		 * transaction is handed over only once the MS actually appears on
+		 * the new TC (rx_scip_ident). */
 		tc->scip_source = nmt;
 		tc->scip_country = trans->subscriber.country;	/* who to expect on the new TC */
 		memcpy(tc->scip_number, trans->subscriber.number, sizeof(tc->scip_number));
@@ -2245,14 +2323,19 @@ static void tx_scip_order(nmt_t *nmt, frame_t *frame)
 		tc->rx_frame_count = 0;
 		nmt_set_dsp_mode(tc, DSP_MODE_FRAME);
 		osmo_timer_schedule(&tc->timer, SCIP_TO);
-		/* old TC: back to the supervised active state, still holding the call */
-		nmt_new_state(nmt, STATE_ACTIVE);
-		nmt->active_state = ACTIVE_STATE_VOICE;
-		nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
-		if (nmt->supervisory) {
-			super_reset(nmt);
-			osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
-		}
+	}
+	/* Scheme C2' (p.64) step 6: 3c 4 times, then 4 idle frames (T') on the
+	 * old TC */
+	if (nmt->tx_frame_count > SCIP_ORDER_FRAMES)
+		frame->mt = NMT_MESSAGE_6;
+
+	if (nmt->tx_frame_count >= 2 * SCIP_ORDER_FRAMES) {
+		/* Order delivered.  The OLD TC keeps the call and stays supervised
+		 * until the MS has re-identified on the new TC (step 8); only then is
+		 * the old TC released (step 11), and on failure the speech path is
+		 * throughconnected here again. */
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: order sent, awaiting identity on new TC #%s (old TC #%s keeps the call until re-identified).\n", tc->sender.kanal, nmt->sender.kanal);
+		scip_order_done(nmt);
 	}
 }
 
@@ -2262,14 +2345,34 @@ static void tx_scip_order(nmt_t *nmt, frame_t *frame)
 static void tx_scip_ident(nmt_t *nmt, frame_t *frame)
 {
 	if (nmt->state == STATE_SCIP_IDENT_REQ) {
-		/* identity request on the new TC, addressed to the expected subscriber */
+		/* identity request on the new TC, addressed to the expected
+		 * subscriber, 4 times (Scheme C2' step 9, max T'), then idle */
+		if (++nmt->tx_frame_count > 4) {
+			frame->mt = NMT_MESSAGE_6;
+			return;
+		}
 		frame->mt = NMT_MESSAGE_3b;
 		frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
 		frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
 		frame->ms_country = nmt_digits2value(&nmt->scip_country, 1);
 		frame->ms_number = nmt_digits2value(nmt->scip_number, 6);
-		if (++nmt->tx_frame_count == 1)
+		if (nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "SCIP: no identity within T', re-requesting identity (3b) on new TC.\n");
+		return;
+	}
+	if (nmt->state == STATE_SCIP_RELEASE) {
+		/* the MS did not come: forced release on the new TC, L(15) 4 times */
+		frame->mt = NMT_MESSAGE_5a;
+		frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
+		frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
+		frame->ms_country = nmt_digits2value(&nmt->scip_country, 1);
+		frame->ms_number = nmt_digits2value(nmt->scip_number, 6);
+		frame->line_signal = (15 << 8) | (15 << 4) | 15;
+		if (++nmt->tx_frame_count >= 4) {
+			nmt->scip_country = 0;
+			nmt->scip_number[0] = '\0';
+			nmt_go_idle(nmt);
+		}
 		return;
 	}
 	/* STATE_SCIP_IDENT: no transaction on this channel yet, radiate the
@@ -2291,9 +2394,10 @@ static void scip_complete_move(nmt_t *nmt)
 		return;
 	}
 
-	/* move the transaction onto the new TC */
+	/* move the transaction onto the new TC, with the power level of the call */
 	old->trans = NULL;
 	old->scip_target = NULL;
+	nmt->sysinfo.ms_power = old->sysinfo.ms_power;
 	nmt->trans = trans;
 	trans->nmt = nmt;
 	nmt->scip_source = NULL;
@@ -2357,12 +2461,12 @@ static void timeout_scip_ident(nmt_t *nmt)
 	LOGP_CHAN(DNMT, LOGL_NOTICE, "SCIP: MS did not re-identify on new TC; reverting call to old TC #%s, forced-releasing new TC.\n",
 		old ? old->sender.kanal : "?");
 
-	/* give up the target */
-	nmt->scip_country = 0;
-	nmt->scip_number[0] = '\0';
+	/* give up the target: forced release there (tx_scip_ident), then idle */
 	nmt->scip_source = NULL;
 	osmo_timer_del(&nmt->timer);
-	nmt_go_idle(nmt);			/* forced release on the new TC */
+	nmt_new_state(nmt, STATE_SCIP_RELEASE);
+	nmt->tx_frame_count = 0;
+	nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
 
 	/* the old TC still owns the transaction and its ø-signal has been up the
 	 * whole time (step: supervisory controls the previous TC) -- just clear its
@@ -2385,7 +2489,8 @@ static int nmt_in_mft(nmt_t *nmt)
 	    || nmt->active_state == ACTIVE_STATE_MFT
 	    || nmt->active_state == ACTIVE_STATE_MFT_OUT
 	    || nmt->active_state == ACTIVE_STATE_RECALL_PROCEED
-	    || nmt->active_state == ACTIVE_STATE_RECALL_DIGITS;
+	    || nmt->active_state == ACTIVE_STATE_RECALL_DIGITS
+	    || nmt->active_state == ACTIVE_STATE_RECALL_END;
 }
 
 void nmt_rx_super(nmt_t *nmt, int tone, double quality)
@@ -2432,14 +2537,21 @@ static void timeout_active(nmt_t *nmt)
 		} else {
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall timeout: no digits received from MS; returning to voice.\n");
 		}
-		/* cancel ø-signal suppression (local equivalent of frame 20 A=10, 4.4.1.10 state 10) */
-		if (nmt->supervisory) {
-			super_reset(nmt);
-			osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
-			LOGP_CHAN(DNMT, LOGL_INFO, "Resuming supervisory alarm after register recall (local equivalent of frame 20 A=10 to BS).\n");
-		}
-		nmt->active_state = ACTIVE_STATE_VOICE;
-		nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+		/* address complete (L(6)), idle frames, then the conversation; the
+		 * supervisory alarm suppression ends after it (tx_active) */
+		nmt->active_state = ACTIVE_STATE_RECALL_END;
+		nmt->tx_frame_count = 0;
+		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
+		return;
+	}
+
+	/* forced release of the MFT state (4.4.1.9, states 13-16): L(10) 4 times,
+	 * 4 idle frames, then the conversation; the MS answers with L(7) */
+	if (nmt->active_state == ACTIVE_STATE_MFT) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "No frame from MS for %d seconds in MFT state, forced release of MFT state.\n", 10);
+		nmt->active_state = ACTIVE_STATE_MFT_OUT;
+		nmt->tx_frame_count = 0;
+		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
 		return;
 	}
 
@@ -2453,15 +2565,90 @@ static void timeout_active(nmt_t *nmt)
 	nmt_release(nmt);
 }
 
+/* Digit frames 14a/14b in the MFT state and in the register recall (NMT Doc
+ * 450-1 4.7.2.1): accepted if the channel number or the identity is ours
+ * (frame 14 has no area information), the position marker S(0)S(0) (14a) or
+ * S(15)S(15) (14b) is correct and the three S(n) are equal. A frame is a new
+ * digit only when its marker changed relative to the previous digit, so the
+ * copies of a digit are taken once; the first digit may come in either frame. */
+static void rx_active_digit(nmt_t *nmt, frame_t *frame)
+{
+	transaction_t *trans = nmt->trans;
+	int odd = (frame->mt == NMT_MESSAGE_14a);
+	int *num;
+	int channel, power;
+	int our_channel, our_identity;
+	char digit;
+
+	if (nmt->active_state == ACTIVE_STATE_RECALL_DIGITS)
+		num = &trans->recall_mft_num;
+	else if (nmt->active_state == ACTIVE_STATE_MFT)
+		num = &nmt->mft_num;
+	else {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame %s: received outside MFT converter and register recall state (%s).\n",
+			nmt_frame_name(frame->mt), nmt_active_state_name(nmt->active_state));
+		return;
+	}
+
+	our_channel = nmt_decode_channel(nmt->sysinfo.system, frame->channel_no, &channel, &power) >= 0
+		&& (channel % 1024) == (atoi(nmt->sender.kanal) % 1024);
+	our_identity = nmt_digits2value(&trans->subscriber.country, 1) == frame->ms_country
+		&& nmt_digits2value(trans->subscriber.number, 6) == frame->ms_number;
+	if (!our_channel && !our_identity) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Digit frame for other channel and subscriber, ignoring.\n");
+		return;
+	}
+	if ((frame->digit >> 12) != (odd ? 0x00 : 0xff)) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Position information of digit does not match, ignoring due to corrupt frame.\n");
+		return;
+	}
+	if (((frame->digit >> 8) & 0xf) != ((frame->digit >> 4) & 0xf)
+	 || ((frame->digit >> 4) & 0xf) != (frame->digit & 0xf)) {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "Digit repetition in frame does not match, ignoring due to corrupt frame.\n");
+		return;
+	}
+	/* *num digits are taken: the next one comes in 14a when it is even, in
+	 * 14b when it is odd; a first digit in 14b counts as the second */
+	if (*num == 0 && !odd)
+		*num = 1;
+	else if (odd != !(*num & 1))
+		return;
+	(*num)++;
+	digit = nmt_value2digit(frame->digit);
+
+	if (nmt->active_state == ACTIVE_STATE_MFT) {
+		dtmf_encode_set_tone(&nmt->dtmf, digit, DTMF_DURATION, 0.0);
+		LOGP_CHAN(DNMT, LOGL_INFO, "Received digit %c (frame %s).\n", digit, nmt_frame_name(frame->mt));
+		return;
+	}
+
+	/* register recall (4.4.1.10): the dialling tone stops with the first digit
+	 * (state 6a) */
+	if (trans->recall_code_len == 0)
+		nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+	trans->recall_code[trans->recall_code_len++] = digit;
+	LOGP_CHAN(DNMT, LOGL_INFO, "Register recall digit received: '%c' (code so far: '%.*s').\n",
+		digit, trans->recall_code_len, trans->recall_code);
+	if (trans->recall_code_len >= RECALL_MAX) {
+		osmo_timer_del(&nmt->timer);
+		timeout_active(nmt);
+		return;
+	}
+	osmo_timer_schedule(&nmt->timer, RECALL_NEXT_TO);
+}
+
 static void rx_active(nmt_t *nmt, frame_t *frame)
 {
 	transaction_t *trans = nmt->trans;
-	char digit;
 
 	/* restart timer on every reception of frame (except during MFT, where the
 	 * ø-signal alarm is suppressed per 4.4.1.9 -- see nmt_in_mft) */
 	if (nmt->supervisory && !nmt_in_mft(nmt))
 		osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO2);
+	/* in the MFT state the MS sends idle frames and digits: it is there */
+	if (nmt->active_state == ACTIVE_STATE_MFT
+	 && (frame->mt == NMT_MESSAGE_15 || frame->mt == NMT_MESSAGE_14a || frame->mt == NMT_MESSAGE_14b))
+		osmo_timer_schedule(&nmt->timer, MFT_TO);
 
 	switch (frame->mt) {
 	case NMT_MESSAGE_10b: /* identity with new power level (NMT Doc 450-1 4.4.1.8) */
@@ -2472,7 +2659,8 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 		if (!match_subscriber(trans, frame))
 			break;
 		/* The MS re-identifies with 10b carrying the new power level in N1.
-		 * Decode N1 to get the new power and update our sysinfo accordingly. */
+		 * The level holds for this call; the channel takes its own level back
+		 * when it goes idle (nmt_go_idle). */
 		{
 			int new_power = trans->pending_power;
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received power-change ack (frame 10b): MS confirmed new power level %d (was %d).\n",
@@ -2499,8 +2687,8 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 	case NMT_MESSAGE_13a: /* line signal */
 	    {
 		int ls;
-		if (!match_channel(nmt, frame))
-			break;
+		/* a line signal needs the identity, not the channel number
+		 * (NMT Doc 450-1 4.7.2.3b) */
 		if (!match_subscriber(trans, frame))
 			break;
 		ls = nmt_line_signal_majority(frame->line_signal, 5, 3);
@@ -2568,106 +2756,8 @@ static void rx_active(nmt_t *nmt, frame_t *frame)
 		break;
 	    }
 	case NMT_MESSAGE_14a: /* digits */
-		if (!match_channel(nmt, frame))
-			break;
-		if (!match_area(nmt, frame))
-			break;
-		/* register recall digit collection (4.4.1.10): 14a carries odd-position
-		 * digits; collect into trans->recall_code and restart the inactivity timer. */
-		if (nmt->active_state == ACTIVE_STATE_RECALL_DIGITS) {
-			if (!(trans->recall_mft_num & 1)) {
-				/* validate triple repetition */
-				if (((frame->digit >> 8) & 0xf) != ((frame->digit >> 4) & 0xf)
-				 || ((frame->digit >> 4) & 0xf) != (frame->digit & 0xf)) {
-					LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall: digit repetition mismatch in 14a, ignoring corrupt frame.\n");
-					break;
-				}
-				char d = nmt_value2digit(frame->digit);
-				if (trans->recall_code_len < (int)sizeof(trans->recall_code) - 1)
-					trans->recall_code[trans->recall_code_len++] = d;
-				trans->recall_mft_num++;
-				LOGP_CHAN(DNMT, LOGL_INFO, "Register recall digit (odd) received: '%c' (code so far: '%.*s').\n",
-					d, trans->recall_code_len, trans->recall_code);
-				/* restart inactivity timeout */
-				osmo_timer_schedule(&nmt->timer, RECALL_TO);
-			}
-			break;
-		}
-		if (nmt->active_state != ACTIVE_STATE_MFT) {
-			/* A keypress digit (frame 14a) arrived without, or before completing,
-			 * the MFT-converter-in handshake (L(8) request -> L(4) ack, 4.4.1.9).
-			 * Per spec it is only valid in MFT state; log the dropped keypress so
-			 * it is visible rather than silently lost. */
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14a: received outside MFT converter state (%s); MFT-in handshake (L(8)->L(4)) not completed, keypress ignored.\n", nmt_active_state_name(nmt->active_state));
-			break;
-		}
-		if ((nmt->mft_num & 1)) {
-			/* 14a carries ODD-position digits; receiving one when an even digit was
-			 * expected is a sequence error (lost/duplicated frame). Log it. */
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14a (odd): out of sequence, expected an even digit (mft_num=%d).\n", nmt->mft_num);
-			break;
-		}
-		if ((frame->digit >> 12) != 0x00) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Position information of digit does not match, ignoring due to corrupt frame.\n");
-			break;
-		}
-		if (((frame->digit >> 8) & 0xf) != ((frame->digit >> 4) & 0xf)
-		 || ((frame->digit >> 4) & 0xf) != (frame->digit & 0xf)) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Digit repetition in frame does not match, ignoring due to corrupt frame.\n");
-			break;
-		}
-		digit = nmt_value2digit(frame->digit);
-		dtmf_encode_set_tone(&nmt->dtmf, digit, DTMF_DURATION, 0.0);
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received (odd)  digit %c.\n", digit);
-		nmt->mft_num++;
-		break;
-	case NMT_MESSAGE_14b: /* digits */
-		if (!match_channel(nmt, frame))
-			break;
-		if (!match_area(nmt, frame))
-			break;
-		/* register recall: 14b carries even-position digits */
-		if (nmt->active_state == ACTIVE_STATE_RECALL_DIGITS) {
-			if (trans->recall_mft_num & 1) {
-				if (((frame->digit >> 8) & 0xf) != ((frame->digit >> 4) & 0xf)
-				 || ((frame->digit >> 4) & 0xf) != (frame->digit & 0xf)) {
-					LOGP_CHAN(DNMT, LOGL_NOTICE, "Register recall: digit repetition mismatch in 14b, ignoring corrupt frame.\n");
-					break;
-				}
-				char d = nmt_value2digit(frame->digit);
-				if (trans->recall_code_len < (int)sizeof(trans->recall_code) - 1)
-					trans->recall_code[trans->recall_code_len++] = d;
-				trans->recall_mft_num++;
-				LOGP_CHAN(DNMT, LOGL_INFO, "Register recall digit (even) received: '%c' (code so far: '%.*s').\n",
-					d, trans->recall_code_len, trans->recall_code);
-				osmo_timer_schedule(&nmt->timer, RECALL_TO);
-			}
-			break;
-		}
-		if (nmt->active_state != ACTIVE_STATE_MFT) {
-			/* Keypress digit (frame 14b) outside MFT state: see 14a above. */
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14b: received outside MFT converter state (%s); MFT-in handshake (L(8)->L(4)) not completed, keypress ignored.\n", nmt_active_state_name(nmt->active_state));
-			break;
-		}
-		if (!(nmt->mft_num & 1)) {
-			/* 14b carries EVEN-position digits; receiving one when an odd digit was
-			 * expected is a sequence error (lost/duplicated frame). */
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Dropping digit frame 14b (even): out of sequence, expected an odd digit (mft_num=%d).\n", nmt->mft_num);
-			break;
-		}
-		if ((frame->digit >> 12) != 0xff) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Position information of digit does not match, ignoring due to corrupt frame.\n");
-			break;
-		}
-		if (((frame->digit >> 8) & 0xf) != ((frame->digit >> 4) & 0xf)
-		 || ((frame->digit >> 4) & 0xf) != (frame->digit & 0xf)) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Digit repetition in frame does not match, ignoring due to corrupt frame.\n");
-			break;
-		}
-		digit = nmt_value2digit(frame->digit);
-		dtmf_encode_set_tone(&nmt->dtmf, digit, DTMF_DURATION, 0.0);
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received (even) digit %c.\n", digit);
-		nmt->mft_num++;
+	case NMT_MESSAGE_14b:
+		rx_active_digit(nmt, frame);
 		break;
 	default:
 		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame->mt), nmt_state_name(nmt->state));
@@ -2683,15 +2773,40 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 		/* Register recall proceed (NMT Doc 450-1 4.4.1.10, state 6): send L(3)
 		 * "proceed to send unencrypted digits" 4 times, then switch to dialtone
 		 * so the subscriber hears the register is ready. */
+		/* 4.4.1.10 states 3 and 6 (p.72): 3 idle frames, then L(3) 4 times */
+		if (++nmt->tx_frame_count <= 3) {
+			frame->mt = NMT_MESSAGE_6;
+			break;
+		}
 		set_line_signal(nmt, frame, 3);
-		if (++nmt->tx_frame_count == 1)
+		if (nmt->tx_frame_count == 4)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Sending register recall proceed (L(3) '%s'): MS may now send digits.\n",
 				nmt_linesignal_name(3, 1));
-		if (nmt->tx_frame_count >= 4) {
+		if (nmt->tx_frame_count >= 7) {
 			LOGP_CHAN(DNMT, LOGL_INFO, "Register recall: proceed sent; entering digit collection.\n");
 			nmt->active_state = ACTIVE_STATE_RECALL_DIGITS;
 			nmt->tx_frame_count = 0;
 			nmt_set_dsp_mode(nmt, DSP_MODE_DIALTONE);
+			/* also ends a recall without any digit */
+			osmo_timer_schedule(&nmt->timer, RECALL_TO);
+		}
+		break;
+	case ACTIVE_STATE_RECALL_END:
+		/* 4.4.1.10 states 9 and 10 (p.72): L(6) 4 times, then 4 idle frames,
+		 * then back to the conversation */
+		if (++nmt->tx_frame_count <= 4)
+			set_line_signal(nmt, frame, 6);
+		else
+			frame->mt = NMT_MESSAGE_6;
+		if (nmt->tx_frame_count >= 8) {
+			nmt->active_state = ACTIVE_STATE_VOICE;
+			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
+			/* cancel the supervisory alarm suppression (state 10: frame 20 A=10) */
+			if (nmt->supervisory) {
+				super_reset(nmt);
+				osmo_timer_schedule(&nmt->timer, SUPERVISORY_TO1, 0);
+				LOGP_CHAN(DNMT, LOGL_INFO, "Resuming supervisory alarm after register recall (local equivalent of frame 20 A=10 to BS).\n");
+			}
 		}
 		break;
 	case ACTIVE_STATE_RECALL_DIGITS:
@@ -2751,22 +2866,32 @@ static void tx_active(nmt_t *nmt, frame_t *frame)
 		 * generation. The ø-signal supervision alarm was already suppressed on
 		 * entry (L(8) handler), the local equivalent of the frame-20 A=4/A=7 order
 		 * to the BS; it is kept suppressed by nmt_in_mft() and resumed at MFT-out. */
+		/* 4.4.1.9 states 3 and 6 (p.70): 3 idle frames, then L(4) 4 times */
+		if (++nmt->tx_frame_count <= 3) {
+			frame->mt = NMT_MESSAGE_6;
+			break;
+		}
 		set_line_signal(nmt, frame, 4);
-		if (++nmt->tx_frame_count == 1)
+		if (nmt->tx_frame_count == 4)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'MFT in acknowledge'.\n");
-		if (nmt->tx_frame_count >= 4) {
+		if (nmt->tx_frame_count >= 7) {
 			nmt->active_state = ACTIVE_STATE_MFT;
 			nmt_set_dsp_mode(nmt, DSP_MODE_DTMF);
+			osmo_timer_schedule(&nmt->timer, MFT_TO);
 		}
 		break;
 	case ACTIVE_STATE_MFT_OUT:
 		/* MFT converter out: acknowledge with L(10) (NMT Doc 450-1 4.4.1.9 state
 		 * 10, "within T'"), then return to the voice path and resume supervision.
 		 * (Same ack-count note as MFT_IN; T' timing is not enforced here.) */
-		set_line_signal(nmt, frame, 10);
-		if (++nmt->tx_frame_count == 1)
+		/* 4.4.1.9 states 10 and 11 (p.70): L(10) 4 times, then 4 idle frames */
+		if (++nmt->tx_frame_count <= 4)
+			set_line_signal(nmt, frame, 10);
+		else
+			frame->mt = NMT_MESSAGE_6;
+		if (nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'MFT out acknowledge'.\n");
-		if (nmt->tx_frame_count >= 4) {
+		if (nmt->tx_frame_count >= 8) {
 			nmt->active_state = ACTIVE_STATE_VOICE;
 			nmt_set_dsp_mode(nmt, DSP_MODE_AUDIO);
 			/* Cancel the ø-signal alarm suppression and resume supervision
@@ -3116,6 +3241,7 @@ const char *nmt_get_frame(nmt_t *nmt)
 		break;
 	case STATE_SCIP_IDENT:
 	case STATE_SCIP_IDENT_REQ:
+	case STATE_SCIP_RELEASE:
 		tx_scip_ident(nmt, &frame);
 		break;
 	default:
@@ -3532,10 +3658,19 @@ static int mwi_send_in_call(nmt_t *nmt, uint8_t flags)
 		trans->subscriber.country, trans->subscriber.number,
 		mwi_flags_string(flags), flags);
 
-	/* Store flags for immediate frame 5c */
-	trans->mwi_flags = flags;
 	/* Accumulate flags for clearing sequence when call ends */
 	trans->mwi_pending |= flags;
+
+	/* in a procedure of the call (MFT, register recall, power change, ...)
+	 * the indicators go out with the clearing only */
+	if (nmt->active_state != ACTIVE_STATE_VOICE) {
+		LOGP_CHAN(DNMT, LOGL_INFO, "MWI in-call: call is in state %s, indicators go out with the clearing.\n",
+			nmt_active_state_name(nmt->active_state));
+		return 0;
+	}
+
+	/* frame 5c carries all indicators set during the call */
+	trans->mwi_flags = trans->mwi_pending;
 
 	/* Switch to frame mode to send MWI, then return to voice */
 	nmt->tx_frame_count = 0;

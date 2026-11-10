@@ -46,6 +46,7 @@ enum nmt_state {
 	STATE_SCIP_ORDER,	/* SCIP: sending channel change order (frame 3c, short procedure) on current TC */
 	STATE_SCIP_IDENT,	/* SCIP: on new TC, waiting for identity (frame 10b) */
 	STATE_SCIP_IDENT_REQ,	/* SCIP: on new TC, re-requesting identity (frame 3b) after T' (Scheme C2' step 9) */
+	STATE_SCIP_RELEASE,	/* SCIP: the MS did not come to the new TC: forced release L(15) x4 there */
 	STATE_MO_RELEASE,	/* acknowlegde release from mobile phone */
 	STATE_MT_RELEASE,	/* sending release toward mobile phone */
 };
@@ -68,8 +69,9 @@ enum nmt_active_state {
 	ACTIVE_STATE_RECALL_PROCEED,	/* register recall (NMT Doc 450-1 4.4.1.10): sending L(3) proceed-
 					 * to-send after the MS's L(5) register-recall request. */
 	ACTIVE_STATE_RECALL_DIGITS,	/* register recall: collecting 14a/14b digit pairs from the MS
-					 * into trans->recall_code; returns to voice after address-complete
-					 * or timeout, logging the collected code. */
+					 * into trans->recall_code until the recall times out. */
+	ACTIVE_STATE_RECALL_END,	/* register recall over: L(6) x4, 4 idle frames, back to voice
+					 * (NMT Doc 450-1 4.4.1.10 states 9-10). */
 };
 
 enum nmt_direction {
@@ -84,7 +86,8 @@ enum nmt_direction {
 typedef struct nmt_sysinfo {
 	int			system;			/* 450 or 900 */
 	enum nmt_chan_type	chan_type;		/* channel type */
-	int			ms_power;		/* ms power level 3 = full */
+	int			ms_power;		/* ms power level 3 = full; changed for a call by a power order */
+	int			ms_power_default;	/* ms power level of the channel, restored when it goes idle */
 	uint8_t			traffic_area;		/* two digits traffic area, encoded as YY */
 	uint8_t			area_no;		/* Area no. 1..4, 0 = no Area no. */
 	/* NMT 900 §4.3.3.13 channel band advertisement (ignored for NMT 450).
