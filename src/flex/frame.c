@@ -1072,7 +1072,6 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		size_t len, i;
 		int word_idx, data_idx;
 		int frag_idx = 0, frag_total = 0;
-		int is_initial_frag;
 		uint32_t f_val, k_sum;
 		int c_val;
 
@@ -1081,7 +1080,6 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 			frag_total = cfg->total_fragments;
 		}
 
-		is_initial_frag = (frag_total <= 1 || frag_idx == 0);
 		f_val = flex_fragment_number(frag_idx);
 		c_val = (frag_total > 1 && frag_idx < frag_total - 1) ? 1 : 0;
 
@@ -1115,30 +1113,10 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		msg_words[0] |= ((uint32_t)(secure_subtype & FLEX_SEC_TYPE_MASK)
 				 << FLEX_SEC_TYPE_SHIFT);
 
-		/* Header word 2: initial fragment only (R/M/D/H/B/I/s/S) */
-		if (is_initial_frag) {
-			int b_field = 0;
-			if (cfg)
-				b_field = cfg->blocking_length & 0xF;
-			msg_words[1] = 0;
-			msg_words[1] |= ((uint32_t)b_field << FLEX_HEX_HDR2_B_SHIFT);
-			if (sequence_num >= 0)
-				msg_words[1] |= FLEX_HEX_HDR2_R_MASK;
-			if (cfg && cfg->mail_drop)
-				msg_words[1] |= FLEX_HEX_HDR2_M_MASK;
-			/* D: Display direction (§3.10.1.2) */
-			if (cfg && cfg->hex_display_rtl)
-				msg_words[1] |= FLEX_HEX_HDR2_D_MASK;
-			/* H: Header message flag (§3.10.1.2) */
-			if (cfg && cfg->hex_header_msg)
-				msg_words[1] |= FLEX_HEX_HDR2_H_MASK;
-			/* I: Status info field enabler (§3.10.1.2) */
-			if (cfg && cfg->hex_status_info)
-				msg_words[1] |= FLEX_HEX_HDR2_I_MASK;
-			data_idx = 2;
-		} else {
-			data_idx = 1;
-		}
+		/* A secure message has one header word (Fig. 3.10.1.4-1): the
+		 * data starts at word 2 of every fragment.  There is no second
+		 * header word and no signature (HEX/Binary only). */
+		data_idx = 1;
 
 		/* Pack hex nibbles as continuous bit stream (same as encode_hex_message) */
 		{
@@ -1159,23 +1137,30 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 
 			word_idx = (bit > 0) ? (bit - 1) / FLEX_BCH_DATA_BITS : data_idx;
 
-			/* Termination fill: inverse of last data bit */
+			/* Termination of binary data, t1t0=10 (3.10.1.4 p.70):
+			 * fill the rest of the last word with the inverse of
+			 * the last data bit; if the data ends exactly on the
+			 * last bit of a word, add a termination word of the
+			 * inverse bit.  The termination of t1t0=01 data is
+			 * not defined: the unused bits stay 0. */
 			if (bit > data_idx * FLEX_BCH_DATA_BITS) {
 				int last_data_bit = (msg_words[(bit - 1) / FLEX_BCH_DATA_BITS]
 						     >> ((bit - 1) % FLEX_BCH_DATA_BITS)) & 1;
 				uint32_t fill_bit = last_data_bit ? 0 : 1;
 				int end_bit = (word_idx + 1) * FLEX_BCH_DATA_BITS;
+				int exact = (bit == end_bit);
 				int b2;
 
-				for (b2 = bit; b2 < end_bit; b2++) {
-					if (fill_bit)
-						msg_words[b2 / FLEX_BCH_DATA_BITS] |=
-							(1U << (b2 % FLEX_BCH_DATA_BITS));
+				if (secure_subtype == FLEX_SEC_TYPE_BINARY) {
+					for (b2 = bit; b2 < end_bit; b2++) {
+						if (fill_bit)
+							msg_words[b2 / FLEX_BCH_DATA_BITS] |=
+								(1U << (b2 % FLEX_BCH_DATA_BITS));
+					}
 				}
 				word_idx++;
 
-				uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
-				if ((last_nib == 0x0 || last_nib == 0xF) &&
+				if (exact && secure_subtype == FLEX_SEC_TYPE_BINARY &&
 				    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
 					uint32_t extra = 0;
 					if (fill_bit)
@@ -1185,12 +1170,6 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 					word_idx++;
 				}
 			}
-		}
-
-		/* Signature: initial fragment only */
-		if (is_initial_frag) {
-			if (cfg)
-				msg_words[1] |= (cfg->precomputed_sig & 0xFF) << FLEX_HEX_HDR2_S_SHIFT;
 		}
 
 		/* K: 10-bit fragment checksum (same as alpha K) */
@@ -1269,7 +1248,6 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		int shift;
 		uint32_t i;
 		int frag_idx = 0, frag_total = 0;
-		int is_initial_frag;
 		uint32_t f_val;
 		int c_val;
 
@@ -1278,7 +1256,6 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 			frag_total = cfg->total_fragments;
 		}
 
-		is_initial_frag = (frag_total <= 1 || frag_idx == 0);
 		f_val = flex_fragment_number(frag_idx);
 		c_val = (frag_total > 1 && frag_idx < frag_total - 1) ? 1 : 0;
 
@@ -1301,15 +1278,11 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 		msg_word[0] |= ((uint32_t)(secure_subtype & FLEX_SEC_TYPE_MASK)
 				<< FLEX_SEC_TYPE_SHIFT);
 
-		/* Pack 7-bit ASCII characters, 3 per word.
-		 * Initial fragment: signature in bits 0-6 of word 1,
-		 * characters start at bit 7.
-		 * Continuation: no signature, 3 chars per word from bit 0. */
+		/* Pack 7-bit characters, 3 per word, from bit 0 of word 2 in
+		 * every fragment.  A secure message has no signature field
+		 * (Fig. 3.10.1.4-1): the first slot is character a0. */
 		i = 0;
-		if (is_initial_frag)
-			shift = FLEX_ALPHA_CHAR2_SHIFT;
-		else
-			shift = 0;
+		shift = 0;
 		word_idx = 1;
 
 		while (i < max_len) {
@@ -1322,40 +1295,16 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 			}
 		}
 
-		/* Pad unused character slots with ETX */
-		if (is_initial_frag) {
-			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == 0 && word_idx > 1) {
-				/* word boundary — no padding needed */
-			}
-		} else {
-			if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == FLEX_ALPHA_CHAR1_SHIFT) {
-				msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR1_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
-						      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
-				word_idx++;
-			} else if (shift == 0 && word_idx > 1) {
-				/* word boundary — no padding needed */
-			}
-		}
-
-		/* Signature: initial fragment only */
-		if (is_initial_frag) {
-			if (cfg)
-				msg_word[1] |= cfg->precomputed_sig & FLEX_ALPHA_SIG_MASK;
+		/* Pad unused character slots of the last word with ETX
+		 * (3.10.1.4 p.70).  A message that ends on the last
+		 * character position needs no padding. */
+		if (shift == FLEX_ALPHA_CHAR2_SHIFT) {
+			msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR2_SHIFT) |
+					      (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+			word_idx++;
+		} else if (shift == FLEX_ALPHA_CHAR3_SHIFT) {
+			msg_word[word_idx] |= (FLEX_ALPHA_ETX << FLEX_ALPHA_CHAR3_SHIFT);
+			word_idx++;
 		}
 
 		/* K: 10-bit fragment checksum */

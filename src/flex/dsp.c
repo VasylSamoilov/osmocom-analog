@@ -3665,8 +3665,21 @@ parse_phase:
 					uint32_t rx_sig = 0;
 					uint32_t sig_sum = 0;
 					int is_initial = (hdr_f == 3); /* F=11 = first/only */
+					/* Only an alphanumeric message has a signature
+					 * slot (3.10.1.3).  A secure message has none:
+					 * its first slot is character a0 (Fig. 3.10.1.4-1). */
+					int sig_slot = is_initial && vec_type != FLEX_VECTOR_TYPE_SECURE;
 					int frag_words_ok = 1; /* 0 if any msg word uncorrectable */
 					const char *alpha_sig_status = ""; /* signature validation result */
+					/* Enhanced Fragmentation (U0 V0 not 00, 3.10.1.3
+					 * p.66): NUL only as reminder characters at the
+					 * end of a fragment; a NUL followed by a data
+					 * character is a reception error. */
+					int nul_pending = 0, nul_error = 0;
+#define FLEX_NUL_TRACK(c) do { \
+		if ((c) == 0) nul_pending = 1; \
+		else if ((c) != FLEX_ALPHA_ETX && nul_pending) nul_error = 1; \
+	} while (0)
 
 					/* Kanji mode: 16-bit Shift-JIS extraction
 					 * (1 char per word, bits 0-15) instead of
@@ -3710,12 +3723,12 @@ parse_phase:
 							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
 							    ph->status[w] == FLEX_WORD_NOT_RECEIVED) {
 								frag_words_ok = 0;
-								if (!(w == start_word && is_initial) && ti < (int)sizeof(text) - 1)
+								if (!(w == start_word && sig_slot) && ti < (int)sizeof(text) - 1)
 									text[ti++] = '?';
 								continue;
 							}
 
-							if (w == start_word && is_initial) {
+							if (w == start_word && sig_slot) {
 								/* Signature word — extract sig,
 								 * skip for character data */
 								rx_sig = ph->words[w] & FLEX_ALPHA_SIG_MASK;
@@ -3745,7 +3758,7 @@ parse_phase:
 								 * Each word carries 3 characters (or 2 on
 								 * the signature word). Show '?' for each. */
 								int lost = 3;
-								if (w == start_word && is_initial)
+								if (w == start_word && sig_slot)
 									lost = 2; /* sig word: only char2+char3 */
 								while (lost-- > 0 && ti < (int)sizeof(text) - 1)
 									text[ti++] = '?';
@@ -3755,21 +3768,24 @@ parse_phase:
 
 							/* First slot: signature on initial
 							 * fragment, character otherwise */
-							if (w == start_word && is_initial) {
+							if (w == start_word && sig_slot) {
 								rx_sig = dw & FLEX_ALPHA_SIG_MASK;
 							} else {
 								ch = (dw >> FLEX_ALPHA_CHAR1_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+								FLEX_NUL_TRACK(ch);
 								if (ch != FLEX_ALPHA_ETX)
 									sig_sum += ch;
 								if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
 									text[ti++] = ch;
 							}
 							ch = (dw >> FLEX_ALPHA_CHAR2_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+							FLEX_NUL_TRACK(ch);
 							if (ch != FLEX_ALPHA_ETX)
 								sig_sum += ch;
 							if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
 								text[ti++] = ch;
 							ch = (dw >> FLEX_ALPHA_CHAR3_SHIFT) & FLEX_ALPHA_CHAR_MASK;
+							FLEX_NUL_TRACK(ch);
 							if (ch != FLEX_ALPHA_ETX)
 								sig_sum += ch;
 							if (ch != FLEX_ALPHA_ETX && ch != '\0' && ti < (int)sizeof(text) - 1)
@@ -3777,6 +3793,10 @@ parse_phase:
 						}
 					}
 					text[ti] = '\0';
+					/* A NUL character, 0 in the signature sum anyway, is
+					 * a reception error only with enhanced fragmentation */
+					if (!(hdr_u || hdr_v))
+						nul_error = 0;
 
 					/* S: Verify 7-bit message signature on initial fragment.
 					 *
@@ -3803,7 +3823,7 @@ parse_phase:
 					 * immediately.  For multi-fragment messages, the
 					 * signature covers ALL fragments — validation must
 					 * wait until reassembly is complete. */
-					if (is_initial) {
+					if (sig_slot) {
 						uint32_t expected_sig = (~sig_sum) & FLEX_ALPHA_SIG_MASK;
 						if (hdr_c == 0) {
 							/* Complete message — validate now */
@@ -3942,8 +3962,17 @@ parse_phase:
 						msg_tag = "SEC:REGACK";
 					}
 
+					/* Fragment control bits of the fragments after the
+					 * first (3.10.1.3 p.66): 00 not supported, 01
+					 * reserved, 10 starts in the default character
+					 * mode, 11 in the alternative character mode */
+					char uv_status[40] = "";
+					if (!is_initial && vec_type != FLEX_VECTOR_TYPE_SECURE)
+						snprintf(uv_status, sizeof(uv_status), ",U=%d,V=%d%s",
+							 hdr_u, hdr_v, nul_error ? ",NUL=error" : "");
+
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d%s%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -3955,6 +3984,7 @@ parse_phase:
 						  (frag_flag == 'F') ? (is_initial ? "frag_start" : "frag_cont") :
 						  "frag_end",
 						  hdr_n, hdr_r, hdr_m,
+						  uv_status,
 						  alpha_sig_status,
 						  alpha_k_status,
 						  alpha_recovered ? ",RX_RECOVERED" : "",
@@ -4050,8 +4080,11 @@ parse_phase:
 							flex->rx.reasm[pol][slot].sig_sum += sig_sum;
 							if (!frag_words_ok)
 								flex->rx.reasm[pol][slot].sig_valid = 0;
-							/* Validate signature across all fragments */
-							if (flex->rx.reasm[pol][slot].sig_valid) {
+							/* Validate signature across all fragments
+							 * (alphanumeric only: a secure message has none) */
+							if (flex->rx.reasm[pol][slot].msg_type == FLEX_VECTOR_TYPE_SECURE) {
+								reasm_sig_status = "";
+							} else if (flex->rx.reasm[pol][slot].sig_valid) {
 								uint32_t total_sum = flex->rx.reasm[pol][slot].sig_sum;
 								uint32_t expected = (~total_sum) & FLEX_ALPHA_SIG_MASK;
 								uint32_t stored_sig = flex->rx.reasm[pol][slot].rx_sig;
@@ -5046,9 +5079,55 @@ parse_phase:
 							  data_bits, blocks);
 					}
 
+					/* K: 12-bit fragment checksum (STD-43A 3.10.1.2,
+					 * Fig. p.59): 1's complement of the binary sum of
+					 * all words of the fragment taken as groups of
+					 * bits 1-8, 9-16 and 17-21, K field counted as 0,
+					 * termination bits included; 12 LSBs sent.  The
+					 * words are header word 1 (at Vy for a long
+					 * address) and the message field words. */
+					const char *hex_k_status = ",K=incomplete";
+					{
+						int k_words_ok = (hex_hdr_idx < FLEX_WORDS_PER_FRAME &&
+								  (ph->status[hex_hdr_idx] == FLEX_WORD_CLEAN ||
+								   ph->status[hex_hdr_idx] == FLEX_WORD_CORRECTED));
+						uint32_t k_sum = 0, k_hdr = 0;
+						int kw;
+
+						if (k_words_ok) {
+							k_hdr = ph->words[hex_hdr_idx];
+							k_sum += (k_hdr & ~FLEX_HEX_HDR_K_MASK) & 0xFF;
+							k_sum += ((k_hdr & ~FLEX_HEX_HDR_K_MASK) >> 8) & 0xFF;
+							k_sum += ((k_hdr & ~FLEX_HEX_HDR_K_MASK) >> 16) & 0x1F;
+						}
+						for (kw = mw1; k_words_ok && kw <= mw2 && kw < FLEX_WORDS_PER_FRAME; kw++) {
+							uint32_t dw;
+
+							if (!is_long && kw == mw1)
+								continue; /* header word 1, counted above */
+							if (ph->status[kw] == FLEX_WORD_UNCORRECTABLE ||
+							    ph->status[kw] == FLEX_WORD_NOT_RECEIVED) {
+								k_words_ok = 0;
+								break;
+							}
+							dw = ph->words[kw];
+							k_sum += dw & 0xFF;
+							k_sum += (dw >> 8) & 0xFF;
+							k_sum += (dw >> 16) & 0x1F;
+						}
+						if (k_words_ok) {
+							uint32_t k_expected = (~k_sum) & FLEX_HEX_HDR_K_MASK;
+
+							hex_k_status = (k_expected == (k_hdr & FLEX_HEX_HDR_K_MASK)) ? ",K=OK" : ",K=FAIL";
+							LOGP_CHAN(DDSP, LOGL_DEBUG,
+								  "RX: Phase %c HEX K received=0x%03X computed=0x%03X\n",
+								  phase_name, k_hdr & FLEX_HEX_HDR_K_MASK, k_expected);
+						}
+					}
+
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,D=%d,H=%d,B=%d,I=%d%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,D=%d,H=%d,B=%d,I=%d%s%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -5064,6 +5143,7 @@ parse_phase:
 						  hex_header_msg,
 						  hex_blocking,
 						  hex_status_info,
+						  hex_k_status,
 						  hex_sig_status,
 						  hex_recovered ? ",RX_RECOVERED" : "",
 						  capcode,

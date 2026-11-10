@@ -1795,9 +1795,10 @@ static inline uint32_t flex_fragment_number(int fragment_index)
  *   bit  2:     D  (display direction: 0=LTR, 1=RTL)
  *   bit  3:     H  (header message flag)
  *   bits 4-7:   B  (blocking length, bits per char; 0000=16)
- *   bit  8:     I  (status info field enabler)
- *   bits 9-12:  s  (reserved, default 0000)
+ *   bits 8-11:  s  (reserved, default 0000)
+ *   bit  12:    I  (status info field enabler)
  *   bits 13-20: S  (8-bit signature)
+ * (Fig. 3.10.1.2-1: R M D H B3-B0 s3-s0 I S7-S0)
  */
 #define FLEX_HEX_HDR2_R_SHIFT		0
 #define FLEX_HEX_HDR2_R_MASK		(1U << 0)
@@ -1809,8 +1810,10 @@ static inline uint32_t flex_fragment_number(int fragment_index)
 #define FLEX_HEX_HDR2_H_MASK		(1U << 3)
 #define FLEX_HEX_HDR2_B_SHIFT		4
 #define FLEX_HEX_HDR2_B_MASK		(0x0FU << 4)
-#define FLEX_HEX_HDR2_I_SHIFT		8
-#define FLEX_HEX_HDR2_I_MASK		(1U << 8)
+#define FLEX_HEX_HDR2_I_SHIFT		12
+#define FLEX_HEX_HDR2_I_MASK		(1U << 12)
+#define FLEX_HEX_HDR2_s_SHIFT		8
+#define FLEX_HEX_HDR2_s_MASK		(0x0FU << 8)
 #define FLEX_HEX_HDR2_S_SHIFT		13
 #define FLEX_HEX_HDR2_S_MASK		(0xFFU << 13)
 
