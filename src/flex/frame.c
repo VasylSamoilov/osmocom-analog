@@ -1828,6 +1828,24 @@ int flex_msg_validate(int msg_type, const char *data, int data_length,
 	return 0;
 }
 
+/* Header fields of a HEX/binary message against its data (STD-43A 3.10.1.2):
+ * a message ends on a character boundary, so its bits (4 a hex digit) are a
+ * multiple of the blocking length B (0 = 16, p.60); the display direction D
+ * is allowed only with a blocking length other than 0001 (p.60).  Returns 0
+ * or -FLEX_ERR_INVALID_MESSAGE. */
+int flex_hex_header_validate(int data_length, int blocking, int display_rtl)
+{
+	int b = blocking ? blocking : 16;
+
+	if (blocking < 0 || blocking > 15)
+		return -FLEX_ERR_INVALID_MESSAGE;
+	if (display_rtl && b == 1)
+		return -FLEX_ERR_INVALID_MESSAGE;
+	if (data_length <= 0 || (data_length * 4) % b != 0)
+		return -FLEX_ERR_INVALID_MESSAGE;
+	return 0;
+}
+
 void flex_frame_params_default(flex_frame_params_t *params)
 {
 	memset(params, 0, sizeof(*params));

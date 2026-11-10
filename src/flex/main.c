@@ -2390,6 +2390,17 @@ static void fifo_process_line(const char *text, int text_length)
 				}
 			}
 
+			/* HEX/binary: the data end on a character boundary and D needs B != 1 */
+			if (mtype == FLEX_MSG_TYPE_HEX &&
+			    flex_hex_header_validate(message_length, msg_blocking_length, msg_hex_display_rtl)) {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "FIFO: rejecting hex capcode=%" PRIu64 ": %d bits with blocking=%d display=%s"
+				     " (bits a multiple of the blocking length, right to left not with blocking 1).\n",
+				     capcode, message_length * 4, msg_blocking_length ? msg_blocking_length : 16,
+				     msg_hex_display_rtl ? "rtl" : "ltr");
+				return;
+			}
+
 			/* Construct instruction data from structured options (§3.9.6).
 			 * When itype= is set and type is instruction, build the
 			 * 14-bit instruction data and replace the message field. */

@@ -4245,6 +4245,13 @@ int flex_scan_or_loopback(flex_t *flex)
 				msg_len = strlen(autobuf);
 			}
 
+			if (flex->default_msg_type == FLEX_MSG_TYPE_HEX &&
+			    flex_hex_header_validate(msg_len, flex->default_blocking_length, 0)) {
+				LOGP(DFLEX, LOGL_NOTICE,
+				     "Rejecting hex capcode %" PRIu64 ": %d bits, not a multiple of the blocking length.\n",
+				     cap, msg_len * 4);
+				continue;
+			}
 			msg = flex_msg_create(flex, cap, flex->default_msg_type,
 					      msg_text, msg_len);
 			if (msg) {
@@ -4448,6 +4455,13 @@ int call_down_setup(int callref, const char *caller_id, enum number_type __attri
 		LOGP(DFLEX, LOGL_INFO, "Paging capcode '%" PRIu64 "' (%s) (dialed '%s') with %s message '%s'.\n",
 		     capcode, flex_capcode_type_name(capcode), dialing, flex_msg_type_name(flex->default_msg_type), message);
 
+		if (flex->default_msg_type == FLEX_MSG_TYPE_HEX &&
+		    flex_hex_header_validate((int)strlen(message), flex->default_blocking_length, 0)) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "Rejecting hex capcode %" PRIu64 ": %d bits, not a multiple of the blocking length.\n",
+			     capcode, (int)strlen(message) * 4);
+			return -CAUSE_INVALNUMBER;
+		}
 		msg = flex_msg_create(flex, capcode, flex->default_msg_type,
 				      message, strlen(message));
 		if (!msg)

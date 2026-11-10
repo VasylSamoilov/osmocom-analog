@@ -2506,4 +2506,9 @@ int flex_scan_message(const char *message_input, int message_input_length,
 int flex_msg_validate(int msg_type, const char *data, int data_length,
 		      int secure_encoding);
 
+/* HEX/binary: the bits of the data (4 a digit) are a multiple of the blocking
+ * length (0 = 16), and right to left display needs a blocking length other
+ * than 1 (STD-43A 3.10.1.2 p.60-61).  Returns 0 or -FLEX_ERR_INVALID_MESSAGE. */
+int flex_hex_header_validate(int data_length, int blocking, int display_rtl);
+
 #endif /* FLEX_FRAME_H */
