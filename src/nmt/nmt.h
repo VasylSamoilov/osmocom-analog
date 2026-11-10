@@ -38,9 +38,6 @@ enum nmt_state {
 	STATE_MO_CONFIRM,	/* identity received, sending confirm */
 	STATE_MO_DIALING,	/* receiving digits from phone */
 	STATE_MO_COMPLETE,	/* all digits received, completing call */
-	STATE_MT_PAGING,	/* paging mobile phone */
-	STATE_MT_QUEUE,		/* no free TC: queueing call, MS waits on CC (frame 2c/2f) */
-	STATE_MT_CHANNEL,	/* assigning traffic channel */
 	STATE_MT_IDENT,		/* waiting for identity */
 	STATE_MT_AUTOANSWER,	/* sending autoanswer, waiting for reply */
 	STATE_MT_RINGING,	/* mobile phone is ringing, waiting for answer */
@@ -130,6 +127,8 @@ struct nmt {
 	struct osmo_timer_list		timer;
 	int			rx_frame_count;		/* receive frame counter */
 	int			tx_frame_count;		/* transmit frame counter */
+	unsigned int		cc_slot;		/* idle calling channel: slots sent (even: idle frame, odd: carousel) */
+	unsigned int		idle_frames;		/* idle frames sent: band advertisement and battery saving take turns */
 	int			tx_callerid_count;	/* counter for caller ID repetition */
 	char			dialing[33];		/* dialed digits */
 	int			mft_num;		/* counter for digit for MFT */

@@ -127,6 +127,12 @@ transaction_t *get_transaction_by_callref(int callref)
 	return trans;
 }
 
+/* first transaction of the list, oldest first (next links the others) */
+transaction_t *get_transaction_list(void)
+{
+	return trans_list;
+}
+
 transaction_t *get_transaction_by_number(struct nmt_subscriber *subscr)
 {
 	transaction_t *trans;

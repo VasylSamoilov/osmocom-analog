@@ -39,18 +39,27 @@
 #include "frame.h"
 #include "countries.h"
 
-/* How does paging on all channels work:
+/* How calls to the MS use the calling channels (the calling channel carousel):
  *
- * Paging is performed on all free CC channels. The transaction pointer
- * is set towards transaction. (nmt->trans points to trans)
+ * A calling channel (CC) stays idle and is not bound to a transaction. Every
+ * even slot carries its idle frame (1a/1a'/1a''/1b), every odd slot the next
+ * frame of the calls to MS that are on the calling channels, or the idle frame
+ * if there is none (our choice; NMT Doc 450-1 4.4.1.7 shows X = 1a, 2a/b/c/d/f).
  *
- * After timeout, all channels with that transaction pointer are released.
+ * A transaction on the calling channels has a phase (trans->cc_phase): paged
+ * (2a once per try on each of its CCs), answered with a free TC (2b), or
+ * answered without (2f/2c twice, then the MS is standby, NMT Doc 450-3 5.4.3).
+ * The MS reacts to 2b/2d/2f/2a only for 2T after its answer, so a queued MS is
+ * paged again when a TC becomes free and gets the 2b after its new answer (as
+ * the PMS in 4.4.1.7 state 4). The transaction is bound to a channel
+ * (trans->nmt, nmt->trans) once the 2b sends it to its TC.
  *
- * When paging was replied, other channels with the transaction pointer are
- * released, but the channel with the reply is linked to transaction in both
- * directions. (trans->nmt points to nmt, nmt->trans points to trans)
- *
+ * Capacity (ours): NMT_MAX_PAGES_PER_CC pages per CC, NMT_MAX_QUEUED queued
+ * calls; a call that would go beyond is rejected at once (-CAUSE_NOCHANNEL).
  */
+#define NMT_MAX_PAGES_PER_CC	3	/* half the slots of a CC, ~3.6/s, one 2a per MS and 1 s try */
+#define NMT_MAX_QUEUED		8	/* answered calls waiting for a TC */
+#define QUEUE_INFO_FRAMES	2	/* 2f/2c after the answer; one is what the MS needs */
 
 static int sms_ref = 0;
 
@@ -59,7 +68,8 @@ static int sms_ref = 0;
 #define RELEASE_TO	2,0	/* how long do we wait for release guard of the phone */
 #define DIALING_TO	1,0	/* if we have a pause during dialing, we abort the call */
 /* unused: #define CHANNEL_TO	2,0	(how long do we wait for phone to appear on assigned channel) */
-#define QUEUE_TO	60,0	/* how long a queued MT call waits on the CC for a free TC */
+#define QUEUE_TO	60,0	/* how long a queued MT call waits for a free TC */
+#define ORDER_TO	2,214000 /* 2T: the MS waits this long for the channel order (NMT Doc 450-3 5.4.3) */
 #define RINGING_TO	60,0	/* how long may the phone ring */
 #define SUPERVISORY_TO1	3	/* 3 sec to detect after setup */
 #define SUPERVISORY_TO2	20,0	/* 20 sec lost until abort */
@@ -135,12 +145,6 @@ static const char *nmt_state_name(enum nmt_state state)
 		return "MO CALL DIALING";
 	case STATE_MO_COMPLETE:
 		return "MO CALL COMPLETE";
-	case STATE_MT_PAGING:
-		return "MT CALL PAGING";
-	case STATE_MT_QUEUE:
-		return "MT CALL QUEUE";
-	case STATE_MT_CHANNEL:
-		return "MT CALL CHANNEL";
 	case STATE_MT_IDENT:
 		return "MT CALL IDENT";
 	case STATE_MT_AUTOANSWER:
@@ -638,65 +642,6 @@ static int nmt_bs_period_frames(int h3)
 	return tbl[h3];
 }
 
-/* Enter paging state and transmit phone's number on calling channel.
- *
- * Battery-saving interaction (when enabled, bs_period>0): a phone asleep for its
- * group's H3 period will not hear an immediate page, so the first attempt is
- * DEFERRED by one H3 period (see below), which guarantees the phone has woken
- * before we page. The deferral is group-aware: only subscribers whose last
- * digit X6 falls in the addressed H7 group are held; others page immediately. */
-static void nmt_page(transaction_t *trans, int try)
-{
-	sender_t *sender;
-	nmt_t *nmt;
-
-	/* Battery-saving page deferral (NMT Doc 450-1 para 4.3.3.12): on the first
-	 * attempt, if any calling channel runs battery saving and this subscriber's
-	 * group is addressed by it, the phone may be asleep. Hold the page for one
-	 * H3 period, which guarantees the phone has woken (whatever its phase)
-	 * before we page; timeout_mt_paging() then performs the real page. */
-	if (try == 1 && !trans->page_deferred) {
-		int x6 = trans->subscriber.number[5] - '0';
-		if (x6 < 0 || x6 > 9)
-			x6 = -1;	/* malformed number: matches no group, pages immediately */
-		for (sender = sender_head; sender; sender = sender->next) {
-			nmt = (nmt_t *)sender;
-			if (!is_chan_class_cc(nmt->sysinfo.chan_type))
-				continue;
-			if (nmt->bs_period > 0 && x6 >= 0 && nmt_bs_group_contains(nmt->bs_group, x6)) {
-				int frames = nmt_bs_period_frames(nmt->bs_period);
-				/* 1 frame = 138.33 ms; round up to whole seconds for the timer */
-				int secs = (frames * 13833 + 999999) / 1000000;
-				if (secs < 1)
-					secs = 1;
-				LOGP(DNMT, LOGL_INFO, "Battery saving active for this subscriber's group (H3=%d, %d frames); deferring page ~%d s to the wake window.\n", nmt->bs_period, frames, secs);
-				trans->page_deferred = 1;
-				trans->page_try = try;
-				osmo_timer_schedule(&trans->timer, secs, 0);
-				return;
-			}
-		}
-	}
-
-	LOGP(DNMT, LOGL_INFO, "Entering paging state (try %d), sending call to '%c,%s'.\n", try, trans->subscriber.country, trans->subscriber.number);
-	trans->page_try = try;
-	osmo_timer_schedule(&trans->timer, PAGING_TO);
-	/* page on all CC (CC/TC) */
-	for (sender = sender_head; sender; sender = sender->next) {
-		nmt = (nmt_t *)sender;
-		if (!is_chan_class_cc(nmt->sysinfo.chan_type))
-			continue;
-		/* page on all idle channels and on channels we previously paged */
-		if (nmt->state != STATE_IDLE && nmt->trans != trans)
-			continue;
-		LOGP(DNMT, LOGL_INFO, "Paging on channel %s.\n", sender->kanal);
-		nmt->trans = trans; /* add transaction before state change, so status is shown correctly */
-		nmt_new_state(nmt, STATE_MT_PAGING);
-		nmt_set_dsp_mode(nmt, DSP_MODE_FRAME);
-		nmt->tx_frame_count = 0;
-	}
-}
-
 static nmt_t *search_free_tc(nmt_t *own)
 {
 	sender_t *sender;
@@ -716,6 +661,346 @@ static nmt_t *search_free_tc(nmt_t *own)
 	}
 
 	return cc_tc;
+}
+
+/*
+ * calling channel carousel (see top of file)
+ */
+
+static int cc_idle(nmt_t *nmt)
+{
+	return is_chan_class_cc(nmt->sysinfo.chan_type) && nmt->state == STATE_IDLE;
+}
+
+static int cc_index(transaction_t *trans, nmt_t *cc)
+{
+	int i;
+
+	for (i = 0; i < trans->page_cc_num; i++) {
+		if (trans->page_cc[i] == cc)
+			return i;
+	}
+	return -1;
+}
+
+/* pages placed on the CC (also those waiting for the battery saving wake window) */
+static int cc_pages_on(nmt_t *cc)
+{
+	transaction_t *trans;
+	int pages = 0;
+
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if ((trans->cc_phase == CC_PHASE_PAGE || trans->cc_phase == CC_PHASE_DEFERRED) && cc_index(trans, cc) >= 0)
+			pages++;
+	}
+	return pages;
+}
+
+static int cc_count_phase(enum cc_phase phase)
+{
+	transaction_t *trans;
+	int count = 0;
+
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if (trans->cc_phase == phase)
+			count++;
+	}
+	return count;
+}
+
+static int idle_tc_count(void)
+{
+	sender_t *sender;
+	nmt_t *nmt;
+	int idle = 0;
+
+	for (sender = sender_head; sender; sender = sender->next) {
+		nmt = (nmt_t *)sender;
+		if (is_chan_class_tc(nmt->sysinfo.chan_type) && nmt->state == STATE_IDLE)
+			idle++;
+	}
+	return idle;
+}
+
+/* Room for one more call to a MS: a page on an idle CC, and, with no idle TC,
+ * a place in the queue for it (counting the calls that are paged already).
+ * Returns NULL if there is room, else what is missing. */
+static const char *cc_admits(void)
+{
+	sender_t *sender;
+	nmt_t *nmt;
+
+	for (sender = sender_head; sender; sender = sender->next) {
+		nmt = (nmt_t *)sender;
+		if (cc_idle(nmt) && cc_pages_on(nmt) < NMT_MAX_PAGES_PER_CC)
+			break;
+	}
+	if (!sender)
+		return "no calling channel with room for a page";
+	if (!idle_tc_count()
+	 && cc_count_phase(CC_PHASE_QUEUE) + cc_count_phase(CC_PHASE_PAGE) + cc_count_phase(CC_PHASE_DEFERRED) >= NMT_MAX_QUEUED)
+		return "no free traffic channel and the queue is full";
+	return NULL;
+}
+
+/* the call is off the calling channels */
+static void cc_leave(transaction_t *trans)
+{
+	trans->cc_phase = CC_PHASE_NONE;
+	trans->page_cc_num = 0;
+	trans->cc = NULL;
+	trans->queue_info_left = 0;
+	trans->repaged = 0;
+	osmo_timer_del(&trans->timer);
+}
+
+static void cc_add(transaction_t *trans, nmt_t *cc)
+{
+	if (trans->page_cc_num < NMT_MAX_CC && cc_index(trans, cc) < 0)
+		trans->page_cc[trans->page_cc_num++] = cc;
+}
+
+/* Page the MS: one 2a per try on each of its CCs (the carousel sends it). The
+ * first try places the page on the idle CCs with room; a queued MS is paged on
+ * the CC it is standby on; later tries add CCs that became idle.
+ *
+ * Battery saving (NMT Doc 450-1 para 4.3.3.12): a MS of a group addressed by a
+ * CC with battery saving may be asleep there; the first page on such a CC waits
+ * one H3 period, which guarantees the MS has woken. CCs where it is awake page
+ * at once. */
+static void nmt_page(transaction_t *trans, int try)
+{
+	sender_t *sender;
+	nmt_t *nmt;
+	int x6 = trans->subscriber.number[5] - '0';
+	int i, secs = 0;
+
+	if (x6 < 0 || x6 > 9)
+		x6 = -1;	/* malformed number: matches no group */
+
+	if (try == 1 && !trans->page_cc_num) {
+		nmt_t *standby = trans->cc;
+
+		trans->cc = NULL;
+		trans->queue_info_left = 0;
+		if (standby && cc_idle(standby))
+			cc_add(trans, standby);
+		else {
+			for (sender = sender_head; sender; sender = sender->next) {
+				nmt = (nmt_t *)sender;
+				if (cc_idle(nmt) && cc_pages_on(nmt) < NMT_MAX_PAGES_PER_CC)
+					cc_add(trans, nmt);
+			}
+		}
+	} else if (try > 1 && !trans->repaged) {
+		for (sender = sender_head; sender; sender = sender->next) {
+			nmt = (nmt_t *)sender;
+			if (cc_idle(nmt) && cc_index(trans, nmt) < 0 && cc_pages_on(nmt) < NMT_MAX_PAGES_PER_CC)
+				cc_add(trans, nmt);
+		}
+	}
+
+	trans->page_try = try;
+	for (i = 0; i < trans->page_cc_num; i++)
+		trans->page_due[i] = 0;
+
+	if (try == 1 && !trans->page_waited) {
+		for (i = 0; i < trans->page_cc_num; i++) {
+			nmt = trans->page_cc[i];
+			if (nmt->bs_period > 0 && x6 >= 0 && nmt_bs_group_contains(nmt->bs_group, x6)) {
+				int frames = nmt_bs_period_frames(nmt->bs_period);
+				/* 1 frame = 138.333 ms; round up to whole seconds for the timer */
+				int s = (frames * 138333 + 999999) / 1000000;
+				if (s < 1)
+					s = 1;
+				if (s > secs)
+					secs = s;
+			} else
+				trans->page_due[i] = cc_idle(nmt);
+		}
+		if (secs) {
+			LOGP(DNMT, LOGL_INFO, "Battery saving active for this subscriber's group; paging there after ~%d s (wake window).\n", secs);
+			trans->page_deferred = 1;
+			trans->page_waited = 1;
+			trans->cc_phase = CC_PHASE_DEFERRED;
+			for (i = 0; i < trans->page_cc_num; i++) {
+				if (trans->page_due[i])
+					trans->cc_phase = CC_PHASE_PAGE;
+			}
+			osmo_timer_schedule(&trans->timer, secs, 0);
+			return;
+		}
+	}
+
+	LOGP(DNMT, LOGL_INFO, "Paging (try %d) '%c,%s' on %d calling channel(s).\n", try, trans->subscriber.country, trans->subscriber.number, trans->page_cc_num);
+	for (i = 0; i < trans->page_cc_num; i++)
+		trans->page_due[i] = cc_idle(trans->page_cc[i]);
+	trans->cc_phase = CC_PHASE_PAGE;
+	osmo_timer_schedule(&trans->timer, PAGING_TO);
+}
+
+/* Queued calls whose MS is paged again because a TC became free: as many as
+ * there are idle TCs not already promised (an order to send, or such a page).
+ * Priority MS first, then the oldest. */
+static void cc_repage_queued(void)
+{
+	transaction_t *trans;
+	int promised = 0, idle = idle_tc_count(), pass;
+
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if (trans->cc_phase == CC_PHASE_ORDER
+		 || (trans->repaged && (trans->cc_phase == CC_PHASE_PAGE || trans->cc_phase == CC_PHASE_DEFERRED)))
+			promised++;
+	}
+	for (pass = 0; pass < 2 && promised < idle; pass++) {
+		for (trans = get_transaction_list(); trans && promised < idle; trans = trans->next) {
+			/* the queue info has to be out first */
+			if (trans->cc_phase != CC_PHASE_QUEUE || trans->queue_info_left > 0)
+				continue;
+			if (!!trans->priority != (pass == 0))
+				continue;
+			LOGP(DNMT, LOGL_INFO, "TC became free, paging queued '%c,%s' again (NMT Doc 450-3 5.4.3).\n", trans->subscriber.country, trans->subscriber.number);
+			osmo_timer_del(&trans->timer);
+			trans->repaged = 1;
+			trans->page_waited = 0;
+			trans->page_cc_num = 0;
+			nmt_page(trans, 1);
+			promised++;
+		}
+	}
+}
+
+static void cc_frame_head(nmt_t *cc, transaction_t *trans, frame_t *frame, enum nmt_mt mt)
+{
+	frame->mt = mt;
+	frame->channel_no = nmt_encode_channel(cc->sysinfo.system, atoi(cc->sender.kanal), cc->sysinfo.ms_power);
+	frame->traffic_area = nmt_encode_traffic_area(cc->sysinfo.system, atoi(cc->sender.kanal), cc->sysinfo.traffic_area);
+	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
+	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
+}
+
+/* The frame of an odd slot of an idle CC. Returns 0 if nothing is pending. */
+static int cc_carousel(nmt_t *cc, frame_t *frame)
+{
+	nmt_t *nmt = cc;	/* for LOGP_CHAN */
+	transaction_t *trans;
+	nmt_t *tc;
+	int i;
+
+	/* the CC of an answered call is gone (a CC/TC carries a call now): the
+	 * call goes on with this one */
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if ((trans->cc_phase == CC_PHASE_ORDER || trans->cc_phase == CC_PHASE_QUEUE) && trans->cc && !cc_idle(trans->cc))
+			trans->cc = cc;
+	}
+
+	cc_repage_queued();
+
+	/* the channel order first: the MS waits for it for 2T only */
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if (trans->cc_phase != CC_PHASE_ORDER || trans->cc != cc)
+			continue;
+		tc = search_free_tc(cc);
+		if (!tc) {
+			/* the TC was taken meanwhile: queue */
+			LOGP_CHAN(DNMT, LOGL_NOTICE, "No free TC, queueing call (%s).\n", trans->priority ? "priority" : "ordinary");
+			trans->cc_phase = CC_PHASE_QUEUE;
+			trans->queue_info_left = QUEUE_INFO_FRAMES;
+			osmo_timer_schedule(&trans->timer, QUEUE_TO);
+			continue;
+		}
+		cc_frame_head(cc, trans, frame, NMT_MESSAGE_2b);
+		frame->tc_no = nmt_encode_tc(tc->sysinfo.system, atoi(tc->sender.kanal), tc->sysinfo.ms_power);
+		LOGP_CHAN(DNMT, LOGL_INFO, "Send channel activation to mobile (TC #%s).\n", tc->sender.kanal);
+		cc_leave(trans);
+		tc->trans = trans;
+		trans->nmt = tc;
+		nmt_new_state(tc, STATE_MT_IDENT);
+		tc->tx_frame_count = 0;
+		return 1;
+	}
+
+	/* then the queue info, also within 2T */
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if (trans->cc_phase != CC_PHASE_QUEUE || trans->cc != cc || trans->queue_info_left <= 0)
+			continue;
+		trans->queue_info_left--;
+		/* H8H9H10: system-specific encoding per NMT 450 4.3.3.11 / NMT 900 4.3.3.12 */
+		cc_frame_head(cc, trans, frame, trans->priority ? NMT_MESSAGE_2c : NMT_MESSAGE_2f);
+		if (cc->sysinfo.system == 450)
+			frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_450 : NMT_QUEUE_H8H9H10_ORDINARY_450;
+		else
+			frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_900 : NMT_QUEUE_H8H9H10_ORDINARY_900;
+		LOGP_CHAN(DNMT, LOGL_INFO, "Send queue info to mobile (%s).\n", trans->priority ? "2c priority" : "2f ordinary");
+		return 1;
+	}
+
+	/* then the pages of this try that did not go out here yet */
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if (trans->cc_phase != CC_PHASE_PAGE)
+			continue;
+		i = cc_index(trans, cc);
+		if (i < 0 || !trans->page_due[i])
+			continue;
+		trans->page_due[i] = 0;
+		cc_frame_head(cc, trans, frame, NMT_MESSAGE_2a);
+		frame->additional_info = nmt_encode_area_no(cc->sysinfo.system, cc->sysinfo.area_no);
+		LOGP_CHAN(DNMT, LOGL_INFO, "Send call to mobile '%c,%s'.\n", trans->subscriber.country, trans->subscriber.number);
+		return 1;
+	}
+
+	return 0;
+}
+
+/* a page of this CC waits for its answer (10a/10d is expected) */
+static int cc_awaits_answer(nmt_t *cc)
+{
+	transaction_t *trans;
+
+	for (trans = get_transaction_list(); trans; trans = trans->next) {
+		if (trans->cc_phase == CC_PHASE_PAGE && cc_index(trans, cc) >= 0)
+			return 1;
+	}
+	return 0;
+}
+
+/* The MS answers a page on the CC (10a, 10d; 11b from a priority MS).
+ * Returns 0 if no page of that MS is going on there. */
+static int cc_answer(nmt_t *cc, frame_t *frame)
+{
+	nmt_t *nmt = cc;	/* for LOGP_CHAN */
+	nmt_subscriber_t subscr;
+	transaction_t *trans;
+
+	memset(&subscr, 0, sizeof(subscr));
+	nmt_value2digits(frame->ms_country, &subscr.country, 1);
+	nmt_value2digits(frame->ms_number, subscr.number, 6);
+	trans = get_transaction_by_number(&subscr);
+	if (!trans || trans->cc_phase != CC_PHASE_PAGE || cc_index(trans, cc) < 0)
+		return 0;
+
+	if (frame->mt == NMT_MESSAGE_11b) {
+		trans->priority = 1;
+		LOGP_CHAN(DNMT, LOGL_INFO, "Call acknowledgment is from a priority MS (PMS).\n");
+	}
+	LOGP_CHAN(DNMT, LOGL_INFO, "Received call acknowledgment from subscriber %c,%s.\n", trans->subscriber.country, trans->subscriber.number);
+	if (trans->sms_string[0])
+		trans->dms_call = 1;
+	osmo_timer_del(&trans->timer);
+	/* the other CCs stop paging, the call goes on here */
+	trans->page_cc_num = 0;
+	trans->cc = cc;
+	trans->repaged = 0;
+	if (search_free_tc(cc)) {
+		trans->cc_phase = CC_PHASE_ORDER;
+		osmo_timer_schedule(&trans->timer, ORDER_TO);
+	} else {
+		LOGP_CHAN(DNMT, LOGL_NOTICE, "No free TC, queueing call (%s).\n", trans->priority ? "priority" : "ordinary");
+		trans->cc_phase = CC_PHASE_QUEUE;
+		trans->queue_info_left = QUEUE_INFO_FRAMES;
+		osmo_timer_schedule(&trans->timer, QUEUE_TO);
+	}
+	return 1;
 }
 
 
@@ -902,25 +1187,18 @@ static void tx_idle(nmt_t *nmt, frame_t *frame)
 		 * are valid; the MTX sends one per frame based on what is configured.
 		 *
 		 * Channel band (§4.3.3.13) and battery saving (§4.3.3.14) use the same
-		 * H1=14 with different H2 values. A single MTX frame can carry only one.
-		 * Configuring both at once is an operator error: channel band takes
-		 * precedence (it is the less common feature and explicitly configured),
-		 * and a one-time warning is logged.
+		 * H1=14 with different H2 values, so one frame carries one of them.
+		 * With both configured they take turns, one idle frame each.
 		 *
 		 * NMT 450: §4.3.3.13 does not exist; only battery saving (§4.3.3.12 in
-		 * the 450-1 spec, printed as §4.3.3.12 there) is used.
+		 * the 450-1 spec) is used.
 		 */
 		int use_band_advert = (nmt->sysinfo.system == 900) &&
 				      (nmt->sysinfo.cc_band_start || nmt->sysinfo.cc_band_end ||
 				       nmt->sysinfo.tc_band_start || nmt->sysinfo.tc_band_end);
 
-		if (use_band_advert && nmt->bs_period > 0 && nmt->tx_frame_count == 1) {
-			LOGP_CHAN(DNMT, LOGL_NOTICE,
-				"Both channel band advertisement (§4.3.3.13) and battery saving "
-				"(§4.3.3.14) are configured, but a single frame can carry only one "
-				"(both use H1=14 with different H2). Channel band takes precedence; "
-				"disable --battery-saving to suppress this warning.\n");
-		}
+		if (use_band_advert && nmt->bs_period > 0 && (nmt->idle_frames++ & 1))
+			use_band_advert = 0;
 
 		if (use_band_advert) {
 			/* §4.3.3.13.2: H1(14) H2(0) = CC band + TC band advertisement.
@@ -1043,6 +1321,9 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received PMS priority seizure (11b) on non-CC channel, ignoring.\n");
 			break;
 		}
+		/* the answer of a PMS to a page */
+		if (cc_answer(nmt, frame))
+			break;
 		if (!match_area(nmt, frame))
 			break;
 		/* extract subscriber from the 11b frame */
@@ -1060,12 +1341,18 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 		}
 		trans->priority = 1;		/* priority queueing (2c) if TC not immediately free */
 		trans->priority_mo = 1;		/* MO flag: post-answer → L(3) proceed + digit collection */
-		/* page the MS on this CC to verify its identity, exactly as the
-		 * standard's state 2a specifies ("MTX checks identity by sending normal
-		 * paging 2a to PMS"). nmt_page() handles the 3× paging retries. */
-		nmt->trans = trans;
-		trans->nmt = nmt;
+		/* page the MS to verify its identity, as the standard's state 2a
+		 * specifies ("MTX checks identity by sending normal paging 2a to
+		 * PMS"). nmt_page() handles the 3x paging retries. */
 		nmt_page(trans, 1);
+		break;
+	case NMT_MESSAGE_10a: /* call acknowledgment */
+	case NMT_MESSAGE_10d: /* call ack on alternate type */
+		if (!match_channel(nmt, frame))
+			break;
+		if (!is_chan_class_cc(nmt->sysinfo.chan_type))
+			break;
+		cc_answer(nmt, frame);
 		break;
 	case NMT_MESSAGE_10b: /* seizure from ordinary MS, or access signal on an access channel */
 	case NMT_MESSAGE_12: /* seizure from coinbox MS */
@@ -1123,9 +1410,10 @@ static void rx_idle(nmt_t *nmt, frame_t *frame)
 			}
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Received TC seizure (frame 10c) from %c,%s matching pending MT call; binding TC and requesting identity.\n",
 				tsubscr.country, tsubscr.number);
-			/* bind transaction to this TC (was on CC during paging) */
+			/* bind transaction to this TC (it was on the calling channels) */
 			if (trans->nmt && trans->nmt != nmt)
 				nmt_go_idle(trans->nmt);
+			cc_leave(trans);
 			trans->nmt = nmt;
 			nmt->trans = trans;
 			osmo_timer_del(&trans->timer);
@@ -1462,24 +1750,31 @@ static void timeout_mo_dialing(nmt_t *nmt)
 /*
  * handle call MTX -> MS
  */
-static void tx_mt_paging(nmt_t *nmt, frame_t *frame)
-{
-	transaction_t *trans = nmt->trans;
-
-	frame->mt = NMT_MESSAGE_2a;
-	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
-	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
-	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
-	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-	frame->additional_info = nmt_encode_area_no(nmt->sysinfo.system, nmt->sysinfo.area_no);
-	if (++nmt->tx_frame_count == 1) {
-		LOGP_CHAN(DNMT, LOGL_INFO, "Send call to mobile.\n");
-	} else
-		tx_idle(nmt, frame);
-}
-
+/* The timer of a transaction on the calling channels. */
 void timeout_mt_paging(transaction_t *trans)
 {
+	/* no TC became free in time: the call fails as congestion; the MS is
+	 * standby on the CC, there is nothing to release */
+	if (trans->cc_phase == CC_PHASE_QUEUE) {
+		LOGP(DNMT, LOGL_NOTICE, "Queue timeout, no TC became free; releasing call.\n");
+		if (trans->callref) {
+			LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
+			call_up_release(trans->callref, CAUSE_NOCHANNEL);
+			trans->callref = 0;
+		}
+		destroy_transaction(trans);
+		return;
+	}
+	/* the order did not go out within 2T: the MS is standby again, it is
+	 * paged with the next try on the CC it answered on */
+	if (trans->cc_phase == CC_PHASE_ORDER) {
+		LOGP(DNMT, LOGL_NOTICE, "Channel order not sent within 2T, paging again.\n");
+		trans->page_cc_num = 0;
+		if (trans->cc)
+			cc_add(trans, trans->cc);
+		trans->cc = NULL;
+		trans->cc_phase = CC_PHASE_PAGE;
+	}
 	/* battery saving: the deferral timer fired, the group's wake window has
 	 * arrived -- now actually page (this was not a failed attempt). */
 	if (trans->page_deferred) {
@@ -1489,7 +1784,7 @@ void timeout_mt_paging(transaction_t *trans)
 		return;
 	}
 	LOGP(DNMT, LOGL_NOTICE, "No answer from mobile phone (try %d).\n", trans->page_try);
-	if (trans->page_try == PAGE_TRIES) {
+	if (trans->page_try >= PAGE_TRIES) {
 		LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
 		if (trans->callref)
 			call_up_release(trans->callref, CAUSE_OUTOFORDER);
@@ -1497,164 +1792,6 @@ void timeout_mt_paging(transaction_t *trans)
 		return;
 	}
 	nmt_page(trans, trans->page_try + 1);
-}
-
-static void rx_mt_paging(nmt_t *nmt, frame_t *frame)
-{
-	transaction_t *trans = nmt->trans;
-	sender_t *sender;
-	nmt_t *other;
-
-	switch (frame->mt) {
-	case NMT_MESSAGE_11b: /* priority MS call acknowledgment (PMS) */
-	case NMT_MESSAGE_10a: /* call acknowledgment */
-	case NMT_MESSAGE_10d: /* call ack on alternate type */
-		if (!match_channel(nmt, frame))
-			break;
-		if (!match_subscriber(trans, frame))
-			break;
-		if (frame->mt == NMT_MESSAGE_11b) {
-			trans->priority = 1;
-			LOGP_CHAN(DNMT, LOGL_INFO, "Call acknowledgment is from a priority MS (PMS).\n");
-			/* NMT Doc 450-1 §4.4.1.7: after ringing+answer, the PMS continues as
-			 * Scheme A (MO call) -- state 11a = authentication request (5a(L=3/11)),
-			 * states 14-16 = PMS dials its own outgoing call (14a/14b digit pairs).
-			 * This single-node emulator routes the PMS through the normal MT call
-			 * path instead: priority queueing (2c) and identity (10b) are correct,
-			 * but the post-answer MO-dialing path (the PMS's own outgoing call) is
-			 * NOT implemented -- there is no mechanism to set up a second outgoing
-			 * call from the answered-PMS context. STANDARD POINT: §4.4.1.7 states
-			 * 11a/13a/14-16 are not reached. */
-		}
-		LOGP_CHAN(DNMT, LOGL_INFO, "Received call acknowledgment from subscriber %c,%s.\n", trans->subscriber.country, trans->subscriber.number);
-		if (trans->sms_string[0])
-			trans->dms_call = 1;
-		osmo_timer_del(&trans->timer);
-		nmt_new_state(nmt, STATE_MT_CHANNEL);
-		trans->nmt = nmt;
-		nmt->tx_frame_count = 0;
-		/* release other channels */
-		for (sender = sender_head; sender; sender = sender->next) {
-			other = (nmt_t *)sender;
-			if (other == nmt)
-				continue;
-			if (other->trans == trans)
-				nmt_go_idle(other);
-		}
-		break;
-	default:
-		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame->mt), nmt_state_name(nmt->state));
-	}
-}
-
-/* Queued MT call: send queue-info (2c priority / 2f ordinary) on the calling channel.
- * Each frame we re-check for a free TC; as soon as one is available, go to the normal
- * channel-assignment path (STATE_MT_CHANNEL -> 2b). NMT Doc 450-1 4.4.1.6/4.4.1.7:
- * "2b is sent instead of 2c" once an idle TC is available.
- */
-static void tx_mt_channel(nmt_t *nmt, frame_t *frame);
-
-static void tx_mt_queue(nmt_t *nmt, frame_t *frame)
-{
-	transaction_t *trans = nmt->trans;
-
-	/* a TC became free -> stop queueing, proceed to assignment */
-	if (search_free_tc(nmt)) {
-		osmo_timer_del(&nmt->timer);
-		if (trans->priority_mo) {
-			/* PMS MO call (4.4.1.7, states 4-5): when a TC becomes free the
-			 * standard requires the MTX to send 2a again on the CC to confirm
-			 * the PMS is still waiting, and wait for a T''' 11b acknowledgement
-			 * BEFORE sending the 2b TC allocation (state 7). A direct jump to
-			 * 2b (the normal path) would skip this re-confirmation handshake.
-			 * nmt_page re-enters STATE_MT_PAGING and schedules the paging timer;
-			 * rx_mt_paging handles the 11b ack and transitions to STATE_MT_CHANNEL
-			 * for the 2b TC allocation as usual. */
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "PMS: TC became free; re-paging MS before TC allocation (4.4.1.7 state 4).\n");
-			nmt_page(trans, 1);
-			tx_mt_paging(nmt, frame);	/* fill current frame with 2a */
-			return;
-		}
-		LOGP_CHAN(DNMT, LOGL_INFO, "TC became free, assigning queued call.\n");
-		nmt_new_state(nmt, STATE_MT_CHANNEL);
-		nmt->tx_frame_count = 0;
-		tx_mt_channel(nmt, frame);
-		return;
-	}
-
-	/* the queue info goes between the idle frames of the calling channel
-	 * (NMT Doc 450-1 scheme 4.4.1.7: X = 1a, 2a/b/c/d/f), so idle MS keep
-	 * their calling channel */
-	if (nmt->tx_frame_count++ & 1) {
-		tx_idle(nmt, frame);
-		return;
-	}
-
-	/* otherwise keep telling the MS it is queued (2c priority, 2f ordinary) */
-	/* H8H9H10: system-specific encoding per NMT 450 §4.3.3.11 / NMT 900 §4.3.3.12.
-	 * Constants are defined at file scope above (NMT_QUEUE_H8H9H10_*). */
-	frame->mt = trans->priority ? NMT_MESSAGE_2c : NMT_MESSAGE_2f;
-	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
-	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
-	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
-	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-	if (nmt->sysinfo.system == 450)
-		frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_450 : NMT_QUEUE_H8H9H10_ORDINARY_450;
-	else
-		frame->additional_info = trans->priority ? NMT_QUEUE_H8H9H10_PRIORITY_900 : NMT_QUEUE_H8H9H10_ORDINARY_900;
-	if (nmt->tx_frame_count == 1)
-		LOGP_CHAN(DNMT, LOGL_INFO, "Send queue info to mobile (%s).\n", trans->priority ? "2c priority" : "2f ordinary");
-}
-
-static void timeout_mt_queue(nmt_t *nmt)
-{
-	transaction_t *trans = nmt->trans;
-
-	LOGP_CHAN(DNMT, LOGL_NOTICE, "Queue timeout, no TC became free; releasing call.\n");
-	LOGP(DNMT, LOGL_INFO, "Release call towards network.\n");
-	if (trans->callref) {
-		call_up_release(trans->callref, CAUSE_NOCHANNEL);
-		trans->callref = 0;
-	}
-	nmt_release(nmt);
-}
-
-static void tx_mt_channel(nmt_t *nmt, frame_t *frame)
-{
-	transaction_t *trans = nmt->trans;
-	nmt_t *tc;
-
-	/* get free channel (after releasing all channels) */
-	tc = search_free_tc(nmt);
-	if (!tc) {
-		/* No free TC: queue the call on the calling channel instead of dropping it. */
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "No free TC, queueing call (%s).\n", trans->priority ? "priority" : "ordinary");
-		nmt_new_state(nmt, STATE_MT_QUEUE);
-		nmt->tx_frame_count = 0;
-		osmo_timer_schedule(&nmt->timer, QUEUE_TO);
-		/* send the queue-info frame now */
-		tx_mt_queue(nmt, frame);
-		return;
-	}
-	if (nmt != tc) {
-		/* link trans and tc together, so we can continue with channel assignment */
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "Switching to TC channel #%s.\n", tc->sender.kanal);
-		nmt_go_idle(nmt);
-		tc->trans = trans;
-		trans->nmt = tc;
-	} else
-		LOGP_CHAN(DNMT, LOGL_NOTICE, "Staying on CC/TC channel #%s.\n", tc->sender.kanal);
-	nmt_new_state(tc, STATE_MT_IDENT);
-	tc->tx_frame_count = 0;
-
-	/* assign channel on 'nmt' to 'tc' */
-	frame->mt = NMT_MESSAGE_2b;
-	frame->channel_no = nmt_encode_channel(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.ms_power);
-	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
-	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
-	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-	frame->tc_no = nmt_encode_tc(tc->sysinfo.system, atoi(tc->sender.kanal), tc->sysinfo.ms_power);
-	LOGP_CHAN(DNMT, LOGL_INFO, "Send channel activation to mobile.\n");
 }
 
 static void tx_mt_ident(nmt_t *nmt, frame_t *frame)
@@ -2718,7 +2855,11 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 
 	LOGP_CHAN(DDSP, LOGL_INFO, "RX Level: %.0f%% Quality=%.0f%%\n", level * 100.0, quality * 100.0);
 
-	rc = decode_frame(nmt->sysinfo.system, &frame, bits, (nmt->sender.loopback) ? MTX_TO_XX : XX_TO_MTX, (nmt->state == STATE_MT_PAGING));
+	/* A call acknowledgment (10a) is only told from a seizure (10b) by what the
+	 * channel waits for: an idle CC that pages a MS. A plain CC gets no seizure,
+	 * a CC/TC only when no page waits for its answer. */
+	rc = decode_frame(nmt->sysinfo.system, &frame, bits, (nmt->sender.loopback) ? MTX_TO_XX : XX_TO_MTX,
+		cc_idle(nmt) && (nmt->sysinfo.chan_type != CHAN_TYPE_CC_TC || cc_awaits_answer(nmt)));
 	if (rc < 0) {
 		LOGP_CHAN(DNMT, (nmt->sender.loopback) ? LOGL_NOTICE : LOGL_DEBUG, "Received invalid frame.\n");
 		return;
@@ -2781,6 +2922,26 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 		break;
 	default:
 		break;
+	}
+
+	/* A MS whose call is still on the calling channels clears on this idle CC:
+	 * the call is bound here as if it had come in on the channel, and the
+	 * clearing is acknowledged like any other below. */
+	if (frame.mt == NMT_MESSAGE_13a && (frame.line_signal & 0xf) == 1 && cc_idle(nmt)
+	 && match_channel(nmt, &frame) && nmt_line_signal_majority(frame.line_signal, 5, 3) == 1) {
+		nmt_subscriber_t subscr;
+		transaction_t *trans;
+
+		memset(&subscr, 0, sizeof(subscr));
+		nmt_value2digits(frame.ms_country, &subscr.country, 1);
+		nmt_value2digits(frame.ms_number, subscr.number, 6);
+		trans = get_transaction_by_number(&subscr);
+		if (trans && trans->cc_phase != CC_PHASE_NONE) {
+			cc_leave(trans);
+			trans->nmt = nmt;
+			nmt->trans = trans;
+			nmt_new_state(nmt, STATE_MT_IDENT);
+		}
 	}
 
 	/* MS releases, but this is not the acknowledge of MTX release */
@@ -2846,9 +3007,6 @@ void nmt_receive_frame(nmt_t *nmt, const char *bits, double quality, double leve
 		break;
 	case STATE_MO_RELEASE:
 		break;
-	case STATE_MT_PAGING:
-		rx_mt_paging(nmt, &frame);
-		break;
 	case STATE_MT_IDENT:
 		rx_mt_ident(nmt, &frame);
 		break;
@@ -2885,9 +3043,6 @@ static void nmt_timeout(void *data)
 	case STATE_MT_RINGING:
 		timeout_mt_ringing(nmt);
 		break;
-	case STATE_MT_QUEUE:
-		timeout_mt_queue(nmt);
-		break;
 	case STATE_MT_RELEASE:
 		timeout_mt_release(nmt);
 		break;
@@ -2915,6 +3070,9 @@ const char *nmt_get_frame(nmt_t *nmt)
 
 	switch(nmt->state) {
 	case STATE_IDLE:
+		/* calling channel: idle frame in even slots, the carousel in odd ones */
+		if (is_chan_class_cc(nmt->sysinfo.chan_type) && (nmt->cc_slot++ & 1) && cc_carousel(nmt, &frame))
+			break;
 		tx_idle(nmt, &frame);
 		break;
 	case STATE_ROAMING_IDENT:
@@ -2934,15 +3092,6 @@ const char *nmt_get_frame(nmt_t *nmt)
 		break;
 	case STATE_MO_RELEASE:
 		tx_mo_release(nmt, &frame);
-		break;
-	case STATE_MT_PAGING:
-		tx_mt_paging(nmt, &frame);
-		break;
-	case STATE_MT_QUEUE:
-		tx_mt_queue(nmt, &frame);
-		break;
-	case STATE_MT_CHANNEL:
-		tx_mt_channel(nmt, &frame);
 		break;
 	case STATE_MT_IDENT:
 		tx_mt_ident(nmt, &frame);
@@ -3012,8 +3161,7 @@ const char *nmt_get_frame(nmt_t *nmt)
 /* Call control starts call towards mobile station. */
 static int _out_setup(int callref, const char *caller_id, enum number_type caller_type, const char *dialing, const char *sms, int sms_len)
 {
-	sender_t *sender;
-	nmt_t *nmt;
+	const char *why;
 	nmt_subscriber_t subscr;
 	transaction_t *trans;
 
@@ -3032,21 +3180,14 @@ static int _out_setup(int callref, const char *caller_id, enum number_type calle
 		return -CAUSE_BUSY;
 	}
 
-	/* 3. check if all paging (calling) channels are busy, return NOCHANNEL */
-	for (sender = sender_head; sender; sender = sender->next) {
-		nmt = (nmt_t *) sender;
-		if (!is_chan_class_cc(nmt->sysinfo.chan_type))
-			continue;
-		if (nmt->state == STATE_IDLE)
-			break;
-	}
-	if (!sender) {
-		LOGP(DNMT, LOGL_NOTICE, "Outgoing call, but no free calling channel, rejecting!\n");
+	/* 3. room on the calling channels, else return NOCHANNEL. With no free
+	 * traffic channel the MS is paged all the same and the call is queued
+	 * when it answers (2f/2c, NMT Doc 450-1 para 4.1.1.2, scheme B step 5) */
+	why = cc_admits();
+	if (why) {
+		LOGP(DNMT, LOGL_NOTICE, "Outgoing call, but %s, rejecting!\n", why);
 		return -CAUSE_NOCHANNEL;
 	}
-	/* no free traffic channel: the MS is paged all the same and the call is
-	 * queued when it answers (2f/2c, NMT Doc 450-1 para 4.1.1.2, scheme B
-	 * step 5) */
 
 	LOGP(DNMT, LOGL_INFO, "Call to mobile station, paging station id '%c%s'\n", subscr.country, subscr.number);
 
@@ -3415,8 +3556,7 @@ static int mwi_send_in_call(nmt_t *nmt, uint8_t flags)
  */
 static int mwi_set(const char *dialing, uint8_t flags)
 {
-	sender_t *sender;
-	nmt_t *nmt;
+	const char *why;
 	nmt_subscriber_t subscr;
 	transaction_t *trans;
 
@@ -3441,20 +3581,12 @@ static int mwi_set(const char *dialing, uint8_t flags)
 		return -CAUSE_BUSY;
 	}
 
-	/* 4. check if all paging (calling) channels are busy */
-	for (sender = sender_head; sender; sender = sender->next) {
-		nmt = (nmt_t *) sender;
-		if (!is_chan_class_cc(nmt->sysinfo.chan_type))
-			continue;
-		if (nmt->state == STATE_IDLE)
-			break;
-	}
-	if (!sender) {
-		LOGP(DNMT, LOGL_NOTICE, "MWI: no free calling channel\n");
+	/* 4. room on the calling channels (as any call to the MS) */
+	why = cc_admits();
+	if (why) {
+		LOGP(DNMT, LOGL_NOTICE, "MWI: %s\n", why);
 		return -CAUSE_NOCHANNEL;
 	}
-	/* no free traffic channel: paged all the same, queued when the MS
-	 * answers (as any call to the MS) */
 
 	LOGP(DNMT, LOGL_INFO, "MWI out-of-call to '%c%s': %s(0x%02x)\n",
 		subscr.country, subscr.number,
@@ -3748,7 +3880,7 @@ void deliver_power_change(const char *command)
 	number = strsep(&p, ",");
 	power_str = p;
 	if (!number || !power_str || !power_str[0]) {
-		LOGP(DNMT, LOGL_NOTICE, "Power change: invalid format. Use: <7-digit-number>,<power 0-7>\n");
+		LOGP(DNMT, LOGL_NOTICE, "Power change: invalid format. Use: <7-digit-number>,<power 0-3>\n");
 		return;
 	}
 	if (strlen(number) != 7) {
@@ -3756,8 +3888,9 @@ void deliver_power_change(const char *command)
 		return;
 	}
 	new_power = atoi(power_str);
-	if (new_power < 0 || new_power > 7) {
-		LOGP(DNMT, LOGL_NOTICE, "Power change: power level %d out of range 0..7.\n", new_power);
+	/* two power bits in N1 / Na (NMT Doc 450-1 4.3.3.1 note 1) */
+	if (new_power < 0 || new_power > 3) {
+		LOGP(DNMT, LOGL_NOTICE, "Power change: power level %d out of range 0..3.\n", new_power);
 		return;
 	}
 	memset(&subscr, 0, sizeof(subscr));
