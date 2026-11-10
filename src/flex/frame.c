@@ -1160,7 +1160,8 @@ static uint32_t encode_secure_message(uint32_t *frame_words, const char *msg,
 				}
 				word_idx++;
 
-				if (exact && secure_subtype == FLEX_SEC_TYPE_BINARY &&
+				/* only the last fragment carries the padding word */
+				if (exact && c_val == 0 && secure_subtype == FLEX_SEC_TYPE_BINARY &&
 				    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
 					uint32_t extra = 0;
 					if (fill_bit)
@@ -2401,27 +2402,19 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 
 		word_idx = (bit > 0) ? (bit - 1) / FLEX_BCH_DATA_BITS : data_idx;
 
-		/* Termination fill (Spec §3.10.1.2 rules 2 & 3):
-		 *
-		 * Rule (2): When data ends in the middle of the last word,
-		 * fill remaining bits with the inverse of the last data bit.
-		 * When data ends exactly at a word boundary, no fill needed.
-		 *
-		 * Rule (3): For the LAST fragment only (C=0): same as (2),
-		 * EXCEPT when data ends exactly at a word boundary AND the
-		 * last character is all-0s or all-1s — in that case, append
-		 * an extra word filled with the inverse of the last data bit.
-		 *
-		 * The extra word prevents ambiguity: without it, the decoder
-		 * can't distinguish "message ended here" from "message data
-		 * that happens to look like fill". */
+		/* Termination (3.10.1.2): a fragment that is not the last is
+		 * packed full and carries neither fill nor padding.  In the
+		 * last fragment, data ending mid-word is followed by fill, the
+		 * inverse of the last data bit; data ending exactly at a word
+		 * end gets a padding word of that inverse bit only when the
+		 * last character (B bits) is uniform. */
 		if (bit > data_idx * FLEX_BCH_DATA_BITS) {
 			int last_data_bit = (msg_words[(bit - 1) / FLEX_BCH_DATA_BITS]
 					     >> ((bit - 1) % FLEX_BCH_DATA_BITS)) & 1;
 			uint32_t fill_bit = last_data_bit ? 0 : 1;
 			int remainder = bit % FLEX_BCH_DATA_BITS;
 
-			if (remainder != 0) {
+			if (remainder != 0 && c_val == 0) {
 				/* Data ends mid-word: fill remaining bits */
 				int end_bit = (word_idx + 1) * FLEX_BCH_DATA_BITS;
 				for (b = bit; b < end_bit; b++) {
@@ -2432,13 +2425,23 @@ static uint32_t encode_hex_message(uint32_t *frame_words, const char *msg,
 			}
 			word_idx++;
 
-			/* Rule (3): extra word only when last fragment,
-			 * data ends at word boundary, and last char is
-			 * all-0s or all-1s */
 			if (c_val == 0 && remainder == 0 &&
 			    word_idx < FLEX_MAX_MSG_WORDS_HEX) {
-				uint8_t last_nib = hex_char_to_nibble(msg[len - 1]);
-				if (last_nib == 0x0 || last_nib == 0xF) {
+				int blk = (config && ((const struct flex_msg_config *)config)->blocking_length) ?
+					((const struct flex_msg_config *)config)->blocking_length : 16;
+				int nbits = (int)len * 4;
+				int uniform = 1, k;
+
+				if (blk > nbits)
+					blk = nbits;
+				for (k = nbits - blk + 1; k < nbits; k++) {
+					int v1 = (hex_char_to_nibble(msg[k / 4]) >> (k % 4)) & 1;
+					int v0 = (hex_char_to_nibble(msg[(nbits - blk) / 4]) >>
+						  ((nbits - blk) % 4)) & 1;
+					if (v1 != v0)
+						uniform = 0;
+				}
+				if (uniform) {
 					uint32_t extra = 0;
 					if (fill_bit)
 						for (b = 0; b < 21; b++)
@@ -2590,6 +2593,33 @@ static uint32_t encode_kanji_message(uint32_t *frame_words, const char *msg,
 				 uint32_t msg_start, uint32_t *fwc_p,
 				 int *error);
 
+/* Number of 21-bit data words of a HEX/binary fragment holding the hex digits
+ * in data: ceil(4*len/21), plus one padding word on the last fragment when the
+ * bits end exactly at a word end and the last character (blocking bits) is
+ * uniform. */
+int flex_binary_data_words(const char *data, int len, int blocking, int last_fragment)
+{
+	int bits = len * 4;
+	int words = (bits + FLEX_BCH_DATA_BITS - 1) / FLEX_BCH_DATA_BITS;
+
+	if (last_fragment && bits > 0 && bits % FLEX_BCH_DATA_BITS == 0 &&
+	    blocking > 0 && blocking <= bits) {
+		int first = 0, i;
+		int equal = 1;
+
+		for (i = bits - blocking; i < bits; i++) {
+			int v = (hex_char_to_nibble(data[i / 4]) >> (i % 4)) & 1;
+			if (i == bits - blocking)
+				first = v;
+			else if (v != first)
+				equal = 0;
+		}
+		if (equal)
+			words++;
+	}
+	return words;
+}
+
 /*
  * Estimate the number of message body words for a given message type and content.
  * Used in the first pass to determine if a message fits in the remaining frame capacity.
@@ -2688,29 +2718,19 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
 			: strlen(msg->message);
 		if (len > FLEX_MAX_CHARS_HEX)
 			return -1;
-		/* Hex packing: 5 nibbles per 21-bit data word.
-		 * Header words: hdr1 (always) + hdr2 (initial fragment only).
-		 * Initial fragment: 2 headers + ceil(len/5) data words.
-		 * Continuation:     1 header  + ceil(len/5) data words.
-		 *
-		 * Termination: if the last nibble is all-0
-		 * or all-1 (0x0 or 0xF), an extra fill word may be appended.
-		 * We add +1 worst-case to ensure the frame has room. */
+		/* Hex packing: the data bits (4 per digit) fill all 21 bits of
+		 * the data words.  Header words: hdr1 (always) + hdr2 (initial
+		 * fragment only). */
 		{
 			int is_continuation = (msg->total_fragments > 1 &&
 					       msg->fragment_index > 0);
 			int hdr_words = is_continuation ? 1 : 2;
-			int data_words = (int)((len + 4) / 5);
 			int is_last_frag = (msg->total_fragments <= 1 ||
 					    msg->fragment_index == msg->total_fragments - 1);
-			/* Extra termination word possible on last fragment */
-			if (is_last_frag && len > 0) {
-				const char *m = msg->message;
-				char last_ch = m[len - 1];
-				if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
-					data_words++;
-			}
-			return hdr_words + data_words;
+
+			return hdr_words + flex_binary_data_words(msg->message, (int)len,
+				msg->blocking_length ? msg->blocking_length : 16,
+				is_last_frag);
 		}
 
 	case FLEX_FRAME_MSG_TYPE_SECURE:
@@ -2724,31 +2744,21 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
 			if (len > FLEX_MAX_CHARS_HEX)
 				return -1;
 			{
-				int is_continuation = (msg->total_fragments > 1 &&
-						       msg->fragment_index > 0);
-				int hdr_words = is_continuation ? 1 : 2;
-				int data_words = (int)((len + 4) / 5);
+				/* One header word in every fragment (Fig. 3.10.1.4-1);
+				 * characters of 1 bit */
 				int is_last_frag = (msg->total_fragments <= 1 ||
 						    msg->fragment_index == msg->total_fragments - 1);
-				if (is_last_frag && len > 0) {
-					const char *m = msg->message;
-					char last_ch = m[len - 1];
-					if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
-						data_words++;
-				}
-				return hdr_words + data_words;
+
+				return 1 + flex_binary_data_words(msg->message, (int)len, 1,
+								  is_last_frag);
 			}
 		} else {
 			/* Alpha encoding: same estimation as alpha */
 			if (len > FLEX_MAX_CHARS_ALPHA)
 				return -1;
 			{
-				int is_continuation = (msg->total_fragments > 1 &&
-						       msg->fragment_index > 0);
-				if (is_continuation)
-					return 1 + (int)((len + 2) / 3);
-				else
-					return 1 + (int)((len + 2 + 2) / 3);
+				/* no signature slot in secure alphanumeric */
+				return 1 + (int)((len + 2) / 3);
 			}
 		}
 

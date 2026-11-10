@@ -237,7 +237,11 @@ static inline int flex_subframe_offset(int num_transmissions, int subframe_index
 #define FLEX_MAX_CHARS_NUMERIC		(((FLEX_MAX_MSG_WORDS_NUMERIC * FLEX_BCH_DATA_BITS) - 2) >> 2)
 /* Maximum hex message words and characters */
 #define FLEX_MAX_MSG_WORDS_HEX		FLEX_MAX_MSG_WORDS_ALPHA
-#define FLEX_MAX_CHARS_HEX		(FLEX_MAX_MSG_WORDS_HEX * 5)
+/* Digits of one HEX fragment: all data bits of the words after one header
+ * word (continuation fragment), 4 bits per digit */
+#define FLEX_MAX_CHARS_HEX		(((FLEX_MAX_MSG_WORDS_HEX - 1) * FLEX_BCH_DATA_BITS) / 4)
+/* Digits of a HEX message sent unfragmented (5 digits per word, 2 header words) */
+#define FLEX_MAX_CHARS_HEX_SINGLE	(FLEX_MAX_MSG_WORDS_HEX * 5)
 
 /* ===== Vector Word Types =====
  *
@@ -2484,6 +2488,10 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 			const flex_frame_params_t *params,
 			uint8_t *buffer, size_t buffer_size,
 			int *msgs_packed, int *error);
+
+/* Data words of a HEX/binary fragment (hex digits in data), including the
+ * padding word of a last fragment that ends exactly at a word end. */
+int flex_binary_data_words(const char *data, int len, int blocking, int last_fragment);
 
 /* Text utilities */
 const char *flex_print_message(const char *message, int message_length);

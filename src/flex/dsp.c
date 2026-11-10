@@ -2021,9 +2021,11 @@ static int flextime_dates_agree(int y1, uint32_t m1, uint32_t d1,
  *     in the last fragment when the last character is all 0s or all 1s: then
  *     a word of the inverse of the last data bit is added.
  * The receiver finds the data length from the rules: the length is a
- * multiple of B.  A fill that is also a valid data end (a fragment that is not
- * the last, ending exactly at a word end with B or more equal bits) cannot be
- * told apart by the standard; the bits are taken as fill. */
+ * multiple of B, the fill is the run of equal bits at the end of the last
+ * word.  Design rule: a fragment that is not the last is packed full (the
+ * transmitter sizes it so), so its fill is shorter than a character and it
+ * has no padding word; only the last fragment can have a longer fill, or the
+ * padding word that tells data from fill at an exact word end. */
 
 /* Length in bits of the data of a fragment of n bits (a multiple of 21).
  * *state: 0 = consistent, 1 = does not follow the rules, 2 = cannot be told
@@ -2079,25 +2081,31 @@ static int flex_hex_terminate(const int8_t *bits, int n, int blocking, int last_
 	for (run = 0; run < FLEX_BCH_DATA_BITS && lw[FLEX_BCH_DATA_BITS - 1 - run] == lw[FLEX_BCH_DATA_BITS - 1]; run++)
 		;
 	if (run == FLEX_BCH_DATA_BITS) {
-		/* A whole word of one value is not fill (fill is shorter) */
-		if ((n % blocking) != 0)
-			*state = 1;
-		return n;
+		/* A whole word of one value is not fill (fill is shorter); the
+		 * bits after the last whole character are too few to be data */
+		return n - (n % blocking);
 	}
 	if (run >= blocking) {
+		/* A fragment that is not the last is packed full: no fill and no
+		 * padding word, the only bits after its last character are the
+		 * ones too few for another character (fewer than B).  A run of B
+		 * bits or more is data; the data end exactly at the word end. */
+		if (!last_fragment) {
+			*state = ((n % blocking) != 0) ? 1 : 0;
+			return n;
+		}
 		if (((n - run) % blocking) == 0)
 			return n - run;
-		/* Equal bits that do not end on a character boundary: for a last
-		 * fragment the rules are not followed; else the data end exactly */
-		*state = (last_fragment || (n % blocking) != 0) ? 1 : 0;
+		/* Equal bits that do not end on a character boundary: the rules
+		 * are not followed */
+		*state = 1;
 		return n;
 	}
-	if ((n % blocking) == 0)
-		return n;
-	if (((n - run) % blocking) == 0)
-		return n - run;
-	*state = 1;
-	return n;
+	/* Fewer than B equal bits at the end: the fill is mandatory only when
+	 * the rest of the word could be mistaken for data, that is when it could
+	 * hold another character.  The bits after the last whole character are
+	 * too few to be data, whether they are fill or not. */
+	return n - (n % blocking);
 }
 
 /* Hex digits of n data bits, 4 bits a digit, the first bit the least

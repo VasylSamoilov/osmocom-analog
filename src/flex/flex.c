@@ -893,6 +893,73 @@ void flex_tempgroup_tick(flex_t *flex, uint32_t abs_frame)
  * (which is told to keep decoding via BIW1 carry-on) can receive the
  * continuation fragments without waiting for the next collapse-aligned frame.
  */
+/* Data bits of a fragment of binary data that is not the last
+ * (STD-43A 3.10.1.2 p.61-62, 3.10.1.4 p.70).  Such a fragment is packed
+ * full: it ends on a character (blocking bits) and on a hex digit (4 bits)
+ * boundary, it has no padding word, and fewer than blocking bits are left
+ * in its last word.  words = data words available.  If no size fits the
+ * words, fewer words are used until one does. */
+static int flex_binary_fragment_bits(int words, int blocking)
+{
+	int a = blocking, b = 4, t, unit, w;
+
+	while (b) {
+		t = a % b;
+		a = b;
+		b = t;
+	}
+	unit = blocking * 4 / a;	/* lcm of blocking and 4 */
+	for (w = words; w >= 1; w--) {
+		int cap = w * FLEX_BCH_DATA_BITS;
+		int bits = (cap / unit) * unit;
+
+		if (bits > 0 && cap - bits < blocking)
+			return bits;
+	}
+	return unit;
+}
+
+/* Split binary data (hex digits) into fragments: all but the last are
+ * packed full (flex_binary_fragment_bits).  The last one takes the rest,
+ * with a word to spare for the padding word.  Returns the number of
+ * fragments (strings to free), 0 on error. */
+static int flex_fragment_binary(const char *data, int blocking, int words_first,
+				int words_next, char **fragments, int max_fragments)
+{
+	int len = (int)strlen(data), pos = 0, count = 0;
+
+	while (pos < len && count < max_fragments) {
+		int words = count ? words_next : words_first;
+		int rest_bits = (len - pos) * 4;
+		int digits;
+
+		if (words < 2)
+			words = 2;
+		if (rest_bits <= (words - 1) * FLEX_BCH_DATA_BITS)
+			digits = len - pos;
+		else
+			digits = flex_binary_fragment_bits(words, blocking) / 4;
+		LOGP(DFLEX, LOGL_DEBUG, "Binary fragment %d: digits %d..%d of %d\n",
+		     count, pos, pos + digits, len);
+		fragments[count] = malloc(digits + 1);
+		if (!fragments[count]) {
+			while (count > 0)
+				free(fragments[--count]);
+			return 0;
+		}
+		memcpy(fragments[count], data + pos, digits);
+		fragments[count][digits] = '\0';
+		pos += digits;
+		count++;
+	}
+	if (pos < len) {
+		while (count > 0)
+			free(fragments[--count]);
+		return 0;
+	}
+	return count;
+}
+
 static void flex_fragment_queue(flex_t *flex)
 {
 	flex_msg_t *msg, *next;
@@ -952,8 +1019,8 @@ static void flex_fragment_queue(flex_t *flex)
 					      - addr_words - 1; /* 1 vector */
 			int data_words = msg_words_avail - 2; /* 2 header words */
 			max_chars = data_words * 5;
-			if (max_chars > FLEX_MAX_CHARS_HEX)
-				max_chars = FLEX_MAX_CHARS_HEX;
+			if (max_chars > FLEX_MAX_CHARS_HEX_SINGLE)
+				max_chars = FLEX_MAX_CHARS_HEX_SINGLE;
 			if (max_chars < 1)
 				max_chars = 1;
 			break;
@@ -974,8 +1041,8 @@ static void flex_fragment_queue(flex_t *flex)
 				/* Binary encoding: same sizing as hex */
 				int data_words = msg_words_avail - 2;
 				max_chars = data_words * 5;
-				if (max_chars > FLEX_MAX_CHARS_HEX)
-					max_chars = FLEX_MAX_CHARS_HEX;
+				if (max_chars > FLEX_MAX_CHARS_HEX_SINGLE)
+					max_chars = FLEX_MAX_CHARS_HEX_SINGLE;
 			}
 			if (max_chars < 1)
 				max_chars = 1;
@@ -1008,9 +1075,26 @@ static void flex_fragment_queue(flex_t *flex)
 		if (msg->data_length <= max_chars)
 			continue;
 
-		/* Split the message */
-		frag_count = flex_fragment_message(msg->data, (int)msg->msg_type,
-						   max_chars, fragments, 64);
+		/* Split the message.  Binary data (HEX, secure binary) is split
+		 * so that no fragment but the last has fill or padding. */
+		if (msg->msg_type == FLEX_MSG_TYPE_HEX ||
+		    (msg->msg_type == FLEX_MSG_TYPE_SECURE && msg->secure_encoding == 1)) {
+			int addr_words = (msg->capcode >= FLEX_LONG_ADDR_MIN) ? 2 : 1;
+			int avail = FLEX_WORDS_PER_FRAME - biw_count - addr_words - 1; /* 1 vector */
+
+			if (avail > FLEX_MAX_MSG_WORDS_HEX)
+				avail = FLEX_MAX_MSG_WORDS_HEX;
+			int is_hex = (msg->msg_type == FLEX_MSG_TYPE_HEX);
+			int blocking = is_hex ? (msg->blocking_length ? msg->blocking_length : 16) : 1;
+
+			/* HEX: 2 header words in the first fragment, 1 after; secure: 1 */
+			frag_count = flex_fragment_binary(msg->data, blocking,
+							  is_hex ? avail - 2 : avail - 1,
+							  avail - 1, fragments, 64);
+		} else {
+			frag_count = flex_fragment_message(msg->data, (int)msg->msg_type,
+							   max_chars, fragments, 64);
+		}
 		if (frag_count <= 1) {
 			/* Fragmentation not needed or failed */
 			if (frag_count == 1)
@@ -1684,15 +1768,11 @@ static int flex_estimate_msg_cost(const flex_msg_t *msg)
 		int is_continuation = (msg->total_fragments > 1 &&
 				       msg->fragment_index > 0);
 		int hdr_words = is_continuation ? 1 : 2;
-		int data_words = (int)((len + 4) / 5);
 		int is_last_frag = (msg->total_fragments <= 1 ||
 				    msg->fragment_index == msg->total_fragments - 1);
-		if (is_last_frag && len > 0) {
-			char last_ch = msg->data[len - 1];
-			if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
-				data_words++;
-		}
-		bw = hdr_words + data_words;
+		bw = hdr_words + flex_binary_data_words(msg->data, (int)len,
+				msg->blocking_length ? msg->blocking_length : 16,
+				is_last_frag);
 		break;
 	}
 
@@ -1701,26 +1781,15 @@ static int flex_estimate_msg_cost(const flex_msg_t *msg)
 			return -1;
 		if (msg->secure_encoding == 1) {
 			/* Binary encoding: same as hex */
-			int is_continuation = (msg->total_fragments > 1 &&
-					       msg->fragment_index > 0);
-			int hdr_words = is_continuation ? 1 : 2;
-			int data_words = (int)((len + 4) / 5);
+			/* one header word in every fragment, 1-bit characters */
 			int is_last_frag = (msg->total_fragments <= 1 ||
 					    msg->fragment_index == msg->total_fragments - 1);
-			if (is_last_frag && len > 0) {
-				char last_ch = msg->data[len - 1];
-				if (last_ch == '0' || last_ch == 'f' || last_ch == 'F')
-					data_words++;
-			}
-			bw = hdr_words + data_words;
+			bw = 1 + flex_binary_data_words(msg->data, (int)len, 1,
+							is_last_frag);
 		} else {
 			/* Alpha encoding */
-			int is_continuation = (msg->total_fragments > 1 &&
-					       msg->fragment_index > 0);
-			if (is_continuation)
-				bw = 1 + (int)((len + 2) / 3);
-			else
-				bw = 1 + (int)((len + 2 + 2) / 3);
+			/* no signature slot in secure alphanumeric */
+			bw = 1 + (int)((len + 2) / 3);
 		}
 		break;
 	}
