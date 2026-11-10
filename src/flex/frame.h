@@ -1017,10 +1017,10 @@ static inline int flex_biw_real_year(int biw_year, int sys_year)
  *
  * Reserved Short:     Reserved for future use (no defined behavior).
  * Info Service:       Under study (no defined behavior yet).
- * Network:            NID system messages.
- *                     Transmitted using Secure (type 0) vector.
- *                     Message contains Service Area ID, Multiplier,
- *                     and Traffic Management Flags.
+ * Network:            NID: Short Message vector t=00 carries the
+ *                     Service Area, Multiplier and Traffic Management
+ *                     Flags. A second Network Address may carry an
+ *                     NID System Message (see Network Address Messages).
  * Temporary:          Group messaging (16 temp address slots).
  *                     16 addresses assigned via short instruction vectors.
  *                     Used for temporary group address assignment.
@@ -1221,51 +1221,23 @@ static inline const char *flex_instr_type_name(uint32_t itype)
 	}
 }
 
-/* ===== Network Message Payload =====
+/* ===== Network Address Messages =====
  *
- * Network (NID) messages are transmitted using Secure (type 0) vectors.
- * The message payload contains system information fields.
+ * Network ID (NID): a Network Address with a Short Message vector t=00.
+ * The 12 bits d0-d11 are A4-A0 service area, M2-M0 multiplier and
+ * T3-T0 traffic management flags (STD-43A Table 3.9.2-1, 6.1.2;
+ * FLEX-93001 3.8.6.3 and 3.8.7.2, p.25-27), see FLEX_SMSG_*.
  *
- * First message word layout (21 bits):
- *   bits 0-11:  Service Area ID (12 bits, 0-4095)
- *   bits 12-15: Coverage Zone Count (4 bits, 0-15)
- *   bits 16-20: Traffic Management Flags (5 bits)
+ * NID System Message: the Network Address twice in the same phase,
+ * the first with the NID, the second with any vector type except the
+ * Short Message vector; R must be 0 (FLEX-93001 3.9.2, p.44). The
+ * message is decoded as any other message of its vector type.
  *
- * Traffic Management Flags:
- *   bit 16: System overload indicator
- *   bit 17: Reserved
- *   bit 18: Reserved
- *   bit 19: Reserved
- *   bit 20: Reserved
- */
-#define FLEX_NET_AREA_ID_MASK		0x0FFFU		/* bits 0-11 */
-#define FLEX_NET_AREA_ID_BITS		12
-#define FLEX_NET_COVERAGE_SHIFT		12
-#define FLEX_NET_COVERAGE_MASK		0x0FU		/* bits 12-15 */
-#define FLEX_NET_TRAFFIC_SHIFT		16
-#define FLEX_NET_TRAFFIC_MASK		0x1FU		/* bits 16-20 */
-#define FLEX_NET_OVERLOAD_BIT		(1U << 16)	/* bit 16: overload */
-
-/* Extract network message fields from first message word */
-static inline uint32_t flex_net_area_id(uint32_t mw)
-{
-	return mw & FLEX_NET_AREA_ID_MASK;
-}
-
-static inline uint32_t flex_net_coverage_zones(uint32_t mw)
-{
-	return (mw >> FLEX_NET_COVERAGE_SHIFT) & FLEX_NET_COVERAGE_MASK;
-}
-
-static inline uint32_t flex_net_traffic_flags(uint32_t mw)
-{
-	return (mw >> FLEX_NET_TRAFFIC_SHIFT) & FLEX_NET_TRAFFIC_MASK;
-}
-
-static inline int flex_net_is_overloaded(uint32_t mw)
-{
-	return (mw & FLEX_NET_OVERLOAD_BIT) ? 1 : 0;
-}
+ * System NID Change Instruction: a Secure message of type t1t0=01 on
+ * the second Network Address (FLEX-93001 3.9.7, p.48). Its data layout
+ * is in the "Secure Instructions to FLEX Pagers" document, which is not
+ * published: the data words are logged as hex. */
+#define FLEX_SECURE_T_NID_CHANGE	0x01U	/* t1t0 = 01 on a Network Address */
 
 /* ===== Operator Messaging Sub-type Classification ===== */
 
@@ -2382,13 +2354,6 @@ uint32_t flex_encode_temp_address(uint32_t temp_addr);
  * addr_offset: offset within the network range (0 to FLEX_ADDR_NETWORK_MAX - FLEX_ADDR_NETWORK_MIN).
  * Returns the encoded 32-bit BCH codeword, or 0 on invalid offset. */
 uint32_t flex_encode_network_address(uint32_t addr_offset);
-
-/* Network message payload encoding.
- * Encodes the first message word containing Service Area ID, Coverage
- * Zone Count, and Traffic Management Flags.
- * Returns the encoded 32-bit BCH codeword. */
-uint32_t flex_encode_network_payload(uint32_t area_id, uint32_t coverage_zones,
-				     uint32_t traffic_flags);
 
 /* Operator messaging address encoding.
  * Encodes an operator messaging address word from the sub-type LSB (0x00-0x0F).

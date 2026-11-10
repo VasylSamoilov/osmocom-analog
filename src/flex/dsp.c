@@ -3213,27 +3213,62 @@ parse_phase:
 				continue;
 			}
 
-			/* Network message payload parsing.
-			 * Network addresses use Secure (type 0) vectors.
-			 * First message word contains Service Area ID, Coverage
-			 * Zone Count, and Traffic Management Flags. */
-			if (aw_type == FLEX_ADDR_NETWORK &&
-			    vec_type == FLEX_VECTOR_TYPE_SECURE &&
-			    mw1 <= 87 && mw1 < FLEX_WORDS_PER_FRAME &&
-			    (ph->status[mw1] == FLEX_WORD_CLEAN ||
-			     ph->status[mw1] == FLEX_WORD_CORRECTED)) {
-				uint32_t net_mw = ph->words[mw1];
+			/* Network Address with a message vector: NID System
+			 * Message (FLEX-93001 3.9.2, p.44), decoded below as any
+			 * other message of its vector type. */
+			if (aw_type == FLEX_ADDR_NETWORK)
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
-					  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  NET area_id=%u zones=%u traffic=0x%02X%s\n",
+					  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  NET NID system message vec_type=%d\n",
 					  bitrate,
 					  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 					  phase_name, capcode,
 					  FLEX_RX_FLAG_NETWORK,
-					  flex_net_area_id(net_mw),
-					  flex_net_coverage_zones(net_mw),
-					  flex_net_traffic_flags(net_mw),
-					  flex_net_is_overloaded(net_mw) ? " OVERLOAD" : "");
-				continue;
+					  vec_type);
+
+			/* Secure t1t0=01 (data defined separately) and t1t0=11
+			 * (reserved), STD-43A 3.10.1.4 p.70: not characters and
+			 * no published layout, so the data words after the
+			 * header are logged as hex.  t1t0=01 on a Network
+			 * Address is the System NID Change Instruction
+			 * (FLEX-93001 3.9.7, p.48). */
+			if (vec_type == FLEX_VECTOR_TYPE_SECURE && mw1 <= 87 && mw2 <= 87) {
+				int sh_idx = is_long ? (j + 1) : mw1;
+				uint32_t sh_t = 0;
+				int sh_ok = sh_idx < FLEX_WORDS_PER_FRAME &&
+					    (ph->status[sh_idx] == FLEX_WORD_CLEAN ||
+					     ph->status[sh_idx] == FLEX_WORD_CORRECTED);
+
+				if (sh_ok)
+					sh_t = (ph->words[sh_idx] >> FLEX_SEC_TYPE_SHIFT) & FLEX_SEC_TYPE_MASK;
+				if (sh_ok && (sh_t == FLEX_SEC_TYPE_SEPARATE || sh_t == 3)) {
+					char hex[600];
+					int hi = 0, w;
+					int nid_change = (aw_type == FLEX_ADDR_NETWORK &&
+							  sh_t == FLEX_SECURE_T_NID_CHANGE);
+
+					hex[0] = '\0';
+					for (w = is_long ? mw1 : (mw1 + 1); w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
+						if (hi >= (int)sizeof(hex) - 8)
+							break;
+						if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
+						    ph->status[w] == FLEX_WORD_NOT_RECEIVED)
+							hi += snprintf(hex + hi, sizeof(hex) - hi, "%s??????", hi ? " " : "");
+						else
+							hi += snprintf(hex + hi, sizeof(hex) - hi, "%s%06X", hi ? " " : "",
+								       ph->words[w] & FLEX_DATA_MASK);
+					}
+					LOGP_CHAN(DDSP, LOGL_NOTICE,
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c [%09" PRIu64 "] %c  SEC t=%u%s payload=[%s]\n",
+						  bitrate,
+						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
+						  phase_name, capcode,
+						  flex_addr_type_flag(aw_type, is_long),
+						  sh_t,
+						  nid_change ? " NID change instruction" :
+						  (sh_t == 3) ? " reserved" : " data defined separately",
+						  hex);
+					continue;
+				}
 			}
 
 			/* Operator messaging payload parsing.

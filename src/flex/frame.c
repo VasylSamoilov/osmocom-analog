@@ -2176,29 +2176,6 @@ uint32_t flex_encode_network_address(uint32_t addr_offset)
 	return flex_encode_word(reverse_bits32(aw));
 }
 
-/*
- * Encode a network message payload word.
- *
- * Packs Service Area ID, Coverage Zone Count, and Traffic Management
- * Flags into a single 21-bit message word.
- *
- * Bit layout:
- *   bits 0-11:  Service Area ID (12 bits, 0-4095)
- *   bits 12-15: Coverage Zone Count (4 bits, 0-15)
- *   bits 16-20: Traffic Management Flags (5 bits)
- */
-uint32_t flex_encode_network_payload(uint32_t area_id, uint32_t coverage_zones,
-				     uint32_t traffic_flags)
-{
-	uint32_t dw = 0;
-
-	dw |= (area_id & FLEX_NET_AREA_ID_MASK);
-	dw |= ((coverage_zones & FLEX_NET_COVERAGE_MASK) << FLEX_NET_COVERAGE_SHIFT);
-	dw |= ((traffic_flags & FLEX_NET_TRAFFIC_MASK) << FLEX_NET_TRAFFIC_SHIFT);
-
-	return flex_encode_word(reverse_bits32(dw));
-}
-
 /* ===== Operator Messaging Address Encoding ===== */
 
 /*
