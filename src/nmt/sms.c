@@ -104,6 +104,8 @@
  * RP-Cause = 0x42, so we use those (they are distinguishable and interoperable). */
 #define RP_IE_USER_DATA		0x41 /* per GSM 04.11; Annex 24 figure's 0x42 is a typo */
 #define RP_IE_CAUSE		0x42
+#define RP_CAUSE_TEMPORARY_FAILURE	41	/* GSM 04.11 Table 8.4 */
+#define RP_CAUSE_INVALID_MESSAGE	95	/* invalid message, unspecified */
 
 /* SC -> MS header */
 static const char sms_header[] = {
@@ -246,18 +248,97 @@ static int encode_time(uint8_t *data, time_t timestamp, int local)
 		digit2 = 10;
 	data[length++] = (digit2 << 4) | digit1;
 
-	/* zone */
-	quarters = (local) ? (timezone / 900) : 0;
+	/* zone: the difference between local time and GMT in quarters of an
+	 * hour, two semi-octets as the other fields (units in the high nibble),
+	 * bit 3 the sign, 0 = positive (east of GMT) (Annex 24 para 2.2.3.11).
+	 * tm_gmtoff is that of the time stamp, with daylight saving. A zero
+	 * units digit is 1010 as in the other fields (para 2.1.2.3); the tens
+	 * digit has 3 bits beside the sign, so a zero there is 000. */
+	quarters = (local) ? (int)(tm->tm_gmtoff / 900) : 0;
+	sign = 0;
 	if (quarters < 0) {
 		quarters = -quarters;
 		sign = 1;
-	} else {
-		quarters = -quarters;
-		sign = 0;
 	}
-	data[length++] = (quarters << 4) | (sign << 3) | (quarters >> 4);
+	if (quarters > 79)
+		quarters = 79;
+	digit2 = quarters % 10;
+	if (digit2 == 0)
+		digit2 = 10;
+	data[length++] = (digit2 << 4) | (sign << 3) | (quarters / 10);
 
 	return length;
+}
+
+/* The characters of ASCII that are elsewhere in the GSM default alphabet
+ * (GSM 03.38; Annex 24 para 2.2.3.10): the code, or the escape 1Bh and the
+ * code of the extension table. ASCII 60h has no GSM character. */
+static const struct {
+	uint8_t ascii;
+	uint8_t escape;
+	uint8_t gsm;
+} gsm_moved[] = {
+	{ '@', 0, 0x00 }, { '$', 0, 0x02 }, { '_', 0, 0x11 },
+	{ '^', 1, 0x14 }, { '{', 1, 0x28 }, { '}', 1, 0x29 }, { '\\', 1, 0x2f },
+	{ '[', 1, 0x3c }, { '~', 1, 0x3d }, { ']', 1, 0x3e }, { '|', 1, 0x40 },
+	{ 0, 0, 0 }
+};
+
+/* ASCII characters that are the same in the GSM default alphabet */
+static int gsm_same_as_ascii(uint8_t c)
+{
+	return (c >= 0x20 && c <= 0x23) || (c >= 0x25 && c <= 0x3f)
+	    || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	    || c == 0x0a || c == 0x0d;
+}
+
+/* An ASCII character as GSM default alphabet code(s): returns 1 or 2. Other
+ * codes below 80h are taken as they are. */
+int sms_ascii_to_gsm(uint8_t c, uint8_t *out)
+{
+	int i;
+
+	for (i = 0; gsm_moved[i].ascii; i++) {
+		if (gsm_moved[i].ascii != c)
+			continue;
+		if (!gsm_moved[i].escape) {
+			out[0] = gsm_moved[i].gsm;
+			return 1;
+		}
+		out[0] = 0x1b;
+		out[1] = gsm_moved[i].gsm;
+		return 2;
+	}
+	out[0] = (c == '`') ? '?' : c;
+	return 1;
+}
+
+/* GSM default alphabet code(s) at data as an ASCII character: returns the
+ * number of codes used (1 or 2) and the character in *ascii, or 0 if there
+ * is no ASCII character for it. */
+int sms_gsm_to_ascii(const uint8_t *data, int length, char *ascii)
+{
+	int i;
+
+	if (length < 1)
+		return 0;
+	if (gsm_same_as_ascii(data[0])) {
+		*ascii = (char)data[0];
+		return 1;
+	}
+	for (i = 0; gsm_moved[i].ascii; i++) {
+		if (gsm_moved[i].escape) {
+			if (length < 2 || data[0] != 0x1b || data[1] != gsm_moved[i].gsm)
+				continue;
+			*ascii = (char)gsm_moved[i].ascii;
+			return 2;
+		}
+		if (data[0] == gsm_moved[i].gsm) {
+			*ascii = (char)gsm_moved[i].ascii;
+			return 1;
+		}
+	}
+	return 0;
 }
 
 /* encode user data */
@@ -429,6 +510,13 @@ static void sms_submit_report(nmt_t *nmt, uint8_t ref, int error)
 	/* RP */
 	data[length++] = (error) ? RP_MT_ERROR : RP_MT_ACK;
 	data[length++] = ref;
+	/* the RP-cause is always included in an RP-ERROR (Annex 24 para
+	 * 2.4.3.3): a cause of GSM 04.11 Table 8.4, the diagnostic is not used */
+	if (error) {
+		data[length++] = RP_IE_CAUSE;
+		data[length++] = 1;
+		data[length++] = (error == FSC_SC_SYSTEM_FAILURE) ? RP_CAUSE_TEMPORARY_FAILURE : RP_CAUSE_INVALID_MESSAGE;
+	}
 
 	dms_send(nmt, data, length, 1);
 }

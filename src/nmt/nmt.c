@@ -3508,15 +3508,23 @@ int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t __attr
 	snprintf(subscriber, sizeof(subscriber), "%c%s",
 		nmt->trans->subscriber.country, nmt->trans->subscriber.number);
 
-	/* Render the message for the text FIFO: printable ASCII verbatim, every
-	 * other byte (incl. 0x00 and the 8-bit NMT national letters) as <0xNN>,
+	/* Render the message for the text FIFO: the codes are those of the GSM
+	 * default alphabet (also the first 128 of the NMT 8-bit sets); the ones
+	 * that are a printable ASCII character are written as it, every other
+	 * code (incl. LF/CR, '<', and the 8-bit NMT national letters) as <0xNN>,
 	 * so no information is lost and the operator sees exactly what arrived. */
-	for (i = 0; i < msg_len && p < (int)sizeof(text) - 7; i++) {
+	for (i = 0; i < msg_len && p < (int)sizeof(text) - 13; ) {
 		uint8_t c = (uint8_t)message[i];
-		if (c >= 0x20 && c < 0x7f && c != '<')
-			text[p++] = (char)c;
-		else
+		char ascii;
+		int used = (c < 0x80) ? sms_gsm_to_ascii((const uint8_t *)message + i, msg_len - i, &ascii) : 0;
+
+		if (used && ascii >= 0x20 && ascii < 0x7f && ascii != '<') {
+			text[p++] = ascii;
+			i += used;
+		} else {
 			p += snprintf(text + p, sizeof(text) - p, "<0x%02x>", c);
+			i++;
+		}
 	}
 	text[p] = '\0';
 
@@ -3589,18 +3597,22 @@ inval:
 	LOGP(DNMT, LOGL_INFO, "SMS from '%s' for subscriber '%s' with message '%s'\n", caller_id, number, message);
 	printf("SMS sending '%s' -> '%s': %s\n", caller_id, number, message);
 
-	/* Decode <0xNN> escapes so the operator can inject any byte, including
-	 * non-printable ones and 0x00, through the text FIFO. Everything else is
-	 * copied verbatim. The result is a byte buffer with an explicit length. */
+	/* Decode <0xNN> escapes so the operator can inject any code, including
+	 * non-printable ones and 0x00, through the text FIFO. Other characters
+	 * are ASCII and become the code(s) of the GSM default alphabet ('@' is
+	 * 00h, '[' is 1Bh 3Ch, ...); an escape is the code as it is. The result
+	 * is a byte buffer with an explicit length. */
 	char msg_bytes[256];
 	int msg_len = 0;
 	{
 		const char *s = message;
-		while (*s && msg_len < (int)sizeof(msg_bytes)) {
+		while (*s && msg_len < (int)sizeof(msg_bytes) - 1) {
 			if (s[0] == '<' && (s[1] == '0') && (s[2] == 'x' || s[2] == 'X')
 			 && isxdigit((unsigned char)s[3]) && isxdigit((unsigned char)s[4]) && s[5] == '>') {
 				msg_bytes[msg_len++] = (uint8_t)strtol(s + 1, NULL, 16);
 				s += 6;
+			} else if ((uint8_t)*s < 0x80) {
+				msg_len += sms_ascii_to_gsm((uint8_t)*s++, (uint8_t *)msg_bytes + msg_len);
 			} else {
 				msg_bytes[msg_len++] = *s++;
 			}

@@ -31,4 +31,6 @@ void sms_deliver_report(nmt_t *nmt, uint8_t ref, int error, uint8_t cause);
 int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t type, uint8_t plan, time_t timestamp, int local, const char *message, int msg_len);
 void sms_release(nmt_t *nmt);
 void sms_reset(nmt_t *nmt);
+int sms_ascii_to_gsm(uint8_t c, uint8_t *out);
+int sms_gsm_to_ascii(const uint8_t *data, int length, char *ascii);
 
