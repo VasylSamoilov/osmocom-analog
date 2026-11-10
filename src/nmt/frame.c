@@ -180,7 +180,9 @@ static int nmt_decode_tc(int nmt_system, uint64_t value, int *channel, int *powe
 		}
 		*power = (value & 0x600) >> 9;
 	} else {
-		*channel = value & 0x3ff;
+		/* NMT Doc 900-1 para 4.3.3.1 Note 4: NaNbNc = 0 a10 a9 .. a0,
+		 * a10 is set for interleaved channels (1024 and up) */
+		*channel = value & 0x7ff;
 	}
 
 	return 0;
@@ -255,20 +257,31 @@ char nmt_value2digit(uint64_t value)
 	return "D1234567890*#ABC"[value & 0x0000f];
 }
 
-uint16_t nmt_encode_area_no(uint8_t area_no)
+uint16_t nmt_encode_area_no(int nmt_system, uint8_t area_no)
 {
-	switch (area_no) {
-	case 1:
-		return 0x3f3;
-	case 2:
-		return 0x3f4;
-	case 3:
-		return 0x3f5;
-	case 4:
-		return 0x3f6;
-	default:
+	if (area_no < 1 || area_no > 4)
 		return 0x000;
-	}
+
+	/* NMT-450: 3F3..3F6.
+	 * NMT-900: area 1..4 is the fictitious channel 1011..1014, coded as a
+	 * channel number (NMT Doc 900-1 para 4.3.3.11.1 and 4.3.3.1 Note 4):
+	 * bit 9 of the channel moves to bit 11, so 9F3..9F6. */
+	if (nmt_system == 900)
+		return 0x9f2 + area_no;
+	return 0x3f2 + area_no;
+}
+
+/* H8H9H10 (digits 13..15) for the area/queue code checks.
+ * NMT-900 codes the fictitious channels 1008..1014 like a channel number,
+ * so 3F0..3F6 are 9F0..9F6 there. Neither range is a valid traffic channel
+ * in the other system, so both are accepted. */
+static int special_code(const uint8_t *digits)
+{
+	int h = (digits[13] << 8) + (digits[14] << 4) + digits[15];
+
+	if (h >= 0x9f0 && h <= 0x9f6)
+		h -= 0x600;
+	return h;
 }
 
 /* convert given number to caller ID frame with given index
@@ -386,7 +399,7 @@ static struct nmt_frame {
 	{ NMT_MESSAGE_10a,	"NNNPZXXXXXXTJJJJ", MS_TO_MTX, 1,	"10a",	"Call acknowledgment from MS on calling channel and access on access channel (shortened frame)" },
 	{ NMT_MESSAGE_10b,	"NNNPZXXXXXXTYKKK", MS_TO_MTX, 1,	"10b",	"Seizure from ordinary MS and identity on traffic channel" },
 	{ NMT_MESSAGE_10c,	"NNNPZXXXXXXTYKKK", MS_TO_MTX, 6,	"10c",	"Seizure and identity from called MS on traffic channel" },
-	{ NMT_MESSAGE_10d,	"NNNPZXXXXXXTJJJJ", MS_TO_MTX, 6,	"10d",	"Call acknowledgement from MS on the alternative type of call on combined CC/TC (shortened frame)" },
+	{ NMT_MESSAGE_10d,	"NNNPZXXXXXXTJJJJ", MS_TO_MTX, 10,	"10d",	"Call acknowledgement from MS on the alternative type of call on combined CC/TC (shortened frame)" },
 	{ NMT_MESSAGE_11a,	"NNNPZXXXXXXTYKKK", MS_TO_MTX, 14,	"11a",	"Roaming updating seizure and identity on traffic channel" },
 	{ NMT_MESSAGE_11b,	"NNNPZXXXXXXTJJJJ", MS_TO_MTX, 15,	"11b",	"Seizure and call achnowledgment on calling channel from MS with priority (shortened frame)" },
 	{ NMT_MESSAGE_12,	"NNNPZXXXXXXTYKKK", MS_TO_MTX, 11,	"12",	"Seizure from coin-box on traffic channel" },
@@ -783,7 +796,8 @@ static enum nmt_mt decode_frame_mt(const uint8_t *digits, enum nmt_direction dir
 				return NMT_MESSAGE_13b;
 			return NMT_MESSAGE_13a;
 		case 9:
-			switch((digits[13] << 8) + (digits[14] << 4) + digits[15]) {
+			/* status info A(n) is digit 7 (frame 25, NMT Doc 450-1 p.31) */
+			switch (digits[7]) {
 			case 2:
 			case 6:
 				return NMT_MESSAGE_25_2;
@@ -796,7 +810,7 @@ static enum nmt_mt decode_frame_mt(const uint8_t *digits, enum nmt_direction dir
 				return NMT_MESSAGE_25_1;
 			}
 		case 10:
-			break;
+			return NMT_MESSAGE_10d;
 		case 11:
 			return NMT_MESSAGE_12;
 		case 12:
@@ -823,13 +837,17 @@ static enum nmt_mt decode_frame_mt(const uint8_t *digits, enum nmt_direction dir
 				return NMT_MESSAGE_21b;
 			return NMT_MESSAGE_4;
 		case 4:
+			/* H1(14) marks additional information of a 1b (NMT Doc 900-1
+			 * para 4.3.3.13.1); 14 is no country digit Z of a 2e */
+			if (digits[6] == 14)
+				return NMT_MESSAGE_1b;
 			if (digits[6] || digits[7] || digits[8] || digits[9] || digits[10] || digits[11] || digits[12])
 				return NMT_MESSAGE_2e;
 			return NMT_MESSAGE_1b;
 		case 5:
 			if (digits[6] == 15)
 				return NMT_MESSAGE_21c;
-			switch((digits[13] << 8) + (digits[14] << 4) + digits[15]) {
+			switch (special_code(digits)) {
 			case 0x3f3:
 			case 0x3f4:
 			case 0x3f5:
@@ -844,7 +862,7 @@ static enum nmt_mt decode_frame_mt(const uint8_t *digits, enum nmt_direction dir
 				return NMT_MESSAGE_5b;
 			return NMT_MESSAGE_5a;
 		case 7:
-			switch((digits[13] << 8) + (digits[14] << 4) + digits[15]) {
+			switch (special_code(digits)) {
 			case 0x3f3:
 			case 0x3f4:
 			case 0x3f5:
@@ -876,7 +894,7 @@ static enum nmt_mt decode_frame_mt(const uint8_t *digits, enum nmt_direction dir
 			/* info to BS (should not happen here) */
 			if (digits[6] == 15)
 				return NMT_MESSAGE_1a;
-			switch((digits[13] << 8) + (digits[14] << 4) + digits[15]) {
+			switch (special_code(digits)) {
 			case 0x3f3:
 			case 0x3f4:
 			case 0x3f5:
@@ -895,11 +913,12 @@ static enum nmt_mt decode_frame_mt(const uint8_t *digits, enum nmt_direction dir
 		case 13:
 			return NMT_MESSAGE_1a_b;
 		case 14:
-			if (digits[13] != 15)
+			/* BS indication Z(15) is digit 6 */
+			if (digits[6] != 15)
 				break;
 			return NMT_MESSAGE_22;
 		case 15:
-			if (digits[13] != 15)
+			if (digits[6] != 15)
 				break;
 			switch (digits[10]) {
 			case 3:

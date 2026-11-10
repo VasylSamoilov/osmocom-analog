@@ -813,7 +813,7 @@ static void tx_ident(nmt_t *nmt, frame_t *frame)
 	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
 	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-	frame->additional_info = nmt_encode_area_no(nmt->sysinfo.area_no);
+	frame->additional_info = nmt_encode_area_no(nmt->sysinfo.system, nmt->sysinfo.area_no);
 }
 
 static void set_line_signal(nmt_t *nmt, frame_t *frame, uint8_t signal)
@@ -991,7 +991,7 @@ static void tx_idle(nmt_t *nmt, frame_t *frame)
 	}
 	if (frame->mt == NMT_MESSAGE_1b || frame->mt == NMT_MESSAGE_4 || frame->mt == NMT_MESSAGE_4b || frame->mt == NMT_MESSAGE_30) {
 		/* sent area info on traffic channels; it is always H8H9H10, because all IEs are aligned 'to the right' */
-		frame->additional_info |= nmt_encode_area_no(nmt->sysinfo.area_no);
+		frame->additional_info |= nmt_encode_area_no(nmt->sysinfo.system, nmt->sysinfo.area_no);
 	}
 }
 
@@ -1467,7 +1467,7 @@ static void tx_mt_paging(nmt_t *nmt, frame_t *frame)
 	frame->traffic_area = nmt_encode_traffic_area(nmt->sysinfo.system, atoi(nmt->sender.kanal), nmt->sysinfo.traffic_area);
 	frame->ms_country = nmt_digits2value(&trans->subscriber.country, 1);
 	frame->ms_number = nmt_digits2value(trans->subscriber.number, 6);
-	frame->additional_info = nmt_encode_area_no(nmt->sysinfo.area_no);
+	frame->additional_info = nmt_encode_area_no(nmt->sysinfo.system, nmt->sysinfo.area_no);
 	if (++nmt->tx_frame_count == 1) {
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send call to mobile.\n");
 	} else
