@@ -335,12 +335,20 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 
 	LOGP(DSMS, LOGL_INFO, "Delivering SMS from upper layer\n");
 
-	orig_len = strlen(orig_address);
 	/* msg_len is supplied by the caller (not strlen) so a message byte 0x00 --
 	 * the GSM/NMT '@' code point -- is carried, not cut as a C-string NUL. */
 
-	if (orig_len > 24) {
-		LOGP(DSMS, LOGL_NOTICE, "Originator Address too long (%d characters)\n", orig_len);
+	/* an address field is at most 12 octets with its length and type octets
+	 * (Annex 24 para 2.1.2.5): 20 digits; characters that are no digit are
+	 * left out by encode_address() */
+	orig_len = 0;
+	for (i = 0; orig_address[i]; i++) {
+		if ((orig_address[i] >= '0' && orig_address[i] <= '9')
+		 || orig_address[i] == '*' || orig_address[i] == '#' || orig_address[i] == '+')
+			orig_len++;
+	}
+	if (orig_len > 20) {
+		LOGP(DSMS, LOGL_NOTICE, "Originator Address too long (%d digits, max 20)\n", orig_len);
 		return -EINVAL;
 	}
 

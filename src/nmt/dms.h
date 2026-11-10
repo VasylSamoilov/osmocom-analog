@@ -19,7 +19,10 @@ struct dms_state {
 	int			eight_bits;		/* what mode are used for DT frames */
 	struct dms_frame	*frame_list;		/* list of frames to transmit */
 	int			send_rr;		/* RR must be sent next */
-	int			peer_busy;		/* peer sent NR (receive-not-ready): pause new I-frames until RR */
+	int			peer_busy;		/* peer sent NR (receive-not-ready): pause new I-frames until RR, DT or T */
+	int			passes;			/* repetitions of the frames since the last ack, at most 4 */
+	int			gap_after;		/* the frame going out is followed by the 81 ms gap */
+	int			gap;			/* in the 81 ms gap: no FFSK */
 };
 
 typedef struct dms {
@@ -28,6 +31,7 @@ typedef struct dms {
 	char			tx_frame[127];		/* carries bits of one frame to transmit */
 	int			tx_frame_length;
 	int			tx_frame_pos;
+	int			tx_mute;		/* samples of speech towards the MS still closed after a frame started */
 	uint16_t		rx_sync;		/* shift register to detect sync */
 	double			rx_sync_level[256];	/* level infos */
 	double			rx_sync_quality[256];	/* quality infos */
@@ -47,6 +51,8 @@ typedef struct dms {
 
 	/* DMS protocol states */
 	struct dms_state	state;
+	struct osmo_timer_list	busy_timer;		/* T: how long a NR holds new frames back */
+	struct osmo_timer_list	gap_timer;		/* the 81 ms gap between repeated frames */
 } dms_t;
 
 int dms_init_sender(nmt_t *nmt);

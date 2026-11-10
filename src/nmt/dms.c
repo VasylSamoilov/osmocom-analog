@@ -26,7 +26,17 @@
 #include "../libmobile/get_time.h"
 #include "nmt.h"
 
-#define MUTE_DURATION		0.300	/* 200ms, and about 95ms for the frame itself */
+/* The speech path is closed for 200 ms from the start of a DMS frame (NMT Doc
+ * 450-3 Annex 21 para 6.6). The frame sync is found 11 bits (9 ms) after the
+ * start of a frame that follows another one without bit sync. */
+#define MUTE_DURATION		0.190
+#define SPEECH_CLOSED		0.200	/* from the start of a frame we send */
+/* T: a NR holds new frames back at most this long (Annex 21 Figure 1) */
+#define BUSY_TO			3,0
+/* frames of the fourth repetition are followed by 81 ms without FFSK
+ * (Annex 21 para 6.5) */
+#define GAP_TO			0,81000
+#define GAP_PASSES		4
 
 #define DMS_DOTTING		"101010101010101"
 #define DMS_SYNC		"00101000111"
@@ -221,10 +231,16 @@ static void dms_frame_add_rand(nmt_t *nmt, int eight_bits)
  */
 
 /* init instance */
-int dms_init_sender(nmt_t __attribute__((unused)) *nmt)
+static void dms_busy_timeout(void *data);
+static void dms_gap_timeout(void *data);
+
+int dms_init_sender(nmt_t *nmt)
 {
 	/* we need some simple random */
 	srandom((unsigned int)(get_time() * 1000));
+
+	osmo_timer_setup(&nmt->dms.busy_timer, dms_busy_timeout, nmt);
+	osmo_timer_setup(&nmt->dms.gap_timer, dms_gap_timeout, nmt);
 
 	return 0;
 }
@@ -238,6 +254,17 @@ void dms_cleanup_sender(nmt_t *nmt)
 /*
  * transmission of frames
  */
+
+/* A frame (DT/RR/NR) starts going out: the speech path is closed in both
+ * directions for 200 ms (Annex 21 para 6.6). */
+static void dms_close_speech(nmt_t *nmt)
+{
+	int samples = (int)((double)nmt->sender.samplerate * SPEECH_CLOSED);
+
+	nmt->dms.tx_mute = samples;
+	if (nmt->rx_mute < samples)
+		nmt->rx_mute = samples;
+}
 
 /* encode DT frame and schedule for next transmission */
 static void dms_encode_dt(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n, uint8_t *_data)
@@ -291,6 +318,7 @@ static void dms_encode_dt(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n, uint8_t *
 	dms->tx_frame_length = 127;
 	dms->tx_frame_pos = 0;
 	dms->tx_frame_valid = 1;
+	dms_close_speech(nmt);
 }
 
 /* encode RR frame and schedule for next transmission */
@@ -335,6 +363,7 @@ static void dms_encode_rr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 	dms->tx_frame_length = 77;
 	dms->tx_frame_pos = 0;
 	dms->tx_frame_valid = 1;
+	dms_close_speech(nmt);
 }
 
 /* check if we have to transmit a frame and render it
@@ -349,14 +378,15 @@ void trigger_frame_transmission(nmt_t *nmt)
 	struct dms_frame *dms_frame;
 	int i;
 
-	/* ongoing transmission, so we wait */
-	if (dms->tx_frame_valid)
+	/* ongoing transmission, or the gap after a repeated frame, so we wait */
+	if (dms->tx_frame_valid || dms->state.gap)
 		return;
 
 	/* check for RR first, because high priority */
 	if (dms->state.send_rr) {
 		LOGP(DDMS, LOGL_DEBUG, "Found pending RR(%d) frame, sending.\n", dms->state.n_r);
 		dms->state.send_rr = 0;
+		dms->state.gap_after = 0;
 		dms_encode_rr(nmt, dms->state.dir ^ 1, 1, dms->state.n_r);
 		return;
 	}
@@ -370,7 +400,12 @@ void trigger_frame_transmission(nmt_t *nmt)
 	}
 
 	/* get next frame to send */
-	/* loop 4 times, because only 4 unacked frames may be transmitted */
+	/* loop 4 times, because only 4 unacked frames may be transmitted.
+	 * Frames that are not acknowledged go out again, back to back. When they
+	 * have to be repeated a fourth time, every frame of the repetition is
+	 * followed by 81 ms without FFSK, and so on until something is acked
+	 * (Annex 21 para 6.5); the frame after a gap has the bit sync, as every
+	 * DT here. */
 	dms_frame = dms->state.frame_list;
 	for (i = 0; i < 4 && dms_frame; i++) {
 		/* stop before DT frame, if RAND was not acked */
@@ -392,6 +427,13 @@ void trigger_frame_transmission(nmt_t *nmt)
 	}
 
 	LOGP(DDMS, LOGL_DEBUG, "Found pending %cT(%d) frame, sending.\n", dms_frame->s + 'C', dms_frame->n);
+
+	dms->state.gap_after = (dms->state.passes >= GAP_PASSES);
+	/* all frames that may go went out once more (the cases below that go
+	 * back to the first frame) */
+	if ((!dms_frame->next || (!dms->state.established && dms_frame->next->s == 1) || i == 3)
+	 && dms->state.passes < GAP_PASSES)
+		dms->state.passes++;
 
 	/* sent next send state to next frame in buffer.
 	 * if there is no next frame, set it to the first frame (cycle).
@@ -417,6 +459,35 @@ void trigger_frame_transmission(nmt_t *nmt)
 	dms_encode_dt(nmt, dms->state.dir ^ 1, dms_frame->s, dms_frame->n, dms_frame->data);
 }
 
+/* The peer may take frames again: after a NR it sent an RR or a DT, or T is
+ * over (Annex 21 para 5.3 and Figure 1). */
+static void dms_peer_ready(nmt_t *nmt, const char *why)
+{
+	dms_t *dms = &nmt->dms;
+
+	if (!dms->state.peer_busy)
+		return;
+	LOGP(DDMS, LOGL_INFO, "Peer is ready again (%s), resuming transmission\n", why);
+	dms->state.peer_busy = 0;
+	osmo_timer_del(&dms->busy_timer);
+}
+
+static void dms_busy_timeout(void *data)
+{
+	nmt_t *nmt = data;
+
+	dms_peer_ready(nmt, "no RR within 3 s after NR");
+	trigger_frame_transmission(nmt);
+}
+
+static void dms_gap_timeout(void *data)
+{
+	nmt_t *nmt = data;
+
+	nmt->dms.state.gap = 0;
+	trigger_frame_transmission(nmt);
+}
+
 /* send data using FSK */
 int dms_send_bit(nmt_t *nmt)
 {
@@ -427,6 +498,13 @@ int dms_send_bit(nmt_t *nmt)
 
 	if (!dms->tx_frame_length || dms->tx_frame_pos == dms->tx_frame_length) {
 		dms->tx_frame_valid = 0;
+		/* a frame of the fourth repetition is followed by the gap */
+		if (dms->state.gap_after) {
+			dms->state.gap_after = 0;
+			dms->state.gap = 1;
+			osmo_timer_schedule(&dms->gap_timer, GAP_TO);
+			return -1;
+		}
 		trigger_frame_transmission(nmt);
 		if (!dms->tx_frame_valid)
 			return -1;
@@ -463,6 +541,9 @@ static void dms_rx_dt(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n, uint8_t *data
 		LOGP(DDMS, LOGL_INFO, "DMS frame ignored, direction indicator mismatch!\n");
 		return;
 	}
+
+	/* a DT of the peer also ends its NR */
+	dms_peer_ready(nmt, "DT after NR");
 
 	if (dms->state.n_r != n) {
 		/* ignore out of sequence frames */
@@ -546,6 +627,9 @@ static int dms_ack_upto(nmt_t *nmt, uint8_t n)
 	if (!dms_frame || i == 4)
 		return 0;
 
+	/* the repetitions count again */
+	dms->state.passes = 0;
+
 	/* flush all acked frames. */
 	dms_frame = dms->state.frame_list;
 	for (j = 0; j <= i; j++) {
@@ -569,6 +653,33 @@ static int dms_ack_upto(nmt_t *nmt, uint8_t n)
 	return 1;
 }
 
+/* An RR/NR(n) that acknowledges nothing (Annex 21 Figure 1, note 2): n = NTX
+ * to NTX+4 refers to the frames under transmission and the next one, n =
+ * NTX-1 to NTX-3 to previous frames. Those are gone from the list, so the
+ * peer lost count: transmission is restarted with NTX = n, the frames that
+ * are not acknowledged are numbered again from n. */
+static void dms_restart_from(nmt_t *nmt, uint8_t n)
+{
+	dms_t *dms = &nmt->dms;
+	struct dms_frame *dms_frame;
+	uint8_t first, next;
+
+	first = dms->state.frame_list ? dms->state.frame_list->n : dms->state.n_count;
+	if (((n - first) & 7) <= 4)
+		return;
+
+	LOGP(DDMS, LOGL_NOTICE, "Peer expects DT(%d), but frames from #%d are pending: restarting with #%d\n", n, first, n);
+	next = n;
+	for (dms_frame = dms->state.frame_list; dms_frame; dms_frame = dms_frame->next) {
+		dms_frame->n = next;
+		next = (next + 1) & 7;
+	}
+	dms->state.n_count = next;
+	dms->state.n_a = n;
+	dms->state.n_s = n;
+	dms->state.passes = 0;
+}
+
 /* decode RR frame from mobile */
 static void dms_rx_rr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 {
@@ -583,18 +694,18 @@ static void dms_rx_rr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 		return;
 	}
 
+	/* any RR clears the peer-busy condition signalled by NR (Figure 1:
+	 * RR(N) -> HOLD = 0), also one that acknowledges nothing new */
+	dms_peer_ready(nmt, "RR after NR");
+
 	if (!dms_ack_upto(nmt, n)) {
-		LOGP(DDMS, LOGL_DEBUG, "Received already acked DMS frame: RR(%d) (s = %d), ignoring\n", n, s);
+		LOGP(DDMS, LOGL_DEBUG, "Received DMS frame RR(%d) (s = %d) that acknowledges nothing\n", n, s);
+		dms_restart_from(nmt, n);
+		trigger_frame_transmission(nmt);
 		return;
 	}
 
 	LOGP(DDMS, LOGL_INFO, "Received valid DMS frame: RR(%d) (s = %d)\n", n, s);
-
-	/* RR clears any peer-busy condition previously signalled by NR */
-	if (dms->state.peer_busy) {
-		LOGP(DDMS, LOGL_INFO, "Peer is ready again (RR after NR), resuming transmission\n");
-		dms->state.peer_busy = 0;
-	}
 
 	/* now trigger frame transmission */
 	trigger_frame_transmission(nmt);
@@ -620,15 +731,18 @@ static void dms_rx_nr(nmt_t *nmt, uint8_t d, uint8_t s, uint8_t n)
 
 	LOGP(DDMS, LOGL_INFO, "Received valid DMS frame: NR(%d) (s = %d)\n", n, s);
 
-	/* process the acknowledgement part (ignored if already acked) */
-	dms_ack_upto(nmt, n);
+	/* process the acknowledgement part */
+	if (!dms_ack_upto(nmt, n))
+		dms_restart_from(nmt, n);
 
 	/* set the peer-busy condition: trigger_frame_transmission() will hold back
-	 * new I-frames (but still honour a pending RR) until an RR clears it. */
+	 * new I-frames (but still honour a pending RR) until an RR or a DT clears
+	 * it, or T is over; every NR starts T again */
 	if (!dms->state.peer_busy) {
 		LOGP(DDMS, LOGL_INFO, "Peer signalled not-ready (NR), pausing new frame transmission\n");
 		dms->state.peer_busy = 1;
 	}
+	osmo_timer_schedule(&dms->busy_timer, BUSY_TO);
 
 	/* still process the queue: a pending RR may need sending, and any
 	 * acknowledged frames were just flushed. */
@@ -882,9 +996,12 @@ void dms_reset(nmt_t *nmt)
 	LOGP(DDMS, LOGL_DEBUG, "Resetting DMS states\n");
 
 	dms->rx_in_sync = 0;
+	osmo_timer_del(&dms->busy_timer);
+	osmo_timer_del(&dms->gap_timer);
 	memset(&dms->state, 0, sizeof(dms->state));
 
 	dms->tx_frame_valid = 0;
+	dms->tx_mute = 0;
 
 	while (dms->state.frame_list)
 		dms_frame_delete(nmt, dms->state.frame_list);

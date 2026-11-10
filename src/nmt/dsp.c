@@ -500,7 +500,16 @@ again:
 		/* send after dejitter, so audio is flushed */
 		if (nmt->dms.tx_frame_valid) {
 			fsk_mod_send(&nmt->fsk_mod, samples, length, 0);
+			nmt->dms.tx_mute = (nmt->dms.tx_mute > length) ? nmt->dms.tx_mute - length : 0;
 			break;
+		}
+		/* the speech stays closed for 200 ms from the start of a DMS
+		 * frame (NMT Doc 450-3 Annex 21 para 6.6) */
+		if (nmt->dms.tx_mute > 0) {
+			int muted = (nmt->dms.tx_mute < length) ? nmt->dms.tx_mute : length;
+
+			memset(samples, 0, muted * sizeof(*samples));
+			nmt->dms.tx_mute -= muted;
 		}
 		if (nmt->supervisory)
 			super_encode(nmt, samples, length);
