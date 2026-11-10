@@ -496,6 +496,20 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 	return 0;
 }
 
+/* a relay layer answer of two octets (SC->MS): header, message type and
+ * reference number */
+static void sms_rp_answer(nmt_t *nmt, uint8_t type, uint8_t ref)
+{
+	uint8_t data[32];
+	int length;
+
+	length = encode_header(data);
+	data[length++] = type;
+	data[length++] = ref;
+
+	dms_send(nmt, data, length, 1);
+}
+
 /* report SMS (SC->MS) */
 static void sms_submit_report(nmt_t *nmt, uint8_t ref, int error)
 {
@@ -887,11 +901,17 @@ release:
 		rc = 0;
 		break;
 	case RP_SM_MEMORY_AVAILABLE:
-		LOGP(DSMS, LOGL_NOTICE, "Received MEMORY-AVAILABLE message.\n");
+		/* answered with RP-ACK, no messages are waiting here (Annex 24
+		 * para 3.4); we release after the answer */
+		LOGP(DSMS, LOGL_NOTICE, "Received MEMORY-AVAILABLE message, answering with RP-ACK.\n");
+		sms_rp_answer(nmt, RP_MT_ACK, data[1]);
 		rc = 0;
 		break;
 	case RP_SM_READY_TO_RECEIVE:
-		LOGP(DSMS, LOGL_NOTICE, "Received READY-TO-RECEIVE message.\n");
+		/* the MS asks for waiting messages: SMS-NO-MESSAGES (Annex 24
+		 * para 3.3); we release after the answer */
+		LOGP(DSMS, LOGL_NOTICE, "Received READY-TO-RECEIVE message, answering with SMS-NO-MESSAGES.\n");
+		sms_rp_answer(nmt, RP_SM_NO_MESSAGE, data[1]);
 		rc = 0;
 		break;
 	default:

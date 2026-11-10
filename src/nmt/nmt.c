@@ -1780,7 +1780,9 @@ static void tx_mo_complete(nmt_t *nmt, frame_t *frame)
 		if (nmt->tx_frame_count == 1)
 			LOGP_CHAN(DNMT, LOGL_INFO, "Send 'address complete'.\n");
 	} else {
-		if (nmt->compandor) {
+		/* a short message call has no speech: no compandor order, as
+		 * for a short message to the MS */
+		if (nmt->compandor && !trans->dms_call) {
 			set_line_signal(nmt, frame, 5);
 			if (nmt->tx_frame_count == 5)
 				LOGP_CHAN(DNMT, LOGL_INFO, "Send 'compandor in'.\n");
