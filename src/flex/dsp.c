@@ -1432,9 +1432,11 @@ static int reasm_append(flex_t *flex, int slot, const char *text, int text_len)
  * Per §4.2 ①: once an address begins transmitting a fragmented message,
  * that same address must not start a new fragmented transmission until
  * the first has been completed.  Therefore, if we receive a new initial
- * fragment (F=11, C=1) or a complete unfragmented message (F=11, C=0)
- * for a capcode that has an active reassembly slot, the previous fragment
- * stream was abandoned (lost fragments on air).
+ * fragment (F=11, C=1) for a capcode that has an active reassembly slot of
+ * another message number, the previous fragment stream was abandoned (lost
+ * fragments on air).  A complete unfragmented message (F=11, C=0) does not
+ * abandon it: the address can have one in a frame while it sends a
+ * fragmented message (STD-43A 3.8.5 (3), 4.2.3).
  *
  * Behavior: log the partial content at NOTICE level (same as reasm_expire
  * timeout path — both represent incomplete fragment streams) and deactivate
@@ -1533,27 +1535,10 @@ static void reasm_expire(flex_t *flex)
 
 /* ---- Message History operations (Req 17) ---- */
 
-/* Find existing entry matching primary key (capcode, N, vec_type, phase).
- * Returns pointer to matching entry, or NULL if not found. */
-static flex_rx_msg_entry_t *msg_history_find(flex_t *flex,
-    uint64_t capcode, int msg_num, int vec_type, int rx_phase)
-{
-	int pol = flex->rx.polarity;
-	int i;
-	for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
-		flex_rx_msg_entry_t *e = &flex->rx.msg_history[pol][i];
-		if (e->active &&
-		    e->capcode == capcode &&
-		    e->msg_num == msg_num &&
-		    e->vec_type == vec_type &&
-		    e->rx_phase == rx_phase)
-			return e;
-	}
-	return NULL;
-}
+static uint32_t flex_rx_retransmission_mask(int vec_type, int is_long, int index);
 
 /* Validate that a found entry matches the incoming message's parameters.
- * Returns 1 if all validation fields match, 0 if N collision detected. */
+ * Returns 1 if all validation fields match, 0 otherwise. */
 static int msg_history_validate(const flex_rx_msg_entry_t *entry,
     int word_count, int frag_count, int is_long, int blocking)
 {
@@ -1563,8 +1548,45 @@ static int msg_history_validate(const flex_rx_msg_entry_t *entry,
 		entry->blocking == blocking);
 }
 
-/* Store or replace entry. Evicts oldest by frame_abs when at capacity.
- * If an entry with the same primary key exists, it is replaced.
+/* Find a stored copy of a message among the messages of the capcode: the same
+ * N, vector, phase and length, and the same words (K and R apart, words lost
+ * in either copy not compared).  Returns NULL if there is none. */
+static flex_rx_msg_entry_t *msg_history_find(flex_t *flex,
+    uint64_t capcode, int msg_num, int vec_type, int rx_phase,
+    const uint32_t *words, const enum flex_word_status *status,
+    int word_count, int frag_count, int is_long, int blocking)
+{
+	int pol = flex->rx.polarity;
+	int i, w;
+
+	for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
+		flex_rx_msg_entry_t *e = &flex->rx.msg_history[pol][i];
+		int same = 1;
+
+		if (!e->active || e->capcode != capcode || e->msg_num != msg_num ||
+		    e->vec_type != vec_type || e->rx_phase != rx_phase ||
+		    !msg_history_validate(e, word_count, frag_count, is_long, blocking))
+			continue;
+
+		for (w = 0; same && w < word_count && w < FLEX_RX_MSG_MAX_WORDS; w++) {
+			int stored_ok = (e->word_status[w] == FLEX_WORD_CLEAN ||
+					 e->word_status[w] == FLEX_WORD_CORRECTED);
+			int this_ok = (status[w] == FLEX_WORD_CLEAN || status[w] == FLEX_WORD_CORRECTED);
+			uint32_t mask = flex_rx_retransmission_mask(vec_type, is_long, w);
+
+			if (stored_ok && this_ok && ((e->words[w] & mask) != (words[w] & mask)))
+				same = 0;
+		}
+
+		if (same)
+			return e;
+	}
+	return NULL;
+}
+
+/* Store a message of a capcode.  A capcode keeps its last FLEX_RX_MSG_BACKLOG
+ * messages: the oldest of its own is replaced when it has as many, else a free
+ * entry, else the oldest entry of all.
  * Returns pointer to the stored entry. */
 static flex_rx_msg_entry_t *msg_history_store(flex_t *flex,
     uint64_t capcode, int msg_num, int vec_type, int rx_phase,
@@ -1575,9 +1597,25 @@ static flex_rx_msg_entry_t *msg_history_store(flex_t *flex,
 	int pol = flex->rx.polarity;
 	int i;
 	flex_rx_msg_entry_t *target = NULL;
+	int own = 0, own_oldest = -1;
+	uint32_t own_oldest_age = 0;
 
-	/* First, check if an entry with the same key already exists */
-	target = msg_history_find(flex, capcode, msg_num, vec_type, rx_phase);
+	for (i = 0; i < FLEX_RX_MSG_HISTORY_MAX; i++) {
+		flex_rx_msg_entry_t *e = &flex->rx.msg_history[pol][i];
+		uint32_t age;
+
+		if (!e->active || e->capcode != capcode)
+			continue;
+		own++;
+		age = (frame_abs - e->frame_abs + 1920) % 1920;
+		if (own_oldest < 0 || age > own_oldest_age) {
+			own_oldest_age = age;
+			own_oldest = i;
+		}
+	}
+
+	if (own >= FLEX_RX_MSG_BACKLOG && own_oldest >= 0)
+		target = &flex->rx.msg_history[pol][own_oldest];
 
 	if (!target) {
 		/* Find an inactive slot */
@@ -1749,64 +1787,141 @@ static int flex_rx_subframe_combine(flex_t *flex,
 	return remaining_uc;
 }
 
-/* Check whether an incoming message is a retransmission of a previously
- * received message and decide how to handle it.
+/* Message number sequence of an address (STD-43A 3.10.1.3 N and R, 4.3.7): the
+ * numbers of the messages with R=1 ascend by one up to the largest number of
+ * the network (--max-message-number), then 0 again.  A number further on tells
+ * that messages were missed; the same number again is a copy of the last
+ * message.  Messages with R=0 are out of the sequence.  out: ",missed=a b ..."
+ * (as received, N), empty if none. */
+static void flex_rx_check_sequence(flex_t *flex, uint64_t capcode, int n, int r,
+				   uint32_t frame_abs, char *out, size_t size)
+{
+	flex_rx_seq_entry_t *seq = flex->rx.msg_sequence[flex->rx.polarity];
+	flex_rx_seq_entry_t *entry = NULL;
+	int i;
+
+	out[0] = '\0';
+	if (!r || n < 0)
+		return;
+
+	for (i = 0; i < FLEX_RX_SEQ_MAX; i++) {
+		if (seq[i].active && seq[i].capcode == capcode) {
+			entry = &seq[i];
+			break;
+		}
+	}
+
+	if (entry) {
+		/* A number above the largest of the setting: the network counts
+		 * further, 63 at most */
+		int modulus = flex->max_message_number;
+		int m, len = 0;
+
+		if (n > modulus)
+			modulus = n;
+		if (entry->n > modulus)
+			modulus = entry->n;
+		modulus++;
+
+		if (n != entry->n) {
+			for (m = (entry->n + 1) % modulus; m != n; m = (m + 1) % modulus) {
+				if (len == 0)
+					len += snprintf(out + len, size - len, ",missed=%d", m);
+				else if ((size_t)len + 8 < size)
+					len += snprintf(out + len, size - len, " %d", m);
+			}
+		}
+
+		entry->n = n;
+		entry->frame_abs = frame_abs;
+		return;
+	}
+
+	/* A new address: a free entry, else the one heard of longest ago */
+	{
+		uint32_t oldest_age = 0;
+		int slot = -1, oldest = 0;
+
+		for (i = 0; i < FLEX_RX_SEQ_MAX && slot < 0; i++) {
+			if (!seq[i].active)
+				slot = i;
+		}
+		if (slot < 0) {
+			for (i = 0; i < FLEX_RX_SEQ_MAX; i++) {
+				uint32_t age = (frame_abs - seq[i].frame_abs + 1920) % 1920;
+				if (age > oldest_age) {
+					oldest_age = age;
+					oldest = i;
+				}
+			}
+			slot = oldest;
+		}
+		seq[slot].capcode = capcode;
+		seq[slot].n = n;
+		seq[slot].frame_abs = frame_abs;
+		seq[slot].active = 1;
+	}
+}
+
+/* Bits of a message word that are the same in a retransmission of the message:
+ * all but the checksum K and the retrieval flag R, which is 0 in a
+ * retransmission (STD-43A 3.10.1.1 to 3.10.1.3, 4.3.7.6).  words start at
+ * mw1: the first header word of a long address is in the vector field. */
+static uint32_t flex_rx_retransmission_mask(int vec_type, int is_long, int index)
+{
+	switch (vec_type) {
+	case FLEX_VECTOR_TYPE_ALPHA:	/* header: K bits 0-9, R bit 19 */
+		return (!is_long && index == 0) ? ~(FLEX_ALPHA_HDR_K_MASK | FLEX_ALPHA_HDR_R_MASK) : 0x1FFFFF;
+	case FLEX_VECTOR_TYPE_HEX_BINARY:	/* header 1: K bits 0-11, header 2: R bit 0 */
+		if (!is_long)
+			return (index == 0) ? ~FLEX_HEX_HDR_K_MASK : (index == 1) ? ~FLEX_HEX_HDR2_R_MASK : 0x1FFFFF;
+		return (index == 0) ? ~FLEX_HEX_HDR2_R_MASK : 0x1FFFFF;
+	case FLEX_VECTOR_TYPE_NUMBERED_NUM:	/* first word: K bits 0-1, R bit 8 */
+		return (!is_long && index == 0) ? ~(0x3U | (FLEX_NUM_R_MASK << FLEX_NUM_R_SHIFT)) : 0x1FFFFF;
+	default:
+		return 0x1FFFFF;
+	}
+}
+
+/* Check whether an incoming message is a copy of a message received before and
+ * decide how to handle it.  As a pager, the receiver keeps the last
+ * FLEX_RX_MSG_BACKLOG messages of each capcode (within the window) and takes a
+ * message that is one of them again as a duplicate: the same message number,
+ * vector, length and words (K and R apart, words lost in either copy not
+ * compared).  R=0 alone does not make a retransmission: a network without
+ * message numbering sends every message with N=0 and R=0 (STD-43A 8.4); a
+ * numbered message sent again with a new number is a new message.
  *
  * Returns:
- *   0  — output message normally (new message, N collision, or first reception)
- *   1  — suppress (duplicate of complete message, or no improvement)
- *  -1  — re-decode with recovered words from entry->words[] */
+ *   0  - output message normally (new message, or first reception)
+ *   1  - suppress (duplicate of complete message, or no improvement)
+ *  -1  - re-decode with recovered words from flex->rx.msg_history_match */
 static int flex_rx_check_retransmission(flex_t *flex,
     uint64_t capcode, int r_flag, int msg_num, int vec_type, int rx_phase,
     const uint32_t *words, const enum flex_word_status *status,
     int word_count, int frag_count, int is_long, int blocking,
     uint32_t frame_abs)
 {
-	/* R=1: always new message */
-	if (r_flag == 1) {
-		msg_history_store(flex, capcode, msg_num, vec_type, rx_phase,
-				  words, status, word_count, frag_count,
-				  is_long, blocking, frame_abs);
-		return 0; /* not a retransmission, output normally */
-	}
+	flex_rx_msg_entry_t *entry = msg_history_find(flex, capcode, msg_num, vec_type, rx_phase,
+						      words, status, word_count, frag_count,
+						      is_long, blocking);
 
-	/* R=0: check history by primary key */
-	flex_rx_msg_entry_t *entry = msg_history_find(flex, capcode, msg_num,
-						      vec_type, rx_phase);
+	flex->rx.msg_history_match = entry;
 
 	if (!entry) {
-		/* No match — first reception (original missed). Store and output. */
+		/* A new message of the capcode: remembered */
 		msg_history_store(flex, capcode, msg_num, vec_type, rx_phase,
 				  words, status, word_count, frag_count,
 				  is_long, blocking, frame_abs);
 		return 0;
 	}
 
-	/* Key matched — validate that this is truly the same message
-	 * (not an N collision where the same N was reused for a different message) */
-	if (!msg_history_validate(entry, word_count, frag_count, is_long, blocking)) {
-		/* Validation failed: N collision. Treat as new message. */
-		LOGP(DFLEX, LOGL_DEBUG,
-		     "RX_N_COLLISION: capcode=%" PRIu64 " N=%d vec_type=%d phase=%d "
-		     "word_count %d!=%d or frag_count %d!=%d or is_long %d!=%d "
-		     "or blocking %d!=%d\n",
-		     capcode, msg_num, vec_type, rx_phase,
-		     word_count, entry->word_count,
-		     frag_count, entry->frag_count,
-		     is_long, entry->is_long,
-		     blocking, entry->blocking);
-		msg_history_store(flex, capcode, msg_num, vec_type, rx_phase,
-				  words, status, word_count, frag_count,
-				  is_long, blocking, frame_abs);
-		return 0; /* output as new message */
-	}
-
 	if (!entry->has_uncorrectable) {
 		/* Original was complete — suppress duplicate */
 		LOGP(DFLEX, LOGL_NOTICE,
-		     "RX_DUP_SUPPRESS: capcode=%" PRIu64 " N=%d vec_type=%d "
+		     "RX_DUP_SUPPRESS: capcode=%" PRIu64 " N=%d R=%d vec_type=%d "
 		     "phase=%d frame=%u\n",
-		     capcode, msg_num, vec_type, rx_phase, frame_abs);
+		     capcode, msg_num, r_flag, vec_type, rx_phase, frame_abs);
 		return 1; /* suppress */
 	}
 
@@ -3502,10 +3617,12 @@ parse_phase:
 						  nid_change ? " NID change instruction" : "",
 						  shex);
 
-					/* Fragments joined end to end in a reassembly slot */
-					if (sh_c == 0 && sh_initial) {
-						reasm_invalidate_capcode(flex, capcode, -1);
-					} else if (sh_c && sh_initial) {
+					/* Fragments joined end to end in a reassembly slot. A
+					 * complete message leaves a reassembly of the capcode
+					 * open: the address can have an unfragmented message
+					 * while it sends a fragmented one (STD-43A 3.8.5 (3),
+					 * 4.2.3) */
+					if (sh_c && sh_initial) {
 						int slot;
 
 						reasm_invalidate_capcode(flex, capcode, sh_n);
@@ -3849,13 +3966,12 @@ parse_phase:
 					}
 				}
 
-				/* Retransmission check for alpha messages.
-				 * Only applies to initial fragments (F=11) which
-				 * carry R and N flags.  Continuation/final fragments
-				 * have U₀/V₀ in bits 19-20 instead of R/M.
-				 * Secure (V=000) does not carry R/N — skip. */
+				/* Duplicates and retransmissions of alphanumeric and secure
+				 * messages, on the initial fragment (F=11): as a pager, the
+				 * receiver keeps the last messages of each capcode.  Secure
+				 * messages have no R (0) */
 				int alpha_recovered = 0;
-				if (hdr_f == 3 && vec_type == FLEX_VECTOR_TYPE_ALPHA) {
+				if (hdr_f == 3) {
 					int rx_phase_idx = phase_name - 'A';
 					uint32_t frame_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
 					int alpha_wc = mw2 - mw1 + 1;
@@ -3865,16 +3981,16 @@ parse_phase:
 						&ph->words[mw1], &ph->status[mw1],
 						alpha_wc, alpha_frag_count, is_long, 0,
 						frame_abs);
-					if (retx == 1) {
-						/* Suppress duplicate */
+					if (retx == 1 && hdr_c == 0) {
+						/* Suppress duplicate.  The first fragment of a message
+						 * sent in fragments goes on: its fragments follow */
 						continue;
 					}
 					if (retx == -1) {
 						/* Re-decode with recovered words from history entry.
 						 * Copy recovered words back into phase data so the
 						 * normal decode path uses the improved data. */
-						flex_rx_msg_entry_t *entry = msg_history_find(flex,
-							capcode, hdr_n, vec_type, rx_phase_idx);
+						flex_rx_msg_entry_t *entry = flex->rx.msg_history_match;
 						if (entry) {
 							int copy_n = alpha_wc;
 							if (copy_n > entry->word_count)
@@ -4228,8 +4344,16 @@ parse_phase:
 						snprintf(uv_status, sizeof(uv_status), ",U=%d,V=%d%s",
 							 hdr_u, hdr_v, nul_error ? ",NUL=error" : "");
 
+					/* The place of the message in the sequence of the address:
+					 * R is in the first fragment; group messages have no number */
+					char alpha_missed[160] = "";
+					if (is_initial && vec_type == FLEX_VECTOR_TYPE_ALPHA && grp_tag[0] == '\0')
+						flex_rx_check_sequence(flex, capcode, hdr_n, hdr_r,
+								       flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame,
+								       alpha_missed, sizeof(alpha_missed));
+
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d%s%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d%s%s%s%s%s [%09" PRIu64 "] %c%c %s \"%s\" {%s}\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -4242,6 +4366,7 @@ parse_phase:
 						  "frag_end",
 						  hdr_n, hdr_r, hdr_m,
 						  uv_status,
+						  alpha_missed,
 						  alpha_sig_status,
 						  alpha_k_status,
 						  alpha_recovered ? ",RX_RECOVERED" : "",
@@ -4420,12 +4545,10 @@ parse_phase:
 						}
 					}
 					/* frag_flag == 'K': complete (unfragmented) message.
-					 * Per §4.2 ①: if this capcode had an active
-					 * reassembly slot, the previous fragment stream
-					 * was abandoned — invalidate it. */
-					if (frag_flag == 'K') {
-						reasm_invalidate_capcode(flex, capcode, -1);
-					}
+					 * A reassembly of the capcode stays open: the address
+					 * can have an unfragmented message while it sends a
+					 * fragmented one (STD-43A 3.8.5 (3), 4.2.3). Only a
+					 * new first fragment abandons it (4.2 (1)). */
 				}
 			} else if (vec_type == FLEX_VECTOR_TYPE_NUMERIC ||
 				   vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM ||
@@ -4500,11 +4623,13 @@ parse_phase:
 						(vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM) ?
 							(num_s ? "NSNUM" : "NNUM") : "NUM";
 
-					/* Retransmission check for numbered numeric (V=111).
-					 * Standard numeric (V=011) and special numeric (V=100)
-					 * do not carry R/N flags — pass through unchanged. */
+					/* Duplicates and retransmissions of numeric messages: as a
+					 * pager, the receiver keeps the last messages of each
+					 * capcode; standard (V=011) and special (V=100) numeric
+					 * messages have no N (-1) and are told apart by content */
 					int num_recovered = 0;
-					if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM && num_n >= 0) {
+					if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM || vec_type == FLEX_VECTOR_TYPE_NUMERIC ||
+					    vec_type == FLEX_VECTOR_TYPE_SPECIAL_NUM) {
 						int rx_phase_idx = phase_name - 'A';
 						uint32_t frame_abs = flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame;
 						int num_wc = mw2 - mw1 + 1;
@@ -4519,8 +4644,7 @@ parse_phase:
 						}
 						if (retx == -1) {
 							/* Re-decode with recovered words */
-							flex_rx_msg_entry_t *entry = msg_history_find(flex,
-								capcode, num_n, vec_type, rx_phase_idx);
+							flex_rx_msg_entry_t *entry = flex->rx.msg_history_match;
 							if (entry) {
 								int copy_n = num_wc;
 								if (copy_n > entry->word_count)
@@ -4672,8 +4796,13 @@ parse_phase:
 
 						/* Output with subtype tag and optional sequencing fields */
 						if (vec_type == FLEX_VECTOR_TYPE_NUMBERED_NUM && num_n >= 0) {
+							char num_missed[160] = "";
+							if (grp_tag[0] == '\0')
+								flex_rx_check_sequence(flex, capcode, num_n, num_r,
+										       flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame,
+										       num_missed, sizeof(num_missed));
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s%s [%09" PRIu64 "] %c%c %s N=%d,R=%d,S=%d \"%s\"\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s%s%s [%09" PRIu64 "] %c%c %s N=%d,R=%d,S=%d \"%s\"\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -4682,6 +4811,7 @@ parse_phase:
 								  flex->rx.polarity ? "inverted" : "normal",
 								  grp_tag,
 								  num_k_status,
+								  num_missed,
 								  num_recovered ? ",RX_RECOVERED" : "",
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
@@ -4862,8 +4992,13 @@ parse_phase:
 							   & FLEX_SMSG_NUMB_N_MASK;
 						uint32_t r = (d_field >> FLEX_SMSG_NUMB_R_SHIFT)
 							   & FLEX_SMSG_NUMB_R_MASK;
+						char smsg_missed[160] = "";
+						if (grp_tag[0] == '\0')
+							flex_rx_check_sequence(flex, capcode, (int)n, (int)r,
+									       flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame,
+									       smsg_missed, sizeof(smsg_missed));
 						LOGP_CHAN(DDSP, LOGL_NOTICE,
-							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s [%09" PRIu64 "] %c%c SMSG %s S=%u N=%u R=%u\n",
+							  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s%s [%09" PRIu64 "] %c%c SMSG %s S=%u N=%u R=%u\n",
 							  bitrate,
 							  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 							  phase_name,
@@ -4871,6 +5006,7 @@ parse_phase:
 							  flex->rx.sync_levels,
 							  flex->rx.polarity ? "inverted" : "normal",
 							  grp_tag,
+							  smsg_missed,
 							  capcode,
 							  flex_addr_type_flag(aw_type, is_long),
 							  prio_flag,
@@ -5060,14 +5196,15 @@ parse_phase:
 							&ph->words[mw1], &ph->status[mw1],
 							hex_wc, hex_frag_count, is_long, hex_blocking,
 							frame_abs);
-						if (retx == 1) {
-							/* Suppress duplicate */
+						if (retx == 1 && hex_c == 0) {
+							/* Suppress duplicate.  The first fragment of a
+							 * message sent in fragments goes on: its
+							 * fragments follow */
 							continue;
 						}
 						if (retx == -1) {
 							/* Re-decode with recovered words */
-							flex_rx_msg_entry_t *entry = msg_history_find(flex,
-								capcode, hex_n, vec_type, rx_phase_idx);
+							flex_rx_msg_entry_t *entry = flex->rx.msg_history_match;
 							if (entry) {
 								int copy_n = hex_wc;
 								if (copy_n > entry->word_count)
@@ -5246,9 +5383,17 @@ parse_phase:
 						 term_state == 1 ? ",fill=inconsistent" :
 						 term_state == 2 ? ",fill=unknown" : "");
 
+					/* The place of the message in the sequence of the address
+					 * (R in header word 2 of the first fragment) */
+					char hex_missed[160] = "";
+					if (hex_is_initial && grp_tag[0] == '\0')
+						flex_rx_check_sequence(flex, capcode, hex_n, hex_r,
+								       flex->rx.fiw_cycle * 128 + flex->rx.fiw_frame,
+								       hex_missed, sizeof(hex_missed));
+
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d%s%s%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d%s%s%s%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -5266,6 +5411,7 @@ parse_phase:
 						  hex_status_info,
 						  hex_rsv_s,
 						  hex_bits_info,
+						  hex_missed,
 						  hex_k_status,
 						  hex_sig_status,
 						  hex_recovered ? ",RX_RECOVERED" : "",
@@ -5370,12 +5516,9 @@ parse_phase:
 						}
 					}
 					/* hex_frag_flag == 'K': complete (unfragmented) message.
-					 * Per §4.2 ①: if this capcode had an active
-					 * reassembly slot, the previous fragment stream
-					 * was abandoned — invalidate it. */
-					if (hex_frag_flag == 'K') {
-						reasm_invalidate_capcode(flex, capcode, -1);
-					}
+					 * A reassembly of the capcode stays open (STD-43A
+					 * 3.8.5 (3), 4.2.3); only a new first fragment
+					 * abandons it (4.2 (1)). */
 				}
 			} else {
 				LOGP_CHAN(DDSP, LOGL_DEBUG,

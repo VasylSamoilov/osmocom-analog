@@ -40,9 +40,13 @@ typedef struct flex_rx_subframe_store {
 	int			active;			/* 1 = accumulating subframes */
 } flex_rx_subframe_store_t;
 
-/* Message history for RX retransmission detection (Req 17-18) */
-#define FLEX_RX_MSG_HISTORY_MAX		256
-#define FLEX_RX_MSG_HISTORY_WINDOW	1920	/* frames (1 hour) */
+/* Message history for RX duplicates and retransmissions (Req 17-18): as a
+ * pager, the last FLEX_RX_MSG_BACKLOG messages of each capcode, within the
+ * window.  The window is shorter than the hour of the frame numbering (1920
+ * frames), so that the age of an entry is not ambiguous */
+#define FLEX_RX_MSG_HISTORY_MAX		1024
+#define FLEX_RX_MSG_BACKLOG		16	/* messages of a capcode */
+#define FLEX_RX_MSG_HISTORY_WINDOW	960	/* frames (30 minutes) */
 #define FLEX_RX_MSG_MAX_WORDS		88	/* max words per message */
 
 typedef struct flex_rx_msg_entry {
@@ -67,6 +71,15 @@ typedef struct flex_rx_msg_entry {
 	uint32_t		frame_abs;		/* absolute frame when stored */
 	int			active;			/* 1 = entry in use */
 } flex_rx_msg_entry_t;
+
+/* Message number sequence of an address on RX */
+#define FLEX_RX_SEQ_MAX			1024
+typedef struct flex_rx_seq_entry {
+	uint64_t		capcode;
+	int			n;			/* last number with R=1 */
+	uint32_t		frame_abs;		/* absolute frame of that message */
+	int			active;
+} flex_rx_seq_entry_t;
 
 /* Forward declarations */
 struct flex;
@@ -197,6 +210,7 @@ typedef struct flex_msg {
 	int			send_delay;		/* frames to defer initial TX (0-1920, default 0) */
 	uint32_t		next_send_frame;	/* absolute frame (cycle*128+frame) for next eligibility */
 	int			assigned_n;		/* N assigned at initial TX (-1=unassigned, 0-63) */
+	int			assigned_r;		/* R of the initial TX (one-shot passes) */
 
 	/* System message transmission method (§3.9.2, Fig. 3.7.2-2).
 	 *   'a' = BIW101 only (no operator address, vector at end of VF)
@@ -225,6 +239,9 @@ typedef struct flex_msg {
  * LRU-bounded to prevent unbounded memory growth. */
 #define FLEX_N_COUNTER_MAX	25000
 #define FLEX_N_COUNTER_BUCKETS	4096
+
+/* Header messages waiting for their data message (STD-43A 3.10.1.2 H) */
+#define FLEX_HEADER_N_SLOTS	16
 
 /* Message queue depth limit per polarity */
 #define FLEX_MSG_QUEUE_MAX	32768
@@ -270,8 +287,18 @@ typedef struct flex_tx_polarity {
 	flex_n_counter_t	*n_lru_tail;		/* least recently used (eviction candidate) */
 	int			n_counter_count;	/* current entries in table */
 
-	/* Fragment retrieval counter (0-63, wrapping) */
+	/* Fragment retrieval counter (0-63, wrapping): identifies the fragments of
+	 * one message in the queue; the message number N is assigned at the first
+	 * transmission */
 	uint32_t		frag_retrieval_seq;
+
+	/* Message number of a HEX/binary header message (H=1), taken by the next
+	 * HEX/binary message of the capcode (STD-43A 3.10.1.2 H) */
+	struct {
+		uint64_t	capcode;
+		int		n;
+		int		active;
+	} header_n[FLEX_HEADER_N_SLOTS];
 
 	/* In-flight fragment tracking */
 	flex_inflight_frag_t	inflight[FLEX_MAX_INFLIGHT];
@@ -378,7 +405,9 @@ typedef struct flex {
 	int			no_ers;			/* skip ERS in single-shot mode */
 	int			chan_setup_enabled;	/* BIW channel setup emission */
 	int			hack_nonstandard_decoders; /* block-boundary fixup for PDW/multimon-ng */
-	int			no_message_numbering;	/* force N=0 R=0 in encoder */
+	int			no_message_numbering;	/* the network does not number the messages: N 0 (or apart
+						 * from the other messages of the address in progress), R=0 */
+	int			max_message_number;	/* largest message number of the network, 0-63 */
 	int			lpf_enabled;		/* baseband LPF */
 
 	/* Multiple transmission config (Spec Section 3.4.2).
@@ -530,14 +559,13 @@ typedef struct flex {
 	 * This is by design: Section 3.2 uses the A + inv.A structure
 	 * precisely so that polarity is irrelevant for sync detection. */
 
-	/* message numbering */
-	uint32_t		msg_sequence;		/* monotonic counter, wraps at 64 (N is 6 bits) */
+	/* message numbering: per address in tx_pol[] (n_counter) */
 	uint32_t		frag_retrieval_seq;	/* monotonic retrieval number for fragments (6-bit, 0-63) */
 
 	/* Per-polarity TX scheduling state (Req 1, 7).
 	 * tx_pol[0] = normal, tx_pol[1] = inverted.
 	 * In single-polarity mode, only tx_pol[0] is used.
-	 * The old global msg_list, msg_sequence, frag_retrieval_seq,
+	 * The old global msg_list, frag_retrieval_seq,
 	 * and tx_temp[] above are retained for backward compatibility
 	 * during migration — new code should use tx_pol[]. */
 	flex_tx_polarity_t	tx_pol[FLEX_TX_POLARITIES];
@@ -940,6 +968,10 @@ typedef struct flex {
 		 * This is a separate structure from the subframe_store — it operates
 		 * at the message layer after parsing, not at the frame/physical layer. */
 		flex_rx_msg_entry_t msg_history[FLEX_RX_POLARITIES][FLEX_RX_MSG_HISTORY_MAX];
+		flex_rx_msg_entry_t *msg_history_match;	/* the stored copy found by the last retransmission check */
+		/* Last message number with R=1 of each address (STD-43A 3.10.1.3 N
+		 * and R): numbers skipped tell missed messages */
+		flex_rx_seq_entry_t msg_sequence[FLEX_RX_POLARITIES][FLEX_RX_SEQ_MAX];
 	} rx;
 } flex_t;
 

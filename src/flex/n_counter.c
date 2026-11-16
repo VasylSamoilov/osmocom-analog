@@ -160,8 +160,21 @@ void flex_n_counter_cleanup(flex_tx_polarity_t *pol)
 	pol->n_counter_count = 0;
 }
 
+/* The number after the last one of a capcode: 0 for a capcode without a counter, 0 again after max_number
+ * (the largest number of the network, 0-63), else one more */
+static uint8_t n_after(const flex_n_counter_t *e, int max_number)
+{
+	if (max_number < 0)
+		max_number = 0;
+	if (max_number > 63)
+		max_number = 63;
+	if (!e || e->n_value >= max_number)
+		return 0;
+	return (uint8_t)(e->n_value + 1);
+}
+
 uint8_t flex_n_counter_get(flex_tx_polarity_t *pol,
-			   uint64_t capcode, uint32_t abs_frame)
+			   uint64_t capcode, uint32_t abs_frame, int max_number)
 {
 	flex_n_counter_t *e = hash_find(pol, capcode);
 
@@ -170,18 +183,22 @@ uint8_t flex_n_counter_get(flex_tx_polarity_t *pol,
 		lru_remove(pol, e);
 		lru_push_head(pol, e);
 		e->last_used_abs = abs_frame;
-		/* Advance N (mod 64) */
-		e->n_value = (e->n_value + 1) & 0x3F;
+		e->n_value = n_after(e, max_number);
 		return e->n_value;
 	}
 
-	/* New entry — starts at N=0, first get returns N=1 */
+	/* New entry: the sequence of an address starts at 0 (STD-43A 3.10.1.3 N) */
 	e = entry_create(pol, capcode, abs_frame);
 	if (!e)
 		return 0; /* fallback on alloc failure */
 
-	e->n_value = (e->n_value + 1) & 0x3F;
+	e->n_value = 0;
 	return e->n_value;
+}
+
+int flex_n_counter_upcoming(flex_tx_polarity_t *pol, uint64_t capcode, int max_number)
+{
+	return n_after(hash_find(pol, capcode), max_number);
 }
 
 int flex_n_counter_peek(flex_tx_polarity_t *pol, uint64_t capcode)

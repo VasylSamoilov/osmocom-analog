@@ -375,6 +375,7 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	msg->send_delay = 0;
 	msg->next_send_frame = 0;
 	msg->assigned_n = -1;
+	msg->assigned_r = 0;
 
 	/* link to tail of list (legacy global queue) — O(1) via tail pointer */
 	msg->flex = flex;
@@ -1114,10 +1115,10 @@ static void flex_fragment_queue(flex_t *flex)
 			continue;
 		}
 
-		/* Assign a retrieval number (N) for this set of fragments.
-		 * N identifies all fragments of the same message.
-		 * Use the per-polarity counter to avoid N collisions across
-		 * polarities (normal vs inverted). */
+		/* Identify the fragments of this message in the queue (the message
+		 * number N is assigned at the first transmission, flex_assign_number).
+		 * Use the per-polarity counter to keep the polarities apart
+		 * (normal vs inverted). */
 		int frag_pol = pol_index(msg->polarity);
 		uint32_t ret_num = flex->tx_pol[frag_pol].frag_retrieval_seq++;
 		flex->tx_pol[frag_pol].frag_retrieval_seq &= 0x3F; /* 6-bit counter: N is 0-63 per spec */
@@ -1368,6 +1369,137 @@ static int flex_msg_supports_retransmit(enum flex_msg_type type)
 	default:
 		return 0;
 	}
+}
+
+/* The message types of the Message Numbering service (STD-43A 8.4 (2) (a)): the
+ * numbered short message (t=10), numbered numeric, HEX/binary and alphanumeric
+ * messages.  Secure messages are not numbered (8.4 (2) (c)). */
+static int flex_msg_numbered(const flex_msg_t *m)
+{
+	switch (m->msg_type) {
+	case FLEX_MSG_TYPE_ALPHA:
+	case FLEX_MSG_TYPE_HEX:
+	case FLEX_MSG_TYPE_NUMBERED_NUM:
+	case FLEX_MSG_TYPE_NUMBERED_SPECIAL:
+		return 1;
+	case FLEX_MSG_TYPE_SHORT:
+		return m->short_msg_type == FLEX_SMSG_TYPE_NUMBERED;
+	default:
+		return 0;
+	}
+}
+
+/* The lowest number that no message of the address in progress on the polarity
+ * has (numbered and still queued: fragments to go, retransmissions, messages of
+ * the frame being built), apart from avoid (-1: none). */
+static int flex_free_number(flex_t *flex, const flex_msg_t *msg, int avoid)
+{
+	int used[64] = {0};
+	flex_msg_t *m;
+	int n;
+
+	if (avoid >= 0 && avoid < 64)
+		used[avoid] = 1;
+
+	for (m = flex->msg_list; m; m = m->next) {
+		if (m != msg && m->capcode == msg->capcode &&
+		    pol_index(m->polarity) == pol_index(msg->polarity) &&
+		    m->assigned_n >= 0)
+			used[m->assigned_n & 0x3F] = 1;
+	}
+
+	for (n = 0; n < 64; n++) {
+		if (!used[n])
+			return n;
+	}
+
+	return 0;
+}
+
+/* Message number N and retrieval flag R of a message at its first transmission
+ * (STD-43A 8.4, 3.10.1.1 to 3.10.1.4 N and R).  Message numbering is a service
+ * of the network:
+ *   - numbering: the numbered types of an address take one sequence of numbers,
+ *     from 0 up to the largest number of the network, then 0 again, with R=1
+ *     (R=0 only on retransmission, 4.3.7.6, and when asked for with r=0);
+ *   - no numbering (--no-message-numbering): R=0;
+ *   - a message the network does not number (no numbering, a secure message, a
+ *     group message of a temporary address) takes the lowest number no message
+ *     of the address in progress has, and with numbering not the next number of
+ *     the sequence either, so that its fragments are told apart (3.10.1.2 to
+ *     3.10.1.4 N, last sentence): 0 when the address has none in progress;
+ *   - a HEX/binary header message (H=1) and the data message after it share the
+ *     number (3.10.1.2 H);
+ *   - msgnum= gives the number, the sequence goes on from it.
+ * Tone, numeric, short numeric and source messages have no number and leave the
+ * sequence alone.  The other fragments of the message take the number.
+ * Returns R. */
+static int flex_assign_number(flex_t *flex, flex_msg_t *msg, uint32_t abs_frame)
+{
+	flex_tx_polarity_t *pol = &flex->tx_pol[pol_index(msg->polarity)];
+	int numbering = !flex->no_message_numbering;
+	int numbered = flex_msg_numbered(msg) && !msg->is_temp_group;
+	int header_slot = -1;
+	int n = 0, r = 0, i;
+	flex_msg_t *m;
+
+	if (msg->msg_type == FLEX_MSG_TYPE_HEX && !msg->hex_header_msg) {
+		for (i = 0; i < FLEX_HEADER_N_SLOTS; i++) {
+			if (pol->header_n[i].active && pol->header_n[i].capcode == msg->capcode) {
+				header_slot = i;
+				break;
+			}
+		}
+	}
+
+	if (msg->numbered_msgnum >= 0) {
+		n = msg->numbered_msgnum;
+		r = (numbering && numbered && msg->numbered_r) ? 1 : 0;
+		if (numbering && numbered)
+			flex_n_counter_set(pol, msg->capcode, abs_frame, (uint8_t)n);
+	} else if (header_slot >= 0) {
+		n = pol->header_n[header_slot].n;
+		r = (numbering && msg->numbered_r) ? 1 : 0;
+		pol->header_n[header_slot].active = 0;
+	} else if (numbering && numbered) {
+		n = flex_n_counter_get(pol, msg->capcode, abs_frame, flex->max_message_number);
+		r = msg->numbered_r ? 1 : 0;
+	} else if (msg->msg_type == FLEX_MSG_TYPE_SECURE || flex_msg_numbered(msg)) {
+		n = flex_free_number(flex, msg, (numbering && !msg->is_temp_group)
+				     ? flex_n_counter_upcoming(pol, msg->capcode, flex->max_message_number) : -1);
+		r = 0;
+	}
+
+	if (msg->msg_type == FLEX_MSG_TYPE_HEX && msg->hex_header_msg) {
+		int slot = -1;
+
+		for (i = 0; i < FLEX_HEADER_N_SLOTS && slot < 0; i++) {
+			if (pol->header_n[i].active && pol->header_n[i].capcode == msg->capcode)
+				slot = i;
+		}
+		for (i = 0; i < FLEX_HEADER_N_SLOTS && slot < 0; i++) {
+			if (!pol->header_n[i].active)
+				slot = i;
+		}
+		if (slot < 0)
+			slot = 0;
+		pol->header_n[slot].capcode = msg->capcode;
+		pol->header_n[slot].n = n;
+		pol->header_n[slot].active = 1;
+	}
+
+	msg->assigned_n = n;
+
+	if (msg->total_fragments > 1) {
+		for (m = flex->msg_list; m; m = m->next) {
+			if (m != msg && m->total_fragments == msg->total_fragments &&
+			    m->retrieval_num == msg->retrieval_num && m->capcode == msg->capcode &&
+			    pol_index(m->polarity) == pol_index(msg->polarity))
+				m->assigned_n = n;
+		}
+	}
+
+	return r;
 }
 
 /*
@@ -3394,40 +3526,23 @@ static int flex_get_next_frame_network(flex_t *flex)
 					{
 						int is_retransmission = (m->assigned_n >= 0);
 						if (!is_retransmission) {
-							if (m->numbered_msgnum >= 0) {
-								m->assigned_n = m->numbered_msgnum;
-								/* Sync counter so next auto-assign continues from here */
-								int mp = pol_index(m->polarity);
-								uint32_t af = ft.cycle * 128 + ft.frame;
-								flex_n_counter_set(
-									&flex->tx_pol[mp], m->capcode, af,
-									(uint8_t)m->numbered_msgnum);
-							} else if (m->total_fragments > 1)
-								m->assigned_n = (int)m->retrieval_num;
-							else {
-								/* Per-capcode N_Counter (Req 4.1-4.3) */
-								int mp = pol_index(m->polarity);
-								uint32_t af = ft.cycle * 128 + ft.frame;
-								m->assigned_n = (int)flex_n_counter_get(
-									&flex->tx_pol[mp], m->capcode, af);
-							}
+							uint32_t af = ft.cycle * 128 + ft.frame;
+							int r = flex_assign_number(flex, m, af);
+
 							fm->sequence_num = m->assigned_n;
 							LOGP(DFLEX, LOGL_INFO,
 							     "TX: capcode=%" PRIu64 "%s N=%d R=%d M=%d type=%s frags=%d retransmit=%d/%d C%u/F%u\n",
 							     m->capcode, flex_grp_tag(m->temp_delivery_slot),
 							     m->assigned_n,
-							     m->numbered_r ? 1 : 0,
+							     r,
 							     m->mail_drop,
 							     flex_msg_type_name(m->msg_type),
 							     m->total_fragments,
 							     m->retransmit_count, m->retransmit_max,
 							     ft.cycle, ft.frame);
-							/* R=1 for normal initial TX.
-							 * R=0 when msg->numbered_r is explicitly 0
-							 * (system messages per spec 3.9.2). */
-							fm->alpha_r_flag = m->numbered_r ? 1 : 0;
-							fm->hex_r_flag = m->numbered_r ? 1 : 0;
-							fm->numbered_r = m->numbered_r ? 1 : 0;
+							fm->alpha_r_flag = r;
+							fm->hex_r_flag = r;
+							fm->numbered_r = r;
 							fm->sysmsg_method = m->sysmsg_method;
 							if (m->retransmit_max > 0) {
 								LOGP(DFLEX, LOGL_INFO,
@@ -3436,6 +3551,19 @@ static int flex_get_next_frame_network(flex_t *flex)
 								     flex_msg_type_name(m->msg_type),
 								     m->assigned_n, m->retransmit_max);
 							}
+						} else if (m->fragment_index > 0) {
+							/* A fragment after the first: the number of the message, R is
+							 * only in the first fragment */
+							fm->sequence_num = m->assigned_n;
+							fm->alpha_r_flag = 0;
+							fm->hex_r_flag = 0;
+							fm->numbered_r = 0;
+							LOGP(DFLEX, LOGL_INFO,
+							     "TX: capcode=%" PRIu64 "%s N=%d fragment %d/%d type=%s C%u/F%u\n",
+							     m->capcode, flex_grp_tag(m->temp_delivery_slot),
+							     m->assigned_n, m->fragment_index + 1, m->total_fragments,
+							     flex_msg_type_name(m->msg_type),
+							     ft.cycle, ft.frame);
 						} else {
 							fm->sequence_num = m->assigned_n;
 							fm->alpha_r_flag = 0;
@@ -3451,18 +3579,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 						}
 					}
 
-					/* --no-message-numbering: override N=0 R=0 */
-					if (flex->no_message_numbering) {
-						fm->sequence_num = 0;
-						fm->alpha_r_flag = 0;
-						fm->hex_r_flag = 0;
-						fm->numbered_r = 0;
-					}
-
-					if (m->numbered_msgnum >= 0)
-						fm->numbered_msgnum = m->numbered_msgnum;
-					else
-						fm->numbered_msgnum = fm->sequence_num;
+					fm->numbered_msgnum = fm->sequence_num;
 				}
 
 				/* Encode this phase */
@@ -3914,11 +4031,11 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.charset = msg->charset;
 			frame_msg.is_temp_group = msg->is_temp_group;
 			frame_msg.temp_delivery_slot = msg->temp_delivery_slot;
-			frame_msg.sequence_num = (msg->numbered_msgnum >= 0)
-				? msg->numbered_msgnum
-				: (msg->total_fragments > 1)
-				? (int)msg->retrieval_num
-				: (int)(flex->msg_sequence & 0x3F);
+			/* The number of the message (and its R) at the first pass; the
+			 * other passes are copies with the same number */
+			if (msg->assigned_n < 0)
+				msg->assigned_r = flex_assign_number(flex, msg, 0);
+			frame_msg.sequence_num = msg->assigned_n;
 			frame_msg.phase = msg->phase;
 			frame_msg.blocking_length = msg->blocking_length;
 			frame_msg.hex_display_rtl = msg->hex_display_rtl;
@@ -3932,11 +4049,11 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.short_msg_number = msg->short_msg_number;
 			frame_msg.short_msg_r = msg->short_msg_r;
 			frame_msg.numbered_s = msg->numbered_s;
-			frame_msg.numbered_msgnum = msg->numbered_msgnum;
-			/* R flag: R=1 for initial TX, R=0 for retransmit pass */
-			frame_msg.alpha_r_flag = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
-			frame_msg.hex_r_flag = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
-			frame_msg.numbered_r = is_retransmit ? 0 : (msg->numbered_r ? 1 : 0);
+			frame_msg.numbered_msgnum = msg->assigned_n;
+			/* R flag: R of the first transmission, R=0 for the retransmit pass */
+			frame_msg.alpha_r_flag = is_retransmit ? 0 : msg->assigned_r;
+			frame_msg.hex_r_flag = is_retransmit ? 0 : msg->assigned_r;
+			frame_msg.numbered_r = is_retransmit ? 0 : msg->assigned_r;
 			frame_msg.sysmsg_method = msg->sysmsg_method;
 			frame_msg.precomputed_sig = msg->precomputed_sig;
 
@@ -4039,7 +4156,6 @@ int flex_get_next_frame(flex_t *flex)
 
 			if (pass >= 3) {
 				/* All 4 passes done — destroy message */
-				flex->msg_sequence++; /* bump for next message */
 				flex_msg_destroy(msg);
 				flex->idle_count = 4;
 			} else {

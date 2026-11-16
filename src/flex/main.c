@@ -97,7 +97,8 @@ static int default_retransmit = 0;		/* --retransmit: 0-15, default 0 (no retrans
 static int default_retransmit_interval = 128;	/* --retransmit-interval: 1-1920 frames, default 128 (~4 min) */
 static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (immediate) */
 static int hack_nonstandard_decoders = 0;	/* --hack-for-non-standard-decoders: block-boundary fixup */
-static int no_message_numbering = 0;		/* --no-message-numbering: force N=0 R=0 in encoder */
+static int no_message_numbering = 0;		/* --no-message-numbering: the network does not number the messages, R=0 */
+static int max_message_number = 63;		/* --max-message-number: largest message number of the network */
 static int roaming_enabled = 0;			/* --roaming: FIW n=1, default 0 */
 static int oneshot = 0;				/* --oneshot: enqueue + ERS + TX + exit */
 static double oneshot_freq_start = 0.0;		/* --oneshot sweep: start freq Hz */
@@ -141,6 +142,7 @@ static const char *oneshot_station_id = "";	/* saved capcode for sweep re-enqueu
 #define OPT_ONESHOT_FREQ	3035
 #define OPT_NO_MSG_NUMBERING	3036
 #define OPT_BIW_TIME_MODE	3037
+#define OPT_MAX_MSG_NUMBER	3038
 
 void print_help(const char *arg0)
 {
@@ -303,10 +305,14 @@ void print_help(const char *arg0)
 	printf("        of such words; BCH(31,21) corrects the 1-bit error on RX.\n");
 	printf("        Default OFF (standard-compliant behavior).\n");
 	printf("    --no-message-numbering\n");
-	printf("        Disable message numbering: always encode N=0 R=0.\n");
-	printf("        Some pagers use N for duplicate detection and may\n");
-	printf("        suppress repeated messages with the same N value.\n");
-	printf("        Default OFF (N increments per capcode, R=1 on initial TX).\n");
+	printf("        The network does not number the messages (STD-43A 8.4, an optional\n");
+	printf("        service): R=0 and N=0, a message in fragments takes a number apart\n");
+	printf("        from the other messages of the address in progress. Default OFF:\n");
+	printf("        the alphanumeric, HEX, numbered numeric and numbered short messages\n");
+	printf("        of each capcode are numbered 0, 1, ... with R=1 on initial TX.\n");
+	printf("    --max-message-number <0-63>\n");
+	printf("        Largest message number of the network (the pagers are set to it):\n");
+	printf("        after it the numbers of a capcode start from 0 again. Default 63.\n");
 	printf("    --fifo <path>\n");
 	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
 	printf("\n");
@@ -353,7 +359,8 @@ void print_help(const char *arg0)
 	printf("            numeric: message = up to 3 BCD digits (short addr)\n");
 	printf("                     or 8 BCD digits (long addr). Default.\n");
 	printf("            source:  message = source code (0-7)\n");
-	printf("            numbered: message = message number N (0-63)\n");
+	printf("            numbered: message = message number N (0-63), empty for the\n");
+	printf("                      next number of the capcode;\n");
 	printf("                      ssource=0-7 and sr=0|1 in options\n");
 	printf("          ssource=0-7  (short msg source code S, for stype=source/numbered)\n");
 	printf("          sr=0|1  (short msg retrieval flag R, for stype=numbered)\n");
@@ -481,6 +488,7 @@ static void add_options(void)
 	option_add(OPT_SEND_DELAY, "send-delay", 1);
 	option_add(OPT_HACK_NONSTANDARD, "hack-for-non-standard-decoders", 0);
 	option_add(OPT_NO_MSG_NUMBERING, "no-message-numbering", 0);
+	option_add(OPT_MAX_MSG_NUMBER, "max-message-number", 1);
 	option_add(OPT_FIFO, "fifo", 1);
 }
 
@@ -907,6 +915,13 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_NO_MSG_NUMBERING:
 		no_message_numbering = 1;
 		break;
+	case OPT_MAX_MSG_NUMBER:
+		max_message_number = atoi(argv[argi]);
+		if (max_message_number < 0 || max_message_number > 63) {
+			fprintf(stderr, "Largest message number must be 0-63, use '-h' for help.\n");
+			return -EINVAL;
+		}
+		break;
 	case OPT_FIFO:
 		msg_send_path = options_strdup(argv[argi++]);
 		break;
@@ -966,7 +981,7 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*short_msg_type = FLEX_SMSG_TYPE_NUMERIC;
 	*short_msg_source = 0;
 	*short_msg_number = 0;
-	*short_msg_r = 0;
+	*short_msg_r = -1;	/* -1: not given */
 	*instr_type = -1;	/* -1 = not set (raw decimal in message field) */
 	*instr_slot = 0;
 	*instr_frame = 0;
@@ -1687,11 +1702,11 @@ static enum flex_msg_type flex_parse_msg_type(const char *s)
 		return FLEX_MSG_TYPE_SHORT;
 	if (!strcasecmp(s, "secure") || !strcasecmp(s, "sec") || !strcmp(s, "7"))
 		return FLEX_MSG_TYPE_SECURE;
-	if (!strcasecmp(s, "special") || !strcasecmp(s, "snum") || !strcmp(s, "8"))
+	if (!strcasecmp(s, "special") || !strcasecmp(s, "snum") || !strcasecmp(s, "special_num") || !strcmp(s, "8"))
 		return FLEX_MSG_TYPE_SPECIAL_NUM;
-	if (!strcasecmp(s, "nnumeric") || !strcasecmp(s, "nnum") || !strcmp(s, "9"))
+	if (!strcasecmp(s, "nnumeric") || !strcasecmp(s, "nnum") || !strcasecmp(s, "numbered_num") || !strcmp(s, "9"))
 		return FLEX_MSG_TYPE_NUMBERED_NUM;
-	if (!strcasecmp(s, "nspecial") || !strcasecmp(s, "nsnum") || !strcmp(s, "10"))
+	if (!strcasecmp(s, "nspecial") || !strcasecmp(s, "nsnum") || !strcasecmp(s, "numbered_special") || !strcmp(s, "10"))
 		return FLEX_MSG_TYPE_NUMBERED_SPECIAL;
 	return FLEX_MSG_TYPE_AUTO; /* unknown */
 }
@@ -2508,7 +2523,22 @@ static void fifo_process_line(const char *text, int text_length)
 				msg->short_msg_type = msg_short_type;
 				msg->short_msg_source = msg_short_source;
 				msg->short_msg_number = msg_short_number;
-				msg->short_msg_r = msg_short_r;
+				msg->short_msg_r = (msg_short_r >= 0) ? msg_short_r : 0;
+				/* stype=numbered takes its number like the other numbered
+				 * types (STD-43A 8.4): the message field when given, as
+				 * msgnum=, else the next number of the address; sr= is
+				 * its R flag, as r= */
+				if (mtype == FLEX_MSG_TYPE_SHORT && msg_short_type == FLEX_SMSG_TYPE_NUMBERED) {
+					if (message_length > 0 && msg->numbered_msgnum < 0) {
+						int sn = atoi(msg_buf);
+						if (sn >= 0 && sn <= 63)
+							msg->numbered_msgnum = sn;
+						else
+							LOGP(DFLEX, LOGL_NOTICE, "FIFO: short message number %d out of range (0-63), using auto-assign.\n", sn);
+					}
+					if (msg_short_r >= 0)
+						msg->numbered_r = msg_short_r;
+				}
 				if (msg->send_delay > 0) {
 					flex_t *fl = (flex_t *)sender_head;
 					uint32_t current_abs = fl->sched_last_cycle * 128 + fl->sched_last_frame;
@@ -2877,6 +2907,7 @@ int main(int argc, char *argv[])
 			f->chan_setup_enabled = chan_setup_enabled;
 			f->hack_nonstandard_decoders = hack_nonstandard_decoders;
 			f->no_message_numbering = no_message_numbering;
+			f->max_message_number = max_message_number;
 
 			/* Parse POCSAG mixing frame slots if specified */
 			if (pocsag_mix) {

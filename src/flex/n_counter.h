@@ -5,9 +5,10 @@
  * least-recently-used entry is evicted (its counter resets to 0
  * on next use).
  *
- * The N counter is 6-bit (0-63), wrapping.  Per ARIB STD-43A §8.5,
- * the pager checks numbered messages separately for each address,
- * so N must be sequential per capcode.
+ * The N counter is 6-bit (0-63): per ARIB STD-43A 8.4 and 3.10.1.3 the
+ * numbers of an address ascend from 0 up to the largest number of the
+ * network, then 0 again.  The pager checks numbered messages separately
+ * for each address, so N must be sequential per capcode.
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -34,11 +35,15 @@ int flex_n_counter_init(struct flex_tx_polarity *pol);
 void flex_n_counter_cleanup(struct flex_tx_polarity *pol);
 
 /* Look up or create an N_Counter entry for capcode.
- * Advances N (mod 64), moves entry to LRU head.
+ * Advances N, moves entry to LRU head: the first number of a capcode is 0,
+ * after max_number (the largest number of the network, 0-63) comes 0 again.
  * If table is full, evicts the LRU tail.
  * Returns the NEW N value (0-63) after advancing. */
 uint8_t flex_n_counter_get(struct flex_tx_polarity *pol,
-			   uint64_t capcode, uint32_t abs_frame);
+			   uint64_t capcode, uint32_t abs_frame, int max_number);
+
+/* The number flex_n_counter_get() would return, without taking it. */
+int flex_n_counter_upcoming(struct flex_tx_polarity *pol, uint64_t capcode, int max_number);
 
 /* Look up the current N value for capcode WITHOUT advancing.
  * Returns the current N (0-63), or -1 if capcode not in table.

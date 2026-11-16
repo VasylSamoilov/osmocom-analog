@@ -1674,6 +1674,7 @@ static void done_rx_msg(pocsag_t *pocsag)
 
 			for (h = 0; h < POCSAG_RX_HISTORY_MAX; h++) {
 				struct pocsag_rx_history_entry *he = &pocsag->rx_history[h];
+				int same = 1, k;
 				if (!he->active)
 					continue;
 				if (now - he->timestamp > pocsag->rx_dedup_window)
@@ -1684,9 +1685,18 @@ static void done_rx_msg(pocsag_t *pocsag)
 					continue;
 				if (he->codeword_count != pocsag->rx_msg_cw_count)
 					continue;
+				/* Another message of the same length: a codeword received in both
+				 * copies differs */
+				for (k = 0; same && k < pocsag->rx_msg_cw_count; k++) {
+					if (pocsag->rx_msg_cw_status[k] >= 0 && he->cw_status[k] >= 0 &&
+					    pocsag->rx_msg_cw_buf[k] != he->codewords[k])
+						same = 0;
+				}
+				if (!same)
+					continue;
 
 				/* Match found — attempt codeword-level recovery */
-				int recovered = 0, k;
+				int recovered = 0;
 				for (k = 0; k < pocsag->rx_msg_cw_count; k++) {
 					if (pocsag->rx_msg_cw_status[k] == -1 && he->cw_status[k] >= 0) {
 						/* Current copy uncorrectable, history copy good — recover */
@@ -1716,19 +1726,39 @@ static void done_rx_msg(pocsag_t *pocsag)
 				break;
 			}
 
-			/* Store current message in history (replace oldest or first empty) */
-			{
-				int best = -1;
-				double oldest = 1e18;
+			/* Store a new message in history.  As a pager, the receiver keeps
+			 * the last POCSAG_RX_HISTORY_BACKLOG messages of each pager (RIC,
+			 * function, speed, polarity): the oldest of its own is replaced
+			 * when it has as many, else a free entry, else the oldest of all */
+			if (!is_duplicate) {
+				int best = -1, own = 0, own_oldest = -1;
+				double oldest = 1e18, own_oldest_time = 1e18;
 				for (h = 0; h < POCSAG_RX_HISTORY_MAX; h++) {
-					if (!pocsag->rx_history[h].active) {
-						best = h;
-						break;
+					struct pocsag_rx_history_entry *he = &pocsag->rx_history[h];
+					if (he->active && he->ric == pocsag->rx_msg_ric &&
+					    he->function == pocsag->rx_msg_function &&
+					    he->baudrate == pocsag->rx_baud_locked &&
+					    he->polarity == pocsag->rx_polarity_locked) {
+						own++;
+						if (he->timestamp < own_oldest_time) {
+							own_oldest_time = he->timestamp;
+							own_oldest = h;
+						}
 					}
-					if (pocsag->rx_history[h].timestamp < oldest) {
+				}
+				if (own >= POCSAG_RX_HISTORY_BACKLOG)
+					best = own_oldest;
+				for (h = 0; best < 0 && h < POCSAG_RX_HISTORY_MAX; h++) {
+					if (!pocsag->rx_history[h].active)
+						best = h;
+				}
+				for (h = 0; best < 0 && h < POCSAG_RX_HISTORY_MAX; h++) {
+					if (pocsag->rx_history[h].timestamp < oldest)
 						oldest = pocsag->rx_history[h].timestamp;
+				}
+				for (h = 0; best < 0 && h < POCSAG_RX_HISTORY_MAX; h++) {
+					if (pocsag->rx_history[h].timestamp == oldest)
 						best = h;
-					}
 				}
 				if (best >= 0) {
 					struct pocsag_rx_history_entry *he = &pocsag->rx_history[best];

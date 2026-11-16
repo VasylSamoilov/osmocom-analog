@@ -3932,15 +3932,18 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 						}
 						break;
 					case FLEX_SMSG_TYPE_NUMBERED:
-						/* t=10: S2S1S0 + N5-N0 + R0.
-						 * Message field = message number N (0-63).
-						 * ssource and sr from options. */
+						/* t=10: S2S1S0 + N5-N0 + R0 (STD-43A Table 3.9.2-1).
+						 * N is the message number assigned by the scheduler
+						 * (sequence_num); without one, the message field.
+						 * R is numbered_r; ssource from options. */
 						dw |= (uint32_t)FLEX_SMSG_TYPE_NUMBERED
 						      << FLEX_SMSG_T_SHIFT;
 						{
 							uint32_t d = 0;
 							int n = 0;
-							if (msgs[idx].message && msgs[idx].message_length > 0)
+							if (msgs[idx].sequence_num >= 0)
+								n = msgs[idx].sequence_num;
+							else if (msgs[idx].message && msgs[idx].message_length > 0)
 								n = atoi(msgs[idx].message);
 							if (n < 0 || n > 63) n = 0;
 							d |= (uint32_t)msgs[idx].short_msg_source
@@ -3948,7 +3951,9 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 							d |= ((uint32_t)n
 							      & FLEX_SMSG_NUMB_N_MASK)
 							     << FLEX_SMSG_NUMB_N_SHIFT;
-							d |= ((uint32_t)msgs[idx].short_msg_r
+							d |= ((uint32_t)(msgs[idx].sequence_num >= 0
+									 ? msgs[idx].numbered_r
+									 : msgs[idx].short_msg_r)
 							      & FLEX_SMSG_NUMB_R_MASK)
 							     << FLEX_SMSG_NUMB_R_SHIFT;
 							dw |= d << FLEX_SMSG_D_SHIFT;

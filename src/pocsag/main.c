@@ -69,7 +69,7 @@ static char padding = 0;
 static enum pocsag_language language = LANGUAGE_DEFAULT;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
-static double dedup_window = 0.0;	/* RX dedup window in seconds (0=disabled) */
+static double dedup_window = 60.0;	/* RX dedup window in seconds (0=disabled) */
 static int network_mode = 0;		/* continuous TX: idle frames when queue empty */
 static int oneshot = 0;
 
@@ -129,10 +129,11 @@ void print_help(const char *arg0)
 	printf("        Recommended: 0 (NUL, default per spec), 3 (ETX), 4 (EOT).\n");
 	printf("        Only NULL can be incomplete (partial bits filled with zeros).\n");
 	printf("    --dedup <seconds>\n");
-	printf("        RX deduplication window in seconds (default 0 = disabled).\n");
-	printf("        When set, duplicate messages to the same RIC+function within this\n");
-	printf("        window are suppressed. Uncorrectable codewords from the new copy\n");
-	printf("        are recovered from the previous copy if possible.\n");
+	printf("        RX deduplication window in seconds (default 60, 0 = disabled).\n");
+	printf("        The receiver keeps the last 16 messages of each RIC+function\n");
+	printf("        (speed and polarity apart); a message that is one of them again\n");
+	printf("        within this window is suppressed. Uncorrectable codewords of the\n");
+	printf("        new copy are recovered from the previous copy if possible.\n");
 	printf("        Typical pager dedup windows: 15, 30, 60, 120 seconds.\n");
 	printf("    --max-batches <count>\n");
 	printf("        Maximum batches per transmission before switching speed/polarity\n");

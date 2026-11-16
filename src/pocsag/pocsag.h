@@ -216,13 +216,16 @@ typedef struct pocsag {
 	 *
 	 * POCSAG pagers have configurable dedup windows (15s, 30s, 1m, 2m).
 	 * Base stations retransmit the same message 2-3 times within this window.
-	 * We store recent messages keyed by (ric, function) and compare incoming
-	 * messages against the history:
-	 *   - If a duplicate is found within the dedup window, suppress the alarm
+	 * We store the last POCSAG_RX_HISTORY_BACKLOG messages of each pager,
+	 * keyed by (ric, function, speed, polarity) on the frequency of this
+	 * receiver, and compare incoming messages against the history:
+	 *   - If the same message (the same codewords, those lost in either copy
+	 *     not compared) is found within the dedup window, suppress the alarm
 	 *     and attempt to recover uncorrectable codewords from the previous copy.
-	 *   - If no match, treat as a new message.
+	 *   - If no match, treat as a new message and remember it.
 	 */
-#define POCSAG_RX_HISTORY_MAX		64
+#define POCSAG_RX_HISTORY_MAX		1024
+#define POCSAG_RX_HISTORY_BACKLOG	16	/* messages kept of each RIC and function */
 #define POCSAG_RX_HISTORY_CW_MAX	256	/* max stored codewords per entry */
 	struct pocsag_rx_history_entry {
 		uint32_t		ric;
