@@ -28,6 +28,8 @@ enum rx_state {
 
 #define MAX_ADB		32	/* 256 characters (protocol uses continuation bit, no fixed limit) */
 #define MAX_NDB		2	/* 24 digits */
+#define GSC_RX_HISTORY_MAX	1024	/* RX messages remembered for duplicates */
+#define GSC_RX_HISTORY_BACKLOG	16	/* of one address and polarity */
 
 /* Non-battery-saver 1,1,0,0 pattern (S2.5). A bit fits the pattern when it
  * equals the bit 4 before and differs from the bit 2 before; a bit error is
@@ -263,6 +265,21 @@ typedef struct gsc {
 	/* --- Further messages of the batch decode_batch() returned the first of --- */
 	gsc_rx_msg_t		rx_batch_out[31];
 	int			rx_batch_out_count;
+
+	/* --- RX duplicates: as a pager, the last GSC_RX_HISTORY_BACKLOG messages
+	 * of each address (with its address number) and polarity, within
+	 * rx_dedup_window seconds (0 = off).  Pages without data (tone only,
+	 * voice) are not remembered --- */
+	double			rx_dedup_window;
+	struct gsc_rx_history_entry {
+		char		address[8];
+		int		polarity_inverted;
+		enum gsc_msg_type type;
+		uint8_t		codes[MAX_ADB * 8 + 1];	/* raw 6-bit codes of the data blocks */
+		int		code_count;
+		double		timestamp;
+		int		active;
+	} rx_history[GSC_RX_HISTORY_MAX];
 
 	/* --- Scan mode --- */
 	uint32_t		scan_from;		/* current scan position (6-digit base) */

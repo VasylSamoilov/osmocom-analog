@@ -52,6 +52,7 @@ static int voice_monitor = 0;		/* voice monitor mode (play to audio output) */
 static int batching_mode = BATCHING_OFF;
 static int protocol_dump = 0;
 static int nbs_mode = 0;
+static double dedup_window = 60.0;	/* --dedup: RX duplicate window in seconds (0 = off) */
 static int oneshot = 0;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
@@ -102,6 +103,12 @@ void print_help(const char *arg0)
 	printf("        Automatic single message TX: enqueue message from CLI args\n");
 	printf("        (address, -y type, -M message), transmit, then exit.\n");
 	printf("        Implies -T. No interactive console needed.\n");
+	printf("    --dedup <seconds>\n");
+	printf("        RX deduplication window in seconds (default 60, 0 = disabled).\n");
+	printf("        The receiver keeps the last 16 messages of each address (with its\n");
+	printf("        address number) and polarity; a data message that is one of them\n");
+	printf("        again within this window is suppressed. Tone and voice pages are\n");
+	printf("        always reported.\n");
 	printf(" -y --type auto | tone | voice | numeric | alpha\n");
 	printf("        Override message type for console and scan modes (default auto).\n");
 	printf("        'auto' determines type from the 7th address digit:\n");
@@ -159,6 +166,7 @@ static void add_options(void)
 	option_add(0x104, "oneshot", 0);
 	option_add('S', "scan", 2);
 	option_add('y', "type", 1);
+	option_add(0x105, "dedup", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -235,6 +243,13 @@ static int handle_options(int short_option, int argi, char **argv)
 	case 0x104: /* --oneshot */
 		oneshot = 1;
 		tx = 1;
+		break;
+	case 0x105: /* --dedup */
+		dedup_window = atof(argv[argi++]);
+		if (dedup_window < 0.0) {
+			fprintf(stderr, "Dedup window must be >= 0 seconds.\n");
+			return -EINVAL;
+		}
 		break;
 	case 'S':
 		scan_from = atoi(argv[argi++]);
@@ -456,6 +471,7 @@ int main(int argc, char *argv[])
 			gsc_t *gsc = (gsc_t *)sender_head;
 			gsc->batching_mode = batching_mode;
 			gsc->protocol_dump = protocol_dump;
+			gsc->rx_dedup_window = dedup_window;
 			gsc->nbs = nbs_mode;
 			gsc->default_msg_type = default_msg_type;
 			/* Set up scan mode */

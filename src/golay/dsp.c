@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <math.h>
 #include <time.h>
+#include <sys/time.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include "../libsample/sample.h"
@@ -331,16 +332,91 @@ static void rx_reset_idle(gsc_t *gsc)
 	gsc->rx_nbs_polarity_pending = 0;
 }
 
+/* A data message that is one of the last messages of its address (with the
+ * address number) and polarity, received within the window, is a duplicate:
+ * a pager stores one copy.  A message that is not is remembered: the oldest
+ * of its own is replaced when the address has GSC_RX_HISTORY_BACKLOG, else a
+ * free entry, else the oldest of all. */
+static int rx_duplicate(gsc_t *gsc, const gsc_rx_msg_t *msg)
+{
+	struct timeval tv;
+	double now, oldest = 1e18, own_oldest_time = 1e18;
+	int i, own = 0, own_oldest = -1, best = -1;
+
+	if (gsc->rx_dedup_window <= 0.0 || msg->alpha_code_count <= 0 ||
+	    (msg->type != TYPE_ALPHA && msg->type != TYPE_NUMERIC))
+		return 0;
+
+	gettimeofday(&tv, NULL);
+	now = (double)tv.tv_sec + tv.tv_usec / 1e6;
+
+	for (i = 0; i < GSC_RX_HISTORY_MAX; i++) {
+		struct gsc_rx_history_entry *he = &gsc->rx_history[i];
+
+		if (!he->active || strcmp(he->address, msg->address) ||
+		    he->polarity_inverted != msg->polarity_inverted)
+			continue;
+		if (now - he->timestamp > gsc->rx_dedup_window) {
+			he->active = 0;
+			continue;
+		}
+		if (he->type == msg->type && he->code_count == msg->alpha_code_count &&
+		    !memcmp(he->codes, msg->alpha_codes, msg->alpha_code_count)) {
+			LOGP_CHAN(DDSP, LOGL_INFO, "RX: duplicate of address '%s' suppressed (polarity=%s).\n",
+				  msg->address, msg->polarity_inverted ? "-" : "+");
+			return 1;
+		}
+		own++;
+		if (he->timestamp < own_oldest_time) {
+			own_oldest_time = he->timestamp;
+			own_oldest = i;
+		}
+	}
+
+	if (own >= GSC_RX_HISTORY_BACKLOG)
+		best = own_oldest;
+	for (i = 0; best < 0 && i < GSC_RX_HISTORY_MAX; i++) {
+		if (!gsc->rx_history[i].active)
+			best = i;
+	}
+	for (i = 0; best < 0 && i < GSC_RX_HISTORY_MAX; i++) {
+		if (gsc->rx_history[i].timestamp < oldest)
+			oldest = gsc->rx_history[i].timestamp;
+	}
+	for (i = 0; best < 0 && i < GSC_RX_HISTORY_MAX; i++) {
+		if (gsc->rx_history[i].timestamp == oldest)
+			best = i;
+	}
+
+	if (best >= 0) {
+		struct gsc_rx_history_entry *he = &gsc->rx_history[best];
+
+		memcpy(he->address, msg->address, sizeof(he->address));
+		he->polarity_inverted = msg->polarity_inverted;
+		he->type = msg->type;
+		memcpy(he->codes, msg->alpha_codes, msg->alpha_code_count);
+		he->code_count = msg->alpha_code_count;
+		he->timestamp = now;
+		he->active = 1;
+	}
+
+	return 0;
+}
+
 /* Report what decode_batch() decoded, in the order received: the message it
- * returned, then the further messages of the batch. */
+ * returned, then the further messages of the batch.  Duplicates are left out. */
 static void rx_report(gsc_t *gsc, gsc_rx_msg_t *msg)
 {
 	int i;
 
 	msg->polarity_inverted = gsc->rx_polarity_inverted;
-	golay_msg_receive(msg);
-	for (i = 0; i < gsc->rx_batch_out_count; i++)
-		golay_msg_receive(&gsc->rx_batch_out[i]);
+	if (!rx_duplicate(gsc, msg))
+		golay_msg_receive(msg);
+	for (i = 0; i < gsc->rx_batch_out_count; i++) {
+		gsc->rx_batch_out[i].polarity_inverted = gsc->rx_polarity_inverted;
+		if (!rx_duplicate(gsc, &gsc->rx_batch_out[i]))
+			golay_msg_receive(&gsc->rx_batch_out[i]);
+	}
 	gsc->rx_batch_out_count = 0;
 }
 
