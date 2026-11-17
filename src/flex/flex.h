@@ -612,6 +612,8 @@ typedef struct flex {
 
 	/* wav-test mode: exit after TX completes */
 	int			wav_test_mode;
+	/* --oneshot, --wav-test: quit when the one-shot transmission is done */
+	int			quit_after_tx;
 
 	/* POCSAG mixing */
 	int			pocsag_mix_enabled;

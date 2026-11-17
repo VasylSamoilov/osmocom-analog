@@ -2741,8 +2741,11 @@ static void myhandler(void)
 	/* Don't process FIFO lines while ERS is running.
 	 * Buffer incoming data but defer processing until ERS completes.
 	 * This ensures abs_frame at enqueue time reflects the actual
-	 * scheduler position, not a time during ERS when no frames are sent. */
-	int ers_active = (flex && !flex->sched_ers_done);
+	 * scheduler position, not a time during ERS when no frames are sent.
+	 * Network mode: until the ERS burst is done; otherwise while the
+	 * transmitter is in the ERS state. */
+	int ers_active = flex && (flex->network_mode ? !flex->sched_ers_done
+						     : flex->state == FLEX_STATE_ERS);
 
 	/* Read whatever is available from the FIFO */
 	space = (int)sizeof(buffer) - pos;
@@ -3005,6 +3008,7 @@ int main(int argc, char *argv[])
 			f->default_blocking_length = default_blocking_length;
 			if (wav_test)
 				f->wav_test_mode = 1;
+			f->quit_after_tx = oneshot || wav_test;
 			f->roaming_active = roaming_enabled;
 			f->biw_datetime_enabled = biw_datetime_enabled;
 			f->biw_time_offset = biw_time_offset;

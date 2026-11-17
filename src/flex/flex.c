@@ -4157,10 +4157,11 @@ int flex_get_next_frame(flex_t *flex)
 oneshot_done:
 		LOGP_CHAN(DFLEX, LOGL_INFO, "One-shot: transmission complete.\n");
 		flex_new_state(flex, FLEX_STATE_IDLE);
-		/* Delayed quit: let RX finish decoding the last frame.
-		 * quit_after_time is checked in myhandler() every loop
-		 * iteration (~1ms).  Set it to now + 250ms. */
-		{
+		/* Delayed quit (--oneshot, --wav-test): let RX finish decoding
+		 * the last frame.  quit_after_time is checked in myhandler()
+		 * every loop iteration (~1ms).  Set it to now + 250ms.
+		 * Otherwise the transmitter waits for the next message. */
+		if (flex->quit_after_tx) {
 			extern double quit_after_time;
 			extern double get_time(void);
 			quit_after_time = get_time() + 0.25;
