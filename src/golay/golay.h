@@ -2,7 +2,7 @@
 #include "../libmobile/sender.h"
 
 enum gsc_msg_type {
-	TYPE_AUTO = 0,	/* Defined by 7th digit */
+	TYPE_AUTO = 0,	/* Not given: tone only without a message, alphanumeric with one */
 	TYPE_TONE,	/* TONE only */
 	TYPE_VOICE,	/* TONE + VOICE */
 	TYPE_ALPHA,	/* TONE + DATA */
@@ -44,7 +44,7 @@ enum rx_state {
 /* instance of decoded (received) message */
 typedef struct gsc_rx_msg {
 	/* --- existing fields (unchanged) --- */
-	char			address[8];		/* 7-digit functional address + NUL */
+	char			address[9];		/* 6 digits, / and the address number 1-4 (123456/1) + NUL */
 	int			address_number;		/* 1-4 */
 	enum gsc_msg_type	type;			/* winner type: TYPE_ALPHA or TYPE_NUMERIC */
 	char			data[MAX_ADB * 8 + 1];		/* winner's decoded message (for backward compat) */
@@ -79,7 +79,7 @@ typedef struct gsc_rx_msg {
 /* instance of outgoing message */
 typedef struct gsc_msg {
 	struct gsc_msg		*next;
-	char			address[8];		/* 7 digits + EOL */
+	char			address[9];		/* 6 digits, / and the address number 1-4 (123456/1) + NUL */
 	enum gsc_msg_type	type;			/* type of message */
 	char			data[256];		/* message to be transmitted */
 	/* --- New fields --- */
@@ -122,7 +122,7 @@ typedef struct gsc {
 
 	gsc_msg_t		*msg_list;		/* queue of messages */
 	const char		*default_message;
-	enum gsc_msg_type	default_msg_type;	/* CLI -y override (TYPE_AUTO = use address) */
+	enum gsc_msg_type	default_msg_type;	/* CLI -y type (TYPE_AUTO: tone only without a message, alphanumeric with one) */
 
 	/* current trasmitting message */
 	uint8_t			bit[16384];
@@ -212,7 +212,7 @@ typedef struct gsc {
 	int			voice_bits;		/* bits received since the voice page */
 	int			voice_hold;		/* bits before the next word may be taken */
 	int			voice_preamble_index;	/* preamble of the voice page (for interleaved addresses) */
-	char			voice_address[8];	/* address of current voice message */
+	char			voice_address[9];	/* address of current voice message */
 	char			voice_filename[512];	/* path of current voice WAV file */
 	samplerate_t		voice_downsample;	/* resampler: DSP rate -> 8000 Hz */
 
@@ -272,7 +272,7 @@ typedef struct gsc {
 	 * voice) are not remembered --- */
 	double			rx_dedup_window;
 	struct gsc_rx_history_entry {
-		char		address[8];
+		char		address[9];
 		int		polarity_inverted;
 		enum gsc_msg_type type;
 		uint8_t		codes[MAX_ADB * 8 + 1];	/* raw 6-bit codes of the data blocks */
@@ -295,6 +295,7 @@ void init_bch(void);
 
 int8_t get_bit(gsc_t *gsc);
 void golay_msg_send(const char *buffer);
+int golay_parse_address(const char *in, char *out);
 void golay_msg_receive(const gsc_rx_msg_t *msg);
 void golay_scan_enqueue(gsc_t *gsc, uint32_t *scan_from, uint32_t scan_to, enum gsc_msg_type type, int batch_size);
 

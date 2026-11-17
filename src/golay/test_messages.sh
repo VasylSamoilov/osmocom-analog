@@ -10,11 +10,12 @@
 #   sleep 2
 #   ./test_messages.sh
 #
-# FIFO format: <7-digit address>,<type prefix>,<payload>
-#   type prefix: a, = alpha  n, = numeric  v, = voice  (none) = auto/tone
+# FIFO format: <address>,<type prefix>,<payload>
+#   type prefix: a, = alpha  n, = numeric  v, = voice  t, = tone  (none) = tone
 #
-# Address format: I G1 G0 A2 A1 A0 F
-#   F suffix: 1-4 = voice, 5-8 = alpha, 9/0 = tone-only
+# Address format: I G1 G0 A2 A1 A0 / address number (123456/1), or
+# 7 digits: the suffix gives the address number (1-4 and 5-8 are 1-4,
+# 9 and 0 are 1 and 2). The type is not taken from the address.
 #
 # Payload limits:
 #   Alpha:   80 chars max (10 blocks × 8 chars)

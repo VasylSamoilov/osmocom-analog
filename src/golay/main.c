@@ -110,20 +110,22 @@ void print_help(const char *arg0)
 	printf("        again within this window is suppressed. Tone and voice pages are\n");
 	printf("        always reported.\n");
 	printf(" -y --type auto | tone | voice | numeric | alpha\n");
-	printf("        Override message type for console and scan modes (default auto).\n");
-	printf("        'auto' determines type from the 7th address digit:\n");
-	printf("          1-4 = voice, 5-8 = alpha, 9/0 = tone-only.\n");
+	printf("        Message type for console and scan modes (default auto).\n");
+	printf("        'auto' is tone-only without a message, alpha with one.\n");
+	printf("        The address number does not set the type: what a pager does\n");
+	printf("        with each address number depends on the pager.\n");
 	printf("        'tone' sends tone-only alert (no data, no voice).\n");
 	printf("        'voice' sends voice page.\n");
 	printf("        'numeric' sends BCD-encoded numeric message.\n");
 	printf("        'alpha' sends alphanumeric message.\n");
 	printf(" -S --scan <from> <to>\n");
-	printf("        Scan through given 7-digit functional address range.\n");
+	printf("        Scan through given range of 7 digit cap codes (the suffix gives\n");
+	printf("        the address number: 1-4 and 5-8 are 1-4, 9 and 0 are 1 and 2).\n");
 	printf("        Messages are batch-packed by preamble group for efficiency.\n");
 	printf("        Use -y to select message type: numeric (default), alpha, or tone.\n");
 	printf("\n");
 	printf("File: %s\n", msg_send_path);
-	printf("        Write \"<address>\" to send a tone-only/auto message.\n");
+	printf("        Write \"<address>\" to send a tone-only message.\n");
 	printf("        Write \"<address>,n,message\" to send a numeric message.\n");
 	printf("        Write \"<address>,a,message\" to send an alphanumeric message.\n");
 	printf("        Write \"<address>,v,<wave file name>\" to send a voice message.\n");
@@ -131,15 +133,17 @@ void print_help(const char *arg0)
 	printf("        Optional polarity suffix: append ',+' or ',-' as last field.\n");
 	printf("        Optional priority prefix: prepend '!' before address.\n");
 	printf("        Examples:\n");
-	printf("          1234569              (auto: tone-only, 7th digit is 9)\n");
-	printf("          1234565,a,HELLO      (alpha message)\n");
-	printf("          1234561,n,5551234    (numeric message)\n");
-	printf("          1234561,t,           (tone-only, override voice default)\n");
-	printf("          1234561,v,alert.wav  (voice page)\n");
-	printf("          !1234565,a,URGENT    (priority alpha message)\n");
+	printf("          123456/2             (tone-only, address number 2)\n");
+	printf("          123456/1,a,HELLO     (alpha message)\n");
+	printf("          123456/3,n,5551234   (numeric message)\n");
+	printf("          123456/4,v,alert.wav (voice page)\n");
+	printf("          1234567,a,HELLO      (7 digits: suffix 7 is address number 3)\n");
+	printf("          !123456/1,a,URGENT   (priority alpha message)\n");
 	printf("\n");
-	printf("By default (auto), type is determined by the 7th digit of the address:\n");
-	printf("  1-4 = voice, 5-8 = alpha, 9/0 = tone-only.\n");
+	printf("The address is 6 digits (I G1 G0 A2 A1 A0) and the address number 1-4\n");
+	printf("(function A-D), written 123456/1. Also accepted: 7 digits (the suffix gives\n");
+	printf("the address number: 1-4 and 5-8 are 1-4, 9 and 0 are 1 and 2), 6 digits\n");
+	printf("(address number 1) and 5 digits (index 0 in front, address number 1).\n");
 	printf("\n");
 	printf("A numeric message can have up to 24 digits, they are: 0123456789U-* and space\n");
 	printf("Also 'shifted' digits can be sent using two digits, they are: ABCDEFGHJLNPR\n");
@@ -367,7 +371,10 @@ static void myhandler(void)
 }
 
 static const struct number_lengths number_lengths[] = {
-	{ 7, "functional address" },
+	{ 8, "address 123456/1 (6 digits, / and the address number 1-4)" },
+	{ 7, "7 digit cap code (the suffix gives the address number)" },
+	{ 6, "6 digit address (address number 1)" },
+	{ 5, "5 digit address (index 0, address number 1)" },
 	{ 0, NULL }
 };
 
@@ -386,7 +393,7 @@ int main(int argc, char *argv[])
 	init_bch();
 
 	/* init mobile interface */
-	main_mobile_init("0123456789", number_lengths, NULL, NULL, "american");
+	main_mobile_init("0123456789/", number_lengths, NULL, NULL, "american");
 
 	/* handle options / config file */
 	add_options();

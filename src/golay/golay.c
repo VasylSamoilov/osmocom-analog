@@ -200,13 +200,15 @@ static void normalize_input_escapes(char *dst, const char *src, int dstsize)
 	dst[o] = '\0';
 }
 
+static int address_function(const char *address);
+
 /* Create message and add to queue */
 static gsc_msg_t *golay_msg_create(gsc_t __attribute__((unused)) *gsc, const char *address, const char *text, enum gsc_msg_type type)
 {
 	gsc_msg_t *msg;
 
-	if (strlen(address) != sizeof(msg->address) - 1) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Address has incorrect length, cannot page!\n");
+	if (address_function(address) < 0) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Address '%s' is not 6 digits, / and the address number 1-4, cannot page!\n", address);
 		return NULL;
 	}
 	if (strlen(text) > sizeof(msg->data) - 1) {
@@ -214,25 +216,10 @@ static gsc_msg_t *golay_msg_create(gsc_t __attribute__((unused)) *gsc, const cha
 		return NULL;
 	}
 
-	/* get type from last digit, if automatic type is given */
-	if (type == TYPE_AUTO) {
-		switch (address[6]) {
-			case '1': type = TYPE_VOICE; break;
-			case '2': type = TYPE_VOICE; break;
-			case '3': type = TYPE_VOICE; break;
-			case '4': type = TYPE_VOICE; break;
-			case '5': type = TYPE_ALPHA; break;
-			case '6': type = TYPE_ALPHA; break;
-			case '7': type = TYPE_ALPHA; break;
-			case '8': type = TYPE_ALPHA; break;
-			case '9': type = TYPE_TONE;  break;
-			case '0': type = TYPE_TONE;  break;
-			default:
-				LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in last address digit.\n", address[6]);
-				return NULL;
-		}
-	} else
-		LOGP(DGOLAY, LOGL_INFO, "Overriding message type as defined by sender.\n");
+	/* The type is set by the sender. Without one: tone only without a
+	 * message, alphanumeric with one */
+	if (type == TYPE_AUTO)
+		type = text[0] ? TYPE_ALPHA : TYPE_TONE;
 
 	LOGP(DGOLAY, LOGL_INFO, "Creating msg instance to page address '%s'.\n", address);
 
@@ -712,11 +699,14 @@ static char encode_numeric(char c)
 
 /* Pager Code Assignment Plans (Motorola GSC Standard, Figure 7.1)
  *
- * A GSC functional address is 7 digits: I G1 G0 A2 A1 A0 F
+ * A GSC address is 6 digits: I G1 G0 A2 A1 A0, and one of its 4 address
+ * numbers 1-4 (function A-D, the inversion of words 1 and 2):
  *   I    = Index digit (0-9), selects preamble: preamble = (I + G0) % 10
  *   G1G0 = Group digits (00-99), selects Word 1 via word1s[G1G0 % 50]
  *   A2A1A0 = Address digits, encoded into Word 2
- *   F    = Function suffix (1-0), determines message type per Function Plan "A"
+ * The address of a message is written 123456/1. The type of a message
+ * (tone, voice, numeric, alphanumeric) is set by the sender: what a pager
+ * does with each address number depends on the pager.
  *
  * System size depends on the Code Assignment Plan:
  *   Plan A: 50 codes    (1 preamble,  50 Word 1s, 1 address per W1)
@@ -735,6 +725,63 @@ static char encode_numeric(char c)
  *   collide with protocol-reserved codewords or cause ambiguity
  *   in the W2-to-address reverse mapping.
  */
+/* Function 0-3 of an address 123456/1 (address number 1-4), -1 if it is not one */
+static int address_function(const char *address)
+{
+	int i;
+
+	if (!address || strlen(address) != 8 || address[6] != '/' || address[7] < '1' || address[7] > '4')
+		return -1;
+	for (i = 0; i < 6; i++) {
+		if (address[i] < '0' || address[i] > '9')
+			return -1;
+	}
+	return address[7] - '1';
+}
+
+/* An address as given by the sender, written 123456/1:
+ *   6 digits, / and the address number 1-4: as it is
+ *   7 digits: the 6 digits and a suffix digit for the address number:
+ *     1-4 and 5-8 are 1-4, 9 and 0 are 1 and 2
+ *   6 digits: address number 1
+ *   5 digits: index digit 0 in front, address number 1
+ * Returns 0, or -EINVAL if it is none of these. */
+int golay_parse_address(const char *in, char *out)
+{
+	char digits[7];
+	int number = 1, n, i;
+
+	if (!in)
+		return -EINVAL;
+	n = strlen(in);
+	if (n == 8 && in[6] == '/') {
+		if (in[7] < '1' || in[7] > '4')
+			return -EINVAL;
+		number = in[7] - '0';
+		n = 6;
+	} else if (n == 7) {
+		if (in[6] < '0' || in[6] > '9')
+			return -EINVAL;
+		number = (in[6] == '0') ? 2 : (in[6] == '9') ? 1 : ((in[6] - '1') % 4) + 1;
+		n = 6;
+	} else if (n != 5 && n != 6)
+		return -EINVAL;
+
+	for (i = 0; i < n; i++) {
+		if (in[i] < '0' || in[i] > '9')
+			return -EINVAL;
+	}
+	if (n == 5) {
+		digits[0] = '0';
+		memcpy(digits + 1, in, 5);
+	} else
+		memcpy(digits, in, 6);
+	digits[6] = '\0';
+
+	sprintf(out, "%s/%d", digits, number);
+	return 0;
+}
+
 static int encode_address(const char *code, int *preamble, uint16_t *word1, uint16_t *word2)
 {
 	static const uint16_t illegal_low[16] = {   0,  25,  51, 103, 206, 340, 363, 412, 445, 530, 642, 726, 782, 810, 825, 877 };
@@ -742,11 +789,12 @@ static int encode_address(const char *code, int *preamble, uint16_t *word1, uint
 	int idx, g0, g1, a0, a1, a2, ap0, ap, ap1, ap2, ap3, b1b0, b3b2, g1g0, a2a1a0;
 	int i;
 
-	for (i = 0; i < 7; i++) {
+	/* The 6 digits of the address, then its end or / and the address number */
+	for (i = 0; i < 6; i++) {
 		if (code[i] < '0' || code[i] > '9')
 			break;
 	}
-	if (code[i]) {
+	if (i < 6 || (code[6] && code[6] != '/')) {
 		LOGP(DGOLAY, LOGL_NOTICE, "Invalid functional address character. Only 0..9 are allowed.\n");
 		return -EINVAL;
 	}
@@ -1530,8 +1578,9 @@ int gsc_decode_tone_address(const uint8_t *bits, int preamble_idx, gsc_rx_msg_t 
 	msg->address[3] = '0' + a2;
 	msg->address[4] = '0' + a1;
 	msg->address[5] = '0' + a0;
-	msg->address[6] = "9034"[function];
-	msg->address[7] = '\0';
+	msg->address[6] = '/';
+	msg->address[7] = '1' + function;
+	msg->address[8] = '\0';
 	msg->address_number = function + 1;
 	msg->preamble_index = preamble_idx;
 	msg->type = TYPE_TONE;
@@ -1590,7 +1639,7 @@ int decode_batch(gsc_t *gsc, gsc_rx_msg_t *msg, int force)
 	uint8_t function;
 	int g1, g0, a2, a1, a0;
 	int g1g0;
-	char idx, suffix;
+	char idx;
 	int remaining;
 	enum gsc_msg_type detected_type;
 
@@ -2056,25 +2105,8 @@ address:
 		}
 	}
 
-	/* Assign function suffix per Function Plan "A":
-	 *   Voice:   function 0-3 -> suffix 1-4
-	 *   Alpha:   function 0-3 -> suffix 5-8
-	 *   Tone:    function 0   -> suffix 9, function 1 -> suffix 0 */
-	switch (detected_type) {
-	case TYPE_VOICE:
-		suffix = '1' + function;
-		break;
-	case TYPE_ALPHA:
-	case TYPE_NUMERIC:
-		suffix = '5' + function;
-		break;
-	default: /* TYPE_TONE */
-		/* Table IX tone suffixes: func 1→9, 2→0, 3→3, 4→4 */
-		suffix = "9034"[function];
-		break;
-	}
-
-	/* Build the 7-digit functional address: I G1 G0 A2 A1 A0 suffix */
+	/* The address: I G1 G0 A2 A1 A0, / and the address number 1-4 (function A-D).
+	 * The message type is what was received, not a property of the address. */
 	LOGP(DGOLAY, LOGL_DEBUG, "Address: idx=%c g1=%d g0=%d a2=%d a1=%d a0=%d func=%d w1=%u w2=%u w1_inv=%d w2_inv=%d\n",
 		idx, g1, g0, a2, a1, a0, function, w1_value, w2_value, w1_inverted, w2_inverted);
 	msg->address[0] = idx;
@@ -2083,8 +2115,9 @@ address:
 	msg->address[3] = '0' + a2;
 	msg->address[4] = '0' + a1;
 	msg->address[5] = '0' + a0;
-	msg->address[6] = suffix;
-	msg->address[7] = '\0';
+	msg->address[6] = '/';
+	msg->address[7] = '1' + function;
+	msg->address[8] = '\0';
 
 	msg->address_number = function + 1;
 	msg->type = detected_type;
@@ -2690,7 +2723,7 @@ decode_done:
 				uint8_t bm_function;
 				int bm_g1, bm_g0, bm_a2, bm_a1, bm_a0;
 				int bm_g1g0;
-				char bm_idx, bm_suffix;
+				char bm_idx;
 				int bm_remaining;
 				enum gsc_msg_type bm_detected_type;
 
@@ -2894,29 +2927,16 @@ decode_done:
 					}
 				}
 
-				/* Assign function suffix */
-				switch (bm_detected_type) {
-				case TYPE_VOICE:
-					bm_suffix = '1' + bm_function;
-					break;
-				case TYPE_ALPHA:
-				case TYPE_NUMERIC:
-					bm_suffix = '5' + bm_function;
-					break;
-				default:
-					bm_suffix = "9034"[bm_function];
-					break;
-				}
-
-				/* Build 7-digit functional address */
+				/* The address: 6 digits, / and the address number 1-4 */
 				batch_msg.address[0] = bm_idx;
 				batch_msg.address[1] = '0' + bm_g1;
 				batch_msg.address[2] = '0' + bm_g0;
 				batch_msg.address[3] = '0' + bm_a2;
 				batch_msg.address[4] = '0' + bm_a1;
 				batch_msg.address[5] = '0' + bm_a0;
-				batch_msg.address[6] = bm_suffix;
-				batch_msg.address[7] = '\0';
+				batch_msg.address[6] = '/';
+				batch_msg.address[7] = '1' + bm_function;
+				batch_msg.address[8] = '\0';
 				batch_msg.address_number = bm_function + 1;
 				batch_msg.type = bm_detected_type;
 
@@ -3196,7 +3216,7 @@ static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polari
 static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type type, const char *message, double polarity)
 {
 	uint16_t word1, word2;
-	uint8_t function;
+	int function;
 	uint32_t golay;
 	uint16_t bch[8];
 	uint8_t msg[12], digit, shifted, contbit, checksum;
@@ -3206,8 +3226,8 @@ static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type ty
 
 	queue_reset(gsc);
 
-	if (!address || strlen(address) != 7) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Invalid functional address '%s' size. Only 7 digits are allowed.\n", address);
+	if (!address || strlen(address) != 8) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Invalid functional address '%s' size. Only 6 digits, / and the address number are allowed.\n", address);
 		return -EINVAL;
 	}
 
@@ -3215,20 +3235,10 @@ static int queue_batch_nbs(gsc_t *gsc, const char *address, enum gsc_msg_type ty
 	if (rc < 0)
 		return rc;
 
-	switch (address[6]) {
-		case '1': function = 0; break;
-		case '2': function = 1; break;
-		case '3': function = 2; break;
-		case '4': function = 3; break;
-		case '5': function = 0; break;
-		case '6': function = 1; break;
-		case '7': function = 2; break;
-		case '8': function = 3; break;
-		case '9': function = 0; break;
-		case '0': function = 1; break;
-		default:
-			LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in last address digit.\n", address[6]);
-			return -EINVAL;
+	function = address_function(address);
+	if (function < 0) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Illegal address number in address '%s'.\n", address);
+		return -EINVAL;
 	}
 
 	LOGP(DGOLAY, LOGL_INFO, "NBS mode: coding %s for functional address '%s'.\n",
@@ -3363,7 +3373,7 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 {
 	int preamble;
 	uint16_t word1, word2;
-	uint8_t function;
+	int function;
 	uint32_t golay;
 	uint16_t bch[8];
 	uint8_t msg[12], digit, shifted, contbit, checksum;
@@ -3373,8 +3383,8 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 	queue_reset(gsc);
 
 	/* check address length */
-	if (!address || strlen(address) != 7) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Invalid functional address '%s' size. Only 7 digits are allowed.\n", address);
+	if (!address || strlen(address) != 8) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Invalid functional address '%s' size. Only 6 digits, / and the address number are allowed.\n", address);
 		return -EINVAL;
 	}
 
@@ -3383,21 +3393,11 @@ static int queue_batch(gsc_t *gsc, const char *address, enum gsc_msg_type type, 
 	if (rc < 0)
 		return rc;
 
-	/* get function from last digit */
-	switch (address[6]) {
-		case '1': function = 0; break;
-		case '2': function = 1; break;
-		case '3': function = 2; break;
-		case '4': function = 3; break;
-		case '5': function = 0; break;
-		case '6': function = 1; break;
-		case '7': function = 2; break;
-		case '8': function = 3; break;
-		case '9': function = 0; break;
-		case '0': function = 1; break;
-		default:
-			LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in last address digit.\n", address[6]);
-			return -EINVAL;
+	/* function of the address number */
+	function = address_function(address);
+	if (function < 0) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Illegal address number in address '%s'.\n", address);
+		return -EINVAL;
 	}
 
 	switch (type) {
@@ -3578,7 +3578,7 @@ static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polari
 	gsc_msg_t **msgp, *msg;
 	int preamble;
 	uint16_t word1, word2;
-	uint8_t function;
+	int function;
 	uint32_t golay;
 	int rc;
 	int count = 0;
@@ -3602,22 +3602,12 @@ static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polari
 				continue;
 			}
 
-			/* Get function from last digit */
-			switch (msg->address[6]) {
-				case '1': function = 0; break;
-				case '2': function = 1; break;
-				case '3': function = 2; break;
-				case '4': function = 3; break;
-				case '5': function = 0; break;
-				case '6': function = 1; break;
-				case '7': function = 2; break;
-				case '8': function = 3; break;
-				case '9': function = 0; break;
-				case '0': function = 1; break;
-				default:
-					LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in interleaved tone address.\n", msg->address[6]);
-					free(msg);
-					continue;
+			/* Function of the address number */
+			function = address_function(msg->address);
+			if (function < 0) {
+				LOGP(DGOLAY, LOGL_NOTICE, "Illegal address number in interleaved tone address '%s'.\n", msg->address);
+				free(msg);
+				continue;
 			}
 
 			LOGP(DGOLAY, LOGL_DEBUG, "Interleaving tone-only address %d: '%s'.\n", count + 1, msg->address);
@@ -3662,22 +3652,12 @@ static int queue_interleaved_tones(gsc_t *gsc, int preamble_index, double polari
 				continue;
 			}
 
-			/* Get function from last digit */
-			switch (msg->address[6]) {
-				case '1': function = 0; break;
-				case '2': function = 1; break;
-				case '3': function = 2; break;
-				case '4': function = 3; break;
-				case '5': function = 0; break;
-				case '6': function = 1; break;
-				case '7': function = 2; break;
-				case '8': function = 3; break;
-				case '9': function = 0; break;
-				case '0': function = 1; break;
-				default:
-					LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in interleaved tone address.\n", msg->address[6]);
-					free(msg);
-					continue;
+			/* Function of the address number */
+			function = address_function(msg->address);
+			if (function < 0) {
+				LOGP(DGOLAY, LOGL_NOTICE, "Illegal address number in interleaved tone address '%s'.\n", msg->address);
+				free(msg);
+				continue;
 			}
 
 			LOGP(DGOLAY, LOGL_DEBUG, "Interleaving tone-only address %d: '%s'.\n", count + 1, msg->address);
@@ -3718,7 +3698,7 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 {
 	int preamble;
 	uint16_t word1, word2;
-	uint8_t function;
+	int function;
 	uint32_t golay;
 	uint16_t bch[8];
 	uint8_t msg[12], digit, shifted, contbit, checksum;
@@ -3790,21 +3770,11 @@ static int queue_batch_group(gsc_t *gsc, gsc_msg_t *msgs, int count)
 			continue;
 		}
 
-		/* Get function from last digit (same switch as queue_batch) */
-		switch (cur->address[6]) {
-			case '1': function = 0; break;
-			case '2': function = 1; break;
-			case '3': function = 2; break;
-			case '4': function = 3; break;
-			case '5': function = 0; break;
-			case '6': function = 1; break;
-			case '7': function = 2; break;
-			case '8': function = 3; break;
-			case '9': function = 0; break;
-			case '0': function = 1; break;
-			default:
-				LOGP(DGOLAY, LOGL_NOTICE, "Illegal function suffix '%c' in batch address.\n", cur->address[6]);
-				continue;
+		/* Function of the address number */
+		function = address_function(cur->address);
+		if (function < 0) {
+			LOGP(DGOLAY, LOGL_NOTICE, "Illegal address number in batch address '%s'.\n", cur->address);
+			continue;
 		}
 
 		LOGP(DGOLAY, LOGL_DEBUG, "Encoding batch address %d/%d: '%s' type=%d.\n", msg_index + 1, count, cur->address, cur->type);
@@ -4489,17 +4459,14 @@ gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
 }
 
 /* Returns 0 on success, -EINVAL on hard rejection.
- * Logs warnings for soft issues (content, type-suffix).
+ * Logs warnings for soft issues (content).
  *
  * Validation stages (in order):
- *  1. Address length - exactly 7 characters (hard reject)
- *  2. Address digits - each character '0'-'9' (hard reject)
- *  3. Illegal GSC codes - G1G0 vs illegal_low[]/illegal_high[] (hard reject)
- *  4. Function suffix - 7th digit '0'-'9' (hard reject, covered by step 2)
- *  5. TYPE_AUTO derivation from function suffix
- *  6. Content warnings (log warning, accept)
- *  7. Type-suffix consistency warnings (log warning, accept)
- *  8. Voice file existence - access(path, R_OK) (hard reject)
+ *  1. Address - 6 digits, / and the address number 1-4 (hard reject)
+ *  2. Illegal GSC codes - G1G0 vs illegal_low[]/illegal_high[] (hard reject)
+ *  3. Type - as given; not given: tone only without a message, alphanumeric with one
+ *  4. Content warnings (log warning, accept)
+ *  5. Voice file existence - access(path, R_OK) (hard reject)
  */
 int golay_validate_msg(const char *address, enum gsc_msg_type type,
                        const char *data)
@@ -4507,27 +4474,16 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 	static const uint16_t illegal_low[16] = {   0,  25,  51, 103, 206, 340, 363, 412, 445, 530, 642, 726, 782, 810, 825, 877 };
 	static const uint16_t illegal_high[7] = {   0, 292, 425, 584, 631, 841, 851 };
 	int i, g1, g0, g1g0, a2, a1, a0, a2a1a0;
-	enum gsc_msg_type suffix_type;
-	int effective_type_is_auto = (type == TYPE_AUTO);
 	enum gsc_msg_type effective_type;
 
-	/* Stage 1: Address length - must be exactly 7 characters */
-	if (!address || strlen(address) != 7) {
-		LOGP(DGOLAY, LOGL_ERROR, "Validation failed: address must be exactly 7 characters (got %d).\n",
-		     address ? (int)strlen(address) : 0);
+	/* Stage 1: Address - 6 digits, / and the address number */
+	if (address_function(address) < 0) {
+		LOGP(DGOLAY, LOGL_ERROR, "Validation failed: address '%s' is not 6 digits, / and the address number 1-4.\n",
+		     address ? address : "");
 		return -EINVAL;
 	}
 
-	/* Stage 2: Address digits - each character must be '0'-'9' */
-	for (i = 0; i < 7; i++) {
-		if (address[i] < '0' || address[i] > '9') {
-			LOGP(DGOLAY, LOGL_ERROR, "Validation failed: non-digit character '%c' at position %d in address '%s'.\n",
-			     address[i], i, address);
-			return -EINVAL;
-		}
-	}
-
-	/* Stage 3: Illegal GSC codes - G1G0 mapped against tables */
+	/* Stage 2: Illegal GSC codes - G1G0 mapped against tables */
 	g1 = address[1] - '0';
 	g0 = address[2] - '0';
 	a2 = address[3] - '0';
@@ -4554,32 +4510,14 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 		}
 	}
 
-	/* Stage 4: Function suffix - 7th digit must be '0'-'9'
-	 * Already guaranteed by stage 2, but kept explicit per design. */
-
-	/* Stage 5: TYPE_AUTO derivation from function suffix */
-	switch (address[6]) {
-	case '1': case '2': case '3': case '4':
-		suffix_type = TYPE_VOICE;
-		break;
-	case '5': case '6': case '7': case '8':
-		suffix_type = TYPE_ALPHA;
-		break;
-	case '9': case '0':
-		suffix_type = TYPE_TONE;
-		break;
-	default:
-		/* Cannot happen after stage 2, but be defensive */
-		LOGP(DGOLAY, LOGL_ERROR, "Validation failed: invalid function suffix '%c'.\n", address[6]);
-		return -EINVAL;
-	}
-
-	if (effective_type_is_auto)
-		effective_type = suffix_type;
+	/* Stage 3: Type, as given by the sender (what a pager does with an
+	 * address number depends on the pager) */
+	if (type == TYPE_AUTO)
+		effective_type = (data && data[0]) ? TYPE_ALPHA : TYPE_TONE;
 	else
 		effective_type = type;
 
-	/* Stage 6: Content warnings (log warning, accept) */
+	/* Stage 4: Content warnings (log warning, accept) */
 	if (data && data[0] != '\0') {
 		/* Scan the normalized form so a "<0xNN>" escape counts as the single
 		 * byte it names rather than six literal characters. Sized to the TX
@@ -4628,20 +4566,7 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 		}
 	}
 
-	/* Stage 7: Type-suffix consistency warnings (log warning, accept) */
-	if (!effective_type_is_auto && type != suffix_type) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: explicit type conflicts with function suffix '%c' (suffix implies %s).\n",
-		     address[6],
-		     suffix_type == TYPE_VOICE ? "voice" :
-		     suffix_type == TYPE_ALPHA ? "alpha" :
-		     suffix_type == TYPE_TONE  ? "tone" : "unknown");
-	}
-	if (effective_type == TYPE_TONE && (address[6] == '3' || address[6] == '4')) {
-		LOGP(DGOLAY, LOGL_NOTICE, "Validation warning: tone-only message for voice-only address (suffix '%c'), potential incompatibility.\n",
-		     address[6]);
-	}
-
-	/* Stage 8: Voice file existence check (hard reject) */
+	/* Stage 5: Voice file existence check (hard reject) */
 	if (effective_type == TYPE_VOICE) {
 		if (!data || data[0] == '\0') {
 			LOGP(DGOLAY, LOGL_ERROR, "Validation failed: voice message requires a file path.\n");
@@ -4659,18 +4584,24 @@ int golay_validate_msg(const char *address, enum gsc_msg_type type,
 /*
  * Scan mode: enqueue a batch of messages for sequential address scanning.
  *
- * GSC addresses are 7 digits.  The scan range iterates over full 7-digit
- * addresses.  The message type is set by the caller via -y.
+ * The scan range counts 7 digit numbers: the 6 digits of the address and the
+ * suffix digit of the address number (1-4 and 5-8 are 1-4, 9 and 0 are 1 and 2).
+ * The message type is set by the caller via -y.
  */
 void golay_scan_enqueue(gsc_t *gsc, uint32_t *scan_from, uint32_t scan_to, enum gsc_msg_type type, int batch_size)
 {
-	char address[8];
+	char digits[16];
+	char address[9];
 	char message[16];
 	gsc_msg_t *msg;
 	int queued = 0;
 
 	while (*scan_from < scan_to && queued < batch_size) {
-		sprintf(address, "%07d", *scan_from);
+		snprintf(digits, sizeof(digits), "%07u", (unsigned) *scan_from);
+		if (golay_parse_address(digits, address) < 0) {
+			(*scan_from)++;
+			continue;
+		}
 
 		/* Generate message payload */
 		switch (type) {
@@ -4702,13 +4633,13 @@ void golay_scan_enqueue(gsc_t *gsc, uint32_t *scan_from, uint32_t scan_to, enum 
 void golay_msg_send(const char *text)
 {
 	char buffer[strlen(text) + 1], *p, *address_string, *message;
+	char address[9];
 	gsc_t *gsc;
 	gsc_msg_t *msg;
 	enum gsc_msg_type type = TYPE_AUTO;
 	int priority = 0;
 	double polarity = 0.0;
 	char *start, *end;
-	int i;
 
 	strcpy(buffer, text);
 
@@ -4739,19 +4670,14 @@ void golay_msg_send(const char *text)
 	p = start;
 	address_string = strsep(&p, ",");
 
-	/* Validate address is exactly 7 digits */
-	if (strlen(address_string) != 7) {
-		LOGP(DGOLAY, LOGL_ERROR, "FIFO: malformed input, address '%s' is not 7 characters (got %zu). Discarding: '%s'\n",
-		     address_string, strlen(address_string), text);
+	/* The address: 6 digits, / and the address number 1-4; 7 digits (the
+	 * suffix gives the address number); 6 or 5 digits (address number 1) */
+	if (golay_parse_address(address_string, address) < 0) {
+		LOGP(DGOLAY, LOGL_ERROR, "FIFO: malformed input, address '%s' is not 123456/1, 7, 6 or 5 digits. Discarding: '%s'\n",
+		     address_string, text);
 		return;
 	}
-	for (i = 0; i < 7; i++) {
-		if (!isdigit((unsigned char)address_string[i])) {
-			LOGP(DGOLAY, LOGL_ERROR, "FIFO: malformed input, address '%s' contains non-digit '%c' at position %d. Discarding: '%s'\n",
-			     address_string, address_string[i], i, text);
-			return;
-		}
-	}
+	address_string = address;
 
 	message = p;
 
@@ -4934,7 +4860,7 @@ int call_down_setup(int __attribute__((unused)) callref, const char *caller_id, 
 	char channel = '\0';
 	sender_t *sender;
 	gsc_t *gsc;
-	const char *address;
+	char address[9];
 	const char *message;
 	gsc_msg_t *msg;
 
@@ -4958,7 +4884,10 @@ int call_down_setup(int __attribute__((unused)) callref, const char *caller_id, 
 	}
 
 	/* get address */
-	address = dialing;
+	if (golay_parse_address(dialing, address) < 0) {
+		LOGP(DGOLAY, LOGL_NOTICE, "Cannot page '%s': not 123456/1, 7, 6 or 5 digits.\n", dialing);
+		return -CAUSE_INVALNUMBER;
+	}
 
 	/* get message */
 	if (caller_id[0])
