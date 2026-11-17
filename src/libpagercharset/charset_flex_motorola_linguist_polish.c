@@ -17,7 +17,7 @@
  * Standard 7-bit ASCII with Polish characters replacing some positions:
  *   0x40 '@' → Ę    0x5B '[' → Ź    0x5C '\' → Ł    0x5D ']' → Ń
  *   0x5E '^' → Ś    0x60 '`' → Ą    0x7B '{' → Ó    0x7C '|' → Ł
- *   0x7D '}' → Ż    0x7E '~' → Ć    0x7F DEL → SP
+ *   0x7D '}' → Ż    0x7E '~' → Ć
  */
 
 #include "pager_charset.h"

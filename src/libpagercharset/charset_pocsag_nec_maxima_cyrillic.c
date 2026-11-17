@@ -110,11 +110,11 @@ static const pager_charset_entry entries[128] = {
 
 	/* 0x40-0x5F: Latin uppercase (standard ASCII) */
 	/* 0x40 */ { "@" },
-	/* 0x41 */ { "A", "a" },
+	/* 0x41 */ { "A", "a", "\xd0\x90", "\xd0\xb0" },     /* Latin A + Cyrillic A lookalike (U+0410/U+0430, no own slot) */
 	/* 0x42 */ { "B", "b", "В", "в" },     /* Latin B + Cyrillic Ве lookalike (no own slot) */
 	/* 0x43 */ { "C", "c", "С", "с" },     /* Latin C + Cyrillic Es lookalike (no own slot) */
 	/* 0x44 */ { "D", "d" },
-	/* 0x45 */ { "E", "e" },
+	/* 0x45 */ { "E", "e", "\xd0\x95", "\xd0\xb5" },     /* Latin E + Cyrillic Ie lookalike (U+0415/U+0435, no own slot) */
 	/* 0x46 */ { "F", "f" },
 	/* 0x47 */ { "G", "g" },
 	/* 0x48 */ { "H", "h", "Н", "н" },     /* Latin H + Cyrillic En lookalike (no own slot) */
@@ -145,11 +145,11 @@ static const pager_charset_entry entries[128] = {
 	/* 0x60-0x7F: Cyrillic А-Я (NEC Maxima vendor-specific order).
 	 * Case-insensitive. */
 	/* 0x60 */ { NULL },                  /* backtick not available */
-	/* 0x61 */ { "А", "а" },              /* U+0410/U+0430 */
+	/* 0x61 */ { "\xd0\x91", "\xd0\xb1" },              /* U+0411/U+0431 Be */
 	/* 0x62 */ { "Г", "г" },              /* U+0413/U+0433 */
 	/* 0x63 */ { NULL },                  /* unmapped */
 	/* 0x64 */ { "Д", "д" },              /* U+0414/U+0434 */
-	/* 0x65 */ { "Е", "е", "Ё", "ё" },   /* U+0415/U+0435 + U+0401/U+0451 */
+	/* 0x65 */ { "\xd0\x81", "\xd1\x91" },   /* U+0401/U+0451 Io */
 	/* 0x66 */ { "Ж", "ж" },              /* U+0416/U+0436 */
 	/* 0x67 */ { "З", "з" },              /* U+0417/U+0437 */
 	/* 0x68 */ { "И", "и" },              /* U+0418/U+0438 */

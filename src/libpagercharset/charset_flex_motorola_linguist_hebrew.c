@@ -167,7 +167,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x7C */ { "|" },
 	/* 0x7D */ { "}" },
 	/* 0x7E */ { "~" },
-	/* 0x7F */ { " " },            /* SP */
+	/* 0x7F */ { NULL },           /* DEL */
 };
 
 const struct pager_charset pager_charset_flex_motorola_linguist_hebrew = {

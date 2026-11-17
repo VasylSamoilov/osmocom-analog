@@ -164,7 +164,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x7C */ { "}" },            /* UNCERTAIN */
 	/* 0x7D */ { "}" },            /* UNCERTAIN */
 	/* 0x7E */ { "Ñ" },            /* U+00D1 — UNCERTAIN placement */
-	/* 0x7F */ { " " },            /* SP (DEL position shows SP) */
+	/* 0x7F */ { NULL },           /* DEL */
 };
 
 const struct pager_charset pager_charset_flex_motorola_linguist_latin1 = {

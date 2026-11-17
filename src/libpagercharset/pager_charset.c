@@ -42,6 +42,11 @@ static const struct pager_charset *registry[] = {
 	&pager_charset_pocsag_philips_prg2220_latin_cyrillic,
 	&pager_charset_pocsag_motorola_advisor_cyrillic,
 	&pager_charset_pocsag_nec_21a_latin_cyrillic,
+	&pager_charset_pocsag_nec_maxima_compact_cyrillic,
+	&pager_charset_pocsag_swissphone_de506_ascii,
+	&pager_charset_pocsag_swissphone_de506_cyrillic,
+	&pager_charset_pocsag_partner_generic_cyrillic,
+	&pager_charset_pocsag_multitone_generic_ascii,
 	/* Golay/GSC */
 	&pager_charset_golay_generic_generic_ascii,
 	/* FLEX */
@@ -139,6 +144,26 @@ int pager_charset_encode(const struct pager_charset *cs, const char **utf8)
 
 	p = *utf8;
 	clen = utf8_char_len((unsigned char)*p);
+
+	/* A glyph of several characters (Arabic lam-alef) first, the longest one */
+	{
+		int best = -1, best_len = clen;
+
+		for (i = 0; i < cs->num_codes; i++) {
+			for (j = 0; j < PAGER_CHARSET_ENTRY_MAX && cs->entries[i][j]; j++) {
+				int n = (int)strlen(cs->entries[i][j]);
+
+				if (n > best_len && strncmp(cs->entries[i][j], p, n) == 0) {
+					best = i;
+					best_len = n;
+				}
+			}
+		}
+		if (best >= 0) {
+			*utf8 = p + best_len;
+			return best;
+		}
+	}
 
 	for (i = 0; i < cs->num_codes; i++) {
 		/* Check primary [0] and all aliases [1..] */

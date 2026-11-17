@@ -143,7 +143,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x6D */ { "Í" },            /* U+00CD */
 	/* 0x6E */ { "Î" },            /* U+00CE */
 	/* 0x6F */ { "Ī" },            /* U+012A I with macron */
-	/* Column 7 (0x70-0x7F): Latin-4 capitals + SP */
+	/* Column 7 (0x70-0x7F): Latin-4 capitals */
 	/* 0x70 */ { "Đ" },            /* U+0110 D with stroke */
 	/* 0x71 */ { "Ā" },            /* U+0100 A with macron */
 	/* 0x72 */ { "Ķ" },            /* U+0136 K with cedilla */
@@ -159,7 +159,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x7C */ { "Õ" },            /* U+00D5 — col 7 row C reads O-tilde/O-macron; UNCERTAIN */
 	/* 0x7D */ { "Ĩ" },            /* U+0128 I with tilde */
 	/* 0x7E */ { "Š" },            /* U+0160 S with caron */
-	/* 0x7F */ { " " },            /* SP */
+	/* 0x7F */ { NULL },           /* DEL */
 };
 
 const struct pager_charset pager_charset_flex_motorola_linguist_latin4 = {

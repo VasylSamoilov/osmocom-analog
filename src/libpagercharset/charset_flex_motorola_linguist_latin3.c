@@ -159,7 +159,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x7C */ { "Ì" },            /* col 7 row C — reads I-grave; UNCERTAIN */
 	/* 0x7D */ { "Ĵ" },            /* U+0134 J with circumflex */
 	/* 0x7E */ { "Ñ" },            /* U+00D1 */
-	/* 0x7F */ { " " },            /* SP */
+	/* 0x7F */ { NULL },           /* DEL */
 };
 
 const struct pager_charset pager_charset_flex_motorola_linguist_latin3 = {

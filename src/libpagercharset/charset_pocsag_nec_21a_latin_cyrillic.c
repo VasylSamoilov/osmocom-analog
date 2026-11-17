@@ -21,7 +21,7 @@
  * Similar to Motorola Advisor Linguist but with key differences:
  *   - Serbian letters (Ѝ,Љ,Њ,Ђ,Ќ,Ў,Џ) in control region 0x10-0x16
  *     instead of symbol positions 0x5C/0x5E/0x5F/0x7B-0x7D.
- *   - 0x5C,0x5E,0x5F,0x7B-0x7D are standard ASCII (\,^,_,{,|,}).
+ *   - 0x5C,0x5E,0x5F,0x7B,0x7D are standard ASCII (\,^,_,{,}); 0x7C is Dze (U+0405).
  *   - No special symbols in control region (no ¤,¢,×,÷,£,°, etc.).
  *   - 0x10: Ѝ (U+040D) — not present in Linguist codepage.
  *   - Ђ appears at both 0x13 and 0x78.
