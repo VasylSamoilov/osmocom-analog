@@ -1,5 +1,6 @@
 #include "../libmobile/sender.h"
 #include "../libfsk_pll/fsk_pll.h"
+#include "../libpagercharset/pager_charset.h"
 
 /*
  * POCSAG RIC (Radio Identity Code) - Pager Address Structure:
@@ -100,13 +101,6 @@ enum pocsag_state {
 	POCSAG_SILENCE,		/* TX silence gap between speed/polarity switches */
 };
 
-enum pocsag_language {
-	LANGUAGE_DEFAULT = 0,
-	LANGUAGE_GERMAN,		/* unknown-unknown-german */
-	LANGUAGE_SKYPER,		/* nec-skyper-categories */
-	LANGUAGE_CYRILLIC,		/* motorola-advisor_linguist-cyrillic */
-};
-
 struct pocsag;
 
 /* instance of outgoing message */
@@ -142,7 +136,7 @@ typedef struct pocsag {
 	/* system info */
 	int			tx; 			/* can transmit */
 	int			rx;			/* can receive */
-	enum pocsag_language	language;		/* special characters */
+	const struct pager_charset *charset;		/* codepage of alphanumeric messages */
 	enum pocsag_function	default_function;	/* default sub-address */
 	enum pocsag_msg_type	default_msg_type;	/* default message type for encoding */
 	const char 		*default_message;	/* default message, if caller has no caller ID */
@@ -337,10 +331,10 @@ void pocsag_exit(void);
 int pocsag_init(void);
 void pocsag_exit(void);
 void pocsag_new_state(pocsag_t *pocsag, enum pocsag_state new_state);
-void pocsag_msg_receive(enum pocsag_language language, const char *channel, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, int baudrate, double polarity, const char *message);
-int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, enum pocsag_language language, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window, int max_batches, int network_mode);
+void pocsag_msg_receive(const char *channel, uint32_t ric, enum pocsag_function function, enum pocsag_msg_type msg_type, int baudrate, double polarity, const char *message);
+int pocsag_create(const char *kanal, double frequency, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int tx, int rx, const struct pager_charset *charset, int baudrate, double deviation, double polarity, enum pocsag_function function, enum pocsag_msg_type msg_type, const char *message, char padding, uint32_t scan_from, uint32_t scan_to, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, int auto_baud, int auto_polarity, double dedup_window, int max_batches, int network_mode);
 void pocsag_destroy(sender_t *sender);
-void pocsag_msg_send(enum pocsag_language language, const char *text, size_t text_length);
+void pocsag_msg_send(const struct pager_charset *charset, const char *text, size_t text_length);
 void pocsag_msg_destroy(pocsag_msg_t *msg);
 void pocsag_get_id(pocsag_t *euro, char *id);
 void pocsag_receive_id(pocsag_t *euro, char *id);

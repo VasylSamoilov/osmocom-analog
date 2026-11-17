@@ -66,7 +66,7 @@ static const char *message = "1234";
  * may expect EOT (0x04), which can be selected with --padding 4.
  */
 static char padding = 0;
-static enum pocsag_language language = LANGUAGE_DEFAULT;
+static const struct pager_charset *charset = &pager_charset_pocsag_generic_generic_ascii;
 static uint32_t scan_from = 0;
 static uint32_t scan_to = 0;
 static double dedup_window = 60.0;	/* RX dedup window in seconds (0=disabled) */
@@ -109,11 +109,15 @@ void print_help(const char *arg0)
 	printf(" -M --message \"...\"\n");
 	printf("        Send this message, if no caller ID was given or of built-in console\n");
 	printf("        is used. (default \"%s\").\n", message);
-	printf(" -L --language <maker-model-codepage>\n");
-	printf("        Select character encoding for TX/RX translation.\n");
-	printf("          unknown-unknown-german                - German Umlauts from/to UTF-8\n");
-	printf("          nec-skyper-categories                 - NEC Skyper ROT-1 Caesar cipher\n");
-	printf("          motorola-advisor_linguist-cyrillic    - Motorola Advisor Linguist Cyrillic\n");
+	printf("    --charset <vendor-model-charset> | list\n");
+	printf("        Codepage of alphanumeric messages: the UTF-8 text is sent as its\n");
+	printf("        codes and the codes received are shown as UTF-8. A character\n");
+	printf("        without a code refuses the message; a code without a glyph is\n");
+	printf("        shown as <0xNN>. 'list' shows the codepages of POCSAG.\n");
+	printf("        (default %s-%s-%s)\n", charset->vendor, charset->model, charset->charset);
+	printf("    --charset-print <vendor-model-charset>\n");
+	printf("        Show the table of a codepage: each code, its glyph and the other\n");
+	printf("        characters accepted for it on TX.\n");
 	printf(" -S --scan <from> <to>\n");
 	printf("        Scan through given RIC range. Messages are batch-packed (up to 8 per\n");
 	printf("        POCSAG batch) by filling all frame slots, dramatically reducing scan\n");
@@ -174,7 +178,7 @@ void print_help(const char *arg0)
 	printf("            RIC: 0-2097151, function: A-D suffix (default A if omitted)\n");
 	printf("          type: auto|tone|numeric|alpha\n");
 	printf("          options: space-separated key=value pairs (can be empty):\n");
-	printf("            charset=default|unknown-unknown-german|nec-skyper-categories|motorola-advisor_linguist-cyrillic\n");
+	printf("            charset=<vendor-model-charset>  codepage of this message\n");
 	printf("            repeat=N          retransmissions after initial TX (0-10, default 0)\n");
 	printf("            delay=N           defer initial TX by N seconds (default 0)\n");
 	printf("            interval=N        seconds between retransmissions (default 10)\n");
@@ -182,8 +186,8 @@ void print_help(const char *arg0)
 	printf("        Examples:\n");
 	printf("          1234567A,alpha,,Hello World\n");
 	printf("          1234567,numeric,,12345\n");
-	printf("          1234567B,alpha,charset=motorola-advisor_linguist-cyrillic,Привіт\n");
-	printf("          1234567C,alpha,charset=nec-skyper-categories,Hello\n");
+	printf("          1234567B,alpha,charset=generic-generic-latin-german,<UTF-8 text>\n");
+	printf("          1234567C,alpha,charset=nec-skyper-ascii-rot1,Hello\n");
 	printf("          1234567,tone,,\n");
 	printf("        Numeric messages: only 0-9 R U <space> - [ ] are valid.\n");
 	printf("        Alphanumeric messages may contain any 7-bit character (0-127).\n");
@@ -206,6 +210,8 @@ void print_help(const char *arg0)
 #define OPT_MAX_BATCHES	259
 #define OPT_NETWORK	260
 #define OPT_ONESHOT	261
+#define OPT_CHARSET	262
+#define OPT_CHARSET_PRINT 263
 
 static void add_options(void)
 {
@@ -218,7 +224,8 @@ static void add_options(void)
 	option_add('y', "type", 1);
 	option_add('P', "polarity", 1);
 	option_add('M', "message", 1);
-	option_add('L', "language", 1);
+	option_add(OPT_CHARSET, "charset", 1);
+	option_add(OPT_CHARSET_PRINT, "charset-print", 1);
 	option_add('S', "scan", 2);
 	option_add(OPT_PADDING, "padding", 1);
 	option_add(OPT_DEDUP, "dedup", 1);
@@ -301,18 +308,29 @@ static int handle_options(int short_option, int argi, char **argv)
 	case 'M':
 		message = options_strdup(argv[argi++]);
 		break;
-	case 'L':
-		if (!strcasecmp(argv[argi], "unknown-unknown-german"))
-			language = LANGUAGE_GERMAN;
-		else if (!strcasecmp(argv[argi], "nec-skyper-categories"))
-			language = LANGUAGE_SKYPER;
-		else if (!strcasecmp(argv[argi], "motorola-advisor_linguist-cyrillic"))
-			language = LANGUAGE_CYRILLIC;
-		else {
-			fprintf(stderr, "Unknown language '%s'. Use unknown-unknown-german, nec-skyper-categories, or motorola-advisor_linguist-cyrillic.\n", argv[argi]);
+	case OPT_CHARSET:
+		if (!strcasecmp(argv[argi], "list")) {
+			printf("POCSAG codepages:\n");
+			pager_charset_list_protocol("pocsag");
+			return 0;
+		}
+		charset = pager_charset_lookup("pocsag", argv[argi]);
+		if (!charset) {
+			fprintf(stderr, "'%s' is not a POCSAG codepage, use '--charset list'.\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
+	case OPT_CHARSET_PRINT:
+		{
+			const struct pager_charset *cs = pager_charset_lookup("pocsag", argv[argi]);
+
+			if (!cs) {
+				fprintf(stderr, "'%s' is not a POCSAG codepage, use '--charset list'.\n", argv[argi]);
+				return -EINVAL;
+			}
+			pager_charset_print(cs);
+		}
+		return 0;
 	case 'S':
 		scan_from = atoi(argv[argi++]);
 		if (scan_from > 2097151) {
@@ -414,7 +432,7 @@ static void myhandler(void)
 				buffer[i] = '\0';
 				if (i > start) {
 					if (tx)
-						pocsag_msg_send(language, buffer + start, i - start);
+						pocsag_msg_send(charset, buffer + start, i - start);
 					else
 						LOGP(DPOCSAG, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
 				}
@@ -568,7 +586,7 @@ int main(int argc, char *argv[])
 			printf("Invalid channel '%s', Use '-k list' to get a list of all channels.\n\n", kanal[i]);
 			goto fail;
 		}
-		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, language, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, !baudrate_given, !polarity_given, dedup_window, max_batches, network_mode);
+		rc = pocsag_create(kanal[i], frequency, dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, tx, rx, charset, baudrate, deviation, polarity, function, msg_type, message, padding, scan_from, scan_to, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback, !baudrate_given, !polarity_given, dedup_window, max_batches, network_mode);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
 			goto fail;
@@ -592,7 +610,7 @@ int main(int argc, char *argv[])
 				       pocsag_msg_type_name(msg_type),
 				       message);
 			if (len > 0 && len < (int)sizeof(fifo_line))
-				pocsag_msg_send(language, fifo_line, len);
+				pocsag_msg_send(charset, fifo_line, len);
 		}
 	}
 

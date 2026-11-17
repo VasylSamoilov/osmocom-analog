@@ -39,6 +39,7 @@
 #include "frame.h"
 #include "dsp.h"
 #include "scheduler.h"
+#include "../libpagercharset/pager_charset.h"
 #ifdef HAVE_SDR
 #include "../libsdr/sdr.h"
 #endif
@@ -64,7 +65,6 @@ static int fixed_mod_type = FLEX_MOD_2FSK;	/* default 2FSK */
 static double fixed_polarity = 0.0;	/* 0.0 = not fixed */
 static int lpf_enabled = 1;
 static int ers_cycles_override = -1;
-static int default_charset = 0;
 static const char *pocsag_mix = NULL;
 static const char *temp_addr = NULL;
 static int no_ers = 0;
@@ -92,7 +92,15 @@ static int wav_test = 0;		/* --wav-test: exit after TX completes */
 static int num_transmissions = 1;	/* --num-transmissions: 1/2/3/4 */
 static int td_collapse = -1;		/* --td-collapse: -1=system, 5/6/7 */
 static int chan_setup_enabled = 0;	/* --chan-setup: enable BIW channel setup */
-int rx_kanji_enabled = 0;		/* --rx-kanji: enable Kanji/Shift-JIS decode */
+const struct pager_charset *flex_charset = &pager_charset_flex_generic_generic_ascii;	/* --charset */
+int flex_kanji = 0;			/* --charset generic-generic-kanji */
+
+/* The key of the Japanese Text Service (STD-43A 1.3.1): HEX/binary messages
+ * of Shift JIS characters, not a codepage of the 7-bit characters */
+static int flex_kanji_key(const char *key)
+{
+	return !strcasecmp(key, "generic-generic-kanji");
+}
 static int default_retransmit = 0;		/* --retransmit: 0-15, default 0 (no retransmission) */
 static int default_retransmit_interval = 128;	/* --retransmit-interval: 1-1920 frames, default 128 (~4 min) */
 static int default_send_delay = 0;		/* --send-delay: 0-1920 frames, default 0 (immediate) */
@@ -128,7 +136,7 @@ static const char *oneshot_station_id = "";	/* saved capcode for sweep re-enqueu
 #define OPT_NUM_TX		3021
 #define OPT_TD_COLLAPSE		3022
 #define OPT_CHAN_SETUP		3023
-#define OPT_RX_KANJI		3024
+#define OPT_CHARSET_PRINT	3024
 #define OPT_RETRANSMIT		3025
 #define OPT_RETRANSMIT_INTERVAL	3026
 #define OPT_SEND_DELAY		3027
@@ -250,8 +258,19 @@ void print_help(const char *arg0)
 	printf("        Example: --oneshot-freq 940.0125,941.0125,25\n");
 	printf("    --ers-cycles <N>\n");
 	printf("        Override ERS cycle count (default auto).\n");
-	printf("    --charset <ascii|kanji>\n");
-	printf("        Set default character set (default ascii).\n");
+	printf("    --charset <vendor-model-charset> | list\n");
+	printf("        Codepage of alphanumeric messages: the UTF-8 text is sent as its\n");
+	printf("        7-bit codes and the codes received are shown as UTF-8. A\n");
+	printf("        character without a code refuses the message; a code without a\n");
+	printf("        glyph is shown as <0xNN>. 'list' shows the codepages of FLEX.\n");
+	printf("        generic-generic-kanji is the Japanese Text Service (STD-43A):\n");
+	printf("        an alphanumeric message is sent as a HEX/binary message of\n");
+	printf("        16-bit Shift JIS characters, and HEX/binary messages of 16 or\n");
+	printf("        8-bit characters received are also shown as text.\n");
+	printf("        (default generic-generic-ascii)\n");
+	printf("    --charset-print <vendor-model-charset>\n");
+	printf("        Show the table of a codepage: each code, its glyph and the other\n");
+	printf("        characters accepted for it on TX.\n");
 	printf("    --pocsag-mix <frames>\n");
 	printf("        Enable POCSAG frame slot allocation.\n");
 	printf("    --temp-addr <cap:temp>\n");
@@ -282,9 +301,6 @@ void print_help(const char *arg0)
 	printf("    --chan-setup\n");
 	printf("        Enable BIW Channel Setup instruction (A-type 0x06) emission.\n");
 	printf("        Emits frame offset, carry-on, NID, and system message bits.\n");
-	printf("    --rx-kanji\n");
-	printf("        Enable Kanji/Shift-JIS 16-bit character decode for RX alpha messages.\n");
-	printf("        Output tagged ALN:KNJ instead of ALN.\n");
 	printf("    --retransmit <0-15>\n");
 	printf("        Default retransmission count after initial TX (default 0 = none).\n");
 	printf("        Each retransmission re-sends the message with R=0 and same N.\n");
@@ -347,7 +363,7 @@ void print_help(const char *arg0)
 	printf("        Types:  auto|tone|numeric|alpha|hex|instruction|short|secure|special|nnumeric|nspecial (or 0-10)\n");
 	printf("        Options: space-separated key=value pairs:\n");
 	printf("          speed=1600|3200|3200-4fsk|6400  polarity=normal|inverted\n");
-	printf("          priority=0|1  charset=ascii|kanji\n");
+	printf("          priority=0|1  charset=<vendor-model-charset>\n");
 	printf("          tempgroup=0|1  source=<id>\n");
 	printf("          phase=A|B|C|D|auto\n");
 	printf("          blocking=0-16  (hex bits/char: 0 or 16=16bit, 1=raw, default 1)\n");
@@ -482,7 +498,7 @@ static void add_options(void)
 	option_add(OPT_NUM_TX, "num-transmissions", 1);
 	option_add(OPT_TD_COLLAPSE, "td-collapse", 1);
 	option_add(OPT_CHAN_SETUP, "chan-setup", 0);
-	option_add(OPT_RX_KANJI, "rx-kanji", 0);
+	option_add(OPT_CHARSET_PRINT, "charset-print", 1);
 	option_add(OPT_RETRANSMIT, "retransmit", 1);
 	option_add(OPT_RETRANSMIT_INTERVAL, "retransmit-interval", 1);
 	option_add(OPT_SEND_DELAY, "send-delay", 1);
@@ -648,12 +664,21 @@ static int handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 	case OPT_CHARSET:
-		if (!strcasecmp(argv[argi], "ascii"))
-			default_charset = 0;
-		else if (!strcasecmp(argv[argi], "kanji"))
-			default_charset = 1;
-		else {
-			fprintf(stderr, "Charset must be ascii or kanji, use '-h' for help.\n");
+		if (!strcasecmp(argv[argi], "list")) {
+			printf("FLEX codepages:\n");
+			pager_charset_list_protocol("flex");
+			printf("  generic-generic-kanji\n");
+			return 0;
+		}
+		if (flex_kanji_key(argv[argi])) {
+			flex_charset = &pager_charset_flex_generic_generic_ascii;
+			flex_kanji = 1;
+			break;
+		}
+		flex_charset = pager_charset_lookup("flex", argv[argi]);
+		flex_kanji = 0;
+		if (!flex_charset) {
+			fprintf(stderr, "'%s' is not a FLEX codepage, use '--charset list'.\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
@@ -885,9 +910,26 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_CHAN_SETUP:
 		chan_setup_enabled = 1;
 		break;
-	case OPT_RX_KANJI:
-		rx_kanji_enabled = 1;
-		break;
+	case OPT_CHARSET_PRINT:
+		if (flex_kanji_key(argv[argi])) {
+			printf("flex generic-generic-kanji (STD-43A Japanese Text Service)\n");
+			printf("An alphanumeric message is sent as a HEX/binary message of 16-bit\n");
+			printf("Shift JIS characters (B = 0000), the hex digits of a character the\n");
+			printf("lowest first; HEX/binary messages of 16 or 8-bit characters received\n");
+			printf("are shown as text. The alphanumeric messages received keep\n");
+			printf("generic-generic-ascii.\n");
+			return 0;
+		}
+		{
+			const struct pager_charset *cs = pager_charset_lookup("flex", argv[argi]);
+
+			if (!cs) {
+				fprintf(stderr, "'%s' is not a FLEX codepage, use '--charset list'.\n", argv[argi]);
+				return -EINVAL;
+			}
+			pager_charset_print(cs);
+		}
+		return 0;
 	case OPT_RETRANSMIT:
 		default_retransmit = atoi(argv[argi]);
 		if (default_retransmit < 0 || default_retransmit > 15) {
@@ -933,12 +975,58 @@ static int handle_options(int short_option, int argi, char **argv)
 }
 
 
+/* The text of a message in its codepage: an alphanumeric message (a secure
+ * message of 7-bit characters) as the codes of the codepage; with Kanji an
+ * alphanumeric message as a HEX/binary message of 16-bit Shift JIS
+ * characters (B = 0000), left to right.  The buffer holds 4 hex digits a
+ * byte of the text.  Returns -1 if a character has no code. */
+static int fifo_encode_text(const struct pager_charset *cs, int kanji, enum flex_msg_type *mtype,
+			    int secure_alpha, char *buf, int buf_size, int *len,
+			    int *blocking, int *display_rtl)
+{
+	if (*len <= 0)
+		return 0;
+
+	if (kanji && *mtype == FLEX_MSG_TYPE_ALPHA) {
+		char hex[buf_size];
+		const char *error = NULL;
+		int n = pager_kanji_encode(buf, *len, 16, hex, buf_size, &error);
+
+		if (n < 0) {
+			LOGP(DFLEX, LOGL_NOTICE, "FIFO: message refused: %s.\n", error ? error : "Kanji");
+			return -1;
+		}
+		memcpy(buf, hex, n + 1);
+		*len = n;
+		*mtype = FLEX_MSG_TYPE_HEX;
+		*blocking = 0;
+		*display_rtl = 0;
+		return 0;
+	}
+
+	if (*mtype == FLEX_MSG_TYPE_ALPHA || (*mtype == FLEX_MSG_TYPE_SECURE && secure_alpha)) {
+		uint8_t codes[*len + 1];
+		const char *bad = NULL;
+		int n = pager_charset_encode_text(cs, buf, *len, codes, sizeof(codes), &bad);
+
+		if (n < 0) {
+			LOGP(DFLEX, LOGL_NOTICE, "FIFO: message refused: character at '%.8s' has no code in codepage %s-%s-%s.\n",
+			     bad ? bad : "", cs->vendor, cs->model, cs->charset);
+			return -1;
+		}
+		memcpy(buf, codes, n);
+		buf[n] = '\0';
+		*len = n;
+	}
+	return 0;
+}
+
 /* Parse FIFO options field: space-separated key=value pairs.
  * Sets per-message parameters from parsed values; unset keys keep defaults. */
 static void parse_fifo_options(const char *opts, int opts_len,
 			       int *speed, int *modulation_type,
 			       double *polarity_out, int *priority,
-			       int *charset, int *is_temp_group,
+			       const struct pager_charset **charset, int *kanji, int *is_temp_group,
 			       char *source_id, int *phase, int *blocking_length,
 			       int *hex_display_rtl, int *hex_header_msg,
 			       int *hex_status_info,
@@ -961,7 +1049,8 @@ static void parse_fifo_options(const char *opts, int opts_len,
 	*modulation_type = (fixed_speed > 0) ? fixed_mod_type : FLEX_MOD_2FSK;
 	*polarity_out = (polarity != 0.0) ? polarity : FLEX_DEFAULT_POLARITY;
 	*priority = 0;
-	*charset = 0;
+	*charset = flex_charset;
+	*kanji = flex_kanji;
 	*is_temp_group = 0;
 	source_id[0] = '\0';
 	*phase = -1;
@@ -1051,10 +1140,16 @@ static void parse_fifo_options(const char *opts, int opts_len,
 		else if (!strcmp(key, "priority"))
 			*priority = atoi(val);
 		else if (!strcmp(key, "charset")) {
-			if (!strcasecmp(val, "kanji"))
-				*charset = 1;
-			else
-				*charset = 0;
+			/* A codepage of FLEX, NULL refuses the message */
+			if (flex_kanji_key(val)) {
+				*charset = &pager_charset_flex_generic_generic_ascii;
+				*kanji = 1;
+			} else {
+				*charset = pager_charset_lookup("flex", val);
+				*kanji = 0;
+				if (!*charset)
+					LOGP(DFLEX, LOGL_NOTICE, "FIFO: '%s' is not a FLEX codepage, see '--charset list'.\n", val);
+			}
 		}
 		else if (!strcmp(key, "tempgroup"))
 			*is_temp_group = atoi(val);
@@ -1716,7 +1811,7 @@ static void fifo_process_line(const char *text, int text_length)
 {
 	char capcode_string[text_length + 1];
 	char type_string[text_length + 1];
-	char msg_buf[text_length + 1];
+	char msg_buf[text_length * 4 + 1];	/* Kanji: 4 hex digits a byte at most */
 	uint64_t capcode;
 	enum flex_msg_type mtype;
 	int message_length = 0;
@@ -1728,7 +1823,8 @@ static void fifo_process_line(const char *text, int text_length)
 	int msg_mod_type;
 	double msg_polarity;
 	int msg_priority;
-	int msg_charset;
+	const struct pager_charset *msg_charset;
+	int msg_kanji;
 	int msg_phase;
 	int msg_blocking_length;
 	int msg_hex_display_rtl;
@@ -2203,10 +2299,12 @@ static void fifo_process_line(const char *text, int text_length)
 			return;
 		}
 
-		/* Extract and parse options (speed, polarity, phase, priority, maildrop) */
+		/* Extract and parse options (speed, polarity, phase, priority, maildrop, charset) */
 		int tg_mail_drop = 0;
+		const struct pager_charset *tg_charset;
+		int tg_kanji;
 		{
-			int dummy_charset, dummy_tg;
+			int dummy_tg;
 			char dummy_src[64];
 			int dummy_bl, dummy_se, dummy_ss, dummy_nm, dummy_nr;
 			int dummy_cs, dummy_rt, dummy_ri, dummy_sd;
@@ -2216,7 +2314,7 @@ static void fifo_process_line(const char *text, int text_length)
 			parse_fifo_options(text + comma2 + 1, comma3 - comma2 - 1,
 					   &tg_speed, &tg_mod,
 					   &tg_pol, &tg_prio,
-					   &dummy_charset, &dummy_tg,
+					   &tg_charset, &tg_kanji, &dummy_tg,
 					   dummy_src, &tg_phase, &dummy_bl,
 					   &dummy_drtl, &dummy_hmsg, &dummy_sinfo,
 					   &tg_mail_drop,
@@ -2235,6 +2333,23 @@ static void fifo_process_line(const char *text, int text_length)
 			message_length = flex_scan_message(text + comma3 + 1,
 							   text_length - comma3 - 1,
 							   msg_buf, sizeof(msg_buf));
+
+		/* The text in the codepage of the message; the group message has
+		 * no HEX/binary header options, so not Kanji */
+		if (!tg_charset)
+			return;
+		if (tg_kanji && mtype_tg == FLEX_MSG_TYPE_ALPHA) {
+			LOGP(DFLEX, LOGL_NOTICE,
+			     "FIFO: tempgroup: Kanji (HEX/binary) is not supported for group messages.\n");
+			return;
+		}
+		{
+			int tg_bl = 0, tg_rtl = 0;
+
+			if (fifo_encode_text(tg_charset, 0, &mtype_tg, 0, msg_buf, sizeof(msg_buf),
+					     &message_length, &tg_bl, &tg_rtl) < 0)
+				return;
+		}
 
 		/* Enqueue */
 		{
@@ -2269,7 +2384,7 @@ static void fifo_process_line(const char *text, int text_length)
 	parse_fifo_options(opts_start, opts_len,
 			   &msg_speed, &msg_mod_type,
 			   &msg_polarity, &msg_priority,
-			   &msg_charset, &is_temp_group,
+			   &msg_charset, &msg_kanji, &is_temp_group,
 			   msg_source, &msg_phase, &msg_blocking_length,
 			   &msg_hex_display_rtl, &msg_hex_header_msg,
 			   &msg_hex_status_info,
@@ -2283,8 +2398,8 @@ static void fifo_process_line(const char *text, int text_length)
 			   &msg_short_number, &msg_short_r,
 			   &msg_instr_type, &msg_instr_slot, &msg_instr_frame);
 
-	/* Discard message if sectype was invalid */
-	if (msg_secure_encoding == -1)
+	/* Discard message if sectype or charset was invalid */
+	if (msg_secure_encoding == -1 || !msg_charset)
 		return;
 
 	/* Parse capcode — supports both plain numeric and Extended CAPCODE
@@ -2360,6 +2475,12 @@ static void fifo_process_line(const char *text, int text_length)
 			mtype = flex_detect_msg_type(msg_buf, message_length);
 		}
 	}
+
+	/* The text in the codepage of the message (Kanji: as HEX/binary) */
+	if (fifo_encode_text(msg_charset, msg_kanji, &mtype, msg_secure_encoding == 0,
+			     msg_buf, sizeof(msg_buf), &message_length,
+			     &msg_blocking_length, &msg_hex_display_rtl) < 0)
+		return;
 
 	/* Fixed-mode rejection: check speed, modulation type, and polarity locks */
 	{
@@ -2497,7 +2618,6 @@ static void fifo_process_line(const char *text, int text_length)
 					     " at end of address field.\n");
 					msg->priority = 0;
 				}
-				msg->charset = msg_charset;
 				msg->is_temp_group = is_temp_group;
 				msg->phase = msg_phase;
 				msg->blocking_length = msg_blocking_length;
@@ -2568,7 +2688,7 @@ static void fifo_process_line(const char *text, int text_length)
 				     flex_mod_name(msg_mod_type),
 				     (msg_polarity < 0) ? "inverted" : "normal",
 				     msg_priority,
-				     msg_charset ? "kanji" : "ascii",
+				     msg_kanji ? "generic-generic-kanji" : msg_charset->charset,
 				     is_temp_group,
 				     flex_phase_name(msg_phase),
 				     message_length,
@@ -2880,7 +3000,6 @@ int main(int argc, char *argv[])
 			f->lpf_enabled = lpf_enabled;
 			f->ers_cycles_override = ers_cycles_override;
 			f->no_ers = no_ers;
-			f->default_charset = default_charset;
 			f->default_polarity = polarity;
 			f->default_phase = default_phase;
 			f->default_blocking_length = default_blocking_length;

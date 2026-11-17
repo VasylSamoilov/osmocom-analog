@@ -1550,7 +1550,7 @@ static void done_rx_msg(pocsag_t *pocsag)
 		  pocsag->rx_msg_uncorrectable, ber);
 
 	if (pocsag->rx_msg_type == POCSAG_MSG_TYPE_TONE) {
-		pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
+		pocsag_msg_receive(pocsag->sender.kanal, pocsag->rx_msg_ric,
 				   pocsag->rx_msg_function, pocsag->rx_msg_type,
 				   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, NULL);
 		return;
@@ -1779,10 +1779,21 @@ static void done_rx_msg(pocsag_t *pocsag)
 		}
 
 		if (!is_duplicate) {
-			text = print_message(cand[0].data, cand[0].len);
-			pocsag_msg_receive(pocsag->language, pocsag->sender.kanal, pocsag->rx_msg_ric,
-					   pocsag->rx_msg_function, pocsag->rx_msg_type,
-					   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, text);
+			/* Alphanumeric: the codes as the text of the codepage */
+			if (cand[0].data == pocsag->rx_msg_data) {
+				char decoded[cand[0].len * 6 + 1];
+
+				pager_charset_decode_text(pocsag->charset, (const uint8_t *)cand[0].data,
+							  cand[0].len, decoded, sizeof(decoded));
+				pocsag_msg_receive(pocsag->sender.kanal, pocsag->rx_msg_ric,
+						   pocsag->rx_msg_function, pocsag->rx_msg_type,
+						   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, decoded);
+			} else {
+				text = print_message(cand[0].data, cand[0].len);
+				pocsag_msg_receive(pocsag->sender.kanal, pocsag->rx_msg_ric,
+						   pocsag->rx_msg_function, pocsag->rx_msg_type,
+						   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, text);
+			}
 		}
 	}
 }

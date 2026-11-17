@@ -2059,7 +2059,6 @@ typedef struct flex_frame_msg {
 	int		speed;			/* 1600, 3200, or 6400 (default 1600) */
 	double		polarity;		/* -1.0 or +1.0 (default FLEX_DEFAULT_POLARITY) */
 	int		priority;		/* 1 = priority, 0 = normal */
-	int		charset;		/* 0 = ASCII, 1 = KANJI */
 	int		is_temp_group;		/* 1 = deliver via Temporary Address (§5.2) */
 	int		temp_delivery_slot;	/* internal: temp addr delivery (0-15, -1=normal) */
 	int		sequence_num;		/* N field: message number (0-63), or -1 to
@@ -2195,7 +2194,6 @@ typedef struct flex_frame_params {
 
 	int		bitrate;		/* bit rate: 1600, 3200, or 6400 (bps, not baud) */
 	int		modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK */
-	int		charset;		/* 0 = ASCII, 1 = KANJI */
 	int		single_phase;		/* 1 = force single-phase output (for
 						 * network mode per-phase encoding) */
 	int		phase_index;		/* phase index for idle fill pattern:

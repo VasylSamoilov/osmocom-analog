@@ -2606,11 +2606,6 @@ static uint32_t encode_instruction_message(const char *msg, int *error)
 
 /* ===== Multi-Message Frame Encoding ===== */
 
-/* Forward declaration — defined after flex_encode_frame_multi(). */
-static uint32_t encode_kanji_message(uint32_t *frame_words, const char *msg,
-				 uint32_t msg_start, uint32_t *fwc_p,
-				 int *error);
-
 /* Number of 21-bit data words of a HEX/binary fragment holding the hex digits
  * in data: ceil(4*len/21), plus one padding word on the last fragment when the
  * bits end exactly at a word end and the last character (blocking bits) is
@@ -2665,18 +2660,6 @@ static int estimate_msg_words(const flex_frame_msg_t *msg)
 		len = (msg->message_length > 0)
 			? (size_t)msg->message_length
 			: strlen(msg->message);
-
-		if (msg->charset == 1) {
-			/* KANJI: 16-bit chars (2 bytes each), 1 char per word.
-			 * Total = 1 (header) + num_chars. */
-			size_t num_chars = len / 2;
-			size_t max_chars = FLEX_MAX_MSG_WORDS_ALPHA - 1;
-			if (num_chars == 0)
-				return -1;
-			if (num_chars > max_chars)
-				num_chars = max_chars;
-			return 1 + (int)num_chars;
-		}
 
 		if (len > FLEX_MAX_CHARS_ALPHA)
 			return -1;
@@ -3812,27 +3795,21 @@ size_t flex_encode_frame_multi(const flex_frame_msg_t *msgs, int msg_count,
 			 * Each encoder writes body words to body_buf starting
 			 * at body_fwc=0 and returns the vector word. */
 			switch (msgs[idx].msg_type) {
-			case FLEX_FRAME_MSG_TYPE_ALPHA:
-				if (msgs[idx].charset == 1) {
-					vw = encode_kanji_message(body_buf,
-						msgs[idx].message,
-						msg_start_for_vec, &body_fwc,
-						&enc_err);
-				} else {
-					struct flex_msg_config acfg;
-					memset(&acfg, 0, sizeof(acfg));
-					acfg.fragment_index = msgs[idx].fragment_index;
-					acfg.total_fragments = msgs[idx].total_fragments;
-					acfg.mail_drop = msgs[idx].mail_drop;
-					acfg.alpha_r_flag = msgs[idx].alpha_r_flag;
-					acfg.precomputed_sig = msgs[idx].precomputed_sig;
-					vw = encode_alpha_message(body_buf,
-						msgs[idx].message,
-						msg_start_for_vec, &body_fwc,
-						msgs[idx].sequence_num,
-						&acfg);
-				}
+			case FLEX_FRAME_MSG_TYPE_ALPHA: {
+				struct flex_msg_config acfg;
+				memset(&acfg, 0, sizeof(acfg));
+				acfg.fragment_index = msgs[idx].fragment_index;
+				acfg.total_fragments = msgs[idx].total_fragments;
+				acfg.mail_drop = msgs[idx].mail_drop;
+				acfg.alpha_r_flag = msgs[idx].alpha_r_flag;
+				acfg.precomputed_sig = msgs[idx].precomputed_sig;
+				vw = encode_alpha_message(body_buf,
+					msgs[idx].message,
+					msg_start_for_vec, &body_fwc,
+					msgs[idx].sequence_num,
+					&acfg);
 				break;
+			}
 
 			case FLEX_FRAME_MSG_TYPE_NUMERIC:
 				vw = encode_numeric_message(body_buf,
@@ -4797,97 +4774,6 @@ size_t flex_encode_data(const flex_frame_msg_t *msgs, int msg_count,
 	}
 
 	return (size_t)(out - buffer);
-}
-
-
-/* ===== KANJI Character Encoding ===== */
-
-/*
- * Encode a KANJI (16-bit character) message.
- *
- * KANJI mode packs one 16-bit character per 21-bit word (5 padding bits),
- * compared to 7-bit ASCII mode which packs 3 characters per word.
- *
- * Word layout:
- *   Word 0: fragment flags (f0f1) + K-bit checksum (same as alpha)
- *   Word 1+: bits [0..15] = 16-bit character, bits [16..20] = 0 (padding)
- *
- * The vector word uses the same alpha vector type (FLEX_VECTOR_TYPE_ALPHA).
- * The receiver distinguishes KANJI from ASCII via the BIW charset field.
- *
- * Parameters follow the same convention as encode_alpha_message():
- *   frame_words  — 88-word frame data array
- *   msg          — UTF-16 character data as raw bytes (2 bytes per char)
- *   msg_start    — word index where message body starts
- *   fwc_p        — pointer to frame word counter (updated on return)
- *   error        — set to negative error code on failure
- *
- * Returns the encoded vector word.  Only body words are written to
- * frame_words starting at *fwc_p.
- */
-static uint32_t encode_kanji_message(uint32_t *frame_words, const char *msg,
-				 uint32_t msg_start, uint32_t *fwc_p,
-				 int *error)
-{
-	uint32_t msg_word[FLEX_MAX_MSG_WORDS_ALPHA] = {0};
-	uint32_t word_idx, fwc;
-	size_t byte_len, num_chars, max_chars;
-	uint32_t k_bit;
-	uint32_t i;
-
-	if (!msg || !fwc_p) {
-		if (error)
-			*error = -FLEX_ERR_INVALID_MESSAGE;
-		return 0;
-	}
-
-	/*
-	 * Message is raw bytes representing 16-bit characters.
-	 * Each character = 2 bytes (big-endian).
-	 */
-	byte_len = strlen(msg);
-	num_chars = byte_len / 2;
-
-	if (num_chars == 0) {
-		if (error)
-			*error = -FLEX_ERR_INVALID_MESSAGE;
-		return 0;
-	}
-
-	/* Max chars: frame capacity minus header word, 1 char per word */
-	max_chars = FLEX_MAX_MSG_WORDS_ALPHA - 1;
-	if (num_chars > max_chars)
-		num_chars = max_chars;
-
-	/* Word 0: fragment flags f0f1=11 (initial fragment).
-	 * Kanji messages currently only support single-fragment encoding
-	 * (no C/F/N fragmentation fields — always F=11, C=0). */
-	msg_word[0] = FLEX_ALPHA_FRAG_INITIAL;
-
-	/* Pack 16-bit characters, 1 per 21-bit word */
-	word_idx = 1;
-	for (i = 0; i < (uint32_t)num_chars; i++) {
-		uint16_t ch = ((uint8_t)msg[i * 2] << 8)
-			    | (uint8_t)msg[i * 2 + 1];
-		msg_word[word_idx++] = (uint32_t)ch; /* bits 0-15, bits 16-20 = 0 */
-	}
-
-	/* K-bit: 10-bit checksum over all message words (same as alpha) */
-	k_bit = 0;
-	for (i = 0; i < word_idx; i++) {
-		k_bit += (msg_word[i])       & 0xFF;
-		k_bit += (msg_word[i] >> 8)  & 0xFF;
-		k_bit += (msg_word[i] >> 16) & 0x1F;
-	}
-	msg_word[0] |= (~k_bit) & 0x3FF;
-
-	/* Write encoded body words to frame (vector word returned to caller) */
-	fwc = *fwc_p;
-	for (i = 0; i < word_idx; i++)
-		frame_words[fwc++] = flex_encode_word(reverse_bits32(msg_word[i]));
-	*fwc_p = fwc;
-
-	return create_alpha_vector(msg_start, word_idx);
 }
 
 /*

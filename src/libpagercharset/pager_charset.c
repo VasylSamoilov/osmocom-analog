@@ -47,6 +47,7 @@ static const struct pager_charset *registry[] = {
 	&pager_charset_pocsag_swissphone_de506_cyrillic,
 	&pager_charset_pocsag_partner_generic_cyrillic,
 	&pager_charset_pocsag_multitone_generic_ascii,
+	&pager_charset_pocsag_nec_skyper_ascii_rot1,
 	/* Golay/GSC */
 	&pager_charset_golay_generic_generic_ascii,
 	/* FLEX */
@@ -197,4 +198,177 @@ void pager_charset_list(void)
 		       registry[i]->charset,
 		       registry[i]->code_bits);
 	}
+}
+
+const struct pager_charset *pager_charset_lookup(const char *protocol, const char *key)
+{
+	int i;
+	char buf[256];
+	size_t len;
+
+	if (!protocol || !key)
+		return NULL;
+
+	for (i = 0; registry[i]; i++) {
+		if (strcasecmp(registry[i]->protocol, protocol))
+			continue;
+		len = snprintf(buf, sizeof(buf), "%s-%s-%s",
+			       registry[i]->vendor, registry[i]->model, registry[i]->charset);
+		if (len < sizeof(buf) && strcasecmp(buf, key) == 0)
+			return registry[i];
+	}
+	return NULL;
+}
+
+void pager_charset_list_protocol(const char *protocol)
+{
+	int i;
+
+	for (i = 0; registry[i]; i++) {
+		if (protocol && strcasecmp(registry[i]->protocol, protocol))
+			continue;
+		printf("  %s-%s-%s\n", registry[i]->vendor, registry[i]->model, registry[i]->charset);
+	}
+}
+
+void pager_charset_print(const struct pager_charset *cs)
+{
+	int i, j;
+
+	if (!cs)
+		return;
+
+	printf("%s %s-%s-%s (%d-bit, %d codes)\n", cs->protocol, cs->vendor, cs->model,
+	       cs->charset, cs->code_bits, cs->num_codes);
+	for (i = 0; i < cs->num_codes; i++) {
+		const char *glyph = cs->entries[i][0];
+
+		if (!glyph) {
+			printf("0x%02X  <0x%02X>\n", i, i);
+			continue;
+		}
+		if (!strcmp(glyph, "\n"))
+			printf("0x%02X  <LF>", i);
+		else if (!strcmp(glyph, "\r"))
+			printf("0x%02X  <CR>", i);
+		else if (!strcmp(glyph, " "))
+			printf("0x%02X  <SP>", i);
+		else
+			printf("0x%02X  %s", i, glyph);
+		for (j = 1; j < PAGER_CHARSET_ENTRY_MAX && cs->entries[i][j]; j++)
+			printf("%s%s", (j == 1) ? "  TX also: " : " ", cs->entries[i][j]);
+		printf("\n");
+	}
+}
+
+/* <0xNN> at p: its value, else -1 */
+static int escaped_code(const char *p)
+{
+	int v = 0, i;
+
+	if (strncasecmp(p, "<0x", 3))
+		return -1;
+	for (i = 3; i < 5; i++) {
+		char c = p[i];
+
+		v <<= 4;
+		if (c >= '0' && c <= '9')
+			v |= c - '0';
+		else if (c >= 'a' && c <= 'f')
+			v |= c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F')
+			v |= c - 'A' + 10;
+		else
+			return -1;
+	}
+	return (p[5] == '>') ? v : -1;
+}
+
+int pager_charset_encode_text(const struct pager_charset *cs, const char *utf8, int length,
+			      uint8_t *out, int out_size, const char **bad)
+{
+	const char *p = utf8, *start, *end;
+	int n = 0, code;
+	char ch[8];
+
+	if (!cs || !utf8 || !out)
+		return -1;
+	end = utf8 + length;
+
+	while (p < end) {
+		unsigned char c = (unsigned char)*p;
+
+		if (n >= out_size)
+			return -1;
+		if ((c < 0x20 || c == 0x7f) && cs->code_bits >= 7) {
+			/* The code of its glyph (LF, CR), else its own */
+			const char *q = ch;
+
+			ch[0] = (char)c;
+			ch[1] = '\0';
+			code = c ? pager_charset_encode(cs, &q) : -1;
+			out[n++] = (code >= 0) ? (uint8_t)code : c;
+			p++;
+			continue;
+		}
+		code = (end - p >= 6) ? escaped_code(p) : -1;
+		if (code >= 0 && code < cs->num_codes) {
+			out[n++] = (uint8_t)code;
+			p += 6;
+			continue;
+		}
+		/* One character, terminated, for the lookup */
+		start = p;
+		{
+			int clen = utf8_char_len(c), i;
+			const char *q = ch;
+
+			if (clen > end - p)
+				clen = end - p;
+			for (i = 0; i < clen; i++)
+				ch[i] = p[i];
+			/* The rest of the text for a glyph of several characters */
+			for (; i < (int)sizeof(ch) - 1 && p + i < end && p[i]; i++)
+				ch[i] = p[i];
+			ch[i] = '\0';
+			code = pager_charset_encode(cs, &q);
+			p += q - ch;
+		}
+		if (code < 0) {
+			if (bad)
+				*bad = start;
+			return -1;
+		}
+		out[n++] = (uint8_t)code;
+	}
+	return n;
+}
+
+int pager_charset_decode_text(const struct pager_charset *cs, const uint8_t *codes,
+			      int length, char *out, int out_size)
+{
+	int i, n = 0, len;
+	char esc[8];
+	const char *glyph;
+
+	if (!out || out_size <= 0)
+		return 0;
+	out[0] = '\0';
+	if (!cs || !codes)
+		return 0;
+
+	for (i = 0; i < length; i++) {
+		glyph = pager_charset_decode(cs, codes[i]);
+		if (!glyph) {
+			snprintf(esc, sizeof(esc), "<0x%02X>", codes[i] & (cs->num_codes - 1));
+			glyph = esc;
+		}
+		len = strlen(glyph);
+		if (n + len >= out_size)
+			break;
+		memcpy(out + n, glyph, len);
+		n += len;
+	}
+	out[n] = '\0';
+	return n;
 }

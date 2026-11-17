@@ -11,6 +11,7 @@ pocsag_SOURCES = \
 	main.c
 pocsag_LDADD = \
 	$(COMMON_LA) \
+	$(top_builddir)/src/libpagercharset/libpagercharset.a \
 	$(top_builddir)/src/liboptions/liboptions.a \
 	$(top_builddir)/src/libmobile/libmobile.a \
 	$(top_builddir)/src/libdtmf/libdtmf.a \

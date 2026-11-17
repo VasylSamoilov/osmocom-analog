@@ -36,7 +36,8 @@ SUBDIRS = \
 	libmtp \
 	libaaimage \
 	libtones \
-	libecho
+	libecho \
+	libpagercharset
 
 if HAVE_ALSA
 SUBDIRS += \

@@ -98,6 +98,45 @@ int pager_charset_encode(const struct pager_charset *cs, const char **utf8);
 /* Print all registered charsets to stdout. */
 void pager_charset_list(void);
 
+/* Find the codepage of a protocol by its "vendor-model-charset" key (not case
+ * sensitive).  Returns NULL if the protocol has no such codepage. */
+const struct pager_charset *pager_charset_lookup(const char *protocol, const char *key);
+
+/* Print the "vendor-model-charset" keys of the codepages of a protocol. */
+void pager_charset_list_protocol(const char *protocol);
+
+/* Print the table of a codepage: one line a code, its glyph and the aliases
+ * accepted on TX; a code without a glyph is shown as <0xNN>. */
+void pager_charset_print(const struct pager_charset *cs);
+
+/* TX: the codes of a UTF-8 text of length bytes, a glyph or an alias for each
+ * character, or <0xNN> (a code of the codepage); a control byte (0x00-0x1F,
+ * 0x7F) of a 7 or 8-bit codepage is the code of its glyph (LF, CR), else its
+ * own code.  Returns the number of codes, or -1 if a character has no code
+ * (*bad, if given, points to it) or out is too small. */
+int pager_charset_encode_text(const struct pager_charset *cs, const char *utf8, int length,
+			      uint8_t *out, int out_size, const char **bad);
+
+/* RX: the UTF-8 text of codes, <0xNN> for a code without a glyph.  The text
+ * is cut to out_size - 1 bytes and always terminated.  Returns its length. */
+int pager_charset_decode_text(const struct pager_charset *cs, const uint8_t *codes,
+			      int length, char *out, int out_size);
+
+/* --- FLEX Japanese Text Service (STD-43A 1.3.1): Shift JIS in HEX/binary --- */
+
+/* The hex digits of a UTF-8 text of length bytes in Shift JIS characters of
+ * blocking bits (8 or 16), the digits of a character the lowest first.
+ * Returns the number of digits, or -1 and *error (if given) if a character
+ * has no Shift JIS code (8 bits: no 1-byte code) or hex is too small. */
+int pager_kanji_encode(const char *utf8, int length, int blocking, char *hex, int hex_size,
+		       const char **error);
+
+/* The UTF-8 text of the hex digits of Shift JIS characters of blocking bits
+ * (8 or 16); a character with a lost digit is '?', a code without a
+ * character <0xNN>/<0xNNNN>.  Right to left (D = 1): the first character is
+ * the last of the text.  Returns the length of the text. */
+int pager_kanji_decode(const char *hex, int blocking, int right_to_left, char *out, int out_size);
+
 /* --- Built-in POCSAG codepages (7-bit, 128 codes) --- */
 
 extern const struct pager_charset pager_charset_pocsag_generic_generic_ascii;
@@ -126,6 +165,7 @@ extern const struct pager_charset pager_charset_pocsag_swissphone_de506_ascii;
 extern const struct pager_charset pager_charset_pocsag_swissphone_de506_cyrillic;
 extern const struct pager_charset pager_charset_pocsag_partner_generic_cyrillic;
 extern const struct pager_charset pager_charset_pocsag_multitone_generic_ascii;
+extern const struct pager_charset pager_charset_pocsag_nec_skyper_ascii_rot1;
 
 /* --- Built-in Golay/GSC codepages (6-bit, 64 codes) --- */
 

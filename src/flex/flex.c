@@ -323,7 +323,6 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	if (flex->fixed_polarity != 0.0)
 		msg->polarity = flex->fixed_polarity;
 	msg->priority = 0;
-	msg->charset = 0;
 	msg->is_temp_group = 0;
 	msg->temp_delivery_slot = -1;
 	msg->source_id[0] = '\0';
@@ -1152,7 +1151,6 @@ static void flex_fragment_queue(flex_t *flex)
 			frag->modulation_type = msg->modulation_type;
 			frag->polarity = msg->polarity;
 			frag->priority = msg->priority;
-			frag->charset = msg->charset;
 			frag->is_temp_group = msg->is_temp_group;
 			frag->temp_delivery_slot = msg->temp_delivery_slot;
 			memcpy(frag->source_id, msg->source_id, sizeof(frag->source_id));
@@ -1877,13 +1875,7 @@ static int flex_estimate_msg_cost(const flex_msg_t *msg)
 	case FLEX_MSG_TYPE_ALPHA: {
 		if (len == 0)
 			return -1;
-		if (msg->charset == 1) {
-			/* KANJI: 16-bit chars, 1 char per word + 1 header */
-			size_t num_chars = len / 2;
-			if (num_chars == 0)
-				return -1;
-			bw = 1 + (int)num_chars;
-		} else {
+		{
 			int is_continuation = (msg->total_fragments > 1 &&
 					       msg->fragment_index > 0);
 			if (is_continuation)
@@ -3502,7 +3494,6 @@ static int flex_get_next_frame_network(flex_t *flex)
 					fm->speed = m->speed;
 					fm->polarity = m->polarity;
 					fm->priority = m->priority;
-					fm->charset = m->charset;
 					fm->is_temp_group = m->is_temp_group;
 					fm->temp_delivery_slot = m->temp_delivery_slot;
 					fm->source_id = m->source_id[0] ? m->source_id : NULL;
@@ -4028,7 +4019,6 @@ int flex_get_next_frame(flex_t *flex)
 			frame_msg.speed = msg->speed;
 			frame_msg.polarity = polarity;
 			frame_msg.priority = msg->priority;
-			frame_msg.charset = msg->charset;
 			frame_msg.is_temp_group = msg->is_temp_group;
 			frame_msg.temp_delivery_slot = msg->temp_delivery_slot;
 			/* The number of the message (and its R) at the first pass; the

@@ -127,7 +127,6 @@ typedef struct flex_msg {
 	int			modulation_type;	/* FLEX_MOD_2FSK or FLEX_MOD_4FSK (default 2FSK) */
 	double			polarity;		/* +1.0 = normal, -1.0 = inverted */
 	int			priority;		/* 0 = normal, 1 = priority */
-	int			charset;		/* 0 = ASCII, 1 = KANJI */
 	int			is_temp_group;		/* 1 = deliver via Temporary Address (§5.2) */
 	int			temp_delivery_slot;	/* internal: temp addr delivery slot (0-15)
 						 * set by flex_tempgroup_enqueue(), -1 = normal.
@@ -492,7 +491,6 @@ typedef struct flex {
 	/* per-message defaults (CLI -M message and FIFO fallback) */
 	int			default_speed;		/* 1600, 3200, 6400 — default 1600 */
 	double			default_polarity;	/* +1.0 = normal, -1.0 = inverted */
-	int			default_charset;	/* 0 = ASCII, 1 = KANJI — default 0 */
 	int			default_phase;		/* -1=auto (scheduler), 0=A, 1=B, 2=C, 3=D */
 	int			default_blocking_length; /* HEX/Binary B field default: 1-15 bits/char,
 						  * 0=16. Default 1 (raw bits). */
@@ -926,10 +924,6 @@ typedef struct flex {
 			int		display_rtl;	/* D: Display direction from initial frag */
 			int		header_msg;	/* H: Header message flag from initial frag */
 			int		status_info;	/* I: Status info field from initial frag */
-			int		kanji;		/* 1 = kanji/Shift-JIS 16-bit extraction
-						 * Set from rx_kanji_enabled on first
-						 * fragment so all fragments in a stream
-						 * use consistent 16-bit extraction. */
 			int		secure_subtype;	/* t1t0 value from secure message header
 						 * (-1 = not a secure message) */
 			/* HEX/Binary data bits of all fragments of the message

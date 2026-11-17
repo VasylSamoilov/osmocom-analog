@@ -35,6 +35,36 @@
 #include "frame.h"
 #include "dsp.h"
 #include "scheduler.h"
+#include "../libpagercharset/pager_charset.h"
+
+/* RX text of the 7-bit characters of an alphanumeric message: the glyphs of
+ * the codepage, <0xNN> for a code without one */
+static const char *rx_alpha_text(const char *codes)
+{
+	static char text[FLEX_REASM_MAX_LEN * 6 + 1];
+
+	pager_charset_decode_text(flex_charset, (const uint8_t *)codes, (int)strlen(codes), text, sizeof(text));
+	return text;
+}
+
+/* Japanese Text Service (STD-43A 1.3.1): the Shift JIS text of the hex digits
+ * of a HEX/binary message of 16 (B = 0000) or 8-bit characters, as
+ * ' "<text>"' after the digits; empty for other blocking lengths or without
+ * the Kanji codepage */
+static const char *rx_kanji_text(const char *hex, int blocking, int display_rtl)
+{
+	static char text[FLEX_REASM_MAX_LEN * 2 + 4];
+	int b = blocking ? blocking : 16;
+
+	text[0] = '\0';
+	if (!flex_kanji || (b != 16 && b != 8))
+		return text;
+	text[0] = ' ';
+	text[1] = '"';
+	pager_kanji_decode(hex, b, display_rtl, text + 2, sizeof(text) - 3);
+	strcat(text, "\"");
+	return text;
+}
 
 #define MAX_DISPLAY	1.4	/* something above speech level, no emphasis */
 
@@ -1403,7 +1433,6 @@ found:
 	flex->rx.reasm[pol][i].msg_num = msg_num;
 	flex->rx.reasm[pol][i].len = 0;
 	flex->rx.reasm[pol][i].msg_type = msg_type;
-	flex->rx.reasm[pol][i].kanji = 0;
 	flex->rx.reasm[pol][i].secure_subtype = -1;
 	flex->rx.reasm[pol][i].expected_f = 0; /* next F after initial (F=11) is F=00 per mod 3 sequence */
 	flex->rx.reasm[pol][i].last_frame = flex->rx.fiw_frame;
@@ -4054,70 +4083,7 @@ parse_phase:
 		else if ((c) != FLEX_ALPHA_ETX && nul_pending) nul_error = 1; \
 	} while (0)
 
-					/* Kanji mode: 16-bit Shift-JIS extraction
-					 * (1 char per word, bits 0-15) instead of
-					 * 7-bit ASCII (3 chars per word).
-					 * Only applies to alpha (V=101), not secure.
-					 *
-					 * For initial fragments: use global flag.
-					 * For continuation/final: use the reassembly
-					 * slot's kanji flag for consistency (Req 15.6),
-					 * so all fragments in a stream use the same
-					 * extraction mode even if the flag changes. */
-					int is_kanji = 0;
-					if (vec_type == FLEX_VECTOR_TYPE_ALPHA) {
-						if (is_initial) {
-							is_kanji = rx_kanji_enabled;
-						} else {
-							/* Check reassembly slot for this stream */
-							int kslot = reasm_find(flex, capcode, hdr_n);
-							if (kslot >= 0)
-								is_kanji = flex->rx.reasm[pol][kslot].kanji;
-							else
-								is_kanji = rx_kanji_enabled;
-						}
-					}
-					if (is_kanji)
-						msg_tag = "ALN:KNJ";
-
-					if (is_kanji) {
-						/* Kanji/Shift-JIS: extract 16-bit chars,
-						 * 1 per word (bits 0-15).  Output as
-						 * 2-byte big-endian per character.
-						 * Signature field handling is the same:
-						 * first word on initial fragment has sig
-						 * in bits 0-6, but in kanji mode we skip
-						 * the signature word entirely for char
-						 * extraction (it doesn't carry a valid
-						 * 16-bit character). */
-						for (w = start_word; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
-							uint16_t ch16;
-
-							if (ph->status[w] == FLEX_WORD_UNCORRECTABLE ||
-							    ph->status[w] == FLEX_WORD_NOT_RECEIVED) {
-								frag_words_ok = 0;
-								if (!(w == start_word && sig_slot) && ti < (int)sizeof(text) - 1)
-									text[ti++] = '?';
-								continue;
-							}
-
-							if (w == start_word && sig_slot) {
-								/* Signature word — extract sig,
-								 * skip for character data */
-								rx_sig = ph->words[w] & FLEX_ALPHA_SIG_MASK;
-								continue;
-							}
-
-							ch16 = ph->words[w] & 0xFFFF;
-							if (ch16 == 0)
-								continue; /* skip NUL padding */
-							/* Output as 2-byte big-endian */
-							if (ti < (int)sizeof(text) - 2) {
-								text[ti++] = (ch16 >> 8) & 0xFF;
-								text[ti++] = ch16 & 0xFF;
-							}
-						}
-					} else {
+					{
 						/* Standard 7-bit ASCII extraction:
 						 * 3 characters per word */
 						for (w = start_word; w <= mw2 && w < FLEX_WORDS_PER_FRAME; w++) {
@@ -4374,7 +4340,7 @@ parse_phase:
 						  flex_addr_type_flag(aw_type, is_long),
 						  prio_flag,
 						  msg_tag,
-						  text,
+						  rx_alpha_text(text),
 						  word_status);
 
 					/* Reassembly logic for fragmented Alpha/Secure messages.
@@ -4405,8 +4371,6 @@ parse_phase:
 						flex->rx.reasm[pol][slot].r_flag = hdr_r;
 						if (vec_type == FLEX_VECTOR_TYPE_SECURE)
 							flex->rx.reasm[pol][slot].secure_subtype = sec_t;
-						if (is_kanji)
-							flex->rx.reasm[pol][slot].kanji = 1;
 						flex->rx.reasm[pol][slot].rx_sig = rx_sig;
 						flex->rx.reasm[pol][slot].sig_sum = sig_sum;
 						flex->rx.reasm[pol][slot].sig_valid = frag_words_ok;
@@ -4447,9 +4411,7 @@ parse_phase:
 						if (slot >= 0) {
 							const char *reasm_tag;
 							const char *reasm_sig_status = "";
-							if (flex->rx.reasm[pol][slot].kanji)
-								reasm_tag = "ALN:KNJ";
-							else if (flex->rx.reasm[pol][slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
+							if (flex->rx.reasm[pol][slot].msg_type == FLEX_VECTOR_TYPE_SECURE)
 								reasm_tag = "SEC";
 							else
 								reasm_tag = msg_tag;
@@ -4519,7 +4481,7 @@ parse_phase:
 									  prio_flag,
 									  reasm_tag,
 									  flex->rx.reasm[pol][slot].secure_subtype,
-									  flex->rx.reasm[pol][slot].buf,
+									  rx_alpha_text(flex->rx.reasm[pol][slot].buf),
 									  flex->rx.reasm[pol][slot].word_status);
 							else
 								LOGP_CHAN(DDSP, LOGL_NOTICE,
@@ -4539,7 +4501,7 @@ parse_phase:
 									  flex_addr_type_flag(aw_type, is_long),
 									  prio_flag,
 									  reasm_tag,
-									  flex->rx.reasm[pol][slot].buf,
+									  rx_alpha_text(flex->rx.reasm[pol][slot].buf),
 									  flex->rx.reasm[pol][slot].word_status);
 							flex->rx.reasm[pol][slot].active = 0;
 						}
@@ -5393,7 +5355,7 @@ parse_phase:
 
 					/* Always output this fragment independently */
 					LOGP_CHAN(DDSP, LOGL_NOTICE,
-						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d%s%s%s%s%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+						  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d%s%s%s%s%s [%09" PRIu64 "] %c%c HEX [%s]%s\n",
 						  bitrate,
 						  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 						  phase_name,
@@ -5418,7 +5380,8 @@ parse_phase:
 						  capcode,
 						  flex_addr_type_flag(aw_type, is_long),
 						  prio_flag,
-						  hex);
+						  hex,
+						  (hex_frag_flag == 'K') ? rx_kanji_text(hex, hex_blocking, hex_display_rtl) : "");
 
 					/* HEX fragment reassembly (same C/F/N pattern as alpha).
 					 *
@@ -5487,7 +5450,7 @@ parse_phase:
 								r_sig = (flex->rx.reasm[pol][slot].rx_sig == ((~r_sum) & 0xFF)) ? "OK" : "FAIL";
 
 							LOGP_CHAN(DDSP, LOGL_NOTICE,
-								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d,K=%s,sig=%s,fragments=%d,bits=%d,nibble=4,order=lsb_first%s [%09" PRIu64 "] %c%c HEX [%s]\n",
+								  "RX: %dbps cycle=%u,frame=%u,phase=%c,baud=%d,fsk=%d,polarity=%s%s,frag=%s,N=%d,R=%d,M=%d,D=%d,H=%d,B=%d,I=%d,s=%d,K=%s,sig=%s,fragments=%d,bits=%d,nibble=4,order=lsb_first%s [%09" PRIu64 "] %c%c HEX [%s]%s\n",
 								  bitrate,
 								  flex->rx.fiw_cycle, flex->rx.fiw_frame,
 								  phase_name,
@@ -5511,7 +5474,10 @@ parse_phase:
 								  capcode,
 								  flex_addr_type_flag(aw_type, is_long),
 								  prio_flag,
-								  flex->rx.reasm[pol][slot].buf);
+								  flex->rx.reasm[pol][slot].buf,
+								  rx_kanji_text(flex->rx.reasm[pol][slot].buf,
+										flex->rx.reasm[pol][slot].blocking,
+										flex->rx.reasm[pol][slot].display_rtl));
 							flex->rx.reasm[pol][slot].active = 0;
 						}
 					}
