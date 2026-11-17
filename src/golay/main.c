@@ -109,6 +109,14 @@ void print_help(const char *arg0)
 	printf("        address number) and polarity; a data message that is one of them\n");
 	printf("        again within this window is suppressed. Tone and voice pages are\n");
 	printf("        always reported.\n");
+	printf("    --charset <vendor-model-charset> | list\n");
+	printf("        Codepage of alphanumeric messages (Rep. 900-2 Table VII): a\n");
+	printf("        character without a code refuses the message. 'list' shows the\n");
+	printf("        codepages of GSC. (default %s-%s-%s)\n",
+	       golay_charset->vendor, golay_charset->model, golay_charset->charset);
+	printf("    --charset-print <vendor-model-charset>\n");
+	printf("        Show the table of a codepage: each code, its glyph and the other\n");
+	printf("        characters accepted for it on TX.\n");
 	printf(" -y --type auto | tone | voice | numeric | alpha\n");
 	printf("        Message type for console and scan modes (default auto).\n");
 	printf("        'auto' is tone-only without a message, alpha with one.\n");
@@ -171,6 +179,8 @@ static void add_options(void)
 	option_add('S', "scan", 2);
 	option_add('y', "type", 1);
 	option_add(0x105, "dedup", 1);
+	option_add(0x106, "charset", 1);
+	option_add(0x107, "charset-print", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -217,6 +227,29 @@ static int handle_options(int short_option, int argi, char **argv)
 	case 'M':
 		message = options_strdup(argv[argi++]);
 		break;
+	case 0x106:
+		if (!strcasecmp(argv[argi], "list")) {
+			printf("GSC codepages:\n");
+			pager_charset_list_protocol("golay");
+			return 0;
+		}
+		golay_charset = pager_charset_lookup("golay", argv[argi]);
+		if (!golay_charset) {
+			fprintf(stderr, "'%s' is not a GSC codepage, use '--charset list'.\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case 0x107:
+		{
+			const struct pager_charset *cs = pager_charset_lookup("golay", argv[argi]);
+
+			if (!cs) {
+				fprintf(stderr, "'%s' is not a GSC codepage, use '--charset list'.\n", argv[argi]);
+				return -EINVAL;
+			}
+			pager_charset_print(cs);
+		}
+		return 0;
 	case 'V':
 		voice_dir = options_strdup(argv[argi++]);
 		break;

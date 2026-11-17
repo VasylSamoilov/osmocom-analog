@@ -1,5 +1,9 @@
 #include <time.h>
 #include "../libmobile/sender.h"
+#include "../libpagercharset/pager_charset.h"
+
+/* Codepage of the alphanumeric messages (--charset) */
+extern const struct pager_charset *golay_charset;
 
 enum gsc_msg_type {
 	TYPE_AUTO = 0,	/* Not given: tone only without a message, alphanumeric with one */

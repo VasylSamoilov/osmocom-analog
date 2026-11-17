@@ -42,6 +42,8 @@
 #include "golay.h"
 #include "dsp.h"
 
+const struct pager_charset *golay_charset = &pager_charset_golay_generic_generic_ascii;
+
 /* Terminal Input Flow (Appendix IV)
  *
  * Selector-level systems:
@@ -236,6 +238,20 @@ static gsc_msg_t *golay_msg_create(gsc_t __attribute__((unused)) *gsc, const cha
 	/* Convert any "<0xNN>" escapes in the input to raw bytes before storing;
 	 * the escape form is longer than its byte, so this never overflows. */
 	normalize_input_escapes(msg->data, text, (int)sizeof(msg->data));
+
+	/* Alphanumeric: every character needs a code in the codepage */
+	if (type == TYPE_ALPHA) {
+		uint8_t codes[sizeof(msg->data)];
+		const char *bad = NULL;
+
+		if (pager_charset_encode_text(golay_charset, msg->data, (int)strlen(msg->data),
+					      codes, (int)sizeof(codes), &bad) < 0) {
+			LOGP(DGOLAY, LOGL_NOTICE, "Message refused: character at '%.8s' has no code in codepage %s-%s-%s.\n",
+			     bad ? bad : "", golay_charset->vendor, golay_charset->model, golay_charset->charset);
+			free(msg);
+			return NULL;
+		}
+	}
 
 	/* Message is returned without linking into any queue.
 	 * The caller is responsible for calling scheduler_enqueue()
@@ -557,45 +573,16 @@ static const uint16_t word1s[50] = {
 	1575, 3463, 3152, 2572, 1252, 2592, 1552,  835, 1440,  160,
 };
 
-/* Rep. 900-2 Table VII (left column) */
+/* Rep. 900-2 Table VII (left column): the code of a character in the
+ * codepage, its glyph or an alias (lowercase, '\', '{', '}', LF); a character
+ * without one (refused by golay_msg_create) as a space */
 static char encode_alpha(char c)
 {
-	if (c >= 'a' && c <= 'z')
-		c = c - 'a' + 'A';
-	switch (c) {
-	case 0x0a:
-	case 0x0d:
-		LOGP(DGOLAY, LOGL_DEBUG, " -> CR/LF character.\n");
-		c = 0x3c;
-		break;
-	case '{':
-		LOGP(DGOLAY, LOGL_DEBUG, " -> '%c' character.\n", c);
-		c = 0x3b;
-		break;
-	case '}':
-		LOGP(DGOLAY, LOGL_DEBUG, " -> '%c' character.\n", c);
-		c = 0x3d;
-		break;
-	case '\\':
-		LOGP(DGOLAY, LOGL_DEBUG, " -> '%c' character.\n", c);
-		c = 0x20;
-		break;
-	case '_':
-		/* '_' (0x5F) falls outside the standard 0x20-0x5D range;
-		 * assigned to the otherwise unused code 0x3F. */
-		LOGP(DGOLAY, LOGL_DEBUG, " -> '%c' character.\n", c);
-		c = 0x3f;
-		break;
-	default:
-		if (c < 0x20 || c > 0x5d) {
-			LOGP(DGOLAY, LOGL_DEBUG, " -> ' ' character.\n");
-			c = 0x20;
-		} else {
-			LOGP(DGOLAY, LOGL_DEBUG, " -> '%c' character.\n", c);
-			c = c - 0x20;
-		}
-	}
-	return c;
+	char s[2] = { c, '\0' };
+	const char *p = s;
+	int code = pager_charset_encode(golay_charset, &p);
+
+	return (code < 0) ? 0x00 : (char)code;
 }
 
 /* Rep. 900-2 Table VII (right columns) */
@@ -1000,40 +987,14 @@ int reverse_word2(uint16_t w2, int g1g0, int *a2, int *a1, int *a0)
 	return 0;
 }
 
-/* Rep. 900-2 Table VII (left column, inverse mapping)
- *
- * Reverse the encode_alpha() mapping: 6-bit code (0x00-0x3F) back to ASCII.
- *
- * The encoder maps ASCII 0x20-0x5D to codes 0x00-0x3D by subtracting 0x20,
- * with special-case overrides for '\\' -> 0x20, CR/LF -> 0x3C,
- * '{' -> 0x3B, and '}' -> 0x3D.  Lowercase letters are uppercased first.
- *
- * Because '\\' and '@' both encode to 0x20, and '{'/'}' collide with
- * '['/']' at codes 0x3B/0x3D, the decoder uses the default arithmetic
- * mapping (code + 0x20) for those codes, recovering '@', '[', and ']'.
- * The '\\', '{', and '}' mappings are lossy in the encoder.
- *
- * Code 0x3C is the CR/LF special case (decoded as CR).
- * Code 0x3E is the NULL fill character used for padding empty slots.
- * Code 0x3F is assigned to '_' (0x5F), which falls outside the standard
- * 0x20-0x5D arithmetic range.
- */
-static const char alpha_decode_table[64] = {
-	/* 0x00 */ ' ', '!', '"', '#', '$', '%', '&', '\'',
-	/* 0x08 */ '(', ')', '*', '+', ',', '-', '.', '/',
-	/* 0x10 */ '0', '1', '2', '3', '4', '5', '6', '7',
-	/* 0x18 */ '8', '9', ':', ';', '<', '=', '>', '?',
-	/* 0x20 */ '\\', 'A', 'B', 'C', 'D', 'E', 'F', 'G',
-	/* 0x28 */ 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
-	/* 0x30 */ 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W',
-	/* 0x38 */ 'X', 'Y', 'Z', '{', '\r', '}', '\0', '_',
-};
-
+/* Rep. 900-2 Table VII (left column, inverse mapping): the glyph of a 6-bit
+ * code in the codepage (code + 0x20, but 0x3C CR and 0x3F '_'); 0x3E, the
+ * NULL fill used for padding, has none and is '\0' */
 char decode_alpha(uint8_t code)
 {
-	/* Mask to 6 bits per Rep. 900-2 Table VII */
-	code &= 0x3F;
-	return alpha_decode_table[code];
+	const char *glyph = pager_charset_decode(golay_charset, code & 0x3F);
+
+	return glyph ? glyph[0] : '\0';
 }
 
 /* Rep. 900-2 Table VII (right columns, inverse mapping)

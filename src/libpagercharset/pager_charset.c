@@ -231,6 +231,18 @@ void pager_charset_list_protocol(const char *protocol)
 	}
 }
 
+/* A glyph for the table: LF, CR and space by name */
+static const char *print_glyph(const char *glyph)
+{
+	if (!strcmp(glyph, "\n"))
+		return "<LF>";
+	if (!strcmp(glyph, "\r"))
+		return "<CR>";
+	if (!strcmp(glyph, " "))
+		return "<SP>";
+	return glyph;
+}
+
 void pager_charset_print(const struct pager_charset *cs)
 {
 	int i, j;
@@ -247,16 +259,9 @@ void pager_charset_print(const struct pager_charset *cs)
 			printf("0x%02X  <0x%02X>\n", i, i);
 			continue;
 		}
-		if (!strcmp(glyph, "\n"))
-			printf("0x%02X  <LF>", i);
-		else if (!strcmp(glyph, "\r"))
-			printf("0x%02X  <CR>", i);
-		else if (!strcmp(glyph, " "))
-			printf("0x%02X  <SP>", i);
-		else
-			printf("0x%02X  %s", i, glyph);
+		printf("0x%02X  %s", i, print_glyph(glyph));
 		for (j = 1; j < PAGER_CHARSET_ENTRY_MAX && cs->entries[i][j]; j++)
-			printf("%s%s", (j == 1) ? "  TX also: " : " ", cs->entries[i][j]);
+			printf("%s%s", (j == 1) ? "  TX also: " : " ", print_glyph(cs->entries[i][j]));
 		printf("\n");
 	}
 }
