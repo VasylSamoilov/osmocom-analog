@@ -453,9 +453,9 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("    --echo-suppressor\n");
 	printf("        Enable echo suppressor (energy-based direction detection).\n");
 	printf("    --echo-threshold <dB>\n");
-	printf("        Set threshold for direction detection (default: 10.0 dB).\n");
+	printf("        Set threshold for direction detection (default: %.1f dB).\n", echo_suppressor_config.threshold_db);
 	printf("    --echo-attenuation <dB>\n");
-	printf("        Set attenuation depth when suppressing (default: 40.0 dB).\n");
+	printf("        Set attenuation depth when suppressing (default: %.1f dB).\n", echo_suppressor_config.attenuation_db);
 	printf("    --echo-hangover <ms>\n");
 	printf("        Set hangover time to prevent rapid switching (default: 150 ms).\n");
 	printf("    --echo-delay <ms>\n");
