@@ -104,13 +104,33 @@ void iir_notch_init(iir_filter_t *filter, double frequency, int samplerate, int 
 	filter->b2 = (1 - K / Q + K * K) * norm;
 }
 
+/* Filter states of a filter that gets no input decay exponentially. When they
+ * become subnormal, arithmetic on them is about 100 times slower. So states that
+ * are below this limit (about -600 dB of full scale) are set to zero, which
+ * does not change the output. This is done every IIR_FLUSH_CHUNK samples, so
+ * states never get to the subnormal range, even with the longest block. */
+#define IIR_FLUSH_LIMIT	1e-30
+#define IIR_FLUSH_CHUNK	256
+
+static inline void iir_flush_states(double *z1, double *z2, int iterations)
+{
+	int j;
+
+	for (j = 0; j < iterations; j++) {
+		if (fabs(z1[j]) < IIR_FLUSH_LIMIT)
+			z1[j] = 0.0;
+		if (fabs(z2[j]) < IIR_FLUSH_LIMIT)
+			z2[j] = 0.0;
+	}
+}
+
 void iir_process(iir_filter_t *filter, sample_t *samples, int length)
 {
 	double a0, a1, a2, b1, b2;
 	double *z1, *z2;
 	double in, out;
 	int iterations = filter->iter;
-	int i, j;
+	int i, j, end;
 
 	/* get states */
 	a0 = filter->a0;
@@ -124,15 +144,21 @@ void iir_process(iir_filter_t *filter, sample_t *samples, int length)
 	z2 = filter->z2;
 
 	/* process filter */
-	for (i = 0; i < length; i++) {
-		in = *samples;
-		for (j = 0; j < iterations; j++) {
-			out = in * a0 + z1[j];
-			z1[j] = in * a1 + z2[j] - b1 * out;
-			z2[j] = in * a2 - b2 * out;
-			in = out;
+	for (i = 0; i < length; ) {
+		end = i + IIR_FLUSH_CHUNK;
+		if (end > length)
+			end = length;
+		for (; i < end; i++) {
+			in = *samples;
+			for (j = 0; j < iterations; j++) {
+				out = in * a0 + z1[j];
+				z1[j] = in * a1 + z2[j] - b1 * out;
+				z2[j] = in * a2 - b2 * out;
+				in = out;
+			}
+			*samples++ = in;
 		}
-		*samples++ = in;
+		iir_flush_states(z1, z2, iterations);
 	}
 }
 
