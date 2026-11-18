@@ -462,6 +462,7 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        Set SDR roundtrip delay for echo detection (default: 160, max: 500).\n");
 	printf("        Use this in SDR environments where echo arrives delayed.\n");
 	printf("        Typical values: 100-200ms for PlutoSDR, 50-100ms for LimeSDR.\n");
+	printf("        Without this option, the delay is measured during the call and used.\n");
 	printf("    --echo-stats\n");
 	printf("        Enable statistics logging for echo suppressor (debugging).\n");
 #ifdef HAVE_SDR
@@ -757,6 +758,7 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_ECHO_DELAY:
 		echo_suppressor_config.echo_delay_ms = atoi(argv[argi]);
+		echo_suppressor_config.echo_delay_given = 1;
 		if (echo_suppressor_config.echo_delay_ms < 0)
 			echo_suppressor_config.echo_delay_ms = 0;
 		if (echo_suppressor_config.echo_delay_ms > 500)

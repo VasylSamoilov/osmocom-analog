@@ -41,12 +41,33 @@ typedef struct {
 	double tx_energy_smooth;    /* Smoothed TX energy */
 	double rx_energy_smooth;    /* Smoothed RX energy */
 	
-	/* TX energy delay buffer for SDR roundtrip compensation */
-	double *tx_energy_history;  /* Circular buffer of TX energy values */
-	int history_size;           /* Buffer size in frames */
-	int history_write_pos;      /* Current write position */
-	int delay_frames;           /* Echo delay in frames */
-	double delayed_tx_energy;   /* TX energy from delay_frames ago */
+	/* TX energy delay buffer for SDR roundtrip compensation: the TX energy is kept in slots of a fixed
+	 * duration, whatever the size of the blocks given to echo_suppressor_process_tx() is */
+	double *tx_energy_history;  /* Circular buffer of TX energy values (dB), one per slot */
+	int history_size;           /* Buffer size in slots */
+	int history_write_pos;      /* Slot to write next */
+	int delay_frames;           /* Echo delay in slots */
+	double delayed_tx_energy;   /* TX energy of the slots the last RX block is compared with */
+	int slot_samples;           /* Samples of a slot */
+	double slot_acc;            /* Sum of squares of the slot that is being filled */
+	int slot_count;             /* Samples of the slot that is being filled */
+	long long slots_written;    /* Slots completed */
+	long long tx_total;         /* TX samples seen */
+	long long rx_total;         /* RX samples seen */
+	long long delay_samples;    /* Echo delay in samples */
+
+	/* Measurement of the echo delay: envelopes (RMS per slot) of TX and of RX before the suppression, and the
+	 * lag where they match best */
+	int auto_delay;             /* use the measured delay */
+	double *est_tx, *est_rx;    /* rings of EST_SLOTS envelopes */
+	double est_rx_acc;          /* sum of squares of the RX slot that is being filled */
+	int est_rx_count;           /* samples of that slot */
+	long long rx_slots;         /* RX slots completed */
+	long long est_next;         /* RX slot of the next estimation */
+	int est_delay_ms;           /* last measured delay, -1 = none yet */
+	double est_corr;            /* its correlation */
+	int sample_rate;
+	int ramp_ms;
 	
 	/* Suppression state */
 	int tx_hangover;            /* Hangover counter (samples) */
@@ -86,6 +107,7 @@ typedef struct {
 	double doubletalk_threshold_db; /* Unused - kept for compatibility */
 	int stats_enabled;          /* Enable statistics logging */
 	int echo_delay_ms;          /* SDR echo delay (default: 0, max: 500) */
+	int echo_delay_given;       /* the delay was given: do not measure and use the measured one */
 } echo_suppressor_config_t;
 
 /* Initialize echo suppressor */
