@@ -111,7 +111,7 @@ uint8_t traffic_area;
 int traffic_area_given = 0;
 char area_no = 0;
 int compandor = 1;
-double network_rx_gain_db = 6.0;
+double network_rx_gain_db = 0.0;
 int num_supervisory = 0;
 int supervisory[MAX_SENDER] = { 1 };
 const char *smsc_number = "767";
@@ -169,7 +169,8 @@ void print_help(const char *arg0)
 	printf("    --network-rx-gain <dB>\n");
 	printf("        Gain of the speech from the mobile toward the network, after the\n");
 	printf("        expander. 0 dB puts the reference tone (1 kHz, 3 kHz deviation) at\n");
-	printf("        about -22 dBFS rms. (default = '%.1f')\n", network_rx_gain_db);
+	printf("        about -20 dBFS rms with the compandor, -22 dBFS without.\n");
+	printf("        (default = '%.1f')\n", network_rx_gain_db);
 	printf(" -0 --supervisory 1..4 | 0\n");
 	printf("        Use supervisory signal 1..4 to detect loss of signal from mobile\n");
 	printf("        station, use 0 to disable. (default = '%d')\n", supervisory[0]);

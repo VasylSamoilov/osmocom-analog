@@ -60,6 +60,8 @@ extern double network_rx_gain_db;
 #define SPEECH_DEVIATION	3000.0	/* deviation of speech at 1 kHz */
 #define TX_PEAK_FSK		(4200.0 / 1800.0 * 1000.0 / SPEECH_DEVIATION)
 #define TX_PEAK_SUPER		(300.0 / 4015.0 * 1000.0 / SPEECH_DEVIATION)
+/* unaffected level of the expander, relative to the reference tone (NMT Doc 900-4 5.25) */
+#define EXPANDER_UNAFFECTED	0.7762	/* -2,2 dB */
 #define BIT_RATE		1200.0
 #define BIT_ADJUST		0.1	/* how much do we adjust bit clock on frequency change */
 #define F0			1800.0
@@ -213,6 +215,9 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 
 	/* attack (3ms) and recovery time (13.5ms) according to NMT specs */
 	setup_compandor(&nmt->cstate, 8000, 3.0, 13.5);
+	/* the expander restores the level above the unaffected level too, over the range of the compressor
+	 * (+20 dB) */
+	compandor_set_expander_max(&nmt->cstate, 9.99);
 
 	/* init filters */
 	iir_highpass_init(&nmt->rx_hp_filter, 300.0, nmt->sender.samplerate, 4);
@@ -610,8 +615,16 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 		}
 		if (ld)
 			meter_add(&ld->rx[2], samples, len, 0.0);
-		if (nmt->compandor)
+		if (nmt->compandor) {
+			/* NMT Doc 900-4 5.25: with the expander bypassed, the reference tone (1 kHz, 3,0 kHz deviation)
+			 * is 2,2 dB below the reference level at the line output, so the unaffected level of the
+			 * expander is 2,2 dB below the reference tone (the level of the FFSK signalling) */
+			for (i = 0; i < len; i++)
+				samples[i] /= EXPANDER_UNAFFECTED;
 			expand_audio(&nmt->cstate, samples, len);
+			for (i = 0; i < len; i++)
+				samples[i] *= EXPANDER_UNAFFECTED;
+		}
 		if (ld)
 			meter_add(&ld->rx[3], samples, len, 0.0);
 		if (nmt->network_rx_gain != 1.0) {
@@ -790,7 +803,8 @@ again:
 			}
 			tx_limiter_process(&nmt->tx_limiter, samples, length);
 			scale = tx_limiter_min_gain(&nmt->tx_limiter);
-			if (ld && scale < 1.0) {
+			/* a block counts as limited from -0.01 dB on */
+			if (ld && scale < 0.999) {
 				ld->limited++;
 				if (scale < ld->min_scale)
 					ld->min_scale = scale;

@@ -147,6 +147,14 @@ void tx_limiter_process(tx_limiter_t *l, sample_t *samples, int length)
 		/* mean of m over the last delay + 1 samples */
 		l->m_sum += m - l->m[slot];
 		l->m[slot] = m;
+		/* the running sum collects rounding errors, so it is summed again once per window */
+		if (slot == n - 1) {
+			int k;
+
+			l->m_sum = 0.0;
+			for (k = 0; k < n; k++)
+				l->m_sum += l->m[k];
+		}
 		g = l->m_sum / (double)n;
 
 		/* the gain rises at most by the release rate */

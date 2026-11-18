@@ -193,6 +193,22 @@ void setup_compandor(compandor_t *state, double samplerate, double attack_ms, do
 	state->c.step_down = pow(COMPANDOR_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
 	state->e.step_up = pow(COMPANDOR_ATTACK_FACTOR, 1000.0 / attack_ms / samplerate);
 	state->e.step_down = pow(COMPANDOR_RECOVERY_FACTOR, 1000.0 / recovery_ms / samplerate);
+	state->e.max_envelope = EXPANDER_ENVELOPE_MAX;
+}
+
+/*
+ * Set the maximum envelope of the expander
+ *
+ * A 2:1 expander restores the level above the unaffected level only if its envelope may rise above 1.0.
+ * The default is EXPANDER_ENVELOPE_MAX; ENVELOPE_MAX gives the same range as the compressor.
+ */
+void compandor_set_expander_max(compandor_t *state, double max_envelope)
+{
+	if (max_envelope < ENVELOPE_MIN)
+		max_envelope = ENVELOPE_MIN;
+	if (max_envelope > ENVELOPE_MAX)
+		max_envelope = ENVELOPE_MAX;
+	state->e.max_envelope = max_envelope;
 }
 
 /*
@@ -383,8 +399,8 @@ void expand_audio(compandor_t *state, sample_t *samples, int num)
 		 */
 		if (envelope < ENVELOPE_MIN)
 			envelope = ENVELOPE_MIN;
-		if (envelope > EXPANDER_ENVELOPE_MAX)
-			envelope = EXPANDER_ENVELOPE_MAX;
+		if (envelope > state->e.max_envelope)
+			envelope = state->e.max_envelope;
 
 		/* Apply expansion by multiplying by envelope
 		 * This is the inverse of compression (which divides by sqrt(envelope))
