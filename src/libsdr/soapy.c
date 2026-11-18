@@ -1052,10 +1052,19 @@ int soapy_get_tosend(int buffer_size)
 	pthread_mutex_lock(&soapy_tx_inst->timestamp_mutex);
 	tosend = buffer_size - (soapy_tx_inst->tx_timeNs - soapy_rx_inst->rx_timeNs) / soapy_tx_inst->Ns_per_sample;
 
-	/* Allow producing up to 2x buffer_size so the caller can catch up
-	 * from small deficits without triggering a hard resync.
-	 * Only resync when hopelessly behind (> 2x buffer = can't recover). */
-	if (tosend > buffer_size * 2) {
+	/* With TX time stamps, a packet stamped in the past is late and the
+	 * device drops it: producing more samples cannot catch up, because
+	 * tx_timeNs only moves on by the samples sent. Any deficit
+	 * (tosend > buffer_size) needs a resync of tx_timeNs to
+	 * rx_timeNs + buffer.
+	 * Without time stamps, allow producing up to 2x buffer_size so the
+	 * caller can catch up from small deficits; resync only when hopelessly
+	 * behind (> 2x buffer = can't recover). */
+	if (soapy_tx_inst->use_time_stamps && tosend > buffer_size) {
+		LOGP(DSOAPY, LOGL_ERROR, "SDR TX late (%d samples behind), resync.\n", tosend - buffer_size);
+		soapy_tx_inst->tx_timeNs = soapy_rx_inst->rx_timeNs + buffer_size * soapy_tx_inst->Ns_per_sample;
+		tosend = buffer_size;
+	} else if (tosend > buffer_size * 2) {
 		LOGP(DSOAPY, LOGL_ERROR, "SDR TX underrun, resync.\n");
 		if (!soapy_tx_inst->use_time_stamps) {
 			soapy_tx_inst->tx_timeNs = soapy_rx_inst->rx_timeNs;

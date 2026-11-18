@@ -1185,10 +1185,14 @@ int uhd_get_tosend(int buffer_size)
 		}
 	}
 
-	/* Allow producing up to 2x buffer_size so the caller can catch up
-	 * from small deficits without triggering a hard resync.
-	 * Only resync when hopelessly behind (> 2x buffer = can't recover). */
-	if (tosend > buffer_size * 2) {
+	/* With TX time stamps, a packet stamped in the past is late and the
+	 * device drops it: producing more samples cannot catch up, because
+	 * tx_time only moves on by the samples sent. Any deficit (advance < 0)
+	 * needs a resync of tx_time to rx_time + buffer.
+	 * Without time stamps, allow producing up to 2x buffer_size so the
+	 * caller can catch up from small deficits; resync only when hopelessly
+	 * behind (> 2x buffer = can't recover). */
+	if ((uhd_tx_inst->tx_timestamps && advance < 0.0) || tosend > buffer_size * 2) {
 		LOGP(DUHD, LOGL_ERROR, "SDR TX underrun (%.1f ms behind), resync.\n",
 			-advance * 1000.0);
 		/* Always resync tx_time regardless of timestamp mode.
