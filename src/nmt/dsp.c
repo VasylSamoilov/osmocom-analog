@@ -51,6 +51,9 @@
  * deviation.
  */
 
+/* gain of the speech toward the network, set by the --network-rx-gain option in main.c */
+extern double network_rx_gain_db;
+
 /* signaling */
 #define MAX_DEVIATION		4700.0
 #define MAX_MODULATION		4055.0
@@ -118,6 +121,89 @@ void dsp_init(void)
 
 static int fsk_send_bit(void *inst);
 static void fsk_receive_bit(void *inst, int bit, double quality, double level);
+static int speech_limiter_init(nmt_t *nmt);
+
+/* Gain to apply after the downsampler, so that the receive audio chain (high pass, notch and low
+ * pass at the DSP rate, downsampler) has 0 dB at 1 kHz. A copy of the filters is run with a test
+ * tone, so the states of the real ones are not touched. */
+static double rx_chain_calibration(nmt_t *nmt)
+{
+	iir_filter_t hp = nmt->rx_hp_filter, notch = nmt->rx_notch_filter, lp = nmt->rx_lp_filter;
+	samplerate_t sr;
+	sample_t *spl;
+	double c = 0.0, s = 0.0, amp;
+	int num, out, i;
+
+	/* 200 ms are enough for the filters to settle; at high rates stay below 100000 samples */
+	num = nmt->sender.samplerate / 5;
+	if (num > 100000)
+		num = 100000;
+	if (num < 4000)
+		num = 4000;
+	if (init_samplerate(&sr, 8000.0, (double)nmt->sender.samplerate, 3400.0) < 0)
+		return 1.0;
+	spl = calloc(num, sizeof(*spl));
+	if (!spl)
+		return 1.0;
+	for (i = 0; i < num; i++)
+		spl[i] = sin(2.0 * PI * 1000.0 * (double)i / (double)nmt->sender.samplerate);
+	iir_process(&hp, spl, num);
+	if (nmt->supervisory)
+		iir_process(&notch, spl, num);
+	iir_process(&lp, spl, num);
+	out = samplerate_downsample(&sr, spl, num);
+	/* amplitude of the 1 kHz component in the second half of the output */
+	for (i = out / 2; i < out; i++) {
+		c += spl[i] * cos(2.0 * PI * 1000.0 * (double)i / 8000.0);
+		s += spl[i] * sin(2.0 * PI * 1000.0 * (double)i / 8000.0);
+	}
+	free(spl);
+	if (out < 16)
+		return 1.0;
+	amp = 2.0 * sqrt(c * c + s * s) / (double)(out - out / 2);
+	if (amp < 0.1 || amp > 10.0)
+		return 1.0;
+	return 1.0 / amp;
+}
+
+/* Scale of the supervisory tone. The tone is added to the audio at the DSP rate, before the pre-emphasis of
+ * the sender (done in software, when on). TX_PEAK_SUPER assumes an ideal 6 dB/octave network (gain f/1 kHz),
+ * but the pre-emphasis also has a low pass at 3400 Hz, so the tone would give less than the 0,3 kHz deviation
+ * that NMT Doc 450-3 1.3.8.3 and NMT Doc 900-4 4.9 require. Measure the pre-emphasis at the frequency of the
+ * tone with a copy of its state, and scale the tone to give exactly that deviation. */
+static double super_tx_calibration(nmt_t *nmt)
+{
+	emphasis_t estate;
+	sample_t *spl;
+	double c = 0.0, s = 0.0, amp, freq;
+	int num, i;
+
+	if (!nmt->supervisory || !nmt->sender.pre_emphasis)
+		return 1.0;
+	freq = super_freq[nmt->supervisory - 1];
+	num = nmt->sender.samplerate / 10;
+	if (num > 100000)
+		num = 100000;
+	if (num < 4000)
+		num = 4000;
+	spl = calloc(num, sizeof(*spl));
+	if (!spl)
+		return 1.0;
+	memcpy(&estate, &nmt->sender.estate, sizeof(estate));
+	for (i = 0; i < num; i++)
+		spl[i] = TX_PEAK_SUPER * sin(2.0 * PI * freq * (double)i / (double)nmt->sender.samplerate);
+	pre_emphasis(&estate, spl, num);
+	for (i = num / 2; i < num; i++) {
+		c += spl[i] * cos(2.0 * PI * freq * (double)i / (double)nmt->sender.samplerate);
+		s += spl[i] * sin(2.0 * PI * freq * (double)i / (double)nmt->sender.samplerate);
+	}
+	free(spl);
+	amp = 2.0 * sqrt(c * c + s * s) / (double)(num - num / 2);
+	if (amp <= 0.0)
+		return 1.0;
+	/* 0,3 kHz of the speech deviation (normalized 1.0 = SPEECH_DEVIATION) */
+	return (300.0 / SPEECH_DEVIATION) / amp;
+}
 
 /* Init FSK of transceiver */
 int dsp_init_sender(nmt_t *nmt, double deviation_factor)
@@ -133,6 +219,24 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 	if (nmt->supervisory)
 		iir_notch_init(&nmt->rx_notch_filter, super_freq[nmt->supervisory - 1], nmt->sender.samplerate, 2, 20.0);
 	iir_lowpass_init(&nmt->rx_lp_filter, 3400.0, nmt->sender.samplerate, 8);
+
+	/* The filters of the receive chain and the downsampler are cascades of biquads, which have a gain at
+	 * 1 kHz (about +4.8 dB at 48 kHz and at 500 kHz). The expander is made for neutral level at
+	 * 1 kHz, so measure the gain of the chain with a test tone and calibrate it away, as the emphasis
+	 * does for itself. */
+	nmt->rx_gain_cal = rx_chain_calibration(nmt);
+	LOGP(DDSP, LOGL_DEBUG, "Receive chain has %.2f dB at 1 kHz, calibrated to 0 dB.\n", -20.0 * log10(nmt->rx_gain_cal));
+	/* The level of the reference tone toward the network is a choice of the network (NMT Doc 450/900-2
+	 * 7A.2), so it is set after the expander and does not change the level the expander works at. */
+	nmt->network_rx_gain = pow(10.0, network_rx_gain_db / 20.0);
+	nmt->super_tx_scale = super_tx_calibration(nmt);
+	if (speech_limiter_init(nmt) < 0) {
+		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory for the speech limiter!\n");
+		return -ENOMEM;
+	}
+	if (nmt->supervisory)
+		LOGP(DDSP, LOGL_INFO, "Supervisory tone %.0f Hz scaled by %.2f dB for %.0f Hz deviation after the pre-emphasis.\n",
+		     super_freq[nmt->supervisory - 1], 20.0 * log10(nmt->super_tx_scale), 300.0);
 
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Init DSP for Transceiver.\n");
 
@@ -195,6 +299,7 @@ void dsp_cleanup_sender(nmt_t *nmt)
 
 	fsk_mod_cleanup(&nmt->fsk_mod);
 	fsk_demod_cleanup(&nmt->fsk_demod);
+	tx_limiter_exit(&nmt->tx_limiter);
 
 	if (nmt->super_filter_spl) {
 		free(nmt->super_filter_spl);
@@ -345,6 +450,106 @@ void super_reset(nmt_t *nmt)
 	nmt->super_detect_count = 0;
 }
 
+/* LEVEL debug: levels of the speech in a call, once per second, at each stage of both directions. dB are
+ * relative to the 1 kHz reference tone (normalized amplitude 1.0 = 3,0 kHz deviation): "pk" is the peak, "rms"
+ * the RMS of a sine with the same power (0 dB = reference tone), "over" the samples beyond the given limit. */
+typedef struct level_meter {
+	double peak, sumsq;
+	long n, over;
+} level_meter_t;
+
+static void meter_add(level_meter_t *m, const sample_t *s, int n, double limit)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		double a = fabs(s[i]);
+
+		if (a > m->peak)
+			m->peak = a;
+		if (limit > 0.0 && a >= limit)
+			m->over++;
+		m->sumsq += s[i] * s[i];
+	}
+	m->n += n;
+}
+
+static double meter_pk_db(const level_meter_t *m)
+{
+	return 20.0 * log10(m->peak + 1e-12);
+}
+
+static double meter_rms_db(const level_meter_t *m)
+{
+	return m->n ? 20.0 * log10(sqrt(m->sumsq / (double)m->n) / M_SQRT1_2 + 1e-12) : -240.0;
+}
+
+#define LEVEL_RX_STAGES 5
+#define LEVEL_TX_STAGES 3
+struct level_debug {
+	nmt_t *nmt;
+	level_meter_t rx[LEVEL_RX_STAGES], tx[LEVEL_TX_STAGES];
+	long rx_samples, tx_samples;
+	long limited;			/* TX blocks scaled down by the speech limiter */
+	double min_scale;		/* lowest scale of the limiter */
+};
+static struct level_debug level_debug[8];
+
+static struct level_debug *level_debug_of(nmt_t *nmt)
+{
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		if (level_debug[i].nmt == nmt)
+			return &level_debug[i];
+		if (!level_debug[i].nmt) {
+			level_debug[i].nmt = nmt;
+			level_debug[i].min_scale = 1.0;
+			return &level_debug[i];
+		}
+	}
+	return NULL;
+}
+
+/* full scale of the 16 bit audio to and from the network, in normalized units */
+#define INT16_FULL_SCALE (1.0 / (SPEECH_LEVEL * 0.7079))
+
+static void level_debug_rx_log(nmt_t *nmt, struct level_debug *ld)
+{
+	static const char *name[LEVEL_RX_STAGES] = { "radio", "filters", "8 kHz", "expander", "to network" };
+	char line[512];
+	int i, pos = 0;
+
+	if (ld->rx_samples < nmt->sender.samplerate)
+		return;
+	for (i = 0; i < LEVEL_RX_STAGES; i++)
+		pos += snprintf(line + pos, sizeof(line) - pos, "%s%s pk %+.1f rms %+.1f", i ? " | " : "", name[i],
+				meter_pk_db(&ld->rx[i]), meter_rms_db(&ld->rx[i]));
+	LOGP_CHAN(DDSP, LOGL_NOTICE, "LEVEL mobile->network dB: %s | clipped %ld (full scale %+.1f dB)\n", line,
+		  ld->rx[LEVEL_RX_STAGES - 1].over, 20.0 * log10(INT16_FULL_SCALE));
+	memset(ld->rx, 0, sizeof(ld->rx));
+	ld->rx_samples = 0;
+}
+
+static void level_debug_tx_log(nmt_t *nmt, struct level_debug *ld)
+{
+	static const char *name[LEVEL_TX_STAGES] = { "from network", "compressor", "with supervisory" };
+	char line[512];
+	int i, pos = 0;
+
+	if (ld->tx_samples < nmt->sender.samplerate)
+		return;
+	for (i = 0; i < LEVEL_TX_STAGES; i++)
+		pos += snprintf(line + pos, sizeof(line) - pos, "%s%s pk %+.1f rms %+.1f", i ? " | " : "", name[i],
+				meter_pk_db(&ld->tx[i]), meter_rms_db(&ld->tx[i]));
+	LOGP_CHAN(DDSP, LOGL_NOTICE, "LEVEL network->mobile dB: %s | clipped from network %ld | limiter: %ld blocks, down to %.1f dB\n",
+		  line, ld->tx[0].over, ld->limited, 20.0 * log10(ld->min_scale));
+	memset(ld->tx, 0, sizeof(ld->tx));
+	ld->tx_samples = 0;
+	ld->limited = 0;
+	ld->min_scale = 1.0;
+}
+
 /* Process received audio stream from radio unit. */
 void sender_receive(sender_t *sender, sample_t *samples, int length, double __attribute__((unused)) rf_level_db)
 {
@@ -352,6 +557,13 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 	sample_t *spl;
 	int max, pos;
 	int i;
+	int in_call = (nmt->dsp_mode == DSP_MODE_AUDIO || nmt->dsp_mode == DSP_MODE_DTMF) && nmt->trans && nmt->trans->callref;
+	struct level_debug *ld = in_call ? level_debug_of(nmt) : NULL;
+
+	if (ld) {
+		meter_add(&ld->rx[0], samples, length, 0.0);
+		ld->rx_samples += length;
+	}
 
 	/* write received samples to decode buffer */
 	max = nmt->super_samples;
@@ -383,19 +595,40 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 	if (nmt->supervisory)
 		iir_process(&nmt->rx_notch_filter, samples, length);
 	iir_process(&nmt->rx_lp_filter, samples, length);
+	if (ld)
+		meter_add(&ld->rx[1], samples, length, 0.0);
 
-	if ((nmt->dsp_mode == DSP_MODE_AUDIO || nmt->dsp_mode == DSP_MODE_DTMF)
-	 && nmt->trans && nmt->trans->callref) {
+	if (in_call) {
 		int len, count;
 
 		len = samplerate_downsample(&nmt->sender.srstate, samples, length);
+		/* the chain from the radio has a gain at 1 kHz, that is calibrated away, so the expander sees
+		 * the level it is made for */
+		if (nmt->rx_gain_cal != 1.0) {
+			for (i = 0; i < len; i++)
+				samples[i] *= nmt->rx_gain_cal;
+		}
+		if (ld)
+			meter_add(&ld->rx[2], samples, len, 0.0);
 		if (nmt->compandor)
 			expand_audio(&nmt->cstate, samples, len);
+		if (ld)
+			meter_add(&ld->rx[3], samples, len, 0.0);
+		if (nmt->network_rx_gain != 1.0) {
+			for (i = 0; i < len; i++)
+				samples[i] *= nmt->network_rx_gain;
+		}
+		/* Echo suppressor RX processing (near-end audio after DSP processing) */
+		call_echo_suppressor_rx(nmt->trans->callref, samples, len);
 		if (nmt->dsp_mode == DSP_MODE_DTMF) {
 			/* encode and fill with silence after finish */
 			count = dtmf_encode(&nmt->dtmf, samples, len);
 			if (count < len)
 				memset(samples + count, 0, sizeof(*samples) * (len - count));
+		}
+		if (ld) {
+			meter_add(&ld->rx[4], samples, len, INT16_FULL_SCALE);
+			level_debug_rx_log(nmt, ld);
 		}
 		spl = nmt->sender.rxbuf;
 		pos = nmt->sender.rxbuf_pos;
@@ -438,6 +671,29 @@ static int fsk_send_bit(void *inst)
 	return dms_send_bit(nmt);
 }
 
+/* Speech limiter of the transmitter (NMT Doc 900-4 4.8.1 and 4.10: maximum permissible deviation 4,7 kHz;
+ * 4.9: the supervisory signal does not pass through the limiter), see tx_limiter.c. The limit is the
+ * maximum deviation less the deviation of the supervisory tone, after the TX gain, with a margin of 5 % for
+ * what the smoothing of the gain does to the pre-emphasis. The speech is delayed by the lookahead of 2 ms,
+ * the gain comes back by 1 dB per 10 ms. */
+#define LIMITER_MARGIN		0.95
+#define LIMITER_LOOKAHEAD_MS	2.0
+#define LIMITER_RELEASE_DB_MS	(1.0 / 10.0)
+
+static int speech_limiter_init(nmt_t *nmt)
+{
+	double limit;
+
+	limit = MAX_DEVIATION / SPEECH_DEVIATION;
+	if (nmt->supervisory)
+		limit -= 300.0 / SPEECH_DEVIATION;
+	if (nmt->sender.tx_gain > 0.0)
+		limit /= nmt->sender.tx_gain;
+	limit *= LIMITER_MARGIN;
+	return tx_limiter_init(&nmt->tx_limiter, &nmt->sender.estate, nmt->sender.pre_emphasis, nmt->sender.samplerate,
+			       limit, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_DB_MS);
+}
+
 /* Generate audio stream with supervisory signal. Keep phase for next call of function. */
 static void super_encode(nmt_t *nmt, sample_t *samples, int length)
 {
@@ -448,7 +704,7 @@ static void super_encode(nmt_t *nmt, sample_t *samples, int length)
 	phase = nmt->super_phase65536;
 
 	for (i = 0; i < length; i++) {
-		*samples++ += dsp_sine_super[(uint16_t)phase];
+		*samples++ += dsp_sine_super[(uint16_t)phase] * nmt->super_tx_scale;
 		phase += phaseshift;
 		if (phase >= 65536)
 			phase -= 65536;
@@ -488,19 +744,32 @@ again:
 	switch (nmt->dsp_mode) {
 	case DSP_MODE_AUDIO:
 	case DSP_MODE_DTMF:
+	{
+		struct level_debug *ld = (nmt->trans && nmt->trans->callref) ? level_debug_of(nmt) : NULL;
+
+		/* the sender adds the pre-emphasis and the deviation after this, and measures the final deviation */
+		nmt->sender.level_debug = (ld != NULL);
 		input_num = samplerate_upsample_input_num(&sender->srstate, length);
 		{
 			int16_t spl[input_num];
 			jitter_load_samples(&sender->dejitter, (uint8_t *)spl, input_num, sizeof(*spl), jitter_conceal_s16, NULL);
 			int16_to_samples_speech(samples, spl, input_num);
 		}
+		if (ld)
+			meter_add(&ld->tx[0], samples, input_num, INT16_FULL_SCALE * 0.9999);
+		/* Echo suppressor TX reference (far-end audio before DSP processing) */
+		if (nmt->trans && nmt->trans->callref)
+			call_echo_suppressor_tx(nmt->trans->callref, samples, input_num);
 		if (nmt->compandor)
 			compress_audio(&nmt->cstate, samples, input_num);
+		if (ld)
+			meter_add(&ld->tx[1], samples, input_num, 0.0);
 		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
 		/* send after dejitter, so audio is flushed */
 		if (nmt->dms.tx_frame_valid) {
 			fsk_mod_send(&nmt->fsk_mod, samples, length, 0);
 			nmt->dms.tx_mute = (nmt->dms.tx_mute > length) ? nmt->dms.tx_mute - length : 0;
+			nmt->tx_limiter_active = 0;
 			break;
 		}
 		/* the speech stays closed for 200 ms from the start of a DMS
@@ -511,16 +780,44 @@ again:
 			memset(samples, 0, muted * sizeof(*samples));
 			nmt->dms.tx_mute -= muted;
 		}
+		{
+			double scale;
+
+			/* a new stretch of speech starts without the old speech in the lookahead */
+			if (!nmt->tx_limiter_active) {
+				tx_limiter_reset(&nmt->tx_limiter);
+				nmt->tx_limiter_active = 1;
+			}
+			tx_limiter_process(&nmt->tx_limiter, samples, length);
+			scale = tx_limiter_min_gain(&nmt->tx_limiter);
+			if (ld && scale < 1.0) {
+				ld->limited++;
+				if (scale < ld->min_scale)
+					ld->min_scale = scale;
+			}
+		}
 		if (nmt->supervisory)
 			super_encode(nmt, samples, length);
+		if (ld) {
+			meter_add(&ld->tx[2], samples, length, 0.0);
+			ld->tx_samples += length;
+			level_debug_tx_log(nmt, ld);
+		}
 		break;
+	}
 	case DSP_MODE_DIALTONE:
+		nmt->sender.level_debug = 0;
+		nmt->tx_limiter_active = 0;
 		dial_tone(nmt, samples, length);
 		break;
 	case DSP_MODE_SILENCE:
+		nmt->sender.level_debug = 0;
+		nmt->tx_limiter_active = 0;
 		memset(samples, 0, length * sizeof(*samples));
 		break;
 	case DSP_MODE_FRAME:
+		nmt->sender.level_debug = 0;
+		nmt->tx_limiter_active = 0;
 		/* Encode frame into audio stream. If frames have
 		 * stopped, process again for rest of stream. */
 		count = fsk_mod_send(&nmt->fsk_mod, samples, length, 0);

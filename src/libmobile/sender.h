@@ -56,6 +56,11 @@ typedef struct sender {
 	int			de_emphasis;		/* use de_emhasis, done by sender */
 	emphasis_t		estate;			/* pre and de emphasis */
 
+	/* LEVEL debug of the final TX deviation, set by the protocol while it sends speech */
+	int			level_debug;
+	double			lv_peak;		/* peak deviation (Hz) */
+	long			lv_samples, lv_over;	/* samples, and samples beyond the maximum deviation */
+
 	/* loopback test */
 	int			loopback;		/* 0 = off, 1 = internal, 2 = external, 3 = audio loop */
 

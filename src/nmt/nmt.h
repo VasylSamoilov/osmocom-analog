@@ -6,6 +6,7 @@
 #include "../libfsk/fsk.h"
 #include "../libgoertzel/goertzel.h"
 #include "../libfilter/iir_filter.h"
+#include "tx_limiter.h"
 
 typedef struct nmt nmt_t;
 #include "dms.h"
@@ -116,6 +117,11 @@ struct nmt {
 	iir_filter_t		rx_notch_filter;	/* filter to remove supervisory signal from audio */
 	iir_filter_t		rx_lp_filter;		/* filter to limit bandwidth to 3400 Hz */
 	iir_filter_t		rx_hp_filter;		/* filter to remove DC / < 300 Hz */
+	double			rx_gain_cal;		/* gain to make the receive chain neutral at 1 kHz */
+	double			network_rx_gain;	/* gain of the speech toward the network, after the expander */
+	double			super_tx_scale;		/* scale of the supervisory tone, so it gives 0,3 kHz deviation */
+	tx_limiter_t		tx_limiter;		/* speech limiter of the transmitter */
+	int			tx_limiter_active;	/* the limiter is running on speech (reset when speech starts) */
 
 	/* sender's states */
 	enum nmt_state		state;

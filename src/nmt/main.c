@@ -111,6 +111,7 @@ uint8_t traffic_area;
 int traffic_area_given = 0;
 char area_no = 0;
 int compandor = 1;
+double network_rx_gain_db = 6.0;
 int num_supervisory = 0;
 int supervisory[MAX_SENDER] = { 1 };
 const char *smsc_number = "767";
@@ -134,6 +135,7 @@ int tc_band_end   = 0;	/* NMT 900 §4.3.3.13: TC/AC band end channel   (0 = unse
 #define OPT_CC_BAND_END		260
 #define OPT_TC_BAND_START	261
 #define OPT_TC_BAND_END		262
+#define OPT_NETWORK_RX_GAIN	263
 
 void print_help(const char *arg0)
 {
@@ -164,6 +166,10 @@ void print_help(const char *arg0)
 	printf("        Give area number 1..4 or 0 for no area number. (default = '%d')\n", area_no);
 	printf(" -C --compandor 1 | 0\n");
 	printf("        Make use of the compandor to reduce noise during call. (default = '%d')\n", compandor);
+	printf("    --network-rx-gain <dB>\n");
+	printf("        Gain of the speech from the mobile toward the network, after the\n");
+	printf("        expander. 0 dB puts the reference tone (1 kHz, 3 kHz deviation) at\n");
+	printf("        about -22 dBFS rms. (default = '%.1f')\n", network_rx_gain_db);
 	printf(" -0 --supervisory 1..4 | 0\n");
 	printf("        Use supervisory signal 1..4 to detect loss of signal from mobile\n");
 	printf("        station, use 0 to disable. (default = '%d')\n", supervisory[0]);
@@ -249,6 +255,7 @@ static void add_options(void)
 	option_add(OPT_CC_BAND_END,   "cc-band-end",   1);
 	option_add(OPT_TC_BAND_START, "tc-band-start", 1);
 	option_add(OPT_TC_BAND_END,   "tc-band-end",   1);
+	option_add(OPT_NETWORK_RX_GAIN, "network-rx-gain", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -391,6 +398,13 @@ error_ta:
 		tc_band_end = atoi(argv[argi]);
 		if (tc_band_end < 1 || tc_band_end > 999) {
 			fprintf(stderr, "--tc-band-end '%s' out of range (1..999, ordinary NMT 900 channels only)\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_NETWORK_RX_GAIN:
+		network_rx_gain_db = atof(argv[argi]);
+		if (network_rx_gain_db < -20.0 || network_rx_gain_db > 20.0) {
+			fprintf(stderr, "--network-rx-gain '%s' out of range (-20..20 dB)\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;

@@ -14,6 +14,7 @@ nmt_SOURCES = \
 	countries.c \
 	transaction.c \
 	dsp.c \
+	tx_limiter.c \
 	frame.c \
 	image.c \
 	main.c

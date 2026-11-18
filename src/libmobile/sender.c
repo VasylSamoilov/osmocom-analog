@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <math.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "get_time.h"
@@ -413,6 +414,27 @@ cant_recover:
 				gain_samples(samples[i], count, inst->tx_gain);
 			/* normal level to frequency deviation of speech level */
 			gain_samples(samples[i], count, inst->speech_deviation);
+			/* LEVEL debug: the final deviation, as transmitted */
+			if (inst->level_debug) {
+				int s;
+
+				for (s = 0; s < count; s++) {
+					double a = fabs(samples[i][s]);
+
+					if (a > inst->lv_peak)
+						inst->lv_peak = a;
+					if (inst->max_deviation > 0.0 && a > inst->max_deviation)
+						inst->lv_over++;
+				}
+				inst->lv_samples += count;
+				if (inst->lv_samples >= inst->samplerate) {
+					LOGP(DSENDER, LOGL_NOTICE, "(chan %s) LEVEL network->mobile transmitted: peak deviation %.0f Hz (max %.0f Hz), %ld samples over the max\n",
+					     inst->kanal, inst->lv_peak, inst->max_deviation, inst->lv_over);
+					inst->lv_peak = 0.0;
+					inst->lv_samples = 0;
+					inst->lv_over = 0;
+				}
+			}
 			/* set paging signal */
 			paging_signal[i] = inst->paging_signal;
 			on[i] = inst->paging_on;
