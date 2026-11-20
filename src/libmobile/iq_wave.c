@@ -29,7 +29,12 @@
 #include "../libfm/fm.h"
 #include "../libam/am.h"
 #include "../libsound/sound.h"
+#include "get_time.h"
 #include "iq_wave.h"
+
+/* The instance whose samples advance the sample clock (the first opened):
+ * channels of one run share the same time. */
+static void *iq_wave_clock_owner = NULL;
 
 /* Global config — set from main_mobile option parsing */
 const char *iq_read_rx_wave = NULL;
@@ -232,6 +237,9 @@ void *iq_wave_open(int direction, const char *audiodev, double *tx_frequency,
 		     iq_read_tx_wave, iq_samplerate);
 	}
 
+	if (!iq_wave_clock_owner)
+		iq_wave_clock_owner = iq;
+
 	return iq;
 
 error:
@@ -252,6 +260,9 @@ void iq_wave_close(void *inst)
 
 	if (!iq)
 		return;
+
+	if (iq_wave_clock_owner == iq)
+		iq_wave_clock_owner = NULL;
 
 	/* destroy wave files */
 	wave_destroy_playback(&iq->wave_rx_play);
@@ -423,6 +434,10 @@ int iq_wave_write(void *inst, sample_t **samples, uint8_t **power, int num,
 	}
 
 	iq->tx_write_pos += num;
+
+	/* Time is the samples processed: each pass writes one buffer */
+	if (iq == iq_wave_clock_owner)
+		sample_clock_advance(num, iq->samplerate);
 
 	return num;
 }

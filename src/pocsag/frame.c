@@ -40,6 +40,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <osmocom/core/timer.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "pocsag.h"
@@ -1278,7 +1279,7 @@ int64_t get_codeword(pocsag_t *pocsag)
 					msg->retransmit_count++;
 					msg->data_index = 0;
 					msg->bit_index = 0;
-					gettimeofday(&tv, NULL);
+					osmo_gettimeofday(&tv, NULL);
 					msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + msg->retransmit_interval;
 					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission %d/%d for RIC %d scheduled in %.0fs.\n",
 						  msg->retransmit_count, msg->retransmit_max, msg->ric, msg->retransmit_interval);
@@ -1306,7 +1307,7 @@ int64_t get_codeword(pocsag_t *pocsag)
 				if (msg->next_send_time > 0.0) {
 					struct timeval tv;
 					double now;
-					gettimeofday(&tv, NULL);
+					osmo_gettimeofday(&tv, NULL);
 					now = (double)tv.tv_sec + tv.tv_usec / 1e6;
 					if (now < msg->next_send_time)
 						continue;
@@ -1341,7 +1342,7 @@ int64_t get_codeword(pocsag_t *pocsag)
 				if (msg->retransmit_count < msg->retransmit_max) {
 					struct timeval tv;
 					msg->retransmit_count++;
-					gettimeofday(&tv, NULL);
+					osmo_gettimeofday(&tv, NULL);
 					msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + msg->retransmit_interval;
 					LOGP_CHAN(DPOCSAG, LOGL_INFO, "Tone retransmission %d/%d for RIC %d scheduled in %.0fs.\n",
 						  msg->retransmit_count, msg->retransmit_max, msg->ric, msg->retransmit_interval);
@@ -1382,7 +1383,7 @@ int64_t get_codeword(pocsag_t *pocsag)
 				int p, s, f;
 				int tx_pol = pocsag_pol_index(pocsag->tx_polarity);
 				int tx_spd = pocsag_speed_index(pocsag->tx_speed);
-				gettimeofday(&tv, NULL);
+				osmo_gettimeofday(&tv, NULL);
 				now = (double)tv.tv_sec + tv.tv_usec / 1e6;
 				for (p = 0; p < POCSAG_NUM_POL; p++) {
 					for (s = 0; s < POCSAG_NUM_SPD; s++) {
@@ -1455,7 +1456,7 @@ int64_t get_codeword(pocsag_t *pocsag)
 					if (cur >= ngroups)
 						cur = 0; /* fallback */
 
-					gettimeofday(&tv, NULL);
+					osmo_gettimeofday(&tv, NULL);
 					now = (double)tv.tv_sec + tv.tv_usec / 1e6;
 
 					/* check next groups in carousel order */
@@ -1669,7 +1670,7 @@ static void done_rx_msg(pocsag_t *pocsag)
 			double now;
 			int h;
 
-			gettimeofday(&tv, NULL);
+			osmo_gettimeofday(&tv, NULL);
 			now = (double)tv.tv_sec + tv.tv_usec / 1e6;
 
 			for (h = 0; h < POCSAG_RX_HISTORY_MAX; h++) {

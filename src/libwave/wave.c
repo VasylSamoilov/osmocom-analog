@@ -30,6 +30,18 @@
 
 /* NOTE: No locking required for writing and reading buffer pointers, since 'int' is atomic on >=32 bit machines */
 
+/* Batch runs: wait instead of dropping samples or returning silence, and let
+ * the file threads poll often, so the CPU is the only limit. */
+static volatile int wave_blocking = 0;
+
+#define WAVE_POLL_US		10000	/* thread poll in real time */
+#define WAVE_POLL_US_BLOCKING	200	/* thread poll and wait in batch */
+
+void wave_set_blocking(int on)
+{
+	wave_blocking = on;
+}
+
 static void *record_child(void *arg)
 {
 	wave_rec_t *rec = (wave_rec_t *)arg;
@@ -39,7 +51,7 @@ static void *record_child(void *arg)
 		/* how much data is in buffer */
 		to_write = (rec->buffer_size + rec->buffer_writep - rec->buffer_readp) % rec->buffer_size;
 		if (to_write == 0) {
-			usleep(10000);
+			usleep((wave_blocking) ? WAVE_POLL_US_BLOCKING : WAVE_POLL_US);
 			continue;
 		}
 		/* only write up to the end of buffer */
@@ -77,7 +89,7 @@ static void *playback_child(void *arg)
 		/* how much space is in buffer */
 		to_read = (play->buffer_size + play->buffer_readp - play->buffer_writep - 1) % play->buffer_size;
 		if (to_read == 0) {
-			usleep(10000);
+			usleep((wave_blocking) ? WAVE_POLL_US_BLOCKING : WAVE_POLL_US);
 			continue;
 		}
 		/* only read up to the end of buffer */
@@ -343,6 +355,12 @@ int wave_write(wave_rec_t *rec, sample_t **samples, int length)
 	/* how much space is in buffer */
 	to_write = (rec->buffer_size + rec->buffer_readp - rec->buffer_writep - 1) % rec->buffer_size;
 	to_write /= 2 * rec->channels;
+	/* batch: wait for the file thread to make room, drop nothing */
+	while (wave_blocking && to_write < length && !rec->finish) {
+		usleep(WAVE_POLL_US_BLOCKING);
+		to_write = (rec->buffer_size + rec->buffer_readp - rec->buffer_writep - 1) % rec->buffer_size;
+		to_write /= 2 * rec->channels;
+	}
 	if (to_write < length)
 		LOGP(DWAVE, LOGL_NOTICE, "Record WAVE buffer overflow.\n");
 	else
@@ -391,6 +409,13 @@ read_empty:
 	/* how much do we read from buffer */
 	to_read = (play->buffer_size + play->buffer_writep - play->buffer_readp) % play->buffer_size;
 	to_read /= 2 * play->channels;
+	/* batch: wait for the file thread to read the samples asked for, so
+	 * no silence is put in that is not in the file */
+	while (wave_blocking && to_read < length && to_read < (int)play->left && !play->finish) {
+		usleep(WAVE_POLL_US_BLOCKING);
+		to_read = (play->buffer_size + play->buffer_writep - play->buffer_readp) % play->buffer_size;
+		to_read /= 2 * play->channels;
+	}
 	if (to_read > (int)play->left)
 		to_read = play->left;
 	if (to_read > length)

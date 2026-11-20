@@ -829,6 +829,7 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	int num_chan, i;
 	int c;
 	int rc;
+	int batch;
 
 	if (!got_init) {
 		fprintf(stderr, "main_mobile_init was not called, please fix!\n");
@@ -896,17 +897,6 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		cc_argv[cc_argc++] = options_strdup("remote 127.0.0.1:4200");
 	}
 
-	/* init OSMO-CC */
-	if (!use_osmocc_sock)
-		console_init(call_device, call_samplerate, call_buffer, loopback, echo_test, echo_analysis, echo_analysis_duration, number_digits, number_lengths, station_id);
-
-	/* init call control instance */
-	rc = call_init(name, (use_osmocc_sock) ? send_patterns : 0, release_on_disconnect, use_osmocc_sock, cc_argc, cc_argv, no_l16, call_toneset);
-	if (rc < 0) {
-		fprintf(stderr, "Failed to create call control instance. Quitting!\n");
-		return;
-	}
-
 #ifdef HAVE_SDR
 	rc = sdr_configure(dsp_samplerate);
 	if (rc < 0)
@@ -924,6 +914,26 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 			iq_write_tx_wave = sdr_config->write_iq_tx_wave;
 	}
 #endif
+
+	/* Batch: every sample from and to files (the IQ wave device, no SDR, no
+	 * call socket). Time is the sample count and the loop runs as fast as the
+	 * CPU allows; nothing is interactive (no keyboard, no displays, no sound
+	 * card on the call side). */
+	batch = iq_wave_is_active() && !use_sdr && !use_osmocc_sock;
+	/* the WAV files (IQ and audio) wait instead of dropping samples */
+	if (batch)
+		wave_set_blocking(1);
+
+	/* init OSMO-CC */
+	if (!use_osmocc_sock)
+		console_init((batch) ? "" : call_device, call_samplerate, call_buffer, loopback, echo_test, echo_analysis, echo_analysis_duration, number_digits, number_lengths, station_id);
+
+	/* init call control instance */
+	rc = call_init(name, (use_osmocc_sock) ? send_patterns : 0, release_on_disconnect, use_osmocc_sock, cc_argc, cc_argv, no_l16, call_toneset);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to create call control instance. Quitting!\n");
+		return;
+	}
 
 	/* open audio */
 	if (sender_open_audio(buffer_size, dsp_interval))
@@ -954,22 +964,29 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		}
 	}
 
-	if (!loopback)
+	if (!loopback && !batch)
 		print_aaimage();
 
-	/* prepare terminal */
-	tcgetattr(0, &term_orig);
-	term = term_orig;
-	term.c_lflag &= ~(ISIG|ICANON|ECHO);
-	term.c_cc[VMIN]=1;
-	term.c_cc[VTIME]=2;
-	tcsetattr(0, TCSANOW, &term);
+	/* prepare terminal (not in batch: no keyboard) */
+	if (!batch) {
+		tcgetattr(0, &term_orig);
+		term = term_orig;
+		term.c_lflag &= ~(ISIG|ICANON|ECHO);
+		term.c_cc[VMIN]=1;
+		term.c_cc[VTIME]=2;
+		tcsetattr(0, TCSANOW, &term);
+	}
 
 	/* catch signals */
 	signal(SIGINT, sighandler);
 	signal(SIGHUP, sighandler);
 	signal(SIGTERM, sighandler);
 	signal(SIGPIPE, sighandler);
+
+	if (batch) {
+		sample_clock_start();
+		LOGP(DSENDER, LOGL_NOTICE, "Batch: all samples from and to files, time follows the samples, not the wall clock.\n");
+	}
 
 	/* start streaming */
 	if (sender_start_audio())
@@ -1000,7 +1017,7 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		}
 
 next_char:
-		c = get_char();
+		c = (batch) ? -1 : get_char();
 		switch (c) {
 		case 3:
 			/* quit */
@@ -1087,7 +1104,8 @@ next_char:
 		if (myhandler)
 			myhandler();
 
-		display_measurements(dsp_interval / 1000.0);
+		if (!batch)
+			display_measurements(dsp_interval / 1000.0);
 
 		now = get_time();
 
@@ -1097,7 +1115,10 @@ next_char:
 		 * the TX ring buffer fed and prevent deficit accumulation from
 		 * usleep overshoot.  For sound card mode, keep the original interval
 		 * since there is no write thread pacemaker. */
-		if (use_sdr) {
+		if (batch) {
+			/* files only: no pacing, the CPU is the limit */
+			sleep = 0.0;
+		} else if (use_sdr) {
 			sleep = 0.0001 - (now - begin_time);
 		} else {
 			sleep = (dsp_interval / 1000.0) - (now - begin_time);
@@ -1122,8 +1143,9 @@ next_char:
 	}
 
 	/* reset terminal */
-	tcsetattr(0, TCSANOW, &term_orig);
-	
+	if (!batch)
+		tcsetattr(0, TCSANOW, &term_orig);
+
 	/* reset real time prio */
 	if (rt_prio > 0) {
 		struct sched_param schedp;

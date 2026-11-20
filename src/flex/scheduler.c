@@ -28,6 +28,7 @@
 #include <time.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
+#include "../libmobile/get_time.h"
 #include "scheduler.h"
 #include "flex.h"
 #include "frame.h"
@@ -96,19 +97,10 @@ int flex_scheduler_get_time(struct flex *flex, flex_frame_time_t *ft)
 	int sec_in_cycle;
 	double total_sec;
 
-	if (clock_gettime(CLOCK_REALTIME, &ts) < 0) {
-		/* Fallback: auto-increment from last known frame */
-		LOGP(DFLEX, LOGL_ERROR, "clock_gettime failed, using fallback auto-increment\n");
-		ft->cycle = flex->sched_fallback_cycle;
-		ft->frame = flex->sched_fallback_frame;
-		ft->frame_offset = 0.0;
-		flex->sched_fallback_frame++;
-		if (flex->sched_fallback_frame >= 128) {
-			flex->sched_fallback_frame = 0;
-			flex->sched_fallback_cycle = (flex->sched_fallback_cycle + 1) % 15;
-		}
-		return -1;
-	}
+	(void)flex;
+
+	/* the wall clock, or the sample clock when reading/writing files only */
+	get_realtime(&ts);
 
 	gmtime_r(&ts.tv_sec, &tm);
 

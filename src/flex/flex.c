@@ -35,6 +35,7 @@
 #include "../libmobile/cause.h"
 #include "../libmobile/main_mobile.h"
 #include <osmocom/cc/message.h>
+#include "../libmobile/get_time.h"
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
@@ -4070,8 +4071,10 @@ int flex_get_next_frame(flex_t *flex)
 			}
 			if (flex->biw_datetime_enabled) {
 				params.biw_datetime = 1;
-				/* Use wall clock + offset */
-				time_t base_time = time(NULL) + flex->biw_time_offset;
+				/* Use wall clock (the sample clock in batch) + offset */
+				struct timespec now_ts;
+				get_realtime(&now_ts);
+				time_t base_time = now_ts.tv_sec + flex->biw_time_offset;
 				struct tm tm_val;
 				localtime_r(&base_time, &tm_val);
 				int real_year = tm_val.tm_year + 1900;

@@ -27,6 +27,7 @@
 #include <math.h>
 #include <sys/time.h>
 #include <time.h>
+#include <osmocom/core/timer.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "../libmobile/call.h"
@@ -449,7 +450,7 @@ void pocsag_msg_receive(const char *channel, uint32_t ric, enum pocsag_function 
 	struct timeval tv;
 	struct tm *tm;
 
-	gettimeofday(&tv, NULL);
+	osmo_gettimeofday(&tv, NULL);
 	tm = localtime(&tv.tv_sec);
 
 	sprintf(text, "%04d-%02d-%02d %02d:%02d:%02d.%03d @%s %d%s,%s,%d,%s",
@@ -905,7 +906,7 @@ void pocsag_msg_send(const struct pager_charset *charset, const char *text, size
 			msg->retransmit_interval = interval;
 			msg->send_delay = delay;
 
-			gettimeofday(&tv, NULL);
+			osmo_gettimeofday(&tv, NULL);
 			msg->next_send_time = (double)tv.tv_sec + tv.tv_usec / 1e6 + delay;
 		}
 	}
@@ -919,7 +920,7 @@ void call_down_clock(void)
 	struct timeval tv;
 	double now;
 
-	gettimeofday(&tv, NULL);
+	osmo_gettimeofday(&tv, NULL);
 	now = (double)tv.tv_sec + tv.tv_usec / 1e6;
 
 	/* Check if any deferred retransmission has become eligible.

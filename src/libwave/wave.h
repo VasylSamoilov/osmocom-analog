@@ -28,6 +28,9 @@ typedef struct wave_play {
 	int		buffer_writep;	/* write pointer to next byte in buffer */
 } wave_play_t;
 
+/* Blocking: a write waits for room and a read waits for the data instead of
+ * dropping samples or returning silence (batch runs, paced by the CPU). */
+void wave_set_blocking(int on);
 int wave_create_record(wave_rec_t *rec, const char *filename, int samplerate, int channels, double max_deviation);
 int wave_create_playback(wave_play_t *play, const char *filename, int *samplerate_p, int *channels_p, double max_deviation);
 int wave_read(wave_play_t *play, sample_t **samples, int length);
