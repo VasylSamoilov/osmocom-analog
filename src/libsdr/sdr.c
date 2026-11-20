@@ -69,6 +69,17 @@ int sdr_rx_overflow = 0;
 static int tx_driver;  /* 0=none, 1=uhd, 2=soapy, 3=rpitx */
 static int rx_driver;  /* 0=none, 1=uhd, 2=soapy */
 
+/* rpitx sends the phase of the IQ signal on one carrier (see rpitx.c):
+ * no DC offset to avoid, at most two carriers, the second one weaker. */
+static int sdr_tx_is_rpitx(void)
+{
+#ifdef HAVE_RPITX
+	return sdr_config->rpitx || sdr_config->tx_rpitx;
+#else
+	return 0;
+#endif
+}
+
 /* Forward declaration for timing function used by threads */
 static double get_time(void);
 
@@ -179,6 +190,20 @@ static void show_spectrum(const char *direction, double halfbandwidth, double ce
 		LOGP(DSDR, LOGL_INFO, "Frequency %c = %.4f MHz\n", '1' + i, frequency[i] / 1e6);
 	if (paging_frequency)
 		LOGP(DSDR, LOGL_INFO, "Frequency P = %.4f MHz (Paging Frequency)\n", paging_frequency / 1e6);
+}
+
+/* Level of an FM carrier. Equal levels for SDRs. rpitx with two carriers:
+ * the first one at 1 / (1 + r), the second one (the second channel or the
+ * paging channel) at r / (1 + r). They must not be equal, else the sum of
+ * both passes through zero, where its phase jumps. */
+static double sdr_tx_amplitude(sdr_t *sdr, int c, int channels)
+{
+	double r;
+
+	if (!sdr_tx_is_rpitx() || channels + (sdr->paging_channel ? 1 : 0) != 2)
+		return sdr->amplitude;
+	r = sdr_config->rpitx_ratio;
+	return (c == 0) ? 1.0 / (1.0 + r) : r / (1.0 + r);
 }
 
 static void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math)
@@ -577,8 +602,32 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		}
 		tx_center_frequency = (tx_high_frequency + tx_low_frequency) / 2.0;
 
-		/* prevent channel bandwidth from overlapping with the center frequency */
-		if (channels == 1 && !sdr->paging_channel) {
+		if (sdr_tx_is_rpitx()) {
+			int carriers = channels + (sdr->paging_channel ? 1 : 0);
+
+			if (carriers > 2) {
+				LOGP(DSDR, LOGL_ERROR, "rpitx can send one or two channels, not %d: it has one carrier that only moves in frequency.\n", carriers);
+				goto error;
+			}
+			for (c = 0; c < channels; c++) {
+				if (am[c])
+					LOGP(DSDR, LOGL_NOTICE, "rpitx cannot modulate the amplitude: AM channel %d only gets the carrier keyed on and off.\n", c);
+			}
+			if (carriers == 2) {
+				double spacing = tx_high_frequency - tx_low_frequency;
+				int tx_rate = sdr_config->split_mode ? sdr_config->tx_samplerate : sdr_config->samplerate;
+
+				LOGP(DSDR, LOGL_NOTICE, "rpitx: two channels on one carrier, the second channel at %.2f of the first one's level (--sdr-rpitx-ratio). The first channel should stay on (control channel), the second one may key on and off. One spacing on the far side of the first channel carries mixing products, keep it unused.\n", sdr_config->rpitx_ratio);
+				if (spacing > tx_rate / 3.0)
+					LOGP(DSDR, LOGL_NOTICE, "rpitx: the spacing of %.0f kHz is more than a third of the sample rate, mixing products fold back near the channels. Increase the sample rate.\n", spacing / 1e3);
+			}
+		}
+
+		/* prevent channel bandwidth from overlapping with the center frequency,
+		 * rpitx makes the carrier directly, it has no DC offset */
+		if (channels == 1 && !sdr->paging_channel && sdr_tx_is_rpitx()) {
+			LOGP(DSDR, LOGL_INFO, "rpitx: the carrier is the channel frequency.\n");
+		} else if (channels == 1 && !sdr->paging_channel) {
 			/* simple: just move off the center by two times half of the bandwidth */
 			tx_center_frequency -= 2.0 * bandwidth / 2.0;
 			/* Note: tx_low_frequency is kept at old center.
@@ -659,7 +708,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				bias = 1.0 - gain;
 				rc = am_mod_init(&sdr->chan[c].am_mod, samplerate, tx_offset, sdr->amplitude * gain, sdr->amplitude * bias);
 			} else
-				rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, tx_offset, sdr->amplitude);
+				rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, tx_offset, sdr_tx_amplitude(sdr, c, channels));
 			if (rc < 0)
 				goto error;
 			/* Initialize TX channelizer if enabled */
@@ -680,7 +729,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			double tx_offset;
 			tx_offset = sdr->chan[sdr->paging_channel].tx_frequency - tx_center_frequency;
 			LOGP(DSDR, LOGL_DEBUG, "Paging Frequency: TX offset: %.6f MHz\n", tx_offset / 1e6);
-			rc = fm_mod_init(&sdr->chan[sdr->paging_channel].fm_mod, samplerate, tx_offset, sdr->amplitude);
+			rc = fm_mod_init(&sdr->chan[sdr->paging_channel].fm_mod, samplerate, tx_offset, sdr_tx_amplitude(sdr, sdr->paging_channel, channels));
 			if (rc < 0)
 				goto error;
 		}
@@ -1818,11 +1867,10 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 	int c, s, ss;
 	int split_mode = sdr_config && sdr_config->split_mode;
 
-	/* Safety check: don't read if RX is not configured (tx_only mode) */
-	if (sdr_config && sdr_config->tx_only) {
-		LOGP(DSDR, LOGL_ERROR, "sdr_read() called in TX-only mode - this is a bug!\n");
-		return 0;  /* No samples available */
-	}
+	/* No RX in tx_only mode (e.g. rpitx). The sender loop of libmobile reads
+	 * on every turn, so this is expected: nothing received. */
+	if (sdr_config && sdr_config->tx_only)
+		return 0;
 
 	/* Use rx_oversample for RX operations in split mode (only for integer resampling) */
 	int rx_os = split_mode ? sdr->rx_oversample : sdr->oversample;
@@ -2373,6 +2421,11 @@ static int sdr_tx_device_paced(void)
 #ifdef HAVE_SOAPY
 	if (tx_driver == 2)
 		return soapy_tx_device_paced();
+#endif
+#ifdef HAVE_RPITX
+	/* the blocking write into the DMA FIFO is the only clock */
+	if (tx_driver == 3)
+		return rpitx_tx_device_paced();
 #endif
 	return 0;
 }

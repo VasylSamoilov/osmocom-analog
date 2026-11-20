@@ -20,10 +20,15 @@
 #ifndef RPITX_H
 #define RPITX_H
 
+/* Two carriers on one rpitx: the second one gets this level relative to the
+ * first, see rpitx.c. */
+#define RPITX_DEFAULT_RATIO	0.6
+
 int rpitx_open(double tx_frequency, double rate, double tx_gain);
 int rpitx_start(void);
 int rpitx_send(float *buff, int num);
 void rpitx_close(void);
 int rpitx_get_tosend(int buffer_size);
+int rpitx_tx_device_paced(void);
 
 #endif /* RPITX_H */

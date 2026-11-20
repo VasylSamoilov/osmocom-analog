@@ -36,9 +36,7 @@ enum paging_signal;
 #ifdef HAVE_UHD
 #include "uhd.h"
 #endif
-#ifdef HAVE_RPITX
 #include "rpitx.h"
-#endif
 
 static int got_init = 0;
 extern int use_sdr;
@@ -53,6 +51,7 @@ void sdr_config_init(double lo_offset)
 	sdr_config->tune_args = "";
 	sdr_config->lo_offset = lo_offset;
 	sdr_config->timestamps = 1;
+	sdr_config->rpitx_ratio = RPITX_DEFAULT_RATIO;
 
 	got_init = 1;
 }
@@ -165,6 +164,16 @@ void sdr_config_print_help(void)
 #ifdef HAVE_RPITX
 	printf("    --sdr-tx-rpitx\n");
 	printf("        Use rpitx driver for TX device (Raspberry Pi GPIO, TX-only)\n");
+	printf("    rpitx notes:\n");
+	printf("        --sdr-tx-gain is the GPIO4 drive level 0..7 (2..16 mA).\n");
+	printf("        Sample rate 10000..200000 S/s, up to 250000 without carrier keying.\n");
+	printf("        One or two FM channels. AM channels only get the carrier keyed.\n");
+	printf("    --sdr-rpitx-ratio <ratio>\n");
+	printf("        With two channels, the level of the second one relative to the first\n");
+	printf("        one, 0.2 .. 0.8. Give first the channel that stays on (control\n");
+	printf("        channel), second the one that is keyed on and off (traffic/voice):\n");
+	printf("        when the first one keys off, the second one gets a short glitch.\n");
+	printf("        (default = %.2f)\n", sdr_config->rpitx_ratio);
 #endif
 	printf("\nUpconverter options:\n");
 	printf("    --sdr-upconverter <Hz>\n");
@@ -248,6 +257,9 @@ void sdr_config_print_hotkeys(void)
 #define	OPT_SDR_PPM		1547
 #define	OPT_SDR_TX_PPM		1548
 #define	OPT_SDR_RX_PPM		1549
+#ifdef HAVE_RPITX
+#define	OPT_SDR_RPITX_RATIO	1550
+#endif
 
 void sdr_config_add_options(void)
 {
@@ -304,6 +316,7 @@ void sdr_config_add_options(void)
 	option_add(OPT_SDR_RX_SOAPY, "sdr-rx-soapy", 0);
 #ifdef HAVE_RPITX
 	option_add(OPT_SDR_TX_RPITX, "sdr-tx-rpitx", 0);
+	option_add(OPT_SDR_RPITX_RATIO, "sdr-rpitx-ratio", 1);
 #endif
 	/* PPM frequency correction */
 	option_add(OPT_SDR_PPM, "sdr-ppm", 1);
@@ -491,6 +504,16 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		sdr_config->tx_rpitx = 1;
 		sdr_config->split_mode = 1;
 		use_sdr = 1;
+		break;
+	case OPT_SDR_RPITX_RATIO:
+		sdr_config->rpitx_ratio = atof(argv[argi]);
+		/* rpitx.c keys the carrier on above |IQ| 0.10 and off below 0.05:
+		 * the second channel alone (r / (1 + r)) must key it on, and the
+		 * lowest point of the sum ((1 - r) / (1 + r)) must not key it off */
+		if (sdr_config->rpitx_ratio < 0.2 || sdr_config->rpitx_ratio > 0.8) {
+			fprintf(stderr, "--sdr-rpitx-ratio must be 0.2 .. 0.8\n");
+			return -EINVAL;
+		}
 		break;
 #endif
 	case OPT_SDR_RX_UHD:

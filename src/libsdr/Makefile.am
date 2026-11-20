@@ -28,6 +28,7 @@ if HAVE_RPITX
 AM_CPPFLAGS += -DHAVE_RPITX
 
 libsdr_a_SOURCES += \
-	rpitx.cpp
+	rpitx.c \
+	rpitx_dma.cpp
 endif
 

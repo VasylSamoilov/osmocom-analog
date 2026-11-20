@@ -4,9 +4,10 @@
 typedef struct sdr_config {
 	int		uhd,			/* select UHD API */
 			soapy;			/* select Soapy SDR API */
-#ifdef HAVE_RPITX
+	/* not under HAVE_RPITX: only libsdr defines it, the layout must be
+	 * the same in every file that includes this header */
 	int		rpitx;			/* select rpitx API (Raspberry Pi GPIO TX) */
-#endif
+	double		rpitx_ratio;		/* --sdr-rpitx-ratio, level of the second carrier */
 	int		channel;		/* channel number */
 	const char	*device_args,		/* arguments */
 			*stream_args,
@@ -59,9 +60,7 @@ typedef struct sdr_config {
 	/* Per-device driver selection (split mode only) */
 	int		tx_uhd;			/* --sdr-tx-uhd */
 	int		tx_soapy;		/* --sdr-tx-soapy */
-#ifdef HAVE_RPITX
 	int		tx_rpitx;		/* --sdr-tx-rpitx */
-#endif
 	int		rx_uhd;			/* --sdr-rx-uhd */
 	int		rx_soapy;		/* --sdr-rx-soapy */
 	/* Bandwidth hint for auto rate selection */
