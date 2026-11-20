@@ -386,14 +386,12 @@ typedef struct flex {
 	 * For 4FSK modes, these are per-symbol (1 symbol = 2 bits = 1 dibit). */
 	double			fsk_bitduration;	/* samples per symbol */
 	double			fsk_bitstep;		/* 1.0 / fsk_bitduration */
-	sample_t		fsk_ramp_up[256];
-	sample_t		fsk_ramp_down[256];
 	sample_t		*fsk_tx_buffer;
 	int			fsk_tx_buffer_size;
 	int			fsk_tx_buffer_length;
 	int			fsk_tx_buffer_pos;
-	double			fsk_tx_phase;
-	uint8_t			fsk_tx_lastbit;
+	double			fsk_tx_phase;		/* position in the symbol, 0-256; carried from symbol to symbol */
+	int			fsk_tx_restart;		/* next frame starts a transmission (after silence) */
 	int	dbg_frame_symbols;	/* debug: total symbols emitted this frame */
 	int	dbg_frame_samples;	/* debug: total samples emitted this frame */
 
@@ -601,7 +599,7 @@ typedef struct flex {
 
 	/* 4-FSK state (3200bps/4FSK and 6400bps/4FSK modes) */
 	sample_t		fsk4_ramps[4][4][256];	/* [from][to][phase] */
-	uint8_t			fsk4_tx_last_level;	/* 0-3 */
+	uint8_t			fsk4_tx_last_level;	/* 0-3, the level on the air: 2FSK uses 0 and 3 */
 
 	/* baseband LPF state */
 	iir_filter_t		lpf;			/* IIR biquad lowpass */
