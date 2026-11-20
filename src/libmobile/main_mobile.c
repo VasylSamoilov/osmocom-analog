@@ -450,6 +450,10 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        Replace received audio by given wave file.\n");
 	printf("    --read-tx-wave <file>\n");
 	printf("        Replace transmitted audio by given wave file.\n");
+	printf("    --start-time <seconds>\n");
+	printf("        Batch runs (all samples from and to IQ files): the time of the first\n");
+	printf("        sample, in seconds since 1970 UTC (default: now). The same time gives\n");
+	printf("        the same output on every run (frame numbers, date and time sent).\n");
 	printf("    --echo-suppressor\n");
 	printf("        Enable echo suppressor (energy-based direction detection).\n");
 	printf("    --echo-threshold <dB>\n");
@@ -532,6 +536,7 @@ void main_mobile_print_hotkeys(void)
 #define	OPT_CALL_BUFFER		1009
 #define	OPT_FAST_MATH		1010
 #define	OPT_NO_L16		1011
+#define	OPT_START_TIME		1020
 #define	OPT_LIMESDR		1100
 #define	OPT_LIMESDR_MINI	1101
 #define	OPT_ECHO_SUPPRESSOR	2000
@@ -573,6 +578,7 @@ void main_mobile_add_options(void)
 	option_add(OPT_WRITE_TX_WAVE, "write-tx-wave", 1);
 	option_add(OPT_READ_RX_WAVE, "read-rx-wave", 1);
 	option_add(OPT_READ_TX_WAVE, "read-tx-wave", 1);
+	option_add(OPT_START_TIME, "start-time", 1);
 	option_add(OPT_ECHO_SUPPRESSOR, "echo-suppressor", 0);
 	option_add(OPT_ECHO_THRESHOLD, "echo-threshold", 1);
 	option_add(OPT_ECHO_ATTENUATION, "echo-attenuation", 1);
@@ -705,6 +711,9 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_READ_TX_WAVE:
 		read_tx_wave = options_strdup(argv[argi]);
+		break;
+	case OPT_START_TIME:
+		sample_clock_set_start(atof(argv[argi]));
 		break;
 #ifdef HAVE_SDR
 	case OPT_LIMESDR:

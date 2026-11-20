@@ -27,6 +27,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+#include <osmocom/core/timer.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include "../libsample/sample.h"
@@ -40,23 +41,11 @@
  * DIMENSION 1000 has 20 s, Motorola GSC manual, Code Word Automatic Reset) */
 #define VOICE_TIMEOUT	50
 
-static void dsp_init_ramp(gsc_t *gsc)
+/* The polarity of the message sent (it may differ from the instance's); the
+ * level on the air stays, the next bit starts from it */
+void dsp_set_tx_polarity(gsc_t *gsc, double polarity)
 {
-        double c;
-        int i;
-
-        LOGP_CHAN(DDSP, LOGL_DEBUG, "Generating cosine shaped ramp table.\n");
-        for (i = 0; i < 256; i++) {
-		/* This is mathematically incorrect... */
-                if (i < 64)
-                        c = 1.0;
-		else if (i >= 192)
-                        c = -1.0;
-		else
-	                c = cos((double)(i - 64) / 128.0 * M_PI);
-                gsc->fsk_ramp_down[i] = c * gsc->fsk_deviation * gsc->fsk_polarity;
-                gsc->fsk_ramp_up[i] = -gsc->fsk_ramp_down[i];
-        }
+	fsk_nrz_mod_set_polarity(&gsc->fsk_mod, polarity);
 }
 
 /* Init transceiver instance. */
@@ -82,10 +71,10 @@ int dsp_init_sender(gsc_t *gsc, int samplerate, double deviation, double polarit
 		goto error;
 	}
 
-	/* create deviation and ramp */
+	/* create deviation and the modulator */
 	gsc->fsk_deviation = 1.0; // equals what we set at sender_set_fm()
 	gsc->fsk_polarity = polarity;
-	dsp_init_ramp(gsc);
+	fsk_nrz_mod_init(&gsc->fsk_mod, samplerate, 600.0, gsc->fsk_deviation, polarity);
 
 	/* initialize RX DSP state for zero-crossing bit recovery */
 	gsc->fsk_rx_phase = 0.0;
@@ -120,71 +109,7 @@ void dsp_cleanup_sender(gsc_t *gsc)
  * return number of samples */
 static int fsk_bit_encode(gsc_t *gsc, uint8_t bit)
 {
-	/* alloc samples, add 1 in case there is a rest */
-	sample_t *spl;
-	sample_t *ramp_up, *ramp_down;
-	double phase, bitstep, devpol;
-	int count;
-	uint8_t lastbit;
-
-	devpol = gsc->fsk_deviation * gsc->fsk_tx_polarity;
-
-	/* Swap ramp tables when per-message polarity differs from instance polarity
-	 * (the ramps were pre-computed at init time using gsc->fsk_polarity) */
-	if (gsc->fsk_tx_polarity != gsc->fsk_polarity) {
-		ramp_up = gsc->fsk_ramp_down;
-		ramp_down = gsc->fsk_ramp_up;
-	} else {
-		ramp_up = gsc->fsk_ramp_up;
-		ramp_down = gsc->fsk_ramp_down;
-	}
-
-	spl = gsc->fsk_tx_buffer;
-	phase = gsc->fsk_tx_phase;
-	lastbit = gsc->fsk_tx_lastbit;
-	bitstep = gsc->fsk_bitstep * 256.0;
-
-	if (lastbit) {
-		if (bit) {
-			/* stay up */
-			do {
-				*spl++ = devpol;
-				phase += bitstep;
-			} while (phase < 256.0);
-			phase -= 256.0;
-		} else {
-			/* ramp down */
-			do {
-				*spl++ = ramp_down[(uint8_t)phase];
-				phase += bitstep;
-			} while (phase < 256.0);
-			phase -= 256.0;
-			lastbit = 0;
-		}
-	} else {
-		if (bit) {
-			/* ramp up */
-			do {
-				*spl++ = ramp_up[(uint8_t)phase];
-				phase += bitstep;
-			} while (phase < 256.0);
-			phase -= 256.0;
-			lastbit = 1;
-		} else {
-			/* stay down */
-			do {
-				*spl++ = -devpol;
-				phase += bitstep;
-			} while (phase < 256.0);
-			phase -= 256.0;
-		}
-	}
-
-	/* depending on the number of samples, return the number */
-	count = ((uintptr_t)spl - (uintptr_t)gsc->fsk_tx_buffer) / sizeof(*spl);
-
-	gsc->fsk_tx_phase = phase;
-	gsc->fsk_tx_lastbit = lastbit;
+	int count = fsk_nrz_mod_bits(&gsc->fsk_mod, (bit) ? 0x80000000 : 0, 1, gsc->fsk_tx_buffer);
 
 	return count;
 }
@@ -347,7 +272,7 @@ static int rx_duplicate(gsc_t *gsc, const gsc_rx_msg_t *msg)
 	    (msg->type != TYPE_ALPHA && msg->type != TYPE_NUMERIC))
 		return 0;
 
-	gettimeofday(&tv, NULL);
+	osmo_gettimeofday(&tv, NULL);
 	now = (double)tv.tv_sec + tv.tv_usec / 1e6;
 
 	for (i = 0; i < GSC_RX_HISTORY_MAX; i++) {
@@ -1285,6 +1210,8 @@ again:
 				}
 			}
 			gsc->wait_2_sec = gsc->sender.samplerate * 2.0;
+			/* the pause and the voice: the bits after them start anew */
+			fsk_nrz_mod_silence(&gsc->fsk_mod);
 			goto again;
 		}
 
@@ -1305,23 +1232,22 @@ again:
 			    gsc->normal_count == 0 &&
 			    gsc->scan_from >= gsc->scan_to &&
 			    !gsc->sender.loopback) {
-				int guard = (int)(gsc->fsk_bitduration + 1.0);
-				sample_t last_val = gsc->fsk_tx_buffer[gsc->fsk_tx_buffer_pos - 1];
-				int gi;
+				int gi = fsk_nrz_mod_guard(&gsc->fsk_mod, samples, length);
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "TX guard: %d samples (last_val=%.3f) -- no more bits\n",
-					  guard, last_val);
-				for (gi = 0; gi < guard && length > 0; gi++) {
-					*samples++ = last_val;
-					*power++ = 1;
-					length--;
-				}
+					  gi, gsc->fsk_mod.last);
+				memset(power, 1, gi);
+				samples += gi;
+				power += gi;
+				length -= gi;
 			}
 			gsc->fsk_tx_buffer_pos = 0;
 			if (length > 0) {
 				memset(samples, 0, sizeof(*samples) * length);
 				memset(power, 0, length);
 			}
+			/* the next bit starts a new transmission */
+			fsk_nrz_mod_silence(&gsc->fsk_mod);
 			return;
 		}
 

@@ -322,8 +322,10 @@ static pocsag_msg_t *pocsag_msg_create(pocsag_t *pocsag, uint32_t callref, uint3
 
 	/* kick transmitter */
 	if (pocsag->state == POCSAG_IDLE) {
-		pocsag->tx_speed = msg->speed;
-		pocsag->tx_polarity = msg->polarity;
+		/* the group of the message, also on the air (the first
+		 * transmission was sent at the speed and polarity the
+		 * modulator had) */
+		dsp_set_tx_group(pocsag, msg->speed, msg->polarity);
 		pocsag->batch_count = 0;
 		pocsag->msg_count = 0;
 		pocsag_new_state(pocsag, POCSAG_PREAMBLE);
@@ -526,8 +528,7 @@ int pocsag_create(const char *kanal, double frequency, const char *device, int u
 
 	/* In network mode, start transmitting immediately (preamble + idle batches) */
 	if (network_mode && tx) {
-		pocsag->tx_speed = baudrate;
-		pocsag->tx_polarity = polarity;
+		dsp_set_tx_group(pocsag, baudrate, polarity);
 		pocsag->batch_count = 0;
 		pocsag->msg_count = 0;
 		pocsag_new_state(pocsag, POCSAG_PREAMBLE);
@@ -961,8 +962,7 @@ void call_down_clock(void)
 						for (msg = pocsag->msg_list[p][s][f]; msg; msg = msg->next) {
 							if (msg->next_send_time > 0.0 && now >= msg->next_send_time) {
 								LOGP_CHAN(DPOCSAG, LOGL_INFO, "Retransmission for RIC %d now eligible, starting TX.\n", msg->ric);
-								pocsag->tx_speed = msg->speed;
-								pocsag->tx_polarity = msg->polarity;
+								dsp_set_tx_group(pocsag, msg->speed, msg->polarity);
 								pocsag->batch_count = 0;
 								pocsag_new_state(pocsag, POCSAG_PREAMBLE);
 								pocsag->word_count = 0;

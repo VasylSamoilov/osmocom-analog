@@ -3,6 +3,7 @@
 
 #include "../libmobile/sender.h"
 #include "../libfilter/iir_filter.h"
+#include "../libfsk/fsk_nrz.h"
 #include "frame.h"
 
 /* Number of independent polarity networks (NORMAL=0, INVERTED=1).
@@ -336,8 +337,6 @@ typedef struct flex {
 	const char		*default_message;
 	uint64_t		default_capcode;
 	enum flex_msg_type	default_msg_type;
-	double			fsk_deviation;
-	double			fsk_polarity;
 
 	/* state machine */
 	enum flex_state		state;
@@ -380,18 +379,13 @@ typedef struct flex {
 	int			frame_target_speed;
 	int			frame_target_mod_type;
 
-	/* DSP state — field names match pocsag_t for shared fsk_block_encode().
-	 * NOTE: fsk_bitduration/fsk_bitstep are SAMPLES PER SYMBOL, not per bit.
-	 * Named "bit" for POCSAG compatibility where bit=symbol (2FSK only).
-	 * For 4FSK modes, these are per-symbol (1 symbol = 2 bits = 1 dibit). */
-	double			fsk_bitduration;	/* samples per symbol */
-	double			fsk_bitstep;		/* 1.0 / fsk_bitduration */
+	/* TX DSP: the symbols (2 and 4 levels, the symbol rate of the frame
+	 * part, the polarity) and the samples of the word being sent */
+	fsk_nrz_mod_t		fsk_mod;
 	sample_t		*fsk_tx_buffer;
 	int			fsk_tx_buffer_size;
 	int			fsk_tx_buffer_length;
 	int			fsk_tx_buffer_pos;
-	double			fsk_tx_phase;		/* position in the symbol, 0-256; carried from symbol to symbol */
-	int			fsk_tx_restart;		/* next frame starts a transmission (after silence) */
 	int	dbg_frame_symbols;	/* debug: total symbols emitted this frame */
 	int	dbg_frame_samples;	/* debug: total samples emitted this frame */
 
@@ -597,9 +591,6 @@ typedef struct flex {
 		flex_msg_t	*delivery_msg;	/* pointer to DELIVERY message in queue */
 	} tx_temp[FLEX_TEMP_ADDR_SLOTS];	/* 16 slots (shared across phases for TX) */
 
-	/* 4-FSK state (3200bps/4FSK and 6400bps/4FSK modes) */
-	sample_t		fsk4_ramps[4][4][256];	/* [from][to][phase] */
-	uint8_t			fsk4_tx_last_level;	/* 0-3, the level on the air: 2FSK uses 0 and 3 */
 
 	/* baseband LPF state */
 	iir_filter_t		lpf;			/* IIR biquad lowpass */

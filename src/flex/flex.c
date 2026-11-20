@@ -3761,7 +3761,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 				  "Network mode: encoded %d-phase frame C%u/F%u speed=%d/%s polarity=%s collapse=%d roaming=%d num_tx=%d sf=%d/%d.\n",
 				  num_phases, ft.cycle, ft.frame, params.bitrate,
 				  (params.modulation_type == FLEX_MOD_4FSK) ? "4fsk" : "2fsk",
-				  (flex->fsk_polarity < 0) ? "inverted" : "normal",
+				  (flex->fsk_mod.polarity < 0) ? "inverted" : "normal",
 				  params.collapse, params.roaming,
 				  params.num_transmissions,
 				  params.subframe_index, params.num_transmissions);
@@ -4214,10 +4214,9 @@ int flex_create(const char *kanal, double frequency, const char *device, int use
 	flex->tx = tx;
 	flex->default_msg_type = msg_type;
 	flex->default_message = message;
-	/* NOTE: fsk_deviation and fsk_polarity are set by dsp_init_sender() above.
-	 * Do NOT overwrite fsk_deviation with the raw deviation (4800 Hz) here —
-	 * it must stay at 1.0 (normalized) because the sender framework multiplies
-	 * samples by speech_deviation to get actual Hz. */
+	/* NOTE: the deviation and polarity of the modulator are set by
+	 * dsp_init_sender() above. The deviation stays 1.0 (normalized): the
+	 * sender framework multiplies the samples by speech_deviation to get Hz. */
 	flex->scan_from = scan_from;
 	flex->scan_to = scan_to;
 	flex->scan_start = scan_from;

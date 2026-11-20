@@ -2,6 +2,7 @@
 #define MOBITEX_H
 
 #include "../libmobile/sender.h"
+#include "../libfsk/fsk_nrz.h"
 
 /* ---- Protocol Constants ---- */
 
@@ -341,16 +342,13 @@ typedef struct mobitex {
 	/* DSP state */
 	double              fsk_deviation;
 	double              fsk_polarity;
-	sample_t            fsk_ramp_up[256];
-	sample_t            fsk_ramp_down[256];
 	double              fsk_bitduration;
 	double              fsk_bitstep;
+	fsk_nrz_mod_t       fsk_mod;                /* TX symbols */
 	sample_t           *fsk_tx_buffer;
 	int                 fsk_tx_buffer_size;
 	int                 fsk_tx_buffer_length;
 	int                 fsk_tx_buffer_pos;
-	double              fsk_tx_phase;
-	uint8_t             fsk_tx_lastbit;
 	double              fsk_rx_phase;
 	uint8_t             fsk_rx_lastbit;
 	uint32_t            fsk_rx_word;        /* 32-bit shift register for sync detection */

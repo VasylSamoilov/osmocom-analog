@@ -1195,30 +1195,13 @@ int64_t get_codeword(pocsag_t *pocsag)
 					pocsag->fsk_tx_buffer_size = need_size;
 				}
 			}
-			pocsag->fsk_tx_bitstep = 1.0 / slow_bitduration;
-			pocsag->fsk_tx_bitduration = slow_bitduration;
+			fsk_nrz_mod_set_rate(&pocsag->fsk_mod, 512.0);
 			LOGP_CHAN(DPOCSAG, LOGL_INFO, "Speed switch: silence gap.\n");
 		}
 		pocsag->word_count++;
 		if (pocsag->word_count >= 3) {
 			/* Silence complete. Reconfigure TX DSP for new speed. */
-			pocsag->fsk_tx_bitstep = 1.0 / ((double)pocsag->samplerate / (double)pocsag->tx_speed);
-			pocsag->fsk_tx_bitduration = (double)pocsag->samplerate / (double)pocsag->tx_speed;
-			pocsag->fsk_tx_polarity = pocsag->tx_polarity;
-			dsp_init_ramp(pocsag);
-			{
-				int new_size = (int)(pocsag->fsk_tx_bitduration * 32.0 + 10);
-				if (new_size > pocsag->fsk_tx_buffer_size) {
-					sample_t *nb = realloc(pocsag->fsk_tx_buffer, new_size * sizeof(sample_t));
-					if (nb) {
-						pocsag->fsk_tx_buffer = nb;
-						pocsag->fsk_tx_buffer_size = new_size;
-					}
-				}
-			}
-			/* Reset TX phase so preamble starts clean */
-			pocsag->fsk_tx_phase = 0.0;
-			pocsag->fsk_tx_lastbit = 0;
+			dsp_set_tx_group(pocsag, pocsag->tx_speed, pocsag->tx_polarity);
 			pocsag_new_state(pocsag, POCSAG_PREAMBLE);
 			pocsag->word_count = 0;
 			pocsag->idle_count = 0;

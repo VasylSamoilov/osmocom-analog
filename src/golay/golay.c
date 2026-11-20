@@ -34,6 +34,7 @@
 #include <ctype.h>
 #include <sys/types.h>
 #include <sys/param.h>
+#include <osmocom/core/timer.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "../libmobile/call.h"
@@ -98,7 +99,6 @@ int golay_create(const char *kanal, double frequency, const char *device, int us
 	gsc->tx = tx;
 	gsc->rx = rx;
 	gsc->default_message = message;
-	gsc->fsk_tx_polarity = gsc->fsk_polarity;
 
 	/* Initialize RX decoder state */
 	if (rx) {
@@ -3935,10 +3935,7 @@ next_msg:
 			count++;
 
 		/* Set per-message TX polarity before encoding */
-		if (msg->polarity != 0.0)
-			gsc->fsk_tx_polarity = msg->polarity;
-		else
-			gsc->fsk_tx_polarity = gsc->fsk_polarity;
+		dsp_set_tx_polarity(gsc, (msg->polarity != 0.0) ? msg->polarity : gsc->fsk_polarity);
 
 		/* Record batch info for completion logging */
 		gsc->tx_preamble_index = msg->preamble_index;
@@ -3996,7 +3993,7 @@ void scheduler_enqueue(gsc_t *gsc, gsc_msg_t *msg)
 	msg->preamble_index = (msg->address[0] - '0' + msg->address[2] - '0') % 10;
 
 	/* Record submission timestamp for expiry */
-	clock_gettime(CLOCK_MONOTONIC, &msg->enqueue_time);
+	osmo_clock_gettime(CLOCK_MONOTONIC,&msg->enqueue_time);
 
 	/* Insert into appropriate queue (FIFO order - append to tail) */
 	if (msg->priority == 1) {
@@ -4025,7 +4022,7 @@ void scheduler_enqueue(gsc_t *gsc, gsc_msg_t *msg)
 	if (gsc->batching_mode != BATCHING_OFF
 	    && !gsc->holdoff_active
 	    && gsc->bit_index >= gsc->bit_num) {
-		clock_gettime(CLOCK_MONOTONIC, &gsc->holdoff_start);
+		osmo_clock_gettime(CLOCK_MONOTONIC,&gsc->holdoff_start);
 		gsc->holdoff_active = 1;
 		LOGP(DGOLAY, LOGL_DEBUG, "Scheduler: hold-off timer started (%d ms).\n", gsc->holdoff_ms);
 	}
@@ -4040,7 +4037,7 @@ void scheduler_expire(gsc_t *gsc)
 	struct timespec now;
 	long age;
 
-	clock_gettime(CLOCK_MONOTONIC, &now);
+	osmo_clock_gettime(CLOCK_MONOTONIC,&now);
 
 	/* Walk priority queue */
 	msgp = &gsc->priority_list;
@@ -4268,7 +4265,7 @@ gsc_msg_t *scheduler_next_batch(gsc_t *gsc)
 		struct timespec now;
 		long elapsed_ms;
 
-		clock_gettime(CLOCK_MONOTONIC, &now);
+		osmo_clock_gettime(CLOCK_MONOTONIC,&now);
 		elapsed_ms = (now.tv_sec - gsc->holdoff_start.tv_sec) * 1000
 			   + (now.tv_nsec - gsc->holdoff_start.tv_nsec) / 1000000;
 

@@ -22,8 +22,6 @@ int dsp_init_sender(mobitex_t *mobitex, int samplerate, int baudrate,
                     double deviation, double polarity)
 {
 	int rc;
-	double c;
-	int i;
 
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Init DSP for transceiver.\n");
 
@@ -57,22 +55,10 @@ int dsp_init_sender(mobitex_t *mobitex, int samplerate, int baudrate,
 		goto error;
 	}
 
-	/* create deviation and ramp */
+	/* create deviation and the modulator */
 	mobitex->fsk_deviation = 1.0;
 	mobitex->fsk_polarity = polarity;
-
-	/* generate cosine shaped ramp table */
-	LOGP_CHAN(DDSP, LOGL_DEBUG, "Generating cosine shaped ramp table.\n");
-	for (i = 0; i < 256; i++) {
-		if (i < 64)
-			c = 1.0;
-		else if (i >= 192)
-			c = -1.0;
-		else
-			c = cos((double)(i - 64) / 128.0 * M_PI);
-		mobitex->fsk_ramp_down[i] = c * mobitex->fsk_deviation * mobitex->fsk_polarity;
-		mobitex->fsk_ramp_up[i] = -mobitex->fsk_ramp_down[i];
-	}
+	fsk_nrz_mod_init(&mobitex->fsk_mod, samplerate, (double)baudrate, mobitex->fsk_deviation, polarity);
 
 	/* init RX state */
 	mobitex->fsk_rx_phase = 0;
@@ -103,64 +89,13 @@ void dsp_cleanup_sender(mobitex_t *mobitex)
 }
 
 /* Encode an array of individual bits into FSK samples in fsk_tx_buffer.
- * For each bit: if same as lastbit, hold level; if different, traverse ramp.
  * Returns number of samples written. */
 int fsk_encode_bits(mobitex_t *mobitex, const uint8_t *bits, int nbits)
 {
-	sample_t *spl;
-	double phase, bitstep, devpol;
-	int i, count;
-	uint8_t lastbit;
+	int i, count = 0;
 
-	devpol = mobitex->fsk_deviation * mobitex->fsk_polarity;
-	spl = mobitex->fsk_tx_buffer;
-	phase = mobitex->fsk_tx_phase;
-	lastbit = mobitex->fsk_tx_lastbit;
-	bitstep = mobitex->fsk_bitstep * 256.0;
-
-	for (i = 0; i < nbits; i++) {
-		uint8_t bit = bits[i] & 1;
-		if (lastbit) {
-			if (bit) {
-				/* stay up */
-				do {
-					*spl++ = devpol;
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-			} else {
-				/* ramp down */
-				do {
-					*spl++ = mobitex->fsk_ramp_down[(uint8_t)phase];
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-				lastbit = 0;
-			}
-		} else {
-			if (bit) {
-				/* ramp up */
-				do {
-					*spl++ = mobitex->fsk_ramp_up[(uint8_t)phase];
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-				lastbit = 1;
-			} else {
-				/* stay down */
-				do {
-					*spl++ = -devpol;
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-			}
-		}
-	}
-
-	count = ((uintptr_t)spl - (uintptr_t)mobitex->fsk_tx_buffer) / sizeof(*spl);
-
-	mobitex->fsk_tx_phase = phase;
-	mobitex->fsk_tx_lastbit = lastbit;
+	for (i = 0; i < nbits; i++)
+		count += fsk_nrz_mod_bits(&mobitex->fsk_mod, (bits[i] & 1) ? 0x80000000 : 0, 1, mobitex->fsk_tx_buffer + count);
 
 	return count;
 }

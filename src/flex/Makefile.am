@@ -25,6 +25,7 @@ flex_LDADD = \
 	$(top_builddir)/src/libemphasis/libemphasis.a \
 	$(top_builddir)/src/libfm/libfm.a \
 	$(top_builddir)/src/libfilter/libfilter.a \
+	$(top_builddir)/src/libfsk/libfsk.a \
 	$(top_builddir)/src/libwave/libwave.a \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/libaaimage/libaaimage.a \

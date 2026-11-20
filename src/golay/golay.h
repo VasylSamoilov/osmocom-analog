@@ -1,5 +1,6 @@
 #include <time.h>
 #include "../libmobile/sender.h"
+#include "../libfsk/fsk_nrz.h"
 #include "../libpagercharset/pager_charset.h"
 
 /* Codepage of the alphanumeric messages (--charset) */
@@ -138,17 +139,13 @@ typedef struct gsc {
 	/* dsp states */
 	double			fsk_deviation;		/* deviation of FSK signal on sound card */
 	double			fsk_polarity;		/* FSK polarity: 1.0 = normal (per GSC standard), -1.0 = inverted */
-	double			fsk_tx_polarity;	/* effective polarity for current TX message */
-	sample_t		fsk_ramp_up[256];	/* samples of upward ramp shape */
-	sample_t		fsk_ramp_down[256];	/* samples of downward ramp shape */
 	double			fsk_bitduration;	/* duration of a bit in samples */
 	double			fsk_bitstep;		/* fraction of a bit each sample */
+	fsk_nrz_mod_t		fsk_mod;		/* TX symbols, in the polarity of the message sent */
 	sample_t		*fsk_tx_buffer;		/* tx buffer for one data block */
 	int			fsk_tx_buffer_size;	/* size of tx buffer (in samples) */
 	int			fsk_tx_buffer_length;	/* usage of buffer (in samples) */
 	int			fsk_tx_buffer_pos;	/* current position sending buffer */
-	double			fsk_tx_phase;		/* current bit position */
-	uint8_t			fsk_tx_lastbit;		/* last bit of last message, to correctly ramp */
 
 	/* voice message */
 	int			wait_2_sec;		/* counter to wait 2 seconds before playback */

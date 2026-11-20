@@ -68,54 +68,8 @@ static const char *rx_kanji_text(const char *hex, int blocking, int display_rtl)
 
 #define MAX_DISPLAY	1.4	/* something above speech level, no emphasis */
 
-/* 4-FSK deviation levels indexed by symbol number (0-3).
- * +4800, +1600, -1600, -4800 Hz deviation levels.
- * With FM deviation = 4800 Hz, these map to +1.0, +1/3, -1/3, -1.0.
- *
- * The standard uses Gray coding for dibit-to-symbol mapping:
- *   dibit "00" -> sym 0 (-4800 Hz), dibit "01" -> sym 1 (-1600 Hz),
- *   dibit "11" -> sym 2 (+1600 Hz), dibit "10" -> sym 3 (+4800 Hz).
- * Gray encoding is applied in fsk4_block_encode(), not here;
- * this array is indexed by the gray-encoded symbol number. */
-static const double fsk4_levels[4] = { -1.0, -1.0/3.0, 1.0/3.0, 1.0 };
-
-/* A symbol ends when the phase reaches 256. The step is samples per symbol
- * in 1/256 symbol, rounded in floating point: 30 steps of 256/30 can sum to
- * just under 256 and give a symbol one sample too long. The tolerance is far
- * below a sample, so symbols of a whole number of samples are exact. */
-#define FSK_PHASE_END	(256.0 - 1e-6)
-
-/* Pre-compute the FSK ramp tables for all 16 level transitions.
- * Each ramp[from][to][phase] is a cosine-shaped transition. 2FSK uses the
- * outer levels 0 and 3 (-1 and +1), 4FSK all four. */
-static void dsp_init_fsk4_ramps(flex_t *flex)
-{
-	int from, to, i;
-	double lf, lt, mid, amp;
-
-	LOGP_CHAN(DDSP, LOGL_DEBUG, "Generating 4-FSK ramp tables.\n");
-	for (from = 0; from < 4; from++) {
-		lf = fsk4_levels[from] * flex->fsk_deviation * flex->fsk_polarity;
-		for (to = 0; to < 4; to++) {
-			lt = fsk4_levels[to] * flex->fsk_deviation * flex->fsk_polarity;
-			mid = (lf + lt) / 2.0;
-			amp = (lf - lt) / 2.0;
-			for (i = 0; i < 256; i++) {
-				double c;
-				if (i < 64)
-					c = 1.0;
-				else if (i >= 192)
-					c = -1.0;
-				else
-					c = cos((double)(i - 64) / 128.0 * M_PI);
-				flex->fsk4_ramps[from][to][i] = mid + amp * c;
-			}
-		}
-	}
-}
-
-/* Switch speed for the next frame portion.
- * Updates fsk_bitduration and fsk_bitstep for the selected mode.
+/* Switch speed for the next frame portion: the symbol rate of the modulator
+ * (which carries the symbol clock over to it).
  *
  * FLEX terminology:
  *   bps    = bit rate (1600, 3200, or 6400 bits/second)
@@ -135,37 +89,24 @@ static void dsp_init_fsk4_ramps(flex_t *flex)
 void dsp_set_speed(flex_t *flex, int bitrate, int modulation_type)
 {
 	int symbol_rate = bitrate;
-	double old_bitduration = flex->fsk_bitduration;
 
 	if (modulation_type == FLEX_MOD_4FSK)
 		symbol_rate = bitrate / 2;
-	flex->fsk_bitduration = (double)flex->sender.samplerate / (double)symbol_rate;
-	/* The phase left by the last symbol is how far the next sample already
-	 * is into the next symbol, as a fraction of the old symbol length: keep
-	 * that time at the new symbol length, so the symbols stay on time across
-	 * the switch (no sample added or lost, no symbol shortened). */
-	if (old_bitduration > 0.0 && old_bitduration != flex->fsk_bitduration)
-		flex->fsk_tx_phase *= old_bitduration / flex->fsk_bitduration;
-	flex->fsk_bitstep = 1.0 / flex->fsk_bitduration;
+	fsk_nrz_mod_set_rate(&flex->fsk_mod, (double)symbol_rate);
 	flex->current_frame_speed = bitrate;
 	flex->current_frame_mod_type = modulation_type;
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "DSP speed: %d bps, %d baud (symbols/s), %s, %.4f samples/symbol.\n",
 		  bitrate, symbol_rate,
 		  (modulation_type == FLEX_MOD_4FSK) ? "4FSK" : "2FSK",
-		  flex->fsk_bitduration);
+		  flex->fsk_mod.symbol_samples);
 }
 
-/* Init transceiver instance. */
+/* The polarity of the frames that follow; the level on the air stays */
 void dsp_set_polarity(flex_t *flex, double polarity)
 {
-	if (flex->fsk_polarity == polarity)
+	if (flex->fsk_mod.polarity == polarity)
 		return;
-	flex->fsk_polarity = polarity;
-	dsp_init_fsk4_ramps(flex);
-	/* The levels are numbered in the polarity: the level on the air
-	 * (the deviation the last symbol ended at) is the opposite number now,
-	 * so the next symbol starts from where the signal is. */
-	flex->fsk4_tx_last_level = 3 - flex->fsk4_tx_last_level;
+	fsk_nrz_mod_set_polarity(&flex->fsk_mod, polarity);
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "DSP polarity set to %s.\n",
 		  polarity < 0 ? "inverted" : "normal");
 }
@@ -219,14 +160,9 @@ int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polar
 		goto error;
 	}
 
-	/* create deviation and ramp */
-	flex->fsk_deviation = 1.0; /* equals what we set at sender_set_fm() */
-	flex->fsk_polarity = polarity;
+	/* the modulator: deviation 1.0 is what we set at sender_set_fm() */
+	fsk_nrz_mod_init(&flex->fsk_mod, samplerate, 1600.0, 1.0, polarity);
 	flex->lpf_enabled = enable_lpf;
-	dsp_init_fsk4_ramps(flex);
-	flex->fsk4_tx_last_level = 0;
-	flex->fsk_tx_phase = 0.0;
-	flex->fsk_tx_restart = 1;
 
 	/* Initialize baseband LPF: 3.2 kHz cutoff, 2 iterations (4th-order).
 	 * Occupied bandwidth must not exceed 16 kHz.
@@ -258,110 +194,20 @@ void dsp_cleanup_sender(flex_t *flex)
 	}
 }
 
-/* Encode one 2-FSK word into audio samples.
- * Reads bits MSB-first from 'word', generates cosine-ramped transitions.
- * Returns number of samples written to fsk_tx_buffer. */
-static int fsk_block_encode(flex_t *flex, uint32_t word, int nbits)
-{
-	sample_t *spl;
-	double phase, bitstep;
-	int i, count;
-	uint8_t last_level, level;
-
-	spl = flex->fsk_tx_buffer;
-	phase = flex->fsk_tx_phase;
-	/* the level on the air, shared with 4FSK: 2FSK is levels 0 and 3 */
-	last_level = flex->fsk4_tx_last_level;
-	bitstep = flex->fsk_bitstep * 256.0;
-
-	for (i = 0; i < nbits; i++) {
-		level = (word & 0x80000000) ? 3 : 0;
-		if (level == last_level) {
-			/* stay */
-			sample_t lev = fsk4_levels[level] * flex->fsk_deviation * flex->fsk_polarity;
-			do {
-				*spl++ = lev;
-				phase += bitstep;
-			} while (phase < FSK_PHASE_END);
-			phase -= 256.0;
-		} else {
-			/* ramp from the level on the air (an inner one after 4FSK) */
-			do {
-				*spl++ = flex->fsk4_ramps[last_level][level][(uint8_t)phase];
-				phase += bitstep;
-			} while (phase < FSK_PHASE_END);
-			phase -= 256.0;
-			last_level = level;
-		}
-		word <<= 1;
-	}
-
-	/* depending on the number of samples, return the number */
-	count = ((uintptr_t)spl - (uintptr_t)flex->fsk_tx_buffer) / sizeof(*spl);
-
-	flex->fsk_tx_phase = phase;
-	flex->fsk4_tx_last_level = last_level;
-
-	return count;
-}
-
-/* 4-FSK encoder for 4-level modes (3200bps/4FSK and 6400bps/4FSK).
- * Encodes 2 bits (one dibit) per symbol.
- *   3200bps/4FSK (A3): 1600 baud (symbols/s)
- *   6400bps/4FSK (A4): 3200 baud (symbols/s)
- * Uses pre-computed cosine ramp tables for smooth transitions. */
+/* 4-FSK (3200bps/4FSK A3 at 1600 baud, 6400bps/4FSK A4 at 3200 baud): a
+ * dibit per symbol, MSB first, Gray coded to the level:
+ *   dibit 00 -> level 0 (-4800 Hz), 01 -> level 1 (-1600 Hz),
+ *   dibit 11 -> level 2 (+1600 Hz), 10 -> level 3 (+4800 Hz).
+ * Returns the number of samples written to fsk_tx_buffer. */
 static int fsk4_block_encode(flex_t *flex, uint32_t word, int nsymbols)
 {
-	sample_t *spl;
-	double phase, bitstep;
-	int i, count;
-	uint8_t last_level, sym;
-
-	/* Gray code lookup: dibit → symbol index.
-	 * 4-level FM uses Gray coding:
-	 *   dibit "00" → -4800 Hz (sym 0)
-	 *   dibit "01" → -1600 Hz (sym 1)
-	 *   dibit "11" → +1600 Hz (sym 2)
-	 *   dibit "10" → +4800 Hz (sym 3)
-	 * Standard binary-to-gray: gray = val ^ (val >> 1)
-	 *   0b00 → 0b00 (0), 0b01 → 0b01 (1),
-	 *   0b10 → 0b11 (3), 0b11 → 0b10 (2) */
 	static const uint8_t gray_encode[4] = { 0, 1, 3, 2 };
-
-	spl = flex->fsk_tx_buffer;
-	phase = flex->fsk_tx_phase;
-	last_level = flex->fsk4_tx_last_level;
-	/* Symbol rate is set by dsp_set_speed(): 1600 sym/s for 3200/4FSK (A3),
-	 * 3200 sym/s for 6400/4FSK (A4). */
-	bitstep = flex->fsk_bitstep * 256.0;
+	int i, count = 0;
 
 	for (i = 0; i < nsymbols; i++) {
-		uint8_t dibit = (word >> 30) & 0x03;
-		sym = gray_encode[dibit];
+		count += fsk_nrz_mod_symbol(&flex->fsk_mod, gray_encode[(word >> 30) & 0x03], flex->fsk_tx_buffer + count);
 		word <<= 2;
-
-		if (sym == last_level) {
-			/* Stay at current level */
-			double lev = fsk4_levels[sym] * flex->fsk_deviation * flex->fsk_polarity;
-			do {
-				*spl++ = lev;
-				phase += bitstep;
-			} while (phase < FSK_PHASE_END);
-			phase -= 256.0;
-		} else {
-			/* Ramp from last_level to sym */
-			do {
-				*spl++ = flex->fsk4_ramps[last_level][sym][(uint8_t)phase];
-				phase += bitstep;
-			} while (phase < FSK_PHASE_END);
-			phase -= 256.0;
-			last_level = sym;
-		}
 	}
-
-	count = ((uintptr_t)spl - (uintptr_t)flex->fsk_tx_buffer) / sizeof(*spl);
-	flex->fsk_tx_phase = phase;
-	flex->fsk4_tx_last_level = last_level;
 
 	return count;
 }
@@ -387,7 +233,7 @@ again:
 				 * a new transmission */
 				memset(samples, 0, sizeof(*samples) * length);
 				memset(power, 0, length);
-				flex->fsk_tx_restart = 1;
+				fsk_nrz_mod_silence(&flex->fsk_mod);
 				return;
 			}
 
@@ -406,17 +252,11 @@ again:
 			if (flex->sync_buffer_length > 0)
 				dsp_set_speed(flex, 1600, FLEX_MOD_2FSK);
 
-			/* A new transmission (after silence) starts with a
-			 * full-length first symbol from the lowest level. A frame
-			 * that follows a frame (network mode, frames after the ERS)
-			 * continues: the phase and the level on the air carry on,
-			 * so the frame is exactly its length and the last symbol
-			 * of the frame before is not cut. */
-			if (flex->fsk_tx_restart) {
-				flex->fsk_tx_phase = 0.0;
-				flex->fsk4_tx_last_level = 0;
-				flex->fsk_tx_restart = 0;
-			}
+			/* A frame that follows a frame (network mode, frames
+			 * after the ERS) continues the symbol clock and the level
+			 * on the air, so the frame is exactly its length and the
+			 * last symbol of the frame before is not cut; after
+			 * silence the modulator starts a new transmission. */
 		}
 
 		/* Select which buffer to consume.
@@ -492,7 +332,7 @@ again:
 		if (flex->current_frame_mod_type == FLEX_MOD_4FSK)
 			flex->fsk_tx_buffer_length = fsk4_block_encode(flex, word, read_bytes * 8 / 2);
 		else
-			flex->fsk_tx_buffer_length = fsk_block_encode(flex, word, read_bytes * 8);
+			flex->fsk_tx_buffer_length = fsk_nrz_mod_bits(&flex->fsk_mod, word, read_bytes * 8, flex->fsk_tx_buffer);
 
 		flex->fsk_tx_buffer_pos = 0;
 		flex->dbg_frame_symbols += (flex->current_frame_mod_type == FLEX_MOD_4FSK)
@@ -518,15 +358,12 @@ again:
 			    flex->idle_count >= 4 &&
 			    flex->scan_from >= flex->scan_to &&
 			    !flex->sender.loopback) {
-				int guard = (int)(flex->fsk_bitduration + 1.0);
-				sample_t last_val = flex->fsk_tx_buffer[flex->fsk_tx_buffer_length - 1];
-				int gi;
-				for (gi = 0; gi < guard && flex->fsk_tx_buffer_length + gi < flex->fsk_tx_buffer_size; gi++)
-					flex->fsk_tx_buffer[flex->fsk_tx_buffer_length + gi] = last_val;
+				int gi = fsk_nrz_mod_guard(&flex->fsk_mod, flex->fsk_tx_buffer + flex->fsk_tx_buffer_length,
+							   flex->fsk_tx_buffer_size - flex->fsk_tx_buffer_length);
 				flex->fsk_tx_buffer_length += gi;
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "TX guard: appended %d samples (last_val=%.3f) -- no more frames\n",
-					  gi, last_val);
+					  gi, flex->fsk_mod.last);
 			}
 		}
 

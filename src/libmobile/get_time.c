@@ -40,11 +40,23 @@ static void sample_clock_update_osmo(void)
 	osmo_gettimeofday_override_time.tv_usec = now.tv_nsec / 1000;
 }
 
+/* The time of the first sample (seconds since 1970 UTC); 0: now */
+static double sample_clock_start_given = 0.0;
+
+void sample_clock_set_start(double seconds)
+{
+	sample_clock_start_given = seconds;
+}
+
 void sample_clock_start(void)
 {
 	if (sample_clock_on)
 		return;
 	clock_gettime(CLOCK_REALTIME, &sample_clock_start_real);
+	if (sample_clock_start_given > 0.0) {
+		sample_clock_start_real.tv_sec = (time_t)sample_clock_start_given;
+		sample_clock_start_real.tv_nsec = (long)((sample_clock_start_given - (double)(time_t)sample_clock_start_given) * 1e9);
+	}
 	clock_gettime(CLOCK_MONOTONIC, &sample_clock_start_mono);
 	sample_clock_elapsed = 0.0;
 	osmo_clock_override_enable(CLOCK_MONOTONIC, true);

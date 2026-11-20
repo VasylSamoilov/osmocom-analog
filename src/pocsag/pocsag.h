@@ -1,5 +1,6 @@
 #include "../libmobile/sender.h"
 #include "../libfsk_pll/fsk_pll.h"
+#include "../libfsk/fsk_nrz.h"
 #include "../libpagercharset/pager_charset.h"
 
 /*
@@ -258,20 +259,13 @@ typedef struct pocsag {
 	double			last_queue_stats_time;
 
 	/* dsp states */
-	double			fsk_deviation;		/* deviation of FSK signal on sound card */
 	double			fsk_polarity;		/* polarity of FSK signal (-1.0 = bit '1' is down) — RX */
-	double			fsk_tx_polarity;	/* TX polarity (may differ during speed switching) */
-	sample_t		fsk_ramp_up[256];	/* samples of upward ramp shape */
-	sample_t		fsk_ramp_down[256];	/* samples of downward ramp shape */
-	double			fsk_bitduration;	/* duration of a bit in samples — used for TX buffer sizing */
-	double			fsk_tx_bitduration;	/* TX bit duration (may differ during speed switching) */
-	double			fsk_tx_bitstep;		/* TX bit step */
+	double			fsk_bitduration;	/* duration of a bit in samples */
+	fsk_nrz_mod_t		fsk_mod;		/* TX symbols: the speed and polarity of the group sent */
 	sample_t		*fsk_tx_buffer;		/* tx buffer for one data block */
 	int			fsk_tx_buffer_size;	/* size of tx buffer (in samples) */
 	int			fsk_tx_buffer_length;	/* usage of buffer (in samples) */
 	int			fsk_tx_buffer_pos;	/* current position sending buffer */
-	double			fsk_tx_phase;		/* current bit position */
-	uint8_t			fsk_tx_lastbit;		/* last bit of last message, to correctly ramp */
 	fsk_pll_t		fsk_rx_pll;		/* locked decoder PLL (FLEX-style) */
 	uint64_t		fsk_rx_word;		/* 64-bit shift register: upper 32 = history, lower 32 = sync/codeword */
 	int			fsk_rx_sync;		/* counts down to next sync */

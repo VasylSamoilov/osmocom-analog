@@ -57,25 +57,6 @@ static inline int hamming32(uint32_t a, uint32_t b)
  */
 #define SYNC_MAX_HAMMING	2
 
-void dsp_init_ramp(pocsag_t *pocsag)
-{
-        double c;
-        int i;
-
-        LOGP_CHAN(DDSP, LOGL_DEBUG, "Generating cosine shaped ramp table.\n");
-        for (i = 0; i < 256; i++) {
-		/* This is mathematically incorrect... */
-                if (i < 64)
-                        c = 1.0;
-		else if (i >= 192)
-                        c = -1.0;
-		else
-	                c = cos((double)(i - 64) / 128.0 * M_PI);
-                pocsag->fsk_ramp_down[i] = c * pocsag->fsk_deviation * pocsag->fsk_tx_polarity;
-                pocsag->fsk_ramp_up[i] = -pocsag->fsk_ramp_down[i];
-        }
-}
-
 /* Init transceiver instance. */
 int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double deviation, double polarity, int auto_baud, int auto_polarity)
 {
@@ -90,11 +71,9 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	sender_set_fm(&pocsag->sender, deviation, baudrate, deviation, MAX_DISPLAY);
 
 	pocsag->fsk_bitduration = (double)samplerate / (double)baudrate;
-	pocsag->fsk_tx_bitduration = pocsag->fsk_bitduration;
-	pocsag->fsk_tx_bitstep = 1.0 / pocsag->fsk_bitduration;
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Use %.4f samples for one bit duration @ %d.\n", pocsag->fsk_bitduration, pocsag->sender.samplerate);
 
-	pocsag->fsk_tx_buffer_size = pocsag->fsk_tx_bitduration * 32.0 + 10; /* 32 bit, add some extra to prevent short buffer due to rounding */
+	pocsag->fsk_tx_buffer_size = pocsag->fsk_bitduration * 32.0 + 10; /* 32 bit, add some extra to prevent short buffer due to rounding */
 	pocsag->fsk_tx_buffer = calloc(pocsag->fsk_tx_buffer_size, sizeof(sample_t));
 	if (!pocsag->fsk_tx_buffer) {
 		LOGP_CHAN(DDSP, LOGL_ERROR, "No memory!\n");
@@ -102,11 +81,9 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 		goto error;
 	}
 
-	/* create deviation and ramp */
-	pocsag->fsk_deviation = 1.0; // equals what we st at sender_set_fm()
+	/* the modulator: deviation 1.0 is what we set at sender_set_fm() */
 	pocsag->fsk_polarity = polarity;
-	pocsag->fsk_tx_polarity = polarity;
-	dsp_init_ramp(pocsag);
+	fsk_nrz_mod_init(&pocsag->fsk_mod, samplerate, (double)baudrate, 1.0, polarity);
 
 	/* store auto-detection config */
 	pocsag->rx_auto_baud = auto_baud;
@@ -165,6 +142,27 @@ void dsp_cleanup_sender(pocsag_t *pocsag)
 	}
 }
 
+/* The speed and polarity of the group to send (a transmission starts with
+ * its preamble): what the scheduler takes the messages for, and what the
+ * modulator sends them at, with room for a codeword at that speed */
+void dsp_set_tx_group(pocsag_t *pocsag, int speed, double polarity)
+{
+	int size;
+
+	pocsag->tx_speed = speed;
+	pocsag->tx_polarity = polarity;
+	fsk_nrz_mod_set_rate(&pocsag->fsk_mod, (double)speed);
+	fsk_nrz_mod_set_polarity(&pocsag->fsk_mod, polarity);
+	size = (int)(pocsag->fsk_mod.symbol_samples * 32.0 + 10);
+	if (size > pocsag->fsk_tx_buffer_size) {
+		sample_t *nb = realloc(pocsag->fsk_tx_buffer, size * sizeof(sample_t));
+		if (nb) {
+			pocsag->fsk_tx_buffer = nb;
+			pocsag->fsk_tx_buffer_size = size;
+		}
+	}
+}
+
 
 /* encode one codeward into samples
  * input: 32 data bits
@@ -172,65 +170,7 @@ void dsp_cleanup_sender(pocsag_t *pocsag)
  * return number of samples */
 static int fsk_block_encode(pocsag_t *pocsag, uint32_t word)
 {
-	/* alloc samples, add 1 in case there is a rest */
-	sample_t *spl;
-	double phase, bitstep, devpol;
-	int i, count;
-	uint8_t lastbit;
-
-	devpol = pocsag->fsk_deviation * pocsag->fsk_tx_polarity;
-	spl = pocsag->fsk_tx_buffer;
-	phase = pocsag->fsk_tx_phase;
-	lastbit = pocsag->fsk_tx_lastbit;
-	bitstep = pocsag->fsk_tx_bitstep * 256.0;
-
-	/* add 32 bits */
-	for (i = 0; i < 32; i++) {
-		if (lastbit) {
-			if ((word & 0x80000000)) {
-				/* stay up */
-				do {
-					*spl++ = devpol;
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-			} else {
-				/* ramp down */
-				do {
-					*spl++ = pocsag->fsk_ramp_down[(uint8_t)phase];
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-				lastbit = 0;
-			}
-		} else {
-			if ((word & 0x80000000)) {
-				/* ramp up */
-				do {
-					*spl++ = pocsag->fsk_ramp_up[(uint8_t)phase];
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-				lastbit = 1;
-			} else {
-				/* stay down */
-				do {
-					*spl++ = -devpol;
-					phase += bitstep;
-				} while (phase < 256.0);
-				phase -= 256.0;
-			}
-		}
-		word <<= 1;
-	}
-
-	/* depending on the number of samples, return the number */
-	count = ((uintptr_t)spl - (uintptr_t)pocsag->fsk_tx_buffer) / sizeof(*spl);
-
-	pocsag->fsk_tx_phase = phase;
-	pocsag->fsk_tx_lastbit = lastbit;
-
-	return count;
+	return fsk_nrz_mod_bits(&pocsag->fsk_mod, word, 32, pocsag->fsk_tx_buffer);
 }
 
 /*
@@ -741,23 +681,23 @@ again:
 			    !pocsag->network_mode &&
 			    pocsag->scan_from >= pocsag->scan_to &&
 			    !pocsag->sender.loopback) {
-				int guard = (int)(pocsag->fsk_tx_bitduration + 1.0);
-				sample_t last_val = pocsag->fsk_tx_buffer[pocsag->fsk_tx_buffer_pos - 1];
-				int gi;
+				int gi = fsk_nrz_mod_guard(&pocsag->fsk_mod, samples, length);
 				LOGP_CHAN(DDSP, LOGL_NOTICE,
 					  "TX guard: %d samples (last_val=%.3f) -- no more codewords\n",
-					  guard, last_val);
-				for (gi = 0; gi < guard && length > 0; gi++) {
-					*samples++ = last_val;
-					*power++ = 1;
-					length--;
-				}
+					  gi, pocsag->fsk_mod.last);
+				memset(power, 1, gi);
+				samples += gi;
+				power += gi;
+				length -= gi;
 			}
 			pocsag->fsk_tx_buffer_pos = 0;
 			if (length > 0) {
 				memset(samples, 0, sizeof(*samples) * length);
 				memset(power, 0, length);
 			}
+			/* the next codeword starts a new transmission (also after
+			 * the gap of a speed or polarity switch) */
+			fsk_nrz_mod_silence(&pocsag->fsk_mod);
 			return;
 		}
 
