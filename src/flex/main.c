@@ -46,6 +46,10 @@
 
 #define MSG_SEND_DEFAULT "/tmp/flex_msg_send"
 static const char *msg_send_path = MSG_SEND_DEFAULT;
+/* The FIFO's command lines read from a file instead (batch runs) */
+static const char *msg_send_file = NULL;
+static int msg_send_eof = 0;
+static int batch_end_set = 0;
 static int msg_send_fd = -1;
 
 static int tx = 0;
@@ -151,6 +155,7 @@ static const char *oneshot_station_id = "";	/* saved capcode for sweep re-enqueu
 #define OPT_NO_MSG_NUMBERING	3036
 #define OPT_BIW_TIME_MODE	3037
 #define OPT_MAX_MSG_NUMBER	3038
+#define OPT_FIFO_FILE		3039
 
 void print_help(const char *arg0)
 {
@@ -331,6 +336,10 @@ void print_help(const char *arg0)
 	printf("        after it the numbers of a capcode start from 0 again. Default 63.\n");
 	printf("    --fifo <path>\n");
 	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
+	printf("    --fifo-file <file>\n");
+	printf("        Read the command lines of the FIFO from a file instead (no FIFO is\n");
+	printf("        made): for batch runs with IQ files, where time follows the samples.\n");
+	printf("        The lines are taken as the FIFO takes them, in order.\n");
 	printf("\n");
 	printf("    FIFO protocol (write to %s):\n", msg_send_path);
 	printf("        Format: capcode,type,options,message\n");
@@ -506,6 +515,7 @@ static void add_options(void)
 	option_add(OPT_NO_MSG_NUMBERING, "no-message-numbering", 0);
 	option_add(OPT_MAX_MSG_NUMBER, "max-message-number", 1);
 	option_add(OPT_FIFO, "fifo", 1);
+	option_add(OPT_FIFO_FILE, "fifo-file", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -966,6 +976,9 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_FIFO:
 		msg_send_path = options_strdup(argv[argi++]);
+		break;
+	case OPT_FIFO_FILE:
+		msg_send_file = options_strdup(argv[argi]);
 		break;
 	default:
 		return main_mobile_handle_options(short_option, argi, argv);
@@ -2758,6 +2771,8 @@ static void myhandler(void)
 	rc = read(msg_send_fd, buffer + pos, space);
 	if (rc > 0)
 		pos += rc;
+	else if (rc == 0 && msg_send_file)
+		msg_send_eof = 1;
 
 	/* Defer line processing while ERS is active */
 	if (ers_active)
@@ -2797,6 +2812,27 @@ static void myhandler(void)
 		if (remaining > 0)
 			memmove(buffer, buffer + line_start, remaining);
 		pos = remaining;
+	}
+
+	/* Batch with a command file: once every line was taken and nothing is
+	 * left to send, end after two more frames (the frame on the air and one
+	 * for a receiver of the same run to finish). */
+	if (msg_send_file && msg_send_eof && pos == 0 && !batch_end_set && sample_clock_active()) {
+		sender_t *s;
+		int idle = 1;
+
+		for (s = sender_head; s; s = s->next) {
+			flex_t *f = (flex_t *)s;
+
+			if (f->tx && (f->msg_list || (!f->network_mode && f->state != FLEX_STATE_IDLE)))
+				idle = 0;
+		}
+		if (idle) {
+			batch_end_set = 1;
+			quit_after_time = get_time() + 2.0 * 1.875;
+			LOGP(DFLEX, LOGL_NOTICE, "Batch: command file done and nothing left to send, ending in %.2f s.\n",
+			     2.0 * 1.875);
+		}
 	}
 
 	/* Delayed quit: wait for RX to finish processing */
@@ -2962,6 +2998,14 @@ int main(int argc, char *argv[])
 		return -EINVAL;
 	}
 
+	/* command lines from a file: read as the FIFO is, no FIFO made */
+	if (msg_send_file) {
+		msg_send_fd = open(msg_send_file, O_RDONLY | O_NONBLOCK);
+		if (msg_send_fd < 0) {
+			fprintf(stderr, "Failed to open command file '%s'!\n", msg_send_file);
+			goto fail;
+		}
+	} else {
 	/* create pipe for message send */
 	unlink(msg_send_path);
 	rc = mkfifo(msg_send_path, 0666);
@@ -2974,6 +3018,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to open message send FIFO '%s'!\n", msg_send_path);
 			goto fail;
 		}
+	}
 	}
 
 	/* inits */
@@ -3137,7 +3182,8 @@ fail:
 	/* pipe cleanup */
 	if (msg_send_fd > 0)
 		close(msg_send_fd);
-	unlink(msg_send_path);
+	if (!msg_send_file)
+		unlink(msg_send_path);
 
 	/* destroy transceiver instance */
 	while (sender_head)
