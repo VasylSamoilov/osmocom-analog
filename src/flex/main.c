@@ -35,6 +35,7 @@
 #include "../liboptions/options.h"
 #include "../libfm/fm.h"
 #include "../libmobile/get_time.h"
+#include "../libmobile/msg_fifo.h"
 #include "flex.h"
 #include "frame.h"
 #include "dsp.h"
@@ -48,9 +49,7 @@
 static const char *msg_send_path = MSG_SEND_DEFAULT;
 /* The FIFO's command lines read from a file instead (batch runs) */
 static const char *msg_send_file = NULL;
-static int msg_send_eof = 0;
-static int batch_end_set = 0;
-static int msg_send_fd = -1;
+static msg_fifo_t msg_fifo;
 
 static int tx = 0;
 static double deviation = 4800;
@@ -2739,11 +2738,8 @@ static void sigusr1_handler(int sig)
 
 static void myhandler(void)
 {
-	static char buffer[4096 + 256];
-	static int pos = 0;
-	int rc, i, line_start;
-	int space;
 	flex_t *flex = (flex_t *)sender_head;
+	char *line;
 
 	/* SIGUSR1: dump scheduler state on request */
 	if (dump_scheduler_requested) {
@@ -2760,19 +2756,8 @@ static void myhandler(void)
 	int ers_active = flex && (flex->network_mode ? !flex->sched_ers_done
 						     : flex->state == FLEX_STATE_ERS);
 
-	/* Read whatever is available from the FIFO */
-	space = (int)sizeof(buffer) - pos;
-	if (space <= 0) {
-		fprintf(stderr, "Message buffer overflow, discarding.\n");
-		pos = 0;
-		space = (int)sizeof(buffer);
-	}
-
-	rc = read(msg_send_fd, buffer + pos, space);
-	if (rc > 0)
-		pos += rc;
-	else if (rc == 0 && msg_send_file)
-		msg_send_eof = 1;
+	/* Read whatever is available from the FIFO (or the command file) */
+	msg_fifo_read(&msg_fifo);
 
 	/* Defer line processing while ERS is active */
 	if (ers_active)
@@ -2780,44 +2765,19 @@ static void myhandler(void)
 
 	/* Process up to a batch of complete lines per call.
 	 * This prevents bulk FIFO writes from starving TX/RX processing. */
-	int lines_processed = 0;
-	line_start = 0;
-	while (line_start < pos) {
-		/* Find next line terminator */
-		for (i = line_start; i < pos; i++) {
-			if (buffer[i] == '\r' || buffer[i] == '\n')
-				break;
+	{
+		int lines_processed = 0;
+
+		while (lines_processed < 64 && (line = msg_fifo_line(&msg_fifo))) {
+			fifo_process_line(line, (int)strlen(line));
+			lines_processed++;
 		}
-
-		if (i >= pos)
-			break;  /* no complete line yet — keep remainder */
-
-		/* Process this line if non-empty */
-		if (i > line_start)
-			fifo_process_line(buffer + line_start, i - line_start);
-
-		/* Skip past the line terminator(s) */
-		i++;
-		while (i < pos && (buffer[i] == '\r' || buffer[i] == '\n'))
-			i++;
-		line_start = i;
-
-		if (++lines_processed >= 64)
-			break;  /* yield to TX/RX, process rest next call */
-	}
-
-	/* Shift any remaining partial line to the front of the buffer */
-	if (line_start > 0) {
-		int remaining = pos - line_start;
-		if (remaining > 0)
-			memmove(buffer, buffer + line_start, remaining);
-		pos = remaining;
 	}
 
 	/* Batch with a command file: once every line was taken and nothing is
 	 * left to send, end after two more frames (the frame on the air and one
 	 * for a receiver of the same run to finish). */
-	if (msg_send_file && msg_send_eof && pos == 0 && !batch_end_set && sample_clock_active()) {
+	{
 		sender_t *s;
 		int idle = 1;
 
@@ -2827,12 +2787,8 @@ static void myhandler(void)
 			if (f->tx && (f->msg_list || (!f->network_mode && f->state != FLEX_STATE_IDLE)))
 				idle = 0;
 		}
-		if (idle) {
-			batch_end_set = 1;
-			quit_after_time = get_time() + 2.0 * 1.875;
-			LOGP(DFLEX, LOGL_NOTICE, "Batch: command file done and nothing left to send, ending in %.2f s.\n",
-			     2.0 * 1.875);
-		}
+		if (msg_fifo_batch_end(&msg_fifo, idle, 2.0 * 1.875))
+			quit = 1;
 	}
 
 	/* Delayed quit: wait for RX to finish processing */
@@ -2998,28 +2954,9 @@ int main(int argc, char *argv[])
 		return -EINVAL;
 	}
 
-	/* command lines from a file: read as the FIFO is, no FIFO made */
-	if (msg_send_file) {
-		msg_send_fd = open(msg_send_file, O_RDONLY | O_NONBLOCK);
-		if (msg_send_fd < 0) {
-			fprintf(stderr, "Failed to open command file '%s'!\n", msg_send_file);
-			goto fail;
-		}
-	} else {
-	/* create pipe for message send */
-	unlink(msg_send_path);
-	rc = mkfifo(msg_send_path, 0666);
-	if (rc < 0) {
-		fprintf(stderr, "Failed to create message send FIFO '%s'!\n", msg_send_path);
+	/* the pipe for message send, or the command lines from a file */
+	if (msg_fifo_open(&msg_fifo, msg_send_path, msg_send_file) < 0)
 		goto fail;
-	} else {
-		msg_send_fd = open(msg_send_path, O_RDWR | O_NONBLOCK);
-		if (msg_send_fd < 0) {
-			fprintf(stderr, "Failed to open message send FIFO '%s'!\n", msg_send_path);
-			goto fail;
-		}
-	}
-	}
 
 	/* inits */
 	fm_init(fast_math);
@@ -3180,10 +3117,7 @@ int main(int argc, char *argv[])
 
 fail:
 	/* pipe cleanup */
-	if (msg_send_fd > 0)
-		close(msg_send_fd);
-	if (!msg_send_file)
-		unlink(msg_send_path);
+	msg_fifo_close(&msg_fifo);
 
 	/* destroy transceiver instance */
 	while (sender_head)

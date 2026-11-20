@@ -32,13 +32,14 @@
 #include "../libmobile/main_mobile.h"
 #include "../liboptions/options.h"
 #include "../libfm/fm.h"
+#include "../libmobile/msg_fifo.h"
 #include "pocsag.h"
 #include "dsp.h"
 
 #define MSG_SEND_DEFAULT "/tmp/pocsag_msg_send"
 #define MSG_RECEIVED "/tmp/pocsag_msg_received"
 static const char *msg_send_path = MSG_SEND_DEFAULT;
-static int msg_send_fd = -1;
+static msg_fifo_t msg_fifo;
 
 static int tx = 0;		/* we transmit */
 static int rx = 0;		/* we receive */
@@ -171,6 +172,9 @@ void print_help(const char *arg0)
 	printf("\n");
 	printf("    --fifo <path>\n");
 	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
+	printf("    --fifo-file <file>\n");
+	printf("        Read the command lines of the FIFO from a file instead (no FIFO is\n");
+	printf("        made): for batch runs with IQ files, where time follows the samples.\n");
 	printf("File: %s\n", msg_send_path);
 	printf("        Write \"<capcode>,<type>,<options>,<message>\" to send a message.\n");
 	printf("        Format: capcode,type,options,message (always 4 comma-separated fields)\n");
@@ -212,6 +216,10 @@ void print_help(const char *arg0)
 #define OPT_ONESHOT	261
 #define OPT_CHARSET	262
 #define OPT_CHARSET_PRINT 263
+#define OPT_FIFO_FILE	264
+
+/* The FIFO's command lines read from a file instead (batch runs) */
+static const char *msg_send_file = NULL;
 
 static void add_options(void)
 {
@@ -231,6 +239,7 @@ static void add_options(void)
 	option_add(OPT_DEDUP, "dedup", 1);
 	option_add(OPT_MAX_BATCHES, "max-batches", 1);
 	option_add(OPT_FIFO, "fifo", 1);
+	option_add(OPT_FIFO_FILE, "fifo-file", 1);
 	option_add(OPT_NETWORK, "network", 0);
 	option_add(OPT_ONESHOT, "oneshot", 0);
 }
@@ -383,6 +392,9 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_FIFO:
 		msg_send_path = options_strdup(argv[argi++]);
 		break;
+	case OPT_FIFO_FILE:
+		msg_send_file = options_strdup(argv[argi]);
+		break;
 	case OPT_NETWORK:
 		network_mode = 1;
 		break;
@@ -399,60 +411,44 @@ static int handle_options(int short_option, int argi, char **argv)
 
 static void myhandler(void)
 {
-	static char buffer[4096];
-	static int buf_len = 0;
-	int rc, i, start;
-	int space = sizeof(buffer) - buf_len;
+	char *line;
 
-	rc = read(msg_send_fd, buffer + buf_len, space);
-	if (rc > 0) {
-		buf_len += rc;
-
-		/* Overflow handling: if buffer is full with no complete message,
-		 * discard all data */
-		if (buf_len == (int)sizeof(buffer)) {
-			int has_newline = 0;
-			for (i = 0; i < buf_len; i++) {
-				if (buffer[i] == '\r' || buffer[i] == '\n') {
-					has_newline = 1;
-					break;
-				}
-			}
-			if (!has_newline) {
-				fprintf(stderr, "Message buffer overflow, discarding!\n");
-				buf_len = 0;
-				return;
-			}
-		}
-
-		/* Process all complete lines */
-		start = 0;
-		for (i = 0; i < buf_len; i++) {
-			if (buffer[i] == '\r' || buffer[i] == '\n') {
-				buffer[i] = '\0';
-				if (i > start) {
-					if (tx)
-						pocsag_msg_send(charset, buffer + start, i - start);
-					else
-						LOGP(DPOCSAG, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
-				}
-				start = i + 1;
-			}
-		}
-
-		/* Retain any partial line */
-		if (start > 0 && start < buf_len) {
-			memmove(buffer, buffer + start, buf_len - start);
-			buf_len -= start;
-		} else if (start >= buf_len) {
-			buf_len = 0;
-		}
+	/* Process all complete lines */
+	msg_fifo_read(&msg_fifo);
+	while ((line = msg_fifo_line(&msg_fifo))) {
+		if (tx)
+			pocsag_msg_send(charset, line, (int)strlen(line));
+		else
+			LOGP(DPOCSAG, LOGL_ERROR, "Failed to send message, transmitter is not enabled!\n");
 	}
 
 	/* --oneshot: quit after transmission completes */
 	if (oneshot) {
 		pocsag_t *pocsag = (pocsag_t *)sender_head;
 		if (pocsag && pocsag->state == POCSAG_IDLE)
+			quit = 1;
+	}
+
+	/* Batch with a command file: once every line was taken and nothing is
+	 * left to send (retransmissions wait in the queues), end a second later
+	 * so a receiver of the same run can finish. */
+	{
+		sender_t *s;
+		int idle = 1;
+
+		for (s = sender_head; s; s = s->next) {
+			pocsag_t *p = (pocsag_t *)s;
+			int pol, spd, fr;
+
+			if (p->state != POCSAG_IDLE)
+				idle = 0;
+			for (pol = 0; pol < POCSAG_NUM_POL; pol++)
+				for (spd = 0; spd < POCSAG_NUM_SPD; spd++)
+					for (fr = 0; fr < 8; fr++)
+						if (p->msg_list[pol][spd][fr])
+							idle = 0;
+		}
+		if (msg_fifo_batch_end(&msg_fifo, idle, 1.0))
 			quit = 1;
 	}
 }
@@ -561,19 +557,9 @@ int main(int argc, char *argv[])
 	if (scan_to > scan_from && !msg_type_given)
 		msg_type = POCSAG_MSG_TYPE_NUMERIC;
 
-	/* create pipe for message sendy */
-	unlink(msg_send_path);
-	rc = mkfifo(msg_send_path, 0666);
-	if (rc < 0) {
-		fprintf(stderr, "Failed to create message send FIFO '%s'!\n", msg_send_path);
+	/* the pipe for message send, or the command lines from a file */
+	if (msg_fifo_open(&msg_fifo, msg_send_path, msg_send_file) < 0)
 		goto fail;
-	} else {
-		msg_send_fd = open(msg_send_path, O_RDWR | O_NONBLOCK);
-		if (msg_send_fd < 0) {
-			fprintf(stderr, "Failed to open message send FIFO '%s'!\n", msg_send_path);
-			goto fail;
-		}
-	}
 
 	/* inits */
 	fm_init(fast_math);
@@ -618,9 +604,7 @@ int main(int argc, char *argv[])
 
 fail:
 	/* pipe */
-	if (msg_send_fd > 0)
-		close(msg_send_fd);
-	unlink(msg_send_path);
+	msg_fifo_close(&msg_fifo);
 
 	/* destroy transceiver instance */
 	while(sender_head)
