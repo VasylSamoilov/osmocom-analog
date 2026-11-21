@@ -39,9 +39,35 @@ The DMA does not stop with the process. The backend stops it on exit, on
 crashes and on the usual signals, but `kill -9` leaves the carrier on (run
 any rpitx tool, e.g. `tune`, and stop it with Ctrl-C to switch it off).
 
-Above 750 MHz (Pi 3) librpitx moves only the fraction of the PLL multiplier,
-which steps every 38.4 MHz. Within +-samplerate/2 of a step the carrier would
-jump, so the backend refuses: e.g. 883.2 MHz (AMPS channels around 440).
+librpitx moves only the fraction of the PLL multiplier. Its integer steps are
+every 38.4 MHz above 750 MHz on the Pi 3 and every 27 MHz above 375 MHz on
+the Pi 4. Within +-samplerate/2 of a step the carrier would jump, so the
+backend refuses: e.g. 883.2 MHz on the Pi 3 (AMPS channels around 440). It
+also refuses carriers the PLL cannot make: on the Pi 4 above 1 GHz, and
+settings that run the PLL below 600 MHz, which freeze the board (librpitx
+allows them).
+
+The pin stays off until the first samples reach the DMA, so a process that
+stalls while starting does not leave a carrier on air.
+
+With `timeout` in a terminal use `timeout --foreground`: plain `timeout` runs
+the program in a background process group, the program is stopped (state `T`)
+when it sets up the terminal for its console, and it never feeds the DMA.
+
+## Measured on a Pi 4 (2026-11-21)
+
+Raspberry Pi 4 Model B, Raspberry Pi OS 11 64 bit, librpitx f01bdb6,
+`gpu_freq=250` and `force_turbo=1` in `/boot/config.txt`, RTL-SDR next to it.
+
+| test | result |
+|---|---|
+| POCSAG 1200, one page, 96 kS/s, drive level 0 | decoded (multimon-ng) |
+| POCSAG `--network` 70 s, pages from `--fifo-file` | all pages decoded, 96000 S/s measured, FIFO fill 21 ms, 0 underruns, eye 17 dB |
+| two channels 434.000 + 434.025, 192 kS/s | 192029 S/s, 0 underruns, CPU 96 % idle; eye 16 dB (first) and 11 dB (second) |
+| PLL follows the frequency samples | flat from 500 Hz to 40 kHz modulation, deviation up to 90 kHz, steps of 33 kHz per sample |
+| carrier offset | Pi and RTL-SDR crystals together about +2 ppm |
+
+`rtl_sdr -g 0` is automatic gain, not the lowest gain: use `-g 0.9` next to the Pi.
 
 ## Build on the Pi
 
