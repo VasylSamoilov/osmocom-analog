@@ -5,6 +5,7 @@ noinst_LIBRARIES = libmobile.a
 libmobile_a_SOURCES = \
 	sender.c \
 	call.c \
+	telephone_event.c \
 	console.c \
 	testton.c \
 	cause.c \

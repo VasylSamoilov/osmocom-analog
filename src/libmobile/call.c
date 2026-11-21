@@ -38,6 +38,7 @@
 #include <osmocom/cc/rtp.h>
 #include "cause.h"
 #include "sender.h"
+#include "telephone_event.h"
 #include "call.h"
 #include "console.h"
 #include "../libecho/suppressor.h"
@@ -106,7 +107,8 @@ static struct osmo_cc_helper_audio_codecs codecs[] = {
 	{ "L16", NULL, 8000, 1, encode_l16, decode_l16, NULL, NULL },
 	{ "PCMA", NULL, 8000, 1, g711_encode_alaw, g711_decode_alaw, NULL, NULL },
 	{ "PCMU", NULL, 8000, 1, g711_encode_ulaw, g711_decode_ulaw, NULL, NULL },
-	{ "telephone-event", NULL, 8000, 1, NULL, NULL, NULL, NULL },  /* RFC 4733 DTMF/Flash */
+	/* RFC 4733 DTMF/flash, no channels in its rtpmap, see telephone_event.c */
+	{ "telephone-event", NULL, 8000, -1, NULL, NULL, te_fmtp_encode, te_fmtp_decode },
 	{ NULL, NULL, 0, 0, NULL, NULL, NULL, NULL},
 };
 
@@ -133,7 +135,8 @@ typedef struct process {
 	struct osmo_timer_list timer;
 	osmo_cc_session_t *session;
 	osmo_cc_session_codec_t *codec; /* codec to send */
-	osmo_cc_session_media_t *media; /* audio media (for RFC 4733 support) */
+	osmo_cc_session_codec_t *telephone_event; /* RFC 4733, if negotiated */
+	struct te_rx te_rx;
 	
 	/* Echo suppressor */
 	int echo_suppressor_enabled;
@@ -164,36 +167,24 @@ static void indicate_disconnect_release(int callref, int cause, uint8_t msg_type
 static void call_echo_suppressor_cleanup(process_t *process);
 static void call_dtmf_cleanup(process_t *process);
 
-/* RFC 4733 event codes */
-#define RFC4733_EVENT_FLASH 16
-
-/* Local RFC 4733 RX callback - handles DTMF/Flash received via RTP directly.
- * This is called when RFC 4733 telephone-event packets are received from the network.
- * Instead of sending osmo-cc messages (which would go back to SIP endpoint),
- * we process the events locally: queue DTMF for TX to mobile, or handle flash.
- */
-static void call_rfc4733_rx_cb(osmo_cc_session_media_t *media, uint8_t event, uint16_t __attribute__((unused)) duration)
+/* RFC 4733 telephone-event packet from the network: handled here, DTMF is
+ * sent to the mobile, flash plays the recall tone (no osmo-cc message, that
+ * would go back to the SIP endpoint) */
+static void call_te_rx(process_t *process, uint32_t timestamp, uint8_t *payload, int payload_len)
 {
-	process_t *process;
-	static const char dtmf_chars[] = "0123456789*#ABCD";
+	uint8_t event;
+	uint16_t duration;
 
-	if (!media || !media->session || !media->session->priv) {
-		LOGP(DCALL, LOGL_ERROR, "RFC 4733 RX: no media/session/priv\n");
+	if (!te_receive(&process->te_rx, timestamp, payload, payload_len, &event, &duration))
 		return;
-	}
 
-	process = (process_t *)media->session->priv;
-
-	if (event == RFC4733_EVENT_FLASH) {
-		/* Flash from network - play recall tone to mobile */
+	if (event == TE_EVENT_FLASH) {
 		LOGP(DCALL, LOGL_INFO, "RFC 4733 Flash received from network (callref=%d)\n", process->callref);
 		call_tone_recall(process->callref, 1);
 	} else if (event <= 15) {
-		/* DTMF from network - queue for TX to mobile */
-		char digit = dtmf_chars[event];
-		char digits[2] = { digit, '\0' };
+		char digits[2] = { te_digit_from_event(event), '\0' };
 		LOGP(DCALL, LOGL_INFO, "RFC 4733 DTMF '%c' received from network -> TX to mobile (callref=%d)\n",
-		     digit, process->callref);
+		     digits[0], process->callref);
 		call_dtmf_queue(process->callref, digits);
 	} else {
 		LOGP(DCALL, LOGL_DEBUG, "RFC 4733 unsupported event %d ignored (callref=%d)\n",
@@ -201,39 +192,16 @@ static void call_rfc4733_rx_cb(osmo_cc_session_media_t *media, uint8_t event, ui
 	}
 }
 
-/* Set up RFC 4733 telephone-event support for a process after codec negotiation.
- * This enables receiving DTMF/Flash via RTP telephone-event packets.
- * Must be called after process->codec is set and session is established.
- */
-static void call_setup_rfc4733(process_t *process)
+/* after the codec is negotiated: tell if RFC 4733 is there */
+static void call_te_log(process_t *process)
 {
-	osmo_cc_session_media_t *media;
-
-	if (!process || !process->session || !process->codec)
-		return;
-
-	/* Get the media from the codec */
-	media = process->codec->media;
-	if (!media)
-		return;
-
-	/* Store media pointer for sending RFC 4733 events */
-	process->media = media;
-
-	/* Check if telephone-event was negotiated */
-	if (!media->telephone_event_negotiated) {
+	if (!process->telephone_event) {
 		LOGP(DCALL, LOGL_NOTICE, "RFC 4733 not available - telephone-event not negotiated (callref=%d)\n",
 		     process->callref);
 		return;
 	}
-
-	/* Set up local RFC 4733 receive callback - handles DTMF/Flash directly
-	 * instead of sending osmo-cc messages back to SIP endpoint */
-	media->event_cb = call_rfc4733_rx_cb;
-	media->event_cb_data = NULL;  /* We use media->session->priv instead */
-
 	LOGP(DCALL, LOGL_INFO, "RFC 4733 enabled for DTMF/Flash signaling (callref=%d, pt=%d)\n",
-	     process->callref, media->telephone_event_pt);
+	     process->callref, process->telephone_event->payload_type_remote);
 }
 
 static process_t *create_process(int callref, enum process_state state)
@@ -603,8 +571,17 @@ static void down_audio(struct osmo_cc_session_codec *codec, uint8_t marker, uint
 	process_t *process = codec->media->session->priv;
 //	sample_t samples[len / 2];
 
+	if (!process)
+		return;
+
+	/* RFC 4733 packets come here too, with their own codec (no decoder) */
+	if (codec == process->telephone_event) {
+		call_te_rx(process, timestamp, payload, payload_len);
+		return;
+	}
+
 	/* if we are disconnected or if a tone is played, ignore audio */
-	if (!process || process->tones.tone != TONES_TONE_OFF)
+	if (process->tones.tone != TONES_TONE_OFF)
 		return;
 
 #if 0
@@ -843,9 +820,9 @@ void call_up_flash(int callref)
 	LOGP(DCALL, LOGL_INFO, "*** Flash (Hook-Flash) received from mobile (callref=%d) ***\n", callref);
 
 	/* Try RFC 4733 first if available (event 16 = Flash) */
-	if (process->media && process->media->telephone_event_negotiated) {
+	if (process->telephone_event) {
 		LOGP(DCALL, LOGL_INFO, "Flash from mobile -> RFC 4733 event 16 (callref=%d)\n", callref);
-		osmo_cc_rtp_send_event(process->media, 16, 400);  /* 400ms duration per TIA/EIA-553-A */
+		te_send(process->telephone_event, TE_EVENT_FLASH, 400);  /* 400ms duration per TIA/EIA-553-A */
 		/* Still toggle hold state for local tracking */
 		process->remote_on_hold = !process->remote_on_hold;
 		return;
@@ -872,29 +849,6 @@ void call_up_flash(int callref)
 	osmo_cc_ll_msg(ep, callref, msg);
 }
 
-/* Convert DTMF character to RFC 4733 event code.
- * Returns event code 0-15 for DTMF, -1 for invalid character.
- * Per RFC 4733 Section 3.2:
- *   0-9: DTMF digits 0-9
- *   10:  DTMF *
- *   11:  DTMF #
- *   12-15: DTMF A-D
- */
-static int dtmf_char_to_rfc4733_event(char digit)
-{
-	if (digit >= '0' && digit <= '9')
-		return digit - '0';
-	if (digit == '*')
-		return 10;
-	if (digit == '#')
-		return 11;
-	if (digit >= 'A' && digit <= 'D')
-		return 12 + (digit - 'A');
-	if (digit >= 'a' && digit <= 'd')
-		return 12 + (digit - 'a');
-	return -1;
-}
-
 /* Transceiver indicates DTMF digit detected from mobile. */
 void call_up_dtmf(int callref, char digit)
 {
@@ -910,19 +864,15 @@ void call_up_dtmf(int callref, char digit)
 
 	process = get_process(callref);
 
-	LOGP(DCALL, LOGL_NOTICE, "call_up_dtmf: digit='%c' callref=%d process=%p media=%p\n",
-	     digit, callref, process, process ? process->media : NULL);
-	if (process && process->media) {
-		LOGP(DCALL, LOGL_NOTICE, "call_up_dtmf: media->telephone_event_negotiated=%d pt=%d\n",
-		     process->media->telephone_event_negotiated, process->media->telephone_event_pt);
-	}
+	LOGP(DCALL, LOGL_NOTICE, "call_up_dtmf: digit='%c' callref=%d process=%p telephone-event=%d\n",
+	     digit, callref, process, (process && process->telephone_event) ? process->telephone_event->payload_type_remote : -1);
 
 	/* Try RFC 4733 first if available */
-	if (process && process->media && process->media->telephone_event_negotiated) {
-		event = dtmf_char_to_rfc4733_event(digit);
+	if (process && process->telephone_event) {
+		event = te_event_from_digit(digit);
 		if (event >= 0) {
 			LOGP(DCALL, LOGL_INFO, "DTMF '%c' from mobile -> RFC 4733 (callref=%d)\n", digit, callref);
-			osmo_cc_rtp_send_event(process->media, event, 160);  /* 160ms duration */
+			te_send(process->telephone_event, event, 160);  /* 160ms duration */
 			return;
 		}
 	}
@@ -1160,15 +1110,15 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		const char *sdp;
 
 		/* sdp accept */
-		sdp = osmo_cc_helper_audio_accept(&ep->session_config, process, codecs + no_l16, down_audio, msg, &process->session, &process->codec, 0);
+		sdp = osmo_cc_helper_audio_accept_te(&ep->session_config, process, codecs + no_l16, down_audio, msg, &process->session, &process->codec, &process->telephone_event, 0);
 		if (!sdp) {
 			disconnect_process(callref, 47);
 			indicate_disconnect_release(callref, 47, OSMO_CC_MSG_REJ_IND);
 			break;
 		}
 
-		/* Set up RFC 4733 telephone-event support */
-		call_setup_rfc4733(process);
+		/* RFC 4733 telephone-event, if negotiated */
+		call_te_log(process);
 
 		/* caller id */
 		rc = osmo_cc_get_ie_calling(msg, 0, &type, &plan, &present, &screen, caller_id, sizeof(caller_id));
@@ -1271,7 +1221,7 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 	    }
 	case OSMO_CC_MSG_SETUP_ACK_REQ:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC overlap from fixed network\n");
-		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
+		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0) {
 			nego_failed:
 			LOGP(DCALL, LOGL_INFO, "Releasing, because codec negotiation failed.\n");
@@ -1284,7 +1234,7 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		break;
 	case OSMO_CC_MSG_PROC_REQ:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC proceeding from fixed network\n");
-		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
+		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
 		/* Notify AMPS layer - can now assign voice channel */
@@ -1292,13 +1242,13 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		break;
 	case OSMO_CC_MSG_PROGRESS_REQ:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC progress from fixed network\n");
-		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
+		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
 		break;
 	case OSMO_CC_MSG_ALERT_REQ:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC alerting from fixed network\n");
-		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
+		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
 		/* Also trigger channel assignment on ALERTING (in case PROCEEDING was skipped) */
@@ -1307,11 +1257,11 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		break;
 	case OSMO_CC_MSG_SETUP_RSP:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC answer from fixed network\n");
-		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
+		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
-		/* Set up RFC 4733 telephone-event support */
-		call_setup_rfc4733(process);
+		/* RFC 4733 telephone-event, if negotiated */
+		call_te_log(process);
 		/* Trigger channel assignment if PROCEEDING was skipped (e.g., console auto-answer) */
 		call_down_proceeding(callref);
 		new_state_process(callref, PROCESS_CONNECT);
@@ -1328,7 +1278,7 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		call_dtmf_init(process);
 		break;
 	case OSMO_CC_MSG_DISC_REQ:
-		rc = osmo_cc_helper_audio_negotiate(msg, &process->session, &process->codec);
+		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
 		rc = osmo_cc_get_ie_cause(msg, 0, &location, &isdn_cause, &sip_cause, &socket_cause);
