@@ -10,11 +10,10 @@ the phase of the IQ signal and sends its frequency, with the carrier on at a
 fixed drive level while the signal is there.
 
 - One FM channel: exact.
-- Two FM channels (EXPERIMENTAL, not usable off air yet): both are sent on
-  the one carrier. In simulation both channels reach 44 dB SINAD; on a Pi 4
-  off air the first one reaches about 20 dB and the second only about 8 dB,
-  POCSAG pages on it do not decode. The cause is under investigation. The
-  second channel is at
+- Two FM channels (experimental, not yet tried with NMT or AMPS): both are
+  sent on the one carrier. On a Pi 4 off air both reach about 25 dB SINAD
+  (test tones, 3 kHz deviation), and a POCSAG page on the weaker one decodes.
+  The second channel is at
   `--sdr-rpitx-ratio` (default 0.6, range 0.2 .. 0.8) of the first one's
   level. With 0.6 the first channel is at -0.9 dB, the second at -10 dB, a
   mixing product at -12 dB sits one spacing on the other side of the first
@@ -31,7 +30,7 @@ fixed drive level while the signal is there.
 
 | option | rpitx meaning |
 |---|---|
-| `--sdr-tx-gain 0..7` | GPIO drive level, 2..16 mA (default 0, lowest) |
+| `--sdr-tx-gain 0..7` | GPIO drive level, 2..16 mA (default 0, lowest). Measured with librpitx's iqdmasync (relative to level 7): -25.6, -14.6, -10.1, -8.1, -3.3, -2.2, -0.8, 0 dB; the backend's own chain sets the pad differently (about 18 dB more at level 0), not measured per level yet |
 | `--sdr-samplerate` | 10000 .. 200000 S/s; up to 250000 without carrier keying |
 | `--sdr-tx-ppm` | crystal correction, needed: ±50 ppm is 23 kHz at 460 MHz |
 | `--sdr-rpitx-ratio` | level of the second channel, below 1 |
@@ -67,8 +66,18 @@ Raspberry Pi 4 Model B, Raspberry Pi OS 11 64 bit, librpitx f01bdb6,
 |---|---|
 | POCSAG 1200, one page, 96 kS/s, drive level 0 | decoded (multimon-ng) |
 | POCSAG `--network` 70 s, pages from `--fifo-file` | all pages decoded, 96000 S/s measured, FIFO fill 21 ms, 0 underruns, eye 17 dB |
-| two channels 434.000 + 434.025, 192 kS/s | 192029 S/s, 0 underruns, CPU 96 % idle; eye 16 dB (first) and 11 dB (second); a page on the second channel does not decode |
-| test tones (1000 / 1700 Hz, 3 kHz deviation), SINAD | one channel 27 dB (limited by the RTL-SDR); two channels 20 dB (first) and 8.5 dB (second), the same at every RTL gain, simulation 44 / 45 dB |
+| two channels 434.000 + 434.025, 192 kS/s | 192027 S/s, 0 underruns, CPU 96 % idle; eye 21 dB (first) and 19 dB (second); a page on the second channel decodes |
+| test tones (1000 / 1700 Hz, 3 kHz deviation), SINAD | one channel 44 dB; two channels 25 / 24 dB (simulation 44 / 45 dB) |
+| levels of the two channels and the product | -1.2 / -11.4 / -12.6 dBc, predicted -0.9 / -10.0 / -11.8 |
+
+The DMA chain matters. librpitx's iqdmasync (frequency + keying) writes 4
+control blocks per sample, and the moment of each frequency update jitters:
+a broadband floor that grows with the frequency steps. With it, one channel
+reached 21..27 dB SINAD and two channels 17 / 8 dB, and a page on the second
+channel did not decode. The backend uses its own chain of 2 blocks per
+sample (as ngfmdmasync, which cannot key), keying only on the sample where
+the carrier switches; see src/libsdr/rpitx_dma.cpp. The test tool behind
+these numbers (twoch, SINAD per channel) is not part of the tree.
 | PLL follows the frequency samples | flat from 500 Hz to 40 kHz modulation, deviation up to 90 kHz, steps of 33 kHz per sample |
 | carrier offset | Pi and RTL-SDR crystals together about +2 ppm |
 

@@ -617,7 +617,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				double spacing = tx_high_frequency - tx_low_frequency;
 				int tx_rate = sdr_config->split_mode ? sdr_config->tx_samplerate : sdr_config->samplerate;
 
-				LOGP(DSDR, LOGL_NOTICE, "rpitx: EXPERIMENTAL: two channels on one carrier; off air the second channel is weak and distorted (see docs/RPITX.md). The second channel at %.2f of the first one's level (--sdr-rpitx-ratio). The first channel should stay on (control channel), the second one may key on and off. One spacing on the far side of the first channel carries mixing products, keep it unused.\n", sdr_config->rpitx_ratio);
+				LOGP(DSDR, LOGL_NOTICE, "rpitx: two channels on one carrier (experimental, see docs/RPITX.md). The second channel at %.2f of the first one's level (--sdr-rpitx-ratio). The first channel should stay on (control channel), the second one may key on and off. One spacing on the far side of the first channel carries mixing products, keep it unused.\n", sdr_config->rpitx_ratio);
 				if (spacing > tx_rate / 3.0)
 					LOGP(DSDR, LOGL_NOTICE, "rpitx: the spacing of %.0f kHz is more than a third of the sample rate, mixing products fold back near the channels. Increase the sample rate.\n", spacing / 1e3);
 			}
