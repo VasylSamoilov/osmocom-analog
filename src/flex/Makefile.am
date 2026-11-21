@@ -1,9 +1,10 @@
 AM_CPPFLAGS = -Wall -Wextra -Wmissing-prototypes -g $(all_includes)
 
+# Not "flex": that is the scanner generator (Debian package flex), which it would hide in the PATH
 bin_PROGRAMS = \
-	flex
+	flexpager
 
-flex_SOURCES = \
+flexpager_SOURCES = \
 	flex.c \
 	frame.c \
 	scheduler.c \
@@ -12,7 +13,7 @@ flex_SOURCES = \
 	dsp.c \
 	image.c \
 	main.c
-flex_LDADD = \
+flexpager_LDADD = \
 	$(COMMON_LA) \
 	$(top_builddir)/src/libpagercharset/libpagercharset.a \
 	$(top_builddir)/src/liboptions/liboptions.a \
@@ -37,14 +38,14 @@ flex_LDADD = \
 	-lm
 
 if HAVE_ALSA
-flex_LDADD += \
+flexpager_LDADD += \
 	$(top_builddir)/src/libsound/libsound.a \
 	$(ALSA_LIBS)
 
 endif
 
 if HAVE_SDR
-flex_LDADD += \
+flexpager_LDADD += \
 	$(top_builddir)/src/libsdr/libsdr.a \
 	$(top_builddir)/src/libchannelizer/libchannelizer.a \
 	$(top_builddir)/src/libpolyphase/libpolyphase.a \

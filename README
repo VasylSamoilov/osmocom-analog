@@ -64,78 +64,168 @@ merged with upstream. In addition to upstream it has:
 Installation
 ============
 
-Debian / Ubuntu / Raspberry Pi OS. The upstream step-by-step guide is at
-http://osmocom-analog.eversberg.eu/docs/install.html
+For Debian, Ubuntu and Raspberry Pi OS. Everything is typed in a terminal, one
+line at a time; a line starting with "sudo" asks for your password. Each step
+ends with a check: do not go on until it gives what is shown. The upstream
+guide is at http://osmocom-analog.eversberg.eu/docs/install.html
 
-1. Tools and libraries
+Three programs are built, in this order, because each one needs the one before:
 
-   Required:
+  libosmo-cc         the call control library
+  osmocom-analog     the base stations and transmitters (this tree)
+  osmo-cc-sip-endpoint   optional: calls to a SIP PBX or provider
 
+Step 1. Install the tools and libraries
+
+     sudo apt update
      sudo apt install build-essential autoconf automake libtool pkg-config git
      sudo apt install libosmocore-dev
 
-   Optional, configure finds them by itself:
+   For the hardware you have (configure finds them by itself; skip what you do
+   not need):
 
-     sudo apt install libasound2-dev                # sound card (radio, headset)
+     sudo apt install libasound2-dev                 # sound card (radio, headset)
      sudo apt install libsoapysdr-dev soapysdr-tools # SoapySDR (LimeSDR, ...)
-     sudo apt install libuhd-dev uhd-host           # UHD (Ettus USRP)
-     sudo apt install libfuse3-dev                  # 'Datenklo' modem emulation
-     sudo apt install libmagickcore-dev             # TV images other than PPM
+     sudo apt install libuhd-dev uhd-host            # UHD (Ettus USRP)
+     sudo apt install libfuse3-dev                   # 'Datenklo' modem emulation
+     sudo apt install libmagickcore-dev              # TV images other than PPM
+     sudo apt install libsofia-sip-ua-dev            # only for step 5 (SIP)
 
    Raspberry Pi as transmitter: librpitx, see docs/RPITX.md.
 
-2. libosmo-cc (call control, 3.2.0 or newer)
+   Check:
 
+     pkg-config --modversion libosmocore
+
+   prints a version (1.6.0 or newer).
+
+Step 2. Get the sources
+
+   A folder for them, here ~/src:
+
+     mkdir -p ~/src
+     cd ~/src
      git clone https://gitea.osmocom.org/cc/libosmo-cc
-     cd libosmo-cc
+     git clone https://github.com/VasylSamoilov/osmocom-analog
+     git clone https://github.com/VasylSamoilov/osmo-cc-sip-endpoint   # only for SIP
+
+   Check: "ls ~/src" lists the folders.
+
+Step 3. Build and install libosmo-cc (3.2.0 or newer)
+
+     cd ~/src/libosmo-cc
      autoreconf -if
      ./configure
      make
      sudo make install
      sudo ldconfig
-     cd ..
 
-   After updating libosmo-cc, rebuild everything that uses it (osmocom-analog,
-   osmo-cc-sip-endpoint): the library version 3.2.0 changed its ABI.
+   Check:
 
-3. osmocom-analog
+     pkg-config --modversion libosmocc
 
-     git clone https://github.com/VasylSamoilov/osmocom-analog
-     cd osmocom-analog
+   prints 3.2.0 or newer (e.g. 3.2.0.4-531f). An older version (3.0.0) means an
+   old libosmo-cc is still installed: run the step again in this folder, and
+   check that "sudo make install" ended without an error.
+
+Step 4. Build and install osmocom-analog
+
+     cd ~/src/osmocom-analog
      autoreconf -if
      ./configure
      make
      sudo make install
-     cd ..
 
-   configure tells what it found:
+   configure ends with what it found, for example:
 
      configure: Compiling with Alsa support
      configure: Compiling with UHD SDR support
      configure: Compiling with SoapySDR support
      configure: Compiling with FUSE
 
-   After a git pull, run "make clean" before "make". If configure fails with
-   "syntax error near unexpected token `ALSA,'", install pkg-config and run
-   "autoreconf -if" again.
+   A line missing means its library of step 1 is not installed: install it and
+   run "./configure" and "make" again.
 
-4. SIP (optional): osmo-cc-sip-endpoint
+   Check:
+
+     bnetz -h
+
+   prints the options of the B-Netz base station.
+
+   The FLEX pager transmitter is "flexpager" (not "flex": that is the scanner
+   generator of the Debian package flex). Its settings file is
+   ~/.osmocom/analog/flex.conf.
+
+Step 5. Optional: osmo-cc-sip-endpoint (calls through SIP)
 
    Connects the base stations to a SIP PBX or provider. Upstream
    (https://gitea.osmocom.org/cc/osmo-cc-sip-endpoint) works; this fork also
    sends and receives hook flash as SIP INFO, for peers without RFC 4733
    telephone-event (with it, flash goes in RTP).
 
-     sudo apt install libsofia-sip-ua-dev
-     git clone https://github.com/VasylSamoilov/osmo-cc-sip-endpoint
-     cd osmo-cc-sip-endpoint
+     cd ~/src/osmo-cc-sip-endpoint
      autoreconf -if
      ./configure
      make
      sudo make install
-     cd ..
 
    The build warns about a Sofia-SIP patch; see the warning in src/sip/sip.c.
+
+   Check:
+
+     osmo-cc-sip-endpoint -h
+
+   prints its options.
+
+
+Updating
+========
+
+Update in the same order as the installation: libosmo-cc first, then the
+programs that use it. Rebuild a program after its library changed: libosmo-cc
+3.2.0 changed its interface, and a program built against an older one does not
+link ("undefined reference to osmo_cc_...").
+
+     cd ~/src/libosmo-cc
+     git pull
+     make clean
+     autoreconf -if
+     ./configure
+     make
+     sudo make install
+     sudo ldconfig
+
+     cd ~/src/osmocom-analog
+     git pull
+     make clean
+     autoreconf -if
+     ./configure
+     make
+     sudo make install
+
+   and the same for osmo-cc-sip-endpoint. "make clean" matters: without it make
+   keeps parts built against the old library.
+
+
+When something goes wrong
+=========================
+
+ * configure: "Package requirements (libosmocc >= 3.2.0) were not met":
+   libosmo-cc is missing or old. Do step 3, then run "./configure" again.
+
+ * make: "undefined reference to osmo_cc_..." (for example
+   osmo_cc_rtp_send_event): parts were built against another libosmo-cc. Run
+   "make clean", "./configure" and "make" again.
+
+ * configure: "syntax error near unexpected token `ALSA,'": pkg-config is
+   missing. Install it (step 1) and run "autoreconf -if" and "./configure"
+   again.
+
+ * A program says "error while loading shared libraries: libosmocc.so":
+   run "sudo ldconfig".
+
+ * Several versions installed: "/sbin/ldconfig -p | grep osmocc" lists the
+   libosmo-cc libraries the programs find.
 
 
 Test
