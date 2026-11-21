@@ -1,4 +1,4 @@
-/* rpitx DMA wrapper - plain C interface to the librpitx C++ classes
+/* rpitx DMA wrapper - plain C interface to librpitx
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -18,37 +18,122 @@
  */
 
 /*
- * The only C++ in the rpitx backend: it drives the librpitx classes and
+ * The only C++ in the rpitx backend: the DMA chain on librpitx's classes,
  * nothing else. The signal processing is in rpitx.c.
  *
  * librpitx moves the fractional multiplier of PLLC once per sample by DMA
  * and puts the clock out on GPIO4 (GPCLK0). The DMA is paced by the PCM
  * clock at the sample rate. The FIFO is a ring of DMA control blocks; the
- * Set...Samples() calls sleep until the ring has room, so they are the
- * sample clock for whoever writes.
+ * writes sleep until the ring has room, so they are the sample clock for
+ * whoever writes.
  *
- * iqdmasync in MODE_FREQ_A takes (frequency, level) per sample, the level
- * 0 switches the pin to input (carrier off), 1..8 is PAD drive 0..7. This
- * is what sendiq -d and spectrumpaint use. 4 control blocks per sample,
- * sendiq limits it to 200 kS/s.
+ * Our chain (keyed_fm_dma) has two control blocks per sample, as librpitx's
+ * ngfmdmasync: the first writes the PLLC fraction (the frequency), the second
+ * paces at the PCM FIFO. Only on a sample where the carrier switches on or
+ * off, the first block is pointed at the function register of GPIO4 instead
+ * (clock out or input) and the frequency holds for that sample.
  *
- * ngfmdmasync takes the frequency only (2 control blocks per sample), the
- * carrier cannot be switched off. This is what pifmrds uses at 228 kS/s.
+ * Why not iqdmasync MODE_FREQ_A, which keys too: it writes 4 blocks per
+ * sample (pad drive, fraction, function, pacing) and that makes the moment
+ * of the frequency update jitter. Measured on a Pi 4 at 192 kS/s with test
+ * tones (3 kHz deviation): one channel 21..27 dB SINAD with iqdmasync, 44 dB
+ * with this chain; two channels on one carrier 17 / 8 dB with iqdmasync,
+ * 25 / 24 dB with this chain (the same as ngfmdmasync, which cannot key).
+ * A 3 block chain (fraction, function, pacing in every sample) gave 24 / 18.
  */
 
 #include <librpitx/librpitx.h>
-#include <complex>
 #include <cstdio>
+#include <unistd.h>
 
 #include "rpitx_dma.h"
 
-static iqdmasync *iq_tx = NULL;
-static ngfmdmasync *fm_tx = NULL;
-static bufferdma *dma_buf = NULL;	/* the one that is open */
-static clkgpio *dma_clk = NULL;
+class keyed_fm_dma : public bufferdma, public clkgpio, public pcmgpio
+{
+	uint32_t fsel_on, fsel_off;
+	uint32_t samplerate;
+	bool last_on;
 
-#define WRITE_CHUNK 1024
-static std::complex<float> fa_buffer[WRITE_CHUNK];
+public:
+	keyed_fm_dma(uint64_t frequency, uint32_t rate, int channel, uint32_t fifo_size)
+		: bufferdma(channel, fifo_size, 2, 1), samplerate(rate), last_on(false)
+	{
+		uint32_t fsel;
+
+		/* the same set up as ngfmdmasync */
+		clkgpio::SetAdvancedPllMode(true);
+		clkgpio::SetCenterFrequency(frequency, samplerate);
+		clkgpio::SetFrequency(0);
+		clkgpio::enableclk(4);
+		pcmgpio::SetPllNumber(clk_plld, 1);
+		pcmgpio::SetFrequency(samplerate);
+		/* GPIO4 function: alt0 = GPCLK0 = carrier on, input = off. The
+		 * constructor puts the clock out already, unmodulated at the
+		 * center frequency: switch it off until the first sample */
+		fsel = clkgpio::gengpio.gpioreg[GPFSEL0];
+		fsel_on = (fsel & ~(7 << 12)) | (4 << 12);
+		fsel_off = fsel & ~(7 << 12);
+		clkgpio::gengpio.gpioreg[GPFSEL0] = fsel_off;
+		SetDmaAlgo();
+	}
+
+	~keyed_fm_dma()
+	{
+		clkgpio::gengpio.gpioreg[GPFSEL0] = fsel_off;
+		clkgpio::disableclk(4);
+	}
+
+	void SetDmaAlgo()
+	{
+		dma_cb_t *cbp = cbarray;
+
+		for (uint32_t s = 0; s < buffersize; s++) {
+			SetEasyCB(cbp++, s, dma_pllc_frac, 1);
+			SetEasyCB(cbp++, s, dma_pcm, 1);
+		}
+		cbp--;
+		cbp->next = mem_virt_to_phys(cbarray);
+	}
+
+	/* one sample into a ring slot the DMA has played */
+	void set_sample(uint32_t index, float frequency, bool on)
+	{
+		dma_cb_t *cb;
+
+		index %= buffersize;
+		cb = &cbarray[index * 2];
+		if (on != last_on) {
+			cb->dst = dma_fsel;
+			sampletab[index] = on ? fsel_on : fsel_off;
+			last_on = on;
+		} else {
+			cb->dst = dma_pllc_frac;
+			sampletab[index] = (0x5A << 24) | GetMasterFrac(frequency);
+		}
+		PushSample(index);
+	}
+
+	/* blocks until all samples are in the ring, with ngfmdmasync's rule:
+	 * sleep until 3/4 of the ring is free, then write what fits */
+	void set_samples(const float *freq, const float *level, int num)
+	{
+		int done = 0, avail, index, n, i, sleep_us;
+
+		while (done < num) {
+			avail = GetBufferAvailable();
+			sleep_us = (int)(1e6 * ((int)buffersize * 3 / 4 - avail) / samplerate) - 200;
+			if (sleep_us > 0)
+				usleep(sleep_us);
+			avail = GetBufferAvailable();
+			index = GetUserMemIndex();
+			n = (num - done < avail) ? num - done : avail;
+			for (i = 0; i < n; i++, done++)
+				set_sample(index + i, freq[done], level[done] > 0.0f);
+		}
+	}
+};
+
+static keyed_fm_dma *tx = NULL;
 
 /*
  * Start and end of a transmission, as rpitx-ui does it
@@ -57,69 +142,41 @@ static std::complex<float> fa_buffer[WRITE_CHUNK];
  * The PCM FIFO that paces the DMA is empty at the start, so the DMA plays
  * its first samples back to back until the FIFO is full (64 samples),
  * starting with ring slot 0, which librpitx never writes before the start.
- * So slot 0 and a lead of 64 samples get an idle sample.
+ * So slot 0 and a lead of 64 samples get "carrier off".
  *
- * The Set...Samples() calls return when the samples are in the ring, not
- * when they are played. Stopping right away loses up to a quarter ring plus
- * a block. So at the end one ring of idle samples is queued, in two halves
- * (a single write of a whole ring would wrap before the DMA has started).
- *
- * The idle sample is "carrier off" in frequency+level mode and 0 Hz (carrier
- * on, unmodulated) in frequency only mode.
+ * The writes return when the samples are in the ring, not when they are
+ * played. Stopping right away loses up to a quarter ring plus a block. So at
+ * the end one ring of "carrier off" is queued, in two halves (a single write
+ * of a whole ring would wrap before the DMA has started).
  */
 #define PCM_FIFO_DEPTH 64
+#define IDLE_CHUNK 1024
 
 static void write_idle(int num)
 {
-	int i, n;
+	static float zero[IDLE_CHUNK];
+	int n;
 
-	if (fm_tx) {
-		static float zero[WRITE_CHUNK];
-		while (num > 0) {
-			n = (num > WRITE_CHUNK) ? WRITE_CHUNK : num;
-			fm_tx->SetFrequencySamples(zero, n);
-			num -= n;
-		}
-		return;
-	}
 	while (num > 0) {
-		n = (num > WRITE_CHUNK) ? WRITE_CHUNK : num;
-		for (i = 0; i < n; i++)
-			fa_buffer[i] = std::complex<float>(0.0f, 0.0f);
-		iq_tx->SetIQSamples(fa_buffer, n, 1);
+		n = (num > IDLE_CHUNK) ? IDLE_CHUNK : num;
+		tx->set_samples(zero, zero, n);
 		num -= n;
 	}
 }
 
-extern "C" int rpitx_dma_open(enum rpitx_dma_mode mode, double frequency, int samplerate, int fifo_size, int pad_level)
+extern "C" int rpitx_dma_open(double frequency, int samplerate, int fifo_size, int pad_level)
 {
-	if (dma_buf)
+	if (tx)
 		return -1;
 
-	if (mode == RPITX_DMA_FREQ_AMP) {
-		iq_tx = new iqdmasync((uint64_t)frequency, (uint32_t)samplerate, 14, (uint32_t)fifo_size, MODE_FREQ_A);
-		/* same PLL loop as sendiq */
-		iq_tx->SetPLLMasterLoop(3, 4, 0);
-		/* The constructor puts the clock out on GPIO4 already, unmodulated
-		 * at the center frequency, until the DMA starts. If the samples
-		 * never come (a stalled process), that carrier would stay on air.
-		 * Switch the pin to input: the DMA sets its function with every
-		 * sample, so it comes on with the first one. */
-		iq_tx->disableclk(4);
-		iq_tx->SetFreqAmplitudeSample(0, std::complex<float>(0.0f, 0.0f), 1);
-		dma_buf = iq_tx;
-		dma_clk = iq_tx;
-		write_idle(PCM_FIFO_DEPTH);
-	} else {
-		fm_tx = new ngfmdmasync((uint64_t)frequency, (uint32_t)samplerate, 14, (uint32_t)fifo_size);
-		/* constant drive, as there is no level per sample */
+	tx = new keyed_fm_dma((uint64_t)frequency, (uint32_t)samplerate, 14, (uint32_t)fifo_size);
+	/* constant drive */
+	{
 		padgpio pad;
 		pad.setlevel(pad_level);
-		fm_tx->SetFrequencySample(0, 0.0f);
-		dma_buf = fm_tx;
-		dma_clk = fm_tx;
-		write_idle(PCM_FIFO_DEPTH);
 	}
+	tx->set_sample(0, 0.0f, false);
+	write_idle(PCM_FIFO_DEPTH);
 
 	return 0;
 }
@@ -128,20 +185,23 @@ extern "C" int rpitx_dma_crosses_boundary(double frequency, double span, double 
 {
 	double k, lo, hi;
 
-	if (!dma_clk)
+	if (!tx)
 		return 0;
 	/* PLL multiplier per Hz, as in clkgpio::GetMasterFrac() */
-	if (dma_clk->PllFixDivider == 1) {
+	clkgpio *clk = tx;
+	double xosc = (double)clk->XOSC_FREQUENCY;
+
+	if (clk->PllFixDivider == 1) {
 		/* PLL pre-divider (above 750 MHz), no Pi 4 pre-divider */
-		if (dma_clk->pi_is_2711)
-			k = 2.0 / (double)dma_clk->XOSC_FREQUENCY;
+		if (clk->pi_is_2711)
+			k = 2.0 / xosc;
 		else
-			k = 1.0 / ((double)dma_clk->XOSC_FREQUENCY * 2.0);
+			k = 1.0 / (xosc * 2.0);
 	} else {
-		if (dma_clk->pi_is_2711)
-			k = (double)dma_clk->PllFixDivider * 2.0 / (double)dma_clk->XOSC_FREQUENCY;
+		if (clk->pi_is_2711)
+			k = (double)clk->PllFixDivider * 2.0 / xosc;
 		else
-			k = (double)dma_clk->PllFixDivider / (double)dma_clk->XOSC_FREQUENCY;
+			k = (double)clk->PllFixDivider / xosc;
 	}
 	lo = (frequency - span) * k;
 	hi = (frequency + span) * k;
@@ -153,70 +213,49 @@ extern "C" int rpitx_dma_crosses_boundary(double frequency, double span, double 
 
 extern "C" void rpitx_dma_write(const float *freq, const float *level, int num)
 {
-	int i, n;
-
-	if (fm_tx) {
-		/* SetFrequencySamples() takes a non-const pointer, but only reads */
-		fm_tx->SetFrequencySamples((float *)freq, num);
-		return;
-	}
-	if (!iq_tx)
-		return;
-
-	while (num > 0) {
-		n = (num > WRITE_CHUNK) ? WRITE_CHUNK : num;
-		for (i = 0; i < n; i++)
-			fa_buffer[i] = std::complex<float>(freq[i], level[i]);
-		iq_tx->SetIQSamples(fa_buffer, n, 1);
-		freq += n;
-		level += n;
-		num -= n;
-	}
+	if (tx)
+		tx->set_samples(freq, level, num);
 }
 
 extern "C" int rpitx_dma_free(void)
 {
-	if (!dma_buf)
+	if (!tx)
 		return 0;
-	return dma_buf->GetBufferAvailable();
+	return tx->GetBufferAvailable();
 }
 
 extern "C" int rpitx_dma_fifo_size(void)
 {
-	if (!dma_buf)
+	if (!tx)
 		return 0;
-	return (int)dma_buf->buffersize;
+	return (int)tx->buffersize;
 }
 
 extern "C" int rpitx_dma_started(void)
 {
-	if (!dma_buf)
+	if (!tx)
 		return 0;
-	return dma_buf->Started;
+	return tx->Started;
 }
 
 extern "C" void rpitx_dma_stop(void)
 {
-	if (!dma_buf)
+	if (!tx)
 		return;
-	dma_buf->stop();
-	dma_clk->disableclk(4);
+	tx->stop();
+	tx->disableclk(4);
 }
 
 extern "C" void rpitx_dma_close(void)
 {
-	if (!dma_buf)
+	if (!tx)
 		return;
 	/* play what is still queued, see above; this also starts a DMA that
 	 * never got a quarter of the ring, so a short transmission is sent */
-	write_idle(dma_buf->buffersize / 2);
-	write_idle(dma_buf->buffersize / 2);
-	dma_buf->stop();
-	/* the destructors switch the clock off and give the GPIO back */
-	delete iq_tx;
-	delete fm_tx;
-	iq_tx = NULL;
-	fm_tx = NULL;
-	dma_buf = NULL;
-	dma_clk = NULL;
+	write_idle(tx->buffersize / 2);
+	write_idle(tx->buffersize / 2);
+	tx->stop();
+	/* the destructor switches the pin to input and the clock off */
+	delete tx;
+	tx = NULL;
 }

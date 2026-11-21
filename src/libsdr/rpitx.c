@@ -62,8 +62,7 @@
 #include "../liblogging/logging.h"
 
 #define RPITX_MIN_RATE		10000
-#define RPITX_MAX_FREQ_AMP_RATE	200000	/* iqdmasync, the limit of sendiq */
-#define RPITX_MAX_FREQ_RATE	250000	/* ngfmdmasync, pifmrds runs 228000 */
+#define RPITX_MAX_RATE		250000	/* 2 control blocks per sample as ngfmdmasync, pifmrds runs 228000 */
 #define RPITX_MIN_FREQUENCY	5e3
 #define RPITX_MAX_FREQUENCY	1500e6
 #define RPITX_FIFO_TIME		0.08	/* sendiq: 16000 samples at 200 kS/s */
@@ -75,7 +74,6 @@
 static struct rpitx {
 	int		open;
 	int		running;
-	enum rpitx_dma_mode mode;
 	int		samplerate;
 	int		fifo;
 	int		pad;
@@ -88,7 +86,6 @@ static struct rpitx {
 	float		*freq;
 	float		*level;
 	int		buffer_size;
-	int		warned_off;
 
 	/* pacing */
 	int		have_last;
@@ -257,16 +254,10 @@ int rpitx_open(double tx_frequency, double rate, double tx_gain)
 		return -1;
 	}
 
-	if (samplerate < RPITX_MIN_RATE || samplerate > RPITX_MAX_FREQ_RATE) {
-		LOGP(DSDR, LOGL_ERROR, "rpitx sample rate %d is out of range: %d .. %d S/s (up to %d S/s with carrier keying)\n",
-		     samplerate, RPITX_MIN_RATE, RPITX_MAX_FREQ_RATE, RPITX_MAX_FREQ_AMP_RATE);
+	if (samplerate < RPITX_MIN_RATE || samplerate > RPITX_MAX_RATE) {
+		LOGP(DSDR, LOGL_ERROR, "rpitx sample rate %d is out of range: %d .. %d S/s\n",
+		     samplerate, RPITX_MIN_RATE, RPITX_MAX_RATE);
 		return -1;
-	}
-	if (samplerate <= RPITX_MAX_FREQ_AMP_RATE)
-		rt.mode = RPITX_DMA_FREQ_AMP;
-	else {
-		rt.mode = RPITX_DMA_FREQ;
-		LOGP(DSDR, LOGL_NOTICE, "rpitx: above %d S/s the carrier cannot be keyed off, it stays on.\n", RPITX_MAX_FREQ_AMP_RATE);
 	}
 
 	/* --sdr-tx-gain is the GPIO drive level 0..7 (2..16 mA) */
@@ -283,13 +274,11 @@ int rpitx_open(double tx_frequency, double rate, double tx_gain)
 	if (rt.fifo < RPITX_MIN_FIFO)
 		rt.fifo = RPITX_MIN_FIFO;
 
-	LOGP(DSDR, LOGL_NOTICE, "rpitx: %.6f MHz on GPIO4, %d S/s, %s, drive level %d, FIFO %d samples (%.0f ms)\n",
-	     tx_frequency / 1e6, samplerate,
-	     (rt.mode == RPITX_DMA_FREQ_AMP) ? "iqdmasync frequency+level (keyed)" : "ngfmdmasync frequency only",
-	     rt.pad, rt.fifo, 1000.0 * rt.fifo / samplerate);
+	LOGP(DSDR, LOGL_NOTICE, "rpitx: %.6f MHz on GPIO4, %d S/s, frequency + keying, drive level %d, FIFO %d samples (%.0f ms)\n",
+	     tx_frequency / 1e6, samplerate, rt.pad, rt.fifo, 1000.0 * rt.fifo / samplerate);
 
 	install_stop_handlers();
-	if (rpitx_dma_open(rt.mode, tx_frequency, samplerate, rt.fifo, rt.pad)) {
+	if (rpitx_dma_open(tx_frequency, samplerate, rt.fifo, rt.pad)) {
 		remove_stop_handlers();
 		LOGP(DSDR, LOGL_ERROR, "rpitx: failed to open the transmitter\n");
 		return -1;
@@ -340,7 +329,7 @@ static void convert(const float *buff, int num)
 	const float scale = (float)rt.samplerate / (2.0f * (float)M_PI);
 	const float on2 = RPITX_LEVEL_ON * RPITX_LEVEL_ON;
 	const float off2 = RPITX_LEVEL_OFF * RPITX_LEVEL_OFF;
-	const float on_level = (float)(rt.pad + 1);
+	const float on_level = 1.0f;
 	float i, q, m2, re, im;
 	int s;
 
@@ -371,10 +360,6 @@ static void convert(const float *buff, int num)
 		} else {
 			rt.prev_valid = 0;
 			rt.level[s] = 0.0f;
-			if (rt.mode == RPITX_DMA_FREQ && !rt.warned_off) {
-				LOGP(DSDR, LOGL_NOTICE, "rpitx: the signal keys the carrier off, but at this sample rate it stays on\n");
-				rt.warned_off = 1;
-			}
 		}
 		/* while off, hold the frequency, so the next key up does not jump */
 		rt.freq[s] = rt.last_freq;

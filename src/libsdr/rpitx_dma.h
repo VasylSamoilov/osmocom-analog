@@ -24,15 +24,9 @@
 extern "C" {
 #endif
 
-/* the transmitter classes of librpitx we use */
-enum rpitx_dma_mode {
-	RPITX_DMA_FREQ_AMP,	/* iqdmasync in MODE_FREQ_A: frequency + drive level (0 = pin off) */
-	RPITX_DMA_FREQ,		/* ngfmdmasync: frequency only, the carrier is always on */
-};
-
 /* Open the transmitter on GPIO4 at the given carrier frequency (Hz), sample rate
- * (S/s) and FIFO size (samples). Returns 0 on success. */
-int rpitx_dma_open(enum rpitx_dma_mode mode, double frequency, int samplerate, int fifo_size, int pad_level);
+ * (S/s), FIFO size (samples) and drive level (0..7). Returns 0 on success. */
+int rpitx_dma_open(double frequency, int samplerate, int fifo_size, int pad_level);
 
 /* After open: does the PLL multiplier cross an integer between
  * frequency - span and frequency + span? librpitx keeps the integer part
@@ -43,8 +37,7 @@ int rpitx_dma_crosses_boundary(double frequency, double span, double *boundary);
 /* Write samples, block until all are in the DMA FIFO. The blocking follows the
  * DMA read position, so this call is the sample clock of the transmitter.
  * freq: frequency offset from the carrier in Hz per sample.
- * level: drive level per sample, 0 = pin off, 1..8 = PAD level 0..7
- *        (ignored in RPITX_DMA_FREQ mode). */
+ * level: 0 = carrier off, above 0 = carrier on (at the drive level of open). */
 void rpitx_dma_write(const float *freq, const float *level, int num);
 
 /* Free FIFO space (samples) as seen from the DMA read position. */

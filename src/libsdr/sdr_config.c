@@ -166,7 +166,7 @@ void sdr_config_print_help(void)
 	printf("        Use rpitx driver for TX device (Raspberry Pi GPIO, TX-only)\n");
 	printf("    rpitx notes:\n");
 	printf("        --sdr-tx-gain is the GPIO4 drive level 0..7 (2..16 mA).\n");
-	printf("        Sample rate 10000..200000 S/s, up to 250000 without carrier keying.\n");
+	printf("        Sample rate 10000..250000 S/s (192000 measured best for two channels).\n");
 	printf("        One FM channel; two are experimental (the second one is weak and\n");
 	printf("        distorted off air). AM channels only get the carrier keyed.\n");
 	printf("    --sdr-rpitx-ratio <ratio>\n");
