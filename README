@@ -29,10 +29,159 @@ Additionally the following communication services are implemented:
  * POCSAG transmitter / receiver
  * Golay/GSC transmitter / receiver
  * DCF77 time signal transmitter and receiver with weather info
+   (also WWVB, MSF, JJY40, JJY60)
  * C-Netz SIM emulator
  * C-Netz magnetic card emulator
+ * FLEX paging transmitter / receiver
+ * Mobitex transmitter / receiver
+ * FM broadcast radio with stereo and RDS (osmoradio, see docs/OSMORADIO.md)
+ * SDR clock calibration from GSM FCCH (osmocalibrate)
 
 USE AT YOUR OWN RISK!
+
+
+This tree
+=========
+
+This is a fork of osmocom-analog by Andreas Eversberg
+(https://gitea.osmocom.org/cellular-infrastructure/osmocom-analog), kept
+merged with upstream. In addition to upstream it has:
+
+ * FLEX, Mobitex, more POCSAG and Golay/GSC, a shared message FIFO for the
+   paging transmitters (--fifo / --fifo-file)
+ * osmoradio: more RDS (RT+, TMC, paging), XDR-GTK protocol
+ * NMT: SMS and DMS work, message waiting indicator, moving calls between
+   voice channels (docs/NMT_*.md)
+ * AMPS / TACS work (docs/AMPS_IMPLEMENTATION_STATUS.md)
+ * SDR: separate TX and RX devices (--sdr-tx-* / --sdr-rx-*), channelizer,
+   polyphase resampler, PPM correction, upconverter, and the Raspberry Pi as
+   transmitter through rpitx (docs/RPITX.md)
+ * DTMF and flash towards the network: RFC 4733 telephone-event in RTP,
+   SIP INFO as fallback
+ * echo suppressor, DTMF towards the mobile
+
+
+Installation
+============
+
+Debian / Ubuntu / Raspberry Pi OS. The upstream step-by-step guide is at
+http://osmocom-analog.eversberg.eu/docs/install.html
+
+1. Tools and libraries
+
+   Required:
+
+     sudo apt install build-essential autoconf automake libtool pkg-config git
+     sudo apt install libosmocore-dev
+
+   Optional, configure finds them by itself:
+
+     sudo apt install libasound2-dev                # sound card (radio, headset)
+     sudo apt install libsoapysdr-dev soapysdr-tools # SoapySDR (LimeSDR, ...)
+     sudo apt install libuhd-dev uhd-host           # UHD (Ettus USRP)
+     sudo apt install libfuse3-dev                  # 'Datenklo' modem emulation
+     sudo apt install libmagickcore-dev             # TV images other than PPM
+
+   Raspberry Pi as transmitter: librpitx, see docs/RPITX.md.
+
+2. libosmo-cc (call control, 3.2.0 or newer)
+
+     git clone https://gitea.osmocom.org/cc/libosmo-cc
+     cd libosmo-cc
+     autoreconf -if
+     ./configure
+     make
+     sudo make install
+     sudo ldconfig
+     cd ..
+
+   After updating libosmo-cc, rebuild everything that uses it (osmocom-analog,
+   osmo-cc-sip-endpoint): the library version 3.2.0 changed its ABI.
+
+3. osmocom-analog
+
+     git clone https://github.com/VasylSamoilov/osmocom-analog
+     cd osmocom-analog
+     autoreconf -if
+     ./configure
+     make
+     sudo make install
+     cd ..
+
+   configure tells what it found:
+
+     configure: Compiling with Alsa support
+     configure: Compiling with UHD SDR support
+     configure: Compiling with SoapySDR support
+     configure: Compiling with FUSE
+
+   After a git pull, run "make clean" before "make". If configure fails with
+   "syntax error near unexpected token `ALSA,'", install pkg-config and run
+   "autoreconf -if" again.
+
+4. SIP (optional): osmo-cc-sip-endpoint
+
+   Connects the base stations to a SIP PBX or provider. Upstream
+   (https://gitea.osmocom.org/cc/osmo-cc-sip-endpoint) works; this fork also
+   sends and receives hook flash as SIP INFO, for peers without RFC 4733
+   telephone-event (with it, flash goes in RTP).
+
+     sudo apt install libsofia-sip-ua-dev
+     git clone https://github.com/VasylSamoilov/osmo-cc-sip-endpoint
+     cd osmo-cc-sip-endpoint
+     autoreconf -if
+     ./configure
+     make
+     sudo make install
+     cd ..
+
+   The build warns about a Sofia-SIP patch; see the warning in src/sip/sip.c.
+
+
+Test
+====
+
+Sound card: run a B-Netz base station, it sends FSK tones:
+
+  bnetz -k 17
+
+SDR: check that SoapySDR finds the device, then run B-Netz on 153.330 MHz and
+listen with a radio:
+
+  SoapySDRUtil --find
+  bnetz --limesdr -k 17        # LimeSDR
+  bnetz --limesdr-mini -k 17   # LimeSDR Mini
+
+Every program lists its options with -h. The radio setup, levels and
+loopback tests are described at http://osmocom-analog.eversberg.eu/docs/
+
+
+Calls through SIP
+=================
+
+Without other options a base station uses its built-in console: the mobile
+calls the console, and the console can call the mobile. With -o the console is
+off and the calls go out on the Osmo-CC socket (127.0.0.1, port 4200 or 4201,
+whichever is free), where osmo-cc-sip-endpoint connects to it:
+
+  nmt --limesdr -k 1 -k 4 -T CC/TC -T TC -0 1 -0 2 -Y se,1 -o
+  osmo-cc-sip-endpoint --local 192.168.0.10 --remote 192.168.0.1
+
+Both pick the free one of the two ports, start them in any order. For other
+addresses use --cc "local <ip>:<port>" and --cc "remote <ip>:<port>" (see
+--cc help). -x instead of -o connects mobiles with each other.
+
+
+Documentation
+=============
+
+ * http://osmocom-analog.eversberg.eu/docs/   upstream manual, every network
+ * docs/RPITX.md                              Raspberry Pi as transmitter
+ * docs/OSMORADIO.md                          FM radio, RDS, XDR-GTK
+ * docs/NMT_MWI.md, docs/NMT_SCIP.md,
+   docs/NMT_ONAIR_TESTS.md                    NMT additions
+ * docs/AMPS_IMPLEMENTATION_STATUS.md         AMPS / TACS
+ * docs/FLEX_INFO_SERVICE_TEST.md             FLEX
 
 
 Acknowledgements:
