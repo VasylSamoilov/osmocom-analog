@@ -974,6 +974,8 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 			    enum flex_msg_type msg_type,
 			    const char *data, int data_length);
 void flex_msg_destroy(flex_msg_t *msg);
+/* Set the polarity of a queued message: its count moves to that polarity (the polarity of the frames follows the counts) */
+void flex_msg_set_polarity(flex_msg_t *msg, double polarity);
 
 /* ERS (Emergency Re-Synchronization) trigger.
  * Polarity is irrelevant for ERS — the BS+Ar+BS_inv+Ar_inv cycle

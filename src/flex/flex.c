@@ -448,6 +448,21 @@ flex_msg_t *flex_msg_create(flex_t *flex, uint64_t capcode,
 	return msg;
 }
 
+/* Set the polarity of a queued message. flex_msg_create() counted it under the default polarity: the count moves
+ * with it, or a message of the other polarity is never selected (the frames take the polarity that has messages) */
+void flex_msg_set_polarity(flex_msg_t *msg, double polarity)
+{
+	int old_pi = pol_index(msg->polarity);
+	int new_pi = pol_index(polarity);
+
+	if (old_pi != new_pi) {
+		if (msg->flex->tx_pol[old_pi].msg_count > 0)
+			msg->flex->tx_pol[old_pi].msg_count--;
+		msg->flex->tx_pol[new_pi].msg_count++;
+	}
+	msg->polarity = polarity;
+}
+
 /* Destroy msg instance */
 void flex_msg_destroy(flex_msg_t *msg)
 {
@@ -724,7 +739,7 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 		}
 		msg->speed = speed;
 		msg->modulation_type = modulation_type;
-		msg->polarity = polarity;
+		flex_msg_set_polarity(msg, polarity);
 		msg->pinned = 1;
 		if (phase >= 0)
 			msg->phase = phase;
@@ -756,7 +771,7 @@ int flex_tempgroup_enqueue(flex_t *flex, const uint64_t *capcodes,
 		}
 		msg->speed = speed;
 		msg->modulation_type = modulation_type;
-		msg->polarity = polarity;
+		flex_msg_set_polarity(msg, polarity);
 		msg->priority = priority;
 		msg->temp_delivery_slot = slot;
 		msg->pinned = 1;
@@ -1150,7 +1165,7 @@ static void flex_fragment_queue(flex_t *flex)
 			/* Copy per-message parameters from original */
 			frag->speed = msg->speed;
 			frag->modulation_type = msg->modulation_type;
-			frag->polarity = msg->polarity;
+			flex_msg_set_polarity(frag, msg->polarity);
 			frag->priority = msg->priority;
 			frag->is_temp_group = msg->is_temp_group;
 			frag->temp_delivery_slot = msg->temp_delivery_slot;
@@ -1513,17 +1528,25 @@ static int flex_assign_number(flex_t *flex, flex_msg_t *msg, uint32_t abs_frame)
  * is transmitted consistently on the same channel parameters.
  */
 
-/* Find the first fragment (fragment_index == 0) of a message identified
- * by retrieval_num in the queue.  Returns NULL if not found. */
-static flex_msg_t *flex_find_first_fragment(flex_t *flex, uint32_t retrieval_num,
-					    int total_fragments)
+/* A fragment of the same message as ref: the same pager (capcode), polarity, retrieval number and number of
+ * fragments. The retrieval number alone is not enough: each polarity counts its own from 0, and the counter
+ * wraps at 64, so two fragmented messages in the queue may share it */
+static int flex_same_fragmented_message(const flex_msg_t *m, const flex_msg_t *ref)
+{
+	return m->total_fragments == ref->total_fragments &&
+	       m->retrieval_num == ref->retrieval_num &&
+	       m->capcode == ref->capcode &&
+	       pol_index(m->polarity) == pol_index(ref->polarity);
+}
+
+/* Find the first fragment (fragment_index == 0) of the message of ref
+ * in the queue.  Returns NULL if not found. */
+static flex_msg_t *flex_find_first_fragment(flex_t *flex, const flex_msg_t *ref)
 {
 	flex_msg_t *m;
 
 	for (m = flex->msg_list; m; m = m->next) {
-		if (m->total_fragments == total_fragments &&
-		    m->retrieval_num == retrieval_num &&
-		    m->fragment_index == 0)
+		if (flex_same_fragmented_message(m, ref) && m->fragment_index == 0)
 			return m;
 	}
 	return NULL;
@@ -1540,26 +1563,22 @@ static flex_msg_t *flex_find_next_fragment(flex_t *flex, flex_msg_t *msg)
 		return NULL;
 
 	for (m = flex->msg_list; m; m = m->next) {
-		if (m->total_fragments == msg->total_fragments &&
-		    m->retrieval_num == msg->retrieval_num &&
-		    m->fragment_index == next_idx)
+		if (flex_same_fragmented_message(m, msg) && m->fragment_index == next_idx)
 			return m;
 	}
 	return NULL;
 }
 
-/* Destroy all fragments of a message identified by retrieval_num.
- * Walks the queue and removes every node with matching retrieval_num
- * and total_fragments. */
-static void flex_destroy_all_fragments(flex_t *flex, uint32_t retrieval_num,
-				       int total_fragments)
+/* Destroy all fragments of the message of ref (ref included). Walks the queue and removes every fragment of the
+ * same message (flex_same_fragmented_message): the fields are copied first, ref itself is one of them */
+static void flex_destroy_all_fragments(flex_t *flex, const flex_msg_t *ref)
 {
+	flex_msg_t key = *ref;
 	flex_msg_t *m, *next;
 
 	for (m = flex->msg_list; m; m = next) {
 		next = m->next;
-		if (m->total_fragments == total_fragments &&
-		    m->retrieval_num == retrieval_num)
+		if (flex_same_fragmented_message(m, &key))
 			flex_msg_destroy(m);
 	}
 }
@@ -1604,8 +1623,12 @@ static void flex_destroy_all_fragments(flex_t *flex, uint32_t retrieval_num,
 static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 			       uint32_t current_abs_frame)
 {
-	/* Message types without R/N: always destroy */
+	/* Message types without R/N: always destroy, logged as the others (every message ends with TX_COMPLETE) */
 	if (!flex_msg_supports_retransmit(msg->msg_type)) {
+		LOGP(DFLEX, LOGL_INFO,
+		     "TX_COMPLETE: capcode=%" PRIu64 "%s type=%s total_tx=1\n",
+		     msg->capcode, flex_grp_tag(msg->temp_delivery_slot),
+		     flex_msg_type_name(msg->msg_type));
 		flex_msg_destroy(msg);
 		return;
 	}
@@ -1642,8 +1665,7 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 
 	/* Look up the first fragment to get authoritative retransmission state */
 	{
-		flex_msg_t *first = flex_find_first_fragment(flex, msg->retrieval_num,
-							    msg->total_fragments);
+		flex_msg_t *first = flex_find_first_fragment(flex, msg);
 
 		/* Non-last fragment */
 		if (msg->fragment_index < msg->total_fragments - 1) {
@@ -1670,8 +1692,7 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 			     msg->capcode, flex_grp_tag(msg->temp_delivery_slot),
 			     flex_msg_type_name(msg->msg_type),
 			     msg->total_fragments);
-			flex_destroy_all_fragments(flex, msg->retrieval_num,
-						   msg->total_fragments);
+			flex_destroy_all_fragments(flex, msg);
 			return;
 		}
 
@@ -1684,8 +1705,7 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 			     flex_msg_type_name(msg->msg_type),
 			     first->assigned_n, 1 + first->retransmit_count,
 			     msg->total_fragments);
-			flex_destroy_all_fragments(flex, msg->retrieval_num,
-						   msg->total_fragments);
+			flex_destroy_all_fragments(flex, msg);
 			return;
 		}
 
@@ -1702,8 +1722,7 @@ static void flex_post_transmit(flex_t *flex, flex_msg_t *msg,
 		{
 			flex_msg_t *frag;
 			for (frag = flex->msg_list; frag; frag = frag->next) {
-				if (frag->total_fragments == msg->total_fragments &&
-				    frag->retrieval_num == msg->retrieval_num &&
+				if (flex_same_fragmented_message(frag, msg) &&
 				    frag->fragment_index > 0) {
 					frag->next_send_frame = first->next_send_frame;
 					frag->fragment_sent = 0;
@@ -2737,8 +2756,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 					flex_msg_t *prev = NULL;
 					flex_msg_t *scan;
 					for (scan = flex->msg_list; scan; scan = scan->next) {
-						if (scan->total_fragments == candidate->total_fragments &&
-						    scan->retrieval_num == candidate->retrieval_num &&
+						if (flex_same_fragmented_message(scan, candidate) &&
 						    scan->fragment_index == candidate->fragment_index - 1) {
 							prev = scan;
 							break;
@@ -3636,8 +3654,7 @@ static int flex_get_next_frame_network(flex_t *flex)
 						for (sib = flex->msg_list; sib; sib = sib->next) {
 							if (sib == pm)
 								continue;
-							if (sib->total_fragments == pm->total_fragments &&
-							    sib->retrieval_num == pm->retrieval_num)
+							if (flex_same_fragmented_message(sib, pm))
 								sib->fragment_tx_phase = p;
 						}
 						LOGP(DFLEX, LOGL_DEBUG,

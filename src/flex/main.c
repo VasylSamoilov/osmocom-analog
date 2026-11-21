@@ -2608,15 +2608,8 @@ static void fifo_process_line(const char *text, int text_length)
 			if (msg) {
 				msg->speed = msg_speed;
 				msg->modulation_type = msg_mod_type;
-				/* Re-credit msg_count if polarity differs from the default
-				 * that flex_msg_create already counted it under. */
-				if ((msg_polarity < 0) != (msg->polarity < 0)) {
-					int old_pi = (msg->polarity < 0) ? 1 : 0;
-					int new_pi = (msg_polarity  < 0) ? 1 : 0;
-					flex->tx_pol[old_pi].msg_count--;
-					flex->tx_pol[new_pi].msg_count++;
-				}
-				msg->polarity = msg_polarity;
+				/* Its count moves from the default polarity flex_msg_create counted it under */
+				flex_msg_set_polarity(msg, msg_polarity);
 				msg->priority = msg_priority;
 
 				/* Tone-only messages cannot be priority.
