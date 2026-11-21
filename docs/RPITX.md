@@ -103,6 +103,7 @@ signal in a 16 kHz channel, so everything below that is "not seen", not
 | floor beside the channels, ±60 kHz .. ±800 kHz | same as with the Pi off (below the B210's floor) |
 | uplink channels 453.000 / 453.025 | same as with the Pi off: no desense seen at this distance |
 | ±20 MHz around the carrier | two narrow unmodulated lines at 474.62 and 477.99 MHz, about -19 dBc, only while rpitx runs; not carrier sidebands (no modulation on them), source not known |
+| test tones, SINAD, same transmission received by the Pi's RTL-SDR and the B210 at once (both tuned 112.5 kHz below the carrier, not between the channels: an IQ image of the first channel lands on the second) | two channels: RTL 25.1 / 23.5, B210 24.8 / 22.5 dB (drive level 7: 25.2 / 24.3 and 24.9 / 23.7): the limit is the transmitter. One channel: RTL 39..42, B210 34 dB (weaker signal there) |
 | harmonics 926 / 1389 / 2315 MHz | all there, the square wave has even ones too; levels not usable (antennas and B210 not flat over the band, GSM-900 at 926 MHz) |
 
 Filter the output before any antenna, and check the 474..478 MHz lines with
