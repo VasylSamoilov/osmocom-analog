@@ -50,6 +50,47 @@ static clkgpio *dma_clk = NULL;
 #define WRITE_CHUNK 1024
 static std::complex<float> fa_buffer[WRITE_CHUNK];
 
+/*
+ * Start and end of a transmission, as rpitx-ui does it
+ * (https://github.com/IgrikXD/rpitx-ui, utils/dma/dma_transmission.cpp):
+ *
+ * The PCM FIFO that paces the DMA is empty at the start, so the DMA plays
+ * its first samples back to back until the FIFO is full (64 samples),
+ * starting with ring slot 0, which librpitx never writes before the start.
+ * So slot 0 and a lead of 64 samples get an idle sample.
+ *
+ * The Set...Samples() calls return when the samples are in the ring, not
+ * when they are played. Stopping right away loses up to a quarter ring plus
+ * a block. So at the end one ring of idle samples is queued, in two halves
+ * (a single write of a whole ring would wrap before the DMA has started).
+ *
+ * The idle sample is "carrier off" in frequency+level mode and 0 Hz (carrier
+ * on, unmodulated) in frequency only mode.
+ */
+#define PCM_FIFO_DEPTH 64
+
+static void write_idle(int num)
+{
+	int i, n;
+
+	if (fm_tx) {
+		static float zero[WRITE_CHUNK];
+		while (num > 0) {
+			n = (num > WRITE_CHUNK) ? WRITE_CHUNK : num;
+			fm_tx->SetFrequencySamples(zero, n);
+			num -= n;
+		}
+		return;
+	}
+	while (num > 0) {
+		n = (num > WRITE_CHUNK) ? WRITE_CHUNK : num;
+		for (i = 0; i < n; i++)
+			fa_buffer[i] = std::complex<float>(0.0f, 0.0f);
+		iq_tx->SetIQSamples(fa_buffer, n, 1);
+		num -= n;
+	}
+}
+
 extern "C" int rpitx_dma_open(enum rpitx_dma_mode mode, double frequency, int samplerate, int fifo_size, int pad_level)
 {
 	if (dma_buf)
@@ -64,19 +105,20 @@ extern "C" int rpitx_dma_open(enum rpitx_dma_mode mode, double frequency, int sa
 		 * never come (a stalled process), that carrier would stay on air.
 		 * Switch the pin to input: the DMA sets its function with every
 		 * sample, so it comes on with the first one. */
-		{
-			generalgpio pin;
-			pin.setmode(4, fsel_input);
-		}
+		iq_tx->disableclk(4);
+		iq_tx->SetFreqAmplitudeSample(0, std::complex<float>(0.0f, 0.0f), 1);
 		dma_buf = iq_tx;
 		dma_clk = iq_tx;
+		write_idle(PCM_FIFO_DEPTH);
 	} else {
 		fm_tx = new ngfmdmasync((uint64_t)frequency, (uint32_t)samplerate, 14, (uint32_t)fifo_size);
 		/* constant drive, as there is no level per sample */
 		padgpio pad;
 		pad.setlevel(pad_level);
+		fm_tx->SetFrequencySample(0, 0.0f);
 		dma_buf = fm_tx;
 		dma_clk = fm_tx;
+		write_idle(PCM_FIFO_DEPTH);
 	}
 
 	return 0;
@@ -165,6 +207,10 @@ extern "C" void rpitx_dma_close(void)
 {
 	if (!dma_buf)
 		return;
+	/* play what is still queued, see above; this also starts a DMA that
+	 * never got a quarter of the ring, so a short transmission is sent */
+	write_idle(dma_buf->buffersize / 2);
+	write_idle(dma_buf->buffersize / 2);
 	dma_buf->stop();
 	/* the destructors switch the clock off and give the GPIO back */
 	delete iq_tx;
