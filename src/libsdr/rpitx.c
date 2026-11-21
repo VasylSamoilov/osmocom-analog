@@ -181,6 +181,54 @@ static void remove_stop_handlers(void)
 	}
 }
 
+/* BCM2711 (Pi 4) or an earlier SoC? */
+static int is_bcm2711(void)
+{
+	char buf[256];
+	size_t n;
+	FILE *fp;
+
+	fp = fopen("/proc/device-tree/compatible", "r");
+	if (!fp)
+		return 0;
+	n = fread(buf, 1, sizeof(buf) - 1, fp);
+	fclose(fp);
+	/* NUL separated strings */
+	for (size_t i = 0; i < n; i++) {
+		if (buf[i] == '\0')
+			buf[i] = ' ';
+	}
+	buf[n] = '\0';
+	return strstr(buf, "bcm2711") != NULL;
+}
+
+/*
+ * The PLL setting librpitx will choose, before it programs it: the same
+ * search as clkgpio::ComputeBestLO(), called by SetCenterFrequency() with
+ * the carrier (twice the carrier on BCM2711) and the sample rate as band.
+ * librpitx accepts PLL rates down to 200 MHz, but below 600 MHz the board
+ * freezes (found by rpitx-ui). Returns the PLL rate, 0 if there is none.
+ */
+static double pll_rate(double carrier, int samplerate, int bcm2711)
+{
+	double xosc = bcm2711 ? 54e6 : 19.2e6;
+	double f = carrier * (bcm2711 ? 2.0 : 1.0);
+	int divider, best = 0;
+
+	if (f * 2.0 > 4e9 || f < 200e6 / 4095.0)
+		return 0.0;
+	if (f * 2.0 > 1500e6)
+		return f * 2.0;	/* PLL pre-divider */
+	for (divider = 4095; divider > 1; divider--) {
+		if (f * divider < 200e6 || f * divider > 1500e6)
+			continue;
+		best = divider;
+		if ((long)((f + samplerate) * divider / xosc) == (long)((f - samplerate) * divider / xosc))
+			break;
+	}
+	return f * best;
+}
+
 int rpitx_open(double tx_frequency, double rate, double tx_gain)
 {
 	int samplerate = (int)rate;
@@ -200,6 +248,12 @@ int rpitx_open(double tx_frequency, double rate, double tx_gain)
 	if (tx_frequency < RPITX_MIN_FREQUENCY || tx_frequency > RPITX_MAX_FREQUENCY) {
 		LOGP(DSDR, LOGL_ERROR, "rpitx can transmit from %.0f kHz to %.0f MHz, not at %.6f MHz\n",
 		     RPITX_MIN_FREQUENCY / 1e3, RPITX_MAX_FREQUENCY / 1e6, tx_frequency / 1e6);
+		return -1;
+	}
+
+	if (pll_rate(tx_frequency, samplerate, is_bcm2711()) < 600e6) {
+		LOGP(DSDR, LOGL_ERROR, "rpitx has no PLL setting for %.6f MHz on this board (the PLL would run below 600 MHz, which freezes the board, or above its limit; on the Pi 4 the limit is 1 GHz)\n",
+		     tx_frequency / 1e6);
 		return -1;
 	}
 
