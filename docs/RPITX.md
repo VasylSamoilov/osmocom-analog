@@ -87,6 +87,27 @@ these numbers (twoch, SINAD per channel) is not part of the tree.
 
 `rtl_sdr -g 0` is automatic gain, not the lowest gain: use `-g 0.9` next to the Pi.
 
+### Seen by a USRP B210 (2026-11-21)
+
+NMT two channels (`-k 1 -k 2 -T CC -T TC`, both idle, 463.000 + 463.025 MHz,
+drive level 0, bare GPIO4 wire), 200 s, 0 underruns. B210 on the same table
+(RX2, its own antenna), each capture compared with one with the Pi off. The Pi
+at level 0 is weak there: the B210's floor is only about 24 dB below the
+signal in a 16 kHz channel, so everything below that is "not seen", not
+"absent".
+
+| what | result |
+|---|---|
+| levels (16 kHz, relative to all within ±100 kHz) | first channel -1.4, second -8.3, product at 462.975 -12.7, 463.050 -19.5 dBc (predicted -0.9 / -10.0 / -11.8) |
+| carrier frequency | about +2 kHz (4 ppm) against the B210's clock (TCXO, ±2 ppm); the RTL-SDR saw +2 ppm. The phone did not mind |
+| floor beside the channels, ±60 kHz .. ±800 kHz | same as with the Pi off (below the B210's floor) |
+| uplink channels 453.000 / 453.025 | same as with the Pi off: no desense seen at this distance |
+| ±20 MHz around the carrier | two narrow unmodulated lines at 474.62 and 477.99 MHz, about -19 dBc, only while rpitx runs; not carrier sidebands (no modulation on them), source not known |
+| harmonics 926 / 1389 / 2315 MHz | all there, the square wave has even ones too; levels not usable (antennas and B210 not flat over the band, GSM-900 at 926 MHz) |
+
+Filter the output before any antenna, and check the 474..478 MHz lines with
+the Pi closer to the B210 or on a cable with an attenuator.
+
 ## Build on the Pi
 
 ```sh
