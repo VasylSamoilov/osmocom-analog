@@ -167,7 +167,8 @@ void sdr_config_print_help(void)
 	printf("    rpitx notes:\n");
 	printf("        --sdr-tx-gain is the GPIO4 drive level 0..7 (2..16 mA).\n");
 	printf("        Sample rate 10000..200000 S/s, up to 250000 without carrier keying.\n");
-	printf("        One or two FM channels. AM channels only get the carrier keyed.\n");
+	printf("        One FM channel; two are experimental (the second one is weak and\n");
+	printf("        distorted off air). AM channels only get the carrier keyed.\n");
 	printf("    --sdr-rpitx-ratio <ratio>\n");
 	printf("        With two channels, the level of the second one relative to the first\n");
 	printf("        one, 0.2 .. 0.8. Give first the channel that stays on (control\n");
