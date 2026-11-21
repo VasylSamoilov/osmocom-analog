@@ -59,6 +59,15 @@ extern "C" int rpitx_dma_open(enum rpitx_dma_mode mode, double frequency, int sa
 		iq_tx = new iqdmasync((uint64_t)frequency, (uint32_t)samplerate, 14, (uint32_t)fifo_size, MODE_FREQ_A);
 		/* same PLL loop as sendiq */
 		iq_tx->SetPLLMasterLoop(3, 4, 0);
+		/* The constructor puts the clock out on GPIO4 already, unmodulated
+		 * at the center frequency, until the DMA starts. If the samples
+		 * never come (a stalled process), that carrier would stay on air.
+		 * Switch the pin to input: the DMA sets its function with every
+		 * sample, so it comes on with the first one. */
+		{
+			generalgpio pin;
+			pin.setmode(4, fsel_input);
+		}
 		dma_buf = iq_tx;
 		dma_clk = iq_tx;
 	} else {
