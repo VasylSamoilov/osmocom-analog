@@ -28,10 +28,10 @@ page by page.
 | STATUS | Rows | Meaning |
 |---|---:|---|
 | IMPLEMENTED | 457 | present, spec-accurate, and exercised (incl. "IMPLEMENTED (RX)" receive-path rows) |
-| NOT-APPLICABLE (mobile-side / regulatory / reserved) | 192 | a mobile "shall" or RF/measurement/reserved item with no base obligation |
+| NOT-APPLICABLE (mobile-side / regulatory / reserved) | 193 | a mobile "shall" or RF/measurement/reserved item with no base obligation |
 | DECODE-ONLY | 110 | field/word parsed on RX but never acted on (logged) |
 | PARTIAL | 105 | present but incomplete, approximated, or not fully enforced |
-| MISSING | 45 | required of the base, no implementation |
+| MISSING | 44 | required of the base, no implementation |
 | STUB | 8 | defined but unreachable / never emitted |
 | EXTENSION (non-spec) | 2 | code exceeds a "Reserved" spec section (SAT/ST detect) |
 | UNVERIFIED | 0 | both prior UNVERIFIED items resolved (see below) |
@@ -52,20 +52,23 @@ page by page.
 > **Second re-validation (2026-10-11, every MISSING row across all ranges):** of the 45 remaining
 > MISSING rows, **38 are correctly MISSING** — all auth-family (CAVE/SSD/AUTHR/AUTHU/AUTHBS,
 > Base-Station Challenge, SSD Update, Auth-Word-C registration, Message Encryption; only *scaffolded*
-> this session, no CAVE engine), plus LASTCHA/LASTCHP, the ±12 kHz voice deviation limiter, and the
-> two busy-idle TX rows (deliberately not implemented — SDR latency). **4 more were stale/misclassified:**
+> this session, no CAVE engine), plus the ±12 kHz voice deviation limiter, and the
+> two busy-idle TX rows (deliberately not implemented — SDR latency). LASTCHA/LASTCHP were
+> reclassified NOT-APPLICABLE: they are mobile-side derived values, not base-transmitted (p.55).
+> **4 more were stale/misclassified:**
 > directed-retry LT↔ORDQ is IMPLEMENTED (`amps.c:4024/4028`); BSCAP and BSPC are DECODE-ONLY
 > (encoder exists, value hardcoded in sysinfo.c); the global-action Local Control overhead word is a
 > STUB (framing defined, never emitted — distinct from the implemented per-call Order 30).
 >
 > Corrected totals above reflect both passes. Net reclassifications out of MISSING: 7 (p.59/p.65
 > orders) + 4 (directed-retry LT, BSCAP, BSPC, Local Control STUB) = 11 rows that were wrongly
-> MISSING, leaving 45 genuinely-missing rows — of which ~38 are the auth family (scaffolded only,
-> no CAVE) and the rest are LASTCHA/LASTCHP, the ±12 kHz deviation limiter, and the two busy-idle
-> TX rows (deliberate SDR-latency omission).
+> MISSING, leaving 44 genuinely-missing rows — of which ~38 are the auth family (scaffolded only,
+> no CAVE) and the rest are the ±12 kHz deviation limiter and the two busy-idle
+> TX rows (deliberate SDR-latency omission). LASTCHA/LASTCHP were later reclassified NOT-APPLICABLE
+> (mobile-side derived, not base-transmitted — p.55).
 
 Of the base-station-obligation rows (the 457 IMPLEMENTED + 110 DECODE-ONLY + 105 PARTIAL +
-45 MISSING + 8 STUB = 725 rows that carry a base obligation, excluding the 192 not-applicable),
+44 MISSING + 8 STUB = 724 rows that carry a base obligation, excluding the 193 not-applicable),
 **~63% are fully implemented**, with the shortfall concentrated in a few coherent areas
 (authentication above all) rather than scattered defects.
 
@@ -203,7 +206,7 @@ PAGE 19 | §1.2 | FIRSTCHA (first CC for access) | partial | partial | Y | N | P
 Numeric indicators F..P. Overhead/location/paging fields that the base transmits are implemented.
 
 PAGE 20 | §1.2 | FIRSTCHP (first CC for paging) | N-A | partial | partial | N | PARTIAL | paging-channel numbering via n_1/channel calc; not a distinct FIRSTCHP var
-PAGE 20 | §1.2 | LASTCHA / LASTCHP (last CC access/paging) | N | N | N | N | MISSING | no lastcha/lastchp in src/amps/
+PAGE 20 | §1.2 | LASTCHA / LASTCHP (last CC access/paging) | N-A | N-A | N-A | N-A | NOT-APPLICABLE | mobile-side derived values, not base-transmitted: the mobile computes FIRSTCHA/LASTCHA/FIRSTCHP/LASTCHP itself from the channel plan + CMAX/CPA/N (p.55 §2.6.1.1 algorithm: LASTCHA=FIRSTCHA-/+CMAX-/+1). The base-side inputs (CMAX-1, CPA, N-1 in Word 2) are IMPLEMENTED and verified; nothing for the base to emit.
 PAGE 20 | §1.2 | LOCAID (location area identity) | N-A | Y | Y | Y | IMPLEMENTED | loc_area.locaid sysinfo.c:92,182; -S locaid
 PAGE 20 | §1.2 | LREG (location registration enable) | N-A | Y | Y | Y | IMPLEMENTED | loc_area.lreg sysinfo.c:93,182
 PAGE 20 | §1.2 | LRCC (last registration CC) | N | N | N | N | NOT-APPLICABLE(mobile-side) | MS stored value
