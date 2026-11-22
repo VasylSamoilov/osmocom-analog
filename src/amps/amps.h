@@ -262,6 +262,7 @@ void amps_destroy(sender_t *sender);
 void amps_go_idle(amps_t *amps);
 void amps_rx_signaling_tone(amps_t *amps, int tone, double quality);
 void amps_rx_sat(amps_t *amps, int tone, double quality);
+void amps_rx_sat_level(amps_t *amps, double quality);
 void amps_rx_sat_mismatch(amps_t *amps, enum sat_state expected, enum sat_state detected);
 const char *sat_state_name(enum sat_state state);
 void amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uint32_t esn, uint32_t min1, uint16_t min2, uint8_t msg_type, uint8_t ordq, uint8_t order, const char *dialing, uint8_t mspc, uint8_t mscap, uint8_t sdcc1, uint8_t sdcc2);

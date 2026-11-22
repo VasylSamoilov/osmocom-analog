@@ -93,7 +93,12 @@ _Static_assert(AMPS_ORDER_MESSAGE_ENCRYPTION == AMPS_ORDER_DISABLE_DTMF + 1,
 #define RELEASE_TIMER	5,0		/* max time to send release messages */
 #define ST_FLASH_MIN	0.2		/* min duration for flash (200ms) */
 #define ST_FLASH_MAX	0.8		/* max duration for flash (800ms) */
-#define ST_RELEASE_TIME	1,800000	/* duration for release (1.8s) */
+#define ST_RELEASE_TIME	1,000000	/* ST still on this long after its detection is a
+					 * release: the mobile sends 1.8 s for release,
+					 * 0.4 s for a flash, and a flash is at most
+					 * ST_FLASH_MAX (0.8 s) measured; detection lags
+					 * about 0.4 s, so this releases about 1.4 s after
+					 * the ST began instead of 2.2 s */
 
 /* Power Control Thresholds */
 #define VMAC_ADJUST_INTERVAL        50     /* Measurements between adjustments */
@@ -833,10 +838,12 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 {
 	transaction_t *trans = amps->trans_list;
 	if (trans == NULL) {
-		LOGP_CHAN(DAMPS, LOGL_ERROR, "Signaling Tone without transaction, please fix!\n");
+		/* the end of a release tone after we released on its timer */
+		if (tone)
+			LOGP_CHAN(DAMPS, LOGL_ERROR, "Signaling Tone without transaction, please fix!\n");
 		return;
 	}
-	
+
 	if (tone)
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Detected Signaling Tone with quality=%.0f.\n", quality * 100.0);
 	else
@@ -1122,34 +1129,10 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 		return;
 	}
 
-	/* Grace period after a power change / blank-and-burst: only the power
-	 * control average is frozen. SAT detection and loss are still handled,
-	 * so a SAT loss arms the fade timer (TIA/EIA-553-A 2.6.4.1); the 5 s
-	 * fade timer already tolerates the short interruption. */
-	if (tone && trans->vmac_grace_count > 0)
-		trans->vmac_grace_count--;
-
 	if (tone) {
 		if (!trans->sat_detected)
 			LOGP(DAMPS, LOGL_INFO, "Detected SAT signal with quality=%.0f.\n", quality * 100.0);
 		trans->sat_detected = 1;
-		
-		/* Power Control Logic */
-		if (trans->state == TRANS_CALL && vmac_enable && trans->vmac_grace_count == 0) {
-			/* Initialize average on first sample */
-			if (trans->sat_level_avg == 0.0)
-				trans->sat_level_avg = quality;
-			
-			/* Update running average */
-			trans->sat_level_avg = (trans->sat_level_avg * 0.9) + (quality * 0.1);
-			trans->vmac_adjust_count++;
-
-			/* Check if time to adjust */
-			if (trans->vmac_adjust_count >= VMAC_ADJUST_INTERVAL) {
-				adjust_vmac(trans);
-				trans->vmac_adjust_count = 0;
-			}
-		}
 	} else {
 		LOGP(DAMPS, LOGL_INFO, "Lost SAT signal\n");
 		trans->sat_detected = 0;
@@ -1193,6 +1176,55 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 
 	if (amps->sender.loopback)
 		return;
+}
+
+/*
+ * SAT level of every detector block while SAT is present (dsp.c), for the
+ * power control average. It must not touch the transaction timer: SAT
+ * detected and SAT lost come to amps_rx_sat() on the transitions only.
+ */
+void amps_rx_sat_level(amps_t *amps, double quality)
+{
+	transaction_t *trans = amps->trans_list;
+
+	if (!trans)
+		return;
+
+	/* a state that waits for SAT, entered while SAT is already there (it
+	 * has no transition then): confirm it as on detection */
+	if (trans->sat_detected
+	 && (trans->state == TRANS_CALL_MO_ASSIGN_CONFIRM
+	  || trans->state == TRANS_CALL_MT_ASSIGN_CONFIRM
+	  || trans->state == TRANS_SILENT_PAGE_ASSIGN_CONFIRM)) {
+		amps_rx_sat(amps, 1, quality);
+		return;
+	}
+
+	/* Grace period after a power change / blank-and-burst: only the power
+	 * control average is frozen. SAT detection and loss are still handled,
+	 * so a SAT loss arms the fade timer (TIA/EIA-553-A 2.6.4.1); the 5 s
+	 * fade timer already tolerates the short interruption. */
+	if (trans->vmac_grace_count > 0) {
+		trans->vmac_grace_count--;
+		return;
+	}
+
+	/* Power Control Logic */
+	if (trans->state == TRANS_CALL && vmac_enable) {
+		/* Initialize average on first sample */
+		if (trans->sat_level_avg == 0.0)
+			trans->sat_level_avg = quality;
+
+		/* Update running average */
+		trans->sat_level_avg = (trans->sat_level_avg * 0.9) + (quality * 0.1);
+		trans->vmac_adjust_count++;
+
+		/* Check if time to adjust */
+		if (trans->vmac_adjust_count >= VMAC_ADJUST_INTERVAL) {
+			adjust_vmac(trans);
+			trans->vmac_adjust_count = 0;
+		}
+	}
 }
 
 /*
@@ -4521,7 +4553,10 @@ void transaction_timeout(void *data)
 	case TRANS_CALL:
 		/* Check if this is ST Release timeout */
 		if (trans->st_start_time != 0.0) {
-			LOGP_CHAN(DAMPS, LOGL_NOTICE, "*** Signaling Tone held > 1.8s - Releasing call ***\n");
+			/* the ST timer is only started with SAT present, and a
+			 * SAT loss does not rearm a pending timer, so a pending
+			 * ST timing means this is the ST timer, not the fade one */
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, "*** Signaling Tone held longer than a flash - Releasing call ***\n");
 			trans->st_start_time = 0.0;
 			/* Release call */
 			if (trans->callref)

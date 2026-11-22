@@ -1048,13 +1048,13 @@ static void sat_decode(amps_t *amps, sample_t *samples, int length)
 	display_measurements_update(amps->dmp_sat_level, sat_level * 100.0, 0.0);
 	display_measurements_update(amps->dmp_sat_quality, sat_quality * 100.0, 0.0);
 
-	/* Continuous SAT update to Upper Layer for Power Control */
-	if (amps->sat_state != SAT_STATE_NONE) {
-
-		/* Pass quality as before. RSSI could be passed too if we updated the API,
-		 * but for now we logged it here as requested. */
-		amps_rx_sat(amps, 1, sat_quality);
-	}
+	/* SAT level of every block for power control. Only this: SAT detected
+	 * and SAT lost go to amps_rx_sat() below, on the transitions, as
+	 * upstream. Calling amps_rx_sat() on every block deleted the
+	 * transaction timer every 67 ms: the 1.8 s release timer of the
+	 * signaling tone, the no-answer timeout and others never fired. */
+	if (amps->sat_state != SAT_STATE_NONE)
+		amps_rx_sat_level(amps, sat_quality);
 
 	/* Debug signaling tone */
 	if (amps->sender.loopback || loglevel == LOGL_DEBUG) {
