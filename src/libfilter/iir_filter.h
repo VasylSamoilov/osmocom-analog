@@ -12,6 +12,10 @@ void iir_highpass_init(iir_filter_t *filter, double frequency, int samplerate, i
 void iir_bandpass_init(iir_filter_t *filter, double frequency, int samplerate, int iterations);
 void iir_notch_init(iir_filter_t *filter, double frequency, int samplerate, int iterations, double Q);
 void iir_process(iir_filter_t *filter, sample_t *samples, int length);
+/* flat Butterworth cascades; 'filter' points to order/2 sections */
+void iir_butterworth_lowpass_init(iir_filter_t *filter, double frequency, int samplerate, int order);
+void iir_butterworth_highpass_init(iir_filter_t *filter, double frequency, int samplerate, int order);
+void iir_butterworth_process(iir_filter_t *filter, int order, sample_t *samples, int length);
 void iir_process_baseband(iir_filter_t *filter, float *baseband, int length);
 
 #endif /* _FILTER_H */

@@ -9,6 +9,11 @@
 #include "tx_limiter.h"
 
 typedef struct nmt nmt_t;
+
+/* orders of the receive audio filters (flat Butterworth cascades) */
+#define RX_HP_ORDER	4	/* 300 Hz high pass */
+#define RX_LP_ORDER	8	/* 3400 Hz low pass */
+
 #include "dms.h"
 #include "sms.h"
 
@@ -115,8 +120,8 @@ struct nmt {
 
 	/* filters */
 	iir_filter_t		rx_notch_filter;	/* filter to remove supervisory signal from audio */
-	iir_filter_t		rx_lp_filter;		/* filter to limit bandwidth to 3400 Hz */
-	iir_filter_t		rx_hp_filter;		/* filter to remove DC / < 300 Hz */
+	iir_filter_t		rx_lp_filter[RX_LP_ORDER / 2];	/* Butterworth: limit bandwidth to 3400 Hz */
+	iir_filter_t		rx_hp_filter[RX_HP_ORDER / 2];	/* Butterworth: remove DC / < 300 Hz */
 	double			rx_gain_cal;		/* gain to make the receive chain neutral at 1 kHz */
 	double			network_rx_gain;	/* gain of the speech toward the network, after the expander */
 	double			super_tx_scale;		/* scale of the supervisory tone, so it gives 0,3 kHz deviation */

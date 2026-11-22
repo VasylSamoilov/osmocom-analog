@@ -71,6 +71,69 @@ void iir_highpass_init(iir_filter_t *filter, double frequency, int samplerate, i
 	filter->b2 = (1 - K / Q + K * K) * norm;
 }
 
+/* Butterworth cascades of 'order' (even, 2..16): one biquad per pole pair, each
+ * with its own Q = 1 / (2 cos((2k-1) pi / (2 order))). The passband is flat
+ * (-3 dB at 'frequency'). iir_lowpass_init() with iterations > 1 instead
+ * repeats one section with Q = 0.7071^(1/iterations), which peaks (8
+ * iterations: +7.7 dB below the cut-off). The sections are 'filter[order/2]'. */
+static int butterworth_sections(int order)
+{
+	if (order < 2 || order > 16 || (order & 1)) {
+		fprintf(stderr, "%s failed: order %d must be even, 2..16, please fix!\n", __func__, order);
+		abort();
+	}
+	return order / 2;
+}
+
+static double butterworth_q(int order, int k)	/* k = 1 .. order/2 */
+{
+	return 1.0 / (2.0 * cos((2.0 * k - 1.0) * PI / (2.0 * order)));
+}
+
+void iir_butterworth_lowpass_init(iir_filter_t *filter, double frequency, int samplerate, int order)
+{
+	int n = butterworth_sections(order), k;
+
+	for (k = 0; k < n; k++) {
+		double Q = butterworth_q(order, k + 1), K = tan(PI * frequency / (double)samplerate);
+		double norm = 1 / (1 + K / Q + K * K);
+
+		memset(&filter[k], 0, sizeof(filter[k]));
+		filter[k].iter = 1;
+		filter[k].a0 = K * K * norm;
+		filter[k].a1 = 2 * filter[k].a0;
+		filter[k].a2 = filter[k].a0;
+		filter[k].b1 = 2 * (K * K - 1) * norm;
+		filter[k].b2 = (1 - K / Q + K * K) * norm;
+	}
+}
+
+void iir_butterworth_highpass_init(iir_filter_t *filter, double frequency, int samplerate, int order)
+{
+	int n = butterworth_sections(order), k;
+
+	for (k = 0; k < n; k++) {
+		double Q = butterworth_q(order, k + 1), K = tan(PI * frequency / (double)samplerate);
+		double norm = 1 / (1 + K / Q + K * K);
+
+		memset(&filter[k], 0, sizeof(filter[k]));
+		filter[k].iter = 1;
+		filter[k].a0 = 1 * norm;
+		filter[k].a1 = -2 * filter[k].a0;
+		filter[k].a2 = filter[k].a0;
+		filter[k].b1 = 2 * (K * K - 1) * norm;
+		filter[k].b2 = (1 - K / Q + K * K) * norm;
+	}
+}
+
+void iir_butterworth_process(iir_filter_t *filter, int order, sample_t *samples, int length)
+{
+	int n = butterworth_sections(order), k;
+
+	for (k = 0; k < n; k++)
+		iir_process(&filter[k], samples, length);
+}
+
 void iir_bandpass_init(iir_filter_t *filter, double frequency, int samplerate, int iterations)
 {
 	double Fc, Q, K, norm;

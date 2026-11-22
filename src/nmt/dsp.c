@@ -130,7 +130,7 @@ static int speech_limiter_init(nmt_t *nmt);
  * tone, so the states of the real ones are not touched. */
 static double rx_chain_calibration(nmt_t *nmt)
 {
-	iir_filter_t hp = nmt->rx_hp_filter, notch = nmt->rx_notch_filter, lp = nmt->rx_lp_filter;
+	iir_filter_t hp[RX_HP_ORDER / 2], notch = nmt->rx_notch_filter, lp[RX_LP_ORDER / 2];
 	samplerate_t sr;
 	sample_t *spl;
 	double c = 0.0, s = 0.0, amp;
@@ -149,10 +149,12 @@ static double rx_chain_calibration(nmt_t *nmt)
 		return 1.0;
 	for (i = 0; i < num; i++)
 		spl[i] = sin(2.0 * PI * 1000.0 * (double)i / (double)nmt->sender.samplerate);
-	iir_process(&hp, spl, num);
+	memcpy(hp, nmt->rx_hp_filter, sizeof(hp));
+	memcpy(lp, nmt->rx_lp_filter, sizeof(lp));
+	iir_butterworth_process(hp, RX_HP_ORDER, spl, num);
 	if (nmt->supervisory)
 		iir_process(&notch, spl, num);
-	iir_process(&lp, spl, num);
+	iir_butterworth_process(lp, RX_LP_ORDER, spl, num);
 	out = samplerate_downsample(&sr, spl, num);
 	/* amplitude of the 1 kHz component in the second half of the output */
 	for (i = out / 2; i < out; i++) {
@@ -220,10 +222,12 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 	compandor_set_expander_max(&nmt->cstate, 9.99);
 
 	/* init filters */
-	iir_highpass_init(&nmt->rx_hp_filter, 300.0, nmt->sender.samplerate, 4);
+	/* flat Butterworth cascades: iir_highpass_init()/iir_lowpass_init() with several iterations
+	 * repeat one peaking section (8 iterations: +7.7 dB at 2,5 kHz, 4 iterations: +3 dB at 500 Hz) */
+	iir_butterworth_highpass_init(nmt->rx_hp_filter, 300.0, nmt->sender.samplerate, RX_HP_ORDER);
 	if (nmt->supervisory)
 		iir_notch_init(&nmt->rx_notch_filter, super_freq[nmt->supervisory - 1], nmt->sender.samplerate, 2, 20.0);
-	iir_lowpass_init(&nmt->rx_lp_filter, 3400.0, nmt->sender.samplerate, 8);
+	iir_butterworth_lowpass_init(nmt->rx_lp_filter, 3400.0, nmt->sender.samplerate, RX_LP_ORDER);
 
 	/* The filters of the receive chain and the downsampler are cascades of biquads, which have a gain at
 	 * 1 kHz (about +4.8 dB at 48 kHz and at 500 kHz). The expander is made for neutral level at
@@ -458,9 +462,19 @@ void super_reset(nmt_t *nmt)
 /* LEVEL debug: levels of the speech in a call, once per second, at each stage of both directions. dB are
  * relative to the 1 kHz reference tone (normalized amplitude 1.0 = 3,0 kHz deviation): "pk" is the peak, "rms"
  * the RMS of a sine with the same power (0 dB = reference tone), "over" the samples beyond the given limit. */
+/* At the 8 kHz stages the meter also measures the low band (below 800 Hz) and the high band (above 2 kHz)
+ * of the speech (4th order Butterworth on a copy), "lo" and "hi" in the log: a colouration of the chain
+ * shows as a change of hi-lo from stage to stage. */
+#define METER_BAND_RATE	8000
+#define METER_LO_HZ	800.0
+#define METER_HI_HZ	2000.0
+
 typedef struct level_meter {
 	double peak, sumsq;
 	long n, over;
+	int band_init;
+	iir_filter_t lo[2], hi[2];
+	double lo_sumsq, hi_sumsq;
 } level_meter_t;
 
 static void meter_add(level_meter_t *m, const sample_t *s, int n, double limit)
@@ -479,23 +493,65 @@ static void meter_add(level_meter_t *m, const sample_t *s, int n, double limit)
 	m->n += n;
 }
 
+/* meter_add() plus low and high band, for 8 kHz stages */
+static void meter_add_bands(level_meter_t *m, const sample_t *s, int n, double limit)
+{
+	sample_t lo[n], hi[n];
+	int i;
+
+	meter_add(m, s, n, limit);
+	if (!m->band_init) {
+		iir_butterworth_lowpass_init(m->lo, METER_LO_HZ, METER_BAND_RATE, 4);
+		iir_butterworth_highpass_init(m->hi, METER_HI_HZ, METER_BAND_RATE, 4);
+		m->band_init = 1;
+	}
+	memcpy(lo, s, sizeof(lo));
+	memcpy(hi, s, sizeof(hi));
+	iir_butterworth_process(m->lo, 4, lo, n);
+	iir_butterworth_process(m->hi, 4, hi, n);
+	for (i = 0; i < n; i++) {
+		m->lo_sumsq += lo[i] * lo[i];
+		m->hi_sumsq += hi[i] * hi[i];
+	}
+}
+
 static double meter_pk_db(const level_meter_t *m)
 {
 	return 20.0 * log10(m->peak + 1e-12);
 }
 
-static double meter_rms_db(const level_meter_t *m)
+static double rms_db(double sumsq, long n)
 {
-	return m->n ? 20.0 * log10(sqrt(m->sumsq / (double)m->n) / M_SQRT1_2 + 1e-12) : -240.0;
+	return n ? 20.0 * log10(sqrt(sumsq / (double)n) / M_SQRT1_2 + 1e-12) : -240.0;
 }
 
-#define LEVEL_RX_STAGES 5
-#define LEVEL_TX_STAGES 3
+static double meter_rms_db(const level_meter_t *m)
+{
+	return rms_db(m->sumsq, m->n);
+}
+
+/* one stage of the log: "name pk x rms y[ lo a hi b]" */
+static int meter_print(char *line, int size, int first, const char *name, const level_meter_t *m)
+{
+	int pos = snprintf(line, size, "%s%s pk %+.1f rms %+.1f", first ? "" : " | ", name, meter_pk_db(m), meter_rms_db(m));
+
+	if (m->band_init && pos < size)
+		pos += snprintf(line + pos, size - pos, " lo %+.1f hi %+.1f", rms_db(m->lo_sumsq, m->n), rms_db(m->hi_sumsq, m->n));
+	return pos;
+}
+
+/* stages of the receive chain (mobile->network) */
+enum { RX_RADIO, RX_HIGHPASS, RX_NOTCH, RX_LOWPASS, RX_8KHZ, RX_CALIBRATED, RX_EXPANDER, RX_TO_NETWORK, LEVEL_RX_STAGES };
+/* stages of the transmit chain (network->mobile) */
+enum { TX_FROM_NETWORK, TX_COMPRESSOR, TX_UPSAMPLED, TX_LIMITED, TX_SUPERVISORY, LEVEL_TX_STAGES };
+
 struct level_debug {
 	nmt_t *nmt;
 	level_meter_t rx[LEVEL_RX_STAGES], tx[LEVEL_TX_STAGES];
 	long rx_samples, tx_samples;
+	long blocks;			/* TX blocks through the speech limiter */
 	long limited;			/* TX blocks scaled down by the speech limiter */
+	long limited_samples;		/* samples in those blocks */
 	double min_scale;		/* lowest scale of the limiter */
 };
 static struct level_debug level_debug[8];
@@ -521,37 +577,42 @@ static struct level_debug *level_debug_of(nmt_t *nmt)
 
 static void level_debug_rx_log(nmt_t *nmt, struct level_debug *ld)
 {
-	static const char *name[LEVEL_RX_STAGES] = { "radio", "filters", "8 kHz", "expander", "to network" };
-	char line[512];
+	static const char *name[LEVEL_RX_STAGES] = { "radio", "highpass", "notch", "lowpass", "8 kHz", "calibrated",
+						     "expander", "to network" };
+	char line[1024];
 	int i, pos = 0;
 
 	if (ld->rx_samples < nmt->sender.samplerate)
 		return;
 	for (i = 0; i < LEVEL_RX_STAGES; i++)
-		pos += snprintf(line + pos, sizeof(line) - pos, "%s%s pk %+.1f rms %+.1f", i ? " | " : "", name[i],
-				meter_pk_db(&ld->rx[i]), meter_rms_db(&ld->rx[i]));
+		pos += meter_print(line + pos, sizeof(line) - pos, !i, name[i], &ld->rx[i]);
 	LOGP_CHAN(DDSP, LOGL_NOTICE, "LEVEL mobile->network dB: %s | clipped %ld (full scale %+.1f dB)\n", line,
-		  ld->rx[LEVEL_RX_STAGES - 1].over, 20.0 * log10(INT16_FULL_SCALE));
+		  ld->rx[RX_TO_NETWORK].over, 20.0 * log10(INT16_FULL_SCALE));
 	memset(ld->rx, 0, sizeof(ld->rx));
 	ld->rx_samples = 0;
 }
 
 static void level_debug_tx_log(nmt_t *nmt, struct level_debug *ld)
 {
-	static const char *name[LEVEL_TX_STAGES] = { "from network", "compressor", "with supervisory" };
-	char line[512];
+	static const char *name[LEVEL_TX_STAGES] = { "from network", "compressor", "upsampled", "limited",
+						     "with supervisory" };
+	char line[1024];
 	int i, pos = 0;
 
 	if (ld->tx_samples < nmt->sender.samplerate)
 		return;
 	for (i = 0; i < LEVEL_TX_STAGES; i++)
-		pos += snprintf(line + pos, sizeof(line) - pos, "%s%s pk %+.1f rms %+.1f", i ? " | " : "", name[i],
-				meter_pk_db(&ld->tx[i]), meter_rms_db(&ld->tx[i]));
-	LOGP_CHAN(DDSP, LOGL_NOTICE, "LEVEL network->mobile dB: %s | clipped from network %ld | limiter: %ld blocks, down to %.1f dB\n",
-		  line, ld->tx[0].over, ld->limited, 20.0 * log10(ld->min_scale));
+		pos += meter_print(line + pos, sizeof(line) - pos, !i, name[i], &ld->tx[i]);
+	LOGP_CHAN(DDSP, LOGL_NOTICE, "LEVEL network->mobile dB: %s | clipped from network %ld | limiter: %ld of %ld blocks"
+		  " (%.0f %% of the samples), down to %.1f dB\n",
+		  line, ld->tx[TX_FROM_NETWORK].over, ld->limited, ld->blocks,
+		  ld->tx_samples ? 100.0 * (double)ld->limited_samples / (double)ld->tx_samples : 0.0,
+		  20.0 * log10(ld->min_scale));
 	memset(ld->tx, 0, sizeof(ld->tx));
 	ld->tx_samples = 0;
+	ld->blocks = 0;
 	ld->limited = 0;
+	ld->limited_samples = 0;
 	ld->min_scale = 1.0;
 }
 
@@ -566,7 +627,7 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 	struct level_debug *ld = in_call ? level_debug_of(nmt) : NULL;
 
 	if (ld) {
-		meter_add(&ld->rx[0], samples, length, 0.0);
+		meter_add(&ld->rx[RX_RADIO], samples, length, 0.0);
 		ld->rx_samples += length;
 	}
 
@@ -596,17 +657,23 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 	}
 
 	/* filter audio */
-	iir_process(&nmt->rx_hp_filter, samples, length);
+	iir_butterworth_process(nmt->rx_hp_filter, RX_HP_ORDER, samples, length);
+	if (ld)
+		meter_add(&ld->rx[RX_HIGHPASS], samples, length, 0.0);
 	if (nmt->supervisory)
 		iir_process(&nmt->rx_notch_filter, samples, length);
-	iir_process(&nmt->rx_lp_filter, samples, length);
 	if (ld)
-		meter_add(&ld->rx[1], samples, length, 0.0);
+		meter_add(&ld->rx[RX_NOTCH], samples, length, 0.0);
+	iir_butterworth_process(nmt->rx_lp_filter, RX_LP_ORDER, samples, length);
+	if (ld)
+		meter_add(&ld->rx[RX_LOWPASS], samples, length, 0.0);
 
 	if (in_call) {
 		int len, count;
 
 		len = samplerate_downsample(&nmt->sender.srstate, samples, length);
+		if (ld)
+			meter_add_bands(&ld->rx[RX_8KHZ], samples, len, 0.0);
 		/* the chain from the radio has a gain at 1 kHz, that is calibrated away, so the expander sees
 		 * the level it is made for */
 		if (nmt->rx_gain_cal != 1.0) {
@@ -614,7 +681,7 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 				samples[i] *= nmt->rx_gain_cal;
 		}
 		if (ld)
-			meter_add(&ld->rx[2], samples, len, 0.0);
+			meter_add_bands(&ld->rx[RX_CALIBRATED], samples, len, 0.0);
 		if (nmt->compandor) {
 			/* NMT Doc 900-4 5.25: with the expander bypassed, the reference tone (1 kHz, 3,0 kHz deviation)
 			 * is 2,2 dB below the reference level at the line output, so the unaffected level of the
@@ -626,7 +693,7 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 				samples[i] *= EXPANDER_UNAFFECTED;
 		}
 		if (ld)
-			meter_add(&ld->rx[3], samples, len, 0.0);
+			meter_add_bands(&ld->rx[RX_EXPANDER], samples, len, 0.0);
 		if (nmt->network_rx_gain != 1.0) {
 			for (i = 0; i < len; i++)
 				samples[i] *= nmt->network_rx_gain;
@@ -640,7 +707,7 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 				memset(samples + count, 0, sizeof(*samples) * (len - count));
 		}
 		if (ld) {
-			meter_add(&ld->rx[4], samples, len, INT16_FULL_SCALE);
+			meter_add_bands(&ld->rx[RX_TO_NETWORK], samples, len, INT16_FULL_SCALE);
 			level_debug_rx_log(nmt, ld);
 		}
 		spl = nmt->sender.rxbuf;
@@ -769,15 +836,17 @@ again:
 			int16_to_samples_speech(samples, spl, input_num);
 		}
 		if (ld)
-			meter_add(&ld->tx[0], samples, input_num, INT16_FULL_SCALE * 0.9999);
+			meter_add_bands(&ld->tx[TX_FROM_NETWORK], samples, input_num, INT16_FULL_SCALE * 0.9999);
 		/* Echo suppressor TX reference (far-end audio before DSP processing) */
 		if (nmt->trans && nmt->trans->callref)
 			call_echo_suppressor_tx(nmt->trans->callref, samples, input_num);
 		if (nmt->compandor)
 			compress_audio(&nmt->cstate, samples, input_num);
 		if (ld)
-			meter_add(&ld->tx[1], samples, input_num, 0.0);
+			meter_add_bands(&ld->tx[TX_COMPRESSOR], samples, input_num, 0.0);
 		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
+		if (ld)
+			meter_add(&ld->tx[TX_UPSAMPLED], samples, length, 0.0);
 		/* send after dejitter, so audio is flushed */
 		if (nmt->dms.tx_frame_valid) {
 			fsk_mod_send(&nmt->fsk_mod, samples, length, 0);
@@ -804,16 +873,21 @@ again:
 			tx_limiter_process(&nmt->tx_limiter, samples, length);
 			scale = tx_limiter_min_gain(&nmt->tx_limiter);
 			/* a block counts as limited from -0.01 dB on */
-			if (ld && scale < 0.999) {
-				ld->limited++;
-				if (scale < ld->min_scale)
-					ld->min_scale = scale;
+			if (ld) {
+				ld->blocks++;
+				if (scale < 0.999) {
+					ld->limited++;
+					ld->limited_samples += length;
+					if (scale < ld->min_scale)
+						ld->min_scale = scale;
+				}
+				meter_add(&ld->tx[TX_LIMITED], samples, length, 0.0);
 			}
 		}
 		if (nmt->supervisory)
 			super_encode(nmt, samples, length);
 		if (ld) {
-			meter_add(&ld->tx[2], samples, length, 0.0);
+			meter_add(&ld->tx[TX_SUPERVISORY], samples, length, 0.0);
 			ld->tx_samples += length;
 			level_debug_tx_log(nmt, ld);
 		}
