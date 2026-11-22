@@ -60,8 +60,11 @@ extern double network_rx_gain_db;
 #define SPEECH_DEVIATION	3000.0	/* deviation of speech at 1 kHz */
 #define TX_PEAK_FSK		(4200.0 / 1800.0 * 1000.0 / SPEECH_DEVIATION)
 #define TX_PEAK_SUPER		(300.0 / 4015.0 * 1000.0 / SPEECH_DEVIATION)
-/* unaffected level of the expander, relative to the reference tone (NMT Doc 900-4 5.25) */
-#define EXPANDER_UNAFFECTED	0.7762	/* -2,2 dB */
+/* noise gate of the received audio (normalized, 1.0 = reference), the threshold of AMPS */
+#define RX_NOISE_GATE		0.10
+/* highest envelope of the expander (1.0 = reference level): the expander restores up to the maximum
+ * deviation the radio carries (4,7 kHz = +3,9 dB over the 3,0 kHz reference), see dsp_init_sender() */
+#define EXPANDER_MAX_ENVELOPE	(MAX_DEVIATION / SPEECH_DEVIATION)
 #define BIT_RATE		1200.0
 #define BIT_ADJUST		0.1	/* how much do we adjust bit clock on frequency change */
 #define F0			1800.0
@@ -217,9 +220,10 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 
 	/* attack (3ms) and recovery time (13.5ms) according to NMT specs */
 	setup_compandor(&nmt->cstate, 8000, 3.0, 13.5);
-	/* the expander restores the level above the unaffected level too, over the range of the compressor
-	 * (+20 dB) */
-	compandor_set_expander_max(&nmt->cstate, 9.99);
+	/* The expander is linear (+-1 dB) from +3 dB to -55 dB re the reference level (NMT Doc 900-4
+	 * 5.25.1). It restores up to what the radio carries (the maximum deviation) and no more: a higher
+	 * ceiling (9.99 = +20 dB) gave gain that only fed acoustic loops between phones, on air. */
+	compandor_set_expander_max(&nmt->cstate, EXPANDER_MAX_ENVELOPE);
 
 	/* init filters */
 	/* flat Butterworth cascades: iir_highpass_init()/iir_lowpass_init() with several iterations
@@ -662,6 +666,20 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 		meter_add(&ld->rx[RX_HIGHPASS], samples, length, 0.0);
 	if (nmt->supervisory)
 		iir_process(&nmt->rx_notch_filter, samples, length);
+	/* Noise gate of the received audio, as in AMPS (amps/dsp.c): what the phone's microphone picks up
+	 * when nobody speaks (room, its own earpiece), lifted by the phone's compressor, stays below the
+	 * threshold (0.10 = 300 Hz deviation, -20 dB re the reference) and is not sent to the network.
+	 * Above the threshold, the threshold is subtracted and made up again. */
+	if (in_call) {
+		for (i = 0; i < length; i++) {
+			double a = fabs(samples[i]);
+
+			if (a < RX_NOISE_GATE)
+				samples[i] = 0.0;
+			else
+				samples[i] = ((samples[i] >= 0.0) ? 1.0 : -1.0) * (a - RX_NOISE_GATE) / (1.0 - RX_NOISE_GATE);
+		}
+	}
 	if (ld)
 		meter_add(&ld->rx[RX_NOTCH], samples, length, 0.0);
 	iir_butterworth_process(nmt->rx_lp_filter, RX_LP_ORDER, samples, length);
@@ -682,16 +700,12 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 		}
 		if (ld)
 			meter_add_bands(&ld->rx[RX_CALIBRATED], samples, len, 0.0);
-		if (nmt->compandor) {
-			/* NMT Doc 900-4 5.25: with the expander bypassed, the reference tone (1 kHz, 3,0 kHz deviation)
-			 * is 2,2 dB below the reference level at the line output, so the unaffected level of the
-			 * expander is 2,2 dB below the reference tone (the level of the FFSK signalling) */
-			for (i = 0; i < len; i++)
-				samples[i] /= EXPANDER_UNAFFECTED;
+		/* NMT Doc 900-4 5.25: the reference level (unaffected level) is the level of the reference tone
+		 * (1 kHz, 3,0 kHz deviation), so the expander is neutral at 1.0, like the compressor of the
+		 * transmitter (4.25). The 2,2 dB of 5.25 apply to the bypassed expander only (the FFSK signalling,
+		 * 2,2 dB below the reference tone, then has the same level with and without the expander). */
+		if (nmt->compandor)
 			expand_audio(&nmt->cstate, samples, len);
-			for (i = 0; i < len; i++)
-				samples[i] *= EXPANDER_UNAFFECTED;
-		}
 		if (ld)
 			meter_add_bands(&ld->rx[RX_EXPANDER], samples, len, 0.0);
 		if (nmt->network_rx_gain != 1.0) {
