@@ -143,6 +143,15 @@ SINAD in dB; "two" is first / second channel.
 - A B210 a few metres away could not check this: the Pi 3's signal there was
   2 dB (463 MHz) and 33 dB (880 MHz) over its floor.
 
+NMT-450 with two phones on the Pi 3 (`-k 90 -k 91 -T CC -T TC -U 1`,
+465.225 / 465.250 MHz, drive level 7, RTL-SDR as receiver): both phones show
+the clock, both call the echo test on the second (traffic) channel,
+supervisory signal 80..99 % quality, about 1 core of 4 busy. Open: during
+calls the transmitter stalled three times for about 60 ms (10 underruns,
+10 ms of old samples); one phone keeps sending frames on the calling channel
+that do not decode (about 70 % quality, against 87 % on the traffic channel)
+and its calls start late.
+
 Channels lost to the PLL steps (computed with the same rules as the
 backend; 1 channel at 48 kS/s, 2 adjacent channels at 192 kS/s):
 
