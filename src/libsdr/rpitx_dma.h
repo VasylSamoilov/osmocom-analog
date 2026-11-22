@@ -41,12 +41,14 @@ int rpitx_dma_crosses_boundary(double frequency, double span, double *boundary);
 void rpitx_dma_write(const float *freq, const float *level, int num);
 
 /* Free FIFO space (samples) as seen from the DMA read position. The chain
- * ends at the last written sample (see rpitx_dma.cpp), so the DMA never runs
- * past it. */
+ * ends after the last written sample in a terminator that switches the pin
+ * off and stops the DMA (see rpitx_dma.cpp), so the DMA never runs past it.
+ * If it stopped there, this starts the transmission again. Call it from the
+ * writing thread only. */
 int rpitx_dma_free(void);
 
-/* How often the DMA reached the last written sample and held it (we were
- * late: an unmodulated carrier, no old signal). */
+/* How often the DMA reached the terminator while we were sending (we were
+ * late: a gap without carrier, no old signal). */
 long rpitx_dma_ran_dry(void);
 
 /* Size of the FIFO (samples). */

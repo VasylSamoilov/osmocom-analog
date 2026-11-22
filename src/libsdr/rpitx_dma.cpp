@@ -48,32 +48,41 @@
 
 #include "rpitx_dma.h"
 
+/* see "Start and end of a transmission" below */
+#define PCM_FIFO_DEPTH 64
+#define IDLE_CHUNK 1024
+
 /*
- * The chain ends where we stopped writing. librpitx closes the ring (the last
- * block points to the first), so when we are late the DMA goes round and
- * plays the signal of one ring ago, and GetBufferAvailable() ((DMA position -
- * last written slot) mod size) then reads "nearly full". Here the pacing block
- * of the slot written last points back to its own first block: the DMA
- * repeats that sample (holds the frequency, the pin stays as it is) until the
- * next sample is linked in. A new sample gets its self-loop first, then the
- * slot before is pointed at it. So the DMA never passes the writer: a stall
- * is a held carrier, never old signal, and the position is unambiguous
- * (DMA on the last written slot = nothing queued).
+ * The chain ends where we stopped writing, in a terminator. librpitx closes
+ * the ring (the last block points to the first): when we are late, the DMA
+ * goes round and plays the signal of one ring ago, and when the program is
+ * killed it goes on for ever with the carrier on. Here the pacing block of the
+ * slot written last points to a terminator, one block after the ring that
+ * switches GPIO4 to input and has no next block: the DMA plays out what we
+ * queued, switches the carrier off and stops. A new sample is pointed at the
+ * terminator first, then the slot before is pointed at the new sample.
+ *
+ * So the DMA never passes the writer (no old signal), a killed program leaves
+ * the carrier off, and a writer that is late gets a short gap without
+ * carrier. Then the transmission starts again like at the beginning (the pin
+ * set again, the lead, the DMA started at a quarter ring).
  */
 class keyed_fm_dma : public bufferdma, public clkgpio, public pcmgpio
 {
 	uint32_t fsel_on, fsel_off;
 	uint32_t samplerate;
 	bool last_on;
-	uint32_t pushed;	/* slot written last (librpitx's last_sample) */
-	bool dry;
+	uint32_t ring;		/* slots of the ring; slot "ring" is the terminator */
+	uint32_t pushed;	/* slot written last */
 
 public:
-	long ran_dry;		/* times the DMA reached the end and held */
+	long ran_dry;		/* times the DMA reached the terminator while we ran */
+
+	uint32_t ring_size(void) { return ring; }
 
 	keyed_fm_dma(uint64_t frequency, uint32_t rate, int channel, uint32_t fifo_size)
-		: bufferdma(channel, fifo_size, 2, 1), samplerate(rate), last_on(false),
-		  pushed(0), dry(false), ran_dry(0)
+		: bufferdma(channel, fifo_size + 1, 2, 1), samplerate(rate), last_on(false),
+		  ring(fifo_size), pushed(0), ran_dry(0)
 	{
 		uint32_t fsel;
 
@@ -104,22 +113,26 @@ public:
 	{
 		dma_cb_t *cbp = cbarray;
 
-		for (uint32_t s = 0; s < buffersize; s++) {
+		for (uint32_t s = 0; s < ring; s++) {
 			SetEasyCB(cbp++, s, dma_pllc_frac, 1);
 			SetEasyCB(cbp++, s, dma_pcm, 1);
 		}
 		cbp--;
 		cbp->next = mem_virt_to_phys(cbarray);
+		/* the terminator: pin to input, then nothing */
+		SetEasyCB(&cbarray[ring * 2], ring, dma_fsel, 1);
+		sampletab[ring] = fsel_off;
+		cbarray[ring * 2].next = 0;
 	}
 
-	/* one sample into the slot after the last one, see above */
+	/* one sample into a slot of the ring, the end of the chain, see above */
 	void set_sample(uint32_t index, float frequency, bool on)
 	{
 		dma_cb_t *cb;
 		uint32_t prev;
 
-		index %= buffersize;
-		prev = (index + buffersize - 1) % buffersize;
+		index %= ring;
+		prev = (index + ring - 1) % ring;
 		cb = &cbarray[index * 2];
 		if (on != last_on) {
 			cb->dst = dma_fsel;
@@ -129,8 +142,8 @@ public:
 			cb->dst = dma_pllc_frac;
 			sampletab[index] = (0x5A << 24) | GetMasterFrac(frequency);
 		}
-		/* the new end of the chain: its pacing block loops to itself */
-		cb[1].next = mem_virt_to_phys(&cbarray[index * 2]);
+		/* the new end of the chain goes to the terminator */
+		cb[1].next = mem_virt_to_phys(&cbarray[ring * 2]);
 		__sync_synchronize();
 		/* then the old end goes on to it */
 		cbarray[prev * 2 + 1].next = mem_virt_to_phys(&cbarray[index * 2]);
@@ -139,24 +152,50 @@ public:
 		pushed = index;
 	}
 
-	/* free slots: (DMA position - last written) mod size, the DMA cannot
-	 * be past the last written slot; on it, nothing is queued. One slot
-	 * stays free, the one the DMA is on. */
+	/* the DMA's slot, the terminator's being "ring" */
+	uint32_t dma_slot(void)
+	{
+		int p = getcbposition();
+
+		if (p < 0)
+			return ring;
+		return (uint32_t)(p / (int)(sizeof(dma_cb_t) * 2));
+	}
+
+	/* the beginning of a transmission, see rpitx_dma_open(): slot 0 and a
+	 * lead without carrier; librpitx starts the DMA at slot 0 when a
+	 * quarter of the ring is written */
+	void begin(void)
+	{
+		set_sample(0, 0.0f, false);
+		for (int i = 0; i < PCM_FIFO_DEPTH; i++)
+			set_sample(pushed + 1, 0.0f, false);
+	}
+
+	/* free slots. The DMA cannot be past the last written slot; on the
+	 * terminator nothing is queued. If it stopped there while we were
+	 * sending, start again (we were late: a gap without carrier). */
 	int free_slots(void)
 	{
-		int raw = GetBufferAvailable();
-		int n = (int)buffersize, fill;
+		uint32_t pos, fill;
 
 		if (!Started)
-			return raw;
-		fill = (n - raw) % n;
-		if (fill == 0) {
-			if (!dry)
-				ran_dry++;
-			dry = true;
-		} else
-			dry = false;
-		return n - 1 - fill;
+			return (int)ring - 1 - (int)pushed;
+		if (!isrunning()) {
+			ran_dry++;
+			/* the chunk that missed the terminator by a sample is not
+			 * played: drop it, start again as at the beginning */
+			stop();
+			last_on = false;
+			begin();
+			return (int)ring - 1 - (int)pushed;
+		}
+		pos = dma_slot();
+		if (pos >= ring)
+			fill = 0;
+		else
+			fill = (pushed + ring - pos) % ring;
+		return (int)(ring - 1 - fill);
 	}
 
 	/* blocks until all samples are in the ring, with ngfmdmasync's rule:
@@ -167,14 +206,24 @@ public:
 
 		while (done < num) {
 			avail = free_slots();
-			sleep_us = (int)(1e6 * ((int)buffersize * 3 / 4 - avail) / samplerate) - 200;
-			if (sleep_us > 0)
-				usleep(sleep_us);
-			avail = free_slots();
+			if (Started) {
+				sleep_us = (int)(1e6 * ((int)ring * 3 / 4 - avail) / samplerate) - 200;
+				if (sleep_us > 0)
+					usleep(sleep_us);
+				avail = free_slots();
+			}
 			n = (num - done < avail) ? num - done : avail;
 			for (i = 0; i < n; i++, done++)
 				set_sample(pushed + 1, freq[done], level[done] > 0.0f);
 		}
+	}
+
+	/* after the last samples: wait (bounded) for the DMA to stop at the
+	 * terminator */
+	void drain(void)
+	{
+		for (int i = 0; i < 100 && Started && isrunning(); i++)
+			usleep(2000);
 	}
 };
 
@@ -192,10 +241,9 @@ static keyed_fm_dma *tx = NULL;
  * The writes return when the samples are in the ring, not when they are
  * played. Stopping right away loses up to a quarter ring plus a block. So at
  * the end one ring of "carrier off" is queued, in two halves (a single write
- * of a whole ring would wrap before the DMA has started).
+ * of a whole ring would wrap before the DMA has started), and we wait for
+ * the DMA to stop at the terminator.
  */
-#define PCM_FIFO_DEPTH 64
-#define IDLE_CHUNK 1024
 
 static void write_idle(int num)
 {
@@ -220,8 +268,7 @@ extern "C" int rpitx_dma_open(double frequency, int samplerate, int fifo_size, i
 		padgpio pad;
 		pad.setlevel(pad_level);
 	}
-	tx->set_sample(0, 0.0f, false);
-	write_idle(PCM_FIFO_DEPTH);
+	tx->begin();
 
 	return 0;
 }
@@ -280,7 +327,7 @@ extern "C" int rpitx_dma_fifo_size(void)
 {
 	if (!tx)
 		return 0;
-	return (int)tx->buffersize;
+	return (int)tx->ring_size();
 }
 
 extern "C" int rpitx_dma_started(void)
@@ -304,8 +351,9 @@ extern "C" void rpitx_dma_close(void)
 		return;
 	/* play what is still queued, see above; this also starts a DMA that
 	 * never got a quarter of the ring, so a short transmission is sent */
-	write_idle(tx->buffersize / 2);
-	write_idle(tx->buffersize / 2);
+	write_idle(tx->ring_size() / 2);
+	write_idle(tx->ring_size() / 2);
+	tx->drain();
 	tx->stop();
 	/* the destructor switches the pin to input and the clock off */
 	delete tx;

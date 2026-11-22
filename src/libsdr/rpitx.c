@@ -99,6 +99,7 @@ static struct rpitx {
 	double		underrun_time;
 	long		underruns_total;
 	long		dry_reported;
+	long		dry_seen;
 } rt;
 
 static double get_time(void)
@@ -319,6 +320,7 @@ int rpitx_start(void)
 	rt.underrun_time = 0.0;
 	rt.underruns_total = 0;
 	rt.dry_reported = rpitx_dma_ran_dry();
+	rt.dry_seen = rt.dry_reported;
 	rt.running = 1;
 
 	/* the DMA itself starts when the FIFO is filled by a quarter */
@@ -377,9 +379,10 @@ static void report(double now)
 
 	if (dry != rt.dry_reported)
 		loglevel_ = LOGL_NOTICE;
-	/* an underrun is a hold now: the DMA repeats the last sample (an
-	 * unmodulated carrier) until we are back, it never plays old signal */
-	LOGP(DSDR, loglevel_, "rpitx: %.0f S/s (nominal %d), lowest FIFO fill %.1f ms, longest write %.1f ms, late %ld times (%.1f ms held), total %ld, DMA ran dry %ld times\n",
+	/* when we are late, the DMA stops at the end of what we wrote and
+	 * switches the carrier off, it never plays old signal; then the
+	 * transmission starts again */
+	LOGP(DSDR, loglevel_, "rpitx: %.0f S/s (nominal %d), lowest FIFO fill %.1f ms, longest write %.1f ms, late %ld times (%.1f ms), total %ld, DMA ran dry %ld times (carrier off, started again)\n",
 	     (double)rt.samples_report / elapsed, rt.samplerate,
 	     1000.0 * rt.min_fill / rt.samplerate, 1000.0 * rt.max_block,
 	     rt.underruns, 1000.0 * rt.underrun_time, rt.underruns_total,
@@ -446,6 +449,12 @@ int rpitx_send(float *buff, int num)
 	t1 = get_time();
 	if (t1 - t0 > rt.max_block)
 		rt.max_block = t1 - t0;
+	/* the DMA ran dry and started again: the fill before is void */
+	if (rpitx_dma_ran_dry() != rt.dry_seen) {
+		rt.dry_seen = rpitx_dma_ran_dry();
+		fill = -1;
+		rt.have_last = 0;
+	}
 	/* the same inside the write: what was in the FIFO plus what we wrote
 	 * must cover the time the write took (we may be stopped in between) */
 	if (fill >= 0) {
