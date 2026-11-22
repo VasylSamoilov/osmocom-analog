@@ -109,6 +109,51 @@ signal in a 16 kHz channel, so everything below that is "not seen", not
 Filter the output before any antenna, and check the 474..478 MHz lines with
 the Pi closer to the B210 or on a cable with an attenuator.
 
+## Bands on a Pi 3 (2026-11-22)
+
+Raspberry Pi 3 Model B, Raspberry Pi OS 13 32 bit, librpitx f01bdb6, set up as
+in `PI_SETUP.md`. Test tones (`twoch -J`, the backend's DMA chain, 192 kS/s,
+first channel 1000 Hz, second 1700 Hz at ratio 0.6), RTL-SDR next to the Pi.
+SINAD in dB; "two" is first / second channel.
+
+| system | carrier MHz | spacing | deviation | one | two |
+|---|---|---|---|---|---|
+| NMT-450 | 463.0125 | 25 kHz | 3 kHz | 43.9 | 42.1 / 35.7 |
+| NMT-450 Thailand/Indonesia | 490.0125 | 20 kHz | 2.4 kHz | 43.9 | 41.4 / 34.7 |
+| NMT-F (France, base at 440) | 442.0125 | 25 kHz | 3 kHz | 44.8 | 42.4 / 35.6 |
+| JTACS/NTACS | 865.00625 | 12.5 kHz | 2 kHz | 34.6 | 35.0 / 24.6 |
+| AMPS | 880.035 | 30 kHz | 3 kHz | 38.6 (41.0 with RTL gain 19.7) | 37.3 / 26.8 |
+| ETACS | 925.0125 | 25 kHz | 3 kHz | 39.0 | 37.4 / 26.5 |
+| TACS | 942.5125 | 25 kHz | 3 kHz | 39.2 | 38.4 / 26.7 |
+| NMT-900 | 947.5125 | 25 kHz | 3 kHz | 39.1 | 38.2 / 26.7 |
+| NMT-900, top | 959.0125 | 25 kHz | 3 kHz | 37.8 | 37.1 / 26.5 |
+
+- Below 750 MHz the Pi 3 sends two channels much cleaner than the Pi 4
+  (second channel 35 dB against 24 dB on the Pi 4 at 463 MHz).
+- Above 750 MHz (PLL at twice the carrier) the second channel stays near
+  27 dB whatever the RTL gain (0.9 .. 29.7 dB: 26.7 .. 27.6), so it is the
+  transmitter. That is about the quality NMT ran with on the Pi 4.
+- JTACS: 12.5 kHz spacing and the 8 kHz wide SINAD filter overlap, the
+  second channel figure is pessimistic.
+- A B210 a few metres away could not check this: the Pi 3's signal there was
+  2 dB (463 MHz) and 33 dB (880 MHz) over its floor.
+
+Channels lost to the PLL steps (computed with the same rules as the
+backend; 1 channel at 48 kS/s, 2 adjacent channels at 192 kS/s):
+
+| system | Pi 3 | Pi 4 |
+|---|---|---|
+| NMT-450 (all plans), NMT-450 Thailand | none | none |
+| NMT-F 440..444.5 | 1 / 8 of 178 (441.6 MHz) | none |
+| NMT-900 935..960 | 1 / 3 (960.0) | 2 / 7 (945.0) |
+| AMPS 869..894 | 1 / 6 (883.2) | 1 / 6 (891.0) |
+| TACS 935..950 | none | 2 / 7 (945.0) |
+| ETACS ext. 917..935 | 2 / 7 (921.6) | 2 / 7 (918.0) |
+| JTACS/NTACS 860..870 | none | 3 / 16 (864.0) |
+
+(one channel / two channels refused.) Everything else in these bands is
+possible on both boards.
+
 ## Build on the Pi
 
 ```sh
