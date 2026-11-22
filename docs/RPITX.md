@@ -185,8 +185,11 @@ network. On 353 or 354 the phones showed "No Service", from the Pi and from
 a USRP alike. The cause was not the transmitter: the fork broadcast N-1 = 0
 (the number of started control channels), and a phone takes only the first
 N dedicated control channels from 334 (B) / 333 (A) as paging channels.
-Fixed: N-1 = CMAX-1 = 20 again, as upstream. Not tried yet: the call on a
-voice channel (`-k 354 -k 355 -T CC/PC -T VC`). `--headless` cannot be
+Fixed: N-1 = CMAX-1 = 20 again, as upstream. Then two channels on the one
+carrier, `-k 354 -T CC/PC -k 355 -T VC -S sid=54 -e -s 96000 --fast-math`
+(880.620 + 880.650 MHz): both phones found the network, a call went to the
+voice channel 355 (the weaker, keyed one), SAT quality 99, signaling tone
+100, "wonderful sound quality", 0 late writes. `--headless` cannot be
 combined with the echo test (`-e`): headless means the Osmo-CC socket.
 
 Channels lost to the PLL steps (computed with the same rules as the
