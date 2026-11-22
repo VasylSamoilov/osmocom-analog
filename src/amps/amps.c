@@ -4565,6 +4565,13 @@ void transaction_timeout(void *data)
 			amps_go_idle(amps);
 			break;
 		}
+		/* With SAT present it is not the fade timer but the wait for
+		 * the reply to an order sent during the call (e.g. Send
+		 * Called-Address after a flash): no reply, the call goes on */
+		if (trans->sat_detected) {
+			LOGP_CHAN(DAMPS, LOGL_NOTICE, "No reply from the mobile to the order sent during the call, the call continues.\n");
+			break;
+		}
 		/* Otherwise this is SAT timeout */
 		LOGP_CHAN(DAMPS, LOGL_NOTICE, "Timeout after %ld seconds loosing SAT signal.\n", trans->timer.timeout.tv_sec);
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Release call towards network.\n");
