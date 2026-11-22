@@ -1618,18 +1618,22 @@ static void *sdr_read_child(void *arg)
 					}
 				}
 
+				/* copy is the number of samples still to copy into the
+				 * ring; count stays as received (the loop end sleeps
+				 * when count <= 0) */
+				int copy = count;
 				if (rx_filter && sdr->thread_read.hb_stages) {
 					in = sdr_halfband_decim(&sdr->thread_read, sdr->thread_read.buffer2, count, in, rx_os);
-					count = 0;	/* written above */
+					copy = 0;	/* written above */
 				}
 #ifndef DISABLE_FILTER
-				if (rx_filter && count) {
-					iir_process_baseband(&sdr->thread_read.lp[0], sdr->thread_read.buffer2, count);
-					iir_process_baseband(&sdr->thread_read.lp[1], sdr->thread_read.buffer2 + 1, count);
+				if (rx_filter && copy) {
+					iir_process_baseband(&sdr->thread_read.lp[0], sdr->thread_read.buffer2, copy);
+					iir_process_baseband(&sdr->thread_read.lp[1], sdr->thread_read.buffer2 + 1, copy);
 				}
 #endif
 				(void)rx_filter;
-				for (s = 0, ss = 0; s < count; s++) {
+				for (s = 0, ss = 0; s < copy; s++) {
 					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];
 					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];
 					in %= sdr->thread_read.buffer_size;
