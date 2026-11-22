@@ -93,7 +93,76 @@ typedef struct sdr_thread {
 	int max_fill;			/* measure maximum buffer fill */
 	double max_fill_timer;		/* timer to display/reset maximum fill */
 	iir_filter_t lp[2];		/* filter for upsample/downsample IQ data */
+	int hb_stages;			/* > 0: halfband x2 cascade instead of the IIR */
+	halfband_t hb[8];
 } sdr_thread_t;
+
+/* Integer rate change by 2^k: a cascade of halfband x2 stages (order 48:
+ * flat to 0.4 of the DSP rate, images/aliases -80 dB, cheaper than the IIR
+ * on RX). Returns k, or 0 for other factors (IIR as before). */
+#define SDR_HALFBAND_ORDER	HALFBAND_ORDER_48
+static int sdr_halfband_stages(int os)
+{
+	int k = 0;
+
+	while ((1 << k) < os && k < 8)
+		k++;
+	return ((1 << k) == os) ? k : 0;
+}
+
+static int sdr_halfband_init(sdr_thread_t *t, int os, const char *dir)
+{
+	int k = sdr_halfband_stages(os), s;
+
+	t->hb_stages = 0;
+	for (s = 0; s < k; s++) {
+		if (halfband_init(&t->hb[s], SDR_HALFBAND_ORDER, HALFBAND_CENTER, 0) < 0)
+			return -1;
+		t->hb_stages = s + 1;
+	}
+	if (k)
+		LOGP(DSDR, LOGL_INFO, "%s: rate x%d with %d halfband stage(s)\n", dir, os, k);
+	return 0;
+}
+
+/* TX: one DSP sample -> 2^stages SDR samples (interleaved float) */
+static void sdr_halfband_interp(halfband_t *hb, int stage, int stages, double i, double q, float **out)
+{
+	sample_t oi[2], oq[2];
+
+	if (stage == stages) {
+		*(*out)++ = i;
+		*(*out)++ = q;
+		return;
+	}
+	halfband_interp2(&hb[stage], i, q, oi, oq);
+	sdr_halfband_interp(hb, stage + 1, stages, oi[0], oq[0], out);
+	sdr_halfband_interp(hb, stage + 1, stages, oi[1], oq[1], out);
+}
+
+/* RX: n SDR samples -> ring buffer at DSP rate. Each decimated sample is
+ * written os times, so sdr_read(), which takes every os-th sample of the
+ * ring, gets it whatever the phase. Returns the new ring in pointer. */
+static int sdr_halfband_decim(sdr_thread_t *t, const float *buf, int n, int in, int os)
+{
+	int s, st, o;
+
+	for (s = 0; s < n; s++) {
+		sample_t si = buf[2 * s], sq = buf[2 * s + 1];
+
+		for (st = 0; st < t->hb_stages; st++)
+			if (!halfband_process(&t->hb[st], &si, &sq))
+				break;
+		if (st < t->hb_stages)
+			continue;
+		for (o = 0; o < os; o++) {
+			t->buffer[in++] = si;
+			t->buffer[in++] = sq;
+			in %= t->buffer_size;
+		}
+	}
+	return in;
+}
 
 typedef struct sdr_chan {
 	double		tx_frequency;	/* frequency used */
@@ -419,6 +488,8 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				int rx_rate = sdr_config->split_mode ? sdr_config->rx_samplerate : sdr_config->samplerate;
 				iir_lowpass_init(&sdr->thread_read.lp[0], samplerate / 2.0, rx_rate, 2);
 				iir_lowpass_init(&sdr->thread_read.lp[1], samplerate / 2.0, rx_rate, 2);
+				if (sdr_halfband_init(&sdr->thread_read, sdr->rx_oversample, "RX") < 0)
+					goto error;
 			}
 		} else {
 			LOGP(DSDR, LOGL_INFO, "Skipping RX buffer allocation (TX-only mode)\n");
@@ -461,6 +532,8 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				int tx_rate = sdr_config->split_mode ? sdr_config->tx_samplerate : sdr_config->samplerate;
 				iir_lowpass_init(&sdr->thread_write.lp[0], samplerate / 2.0, tx_rate, 2);
 				iir_lowpass_init(&sdr->thread_write.lp[1], samplerate / 2.0, tx_rate, 2);
+				if (sdr_halfband_init(&sdr->thread_write, sdr->tx_oversample, "TX") < 0)
+					goto error;
 			}
 		} else {
 			LOGP(DSDR, LOGL_INFO, "Skipping TX buffer allocation (RX-only mode)\n");
@@ -1309,6 +1382,17 @@ static void *sdr_write_child(void *arg)
 				sdr->thread_write.buffer2[s * 2] = out_i[s];
 				sdr->thread_write.buffer2[s * 2 + 1] = out_q[s];
 			}
+		} else if (sdr->thread_write.hb_stages && tx_os > 1) {
+			/* Integer 2^k: halfband interpolator cascade */
+			float *o = sdr->thread_write.buffer2;
+			for (s = 0; s < num; s++) {
+				sdr_halfband_interp(sdr->thread_write.hb, 0, sdr->thread_write.hb_stages,
+				                    sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL,
+				                    sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL, &o);
+				out = (out + 2) % sdr->thread_write.buffer_size;
+			}
+			sdr->thread_write.out = out;
+			out_samples = num * tx_os;
 		} else {
 			/* Legacy path: zero-order hold interpolation + IIR filter */
 			static int tx_upsample_logged = 0;
@@ -1504,6 +1588,11 @@ static void *sdr_read_child(void *arg)
 							int n = (fill_n > 512) ? 512 : (int)fill_n;
 
 							memset(z, 0, sizeof(float) * n * 2);
+							if (rx_filter && sdr->thread_read.hb_stages) {
+								in = sdr_halfband_decim(&sdr->thread_read, z, n, in, rx_os);
+								fill_n -= n;
+								continue;
+							}
 #ifndef DISABLE_FILTER
 							if (rx_filter) {
 								iir_process_baseband(&sdr->thread_read.lp[0], z, n);
@@ -1520,8 +1609,12 @@ static void *sdr_read_child(void *arg)
 					}
 				}
 
+				if (rx_filter && sdr->thread_read.hb_stages) {
+					in = sdr_halfband_decim(&sdr->thread_read, sdr->thread_read.buffer2, count, in, rx_os);
+					count = 0;	/* written above */
+				}
 #ifndef DISABLE_FILTER
-				if (rx_filter) {
+				if (rx_filter && count) {
 					iir_process_baseband(&sdr->thread_read.lp[0], sdr->thread_read.buffer2, count);
 					iir_process_baseband(&sdr->thread_read.lp[1], sdr->thread_read.buffer2 + 1, count);
 				}

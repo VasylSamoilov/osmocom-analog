@@ -430,6 +430,46 @@ static int interpolate_upper(halfband_t *hb, sample_t in_i, sample_t in_q,
 	return need_new;
 }
 
+/*
+ * 2x interpolation in polyphase form.
+ *
+ * Zero-stuffing the input and filtering with the halfband h (gain 2,
+ * centre at delay L-1 output samples, L = order/2) gives two outputs
+ * per input x[m], in time order:
+ *   out[0] = 2 * sum c_j * (x[m - (L-1-d_j)/2] + x[m - (L-1+d_j)/2])
+ *   out[1] = x[m - (L-2)/2]                     (centre tap 0.5 * 2)
+ * with d_j = odd tap distance 2*(n-j)-1. out[0] lies between
+ * x[m - L/2] and x[m - (L-2)/2]. The window of L input samples is
+ * stored twice (no wrap on reads).
+ */
+void halfband_interp2(halfband_t *hb, sample_t in_i, sample_t in_q,
+                      sample_t out_i[2], sample_t out_q[2])
+{
+	int L = hb->order / 2, n = hb->num_coeffs, j;
+	double *bi = hb->buf_i_d, *bq = hb->buf_q_d;
+	double acc_i = 0.0, acc_q = 0.0;
+
+	/* newest sample at window end: w[L-1] = x[m], w[0] = x[m-L+1] */
+	bi[hb->ptr] = bi[hb->ptr + L] = in_i;
+	bq[hb->ptr] = bq[hb->ptr + L] = in_q;
+	if (++hb->ptr == L)
+		hb->ptr = 0;
+	const double *wi = bi + hb->ptr, *wq = bq + hb->ptr;
+
+	/* x[m - k] = w[L-1-k] */
+	for (j = 0; j < n; j++) {
+		int d = 2 * (n - j) - 1;
+		int a = L - 1 - (L - 1 - d) / 2;	/* x[m - (L-1-d)/2] */
+		int b = L - 1 - (L - 1 + d) / 2;	/* x[m - (L-1+d)/2] */
+		acc_i += (wi[a] + wi[b]) * hb->coeffs_d[j];
+		acc_q += (wq[a] + wq[b]) * hb->coeffs_d[j];
+	}
+	out_i[0] = 2.0 * acc_i;
+	out_q[0] = 2.0 * acc_q;
+	out_i[1] = wi[L - 1 - (L - 2) / 2];
+	out_q[1] = wq[L - 1 - (L - 2) / 2];
+}
+
 /* Interpolate one IQ sample pair (2x upsample) */
 int halfband_interpolate(halfband_t *hb, sample_t in_i, sample_t in_q,
                          sample_t *out_i, sample_t *out_q)

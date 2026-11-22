@@ -81,5 +81,13 @@ int halfband_process(halfband_t *hb, sample_t *i, sample_t *q);
 int halfband_interpolate(halfband_t *hb, sample_t in_i, sample_t in_q,
                          sample_t *out_i, sample_t *out_q);
 
+/* 2x interpolation, polyphase form (CENTER mode, double precision).
+ * One input sample gives two output samples at twice the rate: the
+ * delayed input (centre tap phase) and the odd-tap FIR phase. Passband
+ * flat to 0.2, stopband from 0.3 of the output rate. Delay is
+ * order/2 output samples. Use a halfband_t of its own for this. */
+void halfband_interp2(halfband_t *hb, sample_t in_i, sample_t in_q,
+                      sample_t out_i[2], sample_t out_q[2]);
+
 #endif /* _HALFBAND_H */
 
