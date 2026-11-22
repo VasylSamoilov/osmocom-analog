@@ -94,6 +94,7 @@ void tx_limiter_reset(tx_limiter_t *l)
 	memset(l->estate.p.lp.z1, 0, sizeof(l->estate.p.lp.z1));
 	memset(l->estate.p.lp.z2, 0, sizeof(l->estate.p.lp.z2));
 	l->estate.p.x_last = 0.0;
+	l->estate.p.sx = l->estate.p.sy = 0.0;
 }
 
 void tx_limiter_process(tx_limiter_t *l, sample_t *samples, int length)

@@ -107,10 +107,38 @@ int init_emphasis(emphasis_t *state, int samplerate, double cut_off, double cut_
 	return 0;
 }
 
+void emphasis_set_shelf(emphasis_t *state, int samplerate, double cut_off, double high_freq)
+{
+	/* H(s) = (s + wl) / (s + wh), bilinear transform, normalized to 0 dB at 1 kHz */
+	double K = 2.0 * (double)samplerate, wl = 2.0 * PI * cut_off, wh = 2.0 * PI * high_freq;
+	double w = 2.0 * PI * 1000.0, g1k = sqrt(w * w + wl * wl) / sqrt(w * w + wh * wh);
+	double a0 = K + wh;
+
+	state->p.sb0 = (K + wl) / a0 / g1k;
+	state->p.sb1 = (wl - K) / a0 / g1k;
+	state->p.sa1 = (wh - K) / a0;
+	state->p.sx = state->p.sy = 0.0;
+	state->p.shelf = 1;
+}
+
 void pre_emphasis(emphasis_t *state, sample_t *samples, int num)
 {
 	double x, y, x_last, factor, amp;
 	int i;
+
+	if (state->p.shelf) {
+		double b0 = state->p.sb0, b1 = state->p.sb1, a1 = state->p.sa1, sx = state->p.sx, sy = state->p.sy;
+
+		for (i = 0; i < num; i++) {
+			x = samples[i];
+			sy = b0 * x + b1 * sx - a1 * sy;
+			sx = x;
+			samples[i] = sy;
+		}
+		state->p.sx = sx;
+		state->p.sy = sy;
+		return;
+	}
 
 	iir_process(&state->p.lp, samples, num);
 

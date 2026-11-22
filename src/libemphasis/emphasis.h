@@ -6,6 +6,10 @@ typedef struct emphasis {
 		double x_last;
 		double factor;
 		double amp;
+		/* optional shelf instead of the above (emphasis_set_shelf) */
+		int shelf;
+		double sb0, sb1, sa1;	/* first order section */
+		double sx, sy;		/* its state */
 	} p;
 	struct {
 		iir_filter_t hp;
@@ -23,6 +27,8 @@ typedef struct emphasis {
 double timeconstant2cutoff(double time_constant_us);
 int init_emphasis(emphasis_t *state, int samplerate, double cut_off, double cut_off_h, double cut_off_l);
 void pre_emphasis(emphasis_t *state, sample_t *samples, int num);
+/* pre-emphasis as a first order shelf: +6 dB/octave from cut_off, flat above high_freq, 0 dB at 1 kHz */
+void emphasis_set_shelf(emphasis_t *state, int samplerate, double cut_off, double high_freq);
 void de_emphasis(emphasis_t *state, sample_t *samples, int num);
 void dc_filter(emphasis_t *state, sample_t *samples, int num);
 
