@@ -98,6 +98,7 @@ static struct rpitx {
 	long		underruns;
 	double		underrun_time;
 	long		underruns_total;
+	long		resyncs_reported;
 } rt;
 
 static double get_time(void)
@@ -317,6 +318,7 @@ int rpitx_start(void)
 	rt.underruns = 0;
 	rt.underrun_time = 0.0;
 	rt.underruns_total = 0;
+	rt.resyncs_reported = rpitx_dma_resyncs();
 	rt.running = 1;
 
 	/* the DMA itself starts when the FIFO is filled by a quarter */
@@ -371,10 +373,16 @@ static void report(double now)
 	double elapsed = now - rt.t_report;
 	int loglevel_ = (rt.underruns) ? LOGL_NOTICE : LOGL_INFO;
 
-	LOGP(DSDR, loglevel_, "rpitx: %.0f S/s (nominal %d), lowest FIFO fill %.1f ms, longest write %.1f ms, underruns %ld (%.1f ms), total underruns %ld\n",
+	long resyncs = rpitx_dma_resyncs();
+
+	if (resyncs != rt.resyncs_reported)
+		loglevel_ = LOGL_NOTICE;
+	LOGP(DSDR, loglevel_, "rpitx: %.0f S/s (nominal %d), lowest FIFO fill %.1f ms, longest write %.1f ms, underruns %ld (%.1f ms), total underruns %ld, resyncs %ld\n",
 	     (double)rt.samples_report / elapsed, rt.samplerate,
 	     1000.0 * rt.min_fill / rt.samplerate, 1000.0 * rt.max_block,
-	     rt.underruns, 1000.0 * rt.underrun_time, rt.underruns_total);
+	     rt.underruns, 1000.0 * rt.underrun_time, rt.underruns_total,
+	     resyncs - rt.resyncs_reported);
+	rt.resyncs_reported = resyncs;
 	rt.t_report = now;
 	rt.samples_report = 0;
 	rt.min_fill = rt.fifo;

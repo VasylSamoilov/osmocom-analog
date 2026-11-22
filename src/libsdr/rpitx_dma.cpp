@@ -48,15 +48,46 @@
 
 #include "rpitx_dma.h"
 
+static double mono_time(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/*
+ * Fill level. librpitx's GetBufferAvailable() is (DMA position - last written
+ * slot) mod ring size. When we are late and the DMA overtakes the last
+ * written slot, that reads "nearly full", the write would sleep up to 3/4 of
+ * the ring "for room" while the DMA plays old signal, and one short delay
+ * turns into a whole ring of old signal. So we keep the fill ourselves: the
+ * DMA's advance between two polls (the wall clock tells how many whole rings
+ * it went round), minus what it played, plus what we wrote. When it has run
+ * past what we wrote, we jump the write position a short lead ahead of the DMA
+ * (a resync) instead of waiting.
+ */
+#define RESYNC_LEAD_DIV 8	/* lead after a resync: 1/8 ring (10 ms at 80 ms) */
+
 class keyed_fm_dma : public bufferdma, public clkgpio, public pcmgpio
 {
 	uint32_t fsel_on, fsel_off;
 	uint32_t samplerate;
 	bool last_on;
+	uint32_t wr_last;	/* the next write goes to wr_last + 1 */
+	uint32_t pushed;	/* slot last given to PushSample (librpitx's last_sample) */
+	long fill;		/* samples written and not played yet */
+	bool tracking;
+	uint32_t prev_pos;
+	double prev_t;
+	bool rekey;		/* write the pin function on the next sample */
 
 public:
+	long resyncs;
+
 	keyed_fm_dma(uint64_t frequency, uint32_t rate, int channel, uint32_t fifo_size)
-		: bufferdma(channel, fifo_size, 2, 1), samplerate(rate), last_on(false)
+		: bufferdma(channel, fifo_size, 2, 1), samplerate(rate), last_on(false),
+		  wr_last(0), pushed(0), fill(0), tracking(false), prev_pos(0), prev_t(0.0), rekey(false), resyncs(0)
 	{
 		uint32_t fsel;
 
@@ -102,7 +133,10 @@ public:
 
 		index %= buffersize;
 		cb = &cbarray[index * 2];
-		if (on != last_on) {
+		if (on != last_on || rekey) {
+			/* after a resync the slots just played may have switched the
+			 * pin: set it again */
+			rekey = false;
 			cb->dst = dma_fsel;
 			sampletab[index] = on ? fsel_on : fsel_off;
 			last_on = on;
@@ -111,24 +145,67 @@ public:
 			sampletab[index] = (0x5A << 24) | GetMasterFrac(frequency);
 		}
 		PushSample(index);
+		wr_last = index;
+		pushed = index;
+	}
+
+	/* free slots, see "Fill level" above; resyncs if the DMA ran past us */
+	int free_slots(void)
+	{
+		int raw = GetBufferAvailable();
+		long n = (long)buffersize, adv;
+		uint32_t pos;
+		double now, est;
+
+		if (!Started) {
+			tracking = false;
+			return raw;
+		}
+		pos = (uint32_t)((pushed + (uint32_t)raw) % buffersize);
+		now = mono_time();
+		if (!tracking) {
+			tracking = true;
+			fill = n - raw;
+		} else {
+			adv = ((long)pos - (long)prev_pos + n) % n;
+			/* more than half a ring more than the position says: it
+			 * went round whole rings in between */
+			est = (now - prev_t) * samplerate;
+			while ((double)adv + (double)n / 2.0 < est)
+				adv += n;
+			fill -= adv;
+		}
+		prev_pos = pos;
+		prev_t = now;
+		if (fill <= 0) {
+			long lead = n / RESYNC_LEAD_DIV;
+
+			/* the next write goes a lead ahead of the DMA */
+			wr_last = (uint32_t)(((long)pos + lead - 1 + n) % n);
+			fill = lead;
+			rekey = true;
+			resyncs++;
+		}
+		return (int)(n - fill - 1);
 	}
 
 	/* blocks until all samples are in the ring, with ngfmdmasync's rule:
 	 * sleep until 3/4 of the ring is free, then write what fits */
 	void set_samples(const float *freq, const float *level, int num)
 	{
-		int done = 0, avail, index, n, i, sleep_us;
+		int done = 0, avail, n, i, sleep_us;
 
 		while (done < num) {
-			avail = GetBufferAvailable();
+			avail = free_slots();
 			sleep_us = (int)(1e6 * ((int)buffersize * 3 / 4 - avail) / samplerate) - 200;
 			if (sleep_us > 0)
 				usleep(sleep_us);
-			avail = GetBufferAvailable();
-			index = GetUserMemIndex();
+			avail = free_slots();
 			n = (num - done < avail) ? num - done : avail;
 			for (i = 0; i < n; i++, done++)
-				set_sample(index + i, freq[done], level[done] > 0.0f);
+				set_sample(wr_last + 1, freq[done], level[done] > 0.0f);
+			if (Started)
+				fill += n;
 		}
 	}
 };
@@ -221,7 +298,14 @@ extern "C" int rpitx_dma_free(void)
 {
 	if (!tx)
 		return 0;
-	return tx->GetBufferAvailable();
+	return tx->free_slots();
+}
+
+extern "C" long rpitx_dma_resyncs(void)
+{
+	if (!tx)
+		return 0;
+	return tx->resyncs;
 }
 
 extern "C" int rpitx_dma_fifo_size(void)
