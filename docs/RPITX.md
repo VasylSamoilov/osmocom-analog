@@ -58,6 +58,11 @@ stalls while starting does not leave a carrier on air.
 With `timeout` in a terminal use `timeout --foreground`: plain `timeout` runs
 the program in a background process group, the program is stopped (state `T`)
 when it sets up the terminal for its console, and it never feeds the DMA.
+The same happens with sudo 1.9.16 (Raspberry Pi OS 13), which runs the
+command in a pseudo terminal of its own: `sudo nmt ... | tee log` stops nmt.
+Put the pipe inside: `sudo sh -c "nmt ... 2>&1 | tee log"`, or use
+`--headless`. The pin stays off in that case (nothing is sent), but the
+stopped process only goes with `kill -9`.
 
 ## Measured on a Pi 4 (2026-11-21)
 
