@@ -76,6 +76,7 @@ static int echo_analysis = 0;
 static int echo_analysis_duration = 10;
 static int use_osmocc_cross = 0;
 static int use_osmocc_sock = 0;
+static int headless = 0;	/* no terminal: no keyboard, no banner, no displays */
 #define MAX_CC_ARGS 1024
 static int cc_argc = 0;
 static const char *cc_argv[MAX_CC_ARGS];
@@ -429,6 +430,10 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        use one combined control+voice channel and one voice channels.\n");
 	printf(" -o --osmocc-sock\n");
 	printf("        Disable built-in call control and offer socket\n");
+	printf("    --headless\n");
+	printf("        Run without terminal: no keyboard, no banner, no displays, the\n");
+	printf("        terminal is left as it is (for services, scripts, 'timeout').\n");
+	printf("        Implies '-o': calls go through the OSMO-CC socket.\n");
 	printf("    --cc \"<osmo-cc arg>\" [--cc ...]\n");
 	printf("        Pass arguments to Osmo-CC endpoint. Use '-cc help' for description.\n");
 	printf("    --no-l16\n");
@@ -547,6 +552,7 @@ void main_mobile_print_hotkeys(void)
 #define	OPT_ECHO_DELAY		2005
 #define	OPT_ECHO_ANALYSIS	2006
 #define	OPT_ECHO_ANALYSIS_DURATION	2007
+#define	OPT_HEADLESS		2008
 
 void main_mobile_add_options(void)
 {
@@ -565,6 +571,7 @@ void main_mobile_add_options(void)
 	option_add('e', "echo-test", 0);
 	option_add('x', "osmocc-cross", 0);
 	option_add('o', "osmocc-sock", 0);
+	option_add(OPT_HEADLESS, "headless", 0);
 	option_add(OPT_OSMO_CC, "cc", 1);
 	option_add(OPT_NO_L16, "no-l16", 0);
 	option_add('c', "call-device", 1);
@@ -664,6 +671,9 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		break;
 	case 'o':
 		use_osmocc_sock = 1;
+		break;
+	case OPT_HEADLESS:
+		headless = 1;
 		break;
 	case OPT_OSMO_CC:
 		if (!strcasecmp(argv[argi], "help")) {
@@ -838,7 +848,7 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	int num_chan, i;
 	int c;
 	int rc;
-	int batch;
+	int batch, no_tty;
 
 	if (!got_init) {
 		fprintf(stderr, "main_mobile_init was not called, please fix!\n");
@@ -851,6 +861,11 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 
 	/* size of dsp buffer in samples */
 	buffer_size = dsp_samplerate * dsp_buffer / 1000;
+
+	/* headless: no console, calls go through the socket (or the built-in
+	 * forwarding between mobiles) */
+	if (headless && !use_osmocc_cross)
+		use_osmocc_sock = 1;
 
 	/* check OSMO-CC support */
 	if (use_osmocc_cross && num_kanal == 1) {
@@ -932,6 +947,8 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	/* the WAV files (IQ and audio) wait instead of dropping samples */
 	if (batch)
 		wave_set_blocking(1);
+	/* no terminal use (keyboard, banner, displays) */
+	no_tty = batch || headless;
 
 	/* init OSMO-CC */
 	if (!use_osmocc_sock)
@@ -973,11 +990,11 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		}
 	}
 
-	if (!loopback && !batch)
+	if (!loopback && !no_tty)
 		print_aaimage();
 
-	/* prepare terminal (not in batch: no keyboard) */
-	if (!batch) {
+	/* prepare terminal (not in batch or headless: no keyboard) */
+	if (!no_tty) {
 		tcgetattr(0, &term_orig);
 		term = term_orig;
 		term.c_lflag &= ~(ISIG|ICANON|ECHO);
@@ -1026,7 +1043,7 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		}
 
 next_char:
-		c = (batch) ? -1 : get_char();
+		c = (no_tty) ? -1 : get_char();
 		switch (c) {
 		case 3:
 			/* quit */
@@ -1113,7 +1130,7 @@ next_char:
 		if (myhandler)
 			myhandler();
 
-		if (!batch)
+		if (!no_tty)
 			display_measurements(dsp_interval / 1000.0);
 
 		now = get_time();
@@ -1152,7 +1169,7 @@ next_char:
 	}
 
 	/* reset terminal */
-	if (!batch)
+	if (!no_tty)
 		tcsetattr(0, TCSANOW, &term_orig);
 
 	/* reset real time prio */
