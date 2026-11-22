@@ -60,8 +60,7 @@ extern double network_rx_gain_db;
 #define SPEECH_DEVIATION	3000.0	/* deviation of speech at 1 kHz */
 #define TX_PEAK_FSK		(4200.0 / 1800.0 * 1000.0 / SPEECH_DEVIATION)
 #define TX_PEAK_SUPER		(300.0 / 4015.0 * 1000.0 / SPEECH_DEVIATION)
-/* transmitted speech: pre-emphasis flat above this frequency, gain before the compressor (-7 dB) */
-#define TX_EMPHASIS_FLAT_HZ	3000.0
+/* transmitted speech: gain before the compressor (-7 dB) */
 #define TX_SPEECH_GAIN		0.4467
 /* noise gate of the received audio (normalized, 1.0 = reference), the threshold of AMPS */
 #define RX_NOISE_GATE		0.10
@@ -221,13 +220,6 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 	sample_t *spl;
 	int i;
 
-	/* Pre-emphasis as a first order shelf, +6 dB/octave from 300 Hz, flat above 3000 Hz, 0 dB at 1 kHz
-	 * (NMT Doc 900-4 4.14: 6 dB/octave 300..3400 Hz, +1/-3 dB; the shelf is -0,5 dB at 3400 Hz). The
-	 * default emphasis adds a 3400 Hz low pass of two peaking sections that raised the speech peaks: with
-	 * recorded speech offline 0,374 % of the samples went over the limiter threshold, with the shelf
-	 * 0,135 %. The limiter and the supervisory calibration use a copy of this state. */
-	if (nmt->sender.pre_emphasis)
-		emphasis_set_shelf(&nmt->sender.estate, nmt->sender.samplerate, 300.0, TX_EMPHASIS_FLAT_HZ);
 
 	/* attack (3ms) and recovery time (13.5ms) according to NMT specs */
 	setup_compandor(&nmt->cstate, 8000, 3.0, 13.5);
@@ -867,9 +859,9 @@ again:
 			call_echo_suppressor_tx(nmt->trans->callref, samples, input_num);
 		/* NMT has 3,9 dB from the 3,0 kHz reference to the 4,7 kHz maximum deviation (AMPS 12,3 dB): normal
 		 * speech from the network, compressed and pre-emphasized, reached the limiter 11 times per second
-		 * and each limiting was audible. Speech is lowered before the compressor so it stays below: with
-		 * the shelf above, on air with recorded speech, limiter interventions per second 11 -> 0 (median),
-		 * peak deviation 4,3 -> 3,7 kHz. */
+		 * and each limiting was audible. Speech is lowered before the compressor so it stays below
+		 * (offline, recorded speech, standard emphasis: 10 ms blocks over the threshold 87 -> 2 of 1604).
+		 * Provisional: to be replaced by the level plan derived from the standard. */
 		{
 			int k;
 
