@@ -362,6 +362,14 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 		}
 
 		if (rx_gain) {
+			/* a given gain is a fixed gain: switch automatic gain off, the
+			 * driver's default may be automatic (RTL-SDR) */
+			if (SoapySDRDevice_hasGainMode(inst->sdr, SOAPY_SDR_RX, channel)) {
+				if (SoapySDRDevice_setGainMode(inst->sdr, SOAPY_SDR_RX, channel, false) != 0)
+					LOGP(DSOAPY, LOGL_NOTICE, "Failed to switch automatic RX gain off\n");
+				else
+					LOGP(DSOAPY, LOGL_INFO, "Automatic RX gain is off, the gain is fixed\n");
+			}
 			/* set gain */
 			if (SoapySDRDevice_setGain(inst->sdr, SOAPY_SDR_RX, channel, rx_gain) != 0) {
 				LOGP(DSOAPY, LOGL_ERROR, "Failed to set RX gain to %.0f\n", rx_gain);
