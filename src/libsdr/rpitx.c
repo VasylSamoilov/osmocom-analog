@@ -98,7 +98,7 @@ static struct rpitx {
 	long		underruns;
 	double		underrun_time;
 	long		underruns_total;
-	long		resyncs_reported;
+	long		dry_reported;
 } rt;
 
 static double get_time(void)
@@ -318,7 +318,7 @@ int rpitx_start(void)
 	rt.underruns = 0;
 	rt.underrun_time = 0.0;
 	rt.underruns_total = 0;
-	rt.resyncs_reported = rpitx_dma_resyncs();
+	rt.dry_reported = rpitx_dma_ran_dry();
 	rt.running = 1;
 
 	/* the DMA itself starts when the FIFO is filled by a quarter */
@@ -373,16 +373,18 @@ static void report(double now)
 	double elapsed = now - rt.t_report;
 	int loglevel_ = (rt.underruns) ? LOGL_NOTICE : LOGL_INFO;
 
-	long resyncs = rpitx_dma_resyncs();
+	long dry = rpitx_dma_ran_dry();
 
-	if (resyncs != rt.resyncs_reported)
+	if (dry != rt.dry_reported)
 		loglevel_ = LOGL_NOTICE;
-	LOGP(DSDR, loglevel_, "rpitx: %.0f S/s (nominal %d), lowest FIFO fill %.1f ms, longest write %.1f ms, underruns %ld (%.1f ms), total underruns %ld, resyncs %ld\n",
+	/* an underrun is a hold now: the DMA repeats the last sample (an
+	 * unmodulated carrier) until we are back, it never plays old signal */
+	LOGP(DSDR, loglevel_, "rpitx: %.0f S/s (nominal %d), lowest FIFO fill %.1f ms, longest write %.1f ms, late %ld times (%.1f ms held), total %ld, DMA ran dry %ld times\n",
 	     (double)rt.samples_report / elapsed, rt.samplerate,
 	     1000.0 * rt.min_fill / rt.samplerate, 1000.0 * rt.max_block,
 	     rt.underruns, 1000.0 * rt.underrun_time, rt.underruns_total,
-	     resyncs - rt.resyncs_reported);
-	rt.resyncs_reported = resyncs;
+	     dry - rt.dry_reported);
+	rt.dry_reported = dry;
 	rt.t_report = now;
 	rt.samples_report = 0;
 	rt.min_fill = rt.fifo;

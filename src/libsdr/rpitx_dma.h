@@ -40,12 +40,14 @@ int rpitx_dma_crosses_boundary(double frequency, double span, double *boundary);
  * level: 0 = carrier off, above 0 = carrier on (at the drive level of open). */
 void rpitx_dma_write(const float *freq, const float *level, int num);
 
-/* Free FIFO space (samples), from our own fill count (see rpitx_dma.cpp).
- * Call it from the writing thread only: it may resync. */
+/* Free FIFO space (samples) as seen from the DMA read position. The chain
+ * ends at the last written sample (see rpitx_dma.cpp), so the DMA never runs
+ * past it. */
 int rpitx_dma_free(void);
 
-/* How often the DMA ran past what we wrote and we jumped ahead of it. */
-long rpitx_dma_resyncs(void);
+/* How often the DMA reached the last written sample and held it (we were
+ * late: an unmodulated carrier, no old signal). */
+long rpitx_dma_ran_dry(void);
 
 /* Size of the FIFO (samples). */
 int rpitx_dma_fifo_size(void);

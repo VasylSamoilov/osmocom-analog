@@ -48,46 +48,32 @@
 
 #include "rpitx_dma.h"
 
-static double mono_time(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
 /*
- * Fill level. librpitx's GetBufferAvailable() is (DMA position - last written
- * slot) mod ring size. When we are late and the DMA overtakes the last
- * written slot, that reads "nearly full", the write would sleep up to 3/4 of
- * the ring "for room" while the DMA plays old signal, and one short delay
- * turns into a whole ring of old signal. So we keep the fill ourselves: the
- * DMA's advance between two polls (the wall clock tells how many whole rings
- * it went round), minus what it played, plus what we wrote. When it has run
- * past what we wrote, we jump the write position a short lead ahead of the DMA
- * (a resync) instead of waiting.
+ * The chain ends where we stopped writing. librpitx closes the ring (the last
+ * block points to the first), so when we are late the DMA goes round and
+ * plays the signal of one ring ago, and GetBufferAvailable() ((DMA position -
+ * last written slot) mod size) then reads "nearly full". Here the pacing block
+ * of the slot written last points back to its own first block: the DMA
+ * repeats that sample (holds the frequency, the pin stays as it is) until the
+ * next sample is linked in. A new sample gets its self-loop first, then the
+ * slot before is pointed at it. So the DMA never passes the writer: a stall
+ * is a held carrier, never old signal, and the position is unambiguous
+ * (DMA on the last written slot = nothing queued).
  */
-#define RESYNC_LEAD_DIV 8	/* lead after a resync: 1/8 ring (10 ms at 80 ms) */
-
 class keyed_fm_dma : public bufferdma, public clkgpio, public pcmgpio
 {
 	uint32_t fsel_on, fsel_off;
 	uint32_t samplerate;
 	bool last_on;
-	uint32_t wr_last;	/* the next write goes to wr_last + 1 */
-	uint32_t pushed;	/* slot last given to PushSample (librpitx's last_sample) */
-	long fill;		/* samples written and not played yet */
-	bool tracking;
-	uint32_t prev_pos;
-	double prev_t;
-	bool rekey;		/* write the pin function on the next sample */
+	uint32_t pushed;	/* slot written last (librpitx's last_sample) */
+	bool dry;
 
 public:
-	long resyncs;
+	long ran_dry;		/* times the DMA reached the end and held */
 
 	keyed_fm_dma(uint64_t frequency, uint32_t rate, int channel, uint32_t fifo_size)
 		: bufferdma(channel, fifo_size, 2, 1), samplerate(rate), last_on(false),
-		  wr_last(0), pushed(0), fill(0), tracking(false), prev_pos(0), prev_t(0.0), rekey(false), resyncs(0)
+		  pushed(0), dry(false), ran_dry(0)
 	{
 		uint32_t fsel;
 
@@ -126,17 +112,16 @@ public:
 		cbp->next = mem_virt_to_phys(cbarray);
 	}
 
-	/* one sample into a ring slot the DMA has played */
+	/* one sample into the slot after the last one, see above */
 	void set_sample(uint32_t index, float frequency, bool on)
 	{
 		dma_cb_t *cb;
+		uint32_t prev;
 
 		index %= buffersize;
+		prev = (index + buffersize - 1) % buffersize;
 		cb = &cbarray[index * 2];
-		if (on != last_on || rekey) {
-			/* after a resync the slots just played may have switched the
-			 * pin: set it again */
-			rekey = false;
+		if (on != last_on) {
 			cb->dst = dma_fsel;
 			sampletab[index] = on ? fsel_on : fsel_off;
 			last_on = on;
@@ -144,49 +129,34 @@ public:
 			cb->dst = dma_pllc_frac;
 			sampletab[index] = (0x5A << 24) | GetMasterFrac(frequency);
 		}
+		/* the new end of the chain: its pacing block loops to itself */
+		cb[1].next = mem_virt_to_phys(&cbarray[index * 2]);
+		__sync_synchronize();
+		/* then the old end goes on to it */
+		cbarray[prev * 2 + 1].next = mem_virt_to_phys(&cbarray[index * 2]);
+		__sync_synchronize();
 		PushSample(index);
-		wr_last = index;
 		pushed = index;
 	}
 
-	/* free slots, see "Fill level" above; resyncs if the DMA ran past us */
+	/* free slots: (DMA position - last written) mod size, the DMA cannot
+	 * be past the last written slot; on it, nothing is queued. One slot
+	 * stays free, the one the DMA is on. */
 	int free_slots(void)
 	{
 		int raw = GetBufferAvailable();
-		long n = (long)buffersize, adv;
-		uint32_t pos;
-		double now, est;
+		int n = (int)buffersize, fill;
 
-		if (!Started) {
-			tracking = false;
+		if (!Started)
 			return raw;
-		}
-		pos = (uint32_t)((pushed + (uint32_t)raw) % buffersize);
-		now = mono_time();
-		if (!tracking) {
-			tracking = true;
-			fill = n - raw;
-		} else {
-			adv = ((long)pos - (long)prev_pos + n) % n;
-			/* more than half a ring more than the position says: it
-			 * went round whole rings in between */
-			est = (now - prev_t) * samplerate;
-			while ((double)adv + (double)n / 2.0 < est)
-				adv += n;
-			fill -= adv;
-		}
-		prev_pos = pos;
-		prev_t = now;
-		if (fill <= 0) {
-			long lead = n / RESYNC_LEAD_DIV;
-
-			/* the next write goes a lead ahead of the DMA */
-			wr_last = (uint32_t)(((long)pos + lead - 1 + n) % n);
-			fill = lead;
-			rekey = true;
-			resyncs++;
-		}
-		return (int)(n - fill - 1);
+		fill = (n - raw) % n;
+		if (fill == 0) {
+			if (!dry)
+				ran_dry++;
+			dry = true;
+		} else
+			dry = false;
+		return n - 1 - fill;
 	}
 
 	/* blocks until all samples are in the ring, with ngfmdmasync's rule:
@@ -203,9 +173,7 @@ public:
 			avail = free_slots();
 			n = (num - done < avail) ? num - done : avail;
 			for (i = 0; i < n; i++, done++)
-				set_sample(wr_last + 1, freq[done], level[done] > 0.0f);
-			if (Started)
-				fill += n;
+				set_sample(pushed + 1, freq[done], level[done] > 0.0f);
 		}
 	}
 };
@@ -301,11 +269,11 @@ extern "C" int rpitx_dma_free(void)
 	return tx->free_slots();
 }
 
-extern "C" long rpitx_dma_resyncs(void)
+extern "C" long rpitx_dma_ran_dry(void)
 {
 	if (!tx)
 		return 0;
-	return tx->resyncs;
+	return tx->ran_dry;
 }
 
 extern "C" int rpitx_dma_fifo_size(void)
