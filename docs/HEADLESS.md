@@ -25,7 +25,7 @@ it is one fixed operator panel inside every app.
 |---|---|---|---|
 | call phone: dial a mobile, answer, headset audio | `console.c`, `-c hw:..` | yes (keys) | Osmo-CC (exists) |
 | paging input: send a page | console dialling, `--fifo`/`--fifo-file`, caller ID text in an Osmo-CC setup | no | Osmo-CC or the fifo (exists) |
-| test peer: echo test `-e`, echo analysis, loopback `-l`, test tone to the mobile | `console.c`, refused with `-o` | no | missing |
+| test peer: echo test `-e`, echo analysis, test tone to the mobile | `console.c`, refused with `-o` | no | missing |
 | status: call states, who registered (`console_inscription`), measurements | `libdisplay` keys `c`, `m`; the console line | yes | missing |
 | internal tools: wave, IQ and spectrum views (`w`, `q`, `s`), info and scheduler dumps (`i`, `z`), bias calibration (`b`) | main loop hot keys | yes | missing |
 | terminal handling: raw mode, banner, scroll window for the log | main loop | yes | goes away when headless |
@@ -39,39 +39,47 @@ peer is replaced by the socket.
 
 ## What it costs
 
-Not CPU: POCSAG on the x86 mock for 20 s used the same time with and without
-the console. The cost is use and upkeep:
+Not CPU; the cost is use and upkeep:
 
 - it needs the terminal: under `timeout`, a service or a script without
   `--foreground` the app is stopped (SIGTTOU) and never sends;
 - the operator panel is the same for paging and for telephone networks,
   where dialling and headset make no sense for a pager;
-- echo test, loopback and test tone are tied to the console, so they are
-  lost as soon as the app is run with `-o`;
+- echo test, echo analysis and test tone are tied to the console, so they
+  are lost as soon as the app is run with `-o` (loopback `-l` is on the
+  radio side, in `sender.c`, and stays);
 - the panel's code and libraries are in every app.
 
 ## Upstream already has a standalone call phone
 
-`osmo-cc-alsa-endpoint` (gitea.osmocom.org/cc/osmo-cc-alsa-endpoint, binary
-`osmo-cc-alsa-endpoint`): headset on ALSA, dial from the keyboard, caller
-ID, auto alerting / answer, early audio, loopback, Osmo-CC socket. That is
-the call phone part of our console, as a program of its own:
+`osmo-cc-alsa-endpoint` (gitea.osmocom.org/cc/osmo-cc-alsa-endpoint): headset
+on ALSA (`-a`, optional), number on the command line and `d` to dial, caller
+ID (`-I`), auto alerting / answer, early audio, loopback, Osmo-CC socket.
+That is the call phone part of our console, as a program of its own.
+
+Tried on the x86 mock (2026-11-22): it builds against libosmo-cc 3.2.0, and
+without any sound device it sent a page to a headless POCSAG, the caller ID
+as the text:
 
 ```sh
-nmt -k 1 -Y ua,1 ... --headless
-osmo-cc-alsa-endpoint -a hw:0,0 --cc "remote 127.0.0.1:4200"
+pocsag -k 466.230 ... --network --headless -y alpha
+osmo-cc-alsa-endpoint -I 'HELLO FROM EP' --cc 'local 127.0.0.1:4201' \
+        --cc 'remote 127.0.0.1:4200' 1234567          # then press d
+# decoded: POCSAG1200: Address: 1234567  Function: 0  Alpha: HELLO FROM EP
 ```
 
-Missing there against our console: number length check per network, the
-registered phone's number to dial back, test music towards the mobile. It
-is on libosmo-cc 3.0.0 (we are on 3.2.0).
+Not there against our console (from reading its code, not tried): the number
+length check per network, the registered phone's number to dial back, test
+music towards the mobile.
 
 ## Steps
 
 1. **`--headless`** (done, 88a679c). No keyboard, banner, displays, terminal
    left as it is; implies `-o` (or works with `-x`). Tested on the x86 mock in
    a pseudo terminal: plain `timeout` stops the normal app (state T, nothing
-   sent), the headless one runs and stops cleanly.
+   sent), the headless one runs, sends a page from `--fifo-file` (decoded)
+   and stops cleanly. Not for IQ-file batch runs: those are already without
+   terminal, and `-o` turns batch timing off.
 2. **Test peer outside.** Echo, echo analysis, loopback and test tone as an
    Osmo-CC endpoint of their own (a small program, or a mode of the call phone),
    so a headless app can be tested the same way as with a real call. The
@@ -95,8 +103,13 @@ is on libosmo-cc 3.0.0 (we are on 3.2.0).
   console program?
 - Status interface: own socket, or Osmo-CC messages of a new kind? Osmo-CC
   carries calls only; the panel's data is not calls.
-- Several apps on one machine: each needs its own Osmo-CC ports (`--cc
-  "local ..."`); the front end needs a list of them.
+- Several apps on one machine: with default ports the apps pair with each
+  other. Tried: two headless POCSAG apps took 4200 and 4201 and attached to
+  each other as peers, so NMT next to POCSAG would hand its calls to the
+  pager. Each app needs its own ports (`--cc "local ..." --cc "remote ..."`)
+  pointing at its operations peer; the front end needs the list.
+- Without a peer, `-o` logs `OsmoCC-Socket failed` every two seconds or so
+  (7 times in 14 s). Normal for a pager with only `--fifo` input; quieten it?
 - Built-in console: keep it as the default for people who run the apps by
   hand, or make headless the default once steps 2 and 3 are there?
 
