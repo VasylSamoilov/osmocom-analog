@@ -40,9 +40,15 @@ fixed drive level while the signal is there.
 Run as root (DMA, PLL and GPIO through `/dev/mem` and the mailbox).
 Filter the output: it is a square wave with strong odd harmonics.
 
-The DMA does not stop with the process. The backend stops it on exit, on
-crashes and on the usual signals, but `kill -9` leaves the carrier on (run
-any rpitx tool, e.g. `tune`, and stop it with Ctrl-C to switch it off).
+The DMA does not stop with the process, so the backend's chain ends after
+the last written sample in a terminator: a block that switches GPIO4 to input
+and has no next block. Whatever happens to the program (exit, crash,
+`kill -9`, a pipe that takes it down), the DMA plays out what was queued (at
+most the 80 ms ring), switches the carrier off and stops. Tested on a Pi 3:
+0.2 s after `kill -9` the DMA was stopped and the pin an input. If the
+program is only late, the same gives a gap without carrier, never old
+signal; then the transmission starts again. `pinctrl get 4` (Raspberry Pi
+OS 12 and newer) shows the pin: `ip` = off, `a0` = carrier on.
 
 librpitx moves only the fraction of the PLL multiplier. Its integer steps are
 every 38.4 MHz above 750 MHz on the Pi 3 and every 27 MHz above 375 MHz on
