@@ -1514,6 +1514,11 @@ static void *sdr_read_child(void *arg)
 		/* read from SDR */
 		space = (sdr->thread_read.out - sdr->thread_read.in + sdr->thread_read.buffer_size - 2 + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size;
 		num = space / 2;
+		/* halfband decimation writes each output rx_os times; the
+		 * cascade may emit up to rx_os - 1 samples more than it read,
+		 * once for the packet and once for a gap fill */
+		if (sdr->thread_read.hb_stages)
+			num = (num > 2 * rx_os) ? num - 2 * rx_os : 0;
 		if (num) {
 #ifdef HAVE_UHD
 			if (rx_driver == 1)
@@ -1563,6 +1568,10 @@ static void *sdr_read_child(void *arg)
 				 * a wideband spectrum. */
 				int skip_filter = 0;
 				if (sdr->chan && (sdr->chan[0].use_channelizer || sdr->chan[0].use_tx_channelizer))
+					skip_filter = 1;
+				/* radio mode (channels = 0): its channelizer decimates
+				 * the full-rate ring in sdr_read() */
+				if (sdr->radio_channelizer_init)
 					skip_filter = 1;
 				rx_filter = (!skip_filter && rx_os > 1);
 #endif
