@@ -902,6 +902,12 @@ int sdr_configure(int samplerate)
 				sdr_config->tx_samplerate = tx_rate;
 			if (rx_rate > 0 && sdr_config->rx_samplerate == 0)
 				sdr_config->rx_samplerate = rx_rate;
+			/* the master rate below from the rates in use: a given
+			 * --sdr-tx/rx-samplerate, else the selected one */
+			if (sdr_config->tx_samplerate > 0)
+				tx_rate = sdr_config->tx_samplerate;
+			if (sdr_config->rx_samplerate > 0)
+				rx_rate = sdr_config->rx_samplerate;
 
 			/* Set master SDR rate for the sdr.c open check.
 			 * When user specified -s, DSP rate is fixed, so master rate
