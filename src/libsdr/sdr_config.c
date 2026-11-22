@@ -793,6 +793,22 @@ int sdr_configure(int samplerate)
 	if (sdr_config->bandwidth == 0.0)
 		sdr_config->bandwidth = (double)sdr_config->samplerate;
 
+	/* A rate the user gave wins, as upstream: --sdr-samplerate as given,
+	 * else -s sets the SDR rate too (the line above). Auto-selection only
+	 * when neither was given. In split mode an unset TX/RX rate is the SDR
+	 * rate. */
+	if (sdr_config->bandwidth_hint_set && !sdr_config->auto_selection_done
+	 && (sdr_config->samplerate_given || sdr_config->sdr_samplerate_given)) {
+		if (sdr_config->split_mode) {
+			if (sdr_config->tx_samplerate == 0)
+				sdr_config->tx_samplerate = sdr_config->samplerate;
+			if (sdr_config->rx_samplerate == 0)
+				sdr_config->rx_samplerate = sdr_config->samplerate;
+		}
+		LOGP(DSDR, LOGL_INFO, "SDR sample rate as given: %d Hz (no auto-selection)\n", sdr_config->samplerate);
+		sdr_config->auto_selection_done = 1;
+	}
+
 	/* Auto-select sample rates if bandwidth hint is set and not already done */
 	if (sdr_config->bandwidth_hint_set && !sdr_config->auto_selection_done) {
 		sdr_rate_info_t rates = {0};

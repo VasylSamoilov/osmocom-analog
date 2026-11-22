@@ -228,20 +228,15 @@ void print_help(const char *arg0)
 	printf("        If 0, phone ignores BUSY/IDLE bit on FOCC (default = '%d')\n", bis);
 	printf("        If 1, be sure to have a round-trip delay (latency) not more than 5 ms\n");
 	printf(" -S --sysinfo n1=<N minus 1>\n");
-	printf("        N = how many PAGING channels your system has. The phone needs N to\n");
-	printf("        work out which paging channel to listen on, so it hears its own pages.\n");
-	printf("        The field holds N-1 (so n1=0 means 1 paging channel). Range 0..31.\n");
-	printf("        DEFAULT: auto - counted from the channels you start the base with\n");
-	printf("        (CC/PC/combined channels). Set this only to override the auto count.\n");
-	printf("        Wrong value: the phone scans for paging channels that do not exist and\n");
-	printf("        may miss incoming-call pages.\n");
+	printf("        The phone takes the first N dedicated control channels, from 334\n");
+	printf("        upward (system B) or 333 downward (system A), as paging channels and\n");
+	printf("        scans only those (TIA/EIA-553-A 2.6.1.1.2). So N must reach your\n");
+	printf("        control channel: n1=0 means only 334/333. Range 0..31.\n");
+	printf("        DEFAULT: 20, all 21 dedicated control channels (as upstream).\n");
 	printf(" -S --sysinfo cmax1=<CMAX minus 1>\n");
-	printf("        CMAX = how many ACCESS channels your system has. The phone uses CMAX to\n");
-	printf("        choose the access channel it originates calls / answers pages on.\n");
-	printf("        The field holds CMAX-1 (so cmax1=0 means 1 access channel). Range 0..31.\n");
-	printf("        DEFAULT: auto - counted from the control channels you start with.\n");
-	printf("        Set this only to override the auto count.\n");
-	printf("        Wrong value: the phone may try to access channels that do not exist.\n");
+	printf("        The same for the ACCESS channels the phone originates calls and\n");
+	printf("        answers pages on: the first CMAX dedicated control channels.\n");
+	printf("        Range 0..31. DEFAULT: 20, all 21 dedicated control channels.\n");
 	printf(" -S --sysinfo olc=<16-bit mask>\n");
 	printf("        Overload Control (access overload classes): bit i = class i permitted.\n");
 	printf("        Default: not broadcast (all classes implicitly allowed). Also settable at\n");
@@ -1541,18 +1536,25 @@ int main_amps_tacs(const char *name, int argc, char *argv[], const char *toneset
 		if (access_ch < 1) access_ch = 1;
 		n1_auto = (n1 < 0);
 		cmax1_auto = (cmax1 < 0);
+		/* N and CMAX are not the number of channels this base runs: the
+		 * mobile takes the first N (CMAX) dedicated control channels,
+		 * counted from 334 upward (system B) or 333 downward (system A),
+		 * as the paging (access) channels and scans only those
+		 * (TIA/EIA-553-A 2.6.1.1.2: FIRSTCHP, LASTCHP = FIRSTCHP + N - 1).
+		 * Counting the started channels gave N = 1 for one control channel:
+		 * then only 334/333 is a paging channel, and a control channel on
+		 * any other number is never found ("No Service"). Default as
+		 * upstream: N-1 = CMAX-1 = 20, all 21 dedicated control channels. */
 		if (n1_auto) {
-			n1 = paging_ch - 1;
-			if (n1 > 31) n1 = 31;
-			LOGP(DAMPS, LOGL_INFO, "Auto N-1=%d (%d paging channel%s detected)\n",
-				n1, paging_ch, paging_ch == 1 ? "" : "s");
+			n1 = 20;
+			LOGP(DAMPS, LOGL_INFO, "N-1=%d (all 21 dedicated control channels can be paging channels; %d started)\n",
+				n1, paging_ch);
 		} else
 			LOGP(DAMPS, LOGL_INFO, "N-1=%d set explicitly (%d paging channels detected)\n", n1, paging_ch);
 		if (cmax1_auto) {
-			cmax1 = access_ch - 1;
-			if (cmax1 > 31) cmax1 = 31;
-			LOGP(DAMPS, LOGL_INFO, "Auto CMAX-1=%d (%d access channel%s detected)\n",
-				cmax1, access_ch, access_ch == 1 ? "" : "s");
+			cmax1 = 20;
+			LOGP(DAMPS, LOGL_INFO, "CMAX-1=%d (all 21 dedicated control channels can be access channels; %d started)\n",
+				cmax1, access_ch);
 		} else
 			LOGP(DAMPS, LOGL_INFO, "CMAX-1=%d set explicitly (%d access channels detected)\n", cmax1, access_ch);
 

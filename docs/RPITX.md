@@ -179,14 +179,15 @@ switched off then): next to the Pi's wire at drive level 7 our own signal
 raised the uplink floor by 27 dB, a metre away by 12 dB.
 
 AMPS on the Pi 3 (2026-11-22, two Motorola phones, SID 54, system B): with
-`-k 334 -T CC/PC -S sid=54 -S pureg=0 -S pdreg=0 -s 96000 --fast-math`,
-drive level 7, both phones registered (RECC 98 % level, 99..100 % quality,
-all CRCs good) and a call reached the network. With `-T CC/PC/VC` (the
-combined channel) and registration on power-up/down (`pureg`, `pdreg` on,
-the default) the phones showed "No Service", from the Pi and from a USRP
-alike: a setting, not the transmitter. Not tried yet: the call on a voice
-channel (`-k 354 -k 355 -T CC/PC -T VC`). `--headless` cannot be combined
-with the echo test (`-e`): headless means the Osmo-CC socket.
+the control channel on 334, drive level 7, both phones registered (RECC
+98 % level, 99..100 % quality, all CRCs good) and a call reached the
+network. On 353 or 354 the phones showed "No Service", from the Pi and from
+a USRP alike. The cause was not the transmitter: the fork broadcast N-1 = 0
+(the number of started control channels), and a phone takes only the first
+N dedicated control channels from 334 (B) / 333 (A) as paging channels.
+Fixed: N-1 = CMAX-1 = 20 again, as upstream. Not tried yet: the call on a
+voice channel (`-k 354 -k 355 -T CC/PC -T VC`). `--headless` cannot be
+combined with the echo test (`-e`): headless means the Osmo-CC socket.
 
 Channels lost to the PLL steps (computed with the same rules as the
 backend; 1 channel at 48 kS/s, 2 adjacent channels at 192 kS/s):
