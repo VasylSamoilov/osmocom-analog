@@ -152,18 +152,19 @@ SINAD in dB; "two" is first / second channel.
 NMT-450 with two phones on the Pi 3 (`-k 90 -k 91 -T CC -T TC -U 1`,
 465.225 / 465.250 MHz, drive level 7, RTL-SDR as receiver): both phones show
 the clock, both call the echo test on the second (traffic) channel,
-supervisory signal 80..99 % quality, about 1 core of 4 busy. Open: during
-calls the transmitter stalled three times for about 60 ms (10 underruns,
-10 ms of old samples); one phone keeps sending frames on the calling channel
-that do not decode (about 70 % quality, against 87 % on the traffic channel)
-and its calls start late.
+supervisory signal 80..99 % quality, about 1 core of 4 busy. The stalls
+during calls are explained and fixed below. While a phone sent on the
+traffic channel 91, the receiver of the calling channel 90 next to it
+decoded garbage frames (about 70 % quality): the phone's own signal leaking
+into the neighbouring uplink, not a phone fault. Keep one channel free
+between the two, as for AMPS below.
 
 CPU and underruns on the Pi 3. The stalls during calls came from nmt's main
 thread at 100 % of a core: the DSP (FM modulation with sin/cos, filters, FM
 demodulation with atan2) runs at the DSP rate for every channel, plus about
 14 % for the terminal output. With librpitx's closed ring every short delay
-then became a whole ring of old signal (fixed: the chain now ends at the last
-written sample, a delay holds the carrier). Main thread, two channels:
+then became a whole ring of old signal (fixed: the chain now ends in a
+terminator, a delay gives a gap without carrier). Main thread, two channels:
 
 | options | idle | in a phone-to-phone call (both channels) |
 |---|---|---|
