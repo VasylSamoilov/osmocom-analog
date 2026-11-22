@@ -60,6 +60,14 @@ typedef struct sender {
 	int			level_debug;
 	double			lv_peak;		/* peak deviation (Hz) */
 	long			lv_samples, lv_over;	/* samples, and samples beyond the maximum deviation */
+	/* LEVEL debug of the demodulated signal (radio->dsp), once per second while level_debug */
+	struct {
+		long		n, over;		/* samples, samples beyond the maximum deviation */
+		double		sum, sumsq, peak;	/* demodulator output (Hz): mean = carrier offset */
+		double		dc_sumsq, de_sumsq;	/* after DC filter, after de-emphasis (normalized) */
+		double		rf_sum;			/* RF level (dB), sum of the blocks */
+		long		rf_n;
+	} rxlv;
 
 	/* loopback test */
 	int			loopback;		/* 0 = off, 1 = internal, 2 = external, 3 = audio loop */

@@ -489,6 +489,24 @@ cant_recover:
 
 		/* loop through all channels */
 		for (i = 0, inst = sender; inst; i++, inst = inst->slave) {
+			int lv = inst->level_debug && inst->speech_deviation > 0.0, s;
+
+			/* LEVEL debug: the demodulator output as it comes, in Hz */
+			if (lv) {
+				for (s = 0; s < count; s++) {
+					double f = samples[i][s], a = fabs(f);
+
+					inst->rxlv.sum += f;
+					inst->rxlv.sumsq += f * f;
+					if (a > inst->rxlv.peak)
+						inst->rxlv.peak = a;
+					if (inst->max_deviation > 0.0 && a > inst->max_deviation)
+						inst->rxlv.over++;
+				}
+				inst->rxlv.n += count;
+				inst->rxlv.rf_sum += rf_level_db[i];
+				inst->rxlv.rf_n++;
+			}
 			/* frequency deviation of speech level to normal level */
 			gain_samples(samples[i], count, 1.0 / inst->speech_deviation);
 			/* rx gain */
@@ -497,7 +515,27 @@ cant_recover:
 			/* do filter and de-emphasis from radio receive audio, process echo test */
 			if (inst->de_emphasis) {
 				dc_filter(&inst->estate, samples[i], count);
+				if (lv)
+					for (s = 0; s < count; s++)
+						inst->rxlv.dc_sumsq += samples[i][s] * samples[i][s];
 				de_emphasis(&inst->estate, samples[i], count);
+			}
+			if (lv) {
+				for (s = 0; s < count; s++)
+					inst->rxlv.de_sumsq += samples[i][s] * samples[i][s];
+				if (inst->rxlv.n >= inst->samplerate) {
+					double n = (double)inst->rxlv.n, mean = inst->rxlv.sum / n;
+					double ac = sqrt(fmax(inst->rxlv.sumsq / n - mean * mean, 0.0));
+
+					/* dB relative to the reference tone (normalized 1.0 = speech deviation, a sine) */
+					LOGP(DSENDER, LOGL_NOTICE, "(chan %s) LEVEL radio->dsp: RF %.1f dB | demod offset %+.0f Hz, deviation rms %.0f Hz pk %.0f Hz (max %.0f Hz), %ld samples over the max"
+					     " | after DC filter rms %+.1f dB | after de-emphasis rms %+.1f dB\n",
+					     inst->kanal, inst->rxlv.rf_n ? inst->rxlv.rf_sum / inst->rxlv.rf_n : 0.0,
+					     mean, ac, inst->rxlv.peak, inst->max_deviation, inst->rxlv.over,
+					     20.0 * log10(sqrt(inst->rxlv.dc_sumsq / n) / M_SQRT1_2 + 1e-12),
+					     20.0 * log10(sqrt(inst->rxlv.de_sumsq / n) / M_SQRT1_2 + 1e-12));
+					memset(&inst->rxlv, 0, sizeof(inst->rxlv));
+				}
 			}
 			if (inst->loopback != 1) {
 				display_wave(&inst->dispwav, samples[i], count, inst->max_display);
