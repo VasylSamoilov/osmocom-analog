@@ -189,7 +189,15 @@ Fixed: N-1 = CMAX-1 = 20 again, as upstream. Then two channels on the one
 carrier, `-k 354 -T CC/PC -k 355 -T VC -S sid=54 -e -s 96000 --fast-math`
 (880.620 + 880.650 MHz): both phones found the network, a call went to the
 voice channel 355 (the weaker, keyed one), SAT quality 99, signaling tone
-100, "wonderful sound quality", 0 late writes. `--headless` cannot be
+100, "wonderful sound quality", 0 late writes.
+
+AMPS phone to phone on the Pi 3 (`-k 354 -T CC/PC/VC -k 356 -T VC -x`): the
+caller on 356, the called phone paged on 354 and talking there, answered,
+audio both ways, released normally. With the channels next to each other
+(354 + 355, 30 kHz) the call dropped when the called phone answered: its
+signaling tone (10 kHz) while ringing leaked into the receiver of the other
+uplink, and when it stopped, that looked like the caller hanging up. Keep
+one channel free between the two (60 kHz still fits at 192 kS/s). `--headless` cannot be
 combined with the echo test (`-e`): headless means the Osmo-CC socket.
 
 Channels lost to the PLL steps (computed with the same rules as the
