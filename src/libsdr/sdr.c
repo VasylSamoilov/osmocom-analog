@@ -234,8 +234,17 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			return NULL;
 		}
 		if (sdr_config->samplerate % samplerate) {
-			/* Non-integer ratio - will use polyphase resampling (handled in split mode logic below) */
-			LOGP(DSDR, LOGL_NOTICE, "SDR sample rate %d is not a multiple of audio sample rate %d - will use polyphase resampling\n", 
+			/* Non-integer ratio: only split mode has the polyphase
+			 * resampler (below). With one device the samples would run
+			 * at the wrong time and frequency scale, so refuse, as
+			 * upstream does. */
+			if (!sdr_config->split_mode) {
+				LOGP(DSDR, LOGL_ERROR, "SDR sample rate %d is not a multiple of the DSP sample rate %d. Use an SDR rate that is (e.g. %d) or a DSP rate that divides it (-s).\n",
+				     sdr_config->samplerate, samplerate,
+				     (sdr_config->samplerate / samplerate + 1) * samplerate);
+				return NULL;
+			}
+			LOGP(DSDR, LOGL_NOTICE, "SDR sample rate %d is not a multiple of audio sample rate %d - will use polyphase resampling\n",
 			     sdr_config->samplerate, samplerate);
 			oversample = 1;  /* Polyphase handles the resampling */
 		} else {
