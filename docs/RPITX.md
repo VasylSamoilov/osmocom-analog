@@ -152,6 +152,26 @@ calls the transmitter stalled three times for about 60 ms (10 underruns,
 that do not decode (about 70 % quality, against 87 % on the traffic channel)
 and its calls start late.
 
+CPU and underruns on the Pi 3. The stalls during calls came from nmt's main
+thread at 100 % of a core: the DSP (FM modulation with sin/cos, filters, FM
+demodulation with atan2) runs at the DSP rate for every channel, plus about
+14 % for the terminal output. With librpitx's closed ring every short delay
+then became a whole ring of old signal (fixed: the chain now ends at the last
+written sample, a delay holds the carrier). Main thread, two channels:
+
+| options | idle | in a phone-to-phone call (both channels) |
+|---|---|---|
+| `-s 192000` | 99.9 % (underruns in calls) | |
+| `-s 192000 --headless` | 86 % | |
+| `-s 192000 --headless --fast-math` | 62 % | |
+| `-s 96000 --headless --fast-math` (rpitx still 192 kS/s) | 37 % | 56 %, no late writes |
+
+On a Pi 3 use `-s 96000 --fast-math --headless --sdr-tx-samplerate 192000`.
+Not checked yet: the images the 96 -> 192 kS/s step may leave in the
+spectrum. The RTL-SDR gain must be fixed (`--sdr-rx-gain`, automatic gain is
+switched off then): next to the Pi's wire at drive level 7 our own signal
+raised the uplink floor by 27 dB, a metre away by 12 dB.
+
 Channels lost to the PLL steps (computed with the same rules as the
 backend; 1 channel at 48 kS/s, 2 adjacent channels at 192 kS/s):
 
