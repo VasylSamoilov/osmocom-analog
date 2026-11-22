@@ -3830,12 +3830,15 @@ static int amps_decode_word_recc(amps_t *amps, uint64_t word, int first)
 		} else 
 			msg_count++;
 
-		/* Word C - Protocol Capability Indicator (if PCI_HOME or PCI_ROAM is set) */
+		/* Word C - Protocol Capability Indicator (if PCI_HOME or PCI_ROAM is set).
+		 * A mobile sends it only with a (capability) registration or a PCI
+		 * order confirmation, never with an origination or a page response
+		 * (TIA/EIA-553-A 2.6.3.7): those carry ORDER 0 in word B. Assuming it
+		 * in an origination took word D (the first digits) for it and lost
+		 * the dialled number whenever word E followed (9 or more digits).
+		 */
 		if (amps->si.acc_type.pci_home || amps->si.acc_type.pci_roam) {
-			/* If this is an Origination (T=1, Order=0) and it's the last word (nawc=0),
-			 * then it MUST be Word D (Digits). Skip PCI logic.
-			 */
-			if (msg_count == 4 && !(amps->rx_recc_t == 1 && amps->rx_recc_order == 0 && nawc == 0)) {
+			if (msg_count == 4 && amps->rx_recc_order != 0) {
 				// LOGP_CHAN(DFRAME, LOGL_DEBUG, "Decoding Word C (PCI)\n");
 				w = &pci_report_registration_word;
 			} else {
