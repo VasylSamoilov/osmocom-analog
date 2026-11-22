@@ -168,8 +168,12 @@ static void call_echo_suppressor_cleanup(process_t *process);
 static void call_dtmf_cleanup(process_t *process);
 
 /* RFC 4733 telephone-event packet from the network: handled here, DTMF is
- * sent to the mobile, flash plays the recall tone (no osmo-cc message, that
- * would go back to the SIP endpoint) */
+ * sent to the mobile (no osmo-cc message, that would go back to the SIP
+ * endpoint). A flash from the network has no meaning for the mobile and no
+ * end: it used to switch the recall tone on for good, and while a tone plays
+ * all audio to the mobile is dropped (an echo test returns the mobile's own
+ * flash, so the call went silent after the first flash). It is logged only;
+ * hold from the network still plays the recall tone (NOTIFY, with retrieve). */
 static void call_te_rx(process_t *process, uint32_t timestamp, uint8_t *payload, int payload_len)
 {
 	uint8_t event;
@@ -179,8 +183,7 @@ static void call_te_rx(process_t *process, uint32_t timestamp, uint8_t *payload,
 		return;
 
 	if (event == TE_EVENT_FLASH) {
-		LOGP(DCALL, LOGL_INFO, "RFC 4733 Flash received from network (callref=%d)\n", process->callref);
-		call_tone_recall(process->callref, 1);
+		LOGP(DCALL, LOGL_INFO, "RFC 4733 Flash received from network, nothing to do for the mobile (callref=%d)\n", process->callref);
 	} else if (event <= 15) {
 		char digits[2] = { te_digit_from_event(event), '\0' };
 		LOGP(DCALL, LOGL_INFO, "RFC 4733 DTMF '%c' received from network -> TX to mobile (callref=%d)\n",
