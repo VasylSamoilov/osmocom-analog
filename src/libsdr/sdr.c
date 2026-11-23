@@ -157,6 +157,10 @@ typedef struct sdr {
 	int		eng_n;			/* number of them */
 	int		eng_chunk;		/* SDR samples per sdr_engine_tx_produce() */
 	float		*rx_gap_zero;		/* zeros for lost RX samples (rx_max_in) */
+	int		eng_advance;		/* TX: SDR samples the device is kept ahead (time stamps) */
+	int		eng_ring_target;	/* TX: DSP samples kept in the group's ring */
+	double		eng_report;		/* time of the last missing / dropped report */
+	long		eng_missing, eng_dropped;	/* reported so far */
 } sdr_t;
 
 /* use the filter banks: on request, or (auto) for two or more channels when
@@ -742,6 +746,20 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				goto error;
 			}
 		}
+		/* TX latency as before (one buffer): the device a few blocks ahead
+		 * (at least 5 ms, 4 UHD packets), the group's ring the rest */
+		if (ntx) {
+			double adv = 0.005, buf = (double)buffer_size / samplerate;
+
+			if (4.0 * 2040 / sdr->tx_rate > adv)
+				adv = 4.0 * 2040 / sdr->tx_rate;
+			if (adv > buf / 2.0)
+				adv = buf / 2.0;
+			sdr->eng_advance = (int)(adv * sdr->tx_rate);
+			sdr->eng_ring_target = buffer_size - (int)(adv * samplerate);
+			LOGP(DSDR, LOGL_INFO, "TX latency %.1f ms: %.1f ms in the device, %.1f ms in the filter bank ring\n",
+			     buf * 1e3, adv * 1e3, (buf - adv) * 1e3);
+		}
 		for (c = 0; c < ntx; c++)
 			LOGP(DSDR, LOGL_INFO, "TX %s %d: filter bank sub-band %d\n", (c < channels) ? "channel" : "paging channel", c, sdr->group->tx[c].bin);
 		for (c = 0; c < nrx; c++)
@@ -1081,8 +1099,12 @@ static void *sdr_write_child(void *arg)
 		eng_chunk = tx_chunk / eng_step * eng_step;
 		if (eng_chunk < eng_step)
 			eng_chunk = eng_step;
-		eng_target = (int)((double)sdr->buffer_size * sdr->tx_rate / sdr->samplerate);
-		LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: filter bank engine, up to %d samples per block\n", eng_chunk);
+		/* the device's advance: small (the group's ring holds the rest of
+		 * the buffer, sdr_get_tosend()), so the latency is one buffer as
+		 * before */
+		eng_target = sdr->eng_advance;
+		LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: filter bank engine, up to %d samples per block, device %.1f ms ahead\n",
+		     eng_chunk, 1000.0 * eng_target / sdr->tx_rate);
 	}
 	int out_samples;
 
@@ -1829,8 +1851,22 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		int rows = 0;
 
 		/* engine mode: the rows the device RX thread made, all channels */
-		if (sdr->use_engine)
+		if (sdr->use_engine) {
+			double now = get_time();
+
 			rows = sdr_engine_group_read(sdr->group, sdr->eng_i, sdr->eng_q, num);
+			/* the engine's faults, once a second when they change */
+			if (now - sdr->eng_report >= 1.0) {
+				long missing = sdr->group->tx_missing, dropped = sdr->group->rx_dropped;
+
+				if (missing != sdr->eng_missing || dropped != sdr->eng_dropped)
+					LOGP(DSDR, LOGL_ERROR, "Filter bank engine: TX rows missing %ld, RX rows dropped %ld in the last %.1f s (total %ld / %ld)\n",
+					     missing - sdr->eng_missing, dropped - sdr->eng_dropped, now - sdr->eng_report, missing, dropped);
+				sdr->eng_missing = missing;
+				sdr->eng_dropped = dropped;
+				sdr->eng_report = now;
+			}
+		}
 		for (c = 0; c < channels; c++) {
 			sdr_chan_t *ch = &sdr->chan[c];
 			int n;
@@ -1952,7 +1988,8 @@ int sdr_get_tosend(void *inst, int buffer_size)
 	/* engine mode: the group's TX ring (DSP samples) kept at buffer_size;
 	 * the device TX thread takes from it at the device clock */
 	if (sdr->use_engine && sdr->group && sdr->group->n_tx) {
-		count = buffer_size - sdr_ring_fill(&sdr->group->tx_ring);
+		/* the device's advance is part of the buffer */
+		count = buffer_size - (sdr->buffer_size - sdr->eng_ring_target) - sdr_ring_fill(&sdr->group->tx_ring);
 		return (count > 0) ? count : 0;
 	}
 

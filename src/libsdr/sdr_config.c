@@ -770,7 +770,9 @@ int sdr_configure(int samplerate)
 
 	/* Application-level mode restriction */
 	if (sdr_check_separate_device_support(sdr_config->tx_only, sdr_config->rx_only, sdr_config->split_mode)) {
-		fprintf(stderr, "This application requires a single full-duplex SDR device.\n");
+		fprintf(stderr, "This application needs both TX and RX (not --sdr-tx-only / --sdr-rx-only): one full-duplex SDR\n"
+			"(preferred: TX paced by its time stamps where the device has them), or a TX and an RX device\n"
+			"(--sdr-tx-... / --sdr-rx-... options).\n");
 		exit(0);
 	}
 
