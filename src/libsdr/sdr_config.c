@@ -52,6 +52,7 @@ void sdr_config_init(double lo_offset)
 	sdr_config->lo_offset = lo_offset;
 	sdr_config->timestamps = 1;
 	sdr_config->rpitx_ratio = RPITX_DEFAULT_RATIO;
+	sdr_config->filter_bank = -1;
 
 	got_init = 1;
 }
@@ -131,6 +132,12 @@ void sdr_config_print_help(void)
 	printf("        TX-only mode (no RX device needed)\n");
 	printf("    --sdr-rx-only\n");
 	printf("        RX-only mode (no TX device needed)\n");
+	printf("    --sdr-filter-bank auto | on | off\n");
+	printf("        How the channels are taken from / put into the SDR stream: a\n");
+	printf("        polyphase FFT filter bank shared by all channels (cost does not grow\n");
+	printf("        with the number of channels) or a channelizer per channel. 'auto'\n");
+	printf("        uses the bank for two or more channels when the rates fit it.\n");
+	printf("        (default = auto)\n");
 	printf("\n  Per-device overrides (split mode only):\n");
 	printf("    --sdr-tx-channel <channel #>\n");
 	printf("        TX device channel number\n");
@@ -261,6 +268,7 @@ void sdr_config_print_hotkeys(void)
 #ifdef HAVE_RPITX
 #define	OPT_SDR_RPITX_RATIO	1550
 #endif
+#define	OPT_SDR_FILTER_BANK	1551
 
 void sdr_config_add_options(void)
 {
@@ -323,6 +331,7 @@ void sdr_config_add_options(void)
 	option_add(OPT_SDR_PPM, "sdr-ppm", 1);
 	option_add(OPT_SDR_TX_PPM, "sdr-tx-ppm", 1);
 	option_add(OPT_SDR_RX_PPM, "sdr-rx-ppm", 1);
+	option_add(OPT_SDR_FILTER_BANK, "sdr-filter-bank", 1);
 }
 
 int sdr_config_handle_options(int short_option, int argi, char **argv)
@@ -454,6 +463,18 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_RX_ONLY:
 		sdr_config->rx_only = 1;
+		break;
+	case OPT_SDR_FILTER_BANK:
+		if (!strcmp(argv[argi], "auto"))
+			sdr_config->filter_bank = -1;
+		else if (!strcmp(argv[argi], "on"))
+			sdr_config->filter_bank = 1;
+		else if (!strcmp(argv[argi], "off"))
+			sdr_config->filter_bank = 0;
+		else {
+			fprintf(stderr, "--sdr-filter-bank: 'auto', 'on' or 'off', not '%s'\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
 	/* Per-device split override options */
 	case OPT_SDR_TX_CHANNEL:

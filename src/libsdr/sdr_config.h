@@ -49,6 +49,7 @@ typedef struct sdr_config {
 	/* TX-only / RX-only mode flags */
 	int		tx_only;		/* --sdr-tx-only flag */
 	int		rx_only;		/* --sdr-rx-only flag */
+	int		filter_bank;		/* --sdr-filter-bank: -1 auto, 0 off, 1 on */
 	/* Per-device split overrides (split mode only) */
 	int		tx_channel;		/* --sdr-tx-channel */
 	int		rx_channel;		/* --sdr-rx-channel */
