@@ -864,9 +864,10 @@ static tones_seq_t seq_denmark_dialtone[] = {
 	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
 };
 
+/* NMT Doc 450-2/900-2 (1995) 9.6.1: ringing tone 1000 ms tone, 4000 ms pause (was 1 s / 0.5 s) */
 static tones_seq_t seq_denmark_ringback[] = {
 	{ TONES_TDATA_SLIN16HOST, 7999, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
-	{ TONES_TDATA_SLIN16HOST, 4001, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_SLIN16HOST, 32001, slin16_silence, sizeof(slin16_silence), 0.0 },
 	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
 };
 
@@ -896,6 +897,91 @@ tones_set_t set_denmark[] = {
 	{ TONES_TONE_BUSY, seq_denmark_busy },
 	{ TONES_TONE_CONGESTION, seq_denmark_congestion },
 	{ TONES_TONE_OUTOFORDER, seq_denmark_outoforder },
+	{ TONES_TONE_CW, seq_denmark_cw },
+	{ TONES_TONE_SIT, seq_sit },
+	{ 0, NULL }
+};
+
+
+/* Finnish, Norwegian and Swedish tones of the NMT exchange, NMT Doc 450-2/900-2 (1995) 9.6.2 .. 9.6.4:
+ * 425 Hz like the Danish ones; dial tone continuous, special information tone per CCITT. */
+
+static tones_seq_t seq_finland_ringback[] = {
+	{ TONES_TDATA_SLIN16HOST, 8000, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 32000, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+/* busy and congestion: 300 ms tone, 300 ms pause */
+static tones_seq_t seq_finland_busy[] = {
+	{ TONES_TDATA_SLIN16HOST, 2400, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 2400, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+tones_set_t set_finland[] = {
+	{ TONES_TONE_DIALTONE, seq_denmark_dialtone },
+	{ TONES_TONE_RINGBACK, seq_finland_ringback },
+	{ TONES_TONE_BUSY, seq_finland_busy },
+	{ TONES_TONE_CONGESTION, seq_finland_busy },
+	{ TONES_TONE_CW, seq_denmark_cw },
+	{ TONES_TONE_SIT, seq_sit },
+	{ 0, NULL }
+};
+
+static tones_seq_t seq_norway_ringback[] = {
+	{ TONES_TDATA_SLIN16HOST, 8000, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 32000, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+/* busy 500 ms / 500 ms, congestion 250 ms / 250 ms */
+static tones_seq_t seq_norway_busy[] = {
+	{ TONES_TDATA_SLIN16HOST, 4000, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 4000, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+static tones_seq_t seq_norway_congestion[] = {
+	{ TONES_TDATA_SLIN16HOST, 2000, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 2000, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+tones_set_t set_norway[] = {
+	{ TONES_TONE_DIALTONE, seq_denmark_dialtone },
+	{ TONES_TONE_RINGBACK, seq_norway_ringback },
+	{ TONES_TONE_BUSY, seq_norway_busy },
+	{ TONES_TONE_CONGESTION, seq_norway_congestion },
+	{ TONES_TONE_CW, seq_denmark_cw },
+	{ TONES_TONE_SIT, seq_sit },
+	{ 0, NULL }
+};
+
+/* ringing 1000 ms / 5000 ms, busy 250 ms / 250 ms, congestion 250 ms / 750 ms */
+static tones_seq_t seq_sweden_ringback[] = {
+	{ TONES_TDATA_SLIN16HOST, 8000, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 40000, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+static tones_seq_t seq_sweden_busy[] = {
+	{ TONES_TDATA_SLIN16HOST, 2000, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 2000, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+static tones_seq_t seq_sweden_congestion[] = {
+	{ TONES_TDATA_SLIN16HOST, 2000, slin16_denmark_all, sizeof(slin16_denmark_all), -6.0 },
+	{ TONES_TDATA_SLIN16HOST, 6000, slin16_silence, sizeof(slin16_silence), 0.0 },
+	{ TONES_TDATA_EOL, 0, NULL, 0, 0.0 }
+};
+
+tones_set_t set_sweden[] = {
+	{ TONES_TONE_DIALTONE, seq_denmark_dialtone },
+	{ TONES_TONE_RINGBACK, seq_sweden_ringback },
+	{ TONES_TONE_BUSY, seq_sweden_busy },
+	{ TONES_TONE_CONGESTION, seq_sweden_congestion },
 	{ TONES_TONE_CW, seq_denmark_cw },
 	{ TONES_TONE_SIT, seq_sit },
 	{ 0, NULL }

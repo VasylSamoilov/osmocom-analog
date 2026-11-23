@@ -49,6 +49,7 @@
 /* External configuration */
 extern echo_suppressor_config_t echo_suppressor_config;
 
+int mobile_tones = 1;
 int call_tone_repeats = 3;
 double call_tone_timeout = 30.0;
 
@@ -151,6 +152,15 @@ typedef struct process {
 	tones_t tones;
 	uint8_t cause;
 	struct osmo_timer_list timer;
+	/* tones towards the mobile (--mobile-tones), the mirror of the tones towards the network */
+	int mo;			/* the call was made by the mobile */
+	int net_answered;	/* the network answered it */
+	int net_released;	/* the network released it, we only play the tone to the mobile */
+	int mtone;		/* tone played to the mobile, 0 = none */
+	tones_t mtones;
+	uint16_t mt_seq;
+	uint32_t mt_ts;
+	struct osmo_timer_list mtone_timer;
 	osmo_cc_session_t *session;
 	osmo_cc_session_codec_t *codec; /* codec to send */
 	osmo_cc_session_codec_t *telephone_event; /* RFC 4733, if negotiated */
@@ -258,6 +268,7 @@ static void destroy_process(int callref)
 		if (process->callref == callref) {
 			*process_p = process->next;
 			osmo_timer_del(&process->timer);
+			osmo_timer_del(&process->mtone_timer);
 			if (process->session)
 				osmo_cc_free_session(process->session);
 			/* Cleanup DTMF */
@@ -558,6 +569,63 @@ static void set_tone_process(int callref, enum tones_tone tone)
 	tones_set_tone(&call_tones, &process->tones, tone);
 }
 
+static void mtone_stop(process_t *process)
+{
+	if (!process || !process->mtone)
+		return;
+	process->mtone = 0;
+	osmo_timer_del(&process->mtone_timer);
+}
+
+/* the tone to the mobile was played often enough: clear the call */
+static void mtone_timeout(void *data)
+{
+	process_t *process = data;
+	int callref = process->callref, cause = process->cause, net_released = process->net_released;
+
+	LOGP(DCALL, LOGL_INFO, "Tone to the mobile played %d times, releasing the call (cause %d).\n", call_tone_repeats, cause);
+	destroy_process(callref);
+	if (!net_released)
+		indicate_disconnect_release(callref, cause, OSMO_CC_MSG_REL_IND);
+	call_down_release(callref, cause);
+}
+
+/* play a tone to the mobile, from the tone set of the network type; timed: --tone-repeats cycles, then clear */
+static void mtone_start(process_t *process, int tone, int timed)
+{
+	tones_set_tone(&call_tones, &process->mtones, tone);
+	process->mtone = tone;
+	if (timed) {
+		osmo_timer_setup(&process->mtone_timer, mtone_timeout, process);
+		schedule_seconds(&process->mtone_timer, call_tone_seconds(call_tones.spl_repeat[process->mtones.tone], 8000));
+	}
+}
+
+/* The network refuses or ends a call of the mobile without sending tones: if the radio system can keep the call
+ * (call_down_disconnect keeps it, while the mobile can hear audio), the mobile hears the tone of the cause, as an
+ * exchange sends it, then the call clears. Not after answer with normal clearing. Returns 1 if handled. */
+static int mobile_tone_failure(process_t *process, int cause, int net_released)
+{
+	int callref;
+
+	if (!mobile_tones || !process || !process->mo || cause <= 0 || cause >= 128)
+		return 0;
+	if (process->net_answered && (cause == 16 || cause == 31))
+		return 0;
+	callref = process->callref;
+	process->net_released = net_released;
+	process->cause = cause;
+	new_state_process(callref, PROCESS_DISCONNECT);
+	call_down_disconnect(callref, cause);
+	/* the radio system may have released the mobile (it cannot hear audio in this state) */
+	process = get_process(callref);
+	if (!process)
+		return 1;
+	LOGP(DCALL, LOGL_INFO, "Network %s the call (cause %d) without tones: sending the tone to the mobile.\n", net_released ? "released" : "disconnected", cause);
+	mtone_start(process, cause, 1);
+	return 1;
+}
+
 static void disconnect_process(int callref, int cause)
 {
 	process_t *process = get_process(callref);
@@ -722,6 +790,7 @@ int call_up_setup(const char *callerid, const char *dialing, uint8_t network, co
 	call = osmo_cc_call_new(ep);
 
 	process = create_process(call->callref, PROCESS_SETUP_RO);
+	process->mo = 1;
 
 	indicate_setup(process, callerid, dialing, network, network_id);
 
@@ -921,6 +990,11 @@ void call_up_release(int callref, int cause)
 	LOGP(DCALL, LOGL_INFO, "*** Call has been released with cause=%d (callref=%d) ***\n", cause, callref);
 
 	process = get_process(callref);
+	if (process && process->net_released) {
+		/* the network is gone already, we only played the tone to the mobile */
+		destroy_process(callref);
+		return;
+	}
 	if (process) {
 		LOGP(DCALL, LOGL_DEBUG, "Process state: %d, audio_disconnected: %d\n", process->state, process->audio_disconnected);
 		/* just keep OSMO-CC connection if tones shall be sent.
@@ -1048,6 +1122,18 @@ void call_clock(void)
 	}
 
 	while(process) {
+		if (process->mtone) {
+			int16_t spl[160];
+			uint16_t be[160];
+			int k;
+
+			memset(spl, 0, sizeof(spl));
+			tones_read_tone(&process->mtones, spl, 160);
+			for (k = 0; k < 160; k++)
+				be[k] = htons((uint16_t)spl[k]);
+			call_down_audio(decode_l16, process, process->callref, process->mt_seq++, 0, process->mt_ts, 0, (uint8_t *)be, sizeof(be));
+			process->mt_ts += 160;
+		}
 		if (process->tones.tone != TONES_TONE_OFF) {
 			int16_t spl[160];
 			uint8_t *payload;
@@ -1264,6 +1350,9 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		break;
 	case OSMO_CC_MSG_PROGRESS_REQ:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC progress from fixed network\n");
+		rc = osmo_cc_get_ie_progress(msg, 0, &coding, &location, &progress);
+		if (rc >= 0 && (progress == 1 || progress == 8))
+			mtone_stop(process);
 		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
@@ -1276,9 +1365,15 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		/* Also trigger channel assignment on ALERTING (in case PROCEEDING was skipped) */
 		call_down_proceeding(callref);
 		new_state_process(callref, PROCESS_ALERTING_RO);
+		/* the network alerts without in-band audio: the mobile hears our ringback tone */
+		rc = osmo_cc_get_ie_progress(msg, 0, &coding, &location, &progress);
+		if (mobile_tones && process->mo && (rc < 0 || (progress != 1 && progress != 8)))
+			mtone_start(process, TONES_TONE_RINGBACK, 0);
 		break;
 	case OSMO_CC_MSG_SETUP_RSP:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC answer from fixed network\n");
+		process->net_answered = 1;
+		mtone_stop(process);
 		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
@@ -1310,6 +1405,10 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		if (rc < 0)
 			progress = 0;
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC disconnect from fixed network with cause %d\n", isdn_cause);
+		mtone_stop(process);
+		/* no tones from the network (or they are not wanted): our own tone, if the mobile can hear it */
+		if ((release_on_disconnect || (progress != 1 && progress != 8)) && mobile_tone_failure(process, isdn_cause, 0))
+			break;
 		if (release_on_disconnect || (progress != 1 && progress != 8)) {
 			LOGP(DCALL, LOGL_INFO, "Releasing, because we don't send disconnect tones to mobile phone\n");
 			destroy_process(callref);
@@ -1331,10 +1430,16 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		rc = osmo_cc_get_ie_cause(msg, 0, &location, &isdn_cause, &sip_cause, &socket_cause);
 		if (rc < 0)
 			isdn_cause = OSMO_CC_ISDN_CAUSE_NORM_CALL_CLEAR;
+		mtone_stop(process);
+		if (msg->type == OSMO_CC_MSG_REL_REQ)
+			indicate_disconnect_release(callref, isdn_cause, OSMO_CC_MSG_REL_CNF);
+		if (mobile_tone_failure(process, isdn_cause, 1)) {
+			LOGP(DCALL, LOGL_INFO, "Received OSMO-CC %s from fixed network with cause %d\n", (msg->type == OSMO_CC_MSG_REL_REQ) ? "release" : "reject", isdn_cause);
+			break;
+		}
 		destroy_process(callref);
 		if (msg->type == OSMO_CC_MSG_REL_REQ) {
 			LOGP(DCALL, LOGL_INFO, "Received OSMO-CC release from fixed network with cause %d\n", isdn_cause);
-			indicate_disconnect_release(callref, isdn_cause, OSMO_CC_MSG_REL_CNF);
 		} else
 			LOGP(DCALL, LOGL_INFO, "Received OSMO-CC reject from fixed network with cause %d\n", isdn_cause);
 		LOGP(DCALL, LOGL_INFO, "Call released toward mobile network\n");

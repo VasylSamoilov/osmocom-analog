@@ -320,6 +320,15 @@ error_ta:
 			return -EINVAL;
 		}
 		traffic_area = rc << 4;
+		/* the exchange tones of the country (NMT Doc 450-2 9.6), others keep the Danish ones */
+		if (!strcasecmp(country, "SE"))
+			main_mobile_set_toneset("sweden");
+		else if (!strcasecmp(country, "NO"))
+			main_mobile_set_toneset("norway");
+		else if (!strcasecmp(country, "FI"))
+			main_mobile_set_toneset("finland");
+		else
+			main_mobile_set_toneset("denmark");
 		if (p[strlen(p) - 1] != '!') {
 			rc = nmt_ta_by_short_name(nmt_system, country, atoi(p));
 			if (rc < 0)

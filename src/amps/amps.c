@@ -5359,3 +5359,11 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 void dump_info(void) {}
 
 void dump_scheduler_hotkey(void) {}
+
+/* for -t list: when an AMPS/TACS phone hears tones from the network */
+const char *call_mobile_tone_note(void)
+{
+	return "AMPS/TACS: only on the voice channel. During set-up the phone is on the control channel, so the\n"
+	       "network's refusal becomes a Reorder (fast busy) or Intercept order and the phone makes the tone\n"
+	       "itself (TIA/EIA-553-A 3.6.3.3); once on the voice channel (SAT confirmed) it hears all tones.";
+}

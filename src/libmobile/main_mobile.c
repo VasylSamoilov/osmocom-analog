@@ -35,6 +35,8 @@
 #include <osmocom/core/select.h>
 #include <osmocom/cc/endpoint.h>
 #include "call.h"
+#include "../libtones/tones.h"
+#include <osmocom/cc/g711.h>
 #include "console.h"
 #include "get_time.h"
 #ifdef HAVE_SDR
@@ -82,6 +84,12 @@ static int cc_argc = 0;
 static const char *cc_argv[MAX_CC_ARGS];
 int no_l16 = 0;
 static const char *call_toneset = NULL;
+
+/* the radio system may choose its tone set from its options (e.g. NMT by country) */
+void main_mobile_set_toneset(const char *toneset)
+{
+	call_toneset = toneset;
+}
 int send_patterns = 1;
 static int release_on_disconnect = 1;
 int loopback = 0;
@@ -459,6 +467,11 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        Batch runs (all samples from and to IQ files): the time of the first\n");
 	printf("        sample, in seconds since 1970 UTC (default: now). The same time gives\n");
 	printf("        the same output on every run (frame numbers, date and time sent).\n");
+	printf("    --mobile-tones 0 | 1\n");
+	printf("        Tones towards the mobile phone (the mirror of --tones): ringback tone while the\n");
+	printf("        network alerts without audio, and the tone of the cause (busy, congestion, ...)\n");
+	printf("        when the network refuses or ends a call of the phone without tones, if the radio\n");
+	printf("        system can keep the call then (default = '%d').\n", mobile_tones);
 	printf("    --tone-repeats <n>\n");
 	printf("        Busy, congestion and other tones or announcements that we play when a call fails\n");
 	printf("        are played this many times, then the call is cleared (default: %d).\n", call_tone_repeats);
@@ -563,6 +576,7 @@ void main_mobile_print_hotkeys(void)
 #define	OPT_HEADLESS		2008
 #define	OPT_TONE_REPEATS	2010
 #define	OPT_TONE_TIMEOUT	2011
+#define	OPT_MOBILE_TONES	2012
 
 void main_mobile_add_options(void)
 {
@@ -584,6 +598,7 @@ void main_mobile_add_options(void)
 	option_add(OPT_HEADLESS, "headless", 0);
 	option_add(OPT_TONE_REPEATS, "tone-repeats", 1);
 	option_add(OPT_TONE_TIMEOUT, "tone-timeout", 1);
+	option_add(OPT_MOBILE_TONES, "mobile-tones", 1);
 	option_add(OPT_OSMO_CC, "cc", 1);
 	option_add(OPT_NO_L16, "no-l16", 0);
 	option_add('c', "call-device", 1);
@@ -712,6 +727,17 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		call_buffer = atoi(argv[argi]);
 		break;
 	case 't':
+		if (!strcmp(argv[argi], "list")) {
+			g711_init();
+			tones_print_set(call_toneset);
+			printf("\nTowards the network (-t 1): ringback while the phone rings, the tone of the cause when the\n"
+			       "phone does not answer or a call to it fails, until the caller hangs up.\n");
+			printf("Towards the phone (--mobile-tones 1): ringback while the network alerts without audio, the\n"
+			       "tone of the cause when the network refuses or ends a call of the phone without tones,\n"
+			       "%d times (--tone-repeats), at most %.0f s (--tone-timeout).\n", call_tone_repeats, call_tone_timeout);
+			printf("This system: %s\n", call_mobile_tone_note ? call_mobile_tone_note() : "not described");
+			return 0;
+		}
 		send_patterns = atoi(argv[argi]);
 		break;
 	case 'l':
@@ -778,6 +804,9 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_NO_ECHO_SUPPRESSOR:
 		echo_suppressor_config.enabled = 0;
+		break;
+	case OPT_MOBILE_TONES:
+		mobile_tones = atoi(argv[argi]);
 		break;
 	case OPT_TONE_REPEATS:
 		call_tone_repeats = atoi(argv[argi]);

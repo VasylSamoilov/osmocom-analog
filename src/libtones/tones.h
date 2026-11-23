@@ -62,6 +62,7 @@ typedef struct tones {
 } tones_t;
 
 void tones_list_tonesets(void);
+int tones_print_set(const char *toneset);
 int tones_init(tones_data_t *data, const char *toneset, enum tones_tdata coding);
 void tones_exit(tones_data_t *data);
 void tones_set_tone(tones_data_t *data, tones_t *t, enum tones_tone tone);

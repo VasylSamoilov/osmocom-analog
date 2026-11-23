@@ -22,6 +22,9 @@ struct tones_sets_t {
 	{ true, "american", "American tones", set_american },
 	{ true, "oldamerican", "Old American tones", set_oldamerican },
 	{ true, "denmark", "Danish tones", set_denmark },
+	{ true, "finland", "Finnish tones (NMT exchange)", set_finland },
+	{ true, "norway", "Norwegian tones (NMT exchange)", set_norway },
+	{ true, "sweden", "Swedish tones (NMT exchange)", set_sweden },
 	{ true, "japan", "Japanese tones", set_japan },
 	{ true, "france", "French tones", set_france },
 	{ true, "uk", "UK tones", set_uk },
@@ -279,6 +282,53 @@ static void render_tone(tones_data_t *data, uint8_t tone, tones_seq_t *seq, enum
 	/* Store silence interval until repeat. Use duration of TONES_TDATA_EOL. */
 	duration += seq[i].duration;
 	data->spl_repeat[tone] = duration;
+}
+
+static const char *tone_name(int tone)
+{
+	switch (tone) {
+	case TONES_TONE_HANGUP:		return "hangup (16)";
+	case TONES_TONE_BUSY:		return "busy (17)";
+	case TONES_TONE_NOANSWER:	return "no answer (19)";
+	case TONES_TONE_OUTOFORDER:	return "out of order (27)";
+	case TONES_TONE_INVALIDNUMBER:	return "invalid number (28)";
+	case TONES_TONE_CONGESTION:	return "congestion (34)";
+	case TONES_TONE_SIT:		return "special information (SIT)";
+	case TONES_TONE_DIALTONE:	return "dial tone";
+	case TONES_TONE_DIALTONE_SPECIAL: return "special dial tone";
+	case TONES_TONE_RINGBACK:	return "ringback";
+	case TONES_TONE_RECALL:		return "recall";
+	case TONES_TONE_CW:		return "call waiting";
+	case TONES_TONE_AUFSCHALTTON:	return "operator intrusion";
+	}
+	return NULL;
+}
+
+/* print the tones of a tone set, their length, and which tone stands in for the missing ones */
+int tones_print_set(const char *toneset)
+{
+	tones_data_t data;
+	tones_t t;
+	int tone;
+
+	if (tones_init(&data, toneset, TONES_TDATA_SLIN16HOST) < 0)
+		return -1;
+	printf("Tone set '%s' (8000 samples/s):\n", toneset);
+	for (tone = 1; tone < 255; tone++) {
+		const char *name = tone_name(tone);
+
+		if (!name)
+			continue;
+		tones_set_tone(&data, &t, tone);
+		if ((int)t.tone == tone)
+			printf("  %-27s %5.2f s per cycle\n", name, data.spl_repeat[tone] / 8000.0);
+		else if (t.tone == TONES_TONE_SILENCE || t.tone == TONES_TONE_OFF)
+			printf("  %-27s none (silence)\n", name);
+		else
+			printf("  %-27s uses %s\n", name, tone_name(t.tone) ? : "?");
+	}
+	tones_exit(&data);
+	return 0;
 }
 
 int tones_init(tones_data_t *data, const char *toneset, enum tones_tdata coding)

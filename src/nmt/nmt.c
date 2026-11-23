@@ -605,8 +605,6 @@ static void nmt_release(nmt_t *nmt)
 	transaction_t *trans = nmt->trans;
 
 	osmo_timer_del(&nmt->timer);
-	osmo_timer_del(&nmt->local_tone_timer);
-	nmt->local_tone = 0;
 
 	LOGP_CHAN(DNMT, LOGL_INFO, "Releasing connection towards mobile station.\n");
 	if (trans->callref) {
@@ -1746,7 +1744,6 @@ static void rx_mo_dialing(nmt_t *nmt, frame_t *frame)
 			trans->dms_call = 1;
 		} else {
 			LOGP(DNMT, LOGL_INFO, "Setup call to network.\n");
-			trans->mo_call = 1;
 			trans->callref = call_up_setup(&trans->subscriber.country, nmt->dialing, OSMO_CC_NETWORK_NMT_NONE, "");
 		}
 		osmo_timer_del(&nmt->timer);
@@ -3375,7 +3372,6 @@ void call_down_answer(int callref, struct timeval __attribute__((unused)) *tv_me
 	trans = get_transaction_by_callref(callref);
 	if (!trans)
 		return;
-	trans->net_answered = 1;
 	nmt = trans->nmt;
 	if (!nmt || !trans->subscriber.coinbox)
 		return;		/* not a coin-box call: ordinary answer, nothing special */
@@ -3444,24 +3440,8 @@ void call_down_disconnect(int callref, int cause)
 	call_up_release(callref, cause);
 }
 
-/* the tone of the exchange is over: clear the call */
-static void local_tone_timeout(void *data)
-{
-	nmt_t *nmt = data;
-
-	LOGP_CHAN(DNMT, LOGL_INFO, "Busy/congestion tone ends, clearing the call.\n");
-	nmt->local_tone = 0;
-	if (nmt->trans && nmt->state != STATE_IDLE)
-		nmt_release(nmt);
-}
-
-
-/* tones of the exchange (the same set as towards the fixed network), rendered once */
-static tones_data_t local_tones_data;
-static int local_tones_ok = -1;
-
 /* Call control releases call toward mobile station. */
-void call_down_release(int callref, int cause)
+void call_down_release(int callref, int __attribute__((unused)) cause)
 {
 	transaction_t *trans;
 	nmt_t *nmt;
@@ -3480,32 +3460,6 @@ void call_down_release(int callref, int cause)
 
 	if (!nmt) {
 		destroy_transaction(trans);
-		return;
-	}
-
-	/* A call from the MS that the network refuses (busy, congestion) without sending tones: the MTX
-	 * through-connects after address complete and sends the busy or congestion tone in-band to the
-	 * calling subscriber (NMT Doc 450-1 4.4.1.1 scheme A, 450-2 9.6); a clearing signal at once only
-	 * makes the MS sound its malfunction alarm and search for a calling channel (450-3 table 16.3). */
-	if (local_tones_ok < 0)
-		local_tones_ok = (tones_init(&local_tones_data, "denmark", TONES_TDATA_SLIN16HOST) == 0);
-	/* a call of the MS that the network ends with a tone of its own cause: before it answered, any cause;
-	 * after it answered, any cause but normal clearing (16, 31), which clears at once */
-	if (trans->mo_call && (nmt->state == STATE_MO_COMPLETE || nmt->state == STATE_ACTIVE)
-	 && (!trans->net_answered || (cause != 16 && cause != 31))
-	 && cause > 0 && cause < 128 && local_tones_ok && !trans->dms_call) {
-		/* the cause selects the tone: busy, congestion, no answer, out of order (announcement), invalid
-		 * number; any other cause the special information tone (libtones substitutes missing ones) */
-		nmt->local_tone = cause;
-		tones_set_tone(&local_tones_data, &nmt->local_tones, (enum tones_tone)cause);
-		{
-			/* --tone-repeats cycles of the tone (with its pause), at most --tone-timeout */
-			double secs = call_tone_seconds(local_tones_data.spl_repeat[nmt->local_tones.tone], 8000);
-			LOGP_CHAN(DNMT, LOGL_NOTICE, "Call refused by the network (cause %d): sending its tone to the mobile, clearing after %.1f s or when it hangs up.\n",
-				  cause, secs);
-			osmo_timer_setup(&nmt->local_tone_timer, local_tone_timeout, nmt);
-			osmo_timer_schedule(&nmt->local_tone_timer, (int)secs, (int)((secs - (int)secs) * 1e6));
-		}
 		return;
 	}
 
@@ -4114,3 +4068,11 @@ void deliver_power_change(const char *command)
 void dump_info(void) {}
 
 void dump_scheduler_hotkey(void) {}
+
+/* for -t list: when an NMT phone hears tones from the network */
+const char *call_mobile_tone_note(void)
+{
+	return "NMT: the speech path is through-connected after address complete (NMT Doc 450-1 4.4.1.1),\n"
+	       "so a phone's own call hears all tones from the end of dialling; a call to the phone from the\n"
+	       "moment it answers.";
+}
