@@ -147,6 +147,51 @@ static void assign_instance_for_cleanup(soapy_instance_t *inst, double tx_freque
 	}
 }
 
+/* A driver may accept the OFFSET tune argument and ignore it (no baseband / digital tuner, e.g. RTL-SDR,
+ * PlutoSDR): read back where the RF part really is. Applied, the device moves its DC spike (LO leakage) away
+ * at no cost to us. Not applied, the spike stays at the center frequency, which our channel placement keeps
+ * off the channels (one channel: one channel bandwidth off the center; several: between two of them). */
+static int has_tuning_stage(SoapySDRDevice *sdr, int direction, size_t channel)
+{
+	char **names;
+	size_t length = 0, i;
+	int found = 0;
+
+	names = SoapySDRDevice_listFrequencies(sdr, direction, channel, &length);
+	for (i = 0; i < length; i++) {
+		/* RF is the LO itself, CORR a PPM correction (not a frequency) */
+		if (strcasecmp(names[i], "RF") && strcasecmp(names[i], "CORR"))
+			found = 1;
+	}
+	SoapySDRStrings_clear(&names, length);
+	return found;
+}
+
+static void check_lo_offset(SoapySDRDevice *sdr, int direction, size_t channel, double frequency, double lo_offset)
+{
+	const char *dir = (direction == SOAPY_SDR_RX) ? "RX" : "TX";
+	char **names, list[256] = "";
+	size_t length = 0, i;
+	double rf;
+
+	names = SoapySDRDevice_listFrequencies(sdr, direction, channel, &length);
+	for (i = 0; i < length; i++) {
+		size_t l = strlen(list);
+		snprintf(list + l, sizeof(list) - l, "%s%s=%.0f", i ? " " : "", names[i],
+			 SoapySDRDevice_getFrequencyComponent(sdr, direction, channel, names[i]));
+	}
+	SoapySDRStrings_clear(&names, length);
+	LOGP(DSOAPY, LOGL_INFO, "%s frequency %.0f Hz, components: %s\n", dir, frequency, list[0] ? list : "(none listed)");
+	if (lo_offset == 0.0)
+		return;
+	rf = SoapySDRDevice_getFrequencyComponent(sdr, direction, channel, "RF");
+	/* applied: the RF LO moved by the offset and the total is still on frequency (checked by the caller) */
+	if (fabs(rf - (frequency + lo_offset)) < 1000.0 && has_tuning_stage(sdr, direction, channel))
+		LOGP(DSOAPY, LOGL_INFO, "%s LO offset %.0f Hz applied by the device (RF at %.0f Hz): its DC spike is outside our band.\n", dir, lo_offset, rf);
+	else
+		LOGP(DSOAPY, LOGL_NOTICE, "%s LO offset %.0f Hz accepted but NOT applied by the driver (RF at %.0f Hz, wanted %.0f Hz): the DC spike stays at the center frequency, our channel placement keeps it off the channels.\n", dir, lo_offset, rf, frequency + lo_offset);
+}
+
 int soapy_open(size_t channel, const char *_device_args, const char *_stream_args, const char *_tune_args, const char *tx_antenna, const char *rx_antenna, const char *clock_source, double tx_frequency, double rx_frequency, double lo_offset, double rate, double tx_gain, double rx_gain, double bandwidth, int timestamps)
 {
 	double got_frequency, got_rate, got_gain, got_bandwidth;
@@ -193,13 +238,6 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 		return rc;
 	}
 
-	if (lo_offset) {
-		char val[32];
-		snprintf(val, sizeof(val), "%.0f", lo_offset);
-		val[sizeof(val) - 1] = '\0';
-		SoapySDRKwargs_set(&tune_args, "OFFSET", val);
-	}
-
 	/* create SoapySDR device */
 	inst->sdr = SoapySDRDevice_make(&device_args);
 	if (!inst->sdr) {
@@ -207,6 +245,28 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 		assign_instance_for_cleanup(inst, tx_frequency, rx_frequency);
 		soapy_close();
 		return -EIO;
+	}
+
+	/* LO offset: only for a device with a tuning stage after the RF LO (BB, DSP, NCO, ...). Without one,
+	 * SoapySDR puts the rest of the offset into the next component: an RTL-SDR got RF 1 MHz off and
+	 * CORR (its PPM correction) = 1000000, "PLL not locked", no reception. Then we tune plainly; the DC
+	 * spike stays at the center frequency, which our channel placement keeps off the channels. */
+	if (lo_offset) {
+		int ok = 1;
+
+		if (rx_frequency && !has_tuning_stage(inst->sdr, SOAPY_SDR_RX, channel))
+			ok = 0;
+		if (tx_frequency && !has_tuning_stage(inst->sdr, SOAPY_SDR_TX, channel))
+			ok = 0;
+		if (ok) {
+			char val[32];
+			snprintf(val, sizeof(val), "%.0f", lo_offset);
+			val[sizeof(val) - 1] = '\0';
+			SoapySDRKwargs_set(&tune_args, "OFFSET", val);
+		} else {
+			LOGP(DSOAPY, LOGL_NOTICE, "The device has no tuning stage after its RF LO: LO offset %.0f Hz not used. Its DC spike stays at the center frequency, our channel placement keeps it off the channels.\n", lo_offset);
+			lo_offset = 0.0;
+		}
 	}
 
 	/* Detect RTL-SDR and force software clock.
@@ -406,6 +466,7 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 			soapy_close();
 			return -EINVAL;
 		}
+		check_lo_offset(inst->sdr, SOAPY_SDR_RX, channel, rx_frequency, lo_offset);
 
 		/* set bandwidth */
 		if (bandwidth > 0.0) {
@@ -544,6 +605,7 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 			soapy_close();
 			return -EINVAL;
 		}
+		check_lo_offset(inst->sdr, SOAPY_SDR_TX, channel, tx_frequency, lo_offset);
 
 		/* set bandwidth */
 		if (bandwidth > 0.0) {

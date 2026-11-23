@@ -14,6 +14,9 @@ typedef struct sdr_config {
 			*tune_args;
 	int		samplerate;		/* ADC/DAC sample rate */
 	double		lo_offset;		/* LO frequency offset */
+	int		lo_offset_given,	/* given on the command line (else the default) */
+			tx_lo_offset_given,
+			rx_lo_offset_given;
 	double		bandwidth;		/* IF bandwidth */
 	double		tx_gain,		/* gain */
 			rx_gain;

@@ -717,7 +717,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			   This is correct, since there is no bandwidth
 			   below new center frequency.
 			 */
-			LOGP(DSDR, LOGL_INFO, "We shift center frequency %.0f KHz down (half bandwidth), to prevent channel from overlapping with DC level.\n", bandwidth / 2.0 / 1e3);
+			LOGP(DSDR, LOGL_INFO, "We shift center frequency %.0f KHz down (one channel bandwidth, the channel's edge half of it off the center), to prevent channel from overlapping with DC level.\n", bandwidth / 1e3);
 		} else {
 			/* find two channels that are aside the center */
 			double low_dist = 0, high_dist = 0, dist;
@@ -842,7 +842,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			   This is correct, since there is no bandwidth
 			   below new center frequency.
 			 */
-			LOGP(DSDR, LOGL_INFO, "We shift center frequency %.0f KHz down (half bandwidth), to prevent channel from overlapping with DC level.\n", bandwidth / 2.0 / 1e3);
+			LOGP(DSDR, LOGL_INFO, "We shift center frequency %.0f KHz down (one channel bandwidth, the channel's edge half of it off the center), to prevent channel from overlapping with DC level.\n", bandwidth / 1e3);
 		} else {
 			/* find two channels that are aside the center */
 			double low_dist, high_dist, dist;

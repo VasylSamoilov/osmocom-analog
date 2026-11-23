@@ -370,6 +370,7 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_LO_OFFSET:
 		sdr_config->lo_offset = atof(argv[argi]);
+		sdr_config->lo_offset_given = 1;
 		break;
 	case OPT_SDR_BANDWIDTH:
 		sdr_config->bandwidth = atof(argv[argi]);
@@ -420,6 +421,7 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_TX_LO_OFFSET:
 		sdr_config->tx_lo_offset = atof(argv[argi]);
+		sdr_config->tx_lo_offset_given = 1;
 		break;
 	case OPT_SDR_RX_DEVICE:
 		sdr_config->rx_device_args = options_strdup(argv[argi]);
@@ -433,6 +435,7 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_RX_LO_OFFSET:
 		sdr_config->rx_lo_offset = atof(argv[argi]);
+		sdr_config->rx_lo_offset_given = 1;
 		break;
 	/* Upconverter options */
 	case OPT_SDR_UPCONVERTER:
@@ -648,8 +651,10 @@ int sdr_configure(int samplerate)
 				sdr_config->samplerate = sdr_config->rx_samplerate;
 			if (sdr_config->rx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0)
 				sdr_config->bandwidth = sdr_config->rx_bandwidth;
-			if (sdr_config->rx_lo_offset != 0.0)	/* given: wins over the default of the unified one */
+			if (sdr_config->rx_lo_offset_given) {	/* given (also 0): wins over the unified default */
 				sdr_config->lo_offset = sdr_config->rx_lo_offset;
+				sdr_config->lo_offset_given = 1;
+			}
 			if (sdr_config->rx_ppm != 0.0 && sdr_config->ppm == 0.0)
 				sdr_config->ppm = sdr_config->rx_ppm;
 			sdr_config->rx_device_args = NULL;
@@ -682,8 +687,10 @@ int sdr_configure(int samplerate)
 				sdr_config->samplerate = sdr_config->tx_samplerate;
 			if (sdr_config->tx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0)
 				sdr_config->bandwidth = sdr_config->tx_bandwidth;
-			if (sdr_config->tx_lo_offset != 0.0)	/* given: wins over the default of the unified one */
+			if (sdr_config->tx_lo_offset_given) {	/* given (also 0): wins over the unified default */
 				sdr_config->lo_offset = sdr_config->tx_lo_offset;
+				sdr_config->lo_offset_given = 1;
+			}
 			if (sdr_config->tx_ppm != 0.0 && sdr_config->ppm == 0.0)
 				sdr_config->ppm = sdr_config->tx_ppm;
 			sdr_config->tx_device_args = NULL;
