@@ -83,6 +83,34 @@ The device threads (TX ~11 %, RX ~10 % at 10 MS/s) are the UHD transfer,
 the same for both. In the main thread ~7 % at 10 MS/s are the ADC/DAC
 status counters over every SDR sample (to move into the device threads).
 
+## Engine in the device threads (step 3a, done)
+
+`libsdr/sdr_engine.c`: the banks, the channel groups and their DSP rate
+rings; the device RX thread runs the RX bank and the tails, the TX thread
+pulls the TX rings through the tails and the TX bank. A group is one
+program's channels; a row holds one sample of every channel. Groups are
+built by the caller and adopted / dropped by each device thread at a block
+border (trylock); a group that falls behind gets silence on TX and loses
+rows on RX, counted, the others untouched. TX pulled with
+`pfb_chan_tx_need()` / `pfb_chan_tx_pull()` (exact frame counts).
+
+`test_sdr_engine` (null device, TX looped to RX): tones back at 0.000 dB,
+the other channel -173 dB, 0 missing / dropped rows; RX: group A bit
+identical while B joins and leaves; TX: A within -142.6 dB while B joins,
+stalls, transmits and leaves; B's stall counted on B only.
+
+In sdr.c (same B210 loopback as above, DSP 48k, 15 s):
+
+| setup | frames | quality | CPU total | main thread | RX thread | TX thread |
+|---|---|---|---|---|---|---|
+| 2 ch, 1.92 MS/s | 218, 0 invalid | 91.0 % | 17 % | 5 % (was 12) | 5 % | 6 % |
+| 2 ch, 10 MS/s | 216, 0 invalid | 91.3 % | 56 % (was 61) | 8 % (was 34) | 21 % | 21 % |
+| 10 ch, 10 MS/s | 1090, 0 invalid | 91.0 % | 71 % (was 73) | 13 % (was 46) | 26 % | 26 % |
+
+(The quality figure is NMT's FSK decoder measure of how close the tone
+frequency is to ideal at each bit, averaged over a frame; 91 % is its
+ceiling on a clean cable path for every build, old ones included.)
+
 Over the air with phones, B210, filter bank active (2026-11-23):
 
 - NMT 2 channels (90 CC/TC, 92 TC), DSP 48k, SDR 1.92 MS/s, 8 sub-bands:
