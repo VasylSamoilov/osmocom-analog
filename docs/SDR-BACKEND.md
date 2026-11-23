@@ -107,6 +107,24 @@ In sdr.c (same B210 loopback as above, DSP 48k, 15 s):
 | 2 ch, 10 MS/s | 216, 0 invalid | 91.3 % | 56 % (was 61) | 8 % (was 34) | 21 % | 21 % |
 | 10 ch, 10 MS/s | 1090, 0 invalid | 91.0 % | 71 % (was 73) | 13 % (was 46) | 26 % | 26 % |
 
+10 ch at 10 MS/s for 120 s: 8670 frames, 0 invalid, no device events, no
+missing / dropped rows (logged once a second when they change).
+
+Latency, on one clock (time a sample is written -> time it is read back;
+noise as TX audio, B210 loopback, NMT 2 ch, DSP 48k, 1.92 MS/s): engine
+50.5 ms (49.6..51.2), per-channel chain 52.2 ms (51.2..53.1). The device is
+kept a few blocks ahead (>= 5 ms), the group's ring holds the rest of the
+buffer.
+
+Split mode (NMT, B210 TX + RTL-SDR RX via Soapy) on the engine: 228 frames,
+0 invalid, as the chain. FLEX 2 channels (931.9375 / 931.9625 MHz), TX-only
+B210 and RX-only RTL-SDR, engine on both: the TX IQ recorded and decoded
+from file: 1472 / 1472 codewords clean on both channels, as with the chain;
+one over-the-air recording decoded with the RX bank and with the chain: the
+same, all clean, all 5 pages with good checksums. Over the air some runs had
+errors on 931.9375 MHz with either path (not seen in the recordings above;
+a quiet scan shows no signal there, cause open).
+
 (The quality figure is NMT's FSK decoder measure of how close the tone
 frequency is to ideal at each bit, averaged over a frame; 91 % is its
 ceiling on a clean cable path for every build, old ones included.)
