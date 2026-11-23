@@ -122,8 +122,12 @@ B210 and RX-only RTL-SDR, engine on both: the TX IQ recorded and decoded
 from file: 1472 / 1472 codewords clean on both channels, as with the chain;
 one over-the-air recording decoded with the RX bank and with the chain: the
 same, all clean, all 5 pages with good checksums. Over the air some runs had
-errors on 931.9375 MHz with either path (not seen in the recordings above;
-a quiet scan shows no signal there, cause open).
+errors on 931.9375 MHz with either path: the RTL-SDR is about -7 ppm off
+the B210 (-6.6 kHz at 932 MHz, it drifts), next to where the channel 25 kHz
+from its neighbour fails (6..8 kHz: the neighbour gets into its
+demodulator; proven by an offset sweep, over the air and from file). Fixed
+with --sdr-ppm (it had no effect on Soapy, 43349f5) and the FLEX AFC
+(741764e).
 
 (The quality figure is NMT's FSK decoder measure of how close the tone
 frequency is to ideal at each bit, averaged over a frame; 91 % is its
