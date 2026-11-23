@@ -93,12 +93,13 @@ _Static_assert(AMPS_ORDER_MESSAGE_ENCRYPTION == AMPS_ORDER_DISABLE_DTMF + 1,
 #define RELEASE_TIMER	5,0		/* max time to send release messages */
 #define ST_FLASH_MIN	0.2		/* min duration for flash (200ms) */
 #define ST_FLASH_MAX	0.8		/* max duration for flash (800ms) */
-#define ST_RELEASE_TIME	1,000000	/* ST still on this long after its detection is a
-					 * release: the mobile sends 1.8 s for release,
-					 * 0.4 s for a flash, and a flash is at most
-					 * ST_FLASH_MAX (0.8 s) measured; detection lags
-					 * about 0.4 s, so this releases about 1.4 s after
-					 * the ST began instead of 2.2 s */
+#define ST_RELEASE_TIME	3,0		/* fallback only: the release is taken when the ST
+					 * ends (longer than a flash). TIA/EIA-553-A 2.6.4.5:
+					 * the mobile sends ST for 1.8 s, then turns off its
+					 * transmitter; 3.6.4.4: the base station then turns
+					 * off the transmitter. Releasing 1.0 s after the ST
+					 * detection cut the carrier while the mobile was
+					 * still sending its release. */
 
 /* Power Control Thresholds */
 #define VMAC_ADJUST_INTERVAL        50     /* Measurements between adjustments */
@@ -4761,6 +4762,12 @@ again:
 		goto again;
 	case TRANS_CALL_MO_ASSIGN:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Assigning channel to call from mobile station\n");
+		/* key up the voice channel (SAT, silence) before the mobile is sent there: it does not mute
+		 * without SAT (TIA/EIA-553-A 2.4.1) and played the noise of an empty channel; 3.6.4.2 expects
+		 * the voice channel transmitter on while waiting for the mobile */
+		vc = search_channel(trans->chan);
+		if (vc && vc != amps)
+			amps_set_dsp_mode(vc, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
 		trans_new_state(trans, TRANS_CALL_MO_ASSIGN_SEND);
 		return trans;
 	case TRANS_CALL_MO_ASSIGN_SEND:
@@ -4774,6 +4781,12 @@ again:
 		return NULL;
 	case TRANS_CALL_MT_ASSIGN:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Assigning channel to call to mobile station\n");
+		/* key up the voice channel (SAT, silence) before the mobile is sent there: it does not mute
+		 * without SAT (TIA/EIA-553-A 2.4.1) and played the noise of an empty channel; 3.6.4.2 expects
+		 * the voice channel transmitter on while waiting for the mobile */
+		vc = search_channel(trans->chan);
+		if (vc && vc != amps)
+			amps_set_dsp_mode(vc, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
 		trans_new_state(trans, TRANS_CALL_MT_ASSIGN_SEND);
 		return trans;
 	case TRANS_CALL_MT_ASSIGN_SEND:
