@@ -66,6 +66,23 @@ Not yet: through the real demodulator against today's chain, the Pi.
 
 ## In the programs (step 2, done: `--sdr-filter-bank auto|on|off`)
 
+B210 cable loopback (NMT -l 2), same build, bank vs per-channel chain, 15 s,
+DSP 48k; quality and level as NMT measures each received frame (through
+the FM demodulator and the decoder), CPU per thread from /proc:
+
+| setup | frames (15 s) | quality avg / min | events | CPU total (main) |
+|---|---|---|---|---|
+| 2 ch, 1.92 MS/s, bank | 218, 0 invalid | 91.0 / 91 % | 0 | 17 % (12 %) |
+| 2 ch, 1.92 MS/s, chain | 218, 0 invalid | 91.5 / 91 % | 0 | 17 % (12 %) |
+| 2 ch, 10 MS/s, bank | 216, 0 invalid | 91.1 / 91 % | 0 | 61 % (34 %) |
+| 2 ch, 10 MS/s, chain | 216, 0 invalid | 91.1 / 91 % | 0 | 64 % (38 %) |
+| 10 ch, 10 MS/s, bank | 1090, 0 invalid | 91.0 / 91 % | 0 | 73 % (46 %) |
+| 10 ch, 10 MS/s, chain | 0 (main thread at 100 %) | 53 / 43 % (24 frames) | 412 overflows | 115 % (100 %) |
+
+The device threads (TX ~11 %, RX ~10 % at 10 MS/s) are the UHD transfer,
+the same for both. In the main thread ~7 % at 10 MS/s are the ADC/DAC
+status counters over every SDR sample (to move into the device threads).
+
 Over the air with phones, B210, filter bank active (2026-11-23):
 
 - NMT 2 channels (90 CC/TC, 92 TC), DSP 48k, SDR 1.92 MS/s, 8 sub-bands:
