@@ -326,33 +326,23 @@ int soapy_open(size_t channel, const char *_device_args, const char *_stream_arg
 		}
 	}
 
-	/* apply PPM frequency correction */
+	/* PPM frequency correction: the requested frequency is scaled, as with
+	 * UHD. Not the driver's own correction: SoapyRTLSDR keeps it as the
+	 * tuning component "CORR", which the following setFrequency() sets to 0
+	 * again (measured: --sdr-ppm 10 moved the carrier by < 1 kHz at 932 MHz,
+	 * readback RF=931950000 CORR=0). */
 	if (sdr_config) {
 		double rx_ppm_val = sdr_config->rx_ppm;
 		double tx_ppm_val = sdr_config->tx_ppm;
 		if (rx_frequency && rx_ppm_val != 0.0) {
-			if (SoapySDRDevice_hasFrequencyCorrection(inst->sdr, SOAPY_SDR_RX, channel)) {
-				if (SoapySDRDevice_setFrequencyCorrection(inst->sdr, SOAPY_SDR_RX, channel, rx_ppm_val) != 0)
-					LOGP(DSOAPY, LOGL_ERROR, "Failed to set RX frequency correction to %.3f PPM\n", rx_ppm_val);
-				else
-					LOGP(DSOAPY, LOGL_INFO, "Set RX frequency correction to %.3f PPM\n", rx_ppm_val);
-			} else {
-				LOGP(DSOAPY, LOGL_NOTICE, "Device does not support RX frequency correction, will adjust frequency manually (%.3f PPM)\n", rx_ppm_val);
-				inst->ppm_manual_rx = rx_ppm_val;
-				rx_frequency = rx_frequency * (1.0 + rx_ppm_val / 1e6);
-			}
+			inst->ppm_manual_rx = rx_ppm_val;
+			LOGP(DSOAPY, LOGL_INFO, "Applying RX PPM correction %.3f: %.0f Hz -> %.0f Hz\n", rx_ppm_val, rx_frequency, rx_frequency * (1.0 + rx_ppm_val / 1e6));
+			rx_frequency = rx_frequency * (1.0 + rx_ppm_val / 1e6);
 		}
 		if (tx_frequency && tx_ppm_val != 0.0) {
-			if (SoapySDRDevice_hasFrequencyCorrection(inst->sdr, SOAPY_SDR_TX, channel)) {
-				if (SoapySDRDevice_setFrequencyCorrection(inst->sdr, SOAPY_SDR_TX, channel, tx_ppm_val) != 0)
-					LOGP(DSOAPY, LOGL_ERROR, "Failed to set TX frequency correction to %.3f PPM\n", tx_ppm_val);
-				else
-					LOGP(DSOAPY, LOGL_INFO, "Set TX frequency correction to %.3f PPM\n", tx_ppm_val);
-			} else {
-				LOGP(DSOAPY, LOGL_NOTICE, "Device does not support TX frequency correction, will adjust frequency manually (%.3f PPM)\n", tx_ppm_val);
-				inst->ppm_manual_tx = tx_ppm_val;
-				tx_frequency = tx_frequency * (1.0 + tx_ppm_val / 1e6);
-			}
+			inst->ppm_manual_tx = tx_ppm_val;
+			LOGP(DSOAPY, LOGL_INFO, "Applying TX PPM correction %.3f: %.0f Hz -> %.0f Hz\n", tx_ppm_val, tx_frequency, tx_frequency * (1.0 + tx_ppm_val / 1e6));
+			tx_frequency = tx_frequency * (1.0 + tx_ppm_val / 1e6);
 		}
 	}
 
