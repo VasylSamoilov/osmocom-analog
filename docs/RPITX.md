@@ -293,3 +293,30 @@ TC, 192 kS/s; channels 1, 4, 6 need more than 75 % of 192 kS/s): no clock on
 the phones, the call on the weakest channel failed (supervisory quality 39 %),
 the one on the middle channel was "noisy, at the limit" and lost its
 supervisory signal after a few seconds. Not usable on a Pi 4.
+
+Measured afterwards with test tones (twoch with three channels, 1 / 1.7 /
+2.3 kHz at 3 kHz deviation, received by the B210 112.5 kHz below the
+carrier, drive level 7), SINAD per channel:
+
+| Layout (offsets from the carrier) | Levels | SINAD |
+|---|---|---|
+| two channels, 25 kHz apart (reference) | 1 / 0.6 | 24.2 / 21.4 dB |
+| -37.5 / +12.5 / +37.5 kHz (NMT 1, 3, 4) | 1 / 0.7 / 0.5 | 13.2 / 12.5 / 9.2 dB |
+| same | 1 / 0.5 / 0.4 | 17.0 / 13.8 / 7.2 dB |
+| same | 1 / 0.4 / 0.35 | 19.0 / 15.2 / 6.9 dB |
+| same | 1 / 0.3 / 0.3 | 20.9 / 14.9 / 3.6 dB |
+| same, 240 kS/s | 1 / 0.45 / 0.45 | 15.0 / 3.3 / 4.4 dB |
+| -62.5 / +12.5 / +62.5 kHz (NMT 1, 4, 6) | 1 / 0.4 / 0.35 | 14.4 / 3.0 / -1.8 dB |
+| -75 / 0 / +50 kHz | 1 / 0.5 / 0.4 | 8.6 / 7.7 / -4.2 dB |
+| -50 / +25 / +75 kHz | 1 / 0.4 / 0.35 | 18.1 / -0.8 / -7.1 dB |
+
+Weaker second and third channels (their sum below the first, so the sum of
+the three never comes near zero) help the first two; the third stays below
+10 dB. Wider layouts are worse on air, the opposite of the simulation: the
+further the carrier has to swing from sample to sample, the larger the
+transmitter's error. Two channels are the practical maximum of a Pi 4.
+
+The drive level is already the highest (7); the pad's slew rate limit
+(PADS_GPIO_0 bit 4, librpitx clears it) makes no difference: one carrier
+at 463 MHz received at -30.9 / -32.7 dB (limited) and -32.5 / -31.3 dB (not
+limited), SNR 46.5..47.4 dB either way. More signal needs an amplifier.
