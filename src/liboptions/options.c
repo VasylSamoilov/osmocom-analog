@@ -30,13 +30,13 @@ const char *selected_config_file = NULL;
 
 /* Echo suppressor configuration with defaults */
 echo_suppressor_config_t echo_suppressor_config = {
-	.enabled = 0,                    /* Disabled by default */
+	.enabled = 1,                    /* on by default, --no-echo-suppressor turns it off */
 	.threshold_db = -40.0,           /* TX energy threshold */
-	.attenuation_db = 38.0,          /* 38 dB attenuation */
-	.hangover_ms = 150,              /* 150ms hold time */
+	.attenuation_db = 20.0,          /* phone echo measured >= 28 dB down: 20 dB more gives >= 48 dB */
+	.hangover_ms = 60,               /* hold time */
 	.ramp_ms = 2,                    /* 2ms attack time */
 	.release_ms = 200,               /* 200ms release time */
-	.doubletalk_threshold_db = 3.0,  /* Unused in unidirectional mode */
+	.doubletalk_threshold_db = 20.0, /* near end: RX above delayed TX - 20 dB (echo is >= 28 dB down) */
 	.stats_enabled = 0,              /* Statistics disabled by default */
 	.echo_delay_ms = 160             /* SDR echo delay (~150-160ms typical) */
 };

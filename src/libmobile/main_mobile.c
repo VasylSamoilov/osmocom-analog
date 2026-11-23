@@ -459,14 +459,15 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        Batch runs (all samples from and to IQ files): the time of the first\n");
 	printf("        sample, in seconds since 1970 UTC (default: now). The same time gives\n");
 	printf("        the same output on every run (frame numbers, date and time sent).\n");
-	printf("    --echo-suppressor\n");
-	printf("        Enable echo suppressor (energy-based direction detection).\n");
+	printf("    --echo-suppressor | --no-echo-suppressor\n");
+	printf("        Enable (default) or disable the echo suppressor: while the far end talks, the audio of the\n");
+	printf("        phone is attenuated, unless it is louder than an echo can be (the near end breaks in).\n");
 	printf("    --echo-threshold <dB>\n");
 	printf("        Set threshold for direction detection (default: %.1f dB).\n", echo_suppressor_config.threshold_db);
 	printf("    --echo-attenuation <dB>\n");
 	printf("        Set attenuation depth when suppressing (default: %.1f dB).\n", echo_suppressor_config.attenuation_db);
 	printf("    --echo-hangover <ms>\n");
-	printf("        Set hangover time to prevent rapid switching (default: 150 ms).\n");
+	printf("        Set hangover time to prevent rapid switching (default: %d ms).\n", echo_suppressor_config.hangover_ms);
 	printf("    --echo-delay <ms>\n");
 	printf("        Set SDR roundtrip delay for echo detection (default: 160, max: 500).\n");
 	printf("        Use this in SDR environments where echo arrives delayed.\n");
@@ -549,6 +550,7 @@ void main_mobile_print_hotkeys(void)
 #define	OPT_ECHO_ATTENUATION	2002
 #define	OPT_ECHO_HANGOVER	2003
 #define	OPT_ECHO_STATS		2004
+#define	OPT_NO_ECHO_SUPPRESSOR	2009
 #define	OPT_ECHO_DELAY		2005
 #define	OPT_ECHO_ANALYSIS	2006
 #define	OPT_ECHO_ANALYSIS_DURATION	2007
@@ -592,6 +594,7 @@ void main_mobile_add_options(void)
 	option_add(OPT_ECHO_HANGOVER, "echo-hangover", 1);
 	option_add(OPT_ECHO_DELAY, "echo-delay", 1);
 	option_add(OPT_ECHO_STATS, "echo-stats", 0);
+	option_add(OPT_NO_ECHO_SUPPRESSOR, "no-echo-suppressor", 0);
 	option_add(OPT_ECHO_ANALYSIS, "echo-analysis", 0);
 	option_add(OPT_ECHO_ANALYSIS_DURATION, "echo-analysis-duration", 1);
 #ifdef HAVE_SDR
@@ -762,6 +765,9 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 #endif
 	case OPT_ECHO_SUPPRESSOR:
 		echo_suppressor_config.enabled = 1;
+		break;
+	case OPT_NO_ECHO_SUPPRESSOR:
+		echo_suppressor_config.enabled = 0;
 		break;
 	case OPT_ECHO_THRESHOLD:
 		echo_suppressor_config.threshold_db = atof(argv[argi]);

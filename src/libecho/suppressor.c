@@ -44,7 +44,7 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /* Maximum echo delay we support (500ms should cover most SDR setups) */
-#define MAX_ECHO_DELAY_MS 500
+#define MAX_ECHO_DELAY_MS 300	/* round trip of a usable setup: 50..250 ms */
 
 /* The TX energy is kept in slots of this duration. The blocks that are given to process_tx() and
  * process_rx() have any size (the main loop gives what the sound device or SDR needs), and
@@ -60,7 +60,7 @@
 #define EST_SLOTS 1024
 #define EST_WINDOW_MS 2000
 #define EST_INTERVAL_MS 1000
-#define EST_MIN_CORR 0.5
+#define EST_MIN_CORR 0.7
 #define EST_MIN_TX_DB -45.0
 
 static void set_delay(echo_suppressor_state_t *state, int echo_delay_ms, int ramp_ms)
@@ -241,6 +241,9 @@ echo_suppressor_state_t *echo_suppressor_init(int sample_rate, int frame_size,
 	
 	/* Set configuration */
 	state->threshold_db = config->threshold_db;
+	state->doubletalk_db = config->doubletalk_threshold_db;
+	state->near_hangover = 0;
+	state->near_slot = -1000000;
 	state->attenuation_db = config->attenuation_db;
 	state->attenuation_linear = pow(10.0, -config->attenuation_db / 20.0);
 	state->hangover_samples = (config->hangover_ms * sample_rate) / 1000;
@@ -334,8 +337,28 @@ static double tx_reference_energy(echo_suppressor_state_t *state, int count)
 	long long first, last, slot;
 	double energy = -100.0;
 
-	/* the time span of the block on the TX time line, in slots */
+	/* the time span of the block on the TX time line, in slots; while the delay is measured but not yet
+	 * known, any delay up to MAX_ECHO_DELAY_MS is possible, so all of them are taken */
 	first = (state->rx_total - state->delay_samples) / state->slot_samples;
+	if (state->auto_delay && state->est_delay_ms < 0) {
+		long long d = ((long long)MAX_ECHO_DELAY_MS * state->sample_rate) / 1000;
+
+		first = (state->rx_total > d) ? (state->rx_total - d) / state->slot_samples : 0;
+		last = (state->rx_total + count - 1) / state->slot_samples;
+		if (last > state->slots_written - 1)
+			last = state->slots_written - 1;
+		if (first < state->slots_written - state->history_size + 1)
+			first = state->slots_written - state->history_size + 1;
+		if (first < 0)
+			first = 0;
+		for (slot = first; slot <= last; slot++) {
+			double e = state->tx_energy_history[slot % state->history_size];
+
+			if (e > energy)
+				energy = e;
+		}
+		return energy;
+	}
 	last = (state->rx_total + count - 1 - state->delay_samples) / state->slot_samples;
 	if (state->rx_total < state->delay_samples)
 		return -100.0;
@@ -382,7 +405,7 @@ void echo_suppressor_process_rx(echo_suppressor_state_t *state, int16_t *samples
 				state->est_rx_count = 0;
 			}
 		}
-		if (state->rx_slots >= state->est_next) {
+		if (state->rx_slots >= state->est_next && state->rx_slots - state->near_slot > EST_WINDOW_MS / ENERGY_SLOT_MS) {
 			int lag = 0, ms;
 			double corr;
 
@@ -416,8 +439,20 @@ void echo_suppressor_process_rx(echo_suppressor_state_t *state, int16_t *samples
 	/* Decay hangover */
 	state->tx_hangover = MAX(0, state->tx_hangover - count);
 	
+	/* Double talk: the echo of the phone returns at least 28 dB below the far end (measured on air, NMT and
+	 * AMPS phones on the table); RX louder than the far end minus doubletalk_db is the near end talking.
+	 * Then RX passes (break-in) for the hangover time, and the delay measurement pauses. */
+	if (state->doubletalk_db > 0.0 && state->rx_energy > -60.0 && state->rx_energy > tx_ref_energy - state->doubletalk_db) {
+		state->near_hangover = state->hangover_samples;
+		state->near_slot = state->rx_slots;
+	}
+	state->near_hangover = MAX(0, state->near_hangover - count);
+
 	/* Determine RX gain target */
-	if (state->tx_hangover > 0) {
+	if (state->near_hangover > 0) {
+		/* near end talks - pass RX through */
+		state->rx_gain_target = 1.0;
+	} else if (state->tx_hangover > 0) {
 		/* TX active - suppress RX (potential echo) */
 		state->rx_gain_target = state->attenuation_linear;
 		state->suppressed_frames++;
@@ -427,8 +462,9 @@ void echo_suppressor_process_rx(echo_suppressor_state_t *state, int16_t *samples
 	}
 	
 	/* Smooth gain transition per sample (fast attack, slow release per Bell/CCITT) */
+	/* the near end breaking in opens as fast as the suppression closes, so its first syllable is not lost */
 	state->rx_gain = apply_gain_ramp(samples, count, state->rx_gain, state->rx_gain_target,
-	                                 state->attack_alpha, state->release_alpha);
+	                                 state->attack_alpha, (state->near_hangover > 0) ? state->attack_alpha : state->release_alpha);
 	
 	state->rx_frames++;
 }

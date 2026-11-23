@@ -76,6 +76,9 @@ typedef struct {
 	
 	/* Configuration */
 	double threshold_db;        /* TX energy threshold for suppression */
+	double doubletalk_db;       /* RX above the delayed TX minus this is the near end (0 = off) */
+	int near_hangover;          /* near end talking (samples left) */
+	long long near_slot;        /* RX slot of the last near-end detection */
 	double attenuation_db;      /* RX attenuation depth */
 	double attenuation_linear;  /* Attenuation as linear gain */
 	int hangover_samples;       /* Hangover duration in samples */
@@ -104,7 +107,7 @@ typedef struct {
 	int hangover_ms;            /* Hold time after TX stops (Bell/CCITT: 150-300 ms) */
 	int ramp_ms;                /* Attack time (Bell/CCITT: 1-5 ms) */
 	int release_ms;             /* Release time (Bell/CCITT: 200-500 ms) */
-	double doubletalk_threshold_db; /* Unused - kept for compatibility */
+	double doubletalk_threshold_db; /* RX above the delayed TX minus this (dB) is the near end: pass (0 = off) */
 	int stats_enabled;          /* Enable statistics logging */
 	int echo_delay_ms;          /* SDR echo delay (default: 0, max: 500) */
 	int echo_delay_given;       /* the delay was given: do not measure and use the measured one */
