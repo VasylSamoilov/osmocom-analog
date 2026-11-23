@@ -52,6 +52,8 @@ typedef struct transaction {
 
 	/* DMS/SMS */
 	int			dms_call;		/* indicates to use DMS (used for SMS) */
+	int			net_answered;		/* the network answered the call */
+	int			mo_call;		/* the call was made by the MS */
 	char			sms_string[256];	/* current message to deliver (may contain any byte, see sms_len) */
 	int			sms_len;		/* length of sms_string in bytes (so an embedded 0x00 is kept) */
 

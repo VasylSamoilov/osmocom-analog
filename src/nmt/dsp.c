@@ -865,6 +865,14 @@ again:
 			jitter_load_samples(&sender->dejitter, (uint8_t *)spl, input_num, sizeof(*spl), jitter_conceal_s16, NULL);
 			int16_to_samples_speech(samples, spl, input_num);
 		}
+		if (nmt->local_tone) {
+			/* the tone or announcement of the exchange for the cause (libtones, at its network level) */
+			int16_t tspl[input_num];
+
+			memset(tspl, 0, sizeof(tspl));
+			tones_read_tone(&nmt->local_tones, tspl, input_num);
+			int16_to_samples_speech(samples, tspl, input_num);
+		}
 		if (ld)
 			meter_add_bands(&ld->tx[TX_FROM_NETWORK], samples, input_num, INT16_FULL_SCALE * 0.9999);
 		/* Echo suppressor TX reference (far-end audio before DSP processing) */

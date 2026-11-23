@@ -1,3 +1,4 @@
+#include "../libtones/tones.h"
 #include "../libmobile/sender.h"
 #include <osmocom/core/timer.h>
 #include "../libcompandor/compandor.h"
@@ -139,6 +140,11 @@ struct nmt {
 	char			scip_password[4];	/* SCIP: subscriber password echoed on re-identification */
 	enum nmt_active_state	active_state;
 	struct osmo_timer_list		timer;
+	/* busy / congestion tone of the exchange, played by us when the network refuses a call from the MS
+	 * without tones (NMT Doc 450-2 9.6: the MTX sends it in-band to the calling subscriber) */
+	int				local_tone;		/* cause whose tone is played, 0 = off */
+	tones_t				local_tones;		/* its tone or announcement (libtones) */
+	struct osmo_timer_list		local_tone_timer;	/* clears the call after the tone */
 	int			rx_frame_count;		/* receive frame counter */
 	int			tx_frame_count;		/* transmit frame counter */
 	unsigned int		cc_slot;		/* idle calling channel: slots sent (even: idle frame, odd: carousel) */
