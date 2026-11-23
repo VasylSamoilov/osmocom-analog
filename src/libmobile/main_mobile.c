@@ -459,6 +459,12 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("        Batch runs (all samples from and to IQ files): the time of the first\n");
 	printf("        sample, in seconds since 1970 UTC (default: now). The same time gives\n");
 	printf("        the same output on every run (frame numbers, date and time sent).\n");
+	printf("    --tone-repeats <n>\n");
+	printf("        Busy, congestion and other tones or announcements that we play when a call fails\n");
+	printf("        are played this many times, then the call is cleared (default: %d).\n", call_tone_repeats);
+	printf("    --tone-timeout <seconds>\n");
+	printf("        But at most this long; tones sent by the network are waited for this long\n");
+	printf("        (default: %.0f).\n", call_tone_timeout);
 	printf("    --echo-suppressor | --no-echo-suppressor\n");
 	printf("        Enable (default) or disable the echo suppressor: while the far end talks, the audio of the\n");
 	printf("        phone is attenuated, unless it is louder than an echo can be (the near end breaks in).\n");
@@ -555,6 +561,8 @@ void main_mobile_print_hotkeys(void)
 #define	OPT_ECHO_ANALYSIS	2006
 #define	OPT_ECHO_ANALYSIS_DURATION	2007
 #define	OPT_HEADLESS		2008
+#define	OPT_TONE_REPEATS	2010
+#define	OPT_TONE_TIMEOUT	2011
 
 void main_mobile_add_options(void)
 {
@@ -574,6 +582,8 @@ void main_mobile_add_options(void)
 	option_add('x', "osmocc-cross", 0);
 	option_add('o', "osmocc-sock", 0);
 	option_add(OPT_HEADLESS, "headless", 0);
+	option_add(OPT_TONE_REPEATS, "tone-repeats", 1);
+	option_add(OPT_TONE_TIMEOUT, "tone-timeout", 1);
 	option_add(OPT_OSMO_CC, "cc", 1);
 	option_add(OPT_NO_L16, "no-l16", 0);
 	option_add('c', "call-device", 1);
@@ -768,6 +778,16 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_NO_ECHO_SUPPRESSOR:
 		echo_suppressor_config.enabled = 0;
+		break;
+	case OPT_TONE_REPEATS:
+		call_tone_repeats = atoi(argv[argi]);
+		if (call_tone_repeats < 1)
+			call_tone_repeats = 1;
+		break;
+	case OPT_TONE_TIMEOUT:
+		call_tone_timeout = atof(argv[argi]);
+		if (call_tone_timeout < 1.0)
+			call_tone_timeout = 1.0;
 		break;
 	case OPT_ECHO_THRESHOLD:
 		echo_suppressor_config.threshold_db = atof(argv[argi]);

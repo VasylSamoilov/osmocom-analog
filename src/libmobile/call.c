@@ -49,7 +49,25 @@
 /* External configuration */
 extern echo_suppressor_config_t echo_suppressor_config;
 
-#define DISC_TIMEOUT	30, 0
+int call_tone_repeats = 3;
+double call_tone_timeout = 30.0;
+
+/* seconds to play a tone or announcement of the given cycle (tone and pause) */
+double call_tone_seconds(int cycle_samples, int samplerate)
+{
+	double secs = (double)call_tone_repeats * (double)cycle_samples / (double)samplerate;
+
+	if (secs < 1.0)
+		secs = 1.0;
+	if (secs > call_tone_timeout)
+		secs = call_tone_timeout;
+	return secs;
+}
+
+static void schedule_seconds(struct osmo_timer_list *timer, double secs)
+{
+	osmo_timer_schedule(timer, (int)secs, (int)((secs - (int)secs) * 1e6));
+}
 
 //#define DEBUG_LEVEL
 
@@ -551,7 +569,8 @@ static void disconnect_process(int callref, int cause)
 	tones_set_tone(&call_tones, &process->tones, cause);
 	process->audio_disconnected = 1;
 	process->cause = cause;
-	osmo_timer_schedule(&process->timer, DISC_TIMEOUT);
+	/* our tone: call_tone_repeats cycles of it (measured from the tone set), at most call_tone_timeout */
+	schedule_seconds(&process->timer, call_tone_seconds(call_tones.spl_repeat[process->tones.tone], 8000));
 }
 
 static void process_timeout(void *data)
@@ -1305,7 +1324,7 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		/* we might get released during disconnect handling!!! */
 		process = get_process(callref);
 		if (process && process->state == PROCESS_DISCONNECT)
-			osmo_timer_schedule(&process->timer, DISC_TIMEOUT);
+			schedule_seconds(&process->timer, call_tone_timeout);	/* the network's tones: unknown length */
 		break;
 	case OSMO_CC_MSG_REJ_REQ:
 	case OSMO_CC_MSG_REL_REQ:

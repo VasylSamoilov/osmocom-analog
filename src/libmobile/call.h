@@ -27,6 +27,12 @@ void mncc_flush(void);
 /* received messages */
 int call_up_setup(const char *callerid, const char *dialing, uint8_t network, const char *network_id);
 void call_up_alerting(int callref);
+
+/* Tones and announcements played by us: this many cycles, at most call_tone_timeout seconds (--tone-repeats,
+ * --tone-timeout); tones sent by the network itself are waited for up to call_tone_timeout. */
+extern int call_tone_repeats;
+extern double call_tone_timeout;
+double call_tone_seconds(int cycle_samples, int samplerate);
 void call_up_early(int callref);
 void call_up_answer(int callref, const char *connect_id);
 void call_up_flash(int callref);

@@ -3455,7 +3455,6 @@ static void local_tone_timeout(void *data)
 		nmt_release(nmt);
 }
 
-#define LOCAL_TONE_REPEATS	3	/* the tone / announcement is played this many times, then the call clears */
 
 /* tones of the exchange (the same set as towards the fixed network), rendered once */
 static tones_data_t local_tones_data;
@@ -3500,13 +3499,8 @@ void call_down_release(int callref, int cause)
 		nmt->local_tone = cause;
 		tones_set_tone(&local_tones_data, &nmt->local_tones, (enum tones_tone)cause);
 		{
-			/* LOCAL_TONE_REPEATS cycles of the tone (with its pause), within 3..20 s */
-			double secs = LOCAL_TONE_REPEATS * (double)local_tones_data.spl_repeat[nmt->local_tones.tone] / 8000.0;
-
-			if (secs < 3.0)
-				secs = 3.0;
-			if (secs > 20.0)
-				secs = 20.0;
+			/* --tone-repeats cycles of the tone (with its pause), at most --tone-timeout */
+			double secs = call_tone_seconds(local_tones_data.spl_repeat[nmt->local_tones.tone], 8000);
 			LOGP_CHAN(DNMT, LOGL_NOTICE, "Call refused by the network (cause %d): sending its tone to the mobile, clearing after %.1f s or when it hangs up.\n",
 				  cause, secs);
 			osmo_timer_setup(&nmt->local_tone_timer, local_tone_timeout, nmt);
