@@ -155,6 +155,7 @@ static const char *oneshot_station_id = "";	/* saved capcode for sweep re-enqueu
 #define OPT_BIW_TIME_MODE	3037
 #define OPT_MAX_MSG_NUMBER	3038
 #define OPT_FIFO_FILE		3039
+#define OPT_AFC_RANGE		3040
 
 void print_help(const char *arg0)
 {
@@ -330,6 +331,11 @@ void print_help(const char *arg0)
 	printf("        from the other messages of the address in progress. Default OFF:\n");
 	printf("        the alphanumeric, HEX, numbered numeric and numbered short messages\n");
 	printf("        of each capcode are numbered 0, 1, ... with R=1 on initial TX.\n");
+	printf("    --afc-range <Hz>\n");
+	printf("        RX: how far the receiver follows the carrier offset (AFC): at each\n");
+	printf("        sync 1 the offset is measured and the channel's demodulator moved\n");
+	printf("        onto the signal. 0 = off. Correct larger offsets of the SDR with\n");
+	printf("        --sdr-ppm. (default = %.0f)\n", flex_afc_range);
 	printf("    --max-message-number <0-63>\n");
 	printf("        Largest message number of the network (the pagers are set to it):\n");
 	printf("        after it the numbers of a capcode start from 0 again. Default 63.\n");
@@ -513,6 +519,7 @@ static void add_options(void)
 	option_add(OPT_HACK_NONSTANDARD, "hack-for-non-standard-decoders", 0);
 	option_add(OPT_NO_MSG_NUMBERING, "no-message-numbering", 0);
 	option_add(OPT_MAX_MSG_NUMBER, "max-message-number", 1);
+	option_add(OPT_AFC_RANGE, "afc-range", 1);
 	option_add(OPT_FIFO, "fifo", 1);
 	option_add(OPT_FIFO_FILE, "fifo-file", 1);
 }
@@ -965,6 +972,13 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_NO_MSG_NUMBERING:
 		no_message_numbering = 1;
+		break;
+	case OPT_AFC_RANGE:
+		flex_afc_range = atof(argv[argi]);
+		if (flex_afc_range < 0.0) {
+			fprintf(stderr, "--afc-range must be 0 (off) or more Hz.\n");
+			return -EINVAL;
+		}
 		break;
 	case OPT_MAX_MSG_NUMBER:
 		max_message_number = atoi(argv[argi]);
