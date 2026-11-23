@@ -37,6 +37,8 @@ enum amps_trans_state {
 	TRANS_CALL_MWI_SEND,		/* sending Message Waiting order (Order 5), sending */
 	TRANS_CALL_STOP_ALERT,		/* sending Stop Alert order (Order 6), waiting to send */
 	TRANS_CALL_STOP_ALERT_SEND,	/* sending Stop Alert order (Order 6), sending */
+	TRANS_CALL_STOP_ALERT_CONFIRM,	/* Stop Alert sent, waiting for SAT,ST (1,1) to (1,0) (3.6.4.3.2) */
+	TRANS_CALL_WAIT_ORDER,		/* Waiting for Order Task (3.6.4.3.1): SAT, no speech, the network sends the next order */
 	TRANS_CALL_INTERCEPT,		/* sending Intercept order (Order 9), waiting to send */
 	TRANS_CALL_INTERCEPT_SEND,	/* sending Intercept order (Order 9), sending */
 	TRANS_CALL_MAINTENANCE,		/* sending Maintenance order (Order 10), waiting to send */
@@ -104,6 +106,7 @@ typedef struct transaction {
 	int			sat_fade_armed;		/* the timer runs as the SAT fade timer */
 	struct amps		*prekey_vc;		/* voice channel keyed before the designation, not yet in use */
 	int			release_cause;		/* the network released during the designation: release on the VC */
+	int			order_confirmed;	/* the mobile confirmed the order while it was still being sent */
 	int			dtx;			/* if set, DTX is used with this call */
 	double			st_start_time;		/* time when ST was first detected */
 	double			flash_time;		/* time when last flash was detected (for auto Order 8) */

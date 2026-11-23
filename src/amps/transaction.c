@@ -127,6 +127,10 @@ static const char *trans_state_name(int state)
 		return "STOP ALERT";
 	case TRANS_CALL_STOP_ALERT_SEND:
 		return "STOP ALERT SEND";
+	case TRANS_CALL_STOP_ALERT_CONFIRM:
+		return "STOP ALERT CONFIRM";
+	case TRANS_CALL_WAIT_ORDER:
+		return "WAITING FOR ORDER";
 	case TRANS_CALL_INTERCEPT:
 		return "INTERCEPT";
 	case TRANS_CALL_INTERCEPT_SEND:
@@ -243,7 +247,10 @@ const char *trans_short_state_name(int state)
 		return "MWI";
 	case TRANS_CALL_STOP_ALERT:
 	case TRANS_CALL_STOP_ALERT_SEND:
+	case TRANS_CALL_STOP_ALERT_CONFIRM:
 		return "STOPALRT";
+	case TRANS_CALL_WAIT_ORDER:
+		return "WAITORDR";
 	case TRANS_CALL_INTERCEPT:
 	case TRANS_CALL_INTERCEPT_SEND:
 	case TRANS_INTERCEPT:

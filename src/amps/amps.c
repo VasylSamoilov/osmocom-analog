@@ -935,6 +935,26 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 			osmo_timer_schedule(&trans->timer, ANSWER_TO);
 		}
 		break;
+	case TRANS_CALL_STOP_ALERT_SEND:
+		/* The mobile reacts on the first word it decodes, while the base still repeats the message
+		 * (11 times, 3.7.2): ST off now is its confirmation of the Stop Alert being sent. Status
+		 * changes are interpreted within the task (3.6.4); remembered until the message is out. */
+		if (!tone && trans->sat_detected) {
+			LOGP_CHAN(DAMPS, LOGL_INFO, "Stop Alert confirmed by the mobile (ST off) while the order is still sent.\n");
+			trans->order_confirmed = 1;
+		}
+		break;
+	case TRANS_CALL_STOP_ALERT_CONFIRM:
+		/* (1,1) to (1,0): ST off with SAT ((0,x) is treated as (0,0), 3.6.4) */
+		if (!tone && trans->sat_detected) {
+			LOGP_CHAN(DAMPS, LOGL_INFO, "Stop Alert confirmed by the mobile (ST off), Waiting for Order.\n");
+			trans_new_state(trans, TRANS_CALL_WAIT_ORDER);
+		}
+		break;
+	case TRANS_CALL_WAIT_ORDER:
+		/* no order is pending, so an ST change confirms nothing here */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Signaling tone %s while Waiting for Order, ignored.\n", tone ? "on" : "off");
+		break;
 	case TRANS_CALL_MAINTENANCE_SEND:
 		/* Maintenance order ST confirmation
 		 * Per TIA/EIA-553-A: Mobile turns on ST for 500ms to confirm
@@ -1125,6 +1145,8 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 	 && trans->state != TRANS_CALL_PARAM_UPDATE_SEND
 	 && trans->state != TRANS_CALL_MWI
 	 && trans->state != TRANS_CALL_MWI_SEND
+	 && trans->state != TRANS_CALL_STOP_ALERT_CONFIRM
+	 && trans->state != TRANS_CALL_WAIT_ORDER
 	 && trans->state != TRANS_CALL_DIGITS_REQUEST
 	 && trans->state != TRANS_CALL_DIGITS_REQUEST_SEND
 	 && trans->state != TRANS_CALL_ESN_REQUEST
@@ -2481,9 +2503,9 @@ int amps_alert_order(const char *number)
 		return -CAUSE_OUTOFORDER;
 	}
 
-	/* Verify subscriber is in active call state */
-	if (trans->state != TRANS_CALL) {
-		LOGP(DAMPS, LOGL_NOTICE, "Alert Order: subscriber '%s' not in active call (state=%d)\n", 
+	/* Verify subscriber is in active call state, or Waiting for Order (after Stop Alert) */
+	if (trans->state != TRANS_CALL && trans->state != TRANS_CALL_WAIT_ORDER) {
+		LOGP(DAMPS, LOGL_NOTICE, "Alert Order: subscriber '%s' not in active call (state=%d)\n",
 			number, trans->state);
 		return -CAUSE_BUSY;
 	}
@@ -2613,8 +2635,10 @@ int amps_release_order(const char *number)
 	    trans->state != TRANS_CALL_MT_ALERT &&
 	    trans->state != TRANS_CALL_MT_ALERT_SEND &&
 	    trans->state != TRANS_CALL_MT_ALERT_CONFIRM &&
-	    trans->state != TRANS_CALL_MT_ANSWER_WAIT) {
-		LOGP(DAMPS, LOGL_NOTICE, "Release Order: subscriber '%s' not in valid state for release (state=%d)\n", 
+	    trans->state != TRANS_CALL_MT_ANSWER_WAIT &&
+	    trans->state != TRANS_CALL_STOP_ALERT_CONFIRM &&
+	    trans->state != TRANS_CALL_WAIT_ORDER) {
+		LOGP(DAMPS, LOGL_NOTICE, "Release Order: subscriber '%s' not in valid state for release (state=%d)\n",
 			number, trans->state);
 		return -CAUSE_BUSY;
 	}
@@ -2961,6 +2985,11 @@ int amps_stopalert(const char *number)
 	trans->msg_type = 0;
 	trans->ordq = 0;       /* ORDQ=0 for Stop Alert */
 	trans->order = 6;      /* Order 6 = Stop Alert */
+	trans->order_confirmed = 0;
+
+	/* the ringing ends: no alert or answer timer any more; Waiting for Order has no base timer
+	 * (3.6.4.3.1), only the fade timer on SAT loss */
+	osmo_timer_del(&trans->timer);
 
 	/* Set transaction state to trigger FVC transmission */
 	trans_new_state(trans, TRANS_CALL_STOP_ALERT);
@@ -4609,6 +4638,15 @@ void transaction_timeout(void *data)
 		LOGP_CHAN(DAMPS, LOGL_NOTICE, "Alerting timeout, destroying transaction\n");
 		amps_release(trans, CAUSE_NOANSWER);
 		break;
+	case TRANS_CALL_STOP_ALERT_CONFIRM:
+	case TRANS_CALL_WAIT_ORDER:
+		/* the only timer here is the fade timer (armed on SAT loss); the mobile also turns its
+		 * transmitter off when it gets no order within 5 s (2.6.4.3.1) */
+		if (trans->sat_detected)
+			break;
+		LOGP_CHAN(DAMPS, LOGL_NOTICE, "Timeout after %ld seconds loosing SAT signal.\n", trans->timer.timeout.tv_sec);
+		amps_release(trans, CAUSE_TEMPFAIL);
+		break;
 	case TRANS_PAGE_REPLY:
 		if (trans->page_retry++ == PAGE_TRIES) {
 			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Paging timeout, destroying transaction\n");
@@ -5121,12 +5159,18 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		trans_new_state(trans, TRANS_CALL_STOP_ALERT_SEND);
 		return trans;
 	case TRANS_CALL_STOP_ALERT_SEND:
-		/* Stop Alert sent, return to call state (no confirmation expected)
-		 * The mobile stops ringing but stays on the voice channel
-		 */
-		LOGP_CHAN(DAMPS, LOGL_INFO, "Stop Alert order sent\n");
-		trans_new_state(trans, TRANS_CALL);
-		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+		/* "Stop alert: The mobile station confirms the order by a change in the SAT, ST status from
+		 * (1,1) to (1,0). The base station shall then enter the Waiting for Order Task." (TIA/EIA-553-A
+		 * 3.6.4.3.2, p.84). Until then SAT only, no speech: the call is not answered. */
+		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
+		if (trans->order_confirmed) {
+			trans->order_confirmed = 0;
+			LOGP_CHAN(DAMPS, LOGL_INFO, "Stop Alert order sent and already confirmed, Waiting for Order.\n");
+			trans_new_state(trans, TRANS_CALL_WAIT_ORDER);
+			return NULL;
+		}
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Stop Alert order sent, waiting for the confirmation (ST off).\n");
+		trans_new_state(trans, TRANS_CALL_STOP_ALERT_CONFIRM);
 		return NULL;
 	case TRANS_CALL_INTERCEPT:
 		/* Intercept (Order 9, ORDQ=0) - number cannot be completed
