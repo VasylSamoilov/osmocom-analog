@@ -64,6 +64,21 @@ DSP rate sent at -0.18 dB, its images <= -104.3 dBc; two FM channels 25 kHz
 apart in one sub-band: nothing outside them above -115.6 dB.
 Not yet: through the real demodulator against today's chain, the Pi.
 
+## In the programs (step 2, done: `--sdr-filter-bank auto|on|off`)
+
+Over the air with phones, B210, filter bank active (2026-11-23):
+
+- NMT 2 channels (90 CC/TC, 92 TC), DSP 48k, SDR 1.92 MS/s, 8 sub-bands:
+  call between two phones set up and cleared normally; 48 frames from the
+  phones, RX level 93 %, quality 86 % on average (one frame 46 %);
+  supervisory tone 87..95. Audio: "the same" as before (user).
+- AMPS 354 CC/PC, 375 VC, 396 VC (offsets -315, +315, +945 kHz; the layout
+  that failed with the old code), DSP 96k, SDR 3.84 MS/s, 16 sub-bands:
+  both phones registered, call alerted with caller ID, answered, voice on
+  both voice channels, release confirmed by the mobile. RTL-SDR: the control
+  channel at 880.620 MHz, nothing else came up in 880.4..882.1 MHz.
+  Audio: "seems also good" (user).
+
 ## Rules
 
 1. **Nothing changes under a running channel.** SDR rate, centre frequency,
