@@ -94,6 +94,9 @@ typedef struct pfb_chan {
 	sample_t	*mid_i, *mid_q;		/* at 2 dsp */
 	sample_t	*out_i, *out_q;		/* TX: frames for the bank; RX: DSP samples kept */
 	int		kept;			/* RX */
+	/* TX pull: surplus kept between calls */
+	int		mid_kept;		/* samples at 2 dsp not yet resampled (at the start of mid_i/q) */
+	int		fr_len, fr_given;	/* frames in out_i/q, of them given out by the last pull */
 } pfb_chan_t;
 
 /* RX: max_frames = most frames per call; TX: max_in = most DSP samples per
@@ -112,5 +115,13 @@ int pfb_chan_rx_need(const pfb_chan_t *ch, int want);
 int pfb_chan_tx_process(pfb_chan_t *ch, const sample_t *in_i, const sample_t *in_q, int n);
 /* TX: most frames from n DSP samples */
 int pfb_chan_tx_max(const pfb_chan_t *ch, int n);
+
+/* TX, pulled by the bank (channels that started at different times or have
+ * different DSP rates): DSP samples needed for exactly 'frames' frames;
+ * then pull with that many: ch->out_i/out_q hold exactly 'frames' frames
+ * (the surplus is kept for the next pull). Do not mix with
+ * pfb_chan_tx_process() on one channel. */
+int pfb_chan_tx_need(const pfb_chan_t *ch, int frames);
+void pfb_chan_tx_pull(pfb_chan_t *ch, const sample_t *in_i, const sample_t *in_q, int n, int frames);
 
 #endif /* _PFB_H */

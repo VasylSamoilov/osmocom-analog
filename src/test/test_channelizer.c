@@ -681,6 +681,64 @@ static void test_pfb_tx(int fs, int m, int dsp, double off)
 	free(in1);
 }
 
+/* TX pull: random frame counts, each pull exactly that many; the frames
+ * laid end to end equal the push API's on the same input */
+static void test_pfb_tx_pull(int fs, int m, int dsp, double off)
+{
+	pfb_t pfb;
+	pfb_chan_t a, b;
+	int nd = dsp / 5, s, k, total_push = 0, total_pull = 0, pos = 0, bad = 0, max_in = 4000;
+	sample_t *in_i = malloc(sizeof(sample_t) * nd), *in_q = malloc(sizeof(sample_t) * nd);
+	sample_t *push_i, *push_q;
+	double worst = 0;
+	char what[120];
+
+	printf("TX pull %d <- %d S/s, %d bins:\n", fs, dsp, m);
+	pfb_tx_init(&pfb, fs, m, 0.5 * dsp);
+	pfb_chan_tx_init(&a, &pfb, off, dsp, max_in);
+	pfb_chan_tx_init(&b, &pfb, off, dsp, max_in);
+	for (s = 0; s < nd; s++) {
+		in_i[s] = 0.3 * cos(2 * M_PI * 1234.0 / dsp * s) + 0.1 * sin(0.37 * s);
+		in_q[s] = 0.3 * sin(2 * M_PI * 1234.0 / dsp * s);
+	}
+	push_i = malloc(sizeof(sample_t) * pfb_chan_tx_max(&a, nd));
+	push_q = malloc(sizeof(sample_t) * pfb_chan_tx_max(&a, nd));
+	/* push in blocks of 1000 */
+	for (s = 0; s + 1000 <= nd; s += 1000) {
+		int f = pfb_chan_tx_process(&a, in_i + s, in_q + s, 1000);
+
+		memcpy(push_i + total_push, a.out_i, f * sizeof(sample_t));
+		memcpy(push_q + total_push, a.out_q, f * sizeof(sample_t));
+		total_push += f;
+	}
+	/* pull random frame counts */
+	srand(11);
+	while (1) {
+		int frames = 1 + rand() % 300, n = pfb_chan_tx_need(&b, frames);
+
+		if (pos + n > s || total_pull + frames > total_push)
+			break;
+		pfb_chan_tx_pull(&b, in_i + pos, in_q + pos, n, frames);
+		pos += n;
+		if (b.fr_given != frames)
+			bad++;
+		for (k = 0; k < frames; k++)
+			worst = fmax(worst, fabs(b.out_i[k] - push_i[total_pull + k]) + fabs(b.out_q[k] - push_q[total_pull + k]));
+		total_pull += frames;
+	}
+	/* the NCO phasor is renormalised at the end of each call: push and pull
+	 * calls end at other samples, so the last bits differ */
+	snprintf(what, sizeof(what), "%d frames pulled in random counts: wrong counts %d, difference to push (x 1e12)", total_pull, bad);
+	check(!bad && worst < 1e-12 && total_pull > total_push / 2, what, worst * 1e12, "");
+	pfb_chan_exit(&a);
+	pfb_chan_exit(&b);
+	pfb_exit(&pfb);
+	free(in_i);
+	free(in_q);
+	free(push_i);
+	free(push_q);
+}
+
 static void test_refusals(void)
 {
 	channelizer_t ch;
@@ -730,6 +788,9 @@ int main(void)
 	test_pfb_rx(1920000, 16, 48000, 412345);
 	test_pfb_tx(10000000, 64, 48000, -3337500 + 0.31 * 156250);
 	test_pfb_tx(1920000, 16, 48000, -412345);
+	test_pfb_tx_pull(10000000, 64, 48000, -3337500 + 0.31 * 156250);
+	test_pfb_tx_pull(1920000, 8, 48000, 61234);	/* bin rate 480k: 10 x DSP */
+	test_pfb_tx_pull(3840000, 16, 96000, 945000);	/* bin rate = 2 dsp: no wide resampler */
 
 	printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
 	return failures ? 1 : 0;

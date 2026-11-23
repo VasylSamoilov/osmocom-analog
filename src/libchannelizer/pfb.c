@@ -371,8 +371,9 @@ static int chan_init(pfb_chan_t *ch, const pfb_t *pfb, double offset, int dsp_ra
 		goto fail;
 
 	if (tx) {
-		/* max DSP samples in -> 2 max at 2 dsp -> frames */
-		mid_max = 2 * max + 2;
+		/* max DSP samples in -> 2 max at 2 dsp (+ the few kept by the
+		 * pull) -> frames */
+		mid_max = 2 * max + 8;
 		out_max = ch->use_rs1 ? mid_max * resamp_max_out(&ch->rs1) + 2 : mid_max;
 	} else {
 		/* max frames in -> at 2 dsp; the DSP samples kept for the next call */
@@ -491,6 +492,82 @@ int pfb_chan_tx_max(const pfb_chan_t *ch, int n)
 	int mid = 2 * n + 2;
 
 	return ch->use_rs1 ? mid * resamp_max_out(&ch->rs1) + 2 : mid;
+}
+
+int pfb_chan_tx_need(const pfb_chan_t *ch, int frames)
+{
+	int have = ch->fr_len - ch->fr_given, mid;
+
+	if (frames <= have)
+		return 0;
+	/* samples at 2 dsp for the missing frames, the ones kept first; the
+	 * 1:2 gives exactly 2 per DSP sample */
+	mid = ch->use_rs1 ? resamp_need(&ch->rs1, frames - have) : frames - have;
+	mid -= ch->mid_kept;
+	if (mid <= 0)
+		return 0;
+	return (mid + 1) / 2;
+}
+
+void pfb_chan_tx_pull(pfb_chan_t *ch, const sample_t *in_i, const sample_t *in_q, int n, int frames)
+{
+	double pi = ch->nco_i, pq = ch->nco_q, ri = ch->rot_i, rq = ch->rot_q, mag;
+	int s, k, have, use, made;
+
+	if (n > ch->max_in || ch->mid_kept > 6) {
+		fprintf(stderr, "pfb_chan_tx_pull: %d samples (max %d), %d kept: give what pfb_chan_tx_need() says, please fix!\n", n, ch->max_in, ch->mid_kept);
+		abort();
+	}
+	/* frames of the last pull out, the surplus to the front */
+	have = ch->fr_len - ch->fr_given;
+	memmove(ch->out_i, ch->out_i + ch->fr_given, have * sizeof(*ch->out_i));
+	memmove(ch->out_q, ch->out_q + ch->fr_given, have * sizeof(*ch->out_q));
+	ch->fr_len = have;
+	ch->fr_given = 0;
+	/* 1:2 after the kept samples at 2 dsp */
+	k = ch->mid_kept;
+	for (s = 0; s < n; s++)
+		k += resamp_process(&ch->rs2, in_i[s], in_q[s], ch->mid_i + k, ch->mid_q + k);
+	/* as many at 2 dsp as the missing frames need, the rest kept */
+	if (frames > have) {
+		use = ch->use_rs1 ? resamp_need(&ch->rs1, frames - have) : frames - have;
+		if (use > k)
+			use = k;
+	} else
+		use = 0;
+	made = 0;
+	if (ch->use_rs1) {
+		for (s = 0; s < use; s++)
+			made += resamp_process(&ch->rs1, ch->mid_i[s], ch->mid_q[s], ch->out_i + have + made, ch->out_q + have + made);
+	} else {
+		memcpy(ch->out_i + have, ch->mid_i, use * sizeof(*ch->out_i));
+		memcpy(ch->out_q + have, ch->mid_q, use * sizeof(*ch->out_q));
+		made = use;
+	}
+	ch->mid_kept = k - use;
+	memmove(ch->mid_i, ch->mid_i + use, ch->mid_kept * sizeof(*ch->mid_i));
+	memmove(ch->mid_q, ch->mid_q + use, ch->mid_kept * sizeof(*ch->mid_q));
+	/* fine NCO up from 0 Hz on the new frames, in their order */
+	for (s = have; s < have + made; s++) {
+		double xi = ch->out_i[s], xq = ch->out_q[s], t;
+
+		ch->out_i[s] = xi * pi - xq * pq;
+		ch->out_q[s] = xi * pq + xq * pi;
+		t = pi * ri - pq * rq;
+		pq = pi * rq + pq * ri;
+		pi = t;
+	}
+	mag = sqrt(pi * pi + pq * pq);
+	ch->nco_i = pi / mag;
+	ch->nco_q = pq / mag;
+	ch->fr_len = have + made;
+	if (ch->fr_len < frames) {
+		/* less input than pfb_chan_tx_need() asked for: the rest silent */
+		memset(ch->out_i + ch->fr_len, 0, (frames - ch->fr_len) * sizeof(*ch->out_i));
+		memset(ch->out_q + ch->fr_len, 0, (frames - ch->fr_len) * sizeof(*ch->out_q));
+		ch->fr_len = frames;
+	}
+	ch->fr_given = frames;
 }
 
 int pfb_chan_tx_process(pfb_chan_t *ch, const sample_t *in_i, const sample_t *in_q, int n)
