@@ -101,6 +101,9 @@ typedef struct transaction {
 	struct osmo_timer_list		timer;			/* for varous timeouts */
 	struct osmo_timer_list		flash_timer;		/* timer for auto Order 8 after flash */
 	int			sat_detected;		/* state if we detected SAT */
+	int			sat_fade_armed;		/* the timer runs as the SAT fade timer */
+	struct amps		*prekey_vc;		/* voice channel keyed before the designation, not yet in use */
+	int			release_cause;		/* the network released during the designation: release on the VC */
 	int			dtx;			/* if set, DTX is used with this call */
 	double			st_start_time;		/* time when ST was first detected */
 	double			flash_time;		/* time when last flash was detected (for auto Order 8) */

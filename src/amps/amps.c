@@ -902,8 +902,21 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 		break;
 	case TRANS_CALL_RELEASE:
 	case TRANS_CALL_RELEASE_SEND:
-		/* also loosing singaling tone indicates release confirm (after alerting) */
-		LOGP_CHAN(DAMPS, LOGL_DEBUG, "ST detected during CALL/RELEASE state - releasing call (callref=%d)\n", trans->callref);
+		/* The mobile confirms the Release order with ST held for 1.8 s, while ringing after 500 ms
+		 * without ST; the base station turns off the transmitter after that (TIA/EIA-553-A 3.6.4.3,
+		 * 3.6.4.4, p.100, p.102). So the end of a long ST is the confirmation; the end of the ringing
+		 * ST and short ST pulses are not. RELEASE_TIMER ends it, if the confirmation is not seen. */
+		if (tone) {
+			if (trans->st_start_time == 0.0)
+				trans->st_start_time = get_time();
+			break;
+		}
+		if (trans->st_start_time == 0.0 || get_time() - trans->st_start_time < ST_FLASH_MAX) {
+			trans->st_start_time = 0.0;
+			break;
+		}
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Release confirmed by the mobile (ST %.1f s), turning off.\n", get_time() - trans->st_start_time);
+		trans->st_start_time = 0.0;
 		osmo_timer_del(&trans->timer);
 		if (trans->callref)
 			call_up_release(trans->callref, CAUSE_NORMAL);
@@ -1162,7 +1175,10 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 	}
 
 	if (tone) {
-		osmo_timer_del(&trans->timer);
+		/* only the fade timer stops: the timer of the state (answer, alert, release, ...) goes on */
+		if (trans->sat_fade_armed)
+			osmo_timer_del(&trans->timer);
+		trans->sat_fade_armed = 0;
 	} else {
 		/* SAT lost: arm the fade timer (TIA/EIA-553-A 2.6.4.1, p.70).
 		 * This must run even for a DTX call: DTX only suspends SAT for
@@ -1171,8 +1187,10 @@ void amps_rx_sat(amps_t *amps, int tone, double quality)
 		 * link continuity and must release. Previously the timer was
 		 * deleted for DTX calls, so a dropped DTX call was never torn
 		 * down. */
-		if (!osmo_timer_pending(&trans->timer))
+		if (!osmo_timer_pending(&trans->timer)) {
 			osmo_timer_schedule(&trans->timer, SAT_TO2);
+			trans->sat_fade_armed = 1;
+		}
 	}
 
 	if (amps->sender.loopback)
@@ -1723,27 +1741,15 @@ void call_down_disconnect(int callref, int cause)
 		return;
 	}
 
-	/* Release when not active */
-
-	switch (amps->dsp_mode) {
-	case DSP_MODE_AUDIO_RX_AUDIO_TX:
-	case DSP_MODE_AUDIO_RX_FRAME_TX:
-		if (trans->state == TRANS_CALL_MT_ASSIGN_CONFIRM
-		 || trans->state == TRANS_CALL_MT_ALERT
-		 || trans->state == TRANS_CALL_MT_ALERT_SEND
-		 || trans->state == TRANS_CALL_MT_ALERT_CONFIRM
-		 || trans->state == TRANS_CALL_MT_ANSWER_WAIT) {
-			LOGP_CHAN(DAMPS, LOGL_INFO, "Call control disconnect on voice channel while alerting, releasing towards mobile station.\n");
-			amps_release(trans, cause);
-		}
+	/* A call in conversation stays, so the network's in-band tones and announcements reach the mobile.
+	 * In any other state the mobile cannot hear them: it is released as the standard wants for that
+	 * state (Reorder / Intercept on the control channel, Release on the voice channel), and the network
+	 * gets the release. */
+	if (trans->state == TRANS_CALL)
 		return;
-	default:
-		LOGP_CHAN(DAMPS, LOGL_INFO, "Call control disconnects on control channel, removing transaction.\n");
-		call_up_release(callref, cause);
-		trans->callref = 0;
-		destroy_transaction(trans);
-		amps_go_idle(amps);
-	}
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Call control disconnect during set-up (state %s), releasing towards mobile station.\n", trans_short_state_name(trans->state));
+	call_down_release(callref, cause);
+	call_up_release(callref, cause);
 }
 
 /* Call control releases call toward mobile station. */
@@ -1780,9 +1786,13 @@ void call_down_release(int callref, int cause)
 		break;
 	default:
 		/* Phone is on control channel - check if we can send Reorder/Intercept */
+		if (trans->state == TRANS_CALL_MO_ASSIGN_SEND) {
+			/* the designation is on its way: Release on the voice channel when it is complete */
+			trans->release_cause = cause ? cause : CAUSE_NORMAL;
+			return;
+		}
 		if (trans->state == TRANS_CALL_MO_WAIT_PROCEED ||
-		    trans->state == TRANS_CALL_MO_ASSIGN ||
-		    trans->state == TRANS_CALL_MO_ASSIGN_SEND) {
+		    trans->state == TRANS_CALL_MO_ASSIGN) {
 			/*
 			 * Delayed Channel Assignment: Network rejected before phone tuned to VC
 			 * =====================================================================
@@ -4766,12 +4776,23 @@ again:
 		 * without SAT (TIA/EIA-553-A 2.4.1) and played the noise of an empty channel; 3.6.4.2 expects
 		 * the voice channel transmitter on while waiting for the mobile */
 		vc = search_channel(trans->chan);
-		if (vc && vc != amps)
+		if (vc && vc != amps) {
 			amps_set_dsp_mode(vc, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
+			trans->prekey_vc = vc;
+		}
 		trans_new_state(trans, TRANS_CALL_MO_ASSIGN_SEND);
 		return trans;
 	case TRANS_CALL_MO_ASSIGN_SEND:
 		vc = assign_voice_channel(trans);
+		trans->prekey_vc = NULL;
+		if (vc && trans->release_cause) {
+			/* the network released while the designation was sent: the mobile goes to the voice
+			 * channel and does not see a Reorder on the control channel any more */
+			LOGP_CHAN(DAMPS, LOGL_INFO, "Assignment complete, but the network released: Release order on the voice channel\n");
+			amps_set_dsp_mode(vc, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
+			amps_release(trans, trans->release_cause);
+			return NULL;
+		}
 		if (vc) {
 			LOGP_CHAN(DAMPS, LOGL_INFO, "Assignment complete, voice connected\n");
 			/* timer and other things are processed at assign_voice_channel() */
@@ -4785,12 +4806,15 @@ again:
 		 * without SAT (TIA/EIA-553-A 2.4.1) and played the noise of an empty channel; 3.6.4.2 expects
 		 * the voice channel transmitter on while waiting for the mobile */
 		vc = search_channel(trans->chan);
-		if (vc && vc != amps)
+		if (vc && vc != amps) {
 			amps_set_dsp_mode(vc, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
+			trans->prekey_vc = vc;
+		}
 		trans_new_state(trans, TRANS_CALL_MT_ASSIGN_SEND);
 		return trans;
 	case TRANS_CALL_MT_ASSIGN_SEND:
 		vc = assign_voice_channel(trans);
+		trans->prekey_vc = NULL;
 		if (vc) {
 			LOGP_CHAN(DAMPS, LOGL_INFO, "Assignment complete, waiting for SAT on VC\n");
 			/* timer and other things are processed at assign_voice_channel() */

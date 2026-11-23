@@ -25,6 +25,7 @@
 #include "../libmobile/call.h"
 #include "../libmobile/cause.h"
 #include "amps.h"
+#include "dsp.h"
 //#include "database.h"
 
 static const char *trans_state_name(int state)
@@ -365,6 +366,10 @@ void destroy_transaction(transaction_t *trans)
 
 	osmo_timer_del(&trans->timer);
 	osmo_timer_del(&trans->flash_timer);
+
+	/* a voice channel keyed for this call that it never got to: key it off again */
+	if (trans->prekey_vc && trans->prekey_vc->state == STATE_IDLE && !trans->prekey_vc->trans_list)
+		amps_set_dsp_mode(trans->prekey_vc, DSP_MODE_OFF, 0);
 
 	trans_new_state(trans, 0);
 
