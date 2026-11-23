@@ -137,6 +137,7 @@ int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, dou
 			sender->audio_read = sdr_read;
 			sender->audio_write = sdr_write;
 			sender->audio_get_tosend = sdr_get_tosend;
+			sender->audio_set_rx_trim = sdr_set_rx_trim;
 		} else
 #endif
 		{
@@ -322,6 +323,24 @@ void sender_destroy(sender_t *sender)
 }
 
 /* set frequency modulation and parameters */
+/* RX frequency trim (Hz) of this sender's channel, for a decoder that
+ * measures the carrier offset (AFC): moves the channel's demodulator to the
+ * signal. SDR only (else 0). Takes effect from the next block read; returns
+ * the trim set (limited by the device). */
+double sender_set_rx_trim(sender_t *sender, double hz)
+{
+	sender_t *master = sender->master ? sender->master : sender, *inst;
+	int channel = 0;
+
+	if (!master->audio || !master->audio_set_rx_trim)
+		return 0.0;
+	for (inst = master; inst && inst != sender; inst = inst->slave)
+		channel++;
+	if (!inst)
+		return 0.0;
+	return master->audio_set_rx_trim(master->audio, channel, hz);
+}
+
 void sender_set_fm(sender_t *sender, double max_deviation, double max_modulation, double speech_deviation, double max_display)
 {
 	sender->max_deviation = max_deviation;

@@ -48,6 +48,7 @@ typedef struct sender {
 	int			(*audio_write)(void *, sample_t **, uint8_t **, int, enum paging_signal *, int *, int);
 	int			(*audio_read)(void *, sample_t **, int, int, double *);
 	int			(*audio_get_tosend)(void *, int);
+	double			(*audio_set_rx_trim)(void *, int, double);	/* SDR only: RX frequency trim of a channel */
 	int			samplerate;
 	samplerate_t		srstate;		/* sample rate conversion state */
 	double			rx_gain;		/* factor of level to apply on RX samples */
@@ -110,6 +111,7 @@ extern int check_channel;
 int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, double empfangsfrequenz, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, enum paging_signal paging_signal);
 void sender_destroy(sender_t *sender);
 void sender_set_fm(sender_t *sender, double max_deviation, double max_modulation, double speech_deviation, double max_display);
+double sender_set_rx_trim(sender_t *sender, double hz);
 void sender_set_am(sender_t *sender, double max_modulation, double speech_deviation, double max_display, double modulation_index);
 int sender_open_audio(int buffer_size, double interval);
 int sender_start_audio(void);

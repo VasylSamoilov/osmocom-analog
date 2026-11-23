@@ -113,6 +113,7 @@ typedef struct sdr_chan {
 	channelizer_t	rx_ch;		/* SDR rate -> DSP rate, channel at 0 Hz */
 	channelizer_t	tx_ch;		/* DSP rate -> SDR rate, 0 Hz to the channel */
 	double		tx_offset, rx_offset;	/* from the SDR centre (engine mode) */
+	double		rx_trim;	/* RX frequency trim of the demodulator (Hz), set by the decoder */
 } sdr_chan_t;
 
 typedef struct sdr {
@@ -155,6 +156,7 @@ typedef struct sdr {
 	sdr_group_t	*group;
 	sample_t	**eng_i, **eng_q;	/* DSP rate samples of every channel (TX: channels + paging) */
 	int		eng_n;			/* number of them */
+	double		bandwidth;		/* of each channel (Carson) */
 	int		eng_chunk;		/* SDR samples per sdr_engine_tx_produce() */
 	float		*rx_gap_zero;		/* zeros for lost RX samples (rx_max_in) */
 	int		eng_advance;		/* TX: SDR samples the device is kept ahead (time stamps) */
@@ -257,6 +259,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 	sdr->channels = channels;
 	sdr->amplitude = 1.0 / (double)channels;
 	sdr->samplerate = samplerate;
+	sdr->bandwidth = bandwidth;
 	sdr->buffer_size = buffer_size;
 	sdr->interval = interval;
 	sdr->threads = 1; /* always required, because write may block */
@@ -1973,6 +1976,34 @@ static int sdr_tx_device_paced(void)
 }
 
 /* how much do we need to send (in audio sample duration) to get the target delay (buffer size) */
+/* RX frequency trim of one channel (Hz, added to the channel's frequency):
+ * the FM demodulator's oscillator moves the channel to 0 Hz before its
+ * lowpass (fm_demod_set_offset()), so the channel filter follows the signal.
+ * For a decoder that measures the carrier offset (AFC). Applies to the
+ * samples demodulated from the next sdr_read() on. Limited so the channel
+ * stays in the usable DSP band (0.4 of the DSP rate each side); returns the
+ * trim set. Main thread (as sdr_read()). */
+double sdr_set_rx_trim(void *inst, int channel, double hz)
+{
+	sdr_t *sdr = (sdr_t *)inst;
+	double max;
+
+	if (!sdr || channel < 0 || channel >= sdr->channels || !sdr->chan[channel].rx_init || sdr->chan[channel].am)
+		return 0.0;
+	max = 0.4 * sdr->samplerate - sdr->bandwidth / 2.0;
+	if (max < 0.0)
+		max = 0.0;
+	if (hz > max)
+		hz = max;
+	if (hz < -max)
+		hz = -max;
+	if (hz != sdr->chan[channel].rx_trim) {
+		fm_demod_set_offset(&sdr->chan[channel].fm_demod, hz);
+		sdr->chan[channel].rx_trim = hz;
+	}
+	return hz;
+}
+
 int sdr_get_tosend(void *inst, int buffer_size)
 {
 	sdr_t *sdr = (sdr_t *)inst;
