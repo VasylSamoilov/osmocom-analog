@@ -26,7 +26,7 @@
  *
  *     f[n] = arg(s[n] * conj(s[n-1])) * samplerate / 2pi
  *
- * The carrier is on at a constant drive level (--sdr-tx-gain 0..7) while
+ * The carrier is on at the maximum drive level (fixed, 16 mA) while
  * |s| is above a threshold, and off (pin switched to input) below it.
  *
  * One FM channel: the phase is the channel's phase, the conversion is exact.
@@ -262,13 +262,12 @@ int rpitx_open(double tx_frequency, double rate, double tx_gain)
 		return -1;
 	}
 
-	/* --sdr-tx-gain is the GPIO drive level 0..7 (2..16 mA) */
-	pad = lround(tx_gain);
-	if (pad < 0 || pad > 7) {
-		LOGP(DSDR, LOGL_NOTICE, "rpitx: --sdr-tx-gain is the GPIO drive level 0..7, using %d instead of %.1f\n",
-		     (pad < 0) ? 0 : 7, tx_gain);
-		pad = (pad < 0) ? 0 : 7;
-	}
+	/* The GPIO drive level is always the highest (7 = 16 mA): the Pi's own signal is tiny, the most useful
+	 * signal is the full drive, and nothing is gained by less (two channels at level 0: 22 / 15 dB SINAD at
+	 * a B210, at level 7: 24 / 21 dB). --sdr-tx-gain is not used. */
+	pad = 7;
+	if (tx_gain != 0.0)
+		LOGP(DSDR, LOGL_NOTICE, "rpitx: the drive level is fixed at its maximum (7), --sdr-tx-gain %.1f is not used\n", tx_gain);
 
 	rt.samplerate = samplerate;
 	rt.pad = (int)pad;

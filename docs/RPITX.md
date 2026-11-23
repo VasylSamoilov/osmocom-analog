@@ -32,7 +32,7 @@ fixed drive level while the signal is there.
 
 | option | rpitx meaning |
 |---|---|
-| `--sdr-tx-gain 0..7` | GPIO drive level, 2..16 mA (default 0, lowest). Measured with librpitx's iqdmasync (relative to level 7): -25.6, -14.6, -10.1, -8.1, -3.3, -2.2, -0.8, 0 dB; the backend's own chain sets the pad differently (about 18 dB more at level 0), not measured per level yet |
+| `--sdr-tx-gain` | not used: the GPIO drive level is always the maximum (7, 16 mA), the most useful signal of a tiny transmitter. Measured with librpitx's iqdmasync (relative to level 7): -25.6, -14.6, -10.1, -8.1, -3.3, -2.2, -0.8, 0 dB; two channels at a B210: level 0 22 / 15 dB SINAD, level 7 24 / 21 dB |
 | `--sdr-samplerate` | 10000 .. 200000 S/s; up to 250000 without carrier keying |
 | `--sdr-tx-ppm` | crystal correction on top of librpitx's own (it takes the NTP frequency correction when NTP is synced); without NTP needed: ±50 ppm is 23 kHz at 460 MHz |
 | `--sdr-rpitx-ratio` | level of the second channel, below 1 |
@@ -235,7 +235,7 @@ Take an RTL-SDR IQ capture of each step (`rtl_sdr -f <Hz> -s 1024000 -n 20000000
 2. POCSAG, one channel, one page:
    ```sh
    sudo src/pocsag/pocsag -k 466.230 --sdr-rpitx --sdr-samplerate 96000 \
-        --sdr-tx-gain 0 --sdr-tx-ppm <ppm> -B 1200 --oneshot -y alpha -M "HELLO" 1234567
+        --sdr-tx-ppm <ppm> -B 1200 --oneshot -y alpha -M "HELLO" 1234567
    ```
 3. POCSAG continuous (`--network`) for some minutes; read the pacing lines:
    ```
@@ -247,7 +247,7 @@ Take an RTL-SDR IQ capture of each step (`rtl_sdr -f <Hz> -s 1024000 -n 20000000
    ```sh
    sudo src/nmt/nmt -k 1 -Y ua,1 -e -s 192000 --sdr-tx-rpitx --sdr-tx-samplerate 192000 \
         --sdr-rx-soapy --sdr-rx-device-args driver=rtlsdr --sdr-rx-samplerate 960000 \
-        --sdr-rx-gain 30 --sdr-tx-gain 0
+        --sdr-rx-gain 30
    ```
    librpitx corrects the Pi crystal from NTP by itself (when NTP is synced),
    so `--sdr-tx-ppm` is usually not needed.
@@ -265,7 +265,7 @@ The common part of every command (Pi 4, RX by an RTL-SDR):
 ```sh
 COMMON="-s 192000 --sdr-tx-rpitx --sdr-tx-samplerate 192000 --sdr-rx-soapy \
         --sdr-rx-device-args driver=rtlsdr --sdr-rx-samplerate 960000 \
-        --sdr-rx-gain 30 --sdr-tx-gain 0"
+        --sdr-rx-gain 30"
 ```
 
 With two channels the choice is between the clock and calls between phones;
