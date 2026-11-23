@@ -278,6 +278,7 @@ both together would need a third channel.
 | NMT phone to phone, two channels | `nmt -k 1 -k 3 -T CC/TC -T TC -x -I 1 -Y ua,1 $COMMON` | one phone calls the other (`-x`), caller ID on the ringing phone; no clock (combined channel) | caller ID shown, call through |
 | AMPS basic, one channel | `amps -k 354 -T CC/PC/VC -S sid=<sid> -e $COMMON` | calls to and from the network, echo test | (USRP and Pi 3) |
 | AMPS phone to phone, two channels | `amps -k 354 -k 356 -T CC/PC/VC -T VC -x -I 1 -S sid=<sid> -S pureg=0 -S pdreg=0 $COMMON` | one phone calls the other, caller ID (Alert With Info), release by either phone; no echo test (999 is refused) | both directions: caller ID shown, sound OK, the other phone released by the Release order |
+| FLEX network, transmitter only | `flexpager -k 931.9375 --network --biw-datetime auto --biw-sysinfo auto -s 192000 --sdr-tx-rpitx --sdr-tx-samplerate 192000 --sdr-tx-only`, messages into `/tmp/flex_msg_send` | network mode with date, time and time zone in the BIW; alpha at 1600 and 6400 bps (4-FSK), long text, maildrop, temporary group; no RTL-SDR needed | received by `flexpager --sdr-uhd --sdr-rx-only` on a B210: all decoded, frames 92/92 codewords clean, rpitx never late |
 
 AMPS has no clock broadcast. The console has no number of its own, so a call
 from the console shows no caller ID; test caller ID phone to phone. Run
