@@ -304,7 +304,8 @@ void console_msg(osmo_cc_call_t *call, osmo_cc_msg_t *msg)
 		}
 		if (console.state != CONSOLE_IDLE) {
 			LOGP(DCALL, LOGL_NOTICE, "We are busy, rejecting.\n");
-			request_disconnect_release_reject(console.callref, CAUSE_NORMAL, OSMO_CC_MSG_REJ_REQ);
+			/* reject the new call, not the one we have */
+			request_disconnect_release_reject(call->callref, CAUSE_BUSY, OSMO_CC_MSG_REJ_REQ);
 			osmo_cc_free_msg(msg);
 			return;
 		}
