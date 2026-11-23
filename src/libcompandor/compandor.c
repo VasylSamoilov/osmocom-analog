@@ -233,6 +233,29 @@ void compandor_set_compressor_lookahead(compandor_t *state, double samplerate, d
 }
 
 /*
+ * Hold the level of the transmitted (pre-emphasized) speech above a knee (0 = off)
+ *
+ * The deviation limit applies after the pre-emphasis, where 2..3 kHz of speech is up to 7 dB above the
+ * level at 1 kHz. So the knee watches the compressed speech after a first order pre-emphasis (normalized
+ * to 0 dB at 1 kHz) and, where its envelope (attack and recovery of the compressor) is above the knee,
+ * lowers the gain to hold it there. The gain is the lowest one over the lookahead, so it is ready when a
+ * loud syllable arrives. Below the knee nothing changes. Needs the lookahead to be set.
+ */
+void compandor_set_compressor_knee(compandor_t *state, double samplerate, double knee, double emphasis_hz)
+{
+	int i;
+
+	state->c.knee = (knee > 0.0) ? knee : 0.0;
+	state->c.ke_a = exp(-2.0 * M_PI * emphasis_hz / samplerate);
+	state->c.ke_norm = 1.0 / sqrt(1.0 + state->c.ke_a * state->c.ke_a - 2.0 * state->c.ke_a * cos(2.0 * M_PI * 1000.0 / samplerate));
+	state->c.ke_xl = 0.0;
+	state->c.ke_pk = 0.0;
+	state->c.ke_env = ENVELOPE_MIN;
+	for (i = 0; i < COMPANDOR_LOOKAHEAD_MAX; i++)
+		state->c.kg_buf[i] = 1.0;
+}
+
+/*
  * Compress audio for transmission (TX path)
  *
  * PURPOSE: Reduce dynamic range to improve SNR during transmission
@@ -321,11 +344,36 @@ void compress_audio(compandor_t *state, sample_t *samples, int num)
 		if (state->c.lookahead) {
 			/* the envelope follows the new sample, the gain is applied to the delayed one */
 			sample_t delayed = state->c.la_buf[state->c.la_pos];
+			double gain = 1.0 / sqrt_tab[(int)(envelope / 0.001)];
 
+			if (state->c.knee > 0.0) {
+				/* envelope of the new sample, compressed and pre-emphasized */
+				double x = value * gain, e = fabs((x - state->c.ke_a * state->c.ke_xl) * state->c.ke_norm), kg;
+				int k;
+
+				state->c.ke_xl = x;
+				if (e > state->c.ke_pk)
+					state->c.ke_pk = e;
+				else
+					state->c.ke_pk *= step_down;
+				if (state->c.ke_pk > state->c.ke_env)
+					state->c.ke_env *= step_up;
+				else
+					state->c.ke_env *= step_down;
+				if (state->c.ke_env < ENVELOPE_MIN)
+					state->c.ke_env = ENVELOPE_MIN;
+				state->c.kg_buf[state->c.la_pos] = (state->c.ke_env > state->c.knee) ? state->c.knee / state->c.ke_env : 1.0;
+				kg = 1.0;
+				for (k = 0; k < state->c.lookahead; k++) {
+					if (state->c.kg_buf[k] < kg)
+						kg = state->c.kg_buf[k];
+				}
+				gain *= kg;
+			}
 			state->c.la_buf[state->c.la_pos] = value;
 			if (++state->c.la_pos == state->c.lookahead)
 				state->c.la_pos = 0;
-			output = delayed / sqrt_tab[(int)(envelope / 0.001)];
+			output = delayed * gain;
 		} else
 			output = value / sqrt_tab[(int)(envelope / 0.001)];
 		*samples++ = output;

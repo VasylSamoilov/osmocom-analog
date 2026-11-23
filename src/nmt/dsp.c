@@ -60,8 +60,13 @@ extern double network_rx_gain_db;
 #define SPEECH_DEVIATION	3000.0	/* deviation of speech at 1 kHz */
 #define TX_PEAK_FSK		(4200.0 / 1800.0 * 1000.0 / SPEECH_DEVIATION)
 #define TX_PEAK_SUPER		(300.0 / 4015.0 * 1000.0 / SPEECH_DEVIATION)
-/* transmitted speech: gain before the compressor (-7 dB) */
-#define TX_SPEECH_GAIN		0.4467
+/* Transmitted speech: the compressor holds the pre-emphasized level at this knee (re reference, -2 dB). NMT
+ * has 3,9 dB from the 3,0 kHz reference to the 4,7 kHz maximum deviation; the phone itself sends loud speech
+ * up to 5,1 kHz. A fixed loss (-7 dB) kept the limiter quiet but lost 4 dB (loud) .. 6 dB (quiet) of
+ * deviation phone -> network -> phone. Echo test on air with the user's voice (quiet/normal/loud), knee
+ * -3/-2/-1 dB: loss 1,9/1,5/0,6 dB, limiter hits 0/0/3, highest peak 4066/4223/4461 Hz; -2 dB sounded
+ * clearest. */
+#define TX_KNEE_DB		-2.0
 /* noise gate of the received audio (normalized, 1.0 = reference), the threshold of AMPS */
 #define RX_NOISE_GATE		0.10
 /* highest envelope of the expander (1.0 = reference level): the expander restores up to the maximum
@@ -233,6 +238,8 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 	 * 24 -> 0 in 14 s, compressor peaks at onsets 3,5..6 dB lower, rms unchanged. Offline, more than
 	 * ~6 ms got worse again (the gain rises before the end of a word leaves the delay). */
 	compandor_set_compressor_lookahead(&nmt->cstate, 8000, 4.0);
+	/* loud speech is held below the limiter, syllable by syllable (see TX_KNEE_DB) */
+	compandor_set_compressor_knee(&nmt->cstate, 8000, pow(10.0, TX_KNEE_DB / 20.0), CUT_OFF_EMPHASIS_DEFAULT);
 
 	/* init filters */
 	/* flat Butterworth cascades: iir_highpass_init()/iir_lowpass_init() with several iterations
@@ -863,17 +870,6 @@ again:
 		/* Echo suppressor TX reference (far-end audio before DSP processing) */
 		if (nmt->trans && nmt->trans->callref)
 			call_echo_suppressor_tx(nmt->trans->callref, samples, input_num);
-		/* NMT has 3,9 dB from the 3,0 kHz reference to the 4,7 kHz maximum deviation (AMPS 12,3 dB): normal
-		 * speech from the network, compressed and pre-emphasized, reached the limiter 11 times per second
-		 * and each limiting was audible. Speech is lowered before the compressor so it stays below
-		 * (offline, recorded speech, standard emphasis: 10 ms blocks over the threshold 87 -> 2 of 1604).
-		 * Provisional: to be replaced by the level plan derived from the standard. */
-		{
-			int k;
-
-			for (k = 0; k < input_num; k++)
-				samples[k] *= TX_SPEECH_GAIN;
-		}
 		if (nmt->compandor)
 			compress_audio(&nmt->cstate, samples, input_num);
 		if (ld)
