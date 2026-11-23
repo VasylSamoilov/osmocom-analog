@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <math.h>	/* test switch (docs/CONSOLE_TESTS.md): downlink level test */
 #include <sys/time.h>
 #include <sys/param.h>
 #include "../libsample/sample.h"
@@ -99,6 +100,8 @@ static struct osmo_cc_helper_audio_codecs codecs[] = {
 	{ "telephone-event", NULL, 8000, 1, NULL, NULL, NULL, NULL },  /* RFC 4733 DTMF/Flash */
 	{ NULL, NULL , 0, 0, NULL, NULL, NULL, NULL  },
 };
+
+static void request_disconnect_release_reject(int callref, int cause, uint8_t msg_type);
 
 /* stream test music */
 int16_t *test_spl = NULL;
@@ -202,11 +205,130 @@ static void up_audio(struct osmo_cc_session_codec *codec, uint8_t marker, uint16
 		return;
 	}
 	/* if no sound is used, send test tone to mobile */
+	uint8_t *rx_payload = payload;	/* TEST ONLY (OSMO_CONSOLE_RECORD): the received frame */
+	int rx_payload_len = payload_len;
 	if (console.state == CONSOLE_CONNECT) {
 		int16_t spl[160];
 		uint8_t *payload;
 		int payload_len;
 		get_test_patterns(spl, 160);
+		if (getenv("OSMO_CONSOLE_SILENCE"))	/* test switch (docs/CONSOLE_TESTS.md): silence instead of music */
+			memset(spl, 0, sizeof(spl));
+		if (getenv("OSMO_CONSOLE_SPEECH")) {	/* test switch (docs/CONSOLE_TESTS.md): play speech (float32, 8 kHz, 1.0 = reference), looped */
+			static float *sp = NULL;
+			static long sn = 0, sp_pos = 0;
+			double ref = SPEECH_LEVEL * 0.7079 * 32767.0;
+			int k;
+
+			if (!sp) {
+				FILE *fp = fopen(getenv("OSMO_CONSOLE_SPEECH"), "rb");
+
+				if (fp) {
+					fseek(fp, 0, SEEK_END);
+					sn = ftell(fp) / 4;
+					fseek(fp, 0, SEEK_SET);
+					sp = malloc(sizeof(float) * (sn ? sn : 1));
+					if (sp && fread(sp, 4, sn, fp) != (size_t)sn)
+						sn = 0;
+					fclose(fp);
+					LOGP(DCALL, LOGL_NOTICE, "CONSOLE TEST: speech file %ld samples\n", sn);
+				}
+			}
+			for (k = 0; k < 160; k++) {
+				double v = (sp && sn) ? sp[sp_pos] * ref : 0.0;
+
+				if (sn && ++sp_pos == sn)
+					sp_pos = 0;
+				spl[k] = (v > 32767.0) ? 32767 : (v < -32767.0) ? -32767 : (int16_t)v;
+			}
+		}
+		if (getenv("OSMO_CONSOLE_TEST")) {	/* test switch (docs/CONSOLE_TESTS.md): downlink level test sequence */
+			/* reference tone (1 kHz, 3 kHz deviation) = SPEECH_LEVEL * 0.7079 of int16 */
+			static const struct { double sec, db; const char *what; } seq[] = {
+				{ 4, -200.0, "silence" }, { 4, -60.0, "1 kHz at -60 dB" },
+				{ 4, -50.0, "1 kHz at -50 dB" }, { 4, -40.0, "1 kHz at -40 dB" },
+				{ 4, -30.0, "1 kHz at -30 dB" }, { 4, -20.0, "1 kHz at -20 dB" },
+				{ 4, -10.0, "1 kHz at -10 dB" }, { 4, 0.0, "1 kHz at 0 dB" },
+			};
+			static long t = 0;
+			static int last = -1;
+			double total = 0, pos, ref = SPEECH_LEVEL * 0.7079 * 32767.0;
+			int k, n = sizeof(seq) / sizeof(seq[0]), p = 0;
+
+			for (k = 0; k < n; k++)
+				total += seq[k].sec;
+			pos = fmod((double)t / 8000.0, total);
+			for (k = 0; k < n; k++) {
+				if (pos < seq[k].sec) {
+					p = k;
+					break;
+				}
+				pos -= seq[k].sec;
+			}
+			if (p != last) {
+				LOGP(DCALL, LOGL_NOTICE, "CONSOLE TEST: %s\n", seq[p].what);
+				last = p;
+			}
+			for (k = 0; k < 160; k++, t++) {
+				if (seq[p].db < -100.0)
+					spl[k] = 0;
+				else
+					spl[k] = (int16_t)(ref * pow(10.0, seq[p].db / 20.0) * sin(2.0 * M_PI * 1000.0 * (double)t / 8000.0));
+			}
+		}
+		if (getenv("OSMO_CONSOLE_DELAY")) {	/* test switch (docs/CONSOLE_TESTS.md): echo the received audio after the given seconds */
+			static int16_t *dbuf = NULL;
+			static int dlen = 0, dpos = 0;
+			uint8_t *rx_data = NULL;
+			int rx_len = 0, k;
+
+			if (!dbuf) {
+				dlen = (int)(atof(getenv("OSMO_CONSOLE_DELAY")) * 8000.0);
+				if (dlen < 160)
+					dlen = 160;
+				dbuf = calloc(dlen, sizeof(*dbuf));
+				LOGP(DCALL, LOGL_NOTICE, "CONSOLE TEST: echo with %.1f s delay\n", (double)dlen / 8000.0);
+			}
+			codec->decoder(rx_payload, rx_payload_len, &rx_data, &rx_len, &console);
+			for (k = 0; k < 160 && dbuf; k++) {
+				spl[k] = dbuf[dpos];
+				dbuf[dpos] = (rx_len >= 320) ? ((int16_t *)rx_data)[k] : 0;
+				if (++dpos == dlen)
+					dpos = 0;
+			}
+			free(rx_data);
+		}
+		if (getenv("OSMO_CONSOLE_HANGUP")) {	/* test switch (docs/CONSOLE_TESTS.md): the network hangs up after the given seconds */
+			static long frames = 0;
+
+			if (++frames == (long)(atof(getenv("OSMO_CONSOLE_HANGUP")) * 50.0)) {
+				LOGP(DCALL, LOGL_NOTICE, "CONSOLE TEST: network hangs up now\n");
+				frames = 0;
+				request_disconnect_release_reject(console.callref, CAUSE_NORMAL, OSMO_CC_MSG_REL_REQ);
+				free_console();
+				console_new_state(CONSOLE_IDLE);
+				return;
+			}
+		}
+		if (getenv("OSMO_CONSOLE_RECORD")) {	/* test switch (docs/CONSOLE_TESTS.md): record sent and received audio, int16 pairs */
+			static FILE *rec = NULL;
+			uint8_t *rx_data = NULL;
+			int rx_len = 0, k;
+			int16_t pair[320];
+
+			if (!rec)
+				rec = fopen(getenv("OSMO_CONSOLE_RECORD"), "wb");
+			codec->decoder(rx_payload, rx_payload_len, &rx_data, &rx_len, &console);
+			for (k = 0; k < 160; k++) {
+				pair[k * 2] = spl[k];
+				pair[k * 2 + 1] = (rx_len >= 320) ? ((int16_t *)rx_data)[k] : 0;
+			}
+			free(rx_data);
+			if (rec) {
+				fwrite(pair, sizeof(pair), 1, rec);
+				fflush(rec);
+			}
+		}
 		codec->encoder((uint8_t *)spl, 160 * 2, &payload, &payload_len, &console);
 		osmo_cc_rtp_send(codec, payload, payload_len, 0, 1, 160);
 		free(payload);
