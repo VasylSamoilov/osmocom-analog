@@ -6,6 +6,7 @@ noinst_LIBRARIES = libsdr.a
 libsdr_a_SOURCES = \
 	sdr_config.c \
 	sdr.c \
+	sdr_engine.c \
 	sdr_status.c
 
 AM_CPPFLAGS += -DHAVE_SDR

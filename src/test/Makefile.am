@@ -15,6 +15,7 @@ noinst_PROGRAMS = \
 	test_hagelbarger \
 	test_v27scrambler \
 	test_channelizer \
+	test_sdr_engine \
 	test_echo_analysis \
 	test_echo_analysis_edge_cases \
 	test_echo_analysis_final_checkpoint \
@@ -200,6 +201,16 @@ test_goertzel_LDADD = \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(LIBOSMOCC_LIBS) \
 	$(LIBOSMOCORE_LIBS) \
+	-lm
+
+test_sdr_engine_SOURCES = test_sdr_engine.c
+
+test_sdr_engine_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	-lpthread \
 	-lm
 
 test_channelizer_SOURCES = test_channelizer.c
