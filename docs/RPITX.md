@@ -251,4 +251,39 @@ Take an RTL-SDR IQ capture of each step (`rtl_sdr -f <Hz> -s 1024000 -n 20000000
    ```
    librpitx corrects the Pi crystal from NTP by itself (when NTP is synced),
    so `--sdr-tx-ppm` is usually not needed.
-6. Two channels: `-k 1 -k 2 -T CC -T TC`, calling channel first.
+6. Two channels: `-k 1 -k 3 -T CC -T TC`, calling channel first, one free
+   channel between them (see below).
+
+## Base station setups with one Pi
+
+The Pi sends one carrier, so at most two channels: the first (always on)
+must be the control/calling channel, the second the keyed one. Leave one free
+channel between the two: with neighbouring channels the uplink of one leaks
+into the other (a ringing phone's signalling tone released the other call).
+The common part of every command (Pi 4, RX by an RTL-SDR):
+
+```sh
+COMMON="-s 192000 --sdr-tx-rpitx --sdr-tx-samplerate 192000 --sdr-rx-soapy \
+        --sdr-rx-device-args driver=rtlsdr --sdr-rx-samplerate 960000 \
+        --sdr-rx-gain 30 --sdr-tx-gain 0"
+```
+
+With two channels the choice is between the clock and calls between phones;
+both together would need a third channel.
+
+| Setup | Command | What works | Tested on a Pi 4 (2026-11-23) |
+|---|---|---|---|
+| NMT basic, one channel | `nmt -k 1 -Y ua,1 -T CC/TC -e $COMMON` | calls to and from the network, echo test on 999 | echo test with two phones: clear, 0 underruns |
+| NMT clock, two channels | `nmt -k 1 -k 3 -T CC -T TC -U 1 -I 1 -Y ua,1 -e $COMMON` | date and time on the phones (not allowed on a combined CC/TC, NMT Doc 450-1 4.3.3.12.5), calls on the traffic channel; one call at a time, a second caller waits | clock shown, calls of two phones one after the other |
+| NMT phone to phone, two channels | `nmt -k 1 -k 3 -T CC/TC -T TC -x -I 1 -Y ua,1 $COMMON` | one phone calls the other (`-x`), caller ID on the ringing phone; no clock (combined channel) | caller ID shown, call through |
+| AMPS basic, one channel | `amps -k 354 -T CC/PC/VC -S sid=<sid> -e $COMMON` | calls to and from the network, echo test | (USRP and Pi 3) |
+| AMPS phone to phone, two channels | `amps -k 354 -k 356 -T CC/PC/VC -T VC -x -I 1 -S sid=<sid> -S pureg=0 -S pdreg=0 $COMMON` | one phone calls the other, caller ID (Alert With Info), release by either phone; no echo test (999 is refused) | both directions: caller ID shown, sound OK, the other phone released by the Release order |
+
+AMPS has no clock broadcast. The console has no number of its own, so a call
+from the console shows no caller ID; test caller ID phone to phone. Run
+interactively (in tmux) to dial from the console: type the number, then `d`.
+Under `sudo`, `~` is root's home: give log files with an absolute path.
+
+Three channels: not supported (refused). A simulation of the phase of three
+summed channels gives 24 / 22 / 18 dB SINAD at best (NMT channels n, n+3, n+5)
+before the Pi's own limit, which already holds two channels to about 25 dB.
