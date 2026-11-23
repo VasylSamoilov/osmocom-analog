@@ -643,6 +643,15 @@ int sdr_configure(int samplerate)
 				sdr_config->uhd = 1;
 				sdr_config->rx_uhd = 0;
 			}
+			/* and the RX rate, bandwidth, LO offset and PPM, which unified mode reads */
+			if (sdr_config->rx_samplerate && !sdr_config->samplerate)
+				sdr_config->samplerate = sdr_config->rx_samplerate;
+			if (sdr_config->rx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0)
+				sdr_config->bandwidth = sdr_config->rx_bandwidth;
+			if (sdr_config->rx_lo_offset != 0.0)	/* given: wins over the default of the unified one */
+				sdr_config->lo_offset = sdr_config->rx_lo_offset;
+			if (sdr_config->rx_ppm != 0.0 && sdr_config->ppm == 0.0)
+				sdr_config->ppm = sdr_config->rx_ppm;
 			sdr_config->rx_device_args = NULL;
 		}
 		/* If tx_only with only TX driver specified, convert to unified mode for simplicity */
@@ -663,8 +672,20 @@ int sdr_configure(int samplerate)
 				sdr_config->tx_uhd = 0;
 			}
 #ifdef HAVE_RPITX
+			/* the TX driver may be rpitx: it was dropped here, nothing transmitted and the program ended */
+			if (sdr_config->tx_rpitx)
+				sdr_config->rpitx = 1;
 			sdr_config->tx_rpitx = 0;
 #endif
+			/* and the TX rate, bandwidth, LO offset and PPM, which unified mode reads */
+			if (sdr_config->tx_samplerate && !sdr_config->samplerate)
+				sdr_config->samplerate = sdr_config->tx_samplerate;
+			if (sdr_config->tx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0)
+				sdr_config->bandwidth = sdr_config->tx_bandwidth;
+			if (sdr_config->tx_lo_offset != 0.0)	/* given: wins over the default of the unified one */
+				sdr_config->lo_offset = sdr_config->tx_lo_offset;
+			if (sdr_config->tx_ppm != 0.0 && sdr_config->ppm == 0.0)
+				sdr_config->ppm = sdr_config->tx_ppm;
 			sdr_config->tx_device_args = NULL;
 		}
 	}

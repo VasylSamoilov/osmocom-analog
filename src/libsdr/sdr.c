@@ -946,7 +946,11 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 	display_iq_init(samplerate);
 	display_spectrum_init(samplerate, rx_center_frequency);
 
-	LOGP(DSDR, LOGL_INFO, "Using local oscillator offset: %.0f Hz\n", sdr_config->lo_offset);
+	/* rpitx has no LO: it makes the carrier itself (one channel: at the channel frequency) */
+	if (sdr_tx_is_rpitx() && (sdr_config->tx_only || !sdr_config->split_mode))
+		LOGP(DSDR, LOGL_INFO, "rpitx: no local oscillator, no LO offset.\n");
+	else
+		LOGP(DSDR, LOGL_INFO, "Using local oscillator offset: %.0f Hz\n", sdr_config->lo_offset);
 
 	/* Apply upconverter offset only when center frequency is set (i.e., that direction is used) */
 	double actual_tx_center = (tx_center_frequency != 0.0) ? tx_center_frequency + sdr_config->tx_upconverter : 0.0;
@@ -2551,11 +2555,10 @@ int sdr_get_tosend(void *inst, int buffer_size)
 	sdr_t *sdr = (sdr_t *)inst;
 	int count = 0;
 
-	/* Safety check: no TX in rx_only mode */
-	if (sdr_config && sdr_config->rx_only) {
-		LOGP(DSDR, LOGL_ERROR, "sdr_get_tosend() called in RX-only mode - this is a bug!\n");
+	/* RX-only: nothing to send. The sender loop asks every round, this is not an error (it logged
+	 * an error here every millisecond, 12 MB of log per minute). */
+	if (sdr_config && sdr_config->rx_only)
 		return 0;
-	}
 
 	/* Device paced: keep the write ring filled to buffer_size. The write
 	 * thread drains it through the blocking send(), i.e. at the device
