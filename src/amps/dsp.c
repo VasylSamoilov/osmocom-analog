@@ -1921,6 +1921,13 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 			lv_rx_count = 0;
 		}
 
+		/* The voice of the mobile is valid only with its SAT and without ST: with ST it confirms an order
+		 * or releases (1.8 s, then its transmitter goes off), without SAT the carrier is gone or faded.
+		 * Then it is noise ("pshshsh" on the other phone when a phone hung up): send silence. The audio
+		 * is delayed by the SAT detection window above, so the detection is in time for it. */
+		if (!amps->sat_detected || amps->sig_detected)
+			memset(samples, 0, sizeof(*samples) * count);
+
 		/* Echo suppressor RX processing (near-end audio after DSP processing) */
 		call_echo_suppressor_rx(trans->callref, samples, count);
 
