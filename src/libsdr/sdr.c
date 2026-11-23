@@ -50,6 +50,7 @@ enum paging_signal;
 #include "../liblogging/logging.h"
 #include "../libchannelizer/channelizer.h"
 #include "../libchannelizer/pfb.h"
+#include "sdr_engine.h"
 
 /* enable to debug buffer handling */
 //#define DEBUG_BUFFER
@@ -111,7 +112,7 @@ typedef struct sdr_chan {
 	int		rx_init, tx_init;
 	channelizer_t	rx_ch;		/* SDR rate -> DSP rate, channel at 0 Hz */
 	channelizer_t	tx_ch;		/* DSP rate -> SDR rate, 0 Hz to the channel */
-	pfb_chan_t	rx_pc, tx_pc;	/* or the channel of the filter bank */
+	double		tx_offset, rx_offset;	/* from the SDR centre (engine mode) */
 } sdr_chan_t;
 
 typedef struct sdr {
@@ -147,69 +148,31 @@ typedef struct sdr {
 	/* channels = 0 (osmoradio, tv, dcf77): the whole usable band, centred */
 	int		band_rx_init, band_tx_init;
 	channelizer_t	band_rx, band_tx;
-	/* polyphase FFT filter banks shared by all channels (instead of the
-	 * per-channel channelizers) */
-	int		use_bank_rx, use_bank_tx;
-	pfb_t		bank_rx, bank_tx;
-	int		*bank_rx_bins, *bank_tx_bins;
-	int		bank_rx_frames;	/* most frames per sdr_read() */
-	sample_t	**bin_i, **bin_q;	/* RX: frames of each channel's bin */
-	const sample_t	**tx_ci, **tx_cq;	/* TX: each channel's frames */
+	/* engine mode: filter banks shared by all channels, run by the device
+	 * threads; the program's channels are one group (docs/SDR-BACKEND.md) */
+	int		use_engine;
+	sdr_engine_t	engine;
+	sdr_group_t	*group;
+	sample_t	**eng_i, **eng_q;	/* DSP rate samples of every channel (TX: channels + paging) */
+	int		eng_n;			/* number of them */
+	int		eng_chunk;		/* SDR samples per sdr_engine_tx_produce() */
+	float		*rx_gap_zero;		/* zeros for lost RX samples (rx_max_in) */
 } sdr_t;
 
-/* Number of bins of a filter bank for these rates, or 0 if none fits: the
- * spacing (SDR rate / bins) must be more than the DSP rate (the bank keeps
- * +-DSP/2 clean around every channel), the SDR rate a multiple of bins / 2.
- * Of those the cheapest by an estimate of the work per SDR sample:
- * - the bank: the prototype (4 per tap per branch, the length from the
- *   Kaiser formula for the transition spacing - DSP rate) and the FFT
- *   (10 log2 bins);
- * - each channel's tail: the fine NCO at the bin rate (8) and the wide
- *   resampler between the bin rate fb and 2 DSP rate (4 per tap, 2 DSP
- *   outputs per second, 6.75 fb / (min(fb, 2 dsp) - dsp) taps each).
- * Measured at 10 MS/s, DSP 48 k, 2 channels (both ways, this PC): 8 bins
- * 28.6 %, 16: 22.4 %, 32: 21.1 %, 64: 21.3 %, 128: 36.0 % - the estimate
- * ranks them the same. */
-static int sdr_bank_bins(int fs, int dsp, int nchan)
+/* use the filter banks: on request, or (auto) for two or more channels when
+ * they fit the rates of every direction used */
+static int sdr_engine_wanted(int tx_rate, int rx_rate, int dsp, int nchan)
 {
-	int m, best = 0;
-	double best_cost = 0.0;
-
-	for (m = 8; m <= 4096; m *= 2) {
-		double spacing = (double)fs / m, trans, len, t, cost, fb, low, tail;
-
-		if (fs % (m / 2))
-			continue;
-		trans = spacing - dsp;
-		if (trans <= 0.05 * spacing)
-			break;
-		len = (PFB_ATTEN_DB - 7.95) / (2.285 * 2.0 * M_PI * trans / fs) + 1.0;
-		t = ceil(len / m);
-		fb = 2.0 * spacing;
-		low = (fb < 2.0 * dsp) ? fb : 2.0 * dsp;
-		tail = 8.0 * fb / fs + 4.0 * (2.0 * dsp / fs) * 6.75 * fb / (low - dsp);
-		cost = 4.0 * t + 10.0 * log2(m) + nchan * tail;
-		if (!best || cost < best_cost) {
-			best = m;
-			best_cost = cost;
-		}
-	}
-	return best;
-}
-
-/* use a bank: on request, or (auto) for two or more channels when one fits */
-static int sdr_bank_wanted(int fs, int dsp, int nchan)
-{
-	int m = sdr_bank_bins(fs, dsp, nchan);
+	int fits = (!tx_rate || sdr_engine_bins(tx_rate, dsp, nchan)) && (!rx_rate || sdr_engine_bins(rx_rate, dsp, nchan));
 
 	if (sdr_config->filter_bank == 0)
 		return 0;
 	if (sdr_config->filter_bank == 1) {
-		if (!m)
-			LOGP(DSDR, LOGL_NOTICE, "No filter bank fits SDR rate %d and DSP rate %d (sub-bands must be wider than the DSP rate), using a channelizer per channel.\n", fs, dsp);
-		return m;
+		if (!fits)
+			LOGP(DSDR, LOGL_NOTICE, "No filter bank fits SDR rate %d / %d and DSP rate %d (sub-bands must be wider than the DSP rate), using a channelizer per channel.\n", tx_rate, rx_rate, dsp);
+		return fits;
 	}
-	return (nchan >= 2) ? m : 0;
+	return (nchan >= 2) && fits;
 }
 
 static void show_spectrum(const char *direction, double halfbandwidth, double center, double *frequency, double paging_frequency, int num)
@@ -316,7 +279,8 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		sdr->thread_read.buffer = calloc(sdr->thread_read.buffer_size, sizeof(*sdr->thread_read.buffer));
 		sdr->thread_read.buffer2 = calloc(sdr->thread_read.buffer_size, sizeof(*sdr->thread_read.buffer2));
 		sdr->rx_lin = calloc(sdr->rx_max_in * 2, sizeof(*sdr->rx_lin));
-		if (!sdr->thread_read.buffer || !sdr->thread_read.buffer2 || !sdr->rx_lin) {
+		sdr->rx_gap_zero = calloc(sdr->rx_max_in * 2, sizeof(*sdr->rx_gap_zero));
+		if (!sdr->thread_read.buffer || !sdr->thread_read.buffer2 || !sdr->rx_lin || !sdr->rx_gap_zero) {
 			LOGP(DSDR, LOGL_ERROR, "No mem!\n");
 			goto error;
 		}
@@ -447,6 +411,30 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		LOGP(DSDR, LOGL_INFO, "Replacing TX IQ from: %s\n", sdr_config->read_iq_tx_wave);
 	}
 
+	/* engine mode: the filter banks run in the device threads; the channels
+	 * are registered as one group after their offsets are known (below) */
+	if (channels) {
+		int ntx = channels + (sdr->paging_channel ? 1 : 0);
+		int tx_r = tx_frequency ? sdr->tx_rate : 0, rx_r = rx_frequency ? sdr->rx_rate : 0;
+
+		if (!sdr_tx_is_rpitx() && sdr_engine_wanted(tx_r, rx_r, samplerate, ntx)) {
+			int max_block = (sdr->rx_max_in > sdr->tx_max_out) ? sdr->rx_max_in : sdr->tx_max_out;
+
+			rc = sdr_engine_init(&sdr->engine, rx_r, tx_r, samplerate, ntx, max_block);
+			if (rc < 0) {
+				LOGP(DSDR, LOGL_ERROR, "Filter bank engine: %s\n", sdr_engine_error());
+				goto error;
+			}
+			sdr->use_engine = 1;
+			if (tx_r)
+				LOGP(DSDR, LOGL_INFO, "TX filter bank: %d sub-bands of %.1f kHz at %d S/s, %d taps per branch\n",
+				     sdr->engine.bank_tx.m, (double)tx_r / sdr->engine.bank_tx.m / 1e3, pfb_bin_rate(&sdr->engine.bank_tx), sdr->engine.bank_tx.t);
+			if (rx_r)
+				LOGP(DSDR, LOGL_INFO, "RX filter bank: %d sub-bands of %.1f kHz at %d S/s, %d taps per branch\n",
+				     sdr->engine.bank_rx.m, (double)rx_r / sdr->engine.bank_rx.m / 1e3, pfb_bin_rate(&sdr->engine.bank_rx), sdr->engine.bank_rx.t);
+		}
+	}
+
 	if (tx_frequency && channels) {
 		/* calculate required bandwidth (IQ rate) */
 
@@ -560,29 +548,6 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			goto error;
 		}
 		LOGP(DSDR, LOGL_INFO, "Using center frequency: TX %.6f MHz\n", tx_center_frequency / 1e6);
-		/* a filter bank for all channels, or a synthesizer per channel */
-		{
-			int ntx = channels + (sdr->paging_channel ? 1 : 0);
-			int m = sdr_bank_wanted(sdr->tx_rate, samplerate, ntx);
-
-			if (m) {
-				rc = pfb_tx_init(&sdr->bank_tx, sdr->tx_rate, m, samplerate / 2.0);
-				if (rc < 0) {
-					LOGP(DSDR, LOGL_ERROR, "TX filter bank: %s\n", pfb_error());
-					goto error;
-				}
-				sdr->use_bank_tx = 1;
-				sdr->bank_tx_bins = calloc(ntx, sizeof(*sdr->bank_tx_bins));
-				sdr->tx_ci = calloc(ntx, sizeof(*sdr->tx_ci));
-				sdr->tx_cq = calloc(ntx, sizeof(*sdr->tx_cq));
-				if (!sdr->bank_tx_bins || !sdr->tx_ci || !sdr->tx_cq) {
-					LOGP(DSDR, LOGL_ERROR, "No memory!\n");
-					goto error;
-				}
-				LOGP(DSDR, LOGL_INFO, "TX filter bank: %d sub-bands of %.1f kHz at %d S/s, %d taps per branch\n",
-				     m, (double)sdr->tx_rate / m / 1e3, pfb_bin_rate(&sdr->bank_tx), sdr->bank_tx.t);
-			}
-		}
 		/* modulators at 0 Hz at the DSP rate, each channel's synthesizer
 		 * moves it to its offset at the SDR rate (the paging channel has
 		 * its own, so states stay continuous when a channel switches) */
@@ -602,16 +567,11 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, 0.0, sdr_tx_amplitude(sdr, c, channels));
 			if (rc < 0)
 				goto error;
-			if (sdr->use_bank_tx) {
-				rc = pfb_chan_tx_init(&sdr->chan[c].tx_pc, &sdr->bank_tx, tx_offset, samplerate, sdr->buffer_size);
-				if (rc < 0) {
-					LOGP(DSDR, LOGL_ERROR, "TX %s %.6f MHz: %s\n", (c < channels) ? "channel" : "paging channel", sdr->chan[c].tx_frequency / 1e6, pfb_error());
-					goto error;
-				}
-				sdr->bank_tx_bins[c] = sdr->chan[c].tx_pc.bin;
-				sdr->chan[c].tx_init = 1;
-				LOGP(DSDR, LOGL_INFO, "TX %s %d: %.6f MHz, offset %+.1f kHz, filter bank sub-band %d\n",
-				     (c < channels) ? "channel" : "paging channel", c, sdr->chan[c].tx_frequency / 1e6, tx_offset / 1e3, sdr->chan[c].tx_pc.bin);
+			if (sdr->use_engine) {
+				/* registered with the engine below */
+				sdr->chan[c].tx_offset = tx_offset;
+				LOGP(DSDR, LOGL_INFO, "TX %s %d: %.6f MHz, offset %+.1f kHz, filter bank\n",
+				     (c < channels) ? "channel" : "paging channel", c, sdr->chan[c].tx_frequency / 1e6, tx_offset / 1e3);
 				continue;
 			}
 			rc = channelizer_tx_init(&sdr->chan[c].tx_ch, sdr->tx_rate, samplerate, tx_offset, bandwidth, sdr->buffer_size);
@@ -697,37 +657,6 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			goto error;
 		}
 		LOGP(DSDR, LOGL_INFO, "Using center frequency: RX %.6f MHz\n", rx_center_frequency / 1e6);
-		/* a filter bank for all channels, or a channelizer per channel */
-		{
-			int m = sdr_bank_wanted(sdr->rx_rate, samplerate, channels);
-
-			if (m) {
-				rc = pfb_rx_init(&sdr->bank_rx, sdr->rx_rate, m, samplerate / 2.0);
-				if (rc < 0) {
-					LOGP(DSDR, LOGL_ERROR, "RX filter bank: %s\n", pfb_error());
-					goto error;
-				}
-				sdr->use_bank_rx = 1;
-				sdr->bank_rx_frames = sdr->rx_max_in / sdr->bank_rx.d + 2;
-				sdr->bank_rx_bins = calloc(channels, sizeof(*sdr->bank_rx_bins));
-				sdr->bin_i = calloc(channels, sizeof(*sdr->bin_i));
-				sdr->bin_q = calloc(channels, sizeof(*sdr->bin_q));
-				if (!sdr->bank_rx_bins || !sdr->bin_i || !sdr->bin_q) {
-					LOGP(DSDR, LOGL_ERROR, "No memory!\n");
-					goto error;
-				}
-				for (c = 0; c < channels; c++) {
-					sdr->bin_i[c] = calloc(sdr->bank_rx_frames, sizeof(sample_t));
-					sdr->bin_q[c] = calloc(sdr->bank_rx_frames, sizeof(sample_t));
-					if (!sdr->bin_i[c] || !sdr->bin_q[c]) {
-						LOGP(DSDR, LOGL_ERROR, "No memory!\n");
-						goto error;
-					}
-				}
-				LOGP(DSDR, LOGL_INFO, "RX filter bank: %d sub-bands of %.1f kHz at %d S/s, %d taps per branch\n",
-				     m, (double)sdr->rx_rate / m / 1e3, pfb_bin_rate(&sdr->bank_rx), sdr->bank_rx.t);
-			}
-		}
 		/* each channel's channelizer takes it from its offset at the SDR rate
 		 * to 0 Hz at the DSP rate, the demodulators work at 0 Hz */
 		for (c = 0; c < channels; c++) {
@@ -740,16 +669,11 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, 0.0, bandwidth); /* bandwidth are deviation and both sidebands */
 			if (rc < 0)
 				goto error;
-			if (sdr->use_bank_rx) {
-				rc = pfb_chan_rx_init(&sdr->chan[c].rx_pc, &sdr->bank_rx, rx_offset, samplerate, sdr->bank_rx_frames);
-				if (rc < 0) {
-					LOGP(DSDR, LOGL_ERROR, "RX channel %.6f MHz: %s\n", sdr->chan[c].rx_frequency / 1e6, pfb_error());
-					goto error;
-				}
-				sdr->bank_rx_bins[c] = sdr->chan[c].rx_pc.bin;
-				sdr->chan[c].rx_init = 1;
-				LOGP(DSDR, LOGL_INFO, "RX channel %d: %.6f MHz, offset %+.1f kHz, filter bank sub-band %d\n",
-				     c, sdr->chan[c].rx_frequency / 1e6, rx_offset / 1e3, sdr->chan[c].rx_pc.bin);
+			if (sdr->use_engine) {
+				/* registered with the engine below */
+				sdr->chan[c].rx_offset = rx_offset;
+				LOGP(DSDR, LOGL_INFO, "RX channel %d: %.6f MHz, offset %+.1f kHz, filter bank\n",
+				     c, sdr->chan[c].rx_frequency / 1e6, rx_offset / 1e3);
 				continue;
 			}
 			rc = channelizer_rx_init(&sdr->chan[c].rx_ch, sdr->rx_rate, samplerate, rx_offset, bandwidth, sdr->rx_max_in);
@@ -775,6 +699,53 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				sdr->chan[c].dmp_deviation = display_measurements_add(&sender->dispmeas, "Deviation", "%.2f KHz", DISPLAY_MEAS_PEAK2PEAK, DISPLAY_MEAS_LEFT, 0.0, max_deviation / 1000.0 * 1.5, max_deviation / 1000.0);
 			}
 		}
+	}
+
+	/* engine mode: the program's channels as one group */
+	if (sdr->use_engine) {
+		int ntx = tx_frequency ? channels + (sdr->paging_channel ? 1 : 0) : 0;
+		int nrx = rx_frequency ? channels : 0, nbuf = (ntx > nrx) ? ntx : nrx;
+		double tx_off[SDR_ENGINE_MAX_CHAN], rx_off[SDR_ENGINE_MAX_CHAN];
+
+		if (nbuf > SDR_ENGINE_MAX_CHAN) {
+			LOGP(DSDR, LOGL_ERROR, "%d channels, the filter bank engine takes at most %d.\n", nbuf, SDR_ENGINE_MAX_CHAN);
+			goto error;
+		}
+		for (c = 0; c < ntx; c++)
+			tx_off[c] = sdr->chan[c].tx_offset;
+		for (c = 0; c < nrx; c++)
+			rx_off[c] = sdr->chan[c].rx_offset;
+		/* rings: 4 buffers of DSP samples; TX kept at one buffer (the
+		 * latency as before) */
+		sdr->group = sdr_engine_group_add(&sdr->engine, samplerate, nrx, rx_off, ntx, tx_off,
+						  (int)ceil(4.0 * buffer_size * 1000.0 / samplerate) + 10, buffer_size);
+		if (!sdr->group) {
+			LOGP(DSDR, LOGL_ERROR, "Filter bank engine: %s\n", sdr_engine_error());
+			goto error;
+		}
+		for (c = 0; c < ntx; c++)
+			sdr->chan[c].tx_init = 1;
+		for (c = 0; c < nrx; c++)
+			sdr->chan[c].rx_init = 1;
+		sdr->eng_i = calloc(nbuf, sizeof(*sdr->eng_i));
+		sdr->eng_q = calloc(nbuf, sizeof(*sdr->eng_q));
+		if (!sdr->eng_i || !sdr->eng_q) {
+			LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
+			goto error;
+		}
+		sdr->eng_n = nbuf;
+		for (c = 0; c < nbuf; c++) {
+			sdr->eng_i[c] = calloc(buffer_size, sizeof(sample_t));
+			sdr->eng_q[c] = calloc(buffer_size, sizeof(sample_t));
+			if (!sdr->eng_i[c] || !sdr->eng_q[c]) {
+				LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
+				goto error;
+			}
+		}
+		for (c = 0; c < ntx; c++)
+			LOGP(DSDR, LOGL_INFO, "TX %s %d: filter bank sub-band %d\n", (c < channels) ? "channel" : "paging channel", c, sdr->group->tx[c].bin);
+		for (c = 0; c < nrx; c++)
+			LOGP(DSDR, LOGL_INFO, "RX channel %d: filter bank sub-band %d\n", c, sdr->group->rx[c].bin);
 	}
 
 	if (rx_frequency && !channels) {
@@ -1100,8 +1071,67 @@ static void *sdr_write_child(void *arg)
 	}
 	if (tx_chunk > sdr->tx_max_out)
 		tx_chunk = sdr->tx_max_out;
+	/* engine mode: this thread makes the SDR rate IQ, in whole TX bank
+	 * frames; paced by the device's blocking send, or by what the driver
+	 * says is needed to stay one buffer ahead (time stamps, as
+	 * sdr_get_tosend() did for the ring) */
+	int eng_chunk = 0, eng_step = 1, eng_target = 0;
+	if (sdr->use_engine) {
+		eng_step = sdr_engine_tx_step(&sdr->engine);
+		eng_chunk = tx_chunk / eng_step * eng_step;
+		if (eng_chunk < eng_step)
+			eng_chunk = eng_step;
+		eng_target = (int)((double)sdr->buffer_size * sdr->tx_rate / sdr->samplerate);
+		LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: filter bank engine, up to %d samples per block\n", eng_chunk);
+	}
+	int out_samples;
 
 	while (sdr->thread_write.running) {
+		if (sdr->use_engine) {
+			num = eng_chunk;
+			if (!sdr_tx_device_paced()) {
+				int want = 0;
+#ifdef HAVE_UHD
+				if (tx_driver == 1)
+					want = uhd_get_tosend(eng_target);
+#endif
+#ifdef HAVE_SOAPY
+				if (tx_driver == 2)
+					want = soapy_get_tosend(eng_target);
+#endif
+				if (want < eng_step) {
+					usleep(200);
+					continue;
+				}
+				if (want < num)
+					num = want / eng_step * eng_step;
+			}
+			sdr_engine_tx_produce(&sdr->engine, sdr->thread_write.buffer2, num);
+			/* keep the sum within the range of the device */
+			for (s = 0; s < 2 * num; s++)
+				sdr->thread_write.buffer2[s] *= LIMIT_IQ_LEVEL;
+			if (sdr->wave_tx_rec.fp || sdr->wave_tx_play.fp) {
+				sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
+
+				if (sdr->wave_tx_rec.fp) {
+					for (s = 0; s < num; s++) {
+						spl_list[0][s] = sdr->thread_write.buffer2[2 * s];
+						spl_list[1][s] = sdr->thread_write.buffer2[2 * s + 1];
+					}
+					wave_write(&sdr->wave_tx_rec, spl_list, num);
+				}
+				if (sdr->wave_tx_play.fp) {
+					wave_read(&sdr->wave_tx_play, spl_list, num);
+					for (s = 0; s < num; s++) {
+						sdr->thread_write.buffer2[2 * s] = spl_list[0][s];
+						sdr->thread_write.buffer2[2 * s + 1] = spl_list[1][s];
+					}
+				}
+			}
+			sdr_status_tx_iq_accumulate(sdr->thread_write.buffer2, num);
+			out_samples = num;
+			goto send_it;
+		}
 		/* Check how much data is available in ring buffer */
 		fill = (sdr->thread_write.in - sdr->thread_write.out + sdr->thread_write.buffer_size) % sdr->thread_write.buffer_size;
 		num = fill / 2;
@@ -1158,7 +1188,7 @@ static void *sdr_write_child(void *arg)
 		printf("Thread found %d samples in write buffer and forwards them to SDR.\n", num);
 #endif
 		out = sdr->thread_write.out;
-		int out_samples = num;	/* SDR rate samples to send */
+		out_samples = num;	/* SDR rate samples to send */
 
 		for (s = 0, ss = 0; s < num; s++) {
 			sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out];
@@ -1167,6 +1197,7 @@ static void *sdr_write_child(void *arg)
 		}
 		sdr->thread_write.out = out;
 
+send_it:
 		/* send() blocks until the hardware is ready, acting as the
 		 * pacemaker that keeps data flowing at the exact SDR rate. */
 #ifdef HAVE_UHD
@@ -1271,6 +1302,10 @@ static void *sdr_read_child(void *arg)
 		/* read from SDR */
 		space = (sdr->thread_read.out - sdr->thread_read.in + sdr->thread_read.buffer_size - 2 + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size;
 		num = space / 2;
+		/* engine mode: the channels are made here, never hold the device
+		 * back for the ring (it only feeds the status and the displays) */
+		if (sdr->use_engine)
+			num = sdr->rx_max_in;
 		/* the read chunk buffer holds at most rx_max_in samples */
 		if (num > sdr->rx_max_in)
 			num = sdr->rx_max_in;
@@ -1312,6 +1347,23 @@ static void *sdr_read_child(void *arg)
 #endif
 				in = sdr->thread_read.in;
 
+				if (sdr->use_engine) {
+					/* the lost samples as zeros (the timeline stays
+					 * continuous), then the packet, into the channels */
+					long gap = sdr_rx_take_gap();
+
+					while (gap > 0) {
+						int n = (gap > sdr->rx_max_in) ? sdr->rx_max_in : (int)gap;
+
+						memset(sdr->rx_gap_zero, 0, sizeof(float) * 2 * n);
+						sdr_engine_rx_feed(&sdr->engine, sdr->rx_gap_zero, n);
+						gap -= n;
+					}
+					sdr_engine_rx_feed(&sdr->engine, sdr->thread_read.buffer2, count);
+					/* the raw ring: what fits (status, displays) */
+					if (count > space / 2)
+						count = space / 2;
+				} else
 				/* Samples lost before this packet (device overflow), measured
 				 * from device time stamps: insert the same number of zero
 				 * samples, so the sample timeline seen by the DSP stays
@@ -1508,6 +1560,7 @@ void sdr_close(void *inst)
 		free(sdr->zero_power);
 		free(sdr->zero_spl);
 		free(sdr->rx_lin);
+		free(sdr->rx_gap_zero);
 		free(sdr->tx_sum);
 		wave_destroy_record(&sdr->wave_rx_rec);
 		wave_destroy_record(&sdr->wave_tx_rec);
@@ -1523,18 +1576,10 @@ void sdr_close(void *inst)
 					am_mod_exit(&sdr->chan[c].am_mod);
 					am_demod_exit(&sdr->chan[c].am_demod);
 				}
-				if (sdr->chan[c].rx_init) {
-					if (sdr->use_bank_rx)
-						pfb_chan_exit(&sdr->chan[c].rx_pc);
-					else
-						channelizer_exit(&sdr->chan[c].rx_ch);
-				}
-				if (sdr->chan[c].tx_init) {
-					if (sdr->use_bank_tx)
-						pfb_chan_exit(&sdr->chan[c].tx_pc);
-					else
-						channelizer_exit(&sdr->chan[c].tx_ch);
-				}
+				if (sdr->chan[c].rx_init && !sdr->use_engine)
+					channelizer_exit(&sdr->chan[c].rx_ch);
+				if (sdr->chan[c].tx_init && !sdr->use_engine)
+					channelizer_exit(&sdr->chan[c].tx_ch);
 			}
 			free(sdr->chan);
 		}
@@ -1542,24 +1587,19 @@ void sdr_close(void *inst)
 			channelizer_exit(&sdr->band_rx);
 		if (sdr->band_tx_init)
 			channelizer_exit(&sdr->band_tx);
-		if (sdr->use_bank_rx)
-			pfb_exit(&sdr->bank_rx);
-		if (sdr->use_bank_tx)
-			pfb_exit(&sdr->bank_tx);
-		if (sdr->bin_i) {
+		/* the device threads are stopped: the engine and its group go */
+		if (sdr->use_engine)
+			sdr_engine_exit(&sdr->engine);
+		if (sdr->eng_i) {
 			int b;
 
-			for (b = 0; b < sdr->channels; b++) {
-				free(sdr->bin_i[b]);
-				free(sdr->bin_q[b]);
+			for (b = 0; b < sdr->eng_n; b++) {
+				free(sdr->eng_i[b]);
+				free(sdr->eng_q[b]);
 			}
 		}
-		free(sdr->bin_i);
-		free(sdr->bin_q);
-		free(sdr->bank_rx_bins);
-		free(sdr->bank_tx_bins);
-		free(sdr->tx_ci);
-		free(sdr->tx_cq);
+		free(sdr->eng_i);
+		free(sdr->eng_q);
 		free(sdr);
 		sdr = NULL;
 	}
@@ -1601,12 +1641,8 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 	/* all channels, each modulated at 0 Hz at the DSP rate and synthesized
 	 * to its frequency at the SDR rate, added up in tx_sum */
 	buff = sdr->tx_sum;
-	if (channels && sdr->use_bank_tx) {
-		int clear = pfb_chan_tx_max(&sdr->chan[0].tx_pc, num) * sdr->bank_tx.d;
-
-		if (clear > sdr->tx_max_out)
-			clear = sdr->tx_max_out;
-		memset(buff, 0, sizeof(*buff) * 2 * clear);
+	if (channels && sdr->use_engine) {
+		/* engine mode: the device TX thread makes the SDR rate IQ */
 	} else
 		memset(buff, 0, sizeof(*buff) * 2 * channelizer_tx_max(channels ? &sdr->chan[0].tx_ch : &sdr->band_tx, num));
 	if (channels) {
@@ -1639,22 +1675,31 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 				sdr->ch_i[s] = sdr->modbuff[2 * s];
 				sdr->ch_q[s] = sdr->modbuff[2 * s + 1];
 			}
-			if (sdr->use_bank_tx) {
-				/* the channel's frames for the bank (kept in its tail) */
-				n = pfb_chan_tx_process(&ch->tx_pc, sdr->ch_i, sdr->ch_q, num);
-				sdr->tx_ci[c] = ch->tx_pc.out_i;
-				sdr->tx_cq[c] = ch->tx_pc.out_q;
-			} else
-				n = channelizer_tx_process(&ch->tx_ch, sdr->ch_i, sdr->ch_q, num, buff);
+			if (sdr->use_engine) {
+				/* the channel's DSP samples, a row of all channels goes
+				 * into the group's TX ring below */
+				memcpy(sdr->eng_i[c], sdr->ch_i, num * sizeof(*sdr->ch_i));
+				memcpy(sdr->eng_q[c], sdr->ch_q, num * sizeof(*sdr->ch_q));
+				continue;
+			}
+			n = channelizer_tx_process(&ch->tx_ch, sdr->ch_i, sdr->ch_q, num, buff);
 			if (total >= 0 && n != total)
 				LOGP(DSDR, LOGL_ERROR, "TX synthesizers out of step (%d / %d samples), please fix!\n", n, total);
 			total = n;
 		}
-		if (sdr->use_bank_tx)
-			sent = pfb_tx_process(&sdr->bank_tx, channels + (sdr->paging_channel ? 1 : 0), sdr->bank_tx_bins,
-					      sdr->tx_ci, sdr->tx_cq, total, buff);
-		else
-			sent = total;
+		if (sdr->use_engine) {
+			double chan_tx_freq[SDR_STATUS_MAX_CHANNELS];
+			int written = sdr_engine_group_write(sdr->group, sdr->eng_i, sdr->eng_q, num);
+
+			if (written < num)
+				LOGP(DSDR, LOGL_ERROR, "Write SDR buffer overflow (%d of %d DSP samples fit)!\n", written, num);
+			/* the channels' state; the IQ levels count in the TX thread */
+			for (c = 0; c < channels && c < SDR_STATUS_MAX_CHANNELS; c++)
+				chan_tx_freq[c] = sdr->chan[c].tx_frequency;
+			sdr_status_tx_accumulate(NULL, 0, power, num, channels, sdr->amplitude, chan_tx_freq);
+			return num;
+		}
+		sent = total;
 	} else {
 		/* channels = 0: the caller's IQ (interleaved float) is the whole band */
 		float *in = (float *)samples;
@@ -1760,12 +1805,10 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 	 * same for every channel: same rates, same stages), or what is there */
 	__sync_synchronize();
 	avail = ((sdr->thread_read.in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size) / 2;
-	if (channels && sdr->use_bank_rx) {
-		int frames = pfb_chan_rx_need(&sdr->chan[0].rx_pc, num);
-
-		if (frames > sdr->bank_rx_frames)
-			frames = sdr->bank_rx_frames;
-		need = pfb_rx_need(&sdr->bank_rx, frames);
+	if (channels && sdr->use_engine) {
+		/* the channels come from the engine; the raw ring only feeds the
+		 * status and the displays: take what is there */
+		need = avail;
 	} else
 		need = channelizer_rx_need(channels ? &sdr->chan[0].rx_ch : &sdr->band_rx, num);
 	if (need > sdr->rx_max_in)
@@ -1783,18 +1826,20 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 	used = take;
 
 	if (channels) {
-		int frames = 0;
+		int rows = 0;
 
-		/* the bank splits the band once for all channels */
-		if (sdr->use_bank_rx)
-			frames = pfb_rx_process(&sdr->bank_rx, lin, take, channels, sdr->bank_rx_bins, sdr->bin_i, sdr->bin_q);
+		/* engine mode: the rows the device RX thread made, all channels */
+		if (sdr->use_engine)
+			rows = sdr_engine_group_read(sdr->group, sdr->eng_i, sdr->eng_q, num);
 		for (c = 0; c < channels; c++) {
 			sdr_chan_t *ch = &sdr->chan[c];
 			int n;
 
-			if (sdr->use_bank_rx)
-				n = pfb_chan_rx_process(&ch->rx_pc, sdr->bin_i[c], sdr->bin_q[c], frames, num, sdr->ch_i, sdr->ch_q);
-			else
+			if (sdr->use_engine) {
+				n = rows;
+				memcpy(sdr->ch_i, sdr->eng_i[c], n * sizeof(*sdr->ch_i));
+				memcpy(sdr->ch_q, sdr->eng_q[c], n * sizeof(*sdr->ch_q));
+			} else
 				n = channelizer_rx_process(&ch->rx_ch, lin, take, num, sdr->ch_i, sdr->ch_q);
 			if (c == 0)
 				count = n;
@@ -1903,6 +1948,13 @@ int sdr_get_tosend(void *inst, int buffer_size)
 	if (sdr_config && sdr_config->rx_only)
 		return 0;
 	ratio = (double)sdr->samplerate / sdr->tx_rate;
+
+	/* engine mode: the group's TX ring (DSP samples) kept at buffer_size;
+	 * the device TX thread takes from it at the device clock */
+	if (sdr->use_engine && sdr->group && sdr->group->n_tx) {
+		count = buffer_size - sdr_ring_fill(&sdr->group->tx_ring);
+		return (count > 0) ? count : 0;
+	}
 
 	/* Device paced: keep the write ring filled to buffer_size. The write
 	 * thread drains it through the blocking send(), i.e. at the device

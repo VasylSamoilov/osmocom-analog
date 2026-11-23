@@ -120,8 +120,10 @@ int sdr_engine_init(sdr_engine_t *e, int rx_rate, int tx_rate, int max_dsp, int 
 	e->tx_nmax = (tx_nmax > 0) ? tx_nmax : 1;
 	e->max_block = max_block;
 	e->next_id = 1;
+	/* the sub-bands for the channels expected (tx_nmax): the more channels,
+	 * the more the tails weigh against the bank */
 	if (rx_rate) {
-		m = sdr_engine_bins(rx_rate, max_dsp, 2);
+		m = sdr_engine_bins(rx_rate, max_dsp, e->tx_nmax);
 		if (!m) {
 			snprintf(error_text, sizeof(error_text), "no filter bank fits SDR rate %d and DSP rate %d (sub-bands must be wider than the DSP rate)", rx_rate, max_dsp);
 			return -EINVAL;
@@ -139,7 +141,7 @@ int sdr_engine_init(sdr_engine_t *e, int rx_rate, int tx_rate, int max_dsp, int 
 			goto nomem;
 	}
 	if (tx_rate) {
-		m = sdr_engine_bins(tx_rate, max_dsp, 2);
+		m = sdr_engine_bins(tx_rate, max_dsp, e->tx_nmax);
 		if (!m) {
 			snprintf(error_text, sizeof(error_text), "no filter bank fits SDR rate %d and DSP rate %d (sub-bands must be wider than the DSP rate)", tx_rate, max_dsp);
 			sdr_engine_exit(e);

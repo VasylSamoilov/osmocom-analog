@@ -228,6 +228,9 @@ void sdr_status_reset(void);
  * num DSP rate power flags per channel */
 void sdr_status_tx_accumulate(float *buff, int iq_num, uint8_t **power, int num, int channels,
 			      double amplitude, double *chan_tx_freq);
+/* the IQ level part alone (iq_num SDR rate IQ samples), from the device TX
+ * thread in filter bank engine mode */
+void sdr_status_tx_iq_accumulate(const float *buff, int iq_num);
 
 /* Called from sdr_read to accumulate RX IQ samples */
 void sdr_status_rx_accumulate(float *buff, int num);

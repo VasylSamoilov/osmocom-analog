@@ -90,7 +90,18 @@ void sdr_status_tx_accumulate(float *buff, int iq_num, uint8_t **power, int num,
 	}
 	tx->active_channels = active;
 
-	/* Combined IQ levels (SDR rate IQ, iq_num samples) */
+	sdr_status_tx_iq_accumulate(buff, iq_num);
+}
+
+/*
+ * TX IQ levels at the SDR rate alone - from the device TX thread when the
+ * filter bank engine makes the SDR rate IQ there (as the hw counters)
+ */
+void sdr_status_tx_iq_accumulate(const float *buff, int iq_num)
+{
+	sdr_tx_status_t *tx = &sdr_status.tx;
+	int s;
+
 	for (s = 0; s < iq_num; s++) {
 		double vi = fabs(buff[s * 2]);
 		double vq = fabs(buff[s * 2 + 1]);
