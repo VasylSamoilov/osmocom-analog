@@ -21,6 +21,9 @@
 #include <math.h>
 #include "resamp.h"
 
+/* GCC/clang vector extension: 2 doubles, unaligned, may alias the arrays */
+typedef double v2d __attribute__((vector_size(16), aligned(8), may_alias));
+
 static int gcd(int a, int b)
 {
 	while (b) {
@@ -122,6 +125,25 @@ void resamp_exit(resamp_t *r)
 	memset(r, 0, sizeof(*r));
 }
 
+/* output k (from 0) comes at phase + k q (in 1/p input samples), with input
+ * floor((phase + k q) / p) + 1 */
+int resamp_need(const resamp_t *r, int m)
+{
+	if (m <= 0)
+		return 0;
+	return (int)(((long long)r->phase + (long long)(m - 1) * r->q) / r->p) + 1;
+}
+
+/* outputs with phase + k q < n p */
+int resamp_gives(const resamp_t *r, int n)
+{
+	long long lim = (long long)n * r->p - r->phase;
+
+	if (lim <= 0)
+		return 0;
+	return (int)((lim + r->q - 1) / r->q);
+}
+
 int resamp_max_out(const resamp_t *r)
 {
 	return (r->p + r->q - 1) / r->q;
@@ -141,9 +163,23 @@ int resamp_process(resamp_t *r, sample_t in_i, sample_t in_q, sample_t *out_i, s
 	bq = r->buf_q + r->ptr;
 	while (r->phase < p) {
 		const double *h = r->h + r->phase * len;
-		double acc_i = 0.0, acc_q = 0.0;
+		v2d vi0 = { 0, 0 }, vq0 = { 0, 0 }, vi1 = { 0, 0 }, vq1 = { 0, 0 };
+		double acc_i, acc_q;
 
-		for (j = 0; j < len; j++) {
+		/* two independent pairs of 128 bit sums (SSE2, NEON) */
+		for (j = 0; j + 3 < len; j += 4) {
+			v2d h0 = *(const v2d *)(h + j), h1 = *(const v2d *)(h + j + 2);
+
+			vi0 += h0 * *(const v2d *)(bi + j);
+			vq0 += h0 * *(const v2d *)(bq + j);
+			vi1 += h1 * *(const v2d *)(bi + j + 2);
+			vq1 += h1 * *(const v2d *)(bq + j + 2);
+		}
+		vi0 += vi1;
+		vq0 += vq1;
+		acc_i = vi0[0] + vi0[1];
+		acc_q = vq0[0] + vq0[1];
+		for (; j < len; j++) {
 			acc_i += h[j] * bi[j];
 			acc_q += h[j] * bq[j];
 		}

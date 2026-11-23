@@ -42,5 +42,9 @@ void resamp_exit(resamp_t *r);
  * resamp_max_out()) and returns their number. */
 int resamp_process(resamp_t *r, sample_t in_i, sample_t in_q, sample_t *out_i, sample_t *out_q);
 int resamp_max_out(const resamp_t *r);
+/* input samples needed for m (> 0) more output samples */
+int resamp_need(const resamp_t *r, int m);
+/* output samples that n more input samples give */
+int resamp_gives(const resamp_t *r, int n);
 
 #endif /* _RESAMP_H */

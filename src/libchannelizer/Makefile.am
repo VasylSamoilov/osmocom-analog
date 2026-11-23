@@ -5,5 +5,7 @@ noinst_LIBRARIES = libchannelizer.a
 libchannelizer_a_SOURCES = \
 	halfband.c \
 	resamp.c \
+	fftc.c \
+	pfb.c \
 	channelizer.c
 
