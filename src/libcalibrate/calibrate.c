@@ -506,6 +506,14 @@ static int gsm_channel_rate(int samplerate)
 	return rate;
 }
 
+/* IQ samples per read in the detection loop (50 ms, at most 100000) */
+static int calib_block_samples(int samplerate)
+{
+	int n = (int)(samplerate * 0.05);
+
+	return (n > 100000) ? 100000 : n;
+}
+
 /* Blocking receive: retries until buffer is full (used by scan phase) */
 static int receive_iq_blocking(float *buffer, int max_samples)
 {
@@ -828,7 +836,7 @@ static int choose_fcch_reference_arfcn(int samplerate,
 		flush_rx(iq, chunk_samples, samplerate);
 
 		int out_rate = gsm_channel_rate(samplerate);
-		int rc_ch = channelizer_rx_init(&chz, samplerate, out_rate, 0.0, 2.0 * CHANNELIZER_PASS * out_rate);
+		int rc_ch = channelizer_rx_init(&chz, samplerate, out_rate, 0.0, 2.0 * CHANNELIZER_PASS * out_rate, chunk_samples);
 		if (rc_ch < 0) {
 			LOGP(DSDR, LOGL_ERROR, "Channelizer: %s\n", channelizer_error());
 			continue;
@@ -861,8 +869,7 @@ static int choose_fcch_reference_arfcn(int samplerate,
 			if (got <= 0)
 				break;
 			sampled += got;
-			int used;
-			int out_count = channelizer_rx_process(&chz, iq, got, max_out, i_out, q_out, &used);
+			int out_count = channelizer_rx_process(&chz, iq, got, max_out, i_out, q_out);
 			if (out_count <= 0)
 				continue;
 			for (int s = 0; s < out_count; s++) {
@@ -1408,7 +1415,8 @@ static int setup_channels_for_arfcns(calib_channel_t *channels, int max_channels
 			out_rate = gsm_channel_rate(samplerate);
 			int rc = channelizer_rx_init(&channels[num].channelizer,
 			                             samplerate, out_rate, offset,
-			                             2.0 * CHANNELIZER_PASS * out_rate);
+			                             2.0 * CHANNELIZER_PASS * out_rate,
+			                             calib_block_samples(samplerate));
 			if (rc < 0) {
 				LOGP(DSDR, LOGL_ERROR, "Failed to init channelizer for ARFCN %d: %s\n",
 				     arfcns[i].arfcn, channelizer_error());
@@ -1677,9 +1685,7 @@ int calibrate_band(double center_freq, int samplerate,
 	     "Monitoring %d channels, need %d measurements (timeout %.0fs)\n",
 	     num_channels, AVG_COUNT, config->timeout_sec);
 
-	int buffer_samples = (int)(samplerate * 0.05);
-	if (buffer_samples > 100000)
-		buffer_samples = 100000;
+	int buffer_samples = calib_block_samples(samplerate);
 	iq_buffer = calloc(buffer_samples * 2, sizeof(float));
 	int max_out_samples = buffer_samples + 16;
 	ch_iq = calloc(max_out_samples * 2, sizeof(float));
@@ -1800,13 +1806,11 @@ int calibrate_band(double center_freq, int samplerate,
 					channels[c].poly_debug_blocks++;
 				}
 			} else {
-				int used;
-
 				out_count = channelizer_rx_process(&channels[c].channelizer,
 				                                   iq_buffer, samples_received,
 				                                   channels[c].max_out,
 				                                   channels[c].i_out,
-				                                   channels[c].q_out, &used);
+				                                   channels[c].q_out);
 			}
 			if (out_count <= 0) continue;
 

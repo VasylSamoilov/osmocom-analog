@@ -26,13 +26,16 @@
 typedef struct resamp {
 	int		p, q;		/* up, down */
 	int		len;		/* taps per phase = input samples in the window */
-	double		*h;		/* len * p taps, h[j * p + phase] */
+	double		*h;		/* p rows of len taps, row 'phase' in window order (oldest first) */
 	int		ptr;		/* ring position */
 	double		*buf_i, *buf_q;	/* ring of len input samples, stored twice */
 	int		phase;		/* output position within the current input, in 1/p input samples */
 } resamp_t;
 
 int resamp_init(resamp_t *r, int in_rate, int out_rate);
+/* the same with own band edges (Hz): flat to pass_hz, atten from stop_hz on
+ * (what folds or images onto 0 .. pass_hz must lie beyond stop_hz) */
+int resamp_init_band(resamp_t *r, int in_rate, int out_rate, double pass_hz, double stop_hz, double atten);
 void resamp_exit(resamp_t *r);
 
 /* One input sample; writes 0 or more output samples (at most

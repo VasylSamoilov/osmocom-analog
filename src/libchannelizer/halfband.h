@@ -9,10 +9,15 @@
  * (at your option) any later version.
  *
  * Linear phase halfband FIR, double precision, centred at 0 Hz (the
- * channelizer shifts each channel to 0 Hz with an NCO first). Passband
- * 0 .. 0.2, stopband 0.3 .. 0.5 of the higher rate.
- * Measured (docs/CHANNELIZER.md): order 48 rejects aliases / images by
- * 81 dB or more, order 64 by 104 dB or more.
+ * channelizer shifts each channel to 0 Hz with an NCO first).
+ *
+ * The filter is designed for its stage (halfband_design): a stage whose
+ * channel band reaches 'pass' (fraction of its higher rate) must pass
+ * 0 .. pass and stop 0.5 - pass .. 0.5 (what folds onto the channel band).
+ * Early stages of a cascade see the channel in a tiny part of their band and
+ * get by with a few taps; only the stage next to the DSP rate needs many.
+ * The design is checked numerically on a fine grid: the shortest filter
+ * that reaches the attenuation is taken.
  */
 
 #ifndef _HALFBAND_H
@@ -20,28 +25,32 @@
 
 #include "../libsample/sample.h"
 
-#define HALFBAND_ORDER_32	32
-#define HALFBAND_ORDER_48	48
-#define HALFBAND_ORDER_64	64
+#define HALFBAND_MAX_COEFFS	32	/* non-zero coefficients on one side */
 
 typedef struct halfband {
-	int		order;		/* filter order (32, 48, 64) */
+	int		order;		/* 4 * num_coeffs: taps at odd distances 1 .. order/2 - 1 */
 	int		num_coeffs;	/* non-zero coefficients on one side */
-	const double	*coeffs;	/* coeffs[0] outermost .. coeffs[n-1] next to the centre */
+	double		coeffs[HALFBAND_MAX_COEFFS];	/* coeffs[0] outermost .. [n-1] next to the centre */
+	double		pass;		/* passband edge it was designed for (fraction of the higher rate) */
+	double		stop_db;	/* worst measured attenuation in the stopband */
+	double		ripple_db;	/* worst measured deviation in the passband */
 	int		phase;		/* decimation: 0 = store only, 1 = store and output */
 	int		ptr;		/* ring position */
 	double		*buf_i, *buf_q;	/* window stored twice, reads never wrap */
 } halfband_t;
 
-int halfband_init(halfband_t *hb, int order);
+/* Design for a passband 0 .. pass (fraction of the higher rate, < 0.25) and
+ * a stopband 0.5 - pass .. 0.5 with at least atten_db; returns 0 or <0 if no
+ * filter up to HALFBAND_MAX_COEFFS reaches it. */
+int halfband_design(halfband_t *hb, double pass, double atten_db);
 void halfband_exit(halfband_t *hb);
 
-/* 2x decimation: one input sample, returns 1 and the output in *i, *q every
- * second call, else 0. Group delay order/2 input samples. */
-int halfband_decimate(halfband_t *hb, sample_t *i, sample_t *q);
+/* 2x decimation of a block: n input samples (in place, I and Q separately),
+ * returns the number of output samples (written from the start). */
+int halfband_decimate_block(halfband_t *hb, sample_t *i, sample_t *q, int n);
 
-/* 2x interpolation, polyphase form: one input sample gives two output
- * samples, in time order. Unity gain in the passband. */
-void halfband_interpolate(halfband_t *hb, sample_t in_i, sample_t in_q, sample_t out_i[2], sample_t out_q[2]);
+/* 2x interpolation of a block: n input samples, 2n output samples in time
+ * order. Unity gain in the passband. */
+void halfband_interpolate_block(halfband_t *hb, const sample_t *in_i, const sample_t *in_q, int n, sample_t *out_i, sample_t *out_q);
 
 #endif /* _HALFBAND_H */

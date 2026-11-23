@@ -40,10 +40,17 @@ Per channel, both directions, for every SDR driver (libchannelizer,
 libsdr/sdr.c):
 
 - RX: NCO at the SDR rate shifts the channel to 0 Hz; halfband 2x
-  decimators (order 64, double precision) as long as the rate stays an
-  integer of at least 1.25 x the DSP rate (or reaches it exactly); then a
-  rational polyphase resampler P/Q (Kaiser, 100 dB, passband 0.4, stopband
-  0.5 of the DSP rate) to exactly the DSP rate. The demodulator runs at 0 Hz.
+  decimators (double precision) as long as the rate stays an integer of at
+  least 1.25 x the DSP rate (or reaches it exactly); then a rational
+  polyphase resampler P/Q (Kaiser, 100 dB, passband 0.4, stopband 0.5 of the
+  DSP rate) to exactly the DSP rate. The demodulator runs at 0 Hz.
+- Each halfband is designed for its stage (105 dB): with the channel at 0 Hz
+  a stage only has to keep the band the later stages pass, a part of its
+  rate that halves with every stage towards the SDR rate. At 10 MS/s to
+  200 kS/s the stages have 12, 12, 20, 24, 40 taps (was 64 each). The design
+  searches the shortest Kaiser halfband that reaches the attenuation, checked
+  on a grid; designs are cached (first channel ~100 ms, the others reuse it).
+- Block processing, stage by stage (not one call per sample and stage).
 - TX: the mirror image; each channel's synthesizer adds its channel at the
   SDR rate; the write thread only sends.
 - Integer ratios preferred (small P/Q, cheaper), any ratio works.
@@ -63,32 +70,57 @@ libsdr/sdr.c):
 
 ## Measurements
 
-Library (src/test/test_channelizer, PASSED): halfband order 64 alias and
-image rejection 104.6 dB, flat to 0.01 dB; channel level error < 0.01 dB at
-the right frequency (7 tones); everything else in the SDR band <= -104.6 dB
-in the whole DSP band (960k/96k, 384k/96k, 1M/96k non-integer); TX wanted
-line 0.00 dB, everything else <= -107 dB (960k, 3.84M, 1M, 2.4M); TX sample
-count without drift (within one 2^k step).
+Library (src/test/test_channelizer, PASSED): every halfband as designed for
+its stage (passbands 0.005 .. 0.2) flat to 0.01 dB, alias and image
+rejection >= 105.7 dB, in blocks of odd length; channel level error < 0.01
+dB at the right frequency (7 tones), the input from channelizer_rx_need()
+gives exactly the wanted samples per call; everything else in the SDR band
+<= -108.6 dB in the whole DSP band (960k/96k, 384k/96k, 1M/96k
+non-integer, 10M/200k, 768k/192k); TX wanted line 0.00 dB, everything else
+<= -109 dB (960k, 3.84M, 1M, 2.4M, 10M, 768k); TX sample count without
+drift.
 
-CPU of the library on this PC (one core, per channel, RX / TX): 960k/96k
-2.3 / 3.3 %; 384k/96k 0.6 / 1.0 %; 1.92M/96k 4.1 / 6.4 %; 3.84M/96k 7.8 /
-12.4 %; 1M/96k (non-integer) 2.4 / 3.4 %.
+B210, NMT 2 channels at +-25 kHz, TX to RX by cable (-l 2), old and new
+build back to back, 20 s each (SDR 768k, DSP 192k), 3 pairs, with an
+RTL-SDR beside it measuring what is sent (rtl_power, 10 kHz around each
+channel):
 
-B210, NMT 2 channels at +-25 kHz, TX to RX over the air (-l 2), old and new
-build back to back, same setup, 30 s each (SDR 768k, DSP 192k):
+| pair | frames old / new | B210 RX channel old / new | IMD3 old / new | RTL-SDR ch 90, 92 old / new |
+|---|---|---|---|---|
+| 1 | 238 / 236 | -39.1 / -40.1 dBFS | -48.0 / -48.7 dBc | 2.5, 1.0 / 2.3, 0.9 dB |
+| 2 | 238 / 236 | -37.5 / -38.3 dBFS | -49.4 / -49.6 dBc | 3.2, 1.9 / 2.9, 1.6 dB |
+| 3 | 238 / 236 | -37.5 / -37.8 dBFS | -49.5 / -49.1 dBc | 2.5, 0.9 / 2.4, 0.8 dB |
 
-| build | frames | channel | IMD3 | SNR (16 kHz) | CPU |
-|---|---|---|---|---|---|
-| old | 382 ok, 0 bad | -45.9 dBFS | -41.6 dBc | 46.4 dB | 17.2 % |
-| new | 382 ok, 0 bad | -44.5 dBFS | -44.9 dBc | 48.8 dB | 22.3 % |
+0 bad frames. The B210 loopback level moves between sessions (the old build
+measured -42 dBFS an hour earlier) for both builds alike; the sent level is
+the same within 0.3 dB. 2 frames fewer: start-up (design ~100 ms).
 
-At SDR 1.92M: CPU old 17.3 %, new 42.0 % (2 channels x RX and TX per
-channel at the full SDR rate). The old code converted the sum of the band
-once (with the faults above).
+CPU, whole process per thread, 2 channels, 15 s (main / RX thread / TX
+thread):
+
+| SDR rate | old | new |
+|---|---|---|
+| 768k (DSP 192k) | 8 / 2 / 5 % | 11 / 1 / 4 % |
+| 1.92M (DSP 192k) | 8 / 3 / 3 % | 21 / 2 / 2 % |
+| 10M (DSP 200k) | 9 / 16 / 16 %, 216 frames | 50 / 10 / 10 %, 218 frames (before the per-stage design: 100 %, 6 frames, overflows) |
+
+The per-channel chain costs ~10 % of a core per channel and direction at
+10 MS/s: it does not scale to many channels. Next: a polyphase FFT filter
+bank (cost independent of the channel count) and one SDR backend that
+processes register their channels on (see the plan below).
+
+## Plan: filter bank and shared backend
+
+Prototype (~/.cache/sdrangel-rp-rates/pfb, not in the tree yet): 2x
+oversampled polyphase FFT analysis bank, in-tree FFT (Stockham radix 4),
+exact against the direct formula (3e-13), >= 111 dB within +-0.6 x the
+channel bandwidth; 9 % of a core at 10 MS/s for any number of channels, the
+per-channel tail (fine NCO, resampler with band edges) ~0.15 %. Still open:
+TX synthesis bank (must filter the channel before the bank: everything else
+is sent), block borders, the guarantee change (+-W clean instead of the whole
+DSP band), Pi measurements, the backend design.
 
 ## Open
 
-- CPU: a shared first stage for channels close together (halfbands over the
-  whole band while it still holds all channels), same filters, same result.
 - Pi 4 CPU (RTL-SDR RX).
 - Over the air: wide channel spacing (AMPS), osmoradio, osmocalibrate.

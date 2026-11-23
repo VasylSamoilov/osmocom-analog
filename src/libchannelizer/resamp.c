@@ -49,21 +49,27 @@ static double bessel_i0(double x)
 
 int resamp_init(resamp_t *r, int in_rate, int out_rate)
 {
-	double atten = RESAMP_ATTEN_DB, beta, fc, dw, sum = 0.0, low, hi;
-	int g, n, k, taps;
+	double low = (in_rate < out_rate) ? in_rate : out_rate;
+
+	return resamp_init_band(r, in_rate, out_rate, RESAMP_PASS * low, RESAMP_STOP * low, RESAMP_ATTEN_DB);
+}
+
+int resamp_init_band(resamp_t *r, int in_rate, int out_rate, double pass_hz, double stop_hz, double atten)
+{
+	double beta, fc, dw, sum = 0.0, hi, *h;
+	int g, n, k, taps, ph, j;
 
 	memset(r, 0, sizeof(*r));
-	if (in_rate <= 0 || out_rate <= 0 || in_rate == out_rate)
+	if (in_rate <= 0 || out_rate <= 0 || in_rate == out_rate || pass_hz <= 0.0 || stop_hz <= pass_hz)
 		return -EINVAL;
 	g = gcd(in_rate, out_rate);
 	r->p = out_rate / g;
 	r->q = in_rate / g;
 
-	/* design at the upsampled rate hi = P * fin, band edges at the lower rate */
-	low = (in_rate < out_rate) ? in_rate : out_rate;
+	/* design at the upsampled rate hi = P * fin */
 	hi = (double)in_rate * r->p;
-	fc = (RESAMP_PASS + RESAMP_STOP) / 2.0 * low / hi;
-	dw = 2.0 * M_PI * (RESAMP_STOP - RESAMP_PASS) * low / hi;
+	fc = (pass_hz + stop_hz) / 2.0 / hi;
+	dw = 2.0 * M_PI * (stop_hz - pass_hz) / hi;
 	beta = 0.1102 * (atten - 8.7);
 	n = (int)ceil((atten - 7.95) / (2.285 * dw)) + 1;
 	if (!(n & 1))
@@ -72,21 +78,32 @@ int resamp_init(resamp_t *r, int in_rate, int out_rate)
 	r->len = (n + r->p - 1) / r->p;
 	taps = r->len * r->p;
 
+	h = calloc(taps, sizeof(*h));
 	r->h = calloc(taps, sizeof(*r->h));
-	if (!r->h)
+	if (!h || !r->h) {
+		free(h);
+		free(r->h);
+		r->h = NULL;
 		return -ENOMEM;
+	}
 	for (k = 0; k < n; k++) {
 		double t = k - (n - 1) / 2.0;
 		double sinc = (t == 0.0) ? 2.0 * fc : sin(2.0 * M_PI * fc * t) / (M_PI * t);
-		double x = 2.0 * k / (n - 1) - 1.0;
+		double x = (n > 1) ? 2.0 * k / (n - 1) - 1.0 : 0.0;
 		double w = bessel_i0(beta * sqrt(1.0 - x * x)) / bessel_i0(beta);
 
-		r->h[k] = sinc * w;
-		sum += r->h[k];
+		h[k] = sinc * w;
+		sum += h[k];
 	}
 	/* unity gain at 0 Hz: zero stuffing by P loses P */
 	for (k = 0; k < n; k++)
-		r->h[k] *= r->p / sum;
+		h[k] *= r->p / sum;
+	/* one contiguous row per phase, in the order of the window (oldest
+	 * first): row[ph][len-1-j] = h[j P + ph] */
+	for (ph = 0; ph < r->p; ph++)
+		for (j = 0; j < r->len; j++)
+			r->h[ph * r->len + (r->len - 1 - j)] = h[j * r->p + ph];
+	free(h);
 
 	r->buf_i = calloc(2 * r->len, sizeof(*r->buf_i));
 	r->buf_q = calloc(2 * r->len, sizeof(*r->buf_q));
@@ -123,12 +140,12 @@ int resamp_process(resamp_t *r, sample_t in_i, sample_t in_q, sample_t *out_i, s
 	bi = r->buf_i + r->ptr;
 	bq = r->buf_q + r->ptr;
 	while (r->phase < p) {
-		const double *h = r->h + r->phase;
+		const double *h = r->h + r->phase * len;
 		double acc_i = 0.0, acc_q = 0.0;
 
 		for (j = 0; j < len; j++) {
-			acc_i += h[j * p] * bi[len - 1 - j];
-			acc_q += h[j * p] * bq[len - 1 - j];
+			acc_i += h[j] * bi[j];
+			acc_q += h[j] * bq[j];
 		}
 		out_i[count] = acc_i;
 		out_q[count] = acc_q;

@@ -23,12 +23,9 @@ const char *channelizer_error(void)
 	return error_text;
 }
 
-/* renormalise the NCO phasor this often (rounding drift of its magnitude) */
-#define NCO_RENORM	1024
-
-static int init_common(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth, int tx)
+static int init_common(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth, int max_block, int tx)
 {
-	int k = 0, s, rc = -ENOMEM;
+	int k = 0, s, rc = -ENOMEM, work;
 
 	memset(ch, 0, sizeof(*ch));
 	error_text[0] = '\0';
@@ -45,46 +42,76 @@ static int init_common(channelizer_t *ch, int sdr_rate, int dsp_rate, double off
 		snprintf(error_text, sizeof(error_text), "the channel at %+.0f Hz (bandwidth %.0f Hz) is outside the SDR band of +-%.0f Hz", offset, bandwidth, sdr_rate / 2.0);
 		return -EINVAL;
 	}
+	if (max_block < 1) {
+		snprintf(error_text, sizeof(error_text), "no block size");
+		return -EINVAL;
+	}
 
 	ch->sdr_rate = sdr_rate;
 	ch->dsp_rate = dsp_rate;
 	ch->offset = offset;
 	ch->tx = tx;
+	ch->max_block = max_block;
 
 	/* As many halfbands as keep an integer rate of at least 1.25 times the
-	 * DSP rate: the last one folds its transition band (0.2 .. 0.3 of its
-	 * input rate) onto 0.4 .. 0.5 of its output rate, that is above 0.5 of
-	 * the DSP rate, where the resampler stops. Without a resampler (the rate
-	 * after the halfbands is the DSP rate) the halfbands alone pass 0.4 and
-	 * stop from 0.6 (folded onto 0.4 .. 0.5) of the DSP rate. */
+	 * DSP rate (or reach it exactly): the last one folds onto 0.4 .. 0.5 of
+	 * its output rate, above 0.5 of the DSP rate, where the resampler
+	 * stops. */
 	while (k < CHANNELIZER_MAX_HB && !(sdr_rate % (2 << k))
 	    && (sdr_rate / (2 << k) == dsp_rate || sdr_rate / (2 << k) * 4 >= dsp_rate * 5))
 		k++;
 	ch->mid_rate = sdr_rate >> k;
+	ch->use_resamp = (ch->mid_rate != dsp_rate);
+
+	/* Each halfband for its stage (channel at 0 Hz). Stage s (RX: from the
+	 * SDR side) has the higher rate sdr_rate / 2^s; it must keep 0 .. W
+	 * flat and not fold anything onto it, W = where the stages after it
+	 * stop (reach the full attenuation):
+	 * - with the resampler: 0.5 of the DSP rate (RESAMP_STOP)
+	 * - else the last halfband delivers the DSP rate: it passes 0.4 of it
+	 *   (its own W) and stops from 0.6 of it, so W = 0.6 before it.
+	 * TX: the same stages in reverse, the images fall where the aliases
+	 * would. */
 	for (s = 0; s < k; s++) {
-		rc = halfband_init(&ch->hb[s], CHANNELIZER_HB_ORDER);
-		if (rc < 0)
-			goto fail;
-		ch->hb_stages = s + 1;
+		double rate = (double)(sdr_rate >> s), pass;
+		int hs = tx ? k - 1 - s : s;	/* index in hb[]: TX hb[k-1] at the SDR rate */
+
+		if (ch->use_resamp)
+			pass = RESAMP_STOP * dsp_rate / rate;
+		else if (s == k - 1)
+			pass = CHANNELIZER_PASS * dsp_rate / rate;
+		else
+			pass = (1.0 - CHANNELIZER_PASS) * dsp_rate / rate;
+		rc = halfband_design(&ch->hb[hs], pass, CHANNELIZER_ATTEN_DB);
+		if (rc < 0) {
+			snprintf(error_text, sizeof(error_text), "no halfband for stage %d (passband %.4f)", s, pass);
+			goto fail_text;
+		}
+		ch->hb_stages++;
 	}
-	if (ch->mid_rate != dsp_rate) {
+	if (ch->use_resamp) {
 		rc = tx ? resamp_init(&ch->resamp, dsp_rate, ch->mid_rate) : resamp_init(&ch->resamp, ch->mid_rate, dsp_rate);
 		if (rc < 0)
 			goto fail;
-		ch->use_resamp = 1;
 	}
-	if (tx) {
-		int rs_max = ch->use_resamp ? resamp_max_out(&ch->resamp) : 1;
 
-		ch->max_expand = rs_max << k;
-		ch->tmp_i = calloc(ch->max_expand, sizeof(*ch->tmp_i));
-		ch->tmp_q = calloc(ch->max_expand, sizeof(*ch->tmp_q));
-		ch->rs_i = calloc(rs_max, sizeof(*ch->rs_i));
-		ch->rs_q = calloc(rs_max, sizeof(*ch->rs_q));
-		if (!ch->tmp_i || !ch->tmp_q || !ch->rs_i || !ch->rs_q) {
-			rc = -ENOMEM;
-			goto fail;
-		}
+	/* block buffers: the largest number of samples at any stage */
+	if (tx)
+		work = channelizer_tx_max(ch, max_block);
+	else
+		work = max_block;
+	ch->work_i = calloc(work, sizeof(*ch->work_i));
+	ch->work_q = calloc(work, sizeof(*ch->work_q));
+	ch->work2_i = calloc(work, sizeof(*ch->work2_i));
+	ch->work2_q = calloc(work, sizeof(*ch->work2_q));
+	if (!tx) {
+		ch->fifo_size = (int)((double)max_block * dsp_rate / sdr_rate) + 64;
+		ch->fifo_i = calloc(ch->fifo_size, sizeof(*ch->fifo_i));
+		ch->fifo_q = calloc(ch->fifo_size, sizeof(*ch->fifo_q));
+	}
+	if (!ch->work_i || !ch->work_q || !ch->work2_i || !ch->work2_q || (!tx && (!ch->fifo_i || !ch->fifo_q))) {
+		rc = -ENOMEM;
+		goto fail;
 	}
 
 	/* RX shifts the channel down to 0 Hz, TX up from 0 Hz */
@@ -96,135 +123,173 @@ static int init_common(channelizer_t *ch, int sdr_rate, int dsp_rate, double off
 
 fail:
 	snprintf(error_text, sizeof(error_text), "no memory");
+fail_text:
 	channelizer_exit(ch);
 	return rc;
 }
 
-int channelizer_rx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth)
+int channelizer_rx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth, int max_block)
 {
-	return init_common(ch, sdr_rate, dsp_rate, offset, bandwidth, 0);
+	return init_common(ch, sdr_rate, dsp_rate, offset, bandwidth, max_block, 0);
 }
 
-int channelizer_tx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth)
+int channelizer_tx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth, int max_block)
 {
-	return init_common(ch, sdr_rate, dsp_rate, offset, bandwidth, 1);
+	return init_common(ch, sdr_rate, dsp_rate, offset, bandwidth, max_block, 1);
 }
 
 void channelizer_exit(channelizer_t *ch)
 {
 	int s;
 
-	for (s = 0; s < ch->hb_stages; s++)
-		halfband_exit(&ch->hb[s]);
+	for (s = 0; s < CHANNELIZER_MAX_HB; s++)
+		if (ch->hb[s].order)
+			halfband_exit(&ch->hb[s]);
 	if (ch->use_resamp)
 		resamp_exit(&ch->resamp);
-	free(ch->tmp_i);
-	free(ch->tmp_q);
-	free(ch->rs_i);
-	free(ch->rs_q);
+	free(ch->work_i);
+	free(ch->work_q);
+	free(ch->work2_i);
+	free(ch->work2_q);
+	free(ch->fifo_i);
+	free(ch->fifo_q);
 	memset(ch, 0, sizeof(*ch));
 }
 
-static inline void nco_step(channelizer_t *ch)
+/* mix a block with the NCO (in place), renormalising the phasor at the end */
+static void nco_block(channelizer_t *ch, sample_t *i, sample_t *q, int n)
 {
-	double i = ch->nco_i * ch->rot_i - ch->nco_q * ch->rot_q;
-	double q = ch->nco_i * ch->rot_q + ch->nco_q * ch->rot_i;
+	double pi = ch->nco_i, pq = ch->nco_q, ri = ch->rot_i, rq = ch->rot_q, mag;
+	int s;
 
-	if (++ch->nco_count == NCO_RENORM) {
-		double mag = sqrt(i * i + q * q);
+	for (s = 0; s < n; s++) {
+		double xi = i[s], xq = q[s], t;
 
-		i /= mag;
-		q /= mag;
-		ch->nco_count = 0;
+		i[s] = xi * pi - xq * pq;
+		q[s] = xi * pq + xq * pi;
+		t = pi * ri - pq * rq;
+		pq = pi * rq + pq * ri;
+		pi = t;
 	}
-	ch->nco_i = i;
-	ch->nco_q = q;
+	mag = sqrt(pi * pi + pq * pq);
+	ch->nco_i = pi / mag;
+	ch->nco_q = pq / mag;
 }
 
-int channelizer_rx_process(channelizer_t *ch, const float *iq, int n, int want, sample_t *out_i, sample_t *out_q, int *used)
+int channelizer_rx_need(const channelizer_t *ch, int want)
 {
-	int s, st, count = 0;
+	int m = want - ch->fifo_len, s, n;
 
-	for (s = 0; s < n && count < want; s++) {
-		double x_i = iq[2 * s], x_q = iq[2 * s + 1];
-		sample_t i, q;
+	if (m <= 0)
+		return 0;
+	/* resampler: output k (from 0) comes at phase + k q (in 1/p input
+	 * samples), with input floor((phase + k q) / p) + 1 */
+	if (ch->use_resamp) {
+		long long phase = ch->resamp.phase, p = ch->resamp.p, q = ch->resamp.q;
 
-		/* mix down */
-		i = x_i * ch->nco_i - x_q * ch->nco_q;
-		q = x_i * ch->nco_q + x_q * ch->nco_i;
-		nco_step(ch);
+		n = (int)((phase + (long long)(m - 1) * q) / p) + 1;
+		m = n;
+	}
+	/* halfbands from the DSP side: m outputs need 2m inputs, one less if
+	 * one is stored already */
+	for (s = ch->hb_stages - 1; s >= 0; s--)
+		m = 2 * m - ch->hb[s].phase;
+	return m;
+}
 
-		for (st = 0; st < ch->hb_stages; st++)
-			if (!halfband_decimate(&ch->hb[st], &i, &q))
-				break;
-		if (st < ch->hb_stages)
-			continue;
-		if (ch->use_resamp) {
-			/* decimating: 0 or 1 output per input */
+int channelizer_rx_process(channelizer_t *ch, const float *iq, int n, int want, sample_t *out_i, sample_t *out_q)
+{
+	sample_t *wi = ch->work_i, *wq = ch->work_q;
+	int s, st, count, give = 0;
+
+	/* output kept from the last call first */
+	if (ch->fifo_len) {
+		give = (ch->fifo_len < want) ? ch->fifo_len : want;
+		memcpy(out_i, ch->fifo_i, give * sizeof(*out_i));
+		memcpy(out_q, ch->fifo_q, give * sizeof(*out_q));
+		ch->fifo_len -= give;
+		memmove(ch->fifo_i, ch->fifo_i + give, ch->fifo_len * sizeof(*ch->fifo_i));
+		memmove(ch->fifo_q, ch->fifo_q + give, ch->fifo_len * sizeof(*ch->fifo_q));
+	}
+	if (n > ch->max_block)
+		n = ch->max_block;
+	if (n <= 0)
+		return give;
+
+	for (s = 0; s < n; s++) {
+		wi[s] = iq[2 * s];
+		wq[s] = iq[2 * s + 1];
+	}
+	nco_block(ch, wi, wq, n);
+	count = n;
+	for (st = 0; st < ch->hb_stages; st++)
+		count = halfband_decimate_block(&ch->hb[st], wi, wq, count);
+	if (ch->use_resamp) {
+		int r = 0;
+
+		for (s = 0; s < count; s++) {
 			sample_t ri, rq;
 
-			if (!resamp_process(&ch->resamp, i, q, &ri, &rq))
-				continue;
-			i = ri;
-			q = rq;
+			/* decimating: 0 or 1 output per input */
+			if (resamp_process(&ch->resamp, wi[s], wq[s], &ri, &rq)) {
+				ch->work2_i[r] = ri;
+				ch->work2_q[r] = rq;
+				r++;
+			}
 		}
-		out_i[count] = i;
-		out_q[count] = q;
-		count++;
+		wi = ch->work2_i;
+		wq = ch->work2_q;
+		count = r;
 	}
-	*used = s;
-	return count;
+	/* to the caller up to want, the rest kept */
+	for (s = 0; s < count; s++) {
+		if (give < want) {
+			out_i[give] = wi[s];
+			out_q[give] = wq[s];
+			give++;
+		} else if (ch->fifo_len < ch->fifo_size) {
+			ch->fifo_i[ch->fifo_len] = wi[s];
+			ch->fifo_q[ch->fifo_len] = wq[s];
+			ch->fifo_len++;
+		}
+	}
+	return give;
 }
 
 int channelizer_tx_max(const channelizer_t *ch, int n)
 {
-	return n * ch->max_expand;
-}
+	int rs = ch->use_resamp ? (n * resamp_max_out(&ch->resamp)) : n;
 
-/* one sample before stage st -> 2^(hb_stages - st) samples; hb[0] next to the
- * resampler, hb[hb_stages - 1] at the SDR rate */
-static void tx_halfbands(channelizer_t *ch, int st, sample_t i, sample_t q, sample_t **oi, sample_t **oq)
-{
-	sample_t ti[2], tq[2];
-
-	if (st == ch->hb_stages) {
-		*(*oi)++ = i;
-		*(*oq)++ = q;
-		return;
-	}
-	halfband_interpolate(&ch->hb[st], i, q, ti, tq);
-	tx_halfbands(ch, st + 1, ti[0], tq[0], oi, oq);
-	tx_halfbands(ch, st + 1, ti[1], tq[1], oi, oq);
+	return rs << ch->hb_stages;
 }
 
 int channelizer_tx_process(channelizer_t *ch, const sample_t *in_i, const sample_t *in_q, int n, float *iq)
 {
-	int s, p, k, rs, total = 0;
+	sample_t *ai = ch->work_i, *aq = ch->work_q, *bi = ch->work2_i, *bq = ch->work2_q, *t;
+	int s, st, count;
 
-	for (s = 0; s < n; s++) {
-		sample_t *oi = ch->tmp_i, *oq = ch->tmp_q;
-		int count;
-
-		if (ch->use_resamp)
-			rs = resamp_process(&ch->resamp, in_i[s], in_q[s], ch->rs_i, ch->rs_q);
-		else {
-			ch->rs_i[0] = in_i[s];
-			ch->rs_q[0] = in_q[s];
-			rs = 1;
-		}
-		for (p = 0; p < rs; p++)
-			tx_halfbands(ch, 0, ch->rs_i[p], ch->rs_q[p], &oi, &oq);
-		count = oi - ch->tmp_i;
-		/* mix up and add */
-		for (k = 0; k < count; k++) {
-			double i = ch->tmp_i[k], q = ch->tmp_q[k];
-
-			iq[0] += i * ch->nco_i - q * ch->nco_q;
-			iq[1] += i * ch->nco_q + q * ch->nco_i;
-			iq += 2;
-			nco_step(ch);
-		}
-		total += count;
+	if (n > ch->max_block)
+		n = ch->max_block;
+	if (ch->use_resamp) {
+		count = 0;
+		for (s = 0; s < n; s++)
+			count += resamp_process(&ch->resamp, in_i[s], in_q[s], ai + count, aq + count);
+	} else {
+		memcpy(ai, in_i, n * sizeof(*ai));
+		memcpy(aq, in_q, n * sizeof(*aq));
+		count = n;
 	}
-	return total;
+	/* halfbands from the DSP side: hb[0] next to the resampler */
+	for (st = 0; st < ch->hb_stages; st++) {
+		halfband_interpolate_block(&ch->hb[st], ai, aq, count, bi, bq);
+		count *= 2;
+		t = ai; ai = bi; bi = t;
+		t = aq; aq = bq; bq = t;
+	}
+	nco_block(ch, ai, aq, count);
+	for (s = 0; s < count; s++) {
+		iq[2 * s] += ai[s];
+		iq[2 * s + 1] += aq[s];
+	}
+	return count;
 }

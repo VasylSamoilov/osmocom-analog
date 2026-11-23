@@ -191,10 +191,13 @@ static double sdr_tx_amplitude(sdr_t *sdr, int c, int channels)
 	return (c == 0) ? 1.0 / (1.0 + r) : r / (1.0 + r);
 }
 
-/* most samples at rate 'to' from n samples at rate 'from' (+ resampler and halfband rounding) */
+/* Most samples at the SDR rate 'to' for n samples at the DSP rate 'from'.
+ * A channelizer gives at most n * ceil(P/Q) * 2^k (channelizer_tx_max(), RX
+ * needs no more), with ceil(P/Q) <= P/Q + 1 and 2^k <= to / from: at most
+ * 2 n to / from. */
 static int rate_max(int n, int from, int to)
 {
-	return (int)((double)n * to / from) + 64;
+	return (int)ceil(2.0 * n * to / from) + 64;
 }
 
 static void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index)
@@ -348,7 +351,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 	if (tx_frequency && !channels) {
 		/* channels = 0: the caller's IQ is the whole band around the centre */
 		tx_center_frequency = tx_frequency[0];
-		rc = channelizer_tx_init(&sdr->band_tx, sdr->tx_rate, samplerate, 0.0, 2.0 * CHANNELIZER_PASS * samplerate);
+		rc = channelizer_tx_init(&sdr->band_tx, sdr->tx_rate, samplerate, 0.0, 2.0 * CHANNELIZER_PASS * samplerate, sdr->buffer_size);
 		if (rc < 0) {
 			LOGP(DSDR, LOGL_ERROR, "TX: %s\n", channelizer_error());
 			goto error;
@@ -511,7 +514,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, 0.0, sdr_tx_amplitude(sdr, c, channels));
 			if (rc < 0)
 				goto error;
-			rc = channelizer_tx_init(&sdr->chan[c].tx_ch, sdr->tx_rate, samplerate, tx_offset, bandwidth);
+			rc = channelizer_tx_init(&sdr->chan[c].tx_ch, sdr->tx_rate, samplerate, tx_offset, bandwidth, sdr->buffer_size);
 			if (rc < 0) {
 				LOGP(DSDR, LOGL_ERROR, "TX %s %.6f MHz: %s\n", (c < channels) ? "channel" : "paging channel", sdr->chan[c].tx_frequency / 1e6, channelizer_error());
 				goto error;
@@ -606,7 +609,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, 0.0, bandwidth); /* bandwidth are deviation and both sidebands */
 			if (rc < 0)
 				goto error;
-			rc = channelizer_rx_init(&sdr->chan[c].rx_ch, sdr->rx_rate, samplerate, rx_offset, bandwidth);
+			rc = channelizer_rx_init(&sdr->chan[c].rx_ch, sdr->rx_rate, samplerate, rx_offset, bandwidth, sdr->rx_max_in);
 			if (rc < 0) {
 				LOGP(DSDR, LOGL_ERROR, "RX channel %.6f MHz: %s\n", sdr->chan[c].rx_frequency / 1e6, channelizer_error());
 				goto error;
@@ -633,7 +636,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 
 	if (rx_frequency && !channels) {
 		/* channels = 0: the whole usable band around the centre to the caller */
-		rc = channelizer_rx_init(&sdr->band_rx, sdr->rx_rate, samplerate, 0.0, 2.0 * CHANNELIZER_PASS * samplerate);
+		rc = channelizer_rx_init(&sdr->band_rx, sdr->rx_rate, samplerate, 0.0, 2.0 * CHANNELIZER_PASS * samplerate, sdr->rx_max_in);
 		if (rc < 0) {
 			LOGP(DSDR, LOGL_ERROR, "RX: %s\n", channelizer_error());
 			goto error;
@@ -1429,7 +1432,7 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 	/* all channels, each modulated at 0 Hz at the DSP rate and synthesized
 	 * to its frequency at the SDR rate, added up in tx_sum */
 	buff = sdr->tx_sum;
-	memset(buff, 0, sizeof(*buff) * sdr->tx_max_out * 2);
+	memset(buff, 0, sizeof(*buff) * 2 * channelizer_tx_max(channels ? &sdr->chan[0].tx_ch : &sdr->band_tx, num));
 	if (channels) {
 		int n, total = -1;
 
@@ -1531,10 +1534,16 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 		printf("Writing %d samples to write buffer.\n", sent);
 #endif
 		in = sdr->thread_write.in;
-		for (s = 0, ss = 0; s < sent; s++) {
-			sdr->thread_write.buffer[in++] = buff[ss++];
-			sdr->thread_write.buffer[in++] = buff[ss++];
-			in %= sdr->thread_write.buffer_size;
+		{
+			int first = (sdr->thread_write.buffer_size - in) / 2;	/* IQ pairs up to the end of the ring */
+
+			if (first > sent)
+				first = sent;
+			/* the ring's volatile only orders the index updates (with
+			 * __sync_synchronize); the samples are plain copies */
+			memcpy((float *)sdr->thread_write.buffer + in, buff, first * 2 * sizeof(*buff));
+			memcpy((float *)sdr->thread_write.buffer, buff + first * 2, (sent - first) * 2 * sizeof(*buff));
+			in = (in + sent * 2) % sdr->thread_write.buffer_size;
 		}
 		__sync_synchronize();
 		sdr->thread_write.in = in;
@@ -1548,7 +1557,7 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 {
 	sdr_t *sdr = (sdr_t *)inst;
 	float *lin = sdr->rx_lin;
-	int count = 0, avail, take, used = 0, out;
+	int count = 0, avail, need, take, used = 0, out;
 	int c, s;
 
 	/* No RX in tx_only mode (e.g. rpitx). The sender loop of libmobile reads
@@ -1561,28 +1570,34 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		abort();
 	}
 
-	/* SDR rate IQ from the ring, as much as num DSP samples can need */
+	/* SDR rate IQ from the ring: exactly what num DSP samples need (the
+	 * same for every channel: same rates, same stages), or what is there */
 	__sync_synchronize();
 	avail = ((sdr->thread_read.in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size) / 2;
-	take = (avail < sdr->rx_max_in) ? avail : sdr->rx_max_in;
+	need = channelizer_rx_need(channels ? &sdr->chan[0].rx_ch : &sdr->band_rx, num);
+	if (need > sdr->rx_max_in)
+		need = sdr->rx_max_in;
+	take = (avail < need) ? avail : need;
 	out = sdr->thread_read.out;
-	for (s = 0; s < take; s++) {
-		lin[2 * s] = sdr->thread_read.buffer[out];
-		lin[2 * s + 1] = sdr->thread_read.buffer[out + 1];
-		out = (out + 2) % sdr->thread_read.buffer_size;
+	{
+		int first = (sdr->thread_read.buffer_size - out) / 2;	/* IQ pairs up to the end of the ring */
+
+		if (first > take)
+			first = take;
+		memcpy(lin, (const float *)sdr->thread_read.buffer + out, first * 2 * sizeof(*lin));
+		memcpy(lin + first * 2, (const float *)sdr->thread_read.buffer, (take - first) * 2 * sizeof(*lin));
 	}
+	used = take;
 
 	if (channels) {
-		/* channel 0 takes the input needed for num samples, the others the same */
 		for (c = 0; c < channels; c++) {
 			sdr_chan_t *ch = &sdr->chan[c];
-			int n, u;
+			int n;
 
-			n = channelizer_rx_process(&ch->rx_ch, lin, c ? used : take, num, sdr->ch_i, sdr->ch_q, &u);
-			if (c == 0) {
-				used = u;
+			n = channelizer_rx_process(&ch->rx_ch, lin, take, num, sdr->ch_i, sdr->ch_q);
+			if (c == 0)
 				count = n;
-			} else if (n != count)
+			else if (n != count)
 				LOGP(DSDR, LOGL_ERROR, "RX channelizers out of step (%d / %d samples), please fix!\n", n, count);
 			for (s = 0; s < n; s++) {
 				sdr->modbuff[2 * s] = sdr->ch_i[s];
@@ -1630,7 +1645,7 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		/* channels = 0: the whole band, interleaved float to the caller */
 		float *o = (float *)samples;
 
-		count = channelizer_rx_process(&sdr->band_rx, lin, take, num, sdr->ch_i, sdr->ch_q, &used);
+		count = channelizer_rx_process(&sdr->band_rx, lin, take, num, sdr->ch_i, sdr->ch_q);
 		for (s = 0; s < count; s++) {
 			o[2 * s] = sdr->ch_i[s];
 			o[2 * s + 1] = sdr->ch_q[s];
