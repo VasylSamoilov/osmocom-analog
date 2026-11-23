@@ -971,6 +971,7 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	/* OSMO-CC crossover */
 	if (use_osmocc_cross) {
 		use_osmocc_sock = 1;
+		call_cross = 1;
 		cc_argc = 0;
 		cc_argv[cc_argc++] = options_strdup("local 127.0.0.1:4200");
 		cc_argv[cc_argc++] = options_strdup("remote 127.0.0.1:4200");

@@ -31,6 +31,7 @@ void call_up_alerting(int callref);
 /* Tones and announcements played by us: this many cycles, at most call_tone_timeout seconds (--tone-repeats,
  * --tone-timeout); tones sent by the network itself are waited for up to call_tone_timeout. */
 extern int mobile_tones;
+extern int call_cross;	/* calls between our own phones (-x) */
 /* optional, from the radio system: when its phones can hear tones from the network (for -t list) */
 const char *call_mobile_tone_note(void) __attribute__((weak));
 extern int call_tone_repeats;

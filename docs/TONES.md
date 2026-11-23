@@ -44,6 +44,20 @@ tone and pause is measured from the tone set), at most `--tone-timeout`
 seconds (default 30), then the call clears. Tones sent by the network itself
 have no known length and are waited for up to `--tone-timeout`.
 
-In phone-to-phone mode (`-x`) the other leg plays the tone towards the
-calling phone (`-t`), e.g. the Danish "out of order" announcement when the
-called phone does not answer.
+## Codes before tones
+
+Where the radio protocol has a code the phone understands, the code is sent
+and no tone is played. AMPS/TACS on the control channel: Intercept (invalid
+or unassigned number, out of order) or Reorder (other causes), TIA/EIA-553-A
+3.6.3.3; the phone makes its own tone (tested: alternating intercept tone
+until END). On the voice channel AMPS has only the Release order without a
+cause, and NMT has no failure code at all (L(15) only), so there the tone is
+played.
+
+In phone-to-phone mode (`-x`) a call that fails at once (invalid number,
+unknown or busy subscriber) is refused with its cause, without the early
+answer for tones; the calling phone's system then sends its code or plays the
+tone itself. Once the other phone is paged, the other leg answers early and
+plays the ringback and any later tone (e.g. the Danish "out of order"
+announcement when the called phone does not answer); the calling leg does
+not repeat it.

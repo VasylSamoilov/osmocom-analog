@@ -50,6 +50,7 @@
 extern echo_suppressor_config_t echo_suppressor_config;
 
 int mobile_tones = 1;
+int call_cross = 0;
 int call_tone_repeats = 3;
 double call_tone_timeout = 30.0;
 
@@ -155,6 +156,7 @@ typedef struct process {
 	/* tones towards the mobile (--mobile-tones), the mirror of the tones towards the network */
 	int mo;			/* the call was made by the mobile */
 	int net_answered;	/* the network answered it */
+	int net_inband;		/* the network sent in-band audio (progress) */
 	int net_released;	/* the network released it, we only play the tone to the mobile */
 	int mtone;		/* tone played to the mobile, 0 = none */
 	tones_t mtones;
@@ -603,14 +605,16 @@ static void mtone_start(process_t *process, int tone, int timed)
 
 /* The network refuses or ends a call of the mobile without sending tones: if the radio system can keep the call
  * (call_down_disconnect keeps it, while the mobile can hear audio), the mobile hears the tone of the cause, as an
- * exchange sends it, then the call clears. Not after answer with normal clearing. Returns 1 if handled. */
+ * exchange sends it, then the call clears. Not once the network had the audio path. Returns 1 if handled. */
 static int mobile_tone_failure(process_t *process, int cause, int net_released)
 {
 	int callref;
 
 	if (!mobile_tones || !process || !process->mo || cause <= 0 || cause >= 128)
 		return 0;
-	if (process->net_answered && (cause == 16 || cause == 31))
+	/* the network had the audio path (answered, or sent in-band audio): it sent its own tones or
+	 * announcement already, if any (a call between two phones plays it from the other leg) */
+	if (process->net_answered || process->net_inband)
 		return 0;
 	callref = process->callref;
 	process->net_released = net_released;
@@ -623,6 +627,17 @@ static int mobile_tone_failure(process_t *process, int cause, int net_released)
 		return 1;
 	LOGP(DCALL, LOGL_INFO, "Network %s the call (cause %d) without tones: sending the tone to the mobile.\n", net_released ? "released" : "disconnected", cause);
 	mtone_start(process, cause, 1);
+	return 1;
+}
+
+/* -x: a call to a phone that fails before paging is refused with its cause (see the setup) */
+static int refuse_at_once(int callref, int cause)
+{
+	if (!connect_on_setup || !call_cross)
+		return 0;
+	LOGP(DCALL, LOGL_INFO, "Refusing the call from our other phone with cause %d\n", cause);
+	destroy_process(callref);
+	indicate_disconnect_release(callref, cause, OSMO_CC_MSG_REJ_IND);
 	return 1;
 }
 
@@ -1259,9 +1274,12 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 			plan = OSMO_CC_PLAN_TELEPHONY;
 		}
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC call from fixed network '%s' to mobile '%s'\n", caller_id, number);
+		/* between two phones (-x), the caller is one of our phones: a call that fails at once is refused
+		 * with its cause, so the caller's radio system can signal it (AMPS: Intercept / Reorder on the
+		 * control channel) or play its own tone (--mobile-tones); the early answer for tones comes later */
 		if (!connect_on_setup)
 			indicate_proceeding(callref, sdp);
-		else {
+		else if (!call_cross) {
 			LOGP(DCALL, LOGL_DEBUG, "Early connecting after setup\n");
 			indicate_answer(callref, sdp, number);
 		}
@@ -1280,6 +1298,8 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		invalid = mobile_number_check_length(suffix);
 		if (invalid) {
 			LOGP(DCALL, LOGL_NOTICE, "Mobile number '%s' has invalid length: %s\n", suffix, invalid);
+			if (refuse_at_once(callref, OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT))
+				break;
 			disconnect_process(callref, OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT);
 			if (!connect_on_setup) {
 				LOGP(DCALL, LOGL_INFO, "Disconnecting OSMO-CC call towards fixed network (cause=%d)\n", OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT);
@@ -1292,6 +1312,8 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		invalid = mobile_number_check_digits(suffix);
 		if (invalid) {
 			LOGP(DCALL, LOGL_NOTICE, "Mobile number '%s' has invalid digit: %s.\n", suffix, invalid);
+			if (refuse_at_once(callref, OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT))
+				break;
 			disconnect_process(callref, OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT);
 			if (!connect_on_setup) {
 				LOGP(DCALL, LOGL_INFO, "Disconnecting OSMO-CC call towards fixed network (cause=%d)\n", OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT);
@@ -1305,6 +1327,8 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 			invalid = mobile_number_check_valid(suffix);
 			if (invalid) {
 				LOGP(DCALL, LOGL_NOTICE, "Mobile number '%s' is invalid for this network: %s\n", suffix, invalid);
+				if (refuse_at_once(callref, OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT))
+					break;
 				disconnect_process(callref, OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT);
 				if (!connect_on_setup) {
 					LOGP(DCALL, LOGL_INFO, "Disconnecting OSMO-CC call towards fixed network (cause=%d)\n", OSMO_CC_ISDN_CAUSE_INV_NR_FORMAT);
@@ -1318,12 +1342,19 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		rc = call_down_setup(callref, caller_id, caller_type, suffix);
 		if (rc < 0) {
 			LOGP(DCALL, LOGL_NOTICE, "Call rejected, cause %d\n", -rc);
+			if (refuse_at_once(callref, -rc))
+				break;
 			if (!connect_on_setup) {
 				LOGP(DCALL, LOGL_INFO, "Disconnecting OSMO-CC call towards fixed network (cause=%d)\n", -rc);
 				indicate_disconnect_release(callref, -rc, OSMO_CC_MSG_DISC_IND);
 			}
 			disconnect_process(callref, -rc);
 			break;
+		}
+		/* paging: now the early answer, the caller hears the ringback and later tones from us */
+		if (connect_on_setup && call_cross) {
+			LOGP(DCALL, LOGL_DEBUG, "Early connecting after setup\n");
+			indicate_answer(callref, sdp, number);
 		}
 		break;
 	    }
@@ -1351,8 +1382,10 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 	case OSMO_CC_MSG_PROGRESS_REQ:
 		LOGP(DCALL, LOGL_INFO, "Received OSMO-CC progress from fixed network\n");
 		rc = osmo_cc_get_ie_progress(msg, 0, &coding, &location, &progress);
-		if (rc >= 0 && (progress == 1 || progress == 8))
+		if (rc >= 0 && (progress == 1 || progress == 8)) {
+			process->net_inband = 1;
 			mtone_stop(process);
+		}
 		rc = osmo_cc_helper_audio_negotiate_te(msg, &process->session, &process->codec, &process->telephone_event);
 		if (rc < 0)
 			goto nego_failed;
@@ -1367,7 +1400,9 @@ static void ll_msg_cb(osmo_cc_endpoint_t __attribute__((unused)) *ep, uint32_t c
 		new_state_process(callref, PROCESS_ALERTING_RO);
 		/* the network alerts without in-band audio: the mobile hears our ringback tone */
 		rc = osmo_cc_get_ie_progress(msg, 0, &coding, &location, &progress);
-		if (mobile_tones && process->mo && (rc < 0 || (progress != 1 && progress != 8)))
+		if (rc >= 0 && (progress == 1 || progress == 8))
+			process->net_inband = 1;
+		else if (mobile_tones && process->mo)
 			mtone_start(process, TONES_TONE_RINGBACK, 0);
 		break;
 	case OSMO_CC_MSG_SETUP_RSP:
