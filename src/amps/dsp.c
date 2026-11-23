@@ -91,6 +91,34 @@
 #include "../libclipper/clipper.h"
 #include "main.h"
 
+/* Level of the speech at each stage, logged once per second (dB re 1.0 = speech reference deviation) */
+typedef struct lvm { double sq, pk; long n; } lvm_t;
+enum { LR_RADIO, LR_GATED, LR_8KHZ, LR_DEEMPH, LR_VOICE, LR_NETWORK, LR_NUM };
+enum { LT_NETWORK, LT_COMPRESSOR, LT_EMPHASIS, LT_UPSAMPLED, LT_LIMITED, LT_NUM };
+static lvm_t lv_rx[LR_NUM], lv_tx[LT_NUM];
+static long lv_rx_count, lv_tx_count, lv_tx_lim_blocks, lv_tx_blocks;
+
+static void lvm_add(lvm_t *m, const sample_t *s, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		m->sq += s[i] * s[i];
+		if (fabs(s[i]) > m->pk)
+			m->pk = fabs(s[i]);
+	}
+	m->n += n;
+}
+
+static const char *lvm_str(lvm_t *m, char *buf)
+{
+	double rms = (m->n) ? sqrt(m->sq / (double)m->n) : 0.0;
+
+	sprintf(buf, "pk %+.1f rms %+.1f", (m->pk > 0) ? 20.0 * log10(m->pk) : -99.9, (rms > 0) ? 20.0 * log10(rms) : -99.9);
+	memset(m, 0, sizeof(*m));
+	return buf;
+}
+
 #define CHAN amps->sender.kanal
 
 /* uncomment this to debug the encoding process */
@@ -102,6 +130,14 @@
 #define PI			M_PI
 
 #define AMPS_MAX_DEVIATION	8000.0
+/* Voice (TIA/EIA-553-A 3.1.3.1.3): the deviation limiter allows 12 kHz, SAT excluded; it was 6 kHz
+ * (AMPS_MAX_DEVIATION - SAT), and loud speech of the phone (up to 12..13 kHz) came back 5 dB lower.
+ * Echo test on air (Motorola, 3 s delay, the user reading at quiet/normal/loud level), 12 kHz + knee
+ * +8 dB + gain +3 dB: loss quiet -0.5, normal +0.4, loud -1.7 dB of deviation, limiter hits 1 in 38 s
+ * (12 kHz alone: 22); "sound much better". */
+#define AMPS_VOICE_MAX_DEVIATION	12000.0
+#define AMPS_TX_KNEE_DB		8.0	/* compressor knee, pre-emphasized level re reference */
+#define AMPS_TX_GAIN_DB		3.0	/* speech gain before the compressor */
 #define AMPS_MAX_MODULATION	10000.0
 #define AMPS_SPEECH_DEVIATION	2900.0  /* deviation of speech at 1 kHz */
 #define AMPS_FSK_DEVIATION	(8000.0 / AMPS_SPEECH_DEVIATION)	/* no emphasis */
@@ -296,6 +332,12 @@ int dsp_init_sender(amps_t *amps, int tolerant)
 
 	/* attack (3ms) and recovery time (13.5ms) according to amps specs */
 	setup_compandor(&amps->cstate, 8000, 3.0, 13.5);
+	if (!tacs) {
+		/* the gain is ready when a word starts, and loud speech is held below the voice limit, syllable
+		 * by syllable (see AMPS_TX_KNEE_DB) */
+		compandor_set_compressor_lookahead(&amps->cstate, 8000, 4.0);
+		compandor_set_compressor_knee(&amps->cstate, 8000, pow(10.0, AMPS_TX_KNEE_DB / 20.0), 500.0);
+	}
 
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Init DSP for transceiver.\n");
 
@@ -626,6 +668,7 @@ again:
 			jitter_load_samples(&sender->dejitter, (uint8_t *)spl, input_num, sizeof(*spl), jitter_conceal_s16, NULL);
 			int16_to_samples_speech(samples, spl, input_num);
 		}
+		lvm_add(&lv_tx[LT_NETWORK], samples, input_num);
 
 #if 0 /* TX DEBUG: Uncomment to enable TX path level logging */
 		/* TX DEBUG: Track levels at each stage */
@@ -648,7 +691,15 @@ again:
 		if (amps->trans_list && amps->trans_list->callref)
 			call_echo_suppressor_tx(amps->trans_list->callref, samples, input_num);
 
+		if (!tacs) {
+			double g = pow(10.0, AMPS_TX_GAIN_DB / 20.0);
+			int k;
+
+			for (k = 0; k < input_num; k++)
+				samples[k] *= g;
+		}
 		compress_audio(&amps->cstate, samples, input_num);
+		lvm_add(&lv_tx[LT_COMPRESSOR], samples, input_num);
 
 #if 0 /* TX DEBUG: After compressor */
 		{
@@ -677,6 +728,7 @@ again:
 		/* pre-emphasis at 8 kHz (BEFORE upsample) - use correct shelf filter with unity gain at DC */
 		if (amps->pre_emphasis)
 			pre_emphasis_fast(&amps->estate_tx_fast, samples, input_num);
+		lvm_add(&lv_tx[LT_EMPHASIS], samples, input_num);
 
 #if 0 /* TX DEBUG: After pre-emphasis */
 		{
@@ -689,18 +741,24 @@ again:
 #endif
 
 		samplerate_upsample(&sender->srstate, samples, input_num, samples, length);
+		lvm_add(&lv_tx[LT_UPSAMPLED], samples, length);
 
 		/* Deviation limiter (per TIA/EIA-553 §2.1.3.1.3): scale down if peak exceeds limit.
 		 * Applied AFTER upsample to limit actual FM deviation. Leave headroom for SAT. */
 		{
 			double sat_headroom = (!tacs) ? AMPS_SAT_DEVIATION : TACS_SAT_DEVIATION;  /* SAT amplitude in normalized units */
 			double max_speech = sender->max_deviation / sender->speech_deviation - sat_headroom;
+			if (!tacs)	/* TIA/EIA-553-A 3.1.3.1.3: voice limited to 12 kHz, SAT excluded */
+				max_speech = AMPS_VOICE_MAX_DEVIATION / sender->speech_deviation;
 			double peak = 0;
 			int i;
 			for (i = 0; i < length; i++) {
 				double v = fabs(samples[i]);
 				if (v > peak) peak = v;
 			}
+			lv_tx_blocks++;
+			if (peak > max_speech)
+				lv_tx_lim_blocks++;
 			if (peak > max_speech) {
 				double scale = max_speech / peak;
 				for (i = 0; i < length; i++)
@@ -723,6 +781,19 @@ again:
 		}
 #endif
 
+		lvm_add(&lv_tx[LT_LIMITED], samples, length);
+		lv_tx_count += input_num;
+		if (lv_tx_count >= 8000) {
+			char b[LT_NUM][48];
+			int k;
+
+			for (k = 0; k < LT_NUM; k++)
+				lvm_str(&lv_tx[k], b[k]);
+			LOGP_CHAN(DDSP, LOGL_NOTICE, "LEVEL network->mobile dB: from network %s | compressor %s | emphasis %s | upsampled %s | limited %s | limiter: %ld of %ld blocks (limit %+.1f dB)\n",
+				  b[LT_NETWORK], b[LT_COMPRESSOR], b[LT_EMPHASIS], b[LT_UPSAMPLED], b[LT_LIMITED], lv_tx_lim_blocks, lv_tx_blocks,
+				  20.0 * log10((!tacs) ? AMPS_VOICE_MAX_DEVIATION / sender->speech_deviation : sender->max_deviation / sender->speech_deviation - TACS_SAT_DEVIATION));
+			lv_tx_count = lv_tx_lim_blocks = lv_tx_blocks = 0;
+		}
 		/* encode SAT during call */
 		sat_encode(amps, samples, length);
 		break;
@@ -1461,6 +1532,7 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		 * threshold = 0.10 (normalized) = ~290 Hz deviation
 		 * makeup_gain = 1.0 / (1.0 - threshold) = 1.111
 		 */
+		lvm_add(&lv_rx[LR_RADIO], samples, length);
 		{
 			#define FM_NOISE_GATE_THRESHOLD 0.10
 			#define FM_NOISE_GATE_MAKEUP (1.0 / (1.0 - FM_NOISE_GATE_THRESHOLD))
@@ -1480,6 +1552,8 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 				}
 			}
 		}
+
+		lvm_add(&lv_rx[LR_GATED], samples, length);
 
 		/* DEBUG: FM-GATE statistics (disabled - uncomment to enable)
 		 * Logs: FM-GATE: input/output dB levels, percentage of samples gated */
@@ -1761,6 +1835,7 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		 * Notch filter above removes SAT tones (5970/6000/6030 Hz). */
 
 		count = samplerate_downsample(&amps->sender.srstate, samples, length);
+		lvm_add(&lv_rx[LR_8KHZ], samples, count);
 
 		/* DEBUG: Log levels AFTER DOWNSAMPLE (disabled - uncomment to enable)
 		 * Logs: AFTER-DOWNSAMPLE: avg/peak dB levels after resampling to 8kHz */
@@ -1795,6 +1870,7 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 			dc_filter(&amps->estate_rx, samples, count);
 			de_emphasis(&amps->estate_rx, samples, count);
 		}
+		lvm_add(&lv_rx[LR_DEEMPH], samples, count);
 
 		/* Voice band filter (300-3400 Hz) before expander
 		 * Uses separate HPF + LPF since iir_bandpass_init() is a resonant filter
@@ -1803,6 +1879,7 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 		 * not wideband receiver noise that would keep envelope elevated during silence */
 		iir_process(&amps->rx_voice_hpf, samples, count);
 		iir_process(&amps->rx_voice_lpf, samples, count);
+		lvm_add(&lv_rx[LR_VOICE], samples, count);
 
 		/* DEBUG: Log levels BEFORE expander (disabled - uncomment to enable)
 		 * Logs: PRE-EXPANDER: avg/peak dB levels before 2:1 expander */
@@ -1831,6 +1908,18 @@ static void sender_receive_audio(amps_t *amps, sample_t *samples, int length)
 
 		/* removed redundant second downsample - other DSP files (cnetz, nmt, r2000) only have one */
 		expand_audio(&amps->cstate, samples, count);
+		lvm_add(&lv_rx[LR_NETWORK], samples, count);
+		lv_rx_count += count;
+		if (lv_rx_count >= 8000) {
+			char b[LR_NUM][48];
+			int k;
+
+			for (k = 0; k < LR_NUM; k++)
+				lvm_str(&lv_rx[k], b[k]);
+			LOGP_CHAN(DDSP, LOGL_NOTICE, "LEVEL mobile->network dB: radio %s | gated %s | 8 kHz %s | de-emphasis %s | voice band (compressed) %s | to network %s\n",
+				  b[LR_RADIO], b[LR_GATED], b[LR_8KHZ], b[LR_DEEMPH], b[LR_VOICE], b[LR_NETWORK]);
+			lv_rx_count = 0;
+		}
 
 		/* Echo suppressor RX processing (near-end audio after DSP processing) */
 		call_echo_suppressor_rx(trans->callref, samples, count);
