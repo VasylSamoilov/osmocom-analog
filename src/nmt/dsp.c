@@ -227,6 +227,12 @@ int dsp_init_sender(nmt_t *nmt, double deviation_factor)
 	 * 5.25.1). It restores up to what the radio carries (the maximum deviation) and no more: a higher
 	 * ceiling (9.99 = +20 dB) gave gain that only fed acoustic loops between phones, on air. */
 	compandor_set_expander_max(&nmt->cstate, EXPANDER_MAX_ENVELOPE);
+	/* At the onset of a word after a pause the compressor still has the gain of the pause (attack 3 ms),
+	 * the first waves went out several dB too loud and over the limiter. With the speech delayed by 4 ms
+	 * the gain is ready when the word starts. Same recorded speech on air: limiter hits during speech
+	 * 24 -> 0 in 14 s, compressor peaks at onsets 3,5..6 dB lower, rms unchanged. Offline, more than
+	 * ~6 ms got worse again (the gain rises before the end of a word leaves the delay). */
+	compandor_set_compressor_lookahead(&nmt->cstate, 8000, 4.0);
 
 	/* init filters */
 	/* flat Butterworth cascades: iir_highpass_init()/iir_lowpass_init() with several iterations

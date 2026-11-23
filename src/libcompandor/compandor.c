@@ -212,6 +212,27 @@ void compandor_set_expander_max(compandor_t *state, double max_envelope)
 }
 
 /*
+ * Let the compressor look ahead
+ *
+ * The envelope rises by the attack (factor 3 per attack time), so at the onset of a syllable after a pause
+ * the compressor still has the gain of the pause (up to +15 dB) for some ms, and the first waves go out far
+ * too loud. With the speech delayed by the attack time, the envelope has risen before the onset arrives.
+ * The characteristic (2:1, attack, recovery) stays the same, only shifted in time.
+ */
+void compandor_set_compressor_lookahead(compandor_t *state, double samplerate, double lookahead_ms)
+{
+	int n = (int)(samplerate * lookahead_ms / 1000.0 + 0.5);
+
+	if (n < 0)
+		n = 0;
+	if (n > COMPANDOR_LOOKAHEAD_MAX)
+		n = COMPANDOR_LOOKAHEAD_MAX;
+	state->c.lookahead = n;
+	state->c.la_pos = 0;
+	memset(state->c.la_buf, 0, sizeof(state->c.la_buf));
+}
+
+/*
  * Compress audio for transmission (TX path)
  *
  * PURPOSE: Reduce dynamic range to improve SNR during transmission
@@ -296,7 +317,17 @@ void compress_audio(compandor_t *state, sample_t *samples, int num)
 		 * 
 		 * The boost of quiet signals is INTENTIONAL - it improves SNR
 		 * by raising quiet speech above the noise floor during transmission */
-		double output = value / sqrt_tab[(int)(envelope / 0.001)];
+		double output;
+		if (state->c.lookahead) {
+			/* the envelope follows the new sample, the gain is applied to the delayed one */
+			sample_t delayed = state->c.la_buf[state->c.la_pos];
+
+			state->c.la_buf[state->c.la_pos] = value;
+			if (++state->c.la_pos == state->c.lookahead)
+				state->c.la_pos = 0;
+			output = delayed / sqrt_tab[(int)(envelope / 0.001)];
+		} else
+			output = value / sqrt_tab[(int)(envelope / 0.001)];
 		*samples++ = output;
 
 		/* DEBUG: Monitor Compressor Levels */
