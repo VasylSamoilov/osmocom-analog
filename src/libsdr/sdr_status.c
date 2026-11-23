@@ -64,7 +64,7 @@ void sdr_status_reset(void)
 /*
  * TX accumulation — called from sdr_write after FM/AM modulation
  */
-void sdr_status_tx_accumulate(float *buff, int num, uint8_t **power, int channels,
+void sdr_status_tx_accumulate(float *buff, int iq_num, uint8_t **power, int num, int channels,
 			      double amplitude, double *chan_tx_freq)
 {
 	sdr_tx_status_t *tx = &sdr_status.tx;
@@ -90,8 +90,8 @@ void sdr_status_tx_accumulate(float *buff, int num, uint8_t **power, int channel
 	}
 	tx->active_channels = active;
 
-	/* Combined IQ levels */
-	for (s = 0; s < num; s++) {
+	/* Combined IQ levels (SDR rate IQ, iq_num samples) */
+	for (s = 0; s < iq_num; s++) {
 		double vi = fabs(buff[s * 2]);
 		double vq = fabs(buff[s * 2 + 1]);
 		if (vi > tx->peak_i) tx->peak_i = vi;
@@ -100,7 +100,7 @@ void sdr_status_tx_accumulate(float *buff, int num, uint8_t **power, int channel
 		tx->sum_q += vq;
 		tx->sum_sq += vi * vi + vq * vq;
 	}
-	tx->sample_count += num;
+	tx->sample_count += iq_num;
 }
 
 /*

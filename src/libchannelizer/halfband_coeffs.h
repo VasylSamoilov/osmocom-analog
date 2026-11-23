@@ -8,43 +8,18 @@
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * Pre-computed halfband filter coefficients for polyphase decimation.
- * Halfband filters have zeros at every other coefficient (except center),
- * making them efficient for 2x decimation.
- *
- * Reference: SDRangel implementation (GPLv3) was used as reference for
- * understanding the algorithm. These coefficients are independently
- * computed using standard filter design techniques.
+ * Halfband filters: symmetric, every other coefficient zero, centre 0.5;
+ * only the non-zero coefficients of one side are stored, coeffs[0]
+ * outermost. Designed with scipy.signal.remez, passband edge 0.2, stopband
+ * edge 0.3 of the higher rate. Rejection measured with the filters in
+ * halfband.c (docs/CHANNELIZER.md).
  */
 
 #ifndef _HALFBAND_COEFFS_H
 #define _HALFBAND_COEFFS_H
 
-#include <stdint.h>
-
-/*
- * Halfband filter properties:
- * - Symmetric coefficients (linear phase)
- * - Every other coefficient is zero (except center = 0.5)
- * - Only need to store non-zero coefficients
- * - For order N: (N/4) non-zero coefficients on each side
- *
- * Fixed-point scaling: Q1.14 format (multiply result, shift right by 14)
- */
-
-#define HALFBAND_SHIFT_32  12
-#define HALFBAND_SHIFT_48  12
-#define HALFBAND_SHIFT_64  12
-
-/*
- * All coefficients designed with scipy.signal.remez:
- *   passband edge = 200kHz, stopband edge = 300kHz (at 1MHz input rate)
- *   coeffs[0] = outermost tap, coeffs[n-1] = innermost tap (closest to center)
- */
-
-/* 32-tap halfband filter - 8 non-zero coefficients per side
- * Stopband attenuation: -57 dB */
-static const double halfband_coeffs_32_d[8] = {
+/* order 32, 8 non-zero coefficients per side */
+static const double halfband_coeffs_32[8] = {
 	-0.0021073308325794464987,
 	 0.0046487325756916124744,
 	-0.0094253483284870952230,
@@ -55,20 +30,8 @@ static const double halfband_coeffs_32_d[8] = {
 	 0.3156779045528796401321,
 };
 
-static const int32_t halfband_coeffs_32_f[8] = {
-	  -9,
-	  19,
-	 -39,
-	  70,
-	-122,
-	 211,
-	-403,
-	1293,
-};
-
-/* 48-tap halfband filter - 12 non-zero coefficients per side
- * Stopband attenuation: -80 dB */
-static const double halfband_coeffs_48_d[12] = {
+/* order 48, 12 non-zero coefficients per side: 81 dB or more */
+static const double halfband_coeffs_48[12] = {
 	-0.0001977105251997833513,
 	 0.0005764314330547719170,
 	-0.0013517112003954103502,
@@ -83,24 +46,8 @@ static const double halfband_coeffs_48_d[12] = {
 	 0.3164572492646141044226,
 };
 
-static const int32_t halfband_coeffs_48_f[12] = {
-	  -1,
-	   2,
-	  -6,
-	  11,
-	 -20,
-	  35,
-	 -56,
-	  89,
-	-139,
-	 225,
-	-412,
-	1296,
-};
-
-/* 64-tap halfband filter - 16 non-zero coefficients per side
- * Stopband attenuation: -103 dB */
-static const double halfband_coeffs_64_d[16] = {
+/* order 64, 16 non-zero coefficients per side: 104 dB or more */
+static const double halfband_coeffs_64[16] = {
 	-0.0000198070212550087549,
 	 0.0000723396304630611518,
 	-0.0001954236268858796754,
@@ -117,25 +64,6 @@ static const double halfband_coeffs_64_d[16] = {
 	 0.0568675541052285626886,
 	-0.1018932313888856466821,
 	 0.3168836360601109958246,
-};
-
-static const int32_t halfband_coeffs_64_f[16] = {
-	   0,
-	   0,
-	  -1,
-	   2,
-	  -4,
-	   7,
-	 -12,
-	  19,
-	 -30,
-	  46,
-	 -68,
-	 100,
-	-149,
-	 233,
-	-417,
-	1298,
 };
 
 #endif /* _HALFBAND_COEFFS_H */

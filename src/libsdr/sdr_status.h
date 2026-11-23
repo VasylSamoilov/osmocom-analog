@@ -224,8 +224,9 @@ extern sdr_status_t sdr_status;
 void sdr_status_init(int num_channels, double report_interval);
 void sdr_status_reset(void);
 
-/* Called from sdr_write to accumulate TX samples */
-void sdr_status_tx_accumulate(float *buff, int num, uint8_t **power, int channels,
+/* Called from sdr_write to accumulate TX samples: iq_num SDR rate IQ samples,
+ * num DSP rate power flags per channel */
+void sdr_status_tx_accumulate(float *buff, int iq_num, uint8_t **power, int num, int channels,
 			      double amplitude, double *chan_tx_freq);
 
 /* Called from sdr_read to accumulate RX IQ samples */

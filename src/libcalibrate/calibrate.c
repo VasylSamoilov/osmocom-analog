@@ -494,6 +494,18 @@ static int receive_iq(float *buffer, int max_samples)
 	return got;
 }
 
+/* Rate of a GSM channel taken out by the channelizer: the SDR rate halved as
+ * long as it stays at least the GSM rate (halfband stages only, exact). The
+ * FCCH detector works at that rate. */
+static int gsm_channel_rate(int samplerate)
+{
+	int rate = samplerate, gsm = (int)ceil(GSM_RATE);
+
+	while (!(rate % 2) && rate / 2 >= gsm)
+		rate /= 2;
+	return rate;
+}
+
 /* Blocking receive: retries until buffer is full (used by scan phase) */
 static int receive_iq_blocking(float *buffer, int max_samples)
 {
@@ -815,10 +827,12 @@ static int choose_fcch_reference_arfcn(int samplerate,
 
 		flush_rx(iq, chunk_samples, samplerate);
 
-		int rc_ch = channelizer_init(&chz, samplerate, (int)(GSM_RATE + 0.5), 0, 0);
-		if (rc_ch < 0)
+		int out_rate = gsm_channel_rate(samplerate);
+		int rc_ch = channelizer_rx_init(&chz, samplerate, out_rate, 0.0, 2.0 * CHANNELIZER_PASS * out_rate);
+		if (rc_ch < 0) {
+			LOGP(DSDR, LOGL_ERROR, "Channelizer: %s\n", channelizer_error());
 			continue;
-		int out_rate = channelizer_get_output_rate(&chz);
+		}
 		int max_out = chunk_samples + 16;
 		i_out = calloc(max_out, sizeof(sample_t));
 		q_out = calloc(max_out, sizeof(sample_t));
@@ -847,7 +861,8 @@ static int choose_fcch_reference_arfcn(int samplerate,
 			if (got <= 0)
 				break;
 			sampled += got;
-			int out_count = channelizer_process(&chz, iq, got, i_out, q_out);
+			int used;
+			int out_count = channelizer_rx_process(&chz, iq, got, max_out, i_out, q_out, &used);
 			if (out_count <= 0)
 				continue;
 			for (int s = 0; s < out_count; s++) {
@@ -1319,7 +1334,7 @@ static int choose_fcch_reference_arfcn(int samplerate,
 static int setup_channels_for_arfcns(calib_channel_t *channels, int max_channels,
                                      int samplerate, double center_freq,
                                      const arfcn_power_t *arfcns, int num_arfcns,
-                                     int fast_math, int use_polyphase,
+                                     int use_polyphase,
                                      int verbosity)
 {
 	int num = 0;
@@ -1388,18 +1403,19 @@ static int setup_channels_for_arfcns(calib_channel_t *channels, int max_channels
 				     channels[num].mixer_step);
 			}
 		} else {
-			/* Halfband channelizer path (original) */
-			int rc = channelizer_init(&channels[num].channelizer,
-			                          samplerate, target_rate,
-			                          (int)offset, fast_math);
+			/* Channelizer path: NCO shifts the ARFCN exactly to 0 Hz,
+			 * halfband stages take it to the GSM channel rate */
+			out_rate = gsm_channel_rate(samplerate);
+			int rc = channelizer_rx_init(&channels[num].channelizer,
+			                             samplerate, out_rate, offset,
+			                             2.0 * CHANNELIZER_PASS * out_rate);
 			if (rc < 0) {
-				LOGP(DSDR, LOGL_ERROR, "Failed to init channelizer for ARFCN %d\n",
-				     arfcns[i].arfcn);
+				LOGP(DSDR, LOGL_ERROR, "Failed to init channelizer for ARFCN %d: %s\n",
+				     arfcns[i].arfcn, channelizer_error());
 				continue;
 			}
 			channels[num].use_polyphase = 0;
-			out_rate = channelizer_get_output_rate(&channels[num].channelizer);
-			decimation = channelizer_get_decimation(&channels[num].channelizer);
+			decimation = samplerate / out_rate;
 		}
 
 		int rc2 = fcch_detect_init(&channels[num].detector, (double)out_rate);
@@ -1648,7 +1664,6 @@ int calibrate_band(double center_freq, int samplerate,
 	                                         (config->forced_arfcn > 0) ? 1 : max_ch,
 	                                         samplerate, detect_center,
 	                                         detect_list, detect_list_count,
-	                                         config->fast_math,
 	                                         config->use_channelizer,
 	                                         config->verbosity);
 	free(scan_results);
@@ -1785,10 +1800,13 @@ int calibrate_band(double center_freq, int samplerate,
 					channels[c].poly_debug_blocks++;
 				}
 			} else {
-				out_count = channelizer_process(&channels[c].channelizer,
-				                                iq_buffer, samples_received,
-				                                channels[c].i_out,
-				                                channels[c].q_out);
+				int used;
+
+				out_count = channelizer_rx_process(&channels[c].channelizer,
+				                                   iq_buffer, samples_received,
+				                                   channels[c].max_out,
+				                                   channels[c].i_out,
+				                                   channels[c].q_out, &used);
 			}
 			if (out_count <= 0) continue;
 
@@ -1813,18 +1831,10 @@ int calibrate_band(double center_freq, int samplerate,
 				double total_offset;
 				int dbg_idx = -1;
 
-				if (channels[c].use_polyphase) {
-					/* Polyphase path: NCO mixer shifts channel
-					 * exactly to baseband, so detector output
-					 * is the pure clock error directly. */
-					total_offset = offset;
-				} else {
-					/* Halfband channelizer: discrete frequency
-					 * steps may leave a residual offset that the
-					 * channelizer couldn't remove. Add it back. */
-					total_offset = offset
-					    + channels[c].channelizer.center_offset;
-				}
+				/* both paths shift the channel exactly to 0 Hz
+				 * with an NCO: the detector output is the clock
+				 * error directly */
+				total_offset = offset;
 
 				if (debug_sample_count < DEBUG_MAX_DETECTIONS) {
 					dbg_idx = debug_sample_count++;

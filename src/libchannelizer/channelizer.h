@@ -1,4 +1,4 @@
-/* Polyphase channelizer
+/* Channelizer (RX) and synthesizer (TX) of one channel
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -8,74 +8,70 @@
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * Filter chain management for multi-stage decimation channelizer.
- * Reference: SDRangel implementation was studied to understand the algorithm.
+ * One channel at an offset from the SDR's centre frequency, converted
+ * between the SDR rate and the DSP rate:
+ *
+ *   RX: NCO (offset to 0 Hz) at the SDR rate -> k halfband 2x decimators
+ *       -> rational resampler P/Q (if the rate is not reached yet)
+ *       -> channel at 0 Hz at the DSP rate
+ *   TX: channel at 0 Hz at the DSP rate -> rational resampler
+ *       -> k halfband 2x interpolators -> NCO (0 Hz to offset)
+ *       -> added to the SDR rate IQ
+ *
+ * k is as large as possible (halfbands are the cheapest stage): the rate
+ * after them is at least the DSP rate. An integer ratio of the rates is
+ * preferred (small P/Q); any ratio works.
+ *
+ * The channel may be anywhere within the SDR band; its band (bandwidth / 2)
+ * must be within CHANNELIZER_PASS of the DSP rate (passband of the filters).
+ * See docs/CHANNELIZER.md.
  */
 
 #ifndef _CHANNELIZER_H
 #define _CHANNELIZER_H
 
+#include "../libsample/sample.h"
 #include "halfband.h"
+#include "resamp.h"
 
-/* Maximum number of 2x decimation stages (up to 2^8 = 256x decimation) */
-#define CHANNELIZER_MAX_STAGES 8
+#define CHANNELIZER_HB_ORDER	HALFBAND_ORDER_64
+#define CHANNELIZER_MAX_HB	16
+#define CHANNELIZER_PASS	0.4	/* usable part of the DSP rate (each side) */
 
-/* Default filter order */
-#define CHANNELIZER_DEFAULT_ORDER HALFBAND_ORDER_32
-
-/* Channelizer state */
 typedef struct channelizer {
-	int input_rate;             /* Input sample rate (Hz) */
-	int output_rate;            /* Actual output sample rate after decimation */
-	int decimation;             /* Total decimation factor (power of 2) */
-	int center_offset;          /* Resulting center frequency offset (Hz) */
-	int num_stages;             /* Number of halfband stages */
-	int fast_math;              /* 0=double precision, 1=fixed-point */
-	int filter_order;           /* Filter order for all stages */
-	halfband_t stages[CHANNELIZER_MAX_STAGES];
+	int		sdr_rate, dsp_rate;
+	int		hb_stages;		/* k */
+	int		mid_rate;		/* rate after the halfbands (RX) / before them (TX) */
+	int		use_resamp;		/* mid_rate != dsp_rate */
+	double		offset;			/* channel frequency - SDR centre, Hz */
+	halfband_t	hb[CHANNELIZER_MAX_HB];	/* RX: hb[0] at the SDR rate; TX: hb[k-1] at the SDR rate */
+	resamp_t	resamp;
+	double		nco_i, nco_q;		/* NCO phasor */
+	double		rot_i, rot_q;		/* NCO step per SDR sample */
+	int		nco_count;		/* samples since the phasor was renormalised */
+	int		tx;
+	sample_t	*tmp_i, *tmp_q;		/* TX: one DSP sample expanded to SDR samples */
+	sample_t	*rs_i, *rs_q;		/* TX: output of the resampler for one DSP sample */
+	int		max_expand;		/* TX: most SDR samples from one DSP sample */
 } channelizer_t;
 
-/* Initialize channelizer
- * input_rate: Input sample rate in Hz
- * output_rate: Requested output sample rate (actual may be higher)
- * center_freq: Requested channel center frequency offset from DC
- * fast_math: 0 for double precision, 1 for fixed-point
- * Returns 0 on success, <0 on error */
-int channelizer_init(channelizer_t *ch, int input_rate,
-                     int output_rate, int center_freq, int fast_math);
-
-/* Initialize with specific filter order */
-int channelizer_init_order(channelizer_t *ch, int input_rate,
-                           int output_rate, int center_freq,
-                           int fast_math, int filter_order);
-
-/* Free channelizer resources */
+/* Returns 0, or <0 with a reason in channelizer_error(). */
+int channelizer_rx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth);
+int channelizer_tx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth);
+const char *channelizer_error(void);
 void channelizer_exit(channelizer_t *ch);
 
-/* Process block of interleaved IQ samples
- * iq_in: Interleaved float I,Q,I,Q... input array
- * in_count: Number of IQ sample pairs
- * i_out, q_out: Output sample arrays (must be sized for in_count/decimation)
- * Returns: Number of output samples produced */
-int channelizer_process(channelizer_t *ch, float *iq_in, int in_count,
-                        sample_t *i_out, sample_t *q_out);
+/* RX: takes SDR rate samples (interleaved float I/Q) from iq, at most n, until
+ * want DSP rate samples are out (or the input is used up). Returns the number
+ * of output samples; *used gets the number of input samples taken. Channels
+ * with the same rates take the same number of input samples. */
+int channelizer_rx_process(channelizer_t *ch, const float *iq, int n, int want, sample_t *out_i, sample_t *out_q, int *used);
 
-/* Get actual output rate (may be higher than requested) */
-static inline int channelizer_get_output_rate(channelizer_t *ch)
-{
-	return ch->output_rate;
-}
-
-/* Get actual center frequency offset */
-static inline int channelizer_get_center_offset(channelizer_t *ch)
-{
-	return ch->center_offset;
-}
-
-/* Get decimation factor */
-static inline int channelizer_get_decimation(channelizer_t *ch)
-{
-	return ch->decimation;
-}
+/* TX: n DSP rate samples in; the SDR rate samples are ADDED to iq
+ * (interleaved float I/Q). Returns their number (n * sdr_rate / dsp_rate on
+ * average; equal for all channels with the same rates). iq must have room
+ * for channelizer_tx_max(ch, n). */
+int channelizer_tx_process(channelizer_t *ch, const sample_t *in_i, const sample_t *in_q, int n, float *iq);
+int channelizer_tx_max(const channelizer_t *ch, int n);
 
 #endif /* _CHANNELIZER_H */

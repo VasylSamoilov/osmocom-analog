@@ -1,4 +1,4 @@
-/* Halfband decimation/interpolation filter
+/* Halfband 2x decimation / interpolation filter
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -8,86 +8,40 @@
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * Halfband filter for efficient 2x decimation and interpolation.
- * Supports three modes:
- * - CENTER: Extract/insert at center of spectrum (no frequency shift)
- * - LOWER: Extract lower half / insert to lower half (shift by Fs/4)
- * - UPPER: Extract upper half / insert to upper half (shift by Fs/4)
- *
- * Reference: SDRangel implementation was studied to understand the algorithm.
+ * Linear phase halfband FIR, double precision, centred at 0 Hz (the
+ * channelizer shifts each channel to 0 Hz with an NCO first). Passband
+ * 0 .. 0.2, stopband 0.3 .. 0.5 of the higher rate.
+ * Measured (docs/CHANNELIZER.md): order 48 rejects aliases / images by
+ * 81 dB or more, order 64 by 104 dB or more.
  */
 
 #ifndef _HALFBAND_H
 #define _HALFBAND_H
 
-#include <stdint.h>
 #include "../libsample/sample.h"
 
-/* Supported filter orders */
-#define HALFBAND_ORDER_32  32
-#define HALFBAND_ORDER_48  48   /* Default - good balance */
-#define HALFBAND_ORDER_64  64
+#define HALFBAND_ORDER_32	32
+#define HALFBAND_ORDER_48	48
+#define HALFBAND_ORDER_64	64
 
-/* Decimation/interpolation modes */
-typedef enum {
-	HALFBAND_CENTER,      /* Extract/insert at center spectrum (DC) */
-	HALFBAND_LOWER,       /* Extract lower half / insert to lower half */
-	HALFBAND_UPPER,       /* Extract upper half / insert to upper half */
-} halfband_mode_t;
-
-/* Halfband filter state */
 typedef struct halfband {
-	int order;                  /* Filter order (32, 48, or 64) */
-	int num_coeffs;             /* Number of non-zero coefficients */
-	halfband_mode_t mode;       /* Decimation/interpolation mode */
-	int fast_math;              /* 0=double precision, 1=fixed-point */
-	int state;                  /* State machine for modes (0-3) */
-	int ptr;                    /* Ring buffer write position */
-
-	/* Double precision (default) */
-	double *buf_i_d;            /* I component ring buffer */
-	double *buf_q_d;            /* Q component ring buffer */
-	const double *coeffs_d;     /* Filter coefficients */
-
-	/* Fixed-point (fast_math mode) */
-	int32_t *buf_i_f;           /* I component ring buffer */
-	int32_t *buf_q_f;           /* Q component ring buffer */
-	const int32_t *coeffs_f;    /* Filter coefficients */
-	int shift;                  /* Right shift for fixed-point scaling */
+	int		order;		/* filter order (32, 48, 64) */
+	int		num_coeffs;	/* non-zero coefficients on one side */
+	const double	*coeffs;	/* coeffs[0] outermost .. coeffs[n-1] next to the centre */
+	int		phase;		/* decimation: 0 = store only, 1 = store and output */
+	int		ptr;		/* ring position */
+	double		*buf_i, *buf_q;	/* window stored twice, reads never wrap */
 } halfband_t;
 
-/* Initialize halfband filter
- * order: filter order (32, 48, or 64)
- * mode: decimation/interpolation mode (CENTER, LOWER, UPPER)
- * fast_math: 0 for double precision, 1 for fixed-point
- * Returns 0 on success, <0 on error */
-int halfband_init(halfband_t *hb, int order, halfband_mode_t mode, int fast_math);
-
-/* Free halfband filter resources */
+int halfband_init(halfband_t *hb, int order);
 void halfband_exit(halfband_t *hb);
 
-/* Process one IQ sample pair (DECIMATION - 2x downsample)
- * Performs 2x decimation - returns 1 every other sample when output ready
- * i, q: input/output sample (modified in place when output ready)
- * Returns: 1 if output sample ready, 0 if no output yet */
-int halfband_process(halfband_t *hb, sample_t *i, sample_t *q);
+/* 2x decimation: one input sample, returns 1 and the output in *i, *q every
+ * second call, else 0. Group delay order/2 input samples. */
+int halfband_decimate(halfband_t *hb, sample_t *i, sample_t *q);
 
-/* Interpolate one IQ sample pair (INTERPOLATION - 2x upsample)
- * For each input sample, produces 2 output samples.
- * Call twice per input: once with input, once with 0,0.
- * in_i, in_q: input sample (use 0,0 for second call)
- * out_i, out_q: output sample
- * Returns: 1 if need new input sample, 0 if same input produces more output */
-int halfband_interpolate(halfband_t *hb, sample_t in_i, sample_t in_q,
-                         sample_t *out_i, sample_t *out_q);
-
-/* 2x interpolation, polyphase form (CENTER mode, double precision).
- * One input sample gives two output samples at twice the rate: the
- * delayed input (centre tap phase) and the odd-tap FIR phase. Passband
- * flat to 0.2, stopband from 0.3 of the output rate. Delay is
- * order/2 output samples. Use a halfband_t of its own for this. */
-void halfband_interp2(halfband_t *hb, sample_t in_i, sample_t in_q,
-                      sample_t out_i[2], sample_t out_q[2]);
+/* 2x interpolation, polyphase form: one input sample gives two output
+ * samples, in time order. Unity gain in the passband. */
+void halfband_interpolate(halfband_t *hb, sample_t in_i, sample_t in_q, sample_t out_i[2], sample_t out_q[2]);
 
 #endif /* _HALFBAND_H */
-

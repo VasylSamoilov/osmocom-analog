@@ -1,4 +1,4 @@
-/* Polyphase channelizer implementation
+/* Channelizer (RX) and synthesizer (TX) of one channel
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -7,18 +7,6 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- *
- * Multi-stage decimation channelizer using halfband filters.
- * Automatically selects optimal filter chain to reach target sample rate
- * and center frequency.
- *
- * Based on the 'DownChannelizer' C++ implementation from SDRangel (f4exb/sdrangel),
- * which is used extensively for Narrow FM, AM, Broadcast FM, and digital modes.
- *
- * This component is designed to efficiently extract a specific channel from a
- * wideband signal by recursively applying halfband decimation filters and
- * selecting the sub-band (lower, center, or upper) that best contains the
- * target frequency.
  */
 
 #include <stdio.h>
@@ -28,227 +16,215 @@
 #include <math.h>
 #include "channelizer.h"
 
-/*
- * Calculate minimum "fit space" for a channel within a signal band
- * Used to determine which halfband mode gives best channel isolation
- */
-static double channel_min_space(double sig_start, double sig_end,
-                                double chan_start, double chan_end)
+static char error_text[256];
+
+const char *channelizer_error(void)
 {
-	double left_space = chan_start - sig_start;
-	double right_space = sig_end - chan_end;
-	return (left_space < right_space) ? left_space : right_space;
+	return error_text;
 }
 
-/*
- * Recursively create filter chain to extract channel from signal band
- *
- * This recursive process naturally simplifies multi-mode support:
- * - Narrower bandwidths (e.g., NFM, AM) trigger more decimation stages.
- * - Wider bandwidths (e.g., Broadcast FM) stop after fewer stages.
- *
- * Returns the resulting frequency offset
- *
- * sig_start, sig_end: Current signal band edges
- * chan_start, chan_end: Desired channel band edges
- * stages: Array to store created filter stages
- * num_stages: Pointer to stage count
- */
-static double create_filter_chain(channelizer_t *ch,
-                                  double sig_start, double sig_end,
-                                  double chan_start, double chan_end,
-                                  int fast_math, int filter_order)
+/* renormalise the NCO phasor this often (rounding drift of its magnitude) */
+#define NCO_RENORM	1024
+
+static int init_common(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth, int tx)
 {
-	double sig_bw = sig_end - sig_start;
-	double chan_bw = chan_end - chan_start;
-	double rot = sig_bw / 4.0;
-
-	/* Calculate fit space for each mode */
-	double space_lower = channel_min_space(sig_start, sig_start + sig_bw / 2.0,
-	                                       chan_start, chan_end);
-	double space_center = channel_min_space(sig_start + rot, sig_end - rot,
-	                                        chan_start, chan_end);
-	double space_upper = channel_min_space(sig_end - sig_bw / 2.0, sig_end,
-	                                       chan_start, chan_end);
-
-	/* Find best mode */
-	int best_mode;
-	double best_space;
-
-	if (space_lower >= space_center && space_lower >= space_upper) {
-		best_mode = 0;  /* Lower */
-		best_space = space_lower;
-	} else if (space_center >= space_upper) {
-		best_mode = 1;  /* Center */
-		best_space = space_center;
-	} else {
-		best_mode = 2;  /* Upper */
-		best_space = space_upper;
-	}
-
-	/* Check if we should add another stage.
-	 * Continue if:
-	 * 1. We haven't hit max stages
-	 * 2. Signal band is valid
-	 * 3. Channel band is valid
-	 * 4. EITHER the channel fits well (best_space >= chan_bw/8)
-	 *    OR the signal bandwidth is still larger than channel bandwidth
-	 *    (we need more decimation to reach target rate)
-	 */
-	int need_more_decimation = (sig_bw > chan_bw * 1.5);  /* Still need to decimate */
-	int channel_fits = (best_space >= chan_bw / 8.0);
-	
-	fprintf(stderr, "  Stage %d: sig=[%.0f,%.0f] chan=[%.0f,%.0f] best_mode=%d best_space=%.0f need_more=%d fits=%d\n",
-	        ch->num_stages, sig_start, sig_end, chan_start, chan_end, 
-	        best_mode, best_space, need_more_decimation, channel_fits);
-	
-	if (ch->num_stages < CHANNELIZER_MAX_STAGES &&
-	    sig_start < sig_end && chan_start < chan_end &&
-	    (channel_fits || need_more_decimation)) {
-
-		halfband_mode_t mode;
-		double new_sig_start, new_sig_end;
-
-		switch (best_mode) {
-		case 0:  /* Lower half */
-			mode = HALFBAND_LOWER;
-			new_sig_start = sig_start;
-			new_sig_end = sig_start + sig_bw / 2.0;
-			break;
-		case 1:  /* Center */
-			mode = HALFBAND_CENTER;
-			new_sig_start = sig_start + rot;
-			new_sig_end = sig_end - rot;
-			break;
-		case 2:  /* Upper half */
-		default:
-			mode = HALFBAND_UPPER;
-			new_sig_start = sig_end - sig_bw / 2.0;
-			new_sig_end = sig_end;
-			break;
-		}
-
-		/* Initialize this stage */
-		int rc = halfband_init(&ch->stages[ch->num_stages], filter_order,
-		                       mode, fast_math);
-		if (rc < 0)
-			return 0;  /* Error */
-
-		ch->num_stages++;
-
-		/* Recurse with narrower band */
-		return create_filter_chain(ch, new_sig_start, new_sig_end,
-		                           chan_start, chan_end,
-		                           fast_math, filter_order);
-	}
-
-	/* No more stages needed - return final offset */
-	double chan_center = (chan_end + chan_start) / 2.0;
-	double sig_center = (sig_end + sig_start) / 2.0;
-	return chan_center - sig_center;
-}
-
-/* Initialize channelizer with default filter order */
-int channelizer_init(channelizer_t *ch, int input_rate,
-                     int output_rate, int center_freq, int fast_math)
-{
-	return channelizer_init_order(ch, input_rate, output_rate, center_freq,
-	                              fast_math, CHANNELIZER_DEFAULT_ORDER);
-}
-
-/* Initialize channelizer with specific filter order */
-int channelizer_init_order(channelizer_t *ch, int input_rate,
-                           int output_rate, int center_freq,
-                           int fast_math, int filter_order)
-{
-	double half_rate;
-	double chan_bw;
-	double offset;
+	int k = 0, s, rc = -ENOMEM;
 
 	memset(ch, 0, sizeof(*ch));
-
-	if (input_rate <= 0 || output_rate <= 0) {
-		fprintf(stderr, "Channelizer: invalid sample rates\n");
+	error_text[0] = '\0';
+	if (sdr_rate <= 0 || dsp_rate <= 0 || sdr_rate < dsp_rate) {
+		snprintf(error_text, sizeof(error_text), "the SDR rate %d must be at least the DSP rate %d", sdr_rate, dsp_rate);
+		return -EINVAL;
+	}
+	if (bandwidth / 2.0 > CHANNELIZER_PASS * dsp_rate) {
+		snprintf(error_text, sizeof(error_text), "the channel bandwidth %.0f Hz needs a DSP rate of at least %.0f Hz (half of it within %.0f%% of the DSP rate)",
+			 bandwidth, ceil(bandwidth / 2.0 / CHANNELIZER_PASS), CHANNELIZER_PASS * 100.0);
+		return -EINVAL;
+	}
+	if (fabs(offset) + bandwidth / 2.0 > sdr_rate / 2.0) {
+		snprintf(error_text, sizeof(error_text), "the channel at %+.0f Hz (bandwidth %.0f Hz) is outside the SDR band of +-%.0f Hz", offset, bandwidth, sdr_rate / 2.0);
 		return -EINVAL;
 	}
 
-	if (output_rate > input_rate) {
-		fprintf(stderr, "Channelizer: output rate cannot exceed input rate\n");
-		return -EINVAL;
+	ch->sdr_rate = sdr_rate;
+	ch->dsp_rate = dsp_rate;
+	ch->offset = offset;
+	ch->tx = tx;
+
+	/* As many halfbands as keep an integer rate of at least 1.25 times the
+	 * DSP rate: the last one folds its transition band (0.2 .. 0.3 of its
+	 * input rate) onto 0.4 .. 0.5 of its output rate, that is above 0.5 of
+	 * the DSP rate, where the resampler stops. Without a resampler (the rate
+	 * after the halfbands is the DSP rate) the halfbands alone pass 0.4 and
+	 * stop from 0.6 (folded onto 0.4 .. 0.5) of the DSP rate. */
+	while (k < CHANNELIZER_MAX_HB && !(sdr_rate % (2 << k))
+	    && (sdr_rate / (2 << k) == dsp_rate || sdr_rate / (2 << k) * 4 >= dsp_rate * 5))
+		k++;
+	ch->mid_rate = sdr_rate >> k;
+	for (s = 0; s < k; s++) {
+		rc = halfband_init(&ch->hb[s], CHANNELIZER_HB_ORDER);
+		if (rc < 0)
+			goto fail;
+		ch->hb_stages = s + 1;
+	}
+	if (ch->mid_rate != dsp_rate) {
+		rc = tx ? resamp_init(&ch->resamp, dsp_rate, ch->mid_rate) : resamp_init(&ch->resamp, ch->mid_rate, dsp_rate);
+		if (rc < 0)
+			goto fail;
+		ch->use_resamp = 1;
+	}
+	if (tx) {
+		int rs_max = ch->use_resamp ? resamp_max_out(&ch->resamp) : 1;
+
+		ch->max_expand = rs_max << k;
+		ch->tmp_i = calloc(ch->max_expand, sizeof(*ch->tmp_i));
+		ch->tmp_q = calloc(ch->max_expand, sizeof(*ch->tmp_q));
+		ch->rs_i = calloc(rs_max, sizeof(*ch->rs_i));
+		ch->rs_q = calloc(rs_max, sizeof(*ch->rs_q));
+		if (!ch->tmp_i || !ch->tmp_q || !ch->rs_i || !ch->rs_q) {
+			rc = -ENOMEM;
+			goto fail;
+		}
 	}
 
-	ch->input_rate = input_rate;
-	ch->fast_math = fast_math;
-	ch->filter_order = filter_order;
-	ch->num_stages = 0;
-
-	/* Calculate channel bandwidth (same as output rate for baseband) */
-	chan_bw = (double)output_rate;
-
-	/* Create filter chain */
-	half_rate = (double)input_rate / 2.0;
-	
-	fprintf(stderr, "Channelizer init: input=%d output=%d center=%d\n", 
-	        input_rate, output_rate, center_freq);
-	fprintf(stderr, "  Signal band: %.0f to %.0f Hz\n", -half_rate, half_rate);
-	fprintf(stderr, "  Channel band: %.0f to %.0f Hz (bw=%.0f)\n",
-	        (double)center_freq - chan_bw / 2.0,
-	        (double)center_freq + chan_bw / 2.0, chan_bw);
-	
-	offset = create_filter_chain(ch,
-	                             -half_rate, half_rate,
-	                             (double)center_freq - chan_bw / 2.0,
-	                             (double)center_freq + chan_bw / 2.0,
-	                             fast_math, filter_order);
-
-	/* Calculate actual decimation and output rate */
-	ch->decimation = 1 << ch->num_stages;
-	ch->output_rate = input_rate / ch->decimation;
-	ch->center_offset = (int)round(offset);
-
-	fprintf(stderr, "  Created %d stages, decimation=%d, center_offset=%d Hz\n",
-	        ch->num_stages, ch->decimation, ch->center_offset);
-
+	/* RX shifts the channel down to 0 Hz, TX up from 0 Hz */
+	ch->nco_i = 1.0;
+	ch->nco_q = 0.0;
+	ch->rot_i = cos(2.0 * M_PI * offset / sdr_rate);
+	ch->rot_q = (tx ? 1.0 : -1.0) * sin(2.0 * M_PI * offset / sdr_rate);
 	return 0;
+
+fail:
+	snprintf(error_text, sizeof(error_text), "no memory");
+	channelizer_exit(ch);
+	return rc;
 }
 
-/* Free channelizer resources */
+int channelizer_rx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth)
+{
+	return init_common(ch, sdr_rate, dsp_rate, offset, bandwidth, 0);
+}
+
+int channelizer_tx_init(channelizer_t *ch, int sdr_rate, int dsp_rate, double offset, double bandwidth)
+{
+	return init_common(ch, sdr_rate, dsp_rate, offset, bandwidth, 1);
+}
+
 void channelizer_exit(channelizer_t *ch)
 {
-	int i;
+	int s;
 
-	for (i = 0; i < ch->num_stages; i++)
-		halfband_exit(&ch->stages[i]);
-
+	for (s = 0; s < ch->hb_stages; s++)
+		halfband_exit(&ch->hb[s]);
+	if (ch->use_resamp)
+		resamp_exit(&ch->resamp);
+	free(ch->tmp_i);
+	free(ch->tmp_q);
+	free(ch->rs_i);
+	free(ch->rs_q);
 	memset(ch, 0, sizeof(*ch));
 }
 
-/* Process block of IQ samples through filter chain */
-int channelizer_process(channelizer_t *ch, float *iq_in, int in_count,
-                        sample_t *i_out, sample_t *q_out)
+static inline void nco_step(channelizer_t *ch)
 {
-	int i, s;
-	int out_count = 0;
-	sample_t si, sq;
+	double i = ch->nco_i * ch->rot_i - ch->nco_q * ch->rot_q;
+	double q = ch->nco_i * ch->rot_q + ch->nco_q * ch->rot_i;
 
-	/* Process each input sample */
-	for (i = 0; i < in_count; i++) {
-		si = iq_in[i * 2];
-		sq = iq_in[i * 2 + 1];
+	if (++ch->nco_count == NCO_RENORM) {
+		double mag = sqrt(i * i + q * q);
 
-		/* Pass through each stage */
-		int output = 1;
-		for (s = 0; s < ch->num_stages && output; s++) {
-			output = halfband_process(&ch->stages[s], &si, &sq);
-		}
-
-		/* If all stages produced output, store result */
-		if (output) {
-			i_out[out_count] = si;
-			q_out[out_count] = sq;
-			out_count++;
-		}
+		i /= mag;
+		q /= mag;
+		ch->nco_count = 0;
 	}
+	ch->nco_i = i;
+	ch->nco_q = q;
+}
 
-	return out_count;
+int channelizer_rx_process(channelizer_t *ch, const float *iq, int n, int want, sample_t *out_i, sample_t *out_q, int *used)
+{
+	int s, st, count = 0;
+
+	for (s = 0; s < n && count < want; s++) {
+		double x_i = iq[2 * s], x_q = iq[2 * s + 1];
+		sample_t i, q;
+
+		/* mix down */
+		i = x_i * ch->nco_i - x_q * ch->nco_q;
+		q = x_i * ch->nco_q + x_q * ch->nco_i;
+		nco_step(ch);
+
+		for (st = 0; st < ch->hb_stages; st++)
+			if (!halfband_decimate(&ch->hb[st], &i, &q))
+				break;
+		if (st < ch->hb_stages)
+			continue;
+		if (ch->use_resamp) {
+			/* decimating: 0 or 1 output per input */
+			sample_t ri, rq;
+
+			if (!resamp_process(&ch->resamp, i, q, &ri, &rq))
+				continue;
+			i = ri;
+			q = rq;
+		}
+		out_i[count] = i;
+		out_q[count] = q;
+		count++;
+	}
+	*used = s;
+	return count;
+}
+
+int channelizer_tx_max(const channelizer_t *ch, int n)
+{
+	return n * ch->max_expand;
+}
+
+/* one sample before stage st -> 2^(hb_stages - st) samples; hb[0] next to the
+ * resampler, hb[hb_stages - 1] at the SDR rate */
+static void tx_halfbands(channelizer_t *ch, int st, sample_t i, sample_t q, sample_t **oi, sample_t **oq)
+{
+	sample_t ti[2], tq[2];
+
+	if (st == ch->hb_stages) {
+		*(*oi)++ = i;
+		*(*oq)++ = q;
+		return;
+	}
+	halfband_interpolate(&ch->hb[st], i, q, ti, tq);
+	tx_halfbands(ch, st + 1, ti[0], tq[0], oi, oq);
+	tx_halfbands(ch, st + 1, ti[1], tq[1], oi, oq);
+}
+
+int channelizer_tx_process(channelizer_t *ch, const sample_t *in_i, const sample_t *in_q, int n, float *iq)
+{
+	int s, p, k, rs, total = 0;
+
+	for (s = 0; s < n; s++) {
+		sample_t *oi = ch->tmp_i, *oq = ch->tmp_q;
+		int count;
+
+		if (ch->use_resamp)
+			rs = resamp_process(&ch->resamp, in_i[s], in_q[s], ch->rs_i, ch->rs_q);
+		else {
+			ch->rs_i[0] = in_i[s];
+			ch->rs_q[0] = in_q[s];
+			rs = 1;
+		}
+		for (p = 0; p < rs; p++)
+			tx_halfbands(ch, 0, ch->rs_i[p], ch->rs_q[p], &oi, &oq);
+		count = oi - ch->tmp_i;
+		/* mix up and add */
+		for (k = 0; k < count; k++) {
+			double i = ch->tmp_i[k], q = ch->tmp_q[k];
+
+			iq[0] += i * ch->nco_i - q * ch->nco_q;
+			iq[1] += i * ch->nco_q + q * ch->nco_i;
+			iq += 2;
+			nco_step(ch);
+		}
+		total += count;
+	}
+	return total;
 }

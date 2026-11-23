@@ -49,8 +49,6 @@ enum paging_signal;
 #endif
 #include "../liblogging/logging.h"
 #include "../libchannelizer/channelizer.h"
-#include "../libchannelizer/channelizer_tx.h"
-#include "../libpolyphase/polyphase.h"
 
 /* enable to debug buffer handling */
 //#define DEBUG_BUFFER
@@ -87,83 +85,17 @@ typedef struct sdr_thread {
 	int use;
 	volatile int running, exit;	/* flags to control exit of threads */
 	int buffer_size;
-	volatile float *buffer;
-	float *buffer2;
+	volatile float *buffer;		/* ring of SDR rate IQ (interleaved float) */
+	float *buffer2;			/* chunk between the ring and the device */
 	volatile int in, out;		/* in and out pointers (atomic, so no locking required) */
 	int max_fill;			/* measure maximum buffer fill */
 	double max_fill_timer;		/* timer to display/reset maximum fill */
-	iir_filter_t lp[2];		/* filter for upsample/downsample IQ data */
-	int hb_stages;			/* > 0: halfband x2 cascade instead of the IIR */
-	halfband_t hb[8];
 } sdr_thread_t;
 
-/* Integer rate change by 2^k: a cascade of halfband x2 stages (order 48:
- * flat to 0.4 of the DSP rate, images/aliases -80 dB, cheaper than the IIR
- * on RX). Returns k, or 0 for other factors (IIR as before). */
-#define SDR_HALFBAND_ORDER	HALFBAND_ORDER_48
-static int sdr_halfband_stages(int os)
-{
-	int k = 0;
-
-	while ((1 << k) < os && k < 8)
-		k++;
-	return ((1 << k) == os) ? k : 0;
-}
-
-static int sdr_halfband_init(sdr_thread_t *t, int os, const char *dir)
-{
-	int k = sdr_halfband_stages(os), s;
-
-	t->hb_stages = 0;
-	for (s = 0; s < k; s++) {
-		if (halfband_init(&t->hb[s], SDR_HALFBAND_ORDER, HALFBAND_CENTER, 0) < 0)
-			return -1;
-		t->hb_stages = s + 1;
-	}
-	if (k)
-		LOGP(DSDR, LOGL_INFO, "%s: rate x%d with %d halfband stage(s)\n", dir, os, k);
-	return 0;
-}
-
-/* TX: one DSP sample -> 2^stages SDR samples (interleaved float) */
-static void sdr_halfband_interp(halfband_t *hb, int stage, int stages, double i, double q, float **out)
-{
-	sample_t oi[2], oq[2];
-
-	if (stage == stages) {
-		*(*out)++ = i;
-		*(*out)++ = q;
-		return;
-	}
-	halfband_interp2(&hb[stage], i, q, oi, oq);
-	sdr_halfband_interp(hb, stage + 1, stages, oi[0], oq[0], out);
-	sdr_halfband_interp(hb, stage + 1, stages, oi[1], oq[1], out);
-}
-
-/* RX: n SDR samples -> ring buffer at DSP rate. Each decimated sample is
- * written os times, so sdr_read(), which takes every os-th sample of the
- * ring, gets it whatever the phase. Returns the new ring in pointer. */
-static int sdr_halfband_decim(sdr_thread_t *t, const float *buf, int n, int in, int os)
-{
-	int s, st, o;
-
-	for (s = 0; s < n; s++) {
-		sample_t si = buf[2 * s], sq = buf[2 * s + 1];
-
-		for (st = 0; st < t->hb_stages; st++)
-			if (!halfband_process(&t->hb[st], &si, &sq))
-				break;
-		if (st < t->hb_stages)
-			continue;
-		for (o = 0; o < os; o++) {
-			t->buffer[in++] = si;
-			t->buffer[in++] = sq;
-			in %= t->buffer_size;
-		}
-	}
-	return in;
-}
-
+/* Each channel is converted between the SDR rate and the DSP rate by its own
+ * channelizer (RX) and synthesizer (TX), libchannelizer: NCO at the SDR rate,
+ * halfband stages, rational resampler. The modulator and demodulator work at
+ * 0 Hz at the DSP rate. See docs/CHANNELIZER.md. */
 typedef struct sdr_chan {
 	double		tx_frequency;	/* frequency used */
 	double		rx_frequency;	/* frequency used */
@@ -175,60 +107,44 @@ typedef struct sdr_chan {
 	dispmeasparam_t	*dmp_rf_level;
 	dispmeasparam_t	*dmp_freq_offset;
 	dispmeasparam_t	*dmp_deviation;
-	int		use_channelizer;
-	channelizer_t	channelizer;
-	sample_t	*ch_I, *ch_Q;	/* channelizer output buffers (double/sample_t) */
-	float		*ch_iq_float;	/* interleaved float buffer for FM demod */
-	/* TX channelizer (synthesis) */
-	int		use_tx_channelizer;
-	channelizer_tx_t tx_channelizer;
+	int		rx_init, tx_init;
+	channelizer_t	rx_ch;		/* SDR rate -> DSP rate, channel at 0 Hz */
+	channelizer_t	tx_ch;		/* DSP rate -> SDR rate, 0 Hz to the channel */
 } sdr_chan_t;
 
 typedef struct sdr {
 	int		threads;	/* use threads */
-	int		oversample;	/* oversample IQ rate (unified mode) */
-	int		tx_oversample;	/* TX oversample (split mode) - integer part */
-	int		rx_oversample;	/* RX oversample (split mode) - integer part */
-	/* Polyphase resampler for non-integer rate conversion */
-	int		tx_use_polyphase;	/* 1 if TX needs polyphase resampling */
-	int		rx_use_polyphase;	/* 1 if RX needs polyphase resampling */
-	polyphase_t	tx_polyphase;		/* TX polyphase resampler state */
-	polyphase_t	rx_polyphase;		/* RX polyphase resampler state */
-	sample_t	*tx_poly_i;		/* TX polyphase I buffer */
-	sample_t	*tx_poly_q;		/* TX polyphase Q buffer */
-	sample_t	*rx_poly_i;		/* RX polyphase I buffer */
-	sample_t	*rx_poly_q;		/* RX polyphase Q buffer */
-	float		*rx_poly_sdr_buff;	/* RX polyphase SDR interleaved buffer (non-threaded) */
-	int		rx_poly_max_in;		/* Max input samples for RX polyphase */
+	int		tx_rate;	/* SDR sample rate of TX */
+	int		rx_rate;	/* SDR sample rate of RX */
 	sdr_thread_t	thread_read,
 			thread_write;
-	sdr_chan_t	*chan;		/* settings for all channels */
+	sdr_chan_t	*chan;		/* settings for all channels (+ paging channel) */
 	int		paging_channel;	/* if set, points to paging channel */
-	sdr_chan_t	paging_chan;	/* settings for extra paging channel */
 	int		channels;	/* number of frequencies */
 	double		amplitude;	/* amplitude of each carrier */
-	int		samplerate;	/* sample rate of audio data */
-	/* TX channelizer buffers */
-	sample_t	*tx_chan_I;	/* de-interleaved I buffer for TX channelizer */
-	sample_t	*tx_chan_Q;	/* de-interleaved Q buffer for TX channelizer */
+	int		samplerate;	/* sample rate of audio data (DSP rate) */
 	int		buffer_size;	/* buffer in audio samples */
 	double		interval;	/* how often to process the loop */
-	wave_rec_t	wave_rx_rec;
+	wave_rec_t	wave_rx_rec;	/* IQ recording at the SDR rate */
 	wave_rec_t	wave_tx_rec;
 	wave_play_t	wave_rx_play;
 	wave_play_t	wave_tx_play;
-	float		*modbuff;	/* buffer for transmodulation */
+	float		*modbuff;	/* DSP rate IQ of one channel (interleaved float) */
 	sample_t	*modbuff_I;
 	sample_t	*modbuff_Q;
 	sample_t	*modbuff_carrier;
-	sample_t	*wavespl0;	/* sample buffer for wave generation */
+	sample_t	*ch_i, *ch_q;	/* DSP rate IQ of one channel (de-interleaved) */
+	uint8_t		*zero_power;	/* all 0: a channel's carrier off (paging channel switched) */
+	sample_t	*zero_spl;
+	int		rx_max_in;	/* most SDR samples for buffer_size DSP samples */
+	float		*rx_lin;	/* SDR rate IQ taken from the ring for one sdr_read() */
+	int		tx_max_out;	/* most SDR samples from buffer_size DSP samples */
+	float		*tx_sum;	/* SDR rate IQ of all channels for one sdr_write() */
+	sample_t	*wavespl0;	/* sample buffer for wave recording / playback (SDR rate) */
 	sample_t	*wavespl1;
-	sample_t	*chan_in_buff;  /* buffer for channelizer input (decimated block read) */
-	/* Radio mode channelizer (for channels=0 with use_channelizer) */
-	int		radio_channelizer_init;	/* 1 if radio channelizer is initialized */
-	channelizer_t	radio_channelizer;	/* channelizer for radio mode */
-	sample_t	*radio_ch_I;		/* radio channelizer I output buffer */
-	sample_t	*radio_ch_Q;		/* radio channelizer Q output buffer */
+	/* channels = 0 (osmoradio, tv, dcf77): the whole usable band, centred */
+	int		band_rx_init, band_tx_init;
+	channelizer_t	band_rx, band_tx;
 } sdr_t;
 
 static void show_spectrum(const char *direction, double halfbandwidth, double center, double *frequency, double paging_frequency, int num)
@@ -275,10 +191,15 @@ static double sdr_tx_amplitude(sdr_t *sdr, int c, int channels)
 	return (c == 0) ? 1.0 / (1.0 + r) : r / (1.0 + r);
 }
 
-static void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math)
+/* most samples at rate 'to' from n samples at rate 'from' (+ resampler and halfband rounding) */
+static int rate_max(int n, int from, int to)
+{
+	return (int)((double)n * to / from) + 64;
+}
+
+static void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index)
 {
 	sdr_t *sdr;
-	int threads = 1, oversample = 1; /* always use threads */
 	double bandwidth;
 	double tx_center_frequency = 0.0, rx_center_frequency = 0.0;
 	int rc;
@@ -289,49 +210,9 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 
 	LOGP(DSDR, LOGL_DEBUG, "Open SDR device\n");
 
-	/* Auto-calculate optimal rate if requested */
-	if (samplerate == 0 && use_channelizer) {
-		double required_bw = 2.0 * (max_deviation + max_modulation);
-		samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, required_bw);
-		LOGP(DSDR, LOGL_INFO, "Auto-calculated optimal channel rate: %d Hz (from Master %d Hz)\n", 
-		     samplerate, sdr_config->samplerate);
-	}
-
-	if (sdr_config->samplerate != samplerate) {
-		if (samplerate > sdr_config->samplerate) {
-			LOGP(DSDR, LOGL_ERROR, "SDR sample rate must be greater than audio sample rate! (SDR %d < Audio %d)\n", sdr_config->samplerate, samplerate);
-			return NULL;
-		}
-		if (sdr_config->samplerate % samplerate) {
-			/* Non-integer ratio: only split mode has the polyphase
-			 * resampler (below). With one device the samples would run
-			 * at the wrong time and frequency scale, so refuse, as
-			 * upstream does. */
-			if (!sdr_config->split_mode) {
-				LOGP(DSDR, LOGL_ERROR, "SDR sample rate %d is not a multiple of the DSP sample rate %d. Use an SDR rate that is (e.g. %d) or a DSP rate that divides it (-s).\n",
-				     sdr_config->samplerate, samplerate,
-				     (sdr_config->samplerate / samplerate + 1) * samplerate);
-				return NULL;
-			}
-			LOGP(DSDR, LOGL_NOTICE, "SDR sample rate %d is not a multiple of audio sample rate %d - will use polyphase resampling\n",
-			     sdr_config->samplerate, samplerate);
-			oversample = 1;  /* Polyphase handles the resampling */
-		} else {
-			oversample = sdr_config->samplerate / samplerate;
-		}
-		threads = 1;
-	}
-
 	bandwidth = 2.0 * (max_deviation + max_modulation);
 	if (bandwidth)
 		LOGP(DSDR, LOGL_INFO, "Require bandwidth of each channel is 2 * (%.1f deviation + %.1f modulation) = %.1f KHz\n", max_deviation / 1e3, max_modulation / 1e3, bandwidth / 1e3);
-
-	if (use_channelizer && oversample > 1) {
-		LOGP(DSDR, LOGL_INFO, "Using Channelizer with %dx decimation.\n", oversample);
-	} else if (use_channelizer) {
-		LOGP(DSDR, LOGL_NOTICE, "Channelizer requested but oversample is 1. Disabling channelizer.\n");
-		use_channelizer = 0;
-	}
 
 	sdr = calloc(1, sizeof(*sdr));
 	if (!sdr) {
@@ -343,202 +224,55 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 	sdr->samplerate = samplerate;
 	sdr->buffer_size = buffer_size;
 	sdr->interval = interval;
-	sdr->threads = threads; /* always required, because write may block */
-	sdr->oversample = oversample;
-	
-	/* In split mode, calculate separate oversample factors for TX and RX */
-	if (sdr_config->split_mode) {
-		if (sdr_config->tx_samplerate && samplerate) {
-			if (sdr_config->tx_samplerate % samplerate) {
-				/* Non-integer ratio - use polyphase resampler */
-				double ratio = (double)sdr_config->tx_samplerate / (double)samplerate;
-				LOGP(DSDR, LOGL_NOTICE, "TX sample rate %d is not an integer multiple of DSP rate %d (ratio=%.6f)\n",
-				     sdr_config->tx_samplerate, samplerate, ratio);
-				LOGP(DSDR, LOGL_NOTICE, "Enabling polyphase resampler for TX path (DSP %d Hz -> SDR %d Hz)\n",
-				     samplerate, sdr_config->tx_samplerate);
-				sdr->tx_use_polyphase = 1;
-				sdr->tx_oversample = 1; /* Not used when polyphase is active */
-				
-				/* Initialize TX polyphase resampler (upsample: DSP -> SDR).
-				 * The rational polyphase resampler finds exact P/Q ratio via GCD.
-				 * cutoff and phase_steps params are ignored (auto-computed). */
-				int rc = polyphase_init_taps(&sdr->tx_polyphase,
-				                             (double)samplerate,
-				                             (double)sdr_config->tx_samplerate,
-				                             0, 0, 16);
-				if (rc < 0) {
-					LOGP(DSDR, LOGL_ERROR, "Failed to initialize TX polyphase resampler!\n");
-					goto error;
-				}
-				LOGP(DSDR, LOGL_INFO, "TX rational polyphase: %d Hz -> %d Hz (P=%d, Q=%d, branch_len=%d, total_taps=%d)\n",
-				     samplerate, sdr_config->tx_samplerate,
-				     sdr->tx_polyphase.up, sdr->tx_polyphase.down,
-				     sdr->tx_polyphase.branch_len, sdr->tx_polyphase.total_taps);
-				
-				/* Allocate polyphase I/Q buffers - need space for both input and output
-				 * Input: buffer_size samples, Output: max_out samples
-				 * We use the same buffer with offset for output */
-				int max_out = polyphase_output_num(&sdr->tx_polyphase, buffer_size) + 16;
-				int total_size = buffer_size + max_out;  /* Input + output in same buffer */
-				sdr->tx_poly_i = calloc(total_size, sizeof(sample_t));
-				sdr->tx_poly_q = calloc(total_size, sizeof(sample_t));
-				if (!sdr->tx_poly_i || !sdr->tx_poly_q) {
-					LOGP(DSDR, LOGL_ERROR, "NO MEM for TX polyphase buffers!\n");
-					goto error;
-				}
-				LOGP(DSDR, LOGL_INFO, "TX polyphase buffers: input=%d output=%d total=%d samples each\n",
-				     buffer_size, max_out, total_size);
-			} else {
-				sdr->tx_oversample = sdr_config->tx_samplerate / samplerate;
-				LOGP(DSDR, LOGL_INFO, "TX using integer resampling: %d Hz -> %d Hz (oversample=%dx)\n",
-				     samplerate, sdr_config->tx_samplerate, sdr->tx_oversample);
-			}
-		} else {
-			sdr->tx_oversample = oversample;
-		}
-		if (sdr_config->rx_samplerate && samplerate) {
-			if (sdr_config->rx_samplerate % samplerate) {
-				/* Non-integer ratio - use polyphase resampler */
-				double ratio = (double)sdr_config->rx_samplerate / (double)samplerate;
-				LOGP(DSDR, LOGL_NOTICE, "RX sample rate %d is not an integer multiple of DSP rate %d (ratio=%.6f)\n",
-				     sdr_config->rx_samplerate, samplerate, ratio);
-				LOGP(DSDR, LOGL_NOTICE, "Enabling polyphase resampler for RX path (SDR %d Hz -> DSP %d Hz)\n",
-				     sdr_config->rx_samplerate, samplerate);
-				sdr->rx_use_polyphase = 1;
-				sdr->rx_oversample = 1; /* Not used when polyphase is active */
-				
-				/* Initialize RX polyphase resampler (downsample: SDR -> DSP).
-				 * The rational polyphase resampler finds exact P/Q ratio via GCD. */
-				int rc = polyphase_init_taps(&sdr->rx_polyphase,
-				                             (double)sdr_config->rx_samplerate,
-				                             (double)samplerate,
-				                             0, 0, 16);
-				if (rc < 0) {
-					LOGP(DSDR, LOGL_ERROR, "Failed to initialize RX polyphase resampler!\n");
-					goto error;
-				}
-				LOGP(DSDR, LOGL_INFO, "RX rational polyphase: %d Hz -> %d Hz (P=%d, Q=%d, branch_len=%d, total_taps=%d)\n",
-				     sdr_config->rx_samplerate, samplerate,
-				     sdr->rx_polyphase.up, sdr->rx_polyphase.down,
-				     sdr->rx_polyphase.branch_len, sdr->rx_polyphase.total_taps);
-				
-				/* Allocate polyphase I/Q buffers - need space for both input and output
-				 * Input: max_in samples (SDR rate), Output: buffer_size samples (DSP rate) */
-				int max_in = polyphase_input_num(&sdr->rx_polyphase, buffer_size) + 16;
-				int total_size = max_in + buffer_size;  /* Input + output in same buffer */
-				sdr->rx_poly_i = calloc(total_size, sizeof(sample_t));
-				sdr->rx_poly_q = calloc(total_size, sizeof(sample_t));
-				sdr->rx_poly_sdr_buff = calloc(max_in * 2, sizeof(float));  /* Interleaved I/Q */
-				sdr->rx_poly_max_in = max_in;
-				if (!sdr->rx_poly_i || !sdr->rx_poly_q || !sdr->rx_poly_sdr_buff) {
-					LOGP(DSDR, LOGL_ERROR, "NO MEM for RX polyphase buffers!\n");
-					goto error;
-				}
-				LOGP(DSDR, LOGL_INFO, "RX polyphase buffers: input=%d output=%d total=%d samples each\n",
-				     max_in, buffer_size, total_size);
-			} else {
-				sdr->rx_oversample = sdr_config->rx_samplerate / samplerate;
-				LOGP(DSDR, LOGL_INFO, "RX using integer resampling: %d Hz -> %d Hz (oversample=%dx)\n",
-				     sdr_config->rx_samplerate, samplerate, sdr->rx_oversample);
-			}
-		} else {
-			sdr->rx_oversample = oversample;
-		}
-		LOGP(DSDR, LOGL_NOTICE, "Split mode rates: DSP=%d TX_SDR=%d RX_SDR=%d TX_%s=%s RX_%s=%s\n",
-		     samplerate, sdr_config->tx_samplerate, sdr_config->rx_samplerate,
-		     sdr->tx_use_polyphase ? "polyphase" : "os",
-		     sdr->tx_use_polyphase ? "yes" : (sdr->tx_oversample > 1 ? "integer" : "1"),
-		     sdr->rx_use_polyphase ? "polyphase" : "os",
-		     sdr->rx_use_polyphase ? "yes" : (sdr->rx_oversample > 1 ? "integer" : "1"));
-	} else {
-		sdr->tx_oversample = oversample;
-		sdr->rx_oversample = oversample;
-	}
+	sdr->threads = 1; /* always required, because write may block */
 
-	if (threads) {
-		/* RX buffer allocation - only if not TX-only mode */
-		if (!sdr_config->tx_only) {
-			LOGP(DSDR, LOGL_NOTICE, "Allocating RX thread buffers\n");
-			memset(&sdr->thread_read, 0, sizeof(sdr->thread_read));
-			/* Calculate RX input buffer size:
-			 * - For integer resampling: buffer_size * rx_oversample
-			 * - For polyphase: estimate based on ratio + margin */
-			int rx_in_size;
-			if (sdr->rx_use_polyphase) {
-				/* Polyphase input size: need enough for one processing block at SDR rate */
-				rx_in_size = (int)((double)sdr->buffer_size * 
-				             (double)sdr_config->rx_samplerate / (double)samplerate) + 32;
-			} else {
-				rx_in_size = sdr->buffer_size * sdr->rx_oversample;
-			}
-			sdr->thread_read.buffer_size = rx_in_size * 2 * 4 + 2;  /* 4x headroom to absorb main loop jitter */
-			sdr->thread_read.buffer = calloc(sdr->thread_read.buffer_size, sizeof(*sdr->thread_read.buffer));
-			if (!sdr->thread_read.buffer) {
-				LOGP(DSDR, LOGL_ERROR, "No mem!\n");
-				goto error;
-			}
-			sdr->thread_read.buffer2 = calloc(sdr->thread_read.buffer_size, sizeof(*sdr->thread_read.buffer2));
-			if (!sdr->thread_read.buffer2) {
-				LOGP(DSDR, LOGL_ERROR, "No mem!\n");
-				goto error;
-			}
-			sdr->thread_read.in = sdr->thread_read.out = 0;
-			/* Use RX sample rate for read thread filter in split mode (only for integer resampling) */
-			if (sdr->rx_oversample > 1 && !sdr->rx_use_polyphase) {
-				int rx_rate = sdr_config->split_mode ? sdr_config->rx_samplerate : sdr_config->samplerate;
-				iir_lowpass_init(&sdr->thread_read.lp[0], samplerate / 2.0, rx_rate, 2);
-				iir_lowpass_init(&sdr->thread_read.lp[1], samplerate / 2.0, rx_rate, 2);
-				if (sdr_halfband_init(&sdr->thread_read, sdr->rx_oversample, "RX") < 0)
-					goto error;
-			}
-		} else {
-			LOGP(DSDR, LOGL_INFO, "Skipping RX buffer allocation (TX-only mode)\n");
-		}
-		/* TX buffer allocation - only if not RX-only mode */
-		if (!sdr_config->rx_only) {
-			LOGP(DSDR, LOGL_NOTICE, "Allocating TX thread buffers\n");
-			memset(&sdr->thread_write, 0, sizeof(sdr->thread_write));
-			/* Ring buffer holds 3x buffer_size. sdr_get_tosend() allows
-			 * fill + tosend up to 2x buffer_size (catch-up in time stamp
-			 * mode), so a 2x ring had no margin and any extra sample
-			 * would be cut off in sdr_write(), dropping TX samples. The
-			 * extra buffer_size is margin only: device paced mode still
-			 * keeps the fill at buffer_size, so latency is unchanged. */
-			sdr->thread_write.buffer_size = sdr->buffer_size * 6 + 2;
-			sdr->thread_write.buffer = calloc(sdr->thread_write.buffer_size, sizeof(*sdr->thread_write.buffer));
-			if (!sdr->thread_write.buffer) {
-				LOGP(DSDR, LOGL_ERROR, "No mem!\n");
-				goto error;
-			}
-			/* Calculate TX output buffer size:
-			 * - For integer resampling: buffer_size * tx_oversample
-			 * - For polyphase: estimate based on ratio + margin */
-			int tx_out_size;
-			if (sdr->tx_use_polyphase) {
-				/* Polyphase output size estimate with margin */
-				tx_out_size = (int)((double)sdr->buffer_size * 
-				              (double)sdr_config->tx_samplerate / (double)samplerate) + 32;
-			} else {
-				tx_out_size = sdr->buffer_size * sdr->tx_oversample;
-			}
-			sdr->thread_write.buffer2 = calloc(tx_out_size * 2, sizeof(*sdr->thread_write.buffer2));
-			if (!sdr->thread_write.buffer2) {
-				LOGP(DSDR, LOGL_ERROR, "No mem!\n");
-				goto error;
-			}
-			sdr->thread_write.in = sdr->thread_write.out = 0;
-			/* Use TX sample rate for write thread filter in split mode (only for integer resampling) */
-			if (sdr->tx_oversample > 1 && !sdr->tx_use_polyphase) {
-				int tx_rate = sdr_config->split_mode ? sdr_config->tx_samplerate : sdr_config->samplerate;
-				iir_lowpass_init(&sdr->thread_write.lp[0], samplerate / 2.0, tx_rate, 2);
-				iir_lowpass_init(&sdr->thread_write.lp[1], samplerate / 2.0, tx_rate, 2);
-				if (sdr_halfband_init(&sdr->thread_write, sdr->tx_oversample, "TX") < 0)
-					goto error;
-			}
-		} else {
-			LOGP(DSDR, LOGL_INFO, "Skipping TX buffer allocation (RX-only mode)\n");
-		}
+	/* SDR rate of each direction (split mode: each device its own) */
+	sdr->tx_rate = (sdr_config->split_mode && sdr_config->tx_samplerate) ? sdr_config->tx_samplerate : sdr_config->samplerate;
+	sdr->rx_rate = (sdr_config->split_mode && sdr_config->rx_samplerate) ? sdr_config->rx_samplerate : sdr_config->samplerate;
+	if (sdr->tx_rate < samplerate || sdr->rx_rate < samplerate) {
+		LOGP(DSDR, LOGL_ERROR, "The SDR sample rate (TX %d, RX %d) must be at least the DSP sample rate %d (-s).\n", sdr->tx_rate, sdr->rx_rate, samplerate);
+		goto error;
 	}
+	if (sdr->tx_rate % samplerate)
+		LOGP(DSDR, LOGL_NOTICE, "TX: SDR rate %d is not an integer multiple of the DSP rate %d: rational resampling (an integer multiple is cheaper).\n", sdr->tx_rate, samplerate);
+	if (sdr->rx_rate % samplerate && sdr->rx_rate != sdr->tx_rate)
+		LOGP(DSDR, LOGL_NOTICE, "RX: SDR rate %d is not an integer multiple of the DSP rate %d: rational resampling (an integer multiple is cheaper).\n", sdr->rx_rate, samplerate);
+	sdr->rx_max_in = rate_max(buffer_size, samplerate, sdr->rx_rate);
+	sdr->tx_max_out = rate_max(buffer_size, samplerate, sdr->tx_rate);
+
+	/* RX ring of SDR rate IQ, 4 x buffer_size of headroom for the main loop jitter */
+	if (!sdr_config->tx_only) {
+		LOGP(DSDR, LOGL_NOTICE, "Allocating RX thread buffers\n");
+		memset(&sdr->thread_read, 0, sizeof(sdr->thread_read));
+		sdr->thread_read.buffer_size = sdr->rx_max_in * 2 * 4 + 2;
+		sdr->thread_read.buffer = calloc(sdr->thread_read.buffer_size, sizeof(*sdr->thread_read.buffer));
+		sdr->thread_read.buffer2 = calloc(sdr->thread_read.buffer_size, sizeof(*sdr->thread_read.buffer2));
+		sdr->rx_lin = calloc(sdr->rx_max_in * 2, sizeof(*sdr->rx_lin));
+		if (!sdr->thread_read.buffer || !sdr->thread_read.buffer2 || !sdr->rx_lin) {
+			LOGP(DSDR, LOGL_ERROR, "No mem!\n");
+			goto error;
+		}
+		sdr->thread_read.in = sdr->thread_read.out = 0;
+	} else
+		LOGP(DSDR, LOGL_INFO, "Skipping RX buffer allocation (TX-only mode)\n");
+	/* TX ring of SDR rate IQ. It holds 3 x buffer_size: sdr_get_tosend()
+	 * allows fill + tosend up to 2 x buffer_size (catch-up in time stamp
+	 * mode); the third is margin, device paced mode keeps the fill at
+	 * buffer_size, so the latency is unchanged. */
+	if (!sdr_config->rx_only) {
+		LOGP(DSDR, LOGL_NOTICE, "Allocating TX thread buffers\n");
+		memset(&sdr->thread_write, 0, sizeof(sdr->thread_write));
+		sdr->thread_write.buffer_size = sdr->tx_max_out * 2 * 3 + 2;
+		sdr->thread_write.buffer = calloc(sdr->thread_write.buffer_size, sizeof(*sdr->thread_write.buffer));
+		sdr->thread_write.buffer2 = calloc(sdr->tx_max_out * 2, sizeof(*sdr->thread_write.buffer2));
+		sdr->tx_sum = calloc(sdr->tx_max_out * 2, sizeof(*sdr->tx_sum));
+		if (!sdr->thread_write.buffer || !sdr->thread_write.buffer2 || !sdr->tx_sum) {
+			LOGP(DSDR, LOGL_ERROR, "No mem!\n");
+			goto error;
+		}
+		sdr->thread_write.in = sdr->thread_write.out = 0;
+	} else
+		LOGP(DSDR, LOGL_INFO, "Skipping TX buffer allocation (RX-only mode)\n");
 
 	/* alloc fm modulation buffers */
 	sdr->modbuff = calloc(sdr->buffer_size * 2, sizeof(*sdr->modbuff));
@@ -561,13 +295,18 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
 		goto error;
 	}
-	sdr->wavespl0 = calloc(sdr->buffer_size, sizeof(*sdr->wavespl0));
-	if (!sdr->wavespl0) {
-		LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
-		goto error;
+	/* wave recording / playback of the IQ at the SDR rate */
+	{
+		int wmax = (sdr->rx_max_in > sdr->tx_max_out) ? sdr->rx_max_in : sdr->tx_max_out;
+
+		sdr->wavespl0 = calloc(wmax, sizeof(*sdr->wavespl0));
+		sdr->wavespl1 = calloc(wmax, sizeof(*sdr->wavespl1));
 	}
-	sdr->wavespl1 = calloc(sdr->buffer_size, sizeof(*sdr->wavespl1));
-	if (!sdr->wavespl1) {
+	sdr->ch_i = calloc(sdr->buffer_size, sizeof(*sdr->ch_i));
+	sdr->ch_q = calloc(sdr->buffer_size, sizeof(*sdr->ch_q));
+	sdr->zero_power = calloc(sdr->buffer_size, sizeof(*sdr->zero_power));
+	sdr->zero_spl = calloc(sdr->buffer_size, sizeof(*sdr->zero_spl));
+	if (!sdr->wavespl0 || !sdr->wavespl1 || !sdr->ch_i || !sdr->ch_q || !sdr->zero_power || !sdr->zero_spl) {
 		LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
 		goto error;
 	}
@@ -584,42 +323,6 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		if (!sdr->chan) {
 			LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
 			goto error;
-		}
-	}
-
-	if (use_channelizer) {
-		/* Use rx_oversample for RX channelizer buffer in split mode */
-		int rx_os_alloc = (sdr_config && sdr_config->split_mode) ? sdr->rx_oversample : sdr->oversample;
-		sdr->chan_in_buff = calloc(sdr->buffer_size * rx_os_alloc * 2, sizeof(sample_t));
-		if (!sdr->chan_in_buff) {
-			LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
-			goto error;
-		}
-		/* Allocate TX channelizer buffers */
-		sdr->tx_chan_I = calloc(sdr->buffer_size, sizeof(sample_t));
-		sdr->tx_chan_Q = calloc(sdr->buffer_size, sizeof(sample_t));
-		if (!sdr->tx_chan_I || !sdr->tx_chan_Q) {
-			LOGP(DSDR, LOGL_ERROR, "NO MEM for TX channelizer buffers!\n");
-			goto error;
-		}
-		
-		/* Initialize radio channelizer for channels=0 mode (decimation only) */
-		if (!channels && rx_os_alloc > 1) {
-			int rc = channelizer_init(&sdr->radio_channelizer, 
-			                          sdr_config->samplerate, samplerate, 0, fast_math);
-			if (rc < 0) {
-				LOGP(DSDR, LOGL_ERROR, "Failed to init radio channelizer\n");
-				goto error;
-			}
-			sdr->radio_ch_I = calloc(sdr->buffer_size, sizeof(sample_t));
-			sdr->radio_ch_Q = calloc(sdr->buffer_size, sizeof(sample_t));
-			if (!sdr->radio_ch_I || !sdr->radio_ch_Q) {
-				LOGP(DSDR, LOGL_ERROR, "NO MEM for radio channelizer buffers!\n");
-				goto error;
-			}
-			sdr->radio_channelizer_init = 1;
-			LOGP(DSDR, LOGL_INFO, "Radio channelizer: %d Hz -> %d Hz (decimation %dx)\n",
-			     sdr_config->samplerate, samplerate, sdr->radio_channelizer.decimation);
 		}
 	}
 
@@ -642,28 +345,40 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		tx_frequency = NULL;
 	}
 
-	if (tx_frequency && !channels)
+	if (tx_frequency && !channels) {
+		/* channels = 0: the caller's IQ is the whole band around the centre */
 		tx_center_frequency = tx_frequency[0];
-	
-	/* TX IQ wave recording - works for all TX modes, including channels=0 (osmoradio) */
+		rc = channelizer_tx_init(&sdr->band_tx, sdr->tx_rate, samplerate, 0.0, 2.0 * CHANNELIZER_PASS * samplerate);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "TX: %s\n", channelizer_error());
+			goto error;
+		}
+		sdr->band_tx_init = 1;
+	}
+
+	/* TX IQ wave recording / playback at the SDR rate (the signal sent to the device) */
 	if (tx_frequency && sdr_config->write_iq_tx_wave) {
-		rc = wave_create_record(&sdr->wave_tx_rec, sdr_config->write_iq_tx_wave, samplerate, 2, 1.0);
+		rc = wave_create_record(&sdr->wave_tx_rec, sdr_config->write_iq_tx_wave, sdr->tx_rate, 2, 1.0);
 		if (rc < 0) {
 			LOGP(DSDR, LOGL_ERROR, "Failed to create TX WAVE recording instance!\n");
 			goto error;
 		}
-		LOGP(DSDR, LOGL_INFO, "Recording TX IQ to: %s\n", sdr_config->write_iq_tx_wave);
+		LOGP(DSDR, LOGL_INFO, "Recording TX IQ (%d S/s) to: %s\n", sdr->tx_rate, sdr_config->write_iq_tx_wave);
 	}
 	if (tx_frequency && sdr_config->read_iq_tx_wave) {
-		int two = 2;
-		rc = wave_create_playback(&sdr->wave_tx_play, sdr_config->read_iq_tx_wave, &samplerate, &two, 1.0);
+		int two = 2, rate = sdr->tx_rate;
+		rc = wave_create_playback(&sdr->wave_tx_play, sdr_config->read_iq_tx_wave, &rate, &two, 1.0);
 		if (rc < 0) {
 			LOGP(DSDR, LOGL_ERROR, "Failed to create TX WAVE playback instance!\n");
 			goto error;
 		}
+		if (rate != sdr->tx_rate) {
+			LOGP(DSDR, LOGL_ERROR, "TX IQ wave '%s' has %d S/s, the SDR TX rate is %d S/s.\n", sdr_config->read_iq_tx_wave, rate, sdr->tx_rate);
+			goto error;
+		}
 		LOGP(DSDR, LOGL_INFO, "Replacing TX IQ from: %s\n", sdr_config->read_iq_tx_wave);
 	}
-	
+
 	if (tx_frequency && channels) {
 		/* calculate required bandwidth (IQ rate) */
 
@@ -697,7 +412,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			}
 			if (carriers == 2) {
 				double spacing = tx_high_frequency - tx_low_frequency;
-				int tx_rate = sdr_config->split_mode ? sdr_config->tx_samplerate : sdr_config->samplerate;
+				int tx_rate = sdr->tx_rate;
 
 				LOGP(DSDR, LOGL_NOTICE, "rpitx: two channels on one carrier (experimental, see docs/RPITX.md). The second channel at %.2f of the first one's level (--sdr-rpitx-ratio). The first channel should stay on (control channel), the second one may key on and off. One spacing on the far side of the first channel carries mixing products, keep it unused.\n", sdr_config->rpitx_ratio);
 				if (spacing > tx_rate / 3.0)
@@ -760,7 +475,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		}
 
 		/* show spectrum */
-		int tx_rate = sdr_config->split_mode ? sdr_config->tx_samplerate : sdr_config->samplerate;
+		int tx_rate = sdr->tx_rate;
 		show_spectrum("TX", (double)tx_rate / 2.0, tx_center_frequency, tx_frequency, paging_frequency, channels);
 
 		/* range of TX */
@@ -777,43 +492,34 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			goto error;
 		}
 		LOGP(DSDR, LOGL_INFO, "Using center frequency: TX %.6f MHz\n", tx_center_frequency / 1e6);
-		/* set offsets to center frequency */
-		for (c = 0; c < channels; c++) {
-			double tx_offset;
-			tx_offset = sdr->chan[c].tx_frequency - tx_center_frequency;
-			LOGP(DSDR, LOGL_NOTICE, "FM MOD ch%d: tx_freq=%.6f center=%.6f offset=%.1fkHz samplerate=%d\n",
-			     c, sdr->chan[c].tx_frequency / 1e6, tx_center_frequency / 1e6, tx_offset / 1e3, samplerate);
-			sdr->chan[c].am = am[c];
-			if (am[c]) {
-				double gain, bias;
-				gain = modulation_index / 2.0;
-				bias = 1.0 - gain;
-				rc = am_mod_init(&sdr->chan[c].am_mod, samplerate, tx_offset, sdr->amplitude * gain, sdr->amplitude * bias);
+		/* modulators at 0 Hz at the DSP rate, each channel's synthesizer
+		 * moves it to its offset at the SDR rate (the paging channel has
+		 * its own, so states stay continuous when a channel switches) */
+		for (c = 0; c < channels + (sdr->paging_channel ? 1 : 0); c++) {
+			double tx_offset = sdr->chan[c].tx_frequency - tx_center_frequency;
+
+			if (c < channels) {
+				sdr->chan[c].am = am[c];
+				if (am[c]) {
+					double gain, bias;
+					gain = modulation_index / 2.0;
+					bias = 1.0 - gain;
+					rc = am_mod_init(&sdr->chan[c].am_mod, samplerate, 0.0, sdr->amplitude * gain, sdr->amplitude * bias);
+				} else
+					rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, 0.0, sdr_tx_amplitude(sdr, c, channels));
 			} else
-				rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, tx_offset, sdr_tx_amplitude(sdr, c, channels));
+				rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, 0.0, sdr_tx_amplitude(sdr, c, channels));
 			if (rc < 0)
 				goto error;
-			/* Initialize TX channelizer if enabled */
-			if (use_channelizer && oversample > 1) {
-				sdr->chan[c].use_tx_channelizer = 1;
-				rc = channelizer_tx_init(&sdr->chan[c].tx_channelizer,
-				                         sdr_config->samplerate,
-				                         bandwidth, tx_offset, fast_math);
-				if (rc < 0) {
-					LOGP(DSDR, LOGL_ERROR, "Failed to init TX channelizer for channel %d\n", c);
-					goto error;
-				}
-				LOGP(DSDR, LOGL_INFO, "TX Channelizer ch%d: %dx interpolation, offset %.1f kHz\n",
-				     c, sdr->chan[c].tx_channelizer.interpolation, tx_offset / 1e3);
+			rc = channelizer_tx_init(&sdr->chan[c].tx_ch, sdr->tx_rate, samplerate, tx_offset, bandwidth);
+			if (rc < 0) {
+				LOGP(DSDR, LOGL_ERROR, "TX %s %.6f MHz: %s\n", (c < channels) ? "channel" : "paging channel", sdr->chan[c].tx_frequency / 1e6, channelizer_error());
+				goto error;
 			}
-		}
-		if (sdr->paging_channel) {
-			double tx_offset;
-			tx_offset = sdr->chan[sdr->paging_channel].tx_frequency - tx_center_frequency;
-			LOGP(DSDR, LOGL_DEBUG, "Paging Frequency: TX offset: %.6f MHz\n", tx_offset / 1e6);
-			rc = fm_mod_init(&sdr->chan[sdr->paging_channel].fm_mod, samplerate, tx_offset, sdr_tx_amplitude(sdr, sdr->paging_channel, channels));
-			if (rc < 0)
-				goto error;
+			sdr->chan[c].tx_init = 1;
+			LOGP(DSDR, LOGL_INFO, "TX %s %d: %.6f MHz, offset %+.1f kHz, %d halfband stage(s) to %d S/s%s\n",
+			     (c < channels) ? "channel" : "paging channel", c, sdr->chan[c].tx_frequency / 1e6, tx_offset / 1e3,
+			     sdr->chan[c].tx_ch.hb_stages, sdr->chan[c].tx_ch.mid_rate, sdr->chan[c].tx_ch.use_resamp ? ", resampler" : "");
 		}
 		/* show gain */
 		LOGP(DSDR, LOGL_INFO, "Using gain: TX %.1f dB\n", sdr_config->tx_gain);
@@ -871,7 +577,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		}
 
 		/* show spectrum */
-		int rx_rate = sdr_config->split_mode ? sdr_config->rx_samplerate : sdr_config->samplerate;
+		int rx_rate = sdr->rx_rate;
 		show_spectrum("RX", (double)rx_rate / 2.0, rx_center_frequency, rx_frequency, 0.0, channels);
 
 		/* range of RX */
@@ -888,48 +594,30 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			goto error;
 		}
 		LOGP(DSDR, LOGL_INFO, "Using center frequency: RX %.6f MHz\n", rx_center_frequency / 1e6);
-		/* set offsets to center frequency */
+		/* each channel's channelizer takes it from its offset at the SDR rate
+		 * to 0 Hz at the DSP rate, the demodulators work at 0 Hz */
 		for (c = 0; c < channels; c++) {
-			double rx_offset;
-			rx_offset = sdr->chan[c].rx_frequency - rx_center_frequency;
-			LOGP(DSDR, LOGL_DEBUG, "Frequency #%d: RX offset: %.6f MHz\n", c, rx_offset / 1e6);
+			double rx_offset = sdr->chan[c].rx_frequency - rx_center_frequency;
+
 			sdr->chan[c].am = am[c];
-			sdr->chan[c].use_channelizer = use_channelizer;
-			if (sdr->chan[c].use_channelizer) {
-				channelizer_init(&sdr->chan[c].channelizer, sdr_config->samplerate, samplerate, rx_offset, fast_math);
-				sdr->chan[c].ch_I = calloc(buffer_size, sizeof(sample_t));
-				sdr->chan[c].ch_Q = calloc(buffer_size, sizeof(sample_t));
-				sdr->chan[c].ch_iq_float = calloc(buffer_size * 2, sizeof(float));
-				if (!sdr->chan[c].ch_I || !sdr->chan[c].ch_Q || !sdr->chan[c].ch_iq_float) {
-					LOGP(DSDR, LOGL_ERROR, "NO MEM!\n");
-					goto error;
-				}
-			}
 			if (am[c])
-				rc = am_demod_init(&sdr->chan[c].am_demod, samplerate, use_channelizer ? 0.0 : rx_offset, bandwidth / 2.0, 1.0 / modulation_index); /* bandwidth is only one side band */
+				rc = am_demod_init(&sdr->chan[c].am_demod, samplerate, 0.0, bandwidth / 2.0, 1.0 / modulation_index); /* bandwidth is only one side band */
 			else
-				rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, use_channelizer ? 0.0 : rx_offset, bandwidth); /* bandwidth are deviation and both sidebands */
+				rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, 0.0, bandwidth); /* bandwidth are deviation and both sidebands */
 			if (rc < 0)
 				goto error;
+			rc = channelizer_rx_init(&sdr->chan[c].rx_ch, sdr->rx_rate, samplerate, rx_offset, bandwidth);
+			if (rc < 0) {
+				LOGP(DSDR, LOGL_ERROR, "RX channel %.6f MHz: %s\n", sdr->chan[c].rx_frequency / 1e6, channelizer_error());
+				goto error;
+			}
+			sdr->chan[c].rx_init = 1;
+			LOGP(DSDR, LOGL_INFO, "RX channel %d: %.6f MHz, offset %+.1f kHz, %d halfband stage(s) to %d S/s%s\n",
+			     c, sdr->chan[c].rx_frequency / 1e6, rx_offset / 1e3,
+			     sdr->chan[c].rx_ch.hb_stages, sdr->chan[c].rx_ch.mid_rate, sdr->chan[c].rx_ch.use_resamp ? ", resampler" : "");
 		}
 		/* show gain */
 		LOGP(DSDR, LOGL_INFO, "Using gain: RX %.1f dB\n", sdr_config->rx_gain);
-		/* open wave */
-		if (sdr_config->write_iq_rx_wave) {
-			rc = wave_create_record(&sdr->wave_rx_rec, sdr_config->write_iq_rx_wave, samplerate, 2, 1.0);
-			if (rc < 0) {
-				LOGP(DSDR, LOGL_ERROR, "Failed to create WAVE recoding instance!\n");
-				goto error;
-			}
-		}
-		if (sdr_config->read_iq_rx_wave) {
-			int two = 2;
-			rc = wave_create_playback(&sdr->wave_rx_play, sdr_config->read_iq_rx_wave, &samplerate, &two, 1.0);
-			if (rc < 0) {
-				LOGP(DSDR, LOGL_ERROR, "Failed to create WAVE playback instance!\n");
-				goto error;
-			}
-		}
 		/* init measurements display */
 		for (c = 0; c < channels; c++) {
 			sender_t *sender = get_sender_by_empfangsfrequenz(sdr->chan[c].rx_frequency);
@@ -943,8 +631,38 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		}
 	}
 
-	display_iq_init(samplerate);
-	display_spectrum_init(samplerate, rx_center_frequency);
+	if (rx_frequency && !channels) {
+		/* channels = 0: the whole usable band around the centre to the caller */
+		rc = channelizer_rx_init(&sdr->band_rx, sdr->rx_rate, samplerate, 0.0, 2.0 * CHANNELIZER_PASS * samplerate);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "RX: %s\n", channelizer_error());
+			goto error;
+		}
+		sdr->band_rx_init = 1;
+	}
+
+	/* RX IQ wave recording / playback at the SDR rate (the signal from the device) */
+	if (rx_frequency && sdr_config->write_iq_rx_wave) {
+		rc = wave_create_record(&sdr->wave_rx_rec, sdr_config->write_iq_rx_wave, sdr->rx_rate, 2, 1.0);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "Failed to create RX WAVE recording instance!\n");
+			goto error;
+		}
+		LOGP(DSDR, LOGL_INFO, "Recording RX IQ (%d S/s) to: %s\n", sdr->rx_rate, sdr_config->write_iq_rx_wave);
+	}
+	if (rx_frequency && sdr_config->read_iq_rx_wave) {
+		int two = 2, rate = sdr->rx_rate;
+		rc = wave_create_playback(&sdr->wave_rx_play, sdr_config->read_iq_rx_wave, &rate, &two, 1.0);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "Failed to create RX WAVE playback instance (the file must have the SDR RX rate %d S/s)!\n", sdr->rx_rate);
+			goto error;
+		}
+		LOGP(DSDR, LOGL_INFO, "Replacing RX IQ from: %s\n", sdr_config->read_iq_rx_wave);
+	}
+
+	/* IQ and spectrum display of the SDR rate IQ */
+	display_iq_init(sdr->rx_rate);
+	display_spectrum_init(sdr->rx_rate, rx_center_frequency);
 
 	/* rpitx has no LO: it makes the carrier itself (one channel: at the channel frequency) */
 	if (sdr_tx_is_rpitx() && (sdr_config->tx_only || !sdr_config->split_mode))
@@ -1070,12 +788,7 @@ error:
 
 void *sdr_open(int direction, const char *audiodev, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index)
 {
-	return sdr_open_internal(direction, audiodev, tx_frequency, rx_frequency, am, channels, paging_frequency, samplerate, buffer_size, interval, max_deviation, max_modulation, modulation_index, 0, 0);
-}
-
-void *sdr_open_channelizer(int direction, const char *audiodev, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index, int use_channelizer, int fast_math)
-{
-	return sdr_open_internal(direction, audiodev, tx_frequency, rx_frequency, am, channels, paging_frequency, samplerate, buffer_size, interval, max_deviation, max_modulation, modulation_index, use_channelizer, fast_math);
+	return sdr_open_internal(direction, audiodev, tx_frequency, rx_frequency, am, channels, paging_frequency, samplerate, buffer_size, interval, max_deviation, max_modulation, modulation_index);
 }
 
 double bias_I, bias_Q; /* calculated bias */
@@ -1203,7 +916,7 @@ static void *sdr_write_child(void *arg)
 	sdr_t *sdr = (sdr_t *)arg;
 	int num;
 	int fill, out;
-	int s, ss, o;
+	int s, ss;
 
 	/* Diagnostics for split mode */
 	int diag_count = 0;
@@ -1220,41 +933,27 @@ static void *sdr_write_child(void *arg)
 	double pace_start = 0.0, pace_last = 0.0, pace_last_poll = 0.0;
 	long pace_samples = 0;
 
-	/* Use tx_oversample for TX operations in split mode (only for integer resampling) */
-	int tx_os = split_mode ? sdr->tx_oversample : sdr->oversample;
-	
-	/* Check if using polyphase resampler for TX */
-	int use_tx_polyphase = sdr->tx_use_polyphase;
-	int tx_polyphase_logged = 0;
-
-	/* Check if TX channelizer is enabled (only check channel 0 for now) */
-	int use_tx_chan = 0;
-	if (sdr->chan && sdr->chan[0].use_tx_channelizer)
-		use_tx_chan = 1;
-
-	/* Determine TX chunk size.
-	 * For UHD: use the hardware MTU so send() blocks naturally as pacemaker.
-	 * For other drivers: use a reasonable chunk (~1ms worth of samples).
-	 * The chunk size is in INPUT samples (before oversampling). */
+	/* The ring holds SDR rate IQ (sdr_write() synthesizes the channels).
+	 * Chunk size: UHD: the hardware MTU, so send() blocks as the
+	 * pacemaker; others: about 1 ms. */
 	int tx_chunk = 0;
 #ifdef HAVE_UHD
 	if (tx_driver == 1) {
 		int mtu = uhd_get_tx_mtu();
 		if (mtu > 0) {
-			/* MTU is in output samples; convert to input samples */
-			tx_chunk = mtu / tx_os;
-			if (tx_chunk < 1) tx_chunk = 1;
-			LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: UHD MTU=%d output samples, tx_chunk=%d input samples (tx_os=%d)\n",
-			     mtu, tx_chunk, tx_os);
+			tx_chunk = mtu;
+			LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: UHD MTU=%d samples, tx_chunk=%d samples\n", mtu, tx_chunk);
 		}
 	}
 #endif
 	if (tx_chunk == 0) {
-		/* Fallback: ~1ms worth of input samples */
-		tx_chunk = sdr->samplerate / 1000;
-		if (tx_chunk < 100) tx_chunk = 100;
-		LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: using fallback tx_chunk=%d input samples\n", tx_chunk);
+		tx_chunk = sdr->tx_rate / 1000;
+		if (tx_chunk < 100)
+			tx_chunk = 100;
+		LOGP(DSDR, LOGL_NOTICE, "WRITE_THREAD: using tx_chunk=%d samples (1 ms)\n", tx_chunk);
 	}
+	if (tx_chunk > sdr->tx_max_out)
+		tx_chunk = sdr->tx_max_out;
 
 	while (sdr->thread_write.running) {
 		/* Check how much data is available in ring buffer */
@@ -1313,114 +1012,14 @@ static void *sdr_write_child(void *arg)
 		printf("Thread found %d samples in write buffer and forwards them to SDR.\n", num);
 #endif
 		out = sdr->thread_write.out;
-		int out_samples;  /* Number of samples to send to SDR */
+		int out_samples = num;	/* SDR rate samples to send */
 
-		if (use_tx_chan && sdr->tx_chan_I && sdr->tx_chan_Q) {
-			/* TX Channelizer path: proper polyphase interpolation */
-			
-			/* De-interleave I/Q from buffer and apply scaling */
-			for (s = 0; s < num; s++) {
-				sdr->tx_chan_I[s] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
-				sdr->tx_chan_Q[s] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
-				out = (out + 2) % sdr->thread_write.buffer_size;
-			}
-			sdr->thread_write.out = out;
-			
-			/* Clear output buffer before channelizer (it ADDS to output) */
-			memset(sdr->thread_write.buffer2, 0, sizeof(float) * num * tx_os * 2);
-			
-			/* Process through TX channelizer (interpolate + filter) */
-			channelizer_tx_process(&sdr->chan[0].tx_channelizer,
-			                       sdr->tx_chan_I, sdr->tx_chan_Q, num,
-			                       sdr->thread_write.buffer2);
-			out_samples = num * tx_os;
-		} else if (use_tx_polyphase && sdr->tx_poly_i && sdr->tx_poly_q) {
-			/* Polyphase resampler path: arbitrary ratio upsampling */
-			static int tx_poly_debug_count = 0;
-			if (!tx_polyphase_logged) {
-				LOGP(DSDR, LOGL_NOTICE, "TX POLYPHASE UPSAMPLE: DSP %d Hz -> SDR %d Hz (ratio=%.6f)\n",
-				     sdr->samplerate, sdr_config->tx_samplerate,
-				     (double)sdr_config->tx_samplerate / (double)sdr->samplerate);
-				tx_polyphase_logged = 1;
-			}
-			
-			/* De-interleave I/Q from buffer into pre-allocated polyphase input buffers */
-			sample_t *in_i = sdr->tx_poly_i;
-			sample_t *in_q = sdr->tx_poly_q;
-			double in_max = 0;
-			for (s = 0; s < num; s++) {
-				in_i[s] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
-				in_q[s] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
-				if (fabs(in_i[s]) > in_max) in_max = fabs(in_i[s]);
-				if (fabs(in_q[s]) > in_max) in_max = fabs(in_q[s]);
-				out = (out + 2) % sdr->thread_write.buffer_size;
-			}
-			sdr->thread_write.out = out;
-			
-			/* Resample I and Q through polyphase filter
-			 * Output goes directly into buffer2 (de-interleaved first, then interleaved) */
-			int max_out = polyphase_output_num(&sdr->tx_polyphase, num) + 4;
-			
-			/* Use second half of tx_poly buffers for output (they're sized for max_out) */
-			sample_t *out_i = in_i + sdr->buffer_size;  /* Offset past input area */
-			sample_t *out_q = in_q + sdr->buffer_size;
-			
-			out_samples = polyphase_resample_iq(&sdr->tx_polyphase,
-			                                    in_i, in_q, num,
-			                                    out_i, out_q, max_out);
-			
-			/* Debug: check output */
-			double out_max = 0;
-			for (s = 0; s < out_samples; s++) {
-				if (fabs(out_i[s]) > out_max) out_max = fabs(out_i[s]);
-				if (fabs(out_q[s]) > out_max) out_max = fabs(out_q[s]);
-			}
-			tx_poly_debug_count++;
-			if (tx_poly_debug_count % 50 == 1) {
-				LOGP(DSDR, LOGL_NOTICE, "TX POLY: in=%d out=%d max_out=%d | in_max=%.4f out_max=%.4f\n",
-				     num, out_samples, max_out, in_max, out_max);
-			}
-			
-			/* Interleave I/Q into output buffer */
-			for (s = 0; s < out_samples; s++) {
-				sdr->thread_write.buffer2[s * 2] = out_i[s];
-				sdr->thread_write.buffer2[s * 2 + 1] = out_q[s];
-			}
-		} else if (sdr->thread_write.hb_stages && tx_os > 1) {
-			/* Integer 2^k: halfband interpolator cascade */
-			float *o = sdr->thread_write.buffer2;
-			for (s = 0; s < num; s++) {
-				sdr_halfband_interp(sdr->thread_write.hb, 0, sdr->thread_write.hb_stages,
-				                    sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL,
-				                    sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL, &o);
-				out = (out + 2) % sdr->thread_write.buffer_size;
-			}
-			sdr->thread_write.out = out;
-			out_samples = num * tx_os;
-		} else {
-			/* Legacy path: zero-order hold interpolation + IIR filter */
-			static int tx_upsample_logged = 0;
-			if (!tx_upsample_logged) {
-				LOGP(DSDR, LOGL_NOTICE, "TX INTEGER UPSAMPLE: in=%d tx_os=%d out=%d\n", num, tx_os, num * tx_os);
-				tx_upsample_logged = 1;
-			}
-			for (s = 0, ss = 0; s < num; s++) {
-				for (o = 0; o < tx_os; o++) {
-					sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out] * LIMIT_IQ_LEVEL;
-					sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out + 1] * LIMIT_IQ_LEVEL;
-				}
-				out = (out + 2) % sdr->thread_write.buffer_size;
-			}
-			sdr->thread_write.out = out;
-#ifndef DISABLE_FILTER
-			/* filter spectrum */
-			if (tx_os > 1) {
-				iir_process_baseband(&sdr->thread_write.lp[0], sdr->thread_write.buffer2, num * tx_os);
-				iir_process_baseband(&sdr->thread_write.lp[1], sdr->thread_write.buffer2 + 1, num * tx_os);
-			}
-#endif
-			out_samples = num * tx_os;
+		for (s = 0, ss = 0; s < num; s++) {
+			sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out];
+			sdr->thread_write.buffer2[ss++] = sdr->thread_write.buffer[out + 1];
+			out = (out + 2) % sdr->thread_write.buffer_size;
 		}
+		sdr->thread_write.out = out;
 
 		/* send() blocks until the hardware is ready, acting as the
 		 * pacemaker that keeps data flowing at the exact SDR rate. */
@@ -1479,9 +1078,9 @@ static void *sdr_write_child(void *arg)
 				/* After the device buffers are filled, a device paced
 				 * send() drains at the sample rate. Much faster means
 				 * send() does not block and TX is not paced at all. */
-				if (sdr_tx_device_paced() && now - pace_start > 5.0 && rate > 1.5 * sdr->samplerate)
+				if (sdr_tx_device_paced() && now - pace_start > 5.0 && rate > 1.5 * sdr->tx_rate)
 					LOGP(DSDR, LOGL_ERROR, "SDR TX: send() drains %.0f samples/s, expected %d: driver send() is not blocking, TX is unpaced\n",
-					     rate, sdr->samplerate);
+					     rate, sdr->tx_rate);
 				pace_samples = 0;
 				pace_last = now;
 			}
@@ -1502,10 +1101,18 @@ static void *sdr_read_child(void *arg)
 	int num, count = 0;
 	int space, in;
 	int s, ss;
-	int split_mode = sdr_config && sdr_config->split_mode;
 
-	/* Use rx_oversample for RX operations in split mode */
-	int rx_os = split_mode ? sdr->rx_oversample : sdr->oversample;
+	/* The ring takes the SDR rate IQ as received; sdr_read() channelizes it. */
+	sample_t *wav_i = calloc(sdr->rx_max_in, sizeof(*wav_i));
+	sample_t *wav_q = calloc(sdr->rx_max_in, sizeof(*wav_q));
+
+	if (!wav_i || !wav_q) {
+		LOGP(DSDR, LOGL_ERROR, "No mem!\n");
+		free(wav_i);
+		free(wav_q);
+		sdr->thread_read.exit = 1;
+		return NULL;
+	}
 
 	/* DEBUG: track thread activity */
 	static int thr_dbg_cnt = 0;
@@ -1518,11 +1125,9 @@ static void *sdr_read_child(void *arg)
 		/* read from SDR */
 		space = (sdr->thread_read.out - sdr->thread_read.in + sdr->thread_read.buffer_size - 2 + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size;
 		num = space / 2;
-		/* halfband decimation writes each output rx_os times; the
-		 * cascade may emit up to rx_os - 1 samples more than it read,
-		 * once for the packet and once for a gap fill */
-		if (sdr->thread_read.hb_stages)
-			num = (num > 2 * rx_os) ? num - 2 * rx_os : 0;
+		/* the read chunk buffer holds at most rx_max_in samples */
+		if (num > sdr->rx_max_in)
+			num = sdr->rx_max_in;
 		if (num) {
 #ifdef HAVE_UHD
 			if (rx_driver == 1)
@@ -1534,50 +1139,30 @@ static void *sdr_read_child(void *arg)
 #endif
 			if (bias_count >= 0)
 				sdr_bias(sdr->thread_read.buffer2, count);
-			if (count > 0) {
-				thr_total_written += count;
-				
-				/* Diagnostics: track RX thread ring buffer writes */
-				if (sdr->rx_use_polyphase) {
-					static int rx_thr_calls = 0;
-					static int rx_thr_total_written = 0;
-					static double rx_thr_timer = 0;
-					rx_thr_calls++;
-					rx_thr_total_written += count;
-					if (rx_thr_timer == 0.0)
-						rx_thr_timer = get_time();
-					double now = get_time();
-					if (now - rx_thr_timer >= 1.0) {
-						int fill_after = (sdr->thread_read.in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size;
-						LOGP(DSDR, LOGL_NOTICE, "RX THREAD 1s: calls=%d written=%d samples | in=%d out=%d fill=%d/%d bufsz=%d\n",
-						     rx_thr_calls, rx_thr_total_written,
-						     sdr->thread_read.in, sdr->thread_read.out,
-						     fill_after / 2, sdr->thread_read.buffer_size / 2,
-						     sdr->thread_read.buffer_size);
-						rx_thr_calls = 0;
-						rx_thr_total_written = 0;
-						rx_thr_timer = now;
+			/* IQ wave at the SDR rate: playback replaces what the device
+			 * delivered, recording keeps what goes into the ring */
+			if (count > 0 && (sdr->wave_rx_play.fp || sdr->wave_rx_rec.fp)) {
+				sample_t *spl_list[2] = { wav_i, wav_q };
+
+				if (sdr->wave_rx_play.fp) {
+					wave_read(&sdr->wave_rx_play, spl_list, count);
+					for (s = 0; s < count; s++) {
+						sdr->thread_read.buffer2[2 * s] = wav_i[s];
+						sdr->thread_read.buffer2[2 * s + 1] = wav_q[s];
 					}
 				}
+				if (sdr->wave_rx_rec.fp) {
+					for (s = 0; s < count; s++) {
+						wav_i[s] = sdr->thread_read.buffer2[2 * s];
+						wav_q[s] = sdr->thread_read.buffer2[2 * s + 1];
+					}
+					wave_write(&sdr->wave_rx_rec, spl_list, count);
+				}
+			}
+			if (count > 0) {
+				thr_total_written += count;
 #ifdef DEBUG_BUFFER
 				printf("Thread read %d samples from SDR and writes them to read buffer.\n", count);
-#endif
-				int rx_filter = 0;
-#ifndef DISABLE_FILTER
-				/* filter spectrum */
-				/* If channelizer is used (RX or TX), we MUST skip this filter because
-				 * it is a lowpass at center frequency. It would kill offset channels.
-				 * The channelizer handles filtering and decimation internally, which is
-				 * more efficient and allows extracting narrow channels (NFM, AM) from
-				 * a wideband spectrum. */
-				int skip_filter = 0;
-				if (sdr->chan && (sdr->chan[0].use_channelizer || sdr->chan[0].use_tx_channelizer))
-					skip_filter = 1;
-				/* radio mode (channels = 0): its channelizer decimates
-				 * the full-rate ring in sdr_read() */
-				if (sdr->radio_channelizer_init)
-					skip_filter = 1;
-				rx_filter = (!skip_filter && rx_os > 1);
 #endif
 				in = sdr->thread_read.in;
 
@@ -1601,17 +1186,6 @@ static void *sdr_read_child(void *arg)
 							int n = (fill_n > 512) ? 512 : (int)fill_n;
 
 							memset(z, 0, sizeof(float) * n * 2);
-							if (rx_filter && sdr->thread_read.hb_stages) {
-								in = sdr_halfband_decim(&sdr->thread_read, z, n, in, rx_os);
-								fill_n -= n;
-								continue;
-							}
-#ifndef DISABLE_FILTER
-							if (rx_filter) {
-								iir_process_baseband(&sdr->thread_read.lp[0], z, n);
-								iir_process_baseband(&sdr->thread_read.lp[1], z + 1, n);
-							}
-#endif
 							for (s = 0, ss = 0; s < n; s++) {
 								sdr->thread_read.buffer[in++] = z[ss++];
 								sdr->thread_read.buffer[in++] = z[ss++];
@@ -1622,22 +1196,7 @@ static void *sdr_read_child(void *arg)
 					}
 				}
 
-				/* copy is the number of samples still to copy into the
-				 * ring; count stays as received (the loop end sleeps
-				 * when count <= 0) */
-				int copy = count;
-				if (rx_filter && sdr->thread_read.hb_stages) {
-					in = sdr_halfband_decim(&sdr->thread_read, sdr->thread_read.buffer2, count, in, rx_os);
-					copy = 0;	/* written above */
-				}
-#ifndef DISABLE_FILTER
-				if (rx_filter && copy) {
-					iir_process_baseband(&sdr->thread_read.lp[0], sdr->thread_read.buffer2, copy);
-					iir_process_baseband(&sdr->thread_read.lp[1], sdr->thread_read.buffer2 + 1, copy);
-				}
-#endif
-				(void)rx_filter;
-				for (s = 0, ss = 0; s < copy; s++) {
+				for (s = 0, ss = 0; s < count; s++) {
 					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];
 					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];
 					in %= sdr->thread_read.buffer_size;
@@ -1676,6 +1235,8 @@ static void *sdr_read_child(void *arg)
 			usleep(sdr->interval * 1000.0);
 	}
 
+	free(wav_i);
+	free(wav_q);
 	LOGP(DSDR, LOGL_DEBUG, "Thread received exit!\n");
 	sdr->thread_read.exit = 1;
 	return NULL;
@@ -1796,6 +1357,12 @@ void sdr_close(void *inst)
 		free(sdr->modbuff_carrier);
 		free(sdr->wavespl0);
 		free(sdr->wavespl1);
+		free(sdr->ch_i);
+		free(sdr->ch_q);
+		free(sdr->zero_power);
+		free(sdr->zero_spl);
+		free(sdr->rx_lin);
+		free(sdr->tx_sum);
 		wave_destroy_record(&sdr->wave_rx_rec);
 		wave_destroy_record(&sdr->wave_tx_rec);
 		wave_destroy_playback(&sdr->wave_rx_play);
@@ -1803,45 +1370,24 @@ void sdr_close(void *inst)
 		if (sdr->chan) {
 			int c;
 
-			for (c = 0; c < sdr->channels; c++) {
+			for (c = 0; c < sdr->channels + (sdr->paging_channel ? 1 : 0); c++) {
 				fm_mod_exit(&sdr->chan[c].fm_mod);
-				fm_demod_exit(&sdr->chan[c].fm_demod);
-				am_mod_exit(&sdr->chan[c].am_mod);
-				am_demod_exit(&sdr->chan[c].am_demod);
-				if (sdr->chan[c].use_channelizer)
-					channelizer_exit(&sdr->chan[c].channelizer);
-				if (sdr->chan[c].ch_I) free(sdr->chan[c].ch_I);
-				if (sdr->chan[c].ch_Q) free(sdr->chan[c].ch_Q);
-				if (sdr->chan[c].ch_iq_float) free(sdr->chan[c].ch_iq_float);
+				if (c < sdr->channels) {
+					fm_demod_exit(&sdr->chan[c].fm_demod);
+					am_mod_exit(&sdr->chan[c].am_mod);
+					am_demod_exit(&sdr->chan[c].am_demod);
+				}
+				if (sdr->chan[c].rx_init)
+					channelizer_exit(&sdr->chan[c].rx_ch);
+				if (sdr->chan[c].tx_init)
+					channelizer_exit(&sdr->chan[c].tx_ch);
 			}
-			if (sdr->paging_channel)
-				fm_mod_exit(&sdr->chan[sdr->paging_channel].fm_mod);
 			free(sdr->chan);
 		}
-		if (sdr->chan_in_buff)
-			free(sdr->chan_in_buff);
-		if (sdr->tx_chan_I)
-			free(sdr->tx_chan_I);
-		if (sdr->tx_chan_Q)
-			free(sdr->tx_chan_Q);
-		/* Free radio channelizer resources */
-		if (sdr->radio_channelizer_init) {
-			channelizer_exit(&sdr->radio_channelizer);
-			if (sdr->radio_ch_I) free(sdr->radio_ch_I);
-			if (sdr->radio_ch_Q) free(sdr->radio_ch_Q);
-		}
-		/* Free polyphase resampler resources */
-		if (sdr->tx_use_polyphase) {
-			polyphase_free(&sdr->tx_polyphase);
-			if (sdr->tx_poly_i) free(sdr->tx_poly_i);
-			if (sdr->tx_poly_q) free(sdr->tx_poly_q);
-		}
-		if (sdr->rx_use_polyphase) {
-			polyphase_free(&sdr->rx_polyphase);
-			if (sdr->rx_poly_i) free(sdr->rx_poly_i);
-			if (sdr->rx_poly_q) free(sdr->rx_poly_q);
-			if (sdr->rx_poly_sdr_buff) free(sdr->rx_poly_sdr_buff);
-		}
+		if (sdr->band_rx_init)
+			channelizer_exit(&sdr->band_rx);
+		if (sdr->band_tx_init)
+			channelizer_exit(&sdr->band_tx);
 		free(sdr);
 		sdr = NULL;
 	}
@@ -1880,43 +1426,80 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 		abort();
 	}
 
-	/* process all channels */
+	/* all channels, each modulated at 0 Hz at the DSP rate and synthesized
+	 * to its frequency at the SDR rate, added up in tx_sum */
+	buff = sdr->tx_sum;
+	memset(buff, 0, sizeof(*buff) * sdr->tx_max_out * 2);
 	if (channels) {
-		buff = sdr->modbuff;
-		memset(buff, 0, sizeof(*buff) * num * 2);
-		for (c = 0; c < channels; c++) {
-			/* switch to paging channel, if requested */
-			if (on[c] && sdr->paging_channel)
-				fm_modulate_complex(&sdr->chan[sdr->paging_channel].fm_mod, samples[c], power[c], num, buff);
-			else if (sdr->chan[c].am) {
-				am_modulate_complex(&sdr->chan[c].am_mod, samples[c], power[c], num, buff);
-			} else
-				fm_modulate_complex(&sdr->chan[c].fm_mod, samples[c], power[c], num, buff);
-		}
+		int n, total = -1;
 
-		/* TX level diagnostics via status objects */
-		{
-			double chan_tx_freq[SDR_STATUS_MAX_CHANNELS];
-			for (c = 0; c < channels && c < SDR_STATUS_MAX_CHANNELS; c++)
-				chan_tx_freq[c] = sdr->chan[c].tx_frequency;
-			sdr_status_tx_accumulate(buff, num, power, channels, sdr->amplitude, chan_tx_freq);
+		for (c = 0; c < channels + (sdr->paging_channel ? 1 : 0); c++) {
+			sdr_chan_t *ch = &sdr->chan[c];
+
+			memset(sdr->modbuff, 0, sizeof(*sdr->modbuff) * num * 2);
+			if (c == sdr->paging_channel && sdr->paging_channel) {
+				/* the paging channel carries the channel switched to it; else
+				 * it runs without carrier, so its states stay continuous */
+				int pc;
+
+				for (pc = 0; pc < channels; pc++)
+					if (on[pc])
+						break;
+				if (pc < channels)
+					fm_modulate_complex(&ch->fm_mod, samples[pc], power[pc], num, sdr->modbuff);
+				else
+					fm_modulate_complex(&ch->fm_mod, sdr->zero_spl, sdr->zero_power, num, sdr->modbuff);
+			} else if (on[c] && sdr->paging_channel) {
+				/* switched to the paging channel: this one without carrier */
+				fm_modulate_complex(&ch->fm_mod, sdr->zero_spl, sdr->zero_power, num, sdr->modbuff);
+			} else if (ch->am)
+				am_modulate_complex(&ch->am_mod, samples[c], power[c], num, sdr->modbuff);
+			else
+				fm_modulate_complex(&ch->fm_mod, samples[c], power[c], num, sdr->modbuff);
+			for (s = 0; s < num; s++) {
+				sdr->ch_i[s] = sdr->modbuff[2 * s];
+				sdr->ch_q[s] = sdr->modbuff[2 * s + 1];
+			}
+			n = channelizer_tx_process(&ch->tx_ch, sdr->ch_i, sdr->ch_q, num, buff);
+			if (total >= 0 && n != total)
+				LOGP(DSDR, LOGL_ERROR, "TX synthesizers out of step (%d / %d samples), please fix!\n", n, total);
+			total = n;
 		}
+		sent = total;
 	} else {
-		buff = (float *)samples;
+		/* channels = 0: the caller's IQ (interleaved float) is the whole band */
+		float *in = (float *)samples;
+
+		for (s = 0; s < num; s++) {
+			sdr->ch_i[s] = in[2 * s];
+			sdr->ch_q[s] = in[2 * s + 1];
+		}
+		sent = channelizer_tx_process(&sdr->band_tx, sdr->ch_i, sdr->ch_q, num, buff);
+	}
+	/* keep the sum within the range of the device (all carriers at full level) */
+	for (s = 0; s < sent * 2; s++)
+		buff[s] *= LIMIT_IQ_LEVEL;
+
+	/* TX level diagnostics via status objects */
+	if (channels) {
+		double chan_tx_freq[SDR_STATUS_MAX_CHANNELS];
+		for (c = 0; c < channels && c < SDR_STATUS_MAX_CHANNELS; c++)
+			chan_tx_freq[c] = sdr->chan[c].tx_frequency;
+		sdr_status_tx_accumulate(buff, sent, power, num, channels, sdr->amplitude, chan_tx_freq);
 	}
 
 	if (sdr->wave_tx_rec.fp) {
 		sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
-		for (s = 0, ss = 0; s < num; s++) {
+		for (s = 0, ss = 0; s < sent; s++) {
 			spl_list[0][s] = buff[ss++];
 			spl_list[1][s] = buff[ss++];
 		}
-		wave_write(&sdr->wave_tx_rec, spl_list, num);
+		wave_write(&sdr->wave_tx_rec, spl_list, sent);
 	}
 	if (sdr->wave_tx_play.fp) {
 		sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
-		wave_read(&sdr->wave_tx_play, spl_list, num);
-		for (s = 0, ss = 0; s < num; s++) {
+		wave_read(&sdr->wave_tx_play, spl_list, sent);
+		for (s = 0, ss = 0; s < sent; s++) {
 			buff[ss++] = spl_list[0][s];
 			buff[ss++] = spl_list[1][s];
 		}
@@ -1935,596 +1518,139 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 		if (sdr->thread_write.max_fill_timer == 0.0)
 			sdr->thread_write.max_fill_timer = get_time();
 		if (get_time() - sdr->thread_write.max_fill_timer > 1.0) {
-			double delay;
-			delay = (double)sdr->thread_write.max_fill / 2.0 / (double)sdr->samplerate;
-			(void)delay;
 			sdr->thread_write.max_fill = 0;
 			sdr->thread_write.max_fill_timer += 1.0;
-			// LOGP(DSDR, LOGL_DEBUG, "write delay = %.3f ms\n", delay * 1000.0);
 		}
 
-		if (space < num * 2) {
+		/* the ring holds SDR rate samples */
+		if (space < sent * 2) {
 			LOGP(DSDR, LOGL_ERROR, "Write SDR buffer overflow!\n");
-			num = space / 2;
+			sent = space / 2;
 		}
 #ifdef DEBUG_BUFFER
-		printf("Writing %d samples to write buffer.\n", num);
+		printf("Writing %d samples to write buffer.\n", sent);
 #endif
 		in = sdr->thread_write.in;
-		for (s = 0, ss = 0; s < num; s++) {
+		for (s = 0, ss = 0; s < sent; s++) {
 			sdr->thread_write.buffer[in++] = buff[ss++];
 			sdr->thread_write.buffer[in++] = buff[ss++];
 			in %= sdr->thread_write.buffer_size;
 		}
+		__sync_synchronize();
 		sdr->thread_write.in = in;
-		sent = num;
-	} else {
-#ifdef HAVE_UHD
-		if (tx_driver == 1)
-			sent = uhd_send(buff, num);
-#endif
-#ifdef HAVE_SOAPY
-		if (tx_driver == 2)
-			sent = soapy_send(buff, num);
-#endif
-#ifdef HAVE_RPITX
-		if (tx_driver == 3)
-			sent = rpitx_send(buff, num);
-#endif
-		if (sent < 0)
-			return sent;
 	}
-	
-	return sent;
+
+	/* the caller counts in DSP rate samples */
+	return num;
 }
 
 int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_level_db)
 {
 	sdr_t *sdr = (sdr_t *)inst;
-	float *buff = NULL;
-	int count = 0;
-	int c, s, ss;
-	int split_mode = sdr_config && sdr_config->split_mode;
+	float *lin = sdr->rx_lin;
+	int count = 0, avail, take, used = 0, out;
+	int c, s;
 
 	/* No RX in tx_only mode (e.g. rpitx). The sender loop of libmobile reads
 	 * on every turn, so this is expected: nothing received. */
 	if (sdr_config && sdr_config->tx_only)
 		return 0;
 
-	/* Use rx_oversample for RX operations in split mode (only for integer resampling) */
-	int rx_os = split_mode ? sdr->rx_oversample : sdr->oversample;
-	
-	/* Check if using polyphase resampler for RX */
-	int use_rx_polyphase = sdr->rx_use_polyphase;
-	static int rx_polyphase_logged = 0;
-
 	if (num > sdr->buffer_size) {
 		fprintf(stderr, "exceeding maximum size given by sdr->buffer_size, please fix!\n");
 		abort();
 	}
 
-	/* Check if channelizer is enabled:
-	 * - For channel-based mode: check sdr->chan[0].use_channelizer
-	 * - For radio mode (channels=0): check if chan_in_buff was allocated
-	 *   This enables decimation-only mode where SDR decimates but doesn't demodulate */
-	int use_channelizer = (channels && sdr->chan && sdr->chan[0].use_channelizer) ||
-	                      (!channels && sdr->chan_in_buff != NULL && rx_os > 1);
-	int input_num = num;
-
-	/* Calculate how many SDR samples we need to read:
-	 * - Channelizer: num * rx_os (integer decimation)
-	 * - Polyphase: num * ratio (arbitrary decimation)
-	 * - Legacy integer: num * rx_os (but we skip samples)
-	 */
-	if (use_channelizer) {
-		input_num = num * rx_os;
-		if (sdr->chan_in_buff)
-			buff = (float *)sdr->chan_in_buff;
-		else {
-			fprintf(stderr, "Channelizer buffer not allocated! Bug?\n");
-			abort();
-		}
-	} else if (use_rx_polyphase) {
-		/* Polyphase: need to read enough SDR samples to produce 'num' output samples */
-		input_num = polyphase_input_num(&sdr->rx_polyphase, num) + 4;
-		if (channels) {
-			buff = sdr->modbuff;
-		} else {
-			buff = (float *)samples;
-		}
-	} else {
-		if (channels) {
-			buff = sdr->modbuff;
-		} else {
-			buff = (float *)samples;
-		}
+	/* SDR rate IQ from the ring, as much as num DSP samples can need */
+	__sync_synchronize();
+	avail = ((sdr->thread_read.in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size) / 2;
+	take = (avail < sdr->rx_max_in) ? avail : sdr->rx_max_in;
+	out = sdr->thread_read.out;
+	for (s = 0; s < take; s++) {
+		lin[2 * s] = sdr->thread_read.buffer[out];
+		lin[2 * s + 1] = sdr->thread_read.buffer[out + 1];
+		out = (out + 2) % sdr->thread_read.buffer_size;
 	}
-
-	if (sdr->threads) {
-		/* load data from SDR out of ring buffer */
-		int fill, out;
-		volatile int current_in;
-
-		__sync_synchronize();  /* Memory barrier to ensure we see latest writes */
-		current_in = sdr->thread_read.in;
-		fill = (current_in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size;
-
-		int available_sdr_samples = fill / 2;  /* SDR-rate samples available in buffer */
-
-		if (use_channelizer) {
-			int available_dsp_samples = available_sdr_samples / rx_os;
-			if (available_dsp_samples < num)
-				num = available_dsp_samples;
-			input_num = num * rx_os;
-		} else if (use_rx_polyphase) {
-			/* Don't clamp num — the resampler tracks exact in_count/out_count
-			 * state and will produce the correct number of outputs.
-			 * Just read what we need, or all available if less. */
-			int needed_sdr = polyphase_input_num(&sdr->rx_polyphase, num);
-			input_num = (needed_sdr < available_sdr_samples) ? needed_sdr : available_sdr_samples;
-			/* num stays at the full requested amount — passed as output_max
-			 * to the resampler, which will produce fewer if input is short */
-		} else {
-			int available_dsp_samples = available_sdr_samples / rx_os;
-			if (available_dsp_samples < num)
-				num = available_dsp_samples;
-		}
-
-#ifdef DEBUG_BUFFER
-		printf("Reading %d samples from read buffer.\n", num);
-#endif
-		out = sdr->thread_read.out;
-		
-		/* Reading loop - determine how many samples to read from ring buffer */
-		int read_count;
-		if (use_channelizer) {
-			read_count = input_num;  /* Channelizer: read all oversampled samples */
-		} else if (use_rx_polyphase) {
-			read_count = input_num;  /* Polyphase: read all available SDR samples */
-		} else {
-			read_count = num;  /* Legacy: read only what we need (skip samples) */
-		}
-		
-		/* Temporary buffer for polyphase input */
-		sample_t *poly_in_i = NULL, *poly_in_q = NULL;
-		if (use_rx_polyphase && sdr->rx_poly_i && sdr->rx_poly_q) {
-			poly_in_i = sdr->rx_poly_i;
-			poly_in_q = sdr->rx_poly_q;
-		}
-		
-		for (s = 0, ss = 0; s < read_count; s++) {
-			if (use_rx_polyphase && poly_in_i && poly_in_q) {
-				/* Store de-interleaved for polyphase processing */
-				poly_in_i[s] = sdr->thread_read.buffer[out];
-				poly_in_q[s] = sdr->thread_read.buffer[out + 1];
-				out = (out + 2) % sdr->thread_read.buffer_size;
-			} else if (use_channelizer) {
-				/* Channelizer: contiguous read into buff */
-				buff[ss++] = sdr->thread_read.buffer[out];
-				buff[ss++] = sdr->thread_read.buffer[out + 1];
-				out = (out + 2) % sdr->thread_read.buffer_size;
-			} else {
-				/* Legacy: read with skipping */
-				buff[ss++] = sdr->thread_read.buffer[out];
-				buff[ss++] = sdr->thread_read.buffer[out + 1];
-				out = (out + 2 * rx_os) % sdr->thread_read.buffer_size;
-			}
-		}
-		/* Only update out if we actually read something */
-		if (read_count > 0) {
-			sdr->thread_read.out = out;
-		}
-		
-		/* Apply polyphase resampling if needed */
-		if (use_rx_polyphase && poly_in_i && poly_in_q) {
-			/* DEBUG: measure IQ levels BEFORE polyphase resampling */
-			{
-				static int pre_dbg_count = 0;
-				static double pre_pwr_sum = 0.0;
-				static double pre_peak = 0.0;
-				static int pre_samples = 0;
-				for (s = 0; s < read_count; s++) {
-					double pwr = (double)poly_in_i[s] * poly_in_i[s]
-					           + (double)poly_in_q[s] * poly_in_q[s];
-					pre_pwr_sum += pwr;
-					double mag = sqrt(pwr);
-					if (mag > pre_peak) pre_peak = mag;
-					pre_samples++;
-				}
-				pre_dbg_count++;
-				if (pre_dbg_count >= 333) {
-					double rms = sqrt(pre_pwr_sum / pre_samples);
-					LOGP(DSDR, LOGL_NOTICE,
-					     "IQ_BEFORE_POLY: samples=%d rms=%.6f(%.1fdBFS) peak=%.6f(%.1fdBFS) pwr=%.1fdBFS\n",
-					     pre_samples, rms, 20.0*log10(rms+1e-20),
-					     pre_peak, 20.0*log10(pre_peak+1e-20),
-					     10.0*log10(pre_pwr_sum/pre_samples+1e-20));
-					pre_pwr_sum = 0.0;
-					pre_peak = 0.0;
-					pre_samples = 0;
-					pre_dbg_count = 0;
-				}
-			}
-
-			if (!rx_polyphase_logged) {
-				LOGP(DSDR, LOGL_NOTICE, "RX POLYPHASE DOWNSAMPLE: SDR %d Hz -> DSP %d Hz (ratio=%.6f)\n",
-				     sdr_config->rx_samplerate, sdr->samplerate,
-				     (double)sdr_config->rx_samplerate / (double)sdr->samplerate);
-				rx_polyphase_logged = 1;
-			}
-			
-			/* Resample I and Q through polyphase filter
-			 * Use second half of rx_poly buffers for output */
-			int max_in = polyphase_input_num(&sdr->rx_polyphase, sdr->buffer_size) + 16;
-			sample_t *out_i = sdr->rx_poly_i + max_in;
-			sample_t *out_q = sdr->rx_poly_q + max_in;
-			
-			int out_count = polyphase_resample_iq(&sdr->rx_polyphase,
-			                                      poly_in_i, poly_in_q, read_count,
-			                                      out_i, out_q, num);
-			
-			/* Diagnostics: accumulate per-second stats */
-			{
-				static int rd_calls = 0, rd_zero = 0;
-				static int rd_total_sdr_in = 0, rd_total_dsp_out = 0;
-				static int rd_total_fill = 0;
-				static double rd_timer = 0;
-				rd_calls++;
-				if (read_count == 0) rd_zero++;
-				rd_total_sdr_in += read_count;
-				rd_total_dsp_out += out_count;
-				rd_total_fill += available_sdr_samples;
-				if (rd_timer == 0.0)
-					rd_timer = get_time();
-				double now = get_time();
-				if (now - rd_timer >= 1.0) {
-					LOGP(DSDR, LOGL_NOTICE, "RX POLY 1s: calls=%d zero=%d | sdr_in=%d dsp_out=%d (expect %d) | avg_fill=%.0f\n",
-					     rd_calls, rd_zero,
-					     rd_total_sdr_in, rd_total_dsp_out, sdr->samplerate,
-					     (double)rd_total_fill / rd_calls);
-					rd_calls = 0;
-					rd_zero = 0;
-					rd_total_sdr_in = 0;
-					rd_total_dsp_out = 0;
-					rd_total_fill = 0;
-					rd_timer = now;
-				}
-			}
-			
-			/* Interleave I/Q into output buffer */
-			for (s = 0; s < out_count; s++) {
-				buff[s * 2] = out_i[s];
-				buff[s * 2 + 1] = out_q[s];
-			}
-			count = out_count;
-
-			/* DEBUG: measure IQ levels AFTER polyphase resampling */
-			{
-				static int post_dbg_count = 0;
-				static double post_pwr_sum = 0.0;
-				static double post_peak = 0.0;
-				static int post_samples = 0;
-				for (s = 0; s < out_count; s++) {
-					double pwr = (double)buff[s*2] * buff[s*2]
-					           + (double)buff[s*2+1] * buff[s*2+1];
-					post_pwr_sum += pwr;
-					double mag = sqrt(pwr);
-					if (mag > post_peak) post_peak = mag;
-					post_samples++;
-				}
-				post_dbg_count++;
-				if (post_dbg_count >= 333) {
-					double rms = sqrt(post_pwr_sum / post_samples);
-					LOGP(DSDR, LOGL_NOTICE,
-					     "IQ_AFTER_POLY: samples=%d rms=%.6f(%.1fdBFS) peak=%.6f(%.1fdBFS) pwr=%.1fdBFS\n",
-					     post_samples, rms, 20.0*log10(rms+1e-20),
-					     post_peak, 20.0*log10(post_peak+1e-20),
-					     10.0*log10(post_pwr_sum/post_samples+1e-20));
-					post_pwr_sum = 0.0;
-					post_peak = 0.0;
-					post_samples = 0;
-					post_dbg_count = 0;
-				}
-			}
-		} else {
-			count = num; /* Output Sample Count */
-		}
-	} else {
-		/* Non-threaded path: read directly from SDR */
-		int direct_read_count = input_num;
-		
-		/* For polyphase, we need a temporary buffer for SDR samples */
-		float *sdr_buff = buff;
-		if (use_rx_polyphase) {
-			/* Use pre-allocated buffer for SDR rate samples */
-			sdr_buff = sdr->rx_poly_sdr_buff;
-		}
-		
-#ifdef HAVE_UHD
-		if (rx_driver == 1)
-			count = uhd_receive(sdr_buff, direct_read_count);
-#endif
-#ifdef HAVE_SOAPY
-		if (rx_driver == 2)
-			count = soapy_receive(sdr_buff, direct_read_count);
-#endif
-		if (bias_count >= 0)
-			sdr_bias(sdr_buff, count);
-		
-		if (count <= 0)
-			return count;
-		
-		/* Apply resampling based on mode */
-		if (use_channelizer) {
-			/* Channelizer handles decimation internally */
-			count /= rx_os;
-		} else if (use_rx_polyphase) {
-			/* Polyphase downsample */
-			if (!rx_polyphase_logged) {
-				LOGP(DSDR, LOGL_NOTICE, "RX POLYPHASE DOWNSAMPLE (direct): SDR %d Hz -> DSP %d Hz\n",
-				     sdr_config->rx_samplerate, sdr->samplerate);
-				rx_polyphase_logged = 1;
-			}
-			
-			/* Use pre-allocated buffers for de-interleaved I/Q
-			 * rx_poly_i/q layout: [input: max_in samples][output: buffer_size samples] */
-			sample_t *in_i = sdr->rx_poly_i;
-			sample_t *in_q = sdr->rx_poly_q;
-			sample_t *out_i = sdr->rx_poly_i + sdr->rx_poly_max_in;
-			sample_t *out_q = sdr->rx_poly_q + sdr->rx_poly_max_in;
-			
-			/* De-interleave SDR samples */
-			for (s = 0; s < count; s++) {
-				in_i[s] = sdr_buff[s * 2];
-				in_q[s] = sdr_buff[s * 2 + 1];
-			}
-			
-			/* Resample */
-			int out_count = polyphase_resample_iq(&sdr->rx_polyphase,
-			                                      in_i, in_q, count,
-			                                      out_i, out_q, num);
-			
-			/* Interleave into output buffer */
-			for (s = 0; s < out_count; s++) {
-				buff[s * 2] = out_i[s];
-				buff[s * 2 + 1] = out_q[s];
-			}
-			count = out_count;
-		}
-		/* else: legacy integer path - samples already in buff at correct rate */
-	}
-
-	if (sdr_rx_overflow) {
-		LOGP(DSDR, LOGL_ERROR, "SDR RX overflow!\n");
-		sdr_rx_overflow = 0;
-	}
-
-	/* IQ level monitoring via status objects (uses decimated data for RMS) */
-	{
-		int iq_total = use_channelizer ? count * rx_os : count;
-		sdr_status_rx_accumulate(buff, iq_total);
-		sdr_status_snapshot(get_time());
-		/* Update spectral measurements at higher rate (10Hz) for signal meter */
-		sdr_spectral_snapshot(get_time());
-	}
-
-	if (sdr->wave_rx_rec.fp) {
-		// If channelizer, buff is high-speed. We probably want to record decimated output?
-		// Existing logic records 'buff'. If using channelizer, 'buff' is chan_in_buff (wideband).
-		// Maybe useful to record wideband? Or skip?
-		// Let's keep recording whatever 'buff' has (wideband in channelizer case).
-		// But wave_write expects 'count' samples. 'buff' has count * oversample.
-		// Issue: recording wideband with 'count' length logic is wrong.
-		// Fixing this requires more logic. I'll disable wave rec for channelizer or record proper length.
-		// For now, I'll stick to original flow but be aware of rate mismatch.
-		
-		int rec_count = use_channelizer ? count * rx_os : count;
-		sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
-		// wavespl0 size is buffer_size. rec_count might be buffer_size * oversample. Overflow!
-		// We cannot record wideband easily.
-		// I will SKIP wave recording in channelizer mode for now to prevent crash.
-		if (!use_channelizer) {
-			for (s = 0, ss = 0; s < rec_count; s++) {
-				spl_list[0][s] = buff[ss++];
-				spl_list[1][s] = buff[ss++];
-			}
-			wave_write(&sdr->wave_rx_rec, spl_list, rec_count);
-		}
-	}
-	if (sdr->wave_rx_play.fp) {
-		// Same issue as recording. Skip playback for channelizer mode.
-		if (!use_channelizer) {
-			sample_t *spl_list[2] = { sdr->wavespl0, sdr->wavespl1 };
-			wave_read(&sdr->wave_rx_play, spl_list, count);
-			for (s = 0, ss = 0; s < count; s++) {
-				buff[ss++] = spl_list[0][s];
-				buff[ss++] = spl_list[1][s];
-			}
-		}
-	}
-
-	if (use_channelizer) {
-		// Channelizer Processing
-		int final_count = 0;
-		
-		if (channels == 0) {
-			/* Radio mode: decimate IQ data using the radio's channelizer.
-			 * The radio does its own FM demodulation, it just needs decimated IQ.
-			 * Use the halfband channelizer for proper anti-alias filtering. */
-			int ch_in = count * rx_os;
-			
-			/* Use the radio channelizer (initialized in sdr_open when channels=0 && use_channelizer) */
-			if (sdr->radio_channelizer_init) {
-				int ch_out = channelizer_process(&sdr->radio_channelizer, buff, ch_in, 
-				                                  sdr->radio_ch_I, sdr->radio_ch_Q);
-				
-				/* Interleave I/Q back to output buffer */
-				float *out = (float *)samples;
-				for (s = 0; s < ch_out; s++) {
-					out[s * 2] = (float)sdr->radio_ch_I[s];
-					out[s * 2 + 1] = (float)sdr->radio_ch_Q[s];
-				}
-				
-				final_count = ch_out;
-			} else {
-				/* Fallback: simple decimation (not ideal but works) */
-				int ch_out = count;
-				float *out = (float *)samples;
-				for (s = 0; s < ch_out; s++) {
-					out[s * 2] = buff[s * rx_os * 2];
-					out[s * 2 + 1] = buff[s * rx_os * 2 + 1];
-				}
-				final_count = ch_out;
-			}
-			
-			return final_count;
-		}
-		
-		for (c = 0; c < channels; c++) {
-			// Process High-Rate 'buff' -> Decimated 'ch_I'/'ch_Q'
-			// buff is sdr->chan_in_buff (float*).
-			// count is Output samples. Input samples = count * oversample.
-			// channelizer_process takes Input Count.
-			int ch_in = count * rx_os;
-			int ch_out = channelizer_process(&sdr->chan[c].channelizer, (float*)buff, ch_in, sdr->chan[c].ch_I, sdr->chan[c].ch_Q);
-			
-			// Use actual channelizer output count
-			if (ch_out != count) {
-				static int ch_mismatch_logged = 0;
-				if (ch_mismatch_logged < 10) {
-					LOGP(DSDR, LOGL_DEBUG, "Channelizer output mismatch: expected %d, got %d (in=%d, rx_os=%d)\n", 
-					     count, ch_out, ch_in, rx_os);
-					ch_mismatch_logged++;
-				}
-			}
-			int ch_count = (ch_out < count) ? ch_out : count;
-			final_count = ch_count;  /* Track for return */
-			
-			// Interleave doubles to floats for FM demod
-			// FM Demod expects interleaved float baseband.
-			for (s = 0; s < ch_count; s++) {
-				sdr->chan[c].ch_iq_float[2 * s] = (float)sdr->chan[c].ch_I[s];
-				sdr->chan[c].ch_iq_float[2 * s + 1] = (float)sdr->chan[c].ch_Q[s];
-			}
-			
-			// Demodulate Decimated, Interleaved Buffer
-			// This logic seamlessly supports both AM (Narrow/Wide) and FM (Narrow/Wide)
-			// by directing the channelized component to the appropriate demodulator.
-			if (sdr->chan[c].am)
-				am_demodulate_complex(&sdr->chan[c].am_demod, samples[c], ch_count, sdr->chan[c].ch_iq_float, sdr->modbuff_I, sdr->modbuff_Q, sdr->modbuff_carrier);
-			else
-				fm_demodulate_complex(&sdr->chan[c].fm_demod, samples[c], ch_count, sdr->chan[c].ch_iq_float, sdr->modbuff_I, sdr->modbuff_Q);
-				
-			// Measurements (copied from legacy)
-			sender_t *sender = get_sender_by_empfangsfrequenz(sdr->chan[c].rx_frequency);
-			if (!sender || !ch_count) continue;
-			
-			double min, max, avg = 0.0;
-			for (s = 0; s < ch_count; s++) {
-				avg += sdr->modbuff_I[s] * sdr->modbuff_I[s] + sdr->modbuff_Q[s] * sdr->modbuff_Q[s];
-			}
-			avg = sqrt(avg /(double)ch_count);
-			avg = log10(avg) * 20;
-			display_measurements_update(sdr->chan[c].dmp_rf_level, avg, 0.0);
-			if (rf_level_db) rf_level_db[c] = avg;
-			
-			if (!sdr->chan[c].am) {
-				min = max = avg = 0.0;
-				for (s = 0; s < ch_count; s++) {
-					avg += samples[c][s];
-					if (s == 0 || samples[c][s] > max) max = samples[c][s];
-					if (s == 0 || samples[c][s] < min) min = samples[c][s];
-				}
-				avg /= (double)ch_count;
-				display_measurements_update(sdr->chan[c].dmp_freq_offset, avg, 0.0);
-				display_measurements_update(sdr->chan[c].dmp_deviation, max - min, 0.0);
-
-				/* Update per-channel RX status */
-				sdr_status_rx_chan_update(c, rf_level_db ? rf_level_db[c] : avg,
-							 avg, max - min, sdr->chan[c].rx_frequency);
-			}
-		}
-		
-		return final_count;  /* Return actual samples processed */
-	}
-
-	display_iq(buff, count);
-	display_spectrum(buff, count);
 
 	if (channels) {
+		/* channel 0 takes the input needed for num samples, the others the same */
 		for (c = 0; c < channels; c++) {
+			sdr_chan_t *ch = &sdr->chan[c];
+			int n, u;
+
+			n = channelizer_rx_process(&ch->rx_ch, lin, c ? used : take, num, sdr->ch_i, sdr->ch_q, &u);
+			if (c == 0) {
+				used = u;
+				count = n;
+			} else if (n != count)
+				LOGP(DSDR, LOGL_ERROR, "RX channelizers out of step (%d / %d samples), please fix!\n", n, count);
+			for (s = 0; s < n; s++) {
+				sdr->modbuff[2 * s] = sdr->ch_i[s];
+				sdr->modbuff[2 * s + 1] = sdr->ch_q[s];
+			}
 			if (rf_level_db)
 				rf_level_db[c] = NAN;
-			if (sdr->chan[c].am)
-				am_demodulate_complex(&sdr->chan[c].am_demod, samples[c], count, buff, sdr->modbuff_I, sdr->modbuff_Q, sdr->modbuff_carrier);
+			if (ch->am)
+				am_demodulate_complex(&ch->am_demod, samples[c], n, sdr->modbuff, sdr->modbuff_I, sdr->modbuff_Q, sdr->modbuff_carrier);
 			else
-				fm_demodulate_complex(&sdr->chan[c].fm_demod, samples[c], count, buff, sdr->modbuff_I, sdr->modbuff_Q);
-			sender_t *sender = get_sender_by_empfangsfrequenz(sdr->chan[c].rx_frequency);
-			if (!sender || !count)
+				fm_demodulate_complex(&ch->fm_demod, samples[c], n, sdr->modbuff, sdr->modbuff_I, sdr->modbuff_Q);
+			sender_t *sender = get_sender_by_empfangsfrequenz(ch->rx_frequency);
+			if (!sender || !n)
 				continue;
 			double min, max, avg;
 			avg = 0.0;
-			for (s = 0; s < count; s++) {
+			for (s = 0; s < n; s++) {
 				/* average the square length of vector */
 				avg += sdr->modbuff_I[s] * sdr->modbuff_I[s] + sdr->modbuff_Q[s] * sdr->modbuff_Q[s];
 			}
-			avg = sqrt(avg /(double)count); /* RMS */
+			avg = sqrt(avg / (double)n); /* RMS */
 			avg = log10(avg) * 20;
-			display_measurements_update(sdr->chan[c].dmp_rf_level, avg, 0.0);
+			display_measurements_update(ch->dmp_rf_level, avg, 0.0);
 			if (rf_level_db)
 				rf_level_db[c] = avg;
-			if (!sdr->chan[c].am) {
+			if (!ch->am) {
 				min = 0.0;
 				max = 0.0;
 				avg = 0.0;
-				for (s = 0; s < count; s++) {
+				for (s = 0; s < n; s++) {
 					avg += samples[c][s];
 					if (s == 0 || samples[c][s] > max)
 						max = samples[c][s];
 					if (s == 0 || samples[c][s] < min)
 						min = samples[c][s];
 				}
-				avg /= (double)count;
-				display_measurements_update(sdr->chan[c].dmp_freq_offset, avg / 1000.0, 0.0);
+				avg /= (double)n;
+				display_measurements_update(ch->dmp_freq_offset, avg / 1000.0, 0.0);
 				/* use half min and max, because we want the deviation above/below (+-) center frequency. */
-				display_measurements_update(sdr->chan[c].dmp_deviation, min / 2.0 / 1000.0, max / 2.0 / 1000.0);
-
-				/* Update per-channel RX status */
-				sdr_status_rx_chan_update(c, rf_level_db ? rf_level_db[c] : avg,
-							 avg, max - min, sdr->chan[c].rx_frequency);
-				
-				/* DEBUG: FM-DEMOD level diagnostics (disabled - uncomment to enable)
-				 * Logs: FM-DEMOD ch%d: avg/peak Hz deviation and normalized dB levels
-				 * Measures FM demodulator output per channel every second */
-#if 0
-				static int fm_diag_count[16] = {0};
-				static double fm_diag_sum[16] = {0};
-				static double fm_diag_max[16] = {0};
-				
-				if (c < 16) {
-					for (s = 0; s < count; s++) {
-						double abs_dev = fabs(samples[c][s]);
-						fm_diag_sum[c] += abs_dev;
-						if (abs_dev > fm_diag_max[c]) fm_diag_max[c] = abs_dev;
-					}
-					fm_diag_count[c] += count;
-					
-					if (fm_diag_count[c] >= sdr->samplerate) {
-						double fm_avg_hz = fm_diag_sum[c] / fm_diag_count[c];
-						double fm_max_hz = fm_diag_max[c];
-						LOGP(DSDR, LOGL_DEBUG, "FM-DEMOD ch%d: avg=%.0fHz pk=%.0fHz (norm: avg=%.1fdB pk=%.1fdB)\n",
-							c, fm_avg_hz, fm_max_hz,
-							20.0 * log10(fm_avg_hz / 2900.0 + 0.001),
-							20.0 * log10(fm_max_hz / 2900.0 + 0.001));
-						fm_diag_count[c] = 0;
-						fm_diag_sum[c] = 0;
-						fm_diag_max[c] = 0;
-					}
-				}
-#endif
+				display_measurements_update(ch->dmp_deviation, min / 2.0 / 1000.0, max / 2.0 / 1000.0);
+				sdr_status_rx_chan_update(c, rf_level_db ? rf_level_db[c] : avg, avg, max - min, ch->rx_frequency);
 			}
 		}
+	} else {
+		/* channels = 0: the whole band, interleaved float to the caller */
+		float *o = (float *)samples;
+
+		count = channelizer_rx_process(&sdr->band_rx, lin, take, num, sdr->ch_i, sdr->ch_q, &used);
+		for (s = 0; s < count; s++) {
+			o[2 * s] = sdr->ch_i[s];
+			o[2 * s + 1] = sdr->ch_q[s];
+		}
 	}
+
+	/* the ring advances by what the channelizers took */
+	sdr->thread_read.out = (sdr->thread_read.out + 2 * used) % sdr->thread_read.buffer_size;
+
+	if (sdr_rx_overflow) {
+		LOGP(DSDR, LOGL_ERROR, "SDR RX overflow!\n");
+		sdr_rx_overflow = 0;
+	}
+
+	/* IQ level, status, IQ and spectrum display of the SDR rate IQ */
+	sdr_status_rx_accumulate(lin, used);
+	sdr_status_snapshot(get_time());
+	sdr_spectral_snapshot(get_time());
+	display_iq(lin, used);
+	display_spectrum(lin, used);
 
 	return count;
 }
@@ -2554,11 +1680,13 @@ int sdr_get_tosend(void *inst, int buffer_size)
 {
 	sdr_t *sdr = (sdr_t *)inst;
 	int count = 0;
+	double ratio;	/* DSP samples per SDR sample */
 
 	/* RX-only: nothing to send. The sender loop asks every round, this is not an error (it logged
 	 * an error here every millisecond, 12 MB of log per minute). */
 	if (sdr_config && sdr_config->rx_only)
 		return 0;
+	ratio = (double)sdr->samplerate / sdr->tx_rate;
 
 	/* Device paced: keep the write ring filled to buffer_size. The write
 	 * thread drains it through the blocking send(), i.e. at the device
@@ -2572,39 +1700,35 @@ int sdr_get_tosend(void *inst, int buffer_size)
 			     buffer_size, 1000.0 * buffer_size / sdr->samplerate);
 			logged = 1;
 		}
-		count = buffer_size - fill / 2;
+		/* the ring holds SDR rate samples */
+		count = buffer_size - (int)ceil(fill / 2 * ratio);
 		return (count > 0) ? count : 0;
 	}
 
-	int tx_os = sdr_config->split_mode ? sdr->tx_oversample : sdr->oversample;
-
 #ifdef HAVE_UHD
 	if (tx_driver == 1)
-		count = uhd_get_tosend(buffer_size * tx_os);
+		count = uhd_get_tosend((int)(buffer_size / ratio));
 #endif
 #ifdef HAVE_SOAPY
 	if (tx_driver == 2)
-		count = soapy_get_tosend(buffer_size * tx_os);
+		count = soapy_get_tosend((int)(buffer_size / ratio));
 #endif
 #ifdef HAVE_RPITX
 	if (tx_driver == 3)
-		count = rpitx_get_tosend(buffer_size * tx_os);
+		count = rpitx_get_tosend((int)(buffer_size / ratio));
 #endif
 	if (count < 0)
 		return count;
-	/* rounding down, so we never overfill */
-	count /= tx_os;
+	/* subtract what is in the ring, not sent to the SDR yet */
+	{
+		int fill = (sdr->thread_write.in - sdr->thread_write.out + sdr->thread_write.buffer_size) % sdr->thread_write.buffer_size;
 
-	if (sdr->threads) {
-		/* subtract what we have in write buffer, because this is not jet sent to the SDR */
-		int fill;
-
-		fill = (sdr->thread_write.in - sdr->thread_write.out + sdr->thread_write.buffer_size) % sdr->thread_write.buffer_size;
 		count -= fill / 2;
-		if (count < 0)
-			count = 0;
 	}
-
+	/* SDR rate -> DSP rate, rounding down, so we never overfill */
+	count = (int)floor(count * ratio);
+	if (count < 0)
+		count = 0;
 	return count;
 }
 
