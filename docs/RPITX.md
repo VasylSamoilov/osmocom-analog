@@ -285,5 +285,11 @@ interactively (in tmux) to dial from the console: type the number, then `d`.
 Under `sudo`, `~` is root's home: give log files with an absolute path.
 
 Three channels: not supported (refused). A simulation of the phase of three
-summed channels gives 24 / 22 / 18 dB SINAD at best (NMT channels n, n+3, n+5)
-before the Pi's own limit, which already holds two channels to about 25 dB.
+summed channels gives at best 27 / 25 / 18 dB SINAD (NMT channels 1, 3, 4,
+levels 1 / 0.7 / 0.5; with equal spacing the products of the outer channels
+land on the middle one), before the Pi's own limit, which already holds two
+channels to about 25 dB. Tried on a Pi 4 (2026-11-23, test build, CC + TC +
+TC, 192 kS/s; channels 1, 4, 6 need more than 75 % of 192 kS/s): no clock on
+the phones, the call on the weakest channel failed (supervisory quality 39 %),
+the one on the middle channel was "noisy, at the limit" and lost its
+supervisory signal after a few seconds. Not usable on a Pi 4.
