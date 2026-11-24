@@ -215,6 +215,14 @@ the client ends within 1 s when the backend stops.
 
 ## Open
 
+- The backend does not drain its raw SDR rate ring yet: ADC clipping / DC
+  status and the IQ / spectrum displays (rule 5) are not fed there.
+- TX through a real program on the backend: verified at the engine level
+  only (test_sdr_backend); sdr.c has no device-less path, the first run is
+  on the B210 (cable loopback against the in-process numbers above).
+- The backend's centres are the operator's: a client warns when a
+  channel covers one (DC, LO leakage).
+
 - Paging channel (NMT, ...): a second TX channel of the same program that
   carries the switched channel; registered as an ordinary TX channel.
 - rpitx stays outside (makes its own carrier).

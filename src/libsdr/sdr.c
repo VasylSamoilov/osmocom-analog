@@ -317,6 +317,8 @@ static int sdr_open_backend(sdr_t *sdr, double *tx_frequency, double *rx_frequen
 			return rc;
 		sdr->chan[c].tx_offset = tx_f[c] - sdr->client.tx_centre;
 		sdr->chan[c].tx_init = 1;
+		if (fabs(sdr->chan[c].tx_offset) < bandwidth / 2.0)
+			LOGP(DSDR, LOGL_NOTICE, "TX %s %d (%.6f MHz) covers the backend's TX centre (LO leakage): choose the backend's centre off the channels.\n", (c < channels) ? "channel" : "paging channel", c, tx_f[c] / 1e6);
 		LOGP(DSDR, LOGL_INFO, "TX %s %d: %.6f MHz, offset %+.1f kHz, on the backend\n", (c < channels) ? "channel" : "paging channel", c, tx_f[c] / 1e6, sdr->chan[c].tx_offset / 1e3);
 	}
 	for (c = 0; c < nrx; c++) {
@@ -333,6 +335,10 @@ static int sdr_open_backend(sdr_t *sdr, double *tx_frequency, double *rx_frequen
 		sdr->chan[c].rx_offset = rx_f[c] - sdr->client.rx_centre;
 		sdr->chan[c].rx_init = 1;
 		LOGP(DSDR, LOGL_INFO, "RX channel %d: %.6f MHz, offset %+.1f kHz, on the backend\n", c, rx_f[c] / 1e6, sdr->chan[c].rx_offset / 1e3);
+		/* the backend's centre is its operator's choice: on it sit the
+		 * receiver's DC and LO leakage */
+		if (fabs(sdr->chan[c].rx_offset) < bandwidth / 2.0)
+			LOGP(DSDR, LOGL_NOTICE, "RX channel %d (%.6f MHz) covers the backend's RX centre (DC, LO leakage): choose the backend's centre off the channels.\n", c, rx_f[c] / 1e6);
 		/* measurements display, as with a device */
 		sender = get_sender_by_empfangsfrequenz(rx_f[c]);
 		if (!sender)

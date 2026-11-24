@@ -53,6 +53,7 @@ src/dcf77/dcf77
 src/mate/matesimulator
 src/mobitex/mobitex
 src/osmocalibrate/osmocalibrate
+src/sdrbackend/osmo-sdr-backend
 extra/cnetz_memory_card_generator
 
 # Test executables
