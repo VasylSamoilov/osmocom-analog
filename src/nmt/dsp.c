@@ -730,6 +730,8 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 		}
 		/* Echo suppressor RX processing (near-end audio after DSP processing) */
 		call_echo_suppressor_rx(nmt->trans->callref, samples, len);
+		/* DTMF RX: the touch tones of the phone in the call (after the echo suppressor), as AMPS */
+		call_dtmf_rx(nmt->trans->callref, samples, len);
 		if (nmt->dsp_mode == DSP_MODE_DTMF) {
 			/* encode and fill with silence after finish */
 			count = dtmf_encode(&nmt->dtmf, samples, len);
