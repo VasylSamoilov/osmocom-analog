@@ -28,35 +28,59 @@ const char *sdr_engine_error(void)
  * ring of rows, single producer / single consumer
  */
 
-int sdr_ring_init(sdr_ring_t *r, int width, int rows)
+void sdr_ring_set(sdr_ring_t *r, float *buf, int width, int rows, sdr_ring_ctl_t *ctl)
 {
-	memset(r, 0, sizeof(*r));
-	if (width < 1 || rows < 2)
-		return -EINVAL;
-	r->buf = calloc((size_t)width * rows, sizeof(float));
-	if (!r->buf)
-		return -ENOMEM;
+	r->buf = buf;
 	r->width = width;
 	r->rows = rows;
-	return 0;
-}
-
-void sdr_ring_exit(sdr_ring_t *r)
-{
-	free(r->buf);
-	memset(r, 0, sizeof(*r));
+	r->ctl = ctl;
 }
 
 int sdr_ring_fill(const sdr_ring_t *r)
 {
-	int in = __atomic_load_n(&r->in, __ATOMIC_ACQUIRE), out = __atomic_load_n(&r->out, __ATOMIC_ACQUIRE);
+	int in = __atomic_load_n(&r->ctl->in, __ATOMIC_ACQUIRE), out = __atomic_load_n(&r->ctl->out, __ATOMIC_ACQUIRE);
 
+	/* the other side may write anything (shared memory) */
+	if (in < 0 || in >= r->rows || out < 0 || out >= r->rows)
+		return -1;
 	return (in - out + r->rows) % r->rows;
 }
 
 int sdr_ring_space(const sdr_ring_t *r)
 {
-	return r->rows - 1 - sdr_ring_fill(r);
+	int fill = sdr_ring_fill(r);
+
+	return (fill < 0) ? -1 : r->rows - 1 - fill;
+}
+
+/*
+ * views
+ */
+
+int sdr_engine_rows(int dsp_rate, int ring_ms)
+{
+	return ring_ms * dsp_rate / 1000 + 2;
+}
+
+/* the header rounded up, so the rows are aligned */
+static size_t view_header(void)
+{
+	return (sizeof(sdr_view_t) + 63) & ~(size_t)63;
+}
+
+size_t sdr_view_size(int n_rx, int n_tx, int rows)
+{
+	return view_header() + (size_t)rows * 2 * (n_rx + n_tx) * sizeof(float);
+}
+
+/* the rings on a view whose sizes are known (checked) */
+static void view_rings(sdr_view_t *v, int n_rx, int n_tx, int rows, sdr_ring_t *rx, sdr_ring_t *tx)
+{
+	float *rows_rx = (float *)((char *)v + view_header());
+	float *rows_tx = rows_rx + (size_t)rows * 2 * n_rx;
+
+	sdr_ring_set(rx, rows_rx, 2 * (n_rx ? n_rx : 1), rows, &v->rx_ctl);
+	sdr_ring_set(tx, rows_tx, 2 * (n_tx ? n_tx : 1), rows, &v->tx_ctl);
 }
 
 /*
@@ -182,8 +206,8 @@ static void group_free(sdr_group_t *g)
 			pfb_chan_exit(&g->tx[c]);
 		free(g->tx);
 	}
-	sdr_ring_exit(&g->rx_ring);
-	sdr_ring_exit(&g->tx_ring);
+	if (g->view_own)
+		free(g->view);
 	free(g->tx_in_i);
 	free(g->tx_in_q);
 	free(g->rx_out_i);
@@ -230,8 +254,14 @@ int sdr_engine_tx_step(const sdr_engine_t *e)
 
 sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target)
 {
-	sdr_group_t *g;
+	return sdr_engine_group_add_mem(e, dsp_rate, n_rx, rx_offset, n_tx, tx_offset, ring_ms, tx_target, NULL, 0);
+}
+
+sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target, void *mem, size_t size)
+{
+	sdr_group_t *g = NULL;
 	int c, i, rc, rows;
+	size_t vsize;
 
 	error_text[0] = '\0';
 	if (n_rx < 0 || n_rx > SDR_ENGINE_MAX_CHAN || n_tx < 0 || n_tx > SDR_ENGINE_MAX_CHAN || (n_rx && !e->rx_rate) || (n_tx && !e->tx_rate)) {
@@ -258,7 +288,29 @@ sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const
 	g->dsp_rate = dsp_rate;
 	g->n_rx = n_rx;
 	g->n_tx = n_tx;
-	rows = ring_ms * dsp_rate / 1000 + 2;
+	rows = sdr_engine_rows(dsp_rate, ring_ms);
+	/* the view: rings and counters */
+	vsize = sdr_view_size(n_rx, n_tx, rows);
+	if (mem) {
+		if (size < vsize) {
+			snprintf(error_text, sizeof(error_text), "view of %zu bytes, %zu needed", size, vsize);
+			goto fail;
+		}
+		g->view = mem;
+		memset(g->view, 0, vsize);
+	} else {
+		g->view = calloc(1, vsize);
+		if (!g->view)
+			goto nomem;
+		g->view_own = 1;
+	}
+	g->view->size = vsize;
+	g->view->dsp_rate = dsp_rate;
+	g->view->n_rx = n_rx;
+	g->view->n_tx = n_tx;
+	g->view->rows = rows;
+	g->view->tx_scale = sdr_engine_tx_scale(e);
+	view_rings(g->view, n_rx, n_tx, rows, &g->rx_ring, &g->tx_ring);
 	if (n_rx) {
 		int fb = pfb_bin_rate(&e->bank_rx);
 
@@ -266,7 +318,7 @@ sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const
 		g->rx_max = (int)ceil((double)e->rx_frames_max * dsp_rate / fb) + 8;
 		g->rx_out_i = calloc((size_t)n_rx * g->rx_max, sizeof(sample_t));
 		g->rx_out_q = calloc((size_t)n_rx * g->rx_max, sizeof(sample_t));
-		if (!g->rx || !g->rx_out_i || !g->rx_out_q || sdr_ring_init(&g->rx_ring, 2 * n_rx, rows) < 0)
+		if (!g->rx || !g->rx_out_i || !g->rx_out_q)
 			goto nomem;
 		for (c = 0; c < n_rx; c++) {
 			g->rx_offset[c] = rx_offset[c];
@@ -285,7 +337,7 @@ sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const
 		g->tx_max = (int)ceil((double)e->tx_frames_max * dsp_rate / fb) + 8;
 		g->tx_in_i = calloc((size_t)n_tx * g->tx_max, sizeof(sample_t));
 		g->tx_in_q = calloc((size_t)n_tx * g->tx_max, sizeof(sample_t));
-		if (!g->tx || !g->tx_in_i || !g->tx_in_q || sdr_ring_init(&g->tx_ring, 2 * n_tx, rows) < 0)
+		if (!g->tx || !g->tx_in_i || !g->tx_in_q)
 			goto nomem;
 		for (c = 0; c < n_tx; c++) {
 			g->tx_offset[c] = tx_offset[c];
@@ -297,6 +349,14 @@ sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const
 			}
 		}
 		g->tx_target = (tx_target < rows - 1) ? tx_target : rows - 1;
+	}
+	g->view->tx_target = g->tx_target;
+	/* complete: the program side may attach (the magic last) */
+	g->view->version = SDR_VIEW_VERSION;
+	__atomic_store_n(&g->view->magic, SDR_VIEW_MAGIC, __ATOMIC_RELEASE);
+	if (sdr_port_attach(&g->port, g->view, vsize) < 0) {
+		snprintf(error_text, sizeof(error_text), "view not valid, please fix");
+		goto fail;
 	}
 
 	/* into the registry: the device threads adopt it at their next block */
@@ -439,7 +499,13 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 		}
 		/* rows into the ring, what does not fit is dropped */
 		space = sdr_ring_space(r);
-		in = r->in;
+		if (space < 0) {
+			/* the program wrote an index out of range: nothing goes in */
+			g->view->bad_index++;
+			g->view->rx_dropped += out;
+			continue;
+		}
+		in = r->ctl->in;
 		for (s = 0; s < out && s < space; s++) {
 			float *row = r->buf + (size_t)in * r->width;
 
@@ -450,10 +516,10 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 			if (++in == r->rows)
 				in = 0;
 		}
-		__atomic_store_n(&r->in, in, __ATOMIC_RELEASE);
-		g->rx_rows += s;
+		__atomic_store_n(&r->ctl->in, in, __ATOMIC_RELEASE);
+		g->view->rx_rows += s;
 		if (s < out)
-			g->rx_dropped += out - s;
+			g->view->rx_dropped += out - s;
 	}
 }
 
@@ -477,8 +543,13 @@ void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
 			fprintf(stderr, "sdr_engine_tx_produce: %d DSP samples needed, more than %d, please fix!\n", need, g->tx_max);
 			abort();
 		}
+		if (have < 0) {
+			/* the program wrote an index out of range: silence */
+			g->view->bad_index++;
+			have = 0;
+		}
 		take = (have < need) ? have : need;
-		out = r->out;
+		out = r->ctl->out;
 		for (s = 0; s < take; s++) {
 			const float *row = r->buf + (size_t)out * r->width;
 
@@ -489,16 +560,17 @@ void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
 			if (++out == r->rows)
 				out = 0;
 		}
-		__atomic_store_n(&r->out, out, __ATOMIC_RELEASE);
+		if (take)
+			__atomic_store_n(&r->ctl->out, out, __ATOMIC_RELEASE);
 		/* the program fell behind: silence for the missing rows, so the
 		 * tails stay continuous */
 		for (k = 0; k < g->n_tx; k++) {
 			memset(g->tx_in_i + k * g->tx_max + take, 0, (need - take) * sizeof(sample_t));
 			memset(g->tx_in_q + k * g->tx_max + take, 0, (need - take) * sizeof(sample_t));
 		}
-		g->tx_rows += take;
-		if (take < need && g->tx_rows)
-			g->tx_missing += need - take;
+		g->view->tx_rows += take;
+		if (take < need && g->view->tx_rows)
+			g->view->tx_missing += need - take;
 		for (k = 0; k < g->n_tx; k++, c++) {
 			pfb_chan_tx_pull(&g->tx[k], g->tx_in_i + k * g->tx_max, g->tx_in_q + k * g->tx_max, need, frames);
 			e->tx_ci[c] = g->tx[k].out_i;
@@ -513,51 +585,104 @@ void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
  * program side
  */
 
-int sdr_engine_group_read(sdr_group_t *g, sample_t **out_i, sample_t **out_q, int num)
+int sdr_port_attach(sdr_port_t *p, void *mem, size_t size)
 {
-	sdr_ring_t *r = &g->rx_ring;
-	int n = sdr_ring_fill(r), out = r->out, s, k;
+	sdr_view_t *v = mem;
 
+	memset(p, 0, sizeof(*p));
+	if (!v || size < sizeof(*v) || __atomic_load_n(&v->magic, __ATOMIC_ACQUIRE) != SDR_VIEW_MAGIC || v->version != SDR_VIEW_VERSION)
+		return -EINVAL;
+	if (v->n_rx < 0 || v->n_rx > SDR_ENGINE_MAX_CHAN || v->n_tx < 0 || v->n_tx > SDR_ENGINE_MAX_CHAN || v->rows < 2
+	 || v->tx_target < 0 || v->tx_target >= v->rows || v->size > size
+	 || sdr_view_size(v->n_rx, v->n_tx, v->rows) > v->size)
+		return -EINVAL;
+	p->view = v;
+	p->n_rx = v->n_rx;
+	p->n_tx = v->n_tx;
+	p->tx_target = v->tx_target;
+	view_rings(v, p->n_rx, p->n_tx, v->rows, &p->rx, &p->tx);
+	return 0;
+}
+
+int sdr_port_read(sdr_port_t *p, sample_t **out_i, sample_t **out_q, int num)
+{
+	sdr_ring_t *r = &p->rx;
+	int n, out, s, k;
+
+	if (!p->n_rx)
+		return 0;
+	n = sdr_ring_fill(r);
+	if (n < 0)
+		return 0;
+	out = r->ctl->out;
 	if (n > num)
 		n = num;
 	for (s = 0; s < n; s++) {
 		const float *row = r->buf + (size_t)out * r->width;
 
-		for (k = 0; k < g->n_rx; k++) {
+		for (k = 0; k < p->n_rx; k++) {
 			out_i[k][s] = row[2 * k];
 			out_q[k][s] = row[2 * k + 1];
 		}
 		if (++out == r->rows)
 			out = 0;
 	}
-	__atomic_store_n(&r->out, out, __ATOMIC_RELEASE);
+	__atomic_store_n(&r->ctl->out, out, __ATOMIC_RELEASE);
 	return n;
 }
 
-int sdr_engine_group_write(sdr_group_t *g, sample_t **in_i, sample_t **in_q, int num)
+int sdr_port_write(sdr_port_t *p, sample_t **in_i, sample_t **in_q, int num)
 {
-	sdr_ring_t *r = &g->tx_ring;
-	int n = sdr_ring_space(r), in = r->in, s, k;
+	sdr_ring_t *r = &p->tx;
+	int n, in, s, k;
 
+	if (!p->n_tx)
+		return 0;
+	n = sdr_ring_space(r);
+	if (n < 0)
+		return 0;
+	in = r->ctl->in;
 	if (n > num)
 		n = num;
 	for (s = 0; s < n; s++) {
 		float *row = r->buf + (size_t)in * r->width;
 
-		for (k = 0; k < g->n_tx; k++) {
+		for (k = 0; k < p->n_tx; k++) {
 			row[2 * k] = in_i[k][s];
 			row[2 * k + 1] = in_q[k][s];
 		}
 		if (++in == r->rows)
 			in = 0;
 	}
-	__atomic_store_n(&r->in, in, __ATOMIC_RELEASE);
+	__atomic_store_n(&r->ctl->in, in, __ATOMIC_RELEASE);
 	return n;
+}
+
+int sdr_port_tx_fill(sdr_port_t *p)
+{
+	int fill = p->n_tx ? sdr_ring_fill(&p->tx) : 0;
+
+	return (fill < 0) ? 0 : fill;
+}
+
+int sdr_port_tosend(sdr_port_t *p)
+{
+	int n = p->tx_target - sdr_port_tx_fill(p);
+
+	return (p->n_tx && n > 0) ? n : 0;
+}
+
+int sdr_engine_group_read(sdr_group_t *g, sample_t **out_i, sample_t **out_q, int num)
+{
+	return sdr_port_read(&g->port, out_i, out_q, num);
+}
+
+int sdr_engine_group_write(sdr_group_t *g, sample_t **in_i, sample_t **in_q, int num)
+{
+	return sdr_port_write(&g->port, in_i, in_q, num);
 }
 
 int sdr_engine_group_tosend(sdr_group_t *g)
 {
-	int n = g->tx_target - sdr_ring_fill(&g->tx_ring);
-
-	return (n > 0) ? n : 0;
+	return sdr_port_tosend(&g->port);
 }

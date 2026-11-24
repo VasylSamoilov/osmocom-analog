@@ -32,19 +32,54 @@
 #define _SDR_ENGINE_H
 
 #include <pthread.h>
+#include <stdint.h>
+#include <stddef.h>
 #include "../libsample/sample.h"
 #include "../libchannelizer/pfb.h"
 
 #define SDR_ENGINE_MAX_GROUPS	64
 #define SDR_ENGINE_MAX_CHAN	128	/* channels in one group, per direction */
 
-/* single producer, single consumer ring of rows (complex float per channel) */
+/* the indices of a ring, where both sides see them (a view) */
+typedef struct sdr_ring_ctl {
+	volatile int32_t in, out;	/* row indices */
+} sdr_ring_ctl_t;
+
+/* single producer, single consumer ring of rows (complex float per channel):
+ * each side has its own descriptor (its size is its own, never read from
+ * the other side), buffer and indices may be shared memory */
 typedef struct sdr_ring {
 	float		*buf;		/* rows * width floats */
 	int		width;		/* floats per row (2 per channel) */
 	int		rows;		/* capacity (one row stays free) */
-	volatile int	in, out;	/* row indices */
+	sdr_ring_ctl_t	*ctl;
 } sdr_ring_t;
+
+/* A group's view: everything the program side uses, in one block without
+ * pointers, so it can be shared memory (backend process, docs/SDR-BACKEND.md):
+ * the header, then the RX ring's rows, then the TX ring's rows. */
+#define SDR_VIEW_MAGIC		0x56524453	/* "SDRV" */
+#define SDR_VIEW_VERSION	1
+
+typedef struct sdr_view {
+	uint32_t	magic, version;
+	uint64_t	size;		/* bytes of the whole block */
+	int32_t		dsp_rate, n_rx, n_tx, rows;
+	int32_t		tx_target;	/* rows the program keeps in the TX ring */
+	double		tx_scale;	/* TX amplitude of every channel (1 / N max) */
+	/* counters, written by the device threads */
+	volatile int64_t rx_rows, rx_dropped;	/* rows written / dropped (ring full) */
+	volatile int64_t tx_rows, tx_missing;	/* rows taken / missing (ring empty: silence) */
+	volatile int64_t bad_index;		/* indices out of range seen by the device threads */
+	sdr_ring_ctl_t	rx_ctl, tx_ctl;
+} sdr_view_t;
+
+/* the program side of a group */
+typedef struct sdr_port {
+	sdr_view_t	*view;
+	int		n_rx, n_tx, tx_target;
+	sdr_ring_t	rx, tx;
+} sdr_port_t;
 
 typedef struct sdr_engine sdr_engine_t;
 
@@ -54,11 +89,11 @@ typedef struct sdr_group {
 	int		n_rx, n_tx;
 	double		rx_offset[SDR_ENGINE_MAX_CHAN], tx_offset[SDR_ENGINE_MAX_CHAN];
 	pfb_chan_t	*rx, *tx;	/* channel tails */
-	sdr_ring_t	rx_ring, tx_ring;
-	int		tx_target;	/* rows the program keeps in the TX ring */
-	/* counters (read by anyone, written by the device threads) */
-	volatile long	rx_rows, rx_dropped;	/* rows written / dropped (ring full) */
-	volatile long	tx_rows, tx_missing;	/* rows taken / missing (ring empty: silence) */
+	sdr_view_t	*view;		/* rings and counters (own memory or the caller's) */
+	int		view_own;
+	sdr_ring_t	rx_ring, tx_ring;	/* the device threads' descriptors */
+	int		tx_target;
+	sdr_port_t	port;		/* the program side, in-process */
 	/* adoption by the device threads */
 	volatile int	rx_on, tx_on;		/* adopted by the RX / TX thread */
 	volatile int	leaving;		/* remove requested */
@@ -109,6 +144,12 @@ int sdr_engine_bins(int fs, int dsp, int nchan);
  * DSP samples, tx_target: TX ring fill the program keeps (rows). Returns
  * the group or NULL with a reason in sdr_engine_error(). */
 sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target);
+/* the same with the view in the caller's memory (mem, size; zeroed, at
+ * least sdr_view_size() of the group: shared memory for the backend) */
+sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target, void *mem, size_t size);
+/* ring rows for a ring of ring_ms, bytes of a view */
+int sdr_engine_rows(int dsp_rate, int ring_ms);
+size_t sdr_view_size(int n_rx, int n_tx, int rows);
 /* ask the device threads to drop it, wait until they did, free it */
 void sdr_engine_group_remove(sdr_engine_t *e, sdr_group_t *g);
 /* TX amplitude of every channel (1 / tx_nmax of full scale) */
@@ -128,9 +169,18 @@ int sdr_engine_group_read(sdr_group_t *g, sample_t **out_i, sample_t **out_q, in
 int sdr_engine_group_write(sdr_group_t *g, sample_t **in_i, sample_t **in_q, int num);
 int sdr_engine_group_tosend(sdr_group_t *g);
 
-/* ring (also for the backend's shared memory) */
-int sdr_ring_init(sdr_ring_t *r, int width, int rows);
-void sdr_ring_exit(sdr_ring_t *r);
+/* program side on a view (in-process: the group's port; a client of the
+ * backend: its mapped view). attach checks the view (magic, version, sizes
+ * within size); returns 0 or -EINVAL. */
+int sdr_port_attach(sdr_port_t *p, void *mem, size_t size);
+int sdr_port_read(sdr_port_t *p, sample_t **out_i, sample_t **out_q, int num);
+int sdr_port_write(sdr_port_t *p, sample_t **in_i, sample_t **in_q, int num);
+int sdr_port_tosend(sdr_port_t *p);
+int sdr_port_tx_fill(sdr_port_t *p);	/* rows in the TX ring */
+
+/* ring on a buffer and indices (shared or not); fill: rows in it, -1 if an
+ * index is out of range (the other side wrote it) */
+void sdr_ring_set(sdr_ring_t *r, float *buf, int width, int rows, sdr_ring_ctl_t *ctl);
 int sdr_ring_fill(const sdr_ring_t *r);
 int sdr_ring_space(const sdr_ring_t *r);
 

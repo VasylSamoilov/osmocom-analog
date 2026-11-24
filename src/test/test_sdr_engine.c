@@ -107,8 +107,8 @@ static void test_loopback(void)
 
 		check(fabs(l0) < 0.01 && fabs(l1) < 0.01, "level of each channel's tone back (worst error)", fmax(fabs(l0), fabs(l1)), "dB");
 		check(fmax(x0, x1) < -100.0, "the other channel's tone in a channel", fmax(x0, x1), "dB");
-		check(g->tx_missing == 0 && g->rx_dropped == 0, "TX rows missing + RX rows dropped", (double)(g->tx_missing + g->rx_dropped), "");
-		printf("  %ld rows sent, %ld received, TX scale 1/%d\n", g->tx_rows, g->rx_rows, NMAX);
+		check(g->view->tx_missing == 0 && g->view->rx_dropped == 0, "TX rows missing + RX rows dropped", (double)(g->view->tx_missing + g->view->rx_dropped), "");
+		printf("  %ld rows sent, %ld received, TX scale 1/%d\n", (long)g->view->tx_rows, (long)g->view->rx_rows, NMAX);
 	}
 	sdr_engine_exit(&e);
 	free(iq);
@@ -223,7 +223,7 @@ static int tx_run(int with_b, double complex *out_c, int cap, long *b_missing, l
 			sdr_engine_group_write(bg, tip, tqp, s);
 		}
 		if (with_b && b == 300) {
-			*b_missing = bg->tx_missing;
+			*b_missing = bg->view->tx_missing;
 			ra.e = &e;
 			ra.g = bg;
 			pthread_create(&tid, NULL, remove_thread, &ra);
@@ -236,7 +236,7 @@ static int tx_run(int with_b, double complex *out_c, int cap, long *b_missing, l
 		if (with_b && b == 305)
 			pthread_join(tid, NULL);
 	}
-	*a_missing = a->tx_missing;
+	*a_missing = a->view->tx_missing;
 	sdr_engine_exit(&e);
 	free(iq);
 	return n;

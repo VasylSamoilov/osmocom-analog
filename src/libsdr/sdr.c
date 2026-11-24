@@ -1862,7 +1862,7 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 			rows = sdr_engine_group_read(sdr->group, sdr->eng_i, sdr->eng_q, num);
 			/* the engine's faults, once a second when they change */
 			if (now - sdr->eng_report >= 1.0) {
-				long missing = sdr->group->tx_missing, dropped = sdr->group->rx_dropped;
+				long missing = sdr->group->view->tx_missing, dropped = sdr->group->view->rx_dropped;
 
 				if (missing != sdr->eng_missing || dropped != sdr->eng_dropped)
 					LOGP(DSDR, LOGL_ERROR, "Filter bank engine: TX rows missing %ld, RX rows dropped %ld in the last %.1f s (total %ld / %ld)\n",
@@ -2068,7 +2068,7 @@ int sdr_get_tosend(void *inst, int buffer_size)
 	 * the device TX thread takes from it at the device clock */
 	if (sdr->use_engine && sdr->group && sdr->group->n_tx) {
 		/* the device's advance is part of the buffer */
-		count = buffer_size - (sdr->buffer_size - sdr->eng_ring_target) - sdr_ring_fill(&sdr->group->tx_ring);
+		count = buffer_size - (sdr->buffer_size - sdr->eng_ring_target) - sdr_port_tx_fill(&sdr->group->port);
 		return (count > 0) ? count : 0;
 	}
 
