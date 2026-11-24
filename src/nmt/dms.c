@@ -1032,12 +1032,12 @@ void dms_reset(nmt_t *nmt)
 	dms->rx_in_sync = 0;
 	osmo_timer_del(&dms->busy_timer);
 	osmo_timer_del(&dms->gap_timer);
+	/* the frames are freed before the state that points to them is cleared */
+	while (dms->state.frame_list)
+		dms_frame_delete(nmt, dms->state.frame_list);
 	memset(&dms->state, 0, sizeof(dms->state));
 
 	dms->tx_frame_valid = 0;
 	dms->tx_mute = 0;
-
-	while (dms->state.frame_list)
-		dms_frame_delete(nmt, dms->state.frame_list);
 }
 
