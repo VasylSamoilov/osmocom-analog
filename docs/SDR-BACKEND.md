@@ -213,6 +213,21 @@ the client ends within 1 s when the backend stops.
    too far apart for one SDR stream), then broadcast FM next to them.
 4. Pi 4 measurements.
 
+Over the air (B210 cable loopback, NMT `-l 2`, DSP 48k, SDR 1.92 MS/s,
+TX 60 / RX 40, 15 s, 2026-11-24):
+
+| setup | frames | invalid | quality | CPU |
+|---|---|---|---|---|
+| in-process filter bank, NMT 90/92 | 216 | 0 | 91.0 % | 20 % |
+| backend `--channels 2`, NMT 90/92 | 216 | 0 | 91.0 % | nmt 5 % + backend 13 % |
+| backend `--channels 4`, NMT 90/92 and a second NMT 96/98 | 218 / 216 | 0 / 0 | 91.2 / 91.0 % | 5 % + 5 % + backend 15 % |
+
+TX and RX on one device clock: the TX time stamps count on sample by
+sample from the RX time at the start plus the device advance (5 ms), so
+TX stays locked to RX without drift; each program's RX -> TX delay is the
+advance plus its ring target. (Two nmt programs: start them a few seconds
+apart, their FIFOs have fixed names.)
+
 ## Open
 
 - The backend does not drain its raw SDR rate ring yet: ADC clipping / DC
