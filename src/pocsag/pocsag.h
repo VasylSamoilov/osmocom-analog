@@ -1,4 +1,5 @@
 #include "../libmobile/sender.h"
+#include "../libmobile/afc.h"
 #include "../libfsk_pll/fsk_pll.h"
 #include "../libfsk/fsk_nrz.h"
 #include "../libpagercharset/pager_charset.h"
@@ -293,7 +294,13 @@ typedef struct pocsag {
 		uint64_t	word_inv;	/* same, inverted polarity */
 	} rx_baud[3];
 	int			rx_baud_count;	/* number of active baud slots */
+
+	/* AFC (libmobile/afc.c): fitted at each sync word */
+	afc_t			afc;
+	int			afc_decoded;	/* a message in this transmission */
 } pocsag_t;
+
+extern double pocsag_afc_range;	/* --afc-range (Hz), 0 = off */
 
 /* Map baud rate to speed queue index */
 static inline int pocsag_speed_index(int speed)

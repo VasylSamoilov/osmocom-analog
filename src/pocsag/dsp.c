@@ -69,6 +69,8 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	/* set modulation parameters */
 	// NOTE: baudrate equals modulation, because we have a raised cosine ramp of beta = 0.5
 	sender_set_fm(&pocsag->sender, deviation, baudrate, deviation, MAX_DISPLAY);
+	/* AFC: a sample value of 1.0 is the deviation (Hz) */
+	afc_init(&pocsag->afc, &pocsag->sender, pocsag_afc_range, deviation);
 
 	pocsag->fsk_bitduration = (double)samplerate / (double)baudrate;
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Use %.4f samples for one bit duration @ %d.\n", pocsag->fsk_bitduration, pocsag->sender.samplerate);
@@ -202,11 +204,75 @@ static void dsp_rx_unlock(pocsag_t *pocsag)
 	pocsag->rx_rate_locked = 0;
 	pocsag->rx_resync_countdown = 0;
 
+	/* the transmission ended: the AFC's reception is confirmed by a
+	 * message (or two sync words) */
+	afc_release(&pocsag->afc, pocsag->afc_decoded);
+	pocsag->afc_decoded = 0;
+
 	for (i = 0; i < pocsag->rx_baud_count; i++) {
 		fsk_pll_reset(&pocsag->rx_baud[i].pll);
 		pocsag->rx_baud[i].word = 0;
 		pocsag->rx_baud[i].word_inv = 0;
 	}
+}
+
+/*
+ * AFC (libmobile/afc.c, as SDRangel): at each sync codeword the levels of its
+ * 32 symbols are fitted by least squares; the DC found is held for the batch
+ * and moves the channel's demodulator onto the signal.
+ *
+ * pll: the PLL that decoded the sync word (its last 32 symbol values), pol:
+ * its polarity (its values are sample * pol), inverted: its bits were ~SYNC.
+ * Returns 1 and the DC in sample units (relative to the demodulator now).
+ */
+double pocsag_afc_range = 5000.0;	/* --afc-range (Hz), 0 = off */
+
+static int pocsag_afc_sync(pocsag_t *pocsag, const fsk_pll_t *pll, double pol, int inverted, double *dc)
+{
+	uint32_t pat = inverted ? ~(uint32_t)CODEWORD_SYNC : (uint32_t)CODEWORD_SYNC;
+	double levels[32], dev, expected;
+	int i;
+
+	if (pocsag->afc.range <= 0.0 || pll->sym_hist_n < 32)
+		return 0;
+	/* the deviation hunted (SDRangel: mean distance from the mean of the
+	 * last symbols): the 32 before the sync word (the preamble or the last
+	 * codeword), if there */
+	expected = 0.0;
+	if (pll->sym_hist_n >= 64) {
+		double m = 0.0;
+
+		for (i = 0; i < 32; i++)
+			m += pll->sym_hist[(pll->sym_hist_pos + FSK_PLL_SYM_HIST - 64 + i) % FSK_PLL_SYM_HIST];
+		m /= 32.0;
+		for (i = 0; i < 32; i++)
+			expected += fabs(pll->sym_hist[(pll->sym_hist_pos + FSK_PLL_SYM_HIST - 64 + i) % FSK_PLL_SYM_HIST] - m);
+		expected /= 32.0;
+	}
+	/* the 32 symbols of the sync word into the AFC, oldest first, in sample
+	 * units; a bit 1 was a positive value of sample * pol */
+	for (i = 0; i < 32; i++) {
+		afc_symbol(&pocsag->afc, pll->sym_hist[(pll->sym_hist_pos + FSK_PLL_SYM_HIST - 32 + i) % FSK_PLL_SYM_HIST] * pol);
+		levels[i] = (((pat >> (31 - i)) & 1) ? 1.0 : -1.0) * pol;
+	}
+	if (!afc_fit(&pocsag->afc, levels, 32, 0, expected, dc, &dev)) {
+		LOGP_CHAN(DDSP, LOGL_INFO, "AFC: sync word levels do not fit (level %.2f), not used.\n", expected);
+		return 0;
+	}
+	LOGP_CHAN(DDSP, LOGL_INFO, "AFC: carrier %+.0f Hz off the demodulator, trim %+.0f Hz -> %+.0f Hz (deviation %.2f).\n",
+		  *dc * pocsag->afc.dev_hz, pocsag->afc.trim, pocsag->afc.trim + *dc * pocsag->afc.dev_hz, fabs(dev));
+	afc_measured(&pocsag->afc, *dc);
+	return 1;
+}
+
+/* after a lock by the scanner: fit the sync word of the scanner's PLL, the
+ * locked decoder takes the fitted DC (in its polarity) */
+static void pocsag_afc_lock(pocsag_t *pocsag, const fsk_pll_t *scan_pll, double scan_pol, int inverted)
+{
+	double dc;
+
+	if (pocsag_afc_sync(pocsag, scan_pll, scan_pol, inverted, &dc))
+		pocsag->fsk_rx_pll.dc_offset = dc * pocsag->fsk_polarity;
 }
 
 /*
@@ -269,6 +335,13 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 							  pocsag->rx_baud_locked, (pocsag->fsk_polarity < 0) ? "normal" : "inverted",
 							  preamble, (preamble >= 31) ? "+" : "");
 				}
+				/* AFC: the levels of this sync word */
+				{
+					double dc;
+
+					if (pocsag_afc_sync(pocsag, &pocsag->fsk_rx_pll, pocsag->fsk_polarity, 0, &dc))
+						pocsag->fsk_rx_pll.dc_offset = dc * pocsag->fsk_polarity;
+				}
 				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 				pocsag->fsk_rx_sync = 16;
 				pocsag->fsk_rx_index = 0;
@@ -279,14 +352,18 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 			uint32_t trial = ~w;
 			if (pocsag_bch_correct(&trial, NULL) == 0 && trial == CODEWORD_SYNC) {
 				if (pocsag->rx_auto_polarity) {
-					double new_pol = -pocsag->fsk_polarity;
+					double new_pol = -pocsag->fsk_polarity, afc_dc;
 					int preamble = count_preamble_bits(~pocsag->fsk_rx_word);
+					/* AFC: fit before the lock clears the PLL */
+					int afc_ok = pocsag_afc_sync(pocsag, &pocsag->fsk_rx_pll, pocsag->fsk_polarity, 1, &afc_dc);
 					LOGP_CHAN(DDSP, LOGL_INFO, "Inverted FSC in locked mode — flipping to %s polarity (%d%s preamble bits).\n",
 						  (new_pol < 0) ? "normal" : "inverted",
 						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, pocsag->rx_baud_locked, new_pol);
 					pocsag->fsk_rx_pll.last_sample = -pocsag->fsk_rx_pll.last_sample;
 					pocsag->fsk_rx_pll.dc_offset = -pocsag->fsk_rx_pll.dc_offset;
+					if (afc_ok)
+						pocsag->fsk_rx_pll.dc_offset = afc_dc * new_pol;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
 					pocsag->fsk_rx_index = 0;
@@ -464,6 +541,7 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 					  preamble, (preamble >= 31) ? "+" : "");
 				dsp_rx_lock(pocsag, st->baudrate, polarity);
 				fsk_pll_copy_state(&pocsag->fsk_rx_pll, &st->pll);
+				pocsag_afc_lock(pocsag, &st->pll, polarity, 0);
 				pocsag->fsk_rx_word = CODEWORD_SYNC;
 				put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 				pocsag->fsk_rx_sync = 16;
@@ -482,6 +560,7 @@ static int fsk_decode_scan(pocsag_t *pocsag, sample_t *spl, int length, int *con
 						  preamble, (preamble >= 31) ? "+" : "");
 					dsp_rx_lock(pocsag, st->baudrate, polarity);
 					fsk_pll_copy_state(&pocsag->fsk_rx_pll, &st->pll);
+					pocsag_afc_lock(pocsag, &st->pll, polarity, 0);
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
@@ -506,6 +585,7 @@ check_inverted:
 					/* Flip last_sample and DC offset sign for inverted polarity */
 					pocsag->fsk_rx_pll.last_sample = -pocsag->fsk_rx_pll.last_sample;
 					pocsag->fsk_rx_pll.dc_offset = -pocsag->fsk_rx_pll.dc_offset;
+					pocsag_afc_lock(pocsag, &st->pll, polarity, 1);
 					pocsag->fsk_rx_word = CODEWORD_SYNC;
 					put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 					pocsag->fsk_rx_sync = 16;
@@ -527,6 +607,7 @@ check_inverted:
 						fsk_pll_copy_state(&pocsag->fsk_rx_pll, &st->pll);
 						pocsag->fsk_rx_pll.last_sample = -pocsag->fsk_rx_pll.last_sample;
 						pocsag->fsk_rx_pll.dc_offset = -pocsag->fsk_rx_pll.dc_offset;
+						pocsag_afc_lock(pocsag, &st->pll, polarity, 1);
 						pocsag->fsk_rx_word = CODEWORD_SYNC;
 						put_codeword(pocsag, CODEWORD_SYNC, -1, -1);
 						pocsag->fsk_rx_sync = 16;
@@ -651,9 +732,28 @@ static void fsk_decode(pocsag_t *pocsag, sample_t *spl, int length)
 void sender_receive(sender_t *sender, sample_t *samples, int length, double __attribute__((unused)) rf_level_db)
 {
 	pocsag_t *pocsag = (pocsag_t *) sender;
+	double p;
+	int i;
 
-	if (pocsag->rx)
-		fsk_decode(pocsag, samples, length);
+	if (!pocsag->rx)
+		return;
+	/* AFC: a trim set while the last block was decoded turns the
+	 * demodulator from this block on: the DC estimates follow it here
+	 * (sample units, the PLLs work on sample * polarity) */
+	p = afc_block(&pocsag->afc, length, pocsag->samplerate);
+	if (p != 0.0) {
+		pocsag->fsk_rx_pll.dc_offset += p * pocsag->fsk_polarity;
+		for (i = 0; i < FSK_PLL_SYM_HIST; i++)
+			pocsag->fsk_rx_pll.sym_hist[i] += p * pocsag->fsk_polarity;
+		for (i = 0; i < pocsag->rx_baud_count; i++) {
+			int h;
+
+			pocsag->rx_baud[i].pll.dc_offset += p * pocsag->fsk_polarity;
+			for (h = 0; h < FSK_PLL_SYM_HIST; h++)
+				pocsag->rx_baud[i].pll.sym_hist[h] += p * pocsag->fsk_polarity;
+		}
+	}
+	fsk_decode(pocsag, samples, length);
 }
 
 /* Provide stream of audio toward radio unit */

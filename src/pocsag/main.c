@@ -170,6 +170,11 @@ void print_help(const char *arg0)
 	printf("NOTE: Function bits (0-3/A-D) are sub-addresses, NOT message types.\n");
 	printf("      Message encoding (tone/numeric/alpha) is set separately with -y.\n");
 	printf("\n");
+	printf("    --afc-range <Hz>\n");
+	printf("        RX: how far the receiver follows the carrier offset (AFC): at each\n");
+	printf("        sync word the offset is measured and the channel's demodulator moved\n");
+	printf("        onto the signal. 0 = off. Correct larger offsets of the SDR with\n");
+	printf("        --sdr-ppm. (default = %.0f)\n", pocsag_afc_range);
 	printf("    --fifo <path>\n");
 	printf("        Path for the message send FIFO (default %s).\n", MSG_SEND_DEFAULT);
 	printf("    --fifo-file <file>\n");
@@ -217,6 +222,7 @@ void print_help(const char *arg0)
 #define OPT_CHARSET	262
 #define OPT_CHARSET_PRINT 263
 #define OPT_FIFO_FILE	264
+#define OPT_AFC_RANGE	265
 
 /* The FIFO's command lines read from a file instead (batch runs) */
 static const char *msg_send_file = NULL;
@@ -242,6 +248,7 @@ static void add_options(void)
 	option_add(OPT_FIFO_FILE, "fifo-file", 1);
 	option_add(OPT_NETWORK, "network", 0);
 	option_add(OPT_ONESHOT, "oneshot", 0);
+	option_add(OPT_AFC_RANGE, "afc-range", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -386,6 +393,13 @@ static int handle_options(int short_option, int argi, char **argv)
 		max_batches = atoi(argv[argi++]);
 		if (max_batches < 0) {
 			fprintf(stderr, "Max batches must be >= 0.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_AFC_RANGE:
+		pocsag_afc_range = atof(argv[argi]);
+		if (pocsag_afc_range < 0.0) {
+			fprintf(stderr, "--afc-range must be 0 (off) or more Hz.\n");
 			return -EINVAL;
 		}
 		break;
