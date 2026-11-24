@@ -150,14 +150,21 @@ static int program(const char *name, double freq, double tone_hz, double other_h
 static volatile int device_run = 1;
 static sdr_engine_t engine;
 
+static double block_max;	/* longest block (TX + RX), s */
+
 static void *device(void __attribute__((unused)) *arg)
 {
 	float *iq = malloc(sizeof(float) * 2 * BLOCK);
 	double next = now();
 
 	while (device_run) {
+		double t0 = now(), d;
+
 		sdr_engine_tx_produce(&engine, iq, BLOCK);
 		sdr_engine_rx_feed(&engine, iq, BLOCK);
+		d = now() - t0;
+		if (d > block_max)
+			block_max = d;
 		next += (double)BLOCK / FS;
 		while (now() < next)
 			usleep(200);
@@ -235,6 +242,9 @@ int main(void)
 		usleep(10000);
 	check(sdr_backend_groups(b) == 0, "groups left after all programs ended (K removed)", sdr_backend_groups(b), "");
 	check(engine.tx_used == 0, "TX channels in use after all ended", engine.tx_used, "");
+	/* programs join and leave while the device runs: no block may take
+	 * long (the device would fall behind, UHD time stamps late) */
+	check(block_max < 0.002, "longest device block (1 ms of samples) while programs joined and left", block_max * 1e3, "ms");
 
 	/* the backend goes while a program is registered */
 	printf("Backend stops while a program is registered:\n");
