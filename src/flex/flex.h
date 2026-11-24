@@ -2,6 +2,7 @@
 #define FLEX_H
 
 #include "../libmobile/sender.h"
+#include "../libmobile/afc.h"
 #include "../libfilter/iir_filter.h"
 #include "../libfsk/fsk_nrz.h"
 #include "frame.h"
@@ -635,17 +636,7 @@ typedef struct flex {
 		 * demodulator (sender_set_rx_trim()), so its filter stays on the
 		 * signal. */
 		double		sym_raw;		/* the last symbol's value (DC included) */
-		double		sym_hist[256];		/* raw values of the last S1 symbols */
-		int		sym_hist_pos, sym_hist_n;
-		double		afc_range;		/* most trim (Hz), 0 = off */
-		double		afc_dev_hz;		/* Hz of a sample value of 1.0 (speech deviation) */
-		double		afc_trim;		/* trim set (Hz) */
-		double		afc_hunt_centre;	/* trim while hunting (Hz) */
-		double		afc_pending;		/* DC change of the next block (sample units) */
-		int		afc_fits;		/* fits in this reception */
-		int		afc_confirmed;		/* this reception confirmed (2 fits or a frame) */
-		long		afc_samples;		/* samples since the last hunt centre decay */
-		double		afc_last_fit_hz;	/* offset of the last fit (Hz, for the log) */
+		afc_t		afc;			/* libmobile/afc.c, symbol history in step with the sync register */
 		double		pll_envelope;		/* signal envelope estimate */
 		double		pll_envelope_sum;	/* running sum for envelope */
 		int		pll_envelope_count;	/* sample count for envelope */

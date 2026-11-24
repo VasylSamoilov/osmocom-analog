@@ -150,8 +150,7 @@ int dsp_init_sender(flex_t *flex, int samplerate, double deviation, double polar
 	 * occupied bandwidth limit. */
 	sender_set_fm(&flex->sender, deviation, 3200, deviation, MAX_DISPLAY);
 	/* AFC: a sample value of 1.0 is the deviation (Hz) */
-	flex->rx.afc_range = flex_afc_range;
-	flex->rx.afc_dev_hz = deviation;
+	afc_init(&flex->rx.afc, &flex->sender, flex_afc_range, deviation);
 
 	/* Size buffer for slowest speed (1600 baud = most samples per word) */
 	max_bitduration = (double)samplerate / 1600.0;
@@ -790,24 +789,6 @@ static uint32_t flex_extract_inv_a(uint64_t sync_buf_lo, int polarity)
 
 double flex_afc_range = 5000.0;	/* --afc-range (Hz), 0 = off */
 
-/* Set the trim. The DC seen by the decoder moves by -delta from the next
- * block on (the demodulator turns then): the levels follow there. */
-static void flex_afc_set_trim(flex_t *flex, double hz)
-{
-	double applied, delta;
-
-	if (hz > flex->rx.afc_range)
-		hz = flex->rx.afc_range;
-	if (hz < -flex->rx.afc_range)
-		hz = -flex->rx.afc_range;
-	applied = sender_set_rx_trim(&flex->sender, hz);
-	delta = applied - flex->rx.afc_trim;
-	if (delta == 0.0)
-		return;
-	flex->rx.afc_trim = applied;
-	flex->rx.afc_pending -= delta / flex->rx.afc_dev_hz;
-}
-
 /* Least squares fit of x = dc + dev * l to the 80 symbols of sync 1 that are
  * known now: A and inv.A from the corrected A code, B as received. The
  * register holds raw bits: bit 1 = a low symbol (sym < 2), so l = -1. The
@@ -816,17 +797,16 @@ static void flex_afc_fit(flex_t *flex, uint32_t corrected)
 {
 	uint32_t a_raw, inv_raw;
 	uint16_t b_raw;
-	double sx = 0.0, sl = 0.0, sxl = 0.0, sll = 0.0, n = 80.0, ml, mx, var, dev, dc, env;
+	double levels[80], dev, dc, env;
 	int i;
 
-	if (flex->rx.afc_range <= 0.0 || flex->rx.sym_hist_n < 80)
+	if (flex->rx.afc.range <= 0.0 || flex->rx.afc.hist_n < 80)
 		return;
 	a_raw = flex->rx.polarity ? corrected : ~corrected;
 	inv_raw = flex->rx.polarity ? ~corrected : corrected;
 	b_raw = (uint16_t)((flex->rx.sync_buf_lo >> 32) & 0xFFFF);
 	for (i = 0; i < 80; i++) {
 		int bit;
-		double l, x;
 
 		if (i < 32)
 			bit = (a_raw >> (31 - i)) & 1;
@@ -834,49 +814,26 @@ static void flex_afc_fit(flex_t *flex, uint32_t corrected)
 			bit = (b_raw >> (47 - i)) & 1;
 		else
 			bit = (inv_raw >> (79 - i)) & 1;
-		l = bit ? -1.0 : 1.0;
-		x = flex->rx.sym_hist[(flex->rx.sym_hist_pos + 256 - 80 + i) % 256];
-		sx += x;
-		sl += l;
-		sxl += x * l;
-		sll += l * l;
+		levels[i] = bit ? -1.0 : 1.0;
 	}
-	ml = sl / n;
-	mx = sx / n;
-	var = sll / n - ml * ml;
-	if (var < 1e-6)
-		return;
-	dev = (sxl / n - mx * ml) / var;
 	/* false sync guard (SDRangel: 0.6 .. 1.6 of the deviation hunted) */
 	env = flex->rx.pll_envelope;
-	if (fabs(dev) < 0.05 || (env > 0.0 && (fabs(dev) < 0.6 * env || fabs(dev) > 1.6 * env))) {
-		LOGP_CHAN(DDSP, LOGL_INFO, "RX: AFC: sync 1 levels do not fit (deviation %.2f, envelope %.2f), not used.\n", fabs(dev), env);
+	if (!afc_fit(&flex->rx.afc, levels, 80, 0, env, &dc, &dev)) {
+		LOGP_CHAN(DDSP, LOGL_INFO, "RX: AFC: sync 1 levels do not fit (envelope %.2f), not used.\n", env);
 		return;
 	}
-	dc = mx - dev * ml;
 	/* the fitted DC, held for the frame */
 	flex->rx.pll_zero = dc;
-	if (flex->rx.afc_fits == 0)
-		flex->rx.afc_confirmed = 0;
-	flex->rx.afc_fits++;
-	flex->rx.afc_last_fit_hz = dc * flex->rx.afc_dev_hz;
 	LOGP_CHAN(DDSP, LOGL_INFO, "RX: AFC: carrier %+.0f Hz off the demodulator, trim %+.0f Hz -> %+.0f Hz (deviation %.2f).\n",
-		  flex->rx.afc_last_fit_hz, flex->rx.afc_trim, flex->rx.afc_trim + flex->rx.afc_last_fit_hz, fabs(dev));
-	flex_afc_set_trim(flex, flex->rx.afc_trim + flex->rx.afc_last_fit_hz);
+		  dc * flex->rx.afc.dev_hz, flex->rx.afc.trim, flex->rx.afc.trim + dc * flex->rx.afc.dev_hz, fabs(dev));
+	afc_measured(&flex->rx.afc, dc);
 }
 
 /* The reception ended (back to hunting): keep the trim as the hunt centre
  * if it was confirmed, else go back to the hunt centre */
 static void flex_afc_release(flex_t *flex, int decoded)
 {
-	if (flex->rx.afc_range <= 0.0 || flex->rx.afc_fits == 0)
-		return;
-	if (flex->rx.afc_fits >= 2 || decoded)
-		flex->rx.afc_confirmed = 1;
-	if (flex->rx.afc_confirmed)
-		flex->rx.afc_hunt_centre = flex->rx.afc_trim;
-	flex->rx.afc_fits = 0;
-	flex_afc_set_trim(flex, flex->rx.afc_hunt_centre);
+	afc_release(&flex->rx.afc, decoded);
 }
 
 /* Combined A / inv.A error correction for S1 sync.
@@ -5800,10 +5757,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 				       (flex->rx.sync_buf_lo >> 63);
 		flex->rx.sync_buf_lo = (flex->rx.sync_buf_lo << 1) | bit;
 		/* the symbol's value, in step with the register (AFC fit) */
-		flex->rx.sym_hist[flex->rx.sym_hist_pos] = flex->rx.sym_raw;
-		flex->rx.sym_hist_pos = (flex->rx.sym_hist_pos + 1) % 256;
-		if (flex->rx.sym_hist_n < 256)
-			flex->rx.sym_hist_n++;
+		afc_symbol(&flex->rx.afc, flex->rx.sym_raw);
 
 		if (flex->rx.s1_tail_count == 0) {
 			/* Hunting: check for sync marker */
@@ -6180,7 +6134,7 @@ static void flex_rx_sym(flex_t *flex, unsigned char sym)
 
 		if (++flex->rx.data_count == flex->rx.sync_baud * 1760 / 1000) {
 			int bps = flex->rx.sync_baud * (flex->rx.sync_levels == 4 ? 2 : 1);
-			double afc_corr = flex->rx.afc_trim;	/* the AFC's trim (Hz) */
+			double afc_corr = flex->rx.afc.trim;	/* the AFC's trim (Hz) */
 			double data_dc = (flex->rx.data_dc_count > 0) ?
 				flex->rx.data_dc_sum / flex->rx.data_dc_count : 0.0;
 			double sa[4], sd[4];
@@ -6607,27 +6561,8 @@ void sender_receive(sender_t *sender, sample_t *samples, int length,
 
 	/* AFC: a trim set while the last block was decoded turns the
 	 * demodulator from this block on: the levels follow it here */
-	if (flex->rx.afc_pending != 0.0) {
-		int h;
-
-		flex->rx.pll_zero += flex->rx.afc_pending;
-		for (h = 0; h < 256; h++)
-			flex->rx.sym_hist[h] += flex->rx.afc_pending;
-		flex->rx.afc_pending = 0.0;
-	}
-	/* AFC: without fits the hunt centre decays to 0 (exp(-1/30) a second) */
-	if (flex->rx.afc_range > 0.0) {
-		flex->rx.afc_samples += length;
-		if (flex->rx.afc_samples >= flex->sender.samplerate) {
-			flex->rx.afc_samples -= flex->sender.samplerate;
-			if (flex->rx.afc_fits == 0 && flex->rx.afc_hunt_centre != 0.0) {
-				flex->rx.afc_hunt_centre *= 0.967216;
-				if (fabs(flex->rx.afc_hunt_centre) < 10.0)
-					flex->rx.afc_hunt_centre = 0.0;
-				flex_afc_set_trim(flex, flex->rx.afc_hunt_centre);
-			}
-		}
-	}
+	/* (and without fits the hunt centre decays to 0) */
+	flex->rx.pll_zero += afc_block(&flex->rx.afc, length, flex->sender.samplerate);
 
 	for (i = 0; i < length; i++)
 		flex_rx_demodulate(flex, (double)samples[i]);
