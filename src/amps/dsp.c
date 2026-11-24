@@ -1000,8 +1000,9 @@ static void fsk_rx_frame_done(amps_t *amps)
 			amps->fsk_rx_rvc_gap = 0;
 		}
 	} else {
-		/* switch back to first word length with DCC included */
-		if (amps->fsk_rx_frame_length == 240)
+		/* RECC: switch back to first word length with DCC included (the RVC has no DCC: there
+		 * every message is read as 240 bits) */
+		if (amps->fsk_rx_frame_length == 240 && amps->dsp_mode == DSP_MODE_FRAME_RX_FRAME_TX)
 			amps->fsk_rx_frame_length = 247;
 		amps->fsk_rx_sync = FSK_SYNC_NONE;
 		amps->channel_busy = 0;

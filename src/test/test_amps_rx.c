@@ -277,9 +277,9 @@ static void test_clock(void)
 /* The RVC: a release order (F=1 NAWC=0 T=1 ORDER=3), each repeat after its own dotting and sync
  * (101 bits of dotting before the first, 37 before the others), as many repeats as given; a bit
  * of the repeats in wrong_mask wrong, another in each. */
-static void receive_rvc(int repeats, int wrong_mask)
+static void receive_rvc_messages(int repeats, int wrong_mask, int messages)
 {
-	static sample_t samples[96000];
+	static sample_t samples[192000];
 	static char bits[1100];
 	const uint64_t word = reverse_word((1ull << 35) | (1ull << 32) | (3ull << 19));
 	amps_t *amps = control_channel();
@@ -305,11 +305,13 @@ static void receive_rvc(int repeats, int wrong_mask)
 	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
 
 	s = 0;
-	for (i = 0; i < 960; i++)
-		samples[s++] = 0;
-	s += modulate(samples + s, bits, n, 96000.0, 0.0);
-	for (i = 0; i < 9600; i++)
-		samples[s++] = 0;
+	for (r = 0; r < messages; r++) {
+		for (i = 0; i < 960; i++)
+			samples[s++] = 0;
+		s += modulate(samples + s, bits, n, 96000.0, 0.0);
+		for (i = 0; i < 9600; i++)
+			samples[s++] = 0;
+	}
 	release_count = 0;
 	for (i = 0; i < s; i += 960)
 		sender_receive(&amps->sender, samples + i, (s - i < 960) ? s - i : 960, NAN);
@@ -318,8 +320,17 @@ static void receive_rvc(int repeats, int wrong_mask)
 	free(amps);
 }
 
+static void receive_rvc(int repeats, int wrong_mask)
+{
+	receive_rvc_messages(repeats, wrong_mask, 1);
+}
+
 static void test_rvc(void)
 {
+	/* two messages in the same call: the second is read as the first (240 bits after the sync,
+	 * not 247 as the first word on the RECC) */
+	receive_rvc_messages(5, 0, 2);
+	CHECK(release_count == 2, "RVC: two messages in a call are received");
 	receive_rvc(5, 0);
 	CHECK(release_count == 1, "RVC: a release order is received");
 	/* the first, third and fifth repeat wrong, another bit each: only the vote of all 5 is right */
