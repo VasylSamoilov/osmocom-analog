@@ -193,6 +193,15 @@ static void dsp_rx_lock(pocsag_t *pocsag, int baudrate, double polarity)
 	fsk_pll_init(&pocsag->fsk_rx_pll, pocsag->samplerate, baudrate);
 }
 
+/* The transmission ended (in every mode, also with fixed baud rate and
+ * polarity, where the scanner is not used): the AFC's reception is
+ * confirmed by a message (or two sync words) */
+static void dsp_rx_afc_release(pocsag_t *pocsag)
+{
+	afc_release(&pocsag->afc, pocsag->afc_decoded);
+	pocsag->afc_decoded = 0;
+}
+
 /*
  * Reset multi-rate search state. Called when sync is lost (batch ends)
  * and we need to go back to scanning for preamble/sync.
@@ -204,10 +213,7 @@ static void dsp_rx_unlock(pocsag_t *pocsag)
 	pocsag->rx_rate_locked = 0;
 	pocsag->rx_resync_countdown = 0;
 
-	/* the transmission ended: the AFC's reception is confirmed by a
-	 * message (or two sync words) */
-	afc_release(&pocsag->afc, pocsag->afc_decoded);
-	pocsag->afc_decoded = 0;
+	dsp_rx_afc_release(pocsag);
 
 	for (i = 0; i < pocsag->rx_baud_count; i++) {
 		fsk_pll_reset(&pocsag->rx_baud[i].pll);
@@ -391,6 +397,8 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 					pocsag->rx_resync_countdown = 0;
 					if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity)
 						dsp_rx_unlock(pocsag);
+					else
+						dsp_rx_afc_release(pocsag);
 					return;
 				}
 			}
@@ -399,6 +407,8 @@ static void fsk_block_decode(pocsag_t *pocsag, uint8_t bit)
 					  RESYNC_TIMEOUT_BITS, w, pocsag->fsk_rx_bit_count);
 				if (pocsag->rx_auto_baud || pocsag->rx_auto_polarity)
 					dsp_rx_unlock(pocsag);
+				else
+					dsp_rx_afc_release(pocsag);
 			}
 		}
 	} else {
