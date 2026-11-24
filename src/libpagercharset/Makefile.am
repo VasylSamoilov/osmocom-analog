@@ -42,4 +42,6 @@ libpagercharset_a_SOURCES = \
 	charset_flex_motorola_linguist_vietnamese.c \
 	charset_rds_generic_annex_e.c \
 	charset_rds_nokia_finder_text_cyrillic.c \
-	charset_rds_nokia_nkp2_annex_e.c
+	charset_rds_nokia_nkp2_annex_e.c \
+	charset_nmt_generic_generic_gsm.c \
+	charset_nmt_nokia_generic_ukrainian.c
