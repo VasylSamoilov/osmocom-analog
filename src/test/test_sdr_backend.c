@@ -25,6 +25,7 @@
 
 static char sock_name[64];
 static int failures;
+static int prog_dsp = DSP;	/* the DSP rate of the next program forked */
 
 static void check(int ok, const char *what, double value, const char *unit)
 {
@@ -65,13 +66,13 @@ static int program(const char *name, double freq, double tone_hz, double other_h
 	double complex *y = NULL;
 	sample_t ti[1][2000], tq[1][2000], ri[1][2000], rq[1][2000];
 	sample_t *tip[1] = { ti[0] }, *tqp[1] = { tq[0] }, *rip[1] = { ri[0] }, *rqp[1] = { rq[0] };
-	int cap = DSP * ms / 1000, n = 0, s, rc, tries, wrote_bad = 0;
+	int dsp = prog_dsp, cap = dsp * ms / 1000, n = 0, s, rc, tries, wrote_bad = 0;
 	long t = 0;
 	double start;
 
 	usleep(200000);	/* the backend starts */
 	for (tries = 0; tries < 20; tries++) {
-		rc = sdr_client_open(&c, sock_name, name, DSP, 1, &freq, 1, &freq, 200, DSP / 50, err, sizeof(err));
+		rc = sdr_client_open(&c, sock_name, name, dsp, 1, &freq, 1, &freq, 200, dsp / 50, err, sizeof(err));
 		if (rc == 0 || mode == 4 || !strstr(err, "Connection refused"))
 			break;
 		usleep(50000);
@@ -104,15 +105,22 @@ static int program(const char *name, double freq, double tone_hz, double other_h
 		if (k > 2000)
 			k = 2000;
 		for (s = 0; s < k; s++, t++) {
-			double complex z = c.tx_scale * cexp(2 * M_PI * I * tone_hz / DSP * t);
+			double complex z = c.tx_scale * cexp(2 * M_PI * I * tone_hz / dsp * t);
 
 			ti[0][s] = creal(z);
 			tq[0][s] = cimag(z);
 		}
 		sdr_port_write(&c.port, tip, tqp, k);
 		if (mode == 2 && n > cap / 4) {
-			c.port.view->tx_ctl.in = 999999;	/* garbage, once */
-			mode = 0;
+			/* garbage in all four indices, every pass (in and out
+			 * of range): the device threads must neither write nor
+			 * read outside the rings, nobody else be affected */
+			int rows = c.port.view->rows;
+
+			c.port.view->rx_ctl.in = rand() % (4 * rows) - 2 * rows;
+			c.port.view->rx_ctl.out = rand() % (4 * rows) - 2 * rows;
+			c.port.view->tx_ctl.in = rand() % (4 * rows) - 2 * rows;
+			c.port.view->tx_ctl.out = rand() % (4 * rows) - 2 * rows;
 			wrote_bad = 1;
 		}
 		got = sdr_port_read(&c.port, rip, rqp, 2000);
@@ -124,7 +132,7 @@ static int program(const char *name, double freq, double tone_hz, double other_h
 	}
 	{
 		int skip = n / 2, len = n - skip;
-		double own = level(y + skip, len, tone_hz / DSP), other = level(y + skip, len, other_hz / DSP);
+		double own = level(y + skip, len, tone_hz / dsp), other = level(y + skip, len, other_hz / dsp);
 		long bad = (long)c.port.view->bad_index, missing = (long)c.port.view->tx_missing, dropped = (long)c.port.view->rx_dropped;
 		/* a program that wrote a bad index loses its TX (its writes are
 		 * refused too): only the counting is checked */
@@ -183,7 +191,7 @@ int main(void)
 {
 	sdr_backend_t *b;
 	pthread_t tid;
-	pid_t pa, pb, pk, pbad, pref, pgone;
+	pid_t pa, pb, pk, pbad, pref, phalf, pgone;
 	int i;
 
 	/* nothing buffered when the programs fork */
@@ -198,6 +206,10 @@ int main(void)
 	pk = spawn("K", 25000.0, 3000.0, 1000.0, 600, 1);
 	pbad = spawn("X", -100000.0, 500.0, 1000.0, 600, 2);
 	pref = spawn("R", 5e6, 0.0, 0.0, 100, 4);
+	/* a program at half the DSP rate on the same engine */
+	prog_dsp = DSP / 2;
+	phalf = spawn("H", 500000.0, 700.0, -2000.0, 600, 0);
+	prog_dsp = DSP;
 
 	if (sdr_engine_init(&engine, FS, FS, DSP, NMAX, BLOCK) < 0) {
 		printf("  %s\n", sdr_engine_error());
@@ -218,6 +230,7 @@ int main(void)
 	check(status_of(pk) == -1, "K: killed", 0, "");
 	check(status_of(pbad) == 0, "X: wrote a bad index, counted by the device threads", 0, "");
 	check(status_of(pref) == 0, "R: outside the band, refused with the reason", 0, "");
+	check(status_of(phalf) == 0, "H: at half the DSP rate on the same engine, own channel back", 0, "");
 	for (i = 0; i < 300 && sdr_backend_groups(b); i++)
 		usleep(10000);
 	check(sdr_backend_groups(b) == 0, "groups left after all programs ended (K removed)", sdr_backend_groups(b), "");

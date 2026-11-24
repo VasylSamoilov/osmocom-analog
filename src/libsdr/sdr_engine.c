@@ -34,6 +34,7 @@ void sdr_ring_set(sdr_ring_t *r, float *buf, int width, int rows, sdr_ring_ctl_t
 	r->width = width;
 	r->rows = rows;
 	r->ctl = ctl;
+	r->pos = 0;	/* the view starts zeroed */
 }
 
 int sdr_ring_fill(const sdr_ring_t *r)
@@ -51,6 +52,26 @@ int sdr_ring_space(const sdr_ring_t *r)
 	int fill = sdr_ring_fill(r);
 
 	return (fill < 0) ? -1 : r->rows - 1 - fill;
+}
+
+/* the device threads: their own index is r->pos, the program's is read
+ * once and checked (it may write anything at any time) */
+static int ring_space_dev(const sdr_ring_t *r)	/* RX: the device writes */
+{
+	int out = __atomic_load_n(&r->ctl->out, __ATOMIC_ACQUIRE);
+
+	if (out < 0 || out >= r->rows)
+		return -1;
+	return r->rows - 1 - (r->pos - out + r->rows) % r->rows;
+}
+
+static int ring_fill_dev(const sdr_ring_t *r)	/* TX: the device reads */
+{
+	int in = __atomic_load_n(&r->ctl->in, __ATOMIC_ACQUIRE);
+
+	if (in < 0 || in >= r->rows)
+		return -1;
+	return (in - r->pos + r->rows) % r->rows;
 }
 
 /*
@@ -498,14 +519,14 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 				fprintf(stderr, "sdr_engine_rx_feed: channels of a group out of step (%d / %d), please fix!\n", got, out);
 		}
 		/* rows into the ring, what does not fit is dropped */
-		space = sdr_ring_space(r);
+		space = ring_space_dev(r);
 		if (space < 0) {
 			/* the program wrote an index out of range: nothing goes in */
 			g->view->bad_index++;
 			g->view->rx_dropped += out;
 			continue;
 		}
-		in = r->ctl->in;
+		in = r->pos;
 		for (s = 0; s < out && s < space; s++) {
 			float *row = r->buf + (size_t)in * r->width;
 
@@ -516,6 +537,7 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 			if (++in == r->rows)
 				in = 0;
 		}
+		r->pos = in;
 		__atomic_store_n(&r->ctl->in, in, __ATOMIC_RELEASE);
 		g->view->rx_rows += s;
 		if (s < out)
@@ -537,7 +559,7 @@ void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
 	for (j = 0; j < e->tx_n; j++) {
 		sdr_group_t *g = e->tx_list[j];
 		sdr_ring_t *r = &g->tx_ring;
-		int need = pfb_chan_tx_need(&g->tx[0], frames), have = sdr_ring_fill(r), take, out;
+		int need = pfb_chan_tx_need(&g->tx[0], frames), have = ring_fill_dev(r), take, out;
 
 		if (need > g->tx_max) {
 			fprintf(stderr, "sdr_engine_tx_produce: %d DSP samples needed, more than %d, please fix!\n", need, g->tx_max);
@@ -549,7 +571,7 @@ void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
 			have = 0;
 		}
 		take = (have < need) ? have : need;
-		out = r->ctl->out;
+		out = r->pos;
 		for (s = 0; s < take; s++) {
 			const float *row = r->buf + (size_t)out * r->width;
 
@@ -560,8 +582,8 @@ void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
 			if (++out == r->rows)
 				out = 0;
 		}
-		if (take)
-			__atomic_store_n(&r->ctl->out, out, __ATOMIC_RELEASE);
+		r->pos = out;
+		__atomic_store_n(&r->ctl->out, out, __ATOMIC_RELEASE);
 		/* the program fell behind: silence for the missing rows, so the
 		 * tails stay continuous */
 		for (k = 0; k < g->n_tx; k++) {

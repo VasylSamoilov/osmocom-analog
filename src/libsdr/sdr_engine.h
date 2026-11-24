@@ -53,6 +53,8 @@ typedef struct sdr_ring {
 	int		width;		/* floats per row (2 per channel) */
 	int		rows;		/* capacity (one row stays free) */
 	sdr_ring_ctl_t	*ctl;
+	int		pos;		/* the device threads' own index (in for RX, out for
+					 * TX): kept here, only published to ctl, never read back */
 } sdr_ring_t;
 
 /* A group's view: everything the program side uses, in one block without
