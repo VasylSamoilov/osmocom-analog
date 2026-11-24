@@ -57,8 +57,12 @@
  *     dest       = Destination address
  *     message    = SMS text; non-printable bytes are rendered as <0xNN>
  */
-#define SMS_DELIVER "/tmp/nmt_sms_deliver"
-#define SMS_SUBMIT "/tmp/nmt_sms_submit"
+/* paths: --sms-deliver, --sms-submit (several nmt programs at once, e.g.
+ * on one SDR backend, each with its own) */
+static const char *sms_deliver_path = "/tmp/nmt_sms_deliver";
+static const char *sms_submit_path = "/tmp/nmt_sms_submit";
+#define SMS_DELIVER sms_deliver_path
+#define SMS_SUBMIT sms_submit_path
 static int sms_deliver_fd = -1;
 
 /* MWI (Message Waiting Indicator) control FIFO
@@ -100,7 +104,8 @@ static int sms_deliver_fd = -1;
  *       Example:
  *         echo "power 3735859,2" > /tmp/nmt_cmd
  */
-#define NMT_CMD_FIFO "/tmp/nmt_cmd"
+static const char *cmd_fifo_path = "/tmp/nmt_cmd";	/* --cmd-fifo */
+#define NMT_CMD_FIFO cmd_fifo_path
 static int nmt_cmd_fd = -1;
 
 /* settings */
@@ -140,6 +145,9 @@ int tc_band_end   = 0;	/* NMT 900 §4.3.3.13: TC/AC band end channel   (0 = unse
 #define OPT_NETWORK_RX_GAIN	263
 #define OPT_CHARSET		264
 #define OPT_CHARSET_PRINT	265
+#define OPT_SMS_DELIVER		266
+#define OPT_SMS_SUBMIT		267
+#define OPT_CMD_FIFO		268
 
 void print_help(const char *arg0)
 {
@@ -180,6 +188,13 @@ void print_help(const char *arg0)
 	printf("    --charset-print <vendor-model-charset>\n");
 	printf("        Show the table of a codepage: each code, its glyph and the other\n");
 	printf("        characters accepted for it on TX.\n");
+	printf("    --sms-deliver <path>\n");
+	printf("        FIFO to send SMS to mobile stations (default %s)\n", sms_deliver_path);
+	printf("    --sms-submit <path>\n");
+	printf("        File the SMS from mobile stations are written to (default %s)\n", sms_submit_path);
+	printf("    --cmd-fifo <path>\n");
+	printf("        NMT command FIFO (default %s). Several nmt programs at once (e.g. on\n", cmd_fifo_path);
+	printf("        one SDR backend) each need their own paths.\n");
 	printf("    --network-rx-gain <dB>\n");
 	printf("        Gain of the speech from the mobile toward the network, after the\n");
 	printf("        expander. 0 dB puts the reference tone (1 kHz, 3 kHz deviation) at\n");
@@ -273,6 +288,9 @@ static void add_options(void)
 	option_add(OPT_NETWORK_RX_GAIN, "network-rx-gain", 1);
 	option_add(OPT_CHARSET, "charset", 1);
 	option_add(OPT_CHARSET_PRINT, "charset-print", 1);
+	option_add(OPT_SMS_DELIVER, "sms-deliver", 1);
+	option_add(OPT_SMS_SUBMIT, "sms-submit", 1);
+	option_add(OPT_CMD_FIFO, "cmd-fifo", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -449,6 +467,15 @@ error_ta:
 			sms_8bit_set = 4;
 		else
 			sms_8bit_set = 0;
+		break;
+	case OPT_SMS_DELIVER:
+		sms_deliver_path = options_strdup(argv[argi]);
+		break;
+	case OPT_SMS_SUBMIT:
+		sms_submit_path = options_strdup(argv[argi]);
+		break;
+	case OPT_CMD_FIFO:
+		cmd_fifo_path = options_strdup(argv[argi]);
 		break;
 	case OPT_CHARSET_PRINT:
 		{
