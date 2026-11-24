@@ -765,12 +765,15 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 	p = afc_block(&pocsag->afc, length, pocsag->samplerate);
 	if (p != 0.0) {
 		pocsag->fsk_rx_pll.dc_offset += p * pocsag->fsk_polarity;
+		/* the symbol in progress: its samples so far as from this block */
+		pocsag->fsk_rx_pll.sym_sum += p * pocsag->fsk_polarity * pocsag->fsk_rx_pll.sym_n;
 		for (i = 0; i < FSK_PLL_SYM_HIST; i++)
 			pocsag->fsk_rx_pll.sym_hist[i] += p * pocsag->fsk_polarity;
 		for (i = 0; i < pocsag->rx_baud_count; i++) {
 			int h;
 
 			pocsag->rx_baud[i].pll.dc_offset += p * pocsag->fsk_polarity;
+			pocsag->rx_baud[i].pll.sym_sum += p * pocsag->fsk_polarity * pocsag->rx_baud[i].pll.sym_n;
 			for (h = 0; h < FSK_PLL_SYM_HIST; h++)
 				pocsag->rx_baud[i].pll.sym_hist[h] += p * pocsag->fsk_polarity;
 		}

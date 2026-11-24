@@ -1185,8 +1185,13 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 
 	/* AFC: a trim set while the last block was decoded turns the
 	 * demodulator from this block on: the slicer level follows it here */
-	if (gsc->afc.range > 0.0)
-		gsc->rx_dc += afc_block(&gsc->afc, length, gsc->sender.samplerate);
+	if (gsc->afc.range > 0.0) {
+		double p = afc_block(&gsc->afc, length, gsc->sender.samplerate);
+
+		gsc->rx_dc += p;
+		/* the bit in progress: its samples so far as from this block */
+		gsc->rx_bit_sum += p * gsc->rx_bit_n;
+	}
 
 	for (i = 0; i < length; i++) {
 		double level = (gsc->afc.range > 0.0) ? gsc->rx_dc : 0.0;
