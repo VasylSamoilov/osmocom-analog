@@ -134,6 +134,15 @@ double afc_block(afc_t *afc, int length, int samplerate)
 	double p;
 	int i;
 
+	/* the trims set while the last block was decoded turn the demodulator
+	 * from this block on */
+	p = afc->pending;
+	if (p != 0.0) {
+		for (i = 0; i < AFC_HIST; i++)
+			afc->hist[i] += p;
+		afc->pending = 0.0;
+	}
+	/* a decay trim set now turns it from the next block on (pending) */
 	if (afc->range > 0.0 && samplerate > 0) {
 		afc->samples += length;
 		if (afc->samples >= samplerate) {
@@ -145,12 +154,6 @@ double afc_block(afc_t *afc, int length, int samplerate)
 				afc_set_trim(afc, afc->hunt_centre);
 			}
 		}
-	}
-	p = afc->pending;
-	if (p != 0.0) {
-		for (i = 0; i < AFC_HIST; i++)
-			afc->hist[i] += p;
-		afc->pending = 0.0;
 	}
 	return p;
 }
