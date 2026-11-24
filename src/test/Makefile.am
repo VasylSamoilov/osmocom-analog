@@ -11,6 +11,7 @@ noinst_PROGRAMS = \
 	test_sms \
 	test_linesignal \
 	test_sms_escape \
+	test_nmt_charset \
 	test_performance \
 	test_hagelbarger \
 	test_v27scrambler \
@@ -170,6 +171,11 @@ test_sms_escape_SOURCES = test_sms_escape.c
 
 test_sms_escape_LDADD = \
 	-lm
+
+test_nmt_charset_SOURCES = test_nmt_charset.c
+
+test_nmt_charset_LDADD = \
+	$(top_builddir)/src/libpagercharset/libpagercharset.a
 
 test_performance_SOURCES = dummy.c test_performance.c
 
