@@ -1,7 +1,9 @@
 # SDR backend with registered channels (design, for review)
 
-Status: design, 2026-11-23. Nothing of this is built yet except the
-measured prototypes of the filter banks (`~/.cache/sdrangel-rp-rates/pfb`).
+Status 2026-11-24: steps 1, 2 and 3 built (filter banks, the engine in the
+device threads, `osmo-sdr-backend` with `--sdr-backend <socket>` in the
+programs). Open: two programs on one B210 over the air, phones on the
+engine path, broadcast FM next to them, the Pi 4.
 
 ## Goal
 
@@ -171,14 +173,31 @@ Over the air with phones, B210, filter bank active (2026-11-23):
 
 ## Transport (backend process): local only
 
-- Control: a Unix socket. Register (direction, frequency, bandwidth, DSP
-  rate, name), unregister, status. Answers: accepted (ring names) or refused
-  (reason).
-- Samples: shared memory, one ring per channel and direction, single
-  producer, single consumer, lock free; complex float at the DSP rate (48 k:
-  384 kB/s per channel). Latency: one ring fill, set by the program as its
-  buffer today.
-- A program crashing frees its channels (socket closed).
+- Control: a Unix socket (SOCK_SEQPACKET, `@name` = abstract namespace),
+  `libsdr/sdr_backend.c`. One request per connection: the program's
+  channels by frequency, its DSP rate, ring length and TX target. Answer:
+  accepted (a memfd, sealed against resizing, passed with SCM_RIGHTS; the
+  TX scale; the centres) or refused (the reason).
+- Samples: the group's view (`sdr_view_t`) in that shared memory: one RX
+  and one TX ring per program (a row holds a sample of every channel, so
+  all its channels stay in step), single producer, single consumer, lock
+  free, complex float at the DSP rate; the counters. No pointers in it;
+  each side keeps its own ring sizes, the device threads range-check every
+  index the program writes (out of range: nothing in, silence out,
+  counted). Latency: one ring fill, set by the program as its buffer.
+- A program ending or crashing frees its channels (connection closed); a
+  backend ending ends its programs (they see the connection close).
+- Programs: `--sdr-backend <socket>` (`libsdr/sdr_client.c`, `sdr.c`
+  client mode, the same port code as the engine in-process). Backend:
+  `osmo-sdr-backend --tx <MHz> --rx <MHz> --dsp-rate <Hz> --channels <n>`
+  with the usual device options.
+
+Tests: `test_sdr_backend` (null device, TX looped to RX, programs as
+processes: own channels back, the others' <= -173 dB; a killed program
+removed; a bad index counted, nobody else affected; refusal with reason;
+the backend going). End to end: RTL-SDR RX only as the clock with the
+POCSAG test transmission as RX IQ, `pocsag --sdr-backend`: 6/6 messages;
+the client ends within 1 s when the backend stops.
 
 ## Steps
 
