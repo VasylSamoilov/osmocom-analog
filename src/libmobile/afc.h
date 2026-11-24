@@ -36,6 +36,7 @@ typedef struct afc {
 	double		range;		/* most trim (Hz), 0 = off */
 	double		dev_hz;		/* Hz of a sample value of 1.0 */
 	double		trim;		/* trim set (Hz) */
+	double		trim_block;	/* trim the demodulator had for the block being decoded (Hz) */
 	double		hunt_centre;	/* trim while hunting (Hz) */
 	double		pending;	/* DC change from the next block on (sample units) */
 	int		fits;		/* fits in this reception */

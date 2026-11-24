@@ -825,7 +825,7 @@ static void flex_afc_fit(flex_t *flex, uint32_t corrected)
 	/* the fitted DC, held for the frame */
 	flex->rx.pll_zero = dc;
 	LOGP_CHAN(DDSP, LOGL_INFO, "RX: AFC: carrier %+.0f Hz off the demodulator, trim %+.0f Hz -> %+.0f Hz (deviation %.2f).\n",
-		  dc * flex->rx.afc.dev_hz, flex->rx.afc.trim, flex->rx.afc.trim + dc * flex->rx.afc.dev_hz, fabs(dev));
+		  dc * flex->rx.afc.dev_hz, flex->rx.afc.trim_block, flex->rx.afc.trim_block + dc * flex->rx.afc.dev_hz, fabs(dev));
 	afc_measured(&flex->rx.afc, dc);
 }
 

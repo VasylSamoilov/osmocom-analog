@@ -260,7 +260,7 @@ static int pocsag_afc_sync(pocsag_t *pocsag, const fsk_pll_t *pll, double pol, i
 		return 0;
 	}
 	LOGP_CHAN(DDSP, LOGL_INFO, "AFC: carrier %+.0f Hz off the demodulator, trim %+.0f Hz -> %+.0f Hz (deviation %.2f).\n",
-		  *dc * pocsag->afc.dev_hz, pocsag->afc.trim, pocsag->afc.trim + *dc * pocsag->afc.dev_hz, fabs(dev));
+		  *dc * pocsag->afc.dev_hz, pocsag->afc.trim_block, pocsag->afc.trim_block + *dc * pocsag->afc.dev_hz, fabs(dev));
 	afc_measured(&pocsag->afc, *dc);
 	return 1;
 }

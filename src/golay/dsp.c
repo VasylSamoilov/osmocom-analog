@@ -259,7 +259,7 @@ static void golay_afc_preamble(gsc_t *gsc, uint16_t value, int inverted)
 		return;
 	}
 	LOGP_CHAN(DDSP, LOGL_INFO, "AFC: carrier %+.0f Hz off the demodulator, trim %+.0f Hz -> %+.0f Hz (deviation %.2f).\n",
-		  dc * gsc->afc.dev_hz, gsc->afc.trim, gsc->afc.trim + dc * gsc->afc.dev_hz, fabs(dev));
+		  dc * gsc->afc.dev_hz, gsc->afc.trim_block, gsc->afc.trim_block + dc * gsc->afc.dev_hz, fabs(dev));
 	gsc->rx_dc = dc;
 	gsc->rx_dc_held = 1;
 	afc_measured(&gsc->afc, dc);

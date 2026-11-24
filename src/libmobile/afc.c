@@ -114,7 +114,9 @@ void afc_measured(afc_t *afc, double dc)
 		afc->confirmed = 0;
 	afc->fits++;
 	afc->last_fit_hz = dc * afc->dev_hz;
-	afc_set_trim(afc, afc->trim + afc->last_fit_hz);
+	/* the fit is relative to the demodulator of this block: a trim set
+	 * earlier in this block (decay, release) has not turned it yet */
+	afc_set_trim(afc, afc->trim_block + afc->last_fit_hz);
 }
 
 void afc_release(afc_t *afc, int decoded)
@@ -142,6 +144,7 @@ double afc_block(afc_t *afc, int length, int samplerate)
 			afc->hist[i] += p;
 		afc->pending = 0.0;
 	}
+	afc->trim_block = afc->trim;
 	/* a decay trim set now turns it from the next block on (pending) */
 	if (afc->range > 0.0 && samplerate > 0) {
 		afc->samples += length;
