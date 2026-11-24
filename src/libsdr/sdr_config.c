@@ -53,6 +53,7 @@ void sdr_config_init(double lo_offset)
 	sdr_config->timestamps = 1;
 	sdr_config->rpitx_ratio = RPITX_DEFAULT_RATIO;
 	sdr_config->filter_bank = -1;
+	sdr_config->iq_status = 1;
 
 	got_init = 1;
 }
@@ -138,6 +139,10 @@ void sdr_config_print_help(void)
 	printf("        with the number of channels) or a channelizer per channel. 'auto'\n");
 	printf("        uses the bank for two or more channels when the rates fit it.\n");
 	printf("        (default = auto)\n");
+	printf("    --sdr-iq-status on | off\n");
+	printf("        IQ level, peak and clipping counters over every SDR sample (the\n");
+	printf("        status). They cost ~4 %% of a core at 10 MS/s on a PC, more on a\n");
+	printf("        small board. (default = on)\n");
 	printf("    --sdr-backend <socket>\n");
 	printf("        Do not open a device: register the channels on an SDR backend that\n");
 	printf("        owns the radio (docs/SDR-BACKEND.md). '@name' is an abstract socket.\n");
@@ -273,6 +278,7 @@ void sdr_config_print_hotkeys(void)
 #endif
 #define	OPT_SDR_FILTER_BANK	1551
 #define	OPT_SDR_BACKEND		1552
+#define	OPT_SDR_IQ_STATUS	1553
 
 void sdr_config_add_options(void)
 {
@@ -337,6 +343,7 @@ void sdr_config_add_options(void)
 	option_add(OPT_SDR_RX_PPM, "sdr-rx-ppm", 1);
 	option_add(OPT_SDR_FILTER_BANK, "sdr-filter-bank", 1);
 	option_add(OPT_SDR_BACKEND, "sdr-backend", 1);
+	option_add(OPT_SDR_IQ_STATUS, "sdr-iq-status", 1);
 }
 
 int sdr_config_handle_options(int short_option, int argi, char **argv)
@@ -484,6 +491,16 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 	case OPT_SDR_BACKEND:
 		sdr_config->backend = options_strdup(argv[argi]);
 		use_sdr = 1;
+		break;
+	case OPT_SDR_IQ_STATUS:
+		if (!strcmp(argv[argi], "on"))
+			sdr_config->iq_status = 1;
+		else if (!strcmp(argv[argi], "off"))
+			sdr_config->iq_status = 0;
+		else {
+			fprintf(stderr, "--sdr-iq-status: 'on' or 'off', not '%s'\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
 	/* Per-device split override options */
 	case OPT_SDR_TX_CHANNEL:

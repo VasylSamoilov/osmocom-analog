@@ -31,6 +31,15 @@
 /* Global status instance */
 sdr_status_t sdr_status;
 
+/* the IQ level counters over every SDR rate sample (--sdr-iq-status):
+ * ~2.4 % (RX) + 1.5 % (TX) of a core at 10 MS/s on a PC */
+static int iq_counters = 1;
+
+void sdr_status_iq_counters(int on)
+{
+	iq_counters = on;
+}
+
 void sdr_status_init(int num_channels, double report_interval)
 {
 	memset(&sdr_status, 0, sizeof(sdr_status));
@@ -102,6 +111,8 @@ void sdr_status_tx_iq_accumulate(const float *buff, int iq_num)
 	sdr_tx_status_t *tx = &sdr_status.tx;
 	int s;
 
+	if (!iq_counters)
+		return;
 	for (s = 0; s < iq_num; s++) {
 		double vi = fabs(buff[s * 2]);
 		double vq = fabs(buff[s * 2 + 1]);
@@ -122,6 +133,8 @@ void sdr_status_rx_accumulate(float *buff, int num)
 	sdr_rx_status_t *rx = &sdr_status.rx;
 	int s;
 
+	if (!iq_counters)
+		return;
 	for (s = 0; s < num; s++) {
 		double ri = buff[s * 2];
 		double rq = buff[s * 2 + 1];

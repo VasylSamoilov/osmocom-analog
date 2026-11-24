@@ -1092,6 +1092,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 
 	/* Initialize SDR status monitoring */
 	sdr_status_init(channels, 1.0);
+	sdr_status_iq_counters(sdr_config->iq_status);
 
 	/* FFT-based spectral measurement is configured from main.c after sdr_open,
 	 * using the same data path as the scan engine (decimated DSP-rate IQ). */

@@ -222,6 +222,8 @@ extern sdr_status_t sdr_status;
 
 /* API */
 void sdr_status_init(int num_channels, double report_interval);
+/* the IQ level counters over every SDR rate sample on (default) or off */
+void sdr_status_iq_counters(int on);
 void sdr_status_reset(void);
 
 /* Called from sdr_write to accumulate TX samples: iq_num SDR rate IQ samples,
