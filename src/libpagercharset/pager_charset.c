@@ -71,7 +71,12 @@ static const struct pager_charset *registry[] = {
 	&pager_charset_rds_nokia_finder_text_cyrillic,
 	/* NMT SMS */
 	&pager_charset_nmt_generic_generic_gsm,
-	&pager_charset_nmt_nokia_generic_ukrainian,
+	&pager_charset_nmt_generic_generic_cyrillic,
+	&pager_charset_nmt_nokia_generic_cyrillic,
+	&pager_charset_nmt_generic_generic_baltic,
+	&pager_charset_nmt_generic_generic_central,
+	&pager_charset_nmt_generic_generic_western,
+	&pager_charset_nmt_generic_generic_thai,
 	NULL,
 };
 

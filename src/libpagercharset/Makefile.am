@@ -44,4 +44,8 @@ libpagercharset_a_SOURCES = \
 	charset_rds_nokia_finder_text_cyrillic.c \
 	charset_rds_nokia_nkp2_annex_e.c \
 	charset_nmt_generic_generic_gsm.c \
-	charset_nmt_nokia_generic_ukrainian.c
+	charset_nmt_generic_generic_cyrillic.c \
+	charset_nmt_generic_generic_baltic.c \
+	charset_nmt_generic_generic_central.c \
+	charset_nmt_generic_generic_western.c \
+	charset_nmt_generic_generic_thai.c

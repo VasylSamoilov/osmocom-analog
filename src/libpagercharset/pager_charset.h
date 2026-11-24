@@ -197,6 +197,11 @@ extern const struct pager_charset pager_charset_rds_nokia_finder_text_cyrillic;
 /* --- Built-in NMT SMS codepages (7-bit GSM, 8-bit NMT sets) --- */
 
 extern const struct pager_charset pager_charset_nmt_generic_generic_gsm;
-extern const struct pager_charset pager_charset_nmt_nokia_generic_ukrainian;
+extern const struct pager_charset pager_charset_nmt_generic_generic_cyrillic;
+extern const struct pager_charset pager_charset_nmt_nokia_generic_cyrillic;
+extern const struct pager_charset pager_charset_nmt_generic_generic_baltic;
+extern const struct pager_charset pager_charset_nmt_generic_generic_central;
+extern const struct pager_charset pager_charset_nmt_generic_generic_western;
+extern const struct pager_charset pager_charset_nmt_generic_generic_thai;
 
 #endif /* PAGER_CHARSET_H */
