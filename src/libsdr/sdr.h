@@ -10,6 +10,7 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_level_db);
 int sdr_get_tosend(void *inst, int buffer_size);
 double sdr_set_rx_trim(void *inst, int channel, double hz);
+void sdr_set_rx_bandwidth(void *inst, int channel, double hz);
 void calibrate_bias(void);
 int sdr_get_samplerate(void *inst);
 int sdr_set_rx_frequency(double frequency);

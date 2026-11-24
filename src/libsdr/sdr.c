@@ -112,8 +112,10 @@ typedef struct sdr_chan {
 	int		rx_init, tx_init;
 	channelizer_t	rx_ch;		/* SDR rate -> DSP rate, channel at 0 Hz */
 	channelizer_t	tx_ch;		/* DSP rate -> SDR rate, 0 Hz to the channel */
-	double		tx_offset, rx_offset;	/* from the SDR centre (engine mode) */
+	double		tx_offset, rx_offset;	/* from the SDR centre (tx: engine mode) */
 	double		rx_trim;	/* RX frequency trim of the demodulator (Hz), set by the decoder */
+	double		rx_bandwidth_req;	/* RX channel filter asked by the decoder (Hz), 0 = not asked (Carson) */
+	double		rx_bandwidth;	/* RX channel filter set (Hz), 0 = never changed */
 } sdr_chan_t;
 
 typedef struct sdr {
@@ -676,9 +678,9 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 				rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, 0.0, bandwidth); /* bandwidth are deviation and both sidebands */
 			if (rc < 0)
 				goto error;
+			sdr->chan[c].rx_offset = rx_offset;
 			if (sdr->use_engine) {
 				/* registered with the engine below */
-				sdr->chan[c].rx_offset = rx_offset;
 				LOGP(DSDR, LOGL_INFO, "RX channel %d: %.6f MHz, offset %+.1f kHz, filter bank\n",
 				     c, sdr->chan[c].rx_frequency / 1e6, rx_offset / 1e3);
 				continue;
@@ -1976,6 +1978,8 @@ static int sdr_tx_device_paced(void)
 }
 
 /* how much do we need to send (in audio sample duration) to get the target delay (buffer size) */
+static void apply_rx_bandwidth(sdr_t *sdr, int channel);
+
 /* RX frequency trim of one channel (Hz, added to the channel's frequency):
  * the FM demodulator's oscillator moves the channel to 0 Hz before its
  * lowpass (fm_demod_set_offset()), so the channel filter follows the signal.
@@ -2000,8 +2004,52 @@ double sdr_set_rx_trim(void *inst, int channel, double hz)
 	if (hz != sdr->chan[channel].rx_trim) {
 		fm_demod_set_offset(&sdr->chan[channel].fm_demod, hz);
 		sdr->chan[channel].rx_trim = hz;
+		/* a wide filter moves with the channel: keep it off the centre */
+		if (sdr->chan[channel].rx_bandwidth_req > 0.0)
+			apply_rx_bandwidth(sdr, channel);
 	}
 	return hz;
+}
+
+/* the RX channel filter asked for, limited: wider than Carson only as far as
+ * the filter stays off the SDR centre (its DC spike / LO leakage, the
+ * channel placement keeps Carson off it) by RX_DC_GUARD, and within the
+ * usable DSP band */
+#define RX_DC_GUARD	1000.0
+static void apply_rx_bandwidth(sdr_t *sdr, int channel)
+{
+	sdr_chan_t *ch = &sdr->chan[channel];
+	double hz = ch->rx_bandwidth_req, room;
+
+	if (hz <= 0.0)
+		hz = sdr->bandwidth;
+	if (hz > sdr->bandwidth) {
+		room = 2.0 * (fabs(ch->rx_offset + ch->rx_trim) - RX_DC_GUARD);
+		if (hz > room)
+			hz = room;
+		if (hz < sdr->bandwidth)
+			hz = sdr->bandwidth;
+	}
+	if (hz > 0.8 * sdr->samplerate)
+		hz = 0.8 * sdr->samplerate;
+	if (hz != ch->rx_bandwidth) {
+		fm_demod_set_bandwidth(&ch->fm_demod, hz);
+		ch->rx_bandwidth = hz;
+	}
+}
+
+/* RX channel filter bandwidth of one channel (Hz, both sidebands), for a
+ * decoder that hunts with a wide filter and receives with a narrow one
+ * (AFC); 0 = the channel's own (Carson) bandwidth. Limited (see
+ * apply_rx_bandwidth()). Applies from the next sdr_read() on. Main thread. */
+void sdr_set_rx_bandwidth(void *inst, int channel, double hz)
+{
+	sdr_t *sdr = (sdr_t *)inst;
+
+	if (!sdr || channel < 0 || channel >= sdr->channels || !sdr->chan[channel].rx_init || sdr->chan[channel].am)
+		return;
+	sdr->chan[channel].rx_bandwidth_req = hz;
+	apply_rx_bandwidth(sdr, channel);
 }
 
 int sdr_get_tosend(void *inst, int buffer_size)

@@ -26,6 +26,17 @@ void afc_init(afc_t *afc, struct sender *sender, double range_hz, double dev_hz)
 	afc->dev_hz = (dev_hz > 0.0) ? dev_hz : 1.0;
 }
 
+void afc_set_filter(afc_t *afc, double hunt_hz, double track_hz, double narrow_hz)
+{
+	if (afc->range <= 0.0 || hunt_hz <= 0.0 || track_hz <= 0.0)
+		return;
+	afc->hunt_bw = hunt_hz;
+	afc->track_bw = track_hz;
+	afc->narrow_hz = narrow_hz;
+	afc->tracking = 0;
+	afc->bw_applied = 0;	/* at the first block (the SDR is open then) */
+}
+
 void afc_symbol(afc_t *afc, double raw)
 {
 	afc->hist[afc->hist_pos] = raw;
@@ -117,6 +128,15 @@ void afc_measured(afc_t *afc, double dc)
 	/* the fit is relative to the demodulator of this block: a trim set
 	 * earlier in this block (decay, release) has not turned it yet */
 	afc_set_trim(afc, afc->trim_block + afc->last_fit_hz);
+	/* near the noise threshold a carrier cut by the filter on one side is
+	 * measured too close to the centre: narrow only once it is on the
+	 * centre (SDRangel's legMeasured()) */
+	if (afc->hunt_bw > 0.0 && !afc->tracking
+	 && (afc->narrow_hz < 0.0 || fabs(afc->last_fit_hz) < afc->narrow_hz)) {
+		afc->tracking = 1;
+		LOGP(DDSP, LOGL_DEBUG, "AFC: carrier on the centre, channel filter %.1f kHz.\n", afc->track_bw / 1e3);
+		sender_set_rx_bandwidth(afc->sender, afc->track_bw);
+	}
 }
 
 void afc_release(afc_t *afc, int decoded)
@@ -129,6 +149,12 @@ void afc_release(afc_t *afc, int decoded)
 		afc->hunt_centre = afc->trim;
 	afc->fits = 0;
 	afc_set_trim(afc, afc->hunt_centre);
+	/* hunting wide again */
+	if (afc->tracking) {
+		afc->tracking = 0;
+		LOGP(DDSP, LOGL_DEBUG, "AFC: hunting, channel filter %.1f kHz.\n", afc->hunt_bw / 1e3);
+		sender_set_rx_bandwidth(afc->sender, afc->hunt_bw);
+	}
 }
 
 double afc_block(afc_t *afc, int length, int samplerate)
@@ -145,6 +171,11 @@ double afc_block(afc_t *afc, int length, int samplerate)
 		afc->pending = 0.0;
 	}
 	afc->trim_block = afc->trim;
+	/* the hunting filter, once the SDR is open */
+	if (afc->hunt_bw > 0.0 && !afc->bw_applied) {
+		sender_set_rx_bandwidth(afc->sender, afc->tracking ? afc->track_bw : afc->hunt_bw);
+		afc->bw_applied = 1;
+	}
 	/* a decay trim set now turns it from the next block on (pending) */
 	if (afc->range > 0.0 && samplerate > 0) {
 		afc->samples += length;

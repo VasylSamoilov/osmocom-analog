@@ -65,6 +65,7 @@ typedef struct fm_demod {
 int fm_demod_init(fm_demod_t *demod, double samplerate, double offset, double bandwidth);
 void fm_demod_exit(fm_demod_t *demod);
 void fm_demod_set_offset(fm_demod_t *demod, double offset_hz);
+void fm_demod_set_bandwidth(fm_demod_t *demod, double bandwidth);
 void fm_demod_afc_enable(fm_demod_t *demod, double time_constant_s, double max_correction_hz);
 void fm_demod_afc_set_deadband(fm_demod_t *demod, double deadband_hz);
 void fm_demod_afc_disable(fm_demod_t *demod);

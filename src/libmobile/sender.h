@@ -49,6 +49,7 @@ typedef struct sender {
 	int			(*audio_read)(void *, sample_t **, int, int, double *);
 	int			(*audio_get_tosend)(void *, int);
 	double			(*audio_set_rx_trim)(void *, int, double);	/* SDR only: RX frequency trim of a channel */
+	void			(*audio_set_rx_bandwidth)(void *, int, double);	/* SDR only: RX filter of a channel */
 	int			samplerate;
 	samplerate_t		srstate;		/* sample rate conversion state */
 	double			rx_gain;		/* factor of level to apply on RX samples */
@@ -112,6 +113,7 @@ int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, dou
 void sender_destroy(sender_t *sender);
 void sender_set_fm(sender_t *sender, double max_deviation, double max_modulation, double speech_deviation, double max_display);
 double sender_set_rx_trim(sender_t *sender, double hz);
+void sender_set_rx_bandwidth(sender_t *sender, double hz);
 void sender_set_am(sender_t *sender, double max_modulation, double speech_deviation, double max_display, double modulation_index);
 int sender_open_audio(int buffer_size, double interval);
 int sender_start_audio(void);

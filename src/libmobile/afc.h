@@ -30,6 +30,8 @@ struct sender;	/* sender.h (no include guard there) */
 
 #define AFC_HIST		256	/* symbols kept */
 #define AFC_HUNT_WINDOW		64	/* symbols of the hunting mean */
+#define AFC_OFFSET_ROOM		2000.0	/* hunting filter: room each side of Carson (Hz, SDRangel's leg offset allowance) */
+#define AFC_NARROW_RESIDUAL	300.0	/* narrow once a fit is this close (Hz) */
 
 typedef struct afc {
 	struct sender	*sender;
@@ -45,9 +47,19 @@ typedef struct afc {
 	double		last_fit_hz;	/* carrier offset of the last fit (Hz) */
 	double		hist[AFC_HIST];	/* raw symbol values (DC included), oldest first from pos */
 	int		hist_pos, hist_n;
+	/* the channel filter (as SDRangel's legs): hunting wide, receiving
+	 * narrow once a fit placed the carrier closer than narrow_hz (< 0: at
+	 * the first fit); 0 = not switched */
+	double		hunt_bw, track_bw, narrow_hz;
+	int		tracking;
+	int		bw_applied;	/* the hunting filter was set */
 } afc_t;
 
 void afc_init(afc_t *afc, struct sender *sender, double range_hz, double dev_hz);
+/* hunt with a channel filter of hunt_hz (both sidebands), receive with
+ * track_hz once a fit is closer than narrow_hz (< 0: at the first fit);
+ * only with the AFC on (range > 0) */
+void afc_set_filter(afc_t *afc, double hunt_hz, double track_hz, double narrow_hz);
 /* a symbol's raw value (DC included, sample units) */
 void afc_symbol(afc_t *afc, double raw);
 /* hunting: mean of the last n symbols (DC) and the mean distance from it

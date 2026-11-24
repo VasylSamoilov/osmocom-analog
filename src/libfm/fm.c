@@ -319,6 +319,26 @@ void fm_demod_exit(fm_demod_t __attribute__ ((unused)) *demod)
 {
 }
 
+/* Change the bandwidth (2 * (deviation + modulation)) of the channel
+ * filter while receiving: new coefficients, the filter state is kept. For
+ * a decoder that hunts wide and receives narrow (AFC). */
+void fm_demod_set_bandwidth(fm_demod_t *demod, double bandwidth)
+{
+	iir_filter_t f;
+	int i;
+
+	if (!(bandwidth > 0.0) || bandwidth / 2.0 >= demod->samplerate / 2.0)
+		return;
+	iir_lowpass_init(&f, bandwidth / 2.0, demod->samplerate, 2);
+	for (i = 0; i < 2; i++) {
+		demod->lp[i].a0 = f.a0;
+		demod->lp[i].a1 = f.a1;
+		demod->lp[i].a2 = f.a2;
+		demod->lp[i].b1 = f.b1;
+		demod->lp[i].b2 = f.b2;
+	}
+}
+
 /* Update FM demodulator frequency offset (for AFC) */
 void fm_demod_set_offset(fm_demod_t *demod, double offset_hz)
 {

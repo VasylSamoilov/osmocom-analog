@@ -71,6 +71,11 @@ int dsp_init_sender(pocsag_t *pocsag, int samplerate, int baudrate, double devia
 	sender_set_fm(&pocsag->sender, deviation, baudrate, deviation, MAX_DISPLAY);
 	/* AFC: a sample value of 1.0 is the deviation (Hz) */
 	afc_init(&pocsag->afc, &pocsag->sender, pocsag_afc_range, deviation);
+	/* hunting with offset room each side, receiving at Carson once a sync
+	 * word placed the carrier on the centre (SDRangel's legs). Measured:
+	 * the room (15.4 kHz) keeps the sensitivity on the centre, the channel
+	 * width (20 kHz) lost sync words at 4..6 dB channel SNR */
+	afc_set_filter(&pocsag->afc, 2.0 * (deviation + baudrate + AFC_OFFSET_ROOM), 2.0 * (deviation + baudrate), AFC_NARROW_RESIDUAL);
 
 	pocsag->fsk_bitduration = (double)samplerate / (double)baudrate;
 	LOGP_CHAN(DDSP, LOGL_DEBUG, "Use %.4f samples for one bit duration @ %d.\n", pocsag->fsk_bitduration, pocsag->sender.samplerate);

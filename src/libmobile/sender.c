@@ -138,6 +138,7 @@ int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, dou
 			sender->audio_write = sdr_write;
 			sender->audio_get_tosend = sdr_get_tosend;
 			sender->audio_set_rx_trim = sdr_set_rx_trim;
+			sender->audio_set_rx_bandwidth = sdr_set_rx_bandwidth;
 		} else
 #endif
 		{
@@ -339,6 +340,23 @@ double sender_set_rx_trim(sender_t *sender, double hz)
 	if (!inst)
 		return 0.0;
 	return master->audio_set_rx_trim(master->audio, channel, hz);
+}
+
+/* RX channel filter bandwidth (Hz, both sidebands) of this sender's channel,
+ * for a decoder that hunts wide and receives narrow (AFC); 0 = the channel's
+ * own (Carson) bandwidth. SDR only. Takes effect from the next block read. */
+void sender_set_rx_bandwidth(sender_t *sender, double hz)
+{
+	sender_t *master = sender->master ? sender->master : sender, *inst;
+	int channel = 0;
+
+	if (!master->audio || !master->audio_set_rx_bandwidth)
+		return;
+	for (inst = master; inst && inst != sender; inst = inst->slave)
+		channel++;
+	if (!inst)
+		return;
+	master->audio_set_rx_bandwidth(master->audio, channel, hz);
 }
 
 void sender_set_fm(sender_t *sender, double max_deviation, double max_modulation, double speech_deviation, double max_display)
