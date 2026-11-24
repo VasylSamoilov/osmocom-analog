@@ -73,7 +73,8 @@ SUBDIRS += \
 	fuvst \
 	dcf77 \
 	mate \
-	osmocalibrate
+	osmocalibrate \
+	sdrbackend
 
 if HAVE_ALSA
 if HAVE_FUSE

@@ -138,6 +138,9 @@ void sdr_config_print_help(void)
 	printf("        with the number of channels) or a channelizer per channel. 'auto'\n");
 	printf("        uses the bank for two or more channels when the rates fit it.\n");
 	printf("        (default = auto)\n");
+	printf("    --sdr-backend <socket>\n");
+	printf("        Do not open a device: register the channels on an SDR backend that\n");
+	printf("        owns the radio (docs/SDR-BACKEND.md). '@name' is an abstract socket.\n");
 	printf("\n  Per-device overrides (split mode only):\n");
 	printf("    --sdr-tx-channel <channel #>\n");
 	printf("        TX device channel number\n");
@@ -269,6 +272,7 @@ void sdr_config_print_hotkeys(void)
 #define	OPT_SDR_RPITX_RATIO	1550
 #endif
 #define	OPT_SDR_FILTER_BANK	1551
+#define	OPT_SDR_BACKEND		1552
 
 void sdr_config_add_options(void)
 {
@@ -332,6 +336,7 @@ void sdr_config_add_options(void)
 	option_add(OPT_SDR_TX_PPM, "sdr-tx-ppm", 1);
 	option_add(OPT_SDR_RX_PPM, "sdr-rx-ppm", 1);
 	option_add(OPT_SDR_FILTER_BANK, "sdr-filter-bank", 1);
+	option_add(OPT_SDR_BACKEND, "sdr-backend", 1);
 }
 
 int sdr_config_handle_options(int short_option, int argi, char **argv)
@@ -476,6 +481,10 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		}
 		break;
+	case OPT_SDR_BACKEND:
+		sdr_config->backend = options_strdup(argv[argi]);
+		use_sdr = 1;
+		break;
 	/* Per-device split override options */
 	case OPT_SDR_TX_CHANNEL:
 		sdr_config->tx_channel = atoi(argv[argi]);
@@ -596,6 +605,15 @@ int sdr_configure(int samplerate)
 	if (!got_init) {
 		fprintf(stderr, "sdr_config_init was not called, please fix!\n");
 		abort();
+	}
+
+	/* channels on a backend: the device and its options are the backend's */
+	if (sdr_config->backend) {
+		if (have_unified_driver || have_split_driver) {
+			fprintf(stderr, "--sdr-backend: the backend owns the device, do not select a driver as well\n");
+			exit(0);
+		}
+		return 1;
 	}
 
 	/* no sdr selected -> return 0 */

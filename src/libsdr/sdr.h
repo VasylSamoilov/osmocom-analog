@@ -16,6 +16,12 @@ int sdr_get_samplerate(void *inst);
 int sdr_set_rx_frequency(double frequency);
 int sdr_set_tx_frequency(double frequency);
 int sdr_calculate_optimal_rate(int master_rate, double bandwidth);
+/* the device of an SDR backend: call before sdr_open() (no channels, the
+ * frequencies are the centres, the DSP rate the highest of the programs);
+ * nmax: most TX channels. The engine for sdr_backend_start(). */
+struct sdr_engine;
+void sdr_server_mode(int nmax);
+struct sdr_engine *sdr_server_engine(void *inst);
 
 /* SDR capability information */
 typedef struct sdr_caps {

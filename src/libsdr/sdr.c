@@ -51,6 +51,7 @@ enum paging_signal;
 #include "../libchannelizer/channelizer.h"
 #include "../libchannelizer/pfb.h"
 #include "sdr_engine.h"
+#include "sdr_backend.h"
 
 /* enable to debug buffer handling */
 //#define DEBUG_BUFFER
@@ -165,6 +166,12 @@ typedef struct sdr {
 	int		eng_ring_target;	/* TX: DSP samples kept in the group's ring */
 	double		eng_report;		/* time of the last missing / dropped report */
 	long		eng_missing, eng_dropped;	/* reported so far */
+	/* the program side of the group: the engine's own (in-process) or a
+	 * backend's view (client: no device, no device threads) */
+	sdr_port_t	*port;
+	int		use_client;
+	sdr_client_t	client;
+	double		client_check;		/* time the backend was last checked */
 } sdr_t;
 
 /* use the filter banks: on request, or (auto) for two or more channels when
@@ -236,6 +243,121 @@ static int rate_max(int n, int from, int to)
 	return (int)ceil(2.0 * n * to / from) + 64;
 }
 
+/* The device of an SDR backend (sdr_server_mode() before sdr_open() with no
+ * channels, the frequencies are the centres): the engine runs in the
+ * device threads without channels of its own, the backend registers the
+ * programs' groups on it (sdr_server_engine()). */
+static int server_nmax;		/* 0: not a backend */
+
+void sdr_server_mode(int nmax)
+{
+	server_nmax = nmax;
+}
+
+sdr_engine_t *sdr_server_engine(void *inst)
+{
+	sdr_t *sdr = (sdr_t *)inst;
+
+	return (sdr && sdr->use_engine && !sdr->use_client) ? &sdr->engine : NULL;
+}
+
+/* --sdr-backend: no device; the channels (by frequency) are registered on
+ * the backend that owns the radio, it places them and runs the filter
+ * banks; this program exchanges DSP rate samples with it through the
+ * shared view, the same as engine mode in-process. The TX level of every
+ * channel is the backend's (1 / its most channels, docs/SDR-BACKEND.md). */
+static int sdr_open_backend(sdr_t *sdr, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double bandwidth, double max_deviation, double max_modulation, double modulation_index)
+{
+	double tx_f[SDR_ENGINE_MAX_CHAN], rx_f[SDR_ENGINE_MAX_CHAN];
+	int ntx, nrx, nbuf, c, rc;
+	char err[256];
+
+	if (!channels) {
+		LOGP(DSDR, LOGL_ERROR, "--sdr-backend: this program takes the whole SDR band, the backend gives channels only.\n");
+		return -EINVAL;
+	}
+	ntx = tx_frequency ? channels + (sdr->paging_channel ? 1 : 0) : 0;
+	nrx = rx_frequency ? channels : 0;
+	nbuf = (ntx > nrx) ? ntx : nrx;
+	if (nbuf > SDR_ENGINE_MAX_CHAN) {
+		LOGP(DSDR, LOGL_ERROR, "%d channels, the SDR backend takes at most %d.\n", nbuf, SDR_ENGINE_MAX_CHAN);
+		return -EINVAL;
+	}
+	for (c = 0; c < ntx; c++)
+		tx_f[c] = (c < channels) ? tx_frequency[c] : paging_frequency;
+	for (c = 0; c < nrx; c++)
+		rx_f[c] = rx_frequency[c];
+	/* rings as in engine mode: 4 buffers; TX kept at one buffer (the
+	 * device's advance is the backend's) */
+	rc = sdr_client_open(&sdr->client, sdr_config->backend, "osmocom-analog", samplerate, nrx, rx_f, ntx, tx_f,
+			     (int)ceil(4.0 * buffer_size * 1000.0 / samplerate) + 10, buffer_size, err, sizeof(err));
+	if (rc < 0) {
+		LOGP(DSDR, LOGL_ERROR, "%s\n", err);
+		return rc;
+	}
+	sdr->use_client = 1;
+	sdr->use_engine = 1;
+	sdr->port = &sdr->client.port;
+	sdr->eng_ring_target = sdr->port->tx_target;
+	sdr->amplitude = sdr->client.tx_scale;
+	LOGP(DSDR, LOGL_INFO, "SDR backend '%s': %d RX / %d TX channels registered (RX centre %.6f MHz, TX centre %.6f MHz), TX level 1/%.0f\n",
+	     sdr_config->backend, nrx, ntx, sdr->client.rx_centre / 1e6, sdr->client.tx_centre / 1e6, 1.0 / sdr->client.tx_scale);
+
+	/* modulators and demodulators at 0 Hz at the DSP rate */
+	for (c = 0; c < ntx; c++) {
+		sdr->chan[c].tx_frequency = tx_f[c];
+		if (c < channels && am[c]) {
+			double gain = modulation_index / 2.0, bias = 1.0 - gain;
+
+			sdr->chan[c].am = 1;
+			rc = am_mod_init(&sdr->chan[c].am_mod, samplerate, 0.0, sdr->amplitude * gain, sdr->amplitude * bias);
+		} else
+			rc = fm_mod_init(&sdr->chan[c].fm_mod, samplerate, 0.0, sdr->amplitude);
+		if (rc < 0)
+			return rc;
+		sdr->chan[c].tx_offset = tx_f[c] - sdr->client.tx_centre;
+		sdr->chan[c].tx_init = 1;
+		LOGP(DSDR, LOGL_INFO, "TX %s %d: %.6f MHz, offset %+.1f kHz, on the backend\n", (c < channels) ? "channel" : "paging channel", c, tx_f[c] / 1e6, sdr->chan[c].tx_offset / 1e3);
+	}
+	for (c = 0; c < nrx; c++) {
+		sender_t *sender;
+
+		sdr->chan[c].rx_frequency = rx_f[c];
+		sdr->chan[c].am = am[c];
+		if (am[c])
+			rc = am_demod_init(&sdr->chan[c].am_demod, samplerate, 0.0, bandwidth / 2.0, 1.0 / modulation_index);
+		else
+			rc = fm_demod_init(&sdr->chan[c].fm_demod, samplerate, 0.0, bandwidth);
+		if (rc < 0)
+			return rc;
+		sdr->chan[c].rx_offset = rx_f[c] - sdr->client.rx_centre;
+		sdr->chan[c].rx_init = 1;
+		LOGP(DSDR, LOGL_INFO, "RX channel %d: %.6f MHz, offset %+.1f kHz, on the backend\n", c, rx_f[c] / 1e6, sdr->chan[c].rx_offset / 1e3);
+		/* measurements display, as with a device */
+		sender = get_sender_by_empfangsfrequenz(rx_f[c]);
+		if (!sender)
+			continue;
+		sdr->chan[c].dmp_rf_level = display_measurements_add(&sender->dispmeas, "RF Level", "%.1f dB", DISPLAY_MEAS_AVG, DISPLAY_MEAS_LEFT, -96.0, 0.0, -INFINITY);
+		if (!am[c]) {
+			sdr->chan[c].dmp_freq_offset = display_measurements_add(&sender->dispmeas, "Freq. Offset", "%+.2f KHz", DISPLAY_MEAS_AVG, DISPLAY_MEAS_CENTER, -max_modulation / 1000.0 * 2.0, max_modulation / 1000.0 * 2.0, 0.0);
+			sdr->chan[c].dmp_deviation = display_measurements_add(&sender->dispmeas, "Deviation", "%.2f KHz", DISPLAY_MEAS_PEAK2PEAK, DISPLAY_MEAS_LEFT, 0.0, max_deviation / 1000.0 * 1.5, max_deviation / 1000.0);
+		}
+	}
+	sdr->eng_i = calloc(nbuf, sizeof(*sdr->eng_i));
+	sdr->eng_q = calloc(nbuf, sizeof(*sdr->eng_q));
+	if (!sdr->eng_i || !sdr->eng_q)
+		return -ENOMEM;
+	sdr->eng_n = nbuf;
+	for (c = 0; c < nbuf; c++) {
+		sdr->eng_i[c] = calloc(buffer_size, sizeof(sample_t));
+		sdr->eng_q[c] = calloc(buffer_size, sizeof(sample_t));
+		if (!sdr->eng_i[c] || !sdr->eng_q[c])
+			return -ENOMEM;
+	}
+	sdr_status_init(channels, 1.0);
+	return 0;
+}
+
 static void *sdr_open_internal(int direction, const char *device, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double interval, double max_deviation, double max_modulation, double modulation_index)
 {
 	sdr_t *sdr;
@@ -269,6 +391,9 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 	/* SDR rate of each direction (split mode: each device its own) */
 	sdr->tx_rate = (sdr_config->split_mode && sdr_config->tx_samplerate) ? sdr_config->tx_samplerate : sdr_config->samplerate;
 	sdr->rx_rate = (sdr_config->split_mode && sdr_config->rx_samplerate) ? sdr_config->rx_samplerate : sdr_config->samplerate;
+	/* on a backend the SDR rate is its own: here only DSP rate samples */
+	if (sdr_config->backend)
+		sdr->tx_rate = sdr->rx_rate = samplerate;
 	if (sdr->tx_rate < samplerate || sdr->rx_rate < samplerate) {
 		LOGP(DSDR, LOGL_ERROR, "The SDR sample rate (TX %d, RX %d) must be at least the DSP sample rate %d (-s).\n", sdr->tx_rate, sdr->rx_rate, samplerate);
 		goto error;
@@ -386,6 +511,50 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		tx_frequency = NULL;
 	}
 
+	/* channels on a backend: no device */
+	if (sdr_config->backend) {
+		if (sdr_open_backend(sdr, tx_frequency, rx_frequency, am, channels, paging_frequency, samplerate, buffer_size, bandwidth, max_deviation, max_modulation, modulation_index) < 0)
+			goto error;
+		return sdr;
+	}
+
+	/* a backend's device: the engine without channels of its own; the
+	 * DSP rate given is the highest the programs may use */
+	if (server_nmax && !channels) {
+		int tx_r = tx_frequency ? sdr->tx_rate : 0, rx_r = rx_frequency ? sdr->rx_rate : 0;
+		int max_block = (sdr->rx_max_in > sdr->tx_max_out) ? sdr->rx_max_in : sdr->tx_max_out;
+
+		if (tx_frequency)
+			tx_center_frequency = tx_frequency[0];
+		if (rx_frequency)
+			rx_center_frequency = rx_frequency[0];
+		if (sdr_tx_is_rpitx()) {
+			LOGP(DSDR, LOGL_ERROR, "SDR backend: rpitx makes its own carrier, it cannot carry the programs' channels.\n");
+			goto error;
+		}
+		if ((tx_r && !sdr_engine_bins(tx_r, samplerate, server_nmax)) || (rx_r && !sdr_engine_bins(rx_r, samplerate, server_nmax))) {
+			LOGP(DSDR, LOGL_ERROR, "SDR backend: no filter bank fits SDR rate %d / %d and DSP rate %d (sub-bands must be wider than the DSP rate).\n", tx_r, rx_r, samplerate);
+			goto error;
+		}
+		rc = sdr_engine_init(&sdr->engine, rx_r, tx_r, samplerate, server_nmax, max_block);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "Filter bank engine: %s\n", sdr_engine_error());
+			goto error;
+		}
+		sdr->use_engine = 1;
+		/* TX: the device a few blocks ahead, as in engine mode */
+		if (tx_r) {
+			double adv = 0.005, buf = (double)buffer_size / samplerate;
+
+			if (4.0 * 2040 / sdr->tx_rate > adv)
+				adv = 4.0 * 2040 / sdr->tx_rate;
+			if (adv > buf / 2.0)
+				adv = buf / 2.0;
+			sdr->eng_advance = (int)(adv * sdr->tx_rate);
+		}
+		LOGP(DSDR, LOGL_INFO, "SDR backend: filter banks for up to %d TX channels at DSP rates up to %d, centre TX %.6f MHz, RX %.6f MHz\n",
+		     server_nmax, samplerate, tx_center_frequency / 1e6, rx_center_frequency / 1e6);
+	} else
 	if (tx_frequency && !channels) {
 		/* channels = 0: the caller's IQ is the whole band around the centre */
 		tx_center_frequency = tx_frequency[0];
@@ -597,7 +766,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		LOGP(DSDR, LOGL_INFO, "Using gain: TX %.1f dB\n", sdr_config->tx_gain);
 	}
 
-	if (rx_frequency && !channels)
+	if (rx_frequency && !channels && !server_nmax)
 		rx_center_frequency = rx_frequency[0];
 	if (rx_frequency && channels) {
 		/* calculate required bandwidth (IQ rate) */
@@ -710,8 +879,9 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		}
 	}
 
-	/* engine mode: the program's channels as one group */
-	if (sdr->use_engine) {
+	/* engine mode: the program's channels as one group (a backend's
+	 * device has none, its programs register theirs) */
+	if (sdr->use_engine && channels) {
 		int ntx = tx_frequency ? channels + (sdr->paging_channel ? 1 : 0) : 0;
 		int nrx = rx_frequency ? channels : 0, nbuf = (ntx > nrx) ? ntx : nrx;
 		double tx_off[SDR_ENGINE_MAX_CHAN], rx_off[SDR_ENGINE_MAX_CHAN];
@@ -732,6 +902,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			LOGP(DSDR, LOGL_ERROR, "Filter bank engine: %s\n", sdr_engine_error());
 			goto error;
 		}
+		sdr->port = &sdr->group->port;
 		for (c = 0; c < ntx; c++)
 			sdr->chan[c].tx_init = 1;
 		for (c = 0; c < nrx; c++)
@@ -771,7 +942,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			LOGP(DSDR, LOGL_INFO, "RX channel %d: filter bank sub-band %d\n", c, sdr->group->rx[c].bin);
 	}
 
-	if (rx_frequency && !channels) {
+	if (rx_frequency && !channels && !server_nmax) {
 		/* channels = 0: the whole usable band around the centre to the caller */
 		rc = channelizer_rx_init(&sdr->band_rx, sdr->rx_rate, samplerate, 0.0, 2.0 * CHANNELIZER_PASS * samplerate, sdr->rx_max_in);
 		if (rc < 0) {
@@ -1473,6 +1644,10 @@ int sdr_start(void *inst)
 	sdr_t *sdr = (sdr_t *)inst;
 	int rc = -EINVAL;
 
+	/* on a backend: its device threads run already */
+	if (sdr->use_client)
+		return 0;
+
 #ifdef HAVE_UHD
 	if (tx_driver == 1 || rx_driver == 1)
 		rc = uhd_start();
@@ -1614,8 +1789,11 @@ void sdr_close(void *inst)
 			channelizer_exit(&sdr->band_rx);
 		if (sdr->band_tx_init)
 			channelizer_exit(&sdr->band_tx);
-		/* the device threads are stopped: the engine and its group go */
-		if (sdr->use_engine)
+		/* the device threads are stopped: the engine and its group go;
+		 * on a backend the registration ends with the connection */
+		if (sdr->use_client)
+			sdr_client_close(&sdr->client);
+		else if (sdr->use_engine)
 			sdr_engine_exit(&sdr->engine);
 		if (sdr->eng_i) {
 			int b;
@@ -1716,7 +1894,7 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 		}
 		if (sdr->use_engine) {
 			double chan_tx_freq[SDR_STATUS_MAX_CHANNELS];
-			int written = sdr_engine_group_write(sdr->group, sdr->eng_i, sdr->eng_q, num);
+			int written = sdr_port_write(sdr->port, sdr->eng_i, sdr->eng_q, num);
 
 			if (written < num)
 				LOGP(DSDR, LOGL_ERROR, "Write SDR buffer overflow (%d of %d DSP samples fit)!\n", written, num);
@@ -1818,6 +1996,20 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 	int count = 0, avail, need, take, used = 0, out;
 	int c, s;
 
+	/* on a backend: once a second, is it still there? Gone: the program
+	 * ends (-EPERM: the sender loop quits) */
+	if (sdr->use_client) {
+		double t = get_time();
+
+		if (t - sdr->client_check >= 1.0) {
+			sdr->client_check = t;
+			if (!sdr_client_alive(&sdr->client)) {
+				LOGP(DSDR, LOGL_ERROR, "SDR backend '%s' is gone, ending.\n", sdr_config->backend);
+				return -EPERM;
+			}
+		}
+	}
+
 	/* No RX in tx_only mode (e.g. rpitx). The sender loop of libmobile reads
 	 * on every turn, so this is expected: nothing received. */
 	if (sdr_config && sdr_config->tx_only)
@@ -1859,10 +2051,10 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		if (sdr->use_engine) {
 			double now = get_time();
 
-			rows = sdr_engine_group_read(sdr->group, sdr->eng_i, sdr->eng_q, num);
+			rows = sdr_port_read(sdr->port, sdr->eng_i, sdr->eng_q, num);
 			/* the engine's faults, once a second when they change */
 			if (now - sdr->eng_report >= 1.0) {
-				long missing = sdr->group->view->tx_missing, dropped = sdr->group->view->rx_dropped;
+				long missing = sdr->port->view->tx_missing, dropped = sdr->port->view->rx_dropped;
 
 				if (missing != sdr->eng_missing || dropped != sdr->eng_dropped)
 					LOGP(DSDR, LOGL_ERROR, "Filter bank engine: TX rows missing %ld, RX rows dropped %ld in the last %.1f s (total %ld / %ld)\n",
@@ -2066,9 +2258,9 @@ int sdr_get_tosend(void *inst, int buffer_size)
 
 	/* engine mode: the group's TX ring (DSP samples) kept at buffer_size;
 	 * the device TX thread takes from it at the device clock */
-	if (sdr->use_engine && sdr->group && sdr->group->n_tx) {
+	if (sdr->use_engine && sdr->port && sdr->port->n_tx) {
 		/* the device's advance is part of the buffer */
-		count = buffer_size - (sdr->buffer_size - sdr->eng_ring_target) - sdr_port_tx_fill(&sdr->group->port);
+		count = buffer_size - (sdr->buffer_size - sdr->eng_ring_target) - sdr_port_tx_fill(sdr->port);
 		return (count > 0) ? count : 0;
 	}
 

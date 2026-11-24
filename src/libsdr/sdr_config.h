@@ -50,6 +50,7 @@ typedef struct sdr_config {
 	int		tx_only;		/* --sdr-tx-only flag */
 	int		rx_only;		/* --sdr-rx-only flag */
 	int		filter_bank;		/* --sdr-filter-bank: -1 auto, 0 off, 1 on */
+	const char	*backend;		/* --sdr-backend <socket>: channels on an SDR backend, no device */
 	/* Per-device split overrides (split mode only) */
 	int		tx_channel;		/* --sdr-tx-channel */
 	int		rx_channel;		/* --sdr-rx-channel */

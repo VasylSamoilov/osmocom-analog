@@ -1,0 +1,36 @@
+AM_CPPFLAGS = -Wall -Wextra -Wmissing-prototypes -g $(all_includes)
+
+if HAVE_SDR
+
+bin_PROGRAMS = osmo-sdr-backend
+
+osmo_sdr_backend_SOURCES = main.c
+osmo_sdr_backend_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/liboptions/liboptions.a \
+	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libfm/libfm.a \
+	$(top_builddir)/src/libam/libam.a \
+	$(top_builddir)/src/libemphasis/libemphasis.a \
+	$(top_builddir)/src/libsamplerate/libsamplerate.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
+	$(top_builddir)/src/libjitter/libjitter.a \
+	$(top_builddir)/src/libpll/libpll.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
+	$(top_builddir)/src/libdisplay/libdisplay.a \
+	$(top_builddir)/src/libfilter/libfilter.a \
+	$(top_builddir)/src/libfft/libfft.a \
+	$(top_builddir)/src/libwave/libwave.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	$(top_builddir)/src/liblogging/liblogging.a \
+	$(LIBOSMOCORE_LIBS) \
+	$(UHD_LIBS) \
+	$(SOAPY_LIBS) \
+	$(RPITX_LIBS) \
+	-lpthread \
+	-lm
+
+AM_CPPFLAGS += -DHAVE_SDR
+
+endif
