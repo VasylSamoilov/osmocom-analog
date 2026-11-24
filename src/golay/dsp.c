@@ -60,6 +60,10 @@ int dsp_init_sender(gsc_t *gsc, int samplerate, double deviation, double polarit
 	sender_set_fm(&gsc->sender, deviation, 600.0, deviation, MAX_DISPLAY);
 	/* AFC: a sample value of 1.0 is the deviation (Hz) */
 	afc_init(&gsc->afc, &gsc->sender, golay_afc_range, deviation);
+	/* GSC receives with offset room each side of Carson, hunting and
+	 * receiving (SDRangel's GSC leg): its few known patterns may place
+	 * the carrier that far off at a low signal to noise ratio */
+	afc_set_filter(&gsc->afc, 2.0 * (deviation + 600.0 + AFC_OFFSET_ROOM), 2.0 * (deviation + 600.0 + AFC_OFFSET_ROOM), -1.0);
 
 	gsc->fsk_bitduration = (double)samplerate / 600.0;
 	gsc->fsk_bitstep = 1.0 / gsc->fsk_bitduration;
