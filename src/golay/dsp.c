@@ -1187,8 +1187,10 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 	for (i = 0; i < length; i++) {
 		double level = (gsc->afc.range > 0.0) ? gsc->rx_dc : 0.0;
 
-		/* AFC: the middle half of each bit, DC included */
-		if (gsc->afc.range > 0.0 && gsc->fsk_rx_phase >= 0.25 && gsc->fsk_rx_phase < 0.75) {
+		/* AFC: the bit's value, DC included. The PLL below holds the
+		 * transitions at phase 0.5 and decides the bit at the wrap (its
+		 * centre): the quarter bit before the wrap, inside the bit */
+		if (gsc->afc.range > 0.0 && gsc->fsk_rx_phase >= 0.75) {
 			gsc->rx_bit_sum += samples[i];
 			gsc->rx_bit_n++;
 		}
