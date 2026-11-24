@@ -650,7 +650,10 @@ static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 	int i;
 
 	fsk_pll_set_locked(&pocsag->fsk_rx_pll, 1);
-	fsk_pll_set_dc_removal(&pocsag->fsk_rx_pll, 0); /* freeze DC during data decode */
+	/* freeze DC during data decode and between batches; with fixed baud
+	 * rate and polarity this decoder also hunts (no scanner): then the DC
+	 * is the hunting mean, as the scanner's */
+	fsk_pll_set_dc_removal(&pocsag->fsk_rx_pll, !pocsag->fsk_rx_sync && !pocsag->rx_resync_countdown);
 
 	for (i = 0; i < length; i++) {
 		uint8_t bit_val;
@@ -659,6 +662,7 @@ static void fsk_decode_locked(pocsag_t *pocsag, sample_t *spl, int length)
 			continue;
 
 		fsk_block_decode(pocsag, bit_val);
+		fsk_pll_set_dc_removal(&pocsag->fsk_rx_pll, !pocsag->fsk_rx_sync && !pocsag->rx_resync_countdown);
 	}
 }
 
