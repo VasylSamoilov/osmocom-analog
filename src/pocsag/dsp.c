@@ -203,6 +203,9 @@ static void dsp_rx_lock(pocsag_t *pocsag, int baudrate, double polarity)
  * confirmed by a message (or two sync words) */
 static void dsp_rx_afc_release(pocsag_t *pocsag)
 {
+	/* a message still open (its batch ended without idle or address) is
+	 * complete: it confirms this reception, not the next one */
+	put_rx_end(pocsag);
 	afc_release(&pocsag->afc, pocsag->afc_decoded);
 	pocsag->afc_decoded = 0;
 }

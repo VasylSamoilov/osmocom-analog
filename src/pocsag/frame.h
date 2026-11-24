@@ -4,4 +4,5 @@ int scan_message(const char *message_input, int message_input_length, char *mess
 int pocsag_bch_correct(uint32_t *word, uint32_t *corrections_out);
 int64_t get_codeword(pocsag_t *pocsag);
 void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot);
+void put_rx_end(pocsag_t *pocsag);
 

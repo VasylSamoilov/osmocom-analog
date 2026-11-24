@@ -1642,6 +1642,7 @@ static void done_rx_msg(pocsag_t *pocsag)
 
 	/* Send the highest-scoring printable candidate to upper layer */
 	if (ncand > 0) {
+		pocsag->afc_decoded = 1;	/* a copy decoded confirms the AFC's reception */
 		/*
 		 * RX dedup: check message history for retransmission.
 		 * If a matching (ric, function) message with the same codeword count
@@ -1770,19 +1771,23 @@ static void done_rx_msg(pocsag_t *pocsag)
 
 				pager_charset_decode_text(pocsag->charset, (const uint8_t *)cand[0].data,
 							  cand[0].len, decoded, sizeof(decoded));
-				pocsag->afc_decoded = 1;
 				pocsag_msg_receive(pocsag->sender.kanal, pocsag->rx_msg_ric,
 						   pocsag->rx_msg_function, pocsag->rx_msg_type,
 						   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, decoded);
 			} else {
 				text = print_message(cand[0].data, cand[0].len);
-				pocsag->afc_decoded = 1;
 				pocsag_msg_receive(pocsag->sender.kanal, pocsag->rx_msg_ric,
 						   pocsag->rx_msg_function, pocsag->rx_msg_type,
 						   pocsag->rx_baud_locked, pocsag->rx_polarity_locked, text);
 			}
 		}
 	}
+}
+
+/* the transmission ended: a message still open is complete */
+void put_rx_end(pocsag_t *pocsag)
+{
+	done_rx_msg(pocsag);
 }
 
 void put_codeword(pocsag_t *pocsag, uint32_t word, int8_t slot, int8_t subslot)
