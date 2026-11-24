@@ -83,7 +83,18 @@ typedef struct fsk_pll {
 
 	/* Lock state */
 	int		locked;		/* 1 = PLL is locked (use slower correction) */
+
+	/* Symbol values for the AFC (libmobile/afc.c): the mean over the middle
+	 * 50 % of each symbol, DC included, of (sample * polarity); the last
+	 * FSK_PLL_SYM_HIST of them */
+	double		sym_sum;
+	int		sym_n;
+	double		sym_hist[64];
+	int		sym_hist_pos;
+	int		sym_hist_n;
 } fsk_pll_t;
+
+#define FSK_PLL_SYM_HIST	64
 
 /*
  * Initialize an FSK PLL instance.

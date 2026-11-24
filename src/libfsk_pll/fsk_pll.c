@@ -80,6 +80,11 @@ void fsk_pll_reset(fsk_pll_t *pll)
 	pll->level_count = 0;
 
 	pll->locked = 0;
+
+	pll->sym_sum = 0.0;
+	pll->sym_n = 0;
+	pll->sym_hist_pos = 0;
+	pll->sym_hist_n = 0;
 }
 
 void fsk_pll_copy_state(fsk_pll_t *dst, const fsk_pll_t *src)
@@ -90,6 +95,13 @@ void fsk_pll_copy_state(fsk_pll_t *dst, const fsk_pll_t *src)
 
 	/* Copy DC offset */
 	dst->dc_offset = src->dc_offset;
+
+	/* Copy the symbol values (AFC) */
+	dst->sym_sum = src->sym_sum;
+	dst->sym_n = src->sym_n;
+	memcpy(dst->sym_hist, src->sym_hist, sizeof(dst->sym_hist));
+	dst->sym_hist_pos = src->sym_hist_pos;
+	dst->sym_hist_n = src->sym_hist_n;
 
 	/* Copy votes (in-progress symbol) */
 	dst->vote_high = src->vote_high;
@@ -124,6 +136,12 @@ int fsk_pll_process(fsk_pll_t *pll, sample_t sample, double polarity, uint8_t *b
 
 	/* Step 2: Phase percentage for voting window and crossing classification */
 	phasepercent = 100.0 * (double)pll->phase / (double)pll->phase_max;
+
+	/* the symbol's value for the AFC: mean of the middle 50 %, DC included */
+	if (phasepercent > 25.0 && phasepercent < 75.0) {
+		pll->sym_sum += val + pll->dc_offset;
+		pll->sym_n++;
+	}
 
 	/* Step 3: Majority voting in the middle 80% of the symbol period. */
 	if (phasepercent > 10.0 && phasepercent < 90.0) {
@@ -192,6 +210,14 @@ int fsk_pll_process(fsk_pll_t *pll, sample_t sample, double polarity, uint8_t *b
 
 		pll->vote_high = 0;
 		pll->vote_low = 0;
+
+		/* the symbol's value (AFC) */
+		pll->sym_hist[pll->sym_hist_pos] = (pll->sym_n > 0) ? pll->sym_sum / pll->sym_n : val + pll->dc_offset;
+		pll->sym_hist_pos = (pll->sym_hist_pos + 1) % FSK_PLL_SYM_HIST;
+		if (pll->sym_hist_n < FSK_PLL_SYM_HIST)
+			pll->sym_hist_n++;
+		pll->sym_sum = 0.0;
+		pll->sym_n = 0;
 
 		/* Timeout tracking */
 		pll->timeout++;

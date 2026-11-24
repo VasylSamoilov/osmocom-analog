@@ -12,7 +12,8 @@ libmobile_a_SOURCES = \
 	get_time.c \
 	main_mobile.c \
 	iq_wave.c \
-	msg_fifo.c
+	msg_fifo.c \
+	afc.c
 
 if HAVE_ALSA
 AM_CPPFLAGS += -DHAVE_ALSA
