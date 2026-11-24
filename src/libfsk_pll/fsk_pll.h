@@ -37,13 +37,12 @@
  * PHASE_UNLOCKED_RATE: Correction rate when acquiring (not yet locked).
  *   Larger = faster acquisition, but more susceptible to noise.
  *
- * DC_OFFSET_FILTER: Time constant for DC removal IIR, in seconds.
- *   The IIR is: dc = dc * (sr * tc) / (sr * tc + 1) + sample / (sr * tc + 1)
- *   At 0.010s and 31250 Hz: pole at 0.99997, -3dB at ~3 Hz.
+ * The DC offset (carrier offset) while hunting is the mean of the last
+ * FSK_PLL_SYM_HIST symbol values (as SDRangel's radio paging demodulator),
+ * the same number of symbols at every speed.
  */
 #define FSK_PLL_PHASE_LOCKED_RATE	0.045
 #define FSK_PLL_PHASE_UNLOCKED_RATE	0.050
-#define FSK_PLL_DC_OFFSET_FILTER	0.010
 
 /* Maximum consecutive mid-symbol crossings before rejecting sync candidate */
 #define FSK_PLL_NONCONSEC_MAX_SYNC	10
@@ -66,8 +65,8 @@ typedef struct fsk_pll {
 	double		last_sample;	/* previous sample (after DC removal) */
 
 	/* DC offset removal */
-	double		dc_offset;	/* running DC estimate */
-	int		dc_enabled;	/* 1 = DC removal active */
+	double		dc_offset;	/* DC estimate: the mean of the symbol values */
+	int		dc_enabled;	/* 1 = DC follows the symbol values, 0 = held */
 
 	/* Majority voting (2-level FSK: high vs low) */
 	int		vote_high;	/* votes for bit 1 */

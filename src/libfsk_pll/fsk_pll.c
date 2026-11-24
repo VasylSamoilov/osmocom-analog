@@ -121,13 +121,9 @@ int fsk_pll_process(fsk_pll_t *pll, sample_t sample, double polarity, uint8_t *b
 	double val = sample * polarity;
 	double phasepercent;
 
-	/* Step 1: DC offset removal (IIR, matching FLEX).
-	 * dc = dc * (sr * tc) / (sr * tc + 1) + sample / (sr * tc + 1)
-	 * Only active when enabled. */
-	if (pll->dc_enabled) {
-		double tc_samples = (double)pll->samplerate * FSK_PLL_DC_OFFSET_FILTER;
-		pll->dc_offset = (pll->dc_offset * tc_samples + val) / (tc_samples + 1.0);
-	}
+	/* Step 1: DC offset removal. The DC is the hunting mean of the last
+	 * symbol values (set at each symbol boundary, step 6), held while
+	 * disabled. */
 	val -= pll->dc_offset;
 
 	/* Track signal level (mean of |sample|) */
@@ -218,6 +214,19 @@ int fsk_pll_process(fsk_pll_t *pll, sample_t sample, double polarity, uint8_t *b
 			pll->sym_hist_n++;
 		pll->sym_sum = 0.0;
 		pll->sym_n = 0;
+
+		/* the hunting DC (SDRangel's radio paging demodulator): the mean
+		 * of the last FSK_PLL_SYM_HIST symbol values, so it averages over
+		 * the same number of symbols at every speed (a time constant in
+		 * seconds follows the runs of equal bits at 512 baud) */
+		if (pll->dc_enabled) {
+			double s = 0.0;
+			int h;
+
+			for (h = 0; h < pll->sym_hist_n; h++)
+				s += pll->sym_hist[h];
+			pll->dc_offset = s / pll->sym_hist_n;
+		}
 
 		/* Timeout tracking */
 		pll->timeout++;
