@@ -287,7 +287,7 @@ test_amps_orders_LDADD = \
 
 test_amps_rx_SOURCES = test_amps_rx.c ../amps/amps_stations.c ../amps/amps_image.c
 
-test_amps_rx_LDFLAGS = -Wl,--wrap=amps_rx_recc
+test_amps_rx_LDFLAGS = -Wl,--wrap=amps_rx_recc -Wl,--wrap=amps_rx_release_order
 
 test_amps_rx_LDADD = \
 	$(COMMON_LA) \

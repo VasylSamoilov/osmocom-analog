@@ -138,6 +138,8 @@ struct amps {
 	/* the rx buffer received one frame until rx length */
 	char			fsk_rx_frame[FSK_MAX_BITS + 1];	/* +1 because 0-termination */
 	int			fsk_rx_frame_length;	/* length of expected frame */
+	int			fsk_rx_rvc_between;	/* RVC: waiting for the sync of the next repeat */
+	int			fsk_rx_rvc_gap;		/* RVC: bits of that wait */
 	int			fsk_rx_frame_count;	/* count number of received bit */
 	double			fsk_rx_frame_level;	/* sum of level of all bits */
 	double			fsk_rx_frame_quality;	/* sum of quality of all bits */

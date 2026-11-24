@@ -64,6 +64,16 @@ void __wrap_amps_rx_recc(amps_t *amps, uint8_t t, uint8_t scm, uint8_t mpci, uin
 	recc_ordq = ordq;
 }
 
+/* a release order of the phone on the voice channel */
+static int release_count;
+
+void __wrap_amps_rx_release_order(amps_t *amps, uint8_t ordq);
+void __wrap_amps_rx_release_order(amps_t *amps, uint8_t ordq)
+{
+	(void)amps; (void)ordq;
+	release_count++;
+}
+
 /* BCH (48,36) / (40,28) parity, as frame.c */
 static uint16_t bch(uint64_t value, int length)
 {
@@ -155,6 +165,14 @@ static amps_t *control_channel(void)
 	display_measurements_init(&amps->sender.dispmeas, 96000, amps->sender.kanal);
 	amps->chan_type = CHAN_TYPE_CC_PC;
 	amps->si.word2.s = 1;
+	/* the audio path of a voice channel, as amps_create() */
+	init_samplerate(&amps->sender.srstate, 8000.0, 96000.0, 3400.0);
+	init_emphasis(&amps->estate, 96000, CUT_OFF_EMPHASIS_DEFAULT, CUT_OFF_HIGHPASS_DEFAULT, CUT_OFF_LOWPASS_DEFAULT);
+	init_emphasis(&amps->estate_rx, 8000, CUT_OFF_EMPHASIS_DEFAULT, CUT_OFF_HIGHPASS_DEFAULT, CUT_OFF_LOWPASS_DEFAULT);
+	iir_notch_init(&amps->rx_notch_filter, 6000.0, 96000, 2, 10.0);
+	iir_highpass_init(&amps->rx_hpf, 300.0, 96000, 1);
+	iir_highpass_init(&amps->rx_voice_hpf, 300.0, 8000, 2);
+	iir_lowpass_init(&amps->rx_voice_lpf, 3400.0, 8000, 2);
 	if (dsp_init_sender(amps, 0) < 0) {
 		printf("dsp_init_sender failed\n");
 		exit(1);
@@ -256,6 +274,62 @@ static void test_clock(void)
 	CHECK(registration_received(), "the phone's clock 1000 ppm slow: received");
 }
 
+/* The RVC: a release order (F=1 NAWC=0 T=1 ORDER=3), each repeat after its own dotting and sync
+ * (101 bits of dotting before the first, 37 before the others), as many repeats as given; a bit
+ * of the repeats in wrong_mask wrong, another in each. */
+static void receive_rvc(int repeats, int wrong_mask)
+{
+	static sample_t samples[96000];
+	static char bits[1100];
+	const uint64_t word = reverse_word((1ull << 35) | (1ull << 32) | (3ull << 19));
+	amps_t *amps = control_channel();
+	transaction_t trans;
+	int n = 0, i, r, b, s;
+
+	for (r = 0; r < repeats; r++) {
+		for (i = 0; i < ((r == 0) ? 101 : 37); i++)
+			bits[n++] = (i & 1) ? 0 : 1;
+		for (i = 10; i >= 0; i--)
+			bits[n++] = (0x712 >> i) & 1;
+		for (b = 47; b >= 0; b--)
+			bits[n++] = (word >> b) & 1;
+		if (wrong_mask & (1 << r))
+			bits[n - 48 + 3 + 9 * r] ^= 1;
+	}
+
+	/* a voice channel in a call */
+	memset(&trans, 0, sizeof(trans));
+	trans.callref = 1;
+	trans.state = TRANS_CALL;
+	amps->trans_list = &trans;
+	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+
+	s = 0;
+	for (i = 0; i < 960; i++)
+		samples[s++] = 0;
+	s += modulate(samples + s, bits, n, 96000.0, 0.0);
+	for (i = 0; i < 9600; i++)
+		samples[s++] = 0;
+	release_count = 0;
+	for (i = 0; i < s; i += 960)
+		sender_receive(&amps->sender, samples + i, (s - i < 960) ? s - i : 960, NAN);
+	amps->trans_list = NULL;
+	dsp_cleanup_sender(amps);
+	free(amps);
+}
+
+static void test_rvc(void)
+{
+	receive_rvc(5, 0);
+	CHECK(release_count == 1, "RVC: a release order is received");
+	/* the first, third and fifth repeat wrong, another bit each: only the vote of all 5 is right */
+	receive_rvc(5, 0x15);
+	CHECK(release_count == 1, "RVC: each repeat after its own sync, the vote of all 5");
+	/* three repeats only, one of them wrong: the vote of the 3 */
+	receive_rvc(3, 0x02);
+	CHECK(release_count == 1, "RVC: a message of 3 repeats");
+}
+
 /* test_amps_rx measure: registrations received out of 200 in noise and with clock offsets */
 static void measure(void)
 {
@@ -294,6 +368,7 @@ int main(int argc, char *argv[])
 	test_clean();
 	test_vote();
 	test_clock();
+	test_rvc();
 
 	if (failures) {
 		printf("%d check(s) failed\n", failures);

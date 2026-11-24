@@ -819,6 +819,11 @@ again:
 	}
 }
 
+/* RVC: the next repeat comes after 37 bits of dotting and the sync; a little more is waited for */
+#define RVC_GAP_BITS	(37 + 11 + 4)
+
+static void fsk_rx_frame_done(amps_t *amps);
+
 static void fsk_rx_bit(amps_t *amps, sample_t *spl, int len, int pos, int begin, int half, int end)
 {
 	int i;
@@ -910,6 +915,23 @@ prepare_frame:
 		return;
 	}
 
+	/* RVC: between two repeats, the dotting and the sync of the next one (the same way up) */
+	if (amps->fsk_rx_rvc_between) {
+		uint8_t check, expect = (amps->fsk_rx_sync == FSK_SYNC_NEGATIVE) ? 0x80 : 0x00;
+
+		amps->fsk_rx_sync_register = (amps->fsk_rx_sync_register << 1) | bit;
+		check = dsp_sync_check[amps->fsk_rx_sync_register & 0x7ff];
+		if (check == expect || (amps->fsk_rx_sync_tolerant && check == (expect | 0x01))) {
+			amps->fsk_rx_rvc_between = 0;
+			amps->fsk_rx_sync_register = 0x555;
+		} else if (++amps->fsk_rx_rvc_gap > RVC_GAP_BITS) {
+			/* no more repeats: the ones received */
+			amps->fsk_rx_rvc_between = 0;
+			fsk_rx_frame_done(amps);
+		}
+		return;
+	}
+
 	/* count level and quality */
 	amps->fsk_rx_frame_level += (double)(max - min) / (double)((!tacs) ? AMPS_FSK_DEVIATION : TACS_FSK_DEVIATION) / 2.0;
 	if (bit)
@@ -927,27 +949,62 @@ prepare_frame:
 		fprintf(stderr, "our fsk_tx_count (%d) is larger than our max bits we can handle, please fix!\n", amps->fsk_rx_frame_count);
 		abort();
 	}
-	if (amps->fsk_rx_frame_count == amps->fsk_rx_frame_length) {
-		int more;
+	/* RVC: every repeat comes after its own dotting and sync (TIA/EIA-553-A 2.7.2, figure
+	 * 2.7.2-1). Reading the 240 bits after the first sync took the dotting and sync before the
+	 * second and fourth repeat as repeats: never more than 3 of 5 were received. */
+	if (amps->dsp_mode != DSP_MODE_FRAME_RX_FRAME_TX && amps->fsk_rx_frame_count % 48 == 0
+	 && amps->fsk_rx_frame_count < amps->fsk_rx_frame_length) {
+		amps->fsk_rx_rvc_between = 1;
+		amps->fsk_rx_rvc_gap = 0;
+		amps->fsk_rx_sync_register = 0x555;
+		return;
+	}
+	if (amps->fsk_rx_frame_count == amps->fsk_rx_frame_length)
+		fsk_rx_frame_done(amps);
+}
 
-		/* update measurements */
-		display_measurements_update(amps->dmp_frame_level, amps->fsk_rx_frame_level / (double)amps->fsk_rx_frame_count * 100.0, 0.0);
-		display_measurements_update(amps->dmp_frame_quality, amps->fsk_rx_frame_quality / (double)amps->fsk_rx_frame_count * 100.0, 0.0);
+/* a frame is received: decode it, then the next word or back to the dotting */
+static void fsk_rx_frame_done(amps_t *amps)
+{
+	int more, received = amps->fsk_rx_frame_count, i;
 
-		/* a complete frame was received, so we process it */
-		amps->fsk_rx_frame[amps->fsk_rx_frame_count] = '\0';
-		more = amps_decode_frame(amps, amps->fsk_rx_frame, amps->fsk_rx_frame_count, amps->fsk_rx_frame_level / (double)amps->fsk_rx_frame_count, amps->fsk_rx_frame_quality / amps->fsk_rx_frame_level, (amps->fsk_rx_sync == FSK_SYNC_NEGATIVE));
-		if (more) {
-			/* switch to next word length without DCC included */
-			amps->fsk_rx_frame_length = 240;
-			goto prepare_frame;
-		} else {
-			/* switch back to first word length with DCC included */
-			if (amps->fsk_rx_frame_length == 240)
-				amps->fsk_rx_frame_length = 247;
+	/* RVC with less than 5 repeats: the received ones again (with 3: 1 2 3 1 2, the vote of the
+	 * 5 is the vote of the 3) */
+	if (received < amps->fsk_rx_frame_length) {
+		if (received < 48) {
 			amps->fsk_rx_sync = FSK_SYNC_NONE;
-			amps->channel_busy = 0;
+			return;
 		}
+		for (i = received - received % 48; i < amps->fsk_rx_frame_length; i++)
+			amps->fsk_rx_frame[i] = amps->fsk_rx_frame[i % (received - received % 48)];
+		amps->fsk_rx_frame_count = amps->fsk_rx_frame_length;
+	}
+
+	/* update measurements */
+	display_measurements_update(amps->dmp_frame_level, amps->fsk_rx_frame_level / (double)received * 100.0, 0.0);
+	display_measurements_update(amps->dmp_frame_quality, amps->fsk_rx_frame_quality / (double)received * 100.0, 0.0);
+
+	/* a complete frame was received, so we process it */
+	amps->fsk_rx_frame[amps->fsk_rx_frame_count] = '\0';
+	more = amps_decode_frame(amps, amps->fsk_rx_frame, amps->fsk_rx_frame_count, amps->fsk_rx_frame_level / (double)received, amps->fsk_rx_frame_quality / amps->fsk_rx_frame_level, (amps->fsk_rx_sync == FSK_SYNC_NEGATIVE));
+	if (more) {
+		/* switch to next word length without DCC included */
+		amps->fsk_rx_frame_length = 240;
+		amps->fsk_rx_frame_count = 0;
+		amps->fsk_rx_frame_quality = 0.0;
+		amps->fsk_rx_frame_level = 0.0;
+		amps->fsk_rx_sync_register = 0x555;
+		/* RVC: the next word after its own dotting and sync */
+		if (amps->dsp_mode != DSP_MODE_FRAME_RX_FRAME_TX) {
+			amps->fsk_rx_rvc_between = 1;
+			amps->fsk_rx_rvc_gap = 0;
+		}
+	} else {
+		/* switch back to first word length with DCC included */
+		if (amps->fsk_rx_frame_length == 240)
+			amps->fsk_rx_frame_length = 247;
+		amps->fsk_rx_sync = FSK_SYNC_NONE;
+		amps->channel_busy = 0;
 	}
 }
 
@@ -2073,6 +2130,7 @@ void amps_set_dsp_mode(amps_t *amps, enum dsp_mode mode, int frame_length)
 
 	/* reset detection process */
 	amps->fsk_rx_sync = FSK_SYNC_NONE;
+	amps->fsk_rx_rvc_between = 0;
 	amps->channel_busy = 0;
 	amps->fsk_rx_sync_register = 0x555;
 
