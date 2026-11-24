@@ -223,6 +223,8 @@ static void nmt_new_state(nmt_t *nmt, enum nmt_state new_state)
 		return;
 	LOGP_CHAN(DNMT, LOGL_DEBUG, "State change: %s -> %s\n", nmt_state_name(nmt->state), nmt_state_name(new_state));
 	nmt->state = new_state;
+	nmt->release_guard = 0;
+	nmt->release_idle = 0;
 	nmt_display_status();
 }
 
@@ -2186,15 +2188,29 @@ static void timeout_mt_ringing(nmt_t *nmt)
  * handle clearing towards MTX
  */
 
+/* Clearing sequences (NMT Doc 450-1 para 4.4.1.3): the clearing signal 5a(L=13/15) at least T'
+ * (4 frames), from the MTX at most 2 s (until the release guard), then idle frames 6 for T'. */
+#define RELEASE_FRAMES		4
+#define RELEASE_IDLE_FRAMES	4
+
+/* the idle frames that end a clearing; the last one ends the transaction */
+static void tx_release_idle(nmt_t *nmt, frame_t *frame)
+{
+	frame->mt = NMT_MESSAGE_6;
+	if (++nmt->release_idle == RELEASE_IDLE_FRAMES)
+		destroy_transaction(nmt->trans); /* continue with this frame, then go idle */
+}
+
+/* MS clearing: L(15) T', then idle frames T' */
 static void tx_mo_release(nmt_t *nmt, frame_t *frame)
 {
-	transaction_t *trans = nmt->trans;
-
+	if (nmt->tx_frame_count >= RELEASE_FRAMES) {
+		tx_release_idle(nmt, frame);
+		return;
+	}
 	set_line_signal(nmt, frame, 15);
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send release.\n");
-	if (nmt->tx_frame_count == 4)
-		destroy_transaction(trans); /* continue with this frame, then go idle */
 }
 
 /*
@@ -2206,7 +2222,12 @@ static void tx_mt_release(nmt_t *nmt, frame_t *frame)
 	/* L(15) = "clearing, call transfer not activated" per NMT Doc 450-1 para
 	 * 4.3.3.3 -- the plain release. L(13) is the "call transfer activated"
 	 * variant, used only with the call-transfer supplementary service (not
-	 * implemented), so the diagrams' "L(13/15)" reduces to L(15) here. */
+	 * implemented), so the diagrams' "L(13/15)" reduces to L(15) here.
+	 * MTX clearing: at least T', on until the release guard, then idle frames T'. */
+	if (nmt->tx_frame_count >= RELEASE_FRAMES && nmt->release_guard) {
+		tx_release_idle(nmt, frame);
+		return;
+	}
 	set_line_signal(nmt, frame, 15);
 	if (++nmt->tx_frame_count == 1)
 		LOGP_CHAN(DNMT, LOGL_INFO, "Send release.\n");
@@ -2224,6 +2245,8 @@ static void rx_mt_release(nmt_t *nmt, frame_t *frame)
 			break;
 		if (nmt_line_signal_majority(frame->line_signal, 5, 3) != 1)
 			break;
+		if (nmt->release_guard)
+			break; /* the guard is sent 4 times */
 		LOGP_CHAN(DNMT, LOGL_INFO, "Received release guard (line signal L(1) '%s').\n",
 			nmt_linesignal_name(1, 0));
 		if (trans->mwi_call) {
@@ -2234,8 +2257,9 @@ static void rx_mt_release(nmt_t *nmt, frame_t *frame)
 			LOGP_CHAN(DNMT, LOGL_INFO, "MWI out-of-call delivery confirmed (release guard received).\n");
 			printf("MWI delivery confirmed!\n");
 		}
+		/* the clearing signal goes on to T', then the idle frames end it (tx_mt_release) */
 		osmo_timer_del(&nmt->timer);
-		destroy_transaction(trans);
+		nmt->release_guard = 1;
 		break;
 	default:
 		LOGP_CHAN(DNMT, LOGL_DEBUG, "Dropping message %s in state %s\n", nmt_frame_name(frame->mt), nmt_state_name(nmt->state));

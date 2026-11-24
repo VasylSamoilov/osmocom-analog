@@ -141,6 +141,8 @@ struct nmt {
 	struct osmo_timer_list		timer;
 	int			rx_frame_count;		/* receive frame counter */
 	int			tx_frame_count;		/* transmit frame counter */
+	int			release_guard;		/* clearing: the release guard of the MS is in */
+	int			release_idle;		/* clearing: idle frames sent after the clearing signal */
 	unsigned int		cc_slot;		/* idle calling channel: slots sent (even: idle frame, odd: carousel) */
 	unsigned int		idle_frames;		/* idle frames sent: band advertisement and battery saving take turns */
 	int			tx_callerid_count;	/* counter for caller ID repetition */
