@@ -167,6 +167,7 @@ static const char *lvm_str(lvm_t *m, char *buf)
 #define SIG_LOST_COUNT		4	/* number of measures to loose Signaling Tone */
 #define CUT_OFF_HIGHPASS	300.0   /* cut off frequency for high pass filter to remove dc level from sound card / sample */
 #define BEST_QUALITY		0.68	/* Best possible RX quality */
+#define FSK_TRACK_GAIN		0.1	/* how far a zero crossing in the middle of a bit pulls the bit clock in a frame */
 #define COMFORT_NOISE		0.02	/* audio level of comfort noise (relative to speech level) */
 /* SAT level thresholds with hysteresis (relative to nominal=1.0) */
 #define SAT_LEVEL_HIGH		0.50	/* threshold to detect SAT (from no SAT state) */
@@ -1025,6 +1026,19 @@ static void fsk_rx_sample(amps_t *amps, sample_t sample)
 				amps->fsk_rx_elapsed = 0.0;
 			}
 		}
+	} else if ((amps->fsk_rx_last_sample <= 0) != (sample <= 0)) {
+		/* In a frame the bit clock follows the data: a zero crossing in the middle of a bit comes
+		 * half a bit before the bit is decided (the bit count is 0.5 there). A crossing within a
+		 * quarter bit of that pulls the clock by FSK_TRACK_GAIN of its offset; the crossings at the
+		 * edges of the bits (between two equal bits) are far from it and are left out. Where
+		 * between the last sample and this one the crossing is: linear. Before, the clock ran free
+		 * from the dotting for the whole frame (247 bits and more): a phone 500 ppm off was not
+		 * received at all. */
+		double f = amps->fsk_rx_last_sample / (amps->fsk_rx_last_sample - sample);
+		double offset = amps->fsk_rx_bitcount + f * amps->fsk_bitstep - 0.5;
+
+		if (offset > -0.25 && offset < 0.25)
+			amps->fsk_rx_bitcount -= FSK_TRACK_GAIN * offset;
 	}
 	amps->fsk_rx_last_sample = sample;
 	amps->fsk_rx_elapsed += amps->fsk_bitstep;

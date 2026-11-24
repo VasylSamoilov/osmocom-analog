@@ -241,6 +241,21 @@ static void test_vote(void)
 	CHECK(recc_count == 0, "three repeats wrong in the same bit: nothing received");
 }
 
+/* The phone's bit clock 1000 ppm off: 0.7 bit over the 727 bits of the message */
+static void test_clock(void)
+{
+	uint64_t w[3];
+	char bits[1024];
+	int n;
+
+	registration(w);
+	n = recc_bits(bits, w, 3);
+	receive(bits, n, 1000.0);
+	CHECK(registration_received(), "the phone's clock 1000 ppm fast: received");
+	receive(bits, n, -1000.0);
+	CHECK(registration_received(), "the phone's clock 1000 ppm slow: received");
+}
+
 /* test_amps_rx measure: registrations received out of 200 in noise and with clock offsets */
 static void measure(void)
 {
@@ -278,6 +293,7 @@ int main(int argc, char *argv[])
 	printf("AMPS base station receiver (RECC through the DSP at 96 kHz)\n");
 	test_clean();
 	test_vote();
+	test_clock();
 
 	if (failures) {
 		printf("%d check(s) failed\n", failures);
