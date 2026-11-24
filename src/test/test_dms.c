@@ -39,6 +39,33 @@ static const uint8_t test_null[][8] = {
 
 static char ack_bits[77];
 
+/* The bits of an RR(n) frame: the captured RR with its number changed (the
+ * label twice, its parity twice, and the second half a copy of the first) */
+static void rr_bits(char *frame, uint8_t n)
+{
+	uint8_t data = 0;
+	int i, parity = 0;
+
+	memcpy(frame, ack_bits, 77);
+	for (i = 0; i < 7; i++)
+		data = (data << 1) | (frame[26 + i] & 1);
+	data = (data & 0x78) | (n & 7);
+	for (i = 0; i < 7; i++) {
+		frame[26 + i] = frame[35 + i] = '0' | ((data >> (6 - i)) & 1);
+		parity ^= (data >> (6 - i)) & 1;
+	}
+	frame[44] = frame[45] = '0' | parity;
+	memcpy(frame + 46, frame + 15, 31);
+}
+
+static void receive_frame(nmt_t *nmt, const char *frame, int length)
+{
+	int i;
+
+	for (i = 0; i < length; i++)
+		fsk_receive_bit_dms(nmt, frame[i] & 1, 1.0, 1.0);
+}
+
 void dms_receive(nmt_t __attribute__((unused)) *nmt, const uint8_t *data, int length, int __attribute__((unused)) eight_bits)
 {
 	printf("(getting %d digits from DMS layer)\n", length);
@@ -251,6 +278,59 @@ int main(void)
 
 	ok();
 
+	/* A late RR for acknowledged frames (Annex 21 Figure 1 note 2, a slow radio
+	 * path): the peer acknowledged DT up to N and then answers a repeated frame
+	 * with an older RR. The frames it refers to exist: they go again as they
+	 * were, nothing is numbered again (the peer keeps the data it has under
+	 * those numbers). */
+	{
+		char rr[77];
+		uint8_t first_data[8];
+		uint8_t first_n;
+		struct dms_frame *f;
+
+		free_nmt(nmt);
+		nmt = alloc_nmt();
+		dms = &nmt->dms;
+		check_sequence = testsequence;
+		dms_send(nmt, (uint8_t *)testsequence, strlen(testsequence) + 1, 1);
+		/* the opening as above: ID and RAND each way, then data frames */
+		for (j = 0; j < 2; j++) {
+			dms->tx_frame_valid = 0;
+			trigger_frame_transmission(nmt);
+		}
+		receive_frame(nmt, dms->tx_frame, dms->tx_frame_length);       /* the ID back */
+		for (j = 0; j < 2; j++) {
+			dms->tx_frame_valid = 0;
+			trigger_frame_transmission(nmt);
+		}
+		receive_frame(nmt, dms->tx_frame, dms->tx_frame_length);       /* the RAND back */
+		dms->tx_frame_valid = 0;
+		trigger_frame_transmission(nmt);
+		/* the ID (0) and the RAND (1) acknowledged: the link is up, data frames
+		 * from 2 are in the list; keep a copy of the second data frame (it is
+		 * acknowledged next, then asked for again) */
+		rr_bits(rr, 2);
+		receive_frame(nmt, rr, 77);
+		f = dms->state.frame_list;
+		assert(f && f->s == 1 && f->n == 2 && f->next && f->next->s == 1, "Expecting data frames DT(2), DT(3) in the list");
+		first_n = f->next->n;
+		memcpy(first_data, f->next->data, 8);
+		rr_bits(rr, (first_n + 1) & 7);         /* acknowledges up to the second frame */
+		receive_frame(nmt, rr, 77);
+		assert(dms->state.frame_list->n == ((first_n + 1) & 7), "Expecting the frames up to the second acknowledged");
+		printf("Late RR(%d) after RR(%d)\n", first_n, (first_n + 1) & 7);
+		rr_bits(rr, first_n);                   /* the late answer to a repeated frame */
+		receive_frame(nmt, rr, 77);
+		f = dms->state.frame_list;
+		assert(f && f->n == first_n && !memcmp(f->data, first_data, 8),
+			"Expecting the acknowledged frame again with its number and its data");
+		assert(f->next && f->next->n == ((first_n + 1) & 7), "Expecting the frames after it not numbered again");
+		assert(dms->state.n_s == first_n, "Expecting the frame to go next");
+		ok();
+	}
+
+	free_nmt(nmt);
 	return 0;
 }
 

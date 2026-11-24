@@ -18,6 +18,9 @@ struct dms_state {
 	uint8_t			dir;			/* direction */
 	int			eight_bits;		/* what mode are used for DT frames */
 	struct dms_frame	*frame_list;		/* list of frames to transmit */
+	struct dms_frame	acked[3];		/* the last 3 acknowledged frames (copies), oldest first:
+							 * an RR(N) with N = NTX-1..NTX-3 refers to them */
+	int			acked_count;
 	int			send_rr;		/* RR must be sent next */
 	int			peer_busy;		/* peer sent NR (receive-not-ready): pause new I-frames until RR, DT or T */
 	int			passes;			/* repetitions of the frames since the last ack, at most 4 */

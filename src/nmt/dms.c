@@ -645,6 +645,14 @@ static int dms_ack_upto(nmt_t *nmt, uint8_t n)
 			LOGP(DDMS, LOGL_DEBUG, "Raising next frame to send to #%d\n", dms->state.n_s);
 		}
 		LOGP(DDMS, LOGL_DEBUG, "Removing acked frame #%d\n", dms_frame->n);
+		/* keep a copy: a late RR may ask for it again (Annex 21 Figure 1 note 2) */
+		if (dms->state.acked_count == 3) {
+			memmove(dms->state.acked, dms->state.acked + 1, 2 * sizeof(dms->state.acked[0]));
+			dms->state.acked_count = 2;
+		}
+		dms->state.acked[dms->state.acked_count] = *dms_frame;
+		dms->state.acked[dms->state.acked_count].next = NULL;
+		dms->state.acked_count++;
 		dms_frame_next = dms_frame->next;
 		dms_frame_delete(nmt, dms_frame);
 		dms_frame = dms_frame_next;
@@ -655,18 +663,44 @@ static int dms_ack_upto(nmt_t *nmt, uint8_t n)
 
 /* An RR/NR(n) that acknowledges nothing (Annex 21 Figure 1, note 2): n = NTX
  * to NTX+4 refers to the frames under transmission and the next one, n =
- * NTX-1 to NTX-3 to previous frames. Those are gone from the list, so the
- * peer lost count: transmission is restarted with NTX = n, the frames that
- * are not acknowledged are numbered again from n. */
+ * NTX-1 to NTX-3 to previous frames. Figure 1 sets NTX = n: previous frames
+ * that exist (the last acknowledged ones) go again as they were, from DT(n)
+ * on (a peer that answers a repeated frame late, e.g. over a slow radio path,
+ * gets the same data under the same numbers). Only if they do not exist is
+ * transmission restarted with NTX = n and the frames that are not
+ * acknowledged numbered again from n. */
 static void dms_restart_from(nmt_t *nmt, uint8_t n)
 {
 	dms_t *dms = &nmt->dms;
 	struct dms_frame *dms_frame;
 	uint8_t first, next;
+	int i, k;
 
 	first = dms->state.frame_list ? dms->state.frame_list->n : dms->state.n_count;
 	if (((n - first) & 7) <= 4)
 		return;
+
+	for (i = 0; i < dms->state.acked_count; i++) {
+		/* the previous frames from DT(n) on follow each other up to the first one not acknowledged */
+		if (dms->state.acked[i].n != (n & 7) || ((first - n) & 7) != dms->state.acked_count - i)
+			continue;
+		LOGP(DDMS, LOGL_NOTICE, "Peer expects DT(%d) again, which was acknowledged: sending it again from #%d\n", n, n);
+		for (k = dms->state.acked_count - 1; k >= i; k--) {
+			dms_frame = calloc(1, sizeof(*dms_frame));
+			if (!dms_frame) {
+				LOGP(DDMS, LOGL_ERROR, "No memory!\n");
+				return;
+			}
+			*dms_frame = dms->state.acked[k];
+			dms_frame->next = dms->state.frame_list;
+			dms->state.frame_list = dms_frame;
+		}
+		dms->state.acked_count = i;
+		dms->state.n_a = n;
+		dms->state.n_s = n;
+		dms->state.passes = 0;
+		return;
+	}
 
 	LOGP(DDMS, LOGL_NOTICE, "Peer expects DT(%d), but frames from #%d are pending: restarting with #%d\n", n, first, n);
 	next = n;
