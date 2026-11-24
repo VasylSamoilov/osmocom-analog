@@ -229,6 +229,8 @@ const char *nmt_get_frame(nmt_t *nmt);
 void nmt_rx_super(nmt_t *nmt, int tone, double quality);
 void timeout_mt_paging(struct transaction *trans);
 void deliver_sms(const char *sms);
+/* the codepage of the SMS sent (--charset): its glyphs for the codes of the text */
+extern const struct pager_charset *nmt_sms_charset;
 int submit_sms(const char *sms);
 
 /* MWI (Message Waiting Indicator)

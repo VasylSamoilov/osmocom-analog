@@ -65,6 +65,9 @@
  * GSM-compatible NMT Set 0 when an 8-bit message is needed. */
 #define DCS_GSM_7BIT		0x00
 #define DCS_NMT_8BIT_SET0	0x30
+
+/* the NMT Character Set (0..15, Annex 24 4.3) of the 8-bit messages sent: DCS 0x30 + set */
+int sms_8bit_set = 0;
 #define SRI_REPORT		0x20
 #define SRI_MASK		0x20
 
@@ -459,7 +462,7 @@ int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_
 		LOGP(DSMS, LOGL_NOTICE, "8-bit message too long (%d characters, max 160 supported)\n", msg_len);
 		return -EINVAL;
 	}
-	dcs = need_8bit ? DCS_NMT_8BIT_SET0 : DCS_GSM_7BIT;
+	dcs = need_8bit ? (DCS_NMT_8BIT_SET0 | (sms_8bit_set & 0x0f)) : DCS_GSM_7BIT;
 
 	/* HEADER */
 	length = encode_header(data);
@@ -600,6 +603,7 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 	uint8_t orig_type, orig_plan, dest_type, dest_plan;
 	int tp_vpf = VPF_NOT_PRESENT;
 	int coding = 0;
+	uint8_t dcs = 0;
 	int rc;
 
 	LOGP(DSMS, LOGL_DEBUG, "decode_sms_submit: got %d bytes\n", length);
@@ -724,6 +728,7 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 		LOGP(DSMS, LOGL_NOTICE, "SMS coding unsupported (got 0x%02x)\n", data[0]);
 		return -FSC_ERROR_IN_MS;
 	}
+	dcs = data[0];
 	data++;
 	length--;
 
@@ -783,7 +788,7 @@ static int decode_sms_submit(nmt_t *nmt, const uint8_t *data, int length)
 
 	LOGP(DSMS, LOGL_INFO, "Submitting SMS to upper layer\n");
 
-	rc = sms_submit(nmt, ref, orig_address, orig_type, orig_plan, msg_ref, dest_address, dest_type, dest_plan, message, msg_chars);
+	rc = sms_submit(nmt, ref, orig_address, orig_type, orig_plan, msg_ref, dest_address, dest_type, dest_plan, message, msg_chars, dcs);
 	if (rc < 0)
 		return -FSC_SC_SYSTEM_FAILURE;
 

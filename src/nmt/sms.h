@@ -26,7 +26,10 @@ typedef struct sms {
 
 int sms_init_sender(nmt_t *nmt);
 void sms_cleanup_sender(nmt_t *nmt);
-int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_type, uint8_t orig_plan, int msg_ref, const char *dest_address, uint8_t dest_type, uint8_t dest_plan, const char *message, int msg_len);
+/* message: the codes of the text, msg_len of them; dcs: its TP-DCS (0x00 GSM, 0x30 + NMT Character Set) */
+int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t orig_type, uint8_t orig_plan, int msg_ref, const char *dest_address, uint8_t dest_type, uint8_t dest_plan, const char *message, int msg_len, uint8_t dcs);
+/* the NMT Character Set (0..15) of the 8-bit messages sent: TP-DCS 0x30 + set */
+extern int sms_8bit_set;
 void sms_deliver_report(nmt_t *nmt, uint8_t ref, int error, uint8_t cause);
 int sms_deliver(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t type, uint8_t plan, time_t timestamp, int local, const char *message, int msg_len);
 void sms_release(nmt_t *nmt);

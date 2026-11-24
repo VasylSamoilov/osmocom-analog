@@ -89,7 +89,7 @@ void sms_release(nmt_t __attribute__((unused)) *nmt)
 	printf("(got release from SMS layer)\n");
 }
 
-int sms_submit(nmt_t __attribute__((unused)) *nmt, uint8_t __attribute__((unused)) ref, const char __attribute__((unused)) *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char __attribute__((unused)) *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message, int __attribute__((unused)) msg_len)
+int sms_submit(nmt_t __attribute__((unused)) *nmt, uint8_t __attribute__((unused)) ref, const char __attribute__((unused)) *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char __attribute__((unused)) *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message, int __attribute__((unused)) msg_len, uint8_t __attribute__((unused)) dcs)
 {
 	strcpy((char *)dms_buffer, message);
 	dms_buffer_count = strlen(message);

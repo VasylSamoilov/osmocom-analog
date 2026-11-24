@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -31,6 +32,7 @@
 #include "../liblogging/logging.h"
 #include "../liboptions/options.h"
 #include "../libsdr/sdr_config.h"
+#include "../libpagercharset/pager_charset.h"
 #include "nmt.h"
 #include "frame.h"
 #include "dsp.h"
@@ -136,6 +138,8 @@ int tc_band_end   = 0;	/* NMT 900 §4.3.3.13: TC/AC band end channel   (0 = unse
 #define OPT_TC_BAND_START	261
 #define OPT_TC_BAND_END		262
 #define OPT_NETWORK_RX_GAIN	263
+#define OPT_CHARSET		264
+#define OPT_CHARSET_PRINT	265
 
 void print_help(const char *arg0)
 {
@@ -166,6 +170,16 @@ void print_help(const char *arg0)
 	printf("        Give area number 1..4 or 0 for no area number. (default = '%d')\n", area_no);
 	printf(" -C --compandor 1 | 0\n");
 	printf("        Make use of the compandor to reduce noise during call. (default = '%d')\n", compandor);
+	printf("    --charset <vendor-model-charset> | list\n");
+	printf("        Codepage of the SMS sent: the UTF-8 text is sent as its codes, as\n");
+	printf("        7-bit GSM if all are below 0x80, else 8-bit with TP-DCS 0x30 + the NMT\n");
+	printf("        Character Set of the codepage (Annex 24 4.3). The SMS received are\n");
+	printf("        shown in UTF-8 with the codepage of their TP-DCS; a code without a\n");
+	printf("        glyph is <0xNN>. 'list' shows the codepages of NMT.\n");
+	printf("        (default %s-%s-%s)\n", nmt_sms_charset->vendor, nmt_sms_charset->model, nmt_sms_charset->charset);
+	printf("    --charset-print <vendor-model-charset>\n");
+	printf("        Show the table of a codepage: each code, its glyph and the other\n");
+	printf("        characters accepted for it on TX.\n");
 	printf("    --network-rx-gain <dB>\n");
 	printf("        Gain of the speech from the mobile toward the network, after the\n");
 	printf("        expander. 0 dB puts the reference tone (1 kHz, 3 kHz deviation) at\n");
@@ -257,6 +271,8 @@ static void add_options(void)
 	option_add(OPT_TC_BAND_START, "tc-band-start", 1);
 	option_add(OPT_TC_BAND_END,   "tc-band-end",   1);
 	option_add(OPT_NETWORK_RX_GAIN, "network-rx-gain", 1);
+	option_add(OPT_CHARSET, "charset", 1);
+	option_add(OPT_CHARSET_PRINT, "charset-print", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -411,6 +427,40 @@ error_ta:
 			return -EINVAL;
 		}
 		break;
+	case OPT_CHARSET:
+		if (!strcasecmp(argv[argi], "list")) {
+			printf("NMT codepages:\n");
+			pager_charset_list_protocol("nmt");
+			return 0;
+		}
+		nmt_sms_charset = pager_charset_lookup("nmt", argv[argi]);
+		if (!nmt_sms_charset) {
+			fprintf(stderr, "'%s' is not an NMT codepage, use '--charset list'.\n", argv[argi]);
+			return -EINVAL;
+		}
+		/* the 8-bit messages go with the TP-DCS of the set: 0x30 + set (Annex 24 4.3) */
+		if (!strcasecmp(nmt_sms_charset->charset, "baltic"))
+			sms_8bit_set = 1;
+		else if (!strcasecmp(nmt_sms_charset->charset, "central"))
+			sms_8bit_set = 2;
+		else if (!strcasecmp(nmt_sms_charset->charset, "western"))
+			sms_8bit_set = 3;
+		else if (!strcasecmp(nmt_sms_charset->charset, "thai"))
+			sms_8bit_set = 4;
+		else
+			sms_8bit_set = 0;
+		break;
+	case OPT_CHARSET_PRINT:
+		{
+			const struct pager_charset *cs = pager_charset_lookup("nmt", argv[argi]);
+
+			if (!cs) {
+				fprintf(stderr, "'%s' is not an NMT codepage, use '--charset list'.\n", argv[argi]);
+				return -EINVAL;
+			}
+			pager_charset_print(cs);
+		}
+		return 0;
 	case OPT_NETWORK_RX_GAIN:
 		network_rx_gain_db = atof(argv[argi]);
 		if (network_rx_gain_db < -20.0 || network_rx_gain_db > 20.0) {

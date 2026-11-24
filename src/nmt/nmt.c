@@ -33,11 +33,14 @@
 #include "../libmobile/get_time.h"
 #include "../libmobile/console.h"
 #include <osmocom/cc/message.h>
+#include "../libpagercharset/pager_charset.h"
 #include "nmt.h"
 #include "transaction.h"
 #include "dsp.h"
 #include "frame.h"
 #include "countries.h"
+
+const struct pager_charset *nmt_sms_charset = &pager_charset_nmt_generic_generic_gsm;
 
 /* How calls to the MS use the calling channels (the calling channel carousel):
  *
@@ -3523,30 +3526,49 @@ void sms_release(nmt_t *nmt)
  *   dest       = Destination address
  *   message    = SMS text
  */
-int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message, int msg_len)
+/* The codepage of a received TP-DCS: 0x00 the GSM default alphabet, 0x30 + n NMT Character Set n
+ * (Annex 24 4.3); a set the standard does not define has its GSM half only. */
+static const struct pager_charset *sms_charset_of_dcs(uint8_t dcs)
 {
-	char sms[1024];
+	switch (dcs) {
+	case 0x30: return &pager_charset_nmt_generic_generic_cyrillic;
+	case 0x31: return &pager_charset_nmt_generic_generic_baltic;
+	case 0x32: return &pager_charset_nmt_generic_generic_central;
+	case 0x33: return &pager_charset_nmt_generic_generic_western;
+	case 0x34: return &pager_charset_nmt_generic_generic_thai;
+	default: return &pager_charset_nmt_generic_generic_gsm;
+	}
+}
+
+int sms_submit(nmt_t *nmt, uint8_t ref, const char *orig_address, uint8_t __attribute__((unused)) orig_type, uint8_t __attribute__((unused)) orig_plan, int __attribute__((unused)) msg_ref, const char *dest_address, uint8_t __attribute__((unused)) dest_type, uint8_t __attribute__((unused)) dest_plan, const char *message, int msg_len, uint8_t dcs)
+{
+	const struct pager_charset *cs = sms_charset_of_dcs(dcs);
+	char sms[2048];
 	char subscriber[8];
-	char text[768];
+	char text[1536];
 	int i, p = 0;
 
 	/* Get mobile station's subscriber number (country + number) */
 	snprintf(subscriber, sizeof(subscriber), "%c%s",
 		nmt->trans->subscriber.country, nmt->trans->subscriber.number);
 
-	/* Render the message for the text FIFO: the codes are those of the GSM
-	 * default alphabet (also the first 128 of the NMT 8-bit sets); the ones
-	 * that are a printable ASCII character are written as it, every other
-	 * code (incl. LF/CR, '<', and the 8-bit NMT national letters) as <0xNN>,
-	 * so no information is lost and the operator sees exactly what arrived. */
+	/* Render the message for the text FIFO in UTF-8: each code is the glyph
+	 * of the codepage of its DCS, a GSM escape 0x1B and the code after it the
+	 * character of the extension table; LF/CR, '<' and a code without a glyph
+	 * are <0xNN>, so no information is lost and the operator sees exactly
+	 * what arrived. */
 	for (i = 0; i < msg_len && p < (int)sizeof(text) - 13; ) {
 		uint8_t c = (uint8_t)message[i];
+		const char *glyph = pager_charset_decode(cs, c);
 		char ascii;
-		int used = (c < 0x80) ? sms_gsm_to_ascii((const uint8_t *)message + i, msg_len - i, &ascii) : 0;
 
-		if (used && ascii >= 0x20 && ascii < 0x7f && ascii != '<') {
+		if (c == 0x1b && sms_gsm_to_ascii((const uint8_t *)message + i, msg_len - i, &ascii) == 2) {
 			text[p++] = ascii;
-			i += used;
+			i += 2;
+		} else if (glyph && (uint8_t)glyph[0] >= 0x20 && strcmp(glyph, "<")
+			&& p + (int)strlen(glyph) < (int)sizeof(text) - 13) {
+			p += snprintf(text + p, sizeof(text) - p, "%s", glyph);
+			i++;
 		} else {
 			p += snprintf(text + p, sizeof(text) - p, "<0x%02x>", c);
 			i++;
@@ -3623,24 +3645,38 @@ inval:
 	LOGP(DNMT, LOGL_INFO, "SMS from '%s' for subscriber '%s' with message '%s'\n", caller_id, number, message);
 	printf("SMS sending '%s' -> '%s': %s\n", caller_id, number, message);
 
-	/* Decode <0xNN> escapes so the operator can inject any code, including
-	 * non-printable ones and 0x00, through the text FIFO. Other characters
-	 * are ASCII and become the code(s) of the GSM default alphabet ('@' is
-	 * 00h, '[' is 1Bh 3Ch, ...); an escape is the code as it is. The result
+	/* The codes of the text (UTF-8): <0xNN> is the code NN, so the operator
+	 * can inject any code, including non-printable ones and 0x00, through the
+	 * text FIFO; a character is the code of its glyph in the codepage of
+	 * --charset; ASCII the codepage has not is the GSM code(s) of it ('[' is
+	 * 1Bh 3Ch, ...). A character without a code is '?' and logged. The result
 	 * is a byte buffer with an explicit length. */
 	char msg_bytes[256];
 	int msg_len = 0;
 	{
 		const char *s = message;
-		while (*s && msg_len < (int)sizeof(msg_bytes) - 1) {
+		while (*s && msg_len < (int)sizeof(msg_bytes) - 2) {
+			const char *next = s;
+			int code;
+
 			if (s[0] == '<' && (s[1] == '0') && (s[2] == 'x' || s[2] == 'X')
 			 && isxdigit((unsigned char)s[3]) && isxdigit((unsigned char)s[4]) && s[5] == '>') {
 				msg_bytes[msg_len++] = (uint8_t)strtol(s + 1, NULL, 16);
 				s += 6;
+			} else if ((code = pager_charset_encode(nmt_sms_charset, &next)) >= 0) {
+				msg_bytes[msg_len++] = (uint8_t)code;
+				s = next;
 			} else if ((uint8_t)*s < 0x80) {
 				msg_len += sms_ascii_to_gsm((uint8_t)*s++, (uint8_t *)msg_bytes + msg_len);
 			} else {
-				msg_bytes[msg_len++] = *s++;
+				int skip = 1;
+
+				while ((s[skip] & 0xc0) == 0x80)
+					skip++;
+				LOGP(DNMT, LOGL_NOTICE, "SMS character '%.*s' has no code in codepage %s-%s-%s, sending '?'\n",
+					skip, s, nmt_sms_charset->vendor, nmt_sms_charset->model, nmt_sms_charset->charset);
+				msg_bytes[msg_len++] = '?';
+				s += skip;
 			}
 		}
 	}
