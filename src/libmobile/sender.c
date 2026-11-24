@@ -333,7 +333,9 @@ double sender_set_rx_trim(sender_t *sender, double hz)
 	sender_t *master = sender->master ? sender->master : sender, *inst;
 	int channel = 0;
 
-	if (!master->audio || !master->audio_set_rx_trim)
+	/* the decoder's input replaced by a wave file (--read-rx-wave): the
+	 * demodulator does not reach it */
+	if (!master->audio || !master->audio_set_rx_trim || master->wave_rx_play.fp)
 		return 0.0;
 	for (inst = master; inst && inst != sender; inst = inst->slave)
 		channel++;
@@ -350,7 +352,7 @@ void sender_set_rx_bandwidth(sender_t *sender, double hz)
 	sender_t *master = sender->master ? sender->master : sender, *inst;
 	int channel = 0;
 
-	if (!master->audio || !master->audio_set_rx_bandwidth)
+	if (!master->audio || !master->audio_set_rx_bandwidth || master->wave_rx_play.fp)
 		return;
 	for (inst = master; inst && inst != sender; inst = inst->slave)
 		channel++;
