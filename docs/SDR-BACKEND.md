@@ -225,8 +225,8 @@ TX 60 / RX 40, 15 s, 2026-11-24):
 TX and RX on one device clock: the TX time stamps count on sample by
 sample from the RX time at the start plus the device advance (5 ms), so
 TX stays locked to RX without drift; each program's RX -> TX delay is the
-advance plus its ring target. (Two nmt programs: start them a few seconds
-apart, their FIFOs have fixed names.)
+advance plus its ring target. (Two nmt programs: give each its own
+`--sms-deliver`, `--sms-submit` and `--cmd-fifo` paths.)
 
 ## Open
 
