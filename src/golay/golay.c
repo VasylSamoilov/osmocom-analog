@@ -480,6 +480,13 @@ static inline uint32_t calc_golay(uint16_t data)
 	return golay_table[data & 0xfff];
 }
 
+/* the 23 bit Golay codeword of 12 data bits (for the receiver's AFC: the
+ * symbols of a matched preamble codeword) */
+uint32_t golay_encode(uint16_t data)
+{
+	return calc_golay(data);
+}
+
 static inline uint16_t calc_bch(uint16_t data)
 {
 	return bch_table[data & 0x7f];

@@ -136,6 +136,12 @@ void print_help(const char *arg0)
 	printf("    --fifo-file <file>\n");
 	printf("        Read the command lines of the FIFO from a file instead (no FIFO is\n");
 	printf("        made): for batch runs with IQ files, where time follows the samples.\n");
+	printf("    --afc-range <Hz>\n");
+	printf("        RX: how far the receiver follows the carrier offset (AFC): the slicer\n");
+	printf("        level follows the signal, at each preamble codeword the offset is\n");
+	printf("        measured and the channel's demodulator moved onto the signal.\n");
+	printf("        0 = off. Correct larger offsets of the SDR with --sdr-ppm.\n");
+	printf("        (default = %.0f)\n", golay_afc_range);
 	printf("\n");
 	printf("File: %s\n", msg_send_path);
 	printf("        Write \"<address>\" to send a tone-only message.\n");
@@ -187,6 +193,7 @@ static void add_options(void)
 	option_add(0x105, "dedup", 1);
 	option_add(0x106, "charset", 1);
 	option_add(0x107, "charset-print", 1);
+	option_add(0x109, "afc-range", 1);
 }
 
 static int handle_options(int short_option, int argi, char **argv)
@@ -258,6 +265,13 @@ static int handle_options(int short_option, int argi, char **argv)
 		return 0;
 	case 'V':
 		voice_dir = options_strdup(argv[argi++]);
+		break;
+	case 0x109: /* --afc-range */
+		golay_afc_range = atof(argv[argi]);
+		if (golay_afc_range < 0.0) {
+			fprintf(stderr, "--afc-range must be 0 (off) or more Hz.\n");
+			return -EINVAL;
+		}
 		break;
 	case 0x100: /* --voice-monitor */
 		voice_monitor = 1;

@@ -1,5 +1,6 @@
 #include <time.h>
 #include "../libmobile/sender.h"
+#include "../libmobile/afc.h"
 #include "../libfsk/fsk_nrz.h"
 #include "../libpagercharset/pager_charset.h"
 
@@ -170,6 +171,16 @@ typedef struct gsc {
 	sample_t		fsk_rx_last_sample;	/* previous sample for zero-crossing */
 	int			fsk_rx_last_bit;	/* last demodulated bit */
 	uint32_t		fsk_rx_dcd_shreg;	/* shift register for transition detection */
+	/* AFC (libmobile/afc.c, as SDRangel; only with --afc-range > 0): the
+	 * slicer level is the mean of the last 64 bits while hunting, the
+	 * level fitted to a preamble codeword once one is matched (held until
+	 * idle); the offset moves the channel's demodulator */
+	afc_t			afc;
+	double			rx_dc;			/* slicer level (sample units) */
+	int			rx_dc_held;		/* fitted, held */
+	double			rx_bit_sum;		/* the bit's middle, summed */
+	int			rx_bit_n;
+	int			afc_decoded;		/* a message in this reception */
 
 	/* RX decoder state machine */
 	enum rx_state		rx_state;		/* current decoder state */
@@ -292,6 +303,8 @@ int golay_create(const char *kanal, double frequency, const char *device, int us
 void golay_destroy(sender_t *sender);
 
 void init_golay(void);
+uint32_t golay_encode(uint16_t data);
+extern double golay_afc_range;	/* --afc-range (Hz), 0 = off */
 void init_bch(void);
 
 int8_t get_bit(gsc_t *gsc);

@@ -58,6 +58,8 @@ int dsp_init_sender(gsc_t *gsc, int samplerate, double deviation, double polarit
 	/* set modulation parameters */
 	// NOTE: baudrate equals modulation, because we have a raised cosine ramp of beta = 0.5
 	sender_set_fm(&gsc->sender, deviation, 600.0, deviation, MAX_DISPLAY);
+	/* AFC: a sample value of 1.0 is the deviation (Hz) */
+	afc_init(&gsc->afc, &gsc->sender, golay_afc_range, deviation);
 
 	gsc->fsk_bitduration = (double)samplerate / 600.0;
 	gsc->fsk_bitstep = 1.0 / gsc->fsk_bitduration;
@@ -225,8 +227,50 @@ static int rx_nbs_bit(gsc_t *gsc, uint8_t bit)
 }
 
 /* Reset the receiver to idle state, clearing all RX buffers. */
+/*
+ * AFC (libmobile/afc.c, as SDRangel), only with --afc-range > 0: a matched
+ * preamble codeword is 46 known symbols (23 bits, least significant first,
+ * each sent twice; inverted if it was matched inverted): its levels are
+ * fitted by least squares, the slicer takes the fitted DC (held until idle)
+ * and the offset moves the channel's demodulator.
+ */
+double golay_afc_range = 5000.0;	/* --afc-range (Hz), 0 = off */
+
+static void golay_afc_preamble(gsc_t *gsc, uint16_t value, int inverted)
+{
+	uint32_t cw = golay_encode(value) ^ (inverted ? 0x7FFFFF : 0);
+	double levels[46], dc, dev, hunt_dc, hunt_dev;
+	int i;
+
+	if (gsc->afc.range <= 0.0)
+		return;
+	for (i = 0; i < 23; i++) {
+		/* a bit 1 is a positive value of sample * polarity */
+		double l = (((cw >> i) & 1) ? 1.0 : -1.0) * gsc->fsk_polarity;
+
+		levels[2 * i] = l;
+		levels[2 * i + 1] = l;
+	}
+	/* the deviation hunted (mean distance from the mean of the last 64) */
+	if (!afc_hunt(&gsc->afc, AFC_HUNT_WINDOW, &hunt_dc, &hunt_dev))
+		return;
+	if (!afc_fit(&gsc->afc, levels, 46, 0, hunt_dev, &dc, &dev)) {
+		LOGP_CHAN(DDSP, LOGL_INFO, "AFC: preamble codeword levels do not fit (hunted deviation %.2f), not used.\n", hunt_dev);
+		return;
+	}
+	LOGP_CHAN(DDSP, LOGL_INFO, "AFC: carrier %+.0f Hz off the demodulator, trim %+.0f Hz -> %+.0f Hz (deviation %.2f).\n",
+		  dc * gsc->afc.dev_hz, gsc->afc.trim, gsc->afc.trim + dc * gsc->afc.dev_hz, fabs(dev));
+	gsc->rx_dc = dc;
+	gsc->rx_dc_held = 1;
+	afc_measured(&gsc->afc, dc);
+}
+
 static void rx_reset_idle(gsc_t *gsc)
 {
+	/* the AFC's reception ends (confirmed by a message or two fits) */
+	afc_release(&gsc->afc, gsc->afc_decoded);
+	gsc->afc_decoded = 0;
+	gsc->rx_dc_held = 0;
 	if (gsc->rx_state != RX_IDLE) {
 		/* (no log — this fires constantly on noise) */
 	}
@@ -334,6 +378,7 @@ static void rx_report(gsc_t *gsc, gsc_rx_msg_t *msg)
 {
 	int i;
 
+	gsc->afc_decoded = 1;	/* confirms the AFC's reception */
 	msg->polarity_inverted = gsc->rx_polarity_inverted;
 	if (!rx_duplicate(gsc, msg))
 		golay_msg_receive(msg);
@@ -545,6 +590,8 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 				 * inversion (everything inverted). Set batch_candidate
 				 * instead of polarity_inverted; the start code check
 				 * after preamble lock will disambiguate. */
+				/* AFC: the levels of this codeword */
+				golay_afc_preamble(gsc, decoded, inverted);
 				gsc->rx_confirm_index = idx;
 				gsc->rx_confirm_count = 1;
 				if (inverted) {
@@ -599,6 +646,9 @@ static void fsk_receive_bit(gsc_t *gsc, uint8_t bit)
 				rx_reset_idle(gsc);
 				return;
 			}
+
+			/* AFC: the levels of this codeword */
+			golay_afc_preamble(gsc, decoded, gsc->rx_polarity_inverted || gsc->rx_batch_candidate);
 
 			/* Save the raw bits from this confirmed codeword */
 			memcpy(gsc->rx_confirm_bits + gsc->rx_confirm_count * 46,
@@ -1129,12 +1179,25 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 
 	polarity = gsc->fsk_polarity;
 
+	/* AFC: a trim set while the last block was decoded turns the
+	 * demodulator from this block on: the slicer level follows it here */
+	if (gsc->afc.range > 0.0)
+		gsc->rx_dc += afc_block(&gsc->afc, length, gsc->sender.samplerate);
+
 	for (i = 0; i < length; i++) {
+		double level = (gsc->afc.range > 0.0) ? gsc->rx_dc : 0.0;
+
+		/* AFC: the middle half of each bit, DC included */
+		if (gsc->afc.range > 0.0 && gsc->fsk_rx_phase >= 0.25 && gsc->fsk_rx_phase < 0.75) {
+			gsc->rx_bit_sum += samples[i];
+			gsc->rx_bit_n++;
+		}
+
 		/* Soft PLL bit clock recovery (same approach as multimon-ng).
 		 * Sample the demodulated signal, track transitions with a
 		 * gradual phase correction instead of hard resets. */
 		gsc->fsk_rx_dcd_shreg <<= 1;
-		gsc->fsk_rx_dcd_shreg |= ((samples[i] * polarity) > 0.0) ? 1 : 0;
+		gsc->fsk_rx_dcd_shreg |= (((samples[i] - level) * polarity) > 0.0) ? 1 : 0;
 
 		/* Check for transition */
 		if ((gsc->fsk_rx_dcd_shreg ^ (gsc->fsk_rx_dcd_shreg >> 1)) & 1) {
@@ -1147,6 +1210,17 @@ void sender_receive(sender_t *sender, sample_t *samples, int length, double __at
 		gsc->fsk_rx_phase += gsc->fsk_bitstep;
 		if (gsc->fsk_rx_phase >= 1.0) {
 			gsc->fsk_rx_phase -= 1.0;
+			if (gsc->afc.range > 0.0) {
+				double hunt_dc, hunt_dev;
+
+				/* the bit's value into the AFC; while hunting the
+				 * slicer level is the mean of the last 64 bits */
+				afc_symbol(&gsc->afc, (gsc->rx_bit_n > 0) ? gsc->rx_bit_sum / gsc->rx_bit_n : samples[i]);
+				gsc->rx_bit_sum = 0.0;
+				gsc->rx_bit_n = 0;
+				if (!gsc->rx_dc_held && afc_hunt(&gsc->afc, AFC_HUNT_WINDOW, &hunt_dc, &hunt_dev))
+					gsc->rx_dc = hunt_dc;
+			}
 			fsk_receive_bit(gsc, gsc->fsk_rx_dcd_shreg & 1);
 		}
 	}
