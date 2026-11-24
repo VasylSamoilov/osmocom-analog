@@ -217,6 +217,30 @@ static void test_clean(void)
 	CHECK(registration_received(), "a registration (words A, B, C) is received");
 }
 
+/* Every repeat of every word with one bit wrong, each repeat another bit: no repeat has a right
+ * parity, the vote of the repeats is right. */
+static void test_vote(void)
+{
+	uint64_t w[3];
+	char bits[1024];
+	int n, i, r;
+
+	registration(w);
+	n = recc_bits(bits, w, 3);
+	for (i = 0; i < 3; i++)
+		for (r = 0; r < 5; r++)
+			bits[48 + i * 240 + r * 48 + 5 + 7 * r] ^= 1;
+	receive(bits, n, 0.0);
+	CHECK(registration_received(), "every repeat with another bit wrong: the vote is received");
+
+	/* three repeats of word A wrong in the same bit: the vote is wrong too, its parity tells */
+	n = recc_bits(bits, w, 3);
+	for (r = 0; r < 3; r++)
+		bits[48 + r * 48 + 20] ^= 1;
+	receive(bits, n, 0.0);
+	CHECK(recc_count == 0, "three repeats wrong in the same bit: nothing received");
+}
+
 /* test_amps_rx measure: registrations received out of 200 in noise and with clock offsets */
 static void measure(void)
 {
@@ -253,6 +277,7 @@ int main(int argc, char *argv[])
 
 	printf("AMPS base station receiver (RECC through the DSP at 96 kHz)\n");
 	test_clean();
+	test_vote();
 
 	if (failures) {
 		printf("%d check(s) failed\n", failures);
