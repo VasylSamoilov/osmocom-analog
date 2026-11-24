@@ -21,7 +21,8 @@ noinst_PROGRAMS = \
 	test_echo_analysis \
 	test_echo_analysis_edge_cases \
 	test_echo_analysis_final_checkpoint \
-	test_amps_orders
+	test_amps_orders \
+	test_amps_rx
 
 test_filter_SOURCES = test_filter.c dummy.c
 
@@ -283,3 +284,50 @@ test_amps_orders_SOURCES = test_amps_orders.c
 
 test_amps_orders_LDADD = \
 	-lm
+
+test_amps_rx_SOURCES = test_amps_rx.c ../amps/amps_stations.c ../amps/amps_image.c
+
+test_amps_rx_LDFLAGS = -Wl,--wrap=amps_rx_recc
+
+test_amps_rx_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/amps/libamps.a \
+	$(top_builddir)/src/liboptions/liboptions.a \
+	$(top_builddir)/src/libmobile/libmobile.a \
+	$(top_builddir)/src/libtones/libtones.a \
+	$(top_builddir)/src/libdisplay/libdisplay.a \
+	$(top_builddir)/src/libcompandor/libcompandor.a \
+	$(top_builddir)/src/libgoertzel/libgoertzel.a \
+	$(top_builddir)/src/libjitter/libjitter.a \
+	$(top_builddir)/src/libsamplerate/libsamplerate.a \
+	$(top_builddir)/src/libemphasis/libemphasis.a \
+	$(top_builddir)/src/libfm/libfm.a \
+	$(top_builddir)/src/libfilter/libfilter.a \
+	$(top_builddir)/src/libwave/libwave.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	$(top_builddir)/src/libaaimage/libaaimage.a \
+	$(top_builddir)/src/liblogging/liblogging.a \
+	$(top_builddir)/src/libclipper/libclipper.a \
+	$(top_builddir)/src/libecho/libecho.a \
+	$(top_builddir)/src/libdtmf/libdtmf.a \
+	$(LIBOSMOCORE_LIBS) \
+	$(LIBOSMOCC_LIBS) \
+	-lm
+
+if HAVE_ALSA
+test_amps_rx_LDADD += \
+	$(top_builddir)/src/libsound/libsound.a \
+	$(ALSA_LIBS)
+endif
+
+if HAVE_SDR
+test_amps_rx_LDADD += \
+	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
+	$(top_builddir)/src/libam/libam.a \
+	$(top_builddir)/src/libfft/libfft.a \
+	$(UHD_LIBS) \
+	$(SOAPY_LIBS) \
+	$(RPITX_LIBS)
+endif
