@@ -1504,6 +1504,8 @@ static void *sdr_read_child(void *arg)
 	static double thr_timer = 0;
 
 	while (sdr->thread_read.running) {
+		int got = 0;	/* samples the device delivered (count may be cut to the ring's room) */
+
 		/* read from SDR */
 		space = (sdr->thread_read.out - sdr->thread_read.in + sdr->thread_read.buffer_size - 2 + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size;
 		num = space / 2;
@@ -1525,6 +1527,7 @@ static void *sdr_read_child(void *arg)
 #endif
 			if (bias_count >= 0)
 				sdr_bias(sdr->thread_read.buffer2, count);
+			got = count;
 			/* IQ wave at the SDR rate: playback replaces what the device
 			 * delivered, recording keeps what goes into the ring */
 			if (count > 0 && (sdr->wave_rx_play.fp || sdr->wave_rx_rec.fp)) {
@@ -1634,7 +1637,11 @@ static void *sdr_read_child(void *arg)
 		 * short enough that UHD's internal FIFO doesn't overflow. */
 		if (!num)
 			usleep(100);
-		else if (count <= 0)
+		else if (got <= 0)
+			/* only when the device had nothing: in engine mode a full
+			 * raw ring (status, displays; a backend does not read it)
+			 * cuts count to 0, sleeping then makes this thread fall
+			 * behind the device (RX time late, TX time stamps late) */
 			usleep(sdr->interval * 1000.0);
 	}
 
