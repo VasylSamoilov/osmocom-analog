@@ -99,7 +99,7 @@ typedef struct transaction {
 	char			caller_id[33];		/* id of calling phone */
 	char			dialing[33];		/* number dialed by the phone */
 	enum amps_trans_state	state;			/* state of transaction */
-	enum amps_trans_state	mwi_return_state;	/* state to return to after MWI order */
+	enum amps_trans_state	order_return_state;	/* the task an FVC order interrupted (TRANS_NULL: none, the call) */
 	struct osmo_timer_list		timer;			/* for varous timeouts */
 	struct osmo_timer_list		flash_timer;		/* timer for auto Order 8 after flash */
 	int			sat_detected;		/* state if we detected SAT */

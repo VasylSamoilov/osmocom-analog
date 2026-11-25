@@ -833,6 +833,69 @@ static void amps_release(transaction_t *trans, uint8_t cause)
 }
 
 /*
+ * FVC orders of a mobile station on its voice channel (audit, change power, flash with info,
+ * message waiting). TIA/EIA-553-A lists the orders each task of the mobile takes: Waiting for
+ * Order (2.6.4.3.1, the alert sent, not confirmed yet), Waiting for Answer (2.6.4.3.2, ringing),
+ * Conversation (2.6.4.4). The order interrupts that task only on the forward channel: the
+ * mobile's signaling tone (alert confirmation, answer, flash, release) and the timers keep their
+ * meaning in it, and win over the order. When the order is sent, the task goes on.
+ */
+static int fvc_order_state(enum amps_trans_state state)
+{
+	switch (state) {
+	case TRANS_CALL_AUDIT:
+	case TRANS_CALL_AUDIT_SEND:
+	case TRANS_CALL_CHANGE_POWER:
+	case TRANS_CALL_CHANGE_POWER_SEND:
+	case TRANS_CALL_FLASH_INFO:
+	case TRANS_CALL_FLASH_INFO_SEND:
+	case TRANS_CALL_MWI:
+	case TRANS_CALL_MWI_SEND:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/* the task of the mobile station: the state an FVC order interrupted, else the state */
+static enum amps_trans_state trans_task_state(transaction_t *trans)
+{
+	if (!fvc_order_state(trans->state))
+		return trans->state;
+	return (trans->order_return_state == TRANS_NULL) ? TRANS_CALL : trans->order_return_state;
+}
+
+/* start an FVC order (its state) from the task the transaction is in */
+static void fvc_order_start(amps_t *amps, transaction_t *trans, enum amps_trans_state order_state)
+{
+	trans->order_return_state = trans_task_state(trans);
+	trans_new_state(trans, order_state);
+	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+}
+
+/* the order is sent: back to the task, with its audio (ringing and conversation: audio; the alert
+ * not confirmed yet: silence, as after the alert order) */
+static void fvc_order_done(amps_t *amps, transaction_t *trans)
+{
+	enum amps_trans_state task = trans_task_state(trans);
+
+	trans_new_state(trans, task);
+	trans->order_return_state = TRANS_NULL;
+	amps_set_dsp_mode(amps, (task == TRANS_CALL_MT_ALERT_CONFIRM) ? DSP_MODE_AUDIO_RX_SILENCE_TX : DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+}
+
+/* the tasks an order may interrupt: ringing_only for one the mobile ignores while waiting for
+ * order (flash with info) */
+static int fvc_order_allowed(transaction_t *trans, int ringing_only)
+{
+	if (trans->state == TRANS_CALL || trans->state == TRANS_CALL_MT_ANSWER_WAIT)
+		return 1;
+	if (!ringing_only && trans->state == TRANS_CALL_MT_ALERT_CONFIRM)
+		return 1;
+	return 0;
+}
+
+/*
  * receive signaling
  */
 void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
@@ -850,7 +913,9 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 	else
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Lost Signaling Tone signal\n");
 
-	switch (trans->state) {
+	/* during an FVC order the tone means what it means in the task the order interrupted; a change
+	 * of the task (answer, alert confirmed) ends the order */
+	switch (trans_task_state(trans)) {
 	case TRANS_CALL_MO_ASSIGN_CONFIRM: // should not happen
 	case TRANS_CALL:
 		if (tone) {
@@ -1095,20 +1160,16 @@ static void adjust_vmac(transaction_t *trans)
 			trans->current_vmac++;
 			LOGP_CHAN(DAMPS, LOGL_NOTICE, "SAT too strong (%.1f%%), reducing power (VMAC %d->%d)\n", 
 				trans->sat_level_avg * 100.0, trans->current_vmac-1, trans->current_vmac);
-			if (trans->state == TRANS_CALL) {
-				trans_new_state(trans, TRANS_CALL_CHANGE_POWER);
-				amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
-			}
+			if (trans->state == TRANS_CALL)
+				fvc_order_start(amps, trans, TRANS_CALL_CHANGE_POWER);
 		}
 	} else if (trans->sat_level_avg < vmac_level_low) {
 		if (trans->current_vmac > trans->max_vmac) { /* Don't go below configured limit (allow more power) */
 			trans->current_vmac--;
 			LOGP_CHAN(DAMPS, LOGL_NOTICE, "SAT too weak (%.1f%%), increasing power (VMAC %d->%d)\n", 
 				trans->sat_level_avg * 100.0, trans->current_vmac+1, trans->current_vmac);
-			if (trans->state == TRANS_CALL) {
-				trans_new_state(trans, TRANS_CALL_CHANGE_POWER);
-				amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
-			}
+			if (trans->state == TRANS_CALL)
+				fvc_order_start(amps, trans, TRANS_CALL_CHANGE_POWER);
 		}
 	}
 }
@@ -2024,9 +2085,10 @@ int amps_flash_with_info(const char *number, const char *message, int pi, int si
 		return -CAUSE_OUTOFORDER;
 	}
 
-	/* Verify subscriber is in active call state */
-	if (trans->state != TRANS_CALL) {
-		LOGP(DAMPS, LOGL_NOTICE, "Flash With Info: subscriber '%s' not in active call (state=%d)\n", 
+	/* the mobile takes it ringing and in the conversation (TIA/EIA-553-A 2.6.4.3.2, 2.6.4.4; a
+	 * second set of character information after the alert with info, 3.6.5), not before it rings */
+	if (!fvc_order_allowed(trans, 1)) {
+		LOGP(DAMPS, LOGL_NOTICE, "Flash With Info: subscriber '%s' not ringing or in a call (state=%d)\n",
 			number, trans->state);
 		return -CAUSE_BUSY;
 	}
@@ -2040,9 +2102,7 @@ int amps_flash_with_info(const char *number, const char *message, int pi, int si
 	amps->tx_fvc_flashinfo_pi = pi;
 	amps->tx_fvc_flashinfo_si = si;
 
-	/* Set transaction state to trigger FVC transmission */
-	trans_new_state(trans, TRANS_CALL_FLASH_INFO);
-	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+	fvc_order_start(amps, trans, TRANS_CALL_FLASH_INFO);
 
 	return 0;
 }
@@ -2213,8 +2273,7 @@ int amps_flash_with_cri(const char *number, const char *cri_data)
 	trans->order = 18;     /* Order 18 = Flash With Info */
 
 	/* Set transaction state to trigger FVC transmission */
-	trans_new_state(trans, TRANS_CALL_FLASH_INFO);
-	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+	fvc_order_start(amps, trans, TRANS_CALL_FLASH_INFO);
 
 	return 0;
 }
@@ -2283,8 +2342,7 @@ int amps_flash_with_tci(const char *number, const char *tci_data)
 	trans->order = 18;     /* Order 18 = Flash With Info */
 
 	/* Set transaction state to trigger FVC transmission */
-	trans_new_state(trans, TRANS_CALL_FLASH_INFO);
-	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+	fvc_order_start(amps, trans, TRANS_CALL_FLASH_INFO);
 
 	return 0;
 }
@@ -2858,9 +2916,7 @@ int amps_mwi(const char *number, int count, int type)
 	 * - Waiting for Order Task (TRANS_CALL_MT_ALERT_CONFIRM) - after alert sent
 	 */
 	if (trans) {
-		if (trans->state == TRANS_CALL ||
-		    trans->state == TRANS_CALL_MT_ANSWER_WAIT ||
-		    trans->state == TRANS_CALL_MT_ALERT_CONFIRM) {
+		if (fvc_order_allowed(trans, 0)) {
 			/* Valid FVC state - will send on voice channel */
 		} else {
 			LOGP(DAMPS, LOGL_NOTICE, "MWI: subscriber '%s' has transaction but not in valid FVC state (state=%d). "
@@ -2906,21 +2962,14 @@ int amps_mwi(const char *number, int count, int type)
 	LOGP_CHAN(DAMPS, LOGL_NOTICE, ">>> %s - Mobile will show message waiting indicator (%d messages)\n",
 		amps_table4_name(count, type, 5), count);
 
-	/* Save return state - we'll go back to this state after MWI is sent
-	 * Per TIA/EIA-553-A, after MWI during alerting, mobile sends order confirmation
-	 * and remains in the same task (Waiting for Answer Task).
-	 */
-	trans->mwi_return_state = trans->state;
-
 	/* Set order parameters */
 	trans->chan = 0;
 	trans->msg_type = count;  /* MSG_TYPE carries the message count */
 	trans->ordq = type;       /* ORDQ carries the message type (0=voice, 1=SMS, 2=fax) */
 	trans->order = 5;         /* Order 5 = Message Waiting */
 
-	/* Set transaction state to trigger FVC transmission */
-	trans_new_state(trans, TRANS_CALL_MWI);
-	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+	/* the mobile confirms it and stays in its task; the order returns to that task */
+	fvc_order_start(amps, trans, TRANS_CALL_MWI);
 
 	return 0;
 }
@@ -3487,50 +3536,33 @@ int amps_audit_order(const char *number)
 
 
 
-	/* Verify subscriber is in active call state */
-	/* If transaction exists, it must be in a valid state */
-	if (trans && trans->state != TRANS_CALL &&
-	    trans->state != TRANS_CALL_AUDIT &&
-	    trans->state != TRANS_CALL_AUDIT_SEND) {
-		LOGP(DAMPS, LOGL_NOTICE, "Audit Order: subscriber '%s' busy (state=%d)\n", 
-			number, trans->state);
-		return -CAUSE_BUSY;
-	}
-
-	/* If no transaction, create one for FOCC audit */
-	if (!trans) {
-		/* Use the first AMPS instance to send the FOCC message */
-		if (sender_head)
-			amps = (amps_t *) sender_head;
-		else {
-			LOGP(DAMPS, LOGL_ERROR, "No AMPS instance found for Audit\n");
-			return -CAUSE_TEMPFAIL;
+	/* on its voice channel the mobile takes it from the alert on (TIA/EIA-553-A 2.6.4.3.1,
+	 * 2.6.4.3.2, 2.6.4.4); in another procedure (paging, assignment, an order being sent) later */
+	if (trans) {
+		if (!fvc_order_allowed(trans, 0)) {
+			LOGP(DAMPS, LOGL_NOTICE, "Audit Order: subscriber '%s' busy (state=%d)\n",
+				number, trans->state);
+			return -CAUSE_BUSY;
 		}
-
-		trans = create_transaction(amps, TRANS_AUDIT, min1, min2, 0, 0, 0, 7, 0);
-		if (!trans)
-			return -CAUSE_TEMPFAIL;
-		/* Note: create_transaction already links the transaction */
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Audit Order to '%s' on its voice channel\n", number);
+		trans->chan = 0;
+		trans->msg_type = 0;
+		trans->ordq = 0;    /* ORDQ=0 for Audit */
+		trans->order = 7;   /* Audit Order */
+		fvc_order_start(amps, trans, TRANS_CALL_AUDIT);
+		return 0;
 	}
 
-	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Audit Order to '%s'\n", number);
-
-	/* Set transaction state to trigger transmission
-	 * If in call -> FVC (TRANS_CALL_AUDIT)
-	 * If idle -> FOCC (TRANS_AUDIT - will be picked up by amps_tx_frame_focc)
-	 */
-	trans->chan = 0;
-	trans->msg_type = 0;
-	trans->ordq = 0;    /* ORDQ=0 for Audit */
-	trans->order = 7;   /* Audit Order */
-
-	if (trans->state == TRANS_CALL) {
-		trans_new_state(trans, TRANS_CALL_AUDIT);
-		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
-	} else {
-		/* Idle / FOCC - set to TRANS_AUDIT so amps_tx_frame_focc() picks it up */
-		trans_new_state(trans, TRANS_AUDIT);
+	/* idle: on the paging channel (2.6.2.3), as message waiting */
+	amps = search_pc();
+	if (!amps) {
+		LOGP(DAMPS, LOGL_ERROR, "Audit Order: no paging channel available\n");
+		return -CAUSE_NOCHANNEL;
 	}
+	trans = create_transaction(amps, TRANS_AUDIT, min1, min2, 0, 0, 0, 7, 0);
+	if (!trans)
+		return -CAUSE_TEMPFAIL;
+	LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Audit Order to '%s' on the paging channel\n", number);
 
 	return 0;
 }
@@ -3624,9 +3656,10 @@ int amps_change_power_order(const char *number, int level)
 		return -CAUSE_OUTOFORDER;
 	}
 
-	/* Verify subscriber is in active call state (Requirement 12.5) */
-	if (trans->state != TRANS_CALL) {
-		LOGP(DAMPS, LOGL_NOTICE, "Change Power Order: subscriber '%s' not in active call (state=%d)\n", 
+	/* the mobile takes it on its voice channel from the alert on (TIA/EIA-553-A 2.6.4.3.1, 2.6.4.3.2,
+	 * 2.6.4.4) */
+	if (!fvc_order_allowed(trans, 0)) {
+		LOGP(DAMPS, LOGL_NOTICE, "Change Power Order: subscriber '%s' not alerted, ringing or in a call (state=%d)\n",
 			number, trans->state);
 		return -CAUSE_BUSY;
 	}
@@ -3640,9 +3673,7 @@ int amps_change_power_order(const char *number, int level)
 	/* Set the power level in transaction (used by TRANS_CALL_CHANGE_POWER handler) */
 	trans->current_vmac = level;
 
-	/* Transition state and switch DSP mode */
-	trans_new_state(trans, TRANS_CALL_CHANGE_POWER);
-	amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
+	fvc_order_start(amps, trans, TRANS_CALL_CHANGE_POWER);
 
 	return 0;
 }
@@ -4566,7 +4597,8 @@ void transaction_timeout(void *data)
 	transaction_t *trans = data;
 	amps_t *amps = trans->amps;
 
-	switch (trans->state) {
+	/* the timers of the task go on during an FVC order (the alert, the answer, the fade) */
+	switch (trans_task_state(trans)) {
 	case TRANS_CALL_MO_WAIT_PROCEED:
 		/* Network didn't respond with PROCEEDING within timeout
 		 * Per TIA/EIA-553-A §2.6.3.8: Mobile waits up to 5 seconds
@@ -5002,8 +5034,7 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		return trans;
 	case TRANS_CALL_CHANGE_POWER_SEND:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Change Power sent\n");
-		trans_new_state(trans, TRANS_CALL);
-		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+		fvc_order_done(amps, trans);
 		/* Grace period: do not adjust power again until the mobile has settled on the new level */
 		trans->vmac_grace_count = 75; /* SAT measurements (66.7 ms each, ~5 s) without power adjustment */
 		return NULL;
@@ -5017,8 +5048,7 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		return trans;
 	case TRANS_CALL_FLASH_INFO_SEND:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Flash With Info sent\n");
-		trans_new_state(trans, TRANS_CALL);
-		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+		fvc_order_done(amps, trans);
 		return NULL;
 	case TRANS_CALL_PCI_QUERY:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Sending Protocol Capability Indicator order (Order=26, ORDQ=4)\n");
@@ -5044,8 +5074,7 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		return trans;
 	case TRANS_CALL_AUDIT_SEND:
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Audit Order sent\n");
-		trans_new_state(trans, TRANS_CALL);
-		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+		fvc_order_done(amps, trans);
 		return NULL;
 	case TRANS_CALL_PARAM_UPDATE:
 		/* Parameter Update Order (Order 15, ORDQ=0) on FVC.
@@ -5137,15 +5166,8 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		 * - During Conversation Task: return to TRANS_CALL, resume audio
 		 * - During Waiting for Answer Task: return to alerting state, keep waiting
 		 */
-		LOGP_CHAN(DAMPS, LOGL_INFO, "Message Waiting order sent, returning to %s state\n",
-			(trans->mwi_return_state == TRANS_CALL) ? "CALL" : "alerting");
-		trans_new_state(trans, trans->mwi_return_state);
-		if (trans->mwi_return_state == TRANS_CALL) {
-			amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
-		} else {
-			/* Alerting state - keep silence TX, waiting for answer */
-			amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
-		}
+		LOGP_CHAN(DAMPS, LOGL_INFO, "Message Waiting order sent, back to %s\n", trans_short_state_name(trans_task_state(trans)));
+		fvc_order_done(amps, trans);
 		return NULL;
 	case TRANS_CALL_STOP_ALERT:
 		/* Stop Alert (Order 6, ORDQ=0) - stop ringing
