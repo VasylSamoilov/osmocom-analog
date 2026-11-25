@@ -103,6 +103,18 @@ static void test_ringing_answer_during_order(void)
 	CHECK(trans->state == TRANS_CALL && vc->dsp_mode == DSP_MODE_AUDIO_RX_AUDIO_TX, "then the call with audio");
 }
 
+static void test_busy(void)
+{
+	int n = 0;
+	transaction_t *t;
+
+	printf("Message waiting to a phone in another procedure\n");
+	setup(TRANS_CALL_MT_ASSIGN_CONFIRM);
+	CHECK(amps_mwi(NUMBER, 1, 0) == -CAUSE_BUSY, "busy");
+	for (t = vc->trans_list; t; t = t->next)
+		n++;
+	CHECK(n == 1, "no second transaction for the same phone");
+}
 
 static void test_ringing_order_back(void)
 {
@@ -177,6 +189,7 @@ int main(void)
 	test_ringing_order_back();
 	test_alert_wait();
 	test_call();
+	test_busy();
 
 	if (failures) {
 		printf("%d check(s) failed\n", failures);

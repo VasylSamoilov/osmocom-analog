@@ -2950,15 +2950,11 @@ int amps_mwi(const char *number, int count, int type)
 	 * - Waiting for Answer Task (TRANS_CALL_MT_ANSWER_WAIT) - phone is ringing
 	 * - Waiting for Order Task (TRANS_CALL_MT_ALERT_CONFIRM) - after alert sent
 	 */
-	if (trans) {
-		if (fvc_order_allowed(trans, 0)) {
-			/* Valid FVC state - will send on voice channel */
-		} else {
-			LOGP(DAMPS, LOGL_NOTICE, "MWI: subscriber '%s' has transaction but not in valid FVC state (state=%d). "
-				"Will send on FOCC instead.\n", number, trans->state);
-			/* Don't use this transaction, create new one for FOCC */
-			trans = NULL;
-		}
+	/* a phone in another procedure (paging, assignment, registration, an order being sent) is
+	 * busy: a second transaction on the FOCC for the same MIN would run beside the first */
+	if (trans && !fvc_order_allowed(trans, 0)) {
+		LOGP(DAMPS, LOGL_NOTICE, "MWI: subscriber '%s' busy (state=%d)\n", number, trans->state);
+		return -CAUSE_BUSY;
 	}
 
 	/* If no valid transaction, create one for FOCC MWI */
