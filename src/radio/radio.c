@@ -937,38 +937,23 @@ static const rds_preset_t rds_presets[] = {
 #define RDS_PRESET_COUNT (sizeof(rds_presets) / sizeof(rds_presets[0]))
 #define RDS_PRESET_PAGING (RDS_PRESET_COUNT - 1)
 
-static int rds_current_preset = 0;
-static int rds_use_paging_preset = 0;	/* start with the paging preset */
-static uint8_t rds_user_ecc = 0;	/* --rds-ecc, overrides the preset ECC (0 = not set) */
+/* Programme Item Number (PIN) is defined per-preset in rds_preset_t (.pin_day,
+ * .pin_hour, .pin_minute); group versions per-preset (group0/1/2_version). The
+ * station settings outside the presets are in radio->opts (radio_opts_t). */
 
-/* Additional settings not in presets (common to all) */
-static uint8_t rds_ta        = 0;		/* Traffic Announcement */
-
-static uint8_t rds_di_artificial_head = 0;
-static uint8_t rds_di_compressed = 0;
-static uint8_t rds_di_dynamic_pty = 0;
-
-/* Programme Item Number (PIN) is now defined per-preset in rds_preset_t.
- * See preset .pin_day, .pin_hour, .pin_minute fields. */
-static int rds_ct_enabled    = 1;		/* Clock-Time enabled */
-
-/* Group version selection is now per-preset via group0/1/2_version fields.
- * See rds_preset_t and RDS_GROUP_VERSION_AUTO/A/B enum. */
-
-
-static char freq_name[2][64];
-
-/* User overrides */
-static uint16_t rds_user_pi = 0;
-static char *rds_user_callsign = NULL;
+void radio_opts_init(radio_opts_t *opts)
+{
+	memset(opts, 0, sizeof(*opts));
+	opts->rds_ct = 1;	/* Clock-Time enabled */
+}
 
 /* Apply current RDS preset to encoder (for runtime switching) */
 static void rds_apply_preset(radio_t *radio)
 {
-	const rds_preset_t *p = &rds_presets[rds_current_preset];
+	const rds_preset_t *p = &rds_presets[radio->rds_current_preset];
 	rds_encoder_t *enc = &radio->rds_enc;
-	
-	LOGP(DRADIO, LOGL_DEBUG, "RDS: Applying preset %d: %s\n", rds_current_preset, p->name);
+
+	LOGP(DRADIO, LOGL_DEBUG, "RDS: Applying preset %d: %s\n", radio->rds_current_preset, p->name);
 	
 	/* Update PI (will require receiver to re-sync) */
 	uint16_t pi = p->pi;
@@ -978,10 +963,10 @@ static void rds_apply_preset(radio_t *radio)
 		pi = rds_get_pi_from_callsign(p->callsign);
 	}
 
-	if (rds_user_pi)
-		pi = rds_user_pi;
-	else if (rds_user_callsign) {
-		uint16_t cpi = rds_get_pi_from_callsign(rds_user_callsign);
+	if (radio->opts.rds_pi)
+		pi = radio->opts.rds_pi;
+	else if (radio->opts.rds_callsign) {
+		uint16_t cpi = rds_get_pi_from_callsign(radio->opts.rds_callsign);
 		if (cpi) pi = cpi;
 	}
 	rds_enc_set_pi(enc, pi);
@@ -1020,8 +1005,8 @@ static void rds_apply_preset(radio_t *radio)
 	enc->di_stereo = radio->stereo ? 1 : 0;
 	
 	/* Update country codes using API (--rds-ecc overrides the preset) */
-	if (rds_user_ecc != 0) {
-		rds_enc_set_ecc(enc, rds_user_ecc);
+	if (radio->opts.rds_ecc != 0) {
+		rds_enc_set_ecc(enc, radio->opts.rds_ecc);
 	} else if (p->ecc != 0) {
 		rds_enc_set_ecc(enc, p->ecc);
 	} else {
@@ -1262,7 +1247,7 @@ static void rds_apply_preset(radio_t *radio)
 /* Cycle to next RDS preset */
 void rds_next_preset(radio_t *radio)
 {
-	rds_current_preset = (rds_current_preset + 1) % RDS_PRESET_COUNT;
+	radio->rds_current_preset = (radio->rds_current_preset + 1) % RDS_PRESET_COUNT;
 	rds_apply_preset(radio);
 }
 
@@ -1279,14 +1264,6 @@ void rds_flip_rtplus_item_running(radio_t *radio)
 void rds_flip_rtplus_toggle(radio_t *radio)
 {
 	rds_enc_flip_rtplus_toggle(&radio->rds_enc);
-}
-
-/* Polyphase resampler flag (set via CLI before radio_init) */
-static int use_polyphase_resampler = 0;
-
-void radio_set_polyphase(int enable)
-{
-	use_polyphase_resampler = enable;
 }
 
 void radio_set_forced_mono(radio_t *radio, int forced)
@@ -1344,7 +1321,7 @@ double radio_afc_get_freq_error(radio_t *radio)
 	return radio->afc.freq_error_hz;
 }
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int fm_compandor, int rds_force_rbds)
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant_us, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int fm_compandor, int rds_force_rbds, const radio_opts_t *opts)
 {
 	int rc = -EINVAL;
 	double clip_level = 1.0;  /* clipper threshold, reduced for pilot/RDS headroom */
@@ -1468,6 +1445,10 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	clipper_init(clip_level);
 
 	memset(radio, 0, sizeof(*radio));
+	if (opts)
+		radio->opts = *opts;
+	else
+		radio_opts_init(&radio->opts);
 	radio->buffer_size = buffer_size;
 	radio->volume = volume;
 	radio->clip_level = clip_level;
@@ -1646,7 +1627,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	}
 
 	/* check if sample rate is too low (only for linear resampler - polyphase handles any ratio) */
-	if (!use_polyphase_resampler) {
+	if (!radio->opts.polyphase) {
 		if (radio->tx_audio_samplerate > radio->signal_samplerate) {
 			rc = -EINVAL;
 			LOGP(DRADIO, LOGL_ERROR, "You have selected a signal processing sample rate of %.0f. Your audio sample rate is %.0f.\n", radio->signal_samplerate, radio->tx_audio_samplerate);
@@ -1719,9 +1700,9 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	 * 
 	 * Note: Filter order was also increased to 4 in libsamplerate/samplerate.c
 	 */
-	radio->use_polyphase = use_polyphase_resampler;
-	
-	if (use_polyphase_resampler) {
+	radio->use_polyphase = radio->opts.polyphase;
+
+	if (radio->opts.polyphase) {
 		/* Polyphase FIR resampler - handles any input/output ratio */
 		LOGP(DRADIO, LOGL_INFO, "Using polyphase resampler for audio/signal rate conversion.\n");
 		
@@ -1754,8 +1735,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	}
 
 	/* init display of wave form */
-	sprintf(freq_name[0], "%.4f MHz", frequency / 1e6);
-	display_wave_init(&radio->dispwav[0], radio->rx_audio_samplerate, freq_name[0]);
+	sprintf(radio->freq_name[0], "%.4f MHz", frequency / 1e6);
+	display_wave_init(&radio->dispwav[0], radio->rx_audio_samplerate, radio->freq_name[0]);
 
 	/* init filters (using signal sample rate) */
 	switch (radio->modulation) {
@@ -1817,36 +1798,36 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		}
 
 		if (stereo) {
-			sprintf(freq_name[0], "%.4f MHz left", frequency / 1e6);
-			sprintf(freq_name[1], "%.4f MHz right", frequency / 1e6);
-			display_wave_init(&radio->dispwav[1], samplerate, freq_name[1]);
+			sprintf(radio->freq_name[0], "%.4f MHz left", frequency / 1e6);
+			sprintf(radio->freq_name[1], "%.4f MHz right", frequency / 1e6);
+			display_wave_init(&radio->dispwav[1], samplerate, radio->freq_name[1]);
 		}
 		/* Initialize RDS encoder if enabled */
 		if (rds || rds2) {
 			/* Select preset based on emphasis (heuristic for region):
 			 * 75us -> Americas (RBDS) - preset 1
 			 * 50us and others -> Europe/World (RDS) - preset 0 */
-			if (rds_use_paging_preset) {
-				rds_current_preset = RDS_PRESET_PAGING;
+			if (radio->opts.rds_paging_preset) {
+				radio->rds_current_preset = RDS_PRESET_PAGING;
 				LOGP(DRADIO, LOGL_INFO, "RDS: using paging preset\n");
 			} else if (RDS_IS_RBDS_EMPHASIS(time_constant_us)) {
-				rds_current_preset = 1;  /* USA/RBDS (75us) */
+				radio->rds_current_preset = 1;  /* USA/RBDS (75us) */
 				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fus detected: using RBDS (Americas) preset\n", time_constant_us);
 			} else {
-				rds_current_preset = 0;  /* RDS (default, more common globally) */
+				radio->rds_current_preset = 0;  /* RDS (default, more common globally) */
 				LOGP(DRADIO, LOGL_INFO, "Emphasis %.0fus detected: using RDS preset (default)\n", time_constant_us);
 			}
-			const rds_preset_t *p = &rds_presets[rds_current_preset];
-			
+			const rds_preset_t *p = &rds_presets[radio->rds_current_preset];
+
 			/* Calculate PI with user overrides (same logic as rds_apply_preset) */
 			uint16_t pi = p->pi;
 			if (pi == 0 && p->callsign) {
 				pi = rds_get_pi_from_callsign(p->callsign);
 			}
-			if (rds_user_pi)
-				pi = rds_user_pi;
-			else if (rds_user_callsign) {
-				uint16_t cpi = rds_get_pi_from_callsign(rds_user_callsign);
+			if (radio->opts.rds_pi)
+				pi = radio->opts.rds_pi;
+			else if (radio->opts.rds_callsign) {
+				uint16_t cpi = rds_get_pi_from_callsign(radio->opts.rds_callsign);
 				if (cpi) pi = cpi;
 			}
 
@@ -1862,11 +1843,11 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 				radio->rds_enc.debug = rds_debug;
 				radio->rds_enc.verbose = rds_verbose;
 				radio->rds_enc.di_stereo = stereo ? 1 : 0;
-				radio->rds_enc.di_artificial_head = rds_di_artificial_head;
-				radio->rds_enc.di_compressed = rds_di_compressed;
-				radio->rds_enc.di_dynamic_pty = rds_di_dynamic_pty;
-				radio->rds_enc.ta = rds_ta;
-				radio->rds_enc.ct_enabled = rds_ct_enabled;
+				radio->rds_enc.di_artificial_head = radio->opts.rds_di_artificial_head;
+				radio->rds_enc.di_compressed = radio->opts.rds_di_compressed;
+				radio->rds_enc.di_dynamic_pty = radio->opts.rds_di_dynamic_pty;
+				radio->rds_enc.ta = radio->opts.rds_ta;
+				radio->rds_enc.ct_enabled = radio->opts.rds_ct;
 			} else {
 				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping encoder init (RX-only mode)\n");
 			}
@@ -3457,27 +3438,4 @@ int radio_rx(radio_t *radio, float *baseband, int signal_num)
 }
 
 
-void radio_set_callsign(const char *callsign)
-{
-	if (rds_user_callsign)
-		free(rds_user_callsign);
-	rds_user_callsign = callsign ? strdup(callsign) : NULL;
-}
-
-void radio_set_pi(uint16_t pi)
-{
-	rds_user_pi = pi;
-}
-
-/* ECC that overrides the preset ECC, also when presets are switched */
-void radio_set_ecc(uint8_t ecc)
-{
-	rds_user_ecc = ecc;
-}
-
-/* Start with the paging preset instead of the emphasis-selected one */
-void radio_set_paging_preset(int enable)
-{
-	rds_use_paging_preset = enable ? 1 : 0;
-}
 

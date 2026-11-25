@@ -55,7 +55,27 @@ typedef struct afc_state {
 	uint64_t update_count;    /* Number of AFC updates */
 } afc_state_t;
 
+/* Station settings that are not radio_init() parameters (were file
+ * statics in radio.c: one set per station now). radio_opts_init() gives
+ * the defaults; radio_init() copies them into the radio. */
+typedef struct radio_opts {
+	int		polyphase;		/* polyphase resampler instead of the linear one */
+	uint16_t	rds_pi;			/* --pi (0 = from the preset / callsign) */
+	const char	*rds_callsign;		/* --callsign (NULL = none): PI from it (RBDS); kept by the caller */
+	uint8_t		rds_ecc;		/* --rds-ecc, overrides the preset ECC, also on preset change (0 = not set) */
+	int		rds_paging_preset;	/* start with the paging preset instead of the emphasis-selected one */
+	uint8_t		rds_ta;			/* Traffic Announcement */
+	uint8_t		rds_di_artificial_head, rds_di_compressed, rds_di_dynamic_pty;
+	int		rds_ct;			/* Clock-Time groups */
+} radio_opts_t;
+
+void radio_opts_init(radio_opts_t *opts);
+
 typedef struct radio {
+	/* station settings (radio_opts_t) and state that was static */
+	radio_opts_t	opts;
+	int		rds_current_preset;	/* RDS preset in use ('f' cycles) */
+	char		freq_name[2][64];	/* wave display names */
 	/* modes */
 	int		buffer_size;		/* maximum number of samples */
 	enum modulation	modulation;		/* modulation type */
@@ -169,7 +189,7 @@ typedef struct radio {
 	afc_state_t	afc;
 } radio_t;
 
-int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int fm_compandor, int rds_force_rbds);
+int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency, const char *tx_wave_file, const char *rx_wave_file, const char *tx_audiodev, const char *rx_audiodev, enum modulation modulation, double bandwidth, double deviation, double modulation_index, double time_constant, double volume, int stereo, int rds, int rds2, int sca_67k, int sca_92k, int rds_debug, int rds_verbose, int am_compandor, int fm_compandor, int rds_force_rbds, const radio_opts_t *opts);
 void radio_exit(radio_t *radio);
 int radio_start(radio_t *radio);
 int radio_tx(radio_t *radio, float *baseband, int num);
@@ -194,8 +214,3 @@ void radio_afc_set_max_correction(radio_t *radio, double max_hz);
 double radio_afc_get_correction(radio_t *radio);
 double radio_afc_get_freq_error(radio_t *radio);
 
-void radio_set_callsign(const char *callsign);
-void radio_set_pi(uint16_t pi);
-void radio_set_ecc(uint8_t ecc);
-void radio_set_paging_preset(int enable);
-void radio_set_polyphase(int enable);

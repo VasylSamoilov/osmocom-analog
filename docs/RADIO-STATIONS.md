@@ -76,8 +76,16 @@ the backend one registration). Several stations = several processes.
 ## Slices (each a usable state, each proven before the next)
 
 1. radio_tx() exact count (done, 399e63e).
-2. radio.c statics into `radio_t`. Proof: the txfix harness gives
-   bit-identical TX IQ (test tone, RDS on with CT off, stereo, AM).
+2. radio.c statics into `radio_t` (done): `radio_opts_t` (polyphase, PI,
+   callsign, ECC, paging preset, TA, DI flags, CT; `radio_opts_init()`)
+   given to radio_init() and kept in the radio; the RDS preset index and
+   the wave display names in `radio_t`; the radio_set_* setters gone.
+   Proof (txfix harness, the radio.c of 399e63e against this one, test
+   tone, random requests, RDS CT off): bit-identical TX IQ for FM mono
+   (linear, polyphase), stereo, stereo + RDS (preset; PI + ECC; paging
+   preset), mono + RDS with a callsign, AM (linear, polyphase); repeatable
+   run to run. Found on the way, before and after alike: radio_exit()
+   does not free the RDS encoder's biphase waveform (2304 bytes, at exit).
 3. `station_t` and the option rule with N = 1. Proof: the same harness,
    the same command lines give the same IQ; option parsing tests.
 4. libsdr band API; offline test with three bands at different rates

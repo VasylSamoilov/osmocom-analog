@@ -659,6 +659,7 @@ static void print_help(const char *arg0)
 }
 
 static int channelizer_rate = 0; /* IQ rate to the radio, 0 = automatic */
+static radio_opts_t radio_opts; /* the station's settings outside radio_init()'s parameters (radio_opts_init() before the options) */
 static int use_polyphase = 0;
 static int use_afc = 0;
 static double afc_tc_ms = 300.0;
@@ -881,11 +882,11 @@ static int handle_options(int short_option, int argi, char **argv)
 		channelizer_rate = atoi(argv[argi]);
 		break;
 	case OPT_CALL_SIGN:
-		radio_set_callsign(argv[argi]);
+		radio_opts.rds_callsign = options_strdup(argv[argi]);
 		break;
 	case OPT_PI:
 		rds_pi_opt = (uint16_t)strtoul(argv[argi], NULL, 16);
-		radio_set_pi(rds_pi_opt);
+		radio_opts.rds_pi = rds_pi_opt;
 		break;
 	case OPT_POLYPHASE:
 		use_polyphase = 1;
@@ -970,7 +971,7 @@ static int handle_options(int short_option, int argi, char **argv)
 		rds_paging_scan = 1;
 		rds_paging_scan_from = from;
 		rds_paging_scan_to = to;
-		radio_set_paging_preset(1);
+		radio_opts.rds_paging_preset = 1;
 		break;
 	}
 	case OPT_RDS_PAGING_SCAN_TYPE:
@@ -1446,6 +1447,7 @@ int main(int argc, char *argv[])
 	logging_init();
 
 	sdr_config_init(DEFAULT_LO_OFFSET);
+	radio_opts_init(&radio_opts);
 
 	/* handle options / config file */
 	add_options();
@@ -1486,7 +1488,7 @@ int main(int argc, char *argv[])
 		}
 	}
 	if (rds_ecc)
-		radio_set_ecc(rds_ecc);	/* overrides the preset ECC, also on preset change */
+		radio_opts.rds_ecc = rds_ecc;	/* overrides the preset ECC, also on preset change */
 
 	if (rds_paging && tx && !rds_ecc) {
 		fprintf(stderr, "RDS paging TX requires --rds-ecc <hex> (Extended Country Code, EN 50067 Annex D), use '-h' for help!\n");
@@ -1600,11 +1602,9 @@ int main(int argc, char *argv[])
 	 */
 	buffer_size = input_samplerate * dsp_buffer / 1000;
 
-	/* Set polyphase resampler mode before init */
-	if (use_polyphase)
-		radio_set_polyphase(1);
+	radio_opts.polyphase = use_polyphase;
 
-	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor, fm_compandor, rds_force_rbds);
+	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor, fm_compandor, rds_force_rbds, &radio_opts);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
 		exit(0);
