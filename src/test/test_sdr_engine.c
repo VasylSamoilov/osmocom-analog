@@ -262,12 +262,99 @@ static void test_tx_isolation(void)
 	check(bm > 0, "B's missing rows while it stalled (counted on B only)", (double)bm, "");
 }
 
+/* 4. a group above the bank's DSP rate (broadcast FM next to NFM): the
+ * per-channel chain beside the bank, TX looped to RX */
+#define WIDE	240000
+static void test_wide(void)
+{
+	sdr_engine_t e;
+	sdr_group_t *gn, *gw;
+	double offn[2] = { -400000.0, -375000.0 }, offw = 400000.0, scale;
+	int blocks = 500, b, s, nn = 0, nw = 0, capn = DSP, capw = WIDE;
+	float *iq = malloc(sizeof(float) * 2 * BLOCK);
+	static sample_t ti[2][8000], tq[2][8000], ri[2][8000], rq[2][8000];
+	sample_t *tip[2] = { ti[0], ti[1] }, *tqp[2] = { tq[0], tq[1] }, *rip[2] = { ri[0], ri[1] }, *rqp[2] = { rq[0], rq[1] };
+	double complex *y0 = malloc(sizeof(*y0) * capn), *y1 = malloc(sizeof(*y1) * capn), *yw = malloc(sizeof(*yw) * capw);
+	long tn = 0, tw = 0;
+
+	printf("Engine %d S/s, bank for DSP %d, an NFM group (2 ch, %d) and a wide group (1 ch, %d, chain), TX looped to RX:\n", FS, DSP, DSP, WIDE);
+	if (sdr_engine_init(&e, FS, FS, DSP, NMAX, BLOCK) < 0) {
+		printf("  %s\n", sdr_engine_error());
+		failures++;
+		return;
+	}
+	scale = sdr_engine_tx_scale(&e);
+	gn = sdr_engine_group_add(&e, DSP, 2, offn, 2, offn, 200, DSP / 50);
+	gw = sdr_engine_group_add(&e, WIDE, 1, &offw, 1, &offw, 200, WIDE / 50);
+	if (!gn || !gw) {
+		printf("  %s\n", sdr_engine_error());
+		failures++;
+		return;
+	}
+	check(gw->chain && !gn->chain, "the wide group on the chain, the NFM group on the bank", (double)gw->chain, "");
+	for (b = 0; b < blocks; b++) {
+		int n = sdr_engine_group_tosend(gn), got;
+
+		if (n > 8000)
+			n = 8000;
+		for (s = 0; s < n; s++, tn++) {
+			double complex z0 = scale * cexp(2 * M_PI * I * 1000.0 / DSP * tn), z1 = scale * cexp(-2 * M_PI * I * 2000.0 / DSP * tn);
+
+			ti[0][s] = creal(z0); tq[0][s] = cimag(z0);
+			ti[1][s] = creal(z1); tq[1][s] = cimag(z1);
+		}
+		sdr_engine_group_write(gn, tip, tqp, n);
+		n = sdr_engine_group_tosend(gw);
+		if (n > 8000)
+			n = 8000;
+		for (s = 0; s < n; s++, tw++) {
+			double complex z = scale * cexp(2 * M_PI * I * 20000.0 / WIDE * tw);
+
+			ti[0][s] = creal(z); tq[0][s] = cimag(z);
+		}
+		sdr_engine_group_write(gw, tip, tqp, n);
+		sdr_engine_tx_produce(&e, iq, BLOCK);
+		sdr_engine_rx_feed(&e, iq, BLOCK);
+		got = sdr_engine_group_read(gn, rip, rqp, 8000);
+		for (s = 0; s < got && nn < capn; s++, nn++) {
+			y0[nn] = (ri[0][s] + I * rq[0][s]) / scale;
+			y1[nn] = (ri[1][s] + I * rq[1][s]) / scale;
+		}
+		got = sdr_engine_group_read(gw, rip, rqp, 8000);
+		for (s = 0; s < got && nw < capw; s++, nw++)
+			yw[nw] = (ri[0][s] + I * rq[0][s]) / scale;
+	}
+	{
+		int skn = nn / 4, ln = nn - skn, skw = nw / 4, lw = nw - skw;
+		double l0 = level(y0 + skn, ln, 1000.0 / DSP), l1 = level(y1 + skn, ln, -2000.0 / DSP), lw0 = level(yw + skw, lw, 20000.0 / WIDE);
+		double xw = fmax(level(y0 + skn, ln, (offw + 20000.0 - offn[0]) / DSP), level(y1 + skn, ln, (offw + 20000.0 - offn[1]) / DSP));
+		double xn = fmax(level(yw + skw, lw, (offn[0] + 1000.0 - offw) / WIDE), level(yw + skw, lw, (offn[1] - 2000.0 - offw) / WIDE));
+		long expect = (long)blocks * BLOCK / (FS / WIDE);
+
+		check(fabs(l0) < 0.01 && fabs(l1) < 0.01, "level of each NFM channel's tone back (worst error)", fmax(fabs(l0), fabs(l1)), "dB");
+		check(fabs(lw0) < 0.05, "level of the wide channel's tone back (error)", fabs(lw0), "dB");
+		check(xw < -100.0 && xn < -100.0, "the other group's tones in a channel (worst)", fmax(xw, xn), "dB");
+		check(gn->view->tx_missing == 0 && gn->view->rx_dropped == 0 && gw->view->tx_missing == 0 && gw->view->rx_dropped == 0,
+		      "TX rows missing + RX rows dropped, both groups", (double)(gn->view->tx_missing + gn->view->rx_dropped + gw->view->tx_missing + gw->view->rx_dropped), "");
+		check(labs((long)gw->view->rx_rows - expect) <= 8 && labs((long)gw->view->tx_rows - expect) <= 8 + WIDE / 50,
+		      "wide rows received / sent vs the rate (worst difference)", (double)labs((long)gw->view->rx_rows - expect), "");
+		printf("  wide: %ld rows sent, %ld received (%ld expected); NFM: %ld / %ld\n", (long)gw->view->tx_rows, (long)gw->view->rx_rows, expect,
+		       (long)gn->view->tx_rows, (long)gn->view->rx_rows);
+	}
+	sdr_engine_exit(&e);
+	free(iq);
+	free(y0);
+	free(y1);
+	free(yw);
+}
+
 int main(void)
 {
 	printf("=== SDR engine tests ===\n\n");
 	test_loopback();
 	test_rx_isolation();
 	test_tx_isolation();
+	test_wide();
 	printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
 	return failures ? 1 : 0;
 }

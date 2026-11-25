@@ -227,6 +227,17 @@ static void group_free(sdr_group_t *g)
 			pfb_chan_exit(&g->tx[c]);
 		free(g->tx);
 	}
+	if (g->crx) {
+		for (c = 0; c < g->n_rx; c++)
+			channelizer_exit(&g->crx[c]);
+		free(g->crx);
+	}
+	if (g->ctx) {
+		for (c = 0; c < g->n_tx; c++)
+			channelizer_exit(&g->ctx[c]);
+		free(g->ctx);
+	}
+	free(g->tx_fifo);
 	if (g->view_own)
 		free(g->view);
 	free(g->tx_in_i);
@@ -290,8 +301,8 @@ sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, c
 			 n_rx, n_tx, SDR_ENGINE_MAX_CHAN, e->rx_rate ? "on" : "off", e->tx_rate ? "on" : "off");
 		return NULL;
 	}
-	if (dsp_rate > e->max_dsp) {
-		snprintf(error_text, sizeof(error_text), "DSP rate %d above the %d the filter banks are made for", dsp_rate, e->max_dsp);
+	if (dsp_rate <= 0) {
+		snprintf(error_text, sizeof(error_text), "DSP rate %d", dsp_rate);
 		return NULL;
 	}
 	pthread_mutex_lock(&e->lock);
@@ -309,6 +320,7 @@ sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, c
 	g->dsp_rate = dsp_rate;
 	g->n_rx = n_rx;
 	g->n_tx = n_tx;
+	g->chain = (dsp_rate > e->max_dsp);
 	rows = sdr_engine_rows(dsp_rate, ring_ms);
 	/* the view: rings and counters */
 	vsize = sdr_view_size(n_rx, n_tx, rows);
@@ -332,7 +344,25 @@ sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, c
 	g->view->rows = rows;
 	g->view->tx_scale = sdr_engine_tx_scale(e);
 	view_rings(g->view, n_rx, n_tx, rows, &g->rx_ring, &g->tx_ring);
-	if (n_rx) {
+	if (n_rx && g->chain) {
+		/* the chain takes every SDR block whole: its output per block */
+		g->crx = calloc(n_rx, sizeof(*g->crx));
+		g->rx_max = (int)ceil((double)e->max_block * dsp_rate / e->rx_rate) + 8;
+		g->rx_out_i = calloc((size_t)n_rx * g->rx_max, sizeof(sample_t));
+		g->rx_out_q = calloc((size_t)n_rx * g->rx_max, sizeof(sample_t));
+		if (!g->crx || !g->rx_out_i || !g->rx_out_q)
+			goto nomem;
+		for (c = 0; c < n_rx; c++) {
+			g->rx_offset[c] = rx_offset[c];
+			/* the same guarantee as the tails: flat to 0.4 of the DSP rate */
+			rc = channelizer_rx_init(&g->crx[c], e->rx_rate, dsp_rate, rx_offset[c], 2.0 * CHANNELIZER_PASS * dsp_rate, e->max_block);
+			if (rc < 0) {
+				snprintf(error_text, sizeof(error_text), "RX channel at %+.0f Hz, DSP rate %d: %s", rx_offset[c], dsp_rate, channelizer_error());
+				g->n_rx = c;
+				goto fail;
+			}
+		}
+	} else if (n_rx) {
 		int fb = pfb_bin_rate(&e->bank_rx);
 
 		g->rx = calloc(n_rx, sizeof(*g->rx));
@@ -351,7 +381,29 @@ sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, c
 			}
 		}
 	}
-	if (n_tx) {
+	if (n_tx && g->chain) {
+		g->ctx = calloc(n_tx, sizeof(*g->ctx));
+		g->tx_max = (int)ceil((double)e->max_block * dsp_rate / e->tx_rate) + 8;
+		g->tx_in_i = calloc((size_t)n_tx * g->tx_max, sizeof(sample_t));
+		g->tx_in_q = calloc((size_t)n_tx * g->tx_max, sizeof(sample_t));
+		if (!g->ctx || !g->tx_in_i || !g->tx_in_q)
+			goto nomem;
+		for (c = 0; c < n_tx; c++) {
+			g->tx_offset[c] = tx_offset[c];
+			rc = channelizer_tx_init(&g->ctx[c], e->tx_rate, dsp_rate, tx_offset[c], 2.0 * CHANNELIZER_PASS * dsp_rate, g->tx_max);
+			if (rc < 0) {
+				snprintf(error_text, sizeof(error_text), "TX channel at %+.0f Hz, DSP rate %d: %s", tx_offset[c], dsp_rate, channelizer_error());
+				g->n_tx = c;
+				goto fail;
+			}
+		}
+		/* what one pull makes on top of a block still to give */
+		g->tx_fifo_size = e->max_block + channelizer_tx_max(&g->ctx[0], g->tx_max) + 16;
+		g->tx_fifo = calloc((size_t)2 * g->tx_fifo_size, sizeof(float));
+		if (!g->tx_fifo)
+			goto nomem;
+		g->tx_target = (tx_target < rows - 1) ? tx_target : rows - 1;
+	} else if (n_tx) {
 		int fb = pfb_bin_rate(&e->bank_tx);
 
 		g->tx = calloc(n_tx, sizeof(*g->tx));
@@ -468,12 +520,15 @@ static void adopt(sdr_engine_t *e, int tx)
 	pthread_mutex_unlock(&e->lock);
 	if (!changed)
 		return;
-	/* bins of all channels, in list order */
+	/* bins of all channels on the bank, in list order (chain groups have
+	 * none) */
 	c = 0;
 	for (j = 0; j < *n; j++) {
 		sdr_group_t *g = list[j];
 		int k;
 
+		if (g->chain)
+			continue;
 		if (tx) {
 			for (k = 0; k < g->n_tx; k++)
 				e->tx_bins[c++] = g->tx[k].bin;
@@ -510,9 +565,17 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 		int in, space;
 
 		out = 0;
-		for (k = 0; k < g->n_rx; k++, c++) {
-			int got = pfb_chan_rx_process(&g->rx[k], e->rx_bin_i[c], e->rx_bin_q[c], frames, g->rx_max,
-						      g->rx_out_i + k * g->rx_max, g->rx_out_q + k * g->rx_max);
+		for (k = 0; k < g->n_rx; k++) {
+			int got;
+
+			if (g->chain)
+				got = channelizer_rx_process(&g->crx[k], iq, n, g->rx_max,
+							     g->rx_out_i + k * g->rx_max, g->rx_out_q + k * g->rx_max);
+			else {
+				got = pfb_chan_rx_process(&g->rx[k], e->rx_bin_i[c], e->rx_bin_q[c], frames, g->rx_max,
+							  g->rx_out_i + k * g->rx_max, g->rx_out_q + k * g->rx_max);
+				c++;
+			}
 			if (k == 0)
 				out = got;
 			else if (got != out)
@@ -545,9 +608,87 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 	}
 }
 
+/* need rows of the group's TX ring into tx_in_i / _q (channel k at
+ * k * tx_max); the program fell behind: silence for the missing rows, so
+ * the tails stay continuous (counted) */
+static void tx_take(sdr_group_t *g, int need)
+{
+	sdr_ring_t *r = &g->tx_ring;
+	int have = ring_fill_dev(r), take, out, s, k;
+
+	if (need > g->tx_max) {
+		fprintf(stderr, "sdr_engine_tx_produce: %d DSP samples needed, more than %d, please fix!\n", need, g->tx_max);
+		abort();
+	}
+	if (have < 0) {
+		/* the program wrote an index out of range: silence */
+		g->view->bad_index++;
+		have = 0;
+	}
+	take = (have < need) ? have : need;
+	out = r->pos;
+	for (s = 0; s < take; s++) {
+		const float *row = r->buf + (size_t)out * r->width;
+
+		for (k = 0; k < g->n_tx; k++) {
+			g->tx_in_i[k * g->tx_max + s] = row[2 * k];
+			g->tx_in_q[k * g->tx_max + s] = row[2 * k + 1];
+		}
+		if (++out == r->rows)
+			out = 0;
+	}
+	r->pos = out;
+	__atomic_store_n(&r->ctl->out, out, __ATOMIC_RELEASE);
+	for (k = 0; k < g->n_tx; k++) {
+		memset(g->tx_in_i + k * g->tx_max + take, 0, (need - take) * sizeof(sample_t));
+		memset(g->tx_in_q + k * g->tx_max + take, 0, (need - take) * sizeof(sample_t));
+	}
+	g->view->tx_rows += take;
+	if (take < need && g->view->tx_rows)
+		g->view->tx_missing += need - take;
+}
+
+/* a chain group: exactly n SDR samples added to iq; its channelizers make
+ * what the DSP samples give (not a fixed count per call), the surplus waits
+ * in the group's FIFO for the next block */
+static void tx_chain(sdr_engine_t *e, sdr_group_t *g, float *iq, int n)
+{
+	int s, k;
+
+	while (g->tx_fifo_len < n) {
+		/* DSP samples for what is missing, at least one */
+		int need = (int)ceil((double)(n - g->tx_fifo_len) * g->dsp_rate / e->tx_rate), made = 0;
+
+		if (need < 1)
+			need = 1;
+		if (need > g->tx_max)
+			need = g->tx_max;
+		if (g->tx_fifo_len + channelizer_tx_max(&g->ctx[0], need) > g->tx_fifo_size) {
+			fprintf(stderr, "sdr_engine_tx_produce: chain FIFO of %d too small, please fix!\n", g->tx_fifo_size);
+			abort();
+		}
+		tx_take(g, need);
+		memset(g->tx_fifo + 2 * g->tx_fifo_len, 0, sizeof(float) * 2 * channelizer_tx_max(&g->ctx[0], need));
+		for (k = 0; k < g->n_tx; k++) {
+			int got = channelizer_tx_process(&g->ctx[k], g->tx_in_i + k * g->tx_max, g->tx_in_q + k * g->tx_max, need,
+							 g->tx_fifo + 2 * g->tx_fifo_len);
+
+			if (k == 0)
+				made = got;
+			else if (got != made)
+				fprintf(stderr, "sdr_engine_tx_produce: chain channels of a group out of step (%d / %d), please fix!\n", got, made);
+		}
+		g->tx_fifo_len += made;
+	}
+	for (s = 0; s < 2 * n; s++)
+		iq[s] += g->tx_fifo[s];
+	g->tx_fifo_len -= n;
+	memmove(g->tx_fifo, g->tx_fifo + 2 * n, sizeof(float) * 2 * g->tx_fifo_len);
+}
+
 void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
 {
-	int frames = n / e->bank_tx.d, j, k, c, s;
+	int frames = n / e->bank_tx.d, j, k, c, need;
 
 	adopt(e, 1);
 	memset(iq, 0, sizeof(*iq) * 2 * n);
@@ -558,41 +699,13 @@ void sdr_engine_tx_produce(sdr_engine_t *e, float *iq, int n)
 	c = 0;
 	for (j = 0; j < e->tx_n; j++) {
 		sdr_group_t *g = e->tx_list[j];
-		sdr_ring_t *r = &g->tx_ring;
-		int need = pfb_chan_tx_need(&g->tx[0], frames), have = ring_fill_dev(r), take, out;
 
-		if (need > g->tx_max) {
-			fprintf(stderr, "sdr_engine_tx_produce: %d DSP samples needed, more than %d, please fix!\n", need, g->tx_max);
-			abort();
+		if (g->chain) {
+			tx_chain(e, g, iq, n);
+			continue;
 		}
-		if (have < 0) {
-			/* the program wrote an index out of range: silence */
-			g->view->bad_index++;
-			have = 0;
-		}
-		take = (have < need) ? have : need;
-		out = r->pos;
-		for (s = 0; s < take; s++) {
-			const float *row = r->buf + (size_t)out * r->width;
-
-			for (k = 0; k < g->n_tx; k++) {
-				g->tx_in_i[k * g->tx_max + s] = row[2 * k];
-				g->tx_in_q[k * g->tx_max + s] = row[2 * k + 1];
-			}
-			if (++out == r->rows)
-				out = 0;
-		}
-		r->pos = out;
-		__atomic_store_n(&r->ctl->out, out, __ATOMIC_RELEASE);
-		/* the program fell behind: silence for the missing rows, so the
-		 * tails stay continuous */
-		for (k = 0; k < g->n_tx; k++) {
-			memset(g->tx_in_i + k * g->tx_max + take, 0, (need - take) * sizeof(sample_t));
-			memset(g->tx_in_q + k * g->tx_max + take, 0, (need - take) * sizeof(sample_t));
-		}
-		g->view->tx_rows += take;
-		if (take < need && g->view->tx_rows)
-			g->view->tx_missing += need - take;
+		need = pfb_chan_tx_need(&g->tx[0], frames);
+		tx_take(g, need);
 		for (k = 0; k < g->n_tx; k++, c++) {
 			pfb_chan_tx_pull(&g->tx[k], g->tx_in_i + k * g->tx_max, g->tx_in_q + k * g->tx_max, need, frames);
 			e->tx_ci[c] = g->tx[k].out_i;

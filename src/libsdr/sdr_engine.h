@@ -36,6 +36,7 @@
 #include <stddef.h>
 #include "../libsample/sample.h"
 #include "../libchannelizer/pfb.h"
+#include "../libchannelizer/channelizer.h"
 
 #define SDR_ENGINE_MAX_GROUPS	64
 #define SDR_ENGINE_MAX_CHAN	128	/* channels in one group, per direction */
@@ -90,7 +91,13 @@ typedef struct sdr_group {
 	int		dsp_rate;
 	int		n_rx, n_tx;
 	double		rx_offset[SDR_ENGINE_MAX_CHAN], tx_offset[SDR_ENGINE_MAX_CHAN];
-	pfb_chan_t	*rx, *tx;	/* channel tails */
+	pfb_chan_t	*rx, *tx;	/* channel tails (on the bank) */
+	/* a DSP rate above the bank's (broadcast FM next to NFM): every channel
+	 * a channelizer on the SDR stream instead of a tail on the bank */
+	int		chain;
+	channelizer_t	*crx, *ctx;
+	float		*tx_fifo;	/* SDR rate IQ made, not yet given (all TX channels added) */
+	int		tx_fifo_len, tx_fifo_size;
 	sdr_view_t	*view;		/* rings and counters (own memory or the caller's) */
 	int		view_own;
 	sdr_ring_t	rx_ring, tx_ring;	/* the device threads' descriptors */
@@ -143,8 +150,11 @@ int sdr_engine_bins(int fs, int dsp, int nchan);
 
 /* Build and register a group (the caller's thread; takes the filter design
  * time). Offsets in Hz from the SDR centre. ring_ms: ring length in ms of
- * DSP samples, tx_target: TX ring fill the program keeps (rows). Returns
- * the group or NULL with a reason in sdr_engine_error(). */
+ * DSP samples, tx_target: TX ring fill the program keeps (rows). A DSP
+ * rate above max_dsp (wider than the bank's sub-bands, e.g. broadcast FM)
+ * gets the per-channel chain on the SDR stream (docs/SDR-BACKEND.md,
+ * measured cheaper than a bank for it). Returns the group or NULL with a
+ * reason in sdr_engine_error(). */
 sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target);
 /* the same with the view in the caller's memory (mem, size; zeroed, at
  * least sdr_view_size() of the group: shared memory for the backend) */
