@@ -320,8 +320,17 @@ margin; the margin is the bench below). Reference without the backend:
 one osmoradio TX + RX in-process on the B210, same tone, TX 60 / RX 10:
 SINAD 61.1 dB (backend 61.0 dB); both likely limited by the audio path,
 so this shows no loss, not a margin. Once at start osmoradio logged
-`signal_num > signal_buffer_size (7210 > 7200), capping` (its first
-tosend; not looked into).
+`signal_num > signal_buffer_size (7210 > 7200), capping`: its first
+tosend is the whole buffer (7200), and radio_tx() sizes the signal buffer
+as audio x factor + 10 (linear resampler; + 16 polyphase), a safety
+estimate. On the linear path (the default) that capped value is not used:
+the count is then taken exactly (samplerate_upsample_output_num), here
+1440 audio x 5 (48 k wave, 240 k signal) = 7200, so nothing lost, a false
+alarm. Latent, not tested: with a rate ratio that is not an integer the
+exact count can be one above tosend; when tosend is the whole buffer that
+writes one sample past sendbuff (main.c, buffer_size x 2 floats). On the
+polyphase path the cap is the output limit; the audio it does not take is
+lost (a few samples). Parked.
 
 The shipped engine path in the bench (path e: the 48 k bank and the wide
 group on its chain, `bench_wide.c`, `KINDS=ce`): CPU as path c (1.92 M /
