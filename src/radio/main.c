@@ -53,12 +53,133 @@ enum paging_signal;
 #define DEFAULT_LO_OFFSET -1000000.0
 #define RDS_PAGING_PIPE_DEFAULT "/tmp/rds_paging_send"
 
-static const char *rds_paging_pipe_path = RDS_PAGING_PIPE_DEFAULT;
-static int paging_pipe_fd = -1;
+/* one station: its options, RDS, servers and files */
+typedef struct station {
+	const char *rds_paging_pipe_path;
+	int paging_pipe_fd;
 
-/* Signal meter (file-scope so tune callback can access it) */
-static signal_meter_t *meter = NULL;
-static int spectral_freq_idx = -1;	/* index of our registered frequency in spectral measurement */
+	/* Signal meter (file-scope so tune callback can access it) */
+	signal_meter_t *meter;
+	int spectral_freq_idx;	/* index of our registered frequency in spectral measurement */
+
+	double frequency;
+	int dsp_samplerate;
+	const char *tx_wave_file;
+	const char *rx_wave_file;
+	const char *tx_audiodev;
+	const char *rx_audiodev;
+	enum modulation modulation;
+	int rx, tx;
+	/* Audio bandwidth defaults (Hz) - NOT RF/signal bandwidth.
+	 * FM broadcast audio: 30 Hz - 15 kHz (matches 50/75µs pre-emphasis curve).
+	 *
+	 * Carson's Rule: BW = 2 * (Δf + fm)
+	 *   where Δf = peak deviation (75 kHz), fm = max modulating freq
+	 *
+	 * Our variables map to Carson's Rule as:
+	 *   Δf = deviation (75000 Hz)
+	 *   fm = bandwidth_fm (15000 Hz) for mono, or highest subcarrier for stereo/RDS
+	 *   baseband_extent = Δf + fm (one-sided max freq), RF bandwidth = 2x this
+	 *
+	 * Theoretical vs practical RF bandwidth:
+	 *   Mono:   2*(75k+15k) = 180 kHz — fits 200 kHz channel
+	 *   Stereo: 2*(75k+53k) = 256 kHz — theoretical, but fits 200 kHz
+	 *   RDS:    2*(75k+60k) = 270 kHz — theoretical, but fits 200 kHz
+	 *
+	 * Real-world FM+RDS fits in 200 kHz because:
+	 *   - RDS at 57 kHz is only ~5% injection level (low energy)
+	 *   - High-frequency sidebands fall off rapidly
+	 *   - Carson's Rule is worst-case; actual spectrum is narrower
+	 *
+	 * We use the theoretical values for baseband_extent to ensure our
+	 * filters and sample rates capture the full baseband spectrum.
+	 */
+	double bandwidth_am;	/* AM audio bandwidth (Hz) */
+	double bandwidth_fm;	/* FM audio bandwidth (Hz) */
+	double bandwidth;	/* User-specified audio bandwidth override */
+	double deviation;	/* FM deviation (Hz), ±75kHz for broadcast */
+	double modulation_index;
+	double time_constant_us;
+	double volume;
+	int stereo;
+	int rds;
+	int rds2;
+	int rds_debug;
+	int rds_verbose;
+	int rds_force_rbds;
+	int sca_67k;
+	int sca_92k;
+	int am_compandor;
+	int fm_compandor;
+	int rds_paging;
+	int rds_paging_rpc;		/* Default RPC=4: group desig 001, batt sync 00 */
+	uint16_t rds_paging_cc;		/* E.212 MCC for international (0=not set) */
+	uint8_t rds_paging_opc;		/* OPC for international (0=not set) */
+	uint8_t rds_paging_pac;		/* PAC for paging area (0=all areas) */
+	int rds_paging_battery;		/* pagers use battery saving: place calls in their interval */
+	uint8_t rds_ecc;		/* Extended Country Code for 1A variant 0 (0 = not set) */
+	uint16_t rds_pi_opt;		/* --pi, for the ECC / PI country digit check */
+	int rds_paging_13a;		/* enhanced paging 13A address notification */
+	int rds_paging_scan;		/* address range scan enabled */
+	uint32_t rds_paging_scan_from;
+	uint32_t rds_paging_scan_to;
+	int rds_paging_scan_type;	/* enum rds_paging_msg_type: NUM10 */
+	const char *rds_hexrds_file;
+	const char *rds_bitstream_file;
+	const char *rds_tx_hexrds_file;
+	const char *rds_tx_bitstream_file;
+	const char *rds_tmc_events_file;
+	const char *rds_tmc_locations_path;
+
+	/* Protocol server endpoints */
+	const char *xdr_gtk_server;
+	const char *rdsspy_server;
+	const char *uecp_server;
+	const char *asciig_server;
+	const char *rigctl_server_endpoint;
+	const char *rigctl_allowed_hosts;
+	const char *xdr_gtk_password;
+
+	int channelizer_rate; /* IQ rate to the radio, 0 = automatic */
+	radio_opts_t radio_opts; /* the station's settings outside radio_init()'s parameters (radio_opts_init() before the options) */
+	int use_polyphase;
+	int use_afc;
+	double afc_tc_ms;
+	double afc_max_hz;
+} station_t;
+
+static station_t station0;
+static station_t *st = &station0;
+
+/* the initial values of a station's settings */
+static void station_defaults(station_t *s)
+{
+	memset(s, 0, sizeof(*s));
+	s->rds_paging_pipe_path = RDS_PAGING_PIPE_DEFAULT;
+	s->paging_pipe_fd = -1;
+	s->meter = NULL;
+	s->spectral_freq_idx = -1;
+	s->frequency = 0.0;
+	s->dsp_samplerate = 100000;
+	s->modulation = MODULATION_NONE;
+	s->rx = 0;
+	s->tx = 0;
+	s->bandwidth_am = 4500.0;
+	s->bandwidth_fm = 15000.0;
+	s->bandwidth = 0.0;
+	s->deviation = 75000.0;
+	s->modulation_index = 1.0;
+	s->time_constant_us = 50.0;
+	s->volume = 1.0;
+	s->rds_paging_rpc = 4;
+	s->rds_paging_scan_type = 1;
+	s->channelizer_rate = 0;
+	s->use_polyphase = 0;
+	s->use_afc = 0;
+	s->afc_tc_ms = 300.0;
+	s->afc_max_hz = 5000.0;
+	radio_opts_init(&s->radio_opts);
+}
 
 sender_t *sender_head = NULL;
 int use_sdr = 0;
@@ -68,84 +189,7 @@ int fast_math = 0;
 
 sender_t *get_sender_by_empfangsfrequenz(double __attribute__((unused)) freq) { return NULL; }
 
-static double frequency = 0.0;
-static int dsp_samplerate = 100000;
 static int dsp_buffer = 30;
-static const char *tx_wave_file = NULL;
-static const char *rx_wave_file = NULL;
-static const char *tx_audiodev = NULL;
-static const char *rx_audiodev = NULL;
-static enum modulation modulation = MODULATION_NONE;
-static int rx = 0, tx = 0;
-/* Audio bandwidth defaults (Hz) - NOT RF/signal bandwidth.
- * FM broadcast audio: 30 Hz - 15 kHz (matches 50/75µs pre-emphasis curve).
- *
- * Carson's Rule: BW = 2 * (Δf + fm)
- *   where Δf = peak deviation (75 kHz), fm = max modulating freq
- *
- * Our variables map to Carson's Rule as:
- *   Δf = deviation (75000 Hz)
- *   fm = bandwidth_fm (15000 Hz) for mono, or highest subcarrier for stereo/RDS
- *   baseband_extent = Δf + fm (one-sided max freq), RF bandwidth = 2x this
- *
- * Theoretical vs practical RF bandwidth:
- *   Mono:   2*(75k+15k) = 180 kHz — fits 200 kHz channel
- *   Stereo: 2*(75k+53k) = 256 kHz — theoretical, but fits 200 kHz
- *   RDS:    2*(75k+60k) = 270 kHz — theoretical, but fits 200 kHz
- *
- * Real-world FM+RDS fits in 200 kHz because:
- *   - RDS at 57 kHz is only ~5% injection level (low energy)
- *   - High-frequency sidebands fall off rapidly
- *   - Carson's Rule is worst-case; actual spectrum is narrower
- *
- * We use the theoretical values for baseband_extent to ensure our
- * filters and sample rates capture the full baseband spectrum.
- */
-static double bandwidth_am = 4500.0;	/* AM audio bandwidth (Hz) */
-static double bandwidth_fm = 15000.0;	/* FM audio bandwidth (Hz) */
-static double bandwidth = 0.0;		/* User-specified audio bandwidth override */
-static double deviation = 75000.0;	/* FM deviation (Hz), ±75kHz for broadcast */
-static double modulation_index = 1.0;
-static double time_constant_us = 50.0;
-static double volume = 1.0;
-static int stereo = 0;
-static int rds = 0;
-static int rds2 = 0;
-static int rds_debug = 0;
-static int rds_verbose = 0;
-static int rds_force_rbds = 0;
-static int sca_67k = 0;
-static int sca_92k = 0;
-static int am_compandor = 0;
-static int fm_compandor = 0;
-static int rds_paging = 0;
-static int rds_paging_rpc = 4;  /* Default RPC=4: group desig 001, batt sync 00 */
-static uint16_t rds_paging_cc = 0;   /* E.212 MCC for international (0=not set) */
-static uint8_t rds_paging_opc = 0;   /* OPC for international (0=not set) */
-static uint8_t rds_paging_pac = 0;   /* PAC for paging area (0=all areas) */
-static int rds_paging_battery = 0;   /* pagers use battery saving: place calls in their interval */
-static uint8_t rds_ecc = 0;          /* Extended Country Code for 1A variant 0 (0 = not set) */
-static uint16_t rds_pi_opt = 0;      /* --pi, for the ECC / PI country digit check */
-static int rds_paging_13a = 0;       /* enhanced paging 13A address notification */
-static int rds_paging_scan = 0;      /* address range scan enabled */
-static uint32_t rds_paging_scan_from = 0;
-static uint32_t rds_paging_scan_to = 0;
-static int rds_paging_scan_type = 1; /* enum rds_paging_msg_type: NUM10 */
-static const char *rds_hexrds_file = NULL;
-static const char *rds_bitstream_file = NULL;
-static const char *rds_tx_hexrds_file = NULL;
-static const char *rds_tx_bitstream_file = NULL;
-static const char *rds_tmc_events_file = NULL;
-static const char *rds_tmc_locations_path = NULL;
-
-/* Protocol server endpoints */
-static const char *xdr_gtk_server = NULL;
-static const char *rdsspy_server = NULL;
-static const char *uecp_server = NULL;
-static const char *asciig_server = NULL;
-static const char *rigctl_server_endpoint = NULL;
-static const char *rigctl_allowed_hosts = NULL;
-static const char *xdr_gtk_password = NULL;
 
 /* global variable to quit main loop */
 int quit = 0;
@@ -165,14 +209,14 @@ static void radio_tune_cb(int freq_khz, void *arg)
 	double freq_hz = freq_khz * 1000.0;
 
 	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
-	if (rds && ctx->radio) {
+	if (st->rds && ctx->radio) {
 		if (ctx->radio->rds_dec.blocks_ok > 0) {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz, last known RDS data:\n",
-			     frequency / 1e6);
+			     st->frequency / 1e6);
 			rds_decoder_status(&ctx->radio->rds_dec);
 		} else {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz (no valid RDS blocks received)\n",
-			     frequency / 1e6);
+			     st->frequency / 1e6);
 		}
 	}
 
@@ -184,22 +228,22 @@ static void radio_tune_cb(int freq_khz, void *arg)
 	}
 
 	/* Update global frequency and XDR-GTK server state */
-	frequency = freq_hz;
+	st->frequency = freq_hz;
 	if (ctx->xdr_srv)
 		ctx->xdr_srv->freq_khz = freq_khz;
 
 	/* Clear stale measurements from previous frequency */
-	if (meter)
-		signal_meter_reset(meter);
+	if (st->meter)
+		signal_meter_reset(st->meter);
 
 	/* Reset RDS decoder for new station */
-	if (rds && ctx->radio)
+	if (st->rds && ctx->radio)
 		rds_decoder_reset(&ctx->radio->rds_dec);
 
 	/* Update spectral measurement for new frequency */
 	sdr_spectral_set_center(freq_hz);
 	sdr_spectral_clear_freq();
-	spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
+	st->spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
 
 	/* Tell RDS-Spy to reset its decoder state (new station) */
 	if (ctx->rdsspy_srv)
@@ -216,7 +260,7 @@ static void radio_scan_cb(int freq_khz, void *arg)
 	if (sdr_set_rx_frequency(freq_hz) < 0)
 		return;
 
-	frequency = freq_hz;
+	st->frequency = freq_hz;
 	if (ctx->xdr_srv)
 		ctx->xdr_srv->freq_khz = freq_khz;
 
@@ -250,7 +294,7 @@ static void radio_tx_tune_cb(int freq_khz, void *arg)
 		return;
 	}
 
-	frequency = freq_hz;
+	st->frequency = freq_hz;
 }
 
 /* Rigctl callbacks */
@@ -259,14 +303,14 @@ static int rigctl_set_rx_freq(double freq_hz, void *arg)
 	radio_t *r = (radio_t *)arg;
 
 	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
-	if (rds && r) {
+	if (st->rds && r) {
 		if (r->rds_dec.blocks_ok > 0) {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz, last known RDS data:\n",
-			     frequency / 1e6);
+			     st->frequency / 1e6);
 			rds_decoder_status(&r->rds_dec);
 		} else {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz (no valid RDS blocks received)\n",
-			     frequency / 1e6);
+			     st->frequency / 1e6);
 		}
 	}
 
@@ -277,20 +321,20 @@ static int rigctl_set_rx_freq(double freq_hz, void *arg)
 		return -1;
 	}
 
-	frequency = freq_hz;
+	st->frequency = freq_hz;
 
 	/* Clear stale measurements */
-	if (meter)
-		signal_meter_reset(meter);
+	if (st->meter)
+		signal_meter_reset(st->meter);
 
 	/* Reset RDS decoder for new station */
-	if (rds && r)
+	if (st->rds && r)
 		rds_decoder_reset(&r->rds_dec);
 
 	/* Update spectral measurement */
 	sdr_spectral_set_center(freq_hz);
 	sdr_spectral_clear_freq();
-	spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
+	st->spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
 
 	return 0;
 }
@@ -306,20 +350,20 @@ static int rigctl_set_tx_freq(double freq_hz, void *arg)
 		return -1;
 	}
 
-	frequency = freq_hz;
+	st->frequency = freq_hz;
 	return 0;
 }
 
 static double rigctl_get_rx_freq(void *arg)
 {
 	(void)arg;
-	return frequency;
+	return st->frequency;
 }
 
 static double rigctl_get_tx_freq(void *arg)
 {
 	(void)arg;
-	return frequency;
+	return st->frequency;
 }
 
 /* Callback for decoded RDS groups - forwards to protocol servers */
@@ -405,7 +449,7 @@ static void print_help(const char *arg0)
 	printf(" -f --frequency <frequency>\n");
 	printf("        Give frequency in Hertz.\n");
 	printf(" -s --samplerate <sample rate>\n");
-	printf("        Give signal processing sample rate in Hz. (default = %d)\n", dsp_samplerate);
+	printf("        Give signal processing sample rate in Hz. (default = %d)\n", st->dsp_samplerate);
 	printf("        This sample rate must be high enough for the signal's spectrum to fit.\n");
 	printf("        I will inform you, if this bandwidth is too low.\n");
 	printf(" -r --tx-wave-file <filename>\n");
@@ -424,11 +468,11 @@ static void print_help(const char *arg0)
 	printf(" -T --tx\n");
 	printf("        Transmit radio signal.\n");
 	printf(" -B --bandwidth\n");
-	printf("        Give bandwidth of audio frequency. (default AM=%.0f FM=%.0f)\n", bandwidth_am, bandwidth_fm);
+	printf("        Give bandwidth of audio frequency. (default AM=%.0f FM=%.0f)\n", st->bandwidth_am, st->bandwidth_fm);
 	printf(" -D --deviation\n");
-	printf("        Give deviation of frequency modulated signal. (default %.0f)\n", deviation);
+	printf("        Give deviation of frequency modulated signal. (default %.0f)\n", st->deviation);
 	printf(" -I --modulation-index 0..1\n");
-	printf("        Give modulation index of amplitude modulated signal. (default %.0f)\n", modulation_index);
+	printf("        Give modulation index of amplitude modulated signal. (default %.0f)\n", st->modulation_index);
 	printf(" -C --compandor\n");
 	printf("        Enable audio compressor for AM to improve modulation depth.\n");
 	printf("        Uses 2:1 compression with 5ms attack, 200ms recovery.\n");
@@ -438,10 +482,10 @@ static void print_help(const char *arg0)
 	printf("        Raises average modulation to match commercial FM stations.\n");
 	printf(" -E --emphasis <uS> | 0\n");
 	printf("        Use given time constant of pre- and de-emphasis for frequency\n");
-	printf("        modulation. Give 0 to disable emphasis. (default = %.0f uS)\n", time_constant_us);
+	printf("        modulation. Give 0 to disable emphasis. (default = %.0f uS)\n", st->time_constant_us);
 	printf("        VHF broadcast 50 uS in Europe and 75 uS in the United States.\n");
 	printf("        Other radio FM should use 530 uS, to cover complete speech spectrum.\n");
-	printf(" -V --volume %.3f\n", volume);
+	printf(" -V --volume %.3f\n", st->volume);
 	printf("        Change volume of radio side. (Gains transmission, dampens reception)\n");
 	printf(" -S --stereo\n");
 	printf("        Enables stereo carrier for frequency modulated UHF broadcast.\n");
@@ -490,7 +534,7 @@ static void print_help(const char *arg0)
 	printf("          It ignores NI: ni=1 alpha shows I1I2I3OPC as two characters.\n");
 	printf("          Tested pager: national types not shown in this mode. Example:\n");
 	printf("          --pi D2E7 --rds-ecc E0, pager set to D, home MCC 255 (Ukraine):\n");
-	printf("          echo '200078,intl15,cc=255,123456789012345' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,intl15,cc=255,123456789012345' > %s\n", st->rds_paging_pipe_path);
 	printf("        Message length limits (EN 50067):\n");
 	printf("          numeric 18 digits, national alpha 80 chars, intl15 15 digits,\n");
 	printf("          intlfunc 7 digits: longer messages are rejected.\n");
@@ -506,14 +550,14 @@ static void print_help(const char *arg0)
 	printf("          tone: no message.\n");
 	printf("        Hex escapes: <0xCC> in message sends raw byte 0xCC.\n");
 	printf("        Examples:\n");
-	printf("          echo '200078,tone,,' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,tone,tonetype=3 repeat=2,' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,numeric,,1234567890' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,alpha,,Hello World' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,alpha,repeat=3 interval=5,Hello, World!' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,alpha,ni=1 cc=255 opc=1,Intl msg' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,vnum,,31415926535' > %s\n", rds_paging_pipe_path);
-	printf("          echo '200078,vnum,ni=1 cc=262 opc=3,0123456789' > %s\n", rds_paging_pipe_path);
+	printf("          echo '200078,tone,,' > %s\n", st->rds_paging_pipe_path);
+	printf("          echo '200078,tone,tonetype=3 repeat=2,' > %s\n", st->rds_paging_pipe_path);
+	printf("          echo '200078,numeric,,1234567890' > %s\n", st->rds_paging_pipe_path);
+	printf("          echo '200078,alpha,,Hello World' > %s\n", st->rds_paging_pipe_path);
+	printf("          echo '200078,alpha,repeat=3 interval=5,Hello, World!' > %s\n", st->rds_paging_pipe_path);
+	printf("          echo '200078,alpha,ni=1 cc=255 opc=1,Intl msg' > %s\n", st->rds_paging_pipe_path);
+	printf("          echo '200078,vnum,,31415926535' > %s\n", st->rds_paging_pipe_path);
+	printf("          echo '200078,vnum,ni=1 cc=262 opc=3,0123456789' > %s\n", st->rds_paging_pipe_path);
 	printf("    --rds-paging-fifo <path>\n");
 	printf("        Path for the RDS paging named pipe (default %s).\n", RDS_PAGING_PIPE_DEFAULT);
 	printf("    --rds-paging-cc <mcc>\n");
@@ -658,13 +702,6 @@ static void print_help(const char *arg0)
 	sdr_config_print_help();
 }
 
-static int channelizer_rate = 0; /* IQ rate to the radio, 0 = automatic */
-static radio_opts_t radio_opts; /* the station's settings outside radio_init()'s parameters (radio_opts_init() before the options) */
-static int use_polyphase = 0;
-static int use_afc = 0;
-static double afc_tc_ms = 300.0;
-static double afc_max_hz = 5000.0;
-
 #define	OPT_FAST_MATH		1007
 #define	OPT_RDS			1008
 #define	OPT_RDS2		1009
@@ -787,33 +824,33 @@ static int handle_options(int short_option, int argi, char **argv)
 			return rc;
 		break;
 	case 'f':
-		frequency = atof(argv[argi]);
+		st->frequency = atof(argv[argi]);
 		break;
 	case 's':
-		dsp_samplerate = atof(argv[argi]);
+		st->dsp_samplerate = atof(argv[argi]);
 		break;
 	case 'r':
-		tx_wave_file = options_strdup(argv[argi]);
+		st->tx_wave_file = options_strdup(argv[argi]);
 		break;
 	case 'w':
-		rx_wave_file = options_strdup(argv[argi]);
+		st->rx_wave_file = options_strdup(argv[argi]);
 		break;
 	case 'a':
-		tx_audiodev = options_strdup(argv[argi]);
-		rx_audiodev = options_strdup(argv[argi]);
+		st->tx_audiodev = options_strdup(argv[argi]);
+		st->rx_audiodev = options_strdup(argv[argi]);
 		break;
 	case 'M':
 		if (!strcasecmp(argv[argi], "fm"))
-			modulation = MODULATION_FM;
+			st->modulation = MODULATION_FM;
 		else
 		if (!strcasecmp(argv[argi], "am"))
-			modulation = MODULATION_AM_DSB;
+			st->modulation = MODULATION_AM_DSB;
 		else
 		if (!strcasecmp(argv[argi], "usb"))
-			modulation = MODULATION_AM_USB;
+			st->modulation = MODULATION_AM_USB;
 		else
 		if (!strcasecmp(argv[argi], "lsb"))
-			modulation = MODULATION_AM_LSB;
+			st->modulation = MODULATION_AM_LSB;
 		else
 		{
 			fprintf(stderr, "Invalid modulation option, use '-h' for help!\n");
@@ -821,125 +858,125 @@ static int handle_options(int short_option, int argi, char **argv)
 		}
 		break;
 	case 'R':
-		rx = 1;
+		st->rx = 1;
 		break;
 	case 'T':
-		tx = 1;
+		st->tx = 1;
 		break;
 	case 'B':
-		bandwidth = atof(argv[argi]);
+		st->bandwidth = atof(argv[argi]);
 		break;
 	case 'D':
-		deviation = atof(argv[argi]);
+		st->deviation = atof(argv[argi]);
 		break;
 	case 'I':
-		modulation_index = atof(argv[argi]);
-		if (modulation_index < 0.0 || modulation_index > 1.0) {
+		st->modulation_index = atof(argv[argi]);
+		if (st->modulation_index < 0.0 || st->modulation_index > 1.0) {
 			fprintf(stderr, "Invalid modulation index, use '-h' for help!\n");
 			return -EINVAL;
 		}
 		break;
 	case 'C':
-		am_compandor = 1;
+		st->am_compandor = 1;
 		break;
 	case OPT_FM_COMPANDOR:
-		fm_compandor = 1;
+		st->fm_compandor = 1;
 		break;
 	case 'E':
-		time_constant_us = atof(argv[argi]);
+		st->time_constant_us = atof(argv[argi]);
 		break;
 	case 'V':
-		volume = atof(argv[argi]);
+		st->volume = atof(argv[argi]);
 		break;
 	case 'S':
-		stereo = 1;
+		st->stereo = 1;
 		break;
 	case OPT_RDS:
-		rds = 1;
+		st->rds = 1;
 		break;
 	case OPT_RDS2:
-		rds2 = 1;
+		st->rds2 = 1;
 		break;
 	case OPT_RDS_DEBUG:
-		rds_debug = 1;
+		st->rds_debug = 1;
 		break;
 	case OPT_RDS_VERBOSE:
-		rds_verbose = 1;
+		st->rds_verbose = 1;
 		break;
 	case OPT_RBDS:
-		rds_force_rbds = 1;
+		st->rds_force_rbds = 1;
 		break;
 	case OPT_SCA_67K:
-		sca_67k = 1;
+		st->sca_67k = 1;
 		break;
 	case OPT_SCA_92K:
-		sca_92k = 1;
+		st->sca_92k = 1;
 		break;
 	case OPT_FAST_MATH:
 		fast_math = 1;
 		break;
 	case OPT_CHANNELIZER_RATE:
-		channelizer_rate = atoi(argv[argi]);
+		st->channelizer_rate = atoi(argv[argi]);
 		break;
 	case OPT_CALL_SIGN:
-		radio_opts.rds_callsign = options_strdup(argv[argi]);
+		st->radio_opts.rds_callsign = options_strdup(argv[argi]);
 		break;
 	case OPT_PI:
-		rds_pi_opt = (uint16_t)strtoul(argv[argi], NULL, 16);
-		radio_opts.rds_pi = rds_pi_opt;
+		st->rds_pi_opt = (uint16_t)strtoul(argv[argi], NULL, 16);
+		st->radio_opts.rds_pi = st->rds_pi_opt;
 		break;
 	case OPT_POLYPHASE:
-		use_polyphase = 1;
+		st->use_polyphase = 1;
 		break;
 	case OPT_RDS_PAGING:
-		rds_paging = 1;
-		rds = 1;  /* auto-enable RDS */
+		st->rds_paging = 1;
+		st->rds = 1;  /* auto-enable RDS */
 		{
 			int rpc_val = atoi(argv[argi]);
 			if (rpc_val < 0 || rpc_val > 31) {
 				fprintf(stderr, "Invalid RPC value %d (must be 0-31), use '-h' for help!\n", rpc_val);
 				return -EINVAL;
 			}
-			rds_paging_rpc = rpc_val;
+			st->rds_paging_rpc = rpc_val;
 		}
 		break;
 	case OPT_RDS_PAGING_FIFO:
-		rds_paging_pipe_path = argv[argi];
+		st->rds_paging_pipe_path = argv[argi];
 		break;
 	case OPT_RDS_PAGING_CC:
-		rds_paging_cc = (uint16_t)atoi(argv[argi]);
-		if (!mcc_valid(rds_paging_cc)) {
-			const char *cname = mcc_name(rds_paging_cc);
+		st->rds_paging_cc = (uint16_t)atoi(argv[argi]);
+		if (!mcc_valid(st->rds_paging_cc)) {
+			const char *cname = mcc_name(st->rds_paging_cc);
 			if (!cname) {
-				fprintf(stderr, "Invalid E.212 MCC %d (must be 200-999), use '-h' for help!\n", rds_paging_cc);
+				fprintf(stderr, "Invalid E.212 MCC %d (must be 200-999), use '-h' for help!\n", st->rds_paging_cc);
 				return -EINVAL;
 			}
 		}
 		{
-			const char *cname = mcc_name(rds_paging_cc);
+			const char *cname = mcc_name(st->rds_paging_cc);
 			fprintf(stderr, "RDS Paging: international MCC=%d (%s)\n",
-				rds_paging_cc, cname ? cname : "unknown");
+				st->rds_paging_cc, cname ? cname : "unknown");
 		}
 		break;
 	case OPT_RDS_PAGING_OPC:
-		rds_paging_opc = (uint8_t)atoi(argv[argi]);
-		if (rds_paging_opc > 15) {
-			fprintf(stderr, "Invalid OPC %d (must be 0-15), use '-h' for help!\n", rds_paging_opc);
+		st->rds_paging_opc = (uint8_t)atoi(argv[argi]);
+		if (st->rds_paging_opc > 15) {
+			fprintf(stderr, "Invalid OPC %d (must be 0-15), use '-h' for help!\n", st->rds_paging_opc);
 			return -EINVAL;
 		}
 		break;
 	case OPT_RDS_PAGING_PAC:
-		rds_paging_pac = (uint8_t)atoi(argv[argi]);
-		if (rds_paging_pac > 63) {
-			fprintf(stderr, "Invalid PAC %d (must be 0-63), use '-h' for help!\n", rds_paging_pac);
+		st->rds_paging_pac = (uint8_t)atoi(argv[argi]);
+		if (st->rds_paging_pac > 63) {
+			fprintf(stderr, "Invalid PAC %d (must be 0-63), use '-h' for help!\n", st->rds_paging_pac);
 			return -EINVAL;
 		}
 		break;
 	case OPT_RDS_PAGING_BATTERY:
-		rds_paging_battery = 1;
+		st->rds_paging_battery = 1;
 		break;
 	case OPT_RDS_PAGING_13A:
-		rds_paging_13a = 1;
+		st->rds_paging_13a = 1;
 		break;
 	case OPT_RDS_ECC: {
 		const char *a = argv[argi];
@@ -955,8 +992,8 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Invalid ECC '%s' (hex 01-FF or 'list'), use '-h' for help!\n", a);
 			return -EINVAL;
 		}
-		rds_ecc = (uint8_t)v;
-		rds = 1;  /* auto-enable RDS */
+		st->rds_ecc = (uint8_t)v;
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	}
 	case OPT_RDS_PAGING_SCAN: {
@@ -968,70 +1005,70 @@ static int handle_options(int short_option, int argi, char **argv)
 				from, to, RDS_PAGING_ADDR_MAX);
 			return -EINVAL;
 		}
-		rds_paging_scan = 1;
-		rds_paging_scan_from = from;
-		rds_paging_scan_to = to;
-		radio_opts.rds_paging_preset = 1;
+		st->rds_paging_scan = 1;
+		st->rds_paging_scan_from = from;
+		st->rds_paging_scan_to = to;
+		st->radio_opts.rds_paging_preset = 1;
 		break;
 	}
 	case OPT_RDS_PAGING_SCAN_TYPE:
 		if (!strcasecmp(argv[argi], "numeric"))
-			rds_paging_scan_type = RDS_PAGING_NUM10;
+			st->rds_paging_scan_type = RDS_PAGING_NUM10;
 		else if (!strcasecmp(argv[argi], "alpha"))
-			rds_paging_scan_type = RDS_PAGING_ALPHA;
+			st->rds_paging_scan_type = RDS_PAGING_ALPHA;
 		else if (!strcasecmp(argv[argi], "tone"))
-			rds_paging_scan_type = RDS_PAGING_TONE;
+			st->rds_paging_scan_type = RDS_PAGING_TONE;
 		else {
 			fprintf(stderr, "Invalid paging scan type '%s' (numeric, alpha or tone), use '-h' for help!\n", argv[argi]);
 			return -EINVAL;
 		}
 		break;
 	case OPT_RDS_HEXRDS_FILE:
-		rds_hexrds_file = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->rds_hexrds_file = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_RDS_BITSTREAM_FILE:
-		rds_bitstream_file = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->rds_bitstream_file = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_RDS_TX_HEXRDS_FILE:
-		rds_tx_hexrds_file = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->rds_tx_hexrds_file = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_RDS_TX_BITSTREAM_FILE:
-		rds_tx_bitstream_file = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->rds_tx_bitstream_file = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_RDS_TMC_EVENTS:
-		rds_tmc_events_file = options_strdup(argv[argi]);
+		st->rds_tmc_events_file = options_strdup(argv[argi]);
 		break;
 	case OPT_RDS_TMC_LOCATIONS:
-		rds_tmc_locations_path = options_strdup(argv[argi]);
+		st->rds_tmc_locations_path = options_strdup(argv[argi]);
 		break;
 	case OPT_XDR_GTK_SERVER:
-		xdr_gtk_server = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->xdr_gtk_server = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_XDR_GTK_PASSWORD:
-		xdr_gtk_password = options_strdup(argv[argi]);
+		st->xdr_gtk_password = options_strdup(argv[argi]);
 		break;
 	case OPT_RIGCTL_SERVER:
-		rigctl_server_endpoint = options_strdup(argv[argi]);
+		st->rigctl_server_endpoint = options_strdup(argv[argi]);
 		break;
 	case OPT_RIGCTL_ALLOWED:
-		rigctl_allowed_hosts = options_strdup(argv[argi]);
+		st->rigctl_allowed_hosts = options_strdup(argv[argi]);
 		break;
 	case OPT_RDSSPY_SERVER:
-		rdsspy_server = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->rdsspy_server = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_UECP_SERVER:
-		uecp_server = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->uecp_server = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_ASCIIG_SERVER:
-		asciig_server = options_strdup(argv[argi]);
-		rds = 1;  /* auto-enable RDS */
+		st->asciig_server = options_strdup(argv[argi]);
+		st->rds = 1;  /* auto-enable RDS */
 		break;
 	case OPT_LIMESDR:
 		{
@@ -1063,17 +1100,17 @@ static int handle_options(int short_option, int argi, char **argv)
 			return options_command_line(argc_lime, argv_lime, handle_options);
 		}
 	case OPT_AFC:
-		use_afc = 1;
+		st->use_afc = 1;
 		break;
 	case OPT_AFC_TC:
-		afc_tc_ms = atof(argv[argi]);
-		if (afc_tc_ms < 10.0) afc_tc_ms = 10.0;
-		if (afc_tc_ms > 10000.0) afc_tc_ms = 10000.0;
+		st->afc_tc_ms = atof(argv[argi]);
+		if (st->afc_tc_ms < 10.0) st->afc_tc_ms = 10.0;
+		if (st->afc_tc_ms > 10000.0) st->afc_tc_ms = 10000.0;
 		break;
 	case OPT_AFC_MAX:
-		afc_max_hz = atof(argv[argi]);
-		if (afc_max_hz < 100.0) afc_max_hz = 100.0;
-		if (afc_max_hz > 50000.0) afc_max_hz = 50000.0;
+		st->afc_max_hz = atof(argv[argi]);
+		if (st->afc_max_hz < 100.0) st->afc_max_hz = 100.0;
+		if (st->afc_max_hz > 50000.0) st->afc_max_hz = 50000.0;
 		break;
 	default:
 		return sdr_config_handle_options(short_option, argi, argv);
@@ -1381,10 +1418,10 @@ static void paging_pipe_handler(rds_encoder_t *enc)
 	int rc, i, start;
 	int space = sizeof(buf) - buf_len;
 
-	if (paging_pipe_fd < 0)
+	if (st->paging_pipe_fd < 0)
 		return;
 
-	rc = read(paging_pipe_fd, buf + buf_len, space);
+	rc = read(st->paging_pipe_fd, buf + buf_len, space);
 	if (rc > 0) {
 		buf_len += rc;
 
@@ -1447,7 +1484,7 @@ int main(int argc, char *argv[])
 	logging_init();
 
 	sdr_config_init(DEFAULT_LO_OFFSET);
-	radio_opts_init(&radio_opts);
+	station_defaults(st);
 
 	/* handle options / config file */
 	add_options();
@@ -1458,7 +1495,7 @@ int main(int argc, char *argv[])
 	if (argi <= 0)
 		return argi;
 
-	if (frequency == 0.0) {
+	if (st->frequency == 0.0) {
 		printf("No frequency given, I suggest to use 100000000 (100 MHz) and FM\n\n");
 		print_help(argv[0]);
 		exit(0);
@@ -1466,18 +1503,18 @@ int main(int argc, char *argv[])
 
 	/* --rds-ecc: check ECC + PI country digit against EN 50067 Table D.1.
 	 * A mismatch is only a warning: the ECC is still transmitted as given. */
-	if (rds_ecc && rds_pi_opt) {
-		uint8_t pi_cc = rds_pi_opt >> 12;
-		const char *c = rds_get_country_code(pi_cc, rds_ecc);
+	if (st->rds_ecc && st->rds_pi_opt) {
+		uint8_t pi_cc = st->rds_pi_opt >> 12;
+		const char *c = rds_get_country_code(pi_cc, st->rds_ecc);
 
 		if (c && strcmp(c, "--")) {
-			fprintf(stderr, "RDS: ECC %02X + PI %04X (country digit %X) = country %s\n", rds_ecc, rds_pi_opt, pi_cc, c);
+			fprintf(stderr, "RDS: ECC %02X + PI %04X (country digit %X) = country %s\n", st->rds_ecc, st->rds_pi_opt, pi_cc, c);
 		} else {
 			const char *s = rds_ecc_suggest(pi_cc);
 
-			fprintf(stderr, "Warning: ECC %02X + PI %04X (country digit %X) is no country in EN 50067 Table D.1.\n", rds_ecc, rds_pi_opt, pi_cc);
+			fprintf(stderr, "Warning: ECC %02X + PI %04X (country digit %X) is no country in EN 50067 Table D.1.\n", st->rds_ecc, st->rds_pi_opt, pi_cc);
 			fprintf(stderr, "         Receivers show no or a wrong country, pagers may not lock to this channel.\n");
-			fprintf(stderr, "         ECC %02X is still transmitted as given.\n", rds_ecc);
+			fprintf(stderr, "         ECC %02X is still transmitted as given.\n", st->rds_ecc);
 			if (s[0]) {
 				fprintf(stderr, "         For PI country digit %X use --rds-ecc %s\n", pi_cc, s);
 				fprintf(stderr, "         or set --pi to your country digit, see '--rds-ecc list'.\n");
@@ -1487,15 +1524,15 @@ int main(int argc, char *argv[])
 			}
 		}
 	}
-	if (rds_ecc)
-		radio_opts.rds_ecc = rds_ecc;	/* overrides the preset ECC, also on preset change */
+	if (st->rds_ecc)
+		st->radio_opts.rds_ecc = st->rds_ecc;	/* overrides the preset ECC, also on preset change */
 
-	if (rds_paging && tx && !rds_ecc) {
+	if (st->rds_paging && st->tx && !st->rds_ecc) {
 		fprintf(stderr, "RDS paging TX requires --rds-ecc <hex> (Extended Country Code, EN 50067 Annex D), use '-h' for help!\n");
 		exit(0);
 	}
 	/* 13A enhanced paging needs the operator code (EN 50067 M.3.2.7.2) */
-	if (rds_paging_13a && (rds_paging_opc < 1 || rds_paging_opc > 15)) {
+	if (st->rds_paging_13a && (st->rds_paging_opc < 1 || st->rds_paging_opc > 15)) {
 		fprintf(stderr, "--rds-paging-13a requires --rds-paging-opc 1-15 (EN 50067 M.3.2.7.2), use '-h' for help!\n");
 		exit(0);
 	}
@@ -1505,10 +1542,10 @@ int main(int argc, char *argv[])
 	am_init(fast_math);
 
 	/* Determine input samplerate */
-	if (channelizer_rate > 0)
-		input_samplerate = channelizer_rate;
+	if (st->channelizer_rate > 0)
+		input_samplerate = st->channelizer_rate;
 	else
-		input_samplerate = dsp_samplerate;
+		input_samplerate = st->dsp_samplerate;
 
 	rc = sdr_configure(input_samplerate);
 	if (rc < 0)
@@ -1519,61 +1556,61 @@ int main(int argc, char *argv[])
 	}
 
 	/* Set default bandwidth based on modulation type (must be before channelizer rate calc) */
-	if (bandwidth == 0) {
-		if (modulation == MODULATION_FM)
-			bandwidth = bandwidth_fm;
+	if (st->bandwidth == 0) {
+		if (st->modulation == MODULATION_FM)
+			st->bandwidth = st->bandwidth_fm;
 		else
-			bandwidth = bandwidth_am;
+			st->bandwidth = st->bandwidth_am;
 	}
 
 	/* Calculate baseband_extent (max baseband frequency, one-sided)
 	 * Used for channelizer rate calculation before radio_init.
 	 * After radio_init, use radio.baseband_extent instead. */
 	double baseband_extent = 0;
-	if (modulation == MODULATION_FM) {
-		double audio_bw = bandwidth;
+	if (st->modulation == MODULATION_FM) {
+		double audio_bw = st->bandwidth;
 		/* FM broadcast with stereo/RDS needs more bandwidth */
-		if (rds || rds2) audio_bw = 60000.0;
-		else if (stereo) audio_bw = 53000.0;
-		baseband_extent = deviation + audio_bw;
+		if (st->rds || st->rds2) audio_bw = 60000.0;
+		else if (st->stereo) audio_bw = 53000.0;
+		baseband_extent = st->deviation + audio_bw;
 	} else {
 		/* AM: baseband_extent = audio bandwidth */
-		baseband_extent = bandwidth;
+		baseband_extent = st->bandwidth;
 	}
 
 	/* The SDR's channelizer takes the band around the frequency to the
 	 * radio's IQ rate: as given, else the lowest SDR rate / 2^k that holds
 	 * the baseband (halfband stages only) */
-	if (channelizer_rate == 0 && sdr_config && sdr_config->samplerate > dsp_samplerate)
+	if (st->channelizer_rate == 0 && sdr_config && sdr_config->samplerate > st->dsp_samplerate)
 		input_samplerate = sdr_calculate_optimal_rate(sdr_config->samplerate, baseband_extent);
 
 	if (sdr_config)
 		LOGP(DSDR, LOGL_NOTICE, "Channelizer: SDR=%d Hz -> IQ=%d Hz (rf_bw=%.1f kHz, signal=%.1f kHz)\n",
 		     sdr_config->samplerate, input_samplerate,
-		     2.0 * baseband_extent / 1000.0, dsp_samplerate / 1000.0);
+		     2.0 * baseband_extent / 1000.0, st->dsp_samplerate / 1000.0);
 	/* on an SDR backend the SDR rate is the backend's, this program does
 	 * not know it: the IQ rate comes from -s unless it is given */
 	if (sdr_config && sdr_config->backend && input_samplerate < baseband_extent * 2.0 / 0.75)
 		LOGP(DSDR, LOGL_NOTICE, "On the SDR backend: the IQ rate %d Hz is too low for this signal (%.0f kHz wide, needs %.0f Hz): give the backend's SDR rate with --sdr-samplerate, or --channelizer-rate.\n",
 		     input_samplerate, 2.0 * baseband_extent / 1000.0, ceil(baseband_extent * 2.0 / 0.75));
 
-	if (modulation == MODULATION_NONE) {
+	if (st->modulation == MODULATION_NONE) {
 		fprintf(stderr, "Please select modulation, use '-h' for help!\n");
 		exit(0);
 	}
 
-	if (stereo && modulation != MODULATION_FM) {
+	if (st->stereo && st->modulation != MODULATION_FM) {
 		fprintf(stderr, "Stereo works with FM only, use '-h' for help!\n");
 		exit(0);
 	}
-	if (!rx && !tx) {
+	if (!st->rx && !st->tx) {
 		fprintf(stderr, "You need to specify --rx (receiver) and/or --tx (transmitter), use '-h' for help!\n");
 		exit(0);
 	}
-	if (stereo && bandwidth != 15000.0) {
+	if (st->stereo && st->bandwidth != 15000.0) {
 		fprintf(stderr, "Warning: Stereo works with bandwidth of 15 KHz only, using this bandwidth!\n");
 	}
-	if (stereo && time_constant_us != 75.0 && time_constant_us != 50.0) {
+	if (st->stereo && st->time_constant_us != 75.0 && st->time_constant_us != 50.0) {
 		fprintf(stderr, "Stereo works with time constant of 50 uS or 75 uS only, use '-h' for help!\n");
 		exit(0);
 	}
@@ -1582,14 +1619,14 @@ int main(int argc, char *argv[])
 	 * Without this, --rx / --tx still leaves the opposite SDR path enabled,
 	 * which breaks RX-only SDRs (e.g. RTL-SDR) and needlessly initializes
 	 * TX-side radio components in receive-only mode. */
-	if (rx && !tx) {
+	if (st->rx && !st->tx) {
 		if (sdr_config->tx_only) {
 			fprintf(stderr, "Conflicting options: --rx cannot be combined with --sdr-tx-only\n");
 			exit(0);
 		}
 		sdr_config->rx_only = 1;
 	}
-	if (tx && !rx) {
+	if (st->tx && !st->rx) {
 		if (sdr_config->rx_only) {
 			fprintf(stderr, "Conflicting options: --tx cannot be combined with --sdr-rx-only\n");
 			exit(0);
@@ -1602,18 +1639,18 @@ int main(int argc, char *argv[])
 	 */
 	buffer_size = input_samplerate * dsp_buffer / 1000;
 
-	radio_opts.polyphase = use_polyphase;
+	st->radio_opts.polyphase = st->use_polyphase;
 
-	rc = radio_init(&radio, buffer_size, input_samplerate, frequency, tx_wave_file, rx_wave_file, (tx) ? tx_audiodev : NULL, (rx) ? rx_audiodev : NULL, modulation, bandwidth, deviation, modulation_index, time_constant_us, volume, stereo, rds, rds2, sca_67k, sca_92k, rds_debug, rds_verbose, am_compandor, fm_compandor, rds_force_rbds, &radio_opts);
+	rc = radio_init(&radio, buffer_size, input_samplerate, st->frequency, st->tx_wave_file, st->rx_wave_file, (st->tx) ? st->tx_audiodev : NULL, (st->rx) ? st->rx_audiodev : NULL, st->modulation, st->bandwidth, st->deviation, st->modulation_index, st->time_constant_us, st->volume, st->stereo, st->rds, st->rds2, st->sca_67k, st->sca_92k, st->rds_debug, st->rds_verbose, st->am_compandor, st->fm_compandor, st->rds_force_rbds, &st->radio_opts);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
 		exit(0);
 	}
 
 	/* Configure AFC if enabled */
-	if (use_afc && modulation == MODULATION_FM) {
-		radio_afc_set_time_constant(&radio, afc_tc_ms / 1000.0);
-		radio_afc_set_max_correction(&radio, afc_max_hz);
+	if (st->use_afc && st->modulation == MODULATION_FM) {
+		radio_afc_set_time_constant(&radio, st->afc_tc_ms / 1000.0);
+		radio_afc_set_max_correction(&radio, st->afc_max_hz);
 		radio_afc_enable(&radio, 1);
 	}
 
@@ -1621,24 +1658,24 @@ int main(int argc, char *argv[])
 	 * Uses 4096-point FFT with ±20 kHz integration and processing gain.
 	 * Output: SNR in dB (signal - noise).
 	 * The dbf_offset is a fallback before noise floor is established. */
-	meter = signal_meter_init(input_samplerate, 50.0);
-	if (meter)
-		signal_meter_register_thread(meter, "main", gettid());
+	st->meter = signal_meter_init(input_samplerate, 50.0);
+	if (st->meter)
+		signal_meter_register_thread(st->meter, "main", gettid());
 
 	/* NOTE: spectral frequency registration moved after sdr_open_channelizer()
 	 * because sdr_status_init() inside sdr_open zeroes the entire sdr_status
 	 * struct, wiping any previously registered frequencies. */
 
 	/* Set up RDS file output if requested */
-	if (rds_hexrds_file) {
-		rc = rds_decoder_set_hexrds_file(&radio.rds_dec, rds_hexrds_file);
+	if (st->rds_hexrds_file) {
+		rc = rds_decoder_set_hexrds_file(&radio.rds_dec, st->rds_hexrds_file);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to open hexrds output file, exitting!\n");
 			exit(0);
 		}
 	}
-	if (rds_bitstream_file) {
-		rc = rds_decoder_set_bitstream_file(&radio.rds_dec, rds_bitstream_file);
+	if (st->rds_bitstream_file) {
+		rc = rds_decoder_set_bitstream_file(&radio.rds_dec, st->rds_bitstream_file);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to open bitstream output file, exitting!\n");
 			exit(0);
@@ -1647,40 +1684,40 @@ int main(int argc, char *argv[])
 
 	/* Load optional TMC event description table (docs/rds/tmc_events.csv).
 	 * When loaded, the RDS 8A decoder logs human-readable event names. */
-	if (rds_tmc_events_file) {
-		if (rds_tmc_load_events(rds_tmc_events_file) < 0)
+	if (st->rds_tmc_events_file) {
+		if (rds_tmc_load_events(st->rds_tmc_events_file) < 0)
 			fprintf(stderr, "Warning: failed to load TMC events from '%s'\n",
-			        rds_tmc_events_file);
+			        st->rds_tmc_events_file);
 	}
 
 	/* Load optional TMC location table (ISO 14819-3 LCL directory or CSV).
 	 * When loaded, the RDS 8A decoder logs human-readable road names. */
-	if (rds_tmc_locations_path) {
-		if (rds_tmc_load_locations(rds_tmc_locations_path) < 0)
+	if (st->rds_tmc_locations_path) {
+		if (rds_tmc_load_locations(st->rds_tmc_locations_path) < 0)
 			fprintf(stderr, "Warning: failed to load TMC locations from '%s'\n",
-			        rds_tmc_locations_path);
+			        st->rds_tmc_locations_path);
 	}
 
 	/* Set up RDS TX file input if requested (bypasses encoder) */
-	if (rds_tx_hexrds_file && rds_tx_bitstream_file) {
+	if (st->rds_tx_hexrds_file && st->rds_tx_bitstream_file) {
 		fprintf(stderr, "Cannot use both --rds-tx-hexrds-file and --rds-tx-bitstream-file\n");
 		exit(0);
 	}
-	if (rds_tx_hexrds_file) {
-		if (!tx) {
+	if (st->rds_tx_hexrds_file) {
+		if (!st->tx) {
 			fprintf(stderr, "Warning: --rds-tx-hexrds-file requires --tx mode\n");
 		}
-		rc = rds_enc_set_tx_hexrds_file(&radio.rds_enc, rds_tx_hexrds_file);
+		rc = rds_enc_set_tx_hexrds_file(&radio.rds_enc, st->rds_tx_hexrds_file);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to open TX hexrds input file, exitting!\n");
 			exit(0);
 		}
 	}
-	if (rds_tx_bitstream_file) {
-		if (!tx) {
+	if (st->rds_tx_bitstream_file) {
+		if (!st->tx) {
 			fprintf(stderr, "Warning: --rds-tx-bitstream-file requires --tx mode\n");
 		}
-		rc = rds_enc_set_tx_bitstream_file(&radio.rds_enc, rds_tx_bitstream_file);
+		rc = rds_enc_set_tx_bitstream_file(&radio.rds_enc, st->rds_tx_bitstream_file);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to open TX bitstream input file, exitting!\n");
 			exit(0);
@@ -1688,65 +1725,65 @@ int main(int argc, char *argv[])
 	}
 
 	/* Enable RDS paging if requested */
-	if (rds_paging) {
+	if (st->rds_paging) {
 		rds_enc_paging_set_enabled(&radio.rds_enc, 1);
-		rds_enc_paging_set_rpc(&radio.rds_enc, rds_paging_rpc);
-		rds_enc_paging_set_opc(&radio.rds_enc, rds_paging_opc);
-		rds_enc_paging_set_pac(&radio.rds_enc, rds_paging_pac);
+		rds_enc_paging_set_rpc(&radio.rds_enc, st->rds_paging_rpc);
+		rds_enc_paging_set_opc(&radio.rds_enc, st->rds_paging_opc);
+		rds_enc_paging_set_pac(&radio.rds_enc, st->rds_paging_pac);
 		/* International paging defaults (EN 50067 M.3.5.7) */
-		rds_enc_paging_set_cc(&radio.rds_enc, rds_paging_cc);
-		if (rds_paging_battery)
+		rds_enc_paging_set_cc(&radio.rds_enc, st->rds_paging_cc);
+		if (st->rds_paging_battery)
 			rds_enc_paging_set_battery_saving(&radio.rds_enc, 1);
-		if (rds_paging_13a)
+		if (st->rds_paging_13a)
 			rds_enc_paging_set_13a_notify(&radio.rds_enc, 1);
 		/* Enable paging decoder so 7A/13A are decoded as paging, not ODA */
 		radio.rds_dec.paging_enabled = 1;
 		/* Create named pipe for paging commands */
-		unlink(rds_paging_pipe_path);
-		rc = mkfifo(rds_paging_pipe_path, 0666);
+		unlink(st->rds_paging_pipe_path);
+		rc = mkfifo(st->rds_paging_pipe_path, 0666);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to create paging FIFO '%s': %s\n",
-				rds_paging_pipe_path, strerror(errno));
+				st->rds_paging_pipe_path, strerror(errno));
 		} else {
-			paging_pipe_fd = open(rds_paging_pipe_path, O_RDWR | O_NONBLOCK);
-			if (paging_pipe_fd < 0)
+			st->paging_pipe_fd = open(st->rds_paging_pipe_path, O_RDWR | O_NONBLOCK);
+			if (st->paging_pipe_fd < 0)
 				fprintf(stderr, "Failed to open paging FIFO '%s': %s\n",
-					rds_paging_pipe_path, strerror(errno));
+					st->rds_paging_pipe_path, strerror(errno));
 			else {
 				char rpc_buf[80];
 				printf("RDS Paging enabled: %s, OPC=%d%s, PAC=%d%s",
-				       rds_paging_rpc_desc(rds_paging_rpc, rpc_buf, sizeof(rpc_buf)),
-				       rds_paging_opc,
-				       rds_paging_opc ? "" : " (no enhanced paging)",
-				       rds_paging_pac,
-				       rds_paging_pac ? "" : " (all areas)");
-				if (rds_paging_cc) {
-					const char *cname = mcc_name(rds_paging_cc);
+				       rds_paging_rpc_desc(st->rds_paging_rpc, rpc_buf, sizeof(rpc_buf)),
+				       st->rds_paging_opc,
+				       st->rds_paging_opc ? "" : " (no enhanced paging)",
+				       st->rds_paging_pac,
+				       st->rds_paging_pac ? "" : " (all areas)");
+				if (st->rds_paging_cc) {
+					const char *cname = mcc_name(st->rds_paging_cc);
 					printf(", intl MCC=%d (%s)",
-					       rds_paging_cc, cname ? cname : "unknown");
+					       st->rds_paging_cc, cname ? cname : "unknown");
 				}
-				printf(", pipe: %s\n", rds_paging_pipe_path);
+				printf(", pipe: %s\n", st->rds_paging_pipe_path);
 			}
 		}
 	}
 
-	if (rds_paging_scan) {
-		if (!rds_paging) {
+	if (st->rds_paging_scan) {
+		if (!st->rds_paging) {
 			fprintf(stderr, "--rds-paging-scan requires --rds-paging, use '-h' for help!\n");
 			exit(0);
 		}
-		if (!tx) {
+		if (!st->tx) {
 			fprintf(stderr, "--rds-paging-scan requires --tx, use '-h' for help!\n");
 			exit(0);
 		}
-		rc = rds_enc_paging_scan_start(&radio.rds_enc, rds_paging_scan_from, rds_paging_scan_to,
-					       (enum rds_paging_msg_type)rds_paging_scan_type);
+		rc = rds_enc_paging_scan_start(&radio.rds_enc, st->rds_paging_scan_from, st->rds_paging_scan_to,
+					       (enum rds_paging_msg_type)st->rds_paging_scan_type);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to start paging scan\n");
 			exit(0);
 		}
 		printf("RDS Paging scan: addresses %06u-%06u\n",
-		       (unsigned)rds_paging_scan_from, (unsigned)rds_paging_scan_to);
+		       (unsigned)st->rds_paging_scan_from, (unsigned)st->rds_paging_scan_to);
 	}
 
 	/* Initialize protocol servers */
@@ -1757,78 +1794,78 @@ int main(int argc, char *argv[])
 	memset(&rigctl_srv, 0, sizeof(rigctl_srv));
 
 	/* RX-only servers: XDR-GTK and RDS-Spy */
-	if (xdr_gtk_server) {
-		if (!rx)
+	if (st->xdr_gtk_server) {
+		if (!st->rx)
 			fprintf(stderr, "Warning: --xdr-gtk-server is for RX mode (use with --rx)\n");
-		rc = rds_server_init(&xdr_srv, xdr_gtk_server, RDS_PROTO_XDR_GTK, NULL);
+		rc = rds_server_init(&xdr_srv, st->xdr_gtk_server, RDS_PROTO_XDR_GTK, NULL);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to initialize XDR-GTK server\n");
 			goto error;
 		}
-		if (xdr_gtk_password)
-			rds_server_set_password(&xdr_srv, xdr_gtk_password);
-		xdr_srv.freq_khz = (int)(frequency / 1000.0);
+		if (st->xdr_gtk_password)
+			rds_server_set_password(&xdr_srv, st->xdr_gtk_password);
+		xdr_srv.freq_khz = (int)(st->frequency / 1000.0);
 		/* Tell XDR-GTK our de-emphasis setting: 0=50µs (EU), 1=75µs (US) */
-		if (time_constant_us == 50.0)
+		if (st->time_constant_us == 50.0)
 			rds_server_set_deemphasis(&xdr_srv, 0);
-		else if (time_constant_us == 75.0)
+		else if (st->time_constant_us == 75.0)
 			rds_server_set_deemphasis(&xdr_srv, 1);
 		xdr_enabled = 1;
 		printf("XDR-GTK protocol server enabled: %s%s\n",
-		       xdr_gtk_server, xdr_gtk_password ? " (password protected)" : "");
+		       st->xdr_gtk_server, st->xdr_gtk_password ? " (password protected)" : "");
 	}
 
-	if (rdsspy_server) {
-		if (!rx)
+	if (st->rdsspy_server) {
+		if (!st->rx)
 			fprintf(stderr, "Warning: --rdsspy-server is for RX mode (use with --rx)\n");
-		rc = rds_server_init(&rdsspy_srv, rdsspy_server, RDS_PROTO_RDSSPY, NULL);
+		rc = rds_server_init(&rdsspy_srv, st->rdsspy_server, RDS_PROTO_RDSSPY, NULL);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to initialize RDS Spy server\n");
 			goto error;
 		}
 		rdsspy_enabled = 1;
-		printf("RDS Spy protocol server enabled: %s\n", rdsspy_server);
+		printf("RDS Spy protocol server enabled: %s\n", st->rdsspy_server);
 	}
 
 	/* TX-only servers: UECP and ASCII-G */
-	if (uecp_server) {
-		if (!tx)
+	if (st->uecp_server) {
+		if (!st->tx)
 			fprintf(stderr, "Warning: --uecp-server is for TX mode (use with --tx)\n");
-		rc = rds_server_init(&uecp_srv, uecp_server, RDS_PROTO_UECP, &radio.rds_enc);
+		rc = rds_server_init(&uecp_srv, st->uecp_server, RDS_PROTO_UECP, &radio.rds_enc);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to initialize UECP server\n");
 			goto error;
 		}
 		uecp_enabled = 1;
-		printf("UECP protocol server enabled: %s\n", uecp_server);
+		printf("UECP protocol server enabled: %s\n", st->uecp_server);
 	}
 
-	if (asciig_server) {
-		if (!tx)
+	if (st->asciig_server) {
+		if (!st->tx)
 			fprintf(stderr, "Warning: --asciig-server is for TX mode (use with --tx)\n");
-		rc = rds_server_init(&asciig_srv, asciig_server, RDS_PROTO_ASCII_G, &radio.rds_enc);
+		rc = rds_server_init(&asciig_srv, st->asciig_server, RDS_PROTO_ASCII_G, &radio.rds_enc);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to initialize ASCII-G server\n");
 			goto error;
 		}
-		asciig_srv.freq_khz = (int)(frequency / 1000.0);
+		asciig_srv.freq_khz = (int)(st->frequency / 1000.0);
 		asciig_enabled = 1;
-		printf("ASCII-G protocol server enabled: %s\n", asciig_server);
+		printf("ASCII-G protocol server enabled: %s\n", st->asciig_server);
 	}
 
 	/* Rigctl server (hamlib-compatible remote control) */
-	if (rigctl_server_endpoint) {
-		rc = rigctl_server_init(&rigctl_srv, rigctl_server_endpoint, rigctl_allowed_hosts);
+	if (st->rigctl_server_endpoint) {
+		rc = rigctl_server_init(&rigctl_srv, st->rigctl_server_endpoint, st->rigctl_allowed_hosts);
 		if (rc < 0) {
 			fprintf(stderr, "Failed to initialize rigctl server\n");
 			goto error;
 		}
-		rigctl_server_set_mode_flags(&rigctl_srv, tx, rx);
-		rigctl_server_set_frequency(&rigctl_srv, frequency, frequency);
-		rigctl_server_set_modulation(&rigctl_srv, modulation, (int)radio.rf_bandwidth, deviation, modulation_index);
-		rigctl_server_set_flags(&rigctl_srv, stereo, rds);
+		rigctl_server_set_mode_flags(&rigctl_srv, st->tx, st->rx);
+		rigctl_server_set_frequency(&rigctl_srv, st->frequency, st->frequency);
+		rigctl_server_set_modulation(&rigctl_srv, st->modulation, (int)radio.rf_bandwidth, st->deviation, st->modulation_index);
+		rigctl_server_set_flags(&rigctl_srv, st->stereo, st->rds);
 		rigctl_server_set_radio(&rigctl_srv, &radio);
-		rigctl_server_set_meter(&rigctl_srv, meter);
+		rigctl_server_set_meter(&rigctl_srv, st->meter);
 
 		/* Query and set SDR capabilities
 		 *
@@ -1878,7 +1915,7 @@ int main(int argc, char *argv[])
 		};
 		rigctl_server_set_callbacks(&rigctl_srv, &rigctl_cb);
 		rigctl_enabled = 1;
-		printf("Rigctl server enabled: %s\n", rigctl_server_endpoint);
+		printf("Rigctl server enabled: %s\n", st->rigctl_server_endpoint);
 	}
 
 	/* Set up RDS decoder callback for RX protocol servers (XDR-GTK, RDS-Spy) */
@@ -1900,7 +1937,7 @@ int main(int argc, char *argv[])
 		rds_server_set_callbacks(&asciig_srv, radio_tx_tune_cb, NULL, NULL);
 
 	/* Wire spectral scan callback into XDR-GTK server */
-	if (xdr_enabled && rx)
+	if (xdr_enabled && st->rx)
 		rds_server_set_scan_callback(&xdr_srv, radio_scan_cb, &rds_cb_ctx);
 
 
@@ -1926,8 +1963,8 @@ int main(int argc, char *argv[])
 
 	double tx_frequencies[1], rx_frequencies[1];
 	int am[1];
-	tx_frequencies[0] = frequency;
-	rx_frequencies[0] = frequency;
+	tx_frequencies[0] = st->frequency;
+	rx_frequencies[0] = st->frequency;
 	am[0] = 0;
 	sdr = sdr_open(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0, input_samplerate, buffer_size, 1.0, 0.0, 0.0, 0.0);
 	if (!sdr)
@@ -1935,9 +1972,9 @@ int main(int argc, char *argv[])
 	sdr_start(sdr);
 
 	/* Configure spectral measurement - center matches SDR tuned frequency */
-	sdr_spectral_configure(sdr_get_samplerate(sdr), frequency);
-	if (frequency > 0.0)
-		spectral_freq_idx = sdr_spectral_register_freq(frequency);
+	sdr_spectral_configure(sdr_get_samplerate(sdr), st->frequency);
+	if (st->frequency > 0.0)
+		st->spectral_freq_idx = sdr_spectral_register_freq(st->frequency);
 
 	/* prepare terminal */
 	tcgetattr(0, &term_orig);
@@ -1971,12 +2008,12 @@ int main(int argc, char *argv[])
 		 * Use 100us when TX is active to keep the buffer fed.
 		 * In RX-only mode, use 250us to reduce ring buffer pressure
 		 * and avoid SDR-side overflow on high sample rate devices. */
-		if (tx)
+		if (st->tx)
 			usleep(100);
 		else
 			usleep(250);
 		/* Check paging pipe for new messages */
-		if (paging_pipe_fd >= 0)
+		if (st->paging_pipe_fd >= 0)
 			paging_pipe_handler(&radio.rds_enc);
 		
 		/* Poll protocol servers (non-blocking) */
@@ -1992,28 +2029,28 @@ int main(int argc, char *argv[])
 			rigctl_server_poll(&rigctl_srv);
 		
 		got = 0;
-		if (rx) {
+		if (st->rx) {
 			got = sdr_read(sdr, (void *)sendbuff, buffer_size, 0, NULL);
 			/* Feed raw IQ into scan engine if active (FFT-based, no retuning needed
 			 * unless scan range exceeds SDR bandwidth) */
 			if (xdr_enabled && xdr_srv.scan_active)
 				rds_server_scan_feed_iq(&xdr_srv, sendbuff, got,
-							frequency, sdr_get_samplerate(sdr));
+							st->frequency, sdr_get_samplerate(sdr));
 
 			/* Feed IQ into spectral measurement (same data/rate as scan) */
 			sdr_spectral_feed_iq(sendbuff, got);
 
 			/* Feed IQ into signal meter for time-domain RMS */
-			signal_meter_feed_iq(meter, sendbuff, got);
+			signal_meter_feed_iq(st->meter, sendbuff, got);
 			/* Use last known SNR estimate for stereo quieting heuristics in radio_rx(). */
-			radio_set_rx_snr(&radio, signal_meter_get_snr(meter));
+			radio_set_rx_snr(&radio, signal_meter_get_snr(st->meter));
 
 			got = radio_rx(&radio, sendbuff, got);
 			if (got < 0)
 				break;
 
 			/* Update 19 kHz stereo pilot info from radio_rx() results */
-			signal_meter_set_stereo_pilot(meter, radio.rx_pilot_mag_avg,
+			signal_meter_set_stereo_pilot(st->meter, radio.rx_pilot_mag_avg,
 						      radio.rx_pilot_locked);
 
 			/* Feed FFT-based measurements to signal meter.
@@ -2021,20 +2058,20 @@ int main(int argc, char *argv[])
 			 * come from FFT - same method as scan for consistent dBf output. */
 			if (sdr_spectral_is_valid()) {
 				double nf = sdr_spectral_get_noise_floor();
-				signal_meter_set_noise_floor(meter, nf);
-				if (spectral_freq_idx >= 0)
-					signal_meter_set_signal_power(meter, sdr_spectral_get_power(spectral_freq_idx));
+				signal_meter_set_noise_floor(st->meter, nf);
+				if (st->spectral_freq_idx >= 0)
+					signal_meter_set_signal_power(st->meter, sdr_spectral_get_power(st->spectral_freq_idx));
 			} else {
 				const sdr_status_t *ss = sdr_status_get();
 				if (ss && ss->rx.valid)
-					signal_meter_set_noise_floor(meter, ss->rx.noise_floor_db);
+					signal_meter_set_noise_floor(st->meter, ss->rx.noise_floor_db);
 			}
 			/* Refresh SNR after FFT/noise updates for next RX iteration. */
-			radio_set_rx_snr(&radio, signal_meter_get_snr(meter));
+			radio_set_rx_snr(&radio, signal_meter_get_snr(st->meter));
 
 			/* Feed signal level to XDR-GTK for periodic S reports */
 			if (xdr_enabled) {
-				double sig = signal_meter_get_level_dbf(meter);
+				double sig = signal_meter_get_level_dbf(st->meter);
 				int is_stereo = radio.stereo && radio.rx_pilot_locked && !radio.rx_forced_mono;
 				rds_server_update_signal(&xdr_srv,
 					(sig > SIGNAL_METER_NO_VALUE) ? sig : -100.0,
@@ -2044,17 +2081,17 @@ int main(int argc, char *argv[])
 
 			/* Feed signal level to rigctl server */
 			if (rigctl_enabled) {
-				double sig = signal_meter_get_level_dbfs(meter);
+				double sig = signal_meter_get_level_dbfs(st->meter);
 				rigctl_server_set_signal(&rigctl_srv,
 					(sig > SIGNAL_METER_NO_VALUE) ? sig : -100.0);
 			}
 
 			/* CPU update (self-throttles to ~1/sec via internal wall-clock check) */
-			signal_meter_update_cpu(meter);
+			signal_meter_update_cpu(st->meter);
 		}
-		
+
 		/* TX processing - only if TX mode is enabled */
-		if (tx) {
+		if (st->tx) {
 			tosend = sdr_get_tosend(sdr, buffer_size);
 #if 0 /* TX debug logging - uncomment to enable */
 			int tosend_raw = tosend;
@@ -2132,27 +2169,27 @@ next_char:
 			goto next_char;
 		case 'd':
 			/* dump RDS status */
-			if (rx && rds)
+			if (st->rx && st->rds)
 				rds_decoder_status(&radio.rds_dec);
 			goto next_char;
 		case 'f':
 			/* cycle RDS presets */
-			if (tx && rds)
+			if (st->tx && st->rds)
 				rds_next_preset(&radio);
 			goto next_char;
 		case '1':
 			/* flip RT A/B flag */
-			if (tx && rds)
+			if (st->tx && st->rds)
 				rds_flip_rt_ab(&radio);
 			goto next_char;
 		case '2':
 			/* flip RT+ item_running */
-			if (tx && rds)
+			if (st->tx && st->rds)
 				rds_flip_rtplus_item_running(&radio);
 			goto next_char;
 		case '3':
 			/* flip RT+ item_toggle */
-			if (tx && rds)
+			if (st->tx && st->rds)
 				rds_flip_rtplus_toggle(&radio);
 			goto next_char;
 		}
@@ -2184,14 +2221,14 @@ error:
 	}
 
 	free(sendbuff);
-	signal_meter_free(meter);
-	meter = NULL;
+	signal_meter_free(st->meter);
+	st->meter = NULL;
 	if (sdr)
 		sdr_close(sdr);
 	/* Clean up paging pipe */
-	if (paging_pipe_fd >= 0)
-		close(paging_pipe_fd);
-	unlink(rds_paging_pipe_path);
+	if (st->paging_pipe_fd >= 0)
+		close(st->paging_pipe_fd);
+	unlink(st->rds_paging_pipe_path);
 	
 	/* Clean up protocol servers */
 	if (xdr_enabled)

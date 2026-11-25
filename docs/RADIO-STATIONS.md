@@ -86,8 +86,25 @@ the backend one registration). Several stations = several processes.
    preset), mono + RDS with a callsign, AM (linear, polyphase); repeatable
    run to run. Found on the way, before and after alike: radio_exit()
    does not free the RDS encoder's biphase waveform (2304 bytes, at exit).
-3. `station_t` and the option rule with N = 1. Proof: the same harness,
-   the same command lines give the same IQ; option parsing tests.
+3. `station_t` and the option rule with N = 1, three commits:
+   a. the per-station file-scope variables of main.c in one `station_t`
+      (`st->`), `station_defaults()` (done);
+   b. the option rule (a second `-f` refused until step 5);
+   c. main() carved into station init / poll / exit; the paging FIFO's
+      line buffer into the station.
+   Proof for each: `~/.cache/sdrangel-rp-rates/txfix/suite.sh` - osmoradio
+   of two revisions on a fake libsdr (fake_sdr.c in place of sdr.o: no
+   device, no threads, pseudo-random tosend / RX chunks, IQ to / from
+   files, SIGINT after N samples, optional real-time pacing; ASan +
+   UBSan), the same command lines on both: TX IQ bit-identical (FM mono,
+   stereo + RDS + PI + ECC, RDS callsign, AM linear / polyphase, NFM, FM
+   polyphase, AFC options, all five servers on 127.0.0.1, a config file),
+   RX of FM stereo + RDS (wave and hexrds the same), RDS paging through
+   `--rds-paging-fifo` (the encoder's log the same), logs the same
+   (colours, paths, line numbers, pids out). 3a: all 12 the same against
+   778b4f7. Found on the way (parked): a numeric page through the FIFO is
+   logged as sent (`RDS Paging TX: NUM10 ... cnt=1`), but no 7A group
+   comes out of the RX decode of that TX, in 6 s or in 20 s.
 4. libsdr band API; offline test with three bands at different rates
    (engine in-process and two clients on a backend).
 5. N stations: offline (IQ files / engine loop) FM stereo + RDS, AM, NFM
