@@ -4884,8 +4884,10 @@ again:
 		goto again;
 	case TRANS_MWI:
 		/* Message Waiting Indicator on FOCC - send to idle phone
-		 * Per TIA/EIA-553-A, MWI can be sent on FOCC after PCI order confirmation.
-		 * We use this to send MWI to phones that are idle (not in a call).
+		 * Per TIA/EIA-553-A 2.6.2.3 (Idle Task, orders on the FOCC), an idle mobile
+		 * station takes the Message Waiting order and answers with an order
+		 * confirmation on the RECC. We use this to send MWI to phones that are idle
+		 * (not in a call).
 		 * trans->msg_type = count (0-31)
 		 * trans->ordq = type (0=voice, 1=SMS, 2=fax)
 		 * trans->order = 5 (Message Waiting)
