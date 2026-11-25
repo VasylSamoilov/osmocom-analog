@@ -168,7 +168,8 @@ static void program_request(sdr_backend_t *b, program_t *p)
 	}
 	b->n_groups++;
 	memcpy(p->name, req.name, sizeof(p->name));
-	fprintf(stderr, "SDR backend: '%s' registered %d RX / %d TX channels at DSP rate %d\n", p->name, req.n_rx, req.n_tx, req.dsp_rate);
+	fprintf(stderr, "SDR backend: '%s' registered %d RX / %d TX channels at DSP rate %d%s\n", p->name, req.n_rx, req.n_tx, req.dsp_rate,
+		p->group->chain ? " (above the filter banks' rate: per-channel chain)" : "");
 	ans.ok = 1;
 	ans.view_size = p->size;
 	ans.tx_scale = sdr_engine_tx_scale(b->e);

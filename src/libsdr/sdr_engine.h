@@ -40,6 +40,11 @@
 
 #define SDR_ENGINE_MAX_GROUPS	64
 #define SDR_ENGINE_MAX_CHAN	128	/* channels in one group, per direction */
+/* channels on the per-channel chain (a DSP rate above the bank's), all
+ * groups, per direction: each one works at the SDR rate in the device
+ * threads (bench: ~1 - 3 % of a core per direction at 1.92 - 9.6 MS/s on
+ * the PC), so few; a broadcast FM channel or two next to the bank */
+#define SDR_ENGINE_MAX_CHAIN	4
 
 /* the indices of a ring, where both sides see them (a view) */
 typedef struct sdr_ring_ctl {
@@ -117,6 +122,7 @@ struct sdr_engine {
 	int		max_dsp;		/* highest DSP rate the banks carry */
 	int		tx_nmax;		/* most TX channels: each gets 1 / tx_nmax of full scale */
 	int		tx_used;		/* TX channels registered */
+	int		rx_chain, tx_chain;	/* channels on the chain registered (SDR_ENGINE_MAX_CHAIN) */
 	pfb_t		bank_rx, bank_tx;
 	int		max_block;		/* most SDR samples per feed / produce */
 	/* registry: groups[] is changed under 'lock' only; each device thread

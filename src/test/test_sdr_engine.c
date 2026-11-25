@@ -264,8 +264,7 @@ static void test_tx_isolation(void)
 
 /* 4. a group above the bank's DSP rate (broadcast FM next to NFM): the
  * per-channel chain beside the bank, TX looped to RX */
-#define WIDE	240000
-static void test_wide(void)
+static void test_wide(int WIDE)	/* the wide DSP rate: 240 k halfbands only, 100 k through the resampler */
 {
 	sdr_engine_t e;
 	sdr_group_t *gn, *gw;
@@ -329,7 +328,7 @@ static void test_wide(void)
 		double l0 = level(y0 + skn, ln, 1000.0 / DSP), l1 = level(y1 + skn, ln, -2000.0 / DSP), lw0 = level(yw + skw, lw, 20000.0 / WIDE);
 		double xw = fmax(level(y0 + skn, ln, (offw + 20000.0 - offn[0]) / DSP), level(y1 + skn, ln, (offw + 20000.0 - offn[1]) / DSP));
 		double xn = fmax(level(yw + skw, lw, (offn[0] + 1000.0 - offw) / WIDE), level(yw + skw, lw, (offn[1] - 2000.0 - offw) / WIDE));
-		long expect = (long)blocks * BLOCK / (FS / WIDE);
+		long expect = (long)((double)blocks * BLOCK * WIDE / FS);
 
 		check(fabs(l0) < 0.01 && fabs(l1) < 0.01, "level of each NFM channel's tone back (worst error)", fmax(fabs(l0), fabs(l1)), "dB");
 		check(fabs(lw0) < 0.05, "level of the wide channel's tone back (error)", fabs(lw0), "dB");
@@ -348,13 +347,49 @@ static void test_wide(void)
 	free(yw);
 }
 
+/* 5. the chain takes at most SDR_ENGINE_MAX_CHAIN channels per direction;
+ * the next is refused with the reason, a removed group gives its back */
+static void test_chain_limit(void)
+{
+	sdr_engine_t e;
+	sdr_group_t *g[SDR_ENGINE_MAX_CHAIN], *more, *again;
+	double off[SDR_ENGINE_MAX_CHAIN];
+	int i, ok = 1;
+
+	printf("Chain channels: at most %d per direction:\n", SDR_ENGINE_MAX_CHAIN);
+	if (sdr_engine_init(&e, FS, FS, DSP, NMAX, BLOCK) < 0) {
+		printf("  %s\n", sdr_engine_error());
+		failures++;
+		return;
+	}
+	for (i = 0; i < SDR_ENGINE_MAX_CHAIN; i++) {
+		off[i] = -600000.0 + i * 300000.0;
+		g[i] = sdr_engine_group_add(&e, 240000, 1, &off[i], 1, &off[i], 200, 240000 / 50);
+		if (!g[i]) {
+			printf("  %s\n", sdr_engine_error());
+			ok = 0;
+		}
+	}
+	check(ok, "chain groups up to the limit registered", (double)SDR_ENGINE_MAX_CHAIN, "");
+	more = sdr_engine_group_add(&e, 240000, 1, &off[0], 0, NULL, 200, 0);
+	printf("  refused: %s\n", sdr_engine_error());
+	check(!more && strstr(sdr_engine_error(), "per-channel chain") != NULL, "one more chain channel refused, the reason given", 0, "");
+	sdr_engine_group_remove(&e, g[0]);
+	again = sdr_engine_group_add(&e, 240000, 1, &off[0], 1, &off[0], 200, 240000 / 50);
+	check(again != NULL && e.rx_chain == SDR_ENGINE_MAX_CHAIN && e.tx_chain == SDR_ENGINE_MAX_CHAIN, "after a removal one fits again", (double)e.rx_chain, "");
+	check(sdr_engine_group_add(&e, DSP, 1, &off[0], 1, &off[0], 200, DSP / 50) != NULL, "a bank group still fits", 0, "");
+	sdr_engine_exit(&e);
+}
+
 int main(void)
 {
 	printf("=== SDR engine tests ===\n\n");
 	test_loopback();
 	test_rx_isolation();
 	test_tx_isolation();
-	test_wide();
+	test_wide(240000);
+	test_wide(100000);
+	test_chain_limit();
 	printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
 	return failures ? 1 : 0;
 }

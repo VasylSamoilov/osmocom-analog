@@ -311,7 +311,17 @@ sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, c
 		snprintf(error_text, sizeof(error_text), "%d TX channels, %d of %d in use", n_tx, e->tx_used, e->tx_nmax);
 		return NULL;
 	}
+	if (dsp_rate > e->max_dsp && (e->rx_chain + n_rx > SDR_ENGINE_MAX_CHAIN || e->tx_chain + n_tx > SDR_ENGINE_MAX_CHAIN)) {
+		pthread_mutex_unlock(&e->lock);
+		snprintf(error_text, sizeof(error_text), "DSP rate %d is above the %d of the filter banks: per-channel chain, %d RX / %d TX of at most %d each in use",
+			 dsp_rate, e->max_dsp, e->rx_chain, e->tx_chain, SDR_ENGINE_MAX_CHAIN);
+		return NULL;
+	}
 	e->tx_used += n_tx;	/* reserved, given back on failure */
+	if (dsp_rate > e->max_dsp) {
+		e->rx_chain += n_rx;
+		e->tx_chain += n_tx;
+	}
 	pthread_mutex_unlock(&e->lock);
 
 	g = calloc(1, sizeof(*g));
@@ -452,6 +462,10 @@ nomem:
 fail:
 	pthread_mutex_lock(&e->lock);
 	e->tx_used -= n_tx;
+	if (dsp_rate > e->max_dsp) {
+		e->rx_chain -= n_rx;
+		e->tx_chain -= n_tx;
+	}
 	pthread_mutex_unlock(&e->lock);
 	if (g)
 		group_free(g);
@@ -474,6 +488,10 @@ void sdr_engine_group_remove(sdr_engine_t *e, sdr_group_t *g)
 		if (e->groups[i] == g)
 			e->groups[i] = NULL;
 	e->tx_used -= g->n_tx;
+	if (g->chain) {
+		e->rx_chain -= g->n_rx;
+		e->tx_chain -= g->n_tx;
+	}
 	pthread_mutex_unlock(&e->lock);
 	if (__atomic_load_n(&g->rx_on, __ATOMIC_ACQUIRE) || __atomic_load_n(&g->tx_on, __ATOMIC_ACQUIRE)) {
 		fprintf(stderr, "sdr_engine_group_remove: a device thread still uses the group after 2 s, not freed\n");

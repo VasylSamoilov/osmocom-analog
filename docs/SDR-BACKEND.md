@@ -154,9 +154,14 @@ Over the air with phones, B210, filter bank active (2026-11-23):
 1. **Nothing changes under a running channel.** SDR rate, centre frequency,
    gains and the banks are fixed when the backend starts. Registering picks a
    bin and adds a tail, or is refused with the reason: outside the RX or TX
-   band (the backend has one of each), a DSP rate above what the bank's
-   sub-bands carry (the spacing must be more than the DSP rate; the largest
-   DSP rate is set at start), wider than 0.8 of its DSP rate, no channel left.
+   band (the backend has one of each), wider than 0.8 of its DSP rate, no
+   channel left. A DSP rate above what the bank's sub-bands carry (the
+   spacing must be more than the DSP rate; the bank's DSP rate is set at
+   start, `--dsp-rate`) gets the per-channel chain on the SDR stream instead
+   (broadcast FM), at most `SDR_ENGINE_MAX_CHAIN` (4) channels per direction
+   in all: each works at the SDR rate in the device threads. Beyond that it
+   is refused with the reason; the backend logs which groups are on the
+   chain. (The limit is a constant for now; an option for it is open.)
 2. **TX level is fixed per channel.** The backend starts with the most
    channels it carries (N max); each channel's carrier has 1/N max of full
    scale, so the sum never clips and a channel's power never changes when
