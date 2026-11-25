@@ -258,6 +258,38 @@ loopback at TX 60: use RX 10 (about -19 dBFS); there the same 434 frames,
 91.2 %, 6 / 6 pages, no clipping. Backend CPU with the counters on / off
 16 / 14 % and 15 / 15 % (two pairs of runs): within the run spread.
 
+## Broadcast FM next to the narrow channels (measured offline, 2026-11-25)
+
+Broadcast FM (75 kHz deviation) needs a DSP rate of 240 k (mono, osmoradio
+picks SDR rate / 2^k >= 2.67 x (75 k + 15 k)) to 480 k (stereo, RDS) against
+48 k for NFM. Three ways, bench `~/.cache/sdrangel-rp-rates/bench/
+bench_wide.c` (no device, one thread, this PC, % of a core RX / TX; NFM
+channels 25 kHz apart, the wide channel 0.8 - 4 MHz away from them):
+
+- a: one bank made for the wide rate, NFM groups at 48 k on it (the engine
+  today with `--dsp-rate` 240 k);
+- b: two banks, one for 48 k and one for the wide rate;
+- c: the 48 k bank for NFM, the per-channel chain (channelizer) for the
+  wide channel.
+
+| SDR | wide | NFM | a | b | c |
+|---|---|---|---|---|---|
+| 1.92 M | 240 k | 4 | - (no bank: 8 bins minimum) | - | 5.7 / 5.8 |
+| 3.84 M | 240 k | 4 | 10.4 / 11.3 | 13.1 / 13.6 | 9.8 / 10.0 |
+| 3.84 M | 240 k | 16 | 27.1 / 23.1 | 17.2 / 18.4 | 14.4 / 15.0 |
+| 9.6 M | 240 k | 4 | 17.2 / 16.9 | 23.9 / 25.0 | 20.6 / 20.7 |
+| 9.6 M | 240 k | 16 | 36.0 / 31.8 | 29.4 / 29.3 | 26.0 / 25.8 |
+| 9.6 M | 480 k | 4 | 23.7 / 25.0 | 27.0 / 28.5 | 22.1 / 22.0 |
+| 9.6 M | 480 k | 16 | 44.5 / 44.4 | 42.6 / 41.7 | 27.3 / 26.9 |
+
+Quality the same on all three: NFM SINAD 30.5 dB alone and with the wide
+carrier +20 dB; wide SINAD 40.6 dB (240 k) / 43.4 dB (480 k) alone and
+with the NFM channels on; the wide TX in the NFM channels -122 dBc (c) to
+-180 dBc (a, b). Choice: c (cheapest but one case, the only one at
+1.92 MS/s, and the gap grows with the NFM channels). In the engine: a
+group with a DSP rate above the bank's gets the chain on the SDR stream
+in the device threads, beside the bank.
+
 ## Open
 
 - The backend has no IQ / spectrum display (no terminal UI); a status
