@@ -857,6 +857,27 @@ static int fvc_order_state(enum amps_trans_state state)
 	}
 }
 
+/* the FVC order of a state (its first state, also while it is sent), TRANS_NULL none */
+static enum amps_trans_state fvc_order_of(enum amps_trans_state state)
+{
+	switch (state) {
+	case TRANS_CALL_AUDIT:
+	case TRANS_CALL_AUDIT_SEND:
+		return TRANS_CALL_AUDIT;
+	case TRANS_CALL_CHANGE_POWER:
+	case TRANS_CALL_CHANGE_POWER_SEND:
+		return TRANS_CALL_CHANGE_POWER;
+	case TRANS_CALL_FLASH_INFO:
+	case TRANS_CALL_FLASH_INFO_SEND:
+		return TRANS_CALL_FLASH_INFO;
+	case TRANS_CALL_MWI:
+	case TRANS_CALL_MWI_SEND:
+		return TRANS_CALL_MWI;
+	default:
+		return TRANS_NULL;
+	}
+}
+
 /* the task of the mobile station: the state an FVC order interrupted, else the state */
 static enum amps_trans_state trans_task_state(transaction_t *trans)
 {
@@ -882,6 +903,16 @@ static void fvc_order_done(amps_t *amps, transaction_t *trans)
 	trans_new_state(trans, task);
 	trans->order_return_state = TRANS_NULL;
 	amps_set_dsp_mode(amps, (task == TRANS_CALL_MT_ALERT_CONFIRM) ? DSP_MODE_AUDIO_RX_SILENCE_TX : DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
+}
+
+/* an order the change of the task cut short (the alert confirmed, the answer) goes again, whole,
+ * in the new task; the mobile takes it there too */
+static void fvc_order_resume(amps_t *amps, transaction_t *trans, enum amps_trans_state order)
+{
+	if (order == TRANS_NULL)
+		return;
+	LOGP_CHAN(DAMPS, LOGL_INFO, "The order cut short goes again (%s)\n", trans_short_state_name(order));
+	fvc_order_start(amps, trans, order);
 }
 
 /* the tasks an order may interrupt: ringing_only for one the mobile ignores while waiting for
@@ -914,7 +945,9 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 		LOGP_CHAN(DAMPS, LOGL_INFO, "Lost Signaling Tone signal\n");
 
 	/* during an FVC order the tone means what it means in the task the order interrupted; a change
-	 * of the task (answer, alert confirmed) ends the order */
+	 * of the task (answer, alert confirmed) cuts the order short, it goes again in the new task */
+	enum amps_trans_state cut = fvc_order_of(trans->state);
+
 	switch (trans_task_state(trans)) {
 	case TRANS_CALL_MO_ASSIGN_CONFIRM: // should not happen
 	case TRANS_CALL:
@@ -998,6 +1031,7 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 			amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_AUDIO_TX, 0);
 			trans_new_state(trans, TRANS_CALL_MT_ANSWER_WAIT);
 			osmo_timer_schedule(&trans->timer, ANSWER_TO);
+			fvc_order_resume(amps, trans, cut);
 		}
 		break;
 	case TRANS_CALL_STOP_ALERT_SEND:
@@ -1137,6 +1171,7 @@ void amps_rx_signaling_tone(amps_t *amps, int tone, double quality)
 					osmo_timer_schedule(&trans->timer, SAT_TO1);
 				call_up_answer(trans->callref, amps_min2number(trans->min1, trans->min2));
 				trans_new_state(trans, TRANS_CALL);
+				fvc_order_resume(amps, trans, cut);
 			} else {
 				/* ST lost but SAT not detected - likely signal issue or non-compliant phone.
 				 * Keep waiting for answer. The ANSWER_TO timer will handle timeout. */
@@ -4662,6 +4697,9 @@ void transaction_timeout(void *data)
 			amps_release(trans, CAUSE_TEMPFAIL);
 		} else {
 			LOGP_CHAN(DAMPS, LOGL_NOTICE, "Phone does not respond to alert order, retrying\n");
+			/* an order being sent goes again after the alert */
+			if (fvc_order_of(trans->state) != TRANS_NULL)
+				trans->pending_order = fvc_order_of(trans->state);
 			trans_new_state(trans, TRANS_CALL_MT_ALERT);
 			amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_FRAME_TX, 0);
 		}
@@ -5394,6 +5432,13 @@ transaction_t *amps_tx_frame_fvc(amps_t *amps)
 		osmo_timer_schedule(&trans->timer, ALERT_TO);
 		amps_set_dsp_mode(amps, DSP_MODE_AUDIO_RX_SILENCE_TX, 0);
 		trans_new_state(trans, TRANS_CALL_MT_ALERT_CONFIRM);
+		/* an order the alert timer cut short goes now, while the alert waits */
+		if (trans->pending_order != TRANS_NULL) {
+			enum amps_trans_state order = trans->pending_order;
+
+			trans->pending_order = TRANS_NULL;
+			fvc_order_resume(amps, trans, order);
+		}
 		return NULL;
 	/* Silent Page: Maintenance order on FVC */
 	case TRANS_SILENT_PAGE_MAINTENANCE:
