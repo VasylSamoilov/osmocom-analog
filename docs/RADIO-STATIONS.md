@@ -106,10 +106,16 @@ the backend one registration). Several stations = several processes.
       1812553, config frequency + `-f 101e6` on 101 MHz as before, config
       `-V` overridden after `-f` as before, a second `-f` refused. With
       one station the copy itself cannot be seen: per-station separation
-      is proven in step 5. Parked for step 5: flag options (`-S`,
-      `--rds`, `-C`, ...) have no negation, so a default `-S` cannot be
-      switched off for one (AM) station - give flags a `no-` form or keep
-      them after `-f`.
+      is proven in step 5. For step 5 (the user, 2026-11-26): every kind
+      of station has its own set of options - no `no-` forms. A default
+      applies to the stations whose kind it belongs to (`-S`, `--rds*`,
+      `--sca*`, `-D`, `-E`, `--fm-compandor`, AFC: FM; `-I`, `-C`: AM;
+      audio, files, `-B`, `-V`, `-s`, rigctl: all) and is not applied
+      to the others; the same option after the `-f` of a station of
+      another kind is refused (as `-S` with AM is today). Needs to know
+      per option where it was given (defaults or the station) and the
+      option -> kinds table checked against the code before it is
+      written.
    c. main() carved into station init / poll / exit; the paging FIFO's
       line buffer into the station.
    Proof for each: `~/.cache/sdrangel-rp-rates/txfix/suite.sh` - osmoradio
