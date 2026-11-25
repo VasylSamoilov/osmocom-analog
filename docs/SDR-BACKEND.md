@@ -2,8 +2,9 @@
 
 Status 2026-11-24: steps 1, 2 and 3 built (filter banks, the engine in the
 device threads, `osmo-sdr-backend` with `--sdr-backend <socket>` in the
-programs). Open: two programs on one B210 over the air, phones on the
-engine path, broadcast FM next to them, the Pi 4.
+programs). 2026-11-25: two networks (NMT and POCSAG) on one B210 through
+the backend. Open: phones on the engine path, broadcast FM next to them,
+the Pi 4.
 
 ## Goal
 
@@ -228,13 +229,24 @@ TX stays locked to RX without drift; each program's RX -> TX delay is the
 advance plus its ring target. (Two nmt programs: give each its own
 `--sms-deliver`, `--sms-submit` and `--cmd-fifo` paths.)
 
+Two networks on one B210 (2026-11-25, RF loopback, no phones; backend
+centre 465.70 MHz TX and RX, `--channels 4`, 1.92 MS/s, DSP 48k, TX 60 /
+RX 40, 30 s): nmt 90/92 `-l 2` and `pocsag -k 466.230 -T -R -B 1200`,
+six alpha pages from its FIFO, 4 s apart, during the run:
+
+| program | result | CPU |
+|---|---|---|
+| nmt 90/92 | 434 frames, 0 invalid, quality 91.1 % (min 91 %) | 4 % |
+| pocsag 466.230 | 6 / 6 pages received, 0 corrected, 0 uncorrectable | 3 % |
+| backend | | 14 % |
+
+NMT as with NMT alone (216 frames per 15 s, 91 %); the pages did not
+disturb it.
+
 ## Open
 
 - The backend does not drain its raw SDR rate ring yet: ADC clipping / DC
   status and the IQ / spectrum displays (rule 5) are not fed there.
-- TX through a real program on the backend: verified at the engine level
-  only (test_sdr_backend); sdr.c has no device-less path, the first run is
-  on the B210 (cable loopback against the in-process numbers above).
 - The backend's centres are the operator's: a client warns when a
   channel covers one (DC, LO leakage).
 
