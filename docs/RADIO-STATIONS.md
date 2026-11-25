@@ -104,7 +104,9 @@ the backend one registration). Several stations = several processes.
    `--rds-paging-fifo` (the encoder's log the same), logs the same
    (colours, paths, line numbers, pids out). 3a: all 12 the same against
    778b4f7. A page through the FIFO at ~1 s goes out after the encoder's
-   start-up warmup (57 groups, ~5 s, PS only): the paging case runs 12 s
+   start-up warmup (57 groups, ~5 s, PS only; on purpose: receivers lock
+to PI / PS of a station that has just come up before any data): the
+paging case runs 12 s
    and needs the 7A groups decoded (an earlier "no 7A" was its 6 s
    window). Fixed on the way: radio_exit() never called
    rds_encoder_exit() / rds_decoder_exit() - the call on air and the
