@@ -314,9 +314,27 @@ backend:
 | without the FM programs | 434 frames, 91.1 % | 6 / 6 | - | backend 15 % |
 | with TX + RX of broadcast FM | 434 frames, 91.2 % | 6 / 6 | 1 kHz at -9.7 dBFS, SINAD 61.0 dB (5, 15, 25 s) | backend 19 %, osmoradio TX 4 %, RX 3 % |
 
-No ADC clipping, no rows missing or dropped. Once at start osmoradio
-logged `signal_num > signal_buffer_size (7210 > 7200), capping` (its first
+No ADC clipping, no rows missing or dropped. NMT and POCSAG decode the
+same with the FM programs (frames and quality are pass / fail, not a
+margin; the margin is the bench below). Reference without the backend:
+one osmoradio TX + RX in-process on the B210, same tone, TX 60 / RX 10:
+SINAD 61.1 dB (backend 61.0 dB); both likely limited by the audio path,
+so this shows no loss, not a margin. Once at start osmoradio logged
+`signal_num > signal_buffer_size (7210 > 7200), capping` (its first
 tosend; not looked into).
+
+The shipped engine path in the bench (path e: the 48 k bank and the wide
+group on its chain, `bench_wide.c`, `KINDS=ce`): CPU as path c (1.92 M /
+240 k / 4 NFM 5.7 / 5.8 %, 9.6 M / 480 k / 16 NFM 27.6 / 27.3 %), the same
+SINAD, the wide TX in the NFM channels -130 to -180 dBc. Close spacing as
+on the radio (2 NFM at -450 kHz, the wide carrier at -600 kHz, +20 dB,
+137.5 kHz from the nearer NFM channel): NFM SINAD 30.5 dB with and
+without it.
+
+osmoradio on the backend takes its IQ rate from `--sdr-samplerate` (the
+backend's SDR rate) or `--channelizer-rate`; without them it is `-s`
+(100 k), too narrow for 75 kHz FM: it says so at start. Its IQ is at most
+1 (FM 1, AM bias + gain <= 1), so the 1 / N scaling keeps the sum in range.
 
 ## Open
 

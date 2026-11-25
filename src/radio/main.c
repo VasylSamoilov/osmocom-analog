@@ -1549,6 +1549,11 @@ int main(int argc, char *argv[])
 		LOGP(DSDR, LOGL_NOTICE, "Channelizer: SDR=%d Hz -> IQ=%d Hz (rf_bw=%.1f kHz, signal=%.1f kHz)\n",
 		     sdr_config->samplerate, input_samplerate,
 		     2.0 * baseband_extent / 1000.0, dsp_samplerate / 1000.0);
+	/* on an SDR backend the SDR rate is the backend's, this program does
+	 * not know it: the IQ rate comes from -s unless it is given */
+	if (sdr_config && sdr_config->backend && input_samplerate < baseband_extent * 2.0 / 0.75)
+		LOGP(DSDR, LOGL_NOTICE, "On the SDR backend: the IQ rate %d Hz is too low for this signal (%.0f kHz wide, needs %.0f Hz): give the backend's SDR rate with --sdr-samplerate, or --channelizer-rate.\n",
+		     input_samplerate, 2.0 * baseband_extent / 1000.0, ceil(baseband_extent * 2.0 / 0.75));
 
 	if (modulation == MODULATION_NONE) {
 		fprintf(stderr, "Please select modulation, use '-h' for help!\n");
