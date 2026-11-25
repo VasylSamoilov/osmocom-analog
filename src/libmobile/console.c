@@ -510,6 +510,13 @@ void console_msg(osmo_cc_call_t *call, osmo_cc_msg_t *msg)
 
 static char console_text[256];
 static int console_len = 0;
+static int console_no_tty = 0;	/* headless: no status line, no scroll window */
+
+/* call before console_init */
+void console_set_no_tty(void)
+{
+	console_no_tty = 1;
+}
 
 int console_init(const char *audiodev, int samplerate, int buffer, int loopback, int echo_test, int echo_analysis, int echo_analysis_duration, const char *digits, const struct number_lengths *lengths, const char *station_id)
 {
@@ -519,7 +526,8 @@ int console_init(const char *audiodev, int samplerate, int buffer, int loopback,
 	init_testton();
 
 	/* Put scrolling window one line above bottom. */
-	logging_limit_scroll_bottom(1);
+	if (!console_no_tty)
+		logging_limit_scroll_bottom(1);
 
 	memset(&console, 0, sizeof(console));
 	strncpy(console.audiodev, audiodev, sizeof(console.audiodev) - 1);
@@ -718,6 +726,8 @@ dial_after_hangup:
 			sprintf(text, "call disconnected: %s (press h=hangup d=redial)", cause_name(console.disc_cause));
 		break;
 	}
+	if (console_no_tty)
+		return;
 	/* skip if nothing has changed */
 	len = strlen(text);
 	if (console_len == len && !memcmp(console_text, text, len))

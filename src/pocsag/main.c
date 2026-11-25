@@ -502,6 +502,7 @@ int main(int argc, char *argv[])
 
 	/* init mobile interface */
 	main_mobile_init("0123456789ABCD", number_lengths, NULL, pocsag_number_valid, "german");
+	main_mobile_set_no_calls();
 
 	/* handle options / config file */
 	add_options();

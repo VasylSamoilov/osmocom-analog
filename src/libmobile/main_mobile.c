@@ -79,6 +79,7 @@ static int echo_analysis_duration = 10;
 static int use_osmocc_cross = 0;
 static int use_osmocc_sock = 0;
 static int headless = 0;	/* no terminal: no keyboard, no banner, no displays */
+static int no_calls = 0;	/* pagers: messages come from a FIFO, not from calls */
 #define MAX_CC_ARGS 1024
 static int cc_argc = 0;
 static const char *cc_argv[MAX_CC_ARGS];
@@ -336,6 +337,13 @@ void main_mobile_set_number_check_valid(const char *(*check_valid)(const char *)
 	mobile_number_check_valid = check_valid;
 }
 
+/* The network has no calls (pagers): --headless does not imply the OSMO-CC
+ * socket, only -o or -x open it. */
+void main_mobile_set_no_calls(void)
+{
+	no_calls = 1;
+}
+
 /* ask if number is connect */
 int main_mobile_number_ask(const char *number, const char *what)
 {
@@ -441,7 +449,10 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf("    --headless\n");
 	printf("        Run without terminal: no keyboard, no banner, no displays, the\n");
 	printf("        terminal is left as it is (for services, scripts, 'timeout').\n");
-	printf("        Implies '-o': calls go through the OSMO-CC socket.\n");
+	if (no_calls)
+		printf("        No calls on this network: no OSMO-CC socket unless '-o' is given.\n");
+	else
+		printf("        Implies '-o': calls go through the OSMO-CC socket.\n");
 	printf("    --cc \"<osmo-cc arg>\" [--cc ...]\n");
 	printf("        Pass arguments to Osmo-CC endpoint. Use '-cc help' for description.\n");
 	printf("    --no-l16\n");
@@ -918,8 +929,9 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	buffer_size = dsp_samplerate * dsp_buffer / 1000;
 
 	/* headless: no console, calls go through the socket (or the built-in
-	 * forwarding between mobiles) */
-	if (headless && !use_osmocc_cross)
+	 * forwarding between mobiles); a network without calls (pagers) keeps
+	 * the internal console without its terminal and opens no socket */
+	if (headless && !use_osmocc_cross && !no_calls)
 		use_osmocc_sock = 1;
 
 	/* check OSMO-CC support */
@@ -999,7 +1011,8 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	 * call socket). Time is the sample count and the loop runs as fast as the
 	 * CPU allows; nothing is interactive (no keyboard, no displays, no sound
 	 * card on the call side). */
-	batch = iq_wave_is_active() && !use_sdr && !use_osmocc_sock;
+	/* (headless stays real time, as with the socket it had before) */
+	batch = iq_wave_is_active() && !use_sdr && !use_osmocc_sock && !headless;
 	/* the WAV files (IQ and audio) wait instead of dropping samples */
 	if (batch)
 		wave_set_blocking(1);
@@ -1007,8 +1020,10 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	no_tty = batch || headless;
 
 	/* init OSMO-CC */
+	if (!use_osmocc_sock && headless)
+		console_set_no_tty();
 	if (!use_osmocc_sock)
-		console_init((batch) ? "" : call_device, call_samplerate, call_buffer, loopback, echo_test, echo_analysis, echo_analysis_duration, number_digits, number_lengths, station_id);
+		console_init((batch || headless) ? "" : call_device, call_samplerate, call_buffer, loopback, echo_test, echo_analysis, echo_analysis_duration, number_digits, number_lengths, station_id);
 
 	/* init call control instance */
 	rc = call_init(name, (use_osmocc_sock) ? send_patterns : 0, release_on_disconnect, use_osmocc_sock, cc_argc, cc_argv, no_l16, call_toneset);

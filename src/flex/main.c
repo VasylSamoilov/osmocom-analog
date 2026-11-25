@@ -2866,6 +2866,7 @@ int main(int argc, char *argv[])
 		{ 0, NULL }
 	};
 	main_mobile_init("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", number_lengths, NULL, flex_number_valid, NULL);
+	main_mobile_set_no_calls();
 
 	/* handle options / config file */
 	add_options();

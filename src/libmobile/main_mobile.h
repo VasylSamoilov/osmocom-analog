@@ -47,6 +47,7 @@ void main_mobile_init(const char *digits, const struct number_lengths lengths[],
 void main_mobile_set_toneset(const char *toneset);
 void main_mobile_exit(void);
 void main_mobile_set_number_check_valid(const char *(*check_valid)(const char *));
+void main_mobile_set_no_calls(void);
 void main_mobile_print_help(const char *arg0, const char *ext_usage);
 void main_mobile_print_hotkeys(void);
 void main_mobile_print_station_id(void);

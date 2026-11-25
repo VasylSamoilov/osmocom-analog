@@ -80,6 +80,10 @@ music towards the mobile.
    sent), the headless one runs, sends a page from `--fifo-file` (decoded)
    and stops cleanly. Not for IQ-file batch runs: those are already without
    terminal, and `-o` turns batch timing off.
+   Pagers (pocsag, flex, golay) have no calls: there `--headless` does not
+   imply `-o`. They keep the internal call control without its terminal
+   line and open no socket; `-o` still offers it (paging by a call from a
+   PBX). Headless stays real time on IQ files, as before.
 2. **Test peer outside.** Echo, echo analysis, loopback and test tone as an
    Osmo-CC endpoint of their own (a small program, or a mode of the call phone),
    so a headless app can be tested the same way as with a real call. The
@@ -109,7 +113,8 @@ music towards the mobile.
   pager. Each app needs its own ports (`--cc "local ..." --cc "remote ..."`)
   pointing at its operations peer; the front end needs the list.
 - Without a peer, `-o` logs `OsmoCC-Socket failed` every two seconds or so
-  (7 times in 14 s). Normal for a pager with only `--fifo` input; quieten it?
+  (7 times in 14 s). Pagers no longer open the socket when headless (no
+  `-o`), so a pager with only `--fifo` input logs nothing of it.
 - Built-in console: keep it as the default for people who run the apps by
   hand, or make headless the default once steps 2 and 3 are there?
 
