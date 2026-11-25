@@ -54,8 +54,14 @@ the backend one registration). Several stations = several processes.
 7. **One main loop over the stations first** (read, radio_rx, radio_tx,
    write per station, servers polled per station). Threads only if the
    per-station time measured offline needs them.
-8. **Keyboard:** keys act on the selected station (a key selects it);
-   the status line shows which.
+8. **Keys are operations, not per station.** osmoradio still reads its
+   own terminal keys (m, s, w, b displays; d; f RDS preset; 1 - 3 RDS
+   flag flips; q quit) and has no `--headless`; it was not part of the
+   docs/HEADLESS.md work (that is the mobile programs' call console).
+   Those operations belong to the status and control interface
+   (HEADLESS.md step 4), addressed per station. Until that exists: keys
+   with one station as today, with several only q; `--headless` for
+   osmoradio as for the others.
 9. **Start-up refusals:** two stations on the same server endpoint,
    paging pipe, audio device or output file; a station whose band would
    cover the SDR centre in-process (DC, LO leakage; AM carriers first) -
