@@ -243,10 +243,20 @@ six alpha pages from its FIFO, 4 s apart, during the run:
 NMT as with NMT alone (216 frames per 15 s, 91 %); the pages did not
 disturb it.
 
+The backend drains its raw SDR rate ring (`sdr_server_poll()` from its
+main loop, every half `--buffer`): RX overflow and ADC clipping are
+reported there (the programs only see their channels). Clipping is logged
+when it starts, every 10 s while it lasts and when it ends; the counters
+follow `--sdr-iq-status`. B210 loopback above (TX 60), RX gain 76 / 40 /
+20 / 0: clipping 46 / 40 / 0 / 0 % of the samples, NMT and POCSAG the
+same at all four (434 frames 91 %, 6 / 6 pages): the RX 40 numbers in
+these tables were taken with the ADC clipping, FM decoded through it.
+Backend CPU 14 -> 16 % with the drain.
+
 ## Open
 
-- The backend does not drain its raw SDR rate ring yet: ADC clipping / DC
-  status and the IQ / spectrum displays (rule 5) are not fed there.
+- The backend has no IQ / spectrum display (no terminal UI); a status
+  interface would carry them (docs/HEADLESS.md step 4).
 - The backend's centres are the operator's: a client warns when a
   channel covers one (DC, LO leakage).
 

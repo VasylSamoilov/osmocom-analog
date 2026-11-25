@@ -202,7 +202,10 @@ int main(int argc, char *argv[])
 			LOGP(DSDR, LOGL_NOTICE, "%d program(s) registered.\n", g);
 			groups = g;
 		}
-		usleep(100000);
+		/* RX status (clipping, DC, overflow) from the raw ring, which
+		 * holds 4 x --buffer: drain it well within that */
+		sdr_server_poll(sdr);
+		usleep(buffer_ms * 1000 / 2);
 	}
 
 	LOGP(DSDR, LOGL_NOTICE, "Ending: the programs lose their channels.\n");

@@ -2163,6 +2163,59 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 	return count;
 }
 
+/* Backend: drain the raw SDR rate ring that the RX thread fills beside the
+ * engine (no program reads it there): the RX status (clipping, DC, levels)
+ * and the overflow report. No displays (the backend has no terminal UI).
+ * Call it from the backend's main loop, more often than the ring fills
+ * (4 x buffer_size); a full ring only cuts what the status sees. */
+void sdr_server_poll(void *inst)
+{
+	sdr_t *sdr = (sdr_t *)inst;
+	int avail, take, first, out;
+
+	if (!sdr || !sdr->rx_lin || !sdr->thread_read.buffer)
+		return;
+	while (1) {
+		__sync_synchronize();
+		avail = ((sdr->thread_read.in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size) / 2;
+		if (!avail)
+			break;
+		take = (avail > sdr->rx_max_in) ? sdr->rx_max_in : avail;
+		out = sdr->thread_read.out;
+		first = (sdr->thread_read.buffer_size - out) / 2;
+		if (first > take)
+			first = take;
+		memcpy(sdr->rx_lin, (const float *)sdr->thread_read.buffer + out, first * 2 * sizeof(*sdr->rx_lin));
+		memcpy(sdr->rx_lin + first * 2, (const float *)sdr->thread_read.buffer, (take - first) * 2 * sizeof(*sdr->rx_lin));
+		__sync_synchronize();	/* copied before the RX thread may reuse it */
+		sdr->thread_read.out = (out + 2 * take) % sdr->thread_read.buffer_size;
+		sdr_status_rx_accumulate(sdr->rx_lin, take);
+	}
+	if (sdr_rx_overflow) {
+		LOGP(DSDR, LOGL_ERROR, "SDR RX overflow!\n");
+		sdr_rx_overflow = 0;
+	}
+	/* ADC clipping hurts every program's channels: tell the operator when
+	 * it starts, every 10 s while it lasts, and when it ends */
+	{
+		static int clipping = 0;
+		static double clip_report = 0.0;
+		double now = get_time();
+		const sdr_rx_status_t *rx = &sdr_status_get()->rx;
+
+		if (sdr_status_snapshot(now) && rx->valid && rx->sample_count > 0) {
+			if (rx->clip_soft > 0 && (!clipping || now - clip_report >= 10.0)) {
+				LOGP(DSDR, LOGL_NOTICE, "RX clipping: %.2f %% of the samples near full scale (%.2f %% at the ADC rail): lower --sdr-rx-gain.\n",
+				     100.0 * rx->clip_soft / rx->sample_count, 100.0 * rx->clip_hard / rx->sample_count);
+				clip_report = now;
+			}
+			if (!rx->clip_soft && clipping)
+				LOGP(DSDR, LOGL_NOTICE, "RX clipping ended.\n");
+			clipping = (rx->clip_soft > 0);
+		}
+	}
+}
+
 /* TX driver has no device time reference, so its send() backpressure is the
  * only clock that matches the DAC rate. */
 static int sdr_tx_device_paced(void)

@@ -22,6 +22,7 @@ int sdr_calculate_optimal_rate(int master_rate, double bandwidth);
 struct sdr_engine;
 void sdr_server_mode(int nmax);
 struct sdr_engine *sdr_server_engine(void *inst);
+void sdr_server_poll(void *inst);
 
 /* SDR capability information */
 typedef struct sdr_caps {
