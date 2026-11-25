@@ -2100,6 +2100,11 @@ void radio_exit(radio_t *radio)
 		fm_mod_exit(&radio->fm_mod);
 	else
 		am_mod_exit(&radio->am_mod);
+	/* RDS: paging queue and the call on air, biphase table, TX input
+	 * files; decoder output files (hexrds, bitstream with its last byte).
+	 * Both are zero when not initialised (radio_init clears the radio). */
+	rds_encoder_exit(&radio->rds_enc);
+	rds_decoder_exit(&radio->rds_dec);
 }
 
 int radio_start(radio_t __attribute__((unused)) *radio)

@@ -85,7 +85,8 @@ the backend one registration). Several stations = several processes.
    (linear, polyphase), stereo, stereo + RDS (preset; PI + ECC; paging
    preset), mono + RDS with a callsign, AM (linear, polyphase); repeatable
    run to run. Found on the way, before and after alike: radio_exit()
-   does not free the RDS encoder's biphase waveform (2304 bytes, at exit).
+   does not free the RDS encoder's biphase waveform (2304 bytes, at exit;
+   fixed in step 3, below).
 3. `station_t` and the option rule with N = 1, three commits:
    a. the per-station file-scope variables of main.c in one `station_t`
       (`st->`), `station_defaults()` (done);
@@ -102,9 +103,13 @@ the backend one registration). Several stations = several processes.
    RX of FM stereo + RDS (wave and hexrds the same), RDS paging through
    `--rds-paging-fifo` (the encoder's log the same), logs the same
    (colours, paths, line numbers, pids out). 3a: all 12 the same against
-   778b4f7. Found on the way (parked): a numeric page through the FIFO is
-   logged as sent (`RDS Paging TX: NUM10 ... cnt=1`), but no 7A group
-   comes out of the RX decode of that TX, in 6 s or in 20 s.
+   778b4f7. A page through the FIFO at ~1 s goes out after the encoder's
+   start-up warmup (57 groups, ~5 s, PS only): the paging case runs 12 s
+   and needs the 7A groups decoded (an earlier "no 7A" was its 6 s
+   window). Fixed on the way: radio_exit() never called
+   rds_encoder_exit() / rds_decoder_exit() - the call on air and the
+   biphase table leaked, the RDS bitstream file lost its last byte; the
+   suite counts LeakSanitizer reports now.
 4. libsdr band API; offline test with three bands at different rates
    (engine in-process and two clients on a backend).
 5. N stations: offline (IQ files / engine loop) FM stereo + RDS, AM, NFM
