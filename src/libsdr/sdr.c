@@ -2205,8 +2205,9 @@ void sdr_server_poll(void *inst)
 
 		if (sdr_status_snapshot(now) && rx->valid && rx->sample_count > 0) {
 			if (rx->clip_soft > 0 && (!clipping || now - clip_report >= 10.0)) {
-				LOGP(DSDR, LOGL_NOTICE, "RX clipping: %.2f %% of the samples near full scale (%.2f %% at the ADC rail): lower --sdr-rx-gain.\n",
-				     100.0 * rx->clip_soft / rx->sample_count, 100.0 * rx->clip_hard / rx->sample_count);
+				LOGP(DSDR, LOGL_NOTICE, "RX clipping: %.2f %% of the samples near full scale (%.2f %% at the ADC rail), rms %.1f dBFS, DC %.3f / %.3f: lower --sdr-rx-gain.\n",
+				     100.0 * rx->clip_soft / rx->sample_count, 100.0 * rx->clip_hard / rx->sample_count,
+				     (rx->rms > 0.0) ? 20.0 * log10(rx->rms) : -120.0, rx->dc_offset_i, rx->dc_offset_q);
 				clip_report = now;
 			}
 			if (!rx->clip_soft && clipping)

@@ -62,7 +62,7 @@ without any sound device it sent a page to a headless POCSAG, the caller ID
 as the text:
 
 ```sh
-pocsag -k 466.230 ... --network --headless -y alpha
+pocsag -k 466.230 ... --network --headless -o -y alpha   # -o: pagers open no socket without it
 osmo-cc-alsa-endpoint -I 'HELLO FROM EP' --cc 'local 127.0.0.1:4201' \
         --cc 'remote 127.0.0.1:4200' 1234567          # then press d
 # decoded: POCSAG1200: Address: 1234567  Function: 0  Alpha: HELLO FROM EP

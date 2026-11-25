@@ -247,11 +247,16 @@ The backend drains its raw SDR rate ring (`sdr_server_poll()` from its
 main loop, every half `--buffer`): RX overflow and ADC clipping are
 reported there (the programs only see their channels). Clipping is logged
 when it starts, every 10 s while it lasts and when it ends; the counters
-follow `--sdr-iq-status`. B210 loopback above (TX 60), RX gain 76 / 40 /
-20 / 0: clipping 46 / 40 / 0 / 0 % of the samples, NMT and POCSAG the
-same at all four (434 frames 91 %, 6 / 6 pages): the RX 40 numbers in
-these tables were taken with the ADC clipping, FM decoded through it.
-Backend CPU 14 -> 16 % with the drain.
+follow `--sdr-iq-status`. B210 cable loopback above (TX 60), raw RX
+recorded and analysed: at RX 20 the own carriers are -9 dBFS rms (peak
+0.68); at RX 30 and up the ADC is full (rms -1 dBFS, 25 - 46 % of the
+samples clipped, intermod at +100 / -900 / -950 kHz). The RX 40 numbers
+in these tables were taken with the ADC clipping; NMT and POCSAG decoded
+the same at RX 0 to 76 (434 frames 91 %, 6 / 6 pages): quality and
+frame counts do not show it, they are pass / fail, not a margin. Cable
+loopback at TX 60: use RX 10 (about -19 dBFS); there the same 434 frames,
+91.2 %, 6 / 6 pages, no clipping. Backend CPU with the counters on / off
+16 / 14 % and 15 / 15 % (two pairs of runs): within the run spread.
 
 ## Open
 
