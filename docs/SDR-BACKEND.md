@@ -2,9 +2,9 @@
 
 Status 2026-11-24: steps 1, 2 and 3 built (filter banks, the engine in the
 device threads, `osmo-sdr-backend` with `--sdr-backend <socket>` in the
-programs). 2026-11-25: two networks (NMT and POCSAG) on one B210 through
-the backend. Open: phones on the engine path, broadcast FM next to them,
-the Pi 4.
+programs). 2026-11-25: two networks (NMT and POCSAG) and broadcast FM
+(osmoradio, on the per-channel chain) on one B210 through the backend.
+Open: phones on the engine path, the Pi 4.
 
 ## Goal
 
@@ -288,7 +288,30 @@ with the NFM channels on; the wide TX in the NFM channels -122 dBc (c) to
 -180 dBc (a, b). Choice: c (cheapest but one case, the only one at
 1.92 MS/s, and the gap grows with the NFM channels). In the engine: a
 group with a DSP rate above the bank's gets the chain on the SDR stream
-in the device threads, beside the bank.
+in the device threads, beside the bank (221facb; test_sdr_engine 4: NFM
+48 k + wide 240 k at 1.92 MS/s looped, levels exact, the other group
+-144 dB, rows exact, ASan clean).
+
+A program that takes the band (channels = 0, osmoradio: its own
+modulation, IQ at its rate) gets one channel at its frequency on the
+backend; its TX IQ is scaled to the channel level (1 / N max) like every
+channel. Its DSP rate is what it picks for the SDR rate it is told
+(`--sdr-samplerate` of the backend: 240 k at 1.92 MS/s for mono FM).
+
+B210 cable loopback (2026-11-25, `backend_wide.sh`, centre 465.70 MHz,
+`--channels 4`, TX 60 / RX 10, 30 s, no phones): nmt 90/92, pocsag
+466.230 (six pages), osmoradio TX FM 75 kHz at 465.10 MHz (a 1 kHz tone
+from a wave file) and a second osmoradio RX of it, all four on the
+backend:
+
+| | NMT | POCSAG | FM received | CPU |
+|---|---|---|---|---|
+| without the FM programs | 434 frames, 91.1 % | 6 / 6 | - | backend 15 % |
+| with TX + RX of broadcast FM | 434 frames, 91.2 % | 6 / 6 | 1 kHz at -9.7 dBFS, SINAD 61.0 dB (5, 15, 25 s) | backend 19 %, osmoradio TX 4 %, RX 3 % |
+
+No ADC clipping, no rows missing or dropped. Once at start osmoradio
+logged `signal_num > signal_buffer_size (7210 > 7200), capping` (its first
+tosend; not looked into).
 
 ## Open
 

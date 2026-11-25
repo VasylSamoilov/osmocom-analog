@@ -170,6 +170,7 @@ typedef struct sdr {
 	 * backend's view (client: no device, no device threads) */
 	sdr_port_t	*port;
 	int		use_client;
+	int		band_client;	/* a band program (channels = 0) on the backend: one channel, its IQ */
 	sdr_client_t	client;
 	double		client_check;		/* time the backend was last checked */
 } sdr_t;
@@ -269,22 +270,21 @@ sdr_engine_t *sdr_server_engine(void *inst)
 static int sdr_open_backend(sdr_t *sdr, double *tx_frequency, double *rx_frequency, int *am, int channels, double paging_frequency, int samplerate, int buffer_size, double bandwidth, double max_deviation, double max_modulation, double modulation_index)
 {
 	double tx_f[SDR_ENGINE_MAX_CHAN], rx_f[SDR_ENGINE_MAX_CHAN];
-	int ntx, nrx, nbuf, c, rc;
+	int ntx, nrx, nbuf, c, rc, band = !channels;
 	char err[256];
 
-	if (!channels) {
-		LOGP(DSDR, LOGL_ERROR, "--sdr-backend: this program takes the whole SDR band, the backend gives channels only.\n");
-		return -EINVAL;
-	}
-	ntx = tx_frequency ? channels + (sdr->paging_channel ? 1 : 0) : 0;
-	nrx = rx_frequency ? channels : 0;
+	/* a program that takes the band (channels = 0, osmoradio: its own
+	 * modulation, IQ at its rate around its frequency) gets one channel at
+	 * its frequency; above the backend's DSP rate it is on the chain */
+	ntx = tx_frequency ? (band ? 1 : channels + (sdr->paging_channel ? 1 : 0)) : 0;
+	nrx = rx_frequency ? (band ? 1 : channels) : 0;
 	nbuf = (ntx > nrx) ? ntx : nrx;
 	if (nbuf > SDR_ENGINE_MAX_CHAN) {
 		LOGP(DSDR, LOGL_ERROR, "%d channels, the SDR backend takes at most %d.\n", nbuf, SDR_ENGINE_MAX_CHAN);
 		return -EINVAL;
 	}
 	for (c = 0; c < ntx; c++)
-		tx_f[c] = (c < channels) ? tx_frequency[c] : paging_frequency;
+		tx_f[c] = (band || c < channels) ? tx_frequency[c] : paging_frequency;
 	for (c = 0; c < nrx; c++)
 		rx_f[c] = rx_frequency[c];
 	/* rings as in engine mode: 4 buffers; TX kept at one buffer (the
@@ -302,6 +302,16 @@ static int sdr_open_backend(sdr_t *sdr, double *tx_frequency, double *rx_frequen
 	sdr->amplitude = sdr->client.tx_scale;
 	LOGP(DSDR, LOGL_INFO, "SDR backend '%s': %d RX / %d TX channels registered (RX centre %.6f MHz, TX centre %.6f MHz), TX level 1/%.0f\n",
 	     sdr_config->backend, nrx, ntx, sdr->client.rx_centre / 1e6, sdr->client.tx_centre / 1e6, 1.0 / sdr->client.tx_scale);
+	if (band) {
+		/* the program's IQ goes through as it is (TX scaled to the
+		 * channel's level), no modulators here */
+		sdr->band_client = 1;
+		if (ntx)
+			LOGP(DSDR, LOGL_INFO, "TX: %.6f MHz, offset %+.1f kHz, DSP rate %d, on the backend\n", tx_f[0] / 1e6, (tx_f[0] - sdr->client.tx_centre) / 1e3, samplerate);
+		if (nrx)
+			LOGP(DSDR, LOGL_INFO, "RX: %.6f MHz, offset %+.1f kHz, DSP rate %d, on the backend\n", rx_f[0] / 1e6, (rx_f[0] - sdr->client.rx_centre) / 1e3, samplerate);
+		goto buffers;
+	}
 
 	/* modulators and demodulators at 0 Hz at the DSP rate */
 	for (c = 0; c < ntx; c++) {
@@ -349,6 +359,7 @@ static int sdr_open_backend(sdr_t *sdr, double *tx_frequency, double *rx_frequen
 			sdr->chan[c].dmp_deviation = display_measurements_add(&sender->dispmeas, "Deviation", "%.2f KHz", DISPLAY_MEAS_PEAK2PEAK, DISPLAY_MEAS_LEFT, 0.0, max_deviation / 1000.0 * 1.5, max_deviation / 1000.0);
 		}
 	}
+buffers:
 	sdr->eng_i = calloc(nbuf, sizeof(*sdr->eng_i));
 	sdr->eng_q = calloc(nbuf, sizeof(*sdr->eng_q));
 	if (!sdr->eng_i || !sdr->eng_q)
@@ -1923,6 +1934,20 @@ int sdr_write(void *inst, sample_t **samples, uint8_t **power, int num, enum pag
 		/* channels = 0: the caller's IQ (interleaved float) is the whole band */
 		float *in = (float *)samples;
 
+		if (sdr->band_client) {
+			/* on the backend: the channel's rows at its level (1 / N max
+			 * of full scale, as every channel there) */
+			int written;
+
+			for (s = 0; s < num; s++) {
+				sdr->eng_i[0][s] = in[2 * s] * sdr->amplitude;
+				sdr->eng_q[0][s] = in[2 * s + 1] * sdr->amplitude;
+			}
+			written = sdr_port_write(sdr->port, sdr->eng_i, sdr->eng_q, num);
+			if (written < num)
+				LOGP(DSDR, LOGL_ERROR, "Write SDR buffer overflow (%d of %d DSP samples fit)!\n", written, num);
+			return num;
+		}
 		for (s = 0; s < num; s++) {
 			sdr->ch_i[s] = in[2 * s];
 			sdr->ch_q[s] = in[2 * s + 1];
@@ -2138,10 +2163,19 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		/* channels = 0: the whole band, interleaved float to the caller */
 		float *o = (float *)samples;
 
-		count = channelizer_rx_process(&sdr->band_rx, lin, take, num, sdr->ch_i, sdr->ch_q);
-		for (s = 0; s < count; s++) {
-			o[2 * s] = sdr->ch_i[s];
-			o[2 * s + 1] = sdr->ch_q[s];
+		if (sdr->band_client) {
+			/* on the backend: the channel's rows */
+			count = sdr->port->n_rx ? sdr_port_read(sdr->port, sdr->eng_i, sdr->eng_q, num) : 0;
+			for (s = 0; s < count; s++) {
+				o[2 * s] = sdr->eng_i[0][s];
+				o[2 * s + 1] = sdr->eng_q[0][s];
+			}
+		} else {
+			count = channelizer_rx_process(&sdr->band_rx, lin, take, num, sdr->ch_i, sdr->ch_q);
+			for (s = 0; s < count; s++) {
+				o[2 * s] = sdr->ch_i[s];
+				o[2 * s + 1] = sdr->ch_q[s];
+			}
 		}
 	}
 
