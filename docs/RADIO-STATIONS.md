@@ -90,7 +90,26 @@ the backend one registration). Several stations = several processes.
 3. `station_t` and the option rule with N = 1, three commits:
    a. the per-station file-scope variables of main.c in one `station_t`
       (`st->`), `station_defaults()` (done);
-   b. the option rule (a second `-f` refused until step 5);
+   b. the option rule (a second `-f` refused until step 5) (done): the
+      config file and the options before the first command line `-f`
+      fill `station_default`, that `-f` starts the station as a copy of
+      it; a `frequency` in the config file is the default frequency, not
+      a station start; no `-f` on the command line: the station is the
+      defaults. Process-wide: `-h`, `-v`, `--fast-math`, `--limesdr*`
+      (SDR presets), all `--sdr-*`. Everything else is a station option.
+      Behaviour change: a second `-f` was silently the last one wins, now
+      it is refused (exit non-zero, before the SDR is opened). Proof:
+      suite.sh all 12 the same against 1812553; opts.sh (same cache dir):
+      stereo + RDS + PI + ECC and AM with the station options before
+      `-f` = after (TX IQ, SDR calls, log), SDR options before = after,
+      config file frequency without `-f` = the same on the command line =
+      1812553, config frequency + `-f 101e6` on 101 MHz as before, config
+      `-V` overridden after `-f` as before, a second `-f` refused. With
+      one station the copy itself cannot be seen: per-station separation
+      is proven in step 5. Parked for step 5: flag options (`-S`,
+      `--rds`, `-C`, ...) have no negation, so a default `-S` cannot be
+      switched off for one (AM) station - give flags a `no-` form or keep
+      them after `-f`.
    c. main() carved into station init / poll / exit; the paging FIFO's
       line buffer into the station.
    Proof for each: `~/.cache/sdrangel-rp-rates/txfix/suite.sh` - osmoradio

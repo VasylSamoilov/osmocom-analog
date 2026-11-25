@@ -148,8 +148,18 @@ typedef struct station {
 	double afc_max_hz;
 } station_t;
 
+/* Options (docs/RADIO-STATIONS.md): the config file and the command line
+ * options before the first -f fill station_default; the first command line
+ * -f starts the station as a copy of it, the options after it are that
+ * station's. Process options (-v, --fast-math) and the SDR options are
+ * process-wide wherever they stand. One station for now: a second -f is
+ * refused. After the options st points at the station, never at the
+ * defaults. */
+static station_t station_default;
 static station_t station0;
-static station_t *st = &station0;
+static int num_stations;
+static int options_from_command_line;
+static station_t *st = &station_default;
 
 /* the initial values of a station's settings */
 static void station_defaults(station_t *s)
@@ -447,7 +457,9 @@ static void print_help(const char *arg0)
 	printf("        Give a config file to use. If it starts with '~/', path is at home dir.\n");
 	printf("        Each line in config file is one option, '-' or '--' must not be given!\n");
 	printf(" -f --frequency <frequency>\n");
-	printf("        Give frequency in Hertz.\n");
+	printf("        Give frequency in Hertz. Starts the station: station options before\n");
+	printf("        it (and in the config file) are defaults, the ones after it are the\n");
+	printf("        station's. One -f for now (several stations: docs/RADIO-STATIONS.md).\n");
 	printf(" -s --samplerate <sample rate>\n");
 	printf("        Give signal processing sample rate in Hz. (default = %d)\n", st->dsp_samplerate);
 	printf("        This sample rate must be high enough for the signal's spectrum to fit.\n");
@@ -824,6 +836,16 @@ static int handle_options(int short_option, int argi, char **argv)
 			return rc;
 		break;
 	case 'f':
+		/* in the config file: the default frequency */
+		if (options_from_command_line) {
+			if (num_stations) {
+				fprintf(stderr, "A second '-f' (several stations) is not supported yet, one '-f' per osmoradio!\n");
+				return -EINVAL;
+			}
+			station0 = station_default;
+			st = &station0;
+			num_stations = 1;
+		}
 		st->frequency = atof(argv[argi]);
 		break;
 	case 's':
@@ -1491,9 +1513,16 @@ int main(int argc, char *argv[])
 	rc = options_config_file(argc, argv, "~/.osmocom/analog/radio.conf", handle_options);
 	if (rc < 0)
 		return 0;
+	options_from_command_line = 1;
 	argi = options_command_line(argc, argv, handle_options);
 	if (argi <= 0)
 		return argi;
+	/* no -f on the command line: the station is the defaults */
+	if (!num_stations) {
+		station0 = station_default;
+		num_stations = 1;
+	}
+	st = &station0;
 
 	if (st->frequency == 0.0) {
 		printf("No frequency given, I suggest to use 100000000 (100 MHz) and FM\n\n");
