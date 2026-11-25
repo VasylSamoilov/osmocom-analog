@@ -326,11 +326,16 @@ as audio x factor + 10 (linear resampler; + 16 polyphase), a safety
 estimate. On the linear path (the default) that capped value is not used:
 the count is then taken exactly (samplerate_upsample_output_num), here
 1440 audio x 5 (48 k wave, 240 k signal) = 7200, so nothing lost, a false
-alarm. Latent, not tested: with a rate ratio that is not an integer the
-exact count can be one above tosend; when tosend is the whole buffer that
-writes one sample past sendbuff (main.c, buffer_size x 2 floats). On the
-polyphase path the cap is the output limit; the audio it does not take is
-lost (a few samples). Parked.
+alarm. Measured offline (`~/.cache/sdrangel-rp-rates/upcount/up.c`: the
+same count and upsample calls, tosend = the buffer every call, 20000
+calls): 48 k -> 240 k never above tosend; 44.1 k -> 240 k, 32 k -> 240 k
+and 48 k -> 480 k (stereo / RDS) one sample above on the first call only
+(7201, 14401). There radio_tx() writes one IQ sample past sendbuff
+(main.c, buffer_size x 2 floats): a heap overrun of 8 bytes once at
+start, not yet seen in a run. Fix (not applied): on the linear path take
+audio_num from samplerate_upsample_input_num(), or lower it while the
+exact output count is above tosend. On the polyphase path the cap is the
+output limit; the audio it does not take is lost (a few samples). Parked.
 
 The shipped engine path in the bench (path e: the 48 k bank and the wide
 group on its chain, `bench_wide.c`, `KINDS=ce`): CPU as path c (1.92 M /
@@ -344,6 +349,41 @@ osmoradio on the backend takes its IQ rate from `--sdr-samplerate` (the
 backend's SDR rate) or `--channelizer-rate`; without them it is `-s`
 (100 k), too narrow for 75 kHz FM: it says so at start. Its IQ is at most
 1 (FM 1, AM bias + gain <= 1), so the 1 / N scaling keeps the sum in range.
+
+## Several broadcast stations (multi-station osmoradio, 2026-11-25)
+
+Today one osmoradio is one band channel; several stations are several
+osmoradio processes on the backend (each its own group at its rate, the
+wide ones on the chain, at most 4 chain channels per direction on the
+whole backend). One osmoradio with several stations (FM wide, AM, NFM:
+different rates) was postponed; it needs several groups per program
+(sdr_client_open and sdr_engine_group_add take one rate) and an
+in-process path with N IQ channels through the engine (channels = 0
+bypasses it today).
+
+The chain cost is per channel; for several wide channels a bank made for
+the wide rate. Bench `~/.cache/sdrangel-rp-rates/bench/bench_nwide.c`
+(CPU only, no device, one thread, this PC, % of a core RX / TX; channels
+400 kHz apart; quality as in bench_wide, the same primitives):
+
+| SDR | wide | stations | chain (one per station) | one bank for the wide rate |
+|---|---|---|---|---|
+| 9.6 M | 240 k | 1 | 8.9 / 8.8 | 12.2 / 13.8 |
+| 9.6 M | 240 k | 2 | 18.1 / 18.0 | 15.7 / 17.4 |
+| 9.6 M | 240 k | 4 | 36.4 / 36.3 | 19.0 / 18.4 |
+| 9.6 M | 240 k | 8 | 72.9 / 74.8 | 28.5 / 27.3 |
+| 9.6 M | 480 k | 1 | 10.1 / 10.7 | 15.0 / 17.1 |
+| 9.6 M | 480 k | 2 | 20.2 / 20.5 | 19.1 / 21.0 |
+| 9.6 M | 480 k | 4 | 40.5 / 42.0 | 29.2 / 30.2 |
+| 9.6 M | 480 k | 8 | 82.2 / 85.4 | 49.0 / 46.6 |
+| 3.84 M | 240 k | 1 | 3.5 / 3.7 | 6.4 / 7.4 |
+| 3.84 M | 240 k | 2 | 7.2 / 7.9 | 8.5 / 9.5 |
+| 3.84 M | 240 k | 4 | 15.7 / 15.8 | 12.8 / 13.3 |
+
+The chain is linear (about 9 % per station at 9.6 MS/s); the bank wins
+from 2 (240 k at 9.6 M) to 3 stations. So: one wide station on the
+chain as now; from 2 - 3 wide stations a second bank for the wide rate
+(path b of bench_wide) beside the 48 k bank.
 
 ## Open
 
