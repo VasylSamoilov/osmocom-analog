@@ -2233,19 +2233,17 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 		abort();
 	}
 
-	/* audio buffers: how many sample for audio (rounded down) */
-	/* audio buffers: how many sample for audio (rounded down) */
-	if (radio->use_polyphase) {
-		audio_num = polyphase_input_num(&radio->tx_polyphase[0], signal_num);
-	} else {
-		/* Original linear resampler */
-		audio_num = (int)((double)signal_num / radio->tx_resampler[0].factor);
-	}
+	/* audio samples: exactly those the resampler takes from its state to
+	 * give signal_num samples, so the signal is signal_num, never more
+	 * (the caller's buffer holds signal_num) */
+	if (radio->use_polyphase)
+		audio_num = polyphase_input_exact(&radio->tx_polyphase[0], signal_num);
+	else
+		audio_num = samplerate_upsample_input_num(&radio->tx_resampler[0], signal_num);
 
 	if (audio_num > radio->audio_buffer_size) {
-		/* Cap if too large, though this shouldn't happen with correct buffer sizing */
-		LOGP(DRADIO, LOGL_ERROR, "audio_num > audio_buffer_size (%d > %d), capping.\n", audio_num, radio->audio_buffer_size);
-		audio_num = radio->audio_buffer_size;
+		LOGP(DRADIO, LOGL_ERROR, "audio_num > audio_buffer_size (%d > %d), please fix!\n", audio_num, radio->audio_buffer_size);
+		abort();
 	}
 
 	/* Skip processing if no audio samples to process.
@@ -2259,18 +2257,6 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 	audio_samples[0] = radio->audio_buffer;
 	audio_samples[1] = radio->audio_buffer + radio->audio_buffer_size;
 
-	/* signal buffers: a bit more samples to be safe */
-	if (radio->use_polyphase) {
-		signal_num = polyphase_output_num(&radio->tx_polyphase[0], audio_num) + 16; /* +padding */
-	} else {
-		signal_num = (int)((double)audio_num * radio->tx_resampler[0].factor + 0.5) + 10;
-	}
-	
-	if (signal_num > radio->signal_buffer_size) {
-		/* This means we might overflow output buffer, but audio_num was capped? */
-		LOGP(DRADIO, LOGL_ERROR, "signal_num > signal_buffer_size (%d > %d), capping.\n", signal_num, radio->signal_buffer_size);
-		signal_num = radio->signal_buffer_size;
-	}
 	/* Use TX-only signal buffer */
 	signal_samples[0] = radio->tx_signal_buffer;
 	signal_samples[1] = radio->tx_signal_buffer + radio->signal_buffer_size;
@@ -2481,13 +2467,13 @@ int radio_tx(radio_t *radio, float *baseband, int signal_num)
 
 	/* upsample (or resample with polyphase) */
 	if (radio->use_polyphase) {
-		signal_num = polyphase_resample(&radio->tx_polyphase[0], audio_samples[0], audio_num, signal_samples[0], radio->signal_buffer_size);
+		signal_num = polyphase_resample(&radio->tx_polyphase[0], audio_samples[0], audio_num, signal_samples[0], signal_num);
 		if (radio->stereo)
-			polyphase_resample(&radio->tx_polyphase[1], audio_samples[1], audio_num, signal_samples[1], radio->signal_buffer_size);
+			polyphase_resample(&radio->tx_polyphase[1], audio_samples[1], audio_num, signal_samples[1], signal_num);
 			
 
 	} else {
-		signal_num = samplerate_upsample_output_num(&radio->tx_resampler[0], audio_num);
+		/* audio_num is what signal_num outputs take (input_num above) */
 		samplerate_upsample(&radio->tx_resampler[0], audio_samples[0], audio_num, signal_samples[0], signal_num);
 		if (radio->stereo)
 			samplerate_upsample(&radio->tx_resampler[1], audio_samples[1], audio_num, signal_samples[1], signal_num);

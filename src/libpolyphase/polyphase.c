@@ -227,6 +227,20 @@ int polyphase_input_num(polyphase_t *state, int output_num)
 	return (int)((long long)output_num * state->down / state->up) + 2;
 }
 
+/* The input polyphase_resample() takes to give exactly output_num samples
+ * from the current state (output_max = output_num): output n needs the
+ * input up to n * Q / P, so the last one (out_count + output_num - 1) needs
+ * that index + 1 inputs in all, less those already taken. */
+int polyphase_input_exact(polyphase_t *state, int output_num)
+{
+	long long need;
+
+	if (output_num <= 0)
+		return 0;
+	need = (state->out_count + output_num - 1) * state->down / state->up + 1 - state->in_count;
+	return (need > 0) ? (int)need : 0;
+}
+
 /* Resample mono audio using rational polyphase.
  *
  * For absolute output sample n:

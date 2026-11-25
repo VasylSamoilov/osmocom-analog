@@ -68,6 +68,10 @@ int polyphase_output_num(polyphase_t *state, int input_num);
 /* Calculate required input count for desired output count */
 int polyphase_input_num(polyphase_t *state, int output_num);
 
+/* Exact input count for exactly output_num output samples from the current
+ * state (polyphase_input_num is an upper bound for buffer sizes) */
+int polyphase_input_exact(polyphase_t *state, int output_num);
+
 /* Resample IQ (complex) samples.
  * I and Q are processed with identical timing. */
 int polyphase_resample_iq(polyphase_t *state, const sample_t *input_i,

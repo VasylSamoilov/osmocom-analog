@@ -332,10 +332,23 @@ calls): 48 k -> 240 k never above tosend; 44.1 k -> 240 k, 32 k -> 240 k
 and 48 k -> 480 k (stereo / RDS) one sample above on the first call only
 (7201, 14401). There radio_tx() writes one IQ sample past sendbuff
 (main.c, buffer_size x 2 floats): a heap overrun of 8 bytes once at
-start, not yet seen in a run. Fix (not applied): on the linear path take
-audio_num from samplerate_upsample_input_num(), or lower it while the
-exact output count is above tosend. On the polyphase path the cap is the
-output limit; the audio it does not take is lost (a few samples). Parked.
+start. Fixed: radio_tx() takes exactly the audio the resampler needs for
+the requested signal count from its state (linear:
+samplerate_upsample_input_num(); polyphase: the new
+polyphase_input_exact(), output limit = the request) and returns exactly
+the request; the estimate and its cap are gone. Harness
+`~/.cache/sdrangel-rp-rates/txfix` (the real radio.c, no SDR, ASan +
+UBSan, sendbuff exactly buffer_size x 2 as in main.c; waves 48 / 44.1 /
+32 k to 240 k, 48 k to 480 k stereo; requests full buffer, random, 1 - 12):
+before, ASan heap-buffer-overflow on sendbuff at 44.1 k, 32 k and 480 k;
+the polyphase path gave more than asked on every call that was not the
+whole buffer and, at the whole buffer, dropped 2 audio samples per call
+(the stream depends on how it is asked for). After: no ASan report, never
+more than asked, the same stream for full, random and 1 - 12 sample
+requests on both paths. Linear path with the test tone: bit-identical to
+before (full and random, 240 k and 480 k). A wave file is read ahead by a
+thread, so harness runs faster than real time are not repeatable: the
+A/B uses the test tone.
 
 The shipped engine path in the bench (path e: the 48 k bank and the wide
 group on its chain, `bench_wide.c`, `KINDS=ce`): CPU as path c (1.92 M /
