@@ -437,4 +437,31 @@ paging case runs 12 s
    on SoapySDR.
 6. The wide bank (in-process from the station list, backend option).
 7. Per-station retune.
-8. B210 run (cable loopback), after asking.
+8. B210 run (cable loopback) (done, 2026-11-26, the user allowed the
+   radio): b210_multi.sh (~/.cache/sdrangel-rp-rates/lo), the four
+   stations of 5d at 465.3 (FM stereo + RDS, 700 Hz), 466.1 (FM + RDS,
+   1000 Hz), 465.7 (AM, 1300 Hz), 465.6 MHz (NFM, 1900 Hz), each TX + RX
+   of itself, 1.92 MS/s, centre 465.7145 MHz, LO offset and bandwidth
+   automatic (3.99 MHz). SINAD (dB) in-process TX 60 / RX 10, all four
+   sending (two runs): S1 36.5 / 37.3, S2 57.3 / 58.1, S3 31.9 / 33.0, S4
+   37.9 / 38.8; on the backend (osmo-sdr-backend, osmoradio a client):
+   41.9 / 62.4 / 37.6 / 43.0 (the device's level differs per open by up
+   to 9 dB, see LO offset). RDS on air: each station only its PI (207 -
+   225 groups, at most one bad), in-process and on the backend, at every
+   gain tried. Alone (the others RX only) 43.2 / 61.0 / 41.7 / 54.8 - not a
+   level-fair reference on air: alone a station sends at full scale, with
+   four at 1/4 (-12 dB) against the receiver's noise; offline there was no
+   noise. Crosstalk on air (another station's tone in a station's audio),
+   all four sending, TX 60: -47 dB of the AM 1300 Hz in the NFM station
+   100 kHz away, the rest -58 .. -88 dB; alone those bins are -77 .. -90
+   dB, offline the bands' isolation is -145 dB or better. It grows with
+   the TX gain (AM in NFM: TX 50 / RX 20 -58.6, 55 / 15 -53.4, 60 / 10 -47.0
+   dB, ~1.2 dB per dB): the B210 transmitter's nonlinearity, the AM
+   envelope cross-modulating the others - an analog limit of four
+   carriers through one device at this level, not the software. SINAD
+   rises with the TX gain (the receiver's noise: S2 47.5 / 52.7 / 58.1 dB
+   at the three settings; TX 50 or 40 with RX 10 is below the FM threshold,
+   SINAD 10 - 18 dB, no RDS). The meter (xtalk.py) got a grid before its
+   golden section search: over a 9 s window |DFT| has sidelobes every
+   0.1 Hz, the search had landed on one (699.73 Hz for 700.00, -17.8 dB
+   for 36.6); the offline numbers all read the exact tone and stand.
