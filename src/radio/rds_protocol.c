@@ -2197,19 +2197,18 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 				 * rds_enc_set_rt() always toggles A/B.
 				 * If bit 0 = 0, we need to preserve the current A/B flag. */
 				uint8_t ab_toggle = config & 0x01;
-				uint8_t saved_ab = enc->rt_ab;
+				uint8_t saved_ab = rds_enc_get_rt_ab(enc);
 				memcpy(rt, data + 4, text_len);
 				rt[text_len] = '\0';
-				rds_enc_set_rt(enc, rt);
+				rds_enc_set_rt(enc, rt);	/* (from segment 0) */
 				if (!ab_toggle) {
 					/* Restore A/B flag — UECP source doesn't want toggle */
-					enc->rt_ab = saved_ab;
-					enc->rt_segment = 0;
+					rds_enc_set_rt_ab(enc, saved_ab);
 					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\" (A/B not toggled, flag=%c)\n",
 					     name, mec, rt, saved_ab ? 'B' : 'A');
 				} else {
 					LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): \"%s\" (A/B toggled %c->%c)\n",
-					     name, mec, rt, saved_ab ? 'B' : 'A', enc->rt_ab ? 'B' : 'A');
+					     name, mec, rt, saved_ab ? 'B' : 'A', rds_enc_get_rt_ab(enc) ? 'B' : 'A');
 				}
 			}
 		}
@@ -2371,11 +2370,10 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 				}
 			} else {
 				/* Main PSN: enable/disable EON globally */
-				enc->eon_enabled = (flags != 0) ? 1 : 0;
-				rds_enc_scheduler_update(enc);
+				rds_enc_eon_set_enabled(enc, flags != 0);
 				LOGP(DRADIO, LOGL_INFO, "UECP: Set %s (0x%02X): flags=0x%02X %s "
 				     "(PS=%d AF=%d Link=%d PTY=%d PIN=%d Bcast=%d TA=%d)\n",
-				     name, mec, flags, enc->eon_enabled ? "enabled" : "disabled",
+				     name, mec, flags, rds_enc_eon_get_enabled(enc) ? "enabled" : "disabled",
 				     !!(flags & RDS_EON_FLAG_PS), !!(flags & RDS_EON_FLAG_AF),
 				     !!(flags & RDS_EON_FLAG_LINK), !!(flags & RDS_EON_FLAG_PTY),
 				     !!(flags & RDS_EON_FLAG_PIN), !!(flags & RDS_EON_FLAG_BCAST),

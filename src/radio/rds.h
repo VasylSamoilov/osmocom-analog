@@ -2386,6 +2386,9 @@ int rds_enc_get_group_version_b(const rds_encoder_t *rds, int group);
 void rds_enc_restart(rds_encoder_t *rds);
 /* the EON entries from the first one */
 void rds_enc_eon_restart(rds_encoder_t *rds);
+/* EON (14A) sent at all */
+void rds_enc_eon_set_enabled(rds_encoder_t *rds, int enabled);
+int rds_enc_eon_get_enabled(const rds_encoder_t *rds);
 void rds_enc_get_di(const rds_encoder_t *rds, int *stereo, int *artificial, int *compressed, int *dynamic_pty);
 
 /* ============================================================

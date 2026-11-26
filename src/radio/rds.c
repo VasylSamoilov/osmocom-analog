@@ -7900,6 +7900,18 @@ void rds_enc_restart(rds_encoder_t *rds)
 	rds->ert.segment = 0;
 }
 
+/* EON (14A) sent at all (UECP EON enable flags of the main PSN) */
+void rds_enc_eon_set_enabled(rds_encoder_t *rds, int enabled)
+{
+	rds->eon_enabled = enabled ? 1 : 0;
+	rds_enc_scheduler_update(rds);
+}
+
+int rds_enc_eon_get_enabled(const rds_encoder_t *rds)
+{
+	return rds->eon_enabled;
+}
+
 /* The EON entries from the first one, variant 0 */
 void rds_enc_eon_restart(rds_encoder_t *rds)
 {
