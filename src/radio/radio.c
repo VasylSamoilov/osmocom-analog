@@ -1019,7 +1019,7 @@ static void rds_apply_preset(radio_t *radio)
 	rds_enc_set_ms(enc, p->ms);
 	
 	/* Update DI stereo flag based on broadcast mode (-S flag) */
-	enc->di_stereo = radio->stereo ? 1 : 0;
+	rds_enc_set_di_stereo(enc, radio->stereo);
 	
 	/* Update country codes using API (--rds-ecc overrides the preset) */
 	if (radio->opts.rds_ecc != 0) {
@@ -1056,7 +1056,7 @@ static void rds_apply_preset(radio_t *radio)
 	}
 	
 	/* Load Method A if no Method B */
-	if (enc->af_method_b.list_count == 0 && p->af_method_a_str && p->af_method_a_str[0]) {
+	if (rds_enc_af_method_b_get_list_count(enc) == 0 && p->af_method_a_str && p->af_method_a_str[0]) {
 		rds_enc_af_set_method_a(enc, p->af_method_a_str);
 	}
 	
@@ -1071,11 +1071,12 @@ static void rds_apply_preset(radio_t *radio)
 					rds_enc_eon_set_ta(enc, p->eon[i].pi, p->eon[i].ta);
 				}
 				
-				/* Find the entry we just added to set extended fields */
-				for (int j = 0; j < enc->eon_tx_count; j++) {
-					if (enc->eon_tx[j].pi == p->eon[i].pi) {
-						rds_eon_entry_t *eon = &enc->eon_tx[j];
-						
+				/* The entry we just added, to set extended fields */
+				{
+					rds_eon_entry_t *eon = rds_enc_eon_ensure(enc, p->eon[i].pi);
+
+					if (eon) {
+
 						/* AF (variant 4) - convert to 0.1 MHz format */
 						if (p->eon[i].af_count > 0) {
 							for (int k = 0; k < p->eon[i].af_count && k < RDS_EON_MAX_AF; k++) {
@@ -1104,20 +1105,16 @@ static void rds_apply_preset(radio_t *radio)
 						
 						/* Broadcaster data (variant 15) */
 						eon->broadcaster_data = p->eon[i].broadcaster_data;
-						break;
 					}
 				}
 			}
 		}
-		enc->eon_tx_index = 0;
-		enc->eon_tx_variant = 0;
+		rds_enc_eon_restart(enc);
 	}
-	
-	/* Reset PS segment to restart transmission */
-	enc->ps_segment = 0;
-	
-	/* Reset warmup mode: Group 0 only for ~5 seconds (57 groups @ 11.4/sec) */
-	enc->warmup_countdown = 57;
+
+	/* A new programme: PS and eRT from the first segment, group 0 only
+	 * for ~5 seconds (the warmup) */
+	rds_enc_restart(enc);
 	
 	/* --------------------------------------------------------
 	 * Group Version Selection (A vs B)
@@ -1126,26 +1123,31 @@ static void rds_apply_preset(radio_t *radio)
 	 * AUTO (0) = detect from data, A (1) = force A, B (2) = force B
 	 * -------------------------------------------------------- */
 	
-	/* Group 0: 0A (with AF) vs 0B (PI repeat, no AF) */
-	if (p->group0_version == RDS_GROUP_VERSION_AUTO)
-		enc->use_0b = (p->af_method_a_str == NULL || p->af_method_a_str[0] == '\0');  /* No AF -> 0B */
-	else
-		enc->use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
-	
-	/* Group 1: 1A (ECC/Lang/PIN) vs 1B (PIN only) */
-	if (enc->paging.enabled)
-		enc->use_1b = 0;  /* radio paging codes are only in 1A */
-	else if (p->group1_version == RDS_GROUP_VERSION_AUTO)
-		enc->use_1b = (enc->ecc == 0 && p->lang == 0);  /* No ECC/Lang -> 1B */
-	else
-		enc->use_1b = (p->group1_version == RDS_GROUP_VERSION_B);
-	
-	/* Group 2: 2A (64-char RT) vs 2B (32-char, faster) */
-	if (p->group2_version == RDS_GROUP_VERSION_AUTO) {
-		size_t rt_len = p->rt ? strlen(p->rt) : 0;
-		enc->use_2b = (rt_len > 0 && rt_len <= 32);  /* Short RT -> 2B */
-	} else {
-		enc->use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
+	{
+		int use_0b, use_1b, use_2b;
+
+		/* Group 0: 0A (with AF) vs 0B (PI repeat, no AF) */
+		if (p->group0_version == RDS_GROUP_VERSION_AUTO)
+			use_0b = (p->af_method_a_str == NULL || p->af_method_a_str[0] == '\0');  /* No AF -> 0B */
+		else
+			use_0b = (p->group0_version == RDS_GROUP_VERSION_B);
+
+		/* Group 1: 1A (ECC/Lang/PIN) vs 1B (PIN only) */
+		if (rds_enc_paging_get_enabled(enc))
+			use_1b = 0;  /* radio paging codes are only in 1A */
+		else if (p->group1_version == RDS_GROUP_VERSION_AUTO)
+			use_1b = (rds_enc_get_ecc(enc) == 0 && p->lang == 0);  /* No ECC/Lang -> 1B */
+		else
+			use_1b = (p->group1_version == RDS_GROUP_VERSION_B);
+
+		/* Group 2: 2A (64-char RT) vs 2B (32-char, faster) */
+		if (p->group2_version == RDS_GROUP_VERSION_AUTO) {
+			size_t rt_len = p->rt ? strlen(p->rt) : 0;
+			use_2b = (rt_len > 0 && rt_len <= 32);  /* Short RT -> 2B */
+		} else {
+			use_2b = (p->group2_version == RDS_GROUP_VERSION_B);
+		}
+		rds_enc_set_group_versions(enc, use_0b, use_1b, use_2b);
 	}
 	
 	/* Update RT+ (RadioText Plus) Configuration
@@ -1213,10 +1215,8 @@ static void rds_apply_preset(radio_t *radio)
 		rds_enc_ertplus_clear_tags(enc);
 	}
 	
-	/* Reset eRT segment counter to 0 on preset load
-	 * (redsea requires sequential byte reception starting from segment 0) */
-	enc->ert.segment = 0;
-	
+	/* (the eRT from segment 0: rds_enc_restart above) */
+
 	/* Update eRT (Enhanced RadioText) Configuration */
 	if (p->ert.enabled && p->ert.text) {
 		/* Register eRT ODA */
@@ -1241,10 +1241,10 @@ static void rds_apply_preset(radio_t *radio)
 	
 	/* Debug test mode */
 	LOGP(DRADIO, LOGL_INFO, "RDS Preset: %s (PI=%04X) Groups: %s/%s/%s\n",
-	     p->name, enc->pi,
-	     enc->use_0b ? "0B" : "0A",
-	     enc->use_1b ? "1B" : "1A",
-	     enc->use_2b ? "2B" : "2A");
+	     p->name, rds_enc_get_pi(enc),
+	     rds_enc_get_group_version_b(enc, 0) ? "0B" : "0A",
+	     rds_enc_get_group_version_b(enc, 1) ? "1B" : "1A",
+	     rds_enc_get_group_version_b(enc, 2) ? "2B" : "2A");
 	     
 	/* Rebuild group scheduler to reflect new configuration (e.g. enable/disable 10A PTYN) */
 	rds_enc_scheduler_update(enc);
@@ -1858,14 +1858,11 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 					pi, p->ps, p->rt, p->pty, p->ptyn);
 				
 				/* Set debug/verbose flags and DI flags before applying preset */
-				radio->rds_enc.debug = rds_debug;
-				radio->rds_enc.verbose = rds_verbose;
-				radio->rds_enc.di_stereo = stereo ? 1 : 0;
-				radio->rds_enc.di_artificial_head = radio->opts.rds_di_artificial_head;
-				radio->rds_enc.di_compressed = radio->opts.rds_di_compressed;
-				radio->rds_enc.di_dynamic_pty = radio->opts.rds_di_dynamic_pty;
-				radio->rds_enc.ta = radio->opts.rds_ta;
-				radio->rds_enc.ct_enabled = radio->opts.rds_ct;
+				rds_enc_set_logging(&radio->rds_enc, rds_debug, rds_verbose);
+				rds_enc_init_di(&radio->rds_enc, stereo, radio->opts.rds_di_artificial_head,
+						radio->opts.rds_di_compressed, radio->opts.rds_di_dynamic_pty);
+				rds_enc_set_ta(&radio->rds_enc, radio->opts.rds_ta);
+				rds_enc_set_ct_enabled(&radio->rds_enc, radio->opts.rds_ct);
 			} else {
 				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping encoder init (RX-only mode)\n");
 			}
@@ -2036,8 +2033,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 		/* Force A/B flags to 0 (group A) for initial transmission.
 		 * rds_apply_preset() toggles A/B to signal "new text" to receivers,
 		 * but on first load there's no previous text to distinguish from. */
-		radio->rds_enc.rt_ab = 0;
-		radio->rds_enc.ert.ab = 0;
+		rds_enc_set_rt_ab(&radio->rds_enc, 0);
+		rds_enc_set_ert_ab(&radio->rds_enc, 0);
 	}
 
 	return 0;

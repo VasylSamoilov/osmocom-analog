@@ -2091,6 +2091,7 @@ void rds_enc_rtplus_set_item_running(rds_encoder_t *rds, int running);
 
 /* Debug flip functions (keyboard shortcuts for testing) */
 void rds_enc_flip_rt_ab(rds_encoder_t *rds);
+void rds_enc_set_rt_ab(rds_encoder_t *rds, int ab);
 void rds_enc_flip_rtplus_item_running(rds_encoder_t *rds);
 void rds_enc_flip_rtplus_toggle(rds_encoder_t *rds);
 
@@ -2344,6 +2345,18 @@ int rds_enc_get_slc_variants(const rds_encoder_t *rds, int *variants, int max);
 
 /* DI (Decoder Information) - stereo, artificial_head, compressed, dynamic_pty flags */
 void rds_enc_set_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty);
+void rds_enc_set_di_stereo(rds_encoder_t *rds, int stereo);
+/* the DI flags at the start (no log line) */
+void rds_enc_init_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty);
+/* debug (raw codes) / verbose (interpretation) logging */
+void rds_enc_set_logging(rds_encoder_t *rds, int debug, int verbose);
+/* groups 0, 1, 2 as version B (1) or A (0) */
+void rds_enc_set_group_versions(rds_encoder_t *rds, int use_0b, int use_1b, int use_2b);
+int rds_enc_get_group_version_b(const rds_encoder_t *rds, int group);
+/* a new programme (preset): PS / eRT from the first segment, the warmup */
+void rds_enc_restart(rds_encoder_t *rds);
+/* the EON entries from the first one */
+void rds_enc_eon_restart(rds_encoder_t *rds);
 void rds_enc_get_di(const rds_encoder_t *rds, int *stereo, int *artificial, int *compressed, int *dynamic_pty);
 
 /* ============================================================

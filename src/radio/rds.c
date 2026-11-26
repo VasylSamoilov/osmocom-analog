@@ -7081,6 +7081,12 @@ void rds_enc_set_ert_ab(rds_encoder_t *rds, int ab)
 	rds->ert.ab = ab ? 1 : 0;
 }
 
+/* The RadioText A/B flag (rds_enc_flip_rt_ab toggles it for a new text) */
+void rds_enc_set_rt_ab(rds_encoder_t *rds, int ab)
+{
+	rds->rt_ab = ab ? 1 : 0;
+}
+
 int rds_enc_get_ert_ab(const rds_encoder_t *rds)
 {
 	return rds->ert.ab;
@@ -7793,6 +7799,65 @@ void rds_enc_set_ct_correction(rds_encoder_t *rds, time_t seconds)
 time_t rds_enc_get_ct_correction(const rds_encoder_t *rds)
 {
 	return rds ? rds->ct_correction : 0;
+}
+
+/* The encoder's own logging: debug (raw codes), verbose (interpretation) */
+void rds_enc_set_logging(rds_encoder_t *rds, int debug, int verbose)
+{
+	rds->debug = debug;
+	rds->verbose = verbose;
+}
+
+/* The DI flags at the start, before anything is sent (no log line, unlike
+ * rds_enc_set_di) */
+void rds_enc_init_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty)
+{
+	rds->di_stereo = stereo ? 1 : 0;
+	rds->di_artificial_head = artificial;
+	rds->di_compressed = compressed;
+	rds->di_dynamic_pty = dynamic_pty;
+}
+
+/* The DI stereo flag alone (the broadcast's stereo / mono) */
+void rds_enc_set_di_stereo(rds_encoder_t *rds, int stereo)
+{
+	rds->di_stereo = stereo ? 1 : 0;
+}
+
+/* Which version of groups 0, 1 and 2 to send (B: 0B PI repeat / no AF,
+ * 1B PIN only, 2B 32-character RadioText) */
+void rds_enc_set_group_versions(rds_encoder_t *rds, int use_0b, int use_1b, int use_2b)
+{
+	rds->use_0b = use_0b;
+	rds->use_1b = use_1b;
+	rds->use_2b = use_2b;
+}
+
+int rds_enc_get_group_version_b(const rds_encoder_t *rds, int group)
+{
+	switch (group) {
+	case 0: return rds->use_0b;
+	case 1: return rds->use_1b;
+	case 2: return rds->use_2b;
+	}
+	return 0;
+}
+
+/* A new programme (preset): the PS and the eRT from their first segment,
+ * group 0 only for the warmup (~5 s, 57 groups @ 11.4/s) */
+void rds_enc_restart(rds_encoder_t *rds)
+{
+	rds->ps_segment = 0;
+	rds->warmup_countdown = 57;
+	/* redsea requires sequential eRT byte reception starting from segment 0 */
+	rds->ert.segment = 0;
+}
+
+/* The EON entries from the first one, variant 0 */
+void rds_enc_eon_restart(rds_encoder_t *rds)
+{
+	rds->eon_tx_index = 0;
+	rds->eon_tx_variant = 0;
 }
 
 void rds_enc_set_di(rds_encoder_t *rds, int stereo, int artificial, int compressed, int dynamic_pty)

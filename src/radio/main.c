@@ -1550,9 +1550,9 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 	 * specified per-message. ni=1 requires cc and opc. */
 	if (ni) {
 		if (!country_code)
-			country_code = enc->paging.intl_country_code;
+			country_code = rds_enc_paging_get_cc(enc);
 		if (!opc)
-			opc = enc->paging.intl_opc;
+			opc = rds_enc_paging_get_opc(enc);
 		if (!country_code || !opc) {
 			LOGP(DRADIO, LOGL_ERROR,
 			     "RDS paging FIFO: ni=1 requires cc=NNN and opc=N "
