@@ -530,11 +530,12 @@ Layer split (agreed, in slices, each proven identical before the next):
    rds_change) to the display (rds_display_changed, its own state
    'shown') and a consumer (rds_decoder_set_change_callback): PTY, CT,
    the ECC vs RBDS check, a new PS, a finished 2A RadioText, the
-   station's paging system (RPC, block D SI, OPC, PAC). Left inline in
-   rds_decode_group (2313 lines): 44 DEBUG traces (decoder, stay), 63
-   INFO and 18 NOTICE, nearly all verbose decode traces (calls being
-   assembled, segments, 13A notification bits) - to the display still:
-   LPS, PTYN, EON (14A), the ODA registration (3A); the private TX log
-   and UECP decoders still a whole rds_decoder_t);
+   station's paging system (RPC, block D SI, OPC, PAC), 3i the long PS;
+   3j a decoder fed only groups or bits (TX log, UECP, osmordstest) is
+   made without a demodulator, rds_decoder_init_groups(). Done, with this
+   boundary: the display has the lines shown without --rds-verbose and
+   the state changes; the --rds-debug / --rds-verbose traces of what is
+   being decoded (segments, calls being assembled, ON-PS, 3A, 13A bits)
+   stay in the decoder, they are its trace, not a display);
 4. encoder: content sources (PS, RT, AF, paging queue, UECP, Dynamic
    PS) apart from the scheduler and the bit / biphase generator.
