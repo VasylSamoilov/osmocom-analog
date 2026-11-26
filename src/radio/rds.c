@@ -1215,16 +1215,16 @@ static int rds_paging_slot_ok(const rds_paging_enc_t *pag, uint32_t address, int
 }
 
 /* Number of groups a queued message takes on air, from the same encoder that
- * builds it. Only called while no message is transmitting: precompute uses
- * the TX block buffers and starts TX, both are reset here. */
+ * builds it - into a scratch state (the precompute writes only the tx_*
+ * buffers), so the call on air is never touched. */
 static int rds_paging_msg_groups(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 {
+	(void)pag;
 	if (!msg->ngroups) {
-		rds_paging_precompute(pag, msg);
-		msg->ngroups = (uint8_t)pag->tx_total_groups;
-		pag->tx_active = 0;
-		pag->tx_group_idx = 0;
-		pag->tx_total_groups = 0;
+		static rds_paging_enc_t scratch;
+
+		rds_paging_precompute(&scratch, msg);
+		msg->ngroups = (uint8_t)scratch.tx_total_groups;
 	}
 	return msg->ngroups;
 }
