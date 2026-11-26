@@ -560,3 +560,27 @@ Layer split (agreed, in slices, each proven identical before the next):
    own segment cursors (PS, RT, PTYN, AF, EON, TDC): running state of each
    group type, kept with it. Left: the paging queue (application) and its
    interval / slot timing (protocol) are one piece of code.
+
+Ownership (after an architecture review): the decoder and the encoder
+each give out through one sink, the station owns the rest.
+- RX: f6c099f rds_decoder_sink_t (bit, group + present blocks, a received
+  field, a paging message, TDC / IH / TMC, a new station, the 30 s
+  report); the station's rds_rx_app_t (radio_t.rds_app) has the hexrds /
+  bitstream files, the display and its 'shown' state, the servers' and
+  consumers' callbacks. 18c9be9 the last display lines out (CT delta,
+  paging auto detection); check: a decoder without a sink fed the
+  captures (nosink.c) logs only its FEC table line. 82a4c94 the panel's
+  colour is the caller's, the status dump the sink's.
+- TX: 73e49ce rds_encoder_sink_t (a group sent, a sent paging call); the
+  station's rds_tx_app_t (radio_t.rds_tx_app) has the sent calls' display
+  and consumer and the TX monitor (a group-only decoder with its display,
+  on with a TX file); the encoder owns no decoder.
+- Paging TX timing is covered by the harness: a group duration changed
+  (RDS_PAGING_GROUP_US) shows in 'paging' and 'scan'.
+Next: the paging queue as a station-owned source (the queue walk, send
+times, repeats, the scan and the FIFO; the encoder asks it for the next
+call that may start now and keeps the markers, windows, 13A, A/B and the
+call counter), then rds.c split into layer files (allowed as an exact
+move by line range). Found, not fixed yet: on the bit path a lost block
+keeps the previous group's status, the servers get it with the group (the
+hexrds file uses the present mask and is right).
