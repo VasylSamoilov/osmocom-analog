@@ -9735,6 +9735,16 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 			LOGP(DRADIO, LOGL_NOTICE, "RDS PS changed:   \"%s\" (#%d)\n", ps_display, rds->ps_changes);
 		break;
 	}
+	case RDS_CHANGE_RT_2A_END:
+		/* the completed RT about to be replaced (if any) */
+		if (rds->rt_2a[0] != ' ' && rds->rt_2a[0] != '\0') {
+			char rt_disp[256];
+
+			rds_text_to_display((const uint8_t *)rds->rt_2a, 64, rt_disp, sizeof(rt_disp));
+			LOGP(DRADIO, LOGL_INFO, "RDS RT: \"%s\" (2A, A/B=%c)\n",
+			     rt_disp, rds->rt_2a_ab ? 'B' : 'A');
+		}
+		break;
 	case RDS_CHANGE_ECC:
 		/* ECC vs mode mismatch (once, only for valid ECCs) */
 		if (!shown->ecc_mismatch && rds_is_valid_ecc(rds->ecc)) {
@@ -10488,15 +10498,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 			
 			/* Check A/B flag change for 2A buffer */
 			if (ab_flag != rds->rt_2a_ab) {
-				/* A/B flip = new RadioText message starting.
-				 * Log the completed RT we are about to replace (if any). */
-				if (rds->rt_2a[0] != ' ' && rds->rt_2a[0] != '\0') {
-					char rt_disp[256];
-					rds_text_to_display((uint8_t *)rds->rt_2a, 64,
-					                    rt_disp, sizeof(rt_disp));
-					LOGP(DRADIO, LOGL_INFO, "RDS RT: \"%s\" (2A, A/B=%c)\n",
-					     rt_disp, rds->rt_2a_ab ? 'B' : 'A');
-				}
+				/* A/B flip = new RadioText message starting: the one
+				 * received so far is done (still in rt_2a) */
+				rds_changed(rds, RDS_CHANGE_RT_2A_END);
 				rds->rt_2a_ab = ab_flag;
 				rds->rt_2a_segments = 0;
 				memset(rds->rt_2a, ' ', 64);

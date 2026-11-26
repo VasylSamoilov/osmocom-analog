@@ -2511,6 +2511,8 @@ enum rds_change {
 	RDS_CHANGE_CT,		/* a 4A: clock time (rds->ct_*) */
 	RDS_CHANGE_ECC,		/* a 1A variant 0: ECC (rds->ecc) */
 	RDS_CHANGE_PS,		/* a complete PS other than the last one (rds->ps, ps_changes) */
+	RDS_CHANGE_RT_2A_END,	/* a 2A A/B flip: the RadioText so far (rds->rt_2a, rt_2a_ab)
+				 * is done, before the new one clears it */
 };
 
 struct rds_decoder;
