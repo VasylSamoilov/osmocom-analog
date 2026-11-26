@@ -123,6 +123,7 @@ AC_CONFIG_FILES([src/liblogging/Makefile
     src/eurosignal/Makefile
     src/pocsag/Makefile
     src/flex/Makefile
+    src/ermes/Makefile
     src/golay/Makefile
     src/mobitex/Makefile
     src/fuenf/Makefile

@@ -16,7 +16,7 @@
  *   RDS:    8-bit (256 codes) — IEC 62106 Annex E and pager variants
  *
  * Each codepage is identified by four fields:
- *   protocol - paging protocol ("pocsag", "flex", "golay", "rds")
+ *   protocol - paging protocol ("pocsag", "flex", "golay", "ermes", "rds")
  *   vendor   - pager manufacturer ("motorola", "philips", "generic", "nokia", ...)
  *   model    - pager model or family ("advisor-linguist", "prg2220", "nkp2", ...)
  *   charset  - character set description ("ascii", "latin-german", "annex-e", ...)
@@ -170,6 +170,8 @@ extern const struct pager_charset pager_charset_pocsag_nec_skyper_ascii_rot1;
 /* --- Built-in Golay/GSC codepages (6-bit, 64 codes) --- */
 
 extern const struct pager_charset pager_charset_golay_generic_generic_ascii;
+extern const struct pager_charset pager_charset_ermes_generic_generic_standard;
+extern const struct pager_charset pager_charset_ermes_generic_generic_numeric;
 
 /* --- Built-in FLEX codepages (7-bit, 128 codes) --- */
 

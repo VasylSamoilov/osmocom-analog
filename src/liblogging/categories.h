@@ -18,6 +18,7 @@ enum {
 	DPOCSAG,
 	DFLEX,
 	DGOLAY,
+	DERMES,
 	DFUENF,
 	DFRAME,
 	DCALL,

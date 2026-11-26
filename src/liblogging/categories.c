@@ -96,6 +96,11 @@ struct log_info_cat log_categories[] = {
 		.description = "Golay",
 		.color = "\033[1;34m",
 	},
+	[DERMES] = {
+		.name = "DERMES",
+		.description = "ERMES",
+		.color = "\033[1;34m",
+	},
 	[DFUENF] = {
 		.name = "DFUENF",
 		.description = "5-Ton-Folge",

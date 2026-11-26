@@ -25,7 +25,8 @@ noinst_PROGRAMS = \
 	test_echo_analysis_final_checkpoint \
 	test_amps_orders \
 	test_amps_rx \
-	test_amps_states
+	test_amps_states \
+	test_ermes_code
 
 test_filter_SOURCES = test_filter.c dummy.c
 
@@ -354,3 +355,9 @@ endif
 test_amps_states_SOURCES = test_amps_states.c ../amps/amps_stations.c ../amps/amps_image.c
 
 test_amps_states_LDADD = $(test_amps_rx_LDADD)
+
+test_ermes_code_SOURCES = test_ermes_code.c ../ermes/code.c ../ermes/frame.c
+
+test_ermes_code_LDADD = \
+	$(top_builddir)/src/libpagercharset/libpagercharset.a \
+	-lm

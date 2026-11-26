@@ -62,6 +62,7 @@ SUBDIRS += \
 	eurosignal \
 	pocsag \
 	flex \
+	ermes \
 	golay \
 	mobitex \
 	fuenf \

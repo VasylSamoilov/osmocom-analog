@@ -39,6 +39,7 @@ src/eurosignal/eurosignal
 src/pocsag/pocsag
 src/flex/flexpager
 src/golay/golay
+src/ermes/ermes
 src/fuenf/5-ton-folge
 src/tv/osmotv
 src/radio/osmoradio
