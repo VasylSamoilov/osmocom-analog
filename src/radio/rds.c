@@ -4932,6 +4932,15 @@ void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 	rds->tmc_callback_arg = arg;
 }
 
+void rds_decoder_set_paging_callback(rds_decoder_t *rds,
+				     void (*fn)(const rds_paging_dec_t *pd, void *arg),
+				     void *arg)
+{
+	if (!rds) return;
+	rds->paging_callback     = fn;
+	rds->paging_callback_arg = arg;
+}
+
 uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds)
 {
 	return rds ? rds->tmc_ltn : 0;
@@ -9652,6 +9661,54 @@ static void rds_group_received(rds_decoder_t *rds)
 	rds->groups_received++;
 }
 
+/* A paging message is complete (pd->last_*, the decoder's record of it):
+ * to the display (the log) and to the consumer (rds_decoder_set_paging_callback) */
+static void rds_paging_received(rds_decoder_t *rds, uint8_t ab_flag)
+{
+	const rds_paging_dec_t *pd = &rds->paging_dec;
+	uint32_t a = pd->last_address;
+	const char *cname = mcc_name(pd->last_country_code);
+
+	switch (pd->last_type) {
+	case RDS_PAGING_TONE:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: TONE addr=%02u-%04u flag=%s tone=%d tx=%s cnt=%d\n",
+		     a / 10000, a % 10000, PAG_AB(ab_flag),
+		     pd->last_tonetype, PAG_R(pd->last_r_flag), pd->last_call_counter);
+		break;
+	case RDS_PAGING_NUM10:
+	case RDS_PAGING_NUM18:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u len=%d msg=\"%s\"\n",
+		     (pd->last_type == RDS_PAGING_NUM10) ? "NUM10" : "NUM18",
+		     a / 10000, a % 10000, pd->last_msg_len, pd->last_msg);
+		break;
+	case RDS_PAGING_INTL15:
+	case RDS_PAGING_INTLFUNC:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u MCC=%d(%s) msg=\"%s\"\n",
+		     (pd->last_type == RDS_PAGING_INTL15) ? "INTL15" : "INTLFUNC",
+		     a / 10000, a % 10000, pd->last_country_code, cname ? cname : "?", pd->last_msg);
+		break;
+	default: {	/* ALPHA, VNUM, FUNCTIONS */
+		char alpha_disp[RDS_PAGING_DISP_SIZE];
+		const char *msg = pd->last_msg;
+
+		if (pd->last_type == RDS_PAGING_ALPHA) {
+			rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, alpha_disp, sizeof(alpha_disp));
+			msg = alpha_disp;
+		}
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
+		     rds_paging_type_name(pd->last_type),
+		     a / 10000, a % 10000, pd->last_msg_len,
+		     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter, msg);
+		if (pd->last_ni && pd->last_country_code)
+			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX:   international: MCC=%d (%s) OPC=%d\n",
+			     pd->last_country_code, cname ? cname : "unknown", pd->last_opc);
+	}
+	}
+
+	if (rds->paging_callback)
+		rds->paging_callback(pd, rds->paging_callback_arg);
+}
+
 static void rds_decode_group(rds_decoder_t *rds)
 {
 	uint16_t pi = rds->blocks[0];
@@ -10739,9 +10796,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->last_r_flag = (ctrl >> RDS_PAGING_CTRL_R_BIT) & 1;
 			pd->last_call_counter = ctrl & 0x0F;
 			pd->last_ni = 0;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: TONE addr=%02u-%04u flag=%s tone=%d tx=%s cnt=%d\n",
-			     addr / 10000, addr % 10000, PAG_AB(ab_flag),
-			     pd->last_tonetype, PAG_R(pd->last_r_flag), pd->last_call_counter);
+			rds_paging_received(rds, ab_flag);
 			break;
 		}
 		case RDS_7A_PSAC_NUM10_ADDR: {
@@ -10790,10 +10845,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				pd->last_address = pd->address;
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
-				const char *cname = mcc_name(pd->last_country_code);
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: INTLFUNC addr=%02u-%04u MCC=%d(%s) msg=\"%s\"\n",
-				     pd->address / 10000, pd->address % 10000,
-				     pd->last_country_code, cname ? cname : "?", pd->last_msg);
+				rds_paging_received(rds, ab_flag);
 				break;
 			}
 			/* 10-digit numeric: data group (8 digits) */
@@ -10817,8 +10869,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 			pd->last_address = pd->address;
 			memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 			pd->last_msg_len = pd->msg_len;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM10 addr=%02u-%04u len=%d msg=\"%s\"\n",
-			     pd->address / 10000, pd->address % 10000, pd->last_msg_len, pd->last_msg);
+			rds_paging_received(rds, ab_flag);
 			break;
 		}
 		case RDS_7A_PSAC_NUM18_ADDR: {
@@ -10880,10 +10931,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 					pd->last_address = pd->address;
 					memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 					pd->last_msg_len = pd->msg_len;
-					const char *cname = mcc_name(pd->last_country_code);
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: INTL15 addr=%02u-%04u MCC=%d(%s) msg=\"%s\"\n",
-					     pd->address / 10000, pd->address % 10000,
-					     pd->last_country_code, cname ? cname : "?", pd->last_msg);
+					rds_paging_received(rds, ab_flag);
 				}
 				break;
 			}
@@ -10917,8 +10965,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				pd->last_address = pd->address;
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: NUM18 addr=%02u-%04u len=%d msg=\"%s\"\n",
-				     pd->address / 10000, pd->address % 10000, pd->last_msg_len, pd->last_msg);
+				rds_paging_received(rds, ab_flag);
 			} else {
 				pd->expected_psac = RDS_7A_PSAC_NUM18_DATA2;
 				if (rds->verbose) {
@@ -11001,15 +11048,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				pd->last_address = pd->address;
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
-				LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
-				     rds_paging_type_name(pd->last_type),
-				     pd->address / 10000, pd->address % 10000, pd->last_msg_len,
-				     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter, pd->last_msg);
-				if (pd->last_ni && pd->last_country_code) {
-					const char *cname = mcc_name(pd->last_country_code);
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX:   international: MCC=%d (%s) OPC=%d\n",
-					     pd->last_country_code, cname ? cname : "unknown", pd->last_opc);
-				}
+				rds_paging_received(rds, ab_flag);
 			} else {
 				/* Alpha: extract up to 4 characters from blocks C and D */
 				if (rds_paging_dec_room(pd, 4)) {
@@ -11029,19 +11068,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				pd->last_address = pd->address;
 				memcpy(pd->last_msg, pd->msg_buf, pd->msg_len + 1);
 				pd->last_msg_len = pd->msg_len;
-				{
-					char alpha_disp[RDS_PAGING_DISP_SIZE];
-					rds_text_to_display((uint8_t *)pd->last_msg, pd->last_msg_len, alpha_disp, sizeof(alpha_disp));
-					LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX: %s addr=%02u-%04u len=%d %s tx=%s cnt=%d msg=\"%s\"\n",
-					     rds_paging_type_name(pd->last_type),
-					     pd->address / 10000, pd->address % 10000, pd->last_msg_len,
-					     PAG_NI(pd->last_ni), PAG_R(pd->last_r_flag), pd->last_call_counter, alpha_disp);
-					if (pd->last_ni && pd->last_country_code) {
-						const char *cname = mcc_name(pd->last_country_code);
-						LOGP(DRADIO, LOGL_NOTICE, "RDS Paging RX:   international: MCC=%d (%s) OPC=%d\n",
-						     pd->last_country_code, cname ? cname : "unknown", pd->last_opc);
-					}
-				}
+				rds_paging_received(rds, ab_flag);
 			}
 			break;
 		}
@@ -12318,6 +12345,8 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	void *ih_callback_arg = rds->ih_callback_arg;
 	void (*tmc_callback)(const rds_tmc_msg_t *, void *) = rds->tmc_callback;
 	void *tmc_callback_arg = rds->tmc_callback_arg;
+	void (*paging_callback)(const rds_paging_dec_t *, void *) = rds->paging_callback;
+	void *paging_callback_arg = rds->paging_callback_arg;
 	int paging_mode = rds->paging_mode;
 	int paging_timeout_sec = rds->paging_dec.timeout_sec;
 
@@ -12364,6 +12393,8 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	rds->ih_callback_arg = ih_callback_arg;
 	rds->tmc_callback = tmc_callback;
 	rds->tmc_callback_arg = tmc_callback_arg;
+	rds->paging_callback = paging_callback;
+	rds->paging_callback_arg = paging_callback_arg;
 	/* the receiver's paging setting stays; auto detects the new station again */
 	rds->paging_mode = paging_mode;
 	rds->paging_enabled = (paging_mode == RDS_RX_PAGING_ON);

@@ -2797,6 +2797,10 @@ typedef struct rds_decoder {
 	 * msg contains the extracted T/F/DP/direction/extent/event/location fields. */
 	void		(*tmc_callback)(const rds_tmc_msg_t *msg, void *arg);
 	void		*tmc_callback_arg;
+	/* Group 7A: a complete paging message (paging_dec.last_*), after its
+	 * log line (rds_decoder_set_paging_callback) */
+	void		(*paging_callback)(const rds_paging_dec_t *pd, void *arg);
+	void		*paging_callback_arg;
 	struct {
 		int      pending;       /* 1 = multi-group assembly in progress */
 		uint8_t  ci;            /* continuity index of current multi-group message */
@@ -3001,6 +3005,11 @@ void rds_enc_tmc_get_msg(const rds_encoder_t *rds, rds_tmc_msg_t *msg_out);
 void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
 				  void *arg);
+/* A complete received paging message to a consumer (pd->last_type,
+ * last_address, last_msg, last_ni, last_country_code, ...) */
+void rds_decoder_set_paging_callback(rds_decoder_t *rds,
+				     void (*fn)(const rds_paging_dec_t *pd, void *arg),
+				     void *arg);
 /* Get the TMC Location Table Number announced via 3A system-info (0 = encrypted) */
 uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds);
 
