@@ -2511,34 +2511,72 @@ typedef struct rds_decoder {
 	int		verbose;	/* verbose logging (human-readable) */
 	int		force_rbds;	/* force RBDS decoding (--rbds flag) */
 	double		time_constant_us; /* de-emphasis time constant (50=RDS, 75=RBDS) */
-	int		rbds_hint_logged; /* 1 after emphasis/mode mismatch hint logged */
-	int		ecc_mismatch_logged; /* 1 after ECC vs mode mismatch logged */
-	
-	/* Tunable State */
+	double		status_interval;	/* status dump every (samples) */
+	double		signal_debug_interval;	/* signal debug report every (samples) */
+	int		paging_mode;		/* RDS_RX_PAGING_OFF / _AUTO / _ON */
+
+	/* Application: where the decoded groups and messages go */
+	FILE		*hexrds_file;		/* Output file for .hexrds format */
+	FILE		*bitstream_file;	/* Output file for .rds bitstream format */
+	uint8_t		bitstream_byte;		/* Accumulator for bitstream output */
+	int		bitstream_bit_count;	/* Bits accumulated (0-7) */
+
+	/* Protocol server callback (for XDR-GTK, RDS Spy output) */
+	void		(*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg);
+	void		*group_callback_arg;
+
+	/* Group 5: Transparent Data Channel (TDC) receive callback
+	 * Called for every 5A/5B group with: channel (0-31), data bytes, length (4 or 2) */
+	void		(*tdc_callback)(uint8_t channel, const uint8_t *data, int len, void *arg);
+	void		*tdc_callback_arg;
+
+	/* Group 6: In-House application receive callback
+	 * Called for every 6A/6B group with: b_payload (5 bits), is_6b, c_data, d_data */
+	void		(*ih_callback)(uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data, void *arg);
+	void		*ih_callback_arg;
+
+	/* Group 8A: TMC (Traffic Message Channel) receive callback
+	 * Called when a single-group or complete multi-group user message is decoded.
+	 * msg contains the extracted T/F/DP/direction/extent/event/location fields. */
+	void		(*tmc_callback)(const rds_tmc_msg_t *msg, void *arg);
+	void		*tmc_callback_arg;
+
+	/* Group 7A: a complete paging message, after its log line
+	 * (rds_decoder_set_paging_callback) */
+	void		(*paging_callback)(const rds_paging_rx_msg_t *msg, void *arg);
+	void		*paging_callback_arg;
+
+	/* DSP continuity: the demodulator goes on through a new station */
 	double		freq_subcarrier;	/* Current locked frequency (~57000 Hz) */
-	double		phase_subcarrier;	/* Current subcarrier phase (0..2pi) */
-	
-	/* PLL */
 	rds_iir_filter_t	filter_pll;	/* Loop filter for PLL */
 	rds_iir_filter_t	filter_2400_i;	/* 2.4kHz LPF for I */
 	rds_iir_filter_t	filter_2400_q;	/* 2.4kHz LPF for Q */
-	
 	/* AGC for Costas PLL (normalizes baseband level so error signal is meaningful) */
 	double		agc_gain;		/* Current AGC gain */
 	double		agc_alpha;		/* AGC smoothing constant */
-	
+	/* Pre-decimation: integer stride to reduce per-sample DSP work.
+	 * No anti-alias LPF needed: FM baseband above 100 kHz is noise floor
+	 * (pilot=19k, stereo=38k, RDS=57k, SCA=67/92k). The internal 2.4 kHz
+	 * LPF and Costas PLL reject any aliased noise. */
+	int		pre_dec_n;		/* Stride factor (sr / 200kHz, min 1) */
+
+	/*
+	 * Everything above is kept by rds_decoder_reset() (a retune: a new
+	 * station, not a new decoder); everything from here on is what was
+	 * received, cleared by it (RDS_DECODER_RECEIVED).
+	 */
+	int		rbds_hint_logged; /* 1 after emphasis/mode mismatch hint logged */
+	int		ecc_mismatch_logged; /* 1 after ECC vs mode mismatch logged */
+
+	/* Tunable State */
+	double		phase_subcarrier;	/* Current subcarrier phase (0..2pi) */
+
 	/* Clock Recovery (direct 1187.5 Hz oscillator) */
 	double		clock_phi;		/* Bit clock phase (0..2pi) */
 	int		prev_clock_bit;		/* Previous clock level (+1/-1) */
 	double		prev_bb_sample;		/* Previous baseband sample (for zero cross) */
 	double		integrator;		/* Integrate-and-dump accumulator */
 	int		decimate_counter;	/* Decimation counter (per-instance) */
-
-	/* Pre-decimation: integer stride to reduce per-sample DSP work.
-	 * No anti-alias LPF needed: FM baseband above 100 kHz is noise floor
-	 * (pilot=19k, stereo=38k, RDS=57k, SCA=67/92k). The internal 2.4 kHz
-	 * LPF and Costas PLL reject any aliased noise. */
-	int		pre_dec_n;		/* Stride factor (sr / 200kHz, min 1) */
 
 	/* PLL Lock Detection (RdsSurveyor2-style) */
 	double		lock_sum_i;		/* Running sum of |bb_i| at symbol dumps */
@@ -2747,7 +2785,6 @@ typedef struct rds_decoder {
 	uint16_t	on_pin;			/* PIN of ON */
 	
 	/* Radio Paging (EN 50067 Annex M) - Group 7A, 1A RPC, 13A */
-	int		paging_mode;		/* RDS_RX_PAGING_OFF / _AUTO / _ON (kept on reset) */
 	int		paging_enabled;		/* Paging decoded now: mode on, or auto and
 						 * the station signals paging (1A RPC) */
 	int		paging_seen;		/* auto: 1A in a row signalling paging (> 0)
@@ -2756,11 +2793,9 @@ typedef struct rds_decoder {
 	
 	/* Status timing */
 	double		status_timer;
-	double		status_interval;
-	
+
 	/* Signal-level debug instrumentation */
 	double		signal_debug_timer;
-	double		signal_debug_interval;
 	double		sig_bb_i_peak;		/* Peak baseband I since last report */
 	double		sig_bb_q_peak;		/* Peak baseband Q since last report */
 	double		sig_bb_i_sum;		/* Sum of |bb_i| for average */
@@ -2788,35 +2823,6 @@ typedef struct rds_decoder {
 	int		sig_eye_weak;		/* Low-confidence symbol decisions */
 	int		sig_biphase_err[2];	/* Biphase error counts [frame0, frame1] */
 	
-	/* File output for captured RDS data */
-	FILE		*hexrds_file;		/* Output file for .hexrds format */
-	FILE		*bitstream_file;	/* Output file for .rds bitstream format */
-	uint8_t		bitstream_byte;		/* Accumulator for bitstream output */
-	int		bitstream_bit_count;	/* Bits accumulated (0-7) */
-	
-	/* Protocol server callback (for XDR-GTK, RDS Spy output) */
-	void		(*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg);
-	void		*group_callback_arg;
-
-	/* Group 5: Transparent Data Channel (TDC) receive callback
-	 * Called for every 5A/5B group with: channel (0-31), data bytes, length (4 or 2) */
-	void		(*tdc_callback)(uint8_t channel, const uint8_t *data, int len, void *arg);
-	void		*tdc_callback_arg;
-
-	/* Group 6: In-House application receive callback
-	 * Called for every 6A/6B group with: b_payload (5 bits), is_6b, c_data, d_data */
-	void		(*ih_callback)(uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data, void *arg);
-	void		*ih_callback_arg;
-
-	/* Group 8A: TMC (Traffic Message Channel) receive callback
-	 * Called when a single-group or complete multi-group user message is decoded.
-	 * msg contains the extracted T/F/DP/direction/extent/event/location fields. */
-	void		(*tmc_callback)(const rds_tmc_msg_t *msg, void *arg);
-	void		*tmc_callback_arg;
-	/* Group 7A: a complete paging message, after its log line
-	 * (rds_decoder_set_paging_callback) */
-	void		(*paging_callback)(const rds_paging_rx_msg_t *msg, void *arg);
-	void		*paging_callback_arg;
 	struct {
 		int      pending;       /* 1 = multi-group assembly in progress */
 		uint8_t  ci;            /* continuity index of current multi-group message */
@@ -2837,6 +2843,9 @@ typedef struct rds_decoder {
 	uint8_t		tmc_ltn;             /* Location Table Number (0=encrypted, 1-63=national) */
 
 } rds_decoder_t;
+
+/* The first field of what was received (rds_decoder_reset clears from it) */
+#define RDS_DECODER_RECEIVED	rbds_hint_logged
 
 /* Initialize RDS decoder
  * debug: Enable debug logging (raw hex codes, --rds-debug)

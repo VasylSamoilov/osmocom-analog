@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12350,56 +12351,13 @@ void rds_decoder_set_paging(rds_decoder_t *rds, int mode)
 
 void rds_decoder_reset(rds_decoder_t *rds)
 {
-	/* Preserve DSP configuration */
-	double samplerate = rds->samplerate;
-	int debug = rds->debug;
-	int verbose = rds->verbose;
-	int force_rbds = rds->force_rbds;
-	double time_constant_us = rds->time_constant_us;
-	
-	/* Preserve callbacks */
-	void (*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg) = rds->group_callback;
-	void *group_callback_arg = rds->group_callback_arg;
-	
-	/* Preserve the other callbacks and the station's RX settings (a reset
-	 * is a new station on the air, not a new decoder: they were lost) */
-	void (*tdc_callback)(uint8_t, const uint8_t *, int, void *) = rds->tdc_callback;
-	void *tdc_callback_arg = rds->tdc_callback_arg;
-	void (*ih_callback)(uint8_t, int, uint16_t, uint16_t, void *) = rds->ih_callback;
-	void *ih_callback_arg = rds->ih_callback_arg;
-	void (*tmc_callback)(const rds_tmc_msg_t *, void *) = rds->tmc_callback;
-	void *tmc_callback_arg = rds->tmc_callback_arg;
-	void (*paging_callback)(const rds_paging_rx_msg_t *, void *) = rds->paging_callback;
-	void *paging_callback_arg = rds->paging_callback_arg;
-	int paging_mode = rds->paging_mode;
+	/* the reassembly timeout, a setting inside the paging decode state */
 	int paging_timeout_sec = rds->paging_dec.timeout_sec;
+	size_t kept = offsetof(rds_decoder_t, RDS_DECODER_RECEIVED);
 
-	/* Preserve file handles (and the bitstream file's partial byte) */
-	FILE *hexrds_file = rds->hexrds_file;
-	FILE *bitstream_file = rds->bitstream_file;
-	uint8_t bitstream_byte = rds->bitstream_byte;
-	int bitstream_bit_count = rds->bitstream_bit_count;
-
-	/* Preserve filter state (DSP continuity) */
-	rds_iir_filter_t filter_2400_i = rds->filter_2400_i;
-	rds_iir_filter_t filter_2400_q = rds->filter_2400_q;
-	rds_iir_filter_t filter_pll = rds->filter_pll;
-	int pre_dec_n = rds->pre_dec_n;
-	double agc_gain = rds->agc_gain;
-	double agc_alpha = rds->agc_alpha;
-	double freq_subcarrier = rds->freq_subcarrier;
-	double status_interval = rds->status_interval;
-	double signal_debug_interval = rds->signal_debug_interval;
-	
-	/* Clear all decoder state */
-	memset(rds, 0, sizeof(*rds));
-	
-	/* Restore DSP configuration */
-	rds->samplerate = samplerate;
-	rds->debug = debug;
-	rds->verbose = verbose;
-	rds->force_rbds = force_rbds;
-	rds->time_constant_us = time_constant_us;
+	/* Clear what was received; the configuration, the application side
+	 * (files, callbacks) and the DSP continuity stay (rds.h) */
+	memset((char *)rds + kept, 0, sizeof(*rds) - kept);
 
 	/* Reset change-detection sentinels (new stream = fire INFO on first decode) */
 	rds->ansi_display    = isatty(fileno(stdout));
@@ -12407,39 +12365,9 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	rds->ct_shown_hour   = 0xFF;
 	rds->ct_shown_minute = 0xFF;
 
-	/* Restore callbacks */
-	rds->group_callback = group_callback;
-	rds->group_callback_arg = group_callback_arg;
-	
-	rds->tdc_callback = tdc_callback;
-	rds->tdc_callback_arg = tdc_callback_arg;
-	rds->ih_callback = ih_callback;
-	rds->ih_callback_arg = ih_callback_arg;
-	rds->tmc_callback = tmc_callback;
-	rds->tmc_callback_arg = tmc_callback_arg;
-	rds->paging_callback = paging_callback;
-	rds->paging_callback_arg = paging_callback_arg;
 	/* the receiver's paging setting stays; auto detects the new station again */
-	rds->paging_mode = paging_mode;
-	rds->paging_enabled = (paging_mode == RDS_RX_PAGING_ON);
+	rds->paging_enabled = (rds->paging_mode == RDS_RX_PAGING_ON);
 
-	/* Restore file handles */
-	rds->hexrds_file = hexrds_file;
-	rds->bitstream_file = bitstream_file;
-	rds->bitstream_byte = bitstream_byte;
-	rds->bitstream_bit_count = bitstream_bit_count;
-
-	/* Restore filter state */
-	rds->filter_2400_i = filter_2400_i;
-	rds->filter_2400_q = filter_2400_q;
-	rds->filter_pll = filter_pll;
-	rds->pre_dec_n = pre_dec_n;
-	rds->agc_gain = agc_gain;
-	rds->agc_alpha = agc_alpha;
-	rds->freq_subcarrier = freq_subcarrier;
-	rds->status_interval = status_interval;
-	rds->signal_debug_interval = signal_debug_interval;
-	
 	/* Re-initialize decoder-specific defaults */
 	rds->ert_dec.chartable = RDS_ERT_CHARTABLE_DEFAULT;
 	rds->paging_dec.timeout_sec = paging_timeout_sec ? paging_timeout_sec : RDS_PAGING_DEFAULT_TIMEOUT;
@@ -12472,7 +12400,7 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	memset(rds->on_ps, ' ', 8);
 	rds->on_ps[8] = '\0';
 	
-	if (verbose)
+	if (rds->verbose)
 		LOGP(DRADIO, LOGL_INFO, "RDS decoder reset (new station)\n");
 }
 
