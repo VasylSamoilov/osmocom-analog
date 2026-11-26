@@ -1547,6 +1547,30 @@ typedef struct rds_encoder_sink {
 	void	*arg;
 } rds_encoder_sink_t;
 
+/* The paging call queue and the address scan that fills it - the
+ * application side (wall clock: send times, repeats, the scan's pacing);
+ * the protocol (rds_paging_enc_t) takes the next call that may start from
+ * it. */
+typedef struct rds_paging_queue {
+	rds_paging_msg_t *queue_head;
+	rds_paging_msg_t *queue_tail;
+	int		queue_count;
+
+	/* Address range scan: one message per address in [scan_next, scan_end),
+	 * refilled into the queue on demand. Group schedule is 4A each minute,
+	 * 1A at the interval layout, 0A for PS and 7A for the rest. */
+	int		scan_active;
+	uint32_t	scan_from;		/* first address of the scan */
+	uint32_t	scan_next;		/* next address to queue */
+	time_t		scan_start_time;
+	time_t		scan_log_time;		/* last progress log */
+	uint32_t	scan_end;		/* exclusive end (max 1000000) */
+	enum rds_paging_msg_type scan_type;	/* TONE, NUM10 or ALPHA */
+	int		scan_alpha_chars;	/* alpha payload: 4 (one data group) or 6 */
+
+	unsigned long	bs_deferred;		/* calls held back for their window */
+} rds_paging_queue_t;
+
 typedef struct rds_paging_enc {
 	int		enabled;	/* Paging enabled flag */
 	int		enhanced;	/* Enhanced paging (13A) enabled */
@@ -1564,10 +1588,8 @@ typedef struct rds_paging_enc {
 	uint16_t	tx_blocks_d[RDS_PAGING_MAX_GROUPS];
 	uint8_t		tx_psac_seq[RDS_PAGING_MAX_GROUPS];
 
-	/* Message queue */
-	rds_paging_msg_t *queue_head;
-	rds_paging_msg_t *queue_tail;
-	int		queue_count;
+	/* the call queue and the address scan (application) */
+	rds_paging_queue_t q;
 
 	/* 13A address notification state (EN 50067 M.3.4) */
 	uint64_t	notify_bits;	/* Address notification bits (25 or 50 bits) */
@@ -1592,29 +1614,19 @@ typedef struct rds_paging_enc {
 	uint16_t	intl_country_code;	/* E.212 MCC default (e.g. 255=Ukraine) */
 	uint8_t		intl_opc;		/* OPC default (1-15) */
 
-	/* Address range scan: one message per address in [scan_next, scan_end),
-	 * refilled into the queue on demand. Group schedule is 4A each minute,
-	 * 1A at the interval layout, 0A for PS and 7A for the rest. */
-	int		scan_active;
-	uint32_t	scan_from;		/* first address of the scan */
-	uint32_t	scan_next;		/* next address to queue */
-	time_t		scan_start_time;
-	time_t		scan_log_time;		/* last progress log */
-	uint32_t	scan_end;		/* exclusive end (max 1000000) */
+	/* The interval clock (the 'scan_' names are older than the battery
+	 * saving that uses them too): groups since the last 4A, the 1A slots */
 	uint32_t	scan_grp;		/* groups since the last 4A (minute marker) */
 	uint32_t	scan_last_key;		/* interval*16 + slot of the last 1A/4A sent */
 	uint32_t	scan_last_0a;		/* 0A slot of the last 0A sent */
 	uint8_t		pending_13a;		/* 13A groups still to send after the interval marker */
 	uint8_t		scan_n;			/* 1A number in interval: 1, 2 .. 5, 6 = excess */
 	uint8_t		scan_interval;		/* interval number 0-9 of the current 1A */
-	enum rds_paging_msg_type scan_type;	/* TONE, NUM10 or ALPHA */
-	int		scan_alpha_chars;	/* alpha payload: 4 (one data group) or 6 */
 
 	/* Battery saving (EN 50067 M.2.1.3): the group clock drives the 1A
 	 * interval sync bits and calls are only started inside the window of
 	 * their address (last digit d: intervals d, d+1, d+2). */
 	int		battery_saving;
-	unsigned long	bs_deferred;		/* calls held back for their window */
 } rds_paging_enc_t;
 
 /* Paging decoder state - embedded in rds_decoder_t */

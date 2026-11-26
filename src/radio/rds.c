@@ -1068,30 +1068,30 @@ static rds_paging_msg_t *rds_paging_msg_alloc(enum rds_paging_msg_type type,
 
 static void rds_paging_enqueue(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 {
-	if (pag->queue_count >= RDS_PAGING_QUEUE_MAX) {
-		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: queue full (%d), dropping message\n", pag->queue_count);
+	if (pag->q.queue_count >= RDS_PAGING_QUEUE_MAX) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: queue full (%d), dropping message\n", pag->q.queue_count);
 		free(msg);
 		return;
 	}
 	msg->next = NULL;
-	if (pag->queue_tail)
-		pag->queue_tail->next = msg;
+	if (pag->q.queue_tail)
+		pag->q.queue_tail->next = msg;
 	else
-		pag->queue_head = msg;
-	pag->queue_tail = msg;
-	pag->queue_count++;
+		pag->q.queue_head = msg;
+	pag->q.queue_tail = msg;
+	pag->q.queue_count++;
 }
 
 static rds_paging_msg_t *rds_paging_dequeue(rds_paging_enc_t *pag)
 {
-	rds_paging_msg_t *msg = pag->queue_head;
+	rds_paging_msg_t *msg = pag->q.queue_head;
 	if (!msg)
 		return NULL;
-	pag->queue_head = msg->next;
-	if (!pag->queue_head)
-		pag->queue_tail = NULL;
+	pag->q.queue_head = msg->next;
+	if (!pag->q.queue_head)
+		pag->q.queue_tail = NULL;
 	msg->next = NULL;
-	pag->queue_count--;
+	pag->q.queue_count--;
 	return msg;
 }
 
@@ -1112,7 +1112,7 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 /* The paging group clock (scan_grp, groups since the last 4A) drives the 1A
  * interval sync bits and the reduced 1A/7A schedule during a scan and with
  * battery saving. */
-#define RDS_PAGING_TIMED(pag)	((pag)->enabled && ((pag)->scan_active || (pag)->battery_saving))
+#define RDS_PAGING_TIMED(pag)	((pag)->enabled && ((pag)->q.scan_active || (pag)->battery_saving))
 
 #define RDS_PAGING_SCAN_QUEUE	32	/* kept queued during a scan, rest is free for the FIFO */
 #define RDS_PAGING_SCAN_ELIGIBLE 32	/* battery saving: calls kept queued that can be sent now */
@@ -1120,7 +1120,7 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 /* Type 0 groups per second in the timed schedule. EN 50067 3.1.3: four
  * for PS; the rate may be reduced when capacity is needed for other
  * applications, but not below two. A scan uses the minimum. */
-#define RDS_PAGING_0A_RATE(pag)	((pag)->scan_active ? RDS_PAGING_0A_PER_SEC_SCAN : RDS_PAGING_0A_PER_SEC)
+#define RDS_PAGING_0A_RATE(pag)	((pag)->q.scan_active ? RDS_PAGING_0A_PER_SEC_SCAN : RDS_PAGING_0A_PER_SEC)
 /* Share of groups left for 7A in the timed schedule. Per 6 s interval
  * (~68.5 groups): 13 x 1A and 6 x RDS_PAGING_0A_RATE x 0A. */
 #define RDS_PAGING_GROUPS_6S	(6000000.0 / RDS_PAGING_GROUP_US)
@@ -1232,14 +1232,14 @@ static int rds_paging_msg_groups(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 /* number of groups a scan message takes on air */
 static int rds_paging_scan_groups(const rds_paging_enc_t *pag)
 {
-	switch (pag->scan_type) {
+	switch (pag->q.scan_type) {
 	case RDS_PAGING_TONE:
 		return 1;
 	case RDS_PAGING_NUM10:
 		return 2;	/* address + 2 digits, then 8 digits */
 	default:
 		/* alpha: address group + one data group per 4 characters */
-		return 1 + (pag->scan_alpha_chars + 3) / 4;
+		return 1 + (pag->q.scan_alpha_chars + 3) / 4;
 	}
 }
 
@@ -1249,11 +1249,11 @@ static void rds_paging_unlink(rds_paging_enc_t *pag, rds_paging_msg_t *prev, rds
 	if (prev)
 		prev->next = msg->next;
 	else
-		pag->queue_head = msg->next;
-	if (pag->queue_tail == msg)
-		pag->queue_tail = prev;
+		pag->q.queue_head = msg->next;
+	if (pag->q.queue_tail == msg)
+		pag->q.queue_tail = prev;
 	msg->next = NULL;
-	pag->queue_count--;
+	pag->q.queue_count--;
 }
 
 /* With battery saving a call has to fit the three interval windows of its
@@ -1264,7 +1264,7 @@ static void rds_paging_bs_drop_unfit(rds_paging_enc_t *pag)
 	double max_groups = 3 * 6000.0 * RDS_PAGING_7A_PERCENT(pag) / 100.0 / (RDS_PAGING_GROUP_US / 1000.0) - 1.0;
 	rds_paging_msg_t *m, *prev = NULL, *next;
 
-	for (m = pag->queue_head; m; m = next) {
+	for (m = pag->q.queue_head; m; m = next) {
 		int groups = rds_paging_msg_groups(pag, m);
 
 		next = m->next;
@@ -1289,7 +1289,7 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 	int groups = rds_paging_scan_groups(pag);
 	int eligible = 0;
 
-	if (!pag->scan_active)
+	if (!pag->q.scan_active)
 		return;
 
 	/* With battery saving the scheduler holds back calls outside their
@@ -1298,65 +1298,65 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 	if (pag->battery_saving) {
 		rds_paging_msg_t *m;
 
-		for (m = pag->queue_head; m; m = m->next)
+		for (m = pag->q.queue_head; m; m = m->next)
 			if (m->next_send_time <= time(NULL) &&
 			    rds_paging_slot_ok(pag, m->address, m->ngroups ? m->ngroups : groups, NULL))
 				eligible++;
 	}
 
-	while (pag->scan_next < pag->scan_end) {
+	while (pag->q.scan_next < pag->q.scan_end) {
 		char text[8] = "";
 		int len = 0;
 		rds_paging_msg_t *msg;
 
 		if (pag->battery_saving) {
-			if (eligible >= RDS_PAGING_SCAN_ELIGIBLE || pag->queue_count >= RDS_PAGING_SCAN_QUEUE_BS)
+			if (eligible >= RDS_PAGING_SCAN_ELIGIBLE || pag->q.queue_count >= RDS_PAGING_SCAN_QUEUE_BS)
 				break;
-		} else if (pag->queue_count >= RDS_PAGING_SCAN_QUEUE) {
+		} else if (pag->q.queue_count >= RDS_PAGING_SCAN_QUEUE) {
 			break;
 		}
 
-		if (pag->scan_type == RDS_PAGING_ALPHA && pag->scan_alpha_chars == 4)
-			len = snprintf(text, sizeof(text), "%04u", (unsigned)(pag->scan_next % 10000));
-		else if (pag->scan_type != RDS_PAGING_TONE)
-			len = snprintf(text, sizeof(text), "%06u", (unsigned)pag->scan_next);
-		msg = rds_paging_msg_alloc(pag->scan_type, pag->scan_next, text, len, 0, 0);
+		if (pag->q.scan_type == RDS_PAGING_ALPHA && pag->q.scan_alpha_chars == 4)
+			len = snprintf(text, sizeof(text), "%04u", (unsigned)(pag->q.scan_next % 10000));
+		else if (pag->q.scan_type != RDS_PAGING_TONE)
+			len = snprintf(text, sizeof(text), "%06u", (unsigned)pag->q.scan_next);
+		msg = rds_paging_msg_alloc(pag->q.scan_type, pag->q.scan_next, text, len, 0, 0);
 		if (!msg)
 			break;
-		if (pag->battery_saving && rds_paging_slot_ok(pag, pag->scan_next, groups, NULL))
+		if (pag->battery_saving && rds_paging_slot_ok(pag, pag->q.scan_next, groups, NULL))
 			eligible++;
 		rds_paging_enqueue(pag, msg);
-		pag->scan_next++;
+		pag->q.scan_next++;
 	}
 
 	/* Progress every 60 s: addresses completed (not merely queued) */
 	{
 		time_t now = time(NULL);
 
-		if (now - pag->scan_log_time >= 60) {
-			uint32_t total = pag->scan_end - pag->scan_from;
-			uint32_t done = pag->scan_next - pag->scan_from;
-			double elapsed = difftime(now, pag->scan_start_time);
+		if (now - pag->q.scan_log_time >= 60) {
+			uint32_t total = pag->q.scan_end - pag->q.scan_from;
+			uint32_t done = pag->q.scan_next - pag->q.scan_from;
+			double elapsed = difftime(now, pag->q.scan_start_time);
 			double rate, eta;
 
-			done = (done > (uint32_t)pag->queue_count) ? done - pag->queue_count : 0;
+			done = (done > (uint32_t)pag->q.queue_count) ? done - pag->q.queue_count : 0;
 			rate = (elapsed > 0) ? done / elapsed : 0;
 			eta = (rate > 0) ? (total - done) / rate : 0;
 			char extra[48] = "";
 
-			pag->scan_log_time = now;
+			pag->q.scan_log_time = now;
 			if (pag->battery_saving)
-				snprintf(extra, sizeof(extra), ", %lu calls held for their interval", pag->bs_deferred);
+				snprintf(extra, sizeof(extra), ", %lu calls held for their interval", pag->q.bs_deferred);
 			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: %u of %u addresses sent (%.1f%%), queued up to %06u, %.2f addr/s, ETA %uh%02um%s\n",
 			     (unsigned)done, (unsigned)total, 100.0 * done / total,
-			     (unsigned)pag->scan_next, rate,
+			     (unsigned)pag->q.scan_next, rate,
 			     (unsigned)(eta / 3600), (unsigned)(eta / 60) % 60, extra);
 		}
 	}
 
-	if (pag->scan_next >= pag->scan_end && !pag->queue_head && !pag->tx_active && !pag->tx_msg) {
+	if (pag->q.scan_next >= pag->q.scan_end && !pag->q.queue_head && !pag->tx_active && !pag->tx_msg) {
 		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: complete\n");
-		pag->scan_active = 0;
+		pag->q.scan_active = 0;
 		rds_enc_scheduler_update(rds);
 	}
 }
@@ -1427,7 +1427,7 @@ static void rds_paging_sent(rds_encoder_t *rds, int complete)
 	c.opc = msg->opc;
 	c.send_n = msg->repeats_left + 1;
 	c.send_total = msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left);
-	c.scan = pag->scan_active;
+	c.scan = pag->q.scan_active;
 	if (!complete && pag->battery_saving) {
 		c.battery_saving = 1;
 		rds_paging_clock(pag, &c.interval, &c.interval_pos_ms);
@@ -1456,7 +1456,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 
 	/* Find next ready message */
 	while (1) {
-		msg = pag->queue_head;
+		msg = pag->q.queue_head;
 		if (!msg)
 			break;
 
@@ -1470,7 +1470,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 
 			rds_paging_bs_drop_unfit(pag);
 
-			for (m = pag->queue_head; m; prev = m, m = m->next) {
+			for (m = pag->q.queue_head; m; prev = m, m = m->next) {
 				int k;
 
 				if (m->next_send_time > now)
@@ -1481,7 +1481,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 
 						rds_paging_clock(pag, &iv, &pos);
 						m->defer_logged = 1;
-						pag->bs_deferred++;
+						pag->q.bs_deferred++;
 						LOGP(DRADIO, LOGL_INFO, "RDS Paging: addr=%02u-%04u held for its interval window I%u-I%u (now I%u, %.1fs into it)\n",
 						     m->address / 10000, m->address % 10000, d, (d + 2) % 10, iv, pos / 1000.0);
 					}
@@ -1835,23 +1835,23 @@ int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
 	if (type != RDS_PAGING_TONE && type != RDS_PAGING_NUM10 && type != RDS_PAGING_ALPHA)
 		return -1;
 
-	pag->scan_from = from;
-	pag->scan_next = from;
-	pag->scan_end = to + 1;
-	pag->scan_start_time = time(NULL);
-	pag->scan_log_time = pag->scan_start_time;
-	pag->scan_type = type;
+	pag->q.scan_from = from;
+	pag->q.scan_next = from;
+	pag->q.scan_end = to + 1;
+	pag->q.scan_start_time = time(NULL);
+	pag->q.scan_log_time = pag->q.scan_start_time;
+	pag->q.scan_type = type;
 	/* Alpha: 4 characters fit one data group (EN 50067 M.2.1.6.4, Fig. M.5:
 	 * 4 characters per 7A group, segment 1111 carries the last four). If all
 	 * scanned addresses share the group code Y1Y2, the individual code
 	 * Z1..Z4 identifies the address. */
-	pag->scan_alpha_chars = (from / 10000 == to / 10000) ? 4 : 6;
+	pag->q.scan_alpha_chars = (from / 10000 == to / 10000) ? 4 : 6;
 	if (type == RDS_PAGING_ALPHA)
 		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: alpha payload %s (%d groups per call)\n",
-		     pag->scan_alpha_chars == 4 ? "last 4 digits, group code is fixed by the range" :
+		     pag->q.scan_alpha_chars == 4 ? "last 4 digits, group code is fixed by the range" :
 						  "6 digits, range spans more than one group code",
 		     rds_paging_scan_groups(pag));
-	pag->scan_active = 1;
+	pag->q.scan_active = 1;
 	/* pagers need the 4A minute marker for interval sync */
 	rds_enc_set_ct_enabled(rds, 1);
 	rds_paging_clock_sync(rds);
@@ -1880,7 +1880,7 @@ void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enabled = enable;
 	if (!enable) {
-		rds->paging.scan_active = 0;
+		rds->paging.q.scan_active = 0;
 		rds_paging_queue_destroy(&rds->paging);
 	} else {
 		/* Paging needs 4A at each minute and 1A once per second at the
@@ -3732,7 +3732,7 @@ static void rds_paging_update_notify(rds_paging_enc_t *pag, unsigned interval)
 	}
 
 	/* Queued messages */
-	for (msg = pag->queue_head; msg; msg = msg->next) {
+	for (msg = pag->q.queue_head; msg; msg = msg->next) {
 		int bit;
 
 		if (rds_paging_interval_from_addr(msg->address) != interval)
@@ -3861,7 +3861,7 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 		/* 1A slots are inserted by rds_generate_group() */
 		ADD_GRP(RDS_GROUP_7A);
 		LOGP(DRADIO, LOGL_INFO, "RDS Scheduler: paging %s, 13 x 1A per 6 s interval, %d x %s per second, 7A otherwise\n",
-		     rds->paging.scan_active ? "scan" : "battery saving",
+		     rds->paging.q.scan_active ? "scan" : "battery saving",
 		     RDS_PAGING_0A_RATE(&rds->paging), rds->use_0b ? "0B" : "0A");
 		return;
 	}
