@@ -1675,6 +1675,22 @@ typedef struct rds_paging_dec {
 	uint8_t		enhanced_valid;	/* 13A data received at least once */
 } rds_paging_dec_t;
 
+/* A received paging message, as the decoder gives it to the display and a
+ * consumer (rds_decoder_set_paging_callback) */
+typedef struct rds_paging_rx_msg {
+	enum rds_paging_msg_type type;
+	uint32_t	address;	/* 6 digits: group code * 10000 + pager */
+	char		text[RDS_PAGING_MSG_MAX + 1];	/* digits / characters as received */
+	int		len;
+	uint8_t		ab_flag;	/* A/B flag of its groups */
+	uint8_t		tonetype;	/* tone only: E2-E0 */
+	uint8_t		ni;		/* enhanced: 0 = national, 1 = international */
+	uint8_t		r_flag;		/* enhanced: 0 = original, 1 = repeat */
+	uint8_t		call_counter;	/* enhanced: P3-P0 */
+	uint16_t	country_code;	/* international: E.212 MCC (0 = none) */
+	uint8_t		opc;		/* international: OPC (0 = none) */
+} rds_paging_rx_msg_t;
+
 /* ============================================================
  * GROUP VERSION SELECTION (IEC 62106)
  * ============================================================
@@ -2797,9 +2813,9 @@ typedef struct rds_decoder {
 	 * msg contains the extracted T/F/DP/direction/extent/event/location fields. */
 	void		(*tmc_callback)(const rds_tmc_msg_t *msg, void *arg);
 	void		*tmc_callback_arg;
-	/* Group 7A: a complete paging message (paging_dec.last_*), after its
-	 * log line (rds_decoder_set_paging_callback) */
-	void		(*paging_callback)(const rds_paging_dec_t *pd, void *arg);
+	/* Group 7A: a complete paging message, after its log line
+	 * (rds_decoder_set_paging_callback) */
+	void		(*paging_callback)(const rds_paging_rx_msg_t *msg, void *arg);
 	void		*paging_callback_arg;
 	struct {
 		int      pending;       /* 1 = multi-group assembly in progress */
@@ -3005,10 +3021,9 @@ void rds_enc_tmc_get_msg(const rds_encoder_t *rds, rds_tmc_msg_t *msg_out);
 void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
 				  void *arg);
-/* A complete received paging message to a consumer (pd->last_type,
- * last_address, last_msg, last_ni, last_country_code, ...) */
+/* A complete received paging message to a consumer */
 void rds_decoder_set_paging_callback(rds_decoder_t *rds,
-				     void (*fn)(const rds_paging_dec_t *pd, void *arg),
+				     void (*fn)(const rds_paging_rx_msg_t *msg, void *arg),
 				     void *arg);
 /* Get the TMC Location Table Number announced via 3A system-info (0 = encrypted) */
 uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds);

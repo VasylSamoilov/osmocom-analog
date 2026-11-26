@@ -180,6 +180,13 @@ static void print_usage(const char *prog)
 	printf("  %s -v 7 --rds-debug --rds-verbose docs/rds/20091111_France_Info.rds\n", prog);
 }
 
+/* the decoder's paging consumer: counts the messages of a file */
+static void count_page(const rds_paging_rx_msg_t *msg, void *arg)
+{
+	(void)msg;
+	(*(int *)arg)++;
+}
+
 int main(int argc, char *argv[])
 {
 	int file_count = 0;
@@ -270,6 +277,8 @@ int main(int argc, char *argv[])
 			continue;
 		}
 		rds_decoder_set_paging(&rds, paging_mode);
+		int pages = 0;
+		rds_decoder_set_paging_callback(&rds, count_page, &pages);
 
 		int groups;
 		if (is_binary_rds(files[i]))
@@ -284,6 +293,8 @@ int main(int argc, char *argv[])
 			/* Full detail dump (to log, gated by log level) */
 			rds_decoder_status(&rds);
 		}
+		if (pages)
+			printf("Paging messages received: %d\n", pages);
 
 		rds_decoder_exit(&rds);
 	}
