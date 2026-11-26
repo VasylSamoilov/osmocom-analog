@@ -3485,10 +3485,14 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			uint8_t pad = (msg->type == RDS_PAGING_FUNCTIONS) ? 0x0 : RDS_PAGING_BCD_SPACE;
 			if (remaining < 0) remaining = 0;
 			padded_len = ((remaining + 7) / 8) * 8;
+			/* at least one end group: all fill when the digits are all
+			 * gone already (international, 4 or fewer in the header) -
+			 * it was sent unfilled (8 nibbles off the stack) */
+			if (padded_len == 0)
+				padded_len = 8;
 			for (i = len; i < di + padded_len; i++)
 				nibbles[i] = pad;
 			ngroups = padded_len / 8;
-			if (ngroups == 0) ngroups = 1; /* at least one end group */
 		}
 
 		for (i = 0; i < ngroups; i++) {
