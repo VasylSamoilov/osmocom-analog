@@ -208,9 +208,11 @@ void am_demodulate_complex(am_demod_t *demod, sample_t *amplitude, int length, f
 	/* filter carrier */
 	iir_process(&demod->lp[2], carrier, length);
 
-	/* normalize */
+	/* normalize; no carrier at all (IQ of exact zeros: before the first
+	 * signal, a gap the SDR filled with zeros): silence, not 0 / 0 = NaN,
+	 * which the filters after this would keep for good */
 	for (s = 0; s < length; s++)
-		amplitude[s] = (amplitude[s] - carrier[s]) / carrier[s] * gain;
+		amplitude[s] = (carrier[s] > 0.0) ? (amplitude[s] - carrier[s]) / carrier[s] * gain : 0.0;
 }
 
 
