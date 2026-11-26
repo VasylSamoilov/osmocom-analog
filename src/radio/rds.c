@@ -4488,6 +4488,45 @@ static void rds_generate_group(rds_encoder_t *rds)
 /* Forward declaration for bitstream bit reader */
 static int rds_tx_read_bitstream_bit(rds_encoder_t *rds);
 
+/* A group is about to be sent (group_buffer: 4 x 26 bits, data + check
+ * word): the one place that sees every generated group - to the TX log
+ * decoder (with a TX hexrds file) */
+static void rds_group_sent(rds_encoder_t *rds)
+{
+	uint16_t blocks[4];
+	int i, b;
+
+	if (!rds->tx_log_decoder)
+		return;
+	for (i = 0; i < 4; i++) {
+		uint32_t v = 0;
+
+		for (b = 0; b < 26; b++) {
+			int pos = i * 26 + b;
+
+			v = (v << 1) | ((rds->group_buffer[pos / 8] >> (7 - pos % 8)) & 1);
+		}
+		blocks[i] = (v >> 10) & 0xFFFF;
+	}
+
+	/* Log transmitted group using decoder */
+	{
+		uint8_t status[4] = {RDS_STATUS_VALID, RDS_STATUS_VALID,
+		                     RDS_STATUS_VALID, RDS_STATUS_VALID};
+		rds_decoder_feed_group(rds->tx_log_decoder, blocks, status);
+
+		/* Log in RDS Spy format */
+		if (rds->debug || rds->verbose) {
+			int group_type = (blocks[1] >> 11) & 0x1F;
+			int type = group_type >> 1;
+			int version = group_type & 1;
+			LOGP(DRADIO, LOGL_INFO, "RDS TX FILE %d%c: %04X %04X %04X %04X\n",
+			     type, version ? 'B' : 'A',
+			     blocks[0], blocks[1], blocks[2], blocks[3]);
+		}
+	}
+}
+
 /* Get next bit from current group (or directly from bitstream file) */
 static int rds_get_next_bit(rds_encoder_t *rds)
 {
@@ -4504,6 +4543,9 @@ static int rds_get_next_bit(rds_encoder_t *rds)
 	/* Check if we need to generate a new group BEFORE calculating indices */
 	if (rds->group_bit_pos >= 104) {
 		rds_generate_group(rds);
+		/* a new group (every source resets the bit position) */
+		if (rds->group_bit_pos == 0)
+			rds_group_sent(rds);
 	}
 	
 	int byte_pos = rds->group_bit_pos / 8;
@@ -8928,24 +8970,9 @@ static int rds_generate_group_from_file(rds_encoder_t *rds)
 	
 	if (rc <= 0)
 		return 0;  /* Error or skip, fall back to normal generation */
-	
-	/* Log transmitted group using decoder */
-	if (rds->tx_log_decoder) {
-		uint8_t status[4] = {RDS_STATUS_VALID, RDS_STATUS_VALID, 
-		                     RDS_STATUS_VALID, RDS_STATUS_VALID};
-		rds_decoder_feed_group(rds->tx_log_decoder, blocks, status);
-		
-		/* Log in RDS Spy format */
-		if (rds->debug || rds->verbose) {
-			int group_type = (blocks[1] >> 11) & 0x1F;
-			int type = group_type >> 1;
-			int version = group_type & 1;
-			LOGP(DRADIO, LOGL_INFO, "RDS TX FILE %d%c: %04X %04X %04X %04X\n",
-			     type, version ? 'B' : 'A',
-			     blocks[0], blocks[1], blocks[2], blocks[3]);
-		}
-	}
-	
+
+	/* (the TX log decoder sees it in rds_group_sent) */
+
 	/* Encode blocks with CRC and offset words */
 	encoded_blocks[0] = rds_block_encode(blocks[0], RDS_OFFSET_A, 0);
 	encoded_blocks[1] = rds_block_encode(blocks[1], RDS_OFFSET_B, 0);
