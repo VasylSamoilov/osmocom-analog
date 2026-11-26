@@ -40,6 +40,8 @@ enum paging_signal;
 #include "../libsdr/sdr_config.h"
 #include "../libsdr/sdr.h"
 #include "../libsdr/sdr_status.h"
+#include "../libsdr/sdr_engine.h"
+#include "../libsdr/sdr_bands.h"
 #include "../liboptions/options.h"
 #include <osmocom/cc/misc.h>
 #include "radio.h"
@@ -171,20 +173,26 @@ typedef struct station {
 	int xdr_enabled, rdsspy_enabled, uecp_enabled, asciig_enabled;
 	int rigctl_enabled;
 	rds_callback_ctx_t rds_cb_ctx;
+	double baseband_extent;	/* one-sided, of its signal */
+	int band;		/* several stations: its SDR band (sdr_bands), else -1 */
+	char band_name[48];
 } station_t;
 
 /* Options (docs/RADIO-STATIONS.md): the config file and the command line
- * options before the first -f fill station_default; the first command line
- * -f starts the station as a copy of it, the options after it are that
+ * options before the first -f fill station_default; each command line -f
+ * starts a station as a copy of it, the options after it are that
  * station's. Process options (-v, --fast-math) and the SDR options are
- * process-wide wherever they stand. One station for now: a second -f is
- * refused. After the options st points at the station, never at the
- * defaults. */
+ * process-wide wherever they stand. After the options st points at the
+ * first station, never at the defaults. One station: the SDR as before
+ * (its band around its frequency); several: one SDR, a band per station
+ * (sdr_bands: in-process on the filter bank engine, or on the backend). */
+#define STATIONS_MAX	8
 static station_t station_default;
-static station_t station0;
+static station_t stations[STATIONS_MAX];
 static int num_stations;
 static int options_from_command_line;
 static station_t *st = &station_default;
+static sdr_bands_t bands;	/* several stations */
 
 /* the initial values of a station's settings */
 static void station_defaults(station_t *s)
@@ -192,6 +200,7 @@ static void station_defaults(station_t *s)
 	memset(s, 0, sizeof(*s));
 	s->rds_paging_pipe_path = RDS_PAGING_PIPE_DEFAULT;
 	s->paging_pipe_fd = -1;
+	s->band = -1;
 	s->meter = NULL;
 	s->spectral_freq_idx = -1;
 	s->frequency = 0.0;
@@ -229,12 +238,25 @@ static int dsp_buffer = 30;
 /* global variable to quit main loop */
 int quit = 0;
 
+/* The tune callbacks move the SDR: with several stations that would move
+ * all of them (per-station retune: docs/RADIO-STATIONS.md, slice 7) */
+static int retune_refused(const char *who)
+{
+	if (num_stations <= 1)
+		return 0;
+	LOGP(DRADIO, LOGL_NOTICE, "%s: no retune with several stations (yet).\n", who);
+	return 1;
+}
+
 /* Tune callback for XDR-GTK (RX side): retunes the SDR receiver */
 static void radio_tune_cb(int freq_khz, void *arg)
 {
 	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
 	station_t *s = ctx->station;
 	double freq_hz = freq_khz * 1000.0;
+
+	if (retune_refused("Tune"))
+		return;
 
 	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
 	if (s->rds && ctx->radio) {
@@ -285,6 +307,8 @@ static void radio_scan_cb(int freq_khz, void *arg)
 	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
 	double freq_hz = freq_khz * 1000.0;
 
+	if (retune_refused("Scan"))
+		return;
 	if (sdr_set_rx_frequency(freq_hz) < 0)
 		return;
 
@@ -315,6 +339,8 @@ static void radio_tx_tune_cb(int freq_khz, void *arg)
 	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
 	double freq_hz = freq_khz * 1000.0;
 
+	if (retune_refused("TX tune"))
+		return;
 	LOGP(DRADIO, LOGL_NOTICE, "Re-tuning SDR TX to %d kHz\n", freq_khz);
 
 	if (sdr_set_tx_frequency(freq_hz) < 0) {
@@ -331,6 +357,8 @@ static int rigctl_set_rx_freq(double freq_hz, void *arg)
 	station_t *s = (station_t *)arg;
 	radio_t *r = &s->radio;
 
+	if (retune_refused("Rigctl"))
+		return -1;
 	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
 	if (s->rds) {
 		if (r->rds_dec.blocks_ok > 0) {
@@ -372,6 +400,8 @@ static int rigctl_set_tx_freq(double freq_hz, void *arg)
 {
 	station_t *s = (station_t *)arg;
 
+	if (retune_refused("Rigctl"))
+		return -1;
 	LOGP(DRADIO, LOGL_NOTICE, "Rigctl: Re-tuning SDR TX to %.0f Hz\n", freq_hz);
 
 	if (sdr_set_tx_frequency(freq_hz) < 0) {
@@ -474,9 +504,10 @@ static void print_help(const char *arg0)
 	printf("        Give a config file to use. If it starts with '~/', path is at home dir.\n");
 	printf("        Each line in config file is one option, '-' or '--' must not be given!\n");
 	printf(" -f --frequency <frequency>\n");
-	printf("        Give frequency in Hertz. Starts the station: station options before\n");
-	printf("        it (and in the config file) are defaults, the ones after it are the\n");
-	printf("        station's. One -f for now (several stations: docs/RADIO-STATIONS.md).\n");
+	printf("        Give frequency in Hertz. Starts a station: station options before\n");
+	printf("        the first -f (and in the config file) are defaults, the ones after a\n");
+	printf("        -f are that station's. Several -f (up to %d): several stations on one\n", STATIONS_MAX);
+	printf("        SDR, each its own band (docs/RADIO-STATIONS.md).\n");
 	printf("        FM options (stereo, RDS, SCA, deviation, emphasis, FM compandor, AFC,\n");
 	printf("        the RDS servers) are for FM stations, -I and -C for AM: a default\n");
 	printf("        applies to the stations of its modulation only, after -f one of\n");
@@ -1022,14 +1053,13 @@ static int handle_options(int short_option, int argi, char **argv)
 	case 'f':
 		/* in the config file: the default frequency */
 		if (options_from_command_line) {
-			if (num_stations) {
-				fprintf(stderr, "A second '-f' (several stations) is not supported yet, one '-f' per osmoradio!\n");
+			if (num_stations == STATIONS_MAX) {
+				fprintf(stderr, "More than %d stations ('-f'), use '-h' for help!\n", STATIONS_MAX);
 				return -EINVAL;
 			}
-			station0 = station_default;
-			station0.num_given = 0;	/* the defaults' are not the station's */
-			st = &station0;
-			num_stations = 1;
+			stations[num_stations] = station_default;
+			stations[num_stations].num_given = 0;	/* the defaults' are not the station's */
+			st = &stations[num_stations++];
 		}
 		st->frequency = atof(argv[argi]);
 		break;
@@ -2023,7 +2053,46 @@ static int station_poll(station_t *s, void *sdr)
 		rigctl_server_poll(&s->rigctl_srv);
 
 	got = 0;
-	if (s->rx) {
+	if (s->rx && s->band >= 0) {
+		/* several stations: its band; the scan, the spectral measurement
+		 * (one per process, at one rate) and the SNR from it are the
+		 * single station's */
+		got = sdr_band_read(&bands, s->band, s->sendbuff, s->buffer_size);
+		if (got < 0) {
+			LOGP(DRADIO, LOGL_ERROR, "Station %s: the SDR band is gone (%d).\n", s->band_name, got);
+			return -1;
+		}
+		signal_meter_feed_iq(s->meter, s->sendbuff, got);
+		got = radio_rx(&s->radio, s->sendbuff, got);
+		if (got < 0)
+			return -1;
+		signal_meter_set_stereo_pilot(s->meter, s->radio.rx_pilot_mag_avg,
+					      s->radio.rx_pilot_locked);
+		/* the SDR's noise floor (its RX status, in-process): the SNR;
+		 * without it the SNR stays unknown (the radio's initial value) */
+		{
+			const sdr_status_t *ss = sdr_status_get();
+
+			if (ss && ss->rx.valid) {
+				signal_meter_set_noise_floor(s->meter, ss->rx.noise_floor_db);
+				radio_set_rx_snr(&s->radio, signal_meter_get_snr(s->meter));
+			}
+		}
+		if (s->xdr_enabled) {
+			double sig = signal_meter_get_level_dbf(s->meter);
+			int is_stereo = s->radio.stereo && s->radio.rx_pilot_locked && !s->radio.rx_forced_mono;
+			rds_server_update_signal(&s->xdr_srv,
+				(sig > SIGNAL_METER_NO_VALUE) ? sig : -100.0,
+				is_stereo,
+				s->radio.rx_pilot_mag_avg);
+		}
+		if (s->rigctl_enabled) {
+			double sig = signal_meter_get_level_dbfs(s->meter);
+			rigctl_server_set_signal(&s->rigctl_srv,
+				(sig > SIGNAL_METER_NO_VALUE) ? sig : -100.0);
+		}
+		signal_meter_update_cpu(s->meter);
+	} else if (s->rx) {
 		got = sdr_read(sdr, (void *)s->sendbuff, s->buffer_size, 0, NULL);
 		/* Feed raw IQ into scan engine if active (FFT-based, no retuning needed
 		 * unless scan range exceeds SDR bandwidth) */
@@ -2086,10 +2155,13 @@ static int station_poll(station_t *s, void *sdr)
 
 	/* TX processing - only if TX mode is enabled */
 	if (s->tx) {
-		tosend = sdr_get_tosend(sdr, s->buffer_size);
+		if (s->band >= 0)
+			tosend = sdr_band_tosend(&bands, s->band);
+		else
+			tosend = sdr_get_tosend(sdr, s->buffer_size);
 		if (tosend > s->buffer_size)
 			tosend = s->buffer_size;
-		if (tosend == 0)
+		if (tosend == 0 || (s->band >= 0 && tosend < 0))
 			return 0;
 		/* perform radio modulation */
 		tosend = radio_tx(&s->radio, s->sendbuff, tosend);
@@ -2099,7 +2171,10 @@ static int station_poll(station_t *s, void *sdr)
 			return 1; /* radio_tx returned 0: no audio to process, skip SDR write */
 		}
 		/* write to SDR */
-		sdr_write(sdr, (void *)s->sendbuff, NULL, tosend, NULL, NULL, 0);
+		if (s->band >= 0)
+			sdr_band_write(&bands, s->band, s->sendbuff, tosend);
+		else
+			sdr_write(sdr, (void *)s->sendbuff, NULL, tosend, NULL, NULL, 0);
 	}
 
 	return 0;
@@ -2138,46 +2213,13 @@ static void station_exit(station_t *s)
 	radio_exit(&s->radio);
 }
 
-int main(int argc, char *argv[])
+/* After the options, per station (the global st): what its options need
+ * (main's checks, moved as they were) */
+static void station_check_options(char *arg0)
 {
-	int rc, argi;
-	struct termios term, term_orig;
-	int c;
-	void *sdr = NULL;
-
-	loglevel = LOGL_NOTICE;
-	logging_init();
-
-	sdr_config_init(DEFAULT_LO_OFFSET);
-	station_defaults(st);
-
-	/* handle options / config file */
-	add_options();
-	rc = options_config_file(argc, argv, "~/.osmocom/analog/radio.conf", handle_options);
-	if (rc < 0)
-		return 0;
-	options_from_command_line = 1;
-	argi = options_command_line(argc, argv, handle_options);
-	if (argi <= 0)
-		return argi;
-	/* no -f on the command line: the station is the defaults */
-	if (!num_stations) {
-		station0 = station_default;
-		num_stations = 1;
-	}
-	st = &station0;
-	{
-		static station_t initial;
-
-		station_defaults(&initial);
-		rc = station_kind_options(st, &initial);
-		if (rc < 0)
-			return rc;
-	}
-
 	if (st->frequency == 0.0) {
 		printf("No frequency given, I suggest to use 100000000 (100 MHz) and FM\n\n");
-		print_help(argv[0]);
+		print_help(arg0);
 		exit(0);
 	}
 
@@ -2216,24 +2258,24 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "--rds-paging-13a requires --rds-paging-opc 1-15 (EN 50067 M.3.2.7.2), use '-h' for help!\n");
 		exit(0);
 	}
+}
 
-	/* global inits */
-	fm_init(fast_math);
-	am_init(fast_math);
+/* Several stations, in-process: the filter banks' DSP rate (AM, NFM); the
+ * wider stations are on the per-channel chain (docs/RADIO-STATIONS.md) */
+#define BANK_DSP_RATE	48000
 
+/* After sdr_configure(), per station (the global st): its bandwidth, the
+ * extent of its signal and its IQ rate; the checks of its signal (main's,
+ * moved as they were). One station: the lowest SDR rate / 2^k as before;
+ * several: the rate class of the signal - the bank's DSP rate, 240 k or
+ * 480 k (each band its own rate), or --channelizer-rate. */
+static void station_signal(void)
+{
 	/* Determine input samplerate */
 	if (st->channelizer_rate > 0)
 		st->iq_rate = st->channelizer_rate;
 	else
 		st->iq_rate = st->dsp_samplerate;
-
-	rc = sdr_configure(st->iq_rate);
-	if (rc < 0)
-		return rc;
-	if (rc == 0) {
-		fprintf(stderr, "Please select SDR, use '-h' for help!\n");
-		exit(0);
-	}
 
 	/* Set default bandwidth based on modulation type (must be before channelizer rate calc) */
 	if (st->bandwidth == 0) {
@@ -2257,17 +2299,27 @@ int main(int argc, char *argv[])
 		/* AM: baseband_extent = audio bandwidth */
 		baseband_extent = st->bandwidth;
 	}
+	st->baseband_extent = baseband_extent;
 
-	/* The SDR's channelizer takes the band around the frequency to the
-	 * radio's IQ rate: as given, else the lowest SDR rate / 2^k that holds
-	 * the baseband (halfband stages only) */
-	if (st->channelizer_rate == 0 && sdr_config && sdr_config->samplerate > st->dsp_samplerate)
-		st->iq_rate = sdr_calculate_optimal_rate(sdr_config->samplerate, baseband_extent);
+	if (num_stations > 1) {
+		double need = baseband_extent * 2.0 / 0.75;
 
-	if (sdr_config)
-		LOGP(DSDR, LOGL_NOTICE, "Channelizer: SDR=%d Hz -> IQ=%d Hz (rf_bw=%.1f kHz, signal=%.1f kHz)\n",
-		     sdr_config->samplerate, st->iq_rate,
-		     2.0 * baseband_extent / 1000.0, st->dsp_samplerate / 1000.0);
+		if (st->channelizer_rate == 0)
+			st->iq_rate = (need <= BANK_DSP_RATE) ? BANK_DSP_RATE : (need <= 240000.0) ? 240000 : 480000;
+		LOGP(DSDR, LOGL_NOTICE, "Station %.4f MHz: IQ=%d Hz (rf_bw=%.1f kHz)\n",
+		     st->frequency / 1e6, st->iq_rate, 2.0 * baseband_extent / 1000.0);
+	} else {
+		/* The SDR's channelizer takes the band around the frequency to the
+		 * radio's IQ rate: as given, else the lowest SDR rate / 2^k that holds
+		 * the baseband (halfband stages only) */
+		if (st->channelizer_rate == 0 && sdr_config && sdr_config->samplerate > st->dsp_samplerate)
+			st->iq_rate = sdr_calculate_optimal_rate(sdr_config->samplerate, baseband_extent);
+
+		if (sdr_config)
+			LOGP(DSDR, LOGL_NOTICE, "Channelizer: SDR=%d Hz -> IQ=%d Hz (rf_bw=%.1f kHz, signal=%.1f kHz)\n",
+			     sdr_config->samplerate, st->iq_rate,
+			     2.0 * baseband_extent / 1000.0, st->dsp_samplerate / 1000.0);
+	}
 	/* on an SDR backend the SDR rate is the backend's, this program does
 	 * not know it: the IQ rate comes from -s unless it is given */
 	if (sdr_config && sdr_config->backend && st->iq_rate < baseband_extent * 2.0 / 0.75)
@@ -2294,19 +2346,236 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Stereo works with time constant of 50 uS or 75 uS only, use '-h' for help!\n");
 		exit(0);
 	}
+}
+
+static double now_s(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+/* two stations on one thing (string a of station i = string b of j) */
+static int same_thing(const char *what, const char *a, const char *b, int i, int j)
+{
+	if (!a || !b || strcmp(a, b))
+		return 0;
+	fprintf(stderr, "Station %d and %d: the same %s '%s', use '-h' for help!\n", i + 1, j + 1, what, a);
+	return 1;
+}
+
+/* Several stations: what they cannot share (docs/RADIO-STATIONS.md, piece
+ * 9): a server endpoint, a paging FIFO, an audio device, an output file,
+ * the TMC tables (one set per process), overlapping bands. */
+static int stations_refused(void)
+{
+	int i, j, bad = 0;
+
+	for (i = 0; i < num_stations; i++) {
+		station_t *a = &stations[i];
+
+		for (j = i + 1; j < num_stations; j++) {
+			station_t *b = &stations[j];
+			const char *ae[] = { a->xdr_gtk_server, a->rdsspy_server, a->uecp_server, a->asciig_server, a->rigctl_server_endpoint };
+			const char *be[] = { b->xdr_gtk_server, b->rdsspy_server, b->uecp_server, b->asciig_server, b->rigctl_server_endpoint };
+			int x, y;
+
+			for (x = 0; x < 5; x++)
+				for (y = 0; y < 5; y++)
+					bad |= same_thing("server endpoint", ae[x], be[y], i, j);
+			if (a->rds_paging && b->rds_paging)
+				bad |= same_thing("paging FIFO", a->rds_paging_pipe_path, b->rds_paging_pipe_path, i, j);
+			if (a->tx && b->tx)
+				bad |= same_thing("audio input device", a->tx_audiodev, b->tx_audiodev, i, j);
+			if (a->rx && b->rx)
+				bad |= same_thing("audio output device", a->rx_audiodev, b->rx_audiodev, i, j);
+			if (a->rx && b->rx)
+				bad |= same_thing("RX wave file", a->rx_wave_file, b->rx_wave_file, i, j);
+			bad |= same_thing("hexrds file", a->rds_hexrds_file, b->rds_hexrds_file, i, j);
+			bad |= same_thing("RDS bitstream file", a->rds_bitstream_file, b->rds_bitstream_file, i, j);
+			if ((a->rds_tmc_events_file && b->rds_tmc_events_file && strcmp(a->rds_tmc_events_file, b->rds_tmc_events_file))
+			 || (a->rds_tmc_locations_path && b->rds_tmc_locations_path && strcmp(a->rds_tmc_locations_path, b->rds_tmc_locations_path))) {
+				fprintf(stderr, "Station %d and %d: different TMC tables (one set per osmoradio), use '-h' for help!\n", i + 1, j + 1);
+				bad = 1;
+			}
+			if (((a->rx && b->rx) || (a->tx && b->tx)) && fabs(a->frequency - b->frequency) < a->baseband_extent + b->baseband_extent) {
+				fprintf(stderr, "Station %d (%.4f MHz) and %d (%.4f MHz): their bands overlap (%.0f / %.0f kHz wide), use '-h' for help!\n",
+					i + 1, a->frequency / 1e6, j + 1, b->frequency / 1e6, 2.0 * a->baseband_extent / 1e3, 2.0 * b->baseband_extent / 1e3);
+				bad = 1;
+			}
+		}
+	}
+	return bad ? -EINVAL : 0;
+}
+
+/* Several stations in-process: the SDR's centre off all of them (DC, LO
+ * leakage): between the lowest and the highest, moved beside a station
+ * that covers it */
+static double stations_centre(void)
+{
+	double lo = stations[0].frequency, hi = lo, c, guard = 10000.0;
+	int i, moved, tries;
+
+	for (i = 1; i < num_stations; i++) {
+		if (stations[i].frequency < lo)
+			lo = stations[i].frequency;
+		if (stations[i].frequency > hi)
+			hi = stations[i].frequency;
+	}
+	c = (lo + hi) / 2.0;
+	for (tries = 0; tries < 2 * STATIONS_MAX; tries++) {
+		moved = 0;
+		for (i = 0; i < num_stations; i++) {
+			station_t *s = &stations[i];
+
+			if (fabs(c - s->frequency) < s->baseband_extent + guard) {
+				/* to its nearer edge */
+				c = (c < s->frequency) ? s->frequency - s->baseband_extent - guard : s->frequency + s->baseband_extent + guard;
+				moved = 1;
+			}
+		}
+		if (!moved)
+			break;
+	}
+	return c;
+}
+
+/* Several stations: one SDR (in-process: opened as a backend's device, the
+ * engine without channels of its own) or the SDR backend, a band per
+ * station. Returns the SDR (NULL on the backend) in *sdr_p; < 0 on error. */
+static int stations_sdr_open(void **sdr_p, int any_rx, int any_tx)
+{
+	char err[256];
+	int i, ntx = 0;
+
+	*sdr_p = NULL;
+	for (i = 0; i < num_stations; i++)
+		ntx += stations[i].tx;
+	if (sdr_config->backend) {
+		sdr_bands_backend(&bands, sdr_config->backend);
+	} else {
+		double centre = stations_centre();
+		sdr_engine_t *e;
+
+		LOGP(DSDR, LOGL_NOTICE, "%d stations on one SDR, centre %.6f MHz\n", num_stations, centre / 1e6);
+		sdr_server_mode(ntx ? ntx : 1);
+		*sdr_p = sdr_open(0, NULL, any_tx ? &centre : NULL, any_rx ? &centre : NULL, NULL, 0, 0.0,
+				  BANK_DSP_RATE, BANK_DSP_RATE * dsp_buffer / 1000, 1.0, 0.0, 0.0, 1.0);
+		if (!*sdr_p)
+			return -EIO;
+		e = sdr_server_engine(*sdr_p);
+		if (!e) {
+			fprintf(stderr, "Several stations: the SDR has no filter bank engine.\n");
+			return -EIO;
+		}
+		sdr_bands_engine(&bands, e, centre, centre);
+	}
+	for (i = 0; i < num_stations; i++) {
+		station_t *s = &stations[i];
+		sdr_band_def_t def;
+
+		snprintf(s->band_name, sizeof(s->band_name), "osmoradio %.4f MHz", s->frequency / 1e6);
+		def.name = s->band_name;
+		def.rx = s->rx;
+		def.tx = s->tx;
+		def.rx_frequency = s->frequency;
+		def.tx_frequency = s->frequency;
+		def.iq_rate = s->iq_rate;
+		def.buffer_size = s->buffer_size;
+		s->band = sdr_band_add(&bands, &def, err, sizeof(err));
+		if (s->band < 0) {
+			fprintf(stderr, "Station %d: %s\n", i + 1, err);
+			return s->band;
+		}
+		LOGP(DSDR, LOGL_NOTICE, "Station %d: %s, %s%s%s, IQ %d Hz, TX level 1/%.0f\n", i + 1, s->band_name,
+		     s->rx ? "RX" : "", (s->rx && s->tx) ? " + " : "", s->tx ? "TX" : "", s->iq_rate,
+		     s->tx ? 1.0 / sdr_band_tx_scale(&bands, s->band) : 0.0);
+	}
+	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+	int rc, argi, si, any_rx = 0, any_tx = 0, num_started = 0;
+	struct termios term, term_orig;
+	int c;
+	void *sdr = NULL;
+	double server_poll = 0.0;
+
+	loglevel = LOGL_NOTICE;
+	logging_init();
+
+	sdr_config_init(DEFAULT_LO_OFFSET);
+	station_defaults(st);
+
+	/* handle options / config file */
+	add_options();
+	rc = options_config_file(argc, argv, "~/.osmocom/analog/radio.conf", handle_options);
+	if (rc < 0)
+		return 0;
+	options_from_command_line = 1;
+	argi = options_command_line(argc, argv, handle_options);
+	if (argi <= 0)
+		return argi;
+	/* no -f on the command line: the station is the defaults */
+	if (!num_stations) {
+		stations[0] = station_default;
+		num_stations = 1;
+	}
+	for (si = 0; si < num_stations; si++) {
+		static station_t initial;
+
+		st = &stations[si];
+		station_defaults(&initial);
+		rc = station_kind_options(st, &initial);
+		if (rc < 0)
+			return rc;
+		station_check_options(argv[0]);
+	}
+	st = &stations[0];
+
+	/* global inits */
+	fm_init(fast_math);
+	am_init(fast_math);
+
+	/* Determine input samplerate */
+	if (st->channelizer_rate > 0)
+		st->iq_rate = st->channelizer_rate;
+	else
+		st->iq_rate = st->dsp_samplerate;
+
+	rc = sdr_configure(st->iq_rate);
+	if (rc < 0)
+		return rc;
+	if (rc == 0) {
+		fprintf(stderr, "Please select SDR, use '-h' for help!\n");
+		exit(0);
+	}
+
+	for (si = 0; si < num_stations; si++) {
+		st = &stations[si];
+		station_signal();
+	}
+	st = &stations[0];
 
 	/* Keep SDR direction flags in sync with radio app direction flags.
 	 * Without this, --rx / --tx still leaves the opposite SDR path enabled,
 	 * which breaks RX-only SDRs (e.g. RTL-SDR) and needlessly initializes
-	 * TX-side radio components in receive-only mode. */
-	if (st->rx && !st->tx) {
+	 * TX-side radio components in receive-only mode. Several stations: the
+	 * directions of all of them. */
+	for (si = 0; si < num_stations; si++) {
+		any_rx |= stations[si].rx;
+		any_tx |= stations[si].tx;
+	}
+	if (any_rx && !any_tx) {
 		if (sdr_config->tx_only) {
 			fprintf(stderr, "Conflicting options: --rx cannot be combined with --sdr-tx-only\n");
 			exit(0);
 		}
 		sdr_config->rx_only = 1;
 	}
-	if (st->tx && !st->rx) {
+	if (any_tx && !any_rx) {
 		if (sdr_config->rx_only) {
 			fprintf(stderr, "Conflicting options: --tx cannot be combined with --sdr-rx-only\n");
 			exit(0);
@@ -2314,9 +2583,15 @@ int main(int argc, char *argv[])
 		sdr_config->tx_only = 1;
 	}
 
-	rc = station_init(st, sdr);
-	if (rc < 0)
-		goto error;
+	if (num_stations > 1 && stations_refused() < 0)
+		return -EINVAL;
+
+	for (si = 0; si < num_stations; si++) {
+		rc = station_init(&stations[si], sdr);
+		num_started = si + 1;
+		if (rc < 0)
+			goto error;
+	}
 
 	/* real time priority */
 	if (rt_prio > 0) {
@@ -2332,28 +2607,39 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	double tx_frequencies[1], rx_frequencies[1];
-	int am[1];
-	tx_frequencies[0] = st->frequency;
-	rx_frequencies[0] = st->frequency;
-	am[0] = 0;
-	sdr = sdr_open(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0, st->iq_rate, st->buffer_size, 1.0, 0.0, 0.0, 0.0);
-	if (!sdr)
-		goto error;
-	sdr_start(sdr);
+	if (num_stations > 1) {
+		/* a band per station; the spectral measurement is one station's */
+		rc = stations_sdr_open(&sdr, any_rx, any_tx);
+		if (rc < 0)
+			goto error;
+		if (sdr)
+			sdr_start(sdr);
+	} else {
+		double tx_frequencies[1], rx_frequencies[1];
+		int am[1];
+		tx_frequencies[0] = st->frequency;
+		rx_frequencies[0] = st->frequency;
+		am[0] = 0;
+		sdr = sdr_open(0, NULL, tx_frequencies, rx_frequencies, am, 0, 0.0, st->iq_rate, st->buffer_size, 1.0, 0.0, 0.0, 0.0);
+		if (!sdr)
+			goto error;
+		sdr_start(sdr);
 
-	/* Configure spectral measurement - center matches SDR tuned frequency */
-	sdr_spectral_configure(sdr_get_samplerate(sdr), st->frequency);
-	if (st->frequency > 0.0)
-		st->spectral_freq_idx = sdr_spectral_register_freq(st->frequency);
+		/* Configure spectral measurement - center matches SDR tuned frequency */
+		sdr_spectral_configure(sdr_get_samplerate(sdr), st->frequency);
+		if (st->frequency > 0.0)
+			st->spectral_freq_idx = sdr_spectral_register_freq(st->frequency);
+	}
 
-	/* prepare terminal */
+	/* prepare terminal (the keys: one station only) */
 	tcgetattr(0, &term_orig);
 	term = term_orig;
-	term.c_lflag &= ~(ISIG|ICANON|ECHO);
-	term.c_cc[VMIN]=1;
-	term.c_cc[VTIME]=2;
-	tcsetattr(0, TCSANOW, &term);
+	if (num_stations == 1) {
+		term.c_lflag &= ~(ISIG|ICANON|ECHO);
+		term.c_cc[VMIN]=1;
+		term.c_cc[VTIME]=2;
+		tcsetattr(0, TCSANOW, &term);
+	}
 
 	/* catch signals */
 	signal(SIGINT, sighandler);
@@ -2362,10 +2648,12 @@ int main(int argc, char *argv[])
 	signal(SIGPIPE, sighandler);
 
 	printf("Starting radio...\n");
-	rc = radio_start(&st->radio);
-	if (rc < 0) {
-		fprintf(stderr, "Failed to start radio's streaming, exitting!\n");
-		goto error_start;
+	for (si = 0; si < num_stations; si++) {
+		rc = radio_start(&stations[si].radio);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to start radio's streaming, exitting!\n");
+			goto error_start;
+		}
 	}
 
 	while (!quit) {
@@ -2375,10 +2663,31 @@ int main(int argc, char *argv[])
 		 * Use 100us when TX is active to keep the buffer fed.
 		 * In RX-only mode, use 250us to reduce ring buffer pressure
 		 * and avoid SDR-side overflow on high sample rate devices. */
-		if (st->tx)
+		if (any_tx)
 			usleep(100);
 		else
 			usleep(250);
+
+		if (num_stations > 1) {
+			/* each station in turn; the SDR's RX status (raw ring,
+			 * clipping, overflow: as the backend does) every 10 ms */
+			if (sdr && now_s() - server_poll >= 0.010) {
+				server_poll = now_s();
+				sdr_server_poll(sdr);
+			}
+			for (si = 0; si < num_stations; si++) {
+				rc = station_poll(&stations[si], sdr);
+				if (rc < 0)
+					break;
+			}
+			if (rc < 0)
+				break;
+			/* no keys with several stations: the terminal is left
+			 * as it is, CTRL+c is SIGINT (the keys are one station's
+			 * operations: the status and control interface,
+			 * docs/RADIO-STATIONS.md piece 8) */
+			continue;
+		}
 
 		rc = station_poll(st, sdr);
 		if (rc < 0)
@@ -2475,7 +2784,8 @@ error_start:
 	display_iq_on(0);
 
 	/* reset terminal */
-	tcsetattr(0, TCSANOW, &term_orig);
+	if (num_stations == 1)
+		tcsetattr(0, TCSANOW, &term_orig);
 	
 error:
 	/* reset real time prio */
@@ -2487,9 +2797,14 @@ error:
 		sched_setscheduler(0, SCHED_OTHER, &schedp);
 	}
 
+	/* the bands before the SDR: the engine frees its groups at exit, and
+	 * a group of stopped device threads would not go */
+	if (num_stations > 1)
+		sdr_bands_close(&bands);
 	if (sdr)
 		sdr_close(sdr);
-	station_exit(st);
+	for (si = 0; si < num_started; si++)
+		station_exit(&stations[si]);
 
 	/* global exits */
 	fm_exit();

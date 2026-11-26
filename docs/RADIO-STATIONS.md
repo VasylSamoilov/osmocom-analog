@@ -264,7 +264,50 @@ paging case runs 12 s
       x 0.956); the AM station keeps the initial 50 us, so its output is
       as before. Known flake: opts.sh compares two runs of B with RDS,
       the CT minute edge can make them differ once (run again).
-   c. N stations: several `-f`, the loop over them, the SDR bands.
+   c. N stations (done): up to 8 `-f`, each a copy of the defaults; the
+      kind check and main's checks per station (station_check_options(),
+      station_signal(): the moved code as it was, on the global st set per
+      station). One station: everything as before (sdr_open() of its band,
+      spectral measurement, keys). Several: the IQ rate is the class of
+      the signal (extent x 2 / 0.75 up to 48 k: the bank's DSP rate, up
+      to 240 k, else 480 k; or --channelizer-rate); start-up refusals
+      (stations_refused(): a server endpoint, a paging FIFO, an audio
+      device, an RX wave / hexrds / bitstream file on two stations,
+      different TMC tables, overlapping bands of one direction); in-process
+      the SDR opened as a backend's device (sdr_server_mode(TX stations),
+      sdr_open() without channels at the centre, the bank at 48 k), the
+      centre between the lowest and highest station, moved beside a
+      station that covers it (+ 10 kHz); on --sdr-backend no sdr_open(),
+      a registration per station; a band per station (sdr_bands), each at
+      1 / (TX stations) of full scale. The loop polls every station in
+      turn (none skips another), sdr_server_poll() every 10 ms; a
+      station's RX: its band, the meter, the radio, its servers - not the
+      scan, not the spectral measurement (one per process, at one rate);
+      the SNR from the SDR's RX status noise floor when valid, else
+      unknown (the radio's initial -1: no SNR-driven forced mono; the
+      meter says SNR 0 without a noise floor, which forces mono). The tune
+      callbacks (XDR-GTK, RDS Spy, ASCII-G, scan, rigctl) refuse: they
+      move the SDR (slice 7). No keys with several stations: the terminal
+      is left as it is, CTRL+c is SIGINT (the user, 2026-11-26: "we are
+      still reading keys?"). Exit: the bands, then the SDR, then the
+      stations. Proof (fake SDR, same command lines, c1e260e): suite.sh
+      12 the same, opts.sh the same except a second `-f` (a station now),
+      opts5b.sh, extra3c.sh, extra5a.sh the same. Several stations
+      offline: fake_sdr.c got a server mode - the real engine
+      (sdr_engine.c) at --sdr-samplerate, a device thread with TX looped to
+      RX in real time (1 ms blocks), optional white noise (FAKE_NOISE),
+      sdr_bands.c / sdr_client.c real; FM 100.0 MHz (240 k, chain), AM
+      100.6 MHz (48 k, bank), NFM 99.4 MHz (-D 2500 -B 3000, 48 k, bank),
+      each TX + RX of a 1 kHz tone (wave in, wave out), centre 100.1 MHz,
+      TX 1/3 each: SINAD (sinad.py: the tone fitted, the rest from 100 Hz
+      to the band edge) FM 61.2 dB, AM 73.0 dB, NFM 41.8 dB, ASan / UBSan
+      clean. Found on the way, fixed (15e3d63): libam's AM demodulator
+      gave 0 / 0 = NaN for IQ of exact zeros (a band before its first TX,
+      a gap the SDR fills with zeros) and the receiver stayed at full scale
+      for good - one station through IQ files with 0.1 s of zeros in front
+      too (c1e260e: SINAD -52 dB; fixed: 73.1 dB, without zeros the same
+      wave). Not covered offline: sdr.c's server mode with a real device
+      (slice 8), several stations on --sdr-backend.
    d. the proof: FM stereo + RDS, AM, NFM together offline.
 6. The wide bank (in-process from the station list, backend option).
 7. Per-station retune.
