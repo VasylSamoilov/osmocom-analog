@@ -538,4 +538,13 @@ Layer split (agreed, in slices, each proven identical before the next):
    being decoded (segments, calls being assembled, ON-PS, 3A, 13A bits)
    stay in the decoder, they are its trace, not a display);
 4. encoder: content sources (PS, RT, AF, paging queue, UECP, Dynamic
-   PS) apart from the scheduler and the bit / biphase generator.
+   PS) apart from the scheduler and the bit / biphase generator. Proof
+   first (the fake-SDR suite barely covers the scheduler): enc_harness
+   (~/.cache/sdrangel-rp-rds/enc, run.sh <rev> <rev>) runs the encoder
+   alone on its public API, on a fake clock from 23:59:30 UTC (time /
+   clock_gettime / gettimeofday wrapped), and compares the samples and
+   the logs of 7 scenarios: all content (9 group types reach a receiver,
+   CT across the minute), Dynamic PS, paging (ten calls of all types at
+   fixed times, battery saving, 13A; 13 decoded), the address scan (41),
+   the TX hexrds file (twice) and the bitstream file. Negative control:
+   the warmup one group shorter shows in 'all' and 'dps'.
