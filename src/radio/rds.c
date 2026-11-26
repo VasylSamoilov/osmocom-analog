@@ -12592,6 +12592,8 @@ void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
 	rds_decoder_bit(rds, bit);
 }
 
+static void rds_decoder_reports(rds_decoder_t *rds);
+
 void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
                          double pilot_phase, double pilot_phasestep)
 {
@@ -12752,7 +12754,14 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 			rds->prev_clock_bit = lo_clock;
 		}
 	}
-	
+
+	rds_decoder_reports(rds);
+}
+
+/* Application side: the periodic reports, on the decoder's sample clock
+ * (rds_decoder_process advances status_timer and signal_debug_timer) */
+static void rds_decoder_reports(rds_decoder_t *rds)
+{
 	/* Signal-level debug report (every 1 second) */
 	if (rds->signal_debug_timer >= rds->signal_debug_interval) {
 		/*
