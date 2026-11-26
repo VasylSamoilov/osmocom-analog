@@ -2553,6 +2553,22 @@ int main(int argc, char *argv[])
 	else
 		st->iq_rate = st->dsp_samplerate;
 
+	/* several stations in-process: the SDR rate is not one station's IQ
+	 * rate (sdr_configure() takes the rate given as the SDR rate when
+	 * none is set): it is given, it must hold them all */
+	if (num_stations > 1 && !sdr_config->backend && !sdr_config->samplerate && !sdr_config->rx_samplerate && !sdr_config->tx_samplerate) {
+		double lo = stations[0].frequency, hi = lo;
+
+		for (si = 1; si < num_stations; si++) {
+			if (stations[si].frequency < lo)
+				lo = stations[si].frequency;
+			if (stations[si].frequency > hi)
+				hi = stations[si].frequency;
+		}
+		fprintf(stderr, "Several stations on one SDR: give its sample rate (--sdr-samplerate), at least about %.0f S/s for %.4f .. %.4f MHz (75 %% of it usable), use '-h' for help!\n",
+			(hi - lo + 2 * 240000.0) / 0.75, lo / 1e6, hi / 1e6);
+		return -EINVAL;
+	}
 	rc = sdr_configure(st->iq_rate);
 	if (rc < 0)
 		return rc;
