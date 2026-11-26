@@ -165,6 +165,7 @@ typedef struct radio {
 	/* RDS encoder */
 	rds_encoder_t	rds_enc;		/* RDS encoder state */
 	rds_decoder_t	rds_dec;		/* RDS decoder state */
+	rds_rx_app_t	rds_app;		/* its application side: files, display, servers */
 	/* SCA encoder/decoder */
 	sca_encoder_t	sca_enc;		/* SCA encoder state */
 	sca_decoder_t	sca_dec;		/* SCA decoder state */

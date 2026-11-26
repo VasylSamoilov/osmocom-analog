@@ -1872,6 +1872,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 				LOGP(DRADIO, LOGL_NOTICE, "RDS: Initializing decoder for RX path\n");
 				rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us, rds_force_rbds);
 				rds_decoder_set_paging(&radio->rds_dec, radio->opts.rds_rx_paging);
+				rds_rx_app_init(&radio->rds_app);
+				rds_rx_app_attach(&radio->rds_app, &radio->rds_dec);
 			} else {
 				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping decoder init (TX-only mode)\n");
 			}
@@ -2121,6 +2123,7 @@ void radio_exit(radio_t *radio)
 	 * Both are zero when not initialised (radio_init clears the radio). */
 	rds_encoder_exit(&radio->rds_enc);
 	rds_decoder_exit(&radio->rds_dec);
+	rds_rx_app_exit(&radio->rds_app);
 }
 
 int radio_start(radio_t __attribute__((unused)) *radio)

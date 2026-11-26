@@ -671,6 +671,11 @@ void rds_server_cleanup(rds_server_t *srv)
 		close(srv->listen_fd);
 		srv->listen_fd = RDS_FD_NONE;
 	}
+	if (srv->uecp_app) {
+		rds_rx_app_exit(srv->uecp_app);
+		free(srv->uecp_app);
+		srv->uecp_app = NULL;
+	}
 	if (srv->uecp_decoder) {
 		rds_decoder_exit(srv->uecp_decoder);
 		free(srv->uecp_decoder);
@@ -2473,8 +2478,12 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 			/* Lazy-allocate UECP group decoder */
 			if (!srv->uecp_decoder) {
 				srv->uecp_decoder = calloc(1, sizeof(rds_decoder_t));
-				if (srv->uecp_decoder)
+				srv->uecp_app = calloc(1, sizeof(rds_rx_app_t));
+				if (srv->uecp_decoder && srv->uecp_app) {
 					rds_decoder_init_groups(srv->uecp_decoder, 0, 1, 0);
+					rds_rx_app_init(srv->uecp_app);
+					rds_rx_app_attach(srv->uecp_app, srv->uecp_decoder);
+				}
 			}
 			if (srv->uecp_decoder) {
 				uint16_t blocks[4] = { pi, b2, b3, b4 };

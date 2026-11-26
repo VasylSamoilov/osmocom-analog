@@ -276,8 +276,12 @@ int main(int argc, char *argv[])
 			continue;
 		}
 		rds_decoder_set_paging(&rds, paging_mode);
+		/* its application side: the display, and the paging consumer */
+		rds_rx_app_t app;
+		rds_rx_app_init(&app);
+		rds_rx_app_attach(&app, &rds);
 		int pages = 0;
-		rds_decoder_set_paging_callback(&rds, count_page, &pages);
+		rds_rx_app_set_paging_callback(&app, count_page, &pages);
 
 		int groups;
 		if (is_binary_rds(files[i]))
@@ -296,6 +300,7 @@ int main(int argc, char *argv[])
 			printf("Paging messages received: %d\n", pages);
 
 		rds_decoder_exit(&rds);
+		rds_rx_app_exit(&app);
 	}
 
 	printf("\nTotal: %d groups processed across %d file(s)\n", total_groups, file_count);

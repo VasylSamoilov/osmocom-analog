@@ -2003,6 +2003,7 @@ typedef struct rds_encoder {
 	
 	/* TX file logging decoder (decodes transmitted groups for logging) */
 	struct rds_decoder *tx_log_decoder;	/* Decoder for logging TX groups */
+	struct rds_rx_app *tx_log_app;		/* its display (the log lines) */
 
 	/* ============================================================
 	 * Group 8A: Traffic Message Channel (TMC)
@@ -2573,6 +2574,33 @@ enum rds_change {
 
 struct rds_decoder;
 
+/* What the decoder gives out - every bit, every group (with its blocks'
+ * status), a received field, a paging message, TDC / IH / TMC data, a new
+ * station (retune) - to one sink: the station's application side
+ * (rds_rx_app_t: files, display, servers) or anything else. Members left
+ * NULL get nothing; a decoder without a sink only decodes. */
+typedef struct rds_decoder_sink {
+	void	(*bit)(void *arg, int bit);
+	/* present: bit i = block i received (a missing block's status may be
+	 * stale on the bit path) */
+	void	(*group)(void *arg, const uint16_t blocks[4], const uint8_t status[4], uint8_t present);
+	void	(*changed)(void *arg, const struct rds_decoder *rds, enum rds_change what);
+	void	(*paging)(void *arg, const rds_paging_rx_msg_t *msg);
+	void	(*tdc)(void *arg, uint8_t channel, const uint8_t *data, int len);
+	void	(*ih)(void *arg, uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data);
+	void	(*tmc)(void *arg, const rds_tmc_msg_t *msg);
+	void	(*new_station)(void *arg, const struct rds_decoder *rds);
+	void	*arg;
+} rds_decoder_sink_t;
+
+/* The display's own state: what it showed last (set back on a new station) */
+struct rds_display_shown {
+	uint8_t	ct_hour;		/* Hour last logged via INFO */
+	uint8_t	ct_minute;		/* Minute last logged via INFO */
+	uint8_t	pty;			/* PTY value last logged via INFO */
+	uint8_t	ecc_mismatch;		/* ECC vs RDS / RBDS mode mismatch shown */
+};
+
 typedef struct rds_decoder {
 	/* Configuration */
 	double		samplerate;	/* sample rate of signal */
@@ -2584,40 +2612,8 @@ typedef struct rds_decoder {
 	double		signal_debug_interval;	/* signal debug report every (samples) */
 	int		paging_mode;		/* RDS_RX_PAGING_OFF / _AUTO / _ON */
 
-	/* Application: where the decoded groups and messages go */
-	FILE		*hexrds_file;		/* Output file for .hexrds format */
-	FILE		*bitstream_file;	/* Output file for .rds bitstream format */
-	uint8_t		bitstream_byte;		/* Accumulator for bitstream output */
-	int		bitstream_bit_count;	/* Bits accumulated (0-7) */
-
-	/* Protocol server callback (for XDR-GTK, RDS Spy output) */
-	void		(*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg);
-	void		*group_callback_arg;
-
-	/* Group 5: Transparent Data Channel (TDC) receive callback
-	 * Called for every 5A/5B group with: channel (0-31), data bytes, length (4 or 2) */
-	void		(*tdc_callback)(uint8_t channel, const uint8_t *data, int len, void *arg);
-	void		*tdc_callback_arg;
-
-	/* Group 6: In-House application receive callback
-	 * Called for every 6A/6B group with: b_payload (5 bits), is_6b, c_data, d_data */
-	void		(*ih_callback)(uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data, void *arg);
-	void		*ih_callback_arg;
-
-	/* Group 8A: TMC (Traffic Message Channel) receive callback
-	 * Called when a single-group or complete multi-group user message is decoded.
-	 * msg contains the extracted T/F/DP/direction/extent/event/location fields. */
-	void		(*tmc_callback)(const rds_tmc_msg_t *msg, void *arg);
-	void		*tmc_callback_arg;
-
-	/* Group 7A: a complete paging message, after its log line
-	 * (rds_decoder_set_paging_callback) */
-	void		(*paging_callback)(const rds_paging_rx_msg_t *msg, void *arg);
-	void		*paging_callback_arg;
-
-	/* a field received (rds_decoder_set_change_callback), after the display */
-	void		(*change_callback)(const struct rds_decoder *rds, enum rds_change what, void *arg);
-	void		*change_callback_arg;
+	/* Where what was received goes (rds_decoder_set_sink) */
+	rds_decoder_sink_t sink;
 
 	/* DSP continuity: the demodulator goes on through a new station */
 	double		freq_subcarrier;	/* Current locked frequency (~57000 Hz) */
@@ -2811,14 +2807,6 @@ typedef struct rds_decoder {
 	uint8_t		ct_status;		/* Status of CT decode */
 	time_t		ct_utc_timestamp;	/* Decoded CT as unix timestamp (UTC) */
 	time_t		ct_rx_sys_time;		/* System time(NULL) when CT was received */
-	/* The display's own state: what it showed last (rds_display_changed;
-	 * set back by rds_display_new_station on init and reset) */
-	struct rds_display_shown {
-		uint8_t	ct_hour;		/* Hour last logged via INFO */
-		uint8_t	ct_minute;		/* Minute last logged via INFO */
-		uint8_t	pty;			/* PTY value last logged via INFO */
-		uint8_t	ecc_mismatch;		/* ECC vs RDS / RBDS mode mismatch shown */
-	} shown;
 
 	/* Display options */
 	int		ansi_display;		/* 1 = ANSI colour in rds_decoder_display() */
@@ -2922,6 +2910,45 @@ typedef struct rds_decoder {
 
 /* The first field of what was received (rds_decoder_reset clears from it) */
 #define RDS_DECODER_RECEIVED	rbds_hint_logged
+
+/* The station's application side of a decoder, its sink (rds_rx_app_attach):
+ * the hexrds / bitstream files, the display (the log lines of received
+ * fields and paging messages, with its own 'shown' state) and the servers'
+ * and consumers' callbacks. */
+typedef struct rds_rx_app {
+	FILE		*hexrds_file;		/* Output file for .hexrds format */
+	FILE		*bitstream_file;	/* Output file for .rds bitstream format */
+	uint8_t		bitstream_byte;		/* Accumulator for bitstream output */
+	int		bitstream_bit_count;	/* Bits accumulated (0-7) */
+
+	struct rds_display_shown shown;		/* the display: what it showed last */
+
+	/* Protocol server callback (for XDR-GTK, RDS Spy output) */
+	void		(*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg);
+	void		*group_callback_arg;
+	/* Group 5: Transparent Data Channel (TDC): channel (0-31), data bytes, length (4 or 2) */
+	void		(*tdc_callback)(uint8_t channel, const uint8_t *data, int len, void *arg);
+	void		*tdc_callback_arg;
+	/* Group 6: In-House application: b_payload (5 bits), is_6b, c_data, d_data */
+	void		(*ih_callback)(uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data, void *arg);
+	void		*ih_callback_arg;
+	/* Group 8A: TMC, a single-group or complete multi-group user message */
+	void		(*tmc_callback)(const rds_tmc_msg_t *msg, void *arg);
+	void		*tmc_callback_arg;
+	/* Group 7A: a complete paging message, after its log line */
+	void		(*paging_callback)(const rds_paging_rx_msg_t *msg, void *arg);
+	void		*paging_callback_arg;
+	/* a field received, after the display */
+	void		(*change_callback)(const rds_decoder_t *rds, enum rds_change what, void *arg);
+	void		*change_callback_arg;
+} rds_rx_app_t;
+
+/* Where a decoder gives out what it receives (copied; NULL: nowhere) */
+void rds_decoder_set_sink(rds_decoder_t *rds, const rds_decoder_sink_t *sink);
+/* The application side: init, the decoder's sink, close the files */
+void rds_rx_app_init(rds_rx_app_t *app);
+void rds_rx_app_attach(rds_rx_app_t *app, rds_decoder_t *rds);
+void rds_rx_app_exit(rds_rx_app_t *app);
 
 /* Initialize RDS decoder
  * debug: Enable debug logging (raw hex codes, --rds-debug)
@@ -3069,13 +3096,13 @@ size_t rds_ert_extract_tag_text(const rds_ert_decoder_t *ert,
 void rds_decoder_exit(rds_decoder_t *rds);
 
 /* File output for captured RDS data */
-int rds_decoder_set_hexrds_file(rds_decoder_t *rds, const char *filename);
-int rds_decoder_set_bitstream_file(rds_decoder_t *rds, const char *filename);
+int rds_rx_app_set_hexrds_file(rds_rx_app_t *app, const char *filename);
+int rds_rx_app_set_bitstream_file(rds_rx_app_t *app, const char *filename);
 
 /* Set callback for decoded RDS groups (for protocol servers) */
-void rds_decoder_set_group_callback(rds_decoder_t *rds,
-                                    void (*callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg),
-                                    void *arg);
+void rds_rx_app_set_group_callback(rds_rx_app_t *app,
+                                   void (*callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg),
+                                   void *arg);
 
 /* Group 5: Transparent Data Channel (TDC) encoder API
  * EN 50067 S.3.1.5.8, S.3.2.4.  32 independent channels (0-31).
@@ -3083,19 +3110,19 @@ void rds_decoder_set_group_callback(rds_decoder_t *rds,
 void rds_enc_tdc_set_channel(rds_encoder_t *rds, int channel, const uint8_t *data, int len);
 void rds_enc_tdc_clear_channel(rds_encoder_t *rds, int channel);
 void rds_enc_tdc_set_version(rds_encoder_t *rds, int use_5b);
-void rds_decoder_set_tdc_callback(rds_decoder_t *rds,
-				  void (*fn)(uint8_t channel, const uint8_t *data, int len, void *arg),
-				  void *arg);
+void rds_rx_app_set_tdc_callback(rds_rx_app_t *app,
+				 void (*fn)(uint8_t channel, const uint8_t *data, int len, void *arg),
+				 void *arg);
 
 /* Group 6: In-House applications (IH) encoder API
  * EN 50067 S.3.1.5.9, Fig 24.  Payload is operator-defined. */
 void rds_enc_ih_set_6a(rds_encoder_t *rds, uint8_t b_payload, uint16_t c_data, uint16_t d_data);
 void rds_enc_ih_set_6b(rds_encoder_t *rds, uint8_t b_payload, uint16_t d_data);
 void rds_enc_ih_clear(rds_encoder_t *rds);
-void rds_decoder_set_ih_callback(rds_decoder_t *rds,
-				 void (*fn)(uint8_t b_payload, int is_6b,
-					    uint16_t c_data, uint16_t d_data, void *arg),
-				 void *arg);
+void rds_rx_app_set_ih_callback(rds_rx_app_t *app,
+				void (*fn)(uint8_t b_payload, int is_6b,
+					   uint16_t c_data, uint16_t d_data, void *arg),
+				void *arg);
 
 /* Group 8A: TMC (Traffic Message Channel) TX/RX API
  * EN 50067 S.3.1.5.12.  Bit layout from gr-rds (GPLv3) + redsea (MIT).
@@ -3105,17 +3132,17 @@ void rds_enc_tmc_set_msg(rds_encoder_t *rds, const rds_tmc_msg_t *msg);
 void rds_enc_tmc_clear(rds_encoder_t *rds);
 int  rds_enc_tmc_get_active(const rds_encoder_t *rds);
 void rds_enc_tmc_get_msg(const rds_encoder_t *rds, rds_tmc_msg_t *msg_out);
-void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
-				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
-				  void *arg);
+void rds_rx_app_set_tmc_callback(rds_rx_app_t *app,
+				 void (*fn)(const rds_tmc_msg_t *msg, void *arg),
+				 void *arg);
 /* A received field (enum rds_change) to a consumer, after the display */
-void rds_decoder_set_change_callback(rds_decoder_t *rds,
-				     void (*fn)(const rds_decoder_t *rds, enum rds_change what, void *arg),
-				     void *arg);
-/* A complete received paging message to a consumer */
-void rds_decoder_set_paging_callback(rds_decoder_t *rds,
-				     void (*fn)(const rds_paging_rx_msg_t *msg, void *arg),
-				     void *arg);
+void rds_rx_app_set_change_callback(rds_rx_app_t *app,
+				    void (*fn)(const rds_decoder_t *rds, enum rds_change what, void *arg),
+				    void *arg);
+/* A complete received paging message to a consumer, after its log line */
+void rds_rx_app_set_paging_callback(rds_rx_app_t *app,
+				    void (*fn)(const rds_paging_rx_msg_t *msg, void *arg),
+				    void *arg);
 /* Get the TMC Location Table Number announced via 3A system-info (0 = encrypted) */
 uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds);
 

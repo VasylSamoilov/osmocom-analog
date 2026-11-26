@@ -4955,14 +4955,6 @@ void rds_enc_tdc_set_version(rds_encoder_t *rds, int use_5b)
 {
 	if (rds) rds->tdc_use_5b = use_5b ? 1 : 0;
 }
-void rds_decoder_set_tdc_callback(rds_decoder_t *rds,
-				  void (*fn)(uint8_t ch, const uint8_t *data, int len, void *arg),
-				  void *arg)
-{
-	if (!rds) return;
-	rds->tdc_callback = fn;
-	rds->tdc_callback_arg = arg;
-}
 
 /* ============================================================
  * Group 8A: Traffic Message Channel (TMC / ALERT-C)
@@ -5023,32 +5015,6 @@ void rds_enc_tmc_set_msg(rds_encoder_t *rds, const rds_tmc_msg_t *msg)
 void rds_enc_tmc_clear(rds_encoder_t *rds)
 {
 	if (rds) rds->tmc.active = 0;
-}
-void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
-				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
-				  void *arg)
-{
-	if (!rds) return;
-	rds->tmc_callback     = fn;
-	rds->tmc_callback_arg = arg;
-}
-
-void rds_decoder_set_change_callback(rds_decoder_t *rds,
-				     void (*fn)(const rds_decoder_t *rds, enum rds_change what, void *arg),
-				     void *arg)
-{
-	if (!rds) return;
-	rds->change_callback     = fn;
-	rds->change_callback_arg = arg;
-}
-
-void rds_decoder_set_paging_callback(rds_decoder_t *rds,
-				     void (*fn)(const rds_paging_rx_msg_t *msg, void *arg),
-				     void *arg)
-{
-	if (!rds) return;
-	rds->paging_callback     = fn;
-	rds->paging_callback_arg = arg;
 }
 
 uint8_t rds_dec_get_tmc_ltn(const rds_decoder_t *rds)
@@ -5658,15 +5624,6 @@ void rds_enc_ih_set_6b(rds_encoder_t *rds, uint8_t b_payload, uint16_t d_data)
 void rds_enc_ih_clear(rds_encoder_t *rds)
 {
 	if (rds) rds->ih.active = 0;
-}
-void rds_decoder_set_ih_callback(rds_decoder_t *rds,
-				 void (*fn)(uint8_t b_payload, int is_6b,
-					    uint16_t c_data, uint16_t d_data, void *arg),
-				 void *arg)
-{
-	if (!rds) return;
-	rds->ih_callback     = fn;
-	rds->ih_callback_arg = arg;
 }
 
 void rds_enc_set_rt(rds_encoder_t *rds, const char *rt)
@@ -8894,6 +8851,30 @@ void rds_encoder_exit(rds_encoder_t *rds)
 		free(rds->tx_log_decoder);
 		rds->tx_log_decoder = NULL;
 	}
+	if (rds->tx_log_app) {
+		rds_rx_app_exit(rds->tx_log_app);
+		free(rds->tx_log_app);
+		rds->tx_log_app = NULL;
+	}
+}
+
+/* The TX log: a group-only decoder of the sent groups with its display */
+static void rds_tx_log_open(rds_encoder_t *rds)
+{
+	if (rds->tx_log_decoder)
+		return;
+	rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
+	rds->tx_log_app = calloc(1, sizeof(rds_rx_app_t));
+	if (!rds->tx_log_decoder || !rds->tx_log_app) {
+		free(rds->tx_log_decoder);
+		free(rds->tx_log_app);
+		rds->tx_log_decoder = NULL;
+		rds->tx_log_app = NULL;
+		return;
+	}
+	rds_decoder_init_groups(rds->tx_log_decoder, rds->debug, rds->verbose, 0);
+	rds_rx_app_init(rds->tx_log_app);
+	rds_rx_app_attach(rds->tx_log_app, rds->tx_log_decoder);
 }
 
 /* ============================================================
@@ -8953,13 +8934,8 @@ int rds_enc_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename)
 	rds->tx_file_eof_logged = 0;
 	rds->tx_file_groups_sent = 0;
 	
-	/* Allocate TX log decoder if not already done */
-	if (!rds->tx_log_decoder) {
-		rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
-		if (rds->tx_log_decoder) {
-			rds_decoder_init_groups(rds->tx_log_decoder, rds->debug, rds->verbose, 0);
-		}
-	}
+	/* the TX log (once) */
+	rds_tx_log_open(rds);
 	
 	LOGP(DRADIO, LOGL_NOTICE, "RDS TX: Reading hexrds input from '%s' (%ld bytes), looping\n",
 	     filename, rds->tx_file_size);
@@ -8993,13 +8969,8 @@ int rds_enc_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename)
 	rds->tx_file_eof_logged = 0;
 	rds->tx_file_groups_sent = 0;
 	
-	/* Allocate TX log decoder if not already done */
-	if (!rds->tx_log_decoder) {
-		rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
-		if (rds->tx_log_decoder) {
-			rds_decoder_init_groups(rds->tx_log_decoder, rds->debug, rds->verbose, 0);
-		}
-	}
+	/* the TX log (once) */
+	rds_tx_log_open(rds);
 	
 	LOGP(DRADIO, LOGL_NOTICE, "RDS TX: Reading bitstream input from '%s' (%ld bytes), looping\n",
 	     filename, rds->tx_file_size);
@@ -9771,64 +9742,37 @@ static int rds_paging_group(rds_decoder_t *rds, int group_code)
 }
 
 /*
- * RDS decoder application side: what the codec gives - every bit and every
- * group with its blocks' status - to the files and the servers. The codec
- * (rds_decoder_bit, rds_decoder_feed_group) calls only these two.
+ * What the decoder gives out goes to its sink (rds_decoder_set_sink) - the
+ * codec (rds_decoder_bit, rds_decoder_feed_group) gives every bit and every
+ * group, the decode the received fields and messages.
  */
 
-/* A received bit: to the bitstream file (MSB first) */
+/* A received bit */
 static void rds_bit_received(rds_decoder_t *rds, int bit)
 {
-	if (!rds->bitstream_file)
-		return;
-	rds->bitstream_byte = (rds->bitstream_byte << 1) | (bit & 1);
-	rds->bitstream_bit_count++;
-	if (rds->bitstream_bit_count >= 8) {
-		fputc(rds->bitstream_byte, rds->bitstream_file);
-		rds->bitstream_byte = 0;
-		rds->bitstream_bit_count = 0;
-	}
+	if (rds->sink.bit)
+		rds->sink.bit(rds->sink.arg, bit);
 }
 
-/* A received group: to the hexrds file as received, to the field decode
- * (rds_decode_group), then to the servers as received (the status says
- * which blocks are bad) - also a group without block B, whose type is
- * unknown. */
+/* A received group: to the field decode (rds_decode_group), then to the
+ * sink as received (the status says which blocks are bad) - also a group
+ * without block B, whose type is unknown. */
 static void rds_group_received(rds_decoder_t *rds)
 {
-	/* Write to hexrds output file if enabled.
-	 * Format: "XXXX XXXX XXXX XXXX @YYYY/MM/DD HH:MM:SS.mmm" (RDS Spy format)
-	 * Uses ---- for missing blocks */
-	if (rds->hexrds_file) {
-		struct timeval tv;
-		struct tm *tm;
-		int i;
-
-		gettimeofday(&tv, NULL);
-		tm = localtime(&tv.tv_sec);
-
-		for (i = 0; i < 4; i++) {
-			if (i)
-				fputc(' ', rds->hexrds_file);
-			if (rds->group_mask & (1 << i))
-				write_hex16(rds->hexrds_file, rds->blocks[i]);
-			else
-				fprintf(rds->hexrds_file, "----");
-		}
-		fprintf(rds->hexrds_file, " @%04d/%02d/%02d %02d:%02d:%02d.%03d\n",
-			tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
-			tm->tm_hour, tm->tm_min, tm->tm_sec,
-			(int)(tv.tv_usec / 1000));
-		fflush(rds->hexrds_file);
-	}
-
 	rds_decode_group(rds);
 
-	/* Invoke protocol server callback if registered */
-	if (rds->group_callback)
-		rds->group_callback(rds->blocks, rds->block_status, rds->group_callback_arg);
+	if (rds->sink.group)
+		rds->sink.group(rds->sink.arg, rds->blocks, rds->block_status, rds->group_mask);
 
 	rds->groups_received++;
+}
+
+void rds_decoder_set_sink(rds_decoder_t *rds, const rds_decoder_sink_t *sink)
+{
+	if (sink)
+		rds->sink = *sink;
+	else
+		memset(&rds->sink, 0, sizeof(rds->sink));
 }
 
 /* The display for a new station: nothing shown yet (init, reset) */
@@ -9959,9 +9903,8 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 /* The decoder received a field: to the display, then to the consumer */
 static void rds_changed(rds_decoder_t *rds, enum rds_change what)
 {
-	rds_display_changed(rds, &rds->shown, what);
-	if (rds->change_callback)
-		rds->change_callback(rds, what, rds->change_callback_arg);
+	if (rds->sink.changed)
+		rds->sink.changed(rds->sink.arg, rds, what);
 }
 
 /* Display of a received paging message: its log line(s) */
@@ -10027,9 +9970,8 @@ static void rds_paging_received(rds_decoder_t *rds, uint8_t ab_flag)
 	m.country_code = pd->last_country_code;
 	m.opc = pd->last_opc;
 
-	rds_paging_rx_log(&m);
-	if (rds->paging_callback)
-		rds->paging_callback(&m, rds->paging_callback_arg);
+	if (rds->sink.paging)
+		rds->sink.paging(rds->sink.arg, &m);
 }
 
 static void rds_decode_group(rds_decoder_t *rds)
@@ -11917,8 +11859,8 @@ group14_done:
 			if (rds->debug)
 				LOGP(DRADIO, LOGL_DEBUG, "RDS 5%c: TDC ch=%d %d bytes\n",
 				     version ? 'B' : 'A', channel, len);
-			if (rds->tdc_callback)
-				rds->tdc_callback(channel, data, len, rds->tdc_callback_arg);
+			if (rds->sink.tdc)
+				rds->sink.tdc(rds->sink.arg, channel, data, len);
 		}
 	}
 	else if (group_type == 6) {
@@ -11934,9 +11876,8 @@ group14_done:
 		if (rds->debug)
 			LOGP(DRADIO, LOGL_DEBUG, "RDS 6%c: IH b_payload=%02X c=%04X d=%04X\n",
 			     version ? 'B' : 'A', b_payload, c_data, d_data);
-		if (rds->ih_callback)
-			rds->ih_callback(b_payload, version, c_data, d_data,
-					 rds->ih_callback_arg);
+		if (rds->sink.ih)
+			rds->sink.ih(rds->sink.arg, b_payload, version, c_data, d_data);
 	}
 	else if (group_type == 15 && version == 0) {
 		/* Group 15A: Long PS name (RBDS / NRSC-4-B S.6.1.5.20)
@@ -12244,8 +12185,8 @@ group14_done:
 						     msg.direction ? dp_long[dp_ci]
 								   : dp_short[dp_ci]);
 					}
-						if (rds->tmc_callback)
-							rds->tmc_callback(&msg, rds->tmc_callback_arg);
+						if (rds->sink.tmc)
+							rds->sink.tmc(rds->sink.arg, &msg);
 					}
 				} else {
 					/* Follow-on group of multi-group message */
@@ -12319,8 +12260,8 @@ group14_done:
 							msg.event     = rds->tmc_asm.c_first & 0x07FF;
 							msg.location  = rds->tmc_asm.d_first;
 							rds->tmc_asm.pending = 0;
-							if (rds->tmc_callback)
-								rds->tmc_callback(&msg, rds->tmc_callback_arg);
+							if (rds->sink.tmc)
+								rds->sink.tmc(rds->sink.arg, &msg);
 						}
 					} else if (rds->debug) {
 						LOGP(DRADIO, LOGL_DEBUG,
@@ -12526,9 +12467,8 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->force_rbds = force_rbds;
 	rds->time_constant_us = time_constant_us;
 
-	/* Display defaults: colour if stdout is a tty, sentinels for change-detection */
+	/* Display defaults: colour if stdout is a tty */
 	rds->ansi_display    = isatty(fileno(stdout));
-	rds_display_new_station(&rds->shown);
 
 	/* Log emphasis/mode mismatch hints once at startup.
 	 * Do NOT auto-set ECC -- let the actual ECC from Group 1A determine the mode.
@@ -12611,9 +12551,10 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	 * (files, callbacks) and the DSP continuity stay (rds.h) */
 	memset((char *)rds + kept, 0, sizeof(*rds) - kept);
 
-	/* Reset change-detection sentinels (new stream = fire INFO on first decode) */
 	rds->ansi_display    = isatty(fileno(stdout));
-	rds_display_new_station(&rds->shown);
+	/* a new station: the sink's display shows it from the start */
+	if (rds->sink.new_station)
+		rds->sink.new_station(rds->sink.arg, rds);
 
 	/* the receiver's paging setting stays; auto detects the new station again */
 	rds->paging_enabled = (rds->paging_mode == RDS_RX_PAGING_ON);
@@ -13870,34 +13811,176 @@ void rds_decoder_feed_group(rds_decoder_t *rds, const uint16_t blocks[4], const 
 
 void rds_decoder_exit(rds_decoder_t *rds)
 {
-	/* Close output files if open */
-	if (rds->hexrds_file) {
-		fclose(rds->hexrds_file);
-		rds->hexrds_file = NULL;
+	/* nothing of its own to close: the files are the application side's
+	 * (rds_rx_app_exit) */
+	(void)rds;
+}
+
+/*
+ * The station's application side of a decoder (rds_rx_app_t), its sink:
+ * the hexrds / bitstream files, the display (log lines of received fields
+ * and paging messages) and the servers' / consumers' callbacks.
+ */
+
+/* a received bit: to the bitstream file (MSB first) */
+static void rds_rx_app_bit(void *arg, int bit)
+{
+	rds_rx_app_t *app = arg;
+
+	if (!app->bitstream_file)
+		return;
+	app->bitstream_byte = (app->bitstream_byte << 1) | (bit & 1);
+	app->bitstream_bit_count++;
+	if (app->bitstream_bit_count >= 8) {
+		fputc(app->bitstream_byte, app->bitstream_file);
+		app->bitstream_byte = 0;
+		app->bitstream_bit_count = 0;
 	}
-	if (rds->bitstream_file) {
-		/* Flush any remaining bits (pad with zeros) */
-		if (rds->bitstream_bit_count > 0) {
-			rds->bitstream_byte <<= (8 - rds->bitstream_bit_count);
-			fputc(rds->bitstream_byte, rds->bitstream_file);
+}
+
+/* a received group: to the hexrds file as received, then to the servers */
+static void rds_rx_app_group(void *arg, const uint16_t blocks[4], const uint8_t status[4], uint8_t present)
+{
+	rds_rx_app_t *app = arg;
+
+	/* Write to hexrds output file if enabled.
+	 * Format: "XXXX XXXX XXXX XXXX @YYYY/MM/DD HH:MM:SS.mmm" (RDS Spy format)
+	 * Uses ---- for missing blocks */
+	if (app->hexrds_file) {
+		struct timeval tv;
+		struct tm *tm;
+		int i;
+
+		gettimeofday(&tv, NULL);
+		tm = localtime(&tv.tv_sec);
+
+		for (i = 0; i < 4; i++) {
+			if (i)
+				fputc(' ', app->hexrds_file);
+			if (present & (1 << i))
+				write_hex16(app->hexrds_file, blocks[i]);
+			else
+				fprintf(app->hexrds_file, "----");
 		}
-		fclose(rds->bitstream_file);
-		rds->bitstream_file = NULL;
+		fprintf(app->hexrds_file, " @%04d/%02d/%02d %02d:%02d:%02d.%03d\n",
+			tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+			tm->tm_hour, tm->tm_min, tm->tm_sec,
+			(int)(tv.tv_usec / 1000));
+		fflush(app->hexrds_file);
+	}
+
+	/* Invoke protocol server callback if registered */
+	if (app->group_callback)
+		app->group_callback(blocks, status, app->group_callback_arg);
+}
+
+/* a received field: to the display, then to the consumer */
+static void rds_rx_app_changed(void *arg, const rds_decoder_t *rds, enum rds_change what)
+{
+	rds_rx_app_t *app = arg;
+
+	rds_display_changed(rds, &app->shown, what);
+	if (app->change_callback)
+		app->change_callback(rds, what, app->change_callback_arg);
+}
+
+/* a received paging message: to the display, then to the consumer */
+static void rds_rx_app_paging(void *arg, const rds_paging_rx_msg_t *msg)
+{
+	rds_rx_app_t *app = arg;
+
+	rds_paging_rx_log(msg);
+	if (app->paging_callback)
+		app->paging_callback(msg, app->paging_callback_arg);
+}
+
+static void rds_rx_app_tdc(void *arg, uint8_t channel, const uint8_t *data, int len)
+{
+	rds_rx_app_t *app = arg;
+
+	if (app->tdc_callback)
+		app->tdc_callback(channel, data, len, app->tdc_callback_arg);
+}
+
+static void rds_rx_app_ih(void *arg, uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data)
+{
+	rds_rx_app_t *app = arg;
+
+	if (app->ih_callback)
+		app->ih_callback(b_payload, is_6b, c_data, d_data, app->ih_callback_arg);
+}
+
+static void rds_rx_app_tmc(void *arg, const rds_tmc_msg_t *msg)
+{
+	rds_rx_app_t *app = arg;
+
+	if (app->tmc_callback)
+		app->tmc_callback(msg, app->tmc_callback_arg);
+}
+
+/* a new station (retune): the display shows it from the start */
+static void rds_rx_app_new_station(void *arg, const rds_decoder_t *rds)
+{
+	rds_rx_app_t *app = arg;
+
+	(void)rds;
+	rds_display_new_station(&app->shown);
+}
+
+void rds_rx_app_init(rds_rx_app_t *app)
+{
+	memset(app, 0, sizeof(*app));
+	rds_display_new_station(&app->shown);
+}
+
+/* the application side as the decoder's sink */
+void rds_rx_app_attach(rds_rx_app_t *app, rds_decoder_t *rds)
+{
+	rds_decoder_sink_t sink = {
+		.bit = rds_rx_app_bit,
+		.group = rds_rx_app_group,
+		.changed = rds_rx_app_changed,
+		.paging = rds_rx_app_paging,
+		.tdc = rds_rx_app_tdc,
+		.ih = rds_rx_app_ih,
+		.tmc = rds_rx_app_tmc,
+		.new_station = rds_rx_app_new_station,
+		.arg = app,
+	};
+
+	rds_decoder_set_sink(rds, &sink);
+}
+
+void rds_rx_app_exit(rds_rx_app_t *app)
+{
+	/* Close output files if open */
+	if (app->hexrds_file) {
+		fclose(app->hexrds_file);
+		app->hexrds_file = NULL;
+	}
+	if (app->bitstream_file) {
+		/* Flush any remaining bits (pad with zeros) */
+		if (app->bitstream_bit_count > 0) {
+			app->bitstream_byte <<= (8 - app->bitstream_bit_count);
+			fputc(app->bitstream_byte, app->bitstream_file);
+		}
+		fclose(app->bitstream_file);
+		app->bitstream_file = NULL;
 	}
 }
 
 /* Set output file for .hexrds format (text hex groups) */
-int rds_decoder_set_hexrds_file(rds_decoder_t *rds, const char *filename)
+int rds_rx_app_set_hexrds_file(rds_rx_app_t *app, const char *filename)
 {
-	if (rds->hexrds_file) {
-		fclose(rds->hexrds_file);
-		rds->hexrds_file = NULL;
+	if (app->hexrds_file) {
+		fclose(app->hexrds_file);
+		app->hexrds_file = NULL;
 	}
 	if (!filename)
 		return 0;
-	
-	rds->hexrds_file = fopen(filename, "w");
-	if (!rds->hexrds_file) {
+
+	app->hexrds_file = fopen(filename, "w");
+	if (!app->hexrds_file) {
 		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot open hexrds output file '%s': %s\n",
 		     filename, strerror(errno));
 		return -1;
@@ -13907,32 +13990,73 @@ int rds_decoder_set_hexrds_file(rds_decoder_t *rds, const char *filename)
 }
 
 /* Set output file for .rds bitstream format (raw binary bits) */
-int rds_decoder_set_bitstream_file(rds_decoder_t *rds, const char *filename)
+int rds_rx_app_set_bitstream_file(rds_rx_app_t *app, const char *filename)
 {
-	if (rds->bitstream_file) {
-		fclose(rds->bitstream_file);
-		rds->bitstream_file = NULL;
+	if (app->bitstream_file) {
+		fclose(app->bitstream_file);
+		app->bitstream_file = NULL;
 	}
 	if (!filename)
 		return 0;
-	
-	rds->bitstream_file = fopen(filename, "wb");
-	if (!rds->bitstream_file) {
+
+	app->bitstream_file = fopen(filename, "wb");
+	if (!app->bitstream_file) {
 		LOGP(DRADIO, LOGL_ERROR, "RDS: Cannot open bitstream output file '%s': %s\n",
 		     filename, strerror(errno));
 		return -1;
 	}
-	rds->bitstream_byte = 0;
-	rds->bitstream_bit_count = 0;
+	app->bitstream_byte = 0;
+	app->bitstream_bit_count = 0;
 	LOGP(DRADIO, LOGL_NOTICE, "RDS: Writing bitstream output to '%s'\n", filename);
 	return 0;
 }
 
 /* Set callback for decoded RDS groups (for protocol servers) */
-void rds_decoder_set_group_callback(rds_decoder_t *rds,
-                                    void (*callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg),
-                                    void *arg)
+void rds_rx_app_set_group_callback(rds_rx_app_t *app,
+                                   void (*callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg),
+                                   void *arg)
 {
-	rds->group_callback = callback;
-	rds->group_callback_arg = arg;
+	app->group_callback = callback;
+	app->group_callback_arg = arg;
+}
+
+void rds_rx_app_set_tdc_callback(rds_rx_app_t *app,
+				 void (*fn)(uint8_t ch, const uint8_t *data, int len, void *arg),
+				 void *arg)
+{
+	app->tdc_callback = fn;
+	app->tdc_callback_arg = arg;
+}
+
+void rds_rx_app_set_ih_callback(rds_rx_app_t *app,
+				void (*fn)(uint8_t b_payload, int is_6b,
+					   uint16_t c_data, uint16_t d_data, void *arg),
+				void *arg)
+{
+	app->ih_callback = fn;
+	app->ih_callback_arg = arg;
+}
+
+void rds_rx_app_set_tmc_callback(rds_rx_app_t *app,
+				 void (*fn)(const rds_tmc_msg_t *msg, void *arg),
+				 void *arg)
+{
+	app->tmc_callback = fn;
+	app->tmc_callback_arg = arg;
+}
+
+void rds_rx_app_set_change_callback(rds_rx_app_t *app,
+				    void (*fn)(const rds_decoder_t *rds, enum rds_change what, void *arg),
+				    void *arg)
+{
+	app->change_callback = fn;
+	app->change_callback_arg = arg;
+}
+
+void rds_rx_app_set_paging_callback(rds_rx_app_t *app,
+				    void (*fn)(const rds_paging_rx_msg_t *msg, void *arg),
+				    void *arg)
+{
+	app->paging_callback = fn;
+	app->paging_callback_arg = arg;
 }

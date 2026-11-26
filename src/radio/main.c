@@ -1786,14 +1786,14 @@ static int station_init(station_t *s, void *sdr)
 
 	/* Set up RDS file output if requested */
 	if (s->rds_hexrds_file) {
-		rc = rds_decoder_set_hexrds_file(&s->radio.rds_dec, s->rds_hexrds_file);
+		rc = rds_rx_app_set_hexrds_file(&s->radio.rds_app, s->rds_hexrds_file);
 		if (rc < 0) {
 			station_eprintf("Failed to open hexrds output file, exitting!\n");
 			exit(0);
 		}
 	}
 	if (s->rds_bitstream_file) {
-		rc = rds_decoder_set_bitstream_file(&s->radio.rds_dec, s->rds_bitstream_file);
+		rc = rds_rx_app_set_bitstream_file(&s->radio.rds_app, s->rds_bitstream_file);
 		if (rc < 0) {
 			station_eprintf("Failed to open bitstream output file, exitting!\n");
 			exit(0);
@@ -2044,7 +2044,7 @@ static int station_init(station_t *s, void *sdr)
 		s->rds_cb_ctx.rdsspy_srv = s->rdsspy_enabled ? &s->rdsspy_srv : NULL;
 		s->rds_cb_ctx.asciig_srv = NULL;
 		s->rds_cb_ctx.radio = &s->radio;
-		rds_decoder_set_group_callback(&s->radio.rds_dec, rds_group_callback, &s->rds_cb_ctx);
+		rds_rx_app_set_group_callback(&s->radio.rds_app, rds_group_callback, &s->rds_cb_ctx);
 	}
 
 	/* Wire tune callback into XDR-GTK and RDS-Spy servers (RX tuner control) */

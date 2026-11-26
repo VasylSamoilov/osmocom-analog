@@ -604,6 +604,7 @@ typedef struct rds_server {
 	
 	/* UECP group decoder (for human-readable logging of Free Format groups) */
 	struct rds_decoder *uecp_decoder;
+	struct rds_rx_app *uecp_app;	/* its display (the log lines) */
 	
 	/* Callbacks (XDR-GTK) */
 	void		(*tune_cb)(int freq_khz, void *arg);
