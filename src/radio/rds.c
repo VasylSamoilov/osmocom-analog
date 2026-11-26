@@ -40,6 +40,13 @@ static void rds_decode_group(rds_decoder_t *rds);
 /* Forward declaration for dynamic PS cycle tracking */
 void rds_dps_on_ps_cycle_complete(rds_encoder_t *rds);
 
+/* A complete PS cycle (4 segments of 0A / 0B) is sent: to the content
+ * sources that follow the PS on air - Dynamic PS advances on it */
+static void rds_ps_cycle_sent(rds_encoder_t *rds)
+{
+	rds_dps_on_ps_cycle_complete(rds);
+}
+
 /* Forward declaration for TX file input */
 static int rds_generate_group_from_file(rds_encoder_t *rds);
 
@@ -2127,10 +2134,10 @@ static void rds_build_group_0a(rds_encoder_t *rds, uint8_t *group)
 	rds_group_pack(blocks, group, 0);
 	
 	rds->ps_segment = (seg + 1) & RDS_PS_SEG_MASK;
-	
-	/* Dynamic PS: detect completed PS cycle (segment wrapped from 3 to 0) */
+
+	/* a complete PS cycle sent (segment wrapped from 3 to 0) */
 	if (rds->ps_segment == 0)
-		rds_dps_on_ps_cycle_complete(rds);
+		rds_ps_cycle_sent(rds);
 }
 
 /* ============================================================
@@ -2197,10 +2204,10 @@ static void rds_build_group_0b(rds_encoder_t *rds, uint8_t *group)
 		     rds_char_to_display((uint8_t)rds->ps[seg*2+1]));
 	
 	rds->ps_segment = (seg + 1) & RDS_PS_SEG_MASK;
-	
-	/* Dynamic PS: detect completed PS cycle (segment wrapped from 3 to 0) */
+
+	/* a complete PS cycle sent (segment wrapped from 3 to 0) */
 	if (rds->ps_segment == 0)
-		rds_dps_on_ps_cycle_complete(rds);
+		rds_ps_cycle_sent(rds);
 }
 
 
