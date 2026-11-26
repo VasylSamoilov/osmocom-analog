@@ -601,8 +601,11 @@ each give out through one sink, the station owns the rest.
   7e8bace the API; through main.c also scanrun.sh (21 of 21 addresses),
   pagetypes.sh, the suite. Fixed on the way (94eee05): a call queued from
   the 'sent' callback freed the call just sent, its repeats were lost.
-  Left: the 13A notification walks the queue's list itself (pending calls
-  of an interval) - a queue query later.
+  Since: ed9d9e0 the 13A notification asks the queue for its calls'
+  addresses (only the queue's functions touch its list; negative control:
+  the addresses left out shows in 7 scenarios), 89b144a the interval
+  clock's fields named clk_*, 46cb0c9 the sent call's 'repeat=n/total'
+  log counts right (was 2/3 then 1/1 for a call sent twice).
 Next: rds.c split into layer files (allowed as an exact move by line
 range). Fixed (38c0d8e): on the bit path a lost block kept
 the previous group's status, the servers got it as good. Proven since
