@@ -28,6 +28,7 @@
 #endif
 
 int loglevel = LOGL_INFO;
+__thread const char *logging_prefix = "";
 
 static int scroll_window_start = 0;
 static int scroll_window_end = 0;

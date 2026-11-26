@@ -1114,27 +1114,27 @@ static void mtp_receive(void *inst, enum mtp_prim prim, uint8_t slc, uint8_t *da
 	case MTP_PRIM_OUT_OF_SERVICE:
 		switch (*data) {
 		case MTP_CAUSE_ALIGNMENT_TIMEOUT:
-			cause_text =  "MTP link '%s' alignment timeout! Trying again.\n";
+			cause_text =  "alignment timeout! Trying again.";
 			break;
 		case MTP_CAUSE_LINK_FAILURE_LOCAL:
-			cause_text =  "MTP link '%s' from remote to local failed! Starting recovery.\n";
+			cause_text =  "from remote to local failed! Starting recovery.";
 			break;
 		case MTP_CAUSE_LINK_FAILURE_REMOTE:
-			cause_text =  "MTP link '%s' from local to remote failed! Starting recovery.\n";
+			cause_text =  "from local to remote failed! Starting recovery.";
 			break;
 		case MTP_CAUSE_PROVING_FAILURE_LOCAL:
-			cause_text =  "MTP link '%s' proving failed locally! Trying again.\n";
+			cause_text =  "proving failed locally! Trying again.";
 			break;
 		case MTP_CAUSE_PROVING_FAILURE_REMOTE:
-			cause_text =  "MTP link '%s' proving failed remotely! Trying again.\n";
+			cause_text =  "proving failed remotely! Trying again.";
 			break;
 		case MTP_CAUSE_PROVING_TIMEOUT:
-			cause_text =  "MTP link '%s' proving timeout! Trying again.\n";
+			cause_text =  "proving timeout! Trying again.";
 			break;
 		default:
-			cause_text =  "MTP link '%s' failed! Trying again.\n";
+			cause_text =  "failed! Trying again.";
 		}
-		LOGP(DCNETZ, LOGL_NOTICE, cause_text, zzk->sender.kanal);
+		LOGP(DCNETZ, LOGL_NOTICE, "MTP link '%s' %s\n", zzk->sender.kanal, cause_text);
 		mtp_send(&zzk->mtp, MTP_PRIM_START, 0, NULL, 0);
 		zzk->link = 0;
 		display_status();
