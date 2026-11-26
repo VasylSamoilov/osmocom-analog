@@ -770,8 +770,8 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 /* Group designation address ranges (EN 50067 Table M.1)
  * Index = group designation (bits 4-2 of RPC). */
 static const char * const rds_paging_desig_ranges[] = {
-	"none",  "00-99", "00-39", "40-69",
-	"70-99", "00-19", "20-39", "40-59"
+	"none",  "00-99", "00-39", "40-99",
+	"40-69", "70-99", "00-19", "20-39"
 };
 
 /* Format RPC as human-readable string.
