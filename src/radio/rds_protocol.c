@@ -2476,7 +2476,7 @@ static void uecp_process_mec(rds_server_t *srv, uint8_t mec,
 			if (!srv->uecp_decoder) {
 				srv->uecp_decoder = calloc(1, sizeof(rds_decoder_t));
 				if (srv->uecp_decoder)
-					rds_decoder_init(srv->uecp_decoder, 250000.0, 0, 1, 50.0, 0);
+					rds_decoder_init_groups(srv->uecp_decoder, 0, 1, 0);
 			}
 			if (srv->uecp_decoder) {
 				uint16_t blocks[4] = { pi, b2, b3, b4 };

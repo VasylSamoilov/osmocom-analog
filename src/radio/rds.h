@@ -2939,6 +2939,8 @@ void rds_decoder_status(const rds_decoder_t *rds);
 void rds_decoder_display(const rds_decoder_t *rds, FILE *fp);
 
 /* Reset decoder state for new station (clears PI, PS, RT, stats, keeps DSP config) */
+/* a decoder fed only groups or bits, no demodulator (no sample rate) */
+int rds_decoder_init_groups(rds_decoder_t *rds, int debug, int verbose, int force_rbds);
 void rds_decoder_set_paging(rds_decoder_t *rds, int mode);
 void rds_decoder_reset(rds_decoder_t *rds);
 

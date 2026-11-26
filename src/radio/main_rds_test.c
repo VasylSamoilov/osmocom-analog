@@ -262,10 +262,9 @@ int main(int argc, char *argv[])
 
 		printf("\n=== Processing: %s ===\n", files[i]);
 
-		/* Init decoder: samplerate=0 (unused for feed_group).
-		 * Set emphasis to match mode flag -- no actual radio, so avoid
-		 * spurious emphasis/mode mismatch notices. */
-		rc = rds_decoder_init(&rds, 250000.0, rds_debug, rds_verbose, force_rbds ? 75.0 : 50.0, force_rbds);
+		/* Init decoder: fed groups and bits only, no demodulator (and no
+		 * emphasis, so no emphasis / mode mismatch notices) */
+		rc = rds_decoder_init_groups(&rds, rds_debug, rds_verbose, force_rbds);
 		/* Apply --ansi / --no-ansi override after init (init sets from isatty) */
 		if (ansi_override >= 0)
 			rds.ansi_display = ansi_override;

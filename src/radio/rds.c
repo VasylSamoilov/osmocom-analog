@@ -8784,8 +8784,7 @@ int rds_enc_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename)
 	if (!rds->tx_log_decoder) {
 		rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
 		if (rds->tx_log_decoder) {
-			rds_decoder_init(rds->tx_log_decoder, rds->samplerate, 
-			                 rds->debug, rds->verbose, 50.0, 0);
+			rds_decoder_init_groups(rds->tx_log_decoder, rds->debug, rds->verbose, 0);
 		}
 	}
 	
@@ -8825,8 +8824,7 @@ int rds_enc_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename)
 	if (!rds->tx_log_decoder) {
 		rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
 		if (rds->tx_log_decoder) {
-			rds_decoder_init(rds->tx_log_decoder, rds->samplerate,
-			                 rds->debug, rds->verbose, 50.0, 0);
+			rds_decoder_init_groups(rds->tx_log_decoder, rds->debug, rds->verbose, 0);
 		}
 	}
 	
@@ -12294,6 +12292,61 @@ static int rds_biphase_decode(rds_decoder_t *rds, double acc)
 	return bit_decoded;
 }
 
+/* The demodulator of a decoder fed samples (rds_decoder_process): the
+ * subcarrier PLL, AGC, filters, pre-decimation and the report intervals */
+static void rds_decoder_init_dsp(rds_decoder_t *rds, double samplerate)
+{
+	/* Initialize Subcarrier PLL (57 kHz) */
+	rds->freq_subcarrier = 57000.0;
+
+	/* AGC for Costas PLL error normalization
+	 * Redsea uses liquid-dsp AGC with bandwidth=500Hz/171kHz   0.003.
+	 * We use a simpler approach: track signal magnitude with a slow IIR
+	 * and normalize bb_i/bb_q before computing the Costas error.
+	 * This ensures the error signal bb_i*bb_q has consistent magnitude
+	 * regardless of input signal level.
+	 *
+	 * agc_alpha controls adaptation speed: smaller = slower, more stable.
+	 * ~50 Hz bandwidth at 250 kHz -> alpha   2*pi*50/250000   0.00126
+	 * This is slow enough to track the envelope without following
+	 * instantaneous oscillations of the baseband signal.
+	 */
+	rds->agc_gain = 1e-4;  /* Initial power estimate (will converge quickly) */
+	rds->agc_alpha = 2.0 * M_PI * 50.0 / samplerate;
+	if (rds->agc_alpha > 0.01) rds->agc_alpha = 0.01;  /* Clamp for very low sample rates */
+
+	/* Pre-decimation: integer stride to ~200 kHz before per-sample DSP.
+	 * N = floor(sr / 200000), clamped to >= 1. No anti-alias LPF needed:
+	 * FM baseband above 100 kHz is noise floor; internal 2.4 kHz LPF rejects aliases. */
+	rds->pre_dec_n = (int)(samplerate / 200000.0);
+	if (rds->pre_dec_n < 1) rds->pre_dec_n = 1;
+
+	/* Filter Coefficients */
+	/* 2400 Hz LPF */
+	double alpha_2400 = (2.0 * M_PI * 2400.0) / samplerate;
+	rds->filter_2400_i.a[0] = alpha_2400;
+	rds->filter_2400_q.a[0] = alpha_2400;
+
+	/* PLL Loop Filter (~54 Hz BW scaled) */
+	{
+		double alpha_pll = 0.054 * (250000.0 / samplerate);
+		/* Clamp alpha to sane range */
+		if (alpha_pll > 1.0) alpha_pll = 1.0;
+		if (alpha_pll < 0.001) alpha_pll = 0.001;
+		rds->filter_pll.a[0] = alpha_pll;
+	}
+
+	rds->status_interval = samplerate * 30.0;  /* Status dump every 30 seconds */
+	rds->signal_debug_interval = samplerate * 1.0;  /* Signal debug every 1 second */
+}
+
+/* A decoder fed only groups (rds_decoder_feed_group / _feed_bit): no
+ * demodulator, no sample rate */
+int rds_decoder_init_groups(rds_decoder_t *rds, int debug, int verbose, int force_rbds)
+{
+	return rds_decoder_init(rds, 0.0, debug, verbose, 0.0, force_rbds);
+}
+
 int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us, int force_rbds)
 {
 	memset(rds, 0, sizeof(*rds));
@@ -12332,48 +12385,9 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 		rds->rbds_hint_logged = 1;
 	}
 	
-	/* Initialize Subcarrier PLL (57 kHz) */
-	rds->freq_subcarrier = 57000.0;
-	
-	/* AGC for Costas PLL error normalization
-	 * Redsea uses liquid-dsp AGC with bandwidth=500Hz/171kHz   0.003.
-	 * We use a simpler approach: track signal magnitude with a slow IIR
-	 * and normalize bb_i/bb_q before computing the Costas error.
-	 * This ensures the error signal bb_i*bb_q has consistent magnitude
-	 * regardless of input signal level.
-	 * 
-	 * agc_alpha controls adaptation speed: smaller = slower, more stable.
-	 * ~50 Hz bandwidth at 250 kHz -> alpha   2*pi*50/250000   0.00126
-	 * This is slow enough to track the envelope without following
-	 * instantaneous oscillations of the baseband signal.
-	 */
-	rds->agc_gain = 1e-4;  /* Initial power estimate (will converge quickly) */
-	rds->agc_alpha = 2.0 * M_PI * 50.0 / samplerate;
-	if (rds->agc_alpha > 0.01) rds->agc_alpha = 0.01;  /* Clamp for very low sample rates */
-	
-	/* Pre-decimation: integer stride to ~200 kHz before per-sample DSP.
-	 * N = floor(sr / 200000), clamped to >= 1. No anti-alias LPF needed:
-	 * FM baseband above 100 kHz is noise floor; internal 2.4 kHz LPF rejects aliases. */
-	rds->pre_dec_n = (int)(samplerate / 200000.0);
-	if (rds->pre_dec_n < 1) rds->pre_dec_n = 1;
-
-	/* Filter Coefficients */
-	/* 2400 Hz LPF */
-	double alpha_2400 = (2.0 * M_PI * 2400.0) / samplerate;
-	rds->filter_2400_i.a[0] = alpha_2400;
-	rds->filter_2400_q.a[0] = alpha_2400;
-	
-	/* PLL Loop Filter (~54 Hz BW scaled) */
-	{
-		double alpha_pll = 0.054 * (250000.0 / samplerate);
-		/* Clamp alpha to sane range */
-		if (alpha_pll > 1.0) alpha_pll = 1.0;
-		if (alpha_pll < 0.001) alpha_pll = 0.001;
-		rds->filter_pll.a[0] = alpha_pll;
-	}
-	
-	rds->status_interval = samplerate * 30.0;  /* Status dump every 30 seconds */
-	rds->signal_debug_interval = samplerate * 1.0;  /* Signal debug every 1 second */
+	/* the demodulator, not for a decoder fed only groups (samplerate 0) */
+	if (samplerate > 0)
+		rds_decoder_init_dsp(rds, samplerate);
 	
 	/* BER Init */
 	for (int i=0; i<BER_WINDOW_SIZE; i++) rds->ber_history[i] = 1.0f;
@@ -12414,8 +12428,10 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	 * 3. Mapped Frequencies (AF) for multiple networks need storage to be useful.
 	 */
 	
-	if (verbose)
+	if (verbose && samplerate > 0)
 		LOGP(DRADIO, LOGL_INFO, "RDS decoder initialized (IEC 62106 DBPSK, fs=%.0f, debug=%d, verbose=%d)\n", samplerate, debug, verbose);
+	else if (verbose)
+		LOGP(DRADIO, LOGL_INFO, "RDS decoder initialized (groups only, debug=%d, verbose=%d)\n", debug, verbose);
 	return 0;
 }
 
