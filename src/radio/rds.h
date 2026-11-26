@@ -2510,6 +2510,7 @@ enum rds_change {
 	RDS_CHANGE_PTY,		/* a block B: PTY (rds->pty) */
 	RDS_CHANGE_CT,		/* a 4A: clock time (rds->ct_*) */
 	RDS_CHANGE_ECC,		/* a 1A variant 0: ECC (rds->ecc) */
+	RDS_CHANGE_PS,		/* a complete PS other than the last one (rds->ps, ps_changes) */
 };
 
 struct rds_decoder;

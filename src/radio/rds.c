@@ -9724,6 +9724,17 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 		}
 #endif
 		break;
+	case RDS_CHANGE_PS: {
+		char ps_display[64];
+
+		rds_text_to_display((const uint8_t *)rds->ps, 8, ps_display, sizeof(ps_display));
+		/* INFO: always visible */
+		LOGP(DRADIO, LOGL_INFO, "RDS PS: \"%s\" (#%d)\n", ps_display, rds->ps_changes);
+		/* NOTICE: gated by --rds-verbose */
+		if (rds->verbose)
+			LOGP(DRADIO, LOGL_NOTICE, "RDS PS changed:   \"%s\" (#%d)\n", ps_display, rds->ps_changes);
+		break;
+	}
 	case RDS_CHANGE_ECC:
 		/* ECC vs mode mismatch (once, only for valid ECCs) */
 		if (!shown->ecc_mismatch && rds_is_valid_ecc(rds->ecc)) {
@@ -10112,17 +10123,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				rds->ps[8] = '\0';
 				if (memcmp(rds->ps, rds->ps_prev_successful, 8) != 0) {
 					rds->ps_changes++;
-					{
-						char ps_display[64];
-						rds_text_to_display((uint8_t *)rds->ps, 8, ps_display, sizeof(ps_display));
-						/* INFO: always visible */
-						LOGP(DRADIO, LOGL_INFO, "RDS PS: \"%s\" (#%d)\n",
-						     ps_display, rds->ps_changes);
-						/* NOTICE: gated by --rds-verbose */
-						if (rds->verbose)
-							LOGP(DRADIO, LOGL_NOTICE, "RDS PS changed:   \"%s\" (#%d)\n",
-							     ps_display, rds->ps_changes);
-					}
+					rds_changed(rds, RDS_CHANGE_PS);
 					memcpy(rds->ps_prev_successful, rds->ps, 9);
 					memcpy(rds->ps_prev, rds->ps, 9);
 				}
