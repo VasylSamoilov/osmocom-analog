@@ -9735,6 +9735,15 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 			LOGP(DRADIO, LOGL_NOTICE, "RDS PS changed:   \"%s\" (#%d)\n", ps_display, rds->ps_changes);
 		break;
 	}
+	case RDS_CHANGE_LPS: {
+		/* Always at INFO (not gated on verbose) -- the Long PS
+		 * equivalent of the PS INFO line */
+		char display[RDS_LONG_PS_LEN + 1];
+
+		rds_text_to_display((const uint8_t *)rds->long_ps, RDS_LONG_PS_LEN, display, sizeof(display));
+		LOGP(DRADIO, LOGL_INFO, "RDS LPS: \"%s\"\n", display);
+		break;
+	}
 	case RDS_CHANGE_RT_2A_END:
 		/* the completed RT about to be replaced (if any) */
 		if (rds->rt_2a[0] != ' ' && rds->rt_2a[0] != '\0') {
@@ -11798,15 +11807,9 @@ group14_done:
 		if (rds->debug)
 			LOGP(DRADIO, LOGL_DEBUG, "RDS 15A: Long PS seg=%d\n", seg);
 
-		if (rds->long_ps_segments == 0xFF) {
-			/* All 8 segments received -- display complete long PS.
-			 * Always log at INFO (not gated on verbose) -- it is the
-			 * Long PS equivalent of the PS INFO line. */
-			char display[RDS_LONG_PS_LEN + 1];
-			rds_text_to_display((uint8_t *)rds->long_ps, RDS_LONG_PS_LEN,
-			                    display, sizeof(display));
-			LOGP(DRADIO, LOGL_INFO, "RDS LPS: \"%s\"\n", display);
-		}
+		/* all 8 segments received: the long PS is complete */
+		if (rds->long_ps_segments == 0xFF)
+			rds_changed(rds, RDS_CHANGE_LPS);
 	}
 	else if (group_type == 15 && version == 1) {
 		/* Group 15B: Fast Basic Tuning and Switching (EN 50067 S.3.1.5.21, Fig 39)
