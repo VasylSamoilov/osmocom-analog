@@ -1219,7 +1219,7 @@ static int rds_paging_slot_ok(const rds_paging_enc_t *pag, uint32_t address, int
 /* Number of groups a queued message takes on air, from the same encoder that
  * builds it - into a scratch state (the precompute writes only the tx_*
  * buffers), so the call on air is never touched. */
-static int rds_paging_msg_groups(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
+static int rds_paging_msg_groups(const rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 {
 	(void)pag;
 	if (!msg->ngroups) {
@@ -1261,19 +1261,20 @@ static void rds_paging_unlink(rds_paging_queue_t *q, rds_paging_msg_t *prev, rds
 /* With battery saving a call has to fit the three interval windows of its
  * address. A longer call never does, it is dropped instead of waiting in the
  * queue for ever. */
-static void rds_paging_bs_drop_unfit(rds_paging_enc_t *pag)
+static void rds_paging_bs_drop_unfit(rds_paging_queue_t *q, const rds_paging_enc_t *pag)
 {
+	/* the protocol's window capacity */
 	double max_groups = 3 * 6000.0 * RDS_PAGING_7A_PERCENT(pag) / 100.0 / (RDS_PAGING_GROUP_US / 1000.0) - 1.0;
 	rds_paging_msg_t *m, *prev = NULL, *next;
 
-	for (m = pag->q.queue_head; m; m = next) {
+	for (m = q->queue_head; m; m = next) {
 		int groups = rds_paging_msg_groups(pag, m);
 
 		next = m->next;
 		if (groups > max_groups) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS Paging: addr=%02u-%04u needs %d groups, battery saving windows hold %d, dropped\n",
 			     m->address / 10000, m->address % 10000, groups, (int)max_groups);
-			rds_paging_unlink(&pag->q, prev, m);
+			rds_paging_unlink(q, prev, m);
 			free(m);
 			continue;
 		}
@@ -1441,11 +1442,67 @@ static void rds_paging_sent(rds_encoder_t *rds, int complete)
 		rds->sink.paging(rds->sink.arg, &c);
 }
 
+/* The queue's choice of the next call that may start now (application: the
+ * send times, the order), asking the protocol (pag, read only) whether a
+ * call fits the interval window of its address: without battery saving the
+ * head of the queue when it is due; with it, after dropping calls that fit
+ * no window, the due call whose window ends first, the rest keeps its
+ * order. NULL: none now. */
+static rds_paging_msg_t *rds_paging_queue_take(rds_paging_queue_t *q, const rds_paging_enc_t *pag)
+{
+	rds_paging_msg_t *msg = q->queue_head;
+	time_t now = time(NULL);
+
+	if (!msg)
+		return NULL;
+
+	if (pag->battery_saving) {
+		/* Battery saving: only start a call inside the interval window
+		 * of its address (see rds_paging_slot_ok()). Calls outside it
+		 * stay queued, the one whose window ends first goes first,
+		 * the rest keeps its queue order. */
+		rds_paging_msg_t *best = NULL, *best_prev = NULL, *prev = NULL, *m;
+		int best_k = 3;
+
+		rds_paging_bs_drop_unfit(q, pag);
+
+		for (m = q->queue_head; m; prev = m, m = m->next) {
+			int k;
+
+			if (m->next_send_time > now)
+				continue;
+			if (!rds_paging_slot_ok(pag, m->address, rds_paging_msg_groups(pag, m), &k)) {
+				if (!m->defer_logged) {
+					unsigned iv, pos, d = m->address % 10;
+
+					rds_paging_clock(pag, &iv, &pos);
+					m->defer_logged = 1;
+					q->bs_deferred++;
+					LOGP(DRADIO, LOGL_INFO, "RDS Paging: addr=%02u-%04u held for its interval window I%u-I%u (now I%u, %.1fs into it)\n",
+					     m->address / 10000, m->address % 10000, d, (d + 2) % 10, iv, pos / 1000.0);
+				}
+				continue;
+			}
+			if (k < best_k) {
+				best = m;
+				best_prev = prev;
+				best_k = k;
+			}
+		}
+		if (!best)
+			return NULL;
+		rds_paging_unlink(q, best_prev, best);
+		return best;
+	}
+	if (msg->next_send_time > now)
+		return NULL;	/* Head not ready yet, wait */
+	return rds_paging_dequeue(q);
+}
+
 static void rds_paging_start_next(rds_encoder_t *rds)
 {
 	rds_paging_enc_t *pag = &rds->paging;
 	rds_paging_msg_t *msg;
-	time_t now = time(NULL);
 
 	if (pag->tx_active)
 		return;
@@ -1458,73 +1515,26 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 
 	rds_paging_scan_service(rds);
 
-	/* Find next ready message */
-	while (1) {
-		msg = pag->q.queue_head;
-		if (!msg)
-			break;
+	/* the next call that may start now (the queue's choice) */
+	msg = rds_paging_queue_take(&pag->q, pag);
+	if (!msg)
+		return;
 
-		if (pag->battery_saving) {
-			/* Battery saving: only start a call inside the interval window
-			 * of its address (see rds_paging_slot_ok()). Calls outside it
-			 * stay queued, the one whose window ends first goes first,
-			 * the rest keeps its queue order. */
-			rds_paging_msg_t *best = NULL, *best_prev = NULL, *prev = NULL, *m;
-			int best_k = 3;
+	/* the protocol starts it */
+	pag->tx_msg = msg;
+	pag->ab_flag ^= 1;  /* Toggle A/B flag */
 
-			rds_paging_bs_drop_unfit(pag);
-
-			for (m = pag->q.queue_head; m; prev = m, m = m->next) {
-				int k;
-
-				if (m->next_send_time > now)
-					continue;
-				if (!rds_paging_slot_ok(pag, m->address, rds_paging_msg_groups(pag, m), &k)) {
-					if (!m->defer_logged) {
-						unsigned iv, pos, d = m->address % 10;
-
-						rds_paging_clock(pag, &iv, &pos);
-						m->defer_logged = 1;
-						pag->q.bs_deferred++;
-						LOGP(DRADIO, LOGL_INFO, "RDS Paging: addr=%02u-%04u held for its interval window I%u-I%u (now I%u, %.1fs into it)\n",
-						     m->address / 10000, m->address % 10000, d, (d + 2) % 10, iv, pos / 1000.0);
-					}
-					continue;
-				}
-				if (k < best_k) {
-					best = m;
-					best_prev = prev;
-					best_k = k;
-				}
-			}
-			if (!best)
-				return;
-			rds_paging_unlink(&pag->q, best_prev, best);
-			msg = best;
-		} else {
-			if (msg->next_send_time > now)
-				break;	/* Head not ready yet, wait */
-			rds_paging_dequeue(&pag->q);
-		}
-
-		{
-			pag->tx_msg = msg;
-			pag->ab_flag ^= 1;  /* Toggle A/B flag */
-
-			/* Assign call counter and R flag (EN 50067 M.3.5).
-			 * Original send: R=0, P3-P0 = next counter for address.
-			 * Repeat: R=1, P3-P0 = same counter as original. */
-			if (!msg->is_repeat) {
-				msg->call_counter = rds_paging_next_counter(pag, msg->address);
-				msg->is_repeat = 0;
-			}
-			/* is_repeat and call_counter are preserved on re-enqueue */
-
-			rds_paging_precompute(pag, msg);
-			rds_paging_sent(rds, 0);
-			return;
-		}
+	/* Assign call counter and R flag (EN 50067 M.3.5).
+	 * Original send: R=0, P3-P0 = next counter for address.
+	 * Repeat: R=1, P3-P0 = same counter as original. */
+	if (!msg->is_repeat) {
+		msg->call_counter = rds_paging_next_counter(pag, msg->address);
+		msg->is_repeat = 0;
 	}
+	/* is_repeat and call_counter are preserved on re-enqueue */
+
+	rds_paging_precompute(pag, msg);
+	rds_paging_sent(rds, 0);
 }
 
 /* Called when a message transmission completes (tx_active becomes 0) */
