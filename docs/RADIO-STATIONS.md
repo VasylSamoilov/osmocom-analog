@@ -484,18 +484,24 @@ receiver's own setting; the transmitter's --rds-paging no longer turns
 it on. Send conservatively, receive tolerantly: the TX sends enhanced
 paging only when asked (OPC, 13A, enhanced message types; experimental,
 no pager to test it with), the RX decodes what the station signals. auto
-(default): two good 1A in a row with the RPC group designation (EN 50067
-Table M.1, 000 = no basic paging) or the OPC (M.3.2.2, 0 = no enhanced
-paging; an enhanced-only network sends designation 0) not 0 start it, as
-many with both 0 end it; not for a group type a 3A assigns to an ODA
+(default): a 1A with the RPC group designation (EN 50067 Table M.1, 000 =
+no basic paging) or the OPC (M.3.2.2, 0 = no enhanced paging; an
+enhanced-only network sends designation 0) not 0 starts it - one from a
+block without correction, else two in a row (8acf90a: with two always the
+France Culture capture lost its first call, 3 groups after the first 1A)
+-, two in a row with both 0 end it; not for a group type a 3A assigns to an ODA
 (Table 6 "Available when not used for RP"; AID 0000 = the group's
 normal feature, 3.1.5.4). Checked against the EN 50067 text
 (RDS/WORK_EN50067_RDS_Standard.pdf): the 1A, 4A, 7A, 13A handling agrees;
 the log's designation ranges were shifted (673a96d). Test (rxpage.sh,
 ~/.cache/sdrangel-rp-rates/txfix): on = the old forced decode (the same
-logs); auto decodes the test page, paging from the second 1A; off none; a
-station without paging the same verbose logs; noise no detection. Not
-tested: a 3A assigning 7A to an ODA (the encoder does not send one).
+logs); auto decodes the test page; off none; noise no detection. The
+captures in docs/rds through osmordstest --rds-rx-paging: France Culture
+detected, the same 4 calls as on; the 7 stations without paging nothing,
+auto the same logs as off at debug + verbose. Hand-written hexrds
+(~/.cache/sdrangel-rp-rds/cases): basic, enhanced only, 1A that tell
+nothing, the end (two 1A without paging; one does not), a 3A giving 7A to
+an ODA (no paging) and AID 0000 (paging).
 
 Layer split (agreed, in slices, each proven identical before the next):
 1. decoder codec: one bits -> blocks -> groups function (it is twice
