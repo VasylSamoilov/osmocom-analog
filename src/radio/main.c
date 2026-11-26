@@ -1480,7 +1480,7 @@ static void paging_parse_options(const char *opts, int opts_len,
  *   cc=NNN        E.212 MCC for international (e.g. 255=Ukraine)
  *   opc=N         Operator Code 1-15 for international
  * Message: everything after 3rd comma (commas in payload preserved) */
-static void paging_process_line(rds_encoder_t *enc, char *line)
+static void paging_process_line(rds_tx_app_t *app, char *line)
 {
 	int i, comma_count = 0;
 	int comma1 = -1, comma2 = -1, comma3 = -1;
@@ -1550,9 +1550,9 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 	 * specified per-message. ni=1 requires cc and opc. */
 	if (ni) {
 		if (!country_code)
-			country_code = rds_enc_paging_get_cc(enc);
+			country_code = rds_enc_paging_get_cc(app->enc);
 		if (!opc)
-			opc = rds_enc_paging_get_opc(enc);
+			opc = rds_enc_paging_get_opc(app->enc);
 		if (!country_code || !opc) {
 			LOGP(DRADIO, LOGL_ERROR,
 			     "RDS paging FIFO: ni=1 requires cc=NNN and opc=N "
@@ -1579,7 +1579,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: tone-only has no NI bit (EN 50067 M.3.5.2)\n");
 			return;
 		}
-		if (rds_enc_paging_send_tone(enc, address, repeat, interval, tonetype) < 0) {
+		if (rds_tx_app_paging_send_tone(app,address, repeat, interval, tonetype) < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: TONE addr=%02u-%04u rejected, nothing sent\n",
 			     address / 10000, address % 10000);
 			return;
@@ -1595,7 +1595,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: basic numeric (10/18) has no NI bit; use vnum for international numeric\n");
 			return;
 		}
-		if (rds_enc_paging_send_numeric(enc, address, msg, repeat, interval, ni) < 0) {
+		if (rds_tx_app_paging_send_numeric(app,address, msg, repeat, interval, ni) < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: NUMERIC addr=%02u-%04u len=%d rejected, nothing sent\n",
 			     address / 10000, address % 10000, msg_len);
 			return;
@@ -1607,7 +1607,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: alpha requires message text\n");
 			return;
 		}
-		if (rds_enc_paging_send_alpha(enc, address, msg, repeat, interval, ni, country_code, opc) < 0) {
+		if (rds_tx_app_paging_send_alpha(app,address, msg, repeat, interval, ni, country_code, opc) < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: ALPHA addr=%02u-%04u len=%d rejected, nothing sent\n",
 			     address / 10000, address % 10000, msg_len);
 			return;
@@ -1626,7 +1626,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: vnum requires message digits\n");
 			return;
 		}
-		if (rds_enc_paging_send_vnum(enc, address, msg, repeat, interval, ni, country_code, opc) < 0) {
+		if (rds_tx_app_paging_send_vnum(app,address, msg, repeat, interval, ni, country_code, opc) < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: VNUM addr=%02u-%04u len=%d rejected, nothing sent\n",
 			     address / 10000, address % 10000, msg_len);
 			return;
@@ -1645,7 +1645,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: functions requires hex digits\n");
 			return;
 		}
-		if (rds_enc_paging_send_functions(enc, address, msg, repeat, interval, ni, country_code, opc) < 0) {
+		if (rds_tx_app_paging_send_functions(app,address, msg, repeat, interval, ni, country_code, opc) < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: FUNC addr=%02u-%04u len=%d rejected, nothing sent\n",
 			     address / 10000, address % 10000, msg_len);
 			return;
@@ -1664,7 +1664,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: intl15 requires digits and cc=\n");
 			return;
 		}
-		if (rds_enc_paging_send_intl15(enc, address, msg, repeat, interval, country_code) < 0) {
+		if (rds_tx_app_paging_send_intl15(app,address, msg, repeat, interval, country_code) < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: INTL15 addr=%02u-%04u len=%d rejected, nothing sent\n",
 			     address / 10000, address % 10000, msg_len);
 			return;
@@ -1676,7 +1676,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: intlfunc requires hex digits and cc=\n");
 			return;
 		}
-		if (rds_enc_paging_send_intlfunc(enc, address, msg, repeat, interval, country_code) < 0) {
+		if (rds_tx_app_paging_send_intlfunc(app,address, msg, repeat, interval, country_code) < 0) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: INTLFUNC addr=%02u-%04u len=%d rejected, nothing sent\n",
 			     address / 10000, address % 10000, msg_len);
 			return;
@@ -1690,7 +1690,7 @@ static void paging_process_line(rds_encoder_t *enc, char *line)
 
 static void paging_pipe_handler(station_t *s)
 {
-	rds_encoder_t *enc = &s->radio.rds_enc;
+	rds_tx_app_t *app = &s->radio.rds_tx_app;
 	char *buf = s->paging_buf;
 	int buf_len = s->paging_buf_len;
 	int rc, i, start;
@@ -1725,7 +1725,7 @@ static void paging_pipe_handler(station_t *s)
 			if (buf[i] == '\r' || buf[i] == '\n') {
 				buf[i] = '\0';
 				if (i > start)
-					paging_process_line(enc, buf + start);
+					paging_process_line(app, buf + start);
 				start = i + 1;
 			}
 		}
@@ -1896,8 +1896,8 @@ static int station_init(station_t *s, void *sdr)
 			station_eprintf("--rds-paging-scan requires --tx, use '-h' for help!\n");
 			exit(0);
 		}
-		rc = rds_enc_paging_scan_start(&s->radio.rds_enc, s->rds_paging_scan_from, s->rds_paging_scan_to,
-					       (enum rds_paging_msg_type)s->rds_paging_scan_type);
+		rc = rds_tx_app_paging_scan_start(&s->radio.rds_tx_app, s->rds_paging_scan_from, s->rds_paging_scan_to,
+						  (enum rds_paging_msg_type)s->rds_paging_scan_type);
 		if (rc < 0) {
 			station_eprintf("Failed to start paging scan\n");
 			exit(0);

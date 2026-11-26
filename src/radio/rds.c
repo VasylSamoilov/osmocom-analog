@@ -1695,22 +1695,28 @@ static int rds_paging_check_chars(const char *s, int hex, const char *what)
 	return 0;
 }
 
-/* The end of every send: the built call into the queue, then the protocol
- * starts it at once if it may. No queue attached: rejected. */
-static int rds_paging_send(rds_encoder_t *rds, rds_paging_msg_t *msg)
+/* Public API: the protocol starts the next call now if one may start */
+void rds_enc_paging_kick(rds_encoder_t *rds)
 {
-	if (!rds->paging.q) {
-		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: no call queue (no TX application attached), call dropped\n");
+	rds_paging_start_next(rds);
+}
+
+/* The end of every send (application): the built call into the queue, then
+ * the protocol starts it at once if it may. No encoder attached: rejected. */
+static int rds_paging_send(rds_tx_app_t *app, rds_paging_msg_t *msg)
+{
+	if (!app->enc) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: the TX application has no encoder attached, call dropped\n");
 		free(msg);
 		return -1;
 	}
-	rds_paging_enqueue(rds->paging.q, msg);
-	rds_paging_start_next(rds);
+	rds_paging_enqueue(&app->paging_queue, msg);
+	rds_enc_paging_kick(app->enc);
 	return 0;
 }
 
 /* Public API: queue a tone-only page */
-int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
+int rds_tx_app_paging_send_tone(rds_tx_app_t *app, uint32_t address,
 			     int repeats, int interval_sec, uint8_t tonetype)
 {
 	rds_paging_msg_t *msg;
@@ -1727,11 +1733,11 @@ int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->tonetype = tonetype;
 
-	return rds_paging_send(rds, msg);
+	return rds_paging_send(app, msg);
 }
 
 /* Public API: queue a numeric page (auto-selects 10 or 18 digit) */
-int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
+int rds_tx_app_paging_send_numeric(rds_tx_app_t *app, uint32_t address,
 				const char *digits, int repeats, int interval_sec,
 				uint8_t ni)
 {
@@ -1762,11 +1768,11 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = ni;
 
-	return rds_paging_send(rds, msg);
+	return rds_paging_send(app, msg);
 }
 
 /* Public API: queue an alphanumeric page */
-int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
+int rds_tx_app_paging_send_alpha(rds_tx_app_t *app, uint32_t address,
 			      const char *text, int repeats, int interval_sec,
 			      uint8_t ni, uint16_t country_code, uint8_t opc)
 {
@@ -1797,11 +1803,11 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	return rds_paging_send(rds, msg);
+	return rds_paging_send(app, msg);
 }
 
 /* Public API: queue a variable-length numeric page (enhanced, up to 160 digits) */
-int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
+int rds_tx_app_paging_send_vnum(rds_tx_app_t *app, uint32_t address,
 			     const char *digits, int repeats, int interval_sec,
 			     uint8_t ni, uint16_t country_code, uint8_t opc)
 {
@@ -1829,12 +1835,12 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	return rds_paging_send(rds, msg);
+	return rds_paging_send(app, msg);
 }
 
 /* Public API: queue a variable-length functions message (EN 50067 M.3.5.6).
  * digits is a hex string 0-9/A-F; encoded with the full hex alphabet. */
-int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
+int rds_tx_app_paging_send_functions(rds_tx_app_t *app, uint32_t address,
 				  const char *digits, int repeats, int interval_sec,
 				  uint8_t ni, uint16_t country_code, uint8_t opc)
 {
@@ -1862,11 +1868,11 @@ int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	return rds_paging_send(rds, msg);
+	return rds_paging_send(app, msg);
 }
 
 /* Public API: queue a 15-digit international numeric message (M.2.1.6.5). */
-int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
+int rds_tx_app_paging_send_intl15(rds_tx_app_t *app, uint32_t address,
 			       const char *digits, int repeats, int interval_sec,
 			       uint16_t country_code)
 {
@@ -1889,12 +1895,12 @@ int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = 1;
 	msg->country_code = country_code;
-	return rds_paging_send(rds, msg);
+	return rds_paging_send(app, msg);
 }
 
 /* Public API: queue an international functions message (M.2.1.6.6). digits is
  * a hex string 0-9/A-F, up to 7 characters. */
-int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
+int rds_tx_app_paging_send_intlfunc(rds_tx_app_t *app, uint32_t address,
 				 const char *digits, int repeats, int interval_sec,
 				 uint16_t country_code)
 {
@@ -1917,7 +1923,7 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = 1;
 	msg->country_code = country_code;
-	return rds_paging_send(rds, msg);
+	return rds_paging_send(app, msg);
 }
 
 /* Public API: scan addresses from..to (inclusive) with one message each.
@@ -1946,24 +1952,29 @@ static void rds_paging_queue_scan_start(rds_paging_queue_t *q, uint32_t from, ui
 	q->scan_active = 1;
 }
 
-int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
-			      enum rds_paging_msg_type type)
+/* Public API: the scan's schedule on (the protocol half of a scan start) */
+void rds_enc_paging_scan_schedule(rds_encoder_t *rds)
 {
-	rds_paging_enc_t *pag = &rds->paging;
-
-	if (!pag->enabled || !pag->q || from > to || to > RDS_PAGING_ADDR_MAX)
-		return -1;
-	if (type != RDS_PAGING_TONE && type != RDS_PAGING_NUM10 && type != RDS_PAGING_ALPHA)
-		return -1;
-
-	rds_paging_queue_scan_start(pag->q, from, to, type);
-	/* the protocol: the scan's schedule, the 4A minute marker pagers need
-	 * for interval sync, the interval clock */
-	pag->scan_schedule = 1;
+	/* the scan's schedule, the 4A minute marker pagers need for interval
+	 * sync, the interval clock */
+	rds->paging.scan_schedule = 1;
 	rds_enc_set_ct_enabled(rds, 1);
 	rds_paging_clock_sync(rds);
 	rds_enc_scheduler_update(rds);
 	rds_paging_start_next(rds);
+}
+
+/* Public API (application): the address scan */
+int rds_tx_app_paging_scan_start(rds_tx_app_t *app, uint32_t from, uint32_t to,
+				 enum rds_paging_msg_type type)
+{
+	if (!app->enc || !rds_enc_paging_get_enabled(app->enc) || from > to || to > RDS_PAGING_ADDR_MAX)
+		return -1;
+	if (type != RDS_PAGING_TONE && type != RDS_PAGING_NUM10 && type != RDS_PAGING_ALPHA)
+		return -1;
+
+	rds_paging_queue_scan_start(&app->paging_queue, from, to, type);
+	rds_enc_paging_scan_schedule(app->enc);
 	return 0;
 }
 

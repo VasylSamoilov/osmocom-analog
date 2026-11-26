@@ -2529,31 +2529,15 @@ int rds_paging_hex_decode(const uint8_t *nibbles, int count, char *digits, int m
 void rds_paging_addr_pack(uint32_t address, uint16_t *block_c, uint8_t *block_d_hi);
 uint32_t rds_paging_addr_unpack(uint16_t block_c, uint8_t block_d_hi);
 
-/* Queue paging messages */
-int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
-			     int repeats, int interval_sec, uint8_t tonetype);
-int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
-				const char *digits, int repeats, int interval_sec,
-				uint8_t ni);
-int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
-			      const char *text, int repeats, int interval_sec,
-			      uint8_t ni, uint16_t country_code, uint8_t opc);
-int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
-			     const char *digits, int repeats, int interval_sec,
-			     uint8_t ni, uint16_t country_code, uint8_t opc);
-int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
-				  const char *digits, int repeats, int interval_sec,
-				  uint8_t ni, uint16_t country_code, uint8_t opc);
-int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
-			       const char *digits, int repeats, int interval_sec,
-			       uint16_t country_code);
-int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
-				 const char *digits, int repeats, int interval_sec,
-				 uint16_t country_code);
+/* Paging calls are queued and scanned by the TX application
+ * (rds_tx_app_paging_send_*, rds_tx_app_paging_scan_start); the protocol
+ * takes them from its queue. Start the next call now if one may start: */
+void rds_enc_paging_kick(rds_encoder_t *rds);
+/* The scan's schedule on (fewer 0A, timed; CT on, the interval clock
+ * synchronized) and the next call started; off when the scan completes */
+void rds_enc_paging_scan_schedule(rds_encoder_t *rds);
 
 /* Configuration -- encoder setters */
-int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
-			      enum rds_paging_msg_type type);
 void rds_enc_paging_set_battery_saving(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
@@ -3012,6 +2996,34 @@ void rds_tx_app_set_paging_callback(rds_tx_app_t *app,
 				    void (*fn)(const rds_paging_tx_call_t *call, void *arg),
 				    void *arg);
 void rds_tx_app_exit(rds_tx_app_t *app);
+
+/* Queue paging calls (checked against their format, EN 50067 Annex M; -1:
+ * rejected and logged) - the encoder starts one at once if it may */
+int rds_tx_app_paging_send_tone(rds_tx_app_t *app, uint32_t address,
+				int repeats, int interval_sec, uint8_t tonetype);
+int rds_tx_app_paging_send_numeric(rds_tx_app_t *app, uint32_t address,
+				   const char *digits, int repeats, int interval_sec,
+				   uint8_t ni);
+int rds_tx_app_paging_send_alpha(rds_tx_app_t *app, uint32_t address,
+				 const char *text, int repeats, int interval_sec,
+				 uint8_t ni, uint16_t country_code, uint8_t opc);
+int rds_tx_app_paging_send_vnum(rds_tx_app_t *app, uint32_t address,
+				const char *digits, int repeats, int interval_sec,
+				uint8_t ni, uint16_t country_code, uint8_t opc);
+int rds_tx_app_paging_send_functions(rds_tx_app_t *app, uint32_t address,
+				     const char *digits, int repeats, int interval_sec,
+				     uint8_t ni, uint16_t country_code, uint8_t opc);
+int rds_tx_app_paging_send_intl15(rds_tx_app_t *app, uint32_t address,
+				  const char *digits, int repeats, int interval_sec,
+				  uint16_t country_code);
+int rds_tx_app_paging_send_intlfunc(rds_tx_app_t *app, uint32_t address,
+				    const char *digits, int repeats, int interval_sec,
+				    uint16_t country_code);
+/* Scan addresses from..to (inclusive) with one call each; type
+ * RDS_PAGING_TONE, RDS_PAGING_NUM10 or RDS_PAGING_ALPHA. -1: paging off or
+ * a bad range or type */
+int rds_tx_app_paging_scan_start(rds_tx_app_t *app, uint32_t from, uint32_t to,
+				 enum rds_paging_msg_type type);
 
 /* Where a decoder gives out what it receives (copied; NULL: nowhere) */
 void rds_decoder_set_sink(rds_decoder_t *rds, const rds_decoder_sink_t *sink);
