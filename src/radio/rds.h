@@ -1707,6 +1707,8 @@ typedef struct rds_encoder {
 	uint8_t		ta;		/* Traffic Announcement flag */
 	uint8_t		ms;		/* Music/Speech flag (1=Music, 0=Speech) */
 	int		debug;		/* Debug logging (--rds-debug) */
+	unsigned long	dbg_bits, dbg_samples;			/* bits / samples so far (the timing report) */
+	unsigned long	dbg_report_bits, dbg_report_samples;	/* at the last report */
 	int		verbose;	/* Verbose logging (--rds-verbose) */
 	
 	/* Decoder Identification (DI) flags - transmitted via Group 0A/0B.

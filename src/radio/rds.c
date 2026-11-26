@@ -4627,16 +4627,11 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 {
 	int i;
 	double phase = pilot_phase;
-	static int debug_count = 0;
 	double max_injection = 0.0;
-	
+
 	/* Bit consumption tracking for diagnostics */
-	static unsigned long total_bits_consumed = 0;
-	static unsigned long total_samples_processed = 0;
 	int bits_this_call = 0;
-	(void)total_bits_consumed;  /* Suppress unused warning */
-	(void)total_samples_processed;
-	
+
 	for (i = 0; i < num; i++) {
 		/* Advance bit timing */
 		rds->bit_phase += rds->bit_phasestep;
@@ -4724,34 +4719,27 @@ void rds_encoder_process(rds_encoder_t *rds, sample_t *samples, int num,
 			phase -= 2.0 * M_PI;
 	}
 	
-	/* Update totals */
-	total_bits_consumed += bits_this_call;
-	total_samples_processed += num;
-	
+	/* Update totals (this encoder's: one per station) */
+	rds->dbg_bits += bits_this_call;
+	rds->dbg_samples += num;
+
 	/* Debug: log bit consumption for diagnostics */
 	if (rds->debug) {
-		static unsigned long last_report_samples = 0;
-		static unsigned long last_report_bits = 0;
-		if (total_samples_processed - last_report_samples >= rds->samplerate) {
-			double elapsed_sec = (total_samples_processed - last_report_samples) / rds->samplerate;
-			double bit_rate = (total_bits_consumed - last_report_bits) / elapsed_sec;
+		if (rds->dbg_samples - rds->dbg_report_samples >= rds->samplerate) {
+			double elapsed_sec = (rds->dbg_samples - rds->dbg_report_samples) / rds->samplerate;
+			double bit_rate = (rds->dbg_bits - rds->dbg_report_bits) / elapsed_sec;
 			LOGP(DRADIO, LOGL_DEBUG, "RDS ENC TIMING: bit_phase=%.6f bit_phasestep=%.9f | "
 			     "bits=%lu (%.2f bps, expect 1187.5) | samples=%lu\n",
 			     rds->bit_phase, rds->bit_phasestep,
-			     total_bits_consumed - last_report_bits, bit_rate,
-			     total_samples_processed - last_report_samples);
-			last_report_samples = total_samples_processed;
-			last_report_bits = total_bits_consumed;
+			     rds->dbg_bits - rds->dbg_report_bits, bit_rate,
+			     rds->dbg_samples - rds->dbg_report_samples);
+			rds->dbg_report_samples = rds->dbg_samples;
+			rds->dbg_report_bits = rds->dbg_bits;
 		}
 	}
-	
-	/* Debug: log occasionally to confirm RDS is being added */
-	if (++debug_count >= 100) {
-		/* LOGP(DRADIO, LOGL_DEBUG, "RDS: injecting (max=%.4f, phasestep=%.6f, samples=%d)\n",
-		     max_injection, pilot_phasestep, num); */
-		debug_count = 0;
-	}
-	
+	(void)max_injection;
+	(void)pilot_phasestep;
+
 	/* Save phase state */
 	rds->phase = phase;
 }
@@ -9629,6 +9617,10 @@ static void rds_decode_group(rds_decoder_t *rds)
 			     (rds->group_mask & (1<<1)) ? '+' : '-',
 			     (rds->group_mask & (1<<2)) ? '+' : '-',
 			     (rds->group_mask & (1<<3)) ? '+' : '-');
+		/* the servers get the group as received (its blocks' status
+		 * says which are bad), as the hexrds file does */
+		if (rds->group_callback)
+			rds->group_callback(rds->blocks, rds->block_status, rds->group_callback_arg);
 		rds->groups_received++;
 		return;
 	}
@@ -12072,7 +12064,12 @@ static int rds_biphase_decode(rds_decoder_t *rds, double acc)
 int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbose, double time_constant_us, int force_rbds)
 {
 	memset(rds, 0, sizeof(*rds));
-	
+
+	/* the error correction table (one for all decoders, the same for
+	 * all): filled here at the start, not on first use while stations run */
+	if (!rds_fec_table_initialized)
+		rds_fec_init();
+
 	/* Initialize eRT chartable to default value */
 	rds->ert_dec.chartable = RDS_ERT_CHARTABLE_DEFAULT;
 	
@@ -12204,10 +12201,23 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	void (*group_callback)(const uint16_t blocks[4], const uint8_t status[4], void *arg) = rds->group_callback;
 	void *group_callback_arg = rds->group_callback_arg;
 	
-	/* Preserve file handles */
+	/* Preserve the other callbacks and the station's RX settings (a reset
+	 * is a new station on the air, not a new decoder: they were lost) */
+	void (*tdc_callback)(uint8_t, const uint8_t *, int, void *) = rds->tdc_callback;
+	void *tdc_callback_arg = rds->tdc_callback_arg;
+	void (*ih_callback)(uint8_t, int, uint16_t, uint16_t, void *) = rds->ih_callback;
+	void *ih_callback_arg = rds->ih_callback_arg;
+	void (*tmc_callback)(const rds_tmc_msg_t *, void *) = rds->tmc_callback;
+	void *tmc_callback_arg = rds->tmc_callback_arg;
+	int paging_enabled = rds->paging_enabled;
+	int paging_timeout_sec = rds->paging_dec.timeout_sec;
+
+	/* Preserve file handles (and the bitstream file's partial byte) */
 	FILE *hexrds_file = rds->hexrds_file;
 	FILE *bitstream_file = rds->bitstream_file;
-	
+	uint8_t bitstream_byte = rds->bitstream_byte;
+	int bitstream_bit_count = rds->bitstream_bit_count;
+
 	/* Preserve filter state (DSP continuity) */
 	rds_iir_filter_t filter_2400_i = rds->filter_2400_i;
 	rds_iir_filter_t filter_2400_q = rds->filter_2400_q;
@@ -12239,10 +12249,20 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	rds->group_callback = group_callback;
 	rds->group_callback_arg = group_callback_arg;
 	
+	rds->tdc_callback = tdc_callback;
+	rds->tdc_callback_arg = tdc_callback_arg;
+	rds->ih_callback = ih_callback;
+	rds->ih_callback_arg = ih_callback_arg;
+	rds->tmc_callback = tmc_callback;
+	rds->tmc_callback_arg = tmc_callback_arg;
+	rds->paging_enabled = paging_enabled;
+
 	/* Restore file handles */
 	rds->hexrds_file = hexrds_file;
 	rds->bitstream_file = bitstream_file;
-	
+	rds->bitstream_byte = bitstream_byte;
+	rds->bitstream_bit_count = bitstream_bit_count;
+
 	/* Restore filter state */
 	rds->filter_2400_i = filter_2400_i;
 	rds->filter_2400_q = filter_2400_q;
@@ -12256,8 +12276,8 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	
 	/* Re-initialize decoder-specific defaults */
 	rds->ert_dec.chartable = RDS_ERT_CHARTABLE_DEFAULT;
-	rds->paging_dec.timeout_sec = RDS_PAGING_DEFAULT_TIMEOUT;
-	
+	rds->paging_dec.timeout_sec = paging_timeout_sec ? paging_timeout_sec : RDS_PAGING_DEFAULT_TIMEOUT;
+
 	/* BER Init */
 	for (int i = 0; i < BER_WINDOW_SIZE; i++)
 		rds->ber_history[i] = 1.0f;
