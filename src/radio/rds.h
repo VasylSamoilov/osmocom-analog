@@ -1520,6 +1520,7 @@ typedef struct rds_paging_msg {
 	char		data[RDS_PAGING_MSG_MAX + 1];	/* Message content + NUL */
 	int		data_len;	/* Length of message data */
 	int		repeats_left;	/* Remaining retransmissions */
+	int		sends_total;	/* sends of the call, the first one too */
 	int		repeat_interval;/* Seconds between retransmissions */
 	time_t		next_send_time;	/* Earliest time for next transmission */
 	/* Enhanced paging (EN 50067 M.3.5) */

@@ -1060,6 +1060,7 @@ static rds_paging_msg_t *rds_paging_msg_alloc(enum rds_paging_msg_type type,
 	}
 	msg->data_len = data_len;
 	msg->repeats_left = repeats;
+	msg->sends_total = repeats + 1;
 	msg->repeat_interval = interval;
 	msg->next_send_time = 0;
 	msg->next = NULL;
@@ -1509,8 +1510,9 @@ static void rds_paging_sent(rds_encoder_t *rds, int complete)
 	c.call_counter = msg->call_counter;
 	c.country_code = msg->country_code;
 	c.opc = msg->opc;
-	c.send_n = msg->repeats_left + 1;
-	c.send_total = msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left);
+	/* repeats_left counts down after each send (the completion) */
+	c.send_n = msg->sends_total - msg->repeats_left;
+	c.send_total = msg->sends_total;
 	c.scan = pag->scan_schedule;
 	if (!complete && pag->battery_saving) {
 		c.battery_saving = 1;
