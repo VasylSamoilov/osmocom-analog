@@ -154,6 +154,8 @@ typedef struct station {
 
 	int channelizer_rate; /* IQ rate to the radio, 0 = automatic */
 	radio_opts_t radio_opts; /* the station's settings outside radio_init()'s parameters (radio_opts_init() before the options) */
+	int given[128];		/* the station options given on the command line for it (the kind check) */
+	int num_given;
 	int use_polyphase;
 	int use_afc;
 	double afc_tc_ms;
@@ -475,6 +477,10 @@ static void print_help(const char *arg0)
 	printf("        Give frequency in Hertz. Starts the station: station options before\n");
 	printf("        it (and in the config file) are defaults, the ones after it are the\n");
 	printf("        station's. One -f for now (several stations: docs/RADIO-STATIONS.md).\n");
+	printf("        FM options (stereo, RDS, SCA, deviation, emphasis, FM compandor, AFC,\n");
+	printf("        the RDS servers) are for FM stations, -I and -C for AM: a default\n");
+	printf("        applies to the stations of its modulation only, after -f one of\n");
+	printf("        another modulation is refused.\n");
 	printf(" -s --samplerate <sample rate>\n");
 	printf("        Give signal processing sample rate in Hz. (default = %d)\n", st->dsp_samplerate);
 	printf("        This sample rate must be high enough for the signal's spectrum to fit.\n");
@@ -772,72 +778,235 @@ static void print_help(const char *arg0)
 #define OPT_RDS_ECC		1131
 #define OPT_RDS_PAGING_13A	1132
 
+/* The station kinds (the modulation) an option belongs to
+ * (docs/RADIO-STATIONS.md): a default (config file, before the first -f)
+ * applies only to the stations of its kinds, after a station's -f an option
+ * of other kinds is refused. PROCESS: process-wide, wherever it stands (the
+ * --sdr-* options are not in the table, they are process-wide too). */
+#define KIND_FM		1
+#define KIND_AM		2	/* DSB */
+#define KIND_USB	4
+#define KIND_LSB	8
+#define KIND_ALL	(KIND_FM | KIND_AM | KIND_USB | KIND_LSB)
+#define KIND_PROCESS	0
+
+static const char *kind_names[] = { "fm", "am", "usb", "lsb" };
+
+static struct {
+	int short_option;
+	const char *name;
+	int kinds;
+} opt_table[80];
+static int opt_table_num;
+
+static void opt(int short_option, const char *long_option, int parameter_count, int kinds)
+{
+	option_add(short_option, long_option, parameter_count);
+	if (opt_table_num == (int)(sizeof(opt_table) / sizeof(*opt_table))) {
+		fprintf(stderr, "Option table full, please fix!\n");
+		abort();
+	}
+	opt_table[opt_table_num].short_option = short_option;
+	opt_table[opt_table_num].name = long_option;
+	opt_table[opt_table_num].kinds = kinds;
+	opt_table_num++;
+}
+
+/* the option's entry, -1 if it is not in the table (--sdr-*) */
+static int opt_find(int short_option)
+{
+	int i;
+
+	for (i = 0; i < opt_table_num; i++)
+		if (opt_table[i].short_option == short_option)
+			return i;
+	return -1;
+}
+
+static int modulation_kind(enum modulation modulation)
+{
+	switch (modulation) {
+	case MODULATION_FM:
+		return KIND_FM;
+	case MODULATION_AM_DSB:
+		return KIND_AM;
+	case MODULATION_AM_USB:
+		return KIND_USB;
+	case MODULATION_AM_LSB:
+		return KIND_LSB;
+	default:
+		return 0;
+	}
+}
+
 static void add_options(void)
 {
-	option_add('h', "help", 0);
-	option_add('v', "verbose", 1);
-	option_add('f', "frequency", 1);
-	option_add('s', "samplerate", 1);
-	option_add('r', "tx-wave-file", 1);
-	option_add('w', "rx-wave-file", 1);
-	option_add('a', "audio-device", 1);
-	option_add('M', "modulation", 1);
-	option_add('R', "rx", 0);
-	option_add('T', "tx", 0);
-	option_add('B', "bandwidth", 1);
-	option_add('D', "deviation", 1);
-	option_add('I', "modulation-index", 1);
-	option_add('C', "compandor", 0);
-	option_add(OPT_FM_COMPANDOR, "fm-compandor", 0);
-	option_add('E', "emphasis", 1);
-	option_add('V', "volume", 1);
-	option_add('S', "stereo", 0);
-	option_add(OPT_RDS, "rds", 0);
-	option_add(OPT_RDS2, "rds2", 0);
-	option_add(OPT_RDS_DEBUG, "rds-debug", 0);
-	option_add(OPT_RDS_VERBOSE, "rds-verbose", 0);
-	option_add(OPT_SCA_67K, "sca-67k", 0);
-	option_add(OPT_SCA_92K, "sca-92k", 0);
-	option_add(OPT_FAST_MATH, "fast-math", 0);
-	option_add(OPT_CHANNELIZER_RATE, "channelizer-rate", 1);
-	option_add(OPT_LIMESDR, "limesdr", 0);
-	option_add(OPT_LIMESDR_MINI, "limesdr-mini", 0);
-	option_add(OPT_CALL_SIGN, "call-sign", 1);
-	option_add(OPT_PI, "pi", 1);
-	option_add(OPT_POLYPHASE, "polyphase-resampler", 0);
-	option_add(OPT_RBDS, "rbds", 0);
-	option_add(OPT_RDS_PAGING, "rds-paging", 1);
-	option_add(OPT_RDS_PAGING_FIFO, "rds-paging-fifo", 1);
-	option_add(OPT_RDS_PAGING_CC, "rds-paging-cc", 1);
-	option_add(OPT_RDS_PAGING_OPC, "rds-paging-opc", 1);
-	option_add(OPT_RDS_PAGING_PAC, "rds-paging-pac", 1);
-	option_add(OPT_RDS_PAGING_BATTERY, "rds-paging-battery-saving", 0);
-	option_add(OPT_RDS_ECC, "rds-ecc", 1);
-	option_add(OPT_RDS_PAGING_13A, "rds-paging-13a", 0);
-	option_add(OPT_RDS_PAGING_SCAN, "rds-paging-scan", 2);
-	option_add(OPT_RDS_PAGING_SCAN_TYPE, "rds-paging-scan-type", 1);
-	option_add(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1);
-	option_add(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1);
-	option_add(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1);
-	option_add(OPT_RDS_TX_BITSTREAM_FILE, "rds-tx-bitstream-file", 1);
-	option_add(OPT_RDS_TMC_EVENTS, "rds-tmc-events", 1);
-	option_add(OPT_RDS_TMC_LOCATIONS, "rds-tmc-locations", 1);
-	option_add(OPT_XDR_GTK_SERVER, "xdr-gtk-server", 1);
-	option_add(OPT_RDSSPY_SERVER, "rdsspy-server", 1);
-	option_add(OPT_UECP_SERVER, "uecp-server", 1);
-	option_add(OPT_ASCIIG_SERVER, "asciig-server", 1);
-	option_add(OPT_XDR_GTK_PASSWORD, "xdr-gtk-password", 1);
-	option_add(OPT_RIGCTL_SERVER, "rigctl-server", 1);
-	option_add(OPT_RIGCTL_ALLOWED, "rigctl-allowed-hosts", 1);
-	option_add(OPT_AFC, "afc", 0);
-	option_add(OPT_AFC_TC, "afc-tc", 1);
-	option_add(OPT_AFC_MAX, "afc-max", 1);
+	opt('h', "help", 0, KIND_PROCESS);
+	opt('v', "verbose", 1, KIND_PROCESS);
+	opt('f', "frequency", 1, KIND_ALL);
+	opt('s', "samplerate", 1, KIND_ALL);
+	opt('r', "tx-wave-file", 1, KIND_ALL);
+	opt('w', "rx-wave-file", 1, KIND_ALL);
+	opt('a', "audio-device", 1, KIND_ALL);
+	opt('M', "modulation", 1, KIND_ALL);
+	opt('R', "rx", 0, KIND_ALL);
+	opt('T', "tx", 0, KIND_ALL);
+	opt('B', "bandwidth", 1, KIND_ALL);
+	opt('D', "deviation", 1, KIND_FM);
+	opt('I', "modulation-index", 1, KIND_AM);
+	opt('C', "compandor", 0, KIND_AM);
+	opt(OPT_FM_COMPANDOR, "fm-compandor", 0, KIND_FM);
+	opt('E', "emphasis", 1, KIND_FM);
+	opt('V', "volume", 1, KIND_ALL);
+	opt('S', "stereo", 0, KIND_FM);
+	opt(OPT_RDS, "rds", 0, KIND_FM);
+	opt(OPT_RDS2, "rds2", 0, KIND_FM);
+	opt(OPT_RDS_DEBUG, "rds-debug", 0, KIND_FM);
+	opt(OPT_RDS_VERBOSE, "rds-verbose", 0, KIND_FM);
+	opt(OPT_SCA_67K, "sca-67k", 0, KIND_FM);
+	opt(OPT_SCA_92K, "sca-92k", 0, KIND_FM);
+	opt(OPT_FAST_MATH, "fast-math", 0, KIND_PROCESS);
+	opt(OPT_CHANNELIZER_RATE, "channelizer-rate", 1, KIND_ALL);
+	opt(OPT_LIMESDR, "limesdr", 0, KIND_PROCESS);
+	opt(OPT_LIMESDR_MINI, "limesdr-mini", 0, KIND_PROCESS);
+	opt(OPT_CALL_SIGN, "call-sign", 1, KIND_FM);
+	opt(OPT_PI, "pi", 1, KIND_FM);
+	opt(OPT_POLYPHASE, "polyphase-resampler", 0, KIND_ALL);
+	opt(OPT_RBDS, "rbds", 0, KIND_FM);
+	opt(OPT_RDS_PAGING, "rds-paging", 1, KIND_FM);
+	opt(OPT_RDS_PAGING_FIFO, "rds-paging-fifo", 1, KIND_FM);
+	opt(OPT_RDS_PAGING_CC, "rds-paging-cc", 1, KIND_FM);
+	opt(OPT_RDS_PAGING_OPC, "rds-paging-opc", 1, KIND_FM);
+	opt(OPT_RDS_PAGING_PAC, "rds-paging-pac", 1, KIND_FM);
+	opt(OPT_RDS_PAGING_BATTERY, "rds-paging-battery-saving", 0, KIND_FM);
+	opt(OPT_RDS_ECC, "rds-ecc", 1, KIND_FM);
+	opt(OPT_RDS_PAGING_13A, "rds-paging-13a", 0, KIND_FM);
+	opt(OPT_RDS_PAGING_SCAN, "rds-paging-scan", 2, KIND_FM);
+	opt(OPT_RDS_PAGING_SCAN_TYPE, "rds-paging-scan-type", 1, KIND_FM);
+	opt(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1, KIND_FM);
+	opt(OPT_RDS_BITSTREAM_FILE, "rds-bitstream-file", 1, KIND_FM);
+	opt(OPT_RDS_TX_HEXRDS_FILE, "rds-tx-hexrds-file", 1, KIND_FM);
+	opt(OPT_RDS_TX_BITSTREAM_FILE, "rds-tx-bitstream-file", 1, KIND_FM);
+	opt(OPT_RDS_TMC_EVENTS, "rds-tmc-events", 1, KIND_FM);
+	opt(OPT_RDS_TMC_LOCATIONS, "rds-tmc-locations", 1, KIND_FM);
+	/* the RDS servers (XDR-GTK too: it turns RDS on) */
+	opt(OPT_XDR_GTK_SERVER, "xdr-gtk-server", 1, KIND_FM);
+	opt(OPT_RDSSPY_SERVER, "rdsspy-server", 1, KIND_FM);
+	opt(OPT_UECP_SERVER, "uecp-server", 1, KIND_FM);
+	opt(OPT_ASCIIG_SERVER, "asciig-server", 1, KIND_FM);
+	opt(OPT_XDR_GTK_PASSWORD, "xdr-gtk-password", 1, KIND_FM);
+	opt(OPT_RIGCTL_SERVER, "rigctl-server", 1, KIND_ALL);
+	opt(OPT_RIGCTL_ALLOWED, "rigctl-allowed-hosts", 1, KIND_ALL);
+	opt(OPT_AFC, "afc", 0, KIND_FM);
+	opt(OPT_AFC_TC, "afc-tc", 1, KIND_FM);
+	opt(OPT_AFC_MAX, "afc-max", 1, KIND_FM);
         sdr_config_add_options();
+}
+
+/* the station options given on the command line, for the kind check */
+static void station_option_given(station_t *s, int short_option)
+{
+	int i = opt_find(short_option);
+
+	if (i < 0 || opt_table[i].kinds == KIND_PROCESS)
+		return;
+	if (s->num_given == (int)(sizeof(s->given) / sizeof(*s->given))) {
+		fprintf(stderr, "More than %d options for one station, please fix!\n", s->num_given);
+		abort();
+	}
+	s->given[s->num_given++] = short_option;
+}
+
+/* After the options: a station option of another kind given for this
+ * station (after its -f, or on the command line without -f) is refused;
+ * the settings of the other kinds are the initial ones again (a default of
+ * another kind does not apply to this station). The settings each kind's
+ * options set, checked against handle_options(). */
+static int station_kind_options(station_t *s, const station_t *p)
+{
+	int kind = modulation_kind(s->modulation), i, k, j;
+	char kinds[32];
+
+	if (!kind)
+		return 0;	/* no modulation: said later */
+	for (j = 0; j < s->num_given; j++) {
+		i = opt_find(s->given[j]);
+		if (opt_table[i].kinds & kind)
+			continue;
+		kinds[0] = '\0';
+		for (k = 0; k < 4; k++) {
+			if (!(opt_table[i].kinds & (1 << k)))
+				continue;
+			if (kinds[0])
+				strcat(kinds, ", ");
+			strcat(kinds, kind_names[k]);
+		}
+		for (k = 0; !(kind & (1 << k)); k++)
+			;
+		fprintf(stderr, "Option '--%s' is for stations with modulation %s, this station is %s, use '-h' for help!\n", opt_table[i].name, kinds, kind_names[k]);
+		return -EINVAL;
+	}
+	if (!(kind & KIND_FM)) {
+		/* -D -E --fm-compandor -S --rds* --sca* --call-sign --pi --rbds
+		 * --rds-paging* --rds-ecc --rds-*-file --rds-tmc-* the RDS
+		 * servers --afc* */
+		s->deviation = p->deviation;
+		s->time_constant_us = p->time_constant_us;
+		s->fm_compandor = p->fm_compandor;
+		s->stereo = p->stereo;
+		s->rds = p->rds;
+		s->rds2 = p->rds2;
+		s->rds_debug = p->rds_debug;
+		s->rds_verbose = p->rds_verbose;
+		s->rds_force_rbds = p->rds_force_rbds;
+		s->sca_67k = p->sca_67k;
+		s->sca_92k = p->sca_92k;
+		s->radio_opts.rds_callsign = p->radio_opts.rds_callsign;
+		s->rds_pi_opt = p->rds_pi_opt;
+		s->radio_opts.rds_pi = p->radio_opts.rds_pi;
+		s->rds_paging = p->rds_paging;
+		s->rds_paging_rpc = p->rds_paging_rpc;
+		s->rds_paging_pipe_path = p->rds_paging_pipe_path;
+		s->rds_paging_cc = p->rds_paging_cc;
+		s->rds_paging_opc = p->rds_paging_opc;
+		s->rds_paging_pac = p->rds_paging_pac;
+		s->rds_paging_battery = p->rds_paging_battery;
+		s->rds_paging_13a = p->rds_paging_13a;
+		s->rds_ecc = p->rds_ecc;
+		s->rds_paging_scan = p->rds_paging_scan;
+		s->rds_paging_scan_from = p->rds_paging_scan_from;
+		s->rds_paging_scan_to = p->rds_paging_scan_to;
+		s->radio_opts.rds_paging_preset = p->radio_opts.rds_paging_preset;
+		s->rds_paging_scan_type = p->rds_paging_scan_type;
+		s->rds_hexrds_file = p->rds_hexrds_file;
+		s->rds_bitstream_file = p->rds_bitstream_file;
+		s->rds_tx_hexrds_file = p->rds_tx_hexrds_file;
+		s->rds_tx_bitstream_file = p->rds_tx_bitstream_file;
+		s->rds_tmc_events_file = p->rds_tmc_events_file;
+		s->rds_tmc_locations_path = p->rds_tmc_locations_path;
+		s->xdr_gtk_server = p->xdr_gtk_server;
+		s->xdr_gtk_password = p->xdr_gtk_password;
+		s->rdsspy_server = p->rdsspy_server;
+		s->uecp_server = p->uecp_server;
+		s->asciig_server = p->asciig_server;
+		s->use_afc = p->use_afc;
+		s->afc_tc_ms = p->afc_tc_ms;
+		s->afc_max_hz = p->afc_max_hz;
+	}
+	if (!(kind & KIND_AM)) {
+		/* -I -C */
+		s->modulation_index = p->modulation_index;
+		s->am_compandor = p->am_compandor;
+	}
+	return 0;
 }
 
 static int handle_options(int short_option, int argi, char **argv)
 {
 	int rc;
+
+	if (options_from_command_line && short_option != 'f')
+		station_option_given(st, short_option);
 
 	switch (short_option) {
 	case 'h':
@@ -858,6 +1027,7 @@ static int handle_options(int short_option, int argi, char **argv)
 				return -EINVAL;
 			}
 			station0 = station_default;
+			station0.num_given = 0;	/* the defaults' are not the station's */
 			st = &station0;
 			num_stations = 1;
 		}
@@ -1996,6 +2166,14 @@ int main(int argc, char *argv[])
 		num_stations = 1;
 	}
 	st = &station0;
+	{
+		static station_t initial;
+
+		station_defaults(&initial);
+		rc = station_kind_options(st, &initial);
+		if (rc < 0)
+			return rc;
+	}
 
 	if (st->frequency == 0.0) {
 		printf("No frequency given, I suggest to use 100000000 (100 MHz) and FM\n\n");

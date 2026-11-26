@@ -225,7 +225,45 @@ paging case runs 12 s
       Found (parked, before and after alike): rigctl `f` after an RDS Spy
       tune still says 100 MHz - the rigctl server keeps its own copy of the
       frequency, the tune of another server does not reach it.
-   b. each kind its own options (the table, the check after parsing).
+   b. each kind its own options (done): the kinds are the modulations
+      (fm, am = DSB, usb, lsb; narrow FM is fm with its -D / -B). One
+      table in add_options() (`opt()`: name, parameters, kinds) from
+      handle_options() and radio_init():
+      fm only: -D, -E, --fm-compandor, -S, --rds, --rds2, --rds-debug,
+      --rds-verbose, --sca-67k, --sca-92k, --call-sign, --pi, --rbds, all
+      --rds-paging*, --rds-ecc, --rds-hexrds-file, --rds-bitstream-file,
+      --rds-tx-*-file, --rds-tmc-*, the RDS servers (--xdr-gtk-server,
+      its password - it turns RDS on -, --rdsspy-server, --uecp-server,
+      --asciig-server), --afc*; am (DSB) only: -I, -C (radio_init() uses
+      them in the DSB branch only); every kind: -f, -s, -r, -w, -a, -M,
+      -R, -T, -B, -V, --channelizer-rate, --polyphase-resampler,
+      --rigctl-*; process: -h, -v, --fast-math, --limesdr*, --sdr-*. The
+      command line options are recorded per station (after its -f, or all
+      of them without -f); after parsing, when the modulation is known
+      (-M may come last): one of another kind is refused (exit non-zero,
+      before the SDR, "Option '--stereo' is for stations with modulation
+      fm, this station is am"), and the settings of the other kinds are the
+      initial ones again (a default of another kind does not apply).
+      Behaviour changes: `-M am -S` refused by the kind check (was "Stereo
+      works with FM only", exit 0); `-S` before -f or in the config file
+      with an AM station: not applied, the station runs (was refused);
+      `-M usb -C`, `-M fm -I`, `-M am -E` refused (were ignored: -E only
+      scaled the AM volume, see below). Proof: suite.sh 12 the same,
+      opts.sh, extra5a.sh against ad433ad; opts5b.sh: an FM option after
+      an AM station's -f refused (-S, -E, -D, --rds, --pi, --afc,
+      --fm-compandor, --rdsspy-server), -I on FM and -C on USB refused,
+      FM options before -f / in the config file with an AM station = plain
+      AM (TX IQ, SDR calls, log), the same config file with an FM station
+      = ad433ad (and differs from plain FM: applied), AM options in the
+      config file with FM = plain FM, with AM = ad433ad (differs from plain
+      AM), `-I 0.5 -C` after -f = ad433ad, no -f with the frequency in the
+      config file: the command line is the station's (-S on AM refused).
+      Found (parked, before and after alike): radio_init()'s FM
+      modulation budget runs for AM too - an AM station's volume is
+      scaled by the 1 kHz pre-emphasis gain of the time constant (50 us:
+      x 0.956); the AM station keeps the initial 50 us, so its output is
+      as before. Known flake: opts.sh compares two runs of B with RDS,
+      the CT minute edge can make them differ once (run again).
    c. N stations: several `-f`, the loop over them, the SDR bands.
    d. the proof: FM stereo + RDS, AM, NFM together offline.
 6. The wide bank (in-process from the station list, backend option).
