@@ -1096,12 +1096,19 @@ static rds_paging_msg_t *rds_paging_dequeue(rds_paging_queue_t *q)
 	return msg;
 }
 
+/* the queue emptied, the scan stopped (application) */
+static void rds_paging_queue_clear(rds_paging_queue_t *q)
+{
+	rds_paging_msg_t *msg;
+	while ((msg = rds_paging_dequeue(q)) != NULL)
+		free(msg);
+	q->scan_active = 0;
+}
+
 /* the queue emptied (application) and the call on air dropped (protocol) */
 static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 {
-	rds_paging_msg_t *msg;
-	while ((msg = rds_paging_dequeue(&pag->q)) != NULL)
-		free(msg);
+	rds_paging_queue_clear(&pag->q);
 	if (pag->tx_msg) {
 		free(pag->tx_msg);
 		pag->tx_msg = NULL;
@@ -1856,6 +1863,30 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 
 /* Public API: scan addresses from..to (inclusive) with one message each.
  * type: RDS_PAGING_TONE, RDS_PAGING_NUM10 or RDS_PAGING_ALPHA. */
+/* the queue's scan of [from, to] (application; range and type checked by the
+ * caller) */
+static void rds_paging_queue_scan_start(rds_paging_queue_t *q, uint32_t from, uint32_t to,
+					enum rds_paging_msg_type type)
+{
+	q->scan_from = from;
+	q->scan_next = from;
+	q->scan_end = to + 1;
+	q->scan_start_time = time(NULL);
+	q->scan_log_time = q->scan_start_time;
+	q->scan_type = type;
+	/* Alpha: 4 characters fit one data group (EN 50067 M.2.1.6.4, Fig. M.5:
+	 * 4 characters per 7A group, segment 1111 carries the last four). If all
+	 * scanned addresses share the group code Y1Y2, the individual code
+	 * Z1..Z4 identifies the address. */
+	q->scan_alpha_chars = (from / 10000 == to / 10000) ? 4 : 6;
+	if (type == RDS_PAGING_ALPHA)
+		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: alpha payload %s (%d groups per call)\n",
+		     q->scan_alpha_chars == 4 ? "last 4 digits, group code is fixed by the range" :
+					      "6 digits, range spans more than one group code",
+		     rds_paging_scan_groups(q));
+	q->scan_active = 1;
+}
+
 int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
 			      enum rds_paging_msg_type type)
 {
@@ -1866,23 +1897,7 @@ int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
 	if (type != RDS_PAGING_TONE && type != RDS_PAGING_NUM10 && type != RDS_PAGING_ALPHA)
 		return -1;
 
-	pag->q.scan_from = from;
-	pag->q.scan_next = from;
-	pag->q.scan_end = to + 1;
-	pag->q.scan_start_time = time(NULL);
-	pag->q.scan_log_time = pag->q.scan_start_time;
-	pag->q.scan_type = type;
-	/* Alpha: 4 characters fit one data group (EN 50067 M.2.1.6.4, Fig. M.5:
-	 * 4 characters per 7A group, segment 1111 carries the last four). If all
-	 * scanned addresses share the group code Y1Y2, the individual code
-	 * Z1..Z4 identifies the address. */
-	pag->q.scan_alpha_chars = (from / 10000 == to / 10000) ? 4 : 6;
-	if (type == RDS_PAGING_ALPHA)
-		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: alpha payload %s (%d groups per call)\n",
-		     pag->q.scan_alpha_chars == 4 ? "last 4 digits, group code is fixed by the range" :
-						  "6 digits, range spans more than one group code",
-		     rds_paging_scan_groups(&pag->q));
-	pag->q.scan_active = 1;
+	rds_paging_queue_scan_start(&pag->q, from, to, type);
 	/* the protocol: the scan's schedule, the 4A minute marker pagers need
 	 * for interval sync, the interval clock */
 	pag->scan_schedule = 1;
@@ -1913,7 +1928,6 @@ void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enabled = enable;
 	if (!enable) {
-		rds->paging.q.scan_active = 0;
 		rds->paging.scan_schedule = 0;
 		rds_paging_queue_destroy(&rds->paging);
 	} else {
