@@ -1636,14 +1636,14 @@ typedef struct rds_paging_enc {
 	uint16_t	intl_country_code;	/* E.212 MCC default (e.g. 255=Ukraine) */
 	uint8_t		intl_opc;		/* OPC default (1-15) */
 
-	/* The interval clock (the 'scan_' names are older than the battery
-	 * saving that uses them too): groups since the last 4A, the 1A slots */
-	uint32_t	scan_grp;		/* groups since the last 4A (minute marker) */
-	uint32_t	scan_last_key;		/* interval*16 + slot of the last 1A/4A sent */
-	uint32_t	scan_last_0a;		/* 0A slot of the last 0A sent */
+	/* The interval clock (scan and battery saving): groups since the last
+	 * 4A, the 1A slots */
+	uint32_t	clk_groups;		/* groups since the last 4A (minute marker) */
+	uint32_t	clk_last_key;		/* interval*16 + slot of the last 1A/4A sent */
+	uint32_t	clk_last_0a;		/* 0A slot of the last 0A sent */
 	uint8_t		pending_13a;		/* 13A groups still to send after the interval marker */
-	uint8_t		scan_n;			/* 1A number in interval: 1, 2 .. 5, 6 = excess */
-	uint8_t		scan_interval;		/* interval number 0-9 of the current 1A */
+	uint8_t		clk_1a_n;		/* 1A number in interval: 1, 2 .. 5, 6 = excess */
+	uint8_t		clk_interval;		/* interval number 0-9 of the current 1A */
 
 	/* Battery saving (EN 50067 M.2.1.3): the group clock drives the 1A
 	 * interval sync bits and calls are only started inside the window of

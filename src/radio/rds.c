@@ -1119,7 +1119,7 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 
 /* per-message TX logs drop to INFO during a scan; the 60 s progress line stays at NOTICE */
 
-/* The paging group clock (scan_grp, groups since the last 4A) drives the 1A
+/* The paging group clock (clk_groups, groups since the last 4A) drives the 1A
  * interval sync bits and the reduced 1A/7A schedule during a scan and with
  * battery saving. */
 #define RDS_PAGING_TIMED(pag)	((pag)->enabled && ((pag)->scan_schedule || (pag)->battery_saving))
@@ -1139,7 +1139,7 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 /* Interval number (0-9) and position in it (ms) from the paging group clock. */
 static void rds_paging_clock(const rds_paging_enc_t *pag, unsigned *interval, unsigned *pos_ms)
 {
-	uint64_t ms = (uint64_t)pag->scan_grp * RDS_PAGING_GROUP_US / 1000;
+	uint64_t ms = (uint64_t)pag->clk_groups * RDS_PAGING_GROUP_US / 1000;
 
 	if (ms > 59999)
 		ms = 59999;
@@ -1168,11 +1168,11 @@ static int rds_paging_1a_slot(rds_paging_enc_t *pag)
 	rds_paging_clock(pag, &interval, &pos);
 	slot = (pos < 1000) ? 0 : 1 + (pos - 1000) * RDS_PAGING_SCAN_SLOTS / 5000;
 	key = interval * 16 + slot;
-	if (key == pag->scan_last_key)
+	if (key == pag->clk_last_key)
 		return 0;
-	pag->scan_last_key = key;
-	pag->scan_interval = interval;
-	pag->scan_n = (slot < 5) ? slot + 1 : 6;
+	pag->clk_last_key = key;
+	pag->clk_interval = interval;
+	pag->clk_1a_n = (slot < 5) ? slot + 1 : 6;
 	if (slot == 0)
 		rds_paging_marker(pag);
 	return 1;
@@ -1190,9 +1190,9 @@ static void rds_paging_clock_sync(rds_encoder_t *rds)
 	clock_gettime(CLOCK_REALTIME, &ts);
 	now = ts.tv_sec + rds->ct_correction;
 	ms = (uint64_t)(now % 60) * 1000 + ts.tv_nsec / 1000000;
-	pag->scan_grp = ms * 1000 / RDS_PAGING_GROUP_US;
-	pag->scan_last_key = 0xffffffff;
-	pag->scan_last_0a = 0xffffffff;
+	pag->clk_groups = ms * 1000 / RDS_PAGING_GROUP_US;
+	pag->clk_last_key = 0xffffffff;
+	pag->clk_last_0a = 0xffffffff;
 	rds->last_ct_minute = now;
 }
 
@@ -2505,8 +2505,8 @@ static void rds_build_group_2b(rds_encoder_t *rds, uint8_t *group)
  * are set by the scan group scheduler. Returns B1B0 and k. */
 static uint8_t rds_paging_1a_sync(const rds_encoder_t *rds, int *k_out)
 {
-	unsigned interval = rds->paging.scan_interval;
-	int k = rds->paging.scan_n;
+	unsigned interval = rds->paging.clk_interval;
+	int k = rds->paging.clk_1a_n;
 	uint8_t b1, b0;
 
 	switch (k) {
@@ -2554,7 +2554,7 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 		rpc = (rpc & 0x1C) | rds_paging_1a_sync(rds, &sync_k);
 		if (!other_variants)
 			variant = RDS_1A_VARIANT_PAGER;
-		else if (sync_k == 1 || (sync_k == 2 && rds->paging.scan_interval == 0))
+		else if (sync_k == 1 || (sync_k == 2 && rds->paging.clk_interval == 0))
 			variant = RDS_1A_VARIANT_ECC;
 	}
 	
@@ -2661,7 +2661,7 @@ static void rds_build_group_1a(rds_encoder_t *rds, uint8_t *group)
 	if (rds->paging.enabled) {
 		uint16_t sty0 = (uint16_t)(((rds->paging.pac & 0x3F) << 4) | (rds->paging.intl_opc & 0x0F));
 		uint16_t sty1 = (uint16_t)((1 << 10) | (0 << 8) | (rds->ecc & 0xFF));
-		int marker = (sync_k == 1 || (sync_k == 2 && rds->paging.scan_interval == 0));
+		int marker = (sync_k == 1 || (sync_k == 2 && rds->paging.clk_interval == 0));
 
 		switch (variant) {
 		case RDS_1A_VARIANT_PAGER:
@@ -3901,7 +3901,7 @@ static void rds_build_group_13a_paging(rds_encoder_t *rds, uint8_t *group)
 
 	/* 13A follows the first marker of the interval (M.3.4.1.1): IT is the
 	 * current interval of the paging group clock */
-	interval = pag->scan_interval;
+	interval = pag->clk_interval;
 
 	/* Recompute notification bits from current queue state */
 	rds_paging_update_notify(pag, interval);
@@ -4219,7 +4219,7 @@ static void rds_build_group_15a(rds_encoder_t *rds, uint8_t *group);
 static void rds_generate_group(rds_encoder_t *rds)
 {
 	if (rds->paging.enabled)
-		rds->paging.scan_grp++;
+		rds->paging.clk_groups++;
 
 	/* ============================================================
 	 * PRIORITY 0: TX File Input (bypasses ALL other generation)
@@ -4292,12 +4292,12 @@ static void rds_generate_group(rds_encoder_t *rds)
 			rds->last_ct_minute = now;
 			/* 4A is the first marker of interval 0 and anchors the
 			 * paging scan group clock */
-			rds->paging.scan_grp = 0;
-			rds->paging.scan_last_key = 0;
-			rds->paging.scan_last_0a = 0xffffffff;
+			rds->paging.clk_groups = 0;
+			rds->paging.clk_last_key = 0;
+			rds->paging.clk_last_0a = 0xffffffff;
 			/* 4A is the first marker of interval 0 */
-			rds->paging.scan_interval = 0;
-			rds->paging.scan_n = 1;
+			rds->paging.clk_interval = 0;
+			rds->paging.clk_1a_n = 1;
 			if (rds->paging.enabled)
 				rds_paging_marker(&rds->paging);
 			rds->group_sequence++;
@@ -4376,7 +4376,7 @@ static void rds_generate_group(rds_encoder_t *rds)
 
 	if (RDS_PAGING_TIMED(&rds->paging)) {
 		rds_paging_enc_t *pag = &rds->paging;
-		uint64_t ms = (uint64_t)pag->scan_grp * RDS_PAGING_GROUP_US / 1000;
+		uint64_t ms = (uint64_t)pag->clk_groups * RDS_PAGING_GROUP_US / 1000;
 		uint32_t key_0a;
 
 		if (ms > 59999)
@@ -4388,8 +4388,8 @@ static void rds_generate_group(rds_encoder_t *rds)
 			/* 13A right after the first marker (M.3.4.1.1) */
 			pag->pending_13a--;
 			type = RDS_GROUP_13A;
-		} else if (key_0a != pag->scan_last_0a) {
-			pag->scan_last_0a = key_0a;
+		} else if (key_0a != pag->clk_last_0a) {
+			pag->clk_last_0a = key_0a;
 			type = rds->use_0b ? RDS_GROUP_0B : RDS_GROUP_0A;
 		} else {
 			type = RDS_GROUP_7A;
