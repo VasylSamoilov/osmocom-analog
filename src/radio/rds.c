@@ -9681,6 +9681,7 @@ static void rds_display_new_station(struct rds_display_shown *shown)
 	shown->pty = 0xFF;	/* fire INFO on first PTY */
 	shown->ct_hour = 0xFF;
 	shown->ct_minute = 0xFF;
+	shown->ecc_mismatch = 0;
 }
 
 /* The display of a received field: shown when it differs from what was shown
@@ -9722,6 +9723,23 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 			shown->ct_minute = rds->ct_minute;
 		}
 #endif
+		break;
+	case RDS_CHANGE_ECC:
+		/* ECC vs mode mismatch (once, only for valid ECCs) */
+		if (!shown->ecc_mismatch && rds_is_valid_ecc(rds->ecc)) {
+			int ecc_is_rbds = rds_ecc_is_rbds(rds->ecc);
+			if (rds->force_rbds && !ecc_is_rbds) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS: --rbds forced but ECC=0x%02X (%s) "
+				     "is not US/Canada/Mexico. Received stream is likely RDS.\n",
+				     rds->ecc, rds_get_ecc_name(rds->ecc));
+				shown->ecc_mismatch = 1;
+			} else if (!rds->force_rbds && ecc_is_rbds) {
+				LOGP(DRADIO, LOGL_NOTICE, "RDS: ECC=0x%02X (%s) indicates RBDS. "
+				     "Use --rbds for US PTY names and callsign decoding.\n",
+				     rds->ecc, rds_get_ecc_name(rds->ecc));
+				shown->ecc_mismatch = 1;
+			}
+		}
 		break;
 	}
 }
@@ -10337,21 +10355,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 						     rds_get_country_code(cc, rds->ecc),
 						     rds->linkage_actuator ? "Yes" : "No");
 				}
-				/* Check ECC vs mode mismatch (log once, only for valid ECCs) */
-				if (!rds->ecc_mismatch_logged && rds_is_valid_ecc(rds->ecc)) {
-					int ecc_is_rbds = rds_ecc_is_rbds(rds->ecc);
-					if (rds->force_rbds && !ecc_is_rbds) {
-						LOGP(DRADIO, LOGL_NOTICE, "RDS: --rbds forced but ECC=0x%02X (%s) "
-						     "is not US/Canada/Mexico. Received stream is likely RDS.\n",
-						     rds->ecc, rds_get_ecc_name(rds->ecc));
-						rds->ecc_mismatch_logged = 1;
-					} else if (!rds->force_rbds && ecc_is_rbds) {
-						LOGP(DRADIO, LOGL_NOTICE, "RDS: ECC=0x%02X (%s) indicates RBDS. "
-						     "Use --rbds for US PTY names and callsign decoding.\n",
-						     rds->ecc, rds_get_ecc_name(rds->ecc));
-						rds->ecc_mismatch_logged = 1;
-					}
-				}
+				rds_changed(rds, RDS_CHANGE_ECC);
 				break;
 			case RDS_1A_VARIANT_LANGUAGE:
 				/* Language code */

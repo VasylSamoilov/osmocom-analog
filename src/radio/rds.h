@@ -2509,6 +2509,7 @@ typedef struct {
 enum rds_change {
 	RDS_CHANGE_PTY,		/* a block B: PTY (rds->pty) */
 	RDS_CHANGE_CT,		/* a 4A: clock time (rds->ct_*) */
+	RDS_CHANGE_ECC,		/* a 1A variant 0: ECC (rds->ecc) */
 };
 
 struct rds_decoder;
@@ -2579,7 +2580,6 @@ typedef struct rds_decoder {
 	 * received, cleared by it (RDS_DECODER_RECEIVED).
 	 */
 	int		rbds_hint_logged; /* 1 after emphasis/mode mismatch hint logged */
-	int		ecc_mismatch_logged; /* 1 after ECC vs mode mismatch logged */
 
 	/* Tunable State */
 	double		phase_subcarrier;	/* Current subcarrier phase (0..2pi) */
@@ -2758,6 +2758,7 @@ typedef struct rds_decoder {
 		uint8_t	ct_hour;		/* Hour last logged via INFO */
 		uint8_t	ct_minute;		/* Minute last logged via INFO */
 		uint8_t	pty;			/* PTY value last logged via INFO */
+		uint8_t	ecc_mismatch;		/* ECC vs RDS / RBDS mode mismatch shown */
 	} shown;
 
 	/* Display options */
