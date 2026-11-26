@@ -941,6 +941,22 @@ static const rds_preset_t rds_presets[] = {
  * .pin_hour, .pin_minute); group versions per-preset (group0/1/2_version). The
  * station settings outside the presets are in radio->opts (radio_opts_t). */
 
+/* the station sends / receives (radio_opts_t tx / rx); neither set: the
+ * SDR's TX-only / RX-only mode decides, as before */
+static int radio_sends(const radio_t *radio)
+{
+	if (radio->opts.tx || radio->opts.rx)
+		return radio->opts.tx;
+	return !sdr_config || !sdr_config->rx_only;
+}
+
+static int radio_receives(const radio_t *radio)
+{
+	if (radio->opts.tx || radio->opts.rx)
+		return radio->opts.rx;
+	return !sdr_config || !sdr_config->tx_only;
+}
+
 void radio_opts_init(radio_opts_t *opts)
 {
 	memset(opts, 0, sizeof(*opts));
@@ -1833,8 +1849,9 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 
 			/* Initialize encoder with calculated PI and preset values
 			 * (rds_apply_preset will overwrite these, but init needs valid values)
-			 * Only initialize encoder for TX path (not in rx_only mode) */
-			if (!sdr_config || !sdr_config->rx_only) {
+			 * Only initialize encoder for TX path: the station's own
+			 * (several stations: not the SDR's mode of all of them) */
+			if (radio_sends(radio)) {
 				LOGP(DRADIO, LOGL_NOTICE, "RDS: Initializing encoder for TX path\n");
 				rds_encoder_init(&radio->rds_enc, radio->signal_samplerate,
 					pi, p->ps, p->rt, p->pty, p->ptyn);
@@ -1852,8 +1869,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping encoder init (RX-only mode)\n");
 			}
 			
-			/* Only initialize decoder for RX path (not in tx_only mode) */
-			if (!sdr_config || !sdr_config->tx_only) {
+			/* Only initialize decoder for RX path (the station's own) */
+			if (radio_receives(radio)) {
 				LOGP(DRADIO, LOGL_NOTICE, "RDS: Initializing decoder for RX path\n");
 				rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us, rds_force_rbds);
 			} else {
@@ -2008,7 +2025,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 	/* Apply RDS preset after all initialization is complete
 	 * This ensures the preset is applied when everything is fully ready
 	 * Only apply preset for TX path (encoder only, not in rx_only mode) */
-	if ((!sdr_config || !sdr_config->rx_only) && (radio->rds || radio->rds2) && radio->modulation == MODULATION_FM) {
+	if (radio_sends(radio) && (radio->rds || radio->rds2) && radio->modulation == MODULATION_FM) {
 		/* Apply full preset configuration using the comprehensive function
 		 * This ensures all preset fields are applied correctly, including
 		 * EON, RT+, eRT+, eRT, group versions, etc. */

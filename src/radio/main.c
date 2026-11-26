@@ -1715,6 +1715,9 @@ static int station_init(station_t *s, void *sdr)
 	s->buffer_size = s->iq_rate * dsp_buffer / 1000;
 
 	s->radio_opts.polyphase = s->use_polyphase;
+	/* its RDS encoder / decoder by its own directions, not the SDR's mode */
+	s->radio_opts.tx = s->tx;
+	s->radio_opts.rx = s->rx;
 
 	rc = radio_init(&s->radio, s->buffer_size, s->iq_rate, s->frequency, s->tx_wave_file, s->rx_wave_file, (s->tx) ? s->tx_audiodev : NULL, (s->rx) ? s->rx_audiodev : NULL, s->modulation, s->bandwidth, s->deviation, s->modulation_index, s->time_constant_us, s->volume, s->stereo, s->rds, s->rds2, s->sca_67k, s->sca_92k, s->rds_debug, s->rds_verbose, s->am_compandor, s->fm_compandor, s->rds_force_rbds, &s->radio_opts);
 	if (rc < 0) {

@@ -67,6 +67,8 @@ typedef struct radio_opts {
 	uint8_t		rds_ta;			/* Traffic Announcement */
 	uint8_t		rds_di_artificial_head, rds_di_compressed, rds_di_dynamic_pty;
 	int		rds_ct;			/* Clock-Time groups */
+	int		tx, rx;			/* the station sends / receives: its RDS encoder / decoder
+						 * (neither set: from the SDR's TX-only / RX-only mode) */
 } radio_opts_t;
 
 void radio_opts_init(radio_opts_t *opts);
