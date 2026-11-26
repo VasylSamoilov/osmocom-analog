@@ -581,6 +581,8 @@ Next: the paging queue as a station-owned source (the queue walk, send
 times, repeats, the scan and the FIFO; the encoder asks it for the next
 call that may start now and keeps the markers, windows, 13A, A/B and the
 call counter), then rds.c split into layer files (allowed as an exact
-move by line range). Found, not fixed yet: on the bit path a lost block
-keeps the previous group's status, the servers get it with the group (the
-hexrds file uses the present mask and is right).
+move by line range). Fixed (38c0d8e): on the bit path a lost block kept
+the previous group's status, the servers got it as good. Proven since
+(preset.sh): the runtime preset switch ('f' in a pty; the key needs
+'timeout --foreground') before slice 4 and now - the same preset lines,
+the same 104 distinct groups of the new preset (but the CT group).
