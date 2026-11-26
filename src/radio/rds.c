@@ -1112,7 +1112,7 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 /* The paging group clock (scan_grp, groups since the last 4A) drives the 1A
  * interval sync bits and the reduced 1A/7A schedule during a scan and with
  * battery saving. */
-#define RDS_PAGING_TIMED(pag)	((pag)->enabled && ((pag)->q.scan_active || (pag)->battery_saving))
+#define RDS_PAGING_TIMED(pag)	((pag)->enabled && ((pag)->scan_schedule || (pag)->battery_saving))
 
 #define RDS_PAGING_SCAN_QUEUE	32	/* kept queued during a scan, rest is free for the FIFO */
 #define RDS_PAGING_SCAN_ELIGIBLE 32	/* battery saving: calls kept queued that can be sent now */
@@ -1120,7 +1120,7 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 /* Type 0 groups per second in the timed schedule. EN 50067 3.1.3: four
  * for PS; the rate may be reduced when capacity is needed for other
  * applications, but not below two. A scan uses the minimum. */
-#define RDS_PAGING_0A_RATE(pag)	((pag)->q.scan_active ? RDS_PAGING_0A_PER_SEC_SCAN : RDS_PAGING_0A_PER_SEC)
+#define RDS_PAGING_0A_RATE(pag)	((pag)->scan_schedule ? RDS_PAGING_0A_PER_SEC_SCAN : RDS_PAGING_0A_PER_SEC)
 /* Share of groups left for 7A in the timed schedule. Per 6 s interval
  * (~68.5 groups): 13 x 1A and 6 x RDS_PAGING_0A_RATE x 0A. */
 #define RDS_PAGING_GROUPS_6S	(6000000.0 / RDS_PAGING_GROUP_US)
@@ -1357,6 +1357,8 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 	if (pag->q.scan_next >= pag->q.scan_end && !pag->q.queue_head && !pag->tx_active && !pag->tx_msg) {
 		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: complete\n");
 		pag->q.scan_active = 0;
+		/* the protocol back to its normal schedule */
+		pag->scan_schedule = 0;
 		rds_enc_scheduler_update(rds);
 	}
 }
@@ -1427,7 +1429,7 @@ static void rds_paging_sent(rds_encoder_t *rds, int complete)
 	c.opc = msg->opc;
 	c.send_n = msg->repeats_left + 1;
 	c.send_total = msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left);
-	c.scan = pag->q.scan_active;
+	c.scan = pag->scan_schedule;
 	if (!complete && pag->battery_saving) {
 		c.battery_saving = 1;
 		rds_paging_clock(pag, &c.interval, &c.interval_pos_ms);
@@ -1852,7 +1854,9 @@ int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
 						  "6 digits, range spans more than one group code",
 		     rds_paging_scan_groups(pag));
 	pag->q.scan_active = 1;
-	/* pagers need the 4A minute marker for interval sync */
+	/* the protocol: the scan's schedule, the 4A minute marker pagers need
+	 * for interval sync, the interval clock */
+	pag->scan_schedule = 1;
 	rds_enc_set_ct_enabled(rds, 1);
 	rds_paging_clock_sync(rds);
 	rds_enc_scheduler_update(rds);
@@ -1881,6 +1885,7 @@ void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable)
 	rds->paging.enabled = enable;
 	if (!enable) {
 		rds->paging.q.scan_active = 0;
+		rds->paging.scan_schedule = 0;
 		rds_paging_queue_destroy(&rds->paging);
 	} else {
 		/* Paging needs 4A at each minute and 1A once per second at the
@@ -3861,7 +3866,7 @@ void rds_enc_scheduler_update(rds_encoder_t *rds)
 		/* 1A slots are inserted by rds_generate_group() */
 		ADD_GRP(RDS_GROUP_7A);
 		LOGP(DRADIO, LOGL_INFO, "RDS Scheduler: paging %s, 13 x 1A per 6 s interval, %d x %s per second, 7A otherwise\n",
-		     rds->paging.q.scan_active ? "scan" : "battery saving",
+		     rds->paging.scan_schedule ? "scan" : "battery saving",
 		     RDS_PAGING_0A_RATE(&rds->paging), rds->use_0b ? "0B" : "0A");
 		return;
 	}

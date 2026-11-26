@@ -1627,6 +1627,8 @@ typedef struct rds_paging_enc {
 	 * interval sync bits and calls are only started inside the window of
 	 * their address (last digit d: intervals d, d+1, d+2). */
 	int		battery_saving;
+	int		scan_schedule;		/* the scan's schedule (fewer 0A, timed),
+						 * set by the queue while a scan runs */
 } rds_paging_enc_t;
 
 /* Paging decoder state - embedded in rds_decoder_t */
