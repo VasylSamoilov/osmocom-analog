@@ -176,6 +176,7 @@ typedef struct station {
 	int band;		/* several stations: its SDR band (sdr_bands), else -1 */
 	char band_name[48];
 	int64_t band_missing, band_dropped;	/* its band's faults reported so far */
+	char log_tag[24];	/* several stations: "(station N) " before its log lines */
 } station_t;
 
 /* Options (docs/RADIO-STATIONS.md): the config file and the command line
@@ -193,6 +194,20 @@ static int num_stations;
 static int options_from_command_line;
 static station_t *st = &station_default;
 static sdr_bands_t bands;	/* several stations */
+
+/* The station the log lines are about from now on (NULL: none, the
+ * process): with several stations "(station N) " before each of its lines
+ * (liblogging's logging_prefix); one station: none, as before. */
+static void station_log(station_t *s)
+{
+	if (!s || num_stations < 2) {
+		logging_prefix = "";
+		return;
+	}
+	if (!s->log_tag[0])
+		snprintf(s->log_tag, sizeof(s->log_tag), "(station %d) ", (int)(s - stations) + 1);
+	logging_prefix = s->log_tag;
+}
 
 /* the initial values of a station's settings */
 static void station_defaults(station_t *s)
@@ -2600,8 +2615,10 @@ int main(int argc, char *argv[])
 
 	for (si = 0; si < num_stations; si++) {
 		st = &stations[si];
+		station_log(st);
 		station_signal();
 	}
+	station_log(NULL);
 	st = &stations[0];
 
 	/* Keep SDR direction flags in sync with radio app direction flags.
@@ -2632,7 +2649,9 @@ int main(int argc, char *argv[])
 		return -EINVAL;
 
 	for (si = 0; si < num_stations; si++) {
+		station_log(&stations[si]);
 		rc = station_init(&stations[si], sdr);
+		station_log(NULL);
 		num_started = si + 1;
 		if (rc < 0)
 			goto error;
@@ -2739,7 +2758,9 @@ int main(int argc, char *argv[])
 				band_report = now_s();
 			}
 			for (si = 0; si < num_stations; si++) {
+				station_log(&stations[si]);
 				rc = station_poll(&stations[si], sdr);
+				station_log(NULL);
 				if (rc < 0)
 					break;
 			}
@@ -2866,8 +2887,11 @@ error:
 		sdr_bands_close(&bands);
 	if (sdr)
 		sdr_close(sdr);
-	for (si = 0; si < num_started; si++)
+	for (si = 0; si < num_started; si++) {
+		station_log(&stations[si]);
 		station_exit(&stations[si]);
+	}
+	station_log(NULL);
 
 	/* global exits */
 	fm_exit();
