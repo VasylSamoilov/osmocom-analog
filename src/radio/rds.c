@@ -12385,11 +12385,13 @@ void rds_decoder_reset(rds_decoder_t *rds)
 		LOGP(DRADIO, LOGL_INFO, "RDS decoder reset (new station)\n");
 }
 
-/* Feed a single decoded bit into the RDS decoder sync state machine.
- * This bypasses the DSP/PLL/biphase stages and feeds directly into
- * the block synchronizer + group decoder.
- * Used for binary .rds bitstream files (raw RDS bits, MSB first). */
-void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
+/* RDS codec, bits to groups: one received bit into the block synchroniser
+ * (search: a syndrome hit SYNC_THRESHOLD times at the same position;
+ * flywheel: a block every 26 bits, lost after SYNC_LOSS_GROUPS groups
+ * without a good block), the error correction and the group assembly; a
+ * complete group to rds_decode_group(). The one path of the demodulated
+ * bits (rds_decoder_process) and of bitstream files (rds_decoder_feed_bit). */
+static void rds_decoder_bit(rds_decoder_t *rds, int bit)
 {
 	rds->shift_reg = ((rds->shift_reg << 1) | (bit & 1)) & 0x3FFFFFF;
 	rds->bit_count++;
@@ -12400,6 +12402,7 @@ void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
 		/* Search Mode: Check every bit for valid syndrome */
 		uint16_t block_index;
 		if (rds_check_syndrome(rds->shift_reg, &block_index)) {
+			/* Valid syndrome found. Track it for multi-hit confirmation. */
 			int offset = rds->bit_time % 26;
 			int pseudo_block = ((rds->bit_time / 26) + 4 - block_index) % 4;
 
@@ -12407,12 +12410,15 @@ void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
 				LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Hit at offset=%d pseudo=%d block=%c\n",
 					offset, pseudo_block, 'A'+block_index);
 
+			/* Age out old hits */
 			if (rds->sync_hit_time[offset][pseudo_block] < rds->bit_time - SYNC_CONFIRM_BITS)
 				rds->sync_hits[offset][pseudo_block] = 0;
 
+			/* Record this hit */
 			rds->sync_hits[offset][pseudo_block]++;
 			rds->sync_hit_time[offset][pseudo_block] = rds->bit_time;
 
+			/* Check if we have enough hits to acquire sync */
 			if (rds->sync_hits[offset][pseudo_block] > SYNC_THRESHOLD) {
 				rds->synced = 1;
 				rds->block_idx = (block_index + 1) & 0x03;
@@ -12432,86 +12438,120 @@ void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
 				LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Acquired at offset %c (hits=%d)\n",
 					'A'+block_index, rds->sync_hits[offset][pseudo_block]);
 
+				/* Clear sync hit array */
 				memset(rds->sync_hits, 0, sizeof(rds->sync_hits));
 				memset(rds->sync_hit_time, 0, sizeof(rds->sync_hit_time));
 			}
 		}
+		return;
+	}
+
+	/* Synced Mode: Flywheel - only check at expected boundaries */
+	if (rds->bit_count_in_block < 26)
+		return;
+	rds->bit_count_in_block = 0; /* Reset for next block */
+	rds->blocks_received++;
+
+	uint16_t offset;
+	int valid_syndrome = rds_check_syndrome(rds->shift_reg, &offset);
+
+	if (valid_syndrome && (int)offset == rds->block_idx) {
+		/* Valid Match */
+		rds->blocks[rds->block_idx] = (rds->shift_reg >> 10) & 0xFFFF;
+		rds->group_mask |= (1 << rds->block_idx);
+		rds->block_status[rds->block_idx] = RDS_STATUS_VALID;
+		rds->blocks_ok++;
+		rds->nb_ok++;
+		rds->errors = 0;
+		rds->sig_blocks_ok_period++;
 	} else {
-		/* Synced Mode: Flywheel */
-		if (rds->bit_count_in_block >= 26) {
-			rds->bit_count_in_block = 0;
-			rds->blocks_received++;
-
-			uint16_t offset;
-			int valid_syndrome = rds_check_syndrome(rds->shift_reg, &offset);
-
-			if (valid_syndrome && (int)offset == rds->block_idx) {
-				uint16_t data = (rds->shift_reg >> 10) & 0xFFFF;
-				rds->blocks[rds->block_idx] = data;
-				rds->group_mask |= (1 << rds->block_idx);
-				rds->block_status[rds->block_idx] = RDS_STATUS_VALID;
-				rds->blocks_ok++;
-				rds->nb_ok++;
-				rds->errors = 0;
-			} else {
-				uint32_t corrected_block;
-				/* For block 3 (block_idx 2) the offset word is C for a
-				 * version-A group and C' for a version-B group. The group
-				 * version is bit B0 of block B's group-type field, and block B
-				 * has already been received this group, so select the correct
-				 * FEC table (index 4 = C') instead of guessing. */
-				int fec_offset = rds->block_idx;
-				if (rds->block_idx == 2 &&
-				    (rds->group_mask & (1 << 1)) &&
-				    (rds->blocks[1] & RDS_B2_VERSION_MASK))
-					fec_offset = 4; /* C' table */
-				if (rds_correct_errors(rds->shift_reg, fec_offset, &corrected_block)) {
-					uint16_t data = (corrected_block >> 10) & 0xFFFF;
-					rds->blocks[rds->block_idx] = data;
-					rds->group_mask |= (1 << rds->block_idx);
-					rds->block_status[rds->block_idx] = RDS_STATUS_CORRECTED;
-					rds->blocks_ok++;
-					rds->nb_ok++;
-					rds->errors = 0;
-				} else {
-					rds->errors++;
-					rds->blocks_bad++;
-					rds->blocks_missing[rds->block_idx]++;
-					rds->group_error_count++;
-				}
-			}
-
-			rds->block_idx = (rds->block_idx + 1) & 0x03;
-
-			if (rds->block_idx == 0) {
-				rds_decode_group(rds);
-				rds->group_mask = 0;
-
-				if (rds->nb_ok > 0)
-					rds->nb_unsync = 0;
+		/* Mismatch or Invalid - Try FEC */
+		uint32_t corrected_block;
+		/* For block 3 (block_idx 2) the offset word is C for a
+		 * version-A group and C' for a version-B group. The group
+		 * version is bit B0 of block B's group-type field, and block B
+		 * has already been received this group, so select the correct
+		 * FEC table (index 4 = C') instead of guessing. */
+		int fec_offset = rds->block_idx;
+		if (rds->block_idx == 2 &&
+		    (rds->group_mask & (1 << 1)) &&
+		    (rds->blocks[1] & RDS_B2_VERSION_MASK))
+			fec_offset = 4; /* C' table */
+		if (rds_correct_errors(rds->shift_reg, fec_offset, &corrected_block)) {
+			/* FEC succeeded */
+			rds->blocks[rds->block_idx] = (corrected_block >> 10) & 0xFFFF;
+			rds->group_mask |= (1 << rds->block_idx);
+			rds->block_status[rds->block_idx] = RDS_STATUS_CORRECTED;
+			rds->blocks_ok++;
+			rds->nb_ok++;
+			rds->errors = 0;
+			rds->sig_blocks_fec_period++;
+		} else {
+			/* FEC failed */
+			if (rds->debug) {
+				if (valid_syndrome)
+					LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c wrong offset (expected %c got %c) reg=%07X freq=%.2f clk_phi=%.4f\n",
+					     'A'+rds->block_idx, 'A'+rds->block_idx, 'A'+offset, rds->shift_reg,
+					     rds->freq_subcarrier, rds->clock_phi);
 				else
-					rds->nb_unsync++;
-
-				if (rds->nb_unsync >= SYNC_LOSS_GROUPS) {
-					LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Lost Sync (%d groups with no valid blocks)\n", rds->nb_unsync);
-					rds->synced = 0;
-				}
-				rds->nb_ok = 0;
+					LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c no valid syndrome, FEC failed, reg=%07X freq=%.2f clk_phi=%.4f bit_in_blk=%d\n",
+					     'A'+rds->block_idx, rds->shift_reg,
+					     rds->freq_subcarrier, rds->clock_phi, rds->bit_count_in_block);
 			}
-
-			rds->blocks_in_group++;
-			if (rds->blocks_in_group >= 4) {
-				float g_ber = (float)rds->group_error_count / 4.0;
-				rds->ber_accumulator -= rds->ber_history[rds->ber_history_idx];
-				rds->ber_history[rds->ber_history_idx] = g_ber;
-				rds->ber_accumulator += g_ber;
-				rds->ber_history_idx = (rds->ber_history_idx + 1) % BER_WINDOW_SIZE;
-				rds->ber_percent = (rds->ber_accumulator / BER_WINDOW_SIZE) * 100.0;
-				rds->blocks_in_group = 0;
-				rds->group_error_count = 0;
-			}
+			rds->errors++;
+			rds->blocks_bad++;
+			rds->blocks_missing[rds->block_idx]++;
+			rds->group_error_count++;
+			rds->sig_blocks_bad_period++;
+			rds->sig_block_miss[rds->block_idx]++;
+			if (valid_syndrome)
+				rds->sig_block_wrongoff++;
 		}
 	}
+
+	/* Always advance expected block index */
+	rds->block_idx = (rds->block_idx + 1) & 0x03;
+
+	/* Group Processing at end of cycle */
+	if (rds->block_idx == 0) {
+		rds_decode_group(rds);
+		rds->group_mask = 0;
+		rds->sig_groups_period++;
+
+		/* Sync loss detection */
+		if (rds->nb_ok > 0)
+			rds->nb_unsync = 0;
+		else
+			rds->nb_unsync++;
+
+		if (rds->nb_unsync >= SYNC_LOSS_GROUPS) {
+			LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Lost Sync (%d groups with no valid blocks)\n", rds->nb_unsync);
+			rds->synced = 0;
+		}
+		rds->nb_ok = 0;
+	}
+
+	/* BER Update (only on block boundaries) */
+	rds->blocks_in_group++;
+	if (rds->blocks_in_group >= 4) {
+		float g_ber = (float)rds->group_error_count / 4.0;
+		rds->ber_accumulator -= rds->ber_history[rds->ber_history_idx];
+		rds->ber_history[rds->ber_history_idx] = g_ber;
+		rds->ber_accumulator += g_ber;
+		rds->ber_history_idx = (rds->ber_history_idx + 1) % BER_WINDOW_SIZE;
+		rds->ber_percent = (rds->ber_accumulator / BER_WINDOW_SIZE) * 100.0;
+		rds->blocks_in_group = 0;
+		rds->group_error_count = 0;
+	}
+}
+
+/* Feed a single decoded bit into the RDS decoder sync state machine.
+ * This bypasses the DSP/PLL/biphase stages and feeds directly into
+ * the block synchronizer + group decoder.
+ * Used for binary .rds bitstream files (raw RDS bits, MSB first). */
+void rds_decoder_feed_bit(rds_decoder_t *rds, int bit)
+{
+	rds_decoder_bit(rds, bit);
 }
 
 void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
@@ -12664,11 +12704,8 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 
 				if (rds_biphase_decode(rds, rds->integrator)) {
 					/* Got Bit */
-					rds->shift_reg = ((rds->shift_reg << 1) | rds->curr_bit) & 0x3FFFFFF;
-					rds->bit_count++;
-					rds->bit_count_in_block++;
 					rds->sig_bits_period++;
-					
+
 					/* Write to bitstream output file if enabled (MSB first) */
 					if (rds->bitstream_file) {
 						rds->bitstream_byte = (rds->bitstream_byte << 1) | (rds->curr_bit & 1);
@@ -12680,165 +12717,8 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 						}
 					}
 					
-					/* Debug Bit Stream */
-					// LOGP(DRADIO, LOGL_DEBUG, "RDS BIT: %d (reg=%07X)\n", rds->curr_bit, rds->shift_reg);
-					
-					/* Sync State Machine */
-					rds->bit_time++;
-					
-					if (!rds->synced) {
-						/* Search Mode: Check every bit for valid syndrome */
-						uint16_t block_index;
-						if (rds_check_syndrome(rds->shift_reg, &block_index)) {
-							/* Valid syndrome found. Track it for multi-hit confirmation. */
-							int offset = rds->bit_time % 26;
-							int pseudo_block = ((rds->bit_time / 26) + 4 - block_index) % 4;
-							
-							if (rds->debug)
-								LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Hit at offset=%d pseudo=%d block=%c\n", 
-									offset, pseudo_block, 'A'+block_index);
-							
-							/* Age out old hits */
-							if (rds->sync_hit_time[offset][pseudo_block] < rds->bit_time - SYNC_CONFIRM_BITS) {
-								rds->sync_hits[offset][pseudo_block] = 0;
-							}
-							
-							/* Record this hit */
-							rds->sync_hits[offset][pseudo_block]++;
-							rds->sync_hit_time[offset][pseudo_block] = rds->bit_time;
-							
-							/* Check if we have enough hits to acquire sync */
-							if (rds->sync_hits[offset][pseudo_block] > SYNC_THRESHOLD) {
-								rds->synced = 1;
-								rds->block_idx = (block_index + 1) & 0x03;
-								rds->errors = 0;
-								rds->blocks_in_group = 0;
-								rds->group_error_count = 0;
-								rds->blocks_received++;
-								rds->group_mask = (1 << block_index);
-								rds->nb_ok = 1;
-								rds->nb_unsync = 0;
-								rds->bit_count_in_block = 0;
-								
-								uint16_t data = (rds->shift_reg >> 10) & 0xFFFF;
-								rds->blocks[block_index] = data;
-								rds->blocks_ok++;
-								
-								LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Acquired at offset %c (hits=%d)\n", 
-									'A'+block_index, rds->sync_hits[offset][pseudo_block]);
-								
-								/* Clear sync hit array */
-								memset(rds->sync_hits, 0, sizeof(rds->sync_hits));
-								memset(rds->sync_hit_time, 0, sizeof(rds->sync_hit_time));
-							}
-						}
-					} else {
-						/* Synced Mode: Flywheel - only check at expected boundaries */
-						if (rds->bit_count_in_block >= 26) {
-							rds->bit_count_in_block = 0; /* Reset for next block */
-							rds->blocks_received++;
-							
-							uint16_t offset;
-							int valid_syndrome = rds_check_syndrome(rds->shift_reg, &offset);
-							
-							if (valid_syndrome && (int)offset == rds->block_idx) {
-								uint16_t data = (rds->shift_reg >> 10) & 0xFFFF;
-								// LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Valid Block offset=%c data=%04X\n", 'A'+offset, data);
-								
-								/* Valid Match */
-								rds->blocks[rds->block_idx] = data;
-								rds->group_mask |= (1 << rds->block_idx);
-								rds->block_status[rds->block_idx] = RDS_STATUS_VALID;
-								rds->blocks_ok++;
-								rds->nb_ok++;
-								rds->errors = 0;
-								rds->sig_blocks_ok_period++;
-							} else {
-								/* Mismatch or Invalid - Try FEC */
-								uint32_t corrected_block;
-								/* Block 3 uses C' (index 4) for version-B groups;
-								 * version is bit B0 of the already-received block B. */
-								int fec_offset = rds->block_idx;
-								if (rds->block_idx == 2 &&
-								    (rds->group_mask & (1 << 1)) &&
-								    (rds->blocks[1] & RDS_B2_VERSION_MASK))
-									fec_offset = 4; /* C' table */
-								if (rds_correct_errors(rds->shift_reg, fec_offset, &corrected_block)) {
-									/* FEC succeeded! */
-									uint16_t data = (corrected_block >> 10) & 0xFFFF;
-									// LOGP(DRADIO, LOGL_DEBUG, "RDS FEC: Corrected block %c data=%04X\n", 'A'+rds->block_idx, data);
-									
-									rds->blocks[rds->block_idx] = data;
-									rds->group_mask |= (1 << rds->block_idx);
-									rds->block_status[rds->block_idx] = RDS_STATUS_CORRECTED;
-									rds->blocks_ok++;
-									rds->nb_ok++;
-									rds->errors = 0;
-									rds->sig_blocks_fec_period++;
-								} else {
-									/* FEC failed */
-									if (valid_syndrome) {
-										if (rds->debug) {
-									LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c wrong offset (expected %c got %c) reg=%07X freq=%.2f clk_phi=%.4f\n",
-									     'A'+rds->block_idx, 'A'+rds->block_idx, 'A'+offset, rds->shift_reg,
-									     rds->freq_subcarrier, rds->clock_phi);
-								}
-								} else {
-									if (rds->debug) {
-										LOGP(DRADIO, LOGL_DEBUG, "RDS SYNC: Block %c no valid syndrome, FEC failed, reg=%07X freq=%.2f clk_phi=%.4f bit_in_blk=%d\n",
-										     'A'+rds->block_idx, rds->shift_reg,
-										     rds->freq_subcarrier, rds->clock_phi, rds->bit_count_in_block);
-									}
-								}
-									rds->errors++;
-									rds->blocks_bad++;
-									rds->blocks_missing[rds->block_idx]++;
-									rds->group_error_count++;
-									rds->sig_blocks_bad_period++;
-									rds->sig_block_miss[rds->block_idx]++;
-									if (valid_syndrome)
-										rds->sig_block_wrongoff++;
-								}
-							}
-							
-							/* Always advance expected block index */
-							rds->block_idx = (rds->block_idx + 1) & 0x03;
-							
-							/* Group Processing at end of cycle */
-							if (rds->block_idx == 0) {
-								rds_decode_group(rds);
-								rds->group_mask = 0;
-								rds->sig_groups_period++;
-								
-								/* Sync loss detection */
-								if (rds->nb_ok > 0) {
-									rds->nb_unsync = 0;
-								} else {
-									rds->nb_unsync++;
-								}
-								
-								if (rds->nb_unsync >= SYNC_LOSS_GROUPS) {
-									LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Lost Sync (%d groups with no valid blocks)\n", rds->nb_unsync);
-									rds->synced = 0;
-								}
-								
-								rds->nb_ok = 0;
-							}
-							
-							/* BER Update (only on block boundaries) */
-							rds->blocks_in_group++;
-							if (rds->blocks_in_group >= 4) {
-								float g_ber = (float)rds->group_error_count / 4.0;
-								rds->ber_accumulator -= rds->ber_history[rds->ber_history_idx];
-								rds->ber_history[rds->ber_history_idx] = g_ber;
-								rds->ber_accumulator += g_ber;
-								rds->ber_history_idx = (rds->ber_history_idx + 1) % BER_WINDOW_SIZE;
-								rds->ber_percent = (rds->ber_accumulator / BER_WINDOW_SIZE) * 100.0;
-								rds->blocks_in_group = 0;
-								rds->group_error_count = 0;
-							}
-						}
-					}
+					/* the codec: blocks, error correction, groups */
+					rds_decoder_bit(rds, rds->curr_bit);
 				}
 				rds->integrator = 0;
 			}
