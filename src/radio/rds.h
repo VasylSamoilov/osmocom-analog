@@ -1547,6 +1547,15 @@ typedef struct rds_encoder_sink {
 	void	*arg;
 } rds_encoder_sink_t;
 
+/* The 7A groups of one call, as the precompute encodes them (the call on
+ * air, or a count on the stack) */
+typedef struct rds_paging_frames {
+	int		tx_total_groups;/* Total groups needed for the message */
+	uint16_t	tx_blocks_c[RDS_PAGING_MAX_GROUPS];
+	uint16_t	tx_blocks_d[RDS_PAGING_MAX_GROUPS];
+	uint8_t		tx_psac_seq[RDS_PAGING_MAX_GROUPS];
+} rds_paging_frames_t;
+
 /* The paging call queue and the address scan that fills it - the
  * application side (wall clock: send times, repeats, the scan's pacing);
  * the protocol (rds_paging_enc_t) takes the next call that may start from
@@ -1581,12 +1590,9 @@ typedef struct rds_paging_enc {
 	int		tx_active;	/* Currently transmitting a message */
 	rds_paging_msg_t *tx_msg;	/* Message being transmitted (owned copy) */
 	int		tx_group_idx;	/* Current group index within message */
-	int		tx_total_groups;/* Total groups needed for current message */
 
 	/* Pre-computed group data for current message */
-	uint16_t	tx_blocks_c[RDS_PAGING_MAX_GROUPS];
-	uint16_t	tx_blocks_d[RDS_PAGING_MAX_GROUPS];
-	uint8_t		tx_psac_seq[RDS_PAGING_MAX_GROUPS];
+	rds_paging_frames_t fr;
 
 	/* the call queue and the address scan (application) */
 	rds_paging_queue_t q;

@@ -974,7 +974,7 @@ uint32_t rds_paging_addr_unpack(uint16_t block_c, uint8_t block_d_hi)
  * ============================================================ */
 
 /* Forward declarations */
-static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg);
+static void rds_paging_precompute(rds_paging_frames_t *fr, const rds_paging_msg_t *msg);
 
 /* Per-address call counter (EN 50067 M.3.5, P3-P0).
  * Returns next counter value (1-15) for the given address.
@@ -1005,7 +1005,7 @@ static uint8_t rds_paging_next_counter(rds_paging_enc_t *pag, uint32_t address)
  * Only applies to tone-only and alpha address groups.
  * Basic 10/18-digit numeric uses a different format where the
  * lower byte carries message digits, not a control byte. */
-static uint8_t rds_paging_build_ctrl(rds_paging_msg_t *msg)
+static uint8_t rds_paging_build_ctrl(const rds_paging_msg_t *msg)
 {
 	uint8_t ctrl = 0;
 
@@ -1224,16 +1224,17 @@ static int rds_paging_slot_ok(const rds_paging_enc_t *pag, uint32_t address, int
 }
 
 /* Number of groups a queued message takes on air, from the same encoder that
- * builds it - into a scratch state (the precompute writes only the tx_*
- * buffers), so the call on air is never touched. */
+ * builds it - into frames on the stack, so the call on air is never
+ * touched. */
 static int rds_paging_msg_groups(const rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 {
 	(void)pag;
 	if (!msg->ngroups) {
-		static rds_paging_enc_t scratch;
+		rds_paging_frames_t count;
 
-		rds_paging_precompute(&scratch, msg);
-		msg->ngroups = (uint8_t)scratch.tx_total_groups;
+		memset(&count, 0, sizeof(count));
+		rds_paging_precompute(&count, msg);
+		msg->ngroups = (uint8_t)count.tx_total_groups;
 	}
 	return msg->ngroups;
 }
@@ -1441,7 +1442,7 @@ static void rds_paging_sent(rds_encoder_t *rds, int complete)
 	c.address = msg->address;
 	c.data = msg->data;
 	c.data_len = msg->data_len;
-	c.groups = pag->tx_total_groups;
+	c.groups = pag->fr.tx_total_groups;
 	c.ab_flag = pag->ab_flag;
 	c.tonetype = msg->tonetype;
 	c.ni = msg->ni;
@@ -1558,7 +1559,9 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 	}
 	/* is_repeat and call_counter are preserved on re-enqueue */
 
-	rds_paging_precompute(pag, msg);
+	rds_paging_precompute(&pag->fr, msg);
+	pag->tx_group_idx = 0;
+	pag->tx_active = 1;
 	rds_paging_sent(rds, 0);
 }
 
@@ -3379,7 +3382,7 @@ static void rds_build_group_15b(rds_encoder_t *rds, uint8_t *group)
 
 /* Pre-compute block C/D values and PSAC sequence for a paging message.
  * Called when a new message starts transmission. */
-static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
+static void rds_paging_precompute(rds_paging_frames_t *fr, const rds_paging_msg_t *msg)
 {
 	uint16_t addr_c;
 	uint8_t addr_d_hi;
@@ -3392,10 +3395,10 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 	switch (msg->type) {
 	case RDS_PAGING_TONE:
 		/* 1 group: PSAC=0, address + control byte */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_TONE;
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
-		pag->tx_total_groups = 1;
+		fr->tx_psac_seq[0] = RDS_7A_PSAC_TONE;
+		fr->tx_blocks_c[0] = addr_c;
+		fr->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
+		fr->tx_total_groups = 1;
 		break;
 
 	case RDS_PAGING_NUM10: {
@@ -3414,16 +3417,16 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		(void)ncount;
 
 		/* Group 0: address + first 2 digits */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_NUM10_ADDR;
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (nibbles[0] << 4) | nibbles[1];
+		fr->tx_psac_seq[0] = RDS_7A_PSAC_NUM10_ADDR;
+		fr->tx_blocks_c[0] = addr_c;
+		fr->tx_blocks_d[0] = (addr_d_hi << 8) | (nibbles[0] << 4) | nibbles[1];
 
 		/* Group 1: remaining 8 digits */
-		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM10_DATA;
-		pag->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) | (nibbles[4] << 4) | nibbles[5];
-		pag->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) | (nibbles[8] << 4) | nibbles[9];
+		fr->tx_psac_seq[1] = RDS_7A_PSAC_NUM10_DATA;
+		fr->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) | (nibbles[4] << 4) | nibbles[5];
+		fr->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) | (nibbles[8] << 4) | nibbles[9];
 
-		pag->tx_total_groups = 2;
+		fr->tx_total_groups = 2;
 		break;
 	}
 
@@ -3441,21 +3444,21 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		rds_paging_bcd_encode(padded, RDS_PAGING_NUM18_DIGITS, nibbles, RDS_PAGING_NUM18_DIGITS);
 
 		/* Group 0: address + first 2 digits */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_NUM18_ADDR;
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (nibbles[0] << 4) | nibbles[1];
+		fr->tx_psac_seq[0] = RDS_7A_PSAC_NUM18_ADDR;
+		fr->tx_blocks_c[0] = addr_c;
+		fr->tx_blocks_d[0] = (addr_d_hi << 8) | (nibbles[0] << 4) | nibbles[1];
 
 		/* Group 1: digits 3-10 */
-		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;
-		pag->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) | (nibbles[4] << 4) | nibbles[5];
-		pag->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) | (nibbles[8] << 4) | nibbles[9];
+		fr->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;
+		fr->tx_blocks_c[1] = (nibbles[2] << 12) | (nibbles[3] << 8) | (nibbles[4] << 4) | nibbles[5];
+		fr->tx_blocks_d[1] = (nibbles[6] << 12) | (nibbles[7] << 8) | (nibbles[8] << 4) | nibbles[9];
 
 		/* Group 2: digits 11-18 */
-		pag->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;
-		pag->tx_blocks_c[2] = (nibbles[10] << 12) | (nibbles[11] << 8) | (nibbles[12] << 4) | nibbles[13];
-		pag->tx_blocks_d[2] = (nibbles[14] << 12) | (nibbles[15] << 8) | (nibbles[16] << 4) | nibbles[17];
+		fr->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;
+		fr->tx_blocks_c[2] = (nibbles[10] << 12) | (nibbles[11] << 8) | (nibbles[12] << 4) | nibbles[13];
+		fr->tx_blocks_d[2] = (nibbles[14] << 12) | (nibbles[15] << 8) | (nibbles[16] << 4) | nibbles[17];
 
-		pag->tx_total_groups = 3;
+		fr->tx_total_groups = 3;
 		break;
 	}
 
@@ -3470,9 +3473,9 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		int padded_len, ngroups, i, ci;
 
 		/* Group 0: address + control byte */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
+		fr->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;
+		fr->tx_blocks_c[0] = addr_c;
+		fr->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
 		idx = 1;
 
 		if (intl) {
@@ -3486,9 +3489,9 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			uint8_t c0 = (0 < len) ? (uint8_t)msg->data[0] : 0x20;
 			uint8_t c1 = (1 < len) ? (uint8_t)msg->data[1] : 0x20;
 
-			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;
-			pag->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
-			pag->tx_blocks_d[idx] = (c0 << 8) | c1;
+			fr->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;
+			fr->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
+			fr->tx_blocks_d[idx] = (c0 << 8) | c1;
 			idx++;
 			ci = 2; /* message offset: 2 chars consumed */
 		} else {
@@ -3517,15 +3520,15 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			int psac_offset = intl ? (i + 1) : i; /* intl: PSAC=9 already used */
 
 			if (i == ngroups - 1)
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
+				fr->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
 			else
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
-			pag->tx_blocks_c[idx] = (c0 << 8) | c1;
-			pag->tx_blocks_d[idx] = (c2 << 8) | c3;
+				fr->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
+			fr->tx_blocks_c[idx] = (c0 << 8) | c1;
+			fr->tx_blocks_d[idx] = (c2 << 8) | c3;
 			idx++;
 		}
 
-		pag->tx_total_groups = idx;
+		fr->tx_total_groups = idx;
 		break;
 	}
 
@@ -3552,9 +3555,9 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			rds_paging_bcd_encode(msg->data, len, nibbles, len);
 
 		/* Group 0: address + control byte (ctrl has MT=01 set by build_ctrl) */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;   /* 0x8 per M.3.5.5 */
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
+		fr->tx_psac_seq[0] = RDS_7A_PSAC_ALPHA_ADDR;   /* 0x8 per M.3.5.5 */
+		fr->tx_blocks_c[0] = addr_c;
+		fr->tx_blocks_d[0] = (addr_d_hi << 8) | ctrl;
 		idx = 1;
 
 		if (intl) {
@@ -3570,9 +3573,9 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			uint8_t n2 = (2 < len) ? nibbles[2] : RDS_PAGING_BCD_SPACE;
 			uint8_t n3 = (3 < len) ? nibbles[3] : RDS_PAGING_BCD_SPACE;
 
-			pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;  /* 0x9 */
-			pag->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
-			pag->tx_blocks_d[idx] = (n0 << 12) | (n1 << 8) | (n2 << 4) | n3;
+			fr->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST;  /* 0x9 */
+			fr->tx_blocks_c[idx] = (i1 << 12) | (i2 << 8) | (i3 << 4) | (msg->opc & 0xF);
+			fr->tx_blocks_d[idx] = (n0 << 12) | (n1 << 8) | (n2 << 4) | n3;
 			idx++;
 			di = 4; /* nibble offset: 4 digits already sent in the intl header */
 		} else {
@@ -3605,17 +3608,17 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			int psac_offset = intl ? (i + 1) : i; /* intl: PSAC=9 already used */
 
 			if (i == ngroups - 1)
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
+				fr->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_END;
 			else
-				pag->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
-			pag->tx_blocks_c[idx] = (nibbles[ni_off] << 12) | (nibbles[ni_off+1] << 8) |
+				fr->tx_psac_seq[idx] = RDS_7A_PSAC_ALPHA_DATA_FIRST + (psac_offset % 6);
+			fr->tx_blocks_c[idx] = (nibbles[ni_off] << 12) | (nibbles[ni_off+1] << 8) |
 						 (nibbles[ni_off+2] << 4) | nibbles[ni_off+3];
-			pag->tx_blocks_d[idx] = (nibbles[ni_off+4] << 12) | (nibbles[ni_off+5] << 8) |
+			fr->tx_blocks_d[idx] = (nibbles[ni_off+4] << 12) | (nibbles[ni_off+5] << 8) |
 						 (nibbles[ni_off+6] << 4) | nibbles[ni_off+7];
 			idx++;
 		}
 
-		pag->tx_total_groups = idx;
+		fr->tx_total_groups = idx;
 		break;
 	}
 
@@ -3638,18 +3641,18 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 		rds_paging_bcd_encode(padded, 15, nib, 15);
 
 		/* Group 0 (PSAC 7): address + country digits X1 X2 */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_INTL15;
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (x1 << 4) | x2;
+		fr->tx_psac_seq[0] = RDS_7A_PSAC_INTL15;
+		fr->tx_blocks_c[0] = addr_c;
+		fr->tx_blocks_d[0] = (addr_d_hi << 8) | (x1 << 4) | x2;
 		/* Group 1 (PSAC 5): X3 + digits A1..A7 */
-		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;
-		pag->tx_blocks_c[1] = (x3 << 12) | (nib[0] << 8) | (nib[1] << 4) | nib[2];
-		pag->tx_blocks_d[1] = (nib[3] << 12) | (nib[4] << 8) | (nib[5] << 4) | nib[6];
+		fr->tx_psac_seq[1] = RDS_7A_PSAC_NUM18_DATA1;
+		fr->tx_blocks_c[1] = (x3 << 12) | (nib[0] << 8) | (nib[1] << 4) | nib[2];
+		fr->tx_blocks_d[1] = (nib[3] << 12) | (nib[4] << 8) | (nib[5] << 4) | nib[6];
 		/* Group 2 (PSAC 6): digits A8..A15 */
-		pag->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;
-		pag->tx_blocks_c[2] = (nib[7] << 12) | (nib[8] << 8) | (nib[9] << 4) | nib[10];
-		pag->tx_blocks_d[2] = (nib[11] << 12) | (nib[12] << 8) | (nib[13] << 4) | nib[14];
-		pag->tx_total_groups = 3;
+		fr->tx_psac_seq[2] = RDS_7A_PSAC_NUM18_DATA2;
+		fr->tx_blocks_c[2] = (nib[7] << 12) | (nib[8] << 8) | (nib[9] << 4) | nib[10];
+		fr->tx_blocks_d[2] = (nib[11] << 12) | (nib[12] << 8) | (nib[13] << 4) | nib[14];
+		fr->tx_total_groups = 3;
 		break;
 	}
 
@@ -3674,20 +3677,17 @@ static void rds_paging_precompute(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 			nib[i] = 0x0;
 
 		/* Group 0 (PSAC 1): address + country digits X1 X2 */
-		pag->tx_psac_seq[0] = RDS_7A_PSAC_FUNC_ADDR;
-		pag->tx_blocks_c[0] = addr_c;
-		pag->tx_blocks_d[0] = (addr_d_hi << 8) | (x1 << 4) | x2;
+		fr->tx_psac_seq[0] = RDS_7A_PSAC_FUNC_ADDR;
+		fr->tx_blocks_c[0] = addr_c;
+		fr->tx_blocks_d[0] = (addr_d_hi << 8) | (x1 << 4) | x2;
 		/* Group 1 (PSAC 3): X3 + functions digits F1..F7 */
-		pag->tx_psac_seq[1] = RDS_7A_PSAC_NUM10_DATA;
-		pag->tx_blocks_c[1] = (x3 << 12) | (nib[0] << 8) | (nib[1] << 4) | nib[2];
-		pag->tx_blocks_d[1] = (nib[3] << 12) | (nib[4] << 8) | (nib[5] << 4) | nib[6];
-		pag->tx_total_groups = 2;
+		fr->tx_psac_seq[1] = RDS_7A_PSAC_NUM10_DATA;
+		fr->tx_blocks_c[1] = (x3 << 12) | (nib[0] << 8) | (nib[1] << 4) | nib[2];
+		fr->tx_blocks_d[1] = (nib[3] << 12) | (nib[4] << 8) | (nib[5] << 4) | nib[6];
+		fr->tx_total_groups = 2;
 		break;
 	}
 	}
-
-	pag->tx_group_idx = 0;
-	pag->tx_active = 1;
 }
 
 /* Build one Group 7A frame from current paging transmission state.
@@ -3697,6 +3697,7 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 	uint32_t blocks[4] = {0};
 	uint16_t b2;
 	rds_paging_enc_t *pag = &rds->paging;
+	const rds_paging_frames_t *fr = &pag->fr;
 	int gi = pag->tx_group_idx;
 
 	/* Block A: PI */
@@ -3707,23 +3708,23 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 	     (rds->tp << RDS_B2_TP_BIT) |
 	     (rds->pty << RDS_B2_PTY_SHIFT) |
 	     ((pag->ab_flag & 1) << RDS_7A_AB_FLAG_BIT) |
-	     (pag->tx_psac_seq[gi] & RDS_7A_PSAC_MASK);
+	     (fr->tx_psac_seq[gi] & RDS_7A_PSAC_MASK);
 	blocks[1] = rds_build_block(b2, RDS_OFFSET_B);
 
 	/* Block C and D: pre-computed data */
-	blocks[2] = rds_build_block(pag->tx_blocks_c[gi], RDS_OFFSET_C);
-	blocks[3] = rds_build_block(pag->tx_blocks_d[gi], RDS_OFFSET_D);
+	blocks[2] = rds_build_block(fr->tx_blocks_c[gi], RDS_OFFSET_C);
+	blocks[3] = rds_build_block(fr->tx_blocks_d[gi], RDS_OFFSET_D);
 
 	rds_group_pack(blocks, group, 0);
 
 	if (rds->debug)
 		LOGP(DRADIO, LOGL_DEBUG, "RDS TX: Group 7A [%d/%d] PSAC=%d AB=%d C=%04X D=%04X\n",
-		     gi + 1, pag->tx_total_groups, pag->tx_psac_seq[gi],
-		     pag->ab_flag, pag->tx_blocks_c[gi], pag->tx_blocks_d[gi]);
+		     gi + 1, fr->tx_total_groups, fr->tx_psac_seq[gi],
+		     pag->ab_flag, fr->tx_blocks_c[gi], fr->tx_blocks_d[gi]);
 
 	/* Advance to next group */
 	pag->tx_group_idx++;
-	if (pag->tx_group_idx >= pag->tx_total_groups) {
+	if (pag->tx_group_idx >= fr->tx_total_groups) {
 		/* Message transmission complete */
 		pag->tx_active = 0;
 		rds_paging_sent(rds, 1);
