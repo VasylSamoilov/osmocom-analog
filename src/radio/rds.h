@@ -1556,11 +1556,26 @@ typedef struct rds_paging_frames {
 	uint8_t		tx_psac_seq[RDS_PAGING_MAX_GROUPS];
 } rds_paging_frames_t;
 
+/* What the queue asks the protocol (the paging encoder): its whole
+ * interface to it */
+typedef struct rds_paging_queue_ops {
+	int	(*battery_saving)(void *arg);	/* calls wait for their window */
+	/* the call (address, its 7A groups) fits the interval window of its
+	 * address now; *k_out (may be NULL): the window's interval 0-2 it is in */
+	int	(*fits)(void *arg, uint32_t address, int groups, int *k_out);
+	double	(*capacity)(void *arg);		/* groups the three windows hold */
+	int	(*groups)(void *arg, rds_paging_msg_t *msg);	/* its 7A groups (cached) */
+	void	(*clock)(void *arg, unsigned *interval, unsigned *pos_ms);	/* logs */
+	void	*arg;
+} rds_paging_queue_ops_t;
+
 /* The paging call queue and the address scan that fills it - the
  * application side (wall clock: send times, repeats, the scan's pacing);
  * the protocol (rds_paging_enc_t) takes the next call that may start from
  * it. */
 typedef struct rds_paging_queue {
+	rds_paging_queue_ops_t ops;		/* the protocol it serves */
+
 	rds_paging_msg_t *queue_head;
 	rds_paging_msg_t *queue_tail;
 	int		queue_count;
