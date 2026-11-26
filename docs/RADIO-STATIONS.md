@@ -495,7 +495,9 @@ normal feature, 3.1.5.4). Checked against the EN 50067 text
 (RDS/WORK_EN50067_RDS_Standard.pdf): the 1A, 4A, 7A, 13A handling agrees;
 the log's designation ranges were shifted (673a96d). Test (rxpage.sh,
 ~/.cache/sdrangel-rp-rates/txfix): on = the old forced decode (the same
-logs); auto decodes the test page; off none; noise no detection. The
+logs); auto decodes the test page; off none (the noise run never synced,
+so it shows nothing; the no-false-detection case is the captures: Amitie
+89 syncs, no detection). The
 captures in docs/rds through osmordstest --rds-rx-paging: France Culture
 detected, the same 4 calls as on; the 7 stations without paging nothing,
 auto the same logs as off at debug + verbose. Hand-written hexrds
