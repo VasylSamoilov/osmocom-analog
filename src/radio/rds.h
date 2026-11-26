@@ -2904,12 +2904,12 @@ int rds_dec_paging_get_last_msg(const rds_decoder_t *rds,
 				int *msg_len, int *type);
 
 /* Print decoder status (PI, PS, RT, BER) */
-void rds_decoder_status(rds_decoder_t *rds);
+void rds_decoder_status(const rds_decoder_t *rds);
 /* rds_decoder_display() -- formatted one-page RDS status panel.
  * Writes to fp (e.g. stdout) without any log prefix.
  * Respects rds->ansi_display for ANSI colour (set from isatty at init,
  * or override manually). Pure ASCII fallback when ansi_display=0. */
-void rds_decoder_display(rds_decoder_t *rds, FILE *fp);
+void rds_decoder_display(const rds_decoder_t *rds, FILE *fp);
 
 /* Reset decoder state for new station (clears PI, PS, RT, stats, keeps DSP config) */
 void rds_decoder_set_paging(rds_decoder_t *rds, int mode);

@@ -12938,7 +12938,7 @@ uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds)
  * ANSI colour: enabled when rds->ansi_display = 1 (set from isatty
  * at decoder_init, overridable by the application).
  * ============================================================ */
-void rds_decoder_display(rds_decoder_t *rds, FILE *fp)
+void rds_decoder_display(const rds_decoder_t *rds, FILE *fp)
 {
 	if (!rds || !fp) return;
 
@@ -13175,7 +13175,7 @@ void rds_decoder_display(rds_decoder_t *rds, FILE *fp)
 #undef ANSI_RESET
 }
 
-void rds_decoder_status(rds_decoder_t *rds)
+void rds_decoder_status(const rds_decoder_t *rds)
 {
 	char ps_display[64];   /* Larger buffer for UTF-8 + control char display */
 	char rt_display[512];  /* Larger buffer for UTF-8 + control char display */
@@ -13278,7 +13278,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 	
 	/* Alternative Frequencies (Method A) */
 	if (rds->af_method_a_dec.received_count > 0) {
-		rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
+		const rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
 		char af_buf[256] = "";
 		int pos = 0;
 		
@@ -13298,7 +13298,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 	
 	/* AF Method A Last Good (if different from current or current has errors) */
 	if (rds->af_method_a_dec.last_good_count > 0) {
-		rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
+		const rds_af_method_a_dec_t *afd = &rds->af_method_a_dec;
 		char buf[256] = "";
 		int pos = 0;
 		
@@ -13479,7 +13479,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 	
 	/* eRT (if received) */
 	if (rds->ert_has_complete) {
-		rds_ert_decoder_t *ert = &rds->ert_dec_complete;
+		const rds_ert_decoder_t *ert = &rds->ert_dec_complete;
 		char ert_display[513];
 		size_t display_len;
 		
@@ -13505,7 +13505,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 	if (rds->eon_count > 0) {
 		LOGP(DRADIO, LOGL_NOTICE, "EON: %d other network(s)\n", rds->eon_count);
 		for (int e = 0; e < rds->eon_count; e++) {
-			rds_eon_entry_t *eon = &rds->eon[e];
+			const rds_eon_entry_t *eon = &rds->eon[e];
 			char on_ps_disp[9];
 			memcpy(on_ps_disp, eon->ps, 8);
 			for (int j = 0; j < 8; j++)
@@ -13519,7 +13519,7 @@ void rds_decoder_status(rds_decoder_t *rds)
 
 	/* Radio Paging (Group 7A / 1A RPC / 13A Enhanced) */
 	{
-		rds_paging_dec_t *pd = &rds->paging_dec;
+		const rds_paging_dec_t *pd = &rds->paging_dec;
 		int has_paging = (rds->group_type_counts[7 * 2] > 0) ||
 				 pd->rpc_valid || pd->enhanced_valid;
 		if (has_paging) {
