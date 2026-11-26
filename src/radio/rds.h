@@ -716,6 +716,15 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 #define RDS_PAGING_DEFAULT_REPEATS   1  /* Default repeat count (1 = send once) */
 #define RDS_PAGING_DEFAULT_INTERVAL  5  /* Default repeat interval (seconds) */
 #define RDS_PAGING_DEFAULT_TIMEOUT  30  /* Default reassembly timeout (seconds) */
+
+/* Receiver paging decode (the receiver's own setting, not the transmitter's):
+ * off: 7A / 13A are never paging; on: always; auto: once the station signals
+ * paging in 1A (group designation or OPC not 0, RDS_RX_PAGING_CONFIRM 1A in a
+ * row), and the group type not assigned to an ODA by 3A. */
+#define RDS_RX_PAGING_OFF	0
+#define RDS_RX_PAGING_AUTO	1
+#define RDS_RX_PAGING_ON	2
+#define RDS_RX_PAGING_CONFIRM	2
 #define RDS_PAGING_DEFAULT_RPC       4  /* Default RPC (groups 00-99, sync 00) */
 #define RDS_PAGING_COUNTER_MAX      15  /* P3-P0 max (wraps 15->1) */
 #define RDS_PAGING_GROUP_US         87579 /* one RDS group: 104 bit / 1187.5 bit/s */
@@ -2721,7 +2730,11 @@ typedef struct rds_decoder {
 	uint16_t	on_pin;			/* PIN of ON */
 	
 	/* Radio Paging (EN 50067 Annex M) - Group 7A, 1A RPC, 13A */
-	int		paging_enabled;		/* Decode paging groups (--paging) */
+	int		paging_mode;		/* RDS_RX_PAGING_OFF / _AUTO / _ON (kept on reset) */
+	int		paging_enabled;		/* Paging decoded now: mode on, or auto and
+						 * the station signals paging (1A RPC) */
+	int		paging_seen;		/* auto: 1A in a row signalling paging (> 0)
+						 * or none (< 0) */
 	rds_paging_dec_t paging_dec;		/* Paging decoder state */
 	
 	/* Status timing */
@@ -2869,6 +2882,7 @@ void rds_decoder_status(rds_decoder_t *rds);
 void rds_decoder_display(rds_decoder_t *rds, FILE *fp);
 
 /* Reset decoder state for new station (clears PI, PS, RT, stats, keeps DSP config) */
+void rds_decoder_set_paging(rds_decoder_t *rds, int mode);
 void rds_decoder_reset(rds_decoder_t *rds);
 
 /* ============================================================

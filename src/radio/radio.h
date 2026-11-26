@@ -64,6 +64,7 @@ typedef struct radio_opts {
 	const char	*rds_callsign;		/* --callsign (NULL = none): PI from it (RBDS); kept by the caller */
 	uint8_t		rds_ecc;		/* --rds-ecc, overrides the preset ECC, also on preset change (0 = not set) */
 	int		rds_paging_preset;	/* start with the paging preset instead of the emphasis-selected one */
+	int		rds_rx_paging;		/* --rds-rx-paging: RDS_RX_PAGING_* (default auto) */
 	uint8_t		rds_ta;			/* Traffic Announcement */
 	uint8_t		rds_di_artificial_head, rds_di_compressed, rds_di_dynamic_pty;
 	int		rds_ct;			/* Clock-Time groups */

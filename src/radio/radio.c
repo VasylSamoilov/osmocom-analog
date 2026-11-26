@@ -961,6 +961,7 @@ void radio_opts_init(radio_opts_t *opts)
 {
 	memset(opts, 0, sizeof(*opts));
 	opts->rds_ct = 1;	/* Clock-Time enabled */
+	opts->rds_rx_paging = RDS_RX_PAGING_AUTO;
 }
 
 /* Apply current RDS preset to encoder (for runtime switching) */
@@ -1873,6 +1874,7 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 			if (radio_receives(radio)) {
 				LOGP(DRADIO, LOGL_NOTICE, "RDS: Initializing decoder for RX path\n");
 				rds_decoder_init(&radio->rds_dec, radio->signal_samplerate, rds_debug, rds_verbose, time_constant_us, rds_force_rbds);
+				rds_decoder_set_paging(&radio->rds_dec, radio->opts.rds_rx_paging);
 			} else {
 				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping decoder init (TX-only mode)\n");
 			}

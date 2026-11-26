@@ -251,7 +251,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to init decoder for %s\n", files[i]);
 			continue;
 		}
-		rds.paging_enabled = paging_enabled;
+		rds_decoder_set_paging(&rds, paging_enabled ? RDS_RX_PAGING_ON : RDS_RX_PAGING_OFF);
 
 		int groups;
 		if (is_binary_rds(files[i]))

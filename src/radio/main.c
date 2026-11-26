@@ -644,6 +644,12 @@ static void print_help(const char *arg0)
 	printf("        with --rds-paging and --tx: paging pagers lock to the channel by\n");
 	printf("        country (PI country digit and ECC, EN 50067 M.3.2.3).\n");
 	printf("        'list' prints the ECC / PI country digit -> country mapping.\n");
+	printf("    --rds-rx-paging off | auto | on\n");
+	printf("        The receiver's paging decode (Groups 7A / 13A as Radio Paging), its\n");
+	printf("        own setting: --rds-paging is the transmitter's. auto (default):\n");
+	printf("        once the received station signals paging in Group 1A (RPC group\n");
+	printf("        designation or OPC not 0, two 1A in a row) and no Group 3A assigns\n");
+	printf("        7A / 13A to an ODA. on: always. off: never.\n");
 	printf("    --rds-paging-13a\n");
 	printf("        Enhanced paging address notification (EN 50067 M.3.4.1): one\n");
 	printf("        Group 13A (25 notification bits) right after the first marker of\n");
@@ -808,6 +814,7 @@ static void print_help(const char *arg0)
 #define OPT_RDS_PAGING_BATTERY	1130
 #define OPT_RDS_ECC		1131
 #define OPT_RDS_PAGING_13A	1132
+#define OPT_RDS_RX_PAGING	1133
 
 /* The station kinds (the modulation) an option belongs to
  * (docs/RADIO-STATIONS.md): a default (config file, before the first -f)
@@ -912,6 +919,7 @@ static void add_options(void)
 	opt(OPT_RDS_PAGING_BATTERY, "rds-paging-battery-saving", 0, KIND_FM);
 	opt(OPT_RDS_ECC, "rds-ecc", 1, KIND_FM);
 	opt(OPT_RDS_PAGING_13A, "rds-paging-13a", 0, KIND_FM);
+	opt(OPT_RDS_RX_PAGING, "rds-rx-paging", 1, KIND_FM);
 	opt(OPT_RDS_PAGING_SCAN, "rds-paging-scan", 2, KIND_FM);
 	opt(OPT_RDS_PAGING_SCAN_TYPE, "rds-paging-scan-type", 1, KIND_FM);
 	opt(OPT_RDS_HEXRDS_FILE, "rds-hexrds-file", 1, KIND_FM);
@@ -1008,6 +1016,7 @@ static int station_kind_options(station_t *s, const station_t *p)
 		s->rds_paging_scan_from = p->rds_paging_scan_from;
 		s->rds_paging_scan_to = p->rds_paging_scan_to;
 		s->radio_opts.rds_paging_preset = p->radio_opts.rds_paging_preset;
+		s->radio_opts.rds_rx_paging = p->radio_opts.rds_rx_paging;
 		s->rds_paging_scan_type = p->rds_paging_scan_type;
 		s->rds_hexrds_file = p->rds_hexrds_file;
 		s->rds_bitstream_file = p->rds_bitstream_file;
@@ -1214,6 +1223,18 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_RDS_PAGING_13A:
 		st->rds_paging_13a = 1;
+		break;
+	case OPT_RDS_RX_PAGING:
+		if (!strcasecmp(argv[argi], "off"))
+			st->radio_opts.rds_rx_paging = RDS_RX_PAGING_OFF;
+		else if (!strcasecmp(argv[argi], "auto"))
+			st->radio_opts.rds_rx_paging = RDS_RX_PAGING_AUTO;
+		else if (!strcasecmp(argv[argi], "on"))
+			st->radio_opts.rds_rx_paging = RDS_RX_PAGING_ON;
+		else {
+			fprintf(stderr, "Invalid --rds-rx-paging '%s' (off, auto or on), use '-h' for help!\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
 	case OPT_RDS_ECC: {
 		const char *a = argv[argi];
@@ -1814,8 +1835,6 @@ static int station_init(station_t *s, void *sdr)
 			rds_enc_paging_set_battery_saving(&s->radio.rds_enc, 1);
 		if (s->rds_paging_13a)
 			rds_enc_paging_set_13a_notify(&s->radio.rds_enc, 1);
-		/* Enable paging decoder so 7A/13A are decoded as paging, not ODA */
-		s->radio.rds_dec.paging_enabled = 1;
 		/* Create named pipe for paging commands */
 		unlink(s->rds_paging_pipe_path);
 		rc = mkfifo(s->rds_paging_pipe_path, 0666);
