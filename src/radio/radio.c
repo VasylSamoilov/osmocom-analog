@@ -1863,6 +1863,8 @@ int radio_init(radio_t *radio, int buffer_size, int samplerate, double frequency
 						radio->opts.rds_di_compressed, radio->opts.rds_di_dynamic_pty);
 				rds_enc_set_ta(&radio->rds_enc, radio->opts.rds_ta);
 				rds_enc_set_ct_enabled(&radio->rds_enc, radio->opts.rds_ct);
+				rds_tx_app_init(&radio->rds_tx_app);
+				rds_tx_app_attach(&radio->rds_tx_app, &radio->rds_enc);
 			} else {
 				LOGP(DRADIO, LOGL_INFO, "RDS: Skipping encoder init (RX-only mode)\n");
 			}
@@ -2124,6 +2126,7 @@ void radio_exit(radio_t *radio)
 	rds_encoder_exit(&radio->rds_enc);
 	rds_decoder_exit(&radio->rds_dec);
 	rds_rx_app_exit(&radio->rds_app);
+	rds_tx_app_exit(&radio->rds_tx_app);
 }
 
 int radio_start(radio_t __attribute__((unused)) *radio)

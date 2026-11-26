@@ -1825,6 +1825,8 @@ static int station_init(station_t *s, void *sdr)
 		if (!s->tx) {
 			station_eprintf("Warning: --rds-tx-hexrds-file requires --tx mode\n");
 		}
+		/* the TX monitor logs what the file sends */
+		rds_tx_app_monitor(&s->radio.rds_tx_app, s->rds_debug, s->rds_verbose);
 		rc = rds_enc_set_tx_hexrds_file(&s->radio.rds_enc, s->rds_tx_hexrds_file);
 		if (rc < 0) {
 			station_eprintf("Failed to open TX hexrds input file, exitting!\n");
@@ -1835,6 +1837,7 @@ static int station_init(station_t *s, void *sdr)
 		if (!s->tx) {
 			station_eprintf("Warning: --rds-tx-bitstream-file requires --tx mode\n");
 		}
+		rds_tx_app_monitor(&s->radio.rds_tx_app, s->rds_debug, s->rds_verbose);
 		rc = rds_enc_set_tx_bitstream_file(&s->radio.rds_enc, s->rds_tx_bitstream_file);
 		if (rc < 0) {
 			station_eprintf("Failed to open TX bitstream input file, exitting!\n");

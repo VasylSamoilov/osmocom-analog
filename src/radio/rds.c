@@ -1405,8 +1405,9 @@ static void rds_paging_tx_log(const rds_paging_tx_call_t *c)
 
 /* A call starts (complete 0) or its last group is sent (complete 1): as a
  * record to the display and to the consumer */
-static void rds_paging_sent(rds_paging_enc_t *pag, int complete)
+static void rds_paging_sent(rds_encoder_t *rds, int complete)
 {
+	const rds_paging_enc_t *pag = &rds->paging;
 	const rds_paging_msg_t *msg = pag->tx_msg;
 	rds_paging_tx_call_t c;
 
@@ -1432,9 +1433,8 @@ static void rds_paging_sent(rds_paging_enc_t *pag, int complete)
 		rds_paging_clock(pag, &c.interval, &c.interval_pos_ms);
 	}
 
-	rds_paging_tx_log(&c);
-	if (pag->sent_callback)
-		pag->sent_callback(&c, pag->sent_callback_arg);
+	if (rds->sink.paging)
+		rds->sink.paging(rds->sink.arg, &c);
 }
 
 static void rds_paging_start_next(rds_encoder_t *rds)
@@ -1517,7 +1517,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 			/* is_repeat and call_counter are preserved on re-enqueue */
 
 			rds_paging_precompute(pag, msg);
-			rds_paging_sent(pag, 0);
+			rds_paging_sent(rds, 0);
 			return;
 		}
 	}
@@ -1902,14 +1902,6 @@ void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enhanced = enable;
 	rds_enc_scheduler_update(rds);
-}
-
-void rds_enc_set_paging_sent_callback(rds_encoder_t *rds,
-				      void (*fn)(const rds_paging_tx_call_t *call, void *arg),
-				      void *arg)
-{
-	rds->paging.sent_callback = fn;
-	rds->paging.sent_callback_arg = arg;
 }
 
 /* Public API: set OPC for Group 1A (0=no enhanced paging, 1-15=operator) */
@@ -3680,7 +3672,7 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 	if (pag->tx_group_idx >= pag->tx_total_groups) {
 		/* Message transmission complete */
 		pag->tx_active = 0;
-		rds_paging_sent(pag, 1);
+		rds_paging_sent(rds, 1);
 	}
 }
 
@@ -4544,14 +4536,14 @@ static void rds_generate_group(rds_encoder_t *rds)
 static int rds_tx_read_bitstream_bit(rds_encoder_t *rds);
 
 /* A group is about to be sent (group_buffer: 4 x 26 bits, data + check
- * word): the one place that sees every generated group - to the TX log
- * decoder (with a TX hexrds file) */
+ * word): the one place that sees every generated group - its data words
+ * to the sink (the station's TX monitor) */
 static void rds_group_sent(rds_encoder_t *rds)
 {
 	uint16_t blocks[4];
 	int i, b;
 
-	if (!rds->tx_log_decoder)
+	if (!rds->sink.group)
 		return;
 	for (i = 0; i < 4; i++) {
 		uint32_t v = 0;
@@ -4563,23 +4555,15 @@ static void rds_group_sent(rds_encoder_t *rds)
 		}
 		blocks[i] = (v >> 10) & 0xFFFF;
 	}
+	rds->sink.group(rds->sink.arg, blocks);
+}
 
-	/* Log transmitted group using decoder */
-	{
-		uint8_t status[4] = {RDS_STATUS_VALID, RDS_STATUS_VALID,
-		                     RDS_STATUS_VALID, RDS_STATUS_VALID};
-		rds_decoder_feed_group(rds->tx_log_decoder, blocks, status);
-
-		/* Log in RDS Spy format */
-		if (rds->debug || rds->verbose) {
-			int group_type = (blocks[1] >> 11) & 0x1F;
-			int type = group_type >> 1;
-			int version = group_type & 1;
-			LOGP(DRADIO, LOGL_INFO, "RDS TX FILE %d%c: %04X %04X %04X %04X\n",
-			     type, version ? 'B' : 'A',
-			     blocks[0], blocks[1], blocks[2], blocks[3]);
-		}
-	}
+void rds_encoder_set_sink(rds_encoder_t *rds, const rds_encoder_sink_t *sink)
+{
+	if (sink)
+		rds->sink = *sink;
+	else
+		memset(&rds->sink, 0, sizeof(rds->sink));
 }
 
 /* Get next bit from current group (or directly from bitstream file) */
@@ -8846,36 +8830,6 @@ void rds_encoder_exit(rds_encoder_t *rds)
 	}
 	/* Close TX file input if open */
 	rds_enc_close_tx_file(rds);
-	/* Free TX log decoder if allocated */
-	if (rds->tx_log_decoder) {
-		rds_decoder_exit(rds->tx_log_decoder);
-		free(rds->tx_log_decoder);
-		rds->tx_log_decoder = NULL;
-	}
-	if (rds->tx_log_app) {
-		rds_rx_app_exit(rds->tx_log_app);
-		free(rds->tx_log_app);
-		rds->tx_log_app = NULL;
-	}
-}
-
-/* The TX log: a group-only decoder of the sent groups with its display */
-static void rds_tx_log_open(rds_encoder_t *rds)
-{
-	if (rds->tx_log_decoder)
-		return;
-	rds->tx_log_decoder = calloc(1, sizeof(rds_decoder_t));
-	rds->tx_log_app = calloc(1, sizeof(rds_rx_app_t));
-	if (!rds->tx_log_decoder || !rds->tx_log_app) {
-		free(rds->tx_log_decoder);
-		free(rds->tx_log_app);
-		rds->tx_log_decoder = NULL;
-		rds->tx_log_app = NULL;
-		return;
-	}
-	rds_decoder_init_groups(rds->tx_log_decoder, rds->debug, rds->verbose, 0);
-	rds_rx_app_init(rds->tx_log_app);
-	rds_rx_app_attach(rds->tx_log_app, rds->tx_log_decoder);
 }
 
 /* ============================================================
@@ -8935,8 +8889,6 @@ int rds_enc_set_tx_hexrds_file(rds_encoder_t *rds, const char *filename)
 	rds->tx_file_eof_logged = 0;
 	rds->tx_file_groups_sent = 0;
 	
-	/* the TX log (once) */
-	rds_tx_log_open(rds);
 	
 	LOGP(DRADIO, LOGL_NOTICE, "RDS TX: Reading hexrds input from '%s' (%ld bytes), looping\n",
 	     filename, rds->tx_file_size);
@@ -8970,8 +8922,6 @@ int rds_enc_set_tx_bitstream_file(rds_encoder_t *rds, const char *filename)
 	rds->tx_file_eof_logged = 0;
 	rds->tx_file_groups_sent = 0;
 	
-	/* the TX log (once) */
-	rds_tx_log_open(rds);
 	
 	LOGP(DRADIO, LOGL_NOTICE, "RDS TX: Reading bitstream input from '%s' (%ld bytes), looping\n",
 	     filename, rds->tx_file_size);
@@ -14074,4 +14024,100 @@ void rds_rx_app_set_paging_callback(rds_rx_app_t *app,
 {
 	app->paging_callback = fn;
 	app->paging_callback_arg = arg;
+}
+
+/*
+ * The station's TX application side (rds_tx_app_t), the encoder's sink: the
+ * display of sent paging calls and their consumer, and the TX monitor.
+ */
+
+/* a group sent: to the TX monitor, if any */
+static void rds_tx_app_group(void *arg, const uint16_t blocks[4])
+{
+	rds_tx_app_t *app = arg;
+	uint8_t status[4] = {RDS_STATUS_VALID, RDS_STATUS_VALID,
+	                     RDS_STATUS_VALID, RDS_STATUS_VALID};
+
+	if (!app->monitor)
+		return;
+	rds_decoder_feed_group(app->monitor, blocks, status);
+
+	/* Log in RDS Spy format */
+	if (app->monitor_debug || app->monitor_verbose) {
+		int group_type = (blocks[1] >> 11) & 0x1F;
+		int type = group_type >> 1;
+		int version = group_type & 1;
+		LOGP(DRADIO, LOGL_INFO, "RDS TX FILE %d%c: %04X %04X %04X %04X\n",
+		     type, version ? 'B' : 'A',
+		     blocks[0], blocks[1], blocks[2], blocks[3]);
+	}
+}
+
+/* a sent paging call: to the display, then to the consumer */
+static void rds_tx_app_paging(void *arg, const rds_paging_tx_call_t *call)
+{
+	rds_tx_app_t *app = arg;
+
+	rds_paging_tx_log(call);
+	if (app->paging_callback)
+		app->paging_callback(call, app->paging_callback_arg);
+}
+
+void rds_tx_app_init(rds_tx_app_t *app)
+{
+	memset(app, 0, sizeof(*app));
+}
+
+void rds_tx_app_attach(rds_tx_app_t *app, rds_encoder_t *enc)
+{
+	rds_encoder_sink_t sink = {
+		.group = rds_tx_app_group,
+		.paging = rds_tx_app_paging,
+		.arg = app,
+	};
+
+	rds_encoder_set_sink(enc, &sink);
+}
+
+int rds_tx_app_monitor(rds_tx_app_t *app, int debug, int verbose)
+{
+	if (app->monitor)
+		return 0;
+	app->monitor = calloc(1, sizeof(rds_decoder_t));
+	app->monitor_app = calloc(1, sizeof(rds_rx_app_t));
+	if (!app->monitor || !app->monitor_app) {
+		free(app->monitor);
+		free(app->monitor_app);
+		app->monitor = NULL;
+		app->monitor_app = NULL;
+		return -1;
+	}
+	rds_decoder_init_groups(app->monitor, debug, verbose, 0);
+	rds_rx_app_init(app->monitor_app);
+	rds_rx_app_attach(app->monitor_app, app->monitor);
+	app->monitor_debug = debug;
+	app->monitor_verbose = verbose;
+	return 0;
+}
+
+void rds_tx_app_set_paging_callback(rds_tx_app_t *app,
+				    void (*fn)(const rds_paging_tx_call_t *call, void *arg),
+				    void *arg)
+{
+	app->paging_callback = fn;
+	app->paging_callback_arg = arg;
+}
+
+void rds_tx_app_exit(rds_tx_app_t *app)
+{
+	if (app->monitor) {
+		rds_decoder_exit(app->monitor);
+		free(app->monitor);
+		app->monitor = NULL;
+	}
+	if (app->monitor_app) {
+		rds_rx_app_exit(app->monitor_app);
+		free(app->monitor_app);
+		app->monitor_app = NULL;
+	}
 }

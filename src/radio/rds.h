@@ -1537,15 +1537,21 @@ typedef struct rds_paging_msg {
 /* Paging encoder state - embedded in rds_encoder_t */
 struct rds_paging_tx_call;
 
+/* What the encoder gives out - every group sent (its four data words) and a
+ * sent paging call (when it starts and when its last group is sent) - to one
+ * sink: the station's TX application side (rds_tx_app_t: the TX monitor,
+ * the display) or anything else. NULL members get nothing. */
+typedef struct rds_encoder_sink {
+	void	(*group)(void *arg, const uint16_t blocks[4]);
+	void	(*paging)(void *arg, const struct rds_paging_tx_call *call);
+	void	*arg;
+} rds_encoder_sink_t;
+
 typedef struct rds_paging_enc {
 	int		enabled;	/* Paging enabled flag */
 	int		enhanced;	/* Enhanced paging (13A) enabled */
 	uint8_t		rpc;		/* Radio Paging Code (0-31) for Group 1A */
 	uint8_t		ab_flag;	/* Current A/B flag (toggles per new call) */
-
-	/* a call starts / is sent, after its log line (rds_enc_set_paging_sent_callback) */
-	void		(*sent_callback)(const struct rds_paging_tx_call *call, void *arg);
-	void		*sent_callback_arg;
 
 	/* Current transmission state */
 	int		tx_active;	/* Currently transmitting a message */
@@ -2002,8 +2008,7 @@ typedef struct rds_encoder {
 	uint64_t	tx_file_groups_sent;	/* Groups transmitted from file */
 	
 	/* TX file logging decoder (decodes transmitted groups for logging) */
-	struct rds_decoder *tx_log_decoder;	/* Decoder for logging TX groups */
-	struct rds_rx_app *tx_log_app;		/* its display (the log lines) */
+	rds_encoder_sink_t sink;		/* where what is sent is told (rds_encoder_set_sink) */
 
 	/* ============================================================
 	 * Group 8A: Traffic Message Channel (TMC)
@@ -2517,10 +2522,8 @@ void rds_enc_paging_set_battery_saving(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
 void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable);
-/* a sent call (starts / complete) to a consumer, after its log line */
-void rds_enc_set_paging_sent_callback(rds_encoder_t *rds,
-				      void (*fn)(const rds_paging_tx_call_t *call, void *arg),
-				      void *arg);
+/* Where the encoder tells what it sends (copied; NULL: nowhere) */
+void rds_encoder_set_sink(rds_encoder_t *rds, const rds_encoder_sink_t *sink);
 void rds_enc_paging_set_opc(rds_encoder_t *rds, uint8_t opc);
 void rds_enc_paging_set_pac(rds_encoder_t *rds, uint8_t pac);
 void rds_enc_paging_set_cc(rds_encoder_t *rds, uint16_t cc);
@@ -2947,6 +2950,28 @@ typedef struct rds_rx_app {
 	void		(*change_callback)(const rds_decoder_t *rds, enum rds_change what, void *arg);
 	void		*change_callback_arg;
 } rds_rx_app_t;
+
+/* The station's TX application side, the encoder's sink (rds_tx_app_attach):
+ * the display of sent paging calls and their consumer, and the TX monitor -
+ * a group-only decoder with its own display that logs what is sent (on with
+ * a TX file, rds_tx_app_monitor). */
+typedef struct rds_tx_app {
+	rds_decoder_t	*monitor;		/* NULL: no TX monitor */
+	rds_rx_app_t	*monitor_app;		/* its display */
+	int		monitor_debug, monitor_verbose;	/* 'RDS TX FILE' lines */
+	/* a sent paging call (starts / complete), after its log line */
+	void		(*paging_callback)(const rds_paging_tx_call_t *call, void *arg);
+	void		*paging_callback_arg;
+} rds_tx_app_t;
+
+void rds_tx_app_init(rds_tx_app_t *app);
+void rds_tx_app_attach(rds_tx_app_t *app, rds_encoder_t *enc);
+/* the TX monitor (once): a group-only decoder of every sent group */
+int rds_tx_app_monitor(rds_tx_app_t *app, int debug, int verbose);
+void rds_tx_app_set_paging_callback(rds_tx_app_t *app,
+				    void (*fn)(const rds_paging_tx_call_t *call, void *arg),
+				    void *arg);
+void rds_tx_app_exit(rds_tx_app_t *app);
 
 /* Where a decoder gives out what it receives (copied; NULL: nowhere) */
 void rds_decoder_set_sink(rds_decoder_t *rds, const rds_decoder_sink_t *sink);
