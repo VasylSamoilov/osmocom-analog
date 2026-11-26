@@ -47,9 +47,9 @@ void print_help(const char *arg0)
 	main_mobile_print_help(arg0, "");
 	/*      -                                                                             - */
 	printf("Use '-k BS -k BSC' to trace both sides of SS7 link, using a stereo input.\n");
-	printf("Use '-v 0' for total message logging, including errors.\n");
-	printf("Use '-v 1' for all messages, including resends (and weird messages from SAE).\n");
-	printf("Use '-v 2' for messages between DKO and MSC.\n");
+	printf("Use '-v 7' (debug) for total message logging, including errors.\n");
+	printf("Use '-v 6' (info) for all messages, including resends (and weird messages from SAE).\n");
+	printf("Use '-v 5' (notice) for messages between DKO and MSC.\n");
 	main_mobile_print_hotkeys();
 }
 

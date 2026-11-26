@@ -153,12 +153,46 @@ const char *debug_db(double level_db)
 	return text;
 }
 
+/* The verbose levels as syslog numbers them (RFC 5424: the higher, the more
+ * output) and by name; inside, libosmocore's LOGL_* (the lower, the more).
+ * libosmocore has no warning, critical, alert or emergency messages: warning
+ * shows the errors, critical and above only the fatal ones. */
+static const struct {
+	int number;
+	const char *name;
+	int logl;
+} log_levels[] = {
+	{ 7, "debug", LOGL_DEBUG },
+	{ 6, "info", LOGL_INFO },
+	{ 5, "notice", LOGL_NOTICE },
+	{ 4, "warning", LOGL_ERROR },
+	{ 3, "error", LOGL_ERROR },
+	{ 2, "critical", LOGL_FATAL },
+	{ 1, "alert", LOGL_FATAL },
+	{ 0, "emergency", LOGL_FATAL },
+};
+#define LOG_LEVELS_NUM ((int)(sizeof(log_levels) / sizeof(log_levels[0])))
+
+/* the syslog number of a libosmocore level (the first, the one with output) */
+static int log_level_number(int logl)
+{
+	int i;
+
+	for (i = 0; i < LOG_LEVELS_NUM; i++) {
+		if (log_levels[i].logl == logl)
+			return log_levels[i].number;
+	}
+	return -1;
+}
+
 void logging_print_help(void)
 {
 	printf(" -v --verbose <level> | <level>,<category>[,<category>[,...]] | list\n");
 	printf("        Use 'list' to get a list of all levels and categories.\n");
-	printf("        Verbose level: digit of debug level (default = '%d')\n", loglevel);
-	printf("        Verbose level+category: level digit followed by one or more categories\n");
+	printf("        Verbose level: a number, the higher the more output (as syslog):\n");
+	printf("        7 = debug, 6 = info, 5 = notice, 3 = error, or the name\n");
+	printf("        (default = '%d')\n", log_level_number(loglevel));
+	printf("        Verbose level+category: level followed by one or more categories\n");
 	printf("        -> If no category is specified, all categories are selected\n");
 	printf(" -v --verbose date\n");
 	printf("        Show date with debug output\n");
@@ -166,16 +200,15 @@ void logging_print_help(void)
 	printf("        Show date with millisecond precision (for timing analysis)\n");
 }
 
-static unsigned char log_levels[] = { LOGL_DEBUG, LOGL_INFO, LOGL_NOTICE, LOGL_ERROR };
-static char *log_level_names[] = { "debug", "info", "notice", "error" };
-
 static void list_cat(void)
 {
 	int i;
 
-	printf("Give number of debug level:\n");
-	for (i = 0; i < (int)sizeof(log_levels); i++)
-		printf(" %d = %s\n", log_levels[i], log_level_names[i]);
+	printf("Give number or name of debug level (the higher, the more output):\n");
+	for (i = 0; i < LOG_LEVELS_NUM; i++)
+		printf(" %d = %s%s\n", log_levels[i].number, log_levels[i].name,
+		       (log_levels[i].number == 4) ? " (shows the errors)" :
+		       (log_levels[i].number <= 2) ? " (shows fatal errors only)" : "");
 	printf("\n");
 
 	printf("Give name(s) of debug category:\n");
@@ -213,23 +246,18 @@ int parse_logging_opt(const char *optarg)
 
 	dup = dstring = strdup(optarg);
 	p = strsep(&dstring, ",");
-	for (i = 0; i < p[i]; i++) {
-		if (p[i] < '0' || p[i] > '9') {
-			fprintf(stderr, "Only digits are allowed for debug level!\n");
-			free(dup);
-			return -EINVAL;
-		}
-	}
-	loglevel = atoi(p);
-	for (i = 0; i < (int)sizeof(log_levels); i++) {
-		if (log_levels[i] == loglevel)
+	for (i = 0; i < LOG_LEVELS_NUM; i++) {
+		if (!strcasecmp(p, log_levels[i].name))
+			break;
+		if (p[0] >= '0' && p[0] <= '9' && !p[1] && p[0] - '0' == log_levels[i].number)
 			break;
 	}
-	if (i == (int)sizeof(log_levels)) {
-		fprintf(stderr, "Logging level does not exist, use '-v list' to show available levels!\n");
+	if (i == LOG_LEVELS_NUM) {
+		fprintf(stderr, "Logging level '%s' does not exist (7 = debug .. 0 = emergency, or the name), use '-v list' to show available levels!\n", p);
 		free(dup);
 		return -EINVAL;
 	}
+	loglevel = log_levels[i].logl;
 	/* Set loglevel and enable all categories, if dstring is not set. Else set loglevel and disable all categories. */
 	for (i = 0; i < (int)log_categories_size; i++)
 		log_set_category_filter(osmo_stderr_target, i, (!dstring), loglevel);

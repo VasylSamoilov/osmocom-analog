@@ -161,7 +161,8 @@ static void print_usage(const char *prog)
 	printf("Usage: %s [options] file1.hexrds [file2.rds ...]\n\n", prog);
 	printf("RDS file decoder -- validates decoder against captured RDS data.\n\n");
 	printf("Options:\n");
-	printf("  -v <level>    Set logging verbosity (0=debug .. 7=fatal, default=5/notice)\n");
+	printf("  -v <level>    Set logging verbosity, the higher the more output (as syslog):\n");
+	printf("                7 = debug, 6 = info (default), 5 = notice, 3 = error, or the name\n");
 	printf("  --rds-debug   Enable RDS decoder debug (raw hex codes, field extraction)\n");
 	printf("  --rds-verbose Enable RDS decoder verbose (human-readable decoded fields)\n");
 	printf("  --rbds        Force RBDS decoding (callsign lookup, US PTY names)\n");
@@ -176,7 +177,7 @@ static void print_usage(const char *prog)
 	printf("  .rds        Binary bitstream (raw RDS bits, MSB first)\n\n");
 	printf("Examples:\n");
 	printf("  %s --rds-verbose docs/rds/20180424_KCRC.hexrds\n", prog);
-	printf("  %s -v 0 --rds-debug --rds-verbose docs/rds/20091111_France_Info.rds\n", prog);
+	printf("  %s -v 7 --rds-debug --rds-verbose docs/rds/20091111_France_Info.rds\n", prog);
 }
 
 int main(int argc, char *argv[])
@@ -184,6 +185,14 @@ int main(int argc, char *argv[])
 	int file_count = 0;
 	const char *files[256];
 	int total_groups = 0;
+
+	/* Initialize logging framework before the options: -v sets its level
+	 * and categories (after it, the init enabled all categories again).
+	 * Default loglevel is LOGL_INFO. Use -v to override (e.g. -v 7 or -v debug).
+	 * --rds-debug/--rds-verbose are separate flags that control what the
+	 * RDS decoder emits -- they still need the logging level to be low enough
+	 * for the messages to pass through the framework. */
+	logging_init();
 
 	/* Parse arguments */
 	for (int i = 1; i < argc; i++) {
@@ -238,13 +247,6 @@ int main(int argc, char *argv[])
 		print_usage(argv[0]);
 		return 1;
 	}
-
-	/* Initialize logging framework.
-	 * Default loglevel is LOGL_INFO. Use -v to override (e.g. -v 0 for debug).
-	 * --rds-debug/--rds-verbose are separate flags that control what the
-	 * RDS decoder emits -- they still need the logging level to be low enough
-	 * for the messages to pass through the framework. */
-	logging_init();
 
 	/* Process each file with a fresh decoder */
 	for (int i = 0; i < file_count; i++) {
