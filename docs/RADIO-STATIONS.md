@@ -526,10 +526,15 @@ Layer split (agreed, in slices, each proven identical before the next):
    consumer (osmordstest counts them); 3b d098b8f what a retune keeps is
    one block at the front of rds_decoder_t, the reset clears the rest
    (RDS_DECODER_RECEIVED); 3c 88b222b the display and the status dump
-   take a const decoder. Left inline in rds_decode_group (2369 lines): 44
-   DEBUG traces (decoder, stay), 67 INFO verbose interpretations and 29
-   NOTICE state changes (display: to events, e.g. PTY, CT, the ECC
-   checks with their sentinels); the private TX log and UECP decoders
-   still a whole rds_decoder_t);
+   take a const decoder; 3d-3h one change event, rds_changed(enum
+   rds_change) to the display (rds_display_changed, its own state
+   'shown') and a consumer (rds_decoder_set_change_callback): PTY, CT,
+   the ECC vs RBDS check, a new PS, a finished 2A RadioText, the
+   station's paging system (RPC, block D SI, OPC, PAC). Left inline in
+   rds_decode_group (2313 lines): 44 DEBUG traces (decoder, stay), 63
+   INFO and 18 NOTICE, nearly all verbose decode traces (calls being
+   assembled, segments, 13A notification bits) - to the display still:
+   LPS, PTYN, EON (14A), the ODA registration (3A); the private TX log
+   and UECP decoders still a whole rds_decoder_t);
 4. encoder: content sources (PS, RT, AF, paging queue, UECP, Dynamic
    PS) apart from the scheduler and the bit / biphase generator.
