@@ -1,6 +1,7 @@
-/* test of the SDR bands (sdr_bands.c): three bands of one program at
- * different IQ rates (two on the filter bank, one on the per-channel
- * chain), serviced by one loop in turn as osmoradio does; the same body on
+/* test of the SDR bands (sdr_bands.c): four bands of one program at
+ * different IQ rates (AM and NFM on the filter bank, FM mono 240 k and FM
+ * stereo + RDS 480 k on the per-channel chain), serviced by one loop in
+ * turn as osmoradio does; the same body on
  * the engine in-process and on the backend (one registration per band).
  * Null device, TX looped to RX, in real time. */
 
@@ -22,7 +23,8 @@
 
 #define FS	1920000
 #define DSP	48000	/* the filter bank's DSP rate */
-#define NMAX	3	/* TX channels: the three bands */
+#define NB	4	/* bands */
+#define NMAX	NB	/* TX channels: the bands */
 #define BLOCK	1920	/* 1 ms */
 #define MS	800	/* received per band */
 
@@ -57,6 +59,7 @@ static double level(const double complex *y, int n, double f)
 /* the device: TX looped to RX, 1 ms blocks in real time */
 static volatile int device_run;
 static sdr_engine_t engine;
+static volatile double device_late;	/* the device's block was due this long ago (most) */
 
 static void *device(void __attribute__((unused)) *arg)
 {
@@ -64,6 +67,8 @@ static void *device(void __attribute__((unused)) *arg)
 	double next = now();
 
 	while (device_run) {
+		if (now() - next > device_late)
+			device_late = now() - next;
 		sdr_engine_tx_produce(&engine, iq, BLOCK);
 		sdr_engine_rx_feed(&engine, iq, BLOCK);
 		next += (double)BLOCK / FS;
@@ -80,25 +85,26 @@ static const struct {
 	double freq;
 	int rate;
 	double tone;
-} B[3] = {
+} B[NB] = {
 	{ "AM 48k", -300000.0, 48000, 1000.0 },
 	{ "NFM 24k", 250000.0, 24000, -2000.0 },
 	{ "FM 240k", 600000.0, 240000, 30000.0 },
+	{ "FM 480k", -650000.0, 480000, 100000.0 },	/* stereo + RDS */
 };
 
 /* the program: the three bands, one loop over them, each sends its tone
  * and receives MS of its band */
 static void run(sdr_bands_t *bs, const char *how)
 {
-	double complex *y[3];
+	double complex *y[NB];
 	float *buf;
-	int n[3] = { 0, 0, 0 }, cap[3], idx[3], b, s, rc, bufmax = 0;
-	long t[3] = { 0, 0, 0 };
+	int n[NB] = { 0 }, cap[NB], idx[NB], b, s, rc, bufmax = 0, more;
+	long t[NB] = { 0 }, missing[NB], dropped[NB];
 	char err[256];
-	double start;
+	double start, pass, longest = 0.0;
 
-	printf("%s: three bands, one loop:\n", how);
-	for (b = 0; b < 3; b++) {
+	printf("%s: %d bands, one loop:\n", how, NB);
+	for (b = 0; b < NB; b++) {
 		sdr_band_def_t def = { B[b].name, 1, 1, B[b].freq, B[b].freq, B[b].rate, B[b].rate / 50 };	/* 20 ms */
 
 		idx[b] = sdr_band_add(bs, &def, err, sizeof(err));
@@ -113,9 +119,12 @@ static void run(sdr_bands_t *bs, const char *how)
 			bufmax = def.buffer_size;
 	}
 	buf = malloc(sizeof(float) * 2 * bufmax);
-	start = now();
-	while ((n[0] < cap[0] || n[1] < cap[1] || n[2] < cap[2]) && now() - start < MS / 1000.0 * 3) {
-		for (b = 0; b < 3; b++) {
+	start = pass = now();
+	for (more = 1; more && now() - start < MS / 1000.0 * 3; ) {
+		for (more = 0, b = 0; b < NB; b++)
+			if (n[b] < cap[b])
+				more = 1;
+		for (b = 0; b < NB; b++) {
 			int k = sdr_band_tosend(bs, b), got;
 
 			for (s = 0; s < k; s++, t[b]++) {
@@ -132,16 +141,25 @@ static void run(sdr_bands_t *bs, const char *how)
 				y[b][n[b]] = (buf[2 * s] + I * buf[2 * s + 1]) / sdr_band_tx_scale(bs, b);
 		}
 		usleep(2000);
+		if (now() - pass > longest)
+			longest = now() - pass;
+		pass = now();
 	}
-	for (b = 0; b < 3; b++) {
+	/* the counters now: TX runs dry while the levels are worked out */
+	for (b = 0; b < NB; b++) {
+		missing[b] = bs->band[b].port->view->tx_missing;
+		dropped[b] = bs->band[b].port->view->rx_dropped;
+	}
+	printf("  the longest pass of the loop: %.1f ms, the device at most %.1f ms late\n", longest * 1e3, device_late * 1e3);
+	device_late = 0.0;
+	for (b = 0; b < NB; b++) {
 		int skip = n[b] / 2, len = n[b] - skip, o;
 		double own = level(y[b] + skip, len, B[b].tone / B[b].rate), mirror = level(y[b] + skip, len, -B[b].tone / B[b].rate);
 		double other = -300.0;
-		sdr_view_t *v = bs->band[b].port->view;
 		char what[100];
 
 		/* the others' tones, if they fall in this band's rate */
-		for (o = 0; o < 3; o++)
+		for (o = 0; o < NB; o++)
 			if (o != b && fabs(B[o].tone) < B[b].rate / 2.0) {
 				double l = level(y[b] + skip, len, B[o].tone / B[b].rate);
 
@@ -156,8 +174,10 @@ static void run(sdr_bands_t *bs, const char *how)
 		check(mirror < -100.0, what, mirror, "dB");
 		snprintf(what, sizeof(what), "%s: the other bands' tones", B[b].name);
 		check(other < -100.0, what, other, "dB");
-		snprintf(what, sizeof(what), "%s: TX rows missing + RX rows dropped", B[b].name);
-		check(v->tx_missing + v->rx_dropped == 0, what, (double)(v->tx_missing + v->rx_dropped), "");
+		snprintf(what, sizeof(what), "%s: TX rows missing", B[b].name);
+		check(missing[b] == 0, what, (double)missing[b], "");
+		snprintf(what, sizeof(what), "%s: RX rows dropped", B[b].name);
+		check(dropped[b] == 0, what, (double)dropped[b], "");
 		free(y[b]);
 	}
 	free(buf);
@@ -254,7 +274,7 @@ int main(void)
 	}
 	sdr_bands_backend(&bs, sock);
 	run(&bs, "On the backend (one registration per band)");
-	check(sdr_backend_groups(be) == 3, "backend: three registrations", sdr_backend_groups(be), "");
+	check(sdr_backend_groups(be) == NB, "backend: a registration per band", sdr_backend_groups(be), "");
 	sdr_bands_close(&bs);
 	for (i = 0; i < 300 && sdr_backend_groups(be); i++)
 		usleep(10000);
