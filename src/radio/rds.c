@@ -1066,39 +1066,41 @@ static rds_paging_msg_t *rds_paging_msg_alloc(enum rds_paging_msg_type type,
 	return msg;
 }
 
-static void rds_paging_enqueue(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
+/* the queue (application) */
+static void rds_paging_enqueue(rds_paging_queue_t *q, rds_paging_msg_t *msg)
 {
-	if (pag->q.queue_count >= RDS_PAGING_QUEUE_MAX) {
-		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: queue full (%d), dropping message\n", pag->q.queue_count);
+	if (q->queue_count >= RDS_PAGING_QUEUE_MAX) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: queue full (%d), dropping message\n", q->queue_count);
 		free(msg);
 		return;
 	}
 	msg->next = NULL;
-	if (pag->q.queue_tail)
-		pag->q.queue_tail->next = msg;
+	if (q->queue_tail)
+		q->queue_tail->next = msg;
 	else
-		pag->q.queue_head = msg;
-	pag->q.queue_tail = msg;
-	pag->q.queue_count++;
+		q->queue_head = msg;
+	q->queue_tail = msg;
+	q->queue_count++;
 }
 
-static rds_paging_msg_t *rds_paging_dequeue(rds_paging_enc_t *pag)
+static rds_paging_msg_t *rds_paging_dequeue(rds_paging_queue_t *q)
 {
-	rds_paging_msg_t *msg = pag->q.queue_head;
+	rds_paging_msg_t *msg = q->queue_head;
 	if (!msg)
 		return NULL;
-	pag->q.queue_head = msg->next;
-	if (!pag->q.queue_head)
-		pag->q.queue_tail = NULL;
+	q->queue_head = msg->next;
+	if (!q->queue_head)
+		q->queue_tail = NULL;
 	msg->next = NULL;
-	pag->q.queue_count--;
+	q->queue_count--;
 	return msg;
 }
 
+/* the queue emptied (application) and the call on air dropped (protocol) */
 static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 {
 	rds_paging_msg_t *msg;
-	while ((msg = rds_paging_dequeue(pag)) != NULL)
+	while ((msg = rds_paging_dequeue(&pag->q)) != NULL)
 		free(msg);
 	if (pag->tx_msg) {
 		free(pag->tx_msg);
@@ -1230,30 +1232,30 @@ static int rds_paging_msg_groups(rds_paging_enc_t *pag, rds_paging_msg_t *msg)
 }
 
 /* number of groups a scan message takes on air */
-static int rds_paging_scan_groups(const rds_paging_enc_t *pag)
+static int rds_paging_scan_groups(const rds_paging_queue_t *q)
 {
-	switch (pag->q.scan_type) {
+	switch (q->scan_type) {
 	case RDS_PAGING_TONE:
 		return 1;
 	case RDS_PAGING_NUM10:
 		return 2;	/* address + 2 digits, then 8 digits */
 	default:
 		/* alpha: address group + one data group per 4 characters */
-		return 1 + (pag->q.scan_alpha_chars + 3) / 4;
+		return 1 + (q->scan_alpha_chars + 3) / 4;
 	}
 }
 
 /* remove msg from the queue, prev is its predecessor (NULL for the head) */
-static void rds_paging_unlink(rds_paging_enc_t *pag, rds_paging_msg_t *prev, rds_paging_msg_t *msg)
+static void rds_paging_unlink(rds_paging_queue_t *q, rds_paging_msg_t *prev, rds_paging_msg_t *msg)
 {
 	if (prev)
 		prev->next = msg->next;
 	else
-		pag->q.queue_head = msg->next;
-	if (pag->q.queue_tail == msg)
-		pag->q.queue_tail = prev;
+		q->queue_head = msg->next;
+	if (q->queue_tail == msg)
+		q->queue_tail = prev;
 	msg->next = NULL;
-	pag->q.queue_count--;
+	q->queue_count--;
 }
 
 /* With battery saving a call has to fit the three interval windows of its
@@ -1271,7 +1273,7 @@ static void rds_paging_bs_drop_unfit(rds_paging_enc_t *pag)
 		if (groups > max_groups) {
 			LOGP(DRADIO, LOGL_ERROR, "RDS Paging: addr=%02u-%04u needs %d groups, battery saving windows hold %d, dropped\n",
 			     m->address / 10000, m->address % 10000, groups, (int)max_groups);
-			rds_paging_unlink(pag, prev, m);
+			rds_paging_unlink(&pag->q, prev, m);
 			free(m);
 			continue;
 		}
@@ -1286,7 +1288,7 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 {
 	rds_paging_enc_t *pag = &rds->paging;
 
-	int groups = rds_paging_scan_groups(pag);
+	int groups = rds_paging_scan_groups(&pag->q);
 	int eligible = 0;
 
 	if (!pag->q.scan_active)
@@ -1325,7 +1327,7 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 			break;
 		if (pag->battery_saving && rds_paging_slot_ok(pag, pag->q.scan_next, groups, NULL))
 			eligible++;
-		rds_paging_enqueue(pag, msg);
+		rds_paging_enqueue(&pag->q, msg);
 		pag->q.scan_next++;
 	}
 
@@ -1497,12 +1499,12 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 			}
 			if (!best)
 				return;
-			rds_paging_unlink(pag, best_prev, best);
+			rds_paging_unlink(&pag->q, best_prev, best);
 			msg = best;
 		} else {
 			if (msg->next_send_time > now)
 				break;	/* Head not ready yet, wait */
-			rds_paging_dequeue(pag);
+			rds_paging_dequeue(&pag->q);
 		}
 
 		{
@@ -1540,7 +1542,7 @@ static void rds_paging_tx_complete(rds_encoder_t *rds)
 		msg->is_repeat = 1;  /* R=1 for subsequent transmissions */
 		msg->next_send_time = time(NULL) + msg->repeat_interval;
 		pag->tx_msg = NULL;
-		rds_paging_enqueue(pag, msg);
+		rds_paging_enqueue(&pag->q, msg);
 	} else {
 		free(msg);
 		pag->tx_msg = NULL;
@@ -1618,7 +1620,7 @@ int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->tonetype = tonetype;
 
-	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_enqueue(&rds->paging.q, msg);
 	rds_paging_start_next(rds);
 	return 0;
 }
@@ -1655,7 +1657,7 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = ni;
 
-	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_enqueue(&rds->paging.q, msg);
 	rds_paging_start_next(rds);
 	return 0;
 }
@@ -1692,7 +1694,7 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_enqueue(&rds->paging.q, msg);
 	rds_paging_start_next(rds);
 	return 0;
 }
@@ -1726,7 +1728,7 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_enqueue(&rds->paging.q, msg);
 	rds_paging_start_next(rds);
 	return 0;
 }
@@ -1761,7 +1763,7 @@ int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_enqueue(&rds->paging.q, msg);
 	rds_paging_start_next(rds);
 	return 0;
 }
@@ -1790,7 +1792,7 @@ int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = 1;
 	msg->country_code = country_code;
-	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_enqueue(&rds->paging.q, msg);
 	rds_paging_start_next(rds);
 	return 0;
 }
@@ -1820,7 +1822,7 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = 1;
 	msg->country_code = country_code;
-	rds_paging_enqueue(&rds->paging, msg);
+	rds_paging_enqueue(&rds->paging.q, msg);
 	rds_paging_start_next(rds);
 	return 0;
 }
@@ -1852,7 +1854,7 @@ int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
 		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: alpha payload %s (%d groups per call)\n",
 		     pag->q.scan_alpha_chars == 4 ? "last 4 digits, group code is fixed by the range" :
 						  "6 digits, range spans more than one group code",
-		     rds_paging_scan_groups(pag));
+		     rds_paging_scan_groups(&pag->q));
 	pag->q.scan_active = 1;
 	/* the protocol: the scan's schedule, the 4A minute marker pagers need
 	 * for interval sync, the interval clock */
