@@ -9591,41 +9591,74 @@ static int rds_paging_group(rds_decoder_t *rds, int group_code)
 	return !(oda->registered && oda->aid != 0x0000);
 }
 
-static void rds_decode_group(rds_decoder_t *rds)
+/*
+ * RDS decoder application side: what the codec gives - every bit and every
+ * group with its blocks' status - to the files and the servers. The codec
+ * (rds_decoder_bit, rds_decoder_feed_group) calls only these two.
+ */
+
+/* A received bit: to the bitstream file (MSB first) */
+static void rds_bit_received(rds_decoder_t *rds, int bit)
 {
-	uint16_t pi = rds->blocks[0];
-	uint16_t b2 = rds->blocks[1];
-	uint16_t b3 = rds->blocks[2];
-	uint16_t b4 = rds->blocks[3];
-	
+	if (!rds->bitstream_file)
+		return;
+	rds->bitstream_byte = (rds->bitstream_byte << 1) | (bit & 1);
+	rds->bitstream_bit_count++;
+	if (rds->bitstream_bit_count >= 8) {
+		fputc(rds->bitstream_byte, rds->bitstream_file);
+		rds->bitstream_byte = 0;
+		rds->bitstream_bit_count = 0;
+	}
+}
+
+/* A received group: to the hexrds file as received, to the field decode
+ * (rds_decode_group), then to the servers as received (the status says
+ * which blocks are bad) - also a group without block B, whose type is
+ * unknown. */
+static void rds_group_received(rds_decoder_t *rds)
+{
 	/* Write to hexrds output file if enabled.
 	 * Format: "XXXX XXXX XXXX XXXX @YYYY/MM/DD HH:MM:SS.mmm" (RDS Spy format)
 	 * Uses ---- for missing blocks */
 	if (rds->hexrds_file) {
 		struct timeval tv;
 		struct tm *tm;
+		int i;
+
 		gettimeofday(&tv, NULL);
 		tm = localtime(&tv.tv_sec);
-		
-		if (rds->group_mask & (1<<0)) write_hex16(rds->hexrds_file, pi);
-		else fprintf(rds->hexrds_file, "----");
-		fputc(' ', rds->hexrds_file);
-		if (rds->group_mask & (1<<1)) write_hex16(rds->hexrds_file, b2);
-		else fprintf(rds->hexrds_file, "----");
-		fputc(' ', rds->hexrds_file);
-		if (rds->group_mask & (1<<2)) write_hex16(rds->hexrds_file, b3);
-		else fprintf(rds->hexrds_file, "----");
-		fputc(' ', rds->hexrds_file);
-		if (rds->group_mask & (1<<3)) write_hex16(rds->hexrds_file, b4);
-		else fprintf(rds->hexrds_file, "----");
-		
+
+		for (i = 0; i < 4; i++) {
+			if (i)
+				fputc(' ', rds->hexrds_file);
+			if (rds->group_mask & (1 << i))
+				write_hex16(rds->hexrds_file, rds->blocks[i]);
+			else
+				fprintf(rds->hexrds_file, "----");
+		}
 		fprintf(rds->hexrds_file, " @%04d/%02d/%02d %02d:%02d:%02d.%03d\n",
 			tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
 			tm->tm_hour, tm->tm_min, tm->tm_sec,
 			(int)(tv.tv_usec / 1000));
 		fflush(rds->hexrds_file);
 	}
-	
+
+	rds_decode_group(rds);
+
+	/* Invoke protocol server callback if registered */
+	if (rds->group_callback)
+		rds->group_callback(rds->blocks, rds->block_status, rds->group_callback_arg);
+
+	rds->groups_received++;
+}
+
+static void rds_decode_group(rds_decoder_t *rds)
+{
+	uint16_t pi = rds->blocks[0];
+	uint16_t b2 = rds->blocks[1];
+	uint16_t b3 = rds->blocks[2];
+	uint16_t b4 = rds->blocks[3];
+
 	/* Use table-driven decoder for field extraction and logging (NMT-style)
 	 * This populates a frame structure using field definition tables */
 	rds_frame_t frame;
@@ -9696,11 +9729,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 			     (rds->group_mask & (1<<1)) ? '+' : '-',
 			     (rds->group_mask & (1<<2)) ? '+' : '-',
 			     (rds->group_mask & (1<<3)) ? '+' : '-');
-		/* the servers get the group as received (its blocks' status
-		 * says which are bad), as the hexrds file does */
-		if (rds->group_callback)
-			rds->group_callback(rds->blocks, rds->block_status, rds->group_callback_arg);
-		rds->groups_received++;
+		/* the servers still get it (rds_group_received) */
 		return;
 	}
 	
@@ -12022,13 +12051,6 @@ group14_done:
 			break;
 		}
 	}
-	
-	/* Invoke protocol server callback if registered */
-	if (rds->group_callback) {
-		rds->group_callback(rds->blocks, rds->block_status, rds->group_callback_arg);
-	}
-	
-	rds->groups_received++;
 }
 
 /* Simple 1-pole IIR Low Pass Filter step (RC equivalent) */
@@ -12407,6 +12429,8 @@ void rds_decoder_reset(rds_decoder_t *rds)
  * bits (rds_decoder_process) and of bitstream files (rds_decoder_feed_bit). */
 static void rds_decoder_bit(rds_decoder_t *rds, int bit)
 {
+	rds_bit_received(rds, bit);
+
 	rds->shift_reg = ((rds->shift_reg << 1) | (bit & 1)) & 0x3FFFFFF;
 	rds->bit_count++;
 	rds->bit_count_in_block++;
@@ -12528,7 +12552,7 @@ static void rds_decoder_bit(rds_decoder_t *rds, int bit)
 
 	/* Group Processing at end of cycle */
 	if (rds->block_idx == 0) {
-		rds_decode_group(rds);
+		rds_group_received(rds);
 		rds->group_mask = 0;
 		rds->sig_groups_period++;
 
@@ -12720,17 +12744,6 @@ void rds_decoder_process(rds_decoder_t *rds, sample_t *samples, int num,
 					/* Got Bit */
 					rds->sig_bits_period++;
 
-					/* Write to bitstream output file if enabled (MSB first) */
-					if (rds->bitstream_file) {
-						rds->bitstream_byte = (rds->bitstream_byte << 1) | (rds->curr_bit & 1);
-						rds->bitstream_bit_count++;
-						if (rds->bitstream_bit_count >= 8) {
-							fputc(rds->bitstream_byte, rds->bitstream_file);
-							rds->bitstream_byte = 0;
-							rds->bitstream_bit_count = 0;
-						}
-					}
-					
 					/* the codec: blocks, error correction, groups */
 					rds_decoder_bit(rds, rds->curr_bit);
 				}
@@ -13599,7 +13612,7 @@ void rds_decoder_feed_group(rds_decoder_t *rds, const uint16_t blocks[4], const 
 			rds->group_mask |= (1 << i);
 	}
 
-	/* Note: groups_received is incremented inside rds_decode_group() */
+	/* Note: groups_received is incremented inside rds_group_received() */
 	rds->blocks_received += 4;
 	for (int i = 0; i < 4; i++) {
 		if (status[i] != RDS_STATUS_NONE)
@@ -13610,7 +13623,7 @@ void rds_decoder_feed_group(rds_decoder_t *rds, const uint16_t blocks[4], const 
 		}
 	}
 
-	rds_decode_group(rds);
+	rds_group_received(rds);
 }
 
 void rds_decoder_exit(rds_decoder_t *rds)
