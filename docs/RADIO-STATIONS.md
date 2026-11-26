@@ -521,6 +521,15 @@ Layer split (agreed, in slices, each proven identical before the next):
    per-thread logging_prefix; 05a5db6 its console lines too);
 3. decoded data per field (PS, RT, AF, CT, PTYN, EON, TMC, ODA) a store
    the codec fills; display and consumers (paging messages, TMC) read it
-   through events;
+   through events (in part: 3a 6a38e64 / 8158013 a received paging call
+   is an event with its own record, rds_paging_rx_msg_t, to the log and a
+   consumer (osmordstest counts them); 3b d098b8f what a retune keeps is
+   one block at the front of rds_decoder_t, the reset clears the rest
+   (RDS_DECODER_RECEIVED); 3c 88b222b the display and the status dump
+   take a const decoder. Left inline in rds_decode_group (2369 lines): 44
+   DEBUG traces (decoder, stay), 67 INFO verbose interpretations and 29
+   NOTICE state changes (display: to events, e.g. PTY, CT, the ECC
+   checks with their sentinels); the private TX log and UECP decoders
+   still a whole rds_decoder_t);
 4. encoder: content sources (PS, RT, AF, paging queue, UECP, Dynamic
    PS) apart from the scheduler and the bit / biphase generator.
