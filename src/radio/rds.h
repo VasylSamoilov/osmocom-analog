@@ -2504,6 +2504,15 @@ typedef struct {
 	int order;
 } rds_iir_filter_t;
 
+/* What the decoder tells the display and a consumer it has received (the
+ * values are in the decoder: rds->pty, rds->ct_*) */
+enum rds_change {
+	RDS_CHANGE_PTY,		/* a block B: PTY (rds->pty) */
+	RDS_CHANGE_CT,		/* a 4A: clock time (rds->ct_*) */
+};
+
+struct rds_decoder;
+
 typedef struct rds_decoder {
 	/* Configuration */
 	double		samplerate;	/* sample rate of signal */
@@ -2545,6 +2554,10 @@ typedef struct rds_decoder {
 	 * (rds_decoder_set_paging_callback) */
 	void		(*paging_callback)(const rds_paging_rx_msg_t *msg, void *arg);
 	void		*paging_callback_arg;
+
+	/* a field received (rds_decoder_set_change_callback), after the display */
+	void		(*change_callback)(const struct rds_decoder *rds, enum rds_change what, void *arg);
+	void		*change_callback_arg;
 
 	/* DSP continuity: the demodulator goes on through a new station */
 	double		freq_subcarrier;	/* Current locked frequency (~57000 Hz) */
@@ -2739,10 +2752,13 @@ typedef struct rds_decoder {
 	uint8_t		ct_status;		/* Status of CT decode */
 	time_t		ct_utc_timestamp;	/* Decoded CT as unix timestamp (UTC) */
 	time_t		ct_rx_sys_time;		/* System time(NULL) when CT was received */
-	/* Change-detection shadows for INFO log de-duplication */
-	uint8_t		ct_shown_hour;		/* Hour last logged via INFO */
-	uint8_t		ct_shown_minute;	/* Minute last logged via INFO */
-	uint8_t		pty_shown;		/* PTY value last logged via INFO */
+	/* The display's own state: what it showed last (rds_display_changed;
+	 * set back by rds_display_new_station on init and reset) */
+	struct rds_display_shown {
+		uint8_t	ct_hour;		/* Hour last logged via INFO */
+		uint8_t	ct_minute;		/* Minute last logged via INFO */
+		uint8_t	pty;			/* PTY value last logged via INFO */
+	} shown;
 
 	/* Display options */
 	int		ansi_display;		/* 1 = ANSI colour in rds_decoder_display() */
@@ -3030,6 +3046,10 @@ void rds_enc_tmc_get_msg(const rds_encoder_t *rds, rds_tmc_msg_t *msg_out);
 void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 				  void (*fn)(const rds_tmc_msg_t *msg, void *arg),
 				  void *arg);
+/* A received field (enum rds_change) to a consumer, after the display */
+void rds_decoder_set_change_callback(rds_decoder_t *rds,
+				     void (*fn)(const rds_decoder_t *rds, enum rds_change what, void *arg),
+				     void *arg);
 /* A complete received paging message to a consumer */
 void rds_decoder_set_paging_callback(rds_decoder_t *rds,
 				     void (*fn)(const rds_paging_rx_msg_t *msg, void *arg),

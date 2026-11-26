@@ -4937,6 +4937,15 @@ void rds_decoder_set_tmc_callback(rds_decoder_t *rds,
 	rds->tmc_callback_arg = arg;
 }
 
+void rds_decoder_set_change_callback(rds_decoder_t *rds,
+				     void (*fn)(const rds_decoder_t *rds, enum rds_change what, void *arg),
+				     void *arg)
+{
+	if (!rds) return;
+	rds->change_callback     = fn;
+	rds->change_callback_arg = arg;
+}
+
 void rds_decoder_set_paging_callback(rds_decoder_t *rds,
 				     void (*fn)(const rds_paging_rx_msg_t *msg, void *arg),
 				     void *arg)
@@ -9666,6 +9675,65 @@ static void rds_group_received(rds_decoder_t *rds)
 	rds->groups_received++;
 }
 
+/* The display for a new station: nothing shown yet (init, reset) */
+static void rds_display_new_station(struct rds_display_shown *shown)
+{
+	shown->pty = 0xFF;	/* fire INFO on first PTY */
+	shown->ct_hour = 0xFF;
+	shown->ct_minute = 0xFF;
+}
+
+/* The display of a received field: shown when it differs from what was shown
+ * last (a PTY once per new value, the clock time once per minute) */
+static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_shown *shown, enum rds_change what)
+{
+	switch (what) {
+	case RDS_CHANGE_PTY:
+		if (rds->pty != shown->pty) {
+			LOGP(DRADIO, LOGL_INFO, "RDS PTY: %d (%s)\n",
+			     rds->pty, rds_get_pty_name(rds->pty,
+			         rds->force_rbds || RDS_IS_RBDS(rds->ecc)));
+			shown->pty = rds->pty;
+		}
+		break;
+	case RDS_CHANGE_CT:
+#if defined(__GLIBC__) || defined(__linux__)
+		/* the user-readable report only when the displayed minute changes
+		 * -- avoids one INFO line per 4A group (dozens/hour) */
+		if (rds->ct_hour != shown->ct_hour || rds->ct_minute != shown->ct_minute) {
+			int year, month, day;
+			int tz_offset = rds->ct_offset;
+			int local_hour = rds->ct_hour + (tz_offset / 2);
+			int local_minute = rds->ct_minute + (tz_offset % 2) * 30;
+			double delta = difftime(rds->ct_utc_timestamp, rds->ct_rx_sys_time);
+
+			mjd_to_date(rds->ct_mjd, &year, &month, &day);
+			if (local_minute >= 60) { local_minute -= 60; local_hour++; }
+			if (local_minute < 0) { local_minute += 60; local_hour--; }
+			if (local_hour >= 24) local_hour -= 24;
+			if (local_hour < 0) local_hour += 24;
+			LOGP(DRADIO, LOGL_INFO,
+			     "RDS CT: %04d-%02d-%02dT%02d:%02dZ  Offset=%+.1fh"
+			     "  Local=%02d:%02d  (Delta=%+.0fs)\n",
+			     year, month, day, rds->ct_hour, rds->ct_minute,
+			     tz_offset / 2.0,
+			     local_hour, local_minute, delta);
+			shown->ct_hour = rds->ct_hour;
+			shown->ct_minute = rds->ct_minute;
+		}
+#endif
+		break;
+	}
+}
+
+/* The decoder received a field: to the display, then to the consumer */
+static void rds_changed(rds_decoder_t *rds, enum rds_change what)
+{
+	rds_display_changed(rds, &rds->shown, what);
+	if (rds->change_callback)
+		rds->change_callback(rds, what, rds->change_callback_arg);
+}
+
 /* Display of a received paging message: its log line(s) */
 static void rds_paging_rx_log(const rds_paging_rx_msg_t *m)
 {
@@ -9763,15 +9831,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 	if (rds->group_mask & (1<<1)) {
 		rds->tp = tp;
 		rds->tp_status = rds->block_status[1];
-		/* Fire INFO when PTY changes (once per new value) */
-		if (pty != rds->pty_shown) {
-			LOGP(DRADIO, LOGL_INFO, "RDS PTY: %d (%s)\n",
-			     pty, rds_get_pty_name(pty,
-			         rds->force_rbds || RDS_IS_RBDS(rds->ecc)));
-			rds->pty_shown = pty;
-		}
 		rds->pty = pty;
 		rds->pty_status = rds->block_status[1];
+		rds_changed(rds, RDS_CHANGE_PTY);
 	}
 	
 	/* Log every group type for consistent grep-ability.
@@ -10651,20 +10713,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 				LOGP(DRADIO, LOGL_DEBUG, "RDS 4A: Time Delta: RX (UTC) is %.0f seconds %s system time\n",
 				     fabs(delta), (delta >= 0) ? "ahead of" : "behind");
 
-				/* Fire the user-readable report only when the displayed minute
-				 * changes -- avoids one INFO line per 4A group (dozens/hour). */
-				if (rds->ct_hour != rds->ct_shown_hour ||
-				    rds->ct_minute != rds->ct_shown_minute) {
-					LOGP(DRADIO, LOGL_INFO,
-					     "RDS CT: %04d-%02d-%02dT%02d:%02dZ  Offset=%+.1fh"
-					     "  Local=%02d:%02d  (Delta=%+.0fs)\n",
-					     utc_year, utc_month, utc_day, utc_hour, utc_minute,
-					     tz_offset / 2.0,
-					     local_hour, local_minute, delta);
-					rds->ct_shown_hour   = rds->ct_hour;
-					rds->ct_shown_minute = rds->ct_minute;
-				}
 #endif
+				rds_changed(rds, RDS_CHANGE_CT);
 			} else {
 				if (rds->debug)
 					LOGP(DRADIO, LOGL_DEBUG, "RDS 4A: Invalid CT data "
@@ -12237,9 +12287,7 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 
 	/* Display defaults: colour if stdout is a tty, sentinels for change-detection */
 	rds->ansi_display    = isatty(fileno(stdout));
-	rds->pty_shown       = 0xFF;  /* fire INFO on first PTY */
-	rds->ct_shown_hour   = 0xFF;
-	rds->ct_shown_minute = 0xFF;
+	rds_display_new_station(&rds->shown);
 
 	/* Log emphasis/mode mismatch hints once at startup.
 	 * Do NOT auto-set ECC -- let the actual ECC from Group 1A determine the mode.
@@ -12361,9 +12409,7 @@ void rds_decoder_reset(rds_decoder_t *rds)
 
 	/* Reset change-detection sentinels (new stream = fire INFO on first decode) */
 	rds->ansi_display    = isatty(fileno(stdout));
-	rds->pty_shown       = 0xFF;
-	rds->ct_shown_hour   = 0xFF;
-	rds->ct_shown_minute = 0xFF;
+	rds_display_new_station(&rds->shown);
 
 	/* the receiver's paging setting stays; auto detects the new station again */
 	rds->paging_enabled = (rds->paging_mode == RDS_RX_PAGING_ON);
