@@ -1518,6 +1518,8 @@ static rds_paging_msg_t *rds_paging_queue_take(rds_paging_queue_t *q, const rds_
 	return rds_paging_dequeue(q);
 }
 
+static void rds_paging_queue_done(rds_paging_queue_t *q, rds_paging_msg_t *msg);
+
 static void rds_paging_start_next(rds_encoder_t *rds)
 {
 	rds_paging_enc_t *pag = &rds->paging;
@@ -1526,10 +1528,14 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 	if (pag->tx_active)
 		return;
 
-	/* Free previous message if done */
+	/* A call sent but not yet completed (a call queued from the 'sent'
+	 * callback, before the group's end completes it): back to the queue
+	 * for its repeat, as the completion does - freeing it lost the repeat */
 	if (pag->tx_msg) {
-		free(pag->tx_msg);
+		rds_paging_msg_t *done = pag->tx_msg;
+
 		pag->tx_msg = NULL;
+		rds_paging_queue_done(&pag->q, done);
 	}
 
 	rds_paging_scan_service(rds);
