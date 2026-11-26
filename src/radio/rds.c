@@ -1100,7 +1100,6 @@ static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 }
 
 /* per-message TX logs drop to INFO during a scan; the 60 s progress line stays at NOTICE */
-#define RDS_PAGING_TX_LOGL(pag)	((pag)->scan_active ? LOGL_INFO : LOGL_NOTICE)
 
 /* The paging group clock (scan_grp, groups since the last 4A) drives the 1A
  * interval sync bits and the reduced 1A/7A schedule during a scan and with
@@ -1355,6 +1354,81 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 }
 
 /* Try to start transmitting the next queued message */
+/* Display of a sent call: its log lines (a call of the address scan at INFO) */
+static void rds_paging_tx_log(const rds_paging_tx_call_t *c)
+{
+	int lvl = c->scan ? LOGL_INFO : LOGL_NOTICE;
+	uint32_t a = c->address;
+
+	if (c->complete) {
+		LOGP(DRADIO, lvl, "RDS Paging TX: %s addr=%02u-%04u complete (%d grp)\n",
+		     rds_paging_type_name(c->type), a / 10000, a % 10000, c->groups);
+		return;
+	}
+	if (c->type == RDS_PAGING_TONE)
+		LOGP(DRADIO, lvl, "RDS Paging TX: %s addr=%02u-%04u grp=%d flag=%s tone=%d tx=%s cnt=%d repeat=%d/%d\n",
+		     rds_paging_type_name(c->type), a / 10000, a % 10000,
+		     c->groups, PAG_AB(c->ab_flag),
+		     c->tonetype, PAG_R(c->is_repeat), c->call_counter, c->send_n, c->send_total);
+	else {
+		LOGP(DRADIO, lvl, "RDS Paging TX: %s addr=%02u-%04u len=%d grp=%d flag=%s %s tx=%s cnt=%d repeat=%d/%d msg=\"%.*s\"\n",
+		     rds_paging_type_name(c->type), a / 10000, a % 10000,
+		     c->data_len, c->groups, PAG_AB(c->ab_flag),
+		     PAG_NI(c->ni), PAG_R(c->is_repeat), c->call_counter, c->send_n, c->send_total,
+		     c->data_len, c->data);
+		if (c->ni && c->country_code) {
+			const char *cname = mcc_name(c->country_code);
+			/* basic intl15/intlfunc (M.2.1.6.5/6) carry no OPC */
+			if (c->type == RDS_PAGING_INTL15 || c->type == RDS_PAGING_INTLFUNC)
+				LOGP(DRADIO, lvl, "RDS Paging TX:   international: MCC=%d (%s)\n",
+				     c->country_code, cname ? cname : "unknown");
+			else
+				LOGP(DRADIO, lvl, "RDS Paging TX:   international: MCC=%d (%s) OPC=%d\n",
+				     c->country_code, cname ? cname : "unknown", c->opc);
+		}
+	}
+	if (c->battery_saving) {
+		unsigned d = a % 10;
+
+		LOGP(DRADIO, lvl, "RDS Paging TX:   interval I%u (%.1fs in), window of the address I%u-I%u\n",
+		     c->interval, c->interval_pos_ms / 1000.0, d, (d + 2) % 10);
+	}
+}
+
+/* A call starts (complete 0) or its last group is sent (complete 1): as a
+ * record to the display and to the consumer */
+static void rds_paging_sent(rds_paging_enc_t *pag, int complete)
+{
+	const rds_paging_msg_t *msg = pag->tx_msg;
+	rds_paging_tx_call_t c;
+
+	memset(&c, 0, sizeof(c));
+	c.complete = complete;
+	c.type = msg->type;
+	c.address = msg->address;
+	c.data = msg->data;
+	c.data_len = msg->data_len;
+	c.groups = pag->tx_total_groups;
+	c.ab_flag = pag->ab_flag;
+	c.tonetype = msg->tonetype;
+	c.ni = msg->ni;
+	c.is_repeat = msg->is_repeat;
+	c.call_counter = msg->call_counter;
+	c.country_code = msg->country_code;
+	c.opc = msg->opc;
+	c.send_n = msg->repeats_left + 1;
+	c.send_total = msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left);
+	c.scan = pag->scan_active;
+	if (!complete && pag->battery_saving) {
+		c.battery_saving = 1;
+		rds_paging_clock(pag, &c.interval, &c.interval_pos_ms);
+	}
+
+	rds_paging_tx_log(&c);
+	if (pag->sent_callback)
+		pag->sent_callback(&c, pag->sent_callback_arg);
+}
+
 static void rds_paging_start_next(rds_encoder_t *rds)
 {
 	rds_paging_enc_t *pag = &rds->paging;
@@ -1435,39 +1509,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 			/* is_repeat and call_counter are preserved on re-enqueue */
 
 			rds_paging_precompute(pag, msg);
-			if (msg->type == RDS_PAGING_TONE)
-				LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX: %s addr=%02u-%04u grp=%d flag=%s tone=%d tx=%s cnt=%d repeat=%d/%d\n",
-				     rds_paging_type_name(msg->type),
-				     msg->address / 10000, msg->address % 10000,
-				     pag->tx_total_groups, PAG_AB(pag->ab_flag),
-				     msg->tonetype, PAG_R(msg->is_repeat), msg->call_counter,
-				     msg->repeats_left + 1, msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left));
-			else {
-				LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX: %s addr=%02u-%04u len=%d grp=%d flag=%s %s tx=%s cnt=%d repeat=%d/%d msg=\"%.*s\"\n",
-				     rds_paging_type_name(msg->type),
-				     msg->address / 10000, msg->address % 10000,
-				     msg->data_len, pag->tx_total_groups, PAG_AB(pag->ab_flag),
-				     PAG_NI(msg->ni), PAG_R(msg->is_repeat), msg->call_counter,
-				     msg->repeats_left + 1, msg->repeats_left + 1 + (msg->is_repeat ? 0 : msg->repeats_left),
-				     msg->data_len, msg->data);
-				if (msg->ni && msg->country_code) {
-					const char *cname = mcc_name(msg->country_code);
-					/* basic intl15/intlfunc (M.2.1.6.5/6) carry no OPC */
-					if (msg->type == RDS_PAGING_INTL15 || msg->type == RDS_PAGING_INTLFUNC)
-						LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX:   international: MCC=%d (%s)\n",
-						     msg->country_code, cname ? cname : "unknown");
-					else
-						LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX:   international: MCC=%d (%s) OPC=%d\n",
-						     msg->country_code, cname ? cname : "unknown", msg->opc);
-				}
-			}
-			if (pag->battery_saving) {
-				unsigned iv, pos, d = msg->address % 10;
-
-				rds_paging_clock(pag, &iv, &pos);
-				LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX:   interval I%u (%.1fs in), window of the address I%u-I%u\n",
-				     iv, pos / 1000.0, d, (d + 2) % 10);
-			}
+			rds_paging_sent(pag, 0);
 			return;
 		}
 	}
@@ -1852,6 +1894,14 @@ void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable)
 {
 	rds->paging.enhanced = enable;
 	rds_enc_scheduler_update(rds);
+}
+
+void rds_enc_set_paging_sent_callback(rds_encoder_t *rds,
+				      void (*fn)(const rds_paging_tx_call_t *call, void *arg),
+				      void *arg)
+{
+	rds->paging.sent_callback = fn;
+	rds->paging.sent_callback_arg = arg;
 }
 
 /* Public API: set OPC for Group 1A (0=no enhanced paging, 1-15=operator) */
@@ -3622,10 +3672,7 @@ static void rds_build_group_7a(rds_encoder_t *rds, uint8_t *group)
 	if (pag->tx_group_idx >= pag->tx_total_groups) {
 		/* Message transmission complete */
 		pag->tx_active = 0;
-		LOGP(DRADIO, RDS_PAGING_TX_LOGL(pag), "RDS Paging TX: %s addr=%02u-%04u complete (%d grp)\n",
-		     rds_paging_type_name(pag->tx_msg->type),
-		     pag->tx_msg->address / 10000, pag->tx_msg->address % 10000,
-		     pag->tx_total_groups);
+		rds_paging_sent(pag, 1);
 	}
 }
 

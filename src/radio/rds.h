@@ -1535,11 +1535,17 @@ typedef struct rds_paging_msg {
 } rds_paging_msg_t;
 
 /* Paging encoder state - embedded in rds_encoder_t */
+struct rds_paging_tx_call;
+
 typedef struct rds_paging_enc {
 	int		enabled;	/* Paging enabled flag */
 	int		enhanced;	/* Enhanced paging (13A) enabled */
 	uint8_t		rpc;		/* Radio Paging Code (0-31) for Group 1A */
 	uint8_t		ab_flag;	/* Current A/B flag (toggles per new call) */
+
+	/* a call starts / is sent, after its log line (rds_enc_set_paging_sent_callback) */
+	void		(*sent_callback)(const struct rds_paging_tx_call *call, void *arg);
+	void		*sent_callback_arg;
 
 	/* Current transmission state */
 	int		tx_active;	/* Currently transmitting a message */
@@ -1674,6 +1680,29 @@ typedef struct rds_paging_dec {
 	uint8_t		interval_num;	/* Current interval number (0-9) */
 	uint8_t		enhanced_valid;	/* 13A data received at least once */
 } rds_paging_dec_t;
+
+/* A paging call the encoder sends, as it gives it to the display and a
+ * consumer (rds_enc_set_paging_sent_callback): when it starts and when its
+ * last group is sent */
+typedef struct rds_paging_tx_call {
+	int		complete;	/* 0: starts now, 1: its last group sent */
+	enum rds_paging_msg_type type;
+	uint32_t	address;	/* 6 digits: group code * 10000 + pager */
+	const char	*data;		/* the message (valid during the callback) */
+	int		data_len;
+	int		groups;		/* 7A groups of the call */
+	uint8_t		ab_flag;
+	uint8_t		tonetype;	/* tone only */
+	uint8_t		ni;		/* 0 = national, 1 = international */
+	uint8_t		is_repeat;	/* R flag */
+	uint8_t		call_counter;	/* P3-P0 */
+	uint16_t	country_code;	/* international: E.212 MCC */
+	uint8_t		opc;
+	int		send_n, send_total;	/* this send of the call / all */
+	int		battery_saving;	/* the interval below is set */
+	unsigned	interval, interval_pos_ms;	/* the interval it starts in */
+	int		scan;		/* from the address scan */
+} rds_paging_tx_call_t;
 
 /* A received paging message, as the decoder gives it to the display and a
  * consumer (rds_decoder_set_paging_callback) */
@@ -2484,6 +2513,10 @@ void rds_enc_paging_set_battery_saving(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_enabled(rds_encoder_t *rds, int enable);
 void rds_enc_paging_set_rpc(rds_encoder_t *rds, uint8_t rpc);
 void rds_enc_paging_set_13a_notify(rds_encoder_t *rds, int enable);
+/* a sent call (starts / complete) to a consumer, after its log line */
+void rds_enc_set_paging_sent_callback(rds_encoder_t *rds,
+				      void (*fn)(const rds_paging_tx_call_t *call, void *arg),
+				      void *arg);
 void rds_enc_paging_set_opc(rds_encoder_t *rds, uint8_t opc);
 void rds_enc_paging_set_pac(rds_encoder_t *rds, uint8_t pac);
 void rds_enc_paging_set_cc(rds_encoder_t *rds, uint16_t cc);
