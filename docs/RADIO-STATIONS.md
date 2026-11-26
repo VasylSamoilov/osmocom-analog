@@ -128,9 +128,22 @@ the backend one registration). Several stations = several processes.
       extra3c.sh: a page written in two parts and two lines in one write
       (both decoded and logged as before), RX with XDR-GTK + RDS Spy +
       rigctl servers (RDS Spy client gets the same 552 bytes with PI,
-      rigctl `f` the same, wave and hexrds the same). Left for step 5:
-      the server callbacks (tune, scan, rigctl frequency) still use the
-      global `st`; they get the station through their context then.
+      rigctl `f` the same, wave and hexrds the same), a server that
+      fails to start with paging on (same log, no sanitizer / leak
+      report, FIFO removed); the moved code diffed against 5b20f91's
+      main() after mapping the names: only the function frames, the
+      goto / break / continue -> return and the `#if 0` blocks differ.
+      Changed order at exit: the buffer and the meter are freed after
+      sdr_close() now (before it until 5b20f91); the fake SDR has no
+      threads, so this is not measured on a real SDR (libsdr does not
+      use the meter). Left for step 5: the server callbacks (tune,
+      scan, rigctl frequency) still use the global `st`, they get the
+      station through their context then; station_exit() unlinks the
+      paging path also for a station without paging (a second station
+      would remove another's default pipe: unlink only what this station
+      made); settings and running state share `station_t` (the defaults
+      carry an unused `radio_t` and servers): split them before there
+      are N copies.
       Found (parked, before and after alike): the rigctl SDR caps block
       in the server setup never runs - it checks the SDR handle, which
       is opened later.
