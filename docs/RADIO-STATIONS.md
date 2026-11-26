@@ -506,9 +506,14 @@ an ODA (no paging) and AID 0000 (paging).
 Layer split (agreed, in slices, each proven identical before the next):
 1. decoder codec: one bits -> blocks -> groups function (it is twice
    today, rds_decoder_process and rds_decoder_feed_bit), out a group with
-   its block status;
+   its block status (done, 86618f5: rds_decoder_bit());
 2. decoder application: hexrds / bitstream files, servers, periodic
-   status, display, logs tagged with the station, fed from the codec;
+   status, display, logs tagged with the station, fed from the codec
+   (done: 9596aae rds_bit_received() / rds_group_received(), fb6c608
+   rds_decoder_reports(), cb6490a + f1848d8 "(station N) " before each
+   line of a station's work with several stations, liblogging's
+   per-thread logging_prefix; not tagged: printf lines of a station's
+   start, they name their port / FIFO);
 3. decoded data per field (PS, RT, AF, CT, PTYN, EON, TMC, ODA) a store
    the codec fills; display and consumers (paging messages, TMC) read it
    through events;
