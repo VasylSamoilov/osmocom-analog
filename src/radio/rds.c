@@ -12603,6 +12603,10 @@ static void rds_decoder_bit(rds_decoder_t *rds, int bit)
 				uint16_t data = (rds->shift_reg >> 10) & 0xFFFF;
 				rds->blocks[block_index] = data;
 				rds->blocks_ok++;
+				/* this group's status: the blocks before it not
+				 * received, it valid (no other group's left over) */
+				memset(rds->block_status, RDS_STATUS_NONE, sizeof(rds->block_status));
+				rds->block_status[block_index] = RDS_STATUS_VALID;
 
 				LOGP(DRADIO, LOGL_NOTICE, "RDS SYNC: Acquired at offset %c (hits=%d)\n",
 					'A'+block_index, rds->sync_hits[offset][pseudo_block]);
@@ -12667,6 +12671,9 @@ static void rds_decoder_bit(rds_decoder_t *rds, int bit)
 					     'A'+rds->block_idx, rds->shift_reg,
 					     rds->freq_subcarrier, rds->clock_phi, rds->bit_count_in_block);
 			}
+			/* lost: its status says so (it kept the previous
+			 * group's, a server got the block as good) */
+			rds->block_status[rds->block_idx] = RDS_STATUS_ERROR;
 			rds->errors++;
 			rds->blocks_bad++;
 			rds->blocks_missing[rds->block_idx]++;
