@@ -503,7 +503,11 @@ detected, the same 4 calls as on; the 7 stations without paging nothing,
 auto the same logs as off at debug + verbose. Hand-written hexrds
 (~/.cache/sdrangel-rp-rds/cases): basic, enhanced only, 1A that tell
 nothing, the end (two 1A without paging; one does not), a 3A giving 7A to
-an ODA (no paging) and AID 0000 (paging).
+an ODA (no paging) and AID 0000 (paging). A retune between two calls
+(reset5.sh: RDS Spy tunes on its own connection right after the first
+call): the decoder reset, sync again, paging detected again, the second
+call decoded, the hexrds / bitstream files and RDS Spy still fed. Not
+covered: a retune while a call is half assembled.
 
 Layer split (agreed, in slices, each proven identical before the next):
 1. decoder codec: one bits -> blocks -> groups function (it is twice
