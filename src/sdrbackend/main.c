@@ -32,7 +32,6 @@
 #include "../libsdr/sdr_backend.h"
 #include "../libmobile/sender.h"
 
-#define DEFAULT_LO_OFFSET	-1000000.0	/* as the programs (libmobile) */
 
 int use_sdr = 0;
 static const char *socket_name = "@osmocom-sdr-backend";
@@ -143,7 +142,7 @@ int main(int argc, char *argv[])
 	int rc, argi, groups = -1;
 
 	logging_init();
-	sdr_config_init(DEFAULT_LO_OFFSET);
+	sdr_config_init();
 	add_options();
 	rc = options_config_file(argc, argv, "~/.osmocom/sdrbackend/sdrbackend.conf", handle_options);
 	if (rc < 0)

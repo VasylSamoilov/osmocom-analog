@@ -98,7 +98,7 @@ typedef enum {
 
 extern sdr_config_t *sdr_config;
 
-void sdr_config_init(double lo_offset);
+void sdr_config_init(void);
 void sdr_config_print_help(void);
 void sdr_config_print_hotkeys(void);
 void sdr_config_add_options(void);

@@ -51,7 +51,6 @@
 /* External configuration */
 extern echo_suppressor_config_t echo_suppressor_config;
 
-#define DEFAULT_LO_OFFSET -1000000.0
 
 static int got_init = 0;
 
@@ -320,7 +319,7 @@ void main_mobile_init(const char *digits, const struct number_lengths lengths[],
 
 	got_init = 1;
 #ifdef HAVE_SDR
-	sdr_config_init(DEFAULT_LO_OFFSET);
+	sdr_config_init();
 #endif
 }
 

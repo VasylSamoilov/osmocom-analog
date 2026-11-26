@@ -42,14 +42,16 @@ static int got_init = 0;
 extern int use_sdr;
 sdr_config_t *sdr_config = NULL;
 
-void sdr_config_init(double lo_offset)
+/* the LO offset: as given (--sdr-lo-offset, also 0 = none), else
+ * automatic (sdr_lo.c: where the driver applies one, just beyond half the
+ * SDR rate; the SDR layer keeps the DC off the channels / the band) */
+void sdr_config_init(void)
 {
 	sdr_config = calloc(1, sizeof(*sdr_config));
 	memset(sdr_config, 0, sizeof(*sdr_config));
 	sdr_config->device_args = "";
 	sdr_config->stream_args = "";
 	sdr_config->tune_args = "";
-	sdr_config->lo_offset = lo_offset;
 	sdr_config->timestamps = 1;
 	sdr_config->rpitx_ratio = RPITX_DEFAULT_RATIO;
 	sdr_config->filter_bank = -1;
@@ -86,7 +88,9 @@ void sdr_config_print_help(void)
 	printf("        rate.\n");
 	printf("    --sdr-lo-offset <Hz>\n");
 	printf("        Give frequency offset in Hz to move the local oscillator away from the\n");
-	printf("        target frequency. (default = %.0f)\n", sdr_config->lo_offset);
+	printf("        target frequency, 0 = none. (default: automatic - where the driver\n");
+	printf("        applies one, just beyond half the sample rate, so the LO is outside\n");
+	printf("        the received / sent band; the channels are kept off the DC anyway)\n");
 	printf("    --sdr-bandwidth <bandwidth>\n");
 	printf("        Give IF filter bandwidth to use. If not, sample rate is used.\n");
 	printf("    --sdr-rx-antenna <name>\n");
@@ -119,7 +123,7 @@ void sdr_config_print_help(void)
 	printf("    --sdr-tx-bandwidth <Hz>\n");
 	printf("        TX IF bandwidth\n");
 	printf("    --sdr-tx-lo-offset <Hz>\n");
-	printf("        TX LO frequency offset\n");
+	printf("        TX LO frequency offset (default: automatic, as --sdr-lo-offset)\n");
 	printf("    --sdr-rx-device-args <args>\n");
 	printf("        RX SDR device arguments (enables split mode)\n");
 	printf("    --sdr-rx-samplerate <rate>\n");
@@ -127,7 +131,7 @@ void sdr_config_print_help(void)
 	printf("    --sdr-rx-bandwidth <Hz>\n");
 	printf("        RX IF bandwidth\n");
 	printf("    --sdr-rx-lo-offset <Hz>\n");
-	printf("        RX LO frequency offset\n");
+	printf("        RX LO frequency offset (default: automatic, as --sdr-lo-offset)\n");
 	printf("\n  Mode options:\n");
 	printf("    --sdr-tx-only\n");
 	printf("        TX-only mode (no RX device needed)\n");

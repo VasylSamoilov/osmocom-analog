@@ -10,6 +10,7 @@ libsdr_a_SOURCES = \
 	sdr_backend.c \
 	sdr_client.c \
 	sdr_bands.c \
+	sdr_lo.c \
 	sdr_status.c
 
 AM_CPPFLAGS += -DHAVE_SDR

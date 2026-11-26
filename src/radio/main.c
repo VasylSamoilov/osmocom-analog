@@ -52,7 +52,6 @@ enum paging_signal;
 #include "signal_meter.h"
 #include "../libmobile/mcc.h"
 
-#define DEFAULT_LO_OFFSET -1000000.0
 #define RDS_PAGING_PIPE_DEFAULT "/tmp/rds_paging_send"
 
 /* Protocol server callback context */
@@ -2514,7 +2513,7 @@ int main(int argc, char *argv[])
 	loglevel = LOGL_NOTICE;
 	logging_init();
 
-	sdr_config_init(DEFAULT_LO_OFFSET);
+	sdr_config_init();
 	station_defaults(st);
 
 	/* handle options / config file */

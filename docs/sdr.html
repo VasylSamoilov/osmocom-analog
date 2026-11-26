@@ -92,7 +92,7 @@ Being about 1-10 meters away, I use the <b>gain</b> as defined above.
 The <b>sample rate</b> must be 5 MHz minimum.
 The default <b>bandwidth</b> follows the sample rate, if not specified using <b>--sdr-bandwidth</b>.
 Higher sample rate causes more CPU, RAM and USB load.
-The local oscillator frequency causes the transmitted signal to be noisy, so I shift it 1 MHz away, using the default <b>--sdr-lo-offset</b>.
+The local oscillator frequency causes the transmitted signal to be noisy, so it is shifted away automatically: where the driver applies an LO offset (UHD), just beyond half the sample rate (2.7 MHz at 5 MHz), so the LO is outside the band sent and received; the channels are placed off the center (the DC) anyway, and a program with one band (radio, tv, dcf77) gets its band moved off it where the driver cannot do that (SoapySDR). <b>--sdr-lo-offset</b> gives the offset instead (0 = none).
 The audio processing rate of 100 KHz (<b>-s 100000</b>) is used to generate two channels: <b>17</b> and 19.
 Note that channel 19 is not given here, but will be used automatically.
 With B-Netz, the transmitter switches from any voice channel to the paging channel (19) whenever the phone gets paged.

@@ -267,7 +267,10 @@ int main(int argc, char *argv[])
 
 	logging_init();
 
-	sdr_config_init(0.0);
+	sdr_config_init();
+	/* no LO offset (as before): calibration looks at the device itself */
+	sdr_config->lo_offset = 0.0;
+	sdr_config->lo_offset_given = 1;
 	calibrate_config_default(&config);
 
 	add_options();

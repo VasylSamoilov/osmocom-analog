@@ -77,8 +77,6 @@ static struct timesignal_tx generic_tx;
 #ifdef HAVE_SDR
 int use_sdr = 0;
 static void *sdr = NULL;
-/* LO offset: negative to avoid DC spike in the narrow DCF77 signal */
-#define DEFAULT_LO_OFFSET	-10000.0
 #endif
 
 /* not static, in case we add libtimer some day, then compiler hits an error */
@@ -582,7 +580,7 @@ int main(int argc, char *argv[])
 	logging_init();
 
 #ifdef HAVE_SDR
-	sdr_config_init(DEFAULT_LO_OFFSET);
+	sdr_config_init();
 #endif
 
 	/* handle options / config file */

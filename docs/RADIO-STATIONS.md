@@ -376,8 +376,45 @@ paging case runs 12 s
       option (the PS comes from the preset), so both FM stations send the
       same PS and PS separation is not checked; on --sdr-backend the
       usable band is the backend's (osmoradio does not know its rate);
-      for slice 8: where the LO offset (-1 MHz default) puts the DC / LO
-      spur in server mode.
+      for slice 8: where the LO offset puts the DC / LO spur in server
+      mode (since 2026-11-26 automatic, just beyond half the SDR rate
+      where the driver applies one - see "LO offset" below).
+
+   LO offset (the user, 2026-11-26: no fixed 1 MHz anywhere; calculated
+   where the device supports it or given; where not, the SDR layer keeps
+   the signal off the DC, TX and RX; the channels do not care): the
+   programs' defaults (-1 MHz mobile / radio / backend, -3 MHz tv, -10 kHz
+   dcf77) are gone, sdr_config_init() takes none. libsdr/sdr_lo.c decides
+   per direction: given (--sdr-lo-offset, --sdr-tx/rx-lo-offset; 0 =
+   none) or automatic -(0.5 + 0.04) x the SDR rate - the operating point
+   of every B210 run (1.92 MS/s, -1 MHz: just beyond half the rate, the LO
+   outside the stream), now scaling with the rate (at 5 MS/s the old -1 MHz
+   was inside the stream). UHD applies it (its DSP moves the signal back);
+   SoapySDR only knows at open (soapy.c applies it with a tuning stage,
+   else drops it and says so), rpitx has no LO (0, nothing moved). The
+   channels are placed off the centre as before; the band of a program
+   with channels = 0 is moved above the DC (half its IQ rate + 4 % of the
+   SDR rate, the device tuned that much lower, retune too) unless the
+   driver certainly puts the LO outside the stream (UHD, |offset| >= half
+   the rate), when it fits the usable band (75 %), else it stays centred
+   with a notice. An LO offset inside the stream: a notice for a channel
+   on centre + offset. Proof: test_sdr_lo (the decision, 14 cases: the
+   B210 runs' settings give -1036800 Hz, the LO outside, no shift; the
+   old -1 MHz given: as before; SoapySDR bands shifted 196.8 / 336 kHz;
+   no room; 0 given; rpitx); the real sdr.c on fake UHD / SoapySDR
+   drivers (~/.cache/sdrangel-rp-rates/lo/lo_test: one band at 100 MHz, a
+   tone 10 kHz above): TX in absolute frequency and RX in the band at
+   +10 kHz for UHD 1.92 / 5 MS/s, SoapySDR 1.92 / 2.4 MS/s with 240 /
+   480 k bands, 0 given, the old -1 MHz; the device's DC in the band
+   128 - 178 dB below the tone when moved, no room (480 k at 0.96 MS/s):
+   centred with the notice. The fake-SDR osmoradio suites the same (they
+   do not run sdr.c). Not proven: where the spur lands on a real device
+   (B210 run, slice 8); tv and dcf77 (band programs, no test here: their
+   rates and the shift only logged); the analog bandwidth with the LO
+   beyond half the rate (the B210 runs gave --sdr-bandwidth 3000000; the
+   default bandwidth = the rate is unchanged); SDR-rate IQ recordings
+   made with a centred band (--read-iq-*-wave) now play with the band
+   shifted on SoapySDR.
 6. The wide bank (in-process from the station list, backend option).
 7. Per-station retune.
 8. B210 run (cable loopback), after asking.
