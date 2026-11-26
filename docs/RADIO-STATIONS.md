@@ -546,5 +546,17 @@ Layer split (agreed, in slices, each proven identical before the next):
    the logs of 7 scenarios: all content (9 group types reach a receiver,
    CT across the minute), Dynamic PS, paging (ten calls of all types at
    fixed times, battery saving, 13A; 13 decoded), the address scan (41),
-   the TX hexrds file (twice) and the bitstream file. Negative control:
-   the warmup one group shorter shows in 'all' and 'dps'.
+   the TX hexrds file (twice) and the bitstream file, the CT correction
+   (+25 h 17 s, across a day). Negative control: the warmup one group
+   shorter shows in 'all' and 'dps'. Done: 4a 55983bc one 'group sent'
+   point (rds_group_sent: the TX log decoder); 4b d039fb9 radio.c /
+   main.c only through the encoder's API (preset restart, group
+   versions, DI, logging, RT A/B; the encoder has no reset, its running
+   state needs no keep block); 4c f32bf16 a sent paging call is an event
+   with its own record (rds_paging_tx_call_t, start and complete) to the
+   log and a consumer; 4d abddc12 UECP through setters (RT A/B kept, EON
+   enable; tested with a UECP client, uecp_send.py), 1107f86 Dynamic PS
+   advances on a 'PS cycle sent' event. The builders still move their
+   own segment cursors (PS, RT, PTYN, AF, EON, TDC): running state of each
+   group type, kept with it. Left: the paging queue (application) and its
+   interval / slot timing (protocol) are one piece of code.
