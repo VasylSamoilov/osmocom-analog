@@ -59,12 +59,14 @@ typedef struct {
 	rds_server_t *rdsspy_srv;
 	rds_server_t *asciig_srv;
 	radio_t *radio;
+	struct station *station;	/* the station the servers belong to */
 } rds_callback_ctx_t;
 
 /* one station: its options, RDS, servers and files */
 typedef struct station {
 	const char *rds_paging_pipe_path;
 	int paging_pipe_fd;
+	int paging_pipe_made;	/* this station made the FIFO (it removes it at exit) */
 	char paging_buf[4096];	/* paging FIFO: the partial line */
 	int paging_buf_len;
 
@@ -229,17 +231,18 @@ int quit = 0;
 static void radio_tune_cb(int freq_khz, void *arg)
 {
 	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
+	station_t *s = ctx->station;
 	double freq_hz = freq_khz * 1000.0;
 
 	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
-	if (st->rds && ctx->radio) {
+	if (s->rds && ctx->radio) {
 		if (ctx->radio->rds_dec.blocks_ok > 0) {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz, last known RDS data:\n",
-			     st->frequency / 1e6);
+			     s->frequency / 1e6);
 			rds_decoder_status(&ctx->radio->rds_dec);
 		} else {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz (no valid RDS blocks received)\n",
-			     st->frequency / 1e6);
+			     s->frequency / 1e6);
 		}
 	}
 
@@ -250,23 +253,23 @@ static void radio_tune_cb(int freq_khz, void *arg)
 		return;
 	}
 
-	/* Update global frequency and XDR-GTK server state */
-	st->frequency = freq_hz;
+	/* Update the station's frequency and XDR-GTK server state */
+	s->frequency = freq_hz;
 	if (ctx->xdr_srv)
 		ctx->xdr_srv->freq_khz = freq_khz;
 
 	/* Clear stale measurements from previous frequency */
-	if (st->meter)
-		signal_meter_reset(st->meter);
+	if (s->meter)
+		signal_meter_reset(s->meter);
 
 	/* Reset RDS decoder for new station */
-	if (st->rds && ctx->radio)
+	if (s->rds && ctx->radio)
 		rds_decoder_reset(&ctx->radio->rds_dec);
 
 	/* Update spectral measurement for new frequency */
 	sdr_spectral_set_center(freq_hz);
 	sdr_spectral_clear_freq();
-	st->spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
+	s->spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
 
 	/* Tell RDS-Spy to reset its decoder state (new station) */
 	if (ctx->rdsspy_srv)
@@ -283,7 +286,7 @@ static void radio_scan_cb(int freq_khz, void *arg)
 	if (sdr_set_rx_frequency(freq_hz) < 0)
 		return;
 
-	st->frequency = freq_hz;
+	ctx->station->frequency = freq_hz;
 	if (ctx->xdr_srv)
 		ctx->xdr_srv->freq_khz = freq_khz;
 
@@ -307,7 +310,7 @@ static void radio_setting_cb(const char *name, int val, void *arg)
 
 static void radio_tx_tune_cb(int freq_khz, void *arg)
 {
-	(void)arg;
+	rds_callback_ctx_t *ctx = (rds_callback_ctx_t *)arg;
 	double freq_hz = freq_khz * 1000.0;
 
 	LOGP(DRADIO, LOGL_NOTICE, "Re-tuning SDR TX to %d kHz\n", freq_khz);
@@ -317,23 +320,24 @@ static void radio_tx_tune_cb(int freq_khz, void *arg)
 		return;
 	}
 
-	st->frequency = freq_hz;
+	ctx->station->frequency = freq_hz;
 }
 
-/* Rigctl callbacks */
+/* Rigctl callbacks (arg: the station) */
 static int rigctl_set_rx_freq(double freq_hz, void *arg)
 {
-	radio_t *r = (radio_t *)arg;
+	station_t *s = (station_t *)arg;
+	radio_t *r = &s->radio;
 
 	/* Dump RDS status before re-tuning (if RDS enabled and have data) */
-	if (st->rds && r) {
+	if (s->rds) {
 		if (r->rds_dec.blocks_ok > 0) {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz, last known RDS data:\n",
-			     st->frequency / 1e6);
+			     s->frequency / 1e6);
 			rds_decoder_status(&r->rds_dec);
 		} else {
 			LOGP(DRADIO, LOGL_NOTICE, "Leaving %.1f MHz (no valid RDS blocks received)\n",
-			     st->frequency / 1e6);
+			     s->frequency / 1e6);
 		}
 	}
 
@@ -344,27 +348,27 @@ static int rigctl_set_rx_freq(double freq_hz, void *arg)
 		return -1;
 	}
 
-	st->frequency = freq_hz;
+	s->frequency = freq_hz;
 
 	/* Clear stale measurements */
-	if (st->meter)
-		signal_meter_reset(st->meter);
+	if (s->meter)
+		signal_meter_reset(s->meter);
 
 	/* Reset RDS decoder for new station */
-	if (st->rds && r)
+	if (s->rds)
 		rds_decoder_reset(&r->rds_dec);
 
 	/* Update spectral measurement */
 	sdr_spectral_set_center(freq_hz);
 	sdr_spectral_clear_freq();
-	st->spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
+	s->spectral_freq_idx = sdr_spectral_register_freq(freq_hz);
 
 	return 0;
 }
 
 static int rigctl_set_tx_freq(double freq_hz, void *arg)
 {
-	(void)arg;
+	station_t *s = (station_t *)arg;
 
 	LOGP(DRADIO, LOGL_NOTICE, "Rigctl: Re-tuning SDR TX to %.0f Hz\n", freq_hz);
 
@@ -373,20 +377,18 @@ static int rigctl_set_tx_freq(double freq_hz, void *arg)
 		return -1;
 	}
 
-	st->frequency = freq_hz;
+	s->frequency = freq_hz;
 	return 0;
 }
 
 static double rigctl_get_rx_freq(void *arg)
 {
-	(void)arg;
-	return st->frequency;
+	return ((station_t *)arg)->frequency;
 }
 
 static double rigctl_get_tx_freq(void *arg)
 {
-	(void)arg;
-	return st->frequency;
+	return ((station_t *)arg)->frequency;
 }
 
 /* Callback for decoded RDS groups - forwards to protocol servers */
@@ -1618,6 +1620,7 @@ static int station_init(station_t *s, void *sdr)
 			fprintf(stderr, "Failed to create paging FIFO '%s': %s\n",
 				s->rds_paging_pipe_path, strerror(errno));
 		} else {
+			s->paging_pipe_made = 1;
 			s->paging_pipe_fd = open(s->rds_paging_pipe_path, O_RDWR | O_NONBLOCK);
 			if (s->paging_pipe_fd < 0)
 				fprintf(stderr, "Failed to open paging FIFO '%s': %s\n",
@@ -1658,6 +1661,9 @@ static int station_init(station_t *s, void *sdr)
 		printf("RDS Paging scan: addresses %06u-%06u\n",
 		       (unsigned)s->rds_paging_scan_from, (unsigned)s->rds_paging_scan_to);
 	}
+
+	/* the servers' callbacks find their station here */
+	s->rds_cb_ctx.station = s;
 
 	/* Initialize protocol servers */
 	memset(&s->xdr_srv, 0, sizeof(s->xdr_srv));
@@ -1784,7 +1790,7 @@ static int station_init(station_t *s, void *sdr)
 			.set_tx_freq = rigctl_set_tx_freq,
 			.get_rx_freq = rigctl_get_rx_freq,
 			.get_tx_freq = rigctl_get_tx_freq,
-			.arg = &s->radio
+			.arg = s
 		};
 		rigctl_server_set_callbacks(&s->rigctl_srv, &rigctl_cb);
 		s->rigctl_enabled = 1;
@@ -1807,7 +1813,7 @@ static int station_init(station_t *s, void *sdr)
 		rds_server_set_callbacks(&s->rdsspy_srv, radio_tune_cb, NULL, &s->rds_cb_ctx);
 	/* Wire tune callback into ASCII-G server (TX tuner control) */
 	if (s->asciig_enabled)
-		rds_server_set_callbacks(&s->asciig_srv, radio_tx_tune_cb, NULL, NULL);
+		rds_server_set_callbacks(&s->asciig_srv, radio_tx_tune_cb, NULL, &s->rds_cb_ctx);
 
 	/* Wire spectral scan callback into XDR-GTK server */
 	if (s->xdr_enabled && s->rx)
@@ -1941,7 +1947,10 @@ static void station_exit(station_t *s)
 	if (s->paging_pipe_fd >= 0)
 		close(s->paging_pipe_fd);
 	s->paging_pipe_fd = -1;
-	unlink(s->rds_paging_pipe_path);
+	/* only the FIFO this station made (another station's may be there) */
+	if (s->paging_pipe_made)
+		unlink(s->rds_paging_pipe_path);
+	s->paging_pipe_made = 0;
 
 	/* Clean up protocol servers */
 	if (s->xdr_enabled)

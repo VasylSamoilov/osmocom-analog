@@ -200,7 +200,34 @@ paging case runs 12 s
    band client branch duplicates sdr_bands (one of them goes).
 5. N stations: offline (IQ files / engine loop) FM stereo + RDS, AM, NFM
    through the engine and back: SINAD per station, each station's own
-   PI / PS decoded, none leaking into another.
+   PI / PS decoded, none leaking into another. In parts:
+   a. the station through the callbacks, N = 1 (done): the servers'
+      context has its station (`rds_callback_ctx_t.station`); the XDR-GTK /
+      RDS Spy tune, the scan retune, the ASCII-G tune (its context was
+      NULL) and the rigctl callbacks (their argument is the station now,
+      was its radio) change and read that station, not the global `st`;
+      station_exit() removes the paging FIFO only when this station made
+      it (behaviour change: a station without paging no longer removes
+      what is at its FIFO path, the default /tmp/rds_paging_send of
+      another osmoradio included). Settings and running state stay in one
+      `station_t`: the defaults' running part is never started (zeros),
+      a station starts as a copy of it, so the split buys nothing but a
+      bigger diff. Proof: suite.sh 12 the same, opts.sh, extra3c.sh as
+      before, against 89ff013; extra5a.sh: RDS Spy tune to 101 MHz,
+      rigctl `F 102000000` then `f` (RX), ASCII-G tune to 103 MHz (TX):
+      the same SDR calls (sdr_set_rx_frequency 101 / 102 MHz,
+      sdr_set_tx_frequency 103 MHz) and logs (incl. "Leaving 101.0 MHz":
+      rigctl sees the frequency RDS Spy set), a file at the FIFO path of a
+      station without paging: 89ff013 removes it, now kept. The suite runs
+      a case once more when the TX IQ differs: RDS CT (4A) carries the wall
+      clock minute, A and B on both sides of a minute edge differed once.
+      Not covered: the XDR-GTK scan retune (same change as the tune).
+      Found (parked, before and after alike): rigctl `f` after an RDS Spy
+      tune still says 100 MHz - the rigctl server keeps its own copy of the
+      frequency, the tune of another server does not reach it.
+   b. each kind its own options (the table, the check after parsing).
+   c. N stations: several `-f`, the loop over them, the SDR bands.
+   d. the proof: FM stereo + RDS, AM, NFM together offline.
 6. The wide bank (in-process from the station list, backend option).
 7. Per-station retune.
 8. B210 run (cable loopback), after asking.
