@@ -167,7 +167,37 @@ paging case runs 12 s
    biphase table leaked, the RDS bitstream file lost its last byte; the
    suite counts LeakSanitizer reports now.
 4. libsdr band API; offline test with three bands at different rates
-   (engine in-process and two clients on a backend).
+   (engine in-process and two clients on a backend) (done):
+   src/libsdr/sdr_bands.[ch]. `sdr_bands_engine(b, engine, rx_centre,
+   tx_centre)` (in-process: the engine of an SDR opened in server mode)
+   or `sdr_bands_backend(b, socket)`, then `sdr_band_add(b, def)` per band
+   (name, RX / TX flags, frequencies, IQ rate, buffer size; returns the
+   index or the reason) - one engine group, or one backend registration,
+   with one RX and / or one TX channel; `sdr_band_read()` /
+   `_write()` / `_tosend()` by index, interleaved float IQ as osmoradio
+   has it, TX scaled to the band's level (1 / N max), rings and TX target
+   as sdr.c's band client; read returns -EPERM when the backend is gone;
+   `sdr_bands_close()`. The API hangs on a bands object, not on the sdr
+   handle: `sdr_band_add(sdr, ...)` becomes a thin wrapper in sdr.c in
+   step 5. Proof: src/test/test_sdr_bands (null device, TX looped to RX,
+   real time, ASan + UBSan clean): AM 48 k at -300 kHz and NFM 24 k at
+   +250 kHz on the bank, FM 240 k at +600 kHz on the chain, one loop over
+   the three; the same body in-process and on the backend: every band
+   all its rows (rate x 0.8 s), own tone 0.000 dB, its mirror <= -166 dB
+   (I / Q order), the other bands' tones <= -166 dB, 0 TX rows missing /
+   RX rows dropped; refusals: a band outside the SDR band, without
+   direction, a third TX band on an engine for two, a chain band over
+   SDR_ENGINE_MAX_CHAIN, a read above the buffer size or of a band not
+   there; nothing left on the engine / backend after close; the backend
+   stopping while a band is registered: read -EPERM. test_sdr_engine and
+   test_sdr_backend pass as before. For step 5: close the bands before
+   sdr_close() (the engine frees its groups at exit; removing a group of
+   stopped device threads waits 2 s and leaks it), i.e. not in
+   station_exit() after sdr_close(); osmoradio's loop calls
+   sdr_server_poll() (the raw ring, RX status); each station sends at
+   1 / N of full scale; server mode refuses when no bank fits, so a set
+   of FM stations only still builds a bank - measure its cost; sdr.c's
+   band client branch duplicates sdr_bands (one of them goes).
 5. N stations: offline (IQ files / engine loop) FM stereo + RDS, AM, NFM
    through the engine and back: SINAD per station, each station's own
    PI / PS decoded, none leaking into another.

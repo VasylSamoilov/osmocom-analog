@@ -18,6 +18,7 @@ noinst_PROGRAMS = \
 	test_channelizer \
 	test_sdr_engine \
 	test_sdr_backend \
+	test_sdr_bands \
 	test_echo_analysis \
 	test_echo_analysis_edge_cases \
 	test_echo_analysis_final_checkpoint \
@@ -217,6 +218,16 @@ test_sdr_engine_SOURCES = test_sdr_engine.c
 test_sdr_backend_SOURCES = test_sdr_backend.c
 
 test_sdr_backend_LDADD = \
+	$(COMMON_LA) \
+	$(top_builddir)/src/libsdr/libsdr.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	-lpthread \
+	-lm
+
+test_sdr_bands_SOURCES = test_sdr_bands.c
+
+test_sdr_bands_LDADD = \
 	$(COMMON_LA) \
 	$(top_builddir)/src/libsdr/libsdr.a \
 	$(top_builddir)/src/libchannelizer/libchannelizer.a \
