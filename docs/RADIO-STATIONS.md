@@ -408,13 +408,33 @@ paging case runs 12 s
    480 k bands, 0 given, the old -1 MHz; the device's DC in the band
    128 - 178 dB below the tone when moved, no room (480 k at 0.96 MS/s):
    centred with the notice. The fake-SDR osmoradio suites the same (they
-   do not run sdr.c). Not proven: where the spur lands on a real device
-   (B210 run, slice 8); tv and dcf77 (band programs, no test here: their
-   rates and the shift only logged); the analog bandwidth with the LO
-   beyond half the rate (the B210 runs gave --sdr-bandwidth 3000000; the
-   default bandwidth = the rate is unchanged); SDR-rate IQ recordings
-   made with a centred band (--read-iq-*-wave) now play with the band
-   shifted on SoapySDR.
+   do not run sdr.c). On the devices (2026-11-26, the user: "you can test
+   with real uhd and rtl-sdr"): B210, cable loopback, 1.92 MS/s, TX 60 /
+   RX 10, the real sdr.c + uhd.c (~/.cache/sdrangel-rp-rates/lo/b210_bw:
+   one band at the full rate, a tone stepped -900 .. +900 kHz): the analog
+   filter is centred on the LO, so with the automatic offset (LO 1.04 MHz
+   below) and the bandwidth = the rate the band fell by 17.5 dB from -750
+   to +750 kHz (21 dB below 4 MHz at +750 kHz), 3 MHz still 2.5 dB, 4 MHz
+   flat within 1.8 dB - the rule bandwidth >= rate + 2 |offset| (also the
+   2026-11-22 NMT finding at 200 kHz): e7be8ab makes it the default where
+   the LO is outside the stream (a bandwidth given stays as given), the
+   default then flat within 1.9 dB. The absolute level varies by up to
+   9 dB from one device open to the next (the same 4 MHz: -33.1 / -38.4 /
+   -36.6 dBFS), only the shape within a run counts; 5 MHz given: flat,
+   10 dB lower (not looked at). With no offset (0) a tone at the centre
+   came back at -91.5 dBFS instead of about -34: the B210's DC correction
+   notches the centre - the channels must stay off it. RTL-SDR (SoapySDR,
+   no tuning stage: the LO offset dropped, as before): B210 sends FM mono
+   + 1 kHz at 465.70 MHz, the RTL receives with osmoradio (rtl_ab.sh,
+   1.92 MS/s, gain 20): a92edd3 (band centred on the RTL's DC) 47.9 /
+   48.0 / 47.9 dB SINAD, now (the band 196.8 kHz off the DC) 59.5 / 59.4
+   / 59.6 dB, both orders. The B210 TX of a92edd3 vs now (received by the
+   RTL, now): 59.5 / 59.5 dB both - the RTL's limit. Not proven: tv and
+   dcf77 (band programs, no test here: their rates and the shift only
+   logged); SoapySDR devices with a tuning stage (the offset applied: the
+   band is moved too, harmless) - none here; SDR-rate IQ recordings made
+   with a centred band (--read-iq-*-wave) now play with the band shifted
+   on SoapySDR.
 6. The wide bank (in-process from the station list, backend option).
 7. Per-station retune.
 8. B210 run (cable loopback), after asking.
