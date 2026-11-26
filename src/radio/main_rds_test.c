@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <unistd.h>
 #include "rds.h"
 #include "../liblogging/logging.h"
 
@@ -265,12 +266,13 @@ int main(int argc, char *argv[])
 		/* Init decoder: fed groups and bits only, no demodulator (and no
 		 * emphasis, so no emphasis / mode mismatch notices) */
 		rc = rds_decoder_init_groups(&rds, rds_debug, rds_verbose, force_rbds);
-		/* Apply --ansi / --no-ansi override after init (init sets from isatty) */
+		/* The panel's colour: a terminal, --ansi / --no-ansi, NO_COLOR
+		 * (de-facto standard) */
+		int ansi = isatty(fileno(stdout));
 		if (ansi_override >= 0)
-			rds.ansi_display = ansi_override;
-		/* Respect NO_COLOR environment variable (de-facto standard) */
+			ansi = ansi_override;
 		if (getenv("NO_COLOR"))
-			rds.ansi_display = 0;
+			ansi = 0;
 		if (rc) {
 			fprintf(stderr, "Failed to init decoder for %s\n", files[i]);
 			continue;
@@ -292,7 +294,7 @@ int main(int argc, char *argv[])
 		if (groups > 0) {
 			total_groups += groups;
 			/* Compact panel display (to stdout, no log prefix) */
-			rds_decoder_display(&rds, stdout);
+			rds_decoder_display(&rds, ansi, stdout);
 			/* Full detail dump (to log, gated by log level) */
 			rds_decoder_status(&rds);
 		}

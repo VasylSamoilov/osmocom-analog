@@ -12477,8 +12477,6 @@ int rds_decoder_init(rds_decoder_t *rds, double samplerate, int debug, int verbo
 	rds->force_rbds = force_rbds;
 	rds->time_constant_us = time_constant_us;
 
-	/* Display defaults: colour if stdout is a tty */
-	rds->ansi_display    = isatty(fileno(stdout));
 
 	/* Log emphasis/mode mismatch hints once at startup.
 	 * Do NOT auto-set ECC -- let the actual ECC from Group 1A determine the mode.
@@ -12561,7 +12559,6 @@ void rds_decoder_reset(rds_decoder_t *rds)
 	 * (files, callbacks) and the DSP continuity stay (rds.h) */
 	memset((char *)rds + kept, 0, sizeof(*rds) - kept);
 
-	rds->ansi_display    = isatty(fileno(stdout));
 	/* a new station: the sink's display shows it from the start */
 	if (rds->sink.new_station)
 		rds->sink.new_station(rds->sink.arg, rds);
@@ -13038,10 +13035,11 @@ static void rds_decoder_reports(rds_decoder_t *rds)
 		rds->sig_eye_weak = 0;
 	}
 	
-	/* Output status */
+	/* the status report time (every 30 s of signal): the sink's */
 	if (rds->status_timer >= rds->status_interval) {
 		rds->status_timer = 0;
-		rds_decoder_status(rds);
+		if (rds->sink.report)
+			rds->sink.report(rds->sink.arg, rds);
 	}
 }
 int rds_dec_get_pi(rds_decoder_t *rds, uint16_t *pi)
@@ -13136,21 +13134,20 @@ uint16_t rds_dec_get_slc_broadcaster(const rds_decoder_t *rds)
  *  | Groups: 0A:47.2%  2A:36.8%  1A:3.4%  10A:0.7%  ...    |
  *  +---------------------------------------------------------+
  *
- * ANSI colour: enabled when rds->ansi_display = 1 (set from isatty
- * at decoder_init, overridable by the application).
+ * ANSI colour: when ansi is 1 (the caller's choice, e.g. isatty).
  * ============================================================ */
-void rds_decoder_display(const rds_decoder_t *rds, FILE *fp)
+void rds_decoder_display(const rds_decoder_t *rds, int ansi, FILE *fp)
 {
 	if (!rds || !fp) return;
 
 /* ANSI helpers (pure ASCII escape sequences, safe in C string literals) */
-#define ANSI_BOLD    (rds->ansi_display ? "\033[1m"    : "")
-#define ANSI_DIM     (rds->ansi_display ? "\033[2m"    : "")
-#define ANSI_GREEN   (rds->ansi_display ? "\033[32m"   : "")
-#define ANSI_YELLOW  (rds->ansi_display ? "\033[33m"   : "")
-#define ANSI_CYAN    (rds->ansi_display ? "\033[36m"   : "")
-#define ANSI_RED     (rds->ansi_display ? "\033[31m"   : "")
-#define ANSI_RESET   (rds->ansi_display ? "\033[0m"    : "")
+#define ANSI_BOLD    (ansi ? "\033[1m"    : "")
+#define ANSI_DIM     (ansi ? "\033[2m"    : "")
+#define ANSI_GREEN   (ansi ? "\033[32m"   : "")
+#define ANSI_YELLOW  (ansi ? "\033[33m"   : "")
+#define ANSI_CYAN    (ansi ? "\033[36m"   : "")
+#define ANSI_RED     (ansi ? "\033[31m"   : "")
+#define ANSI_RESET   (ansi ? "\033[0m"    : "")
 
 	const char *sep = "+--------------------------------------------------------"
 	                  "---------------------+";
@@ -13252,8 +13249,8 @@ void rds_decoder_display(const rds_decoder_t *rds, FILE *fp)
 
 	/* --- Line 4: DI flags --- */
 	{
-#define DI_CHR(v)  ((v) ? (rds->ansi_display ? "\033[32mS\033[0m" : "S") : \
-                           (rds->ansi_display ? "\033[2m_\033[0m" : "_"))
+#define DI_CHR(v)  ((v) ? (ansi ? "\033[32mS\033[0m" : "S") : \
+                           (ansi ? "\033[2m_\033[0m" : "_"))
 		fprintf(fp, "| %sDI:%s [%s] Has stereo  [%s] Artificial head"
 		            "  [%s] Compressed  [%s] Dynamic PTY"
 		            "                  |\n",
@@ -13937,6 +13934,13 @@ static void rds_rx_app_new_station(void *arg, const rds_decoder_t *rds)
 	rds_display_new_station(&app->shown);
 }
 
+/* the periodic status report: the status dump */
+static void rds_rx_app_report(void *arg, const rds_decoder_t *rds)
+{
+	(void)arg;
+	rds_decoder_status(rds);
+}
+
 void rds_rx_app_init(rds_rx_app_t *app)
 {
 	memset(app, 0, sizeof(*app));
@@ -13955,6 +13959,7 @@ void rds_rx_app_attach(rds_rx_app_t *app, rds_decoder_t *rds)
 		.ih = rds_rx_app_ih,
 		.tmc = rds_rx_app_tmc,
 		.new_station = rds_rx_app_new_station,
+		.report = rds_rx_app_report,
 		.arg = app,
 	};
 

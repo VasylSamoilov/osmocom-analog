@@ -2593,6 +2593,8 @@ typedef struct rds_decoder_sink {
 	void	(*ih)(void *arg, uint8_t b_payload, int is_6b, uint16_t c_data, uint16_t d_data);
 	void	(*tmc)(void *arg, const rds_tmc_msg_t *msg);
 	void	(*new_station)(void *arg, const struct rds_decoder *rds);
+	/* every 30 s of signal: time for a status report */
+	void	(*report)(void *arg, const struct rds_decoder *rds);
 	void	*arg;
 } rds_decoder_sink_t;
 
@@ -2811,8 +2813,6 @@ typedef struct rds_decoder {
 	time_t		ct_utc_timestamp;	/* Decoded CT as unix timestamp (UTC) */
 	time_t		ct_rx_sys_time;		/* System time(NULL) when CT was received */
 
-	/* Display options */
-	int		ansi_display;		/* 1 = ANSI colour in rds_decoder_display() */
 	
 	/* Group 10A: Programme Type Name (IEC 62106 S6.1.5.8) */
 	char		ptyn[9];		/* PTY Name (8 chars) */
@@ -3015,9 +3015,8 @@ int rds_dec_paging_get_last_msg(const rds_decoder_t *rds,
 void rds_decoder_status(const rds_decoder_t *rds);
 /* rds_decoder_display() -- formatted one-page RDS status panel.
  * Writes to fp (e.g. stdout) without any log prefix.
- * Respects rds->ansi_display for ANSI colour (set from isatty at init,
- * or override manually). Pure ASCII fallback when ansi_display=0. */
-void rds_decoder_display(const rds_decoder_t *rds, FILE *fp);
+ * ansi 1: ANSI colour (the caller's choice, e.g. isatty); 0: pure ASCII. */
+void rds_decoder_display(const rds_decoder_t *rds, int ansi, FILE *fp);
 
 /* Reset decoder state for new station (clears PI, PS, RT, stats, keeps DSP config) */
 /* a decoder fed only groups or bits, no demodulator (no sample rate) */
