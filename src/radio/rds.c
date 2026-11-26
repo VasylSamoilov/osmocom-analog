@@ -36,6 +36,7 @@
 /* Forward declaration for encoder loopback verification */
 
 static void rds_decode_group(rds_decoder_t *rds);
+static void rds_changed(rds_decoder_t *rds, enum rds_change what);
 
 /* Forward declaration for dynamic PS cycle tracking */
 void rds_dps_on_ps_cycle_complete(rds_encoder_t *rds);
@@ -9703,8 +9704,9 @@ static void rds_paging_dec_detect(rds_decoder_t *rds, uint8_t rpc, uint16_t b3)
 			rds->paging_seen = RDS_RX_PAGING_CONFIRM;
 		if (rds->paging_seen >= RDS_RX_PAGING_CONFIRM && !rds->paging_enabled) {
 			rds->paging_enabled = 1;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: station signals paging (designation %d, OPC %s), 7A / 13A decoded as paging\n",
-			     desig, opc_ok ? (opc ? "set" : "0") : "not seen");
+			rds->paging_detect_desig = desig;
+			rds->paging_detect_opc = opc_ok ? (opc ? 1 : 0) : -1;
+			rds_changed(rds, RDS_CHANGE_PAGING_DETECTED);
 		}
 	} else {
 		rds->paging_seen = (rds->paging_seen < 0) ? rds->paging_seen - 1 : -1;
@@ -9712,7 +9714,7 @@ static void rds_paging_dec_detect(rds_decoder_t *rds, uint8_t rpc, uint16_t b3)
 			rds->paging_enabled = 0;
 			rds->paging_dec.rpc_valid = 0;
 			rds->paging_dec.opc_valid = 0;
-			LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: station no longer signals paging (designation 0, OPC 0)\n");
+			rds_changed(rds, RDS_CHANGE_PAGING_LOST);
 		}
 	}
 	if (rds->paging_seen > RDS_RX_PAGING_CONFIRM)
@@ -9799,6 +9801,13 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 		break;
 	case RDS_CHANGE_CT:
 #if defined(__GLIBC__) || defined(__linux__)
+		/* the received time against the system's, every 4A (DEBUG) */
+		{
+			double delta = difftime(rds->ct_utc_timestamp, rds->ct_rx_sys_time);
+
+			LOGP(DRADIO, LOGL_DEBUG, "RDS 4A: Time Delta: RX (UTC) is %.0f seconds %s system time\n",
+			     fabs(delta), (delta >= 0) ? "ahead of" : "behind");
+		}
 		/* the user-readable report only when the displayed minute changes
 		 * -- avoids one INFO line per 4A group (dozens/hour) */
 		if (rds->ct_hour != shown->ct_hour || rds->ct_minute != shown->ct_minute) {
@@ -9853,6 +9862,14 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 			LOGP(DRADIO, LOGL_INFO, "RDS RT: \"%s\" (2A, A/B=%c)\n",
 			     rt_disp, rds->rt_2a_ab ? 'B' : 'A');
 		}
+		break;
+	case RDS_CHANGE_PAGING_DETECTED:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: station signals paging (designation %d, OPC %s), 7A / 13A decoded as paging\n",
+		     rds->paging_detect_desig,
+		     (rds->paging_detect_opc < 0) ? "not seen" : (rds->paging_detect_opc ? "set" : "0"));
+		break;
+	case RDS_CHANGE_PAGING_LOST:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: station no longer signals paging (designation 0, OPC 0)\n");
 		break;
 	case RDS_CHANGE_PAGING_RPC: {
 		char rpc_buf[80];
@@ -10840,14 +10857,7 @@ static void rds_decode_group(rds_decoder_t *rds)
 				rds->ct_utc_timestamp = rx_utc;
 				rds->ct_rx_sys_time = sys_now;
 
-#if defined(__GLIBC__) || defined(__linux__)
-				double delta = difftime(rx_utc, sys_now);
-
-				/* Demote raw time-delta to DEBUG -- it repeats every 4A group */
-				LOGP(DRADIO, LOGL_DEBUG, "RDS 4A: Time Delta: RX (UTC) is %.0f seconds %s system time\n",
-				     fabs(delta), (delta >= 0) ? "ahead of" : "behind");
-
-#endif
+				/* (the time delta to the system: the display's) */
 				rds_changed(rds, RDS_CHANGE_CT);
 			} else {
 				if (rds->debug)

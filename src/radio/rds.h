@@ -2564,6 +2564,9 @@ enum rds_change {
 	RDS_CHANGE_LPS,		/* a 15A while the long PS is complete (rds->long_ps) */
 	RDS_CHANGE_RT_2A_END,	/* a 2A A/B flip: the RadioText so far (rds->rt_2a, rt_2a_ab)
 				 * is done, before the new one clears it */
+	/* receiver paging auto: the station signals paging (paging_detect_*) / no longer */
+	RDS_CHANGE_PAGING_DETECTED,
+	RDS_CHANGE_PAGING_LOST,
 	/* the station's paging system (rds->paging_dec), each when it changes */
 	RDS_CHANGE_PAGING_RPC,	/* 1A block B: group designation (rpc) */
 	RDS_CHANGE_PAGING_SI0,	/* 1A block D sub type 0: PAC, OPC (si_pac, si_opc) */
@@ -2853,6 +2856,8 @@ typedef struct rds_decoder {
 						 * the station signals paging (1A RPC) */
 	int		paging_seen;		/* auto: 1A in a row signalling paging (> 0)
 						 * or none (< 0) */
+	int		paging_detect_desig;	/* auto: the designation it was detected on */
+	int		paging_detect_opc;	/* auto: its OPC 0 / set 1 / not seen -1 */
 	rds_paging_dec_t paging_dec;		/* Paging decoder state */
 	
 	/* Status timing */
