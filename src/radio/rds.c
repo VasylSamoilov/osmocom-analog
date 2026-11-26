@@ -9745,6 +9745,32 @@ static void rds_display_changed(const rds_decoder_t *rds, struct rds_display_sho
 			     rt_disp, rds->rt_2a_ab ? 'B' : 'A');
 		}
 		break;
+	case RDS_CHANGE_PAGING_RPC: {
+		char rpc_buf[80];
+
+		LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Paging detected: %s\n",
+		     rds_paging_rpc_desc(rds->paging_dec.rpc, rpc_buf, sizeof(rpc_buf)));
+		break;
+	}
+	case RDS_CHANGE_PAGING_SI0:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: block D SI sub type 0: PAC=%u%s OPC=%u%s\n",
+		     rds->paging_dec.si_pac, rds->paging_dec.si_pac ? "" : " (all areas)",
+		     rds->paging_dec.si_opc, rds->paging_dec.si_opc ? "" : " (no enhanced paging)");
+		break;
+	case RDS_CHANGE_PAGING_SI1:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: block D SI sub type 1: ECC=0x%02X (%s)\n",
+		     rds->paging_dec.si_ecc, rds_get_ecc_name(rds->paging_dec.si_ecc));
+		break;
+	case RDS_CHANGE_PAGING_OPC:
+		if (rds->paging_dec.opc != 0)
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Enhanced paging detected: OPC=%d\n", rds->paging_dec.opc);
+		else
+			LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: No enhanced paging (OPC=0)\n");
+		break;
+	case RDS_CHANGE_PAGING_PAC:
+		LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Paging area: PAC=%d%s\n",
+		     rds->paging_dec.pac, rds->paging_dec.pac ? "" : " (all areas)");
+		break;
 	case RDS_CHANGE_ECC:
 		/* ECC vs mode mismatch (once, only for valid ECCs) */
 		if (!shown->ecc_mismatch && rds_is_valid_ecc(rds->ecc)) {
@@ -10190,11 +10216,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 				pd->rpc_valid = 1;
 				/* B1/B0 change from 1A to 1A (interval sync), so only a
 				 * change of the group designation is reported */
-				if (!was_valid || old_desig != pd->rpc_group_desig) {
-					char rpc_buf[80];
-					LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Paging detected: %s\n",
-					     rds_paging_rpc_desc(pd->rpc, rpc_buf, sizeof(rpc_buf)));
-				} else if (rds->debug)
+				if (!was_valid || old_desig != pd->rpc_group_desig)
+					rds_changed(rds, RDS_CHANGE_PAGING_RPC);
+				else if (rds->debug)
 					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: RPC=%d B1=%d B0=%d\n", pd->rpc,
 					     (pd->rpc_batt_sync >> 1) & 1, pd->rpc_batt_sync & 1);
 				if (rds->block_status[1] <= RDS_STATUS_CORRECTED)
@@ -10271,13 +10295,13 @@ static void rds_decode_group(rds_decoder_t *rds)
 
 				if (!(b4 & (1 << 10))) {
 					uint8_t pac = (b4 >> 4) & 0x3F, opc = b4 & 0x0F;
+					int changed = !(pd->si_valid & 1) || pd->si_pac != pac || pd->si_opc != opc;
 
-					if (!(pd->si_valid & 1) || pd->si_pac != pac || pd->si_opc != opc)
-						LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: block D SI sub type 0: PAC=%u%s OPC=%u%s\n",
-						     pac, pac ? "" : " (all areas)", opc, opc ? "" : " (no enhanced paging)");
 					pd->si_pac = pac;
 					pd->si_opc = opc;
 					pd->si_valid |= 1;
+					if (changed)
+						rds_changed(rds, RDS_CHANGE_PAGING_SI0);
 					/* OPC in block 4 as in blocks 3 of variants 0/2 (M.3.2.5.2) */
 					pd->opc = opc;
 					pd->opc_valid = 1;
@@ -10285,11 +10309,12 @@ static void rds_decode_group(rds_decoder_t *rds)
 					uint8_t usage = (b4 >> 8) & 0x03, val = b4 & 0xFF;
 
 					if (usage == 0) {
-						if (!(pd->si_valid & 2) || pd->si_ecc != val)
-							LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: block D SI sub type 1: ECC=0x%02X (%s)\n",
-							     val, rds_get_ecc_name(val));
+						int changed = !(pd->si_valid & 2) || pd->si_ecc != val;
+
 						pd->si_ecc = val;
 						pd->si_valid |= 2;
+						if (changed)
+							rds_changed(rds, RDS_CHANGE_PAGING_SI1);
 						/* same ECC as 1A variant 0 (M.3.2.5.2.1: ECC in block 4) */
 						rds->ecc = val;
 						rds->ecc_status = rds->block_status[3];
@@ -10347,12 +10372,9 @@ static void rds_decode_group(rds_decoder_t *rds)
 					if (rds->paging_enabled) {
 						rds_paging_dec_t *pd = &rds->paging_dec;
 						if (!pd->opc_valid || pd->opc != opc_val) {
-							if (opc_val != 0)
-								LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Enhanced paging detected: OPC=%d\n", opc_val);
-							else
-								LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: No enhanced paging (OPC=0)\n");
 							pd->opc = opc_val;
 							pd->opc_valid = 1;
+							rds_changed(rds, RDS_CHANGE_PAGING_OPC);
 						}
 					}
 					if (rds->debug)
@@ -10410,19 +10432,15 @@ static void rds_decode_group(rds_decoder_t *rds)
 					rds->paging_id_status = rds->block_status[2];
 					/* Track OPC state change */
 					if (!pd->opc_valid || pd->opc != opc_val) {
-						if (opc_val != 0)
-							LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Enhanced paging detected: OPC=%d\n", opc_val);
-						else
-							LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: No enhanced paging (OPC=0)\n");
 						pd->opc = opc_val;
 						pd->opc_valid = 1;
+						rds_changed(rds, RDS_CHANGE_PAGING_OPC);
 					}
 					/* Track PAC state change */
 					if (!pd->pac_valid || pd->pac != pac_val) {
-						LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: Paging area: PAC=%d%s\n",
-						     pac_val, pac_val ? "" : " (all areas)");
 						pd->pac = pac_val;
 						pd->pac_valid = 1;
+						rds_changed(rds, RDS_CHANGE_PAGING_PAC);
 					}
 					if (rds->debug)
 						LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Paging OPC=%d PAC=%d LA=%d\n",

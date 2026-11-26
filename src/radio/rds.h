@@ -2513,6 +2513,12 @@ enum rds_change {
 	RDS_CHANGE_PS,		/* a complete PS other than the last one (rds->ps, ps_changes) */
 	RDS_CHANGE_RT_2A_END,	/* a 2A A/B flip: the RadioText so far (rds->rt_2a, rt_2a_ab)
 				 * is done, before the new one clears it */
+	/* the station's paging system (rds->paging_dec), each when it changes */
+	RDS_CHANGE_PAGING_RPC,	/* 1A block B: group designation (rpc) */
+	RDS_CHANGE_PAGING_SI0,	/* 1A block D sub type 0: PAC, OPC (si_pac, si_opc) */
+	RDS_CHANGE_PAGING_SI1,	/* 1A block D sub type 1: ECC (si_ecc) */
+	RDS_CHANGE_PAGING_OPC,	/* 1A variant 0 / 2: OPC (opc) */
+	RDS_CHANGE_PAGING_PAC,	/* 1A variant 2: PAC (pac) */
 };
 
 struct rds_decoder;
