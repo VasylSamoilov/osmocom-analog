@@ -42,6 +42,7 @@ imts_dialer_LDADD = \
 	$(top_builddir)/src/libsample/libsample.a \
 	$(top_builddir)/src/liblogging/liblogging.a \
 	$(LIBOSMOCORE_LIBS) \
+	$(LIBOSMOCC_LIBS) \
 	-lm
 
 if HAVE_ALSA
