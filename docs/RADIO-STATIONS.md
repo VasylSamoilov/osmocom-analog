@@ -312,35 +312,72 @@ paging case runs 12 s
       1.92 MS/s (centre 100.0145 MHz, moved off the AM station): S1 FM
       stereo + RDS PI 5A12 99.6 MHz (480 k, chain), S2 FM mono + RDS PI
       5B34 100.4 MHz (480 k, chain), S3 AM 100.0 MHz (48 k, bank), S4 NFM
-      99.9 MHz (48 k, bank), each a 1 kHz tone, TX + RX of itself. The same
-      command every run, only who sends changes. SINAD (dB) with one
-      station sending / all four / all four again / all four with white
-      noise at -50 dBFS: S1 55.5 / 55.5 / 55.5 / 52.0 (L and R alike), S2
-      71.1 / 71.1 / 71.1 / 69.8, S3 73.1 / 73.0 / 73.0 / 50.3, S4 41.8 /
-      41.8 / 41.8 / 41.7. RDS: S1 decodes only 5A12, S2 only 5B34, in
-      every run. Negative control, S2 not sending: no RDS groups for S2;
-      with noise its audio is noise (no 1 kHz, SINAD -33.8 dB); without
-      noise its FM limiter makes audio of what is left of the others
-      (about -100 dB) - in a band of exact zeros only. No band reported TX
-      rows missing / RX rows dropped (osmoradio reports them per band once
-      a second when they change, as sdr.c does for its channels).
-      ASan / UBSan clean. The alone reference is this, not one station
-      through IQ files: the wave reader thread (real time) against an IQ
-      file made faster than real time, or paced by the wall clock, drifts
-      (the tone at 999.9 Hz, 42 dB): no reference. Changed on the way: the
-      SNR of several stations is not the SDR's RX status - its noise floor
-      is the histogram of the whole band, the other stations in it, it
-      would force mono; the SNR stays unknown (the stereo blend then
-      follows the program, the content cap: an L / R test tone pair is
-      blended, so separation is not measured here). Found (parked):
-      without noise, a station's RDS block A fails for about 5.5 s after
-      the start (groups 4 - 66), also when it is the only sender; with
-      noise every group decodes. Without noise, S1 came out twice in
-      about ten runs at 41.4 dB with L at 999.9 Hz and R at 1000.1 Hz (a
-      slow phase drift between them: the stereo decoder; other runs
-      55.5 dB). A per-station spectral measurement (noise floor: the SNR,
-      the stereo blend, the XDR-GTK / rigctl levels) - today one per
-      process, the single station's.
+      99.9 MHz (48 k, bank); each its own tone (700, 1000, 1300, 1900 Hz:
+      another station's audio in it would be seen), TX + RX of itself. The
+      same command every run, only who sends changes. The meter (xtalk.py):
+      the tone fitted by least squares and subtracted, the rest from 100 Hz
+      to the band edge; the other tones by their fitted amplitude. (The
+      first meter, an FFT with a Hann window and +- 3 bins, read 42 dB
+      whenever the half file was not a whole number of bins - 13.999 s
+      instead of 14.000 s: window leakage, not the radio; every "42 dB" and
+      "999.9 Hz" seen with it was that.) SINAD (dB), one station sending /
+      all four / all four again / all four with white noise at -50 dBFS:
+      S1 55.4 / 55.4 / 55.4 / 51.9 (L and R alike), S2 71.1 / 71.1 / 71.1
+      / 69.8, S3 77.3 / 77.4 / 77.4 / 50.5, S4 96.1 / 94.9 / 94.7 / 61.3.
+      The other stations' tones in each: -75 .. -90 dB below its own, and
+      the same to 0.1 dB when they do not send (S1 alone: -76.3 / -82.1 /
+      -89.5 dB, all four: the same): the station's own residual, the
+      crosstalk is below it. A station's TX in the others' bands (SDR rate
+      IQ, S1 sending alone, a Blackman window: upper bounds): -145 dB in
+      S2's band, -163 dB in S3's, -176 dB in S4's, -127 dB at its own
+      mirror. RDS: S1 decodes only 5A12, S2 only 5B34, in every run.
+      Negative control, S2 not sending: no RDS groups for S2; with noise
+      its audio is noise (every tone within 4 dB of it); without noise
+      its FM limiter makes audio of the others' trace (the -145 dB) - in a
+      noise-free loop only. No band reported TX rows missing / RX rows
+      dropped (osmoradio reports them per band once a second when they
+      change, as sdr.c does for its channels). ASan / UBSan clean.
+      On the SDR backend (backend5.sh: osmo-sdr-backend built on
+      fake_sdr.c, the real engine and the looped device; osmoradio a
+      separate process with --sdr-backend): the four stations registered
+      (4 programs) and removed at the end; SINAD 55.4 / 71.1 / 77.4 /
+      95.6 dB, the same residual at the others' tones, each only its PI;
+      both processes ASan clean. Servers and paging per station
+      (extra5c.sh): two FM + RDS paging stations, each its RDS Spy port and
+      FIFO - each RDS Spy client only its PI (34 x 5A12 / 34 x 5B34), a page
+      into station 1's FIFO: 7A groups in station 1's RDS only; rigctl on
+      station 2: its frequency, a retune refused ("no retune with several
+      stations"); both FIFOs removed at exit. Refusals (opts5c.sh, exit
+      non-zero, nothing sent): the same RDS Spy endpoint, XDR-GTK = rigctl
+      endpoint, the same paging FIFO, audio device, RX wave file, hexrds
+      file, different TMC tables, overlapping bands, 9 stations, a fifth
+      wide station (the chain cap), a station beyond the usable band (75 %
+      of the SDR rate, as sdr.c; added here - a band past Nyquist was
+      taken); the same TX wave (an input) on two stations is fine. An
+      error opening the SDR with several stations exits 1 (one station:
+      0, as before). Changed on the way: the SNR of several stations is
+      not the SDR's RX status - its noise floor is the histogram of the
+      whole band, the other stations in it, it would force mono; the SNR
+      stays unknown (the stereo blend then follows the program, the
+      content cap: an L / R test tone pair is blended, so stereo
+      separation is not measured here - L = R tones). Found (parked):
+      in-process without any noise the first RDS station on the command
+      line (the only one when one sends) has whole groups missing for the
+      encoder's warmup (about 5.5 s, groups 4 - 66), the second not;
+      white noise at -150 dBFS (the audio the same to 0.1 dB) makes every
+      group decode, on the backend every group decodes: the decoder with a
+      signal of no noise at all, not one station on another (the only
+      statics in rds.c are debug counters and read-only tables). The
+      NFM station's SINAD with a 1 kHz tone was 41.8 dB, with 1900 Hz
+      95 dB: its harmonics of 1 kHz fall in its 3 kHz band (not looked
+      at). Open: a per-station spectral measurement (noise floor: the
+      SNR, the stereo blend, the XDR-GTK / rigctl levels) - today one per
+      process, the single station's; a PS per station: there is no PS
+      option (the PS comes from the preset), so both FM stations send the
+      same PS and PS separation is not checked; on --sdr-backend the
+      usable band is the backend's (osmoradio does not know its rate);
+      for slice 8: where the LO offset (-1 MHz default) puts the DC / LO
+      spur in server mode.
 6. The wide bank (in-process from the station list, backend option).
 7. Per-station retune.
 8. B210 run (cable loopback), after asking.

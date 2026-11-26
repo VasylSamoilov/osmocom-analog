@@ -2455,6 +2455,18 @@ static int stations_sdr_open(void **sdr_p, int any_rx, int any_tx)
 		sdr_engine_t *e;
 
 		LOGP(DSDR, LOGL_NOTICE, "%d stations on one SDR, centre %.6f MHz\n", num_stations, centre / 1e6);
+		/* the usable band: 75 % of the SDR rate (as sdr.c), no filter
+		 * is perfect; beyond it a band aliases */
+		for (i = 0; i < num_stations; i++) {
+			station_t *s = &stations[i];
+
+			if (fabs(s->frequency - centre) + s->baseband_extent > 0.375 * sdr_config->samplerate) {
+				fprintf(stderr, "Station %d (%.4f MHz, %.0f kHz wide): beyond the usable band of the SDR (%.4f .. %.4f MHz at %d S/s), use '-h' for help!\n",
+					i + 1, s->frequency / 1e6, 2.0 * s->baseband_extent / 1e3,
+					(centre - 0.375 * sdr_config->samplerate) / 1e6, (centre + 0.375 * sdr_config->samplerate) / 1e6, sdr_config->samplerate);
+				return -EINVAL;
+			}
+		}
 		sdr_server_mode(ntx ? ntx : 1);
 		*sdr_p = sdr_open(0, NULL, any_tx ? &centre : NULL, any_rx ? &centre : NULL, NULL, 0, 0.0,
 				  BANK_DSP_RATE, BANK_DSP_RATE * dsp_buffer / 1000, 1.0, 0.0, 0.0, 1.0);
@@ -2493,7 +2505,7 @@ static int stations_sdr_open(void **sdr_p, int any_rx, int any_tx)
 
 int main(int argc, char *argv[])
 {
-	int rc, argi, si, any_rx = 0, any_tx = 0, num_started = 0;
+	int rc, argi, si, any_rx = 0, any_tx = 0, num_started = 0, exit_rc = 0;
 	struct termios term, term_orig;
 	int c;
 	void *sdr = NULL;
@@ -2606,8 +2618,10 @@ int main(int argc, char *argv[])
 	if (num_stations > 1) {
 		/* a band per station; the spectral measurement is one station's */
 		rc = stations_sdr_open(&sdr, any_rx, any_tx);
-		if (rc < 0)
+		if (rc < 0) {
+			exit_rc = 1;	/* (one station: 0 on an SDR error, as before) */
 			goto error;
+		}
 		if (sdr)
 			sdr_start(sdr);
 	} else {
@@ -2824,7 +2838,7 @@ error:
 
 	options_free();
 
-	return 0;
+	return exit_rc;
 }
 
 void osmo_cc_set_log_cat(int __attribute__((unused)) cc_log_cat) {}
