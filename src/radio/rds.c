@@ -1282,18 +1282,18 @@ static void rds_paging_bs_drop_unfit(rds_paging_queue_t *q, const rds_paging_enc
 	}
 }
 
-/* Keep the queue filled from the scan range; end the scan when the last
- * address has been transmitted. The address is carried in the payload
- * (6 digits) so the pager that responded can be identified. */
-static void rds_paging_scan_service(rds_encoder_t *rds)
+/* Keep the queue filled from the scan range (application); end the scan
+ * when the last address has been transmitted - returns 1 then. The address
+ * is carried in the payload (6 digits) so the pager that responded can be
+ * identified. The protocol (read only) tells which calls fit their window
+ * now and whether a call is on air. */
+static int rds_paging_queue_scan(rds_paging_queue_t *q, const rds_paging_enc_t *pag)
 {
-	rds_paging_enc_t *pag = &rds->paging;
-
-	int groups = rds_paging_scan_groups(&pag->q);
+	int groups = rds_paging_scan_groups(q);
 	int eligible = 0;
 
-	if (!pag->q.scan_active)
-		return;
+	if (!q->scan_active)
+		return 0;
 
 	/* With battery saving the scheduler holds back calls outside their
 	 * interval window, so the queue is filled until enough calls can be
@@ -1301,66 +1301,78 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 	if (pag->battery_saving) {
 		rds_paging_msg_t *m;
 
-		for (m = pag->q.queue_head; m; m = m->next)
+		for (m = q->queue_head; m; m = m->next)
 			if (m->next_send_time <= time(NULL) &&
 			    rds_paging_slot_ok(pag, m->address, m->ngroups ? m->ngroups : groups, NULL))
 				eligible++;
 	}
 
-	while (pag->q.scan_next < pag->q.scan_end) {
+	while (q->scan_next < q->scan_end) {
 		char text[8] = "";
 		int len = 0;
 		rds_paging_msg_t *msg;
 
 		if (pag->battery_saving) {
-			if (eligible >= RDS_PAGING_SCAN_ELIGIBLE || pag->q.queue_count >= RDS_PAGING_SCAN_QUEUE_BS)
+			if (eligible >= RDS_PAGING_SCAN_ELIGIBLE || q->queue_count >= RDS_PAGING_SCAN_QUEUE_BS)
 				break;
-		} else if (pag->q.queue_count >= RDS_PAGING_SCAN_QUEUE) {
+		} else if (q->queue_count >= RDS_PAGING_SCAN_QUEUE) {
 			break;
 		}
 
-		if (pag->q.scan_type == RDS_PAGING_ALPHA && pag->q.scan_alpha_chars == 4)
-			len = snprintf(text, sizeof(text), "%04u", (unsigned)(pag->q.scan_next % 10000));
-		else if (pag->q.scan_type != RDS_PAGING_TONE)
-			len = snprintf(text, sizeof(text), "%06u", (unsigned)pag->q.scan_next);
-		msg = rds_paging_msg_alloc(pag->q.scan_type, pag->q.scan_next, text, len, 0, 0);
+		if (q->scan_type == RDS_PAGING_ALPHA && q->scan_alpha_chars == 4)
+			len = snprintf(text, sizeof(text), "%04u", (unsigned)(q->scan_next % 10000));
+		else if (q->scan_type != RDS_PAGING_TONE)
+			len = snprintf(text, sizeof(text), "%06u", (unsigned)q->scan_next);
+		msg = rds_paging_msg_alloc(q->scan_type, q->scan_next, text, len, 0, 0);
 		if (!msg)
 			break;
-		if (pag->battery_saving && rds_paging_slot_ok(pag, pag->q.scan_next, groups, NULL))
+		if (pag->battery_saving && rds_paging_slot_ok(pag, q->scan_next, groups, NULL))
 			eligible++;
-		rds_paging_enqueue(&pag->q, msg);
-		pag->q.scan_next++;
+		rds_paging_enqueue(q, msg);
+		q->scan_next++;
 	}
 
 	/* Progress every 60 s: addresses completed (not merely queued) */
 	{
 		time_t now = time(NULL);
 
-		if (now - pag->q.scan_log_time >= 60) {
-			uint32_t total = pag->q.scan_end - pag->q.scan_from;
-			uint32_t done = pag->q.scan_next - pag->q.scan_from;
-			double elapsed = difftime(now, pag->q.scan_start_time);
+		if (now - q->scan_log_time >= 60) {
+			uint32_t total = q->scan_end - q->scan_from;
+			uint32_t done = q->scan_next - q->scan_from;
+			double elapsed = difftime(now, q->scan_start_time);
 			double rate, eta;
 
-			done = (done > (uint32_t)pag->q.queue_count) ? done - pag->q.queue_count : 0;
+			done = (done > (uint32_t)q->queue_count) ? done - q->queue_count : 0;
 			rate = (elapsed > 0) ? done / elapsed : 0;
 			eta = (rate > 0) ? (total - done) / rate : 0;
 			char extra[48] = "";
 
-			pag->q.scan_log_time = now;
+			q->scan_log_time = now;
 			if (pag->battery_saving)
-				snprintf(extra, sizeof(extra), ", %lu calls held for their interval", pag->q.bs_deferred);
+				snprintf(extra, sizeof(extra), ", %lu calls held for their interval", q->bs_deferred);
 			LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: %u of %u addresses sent (%.1f%%), queued up to %06u, %.2f addr/s, ETA %uh%02um%s\n",
 			     (unsigned)done, (unsigned)total, 100.0 * done / total,
-			     (unsigned)pag->q.scan_next, rate,
+			     (unsigned)q->scan_next, rate,
 			     (unsigned)(eta / 3600), (unsigned)(eta / 60) % 60, extra);
 		}
 	}
 
-	if (pag->q.scan_next >= pag->q.scan_end && !pag->q.queue_head && !pag->tx_active && !pag->tx_msg) {
+	/* complete: all queued and sent, nothing on air (the protocol) */
+	if (q->scan_next >= q->scan_end && !q->queue_head && !pag->tx_active && !pag->tx_msg) {
 		LOGP(DRADIO, LOGL_NOTICE, "RDS Paging scan: complete\n");
-		pag->q.scan_active = 0;
-		/* the protocol back to its normal schedule */
+		q->scan_active = 0;
+		return 1;
+	}
+	return 0;
+}
+
+/* the scan keeps the queue filled; when it is complete the protocol goes
+ * back to its normal schedule */
+static void rds_paging_scan_service(rds_encoder_t *rds)
+{
+	rds_paging_enc_t *pag = &rds->paging;
+
+	if (rds_paging_queue_scan(&pag->q, pag)) {
 		pag->scan_schedule = 0;
 		rds_enc_scheduler_update(rds);
 	}
@@ -1537,6 +1549,21 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 	rds_paging_sent(rds, 0);
 }
 
+/* A call is sent (application): queued again for its next repeat (R=1, after
+ * its repeat interval) or freed */
+static void rds_paging_queue_done(rds_paging_queue_t *q, rds_paging_msg_t *msg)
+{
+	if (msg->repeats_left > 0) {
+		/* Re-enqueue for retransmission */
+		msg->repeats_left--;
+		msg->is_repeat = 1;  /* R=1 for subsequent transmissions */
+		msg->next_send_time = time(NULL) + msg->repeat_interval;
+		rds_paging_enqueue(q, msg);
+	} else {
+		free(msg);
+	}
+}
+
 /* Called when a message transmission completes (tx_active becomes 0) */
 static void rds_paging_tx_complete(rds_encoder_t *rds)
 {
@@ -1546,19 +1573,9 @@ static void rds_paging_tx_complete(rds_encoder_t *rds)
 	if (!msg)
 		return;
 
-	if (msg->repeats_left > 0) {
-		/* Re-enqueue for retransmission */
-		msg->repeats_left--;
-		msg->is_repeat = 1;  /* R=1 for subsequent transmissions */
-		msg->next_send_time = time(NULL) + msg->repeat_interval;
-		pag->tx_msg = NULL;
-		rds_paging_enqueue(&pag->q, msg);
-	} else {
-		free(msg);
-		pag->tx_msg = NULL;
-	}
-
-	/* Try to start next message */
+	/* the call back to the queue, the protocol starts the next */
+	pag->tx_msg = NULL;
+	rds_paging_queue_done(&pag->q, msg);
 	rds_paging_start_next(rds);
 }
 
