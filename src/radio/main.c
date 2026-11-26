@@ -209,6 +209,10 @@ static void station_log(station_t *s)
 	logging_prefix = s->log_tag;
 }
 
+/* a station's own console lines, with its log tag (station_log()) */
+#define station_printf(fmt, args...) printf("%s" fmt, logging_prefix, ## args)
+#define station_eprintf(fmt, args...) fprintf(stderr, "%s" fmt, logging_prefix, ## args)
+
 /* the initial values of a station's settings */
 static void station_defaults(station_t *s)
 {
@@ -1757,7 +1761,7 @@ static int station_init(station_t *s, void *sdr)
 
 	rc = radio_init(&s->radio, s->buffer_size, s->iq_rate, s->frequency, s->tx_wave_file, s->rx_wave_file, (s->tx) ? s->tx_audiodev : NULL, (s->rx) ? s->rx_audiodev : NULL, s->modulation, s->bandwidth, s->deviation, s->modulation_index, s->time_constant_us, s->volume, s->stereo, s->rds, s->rds2, s->sca_67k, s->sca_92k, s->rds_debug, s->rds_verbose, s->am_compandor, s->fm_compandor, s->rds_force_rbds, &s->radio_opts);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to initialize radio with given options, exitting!\n");
+		station_eprintf("Failed to initialize radio with given options, exitting!\n");
 		exit(0);
 	}
 
@@ -1784,14 +1788,14 @@ static int station_init(station_t *s, void *sdr)
 	if (s->rds_hexrds_file) {
 		rc = rds_decoder_set_hexrds_file(&s->radio.rds_dec, s->rds_hexrds_file);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to open hexrds output file, exitting!\n");
+			station_eprintf("Failed to open hexrds output file, exitting!\n");
 			exit(0);
 		}
 	}
 	if (s->rds_bitstream_file) {
 		rc = rds_decoder_set_bitstream_file(&s->radio.rds_dec, s->rds_bitstream_file);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to open bitstream output file, exitting!\n");
+			station_eprintf("Failed to open bitstream output file, exitting!\n");
 			exit(0);
 		}
 	}
@@ -1800,7 +1804,7 @@ static int station_init(station_t *s, void *sdr)
 	 * When loaded, the RDS 8A decoder logs human-readable event names. */
 	if (s->rds_tmc_events_file) {
 		if (rds_tmc_load_events(s->rds_tmc_events_file) < 0)
-			fprintf(stderr, "Warning: failed to load TMC events from '%s'\n",
+			station_eprintf("Warning: failed to load TMC events from '%s'\n",
 			        s->rds_tmc_events_file);
 	}
 
@@ -1808,32 +1812,32 @@ static int station_init(station_t *s, void *sdr)
 	 * When loaded, the RDS 8A decoder logs human-readable road names. */
 	if (s->rds_tmc_locations_path) {
 		if (rds_tmc_load_locations(s->rds_tmc_locations_path) < 0)
-			fprintf(stderr, "Warning: failed to load TMC locations from '%s'\n",
+			station_eprintf("Warning: failed to load TMC locations from '%s'\n",
 			        s->rds_tmc_locations_path);
 	}
 
 	/* Set up RDS TX file input if requested (bypasses encoder) */
 	if (s->rds_tx_hexrds_file && s->rds_tx_bitstream_file) {
-		fprintf(stderr, "Cannot use both --rds-tx-hexrds-file and --rds-tx-bitstream-file\n");
+		station_eprintf("Cannot use both --rds-tx-hexrds-file and --rds-tx-bitstream-file\n");
 		exit(0);
 	}
 	if (s->rds_tx_hexrds_file) {
 		if (!s->tx) {
-			fprintf(stderr, "Warning: --rds-tx-hexrds-file requires --tx mode\n");
+			station_eprintf("Warning: --rds-tx-hexrds-file requires --tx mode\n");
 		}
 		rc = rds_enc_set_tx_hexrds_file(&s->radio.rds_enc, s->rds_tx_hexrds_file);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to open TX hexrds input file, exitting!\n");
+			station_eprintf("Failed to open TX hexrds input file, exitting!\n");
 			exit(0);
 		}
 	}
 	if (s->rds_tx_bitstream_file) {
 		if (!s->tx) {
-			fprintf(stderr, "Warning: --rds-tx-bitstream-file requires --tx mode\n");
+			station_eprintf("Warning: --rds-tx-bitstream-file requires --tx mode\n");
 		}
 		rc = rds_enc_set_tx_bitstream_file(&s->radio.rds_enc, s->rds_tx_bitstream_file);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to open TX bitstream input file, exitting!\n");
+			station_eprintf("Failed to open TX bitstream input file, exitting!\n");
 			exit(0);
 		}
 	}
@@ -1854,17 +1858,17 @@ static int station_init(station_t *s, void *sdr)
 		unlink(s->rds_paging_pipe_path);
 		rc = mkfifo(s->rds_paging_pipe_path, 0666);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to create paging FIFO '%s': %s\n",
+			station_eprintf("Failed to create paging FIFO '%s': %s\n",
 				s->rds_paging_pipe_path, strerror(errno));
 		} else {
 			s->paging_pipe_made = 1;
 			s->paging_pipe_fd = open(s->rds_paging_pipe_path, O_RDWR | O_NONBLOCK);
 			if (s->paging_pipe_fd < 0)
-				fprintf(stderr, "Failed to open paging FIFO '%s': %s\n",
+				station_eprintf("Failed to open paging FIFO '%s': %s\n",
 					s->rds_paging_pipe_path, strerror(errno));
 			else {
 				char rpc_buf[80];
-				printf("RDS Paging enabled: %s, OPC=%d%s, PAC=%d%s",
+				station_printf("RDS Paging enabled: %s, OPC=%d%s, PAC=%d%s",
 				       rds_paging_rpc_desc(s->rds_paging_rpc, rpc_buf, sizeof(rpc_buf)),
 				       s->rds_paging_opc,
 				       s->rds_paging_opc ? "" : " (no enhanced paging)",
@@ -1882,20 +1886,20 @@ static int station_init(station_t *s, void *sdr)
 
 	if (s->rds_paging_scan) {
 		if (!s->rds_paging) {
-			fprintf(stderr, "--rds-paging-scan requires --rds-paging, use '-h' for help!\n");
+			station_eprintf("--rds-paging-scan requires --rds-paging, use '-h' for help!\n");
 			exit(0);
 		}
 		if (!s->tx) {
-			fprintf(stderr, "--rds-paging-scan requires --tx, use '-h' for help!\n");
+			station_eprintf("--rds-paging-scan requires --tx, use '-h' for help!\n");
 			exit(0);
 		}
 		rc = rds_enc_paging_scan_start(&s->radio.rds_enc, s->rds_paging_scan_from, s->rds_paging_scan_to,
 					       (enum rds_paging_msg_type)s->rds_paging_scan_type);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to start paging scan\n");
+			station_eprintf("Failed to start paging scan\n");
 			exit(0);
 		}
-		printf("RDS Paging scan: addresses %06u-%06u\n",
+		station_printf("RDS Paging scan: addresses %06u-%06u\n",
 		       (unsigned)s->rds_paging_scan_from, (unsigned)s->rds_paging_scan_to);
 	}
 
@@ -1912,10 +1916,10 @@ static int station_init(station_t *s, void *sdr)
 	/* RX-only servers: XDR-GTK and RDS-Spy */
 	if (s->xdr_gtk_server) {
 		if (!s->rx)
-			fprintf(stderr, "Warning: --xdr-gtk-server is for RX mode (use with --rx)\n");
+			station_eprintf("Warning: --xdr-gtk-server is for RX mode (use with --rx)\n");
 		rc = rds_server_init(&s->xdr_srv, s->xdr_gtk_server, RDS_PROTO_XDR_GTK, NULL);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to initialize XDR-GTK server\n");
+			station_eprintf("Failed to initialize XDR-GTK server\n");
 			return -1;
 		}
 		if (s->xdr_gtk_password)
@@ -1927,53 +1931,53 @@ static int station_init(station_t *s, void *sdr)
 		else if (s->time_constant_us == 75.0)
 			rds_server_set_deemphasis(&s->xdr_srv, 1);
 		s->xdr_enabled = 1;
-		printf("XDR-GTK protocol server enabled: %s%s\n",
+		station_printf("XDR-GTK protocol server enabled: %s%s\n",
 		       s->xdr_gtk_server, s->xdr_gtk_password ? " (password protected)" : "");
 	}
 
 	if (s->rdsspy_server) {
 		if (!s->rx)
-			fprintf(stderr, "Warning: --rdsspy-server is for RX mode (use with --rx)\n");
+			station_eprintf("Warning: --rdsspy-server is for RX mode (use with --rx)\n");
 		rc = rds_server_init(&s->rdsspy_srv, s->rdsspy_server, RDS_PROTO_RDSSPY, NULL);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to initialize RDS Spy server\n");
+			station_eprintf("Failed to initialize RDS Spy server\n");
 			return -1;
 		}
 		s->rdsspy_enabled = 1;
-		printf("RDS Spy protocol server enabled: %s\n", s->rdsspy_server);
+		station_printf("RDS Spy protocol server enabled: %s\n", s->rdsspy_server);
 	}
 
 	/* TX-only servers: UECP and ASCII-G */
 	if (s->uecp_server) {
 		if (!s->tx)
-			fprintf(stderr, "Warning: --uecp-server is for TX mode (use with --tx)\n");
+			station_eprintf("Warning: --uecp-server is for TX mode (use with --tx)\n");
 		rc = rds_server_init(&s->uecp_srv, s->uecp_server, RDS_PROTO_UECP, &s->radio.rds_enc);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to initialize UECP server\n");
+			station_eprintf("Failed to initialize UECP server\n");
 			return -1;
 		}
 		s->uecp_enabled = 1;
-		printf("UECP protocol server enabled: %s\n", s->uecp_server);
+		station_printf("UECP protocol server enabled: %s\n", s->uecp_server);
 	}
 
 	if (s->asciig_server) {
 		if (!s->tx)
-			fprintf(stderr, "Warning: --asciig-server is for TX mode (use with --tx)\n");
+			station_eprintf("Warning: --asciig-server is for TX mode (use with --tx)\n");
 		rc = rds_server_init(&s->asciig_srv, s->asciig_server, RDS_PROTO_ASCII_G, &s->radio.rds_enc);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to initialize ASCII-G server\n");
+			station_eprintf("Failed to initialize ASCII-G server\n");
 			return -1;
 		}
 		s->asciig_srv.freq_khz = (int)(s->frequency / 1000.0);
 		s->asciig_enabled = 1;
-		printf("ASCII-G protocol server enabled: %s\n", s->asciig_server);
+		station_printf("ASCII-G protocol server enabled: %s\n", s->asciig_server);
 	}
 
 	/* Rigctl server (hamlib-compatible remote control) */
 	if (s->rigctl_server_endpoint) {
 		rc = rigctl_server_init(&s->rigctl_srv, s->rigctl_server_endpoint, s->rigctl_allowed_hosts);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to initialize rigctl server\n");
+			station_eprintf("Failed to initialize rigctl server\n");
 			return -1;
 		}
 		rigctl_server_set_mode_flags(&s->rigctl_srv, s->tx, s->rx);
@@ -2031,7 +2035,7 @@ static int station_init(station_t *s, void *sdr)
 		};
 		rigctl_server_set_callbacks(&s->rigctl_srv, &rigctl_cb);
 		s->rigctl_enabled = 1;
-		printf("Rigctl server enabled: %s\n", s->rigctl_server_endpoint);
+		station_printf("Rigctl server enabled: %s\n", s->rigctl_server_endpoint);
 	}
 
 	/* Set up RDS decoder callback for RX protocol servers (XDR-GTK, RDS-Spy) */
@@ -2059,7 +2063,7 @@ static int station_init(station_t *s, void *sdr)
 
 	s->sendbuff = calloc(s->buffer_size * 2, sizeof(*s->sendbuff));
 	if (!s->sendbuff) {
-		fprintf(stderr, "No mem!\n");
+		station_eprintf("No mem!\n");
 		return -1;
 	}
 
@@ -2262,19 +2266,19 @@ static void station_check_options(char *arg0)
 		const char *c = rds_get_country_code(pi_cc, st->rds_ecc);
 
 		if (c && strcmp(c, "--")) {
-			fprintf(stderr, "RDS: ECC %02X + PI %04X (country digit %X) = country %s\n", st->rds_ecc, st->rds_pi_opt, pi_cc, c);
+			station_eprintf("RDS: ECC %02X + PI %04X (country digit %X) = country %s\n", st->rds_ecc, st->rds_pi_opt, pi_cc, c);
 		} else {
 			const char *s = rds_ecc_suggest(pi_cc);
 
-			fprintf(stderr, "Warning: ECC %02X + PI %04X (country digit %X) is no country in EN 50067 Table D.1.\n", st->rds_ecc, st->rds_pi_opt, pi_cc);
-			fprintf(stderr, "         Receivers show no or a wrong country, pagers may not lock to this channel.\n");
-			fprintf(stderr, "         ECC %02X is still transmitted as given.\n", st->rds_ecc);
+			station_eprintf("Warning: ECC %02X + PI %04X (country digit %X) is no country in EN 50067 Table D.1.\n", st->rds_ecc, st->rds_pi_opt, pi_cc);
+			station_eprintf("         Receivers show no or a wrong country, pagers may not lock to this channel.\n");
+			station_eprintf("         ECC %02X is still transmitted as given.\n", st->rds_ecc);
 			if (s[0]) {
-				fprintf(stderr, "         For PI country digit %X use --rds-ecc %s\n", pi_cc, s);
-				fprintf(stderr, "         or set --pi to your country digit, see '--rds-ecc list'.\n");
+				station_eprintf("         For PI country digit %X use --rds-ecc %s\n", pi_cc, s);
+				station_eprintf("         or set --pi to your country digit, see '--rds-ecc list'.\n");
 			} else {
-				fprintf(stderr, "         PI country digit %X is not a country digit (1-F), set --pi to your\n", pi_cc);
-				fprintf(stderr, "         country digit, see '--rds-ecc list'.\n");
+				station_eprintf("         PI country digit %X is not a country digit (1-F), set --pi to your\n", pi_cc);
+				station_eprintf("         country digit, see '--rds-ecc list'.\n");
 			}
 		}
 	}
@@ -2282,12 +2286,12 @@ static void station_check_options(char *arg0)
 		st->radio_opts.rds_ecc = st->rds_ecc;	/* overrides the preset ECC, also on preset change */
 
 	if (st->rds_paging && st->tx && !st->rds_ecc) {
-		fprintf(stderr, "RDS paging TX requires --rds-ecc <hex> (Extended Country Code, EN 50067 Annex D), use '-h' for help!\n");
+		station_eprintf("RDS paging TX requires --rds-ecc <hex> (Extended Country Code, EN 50067 Annex D), use '-h' for help!\n");
 		exit(0);
 	}
 	/* 13A enhanced paging needs the operator code (EN 50067 M.3.2.7.2) */
 	if (st->rds_paging_13a && (st->rds_paging_opc < 1 || st->rds_paging_opc > 15)) {
-		fprintf(stderr, "--rds-paging-13a requires --rds-paging-opc 1-15 (EN 50067 M.3.2.7.2), use '-h' for help!\n");
+		station_eprintf("--rds-paging-13a requires --rds-paging-opc 1-15 (EN 50067 M.3.2.7.2), use '-h' for help!\n");
 		exit(0);
 	}
 }
@@ -2571,12 +2575,14 @@ int main(int argc, char *argv[])
 		static station_t initial;
 
 		st = &stations[si];
+		station_log(st);
 		station_defaults(&initial);
 		rc = station_kind_options(st, &initial);
 		if (rc < 0)
 			return rc;
 		station_check_options(argv[0]);
 	}
+	station_log(NULL);
 	st = &stations[0];
 
 	/* global inits */
