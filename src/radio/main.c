@@ -1494,6 +1494,12 @@ static void paging_process_line(rds_tx_app_t *app, char *line)
 	char *msg;
 	int msg_len;
 
+	/* a station that does not send has no encoder for its calls */
+	if (!app->enc) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS paging FIFO: this station does not send (no --tx), line ignored\n");
+		return;
+	}
+
 	/* Find exactly 3 commas */
 	for (i = 0; i < len; i++) {
 		if (line[i] == ',') {
