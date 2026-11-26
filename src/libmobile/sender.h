@@ -82,6 +82,7 @@ typedef struct sender {
 	wave_rec_t		wave_rx_rec;		/* wave recording (from rx) */
 	wave_rec_t		wave_tx_rec;		/* wave recording (from tx) */
 	wave_play_t		wave_rx_play;		/* wave playback (as rx) */
+	int			rx_wave_pad;		/* -a none: silence after its end, then quit */
 	wave_play_t		wave_tx_play;		/* wave playback (as tx) */
 
 	/* audio buffer for audio to send to transmitter */
@@ -109,6 +110,7 @@ extern sender_t *sender_head;
 extern int cant_recover;
 extern int check_channel;
 
+int sender_audio_none(void);
 int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, double empfangsfrequenz, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, enum paging_signal paging_signal);
 void sender_destroy(sender_t *sender);
 void sender_set_fm(sender_t *sender, double max_deviation, double max_modulation, double speech_deviation, double max_display);

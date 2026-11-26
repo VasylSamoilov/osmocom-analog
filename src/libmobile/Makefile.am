@@ -12,6 +12,7 @@ libmobile_a_SOURCES = \
 	get_time.c \
 	main_mobile.c \
 	iq_wave.c \
+	audio_none.c \
 	msg_fifo.c \
 	afc.c
 

@@ -399,6 +399,10 @@ void main_mobile_print_help(const char *arg0, const char *ext_usage)
 	printf(" -a --audio-device hw:<card>,<device>[/hw:<card>,<rec-device>]\n");
 	printf("        Sound card and device number (default = '%s')\n", dsp_device[0]);
 	printf("        You may specify a different recording device by using '/'.\n");
+	printf("        'none': no sound card, the audio wave files are the only input and\n");
+	printf("        output (--read-rx-wave, --write-tx-wave, ...); the run is a batch,\n");
+	printf("        time follows the samples (as with the IQ wave files), it ends after\n");
+	printf("        the RX wave file and 2 s of silence (or as the program ends it).\n");
 	printf("        Don't set it for SDR!\n");
 	printf(" -s --samplerate <rate>\n");
 	printf("        Sample rate of sound device (default = '%d')\n", dsp_samplerate);
@@ -1006,12 +1010,13 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	}
 #endif
 
-	/* Batch: every sample from and to files (the IQ wave device, no SDR, no
-	 * call socket). Time is the sample count and the loop runs as fast as the
-	 * CPU allows; nothing is interactive (no keyboard, no displays, no sound
-	 * card on the call side). */
+	/* Batch: every sample from and to files (the IQ wave device, or no audio
+	 * device - -a none: the audio wave files only -, no SDR, no call socket).
+	 * Time is the sample count and the loop runs as fast as the CPU allows;
+	 * nothing is interactive (no keyboard, no displays, no sound card on the
+	 * call side). */
 	/* (headless stays real time, as with the socket it had before) */
-	batch = iq_wave_is_active() && !use_sdr && !use_osmocc_sock && !headless;
+	batch = (iq_wave_is_active() || sender_audio_none()) && !use_sdr && !use_osmocc_sock && !headless;
 	/* the WAV files (IQ and audio) wait instead of dropping samples */
 	if (batch)
 		wave_set_blocking(1);

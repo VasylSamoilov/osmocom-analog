@@ -30,6 +30,7 @@
 #include "get_time.h"
 #include "sender.h"
 #include "iq_wave.h"
+#include "audio_none.h"
 #include <osmocom/core/timer.h>
 #ifdef HAVE_SDR
 #include "../libsdr/sdr_config.h"
@@ -42,6 +43,77 @@ sender_t *sender_head = NULL;
 static sender_t **sender_tailp = &sender_head;
 int cant_recover = 0;
 int check_channel = 1;
+
+/* The IQ wave virtual device (any IQ wave option) */
+static void sender_use_iq_wave(sender_t *sender)
+{
+	sender->audio_open = iq_wave_open;
+	sender->audio_start = iq_wave_start;
+	sender->audio_close = iq_wave_close;
+	sender->audio_read = iq_wave_read;
+	sender->audio_write = iq_wave_write;
+	sender->audio_get_tosend = iq_wave_get_tosend;
+}
+
+/* The audio device of a sender (a master): the IQ wave files, else the SDR,
+ * else none (-a none: the audio wave files only), else the sound card */
+static int sender_select_audio(sender_t *sender, int use_sdr)
+{
+	(void)use_sdr;
+	if (iq_wave_is_active()) {
+		sender_use_iq_wave(sender);
+		return 0;
+	}
+#ifdef HAVE_SDR
+	if (use_sdr) {
+		/* sdr.c handles both single-device and split mode internally */
+		sender->audio_open = sdr_open;
+		sender->audio_start = sdr_start;
+		sender->audio_close = sdr_close;
+		sender->audio_read = sdr_read;
+		sender->audio_write = sdr_write;
+		sender->audio_get_tosend = sdr_get_tosend;
+		sender->audio_set_rx_trim = sdr_set_rx_trim;
+		sender->audio_set_rx_bandwidth = sdr_set_rx_bandwidth;
+		return 0;
+	}
+#endif
+	if (!strcmp(sender->device, AUDIO_NONE_DEVICE)) {
+		sender->audio_open = audio_none_open;
+		sender->audio_start = audio_none_start;
+		sender->audio_close = audio_none_close;
+		sender->audio_read = audio_none_read;
+		sender->audio_write = audio_none_write;
+		sender->audio_get_tosend = audio_none_get_tosend;
+		return 0;
+	}
+#ifdef HAVE_ALSA
+	sender->audio_open = sound_open;
+	sender->audio_start = sound_start;
+	sender->audio_close = sound_close;
+	sender->audio_read = sound_read;
+	sender->audio_write = sound_write;
+	sender->audio_get_tosend = sound_get_tosend;
+	return 0;
+#else
+	LOGP(DSENDER, LOGL_ERROR, "No sound card support compiled in!\n");
+	return -ENOTSUP;
+#endif
+}
+
+/* -a none: no audio device, the audio wave files only (a batch) */
+int sender_audio_none(void)
+{
+	sender_t *sender;
+
+	for (sender = sender_head; sender; sender = sender->next) {
+		if (sender->master)
+			continue;
+		if (sender->audio_open != audio_none_open)
+			return 0;
+	}
+	return sender_head != NULL;
+}
 
 /* Init transceiver instance and link to list of transceivers. */
 int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, double empfangsfrequenz, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, int pre_emphasis, int de_emphasis, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback, enum paging_signal paging_signal)
@@ -120,41 +192,9 @@ int sender_create(sender_t *sender, const char *kanal, double sendefrequenz, dou
 		slave->slave = sender;
 	} else {
 		/* link audio device */
-		if (iq_wave_is_active()) {
-			sender->audio_open = iq_wave_open;
-			sender->audio_start = iq_wave_start;
-			sender->audio_close = iq_wave_close;
-			sender->audio_read = iq_wave_read;
-			sender->audio_write = iq_wave_write;
-			sender->audio_get_tosend = iq_wave_get_tosend;
-		} else
-#ifdef HAVE_SDR
-		if (use_sdr) {
-			/* sdr.c handles both single-device and split mode internally */
-			sender->audio_open = sdr_open;
-			sender->audio_start = sdr_start;
-			sender->audio_close = sdr_close;
-			sender->audio_read = sdr_read;
-			sender->audio_write = sdr_write;
-			sender->audio_get_tosend = sdr_get_tosend;
-			sender->audio_set_rx_trim = sdr_set_rx_trim;
-			sender->audio_set_rx_bandwidth = sdr_set_rx_bandwidth;
-		} else
-#endif
-		{
-#ifdef HAVE_ALSA
-			sender->audio_open = sound_open;
-			sender->audio_start = sound_start;
-			sender->audio_close = sound_close;
-			sender->audio_read = sound_read;
-			sender->audio_write = sound_write;
-			sender->audio_get_tosend = sound_get_tosend;
-#else
-			LOGP(DSENDER, LOGL_ERROR, "No sound card support compiled in!\n");
-			rc = -ENOTSUP;
+		rc = sender_select_audio(sender, use_sdr);
+		if (rc < 0)
 			goto error;
-#endif
-		}
 	}
 
 	rc = init_samplerate(&sender->srstate, 8000.0, (double)samplerate, 3400.0);
@@ -207,14 +247,8 @@ int sender_open_audio(int buffer_size, double interval)
 		/* Late re-selection: if IQ wave became active after sender_create
 		 * (e.g. options copied from sdr_config in main_mobile_loop),
 		 * switch the audio backend now before opening. */
-		if (iq_wave_is_active() && master->audio_open != iq_wave_open) {
-			master->audio_open = iq_wave_open;
-			master->audio_start = iq_wave_start;
-			master->audio_close = iq_wave_close;
-			master->audio_read = iq_wave_read;
-			master->audio_write = iq_wave_write;
-			master->audio_get_tosend = iq_wave_get_tosend;
-		}
+		if (iq_wave_is_active() && master->audio_open != iq_wave_open)
+			sender_use_iq_wave(master);
 
 		/* get list of frequencies */
 		channels = 0;
@@ -523,8 +557,24 @@ cant_recover:
 	if (count) {
 		if (sender->wave_rx_rec.fp)
 			wave_write(&sender->wave_rx_rec, samples, count);
-		if (sender->wave_rx_play.fp)
+		if (sender->wave_rx_play.fp) {
 			wave_read(&sender->wave_rx_play, samples, count);
+			/* -a none: the RX wave file is the only input, so its end
+			 * ends the run - after 2 s of silence for the decoders to
+			 * finish a frame, as the IQ wave device does */
+			if (sender->audio_open == audio_none_open && !sender->wave_rx_play.left) {
+				if (!sender->rx_wave_pad) {
+					sender->rx_wave_pad = sender->samplerate * 2;
+					LOGP(DSENDER, LOGL_NOTICE, "RX wave end - padding %d samples for the decoders to flush.\n",
+					     sender->rx_wave_pad);
+				}
+				sender->rx_wave_pad -= count;
+				if (sender->rx_wave_pad <= 0) {
+					LOGP(DSENDER, LOGL_NOTICE, "RX wave padding done, quitting.\n");
+					*quit = 1;
+				}
+			}
+		}
 
 		/* loop through all channels */
 		for (i = 0, inst = sender; inst; i++, inst = inst->slave) {
