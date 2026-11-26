@@ -117,7 +117,23 @@ the backend one registration). Several stations = several processes.
       option -> kinds table checked against the code before it is
       written.
    c. main() carved into station init / poll / exit; the paging FIFO's
-      line buffer into the station.
+      line buffer into the station (done): `station_init()` (radio,
+      AFC, meter, RDS files, TMC, paging + FIFO, servers, buffer),
+      `station_poll()` (paging FIFO, servers, RX, TX; the loop's sleep
+      and the keys stay in main), `station_exit()` after sdr_close().
+      The station holds its running state too: IQ rate, buffer size,
+      buffer, `radio_t`, the five servers, the callback context, the
+      FIFO's partial line. Dead `#if 0` loop debug counters removed.
+      Proof: suite.sh 12 the same and opts.sh against 5b20f91;
+      extra3c.sh: a page written in two parts and two lines in one write
+      (both decoded and logged as before), RX with XDR-GTK + RDS Spy +
+      rigctl servers (RDS Spy client gets the same 552 bytes with PI,
+      rigctl `f` the same, wave and hexrds the same). Left for step 5:
+      the server callbacks (tune, scan, rigctl frequency) still use the
+      global `st`; they get the station through their context then.
+      Found (parked, before and after alike): the rigctl SDR caps block
+      in the server setup never runs - it checks the SDR handle, which
+      is opened later.
    Proof for each: `~/.cache/sdrangel-rp-rates/txfix/suite.sh` - osmoradio
    of two revisions on a fake libsdr (fake_sdr.c in place of sdr.o: no
    device, no threads, pseudo-random tosend / RX chunks, IQ to / from
