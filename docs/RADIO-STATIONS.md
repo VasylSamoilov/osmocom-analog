@@ -512,8 +512,7 @@ Layer split (agreed, in slices, each proven identical before the next):
    (done: 9596aae rds_bit_received() / rds_group_received(), fb6c608
    rds_decoder_reports(), cb6490a + f1848d8 "(station N) " before each
    line of a station's work with several stations, liblogging's
-   per-thread logging_prefix; not tagged: printf lines of a station's
-   start, they name their port / FIFO);
+   per-thread logging_prefix; 05a5db6 its console lines too);
 3. decoded data per field (PS, RT, AF, CT, PTYN, EON, TMC, ODA) a store
    the codec fills; display and consumers (paging messages, TMC) read it
    through events;
