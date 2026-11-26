@@ -258,6 +258,30 @@ static void lo_spur_notice(const char *dir, const sdr_lo_plan_t *p, double centr
 			     dir, c, f[c] / 1e6, spur / 1e6, p->lo_offset);
 }
 
+/* The analog filter is centred on the LO (centre + offset), the band is
+ * not: with the LO outside the stream it must reach |offset| + rate / 2
+ * on the far side, i.e. a bandwidth of rate + 2 |offset| (B210 cable
+ * loopback, 1.92 MS/s, automatic offset: with the bandwidth = rate the band
+ * fell by 21 dB towards its far edge, 3 MHz still 2.5 dB, 4 MHz flat within
+ * 1.8 dB). A bandwidth given is used as given. */
+static double lo_bandwidth(const char *dir, double bw, int given, const sdr_lo_plan_t *p, int rate)
+{
+	double need = rate + 2.0 * fabs(p->lo_offset);
+
+	if (given || !p->lo_outside || bw >= need)
+		return bw;
+	LOGP(DSDR, LOGL_INFO, "%s: analog bandwidth %.0f Hz (the rate + 2 x the LO offset: the filter is centred on the LO), not %.0f Hz.\n", dir, need, bw);
+	return need;
+}
+
+static double unified_bandwidth(sdr_t *sdr, int tx, int rx)
+{
+	double t = tx ? lo_bandwidth("TX", sdr_config->bandwidth, sdr_config->bandwidth_given, &sdr->lo_tx, sdr->tx_rate) : 0.0;
+	double r = rx ? lo_bandwidth("RX", sdr_config->bandwidth, sdr_config->bandwidth_given, &sdr->lo_rx, sdr->rx_rate) : 0.0;
+
+	return (t > r) ? t : r;
+}
+
 /* Most samples at the SDR rate 'to' for n samples at the DSP rate 'from'.
  * A channelizer gives at most n * ceil(P/Q) * 2^k (channelizer_tx_max(), RX
  * needs no more), with ceil(P/Q) <= P/Q + 1 and 2^k <= to / from: at most
@@ -1078,7 +1102,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		/* Split mode: open TX and RX devices independently, possibly with different drivers */
 #ifdef HAVE_UHD
 		if (sdr_config->tx_uhd) {
-			rc = uhd_open(sdr_config->tx_channel, sdr_config->tx_device_args, sdr_config->tx_stream_args, sdr_config->tx_tune_args, sdr_config->tx_antenna, NULL, sdr_config->tx_clock_source, actual_tx_center, 0.0, sdr->lo_tx.lo_offset, (double)sdr_config->tx_samplerate, sdr_config->tx_gain, 0.0, sdr_config->tx_bandwidth, sdr_config->timestamps);
+			rc = uhd_open(sdr_config->tx_channel, sdr_config->tx_device_args, sdr_config->tx_stream_args, sdr_config->tx_tune_args, sdr_config->tx_antenna, NULL, sdr_config->tx_clock_source, actual_tx_center, 0.0, sdr->lo_tx.lo_offset, (double)sdr_config->tx_samplerate, sdr_config->tx_gain, 0.0, lo_bandwidth("TX", sdr_config->tx_bandwidth, sdr_config->tx_bandwidth_given || sdr_config->bandwidth_given, &sdr->lo_tx, sdr->tx_rate), sdr_config->timestamps);
 			if (rc)
 				goto error;
 			tx_driver = 1;
@@ -1086,7 +1110,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 #endif
 #ifdef HAVE_SOAPY
 		if (sdr_config->tx_soapy) {
-			rc = soapy_open(sdr_config->tx_channel, sdr_config->tx_device_args, sdr_config->tx_stream_args, sdr_config->tx_tune_args, sdr_config->tx_antenna, NULL, sdr_config->tx_clock_source, actual_tx_center, 0.0, sdr->lo_tx.lo_offset, (double)sdr_config->tx_samplerate, sdr_config->tx_gain, 0.0, sdr_config->tx_bandwidth, sdr_config->timestamps);
+			rc = soapy_open(sdr_config->tx_channel, sdr_config->tx_device_args, sdr_config->tx_stream_args, sdr_config->tx_tune_args, sdr_config->tx_antenna, NULL, sdr_config->tx_clock_source, actual_tx_center, 0.0, sdr->lo_tx.lo_offset, (double)sdr_config->tx_samplerate, sdr_config->tx_gain, 0.0, lo_bandwidth("TX", sdr_config->tx_bandwidth, sdr_config->tx_bandwidth_given || sdr_config->bandwidth_given, &sdr->lo_tx, sdr->tx_rate), sdr_config->timestamps);
 			if (rc)
 				goto error;
 			tx_driver = 2;
@@ -1107,7 +1131,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 #endif
 #ifdef HAVE_UHD
 		if (sdr_config->rx_uhd) {
-			rc = uhd_open(sdr_config->rx_channel, sdr_config->rx_device_args, sdr_config->rx_stream_args, sdr_config->rx_tune_args, NULL, sdr_config->rx_antenna, sdr_config->rx_clock_source, 0.0, actual_rx_center, sdr->lo_rx.lo_offset, (double)sdr_config->rx_samplerate, 0.0, sdr_config->rx_gain, sdr_config->rx_bandwidth, sdr_config->timestamps);
+			rc = uhd_open(sdr_config->rx_channel, sdr_config->rx_device_args, sdr_config->rx_stream_args, sdr_config->rx_tune_args, NULL, sdr_config->rx_antenna, sdr_config->rx_clock_source, 0.0, actual_rx_center, sdr->lo_rx.lo_offset, (double)sdr_config->rx_samplerate, 0.0, sdr_config->rx_gain, lo_bandwidth("RX", sdr_config->rx_bandwidth, sdr_config->rx_bandwidth_given || sdr_config->bandwidth_given, &sdr->lo_rx, sdr->rx_rate), sdr_config->timestamps);
 			if (rc)
 				goto error;
 			rx_driver = 1;
@@ -1115,7 +1139,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 #endif
 #ifdef HAVE_SOAPY
 		if (sdr_config->rx_soapy) {
-			rc = soapy_open(sdr_config->rx_channel, sdr_config->rx_device_args, sdr_config->rx_stream_args, sdr_config->rx_tune_args, NULL, sdr_config->rx_antenna, sdr_config->rx_clock_source, 0.0, actual_rx_center, sdr->lo_rx.lo_offset, (double)sdr_config->rx_samplerate, 0.0, sdr_config->rx_gain, sdr_config->rx_bandwidth, sdr_config->timestamps);
+			rc = soapy_open(sdr_config->rx_channel, sdr_config->rx_device_args, sdr_config->rx_stream_args, sdr_config->rx_tune_args, NULL, sdr_config->rx_antenna, sdr_config->rx_clock_source, 0.0, actual_rx_center, sdr->lo_rx.lo_offset, (double)sdr_config->rx_samplerate, 0.0, sdr_config->rx_gain, lo_bandwidth("RX", sdr_config->rx_bandwidth, sdr_config->rx_bandwidth_given || sdr_config->bandwidth_given, &sdr->lo_rx, sdr->rx_rate), sdr_config->timestamps);
 			if (rc)
 				goto error;
 			rx_driver = 2;
@@ -1125,7 +1149,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		/* Single-device mode (including TX-only / RX-only): existing dispatch */
 #ifdef HAVE_UHD
 		if (sdr_config->uhd) {
-			rc = uhd_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, actual_tx_center, actual_rx_center, (actual_rx_center != 0.0) ? sdr->lo_rx.lo_offset : sdr->lo_tx.lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, sdr_config->bandwidth, sdr_config->timestamps);
+			rc = uhd_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, actual_tx_center, actual_rx_center, (actual_rx_center != 0.0) ? sdr->lo_rx.lo_offset : sdr->lo_tx.lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, unified_bandwidth(sdr, actual_tx_center != 0.0, actual_rx_center != 0.0), sdr_config->timestamps);
 			if (rc)
 				goto error;
 			if (actual_tx_center != 0.0)
@@ -1136,7 +1160,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 #endif
 #ifdef HAVE_SOAPY
 		if (sdr_config->soapy) {
-			rc = soapy_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, actual_tx_center, actual_rx_center, (actual_rx_center != 0.0) ? sdr->lo_rx.lo_offset : sdr->lo_tx.lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, sdr_config->bandwidth, sdr_config->timestamps);
+			rc = soapy_open(sdr_config->channel, sdr_config->device_args, sdr_config->stream_args, sdr_config->tune_args, sdr_config->tx_antenna, sdr_config->rx_antenna, sdr_config->clock_source, actual_tx_center, actual_rx_center, (actual_rx_center != 0.0) ? sdr->lo_rx.lo_offset : sdr->lo_tx.lo_offset, sdr_config->samplerate, sdr_config->tx_gain, sdr_config->rx_gain, unified_bandwidth(sdr, actual_tx_center != 0.0, actual_rx_center != 0.0), sdr_config->timestamps);
 			if (rc)
 				goto error;
 			if (actual_tx_center != 0.0)

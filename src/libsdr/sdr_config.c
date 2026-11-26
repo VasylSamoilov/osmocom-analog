@@ -399,6 +399,7 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_BANDWIDTH:
 		sdr_config->bandwidth = atof(argv[argi]);
+		sdr_config->bandwidth_given = 1;
 		break;
 	case OPT_SDR_RX_ANTENNA:
 		sdr_config->rx_antenna = options_strdup(argv[argi]);
@@ -443,6 +444,7 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_TX_BANDWIDTH:
 		sdr_config->tx_bandwidth = atof(argv[argi]);
+		sdr_config->tx_bandwidth_given = 1;
 		break;
 	case OPT_SDR_TX_LO_OFFSET:
 		sdr_config->tx_lo_offset = atof(argv[argi]);
@@ -457,6 +459,7 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_RX_BANDWIDTH:
 		sdr_config->rx_bandwidth = atof(argv[argi]);
+		sdr_config->rx_bandwidth_given = 1;
 		break;
 	case OPT_SDR_RX_LO_OFFSET:
 		sdr_config->rx_lo_offset = atof(argv[argi]);
@@ -709,8 +712,10 @@ int sdr_configure(int samplerate)
 			/* and the RX rate, bandwidth, LO offset and PPM, which unified mode reads */
 			if (sdr_config->rx_samplerate && !sdr_config->samplerate)
 				sdr_config->samplerate = sdr_config->rx_samplerate;
-			if (sdr_config->rx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0)
+			if (sdr_config->rx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0) {
 				sdr_config->bandwidth = sdr_config->rx_bandwidth;
+				sdr_config->bandwidth_given = sdr_config->rx_bandwidth_given;
+			}
 			if (sdr_config->rx_lo_offset_given) {	/* given (also 0): wins over the unified default */
 				sdr_config->lo_offset = sdr_config->rx_lo_offset;
 				sdr_config->lo_offset_given = 1;
@@ -745,8 +750,10 @@ int sdr_configure(int samplerate)
 			/* and the TX rate, bandwidth, LO offset and PPM, which unified mode reads */
 			if (sdr_config->tx_samplerate && !sdr_config->samplerate)
 				sdr_config->samplerate = sdr_config->tx_samplerate;
-			if (sdr_config->tx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0)
+			if (sdr_config->tx_bandwidth != 0.0 && sdr_config->bandwidth == 0.0) {
 				sdr_config->bandwidth = sdr_config->tx_bandwidth;
+				sdr_config->bandwidth_given = sdr_config->tx_bandwidth_given;
+			}
 			if (sdr_config->tx_lo_offset_given) {	/* given (also 0): wins over the unified default */
 				sdr_config->lo_offset = sdr_config->tx_lo_offset;
 				sdr_config->lo_offset_given = 1;

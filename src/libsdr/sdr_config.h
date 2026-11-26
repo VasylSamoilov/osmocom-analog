@@ -18,6 +18,9 @@ typedef struct sdr_config {
 			tx_lo_offset_given,
 			rx_lo_offset_given;
 	double		bandwidth;		/* IF bandwidth */
+	int		bandwidth_given,	/* given on the command line (else from the rate, and the LO offset: sdr.c) */
+			tx_bandwidth_given,
+			rx_bandwidth_given;
 	double		tx_gain,		/* gain */
 			rx_gain;
 	const char	*tx_antenna,		/* list/override antennas */
