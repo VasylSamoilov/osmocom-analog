@@ -176,6 +176,7 @@ typedef struct station {
 	double baseband_extent;	/* one-sided, of its signal */
 	int band;		/* several stations: its SDR band (sdr_bands), else -1 */
 	char band_name[48];
+	int64_t band_missing, band_dropped;	/* its band's faults reported so far */
 } station_t;
 
 /* Options (docs/RADIO-STATIONS.md): the config file and the command line
@@ -2068,16 +2069,11 @@ static int station_poll(station_t *s, void *sdr)
 			return -1;
 		signal_meter_set_stereo_pilot(s->meter, s->radio.rx_pilot_mag_avg,
 					      s->radio.rx_pilot_locked);
-		/* the SDR's noise floor (its RX status, in-process): the SNR;
-		 * without it the SNR stays unknown (the radio's initial value) */
-		{
-			const sdr_status_t *ss = sdr_status_get();
-
-			if (ss && ss->rx.valid) {
-				signal_meter_set_noise_floor(s->meter, ss->rx.noise_floor_db);
-				radio_set_rx_snr(&s->radio, signal_meter_get_snr(s->meter));
-			}
-		}
+		/* the SNR stays unknown (the radio's initial value: no SNR
+		 * driven stereo blend). Not the SDR's RX status: its noise
+		 * floor is of the whole band, the other stations in it; a
+		 * station's own needs its spectral measurement (one per
+		 * process today, docs/RADIO-STATIONS.md) */
 		if (s->xdr_enabled) {
 			double sig = signal_meter_get_level_dbf(s->meter);
 			int is_stereo = s->radio.stereo && s->radio.rx_pilot_locked && !s->radio.rx_forced_mono;
@@ -2501,7 +2497,7 @@ int main(int argc, char *argv[])
 	struct termios term, term_orig;
 	int c;
 	void *sdr = NULL;
-	double server_poll = 0.0;
+	double server_poll = 0.0, band_report = 0.0;
 
 	loglevel = LOGL_NOTICE;
 	logging_init();
@@ -2674,6 +2670,22 @@ int main(int argc, char *argv[])
 			if (sdr && now_s() - server_poll >= 0.010) {
 				server_poll = now_s();
 				sdr_server_poll(sdr);
+			}
+			/* each band's faults, once a second when they change
+			 * (as sdr.c's engine mode does for its channels) */
+			if (now_s() - band_report >= 1.0) {
+				for (si = 0; si < num_stations; si++) {
+					station_t *s = &stations[si];
+					sdr_view_t *v = bands.band[s->band].port->view;
+
+					if (v->tx_missing != s->band_missing || v->rx_dropped != s->band_dropped)
+						LOGP(DSDR, LOGL_ERROR, "Station %s: TX rows missing %ld, RX rows dropped %ld in the last %.1f s (total %ld / %ld)\n",
+						     s->band_name, (long)(v->tx_missing - s->band_missing), (long)(v->rx_dropped - s->band_dropped),
+						     now_s() - band_report, (long)v->tx_missing, (long)v->rx_dropped);
+					s->band_missing = v->tx_missing;
+					s->band_dropped = v->rx_dropped;
+				}
+				band_report = now_s();
 			}
 			for (si = 0; si < num_stations; si++) {
 				rc = station_poll(&stations[si], sdr);

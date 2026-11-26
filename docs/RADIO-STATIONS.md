@@ -308,7 +308,39 @@ paging case runs 12 s
       too (c1e260e: SINAD -52 dB; fixed: 73.1 dB, without zeros the same
       wave). Not covered offline: sdr.c's server mode with a real device
       (slice 8), several stations on --sdr-backend.
-   d. the proof: FM stereo + RDS, AM, NFM together offline.
+   d. the proof (done): multi5d.sh, four stations on one fake SDR at
+      1.92 MS/s (centre 100.0145 MHz, moved off the AM station): S1 FM
+      stereo + RDS PI 5A12 99.6 MHz (480 k, chain), S2 FM mono + RDS PI
+      5B34 100.4 MHz (480 k, chain), S3 AM 100.0 MHz (48 k, bank), S4 NFM
+      99.9 MHz (48 k, bank), each a 1 kHz tone, TX + RX of itself. The same
+      command every run, only who sends changes. SINAD (dB) with one
+      station sending / all four / all four again / all four with white
+      noise at -50 dBFS: S1 55.5 / 55.5 / 55.5 / 52.0 (L and R alike), S2
+      71.1 / 71.1 / 71.1 / 69.8, S3 73.1 / 73.0 / 73.0 / 50.3, S4 41.8 /
+      41.8 / 41.8 / 41.7. RDS: S1 decodes only 5A12, S2 only 5B34, in
+      every run. Negative control, S2 not sending: no RDS groups for S2;
+      with noise its audio is noise (no 1 kHz, SINAD -33.8 dB); without
+      noise its FM limiter makes audio of what is left of the others
+      (about -100 dB) - in a band of exact zeros only. No band reported TX
+      rows missing / RX rows dropped (osmoradio reports them per band once
+      a second when they change, as sdr.c does for its channels).
+      ASan / UBSan clean. The alone reference is this, not one station
+      through IQ files: the wave reader thread (real time) against an IQ
+      file made faster than real time, or paced by the wall clock, drifts
+      (the tone at 999.9 Hz, 42 dB): no reference. Changed on the way: the
+      SNR of several stations is not the SDR's RX status - its noise floor
+      is the histogram of the whole band, the other stations in it, it
+      would force mono; the SNR stays unknown (the stereo blend then
+      follows the program, the content cap: an L / R test tone pair is
+      blended, so separation is not measured here). Found (parked):
+      without noise, a station's RDS block A fails for about 5.5 s after
+      the start (groups 4 - 66), also when it is the only sender; with
+      noise every group decodes. Without noise, S1 came out twice in
+      about ten runs at 41.4 dB with L at 999.9 Hz and R at 1000.1 Hz (a
+      slow phase drift between them: the stereo decoder; other runs
+      55.5 dB). A per-station spectral measurement (noise floor: the SNR,
+      the stereo blend, the XDR-GTK / rigctl levels) - today one per
+      process, the single station's.
 6. The wide bank (in-process from the station list, backend option).
 7. Per-station retune.
 8. B210 run (cable loopback), after asking.
