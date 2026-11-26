@@ -465,3 +465,46 @@ paging case runs 12 s
    golden section search: over a 9 s window |DFT| has sidelobes every
    0.1 Hz, the search had landed on one (699.73 Hz for 700.00, -17.8 dB
    for 36.6); the offline numbers all read the exact tone and stand.
+
+## RDS per station
+
+Each station its own RDS: an encoder if it sends, a decoder if it
+receives (radio_opts_t tx / rx, f26c7dc; was from the SDR's TX-only /
+RX-only mode of all stations together). Nothing shared that changes
+output: the encoder's timing counters per encoder, a decoder reset
+(retune) keeps its callbacks, its paging setting, its reassembly timeout
+and the bitstream file's partial byte, groups without block B reach the
+servers too, the FEC table is filled at init (47f28c2). Left: the TMC
+tables are process-wide (two stations' different tables are refused; a
+station without its own logs with another's names), log lines are not
+tagged with their station (the layer split, below).
+
+Receiver paging (fceae91): --rds-rx-paging off | auto | on, the
+receiver's own setting; the transmitter's --rds-paging no longer turns
+it on. Send conservatively, receive tolerantly: the TX sends enhanced
+paging only when asked (OPC, 13A, enhanced message types; experimental,
+no pager to test it with), the RX decodes what the station signals. auto
+(default): two good 1A in a row with the RPC group designation (EN 50067
+Table M.1, 000 = no basic paging) or the OPC (M.3.2.2, 0 = no enhanced
+paging; an enhanced-only network sends designation 0) not 0 start it, as
+many with both 0 end it; not for a group type a 3A assigns to an ODA
+(Table 6 "Available when not used for RP"; AID 0000 = the group's
+normal feature, 3.1.5.4). Checked against the EN 50067 text
+(RDS/WORK_EN50067_RDS_Standard.pdf): the 1A, 4A, 7A, 13A handling agrees;
+the log's designation ranges were shifted (673a96d). Test (rxpage.sh,
+~/.cache/sdrangel-rp-rates/txfix): on = the old forced decode (the same
+logs); auto decodes the test page, paging from the second 1A; off none; a
+station without paging the same verbose logs; noise no detection. Not
+tested: a 3A assigning 7A to an ODA (the encoder does not send one).
+
+Layer split (agreed, in slices, each proven identical before the next):
+1. decoder codec: one bits -> blocks -> groups function (it is twice
+   today, rds_decoder_process and rds_decoder_feed_bit), out a group with
+   its block status;
+2. decoder application: hexrds / bitstream files, servers, periodic
+   status, display, logs tagged with the station, fed from the codec;
+3. decoded data per field (PS, RT, AF, CT, PTYN, EON, TMC, ODA) a store
+   the codec fills; display and consumers (paging messages, TMC) read it
+   through events;
+4. encoder: content sources (PS, RT, AF, paging queue, UECP, Dynamic
+   PS) apart from the scheduler and the bit / biphase generator.
