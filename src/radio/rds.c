@@ -1108,7 +1108,8 @@ static void rds_paging_queue_clear(rds_paging_queue_t *q)
 /* the queue emptied (application) and the call on air dropped (protocol) */
 static void rds_paging_queue_destroy(rds_paging_enc_t *pag)
 {
-	rds_paging_queue_clear(&pag->q);
+	if (pag->q)
+		rds_paging_queue_clear(pag->q);
 	if (pag->tx_msg) {
 		free(pag->tx_msg);
 		pag->tx_msg = NULL;
@@ -1268,6 +1269,21 @@ static void rds_paging_op_clock(void *arg, unsigned *interval, unsigned *pos_ms)
 	rds_paging_clock(arg, interval, pos_ms);
 }
 
+/* The queue the paging protocol takes its calls from (NULL: none), and its
+ * questions answered by this protocol */
+static void rds_paging_attach_queue(rds_paging_enc_t *pag, rds_paging_queue_t *q)
+{
+	pag->q = q;
+	if (!q)
+		return;
+	q->ops.battery_saving = rds_paging_op_battery_saving;
+	q->ops.fits = rds_paging_op_fits;
+	q->ops.capacity = rds_paging_op_capacity;
+	q->ops.groups = rds_paging_op_groups;
+	q->ops.clock = rds_paging_op_clock;
+	q->ops.arg = pag;
+}
+
 /* number of groups a scan message takes on air */
 static int rds_paging_scan_groups(const rds_paging_queue_t *q)
 {
@@ -1412,7 +1428,7 @@ static void rds_paging_scan_service(rds_encoder_t *rds)
 {
 	rds_paging_enc_t *pag = &rds->paging;
 
-	if (rds_paging_queue_scan(&pag->q, pag->tx_active || pag->tx_msg)) {
+	if (pag->q && rds_paging_queue_scan(pag->q, pag->tx_active || pag->tx_msg)) {
 		pag->scan_schedule = 0;
 		rds_enc_scheduler_update(rds);
 	}
@@ -1568,13 +1584,15 @@ static void rds_paging_start_next(rds_encoder_t *rds)
 		rds_paging_msg_t *done = pag->tx_msg;
 
 		pag->tx_msg = NULL;
-		rds_paging_queue_done(&pag->q, done);
+		rds_paging_queue_done(pag->q, done);
 	}
+	if (!pag->q)
+		return;
 
 	rds_paging_scan_service(rds);
 
 	/* the next call that may start now (the queue's choice) */
-	msg = rds_paging_queue_take(&pag->q);
+	msg = rds_paging_queue_take(pag->q);
 	if (!msg)
 		return;
 
@@ -1601,7 +1619,7 @@ static void rds_paging_start_next(rds_encoder_t *rds)
  * its repeat interval) or freed */
 static void rds_paging_queue_done(rds_paging_queue_t *q, rds_paging_msg_t *msg)
 {
-	if (msg->repeats_left > 0) {
+	if (q && msg->repeats_left > 0) {
 		/* Re-enqueue for retransmission */
 		msg->repeats_left--;
 		msg->is_repeat = 1;  /* R=1 for subsequent transmissions */
@@ -1623,7 +1641,7 @@ static void rds_paging_tx_complete(rds_encoder_t *rds)
 
 	/* the call back to the queue, the protocol starts the next */
 	pag->tx_msg = NULL;
-	rds_paging_queue_done(&pag->q, msg);
+	rds_paging_queue_done(pag->q, msg);
 	rds_paging_start_next(rds);
 }
 
@@ -1677,6 +1695,20 @@ static int rds_paging_check_chars(const char *s, int hex, const char *what)
 	return 0;
 }
 
+/* The end of every send: the built call into the queue, then the protocol
+ * starts it at once if it may. No queue attached: rejected. */
+static int rds_paging_send(rds_encoder_t *rds, rds_paging_msg_t *msg)
+{
+	if (!rds->paging.q) {
+		LOGP(DRADIO, LOGL_ERROR, "RDS Paging: no call queue (no TX application attached), call dropped\n");
+		free(msg);
+		return -1;
+	}
+	rds_paging_enqueue(rds->paging.q, msg);
+	rds_paging_start_next(rds);
+	return 0;
+}
+
 /* Public API: queue a tone-only page */
 int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
 			     int repeats, int interval_sec, uint8_t tonetype)
@@ -1695,9 +1727,7 @@ int rds_enc_paging_send_tone(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->tonetype = tonetype;
 
-	rds_paging_enqueue(&rds->paging.q, msg);
-	rds_paging_start_next(rds);
-	return 0;
+	return rds_paging_send(rds, msg);
 }
 
 /* Public API: queue a numeric page (auto-selects 10 or 18 digit) */
@@ -1732,9 +1762,7 @@ int rds_enc_paging_send_numeric(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = ni;
 
-	rds_paging_enqueue(&rds->paging.q, msg);
-	rds_paging_start_next(rds);
-	return 0;
+	return rds_paging_send(rds, msg);
 }
 
 /* Public API: queue an alphanumeric page */
@@ -1769,9 +1797,7 @@ int rds_enc_paging_send_alpha(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	rds_paging_enqueue(&rds->paging.q, msg);
-	rds_paging_start_next(rds);
-	return 0;
+	return rds_paging_send(rds, msg);
 }
 
 /* Public API: queue a variable-length numeric page (enhanced, up to 160 digits) */
@@ -1803,9 +1829,7 @@ int rds_enc_paging_send_vnum(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	rds_paging_enqueue(&rds->paging.q, msg);
-	rds_paging_start_next(rds);
-	return 0;
+	return rds_paging_send(rds, msg);
 }
 
 /* Public API: queue a variable-length functions message (EN 50067 M.3.5.6).
@@ -1838,9 +1862,7 @@ int rds_enc_paging_send_functions(rds_encoder_t *rds, uint32_t address,
 	msg->country_code = country_code;
 	msg->opc = opc;
 
-	rds_paging_enqueue(&rds->paging.q, msg);
-	rds_paging_start_next(rds);
-	return 0;
+	return rds_paging_send(rds, msg);
 }
 
 /* Public API: queue a 15-digit international numeric message (M.2.1.6.5). */
@@ -1867,9 +1889,7 @@ int rds_enc_paging_send_intl15(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = 1;
 	msg->country_code = country_code;
-	rds_paging_enqueue(&rds->paging.q, msg);
-	rds_paging_start_next(rds);
-	return 0;
+	return rds_paging_send(rds, msg);
 }
 
 /* Public API: queue an international functions message (M.2.1.6.6). digits is
@@ -1897,9 +1917,7 @@ int rds_enc_paging_send_intlfunc(rds_encoder_t *rds, uint32_t address,
 		return -1;
 	msg->ni = 1;
 	msg->country_code = country_code;
-	rds_paging_enqueue(&rds->paging.q, msg);
-	rds_paging_start_next(rds);
-	return 0;
+	return rds_paging_send(rds, msg);
 }
 
 /* Public API: scan addresses from..to (inclusive) with one message each.
@@ -1933,12 +1951,12 @@ int rds_enc_paging_scan_start(rds_encoder_t *rds, uint32_t from, uint32_t to,
 {
 	rds_paging_enc_t *pag = &rds->paging;
 
-	if (!pag->enabled || from > to || to > RDS_PAGING_ADDR_MAX)
+	if (!pag->enabled || !pag->q || from > to || to > RDS_PAGING_ADDR_MAX)
 		return -1;
 	if (type != RDS_PAGING_TONE && type != RDS_PAGING_NUM10 && type != RDS_PAGING_ALPHA)
 		return -1;
 
-	rds_paging_queue_scan_start(&pag->q, from, to, type);
+	rds_paging_queue_scan_start(pag->q, from, to, type);
 	/* the protocol: the scan's schedule, the 4A minute marker pagers need
 	 * for interval sync, the interval clock */
 	pag->scan_schedule = 1;
@@ -3819,7 +3837,7 @@ static void rds_paging_update_notify(rds_paging_enc_t *pag, unsigned interval)
 	}
 
 	/* Queued messages */
-	for (msg = pag->q.queue_head; msg; msg = msg->next) {
+	for (msg = pag->q ? pag->q->queue_head : NULL; msg; msg = msg->next) {
 		int bit;
 
 		if (rds_paging_interval_from_addr(msg->address) != interval)
@@ -4791,14 +4809,6 @@ int rds_encoder_init(rds_encoder_t *rds, double samplerate, uint16_t pi,
 	     rds->ct_enabled, rds->local_offset/2.0, (rds->local_offset == 0) ? "UTC" : "Local",
 	     rds->ecc, rds->pin_day, rds->pin_hour, rds->pin_minute, rds->ptyn);
 	LOGP(DRADIO, LOGL_INFO, "RDS Groups: 0A (PS), 2A (RT), 1A (ECC), 10A (PTYN), 4A (CT)\n");
-
-	/* the paging queue's questions go to this encoder's paging protocol */
-	rds->paging.q.ops.battery_saving = rds_paging_op_battery_saving;
-	rds->paging.q.ops.fits = rds_paging_op_fits;
-	rds->paging.q.ops.capacity = rds_paging_op_capacity;
-	rds->paging.q.ops.groups = rds_paging_op_groups;
-	rds->paging.q.ops.clock = rds_paging_op_clock;
-	rds->paging.q.ops.arg = &rds->paging;
 
 	return 0;
 }
@@ -8918,7 +8928,10 @@ void rds_enc_oda_clear(rds_encoder_t *rds)
 
 void rds_encoder_exit(rds_encoder_t *rds)
 {
-	rds_paging_queue_destroy(&rds->paging);
+	/* the call on air (the queue is the TX application's, its exit) */
+	free(rds->paging.tx_msg);
+	rds->paging.tx_msg = NULL;
+	rds->paging.tx_active = 0;
 	if (rds->waveform_biphase) {
 		free(rds->waveform_biphase);
 		rds->waveform_biphase = NULL;
@@ -14179,6 +14192,9 @@ void rds_tx_app_attach(rds_tx_app_t *app, rds_encoder_t *enc)
 	};
 
 	rds_encoder_set_sink(enc, &sink);
+	/* the encoder's paging takes its calls from this application's queue */
+	app->enc = enc;
+	rds_paging_attach_queue(&enc->paging, &app->paging_queue);
 }
 
 int rds_tx_app_monitor(rds_tx_app_t *app, int debug, int verbose)
@@ -14212,6 +14228,11 @@ void rds_tx_app_set_paging_callback(rds_tx_app_t *app,
 
 void rds_tx_app_exit(rds_tx_app_t *app)
 {
+	/* the paging queue: its calls freed, the encoder no longer takes from it */
+	rds_paging_queue_clear(&app->paging_queue);
+	if (app->enc && app->enc->paging.q == &app->paging_queue)
+		app->enc->paging.q = NULL;
+	app->enc = NULL;
 	if (app->monitor) {
 		rds_decoder_exit(app->monitor);
 		free(app->monitor);

@@ -1609,8 +1609,9 @@ typedef struct rds_paging_enc {
 	/* Pre-computed group data for current message */
 	rds_paging_frames_t fr;
 
-	/* the call queue and the address scan (application) */
-	rds_paging_queue_t q;
+	/* the call queue and the address scan: the TX application's
+	 * (rds_tx_app_attach); NULL: none, nothing is sent */
+	rds_paging_queue_t *q;
 
 	/* 13A address notification state (EN 50067 M.3.4) */
 	uint64_t	notify_bits;	/* Address notification bits (25 or 50 bits) */
@@ -2997,6 +2998,10 @@ typedef struct rds_tx_app {
 	/* a sent paging call (starts / complete), after its log line */
 	void		(*paging_callback)(const rds_paging_tx_call_t *call, void *arg);
 	void		*paging_callback_arg;
+	/* the paging call queue and the address scan, the encoder's paging
+	 * protocol takes its calls from it (rds_tx_app_attach) */
+	rds_encoder_t	*enc;
+	rds_paging_queue_t paging_queue;
 } rds_tx_app_t;
 
 void rds_tx_app_init(rds_tx_app_t *app);
