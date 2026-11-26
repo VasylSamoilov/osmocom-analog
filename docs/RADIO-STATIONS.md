@@ -558,8 +558,8 @@ Layer split (agreed, in slices, each proven identical before the next):
    enable; tested with a UECP client, uecp_send.py), 1107f86 Dynamic PS
    advances on a 'PS cycle sent' event. The builders still move their
    own segment cursors (PS, RT, PTYN, AF, EON, TDC): running state of each
-   group type, kept with it. Left: the paging queue (application) and its
-   interval / slot timing (protocol) are one piece of code.
+   group type, kept with it. The paging queue (application) apart from
+   its interval / slot timing (protocol): see Ownership below.
 
 Ownership (after an architecture review): the decoder and the encoder
 each give out through one sink, the station owns the rest.
@@ -577,11 +577,34 @@ each give out through one sink, the station owns the rest.
   on with a TX file); the encoder owns no decoder.
 - Paging TX timing is covered by the harness: a group duration changed
   (RDS_PAGING_GROUP_US) shows in 'paging' and 'scan'.
-Next: the paging queue as a station-owned source (the queue walk, send
-times, repeats, the scan and the FIFO; the encoder asks it for the next
-call that may start now and keeps the markers, windows, 13A, A/B and the
-call counter), then rds.c split into layer files (allowed as an exact
-move by line range). Fixed (38c0d8e): on the bit path a lost block kept
+- Paging TX queue: the station's. rds_tx_app_t has the call queue and
+  the address scan (rds_paging_queue_t: the queue walk, send times,
+  repeats, the scan's refill and progress); the encoder's protocol takes
+  the next call that may start now from it and keeps the markers,
+  windows, 13A, A/B, the call counter and the call on air. The queue asks
+  the protocol only through its ops (battery saving on, a call fits its
+  window now, the windows' capacity, a call's groups, the interval clock
+  for a log line). Calls: rds_tx_app_paging_send_* and
+  rds_tx_app_paging_scan_start (main.c: the FIFO, --rds-paging-scan); the
+  protocol's rds_enc_paging_kick and rds_enc_paging_scan_schedule.
+  Steps, each the same in the harness (15 scenarios by now: also paging
+  without battery saving, calls too long for their windows - dropped,
+  paging off and on with calls queued, a call queued from the 'sent'
+  callback, a FIFO call during a 401-address scan, alpha scans of 4 and 6
+  characters; negative control: the window choice reversed shows in
+  disable / scan / scan_fifo): 4029fab the group count pure, 843682c the
+  queue's own struct, f8850e1 the scan's schedule a protocol setting,
+  0cd6736 / 6685bae / 5f7bfcc / 0c2bbbc the queue's halves (list, take,
+  refill, repeat, clear, scan start), a94f28a a call's groups in their own
+  struct (the count on the stack: was one static scratch shared by the
+  stations), dace77d the ops, a25df38 the queue in the TX application,
+  7e8bace the API; through main.c also scanrun.sh (21 of 21 addresses),
+  pagetypes.sh, the suite. Fixed on the way (94eee05): a call queued from
+  the 'sent' callback freed the call just sent, its repeats were lost.
+  Left: the 13A notification walks the queue's list itself (pending calls
+  of an interval) - a queue query later.
+Next: rds.c split into layer files (allowed as an exact move by line
+range). Fixed (38c0d8e): on the bit path a lost block kept
 the previous group's status, the servers got it as good. Proven since
 (preset.sh): the runtime preset switch ('f' in a pty; the key needs
 'timeout --foreground') before slice 4 and now - the same preset lines,
