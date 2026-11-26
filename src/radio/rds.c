@@ -9522,7 +9522,9 @@ static void rds_paging_dec_interval_sync(rds_decoder_t *rds, uint8_t b1b0)
  *                    sends designation 0 (M.3.2)
  * A 1A with either signals paging; one with designation 0 and an OPC of 0 in
  * its block C signals none; others (designation 0, no variant 0 / 2 block C)
- * tell nothing. RDS_RX_PAGING_CONFIRM in a row start or end the decode. */
+ * tell nothing. One signalling 1A from a block without correction, or
+ * RDS_RX_PAGING_CONFIRM in a row, start the decode; RDS_RX_PAGING_CONFIRM
+ * signalling none in a row end it. */
 static void rds_paging_dec_detect(rds_decoder_t *rds, uint8_t rpc, uint16_t b3)
 {
 	int desig_ok = rds->block_status[1] <= RDS_STATUS_CORRECTED;
@@ -9541,7 +9543,14 @@ static void rds_paging_dec_detect(rds_decoder_t *rds, uint8_t rpc, uint16_t b3)
 	else
 		return;		/* tells nothing */
 	if (signals) {
+		/* from a block without correction at once: the first call follows
+		 * the first 1A by a few groups (France Culture capture) */
+		int clean = (desig_ok && desig && rds->block_status[1] == RDS_STATUS_VALID) ||
+			    (opc_ok && opc && rds->block_status[2] == RDS_STATUS_VALID);
+
 		rds->paging_seen = (rds->paging_seen > 0) ? rds->paging_seen + 1 : 1;
+		if (clean)
+			rds->paging_seen = RDS_RX_PAGING_CONFIRM;
 		if (rds->paging_seen >= RDS_RX_PAGING_CONFIRM && !rds->paging_enabled) {
 			rds->paging_enabled = 1;
 			LOGP(DRADIO, LOGL_NOTICE, "RDS 1A: station signals paging (designation %d, OPC %s), 7A / 13A decoded as paging\n",
@@ -9560,6 +9569,12 @@ static void rds_paging_dec_detect(rds_decoder_t *rds, uint8_t rpc, uint16_t b3)
 		rds->paging_seen = RDS_RX_PAGING_CONFIRM;
 	if (rds->paging_seen < -RDS_RX_PAGING_CONFIRM)
 		rds->paging_seen = -RDS_RX_PAGING_CONFIRM;
+}
+
+/* The option that would decode paging the receiver does not decode now */
+static const char *rds_paging_hint(const rds_decoder_t *rds)
+{
+	return (rds->paging_mode == RDS_RX_PAGING_AUTO) ? "--rds-rx-paging on" : "--rds-rx-paging on|auto";
 }
 
 /* 7A / 13A as paging. On: always (as before). Auto: paging signalled and the
@@ -9985,8 +10000,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 			} else if (b2_payload != 0) {
 				/* 1A without paging: bits 4-0 are spare per IEC 62106:2018 */
 				if (rds->verbose)
-					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Spare bits=%d (likely RPC -- --rds-rx-paging on|auto to decode)\n",
-					     b2_payload);
+					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Spare bits=%d (likely RPC -- %s to decode)\n",
+					     b2_payload, rds_paging_hint(rds));
 				else if (rds->debug)
 					LOGP(DRADIO, LOGL_DEBUG, "RDS 1A: Spare bits (B2[4:0])=%d (expected 0)\n",
 					     b2_payload);
@@ -10231,8 +10246,8 @@ static void rds_decode_group(rds_decoder_t *rds)
 						     rds->linkage_actuator);
 				} else if (rds->verbose) {
 					LOGP(DRADIO, LOGL_INFO, "RDS 1A: Paging ID=0x%03X (ignored, "
-					     "--rds-rx-paging on|auto to decode)\n",
-					     payload & RDS_1A_PAYLOAD_MASK);
+					     "%s to decode)\n",
+					     payload & RDS_1A_PAYLOAD_MASK, rds_paging_hint(rds));
 				}
 				break;
 			case RDS_1A_VARIANT_BCAST:
@@ -11707,12 +11722,11 @@ group14_done:
 			/* ODA registered -- handled by ODA routing below */
 		} else if (is_oda_eligible) {
 			if (rds->verbose) {
-				const char *hint = "";
-				if (!rds->paging_enabled &&
-				    ((group_type == 7 && version == 0) || (group_type == 13 && version == 0)))
-					hint = " (--rds-rx-paging on|auto to decode as Radio Paging)";
-				LOGP(DRADIO, LOGL_INFO, "RDS %d%c: ODA-eligible group (no 3A registration yet)%s\n",
-				     group_type, version ? 'B' : 'A', hint);
+				int hint = !rds->paging_enabled &&
+					   ((group_type == 7 && version == 0) || (group_type == 13 && version == 0));
+				LOGP(DRADIO, LOGL_INFO, "RDS %d%c: ODA-eligible group (no 3A registration yet)%s%s%s\n",
+				     group_type, version ? 'B' : 'A', hint ? " (" : "",
+				     hint ? rds_paging_hint(rds) : "", hint ? " to decode as Radio Paging)" : "");
 			}
 		} else {
 			if (rds->verbose)

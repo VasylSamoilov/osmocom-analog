@@ -648,8 +648,8 @@ static void print_help(const char *arg0)
 	printf("        The receiver's paging decode (Groups 7A / 13A as Radio Paging), its\n");
 	printf("        own setting: --rds-paging is the transmitter's. auto (default):\n");
 	printf("        once the received station signals paging in Group 1A (RPC group\n");
-	printf("        designation or OPC not 0, two 1A in a row) and no Group 3A assigns\n");
-	printf("        7A / 13A to an ODA. on: always. off: never.\n");
+	printf("        designation or OPC not 0; one error-free 1A or two in a row) and\n");
+	printf("        no Group 3A assigns 7A / 13A to an ODA. on: always. off: never.\n");
 	printf("    --rds-paging-13a\n");
 	printf("        Enhanced paging address notification (EN 50067 M.3.4.1): one\n");
 	printf("        Group 13A (25 notification bits) right after the first marker of\n");

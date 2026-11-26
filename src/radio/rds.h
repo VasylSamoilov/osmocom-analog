@@ -719,8 +719,9 @@ int rds_af_method_b_build_codes(const rds_af_method_b_list_t *list, uint8_t *cod
 
 /* Receiver paging decode (the receiver's own setting, not the transmitter's):
  * off: 7A / 13A are never paging; on: always; auto: once the station signals
- * paging in 1A (group designation or OPC not 0, RDS_RX_PAGING_CONFIRM 1A in a
- * row), and the group type not assigned to an ODA by 3A. */
+ * paging in 1A (group designation or OPC not 0: one 1A without correction, or
+ * RDS_RX_PAGING_CONFIRM in a row), and the group type not assigned to an ODA
+ * by 3A. */
 #define RDS_RX_PAGING_OFF	0
 #define RDS_RX_PAGING_AUTO	1
 #define RDS_RX_PAGING_ON	2

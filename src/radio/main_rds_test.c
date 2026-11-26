@@ -26,7 +26,7 @@
 static int rds_debug = 0;
 static int rds_verbose = 0;
 static int force_rbds = 0;
-static int paging_enabled = 0;
+static int paging_mode = RDS_RX_PAGING_OFF;
 static int ansi_override = -1; /* -1=auto, 0=force off, 1=force on */
 
 /* Parse a single hex group line from .hexrds format.
@@ -166,6 +166,10 @@ static void print_usage(const char *prog)
 	printf("  --rds-verbose Enable RDS decoder verbose (human-readable decoded fields)\n");
 	printf("  --rbds        Force RBDS decoding (callsign lookup, US PTY names)\n");
 	printf("  --paging      Enable Radio Paging decoding (Group 7A, 1A RPC, 13A)\n");
+	printf("                = --rds-rx-paging on\n");
+	printf("  --rds-rx-paging off | auto | on\n");
+	printf("                Paging decode: off (default), auto (once 1A signals paging,\n");
+	printf("                as osmoradio's default), on\n");
 	printf("  --help        Show this help\n\n");
 	printf("Supported formats:\n");
 	printf("  .hexrds     Hex text (RDS Spy, redsea, RdsSurveyor2)\n");
@@ -200,7 +204,19 @@ int main(int argc, char *argv[])
 		} else if (strcmp(argv[i], "--rbds") == 0) {
 			force_rbds = 1;
 		} else if (strcmp(argv[i], "--paging") == 0) {
-			paging_enabled = 1;
+			paging_mode = RDS_RX_PAGING_ON;
+		} else if (strcmp(argv[i], "--rds-rx-paging") == 0 && i + 1 < argc) {
+			i++;
+			if (!strcmp(argv[i], "off"))
+				paging_mode = RDS_RX_PAGING_OFF;
+			else if (!strcmp(argv[i], "auto"))
+				paging_mode = RDS_RX_PAGING_AUTO;
+			else if (!strcmp(argv[i], "on"))
+				paging_mode = RDS_RX_PAGING_ON;
+			else {
+				fprintf(stderr, "Invalid --rds-rx-paging '%s' (off, auto or on)\n", argv[i]);
+				return 1;
+			}
 		} else if (strcmp(argv[i], "--ansi") == 0) {
 			ansi_override = 1;
 		} else if (strcmp(argv[i], "--no-ansi") == 0) {
@@ -251,7 +267,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Failed to init decoder for %s\n", files[i]);
 			continue;
 		}
-		rds_decoder_set_paging(&rds, paging_enabled ? RDS_RX_PAGING_ON : RDS_RX_PAGING_OFF);
+		rds_decoder_set_paging(&rds, paging_mode);
 
 		int groups;
 		if (is_binary_rds(files[i]))
