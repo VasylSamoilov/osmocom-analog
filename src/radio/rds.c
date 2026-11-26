@@ -1298,6 +1298,17 @@ static int rds_paging_scan_groups(const rds_paging_queue_t *q)
 	}
 }
 
+/* the address of every queued call, in queue order (the protocol's 13A
+ * notification of pending calls) */
+static void rds_paging_queue_addresses(const rds_paging_queue_t *q,
+				       void (*fn)(uint32_t address, void *arg), void *arg)
+{
+	const rds_paging_msg_t *m;
+
+	for (m = q->queue_head; m; m = m->next)
+		fn(m->address, arg);
+}
+
 /* remove msg from the queue, prev is its predecessor (NULL for the head) */
 static void rds_paging_unlink(rds_paging_queue_t *q, rds_paging_msg_t *prev, rds_paging_msg_t *msg)
 {
@@ -3828,13 +3839,32 @@ static uint8_t rds_paging_interval_from_addr(uint32_t address)
 	return address % 10;
 }
 
+/* the notification bits of one interval, collected over the queued calls */
+struct rds_paging_notify_acc {
+	unsigned	interval;
+	int		use_50;
+	uint64_t	bits;
+};
+
+static void rds_paging_notify_add(uint32_t address, void *arg)
+{
+	struct rds_paging_notify_acc *acc = arg;
+	int bit;
+
+	if (rds_paging_interval_from_addr(address) != acc->interval)
+		return;
+	bit = acc->use_50 ? rds_paging_notify_bit_50(address)
+			  : rds_paging_notify_bit_25(address);
+	acc->bits |= (1ULL << bit);
+}
+
 /* Recompute notify_bits from queue + active TX message.
  * Called each time a 13A group is built. */
 static void rds_paging_update_notify(rds_paging_enc_t *pag, unsigned interval)
 {
 	uint64_t bits = 0;
-	rds_paging_msg_t *msg;
 	int use_50 = pag->notify_50bit;
+	struct rds_paging_notify_acc acc = { interval, use_50, 0 };
 
 	/* The bits tell the pagers of this interval (last digit Z4 = interval,
 	 * EN 50067 M.3.4.1.2) whether a message for their sub group Z2Z3 is
@@ -3847,16 +3877,10 @@ static void rds_paging_update_notify(rds_paging_enc_t *pag, unsigned interval)
 		bits |= (1ULL << bit);
 	}
 
-	/* Queued messages */
-	for (msg = pag->q ? pag->q->queue_head : NULL; msg; msg = msg->next) {
-		int bit;
-
-		if (rds_paging_interval_from_addr(msg->address) != interval)
-			continue;
-		bit = use_50 ? rds_paging_notify_bit_50(msg->address)
-			     : rds_paging_notify_bit_25(msg->address);
-		bits |= (1ULL << bit);
-	}
+	/* Queued messages (the queue's addresses, in queue order) */
+	if (pag->q)
+		rds_paging_queue_addresses(pag->q, rds_paging_notify_add, &acc);
+	bits |= acc.bits;
 
 	pag->notify_bits = bits;
 }
