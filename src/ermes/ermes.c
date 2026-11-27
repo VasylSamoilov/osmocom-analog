@@ -158,8 +158,9 @@ static void ermes_next_slot(ermes_t *ermes)
  * after power on, from one type: 0000 alone gave the hour (weekday stays its default Mo), 0001
  * alone the weekday (hour 0); every mixed schedule gave one of them, the 13-type cycle neither; no
  * update later (hold for a minute each, a date change at midnight). No ERMES document says when a
- * receiver takes the time (docs/SSI_TIME_RULES.md): an NEC firmware choice. The minute follows the
- * cycle number. */
+ * receiver takes the time (docs/SSI_TIME_RULES.md): an NEC firmware choice. The minute it takes
+ * from the cycle number, also only then: afterwards its own clock runs on (a pager set by a
+ * --clock 15:58 network still showed 16:06 while it received our real-time network). */
 static void ermes_ssi(ermes_t *ermes, ermes_ssi_t *ssi)
 {
 	time_t now = (time_t)ermes_network_time(ermes);
@@ -271,7 +272,7 @@ static int ermes_next_batch(ermes_t *ermes)
 	ermes_ssi_t ssi;
 	ermes_page_t pages[MAX_PAGES];
 	ermes_msg_t *msgs[MAX_PAGES], **mp, *m;
-	int n = 0, sent, i;
+	int n = 0, sent, i, carried;
 
 	if (!ermes->started)
 		ermes_start_time(ermes);
@@ -289,12 +290,20 @@ static int ermes_next_batch(ermes_t *ermes)
 		pages[n++] = m->page;
 	}
 
-	sent = ermes_build_batch(&ermes->net, &t, &ssi, pages, n, ermes->batch_bits);
+	carried = ermes->carry.count;
+	sent = ermes_build_batch(&ermes->net, &t, &ssi, pages, n, &ermes->carry, ermes->batch_bits);
 	if (sent < 0) {
 		LOGP_CHAN(DERMES, LOGL_ERROR, "Failed to build batch %c, sending it idle.\n", ermes_batch_name(t.batch));
-		sent = ermes_build_batch(&ermes->net, &t, &ssi, NULL, 0, ermes->batch_bits);
+		ermes->carry.count = 0;
+		sent = ermes_build_batch(&ermes->net, &t, &ssi, NULL, 0, NULL, ermes->batch_bits);
 		n = 0;
 	}
+	if (carried)
+		LOGP_CHAN(DERMES, LOGL_INFO, "Batch %c continues a message: %d codewords%s\n", ermes_batch_name(t.batch),
+			  carried - ermes->carry.count, ermes->carry.count ? ", more in the next batch" : ", its end");
+	else if (ermes->carry.count)
+		LOGP_CHAN(DERMES, LOGL_INFO, "The last message of batch %c runs on into the next batch (%d codewords)\n",
+			  ermes_batch_name(t.batch), ermes->carry.count);
 
 	for (i = 0; i < sent; i++) {
 		m = msgs[i];
@@ -456,7 +465,8 @@ int ermes_page_queue(ermes_t *ermes, uint32_t local_address, const ermes_page_op
 {
 	enum ermes_category category = opts->category;
 	ermes_msg_t *m, **mp;
-	uint32_t data[ERMES_BATCH_CW_LAST];
+	uint32_t data[ERMES_MAX_MSG_WORDS];
+	int nd, max_words;
 
 	if (local_address >> ERMES_LA_BITS) {
 		LOGP(DERMES, LOGL_ERROR, "Local address 0x%X has more than %d bits.\n", local_address, ERMES_LA_BITS);
@@ -478,9 +488,17 @@ int ermes_page_queue(ermes_t *ermes, uint32_t local_address, const ermes_page_op
 	m->page.alert = opts->alert;
 	m->page.text = m->text;
 	m->page.charset = opts->charset ? opts->charset : ermes_charset;
-	if (ermes_data_words(&m->page, data, ERMES_BATCH_CW_LAST) < 0) {
-		LOGP(DERMES, LOGL_ERROR, "Message \"%s\" can't be sent as %s: a character without a code, or too long.\n",
+	nd = ermes_data_words(&m->page, data, ERMES_MAX_MSG_WORDS);
+	if (nd < 0) {
+		LOGP(DERMES, LOGL_ERROR, "Message \"%s\" can't be sent as %s: a character without a code.\n",
 		     text, ermes_category_name(category));
+		free(m);
+		return -1;
+	}
+	/* a message runs on into the next batches when it does not fit in its own (§10.5-10.6) */
+	max_words = ERMES_MAX_MSG_WORDS;
+	if (nd > max_words) {
+		LOGP(DERMES, LOGL_ERROR, "Message of %d data words is longer than %d.\n", nd, max_words);
 		free(m);
 		return -1;
 	}

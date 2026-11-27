@@ -106,11 +106,24 @@ const char *ermes_ssi_str(const ermes_ssi_t *ssi);
 /* "message number 3, alpha "Hello", not urgent, alert type 0" */
 const char *ermes_page_str(const ermes_page_t *page);
 
+/* Message data words of one message at most: 1023 alphanumeric characters (7 bits) and EOM */
+#define ERMES_MAX_MSG_WORDS	400
+
+/* The rest of a message that did not fit in its batch: its codewords, the closing message
+ * delimiter included, sent first in the next batches of the channel, immediately after their
+ * address partition and without a delimiter before (§10.5-10.6 p.34, ed.1 §11.5-11.6 p.31) */
+typedef struct ermes_carry {
+	uint32_t	cw[ERMES_MAX_MSG_WORDS + 3];
+	int		count;
+} ermes_carry_t;
+
 /* Build one batch. pages[] must all belong to this batch type (the initial address is only
- * sent in its own batch, §4.1 p.10) and must fit; the messages follow in the same batch.
+ * sent in its own batch, §4.1 p.10). The message partition starts with the carry of the batch
+ * before (if any); then the messages of the pages, each whole, and the last one may run on into
+ * the next batches through the carry. With carry NULL every message must fit whole.
  * bits[] gets ermes_batch_length(t->slot) * 30 bits, one per byte, in air order.
  * Returns the number of pages sent (the first ones that fit), or -1 on error. */
 int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, const ermes_ssi_t *ssi,
-		      const ermes_page_t *pages, int num_pages, uint8_t *bits);
+		      const ermes_page_t *pages, int num_pages, ermes_carry_t *carry, uint8_t *bits);
 
 #endif /* ERMES_FRAME_H */

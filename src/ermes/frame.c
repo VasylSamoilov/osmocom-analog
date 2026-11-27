@@ -28,7 +28,7 @@
 
 #define MAX_MSG_WORDS	(ERMES_BATCH_CW_LAST)
 #define FLAG_BITS	1	/* ETI, BAI, RSVD, EB, AII, UMI */
-#define ERMES_MAX_TEXT_STR	512
+#define ERMES_MAX_TEXT_STR	1200
 
 /* Append a field MSB first: the fields of a word are given in the order of the figure */
 static void field(uint64_t *word, uint32_t value, int bits)
@@ -180,7 +180,7 @@ int ermes_data_words(const ermes_page_t *page, uint32_t *info, int max_words)
 	struct bitwriter w = { info, max_words, 0 };
 	const struct pager_charset *cs = page_charset(page);
 	const char *text = page->text ? page->text : "";
-	uint8_t codes[ERMES_BATCH_CW_LAST * ERMES_INFO_BITS / ERMES_NUMERIC_BITS];
+	uint8_t codes[ERMES_MAX_MSG_WORDS * ERMES_INFO_BITS / ERMES_NUMERIC_BITS];
 	const char *space = " ";
 	int n, i, fill;
 
@@ -224,41 +224,71 @@ static uint32_t page_ia(const ermes_page_t *page)
 }
 
 int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, const ermes_ssi_t *ssi,
-		      const ermes_page_t *pages, int num_pages, uint8_t *bits)
+		      const ermes_page_t *pages, int num_pages, ermes_carry_t *carry, uint8_t *bits)
 {
 	uint32_t msg[MAX_MSG_WORDS];	/* message partition codewords before interleaving */
+	uint32_t whole[ERMES_MAX_MSG_WORDS + 3];
 	int order[ERMES_MAX_IA];
-	int i, j, k, n = 0, nmsg, sent, cap, num_cb;
+	int i, j, k, n = 0, nmsg, sent, cap, num_cb, nwhole, room;
 
 	if (t->slot < 0 || t->slot >= ERMES_BATCHES || t->batch < 0 || t->batch >= ERMES_BATCHES)
 		return -1;
 	if (num_pages > ERMES_MAX_IA)
 		num_pages = ERMES_MAX_IA;
 
-	/* take the pages of this batch type that fit; the message partition needs a leading
-	 * delimiter and, per message, header + data + delimiter (§5.5.5 p.23) */
-	nmsg = 1;
-	msg[0] = ERMES_MD;
+	nmsg = 0;
 	sent = 0;
+	if (carry && carry->count) {
+		/* the rest of a message of the batch before comes first (§10.5): as much as fits
+		 * with no initial address; if it does not all fit, the batch carries only it */
+		cap = ermes_max_codeblocks(t->slot, 0) * ERMES_CODEBLOCK_CW;
+		nmsg = (carry->count < cap) ? carry->count : cap;
+		memcpy(msg, carry->cw, nmsg * sizeof(uint32_t));
+		memmove(carry->cw, carry->cw + nmsg, (carry->count - nmsg) * sizeof(uint32_t));
+		carry->count -= nmsg;
+		if (carry->count)
+			num_pages = 0;
+		/* its closing delimiter is the leading one of the next message (one delimiter separates
+		 * messages, §5.5.5 p.23) */
+	} else
+		msg[nmsg++] = ERMES_MD;
+
+	/* the pages of this batch type: per message header + data + closing delimiter (§5.5.5); a
+	 * message that does not fit whole is started and runs on through the carry, as the last one */
 	for (i = 0; i < num_pages; i++) {
-		uint32_t hdr[2], data[MAX_MSG_WORDS];
+		uint32_t hdr[2], data[ERMES_MAX_MSG_WORDS];
 		int nd;
 
 		if (ermes_address_batch(pages[i].local_address) != t->batch)
 			return -1;
-		nd = ermes_data_words(&pages[i], data, MAX_MSG_WORDS);
+		nd = ermes_data_words(&pages[i], data, ERMES_MAX_MSG_WORDS);
 		if (nd < 0)
 			return -1;
-		cap = ermes_max_codeblocks(t->slot, sent + 1) * ERMES_CODEBLOCK_CW;
-		if (nmsg + 2 + nd + 1 > cap)
-			break;
 		ermes_header_words(&pages[i], hdr);
-		msg[nmsg++] = ermes_bch_encode(hdr[0]);
-		msg[nmsg++] = ermes_bch_encode(hdr[1]);
+		nwhole = 0;
+		whole[nwhole++] = ermes_bch_encode(hdr[0]);
+		whole[nwhole++] = ermes_bch_encode(hdr[1]);
 		for (j = 0; j < nd; j++)
-			msg[nmsg++] = ermes_bch_encode(data[j]);
-		msg[nmsg++] = ERMES_MD;
-		order[sent++] = i;
+			whole[nwhole++] = ermes_bch_encode(data[j]);
+		whole[nwhole++] = ERMES_MD;
+		/* one more initial address takes room from the message partition */
+		cap = ermes_max_codeblocks(t->slot, sent + 1) * ERMES_CODEBLOCK_CW;
+		room = cap - nmsg;
+		if (nwhole <= room) {
+			memcpy(msg + nmsg, whole, nwhole * sizeof(uint32_t));
+			nmsg += nwhole;
+			order[sent++] = i;
+			continue;
+		}
+		/* runs on: the header and at least one data word here, the rest in the next batches */
+		if (carry && room >= 3) {
+			memcpy(msg + nmsg, whole, room * sizeof(uint32_t));
+			nmsg += room;
+			memcpy(carry->cw, whole + room, (nwhole - room) * sizeof(uint32_t));
+			carry->count = nwhole - room;
+			order[sent++] = i;
+		}
+		break;
 	}
 
 	/* synchronization partition (§5.2 p.15): fixed words */

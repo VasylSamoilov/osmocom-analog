@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include "../ermes/code.h"
 #include "../ermes/frame.h"
@@ -200,7 +201,7 @@ static void test_frame(void)
 		CHECK(nd == 1 && data[0] == bits("1000001 0010001 0010"), "alpha A -> %d %05x", nd, data[0]);
 	}
 
-	rc = ermes_build_batch(&net, &t, &ssi, pages, 1, b);
+	rc = ermes_build_batch(&net, &t, &ssi, pages, 1, NULL, b);
 	CHECK(rc == 1, "build rc %d", rc);
 	CHECK(word_at(b, 0) == ERMES_PREAMBLE && word_at(b, 1) == ERMES_SW1, "sync partition");
 	w = word_at(b, 2);
@@ -231,15 +232,95 @@ static void test_frame(void)
 	}
 
 	/* a page for another batch type is refused, the last slot has 190 words */
-	CHECK(ermes_build_batch(&net, &t, &ssi, &pages[1], 1, b) == -1, "wrong batch refused");
+	CHECK(ermes_build_batch(&net, &t, &ssi, &pages[1], 1, NULL, b) == -1, "wrong batch refused");
 	t.slot = 15; t.batch = 1;
-	rc = ermes_build_batch(&net, &t, &ssi, &pages[1], 1, b);
+	rc = ermes_build_batch(&net, &t, &ssi, &pages[1], 1, NULL, b);
 	CHECK(rc == 1, "slot 15 rc %d", rc);
 	t.slot = 3; t.batch = 0;
-	CHECK(ermes_build_batch(&net, &t, &ssi, NULL, 0, b) == 0, "empty batch");
+	CHECK(ermes_build_batch(&net, &t, &ssi, NULL, 0, NULL, b) == 0, "empty batch");
 	for (i = 5; i < 10; i++)
 		CHECK(word_at(b, i) == ERMES_APT, "empty: APT at %d", i);
 	printf("frame done\n");
+}
+
+/* Message partition codewords of a built batch (I initial addresses), deinterleaved */
+static int partition_words(const uint8_t *b, int slot, int ia, uint32_t *out)
+{
+	int k, n = 0, first = 5 + ia + ermes_apt_count(ia);
+
+	for (k = 0; k < ermes_max_codeblocks(slot, ia); k++, n += 9)
+		ermes_deinterleave(b + (first + 9 * k) * 30, out + n);
+	return n;
+}
+
+/* §10.5 p.34: a message longer than its batch runs on in the next batches, immediately after their
+ * address partition, with no delimiter between the parts; other pages wait, a message after it
+ * starts behind its closing delimiter */
+static void test_continuation(void)
+{
+	static uint8_t b[190 * 30];
+	static char text[700];
+	static uint32_t got[2000];
+	ermes_network_t net = { .zone = 2, .country = 1, .operator = 2, .pa = 0, .bai = 0, .fsi = 30 };
+	ermes_batch_time_t t = { .cycle = 10, .ssn = 0, .slot = 4, .batch = 0 };
+	ermes_ssi_t ssi = { .ssit = 0, .ssif = 0 };
+	ermes_page_t page = { .local_address = 0x318E40, .number = 7, .category = ERMES_CAT_ALPHA };
+	ermes_page_t next = { .local_address = 0x000011, .number = 1, .category = ERMES_CAT_NUMERIC, .text = "42" };
+	ermes_carry_t carry = { .count = 0 };
+	uint32_t w, data[400], hdr[2], all[500];
+	int i, n = 0, rc, nd, nall = 0, batches = 0, md_inside = 0;
+
+	for (i = 0; i < 600; i++)
+		text[i] = 'A' + i % 26;
+	text[600] = '\0';
+	page.text = text;
+	nd = ermes_data_words(&page, data, 400);
+	ermes_header_words(&page, hdr);
+	all[nall++] = ermes_bch_encode(hdr[0]);
+	all[nall++] = ermes_bch_encode(hdr[1]);
+	for (i = 0; i < nd; i++)
+		all[nall++] = ermes_bch_encode(data[i]);
+	all[nall++] = ERMES_MD;
+
+	/* batch A (slot 4) starts it: leading MD, then as much as fits */
+	rc = ermes_build_batch(&net, &t, &ssi, &page, 1, &carry, b);
+	CHECK(rc == 1, "first batch rc %d", rc);
+	CHECK(carry.count > 0, "message runs on (carry %d)", carry.count);
+	n = partition_words(b, t.slot, 1, got);
+	CHECK(got[0] == ERMES_MD, "leading delimiter");
+	memmove(got, got + 1, (n - 1) * sizeof(uint32_t)); n--;
+	batches = 1;
+	/* the next batches (B, C, ... in slots 5, 6, ...) carry the rest right after their address
+	 * partition; batch B also has a page of its own, which must come after the closing delimiter */
+	while (carry.count && batches < 10) {
+		uint32_t part[200];
+		int np, before = carry.count;
+
+		t.slot++; t.batch++;
+		rc = ermes_build_batch(&net, &t, &ssi, (t.batch == 1) ? &next : NULL, (t.batch == 1) ? 1 : 0, &carry, b);
+		np = partition_words(b, t.slot, rc > 0 ? rc : 0, part);
+		CHECK(part[0] != ERMES_MD, "batch %c: no delimiter before the continued part", 'A' + t.batch);
+		for (i = 0; i < before - carry.count; i++) {
+			if (part[i] == ERMES_MD && i < before - carry.count - 1)
+				md_inside++;
+			got[n++] = part[i];
+		}
+		if (!carry.count && rc == 1) {
+			/* the page of this batch follows the closing delimiter */
+			i = before;
+			CHECK(part[i - 1] == ERMES_MD && part[i] != ERMES_MD, "next page right after the closing delimiter");
+		}
+		(void)np;
+		batches++;
+	}
+	CHECK(!carry.count, "message ended within %d batches", batches);
+	CHECK(md_inside == 0, "no delimiter inside the message");
+	CHECK(n == nall, "%d codewords received, %d sent", n, nall);
+	for (i = 0; i < n && i < nall; i++)
+		CHECK(got[i] == all[i], "codeword %d differs", i);
+	w = got[0];
+	CHECK(ermes_bch_decode(&w) == 0 && (w >> 12) == 0x318E4, "header after reassembly");
+	printf("continuation done (%d characters = %d codewords over %d batches)\n", 600, nall, batches);
 }
 
 int main(void)
@@ -251,6 +332,7 @@ int main(void)
 	test_batch_numbers();
 	test_channels();
 	test_frame();
+	test_continuation();
 	if (failed) {
 		printf("%d check(s) FAILED\n", failed);
 		return 1;

@@ -21,7 +21,7 @@
 #include "../libfsk/fsk_nrz.h"
 #include "frame.h"
 
-#define ERMES_MAX_TEXT	256
+#define ERMES_MAX_TEXT	1024	/* bytes of a message text (UTF-8), terminator included */
 
 /* --ssi: the SSI schedule. HOLD is the network schedule (default); the others are for tests of
  * receivers only, as is one SSIT (ERMES_SSIT_*) in every batch */
@@ -70,6 +70,7 @@ typedef struct ermes {
 	sample_t		*tx_buffer;
 	int			tx_buffer_size, tx_buffer_length, tx_buffer_pos;
 	uint8_t			batch_bits[ERMES_BATCH_CW_LAST * ERMES_CW_BITS];
+	ermes_carry_t		carry;			/* rest of a message running on into the next batches */
 } ermes_t;
 
 int ermes_create(const char *kanal, int channel, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double polarity, const ermes_network_t *net, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback);
