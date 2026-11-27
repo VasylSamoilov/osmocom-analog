@@ -156,6 +156,21 @@ static ermes_msg_t *new_msg(uint32_t local_address, const ermes_page_opts_t *opt
 	if (!m)
 		return NULL;
 	strcpy(m->text, (category == ERMES_CAT_TONE) ? "" : text);
+	/* DC1 (raw or <0x11>) is the end of an alphanumeric message (-2 Table B.3 note 1): the text
+	 * ends there, as on the air, and the rest is dropped */
+	if (category == ERMES_CAT_ALPHA) {
+		char *dc1 = strchr(m->text, 0x11), *esc;
+
+		for (esc = m->text; *esc && strncasecmp(esc, "<0x11>", 6); esc++)
+			;
+		if (*esc && (!dc1 || esc < dc1))
+			dc1 = esc;
+		if (dc1) {
+			LOGP(DERMES, LOGL_NOTICE, "Text cut at its DC1 (the end of message): \"%s\" dropped.\n",
+			     dc1 + ((*dc1 == 0x11) ? 1 : 6));
+			*dc1 = '\0';
+		}
+	}
 	m->page.local_address = local_address;
 	m->page.category = category;
 	m->page.urgent = opts->urgent;

@@ -54,7 +54,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x18 */ { "Σ" },
 	/* 0x19 */ { "θ" },
 	/* 0x1A */ { "Ξ" },
-	/* 0x1B */ { NULL },       /* ESCAPE: shown and written as <0x1B> */
+	/* 0x1B */ { "␛", "\x1b" },  /* U+241B, ESCAPE (also <0x1B>) */
 	/* 0x1C */ { "Æ" },
 	/* 0x1D */ { "æ" },
 	/* 0x1E */ { "ß" },
