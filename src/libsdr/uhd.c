@@ -24,6 +24,10 @@
 #include <math.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/ioctl.h>
+#include <linux/usbdevice_fs.h>
 #include <uhd.h>
 #include <uhd/usrp/usrp.h>
 #include "uhd.h"
@@ -70,6 +74,7 @@ typedef struct uhd_instance {
 	double			tx_fail_logged;	/* last 'still failing' line */
 	long long		tx_fail_dropped;/* tx_dropped when the failure began */
 	unsigned long		tx_fail_writes;	/* failed writes of this failure */
+	char			serial[64];	/* the device's serial (a USB reset of this one only) */
 } uhd_instance_t;
 
 static double uhd_mono_time(void)
@@ -140,7 +145,7 @@ static void init_software_clock(uhd_instance_t *inst)
 	LOGP(DUHD, LOGL_NOTICE, "Using software clock for TX-only mode (may drift relative to SDR sample clock)\n");
 }
 
-int uhd_open(size_t channel, const char *_device_args, const char *_stream_args, const char *_tune_args, const char *tx_antenna, const char *rx_antenna, const char *clock_source, double tx_frequency, double rx_frequency, double lo_offset, double rate, double tx_gain, double rx_gain, double bandwidth, int timestamps)
+static int uhd_open_device(size_t channel, const char *_device_args, const char *_stream_args, const char *_tune_args, const char *tx_antenna, const char *rx_antenna, const char *clock_source, double tx_frequency, double rx_frequency, double lo_offset, double rate, double tx_gain, double rx_gain, double bandwidth, int timestamps)
 {
 	uhd_error error;
 	double got_frequency, got_rate, got_gain, got_bandwidth;
@@ -452,6 +457,19 @@ int uhd_open(size_t channel, const char *_device_args, const char *_stream_args,
 			return -EIO;
 		}
 
+		/* the device's serial: a USB reset of this one if TX does not
+		 * respond at start */
+		{
+			uhd_usrp_tx_info_t info;
+
+			memset(&info, 0, sizeof(info));
+			if (!uhd_usrp_get_tx_info(inst->usrp, channel, &info)) {
+				if (info.mboard_serial)
+					snprintf(inst->serial, sizeof(inst->serial), "%s", info.mboard_serial);
+				uhd_usrp_tx_info_free(&info);
+			}
+		}
+
 		/* get buffer sizes */
 		error = uhd_tx_streamer_max_num_samps(inst->tx_streamer, &tx_samps_per_buff);
 		if (error) {
@@ -675,6 +693,169 @@ int uhd_open(size_t channel, const char *_device_args, const char *_stream_args,
 	/* Single-device mode: both TX and RX point to the same instance */
 	uhd_tx_inst = uhd_rx_inst = inst;
 
+	return 0;
+}
+
+/* USB reset of the Ettus USB device (vendor 2500) with this serial; waits
+ * until it is back. A network device has no USB entry: -ENODEV. */
+static int uhd_usb_reset(const char *serial)
+{
+	char path[512], val[64], dev[64] = "";
+	unsigned busnum = 0, devnum = 0;
+	struct dirent *de;
+	DIR *dir;
+	FILE *fp;
+	int fd, rc, i;
+
+	if (!serial[0])
+		return -ENODEV;
+	dir = opendir("/sys/bus/usb/devices");
+	if (!dir)
+		return -errno;
+	while ((de = readdir(dir)) && !dev[0]) {
+		int ok;
+
+		if (de->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", de->d_name);
+		if (!(fp = fopen(path, "r")))
+			continue;
+		ok = fgets(val, sizeof(val), fp) && !strncmp(val, "2500", 4);
+		fclose(fp);
+		if (!ok)
+			continue;
+		snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", de->d_name);
+		if (!(fp = fopen(path, "r")))
+			continue;
+		ok = fgets(val, sizeof(val), fp) != NULL;
+		fclose(fp);
+		val[strcspn(val, "\r\n")] = '\0';
+		if (!ok || strcmp(val, serial))
+			continue;
+		snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/busnum", de->d_name);
+		if ((fp = fopen(path, "r"))) {
+			ok = fscanf(fp, "%u", &busnum) == 1;
+			fclose(fp);
+		} else
+			ok = 0;
+		snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/devnum", de->d_name);
+		if (ok && (fp = fopen(path, "r"))) {
+			if (fscanf(fp, "%u", &devnum) == 1)
+				snprintf(dev, sizeof(dev), "/dev/bus/usb/%03u/%03u", busnum, devnum);
+			fclose(fp);
+		}
+	}
+	closedir(dir);
+	if (!dev[0])
+		return -ENODEV;
+
+	fd = open(dev, O_WRONLY);
+	if (fd < 0) {
+		rc = -errno;
+		LOGP(DUHD, LOGL_ERROR, "USB reset of the device %s (%s): %s\n", serial, dev, strerror(errno));
+		return rc;
+	}
+	rc = ioctl(fd, USBDEVFS_RESET, 0) < 0 ? -errno : 0;
+	close(fd);
+	if (rc) {
+		LOGP(DUHD, LOGL_ERROR, "USB reset of the device %s (%s): %s\n", serial, dev, strerror(-rc));
+		return rc;
+	}
+	/* back when its node can be opened again (up to 10 s) */
+	for (i = 0; i < 100; i++) {
+		usleep(100000);
+		fd = open(dev, O_WRONLY);
+		if (fd >= 0) {
+			close(fd);
+			break;
+		}
+	}
+	LOGP(DUHD, LOGL_NOTICE, "USB reset of the device %s (%s) done\n", serial, dev);
+	return 0;
+}
+
+#ifndef TEST_TX_PROBE_FAIL
+#define TEST_TX_PROBE_FAIL 0	/* test: the first start's TX probe fails */
+#endif
+
+/* Does TX take a write? One packet of zeros as a burst of its own (no time
+ * stamp, start and end of burst), before streaming starts. A broken USB
+ * transfer fails it at once. 0: it does; what: UHD's reason. */
+static int uhd_tx_probe(char *what, size_t len)
+{
+	const void *buffs_ptr[1];
+	uhd_tx_metadata_handle md = NULL;
+	size_t mtu = 0, count = 0;
+	uhd_error error;
+	float *zero;
+	int rc = 0;
+
+	what[0] = '\0';
+	if (!uhd_tx_inst || !uhd_tx_inst->tx_streamer)
+		return 0;
+	if (uhd_tx_streamer_max_num_samps(uhd_tx_inst->tx_streamer, &mtu) || !mtu)
+		return 0;
+	zero = calloc(mtu * 2, sizeof(float));
+	if (!zero)
+		return 0;
+	if (uhd_tx_metadata_make(&md, false, 0, 0.0, true, true)) {
+		free(zero);
+		return 0;
+	}
+	buffs_ptr[0] = zero;
+	error = uhd_tx_streamer_send(uhd_tx_inst->tx_streamer, buffs_ptr, mtu, &md, 0.5, &count);
+#if TEST_TX_PROBE_FAIL
+	{
+		static int failed;
+
+		if (!failed++) {
+			error = UHD_ERROR_IO;
+			snprintf(what, len, "TEST_TX_PROBE_FAIL");
+			rc = -1;
+		}
+	}
+#endif
+	if (error) {
+		uhd_tx_streamer_last_error(uhd_tx_inst->tx_streamer, what, len);
+		rc = -1;
+	} else if (count == 0 && !rc) {
+		snprintf(what, len, "nothing sent within 0.5 s");
+		rc = -1;
+	}
+	uhd_tx_metadata_free(&md);
+	free(zero);
+	return rc;
+}
+
+/* Open the device. With TX, one probe write: a device whose TX does not
+ * respond (its USB transfer broken, a state it keeps across processes
+ * until it is reset) is reset on USB and opened again, once. */
+int uhd_open(size_t channel, const char *_device_args, const char *_stream_args, const char *_tune_args, const char *tx_antenna, const char *rx_antenna, const char *clock_source, double tx_frequency, double rx_frequency, double lo_offset, double rate, double tx_gain, double rx_gain, double bandwidth, int timestamps)
+{
+	char what[256], serial[64];
+	int rc;
+
+	rc = uhd_open_device(channel, _device_args, _stream_args, _tune_args, tx_antenna, rx_antenna, clock_source, tx_frequency, rx_frequency, lo_offset, rate, tx_gain, rx_gain, bandwidth, timestamps);
+	if (rc < 0 || tx_frequency == 0.0 || !uhd_tx_probe(what, sizeof(what)))
+		return rc;
+
+	snprintf(serial, sizeof(serial), "%s", uhd_tx_inst->serial);
+	LOGP(DUHD, LOGL_ERROR, "TX of the device %s does not respond (%s): USB reset and open again\n",
+	     serial[0] ? serial : "(no serial)", what);
+	uhd_close();
+	if (uhd_usb_reset(serial) < 0) {
+		LOGP(DUHD, LOGL_ERROR, "TX does not respond and the device cannot be reset (not a USB device?)\n");
+		return -EIO;
+	}
+	rc = uhd_open_device(channel, _device_args, _stream_args, _tune_args, tx_antenna, rx_antenna, clock_source, tx_frequency, rx_frequency, lo_offset, rate, tx_gain, rx_gain, bandwidth, timestamps);
+	if (rc < 0)
+		return rc;
+	if (uhd_tx_probe(what, sizeof(what))) {
+		LOGP(DUHD, LOGL_ERROR, "TX still does not respond after the USB reset (%s)\n", what);
+		uhd_close();
+		return -EIO;
+	}
+	LOGP(DUHD, LOGL_NOTICE, "TX responds after the USB reset\n");
 	return 0;
 }
 
