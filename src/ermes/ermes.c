@@ -175,7 +175,7 @@ int ermes_msg_send(const char *line)
 		field[i] = p;
 	}
 	if (ermes_parse_address(buf, &la) < 0) {
-		LOGP(DERMES, LOGL_ERROR, "Bad address \"%s\" in \"%s\": the local address (decimal or 0x hex) or nec:<label code>.\n", buf, line);
+		LOGP(DERMES, LOGL_ERROR, "Bad address \"%s\" in \"%s\": the local address (decimal or 0x hex) or nec-<label code>.\n", buf, line);
 		return -1;
 	}
 	if (field[0] && *field[0] && (ermes_category_from_name(field[0], &opts.category) < 0 || opts.category == ERMES_CAT_TRANSPARENT)) {

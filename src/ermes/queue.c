@@ -141,6 +141,10 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 		LOGP(DERMES, LOGL_ERROR, "Local address 0x%X has more than %d bits.\n", local_address, ERMES_LA_BITS);
 		return -1;
 	}
+	if (ermes_is_cta(local_address)) {
+		LOGP(DERMES, LOGL_ERROR, "Local address 0x%X is a common temporary address of group calls (initial address all ones), not a receiver's.\n", local_address);
+		return -1;
+	}
 	if (!text)
 		text = "";
 	if (strlen(text) >= ERMES_MAX_TEXT) {

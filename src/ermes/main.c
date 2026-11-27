@@ -170,7 +170,7 @@ void print_help(const char *arg0)
 	printf("    --page <address>,<type>,<options>,<message>\n");
 	printf("        Queue this page --page-delay seconds after start (may be repeated).\n");
 	printf("        The address is the %d-bit local address, decimal or 0x hex, or\n", ERMES_LA_BITS);
-	printf("        nec:<code> as NEC shows it (\"Tokyo hex\", the local address * %d).\n", 1 << ERMES_NEC_SHIFT);
+	printf("        nec-<code> as NEC shows it (\"Tokyo hex\", the local address * %d).\n", 1 << ERMES_NEC_SHIFT);
 	printf("    --page-delay <seconds>\n");
 	printf("        Let the receiver find the channel first. (default %.0f)\n", page_delay);
 	printf("    --book <file>\n");
@@ -184,7 +184,7 @@ void print_help(const char *arg0)
 	printf("        Named pipe for pages, one per line as --page. (default %s)\n", MSG_SEND_DEFAULT);
 	printf("    FIFO protocol (as flex and pocsag):\n");
 	printf("        Format: address,type,options,message\n");
-	printf("          address  local address (decimal or 0x hex) or nec:<label code>\n");
+	printf("          address  local address (decimal or 0x hex) or nec-<label code>\n");
 	printf("          type     tone|numeric|alpha (empty: -y)\n");
 	printf("          options  space-separated key=value pairs:\n");
 	printf("                   priority=1-3  urgent=0|1  alert=0-7\n");
@@ -192,7 +192,7 @@ void print_help(const char *arg0)
 	printf("                   retransmit=0-%d  retransmit_interval=1-%d (seconds)\n",
 	       ERMES_RETRANSMIT_MAX, ERMES_RETRANSMIT_INTERVAL_MAX_S);
 	printf("          message  the rest of the line, commas included\n");
-	printf("        Example: nec:C63900,alpha,priority=1 urgent=1 alert=3,Call home, now\n");
+	printf("        Example: nec-C63900,alpha,priority=1 urgent=1 alert=3,Call home, now\n");
 	printf("        A page gets its message number when it is sent, so the numbers of an\n");
 	printf("        address go up on the air whatever the priorities.\n");
 	printf("    --fifo-file <file>\n");

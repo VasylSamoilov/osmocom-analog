@@ -253,8 +253,8 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 {
 	uint32_t msg[MAX_MSG_WORDS];	/* message partition codewords before interleaving */
 	uint32_t whole[ERMES_MAX_MSG_WORDS + 3];
-	int order[ERMES_MAX_IA];
-	int i, j, k, n = 0, nmsg, sent, cap, num_cb, nwhole, room;
+	int order[ERMES_MAX_IA];	/* the pages with an initial address in this batch */
+	int i, j, k, n = 0, nmsg, sent, nia, ia, cap, num_cb, nwhole, room;
 
 	if (t->slot < 0 || t->slot >= ERMES_BATCHES || t->batch < 0 || t->batch >= ERMES_BATCHES)
 		return -1;
@@ -263,6 +263,7 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 
 	nmsg = 0;
 	sent = 0;
+	nia = 0;
 	if (carry && carry->count) {
 		/* the rest of a message of the batch before comes first (§10.5): as much as fits
 		 * with no initial address; if it does not all fit, the batch carries only it */
@@ -279,13 +280,19 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		msg[nmsg++] = ERMES_MD;
 
 	/* the pages of this batch type: per message header + data + closing delimiter (§5.5.5); a
-	 * message that does not fit whole is started and runs on through the carry, as the last one */
+	 * message that does not fit whole is started and runs on through the carry, as the last one.
+	 * A message to a common temporary address (stage 3 of a group call, §10.3) has no initial
+	 * address: its receivers were addressed in their own batches and search for it (-5 §7.8
+	 * Fig.16: "PAD ... APT ... GROUP MESSAGE"); it may go in any batch. */
 	for (i = 0; i < num_pages; i++) {
 		uint32_t hdr[2], data[ERMES_MAX_MSG_WORDS];
 		int nd;
 
-		if (ermes_address_batch(pages[i].local_address) != t->batch)
+		ia = !ermes_is_cta(pages[i].local_address);
+		if (ia && ermes_address_batch(pages[i].local_address) != t->batch)
 			return -1;
+		if (ia && nia == ERMES_MAX_IA)
+			break;
 		nd = ermes_data_words(&pages[i], data, ERMES_MAX_MSG_WORDS);
 		if (nd < 0)
 			return -1;
@@ -297,12 +304,14 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 			whole[nwhole++] = ermes_bch_encode(data[j]);
 		whole[nwhole++] = ERMES_MD;
 		/* one more initial address takes room from the message partition */
-		cap = ermes_max_codeblocks(t->slot, sent + 1) * ERMES_CODEBLOCK_CW;
+		cap = ermes_max_codeblocks(t->slot, nia + ia) * ERMES_CODEBLOCK_CW;
 		room = cap - nmsg;
 		if (nwhole <= room) {
 			memcpy(msg + nmsg, whole, nwhole * sizeof(uint32_t));
 			nmsg += nwhole;
-			order[sent++] = i;
+			if (ia)
+				order[nia++] = i;
+			sent++;
 			continue;
 		}
 		/* runs on: the header and at least one data word here, the rest in the next batches */
@@ -311,7 +320,9 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 			nmsg += room;
 			memcpy(carry->cw, whole + room, (nwhole - room) * sizeof(uint32_t));
 			carry->count = nwhole - room;
-			order[sent++] = i;
+			if (ia)
+				order[nia++] = i;
+			sent++;
 		}
 		break;
 	}
@@ -326,20 +337,20 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 	put_word(bits, &n, ermes_bch_encode(ermes_ssi_word(ssi)));
 
 	/* address partition (§5.4 p.18): initial addresses, highest first, then APTs */
-	for (i = 0; i < sent; i++) {
-		for (j = i + 1; j < sent; j++) {
+	for (i = 0; i < nia; i++) {
+		for (j = i + 1; j < nia; j++) {
 			if (page_ia(&pages[order[j]]) > page_ia(&pages[order[i]])) {
 				k = order[i]; order[i] = order[j]; order[j] = k;
 			}
 		}
 	}
-	for (i = 0; i < sent; i++)
+	for (i = 0; i < nia; i++)
 		put_word(bits, &n, ermes_bch_encode(page_ia(&pages[order[i]])));
-	for (i = 0; i < ermes_apt_count(sent); i++)
+	for (i = 0; i < ermes_apt_count(nia); i++)
 		put_word(bits, &n, ERMES_APT);
 
 	/* message partition (§5.5, §7): fill every codeblock, idle ones with delimiters (§5.5.6-7) */
-	num_cb = ermes_max_codeblocks(t->slot, sent);
+	num_cb = ermes_max_codeblocks(t->slot, nia);
 	for (; nmsg < num_cb * ERMES_CODEBLOCK_CW; nmsg++)
 		msg[nmsg] = ERMES_MD;
 	for (k = 0; k < num_cb; k++) {
@@ -395,7 +406,7 @@ char ermes_batch_name(int batch)
 	return 'A' + batch;
 }
 
-#define NEC_PREFIX	"nec:"
+#define NEC_PREFIX	"nec-"	/* no ':' - lines may have "kind:" prefixes (tempgroup:) */
 
 int ermes_parse_address(const char *s, uint32_t *local_address)
 {
@@ -407,7 +418,7 @@ int ermes_parse_address(const char *s, uint32_t *local_address)
 		s += strlen(NEC_PREFIX);
 	if (!*s || *s == '-' || *s == '+')
 		return -1;
-	/* hex only with 0x (or nec:): a decimal number with leading zeros, as the console dials 7
+	/* hex only with 0x (or nec-): a decimal number with leading zeros, as the console dials 7
 	 * digits ("0000083"), is decimal, not octal */
 	if (nec)
 		v = strtoul(s, &end, 16);

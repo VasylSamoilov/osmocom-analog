@@ -100,7 +100,7 @@ int ermes_category_from_name(const char *name, enum ermes_category *category);	/
 char ermes_batch_name(int batch);						/* 0..15 -> 'A'..'P' */
 
 /* Address as the user gives it: "3247680" or "0x318E40" (22-bit local address), or
- * "nec:C63900" (NEC "Tokyo hex" of the pager label = local address * 4). 0 or -1. */
+ * "nec-C63900" (NEC "Tokyo hex" of the pager label = local address * 4). 0 or -1. */
 int ermes_parse_address(const char *s, uint32_t *local_address);
 /* "0x318E40 (NEC C63900), batch A" */
 const char *ermes_print_address(uint32_t local_address);

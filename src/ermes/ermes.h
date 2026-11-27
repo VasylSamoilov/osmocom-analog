@@ -53,7 +53,7 @@ int ermes_create(const char *kanal, int channel, const char *device, int use_sdr
 void ermes_destroy(sender_t *sender);
 
 /* Queue a page from a FIFO or --page line, as flex and pocsag: "address,type,options,message"
- * (the message is the rest of the line); the address decimal, 0x hex or nec:<label code> */
+ * (the message is the rest of the line); the address decimal, 0x hex or nec-<label code> */
 int ermes_msg_send(const char *line);
 
 /* 1 if nothing is queued */

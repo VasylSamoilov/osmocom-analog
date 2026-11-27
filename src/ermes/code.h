@@ -91,6 +91,21 @@ static inline int ermes_address_batch(uint32_t local_address)
 	return local_address & ((1u << ERMES_BATCH_BITS) - 1);
 }
 
+/* Common temporary addresses of group calls (§10.3 p.32, Table 16 p.22): the group initial
+ * address, eighteen ones, and the 4-bit pointer (CTAP 0..15) in place of the batch type. Not the
+ * address of a receiver. */
+#define ERMES_CTA_IA		((1u << ERMES_IA_BITS) - 1)
+#define ERMES_CTAP_COUNT	16
+static inline int ermes_is_cta(uint32_t local_address)
+{
+	return ermes_initial_address(local_address) == ERMES_CTA_IA;
+}
+
+static inline uint32_t ermes_cta(int ctap)
+{
+	return (ERMES_CTA_IA << ERMES_BATCH_BITS) | (ctap & ((1u << ERMES_BATCH_BITS) - 1));
+}
+
 /* SSI types (Table 4 p.16) */
 #define ERMES_SSIT_ZONE_HOUR_DATE	0x0
 #define ERMES_SSIT_DAY_MONTH_YEAR	0x1

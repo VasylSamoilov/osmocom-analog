@@ -28,7 +28,7 @@ per line, as flex and pocsag:
 
 ```
 address,type,options,message
-nec:C63900,alpha,priority=1 urgent=1,Call home
+nec-C63900,alpha,priority=1 urgent=1,Call home
 ```
 
 `ermes -h` lists all options. The type defaults to tone (`-y`), and a tone
@@ -48,7 +48,7 @@ the other programs.
 5. Send a page:
 
 ```
-echo 'nec:C63900,alpha,,Hello' > /tmp/ermes_msg_send
+echo 'nec-C63900,alpha,,Hello' > /tmp/ermes_msg_send
 ```
 
 If the pager does not lock, the network or the channel is wrong, or its FSN
@@ -63,12 +63,12 @@ address can be given three ways; all three below are the same pager:
 |---------------|--------------|--------------------------------------------|
 | decimal       | `3247680`    | the local address, 0..4194303              |
 | hex           | `0x318E40`   | the local address, 0x0..0x3FFFFF           |
-| NEC label     | `nec:C63900` | NEC "Tokyo hex": the local address * 4     |
+| NEC label     | `nec-C63900` | NEC "Tokyo hex": the local address * 4     |
 
 NEC pagers show and program the address in "Tokyo hex", the local address
-shifted left by two bits. The code on the label is this value. A `nec:` code
+shifted left by two bits. The code on the label is this value. A `nec-` code
 must be a multiple of 4 (its two lowest bits zero) and at most `FFFFFC`:
-`nec:C63901` is refused.
+`nec-C63901` is refused.
 
 A decimal address may have leading zeros (`0000083` is 83, as the console
 dials 7 digits); hex needs `0x`.
@@ -178,7 +178,7 @@ A line has four fields, separated by commas:
 address,type,options,message
 ```
 
-- `address`: as in Addresses (`3247680`, `0x318E40`, `nec:C63900`).
+- `address`: as in Addresses (`3247680`, `0x318E40`, `nec-C63900`).
 - `type`: `tone`, `numeric` or `alpha` (or `t`, `n`, `a`). Empty: `-y`.
 - `options`: space-separated `key=value` pairs, may be empty.
 - `message`: the rest of the line, commas included. Missing: `-M`.
@@ -207,10 +207,10 @@ code) is not queued; the log says why.
 Examples:
 
 ```
-nec:C63900,alpha,,Call home
-nec:C63900,numeric,,0123 456-789
-nec:C63900,tone
-nec:C63900,tone,urgent=1 alert=3
+nec-C63900,alpha,,Call home
+nec-C63900,numeric,,0123 456-789
+nec-C63900,tone
+nec-C63900,tone,urgent=1 alert=3
 0x318E40,alpha,priority=1 urgent=1,Meeting at 10, room 2
 3247680,alpha,retransmit=2 retransmit_interval=60,Sent three times, one number
 ```
@@ -218,7 +218,7 @@ nec:C63900,tone,urgent=1 alert=3
 Write to the FIFO from a shell:
 
 ```
-echo 'nec:C63900,alpha,,Hello' > /tmp/ermes_msg_send
+echo 'nec-C63900,alpha,,Hello' > /tmp/ermes_msg_send
 ```
 
 or put the lines in a file and run with `--fifo-file pages.txt`.
