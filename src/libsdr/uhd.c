@@ -27,10 +27,13 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <linux/usbdevice_fs.h>
 #include <uhd.h>
 #include <uhd/usrp/usrp.h>
 #include "uhd.h"
+#include "../libsample/sample.h"
+#include "sdr.h"
 #include "sdr_config.h"
 #include "../liblogging/logging.h"
 #include "../liboptions/options.h"
@@ -139,6 +142,80 @@ static uhd_instance_t *uhd_rx_inst = NULL;
 int uhd_tx_dead(void)
 {
 	return uhd_tx_inst && uhd_tx_inst->tx_dead;
+}
+
+/* a lock sensor of the motherboard: 1 locked, 0 not, -1 no such sensor (a missing sensor is not
+ * "unlocked": a B210 without GPSDO has no gps_locked) */
+static int clock_sensor(uhd_usrp_handle usrp, uhd_string_vector_handle names, size_t n, const char *name)
+{
+	uhd_sensor_value_handle value;
+	char got[64];
+	bool locked = false;
+	size_t i;
+	int rc = -1;
+
+	for (i = 0; i < n; i++) {
+		if (uhd_string_vector_at(names, i, got, sizeof(got)) == UHD_ERROR_NONE && !strcmp(got, name))
+			break;
+	}
+	if (i == n)
+		return -1;
+	if (uhd_sensor_value_make(&value) != UHD_ERROR_NONE)
+		return -1;
+	if (uhd_usrp_get_mboard_sensor(usrp, name, 0, &value) == UHD_ERROR_NONE
+	 && uhd_sensor_value_to_bool(value, &locked) == UHD_ERROR_NONE)
+		rc = locked ? 1 : 0;
+	uhd_sensor_value_free(&value);
+	return rc;
+}
+
+/* Read the TX device's clock into *st and log what changed (UHD category, only on change). From
+ * the main loop only: these are control-path calls that can block for milliseconds. */
+void uhd_clock_poll(sdr_clock_status_t *st)
+{
+	uhd_instance_t *inst = uhd_tx_inst;
+	uhd_string_vector_handle names;
+	sdr_clock_status_t now;
+	struct timeval tv;
+	int64_t secs;
+	double frac;
+	size_t n = 0;
+
+	if (!inst || !inst->usrp)
+		return;
+	memset(&now, 0, sizeof(now));
+	now.valid = 1;
+	now.ref_locked = now.gps_locked = -1;
+	if (uhd_usrp_get_clock_source(inst->usrp, 0, now.clock_source, sizeof(now.clock_source)) != UHD_ERROR_NONE)
+		strcpy(now.clock_source, "?");
+	if (uhd_usrp_get_time_source(inst->usrp, 0, now.time_source, sizeof(now.time_source)) != UHD_ERROR_NONE)
+		strcpy(now.time_source, "?");
+	if (uhd_string_vector_make(&names) == UHD_ERROR_NONE) {
+		if (uhd_usrp_get_mboard_sensor_names(inst->usrp, 0, &names) == UHD_ERROR_NONE)
+			uhd_string_vector_size(names, &n);
+		now.ref_locked = clock_sensor(inst->usrp, names, n, "ref_locked");
+		now.gps_locked = clock_sensor(inst->usrp, names, n, "gps_locked");
+		uhd_string_vector_free(&names);
+	}
+	if (uhd_usrp_get_time_now(inst->usrp, 0, &secs, &frac) == UHD_ERROR_NONE) {
+		gettimeofday(&tv, NULL);
+		now.have_time = 1;
+		now.device_time = (double)secs + frac;
+		now.system_time = tv.tv_sec + tv.tv_usec / 1e6;
+	}
+	now.ref_changes = st->ref_changes + (st->valid && now.ref_locked != st->ref_locked);
+	now.gps_changes = st->gps_changes + (st->valid && now.gps_locked != st->gps_locked);
+	if (!st->valid || strcmp(now.clock_source, st->clock_source) || strcmp(now.time_source, st->time_source)
+	 || now.ref_locked != st->ref_locked || now.gps_locked != st->gps_locked) {
+		LOGP(DUHD, st->valid ? LOGL_NOTICE : LOGL_INFO,
+		     "Clock: reference %s%s, time source %s%s (lock changes so far: reference %lu, GPS %lu)\n",
+		     now.clock_source,
+		     now.ref_locked < 0 ? "" : now.ref_locked ? " locked" : " NOT LOCKED",
+		     now.time_source,
+		     now.gps_locked < 0 ? ", no GPS" : now.gps_locked ? ", GPS locked" : ", GPS NOT LOCKED",
+		     now.ref_changes, now.gps_changes);
+	}
+	*st = now;
 }
 
 static double get_software_time(uhd_instance_t *inst)

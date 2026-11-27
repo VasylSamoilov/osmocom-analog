@@ -11,6 +11,26 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 int sdr_get_tosend(void *inst, int buffer_size);
 /* the SDR cannot go on (TX transport broken): the program's exit code, 0: works */
 int sdr_fatal(void);
+
+/* The TX device's clock: reference, time source, lock sensors, device time. Read in the main loop
+ * only (control-path calls that can block for milliseconds: never in the read/write threads). */
+typedef struct sdr_clock_status {
+	int		valid;			/* read at least once */
+	char		clock_source[32];	/* "internal", "external", "gpsdo" ... */
+	char		time_source[32];
+	int		ref_locked;		/* 1 locked, 0 not, -1 no such sensor */
+	int		gps_locked;		/* 1 locked, 0 not, -1 no such sensor (no GPSDO) */
+	unsigned long	ref_changes, gps_changes; /* lock changes seen since the start */
+	int		have_time;
+	/* the device time and the system clock at (nearly) the same moment. Without PPS the
+	 * device time is not UTC: it counts from when UHD set it at the start, so the two give the
+	 * device clock's drift against the system clock, not an offset to UTC. */
+	double		device_time, system_time;
+} sdr_clock_status_t;
+/* poll the clock status (rate-limited to once a second; logs changes only): from the main loop */
+void sdr_clock_poll(void);
+/* the last status; 0, or -1 if the device has none (no UHD TX) */
+int sdr_clock_status(sdr_clock_status_t *status);
 double sdr_set_rx_trim(void *inst, int channel, double hz);
 void sdr_set_rx_bandwidth(void *inst, int channel, double hz);
 void calibrate_bias(void);

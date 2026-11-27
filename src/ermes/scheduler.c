@@ -23,9 +23,12 @@
 #include <pthread.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/timex.h>
+#include <unistd.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "../libmobile/main_mobile.h"
+#include "../libmobile/get_time.h"
 #include "ermes.h"
 #include "ssi.h"
 #include "scheduler.h"
@@ -59,6 +62,37 @@ static struct {
 	double		clock_start;
 } grid;
 
+/* The system clock against UTC (NTP): the grid is set from it at the start. ETS 300 133-4 §12.4
+ * wants the cycles within ±2 ms of UTC; better than NTP is not possible this way. Said once. */
+static void system_clock_check(void)
+{
+	struct timex tx;
+	int state;
+
+	if (sample_clock_active())
+		return;	/* a run of wave files: the samples are the time */
+	memset(&tx, 0, sizeof(tx));
+	state = ntp_adjtime(&tx);
+	if (state < 0) {
+		LOGP(DERMES, LOGL_NOTICE, "System clock: its NTP state can't be read; the grid is set from it (ETS 300 133-4 §12.4: within ±2 ms of UTC).\n");
+		return;
+	}
+	if (state == TIME_ERROR || (tx.status & STA_UNSYNC)) {
+		/* systemd-timesyncd (SNTP) sets the clock without the kernel's error estimate: it
+		 * marks a synchronised clock with this file */
+		if (access("/run/systemd/timesync/synchronized", F_OK) == 0) {
+			LOGP(DERMES, LOGL_INFO, "System clock: synchronised by systemd-timesyncd (SNTP, no error estimate, typically a few ms; chrony gives an estimate and better time).\n");
+			return;
+		}
+		LOGP(DERMES, LOGL_NOTICE, "System clock NOT synchronised (NTP): the grid is set from it, ETS 300 133-4 §12.4 wants the cycles within ±2 ms of UTC. Run chrony or ntpd (timedatectl set-ntp true).\n");
+		return;
+	}
+	LOGP(DERMES, (tx.esterror > 2000) ? LOGL_NOTICE : LOGL_INFO,
+	     "System clock: NTP synchronised, estimated error %.2f ms (maximum %.1f ms)%s\n",
+	     tx.esterror / 1000.0, tx.maxerror / 1000.0,
+	     (tx.esterror > 2000) ? " - more than the ±2 ms of ETS 300 133-4 §12.4: a better time source (local NTP server, GPS)" : "");
+}
+
 static void start_time(ermes_t *ermes)
 {
 	struct timeval tv;
@@ -77,6 +111,7 @@ static void start_time(ermes_t *ermes)
 		ermes->started = 1;
 		return;
 	}
+	system_clock_check();
 	gettimeofday(&tv, NULL);
 	/* the first sample made now is on the air after the latency and the premodulation filter */
 	now = tv.tv_sec + tv.tv_usec / 1e6 + ermes_clock_offset

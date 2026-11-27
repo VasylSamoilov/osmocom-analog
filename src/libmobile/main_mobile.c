@@ -1113,6 +1113,9 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 			*quit = 1;
 			break;
 		}
+		/* the device's clock: reference, locks, time (once a second, changes logged) */
+		if (use_sdr)
+			sdr_clock_poll();
 #endif
 
 		/* process sound of all transceivers */

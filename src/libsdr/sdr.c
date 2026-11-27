@@ -2350,6 +2350,34 @@ int sdr_fatal(void)
 	return 0;
 }
 
+static sdr_clock_status_t clock_status;
+static double clock_polled;
+
+void sdr_clock_poll(void)
+{
+#ifdef HAVE_UHD
+	struct timespec ts;
+	double now;
+
+	if (tx_driver != 1)
+		return;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	now = ts.tv_sec + ts.tv_nsec / 1e9;
+	if (clock_status.valid && now - clock_polled < 1.0)
+		return;
+	clock_polled = now;
+	uhd_clock_poll(&clock_status);
+#endif
+}
+
+int sdr_clock_status(sdr_clock_status_t *status)
+{
+	if (!clock_status.valid)
+		return -1;
+	*status = clock_status;
+	return 0;
+}
+
 static int sdr_tx_device_paced(void)
 {
 #ifdef HAVE_UHD
