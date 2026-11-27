@@ -52,7 +52,8 @@ typedef struct ermes_batch_time {
 	int	batch;		/* 0..15 batch type A..P sent in this slot (channel dependent) */
 } ermes_batch_time_t;
 
-/* A message to send: one individual call, no additional information (AII = 0) */
+/* A message to send: an individual call without additional information (AII = 0), or a stage of
+ * a group call (below) */
 typedef struct ermes_page {
 	uint32_t		local_address;	/* 22 bit; 4 LSBs = batch type */
 	int			number;		/* message number 1..31, 0 = numbering off; -1 = not given
@@ -63,7 +64,9 @@ typedef struct ermes_page {
 	const char		*text;		/* UTF-8 */
 	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = ERMES standard (Table B.3) */
 	int			group_pointer;	/* stage 2 of a group call (§10.3): 1..16 = CTAP 0..15,
-						 * sent as AII 1, AIT 111, AIN = CTAP, no data; 0 = none */
+						 * sent as AII 1, AIT 111, AIN = CTAP, no data; 0 = none.
+						 * Without no_ia: with the initial address (stage 1
+						 * and 2 together, --group-fig16) */
 	int			ia_only;	/* stage 1 of a group call: only the initial address, no
 						 * message in this batch */
 	int			no_ia;		/* stage 2: the message only, no initial address (it
@@ -131,10 +134,13 @@ typedef struct ermes_carry {
 
 /* Build one batch. pages[] must all belong to this batch type (the initial address is only
  * sent in its own batch, §4.1 p.10). The message partition starts with the carry of the batch
- * before (if any); then the messages of the pages, each whole, and the last one may run on into
- * the next batches through the carry. With carry NULL every message must fit whole.
+ * before (if any); then the messages of the pages that fit, taken in the order given, each
+ * whole, and one more may run on into the next batches through the carry. On the air they go in
+ * ascending order of local address, so one runs on only if it is the highest. A batch
+ * with message data but no initial address gets a PAD (eighteen ones) in its address partition.
+ * With carry NULL every message must fit whole. Up to ERMES_MAX_IA pages (Table 1).
  * bits[] gets ermes_batch_length(t->slot) * 30 bits, one per byte, in air order.
- * Returns the number of pages sent (the first ones that fit), or -1 on error. */
+ * Returns the number of pages sent (the first ones given that fit), or -1 on error. */
 int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, const ermes_ssi_t *ssi,
 		      const ermes_page_t *pages, int num_pages, ermes_carry_t *carry, uint8_t *bits);
 

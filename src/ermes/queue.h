@@ -65,8 +65,9 @@ struct ermes;
 /* A group call (§10.3): one message to several receivers through a common temporary address.
  * Each member is served by one channel (the one carrying its FSN), one stage per batch, one after
  * another: its initial address alone in its own batch (stage 1; it then searches the subsequent
- * batches), its pointer in the next batch (stage 2), and after the last member's pointer, in the
- * next batch, the message once to the CTA (stage 3). */
+ * batches), its pointer in the next batch (stage 2; with --group-fig16 with stage 1), and after
+ * the last member's pointer, in the next batch, the message once to the CTA (stage 3). At most 32
+ * members: a limit of this program, not of the standard. */
 #define ERMES_GROUP_MAX_MEMBERS	32
 typedef struct ermes_group {
 	int			num;

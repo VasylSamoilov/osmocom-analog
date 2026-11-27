@@ -300,7 +300,9 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 	 * A message to a common temporary address (stage 3 of a group call, §10.3) has no initial
 	 * address: its receivers were addressed in their own batches and search for it (-5 §7.8
 	 * Fig.16: "PAD ... APT ... GROUP MESSAGE"); it may go in any batch. So has a group call's
-	 * stage 2 (no_ia), and stage 1 is an initial address without message (ia_only). */
+	 * stage 2 (no_ia), and stage 1 is an initial address without message (ia_only), or with the
+	 * pointer (--group-fig16). The pages are taken in the order given (priority, then arrival);
+	 * the order on the air is set below. */
 	for (i = 0; i < num_pages; i++) {
 		uint32_t hdr[2], data[ERMES_MAX_MSG_WORDS];
 		int nd;

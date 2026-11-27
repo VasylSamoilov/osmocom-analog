@@ -16,9 +16,10 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
- * The transmitter is a single channel network (FSI 30) that sends continuously: every batch
- * of every subsequence, idle ones with only system information, APTs and message delimiters,
- * so that a pager finds the channel, locks to it and keeps its batch timing.
+ * Each channel (-k) sends continuously: every batch of every subsequence, idle ones with only
+ * system information, APTs and message delimiters, so that a pager finds the channel, locks to
+ * it and keeps its batch timing. One channel is a single channel network (FSI 30); several form
+ * one network, each carrying its frequency subset (--fsi, §9.2).
  *
  * It behaves as an I1 version 01.00 network (ETS 300 133-4 ed.2 §4.6, Table 2 p.14): no IVR1
  * (SSIT 0010) and only the SSI types of edition 1, 0000 (zone/hour/date) and 0001

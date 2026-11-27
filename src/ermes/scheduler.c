@@ -153,13 +153,15 @@ static void next_slot(ermes_t *ermes)
  * own batch; it then searches its local address "in subsequent batches" (§10.3 - not in the current
  * one, as for an individual call, §10.2). Stage 2: in the next batch, a header to its local
  * address with its own next number and AII 1, AIT 111, AIN = CTAP (no initial address, no data).
+ * With --group-fig16 stage 2 goes with stage 1, in the member's own batch (-5 §7.8 Fig.16).
  * Stage 3: in the batch after the last member's stage 2, the message itself to the common
  * temporary address with number 00000, ended as any message (EOM, fill, delimiter). The call ends
  * there; the CTAP is held until 12 s after the last member's initial address (§10.8.2). A call
  * starts at a time slot from which its members' batches, plus the two batches of stage 2 and 3,
  * are within 16 batches: the members search only 12 s from their initial address. While a call is
  * on, the channel sends nothing else, and it starts one only with no message running on (the
- * carry), so no batch lacks room.
+ * carry), so no batch lacks room. A member gets no other message from its initial address until
+ * the message is sent (also while it runs on); in the hold it does.
  */
 #define GROUP_SEARCH_S	12.0	/* §10.8.2 */
 
@@ -501,7 +503,8 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 		char when[64];
 
 		m = msgs[i];
-		/* the batch builder sends the first pages given, in this order */
+		/* the batch builder sends the first pages given (on the air in ascending order of
+		 * local address; several to one address keep the order of their numbers) */
 		if (m->page.number < 0) {
 			if (ermes_number_next(m->page.local_address) != pages[i].number)
 				LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);

@@ -27,9 +27,9 @@
 #include "scheduler.h"
 
 /* A common temporary address pointer (CTAP) of a channel: free -> addressing (stage 1 and 2: the
- * members get their initial address and the pointer, each in its batch) -> message (stage 3 runs
- * on into further batches) -> hold (the members may still search, §10.8.2: no reuse until 12 s
- * after the last member's batch) -> free */
+ * members get their initial address and the pointer, each in its batch, or with --group-fig16
+ * both in one) -> message (stage 3 runs on into further batches) -> hold (the members may still
+ * search, §10.8.2: no reuse until 12 s after the last member's batch) -> free */
 enum ermes_ctap_state {
 	ERMES_CTAP_FREE = 0,
 	ERMES_CTAP_ADDRESSING,
@@ -46,7 +46,8 @@ typedef struct ermes_ctap_slot {
 	uint64_t		last_pointer_at;	/* the batch of the last stage 2 (scheduler), 0 = none */
 	double			first, last;	/* network time of the first and last member's initial address */
 	double			free_at;	/* hold: network time it becomes free */
-	/* its receivers on this channel: they get no other message until the slot is free */
+	/* its receivers on this channel: they get no other message while it is addressing or
+	 * message; in hold they do */
 	uint32_t		member[ERMES_GROUP_MAX_MEMBERS];
 } ermes_ctap_slot_t;
 

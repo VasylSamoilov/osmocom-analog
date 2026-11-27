@@ -2,9 +2,9 @@
 
 `ermes` is an ERMES paging network (ETS 300 133): batches locked to UTC, the
 system information with the time and date, individual pages (tone, numeric,
-alphanumeric), message numbers, urgent pages, alert types, priorities,
-retransmission and long messages over several batches. One or more channels
-(`-k`) form one network with one queue.
+alphanumeric), group calls, message numbers, urgent pages, alert types,
+priorities, retransmission and long messages over several batches. One or
+more channels (`-k`) form one network with one queue.
 
 References below are to ETS 300 133-4 (air interface, edition 2, 1997) unless
 another part is named.
@@ -277,6 +277,11 @@ batch, one after another for each member:
    with message number 0, ended as any message; every member files it under
    the number it was given. The call ends there.
 
+With `--group-fig16` stage 2 goes with stage 1: the pointer with the member's
+initial address in its own batch, as the receiver test of group calls has it
+(ETS 300 133-5 §7.8 Fig.16), and the text in the batch after the last member.
+Observed with the NEC PA3E6-1A: the group text arrived with both layouts.
+
 All within 16 batches of the first initial address: the members search only
 12 s (§10.8.2). A call starts at a time slot from which its stages fit; a
 group whose members' batch types are spread over more than 14 batches in a
@@ -288,17 +293,17 @@ members get no other message from their initial address until the text is
 sent (also while a long text runs on); from the next batch they take other
 messages again. The pointer itself is held 12 s after the last member's
 initial address (the members may still search for its text), then free for
-another call. The 16 pointers of a
-channel each go: free, addressing, message (the text runs on into further
-batches), hold, free; the log shows every change. A member is served by the
-channel that carries its FSN. At most 32 members; `retransmit=` is refused
-for group calls.
+another call. The 16 pointers of a channel each go: free, addressing, message
+(the text runs on into further batches), hold, free; the log shows every
+change. A member is served by the channel that carries its FSN. At most 32
+members (a limit of this program, not of the standard); `retransmit=` is
+refused for group calls.
 
 A batch that carries a pointer (stage 2), the text (stage 3) or the rest of a
 long message continued from the batch before (§10.5) has no initial address
-of its own; when no other traffic fills its address partition, it gets a PAD
-there: the group initial address, eighteen ones, the highest of
-all and nobody's own. The receiver test of group calls has these batches
+of its own; when no other initial address is in the batch, it gets a PAD in
+its address partition: the group initial address, eighteen ones, the highest
+of all and nobody's own. The receiver test of group calls has these batches
 occupied the same way (ETS 300 133-5 §7.8 Fig.16, TBR 7 §8.15: "PAD: an
 initial address, higher than the receiver under test, used to occupy start
 of address partition"). Receivers skip a batch whose address partition holds
