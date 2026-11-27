@@ -24,8 +24,13 @@ typedef struct sdr_clock_status {
 	int		have_time;
 	/* the device time and the system clock at (nearly) the same moment. Without PPS the
 	 * device time is not UTC: it counts from when UHD set it at the start, so the two give the
-	 * device clock's drift against the system clock, not an offset to UTC. */
-	double		device_time, system_time;
+	 * device clock's drift against the system clock, not an offset to UTC. system_time is the
+	 * middle of the system clock read before and after the device's; time_uncertainty half the
+	 * span (the USB control round trip): reject wide ones. */
+	double		device_time, system_time, time_uncertainty;
+	double		system_raw;	/* the same moment on CLOCK_MONOTONIC_RAW: no NTP slews, the
+					 * fair yardstick for the device clock's rate */
+	double		poll_ms, poll_ms_max;	/* how long the last / longest poll blocked the main loop */
 } sdr_clock_status_t;
 /* poll the clock status (rate-limited to once a second; logs changes only): from the main loop */
 void sdr_clock_poll(void);

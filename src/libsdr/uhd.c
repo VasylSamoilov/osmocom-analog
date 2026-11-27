@@ -79,6 +79,10 @@ typedef struct uhd_instance {
 	unsigned long		tx_fail_writes;	/* failed writes of this failure */
 	char			serial[64];	/* the device's serial (a USB reset of this one only) */
 	int			tx_dead;	/* writes failed too long: the program stops */
+	/* clock status: what does not change while running, read once (uhd_clock_poll) */
+	int			clock_cached;
+	char			clock_source[32], time_source[32];
+	int			has_ref_sensor, has_gps_sensor;
 } uhd_instance_t;
 
 /* TX writes failing this long while running: the transport is broken (a
@@ -144,22 +148,27 @@ int uhd_tx_dead(void)
 	return uhd_tx_inst && uhd_tx_inst->tx_dead;
 }
 
-/* a lock sensor of the motherboard: 1 locked, 0 not, -1 no such sensor (a missing sensor is not
- * "unlocked": a B210 without GPSDO has no gps_locked) */
-static int clock_sensor(uhd_usrp_handle usrp, uhd_string_vector_handle names, size_t n, const char *name)
+/* is there a motherboard sensor of this name (a missing one is not "unlocked": a B210 without
+ * GPSDO has no gps_locked) */
+static int has_sensor(uhd_string_vector_handle names, size_t n, const char *name)
 {
-	uhd_sensor_value_handle value;
 	char got[64];
-	bool locked = false;
 	size_t i;
-	int rc = -1;
 
 	for (i = 0; i < n; i++) {
 		if (uhd_string_vector_at(names, i, got, sizeof(got)) == UHD_ERROR_NONE && !strcmp(got, name))
-			break;
+			return 1;
 	}
-	if (i == n)
-		return -1;
+	return 0;
+}
+
+/* a lock sensor of the motherboard: 1 locked, 0 not */
+static int clock_sensor(uhd_usrp_handle usrp, const char *name)
+{
+	uhd_sensor_value_handle value;
+	bool locked = false;
+	int rc = -1;
+
 	if (uhd_sensor_value_make(&value) != UHD_ERROR_NONE)
 		return -1;
 	if (uhd_usrp_get_mboard_sensor(usrp, name, 0, &value) == UHD_ERROR_NONE
@@ -176,33 +185,52 @@ void uhd_clock_poll(sdr_clock_status_t *st)
 	uhd_instance_t *inst = uhd_tx_inst;
 	uhd_string_vector_handle names;
 	sdr_clock_status_t now;
-	struct timeval tv;
+	struct timespec before, after, raw_before, raw_after, start, end;
 	int64_t secs;
 	double frac;
 	size_t n = 0;
 
 	if (!inst || !inst->usrp)
 		return;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	/* the sources and the sensor list do not change while running: once */
+	if (!inst->clock_cached) {
+		inst->clock_cached = 1;
+		if (uhd_usrp_get_clock_source(inst->usrp, 0, inst->clock_source, sizeof(inst->clock_source)) != UHD_ERROR_NONE)
+			strcpy(inst->clock_source, "?");
+		if (uhd_usrp_get_time_source(inst->usrp, 0, inst->time_source, sizeof(inst->time_source)) != UHD_ERROR_NONE)
+			strcpy(inst->time_source, "?");
+		if (uhd_string_vector_make(&names) == UHD_ERROR_NONE) {
+			if (uhd_usrp_get_mboard_sensor_names(inst->usrp, 0, &names) == UHD_ERROR_NONE)
+				uhd_string_vector_size(names, &n);
+			inst->has_ref_sensor = has_sensor(names, n, "ref_locked");
+			inst->has_gps_sensor = has_sensor(names, n, "gps_locked");
+			uhd_string_vector_free(&names);
+		}
+	}
 	memset(&now, 0, sizeof(now));
 	now.valid = 1;
-	now.ref_locked = now.gps_locked = -1;
-	if (uhd_usrp_get_clock_source(inst->usrp, 0, now.clock_source, sizeof(now.clock_source)) != UHD_ERROR_NONE)
-		strcpy(now.clock_source, "?");
-	if (uhd_usrp_get_time_source(inst->usrp, 0, now.time_source, sizeof(now.time_source)) != UHD_ERROR_NONE)
-		strcpy(now.time_source, "?");
-	if (uhd_string_vector_make(&names) == UHD_ERROR_NONE) {
-		if (uhd_usrp_get_mboard_sensor_names(inst->usrp, 0, &names) == UHD_ERROR_NONE)
-			uhd_string_vector_size(names, &n);
-		now.ref_locked = clock_sensor(inst->usrp, names, n, "ref_locked");
-		now.gps_locked = clock_sensor(inst->usrp, names, n, "gps_locked");
-		uhd_string_vector_free(&names);
-	}
+	strcpy(now.clock_source, inst->clock_source);
+	strcpy(now.time_source, inst->time_source);
+	now.ref_locked = inst->has_ref_sensor ? clock_sensor(inst->usrp, "ref_locked") : -1;
+	now.gps_locked = inst->has_gps_sensor ? clock_sensor(inst->usrp, "gps_locked") : -1;
+	/* the system clock read before and after the device's: the middle, and half the span */
+	clock_gettime(CLOCK_MONOTONIC_RAW, &raw_before);
+	clock_gettime(CLOCK_REALTIME, &before);
 	if (uhd_usrp_get_time_now(inst->usrp, 0, &secs, &frac) == UHD_ERROR_NONE) {
-		gettimeofday(&tv, NULL);
+		clock_gettime(CLOCK_REALTIME, &after);
+		clock_gettime(CLOCK_MONOTONIC_RAW, &raw_after);
 		now.have_time = 1;
 		now.device_time = (double)secs + frac;
-		now.system_time = tv.tv_sec + tv.tv_usec / 1e6;
+		now.system_time = ((before.tv_sec + before.tv_nsec / 1e9) + (after.tv_sec + after.tv_nsec / 1e9)) / 2.0;
+		now.system_raw = ((raw_before.tv_sec + raw_before.tv_nsec / 1e9) + (raw_after.tv_sec + raw_after.tv_nsec / 1e9)) / 2.0;
+		now.time_uncertainty = ((after.tv_sec - before.tv_sec) + (after.tv_nsec - before.tv_nsec) / 1e9) / 2.0;
 	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	now.poll_ms = ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) * 1e3;
+	now.poll_ms_max = (now.poll_ms > st->poll_ms_max) ? now.poll_ms : st->poll_ms_max;
+	if (now.poll_ms_max > st->poll_ms_max && st->valid)
+		LOGP(DUHD, LOGL_DEBUG, "Clock poll blocked the main loop %.2f ms (new maximum)\n", now.poll_ms_max);
 	now.ref_changes = st->ref_changes + (st->valid && now.ref_locked != st->ref_locked);
 	now.gps_changes = st->gps_changes + (st->valid && now.gps_locked != st->gps_locked);
 	if (!st->valid || strcmp(now.clock_source, st->clock_source) || strcmp(now.time_source, st->time_source)
