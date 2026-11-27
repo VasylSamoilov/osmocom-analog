@@ -37,10 +37,10 @@ static const pager_charset_entry entries[128] = {
 	/* 0x07 */ { "ì" },
 	/* 0x08 */ { "ò" },
 	/* 0x09 */ { "ç" },
-	/* 0x0A */ { "\n" },       /* LINE FEED */
+	/* 0x0A */ { "␊", "\n" },  /* U+240A, LINE FEED */
 	/* 0x0B */ { "Ø" },
 	/* 0x0C */ { "ø" },
-	/* 0x0D */ { "\r" },       /* CARRIAGE RETURN */
+	/* 0x0D */ { "␍", "\r" },  /* U+240D, CARRIAGE RETURN */
 	/* 0x0E */ { "Å" },
 	/* 0x0F */ { "å" },
 	/* 0x10 */ { "Δ" },
@@ -54,7 +54,7 @@ static const pager_charset_entry entries[128] = {
 	/* 0x18 */ { "Σ" },
 	/* 0x19 */ { "θ" },
 	/* 0x1A */ { "Ξ" },
-	/* 0x1B */ { NULL },       /* ESCAPE */
+	/* 0x1B */ { NULL },       /* ESCAPE: shown and written as <0x1B> */
 	/* 0x1C */ { "Æ" },
 	/* 0x1D */ { "æ" },
 	/* 0x1E */ { "ß" },

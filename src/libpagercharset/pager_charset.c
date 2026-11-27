@@ -316,13 +316,22 @@ int pager_charset_encode_text(const struct pager_charset *cs, const char *utf8, 
 		if (n >= out_size)
 			return -1;
 		if ((c < 0x20 || c == 0x7f) && cs->code_bits >= 7) {
-			/* The code of its glyph (LF, CR), else its own */
+			/* The code whose entry lists it (LF, CR), else its own code - but only if that
+			 * code has no glyph of its own: a TAB must not go out as the character that
+			 * sits at 0x09 (ERMES 'ç', NMT, FLEX Linguist ...) */
 			const char *q = ch;
 
 			ch[0] = (char)c;
 			ch[1] = '\0';
 			code = c ? pager_charset_encode(cs, &q) : -1;
-			out[n++] = (code >= 0) ? (uint8_t)code : c;
+			if (code < 0 && c < cs->num_codes && !cs->entries[c][0])
+				code = c;
+			if (code < 0) {
+				if (bad)
+					*bad = p;
+				return -1;
+			}
+			out[n++] = (uint8_t)code;
 			p++;
 			continue;
 		}

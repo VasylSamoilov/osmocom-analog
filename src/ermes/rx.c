@@ -116,6 +116,7 @@ static void decode_text(ermes_rx_t *rx, ermes_rx_msg_t *m, const uint32_t *info,
 {
 	int bit, total = n * ERMES_INFO_BITS, len = 0, i, code, bad, last_bad = -2;
 	const char *s;
+	char hex[8];
 
 	m->text[0] = '\0';
 	if (m->category == ERMES_CAT_NUMERIC) {
@@ -171,9 +172,13 @@ numeric_end:
 			m->eom = 1;
 			break;
 		} else {
+			/* a code without a glyph (ESC, ...) as <0xNN>: the log line stays one line
+			 * (LF and CR have their glyphs) and the code is not lost */
 			s = rx->charset ? pager_charset_decode(rx->charset, code) : NULL;
-			if (!s)
-				s = "?";
+			if (!s) {
+				snprintf(hex, sizeof(hex), "<0x%02X>", code);
+				s = hex;
+			}
 		}
 		if (len + (int)strlen(s) < ERMES_RX_TEXT - 1) {
 			strcpy(m->text + len, s);

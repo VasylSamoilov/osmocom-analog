@@ -235,6 +235,11 @@ int ermes_data_words(const ermes_page_t *page, uint32_t *info, int max_words)
 		n = pager_charset_encode_text(cs, text, strlen(text), codes, sizeof(codes), NULL);
 		if (n < 0)
 			return -1;
+		/* DC1 is the end of message, only after the text (-2 Table B.3 note 1) */
+		for (i = 0; i < n; i++) {
+			if (codes[i] == ERMES_EOM)
+				return -1;
+		}
 		for (i = 0; i < n; i++) {
 			if (put_bits(&w, codes[i], ERMES_ALPHA_BITS) < 0)
 				return -1;
