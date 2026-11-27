@@ -10,6 +10,7 @@
 #include "../ermes/code.h"
 #include "../ermes/frame.h"
 #include "../ermes/rx.h"
+#include "../ermes/dsp.h"
 #include "../libpagercharset/pager_charset.h"
 
 static int failed;
@@ -645,8 +646,47 @@ static void test_rx_file(const char *file)
 	       rx.inverted_seen ? " (a sync was seen with inverted polarity)" : "");
 }
 
+/* ERMES_RX_WAV=x.wav (PCM 16 bit, first channel, full scale = outer deviation) [ERMES_RX_CHANNEL]
+ * [ERMES_RX_POLARITY=-1]: the DSP and the decoder on a wave file */
+static void test_rx_wav(const char *file)
+{
+	ermes_rx_t rx;
+	ermes_dsp_rx_t dsp;
+	FILE *fp = fopen(file, "rb");
+	unsigned char hdr[44];
+	int16_t pcm[4096];
+	double x[4096];
+	int channels, rate, n, i;
+
+	if (!fp || fread(hdr, 1, 44, fp) != 44) {
+		printf("cannot read %s\n", file);
+		failed++;
+		return;
+	}
+	channels = hdr[22] | (hdr[23] << 8);
+	rate = hdr[24] | (hdr[25] << 8) | (hdr[26] << 16) | (hdr[27] << 24);
+	rx_verbose = 1;
+	rx_ngot = rx_nbatch = 0;
+	ermes_rx_init(&rx, getenv("ERMES_RX_CHANNEL") ? atoi(getenv("ERMES_RX_CHANNEL")) : 0,
+		      &pager_charset_ermes_generic_generic_standard, NULL, rx_batch_cb, rx_msg_cb);
+	ermes_dsp_rx_init(&dsp, &rx, rate, getenv("ERMES_RX_POLARITY") ? atof(getenv("ERMES_RX_POLARITY")) : 1.0);
+	while ((n = fread(pcm, 2 * channels, 4096 / channels, fp)) > 0) {
+		for (i = 0; i < n; i++)
+			x[i] = pcm[i * channels] / 32767.0;
+		ermes_dsp_rx_samples(&dsp, x, n);
+	}
+	fclose(fp);
+	printf("%s: %d Hz, %llu symbols, %d batches, %d messages; dc %.3f gain %.3f%s\n", file, rate,
+	       (unsigned long long)dsp.symbols, rx.batches, rx.messages, dsp.dc, dsp.gain,
+	       rx.inverted_seen ? " (a sync was seen with inverted polarity)" : "");
+}
+
 int main(void)
 {
+	if (getenv("ERMES_RX_WAV")) {
+		test_rx_wav(getenv("ERMES_RX_WAV"));
+		return failed ? 1 : 0;
+	}
 	if (getenv("ERMES_RX_FILE")) {
 		test_rx_file(getenv("ERMES_RX_FILE"));
 		return failed ? 1 : 0;

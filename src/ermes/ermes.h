@@ -25,6 +25,8 @@
 #include "numbers.h"
 #include "ssi.h"
 #include "scheduler.h"
+#include "rx.h"
+#include "dsp.h"
 
 /* A common temporary address pointer (CTAP) of a channel: free -> addressing (stage 1 and 2: the
  * members get their initial address and the pointer, each in its batch, or with --group-fig16
@@ -86,6 +88,10 @@ typedef struct ermes {
 	ermes_ctap_slot_t	ctap[ERMES_CTAP_COUNT];
 	int			group_ctap;		/* the slot of the call being sent, -1 = none */
 	int			ctap_next;		/* where the search for a free one starts */
+
+	/* receiver: what the channel carries (our own transmission, or another network) */
+	ermes_rx_t		rx;
+	ermes_dsp_rx_t		rx_dsp;
 } ermes_t;
 
 int ermes_create(const char *kanal, int channel, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double polarity, const ermes_network_t *net, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback);

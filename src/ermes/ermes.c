@@ -127,9 +127,34 @@ void sender_send(sender_t *sender, sample_t *samples, uint8_t *power, int length
 	}
 }
 
-/* Receive audio from radio unit: no receiver yet */
-void sender_receive(sender_t __attribute__((unused)) *sender, sample_t __attribute__((unused)) *samples, int __attribute__((unused)) length, double __attribute__((unused)) rf_level_db)
+/* Receive: FM demodulated samples of the channel (1.0 = the outer deviation) */
+void sender_receive(sender_t *sender, sample_t *samples, int length, double __attribute__((unused)) rf_level_db)
 {
+	ermes_t *ermes = (ermes_t *)sender;
+
+	ermes_dsp_rx_samples(&ermes->rx_dsp, samples, length);
+}
+
+#define CHAN ermes->sender.kanal
+
+static void rx_batch(void *priv, const ermes_rx_batch_t *b)
+{
+	ermes_t *ermes = priv;
+
+	LOGP_CHAN(DERMES, LOGL_INFO, "Received batch %c minute %d subsequence %d: %d-%d PA %d FSI %d ETI %d, %d initial address(es), %d codeblocks%s%s%s%s [%d bits corrected, %d codewords in error, sync %d bits off]\n",
+		  'A' + b->batch, b->cycle, b->ssn, b->country, b->operator, b->pa, b->fsi, b->eti, b->ia_count, b->codeblocks,
+		  b->si_ok ? "" : ", system information in error",
+		  b->flywheel ? ", no sync (taken on timing)" : "",
+		  b->apt != b->apt_expected ? ", APT count not as the formula" : "",
+		  b->not_ascending ? ", messages not in ascending order" : "",
+		  b->corrected, b->bad, b->sync_errors);
+}
+
+static void rx_message(void *priv, const ermes_rx_batch_t *b, const ermes_rx_msg_t *m)
+{
+	ermes_t *ermes = priv;
+
+	LOGP_CHAN(DERMES, LOGL_NOTICE, "Received in batch %c: %s\n", 'A' + b->batch, ermes_rx_msg_str(m));
 }
 
 int ermes_create(const char *kanal, int channel, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double polarity, const ermes_network_t *net, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback)
@@ -157,6 +182,8 @@ int ermes_create(const char *kanal, int channel, const char *device, int use_sdr
 	/* a sample value of 1.0 is the outer deviation */
 	sender_set_fm(&ermes->sender, ERMES_DEVIATION_HZ, ERMES_SYMBOL_RATE, ERMES_DEVIATION_HZ, MAX_DISPLAY);
 	ermes->polarity = polarity;
+	ermes_rx_init(&ermes->rx, channel, ermes_charset, ermes, rx_batch, rx_message);
+	ermes_dsp_rx_init(&ermes->rx_dsp, &ermes->rx, samplerate, polarity);
 	iir_bessel_lowpass_init(ermes->premod, PREMOD_CUTOFF_HZ, samplerate * PREMOD_OVERSAMPLE, PREMOD_ORDER);
 	ermes->premod_symbol_samples = (double)samplerate * PREMOD_OVERSAMPLE / ERMES_SYMBOL_RATE;
 	ermes->premod_delay = premod_group_delay(ermes->premod, samplerate * PREMOD_OVERSAMPLE);

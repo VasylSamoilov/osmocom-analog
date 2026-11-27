@@ -356,7 +356,7 @@ test_amps_states_SOURCES = test_amps_states.c ../amps/amps_stations.c ../amps/am
 
 test_amps_states_LDADD = $(test_amps_rx_LDADD)
 
-test_ermes_code_SOURCES = test_ermes_code.c ../ermes/code.c ../ermes/frame.c ../ermes/rx.c
+test_ermes_code_SOURCES = test_ermes_code.c ../ermes/code.c ../ermes/frame.c ../ermes/rx.c ../ermes/dsp.c
 
 test_ermes_code_LDADD = \
 	$(top_builddir)/src/libpagercharset/libpagercharset.a \
