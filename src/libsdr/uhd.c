@@ -66,7 +66,52 @@ typedef struct uhd_instance {
 	int			rx_dev_warned;	/* overflow without device time logged */
 	long long		rx_gap;		/* samples lost before the last packet, not yet filled */
 	long long		tx_dropped;	/* TX samples not sent (failed writes), their time passed */
+	double			tx_fail_since;	/* monotonic time of the first failed write, 0: writes work */
+	double			tx_fail_logged;	/* last 'still failing' line */
+	long long		tx_fail_dropped;/* tx_dropped when the failure began */
+	unsigned long		tx_fail_writes;	/* failed writes of this failure */
 } uhd_instance_t;
+
+static double uhd_mono_time(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* TX write state, logged when it changes (a failed write repeats some
+ * hundred times per second while a transport is broken) */
+static void uhd_tx_write_failed(uhd_instance_t *inst, uhd_error error, const char *what)
+{
+	double now = uhd_mono_time();
+
+	inst->tx_fail_writes++;
+	if (!inst->tx_fail_since) {
+		inst->tx_fail_since = now;
+		inst->tx_fail_logged = now;
+		inst->tx_fail_dropped = inst->tx_dropped;
+		LOGP(DUHD, LOGL_ERROR, "TX writes fail (error=%d): %s - samples are dropped until they work again\n", error, what);
+		return;
+	}
+	if (now - inst->tx_fail_logged >= 5.0) {
+		inst->tx_fail_logged = now;
+		LOGP(DUHD, LOGL_ERROR, "TX writes still fail after %.0f s (%lu failed, %.1f s of samples dropped): %s\n",
+		     now - inst->tx_fail_since, inst->tx_fail_writes,
+		     (inst->tx_dropped - inst->tx_fail_dropped) / inst->samplerate, what);
+	}
+}
+
+static void uhd_tx_write_ok(uhd_instance_t *inst)
+{
+	if (!inst->tx_fail_since)
+		return;
+	LOGP(DUHD, LOGL_NOTICE, "TX writes work again after %.1f s (%lu failed, %.3f s of samples dropped)\n",
+	     uhd_mono_time() - inst->tx_fail_since, inst->tx_fail_writes,
+	     (inst->tx_dropped - inst->tx_fail_dropped) / inst->samplerate);
+	inst->tx_fail_since = 0;
+	inst->tx_fail_writes = 0;
+}
 
 /* In single-device mode, both point to the same instance.
  * In split mode (future), they point to separate instances. */
@@ -862,13 +907,16 @@ int uhd_send(float *buff, int num)
 			char what[256] = "";
 
 			uhd_tx_streamer_last_error(uhd_tx_inst->tx_streamer, what, sizeof(what));
-			LOGP(DUHD, LOGL_ERROR, "Failed to write to TX streamer (error=%d, chunk=%d, count=%zu): %s\n", error, chunk, count, what);
+			LOGP(DUHD, LOGL_DEBUG, "Failed to write to TX streamer (error=%d, chunk=%d, count=%zu): %s\n", error, chunk, count, what);
+			uhd_tx_write_failed(uhd_tx_inst, error, what);
 			break;
 		}
 		if (count == 0) {
 			LOGP(DUHD, LOGL_DEBUG, "TX streamer returned 0 samples (chunk=%d)\n", chunk);
+			uhd_tx_write_failed(uhd_tx_inst, UHD_ERROR_NONE, "send() timed out, nothing sent");
 			break;
 		}
+		uhd_tx_write_ok(uhd_tx_inst);
 
 		/* increment time stamp */
 		uhd_tx_inst->tx_time_fract_sec += (double)count / uhd_tx_inst->samplerate;
