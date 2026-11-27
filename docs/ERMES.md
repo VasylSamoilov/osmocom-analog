@@ -479,6 +479,37 @@ nec-C63900,alpha,opid=2-1-3,For the visitor from 2-1-3
 Not tested on a pager yet: the NEC locks only to its home network. PDW
 does not parse the external bit (it shows the OPID codeword as text).
 
+## Receiving
+
+Every channel also receives: what the SDR hears on its frequency (our own
+transmission, or another network) is decoded and logged. It is a monitor,
+not a pager: every batch and every message, whatever its address.
+
+```
+(chan 9) Received in batch A: message to 0x318E40 number 7, alpha "R1 receiver check one", not urgent, alert 0
+(chan 9) Received in batch E: message to common temporary address CTAP 0 number 0, alpha "R1 group END", not urgent, alert 0, group of 2: 0x318E40/8 0x000022/1
+```
+
+- Messages at log level notice (`-v 5` and up), each batch at info
+  (`-v 6`): system information, initial addresses, codeblocks, bits
+  corrected, codewords in error, how far the sync was off.
+- Group calls: the pointers are kept per CTAP for 12 s; the text to the
+  common temporary address is shown with its members and their numbers.
+- Visitors (EB, OPID), `lastnum`, long-message parts (link counter) are
+  named as such.
+- Bad codewords: numeric text stops at the first one, alphanumeric shows
+  `?` for one and stops after two in a row (ETS 300 133-5 §7.5, §7.6); runs
+  without a readable header are counted in the batch, not shown.
+- Noted, not acted on: a message whose initial address is not in its
+  batch, messages not in ascending address order (pagers rely on it).
+- The channel's `-P` polarity applies to receiving too; the long batch
+  follows the channel number.
+
+Decode a recording: `--read-rx-wave x.wav` (FM demodulated, full scale =
+outer deviation, as `--write-tx-wave` writes it). On the B210 the network
+decodes its own transmission (`--sdr-rx-gain 10`): checked with all 74
+batches clean and every page, the group text with its members.
+
 ## Several channels
 
 ```
