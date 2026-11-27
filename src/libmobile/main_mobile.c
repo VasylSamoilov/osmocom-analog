@@ -1106,8 +1106,8 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		begin_time = get_time();
 
 #ifdef HAVE_SDR
-		/* the SDR cannot go on: end the normal way (the device is closed
-		 * and reset), the exit code tells a supervisor to restart */
+		/* the SDR cannot go on (a hard failure): stop the normal way (the
+		 * channels and the device closed), the exit code tells why */
 		if (use_sdr && !main_mobile_exit_code && (main_mobile_exit_code = sdr_fatal())) {
 			LOGP(DSENDER, LOGL_ERROR, "The SDR cannot go on, quitting with exit code %d.\n", main_mobile_exit_code);
 			*quit = 1;
