@@ -18,9 +18,6 @@ osmocalibrate_LDADD = \
 	$(top_builddir)/src/libam/libam.a \
 	$(top_builddir)/src/libemphasis/libemphasis.a \
 	$(top_builddir)/src/libsamplerate/libsamplerate.a \
-	$(top_builddir)/src/libpolyphase/libpolyphase.a \
-	$(top_builddir)/src/libfastmath/libfastmath.a \
-	$(top_builddir)/src/libiqringbuf/libiqringbuf.a \
 	$(top_builddir)/src/libjitter/libjitter.a \
 	$(top_builddir)/src/libfilter/libfilter.a \
 	$(top_builddir)/src/libdisplay/libdisplay.a \

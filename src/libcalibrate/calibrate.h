@@ -1,7 +1,9 @@
 /* SDR Clock Calibration Library
  *
- * Fast automatic calibration using polyphase channelizer for parallel
- * GSM FCCH tone detection.
+ * GSM base stations as the frequency reference: the band's power scan,
+ * then windows of channels (as many as the CPU budget allows) measured in
+ * parallel: FCCH offset per channel, SCH/BCCH identity as the proof of a
+ * real cell. Stops after enough confirmed towers agree.
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -19,10 +21,6 @@
 
 #include "gsm_sch.h"
 
-/* Calibration signal types */
-#define CALIB_SIGNAL_GSM_FCCH   1
-#define CALIB_SIGNAL_LTE_PSS    2
-
 /* GSM band identifiers (single values, not bitmask) */
 #define GSM_BAND_900    1
 #define GSM_BAND_1800   2
@@ -30,65 +28,71 @@
 #define GSM_BAND_850    4
 #define GSM_BAND_ALL    0       /* Scan all supported bands */
 
-/* Maximum parallel channels for channelizer */
-#define CALIB_MAX_CHANNELS      5
-
 /* Maximum bands we can scan */
 #define CALIB_MAX_BANDS         4
 
-/* Carriers measured per band (the winner and, if it is not confirmed as a
- * base station, the next candidates) */
-#define CALIB_MAX_CELLS         4
+/* carriers measured in one run (all of them with --full) */
+#define CALIB_MAX_CELLS         256
+
+/* towers agree if their offsets are within this (GSM base stations: +-0.05
+ * ppm each, 3GPP TS 45.010) */
+#define CALIB_AGREE_PPM         0.1
 
 /* One measured carrier: its offset and its identity */
 typedef struct {
 	int arfcn;
+	int gsm_band;
 	double freq_hz;
 	double hz_offset;           /* FCCH offset (trimmed mean) */
 	double ppm_offset;
 	double stddev_hz;
 	int num_measurements;
+	double level_dbfs;          /* channel level (at the RX gain in use) */
+	double snr_db;              /* FCCH SNR, mean of the measurements */
 	int decoded;                /* identity decoding was run */
 	int confirmed;              /* SCH decodes consistent: a base station */
 	double confirm_sec;         /* decoding time until confirmed */
+	int agrees;                 /* within CALIB_AGREE_PPM of the result */
 	gsm_cell_ident_t ident;     /* BSIC, FN, SI counts, MCC/MNC/LAC/CI */
 } calibrate_cell_t;
 
-/* Calibration result structure (per-band) */
+/* Result of a run */
 typedef struct {
-	double ppm_offset;          /* Calculated ppm error */
-	double hz_offset;           /* Frequency offset in Hz */
-	double confidence;          /* 0.0 - 1.0 quality metric */
-	double freq_hz;             /* Calibration signal frequency */
-	double stddev_hz;           /* Standard deviation of measurements */
-	int signal_type;            /* CALIB_SIGNAL_* */
-	double signal_strength_db;  /* Relative signal power */
-	int gsm_band;               /* GSM_BAND_* if GSM signal */
-	int arfcn;                  /* Best ARFCN if GSM signal */
-	int num_measurements;       /* Number of measurements collected */
-	int num_agree;              /* measurements within the agreement window */
-	double agree_hz;            /* agreement window (+- Hz around the result) */
-	double sem_hz;              /* standard error of the mean */
-	int confirmed;              /* the result carrier is a confirmed base station */
-	int valid;                  /* 1 if this result is valid */
+	int valid;                  /* a result (enough agreeing towers, or what there is) */
+	double ppm_offset;          /* mean of the agreeing towers */
+	int num_towers;             /* confirmed towers measured */
+	int num_agree;              /* of them within CALIB_AGREE_PPM of the result */
+	int disagree;               /* confirmed towers outside it */
+	double spread_ppm;          /* max - min of the confirmed towers */
+	double time_to_result;      /* s from the start until the result was known */
+	/* how it ran */
+	int samplerate;
+	int channels_per_window;
+	double cpu_per_channel;     /* share of one core per channel, measured */
+	double cpu_transport;       /* share of one core for the reading threads */
+	int windows;
 	calibrate_cell_t cells[CALIB_MAX_CELLS]; /* carriers measured, in order */
 	int num_cells;
 } calibrate_result_t;
 
 /* Calibration configuration */
 typedef struct {
-	int scan_gsm;               /* Scan GSM bands */
 	int gsm_bands;              /* GSM_BAND_* or GSM_BAND_ALL */
-	double timeout_sec;         /* Maximum calibration time per band */
+	double timeout_sec;         /* most time per window */
 	int verbosity;              /* 0=quiet, 1=normal, 2=debug */
-	int num_channels;           /* Number of parallel channels (1..CALIB_MAX_CHANNELS) */
-	int fast_math;              /* 0=double precision, 1=fixed-point (lower CPU) */
-	int use_channelizer;        /* 1=use polyphase resampler path (lower CPU) */
-	int forced_arfcn;           /* >0: force this ARFCN for FCCH detection */
-	int probe_sequential;       /* 1=probe ARFCNs one-by-one; stop on clear FCCH */
+	int num_channels;           /* channels per window, 0 = as the CPU budget allows */
+	double cpu_percent;         /* CPU budget for the channels, % of one core */
+	int towers;                 /* stop after this many agreeing confirmed towers */
+	int full;                   /* measure every carrier found */
+	int forced_arfcn;           /* >0: only this ARFCN */
 	int confirm;                /* 1=use only carriers whose SCH identity decodes */
 	double decode_timeout_sec;  /* time allowed for the identity decoding */
 	int decode_bcch;            /* also decode BCCH System Information */
+	/* the device's usable part of the stream each side of the centre:
+	 * this fraction of the rate, at most usable_max_hz (0: no limit);
+	 * channels and scan steps stay inside it (docs/SDR-FRONTENDS.md) */
+	double usable_fraction;
+	double usable_max_hz;
 } calibrate_config_t;
 
 /* Initialize default configuration */
@@ -98,18 +102,13 @@ void calibrate_config_default(calibrate_config_t *config);
  * started), read in chunks of at most buffer_size samples. */
 void calibrate_set_sdr(void *sdr, int buffer_size);
 
-/* Calibrate a single band. Returns 0 on success, <0 on error. */
-int calibrate_band(double center_freq, int samplerate,
-                   int gsm_band, calibrate_config_t *config,
-                   calibrate_result_t *result);
-
-/* Full automatic calibration — scans one or all bands.
- * results: array of CALIB_MAX_BANDS results (one per band)
- * num_results: number of valid results written
- * Returns 0 on success (at least one band), <0 on total failure. */
-int calibrate_auto(double center_freq, int samplerate,
-                   calibrate_config_t *config,
-                   calibrate_result_t *results, int *num_results);
+/* The whole run: scan the band(s), measure windows of carriers until
+ * config->towers confirmed towers agree (or all are measured with --full).
+ * Returns 0 if there is a result, <0 if not (result->cells still lists
+ * what was measured). start_info: the start of the line logged once the
+ * cost per channel is measured (the rate, the bus load). */
+int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_t *result,
+		   const char *start_info);
 
 /* Utility: Convert ARFCN to downlink frequency (Hz) */
 double arfcn_to_freq(int arfcn, int gsm_band);

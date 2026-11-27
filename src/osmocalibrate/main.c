@@ -1,6 +1,8 @@
 /* osmocalibrate - Fast automatic SDR clock calibration
  *
- * Scans GSM bands to find FCCH tones and measure crystal frequency offset.
+ * GSM base stations as the reference: the band's carriers, measured in
+ * windows of as many channels as the CPU budget allows, each confirmed as a
+ * cell by its decoded identity; the result when enough towers agree.
  * Uses the common sdr_config option infrastructure shared with all other
  * osmocom-analog tools.
  *
@@ -26,7 +28,6 @@ typedef struct sender sender_t;
 #include <sys/resource.h>
 
 #include "../libcalibrate/calibrate.h"
-#include "../libfastmath/fastmath.h"
 #include "../libsample/sample.h"
 #include "../libsdr/sdr_config.h"
 #include "../libsdr/sdr.h"
@@ -36,6 +37,8 @@ typedef struct sender sender_t;
 /* Globals required by linked libraries */
 sender_t *sender_head = NULL;
 int use_sdr = 0;
+
+#define MAX_AUTO_RATE	16000000	/* the widest SDR rate chosen without --sdr-samplerate */
 
 /* Calibration-specific options */
 static calibrate_config_t config;
@@ -47,10 +50,10 @@ enum {
 	OPT_TIMEOUT,
 	OPT_JSON,
 	OPT_NUM_CHANNELS,
-	OPT_FAST_MATH,
-	OPT_CHANNELIZER,
+	OPT_CPU,
+	OPT_TOWERS,
+	OPT_FULL,
 	OPT_ARFCN,
-	OPT_PROBE_SEQUENTIAL,
 	OPT_CONFIRM,
 	OPT_NO_CONFIRM,
 	OPT_DECODE_TIMEOUT,
@@ -60,35 +63,38 @@ enum {
 static void print_help(const char *arg0)
 {
 	printf("Usage: %s [options]\n", arg0);
-	printf("\nFast automatic SDR clock calibration using GSM FCCH signals.\n");
-	printf("Uses parallel channelizer-based detection across multiple ARFCNs.\n\n");
+	printf("\nSDR clock calibration against GSM base stations: their FCCH gives the\n");
+	printf("offset, their decoded identity (SCH, BCCH) proves they are cells.\n\n");
 	printf("Calibration options:\n");
 	printf("  -h, --help              Show this help\n");
 	printf("  -v, --verbose <level>   Set verbosity (default: 5)\n");
 	printf("  -q, --quiet             Quiet mode (only output result)\n");
-	printf("      --band <band>       GSM band: 900, 850, 1800, 1900, all\n");
-	printf("      --timeout <sec>     Timeout per band in seconds (default: 60)\n");
-	printf("      --channels <n>      Number of parallel channels (default: %d)\n",
-	       CALIB_MAX_CHANNELS);
-	printf("      --fast-math         Use fixed-point math (lower CPU usage)\n");
-	printf("      --channelizer       Use polyphase resampler (much lower CPU)\n");
-	printf("      --arfcn <n>         Force FCCH detection on a specific ARFCN\n");
-	printf("      --probe-sequential  Probe ARFCNs one-by-one; stop on clear FCCH\n");
+	printf("      --band <band>       GSM band: 900, 850, 1800, 1900, all (default 900)\n");
+	printf("      --arfcn <n>         Measure only this ARFCN\n");
+	printf("      --towers <n>        Stop after n confirmed towers agree (default %d)\n", config.towers);
+	printf("      --full              Measure every carrier found, list all towers\n");
+	printf("      --channels auto|<n> Channels per window: as many as the CPU budget\n");
+	printf("                          allows (default), or n\n");
+	printf("      --cpu <percent>     CPU budget for the channels, %% of one core\n");
+	printf("                          (default %.0f)\n", config.cpu_percent);
+	printf("      --timeout <sec>     Most time per window (default %.0f)\n", config.timeout_sec);
 	printf("      --confirm           Use only carriers confirmed as base stations by\n");
 	printf("                          decoding their SCH (BSIC, frame number) (default)\n");
-	printf("      --no-confirm        Use the measured carrier even if its identity\n");
+	printf("      --no-confirm        Use the measured carriers even if their identity\n");
 	printf("                          does not decode\n");
 	printf("      --decode-timeout <s> Time allowed for the identity decoding\n");
 	printf("                          (default: %.0f)\n", config.decode_timeout_sec);
 	printf("      --no-bcch           Decode only the SCH, not the System Information\n");
 	printf("                          (MCC, MNC, LAC, cell identity)\n");
 	printf("  -j, --json              Output in JSON format\n");
+	printf("\nThe SDR rate is the widest the device and its USB link carry (with a\n");
+	printf("margin), no wider than the band; --sdr-samplerate sets it.\n");
 	sdr_config_print_help();
 	printf("\nExamples:\n");
-	printf("  %s --sdr-uhd --sdr-rx-gain 40 --sdr-samplerate 2000000\n", arg0);
+	printf("  %s --sdr-uhd --sdr-rx-gain 50 --sdr-rx-antenna RX2\n", arg0);
 	printf("  %s --sdr-uhd --band all          Scan all GSM bands\n", arg0);
-	printf("  %s --sdr-soapy --band 1800 -v 7  Calibrate on DCS-1800, verbose\n", arg0);
-	printf("  %s --sdr-soapy -j                Output JSON for scripting\n", arg0);
+	printf("  %s --sdr-soapy driver=rtlsdr --band 900 --arfcn 76\n", arg0);
+	printf("  %s --sdr-uhd -j                  Output JSON for scripting\n", arg0);
 }
 
 static void add_options(void)
@@ -99,10 +105,10 @@ static void add_options(void)
 	option_add(OPT_BAND, "band", 1);
 	option_add(OPT_TIMEOUT, "timeout", 1);
 	option_add(OPT_NUM_CHANNELS, "channels", 1);
-	option_add(OPT_FAST_MATH, "fast-math", 0);
-	option_add(OPT_CHANNELIZER, "channelizer", 0);
+	option_add(OPT_CPU, "cpu", 1);
+	option_add(OPT_TOWERS, "towers", 1);
+	option_add(OPT_FULL, "full", 0);
 	option_add(OPT_ARFCN, "arfcn", 1);
-	option_add(OPT_PROBE_SEQUENTIAL, "probe-sequential", 0);
 	option_add(OPT_CONFIRM, "confirm", 0);
 	option_add(OPT_NO_CONFIRM, "no-confirm", 0);
 	option_add(OPT_DECODE_TIMEOUT, "decode-timeout", 1);
@@ -149,17 +155,32 @@ static int handle_options(int short_option, int argi, char **argv)
 		config.timeout_sec = atof(argv[argi]);
 		break;
 	case OPT_NUM_CHANNELS:
+		if (!strcasecmp(argv[argi], "auto")) {
+			config.num_channels = 0;
+			break;
+		}
 		config.num_channels = atoi(argv[argi]);
-		if (config.num_channels < 1)
-			config.num_channels = 1;
-		if (config.num_channels > CALIB_MAX_CHANNELS)
-			config.num_channels = CALIB_MAX_CHANNELS;
+		if (config.num_channels < 1) {
+			fprintf(stderr, "--channels: 'auto' or a number from 1, not '%s'\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
-	case OPT_FAST_MATH:
-		config.fast_math = 1;
+	case OPT_CPU:
+		config.cpu_percent = atof(argv[argi]);
+		if (config.cpu_percent <= 0.0) {
+			fprintf(stderr, "--cpu: a percentage of one core above 0, not '%s'\n", argv[argi]);
+			return -EINVAL;
+		}
 		break;
-	case OPT_CHANNELIZER:
-		config.use_channelizer = 1;
+	case OPT_TOWERS:
+		config.towers = atoi(argv[argi]);
+		if (config.towers < 1) {
+			fprintf(stderr, "--towers: a number from 1, not '%s'\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_FULL:
+		config.full = 1;
 		break;
 	case OPT_ARFCN:
 		config.forced_arfcn = atoi(argv[argi]);
@@ -167,9 +188,6 @@ static int handle_options(int short_option, int argi, char **argv)
 			fprintf(stderr, "Invalid ARFCN: %s\n", argv[argi]);
 			return -EINVAL;
 		}
-		break;
-	case OPT_PROBE_SEQUENTIAL:
-		config.probe_sequential = 1;
 		break;
 	case OPT_CONFIRM:
 		config.confirm = 1;
@@ -224,9 +242,17 @@ static int open_sdr_rx(double center_freq, int samplerate)
 	 * the reads (scan processing, retune) stay far below it */
 	int buffer_size = samplerate / 10;
 	double rx_frequency = center_freq;
+	/* the read thread sleeps this long (ms) when the device has nothing:
+	 * half a UHD packet (about 2000 samples), at most 1 ms (at 16 MS/s and
+	 * more, 1 ms is half of UHD's receive buffer: it overflowed) */
+	double interval = 1000.0 * 1000.0 / samplerate;
 	int rc;
 
-	sdr = sdr_open(0, NULL, NULL, &rx_frequency, NULL, 0, 0.0, samplerate, buffer_size, 1.0, 0.0, 0.0, 0.0);
+	if (interval > 1.0)
+		interval = 1.0;
+	if (interval < 0.02)
+		interval = 0.02;
+	sdr = sdr_open(0, NULL, NULL, &rx_frequency, NULL, 0, 0.0, samplerate, buffer_size, interval, 0.0, 0.0, 0.0);
 	if (!sdr)
 		return -EIO;
 	rc = sdr_start(sdr);
@@ -247,63 +273,123 @@ static void close_sdr(void)
 	sdr = NULL;
 }
 
-static void print_cell_text(const calibrate_cell_t *cell)
+static void print_cell_text(const calibrate_cell_t *cell, double applied_ppm)
 {
 	const gsm_cell_ident_t *id = &cell->ident;
+	char ident[96] = "", mccmnc[16] = "-", laci[40] = "-";
 
-	printf("      ARFCN %4d %.1f MHz: ", cell->arfcn, cell->freq_hz / 1e6);
-	if (cell->num_measurements > 0)
-		printf("%+.1f Hz (%.3f ppm, %d meas.), ", cell->hz_offset,
-		       cell->ppm_offset, cell->num_measurements);
-	if (!cell->decoded) {
-		printf("identity not decoded\n");
-		return;
-	}
-	if (!cell->confirmed) {
-		printf("NOT confirmed (SCH good %d, bad %d)\n", id->sch_good, id->sch_bad);
-		return;
-	}
-	printf("confirmed, BSIC %d (NCC %d, BCC %d), SCH %d good\n", id->bsic,
-	       gsm_bsic_ncc(id->bsic), gsm_bsic_bcc(id->bsic), id->sch_good);
-	if (id->have_lai || id->bcch_good) {
-		printf("        ");
-		if (id->have_lai)
-			printf("MCC %03d MNC %0*d LAC %d ", id->mcc, id->mnc_3digit ? 3 : 2,
-			       id->mnc, id->lac);
+	if (cell->confirmed)
+		snprintf(ident, sizeof(ident), "BSIC %2d", id->bsic);
+	else if (cell->decoded)
+		snprintf(ident, sizeof(ident), "not confirmed");
+	else
+		snprintf(ident, sizeof(ident), "no identity");
+	if (id->have_lai) {
+		snprintf(mccmnc, sizeof(mccmnc), "%03d-%0*d", id->mcc, id->mnc_3digit ? 3 : 2, id->mnc);
 		if (id->have_ci)
-			printf("CI %d ", id->ci);
-		printf("(SI good %d: SI3 %d, SI4 %d)\n", id->bcch_good,
-		       id->si_count[GSM_SI_3], id->si_count[GSM_SI_4]);
+			snprintf(laci, sizeof(laci), "LAC %d CI %d", id->lac, id->ci);
+		else
+			snprintf(laci, sizeof(laci), "LAC %d", id->lac);
 	}
+	printf("  %-8s ARFCN %4d %9.3f MHz  %-13s %-7s %-20s", gsm_band_name(cell->gsm_band), cell->arfcn,
+	       cell->freq_hz / 1e6, ident, mccmnc, laci);
+	if (cell->num_measurements >= 3)
+		printf(" %+8.1f Hz %7.3f ppm %6.1f dBFS  SNR %4.1f dB%s\n", cell->hz_offset,
+		       cell->ppm_offset + applied_ppm, cell->level_dbfs, cell->snr_db,
+		       (cell->confirmed && !cell->agrees) ? "  disagrees" : "");
+	else
+		printf(" no FCCH         %6.1f dBFS\n", cell->level_dbfs);
 }
 
-static void print_cell_json(const calibrate_cell_t *cell, int comma)
+static void print_cell_json(const calibrate_cell_t *cell, double applied_ppm, int comma)
 {
 	const gsm_cell_ident_t *id = &cell->ident;
 
-	printf("%s{\"arfcn\": %d, \"frequency\": %.0f, \"hz\": %.2f, \"ppm\": %.6f, "
-	       "\"measurements\": %d, \"confirmed\": %s",
-	       comma ? ", " : "", cell->arfcn, cell->freq_hz, cell->hz_offset,
-	       cell->ppm_offset, cell->num_measurements, cell->confirmed ? "true" : "false");
+	printf("%s{\"band\": \"%s\", \"arfcn\": %d, \"frequency\": %.0f, \"measurements\": %d, "
+	       "\"level_dbfs\": %.1f, \"confirmed\": %s",
+	       comma ? ", " : "", gsm_band_name(cell->gsm_band), cell->arfcn, cell->freq_hz,
+	       cell->num_measurements, cell->level_dbfs, cell->confirmed ? "true" : "false");
+	if (cell->num_measurements >= 3)
+		printf(", \"hz\": %.2f, \"ppm\": %.6f, \"stddev_hz\": %.2f, \"snr_db\": %.1f, \"agrees\": %s",
+		       cell->hz_offset, cell->ppm_offset + applied_ppm, cell->stddev_hz, cell->snr_db,
+		       cell->agrees ? "true" : "false");
 	if (cell->confirmed)
-		printf(", \"bsic\": %d, \"ncc\": %d, \"bcc\": %d, \"fn\": %u, \"sch_good\": %d",
-		       id->bsic, gsm_bsic_ncc(id->bsic), gsm_bsic_bcc(id->bsic), id->fn,
-		       id->sch_good);
+		printf(", \"bsic\": %d", id->bsic);
 	if (id->have_lai)
 		printf(", \"mcc\": \"%03d\", \"mnc\": \"%0*d\", \"lac\": %d", id->mcc,
 		       id->mnc_3digit ? 3 : 2, id->mnc, id->lac);
 	if (id->have_ci)
 		printf(", \"ci\": %d", id->ci);
-	printf(", \"si_good\": %d}", id->bcch_good);
+	printf("}");
+}
+
+/* Per device: the usable part of the stream each side of the centre and the
+ * rates (docs/SDR-FRONTENDS.md). One entry per device; the first that
+ * matches. max_rate: refused above (0: no limit), max_auto_rate: the widest
+ * chosen on its own (0: MAX_AUTO_RATE). */
+typedef struct device_rule {
+	const char	*name;
+	int		uhd;		/* matches --sdr-uhd */
+	const char	*args;		/* matches a Soapy device args substring (NULL: any) */
+	double		usable_fraction, usable_max_hz;
+	int		max_rate, max_auto_rate;
+	const char	*why;		/* of max_rate */
+} device_rule_t;
+
+static const device_rule_t device_rules[] = {
+	/* B200/B210: +-0.40 (power-of-2 decimation >= 4 of the master clock;
+	 * above 15.36 MS/s the master clock is the rate, the AD9361 alone,
+	 * +-0.40 with the LO centred, as here: no LO offset) */
+	/* chosen on its own at most 8 MS/s, for the CPU: at 16 MS/s the reading
+	 * took 17-20 % of a core and a channel 17 %, one channel per window in
+	 * the 50 % budget; at 8 MS/s 11 % and about 9 % */
+	{ "UHD (B200/B210)", 1, NULL, 0.40, 0.0, 0, 8000000, NULL },
+	/* RTL2832U: its FIR is flat to +-0.9 MHz at any rate */
+	{ "RTL-SDR", 0, "rtlsdr", 0.40, 0.85e6, 0, 0, NULL },
+	/* LMS7002M: clean to +-0.30 */
+	{ "LimeSDR", 0, "lime", 0.30, 0.0, 0, 0, NULL },
+	/* unknown */
+	{ "this device", 0, NULL, 0.35, 0.0, 0, 0, NULL },
+};
+
+static const device_rule_t *device_rule(void)
+{
+	const char *args = sdr_config->device_args ? sdr_config->device_args : "";
+	int n = sizeof(device_rules) / sizeof(device_rules[0]);
+
+	for (int i = 0; i < n - 1; i++) {
+		if (device_rules[i].uhd) {
+			if (sdr_config->uhd)
+				return &device_rules[i];
+		} else if (sdr_config->soapy && device_rules[i].args && strstr(args, device_rules[i].args))
+			return &device_rules[i];
+	}
+	return &device_rules[n - 1];
+}
+
+/* the band(s) asked for: the widest span */
+static double wanted_span(void)
+{
+	double c, bw, span = 0.0;
+	int s, e, b;
+
+	for (b = GSM_BAND_900; b <= GSM_BAND_850; b++) {
+		if (config.gsm_bands != GSM_BAND_ALL && config.gsm_bands != b)
+			continue;
+		gsm_band_params(b, &c, &bw, &s, &e);
+		if (bw > span)
+			span = bw;
+	}
+	return span;
 }
 
 int main(int argc, char *argv[])
 {
-	calibrate_result_t results[CALIB_MAX_BANDS];
-	int num_results = 0;
+	static calibrate_result_t result;
 	double center_freq, bandwidth;
 	int arfcn_start, arfcn_end;
 	int samplerate;
+	char start_info[256];
 	int rc;
 
 	logging_init();
@@ -335,9 +421,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	samplerate = sdr_config->samplerate;
-	if (samplerate == 0)
-		samplerate = 1000000;
+	int rate_given = sdr_config->samplerate != 0;
+	samplerate = rate_given ? sdr_config->samplerate : 1000000;
 
 	rc = sdr_configure(samplerate);
 	if (rc < 0)
@@ -347,32 +432,54 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	signal(SIGINT, SIG_DFL);
-	signal(SIGTERM, SIG_DFL);
+	const device_rule_t *dev = device_rule();
+	int max_auto = dev->max_auto_rate ? dev->max_auto_rate : MAX_AUTO_RATE;
 
-	/* Init fast math lookup tables if requested */
-	if (config.fast_math) {
-		rc = fastmath_init();
+	config.usable_fraction = dev->usable_fraction;
+	config.usable_max_hz = dev->usable_max_hz;
+	if (rate_given && dev->max_rate && samplerate > dev->max_rate) {
+		fprintf(stderr, "--sdr-samplerate %d: above %.2f MS/s on %s: %s. Use %.2f MS/s or less (%.0f MS/s is the widest chosen on its own).\n",
+			samplerate, dev->max_rate / 1e6, dev->name, dev->why, dev->max_rate / 1e6, max_auto / 1e6);
+		return 1;
+	}
+	if (rate_given) {
+		snprintf(start_info, sizeof(start_info), "SDR rate %d S/s (given)", samplerate);
+	} else {
+		/* the widest the device and the bus carry; one ARFCN needs no more
+		 * than 1 MS/s, a band no more than its span */
+		sdr_rate_widest_t w;
+		double want = (config.forced_arfcn > 0) ? 1e6 : wanted_span() / 0.8;
+
+		/* at most 16 MS/s: at 32 MS/s the reading alone took 20 % of a
+		 * core and the B210 overflowed (B210, this PC, 2026-11-27);
+		 * the device's own limit above */
+		if (want > max_auto)
+			want = max_auto;
+
+		rc = sdr_rx_widest_rate(500000, (int)want, &w);
 		if (rc < 0) {
-			fprintf(stderr, "Failed to init fast math tables\n");
+			fprintf(stderr, "No SDR rate: %s. Give one with --sdr-samplerate.\n", w.why);
 			return 1;
 		}
+		samplerate = rc;
+		sdr_config->samplerate = samplerate;
+		if (!sdr_config->bandwidth_given)
+			sdr_config->bandwidth = samplerate;
+		snprintf(start_info, sizeof(start_info), "SDR rate %d S/s (device up to %.1f MS/s, bus up to %.1f MS/s on USB %d Mbit/s: load %.0f %%)",
+			 samplerate, w.device_max / 1e6, w.bus_max / 1e6, w.usb_speed, 100.0 * w.bus_load);
 	}
+
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTERM, SIG_DFL);
 
 	/* Use GSM-900 center for initial SDR open (will retune during scan) */
 	gsm_band_params(GSM_BAND_900, &center_freq, &bandwidth,
 	                &arfcn_start, &arfcn_end);
 
-	if (config.verbosity >= 1 && !json_output) {
-		printf("osmocalibrate - SDR clock calibration\n");
-		if (config.gsm_bands == GSM_BAND_ALL)
-			printf("Scanning all GSM bands with %d parallel channels...\n",
-			       config.num_channels);
-		else
-			printf("Scanning %s with %d parallel channels...\n",
-			       gsm_band_name(config.gsm_bands),
-			       config.num_channels);
-	}
+	if (config.verbosity >= 1 && !json_output)
+		printf("osmocalibrate - SDR clock calibration, %s, %s\n",
+		       (config.gsm_bands == GSM_BAND_ALL) ? "all GSM bands" : gsm_band_name(config.gsm_bands),
+		       start_info);
 
 	rc = open_sdr_rx(center_freq, samplerate);
 	if (rc < 0) {
@@ -385,14 +492,9 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (config.verbosity >= 1 && !json_output)
-		printf("SDR opened at %.3f MHz, %d Hz sample rate\n",
-		       center_freq / 1e6, samplerate);
-
 	struct timespec t0, t1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
-	rc = calibrate_auto(center_freq, samplerate, &config,
-	                     results, &num_results);
+	rc = calibrate_auto(samplerate, &config, &result, start_info);
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 
 	close_sdr();
@@ -403,90 +505,58 @@ int main(int argc, char *argv[])
 		double wall = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 		double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6 +
 			     ru.ru_stime.tv_sec + ru.ru_stime.tv_usec * 1e-6;
-		LOGP(DSDR, LOGL_NOTICE, "Calibration took %.1f s, CPU %.2f s (%.1f%% of one core)\n",
-		     wall, cpu, (wall > 0.0) ? 100.0 * cpu / wall : 0.0);
+		LOGP(DSDR, LOGL_NOTICE, "Calibration took %.1f s, CPU %.2f s (%.1f%% of one core), result after %.1f s\n",
+		     wall, cpu, (wall > 0.0) ? 100.0 * cpu / wall : 0.0, result.time_to_result);
 	}
 
-	if (rc < 0 || num_results == 0) {
-		if (!json_output)
-			fprintf(stderr, "Calibration failed: %s\n",
-			        strerror(rc < 0 ? -rc : ENODATA));
-		else
-			printf("{\"success\": false, \"error\": \"%s\"}\n",
-			       strerror(rc < 0 ? -rc : ENODATA));
-		return 1;
-	}
-
-	/* Output results */
 	double applied_ppm = sdr_config->rx_ppm;
 
-	if (json_output) {
-		printf("{\"success\": true, ");
-		if (applied_ppm != 0.0)
-			printf("\"applied_ppm\": %.6f, ", applied_ppm);
-		printf("\"bands\": [");
-		for (int i = 0; i < num_results; i++) {
-			double total_ppm = results[i].ppm_offset + applied_ppm;
-			if (i > 0) printf(", ");
-			printf("{\"band\": \"%s\", ", gsm_band_name(results[i].gsm_band));
-			printf("\"ppm\": %.6f, ", total_ppm);
-			printf("\"residual_ppm\": %.6f, ", results[i].ppm_offset);
-			printf("\"hz\": %.2f, ", results[i].hz_offset);
-			printf("\"stddev_hz\": %.2f, ", results[i].stddev_hz);
-			printf("\"frequency\": %.0f, ", results[i].freq_hz);
-			printf("\"measurements\": %d, ", results[i].num_measurements);
-			printf("\"agree\": %d, ", results[i].num_agree);
-			printf("\"sem_hz\": %.2f, ", results[i].sem_hz);
-			printf("\"confidence\": %.2f, ", results[i].confidence);
-			printf("\"arfcn\": %d, ", results[i].arfcn);
-			printf("\"confirmed\": %s, ", results[i].confirmed ? "true" : "false");
-			printf("\"carriers\": [");
-			for (int c = 0; c < results[i].num_cells; c++)
-				print_cell_json(&results[i].cells[c], c > 0);
-			printf("]}");
+	if (rc < 0 || !result.valid) {
+		if (!json_output) {
+			fprintf(stderr, "Calibration failed: %s\n", (rc == -EINVAL) ? "see above" : "no confirmed tower");
+			for (int c = 0; c < result.num_cells; c++)
+				print_cell_text(&result.cells[c], applied_ppm);
+		} else {
+			printf("{\"success\": false, \"error\": \"%s\", \"carriers\": [",
+			       (rc == -EINVAL) ? "invalid setting" : "no confirmed tower");
+			for (int c = 0; c < result.num_cells; c++)
+				print_cell_json(&result.cells[c], applied_ppm, c > 0);
+			printf("]}\n");
 		}
+		fflush(stdout);
+		fflush(stderr);
+		_exit(1);
+	}
+
+	double total_ppm = result.ppm_offset + applied_ppm;
+
+	if (json_output) {
+		printf("{\"success\": true, \"ppm\": %.6f, ", total_ppm);
+		if (applied_ppm != 0.0)
+			printf("\"applied_ppm\": %.6f, \"residual_ppm\": %.6f, ", applied_ppm, result.ppm_offset);
+		printf("\"towers\": %d, \"agree\": %d, \"disagree\": %s, \"spread_ppm\": %.6f, ",
+		       result.num_towers, result.num_agree, result.disagree ? "true" : "false", result.spread_ppm);
+		printf("\"rx_gain_db\": %.1f, \"samplerate\": %d, \"channels_per_window\": %d, \"time_s\": %.1f, ",
+		       sdr_config->rx_gain, result.samplerate, result.channels_per_window, result.time_to_result);
+		printf("\"carriers\": [");
+		for (int c = 0; c < result.num_cells; c++)
+			print_cell_json(&result.cells[c], applied_ppm, c > 0);
 		printf("]}\n");
 	} else {
-		printf("\n=== Calibration Results ===\n");
+		printf("\n=== Calibration result ===\n");
+		if (result.disagree)
+			printf("  %.3f ppm from %d agreeing towers; %d tower(s) DISAGREE: spread %.3f ppm\n",
+			       total_ppm, result.num_agree, result.disagree, result.spread_ppm);
+		else
+			printf("  %.3f ppm: %d tower%s agree%s (spread %.3f ppm)\n", total_ppm, result.num_agree,
+			       (result.num_agree == 1) ? "" : "s", (result.num_agree == 1) ? "s" : "", result.spread_ppm);
 		if (applied_ppm != 0.0)
-			printf("  (applied --sdr-ppm %.3f during measurement)\n", applied_ppm);
-		for (int i = 0; i < num_results; i++) {
-			double total_ppm = results[i].ppm_offset + applied_ppm;
-			printf("\n  %s (%.3f MHz):\n",
-			       gsm_band_name(results[i].gsm_band),
-			       results[i].freq_hz / 1e6);
-			printf("    Offset:       %+.2f Hz (%.3f ppm)\n",
-			       results[i].hz_offset, results[i].ppm_offset);
-			if (applied_ppm != 0.0)
-				printf("    Total PPM:    %.3f (residual %+.3f + applied %+.3f)\n",
-				       total_ppm, results[i].ppm_offset, applied_ppm);
-			printf("    Std dev:      %.1f Hz (mean +-%.1f Hz)\n",
-			       results[i].stddev_hz, results[i].sem_hz);
-			printf("    Measurements: %d, %d agree within +-%.0f Hz (confidence %.0f%%)\n",
-			       results[i].num_measurements, results[i].num_agree,
-			       results[i].agree_hz, results[i].confidence * 100);
-			printf("    Carriers:\n");
-			for (int c = 0; c < results[i].num_cells; c++)
-				print_cell_text(&results[i].cells[c]);
-		}
-
-		/* Best result (lowest stddev) */
-		int best = 0;
-		for (int i = 1; i < num_results; i++) {
-			if (results[i].stddev_hz < results[best].stddev_hz)
-				best = i;
-		}
-
-		printf("\nBest result from %s:\n", gsm_band_name(results[best].gsm_band));
-		double best_total_ppm = results[best].ppm_offset + applied_ppm;
-		printf("  Frequency offset: %+.2f Hz\n", results[best].hz_offset);
-		printf("  PPM offset:       %.3f ppm\n", results[best].ppm_offset);
-		if (applied_ppm != 0.0)
-			printf("  Total PPM:        %.3f ppm (residual %+.3f + applied %+.3f)\n",
-			       best_total_ppm, results[best].ppm_offset, applied_ppm);
-		printf("  Std deviation:    %.1f Hz\n", results[best].stddev_hz);
+			printf("  (residual %+.3f with --sdr-ppm %.3f applied)\n", result.ppm_offset, applied_ppm);
+		for (int c = 0; c < result.num_cells; c++)
+			print_cell_text(&result.cells[c], applied_ppm);
+		printf("  Levels in dBFS at RX gain %.1f dB.\n", sdr_config->rx_gain);
 		printf("\nTo apply this correction:\n");
-		printf("  --sdr-ppm %.1f\n", best_total_ppm);
+		printf("  --sdr-ppm %.1f\n", total_ppm);
 	}
 
 	fflush(stdout);
