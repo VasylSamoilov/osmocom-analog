@@ -291,9 +291,10 @@ batches), hold, free; the log shows every change. A member is served by the
 channel that carries its FSN. At most 32 members; `retransmit=` is refused
 for group calls.
 
-A batch that carries a pointer (stage 2) or the text (stage 3) has no initial
-address of its own; when no other traffic fills its address partition, it
-gets a PAD there: the group initial address, eighteen ones, the highest of
+A batch that carries a pointer (stage 2), the text (stage 3) or the rest of a
+long message continued from the batch before (§10.5) has no initial address
+of its own; when no other traffic fills its address partition, it gets a PAD
+there: the group initial address, eighteen ones, the highest of
 all and nobody's own. The receiver test of group calls has these batches
 occupied the same way (ETS 300 133-5 §7.8 Fig.16, TBR 7 §8.15: "PAD: an
 initial address, higher than the receiver under test, used to occupy start

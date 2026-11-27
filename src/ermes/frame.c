@@ -252,11 +252,9 @@ static void put_word(uint8_t *bits, int *n, uint32_t cw)
 		bits[(*n)++] = (cw >> i) & 1;
 }
 
-/* Initial address of a page (a PAD: eighteen ones) */
+/* Initial address of a page */
 static uint32_t page_ia(const ermes_page_t *page)
 {
-	if (page->pad)
-		return ERMES_CTA_IA;
 	return ermes_initial_address(page->local_address);
 }
 
@@ -266,7 +264,7 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 	uint32_t msg[MAX_MSG_WORDS];	/* message partition codewords before interleaving */
 	uint32_t whole[ERMES_MAX_MSG_WORDS + 3];
 	int order[ERMES_MAX_IA];	/* the pages with an initial address in this batch */
-	int i, j, k, n = 0, nmsg, sent, nia, ia, cap, num_cb, nwhole, room;
+	int i, j, k, n = 0, nmsg, sent, nia, ia, cap, num_cb, nwhole, room, carried = 0, pad;
 
 	if (t->slot < 0 || t->slot >= ERMES_BATCHES || t->batch < 0 || t->batch >= ERMES_BATCHES)
 		return -1;
@@ -281,6 +279,7 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		 * with no initial address; if it does not all fit, the batch carries only it */
 		cap = ermes_max_codeblocks(t->slot, 0) * ERMES_CODEBLOCK_CW;
 		nmsg = (carry->count < cap) ? carry->count : cap;
+		carried = 1;
 		memcpy(msg, carry->cw, nmsg * sizeof(uint32_t));
 		memmove(carry->cw, carry->cw + nmsg, (carry->count - nmsg) * sizeof(uint32_t));
 		carry->count -= nmsg;
@@ -301,8 +300,8 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		uint32_t hdr[2], data[ERMES_MAX_MSG_WORDS];
 		int nd;
 
-		ia = pages[i].pad || (!pages[i].no_ia && !ermes_is_cta(pages[i].local_address));
-		if (ia && !pages[i].pad && ermes_address_batch(pages[i].local_address) != t->batch)
+		ia = !pages[i].no_ia && !ermes_is_cta(pages[i].local_address);
+		if (ia && ermes_address_batch(pages[i].local_address) != t->batch)
 			return -1;
 		if (ia && nia == ERMES_MAX_IA)
 			break;
@@ -349,6 +348,15 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		break;
 	}
 
+	/* a batch with a message (or the rest of one) but no initial address gets a PAD: an initial
+	 * address of eighteen ones (the group initial address: the highest, nobody's own), as in the
+	 * receiver tests (-5 §7.8 p.17 "PAD: an initial address ... used to occupy start of address
+	 * partition", Fig.16 "4*PAD ... GROUP MESSAGE"; TBR 7 p.27). Receivers and decoders such as
+	 * PDW skip the message partition of a batch with no initial address: group calls (stage 2 and
+	 * 3) and continued messages (§10.5) were lost there. It costs no room: with 0 or 1 initial
+	 * address the address partition is the same 9 codewords. */
+	pad = (nia == 0 && (nmsg > 1 || carried));
+
 	/* synchronization partition (§5.2 p.15): fixed words */
 	put_word(bits, &n, ERMES_PREAMBLE);
 	put_word(bits, &n, ERMES_SW1);
@@ -368,11 +376,13 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 	}
 	for (i = 0; i < nia; i++)
 		put_word(bits, &n, ermes_bch_encode(page_ia(&pages[order[i]])));
-	for (i = 0; i < ermes_apt_count(nia); i++)
+	if (pad)
+		put_word(bits, &n, ermes_bch_encode(ERMES_CTA_IA));
+	for (i = 0; i < ermes_apt_count(nia + pad); i++)
 		put_word(bits, &n, ERMES_APT);
 
 	/* message partition (§5.5, §7): fill every codeblock, idle ones with delimiters (§5.5.6-7) */
-	num_cb = ermes_max_codeblocks(t->slot, nia);
+	num_cb = ermes_max_codeblocks(t->slot, nia + pad);
 	for (; nmsg < num_cb * ERMES_CODEBLOCK_CW; nmsg++)
 		msg[nmsg] = ERMES_MD;
 	for (k = 0; k < num_cb; k++) {
