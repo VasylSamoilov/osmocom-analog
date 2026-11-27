@@ -22,6 +22,8 @@ typedef struct sender sender_t;
 #include <signal.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/resource.h>
 
 #include "../libcalibrate/calibrate.h"
 #include "../libfastmath/fastmath.h"
@@ -54,6 +56,10 @@ enum {
 	OPT_CHANNELIZER,
 	OPT_ARFCN,
 	OPT_PROBE_SEQUENTIAL,
+	OPT_CONFIRM,
+	OPT_NO_CONFIRM,
+	OPT_DECODE_TIMEOUT,
+	OPT_NO_BCCH,
 };
 
 static void print_help(const char *arg0)
@@ -73,6 +79,14 @@ static void print_help(const char *arg0)
 	printf("      --channelizer       Use polyphase resampler (much lower CPU)\n");
 	printf("      --arfcn <n>         Force FCCH detection on a specific ARFCN\n");
 	printf("      --probe-sequential  Probe ARFCNs one-by-one; stop on clear FCCH\n");
+	printf("      --confirm           Use only carriers confirmed as base stations by\n");
+	printf("                          decoding their SCH (BSIC, frame number) (default)\n");
+	printf("      --no-confirm        Use the measured carrier even if its identity\n");
+	printf("                          does not decode\n");
+	printf("      --decode-timeout <s> Time allowed for the identity decoding\n");
+	printf("                          (default: %.0f)\n", config.decode_timeout_sec);
+	printf("      --no-bcch           Decode only the SCH, not the System Information\n");
+	printf("                          (MCC, MNC, LAC, cell identity)\n");
 	printf("  -j, --json              Output in JSON format\n");
 	sdr_config_print_help();
 	printf("\nExamples:\n");
@@ -94,6 +108,10 @@ static void add_options(void)
 	option_add(OPT_CHANNELIZER, "channelizer", 0);
 	option_add(OPT_ARFCN, "arfcn", 1);
 	option_add(OPT_PROBE_SEQUENTIAL, "probe-sequential", 0);
+	option_add(OPT_CONFIRM, "confirm", 0);
+	option_add(OPT_NO_CONFIRM, "no-confirm", 0);
+	option_add(OPT_DECODE_TIMEOUT, "decode-timeout", 1);
+	option_add(OPT_NO_BCCH, "no-bcch", 0);
 	option_add('j', "json", 0);
 	sdr_config_add_options();
 }
@@ -157,6 +175,22 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_PROBE_SEQUENTIAL:
 		config.probe_sequential = 1;
+		break;
+	case OPT_CONFIRM:
+		config.confirm = 1;
+		break;
+	case OPT_NO_CONFIRM:
+		config.confirm = 0;
+		break;
+	case OPT_DECODE_TIMEOUT:
+		config.decode_timeout_sec = atof(argv[argi]);
+		if (config.decode_timeout_sec <= 0.0) {
+			fprintf(stderr, "Invalid decode timeout: %s\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_NO_BCCH:
+		config.decode_bcch = 0;
 		break;
 	case 'j':
 		json_output = 1;
@@ -256,6 +290,56 @@ static void close_sdr(void)
 #endif
 }
 
+static void print_cell_text(const calibrate_cell_t *cell)
+{
+	const gsm_cell_ident_t *id = &cell->ident;
+
+	printf("      ARFCN %4d %.1f MHz: ", cell->arfcn, cell->freq_hz / 1e6);
+	if (cell->num_measurements > 0)
+		printf("%+.1f Hz (%.3f ppm, %d meas.), ", cell->hz_offset,
+		       cell->ppm_offset, cell->num_measurements);
+	if (!cell->decoded) {
+		printf("identity not decoded\n");
+		return;
+	}
+	if (!cell->confirmed) {
+		printf("NOT confirmed (SCH good %d, bad %d)\n", id->sch_good, id->sch_bad);
+		return;
+	}
+	printf("confirmed, BSIC %d (NCC %d, BCC %d), SCH %d good\n", id->bsic,
+	       gsm_bsic_ncc(id->bsic), gsm_bsic_bcc(id->bsic), id->sch_good);
+	if (id->have_lai || id->bcch_good) {
+		printf("        ");
+		if (id->have_lai)
+			printf("MCC %03d MNC %0*d LAC %d ", id->mcc, id->mnc_3digit ? 3 : 2,
+			       id->mnc, id->lac);
+		if (id->have_ci)
+			printf("CI %d ", id->ci);
+		printf("(SI good %d: SI3 %d, SI4 %d)\n", id->bcch_good,
+		       id->si_count[GSM_SI_3], id->si_count[GSM_SI_4]);
+	}
+}
+
+static void print_cell_json(const calibrate_cell_t *cell, int comma)
+{
+	const gsm_cell_ident_t *id = &cell->ident;
+
+	printf("%s{\"arfcn\": %d, \"frequency\": %.0f, \"hz\": %.2f, \"ppm\": %.6f, "
+	       "\"measurements\": %d, \"confirmed\": %s",
+	       comma ? ", " : "", cell->arfcn, cell->freq_hz, cell->hz_offset,
+	       cell->ppm_offset, cell->num_measurements, cell->confirmed ? "true" : "false");
+	if (cell->confirmed)
+		printf(", \"bsic\": %d, \"ncc\": %d, \"bcc\": %d, \"fn\": %u, \"sch_good\": %d",
+		       id->bsic, gsm_bsic_ncc(id->bsic), gsm_bsic_bcc(id->bsic), id->fn,
+		       id->sch_good);
+	if (id->have_lai)
+		printf(", \"mcc\": \"%03d\", \"mnc\": \"%0*d\", \"lac\": %d", id->mcc,
+		       id->mnc_3digit ? 3 : 2, id->mnc, id->lac);
+	if (id->have_ci)
+		printf(", \"ci\": %d", id->ci);
+	printf(", \"si_good\": %d}", id->bcch_good);
+}
+
 int main(int argc, char *argv[])
 {
 	calibrate_result_t results[CALIB_MAX_BANDS];
@@ -345,10 +429,23 @@ int main(int argc, char *argv[])
 		printf("SDR opened at %.3f MHz, %d Hz sample rate\n",
 		       center_freq / 1e6, samplerate);
 
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	rc = calibrate_auto(center_freq, samplerate, &config,
 	                     results, &num_results);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
 
 	close_sdr();
+
+	{
+		struct rusage ru;
+		getrusage(RUSAGE_SELF, &ru);
+		double wall = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+		double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6 +
+			     ru.ru_stime.tv_sec + ru.ru_stime.tv_usec * 1e-6;
+		LOGP(DSDR, LOGL_NOTICE, "Calibration took %.1f s, CPU %.2f s (%.1f%% of one core)\n",
+		     wall, cpu, (wall > 0.0) ? 100.0 * cpu / wall : 0.0);
+	}
 
 	if (rc < 0 || num_results == 0) {
 		if (!json_output)
@@ -378,7 +475,15 @@ int main(int argc, char *argv[])
 			printf("\"stddev_hz\": %.2f, ", results[i].stddev_hz);
 			printf("\"frequency\": %.0f, ", results[i].freq_hz);
 			printf("\"measurements\": %d, ", results[i].num_measurements);
-			printf("\"confidence\": %.2f}", results[i].confidence);
+			printf("\"agree\": %d, ", results[i].num_agree);
+			printf("\"sem_hz\": %.2f, ", results[i].sem_hz);
+			printf("\"confidence\": %.2f, ", results[i].confidence);
+			printf("\"arfcn\": %d, ", results[i].arfcn);
+			printf("\"confirmed\": %s, ", results[i].confirmed ? "true" : "false");
+			printf("\"carriers\": [");
+			for (int c = 0; c < results[i].num_cells; c++)
+				print_cell_json(&results[i].cells[c], c > 0);
+			printf("]}");
 		}
 		printf("]}\n");
 	} else {
@@ -395,10 +500,14 @@ int main(int argc, char *argv[])
 			if (applied_ppm != 0.0)
 				printf("    Total PPM:    %.3f (residual %+.3f + applied %+.3f)\n",
 				       total_ppm, results[i].ppm_offset, applied_ppm);
-			printf("    Std dev:      %.1f Hz\n", results[i].stddev_hz);
-			printf("    Measurements: %d (%.0f%% confidence)\n",
-			       results[i].num_measurements,
-			       results[i].confidence * 100);
+			printf("    Std dev:      %.1f Hz (mean +-%.1f Hz)\n",
+			       results[i].stddev_hz, results[i].sem_hz);
+			printf("    Measurements: %d, %d agree within +-%.0f Hz (confidence %.0f%%)\n",
+			       results[i].num_measurements, results[i].num_agree,
+			       results[i].agree_hz, results[i].confidence * 100);
+			printf("    Carriers:\n");
+			for (int c = 0; c < results[i].num_cells; c++)
+				print_cell_text(&results[i].cells[c]);
 		}
 
 		/* Best result (lowest stddev) */

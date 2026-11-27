@@ -17,6 +17,8 @@
 
 #include <stdint.h>
 
+#include "gsm_sch.h"
+
 /* Calibration signal types */
 #define CALIB_SIGNAL_GSM_FCCH   1
 #define CALIB_SIGNAL_LTE_PSS    2
@@ -34,6 +36,24 @@
 /* Maximum bands we can scan */
 #define CALIB_MAX_BANDS         4
 
+/* Carriers measured per band (the winner and, if it is not confirmed as a
+ * base station, the next candidates) */
+#define CALIB_MAX_CELLS         4
+
+/* One measured carrier: its offset and its identity */
+typedef struct {
+	int arfcn;
+	double freq_hz;
+	double hz_offset;           /* FCCH offset (trimmed mean) */
+	double ppm_offset;
+	double stddev_hz;
+	int num_measurements;
+	int decoded;                /* identity decoding was run */
+	int confirmed;              /* SCH decodes consistent: a base station */
+	double confirm_sec;         /* decoding time until confirmed */
+	gsm_cell_ident_t ident;     /* BSIC, FN, SI counts, MCC/MNC/LAC/CI */
+} calibrate_cell_t;
+
 /* Calibration result structure (per-band) */
 typedef struct {
 	double ppm_offset;          /* Calculated ppm error */
@@ -46,7 +66,13 @@ typedef struct {
 	int gsm_band;               /* GSM_BAND_* if GSM signal */
 	int arfcn;                  /* Best ARFCN if GSM signal */
 	int num_measurements;       /* Number of measurements collected */
+	int num_agree;              /* measurements within the agreement window */
+	double agree_hz;            /* agreement window (+- Hz around the result) */
+	double sem_hz;              /* standard error of the mean */
+	int confirmed;              /* the result carrier is a confirmed base station */
 	int valid;                  /* 1 if this result is valid */
+	calibrate_cell_t cells[CALIB_MAX_CELLS]; /* carriers measured, in order */
+	int num_cells;
 } calibrate_result_t;
 
 /* Calibration configuration */
@@ -60,6 +86,9 @@ typedef struct {
 	int use_channelizer;        /* 1=use polyphase resampler path (lower CPU) */
 	int forced_arfcn;           /* >0: force this ARFCN for FCCH detection */
 	int probe_sequential;       /* 1=probe ARFCNs one-by-one; stop on clear FCCH */
+	int confirm;                /* 1=use only carriers whose SCH identity decodes */
+	double decode_timeout_sec;  /* time allowed for the identity decoding */
+	int decode_bcch;            /* also decode BCCH System Information */
 } calibrate_config_t;
 
 /* Initialize default configuration */

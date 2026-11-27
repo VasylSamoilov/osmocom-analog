@@ -581,6 +581,9 @@ void calibrate_config_default(calibrate_config_t *config)
 	config->use_channelizer = 0;
 	config->forced_arfcn = -1;
 	config->probe_sequential = 0;
+	config->confirm = 1;
+	config->decode_timeout_sec = 5.0;
+	config->decode_bcch = 1;
 }
 
 /* ================================================================
@@ -730,12 +733,29 @@ static int scan_band(int samplerate, int gsm_band,
 /* Kalibrate-style FCCH pre-validation:
  * probe top power ARFCNs briefly and choose the one with strongest FCCH evidence.
  * Returns index into 'scan_results', or -1 on failure/no evidence. */
+/* other probed candidates with usable FCCH evidence, best first, as
+ * alternatives when the winner is not confirmed as a base station */
+typedef struct {
+	int idx;
+	double score;
+} ranked_cand_t;
+
+static int compare_ranked_desc(const void *a, const void *b)
+{
+	const ranked_cand_t *pa = a;
+	const ranked_cand_t *pb = b;
+	return (pa->score < pb->score) - (pa->score > pb->score);
+}
+
 static int choose_fcch_reference_arfcn(int samplerate,
 				       const arfcn_power_t *scan_results,
 				       int num_active,
 				       int verbosity,
-				       int probe_sequential)
+				       int probe_sequential,
+				       ranked_cand_t *ranked, int max_ranked,
+				       int *num_ranked)
 {
+	*num_ranked = 0;
 	int top_n = num_active; /* Probe all active ARFCNs, but in batches. */
 	if (top_n <= 0)
 		return -1;
@@ -988,6 +1008,11 @@ static int choose_fcch_reference_arfcn(int samplerate,
 		/* Penalize isolated families; they are often stable but wrong locks. */
 		if (consensus_hits < 2)
 			candidate_score -= 8.0;
+		if ((strict_quality || fallback_quality) && *num_ranked < max_ranked) {
+			ranked[*num_ranked].idx = i;
+			ranked[*num_ranked].score = candidate_score + (strict_quality ? 1000.0 : 0.0);
+			(*num_ranked)++;
+		}
 		if (!strict_quality)
 			candidate_score = -1e9;
 		if (strict_quality && (candidate_score > best_score ||
@@ -1505,35 +1530,16 @@ static double channel_power_db(const float *iq, int count)
  * Calibrate a single band: scan + detect
  * ================================================================ */
 
-int calibrate_band(double center_freq, int samplerate,
-                   int gsm_band, calibrate_config_t *config,
-                   calibrate_result_t *result)
+/* Phase 1: scan the band, choose the carriers to measure (best first).
+ * Returns their number (at most max_list), <0 on error. */
+static int select_carriers(int samplerate, int gsm_band, calibrate_config_t *config,
+			   arfcn_power_t *list, int max_list)
 {
-	calib_channel_t channels[CALIB_MAX_CHANNELS];
-	float *iq_buffer = NULL;
-	float *ch_iq = NULL;
-	float offsets[AVG_COUNT];
-	float snrs[AVG_COUNT];
-	debug_sample_t debug_samples[DEBUG_MAX_DETECTIONS];
-	int debug_sample_count = 0;
-	int measurement_count = 0;
-	int rejected_count = 0;
-	int total_reads = 0;
-	int num_channels;
-	int detect_arfcn = -1;
 	int arfcn_start, arfcn_end;
 	double band_center, band_bw;
 
-	memset(result, 0, sizeof(*result));
-	memset(channels, 0, sizeof(channels));
-	result->gsm_band = gsm_band;
-
 	gsm_band_params(gsm_band, &band_center, &band_bw,
 	                &arfcn_start, &arfcn_end);
-
-	int max_ch = config->num_channels;
-	if (max_ch < 1) max_ch = 1;
-	if (max_ch > CALIB_MAX_CHANNELS) max_ch = CALIB_MAX_CHANNELS;
 
 	LOGP(DSDR, LOGL_INFO,
 	     "\n=== Phase 1: Scanning %s band for active channels ===\n",
@@ -1596,12 +1602,7 @@ int calibrate_band(double center_freq, int samplerate,
 	LOGP(DSDR, LOGL_INFO, "%d ARFCNs above threshold (%.1f dBFS)\n",
 	     num_active, threshold);
 
-	(void)center_freq;
-	double detect_center;
-	arfcn_power_t forced_entry;
-	arfcn_power_t winner_entry;
-	arfcn_power_t *detect_list = scan_results;
-	int detect_list_count = num_active;
+	int num_list = 0;
 
 	if (config->forced_arfcn > 0) {
 		int found = -1;
@@ -1618,42 +1619,90 @@ int calibrate_band(double center_freq, int samplerate,
 			free(scan_results);
 			return -ENODATA;
 		}
-		forced_entry = scan_results[found];
-		detect_center = forced_entry.freq;
-		detect_arfcn = forced_entry.arfcn;
-		detect_list = &forced_entry;
-		detect_list_count = 1;
+		list[num_list++] = scan_results[found];
 		LOGP(DSDR, LOGL_NOTICE,
 		     "Using forced ARFCN %d at %.3f MHz for FCCH detection\n",
-		     detect_arfcn, detect_center / 1e6);
+		     list[0].arfcn, list[0].freq / 1e6);
 	} else {
+		ranked_cand_t *ranked = calloc(num_active, sizeof(*ranked));
+		int num_ranked = 0;
+		if (!ranked) {
+			free(scan_results);
+			return -ENOMEM;
+		}
 		int best_fcch_idx = choose_fcch_reference_arfcn(samplerate,
 							       scan_results,
 							       num_active,
 							       config->verbosity,
-							       config->probe_sequential);
+							       config->probe_sequential,
+							       ranked, num_active,
+							       &num_ranked);
 		if (best_fcch_idx >= 0) {
-			detect_center = scan_results[best_fcch_idx].freq;
-			detect_arfcn = scan_results[best_fcch_idx].arfcn;
 			/* Use the winning ARFCN directly in phase 2. If we only retune
 			 * center while keeping the full power-sorted list, adjacent
 			 * stronger channels can replace the winner during setup. */
-			winner_entry = scan_results[best_fcch_idx];
-			detect_list = &winner_entry;
-			detect_list_count = 1;
+			list[num_list++] = scan_results[best_fcch_idx];
 			if (config->verbosity >= 1) {
 				LOGP(DSDR, LOGL_INFO,
 				     "Using FCCH pre-validation winner ARFCN %d at %.3f MHz for phase 2\n",
-				     detect_arfcn, detect_center / 1e6);
+				     list[0].arfcn, list[0].freq / 1e6);
+			}
+			/* then the other candidates with FCCH evidence, best first */
+			qsort(ranked, num_ranked, sizeof(*ranked), compare_ranked_desc);
+			for (int i = 0; i < num_ranked && num_list < max_list; i++) {
+				if (ranked[i].idx != best_fcch_idx)
+					list[num_list++] = scan_results[ranked[i].idx];
 			}
 		} else {
 			LOGP(DSDR, LOGL_NOTICE,
 			     "FCCH pre-validation found no reliable winner. "
 			     "Use --arfcn <n> or improve SNR/antenna to avoid wrong auto-lock\n");
+			free(ranked);
 			free(scan_results);
 			return -ENODATA;
 		}
+		free(ranked);
 	}
+	free(scan_results);
+	return num_list;
+}
+
+/* ================================================================
+ * Phase 2: FCCH measurement and identity decoding on one carrier
+ * ================================================================ */
+
+static double now_sec(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static int detect_on_arfcn(int samplerate, int gsm_band, calibrate_config_t *config,
+			   const arfcn_power_t *entry, calibrate_result_t *result,
+			   calibrate_cell_t *cell)
+{
+	calib_channel_t channels[CALIB_MAX_CHANNELS];
+	float *iq_buffer = NULL;
+	float *ch_iq = NULL;
+	float offsets[AVG_COUNT];
+	float snrs[AVG_COUNT];
+	debug_sample_t debug_samples[DEBUG_MAX_DETECTIONS];
+	int debug_sample_count = 0;
+	int measurement_count = 0;
+	int rejected_count = 0;
+	int total_reads = 0;
+	int num_channels;
+	double detect_center = entry->freq;
+	int detect_arfcn = entry->arfcn;
+
+	memset(result, 0, sizeof(*result));
+	memset(channels, 0, sizeof(channels));
+	memset(cell, 0, sizeof(*cell));
+	result->gsm_band = gsm_band;
+	cell->arfcn = detect_arfcn;
+	cell->freq_hz = detect_center;
+	cell->ident.bsic = -1;
 
 	/* Phase 2: Retune and detect */
 	LOGP(DSDR, LOGL_INFO,
@@ -1664,17 +1713,14 @@ int calibrate_band(double center_freq, int samplerate,
 	if (rc < 0) {
 		LOGP(DSDR, LOGL_ERROR, "Failed to retune to %.3f MHz\n",
 		     detect_center / 1e6);
-		free(scan_results);
 		return rc;
 	}
 
-	num_channels = setup_channels_for_arfcns(channels,
-	                                         (config->forced_arfcn > 0) ? 1 : max_ch,
+	num_channels = setup_channels_for_arfcns(channels, 1,
 	                                         samplerate, detect_center,
-	                                         detect_list, detect_list_count,
+	                                         entry, 1,
 	                                         config->use_channelizer,
 	                                         config->verbosity);
-	free(scan_results);
 
 	if (num_channels == 0) {
 		LOGP(DSDR, LOGL_ERROR, "No channels could be set up for detection\n");
@@ -1726,14 +1772,48 @@ int calibrate_band(double center_freq, int samplerate,
 	int max_reads = 5000;
 	int logged_channels = 0;
 
+	/* Identity decoding on the measured carrier (channel 0): starts when
+	 * a few FCCH offsets are known, ends when confirmed (and SI3 seen if
+	 * BCCH is decoded) or after the decode timeout. */
+	gsm_sch_t sch;
+	enum { DEC_WAIT, DEC_RUN, DEC_DONE } dec_state = DEC_WAIT;
+	double dec_start = 0.0;
+	int dec_failed = 0;
+	if (gsm_sch_init(&sch, channels[0].detector.sample_rate, config->decode_bcch) < 0) {
+		LOGP(DSDR, LOGL_ERROR, "Cannot decode the cell identity at %.0f Hz\n",
+		     channels[0].detector.sample_rate);
+		dec_state = DEC_DONE;
+		dec_failed = 1;
+	}
+
 	/* EMA-smoothed offset for convergence tracking
 	 * (inspired by SDRangel freqtracker alphaEMA approach) */
 	double ema_offset = 0.0;
 	int ema_initialized = 0;
 	const double ema_alpha = 0.15;  /* smoothing factor */
 
-	while (measurement_count < AVG_COUNT && total_reads < max_reads) {
+	while ((measurement_count < AVG_COUNT || dec_state == DEC_RUN) && total_reads < max_reads) {
 		int samples_received;
+
+		if (dec_state == DEC_RUN) {
+			double el = now_sec() - dec_start;
+			int done = gsm_sch_confirmed(&sch) &&
+				   (!config->decode_bcch || sch.ident.have_ci);
+			if (gsm_sch_confirmed(&sch) && !cell->confirmed) {
+				cell->confirmed = 1;
+				cell->confirm_sec = el;
+			}
+			if (done || el > config->decode_timeout_sec) {
+				dec_state = DEC_DONE;
+				LOGP(DSDR, LOGL_INFO,
+				     "  ARFCN %d identity decoding ended after %.2f s: %s\n",
+				     detect_arfcn, el,
+				     gsm_sch_confirmed(&sch) ? "confirmed" : "NOT confirmed");
+				/* an unconfirmed carrier is not measured further */
+				if (config->confirm && !gsm_sch_confirmed(&sch))
+					break;
+			}
+		}
 
 		if (difftime(time(NULL), start_time) > config->timeout_sec) {
 			LOGP(DSDR, LOGL_NOTICE,
@@ -1750,8 +1830,10 @@ int calibrate_band(double center_freq, int samplerate,
 			continue;
 		}
 
-		for (int c = 0; c < num_channels && measurement_count < AVG_COUNT; c++) {
+		for (int c = 0; c < num_channels; c++) {
 			if (!channels[c].active) continue;
+			if (measurement_count >= AVG_COUNT && !(c == 0 && dec_state == DEC_RUN))
+				continue;
 
 			int out_count;
 
@@ -1826,6 +1908,17 @@ int calibrate_band(double center_freq, int samplerate,
 				     c, channels[c].arfcn,
 				     channels[c].abs_freq / 1e6, pwr);
 			}
+
+			if (c == 0 && dec_state == DEC_WAIT && measurement_count >= 3) {
+				dec_state = DEC_RUN;
+				dec_start = now_sec();
+				cell->decoded = 1;
+			}
+			if (c == 0 && dec_state == DEC_RUN)
+				gsm_sch_process(&sch, ch_iq, out_count,
+						running_median(offsets, measurement_count));
+			if (measurement_count >= AVG_COUNT)
+				continue;
 
 			double offset, snr_db;
 			rc = fcch_detect_process(&channels[c].detector,
@@ -1976,6 +2069,12 @@ int calibrate_band(double center_freq, int samplerate,
 
 	cleanup_channels(channels, num_channels);
 
+	cell->ident = sch.ident;
+	cell->confirmed = gsm_sch_confirmed(&sch);
+	gsm_sch_exit(&sch);
+	if (dec_failed)
+		cell->decoded = 0;
+
 	if (measurement_count < 3) {
 		LOGP(DSDR, LOGL_ERROR,
 		     "%s: insufficient measurements (%d/%d)\n",
@@ -1985,7 +2084,10 @@ int calibrate_band(double center_freq, int samplerate,
 
 	int trim = (measurement_count > 2 * AVG_THRESHOLD) ? AVG_THRESHOLD : 0;
 	double stddev;
-	double avg_offset = trimmed_mean(offsets, measurement_count, trim, &stddev);
+	/* trimmed_mean() sorts: on a copy, offsets[] stays paired with snrs[] */
+	float sorted_offsets[AVG_COUNT];
+	memcpy(sorted_offsets, offsets, measurement_count * sizeof(float));
+	double avg_offset = trimmed_mean(sorted_offsets, measurement_count, trim, &stddev);
 	double guarded_offset = 0.0, guarded_stddev = 0.0;
 	if (select_near_center_family(offsets, snrs, measurement_count,
 				      &guarded_offset, &guarded_stddev)) {
@@ -2013,32 +2115,51 @@ int calibrate_band(double center_freq, int samplerate,
 	for (int i = 0; i < measurement_count; i++)
 		accepted_snr_sum += snrs[i];
 	double accepted_snr_avg = accepted_snr_sum / measurement_count;
+	/* detector "rejected" counts every processed block without an FCCH
+	 * (most blocks): a diagnostic, not a quality measure */
 	double reject_ratio = (double)detector_rejected_total /
 			      (double)((detector_found_total > 0) ? detector_found_total : 1);
+
+	/* Confidence: how many measurements agree with the result (within
+	 * 4 standard deviations of the trimmed set, at least +-50 Hz: wrong
+	 * detections are far off), scaled down when fewer than AVG_COUNT
+	 * measurements were collected and when the FCCH SNR is low. */
+	double agree_hz = 4.0 * stddev;
+	if (agree_hz < 50.0)
+		agree_hz = 50.0;
+	int num_agree = 0;
+	for (int i = 0; i < measurement_count; i++)
+		if (fabs(offsets[i] - avg_offset) <= agree_hz)
+			num_agree++;
 	double count_conf = clamp01((double)measurement_count / AVG_COUNT);
 	double snr_conf = clamp01((accepted_snr_avg - RESULT_MIN_ACCEPTED_SNR_DB) /
 				  (RESULT_FULL_ACCEPTED_SNR_DB - RESULT_MIN_ACCEPTED_SNR_DB));
-	double reject_conf = clamp01((RESULT_REJECT_RATIO_BAD - reject_ratio) /
-				     (RESULT_REJECT_RATIO_BAD - RESULT_REJECT_RATIO_GOOD));
-	double quality_conf = (0.2 + 0.8 * snr_conf) * (0.2 + 0.8 * reject_conf);
+	double agree_ratio = (double)num_agree / measurement_count;
 
 	result->hz_offset = avg_offset;
 	result->ppm_offset = (avg_offset / detect_center) * 1e6;
 	result->freq_hz = detect_center;
 	result->arfcn = detect_arfcn;
 	result->signal_type = CALIB_SIGNAL_GSM_FCCH;
-	result->confidence = count_conf * quality_conf;
+	result->confidence = agree_ratio * count_conf * (0.5 + 0.5 * snr_conf);
 	result->gsm_band = gsm_band;
 	result->stddev_hz = stddev;
 	result->num_measurements = measurement_count;
+	result->num_agree = num_agree;
+	result->agree_hz = agree_hz;
+	result->sem_hz = (num_agree > 1) ? stddev / sqrt((double)num_agree) : stddev;
 	result->valid = 1;
 
-	if (accepted_snr_avg < RESULT_MIN_ACCEPTED_SNR_DB ||
-	    reject_ratio > RESULT_REJECT_RATIO_BAD) {
+	cell->hz_offset = avg_offset;
+	cell->ppm_offset = result->ppm_offset;
+	cell->stddev_hz = stddev;
+	cell->num_measurements = measurement_count;
+
+	if (accepted_snr_avg < RESULT_MIN_ACCEPTED_SNR_DB) {
 		LOGP(DSDR, LOGL_NOTICE,
-		     "%s low-quality lock warning: accepted_snr=%.1f dB reject_ratio=%.2f "
+		     "%s low-quality lock warning: accepted_snr=%.1f dB "
 		     "(confidence %.0f%%)\n",
-		     gsm_band_name(gsm_band), accepted_snr_avg, reject_ratio,
+		     gsm_band_name(gsm_band), accepted_snr_avg,
 		     result->confidence * 100.0);
 	}
 
@@ -2067,6 +2188,103 @@ int calibrate_band(double center_freq, int samplerate,
 	     ema_offset);
 
 	return 0;
+}
+
+static void log_cell(const calibrate_cell_t *cell)
+{
+	const gsm_cell_ident_t *id = &cell->ident;
+
+	if (!cell->decoded) {
+		LOGP(DSDR, LOGL_NOTICE, "  ARFCN %d: identity not decoded\n", cell->arfcn);
+		return;
+	}
+	if (!cell->confirmed) {
+		LOGP(DSDR, LOGL_NOTICE,
+		     "  ARFCN %d: NOT confirmed as a base station (SCH good %d, bad %d)\n",
+		     cell->arfcn, id->sch_good, id->sch_bad);
+		return;
+	}
+	LOGP(DSDR, LOGL_NOTICE,
+	     "  ARFCN %d: confirmed in %.2f s, BSIC %d (NCC %d BCC %d), FN %u, "
+	     "SCH good %d (consistent %d) bad %d, SNR %.1f dB\n",
+	     cell->arfcn, cell->confirm_sec, id->bsic, gsm_bsic_ncc(id->bsic),
+	     gsm_bsic_bcc(id->bsic), id->fn, id->sch_good, id->sch_consistent,
+	     id->sch_bad, id->snr_db);
+	if (id->bcch_good || id->bcch_bad)
+		LOGP(DSDR, LOGL_NOTICE,
+		     "  ARFCN %d: BCCH good %d bad %d (SI1 %d SI2 %d SI3 %d SI4 %d other %d)\n",
+		     cell->arfcn, id->bcch_good, id->bcch_bad, id->si_count[GSM_SI_1],
+		     id->si_count[GSM_SI_2], id->si_count[GSM_SI_3], id->si_count[GSM_SI_4],
+		     id->si_count[GSM_SI_OTHER]);
+	if (id->have_lai && id->have_ci)
+		LOGP(DSDR, LOGL_NOTICE, "  ARFCN %d: MCC %03d MNC %0*d LAC %d CI %d\n",
+		     cell->arfcn, id->mcc, id->mnc_3digit ? 3 : 2, id->mnc, id->lac, id->ci);
+	else if (id->have_lai)
+		LOGP(DSDR, LOGL_NOTICE, "  ARFCN %d: MCC %03d MNC %0*d LAC %d\n",
+		     cell->arfcn, id->mcc, id->mnc_3digit ? 3 : 2, id->mnc, id->lac);
+}
+
+/* ================================================================
+ * Calibrate a single band: scan, then measure the best carrier; with
+ * confirmation on, a carrier whose SCH does not decode is reported but
+ * not used, the next candidate is measured instead.
+ * ================================================================ */
+
+int calibrate_band(double center_freq, int samplerate,
+                   int gsm_band, calibrate_config_t *config,
+                   calibrate_result_t *result)
+{
+	arfcn_power_t list[CALIB_MAX_CELLS];
+	calibrate_result_t *try_result;
+	calibrate_cell_t cells[CALIB_MAX_CELLS];
+	int num_cells = 0, chosen = -1, last_rc = -ENODATA;
+
+	(void)center_freq;
+	memset(result, 0, sizeof(*result));
+	result->gsm_band = gsm_band;
+
+	int num_list = select_carriers(samplerate, gsm_band, config, list, CALIB_MAX_CELLS);
+	if (num_list <= 0)
+		return (num_list < 0) ? num_list : -ENODATA;
+
+	try_result = calloc(CALIB_MAX_CELLS, sizeof(*try_result));
+	if (!try_result)
+		return -ENOMEM;
+
+	for (int i = 0; i < num_list; i++) {
+		int rc = detect_on_arfcn(samplerate, gsm_band, config, &list[i],
+					 &try_result[i], &cells[num_cells]);
+		calibrate_cell_t *cell = &cells[num_cells++];
+		log_cell(cell);
+		if (rc == -ERANGE) {
+			last_rc = rc;	/* caller retries with the channelizer */
+			break;
+		}
+		if (rc == 0 && (!config->confirm || cell->confirmed)) {
+			chosen = i;
+			break;
+		}
+		if (rc == 0)
+			LOGP(DSDR, LOGL_NOTICE,
+			     "ARFCN %d is not confirmed as a base station: not used%s\n",
+			     list[i].arfcn,
+			     (i + 1 < num_list) ? ", trying the next candidate" :
+			     " (--no-confirm to use it anyway)");
+		last_rc = (rc < 0) ? rc : -ENODATA;
+	}
+
+	if (chosen >= 0) {
+		*result = try_result[chosen];
+		result->confirmed = cells[chosen].confirmed;
+	} else {
+		result->gsm_band = gsm_band;
+		result->valid = 0;
+	}
+	memcpy(result->cells, cells, num_cells * sizeof(cells[0]));
+	result->num_cells = num_cells;
+	free(try_result);
+
+	return (chosen >= 0) ? 0 : last_rc;
 }
 
 /* ================================================================
