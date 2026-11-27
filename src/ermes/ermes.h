@@ -20,35 +20,12 @@
 #include "../libmobile/sender.h"
 #include "../libfsk/fsk_nrz.h"
 #include "frame.h"
+#include "queue.h"
+#include "numbers.h"
+#include "ssi.h"
+#include "scheduler.h"
 
-#define ERMES_MAX_TEXT	1024	/* bytes of a message text (UTF-8), terminator included */
-
-/* --ssi: the SSI schedule. HOLD is the network schedule (default); the others are for tests of
- * receivers only, as is one SSIT (ERMES_SSIT_*) in every batch */
-#define ERMES_SSI_HOLD		-5	/* network: 0000 / 0001 by turns per subsequence from the
-					 * hour start (--ssi-hold) */
-#define ERMES_SSI_ALTERNATE	-1	/* test: 0000 / 0001 by turns every batch */
-#define ERMES_SSI_CYCLE		-2	/* test: the 13 types of edition 2, one a batch */
-#define ERMES_SSI_STRICT	-3	/* test: 0000 0001 by turns every batch, from a batch counter */
-#define ERMES_SSI_PAIRS		-4	/* test: 0000 0000 0001 0001 ... */
-extern int ermes_ssi_hold;
-extern int ermes_ssi_mode;
-
-/* --clock: seconds between the network clock and the system clock */
-extern double ermes_clock_offset;
-
-/* --tx-latency: seconds from making a sample to its transmission (< 0: the DSP buffer) */
-extern double ermes_tx_latency;
-
-/* --year-from: SSI year moved into [year, year+27] by 28-year steps (0 = off) */
-extern int ermes_year_from;
-
-typedef struct ermes_msg {
-	struct ermes_msg	*next;
-	ermes_page_t		page;
-	char			text[ERMES_MAX_TEXT];
-} ermes_msg_t;
-
+/* One transmitter (channel): sources -> queue -> scheduler -> batch builder -> modulator */
 typedef struct ermes {
 	sender_t		sender;
 	int			channel;		/* 1..16 */
@@ -59,11 +36,10 @@ typedef struct ermes {
 	int			started;
 	double			clock_start;		/* network time of the first batch (s since the epoch) */
 	uint64_t		cw_sent;		/* codewords sent since */
-	int			ssit_next;		/* --ssi cycle: SSIT of the next batch */
+	int			ssit_next;		/* batch counter of the --ssi test schedules */
 	int			skip_bits;		/* bits of the first batch already past at start (UTC lock) */
 
-	/* queue */
-	ermes_msg_t		*msg_list;
+	ermes_queue_t		queue;
 
 	/* modulator */
 	fsk_nrz_mod_t		fsk_mod;
@@ -78,22 +54,6 @@ void ermes_destroy(sender_t *sender);
 
 /* Queue a page: "<local address>[,tone|numeric|alpha[,<text>]]"; the address is decimal or 0x hex */
 int ermes_msg_send(const char *line);
-
-/* Queue a page given as values. Returns 0 or -1 (not queued, logged) */
-/* How a page is sent: paging category, UMI and alert type (VIF, Fig.11 / Table 9 p.19) */
-typedef struct ermes_page_opts {
-	enum ermes_category	category;
-	int			urgent;		/* UMI */
-	int			alert;		/* 0..7 */
-	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = --charset */
-} ermes_page_opts_t;
-
-extern ermes_page_opts_t ermes_default_opts;
-
-/* Options field of a FIFO line (as flex): "urgent=1 alert=3 charset=..." onto opts. 0 or -1 (logged) */
-int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts);
-
-int ermes_page_queue(ermes_t *ermes, uint32_t local_address, const ermes_page_opts_t *opts, const char *text);
 
 /* 1 if nothing is queued */
 int ermes_idle(void);

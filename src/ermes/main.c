@@ -40,8 +40,6 @@
 #define MAX_START_PAGES 16
 
 extern const char *ermes_default_text;
-extern const char *ermes_number_file;
-extern const struct pager_charset *ermes_charset;
 static const char *number_file = NULL;
 
 static const char *msg_send_path = MSG_SEND_DEFAULT;
