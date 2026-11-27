@@ -80,6 +80,7 @@ static double start_time;
 #define OPT_URGENT	271
 #define OPT_ALERT	272
 #define OPT_TX_LATENCY	273
+#define OPT_YEAR_FROM	274
 
 void print_help(const char *arg0)
 {
@@ -112,6 +113,11 @@ void print_help(const char *arg0)
 	printf("        13 types (edition 2 5.3.2.1: zone/hour/date, day/month/year, network\n");
 	printf("        version 02.01, reserved ones all zero). alternate: zone/hour/date and\n");
 	printf("        day/month/year by turns. Or one type in every batch. (default hold)\n");
+	printf("    --year-from <year>\n");
+	printf("        Send the year (SSI day/month/year) moved by whole 28-year steps into\n");
+	printf("        <year> .. <year>+27, for pagers whose calendar ends early: the weekday\n");
+	printf("        and the date stay right (1901-2099). E.g. 1995: 2026 is sent as 1998.\n");
+	printf("        (default: the real year)\n");
 	printf("    --tx-latency <ms>\n");
 	printf("        Time from making a sample to sending it, so the batches are locked to\n");
 	printf("        UTC on the air. (default: the DSP buffer, -b)\n");
@@ -172,6 +178,7 @@ static void add_options(void)
 	option_add(OPT_URGENT, "urgent", 0);
 	option_add(OPT_ALERT, "alert", 1);
 	option_add(OPT_TX_LATENCY, "tx-latency", 1);
+	option_add(OPT_YEAR_FROM, "year-from", 1);
 	option_add('M', "message", 1);
 	option_add(OPT_PAGE, "page", 1);
 	option_add(OPT_PAGE_DELAY, "page-delay", 1);
@@ -229,6 +236,13 @@ static int handle_options(int short_option, int argi, char **argv)
 		if (ermes_category_from_name(argv[argi], &ermes_default_opts.category) < 0
 		 || ermes_default_opts.category == ERMES_CAT_TRANSPARENT) {
 			fprintf(stderr, "Given type is not tone, numeric or alpha.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_YEAR_FROM:
+		ermes_year_from = atoi(argv[argi]);
+		if (ermes_year_from < ERMES_YEAR_BASE || ermes_year_from + 27 > ERMES_YEAR_BASE + (1 << ERMES_YEAR_BITS) - 1) {
+			fprintf(stderr, "Given year-from is not %d..%d.\n", ERMES_YEAR_BASE, ERMES_YEAR_BASE + (1 << ERMES_YEAR_BITS) - 28);
 			return -EINVAL;
 		}
 		break;

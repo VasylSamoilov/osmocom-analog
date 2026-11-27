@@ -57,6 +57,24 @@ static const uint8_t dibit_level[4] = { 0, 1, 3, 2 };
 /* --clock: the network clock runs this many seconds from the system clock (0 = real time) */
 double ermes_clock_offset = 0.0;
 
+/* --year-from: the year sent in the SSI (type 0001) moved into [ermes_year_from, +27] by whole
+ * 28-year steps, so that pagers whose firmware calendar ends early (NEC: the Skyper counter
+ * overflows after 2026-11, the PA4PY-20A ends 2013) get a year they know. Weekdays and leap years
+ * repeat every 28 years from 1901 to 2099, so weekday, month and day stay right. 0 = off. */
+int ermes_year_from = 0;
+#define CALENDAR_CYCLE	28
+
+static int ermes_year(int year)
+{
+	if (!ermes_year_from)
+		return year;
+	while (year >= ermes_year_from + CALENDAR_CYCLE)
+		year -= CALENDAR_CYCLE;
+	while (year < ermes_year_from)
+		year += CALENDAR_CYCLE;
+	return year;
+}
+
 /* Network time (seconds since the epoch) at the start of the batch being built: the start of
  * the first batch plus the codewords sent since, so it follows the samples, not the wall clock */
 static double ermes_network_time(const ermes_t *ermes)
@@ -171,7 +189,7 @@ static void ermes_ssi(ermes_t *ermes, ermes_ssi_t *ssi)
 		break;
 	case ERMES_SSIT_DAY_MONTH_YEAR:
 		/* struct tm: Sunday = 0, months from 0, years from 1900; ERMES: Monday = 1 .. Sunday = 7 */
-		ssi->ssif = ermes_ssif_day_month_year(tm.tm_wday ? tm.tm_wday : 7, tm.tm_mon + 1, tm.tm_year + 1900);
+		ssi->ssif = ermes_ssif_day_month_year(tm.tm_wday ? tm.tm_wday : 7, tm.tm_mon + 1, ermes_year(tm.tm_year + 1900));
 		break;
 	case ERMES_SSIT_IVR1:
 		/* a network that cycles the SSIT is an I1 version >= 02.01 one (§4.6.1 p.14) */

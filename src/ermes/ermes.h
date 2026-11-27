@@ -38,6 +38,9 @@ extern double ermes_clock_offset;
 /* --tx-latency: seconds from making a sample to its transmission (< 0: the DSP buffer) */
 extern double ermes_tx_latency;
 
+/* --year-from: SSI year moved into [year, year+27] by 28-year steps (0 = off) */
+extern int ermes_year_from;
+
 typedef struct ermes_msg {
 	struct ermes_msg	*next;
 	ermes_page_t		page;
