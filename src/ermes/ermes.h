@@ -23,12 +23,14 @@
 
 #define ERMES_MAX_TEXT	256
 
-/* --ssi: the SSI types by turns, the 13-value cycle of edition 2, or one SSIT (ERMES_SSIT_*) in every batch */
-#define ERMES_SSI_ALTERNATE	-1
-#define ERMES_SSI_CYCLE		-2
-#define ERMES_SSI_STRICT	-3	/* 0000 0001 by turns every batch, from a batch counter */
-#define ERMES_SSI_PAIRS		-4	/* 0000 0000 0001 0001 ... */
-#define ERMES_SSI_HOLD		-5	/* one type for --ssi-hold subsequences, then the other */
+/* --ssi: the SSI schedule. HOLD is the network schedule (default); the others are for tests of
+ * receivers only, as is one SSIT (ERMES_SSIT_*) in every batch */
+#define ERMES_SSI_HOLD		-5	/* network: 0000 / 0001 by turns per subsequence from the
+					 * hour start (--ssi-hold) */
+#define ERMES_SSI_ALTERNATE	-1	/* test: 0000 / 0001 by turns every batch */
+#define ERMES_SSI_CYCLE		-2	/* test: the 13 types of edition 2, one a batch */
+#define ERMES_SSI_STRICT	-3	/* test: 0000 0001 by turns every batch, from a batch counter */
+#define ERMES_SSI_PAIRS		-4	/* test: 0000 0000 0001 0001 ... */
 extern int ermes_ssi_hold;
 extern int ermes_ssi_mode;
 

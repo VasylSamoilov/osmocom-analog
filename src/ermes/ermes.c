@@ -45,9 +45,10 @@
 ermes_page_opts_t ermes_default_opts = { .category = ERMES_CAT_TONE, .urgent = 0, .alert = 0 };
 const char *ermes_default_text = "";
 const struct pager_charset *ermes_charset = &pager_charset_ermes_generic_generic_standard;
-/* SSI type sent: ERMES_SSI_ALTERNATE (0000 and 0001 by turns) or one SSIT in every batch */
+/* --ssi: the SSI schedule, ERMES_SSI_HOLD for a network (default), the others for tests (ermes.h) */
 int ermes_ssi_mode = ERMES_SSI_HOLD;
-/* --ssi-hold: subsequences each type is held with --ssi hold (5 = one minute) */
+/* --ssi-hold: subsequences each type is held with --ssi hold (1 as the real networks; 5 = one
+ * minute for tests) */
 int ermes_ssi_hold = 1;
 
 /* Dibit to level of the modulator: 00 -4687.5, 01 -1562.5, 11 +1562.5, 10 +4687.5 Hz
@@ -141,18 +142,24 @@ static void ermes_next_slot(ermes_t *ermes)
 }
 
 /* SSI of this batch, local time (§5.3.2.2-3 p.17), by --ssi:
- *   hold (default)  one type in every batch for --ssi-hold subsequences, then the other, so that
- *                   every pager sees the same word at each of its wakes
+ *   hold (default)  the network's schedule: the hour starts with 0000 (zone/hour/date) in every
+ *                   batch of its first subsequence, 0001 (day/month/year) in the next, and so on
+ *                   by turns (--ssi-hold subsequences each, default 1), as the Swiss (1997) and
+ *                   Dutch (2014) networks sent. The zone reaches every pager at least once per
+ *                   hour (ed.1 §6.3.1.1 p.15), every 24 s here.
+ * For tests only (receiver behaviour, not network schedules):
  *   alternate       0000 / 0001 from batch to batch, the subsequence count added (a subsequence
  *                   has an even number of batches), so an own batch gets both types by turns
  *   strict, pairs   0000 0001 ... and 0000 0000 0001 0001 ... from a batch counter
- *   cycle           the 13 allowed types, one step a batch (edition 2 §5.3.2.1 p.16)
- *   one type        in every batch
- * NEC PA3E6-1A on air (2026-11-26): it sets its clock from SSI only when it acquires the network
- * after power on, one type: 0000 alone gave the hour (weekday stays the default Mo), 0001 alone
- * the weekday (hour 0); mixed schedules gave one of them, the 13-type cycle neither; no update
- * later in battery saving (hold: 0001 a minute after acquisition did not change the weekday).
- * The minute follows the cycle number. */
+ *   cycle           the 13 allowed types, one step a batch (edition 2 §5.3.2.1 p.16): edition 1
+ *                   pagers cannot use the types they do not know
+ *   one type        zone-hour-date or day-month-year in every batch
+ * NEC PA3E6-1A on air (2026-11-26/27): it sets its clock from SSI only when it acquires the network
+ * after power on, from one type: 0000 alone gave the hour (weekday stays its default Mo), 0001
+ * alone the weekday (hour 0); every mixed schedule gave one of them, the 13-type cycle neither; no
+ * update later (hold for a minute each, a date change at midnight). No ERMES document says when a
+ * receiver takes the time (docs/SSI_TIME_RULES.md): an NEC firmware choice. The minute follows the
+ * cycle number. */
 static void ermes_ssi(ermes_t *ermes, ermes_ssi_t *ssi)
 {
 	time_t now = (time_t)ermes_network_time(ermes);
@@ -163,9 +170,13 @@ static void ermes_ssi(ermes_t *ermes, ermes_ssi_t *ssi)
 	if (ssit == ERMES_SSI_ALTERNATE)
 		ssit = ((ermes->slot + ermes->cycle * ERMES_SUBSEQUENCES + ermes->ssn) & 1) ? ERMES_SSIT_DAY_MONTH_YEAR : ERMES_SSIT_ZONE_HOUR_DATE;
 	if (ssit == ERMES_SSI_HOLD) {
-		/* one type in every batch of ermes_ssi_hold subsequences, then the other. With 1 this is
-		 * what the Swiss network sent (recording of 1997-07-03 13:38, country 228: 0000 in every
-		 * batch of subsequences 0 and 2, 0001 in 1 and 3) */
+		/* one type in every batch of ermes_ssi_hold subsequences, then the other, counted from
+		 * the start of the hour: n = 5 * cycle + subsequence, so the hour starts with 0000 in its
+		 * first subsequence and the types go by turns from there. An hour has 300 subsequences
+		 * (even), so the turns go on across hours and days, and a restart, which takes its
+		 * position from UTC, keeps them. With 1 (default) this is what two real networks sent:
+		 * Switzerland 1997-07-03 13:38 (cycle 38: 0000 0001 0000 0001 in subsequences 0..3) and
+		 * the Netherlands 2014-07-20 16:13 (cycle 13: 0001 in subsequence 2 = n 67, 0000 in 3) */
 		int count = ermes->cycle * ERMES_SUBSEQUENCES + ermes->ssn;
 
 		ssit = ((count / ermes_ssi_hold) & 1) ? ERMES_SSIT_DAY_MONTH_YEAR : ERMES_SSIT_ZONE_HOUR_DATE;
