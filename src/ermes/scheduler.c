@@ -103,7 +103,8 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	ermes_ssi_t ssi;
 	ermes_page_t pages[MAX_PAGES];
 	ermes_msg_t *msgs[MAX_PAGES], *m;
-	int n = 0, sent, i, carried;
+	struct timeval tv;
+	int n = 0, sent, i, carried, prio, ahead;
 
 	if (!ermes->started)
 		start_time(ermes);
@@ -114,11 +115,20 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	t.batch = ermes_channel_batch(ermes->channel, ermes->slot);
 	ermes_ssi_select(&ermes->net, &t, (time_t)network_time(ermes), &ermes->ssit_next, &ssi);
 
-	for (m = ermes->queue.head; m && n < MAX_PAGES; m = m->next) {
-		if (ermes_address_batch(m->page.local_address) != t.batch)
-			continue;
-		msgs[n] = m;
-		pages[n++] = m->page;
+	/* the pages of this batch type, highest priority first, then in the order they came (head
+	 * of the line in each priority class, ETS 300 133-3 §13.5.5.2 p.174). Each gets the next
+	 * number of its address in this order (several of one address follow on); the numbers are
+	 * taken only for the pages that are sent. */
+	for (prio = ERMES_PRIORITY_HIGH; prio <= ERMES_PRIORITY_LOW; prio++) {
+		for (m = ermes->queue.head; m && n < MAX_PAGES; m = m->next) {
+			if (m->priority != prio || ermes_address_batch(m->page.local_address) != t.batch)
+				continue;
+			msgs[n] = m;
+			pages[n] = m->page;
+			for (ahead = 0, i = 0; i < n; i++)
+				ahead += (pages[i].local_address == m->page.local_address);
+			pages[n++].number = ermes_number_peek(m->page.local_address, ahead);
+		}
 	}
 
 	carried = ermes->carry.count;
@@ -136,10 +146,15 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 		LOGP_CHAN(DERMES, LOGL_INFO, "The last message of batch %c runs on into the next batch (%d codewords)\n",
 			  ermes_batch_name(t.batch), ermes->carry.count);
 
+	gettimeofday(&tv, NULL);
 	for (i = 0; i < sent; i++) {
 		m = msgs[i];
-		LOGP_CHAN(DERMES, LOGL_NOTICE, "Page sent to %s: %s; at minute %d, subsequence %d, time slot %d\n",
-			  ermes_print_address(m->page.local_address), ermes_page_str(&m->page),
+		/* the batch builder sends the first pages given, in this order */
+		if (ermes_number_next(m->page.local_address) != pages[i].number)
+			LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);
+		LOGP_CHAN(DERMES, LOGL_NOTICE, "Page sent to %s, %s, %.1f s after it came: %s; at minute %d, subsequence %d, time slot %d\n",
+			  ermes_print_address(m->page.local_address), ermes_priority_name(m->priority),
+			  tv.tv_sec + tv.tv_usec / 1e6 - m->queued, ermes_page_str(&pages[i]),
 			  t.cycle, t.ssn, t.slot);
 		ermes_queue_remove(&ermes->queue, m);
 	}

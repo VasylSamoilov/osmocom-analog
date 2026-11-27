@@ -27,13 +27,26 @@
 
 #define ERMES_MAX_TEXT	1024	/* bytes of a message text (UTF-8), terminator included */
 
-/* How a page is sent: paging category, UMI and alert type (VIF, Fig.11 / Table 9 p.19) */
+/* Priority levels (ETS 300 133-2 §4.3.2 p.21-23, §6.2.6 p.42): 1 goes on the air before lower
+ * priorities (delay at most 1 min), 2 is the normal level (2.5 min), 3 is for traffic that is not
+ * time sensitive and must not delay 1 and 2 (24 h). Only the network's queue order: no bit on
+ * the air (the UMI, urgent, is a separate thing, -4 Table 9 p.19). */
+#define ERMES_PRIORITY_HIGH	1
+#define ERMES_PRIORITY_NORMAL	2
+#define ERMES_PRIORITY_LOW	3
+
+/* How a page is sent: paging category, UMI and alert type (VIF, Fig.11 / Table 9 p.19), and its
+ * priority in the queue */
 typedef struct ermes_page_opts {
 	enum ermes_category	category;
 	int			urgent;		/* UMI */
 	int			alert;		/* 0..7 */
 	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = --charset */
+	int			priority;	/* ERMES_PRIORITY_* */
 } ermes_page_opts_t;
+
+/* "priority 2 (normal)" */
+const char *ermes_priority_name(int priority);
 
 /* defaults of the sources (command line) */
 extern ermes_page_opts_t ermes_default_opts;
@@ -41,15 +54,18 @@ extern const struct pager_charset *ermes_charset;
 
 typedef struct ermes_msg {
 	struct ermes_msg	*next;
-	ermes_page_t		page;
+	ermes_page_t		page;		/* number -1 until the scheduler sends it */
 	char			text[ERMES_MAX_TEXT];
+	int			priority;	/* ERMES_PRIORITY_* */
+	double			queued;		/* when it came (s since the epoch, system clock) */
 } ermes_msg_t;
 
 typedef struct ermes_queue {
 	ermes_msg_t		*head;		/* in the order they came */
 } ermes_queue_t;
 
-/* Options field of a FIFO line (as flex): "urgent=1 alert=3 charset=..." onto opts. 0 or -1 (logged) */
+/* Options field of a FIFO line (as flex): "priority=1 urgent=1 alert=3 charset=..." onto opts.
+ * 0 or -1 (logged) */
 int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts);
 
 /* Check a page and put it at the end of the queue. 0, or -1 (not queued, logged) */

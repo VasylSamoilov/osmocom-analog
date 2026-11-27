@@ -79,6 +79,7 @@ static double start_time;
 #define OPT_ALERT	272
 #define OPT_TX_LATENCY	273
 #define OPT_YEAR_FROM	274
+#define OPT_PRIORITY	275
 
 void print_help(const char *arg0)
 {
@@ -137,6 +138,10 @@ void print_help(const char *arg0)
 	printf("        Pages without a type are urgent (UMI, Table 9).\n");
 	printf("    --alert 0..%d\n", (1 << ERMES_ALERT_BITS) - 1);
 	printf("        Alert type of pages without a type. (default %d)\n", ermes_default_opts.alert);
+	printf("    --priority %d..%d\n", ERMES_PRIORITY_HIGH, ERMES_PRIORITY_LOW);
+	printf("        Priority of pages without one (ETS 300 133-2 4.3.2): %d goes before the\n", ERMES_PRIORITY_HIGH);
+	printf("        others, %d is normal, %d only when nothing else waits for its batch.\n", ERMES_PRIORITY_NORMAL, ERMES_PRIORITY_LOW);
+	printf("        Only the queue order, nothing on the air. (default %d)\n", ermes_default_opts.priority);
 	printf(" -M --message \"...\"\n");
 	printf("        Text of pages without a text (console, FIFO lines without text).\n");
 	printf("    --charset <vendor-model-charset> | list\n");
@@ -161,9 +166,12 @@ void print_help(const char *arg0)
 	printf("          address  local address (decimal or 0x hex) or nec:<label code>\n");
 	printf("          type     tone|numeric|alpha (empty: -y)\n");
 	printf("          options  space-separated key=value pairs:\n");
-	printf("                   urgent=0|1  alert=0-7  charset=<vendor-model-charset>\n");
+	printf("                   priority=1-3  urgent=0|1  alert=0-7\n");
+	printf("                   charset=<vendor-model-charset>\n");
 	printf("          message  the rest of the line, commas included\n");
-	printf("        Example: nec:C63900,alpha,urgent=1 alert=3,Call home, now\n");
+	printf("        Example: nec:C63900,alpha,priority=1 urgent=1 alert=3,Call home, now\n");
+	printf("        A page gets its message number when it is sent, so the numbers of an\n");
+	printf("        address go up on the air whatever the priorities.\n");
 	printf("    --fifo-file <file>\n");
 	printf("        Read the page lines from this file instead, then end when all are sent.\n");
 	main_mobile_print_station_id();
@@ -182,6 +190,7 @@ static void add_options(void)
 	option_add('y', "type", 1);
 	option_add(OPT_URGENT, "urgent", 0);
 	option_add(OPT_ALERT, "alert", 1);
+	option_add(OPT_PRIORITY, "priority", 1);
 	option_add(OPT_TX_LATENCY, "tx-latency", 1);
 	option_add(OPT_YEAR_FROM, "year-from", 1);
 	option_add('M', "message", 1);
@@ -259,6 +268,16 @@ static int handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_ALERT:
 		return field_option("alert", argv[argi], ERMES_ALERT_BITS, &ermes_default_opts.alert);
+	case OPT_PRIORITY:
+	{
+		char opt[32];
+
+		/* the same check as the FIFO option */
+		snprintf(opt, sizeof(opt), "priority=%s", argv[argi]);
+		if (ermes_parse_page_opts(opt, &ermes_default_opts) < 0)
+			return -EINVAL;
+		break;
+	}
 	case OPT_SSI_HOLD:
 		ermes_ssi_hold = atoi(argv[argi]);
 		if (ermes_ssi_hold < 1) {

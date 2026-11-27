@@ -29,4 +29,8 @@ extern const char *ermes_number_file;
  * message (ETS 300 133-2 §4.3.1.3 p.18, -4 Table 8 p.19, §10.2 p.31). Takes the number. */
 int ermes_number_next(uint32_t local_address);
 
+/* The number ermes_number_next() gives after ahead more numbers of the address are taken, without
+ * taking it (ahead 0 = the next one) */
+int ermes_number_peek(uint32_t local_address, int ahead);
+
 #endif /* ERMES_NUMBERS_H */

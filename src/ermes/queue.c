@@ -21,11 +21,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/time.h>
 #include "../liblogging/logging.h"
 #include "queue.h"
-#include "numbers.h"
 
-ermes_page_opts_t ermes_default_opts = { .category = ERMES_CAT_TONE, .urgent = 0, .alert = 0 };
+const char *ermes_priority_name(int priority)
+{
+	switch (priority) {
+	case ERMES_PRIORITY_HIGH:
+		return "priority 1 (high)";
+	case ERMES_PRIORITY_NORMAL:
+		return "priority 2 (normal)";
+	case ERMES_PRIORITY_LOW:
+		return "priority 3 (low)";
+	}
+	return "priority ?";
+}
+
+ermes_page_opts_t ermes_default_opts = { .category = ERMES_CAT_TONE, .urgent = 0, .alert = 0, .priority = ERMES_PRIORITY_NORMAL };
 const struct pager_charset *ermes_charset = &pager_charset_ermes_generic_generic_standard;
 
 /* The options field of a FIFO line, as flex and pocsag: space separated key=value pairs */
@@ -57,6 +70,14 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 				o.urgent = v;
 			else
 				o.alert = v;
+		} else if (!strcasecmp(key, "priority")) {
+			v = strtol(val, &end, 10);
+			if (end == val || *end || v < ERMES_PRIORITY_HIGH || v > ERMES_PRIORITY_LOW) {
+				LOGP(DERMES, LOGL_ERROR, "Option priority=%s is not %d (high), %d (normal) or %d (low).\n",
+				     val, ERMES_PRIORITY_HIGH, ERMES_PRIORITY_NORMAL, ERMES_PRIORITY_LOW);
+				return -1;
+			}
+			o.priority = v;
 		} else if (!strcasecmp(key, "charset")) {
 			o.charset = pager_charset_lookup("ermes", val);
 			if (!o.charset) {
@@ -64,7 +85,7 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 				return -1;
 			}
 		} else {
-			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (urgent, alert, charset).\n", key);
+			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (priority, urgent, alert, charset).\n", key);
 			return -1;
 		}
 	}
@@ -77,6 +98,7 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 	enum ermes_category category = opts->category;
 	ermes_msg_t *m, **mp;
 	uint32_t data[ERMES_MAX_MSG_WORDS];
+	struct timeval tv;
 	int nd;
 
 	if (local_address >> ERMES_LA_BITS) {
@@ -112,11 +134,17 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 		free(m);
 		return -1;
 	}
-	m->page.number = ermes_number_next(local_address);
+	/* the number is given when it is sent, so the numbers of an address go up on the air even
+	 * when a page of higher priority goes before one that came earlier */
+	m->page.number = -1;
+	m->priority = opts->priority;
+	gettimeofday(&tv, NULL);
+	m->queued = tv.tv_sec + tv.tv_usec / 1e6;
 	for (mp = &queue->head; *mp; mp = &(*mp)->next)
 		;
 	*mp = m;
-	LOGP(DERMES, LOGL_NOTICE, "Page queued for %s: %s\n", ermes_print_address(local_address), ermes_page_str(&m->page));
+	LOGP(DERMES, LOGL_NOTICE, "Page queued for %s, %s: %s\n", ermes_print_address(local_address),
+	     ermes_priority_name(m->priority), ermes_page_str(&m->page));
 	return 0;
 }
 

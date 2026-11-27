@@ -460,7 +460,9 @@ const char *ermes_page_str(const ermes_page_t *page)
 
 	char number[32];
 
-	if (page->number)
+	if (page->number < 0)
+		snprintf(number, sizeof(number), "numbered when sent");
+	else if (page->number)
 		snprintf(number, sizeof(number), "message number %d", page->number);
 	else
 		snprintf(number, sizeof(number), "no message number");

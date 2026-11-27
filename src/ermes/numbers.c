@@ -29,27 +29,54 @@ const char *ermes_number_file = NULL;
 #define MAX_NUMBERS	1024
 #define LAST_NUMBER	31
 
+static uint32_t addr[MAX_NUMBERS];
+static int last[MAX_NUMBERS];		/* last number given, 0 = none yet */
+static int count = -1;
+
+/* the counters, read from the file at first use */
+static void load(void)
+{
+	FILE *fp;
+
+	if (count >= 0)
+		return;
+	count = 0;
+	if (ermes_number_file && (fp = fopen(ermes_number_file, "r"))) {
+		unsigned int a;
+		int n;
+
+		while (count < MAX_NUMBERS && fscanf(fp, "%x %d", &a, &n) == 2) {
+			addr[count] = a;
+			last[count++] = n;
+		}
+		fclose(fp);
+	}
+}
+
+/* the last number given to the address, 0 if none */
+static int last_number(uint32_t local_address)
+{
+	int i;
+
+	load();
+	for (i = 0; i < count; i++) {
+		if (addr[i] == local_address)
+			return last[i];
+	}
+	return 0;
+}
+
+int ermes_number_peek(uint32_t local_address, int ahead)
+{
+	return ((last_number(local_address) + ahead) % LAST_NUMBER) + 1;
+}
+
 int ermes_number_next(uint32_t local_address)
 {
-	static uint32_t addr[MAX_NUMBERS];
-	static int last[MAX_NUMBERS];
-	static int count = -1;
 	FILE *fp;
 	int i;
 
-	if (count < 0) {
-		count = 0;
-		if (ermes_number_file && (fp = fopen(ermes_number_file, "r"))) {
-			unsigned int a;
-			int n;
-
-			while (count < MAX_NUMBERS && fscanf(fp, "%x %d", &a, &n) == 2) {
-				addr[count] = a;
-				last[count++] = n;
-			}
-			fclose(fp);
-		}
-	}
+	load();
 	for (i = 0; i < count; i++) {
 		if (addr[i] == local_address)
 			break;

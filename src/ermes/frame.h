@@ -55,7 +55,8 @@ typedef struct ermes_batch_time {
 /* A message to send: one individual call, no additional information (AII = 0) */
 typedef struct ermes_page {
 	uint32_t		local_address;	/* 22 bit; 4 LSBs = batch type */
-	int			number;		/* message number 1..31, 0 = numbering off */
+	int			number;		/* message number 1..31, 0 = numbering off; -1 = not given
+						 * yet (a queued page: ermes_page_str only) */
 	enum ermes_category	category;
 	int			urgent;		/* UMI */
 	int			alert;		/* 0..7 */
