@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #include "../libsample/sample.h"
 #include "../liblogging/logging.h"
 #include "../libmobile/call.h"
@@ -46,29 +47,70 @@
 
 const char *ermes_default_text = "";
 
-/* Dibit to level of the modulator: 00 -4687.5, 01 -1562.5, 11 +1562.5, 10 +4687.5 Hz
- * (Table 17 p.26); the levels of fsk_nrz are -1, -1/3, +1/3, +1 of the deviation. */
-static const uint8_t dibit_level[4] = { 0, 1, 3, 2 };
+/* Dibit to frequency deviation, as a fraction of the outer deviation: 00 -4687.5, 01 -1562.5,
+ * 11 +1562.5, 10 +4687.5 Hz (Table 17 p.26) */
+static const double dibit_deviation[4] = { -1.0, -1.0 / 3.0, 1.0, 1.0 / 3.0 };
+
+/* Premodulation pulse shaping (§8.3.3 Fig.16): the symbols as rectangular levels through the
+ * 10th order Bessel lowpass with 3 dB at 3.9 kHz that the standard gives as the reference shape.
+ * The filter runs at PREMOD_OVERSAMPLE times the sample rate, where the bilinear transform keeps
+ * the analog shape inside the masks up to 19 kHz (test_ermes_code checks every mask corner); every
+ * PREMOD_OVERSAMPLE-th sample is taken (nothing is left above half the sample rate to fold). */
+#define PREMOD_OVERSAMPLE	4
+#define PREMOD_ORDER		10
+#define PREMOD_CUTOFF_HZ	3900.0
+
+/* the delay of the filter (its group delay at low frequency, nearly constant in the passband), so
+ * the batches still leave the antenna on the UTC grid */
+static double premod_group_delay(const iir_filter_t *f, int rate)
+{
+	const double hz = 10.0, w = 2.0 * M_PI * hz / rate;
+	double ph = 0.0;
+	int k;
+
+	for (k = 0; k < PREMOD_ORDER / 2; k++) {
+		ph += atan2(-f[k].a1 * sin(w) - f[k].a2 * sin(2 * w), f[k].a0 + f[k].a1 * cos(w) + f[k].a2 * cos(2 * w))
+		    - atan2(-f[k].b1 * sin(w) - f[k].b2 * sin(2 * w), 1.0 + f[k].b1 * cos(w) + f[k].b2 * cos(2 * w));
+	}
+	return -ph / (2.0 * M_PI * hz);
+}
+
+/* The symbols of a batch into samples, from bit 'from' on: returns the number of samples */
+static int modulate(ermes_t *ermes, int from, int nbits)
+{
+	sample_t *sub = ermes->premod_buffer;
+	int i, n, nsub = 0, count = 0;
+
+	for (i = from; i < nbits; i += 2) {
+		sample_t level = dibit_deviation[(ermes->batch_bits[i] << 1) | ermes->batch_bits[i + 1]] * ermes->polarity;
+
+		/* sub-samples of this symbol: its length at the oversampled rate, the fraction carried on */
+		ermes->premod_phase += ermes->premod_symbol_samples;
+		n = (int)ermes->premod_phase;
+		ermes->premod_phase -= n;
+		while (n--)
+			sub[nsub++] = level;
+	}
+	iir_butterworth_process(ermes->premod, PREMOD_ORDER, sub, nsub);
+	for (i = 0; i < nsub; i++) {
+		if (ermes->premod_decimate++ % PREMOD_OVERSAMPLE == 0)
+			ermes->tx_buffer[count++] = sub[i];
+	}
+	return count;
+}
 
 /* Provide stream of audio toward radio unit */
 void sender_send(sender_t *sender, sample_t *samples, uint8_t *power, int length)
 {
 	ermes_t *ermes = (ermes_t *) sender;
-	int nbits, i, count;
+	int nbits, count;
 
 	while (length) {
 		if (ermes->tx_buffer_pos == ermes->tx_buffer_length) {
 			nbits = ermes_scheduler_next_batch(ermes);
-			count = 0;
 			/* the first batch starts where UTC is in it (the scheduler's UTC lock) */
-			i = ermes->skip_bits;
+			ermes->tx_buffer_length = modulate(ermes, ermes->skip_bits, nbits);
 			ermes->skip_bits = 0;
-			for (; i < nbits; i += 2) {
-				int dibit = (ermes->batch_bits[i] << 1) | ermes->batch_bits[i + 1];
-
-				count += fsk_nrz_mod_symbol(&ermes->fsk_mod, dibit_level[dibit], ermes->tx_buffer + count);
-			}
-			ermes->tx_buffer_length = count;
 			ermes->tx_buffer_pos = 0;
 		}
 		count = ermes->tx_buffer_length - ermes->tx_buffer_pos;
@@ -112,10 +154,15 @@ int ermes_create(const char *kanal, int channel, const char *device, int use_sdr
 
 	/* a sample value of 1.0 is the outer deviation */
 	sender_set_fm(&ermes->sender, ERMES_DEVIATION_HZ, ERMES_SYMBOL_RATE, ERMES_DEVIATION_HZ, MAX_DISPLAY);
-	fsk_nrz_mod_init(&ermes->fsk_mod, samplerate, (double)ERMES_SYMBOL_RATE, 1.0, polarity);
-	ermes->tx_buffer_size = fsk_nrz_mod_max_samples(samplerate, ERMES_SYMBOL_RATE, ERMES_BATCH_CW_LAST * ERMES_CW_BITS / 2) + 16;
+	ermes->polarity = polarity;
+	iir_bessel_lowpass_init(ermes->premod, PREMOD_CUTOFF_HZ, samplerate * PREMOD_OVERSAMPLE, PREMOD_ORDER);
+	ermes->premod_symbol_samples = (double)samplerate * PREMOD_OVERSAMPLE / ERMES_SYMBOL_RATE;
+	ermes->premod_delay = premod_group_delay(ermes->premod, samplerate * PREMOD_OVERSAMPLE);
+	/* a batch at most, and one sample more per symbol for the fractions */
+	ermes->tx_buffer_size = (int)((double)samplerate / ERMES_SYMBOL_RATE * ERMES_BATCH_CW_LAST * ERMES_CW_BITS / 2) + ERMES_BATCH_CW_LAST * ERMES_CW_BITS / 2;
 	ermes->tx_buffer = calloc(ermes->tx_buffer_size, sizeof(sample_t));
-	if (!ermes->tx_buffer) {
+	ermes->premod_buffer = calloc(ermes->tx_buffer_size * PREMOD_OVERSAMPLE, sizeof(sample_t));
+	if (!ermes->tx_buffer || !ermes->premod_buffer) {
 		LOGP(DERMES, LOGL_ERROR, "No memory!\n");
 		ermes_destroy(&ermes->sender);
 		return -ENOMEM;
@@ -135,6 +182,7 @@ void ermes_destroy(sender_t *sender)
 	if (!sender_head->next)
 		ermes_queue_flush(&ermes_queue);
 	free(ermes->tx_buffer);
+	free(ermes->premod_buffer);
 	sender_destroy(&ermes->sender);
 	free(ermes);
 }

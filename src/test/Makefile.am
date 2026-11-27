@@ -360,4 +360,5 @@ test_ermes_code_SOURCES = test_ermes_code.c ../ermes/code.c ../ermes/frame.c
 
 test_ermes_code_LDADD = \
 	$(top_builddir)/src/libpagercharset/libpagercharset.a \
+	$(top_builddir)/src/libfilter/libfilter.a \
 	-lm

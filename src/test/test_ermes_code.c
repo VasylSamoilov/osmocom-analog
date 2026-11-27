@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
+#include "../libsample/sample.h"
+#include "../libfilter/iir_filter.h"
 #include "../ermes/code.h"
 #include "../ermes/frame.h"
 
@@ -178,6 +181,101 @@ static uint32_t word_at(const uint8_t *b, int index)
 }
 
 /* Build a batch for the NEC PA3E6-1A factory default (local address 0x318E40) and read it back */
+/* §8.3.3 Fig.16: the premodulation filter (10th order Bessel, 3 dB at 3.9 kHz) at the sample rate
+ * of the transmitter, against the amplitude masks (a), (b) and the group delay mask (c) */
+struct mask_point { double khz, db; };
+
+/* the mask in dB at f, linear between its corners; outside: -1000 / +1000 (no limit) */
+static double mask_db(const struct mask_point *m, int n, double khz, double none)
+{
+	int i;
+
+	if (khz < m[0].khz || khz > m[n - 1].khz)
+		return none;
+	for (i = 1; i < n; i++) {
+		if (khz <= m[i].khz)
+			return m[i - 1].db + (m[i].db - m[i - 1].db) * (khz - m[i - 1].khz) / (m[i].khz - m[i - 1].khz);
+	}
+	return none;
+}
+
+/* response of the biquad cascade at f: magnitude (dB) and phase (rad) */
+static void cascade_response(const iir_filter_t *f, int n, double hz, int rate, double *db, double *phase)
+{
+	double w = 2.0 * M_PI * hz / rate, mag = 1.0, ph = 0.0;
+	int k;
+
+	for (k = 0; k < n; k++) {
+		/* H(z) = (a0 + a1 z^-1 + a2 z^-2) / (1 + b1 z^-1 + b2 z^-2) */
+		double nr = f[k].a0 + f[k].a1 * cos(w) + f[k].a2 * cos(2 * w);
+		double ni = -f[k].a1 * sin(w) - f[k].a2 * sin(2 * w);
+		double dr = 1.0 + f[k].b1 * cos(w) + f[k].b2 * cos(2 * w);
+		double di = -f[k].b1 * sin(w) - f[k].b2 * sin(2 * w);
+
+		mag *= sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+		ph += atan2(ni, nr) - atan2(di, dr);
+	}
+	*db = 20.0 * log10(mag);
+	*phase = ph;
+}
+
+static void test_premodulation_filter(void)
+{
+	/* Fig.16(a)/(b): the response must stay below the upper and above the lower mask */
+	static const struct mask_point upper[] = {
+		{ 0.0, 0.0 }, { 1.47, 0.0 }, { 3.1, -1.0 }, { 4.5, -3.0 }, { 7.5, -10.0 }, { 15.2, -40.0 }, { 19.0, -60.0 },
+	};
+	static const struct mask_point lower[] = {
+		{ 0.0, 0.0 }, { 1.47, -0.5 }, { 2.6, -1.5 }, { 3.7, -3.0 }, { 6.8, -10.0 }, { 12.0, -40.0 }, { 16.0, -70.0 },
+	};
+	/* the transmitter runs it at 4 times its sample rate of 48 kHz (ermes.c) */
+	const int rate = 4 * 48000, order = 10, n = order / 2;
+	iir_filter_t f[5];
+	double hz, db, ph, last_ph = 0.0, gd, gd0 = 0.0, worst_amp = 1e9, worst_gd = 0.0, worst_gd_hz = 0.0;
+	int first = 1;
+
+	iir_bessel_lowpass_init(f, 3900.0, rate, order);
+	cascade_response(f, n, 3900.0, rate, &db, &ph);
+	CHECK(fabs(db + 3.0103) < 0.05, "3 dB at 3.9 kHz: %.3f dB", db);
+	for (hz = 10.0; hz <= 19000.0; hz += 10.0) {
+		double up, lo;
+
+		cascade_response(f, n, hz, rate, &db, &ph);
+		up = mask_db(upper, sizeof(upper) / sizeof(upper[0]), hz / 1000.0, 1000.0);
+		lo = mask_db(lower, sizeof(lower) / sizeof(lower[0]), hz / 1000.0, -1000.0);
+		CHECK(db <= up + 1e-9 && db >= lo - 1e-9, "amplitude %.2f dB at %.0f Hz outside the mask (%.2f .. %.2f)", db, hz, lo, up);
+		if (up - db < worst_amp)
+			worst_amp = up - db;
+		if (db - lo < worst_amp)
+			worst_amp = db - lo;
+		/* group delay -d(phase)/d(omega), from the phase step (unwrapped) */
+		if (!first) {
+			double d = ph - last_ph;
+
+			while (d > M_PI) d -= 2 * M_PI;
+			while (d < -M_PI) d += 2 * M_PI;
+			gd = -d / (2.0 * M_PI * 10.0);
+			if (hz <= 20.0)
+				gd0 = gd;
+			/* Fig.16(c): +-32 us to 3.2 kHz, +-80 us to 5.5 kHz */
+			if (hz <= 5500.0) {
+				double lim = (hz <= 3200.0) ? 32e-6 : 80e-6;
+
+				CHECK(fabs(gd - gd0) <= lim, "group delay %.1f us from DC at %.0f Hz (limit %.0f us)",
+				      (gd - gd0) * 1e6, hz, lim * 1e6);
+				if (fabs(gd - gd0) > worst_gd) {
+					worst_gd = fabs(gd - gd0);
+					worst_gd_hz = hz;
+				}
+			}
+		}
+		first = 0;
+		last_ph = ph;
+	}
+	printf("premodulation filter done (amplitude at least %.2f dB inside the masks; group delay %.0f us at DC, deviation at most %.1f us at %.0f Hz)\n",
+	       worst_amp, gd0 * 1e6, worst_gd * 1e6, worst_gd_hz);
+}
+
 /* §9.2 Fig.18 p.30 and its text examples */
 static void test_fsi(void)
 {
@@ -362,6 +460,7 @@ int main(void)
 	test_batch_numbers();
 	test_channels();
 	test_fsi();
+	test_premodulation_filter();
 	test_frame();
 	test_continuation();
 	if (failed) {

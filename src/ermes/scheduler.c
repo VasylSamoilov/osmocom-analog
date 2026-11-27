@@ -78,8 +78,9 @@ static void start_time(ermes_t *ermes)
 		return;
 	}
 	gettimeofday(&tv, NULL);
+	/* the first sample made now is on the air after the latency and the premodulation filter */
 	now = tv.tv_sec + tv.tv_usec / 1e6 + ermes_clock_offset
-	    + ((ermes_tx_latency >= 0) ? ermes_tx_latency : dsp_buffer / 1000.0);
+	    + ((ermes_tx_latency >= 0) ? ermes_tx_latency : dsp_buffer / 1000.0) + ermes->premod_delay;
 	minute = (time_t)now - ((time_t)now % 60);
 	gmtime_r(&minute, &tm);
 	ermes->cycle = tm.tm_min;

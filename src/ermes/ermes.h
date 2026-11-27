@@ -18,7 +18,7 @@
  */
 
 #include "../libmobile/sender.h"
-#include "../libfsk/fsk_nrz.h"
+#include "../libfilter/iir_filter.h"
 #include "frame.h"
 #include "queue.h"
 #include "book.h"
@@ -68,7 +68,13 @@ typedef struct ermes {
 
 
 	/* modulator */
-	fsk_nrz_mod_t		fsk_mod;
+	double			polarity;		/* 1.0 normal, -1.0 inverted */
+	iir_filter_t		premod[5];		/* premodulation Bessel lowpass (§8.3.3), 10th order */
+	double			premod_symbol_samples;	/* samples a symbol at its (oversampled) rate */
+	double			premod_phase;		/* the fraction of a sample carried on */
+	unsigned int		premod_decimate;	/* the oversampled samples, to take every n-th */
+	double			premod_delay;		/* its delay in s (UTC lock) */
+	sample_t		*premod_buffer;
 	sample_t		*tx_buffer;
 	int			tx_buffer_size, tx_buffer_length, tx_buffer_pos;
 	uint8_t			batch_bits[ERMES_BATCH_CW_LAST * ERMES_CW_BITS];
