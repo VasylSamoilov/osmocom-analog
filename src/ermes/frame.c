@@ -252,9 +252,11 @@ static void put_word(uint8_t *bits, int *n, uint32_t cw)
 		bits[(*n)++] = (cw >> i) & 1;
 }
 
-/* Initial address of a page */
+/* Initial address of a page (a PAD: eighteen ones) */
 static uint32_t page_ia(const ermes_page_t *page)
 {
+	if (page->pad)
+		return ERMES_CTA_IA;
 	return ermes_initial_address(page->local_address);
 }
 
@@ -299,8 +301,8 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		uint32_t hdr[2], data[ERMES_MAX_MSG_WORDS];
 		int nd;
 
-		ia = !pages[i].no_ia && !ermes_is_cta(pages[i].local_address);
-		if (ia && ermes_address_batch(pages[i].local_address) != t->batch)
+		ia = pages[i].pad || (!pages[i].no_ia && !ermes_is_cta(pages[i].local_address));
+		if (ia && !pages[i].pad && ermes_address_batch(pages[i].local_address) != t->batch)
 			return -1;
 		if (ia && nia == ERMES_MAX_IA)
 			break;

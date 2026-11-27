@@ -68,6 +68,10 @@ typedef struct ermes_page {
 						 * message in this batch */
 	int			no_ia;		/* stage 2: the message only, no initial address (it
 						 * was sent in an earlier batch); any batch */
+	int			pad;		/* a PAD (-5 §7.8 p.17, TBR 7 p.27): an initial address
+						 * alone that only occupies the address partition, here
+						 * eighteen ones (the group initial address, highest of
+						 * all, nobody's own); local_address is not used */
 } ermes_page_t;
 
 /* Supplementary system information for this batch (§5.3.2 p.16-18) */

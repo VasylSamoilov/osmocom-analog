@@ -309,7 +309,7 @@ static int group_pages(ermes_t *ermes, const ermes_batch_time_t *t, ermes_msg_t 
 	ermes_msg_t *m = s->msg;
 	ermes_group_t *g = m->group;
 	uint64_t now = batch_id(ermes);
-	int i, n = 0;
+	int i, n = 0, has_ia, has_msg;
 
 	for (i = 0; i < g->num && n < MAX_PAGES - 1; i++) {
 		if (g->channel[i] != ermes || g->done[i])
@@ -339,6 +339,20 @@ static int group_pages(ermes_t *ermes, const ermes_batch_time_t *t, ermes_msg_t 
 		pages[n].number = 0;
 		msgs[n++] = m;
 	}
+	/* a batch with stage 2 or 3 but no initial address of its own gets a PAD, as the receiver
+	 * test of group calls has its address partition occupied (-5 §7.8 Fig.16: "4*PAD ... GROUP
+	 * MESSAGE"; TBR 7 §8.15): receivers (and decoders such as PDW) skip the message partition of a
+	 * batch without any initial address */
+	for (i = 0, has_ia = 0, has_msg = 0; i < n; i++) {
+		has_ia |= pages[i].ia_only;
+		has_msg |= !pages[i].ia_only;
+	}
+	if (has_msg && !has_ia && n < MAX_PAGES) {
+		memset(&pages[n], 0, sizeof(pages[n]));
+		pages[n].pad = 1;
+		pages[n].ia_only = 1;
+		msgs[n++] = m;
+	}
 	return n;
 }
 
@@ -356,6 +370,11 @@ static void group_sent(ermes_t *ermes, const ermes_batch_time_t *t, const ermes_
 		LOGP_CHAN(DERMES, LOGL_ERROR, "Group call: %d of its %d message(s) did not fit in batch %c\n",
 			  n - sent, n, ermes_batch_name(t->batch));
 	for (i = 0; i < sent; i++) {
+		if (pages[i].pad) {
+			LOGP_CHAN(DERMES, LOGL_INFO, "Group call: a PAD (initial address of eighteen ones) occupies the address partition of batch %c\n",
+				  ermes_batch_name(t->batch));
+			continue;
+		}
 		if (pages[i].ia_only) {
 			for (j = 0; j < g->num; j++) {
 				if (g->member[j] == pages[i].local_address)
