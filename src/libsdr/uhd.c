@@ -35,6 +35,11 @@
 #ifndef TEST_UNDERRUN_RECOVERY
 #define TEST_UNDERRUN_RECOVERY 0
 #endif
+/* test: every TX write fails from 5 s to 8 s after the first write (wall
+ * time; as a broken USB transfer does: at once, nothing sent) */
+#ifndef TEST_TX_FAIL
+#define TEST_TX_FAIL 0
+#endif
 
 extern int sdr_rx_overflow;
 
@@ -60,6 +65,7 @@ typedef struct uhd_instance {
 	double			rx_dev_next;	/* device time of the next expected RX sample */
 	int			rx_dev_warned;	/* overflow without device time logged */
 	long long		rx_gap;		/* samples lost before the last packet, not yet filled */
+	long long		tx_dropped;	/* TX samples not sent (failed writes), their time passed */
 } uhd_instance_t;
 
 /* In single-device mode, both point to the same instance.
@@ -833,6 +839,18 @@ int uhd_send(float *buff, int num)
 		buffs_ptr[0] = buff;
 		count = 0;
 		double t_before = get_software_time(uhd_tx_inst);
+#if TEST_TX_FAIL
+		static struct timespec fail_t0;
+		struct timespec fail_now;
+
+		clock_gettime(CLOCK_MONOTONIC, &fail_now);
+		if (!fail_t0.tv_sec)
+			fail_t0 = fail_now;
+		if (fail_now.tv_sec - fail_t0.tv_sec >= 5 && fail_now.tv_sec - fail_t0.tv_sec < 8) {
+			error = UHD_ERROR_IO;
+			count = 0;
+		} else
+#endif
 		error = uhd_tx_streamer_send(uhd_tx_inst->tx_streamer, buffs_ptr, chunk, &uhd_tx_inst->tx_metadata, 1.0, &count);
 		double t_after = get_software_time(uhd_tx_inst);
 		if (t_after - t_before > 0.01) {
@@ -862,6 +880,22 @@ int uhd_send(float *buff, int num)
 		sent += count;
 		buff += count * 2;
 		num -= count;
+	}
+
+	/* Not sent (a failed write or a timeout): the samples are dropped, but
+	 * their time passes as if sent - TX time moves on, so the caller is not
+	 * asked again for the same time (it would make samples far faster than
+	 * real time, and the application's time, counted in samples, would run
+	 * ahead); where a blocking send paces TX, wait their duration instead. */
+	if (num > 0) {
+		uhd_tx_inst->tx_time_fract_sec += (double)num / uhd_tx_inst->samplerate;
+		while (uhd_tx_inst->tx_time_fract_sec >= 1.0) {
+			uhd_tx_inst->tx_time_secs++;
+			uhd_tx_inst->tx_time_fract_sec -= 1.0;
+		}
+		uhd_tx_inst->tx_dropped += num;
+		if (uhd_tx_inst->software_clock)
+			usleep((useconds_t)((double)num / uhd_tx_inst->samplerate * 1e6));
 	}
 
 	return sent;
