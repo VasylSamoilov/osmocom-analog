@@ -32,7 +32,9 @@
 #include "../liboptions/options.h"
 
 /* HACK: Set to 1 to trigger a one-time TX underrun after 5 seconds for testing recovery */
+#ifndef TEST_UNDERRUN_RECOVERY
 #define TEST_UNDERRUN_RECOVERY 0
+#endif
 
 extern int sdr_rx_overflow;
 
@@ -839,7 +841,10 @@ int uhd_send(float *buff, int num)
 			     uhd_tx_inst->tx_timestamps);
 		}
 		if (error) {
-			LOGP(DUHD, LOGL_ERROR, "Failed to write to TX streamer (error=%d, chunk=%d, count=%zu)\n", error, chunk, count);
+			char what[256] = "";
+
+			uhd_tx_streamer_last_error(uhd_tx_inst->tx_streamer, what, sizeof(what));
+			LOGP(DUHD, LOGL_ERROR, "Failed to write to TX streamer (error=%d, chunk=%d, count=%zu): %s\n", error, chunk, count, what);
 			break;
 		}
 		if (count == 0) {
