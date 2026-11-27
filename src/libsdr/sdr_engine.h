@@ -147,7 +147,10 @@ struct sdr_engine {
 /* rx_rate / tx_rate: SDR rates (0 for a direction not used), max_dsp: the
  * highest DSP rate of a group, tx_nmax: most TX channels at once, max_block:
  * most SDR samples per sdr_engine_rx_feed() / _tx_produce() call. The
- * number of sub-bands is chosen for the rates (cheapest by estimate). */
+ * number of sub-bands is chosen for the rates (cheapest by estimate).
+ * RX only (tx_rate 0) with max_dsp 0: no bank, every group on the
+ * per-channel chain (at most SDR_ENGINE_MAX_CHAIN channels): one or two
+ * channels, where that is cheaper, or a rate no bank fits. */
 int sdr_engine_init(sdr_engine_t *e, int rx_rate, int tx_rate, int max_dsp, int tx_nmax, int max_block);
 const char *sdr_engine_error(void);
 void sdr_engine_exit(sdr_engine_t *e);

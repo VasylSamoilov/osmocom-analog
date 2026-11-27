@@ -1705,6 +1705,17 @@ int uhd_query_sample_rates(const char *device_args, int direction, size_t channe
 	info->is_continuous = 1;
 	info->min_rate = start;
 	info->max_rate = stop;
+	/* B200 / B210: the range is that of the master clock UHD chose for now
+	 * (16 MHz at the start), the clock follows the rate asked for: up to
+	 * 56 MS/s (Ettus) */
+	{
+		char name[64] = "";
+
+		if (uhd_usrp_get_mboard_name(usrp, 0, name, sizeof(name)) == 0 && !strncmp(name, "B2", 2) && stop < 56e6) {
+			info->max_rate = 56e6;
+			stop = 56e6;
+		}
+	}
 	info->rates = NULL;
 	info->num_rates = 0;
 

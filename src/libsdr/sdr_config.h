@@ -121,6 +121,23 @@ void sdr_config_set_bandwidth(double max_deviation, double max_modulation, int n
  */
 int sdr_select_rate(double required_bandwidth, int *dsp_samplerate);
 
+/* The widest RX rate for a band receiver (channels = 0, a scanner, a
+ * calibrator): base * 2^k for a device with a continuous range, else the
+ * widest listed rate from base up; at most max_wanted, 80 % of the device's
+ * top rate, and half of what the USB link (from sysfs; USB 2 if unknown)
+ * carries at the device's bytes per sample. Queries the device (opens it
+ * once). Returns the rate, or <0 with a reason in info->why. Call after
+ * sdr_configure(), before sdr_open(). */
+typedef struct sdr_rate_widest {
+	int		rate;
+	double		device_max, bus_max;	/* the limits used, S/s */
+	double		bus_load;		/* share of the link's practical throughput */
+	int		usb_speed;		/* Mbit/s, 0 unknown */
+	int		bytes_per_sample;
+	char		why[256];
+} sdr_rate_widest_t;
+int sdr_rx_widest_rate(int base, int max_wanted, sdr_rate_widest_t *info);
+
 /* Rate info helpers */
 void sdr_rate_info_free(sdr_rate_info_t *info);
 int sdr_select_optimal_rate(double min_bandwidth, double min_if_bw, int dsp_rate, const sdr_rate_info_t *info, int *out_rate);

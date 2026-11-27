@@ -167,7 +167,9 @@ int sdr_engine_init(sdr_engine_t *e, int rx_rate, int tx_rate, int max_dsp, int 
 	e->next_id = 1;
 	/* the sub-bands for the channels expected (tx_nmax): the more channels,
 	 * the more the tails weigh against the bank */
-	if (rx_rate) {
+	/* RX max_dsp = 0: no bank, every group on the per-channel chain (a few
+	 * channels, or a rate no bank fits) */
+	if (rx_rate && max_dsp > 0) {
 		m = sdr_engine_bins(rx_rate, max_dsp, e->tx_nmax);
 		if (!m) {
 			snprintf(error_text, sizeof(error_text), "no filter bank fits SDR rate %d and DSP rate %d (sub-bands must be wider than the DSP rate)", rx_rate, max_dsp);
@@ -179,6 +181,8 @@ int sdr_engine_init(sdr_engine_t *e, int rx_rate, int tx_rate, int max_dsp, int 
 			return rc;
 		}
 		e->rx_frames_max = max_block / e->bank_rx.d + 2;
+	}
+	if (rx_rate) {
 		e->rx_bins = calloc(SDR_ENGINE_MAX_GROUPS * SDR_ENGINE_MAX_CHAN, sizeof(*e->rx_bins));
 		e->rx_bin_i = calloc(SDR_ENGINE_MAX_GROUPS * SDR_ENGINE_MAX_CHAN, sizeof(*e->rx_bin_i));
 		e->rx_bin_q = calloc(SDR_ENGINE_MAX_GROUPS * SDR_ENGINE_MAX_CHAN, sizeof(*e->rx_bin_q));
@@ -575,7 +579,7 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 		fprintf(stderr, "sdr_engine_rx_feed: %d samples, more than %d, please fix!\n", n, e->max_block);
 		abort();
 	}
-	frames = pfb_rx_process(&e->bank_rx, iq, n, e->rx_bins_n, e->rx_bins, e->rx_bin_i, e->rx_bin_q);
+	frames = e->bank_rx.m ? pfb_rx_process(&e->bank_rx, iq, n, e->rx_bins_n, e->rx_bins, e->rx_bin_i, e->rx_bin_q) : 0;
 	c = 0;
 	for (j = 0; j < e->rx_n; j++) {
 		sdr_group_t *g = e->rx_list[j];

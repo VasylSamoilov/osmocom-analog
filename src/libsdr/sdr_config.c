@@ -25,6 +25,7 @@ enum paging_signal;
 #include <stdint.h>
 #include <errno.h>
 #include <math.h>
+#include <dirent.h>
 #include "../libsample/sample.h"
 #include "../liboptions/options.h"
 #include "../liblogging/logging.h"
@@ -32,6 +33,7 @@ enum paging_signal;
 #include "sdr_config.h"
 #ifdef HAVE_SOAPY
 #include "soapy.h"
+#include <SoapySDR/Constants.h>
 #endif
 #ifdef HAVE_UHD
 #include "uhd.h"
@@ -1406,4 +1408,113 @@ int sdr_select_rate(double required_bandwidth, int *dsp_samplerate)
 
 	LOGP(DSDR, LOGL_INFO, "=== SDR Rate Selection Complete ===\n");
 	return 1;
+}
+
+/* The USB speed (Mbit/s, from sysfs) of the SDR on the bus: the fastest of
+ * the known SDR vendors' devices (Ettus, Realtek RTL2832, Great Scott /
+ * Airspy, Lime, Nuand); 0 if none is found (a network device, another
+ * vendor). */
+static int sdr_usb_speed(void)
+{
+	static const char *vendors[] = { "2500", "0bda", "1d50", "0403", "2cf0", NULL };
+	DIR *dir = opendir("/sys/bus/usb/devices");
+	struct dirent *de;
+	int best = 0;
+
+	if (!dir)
+		return 0;
+	while ((de = readdir(dir))) {
+		char path[512], buf[32];
+		FILE *fp;
+		int v, match = 0;
+
+		snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", de->d_name);
+		fp = fopen(path, "r");
+		if (!fp)
+			continue;
+		if (fgets(buf, sizeof(buf), fp))
+			for (v = 0; vendors[v]; v++)
+				if (!strncmp(buf, vendors[v], 4))
+					match = 1;
+		fclose(fp);
+		if (!match)
+			continue;
+		snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/speed", de->d_name);
+		fp = fopen(path, "r");
+		if (!fp)
+			continue;
+		if (fgets(buf, sizeof(buf), fp) && atoi(buf) > best)
+			best = atoi(buf);
+		fclose(fp);
+	}
+	closedir(dir);
+	return best;
+}
+
+int sdr_rx_widest_rate(int base, int max_wanted, sdr_rate_widest_t *info)
+{
+	sdr_rate_info_t rates = { 0 };
+	int have = 0, best = 0, i, bytes, speed;
+	double dev_max, bus_max, practical;
+
+	memset(info, 0, sizeof(*info));
+	if (!sdr_config)
+		return -EINVAL;
+#ifdef HAVE_SOAPY
+	if (!have && sdr_config->soapy) {
+		sdr_rate_info_t bw = { 0 };
+
+		have = (soapy_query_device_info(sdr_config->device_args, SOAPY_SDR_RX, sdr_config->channel, &rates, &bw) == 0);
+		sdr_rate_info_free(&bw);
+	}
+#endif
+#ifdef HAVE_UHD
+	if (!have && sdr_config->uhd)
+		have = (uhd_query_sample_rates(sdr_config->device_args, 0, sdr_config->channel, &rates) == 0);
+#endif
+	if (!have) {
+		snprintf(info->why, sizeof(info->why), "the device's rates cannot be queried");
+		return -EIO;
+	}
+	/* the bus: bytes per sample on the wire (8 bit IQ for the RTL2832, 16 bit
+	 * else), what a USB 2 / 3 link carries in practice, half of it used */
+	bytes = (sdr_config->soapy && strstr(sdr_config->device_args, "rtlsdr")) ? 2 : 4;
+	speed = sdr_usb_speed();
+	if (speed >= 5000)
+		practical = 300e6;
+	else
+		practical = 35e6;	/* USB 2, also when unknown */
+	bus_max = 0.5 * practical / bytes;
+	/* the device: below its top rate (the RTL2832 drops samples at 3.2 MS/s) */
+	dev_max = rates.is_continuous ? rates.max_rate : 0.0;
+	for (i = 0; i < rates.num_rates; i++)
+		if (rates.rates[i] > dev_max)
+			dev_max = rates.rates[i];
+	dev_max *= 0.8;
+	info->device_max = dev_max;
+	info->bus_max = bus_max;
+	info->usb_speed = speed;
+	info->bytes_per_sample = bytes;
+	if (rates.is_continuous) {
+		/* base * 2^k */
+		for (double r = base; r <= max_wanted && r <= dev_max && r <= bus_max && r <= rates.max_rate; r *= 2)
+			if (r >= rates.min_rate)
+				best = (int)r;
+	} else {
+		for (i = 0; i < rates.num_rates; i++) {
+			double r = rates.rates[i];
+
+			if (r <= max_wanted && r <= dev_max && r <= bus_max && r >= base && r > best)
+				best = (int)r;
+		}
+	}
+	sdr_rate_info_free(&rates);
+	if (!best) {
+		snprintf(info->why, sizeof(info->why), "no rate from %d Hz up within the device's %.0f Hz (80 %% of its top) and the bus's %.0f Hz (half of USB %s at %d bytes per sample)",
+			 base, dev_max, bus_max, (speed >= 5000) ? "3" : "2", bytes);
+		return -EINVAL;
+	}
+	info->rate = best;
+	info->bus_load = (double)best * bytes / practical;
+	return best;
 }
