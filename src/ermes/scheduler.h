@@ -35,6 +35,9 @@ extern double ermes_tx_latency;
 #define ERMES_RECEIVER_BATCH_DEFAULT	2
 #define ERMES_RECEIVER_BATCH_MAX	32
 extern int ermes_receiver_batch;
+/* --group-fig16: a group call's pointer goes with the member's initial address in its own batch
+ * (ETS 300 133-5 §7.8 Fig.16), not in the batch after */
+extern int ermes_group_fig16;
 
 /* Build the next batch of the channel into ermes->batch_bits: its system information, the
  * pages it carries (taken off the queue) and the continued part of a long message. The first

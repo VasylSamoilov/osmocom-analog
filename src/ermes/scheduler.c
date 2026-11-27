@@ -36,6 +36,7 @@
 double ermes_clock_offset = 0.0;
 double ermes_tx_latency = -1.0;	/* < 0: dsp_buffer */
 int ermes_receiver_batch = ERMES_RECEIVER_BATCH_DEFAULT;
+int ermes_group_fig16 = 0;
 
 /* Network time (seconds since the epoch) at the start of the batch being built: the start of
  * the first batch plus the codewords sent since, so it follows the samples, not the wall clock */
@@ -315,12 +316,18 @@ static int group_pages(ermes_t *ermes, const ermes_batch_time_t *t, ermes_msg_t 
 		if (g->channel[i] != ermes || g->done[i])
 			continue;
 		if (!g->ia_at[i]) {
-			/* stage 1: the initial address alone, in its own batch */
+			/* stage 1: the initial address alone, in its own batch; with --group-fig16 the
+			 * pointer with it (stage 1 and 2 in one batch, as -5 §7.8 Fig.16 "IA APT MD
+			 * MESSAGE 1") */
 			if (ermes_address_batch(g->member[i]) != t->batch)
 				continue;
 			memset(&pages[n], 0, sizeof(pages[n]));
 			pages[n].local_address = g->member[i];
-			pages[n].ia_only = 1;
+			if (ermes_group_fig16) {
+				pages[n].number = ermes_number_peek(g->member[i], 0);
+				pages[n].group_pointer = ermes->group_ctap + 1;
+			} else
+				pages[n].ia_only = 1;
 			msgs[n++] = m;
 		} else if (g->ia_at[i] < now) {
 			/* stage 2: the pointer, in the batch after its initial address */
@@ -357,7 +364,7 @@ static void group_sent(ermes_t *ermes, const ermes_batch_time_t *t, const ermes_
 		LOGP_CHAN(DERMES, LOGL_ERROR, "Group call: %d of its %d message(s) did not fit in batch %c\n",
 			  n - sent, n, ermes_batch_name(t->batch));
 	for (i = 0; i < sent; i++) {
-		if (pages[i].ia_only) {
+		if (pages[i].ia_only || (pages[i].group_pointer && !pages[i].no_ia)) {
 			for (j = 0; j < g->num; j++) {
 				if (g->member[j] == pages[i].local_address)
 					g->ia_at[j] = batch_id(ermes);
@@ -368,7 +375,9 @@ static void group_sent(ermes_t *ermes, const ermes_batch_time_t *t, const ermes_
 			s->last = net_now;
 			LOGP_CHAN(DERMES, LOGL_NOTICE, "Group call to %s: stage 1, the initial address; at minute %d, subsequence %d, time slot %d\n",
 				  ermes_print_address(pages[i].local_address), t->cycle, t->ssn, t->slot);
-			continue;
+			if (pages[i].ia_only)
+				continue;
+			/* Fig.16: the pointer with it, below */
 		}
 		if (pages[i].group_pointer) {
 			if (ermes_number_next(pages[i].local_address) != pages[i].number)
