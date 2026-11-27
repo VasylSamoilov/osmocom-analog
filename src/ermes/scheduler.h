@@ -40,8 +40,9 @@ extern int ermes_group_fig16;
  * Returns the number of bits. (ETS 300 133-3 §13.5.4: the allocation algorithm) */
 int ermes_scheduler_next_batch(struct ermes *ermes);
 
-/* 1 if a channel carries the receiver: its FSI has the receiver's FSN (book), or the FSN is not
- * known. A page for a receiver no channel carries could never be sent. */
-int ermes_scheduler_reachable(uint32_t local_address);
+/* 1 if a channel carries the receiver (local address, home operator -1 = ours): its FSI has the
+ * receiver's FSN (book), or the FSN is not known. A page for a receiver no channel carries could
+ * never be sent. */
+int ermes_scheduler_reachable(uint32_t local_address, int opid);
 
 #endif /* ERMES_SCHEDULER_H */

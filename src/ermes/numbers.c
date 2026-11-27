@@ -26,21 +26,21 @@
 #define LAST_NUMBER	31
 
 /* the last number given to the address, 0 if none */
-static int last_number(uint32_t local_address)
+static int last_number(uint32_t local_address, int opid)
 {
-	ermes_subscriber_t *s = ermes_book_find(local_address, 0);
+	ermes_subscriber_t *s = ermes_book_find(local_address, opid, 0);
 
 	return s ? s->number : 0;
 }
 
-int ermes_number_peek(uint32_t local_address, int ahead)
+int ermes_number_peek(uint32_t local_address, int opid, int ahead)
 {
-	return ((last_number(local_address) + ahead) % LAST_NUMBER) + 1;
+	return ((last_number(local_address, opid) + ahead) % LAST_NUMBER) + 1;
 }
 
-int ermes_number_next(uint32_t local_address)
+int ermes_number_next(uint32_t local_address, int opid)
 {
-	ermes_subscriber_t *s = ermes_book_find(local_address, 1);
+	ermes_subscriber_t *s = ermes_book_find(local_address, opid, 1);
 
 	if (!s)
 		return 1;

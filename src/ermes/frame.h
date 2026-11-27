@@ -63,6 +63,10 @@ typedef struct ermes_page {
 	int			alert;		/* 0..7 */
 	const char		*text;		/* UTF-8 */
 	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = ERMES standard (Table B.3) */
+	int			external;	/* a visiting receiver of another operator (-4 Table 8
+						 * EB = 1, §5.5.2): the header is followed by its home
+						 * operator's identity, and the batch has ETI = 1 (§9.4) */
+	int			opid;		/* that OPID, 13 bits: zone 3, country 7, operator 3 */
 	int			last_number;	/* retransmission of the latest message number (-2
 						 * §4.3.1.3.3, -4 Table 15): AII 1, AIT 100, AIN 0001,
 						 * no data; number = the latest one sent to the receiver */
@@ -114,6 +118,13 @@ char ermes_batch_name(int batch);						/* 0..15 -> 'A'..'P' */
 /* Address as the user gives it: "3247680" or "0x318E40" (22-bit local address), or
  * "nec-C63900" (NEC "Tokyo hex" of the pager label = local address * 4). 0 or -1. */
 int ermes_parse_address(const char *s, uint32_t *local_address);
+
+/* operator identity "zone-country-operator" (2-1-3) <-> its 13 bits (§3.1); 0 or -1 */
+int ermes_parse_opid(const char *s, int *opid);
+const char *ermes_opid_str(int opid);
+/* the receiver of a page: its local address and home operator, -1 = ours (EB = 0). A visiting
+ * receiver is another receiver than ours with the same local address: own number, own book line */
+#define ERMES_PAGE_OPID(page)	((page)->external ? (page)->opid : -1)
 /* "0x318E40 (NEC C63900), batch A" */
 const char *ermes_print_address(uint32_t local_address);
 

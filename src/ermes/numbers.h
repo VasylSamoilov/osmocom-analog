@@ -22,12 +22,14 @@
 
 #include <stdint.h>
 
-/* The counters are kept in the subscriber book (book.h). The next message number of an address: one counter per address (RIC), 1..31 from 1, +1 per
- * message (ETS 300 133-2 §4.3.1.3 p.18, -4 Table 8 p.19, §10.2 p.31). Takes the number. */
-int ermes_number_next(uint32_t local_address);
+/* The counters are kept in the subscriber book (book.h). The next message number of a receiver:
+ * one counter per receiver - local address and home operator (opid, -1 = ours; a visitor with the
+ * same local address is another receiver) - 1..31 from 1, +1 per message (ETS 300 133-2 §4.3.1.3
+ * p.18, -4 Table 8 p.19, §10.2 p.31). Takes the number. */
+int ermes_number_next(uint32_t local_address, int opid);
 
-/* The number ermes_number_next() gives after ahead more numbers of the address are taken, without
- * taking it (ahead 0 = the next one) */
-int ermes_number_peek(uint32_t local_address, int ahead);
+/* The number ermes_number_next() gives after ahead more numbers of the receiver are taken,
+ * without taking it (ahead 0 = the next one) */
+int ermes_number_peek(uint32_t local_address, int opid, int ahead);
 
 #endif /* ERMES_NUMBERS_H */

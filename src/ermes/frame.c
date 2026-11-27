@@ -113,7 +113,7 @@ void ermes_header_words(const ermes_page_t *page, uint32_t info[2])
 
 	field(&h, page->local_address, ERMES_LA_BITS);
 	field(&h, page->number, ERMES_MSG_NUMBER_BITS);
-	field(&h, 0, FLAG_BITS);	/* external bit: home network */
+	field(&h, page->external, FLAG_BITS);	/* external bit: 0 home receiver, 1 visiting (Table 8) */
 	if (page->group_pointer) {
 		/* §10.3 Fig.20 second stage, §5.5.1.2 Table 10/16: AII 1, AIT 111, AIN = CTAP */
 		field(&h, 1, FLAG_BITS);
@@ -267,7 +267,7 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		      const ermes_page_t *pages, int num_pages, ermes_carry_t *carry, uint8_t *bits)
 {
 	uint32_t msg[MAX_MSG_WORDS];	/* message partition codewords before interleaving */
-	uint32_t whole[ERMES_MAX_MSG_WORDS + 3];
+	uint32_t whole[ERMES_MAX_MSG_WORDS + 4];	/* header 2, OPID 1, data, delimiter 1 */
 	int order[ERMES_MAX_IA];	/* the pages with an initial address in this batch */
 	uint32_t stage[MAX_MSG_WORDS];	/* the messages of this batch, in the order they were taken */
 	struct {
@@ -333,6 +333,10 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		nwhole = 0;
 		whole[nwhole++] = ermes_bch_encode(hdr[0]);
 		whole[nwhole++] = ermes_bch_encode(hdr[1]);
+		/* EB = 1: the home operator's identity first, 13 bits and trailing zeros to a codeword
+		 * (§5.5.2), then the AIF (if any) and the data */
+		if (pages[i].external)
+			whole[nwhole++] = ermes_bch_encode((uint32_t)pages[i].opid << (ERMES_INFO_BITS - ERMES_OPID_BITS));
 		for (j = 0; j < nd; j++)
 			whole[nwhole++] = ermes_bch_encode(data[j]);
 		whole[nwhole++] = ERMES_MD;
@@ -405,7 +409,10 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 	put_word(bits, &n, ERMES_SW1);
 
 	/* system information partition (§5.3): SI, SI, SSI */
-	put_word(bits, &n, ermes_bch_encode(ermes_si_word1(net, 0)));
+	/* ETI = 1: a visiting receiver's initial address is in this batch (§9.4) */
+	for (i = 0, k = 0; i < nia; i++)
+		k |= pages[order[i]].external;
+	put_word(bits, &n, ermes_bch_encode(ermes_si_word1(net, k)));
 	put_word(bits, &n, ermes_bch_encode(ermes_si_word2(net, t)));
 	put_word(bits, &n, ermes_bch_encode(ermes_ssi_word(ssi)));
 
@@ -594,13 +601,38 @@ const char *ermes_page_str(const ermes_page_t *page)
 			 number, page->group_pointer - 1);
 		return buf;
 	}
-	if (page->last_number) {
+	if (page->last_number)
 		snprintf(buf, sizeof(buf), "%s, retransmission of the latest message number",
 			 (page->number < 0) ? "latest number taken when sent" : number);
-		return buf;
+	else
+		snprintf(buf, sizeof(buf), "%s, %s%s%s%s, %s, alert type %d", number,
+			 ermes_category_name(page->category), text[0] ? " \"" : "", text, text[0] ? "\"" : "",
+			 page->urgent ? "urgent" : "not urgent", page->alert);
+	if (page->external) {
+		size_t len = strlen(buf);
+
+		snprintf(buf + len, sizeof(buf) - len, ", visiting receiver of operator %s (EB 1)", ermes_opid_str(page->opid));
 	}
-	snprintf(buf, sizeof(buf), "%s, %s%s%s%s, %s, alert type %d", number,
-		 ermes_category_name(page->category), text[0] ? " \"" : "", text, text[0] ? "\"" : "",
-		 page->urgent ? "urgent" : "not urgent", page->alert);
+	return buf;
+}
+
+int ermes_parse_opid(const char *s, int *opid)
+{
+	int z, c, op, len = 0;
+
+	if (sscanf(s, "%d-%d-%d%n", &z, &c, &op, &len) != 3 || s[len]
+	 || z < 0 || z >= (1 << ERMES_ZONE_BITS) || c < 0 || c >= (1 << ERMES_COUNTRY_BITS)
+	 || op < 0 || op >= (1 << ERMES_OPERATOR_BITS))
+		return -1;
+	*opid = (z << (ERMES_COUNTRY_BITS + ERMES_OPERATOR_BITS)) | (c << ERMES_OPERATOR_BITS) | op;
+	return 0;
+}
+
+const char *ermes_opid_str(int opid)
+{
+	static char buf[16];
+
+	snprintf(buf, sizeof(buf), "%d-%d-%d", opid >> (ERMES_COUNTRY_BITS + ERMES_OPERATOR_BITS),
+		 (opid >> ERMES_OPERATOR_BITS) & ((1 << ERMES_COUNTRY_BITS) - 1), opid & ((1 << ERMES_OPERATOR_BITS) - 1));
 	return buf;
 }

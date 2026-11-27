@@ -199,6 +199,7 @@ lines without them:
 | `charset`             | a codepage name | `--charset` | `--charset`       | codepage of an alphanumeric message (see Codepages) |
 | `retransmit`          | 0..15 | 0       | `--retransmit`               | times the page is sent again after the first, with the same number (ETS 300 133-2 §4.3.1.3.1) |
 | `retransmit_interval` | 1..3600 | 300   | `--retransmit-interval`      | seconds between the transmissions |
+| `opid`                | zone-country-operator | none | -              | the page is for a visiting receiver of that home operator (see Visiting receivers) |
 
 Other command-line defaults: `-y` the type (default tone), `-M` the text
 (default empty). A command-line default applies to every page that does not
@@ -446,6 +447,37 @@ nec-C63900,book
 The second line only logs the entry. A bad value changes nothing. (Setting
 `number` ahead of the pager makes it see a gap: with `lastnum`, a way to test
 its missing-message report.)
+
+A visiting receiver (below) has its own line, with `opid=`:
+`0x318E40 opid=2-1-3 number=22`; the FIFO `book` command picks it the same
+way (`nec-C63900,book,opid=2-1-3 number=20`).
+
+## Visiting receivers
+
+A pager of another operator can visit our network (roaming, ETS 300 133-4
+Table 8, §5.5.2, §9.4). Local addresses are unique only within an operator,
+so a visitor is told apart by its home operator's identity (OPID, 13 bits:
+zone, country, operator - the same three numbers as our network's `-Z -C
+-O`). The page option `opid=2-1-3` sends a page to the visitor with that home
+operator:
+
+- the message header has the external bit EB = 1;
+- right after the header comes one codeword with the OPID (13 bits, then
+  zeros), then the text;
+- the batch's system information has ETI = 1 (a visitor's initial address
+  is in this batch), so visitors may sleep through batches with ETI = 0.
+
+A visitor is another receiver than ours with the same local address: it has
+its own message numbers (a book line with `opid=`), and our pager with that
+address does not take its pages. `lastnum` works for visitors too. Group
+calls go to our own receivers only (`opid` refused there).
+
+```
+nec-C63900,alpha,opid=2-1-3,For the visitor from 2-1-3
+```
+
+Not tested on a pager yet: the NEC locks only to its home network. PDW
+does not parse the external bit (it shows the OPID codeword as text).
 
 ## Several channels
 

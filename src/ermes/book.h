@@ -28,6 +28,8 @@
 
 typedef struct ermes_subscriber {
 	uint32_t	local_address;	/* 22 bit */
+	int		opid;		/* home operator of a visiting receiver (13 bits), -1 = ours: with the
+					 * local address the key (local addresses are unique per operator) */
 	int		number;		/* last message number given, 1..31, 0 = none yet */
 	int		fsn;		/* frequency subset number 0..15 (§9.2), -1 = not known: the
 					 * page goes on the first channel that has room for it */
@@ -41,12 +43,15 @@ extern const char *ermes_book_old_numbers;
 
 /* The entry of a receiver; with create a new one (all defaults) if it has none. NULL if there is
  * none (or no memory). The book is read from the file at first use. */
-ermes_subscriber_t *ermes_book_find(uint32_t local_address, int create);
+/* the entry of a receiver: local address and home operator (-1 = ours) */
+ermes_subscriber_t *ermes_book_find(uint32_t local_address, int opid, int create);
 
 /* Write the book to its file. 0 or -1 (logged) */
 int ermes_book_save(void);
 
 /* FIFO type "book": "number=5 fsn=8" set for one receiver, saved; empty: the entry is logged */
 int ermes_book_set(uint32_t local_address, const char *settings);
+/* "0x318E40" or "0x318E40 opid 2-1-3": for logs */
+const char *ermes_book_name(uint32_t local_address, int opid);
 
 #endif /* ERMES_BOOK_H */

@@ -46,6 +46,8 @@ typedef struct ermes_page_opts {
 	int			retransmit;	/* transmissions after the first, same number */
 	int			retransmit_interval; /* seconds between them */
 	int			last_number;	/* type "lastnum": the latest message number again */
+	int			external;	/* opid=: a visiting receiver (EB = 1) ... */
+	int			opid;		/* ... of this home operator (13 bits) */
 } ermes_page_opts_t;
 
 /* Repetition (ETS 300 133-2 §4.3.1.3.1 p.18): the message is sent again with its number, within

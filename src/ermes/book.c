@@ -34,7 +34,7 @@ static ermes_subscriber_t *book;
 static int book_count, book_size;
 static int loaded;
 
-static ermes_subscriber_t *add(uint32_t local_address)
+static ermes_subscriber_t *add(uint32_t local_address, int opid)
 {
 	if (book_count == book_size) {
 		int size = book_size ? book_size * 2 : 64;
@@ -49,8 +49,20 @@ static ermes_subscriber_t *add(uint32_t local_address)
 	}
 	memset(&book[book_count], 0, sizeof(book[0]));
 	book[book_count].local_address = local_address;
+	book[book_count].opid = opid;
 	book[book_count].fsn = -1;
 	return &book[book_count++];
+}
+
+const char *ermes_book_name(uint32_t local_address, int opid)
+{
+	static char buf[48];
+
+	if (opid < 0)
+		snprintf(buf, sizeof(buf), "0x%06X", local_address);
+	else
+		snprintf(buf, sizeof(buf), "0x%06X opid=%s", local_address, ermes_opid_str(opid));
+	return buf;
 }
 
 /* "number=5": one setting of an entry. 0 or -1 */
@@ -73,6 +85,9 @@ static int set(ermes_subscriber_t *s, const char *key, const char *val)
 		s->fsn = v;
 		return 0;
 	}
+	/* a visiting receiver's line: part of the key */
+	if (!strcasecmp(key, "opid"))
+		return ermes_parse_opid(val, &s->opid);
 	return -1;
 }
 
@@ -88,19 +103,30 @@ int ermes_book_set(uint32_t local_address, const char *settings)
 		return -1;
 	}
 	strcpy(buf, settings);
+	/* the line is chosen by opid= (a visiting receiver) or is ours */
+	memset(&copy, 0, sizeof(copy));
+	copy.opid = -1;
+	for (tok = strtok_r(buf, " \t\r\n", &save); tok; tok = strtok_r(NULL, " \t\r\n", &save)) {
+		if (strncasecmp(tok, "opid=", 5))
+			continue;
+		if (ermes_parse_opid(tok + 5, &copy.opid) < 0) {
+			LOGP(DERMES, LOGL_ERROR, "Bad book setting %s (zone-country-operator).\n", tok);
+			return -1;
+		}
+	}
+	strcpy(buf, settings);
 	/* checked on a copy: a refused line adds or changes nothing */
-	s = ermes_book_find(local_address, 0);
+	s = ermes_book_find(local_address, copy.opid, 0);
 	if (s)
 		copy = *s;
 	else {
-		memset(&copy, 0, sizeof(copy));
 		copy.local_address = local_address;
 		copy.fsn = -1;
 	}
 	for (tok = strtok_r(buf, " \t\r\n", &save); tok; tok = strtok_r(NULL, " \t\r\n", &save)) {
 		eq = strchr(tok, '=');
 		if (!eq) {
-			LOGP(DERMES, LOGL_ERROR, "Book setting \"%s\" is not key=value (number, fsn).\n", tok);
+			LOGP(DERMES, LOGL_ERROR, "Book setting \"%s\" is not key=value (number, fsn, opid).\n", tok);
 			return -1;
 		}
 		*eq = '\0';
@@ -110,15 +136,15 @@ int ermes_book_set(uint32_t local_address, const char *settings)
 		}
 	}
 	if (!s)
-		s = ermes_book_find(local_address, 1);
+		s = ermes_book_find(local_address, copy.opid, 1);
 	if (!s)
 		return -1;
 	*s = copy;
 	ermes_book_save();
 	if (s->fsn >= 0)
-		LOGP(DERMES, LOGL_NOTICE, "Book: 0x%06X number=%d fsn=%d\n", s->local_address, s->number, s->fsn);
+		LOGP(DERMES, LOGL_NOTICE, "Book: %s number=%d fsn=%d\n", ermes_book_name(s->local_address, s->opid), s->number, s->fsn);
 	else
-		LOGP(DERMES, LOGL_NOTICE, "Book: 0x%06X number=%d (fsn not known)\n", s->local_address, s->number);
+		LOGP(DERMES, LOGL_NOTICE, "Book: %s number=%d (fsn not known)\n", ermes_book_name(s->local_address, s->opid), s->number);
 	return 0;
 }
 
@@ -126,7 +152,7 @@ int ermes_book_set(uint32_t local_address, const char *settings)
 static void parse_line(char *line, const char *file, int lineno)
 {
 	char *p, *tok, *val, *save = NULL;
-	ermes_subscriber_t *s;
+	ermes_subscriber_t *s, copy;
 	uint32_t la;
 
 	p = strchr(line, '#');
@@ -139,21 +165,27 @@ static void parse_line(char *line, const char *file, int lineno)
 		LOGP(DERMES, LOGL_ERROR, "%s:%d: \"%s\" is not a local address, line ignored.\n", file, lineno, tok);
 		return;
 	}
-	s = ermes_book_find(la, 1);
-	if (!s)
-		return;
+	/* the whole line first: opid= is part of the key */
+	memset(&copy, 0, sizeof(copy));
+	copy.opid = -1;
+	copy.fsn = -1;
 	while ((tok = strtok_r(NULL, " \t\r\n", &save))) {
 		val = strchr(tok, '=');
 		if (!val) {
 			/* old numbers file: the bare number */
-			if (set(s, "number", tok) < 0)
+			if (set(&copy, "number", tok) < 0)
 				LOGP(DERMES, LOGL_ERROR, "%s:%d: \"%s\" is not key=value, ignored.\n", file, lineno, tok);
 			continue;
 		}
 		*val++ = '\0';
-		if (set(s, tok, val) < 0)
+		if (set(&copy, tok, val) < 0)
 			LOGP(DERMES, LOGL_ERROR, "%s:%d: \"%s=%s\" is not known or out of range, ignored.\n", file, lineno, tok, val);
 	}
+	s = ermes_book_find(la, copy.opid, 1);
+	if (!s)
+		return;
+	copy.local_address = la;
+	*s = copy;
 }
 
 static int load_file(const char *file)
@@ -190,16 +222,16 @@ static void load(void)
 	}
 }
 
-ermes_subscriber_t *ermes_book_find(uint32_t local_address, int create)
+ermes_subscriber_t *ermes_book_find(uint32_t local_address, int opid, int create)
 {
 	int i;
 
 	load();
 	for (i = 0; i < book_count; i++) {
-		if (book[i].local_address == local_address)
+		if (book[i].local_address == local_address && book[i].opid == opid)
 			return &book[i];
 	}
-	return create ? add(local_address) : NULL;
+	return create ? add(local_address, opid) : NULL;
 }
 
 int ermes_book_save(void)
@@ -216,9 +248,10 @@ int ermes_book_save(void)
 	}
 	fprintf(fp, "# ERMES subscriber book: one receiver per line, <local address> key=value ...\n");
 	fprintf(fp, "# number = last message number sent (1..31), fsn = frequency subset number (0..15,\n");
-	fprintf(fp, "# missing: not known). Rewritten by the program.\n");
+	fprintf(fp, "# missing: not known), opid = home operator of a visiting receiver (missing: ours).\n");
+	fprintf(fp, "# Rewritten by the program.\n");
 	for (i = 0; i < book_count; i++) {
-		fprintf(fp, "0x%06X number=%d", book[i].local_address, book[i].number);
+		fprintf(fp, "%s number=%d", ermes_book_name(book[i].local_address, book[i].opid), book[i].number);
 		if (book[i].fsn >= 0)
 			fprintf(fp, " fsn=%d", book[i].fsn);
 		fprintf(fp, "\n");

@@ -240,11 +240,6 @@ int ermes_msg_send(const char *line)
 			LOGP(DERMES, LOGL_ERROR, "Bad address \"%s\" in \"%s\": the local address (decimal or 0x hex) or nec-<label code>.\n", tok, line);
 			return -1;
 		}
-		/* a page that no channel may carry would wait for ever (a book change may fix it) */
-		if (!book && !ermes_scheduler_reachable(la)) {
-			LOGP(DERMES, LOGL_ERROR, "No channel carries %s: its FSN (book) is not in any channel's FSI.\n", ermes_print_address(la));
-			return -1;
-		}
 		members[num++] = la;
 	}
 	if (!num) {
@@ -271,6 +266,18 @@ int ermes_msg_send(const char *line)
 	if (opts.last_number && (group || opts.retransmit)) {
 		LOGP(DERMES, LOGL_ERROR, "lastnum goes to one receiver, without retransmit.\n");
 		return -1;
+	}
+	if (group && opts.external) {
+		LOGP(DERMES, LOGL_ERROR, "A group call goes to our own receivers: no opid.\n");
+		return -1;
+	}
+	/* a page that no channel may carry would wait for ever (a book change may fix it) */
+	for (i = 0; i < num; i++) {
+		if (!ermes_scheduler_reachable(members[i], opts.external ? opts.opid : -1)) {
+			LOGP(DERMES, LOGL_ERROR, "No channel carries %s: its FSN (book) is not in any channel's FSI.\n",
+			     ermes_print_address(members[i]));
+			return -1;
+		}
 	}
 	if (field[2])
 		text = field[2];

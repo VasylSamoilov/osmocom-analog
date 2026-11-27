@@ -116,21 +116,21 @@ static void start_time(ermes_t *ermes)
 
 /* 1 if this channel may carry pages for the receiver: its FSI has the receiver's FSN; a receiver
  * whose FSN is not known (not in the book) goes on any channel, the first with room */
-static int fsn_on_channel(const ermes_t *ermes, uint32_t local_address)
+static int fsn_on_channel(const ermes_t *ermes, uint32_t local_address, int opid)
 {
-	const ermes_subscriber_t *s = ermes_book_find(local_address, 0);
+	const ermes_subscriber_t *s = ermes_book_find(local_address, opid, 0);
 
 	if (!s || s->fsn < 0)
 		return 1;
 	return ermes_fsi_has_fsn(ermes->net.fsi, s->fsn);
 }
 
-int ermes_scheduler_reachable(uint32_t local_address)
+int ermes_scheduler_reachable(uint32_t local_address, int opid)
 {
 	sender_t *s;
 
 	for (s = sender_head; s; s = s->next) {
-		if (fsn_on_channel((ermes_t *)s, local_address))
+		if (fsn_on_channel((ermes_t *)s, local_address, opid))
 			return 1;
 	}
 	return 0;
@@ -240,7 +240,7 @@ static void group_start(ermes_t *ermes)
 			/* in the order they came: an individual page before it for this channel goes first
 			 * (a retransmission waiting for its time does not hold the call) */
 			if (!m->group) {
-				if (!m->sent && fsn_on_channel(ermes, m->page.local_address))
+				if (!m->sent && fsn_on_channel(ermes, m->page.local_address, ERMES_PAGE_OPID(&m->page)))
 					return;
 				continue;
 			}
@@ -249,7 +249,7 @@ static void group_start(ermes_t *ermes)
 			lo = ERMES_BATCHES;
 			hi = -1;
 			for (count = 0, i = 0; i < g->num; i++) {
-				if (g->channel[i] || g->done[i] || !fsn_on_channel(ermes, g->member[i]))
+				if (g->channel[i] || g->done[i] || !fsn_on_channel(ermes, g->member[i], -1))
 					continue;
 				count++;
 				off = (ermes_address_batch(g->member[i]) - ermes_channel_batch(ermes->channel, ermes->slot)
@@ -277,7 +277,7 @@ static void group_start(ermes_t *ermes)
 			}
 			s = &ermes->ctap[c];
 			for (count = 0, i = 0; i < g->num; i++) {
-				if (!g->channel[i] && !g->done[i] && fsn_on_channel(ermes, g->member[i])) {
+				if (!g->channel[i] && !g->done[i] && fsn_on_channel(ermes, g->member[i], -1)) {
 					g->channel[i] = ermes;
 					s->member[count++] = g->member[i];
 				}
@@ -327,7 +327,7 @@ static int group_pages(ermes_t *ermes, const ermes_batch_time_t *t, ermes_msg_t 
 			memset(&pages[n], 0, sizeof(pages[n]));
 			pages[n].local_address = g->member[i];
 			if (ermes_group_fig16) {
-				pages[n].number = ermes_number_peek(g->member[i], 0);
+				pages[n].number = ermes_number_peek(g->member[i], -1, 0);
 				pages[n].group_pointer = ermes->group_ctap + 1;
 			} else
 				pages[n].ia_only = 1;
@@ -336,7 +336,7 @@ static int group_pages(ermes_t *ermes, const ermes_batch_time_t *t, ermes_msg_t 
 			/* stage 2: the pointer, in the batch after its initial address */
 			memset(&pages[n], 0, sizeof(pages[n]));
 			pages[n].local_address = g->member[i];
-			pages[n].number = ermes_number_peek(g->member[i], 0);
+			pages[n].number = ermes_number_peek(g->member[i], -1, 0);
 			pages[n].group_pointer = ermes->group_ctap + 1;
 			pages[n].no_ia = 1;
 			msgs[n++] = m;
@@ -383,7 +383,7 @@ static void group_sent(ermes_t *ermes, const ermes_batch_time_t *t, const ermes_
 			/* Fig.16: the pointer with it, below */
 		}
 		if (pages[i].group_pointer) {
-			if (ermes_number_next(pages[i].local_address) != pages[i].number)
+			if (ermes_number_next(pages[i].local_address, -1) != pages[i].number)
 				LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);
 			for (j = 0; j < g->num; j++) {
 				if (g->member[j] == pages[i].local_address)
@@ -457,10 +457,10 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			if (m->group || m->priority != prio || ermes_address_batch(m->page.local_address) != t.batch)
 				continue;
 			/* only on a channel whose frequency subset has the receiver's FSN (§9.2) */
-			if (!fsn_on_channel(ermes, m->page.local_address))
+			if (!fsn_on_channel(ermes, m->page.local_address, ERMES_PAGE_OPID(&m->page)))
 				continue;
 			/* a member of a group call gets nothing else until its message is sent */
-			if (in_group_call(m->page.local_address))
+			if (!m->page.external && in_group_call(m->page.local_address))
 				continue;
 			/* a retransmission waits for its time */
 			if (m->sent && m->next_time > net_now)
@@ -468,12 +468,13 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			/* any number of messages to one receiver in a batch (§10.2), as room allows; the
 			 * ones before it take the numbers ahead of it */
 			for (ahead = 0, i = 0; i < n; i++) {
-				if (pages[i].local_address == m->page.local_address)
+				if (pages[i].local_address == m->page.local_address
+				 && ERMES_PAGE_OPID(&pages[i]) == ERMES_PAGE_OPID(&m->page))
 					ahead += (msgs[i]->page.number < 0 && !msgs[i]->page.last_number);
 			}
 			/* lastnum: the latest number, including new ones before it in this batch; none
 			 * sent yet: nothing to repeat */
-			if (m->page.last_number && !ermes_number_peek(m->page.local_address, ahead - 1)) {
+			if (m->page.last_number && !ermes_number_peek(m->page.local_address, ERMES_PAGE_OPID(&m->page), ahead - 1)) {
 				LOGP_CHAN(DERMES, LOGL_ERROR, "No message was sent to %s yet: no latest message number to send.\n",
 					  ermes_print_address(m->page.local_address));
 				ermes_queue_remove(&ermes_queue, m);
@@ -483,9 +484,9 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			pages[n] = m->page;
 			/* a retransmission keeps the number of its first transmission */
 			if (m->page.last_number)
-				pages[n].number = ermes_number_peek(m->page.local_address, ahead - 1);
+				pages[n].number = ermes_number_peek(m->page.local_address, ERMES_PAGE_OPID(&m->page), ahead - 1);
 			else if (m->page.number < 0)
-				pages[n].number = ermes_number_peek(m->page.local_address, ahead);
+				pages[n].number = ermes_number_peek(m->page.local_address, ERMES_PAGE_OPID(&m->page), ahead);
 			n++;
 		}
 	}
@@ -516,7 +517,7 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 		/* the batch builder sends the first pages given (on the air in ascending order of
 		 * local address; several to one address keep the order of their numbers) */
 		if (m->page.number < 0 && !m->page.last_number) {
-			if (ermes_number_next(m->page.local_address) != pages[i].number)
+			if (ermes_number_next(m->page.local_address, ERMES_PAGE_OPID(&m->page)) != pages[i].number)
 				LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);
 			m->page.number = pages[i].number;
 		}

@@ -114,6 +114,13 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 		} else if (!strcasecmp(key, "retransmit_interval")) {
 			if (int_option(key, val, 1, ERMES_RETRANSMIT_INTERVAL_MAX_S, &o.retransmit_interval) < 0)
 				return -1;
+		} else if (!strcasecmp(key, "opid")) {
+			/* home operator of a visiting receiver, as the network's: zone-country-operator */
+			if (ermes_parse_opid(val, &o.opid) < 0) {
+				LOGP(DERMES, LOGL_ERROR, "Option opid=%s is not zone-country-operator (0..7-0..127-0..7).\n", val);
+				return -1;
+			}
+			o.external = 1;
 		} else if (!strcasecmp(key, "charset")) {
 			o.charset = pager_charset_lookup("ermes", val);
 			if (!o.charset) {
@@ -121,7 +128,7 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 				return -1;
 			}
 		} else {
-			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (priority, urgent, alert, charset, retransmit, retransmit_interval).\n", key);
+			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (priority, urgent, alert, charset, retransmit, retransmit_interval, opid).\n", key);
 			return -1;
 		}
 	}
@@ -154,6 +161,8 @@ static ermes_msg_t *new_msg(uint32_t local_address, const ermes_page_opts_t *opt
 	m->page.urgent = opts->urgent;
 	m->page.alert = opts->alert;
 	m->page.last_number = opts->last_number;
+	m->page.external = opts->external;
+	m->page.opid = opts->opid;
 	m->page.text = m->text;
 	m->page.charset = opts->charset ? opts->charset : ermes_charset;
 	nd = ermes_data_words(&m->page, data, ERMES_MAX_MSG_WORDS);
