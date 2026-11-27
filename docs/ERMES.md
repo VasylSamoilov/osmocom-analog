@@ -252,9 +252,9 @@ characters over three arrived whole.
 
 The standard allows any number of messages to one receiver in a batch, one
 initial address each (§10.2); a batch has room for about 35 tone pages or 15
-short texts. The network sends at most 2 to the same receiver in one batch
-(`--receiver-batch`, 1..32); the others follow in its next batches, 12 s
-apart, in order and numbered in order.
+short texts. The network sends as many to the same receiver in one batch as
+fit, numbered in order; the rest follow in its next batches, 12 s apart.
+Observed with the NEC PA3E6-1A: 4 in one batch all arrived.
 
 ### Group calls
 

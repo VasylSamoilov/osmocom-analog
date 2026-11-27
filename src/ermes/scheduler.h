@@ -30,11 +30,6 @@ extern double ermes_clock_offset;
 /* --tx-latency: seconds from making a sample to its transmission (< 0: the DSP buffer) */
 extern double ermes_tx_latency;
 
-/* --receiver-batch: messages to one receiver in one batch at most; more wait for its next batch.
- * A network choice: the standard allows any number (§10.2, one initial address each). */
-#define ERMES_RECEIVER_BATCH_DEFAULT	2
-#define ERMES_RECEIVER_BATCH_MAX	32
-extern int ermes_receiver_batch;
 /* --group-fig16: a group call's pointer goes with the member's initial address in its own batch
  * (ETS 300 133-5 §7.8 Fig.16), not in the batch after */
 extern int ermes_group_fig16;
