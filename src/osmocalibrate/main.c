@@ -27,16 +27,11 @@ typedef struct sender sender_t;
 
 #include "../libcalibrate/calibrate.h"
 #include "../libfastmath/fastmath.h"
+#include "../libsample/sample.h"
 #include "../libsdr/sdr_config.h"
+#include "../libsdr/sdr.h"
 #include "../liblogging/logging.h"
 #include "../liboptions/options.h"
-
-#ifdef HAVE_SOAPY
-#include "../libsdr/soapy.h"
-#endif
-#ifdef HAVE_UHD
-#include "../libsdr/uhd.h"
-#endif
 
 /* Globals required by linked libraries */
 sender_t *sender_head = NULL;
@@ -217,77 +212,39 @@ int sdr_check_separate_device_support(int tx_only, int rx_only, int split_mode)
 	return 0;
 }
 
+static void *sdr;
+
+/* RX only, the whole band at the DSP rate (channels = 0): libsdr opens the
+ * device (upconverter, PPM, clock source as every program), its read thread
+ * fills a ring that calibrate.c reads with sdr_read(). The SDR rate is the
+ * DSP rate here, so the band passes unchanged (no channelizer stage). */
 static int open_sdr_rx(double center_freq, int samplerate)
 {
-	/* Apply upconverter offset (mirrors sdr_open_internal in sdr.c) */
-	double actual_freq = center_freq + sdr_config->rx_upconverter;
+	/* 100 ms per read; the ring holds 8 x that (0.8 s): the gaps between
+	 * the reads (scan processing, retune) stay far below it */
+	int buffer_size = samplerate / 10;
+	double rx_frequency = center_freq;
+	int rc;
 
-	if (sdr_config->rx_upconverter != 0.0)
-		LOGP(DSDR, LOGL_INFO, "Calibrate upconverter RX: %.6f MHz + %.6f MHz = %.6f MHz\n",
-		     center_freq / 1e6, sdr_config->rx_upconverter / 1e6, actual_freq / 1e6);
-
-#ifdef HAVE_UHD
-	if (sdr_config->uhd) {
-		int rc;
-		rc = uhd_open(sdr_config->channel,
-		              sdr_config->device_args,
-		              sdr_config->stream_args,
-		              sdr_config->tune_args,
-		              "",
-		              sdr_config->rx_antenna,
-		              sdr_config->clock_source,
-		              0.0,
-		              actual_freq,
-		              sdr_config->lo_offset,
-		              (double)samplerate,
-		              0.0,
-		              sdr_config->rx_gain,
-		              sdr_config->bandwidth ? sdr_config->bandwidth : (double)samplerate,
-		              0);
-		if (rc) return rc;
-		rc = uhd_start();
-		if (rc < 0) { uhd_close(); return rc; }
-		return 0;
+	sdr = sdr_open(0, NULL, NULL, &rx_frequency, NULL, 0, 0.0, samplerate, buffer_size, 1.0, 0.0, 0.0, 0.0);
+	if (!sdr)
+		return -EIO;
+	rc = sdr_start(sdr);
+	if (rc < 0) {
+		sdr_close(sdr);
+		sdr = NULL;
+		return rc;
 	}
-#endif
-#ifdef HAVE_SOAPY
-	if (sdr_config->soapy) {
-		int rc;
-		rc = soapy_open(sdr_config->channel,
-		                sdr_config->device_args,
-		                sdr_config->stream_args,
-		                sdr_config->tune_args,
-		                "",
-		                sdr_config->rx_antenna,
-		                sdr_config->clock_source,
-		                0.0,
-		                actual_freq,
-		                sdr_config->lo_offset,
-		                (double)samplerate,
-		                0.0,
-		                sdr_config->rx_gain,
-		                sdr_config->bandwidth ? sdr_config->bandwidth : (double)samplerate,
-		                0);
-		if (rc) return rc;
-		rc = soapy_start();
-		if (rc < 0) { soapy_close(); return rc; }
-		return 0;
-	}
-#endif
-	fprintf(stderr, "No SDR backend selected. Use --sdr-soapy or --sdr-uhd.\n");
-	return -ENODEV;
+	calibrate_set_sdr(sdr, buffer_size);
+	return 0;
 }
 
 static void close_sdr(void)
 {
-#ifdef HAVE_SOAPY
-	if (sdr_config->soapy)
-		soapy_close();
-#endif
-#ifdef HAVE_UHD
-	if (sdr_config->uhd)
-		uhd_close();
-#endif
+	calibrate_set_sdr(NULL, 0);
+	if (sdr)
+		sdr_close(sdr);
+	sdr = NULL;
 }
 
 static void print_cell_text(const calibrate_cell_t *cell)

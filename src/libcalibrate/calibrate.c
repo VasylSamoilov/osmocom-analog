@@ -33,12 +33,7 @@
 #include "../liblogging/logging.h"
 #include "../libfft/fft.h"
 
-#ifdef HAVE_SOAPY
-#include "../libsdr/soapy.h"
-#endif
-#ifdef HAVE_UHD
-#include "../libsdr/uhd.h"
-#endif
+#include "../libsdr/sdr.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -480,18 +475,29 @@ static double running_median(const float *values, int count)
 	return med;
 }
 
+static void *calib_sdr;		/* libsdr instance, the whole band (channels = 0) */
+static int calib_sdr_chunk;	/* its buffer_size: most samples per sdr_read() */
+
+void calibrate_set_sdr(void *sdr, int buffer_size)
+{
+	calib_sdr = sdr;
+	calib_sdr_chunk = buffer_size;
+}
+
+/* IQ from libsdr's RX ring (interleaved float at the DSP rate): what is
+ * there, at most max_samples; 0 if nothing yet */
 static int receive_iq(float *buffer, int max_samples)
 {
-	int got = 0;
-#ifdef HAVE_SOAPY
-	if (sdr_config->soapy)
-		got = soapy_receive(buffer, max_samples);
-#endif
-#ifdef HAVE_UHD
-	if (sdr_config->uhd)
-		got = uhd_receive(buffer, max_samples);
-#endif
-	return got;
+	int got;
+
+	if (!calib_sdr)
+		return -ENODEV;
+	if (max_samples > calib_sdr_chunk)
+		max_samples = calib_sdr_chunk;
+	if (max_samples <= 0)
+		return 0;
+	got = sdr_read(calib_sdr, (sample_t **)(void *)buffer, max_samples, 0, NULL);
+	return (got < 0) ? 0 : got;
 }
 
 /* Rate of a GSM channel taken out by the channelizer: the SDR rate halved as
@@ -535,18 +541,9 @@ static int receive_iq_blocking(float *buffer, int max_samples)
 /* Retune SDR RX to new center frequency */
 static int retune_rx(double frequency)
 {
-	/* Apply upconverter offset (mirrors sdr_open_internal in sdr.c) */
-	double actual_freq = frequency + sdr_config->rx_upconverter;
-
-#ifdef HAVE_UHD
-	if (sdr_config->uhd)
-		return uhd_set_rx_frequency(actual_freq);
-#endif
-#ifdef HAVE_SOAPY
-	if (sdr_config->soapy)
-		return soapy_set_rx_frequency(actual_freq);
-#endif
-	return -ENODEV;
+	/* sdr_open() applies the upconverter, sdr_set_rx_frequency() does not
+	 * (it only moves the device by the band's shift off the DC): add it */
+	return sdr_set_rx_frequency(frequency + sdr_config->rx_upconverter);
 }
 
 /* Flush RX buffer after retune (discard stale samples) */

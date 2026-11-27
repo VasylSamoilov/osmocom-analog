@@ -1,5 +1,4 @@
-AM_CPPFLAGS = -Wall -Wextra -Wmissing-prototypes -g $(all_includes) \
-	$(SOAPY_CFLAGS) $(UHD_CFLAGS)
+AM_CPPFLAGS = -Wall -Wextra -Wmissing-prototypes -g $(all_includes)
 
 noinst_LIBRARIES = libcalibrate.a
 
@@ -13,11 +12,3 @@ noinst_HEADERS = \
 	calibrate.h \
 	fcch_detect.h \
 	gsm_sch.h
-
-if HAVE_UHD
-AM_CPPFLAGS += -DHAVE_UHD
-endif
-
-if HAVE_SOAPY
-AM_CPPFLAGS += -DHAVE_SOAPY
-endif

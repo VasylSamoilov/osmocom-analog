@@ -94,6 +94,10 @@ typedef struct {
 /* Initialize default configuration */
 void calibrate_config_default(calibrate_config_t *config);
 
+/* The SDR to receive from: a libsdr instance (sdr_open() with channels = 0,
+ * started), read in chunks of at most buffer_size samples. */
+void calibrate_set_sdr(void *sdr, int buffer_size);
+
 /* Calibrate a single band. Returns 0 on success, <0 on error. */
 int calibrate_band(double center_freq, int samplerate,
                    int gsm_band, calibrate_config_t *config,
