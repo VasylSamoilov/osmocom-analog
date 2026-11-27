@@ -76,6 +76,52 @@ static int set(ermes_subscriber_t *s, const char *key, const char *val)
 	return -1;
 }
 
+/* "number=5 fsn=8" for one receiver while running (FIFO type "book"); none: just log the entry.
+ * All or nothing; saved. 0 or -1 */
+int ermes_book_set(uint32_t local_address, const char *settings)
+{
+	ermes_subscriber_t *s, copy;
+	char buf[256], *tok, *save, *eq;
+
+	if (strlen(settings) >= sizeof(buf)) {
+		LOGP(DERMES, LOGL_ERROR, "Book settings too long.\n");
+		return -1;
+	}
+	strcpy(buf, settings);
+	/* checked on a copy: a refused line adds or changes nothing */
+	s = ermes_book_find(local_address, 0);
+	if (s)
+		copy = *s;
+	else {
+		memset(&copy, 0, sizeof(copy));
+		copy.local_address = local_address;
+		copy.fsn = -1;
+	}
+	for (tok = strtok_r(buf, " \t\r\n", &save); tok; tok = strtok_r(NULL, " \t\r\n", &save)) {
+		eq = strchr(tok, '=');
+		if (!eq) {
+			LOGP(DERMES, LOGL_ERROR, "Book setting \"%s\" is not key=value (number, fsn).\n", tok);
+			return -1;
+		}
+		*eq = '\0';
+		if (set(&copy, tok, eq + 1) < 0) {
+			LOGP(DERMES, LOGL_ERROR, "Bad book setting %s=%s (number 0..31, fsn 0..15).\n", tok, eq + 1);
+			return -1;
+		}
+	}
+	if (!s)
+		s = ermes_book_find(local_address, 1);
+	if (!s)
+		return -1;
+	*s = copy;
+	ermes_book_save();
+	if (s->fsn >= 0)
+		LOGP(DERMES, LOGL_NOTICE, "Book: 0x%06X number=%d fsn=%d\n", s->local_address, s->number, s->fsn);
+	else
+		LOGP(DERMES, LOGL_NOTICE, "Book: 0x%06X number=%d (fsn not known)\n", s->local_address, s->number);
+	return 0;
+}
+
 /* one line of the book, or of an old numbers file ("<address hex> <number>") */
 static void parse_line(char *line, const char *file, int lineno)
 {

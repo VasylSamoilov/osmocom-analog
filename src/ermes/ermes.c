@@ -42,6 +42,7 @@
 #include "../libmobile/cause.h"
 #include "../libmobile/main_mobile.h"
 #include "ermes.h"
+#include "book.h"
 
 #define MAX_DISPLAY	1.4	/* something above speech level, no emphasis */
 #define GROUP_PREFIX	"tempgroup:"	/* a group call, as flex */
@@ -213,7 +214,7 @@ int ermes_msg_send(const char *line)
 	ermes_page_opts_t opts = ermes_default_opts;
 	const char *text = ermes_default_text;
 	uint32_t la, members[ERMES_GROUP_MAX_MEMBERS];
-	int i, num = 0, group;
+	int i, num = 0, group, book;
 
 	if (!sender_head) {
 		LOGP(DERMES, LOGL_ERROR, "No transmitter.\n");
@@ -227,6 +228,8 @@ int ermes_msg_send(const char *line)
 	}
 	/* a group call, as flex: "tempgroup:<address> <address> ...,type,options,message" */
 	group = !strncasecmp(buf, GROUP_PREFIX, strlen(GROUP_PREFIX));
+	/* type "book": change the receiver's book entry, "number=5 fsn=8" in the options field */
+	book = (field[0] && !strcasecmp(field[0], "book"));
 	/* strtok_r: the checks below may read the book, which tokenizes too */
 	for (tok = strtok_r(buf + (group ? strlen(GROUP_PREFIX) : 0), " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
 		if (num == ERMES_GROUP_MAX_MEMBERS || (!group && num == 1)) {
@@ -237,8 +240,8 @@ int ermes_msg_send(const char *line)
 			LOGP(DERMES, LOGL_ERROR, "Bad address \"%s\" in \"%s\": the local address (decimal or 0x hex) or nec-<label code>.\n", tok, line);
 			return -1;
 		}
-		/* a page that no channel may carry would wait for ever */
-		if (!ermes_scheduler_reachable(la)) {
+		/* a page that no channel may carry would wait for ever (a book change may fix it) */
+		if (!book && !ermes_scheduler_reachable(la)) {
 			LOGP(DERMES, LOGL_ERROR, "No channel carries %s: its FSN (book) is not in any channel's FSI.\n", ermes_print_address(la));
 			return -1;
 		}
@@ -247,6 +250,13 @@ int ermes_msg_send(const char *line)
 	if (!num) {
 		LOGP(DERMES, LOGL_ERROR, "No address in \"%s\".\n", line);
 		return -1;
+	}
+	if (book) {
+		if (group) {
+			LOGP(DERMES, LOGL_ERROR, "book takes one receiver.\n");
+			return -1;
+		}
+		return ermes_book_set(members[0], field[1] ? field[1] : "");
 	}
 	if (field[0] && !strcasecmp(field[0], "lastnum")) {
 		/* the latest message number again (-2 §4.3.1.3.3): a header only */

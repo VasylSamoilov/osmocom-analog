@@ -46,4 +46,7 @@ ermes_subscriber_t *ermes_book_find(uint32_t local_address, int create);
 /* Write the book to its file. 0 or -1 (logged) */
 int ermes_book_save(void);
 
+/* FIFO type "book": "number=5 fsn=8" set for one receiver, saved; empty: the entry is logged */
+int ermes_book_set(uint32_t local_address, const char *settings);
+
 #endif /* ERMES_BOOK_H */

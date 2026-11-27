@@ -180,6 +180,9 @@ address,type,options,message
 
 - `address`: as in Addresses (`3247680`, `0x318E40`, `nec-C63900`).
 - `type`: `tone`, `numeric` or `alpha` (or `t`, `n`, `a`). Empty: `-y`.
+  Two more types are commands, not pages: `lastnum` (the latest message
+  number again, see Message numbers) and `book` (change the receiver's book
+  entry, see Subscriber book).
 - `options`: space-separated `key=value` pairs, may be empty.
 - `message`: the rest of the line, commas included. Missing: `-M`.
 
@@ -236,6 +239,14 @@ reports a missing number. The number is given when the page is first sent,
 not when it is queued: the numbers of an address go up on the air whatever
 the priorities. A retransmission keeps its number. The last number of every
 address is kept in the subscriber book across runs.
+
+`nec-C63900,lastnum` sends the receiver its latest message number again: a
+header only, AII 1, AIT 100, AIN 0001 (ETS 300 133-2 §4.3.1.3.3, -4 Table
+15), taking no number. The pager compares it with the number of its last
+correct message and reports the ones it missed. One receiver, no
+`retransmit`; a receiver that never got a message has no number to repeat
+(refused). Observed with the NEC PA3E6-1A: its last message was 3, the book
+was set to 5, `lastnum` sent 5, and it showed "missing 04-05".
 
 ### Long messages
 
@@ -423,6 +434,18 @@ must know, one line each:
   sequence and reports missing messages, so it is kept across runs.
 - `fsn`: the receiver's frequency subset number (0..15, below). Without it a
   page goes on the first channel with room.
+
+While the network runs, the FIFO type `book` changes an entry, with the same
+`key=value` pairs in the options field; the file is saved at once:
+
+```
+nec-C63900,book,number=5 fsn=8
+nec-C63900,book
+```
+
+The second line only logs the entry. A bad value changes nothing. (Setting
+`number` ahead of the pager makes it see a gap: with `lastnum`, a way to test
+its missing-message report.)
 
 ## Several channels
 
