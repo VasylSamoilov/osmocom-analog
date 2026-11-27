@@ -26,7 +26,8 @@ noinst_PROGRAMS = \
 	test_amps_orders \
 	test_amps_rx \
 	test_amps_states \
-	test_ermes_code
+	test_ermes_code \
+	test_lte_cell
 
 test_filter_SOURCES = test_filter.c dummy.c
 
@@ -361,4 +362,14 @@ test_ermes_code_SOURCES = test_ermes_code.c ../ermes/code.c ../ermes/frame.c ../
 test_ermes_code_LDADD = \
 	$(top_builddir)/src/libpagercharset/libpagercharset.a \
 	$(top_builddir)/src/libfilter/libfilter.a \
+	-lm
+
+test_lte_cell_SOURCES = test_lte_cell.c
+
+test_lte_cell_LDADD = \
+	$(top_builddir)/src/libcalibrate/libcalibrate.a \
+	$(top_builddir)/src/libchannelizer/libchannelizer.a \
+	$(top_builddir)/src/libpolyphase/libpolyphase.a \
+	$(top_builddir)/src/libsample/libsample.a \
+	$(top_builddir)/src/libfft/libfft.a \
 	-lm
