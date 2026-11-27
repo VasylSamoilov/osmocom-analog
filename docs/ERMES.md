@@ -31,7 +31,309 @@ address,type,options,message
 nec:C63900,alpha,priority=1 urgent=1,Call home
 ```
 
-`ermes -h` lists all options.
+`ermes -h` lists all options. The type defaults to tone (`-y`), and a tone
+page drops its text: give `alpha` or `numeric` for a page with text.
+
+Options can also go in `~/.osmocom/analog/ermes.conf`, one per line, as for
+the other programs.
+
+## Paging a pager: the short way
+
+1. Find the pager's address: the code on its label (NEC: `CODE C63900`).
+2. Find its channel: the frequency it is programmed for (see Channels). A
+   pager programmed for "channel 8" in the 1992 numbering is `-k 9`.
+3. Find its home network: zone, country, operator. NEC pagers leave the
+   factory with 2-1-2, the default here.
+4. Start the network and wait until the pager shows the network lock.
+5. Send a page:
+
+```
+echo 'nec:C63900,alpha,,Hello' > /tmp/ermes_msg_send
+```
+
+If the pager does not lock, the network or the channel is wrong, or its FSN
+is not carried (see Several channels).
+
+## Addresses
+
+A pager is called by its 22-bit local address (ETS 300 133-4 §3.1). The
+address can be given three ways; all three below are the same pager:
+
+| Form          | Example      | Meaning                                    |
+|---------------|--------------|--------------------------------------------|
+| decimal       | `3247680`    | the local address, 0..4194303              |
+| hex           | `0x318E40`   | the local address, 0x0..0x3FFFFF           |
+| NEC label     | `nec:C63900` | NEC "Tokyo hex": the local address * 4     |
+
+NEC pagers show and program the address in "Tokyo hex", the local address
+shifted left by two bits. The code on the label is this value. A `nec:` code
+must be a multiple of 4 (its two lowest bits zero) and at most `FFFFFC`:
+`nec:C63901` is refused.
+
+A decimal address with a leading zero is read as octal (`0123456` is
+42798). Write decimal addresses without leading zeros, or use hex.
+
+The parts of a local address:
+
+| Bits | Part            | What it does                                      |
+|------|-----------------|---------------------------------------------------|
+| 18   | initial address | sent in the address partition of the batch (§5.4) |
+| 4    | batch type      | the lowest 4 bits, 0..15 = batch A..P             |
+
+The pager wakes only in its own batch (§4.1): its initial address is sent
+only there. The message header then carries the full 22-bit local address
+(§5.5.1 Fig.10).
+
+The radio identity code (RIC, §3.1 Fig.1) is the full identity of a receiver,
+35 bits: zone (3), country (7), operator (3), initial address (18), batch
+number (4). It is never sent as one word: zone, country and operator are
+the network (system information), the initial address goes in the address
+partition, the batch number is the batch the page is sent in.
+
+Worked example, the NEC label `C63900`, computed by the program
+(`ermes_parse_address`, `ermes_print_address`):
+
+| Step                              | Value                                  |
+|-----------------------------------|----------------------------------------|
+| label (Tokyo hex)                 | `C63900`                               |
+| local address = label / 4         | `0x318E40` = 3247680                   |
+| batch = lowest 4 bits             | `0x0` = batch A                        |
+| initial address = upper 18 bits   | `0x318E4` = 202980                     |
+| RIC with network 2-1-2            | `010 0000001 010 110001100011100100 0000` |
+
+The log shows every address as `0x318E40 (NEC C63900), batch A`.
+
+## Network
+
+The network identity is sent in every batch (§5.3.1, Fig.5). A pager locks
+only to its home network: the zone, country and operator it was programmed
+with must match.
+
+| Option       | Bits | Range | Default | Sent in                               |
+|--------------|------|-------|---------|---------------------------------------|
+| `--zone`     | 3    | 0..7  | 2       | SSI type 0000 (zone/hour/date)        |
+| `--country`  | 7    | 0..127| 1       | system information, every batch       |
+| `--operator` | 3    | 0..7  | 2       | system information, every batch       |
+| `--pa`       | 6    | 0..63 | 0       | system information (paging area)      |
+| `--fsi`      | 5    | 0..30 | 30 (one channel) | system information (see Several channels) |
+
+Zone and country together are the 3-digit country number of ITU-T E.212
+annex A: the first digit is the zone, the last two the country (§5.3.1.1).
+The defaults, 2-1-2 and paging area 0, are the factory setting of NEC ERMES
+pagers, so a pager as delivered locks without options. The values may be
+given in decimal or 0x hex.
+
+Not settable, always 0: the border area indicator (BAI, §9.3) and the
+external traffic indicator (ETI, §9.4). The network is a home network only.
+
+Observed with an NEC PA3E6-1A: no lock with country 4 (2-4-2), lock with its
+home 2-1-2.
+
+## Channels
+
+Channels are numbered as in the 1997 edition (§8.2): channel n is
+169.400 + n * 0.025 MHz, n = 1..16. The 1992 edition and early pagers count
+from 0 at 169.425 MHz: their channel n is `-k n+1` here. `ermes -k list`
+prints the table.
+
+The batches are shifted from channel to channel (§4.1 Fig.3), so the time
+slot of a batch type depends on the channel. The program does this.
+
+| `-k` | Frequency (MHz) | 1992 number | First batch in a subsequence |
+|------|-----------------|-------------|------------------------------|
+| 1    | 169.425         | 0           | A                            |
+| 2    | 169.450         | 1           | B                            |
+| 3    | 169.475         | 2           | P                            |
+| 4    | 169.500         | 3           | C                            |
+| 5    | 169.525         | 4           | O                            |
+| 6    | 169.550         | 5           | D                            |
+| 7    | 169.575         | 6           | N                            |
+| 8    | 169.600         | 7           | E                            |
+| 9    | 169.625         | 8           | M                            |
+| 10   | 169.650         | 9           | F                            |
+| 11   | 169.675         | 10          | L                            |
+| 12   | 169.700         | 11          | G                            |
+| 13   | 169.725         | 12          | K                            |
+| 14   | 169.750         | 13          | H                            |
+| 15   | 169.775         | 14          | J                            |
+| 16   | 169.800         | 15          | I                            |
+
+Observed: the NEC PA3E6-1A with home channel 8 received on 169.625 MHz
+(`-k 9`), not on 169.600 MHz (`-k 8`).
+
+## Sending messages
+
+Pages come from four sources:
+
+| Source             | How                                                        |
+|--------------------|------------------------------------------------------------|
+| FIFO               | a named pipe, `/tmp/ermes_msg_send` by default (`--fifo <path>`); write one line per page |
+| `--fifo-file <f>`  | the lines of a file instead of the FIFO; the program ends when all are sent |
+| `--page <line>`    | one page, queued `--page-delay` seconds after start (default 30), so the pager can find the channel first; up to 16 |
+| call control       | the console (type the 7-digit local address, then `d`) or the Osmo-CC socket (`-o`) |
+
+A line has four fields, separated by commas:
+
+```
+address,type,options,message
+```
+
+- `address`: as in Addresses (`3247680`, `0x318E40`, `nec:C63900`).
+- `type`: `tone`, `numeric` or `alpha` (or `t`, `n`, `a`). Empty: `-y`.
+- `options`: space-separated `key=value` pairs, may be empty.
+- `message`: the rest of the line, commas included. Missing: `-M`.
+
+Only the address is required. Empty lines are skipped.
+
+Options of a line, and the command-line option that sets the default for
+lines without them:
+
+| Key                   | Range | Default | Command line                 | What it does |
+|-----------------------|-------|---------|------------------------------|--------------|
+| `priority`            | 1..3  | 2       | `--priority`                 | queue order: 1 before 2 before 3, arrival order within one priority (ETS 300 133-2 §4.3.2); nothing on the air |
+| `urgent`              | 0..1  | 0       | `--urgent` (sets 1)          | urgent message indicator, UMI (§5.5.1.1 Table 9) |
+| `alert`               | 0..7  | 0       | `--alert`                    | alert type (Table 9); what each type sounds like is up to the pager |
+| `charset`             | a codepage name | `--charset` | `--charset`       | codepage of an alphanumeric message (see Codepages) |
+| `retransmit`          | 0..15 | 0       | `--retransmit`               | times the page is sent again after the first, with the same number (ETS 300 133-2 §4.3.1.3.1) |
+| `retransmit_interval` | 1..3600 | 300   | `--retransmit-interval`      | seconds between the transmissions |
+
+Other command-line defaults: `-y` the type (default tone), `-M` the text
+(default empty). A command-line default applies to every page that does not
+set the key itself, whatever its type.
+
+A line with an error (bad address, type, option or a character without a
+code) is not queued; the log says why.
+
+Examples:
+
+```
+nec:C63900,alpha,,Call home
+nec:C63900,numeric,,0123 456-789
+nec:C63900,tone
+nec:C63900,tone,urgent=1 alert=3
+0x318E40,alpha,priority=1 urgent=1,Meeting at 10, room 2
+3247680,alpha,retransmit=2 retransmit_interval=60,Sent three times, one number
+```
+
+Write to the FIFO from a shell:
+
+```
+echo 'nec:C63900,alpha,,Hello' > /tmp/ermes_msg_send
+```
+
+or put the lines in a file and run with `--fifo-file pages.txt`.
+
+Call control: the console dials exactly 7 digits, the local address in
+decimal; it pages with type `-y` and the text `-M`. Addresses below 1000000
+need leading zeros there and are then read as octal or refused (see
+Addresses), so the
+console reaches only addresses 1000000 and up. Over the Osmo-CC socket the
+called number is the address and the caller ID, if any, is the text.
+
+### Message numbers
+
+Every page to an address gets the next message number, 1..31, then 1 again
+(ETS 300 133-2 §4.3.1.3; §5.5.1 Table 8). The pager checks the sequence and
+reports a missing number. The number is given when the page is first sent,
+not when it is queued: the numbers of an address go up on the air whatever
+the priorities. A retransmission keeps its number. The last number of every
+address is kept in the subscriber book across runs.
+
+### Long messages
+
+A message holds up to 1023 bytes of text (UTF-8: a character outside ASCII
+takes 2 or 3 bytes). When it does not fit in its batch, it runs on into the
+next batches, right after their address partition (§10.5). One batch in time
+slots 0..14 holds about 359 alphanumeric characters, the long last slot 451
+(computed by the batch builder, one address in the batch).
+
+Observed with the NEC PA3E6-1A: 500 characters over two batches and 1000
+characters over three arrived whole.
+
+## Message formats
+
+The paging category is sent in the message header (§5.5.1.1 Table 9).
+
+| Type      | Data                                 | Ends with |
+|-----------|--------------------------------------|-----------|
+| `tone`    | none: an alert only; a text is dropped | - |
+| `numeric` | 4 bits a character (ETS 300 133-2 Table B.1) | spaces fill the last codeword |
+| `alpha`   | 7 bits a character (Table B.3, or `--charset`) | EOM (DC1) and EOM fill (§5.5.4) |
+
+Numeric characters, the 16 codes of Table B.1:
+
+```
+0 1 2 3 4 5 6 7 8 9 / space U - . %
+```
+
+A lowercase `u` is sent as `U`. Any other character refuses the page.
+
+Transparent data (category 11) is part of the standard, but not offered:
+`-y` and the type field refuse it.
+
+Limits: 1023 bytes of text per message (above), numeric characters only in
+numeric pages, codepage characters only in alphanumeric pages.
+
+## Codepages
+
+Alphanumeric pages are coded with a codepage of 128 characters. The ERMES
+codepages:
+
+| Name                         | Bits | Use |
+|------------------------------|------|-----|
+| `generic-generic-standard`   | 7    | the ERMES character set, ETS 300 133-2 Table B.3: the default for alphanumeric pages |
+| `generic-generic-numeric`    | 4    | Table B.1: numeric pages always use it |
+
+- `--charset list` lists them.
+- `--charset-print <name>` prints a table, e.g.
+  `ermes --charset-print generic-generic-standard`.
+- `--charset <name>` sets the codepage of alphanumeric pages.
+- `charset=<name>` in a line sets it for that page.
+
+The standard table has ASCII letters, digits and most signs, LF and CR, and
+`@ £ $ ¥ è é ù ì ò ç Ø ø Å å Δ Φ Γ Λ Ω Π ψ Σ θ Ξ Æ æ ß É ¤ ¡ Ä Ö Ñ Ü § ¿ ä ö
+ñ ü à`. It has no `~`, `{`, `}`, `[`, `]`, `\`, `^`, `_`, `` ` `` or `|`, and no
+Cyrillic. A page with a character that is not in its codepage is refused.
+
+Use `generic-generic-numeric` only for numeric pages (they take it by
+themselves); as the codepage of an alphanumeric page it gives a wrong
+message.
+
+## Time and date
+
+The network sends the time in the supplementary system information (SSI,
+§5.3.2): type 0000 zone/hour/date and type 0001 day/month/year (Fig.7,
+Fig.8). Hour and date are local time; the zone is `--zone`. The batches
+are locked to UTC: the cycle number (0..59) is the UTC minute, a
+subsequence starts every 12 s (§4.1).
+
+| Option | Default | What it does |
+|--------|---------|--------------|
+| `--ssi hold` | hold | the network schedule: the hour starts with 0000 in every batch of its first subsequence, 0001 in the next, and so on by turns. This is what the Swiss (1997) and Dutch (2014) networks sent. |
+| `--ssi-hold <n>` | 1 | subsequences each type is held (5 = one minute, for tests) |
+| `--year-from <year>` | the real year | send the year moved by 28-year steps into `<year>`..`<year>+27`, for pagers whose calendar ends early; weekday and date stay right. Range 1990..2090. E.g. 1995: 2026 is sent as 1998. |
+| `--clock "YYYY-MM-DD HH:MM:SS"` | the system clock | run the network clock from this local time |
+| `--tx-latency <ms>` | the DSP buffer, `-b` (50 ms) | time from making a sample to sending it, so the batches are on time on the air |
+
+The other `--ssi` modes (`alternate`, `strict`, `pairs`, `cycle`,
+`zone-hour-date`, `day-month-year`) are for receiver tests only, not for a
+network. `cycle` sends the 13 SSI types of edition 2; edition 1 pagers
+cannot use it.
+
+The network behaves as an I1 version 01.00 network (§4.6): only SSI types
+0000 and 0001, no version (0010).
+
+What the NEC PA3E6-1A does with the time, as observed on the air (not from
+the standard, which does not say when a receiver takes the time):
+
+- Before the first lock it shows `--:--`.
+- At acquisition it takes the minute from the cycle number and one SSI
+  value: 0000 gives the hour (the weekday stays Mo), 0001 the weekday (the
+  hour stays 0). Its own clock then runs on.
+- The hour appeared complete only after the network had run across a full
+  hour (three cases). Most likely it takes the hour at the top of the hour,
+  when subsequence 0 carries 0000; not confirmed.
+- The 13-type `cycle` gave it neither value.
 
 ## Subscriber book
 

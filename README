@@ -33,6 +33,7 @@ Additionally the following communication services are implemented:
  * C-Netz SIM emulator
  * C-Netz magnetic card emulator
  * FLEX paging transmitter / receiver
+ * ERMES paging transmitter (see docs/ERMES.md)
  * Mobitex transmitter / receiver
  * FM broadcast radio with stereo and RDS (osmoradio, see docs/OSMORADIO.md)
  * SDR clock calibration from GSM FCCH (osmocalibrate)
@@ -272,6 +273,7 @@ Documentation
    docs/NMT_ONAIR_TESTS.md                    NMT additions
  * docs/AMPS_IMPLEMENTATION_STATUS.md         AMPS / TACS
  * docs/FLEX_INFO_SERVICE_TEST.md             FLEX
+ * docs/ERMES.md                              ERMES pager network
 
 
 Acknowledgements:
