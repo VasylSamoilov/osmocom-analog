@@ -158,6 +158,7 @@ typedef struct sdr {
 	 * DC by lo_*.band_shift */
 	int		band_rx_init, band_tx_init;
 	channelizer_t	band_rx, band_tx;
+	int		band_rx_pass;	/* band_rx has nothing to do (SDR rate = DSP rate, no shift): the ring as it is */
 	/* engine mode: filter banks shared by all channels, run by the device
 	 * threads; the program's channels are one group (docs/SDR-BACKEND.md) */
 	int		use_engine;
@@ -1052,6 +1053,8 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 			goto error;
 		}
 		sdr->band_rx_init = 1;
+		/* no stage, no NCO step: its output is its input, bit for bit */
+		sdr->band_rx_pass = (sdr->band_rx.hb_stages == 0 && !sdr->band_rx.use_resamp && sdr->band_rx.offset == 0.0);
 	}
 
 	/* RX IQ wave recording / playback at the SDR rate (the signal from the device) */
@@ -1699,10 +1702,17 @@ static void *sdr_read_child(void *arg)
 					}
 				}
 
-				for (s = 0, ss = 0; s < count; s++) {
-					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];
-					sdr->thread_read.buffer[in++] = sdr->thread_read.buffer2[ss++];
-					in %= sdr->thread_read.buffer_size;
+				/* into the ring: up to its end, the rest from its start */
+				{
+					int first = (sdr->thread_read.buffer_size - in) / 2;
+
+					if (first > count)
+						first = count;
+					/* the volatile only orders the index updates (with
+					 * __sync_synchronize); the samples are plain copies */
+					memcpy((float *)sdr->thread_read.buffer + in, sdr->thread_read.buffer2, first * 2 * sizeof(float));
+					memcpy((float *)sdr->thread_read.buffer, sdr->thread_read.buffer2 + first * 2, (count - first) * 2 * sizeof(float));
+					in = (in + count * 2) % sdr->thread_read.buffer_size;
 				}
 				__sync_synchronize();  /* Memory barrier to ensure writes are visible */
 				sdr->thread_read.in = in;
@@ -2159,6 +2169,10 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 		need = sdr->rx_max_in;
 	take = (avail < need) ? avail : need;
 	out = sdr->thread_read.out;
+	/* the band passes unchanged: straight from the ring to the caller, the
+	 * status and the displays below see the same samples there */
+	if (!channels && !sdr->band_client && sdr->band_rx_pass)
+		lin = (float *)samples;
 	{
 		int first = (sdr->thread_read.buffer_size - out) / 2;	/* IQ pairs up to the end of the ring */
 
@@ -2256,6 +2270,9 @@ int sdr_read(void *inst, sample_t **samples, int num, int channels, double *rf_l
 				o[2 * s] = sdr->eng_i[0][s];
 				o[2 * s + 1] = sdr->eng_q[0][s];
 			}
+		} else if (sdr->band_rx_pass) {
+			/* in the caller's buffer already */
+			count = take;
 		} else {
 			count = channelizer_rx_process(&sdr->band_rx, lin, take, num, sdr->ch_i, sdr->ch_q);
 			for (s = 0; s < count; s++) {

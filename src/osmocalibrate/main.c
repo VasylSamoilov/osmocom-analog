@@ -312,6 +312,9 @@ int main(int argc, char *argv[])
 	/* no LO offset (as before): calibration looks at the device itself */
 	sdr_config->lo_offset = 0.0;
 	sdr_config->lo_offset_given = 1;
+	/* no IQ level counters (nobody shows them here, they cost a pass over
+	 * every sample); --sdr-iq-status on to have them */
+	sdr_config->iq_status = 0;
 	calibrate_config_default(&config);
 
 	add_options();

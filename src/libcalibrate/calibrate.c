@@ -27,7 +27,6 @@
 #include "../libchannelizer/channelizer.h"
 #include "../libpolyphase/polyphase.h"
 #include "../libfastmath/fastmath.h"
-#include "../libiqringbuf/iqringbuf.h"
 #include "../libsample/sample.h"
 #include "../libsdr/sdr_config.h"
 #include "../liblogging/logging.h"
@@ -477,11 +476,13 @@ static double running_median(const float *values, int count)
 
 static void *calib_sdr;		/* libsdr instance, the whole band (channels = 0) */
 static int calib_sdr_chunk;	/* its buffer_size: most samples per sdr_read() */
+static int calib_rate;		/* its rate (sleeps while the ring fills) */
 
 void calibrate_set_sdr(void *sdr, int buffer_size)
 {
 	calib_sdr = sdr;
 	calib_sdr_chunk = buffer_size;
+	calib_rate = sdr ? sdr_get_samplerate(sdr) : 0;
 }
 
 /* IQ from libsdr's RX ring (interleaved float at the DSP rate): what is
@@ -520,20 +521,28 @@ static int calib_block_samples(int samplerate)
 	return (n > 100000) ? 100000 : n;
 }
 
-/* Blocking receive: retries until buffer is full (used by scan phase) */
+/* Blocking receive: until the buffer is full, or 100 ms without a sample.
+ * Sleeps for the time the missing samples take (at most 20 ms): few large
+ * reads, no polling of the ring. */
 static int receive_iq_blocking(float *buffer, int max_samples)
 {
-	int total = 0, retries = 0;
-	const int max_retries = 100;
-	while (total < max_samples && retries < max_retries) {
+	int total = 0;
+	double idle = 0.0;
+
+	while (total < max_samples && idle < 0.1) {
 		int got = receive_iq(buffer + total * 2, max_samples - total);
 		if (got > 0) {
 			total += got;
-			retries = 0;
-		} else {
-			usleep(1000);
-			retries++;
+			idle = 0.0;
+			continue;
 		}
+		double wait = (calib_rate > 0) ? (double)(max_samples - total) / calib_rate : 0.001;
+		if (wait > 0.02)
+			wait = 0.02;
+		if (wait < 0.001)
+			wait = 0.001;
+		usleep((useconds_t)(wait * 1e6));
+		idle += wait;
 	}
 	return total;
 }
@@ -1744,27 +1753,10 @@ static int detect_on_arfcn(int samplerate, int gsm_band, calibrate_config_t *con
 		return -ENOMEM;
 	}
 
-	/* Flush stale samples from SDR (direct read, before ring buffer) */
+	/* Flush stale samples from SDR */
 	flush_rx(iq_buffer, buffer_samples, samplerate);
 
-	/* Start threaded ring buffer reader.
-	 * 1 second of buffering absorbs processing jitter at any sample rate.
-	 * Chunk size 8192 balances USB transfer efficiency vs latency. */
-	iqringbuf_t rb;
-	rc = iqringbuf_init(&rb, 1.0, samplerate, 8192, receive_iq);
-	if (rc < 0) {
-		free(iq_buffer); free(ch_iq); free(mix_i); free(mix_q);
-		cleanup_channels(channels, num_channels);
-		return -ENOMEM;
-	}
-	rc = iqringbuf_start(&rb);
-	if (rc < 0) {
-		iqringbuf_free(&rb);
-		free(iq_buffer); free(ch_iq); free(mix_i); free(mix_q);
-		cleanup_channels(channels, num_channels);
-		return -ENOMEM;
-	}
-
+	/* libsdr's read thread drains the device into its ring meanwhile */
 	time_t start_time = time(NULL);
 	int max_reads = 5000;
 	int logged_channels = 0;
@@ -1820,8 +1812,8 @@ static int detect_on_arfcn(int samplerate, int gsm_band, calibrate_config_t *con
 			break;
 		}
 
-		/* Read from ring buffer — never blocks the SDR */
-		samples_received = iqringbuf_read(&rb, iq_buffer, buffer_samples);
+		/* from libsdr's ring (its read thread never blocks the SDR) */
+		samples_received = receive_iq_blocking(iq_buffer, buffer_samples);
 		if (samples_received < buffer_samples / 2) {
 			total_reads++;
 			continue;
@@ -2034,15 +2026,6 @@ static int detect_on_arfcn(int samplerate, int gsm_band, calibrate_config_t *con
 	free(ch_iq);
 	free(mix_i);
 	free(mix_q);
-
-	/* Stop ring buffer reader thread */
-	iqringbuf_stop(&rb);
-	if (rb.overflows > 0)
-		LOGP(DSDR, LOGL_NOTICE,
-		     "Ring buffer: %d overflows (%.1f%% data loss)\n",
-		     rb.overflows,
-		     100.0 * rb.overflows / (rb.total_read > 0 ? rb.total_read : 1));
-	iqringbuf_free(&rb);
 
 	/* Final stats */
 	int detector_found_total = 0;

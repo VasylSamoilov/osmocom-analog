@@ -761,10 +761,47 @@ static void test_refusals(void)
 	}
 }
 
+/* SDR rate = DSP rate, no offset: no stage, the output is the input bit for
+ * bit (libsdr passes the band through then, channels = 0, without it) */
+static void test_rx_identity(int rate)
+{
+	channelizer_t ch;
+	int n = 4096, blk = 1000, got = 0, s, same = 1;
+	float *iq = malloc(n * 2 * sizeof(*iq));
+	sample_t *oi = malloc(n * sizeof(*oi)), *oq = malloc(n * sizeof(*oq));
+
+	printf("RX identity at %d Hz (no stage, no shift):\n", rate);
+	for (s = 0; s < 2 * n; s++)
+		iq[s] = (float)(sin(0.37 * s) * 0.7 + ((s % 7) - 3) * 1e-7);
+	iq[5] = -0.0f;
+	if (channelizer_rx_init(&ch, rate, rate, 0.0, 2.0 * CHANNELIZER_PASS * rate, blk) < 0) {
+		printf("  init: %s\n", channelizer_error());
+		failures++;
+		goto out;
+	}
+	check(ch.hb_stages == 0 && !ch.use_resamp, "no stage (1 = yes)", ch.hb_stages == 0 && !ch.use_resamp, "");
+	while (got < n) {
+		int k = (n - got < blk) ? n - got : blk;
+
+		got += channelizer_rx_process(&ch, iq + 2 * got, k, k, oi + got, oq + got);
+	}
+	for (s = 0; s < n; s++)
+		if ((float)oi[s] != iq[2 * s] || (float)oq[s] != iq[2 * s + 1])
+			same = 0;
+	check(same, "output = input, every sample (1 = yes)", same, "");
+	channelizer_exit(&ch);
+out:
+	free(iq);
+	free(oi);
+	free(oq);
+}
+
 int main(void)
 {
 	printf("=== libchannelizer tests ===\n\n");
 	test_halfband();
+	test_rx_identity(1000000);
+	test_rx_identity(2400000);
 	test_refusals();
 	/* integer ratios */
 	test_rx(960000, 96000, -315000, 36000);
