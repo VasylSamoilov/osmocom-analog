@@ -11,6 +11,7 @@ ermes_SOURCES = \
 	queue.c \
 	ssi.c \
 	scheduler.c \
+	rx.c \
 	ermes.c \
 	image.c \
 	main.c

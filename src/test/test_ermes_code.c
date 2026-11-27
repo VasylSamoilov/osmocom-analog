@@ -9,6 +9,8 @@
 #include "../libfilter/iir_filter.h"
 #include "../ermes/code.h"
 #include "../ermes/frame.h"
+#include "../ermes/rx.h"
+#include "../libpagercharset/pager_charset.h"
 
 static int failed;
 
@@ -451,8 +453,204 @@ static void test_continuation(void)
 	printf("continuation done (%d characters = %d codewords over %d batches)\n", 600, nall, batches);
 }
 
+/*
+ * Receiver (rx.c): the encoder's own batches in, the pages out
+ */
+
+#define RX_MAX	64
+static ermes_rx_msg_t rx_got[RX_MAX];
+static int rx_ngot, rx_nbatch, rx_verbose;
+
+static void rx_batch_cb(void __attribute__((unused)) *priv, const ermes_rx_batch_t *b)
+{
+	rx_nbatch++;
+	if (rx_verbose)
+		printf("  batch %c cycle %d ssn %d: country %d op %d ETI %d FSI %d, I %d J %d/%d K %d, %d corrected, %d in error, %d unreadable, fill %d%s%s\n",
+		       'A' + b->batch, b->cycle, b->ssn, b->country, b->operator, b->eti, b->fsi, b->ia_count, b->apt,
+		       b->apt_expected, b->codeblocks, b->corrected, b->bad, b->unreadable, b->fill, b->si_ok ? "" : " SI BAD",
+		       b->flywheel ? " (no sync, on timing)" : "");
+}
+
+static void rx_msg_cb(void __attribute__((unused)) *priv, const ermes_rx_batch_t __attribute__((unused)) *b, const ermes_rx_msg_t *m)
+{
+	if (rx_verbose)
+		printf("  %s\n", ermes_rx_msg_str(m));
+	if (rx_ngot < RX_MAX)
+		rx_got[rx_ngot++] = *m;
+}
+
+static const ermes_rx_msg_t *rx_find(uint32_t la, int kind)
+{
+	int i;
+
+	for (i = 0; i < rx_ngot; i++) {
+		if (rx_got[i].local_address == la && (int)rx_got[i].kind == kind)
+			return &rx_got[i];
+	}
+	return NULL;
+}
+
+/* flip n bits of codeword w of the message partition of a batch (after interleaving: bit b of a
+ * codeword in codeblock k is at column-major position) */
+static void flip_partition(uint8_t *b, int first, int w, int nbits)
+{
+	int k = w / 9, row = w % 9, col;
+
+	for (col = 0; col < nbits; col++)
+		b[(first + 9 * k) * 30 + (5 + 7 * col) * 9 + row] ^= 1;
+}
+
+static void test_rx(void)
+{
+	static uint8_t b[190 * 30], stream[40 * 190 * 30];
+	static char longtext[601];
+	ermes_network_t net = { .zone = 2, .country = 1, .operator = 2, .pa = 0, .bai = 0, .fsi = 30 };
+	ermes_ssi_t ssi = { .ssit = 0, .ssif = 0 };
+	ermes_carry_t carry = { .count = 0 };
+	ermes_batch_time_t t;
+	ermes_rx_t rx;
+	const ermes_rx_msg_t *m;
+	int slot, i, n, len, rc, pos = 0, numeric_batch = -1;
+	uint32_t seed = 1;
+	/* pages that need their own batch type (initial address), and two that go in any batch */
+	ermes_page_t pages[] = {
+		{ .local_address = 0x318E40, .number = 1, .category = ERMES_CAT_ALPHA, .text = "Hello NEC" },
+		{ .local_address = 0x000011, .number = 3, .category = ERMES_CAT_NUMERIC, .text = "0123456789" },
+		{ .local_address = 0x000022, .number = 2, .category = ERMES_CAT_TONE, .alert = 5, .urgent = 1 },
+		{ .local_address = 0x000033, .number = 7, .category = ERMES_CAT_ALPHA, .text = longtext },
+		{ .local_address = 0x000044, .number = 1, .category = ERMES_CAT_ALPHA, .text = "visitor", .external = 1, .opid = (2 << 10) | (1 << 3) | 3 },
+		{ .local_address = 0x000055, .number = 9, .last_number = 1 },
+		{ .local_address = 0x000066, .number = 4, .category = ERMES_CAT_ALPHA, .group_pointer = 4, .ia_only = 0 },
+		{ .local_address = 0x000077, .number = 6, .category = ERMES_CAT_NUMERIC, .text = "555123" },
+	};
+	ermes_page_t cta = { .local_address = (ERMES_CTA_IA << 4) | 3, .number = 0, .category = ERMES_CAT_ALPHA, .text = "group text" };
+	int npages = sizeof(pages) / sizeof(pages[0]);
+
+	for (i = 0; i < 600; i++)
+		longtext[i] = 'a' + i % 26;
+	longtext[600] = '\0';
+
+	/* noise first: no lock on it */
+	for (i = 0; i < 20000; i++) {
+		seed = seed * 1103515245 + 12345;
+		stream[pos++] = (seed >> 16) & 1;
+	}
+	/* two subsequences on channel 9: the pages in the batches of their type, the group text in
+	 * the batch after the pointer's */
+	for (n = 0; n < 32; n++) {
+		ermes_page_t sel[4];
+		int nsel = 0;
+
+		slot = n % 16;
+		t.cycle = 20;
+		t.ssn = n / 16;
+		t.slot = slot;
+		t.batch = ermes_channel_batch(9, slot);
+		if (n < 16) {
+			for (i = 0; i < npages; i++) {
+				if (ermes_address_batch(pages[i].local_address) == t.batch)
+					sel[nsel++] = pages[i];
+			}
+		}
+		if (n == 16 + 2)
+			sel[nsel++] = cta;
+		rc = ermes_build_batch(&net, &t, &ssi, sel, nsel, &carry, b);
+		CHECK(rc == nsel, "batch %c built %d of %d", 'A' + t.batch, rc, nsel);
+		len = ermes_batch_length(slot);
+		/* bit errors: 2 in the system information (corrected) */
+		if (n == 1) {
+			b[3 * 30 + 3] ^= 1;
+			b[3 * 30 + 17] ^= 1;
+		}
+		/* 3 in the numeric page's second data codeword (§7.5: no digit from there on) */
+		for (i = 0; i < nsel; i++) {
+			uint32_t cw[190], w1, w2;
+			int first = 5 + nsel + ermes_apt_count(nsel), k, nw;
+
+			if (sel[i].local_address != 0x000077)
+				continue;
+			nw = partition_words(b, slot, nsel, cw);
+			for (k = 0; k + 3 < nw; k++) {
+				w1 = cw[k];
+				w2 = cw[k + 1];
+				if (ermes_bch_decode(&w1) == 0 && ermes_bch_decode(&w2) == 0
+				 && (w1 >> 12) == (0x000077 >> 4) && (w2 >> 26) == 7)
+					break;
+			}
+			CHECK(k + 3 < nw, "numeric page found in its batch");
+			flip_partition(b, first, k + 3, 3);
+			numeric_batch = n;
+		}
+		memcpy(stream + pos, b, len * 30);
+		pos += len * 30;
+	}
+	(void)numeric_batch;
+
+	rx_ngot = rx_nbatch = 0;
+	ermes_rx_init(&rx, 9, &pager_charset_ermes_generic_generic_standard, NULL, rx_batch_cb, rx_msg_cb);
+	for (i = 0; i < pos; i++)
+		ermes_rx_bit(&rx, stream[i]);
+	CHECK(rx_nbatch == 32, "%d batches decoded, 32 sent", rx_nbatch);
+
+	m = rx_find(0x318E40, ERMES_RX_MESSAGE);
+	CHECK(m && m->number == 1 && !strcmp(m->text, "Hello NEC") && m->eom && !m->no_ia, "alpha to the NEC: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x000011, ERMES_RX_MESSAGE);
+	CHECK(m && m->category == ERMES_CAT_NUMERIC && !strcmp(m->text, "0123456789"), "numeric: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x000022, ERMES_RX_MESSAGE);
+	CHECK(m && m->category == ERMES_CAT_TONE && m->alert == 5 && m->urgent, "tone: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x000033, ERMES_RX_MESSAGE);
+	CHECK(m && !strcmp(m->text, longtext) && m->batches >= 2, "long text over batches: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x000044, ERMES_RX_MESSAGE);
+	CHECK(m && m->external && m->opid == pages[4].opid && !strcmp(m->text, "visitor"), "visitor: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x000055, ERMES_RX_LAST_NUMBER);
+	CHECK(m && m->number == 9, "lastnum: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x000066, ERMES_RX_POINTER);
+	CHECK(m && m->ain == 3 && m->number == 4, "pointer: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(cta.local_address, ERMES_RX_GROUP);
+	CHECK(m && !strcmp(m->text, "group text") && m->members == 1 && m->member[0] == 0x000066 && m->member_number[0] == 4,
+	      "group text with its member: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x000077, ERMES_RX_MESSAGE);
+	CHECK(m && m->truncated && strlen(m->text) < 6 && !strncmp(m->text, "555123", strlen(m->text)),
+	      "numeric with a codeword in error cut (§7.5): %s", m ? ermes_rx_msg_str(m) : "missing");
+	CHECK(rx_ngot == npages + 1, "%d messages, %d sent", rx_ngot, npages + 1);
+	printf("receiver done (%d batches, %d messages)\n", rx_nbatch, rx_ngot);
+}
+
+/* ERMES_RX_FILE=x.bits (ASCII 0/1) or x.sym (bytes 0..3 = lowest..highest level) [ERMES_RX_CHANNEL]:
+ * decode a capture, print everything */
+static void test_rx_file(const char *file)
+{
+	static const int level_dibit[4] = { 0, 1, 3, 2 };
+	ermes_rx_t rx;
+	FILE *fp = fopen(file, "rb");
+	int c, sym = strstr(file, ".sym") != NULL;
+
+	if (!fp) {
+		printf("cannot open %s\n", file);
+		failed++;
+		return;
+	}
+	rx_verbose = 1;
+	rx_ngot = rx_nbatch = 0;
+	ermes_rx_init(&rx, getenv("ERMES_RX_CHANNEL") ? atoi(getenv("ERMES_RX_CHANNEL")) : 0,
+		      &pager_charset_ermes_generic_generic_standard, NULL, rx_batch_cb, rx_msg_cb);
+	while ((c = fgetc(fp)) != EOF) {
+		if (sym)
+			ermes_rx_dibit(&rx, level_dibit[c & 3]);
+		else if (c == '0' || c == '1')
+			ermes_rx_bit(&rx, c - '0');
+	}
+	fclose(fp);
+	printf("%s: %d batches, %d messages%s\n", file, rx.batches, rx.messages,
+	       rx.inverted_seen ? " (a sync was seen with inverted polarity)" : "");
+}
+
 int main(void)
 {
+	if (getenv("ERMES_RX_FILE")) {
+		test_rx_file(getenv("ERMES_RX_FILE"));
+		return failed ? 1 : 0;
+	}
 	test_bch_vectors();
 	test_bch_correction();
 	test_fixed_words();
@@ -463,6 +661,7 @@ int main(void)
 	test_premodulation_filter();
 	test_frame();
 	test_continuation();
+	test_rx();
 	if (failed) {
 		printf("%d check(s) FAILED\n", failed);
 		return 1;
