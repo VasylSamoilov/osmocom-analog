@@ -796,24 +796,33 @@ static int uhd_usb_reset(const char *serial)
 #define TEST_TX_PROBE_FAIL 0	/* test: the first start's TX probe fails */
 #endif
 
-/* Does TX take a write? One packet of zeros as a burst of its own (no time
- * stamp, start and end of burst), before streaming starts. A broken USB
- * transfer fails it at once. 0: it does; what: UHD's reason. */
+/* Does TX work end to end? A burst of zeros (no time stamp, start and end
+ * of burst) of 100 ms, at least 64 packets - far more than UHD's USB send
+ * frames, so the transfers really go out - then the device's end of burst
+ * ACK is awaited (1 s). A send only queues into the send frames and returns
+ * at once: a broken USB transfer (a device that kept it from an earlier
+ * run) shows as an error at a later send or as a missing ACK. Before
+ * streaming starts. 0: it works; what: the reason. */
 static int uhd_tx_probe(char *what, size_t len)
 {
 	const void *buffs_ptr[1];
 	uhd_tx_metadata_handle md = NULL;
-	size_t mtu = 0, count = 0;
+	uhd_async_metadata_handle amd = NULL;
+	size_t mtu = 0, count = 0, total;
 	uhd_error error;
 	float *zero;
-	int rc = 0;
+	int rc = 0, acked = 0, events = 0;
+	double t0;
 
 	what[0] = '\0';
 	if (!uhd_tx_inst || !uhd_tx_inst->tx_streamer)
 		return 0;
 	if (uhd_tx_streamer_max_num_samps(uhd_tx_inst->tx_streamer, &mtu) || !mtu)
 		return 0;
-	zero = calloc(mtu * 2, sizeof(float));
+	total = (size_t)(uhd_tx_inst->samplerate * 0.1);
+	if (total < 64 * mtu)
+		total = 64 * mtu;
+	zero = calloc(total * 2, sizeof(float));
 	if (!zero)
 		return 0;
 	if (uhd_tx_metadata_make(&md, false, 0, 0.0, true, true)) {
@@ -821,7 +830,23 @@ static int uhd_tx_probe(char *what, size_t len)
 		return 0;
 	}
 	buffs_ptr[0] = zero;
-	error = uhd_tx_streamer_send(uhd_tx_inst->tx_streamer, buffs_ptr, mtu, &md, 0.5, &count);
+	error = uhd_tx_streamer_send(uhd_tx_inst->tx_streamer, buffs_ptr, total, &md, 1.0, &count);
+	/* the ACK of the burst's end (any other event, e.g. an underflow of
+	 * this burst, is not a broken transport) */
+	if (!error && count == total && !uhd_async_metadata_make(&amd)) {
+		t0 = uhd_mono_time();
+		while (!acked && uhd_mono_time() - t0 < 1.0) {
+			uhd_async_metadata_event_code_t code;
+			bool valid = false;
+
+			if (uhd_tx_streamer_recv_async_msg(uhd_tx_inst->tx_streamer, &amd, 0.1, &valid) || !valid)
+				continue;
+			events++;
+			if (!uhd_async_metadata_event_code(amd, &code) && code == UHD_ASYNC_METADATA_EVENT_CODE_BURST_ACK)
+				acked = 1;
+		}
+		uhd_async_metadata_free(&amd);
+	}
 #if TEST_TX_PROBE_FAIL
 	{
 		static int failed;
@@ -833,13 +858,19 @@ static int uhd_tx_probe(char *what, size_t len)
 		}
 	}
 #endif
-	if (error) {
+	if (rc) {
+		/* the test's failure */
+	} else if (error) {
 		uhd_tx_streamer_last_error(uhd_tx_inst->tx_streamer, what, len);
 		rc = -1;
-	} else if (count == 0 && !rc) {
-		snprintf(what, len, "nothing sent within 0.5 s");
+	} else if (count < total) {
+		snprintf(what, len, "%zu of %zu probe samples sent within 1 s", count, total);
 		rc = -1;
-	}
+	} else if (!acked) {
+		snprintf(what, len, "no end of burst ACK within 1 s (%d other events)", events);
+		rc = -1;
+	} else
+		LOGP(DUHD, LOGL_INFO, "TX probe: %zu samples sent, end of burst ACK received\n", total);
 	uhd_tx_metadata_free(&md);
 	free(zero);
 	return rc;
