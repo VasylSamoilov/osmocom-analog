@@ -264,6 +264,11 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 	uint32_t msg[MAX_MSG_WORDS];	/* message partition codewords before interleaving */
 	uint32_t whole[ERMES_MAX_MSG_WORDS + 3];
 	int order[ERMES_MAX_IA];	/* the pages with an initial address in this batch */
+	uint32_t stage[MAX_MSG_WORDS];	/* the messages of this batch, in the order they were taken */
+	struct {
+		int page, off, len;
+	} placed[ERMES_MAX_IA];		/* each one's page and words in stage[] */
+	int nstage = 0, nplaced = 0;
 	int i, j, k, n = 0, nmsg, sent, nia, ia, cap, num_cb, nwhole, room, carried = 0, pad;
 
 	if (t->slot < 0 || t->slot >= ERMES_BATCHES || t->batch < 0 || t->batch >= ERMES_BATCHES)
@@ -328,16 +333,30 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 		cap = ermes_max_codeblocks(t->slot, nia + ia) * ERMES_CODEBLOCK_CW;
 		room = cap - nmsg;
 		if (nwhole <= room) {
-			memcpy(msg + nmsg, whole, nwhole * sizeof(uint32_t));
+			memcpy(stage + nstage, whole, nwhole * sizeof(uint32_t));
+			placed[nplaced].page = i;
+			placed[nplaced].off = nstage;
+			placed[nplaced++].len = nwhole;
+			nstage += nwhole;
 			nmsg += nwhole;
 			if (ia)
 				order[nia++] = i;
 			sent++;
 			continue;
 		}
-		/* runs on: the header and at least one data word here, the rest in the next batches */
-		if (carry && room >= 3) {
-			memcpy(msg + nmsg, whole, room * sizeof(uint32_t));
+		/* runs on: the header and at least one data word here, the rest in the next batches. It
+		 * is the last message of the batch, so (in ascending order, below) only when no message
+		 * of a higher local address is placed; otherwise it waits for a later batch */
+		for (j = 0, k = 1; j < nplaced; j++) {
+			if (pages[placed[j].page].local_address > pages[i].local_address)
+				k = 0;
+		}
+		if (carry && room >= 3 && k) {
+			memcpy(stage + nstage, whole, room * sizeof(uint32_t));
+			placed[nplaced].page = i;
+			placed[nplaced].off = nstage;
+			placed[nplaced++].len = room;
+			nstage += room;
 			nmsg += room;
 			memcpy(carry->cw, whole + room, (nwhole - room) * sizeof(uint32_t));
 			carry->count = nwhole - room;
@@ -346,6 +365,23 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 			sent++;
 		}
 		break;
+	}
+
+	/* the messages in ascending order of local address (several of one address in the order they
+	 * came, i.e. of their numbers). The standard sets no order (§5.5), but receivers stop
+	 * searching at a message to a higher local address than their own: the NEC PA3E6-1A missed
+	 * its message behind messages to higher addresses and found it behind lower ones (on air
+	 * 2026-11-27). A message that runs on is the highest and stays last. */
+	for (i = 1; i < nplaced; i++) {
+		for (j = i; j > 0 && pages[placed[j - 1].page].local_address > pages[placed[j].page].local_address; j--) {
+			k = placed[j].page; placed[j].page = placed[j - 1].page; placed[j - 1].page = k;
+			k = placed[j].off; placed[j].off = placed[j - 1].off; placed[j - 1].off = k;
+			k = placed[j].len; placed[j].len = placed[j - 1].len; placed[j - 1].len = k;
+		}
+	}
+	for (i = 0, k = nmsg - nstage; i < nplaced; i++) {
+		memcpy(msg + k, stage + placed[i].off, placed[i].len * sizeof(uint32_t));
+		k += placed[i].len;
 	}
 
 	/* a batch with a message (or the rest of one) but no initial address gets a PAD: an initial

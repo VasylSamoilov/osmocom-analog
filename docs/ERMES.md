@@ -304,6 +304,20 @@ group texts (or all of them) and then missed its own pages for minutes, and
 PDW's decoder showed no group message at all. With it both get the full text
 (tested with 40 and 70 characters, one and two members).
 
+## Order of messages in a batch
+
+The initial addresses go highest first (§5.4). For the messages the standard
+sets no order, but receivers expect them **lowest local address first**: the
+NEC PA3E6-1A stops searching at the first message to a higher address than
+its own. Tested on air: its message behind messages to higher addresses was
+lost (with 3 to 35 addresses in the batch, tone or alpha), behind messages
+to lower addresses it arrived (also as number 18 of 35). So the messages of
+a batch go out in ascending order of local address; several to one receiver
+keep the order of their numbers. A message that does not fit and runs on into
+the next batch must be the last one, so it runs on only when no higher
+address follows; otherwise it waits for the receiver's next batch. A batch
+takes up to 139 initial addresses (Table 1), as many as fit.
+
 ## Message formats
 
 The paging category is sent in the message header (§5.5.1.1 Table 9).

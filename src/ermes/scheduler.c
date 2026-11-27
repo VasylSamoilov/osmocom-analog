@@ -31,7 +31,7 @@
 #include "scheduler.h"
 
 #define CHAN ermes->sender.kanal
-#define MAX_PAGES	32	/* initial addresses per batch we fill */
+#define MAX_PAGES	ERMES_MAX_IA	/* pages per batch: as many as it has initial addresses (Table 1) */
 
 double ermes_clock_offset = 0.0;
 double ermes_tx_latency = -1.0;	/* < 0: dsp_buffer */
