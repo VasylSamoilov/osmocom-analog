@@ -1410,13 +1410,11 @@ int sdr_select_rate(double required_bandwidth, int *dsp_samplerate)
 	return 1;
 }
 
-/* The USB speed (Mbit/s, from sysfs) of the SDR on the bus: the fastest of
- * the known SDR vendors' devices (Ettus, Realtek RTL2832, Great Scott /
- * Airspy, Lime, Nuand); 0 if none is found (a network device, another
- * vendor). */
-static int sdr_usb_speed(void)
+/* The USB speed (Mbit/s, from sysfs) of the SDR on the bus: the slowest of
+ * the devices of these vendors (USB vendor IDs); 0 if none is found (a
+ * network device, another vendor). */
+static int sdr_usb_speed(const char *const *vendors)
 {
-	static const char *vendors[] = { "2500", "0bda", "1d50", "0403", "2cf0", NULL };
 	DIR *dir = opendir("/sys/bus/usb/devices");
 	struct dirent *de;
 	int best = 0;
@@ -1443,7 +1441,7 @@ static int sdr_usb_speed(void)
 		fp = fopen(path, "r");
 		if (!fp)
 			continue;
-		if (fgets(buf, sizeof(buf), fp) && atoi(buf) > best)
+		if (fgets(buf, sizeof(buf), fp) && atoi(buf) > 0 && (!best || atoi(buf) < best))
 			best = atoi(buf);
 		fclose(fp);
 	}
@@ -1479,7 +1477,22 @@ int sdr_rx_widest_rate(int base, int max_wanted, sdr_rate_widest_t *info)
 	/* the bus: bytes per sample on the wire (8 bit IQ for the RTL2832, 16 bit
 	 * else), what a USB 2 / 3 link carries in practice, half of it used */
 	bytes = (sdr_config->soapy && strstr(sdr_config->device_args, "rtlsdr")) ? 2 : 4;
-	speed = sdr_usb_speed();
+	{
+		/* the device's vendor (Ettus, Realtek RTL2832, Lime / Great Scott
+		 * / Airspy, Nuand); not known: all of them, the slowest */
+		static const char *const ettus[] = { "2500", NULL }, *const rtl[] = { "0bda", NULL },
+			*const lime[] = { "1d50", "0403", NULL },
+			*const any[] = { "2500", "0bda", "1d50", "0403", "2cf0", NULL };
+		const char *const *v = any;
+
+		if (sdr_config->uhd)
+			v = ettus;
+		else if (strstr(sdr_config->device_args, "rtlsdr"))
+			v = rtl;
+		else if (strstr(sdr_config->device_args, "lime"))
+			v = lime;
+		speed = sdr_usb_speed(v);
+	}
 	if (speed >= 5000)
 		practical = 300e6;
 	else
@@ -1506,6 +1519,16 @@ int sdr_rx_widest_rate(int base, int max_wanted, sdr_rate_widest_t *info)
 
 			if (r <= max_wanted && r <= dev_max && r <= bus_max && r >= base && r > best)
 				best = (int)r;
+		}
+		/* none that small (an RTL2832 lists 1.024 MS/s, not 1): the
+		 * smallest above it within the limits */
+		if (!best) {
+			for (i = 0; i < rates.num_rates; i++) {
+				double r = rates.rates[i];
+
+				if (r > max_wanted && r <= dev_max && r <= bus_max && (!best || r < best))
+					best = (int)r;
+			}
 		}
 	}
 	sdr_rate_info_free(&rates);

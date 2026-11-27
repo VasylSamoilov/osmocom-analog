@@ -324,15 +324,16 @@ static int window_capacity(int samplerate)
 	return 2 * ((int)floor((reach - CHANNEL_SPACING / 2.0) / CHANNEL_SPACING) + 1);
 }
 
-/* Blocking receive: until the buffer is full, or 100 ms without a sample.
- * Sleeps for the time the missing samples take (at most 20 ms): few large
- * reads, no polling of the ring. */
+/* Blocking receive: until the buffer is full, or 1 s without a sample (an
+ * RTL2832 delivers in large chunks, the first ones late after a start or a
+ * retune). Sleeps for the time the missing samples take (at most 20 ms):
+ * few large reads, no polling of the ring. */
 static int receive_iq_blocking(float *buffer, int max_samples)
 {
 	int total = 0;
 	double idle = 0.0;
 
-	while (total < max_samples && idle < 0.1) {
+	while (total < max_samples && idle < 1.0) {
 		int got = receive_iq(buffer + total * 2, max_samples - total);
 		if (got > 0) {
 			total += got;
