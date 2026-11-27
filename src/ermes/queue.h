@@ -63,16 +63,25 @@ extern const struct pager_charset *ermes_charset;
 struct ermes;
 
 /* A group call (§10.3): one message to several receivers through a common temporary address.
- * Each member is served by one channel (the one carrying its FSN), which sends its stage 1 and 2
- * and then the message once to the CTA (stage 3) for its members. */
+ * Each member is served by one channel (the one carrying its FSN), one stage per batch, one after
+ * another: its initial address alone in its own batch (stage 1; it then searches the subsequent
+ * batches), its pointer in the next batch (stage 2), and after the last member's pointer, in the
+ * next batch, the message once to the CTA (stage 3). */
 #define ERMES_GROUP_MAX_MEMBERS	32
 typedef struct ermes_group {
 	int			num;
 	uint32_t		member[ERMES_GROUP_MAX_MEMBERS];	/* local addresses */
 	struct ermes		*channel[ERMES_GROUP_MAX_MEMBERS];	/* serving it, NULL = not yet */
+	uint64_t		ia_at[ERMES_GROUP_MAX_MEMBERS];		/* stage 1 sent in the batch at
+								 * this codeword count + 1, 0 = not */
 	int			done[ERMES_GROUP_MAX_MEMBERS];		/* stage 2 sent */
 	int			active;		/* channels sending their part now */
 } ermes_group_t;
+
+/* The batch types of a group's members must leave room for its stages within the 16 batches of
+ * the members' search (§10.8.2): the initial addresses within 14 batches in a row. 0, or -1 if
+ * they are spread over more (logged). */
+int ermes_group_fits(const uint32_t *members, int num);
 
 typedef struct ermes_msg {
 	struct ermes_msg	*next;

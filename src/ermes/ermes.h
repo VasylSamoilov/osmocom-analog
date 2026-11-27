@@ -41,9 +41,13 @@ typedef struct ermes_ctap_slot {
 	enum ermes_ctap_state	state;
 	ermes_msg_t		*msg;		/* the group call (addressing) */
 	int			members;	/* its receivers on this channel */
-	int			left;		/* whose stage 2 is still to send */
-	double			first, last;	/* network time of the first and last member's batch */
+	int			ia_left;	/* whose stage 1 (initial address) is still to send */
+	int			left;		/* whose stage 2 (pointer) is still to send */
+	uint64_t		last_pointer_at;	/* the batch of the last stage 2 (scheduler), 0 = none */
+	double			first, last;	/* network time of the first and last member's initial address */
 	double			free_at;	/* hold: network time it becomes free */
+	/* its receivers on this channel: they get no other message until the slot is free */
+	uint32_t		member[ERMES_GROUP_MAX_MEMBERS];
 } ermes_ctap_slot_t;
 
 const char *ermes_ctap_state_name(enum ermes_ctap_state state);

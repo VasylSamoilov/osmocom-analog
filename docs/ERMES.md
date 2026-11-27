@@ -264,21 +264,37 @@ One message to several pagers, as flex (a space-separated address list):
 tempgroup:nec-C63900 0x00001C 0x000127,alpha,,Meeting at 10
 ```
 
-The message is sent once (ETS 300 133-4 §10.3). Each member is first called
-in its own batch with a short header: its own next message number and a
-pointer (CTAP 0..15) to a common temporary address (CTA, eighteen ones and
-the pointer). The text then goes once to that CTA, with message number 0;
-every member files it under the number it was given. The text follows within
-the subsequence of the first member, as the members search for it only 12 s
-(§10.8.2).
+The message is sent once (ETS 300 133-4 §10.3), in three stages, one per
+batch, one after another for each member:
+
+1. its initial address alone, in its own batch; a group member then searches
+   "in subsequent batches" (§10.3), unlike an individual call, which also
+   looks in the current one (§10.2);
+2. in the next batch, a short header to it: its own next message number and a
+   pointer (CTAP 0..15) to a common temporary address (CTA, eighteen ones and
+   the pointer);
+3. in the batch after the last member's stage 2, the text once to the CTA,
+   with message number 0, ended as any message; every member files it under
+   the number it was given. The call ends there.
+
+All within 16 batches of the first initial address: the members search only
+12 s (§10.8.2). A call starts at a time slot from which its stages fit; a
+group whose members' batch types are spread over more than 14 batches in a
+row is refused (split it). For one pager in batch A: A, B, C.
 
 Each channel sends one group call at a time and nothing else meanwhile; a
-call starts when the individual pages that came before it are sent. The 16
-pointers of a channel each go: free, addressing (members being called),
-message (the text runs on into further batches), hold (12 s after the last
-member's batch the members have stopped searching), free. The log shows every
-change. A member is served by the channel that carries its FSN. At most 32
-members; `retransmit=` is refused for group calls.
+call starts when the individual pages that came before it are sent. The
+members get no other message until the call is done: its pointer is held 12 s
+after the last member's initial address, then free. The 16 pointers of a
+channel each go: free, addressing, message (the text runs on into further
+batches), hold, free; the log shows every change. A member is served by the
+channel that carries its FSN. At most 32 members; `retransmit=` is refused
+for group calls.
+
+Observed with the NEC PA3E6-1A, with the earlier layout (stage 1 and 2 in the
+member's batch, the text in the last member's batch): texts in its own batch
+arrived; texts in a later batch failed when longer than about 12 data words,
+and it then missed its own pages for up to 2 minutes.
 
 ## Message formats
 

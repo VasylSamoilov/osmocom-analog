@@ -293,16 +293,26 @@ int ermes_build_batch(const ermes_network_t *net, const ermes_batch_time_t *t, c
 	 * message that does not fit whole is started and runs on through the carry, as the last one.
 	 * A message to a common temporary address (stage 3 of a group call, §10.3) has no initial
 	 * address: its receivers were addressed in their own batches and search for it (-5 §7.8
-	 * Fig.16: "PAD ... APT ... GROUP MESSAGE"); it may go in any batch. */
+	 * Fig.16: "PAD ... APT ... GROUP MESSAGE"); it may go in any batch. So has a group call's
+	 * stage 2 (no_ia), and stage 1 is an initial address without message (ia_only). */
 	for (i = 0; i < num_pages; i++) {
 		uint32_t hdr[2], data[ERMES_MAX_MSG_WORDS];
 		int nd;
 
-		ia = !ermes_is_cta(pages[i].local_address);
+		ia = !pages[i].no_ia && !ermes_is_cta(pages[i].local_address);
 		if (ia && ermes_address_batch(pages[i].local_address) != t->batch)
 			return -1;
 		if (ia && nia == ERMES_MAX_IA)
 			break;
+		/* stage 1 of a group call: the initial address alone; the receiver searches the
+		 * subsequent batches (§10.3) */
+		if (pages[i].ia_only) {
+			if (nmsg > ermes_max_codeblocks(t->slot, nia + 1) * ERMES_CODEBLOCK_CW)
+				break;
+			order[nia++] = i;
+			sent++;
+			continue;
+		}
 		nd = ermes_data_words(&pages[i], data, ERMES_MAX_MSG_WORDS);
 		if (nd < 0)
 			return -1;

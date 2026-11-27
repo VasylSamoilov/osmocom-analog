@@ -209,6 +209,34 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 	return 0;
 }
 
+/* Stage 1 to 3 take the batches of the members' initial addresses and two more (stage 2 after the
+ * last initial address, stage 3 after that), all within 16 batches from the first initial address.
+ * The batch types follow each other in the same cyclic order on every channel (Fig.3: a channel
+ * only starts elsewhere), so this depends on the batch types alone: the members' types must fit
+ * in 14 consecutive ones, i.e. leave a gap of at least 2 types without members. */
+#define GROUP_SPAN_MAX	(ERMES_BATCHES - 2)
+
+int ermes_group_fits(const uint32_t *members, int num)
+{
+	int used[ERMES_BATCHES] = { 0 }, i, b, gap, best = 0;
+
+	for (i = 0; i < num; i++)
+		used[ermes_address_batch(members[i])] = 1;
+	/* the longest run of unused batch types, cyclic */
+	for (b = 0; b < ERMES_BATCHES; b++) {
+		for (gap = 0; gap < ERMES_BATCHES && !used[(b + gap) % ERMES_BATCHES]; gap++)
+			;
+		if (gap > best)
+			best = gap;
+	}
+	if (ERMES_BATCHES - best > GROUP_SPAN_MAX) {
+		LOGP(DERMES, LOGL_ERROR, "Group call: the members' batch types cover more than %d batches in a row; its three stages would not fit in the 12 s the members search (§10.8.2). Split the group.\n",
+		     GROUP_SPAN_MAX);
+		return -1;
+	}
+	return 0;
+}
+
 int ermes_queue_group(ermes_queue_t *queue, const uint32_t *members, int num, const ermes_page_opts_t *opts,
 		      const char *text)
 {
@@ -237,6 +265,8 @@ int ermes_queue_group(ermes_queue_t *queue, const uint32_t *members, int num, co
 			}
 		}
 	}
+	if (ermes_group_fits(members, num) < 0)
+		return -1;
 	g = calloc(1, sizeof(*g));
 	if (!g)
 		return -1;
