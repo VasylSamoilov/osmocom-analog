@@ -141,13 +141,13 @@ static void rx_batch(void *priv, const ermes_rx_batch_t *b)
 {
 	ermes_t *ermes = priv;
 
-	LOGP_CHAN(DERMES, LOGL_INFO, "Received batch %c minute %d subsequence %d: %d-%d PA %d FSI %d ETI %d, %d initial address(es), %d codeblocks%s%s%s%s [%d bits corrected, %d codewords in error, sync %d bits off]\n",
-		  'A' + b->batch, b->cycle, b->ssn, b->country, b->operator, b->pa, b->fsi, b->eti, b->ia_count, b->codeblocks,
+	LOGP_CHAN(DERMES, LOGL_INFO, "Received batch %c minute %d subsequence %d: %d-%d PA %d FSI %d ETI %d BAI %d SSIT %d, %d initial address(es), %d codeblocks%s%s%s%s [%d bits corrected, %d codewords in error, %d runs without a header, %d messages without an initial address in 12 s (not shown), sync %d bits off]\n",
+		  'A' + b->batch, b->cycle, b->ssn, b->country, b->operator, b->pa, b->fsi, b->eti, b->bai, b->ssit, b->ia_count, b->codeblocks,
 		  b->si_ok ? "" : ", system information in error",
 		  b->flywheel ? ", no sync (taken on timing)" : "",
 		  b->apt != b->apt_expected ? ", APT count not as the formula" : "",
 		  b->not_ascending ? ", messages not in ascending order" : "",
-		  b->corrected, b->bad, b->sync_errors);
+		  b->corrected, b->bad, b->unreadable, b->no_ia, b->sync_errors);
 }
 
 static void rx_message(void *priv, const ermes_rx_batch_t *b, const ermes_rx_msg_t *m)

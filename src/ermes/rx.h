@@ -35,6 +35,8 @@ typedef struct ermes_rx_batch {
 	int		fill;		/* codewords before the first delimiter that were fill */
 	int		not_ascending;	/* messages not in ascending order of local address */
 	int		unreadable;	/* runs of codewords between delimiters without a header */
+	int		no_ia;		/* headers whose initial address was not sent in the 12 s before (-4
+					 * §10.8.1): fill or a message nobody searches for, not shown */
 } ermes_rx_batch_t;
 
 enum ermes_rx_kind {
@@ -56,12 +58,22 @@ typedef struct ermes_rx_msg {
 	int		link_counter;	/* submessage: bits still to come (§10.4) */
 	char		text[ERMES_RX_TEXT];	/* UTF-8 */
 	int		eom;		/* alpha: the end of message character was found */
-	int		truncated;	/* text cut where the standard says to stop (-5 §7.5, §7.6) */
+	int		bad_fill;	/* after the EOM not the fill (EOM repeated, -4 §5.5.4) ... */
+	char		after_eom[256];	/* ... and what was there instead, as characters */
+	int		chars;		/* characters of the text, and how many of them came from */
+	int		chars_corrected; /* codewords with bits corrected */
+	int		chars_bad;	/* or not decodable (shown as '?') */
+	uint8_t		char_state[ERMES_RX_TEXT]; /* per character: 0 ok, 1 corrected, 2 bad (as pocsag) */
+	int		character_set;	/* AIF character set indicator (Table 15 AIN 0010, long), -1 none */
+	int		repeat;		/* number seen before for this receiver: 1 same text, 2 other text */
+	int		missing_from, missing_to; /* numbers skipped before this one (0 = none) */
+	int		no_eom;		/* alpha: no end of message found (its codeword in error, or cut) */
+	int		missing_part;	/* the rest of the message was not received (lock lost while it
+					 * ran on): shown as <..> where it is missing */
 	int		words;		/* codewords, header included */
 	int		corrected;	/* bits corrected */
 	int		bad;		/* codewords not decodable */
 	int		batches;	/* batches it spans (§10.5) */
-	int		no_ia;		/* its initial address was not in its first batch */
 	int		members;	/* group text: the pointers seen for its CTAP (12 s) */
 	uint32_t	member[ERMES_RX_MAX_MEMBERS];
 	int		member_number[ERMES_RX_MAX_MEMBERS];
@@ -89,24 +101,52 @@ typedef struct ermes_rx {
 	int		flywheel;
 	int		lost;		/* batches in a row taken without sync */
 
+	uint64_t	batch_start;	/* bit count where the batch being collected starts */
+
 	/* a message running on into the next batch (§10.5) */
 	int		pending;
 	uint32_t	pend_info[ERMES_RX_MAX_WORDS];
 	int8_t		pend_err[ERMES_RX_MAX_WORDS];
 	int		pend_words;
 	int		pend_batches;
-	int		pend_no_ia;
+	uint64_t	pend_ia_bit;	/* start of its receiver's initial address batch */
+	uint64_t	cur_start;	/* start of the batch being decoded */
+	ermes_rx_batch_t last_batch;	/* the last batch decoded (for a message flushed later) */
+	int		open_md;	/* the batch before ended with a delimiter: a message may start
+					 * right after the next address partition (-5 Fig.5, Fig.9) */
 
-	/* group calls: the pointers per CTAP, 12 s (§10.8.2) */
+	/* the initial addresses of the last batches with where they started: a receiver searches
+	 * for its message 12 s from the start of the batch with its initial address (§10.8) */
+	struct {
+		uint64_t	start;
+		int		n;
+		uint32_t	ia[ERMES_MAX_IA];
+	} hist[ERMES_BATCHES + 1];
+	int		hist_pos;
+
+	/* group calls: the pointers per CTAP, with the start of the member's initial address batch */
 	struct {
 		int		n;
 		uint32_t	la[ERMES_RX_MAX_MEMBERS];
 		int		number[ERMES_RX_MAX_MEMBERS];
-		uint64_t	bit[ERMES_RX_MAX_MEMBERS];
+		uint64_t	ia_start[ERMES_RX_MAX_MEMBERS];
 	} ctap[16];
+
+	/* message numbers per receiver (local address, home operator): repeats and gaps (-5 §7.7,
+	 * §8.2) */
+	struct {
+		uint32_t	la;
+		int		opid;
+		int		number;
+		uint32_t	text_hash;
+		uint64_t	used;
+	} seen[256];
+	uint64_t	seen_clock;
 
 	/* counts */
 	int		batches, messages;
+	int		complete, damaged, incomplete;	/* texts: whole, with '?', a part or the end missing */
+	int		runs_on;			/* of them over several batches (§10.5) */
 } ermes_rx_t;
 
 /* channel 1..16 (0: not known), charset: the network's codepage for alphanumeric text (a pager

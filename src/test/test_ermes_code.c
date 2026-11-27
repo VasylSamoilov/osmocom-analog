@@ -594,7 +594,8 @@ static void test_rx(void)
 	CHECK(rx_nbatch == 32, "%d batches decoded, 32 sent", rx_nbatch);
 
 	m = rx_find(0x318E40, ERMES_RX_MESSAGE);
-	CHECK(m && m->number == 1 && !strcmp(m->text, "Hello NEC") && m->eom && !m->no_ia, "alpha to the NEC: %s", m ? ermes_rx_msg_str(m) : "missing");
+	CHECK(m && m->number == 1 && !strcmp(m->text, "Hello NEC") && m->eom && !m->bad_fill && !m->chars_bad && m->chars == 9,
+	      "alpha to the NEC: %s", m ? ermes_rx_msg_str(m) : "missing");
 	m = rx_find(0x000011, ERMES_RX_MESSAGE);
 	CHECK(m && m->category == ERMES_CAT_NUMERIC && !strcmp(m->text, "0123456789"), "numeric: %s", m ? ermes_rx_msg_str(m) : "missing");
 	m = rx_find(0x000022, ERMES_RX_MESSAGE);
@@ -611,10 +612,287 @@ static void test_rx(void)
 	CHECK(m && !strcmp(m->text, "group text") && m->members == 1 && m->member[0] == 0x000066 && m->member_number[0] == 4,
 	      "group text with its member: %s", m ? ermes_rx_msg_str(m) : "missing");
 	m = rx_find(0x000077, ERMES_RX_MESSAGE);
-	CHECK(m && m->truncated && strlen(m->text) < 6 && !strncmp(m->text, "555123", strlen(m->text)),
-	      "numeric with a codeword in error cut (§7.5): %s", m ? ermes_rx_msg_str(m) : "missing");
+	/* a monitor: the digits from the bad codeword '?', the rest kept (5551 in the good one) */
+	CHECK(m && !strncmp(m->text, "5551?", 5) && m->chars_bad >= 2 && m->char_state[0] == 0 && m->char_state[4] == 2,
+	      "numeric with a codeword in error: %s", m ? ermes_rx_msg_str(m) : "missing");
 	CHECK(rx_ngot == npages + 1, "%d messages, %d sent", rx_ngot, npages + 1);
 	printf("receiver done (%d batches, %d messages)\n", rx_nbatch, rx_ngot);
+}
+
+/*
+ * Receiver conformance cases (ETS 300 133-5 §7, TBR 7 §8): batches built from raw codewords, as
+ * the test figures draw them (FILL, PADs, a message in a later batch), which the encoder does not
+ * make
+ */
+
+static ermes_network_t conf_net = { .zone = 2, .country = 1, .operator = 2, .pa = 0, .bai = 0, .fsi = 30 };
+#define CONF_NEC	0x318E40u
+#define CONF_FILL	ermes_bch_encode(0x2AAAA)	/* a codeword, not MD, no EOM (-5 p.17 "FILL") */
+#define CONF_PAD	(ERMES_CTA_IA)			/* -5 p.17: an IA higher than the receiver's */
+
+/* a batch on channel 9 in slot 'slot': its IAs (18 bits each), the APTs to the codeblock
+ * boundary, the message partition's first codewords, MD to the end */
+static int conf_batch(uint8_t *b, int slot, const uint32_t *ia, int nia, const uint32_t *msg, int nmsg)
+{
+	ermes_batch_time_t t = { .cycle = 30, .ssn = 0, .slot = slot, .batch = ermes_channel_batch(9, slot) };
+	ermes_ssi_t ssi = { .ssit = 1, .ssif = 0 };
+	uint32_t part[190];
+	int n = 0, i, j, k, len = ermes_batch_length(slot), cb;
+
+#define PUT(w) do { for (j = 29; j >= 0; j--) b[n++] = ((w) >> j) & 1; } while (0)
+	PUT(ERMES_PREAMBLE);
+	PUT(ERMES_SW1);
+	PUT(ermes_bch_encode(ermes_si_word1(&conf_net, 0)));
+	PUT(ermes_bch_encode(ermes_si_word2(&conf_net, &t)));
+	PUT(ermes_bch_encode(ermes_ssi_word(&ssi)));
+	for (i = 0; i < nia; i++)
+		PUT(ermes_bch_encode(ia[i]));
+	for (i = 0; i < ermes_apt_count(nia); i++)
+		PUT(ERMES_APT);
+#undef PUT
+	cb = ermes_max_codeblocks(slot, nia);
+	for (k = 0; k < cb * 9; k++)
+		part[k] = (k < nmsg) ? msg[k] : ERMES_MD;
+	for (k = 0; k < cb; k++) {
+		ermes_interleave(part + 9 * k, b + n);
+		n += 270;
+	}
+	return (n == len * 30) ? n : -1;
+}
+
+/* header codewords: Fig.10, VIF given */
+static int conf_header(uint32_t *w, uint32_t la, int number, int eb, int aii, int vif)
+{
+	uint64_t h = ((uint64_t)la << 14) | ((uint64_t)number << 9) | ((uint64_t)eb << 8) | ((uint64_t)aii << 7) | vif;
+
+	w[0] = ermes_bch_encode(h >> 18);
+	w[1] = ermes_bch_encode(h & 0x3FFFF);
+	return 2;
+}
+
+/* alphanumeric data codewords of a text, standard fill */
+static int conf_alpha(uint32_t *w, const char *text)
+{
+	ermes_page_t p = { .category = ERMES_CAT_ALPHA, .text = text };
+	uint32_t d[64];
+	int n = ermes_data_words(&p, d, 64), i;
+
+	for (i = 0; i < n; i++)
+		w[i] = ermes_bch_encode(d[i]);
+	return n;
+}
+
+static uint8_t conf_stream[40 * 190 * 30];
+static int conf_pos;
+
+static void conf_add(int slot, const uint32_t *ia, int nia, const uint32_t *msg, int nmsg)
+{
+	int n = conf_batch(conf_stream + conf_pos, slot, ia, nia, msg, nmsg);
+
+	CHECK(n > 0, "conformance batch slot %d built", slot);
+	conf_pos += (n > 0) ? n : 0;
+}
+
+static void conf_run(int lose_after_bits)
+{
+	ermes_rx_t rx;
+	int i;
+
+	rx_ngot = rx_nbatch = 0;
+	ermes_rx_init(&rx, 9, &pager_charset_ermes_generic_generic_standard, NULL, rx_batch_cb, rx_msg_cb);
+	for (i = 0; i < conf_pos; i++)
+		ermes_rx_bit(&rx, (lose_after_bits && i >= lose_after_bits) ? ((i * 7) >> 3) & 1 : conf_stream[i]);
+	/* noise after: the lock goes */
+	for (i = 0; i < 3 * 190 * 30; i++)
+		ermes_rx_bit(&rx, (i * 13 >> 2) & 1);
+}
+
+static void test_rx_conformance(void)
+{
+	uint32_t ia_nec = CONF_NEC >> 4, pads[4] = { CONF_PAD, CONF_PAD, CONF_PAD, CONF_PAD }, ia[4], msg[190];
+	const ermes_rx_msg_t *m;
+	int n, i, slot;
+
+	/* -5 7.1.3 Fig.5: batch 1 "3*PAD IA APT FILL MD" with the MD last, batch 2 "PAD 4*APT MESSAGE MD" */
+	conf_pos = 0;
+	ia[0] = pads[0]; ia[1] = pads[1]; ia[2] = pads[2]; ia[3] = ia_nec;
+	n = ermes_max_codeblocks(0, 4) * 9;
+	for (i = 0; i < n - 1; i++)
+		msg[i] = CONF_FILL;
+	msg[n - 1] = ERMES_MD;
+	conf_add(0, ia, 4, msg, n);
+	n = conf_header(msg, CONF_NEC, 5, 0, 0, (ERMES_CAT_ALPHA << 4));
+	n += conf_alpha(msg + n, "Fig 5 next batch");
+	msg[n++] = ERMES_MD;
+	conf_add(1, pads, 1, msg, n);
+	conf_run(0);
+	m = rx_find(CONF_NEC, ERMES_RX_MESSAGE);
+	CHECK(m && !strcmp(m->text, "Fig 5 next batch") && rx_ngot == 1, "-5 7.1.3 message in the next batch: %s (%d)",
+	      m ? ermes_rx_msg_str(m) : "missing", rx_ngot);
+
+	/* -5 7.1.4/7.1.5: IA in one batch, the message 15 batches later (received) / 16 later (not) */
+	for (int later = 15; later <= 16; later++) {
+		conf_pos = 0;
+		conf_add(0, &ia_nec, 1, NULL, 0);
+		for (slot = 1; slot < later; slot++)
+			conf_add(slot % 16, NULL, 0, NULL, 0);
+		n = conf_header(msg, CONF_NEC, 6, 0, 0, (ERMES_CAT_ALPHA << 4));
+		n += conf_alpha(msg + n, "late");
+		msg[n++] = ERMES_MD;
+		/* "4*PAD APT FILL MD MESSAGE MD" */
+		{
+			uint32_t m2[64];
+			int k = 0;
+
+			m2[k++] = CONF_FILL;
+			m2[k++] = ERMES_MD;
+			memcpy(m2 + k, msg, n * sizeof(uint32_t));
+			conf_add(later % 16, pads, 4, m2, k + n);
+		}
+		conf_run(0);
+		m = rx_find(CONF_NEC, ERMES_RX_MESSAGE);
+		if (later == 15)
+			CHECK(m && !strcmp(m->text, "late"), "-5 7.1.4 message 15 batches after the IA received");
+		else
+			CHECK(!m && rx_ngot == 0, "-5 7.1.5 message 16 batches after the IA not received (%d)", rx_ngot);
+	}
+
+	/* -5 7.8 Fig.16 with real FILL: pointer with the IA, 14 batches of FILL, the group text in the
+	 * 15th; and 7.9: in the 17th the member's search is over */
+	for (int later = 15; later <= 17; later += 2) {
+		uint32_t cta = (ERMES_CTA_IA << 4) | 4;
+
+		conf_pos = 0;
+		ia[0] = pads[0]; ia[1] = pads[1]; ia[2] = pads[2]; ia[3] = ia_nec;
+		msg[0] = ERMES_MD;
+		n = 1 + conf_header(msg + 1, CONF_NEC, 7, 0, 1, (ERMES_AIT_CTAP << 4) | 4);
+		msg[n++] = ERMES_MD;
+		for (i = 0; i < 20; i++)
+			msg[n++] = CONF_FILL;
+		conf_add(0, ia, 4, msg, n);
+		for (slot = 1; slot < later; slot++) {
+			for (i = 0; i < 40; i++)
+				msg[i] = CONF_FILL;
+			conf_add(slot % 16, NULL, 0, msg, 40);
+		}
+		msg[0] = CONF_FILL;
+		msg[1] = ERMES_MD;
+		n = 2 + conf_header(msg + 2, cta, 0, 0, 0, (ERMES_CAT_ALPHA << 4));
+		n += conf_alpha(msg + n, "group text");
+		msg[n++] = ERMES_MD;
+		conf_add(later % 16, pads, 4, msg, n);
+		conf_run(0);
+		m = rx_find(cta, ERMES_RX_GROUP);
+		if (later == 15)
+			CHECK(m && !strcmp(m->text, "group text") && m->members == 1 && m->member[0] == CONF_NEC
+			      && rx_ngot == 2, "-5 7.8 group call with FILL: %s (%d messages)", m ? ermes_rx_msg_str(m) : "missing", rx_ngot);
+		else
+			CHECK(m && m->members == 0, "-5 7.9 group text after the search: no member (%d)", m ? m->members : -1);
+	}
+
+	/* -5 7.6 Fig.15: "MESSAGE EOM MD 3*CHARACTERS": the characters after the MD are no message */
+	conf_pos = 0;
+	msg[0] = ERMES_MD;
+	n = 1 + conf_header(msg + 1, CONF_NEC, 8, 0, 0, (ERMES_CAT_ALPHA << 4));
+	n += conf_alpha(msg + n, "ABCDEFGH");
+	msg[n++] = ERMES_MD;
+	n += conf_alpha(msg + n, "XYZ");
+	conf_add(0, &ia_nec, 1, msg, n);
+	conf_run(0);
+	m = rx_find(CONF_NEC, ERMES_RX_MESSAGE);
+	CHECK(m && !strcmp(m->text, "ABCDEFGH") && rx_ngot == 1 && !m->bad_fill, "-5 7.6 alpha termination: %d messages", rx_ngot);
+
+	/* not the fill after the EOM: shown apart, with a warning */
+	conf_pos = 0;
+	{
+		ermes_page_t p = { .category = ERMES_CAT_ALPHA, .text = "AB" };
+		uint32_t d[8];
+		int nd = ermes_data_words(&p, d, 8);
+
+		msg[0] = ERMES_MD;
+		n = 1 + conf_header(msg + 1, CONF_NEC, 9, 0, 0, (ERMES_CAT_ALPHA << 4));
+		/* A B EOM fill: bits 21..27 (the fill's first 7, in the second word at 3..9) become 'X' */
+		d[1] = (d[1] & ~(0x7Fu << 8)) | (0x58u << 8);
+		for (i = 0; i < nd; i++)
+			msg[n++] = ermes_bch_encode(d[i]);
+		msg[n++] = ERMES_MD;
+	}
+	conf_add(0, &ia_nec, 1, msg, n);
+	conf_run(0);
+	m = rx_find(CONF_NEC, ERMES_RX_MESSAGE);
+	CHECK(m && !strcmp(m->text, "AB") && m->bad_fill && strchr(m->after_eom, 'X'), "not the fill after the EOM: %s",
+	      m ? ermes_rx_msg_str(m) : "missing");
+
+	/* -4 p.20, p.34: long message, AIF = category 2 + length 16 (the p.34 example: 10000 bits),
+	 * AIN = urgent + alert; and EB = 1 with an AIF right after the 13 bit OPID (p.22) */
+	conf_pos = 0;
+	msg[0] = ERMES_MD;
+	n = 1 + conf_header(msg + 1, CONF_NEC, 10, 0, 1, (0 << 4) | 0xC);
+	msg[n++] = ermes_bch_encode((ERMES_CAT_ALPHA << 16) | 10000);
+	n += conf_alpha(msg + n, "part one");
+	msg[n++] = ERMES_MD;
+	{
+		int opid = (2 << 10) | (1 << 3) | 3;
+		uint64_t bits = ((uint64_t)opid << 11) | (1u << 10) | (5u << 7) | (0u << 2) | ERMES_CAT_ALPHA; /* 24 bits */
+
+		n += conf_header(msg + n, 0x318E50, 3, 1, 1, (ERMES_AIT_MISC << 4) | 2);
+		msg[n++] = ermes_bch_encode(bits >> 6);
+		msg[n++] = ermes_bch_encode((bits & 63) << 12);
+		n += conf_alpha(msg + n, "visitor");
+		msg[n++] = ERMES_MD;
+	}
+	ia[0] = 0x318E5; ia[1] = ia_nec;
+	conf_add(0, ia, 2, msg, n);
+	conf_run(0);
+	m = rx_find(CONF_NEC, ERMES_RX_SUBMESSAGE);
+	CHECK(m && m->link_counter == 10000 && m->category == ERMES_CAT_ALPHA && m->urgent && m->alert == 4
+	      && !strcmp(m->text, "part one"), "long message AIF: %s", m ? ermes_rx_msg_str(m) : "missing");
+	m = rx_find(0x318E50, ERMES_RX_MESSAGE);
+	CHECK(m && m->external && m->opid == ((2 << 10) | (1 << 3) | 3) && m->urgent && m->alert == 5
+	      && !strcmp(m->text, "visitor"), "EB with an AIF after the OPID: %s", m ? ermes_rx_msg_str(m) : "missing");
+
+	/* numbers: a repeat (-5 7.7) and a gap (8.2) */
+	conf_pos = 0;
+	for (i = 0; i < 3; i++) {
+		static const int num[3] = { 11, 11, 14 };
+
+		msg[0] = ERMES_MD;
+		n = 1 + conf_header(msg + 1, CONF_NEC, num[i], 0, 0, (ERMES_CAT_ALPHA << 4));
+		n += conf_alpha(msg + n, "same");
+		msg[n++] = ERMES_MD;
+		conf_add(0, &ia_nec, 1, msg, n);
+		conf_add(1, NULL, 0, NULL, 0);
+	}
+	conf_run(0);
+	CHECK(rx_ngot == 3 && rx_got[1].repeat == 1 && rx_got[2].missing_from == 12 && rx_got[2].missing_to == 13,
+	      "repeat and gap: %d messages, repeat %d, missing %d..%d", rx_ngot, rx_ngot > 1 ? rx_got[1].repeat : -1,
+	      rx_ngot > 2 ? rx_got[2].missing_from : -1, rx_ngot > 2 ? rx_got[2].missing_to : -1);
+
+	/* the lock lost while a message runs on: reported with <..> */
+	conf_pos = 0;
+	{
+		char longtext[500];
+
+		memset(longtext, 'L', 499);
+		longtext[499] = '\0';
+		msg[0] = ERMES_MD;
+		n = 1 + conf_header(msg + 1, CONF_NEC, 15, 0, 0, (ERMES_CAT_ALPHA << 4));
+		{
+			ermes_page_t p = { .category = ERMES_CAT_ALPHA, .text = longtext };
+			uint32_t d[400];
+			int nd = ermes_data_words(&p, d, 400);
+
+			for (i = 0; i < nd && n < ermes_max_codeblocks(0, 1) * 9; i++)
+				msg[n++] = ermes_bch_encode(d[i]);
+		}
+		conf_add(0, &ia_nec, 1, msg, n);
+		conf_run(conf_pos);	/* nothing after this batch */
+	}
+	m = rx_find(CONF_NEC, ERMES_RX_MESSAGE);
+	CHECK(m && m->missing_part && strstr(m->text, "<..>") && !strncmp(m->text, "LLLL", 4),
+	      "rest not received: %s", m ? ermes_rx_msg_str(m) : "missing");
+
+	printf("receiver conformance done\n");
 }
 
 /* ERMES_RX_FILE=x.bits (ASCII 0/1) or x.sym (bytes 0..3 = lowest..highest level) [ERMES_RX_CHANNEL]:
@@ -642,7 +920,8 @@ static void test_rx_file(const char *file)
 			ermes_rx_bit(&rx, c - '0');
 	}
 	fclose(fp);
-	printf("%s: %d batches, %d messages%s\n", file, rx.batches, rx.messages,
+	printf("%s: %d batches, %d messages (texts: %d complete, %d damaged, %d incomplete; %d over several batches)%s\n",
+	       file, rx.batches, rx.messages, rx.complete, rx.damaged, rx.incomplete, rx.runs_on,
 	       rx.inverted_seen ? " (a sync was seen with inverted polarity)" : "");
 }
 
@@ -676,8 +955,9 @@ static void test_rx_wav(const char *file)
 		ermes_dsp_rx_samples(&dsp, x, n);
 	}
 	fclose(fp);
-	printf("%s: %d Hz, %llu symbols, %d batches, %d messages; dc %.3f gain %.3f%s\n", file, rate,
-	       (unsigned long long)dsp.symbols, rx.batches, rx.messages, dsp.dc, dsp.gain,
+	printf("%s: %d Hz, %llu symbols, %d batches, %d messages (texts: %d complete, %d damaged, %d incomplete; %d over several batches); dc %.3f gain %.3f%s\n",
+	       file, rate, (unsigned long long)dsp.symbols, rx.batches, rx.messages, rx.complete, rx.damaged, rx.incomplete,
+	       rx.runs_on, dsp.dc, dsp.gain,
 	       rx.inverted_seen ? " (a sync was seen with inverted polarity)" : "");
 }
 
@@ -702,6 +982,7 @@ int main(void)
 	test_frame();
 	test_continuation();
 	test_rx();
+	test_rx_conformance();
 	if (failed) {
 		printf("%d check(s) FAILED\n", failed);
 		return 1;

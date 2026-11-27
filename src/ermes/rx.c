@@ -30,6 +30,7 @@
 #define MD_ERRORS	2	/* a delimiter with 3 bits off is "in error" (-5 §7.6 NOTE) */
 #define MD_ERRORS_NO_CODEWORD 4	/* ... but still a delimiter when it is no codeword either */
 #define APT_ERRORS	3
+#define APT_ERRORS_NO_CODEWORD 6
 #define CTAP_BITS	(12 * ERMES_BIT_RATE)	/* the members' search: 12 s (§10.8.2) */
 
 #define INFO(cw)	((cw) >> (ERMES_CW_BITS - ERMES_INFO_BITS))
@@ -94,50 +95,139 @@ static int batch_slot(const ermes_rx_t *rx, int batch)
  * Messages
  */
 
-static void ctap_expire(ermes_rx_t *rx)
+/* bits of the information fields after the header, MSB of the first word first */
+static uint32_t get_bits(const uint32_t *info, int bit, int n)
 {
-	int c, i, j;
+	uint32_t v = 0;
+	int i;
 
-	for (c = 0; c < 16; c++) {
-		for (i = 0, j = 0; i < rx->ctap[c].n; i++) {
-			if (rx->bit_count - rx->ctap[c].bit[i] > (uint64_t)CTAP_BITS + ERMES_BATCH_CW_LAST * ERMES_CW_BITS)
-				continue;
-			rx->ctap[c].la[j] = rx->ctap[c].la[i];
-			rx->ctap[c].number[j] = rx->ctap[c].number[i];
-			rx->ctap[c].bit[j] = rx->ctap[c].bit[i];
-			j++;
-		}
-		rx->ctap[c].n = j;
+	for (i = 0; i < n; i++, bit++)
+		v = (v << 1) | ((info[bit / ERMES_INFO_BITS] >> (ERMES_INFO_BITS - 1 - bit % ERMES_INFO_BITS)) & 1);
+	return v;
+}
+
+/* the state of the bits [bit, bit + n): 0 all from correct codewords, 1 one corrected, 2 one not
+ * decodable */
+static int bits_state(const int8_t *err, int bit, int n)
+{
+	int i, s = 0;
+
+	for (i = bit / ERMES_INFO_BITS; i <= (bit + n - 1) / ERMES_INFO_BITS; i++) {
+		if (err[i] < 0)
+			return 2;
+		if (err[i] > 0)
+			s = 1;
 	}
+	return s;
+}
+
+/* the start of the batch with the receiver's initial address, if it was sent in the 12 s before
+ * the batch starting at 'now' (-4 §10.8.1/§10.8.2: a receiver searches 12 s from the start of that
+ * batch); 0 if not */
+static uint64_t ia_start(const ermes_rx_t *rx, const ermes_rx_batch_t *b, uint64_t now, uint32_t la)
+{
+	uint32_t ia = la >> (ERMES_LA_BITS - ERMES_IA_BITS);
+	uint64_t best = 0;
+	int h, i;
+
+	for (i = 0; i < b->ia_count; i++) {
+		if (b->ia[i] == ia)
+			return now;
+	}
+	for (h = 0; h < ERMES_BATCHES + 1; h++) {
+		if (!rx->hist[h].start || rx->hist[h].start >= now || now - rx->hist[h].start >= (uint64_t)CTAP_BITS)
+			continue;
+		for (i = 0; i < rx->hist[h].n; i++) {
+			if (rx->hist[h].ia[i] == ia && rx->hist[h].start > best)
+				best = rx->hist[h].start;
+		}
+	}
+	return best;
+}
+
+static uint32_t text_hash(const char *s)
+{
+	uint32_t h = 2166136261u;
+
+	while (*s)
+		h = (h ^ (uint8_t)*s++) * 16777619u;
+	return h;
+}
+
+/* message numbers of a receiver: a repeat (-5 §7.7) or numbers skipped (-5 §8.2) */
+static void numbers(ermes_rx_t *rx, ermes_rx_msg_t *m)
+{
+	int i, oldest = 0, expect;
+	uint32_t h = text_hash(m->text);
+
+	if (!m->number || m->kind == ERMES_RX_GROUP || m->kind == ERMES_RX_SUBMESSAGE || m->kind == ERMES_RX_OTHER)
+		return;
+	rx->seen_clock++;
+	for (i = 0; i < 256; i++) {
+		if (rx->seen[i].used && rx->seen[i].la == m->local_address && rx->seen[i].opid == m->opid)
+			break;
+		if (rx->seen[i].used < rx->seen[oldest].used)
+			oldest = i;
+	}
+	if (i == 256) {
+		i = oldest;
+		rx->seen[i].la = m->local_address;
+		rx->seen[i].opid = m->opid;
+		rx->seen[i].number = m->number;
+		rx->seen[i].text_hash = h;
+		rx->seen[i].used = rx->seen_clock;
+		return;
+	}
+	rx->seen[i].used = rx->seen_clock;
+	if (m->kind == ERMES_RX_LAST_NUMBER) {
+		/* the latest number sent: anything after the one seen was missed */
+		if (m->number != rx->seen[i].number) {
+			m->missing_from = rx->seen[i].number % 31 + 1;
+			m->missing_to = m->number;
+			rx->seen[i].number = m->number;
+		}
+		return;
+	}
+	if (m->number == rx->seen[i].number) {
+		m->repeat = (h == rx->seen[i].text_hash) ? 1 : 2;
+		return;
+	}
+	expect = rx->seen[i].number % 31 + 1;
+	if (m->number != expect) {
+		m->missing_from = expect;
+		m->missing_to = (m->number + 29) % 31 + 1;
+	}
+	rx->seen[i].number = m->number;
+	rx->seen[i].text_hash = h;
 }
 
 /* the text of a message: alpha up to EOM, numeric to the end; stops where -5 §7.5/§7.6 say */
 static void decode_text(ermes_rx_t *rx, ermes_rx_msg_t *m, const uint32_t *info, const int8_t *err, int n)
 {
-	int bit, total = n * ERMES_INFO_BITS, len = 0, i, code, bad, last_bad = -2;
+	int bit, total = n * ERMES_INFO_BITS, len = 0, i, code, state, eom_bit = -1;
 	const char *s;
 	char hex[8];
 
 	m->text[0] = '\0';
 	if (m->category == ERMES_CAT_NUMERIC) {
-		/* §7.5: nothing after a codeword in error */
+		/* a monitor, not a pager: digits from a codeword in error are '?' and the text goes on
+		 * (a pager shows nothing after it, -5 §7.5) */
 		for (bit = 0; bit + ERMES_NUMERIC_BITS <= total; bit += ERMES_NUMERIC_BITS) {
-			for (i = bit / ERMES_INFO_BITS; i <= (bit + ERMES_NUMERIC_BITS - 1) / ERMES_INFO_BITS; i++) {
-				if (err[i] < 0) {
-					m->truncated = 1;
-					goto numeric_end;
-				}
+			state = bits_state(err, bit, ERMES_NUMERIC_BITS);
+			if (len < ERMES_RX_TEXT - 1) {
+				m->char_state[len] = state;
+				m->text[len++] = (state == 2) ? '?' : numeric_chars[get_bits(info, bit, ERMES_NUMERIC_BITS)];
 			}
-			for (code = 0, i = 0; i < ERMES_NUMERIC_BITS; i++)
-				code = (code << 1) | ((info[(bit + i) / ERMES_INFO_BITS] >> (ERMES_INFO_BITS - 1 - (bit + i) % ERMES_INFO_BITS)) & 1);
-			if (len < ERMES_RX_TEXT - 1)
-				m->text[len++] = numeric_chars[code];
 		}
-numeric_end:
 		/* trailing fill (spaces) */
 		while (len && m->text[len - 1] == ' ')
 			len--;
 		m->text[len] = '\0';
+		for (i = 0; i < len; i++) {
+			m->chars_corrected += (m->char_state[i] == 1);
+			m->chars_bad += (m->char_state[i] == 2);
+		}
+		m->chars = len;
 		return;
 	}
 	if (m->category != ERMES_CAT_ALPHA && m->category != ERMES_CAT_TRANSPARENT)
@@ -148,69 +238,88 @@ numeric_end:
 		m->text[len ? len - 1 : 0] = '\0';
 		return;
 	}
-	/* §7.6: no character after an EOM or a delimiter in error, or after two codewords in error
-	 * in a row; a character in one codeword in error is shown as '?' */
-	for (i = 0; i < n; i++) {
-		if (err[i] < 0) {
-			if (last_bad == i - 1) {
-				m->truncated = 1;
-				n = i - 1;
-				break;
-			}
-			last_bad = i;
-		}
-	}
-	total = n * ERMES_INFO_BITS;
+	/* a monitor, not a pager: characters from a codeword in error are '?' and the text goes on (a
+	 * pager stops after two in a row, -5 §7.6); the 7-bit grid does not depend on them */
 	for (bit = 0; bit + ERMES_ALPHA_BITS <= total; bit += ERMES_ALPHA_BITS) {
-		for (bad = 0, i = bit / ERMES_INFO_BITS; i <= (bit + ERMES_ALPHA_BITS - 1) / ERMES_INFO_BITS; i++)
-			bad |= (err[i] < 0);
-		for (code = 0, i = 0; i < ERMES_ALPHA_BITS; i++)
-			code = (code << 1) | ((info[(bit + i) / ERMES_INFO_BITS] >> (ERMES_INFO_BITS - 1 - (bit + i) % ERMES_INFO_BITS)) & 1);
-		if (bad) {
+		state = bits_state(err, bit, ERMES_ALPHA_BITS);
+		code = get_bits(info, bit, ERMES_ALPHA_BITS);
+		if (state == 2) {
 			s = "?";
 		} else if (code == ERMES_EOM) {
+			/* the end mark is not shown */
 			m->eom = 1;
+			eom_bit = bit + ERMES_ALPHA_BITS;
 			break;
 		} else {
-			/* a code without a glyph (ESC, ...) as <0xNN>: the log line stays one line
-			 * (LF and CR have their glyphs) and the code is not lost */
+			/* a code without a glyph as <0xNN>: the log line stays one line (LF, CR, ESC
+			 * have their glyphs) and the code is not lost */
 			s = rx->charset ? pager_charset_decode(rx->charset, code) : NULL;
 			if (!s) {
 				snprintf(hex, sizeof(hex), "<0x%02X>", code);
 				s = hex;
 			}
 		}
-		if (len + (int)strlen(s) < ERMES_RX_TEXT - 1) {
+		if (len + (int)strlen(s) < ERMES_RX_TEXT - 1 && m->chars < ERMES_RX_TEXT) {
 			strcpy(m->text + len, s);
 			len += strlen(s);
+			m->char_state[m->chars++] = state;
+			m->chars_corrected += (state == 1);
+			m->chars_bad += (state == 2);
 		}
 	}
-	if (!m->eom && !m->truncated)
-		m->truncated = 1;	/* no EOM: its codeword was in error or the message was cut */
+	if (!m->eom) {
+		m->no_eom = 1;	/* its codeword was in error or the message was cut */
+		return;
+	}
+	/* after the EOM: the fill, EOM repeated to the end of the codeword (-4 §5.5.4); anything else
+	 * is shown apart, with a warning */
+	for (bit = eom_bit; bit < total; bit++) {
+		if (bits_state(err, bit, 1) == 2)
+			continue;
+		if (get_bits(info, bit, 1) != ((ERMES_EOM >> (ERMES_ALPHA_BITS - 1 - (bit - eom_bit) % ERMES_ALPHA_BITS)) & 1)) {
+			m->bad_fill = 1;
+			break;
+		}
+	}
+	if (m->bad_fill) {
+		int alen = 0;
+
+		for (bit = eom_bit; bit + ERMES_ALPHA_BITS <= total; bit += ERMES_ALPHA_BITS) {
+			code = get_bits(info, bit, ERMES_ALPHA_BITS);
+			if (bits_state(err, bit, ERMES_ALPHA_BITS) == 2)
+				s = "?";
+			else if (!(s = rx->charset ? pager_charset_decode(rx->charset, code) : NULL)) {
+				snprintf(hex, sizeof(hex), "<0x%02X>", code);
+				s = hex;
+			}
+			if (alen + (int)strlen(s) < (int)sizeof(m->after_eom) - 1) {
+				strcpy(m->after_eom + alen, s);
+				alen += strlen(s);
+			}
+		}
+	}
 }
 
-/* one message: its codewords from the header to (not including) the closing delimiter */
-static void message(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_t *info, const int8_t *err, int n, int batches, int no_ia)
+/* one message: its codewords from the header to (not including) the closing delimiter. The caller
+ * has checked its header and that its receiver was initially addressed: ia_bit = the start of that
+ * batch. missing: the rest was not received (lock lost while it ran on). */
+static void message(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_t *info, const int8_t *err, int n, int batches,
+		    uint64_t ia_bit, int missing)
 {
 	ermes_rx_msg_t m;
 	uint64_t h;
-	int i, idx, aii, c;
+	int i, j, bit, aii, c, len;
 
 	memset(&m, 0, sizeof(m));
 	m.words = n;
 	m.batches = batches;
-	m.no_ia = no_ia;
 	m.opid = -1;
+	m.character_set = -1;
 	for (i = 0; i < n; i++) {
 		if (err[i] < 0)
 			m.bad++;
 		else
 			m.corrected += err[i];
-	}
-	if (n < 2 || err[0] < 0 || err[1] < 0) {
-		/* no header: not reported as a message, counted in its batch */
-		b->unreadable++;
-		return;
 	}
 	/* Fig.10 p.18: local address 22, number 5, EB 1, AII 1, VIF 7 */
 	h = ((uint64_t)info[0] << ERMES_INFO_BITS) | info[1];
@@ -218,22 +327,33 @@ static void message(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_t *info, c
 	m.number = (h >> 9) & 31;
 	m.external = (h >> 8) & 1;
 	aii = (h >> 7) & 1;
-	idx = 2;
-	if (m.external && idx < n) {
-		/* §5.5.2: the home operator's identity, 13 bits and zeros */
-		m.opid = info[idx++] >> (ERMES_INFO_BITS - ERMES_OPID_BITS);
+	bit = 2 * ERMES_INFO_BITS;
+	/* §5.5.2: EB = 1, the home operator's identity, 13 bits; the AIF (if any) right after it, then
+	 * zeros to the end of the codeword */
+	if (m.external && bit + ERMES_OPID_BITS <= n * ERMES_INFO_BITS) {
+		m.opid = get_bits(info, bit, ERMES_OPID_BITS);
+		bit += ERMES_OPID_BITS;
 	}
+	m.kind = ERMES_RX_MESSAGE;
 	if (aii) {
 		m.ait = (h >> 4) & 7;
 		m.ain = h & 15;
 		if (m.ait == ERMES_AIT_CTAP) {
+			/* stage 2: kept for the text, with the start of the member's initial address batch */
 			m.kind = ERMES_RX_POINTER;
 			c = m.ain;
-			ctap_expire(rx);
-			if (rx->ctap[c].n < ERMES_RX_MAX_MEMBERS) {
-				rx->ctap[c].la[rx->ctap[c].n] = m.local_address;
-				rx->ctap[c].number[rx->ctap[c].n] = m.number;
-				rx->ctap[c].bit[rx->ctap[c].n] = rx->bit_count;
+			for (i = 0, j = 0; i < rx->ctap[c].n; i++) {
+				if (rx->cur_start - rx->ctap[c].ia_start[i] >= (uint64_t)CTAP_BITS)
+					continue;
+				rx->ctap[c].la[j] = rx->ctap[c].la[i];
+				rx->ctap[c].number[j] = rx->ctap[c].number[i];
+				rx->ctap[c].ia_start[j++] = rx->ctap[c].ia_start[i];
+			}
+			rx->ctap[c].n = j;
+			if (j < ERMES_RX_MAX_MEMBERS) {
+				rx->ctap[c].la[j] = m.local_address;
+				rx->ctap[c].number[j] = m.number;
+				rx->ctap[c].ia_start[j] = ia_bit;
 				rx->ctap[c].n++;
 			}
 			goto report;
@@ -242,24 +362,34 @@ static void message(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_t *info, c
 			m.kind = ERMES_RX_LAST_NUMBER;
 			goto report;
 		}
-		if (m.ait == ERMES_AIT_MISC && m.ain == 0x2 && idx < n) {
+		if (m.ait == ERMES_AIT_MISC && m.ain == 0x2 && bit + 11 <= n * ERMES_INFO_BITS) {
 			/* Table 15 AIN 0010, Fig.13: UMI 1, ALERT 3, character set 5, category 2 */
-			uint32_t aif = info[idx++] >> (ERMES_INFO_BITS - 11);
+			uint32_t aif = get_bits(info, bit, 11);
 
-			m.kind = ERMES_RX_MESSAGE;
+			bit += 11;
 			m.urgent = (aif >> 10) & 1;
 			m.alert = (aif >> 7) & 7;
+			m.character_set = (aif >> 2) & 31;
 			m.category = aif & 3;
-			decode_text(rx, &m, info + idx, err + idx, n - idx);
-			goto report;
+			goto text;
 		}
-		if ((m.ait == 0 || m.ait == 1 || m.ait == 5 || m.ait == 6) && idx < n) {
-			/* §10.4: link counter 16 bits (and zeros), then the data; alphanumeric */
+		if (m.ait == 0 || m.ait == 1 || m.ait == 5 || m.ait == 6) {
+			/* §10.4, Table 11 p.20: AIN = urgent and alert type; AIF = category 2, length 16
+			 * (with an additional character set, AIT 110/101: character set 5, reserved 2) */
+			len = (m.ait == 0 || m.ait == 1) ? 18 : 25;
+			if (bit + len > n * ERMES_INFO_BITS) {
+				m.kind = ERMES_RX_OTHER;
+				goto report;
+			}
 			m.kind = ERMES_RX_SUBMESSAGE;
-			m.link_counter = info[idx++] >> (ERMES_INFO_BITS - 16);
-			m.category = ERMES_CAT_ALPHA;
-			decode_text(rx, &m, info + idx, err + idx, n - idx);
-			goto report;
+			m.urgent = (m.ain >> 3) & 1;
+			m.alert = m.ain & 7;
+			m.category = get_bits(info, bit, 2);
+			m.link_counter = get_bits(info, bit + 2, 16);
+			if (len == 25)
+				m.character_set = get_bits(info, bit + 18, 5);
+			bit += len;
+			goto text;
 		}
 		m.kind = ERMES_RX_OTHER;
 		goto report;
@@ -268,22 +398,41 @@ static void message(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_t *info, c
 	m.category = (h >> 4) & 3;
 	m.urgent = (h >> 3) & 1;
 	m.alert = h & 7;
-	m.kind = ERMES_RX_MESSAGE;
 	if ((m.local_address >> (ERMES_LA_BITS - ERMES_IA_BITS)) == ERMES_CTA_IA) {
-		/* stage 3: the members are those whose pointer named this CTAP */
+		/* stage 3: the members whose pointer named this CTAP and whose search (12 s from the
+		 * start of their initial address batch, §10.8.2) still runs */
 		c = m.local_address & 15;
 		m.kind = ERMES_RX_GROUP;
-		m.no_ia = 0;
-		ctap_expire(rx);
 		for (i = 0; i < rx->ctap[c].n; i++) {
+			if (rx->cur_start - rx->ctap[c].ia_start[i] >= (uint64_t)CTAP_BITS)
+				continue;
 			m.member[m.members] = rx->ctap[c].la[i];
 			m.member_number[m.members++] = rx->ctap[c].number[i];
 		}
 		rx->ctap[c].n = 0;
 	}
-	decode_text(rx, &m, info + idx, err + idx, n - idx);
+text:
+	/* the data starts with the codeword after the header (and OPID/AIF and their zeros) */
+	i = (bit + ERMES_INFO_BITS - 1) / ERMES_INFO_BITS;
+	if (i <= n)
+		decode_text(rx, &m, info + i, err + i, n - i);
+	if (missing) {
+		m.missing_part = 1;
+		len = strlen(m.text);
+		snprintf(m.text + len, ERMES_RX_TEXT - len, "<..>");
+	}
 report:
+	numbers(rx, &m);
 	rx->messages++;
+	if (m.kind == ERMES_RX_MESSAGE || m.kind == ERMES_RX_GROUP || m.kind == ERMES_RX_SUBMESSAGE) {
+		if (m.missing_part || m.no_eom)
+			rx->incomplete++;
+		else if (m.chars_bad)
+			rx->damaged++;
+		else
+			rx->complete++;
+	}
+	rx->runs_on += (batches > 1);
 	if (rx->msg_cb)
 		rx->msg_cb(rx->priv, b, &m);
 }
@@ -302,65 +451,106 @@ static int is_md(uint32_t cw)
 	return 0;
 }
 
-static int has_ia(const ermes_rx_batch_t *b, uint32_t la)
+/* codewords from *i up to the next delimiter or the end; *i ends there. Returns how many. */
+static int read_run(const uint32_t *cw, int n, int *i, uint32_t *info, int8_t *err)
 {
-	int i;
+	uint32_t w;
+	int k = 0, e;
 
-	for (i = 0; i < b->ia_count; i++) {
-		if (b->ia[i] == la >> (ERMES_LA_BITS - ERMES_IA_BITS))
-			return 1;
+	for (; *i < n && !is_md(cw[*i]); (*i)++, k++) {
+		w = cw[*i];
+		e = ermes_bch_decode(&w);
+		if (k < ERMES_RX_MAX_WORDS) {
+			info[k] = INFO(w);
+			err[k] = e;
+		}
 	}
-	return 0;
+	return (k > ERMES_RX_MAX_WORDS) ? ERMES_RX_MAX_WORDS : k;
 }
 
-/* the message partition: codewords after de-interleaving, err = bits corrected or -1 */
+/* is a run of codewords a message? Its header must decode and its receiver must have been
+ * initially addressed in the 12 s before (a text to a CTA needs none): else it is fill or a
+ * message nobody searches for (-4 §10.8.1, -5 7.1.5). *ia_bit = the start of that batch. */
+static int accept(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_t *info, const int8_t *err, int k, uint64_t *ia_bit)
+{
+	uint32_t la;
+
+	if (k < 2 || err[0] < 0 || err[1] < 0) {
+		b->unreadable++;
+		return 0;
+	}
+	la = ((((uint64_t)info[0] << ERMES_INFO_BITS) | info[1]) >> 14);
+	if ((la >> (ERMES_LA_BITS - ERMES_IA_BITS)) == ERMES_CTA_IA) {
+		*ia_bit = rx->cur_start;
+		return 1;
+	}
+	*ia_bit = ia_start(rx, b, rx->cur_start, la);
+	if (!*ia_bit) {
+		b->no_ia++;
+		return 0;
+	}
+	return 1;
+}
+
+static void run_on(ermes_rx_t *rx, const uint32_t *info, const int8_t *err, int k, uint64_t ia_bit)
+{
+	memcpy(rx->pend_info, info, k * sizeof(info[0]));
+	memcpy(rx->pend_err, err, k * sizeof(err[0]));
+	rx->pend_words = k;
+	rx->pend_batches = 1;
+	rx->pend_ia_bit = ia_bit;
+	rx->pending = 1;
+}
+
+/* the message partition: codewords after de-interleaving */
 static void message_partition(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_t *cw, int n)
 {
 	uint32_t info[ERMES_RX_MAX_WORDS];
 	int8_t err[ERMES_RX_MAX_WORDS];
-	int i = 0, k, e, last_la = -1;
-	uint32_t w;
+	int i = 0, k, last_la = -1;
+	uint64_t ia_bit;
 
-#define IS_MD(x)	is_md(x)
-
-	/* the rest of a message of the batch before comes first (§10.5): up to its delimiter */
 	if (rx->pending) {
-		for (; i < n && !IS_MD(cw[i]); i++) {
-			if (rx->pend_words < ERMES_RX_MAX_WORDS) {
-				w = cw[i];
-				e = ermes_bch_decode(&w);
-				rx->pend_info[rx->pend_words] = INFO(w);
-				rx->pend_err[rx->pend_words++] = e;
-			}
-		}
+		/* the rest of a message of the batch before comes first (§10.5), up to its delimiter */
+		k = read_run(cw, n, &i, info, err);
+		if (rx->pend_words + k > ERMES_RX_MAX_WORDS)
+			k = ERMES_RX_MAX_WORDS - rx->pend_words;
+		memcpy(rx->pend_info + rx->pend_words, info, k * sizeof(info[0]));
+		memcpy(rx->pend_err + rx->pend_words, err, k * sizeof(err[0]));
+		rx->pend_words += k;
 		rx->pend_batches++;
 		if (i == n)
-			return;	/* runs on further */
+			goto out;	/* runs on further */
 		rx->pending = 0;
-		message(rx, b, rx->pend_info, rx->pend_err, rx->pend_words, rx->pend_batches, rx->pend_no_ia);
+		message(rx, b, rx->pend_info, rx->pend_err, rx->pend_words, rx->pend_batches, rx->pend_ia_bit, 0);
+	} else if (rx->open_md) {
+		/* the batch before ended with a delimiter: a message may start right here (-5 Fig.5,
+		 * Fig.9); fill otherwise (Fig.4) */
+		k = read_run(cw, n, &i, info, err);
+		if (k && accept(rx, b, info, err, k, &ia_bit)) {
+			if (i == n) {
+				run_on(rx, info, err, k, ia_bit);
+				goto out;
+			}
+			message(rx, b, info, err, k, 1, ia_bit, 0);
+		} else
+			b->fill += k;
 	} else {
 		/* anything before the first delimiter is fill (-5 §7.1.2 Fig.4) */
-		for (; i < n && !IS_MD(cw[i]); i++)
+		for (; i < n && !is_md(cw[i]); i++)
 			b->fill++;
 	}
 	while (i < n) {
 		/* at a delimiter; more delimiters are idle fill (§5.5.6) */
-		while (i < n && IS_MD(cw[i]))
+		while (i < n && is_md(cw[i]))
 			i++;
 		if (i == n)
 			break;
-		for (k = 0; i < n && !IS_MD(cw[i]); i++, k++) {
-			w = cw[i];
-			e = ermes_bch_decode(&w);
-			if (k < ERMES_RX_MAX_WORDS) {
-				info[k] = INFO(w);
-				err[k] = e;
-			}
-		}
-		if (k > ERMES_RX_MAX_WORDS)
-			k = ERMES_RX_MAX_WORDS;
+		k = read_run(cw, n, &i, info, err);
+		if (!accept(rx, b, info, err, k, &ia_bit))
+			continue;
 		/* the order the pagers rely on (a5baa58): ascending local address */
-		if (k >= 2 && err[0] >= 0 && err[1] >= 0) {
+		{
 			uint32_t la = ((((uint64_t)info[0] << ERMES_INFO_BITS) | info[1]) >> 14);
 
 			if ((int)la < last_la)
@@ -368,20 +558,22 @@ static void message_partition(ermes_rx_t *rx, ermes_rx_batch_t *b, const uint32_
 			last_la = la;
 		}
 		if (i == n) {
-			/* runs on into the next batch */
-			memcpy(rx->pend_info, info, k * sizeof(info[0]));
-			memcpy(rx->pend_err, err, k * sizeof(err[0]));
-			rx->pend_words = k;
-			rx->pend_batches = 1;
-			rx->pend_no_ia = (k >= 2 && err[0] >= 0 && err[1] >= 0)
-				? !has_ia(b, (uint32_t)((((uint64_t)info[0] << ERMES_INFO_BITS) | info[1]) >> 14)) : 0;
-			rx->pending = 1;
+			run_on(rx, info, err, k, ia_bit);	/* into the next batch */
 			break;
 		}
-		message(rx, b, info, err, k, 1, (k >= 2 && err[0] >= 0 && err[1] >= 0)
-			? !has_ia(b, (uint32_t)((((uint64_t)info[0] << ERMES_INFO_BITS) | info[1]) >> 14)) : 0);
+		message(rx, b, info, err, k, 1, ia_bit, 0);
 	}
-#undef IS_MD
+out:
+	rx->open_md = (!rx->pending && n > 0 && is_md(cw[n - 1]));
+}
+
+/* a message that was running on when the lock was lost: reported with <..> for the rest */
+static void flush_pending(ermes_rx_t *rx)
+{
+	if (!rx->pending)
+		return;
+	rx->pending = 0;
+	message(rx, &rx->last_batch, rx->pend_info, rx->pend_err, rx->pend_words, rx->pend_batches, rx->pend_ia_bit, 1);
 }
 
 /* a whole batch is in rx->bits */
@@ -440,6 +632,9 @@ static void batch(ermes_rx_t *rx)
 		if (ermes_distance(w, ERMES_APT) <= APT_ERRORS)
 			break;
 		e = ermes_bch_decode(&w);
+		/* an APT further off is still one when it is no codeword either (APT is not one) */
+		if (e < 0 && ermes_distance(word_at(rx->bits, a * ERMES_CW_BITS), ERMES_APT) <= APT_ERRORS_NO_CODEWORD)
+			break;
 		if (e < 0) {
 			b.ia_bad++;
 			b.bad++;
@@ -473,16 +668,24 @@ static void batch(ermes_rx_t *rx)
 			b.corrected += e;
 	}
 	rx->batches++;
+	rx->cur_start = rx->batch_start;
 	/* the messages, then the batch with what was counted in them */
 	message_partition(rx, &b, msg, b.codeblocks * ERMES_CODEBLOCK_CW);
 	if (rx->batch_cb)
 		rx->batch_cb(rx->priv, &b);
+	rx->last_batch = b;
+
+	/* its initial addresses, for the receivers' 12 s search (§10.8) */
+	rx->hist[rx->hist_pos].start = rx->cur_start;
+	rx->hist[rx->hist_pos].n = b.ia_count;
+	memcpy(rx->hist[rx->hist_pos].ia, b.ia, b.ia_count * sizeof(b.ia[0]));
+	rx->hist_pos = (rx->hist_pos + 1) % (ERMES_BATCHES + 1);
 
 	/* lost: no sync where expected and no system information */
 	if (rx->flywheel && !b.si_ok) {
 		if (++rx->lost >= LOST_BATCHES) {
 			rx->locked = 0;
-			rx->pending = 0;
+			flush_pending(rx);
 		}
 	} else
 		rx->lost = 0;
@@ -519,7 +722,9 @@ void ermes_rx_bit(ermes_rx_t *rx, int bit)
 		/* lock: the batch starts with the 60 bits just seen */
 		rx->locked = 1;
 		rx->lost = 0;
-		rx->pending = 0;
+		flush_pending(rx);
+		rx->open_md = 0;
+		rx->batch_start = rx->bit_count - SYNC_BITS + 1;
 		rx->sync_errors = d;
 		rx->flywheel = 0;
 		for (d = 0; d < SYNC_BITS; d++)
@@ -529,6 +734,8 @@ void ermes_rx_bit(ermes_rx_t *rx, int bit)
 		return;
 	}
 
+	if (!rx->nbits)
+		rx->batch_start = rx->bit_count;
 	rx->bits[rx->nbits++] = bit & 1;
 	if (rx->nbits == SYNC_BITS) {
 		/* where the next batch was expected: its preamble and SW1 */
@@ -553,6 +760,7 @@ void ermes_rx_bit(ermes_rx_t *rx, int bit)
 				return;
 			memmove(rx->bits, rx->bits + ERMES_BATCH_CW * ERMES_CW_BITS, SYNC_BITS);
 			rx->nbits = SYNC_BITS;
+			rx->batch_start = rx->bit_count - SYNC_BITS + 1;
 			rx->sync_errors = sync_distance(rx->shift);
 			rx->flywheel = 0;
 			rx->length = 0;
@@ -608,16 +816,35 @@ const char *ermes_rx_msg_str(const ermes_rx_msg_t *m)
 			for (i = 0; i < m->members && len < (int)sizeof(extra) - 24; i++)
 				len += snprintf(extra + len, sizeof(extra) - len, " 0x%06X/%d", m->member[i], m->member_number[i]);
 		}
-		snprintf(buf, sizeof(buf), "message to %s number %d, %s%s%s%s%s, %s, alert %d%s", who, m->number,
+		if (m->character_set >= 0) {
+			len = strlen(extra);
+			snprintf(extra + len, sizeof(extra) - len, ", character set %d", m->character_set);
+		}
+		snprintf(buf, sizeof(buf), "message to %s number %d, %s%s%s%s, %s, alert %d%s", who, m->number,
 			 cat[m->category & 3], m->text[0] ? " \"" : "", m->text, m->text[0] ? "\"" : "",
-			 m->truncated ? " (cut: codewords in error or no EOM)" : "",
 			 m->urgent ? "urgent" : "not urgent", m->alert, extra);
 	}
 	len = strlen(buf);
+	/* status: complete, damaged (characters '?'), incomplete (a part missing <..>, no EOM) */
+	if (m->kind == ERMES_RX_MESSAGE || m->kind == ERMES_RX_GROUP || m->kind == ERMES_RX_SUBMESSAGE) {
+		if (m->missing_part || m->no_eom)
+			len += snprintf(buf + len, sizeof(buf) - len, "; INCOMPLETE (%s)",
+					m->missing_part ? "the rest not received" : "no end of message");
+		else if (m->chars_bad)
+			len += snprintf(buf + len, sizeof(buf) - len, "; DAMAGED (%d of %d characters bad)", m->chars_bad, m->chars);
+		else
+			len += snprintf(buf + len, sizeof(buf) - len, "; complete");
+		if (m->chars_corrected)
+			len += snprintf(buf + len, sizeof(buf) - len, ", %d of %d characters corrected", m->chars_corrected, m->chars);
+		if (m->bad_fill)
+			len += snprintf(buf + len, sizeof(buf) - len, "; WARNING after the end of message not the fill: \"%s\"", m->after_eom);
+	}
 	if (m->batches > 1)
-		len += snprintf(buf + len, sizeof(buf) - len, ", over %d batches", m->batches);
-	if (m->no_ia)
-		len += snprintf(buf + len, sizeof(buf) - len, ", no initial address in its batch");
+		len += snprintf(buf + len, sizeof(buf) - len, "; %d words over %d batches", m->words, m->batches);
+	if (m->repeat)
+		len += snprintf(buf + len, sizeof(buf) - len, "; REPEAT of number %d%s", m->number, m->repeat == 2 ? " with another text" : "");
+	if (m->missing_from)
+		len += snprintf(buf + len, sizeof(buf) - len, "; numbers %d..%d missing", m->missing_from, m->missing_to);
 	if (m->corrected || m->bad)
 		snprintf(buf + len, sizeof(buf) - len, " [%d bits corrected, %d codewords in error]", m->corrected, m->bad);
 	return buf;
