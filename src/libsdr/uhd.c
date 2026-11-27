@@ -75,7 +75,13 @@ typedef struct uhd_instance {
 	long long		tx_fail_dropped;/* tx_dropped when the failure began */
 	unsigned long		tx_fail_writes;	/* failed writes of this failure */
 	char			serial[64];	/* the device's serial (a USB reset of this one only) */
+	int			tx_dead;	/* writes failed too long: reset at close, the program ends */
 } uhd_instance_t;
+
+/* TX writes failing this long while running: the transport is broken (a
+ * USB transfer error stays until the device is reset, also across
+ * processes); the program ends with UHD_EXIT_TX_DEAD for its supervisor */
+#define UHD_TX_DEAD_S	2.0
 
 static double uhd_mono_time(void)
 {
@@ -98,6 +104,11 @@ static void uhd_tx_write_failed(uhd_instance_t *inst, uhd_error error, const cha
 		inst->tx_fail_dropped = inst->tx_dropped;
 		LOGP(DUHD, LOGL_ERROR, "TX writes fail (error=%d): %s - samples are dropped until they work again\n", error, what);
 		return;
+	}
+	if (!inst->tx_dead && now - inst->tx_fail_since >= UHD_TX_DEAD_S) {
+		inst->tx_dead = 1;
+		LOGP(DUHD, LOGL_ERROR, "TX writes failed for %.0f s (%s): the device is reset when it is closed and the program ends with exit code %d - restart it\n",
+		     UHD_TX_DEAD_S, what, UHD_EXIT_TX_DEAD);
 	}
 	if (now - inst->tx_fail_logged >= 5.0) {
 		inst->tx_fail_logged = now;
@@ -122,6 +133,13 @@ static void uhd_tx_write_ok(uhd_instance_t *inst)
  * In split mode (future), they point to separate instances. */
 static uhd_instance_t *uhd_tx_inst = NULL;
 static uhd_instance_t *uhd_rx_inst = NULL;
+
+/* TX writes failed too long (the transport is broken): the program should
+ * end, the device is reset when it is closed */
+int uhd_tx_dead(void)
+{
+	return uhd_tx_inst && uhd_tx_inst->tx_dead;
+}
 
 static double get_software_time(uhd_instance_t *inst)
 {
@@ -904,7 +922,12 @@ int uhd_start(void)
 
 void uhd_close(void)
 {
+	char reset_serial[64] = "";
+
 	LOGP(DUHD, LOGL_DEBUG, "Clean up UHD\n");
+	/* a broken TX transport: reset the device once it is released */
+	if (uhd_tx_inst && uhd_tx_inst->tx_dead)
+		snprintf(reset_serial, sizeof(reset_serial), "%s", uhd_tx_inst->serial);
 	if (uhd_tx_inst) {
 		if (uhd_tx_inst->tx_streamer)
 			uhd_tx_streamer_free(&uhd_tx_inst->tx_streamer);
@@ -934,6 +957,8 @@ void uhd_close(void)
 		free(uhd_rx_inst);
 	}
 	uhd_tx_inst = uhd_rx_inst = NULL;
+	if (reset_serial[0])
+		uhd_usb_reset(reset_serial);
 }
 int uhd_set_rx_frequency(double frequency)
 {

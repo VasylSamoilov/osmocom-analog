@@ -2339,6 +2339,17 @@ void sdr_server_poll(void *inst)
 
 /* TX driver has no device time reference, so its send() backpressure is the
  * only clock that matches the DAC rate. */
+/* The SDR cannot go on (a TX transport broken): the exit code the program
+ * should end with, 0: it works */
+int sdr_fatal(void)
+{
+#ifdef HAVE_UHD
+	if (tx_driver == 1 && uhd_tx_dead())
+		return UHD_EXIT_TX_DEAD;
+#endif
+	return 0;
+}
+
 static int sdr_tx_device_paced(void)
 {
 #ifdef HAVE_UHD

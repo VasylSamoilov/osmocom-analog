@@ -61,6 +61,8 @@ int num_device = 0;
 const char *dsp_device[MAX_SENDER] = { "hw:0,0" };
 int allow_sdr = 1;
 int use_sdr = 0;
+/* not 0: the program ends with it (main_mobile_exit), e.g. a broken SDR */
+static int main_mobile_exit_code = 0;
 int dsp_samplerate = 48000;
 double dsp_interval = 1.0;
 int dsp_buffer = 50;
@@ -329,6 +331,10 @@ void main_mobile_exit(void)
 		enable_limit_scroll(false);
 		printf("\n\n");
 	}
+	/* the loop ended because the SDR cannot go on (the program's own
+	 * cleanup, the channels and the device, is done before this call) */
+	if (main_mobile_exit_code)
+		exit(main_mobile_exit_code);
 }
 
 void main_mobile_set_number_check_valid(const char *(*check_valid)(const char *))
@@ -1098,6 +1104,16 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	while(!(*quit)) {
 		int work;
 		begin_time = get_time();
+
+#ifdef HAVE_SDR
+		/* the SDR cannot go on: end the normal way (the device is closed
+		 * and reset), the exit code tells a supervisor to restart */
+		if (use_sdr && !main_mobile_exit_code && (main_mobile_exit_code = sdr_fatal())) {
+			LOGP(DSENDER, LOGL_ERROR, "The SDR cannot go on, quitting with exit code %d.\n", main_mobile_exit_code);
+			*quit = 1;
+			break;
+		}
+#endif
 
 		/* process sound of all transceivers */
 		for (sender = sender_head; sender; sender = sender->next) {
