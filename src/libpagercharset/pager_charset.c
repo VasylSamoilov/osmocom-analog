@@ -316,16 +316,13 @@ int pager_charset_encode_text(const struct pager_charset *cs, const char *utf8, 
 		if (n >= out_size)
 			return -1;
 		if ((c < 0x20 || c == 0x7f) && cs->code_bits >= 7) {
-			/* The code whose entry lists it (LF, CR), else its own code - but only if that
-			 * code has no glyph of its own: a TAB must not go out as the character that
-			 * sits at 0x09 (ERMES 'ç', NMT, FLEX Linguist ...) */
+			/* Only the code whose entry lists it (LF, CR, ...): a control byte the
+			 * codepage does not map is not sent (written <0xNN> it is, as given) */
 			const char *q = ch;
 
 			ch[0] = (char)c;
 			ch[1] = '\0';
 			code = c ? pager_charset_encode(cs, &q) : -1;
-			if (code < 0 && c < cs->num_codes && !cs->entries[c][0])
-				code = c;
 			if (code < 0) {
 				if (bad)
 					*bad = p;
