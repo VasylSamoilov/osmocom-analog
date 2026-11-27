@@ -30,6 +30,12 @@ extern double ermes_clock_offset;
 /* --tx-latency: seconds from making a sample to its transmission (< 0: the DSP buffer) */
 extern double ermes_tx_latency;
 
+/* --receiver-batch: messages to one receiver in one batch at most; more wait for its next batch.
+ * A network choice: the standard allows any number (§10.2, one initial address each). */
+#define ERMES_RECEIVER_BATCH_DEFAULT	2
+#define ERMES_RECEIVER_BATCH_MAX	32
+extern int ermes_receiver_batch;
+
 /* Build the next batch of the channel into ermes->batch_bits: its system information, the
  * pages it carries (taken off the queue) and the continued part of a long message. The first
  * call locks the batches to UTC (ermes->skip_bits: bits of the first batch already past).

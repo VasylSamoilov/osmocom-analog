@@ -86,6 +86,7 @@ static double start_time;
 #define OPT_PRIORITY	275
 #define OPT_RETRANSMIT	276
 #define OPT_RETRANSMIT_INTERVAL 277
+#define OPT_RECEIVER_BATCH 278
 
 void print_help(const char *arg0)
 {
@@ -160,6 +161,9 @@ void print_help(const char *arg0)
 	printf("        message number (ETS 300 133-2 4.3.1.3.1). (default %d)\n", ermes_default_opts.retransmit);
 	printf("    --retransmit-interval 1..%d\n", ERMES_RETRANSMIT_INTERVAL_MAX_S);
 	printf("        Seconds between the transmissions. (default %d)\n", ermes_default_opts.retransmit_interval);
+	printf("    --receiver-batch 1..%d\n", ERMES_RECEIVER_BATCH_MAX);
+	printf("        Messages to one receiver in one batch at most; more go in its next batch,\n");
+	printf("        in order. The standard allows any number. (default %d)\n", ERMES_RECEIVER_BATCH_DEFAULT);
 	printf(" -M --message \"...\"\n");
 	printf("        Text of pages without a text (console, FIFO lines without text).\n");
 	printf("    --charset <vendor-model-charset> | list\n");
@@ -218,6 +222,7 @@ static void add_options(void)
 	option_add(OPT_PRIORITY, "priority", 1);
 	option_add(OPT_RETRANSMIT, "retransmit", 1);
 	option_add(OPT_RETRANSMIT_INTERVAL, "retransmit-interval", 1);
+	option_add(OPT_RECEIVER_BATCH, "receiver-batch", 1);
 	option_add(OPT_TX_LATENCY, "tx-latency", 1);
 	option_add(OPT_YEAR_FROM, "year-from", 1);
 	option_add('M', "message", 1);
@@ -327,6 +332,13 @@ static int handle_options(int short_option, int argi, char **argv)
 			return -EINVAL;
 		break;
 	}
+	case OPT_RECEIVER_BATCH:
+		ermes_receiver_batch = atoi(argv[argi]);
+		if (ermes_receiver_batch < 1 || ermes_receiver_batch > ERMES_RECEIVER_BATCH_MAX) {
+			fprintf(stderr, "Given receiver-batch is not 1..%d.\n", ERMES_RECEIVER_BATCH_MAX);
+			return -EINVAL;
+		}
+		break;
 	case OPT_SSI_HOLD:
 		ermes_ssi_hold = atoi(argv[argi]);
 		if (ermes_ssi_hold < 1) {

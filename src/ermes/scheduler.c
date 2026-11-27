@@ -35,6 +35,7 @@
 
 double ermes_clock_offset = 0.0;
 double ermes_tx_latency = -1.0;	/* < 0: dsp_buffer */
+int ermes_receiver_batch = ERMES_RECEIVER_BATCH_DEFAULT;
 
 /* Network time (seconds since the epoch) at the start of the batch being built: the start of
  * the first batch plus the codewords sent since, so it follows the samples, not the wall clock */
@@ -331,7 +332,7 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	ermes_msg_t *msgs[MAX_PAGES], *m;
 	struct timeval tv;
 	double now, net_now;
-	int n = 0, sent, i, carried, prio, ahead, group;
+	int n = 0, sent, i, carried, prio, ahead, same, group;
 
 	if (!ermes->started)
 		start_time(ermes);
@@ -368,14 +369,21 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			/* a retransmission waits for its time */
 			if (m->sent && m->next_time > net_now)
 				continue;
+			/* at most --receiver-batch messages to one receiver in a batch; the others wait
+			 * for its next batch, in order (the standard allows any number, §10.2) */
+			for (same = 0, ahead = 0, i = 0; i < n; i++) {
+				if (pages[i].local_address != m->page.local_address)
+					continue;
+				same++;
+				ahead += (msgs[i]->page.number < 0);
+			}
+			if (same >= ermes_receiver_batch)
+				continue;
 			msgs[n] = m;
 			pages[n] = m->page;
 			/* a retransmission keeps the number of its first transmission */
-			if (m->page.number < 0) {
-				for (ahead = 0, i = 0; i < n; i++)
-					ahead += (msgs[i]->page.number < 0 && pages[i].local_address == m->page.local_address);
+			if (m->page.number < 0)
 				pages[n].number = ermes_number_peek(m->page.local_address, ahead);
-			}
 			n++;
 		}
 	}

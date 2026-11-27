@@ -248,6 +248,14 @@ slots 0..14 holds about 359 alphanumeric characters, the long last slot 451
 Observed with the NEC PA3E6-1A: 500 characters over two batches and 1000
 characters over three arrived whole.
 
+### Several messages to one pager
+
+The standard allows any number of messages to one receiver in a batch, one
+initial address each (§10.2); a batch has room for about 35 tone pages or 15
+short texts. The network sends at most 2 to the same receiver in one batch
+(`--receiver-batch`, 1..32); the others follow in its next batches, 12 s
+apart, in order and numbered in order.
+
 ### Group calls
 
 One message to several pagers, as flex (a space-separated address list):
