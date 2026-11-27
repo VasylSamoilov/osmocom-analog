@@ -151,4 +151,16 @@ int ermes_channel_batch(int channel, int slot);
 /* §8.2 p.25: nominal frequency of channel 1..16 in Hz */
 double ermes_channel_frequency(int channel);
 
+/* §9.2 Fig.18 p.30: frequency subsets. A receiver has an FSN 0..15; a channel sends an FSI
+ * 0..30, the subset of FSNs whose messages it carries: 0..15 one FSN, 16..23 two, 24..27 four,
+ * 28..29 eight, 30 all. E.g. FSI 27 carries FSN 12..15; FSN 12 listens to FSI 12, 22, 27, 29, 30. */
+#define ERMES_FSN_COUNT		16
+#define ERMES_FSI_MAX		30
+/* the first FSN of an FSI subset and how many; -1 if the FSI is not 0..30 */
+int ermes_fsi_subset(int fsi, int *count);
+/* 1 if the channel's FSI carries messages for the FSN */
+int ermes_fsi_has_fsn(int fsi, int fsn);
+/* 1 if two FSIs have an FSN in common (a page could go on both channels) */
+int ermes_fsi_overlap(int fsi_a, int fsi_b);
+
 #endif /* ERMES_CODE_H */

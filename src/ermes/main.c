@@ -46,7 +46,11 @@ static const char *msg_send_path = MSG_SEND_DEFAULT;
 static const char *msg_send_file = NULL;
 static msg_fifo_t msg_fifo;
 
-static double polarity = 1.0;
+/* per channel, in the order of -k: polarity (-P) and frequency subset indicator (--fsi) */
+static double polarity[MAX_SENDER];
+static int num_polarity = 0;
+static int fsi[MAX_SENDER];
+static int num_fsi = 0;
 /* Default network: the factory setting of NEC ERMES pagers (ERM1BV2 ROM map: zone 2, country 1,
  * operator 2, paging area 0), so a pager as delivered answers without options. */
 #define DEFAULT_ZONE		2
@@ -93,8 +97,12 @@ void print_help(const char *arg0)
 	printf("        Edition 1 (1992) and early pagers count from 0 at %.3f MHz: their\n",
 	       (ERMES_CHANNEL_BASE_HZ + ERMES_CHANNEL_STEP_HZ) / 1e6);
 	printf("        channel 8 is -k 9 here (a NEC PA3E6-1A home channel 8 = 169.625 MHz).\n");
+	printf("        Several -k: one network on several channels, one clock, one queue; each\n");
+	printf("        channel carries the pages of the receivers of its frequency subset (--fsi).\n");
 	printf(" -P --polarity normal | inverted\n");
-	printf("        Normal: dibit 10 = +%.1f Hz (ETS 300 133-4 Table 17). (default normal)\n", ERMES_DEVIATION_HZ);
+	printf("        Normal: dibit 10 = +%.1f Hz (ETS 300 133-4 Table 17). Once per -k, in\n", ERMES_DEVIATION_HZ);
+	printf("        the same order (one: all channels). The standard has normal only; inverted\n");
+	printf("        is for a radio path that inverts. (default normal)\n");
 	printf("    --zone 0..%d --country 0..%d --operator 0..%d\n",
 	       (1 << ERMES_ZONE_BITS) - 1, (1 << ERMES_COUNTRY_BITS) - 1, (1 << ERMES_OPERATOR_BITS) - 1);
 	printf("        The network, sent in the system information: the receivers' home\n");
@@ -102,9 +110,12 @@ void print_help(const char *arg0)
 	printf("        setting of NEC ERMES pagers)\n");
 	printf("    --pa 0..%d\n", (1 << ERMES_PA_BITS) - 1);
 	printf("        Paging area. (default %d)\n", net.pa);
-	printf("    --fsi 0..%d\n", (1 << ERMES_FSI_BITS) - 1);
-	printf("        Frequency subset indicator. %d = single channel network, all receivers.\n", ERMES_FSI_ALL);
-	printf("        (default %d)\n", net.fsi);
+	printf("    --fsi 0..%d\n", ERMES_FSI_MAX);
+	printf("        Frequency subset indicator of a channel (ETS 300 133-4 9.2 Fig.18): the\n");
+	printf("        receivers' frequency subset numbers (FSN, fsn= in the book) it carries:\n");
+	printf("        0..15 one FSN, 16..23 two, 24..27 four, 28..29 eight, %d all. Once per -k,\n", ERMES_FSI_ALL);
+	printf("        in the same order; the channels' subsets must not overlap. (default: one\n");
+	printf("        channel %d, two channels 29 and 28 as the standard says; more: give them)\n", ERMES_FSI_ALL);
 	printf("    --ssi hold | <test mode>\n");
 	printf("        Supplementary system information (time and date).\n");
 	printf("        hold (default): the network schedule. The hour starts with zone/hour/date\n");
@@ -240,10 +251,14 @@ static int handle_options(int short_option, int argi, char **argv)
 {
 	switch (short_option) {
 	case 'P':
+		if (num_polarity == MAX_SENDER) {
+			fprintf(stderr, "More than %d -P given.\n", MAX_SENDER);
+			return -EINVAL;
+		}
 		if (argv[argi][0] == 'n' || argv[argi][0] == 'N')
-			polarity = 1.0;
+			polarity[num_polarity++] = 1.0;
 		else if (argv[argi][0] == 'i' || argv[argi][0] == 'I')
-			polarity = -1.0;
+			polarity[num_polarity++] = -1.0;
 		else {
 			fprintf(stderr, "Given polarity is not 'normal' or 'inverted'.\n");
 			return -EINVAL;
@@ -258,7 +273,21 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_PA:
 		return field_option("PA", argv[argi], ERMES_PA_BITS, &net.pa);
 	case OPT_FSI:
-		return field_option("FSI", argv[argi], ERMES_FSI_BITS, &net.fsi);
+	{
+		int count;
+
+		if (num_fsi == MAX_SENDER) {
+			fprintf(stderr, "More than %d --fsi given.\n", MAX_SENDER);
+			return -EINVAL;
+		}
+		if (field_option("FSI", argv[argi], ERMES_FSI_BITS, &fsi[num_fsi]) < 0
+		 || ermes_fsi_subset(fsi[num_fsi], &count) < 0) {
+			fprintf(stderr, "Given FSI '%s' is not 0..%d.\n", argv[argi], ERMES_FSI_MAX);
+			return -EINVAL;
+		}
+		num_fsi++;
+		break;
+	}
 	case 'y':
 		if (ermes_category_from_name(argv[argi], &ermes_default_opts.category) < 0
 		 || ermes_default_opts.category == ERMES_CAT_TRANSPARENT) {
@@ -425,7 +454,8 @@ static const struct number_lengths number_lengths[] = {
 
 int main(int argc, char *argv[])
 {
-	int rc, argi, i, channel;
+	int rc, argi, i, j, channel[MAX_SENDER], chan_fsi[MAX_SENDER];
+	double chan_polarity[MAX_SENDER];
 	const char *station_id = "";
 	char *end;
 
@@ -450,28 +480,74 @@ int main(int argc, char *argv[])
 			return rc;
 	}
 
-	if (num_kanal != 1) {
-		printf("Give one channel (-k 1..%d), use '-k list' to list them.\n\n", ERMES_CHANNELS);
+	if (!num_kanal) {
+		printf("Give a channel (-k 1..%d), use '-k list' to list them.\n\n", ERMES_CHANNELS);
 		print_help(argv[0]);
 		return 0;
 	}
-	if (!strcasecmp(kanal[0], "list")) {
-		printf("Channel  Frequency\n");
-		for (i = 1; i <= ERMES_CHANNELS; i++)
-			printf("%4d     %.4f MHz\n", i, ermes_channel_frequency(i) / 1e6);
+	for (i = 0; i < num_kanal; i++) {
+		if (!strcasecmp(kanal[i], "list")) {
+			printf("Channel  Frequency\n");
+			for (j = 1; j <= ERMES_CHANNELS; j++)
+				printf("%4d     %.4f MHz\n", j, ermes_channel_frequency(j) / 1e6);
+			return 0;
+		}
+		channel[i] = strtol(kanal[i], &end, 10);
+		if (*end || channel[i] < 1 || channel[i] > ERMES_CHANNELS) {
+			fprintf(stderr, "Invalid channel '%s', use 1..%d.\n", kanal[i], ERMES_CHANNELS);
+			return 0;
+		}
+	}
+	/* per channel: one value for all, or one per -k */
+	if (num_polarity > 1 && num_polarity != num_kanal) {
+		fprintf(stderr, "Give -P once, or once per channel (%d).\n", num_kanal);
 		return 0;
 	}
-	channel = strtol(kanal[0], &end, 10);
-	if (*end || channel < 1 || channel > ERMES_CHANNELS) {
-		fprintf(stderr, "Invalid channel '%s', use 1..%d.\n", kanal[0], ERMES_CHANNELS);
+	for (i = 0; i < num_kanal; i++)
+		chan_polarity[i] = num_polarity ? polarity[(num_polarity == 1) ? 0 : i] : 1.0;
+	if (num_fsi) {
+		if (num_fsi != num_kanal) {
+			fprintf(stderr, "Give --fsi once per channel (%d).\n", num_kanal);
+			return 0;
+		}
+		memcpy(chan_fsi, fsi, num_kanal * sizeof(int));
+	} else if (num_kanal == 1)
+		chan_fsi[0] = ERMES_FSI_ALL;
+	else if (num_kanal == 2) {
+		/* §9.2 p.29: "In two channel networks the transmitted FSI shall be set to 28 and 29",
+		 * used in descending order */
+		chan_fsi[0] = ERMES_FSI_ALL - 1;
+		chan_fsi[1] = ERMES_FSI_ALL - 2;
+	} else {
+		fprintf(stderr, "With %d channels give --fsi for each: the standard says 30 for one, 28 and 29 for two.\n", num_kanal);
 		return 0;
+	}
+	for (i = 0; i < num_kanal; i++) {
+		for (j = i + 1; j < num_kanal; j++) {
+			/* one transmitter cannot send two signals on one frequency */
+			if (channel[i] == channel[j]) {
+				fprintf(stderr, "Channel %d given twice: two signals on one frequency collide on the air.\n", channel[i]);
+				return 0;
+			}
+			/* a page could go on both */
+			if (ermes_fsi_overlap(chan_fsi[i], chan_fsi[j])) {
+				fprintf(stderr, "Channels %d (FSI %d) and %d (FSI %d) have receivers (FSN) in common: give FSIs that do not overlap.\n",
+					channel[i], chan_fsi[i], channel[j], chan_fsi[j]);
+				return 0;
+			}
+		}
 	}
 	if (use_sdr) {
-		dsp_device[0] = "sdr";
-		num_device = 1;
+		for (i = 0; i < num_kanal; i++)
+			dsp_device[i] = "sdr";
+		num_device = num_kanal;
 	}
-	if (num_device == 0)
+	if (num_kanal == 1 && num_device == 0)
 		num_device = 1;
+	if (num_kanal != num_device) {
+		fprintf(stderr, "You need to specify as many sound devices as you have channels.\n");
+		return 0;
+	}
 
 	if (msg_fifo_open(&msg_fifo, msg_send_path, msg_send_file) < 0)
 		goto fail;
@@ -494,12 +570,18 @@ int main(int argc, char *argv[])
 
 	fm_init(fast_math);
 
-	rc = ermes_create(kanal[0], channel, dsp_device[0], use_sdr, dsp_samplerate, rx_gain, tx_gain, polarity, &net, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
-	if (rc < 0) {
-		fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
-		goto fail;
+	for (i = 0; i < num_kanal; i++) {
+		ermes_network_t chan_net = net;
+
+		chan_net.fsi = chan_fsi[i];
+		rc = ermes_create(kanal[i], channel[i], dsp_device[i], use_sdr, dsp_samplerate, rx_gain, tx_gain, chan_polarity[i], &chan_net, write_rx_wave, write_tx_wave, read_rx_wave, read_tx_wave, loopback);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to create \"Sender\" instance. Quitting!\n");
+			goto fail;
+		}
+		printf("Base station ready on channel %d, %.4f MHz, FSI %d, polarity %s\n", channel[i],
+		       ermes_channel_frequency(channel[i]) / 1e6, chan_fsi[i], (chan_polarity[i] > 0) ? "normal" : "inverted");
 	}
-	printf("Base station ready on channel %d, %.4f MHz\n", channel, ermes_channel_frequency(channel) / 1e6);
 
 	start_time = now_s();
 	main_mobile_loop("ermes", &quit, myhandler, station_id);

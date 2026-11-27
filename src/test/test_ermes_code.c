@@ -178,6 +178,36 @@ static uint32_t word_at(const uint8_t *b, int index)
 }
 
 /* Build a batch for the NEC PA3E6-1A factory default (local address 0x318E40) and read it back */
+/* §9.2 Fig.18 p.30 and its text examples */
+static void test_fsi(void)
+{
+	static const int fsn12[] = { 12, 22, 27, 29, 30 };
+	int fsi, fsn, n, count;
+
+	/* "when the FSI on a channel equals 27 only messages to receivers with FSNs of 12, 13, 14 or
+	 * 15 will be carried" */
+	CHECK(ermes_fsi_subset(27, &count) == 12 && count == 4, "FSI 27 = FSN 12..15");
+	/* "a receiver with FSN = 12 should look for its messages only on channels broadcasting FSI
+	 * values of 12, 22, 27, 29 or 30" */
+	for (n = 0, fsi = 0; fsi <= ERMES_FSI_MAX; fsi++) {
+		if (!ermes_fsi_has_fsn(fsi, 12))
+			continue;
+		CHECK(n < 5 && fsn12[n] == fsi, "FSN 12 on FSI %d", fsi);
+		n++;
+	}
+	CHECK(n == 5, "FSN 12 on %d FSIs", n);
+	/* single channel 30 = all; two channels 28 and 29 split the FSNs */
+	for (fsn = 0; fsn < ERMES_FSN_COUNT; fsn++) {
+		CHECK(ermes_fsi_has_fsn(30, fsn), "FSI 30 has FSN %d", fsn);
+		CHECK(ermes_fsi_has_fsn(28, fsn) + ermes_fsi_has_fsn(29, fsn) == 1, "FSN %d on one of 28/29", fsn);
+	}
+	CHECK(ermes_fsi_subset(28, &count) == 0 && count == 8, "FSI 28 = FSN 0..7");
+	CHECK(!ermes_fsi_overlap(28, 29) && ermes_fsi_overlap(30, 5) && ermes_fsi_overlap(27, 13)
+	      && !ermes_fsi_overlap(27, 11), "overlaps");
+	CHECK(ermes_fsi_subset(31, &count) < 0, "FSI 31 invalid");
+	printf("frequency subsets done\n");
+}
+
 static void test_frame(void)
 {
 	static uint8_t b[190 * 30];
@@ -331,6 +361,7 @@ int main(void)
 	test_interleave();
 	test_batch_numbers();
 	test_channels();
+	test_fsi();
 	test_frame();
 	test_continuation();
 	if (failed) {

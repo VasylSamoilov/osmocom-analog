@@ -129,7 +129,9 @@ void ermes_destroy(sender_t *sender)
 {
 	ermes_t *ermes = (ermes_t *) sender;
 
-	ermes_queue_flush(&ermes->queue);
+	/* the queue is the network's: emptied when the last channel goes */
+	if (!sender_head->next)
+		ermes_queue_flush(&ermes_queue);
 	free(ermes->tx_buffer);
 	sender_destroy(&ermes->sender);
 	free(ermes);
@@ -139,8 +141,11 @@ int ermes_idle(void)
 {
 	sender_t *s;
 
+	if (ermes_queue.head)
+		return 0;
+	/* the rest of a long message still to send */
 	for (s = sender_head; s; s = s->next) {
-		if (((ermes_t *)s)->queue.head)
+		if (((ermes_t *)s)->carry.count)
 			return 0;
 	}
 	return 1;
@@ -181,7 +186,7 @@ int ermes_msg_send(const char *line)
 		return -1;
 	if (field[2])
 		text = field[2];
-	return ermes_queue_page(&((ermes_t *)sender_head)->queue, la, &opts, text);
+	return ermes_queue_page(&ermes_queue, la, &opts, text);
 }
 
 const char *ermes_number_valid(const char *number)
@@ -206,7 +211,7 @@ int call_down_setup(int __attribute__((unused)) callref, const char *caller_id, 
 		return -CAUSE_NOCHANNEL;
 	if (ermes_parse_address(dialing, &la) < 0)
 		return -CAUSE_INVALNUMBER;
-	if (ermes_queue_page(&((ermes_t *)sender_head)->queue, la, &ermes_default_opts, text) < 0)
+	if (ermes_queue_page(&ermes_queue, la, &ermes_default_opts, text) < 0)
 		return -CAUSE_INVALNUMBER;
 	return -CAUSE_NORMAL;
 }

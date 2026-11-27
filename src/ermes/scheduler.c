@@ -48,6 +48,15 @@ static double network_time(const ermes_t *ermes)
  * Every start then keeps the same grid, as a real network: a pager that synchronised before keeps
  * waking at the right time (with a grid shifted at every start it wakes too early or too late,
  * misses its batch and is lost until it searches again). */
+/* The grid of the network: computed once, by the first channel that starts; every channel takes
+ * the same, so all channels send the same time slot at the same sample (they are fed the same
+ * number of samples, libmobile) */
+static struct {
+	int		done;
+	int		cycle, ssn, slot, skip_bits;
+	double		clock_start;
+} grid;
+
 static void start_time(ermes_t *ermes)
 {
 	struct timeval tv;
@@ -56,6 +65,16 @@ static void start_time(ermes_t *ermes)
 	time_t minute;
 	int slot, skip;
 
+	if (grid.done) {
+		ermes->cycle = grid.cycle;
+		ermes->ssn = grid.ssn;
+		ermes->slot = grid.slot;
+		ermes->skip_bits = grid.skip_bits;
+		ermes->clock_start = grid.clock_start;
+		ermes->cw_sent = 0;
+		ermes->started = 1;
+		return;
+	}
 	gettimeofday(&tv, NULL);
 	now = tv.tv_sec + tv.tv_usec / 1e6 + ermes_clock_offset
 	    + ((ermes_tx_latency >= 0) ? ermes_tx_latency : dsp_buffer / 1000.0);
@@ -81,9 +100,26 @@ static void start_time(ermes_t *ermes)
 			   + (double)ermes_batch_offset(ermes->slot) * ERMES_CW_BITS / ERMES_BIT_RATE;
 	ermes->cw_sent = 0;
 	ermes->started = 1;
+	grid.cycle = ermes->cycle;
+	grid.ssn = ermes->ssn;
+	grid.slot = ermes->slot;
+	grid.skip_bits = ermes->skip_bits;
+	grid.clock_start = ermes->clock_start;
+	grid.done = 1;
 	LOGP_CHAN(DERMES, LOGL_INFO, "Transmission starts locked to %s UTC %02d:%02d:%06.3f: minute (cycle) %d, subsequence %d, time slot %d, %d bits into the batch\n",
 		  ermes_clock_offset ? "network time (--clock)" : "", tm.tm_hour, tm.tm_min, now - minute,
 		  ermes->cycle, ermes->ssn, ermes->slot, skip);
+}
+
+/* 1 if this channel may carry pages for the receiver: its FSI has the receiver's FSN; a receiver
+ * whose FSN is not known (not in the book) goes on any channel, the first with room */
+static int fsn_on_channel(const ermes_t *ermes, uint32_t local_address)
+{
+	const ermes_subscriber_t *s = ermes_book_find(local_address, 0);
+
+	if (!s || s->fsn < 0)
+		return 1;
+	return ermes_fsi_has_fsn(ermes->net.fsi, s->fsn);
 }
 
 static void next_slot(ermes_t *ermes)
@@ -127,8 +163,11 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	now = tv.tv_sec + tv.tv_usec / 1e6;
 	net_now = network_time(ermes);
 	for (prio = ERMES_PRIORITY_HIGH; prio <= ERMES_PRIORITY_LOW; prio++) {
-		for (m = ermes->queue.head; m && n < MAX_PAGES; m = m->next) {
+		for (m = ermes_queue.head; m && n < MAX_PAGES; m = m->next) {
 			if (m->priority != prio || ermes_address_batch(m->page.local_address) != t.batch)
+				continue;
+			/* only on a channel whose frequency subset has the receiver's FSN (§9.2) */
+			if (!fsn_on_channel(ermes, m->page.local_address))
 				continue;
 			/* a retransmission waits for its time */
 			if (m->sent && m->next_time > net_now)
@@ -185,7 +224,7 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			m->next_time = net_now + m->retransmit_interval;
 			continue;
 		}
-		ermes_queue_remove(&ermes->queue, m);
+		ermes_queue_remove(&ermes_queue, m);
 	}
 	LOGP_CHAN(DERMES, LOGL_DEBUG, "Batch %c at minute %d, subsequence %d, time slot %d: %s; %d page(s)\n",
 		  ermes_batch_name(t.batch), t.cycle, t.ssn, t.slot, ermes_ssi_str(&ssi), sent);

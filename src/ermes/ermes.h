@@ -40,7 +40,6 @@ typedef struct ermes {
 	int			ssit_next;		/* batch counter of the --ssi test schedules */
 	int			skip_bits;		/* bits of the first batch already past at start (UTC lock) */
 
-	ermes_queue_t		queue;
 
 	/* modulator */
 	fsk_nrz_mod_t		fsk_mod;

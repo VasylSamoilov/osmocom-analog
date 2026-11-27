@@ -38,6 +38,8 @@ const char *ermes_priority_name(int priority)
 	return "priority ?";
 }
 
+ermes_queue_t ermes_queue;
+
 const char *ermes_retransmit_str(const ermes_msg_t *msg)
 {
 	static char buf[80];

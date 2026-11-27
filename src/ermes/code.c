@@ -158,3 +158,37 @@ double ermes_channel_frequency(int channel)
 {
 	return ERMES_CHANNEL_BASE_HZ + channel * ERMES_CHANNEL_STEP_HZ;
 }
+
+/* Fig.18: a binary tree over the FSNs; each level up halves the number of nodes. Level 0 is
+ * FSI 0..15 (one FSN each, FSI = FSN), level 1 FSI 16..23, level 2 24..27, level 3 28..29,
+ * level 4 FSI 30. Node k of a level covers FSNs k * size .. k * size + size - 1. */
+int ermes_fsi_subset(int fsi, int *count)
+{
+	int base = 0, nodes = ERMES_FSN_COUNT, size = 1;
+
+	if (fsi < 0 || fsi > ERMES_FSI_MAX)
+		return -1;
+	while (fsi >= base + nodes) {
+		base += nodes;
+		nodes /= 2;
+		size *= 2;
+	}
+	*count = size;
+	return (fsi - base) * size;
+}
+
+int ermes_fsi_has_fsn(int fsi, int fsn)
+{
+	int count, first = ermes_fsi_subset(fsi, &count);
+
+	return first >= 0 && fsn >= first && fsn < first + count;
+}
+
+int ermes_fsi_overlap(int fsi_a, int fsi_b)
+{
+	int ca = 0, cb = 0, a = ermes_fsi_subset(fsi_a, &ca), b = ermes_fsi_subset(fsi_b, &cb);
+
+	if (a < 0 || b < 0)
+		return 0;
+	return a < b + cb && b < a + ca;
+}

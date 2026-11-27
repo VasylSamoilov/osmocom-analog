@@ -77,6 +77,9 @@ typedef struct ermes_queue {
 	ermes_msg_t		*head;		/* in the order they came */
 } ermes_queue_t;
 
+/* The network's queue: one for all channels; each channel takes the pages it may carry */
+extern ermes_queue_t ermes_queue;
+
 /* Options field of a FIFO line (as flex): "priority=1 urgent=1 alert=3 charset=... retransmit=2
  * retransmit_interval=300" onto opts. 0 or -1 (logged) */
 int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts);

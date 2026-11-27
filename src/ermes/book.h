@@ -29,6 +29,8 @@
 typedef struct ermes_subscriber {
 	uint32_t	local_address;	/* 22 bit */
 	int		number;		/* last message number given, 1..31, 0 = none yet */
+	int		fsn;		/* frequency subset number 0..15 (§9.2), -1 = not known: the
+					 * page goes on the first channel that has room for it */
 } ermes_subscriber_t;
 
 /* --book: the file (NULL = kept in memory only). ermes_book_old_numbers: a message number file of

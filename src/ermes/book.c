@@ -49,6 +49,7 @@ static ermes_subscriber_t *add(uint32_t local_address)
 	}
 	memset(&book[book_count], 0, sizeof(book[0]));
 	book[book_count].local_address = local_address;
+	book[book_count].fsn = -1;
 	return &book[book_count++];
 }
 
@@ -63,6 +64,13 @@ static int set(ermes_subscriber_t *s, const char *key, const char *val)
 		if (end == val || *end || v < 0 || v > (1 << ERMES_MSG_NUMBER_BITS) - 1)
 			return -1;
 		s->number = v;
+		return 0;
+	}
+	if (!strcasecmp(key, "fsn")) {
+		v = strtol(val, &end, 10);
+		if (end == val || *end || v < 0 || v >= ERMES_FSN_COUNT)
+			return -1;
+		s->fsn = v;
 		return 0;
 	}
 	return -1;
@@ -161,9 +169,14 @@ int ermes_book_save(void)
 		return -1;
 	}
 	fprintf(fp, "# ERMES subscriber book: one receiver per line, <local address> key=value ...\n");
-	fprintf(fp, "# number = last message number sent (1..31). Rewritten by the program.\n");
-	for (i = 0; i < book_count; i++)
-		fprintf(fp, "0x%06X number=%d\n", book[i].local_address, book[i].number);
+	fprintf(fp, "# number = last message number sent (1..31), fsn = frequency subset number (0..15,\n");
+	fprintf(fp, "# missing: not known). Rewritten by the program.\n");
+	for (i = 0; i < book_count; i++) {
+		fprintf(fp, "0x%06X number=%d", book[i].local_address, book[i].number);
+		if (book[i].fsn >= 0)
+			fprintf(fp, " fsn=%d", book[i].fsn);
+		fprintf(fp, "\n");
+	}
 	fclose(fp);
 	return 0;
 }
