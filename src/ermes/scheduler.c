@@ -18,6 +18,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <stdint.h>
 #include <pthread.h>
 #include <time.h>
@@ -122,6 +123,17 @@ static int fsn_on_channel(const ermes_t *ermes, uint32_t local_address)
 	return ermes_fsi_has_fsn(ermes->net.fsi, s->fsn);
 }
 
+int ermes_scheduler_reachable(uint32_t local_address)
+{
+	sender_t *s;
+
+	for (s = sender_head; s; s = s->next) {
+		if (fsn_on_channel((ermes_t *)s, local_address))
+			return 1;
+	}
+	return 0;
+}
+
 static void next_slot(ermes_t *ermes)
 {
 	if (++ermes->slot < ERMES_BATCHES)
@@ -133,6 +145,184 @@ static void next_slot(ermes_t *ermes)
 	ermes->cycle = (ermes->cycle + 1) % ERMES_CYCLES;
 }
 
+/*
+ * Group calls (§10.3, §10.8.2). A channel sends one group call at a time, for the members it
+ * carries: stage 1 and 2 in each member's batch (its initial address, then a header with its own
+ * next number and AII 1, AIT 111, AIN = CTAP), and in the batch of the last member the message
+ * itself to the common temporary address with number 00000 (stage 3). Every batch type comes once
+ * in 16 time slots, so all members and the start of stage 3 are within 12 s of the first member's
+ * batch, as the members search no longer (§10.8.2). While a call is on, the channel sends nothing
+ * else, and it starts one only with no message running on (the carry), so no batch lacks room.
+ */
+#define GROUP_SEARCH_S	12.0	/* §10.8.2 */
+
+const char *ermes_ctap_state_name(enum ermes_ctap_state state)
+{
+	switch (state) {
+	case ERMES_CTAP_FREE:		return "free";
+	case ERMES_CTAP_ADDRESSING:	return "addressing";
+	case ERMES_CTAP_MESSAGE:	return "message";
+	case ERMES_CTAP_HOLD:		return "hold";
+	}
+	return "?";
+}
+
+static void ctap_state(ermes_t *ermes, int c, enum ermes_ctap_state state, const char *why)
+{
+	ermes_ctap_slot_t *s = &ermes->ctap[c];
+
+	LOGP_CHAN(DERMES, LOGL_INFO, "CTAP %d: %s -> %s (%s)\n", c, ermes_ctap_state_name(s->state),
+		  ermes_ctap_state_name(state), why);
+	s->state = state;
+}
+
+/* each batch: a message that ran on has ended, a hold has run out */
+static void ctap_update(ermes_t *ermes, double net_now)
+{
+	int c;
+
+	for (c = 0; c < ERMES_CTAP_COUNT; c++) {
+		ermes_ctap_slot_t *s = &ermes->ctap[c];
+
+		if (s->state == ERMES_CTAP_MESSAGE && !ermes->carry.count)
+			ctap_state(ermes, c, ERMES_CTAP_HOLD, "the message is sent");
+		if (s->state == ERMES_CTAP_HOLD && net_now >= s->free_at)
+			ctap_state(ermes, c, ERMES_CTAP_FREE, "the members' search is over");
+	}
+}
+
+/* take the next group call with members this channel carries, if a CTAP is free */
+static void group_start(ermes_t *ermes)
+{
+	ermes_msg_t *m;
+	ermes_group_t *g;
+	ermes_ctap_slot_t *s;
+	char why[64];
+	int prio, i, k, c, count;
+
+	for (prio = ERMES_PRIORITY_HIGH; prio <= ERMES_PRIORITY_LOW; prio++) {
+		for (m = ermes_queue.head; m; m = m->next) {
+			if (m->priority != prio)
+				continue;
+			/* in the order they came: an individual page before it for this channel goes first
+			 * (a retransmission waiting for its time does not hold the call) */
+			if (!m->group) {
+				if (!m->sent && fsn_on_channel(ermes, m->page.local_address))
+					return;
+				continue;
+			}
+			g = m->group;
+			for (count = 0, i = 0; i < g->num; i++)
+				count += (!g->channel[i] && !g->done[i] && fsn_on_channel(ermes, g->member[i]));
+			if (!count)
+				continue;
+			for (k = 0; k < ERMES_CTAP_COUNT; k++) {
+				c = (ermes->ctap_next + k) % ERMES_CTAP_COUNT;
+				if (ermes->ctap[c].state == ERMES_CTAP_FREE)
+					break;
+			}
+			if (k == ERMES_CTAP_COUNT) {
+				LOGP_CHAN(DERMES, LOGL_DEBUG, "Group call waits for a free CTAP\n");
+				return;
+			}
+			for (i = 0; i < g->num; i++) {
+				if (!g->channel[i] && !g->done[i] && fsn_on_channel(ermes, g->member[i]))
+					g->channel[i] = ermes;
+			}
+			g->active++;
+			s = &ermes->ctap[c];
+			s->msg = m;
+			s->members = s->left = count;
+			s->first = s->last = -1.0;
+			ermes->group_ctap = c;
+			ermes->ctap_next = (c + 1) % ERMES_CTAP_COUNT;
+			snprintf(why, sizeof(why), "a group call to %d receiver(s)", count);
+			ctap_state(ermes, c, ERMES_CTAP_ADDRESSING, why);
+			LOGP_CHAN(DERMES, LOGL_NOTICE, "Group call starts: %d receiver(s) on this channel, the message to %s\n",
+				  count, ermes_print_address(ermes_cta(c)));
+			return;
+		}
+	}
+}
+
+/* the pages of the group call in this batch: stage 2 of its members of this batch type, and stage
+ * 3 when none is left after them. Returns how many. */
+static int group_pages(ermes_t *ermes, const ermes_batch_time_t *t, ermes_msg_t **msgs, ermes_page_t *pages)
+{
+	ermes_ctap_slot_t *s = &ermes->ctap[ermes->group_ctap];
+	ermes_msg_t *m = s->msg;
+	ermes_group_t *g = m->group;
+	int i, n = 0;
+
+	for (i = 0; i < g->num && n < MAX_PAGES - 1; i++) {
+		if (g->channel[i] != ermes || g->done[i] || ermes_address_batch(g->member[i]) != t->batch)
+			continue;
+		memset(&pages[n], 0, sizeof(pages[n]));
+		pages[n].local_address = g->member[i];
+		pages[n].number = ermes_number_peek(g->member[i], 0);
+		pages[n].group_pointer = ermes->group_ctap + 1;
+		msgs[n++] = m;
+	}
+	if (s->left == n) {
+		pages[n] = m->page;
+		pages[n].local_address = ermes_cta(ermes->group_ctap);
+		pages[n].number = 0;
+		msgs[n++] = m;
+	}
+	return n;
+}
+
+/* after the batch: the pages of the group call that went out */
+static void group_sent(ermes_t *ermes, const ermes_batch_time_t *t, const ermes_page_t *pages, int n, int sent,
+		       double net_now)
+{
+	int c = ermes->group_ctap;
+	ermes_ctap_slot_t *s = &ermes->ctap[c];
+	ermes_msg_t *m = s->msg;
+	ermes_group_t *g = m->group;
+	int i, j, all;
+
+	if (sent < n)
+		LOGP_CHAN(DERMES, LOGL_ERROR, "Group call: %d of its %d message(s) did not fit in batch %c\n",
+			  n - sent, n, ermes_batch_name(t->batch));
+	for (i = 0; i < sent; i++) {
+		if (pages[i].group_pointer) {
+			if (ermes_number_next(pages[i].local_address) != pages[i].number)
+				LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);
+			for (j = 0; j < g->num; j++) {
+				if (g->member[j] == pages[i].local_address)
+					g->done[j] = 1;
+			}
+			s->left--;
+			if (s->first < 0)
+				s->first = net_now;
+			s->last = net_now;
+			LOGP_CHAN(DERMES, LOGL_NOTICE, "Group call to %s: %s; at minute %d, subsequence %d, time slot %d\n",
+				  ermes_print_address(pages[i].local_address), ermes_page_str(&pages[i]), t->cycle, t->ssn, t->slot);
+			continue;
+		}
+		/* stage 3 */
+		LOGP_CHAN(DERMES, LOGL_NOTICE, "Group call message to %s, %.1f s after the first member's batch: %s; at minute %d, subsequence %d, time slot %d\n",
+			  ermes_print_address(pages[i].local_address), net_now - s->first, ermes_page_str(&pages[i]),
+			  t->cycle, t->ssn, t->slot);
+		if (net_now - s->first >= GROUP_SEARCH_S)
+			LOGP_CHAN(DERMES, LOGL_ERROR, "Group call message %.1f s after the first member's batch: its receivers search only %.0f s\n",
+				  net_now - s->first, GROUP_SEARCH_S);
+		s->free_at = s->last + GROUP_SEARCH_S;
+		s->msg = NULL;
+		ermes->group_ctap = -1;
+		if (ermes->carry.count)
+			ctap_state(ermes, c, ERMES_CTAP_MESSAGE, "the message runs on into the next batches");
+		else
+			ctap_state(ermes, c, ERMES_CTAP_HOLD, "the message is sent");
+		g->active--;
+		for (all = 1, j = 0; j < g->num; j++)
+			all &= g->done[j];
+		if (all && !g->active)
+			ermes_queue_remove(&ermes_queue, m);
+	}
+}
+
 int ermes_scheduler_next_batch(ermes_t *ermes)
 {
 	ermes_batch_time_t t;
@@ -141,7 +331,7 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	ermes_msg_t *msgs[MAX_PAGES], *m;
 	struct timeval tv;
 	double now, net_now;
-	int n = 0, sent, i, carried, prio, ahead;
+	int n = 0, sent, i, carried, prio, ahead, group;
 
 	if (!ermes->started)
 		start_time(ermes);
@@ -162,9 +352,15 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	gettimeofday(&tv, NULL);
 	now = tv.tv_sec + tv.tv_usec / 1e6;
 	net_now = network_time(ermes);
-	for (prio = ERMES_PRIORITY_HIGH; prio <= ERMES_PRIORITY_LOW; prio++) {
+	ctap_update(ermes, net_now);
+	if (ermes->group_ctap < 0 && !ermes->carry.count)
+		group_start(ermes);
+	group = (ermes->group_ctap >= 0);
+	if (group)
+		n = group_pages(ermes, &t, msgs, pages);
+	for (prio = ERMES_PRIORITY_HIGH; prio <= ERMES_PRIORITY_LOW && !group; prio++) {
 		for (m = ermes_queue.head; m && n < MAX_PAGES; m = m->next) {
-			if (m->priority != prio || ermes_address_batch(m->page.local_address) != t.batch)
+			if (m->group || m->priority != prio || ermes_address_batch(m->page.local_address) != t.batch)
 				continue;
 			/* only on a channel whose frequency subset has the receiver's FSN (§9.2) */
 			if (!fsn_on_channel(ermes, m->page.local_address))
@@ -199,6 +395,10 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 		LOGP_CHAN(DERMES, LOGL_INFO, "The last message of batch %c runs on into the next batch (%d codewords)\n",
 			  ermes_batch_name(t.batch), ermes->carry.count);
 
+	if (group) {
+		group_sent(ermes, &t, pages, n, sent, net_now);
+		sent = 0;
+	}
 	for (i = 0; i < sent; i++) {
 		char when[64];
 

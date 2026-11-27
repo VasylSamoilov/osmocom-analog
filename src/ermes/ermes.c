@@ -42,6 +42,7 @@
 #include "ermes.h"
 
 #define MAX_DISPLAY	1.4	/* something above speech level, no emphasis */
+#define GROUP_PREFIX	"tempgroup:"	/* a group call, as flex */
 
 const char *ermes_default_text = "";
 
@@ -106,6 +107,7 @@ int ermes_create(const char *kanal, int channel, const char *device, int use_sdr
 		return rc;
 	}
 	ermes->channel = channel;
+	ermes->group_ctap = -1;	/* no group call; all CTAPs free (calloc) */
 	ermes->net = *net;
 
 	/* a sample value of 1.0 is the outer deviation */
@@ -158,11 +160,11 @@ int ermes_idle(void)
 int ermes_msg_send(const char *line)
 {
 	/* as flex and pocsag: address,type,options,message - the message is the rest of the line */
-	char buf[ERMES_MAX_TEXT + 512], *field[3] = { NULL, NULL, NULL }, *p;
+	char buf[ERMES_MAX_TEXT + 512], *field[3] = { NULL, NULL, NULL }, *p, *tok, *save = NULL;
 	ermes_page_opts_t opts = ermes_default_opts;
 	const char *text = ermes_default_text;
-	uint32_t la;
-	int i;
+	uint32_t la, members[ERMES_GROUP_MAX_MEMBERS];
+	int i, num = 0, group;
 
 	if (!sender_head) {
 		LOGP(DERMES, LOGL_ERROR, "No transmitter.\n");
@@ -174,8 +176,27 @@ int ermes_msg_send(const char *line)
 		*p++ = '\0';
 		field[i] = p;
 	}
-	if (ermes_parse_address(buf, &la) < 0) {
-		LOGP(DERMES, LOGL_ERROR, "Bad address \"%s\" in \"%s\": the local address (decimal or 0x hex) or nec-<label code>.\n", buf, line);
+	/* a group call, as flex: "tempgroup:<address> <address> ...,type,options,message" */
+	group = !strncasecmp(buf, GROUP_PREFIX, strlen(GROUP_PREFIX));
+	/* strtok_r: the checks below may read the book, which tokenizes too */
+	for (tok = strtok_r(buf + (group ? strlen(GROUP_PREFIX) : 0), " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
+		if (num == ERMES_GROUP_MAX_MEMBERS || (!group && num == 1)) {
+			LOGP(DERMES, LOGL_ERROR, "Too many addresses in \"%s\" (a group call: tempgroup: and at most %d).\n", line, ERMES_GROUP_MAX_MEMBERS);
+			return -1;
+		}
+		if (ermes_parse_address(tok, &la) < 0) {
+			LOGP(DERMES, LOGL_ERROR, "Bad address \"%s\" in \"%s\": the local address (decimal or 0x hex) or nec-<label code>.\n", tok, line);
+			return -1;
+		}
+		/* a page that no channel may carry would wait for ever */
+		if (!ermes_scheduler_reachable(la)) {
+			LOGP(DERMES, LOGL_ERROR, "No channel carries %s: its FSN (book) is not in any channel's FSI.\n", ermes_print_address(la));
+			return -1;
+		}
+		members[num++] = la;
+	}
+	if (!num) {
+		LOGP(DERMES, LOGL_ERROR, "No address in \"%s\".\n", line);
 		return -1;
 	}
 	if (field[0] && *field[0] && (ermes_category_from_name(field[0], &opts.category) < 0 || opts.category == ERMES_CAT_TRANSPARENT)) {
@@ -186,7 +207,9 @@ int ermes_msg_send(const char *line)
 		return -1;
 	if (field[2])
 		text = field[2];
-	return ermes_queue_page(&ermes_queue, la, &opts, text);
+	if (group)
+		return ermes_queue_group(&ermes_queue, members, num, &opts, text);
+	return ermes_queue_page(&ermes_queue, members[0], &opts, text);
 }
 
 const char *ermes_number_valid(const char *number)

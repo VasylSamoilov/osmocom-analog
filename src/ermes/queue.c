@@ -129,31 +129,25 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 	return 0;
 }
 
-int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_page_opts_t *opts, const char *text)
+/* A queue entry for the page text and options: the text checked (length, characters). NULL if it
+ * can't be sent (logged). */
+static ermes_msg_t *new_msg(uint32_t local_address, const ermes_page_opts_t *opts, const char *text)
 {
 	enum ermes_category category = opts->category;
-	ermes_msg_t *m, **mp;
 	uint32_t data[ERMES_MAX_MSG_WORDS];
 	struct timeval tv;
+	ermes_msg_t *m;
 	int nd;
 
-	if (local_address >> ERMES_LA_BITS) {
-		LOGP(DERMES, LOGL_ERROR, "Local address 0x%X has more than %d bits.\n", local_address, ERMES_LA_BITS);
-		return -1;
-	}
-	if (ermes_is_cta(local_address)) {
-		LOGP(DERMES, LOGL_ERROR, "Local address 0x%X is a common temporary address of group calls (initial address all ones), not a receiver's.\n", local_address);
-		return -1;
-	}
 	if (!text)
 		text = "";
 	if (strlen(text) >= ERMES_MAX_TEXT) {
 		LOGP(DERMES, LOGL_ERROR, "Message too long (at most %d bytes).\n", ERMES_MAX_TEXT - 1);
-		return -1;
+		return NULL;
 	}
 	m = calloc(1, sizeof(*m));
 	if (!m)
-		return -1;
+		return NULL;
 	strcpy(m->text, (category == ERMES_CAT_TONE) ? "" : text);
 	m->page.local_address = local_address;
 	m->page.category = category;
@@ -166,13 +160,13 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 		LOGP(DERMES, LOGL_ERROR, "Message \"%s\" can't be sent as %s: a character without a code.\n",
 		     text, ermes_category_name(category));
 		free(m);
-		return -1;
+		return NULL;
 	}
 	/* a message runs on into the next batches when it does not fit in its own (§10.5-10.6) */
 	if (nd > ERMES_MAX_MSG_WORDS) {
 		LOGP(DERMES, LOGL_ERROR, "Message of %d data words is longer than %d.\n", nd, ERMES_MAX_MSG_WORDS);
 		free(m);
-		return -1;
+		return NULL;
 	}
 	/* the number is given when it is sent, so the numbers of an address go up on the air even
 	 * when a page of higher priority goes before one that came earlier */
@@ -182,11 +176,87 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 	m->retransmit_interval = opts->retransmit_interval;
 	gettimeofday(&tv, NULL);
 	m->queued = tv.tv_sec + tv.tv_usec / 1e6;
+	return m;
+}
+
+static void append(ermes_queue_t *queue, ermes_msg_t *m)
+{
+	ermes_msg_t **mp;
+
 	for (mp = &queue->head; *mp; mp = &(*mp)->next)
 		;
 	*mp = m;
+}
+
+int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_page_opts_t *opts, const char *text)
+{
+	ermes_msg_t *m;
+
+	if (local_address >> ERMES_LA_BITS) {
+		LOGP(DERMES, LOGL_ERROR, "Local address 0x%X has more than %d bits.\n", local_address, ERMES_LA_BITS);
+		return -1;
+	}
+	if (ermes_is_cta(local_address)) {
+		LOGP(DERMES, LOGL_ERROR, "Local address 0x%X is a common temporary address of group calls (initial address all ones), not a receiver's.\n", local_address);
+		return -1;
+	}
+	m = new_msg(local_address, opts, text);
+	if (!m)
+		return -1;
+	append(queue, m);
 	LOGP(DERMES, LOGL_NOTICE, "Page queued for %s, %s%s: %s\n", ermes_print_address(local_address),
 	     ermes_priority_name(m->priority), ermes_retransmit_str(m), ermes_page_str(&m->page));
+	return 0;
+}
+
+int ermes_queue_group(ermes_queue_t *queue, const uint32_t *members, int num, const ermes_page_opts_t *opts,
+		      const char *text)
+{
+	ermes_msg_t *m;
+	ermes_group_t *g;
+	char list[ERMES_GROUP_MAX_MEMBERS * 12];
+	int i, j, len = 0;
+
+	if (num < 1 || num > ERMES_GROUP_MAX_MEMBERS) {
+		LOGP(DERMES, LOGL_ERROR, "A group call has 1..%d receivers, not %d.\n", ERMES_GROUP_MAX_MEMBERS, num);
+		return -1;
+	}
+	if (opts->retransmit) {
+		LOGP(DERMES, LOGL_ERROR, "Retransmission of group calls is not done: send the group call again.\n");
+		return -1;
+	}
+	for (i = 0; i < num; i++) {
+		if ((members[i] >> ERMES_LA_BITS) || ermes_is_cta(members[i])) {
+			LOGP(DERMES, LOGL_ERROR, "Group call: 0x%X is not the local address of a receiver.\n", members[i]);
+			return -1;
+		}
+		for (j = 0; j < i; j++) {
+			if (members[j] == members[i]) {
+				LOGP(DERMES, LOGL_ERROR, "Group call: 0x%06X is given twice.\n", members[i]);
+				return -1;
+			}
+		}
+	}
+	g = calloc(1, sizeof(*g));
+	if (!g)
+		return -1;
+	/* the message itself goes to the common temporary address, with the dummy number 00000
+	 * (§10.3 third stage); the address is set when the call starts */
+	m = new_msg(0, opts, text);
+	if (!m) {
+		free(g);
+		return -1;
+	}
+	m->page.number = 0;
+	g->num = num;
+	memcpy(g->member, members, num * sizeof(uint32_t));
+	m->group = g;
+	append(queue, m);
+	for (i = 0; i < num && len < (int)sizeof(list) - 12; i++)
+		len += snprintf(list + len, sizeof(list) - len, "%s0x%06X", i ? " " : "", members[i]);
+	LOGP(DERMES, LOGL_NOTICE, "Group call queued for %d receiver(s) %s, %s: %s %s%s%s\n", num, list,
+	     ermes_priority_name(m->priority), ermes_category_name(m->page.category),
+	     m->text[0] ? "\"" : "", m->text, m->text[0] ? "\"" : "");
 	return 0;
 }
 
@@ -200,6 +270,7 @@ void ermes_queue_remove(ermes_queue_t *queue, ermes_msg_t *msg)
 			break;
 		}
 	}
+	free(msg->group);
 	free(msg);
 }
 
@@ -209,6 +280,7 @@ void ermes_queue_flush(ermes_queue_t *queue)
 
 	while ((m = queue->head)) {
 		queue->head = m->next;
+		free(m->group);
 		free(m);
 	}
 }

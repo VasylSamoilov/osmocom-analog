@@ -114,11 +114,18 @@ void ermes_header_words(const ermes_page_t *page, uint32_t info[2])
 	field(&h, page->local_address, ERMES_LA_BITS);
 	field(&h, page->number, ERMES_MSG_NUMBER_BITS);
 	field(&h, 0, FLAG_BITS);	/* external bit: home network */
-	field(&h, 0, FLAG_BITS);	/* AII: no additional information */
-	field(&h, 0, FLAG_BITS);	/* RSVD */
-	field(&h, page->category, ERMES_CATEGORY_BITS);
-	field(&h, page->urgent, FLAG_BITS);
-	field(&h, page->alert, ERMES_ALERT_BITS);
+	if (page->group_pointer) {
+		/* §10.3 Fig.20 second stage, §5.5.1.2 Table 10/16: AII 1, AIT 111, AIN = CTAP */
+		field(&h, 1, FLAG_BITS);
+		field(&h, ERMES_AIT_CTAP, ERMES_AIT_BITS);
+		field(&h, page->group_pointer - 1, ERMES_AIN_BITS);
+	} else {
+		field(&h, 0, FLAG_BITS);	/* AII: no additional information */
+		field(&h, 0, FLAG_BITS);	/* RSVD */
+		field(&h, page->category, ERMES_CATEGORY_BITS);
+		field(&h, page->urgent, FLAG_BITS);
+		field(&h, page->alert, ERMES_ALERT_BITS);
+	}
 
 	info[0] = (h >> ERMES_INFO_BITS) & ((1u << ERMES_INFO_BITS) - 1);
 	info[1] = h & ((1u << ERMES_INFO_BITS) - 1);
@@ -201,6 +208,9 @@ int ermes_data_words(const ermes_page_t *page, uint32_t *info, int max_words)
 	const struct pager_charset *cs;
 	int n, i, code;
 
+	/* the group call pointer has no additional information field (Table 16: zero length) */
+	if (page->group_pointer)
+		return 0;
 	switch (page->category) {
 	case ERMES_CAT_TONE:
 		return 0;
@@ -443,6 +453,11 @@ const char *ermes_print_address(uint32_t local_address)
 {
 	static char buf[64];
 
+	if (ermes_is_cta(local_address)) {
+		snprintf(buf, sizeof(buf), "0x%06X (common temporary address, CTAP %d)", local_address,
+			 ermes_address_batch(local_address));
+		return buf;
+	}
 	snprintf(buf, sizeof(buf), "0x%06X (NEC %06X), batch %c", local_address,
 		 local_address << ERMES_NEC_SHIFT, ermes_batch_name(ermes_address_batch(local_address)));
 	return buf;
@@ -509,6 +524,11 @@ const char *ermes_page_str(const ermes_page_t *page)
 		snprintf(number, sizeof(number), "message number %d", page->number);
 	else
 		snprintf(number, sizeof(number), "no message number");
+	if (page->group_pointer) {
+		snprintf(buf, sizeof(buf), "%s, group call: the message follows at the common temporary address of CTAP %d",
+			 number, page->group_pointer - 1);
+		return buf;
+	}
 	snprintf(buf, sizeof(buf), "%s, %s%s%s%s, %s, alert type %d", number,
 		 ermes_category_name(page->category), text[0] ? " \"" : "", text, text[0] ? "\"" : "",
 		 page->urgent ? "urgent" : "not urgent", page->alert);

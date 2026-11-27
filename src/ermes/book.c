@@ -79,14 +79,14 @@ static int set(ermes_subscriber_t *s, const char *key, const char *val)
 /* one line of the book, or of an old numbers file ("<address hex> <number>") */
 static void parse_line(char *line, const char *file, int lineno)
 {
-	char *p, *tok, *val;
+	char *p, *tok, *val, *save = NULL;
 	ermes_subscriber_t *s;
 	uint32_t la;
 
 	p = strchr(line, '#');
 	if (p)
 		*p = '\0';
-	tok = strtok(line, " \t\r\n");
+	tok = strtok_r(line, " \t\r\n", &save);
 	if (!tok)
 		return;
 	if (ermes_parse_address(tok, &la) < 0) {
@@ -96,7 +96,7 @@ static void parse_line(char *line, const char *file, int lineno)
 	s = ermes_book_find(la, 1);
 	if (!s)
 		return;
-	while ((tok = strtok(NULL, " \t\r\n"))) {
+	while ((tok = strtok_r(NULL, " \t\r\n", &save))) {
 		val = strchr(tok, '=');
 		if (!val) {
 			/* old numbers file: the bare number */

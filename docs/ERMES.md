@@ -248,6 +248,30 @@ slots 0..14 holds about 359 alphanumeric characters, the long last slot 451
 Observed with the NEC PA3E6-1A: 500 characters over two batches and 1000
 characters over three arrived whole.
 
+### Group calls
+
+One message to several pagers, as flex (a space-separated address list):
+
+```
+tempgroup:nec-C63900 0x00001C 0x000127,alpha,,Meeting at 10
+```
+
+The message is sent once (ETS 300 133-4 §10.3). Each member is first called
+in its own batch with a short header: its own next message number and a
+pointer (CTAP 0..15) to a common temporary address (CTA, eighteen ones and
+the pointer). The text then goes once to that CTA, with message number 0;
+every member files it under the number it was given. The text follows within
+the subsequence of the first member, as the members search for it only 12 s
+(§10.8.2).
+
+Each channel sends one group call at a time and nothing else meanwhile; a
+call starts when the individual pages that came before it are sent. The 16
+pointers of a channel each go: free, addressing (members being called),
+message (the text runs on into further batches), hold (12 s after the last
+member's batch the members have stopped searching), free. The log shows every
+change. A member is served by the channel that carries its FSN. At most 32
+members; `retransmit=` is refused for group calls.
+
 ## Message formats
 
 The paging category is sent in the message header (§5.5.1.1 Table 9).

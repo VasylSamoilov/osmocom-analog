@@ -184,7 +184,9 @@ void print_help(const char *arg0)
 	printf("        Named pipe for pages, one per line as --page. (default %s)\n", MSG_SEND_DEFAULT);
 	printf("    FIFO protocol (as flex and pocsag):\n");
 	printf("        Format: address,type,options,message\n");
-	printf("          address  local address (decimal or 0x hex) or nec-<label code>\n");
+	printf("          address  local address (decimal or 0x hex) or nec-<label code>;\n");
+	printf("                   tempgroup:<address> <address> ... : a group call, the\n");
+	printf("                   message sent once through a common temporary address\n");
 	printf("          type     tone|numeric|alpha (empty: -y)\n");
 	printf("          options  space-separated key=value pairs:\n");
 	printf("                   priority=1-3  urgent=0|1  alert=0-7\n");

@@ -95,6 +95,9 @@ static inline int ermes_address_batch(uint32_t local_address)
  * address, eighteen ones, and the 4-bit pointer (CTAP 0..15) in place of the batch type. Not the
  * address of a receiver. */
 #define ERMES_CTA_IA		((1u << ERMES_IA_BITS) - 1)
+#define ERMES_AIT_BITS		3	/* §5.5.1.2 Fig.12 p.19: VIF with AII = 1 = AIT + AIN */
+#define ERMES_AIN_BITS		4
+#define ERMES_AIT_CTAP		0x7	/* Table 10: 111 common temporary address pointers */
 #define ERMES_CTAP_COUNT	16
 static inline int ermes_is_cta(uint32_t local_address)
 {

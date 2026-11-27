@@ -60,8 +60,23 @@ const char *ermes_priority_name(int priority);
 extern ermes_page_opts_t ermes_default_opts;
 extern const struct pager_charset *ermes_charset;
 
+struct ermes;
+
+/* A group call (§10.3): one message to several receivers through a common temporary address.
+ * Each member is served by one channel (the one carrying its FSN), which sends its stage 1 and 2
+ * and then the message once to the CTA (stage 3) for its members. */
+#define ERMES_GROUP_MAX_MEMBERS	32
+typedef struct ermes_group {
+	int			num;
+	uint32_t		member[ERMES_GROUP_MAX_MEMBERS];	/* local addresses */
+	struct ermes		*channel[ERMES_GROUP_MAX_MEMBERS];	/* serving it, NULL = not yet */
+	int			done[ERMES_GROUP_MAX_MEMBERS];		/* stage 2 sent */
+	int			active;		/* channels sending their part now */
+} ermes_group_t;
+
 typedef struct ermes_msg {
 	struct ermes_msg	*next;
+	ermes_group_t		*group;		/* a group call, NULL = an individual page */
 	ermes_page_t		page;		/* number -1 until the scheduler sends it first */
 	char			text[ERMES_MAX_TEXT];
 	int			priority;	/* ERMES_PRIORITY_* */
@@ -89,6 +104,11 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 
 /* ", sent 2 more times 300 s apart" or "" */
 const char *ermes_retransmit_str(const ermes_msg_t *msg);
+
+/* Check a group call to several receivers (flex style "tempgroup:<address> <address> ...") and
+ * put it at the end of the queue. 0, or -1 (not queued, logged) */
+int ermes_queue_group(ermes_queue_t *queue, const uint32_t *members, int num, const ermes_page_opts_t *opts,
+		      const char *text);
 
 /* Take a message off the queue and free it */
 void ermes_queue_remove(ermes_queue_t *queue, ermes_msg_t *msg);

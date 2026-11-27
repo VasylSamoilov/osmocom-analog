@@ -26,6 +26,28 @@
 #include "ssi.h"
 #include "scheduler.h"
 
+/* A common temporary address pointer (CTAP) of a channel: free -> addressing (stage 1 and 2: the
+ * members get their initial address and the pointer, each in its batch) -> message (stage 3 runs
+ * on into further batches) -> hold (the members may still search, §10.8.2: no reuse until 12 s
+ * after the last member's batch) -> free */
+enum ermes_ctap_state {
+	ERMES_CTAP_FREE = 0,
+	ERMES_CTAP_ADDRESSING,
+	ERMES_CTAP_MESSAGE,
+	ERMES_CTAP_HOLD,
+};
+
+typedef struct ermes_ctap_slot {
+	enum ermes_ctap_state	state;
+	ermes_msg_t		*msg;		/* the group call (addressing) */
+	int			members;	/* its receivers on this channel */
+	int			left;		/* whose stage 2 is still to send */
+	double			first, last;	/* network time of the first and last member's batch */
+	double			free_at;	/* hold: network time it becomes free */
+} ermes_ctap_slot_t;
+
+const char *ermes_ctap_state_name(enum ermes_ctap_state state);
+
 /* One transmitter (channel): sources -> queue -> scheduler -> batch builder -> modulator */
 typedef struct ermes {
 	sender_t		sender;
@@ -47,6 +69,12 @@ typedef struct ermes {
 	int			tx_buffer_size, tx_buffer_length, tx_buffer_pos;
 	uint8_t			batch_bits[ERMES_BATCH_CW_LAST * ERMES_CW_BITS];
 	ermes_carry_t		carry;			/* rest of a message running on into the next batches */
+
+	/* group calls (§10.3): the 16 common temporary address pointers of this channel, each a
+	 * state machine (scheduler.c); one call is addressed at a time */
+	ermes_ctap_slot_t	ctap[ERMES_CTAP_COUNT];
+	int			group_ctap;		/* the slot of the call being sent, -1 = none */
+	int			ctap_next;		/* where the search for a free one starts */
 } ermes_t;
 
 int ermes_create(const char *kanal, int channel, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double polarity, const ermes_network_t *net, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback);

@@ -62,6 +62,8 @@ typedef struct ermes_page {
 	int			alert;		/* 0..7 */
 	const char		*text;		/* UTF-8 */
 	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = ERMES standard (Table B.3) */
+	int			group_pointer;	/* stage 2 of a group call (§10.3): 1..16 = CTAP 0..15,
+						 * sent as AII 1, AIT 111, AIN = CTAP, no data; 0 = none */
 } ermes_page_t;
 
 /* Supplementary system information for this batch (§5.3.2 p.16-18) */
