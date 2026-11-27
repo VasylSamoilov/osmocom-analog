@@ -22,10 +22,7 @@
 
 #include <stdint.h>
 
-/* --numbers: file that keeps the last number of every address across runs (NULL = none) */
-extern const char *ermes_number_file;
-
-/* The next message number of an address: one counter per address (RIC), 1..31 from 1, +1 per
+/* The counters are kept in the subscriber book (book.h). The next message number of an address: one counter per address (RIC), 1..31 from 1, +1 per
  * message (ETS 300 133-2 §4.3.1.3 p.18, -4 Table 8 p.19, §10.2 p.31). Takes the number. */
 int ermes_number_next(uint32_t local_address);
 

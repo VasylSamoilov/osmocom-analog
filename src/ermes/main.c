@@ -40,7 +40,7 @@
 #define MAX_START_PAGES 16
 
 extern const char *ermes_default_text;
-static const char *number_file = NULL;
+static const char *book_file = NULL;
 
 static const char *msg_send_path = MSG_SEND_DEFAULT;
 static const char *msg_send_file = NULL;
@@ -69,7 +69,7 @@ static double start_time;
 #define OPT_FIFO_FILE	262
 #define OPT_PAGE	263
 #define OPT_PAGE_DELAY	264
-#define OPT_NUMBERS	265
+#define OPT_BOOK	265
 #define OPT_CHARSET	266
 #define OPT_CHARSET_PRINT 267
 #define OPT_SSI		268
@@ -162,10 +162,12 @@ void print_help(const char *arg0)
 	printf("        nec:<code> as NEC shows it (\"Tokyo hex\", the local address * %d).\n", 1 << ERMES_NEC_SHIFT);
 	printf("    --page-delay <seconds>\n");
 	printf("        Let the receiver find the channel first. (default %.0f)\n", page_delay);
-	printf("    --numbers <file>\n");
-	printf("        Last message number of each address, kept across runs: a receiver\n");
-	printf("        reports missing messages when the numbers start again.\n");
-	printf("        (default ~/.osmocom/analog/ermes_numbers)\n");
+	printf("    --book <file>\n");
+	printf("        Subscriber book: one receiver per line, <local address> key=value ...\n");
+	printf("        For now the last message number of each (number=1..31), kept across\n");
+	printf("        runs: a receiver reports missing messages when the numbers start again.\n");
+	printf("        Without it, the numbers of an earlier ermes_numbers file are taken over.\n");
+	printf("        (default ~/.osmocom/analog/ermes_book)\n");
 	printf("    --fifo <path>\n");
 	printf("        Named pipe for pages, one per line as --page. (default %s)\n", MSG_SEND_DEFAULT);
 	printf("    FIFO protocol (as flex and pocsag):\n");
@@ -207,7 +209,7 @@ static void add_options(void)
 	option_add('M', "message", 1);
 	option_add(OPT_PAGE, "page", 1);
 	option_add(OPT_PAGE_DELAY, "page-delay", 1);
-	option_add(OPT_NUMBERS, "numbers", 1);
+	option_add(OPT_BOOK, "book", 1);
 	option_add(OPT_CHARSET, "charset", 1);
 	option_add(OPT_CHARSET_PRINT, "charset-print", 1);
 	option_add(OPT_SSI, "ssi", 1);
@@ -373,8 +375,8 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_PAGE_DELAY:
 		page_delay = atof(argv[argi]);
 		break;
-	case OPT_NUMBERS:
-		number_file = options_strdup(argv[argi]);
+	case OPT_BOOK:
+		book_file = options_strdup(argv[argi]);
 		break;
 	case OPT_FIFO:
 		msg_send_path = options_strdup(argv[argi]);
@@ -474,17 +476,20 @@ int main(int argc, char *argv[])
 	if (msg_fifo_open(&msg_fifo, msg_send_path, msg_send_file) < 0)
 		goto fail;
 
-	if (number_file)
-		ermes_number_file = number_file;
+	if (book_file)
+		ermes_book_file = book_file;
 	else if (getenv("HOME")) {
-		static char path[512];
+		static char path[512], old[512];
 
 		snprintf(path, sizeof(path), "%s/.osmocom", getenv("HOME"));
 		mkdir(path, 0755);
 		snprintf(path, sizeof(path), "%s/.osmocom/analog", getenv("HOME"));
 		mkdir(path, 0755);
-		snprintf(path, sizeof(path), "%s/.osmocom/analog/ermes_numbers", getenv("HOME"));
-		ermes_number_file = path;
+		snprintf(path, sizeof(path), "%s/.osmocom/analog/ermes_book", getenv("HOME"));
+		ermes_book_file = path;
+		/* the message numbers file of earlier versions, taken over when there is no book yet */
+		snprintf(old, sizeof(old), "%s/.osmocom/analog/ermes_numbers", getenv("HOME"));
+		ermes_book_old_numbers = old;
 	}
 
 	fm_init(fast_math);

@@ -17,53 +17,20 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
  * The pager checks the sequence and reports missing messages, so the last number of every
- * address is kept in a file across runs ("<address hex> <number>" per line).
+ * address is kept in the subscriber book across runs.
  */
 
-#include <stdio.h>
-#include "../liblogging/logging.h"
 #include "numbers.h"
+#include "book.h"
 
-const char *ermes_number_file = NULL;
-
-#define MAX_NUMBERS	1024
 #define LAST_NUMBER	31
-
-static uint32_t addr[MAX_NUMBERS];
-static int last[MAX_NUMBERS];		/* last number given, 0 = none yet */
-static int count = -1;
-
-/* the counters, read from the file at first use */
-static void load(void)
-{
-	FILE *fp;
-
-	if (count >= 0)
-		return;
-	count = 0;
-	if (ermes_number_file && (fp = fopen(ermes_number_file, "r"))) {
-		unsigned int a;
-		int n;
-
-		while (count < MAX_NUMBERS && fscanf(fp, "%x %d", &a, &n) == 2) {
-			addr[count] = a;
-			last[count++] = n;
-		}
-		fclose(fp);
-	}
-}
 
 /* the last number given to the address, 0 if none */
 static int last_number(uint32_t local_address)
 {
-	int i;
+	ermes_subscriber_t *s = ermes_book_find(local_address, 0);
 
-	load();
-	for (i = 0; i < count; i++) {
-		if (addr[i] == local_address)
-			return last[i];
-	}
-	return 0;
+	return s ? s->number : 0;
 }
 
 int ermes_number_peek(uint32_t local_address, int ahead)
@@ -73,29 +40,11 @@ int ermes_number_peek(uint32_t local_address, int ahead)
 
 int ermes_number_next(uint32_t local_address)
 {
-	FILE *fp;
-	int i;
+	ermes_subscriber_t *s = ermes_book_find(local_address, 1);
 
-	load();
-	for (i = 0; i < count; i++) {
-		if (addr[i] == local_address)
-			break;
-	}
-	if (i == count) {
-		if (count == MAX_NUMBERS)
-			return 1;
-		addr[count] = local_address;
-		last[count++] = 0;
-	}
-	last[i] = (last[i] % LAST_NUMBER) + 1;
-
-	if (ermes_number_file && (fp = fopen(ermes_number_file, "w"))) {
-		int j;
-
-		for (j = 0; j < count; j++)
-			fprintf(fp, "0x%06X %d\n", addr[j], last[j]);
-		fclose(fp);
-	} else if (ermes_number_file)
-		LOGP(DERMES, LOGL_ERROR, "Cannot write message numbers to '%s'.\n", ermes_number_file);
-	return last[i];
+	if (!s)
+		return 1;
+	s->number = (s->number % LAST_NUMBER) + 1;
+	ermes_book_save();
+	return s->number;
 }

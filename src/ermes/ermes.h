@@ -21,6 +21,7 @@
 #include "../libfsk/fsk_nrz.h"
 #include "frame.h"
 #include "queue.h"
+#include "book.h"
 #include "numbers.h"
 #include "ssi.h"
 #include "scheduler.h"

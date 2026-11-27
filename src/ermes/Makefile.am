@@ -6,6 +6,7 @@ bin_PROGRAMS = \
 ermes_SOURCES = \
 	code.c \
 	frame.c \
+	book.c \
 	numbers.c \
 	queue.c \
 	ssi.c \
