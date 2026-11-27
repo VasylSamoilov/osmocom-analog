@@ -153,6 +153,7 @@ static ermes_msg_t *new_msg(uint32_t local_address, const ermes_page_opts_t *opt
 	m->page.category = category;
 	m->page.urgent = opts->urgent;
 	m->page.alert = opts->alert;
+	m->page.last_number = opts->last_number;
 	m->page.text = m->text;
 	m->page.charset = opts->charset ? opts->charset : ermes_charset;
 	nd = ermes_data_words(&m->page, data, ERMES_MAX_MSG_WORDS);

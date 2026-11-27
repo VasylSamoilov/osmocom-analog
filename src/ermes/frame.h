@@ -63,6 +63,9 @@ typedef struct ermes_page {
 	int			alert;		/* 0..7 */
 	const char		*text;		/* UTF-8 */
 	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = ERMES standard (Table B.3) */
+	int			last_number;	/* retransmission of the latest message number (-2
+						 * §4.3.1.3.3, -4 Table 15): AII 1, AIT 100, AIN 0001,
+						 * no data; number = the latest one sent to the receiver */
 	int			group_pointer;	/* stage 2 of a group call (§10.3): 1..16 = CTAP 0..15,
 						 * sent as AII 1, AIT 111, AIN = CTAP, no data; 0 = none.
 						 * Without no_ia: with the initial address (stage 1

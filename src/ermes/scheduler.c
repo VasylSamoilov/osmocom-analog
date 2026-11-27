@@ -469,12 +469,22 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			 * ones before it take the numbers ahead of it */
 			for (ahead = 0, i = 0; i < n; i++) {
 				if (pages[i].local_address == m->page.local_address)
-					ahead += (msgs[i]->page.number < 0);
+					ahead += (msgs[i]->page.number < 0 && !msgs[i]->page.last_number);
+			}
+			/* lastnum: the latest number, including new ones before it in this batch; none
+			 * sent yet: nothing to repeat */
+			if (m->page.last_number && !ermes_number_peek(m->page.local_address, ahead - 1)) {
+				LOGP_CHAN(DERMES, LOGL_ERROR, "No message was sent to %s yet: no latest message number to send.\n",
+					  ermes_print_address(m->page.local_address));
+				ermes_queue_remove(&ermes_queue, m);
+				break;
 			}
 			msgs[n] = m;
 			pages[n] = m->page;
 			/* a retransmission keeps the number of its first transmission */
-			if (m->page.number < 0)
+			if (m->page.last_number)
+				pages[n].number = ermes_number_peek(m->page.local_address, ahead - 1);
+			else if (m->page.number < 0)
 				pages[n].number = ermes_number_peek(m->page.local_address, ahead);
 			n++;
 		}
@@ -505,7 +515,7 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 		m = msgs[i];
 		/* the batch builder sends the first pages given (on the air in ascending order of
 		 * local address; several to one address keep the order of their numbers) */
-		if (m->page.number < 0) {
+		if (m->page.number < 0 && !m->page.last_number) {
 			if (ermes_number_next(m->page.local_address) != pages[i].number)
 				LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);
 			m->page.number = pages[i].number;

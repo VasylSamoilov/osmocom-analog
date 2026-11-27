@@ -98,6 +98,8 @@ static inline int ermes_address_batch(uint32_t local_address)
 #define ERMES_AIT_BITS		3	/* §5.5.1.2 Fig.12 p.19: VIF with AII = 1 = AIT + AIN */
 #define ERMES_AIN_BITS		4
 #define ERMES_AIT_CTAP		0x7	/* Table 10: 111 common temporary address pointers */
+#define ERMES_AIT_MISC		0x4	/* Table 10: 100 miscellaneous (Table 15) */
+#define ERMES_AIN_LAST_NUMBER	0x1	/* Table 15: 0001 retransmission of latest message number */
 #define ERMES_CTAP_COUNT	16
 static inline int ermes_is_cta(uint32_t local_address)
 {

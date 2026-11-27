@@ -119,6 +119,11 @@ void ermes_header_words(const ermes_page_t *page, uint32_t info[2])
 		field(&h, 1, FLAG_BITS);
 		field(&h, ERMES_AIT_CTAP, ERMES_AIT_BITS);
 		field(&h, page->group_pointer - 1, ERMES_AIN_BITS);
+	} else if (page->last_number) {
+		/* §5.5.1.2.3 Table 15: AII 1, AIT 100, AIN 0001, the AIF has zero length */
+		field(&h, 1, FLAG_BITS);
+		field(&h, ERMES_AIT_MISC, ERMES_AIT_BITS);
+		field(&h, ERMES_AIN_LAST_NUMBER, ERMES_AIN_BITS);
 	} else {
 		field(&h, 0, FLAG_BITS);	/* AII: no additional information */
 		field(&h, 0, FLAG_BITS);	/* RSVD */
@@ -209,7 +214,7 @@ int ermes_data_words(const ermes_page_t *page, uint32_t *info, int max_words)
 	int n, i, code;
 
 	/* the group call pointer has no additional information field (Table 16: zero length) */
-	if (page->group_pointer)
+	if (page->group_pointer || page->last_number)
 		return 0;
 	switch (page->category) {
 	case ERMES_CAT_TONE:
@@ -587,6 +592,11 @@ const char *ermes_page_str(const ermes_page_t *page)
 	if (page->group_pointer) {
 		snprintf(buf, sizeof(buf), "%s, group call: the message follows at the common temporary address of CTAP %d",
 			 number, page->group_pointer - 1);
+		return buf;
+	}
+	if (page->last_number) {
+		snprintf(buf, sizeof(buf), "%s, retransmission of the latest message number",
+			 (page->number < 0) ? "latest number taken when sent" : number);
 		return buf;
 	}
 	snprintf(buf, sizeof(buf), "%s, %s%s%s%s, %s, alert type %d", number,

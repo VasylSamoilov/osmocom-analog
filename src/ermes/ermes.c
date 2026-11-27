@@ -248,12 +248,20 @@ int ermes_msg_send(const char *line)
 		LOGP(DERMES, LOGL_ERROR, "No address in \"%s\".\n", line);
 		return -1;
 	}
-	if (field[0] && *field[0] && (ermes_category_from_name(field[0], &opts.category) < 0 || opts.category == ERMES_CAT_TRANSPARENT)) {
-		LOGP(DERMES, LOGL_ERROR, "Bad type \"%s\": tone, numeric or alpha.\n", field[0]);
+	if (field[0] && !strcasecmp(field[0], "lastnum")) {
+		/* the latest message number again (-2 §4.3.1.3.3): a header only */
+		opts.last_number = 1;
+		opts.category = ERMES_CAT_TONE;
+	} else if (field[0] && *field[0] && (ermes_category_from_name(field[0], &opts.category) < 0 || opts.category == ERMES_CAT_TRANSPARENT)) {
+		LOGP(DERMES, LOGL_ERROR, "Bad type \"%s\": tone, numeric, alpha or lastnum.\n", field[0]);
 		return -1;
 	}
 	if (field[1] && ermes_parse_page_opts(field[1], &opts) < 0)
 		return -1;
+	if (opts.last_number && (group || opts.retransmit)) {
+		LOGP(DERMES, LOGL_ERROR, "lastnum goes to one receiver, without retransmit.\n");
+		return -1;
+	}
 	if (field[2])
 		text = field[2];
 	if (group)
