@@ -70,8 +70,8 @@ shifted left by two bits. The code on the label is this value. A `nec:` code
 must be a multiple of 4 (its two lowest bits zero) and at most `FFFFFC`:
 `nec:C63901` is refused.
 
-A decimal address with a leading zero is read as octal (`0123456` is
-42798). Write decimal addresses without leading zeros, or use hex.
+A decimal address may have leading zeros (`0000083` is 83, as the console
+dials 7 digits); hex needs `0x`.
 
 The parts of a local address:
 
@@ -225,9 +225,7 @@ or put the lines in a file and run with `--fifo-file pages.txt`.
 
 Call control: the console dials exactly 7 digits, the local address in
 decimal; it pages with type `-y` and the text `-M`. Addresses below 1000000
-need leading zeros there and are then read as octal or refused (see
-Addresses), so the
-console reaches only addresses 1000000 and up. Over the Osmo-CC socket the
+are dialled with leading zeros (`0000083`). Over the Osmo-CC socket the
 called number is the address and the caller ID, if any, is the text.
 
 ### Message numbers
@@ -276,13 +274,16 @@ numeric pages, codepage characters only in alphanumeric pages.
 
 ## Codepages
 
-Alphanumeric pages are coded with a codepage of 128 characters. The ERMES
-codepages:
+Alphanumeric pages are coded with a codepage of 128 characters (7 bits). The
+ERMES codepages:
 
-| Name                         | Bits | Use |
-|------------------------------|------|-----|
-| `generic-generic-standard`   | 7    | the ERMES character set, ETS 300 133-2 Table B.3: the default for alphanumeric pages |
-| `generic-generic-numeric`    | 4    | Table B.1: numeric pages always use it |
+| Name                         | Use |
+|------------------------------|-----|
+| `generic-generic-standard`   | the ERMES character set, ETS 300 133-2 Table B.3: the default |
+
+Numeric pages have no codepage: numeric is a message type with one fixed set
+of 16 characters (Table B.1, see Message formats), as in the other paging
+protocols.
 
 - `--charset list` lists them.
 - `--charset-print <name>` prints a table, e.g.
@@ -294,10 +295,6 @@ The standard table has ASCII letters, digits and most signs, LF and CR, and
 `@ £ $ ¥ è é ù ì ò ç Ø ø Å å Δ Φ Γ Λ Ω Π ψ Σ θ Ξ Æ æ ß É ¤ ¡ Ä Ö Ñ Ü § ¿ ä ö
 ñ ü à`. It has no `~`, `{`, `}`, `[`, `]`, `\`, `^`, `_`, `` ` `` or `|`, and no
 Cyrillic. A page with a character that is not in its codepage is refused.
-
-Use `generic-generic-numeric` only for numeric pages (they take it by
-themselves); as the codepage of an alphanumeric page it gives a wrong
-message.
 
 ## Time and date
 

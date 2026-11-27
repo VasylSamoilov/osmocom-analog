@@ -148,12 +148,12 @@ void print_help(const char *arg0)
 	printf("        Type of pages without a type. (default %s)\n",
 	       ermes_category_name(ermes_default_opts.category));
 	printf("    --urgent\n");
-	printf("        Pages without a type are urgent (UMI, Table 9).\n");
+	printf("        Pages are urgent (UMI, Table 9) unless their line says urgent=0.\n");
 	printf("    --alert 0..%d\n", (1 << ERMES_ALERT_BITS) - 1);
-	printf("        Alert type of pages without a type. (default %d)\n", ermes_default_opts.alert);
+	printf("        Alert type of pages whose line gives none (alert=). (default %d)\n", ermes_default_opts.alert);
 	printf("    --priority %d..%d\n", ERMES_PRIORITY_HIGH, ERMES_PRIORITY_LOW);
 	printf("        Priority of pages without one (ETS 300 133-2 4.3.2): %d goes before the\n", ERMES_PRIORITY_HIGH);
-	printf("        others, %d is normal, %d only when nothing else waits for its batch.\n", ERMES_PRIORITY_NORMAL, ERMES_PRIORITY_LOW);
+	printf("        others, %d is normal, %d after them (a batch takes them in this order).\n", ERMES_PRIORITY_NORMAL, ERMES_PRIORITY_LOW);
 	printf("        Only the queue order, nothing on the air. (default %d)\n", ermes_default_opts.priority);
 	printf("    --retransmit 0..%d\n", ERMES_RETRANSMIT_MAX);
 	printf("        Times a page without one is sent again after the first, with the same\n");
@@ -175,8 +175,9 @@ void print_help(const char *arg0)
 	printf("        Let the receiver find the channel first. (default %.0f)\n", page_delay);
 	printf("    --book <file>\n");
 	printf("        Subscriber book: one receiver per line, <local address> key=value ...\n");
-	printf("        For now the last message number of each (number=1..31), kept across\n");
-	printf("        runs: a receiver reports missing messages when the numbers start again.\n");
+	printf("        number=1..31: the last message number, kept across runs (a receiver\n");
+	printf("        reports missing messages when the numbers start again); fsn=0..15: the\n");
+	printf("        receiver's frequency subset number (see --fsi). The program rewrites it.\n");
 	printf("        Without it, the numbers of an earlier ermes_numbers file are taken over.\n");
 	printf("        (default ~/.osmocom/analog/ermes_book)\n");
 	printf("    --fifo <path>\n");
@@ -364,7 +365,7 @@ static int handle_options(int short_option, int argi, char **argv)
 		else if (!strcasecmp(argv[argi], "day-month-year"))
 			ermes_ssi_mode = ERMES_SSIT_DAY_MONTH_YEAR;
 		else {
-			fprintf(stderr, "Given SSI is not alternate, zone-hour-date or day-month-year.\n");
+			fprintf(stderr, "Given SSI is not hold, or a test mode: alternate, cycle, strict, pairs, zone-hour-date, day-month-year.\n");
 			return -EINVAL;
 		}
 		break;

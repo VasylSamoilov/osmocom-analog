@@ -124,11 +124,29 @@ void ermes_header_words(const ermes_page_t *page, uint32_t info[2])
 	info[1] = h & ((1u << ERMES_INFO_BITS) - 1);
 }
 
-/* The codepage of a page: numeric Table B.1, alphanumeric the page's (default Table B.3) */
+/* Numeric paging: one fixed set of 16 characters, 4 bits each, code = position
+ * (ETS 300 133-2 Annex B.1 Table B.1); a message type, not a codepage */
+static const char numeric_chars[ERMES_NUMERIC_CODES + 1] = "0123456789/ U-.%";
+#define NUMERIC_SPACE	0xB	/* fill (§5.5.4 p.23) */
+
+int ermes_numeric_code(char c)
+{
+	const char *p;
+
+	if (c == 'u')
+		c = 'U';
+	p = (c) ? strchr(numeric_chars, c) : NULL;
+	return p ? (int)(p - numeric_chars) : -1;
+}
+
+char ermes_numeric_char(int code)
+{
+	return (code >= 0 && code < ERMES_NUMERIC_CODES) ? numeric_chars[code] : '?';
+}
+
+/* The codepage of an alphanumeric page: the page's, default Table B.3 */
 static const struct pager_charset *page_charset(const ermes_page_t *page)
 {
-	if (page->category == ERMES_CAT_NUMERIC)
-		return &pager_charset_ermes_generic_generic_numeric;
 	return page->charset ? page->charset : &pager_charset_ermes_generic_generic_standard;
 }
 
@@ -178,35 +196,42 @@ static int fill_word(struct bitwriter *w, uint32_t pattern, int len)
 int ermes_data_words(const ermes_page_t *page, uint32_t *info, int max_words)
 {
 	struct bitwriter w = { info, max_words, 0 };
-	const struct pager_charset *cs = page_charset(page);
 	const char *text = page->text ? page->text : "";
-	uint8_t codes[ERMES_MAX_MSG_WORDS * ERMES_INFO_BITS / ERMES_NUMERIC_BITS];
-	const char *space = " ";
-	int n, i, fill;
+	uint8_t codes[ERMES_MAX_MSG_WORDS * ERMES_INFO_BITS / ERMES_ALPHA_BITS];
+	const struct pager_charset *cs;
+	int n, i, code;
 
-	if (page->category == ERMES_CAT_TONE)
+	switch (page->category) {
+	case ERMES_CAT_TONE:
 		return 0;
-	if (page->category != ERMES_CAT_NUMERIC && page->category != ERMES_CAT_ALPHA)
-		return -1;
-	n = pager_charset_encode_text(cs, text, strlen(text), codes, sizeof(codes), NULL);
-	if (n < 0)
-		return -1;
-	for (i = 0; i < n; i++) {
-		if (put_bits(&w, codes[i], cs->code_bits) < 0)
+	case ERMES_CAT_NUMERIC:
+		/* Table B.1, no terminator; space and partial spaces fill the codeword (§5.5.4 p.23) */
+		for (i = 0; text[i]; i++) {
+			code = ermes_numeric_code(text[i]);
+			if (code < 0 || put_bits(&w, code, ERMES_NUMERIC_BITS) < 0)
+				return -1;
+		}
+		if (fill_word(&w, NUMERIC_SPACE, ERMES_NUMERIC_BITS) < 0)
 			return -1;
-	}
-	if (page->category == ERMES_CAT_NUMERIC) {
-		/* no terminator; space and partial spaces fill the codeword (§5.5.4 p.23) */
-		fill = pager_charset_encode(cs, &space);
-	} else {
-		/* EOM, then EOM and partial EOM fill the codeword (§5.5.4 p.23) */
-		if (put_bits(&w, ERMES_EOM, cs->code_bits) < 0)
+		return w.nbits / ERMES_INFO_BITS;
+	case ERMES_CAT_ALPHA:
+		/* the codepage, then EOM, then EOM and partial EOM fill the codeword (§5.5.4 p.23) */
+		cs = page_charset(page);
+		n = pager_charset_encode_text(cs, text, strlen(text), codes, sizeof(codes), NULL);
+		if (n < 0)
 			return -1;
-		fill = ERMES_EOM;
-	}
-	if (fill_word(&w, fill, cs->code_bits) < 0)
+		for (i = 0; i < n; i++) {
+			if (put_bits(&w, codes[i], ERMES_ALPHA_BITS) < 0)
+				return -1;
+		}
+		if (put_bits(&w, ERMES_EOM, ERMES_ALPHA_BITS) < 0)
+			return -1;
+		if (fill_word(&w, ERMES_EOM, ERMES_ALPHA_BITS) < 0)
+			return -1;
+		return w.nbits / ERMES_INFO_BITS;
+	default:
 		return -1;
-	return w.nbits / ERMES_INFO_BITS;
+	}
 }
 
 static void put_word(uint8_t *bits, int *n, uint32_t cw)
@@ -380,9 +405,16 @@ int ermes_parse_address(const char *s, uint32_t *local_address)
 
 	if (nec)
 		s += strlen(NEC_PREFIX);
-	if (!*s)
+	if (!*s || *s == '-' || *s == '+')
 		return -1;
-	v = strtoul(s, &end, nec ? 16 : 0);
+	/* hex only with 0x (or nec:): a decimal number with leading zeros, as the console dials 7
+	 * digits ("0000083"), is decimal, not octal */
+	if (nec)
+		v = strtoul(s, &end, 16);
+	else if (!strncasecmp(s, "0x", 2))
+		v = strtoul(s + 2, &end, 16);
+	else
+		v = strtoul(s, &end, 10);
 	if (*end)
 		return -1;
 	if (nec) {

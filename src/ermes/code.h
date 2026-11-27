@@ -70,6 +70,7 @@
 #define ERMES_CATEGORY_BITS	2	/* Fig.11 p.19 */
 #define ERMES_ALERT_BITS	3
 #define ERMES_NUMERIC_BITS	4	/* ETS 300 133-2 B.1 p.45 */
+#define ERMES_NUMERIC_CODES	16	/* Table B.1: the 16 characters of numeric paging */
 #define ERMES_ALPHA_BITS	7	/* ETS 300 133-2 B.2 p.46 */
 #define ERMES_FSI_ALL		30	/* single channel network: every FSN (§9.2 p.29) */
 #define ERMES_CHANNELS		16	/* §8.2 p.25: n = 1..16 */

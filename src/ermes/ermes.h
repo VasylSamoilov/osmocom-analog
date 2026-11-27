@@ -52,7 +52,8 @@ typedef struct ermes {
 int ermes_create(const char *kanal, int channel, const char *device, int use_sdr, int samplerate, double rx_gain, double tx_gain, double polarity, const ermes_network_t *net, const char *write_rx_wave, const char *write_tx_wave, const char *read_rx_wave, const char *read_tx_wave, int loopback);
 void ermes_destroy(sender_t *sender);
 
-/* Queue a page: "<local address>[,tone|numeric|alpha[,<text>]]"; the address is decimal or 0x hex */
+/* Queue a page from a FIFO or --page line, as flex and pocsag: "address,type,options,message"
+ * (the message is the rest of the line); the address decimal, 0x hex or nec:<label code> */
 int ermes_msg_send(const char *line);
 
 /* 1 if nothing is queued */

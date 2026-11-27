@@ -27,7 +27,6 @@ libpagercharset_a_SOURCES = \
 	charset_pocsag_swissphone_de506_cyrillic.c \
 	charset_golay_generic_ascii.c \
 	charset_ermes_generic_standard.c \
-	charset_ermes_generic_numeric.c \
 	charset_flex_generic_ascii.c \
 	charset_flex_motorola_linguist_arabic.c \
 	charset_flex_motorola_linguist_arabic_english.c \

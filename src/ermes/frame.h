@@ -83,6 +83,11 @@ uint32_t ermes_ssi_word(const ermes_ssi_t *ssi);
 /* Message header (§5.5.1 Fig.10-11 p.18-19): two 18-bit information words */
 void ermes_header_words(const ermes_page_t *page, uint32_t info[2]);
 
+/* Numeric paging (ETS 300 133-2 Table B.1): code 0..15 of a character ("0123456789/ U-.%", u = U),
+ * -1 if it has none; and the character of a code */
+int ermes_numeric_code(char c);
+char ermes_numeric_char(int code);
+
 /* Message data as 18-bit information words after the header, with termination and fill
  * (§5.5.4 p.22-23). Returns the number of words, -1 on a character that can't be coded. */
 int ermes_data_words(const ermes_page_t *page, uint32_t *info, int max_words);

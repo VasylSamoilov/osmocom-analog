@@ -52,7 +52,6 @@ static const struct pager_charset *registry[] = {
 	&pager_charset_golay_generic_generic_ascii,
 	/* ERMES */
 	&pager_charset_ermes_generic_generic_standard,
-	&pager_charset_ermes_generic_generic_numeric,
 	/* FLEX */
 	&pager_charset_flex_generic_generic_ascii,
 	&pager_charset_flex_motorola_linguist_cyrillic,

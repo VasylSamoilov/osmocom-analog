@@ -170,8 +170,11 @@ extern const struct pager_charset pager_charset_pocsag_nec_skyper_ascii_rot1;
 /* --- Built-in Golay/GSC codepages (6-bit, 64 codes) --- */
 
 extern const struct pager_charset pager_charset_golay_generic_generic_ascii;
+
+/* --- Built-in ERMES codepages (7-bit, 128 codes; numeric paging is the fixed Table B.1 of the
+ * protocol, not a codepage) --- */
+
 extern const struct pager_charset pager_charset_ermes_generic_generic_standard;
-extern const struct pager_charset pager_charset_ermes_generic_generic_numeric;
 
 /* --- Built-in FLEX codepages (7-bit, 128 codes) --- */
 
