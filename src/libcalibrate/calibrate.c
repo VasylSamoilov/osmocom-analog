@@ -48,6 +48,15 @@
 #define NO_FCCH_SEC     2.0
 /* nor one with fewer than 3 in this time */
 #define FEW_FCCH_SEC    4.0
+/* nor one whose first FCCH are this weak (mean SNR); the run stops after
+ * this many carriers in a row (strongest first) without a confirmed one */
+#define WEAK_FCCH_COUNT 5
+#define WEAK_FCCH_SNR_DB 10.0
+#define WEAK_IN_A_ROW   8
+/* a carrier with this many offsets after this time is done (trimmed mean
+ * from 17 on) */
+#define SLOW_SEC        6.0
+#define SLOW_MIN        20
 
 /* GSM channel spacing */
 #define CHANNEL_SPACING 200000  /* 200 kHz */
@@ -643,13 +652,31 @@ typedef struct {
 	calibrate_cell_t *cell;
 } wchan_t;
 
-/* the CPU measurement of the first window */
+/* the CPU measurement of the first window, shares of one core, split into
+ * what grows with the SDR rate and what does not */
 typedef struct {
 	int		done;
-	double		per_channel;	/* share of a core per channel (main thread) */
-	double		transport;	/* share of a core of the other threads */
+	int		rate;		/* SDR rate measured at */
+	double		per_channel;	/* main thread per channel: separation + detection */
+	double		transport;	/* the reading: other threads + the main thread's reads */
+	double		sep;		/* per channel: separation (grows with the rate) */
+	double		det;		/* per channel: FCCH, SCH, BCCH (does not) */
 	int		budget_channels;
+	int		applied;	/* the rate chosen from it */
 } cpu_meter_t;
+
+/* channels that fit the budget at another rate, from the measurement:
+ * the reading and the separation scale with the rate */
+static int budget_at(const cpu_meter_t *m, double cpu_percent, int rate)
+{
+	double x = (double)rate / m->rate;
+	double c = m->sep * x + m->det;
+	double free = 0.85 * cpu_percent / 100.0 - m->transport * x;
+
+	if (c <= 0.0 || free <= 0.0)
+		return 0;
+	return (int)floor(free / c);
+}
 
 static void cell_result(wchan_t *w, int gsm_band)
 {
@@ -696,6 +723,7 @@ static int measure_window(int samplerate, int gsm_band, calibrate_config_t *conf
 			  calibrate_cell_t *cells, cpu_meter_t *meter, double t_run_start,
 			  const char *start_info)
 {
+	(void)start_info;
 	int dsp = gsm_channel_rate(samplerate);
 	int block = calib_block_samples(samplerate);
 	/* the bank from 4 channels: measured at 8 MS/s, DSP 500 k (one
@@ -777,7 +805,8 @@ static int measure_window(int samplerate, int gsm_band, calibrate_config_t *conf
 	settle_rx();
 
 	double t0 = now_sec(), thr0 = cpu_sec(CLOCK_THREAD_CPUTIME_ID), proc0 = cpu_sec(CLOCK_PROCESS_CPUTIME_ID);
-	int left = n;
+	double tc_read = 0.0, tc_sep = 0.0;	/* main thread CPU: reading, separation */
+	int left = n, probe_end = 0;
 
 	while (left > 0) {
 		double t = now_sec() - t0;
@@ -788,35 +817,40 @@ static int measure_window(int samplerate, int gsm_band, calibrate_config_t *conf
 			break;
 		}
 		/* the budget is the whole program's (the reading too), with 15 %
-		 * margin; the cost per channel measured here (on the chain it is
-		 * not less than on the bank from 4 channels, by the bench) */
+		 * margin: what each part costs, measured here */
 		if (meter && !meter->done && t >= CPU_MEASURE_SEC) {
 			double thr = cpu_sec(CLOCK_THREAD_CPUTIME_ID) - thr0;
 			double proc = cpu_sec(CLOCK_PROCESS_CPUTIME_ID) - proc0;
 
-			meter->per_channel = thr / t / n;
-			meter->transport = (proc - thr) / t;
-			meter->budget_channels = (int)floor((0.85 * config->cpu_percent / 100.0 - meter->transport) / meter->per_channel);
+			meter->rate = samplerate;
+			meter->transport = (proc - thr + tc_read) / t;
+			meter->sep = tc_sep / t / n;
+			meter->det = (thr - tc_read - tc_sep) / t / n;
+			meter->per_channel = meter->sep + meter->det;
+			meter->budget_channels = budget_at(meter, config->cpu_percent, samplerate);
 			if (meter->budget_channels < 1)
 				meter->budget_channels = 1;
 			meter->done = 1;
-			LOGP(DSDR, LOGL_NOTICE, "%s, %d channels per window (%s%.0f %% of a core with the reading, 15 %% kept free: %.1f %% per channel measured), reading %.1f %% of a core\n",
-			     start_info ? start_info : "", config->num_channels ? config->num_channels : meter->budget_channels,
-			     config->num_channels ? "forced; budget " : "budget ", config->cpu_percent,
-			     100.0 * meter->per_channel, 100.0 * meter->transport);
-			if (config->num_channels && config->num_channels * meter->per_channel + meter->transport > config->cpu_percent / 100.0)
-				LOGP(DSDR, LOGL_NOTICE, "--channels %d needs about %.0f %% of a core with the reading, more than the budget of %.0f %%\n",
-				     config->num_channels, 100.0 * (config->num_channels * meter->per_channel + meter->transport), config->cpu_percent);
+			/* the rate may change: this window was the probe, its
+			 * carriers are measured again at the rate chosen */
+			if (config->reopen) {
+				probe_end = 1;
+				break;
+			}
 		}
 
+		double tc = cpu_sec(CLOCK_THREAD_CPUTIME_ID);
 		int got = receive_iq_blocking(band, block);
 		if (got <= 0) {
 			LOGP(DSDR, LOGL_ERROR, "No samples from the SDR\n");
 			rc = -EIO;
 			break;
 		}
+		double tc2 = cpu_sec(CLOCK_THREAD_CPUTIME_ID);
+		tc_read += tc2 - tc;
 		sdr_engine_rx_feed(&eng, band, got);
 		int rows = sdr_engine_group_read(grp, oi, oq, rows_max);
+		tc_sep += cpu_sec(CLOCK_THREAD_CPUTIME_ID) - tc2;
 		if (rows <= 0)
 			continue;
 
@@ -873,17 +907,42 @@ static int measure_window(int samplerate, int gsm_band, calibrate_config_t *conf
 			}
 			if (!ch->finished && ch->nmeas >= AVG_COUNT && (ch->dec == DEC_DONE || !ch->sch_ok))
 				ch->finished = 1;
+			/* a slow one (weak, at the window's edge: 50 FCCH once took
+			 * 22 s) does not hold the window: what it has after SLOW_SEC */
+			if (!ch->finished && t > SLOW_SEC && ch->nmeas >= SLOW_MIN && (ch->dec == DEC_DONE || !ch->sch_ok)) {
+				LOGP(DSDR, LOGL_INFO, "  ARFCN %d: %d FCCH in %.1f s, enough\n", ch->entry->arfcn, ch->nmeas, t);
+				ch->finished = 1;
+			}
 			/* no BCCH carrier */
 			if (!ch->finished && ((t > NO_FCCH_SEC && ch->nmeas == 0) || (t > FEW_FCCH_SEC && ch->nmeas < 3))) {
 				LOGP(DSDR, LOGL_INFO, "  ARFCN %d: %d FCCH in %.1f s, no BCCH carrier\n",
 				     ch->entry->arfcn, ch->nmeas, t);
 				ch->finished = 1;
 			}
+			/* tones too weak for a BCCH carrier that can confirm: the
+			 * confirmed ones gave a mean FCCH SNR of 12.7-14 dB, the
+			 * carriers without a BCCH 6.5-8.4 dB (B210, GSM-900/1800) */
+			if (!ch->finished && ch->nmeas >= WEAK_FCCH_COUNT && !(config->confirm && ch->cell->confirmed)) {
+				double s = 0.0;
+
+				for (int i = 0; i < ch->nmeas; i++)
+					s += ch->snrs[i];
+				if (s / ch->nmeas < WEAK_FCCH_SNR_DB && !config->full) {
+					LOGP(DSDR, LOGL_INFO, "  ARFCN %d: FCCH SNR %.1f dB after %d, too weak to confirm\n",
+					     ch->entry->arfcn, s / ch->nmeas, ch->nmeas);
+					ch->finished = 1;
+				}
+			}
 			if (ch->finished) {
 				cell_result(ch, gsm_band);
 				left--;
 			}
 		}
+	}
+	if (probe_end) {
+		LOGP(DSDR, LOGL_INFO, "Window at %.3f MHz: the cost measured in %.1f s\n", centre / 1e6, now_sec() - t0);
+		rc = -EAGAIN;
+		goto out_chan;
 	}
 	/* what did not finish (timeout, error) */
 	for (c = 0; c < n; c++)
@@ -976,19 +1035,27 @@ static int evaluate(calibrate_result_t *r, const calibrate_config_t *config)
 static double window_centre(const arfcn_power_t *list, int n, int first, double reach, int per_window)
 {
 	double best_centre = list[first].freq + CHANNEL_SPACING / 2.0;
-	int best = -1;
+	double best = -1.0;
 
 	if (per_window <= 1)
 		return best_centre;
 	for (int j = -(int)(reach / CHANNEL_SPACING) - 1; j <= (int)(reach / CHANNEL_SPACING); j++) {
 		double c = list[first].freq + CHANNEL_SPACING / 2.0 + j * CHANNEL_SPACING;
-		int count = 0;
+		double count = 0.0;
+		int rank = 0;
 
 		if (fabs(list[first].freq - c) > reach)
 			continue;
-		for (int i = 0; i < n; i++)
-			if (!list[i].done && fabs(list[i].freq - c) <= reach)
-				count++;
+		/* the strong ones count (the 2 x per_window strongest not
+		 * measured yet), the weaker only to break ties: they rarely
+		 * confirm */
+		for (int i = 0; i < n; i++) {
+			if (list[i].done)
+				continue;
+			if (fabs(list[i].freq - c) <= reach && fabs(list[i].freq - c) >= DC_GUARD_HZ)
+				count += (rank < 2 * per_window) ? 1.0 : 0.001;
+			rank++;
+		}
 		if (count > best || (count == best && fabs(c - list[first].freq) < fabs(best_centre - list[first].freq))) {
 			best = count;
 			best_centre = c;
@@ -1001,29 +1068,140 @@ static double window_centre(const arfcn_power_t *list, int n, int first, double 
  * Main entry point
  * ================================================================ */
 
+/* channels one window can hold at this rate (the usable part; without a
+ * bank, at most the chain's) */
+static int rate_capacity(int samplerate)
+{
+	int capacity = window_capacity(samplerate);
+
+	if (capacity > SDR_ENGINE_MAX_CHAN)
+		capacity = SDR_ENGINE_MAX_CHAN;
+	if (sdr_engine_bins(samplerate, gsm_channel_rate(samplerate), 8) == 0 && capacity > SDR_ENGINE_MAX_CHAIN)
+		capacity = SDR_ENGINE_MAX_CHAIN;
+	return capacity;
+}
+
+/* After the measurement: the rate (from the one opened, the widest, down
+ * by halves to 1 MS/s) with the most channels per window in the budget
+ * (ties: the wider, no reopen), from what the reading, the separation and
+ * the detection cost at the rate opened; reopens the SDR if another one.
+ * Logs the start line. Returns 0, <0 if the reopen failed. */
+/* the most carriers not measured yet that one window at this rate takes */
+static int rate_cover(const arfcn_power_t *list, int n, int samplerate)
+{
+	double reach = window_reach(samplerate);
+	int best = 0;
+
+	for (int f = 0; f < n; f++) {
+		if (list[f].done)
+			continue;
+		double c = window_centre(list, n, f, reach, 2);
+		int k = 0;
+
+		for (int i = 0; i < n; i++)
+			if (!list[i].done && fabs(list[i].freq - c) <= reach && fabs(list[i].freq - c) >= DC_GUARD_HZ)
+				k++;
+		if (k > best)
+			best = k;
+	}
+	return best;
+}
+
+/* channels a window at this rate measures: the budget's, the capacity's,
+ * and the carriers left in reach */
+static int rate_channels(const cpu_meter_t *m, double cpu_percent, const arfcn_power_t *list, int n, int r)
+{
+	int k = budget_at(m, cpu_percent, r), c = rate_capacity(r), v = rate_cover(list, n, r);
+
+	if (k > c)
+		k = c;
+	if (k > v)
+		k = v;
+	return k;
+}
+
+static int choose_rate(calibrate_config_t *config, cpu_meter_t *m, int *samplerate, const char *start_info,
+		       const arfcn_power_t *list, int nlist)
+{
+	int best = *samplerate, best_n, r, n, max_n, i, nr = 0;
+	int rates[16], chans[16];
+
+	/* the rates from the one open down by halves, and what each measures;
+	 * the widest that gets at least 3/4 of the most (a wider window takes
+	 * the strong carriers together, a narrower one fills up with weak
+	 * ones nearby) */
+	rates[nr] = best;
+	chans[nr++] = rate_channels(m, config->cpu_percent, list, nlist, best);
+	if (config->reopen && !config->num_channels) {
+		for (r = *samplerate / 2; r >= 1000000 && !(r % 2) && nr < 16; r /= 2) {
+			if (gsm_channel_rate(r) < GSM_RATE)
+				break;
+			rates[nr] = r;
+			chans[nr++] = rate_channels(m, config->cpu_percent, list, nlist, r);
+		}
+	}
+	for (max_n = 0, i = 0; i < nr; i++)
+		if (chans[i] > max_n)
+			max_n = chans[i];
+	best_n = chans[0];
+	for (i = 0; i < nr; i++) {
+		if (4 * chans[i] >= 3 * max_n) {
+			best = rates[i];
+			best_n = chans[i];
+			break;
+		}
+	}
+	n = 0;
+	LOGP(DSDR, LOGL_NOTICE, "%s; measured at %d S/s: reading %.1f %% of a core, a channel %.1f %% (separation %.1f %%, detection %.1f %%)\n",
+	     start_info ? start_info : "", m->rate, 100.0 * m->transport, 100.0 * m->per_channel, 100.0 * m->sep, 100.0 * m->det);
+	if (best != *samplerate) {
+		int rc;
+
+		LOGP(DSDR, LOGL_NOTICE, "SDR rate %d S/s instead of %d: %d carriers per window (budget, capacity, carriers in reach) instead of %d; reopening the SDR\n",
+		     best, *samplerate, best_n, rate_channels(m, config->cpu_percent, list, nlist, *samplerate));
+		rc = config->reopen(best);
+		if (rc < 0) {
+			LOGP(DSDR, LOGL_ERROR, "Reopening the SDR at %d S/s failed\n", best);
+			return rc;
+		}
+		*samplerate = best;
+	}
+	n = budget_at(m, config->cpu_percent, *samplerate);
+	if (n > rate_capacity(*samplerate))
+		n = rate_capacity(*samplerate);
+	m->budget_channels = (n < 1) ? 1 : n;
+	LOGP(DSDR, LOGL_NOTICE, "SDR rate %d S/s, %d channels per window (%s%.0f %% of a core with the reading, 15 %% kept free)\n",
+	     *samplerate, config->num_channels ? config->num_channels : m->budget_channels,
+	     config->num_channels ? "forced; budget " : "budget ", config->cpu_percent);
+	if (config->num_channels) {
+		double x = (double)*samplerate / m->rate;
+		double need = config->num_channels * (m->sep * x + m->det) + m->transport * x;
+
+		if (need > config->cpu_percent / 100.0)
+			LOGP(DSDR, LOGL_NOTICE, "--channels %d needs about %.0f %% of a core with the reading, more than the budget of %.0f %%\n",
+			     config->num_channels, 100.0 * need, config->cpu_percent);
+	}
+	return 0;
+}
+
 int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_t *result,
 		   const char *start_info)
 {
 	int bands_to_scan[CALIB_MAX_BANDS];
-	int num_bands = 0, stop = 0;
+	int num_bands = 0, stop = 0, since_confirmed = 0;
 	int capacity, per_window;
 	double reach;
 
 	if (config->usable_fraction > 0.0)
 		calib_usable_fraction = config->usable_fraction;
 	calib_usable_max_hz = config->usable_max_hz;
-	capacity = window_capacity(samplerate);
+	capacity = rate_capacity(samplerate);
 	reach = window_reach(samplerate);
 	double t_start = now_sec();
 	cpu_meter_t meter = { 0 };
 
 	memset(result, 0, sizeof(*result));
 	result->samplerate = samplerate;
-	if (capacity > SDR_ENGINE_MAX_CHAN)
-		capacity = SDR_ENGINE_MAX_CHAN;
-	/* without a bank (rate too low for one) the chain carries at most 4 */
-	if (sdr_engine_bins(samplerate, gsm_channel_rate(samplerate), 8) == 0 && capacity > SDR_ENGINE_MAX_CHAIN)
-		capacity = SDR_ENGINE_MAX_CHAIN;
 	if (capacity < 1) {
 		LOGP(DSDR, LOGL_ERROR, "%d S/s is too narrow for a GSM channel\n", samplerate);
 		return -EINVAL;
@@ -1054,6 +1232,7 @@ int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_
 			free(list);
 			continue;
 		}
+		since_confirmed = 0;
 		while (!stop) {
 			arfcn_power_t *ents[SDR_ENGINE_MAX_CHAN];
 			int k = 0, i, first = -1;
@@ -1065,7 +1244,8 @@ int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_
 				}
 			if (first < 0 || result->num_cells >= CALIB_MAX_CELLS)
 				break;
-			double centre = window_centre(list, n, first, reach, per_window);			/* the strongest first, then the next strongest in reach */
+			double centre = window_centre(list, n, first, reach, per_window);
+			/* the strongest first, then the next strongest in reach */
 			for (i = first; i < n && k < per_window && result->num_cells + k < CALIB_MAX_CELLS; i++) {
 				if (list[i].done || fabs(list[i].freq - centre) > reach
 				 || fabs(list[i].freq - centre) < DC_GUARD_HZ)
@@ -1076,24 +1256,54 @@ int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_
 			int rc = measure_window(samplerate, band, config, centre, ents, k,
 						&result->cells[result->num_cells],
 						meter.done ? NULL : &meter, t_start, start_info);
-			if (rc < 0 && rc != -EIO)
+			if (rc == -EAGAIN) {
+				/* the probe: measured again at the rate chosen */
+				for (i = 0; i < k; i++)
+					ents[i]->done = 0;
+				k = 0;
+			} else if (rc < 0 && rc != -EIO)
 				break;
 			result->num_cells += k;
-			result->windows++;
+			if (k)
+				result->windows++;
 			if (rc == -EIO) {
 				stop = 1;
 				break;
 			}
-			/* the channels per window from the measured cost */
-			if (meter.done && !config->num_channels) {
-				per_window = meter.budget_channels;
+			/* measured: the rate and the channels per window */
+			if (meter.done && !meter.applied) {
+				meter.applied = 1;
+				if (choose_rate(config, &meter, &samplerate, start_info, list, n) < 0) {
+					stop = 1;
+					break;
+				}
+				capacity = rate_capacity(samplerate);
+				reach = window_reach(samplerate);
+				result->samplerate = samplerate;
+				if (!config->num_channels)
+					per_window = meter.budget_channels;
 				if (per_window > capacity)
 					per_window = capacity;
+			}
+			/* strongest first: after this many in a row without a
+			 * confirmed one, the rest (weaker) are not worth it */
+			{
+				int any = 0;
+
+				for (i = result->num_cells - k; i < result->num_cells; i++)
+					if (result->cells[i].confirmed)
+						any = 1;
+				since_confirmed = any ? 0 : since_confirmed + k;
 			}
 			int agree = evaluate(result, config);
 			if (!config->full && agree >= ((config->forced_arfcn > 0) ? 1 : config->towers)) {
 				result->time_to_result = now_sec() - t_start;
 				stop = 1;
+			} else if (!config->full && since_confirmed >= WEAK_IN_A_ROW) {
+				LOGP(DSDR, LOGL_NOTICE, "%s: %d carriers in a row without a confirmed one: the weaker rest is not measured (--full to measure all)\n",
+				     gsm_band_name(band), since_confirmed);
+				result->stopped_weak = 1;
+				break;
 			}
 		}
 		free(list);

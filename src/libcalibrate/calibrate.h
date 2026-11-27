@@ -71,6 +71,7 @@ typedef struct {
 	double cpu_per_channel;     /* share of one core per channel, measured */
 	double cpu_transport;       /* share of one core for the reading threads */
 	int windows;
+	int stopped_weak;           /* the weaker carriers left out (none confirmed in a row) */
 	calibrate_cell_t cells[CALIB_MAX_CELLS]; /* carriers measured, in order */
 	int num_cells;
 } calibrate_result_t;
@@ -93,6 +94,10 @@ typedef struct {
 	 * channels and scan steps stay inside it (docs/SDR-FRONTENDS.md) */
 	double usable_fraction;
 	double usable_max_hz;
+	/* reopen the SDR at another rate (NULL: the rate stays): after the
+	 * cost is measured at the widest, the rate with the most channels per
+	 * window in the budget */
+	int (*reopen)(int samplerate);
 } calibrate_config_t;
 
 /* Initialize default configuration */

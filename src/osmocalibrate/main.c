@@ -38,8 +38,6 @@ typedef struct sender sender_t;
 sender_t *sender_head = NULL;
 int use_sdr = 0;
 
-#define MAX_AUTO_RATE	16000000	/* the widest SDR rate chosen without --sdr-samplerate */
-
 /* Calibration-specific options */
 static calibrate_config_t config;
 static int json_output = 0;
@@ -273,6 +271,20 @@ static void close_sdr(void)
 	sdr = NULL;
 }
 
+/* the SDR at another rate (calibrate.c, from the measured cost) */
+static int reopen_sdr(int samplerate)
+{
+	double c, bw;
+	int s, e;
+
+	close_sdr();
+	sdr_config->samplerate = samplerate;
+	if (!sdr_config->bandwidth_given)
+		sdr_config->bandwidth = samplerate;
+	gsm_band_params(GSM_BAND_900, &c, &bw, &s, &e);
+	return open_sdr_rx(c, samplerate);
+}
+
 static void print_cell_text(const calibrate_cell_t *cell, double applied_ppm)
 {
 	const gsm_cell_ident_t *id = &cell->ident;
@@ -326,7 +338,8 @@ static void print_cell_json(const calibrate_cell_t *cell, double applied_ppm, in
 /* Per device: the usable part of the stream each side of the centre and the
  * rates (docs/SDR-FRONTENDS.md). One entry per device; the first that
  * matches. max_rate: refused above (0: no limit), max_auto_rate: the widest
- * chosen on its own (0: MAX_AUTO_RATE). */
+ * chosen on its own (0: what the device and the bus carry; the CPU budget
+ * then picks the rate, calibrate.c). */
 typedef struct device_rule {
 	const char	*name;
 	int		uhd;		/* matches --sdr-uhd */
@@ -340,10 +353,7 @@ static const device_rule_t device_rules[] = {
 	/* B200/B210: +-0.40 (power-of-2 decimation >= 4 of the master clock;
 	 * above 15.36 MS/s the master clock is the rate, the AD9361 alone,
 	 * +-0.40 with the LO centred, as here: no LO offset) */
-	/* chosen on its own at most 8 MS/s, for the CPU: at 16 MS/s the reading
-	 * took 17-20 % of a core and a channel 17 %, one channel per window in
-	 * the 50 % budget; at 8 MS/s 11 % and about 9 % */
-	{ "UHD (B200/B210)", 1, NULL, 0.40, 0.0, 0, 8000000, NULL },
+	{ "UHD (B200/B210)", 1, NULL, 0.40, 0.0, 0, 0, NULL },
 	/* RTL2832U: its FIR is flat to +-0.9 MHz at any rate */
 	{ "RTL-SDR", 0, "rtlsdr", 0.40, 0.85e6, 0, 0, NULL },
 	/* LMS7002M: clean to +-0.30 */
@@ -433,13 +443,13 @@ int main(int argc, char *argv[])
 	}
 
 	const device_rule_t *dev = device_rule();
-	int max_auto = dev->max_auto_rate ? dev->max_auto_rate : MAX_AUTO_RATE;
+	int max_auto = dev->max_auto_rate;
 
 	config.usable_fraction = dev->usable_fraction;
 	config.usable_max_hz = dev->usable_max_hz;
 	if (rate_given && dev->max_rate && samplerate > dev->max_rate) {
-		fprintf(stderr, "--sdr-samplerate %d: above %.2f MS/s on %s: %s. Use %.2f MS/s or less (%.0f MS/s is the widest chosen on its own).\n",
-			samplerate, dev->max_rate / 1e6, dev->name, dev->why, dev->max_rate / 1e6, max_auto / 1e6);
+		fprintf(stderr, "--sdr-samplerate %d: above %.2f MS/s on %s: %s. Use %.2f MS/s or less.\n",
+			samplerate, dev->max_rate / 1e6, dev->name, dev->why, dev->max_rate / 1e6);
 		return 1;
 	}
 	if (rate_given) {
@@ -450,11 +460,12 @@ int main(int argc, char *argv[])
 		sdr_rate_widest_t w;
 		double want = (config.forced_arfcn > 0) ? 1e6 : wanted_span() / 0.8;
 
-		/* at most 16 MS/s: at 32 MS/s the reading alone took 20 % of a
-		 * core and the B210 overflowed (B210, this PC, 2026-11-27);
-		 * the device's own limit above */
-		if (want > max_auto)
+		/* the device's own rule, if any; else the widest, and the CPU
+		 * budget picks a narrower one once the cost is measured */
+		if (max_auto && want > max_auto)
 			want = max_auto;
+		if (config.forced_arfcn <= 0)
+			config.reopen = reopen_sdr;
 
 		rc = sdr_rx_widest_rate(500000, (int)want, &w);
 		if (rc < 0) {
@@ -465,7 +476,7 @@ int main(int argc, char *argv[])
 		sdr_config->samplerate = samplerate;
 		if (!sdr_config->bandwidth_given)
 			sdr_config->bandwidth = samplerate;
-		snprintf(start_info, sizeof(start_info), "SDR rate %d S/s (device up to %.1f MS/s, bus up to %.1f MS/s on USB %d Mbit/s: load %.0f %%)",
+		snprintf(start_info, sizeof(start_info), "SDR opened at %d S/s, the widest (device up to %.1f MS/s, bus up to %.1f MS/s on USB %d Mbit/s: load %.0f %%)",
 			 samplerate, w.device_max / 1e6, w.bus_max / 1e6, w.usb_speed, 100.0 * w.bus_load);
 	}
 
@@ -552,8 +563,9 @@ int main(int argc, char *argv[])
 			printf("  %.3f ppm: %d tower%s agree%s (spread %.3f ppm)\n", total_ppm, result.num_agree,
 			       (result.num_agree == 1) ? "" : "s", (result.num_agree == 1) ? "s" : "", result.spread_ppm);
 		if (!config.full && config.forced_arfcn <= 0 && result.num_agree < config.towers)
-			printf("  only %d of the %d agreeing towers asked for (--towers): no more confirmed carriers found\n",
-			       result.num_agree, config.towers);
+			printf("  only %d of the %d agreeing towers asked for (--towers): %s\n",
+			       result.num_agree, config.towers,
+			       result.stopped_weak ? "the weaker carriers left out after a row without one (--full measures all)" : "no more confirmed carriers found");
 		if (applied_ppm != 0.0)
 			printf("  (residual %+.3f with --sdr-ppm %.3f applied)\n", result.ppm_offset, applied_ppm);
 		for (int c = 0; c < result.num_cells; c++)
