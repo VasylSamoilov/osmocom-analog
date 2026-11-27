@@ -43,7 +43,15 @@ typedef struct ermes_page_opts {
 	int			alert;		/* 0..7 */
 	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = --charset */
 	int			priority;	/* ERMES_PRIORITY_* */
+	int			retransmit;	/* transmissions after the first, same number */
+	int			retransmit_interval; /* seconds between them */
 } ermes_page_opts_t;
+
+/* Repetition (ETS 300 133-2 §4.3.1.3.1 p.18): the message is sent again with its number, within
+ * an interval set by the operator, 5 minutes by default */
+#define ERMES_RETRANSMIT_MAX		15
+#define ERMES_RETRANSMIT_INTERVAL_S	300
+#define ERMES_RETRANSMIT_INTERVAL_MAX_S	3600
 
 /* "priority 2 (normal)" */
 const char *ermes_priority_name(int priority);
@@ -54,22 +62,30 @@ extern const struct pager_charset *ermes_charset;
 
 typedef struct ermes_msg {
 	struct ermes_msg	*next;
-	ermes_page_t		page;		/* number -1 until the scheduler sends it */
+	ermes_page_t		page;		/* number -1 until the scheduler sends it first */
 	char			text[ERMES_MAX_TEXT];
 	int			priority;	/* ERMES_PRIORITY_* */
 	double			queued;		/* when it came (s since the epoch, system clock) */
+	int			retransmit;	/* transmissions still to come after this one */
+	int			retransmit_interval; /* seconds */
+	int			sent;		/* transmissions so far */
+	double			first_time;	/* network time of the first transmission */
+	double			next_time;	/* network time of the next retransmission */
 } ermes_msg_t;
 
 typedef struct ermes_queue {
 	ermes_msg_t		*head;		/* in the order they came */
 } ermes_queue_t;
 
-/* Options field of a FIFO line (as flex): "priority=1 urgent=1 alert=3 charset=..." onto opts.
- * 0 or -1 (logged) */
+/* Options field of a FIFO line (as flex): "priority=1 urgent=1 alert=3 charset=... retransmit=2
+ * retransmit_interval=300" onto opts. 0 or -1 (logged) */
 int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts);
 
 /* Check a page and put it at the end of the queue. 0, or -1 (not queued, logged) */
 int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_page_opts_t *opts, const char *text);
+
+/* ", sent 2 more times 300 s apart" or "" */
+const char *ermes_retransmit_str(const ermes_msg_t *msg);
 
 /* Take a message off the queue and free it */
 void ermes_queue_remove(ermes_queue_t *queue, ermes_msg_t *msg);

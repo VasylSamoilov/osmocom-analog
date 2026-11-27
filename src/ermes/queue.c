@@ -38,7 +38,35 @@ const char *ermes_priority_name(int priority)
 	return "priority ?";
 }
 
-ermes_page_opts_t ermes_default_opts = { .category = ERMES_CAT_TONE, .urgent = 0, .alert = 0, .priority = ERMES_PRIORITY_NORMAL };
+const char *ermes_retransmit_str(const ermes_msg_t *msg)
+{
+	static char buf[80];
+
+	if (!msg->retransmit)
+		return "";
+	snprintf(buf, sizeof(buf), ", sent %d more time%s %d s apart", msg->retransmit,
+		 (msg->retransmit == 1) ? "" : "s", msg->retransmit_interval);
+	return buf;
+}
+
+ermes_page_opts_t ermes_default_opts = {
+	.category = ERMES_CAT_TONE, .urgent = 0, .alert = 0, .priority = ERMES_PRIORITY_NORMAL,
+	.retransmit = 0, .retransmit_interval = ERMES_RETRANSMIT_INTERVAL_S,
+};
+
+/* a whole number option value in min..max. 0 or -1 (logged) */
+static int int_option(const char *key, const char *val, int min, int max, int *value)
+{
+	char *end;
+	long v = strtol(val, &end, 10);
+
+	if (end == val || *end || v < min || v > max) {
+		LOGP(DERMES, LOGL_ERROR, "Option %s=%s is not %d..%d.\n", key, val, min, max);
+		return -1;
+	}
+	*value = v;
+	return 0;
+}
 const struct pager_charset *ermes_charset = &pager_charset_ermes_generic_generic_standard;
 
 /* The options field of a FIFO line, as flex and pocsag: space separated key=value pairs */
@@ -78,6 +106,12 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 				return -1;
 			}
 			o.priority = v;
+		} else if (!strcasecmp(key, "retransmit")) {
+			if (int_option(key, val, 0, ERMES_RETRANSMIT_MAX, &o.retransmit) < 0)
+				return -1;
+		} else if (!strcasecmp(key, "retransmit_interval")) {
+			if (int_option(key, val, 1, ERMES_RETRANSMIT_INTERVAL_MAX_S, &o.retransmit_interval) < 0)
+				return -1;
 		} else if (!strcasecmp(key, "charset")) {
 			o.charset = pager_charset_lookup("ermes", val);
 			if (!o.charset) {
@@ -85,7 +119,7 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 				return -1;
 			}
 		} else {
-			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (priority, urgent, alert, charset).\n", key);
+			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (priority, urgent, alert, charset, retransmit, retransmit_interval).\n", key);
 			return -1;
 		}
 	}
@@ -138,13 +172,15 @@ int ermes_queue_page(ermes_queue_t *queue, uint32_t local_address, const ermes_p
 	 * when a page of higher priority goes before one that came earlier */
 	m->page.number = -1;
 	m->priority = opts->priority;
+	m->retransmit = opts->retransmit;
+	m->retransmit_interval = opts->retransmit_interval;
 	gettimeofday(&tv, NULL);
 	m->queued = tv.tv_sec + tv.tv_usec / 1e6;
 	for (mp = &queue->head; *mp; mp = &(*mp)->next)
 		;
 	*mp = m;
-	LOGP(DERMES, LOGL_NOTICE, "Page queued for %s, %s: %s\n", ermes_print_address(local_address),
-	     ermes_priority_name(m->priority), ermes_page_str(&m->page));
+	LOGP(DERMES, LOGL_NOTICE, "Page queued for %s, %s%s: %s\n", ermes_print_address(local_address),
+	     ermes_priority_name(m->priority), ermes_retransmit_str(m), ermes_page_str(&m->page));
 	return 0;
 }
 

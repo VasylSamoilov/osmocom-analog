@@ -104,6 +104,7 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	ermes_page_t pages[MAX_PAGES];
 	ermes_msg_t *msgs[MAX_PAGES], *m;
 	struct timeval tv;
+	double now, net_now;
 	int n = 0, sent, i, carried, prio, ahead;
 
 	if (!ermes->started)
@@ -119,15 +120,28 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 	 * of the line in each priority class, ETS 300 133-3 §13.5.5.2 p.174). Each gets the next
 	 * number of its address in this order (several of one address follow on); the numbers are
 	 * taken only for the pages that are sent. */
+	/* times of transmissions are network time, from the samples: it runs at the speed of the
+	 * output, faster than the wall clock when only a wave file is written. The arrival of a page
+	 * is wall clock (the source does not know the network time). */
+	gettimeofday(&tv, NULL);
+	now = tv.tv_sec + tv.tv_usec / 1e6;
+	net_now = network_time(ermes);
 	for (prio = ERMES_PRIORITY_HIGH; prio <= ERMES_PRIORITY_LOW; prio++) {
 		for (m = ermes->queue.head; m && n < MAX_PAGES; m = m->next) {
 			if (m->priority != prio || ermes_address_batch(m->page.local_address) != t.batch)
 				continue;
+			/* a retransmission waits for its time */
+			if (m->sent && m->next_time > net_now)
+				continue;
 			msgs[n] = m;
 			pages[n] = m->page;
-			for (ahead = 0, i = 0; i < n; i++)
-				ahead += (pages[i].local_address == m->page.local_address);
-			pages[n++].number = ermes_number_peek(m->page.local_address, ahead);
+			/* a retransmission keeps the number of its first transmission */
+			if (m->page.number < 0) {
+				for (ahead = 0, i = 0; i < n; i++)
+					ahead += (msgs[i]->page.number < 0 && pages[i].local_address == m->page.local_address);
+				pages[n].number = ermes_number_peek(m->page.local_address, ahead);
+			}
+			n++;
 		}
 	}
 
@@ -146,16 +160,31 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 		LOGP_CHAN(DERMES, LOGL_INFO, "The last message of batch %c runs on into the next batch (%d codewords)\n",
 			  ermes_batch_name(t.batch), ermes->carry.count);
 
-	gettimeofday(&tv, NULL);
 	for (i = 0; i < sent; i++) {
+		char when[64];
+
 		m = msgs[i];
 		/* the batch builder sends the first pages given, in this order */
-		if (ermes_number_next(m->page.local_address) != pages[i].number)
-			LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);
-		LOGP_CHAN(DERMES, LOGL_NOTICE, "Page sent to %s, %s, %.1f s after it came: %s; at minute %d, subsequence %d, time slot %d\n",
+		if (m->page.number < 0) {
+			if (ermes_number_next(m->page.local_address) != pages[i].number)
+				LOGP_CHAN(DERMES, LOGL_ERROR, "Message number %d taken out of order\n", pages[i].number);
+			m->page.number = pages[i].number;
+		}
+		if (!m->sent++) {
+			m->first_time = net_now;
+			snprintf(when, sizeof(when), "%.1f s after it came", now - m->queued);
+		} else
+			snprintf(when, sizeof(when), "transmission %d, %.0f s after the first", m->sent, net_now - m->first_time);
+		LOGP_CHAN(DERMES, LOGL_NOTICE, "Page sent to %s, %s, %s: %s; at minute %d, subsequence %d, time slot %d%s\n",
 			  ermes_print_address(m->page.local_address), ermes_priority_name(m->priority),
-			  tv.tv_sec + tv.tv_usec / 1e6 - m->queued, ermes_page_str(&pages[i]),
-			  t.cycle, t.ssn, t.slot);
+			  when, ermes_page_str(&pages[i]), t.cycle, t.ssn, t.slot,
+			  m->retransmit ? "; again later" : "");
+		if (m->retransmit) {
+			/* again with its number after the interval (ETS 300 133-2 §4.3.1.3.1) */
+			m->retransmit--;
+			m->next_time = net_now + m->retransmit_interval;
+			continue;
+		}
 		ermes_queue_remove(&ermes->queue, m);
 	}
 	LOGP_CHAN(DERMES, LOGL_DEBUG, "Batch %c at minute %d, subsequence %d, time slot %d: %s; %d page(s)\n",
