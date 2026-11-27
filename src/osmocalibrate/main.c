@@ -220,7 +220,7 @@ static void *sdr;
  * DSP rate here, so the band passes unchanged (no channelizer stage). */
 static int open_sdr_rx(double center_freq, int samplerate)
 {
-	/* 100 ms per read; the ring holds 8 x that (0.8 s): the gaps between
+	/* 100 ms per read; the ring holds 4 x that (0.4 s): the gaps between
 	 * the reads (scan processing, retune) stay far below it */
 	int buffer_size = samplerate / 10;
 	double rx_frequency = center_freq;

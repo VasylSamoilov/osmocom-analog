@@ -6,6 +6,30 @@ programs). 2026-11-25: two networks (NMT and POCSAG) and broadcast FM
 (osmoradio, on the per-channel chain) on one B210 through the backend.
 Open: phones on the engine path, the Pi 4.
 
+## Which path to use (for a new program or tool)
+
+Never call `uhd_*` / `soapy_*` directly: open the radio with `sdr_open()`, then:
+
+| You want | Use | What you get |
+|---|---|---|
+| FM / AM channels (a network, a pager, a radio) | `sdr_open(..., channels = N, ...)`, `sdr_read()` / `sdr_write()` | demodulated audio per channel; with 2+ channels the filter bank is used on its own (`--sdr-filter-bank auto`) |
+| the whole band as IQ (DCF77, TV, a scanner) | `sdr_open(..., channels = 0, ...)`, `sdr_read(..., 0, NULL)` | interleaved float IQ at the DSP rate; DSP rate = SDR rate passes unchanged (no shift, no stage) |
+| many channels as **complex IQ** (a calibrator, a monitor, a multi-channel decoder) | the band as above, then `sdr_engine_init()` + `sdr_engine_group_add()` (offsets per channel) + `sdr_engine_rx_feed()` + `sdr_engine_group_read()` (`libsdr/sdr_engine.h`) | complex IQ at 0 Hz per channel from the polyphase bank: cost almost independent of the channel count; `sdr_engine_bins()` says whether a bank fits (sub-bands wider than the DSP rate) |
+| one or two channels, IQ | the band, then `channelizer_rx_init()` / `channelizer_rx_process()` per channel (`libchannelizer`) | cheaper than a bank for very few channels; one channelizer per channel costs the full SDR rate each |
+
+Retuning RX while running (a scanner, a calibrator): `sdr_set_rx_frequency()`,
+then `sdr_rx_settle(sdr, seconds)`, which drops the ring's backlog and
+everything up to that time after the retune (the B210 delivers zeros while a
+retune runs: 3 ms within a band, 100-120 ms to another band), so the next
+`sdr_read()` is from the new frequency only.
+
+You get libsdr's read thread (the device is drained while the program
+works), timestamps and gap filling, the device options (antenna, clock,
+`--sdr-ppm`, upconverter), status and displays. Example: osmocalibrate had
+its own `uhd_receive()` and a channelizer per ARFCN, which caused RX
+overflows during its setup pauses and grew linearly in CPU; it moved to
+`sdr_open` (80145d8) and the bank (2026-11-27).
+
 ## Goal
 
 One radio, many networks: an SDR backend owns the device; the programs (nmt,

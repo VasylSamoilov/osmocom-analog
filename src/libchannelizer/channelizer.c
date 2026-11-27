@@ -216,11 +216,29 @@ int channelizer_rx_process(channelizer_t *ch, const float *iq, int n, int want, 
 	if (n <= 0)
 		return give;
 
+	/* nothing to do (SDR rate = DSP rate, centred): the input, deinterleaved
+	 * straight to the caller, the rest kept */
+	if (ch->offset == 0.0 && ch->hb_stages == 0 && !ch->use_resamp) {
+		for (s = 0; s < n; s++) {
+			if (give < want) {
+				out_i[give] = iq[2 * s];
+				out_q[give] = iq[2 * s + 1];
+				give++;
+			} else if (ch->fifo_len < ch->fifo_size) {
+				ch->fifo_i[ch->fifo_len] = iq[2 * s];
+				ch->fifo_q[ch->fifo_len] = iq[2 * s + 1];
+				ch->fifo_len++;
+			}
+		}
+		return give;
+	}
 	for (s = 0; s < n; s++) {
 		wi[s] = iq[2 * s];
 		wq[s] = iq[2 * s + 1];
 	}
-	nco_block(ch, wi, wq, n);
+	/* centred: the NCO stays at 1 + 0j, its product is the input */
+	if (ch->offset != 0.0)
+		nco_block(ch, wi, wq, n);
 	count = n;
 	for (st = 0; st < ch->hb_stages; st++)
 		count = halfband_decimate_block(&ch->hb[st], wi, wq, count);

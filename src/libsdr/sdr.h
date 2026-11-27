@@ -41,6 +41,13 @@ void sdr_set_rx_bandwidth(void *inst, int channel, double hz);
 void calibrate_bias(void);
 int sdr_get_samplerate(void *inst);
 int sdr_set_rx_frequency(double frequency);
+/* RX after sdr_set_rx_frequency(): drop what the ring holds and receives
+ * until settle_sec after the retune returned, then what it holds at that
+ * moment, so the next sdr_read() gives samples from the new frequency only,
+ * settled (the ring keeps what came before the retune; while a retune runs
+ * the B210 delivers zeros). Blocks until then. Returns the
+ * number of SDR rate samples dropped. */
+long sdr_rx_settle(void *inst, double settle_sec);
 int sdr_set_tx_frequency(double frequency);
 int sdr_calculate_optimal_rate(int master_rate, double bandwidth);
 /* the device of an SDR backend: call before sdr_open() (no channels, the

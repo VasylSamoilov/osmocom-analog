@@ -1218,20 +1218,61 @@ void calibrate_bias(void)
 
 
 /* Set RX frequency on the active SDR backend */
+static double rx_retune_done;	/* when the last RX retune returned (get_time()) */
+
 int sdr_set_rx_frequency(double freq)
 {
+	int rc = -ENODEV;
+
 	/* the band (channels = 0) is off the DC: the device that much lower */
 	freq -= rx_band_shift;
 #ifdef HAVE_UHD
 	if (rx_driver == 1)
-		return uhd_set_rx_frequency(freq);
+		rc = uhd_set_rx_frequency(freq);
+	else
 #endif
 #ifdef HAVE_SOAPY
 	if (rx_driver == 2)
-		return soapy_set_rx_frequency(freq);
+		rc = soapy_set_rx_frequency(freq);
+	else
 #endif
-	LOGP(DSDR, LOGL_ERROR, "Cannot set RX frequency: no SDR backend active\n");
-	return -ENODEV;
+		LOGP(DSDR, LOGL_ERROR, "Cannot set RX frequency: no SDR backend active\n");
+	rx_retune_done = get_time();
+	return rc;
+}
+
+/* Measured on the B210 (UHD 4.8, 1 MS/s): a step within a band returns in
+ * 3 ms, another band in 100-120 ms; for as long as the call takes, the
+ * stream carries exact zeros (no gap reported: they come from the device or
+ * UHD, not from the gap fill here); the first samples at the new frequency
+ * are in the ring 1-3 ms after the return, their level settles within
+ * 2.5 ms. */
+long sdr_rx_settle(void *inst, double settle_sec)
+{
+	sdr_t *sdr = (sdr_t *)inst;
+	long dropped = 0;
+	int avail, last = 0;
+
+	if (!sdr || !sdr->thread_read.buffer)
+		return 0;
+	while (1) {
+		/* the ring's samples so far: dropped (the read side owns out) */
+		__sync_synchronize();
+		avail = ((sdr->thread_read.in - sdr->thread_read.out + sdr->thread_read.buffer_size) % sdr->thread_read.buffer_size) / 2;
+		sdr->thread_read.out = (sdr->thread_read.out + 2 * avail) % sdr->thread_read.buffer_size;
+		dropped += avail;
+		if (last)
+			break;
+		/* once more after the time: what came until then */
+		if (get_time() >= rx_retune_done + settle_sec)
+			last = 1;
+		else
+			usleep(1000);
+	}
+	/* the band channelizer's kept output is from before, too */
+	if (sdr->band_rx_init)
+		sdr->band_rx.fifo_len = 0;
+	return dropped;
 }
 
 /* Set TX frequency on the active SDR backend */

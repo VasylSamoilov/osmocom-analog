@@ -70,7 +70,7 @@
 #define SCAN_FFT_SIZE   4096    /* FFT size for power scan */
 #define SCAN_FFT_LOG2   12
 #define SCAN_AVG_FRAMES 32      /* FFT frames to average during scan */
-#define SCAN_SETTLE_MS  50      /* ms to discard after retune (B210 needs ~30ms) */
+#define SCAN_SETTLE_MS  50      /* ms after a retune returned to discard (B210: 5.5 ms measured; other devices buffer more) */
 #define DEBUG_MAX_DETECTIONS 4096
 #define PREVALIDATE_SEC   0.45  /* Seconds to probe each candidate ARFCN */
 #define PREVALIDATE_BATCH_TARGET_SEC 3.6 /* target wall-time per probe batch */
@@ -555,24 +555,16 @@ static int retune_rx(double frequency)
 	return sdr_set_rx_frequency(frequency + sdr_config->rx_upconverter);
 }
 
-/* Flush RX buffer after retune (discard stale samples) */
+/* After a retune: libsdr drops what came before it, until SCAN_SETTLE_MS
+ * after the retune returned (the ring's backlog, the zeros while the
+ * retune runs, the settling) */
 static void flush_rx(float *buf, int buf_samples, int samplerate)
 {
-	int total_discard = (int)(samplerate * SCAN_SETTLE_MS / 1000.0);
-	if (total_discard < 4096) total_discard = 4096;
-
-	int chunk = buf_samples;
-	if (chunk > total_discard) chunk = total_discard;
-	if (chunk < 1024) chunk = 1024;
-
-	int discarded = 0;
-	while (discarded < total_discard) {
-		int want = total_discard - discarded;
-		if (want > chunk) want = chunk;
-		int got = receive_iq_blocking(buf, want);
-		if (got <= 0) break;
-		discarded += got;
-	}
+	(void)buf;
+	(void)buf_samples;
+	(void)samplerate;
+	if (calib_sdr)
+		sdr_rx_settle(calib_sdr, SCAN_SETTLE_MS / 1000.0);
 }
 
 void calibrate_config_default(calibrate_config_t *config)

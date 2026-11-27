@@ -796,12 +796,52 @@ out:
 	free(oq);
 }
 
+/* centred channel with stages: without the NCO (offset 0) the same output as
+ * with it turning at 1 + 0j (forced by a nonzero offset after the init),
+ * every sample */
+static void test_rx_centred(int sdr, int dsp)
+{
+	channelizer_t a, b;
+	int n = 20000, blk = 2000, s, ga = 0, gb = 0, same = 1, cap = n;
+	float *iq = malloc(n * 2 * sizeof(*iq));
+	sample_t *ai = malloc(cap * sizeof(*ai)), *aq = malloc(cap * sizeof(*aq));
+	sample_t *bi = malloc(cap * sizeof(*bi)), *bq = malloc(cap * sizeof(*bq));
+
+	printf("RX centred %d -> %d Hz, without the NCO = with it at 1 + 0j:\n", sdr, dsp);
+	for (s = 0; s < 2 * n; s++)
+		iq[s] = (float)(sin(0.0123 * s * s) * 0.5);
+	if (channelizer_rx_init(&a, sdr, dsp, 0.0, 2.0 * CHANNELIZER_PASS * dsp, blk) < 0
+	 || channelizer_rx_init(&b, sdr, dsp, 0.0, 2.0 * CHANNELIZER_PASS * dsp, blk) < 0) {
+		printf("  init: %s\n", channelizer_error());
+		failures++;
+		goto out;
+	}
+	b.offset = 1e-300;	/* the NCO runs, its phasor stays 1 + 0j */
+	for (s = 0; s + blk <= n; s += blk) {
+		ga += channelizer_rx_process(&a, iq + 2 * s, blk, cap - ga, ai + ga, aq + ga);
+		gb += channelizer_rx_process(&b, iq + 2 * s, blk, cap - gb, bi + gb, bq + gb);
+	}
+	if (ga != gb)
+		same = 0;
+	for (s = 0; s < ga && same; s++)
+		if (ai[s] != bi[s] || aq[s] != bq[s])
+			same = 0;
+	check(same && ga > 0, "same samples (1 = yes)", same && ga > 0, "");
+	channelizer_exit(&a);
+	channelizer_exit(&b);
+out:
+	free(iq);
+	free(ai); free(aq); free(bi); free(bq);
+}
+
 int main(void)
 {
 	printf("=== libchannelizer tests ===\n\n");
 	test_halfband();
 	test_rx_identity(1000000);
 	test_rx_identity(2400000);
+	test_rx_centred(1000000, 500000);
+	test_rx_centred(1000000, 96000);
 	test_refusals();
 	/* integer ratios */
 	test_rx(960000, 96000, -315000, 36000);
