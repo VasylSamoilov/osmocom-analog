@@ -43,6 +43,7 @@
 #include <math.h>
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <SoapySDR/Device.h>
 #include <SoapySDR/Formats.h>
 #include <SoapySDR/Errors.h>
@@ -53,6 +54,11 @@
 #include "../liboptions/options.h"
 
 extern int sdr_rx_overflow;
+
+/* test: every TX write fails 5-8 s after the first (as libsdr/uhd.c) */
+#ifndef TEST_TX_FAIL
+#define TEST_TX_FAIL 0
+#endif
 
 /* Per-device instance holding all state that was previously module-level static */
 typedef struct soapy_instance {
@@ -75,7 +81,54 @@ typedef struct soapy_instance {
 	double			ppm_manual_tx;	/* nonzero if manual frequency correction needed (device doesn't support it) */
 	int			tx_status_unsupported; /* readStreamStatus() not implemented by driver */
 	long long		rx_gap;		/* samples lost before the last packet, not yet filled */
+	long long		tx_dropped;	/* TX samples not sent (failed writes), their time passed */
+	double			tx_fail_since;	/* monotonic time of the first failed write, 0: writes work */
+	double			tx_fail_logged;	/* last 'still failing' line */
+	long long		tx_fail_dropped;/* tx_dropped when the failure began */
+	unsigned long		tx_fail_writes;	/* failed writes of this failure */
 } soapy_instance_t;
+
+static double soapy_mono_time(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* TX write state, logged when it changes (as libsdr/uhd.c) */
+static void soapy_tx_write_failed(soapy_instance_t *inst, int error)
+{
+	double now = soapy_mono_time();
+
+	inst->tx_fail_writes++;
+	if (!inst->tx_fail_since) {
+		inst->tx_fail_since = now;
+		inst->tx_fail_logged = now;
+		inst->tx_fail_dropped = inst->tx_dropped;
+		LOGP(DSOAPY, LOGL_ERROR, "TX writes fail (error=%d): %s - samples are dropped until they work again\n",
+		     error, error ? SoapySDR_errToStr(error) : "nothing sent");
+		return;
+	}
+	if (now - inst->tx_fail_logged >= 5.0) {
+		inst->tx_fail_logged = now;
+		LOGP(DSOAPY, LOGL_ERROR, "TX writes still fail after %.0f s (%lu failed, %.1f s of samples dropped): %s\n",
+		     now - inst->tx_fail_since, inst->tx_fail_writes,
+		     (inst->tx_dropped - inst->tx_fail_dropped) / inst->samplerate,
+		     error ? SoapySDR_errToStr(error) : "nothing sent");
+	}
+}
+
+static void soapy_tx_write_ok(soapy_instance_t *inst)
+{
+	if (!inst->tx_fail_since)
+		return;
+	LOGP(DSOAPY, LOGL_NOTICE, "TX writes work again after %.1f s (%lu failed, %.3f s of samples dropped)\n",
+	     soapy_mono_time() - inst->tx_fail_since, inst->tx_fail_writes,
+	     (inst->tx_dropped - inst->tx_fail_dropped) / inst->samplerate);
+	inst->tx_fail_since = 0;
+	inst->tx_fail_writes = 0;
+}
 
 /* In single-device mode, both point to the same instance.
  * In split mode (future), they point to separate instances. */
@@ -874,10 +927,24 @@ int soapy_send(float *buff, int num)
 		if (soapy_tx_inst->use_time_stamps && !split_mode)
 			flags |= SOAPY_SDR_HAS_TIME;
 		count = SoapySDRDevice_writeStream(soapy_tx_inst->sdr, soapy_tx_inst->txStream, buffs_ptr, chunk, &flags, soapy_tx_inst->tx_timeNs, 1000000);
+#if TEST_TX_FAIL
+		{
+			static struct timespec fail_t0;
+			struct timespec fail_now;
+
+			clock_gettime(CLOCK_MONOTONIC, &fail_now);
+			if (!fail_t0.tv_sec)
+				fail_t0 = fail_now;
+			if (fail_now.tv_sec - fail_t0.tv_sec >= 5 && fail_now.tv_sec - fail_t0.tv_sec < 8)
+				count = SOAPY_SDR_STREAM_ERROR;
+		}
+#endif
 		if (count <= 0) {
-			LOGP(DUHD, LOGL_ERROR, "Failed to write to TX streamer (error=%d)\n", count);
+			LOGP(DSOAPY, LOGL_DEBUG, "Failed to write to TX streamer (error=%d)\n", count);
+			soapy_tx_write_failed(soapy_tx_inst, count);
 			break;
 		}
+		soapy_tx_write_ok(soapy_tx_inst);
 		/* Update TX time for samples actually sent.
 		 * When device paced, tosend() is not used and TX time is
 		 * only a sample counter. */
@@ -894,6 +961,21 @@ int soapy_send(float *buff, int num)
 		sent += count;
 		buff += count * 2;
 		num -= count;
+	}
+
+	/* Not sent: the samples are dropped, but their time passes as if sent
+	 * (as libsdr/uhd.c) - TX time moves on, so the caller is not asked again
+	 * for the same time; where a blocking write paces TX, wait their
+	 * duration instead. */
+	if (num > 0) {
+		if (soapy_tx_inst->tx_valid) {
+			pthread_mutex_lock(&soapy_tx_inst->timestamp_mutex);
+			soapy_tx_inst->tx_timeNs += samples_to_ns(soapy_tx_inst, num);
+			pthread_mutex_unlock(&soapy_tx_inst->timestamp_mutex);
+		}
+		soapy_tx_inst->tx_dropped += num;
+		if (soapy_tx_device_paced())
+			usleep((useconds_t)((double)num / soapy_tx_inst->samplerate * 1e6));
 	}
 
 	return sent;
