@@ -15,7 +15,13 @@ Never call `uhd_*` / `soapy_*` directly: open the radio with `sdr_open()`, then:
 | FM / AM channels (a network, a pager, a radio) | `sdr_open(..., channels = N, ...)`, `sdr_read()` / `sdr_write()` | demodulated audio per channel; with 2+ channels the filter bank is used on its own (`--sdr-filter-bank auto`) |
 | the whole band as IQ (DCF77, TV, a scanner) | `sdr_open(..., channels = 0, ...)`, `sdr_read(..., 0, NULL)` | interleaved float IQ at the DSP rate; DSP rate = SDR rate passes unchanged (no shift, no stage) |
 | many channels as **complex IQ** (a calibrator, a monitor, a multi-channel decoder) | the band as above, then `sdr_engine_init()` + `sdr_engine_group_add()` (offsets per channel) + `sdr_engine_rx_feed()` + `sdr_engine_group_read()` (`libsdr/sdr_engine.h`) | complex IQ at 0 Hz per channel from the polyphase bank: cost almost independent of the channel count; `sdr_engine_bins()` says whether a bank fits (sub-bands wider than the DSP rate) |
-| one or two channels, IQ | the band, then `channelizer_rx_init()` / `channelizer_rx_process()` per channel (`libchannelizer`) | cheaper than a bank for very few channels; one channelizer per channel costs the full SDR rate each |
+| one to three channels, IQ, or a rate no bank fits | the same engine calls with `sdr_engine_init(e, rate, 0, 0, 0, max_block)` (`max_dsp` 0: no bank, every channel a channelizer on the per-channel chain, at most `SDR_ENGINE_MAX_CHAIN`) | cheaper than a bank below about 4 channels (GSM, DSP 500 k, measured: 8 MS/s chain 7.3 % of a core per channel, bank 10.5 % + 4.5 % per channel; 16 MS/s 13.4 % vs 15 % + 6.5 %); each chain channel costs the full SDR rate |
+
+The rate of a band receiver: `sdr_rx_widest_rate(base, max_wanted, &info)`
+(after `sdr_configure()`, before `sdr_open()`) gives the widest the device
+has (80 % of its top) within half of what its USB link carries, with the
+limits and the bus load; keep channels inside the device's usable part of
+the stream (`docs/SDR-FRONTENDS.md`).
 
 Retuning RX while running (a scanner, a calibrator): `sdr_set_rx_frequency()`,
 then `sdr_rx_settle(sdr, seconds)`, which drops the ring's backlog and

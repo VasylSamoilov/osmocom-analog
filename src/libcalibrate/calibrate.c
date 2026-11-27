@@ -963,8 +963,9 @@ static int evaluate(calibrate_result_t *r, const calibrate_config_t *config)
 			r->disagree++;
 	}
 	r->num_agree = agree;
+	/* none near the median (two towers apart): no result, both listed */
 	r->ppm_offset = agree ? sum / agree : med;
-	r->valid = 1;
+	r->valid = (agree > 0);
 	return agree;
 }
 

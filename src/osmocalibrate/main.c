@@ -513,12 +513,13 @@ int main(int argc, char *argv[])
 
 	if (rc < 0 || !result.valid) {
 		if (!json_output) {
-			fprintf(stderr, "Calibration failed: %s\n", (rc == -EINVAL) ? "see above" : "no confirmed tower");
+			fprintf(stderr, "Calibration failed: %s\n", (rc == -EINVAL) ? "see above" :
+				result.num_towers ? "the confirmed towers disagree, none agrees with another" : "no confirmed tower");
 			for (int c = 0; c < result.num_cells; c++)
 				print_cell_text(&result.cells[c], applied_ppm);
 		} else {
 			printf("{\"success\": false, \"error\": \"%s\", \"carriers\": [",
-			       (rc == -EINVAL) ? "invalid setting" : "no confirmed tower");
+			       (rc == -EINVAL) ? "invalid setting" : result.num_towers ? "towers disagree" : "no confirmed tower");
 			for (int c = 0; c < result.num_cells; c++)
 				print_cell_json(&result.cells[c], applied_ppm, c > 0);
 			printf("]}\n");
@@ -550,6 +551,9 @@ int main(int argc, char *argv[])
 		else
 			printf("  %.3f ppm: %d tower%s agree%s (spread %.3f ppm)\n", total_ppm, result.num_agree,
 			       (result.num_agree == 1) ? "" : "s", (result.num_agree == 1) ? "s" : "", result.spread_ppm);
+		if (!config.full && config.forced_arfcn <= 0 && result.num_agree < config.towers)
+			printf("  only %d of the %d agreeing towers asked for (--towers): no more confirmed carriers found\n",
+			       result.num_agree, config.towers);
 		if (applied_ppm != 0.0)
 			printf("  (residual %+.3f with --sdr-ppm %.3f applied)\n", result.ppm_offset, applied_ppm);
 		for (int c = 0; c < result.num_cells; c++)
