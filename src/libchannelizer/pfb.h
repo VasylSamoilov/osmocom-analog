@@ -36,6 +36,7 @@
 #include "../libsample/sample.h"
 #include "fftc.h"
 #include "resamp.h"
+#include "halfband.h"
 
 #define PFB_ATTEN_DB	105.0
 
@@ -90,6 +91,8 @@ typedef struct pfb_chan {
 	double		nco_i, nco_q, rot_i, rot_q;
 	int		use_rs1;
 	resamp_t	rs1, rs2;		/* RX: rs1 fb -> 2 dsp, rs2 2 dsp -> dsp; TX: rs2 dsp -> 2 dsp, rs1 2 dsp -> fb */
+	int		use_hb1;		/* RX, fb = 4 dsp: a halfband instead of rs1 (same band edges) */
+	halfband_t	hb1;
 	int		max_in;			/* RX: most frames per call; TX: most DSP samples per call */
 	sample_t	*mid_i, *mid_q;		/* at 2 dsp */
 	sample_t	*out_i, *out_q;		/* TX: frames for the bank; RX: DSP samples kept */

@@ -986,8 +986,30 @@ static int uhd_tx_probe(char *what, size_t len)
  * until it is reset) is reset on USB and opened again, once. */
 int uhd_open(size_t channel, const char *_device_args, const char *_stream_args, const char *_tune_args, const char *tx_antenna, const char *rx_antenna, const char *clock_source, double tx_frequency, double rx_frequency, double lo_offset, double rate, double tx_gain, double rx_gain, double bandwidth, int timestamps)
 {
-	char what[256], serial[64];
+	char what[256], serial[64], args[1024];
 	int rc;
+
+	/* RX: UHD's receive buffer (B200 over USB: 16 frames of 2040 samples)
+	 * holds 33 ms at 1 MS/s but 1 ms at 32 MS/s; one recv() held up for
+	 * 1.1 ms inside UHD lost samples there (measured). Frames for 100 ms at
+	 * the rate, at most 1024, only from 32 on (not below UHD's defaults);
+	 * device args that set it win. RX only: TX (num_send_frames) is not
+	 * touched. While the read thread keeps up the buffer is empty, so the
+	 * latency stays the same (measured at 1 MS/s). */
+	snprintf(args, sizeof(args), "%s", _device_args ? _device_args : "");
+	if (rx_frequency != 0.0 && !strstr(args, "num_recv_frames")) {
+		int frames = (int)ceil(0.1 * rate / 2040.0);
+
+		if (frames > 1024)
+			frames = 1024;
+		if (frames >= 32) {
+			size_t len = strlen(args);
+
+			snprintf(args + len, sizeof(args) - len, "%snum_recv_frames=%d", len ? "," : "", frames);
+			LOGP(DUHD, LOGL_INFO, "RX: %d receive frames (%.0f ms at %.0f S/s)\n", frames, 1000.0 * frames * 2040.0 / rate, rate);
+		}
+	}
+	_device_args = args;
 
 	rc = uhd_open_device(channel, _device_args, _stream_args, _tune_args, tx_antenna, rx_antenna, clock_source, tx_frequency, rx_frequency, lo_offset, rate, tx_gain, rx_gain, bandwidth, timestamps);
 	if (rc < 0 || tx_frequency == 0.0 || !uhd_tx_probe(what, sizeof(what)))

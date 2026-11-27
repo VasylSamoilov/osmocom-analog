@@ -863,6 +863,10 @@ int main(void)
 	test_pfb_rx_bank(1920000, 16, 24000);
 	test_pfb_rx(10000000, 64, 48000, -3337500 + 0.31 * 156250);
 	test_pfb_rx(1920000, 16, 48000, 412345);
+	/* bin rate = 4 x DSP rate: the halfband instead of the wide resampler
+	 * (GSM at 8 MS/s, osmocalibrate) */
+	test_pfb_rx(8000000, 8, 500000, -3100000 + 23456);
+	test_pfb_rx(8000000, 8, 500000, 1234567);
 	test_pfb_tx(10000000, 64, 48000, -3337500 + 0.31 * 156250);
 	test_pfb_tx(1920000, 16, 48000, -412345);
 	test_pfb_tx_pull(10000000, 64, 48000, -3337500 + 0.31 * 156250);

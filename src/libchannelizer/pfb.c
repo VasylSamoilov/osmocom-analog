@@ -358,6 +358,13 @@ static int chan_init(pfb_chan_t *ch, const pfb_t *pfb, double offset, int dsp_ra
 	 * stops what would fold or image onto it */
 	low = (fb < mid) ? fb : mid;
 	ch->use_rs1 = (fb != mid);
+	/* RX with fb = 2 x mid: the same band edges (pass dsp/2 = 0.125 fb,
+	 * stop from mid - dsp/2 = 0.375 fb = 0.5 - pass) are a halfband's,
+	 * computed only at the output rate and with every other tap zero */
+	if (!tx && fb == 2 * mid && halfband_design(&ch->hb1, dsp_rate / 2.0 / fb, PFB_ATTEN_DB) == 0) {
+		ch->use_rs1 = 0;
+		ch->use_hb1 = 1;
+	}
 	if (ch->use_rs1) {
 		rc = tx ? resamp_init_band(&ch->rs1, mid, fb, dsp_rate / 2.0, low - dsp_rate / 2.0, PFB_ATTEN_DB)
 			: resamp_init_band(&ch->rs1, fb, mid, dsp_rate / 2.0, low - dsp_rate / 2.0, PFB_ATTEN_DB);
@@ -411,6 +418,8 @@ void pfb_chan_exit(pfb_chan_t *ch)
 {
 	if (ch->use_rs1 && ch->rs1.h)
 		resamp_exit(&ch->rs1);
+	if (ch->use_hb1)
+		halfband_exit(&ch->hb1);
 	if (ch->rs2.h)
 		resamp_exit(&ch->rs2);
 	free(ch->mid_i);
@@ -431,6 +440,8 @@ int pfb_chan_rx_need(const pfb_chan_t *ch, int want)
 	n = resamp_need(&ch->rs2, m);
 	if (ch->use_rs1)
 		n = resamp_need(&ch->rs1, n);
+	else if (ch->use_hb1 && n > 0)
+		n = 2 * n - ch->hb1.phase;	/* one less if one is stored already */
 	return n;
 }
 
@@ -471,6 +482,8 @@ int pfb_chan_rx_process(pfb_chan_t *ch, const sample_t *bin_i, const sample_t *b
 	mag = sqrt(pi * pi + pq * pq);
 	ch->nco_i = pi / mag;
 	ch->nco_q = pq / mag;
+	if (ch->use_hb1)
+		k = halfband_decimate_block(&ch->hb1, ch->mid_i, ch->mid_q, k);
 	/* 2:1 to the DSP rate: up to want to the caller, the rest kept */
 	for (s = 0; s < k; s++) {
 		n = resamp_process(&ch->rs2, ch->mid_i[s], ch->mid_q[s], ti, tq);
