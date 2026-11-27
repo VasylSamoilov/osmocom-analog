@@ -198,8 +198,10 @@ static void ctap_update(ermes_t *ermes, double net_now)
 	}
 }
 
-/* 1 if the receiver is a member of a group call that is not done: a CTAP of some channel, not free,
- * has it. Until then it gets no other message. */
+/* 1 if the receiver is a member of a group call whose message is not sent yet: a CTAP of some
+ * channel addressing or sending it (also while the message runs on into the next batches). Until
+ * then it gets no other message. Once the message is sent the CTAP holds (not reused while the
+ * members may still search for it) but the members take other messages from the next batch. */
 static int in_group_call(uint32_t local_address)
 {
 	sender_t *sd;
@@ -209,7 +211,7 @@ static int in_group_call(uint32_t local_address)
 		ermes_t *e = (ermes_t *)sd;
 
 		for (c = 0; c < ERMES_CTAP_COUNT; c++) {
-			if (e->ctap[c].state == ERMES_CTAP_FREE)
+			if (e->ctap[c].state == ERMES_CTAP_FREE || e->ctap[c].state == ERMES_CTAP_HOLD)
 				continue;
 			for (i = 0; i < e->ctap[c].members; i++) {
 				if (e->ctap[c].member[i] == local_address)
@@ -455,8 +457,7 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			/* only on a channel whose frequency subset has the receiver's FSN (§9.2) */
 			if (!fsn_on_channel(ermes, m->page.local_address))
 				continue;
-			/* a member of a group call gets nothing else until the call is done (its CTAP
-			 * free: 12 s after the last member's initial address) */
+			/* a member of a group call gets nothing else until its message is sent */
 			if (in_group_call(m->page.local_address))
 				continue;
 			/* a retransmission waits for its time */

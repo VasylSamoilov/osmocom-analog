@@ -284,8 +284,11 @@ row is refused (split it). For one pager in batch A: A, B, C.
 
 Each channel sends one group call at a time and nothing else meanwhile; a
 call starts when the individual pages that came before it are sent. The
-members get no other message until the call is done: its pointer is held 12 s
-after the last member's initial address, then free. The 16 pointers of a
+members get no other message from their initial address until the text is
+sent (also while a long text runs on); from the next batch they take other
+messages again. The pointer itself is held 12 s after the last member's
+initial address (the members may still search for its text), then free for
+another call. The 16 pointers of a
 channel each go: free, addressing, message (the text runs on into further
 batches), hold, free; the log shows every change. A member is served by the
 channel that carries its FSN. At most 32 members; `retransmit=` is refused
