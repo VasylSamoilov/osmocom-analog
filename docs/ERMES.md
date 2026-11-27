@@ -291,10 +291,17 @@ batches), hold, free; the log shows every change. A member is served by the
 channel that carries its FSN. At most 32 members; `retransmit=` is refused
 for group calls.
 
-Observed with the NEC PA3E6-1A, with the earlier layout (stage 1 and 2 in the
-member's batch, the text in the last member's batch): texts in its own batch
-arrived; texts in a later batch failed when longer than about 12 data words,
-and it then missed its own pages for up to 2 minutes.
+A batch that carries a pointer (stage 2) or the text (stage 3) has no initial
+address of its own; when no other traffic fills its address partition, it
+gets a PAD there: the group initial address, eighteen ones, the highest of
+all and nobody's own. The receiver test of group calls has these batches
+occupied the same way (ETS 300 133-5 §7.8 Fig.16, TBR 7 §8.15: "PAD: an
+initial address, higher than the receiver under test, used to occupy start
+of address partition"). Receivers skip a batch whose address partition holds
+no initial address: without the PAD the NEC PA3E6-1A lost the end of longer
+group texts (or all of them) and then missed its own pages for minutes, and
+PDW's decoder showed no group message at all. With it both get the full text
+(tested with 40 and 70 characters, one and two members).
 
 ## Message formats
 
