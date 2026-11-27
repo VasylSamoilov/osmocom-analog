@@ -51,6 +51,8 @@ static ermes_subscriber_t *add(uint32_t local_address, int opid)
 	book[book_count].local_address = local_address;
 	book[book_count].opid = opid;
 	book[book_count].fsn = -1;
+	book[book_count].hnl = -1;
+	book[book_count].enl = -1;
 	return &book[book_count++];
 }
 
@@ -88,7 +90,31 @@ static int set(ermes_subscriber_t *s, const char *key, const char *val)
 	/* a visiting receiver's line: part of the key */
 	if (!strcasecmp(key, "opid"))
 		return ermes_parse_opid(val, &s->opid);
+	if (!strcasecmp(key, "hnl") || !strcasecmp(key, "enl")) {
+		v = strtol(val, &end, 10);
+		if (end == val || *end || v < 0 || v > 5)
+			return -1;
+		if (!strcasecmp(key, "hnl"))
+			s->hnl = v;
+		else
+			s->enl = v;
+		return 0;
+	}
 	return -1;
+}
+
+int ermes_book_active_cycle(uint32_t local_address, int opid, int cycle)
+{
+	ermes_subscriber_t *s = ermes_book_find(local_address, opid, 0);
+	int level, mask;
+
+	/* ours: HNL, default 0; a visitor: ENL, default 2 (Table 19) */
+	if (opid < 0)
+		level = (s && s->hnl >= 0) ? s->hnl : 0;
+	else
+		level = (s && s->enl >= 0) ? s->enl : 2;
+	mask = (1 << level) - 1;
+	return (cycle & mask) == (int)((local_address >> ERMES_BATCH_BITS) & mask);
 }
 
 /* "number=5 fsn=8" for one receiver while running (FIFO type "book"); none: just log the entry.
@@ -122,16 +148,17 @@ int ermes_book_set(uint32_t local_address, const char *settings)
 	else {
 		copy.local_address = local_address;
 		copy.fsn = -1;
+		copy.hnl = copy.enl = -1;
 	}
 	for (tok = strtok_r(buf, " \t\r\n", &save); tok; tok = strtok_r(NULL, " \t\r\n", &save)) {
 		eq = strchr(tok, '=');
 		if (!eq) {
-			LOGP(DERMES, LOGL_ERROR, "Book setting \"%s\" is not key=value (number, fsn, opid).\n", tok);
+			LOGP(DERMES, LOGL_ERROR, "Book setting \"%s\" is not key=value (number, fsn, hnl, enl, opid).\n", tok);
 			return -1;
 		}
 		*eq = '\0';
 		if (set(&copy, tok, eq + 1) < 0) {
-			LOGP(DERMES, LOGL_ERROR, "Bad book setting %s=%s (number 0..31, fsn 0..15).\n", tok, eq + 1);
+			LOGP(DERMES, LOGL_ERROR, "Bad book setting %s=%s (number 0..31, fsn 0..15, hnl/enl 0..5).\n", tok, eq + 1);
 			return -1;
 		}
 	}
@@ -169,6 +196,7 @@ static void parse_line(char *line, const char *file, int lineno)
 	memset(&copy, 0, sizeof(copy));
 	copy.opid = -1;
 	copy.fsn = -1;
+	copy.hnl = copy.enl = -1;
 	while ((tok = strtok_r(NULL, " \t\r\n", &save))) {
 		val = strchr(tok, '=');
 		if (!val) {
@@ -254,6 +282,10 @@ int ermes_book_save(void)
 		fprintf(fp, "%s number=%d", ermes_book_name(book[i].local_address, book[i].opid), book[i].number);
 		if (book[i].fsn >= 0)
 			fprintf(fp, " fsn=%d", book[i].fsn);
+		if (book[i].hnl >= 0)
+			fprintf(fp, " hnl=%d", book[i].hnl);
+		if (book[i].enl >= 0)
+			fprintf(fp, " enl=%d", book[i].enl);
 		fprintf(fp, "\n");
 	}
 	fclose(fp);

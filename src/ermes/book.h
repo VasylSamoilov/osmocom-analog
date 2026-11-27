@@ -31,6 +31,10 @@ typedef struct ermes_subscriber {
 	int		opid;		/* home operator of a visiting receiver (13 bits), -1 = ours: with the
 					 * local address the key (local addresses are unique per operator) */
 	int		number;		/* last message number given, 1..31, 0 = none yet */
+	int		hnl, enl;	/* battery saving at sequence level (-4 §11.4 Table 19): the
+					 * receiver listens only in cycles whose number ends in the
+					 * last HNL (home) / ENL (abroad) bits of its initial address;
+					 * -1 = the default, HNL 0 (all cycles), ENL 2 (every 4th) */
 	int		fsn;		/* frequency subset number 0..15 (§9.2), -1 = not known: the
 					 * page goes on the first channel that has room for it */
 } ermes_subscriber_t;
@@ -51,6 +55,8 @@ int ermes_book_save(void);
 
 /* FIFO type "book": "number=5 fsn=8" set for one receiver, saved; empty: the entry is logged */
 int ermes_book_set(uint32_t local_address, const char *settings);
+/* 1 if the receiver (local address, home operator -1 = ours) listens in this cycle (-4 §11.4) */
+int ermes_book_active_cycle(uint32_t local_address, int opid, int cycle);
 /* "0x318E40" or "0x318E40 opid 2-1-3": for logs */
 const char *ermes_book_name(uint32_t local_address, int opid);
 

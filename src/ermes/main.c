@@ -85,7 +85,7 @@ static double start_time;
 #define OPT_YEAR_FROM	274
 #define OPT_PRIORITY	275
 #define OPT_RETRANSMIT	276
-#define OPT_RETRANSMIT_INTERVAL 277
+#define OPT_RETRANSMIT_WINDOW 277
 #define OPT_GROUP_FIG16	279
 
 void print_help(const char *arg0)
@@ -159,8 +159,9 @@ void print_help(const char *arg0)
 	printf("    --retransmit 0..%d\n", ERMES_RETRANSMIT_MAX);
 	printf("        Times a page without one is sent again after the first, with the same\n");
 	printf("        message number (ETS 300 133-2 4.3.1.3.1). (default %d)\n", ermes_default_opts.retransmit);
-	printf("    --retransmit-interval 1..%d\n", ERMES_RETRANSMIT_INTERVAL_MAX_S);
-	printf("        Seconds between the transmissions. (default %d)\n", ermes_default_opts.retransmit_interval);
+	printf("    --retransmit-window 1..%d\n", ERMES_RETRANSMIT_WINDOW_MAX_S);
+	printf("        Seconds from the first to the last transmission; the repeats are spread\n");
+	printf("        evenly over it (ETS 300 133-2 4.3.1.3.1). (default %d)\n", ermes_default_opts.retransmit_window);
 	printf("    --group-fig16\n");
 	printf("        A group call's pointer goes with the member's initial address in its own\n");
 	printf("        batch (ETS 300 133-5 7.8 Fig.16), not alone in the batch after.\n");
@@ -195,8 +196,8 @@ void print_help(const char *arg0)
 	printf("          options  space-separated key=value pairs:\n");
 	printf("                   priority=1-3  urgent=0|1  alert=0-7\n");
 	printf("                   charset=<vendor-model-charset>\n");
-	printf("                   retransmit=0-%d  retransmit_interval=1-%d (seconds)\n",
-	       ERMES_RETRANSMIT_MAX, ERMES_RETRANSMIT_INTERVAL_MAX_S);
+	printf("                   retransmit=0-%d  retransmit_window=1-%d (seconds)\n",
+	       ERMES_RETRANSMIT_MAX, ERMES_RETRANSMIT_WINDOW_MAX_S);
 	printf("          message  the rest of the line, commas included\n");
 	printf("        Example: nec-C63900,alpha,priority=1 urgent=1 alert=3,Call home, now\n");
 	printf("        A page gets its message number when it is sent, so the numbers of an\n");
@@ -221,7 +222,7 @@ static void add_options(void)
 	option_add(OPT_ALERT, "alert", 1);
 	option_add(OPT_PRIORITY, "priority", 1);
 	option_add(OPT_RETRANSMIT, "retransmit", 1);
-	option_add(OPT_RETRANSMIT_INTERVAL, "retransmit-interval", 1);
+	option_add(OPT_RETRANSMIT_WINDOW, "retransmit-window", 1);
 	option_add(OPT_GROUP_FIG16, "group-fig16", 0);
 	option_add(OPT_TX_LATENCY, "tx-latency", 1);
 	option_add(OPT_YEAR_FROM, "year-from", 1);
@@ -320,10 +321,10 @@ static int handle_options(int short_option, int argi, char **argv)
 		return field_option("alert", argv[argi], ERMES_ALERT_BITS, &ermes_default_opts.alert);
 	case OPT_PRIORITY:
 	case OPT_RETRANSMIT:
-	case OPT_RETRANSMIT_INTERVAL:
+	case OPT_RETRANSMIT_WINDOW:
 	{
 		const char *key = (short_option == OPT_PRIORITY) ? "priority"
-				: (short_option == OPT_RETRANSMIT) ? "retransmit" : "retransmit_interval";
+				: (short_option == OPT_RETRANSMIT) ? "retransmit" : "retransmit_window";
 		char opt[64];
 
 		/* the same check as the FIFO option */

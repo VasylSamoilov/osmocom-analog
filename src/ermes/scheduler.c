@@ -266,15 +266,29 @@ static void group_start(ermes_t *ermes)
 				LOGP_CHAN(DERMES, LOGL_DEBUG, "Group call waits for a time slot from which its stages fit\n");
 				return;
 			}
-			for (k = 0; k < ERMES_CTAP_COUNT; k++) {
-				c = (ermes->ctap_next + k) % ERMES_CTAP_COUNT;
-				if (ermes->ctap[c].state == ERMES_CTAP_FREE)
-					break;
+			/* all members of a group get the same CTA (-4 §10.3 p.32): the first channel takes
+			 * a CTAP free on every channel, the others use the same one when it is free there */
+			if (g->ctap >= 0) {
+				c = g->ctap;
+				k = (ermes->ctap[c].state == ERMES_CTAP_FREE) ? 0 : ERMES_CTAP_COUNT;
+			} else {
+				for (k = 0; k < ERMES_CTAP_COUNT; k++) {
+					sender_t *sd;
+
+					c = (ermes->ctap_next + k) % ERMES_CTAP_COUNT;
+					for (sd = sender_head; sd; sd = sd->next) {
+						if (((ermes_t *)sd)->ctap[c].state != ERMES_CTAP_FREE)
+							break;
+					}
+					if (!sd)
+						break;
+				}
 			}
 			if (k == ERMES_CTAP_COUNT) {
 				LOGP_CHAN(DERMES, LOGL_DEBUG, "Group call waits for a free CTAP\n");
 				return;
 			}
+			g->ctap = c;
 			s = &ermes->ctap[c];
 			for (count = 0, i = 0; i < g->num; i++) {
 				if (!g->channel[i] && !g->done[i] && fsn_on_channel(ermes, g->member[i], -1)) {
@@ -322,7 +336,8 @@ static int group_pages(ermes_t *ermes, const ermes_batch_time_t *t, ermes_msg_t 
 			/* stage 1: the initial address alone, in its own batch; with --group-fig16 the
 			 * pointer with it (stage 1 and 2 in one batch, as -5 §7.8 Fig.16 "IA APT MD
 			 * MESSAGE 1") */
-			if (ermes_address_batch(g->member[i]) != t->batch)
+			if (ermes_address_batch(g->member[i]) != t->batch
+			 || !ermes_book_active_cycle(g->member[i], -1, t->cycle))
 				continue;
 			memset(&pages[n], 0, sizeof(pages[n]));
 			pages[n].local_address = g->member[i];
@@ -459,6 +474,9 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			/* only on a channel whose frequency subset has the receiver's FSN (§9.2) */
 			if (!fsn_on_channel(ermes, m->page.local_address, ERMES_PAGE_OPID(&m->page)))
 				continue;
+			/* only in a cycle the receiver listens in (-4 §11.4: HNL at home, ENL abroad) */
+			if (!ermes_book_active_cycle(m->page.local_address, ERMES_PAGE_OPID(&m->page), t.cycle))
+				continue;
 			/* a member of a group call gets nothing else until its message is sent */
 			if (!m->page.external && in_group_call(m->page.local_address))
 				continue;
@@ -531,9 +549,11 @@ int ermes_scheduler_next_batch(ermes_t *ermes)
 			  when, ermes_page_str(&pages[i]), t.cycle, t.ssn, t.slot,
 			  m->retransmit ? "; again later" : "");
 		if (m->retransmit) {
-			/* again with its number after the interval (ETS 300 133-2 §4.3.1.3.1) */
+			/* again with its number, the repeats spread over the window from the first
+			 * transmission (ETS 300 133-2 §4.3.1.3.1): with 2 in 300 s at +150 s, +300 s */
 			m->retransmit--;
-			m->next_time = net_now + m->retransmit_interval;
+			m->next_time = m->first_time + (double)m->retransmit_window * (m->retransmit_total - m->retransmit)
+				       / m->retransmit_total;
 			continue;
 		}
 		ermes_queue_remove(&ermes_queue, m);

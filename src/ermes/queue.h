@@ -44,7 +44,10 @@ typedef struct ermes_page_opts {
 	const struct pager_charset *charset;	/* alphanumeric codepage, NULL = --charset */
 	int			priority;	/* ERMES_PRIORITY_* */
 	int			retransmit;	/* transmissions after the first, same number */
-	int			retransmit_interval; /* seconds between them */
+	int			retransmit_window; /* seconds from the first to the last transmission:
+						 * the repeats spread evenly over it (-2 §4.3.1.3.1:
+						 * "within an operator defined time interval from the
+						 * initial message transmission", default 5 min) */
 	int			last_number;	/* type "lastnum": the latest message number again */
 	int			external;	/* opid=: a visiting receiver (EB = 1) ... */
 	int			opid;		/* ... of this home operator (13 bits) */
@@ -53,8 +56,8 @@ typedef struct ermes_page_opts {
 /* Repetition (ETS 300 133-2 §4.3.1.3.1 p.18): the message is sent again with its number, within
  * an interval set by the operator, 5 minutes by default */
 #define ERMES_RETRANSMIT_MAX		15
-#define ERMES_RETRANSMIT_INTERVAL_S	300
-#define ERMES_RETRANSMIT_INTERVAL_MAX_S	3600
+#define ERMES_RETRANSMIT_WINDOW_S	300
+#define ERMES_RETRANSMIT_WINDOW_MAX_S	3600
 
 /* "priority 2 (normal)" */
 const char *ermes_priority_name(int priority);
@@ -80,6 +83,8 @@ typedef struct ermes_group {
 								 * this codeword count + 1, 0 = not */
 	int			done[ERMES_GROUP_MAX_MEMBERS];		/* stage 2 sent */
 	int			active;		/* channels sending their part now */
+	int			ctap;		/* the one CTAP of the call on every channel (§10.3: all
+						 * members the same CTA), -1 = none yet */
 } ermes_group_t;
 
 /* The batch types of a group's members must leave room for its stages within the 16 batches of
@@ -95,7 +100,8 @@ typedef struct ermes_msg {
 	int			priority;	/* ERMES_PRIORITY_* */
 	double			queued;		/* when it came (s since the epoch, system clock) */
 	int			retransmit;	/* transmissions still to come after this one */
-	int			retransmit_interval; /* seconds */
+	int			retransmit_window; /* seconds */
+	int			retransmit_total; /* repeats asked for (the spacing: window / total) */
 	int			sent;		/* transmissions so far */
 	double			first_time;	/* network time of the first transmission */
 	double			next_time;	/* network time of the next retransmission */
@@ -109,7 +115,7 @@ typedef struct ermes_queue {
 extern ermes_queue_t ermes_queue;
 
 /* Options field of a FIFO line (as flex): "priority=1 urgent=1 alert=3 charset=... retransmit=2
- * retransmit_interval=300" onto opts. 0 or -1 (logged) */
+ * retransmit_window=300" onto opts. 0 or -1 (logged) */
 int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts);
 
 /* Check a page and put it at the end of the queue. 0, or -1 (not queued, logged) */

@@ -123,8 +123,9 @@ The defaults, 2-1-2 and paging area 0, are the factory setting of NEC ERMES
 pagers, so a pager as delivered locks without options. The values may be
 given in decimal or 0x hex.
 
-Not settable, always 0: the border area indicator (BAI, §9.3) and the
-external traffic indicator (ETI, §9.4). The network is a home network only.
+Not settable, always 0: the border area indicator (BAI, §9.3). The external
+traffic indicator (ETI, §9.4) is 1 in a batch with a visitor's initial
+address (see Visiting receivers), else 0.
 
 Observed with an NEC PA3E6-1A: no lock with country 4 (2-4-2), lock with its
 home 2-1-2.
@@ -198,7 +199,7 @@ lines without them:
 | `alert`               | 0..7  | 0       | `--alert`                    | alert type (Table 9); what each type sounds like is up to the pager |
 | `charset`             | a codepage name | `--charset` | `--charset`       | codepage of an alphanumeric message (see Codepages) |
 | `retransmit`          | 0..15 | 0       | `--retransmit`               | times the page is sent again after the first, with the same number (ETS 300 133-2 §4.3.1.3.1) |
-| `retransmit_interval` | 1..3600 | 300   | `--retransmit-interval`      | seconds between the transmissions |
+| `retransmit_window`   | 1..3600 | 300   | `--retransmit-window`        | seconds from the first to the last transmission; the repeats are spread evenly over it (ETS 300 133-2 §4.3.1.3.1, default 5 min) |
 | `opid`                | zone-country-operator | none | -              | the page is for a visiting receiver of that home operator (see Visiting receivers) |
 
 Other command-line defaults: `-y` the type (default tone), `-M` the text
@@ -216,7 +217,7 @@ nec-C63900,numeric,,0123 456-789
 nec-C63900,tone
 nec-C63900,tone,urgent=1 alert=3
 0x318E40,alpha,priority=1 urgent=1,Meeting at 10, room 2
-3247680,alpha,retransmit=2 retransmit_interval=60,Sent three times, one number
+3247680,alpha,retransmit=2 retransmit_window=60,Sent three times within a minute, one number
 ```
 
 Write to the FIFO from a shell:
@@ -249,9 +250,11 @@ correct message and reports the ones it missed. One receiver, no
 (refused). Observed with the NEC PA3E6-1A: its last message was 3, the book
 was set to 5, `lastnum` sent 5, and it showed "missing 04-05".
 
-### Long messages
+### Messages over several batches
 
-A message holds up to 1023 bytes of text (UTF-8: a character outside ASCII
+(Not the long-message procedure of §10.4 with submessages and a link
+counter: that is not sent yet; the receiver decodes it.) A message holds up
+to 1023 bytes of text (UTF-8: a character outside ASCII
 takes 2 or 3 bytes). When it does not fit in its batch, it runs on into the
 next batches, right after their address partition (§10.5). One batch in time
 slots 0..14 holds about 359 alphanumeric characters, the long last slot 451
@@ -307,9 +310,11 @@ messages again. The pointer itself is held 12 s after the last member's
 initial address (the members may still search for its text), then free for
 another call. The 16 pointers of a channel each go: free, addressing, message
 (the text runs on into further batches), hold, free; the log shows every
-change. A member is served by the channel that carries its FSN. At most 32
-members (a limit of this program, not of the standard); `retransmit=` is
-refused for group calls.
+change. A member is served by the channel that carries its FSN; all members
+get the same CTAP, on every channel (§10.3). A member no channel carries is
+left out with a notice, the call goes to the others (ETS 300 133-2 p.25). At
+most 32 members (a limit of this program, not of the standard); `retransmit=`
+is refused for group calls.
 
 A batch that carries a pointer (stage 2), the text (stage 3) or the rest of a
 long message continued from the batch before (§10.5) has no initial address
@@ -435,6 +440,11 @@ must know, one line each:
   sequence and reports missing messages, so it is kept across runs.
 - `fsn`: the receiver's frequency subset number (0..15, below). Without it a
   page goes on the first channel with room.
+- `hnl` (ours) / `enl` (a visitor's line), 0..5: battery saving at sequence
+  level (ETS 300 133-4 §11.4 Table 19): the receiver listens only in the
+  cycles (minutes) whose number ends in the same last `hnl`/`enl` bits as its
+  initial address; its pages wait for such a minute. Missing: the defaults
+  of the standard, HNL 0 (every minute) and ENL 2 (every 4th minute).
 
 While the network runs, the FIFO type `book` changes an entry, with the same
 `key=value` pairs in the options field; the file is saved at once:
@@ -457,9 +467,9 @@ way (`nec-C63900,book,opid=2-1-3 number=20`).
 A pager of another operator can visit our network (roaming, ETS 300 133-4
 Table 8, §5.5.2, §9.4). Local addresses are unique only within an operator,
 so a visitor is told apart by its home operator's identity (OPID, 13 bits:
-zone, country, operator - the same three numbers as our network's `-Z -C
--O`). The page option `opid=2-1-3` sends a page to the visitor with that home
-operator:
+zone, country, operator - the same three numbers as our network's `--zone
+--country --operator`). The page option `opid=2-1-3` sends a page to the
+visitor with that home operator:
 
 - the message header has the external bit EB = 1;
 - right after the header comes one codeword with the OPID (13 bits, then
@@ -470,7 +480,10 @@ operator:
 A visitor is another receiver than ours with the same local address: it has
 its own message numbers (a book line with `opid=`), and our pager with that
 address does not take its pages. `lastnum` works for visitors too. Group
-calls go to our own receivers only (`opid` refused there).
+calls go to our own receivers only (`opid` refused there). Priority 1 is not
+used for a visitor: it becomes 2 (ETS 300 133-2 p.18). A visitor listens
+only every 4th minute by default (ENL 2, see Subscriber book): its pages wait
+for its minutes.
 
 ```
 nec-C63900,alpha,opid=2-1-3,For the visitor from 2-1-3
@@ -486,22 +499,38 @@ transmission, or another network) is decoded and logged. It is a monitor,
 not a pager: every batch and every message, whatever its address.
 
 ```
-(chan 9) Received in batch A: message to 0x318E40 number 7, alpha "R1 receiver check one", not urgent, alert 0
-(chan 9) Received in batch E: message to common temporary address CTAP 0 number 0, alpha "R1 group END", not urgent, alert 0, group of 2: 0x318E40/8 0x000022/1
+(chan 9) Received in batch A: message to 0x318E40 number 7, alpha "R1 receiver check one", not urgent, alert 0; complete
+(chan 9) Received in batch E: message to common temporary address CTAP 0 number 0, alpha "R1 group END", not urgent, alert 0, group of 2: 0x318E40/8 0x000022/1; complete
 ```
 
 - Messages at log level notice (`-v 5` and up), each batch at info
-  (`-v 6`): system information, initial addresses, codeblocks, bits
-  corrected, codewords in error, how far the sync was off.
-- Group calls: the pointers are kept per CTAP for 12 s; the text to the
-  common temporary address is shown with its members and their numbers.
-- Visitors (EB, OPID), `lastnum`, long-message parts (link counter) are
-  named as such.
-- Bad codewords: numeric text stops at the first one, alphanumeric shows
-  `?` for one and stops after two in a row (ETS 300 133-5 §7.5, §7.6); runs
-  without a readable header are counted in the batch, not shown.
-- Noted, not acted on: a message whose initial address is not in its
-  batch, messages not in ascending address order (pagers rely on it).
+  (`-v 6`): system information (with ETI, BAI, SSIT), initial addresses,
+  codeblocks, bits corrected, codewords in error, runs without a header,
+  headers nobody was addressed for, how far the sync was off.
+- A message counts when its receiver's initial address was sent in the 12 s
+  before, from the start of that batch (ETS 300 133-4 §10.8): in the same
+  batch, or earlier (a group pointer, a message delayed or after the
+  address partition of the next batch). Other runs between delimiters are
+  fill and only counted.
+- Group calls: the pointers are kept per CTAP; the text to the common
+  temporary address is shown with the members whose 12 s search still runs,
+  and their numbers.
+- Visitors (EB, OPID), `lastnum`, long-message parts (category, link
+  counter, character set) are named as such.
+- Text: LF, CR, ESC as ␊ ␍ ␛, other codes without a glyph as `<0xNN>`, so a
+  line stays one line. The end of message is not shown; if what follows it
+  is not the fill, it is shown apart with a WARNING. A character from a
+  codeword in error is `?` and the text goes on (a monitor, not a pager:
+  pagers stop, -5 §7.5/§7.6); each character keeps its state (ok,
+  corrected, bad).
+- Status of each text: `complete` (n characters corrected, if any),
+  `DAMAGED (n of m characters bad)`, `INCOMPLETE` (the rest not received -
+  `<..>` where it is missing, when the lock was lost while it ran on - or no
+  end of message); a message over several batches says so.
+- Per receiver: a number seen again (`REPEAT`, same or another text) and
+  numbers skipped (`numbers 12..13 missing`), also from `lastnum`.
+- Noted, not acted on: messages not in ascending address order (pagers rely
+  on it).
 - The channel's `-P` polarity applies to receiving too; the long batch
   follows the channel number.
 

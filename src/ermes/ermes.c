@@ -298,13 +298,22 @@ int ermes_msg_send(const char *line)
 		LOGP(DERMES, LOGL_ERROR, "A group call goes to our own receivers: no opid.\n");
 		return -1;
 	}
-	/* a page that no channel may carry would wait for ever (a book change may fix it) */
+	/* a page that no channel may carry would wait for ever (a book change may fix it); a group
+	 * call goes to the members that can be reached (-2 p.25) */
 	for (i = 0; i < num; i++) {
-		if (!ermes_scheduler_reachable(members[i], opts.external ? opts.opid : -1)) {
-			LOGP(DERMES, LOGL_ERROR, "No channel carries %s: its FSN (book) is not in any channel's FSI.\n",
-			     ermes_print_address(members[i]));
+		if (ermes_scheduler_reachable(members[i], opts.external ? opts.opid : -1))
+			continue;
+		LOGP(DERMES, group ? LOGL_NOTICE : LOGL_ERROR, "No channel carries %s: its FSN (book) is not in any channel's FSI%s.\n",
+		     ermes_print_address(members[i]), group ? ", left out of the group call" : "");
+		if (!group)
 			return -1;
-		}
+		memmove(members + i, members + i + 1, (num - i - 1) * sizeof(members[0]));
+		num--;
+		i--;
+	}
+	if (!num) {
+		LOGP(DERMES, LOGL_ERROR, "No member of the group call can be reached.\n");
+		return -1;
 	}
 	if (field[2])
 		text = field[2];
@@ -335,6 +344,11 @@ int call_down_setup(int __attribute__((unused)) callref, const char *caller_id, 
 		return -CAUSE_NOCHANNEL;
 	if (ermes_parse_address(dialing, &la) < 0)
 		return -CAUSE_INVALNUMBER;
+	/* as the FIFO: a page no channel may carry would wait for ever */
+	if (!ermes_scheduler_reachable(la, -1)) {
+		LOGP(DERMES, LOGL_ERROR, "No channel carries %s: its FSN (book) is not in any channel's FSI.\n", ermes_print_address(la));
+		return -CAUSE_OUTOFORDER;
+	}
 	if (ermes_queue_page(&ermes_queue, la, &ermes_default_opts, text) < 0)
 		return -CAUSE_INVALNUMBER;
 	return -CAUSE_NORMAL;

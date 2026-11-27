@@ -46,14 +46,14 @@ const char *ermes_retransmit_str(const ermes_msg_t *msg)
 
 	if (!msg->retransmit)
 		return "";
-	snprintf(buf, sizeof(buf), ", sent %d more time%s %d s apart", msg->retransmit,
-		 (msg->retransmit == 1) ? "" : "s", msg->retransmit_interval);
+	snprintf(buf, sizeof(buf), ", sent %d more time%s within %d s", msg->retransmit,
+		 (msg->retransmit == 1) ? "" : "s", msg->retransmit_window);
 	return buf;
 }
 
 ermes_page_opts_t ermes_default_opts = {
 	.category = ERMES_CAT_TONE, .urgent = 0, .alert = 0, .priority = ERMES_PRIORITY_NORMAL,
-	.retransmit = 0, .retransmit_interval = ERMES_RETRANSMIT_INTERVAL_S,
+	.retransmit = 0, .retransmit_window = ERMES_RETRANSMIT_WINDOW_S,
 };
 
 /* a whole number option value in min..max. 0 or -1 (logged) */
@@ -111,8 +111,8 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 		} else if (!strcasecmp(key, "retransmit")) {
 			if (int_option(key, val, 0, ERMES_RETRANSMIT_MAX, &o.retransmit) < 0)
 				return -1;
-		} else if (!strcasecmp(key, "retransmit_interval")) {
-			if (int_option(key, val, 1, ERMES_RETRANSMIT_INTERVAL_MAX_S, &o.retransmit_interval) < 0)
+		} else if (!strcasecmp(key, "retransmit_window")) {
+			if (int_option(key, val, 1, ERMES_RETRANSMIT_WINDOW_MAX_S, &o.retransmit_window) < 0)
 				return -1;
 		} else if (!strcasecmp(key, "opid")) {
 			/* home operator of a visiting receiver, as the network's: zone-country-operator */
@@ -128,7 +128,7 @@ int ermes_parse_page_opts(const char *options, ermes_page_opts_t *opts)
 				return -1;
 			}
 		} else {
-			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (priority, urgent, alert, charset, retransmit, retransmit_interval, opid).\n", key);
+			LOGP(DERMES, LOGL_ERROR, "Unknown option \"%s\" (priority, urgent, alert, charset, retransmit, retransmit_window, opid).\n", key);
 			return -1;
 		}
 	}
@@ -197,8 +197,14 @@ static ermes_msg_t *new_msg(uint32_t local_address, const ermes_page_opts_t *opt
 	 * when a page of higher priority goes before one that came earlier */
 	m->page.number = -1;
 	m->priority = opts->priority;
+	/* a visitor's page: no priority 1 outside its home network (-2 p.18, -3 p.39) */
+	if (opts->external && m->priority == ERMES_PRIORITY_HIGH) {
+		LOGP(DERMES, LOGL_NOTICE, "Priority 1 is not used for a visiting receiver (ETS 300 133-2 p.18): priority 2.\n");
+		m->priority = ERMES_PRIORITY_NORMAL;
+	}
 	m->retransmit = opts->retransmit;
-	m->retransmit_interval = opts->retransmit_interval;
+	m->retransmit_window = opts->retransmit_window;
+	m->retransmit_total = opts->retransmit;
 	gettimeofday(&tv, NULL);
 	m->queued = tv.tv_sec + tv.tv_usec / 1e6;
 	return m;
@@ -295,6 +301,7 @@ int ermes_queue_group(ermes_queue_t *queue, const uint32_t *members, int num, co
 	g = calloc(1, sizeof(*g));
 	if (!g)
 		return -1;
+	g->ctap = -1;
 	/* the message itself goes to the common temporary address, with the dummy number 00000
 	 * (§10.3 third stage); the address is set when the call starts */
 	m = new_msg(0, opts, text);
