@@ -919,6 +919,8 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	int buffer_size;
 	sender_t *sender;
 	double last_time_call = 0, begin_time, now, sleep;
+	double loop_start = 0.0, loop_longest = 0.0;
+	unsigned long loop_passes = 0, loop_over_1ms = 0, loop_over_2ms = 0, loop_over_5ms = 0;
 	struct termios term, term_orig;
 	int num_chan, i;
 	int c;
@@ -1229,6 +1231,22 @@ next_char:
 
 		now = get_time();
 
+		/* how long a pass took (what blocks the loop delays the TX feed): the longest after
+		 * the first 5 s (the start), at the end */
+		if (!loop_start)
+			loop_start = begin_time;
+		if (begin_time - loop_start >= 5.0) {
+			loop_passes++;
+			if (now - begin_time > loop_longest)
+				loop_longest = now - begin_time;
+			if (now - begin_time > 0.001)
+				loop_over_1ms++;
+			if (now - begin_time > 0.002)
+				loop_over_2ms++;
+			if (now - begin_time > 0.005)
+				loop_over_5ms++;
+		}
+
 		/* sleep interval:
 		 * When using SDR, the write thread's send() is the real pacemaker.
 		 * Use a short yield (100us) instead of the full dsp_interval to keep
@@ -1250,6 +1268,10 @@ next_char:
 //		now = get_time();
 //		printf("duration =%.6f\n", now - begin_time);
 	}
+
+	if (loop_passes)
+		LOGP(DSENDER, LOGL_INFO, "Main loop: %lu passes after the first 5 s, the longest %.2f ms; over 1 ms %lu, over 2 ms %lu, over 5 ms %lu.\n",
+		     loop_passes, loop_longest * 1e3, loop_over_1ms, loop_over_2ms, loop_over_5ms);
 
 	/* reset signals */
 	signal(SIGINT, SIG_DFL);
