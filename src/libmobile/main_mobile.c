@@ -39,6 +39,7 @@
 #include <osmocom/cc/g711.h>
 #include "console.h"
 #include "get_time.h"
+#include "clock_monitor.h"
 #ifdef HAVE_SDR
 #include "../libsdr/sdr.h"
 #include "../libsdr/sdr_config.h"
@@ -884,12 +885,19 @@ int main_mobile_handle_options(int short_option, int argi, char **argv)
 /* global variable to quit main loop */
 int quit = 0;
 
+/* SIGUSR1: the clock status (main loop) */
+static volatile sig_atomic_t clock_report_asked;
+
 void sighandler(int sigset)
 {
 	if (sigset == SIGHUP)
 		return;
 	if (sigset == SIGPIPE)
 		return;
+	if (sigset == SIGUSR1) {
+		clock_report_asked = 1;
+		return;
+	}
 
 	printf("Signal received: %d\n", sigset);
 
@@ -1091,6 +1099,7 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 	signal(SIGHUP, sighandler);
 	signal(SIGTERM, sighandler);
 	signal(SIGPIPE, sighandler);
+	signal(SIGUSR1, sighandler);
 
 	if (batch) {
 		sample_clock_start();
@@ -1102,6 +1111,12 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 		*quit = 1;
 	if (console_start_audio())
 		*quit = 1;
+
+#ifdef HAVE_SDR
+	/* the device's clock against the PC's: what the protocol needs */
+	if (use_sdr)
+		clock_monitor_start(name, sender_head ? sender_head->sendefrequenz : 0.0);
+#endif
 
 	while(!(*quit)) {
 		int work;
@@ -1115,9 +1130,16 @@ void main_mobile_loop(const char *name, int *quit, void (*myhandler)(void), cons
 			*quit = 1;
 			break;
 		}
-		/* the device's clock: reference, locks, time (once a second, changes logged) */
-		if (use_sdr)
+		/* the device's clock: a copy of what libsdr's control thread read (once a second,
+		 * lock changes logged), the monitor */
+		if (use_sdr) {
 			sdr_clock_poll();
+			clock_monitor_poll();
+			if (clock_report_asked) {
+				clock_report_asked = 0;
+				clock_monitor_report();
+			}
+		}
 #endif
 
 		/* process sound of all transceivers */
@@ -1272,10 +1294,14 @@ next_char:
 	if (loop_passes)
 		LOGP(DSENDER, LOGL_INFO, "Main loop: %lu passes after the first 5 s, the longest %.2f ms; over 1 ms %lu, over 2 ms %lu, over 5 ms %lu.\n",
 		     loop_passes, loop_longest * 1e3, loop_over_1ms, loop_over_2ms, loop_over_5ms);
+#ifdef HAVE_SDR
+	clock_monitor_stop();
+#endif
 
 	/* reset signals */
 	signal(SIGINT, SIG_DFL);
 	signal(SIGHUP, SIG_DFL);
+	signal(SIGUSR1, SIG_DFL);
 	signal(SIGTERM, SIG_DFL);
 	signal(SIGPIPE, SIG_DFL);
 

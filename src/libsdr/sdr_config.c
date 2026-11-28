@@ -207,13 +207,23 @@ void sdr_config_print_help(void)
 	printf("        RX-specific upconverter offset (Hz).\n");
 	printf("\nFrequency correction:\n");
 	printf("    --sdr-ppm <correction>\n");
-	printf("        Roles of crystal oscillator in PPM (parts per million).\n");
-	printf("        Positive value means crystal is fast, negative means slow.\n");
-	printf("        Applies to both TX and RX, or unified device.\n");
+	printf("        Error of the crystal oscillator in PPM (parts per million): positive\n");
+	printf("        when it is slow (the frequencies asked for are raised by as much),\n");
+	printf("        negative when it is fast; the value osmocalibrate prints. The carrier\n");
+	printf("        only, not the sample rate. Applies to both TX and RX, or unified device.\n");
 	printf("    --sdr-tx-ppm <correction>\n");
 	printf("        PPM correction for TX device (split mode only).\n");
 	printf("    --sdr-rx-ppm <correction>\n");
 	printf("        PPM correction for RX device (split mode only).\n");
+	printf("\nClock monitor (UHD: the device clock against the PC's and NTP's UTC):\n");
+	printf("    --sdr-clock-trim off | dry | on\n");
+	printf("        Steer the TX carrier by the drift against NTP's UTC, very slowly: steps of\n");
+	printf("        at most 0.1 ppm, after 30 min or more of NTP synchronised and only when the\n");
+	printf("        error is well beyond its uncertainty. dry: log what it would do. The\n");
+	printf("        carrier only (as --sdr-ppm), not the symbol rate. (default off)\n");
+	printf("    --sdr-clock-log <file>\n");
+	printf("        Append the monitor's points (every 10 s) to this file, for analysis.\n");
+	printf("    The clock status on demand: SIGUSR1 (kill -USR1 <pid>); also at the end.\n");
 }
 
 void sdr_config_print_hotkeys(void)
@@ -285,6 +295,8 @@ void sdr_config_print_hotkeys(void)
 #define	OPT_SDR_FILTER_BANK	1551
 #define	OPT_SDR_BACKEND		1552
 #define	OPT_SDR_IQ_STATUS	1553
+#define	OPT_SDR_CLOCK_TRIM	1554
+#define	OPT_SDR_CLOCK_LOG	1555
 
 void sdr_config_add_options(void)
 {
@@ -347,6 +359,8 @@ void sdr_config_add_options(void)
 	option_add(OPT_SDR_PPM, "sdr-ppm", 1);
 	option_add(OPT_SDR_TX_PPM, "sdr-tx-ppm", 1);
 	option_add(OPT_SDR_RX_PPM, "sdr-rx-ppm", 1);
+	option_add(OPT_SDR_CLOCK_TRIM, "sdr-clock-trim", 1);
+	option_add(OPT_SDR_CLOCK_LOG, "sdr-clock-log", 1);
 	option_add(OPT_SDR_FILTER_BANK, "sdr-filter-bank", 1);
 	option_add(OPT_SDR_BACKEND, "sdr-backend", 1);
 	option_add(OPT_SDR_IQ_STATUS, "sdr-iq-status", 1);
@@ -607,6 +621,21 @@ int sdr_config_handle_options(int short_option, int argi, char **argv)
 		break;
 	case OPT_SDR_RX_PPM:
 		sdr_config->rx_ppm = atof(argv[argi]);
+		break;
+	case OPT_SDR_CLOCK_TRIM:
+		if (!strcasecmp(argv[argi], "off"))
+			sdr_config->clock_trim = 0;
+		else if (!strcasecmp(argv[argi], "dry"))
+			sdr_config->clock_trim = 1;
+		else if (!strcasecmp(argv[argi], "on"))
+			sdr_config->clock_trim = 2;
+		else {
+			fprintf(stderr, "--sdr-clock-trim takes off, dry or on.\n");
+			return -EINVAL;
+		}
+		break;
+	case OPT_SDR_CLOCK_LOG:
+		sdr_config->clock_log = options_strdup(argv[argi]);
 		break;
 	default:
 		return -EINVAL;

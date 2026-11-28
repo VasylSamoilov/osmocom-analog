@@ -27,7 +27,12 @@ noinst_PROGRAMS = \
 	test_amps_rx \
 	test_amps_states \
 	test_ermes_code \
-	test_lte_cell
+	test_lte_cell \
+	test_clock_drift
+
+test_clock_drift_SOURCES = test_clock_drift.c ../libmobile/clock_drift.c
+
+test_clock_drift_LDADD = -lm
 
 test_filter_SOURCES = test_filter.c dummy.c
 

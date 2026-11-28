@@ -46,6 +46,8 @@ typedef struct sdr_config {
 	double		ppm;			/* unified PPM correction (both TX and RX) */
 	double		tx_ppm;			/* split mode: TX device PPM correction */
 	double		rx_ppm;			/* split mode: RX device PPM correction */
+	int		clock_trim;		/* --sdr-clock-trim: 0 off, 1 dry run, 2 on */
+	const char	*clock_log;		/* --sdr-clock-log: the clock monitor's points */
 	/* Upconverter support (e.g., Ham-It-Up for kHz band reception) */
 	double		tx_upconverter;		/* TX upconverter offset (Hz) */
 	double		rx_upconverter;		/* RX upconverter offset (Hz) */

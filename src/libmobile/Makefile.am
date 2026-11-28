@@ -14,7 +14,9 @@ libmobile_a_SOURCES = \
 	iq_wave.c \
 	audio_none.c \
 	msg_fifo.c \
-	afc.c
+	afc.c \
+	clock_drift.c \
+	clock_monitor.c
 
 if HAVE_ALSA
 AM_CPPFLAGS += -DHAVE_ALSA
