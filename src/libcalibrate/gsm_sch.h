@@ -39,6 +39,11 @@ typedef struct gsm_cell_ident {
 	int		mcc, mnc, mnc_3digit, lac;
 	int		have_ci;	/* cell identity known (SI3) */
 	int		ci;
+	/* the sample clock from the frame timing (consistent SCH: position
+	 * against frame number, a regression): the crystal alone, no tuning
+	 * step in it. positive = the SDR clock is slow (as the carrier ppm) */
+	double		timing_ppm, timing_std_ppm;
+	int		timing_points;
 } gsm_cell_ident_t;
 
 /* si_count[] index */
@@ -60,6 +65,11 @@ typedef struct gsm_sch {
 	int64_t		first_pos;	/* first good SCH: stream position, */
 	uint32_t	first_fn;	/* frame number */
 	int64_t		bcch_done_fn;	/* last BCCH block FN decoded */
+	/* frame timing regression: k frames since (t_fn, t_pos), y samples */
+	int		t_n;
+	uint32_t	t_fn;
+	double		t_pos;
+	double		t_sk, t_sy, t_skk, t_sky, t_syy;
 	gsm_cell_ident_t ident;
 } gsm_sch_t;
 

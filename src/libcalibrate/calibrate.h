@@ -118,6 +118,7 @@ typedef struct {
 	double cpu_transport;       /* share of one core for the reading threads */
 	int windows;
 	int stopped_weak;           /* the weaker carriers left out (none confirmed in a row) */
+	double lte_idle_sec;        /* LTE: idle between windows to stay within --cpu */
 	calibrate_cell_t cells[CALIB_MAX_CELLS]; /* carriers measured, in order */
 	int num_cells;
 } calibrate_result_t;
@@ -147,7 +148,16 @@ typedef struct {
 	 * cost is measured at the widest, the rate with the most channels per
 	 * window in the budget */
 	int (*reopen)(int samplerate);
+	/* another RX rate without a reopen (NULL: not possible), at most the
+	 * rate opened; window_stage: CALIB_STAGE_* what a window may use */
+	int (*set_rate)(int samplerate);
+	int window_stage;
 } calibrate_config_t;
+
+/* a window at the narrowest rate that holds its carriers (set_rate) */
+#define CALIB_STAGE_RATE	1
+/* the window's channels on one shared first stage (libsdr's engine) */
+#define CALIB_STAGE_SHARED	2
 
 /* Initialize default configuration */
 void calibrate_config_default(calibrate_config_t *config);

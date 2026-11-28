@@ -42,6 +42,7 @@ int use_sdr = 0;
 /* Calibration-specific options */
 static calibrate_config_t config;
 static int json_output = 0;
+static int ppm_from = -1;	/* --ppm-from: -1 the device's rule, 0 carrier, 1 timing */
 
 /* Custom option IDs (above 512 to avoid collision with sdr_config) */
 enum {
@@ -57,6 +58,8 @@ enum {
 	OPT_NO_CONFIRM,
 	OPT_DECODE_TIMEOUT,
 	OPT_NO_BCCH,
+	OPT_WINDOW_STAGE,
+	OPT_PPM_FROM,
 };
 
 static void print_help(const char *arg0)
@@ -90,6 +93,14 @@ static void print_help(const char *arg0)
 	printf("                          does not decode\n");
 	printf("      --decode-timeout <s> Time allowed for the identity decoding\n");
 	printf("                          (default: %.0f)\n", config.decode_timeout_sec);
+	printf("      --ppm-from carrier|timing\n");
+	printf("                          The result from the carriers' offsets or from the\n");
+	printf("                          frame timing (GSM TDMA, LTE frames: the crystal\n");
+	printf("                          alone); default timing on an RTL-SDR, else carrier\n");
+	printf("      --window-stage none|rate|shared|both\n");
+	printf("                          A window of carriers: at the narrowest SDR rate that\n");
+	printf("                          holds them (changed without a reopen), on one shared\n");
+	printf("                          first stage, both, or neither (default rate)\n");
 	printf("      --no-bcch           Decode only the SCH, not the System Information\n");
 	printf("                          (MCC, MNC, LAC, cell identity)\n");
 	printf("  -j, --json              Output in JSON format\n");
@@ -120,6 +131,8 @@ static void add_options(void)
 	option_add(OPT_NO_CONFIRM, "no-confirm", 0);
 	option_add(OPT_DECODE_TIMEOUT, "decode-timeout", 1);
 	option_add(OPT_NO_BCCH, "no-bcch", 0);
+	option_add(OPT_WINDOW_STAGE, "window-stage", 1);
+	option_add(OPT_PPM_FROM, "ppm-from", 1);
 	option_add('j', "json", 0);
 	sdr_config_add_options();
 }
@@ -293,6 +306,30 @@ static int handle_options(int short_option, int argi, char **argv)
 	case OPT_NO_BCCH:
 		config.decode_bcch = 0;
 		break;
+	case OPT_PPM_FROM:
+		if (!strcasecmp(argv[argi], "timing"))
+			ppm_from = 1;
+		else if (!strcasecmp(argv[argi], "carrier"))
+			ppm_from = 0;
+		else {
+			fprintf(stderr, "--ppm-from: carrier or timing, not '%s'\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
+	case OPT_WINDOW_STAGE:
+		if (!strcasecmp(argv[argi], "none"))
+			config.window_stage = 0;
+		else if (!strcasecmp(argv[argi], "rate"))
+			config.window_stage = CALIB_STAGE_RATE;
+		else if (!strcasecmp(argv[argi], "shared"))
+			config.window_stage = CALIB_STAGE_SHARED;
+		else if (!strcasecmp(argv[argi], "both"))
+			config.window_stage = CALIB_STAGE_RATE | CALIB_STAGE_SHARED;
+		else {
+			fprintf(stderr, "--window-stage: none, rate, shared or both, not '%s'\n", argv[argi]);
+			return -EINVAL;
+		}
+		break;
 	case 'j':
 		json_output = 1;
 		break;
@@ -319,6 +356,7 @@ int sdr_check_separate_device_support(int tx_only, int rx_only, int split_mode)
 }
 
 static void *sdr;
+static int open_buffer;		/* buffer_size of the open (sdr_set_rx_rate keeps the buffers) */
 
 /* RX only, the whole band at the DSP rate (channels = 0): libsdr opens the
  * device (upconverter, PPM, clock source as every program), its read thread
@@ -350,6 +388,24 @@ static int open_sdr_rx(double center_freq, int samplerate)
 		return rc;
 	}
 	calibrate_set_sdr(sdr, buffer_size);
+	open_buffer = buffer_size;
+	return 0;
+}
+
+/* another rate on the open SDR (libsdr's sdr_set_rx_rate(), no reopen; at
+ * most the rate opened); the reopen if libsdr cannot */
+static int set_rate_sdr(int samplerate)
+{
+	int rc;
+
+	if (!sdr)
+		return -ENODEV;
+	rc = sdr_set_rx_rate(sdr, samplerate);
+	if (rc == -ENOTSUP && config.reopen)
+		return config.reopen(samplerate);
+	if (rc < 0)
+		return rc;
+	calibrate_set_sdr(sdr, open_buffer);
 	return 0;
 }
 
@@ -429,8 +485,8 @@ static void print_cell_text(const calibrate_cell_t *cell, double applied_ppm)
 	printf("  %-8s ARFCN %4d %9.3f MHz  %-13s %-7s %-20s", gsm_band_name(cell->gsm_band), cell->arfcn,
 	       cell->freq_hz / 1e6, ident, mccmnc, laci);
 	if (cell->num_measurements >= 3)
-		printf(" %+8.1f Hz %7.3f ppm %6.1f dBFS  SNR %4.1f dB%s\n", cell->hz_offset,
-		       cell->ppm_offset + applied_ppm, cell->level_dbfs, cell->snr_db,
+		printf(" %+8.1f Hz %7.3f ppm%s %6.1f dBFS  SNR %4.1f dB%s\n", cell->hz_offset,
+		       cell->ppm_offset + applied_ppm, cell->lte.timing ? " (timing)" : "", cell->level_dbfs, cell->snr_db,
 		       (cell->confirmed && !cell->agrees) ? "  disagrees" : "");
 	else
 		printf(" no FCCH         %6.1f dBFS\n", cell->level_dbfs);
@@ -701,7 +757,7 @@ int main(int argc, char *argv[])
 	/* the RTL's R820T lands off the LO set (PLL step, up to +-0.5 ppm at
 	 * 900 MHz, per frequency): its carrier offsets carry that; the LTE
 	 * frame timing is the crystal only */
-	config.lte_timing = dev->lte_timing;
+	config.lte_timing = (ppm_from >= 0) ? ppm_from : dev->lte_timing;
 	if (bands_in_reach() < 0)
 		return 1;
 	if (config.forced_arfcn > 0) {
@@ -735,8 +791,10 @@ int main(int argc, char *argv[])
 		 * budget picks a narrower one once the cost is measured */
 		if (max_auto && want > max_auto)
 			want = max_auto;
-		if (config.forced_arfcn <= 0)
+		if (config.forced_arfcn <= 0) {
 			config.reopen = reopen_sdr;
+			config.set_rate = set_rate_sdr;
+		}
 
 		/* with LTE: rates of 1.92 MS/s x 2^k (LTE's rate: no resampler
 		 * for its carriers, measured 26 % less separation than at

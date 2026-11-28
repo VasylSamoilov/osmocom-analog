@@ -79,6 +79,7 @@
 #define SCAN_AVG_SEC    0.02    /* and at least this long (LTE: PSS/SSS/PBCH every 5 ms) */
 #define SCAN_SETTLE_MS  50      /* ms after a retune returned to discard (B210: 5.5 ms measured; other devices buffer more) */
 #define SCAN_RES_HZ     25e3    /* cells of the spectrum kept */
+#define SCAN_COH_SEC    0.04    /* LTE: the 10 ms repetition measured over this */
 #define SCAN_DC_HZ      10e3    /* the receiver's DC strip, left out */
 #define SCAN_MARGIN_HZ  0.7e6   /* scanned beyond the band's outer carriers */
 /* the scan centres 50 kHz off the 100 kHz raster (GSM, LTE): no carrier
@@ -92,6 +93,10 @@
 #define LTE_PEAK_REACH  5       /* a peak: the most within +- this many EARFCNs */
 #define LTE_PEAK_MIN_DB 2.0     /* above the floor (10th percentile of 100 kHz cells) */
 #define LTE_FLOOR_PCT   10
+#define LTE_COH_MIN     0.15    /* 10 ms repetition: least coherence of a carrier's cell */
+#define LTE_COH_GAP     3       /* cells below it inside a block (75 kHz) */
+#define LTE_COH_WIDTH_TOL 150e3 /* edges: a width this much wider than the block still tried */
+#define LTE_COH_MIN_WIDTH 2.2e6 /* narrower: no carrier (1.4 MHz carriers are left out; spurs) */
 #define LTE_WEAK_IN_A_ROW 16    /* peaks in a row without a confirmed cell: the band ends
                                  * (the power rank is weak: UMTS and loaded
                                  * carriers outrank idle cells; 1500 came 10th) */
@@ -101,6 +106,9 @@
 #define LTE_MAX_SEC     4.0     /* most time per carrier */
 #define LTE_TIMING_STD  0.02    /* timing ppm wanted (lte_timing) */
 #define LTE_TIMING_MAX_SEC 12.0
+#define GSM_TIMING_MAX_SEC 10.0 /* SCH decoding for the timing (lte_timing) */
+
+static int calib_timing;	/* config->lte_timing: GSM too from the frame timing */
 #define LTE_ALIAS_MIN   3.0     /* cfo_alias_margin below: weight LTE_LOW_WEIGHT */
 #define LTE_LOW_WEIGHT  0.25
 #define LTE_LO_OFF_HZ   750e3   /* the LO this far from the carrier (outside its 6 RB) where the rate allows */
@@ -357,6 +365,36 @@ static int window_capacity(int samplerate)
 	return 2 * ((int)floor((reach - CHANNEL_SPACING / 2.0) / CHANNEL_SPACING) + 1);
 }
 
+/* the SDR at this rate (config->set_rate: libsdr's sdr_set_rx_rate(), no
+ * reopen), what the window uses; the current one if it cannot change */
+static int use_rate(calibrate_config_t *config, int rate)
+{
+	if (rate == calib_rate || !config->set_rate || !(config->window_stage & CALIB_STAGE_RATE))
+		return calib_rate;
+	if (config->set_rate(rate) < 0) {
+		LOGP(DSDR, LOGL_ERROR, "Changing the SDR rate to %d S/s failed\n", rate);
+		return -EIO;
+	}
+	return calib_rate;
+}
+
+/* the narrowest rate (max_rate / 2^k, at least 1 MS/s) whose usable part
+ * holds the window's channels (each half_need either side of its centre) */
+static int window_rate(calibrate_config_t *config, int max_rate, double centre, arfcn_power_t **ents, int n, double half_need)
+{
+	double need = 0.0;
+	int r = max_rate;
+
+	for (int c = 0; c < n; c++)
+		if (fabs(ents[c]->freq - centre) > need)
+			need = fabs(ents[c]->freq - centre);
+	need += half_need;
+	if (config->window_stage & CALIB_STAGE_RATE)
+		while (!(r % 2) && r / 2 >= 1000000 && usable_half(r / 2) >= need)
+			r /= 2;
+	return use_rate(config, r);
+}
+
 /* Blocking receive: until the buffer is full, or 1 s without a sample (an
  * RTL2832 delivers in large chunks, the first ones late after a start or a
  * retune). Sleeps for the time the missing samples take (at most 20 ms):
@@ -433,6 +471,7 @@ void calibrate_config_default(calibrate_config_t *config)
 	config->confirm = 1;
 	config->decode_timeout_sec = 5.0;
 	config->decode_bcch = 1;
+	config->window_stage = CALIB_STAGE_RATE;
 	config->usable_fraction = 0.35;	/* an unknown device */
 	config->usable_max_hz = 0.0;
 }
@@ -448,12 +487,14 @@ static struct {
 	int	n;
 	float	*pow;		/* <0: not measured */
 	float	*dist;		/* the cell from its step's centre (Hz) */
+	float	*coh;		/* LTE in the run: the 10 ms repetition, 0..1 (<0: not measured) */
 } spec;
 
 static void spec_exit(void)
 {
 	free(spec.pow);
 	free(spec.dist);
+	free(spec.coh);
 	memset(&spec, 0, sizeof(spec));
 }
 
@@ -476,9 +517,17 @@ static int spec_init(const calibrate_config_t *config)
 	spec.dist = malloc(spec.n * sizeof(float));
 	if (!spec.pow || !spec.dist)
 		return -ENOMEM;
+	for (int b = 0; b < config->num_bands; b++)
+		if (config->bands[b].system == CALIB_LTE && !spec.coh) {
+			spec.coh = malloc(spec.n * sizeof(float));
+			if (!spec.coh)
+				return -ENOMEM;
+		}
 	for (int i = 0; i < spec.n; i++) {
 		spec.pow[i] = -1.0f;
 		spec.dist[i] = 1e30f;
+		if (spec.coh)
+			spec.coh[i] = -1.0f;
 	}
 	return 0;
 }
@@ -560,8 +609,16 @@ static int scan_range(int samplerate, const char *name, double band_lo, double b
 	double *csum = calloc(cells_max, sizeof(double));
 	int *ccnt = calloc(cells_max, sizeof(int));
 	int done_steps = 0;
+	/* LTE in the run: SCAN_COH_SEC more per step, 10 ms apart */
+	int coh_lag = (int)lround(0.01 * samplerate), coh_n = coh_lag + (int)(SCAN_COH_SEC * samplerate);
+	float *coh_buf = spec.coh ? malloc((size_t)coh_n * 2 * sizeof(float)) : NULL;
+	double *coh_acc = calloc(4 * fft_size, sizeof(double));
+	double *coh_b_re = calloc(fft_size, sizeof(double)), *coh_b_im = calloc(fft_size, sizeof(double));
+	double *ccoh = calloc(4 * cells_max, sizeof(double));
 
-	if (!fft_re || !fft_im || !mag_accum || !window || !iq_buf || !csum || !ccnt) {
+	if (!fft_re || !fft_im || !mag_accum || !window || !iq_buf || !csum || !ccnt || !coh_acc || !coh_b_re || !coh_b_im || !ccoh
+	 || (spec.coh && !coh_buf)) {
+		free(coh_buf); free(coh_acc); free(coh_b_re); free(coh_b_im); free(ccoh);
 		free(fft_re); free(fft_im); free(mag_accum); free(window); free(iq_buf); free(csum); free(ccnt);
 		return -ENOMEM;
 	}
@@ -624,8 +681,35 @@ static int scan_range(int samplerate, const char *name, double band_lo, double b
 		/* fft_process() scales the forward transform by 1 / N */
 		double scale = (double)fft_size * fft_size / (frames_done * wsum * fft_size * bin_hz);
 
+		/* LTE: what repeats after 10 ms (CRS, PSS, SSS) per bin, from
+		 * one contiguous capture: sum of X(t) conj X(t + 10 ms) and
+		 * both energies */
+		int have_coh = 0;
+		if (spec.coh && coh_buf) {
+			int got = receive_iq_blocking(coh_buf, coh_n), nb = 0;
+
+			memset(coh_acc, 0, 4 * fft_size * sizeof(double));
+			for (int p = 0; p + coh_lag + fft_size <= got; p += fft_size, nb++) {
+				for (int i = 0; i < fft_size; i++) {
+					fft_re[i] = coh_buf[(p + i) * 2];
+					fft_im[i] = coh_buf[(p + i) * 2 + 1];
+					coh_b_re[i] = coh_buf[(p + coh_lag + i) * 2];
+					coh_b_im[i] = coh_buf[(p + coh_lag + i) * 2 + 1];
+				}
+				fft_process(1, SCAN_FFT_LOG2, fft_re, fft_im);
+				fft_process(1, SCAN_FFT_LOG2, coh_b_re, coh_b_im);
+				for (int i = 0; i < fft_size; i++) {
+					coh_acc[4 * i] += fft_re[i] * coh_b_re[i] + fft_im[i] * coh_b_im[i];
+					coh_acc[4 * i + 1] += fft_im[i] * coh_b_re[i] - fft_re[i] * coh_b_im[i];
+					coh_acc[4 * i + 2] += fft_re[i] * fft_re[i] + fft_im[i] * fft_im[i];
+					coh_acc[4 * i + 3] += coh_b_re[i] * coh_b_re[i] + coh_b_im[i] * coh_b_im[i];
+				}
+			}
+			have_coh = (nb > 0);
+		}
 		memset(csum, 0, cells_max * sizeof(double));
 		memset(ccnt, 0, cells_max * sizeof(int));
+		memset(ccoh, 0, 4 * cells_max * sizeof(double));
 		for (int k = 0; k < fft_size; k++) {
 			double off = ((k < fft_size / 2) ? k : k - fft_size) * bin_hz;
 			int ci;
@@ -637,6 +721,9 @@ static int scan_range(int samplerate, const char *name, double band_lo, double b
 				continue;
 			csum[ci] += mag_accum[k] * scale;
 			ccnt[ci]++;
+			if (have_coh)
+				for (int q = 0; q < 4; q++)
+					ccoh[4 * ci + q] += coh_acc[4 * k + q];
 		}
 		for (int ci = 0; ci < cells_max; ci++) {
 			int i = c0 + ci;
@@ -648,6 +735,11 @@ static int scan_range(int samplerate, const char *name, double band_lo, double b
 			if (d < spec.dist[i]) {
 				spec.pow[i] = (float)(csum[ci] / ccnt[ci]);
 				spec.dist[i] = (float)d;
+				if (have_coh) {
+					double e = sqrt(ccoh[4 * ci + 2] * ccoh[4 * ci + 3]);
+
+					spec.coh[i] = (e > 0.0) ? (float)(hypot(ccoh[4 * ci], ccoh[4 * ci + 1]) / e) : 0.0f;
+				}
 			}
 		}
 
@@ -659,6 +751,7 @@ static int scan_range(int samplerate, const char *name, double band_lo, double b
 	LOGP(DSDR, LOGL_INFO, "Scanned %s: %.1f-%.1f MHz, %d of %d steps of %.1f MHz (the rest scanned before)\n",
 	     name, band_lo / 1e6, band_hi / 1e6, done_steps, num_steps, step_hz / 1e6);
 	free(fft_re); free(fft_im); free(mag_accum); free(window); free(iq_buf); free(csum); free(ccnt);
+	free(coh_buf); free(coh_acc); free(coh_b_re); free(coh_b_im); free(ccoh);
 	return 0;
 }
 
@@ -752,6 +845,9 @@ static int band_candidates(int samplerate, const calib_band_t *band, calibrate_c
 		free(list);
 		return -ENOMEM;
 	}
+	/* the scan at the widest rate (fewer steps) */
+	if (use_rate(config, samplerate) < 0)
+		return -EIO;
 	int rc = scan_range(samplerate, gsm_band_name(gsm_band), band->f_lo - CHANNEL_SPACING, band->f_hi + CHANNEL_SPACING,
 			    config->verbosity);
 	int num_scanned = 0, before = 0;
@@ -854,6 +950,151 @@ static int compare_peak(const void *a, const void *b)
 	return (pa->freq > pb->freq) - (pa->freq < pb->freq);
 }
 
+/* LTE carriers from the 10 ms repetition (spec.coh): CRS, PSS and SSS repeat
+ * every frame over the carrier's whole occupied width (N_RB x 180 kHz + 15
+ * kHz), so a carrier is a block of coherent cells of one of the six widths,
+ * its centre the block's middle. Stationary tones (receiver spurs) are
+ * coherent too but narrow; UMTS (CPICH, 10 ms) is 3.84 MHz wide, no LTE
+ * width; GSM does not repeat at 10 ms. A block wider than one carrier
+ * (contiguous carriers) gives the carriers of each width at both its edges.
+ * The candidates (list[].arfcn, .freq on the raster), the strongest block
+ * first; returns their number. */
+/* the LTE width (index into 15..100 RB, 1..5) of an occupied width, -1 */
+static int lte_width_match(double w)
+{
+	static const int rb[6] = { 6, 15, 25, 50, 75, 100 };
+
+	for (int k = 1; k < 6; k++)
+		if (fabs(w - (rb[k] * 180e3 + 15e3)) <= ((rb[k] <= 25) ? 400e3 : 600e3))
+			return k;
+	return -1;
+}
+
+static int lte_coh_candidates(const calib_band_t *band, int first, int nr, double ff, arfcn_power_t *list, const char *name)
+{
+	static const int rb[6] = { 6, 15, 25, 50, 75, 100 };
+	int i0 = spec_cell(band->f_lo - LTE_6RB_HZ), i1 = spec_cell(band->f_hi + LTE_6RB_HZ), i, j, np = 0, nv = 0, blocks = 0;
+	float *v;
+	double thr;
+
+	if (i0 < 0)
+		i0 = 0;
+	if (i1 < 0 || i1 >= spec.n)
+		i1 = spec.n - 1;
+	v = malloc((i1 - i0 + 1) * sizeof(float));
+	if (!v)
+		return 0;
+	for (i = i0; i <= i1; i++)
+		if (spec.coh[i] >= 0.0f)
+			v[nv++] = spec.coh[i];
+	if (!nv) {
+		free(v);
+		return 0;
+	}
+	qsort(v, nv, sizeof(float), compare_float);
+	/* noise: a cell's coherence without a repeating signal (~1/sqrt(bins
+	 * x blocks)); the low part of the band is that */
+	thr = 3.0 * v[nv / 5];
+	if (thr < LTE_COH_MIN)
+		thr = LTE_COH_MIN;
+	free(v);
+	/* the blocks: coherent cells, gaps (the DC strip, a weak cell) up to
+	 * LTE_COH_GAP cells; blocks under 0.3 MHz are noise and dropped,
+	 * what is left closer than 150 kHz joined */
+	int nbk = 0, cap = 256;
+	double (*bk)[3] = malloc(cap * sizeof(*bk));
+
+	if (!bk)
+		return 0;
+	for (i = i0; i <= i1; i++) {
+		int gap = 0, last, cnt = 0;
+		double sum = 0.0, lo, hi;
+
+		if (spec.coh[i] < thr)
+			continue;
+		last = i;
+		for (j = i; j <= i1; j++) {
+			if (spec.coh[j] >= thr) {
+				last = j;
+				gap = 0;
+				sum += spec.coh[j];
+				cnt++;
+			} else if (++gap > LTE_COH_GAP)
+				break;
+		}
+		lo = spec.f0 + i * SCAN_RES_HZ;
+		hi = spec.f0 + (last + 1) * SCAN_RES_HZ;
+		i = last;
+		if (hi - lo < 0.3e6)
+			continue;
+		if (nbk && lo - bk[nbk - 1][1] <= 150e3) {
+			bk[nbk - 1][1] = hi;
+			bk[nbk - 1][2] = 0.5 * (bk[nbk - 1][2] + sum / cnt);
+		} else if (nbk < cap) {
+			bk[nbk][0] = lo;
+			bk[nbk][1] = hi;
+			bk[nbk][2] = sum / cnt;
+			nbk++;
+		}
+	}
+	/* the units: every block, and two neighbours whose gap (a carrier's
+	 * centre 6 RB repeat less: the PBCH changes every frame) is at most
+	 * 1.1 MHz when together they have an LTE width */
+	for (int u = 0; u < 2 * nbk; u++) {
+		int a = u / 2, pair = u % 2;
+		double lo = bk[a][0], hi = bk[a][1], mean = bk[a][2], w, cand[14];
+		int nc = 0, match;
+
+		if (pair) {
+			if (a + 1 >= nbk || bk[a + 1][0] - bk[a][1] > 1.1e6)
+				continue;
+			hi = bk[a + 1][1];
+			mean = 0.5 * (bk[a][2] + bk[a + 1][2]);
+		}
+		w = hi - lo;
+		if (w < LTE_COH_MIN_WIDTH)
+			continue;
+		match = lte_width_match(w);
+		if (pair && match < 0)
+			continue;
+		blocks++;
+		cand[nc++] = 0.5 * (lo + hi);
+		if (match < 0)
+			for (int k = 1; k < 6; k++) {
+				double o = rb[k] * 180e3 + 15e3;
+
+				if (o > w + LTE_COH_WIDTH_TOL)
+					continue;
+				cand[nc++] = lo + 0.5 * o;
+				cand[nc++] = hi - 0.5 * o;
+			}
+		LOGP(DSDR, LOGL_INFO, "%s: repeating %s %.3f-%.3f MHz (%.3f MHz, coherence %.2f): %s\n", name, pair ? "pair" : "block",
+		     lo / 1e6, hi / 1e6, w / 1e6, mean, (match >= 0) ? "an LTE width" : "no LTE width: its middle and edges");
+		for (int c = 0; c < nc; c++) {
+			int k = (int)lround((cand[c] - ff) / 100e3), dup = 0;
+
+			if (k < 0 || k >= nr)
+				continue;
+			for (j = 0; j < np; j++)
+				if (list[j].arfcn == first + k)
+					dup = 1;
+			if (dup)
+				continue;
+			list[np].arfcn = first + k;
+			list[np].freq = ff + 100e3 * k;
+			/* the rank: an LTE width first, then the middles, then
+			 * the edges; above any power in dBFS (they follow) */
+			list[np].power_db = 100.0 + mean + ((match >= 0) ? 2.0 : (c == 0) ? 1.0 : 0.0);
+			list[np].peak = 0;
+			np++;
+		}
+	}
+	free(bk);
+	qsort(list, np, sizeof(*list), compare_power_desc);
+	LOGP(DSDR, LOGL_INFO, "%s: %d repeating blocks (threshold %.2f), %d candidates\n", name, blocks, thr, np);
+	return np;
+}
+
 /* LTE: the EARFCNs whose centre 6 RB power is the most within +-500 kHz and
  * above the floor, strongest first, each with its raster neighbours (the
  * peak of an evenly loaded carrier is not always on its centre: measured on
@@ -871,6 +1112,8 @@ static int lte_candidates(int samplerate, const calib_band_t *band, calibrate_co
 	if (lte_band_dl_range(band->id, &first, &last, &ff, &fl) < 0)
 		return -EINVAL;
 	nr = last - first + 1;
+	if (use_rate(config, samplerate) < 0)
+		return -EIO;
 	rc = scan_range(samplerate, name, band->f_lo - LTE_6RB_HZ, band->f_hi + LTE_6RB_HZ, config->verbosity);
 	if (rc < 0)
 		return rc;
@@ -904,6 +1147,10 @@ static int lte_candidates(int samplerate, const calib_band_t *band, calibrate_co
 	}
 	qsort(cellp, m, sizeof(double), compare_double);
 	floor_db = cellp[m * LTE_FLOOR_PCT / 100];
+	/* the 10 ms repetition measured: its carriers first, the power peaks
+	 * after them (weak cells barely repeat above the noise) */
+	if (spec.coh)
+		np = lte_coh_candidates(band, first, nr, ff, list, name);
 	for (i = 0; i < nr; i++) {
 		int top = 1;
 
@@ -963,8 +1210,12 @@ static int lte_candidates(int samplerate, const calib_band_t *band, calibrate_co
 	}
 	LOGP(DSDR, LOGL_INFO, "%s: %d EARFCNs, floor %.1f dBFS per 1.08 MHz, %d peaks%s\n", name, m, floor_db, np,
 	     np ? " (strongest first):" : "");
-	for (i = 0; i < np && i < 15; i++)
-		LOGP(DSDR, LOGL_INFO, "  EARFCN %5d  %.1f MHz  %+.1f dB\n", list[i].arfcn, list[i].freq / 1e6, list[i].power_db - floor_db);
+	for (i = 0; i < np && i < 15; i++) {
+		if (list[i].power_db >= 100.0)
+			LOGP(DSDR, LOGL_INFO, "  EARFCN %5d  %.1f MHz  10 ms repetition (rank %.2f)\n", list[i].arfcn, list[i].freq / 1e6, list[i].power_db - 100.0);
+		else
+			LOGP(DSDR, LOGL_INFO, "  EARFCN %5d  %.1f MHz  %+.1f dB\n", list[i].arfcn, list[i].freq / 1e6, list[i].power_db - floor_db);
+	}
 	/* each peak with its neighbours (a stronger peak takes a shared one) */
 	for (i = 0; i < np; i++) {
 		arfcn_power_t pk = list[i];
@@ -1094,21 +1345,39 @@ static void cell_result(wchan_t *w)
 	cell->ppm_offset = avg / cell->freq_hz * 1e6;
 	cell->carrier_ppm = cell->ppm_offset;
 	cell->weight = 1.0;
+	cell->lte.timing_ppm = cell->ident.timing_ppm;
+	cell->lte.timing_std_ppm = cell->ident.timing_std_ppm;
+	/* a tuner whose LO is off its setting (RTL): the TDMA frame timing,
+	 * the crystal alone, as LTE's; a residual like the carrier's */
+	if (calib_timing) {
+		cell->lte.timing = 1;
+		if (cell->ident.timing_points >= 6 && cell->ident.timing_std_ppm > 0.0) {
+			cell->ppm_offset = cell->ident.timing_ppm - sdr_config->rx_ppm;
+			cell->weight = (cell->ident.timing_std_ppm <= 2.5 * LTE_TIMING_STD) ? 1.0 : LTE_LOW_WEIGHT;
+		} else
+			cell->weight = 0.0;	/* no timing: not in the result */
+	}
 	cell->stddev_hz = stddev;
 	cell->snr_db = snr_sum / w->nmeas;
-	LOGP(DSDR, LOGL_INFO, "  %s ARFCN %d: %d measurements, %+.2f Hz (%.3f ppm), stddev %.1f Hz, SNR %.1f dB, %s\n",
-	     gsm_band_name(gsm_band), cell->arfcn, w->nmeas, avg, cell->ppm_offset, stddev,
-	     cell->snr_db, cell->confirmed ? "confirmed" : (cell->decoded ? "NOT confirmed" : "identity not decoded"));
+	LOGP(DSDR, LOGL_INFO, "  %s ARFCN %d: %d measurements, %+.2f Hz (%.3f ppm), stddev %.1f Hz, SNR %.1f dB, %s; frame timing %.4f +- %.4f ppm (%d SCH)\n",
+	     gsm_band_name(gsm_band), cell->arfcn, w->nmeas, avg, cell->carrier_ppm, stddev,
+	     cell->snr_db, cell->confirmed ? "confirmed" : (cell->decoded ? "NOT confirmed" : "identity not decoded"),
+	     cell->ident.timing_ppm, cell->ident.timing_std_ppm, cell->ident.timing_points);
 }
 
 /* Measure the carriers ents[0..n-1] (all within the window of 'centre').
  * Fills their cells. Returns 0, <0 on error. */
-static int measure_window(int samplerate, calibrate_config_t *config,
+static int measure_window(int max_rate, calibrate_config_t *config,
 			  double centre, arfcn_power_t **ents, int n,
 			  calibrate_cell_t *cells, cpu_meter_t *meter, double t_run_start,
 			  const char *start_info)
 {
 	(void)start_info;
+	/* the window's rate: the narrowest that holds its channels (not in
+	 * the cost probe, which measures at the rate opened) */
+	int samplerate = meter ? use_rate(config, max_rate) : window_rate(config, max_rate, centre, ents, n, CHANNEL_SPACING / 2.0);
+	if (samplerate < 0)
+		return -EIO;
 	int dsp = gsm_channel_rate(samplerate);
 	int block = calib_block_samples(samplerate);
 	/* the bank from 4 channels: measured at 8 MS/s, DSP 500 k (one
@@ -1147,7 +1416,8 @@ static int measure_window(int samplerate, calibrate_config_t *config,
 		rc = -EINVAL;
 		goto out_free;
 	}
-	grp = sdr_engine_group_add(&eng, dsp, n, offs, 0, NULL, 1000, 0);
+	grp = (!use_bank && (config->window_stage & CALIB_STAGE_SHARED)) ? sdr_engine_group_add_shared(&eng, dsp, n, offs, 1000)
+		: sdr_engine_group_add(&eng, dsp, n, offs, 0, NULL, 1000, 0);
 	if (!grp) {
 		LOGP(DSDR, LOGL_ERROR, "Channel separation: %s\n", sdr_engine_error());
 		sdr_engine_exit(&eng);
@@ -1268,8 +1538,12 @@ static int measure_window(int samplerate, calibrate_config_t *config,
 					ch->cell->confirmed = 1;
 					ch->cell->confirm_sec = el;
 				}
-				if ((gsm_sch_confirmed(&ch->sch) && (!config->decode_bcch || ch->sch.ident.have_ci))
-				 || el > config->decode_timeout_sec) {
+				/* the RTL: the frame timing needs SCH over seconds */
+				int timing_done = !config->lte_timing
+					|| (ch->sch.ident.timing_points >= 12 && ch->sch.ident.timing_std_ppm > 0.0
+					    && ch->sch.ident.timing_std_ppm <= LTE_TIMING_STD);
+				if ((gsm_sch_confirmed(&ch->sch) && (!config->decode_bcch || ch->sch.ident.have_ci) && timing_done)
+				 || el > (config->lte_timing ? GSM_TIMING_MAX_SEC : config->decode_timeout_sec)) {
 					ch->dec = DEC_DONE;
 					LOGP(DSDR, LOGL_INFO, "  ARFCN %d identity decoding ended after %.2f s: %s\n",
 					     ch->entry->arfcn, el, gsm_sch_confirmed(&ch->sch) ? "confirmed" : "NOT confirmed");
@@ -1467,9 +1741,12 @@ static void lte_result(const lte_cell_t *lc, const arfcn_power_t *ent, const cal
 /* Measure the LTE carriers ents[0..n-1] in the window of 'centre'; the cells
  * found go into the result. prior: the carrier ppm of the towers so far (or
  * NAN). Returns the number of confirmed cells, <0 on error. */
-static int measure_window_lte(int samplerate, calibrate_config_t *config, double centre, arfcn_power_t **ents, int n,
+static int measure_window_lte(int max_rate, calibrate_config_t *config, double centre, arfcn_power_t **ents, int n,
 			      calibrate_result_t *result, double prior)
 {
+	int samplerate = window_rate(config, max_rate, centre, ents, n, CALIB_LTE_HALF_HZ);
+	if (samplerate < 0)
+		return -EIO;
 	int block = calib_block_samples(samplerate);
 	int use_bank = (n >= 4 && sdr_engine_bins(samplerate, LTE_DSP, n) > 0);
 	sdr_engine_t eng;
@@ -1503,7 +1780,8 @@ static int measure_window_lte(int samplerate, calibrate_config_t *config, double
 		goto out;
 	}
 	eng_ok = 1;
-	grp = sdr_engine_group_add(&eng, LTE_DSP, n, offs, 0, NULL, 1000, 0);
+	grp = (!use_bank && (config->window_stage & CALIB_STAGE_SHARED)) ? sdr_engine_group_add_shared(&eng, LTE_DSP, n, offs, 1000)
+		: sdr_engine_group_add(&eng, LTE_DSP, n, offs, 0, NULL, 1000, 0);
 	if (!grp) {
 		LOGP(DSDR, LOGL_ERROR, "Channel separation: %s\n", sdr_engine_error());
 		rc = -EINVAL;
@@ -1616,6 +1894,9 @@ static int cell_usable(const calibrate_cell_t *cell, const calibrate_config_t *c
 	if (cell->system == CALIB_LTE)
 		return cell->confirmed && (cell->lte.timing ? cell->lte.timing_std_ppm > 0.0 : cell->num_measurements >= 3);
 	if (cell->num_measurements < 3)
+		return 0;
+	/* from the frame timing: only with one */
+	if (cell->lte.timing && (cell->ident.timing_points < 6 || cell->ident.timing_std_ppm <= 0.0))
 		return 0;
 	return config->confirm ? cell->confirmed : 1;
 }
@@ -1817,9 +2098,10 @@ static int choose_rate(calibrate_config_t *config, cpu_meter_t *m, int *samplera
 	if (best != *samplerate) {
 		int rc;
 
-		LOGP(DSDR, LOGL_NOTICE, "SDR rate %d S/s instead of %d: %d carriers per window (budget, capacity, carriers in reach) instead of %d; reopening the SDR\n",
-		     best, *samplerate, best_n, rate_channels(m, config->cpu_percent, list, nlist, *samplerate));
-		rc = config->reopen(best);
+		LOGP(DSDR, LOGL_NOTICE, "SDR rate %d S/s instead of %d: %d carriers per window (budget, capacity, carriers in reach) instead of %d; %s\n",
+		     best, *samplerate, best_n, rate_channels(m, config->cpu_percent, list, nlist, *samplerate),
+		     config->set_rate ? "changing the rate" : "reopening the SDR");
+		rc = config->set_rate ? config->set_rate(best) : config->reopen(best);
 		if (rc < 0) {
 			LOGP(DSDR, LOGL_ERROR, "Reopening the SDR at %d S/s failed\n", best);
 			return rc;
@@ -1844,6 +2126,33 @@ static int choose_rate(calibrate_config_t *config, cpu_meter_t *m, int *samplera
 	return 0;
 }
 
+/* Towers of both kinds when both are asked for: the agreeing towers so far
+ * are all GSM (or all LTE) while the run has bands of the other kind left
+ * to scan: not yet a result. A run whose other kind finds nothing ends with
+ * what it has ("only n of"). */
+static int stop_needs_lte(const calibrate_result_t *r, const calibrate_config_t *config)
+{
+	int gsm = 0, lte = 0, want_gsm = 0, want_lte = 0;
+
+	for (int b = 0; b < config->num_bands; b++)
+		if (config->bands[b].scan) {
+			if (config->bands[b].system == CALIB_GSM)
+				want_gsm = 1;
+			else
+				want_lte = 1;
+		}
+	if (!want_gsm || !want_lte || config->forced_arfcn > 0)
+		return 0;
+	for (int i = 0; i < r->num_cells; i++)
+		if (r->cells[i].agrees && r->cells[i].weight >= 1.0) {
+			if (r->cells[i].system == CALIB_GSM)
+				gsm = 1;
+			else
+				lte = 1;
+		}
+	return !(gsm && lte);
+}
+
 /* An LTE band: its peaks, strongest first, a window each (the peak's
  * EARFCN and its raster neighbours), until enough towers agree or too many
  * peaks in a row without a confirmed cell. Returns 0, <0 to stop. */
@@ -1860,7 +2169,14 @@ static int calibrate_lte_band(int *samplerate, calibrate_config_t *config, const
 	}
 	/* the windows' rate: the chain costs at the SDR rate, the scan was
 	 * done at the widest */
-	if (*samplerate > LTE_RATE_MAX && config->reopen) {
+	int lte_max = *samplerate;
+
+	/* without a reopen: the windows' rate at most LTE_RATE_MAX, the scans
+	 * stay at the widest */
+	if (config->set_rate && (config->window_stage & CALIB_STAGE_RATE)) {
+		while (lte_max > LTE_RATE_MAX && !(lte_max % 2) && lte_max / 2 >= LTE_DSP)
+			lte_max /= 2;
+	} else if (*samplerate > LTE_RATE_MAX && config->reopen) {
 		int r = *samplerate;
 
 		while (r > LTE_RATE_MAX && !(r % 2) && r / 2 >= LTE_DSP)
@@ -1876,8 +2192,11 @@ static int calibrate_lte_band(int *samplerate, calibrate_config_t *config, const
 			}
 			*samplerate = r;
 		}
+		lte_max = *samplerate;
 	}
-	lreach = usable_half(*samplerate) - CALIB_LTE_HALF_HZ;
+	double t_band = now_sec(), c_band = cpu_sec(CLOCK_PROCESS_CPUTIME_ID);
+
+	lreach = usable_half(lte_max) - CALIB_LTE_HALF_HZ;
 	if (lreach < 0.0) {
 		LOGP(DSDR, LOGL_ERROR, "LTE band %d: %d S/s holds no LTE carrier (+-%.0f kHz usable, +-%.0f kHz needed)\n",
 		     cb->id, *samplerate, usable_half(*samplerate) / 1e3, CALIB_LTE_HALF_HZ / 1e3);
@@ -1920,7 +2239,7 @@ static int calibrate_lte_band(int *samplerate, calibrate_config_t *config, const
 		}
 		if (!k)
 			continue;
-		int rc = measure_window_lte(*samplerate, config, centre, ents, k, result, prior_ppm(result, config));
+		int rc = measure_window_lte(lte_max, config, centre, ents, k, result, prior_ppm(result, config));
 		if (rc == -EIO) {
 			*stop = 1;
 			break;
@@ -1929,8 +2248,26 @@ static int calibrate_lte_band(int *samplerate, calibrate_config_t *config, const
 			break;
 		result->windows++;
 		since = (rc > 0) ? 0 : since + 1;
+		/* within --cpu (the searches come in bursts): idle, the ring
+		 * drained, until the band's share is back in the budget */
+		{
+			double wall = now_sec() - t_band, used = cpu_sec(CLOCK_PROCESS_CPUTIME_ID) - c_band;
+			double budget = config->cpu_percent / 100.0;
+
+			if (wall > 0.0 && used / wall > budget) {
+				double idle = used / budget - wall;
+
+				if (idle > 5.0)
+					idle = 5.0;
+				for (double t = 0.0; t < idle; t += 0.05) {
+					usleep(50000);
+					sdr_rx_settle(calib_sdr, 0.0);
+				}
+				result->lte_idle_sec += idle;
+			}
+		}
 		int agree = evaluate(result, config);
-		if (!config->full && agree >= config->towers) {
+		if (!config->full && agree >= config->towers && !stop_needs_lte(result, config)) {
 			result->time_to_result = now_sec() - t_start;
 			*stop = 1;
 		} else if (!config->full && since >= LTE_WEAK_IN_A_ROW) {
@@ -1947,7 +2284,7 @@ static int calibrate_lte_band(int *samplerate, calibrate_config_t *config, const
 int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_t *result,
 		   const char *start_info)
 {
-	int stop = 0, since_confirmed = 0, any_gsm = 0;
+	int stop = 0, since_confirmed = 0, any_gsm = 0, gsm_enough = 0;
 	int capacity, per_window;
 	double reach;
 
@@ -1980,6 +2317,7 @@ int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_
 		per_window = capacity;
 
 	lte_tested_n = 0;
+	calib_timing = config->lte_timing;
 	if (spec_init(config) < 0) {
 		LOGP(DSDR, LOGL_ERROR, "No band to measure\n");
 		return -EINVAL;
@@ -1991,7 +2329,7 @@ int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_
 		arfcn_power_t *list;
 		int n;
 
-		if (!cb->scan)
+		if (!cb->scan || (gsm_enough && cb->system == CALIB_GSM))
 			continue;
 		if (cb->system == CALIB_LTE) {
 			if (calibrate_lte_band(&samplerate, config, cb, result, t_start, &stop) < 0)
@@ -2073,6 +2411,12 @@ int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_
 			}
 			int agree = evaluate(result, config);
 			if (!config->full && agree >= ((config->forced_arfcn > 0) ? 1 : config->towers)) {
+				if (stop_needs_lte(result, config)) {
+					/* enough GSM: on to LTE, the other GSM bands left out */
+					LOGP(DSDR, LOGL_NOTICE, "%d towers agree, all GSM: the LTE bands next (towers of both kinds when both are asked for)\n", agree);
+					gsm_enough = 1;
+					break;
+				}
 				result->time_to_result = now_sec() - t_start;
 				stop = 1;
 			} else if (!config->full && since_confirmed >= WEAK_IN_A_ROW) {

@@ -598,6 +598,42 @@ static int try_sch(gsm_sch_t *sch, double guess, double w)
 		sch->first_pos = abs_pos;
 		sch->first_fn = fn;
 	}
+	/* frame timing: the burst position (fractional) against the frame
+	 * number, from the first decode of the consistent run */
+	if (id->sch_consistent == 1 && !consistent)
+		sch->t_n = 0;
+	if (consistent || id->sch_consistent == 1) {
+		double posf = (double)sch->buf_pos + pos;
+
+		if (!sch->t_n) {
+			sch->t_fn = fn;
+			sch->t_pos = posf;
+			sch->t_sk = sch->t_sy = sch->t_skk = sch->t_sky = sch->t_syy = 0.0;
+		}
+		double k = (double)(((long)fn - (long)sch->t_fn + FN_MODULUS) % FN_MODULUS);
+		/* the deviation from the nominal samples per frame */
+		double y = posf - sch->t_pos - k * FRAME_SYMBOLS * sch->sps;
+
+		sch->t_n++;
+		sch->t_sk += k;
+		sch->t_sy += y;
+		sch->t_skk += k * k;
+		sch->t_sky += k * y;
+		sch->t_syy += y * y;
+		if (sch->t_n >= 4) {
+			double n = sch->t_n, sxx = sch->t_skk - sch->t_sk * sch->t_sk / n;
+			double sxy = sch->t_sky - sch->t_sk * sch->t_sy / n, syy = sch->t_syy - sch->t_sy * sch->t_sy / n;
+
+			if (sxx > 0.0) {
+				double b = sxy / sxx, ssr = syy - b * sxy, per = FRAME_SYMBOLS * sch->sps;
+
+				/* slow clock: fewer samples per frame */
+				id->timing_ppm = -b / per * 1e6;
+				id->timing_std_ppm = (ssr > 0.0 && n > 2) ? sqrt(ssr / (n - 2) / sxx) / per * 1e6 : 0.0;
+				id->timing_points = sch->t_n;
+			}
+		}
+	}
 	LOGP(DSDR, LOGL_DEBUG, "  SCH: BSIC %d (NCC %d BCC %d) FN %u (T1 %d T2 %d T3 %d) "
 	     "SNR %.1f dB%s\n", bsic, bsic >> 3, bsic & 7, fn, t1, t2, t3, snr,
 	     consistent ? ", consistent" : "");
