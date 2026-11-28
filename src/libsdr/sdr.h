@@ -12,8 +12,22 @@ int sdr_get_tosend(void *inst, int buffer_size);
 /* the SDR cannot go on (TX transport broken): the program's exit code, 0: works */
 int sdr_fatal(void);
 
-/* The TX device's clock: reference, time source, lock sensors, device time. Read in the main loop
- * only (control-path calls that can block for milliseconds: never in the read/write threads). */
+/* The device time and the system clocks at (nearly) the same moment. Without PPS the device time
+ * is not UTC: it counts from when UHD set it at the start, so the pairs give the device clock's
+ * drift against the system clocks, not an offset to UTC. */
+typedef struct sdr_clock_pair {
+	unsigned long	seq;		/* counts the readings: a new one when it changes */
+	double		device;		/* device time, s */
+	double		system;		/* CLOCK_REALTIME (NTP's UTC) */
+	double		raw;		/* CLOCK_MONOTONIC_RAW: no NTP slews, the fair yardstick for
+					 * the device clock's rate */
+	double		uncertainty;	/* half the span of the system clock reads around the
+					 * device's (the USB control round trip); 0: not known */
+} sdr_clock_pair_t;
+
+/* The device's clock: reference, time source, lock sensors, temperature, device time. Read by
+ * libsdr's control thread (UHD), so the main loop never waits on a USB control round trip; the
+ * main loop gets a copy. */
 typedef struct sdr_clock_status {
 	int		valid;			/* read at least once */
 	char		clock_source[32];	/* "internal", "external", "gpsdo" ... */
@@ -21,21 +35,26 @@ typedef struct sdr_clock_status {
 	int		ref_locked;		/* 1 locked, 0 not, -1 no such sensor */
 	int		gps_locked;		/* 1 locked, 0 not, -1 no such sensor (no GPSDO) */
 	unsigned long	ref_changes, gps_changes; /* lock changes seen since the start */
-	int		have_time;
-	/* the device time and the system clock at (nearly) the same moment. Without PPS the
-	 * device time is not UTC: it counts from when UHD set it at the start, so the two give the
-	 * device clock's drift against the system clock, not an offset to UTC. system_time is the
-	 * middle of the system clock read before and after the device's; time_uncertainty half the
-	 * span (the USB control round trip): reject wide ones. */
-	double		device_time, system_time, time_uncertainty;
-	double		system_raw;	/* the same moment on CLOCK_MONOTONIC_RAW: no NTP slews, the
-					 * fair yardstick for the device clock's rate */
-	double		poll_ms, poll_ms_max;	/* how long the last / longest poll blocked the main loop */
+	double		temperature;		/* °C (B210: the AD9361's sensor), NAN: no sensor */
+	/* every 10 s: the device time read on the control path, bracketed by the system clocks */
+	sdr_clock_pair_t poll_time;
+	/* from the RX stream's time stamps: the end of a packet against the system clocks when it
+	 * arrived, the packet with the least delay of a second (the delay only adds, so the least
+	 * is the truest); no control call. seq 0: no RX time stamps */
+	sdr_clock_pair_t rx_time;
+	double		ctl_ms_max;		/* the longest control call of the thread (not in the
+						 * main loop) */
+	int		paced_by_pc;		/* TX paced by the PC's clock (no RX stream) */
 } sdr_clock_status_t;
-/* poll the clock status (rate-limited to once a second; logs changes only): from the main loop */
+/* copy the clock status from the control thread (rate-limited to once a second) and log what
+ * changed (lock changes, at most once a second): from the main loop */
 void sdr_clock_poll(void);
-/* the last status; 0, or -1 if the device has none (no UHD TX) */
+/* the last status; 0, or -1 if the device has none (no UHD) */
 int sdr_clock_status(sdr_clock_status_t *status);
+/* the TX carrier's ppm correction now (--sdr-ppm, then a trim: the clock monitor), and a new one:
+ * the carrier only (the NCO, the RF LO stays), 0 or <0 (not supported by the device) */
+double sdr_get_tx_ppm(void);
+int sdr_set_tx_ppm(double ppm);
 double sdr_set_rx_trim(void *inst, int channel, double hz);
 void sdr_set_rx_bandwidth(void *inst, int channel, double hz);
 void calibrate_bias(void);

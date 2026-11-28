@@ -15,9 +15,12 @@ int uhd_tx_device_paced(void);
  * is broken; a new start checks the device and resets it) */
 #define UHD_EXIT_TX_DEAD	3
 int uhd_tx_dead(void);
-/* the TX device's clock status into *st, changes logged (main loop only) */
+/* a copy of the device's clock status from the control thread (never blocks on the device): 0,
+ * -1 none yet */
 struct sdr_clock_status;
-void uhd_clock_poll(struct sdr_clock_status *st);
+int uhd_clock_status(struct sdr_clock_status *st);
+double uhd_get_tx_ppm(void);
+int uhd_set_tx_ppm(double ppm);
 long uhd_rx_take_gap(void);
 void uhd_tx_poll_events(unsigned long *underflow, unsigned long *seq_error, unsigned long *time_error);
 

@@ -2485,18 +2485,47 @@ static double clock_polled;
 void sdr_clock_poll(void)
 {
 #ifdef HAVE_UHD
+	sdr_clock_status_t now;
 	struct timespec ts;
-	double now;
+	double t;
 
-	if (tx_driver != 1)
+	if (tx_driver != 1 && rx_driver != 1)
 		return;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	now = ts.tv_sec + ts.tv_nsec / 1e9;
-	if (clock_status.valid && now - clock_polled < 1.0)
+	t = ts.tv_sec + ts.tv_nsec / 1e9;
+	if (t - clock_polled < 1.0)
 		return;
-	clock_polled = now;
-	uhd_clock_poll(&clock_status);
+	clock_polled = t;
+	if (uhd_clock_status(&now) < 0)
+		return;
+	/* a lock change (the first state goes with the clock monitor's line) */
+	if (clock_status.valid && (now.ref_changes != clock_status.ref_changes || now.gps_changes != clock_status.gps_changes))
+		LOGP(DUHD, LOGL_NOTICE, "Clock: reference %s%s%s (lock changes so far: reference %lu, GPS %lu)\n",
+		     now.clock_source,
+		     now.ref_locked < 0 ? "" : now.ref_locked ? " locked" : " NOT LOCKED",
+		     now.gps_locked < 0 ? "" : now.gps_locked ? ", GPS locked" : ", GPS NOT LOCKED",
+		     now.ref_changes, now.gps_changes);
+	clock_status = now;
 #endif
+}
+
+double sdr_get_tx_ppm(void)
+{
+#ifdef HAVE_UHD
+	if (tx_driver == 1)
+		return uhd_get_tx_ppm();
+#endif
+	return sdr_config ? sdr_config->tx_ppm : 0.0;
+}
+
+int sdr_set_tx_ppm(double ppm)
+{
+#ifdef HAVE_UHD
+	if (tx_driver == 1)
+		return uhd_set_tx_ppm(ppm);
+#endif
+	(void)ppm;
+	return -ENOTSUP;
 }
 
 int sdr_clock_status(sdr_clock_status_t *status)

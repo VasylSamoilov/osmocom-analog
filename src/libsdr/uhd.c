@@ -17,6 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE	/* pthread_setname_np */
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -28,6 +29,8 @@
 #include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <signal.h>
 #include <linux/usbdevice_fs.h>
 #include <uhd.h>
 #include <uhd/usrp/usrp.h>
@@ -79,10 +82,17 @@ typedef struct uhd_instance {
 	unsigned long		tx_fail_writes;	/* failed writes of this failure */
 	char			serial[64];	/* the device's serial (a USB reset of this one only) */
 	int			tx_dead;	/* writes failed too long: the program stops */
-	/* clock status: what does not change while running, read once (uhd_clock_poll) */
-	int			clock_cached;
+	size_t			channel;	/* of the open */
+	double			tx_nominal;	/* the TX frequency asked for, before the ppm correction */
+	double			tx_rf_freq;	/* the RF LO of the last TX tune (a ppm trim keeps it) */
+	/* clock status: what does not change while running, read once by the control thread */
 	char			clock_source[32], time_source[32];
 	int			has_ref_sensor, has_gps_sensor;
+	int			temp_sensor;	/* "temp" on: 0 none, 1 RX, 2 TX, 3 the motherboard */
+	/* RX time stamps (the read thread): the packet of this second with the least delay */
+	double			rx_win_start;	/* raw time the second began, 0: none yet */
+	double			rx_win_delay;	/* its least raw - device */
+	sdr_clock_pair_t	rx_win;
 } uhd_instance_t;
 
 /* TX writes failing this long while running: the transport is broken (a
@@ -148,102 +158,290 @@ int uhd_tx_dead(void)
 	return uhd_tx_inst && uhd_tx_inst->tx_dead;
 }
 
-/* is there a motherboard sensor of this name (a missing one is not "unlocked": a B210 without
- * GPSDO has no gps_locked) */
-static int has_sensor(uhd_string_vector_handle names, size_t n, const char *name)
-{
-	char got[64];
-	size_t i;
+/*
+ * The control thread: the clock's sensors and the device time are read off the main loop (a USB
+ * control round trip blocked it for up to 16 ms). Every control call on the open device - the
+ * thread's and the other threads' (frequency, rate, ppm) - holds uhd_ctl_lock, one call at a
+ * time, so a retune waits for one read at most. What the thread reads goes to uhd_status under
+ * uhd_status_lock, which is held only for a copy: the main loop never waits on the device. The
+ * read thread puts the RX time stamps there too (once a second). The thread starts when the
+ * device is open (after the TX probe and a reopen) and is stopped and joined first in
+ * uhd_close(); it stops reading once TX is dead (a broken transport).
+ */
+static pthread_mutex_t uhd_ctl_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t uhd_status_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t uhd_ctl_wake;
+static pthread_t uhd_ctl_thread;
+static int uhd_ctl_running, uhd_ctl_quit;
+static sdr_clock_status_t uhd_status;
 
-	for (i = 0; i < n; i++) {
-		if (uhd_string_vector_at(names, i, got, sizeof(got)) == UHD_ERROR_NONE && !strcmp(got, name))
-			return 1;
-	}
-	return 0;
+#define UHD_REF_EVERY_S		1.0	/* ref_locked */
+#define UHD_SLOW_EVERY_S	10.0	/* GPS lock, temperature, device time */
+
+static double ts_sec(const struct timespec *ts)
+{
+	return ts->tv_sec + ts->tv_nsec / 1e9;
 }
 
-/* a lock sensor of the motherboard: 1 locked, 0 not */
-static int clock_sensor(uhd_usrp_handle usrp, const char *name)
+/* is there a sensor of this name (a missing one is not "unlocked": a B210 without GPSDO has no
+ * gps_locked); where: 1 RX, 2 TX, 3 the motherboard */
+static int has_sensor(uhd_instance_t *inst, int where, const char *name)
 {
-	uhd_sensor_value_handle value;
+	uhd_string_vector_handle names;
+	char got[64];
+	size_t i, n = 0;
+	uhd_error e;
+	int found = 0;
+
+	if (uhd_string_vector_make(&names) != UHD_ERROR_NONE)
+		return 0;
+	if (where == 1)
+		e = uhd_usrp_get_rx_sensor_names(inst->usrp, inst->channel, &names);
+	else if (where == 2)
+		e = uhd_usrp_get_tx_sensor_names(inst->usrp, inst->channel, &names);
+	else
+		e = uhd_usrp_get_mboard_sensor_names(inst->usrp, 0, &names);
+	if (e == UHD_ERROR_NONE)
+		uhd_string_vector_size(names, &n);
+	for (i = 0; i < n && !found; i++)
+		found = (uhd_string_vector_at(names, i, got, sizeof(got)) == UHD_ERROR_NONE && !strcmp(got, name));
+	uhd_string_vector_free(&names);
+	return found;
+}
+
+/* a sensor, under the control lock: a lock sensor (value NULL) 1 locked, 0 not; a real one into
+ * *value, 0; -1: not read */
+static int read_sensor(uhd_instance_t *inst, int where, const char *name, double *value)
+{
+	uhd_sensor_value_handle h;
+	uhd_error e;
 	bool locked = false;
 	int rc = -1;
 
-	if (uhd_sensor_value_make(&value) != UHD_ERROR_NONE)
+	if (uhd_sensor_value_make(&h) != UHD_ERROR_NONE)
 		return -1;
-	if (uhd_usrp_get_mboard_sensor(usrp, name, 0, &value) == UHD_ERROR_NONE
-	 && uhd_sensor_value_to_bool(value, &locked) == UHD_ERROR_NONE)
-		rc = locked ? 1 : 0;
-	uhd_sensor_value_free(&value);
+	pthread_mutex_lock(&uhd_ctl_lock);
+	if (where == 1)
+		e = uhd_usrp_get_rx_sensor(inst->usrp, name, inst->channel, &h);
+	else if (where == 2)
+		e = uhd_usrp_get_tx_sensor(inst->usrp, name, inst->channel, &h);
+	else
+		e = uhd_usrp_get_mboard_sensor(inst->usrp, name, 0, &h);
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	if (e == UHD_ERROR_NONE) {
+		if (value)
+			rc = (uhd_sensor_value_to_realnum(h, value) == UHD_ERROR_NONE) ? 0 : -1;
+		else if (uhd_sensor_value_to_bool(h, &locked) == UHD_ERROR_NONE)
+			rc = locked ? 1 : 0;
+	}
+	uhd_sensor_value_free(&h);
 	return rc;
 }
 
-/* Read the TX device's clock into *st and log what changed (UHD category, only on change). From
- * the main loop only: these are control-path calls that can block for milliseconds. */
-void uhd_clock_poll(sdr_clock_status_t *st)
+/* the device time, bracketed by the system clocks (under the control lock) */
+static int read_device_time(uhd_instance_t *inst, sdr_clock_pair_t *p)
 {
-	uhd_instance_t *inst = uhd_tx_inst;
-	uhd_string_vector_handle names;
-	sdr_clock_status_t now;
-	struct timespec before, after, raw_before, raw_after, start, end;
+	struct timespec raw0, raw1, rt0, rt1;
 	int64_t secs;
 	double frac;
-	size_t n = 0;
+	uhd_error e;
 
-	if (!inst || !inst->usrp)
-		return;
-	clock_gettime(CLOCK_MONOTONIC, &start);
-	/* the sources and the sensor list do not change while running: once */
-	if (!inst->clock_cached) {
-		inst->clock_cached = 1;
-		if (uhd_usrp_get_clock_source(inst->usrp, 0, inst->clock_source, sizeof(inst->clock_source)) != UHD_ERROR_NONE)
-			strcpy(inst->clock_source, "?");
-		if (uhd_usrp_get_time_source(inst->usrp, 0, inst->time_source, sizeof(inst->time_source)) != UHD_ERROR_NONE)
-			strcpy(inst->time_source, "?");
-		if (uhd_string_vector_make(&names) == UHD_ERROR_NONE) {
-			if (uhd_usrp_get_mboard_sensor_names(inst->usrp, 0, &names) == UHD_ERROR_NONE)
-				uhd_string_vector_size(names, &n);
-			inst->has_ref_sensor = has_sensor(names, n, "ref_locked");
-			inst->has_gps_sensor = has_sensor(names, n, "gps_locked");
-			uhd_string_vector_free(&names);
+	pthread_mutex_lock(&uhd_ctl_lock);
+	clock_gettime(CLOCK_MONOTONIC_RAW, &raw0);
+	clock_gettime(CLOCK_REALTIME, &rt0);
+	e = uhd_usrp_get_time_now(inst->usrp, 0, &secs, &frac);
+	clock_gettime(CLOCK_REALTIME, &rt1);
+	clock_gettime(CLOCK_MONOTONIC_RAW, &raw1);
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	if (e != UHD_ERROR_NONE)
+		return -1;
+	p->device = (double)secs + frac;
+	p->system = (ts_sec(&rt0) + ts_sec(&rt1)) / 2.0;
+	p->raw = (ts_sec(&raw0) + ts_sec(&raw1)) / 2.0;
+	p->uncertainty = (ts_sec(&rt1) - ts_sec(&rt0)) / 2.0;
+	return 0;
+}
+
+static void *uhd_ctl_main(void *arg)
+{
+	uhd_instance_t *inst = arg;
+	struct timespec t0, t1, wake;
+	double now, next_ref = 0.0, next_slow = 0.0, ms, temp;
+	sdr_clock_pair_t pair;
+	char clock_source[32], time_source[32];
+	int ref, gps, ok;
+
+	/* what does not change while running: once */
+	pthread_mutex_lock(&uhd_ctl_lock);
+	if (uhd_usrp_get_clock_source(inst->usrp, 0, clock_source, sizeof(clock_source)) != UHD_ERROR_NONE)
+		strcpy(clock_source, "?");
+	if (uhd_usrp_get_time_source(inst->usrp, 0, time_source, sizeof(time_source)) != UHD_ERROR_NONE)
+		strcpy(time_source, "?");
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	pthread_mutex_lock(&uhd_ctl_lock);
+	inst->has_ref_sensor = has_sensor(inst, 3, "ref_locked");
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	pthread_mutex_lock(&uhd_ctl_lock);
+	inst->has_gps_sensor = has_sensor(inst, 3, "gps_locked");
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	/* the temperature: the B210 has it on the AD9361 (RX and TX frontend sensors) */
+	pthread_mutex_lock(&uhd_ctl_lock);
+	inst->temp_sensor = (inst->rx_streamer && has_sensor(inst, 1, "temp")) ? 1
+			  : (inst->tx_streamer && has_sensor(inst, 2, "temp")) ? 2
+			  : has_sensor(inst, 3, "temp") ? 3 : 0;
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	pthread_mutex_lock(&uhd_status_lock);
+	strcpy(uhd_status.clock_source, clock_source);
+	strcpy(uhd_status.time_source, time_source);
+	pthread_mutex_unlock(&uhd_status_lock);
+
+	pthread_mutex_lock(&uhd_status_lock);
+	while (!uhd_ctl_quit) {
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		now = ts_sec(&t0);
+		/* a broken TX transport: the device is left alone (the program stops) */
+		if (!inst->tx_dead && now >= next_ref) {
+			int slow = (now >= next_slow);
+
+			pthread_mutex_unlock(&uhd_status_lock);
+			next_ref = now + UHD_REF_EVERY_S;
+			if (slow)
+				next_slow = now + UHD_SLOW_EVERY_S;
+			ref = inst->has_ref_sensor ? read_sensor(inst, 3, "ref_locked", NULL) : -1;
+			gps = -1;
+			temp = NAN;
+			ok = -1;
+			if (slow) {
+				if (inst->has_gps_sensor)
+					gps = read_sensor(inst, 3, "gps_locked", NULL);
+				if (inst->temp_sensor && read_sensor(inst, inst->temp_sensor, "temp", &temp) < 0)
+					temp = NAN;
+				ok = read_device_time(inst, &pair);
+			}
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			ms = (ts_sec(&t1) - now) * 1e3;
+			pthread_mutex_lock(&uhd_status_lock);
+			if (uhd_status.valid && ref != uhd_status.ref_locked)
+				uhd_status.ref_changes++;
+			uhd_status.ref_locked = ref;
+			if (slow) {
+				if (uhd_status.valid && gps != uhd_status.gps_locked)
+					uhd_status.gps_changes++;
+				uhd_status.gps_locked = gps;
+				uhd_status.temperature = temp;
+				if (ok == 0) {
+					pair.seq = uhd_status.poll_time.seq + 1;
+					uhd_status.poll_time = pair;
+				}
+			}
+			if (ms > uhd_status.ctl_ms_max)
+				uhd_status.ctl_ms_max = ms;
+			uhd_status.valid = 1;
 		}
+		/* until the next read, or woken to stop */
+		wake.tv_sec = (time_t)next_ref;
+		wake.tv_nsec = (long)((next_ref - (double)wake.tv_sec) * 1e9);
+		if (inst->tx_dead) {
+			wake.tv_sec = t0.tv_sec + 1;
+			wake.tv_nsec = t0.tv_nsec;
+		}
+		if (!uhd_ctl_quit)
+			pthread_cond_timedwait(&uhd_ctl_wake, &uhd_status_lock, &wake);
 	}
-	memset(&now, 0, sizeof(now));
-	now.valid = 1;
-	strcpy(now.clock_source, inst->clock_source);
-	strcpy(now.time_source, inst->time_source);
-	now.ref_locked = inst->has_ref_sensor ? clock_sensor(inst->usrp, "ref_locked") : -1;
-	now.gps_locked = inst->has_gps_sensor ? clock_sensor(inst->usrp, "gps_locked") : -1;
-	/* the system clock read before and after the device's: the middle, and half the span */
-	clock_gettime(CLOCK_MONOTONIC_RAW, &raw_before);
-	clock_gettime(CLOCK_REALTIME, &before);
-	if (uhd_usrp_get_time_now(inst->usrp, 0, &secs, &frac) == UHD_ERROR_NONE) {
-		clock_gettime(CLOCK_REALTIME, &after);
-		clock_gettime(CLOCK_MONOTONIC_RAW, &raw_after);
-		now.have_time = 1;
-		now.device_time = (double)secs + frac;
-		now.system_time = ((before.tv_sec + before.tv_nsec / 1e9) + (after.tv_sec + after.tv_nsec / 1e9)) / 2.0;
-		now.system_raw = ((raw_before.tv_sec + raw_before.tv_nsec / 1e9) + (raw_after.tv_sec + raw_after.tv_nsec / 1e9)) / 2.0;
-		now.time_uncertainty = ((after.tv_sec - before.tv_sec) + (after.tv_nsec - before.tv_nsec) / 1e9) / 2.0;
+	pthread_mutex_unlock(&uhd_status_lock);
+	return NULL;
+}
+
+/* the open device's control thread (once; no status without it) */
+static void uhd_ctl_start(void)
+{
+	uhd_instance_t *inst = uhd_tx_inst ? uhd_tx_inst : uhd_rx_inst;
+	static int cond_init;
+	sigset_t all, old;
+	int rc;
+
+	if (uhd_ctl_running || !inst || !inst->usrp)
+		return;
+	if (!cond_init) {
+		pthread_condattr_t ca;
+
+		pthread_condattr_init(&ca);
+		pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+		pthread_cond_init(&uhd_ctl_wake, &ca);
+		pthread_condattr_destroy(&ca);
+		cond_init = 1;
 	}
-	clock_gettime(CLOCK_MONOTONIC, &end);
-	now.poll_ms = ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) * 1e3;
-	now.poll_ms_max = (now.poll_ms > st->poll_ms_max) ? now.poll_ms : st->poll_ms_max;
-	if (now.poll_ms_max > st->poll_ms_max && st->valid)
-		LOGP(DUHD, LOGL_DEBUG, "Clock poll blocked the main loop %.2f ms (new maximum)\n", now.poll_ms_max);
-	now.ref_changes = st->ref_changes + (st->valid && now.ref_locked != st->ref_locked);
-	now.gps_changes = st->gps_changes + (st->valid && now.gps_locked != st->gps_locked);
-	if (!st->valid || strcmp(now.clock_source, st->clock_source) || strcmp(now.time_source, st->time_source)
-	 || now.ref_locked != st->ref_locked || now.gps_locked != st->gps_locked) {
-		LOGP(DUHD, st->valid ? LOGL_NOTICE : LOGL_INFO,
-		     "Clock: reference %s%s, time source %s%s (lock changes so far: reference %lu, GPS %lu)\n",
-		     now.clock_source,
-		     now.ref_locked < 0 ? "" : now.ref_locked ? " locked" : " NOT LOCKED",
-		     now.time_source,
-		     now.gps_locked < 0 ? ", no GPS" : now.gps_locked ? ", GPS locked" : ", GPS NOT LOCKED",
-		     now.ref_changes, now.gps_changes);
+	pthread_mutex_lock(&uhd_status_lock);
+	memset(&uhd_status, 0, sizeof(uhd_status));
+	uhd_status.ref_locked = uhd_status.gps_locked = -1;
+	uhd_status.temperature = NAN;
+	uhd_ctl_quit = 0;
+	pthread_mutex_unlock(&uhd_status_lock);
+	/* signals go to the main thread */
+	sigfillset(&all);
+	pthread_sigmask(SIG_BLOCK, &all, &old);
+	rc = pthread_create(&uhd_ctl_thread, NULL, uhd_ctl_main, inst);
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+	if (rc) {
+		LOGP(DUHD, LOGL_NOTICE, "No control thread (%s): no clock status\n", strerror(rc));
+		return;
 	}
-	*st = now;
+	pthread_setname_np(uhd_ctl_thread, "uhd_ctl");
+	uhd_ctl_running = 1;
+}
+
+static void uhd_ctl_stop(void)
+{
+	if (!uhd_ctl_running)
+		return;
+	pthread_mutex_lock(&uhd_status_lock);
+	uhd_ctl_quit = 1;
+	pthread_cond_signal(&uhd_ctl_wake);
+	pthread_mutex_unlock(&uhd_status_lock);
+	pthread_join(uhd_ctl_thread, NULL);
+	uhd_ctl_running = 0;
+}
+
+/* the RX packet that just came (the read thread): its end against the system clocks now; the
+ * packet of the second with the least delay goes to the status */
+static void uhd_rx_time_point(uhd_instance_t *inst, const struct timespec *raw, const struct timespec *rt, double end)
+{
+	double r = ts_sec(raw), delay = r - end;
+
+	if (inst->rx_win_start && r - inst->rx_win_start < 1.0) {
+		if (delay >= inst->rx_win_delay)
+			return;
+	} else {
+		if (inst->rx_win_start) {
+			pthread_mutex_lock(&uhd_status_lock);
+			inst->rx_win.seq = uhd_status.rx_time.seq + 1;
+			uhd_status.rx_time = inst->rx_win;
+			pthread_mutex_unlock(&uhd_status_lock);
+		}
+		inst->rx_win_start = r;
+	}
+	inst->rx_win_delay = delay;
+	inst->rx_win.device = end;
+	inst->rx_win.raw = r;
+	inst->rx_win.system = ts_sec(rt);
+	inst->rx_win.uncertainty = 0.0;
+}
+
+/* a copy of the clock status the control thread read: 0, -1 none yet. Never blocks on the
+ * device. */
+int uhd_clock_status(sdr_clock_status_t *st)
+{
+	uhd_instance_t *inst = uhd_tx_inst ? uhd_tx_inst : uhd_rx_inst;
+	int rc;
+
+	if (!uhd_ctl_running || !inst)
+		return -1;
+	pthread_mutex_lock(&uhd_status_lock);
+	*st = uhd_status;
+	rc = uhd_status.valid ? 0 : -1;
+	pthread_mutex_unlock(&uhd_status_lock);
+	st->paced_by_pc = inst->software_clock;
+	return rc;
 }
 
 static double get_software_time(uhd_instance_t *inst)
@@ -369,6 +567,8 @@ static int uhd_open_device(size_t channel, const char *_device_args, const char 
 	}
 
 	/* apply PPM frequency correction (UHD has no native PPM API, adjust frequencies manually) */
+	inst->tx_nominal = tx_frequency;
+	inst->channel = channel;
 	if (sdr_config) {
 		if (sdr_config->tx_ppm != 0.0) {
 			inst->ppm_tx = sdr_config->tx_ppm;
@@ -526,6 +726,9 @@ static int uhd_open_device(size_t channel, const char *_device_args, const char 
 			uhd_close();
 			return -EIO;
 		}
+		inst->tx_rf_freq = tune_result.actual_rf_freq;
+		LOGP(DUHD, LOGL_DEBUG, "TX tuned: RF LO %.3f Hz (target %.3f), DSP %.3f Hz (target %.3f)\n",
+		     tune_result.actual_rf_freq, tune_result.target_rf_freq, tune_result.actual_dsp_freq, tune_result.target_dsp_freq);
 
 		/* see what frequency actually is */
 		error = uhd_usrp_get_tx_freq(inst->usrp, channel, &got_frequency);
@@ -1011,9 +1214,15 @@ int uhd_open(size_t channel, const char *_device_args, const char *_stream_args,
 	}
 	_device_args = args;
 
+	/* (a second open replaces the instance: its thread first) */
+	uhd_ctl_stop();
 	rc = uhd_open_device(channel, _device_args, _stream_args, _tune_args, tx_antenna, rx_antenna, clock_source, tx_frequency, rx_frequency, lo_offset, rate, tx_gain, rx_gain, bandwidth, timestamps);
-	if (rc < 0 || tx_frequency == 0.0 || !uhd_tx_probe(what, sizeof(what)))
+	if (rc < 0)
 		return rc;
+	if (tx_frequency == 0.0 || !uhd_tx_probe(what, sizeof(what))) {
+		uhd_ctl_start();
+		return rc;
+	}
 
 	snprintf(serial, sizeof(serial), "%s", uhd_tx_inst->serial);
 	LOGP(DUHD, LOGL_ERROR, "TX of the device %s does not respond (%s): USB reset and open again\n",
@@ -1032,6 +1241,7 @@ int uhd_open(size_t channel, const char *_device_args, const char *_stream_args,
 		return -EIO;
 	}
 	LOGP(DUHD, LOGL_NOTICE, "TX responds after the USB reset\n");
+	uhd_ctl_start();
 	return 0;
 }
 
@@ -1081,6 +1291,8 @@ int uhd_start(void)
 void uhd_close(void)
 {
 	LOGP(DUHD, LOGL_DEBUG, "Clean up UHD\n");
+	/* the control thread first: it uses the device */
+	uhd_ctl_stop();
 	if (uhd_tx_inst) {
 		if (uhd_tx_inst->tx_streamer)
 			uhd_tx_streamer_free(&uhd_tx_inst->tx_streamer);
@@ -1116,7 +1328,7 @@ void uhd_close(void)
  * and drained, rate and analog bandwidth set, the frequency set again (the
  * master clock may move), the stream started again. The device time
  * stamps restart their check. bandwidth 0: left as it is. */
-int uhd_set_rx_rate(double rate, double bandwidth)
+static int set_rx_rate(double rate, double bandwidth)
 {
 	uhd_instance_t *inst = uhd_rx_inst;
 	uhd_stream_cmd_t stream_cmd;
@@ -1179,7 +1391,18 @@ int uhd_set_rx_rate(double rate, double bandwidth)
 	return 0;
 }
 
-int uhd_set_rx_frequency(double frequency)
+/* (the control lock: the control thread reads meanwhile) */
+int uhd_set_rx_rate(double rate, double bandwidth)
+{
+	int rc;
+
+	pthread_mutex_lock(&uhd_ctl_lock);
+	rc = set_rx_rate(rate, bandwidth);
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	return rc;
+}
+
+static int set_rx_frequency(double frequency)
 {
 	uhd_instance_t *inst = uhd_rx_inst;
 	uhd_tune_request_t tune_request;
@@ -1225,7 +1448,17 @@ int uhd_set_rx_frequency(double frequency)
 	return 0;
 }
 
-int uhd_set_tx_frequency(double frequency)
+int uhd_set_rx_frequency(double frequency)
+{
+	int rc;
+
+	pthread_mutex_lock(&uhd_ctl_lock);
+	rc = set_rx_frequency(frequency);
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	return rc;
+}
+
+static int set_tx_frequency(double frequency)
 {
 	uhd_instance_t *inst = uhd_tx_inst;
 	uhd_tune_request_t tune_request;
@@ -1255,6 +1488,8 @@ int uhd_set_tx_frequency(double frequency)
 		LOGP(DUHD, LOGL_ERROR, "Failed to set TX frequency to %.0f Hz\n", frequency);
 		return -EIO;
 	}
+	inst->tx_nominal = frequency;
+	inst->tx_rf_freq = tune_result.actual_rf_freq;
 
 	error = uhd_usrp_get_tx_freq(inst->usrp, 0, &got_frequency);
 	if (error) {
@@ -1268,6 +1503,57 @@ int uhd_set_tx_frequency(double frequency)
 	}
 
 	LOGP(DUHD, LOGL_INFO, "TX frequency set to %.0f Hz\n", got_frequency);
+	return 0;
+}
+
+int uhd_set_tx_frequency(double frequency)
+{
+	int rc;
+
+	pthread_mutex_lock(&uhd_ctl_lock);
+	rc = set_tx_frequency(frequency);
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	return rc;
+}
+
+double uhd_get_tx_ppm(void)
+{
+	return uhd_tx_inst ? uhd_tx_inst->ppm_tx : 0.0;
+}
+
+/* Another ppm correction of the TX carrier: the RF LO of the last tune stays, the DSP (the FPGA's
+ * NCO) takes the change - no synthesizer retune, so no gap in the TX. The symbol rate stays (the
+ * carrier only, as --sdr-ppm). */
+int uhd_set_tx_ppm(double ppm)
+{
+	uhd_instance_t *inst = uhd_tx_inst;
+	uhd_tune_request_t tune_request;
+	uhd_tune_result_t tune_result;
+	uhd_error error;
+	double target;
+
+	if (!inst || !inst->usrp || !inst->tx_streamer || inst->tx_nominal == 0.0)
+		return -ENODEV;
+	target = inst->tx_nominal * (1.0 + ppm / 1e6);
+	memset(&tune_request, 0, sizeof(tune_request));
+	tune_request.target_freq = target;
+	tune_request.rf_freq_policy = UHD_TUNE_REQUEST_POLICY_MANUAL;
+	tune_request.rf_freq = inst->tx_rf_freq;
+	tune_request.dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO;
+	tune_request.args = "";
+	pthread_mutex_lock(&uhd_ctl_lock);
+	error = uhd_usrp_set_tx_freq(inst->usrp, &tune_request, inst->channel, &tune_result);
+	pthread_mutex_unlock(&uhd_ctl_lock);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to trim the TX carrier to %+.3f ppm\n", ppm);
+		return -EIO;
+	}
+	if (fabs(tune_result.actual_rf_freq - inst->tx_rf_freq) > 1.0)
+		LOGP(DUHD, LOGL_NOTICE, "TX trim moved the RF LO: %.3f -> %.3f Hz\n", inst->tx_rf_freq, tune_result.actual_rf_freq);
+	inst->tx_rf_freq = tune_result.actual_rf_freq;
+	inst->ppm_tx = ppm;
+	LOGP(DUHD, LOGL_INFO, "TX carrier at %+.3f ppm: %.3f Hz (RF LO %.3f Hz, DSP %.3f Hz)\n",
+	     ppm, target, tune_result.actual_rf_freq, tune_result.actual_dsp_freq);
 	return 0;
 }
 
@@ -1435,6 +1721,7 @@ int uhd_receive(float *buff, int max)
 	uhd_error error;
 	bool has_time_spec;
 	int rc;
+	struct timespec got_raw, got_rt;
 
 	/* TX-only mode or no RX instance: no RX streamer available */
 	if (!uhd_rx_inst || !uhd_rx_inst->rx_streamer)
@@ -1453,6 +1740,9 @@ int uhd_receive(float *buff, int max)
 	buffs_ptr[0] = buff;
 	count = 0;
 	error = uhd_rx_streamer_recv(uhd_rx_inst->rx_streamer, buffs_ptr, num_to_read, &uhd_rx_inst->rx_metadata, 0.0, false, &count);
+	/* when it came: the device clock against the system clocks (uhd_rx_time_point) */
+	clock_gettime(CLOCK_MONOTONIC_RAW, &got_raw);
+	clock_gettime(CLOCK_REALTIME, &got_rt);
 	if (error) {
 		LOGP(DUHD, LOGL_ERROR, "Failed to read from UHD device.\n");
 		return -EIO;
@@ -1499,6 +1789,7 @@ int uhd_receive(float *buff, int max)
 				}
 				uhd_rx_inst->rx_dev_next = pkt_time + (double)count / uhd_rx_inst->samplerate;
 				uhd_rx_inst->rx_dev_valid = 1;
+				uhd_rx_time_point(uhd_rx_inst, &got_raw, &got_rt, uhd_rx_inst->rx_dev_next);
 			} else if (sdr_rx_overflow && !uhd_rx_inst->rx_dev_warned) {
 				LOGP(DUHD, LOGL_ERROR, "RX overflow without device time stamps: lost samples cannot be measured or filled\n");
 				uhd_rx_inst->rx_dev_warned = 1;
