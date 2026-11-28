@@ -85,6 +85,7 @@ static int sdr_tx_is_rpitx(void)
 
 /* Forward declaration for timing function used by threads */
 static double get_time(void);
+static void *sdr_read_child(void *arg);
 
 typedef struct sdr_thread {
 	int use;
@@ -125,6 +126,7 @@ typedef struct sdr {
 	int		threads;	/* use threads */
 	int		tx_rate;	/* SDR sample rate of TX */
 	int		rx_rate;	/* SDR sample rate of RX */
+	int		rx_rate_open;	/* ... at the open (sdr_set_rx_rate() at most this) */
 	sdr_thread_t	thread_read,
 			thread_write;
 	sdr_chan_t	*chan;		/* settings for all channels (+ paging channel) */
@@ -469,6 +471,7 @@ static void *sdr_open_internal(int direction, const char *device, double *tx_fre
 		LOGP(DSDR, LOGL_NOTICE, "RX: SDR rate %d is not an integer multiple of the DSP rate %d: rational resampling (an integer multiple is cheaper).\n", sdr->rx_rate, samplerate);
 	sdr->rx_max_in = rate_max(buffer_size, samplerate, sdr->rx_rate);
 	sdr->tx_max_out = rate_max(buffer_size, samplerate, sdr->tx_rate);
+	sdr->rx_rate_open = sdr->rx_rate;
 
 	/* the LO offset and the band's shift off the DC, per direction
 	 * (sdr_lo.c): UHD applies an LO offset (its DSP moves the signal
@@ -1273,6 +1276,74 @@ long sdr_rx_settle(void *inst, double settle_sec)
 	if (sdr->band_rx_init)
 		sdr->band_rx.fifo_len = 0;
 	return dropped;
+}
+
+int sdr_set_rx_rate(void *inst, int rate)
+{
+	sdr_t *sdr = (sdr_t *)inst;
+	double t0 = get_time(), bw;
+	int rc = -ENOTSUP, running;
+	const char *why = NULL;
+
+	if (!sdr)
+		return -EINVAL;
+	if (rate == sdr->rx_rate)
+		return 0;
+	if (sdr->use_client || sdr->use_engine || sdr->channels != 0)
+		why = "only a band receiver (channels = 0) on its own device";
+	else if (tx_driver != 0)
+		why = "RX only (the TX stream keeps its rate)";
+	else if (!sdr->band_rx_init || !sdr->band_rx_pass || sdr->samplerate != sdr->rx_rate)
+		why = "only a band that passes unchanged (DSP rate = SDR rate, no shift)";
+	else if (sdr->lo_rx.lo_offset != 0.0)
+		why = "no LO offset (it was planned for the rate of the open)";
+	else if (rate > sdr->rx_rate_open || rate <= 0)
+		why = "at most the rate of the open (the buffers are sized for it)";
+	if (why) {
+		LOGP(DSDR, LOGL_ERROR, "Cannot change the RX rate to %d S/s without reopening: %s\n", rate, why);
+		return -ENOTSUP;
+	}
+	/* the read thread stopped: it calls the driver's receive */
+	running = sdr->threads && sdr->thread_read.running;
+	if (running) {
+		sdr->thread_read.running = 0;
+		while (sdr->thread_read.exit == 0)
+			usleep(1000);
+	}
+	bw = sdr_config->bandwidth_given ? 0.0 : (double)rate;
+#ifdef HAVE_UHD
+	if (rx_driver == 1)
+		rc = uhd_set_rx_rate((double)rate, bw);
+#endif
+#ifdef HAVE_SOAPY
+	if (rx_driver == 2)
+		rc = soapy_set_rx_rate((double)rate, bw);
+#endif
+	if (rc < 0)
+		return rc;
+	sdr->rx_rate = rate;
+	sdr->samplerate = rate;
+	sdr_config->samplerate = rate;
+	if (!sdr_config->bandwidth_given)
+		sdr_config->bandwidth = rate;
+	/* the ring's backlog is from the old rate; sdr_rx_settle() counts from here */
+	sdr->thread_read.out = sdr->thread_read.in;
+	sdr->band_rx.fifo_len = 0;
+	rx_retune_done = get_time();
+	if (running) {
+		pthread_t tid;
+
+		sdr->thread_read.running = 1;
+		sdr->thread_read.exit = 0;
+		if (pthread_create(&tid, NULL, sdr_read_child, inst) != 0) {
+			sdr->thread_read.running = 0;
+			LOGP(DSDR, LOGL_ERROR, "Failed to create the read thread again\n");
+			return -EIO;
+		}
+		pthread_setname_np(tid, "sdr_rx");
+	}
+	LOGP(DSDR, LOGL_INFO, "RX rate %d S/s, changed in %.1f ms without a reopen\n", rate, 1000.0 * (get_time() - t0));
+	return 0;
 }
 
 /* Set TX frequency on the active SDR backend */

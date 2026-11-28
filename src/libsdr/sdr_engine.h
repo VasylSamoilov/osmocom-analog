@@ -101,6 +101,13 @@ typedef struct sdr_group {
 	 * a channelizer on the SDR stream instead of a tail on the bank */
 	int		chain;
 	channelizer_t	*crx, *ctx;
+	/* RX chain, opt-in (sdr_engine_group_add_shared()): one first stage
+	 * for the group's span, the channels from its output */
+	int		pre_init, pre_rate, pre_max;
+	double		pre_centre;
+	channelizer_t	pre;
+	sample_t	*pre_i, *pre_q;
+	float		*pre_iq;
 	float		*tx_fifo;	/* SDR rate IQ made, not yet given (all TX channels added) */
 	int		tx_fifo_len, tx_fifo_size;
 	sdr_view_t	*view;		/* rings and counters (own memory or the caller's) */
@@ -168,6 +175,16 @@ sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const
 /* the same with the view in the caller's memory (mem, size; zeroed, at
  * least sdr_view_size() of the group: shared memory for the backend) */
 sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target, void *mem, size_t size);
+/* RX only, opt-in for the per-channel chain (max_dsp 0 or a DSP rate above
+ * the banks'): the group's channels share a first stage, the NCO to the
+ * middle of their offsets and the halfbands down to the narrowest SDR rate
+ * / 2^k that holds them all (each to half its DSP rate either side, within
+ * 0.4 of that rate); each channel is then cut from its output (as float
+ * IQ, like the device's). Without room to halve even once it is the plain
+ * chain. sdr_engine_group_shared_rate(): the rate of the shared stage, 0
+ * if none. */
+sdr_group_t *sdr_engine_group_add_shared(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int ring_ms);
+int sdr_engine_group_shared_rate(const sdr_group_t *g);
 /* ring rows for a ring of ring_ms, bytes of a view */
 int sdr_engine_rows(int dsp_rate, int ring_ms);
 size_t sdr_view_size(int n_rx, int n_tx, int rows);

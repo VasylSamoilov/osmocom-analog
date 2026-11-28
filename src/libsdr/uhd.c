@@ -1111,6 +1111,74 @@ void uhd_close(void)
 	}
 	uhd_tx_inst = uhd_rx_inst = NULL;
 }
+/* Another RX rate on the open device (RX only; the receive frames of the
+ * open stay, so a lower rate gets more buffer time): the stream stopped
+ * and drained, rate and analog bandwidth set, the frequency set again (the
+ * master clock may move), the stream started again. The device time
+ * stamps restart their check. bandwidth 0: left as it is. */
+int uhd_set_rx_rate(double rate, double bandwidth)
+{
+	uhd_instance_t *inst = uhd_rx_inst;
+	uhd_stream_cmd_t stream_cmd;
+	uhd_error error;
+	double got_rate, got_freq = 0.0;
+	float drain[2 * 4096];
+	void *buffs_ptr[1] = { drain };
+	size_t count;
+	int i;
+
+	if (!inst || !inst->usrp || !inst->rx_streamer)
+		return -ENODEV;
+	memset(&stream_cmd, 0, sizeof(stream_cmd));
+	stream_cmd.stream_mode = UHD_STREAM_MODE_STOP_CONTINUOUS;
+	stream_cmd.stream_now = true;
+	error = uhd_rx_streamer_issue_stream_cmd(inst->rx_streamer, &stream_cmd);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to stop the RX stream\n");
+		return -EIO;
+	}
+	/* what is on its way still */
+	for (i = 0; i < 1000; i++) {
+		count = 0;
+		if (uhd_rx_streamer_recv(inst->rx_streamer, buffs_ptr, 4096, &inst->rx_metadata, 0.05, false, &count) || !count)
+			break;
+	}
+	uhd_usrp_get_rx_freq(inst->usrp, 0, &got_freq);
+	error = uhd_usrp_set_rx_rate(inst->usrp, rate, 0);
+	if (!error)
+		error = uhd_usrp_get_rx_rate(inst->usrp, 0, &got_rate);
+	if (error || fabs(got_rate - rate) > 1.0) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to set RX rate to %.0f Hz\n", rate);
+		return -EIO;
+	}
+	if (bandwidth > 0.0 && uhd_usrp_set_rx_bandwidth(inst->usrp, bandwidth, 0) != 0)
+		LOGP(DUHD, LOGL_NOTICE, "Failed to set RX bandwidth to %.0f Hz\n", bandwidth);
+	if (got_freq > 0.0) {
+		uhd_tune_request_t tune_request;
+		uhd_tune_result_t tune_result;
+
+		memset(&tune_request, 0, sizeof(tune_request));
+		tune_request.target_freq = got_freq;
+		tune_request.rf_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO;
+		tune_request.dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO;
+		tune_request.args = "";
+		if (uhd_usrp_set_rx_freq(inst->usrp, &tune_request, 0, &tune_result))
+			LOGP(DUHD, LOGL_ERROR, "Failed to set RX frequency %.0f Hz again\n", got_freq);
+	}
+	inst->samplerate = rate;
+	inst->rx_dev_valid = 0;
+	inst->rx_gap = 0;
+	stream_cmd.stream_mode = UHD_STREAM_MODE_START_CONTINUOUS;
+	stream_cmd.stream_now = true;
+	error = uhd_rx_streamer_issue_stream_cmd(inst->rx_streamer, &stream_cmd);
+	if (error) {
+		LOGP(DUHD, LOGL_ERROR, "Failed to start the RX stream again\n");
+		return -EIO;
+	}
+	LOGP(DUHD, LOGL_INFO, "RX rate set to %.0f Hz\n", got_rate);
+	return 0;
+}
+
 int uhd_set_rx_frequency(double frequency)
 {
 	uhd_instance_t *inst = uhd_rx_inst;

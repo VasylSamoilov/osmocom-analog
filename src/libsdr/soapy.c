@@ -786,6 +786,45 @@ void soapy_close(void)
 	}
 	soapy_tx_inst = soapy_rx_inst = NULL;
 }
+/* Another RX rate on the open device (RX only): the stream deactivated,
+ * rate and analog bandwidth set, the stream activated again. The receive
+ * time line restarts. bandwidth 0: left as it is. */
+int soapy_set_rx_rate(double rate, double bandwidth)
+{
+	soapy_instance_t *inst = soapy_rx_inst;
+	double got_rate;
+
+	if (!inst || !inst->sdr || !inst->rxStream)
+		return -ENODEV;
+	SoapySDRDevice_deactivateStream(inst->sdr, inst->rxStream, 0, 0);
+	if (SoapySDRDevice_setSampleRate(inst->sdr, SOAPY_SDR_RX, 0, rate) != 0) {
+		LOGP(DSOAPY, LOGL_ERROR, "Failed to set RX rate to %.0f Hz\n", rate);
+		return -EIO;
+	}
+	got_rate = SoapySDRDevice_getSampleRate(inst->sdr, SOAPY_SDR_RX, 0);
+	if (fabs(got_rate - rate) > 1.0) {
+		LOGP(DSOAPY, LOGL_ERROR, "Given RX rate %.0f Hz is not supported, got %.0f Hz\n", rate, got_rate);
+		return -EINVAL;
+	}
+	if (bandwidth > 0.0 && SoapySDRDevice_setBandwidth(inst->sdr, SOAPY_SDR_RX, 0, bandwidth) != 0)
+		LOGP(DSOAPY, LOGL_NOTICE, "Failed to set RX bandwidth to %.0f Hz\n", bandwidth);
+	inst->samplerate = rate;
+	inst->rx_valid = 0;
+	inst->rx_gap = 0;
+	/* as at the open: time stamps only for an integer ns per sample */
+	if (inst->use_time_stamps && (1000000000LL % (long long)rate)) {
+		LOGP(DSOAPY, LOGL_NOTICE, "Sample rate %.0f does not map to integer ns/sample; disabling hardware timestamp arithmetic and using software timing.\n", rate);
+		inst->use_time_stamps = 0;
+	}
+	inst->Ns_per_sample = 1000000000LL / (long long)rate;
+	if (SoapySDRDevice_activateStream(inst->sdr, inst->rxStream, 0, 0, 0) != 0) {
+		LOGP(DSOAPY, LOGL_ERROR, "Failed to activate the RX stream again\n");
+		return -EIO;
+	}
+	LOGP(DSOAPY, LOGL_INFO, "RX rate set to %.0f Hz\n", got_rate);
+	return 0;
+}
+
 int soapy_set_rx_frequency(double frequency)
 {
 	soapy_instance_t *inst = soapy_rx_inst;

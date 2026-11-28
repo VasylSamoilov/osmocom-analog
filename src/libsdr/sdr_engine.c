@@ -236,6 +236,11 @@ static void group_free(sdr_group_t *g)
 			channelizer_exit(&g->crx[c]);
 		free(g->crx);
 	}
+	if (g->pre_init)
+		channelizer_exit(&g->pre);
+	free(g->pre_i);
+	free(g->pre_q);
+	free(g->pre_iq);
 	if (g->ctx) {
 		for (c = 0; c < g->n_tx; c++)
 			channelizer_exit(&g->ctx[c]);
@@ -288,12 +293,53 @@ int sdr_engine_tx_step(const sdr_engine_t *e)
 	return e->bank_tx.d;
 }
 
+static sdr_group_t *group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target, void *mem, size_t size, int shared);
+
 sdr_group_t *sdr_engine_group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target)
 {
-	return sdr_engine_group_add_mem(e, dsp_rate, n_rx, rx_offset, n_tx, tx_offset, ring_ms, tx_target, NULL, 0);
+	return group_add(e, dsp_rate, n_rx, rx_offset, n_tx, tx_offset, ring_ms, tx_target, NULL, 0, 0);
 }
 
 sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target, void *mem, size_t size)
+{
+	return group_add(e, dsp_rate, n_rx, rx_offset, n_tx, tx_offset, ring_ms, tx_target, mem, size, 0);
+}
+
+sdr_group_t *sdr_engine_group_add_shared(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int ring_ms)
+{
+	return group_add(e, dsp_rate, n_rx, rx_offset, 0, NULL, ring_ms, 0, NULL, 0, 1);
+}
+
+int sdr_engine_group_shared_rate(const sdr_group_t *g)
+{
+	return g->pre_rate;
+}
+
+/* the shared first stage of a chain group: the SDR rate halved as long as
+ * the group's channels (each to half its DSP rate either side of its
+ * offset) stay within the channelizer's pass band (0.4 of the rate) around
+ * their middle; 0 if not even once */
+static int shared_rate(int sdr_rate, int dsp_rate, int n, const double *off, double *centre)
+{
+	double lo = off[0], hi = off[0], half;
+	int r = sdr_rate, best = 0;
+
+	for (int c = 1; c < n; c++) {
+		if (off[c] < lo)
+			lo = off[c];
+		if (off[c] > hi)
+			hi = off[c];
+	}
+	*centre = 0.5 * (lo + hi);
+	half = 0.5 * (hi - lo) + 0.5 * dsp_rate;
+	while (!(r % 2) && r / 2 >= dsp_rate && half <= CHANNELIZER_PASS * (r / 2)) {
+		r /= 2;
+		best = r;
+	}
+	return best;
+}
+
+static sdr_group_t *group_add(sdr_engine_t *e, int dsp_rate, int n_rx, const double *rx_offset, int n_tx, const double *tx_offset, int ring_ms, int tx_target, void *mem, size_t size, int shared)
 {
 	sdr_group_t *g = NULL;
 	int c, i, rc, rows;
@@ -359,6 +405,41 @@ sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, c
 	g->view->tx_scale = sdr_engine_tx_scale(e);
 	view_rings(g->view, n_rx, n_tx, rows, &g->rx_ring, &g->tx_ring);
 	if (n_rx && g->chain) {
+		int in_rate = e->rx_rate, in_block = e->max_block;
+		double centre = 0.0;
+
+		/* opt-in: one first stage for the group's span (the NCO to its
+		 * middle and the halfbands down to the narrowest rate that holds
+		 * all channels), then each channel from that */
+		if (shared && (g->pre_rate = shared_rate(e->rx_rate, dsp_rate, n_rx, rx_offset, &centre)) > 0) {
+			double half = 0.0;
+
+			for (c = 0; c < n_rx; c++)
+				if (fabs(rx_offset[c] - centre) > half)
+					half = fabs(rx_offset[c] - centre);
+			half += 0.5 * dsp_rate;
+			rc = channelizer_rx_init(&g->pre, e->rx_rate, g->pre_rate, centre, 2.0 * half, e->max_block);
+			if (rc < 0) {
+				snprintf(error_text, sizeof(error_text), "shared stage at %+.0f Hz, %d S/s: %s", centre, g->pre_rate, channelizer_error());
+				g->pre_rate = 0;
+				g->n_rx = 0;
+				goto fail;
+			}
+			g->pre_init = 1;
+			g->pre_centre = centre;
+			g->pre_max = (int)ceil((double)e->max_block * g->pre_rate / e->rx_rate) + 8;
+			g->pre_i = calloc(g->pre_max, sizeof(sample_t));
+			g->pre_q = calloc(g->pre_max, sizeof(sample_t));
+			g->pre_iq = calloc((size_t)2 * g->pre_max, sizeof(float));
+			if (!g->pre_i || !g->pre_q || !g->pre_iq)
+				goto nomem;
+			in_rate = g->pre_rate;
+			in_block = g->pre_max;
+		} else {
+			/* no room for a shared stage: the plain chain */
+			g->pre_rate = 0;
+			centre = 0.0;
+		}
 		/* the chain takes every SDR block whole: its output per block */
 		g->crx = calloc(n_rx, sizeof(*g->crx));
 		g->rx_max = (int)ceil((double)e->max_block * dsp_rate / e->rx_rate) + 8;
@@ -369,7 +450,7 @@ sdr_group_t *sdr_engine_group_add_mem(sdr_engine_t *e, int dsp_rate, int n_rx, c
 		for (c = 0; c < n_rx; c++) {
 			g->rx_offset[c] = rx_offset[c];
 			/* the same guarantee as the tails: flat to 0.4 of the DSP rate */
-			rc = channelizer_rx_init(&g->crx[c], e->rx_rate, dsp_rate, rx_offset[c], 2.0 * CHANNELIZER_PASS * dsp_rate, e->max_block);
+			rc = channelizer_rx_init(&g->crx[c], in_rate, dsp_rate, rx_offset[c] - centre, 2.0 * CHANNELIZER_PASS * dsp_rate, in_block);
 			if (rc < 0) {
 				snprintf(error_text, sizeof(error_text), "RX channel at %+.0f Hz, DSP rate %d: %s", rx_offset[c], dsp_rate, channelizer_error());
 				g->n_rx = c;
@@ -587,11 +668,23 @@ void sdr_engine_rx_feed(sdr_engine_t *e, const float *iq, int n)
 		int in, space;
 
 		out = 0;
+		const float *civ = iq;
+		int cn = n;
+
+		if (g->pre_init) {
+			/* the shared stage once, then the channels from it */
+			cn = channelizer_rx_process(&g->pre, iq, n, g->pre_max, g->pre_i, g->pre_q);
+			for (s = 0; s < cn; s++) {
+				g->pre_iq[2 * s] = (float)g->pre_i[s];
+				g->pre_iq[2 * s + 1] = (float)g->pre_q[s];
+			}
+			civ = g->pre_iq;
+		}
 		for (k = 0; k < g->n_rx; k++) {
 			int got;
 
 			if (g->chain)
-				got = channelizer_rx_process(&g->crx[k], iq, n, g->rx_max,
+				got = channelizer_rx_process(&g->crx[k], civ, cn, g->rx_max,
 							     g->rx_out_i + k * g->rx_max, g->rx_out_q + k * g->rx_max);
 			else {
 				got = pfb_chan_rx_process(&g->rx[k], e->rx_bin_i[c], e->rx_bin_q[c], frames, g->rx_max,

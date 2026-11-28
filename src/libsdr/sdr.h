@@ -48,6 +48,17 @@ int sdr_set_rx_frequency(double frequency);
  * the B210 delivers zeros). Blocks until then. Returns the
  * number of SDR rate samples dropped. */
 long sdr_rx_settle(void *inst, double settle_sec);
+/* Another RX rate without reopening the device: for a band receiver whose
+ * band passes unchanged (channels = 0, DSP rate = SDR rate, no LO offset or
+ * shift), RX only, at most the rate it was opened at (the buffers and the
+ * device's receive frames are sized for that). The read thread is stopped,
+ * the device's stream stopped and started again at the new rate (analog
+ * bandwidth = the rate unless --sdr-bandwidth was given), the ring
+ * emptied; sdr_read() then gives the new rate (sdr_get_samplerate()), and
+ * sdr_rx_settle() drops what came before the change settled. Returns 0,
+ * -ENOTSUP for a configuration it does not cover (with the reason logged),
+ * <0 when the device refused (the stream is then stopped). */
+int sdr_set_rx_rate(void *inst, int rate);
 int sdr_set_tx_frequency(double frequency);
 int sdr_calculate_optimal_rate(int master_rate, double bandwidth);
 /* the device of an SDR backend: call before sdr_open() (no channels, the

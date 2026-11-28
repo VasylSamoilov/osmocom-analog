@@ -22,6 +22,7 @@ long uhd_rx_take_gap(void);
 void uhd_tx_poll_events(unsigned long *underflow, unsigned long *seq_error, unsigned long *time_error);
 
 int uhd_set_rx_frequency(double frequency);
+int uhd_set_rx_rate(double rate, double bandwidth);
 int uhd_set_tx_frequency(double frequency);
 
 /* Query supported sample rates from device */

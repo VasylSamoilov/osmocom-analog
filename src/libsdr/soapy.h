@@ -14,6 +14,7 @@ long soapy_rx_take_gap(void);
 void soapy_tx_poll_events(unsigned long *underflow, unsigned long *seq_error, unsigned long *time_error);
 
 int soapy_set_rx_frequency(double frequency);
+int soapy_set_rx_rate(double rate, double bandwidth);
 int soapy_set_tx_frequency(double frequency);
 
 /* Query supported sample rates and IF bandwidths from device (single open) */
