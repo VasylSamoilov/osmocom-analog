@@ -630,9 +630,9 @@ static int rate_fits(int samplerate, const device_rule_t *dev)
 		else
 			lte = 1;
 	}
-	/* GSM: a 200 kHz channel off the DC (calibrate.c window_capacity) */
-	if (gsm && half < 300e3) {
-		fprintf(stderr, "%d S/s on %s: +-%.0f kHz usable, a GSM channel needs +-300 kHz. Use a wider --sdr-samplerate.\n",
+	/* GSM: a 200 kHz channel 100 kHz off the DC (calibrate.c window_capacity) */
+	if (gsm && half < 200e3) {
+		fprintf(stderr, "%d S/s on %s: +-%.0f kHz usable, a GSM channel needs +-200 kHz. Use a wider --sdr-samplerate.\n",
 			samplerate, dev->name, half / 1e3);
 		return -EINVAL;
 	}

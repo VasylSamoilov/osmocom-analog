@@ -92,7 +92,9 @@
 #define LTE_PEAK_REACH  5       /* a peak: the most within +- this many EARFCNs */
 #define LTE_PEAK_MIN_DB 2.0     /* above the floor (10th percentile of 100 kHz cells) */
 #define LTE_FLOOR_PCT   10
-#define LTE_WEAK_IN_A_ROW 6     /* peaks in a row without a confirmed cell: the band ends */
+#define LTE_WEAK_IN_A_ROW 16    /* peaks in a row without a confirmed cell: the band ends
+                                 * (the power rank is weak: UMTS and loaded
+                                 * carriers outrank idle cells; 1500 came 10th) */
 #define LTE_STAGGER_SEC 0.03    /* channel c starts c x this late: their searches do not coincide */
 #define LTE_NO_MIB_SEC  2.0     /* a cell without a good MIB this long: no cell */
 #define LTE_MIN_POINTS  50      /* frame-to-frame offset points (0.5 s) */
@@ -966,9 +968,18 @@ static int lte_candidates(int samplerate, const calib_band_t *band, calibrate_co
 	/* each peak with its neighbours (a stronger peak takes a shared one) */
 	for (i = 0; i < np; i++) {
 		arfcn_power_t pk = list[i];
+		int kc = pk.arfcn - first;
+		/* the fourth: two EARFCNs off, on the side the top extends to
+		 * (a loaded carrier's flat top puts its peak up to 2 off) */
+		double pl = (kc >= 2 && !isnan(p[kc - 2])) ? p[kc - 2] : -1e9;
+		double ph = (kc + 2 < nr && !isnan(p[kc + 2])) ? p[kc + 2] : -1e9;
+		int side = (ph >= pl) ? 2 : -2;
 
-		for (j = -1; j <= 1; j++) {
+		for (j = -2; j <= 2; j++) {
 			int k = pk.arfcn - first + j, e;
+
+			if ((j == 2 || j == -2) && j != side)
+				continue;
 			double f = ff + 100e3 * k;
 			int dup = 0;
 
@@ -1874,7 +1885,7 @@ static int calibrate_lte_band(int *samplerate, calibrate_config_t *config, const
 		return 0;
 	}
 	while (!*stop) {
-		arfcn_power_t *ents[3];
+		arfcn_power_t *ents[SDR_ENGINE_MAX_CHAIN];
 		int first = -1, k = 0, pk;
 		double centre = 0.0;
 
@@ -1886,7 +1897,7 @@ static int calibrate_lte_band(int *samplerate, calibrate_config_t *config, const
 		if (first < 0 || result->num_cells >= CALIB_MAX_CELLS)
 			break;
 		pk = list[first].peak;
-		for (i = first; i < n && list[i].peak == pk && k < 3; i++)
+		for (i = first; i < n && list[i].peak == pk && k < SDR_ENGINE_MAX_CHAIN; i++)
 			if (!list[i].done)
 				ents[k++] = &list[i];
 		for (i = 0; i < k; i++)
