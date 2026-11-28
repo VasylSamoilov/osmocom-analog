@@ -176,6 +176,28 @@ static void nco_block(channelizer_t *ch, sample_t *i, sample_t *q, int n)
 	ch->nco_q = pq / mag;
 }
 
+/* the same from interleaved float IQ (RX): the conversion in the same pass
+ * (the phasor's chain of products sets the pace, the rest comes free);
+ * the same operations as nco_block() on the converted samples */
+static void nco_block_iq(channelizer_t *ch, const float *iq, sample_t *i, sample_t *q, int n)
+{
+	double pi = ch->nco_i, pq = ch->nco_q, ri = ch->rot_i, rq = ch->rot_q, mag;
+	int s;
+
+	for (s = 0; s < n; s++) {
+		double xi = iq[2 * s], xq = iq[2 * s + 1], t;
+
+		i[s] = xi * pi - xq * pq;
+		q[s] = xi * pq + xq * pi;
+		t = pi * ri - pq * rq;
+		pq = pi * rq + pq * ri;
+		pi = t;
+	}
+	mag = sqrt(pi * pi + pq * pq);
+	ch->nco_i = pi / mag;
+	ch->nco_q = pq / mag;
+}
+
 int channelizer_rx_need(const channelizer_t *ch, int want)
 {
 	int m = want - ch->fifo_len, s, n;
@@ -232,13 +254,14 @@ int channelizer_rx_process(channelizer_t *ch, const float *iq, int n, int want, 
 		}
 		return give;
 	}
-	for (s = 0; s < n; s++) {
-		wi[s] = iq[2 * s];
-		wq[s] = iq[2 * s + 1];
-	}
 	/* centred: the NCO stays at 1 + 0j, its product is the input */
 	if (ch->offset != 0.0)
-		nco_block(ch, wi, wq, n);
+		nco_block_iq(ch, iq, wi, wq, n);
+	else
+		for (s = 0; s < n; s++) {
+			wi[s] = iq[2 * s];
+			wq[s] = iq[2 * s + 1];
+		}
 	count = n;
 	for (st = 0; st < ch->hb_stages; st++)
 		count = halfband_decimate_block(&ch->hb[st], wi, wq, count);

@@ -35,8 +35,11 @@ typedef struct halfband {
 	double		stop_db;	/* worst measured attenuation in the stopband */
 	double		ripple_db;	/* worst measured deviation in the passband */
 	int		phase;		/* decimation: 0 = store only, 1 = store and output */
-	int		ptr;		/* ring position */
-	double		*buf_i, *buf_q;	/* window stored twice, reads never wrap */
+	int		ptr;		/* ring position (interpolation) */
+	double		*buf_i, *buf_q;	/* interpolation: window stored twice, reads never
+					 * wrap; decimation: the last order samples */
+	double		*work;		/* decimation: the block split by parity */
+	int		work_len;
 } halfband_t;
 
 /* Design for a passband 0 .. pass (fraction of the higher rate, < 0.25) and

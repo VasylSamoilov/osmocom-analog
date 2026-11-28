@@ -169,45 +169,129 @@ void halfband_exit(halfband_t *hb)
 {
 	free(hb->buf_i);
 	free(hb->buf_q);
+	free(hb->work);
 	memset(hb, 0, sizeof(*hb));
 }
 
 /* Window of order samples, bi[0] oldest. The non-zero taps sit at odd
  * distances 1, 3, ... from the centre bi[order/2]; coeffs[0] (outermost) at
  * bi[1] and bi[order-1]; centre tap 0.5. */
+/* two doubles side by side (GCC/clang vector extension: SSE2, NEON); the
+ * lanes compute exactly as scalar code does */
+typedef double v2d __attribute__((vector_size(16)));
+
+static inline v2d ld2(const double *p)
+{
+	v2d v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline void st2(double *p, v2d v)
+{
+	memcpy(p, &v, sizeof(v));
+}
+
+/* The input x[t] as a line L[order + t] after the last order samples
+ * (L[0 .. order-1], kept in buf_i/buf_q). An output at input s (s = s0,
+ * s0 + 2, ...; s0 = 0 if phase is 1) has the taps x[s - order + 2 + 2j] and
+ * x[s - 2j], the centre x[s - order/2 + 1]: the taps all of the parity of
+ * s0, the centre of the other. Split into the two parities (A: the taps, B:
+ * the centres), output k needs A[1 + j + k], A[order/2 + k - j] and
+ * B[order/4 + s0 + k]: contiguous in k, so the outputs are computed side by
+ * side, tap by tap. Every output's sum is formed in the same order as one at
+ * a time (centre, then j = 0 .. nc-1): the result is the same to the bit. */
 int halfband_decimate_block(halfband_t *hb, sample_t *in_i, sample_t *in_q, int n)
 {
 	const int nc = hb->num_coeffs, order = hb->order, half = order / 2;
 	const double *c = hb->coeffs;
-	double *buf_i = hb->buf_i, *buf_q = hb->buf_q;
-	int ptr = hb->ptr, phase = hb->phase, s, j, out = 0;
+	double *hist_i = hb->buf_i, *hist_q = hb->buf_q;
+	int phase = hb->phase, s0 = phase ? 0 : 1, len = order + n, out, j, k, t;
+	double *ai, *aq, *bi, *bq;
 
-	for (s = 0; s < n; s++) {
-		buf_i[ptr] = buf_i[ptr + order] = in_i[s];
-		buf_q[ptr] = buf_q[ptr + order] = in_q[s];
-		if (++ptr == order)
-			ptr = 0;
-		if (!phase) {
-			phase = 1;
-			continue;
+	out = (n > s0) ? (n - s0 + 1) / 2 : 0;
+	if (hb->work_len < len / 2 + 2) {
+		free(hb->work);
+		hb->work_len = len / 2 + 2 + 1024;
+		hb->work = malloc(4 * hb->work_len * sizeof(double));
+		if (!hb->work) {
+			hb->work_len = 0;
+			return 0;
 		}
-		phase = 0;
+	}
+	ai = hb->work;
+	aq = ai + hb->work_len;
+	bi = aq + hb->work_len;
+	bq = bi + hb->work_len;
+	/* the line, split by parity relative to s0 */
+	{
+		/* L[t] goes to A if t has the parity of s0, else to B; at index
+		 * t >> 1 (order is even: the history keeps the parities) */
+		double *ei = s0 ? bi : ai, *eq = s0 ? bq : aq;	/* even t */
+		double *oi = s0 ? ai : bi, *oq = s0 ? aq : bq;	/* odd t */
 
-		const double *bi = buf_i + ptr, *bq = buf_q + ptr;
-		double acc_i = bi[half] * 0.5, acc_q = bq[half] * 0.5;
+		for (t = 0; t < order; t += 2) {
+			ei[t >> 1] = hist_i[t];
+			eq[t >> 1] = hist_q[t];
+			oi[t >> 1] = hist_i[t + 1];
+			oq[t >> 1] = hist_q[t + 1];
+		}
+		ei += order / 2;
+		eq += order / 2;
+		oi += order / 2;
+		oq += order / 2;
+		for (t = 0; t + 1 < n; t += 2) {
+			ei[t >> 1] = in_i[t];
+			eq[t >> 1] = in_q[t];
+			oi[t >> 1] = in_i[t + 1];
+			oq[t >> 1] = in_q[t + 1];
+		}
+		if (t < n) {
+			ei[t >> 1] = in_i[t];
+			eq[t >> 1] = in_q[t];
+		}
+	}
+	/* the last order samples for the next block */
+	for (t = 0; t < order; t++) {
+		int u = n + t;
+
+		hist_i[t] = (u < order) ? hist_i[u] : in_i[u - order];
+		hist_q[t] = (u < order) ? hist_q[u] : in_q[u - order];
+	}
+	const double *cb_i = bi + half / 2 + s0, *cb_q = bq + half / 2 + s0;
+
+	/* two outputs per vector, two vectors per pass (I and Q each) */
+	for (k = 0; k + 4 <= out; k += 4) {
+		v2d i0 = ld2(cb_i + k) * 0.5, i1 = ld2(cb_i + k + 2) * 0.5;
+		v2d q0 = ld2(cb_q + k) * 0.5, q1 = ld2(cb_q + k + 2) * 0.5;
 
 		for (j = 0; j < nc; j++) {
-			int l = 1 + 2 * j, r = order - 1 - 2 * j;
+			const double cj = c[j];
+			const double *li = ai + 1 + j + k, *ri = ai + half - j + k;
+			const double *lq = aq + 1 + j + k, *rq = aq + half - j + k;
 
-			acc_i += (bi[l] + bi[r]) * c[j];
-			acc_q += (bq[l] + bq[r]) * c[j];
+			i0 += (ld2(li) + ld2(ri)) * cj;
+			i1 += (ld2(li + 2) + ld2(ri + 2)) * cj;
+			q0 += (ld2(lq) + ld2(rq)) * cj;
+			q1 += (ld2(lq + 2) + ld2(rq + 2)) * cj;
 		}
-		in_i[out] = acc_i;
-		in_q[out] = acc_q;
-		out++;
+		st2(in_i + k, i0);
+		st2(in_i + k + 2, i1);
+		st2(in_q + k, q0);
+		st2(in_q + k + 2, q1);
 	}
-	hb->ptr = ptr;
-	hb->phase = phase;
+	for (; k < out; k++) {
+		double acc_i = cb_i[k] * 0.5, acc_q = cb_q[k] * 0.5;
+
+		for (j = 0; j < nc; j++) {
+			acc_i += (ai[1 + j + k] + ai[half - j + k]) * c[j];
+			acc_q += (aq[1 + j + k] + aq[half - j + k]) * c[j];
+		}
+		in_i[k] = acc_i;
+		in_q[k] = acc_q;
+	}
+	hb->phase = phase ^ (n & 1);
 	return out;
 }
 
