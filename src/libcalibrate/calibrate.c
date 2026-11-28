@@ -965,7 +965,7 @@ static int lte_width_match(double w)
 	static const int rb[6] = { 6, 15, 25, 50, 75, 100 };
 
 	for (int k = 1; k < 6; k++)
-		if (fabs(w - (rb[k] * 180e3 + 15e3)) <= ((rb[k] <= 25) ? 400e3 : 600e3))
+		if (fabs(w - (rb[k] * 180e3 + 15e3)) <= ((rb[k] <= 25) ? 400e3 : (rb[k] == 50) ? 800e3 : 1100e3))
 			return k;
 	return -1;
 }
@@ -1059,6 +1059,12 @@ static int lte_coh_candidates(const calib_band_t *band, int first, int nr, doubl
 			continue;
 		blocks++;
 		cand[nc++] = 0.5 * (lo + hi);
+		/* a block a little wider than its width (a neighbour's edge in
+		 * it): the carrier at either edge, too */
+		if (match >= 0 && w > rb[match] * 180e3 + 15e3 + 100e3) {
+			cand[nc++] = hi - 0.5 * (rb[match] * 180e3 + 15e3);
+			cand[nc++] = lo + 0.5 * (rb[match] * 180e3 + 15e3);
+		}
 		if (match < 0)
 			for (int k = 1; k < 6; k++) {
 				double o = rb[k] * 180e3 + 15e3;
