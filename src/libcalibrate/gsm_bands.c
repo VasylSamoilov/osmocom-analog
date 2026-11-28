@@ -1,4 +1,9 @@
-/* GSM Band Definitions and ARFCN Conversion
+/* GSM bands and ARFCNs, 3GPP TS 45.005 clause 2
+ *
+ * Downlink (base transmit) carrier frequencies, Table 2-2 (fixed
+ * designation); GSM 750 has no fixed designation (Table 2-1, dynamic
+ * mapping), its ARFCNs here are the usual 438..511 (as libosmocore). In GSM
+ * 750 the downlink is the lower block (747-763 MHz).
  *
  * (C) 2026 by Vasyl Samoilov <vasyl.samoilov@gmail.com>
  * All Rights Reserved
@@ -9,99 +14,116 @@
  * (at your option) any later version.
  */
 
+#include <stddef.h>
+#include <strings.h>
 #include "calibrate.h"
 
-/* GSM-900 (primary, E-GSM): ARFCN 0-124, 975-1023
- * Downlink: 935-960 MHz (primary), 925-935 MHz (extended)
- */
-#define GSM900_ARFCN_START      0
-#define GSM900_ARFCN_END        124
-#define GSM900_DL_BASE          935.0e6
-#define GSM900_CHANNEL_SPACING  200000.0
+/* DL = f_ref + 200 kHz * (n - n_ref) for first <= n <= last */
+static const gsm_band_def_t gsm_bands[] = {
+	/* id, name, option, { first, last, f_ref, n_ref } x 2, dynamic */
+	{ GSM_BAND_450,  "GSM-450",  "450",  { {  259,  293,  460.6e6,  259 }, { 0, -1, 0, 0 } }, 0 },
+	{ GSM_BAND_480,  "GSM-480",  "480",  { {  306,  340,  489.0e6,  306 }, { 0, -1, 0, 0 } }, 0 },
+	{ GSM_BAND_750,  "GSM-750",  "750",  { {  438,  511,  747.2e6,  438 }, { 0, -1, 0, 0 } }, 1 },
+	{ GSM_BAND_850,  "GSM-850",  "850",  { {  128,  251,  869.2e6,  128 }, { 0, -1, 0, 0 } }, 0 },
+	/* P-, E-, R-GSM 900 nest; the first in this order names a carrier */
+	{ GSM_BAND_900,  "GSM-900",  "900",  { {    1,  124,  935.0e6,    0 }, { 0, -1, 0, 0 } }, 0 },
+	{ GSM_BAND_E900, "E-GSM-900", "e900", { {    0,  124,  935.0e6,    0 }, {  975, 1023, 935.0e6, 1024 } }, 0 },
+	{ GSM_BAND_R900, "R-GSM-900", "r900", { {    0,  124,  935.0e6,    0 }, {  955, 1023, 935.0e6, 1024 } }, 0 },
+	{ GSM_BAND_1800, "DCS-1800", "1800", { {  512,  885, 1805.2e6,  512 }, { 0, -1, 0, 0 } }, 0 },
+	{ GSM_BAND_1900, "PCS-1900", "1900", { {  512,  810, 1930.2e6,  512 }, { 0, -1, 0, 0 } }, 0 },
+	{ 0, NULL, NULL, { { 0, -1, 0, 0 }, { 0, -1, 0, 0 } }, 0 },
+};
 
-/* GSM-1800 (DCS): ARFCN 512-885
- * Downlink: 1805.2-1879.8 MHz
- */
-#define GSM1800_ARFCN_START     512
-#define GSM1800_ARFCN_END       885
-#define GSM1800_DL_BASE         1805.2e6
+const gsm_band_def_t *gsm_band_at(int i)
+{
+	if (i < 0 || i >= (int)(sizeof(gsm_bands) / sizeof(gsm_bands[0])) - 1)
+		return NULL;
+	return &gsm_bands[i];
+}
 
-/* GSM-1900 (PCS): ARFCN 512-810
- * Downlink: 1930.2-1989.8 MHz
- */
-#define GSM1900_ARFCN_START     512
-#define GSM1900_ARFCN_END       810
-#define GSM1900_DL_BASE         1930.2e6
+const gsm_band_def_t *gsm_band_def(int id)
+{
+	for (int i = 0; gsm_bands[i].id; i++)
+		if (gsm_bands[i].id == id)
+			return &gsm_bands[i];
+	return NULL;
+}
 
-/* GSM-850: ARFCN 128-251
- * Downlink: 869.2-893.8 MHz
- */
-#define GSM850_ARFCN_START      128
-#define GSM850_ARFCN_END        251
-#define GSM850_DL_BASE          869.2e6
+int gsm_band_parse(const char *arg)
+{
+	for (int i = 0; gsm_bands[i].id; i++)
+		if (!strcasecmp(arg, gsm_bands[i].arg))
+			return gsm_bands[i].id;
+	/* the spec's names */
+	if (!strcasecmp(arg, "p900") || !strcasecmp(arg, "pgsm900") || !strcasecmp(arg, "gsm900"))
+		return GSM_BAND_900;
+	if (!strcasecmp(arg, "egsm900") || !strcasecmp(arg, "egsm"))
+		return GSM_BAND_E900;
+	if (!strcasecmp(arg, "rgsm900") || !strcasecmp(arg, "rgsm"))
+		return GSM_BAND_R900;
+	if (!strcasecmp(arg, "dcs1800") || !strcasecmp(arg, "dcs"))
+		return GSM_BAND_1800;
+	if (!strcasecmp(arg, "pcs1900") || !strcasecmp(arg, "pcs"))
+		return GSM_BAND_1900;
+	return -1;
+}
 
-/* Convert ARFCN to downlink frequency in Hz */
+/* Downlink frequency of an ARFCN in a band (Hz), 0 if not in it */
 double arfcn_to_freq(int arfcn, int gsm_band)
 {
-	switch (gsm_band) {
-	case GSM_BAND_900:
-		if (arfcn >= 0 && arfcn <= 124)
-			return GSM900_DL_BASE + arfcn * GSM900_CHANNEL_SPACING;
-		/* Extended GSM-900 (ARFCN 975-1023) maps to 925-935 MHz */
-		if (arfcn >= 975 && arfcn <= 1023)
-			return 925.0e6 + (arfcn - 975) * GSM900_CHANNEL_SPACING;
-		break;
-	case GSM_BAND_1800:
-		if (arfcn >= 512 && arfcn <= 885)
-			return GSM1800_DL_BASE + (arfcn - 512) * GSM900_CHANNEL_SPACING;
-		break;
-	case GSM_BAND_1900:
-		if (arfcn >= 512 && arfcn <= 810)
-			return GSM1900_DL_BASE + (arfcn - 512) * GSM900_CHANNEL_SPACING;
-		break;
-	case GSM_BAND_850:
-		if (arfcn >= 128 && arfcn <= 251)
-			return GSM850_DL_BASE + (arfcn - 128) * GSM900_CHANNEL_SPACING;
-		break;
-	}
+	const gsm_band_def_t *b = gsm_band_def(gsm_band);
+
+	if (!b)
+		return 0.0;
+	for (int r = 0; r < 2; r++)
+		if (arfcn >= b->run[r].first && arfcn <= b->run[r].last)
+			return b->run[r].f_ref + 200e3 * (arfcn - b->run[r].n_ref);
 	return 0.0;
 }
 
-/* Get band parameters for wideband scanning */
-void gsm_band_params(int gsm_band, double *center_freq, double *bandwidth,
-                     int *arfcn_start, int *arfcn_end)
+/* ARFCN of a downlink frequency in a band, -1 if none */
+int gsm_freq_to_arfcn(int gsm_band, double freq_hz)
 {
-	switch (gsm_band) {
-	case GSM_BAND_900:
-		/* Cover 935-960 MHz (primary GSM-900 downlink) */
-		*center_freq = 947.5e6;
-		*bandwidth = 25.0e6;
-		*arfcn_start = GSM900_ARFCN_START;
-		*arfcn_end = GSM900_ARFCN_END;
-		break;
-	case GSM_BAND_1800:
-		/* Split into two scans due to wide bandwidth */
-		*center_freq = 1842.5e6;
-		*bandwidth = 75.0e6;
-		*arfcn_start = GSM1800_ARFCN_START;
-		*arfcn_end = GSM1800_ARFCN_END;
-		break;
-	case GSM_BAND_1900:
-		*center_freq = 1960.0e6;
-		*bandwidth = 60.0e6;
-		*arfcn_start = GSM1900_ARFCN_START;
-		*arfcn_end = GSM1900_ARFCN_END;
-		break;
-	case GSM_BAND_850:
-		*center_freq = 881.5e6;
-		*bandwidth = 25.0e6;
-		*arfcn_start = GSM850_ARFCN_START;
-		*arfcn_end = GSM850_ARFCN_END;
-		break;
-	default:
-		*center_freq = 0;
-		*bandwidth = 0;
-		*arfcn_start = 0;
-		*arfcn_end = 0;
+	const gsm_band_def_t *b = gsm_band_def(gsm_band);
+
+	if (!b)
+		return -1;
+	for (int r = 0; r < 2; r++) {
+		double k = (freq_hz - b->run[r].f_ref) / 200e3;
+		int n = (int)(k + ((k < 0) ? -0.5 : 0.5)) + b->run[r].n_ref;
+
+		if (n >= b->run[r].first && n <= b->run[r].last
+		 && freq_hz - arfcn_to_freq(n, gsm_band) < 1.0 && freq_hz - arfcn_to_freq(n, gsm_band) > -1.0)
+			return n;
 	}
+	return -1;
+}
+
+/* the lowest and highest downlink carrier of a band (Hz); 0, -1 unknown */
+int gsm_band_dl_range(int gsm_band, double *f_lo, double *f_hi)
+{
+	const gsm_band_def_t *b = gsm_band_def(gsm_band);
+	double lo = 0.0, hi = 0.0;
+
+	if (!b)
+		return -1;
+	for (int r = 0; r < 2; r++) {
+		if (b->run[r].last < b->run[r].first)
+			continue;
+		double a = arfcn_to_freq(b->run[r].first, gsm_band), z = arfcn_to_freq(b->run[r].last, gsm_band);
+		if (lo == 0.0 || a < lo)
+			lo = a;
+		if (z > hi)
+			hi = z;
+	}
+	*f_lo = lo;
+	*f_hi = hi;
+	return 0;
+}
+
+const char *gsm_band_name(int gsm_band)
+{
+	const gsm_band_def_t *b = gsm_band_def(gsm_band);
+
+	return b ? b->name : "Unknown";
 }

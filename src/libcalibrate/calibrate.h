@@ -21,15 +21,51 @@
 
 #include "gsm_sch.h"
 
-/* GSM band identifiers (single values, not bitmask) */
-#define GSM_BAND_900    1
+/* GSM band identifiers (gsm_bands.c, 3GPP TS 45.005 clause 2) */
+#define GSM_BAND_900    1	/* P-GSM 900 */
 #define GSM_BAND_1800   2
 #define GSM_BAND_1900   3
 #define GSM_BAND_850    4
-#define GSM_BAND_ALL    0       /* Scan all supported bands */
+#define GSM_BAND_450    5
+#define GSM_BAND_480    6
+#define GSM_BAND_750    7
+#define GSM_BAND_E900   8
+#define GSM_BAND_R900   9
 
-/* Maximum bands we can scan */
-#define CALIB_MAX_BANDS         4
+typedef struct gsm_band_def {
+	int		id;
+	const char	*name;		/* GSM-900, DCS-1800, ... */
+	const char	*arg;		/* --band name */
+	struct {
+		int	first, last;	/* ARFCNs (last < first: none) */
+		double	f_ref;		/* downlink of n_ref (Hz) */
+		int	n_ref;
+	} run[2];
+	int		dynamic;	/* numbering not fixed by 45.005 (GSM 750) */
+} gsm_band_def_t;
+
+/* the table, in order (i from 0; NULL after the last) */
+const gsm_band_def_t *gsm_band_at(int i);
+const gsm_band_def_t *gsm_band_def(int id);
+/* id of a --band name, -1 if none */
+int gsm_band_parse(const char *arg);
+int gsm_freq_to_arfcn(int gsm_band, double freq_hz);
+int gsm_band_dl_range(int gsm_band, double *f_lo, double *f_hi);
+
+/* systems */
+#define CALIB_GSM	0
+#define CALIB_LTE	1
+
+/* the bands of a run (GSM and LTE; LTE: all of 36.101) */
+#define CALIB_MAX_BANDS         128
+
+/* one band to measure: its carriers within [f_lo, f_hi] (the part in reach) */
+typedef struct calib_band {
+	int		system;		/* CALIB_GSM, CALIB_LTE */
+	int		id;		/* GSM_BAND_* or the LTE band number */
+	double		f_lo, f_hi;	/* downlink carrier frequencies (Hz) */
+	int		scan;		/* 0: inside another band of the run (only names carriers) */
+} calib_band_t;
 
 /* carriers measured in one run (all of them with --full) */
 #define CALIB_MAX_CELLS         256
@@ -40,8 +76,9 @@
 
 /* One measured carrier: its offset and its identity */
 typedef struct {
-	int arfcn;
-	int gsm_band;
+	int system;                 /* CALIB_GSM, CALIB_LTE */
+	int arfcn;                  /* LTE: the EARFCN */
+	int gsm_band;               /* LTE: the band number */
 	double freq_hz;
 	double hz_offset;           /* FCCH offset (trimmed mean) */
 	double ppm_offset;
@@ -53,7 +90,16 @@ typedef struct {
 	int confirmed;              /* SCH decodes consistent: a base station */
 	double confirm_sec;         /* decoding time until confirmed */
 	int agrees;                 /* within CALIB_AGREE_PPM of the result */
+	double weight;              /* in the result: 1, less when uncertain */
+	double carrier_ppm;         /* the carrier's offset (the prior for LTE searches) */
 	gsm_cell_ident_t ident;     /* BSIC, FN, SI counts, MCC/MNC/LAC/CI */
+	struct {
+		int pci, n_rb, ports, tdd;
+		double rsrp_dbfs, rsrq_db, sinr_db;
+		double alias_margin;    /* cfo_alias_margin (standard errors) */
+		double timing_ppm, timing_std_ppm;
+		int timing;             /* ppm_offset is the timing ppm (RTL) */
+	} lte;
 } calibrate_cell_t;
 
 /* Result of a run */
@@ -78,8 +124,11 @@ typedef struct {
 
 /* Calibration configuration */
 typedef struct {
-	int gsm_bands;              /* GSM_BAND_* or GSM_BAND_ALL */
-	double timeout_sec;         /* most time per window */
+	calib_band_t bands[CALIB_MAX_BANDS]; /* in the order measured */
+	int num_bands;
+	int lte_timing;             /* LTE: the frame timing ppm, not the carrier's
+	                             * (a tuner whose LO is off its setting: RTL) */
+	double timeout_sec;        /* most time per window */
 	int verbosity;              /* 0=quiet, 1=normal, 2=debug */
 	int num_channels;           /* channels per window, 0 = as the CPU budget allows */
 	double cpu_percent;         /* CPU budget for the channels, % of one core */
@@ -118,11 +167,11 @@ int calibrate_auto(int samplerate, calibrate_config_t *config, calibrate_result_
 /* Utility: Convert ARFCN to downlink frequency (Hz) */
 double arfcn_to_freq(int arfcn, int gsm_band);
 
-/* Utility: Get band center frequency and bandwidth for wideband scan */
-void gsm_band_params(int gsm_band, double *center_freq, double *bandwidth,
-                     int *arfcn_start, int *arfcn_end);
-
 /* Utility: band name string */
 const char *gsm_band_name(int gsm_band);
+
+/* the half width of the stream an LTE carrier needs (its centre 6 RB and
+ * the offset): reach and rate checks */
+#define CALIB_LTE_HALF_HZ	600e3
 
 #endif /* CALIBRATE_H */
